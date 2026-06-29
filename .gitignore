@@ -1,0 +1,7 @@
+# herdkit — code only. Never commit secrets or per-machine state.
+.herd/secrets          # API-backend credentials (Linear/Jira/DevOps) — gitignored by contract
+*.log
+.DS_Store
+
+# worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo)
+*-trees/
