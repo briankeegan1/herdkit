@@ -17,8 +17,8 @@ LOG="$DIR/.app-server.log"
 [ -n "$APP_PREVIEW_CMD" ] || { echo "app-monitor: no APP_PREVIEW_CMD configured"; exit 1; }
 
 # The preview server in the background — this is what the browser renders. Dies with the pane.
-# The "--server.port / --server.headless" convention matches Streamlit; projects whose preview
-# command takes the port differently can wrap it in their APP_PREVIEW_CMD.
+# The "--server.port / --server.headless" flags follow a common dev-server convention; a project
+# whose preview command takes the port differently can wrap it inside its own APP_PREVIEW_CMD.
 # shellcheck disable=SC2086
 $APP_PREVIEW_CMD --server.port "$PORT" --server.headless true >"$LOG" 2>&1 &
 SERVER_PID=$!
