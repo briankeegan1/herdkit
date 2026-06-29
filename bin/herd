@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# herd — the herdkit CLI. Stands the herd workflow up in a project, upgrades the engine, and
+# routes engine bugs back to the herdkit repo. Plain shell; the scout/interview may shell out to
+# a one-shot `claude -p` where judgment helps, but the CLI itself stays heuristic + interactive.
+#
+#   herd init       stand up herdkit in a project (greenfield interview / brownfield scout):
+#                   discover the work tracker, write .herd/config, render the coordinator skill.
+#   herd upgrade    re-render the coordinator skill from the current template + bump HERD_VERSION,
+#                   PRESERVING the project's .herd/config answers; warn on newly-added keys.
+#   herd report     file a cross-repo gh issue against HERD_REPO (the herdkit repo), stamped with
+#                   this project + the lane involved + the version pin.
+#   herd render     (internal) re-render only the coordinator skill from .herd/config.
+#
+# Engine contract version this CLI ships.
+HERDKIT_CONTRACT_VERSION=1
+set -euo pipefail
+
+# Resolve the herdkit install root from this script's location (bin/herd → repo root).
+HERDKIT_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPTS_DIR="$HERDKIT_HOME/scripts/herd"
+TEMPLATES_DIR="$HERDKIT_HOME/templates"
+
+c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
+warn() { printf '%s⚠️  %s%s\n' "$c_yel" "$*" "$c_rst" >&2; }
+die()  { printf '%s❌ %s%s\n' "$c_red" "$*" "$c_rst" >&2; exit 1; }
+ask()  { # ask "<prompt>" "<default>" → echoes the answer (default on empty / non-interactive)
+  local prompt="$1" def="${2:-}" ans=""
+  if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+    printf '%s%s%s' "$c_bold" "$prompt" "$c_rst" >&2
+    [ -n "$def" ] && printf ' %s[%s]%s' "$c_dim" "$def" "$c_rst" >&2
+    printf ': ' >&2
+    read -r ans || true
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+# render_skill <project_root> <config_file> — render templates/coordinator.md.tmpl into the
+# project's .claude/commands/<name>.md, substituting {{TOKENS}} from the config. Pure bash string
+# replacement (no sed) so values containing / & | are safe.
+render_skill() {
+  local root="$1" cfg="$2"
+  # Load the config in a subshell-safe way: source it to read the answers.
+  # shellcheck source=/dev/null
+  ( . "$cfg"
+    : "${WORKSPACE_NAME:=$(basename "$root")}"
+    : "${PROJECT_ROOT:=$root}"
+    : "${DEFAULT_BRANCH:=origin/main}"
+    : "${BACKLOG_FILE:=BACKLOG.md}"
+    : "${DENY_PATHS:=}"
+    : "${HERD_REPO:=}"
+    : "${COORDINATOR_CMD:=/coordinator}"
+    local name="${COORDINATOR_CMD#/}"; name="${name:-coordinator}"
+    local out_dir="$root/.claude/commands"
+    mkdir -p "$out_dir"
+    local out="$out_dir/$name.md"
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
+      line="${line//\{\{PROJECT_ROOT\}\}/$PROJECT_ROOT}"
+      line="${line//\{\{DEFAULT_BRANCH\}\}/$DEFAULT_BRANCH}"
+      line="${line//\{\{BACKLOG_FILE\}\}/$BACKLOG_FILE}"
+      line="${line//\{\{SCRIPTS_DIR\}\}/$SCRIPTS_DIR}"
+      line="${line//\{\{DENY_PATHS\}\}/$DENY_PATHS}"
+      line="${line//\{\{HERD_REPO\}\}/$HERD_REPO}"
+      line="${line//\{\{COORDINATOR_CMD\}\}/$COORDINATOR_CMD}"
+      printf '%s\n' "$line"
+    done < "$TEMPLATES_DIR/coordinator.md.tmpl" > "$out"
+    printf '%s' "$out"
+  )
+}
+
+# ── scout: cheap heuristics about the repo, printed for the interview defaults ─────────────────
+scout_repo() {
+  local root="$1" lang="unknown" backlog="" tracker_hint=""
+  [ -f "$root/package.json" ] && lang="node"
+  { [ -f "$root/pyproject.toml" ] || [ -f "$root/requirements.txt" ] || [ -f "$root/setup.py" ]; } && lang="python"
+  [ -f "$root/go.mod" ] && lang="go"
+  [ -f "$root/Cargo.toml" ] && lang="rust"
+  for f in BACKLOG.md TODO.md ROADMAP.md CHANGELOG.md; do
+    [ -f "$root/$f" ] && backlog="${backlog:+$backlog }$f"
+  done
+  [ -d "$root/.github" ] && tracker_hint="github"
+  { grep -rqs -iE 'LINEAR_|linear\.app' "$root" 2>/dev/null; } && tracker_hint="${tracker_hint:+$tracker_hint,}linear?"
+  { grep -rqs -iE 'JIRA_|atlassian' "$root" 2>/dev/null; } && tracker_hint="${tracker_hint:+$tracker_hint,}jira?"
+  printf 'lang=%s\nbacklog=%s\ntracker=%s\n' "$lang" "$backlog" "$tracker_hint"
+}
+
+cmd_init() {
+  local root; root="$(pwd)"
+  [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
+  say "${c_bold}herd init${c_rst} — standing up the herd workflow in $root"
+  say ""
+
+  # 1. Scout.
+  local s; s="$(scout_repo "$root")"
+  local lang backlog tracker
+  lang="$(printf '%s' "$s" | sed -n 's/^lang=//p')"
+  backlog="$(printf '%s' "$s" | sed -n 's/^backlog=//p')"
+  tracker="$(printf '%s' "$s" | sed -n 's/^tracker=//p')"
+  say "${c_dim}scout: language=${lang:-unknown}  backlog-files=[${backlog:-none}]  tracker-signals=[${tracker:-none}]${c_rst}"
+  # Optional one-shot Claude scout pass (judgment, not heuristics) — best-effort, never blocks.
+  if command -v claude >/dev/null 2>&1 && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+    local want; want="$(ask "Run a one-shot Claude scout to propose conventions? (y/N)" "n")"
+    if [ "$want" = "y" ] || [ "$want" = "Y" ]; then
+      say "${c_dim}(scouting — read-only; this can take a moment)${c_rst}"
+      claude -p "Scout this repo at $root for a multi-agent workflow config. In <=10 lines report: the default branch, the test/lint command to use as a healthcheck, whether there is an app preview command, the privacy/gitignored dirs, and which work tracker it uses. Read-only." 2>/dev/null || warn "scout pass skipped (claude error)"
+    fi
+  fi
+  say ""
+
+  # 2. Interview (detected values as defaults).
+  local def_branch; def_branch="$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
+  local project_root worktrees default_branch workspace
+  project_root="$(ask "PROJECT_ROOT" "$root")"
+  worktrees="$(ask "WORKTREES_DIR (worktree pool, sibling, never committed)" "${project_root}-trees")"
+  default_branch="$(ask "DEFAULT_BRANCH (remote/branch to fork+push)" "origin/$def_branch")"
+  workspace="$(ask "WORKSPACE_NAME (herdr label)" "$(basename "$project_root")")"
+
+  # 3. Work-tracker discovery dialogue.
+  say ""
+  say "${c_bold}Work tracker${c_rst}"
+  local backlog_file="BACKLOG.md" backend="file" make_backlog=""
+  if [ -n "$backlog" ]; then
+    local first; first="$(printf '%s' "$backlog" | awk '{print $1}')"
+    say "  Found: $backlog"
+    local use; use="$(ask "Use '$first' as the work tracker? (Y/n)" "y")"
+    if [ "$use" = "y" ] || [ "$use" = "Y" ]; then
+      backlog_file="$first"
+      case "$first" in CHANGELOG.md) backend="changelog" ;; *) backend="file" ;; esac
+    else
+      make_backlog=1
+    fi
+  else
+    say "  No BACKLOG.md / TODO.md / CHANGELOG found."
+    local choice
+    choice="$(ask "Tracker: [1] create BACKLOG.md (recommended)  [2] GitHub Issues (coming soon)  [3] file backend at a custom path" "1")"
+    case "$choice" in
+      2) warn "GitHub-Issues backend is a Phase 3 target — falling back to a file BACKLOG.md for now."; make_backlog=1 ;;
+      3) backlog_file="$(ask "BACKLOG_FILE (repo-relative)" "BACKLOG.md")"; make_backlog=1 ;;
+      *) make_backlog=1 ;;
+    esac
+  fi
+  # Explicit opt-in for an API backend (stubbed as "coming soon" in v1).
+  local api; api="$(ask "Do you use Linear / Jira / Azure DevOps? (name one, or blank)" "")"
+  if [ -n "$api" ]; then
+    warn "$api adapter is 'coming soon' (Phase 3). v1 ships file backends only — using the file backend; you can switch SCRIBE_BACKEND later and add creds to .herd/secrets."
+  fi
+
+  # 4. Health + preview.
+  say ""
+  local healthcheck heavy_glob preview deny
+  healthcheck="$(ask "HEALTHCHECK_CMD (exit 0 clean / 1 code error / 2 data-env; blank = syntax-only)" ".herd/healthcheck.project.sh")"
+  heavy_glob="$(ask "HEALTHCHECK_HEAVY_GLOB (diff paths forcing the heavy profile; blank = always heavy)" "")"
+  preview="$(ask "APP_PREVIEW_CMD (live preview; blank = none → quick-only)" "")"
+  deny="$(ask "DENY_PATHS (never-committed dirs)" "")"
+
+  local herd_repo; herd_repo="$(ask "HERD_REPO (where engine bugs escalate)" "briankeegan1/herdkit")"
+
+  # 5. Write .herd/config.
+  mkdir -p "$project_root/.herd"
+  local cfg="$project_root/.herd/config"
+  if [ -f "$cfg" ]; then
+    local ov; ov="$(ask ".herd/config already exists — overwrite? (y/N)" "n")"
+    [ "$ov" = "y" ] || [ "$ov" = "Y" ] || die "aborted; existing .herd/config left untouched"
+  fi
+  cat > "$cfg" <<EOF
+# .herd/config — generated by 'herd init'. Commit this (code-shaped config, zero-secret).
+HERD_VERSION=$HERDKIT_CONTRACT_VERSION
+
+PROJECT_ROOT="$project_root"
+WORKTREES_DIR="$worktrees"
+DEFAULT_BRANCH="$default_branch"
+WORKSPACE_NAME="$workspace"
+
+BACKLOG_FILE="$backlog_file"
+SCRIBE_BACKEND="$backend"
+SHARE_LINKS=""
+
+HEALTHCHECK_CMD="$healthcheck"
+HEALTHCHECK_HEAVY_GLOB="$heavy_glob"
+APP_PREVIEW_CMD="$preview"
+SMOKE_CMD=""
+
+MODEL_COORDINATOR="claude-opus-4-8"
+MODEL_FEATURE="claude-opus-4-8"
+MODEL_QUICK="claude-sonnet-4-6"
+MODEL_SCRIBE="claude-sonnet-4-6"
+MODEL_RESEARCH="claude-sonnet-4-6"
+MODEL_REVIEW="claude-opus-4-8"
+
+DENY_PATHS="$deny"
+REVIEW_CHECKLIST=".herd/review-checklist.md"
+COORDINATOR_CMD="/coordinator"
+WATCHER_AUTOMERGE="true"
+HERD_REPO="$herd_repo"
+EOF
+  ok "wrote $cfg"
+
+  # Seed a BACKLOG.md if we promised to create one.
+  if [ -n "$make_backlog" ] && [ ! -f "$project_root/$backlog_file" ]; then
+    cat > "$project_root/$backlog_file" <<EOF
+# $workspace — backlog
+
+> Single source of truth for planned work. The coordinator owns this file; the async scribe is
+> the only automated writer. 🔜 planned · 🚧 in progress · ✅ shipped.
+
+## Now
+
+## Next
+
+## Recently shipped
+EOF
+    ok "seeded $backlog_file"
+  fi
+
+  # 6. Render the coordinator skill.
+  local skill; skill="$(render_skill "$project_root" "$cfg")"
+  ok "rendered coordinator skill → $skill"
+
+  say ""
+  ok "herd init complete."
+  say "  Next:  cd $project_root && bash $SCRIPTS_DIR/coordinator.sh   # launch the control room"
+  say "  Skill: /coordinator (regenerate after an engine bump with: herd upgrade)"
+}
+
+cmd_upgrade() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  # Preserve answers; bump the version pin in place.
+  local cur; cur="$(. "$cfg"; printf '%s' "${HERD_VERSION:-0}")"
+  if [ "$cur" -gt "$HERDKIT_CONTRACT_VERSION" ] 2>/dev/null; then
+    warn "project pinned HERD_VERSION=$cur is NEWER than this CLI's contract ($HERDKIT_CONTRACT_VERSION) — upgrade your herdkit install."
+  fi
+  # Warn on config keys this contract expects but the project's config is missing.
+  local expected="HEALTHCHECK_CMD HEALTHCHECK_HEAVY_GLOB SMOKE_CMD SHARE_LINKS REVIEW_CHECKLIST COORDINATOR_CMD WATCHER_AUTOMERGE HERD_REPO"
+  local missing="" k
+  for k in $expected; do
+    grep -qE "^[[:space:]]*$k=" "$cfg" || missing="${missing:+$missing }$k"
+  done
+  [ -n "$missing" ] && warn "config is missing keys this version uses (defaults apply; add them to .herd/config): $missing"
+  # Bump HERD_VERSION (or append if absent).
+  if grep -qE '^[[:space:]]*HERD_VERSION=' "$cfg"; then
+    local tmp; tmp="$(mktemp)"
+    sed -E "s/^([[:space:]]*HERD_VERSION=).*/\1$HERDKIT_CONTRACT_VERSION/" "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+  else
+    printf 'HERD_VERSION=%s\n' "$HERDKIT_CONTRACT_VERSION" >> "$cfg"
+  fi
+  ok "HERD_VERSION → $HERDKIT_CONTRACT_VERSION"
+  local skill; skill="$(render_skill "$root" "$cfg")"
+  ok "re-rendered coordinator skill → $skill"
+}
+
+cmd_render() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local skill; skill="$(render_skill "$root" "$cfg")"
+  ok "rendered coordinator skill → $skill"
+}
+
+cmd_report() {
+  local symptom="${1:-}"
+  [ -n "$symptom" ] || die "usage: herd report \"<symptom + which lane>\""
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  local repo="briankeegan1/herdkit" project ver
+  if [ -f "$cfg" ]; then
+    repo="$(. "$cfg"; printf '%s' "${HERD_REPO:-briankeegan1/herdkit}")"
+    project="$(. "$cfg"; printf '%s' "${WORKSPACE_NAME:-$(basename "$root")}")"
+    ver="$(. "$cfg"; printf '%s' "${HERD_VERSION:-?}")"
+  else
+    project="$(basename "$root")"; ver="?"
+  fi
+  command -v gh >/dev/null 2>&1 || die "gh CLI not found — needed to file a cross-repo issue"
+  local body
+  body="$(printf 'Reported from project **%s** (HERD_VERSION %s) via \`herd report\`.\n\n**Symptom / lane:** %s\n\n_Stamped automatically; add a repro below._' "$project" "$ver" "$symptom")"
+  say "Filing engine bug on ${c_bold}$repo${c_rst}…"
+  gh issue create -R "$repo" \
+    --title "[$project] $symptom" \
+    --body "$body" \
+    --label "herd-engine" 2>/dev/null \
+  || gh issue create -R "$repo" --title "[$project] $symptom" --body "$body"
+}
+
+usage() {
+  cat <<EOF
+herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
+
+  herd init                 stand up herdkit in the current repo (interview + scout)
+  herd upgrade              bump HERD_VERSION + re-render the coordinator skill (keeps answers)
+  herd render               re-render only the coordinator skill from .herd/config
+  herd report "<symptom>"   file an engine bug as a gh issue on HERD_REPO
+  herd help                 this help
+
+Engine scripts: $SCRIPTS_DIR
+Templates:      $TEMPLATES_DIR
+EOF
+}
+
+case "${1:-help}" in
+  init)    shift; cmd_init "$@" ;;
+  upgrade) shift; cmd_upgrade "$@" ;;
+  render)  shift; cmd_render "$@" ;;
+  report)  shift; cmd_report "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

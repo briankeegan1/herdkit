@@ -6,17 +6,28 @@
 # Usage (at the top of any herd script, after HERE is set):
 #   . "$HERE/herd-config.sh"
 #
-# Config discovery:
-#   * HERD_CONFIG_FILE (env) — explicit path; the `herd` CLI sets this to the consuming
-#     project's .herd/config when the engine lives in a separate global install.
-#   * otherwise <repo>/.herd/config, resolved two dirs up from scripts/herd/ (the layout
-#     when the engine is vendored into / dogfooded by a project).
+# Config discovery, in order:
+#   1. HERD_CONFIG_FILE (env) — explicit path; tests + the `herd` CLI set this.
+#   2. walk up from $PWD for a .herd/config — makes the GLOBAL-INSTALL model work: a lane
+#      script lives in the herdkit install but is invoked with cwd inside the consuming project,
+#      so it finds that project's committed .herd/config.
+#   3. <repo>/.herd/config, two dirs up from scripts/herd/ — the DOGFOOD/vendored layout.
 #
 # This file is ZERO-SECRET. API-backend credentials live in .herd/secrets (gitignored),
 # sourced separately by scribe-step.sh — never here, never in .herd/config.
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
-_HERD_CONFIG_FILE="${HERD_CONFIG_FILE:-"$_HERD_REPO_DEFAULT/.herd/config"}"
+_herd_find_config() {
+  [ -n "${HERD_CONFIG_FILE:-}" ] && { printf '%s' "$HERD_CONFIG_FILE"; return; }
+  local d="$PWD"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -f "$d/.herd/config" ] && { printf '%s' "$d/.herd/config"; return; }
+    d="$(dirname "$d")"
+  done
+  printf '%s' "$_HERD_REPO_DEFAULT/.herd/config"
+}
+_HERD_CONFIG_FILE="$(_herd_find_config)"
+unset -f _herd_find_config
 if [ -f "$_HERD_CONFIG_FILE" ]; then
   # shellcheck source=/dev/null
   . "$_HERD_CONFIG_FILE"

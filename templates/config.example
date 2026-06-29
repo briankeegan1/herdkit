@@ -1,0 +1,43 @@
+# .herd/config — read by the herd engine; one per consuming project.
+# Shell-sourceable KEY=value. COMMIT this file — it is code-shaped config, not data.
+# It must be ZERO-SECRET: API-backend credentials go in .herd/secrets (gitignored), never here.
+# `herd init` writes this for you; every key has a generic fallback in herd-config.sh, so only
+# set what differs from the defaults.
+HERD_VERSION=1                       # engine contract version (herd upgrade bumps this)
+
+PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
+WORKTREES_DIR="$HOME/source/myproject-trees"   # the worktree pool (sibling, never committed)
+DEFAULT_BRANCH="origin/main"                   # branch off / push to this
+WORKSPACE_NAME="myproject"                     # herdr workspace label
+
+BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
+SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
+SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "data .venv")
+
+# health + preview — the two big project-specific commands.
+HEALTHCHECK_CMD=".herd/healthcheck.project.sh"  # exit 0 clean/data-env, 1 code error, 2 data/env
+HEALTHCHECK_HEAVY_GLOB="^app/"                   # diff paths that force the heavy profile (egrep)
+APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
+SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
+
+# model map — role → model
+MODEL_COORDINATOR="claude-opus-4-8"
+MODEL_FEATURE="claude-opus-4-8"     # real features want the judgment
+MODEL_QUICK="claude-sonnet-4-6"     # trivial lane → cheaper model
+MODEL_SCRIBE="claude-sonnet-4-6"
+MODEL_RESEARCH="claude-sonnet-4-6"
+MODEL_REVIEW="claude-opus-4-8"      # the pre-merge gate — a STRONG model on purpose
+
+# privacy / safety
+DENY_PATHS="data/"                  # never committed; the local lane is scoped here
+REVIEW_CHECKLIST=".herd/review-checklist.md"  # project risk list injected into the review gate
+
+# the generated coordinator skill the control room launches
+COORDINATOR_CMD="/coordinator"
+
+# human-in-the-loop lever — "true" = auto-merge ready PRs; "false" = run the full
+# healthcheck + review pipeline but flag the PR for a human to merge.
+WATCHER_AUTOMERGE="true"
+
+# routing — where engine bugs escalate (herd report files a gh issue here)
+HERD_REPO="briankeegan1/herdkit"
