@@ -1,0 +1,33 @@
+# .herd/config — herdkit's OWN dogfood config (herd-on-herd, workspace wB).
+# herdkit is developed using the herd. Commit this; it is zero-secret.
+HERD_VERSION=1
+
+PROJECT_ROOT="$HOME/source/herdkit"
+WORKTREES_DIR="$HOME/source/herdkit-trees"
+DEFAULT_BRANCH="origin/main"
+WORKSPACE_NAME="herdkit"
+
+BACKLOG_FILE="BACKLOG.md"
+SCRIBE_BACKEND="file"
+SHARE_LINKS=""
+
+# HEALTHCHECK = shellcheck over the scripts + bats over the tests (degrades to bash -n + the
+# hermetic queue tests when those tools are absent). No app preview — every lane is the quick
+# lane, so HEALTHCHECK_HEAVY_GLOB is empty (every change runs the full healthcheck).
+HEALTHCHECK_CMD=".herd/healthcheck.project.sh"
+HEALTHCHECK_HEAVY_GLOB=""
+APP_PREVIEW_CMD=""
+SMOKE_CMD=""
+
+MODEL_COORDINATOR="claude-opus-4-8"
+MODEL_FEATURE="claude-opus-4-8"
+MODEL_QUICK="claude-sonnet-4-6"
+MODEL_SCRIBE="claude-sonnet-4-6"
+MODEL_RESEARCH="claude-sonnet-4-6"
+MODEL_REVIEW="claude-opus-4-8"
+
+DENY_PATHS=".herd/secrets"
+REVIEW_CHECKLIST=".herd/review-checklist.md"
+COORDINATOR_CMD="/coordinator"
+WATCHER_AUTOMERGE="true"
+HERD_REPO="briankeegan1/herdkit"
