@@ -305,6 +305,38 @@ cmd_render() {
   ok "rendered coordinator skill → $skill"
 }
 
+cmd_backlog() {
+  # Print the project's OPEN work items via the active SCRIBE_BACKEND — the generic,
+  # backend-agnostic "what's my open work?" command. The file backend greps $BACKLOG_FILE,
+  # the github backend runs `gh issue list`, the linear backend queries Linear; every backend
+  # emits the same "#<id> <title>" line shape via _backend_list_open, so a non-file-backend
+  # project surfaces its issue tracker as actionable work rather than a tracked file.
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  # Load the project's answers through the shared loader (sets SCRIBE_BACKEND, BACKLOG_FILE,
+  # PROJECT_ROOT, HERD_REPO, …). Pin it to this repo's config so the loader doesn't walk elsewhere.
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # API backends (e.g. linear) read credentials from .herd/secrets (gitignored); file/github do
+  # not. Best-effort + absent-file-safe, mirroring how scribe-step.sh sources secrets.
+  local secrets="$PROJECT_ROOT/.herd/secrets"
+  # shellcheck source=/dev/null
+  [ -f "$secrets" ] && . "$secrets"
+  # Source the pluggable backend keyed on SCRIBE_BACKEND (default: file). Loud if it is missing.
+  local backend_file="$SCRIPTS_DIR/backends/${SCRIBE_BACKEND}.sh"
+  [ -f "$backend_file" ] || die "unknown SCRIBE_BACKEND '$SCRIBE_BACKEND' — no backends/${SCRIBE_BACKEND}.sh"
+  # shellcheck source=/dev/null
+  . "$backend_file"
+  command -v _backend_list_open >/dev/null 2>&1 \
+    || die "backend '$SCRIBE_BACKEND' defines no _backend_list_open op"
+  # Run the op from the project root: the file backend greps $BACKLOG_FILE (repo-relative); the
+  # tracker backends ignore cwd. A backend with a missing dep (no gh / no key) fails loud + non-zero.
+  cd "$PROJECT_ROOT" 2>/dev/null || true
+  _backend_list_open
+}
+
 cmd_report() {
   local symptom="${1:-}"
   [ -n "$symptom" ] || die "usage: herd report \"<symptom + which lane>\""
@@ -336,6 +368,7 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd init                 stand up herdkit in the current repo (interview + scout)
   herd upgrade              bump HERD_VERSION + re-render the coordinator skill (keeps answers)
   herd render               re-render only the coordinator skill from .herd/config
+  herd backlog              list open work items via the active backend (file/github/linear)
   herd report "<symptom>"   file an engine bug as a gh issue on HERD_REPO
   herd help                 this help
 
@@ -348,6 +381,7 @@ case "${1:-help}" in
   init)    shift; cmd_init "$@" ;;
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
+  backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 2 ;;

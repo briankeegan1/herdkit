@@ -14,7 +14,12 @@ in parallel.
 
 ## On invocation
 
-1. Read `{{BACKLOG_FILE}}` to see planned (🔜), in-progress (🚧), and shipped (✅) items.
+1. See your **open work** through the active work-tracker backend, not by assuming a literal
+   file: run `herd backlog` (it sources the project's `SCRIBE_BACKEND` and prints each open item
+   as a `#id title` line via `_backend_list_open`). A **file** backend greps `{{BACKLOG_FILE}}`
+   (🔜 planned · 🚧 in progress); a **github**/**linear** backend drains its issue tracker as the
+   work source instead. When the file backend is in use, also read `{{BACKLOG_FILE}}` for the
+   planned/shipped (✅) prose history.
 2. Get current state of in-flight work (run both, they're fast):
    - `git worktree list` — existing feature worktrees
    - `herdr agent list` — which sub-agents are running / idle / blocked
@@ -68,8 +73,9 @@ Never run more than the user wants in parallel — call out if 4+ agents are alr
 
 ## Browse / Add / Curate
 
-- **Browse:** summarize `{{BACKLOG_FILE}}` grouped by status. For *real* status (is a 🔜 already
-  shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
+- **Browse:** summarize the open work (`herd backlog` for the live, backend-agnostic set;
+  `{{BACKLOG_FILE}}` for the file backend's full grouped history). For *real* status (is a 🔜
+  already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
 - **Add:** enqueue it — the scribe does the research + writes the grounded entry:
   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
