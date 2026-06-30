@@ -18,6 +18,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 REPO="$PROJECT_ROOT"
 
+# 0. Fail fast if herdr is missing or its CLI/JSON contract has skewed — otherwise the very first
+#    `herdr tab create` below blows up cryptically.
+. "$HERE/herd-preflight.sh"
+herd_preflight || exit 1
+
 # 1. Close an existing coordinator tab (clean relaunch).
 existing=$(herdr tab list | python3 -c \
   'import sys,json; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")=="coordinator"), ""))')
