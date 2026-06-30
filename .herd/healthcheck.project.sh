@@ -58,5 +58,26 @@ elif ls tests/test-*.sh >/dev/null 2>&1; then
   fi
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; }
+# 4. leak-guard — no single-consumer (Northstar) literal may leak into the generic engine.
+# The pattern list lives HERE in .herd/ (outside the scanned surface: scripts/herd + bin/herd +
+# templates), so this guard never matches itself. The documented generic placeholder
+# "$HOME/source/myproject" in templates/config.example is allowed; everything else under
+# $HOME/source/ is a hardcoded leak.
+lg_note="leak-guard: clean"
+leak_pat='northstar|/Users/macbookpro|\$HOME/source/|streamlit|app/dashboard\.py'
+leak_files=()
+while IFS= read -r f; do [ -n "$f" ] && leak_files+=("$f"); done < <(
+  { find scripts/herd -type f 2>/dev/null
+    [ -f bin/herd ] && echo bin/herd
+    find templates -type f 2>/dev/null; } | sort -u
+)
+if [ "${#leak_files[@]}" -gt 0 ]; then
+  if hits="$(grep -HinE "$leak_pat" "${leak_files[@]}" 2>/dev/null | grep -vE '\$HOME/source/myproject')"; then
+    [ -n "$ONELINE" ] && echo "leak-guard: $(printf '%s' "$hits" | head -1)" \
+      || { echo "LEAK-GUARD: single-consumer literal in generic engine"; printf '%s\n' "$hits"; }
+    exit 1
+  fi
+fi
+
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $lg_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $lg_note"; }
 exit 0
