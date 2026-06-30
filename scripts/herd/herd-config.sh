@@ -70,3 +70,18 @@ unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE
 # Derived helpers — split DEFAULT_BRANCH (e.g. "origin/main") for push/pull commands.
 HERD_REMOTE="${DEFAULT_BRANCH%%/*}"
 HERD_BRANCH_NAME="${DEFAULT_BRANCH#*/}"
+
+# ── Project-scoped singleton identifiers ─────────────────────────────────────
+# The coordinator/scribe/researcher are PER-PROJECT singletons. Two projects sharing one herdr
+# must NOT collide on a global name: relaunching project B's coordinator would close A's tab, and
+# B's scribe/research spawn-lock (a global `herdr agent list` name match) would see A's drainer and
+# never start its own → B's queue never drains. So suffix every singleton name with the project's
+# WORKSPACE_NAME. The "is my singleton already running?" checks then match only THIS project's
+# agent. Sanitize WORKSPACE_NAME to a safe slug ([A-Za-z0-9_-]) for use as an agent/tab identifier.
+_HERD_WS_SLUG="$(printf '%s' "$WORKSPACE_NAME" | tr -c 'A-Za-z0-9_-' '-')"
+[ -n "$_HERD_WS_SLUG" ] || _HERD_WS_SLUG="project"
+HERD_AGENT_COORDINATOR="coordinator-$_HERD_WS_SLUG"
+HERD_AGENT_SCRIBE="scribe-$_HERD_WS_SLUG"
+HERD_AGENT_RESEARCHER="researcher-$_HERD_WS_SLUG"
+HERD_TAB_COORDINATOR="coordinator-$_HERD_WS_SLUG"
+unset _HERD_WS_SLUG

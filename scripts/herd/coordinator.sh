@@ -4,7 +4,7 @@
 #     [  live BACKLOG    |   coordinator Claude running the /coordinator skill  ]
 #       (left, always on)    (right, prompts you: implement / browse / add)
 #
-# Idempotent: closes any existing "coordinator" tab first, so you can re-run it anytime to get a
+# Idempotent: closes this project's existing coordinator tab first, so you can re-run it anytime to get a
 # fresh control room. The left pane stays pinned to the backlog; the right pane is where you drive
 # work and spin up feature sub-agents. The 🐑 herd-watch console is pinned below the coordinator
 # (auto-merges ready PRs, healthcheck + review gated) unless suppressed.
@@ -23,13 +23,14 @@ REPO="$PROJECT_ROOT"
 . "$HERE/herd-preflight.sh"
 herd_preflight || exit 1
 
-# 1. Close an existing coordinator tab (clean relaunch).
-existing=$(herdr tab list | python3 -c \
-  'import sys,json; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")=="coordinator"), ""))')
+# 1. Close THIS project's existing coordinator tab (clean relaunch). Matched on the project-scoped
+#    label so we never close another project's coordinator sharing this herdr.
+existing=$(herdr tab list | LABEL="$HERD_TAB_COORDINATOR" python3 -c \
+  'import sys,json,os; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")==os.environ["LABEL"]), ""))')
 [ -n "$existing" ] && herdr tab close "$existing" >/dev/null 2>&1 || true
 
 # 2. Fresh coordinator tab; grab its tab id + root pane id + workspace id.
-created=$(herdr tab create --cwd "$REPO" --label coordinator --focus)
+created=$(herdr tab create --cwd "$REPO" --label "$HERD_TAB_COORDINATOR" --focus)
 read -r TAB ROOT WS < <(printf '%s' "$created" | python3 -c \
   'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"], d["tab"]["workspace_id"])')
 
@@ -40,7 +41,7 @@ herdr workspace rename "$WS" "$WORKSPACE_NAME" >/dev/null 2>&1 || true
 herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null
 
 # 4. Right pane = coordinator Claude, auto-running the generated coordinator skill.
-started=$(herdr agent start coordinator --cwd "$REPO" --tab "$TAB" --split right -- claude "$COORDINATOR_CMD")
+started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --cwd "$REPO" --tab "$TAB" --split right -- claude "$COORDINATOR_CMD")
 AGENT_PANE=$(printf '%s' "$started" | python3 -c \
   'import sys,json; print(json.load(sys.stdin)["result"]["agent"]["pane_id"])')
 
@@ -57,4 +58,4 @@ else
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ]   tab $TAB"
 fi
 
-echo "   jump to it:   herdr agent focus coordinator"
+echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"

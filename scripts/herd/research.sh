@@ -4,7 +4,7 @@
 # capturing the printed REQ_ID so it can fetch the report later with research-get.sh.
 #
 # Model: every request is a file in $WORKTREES_DIR/research-queue/. A single drainer (a Claude
-# named "researcher") fans out Explore subagents over the repo, writes a per-request findings
+# named "researcher-<WORKSPACE_NAME>") fans out Explore subagents over the repo, writes a per-request findings
 # report, and reports back peripherally — a herdr notification + the .research-reports inbox.
 # Fire several questions in a row; the one drainer batches through them.
 #
@@ -62,9 +62,11 @@ echo "🔎 queued: $REQ"
 echo "REQ_ID $REQ_ID"
 echo "report → $REPORTS/$REQ_ID.md  (fetch with: research-get.sh $REQ_ID)"
 
-# 5. A live researcher drainer already running? It'll pick this up from the queue.
-if herdr agent list 2>/dev/null | python3 -c 'import sys,json
-sys.exit(0 if any(x.get("name")=="researcher" for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
+# 5. Is THIS project's researcher drainer already running? Match the project-scoped name so two
+#    projects in one herdr each spawn their OWN drainer (a global "researcher" match would let
+#    project B see project A's researcher and never start its own → B's queue would never drain).
+if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_RESEARCHER" python3 -c 'import sys,json,os
+sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
   echo "🔎 researcher already running — it will drain this."; exit 0
 fi
 
@@ -92,7 +94,7 @@ Use research-step.sh for all queue/report mechanics. Read-only always: never wri
 never git, never switch branches.
 EOF
 )
-created=$(herdr tab create --cwd "$REPO" --label researcher --no-focus)
+created=$(herdr tab create --cwd "$REPO" --label "$HERD_AGENT_RESEARCHER" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herdr agent start researcher --cwd "$REPO" --tab "$TAB" --no-focus --env "RESEARCH_TAB=$TAB" -- claude --model "$RESEARCH_MODEL" $CLAUDE_FLAGS "$PROMPT"
+herdr agent start "$HERD_AGENT_RESEARCHER" --cwd "$REPO" --tab "$TAB" --no-focus --env "RESEARCH_TAB=$TAB" -- claude --model "$RESEARCH_MODEL" $CLAUDE_FLAGS "$PROMPT"
 echo "🔎 researcher drainer dispatched (tab $TAB). Coordinator is free; fetch the report with research-get.sh $REQ_ID."

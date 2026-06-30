@@ -3,7 +3,7 @@
 # scribe drainer is running. The coordinator calls this and returns to you instantly.
 #
 # Model: every request is a file in $WORKTREES_DIR/backlog-queue/. A single drainer (a Claude
-# named "scribe") edits $BACKLOG_FILE, commits straight to the default branch, and reports back
+# named "scribe-<WORKSPACE_NAME>") edits $BACKLOG_FILE, commits straight to the default branch, and reports back
 # peripherally — live "✍️ JUST SCRIBED" banner + a herdr notification + the .scribe-reports
 # inbox. Fire several requests in a row; the one drainer batches through them. Concurrency-safe:
 # atomic per-file claim, git push serializes writes, the user's manual edits survive via
@@ -51,9 +51,11 @@ else
   trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
 fi
 
-# 3. A live scribe drainer already running? It'll pick this up from the queue.
-if herdr agent list 2>/dev/null | python3 -c 'import sys,json
-sys.exit(0 if any(x.get("name")=="scribe" for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
+# 3. Is THIS project's scribe drainer already running? Match the project-scoped name so two
+#    projects in one herdr each spawn their OWN drainer (a global "scribe" match would let project
+#    B see project A's scribe and never start its own → B's queue would never drain).
+if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_SCRIBE" python3 -c 'import sys,json,os
+sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
   echo "✍️  scribe already running — it will drain this."; exit 0
 fi
 
@@ -100,7 +102,7 @@ Use scribe-step.sh for all mechanics. Never edit files or switch branches.
 EOF
 )
 fi
-created=$(herdr tab create --cwd "$REPO" --label scribe --no-focus)
+created=$(herdr tab create --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herdr agent start scribe --cwd "$REPO" --tab "$TAB" --no-focus --env "SCRIBE_TAB=$TAB" -- claude --model "$SCRIBE_MODEL" $CLAUDE_FLAGS "$PROMPT"
+herdr agent start "$HERD_AGENT_SCRIBE" --cwd "$REPO" --tab "$TAB" --no-focus --env "SCRIBE_TAB=$TAB" -- claude --model "$SCRIBE_MODEL" $CLAUDE_FLAGS "$PROMPT"
 echo "✍️  scribe drainer dispatched (tab $TAB). Coordinator is free; watch for the JUST SCRIBED banner."
