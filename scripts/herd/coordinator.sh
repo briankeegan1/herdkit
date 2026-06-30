@@ -23,29 +23,46 @@ REPO="$PROJECT_ROOT"
 . "$HERE/herd-preflight.sh"
 herd_preflight || exit 1
 
-# 1. Close THIS project's existing coordinator tab (clean relaunch). Matched on the project-scoped
-#    label so we never close another project's coordinator sharing this herdr.
-existing=$(herdr tab list | LABEL="$HERD_TAB_COORDINATOR" python3 -c \
-  'import sys,json,os; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")==os.environ["LABEL"]), ""))')
-[ -n "$existing" ] && herdr tab close "$existing" >/dev/null 2>&1 || true
+# 1. Resolve THIS project's OWN herdr workspace (labeled $WORKSPACE_NAME) — reuse if it already
+#    exists, otherwise create a dedicated one. This is the multi-tenancy fix: every project gets its
+#    own workspace, so launching project B's coordinator never lands in (or renames) project A's
+#    ambient/focused workspace. We match on the project-scoped label and only ever touch a workspace
+#    we created or that is already ours — never the ambient one.
+WS=$(herdr workspace list | LABEL="$WORKSPACE_NAME" python3 -c \
+  'import sys,json,os; d=json.load(sys.stdin); print(next((w["workspace_id"] for w in d["result"]["workspaces"] if w.get("label")==os.environ["LABEL"]), ""))')
 
-# 2. Fresh coordinator tab; grab its tab id + root pane id + workspace id.
-created=$(herdr tab create --cwd "$REPO" --label "$HERD_TAB_COORDINATOR" --focus)
-read -r TAB ROOT WS < <(printf '%s' "$created" | python3 -c \
-  'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"], d["tab"]["workspace_id"])')
+if [ -n "$WS" ]; then
+  # 1a. REUSE: our workspace already exists. Focus it (bring it forward), then do a clean relaunch by
+  #     closing our existing coordinator tab — scoped to THIS workspace via `--workspace`, so we never
+  #     close another project's coordinator tab that happens to share the same project-scoped label.
+  herdr workspace focus "$WS" >/dev/null 2>&1 || true
+  existing=$(herdr tab list --workspace "$WS" | LABEL="$HERD_TAB_COORDINATOR" python3 -c \
+    'import sys,json,os; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")==os.environ["LABEL"]), ""))')
+  [ -n "$existing" ] && herdr tab close "$existing" >/dev/null 2>&1 || true
+  # Fresh coordinator tab INSIDE our workspace (explicit --workspace, not the ambient one).
+  created=$(herdr tab create --workspace "$WS" --cwd "$REPO" --label "$HERD_TAB_COORDINATOR" --focus)
+  read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])')
+else
+  # 1b. CREATE: no workspace for this project yet. Create one with the right label up front (no
+  #     post-hoc rename of the ambient workspace). Its root tab becomes the coordinator tab — relabel
+  #     it so future relaunches (1a) can find + close it. We reuse the root pane/tab the create
+  #     returns rather than spawning an extra tab, so a fresh workspace has no orphan default tab.
+  created=$(herdr workspace create --cwd "$REPO" --label "$WORKSPACE_NAME" --focus)
+  read -r WS TAB ROOT < <(printf '%s' "$created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["workspace"]["workspace_id"], d["tab"]["tab_id"], d["root_pane"]["pane_id"])')
+  herdr tab rename "$TAB" "$HERD_TAB_COORDINATOR" >/dev/null 2>&1 || true
+fi
 
-# Name the workspace for this project.
-herdr workspace rename "$WS" "$WORKSPACE_NAME" >/dev/null 2>&1 || true
-
-# 3. Left (root) pane = pinned live backlog viewer.
+# 2. Left (root) pane = pinned live backlog viewer.
 herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null
 
-# 4. Right pane = coordinator Claude, auto-running the generated coordinator skill.
+# 3. Right pane = coordinator Claude, auto-running the generated coordinator skill.
 started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --cwd "$REPO" --tab "$TAB" --split right -- claude "$COORDINATOR_CMD")
 AGENT_PANE=$(printf '%s' "$started" | python3 -c \
   'import sys,json; print(json.load(sys.stdin)["result"]["agent"]["pane_id"])')
 
-# 5. Pin the live herd-watch console BELOW the coordinator (auto-merges ready PRs, gated). Skip
+# 4. Pin the live herd-watch console BELOW the coordinator (auto-merges ready PRs, gated). Skip
 #    with HERD_NO_WATCH=1; status-only with AGENT_WATCH_DRYRUN=1.
 if [ "${HERD_NO_WATCH:-}" != "1" ]; then
   split=$(herdr pane split "$AGENT_PANE" --direction down --ratio 0.72 \
