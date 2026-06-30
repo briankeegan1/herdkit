@@ -134,10 +134,21 @@ cmd_init() {
     fi
   else
     say "  No BACKLOG.md / TODO.md / CHANGELOG found."
+    # A .github/ dir (surfaced by scout as tracker=github) makes GitHub Issues the natural default.
+    local gh_hint="" def_choice="1"
+    case "$tracker" in *github*) gh_hint=" (detected .github/)"; def_choice="2" ;; esac
     local choice
-    choice="$(ask "Tracker: [1] create BACKLOG.md (recommended)  [2] GitHub Issues (coming soon)  [3] file backend at a custom path" "1")"
+    choice="$(ask "Tracker: [1] create BACKLOG.md (recommended)  [2] GitHub Issues$gh_hint  [3] file backend at a custom path" "$def_choice")"
     case "$choice" in
-      2) warn "GitHub-Issues backend is a Phase 3 target — falling back to a file BACKLOG.md for now."; make_backlog=1 ;;
+      2)
+        if command -v gh >/dev/null 2>&1; then
+          backend="github"
+          ok "GitHub Issues work tracker (SCRIBE_BACKEND=github) — items become issues; no BACKLOG.md."
+        else
+          warn "GitHub Issues selected but 'gh' CLI not found — falling back to a file BACKLOG.md."
+          make_backlog=1
+        fi
+        ;;
       3) backlog_file="$(ask "BACKLOG_FILE (repo-relative)" "BACKLOG.md")"; make_backlog=1 ;;
       *) make_backlog=1 ;;
     esac
