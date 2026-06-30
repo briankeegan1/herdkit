@@ -7,6 +7,10 @@ set -euo pipefail
 NAME="${1:?usage: new-feature.sh <feature-name>   (e.g. new-feature.sh dividend-history)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Fail fast if herdr is missing or its CLI/JSON contract has skewed before we set up a worktree
+# that the lanes (which all shell out to herdr) would then fail to drive.
+. "$HERE/herd-preflight.sh"
+herd_preflight || exit 1
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 BRANCH="feat/$NAME"
