@@ -17,7 +17,18 @@ HERDKIT_CONTRACT_VERSION=1
 set -euo pipefail
 
 # Resolve the herdkit install root from this script's location (bin/herd → repo root).
-HERDKIT_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+# Follow any chain of symlinks to the REAL file first, so the documented symlink install
+# (e.g. ln -s ~/source/herdkit/bin/herd /opt/homebrew/bin/herd) derives home from the real
+# location, not the symlink's dir. macOS readlink has no -f, so resolve in pure bash.
+herd_src="${BASH_SOURCE[0]}"
+while [ -L "$herd_src" ]; do
+  herd_target="$(readlink "$herd_src")"
+  case "$herd_target" in
+    /*) herd_src="$herd_target" ;;
+    *)  herd_src="$(cd "$(dirname "$herd_src")" && cd "$(dirname "$herd_target")" && pwd)/$(basename "$herd_target")" ;;
+  esac
+done
+HERDKIT_HOME="$(cd "$(dirname "$herd_src")/.." && pwd)"
 SCRIPTS_DIR="$HERDKIT_HOME/scripts/herd"
 TEMPLATES_DIR="$HERDKIT_HOME/templates"
 
