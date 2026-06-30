@@ -72,6 +72,7 @@ Other commands:
 
 ```sh
 herd upgrade                 # bump the engine pin + re-render the skill, keeping your answers
+herd backlog                 # list open work items via the active backend (see below)
 herd report "<symptom + lane>"   # file an engine bug as a gh issue on HERD_REPO (see below)
 ```
 
@@ -125,6 +126,29 @@ coordinator drains those issues, fixes once, cuts a release, and every consumer 
 lane. The coordinator skill carries this routing rule.)
 
 ---
+
+## Drain the work source — `herd backlog`
+
+`herd backlog` prints the project's **OPEN work items** through the active `SCRIBE_BACKEND`,
+so the same command answers "what's my open work?" regardless of where the tracker lives:
+
+- **`file`** (default) — greps `BACKLOG_FILE` for queued (🔜) / in-progress (🚧) items.
+- **`github`** — runs `gh issue list --state open`.
+- **`linear`** — queries Linear for issues whose state isn't completed/canceled.
+
+Every backend emits the same one-line `#<id> <title>` shape, so a non-file project surfaces
+its issue tracker as actionable work rather than a tracked file:
+
+```sh
+$ herd backlog
+#8 [herdkit] README: add a usage example for 'herd backlog'. Lane: docs.
+#5 watcher: re-verify MERGEABLE in the instant before merge. Lane: app.
+```
+
+This is how a coordinator **drains its tracker as the work source**: it lists open items via
+the backend, picks one, and delegates it to a lane. Combined with `herd report` (which files an
+engine bug as an issue on `HERD_REPO`), it closes the cross-repo dispatch loop — a consumer
+reports out, the herdkit coordinator drains those issues with `herd backlog`, and ships the fix.
 
 ## Work-tracker backends
 
