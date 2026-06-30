@@ -153,10 +153,27 @@ cmd_init() {
       *) make_backlog=1 ;;
     esac
   fi
-  # Explicit opt-in for an API backend (stubbed as "coming soon" in v1).
-  local api; api="$(ask "Do you use Linear / Jira / Azure DevOps? (name one, or blank)" "")"
+  # Explicit opt-in for an API backend. Linear ships (Phase 3) when a key is available; the other
+  # API trackers remain "coming soon" and fall back to the file backend.
+  local api linear_key=""; api="$(ask "Do you use Linear / Jira / Azure DevOps? (name one, or blank)" "")"
   if [ -n "$api" ]; then
-    warn "$api adapter is 'coming soon' (Phase 3). v1 ships file backends only — using the file backend; you can switch SCRIBE_BACKEND later and add creds to .herd/secrets."
+    case "$(printf '%s' "$api" | tr '[:upper:]' '[:lower:]')" in
+      *linear*)
+        # Prefer a key already in the environment; else prompt. The key is stored in .herd/secrets
+        # (gitignored) below — NEVER echoed into .herd/config.
+        linear_key="${LINEAR_API_KEY:-}"
+        [ -n "$linear_key" ] || linear_key="$(ask "Linear API key (→ .herd/secrets, gitignored; blank to skip)" "")"
+        if [ -n "$linear_key" ]; then
+          backend="linear"; make_backlog=""   # API backend — no tracked file to seed.
+          ok "Linear work tracker (SCRIBE_BACKEND=linear) — items become Linear issues; key → .herd/secrets."
+        else
+          warn "Linear selected but no API key provided — using the file backend for now; add LINEAR_API_KEY to .herd/secrets and set SCRIBE_BACKEND=linear later."
+        fi
+        ;;
+      *)
+        warn "$api adapter is 'coming soon' (Phase 3). v1 ships file backends only — using the file backend; you can switch SCRIBE_BACKEND later and add creds to .herd/secrets."
+        ;;
+    esac
   fi
 
   # 4. Health + preview.
@@ -208,6 +225,22 @@ WATCHER_AUTOMERGE="true"
 HERD_REPO="$herd_repo"
 EOF
   ok "wrote $cfg"
+
+  # API-backend credentials live in .herd/secrets (gitignored), never in the committed config.
+  if [ "$backend" = "linear" ] && [ -n "$linear_key" ]; then
+    local secrets="$project_root/.herd/secrets"
+    {
+      printf '# .herd/secrets — API-backend credentials. GITIGNORED. Never commit.\n'
+      printf 'LINEAR_API_KEY=%q\n' "$linear_key"
+    } > "$secrets"
+    chmod 600 "$secrets" 2>/dev/null || true
+    ok "wrote $secrets (gitignored)"
+    local gi="$project_root/.gitignore"
+    if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
+      printf '.herd/secrets\n' >> "$gi"
+      ok "added .herd/secrets to .gitignore"
+    fi
+  fi
 
   # Seed a BACKLOG.md if we promised to create one.
   if [ -n "$make_backlog" ] && [ ! -f "$project_root/$backlog_file" ]; then
