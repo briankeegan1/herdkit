@@ -7,8 +7,9 @@
 #                   discover the work tracker, write .herd/config, render the coordinator skill.
 #   herd upgrade    re-render the coordinator skill from the current template + bump HERD_VERSION,
 #                   PRESERVING the project's .herd/config answers; warn on newly-added keys.
-#   herd report     file a cross-repo gh issue against HERD_REPO (the herdkit repo), stamped with
-#                   this project + the lane involved + the version pin.
+#   herd report     file a cross-repo issue against HERD_REPO (the herdkit repo) via the report
+#                   backend (HERD_REPORT_BACKEND, default github), stamped with this project +
+#                   the lane involved + the version pin. Dedups against open items before filing.
 #   herd render     (internal) re-render only the coordinator skill from .herd/config.
 #
 # Engine contract version this CLI ships.
@@ -337,28 +338,115 @@ cmd_backlog() {
   _backend_list_open
 }
 
+# ── herd report dedup helpers (pure shell — no LLM dependency) ──────────────────────────────────
+# A semantic/LLM-judged dedup pass could be a later enhancement; these stay heuristic + offline.
+_report_norm() {
+  # Normalize a title for comparison: lowercase, strip punctuation to spaces, collapse runs.
+  # Prints a single space-delimited token stream (may have a leading/trailing space).
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' ' ' | tr -s ' '
+}
+
+_report_find_dups() {
+  # $1 = the new report title; $2 = newline-separated open items ("#<id> <title>" or backlog
+  # lines). Prints each open item judged a LIKELY duplicate: a normalized substring match
+  # (either direction) or >=60% overlap of the new title's significant (>=3-char) words.
+  local new="$1" items="$2" new_norm cand cand_norm w total hit
+  new_norm="$(_report_norm "$new")"; new_norm="${new_norm# }"; new_norm="${new_norm% }"
+  [ -n "$new_norm" ] || return 0
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    cand_norm="$(_report_norm "$cand")"; cand_norm="${cand_norm# }"; cand_norm="${cand_norm% }"
+    [ -n "$cand_norm" ] || continue
+    # Whole-title substring either direction → strong signal.
+    case " $cand_norm " in *" $new_norm "*) printf '%s\n' "$cand"; continue ;; esac
+    case " $new_norm "  in *" $cand_norm "*) printf '%s\n' "$cand"; continue ;; esac
+    # Keyword overlap: fraction of the new title's significant words present in the candidate.
+    total=0; hit=0
+    for w in $new_norm; do
+      [ "${#w}" -ge 3 ] || continue
+      total=$((total + 1))
+      case " $cand_norm " in *" $w "*) hit=$((hit + 1)) ;; esac
+    done
+    [ "$total" -gt 0 ] && [ $((hit * 10)) -ge $((total * 6)) ] && printf '%s\n' "$cand"
+  done <<EOF
+$items
+EOF
+  return 0   # never let a no-match (false && chain) propagate as failure under set -e
+}
+
 cmd_report() {
   local symptom="${1:-}"
   [ -n "$symptom" ] || die "usage: herd report \"<symptom + which lane>\""
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
-  local repo="briankeegan1/herdkit" project ver
-  if [ -f "$cfg" ]; then
-    repo="$(. "$cfg"; printf '%s' "${HERD_REPO:-briankeegan1/herdkit}")"
-    project="$(. "$cfg"; printf '%s' "${WORKSPACE_NAME:-$(basename "$root")}")"
-    ver="$(. "$cfg"; printf '%s' "${HERD_VERSION:-?}")"
-  else
-    project="$(basename "$root")"; ver="?"
-  fi
-  command -v gh >/dev/null 2>&1 || die "gh CLI not found — needed to file a cross-repo issue"
-  local body
+  # Load the project's answers through the shared loader (HERD_REPO, WORKSPACE_NAME, HERD_VERSION,
+  # …). Pin it to this repo's config when present so the loader doesn't walk elsewhere. Capture any
+  # env HERD_REPORT_BACKEND first so env wins over a config value.
+  local env_backend="${HERD_REPORT_BACKEND:-}"
+  [ -f "$cfg" ] && export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # API report backends (e.g. linear) read credentials from .herd/secrets (gitignored); github does
+  # not. Best-effort + absent-file-safe, mirroring cmd_backlog / scribe-step.sh.
+  local secrets="$PROJECT_ROOT/.herd/secrets"
+  # shellcheck source=/dev/null
+  [ -f "$secrets" ] && . "$secrets"
+  local project ver
+  project="${WORKSPACE_NAME:-$(basename "$root")}"
+  ver="${HERD_VERSION:-?}"
+  # HERD_REPO names the GitHub repo engine bugs escalate to; preserve the historical default.
+  : "${HERD_REPO:=briankeegan1/herdkit}"
+
+  # Report backend (distinct from SCRIBE_BACKEND, which tracks THIS project's own work): `herd
+  # report` files an ENGINE bug on HERD_REPO, a GitHub repo, so default github — preserving today's
+  # behavior exactly. Env wins, then config, then the github default.
+  local report_backend="${env_backend:-${HERD_REPORT_BACKEND:-github}}"
+  local backend_file="$SCRIPTS_DIR/backends/${report_backend}.sh"
+  [ -f "$backend_file" ] \
+    || die "unknown HERD_REPORT_BACKEND '$report_backend' — no backends/${report_backend}.sh"
+  # shellcheck source=/dev/null
+  . "$backend_file"
+  command -v _backend_add_item >/dev/null 2>&1 \
+    || die "report backend '$report_backend' defines no _backend_add_item op"
+  command -v _backend_list_open >/dev/null 2>&1 \
+    || die "report backend '$report_backend' defines no _backend_list_open op"
+
+  local title body report_text
+  title="[$project] $symptom"
   body="$(printf 'Reported from project **%s** (HERD_VERSION %s) via \`herd report\`.\n\n**Symptom / lane:** %s\n\n_Stamped automatically; add a repro below._' "$project" "$ver" "$symptom")"
-  say "Filing engine bug on ${c_bold}$repo${c_rst}…"
-  gh issue create -R "$repo" \
-    --title "[$project] $symptom" \
-    --body "$body" \
-    --label "herd-engine" 2>/dev/null \
-  || gh issue create -R "$repo" --title "[$project] $symptom" --body "$body"
+  # The first line is the issue title (the github/linear backends take head -n1 as the title).
+  report_text="$(printf '%s\n\n%s' "$title" "$body")"
+
+  # ── Dedup BEFORE filing — compare the title against open items on the target ──────────────────
+  # Best-effort: a list failure (e.g. a missing dep) is non-fatal here; the add path below surfaces
+  # any dep error loudly. HERD_REPORT_FORCE=1 skips the check entirely.
+  if [ -z "${HERD_REPORT_FORCE:-}" ]; then
+    local open_items dup_hits
+    open_items="$(_backend_list_open 2>/dev/null)" || true
+    dup_hits="$(_report_find_dups "$title" "$open_items")"
+    if [ -n "$dup_hits" ]; then
+      warn "possible duplicate(s) already open on $HERD_REPO:"
+      printf '%s\n' "$dup_hits" >&2
+      if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+        local ans; ans="$(ask "File anyway? [f]ile / [c]ancel" "c")"
+        case "$ans" in
+          f|F|file) say "filing anyway…" ;;
+          *) say "cancelled — not filing (matched an open item above)"; return 0 ;;
+        esac
+      else
+        warn "not filing a likely duplicate — re-run with HERD_REPORT_FORCE=1 to file anyway"
+        return 0
+      fi
+    fi
+  fi
+
+  say "Filing engine bug on ${c_bold}$HERD_REPO${c_rst} via the ${report_backend} backend…"
+  _BACKEND_RESULT=""
+  _backend_add_item "report" "$report_text"
+  case "${_BACKEND_RESULT:-}" in
+    DONE) ok "filed." ;;
+    *)    warn "backend reported no change (${_BACKEND_RESULT:-?}) — nothing filed" ;;
+  esac
 }
 
 usage() {
@@ -369,7 +457,8 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd upgrade              bump HERD_VERSION + re-render the coordinator skill (keeps answers)
   herd render               re-render only the coordinator skill from .herd/config
   herd backlog              list open work items via the active backend (file/github/linear)
-  herd report "<symptom>"   file an engine bug as a gh issue on HERD_REPO
+  herd report "<symptom>"   file an engine bug on HERD_REPO via HERD_REPORT_BACKEND (default
+                            github); dedups against open items first (HERD_REPORT_FORCE=1 forces)
   herd help                 this help
 
 Engine scripts: $SCRIPTS_DIR
