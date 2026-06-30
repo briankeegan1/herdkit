@@ -14,6 +14,13 @@
 - 🔜 **`herd upgrade` versioned migrations** — `migrations/vN→vM.sh` that transform a consumer's config/hooks to a new engine contract, so breaking engine changes are inherited without clobbering custom setup (engine stays pristine; only config + override hooks are local).
 - 🔜 **Cross-repo dependency-loop SIMULATION** — dry-run the full A→B loop (file → build → ship → detect-done → `herd upgrade` → unblock) with existing primitives + thin stand-ins, to validate the design and produce a gap report BEFORE building the machinery above. Doubles as a Phase-4 brownfield test (stand up a structurally-different "Repo A").
 
+## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
+
+- 🔜 **Dispatch vs. dependency intent** — separate `herd report --to B` (fire-and-forget issue, default) from `herd report --to B --dep` / `herd depend B#id` (also records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, so a misclassified or no-longer-blocking dependency is never stuck.
+- 🔜 **Watcher flexibility for long-pending deps** — backoff polling for old deps; richer dep states (`open / in-review / in-progress / stalled / closed`); surface `stalled` (open, no activity > N days) + optional TTL so a slow enterprise PR never silently rots or busy-polls. A `blocked-on` is a status line, never a workspace freeze.
+- 🔜 **Configurable watcher views** — lenses `mine | all | deps | review-queue` + filters (author/assignee/label/status); default view in `.herd/config`. Lets a teammate watch the whole repo's PRs, not just their own.
+- 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + an ownership/assignee filter (`_backend_list_open --mine`); auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the shipped required-checks gate (PR #5). `solo` default today; `team` is a config flip, not a rewrite.
+
 ## Someday / Deferred
 
 - 🔜 **Phase 4: onboard an external consumer** — `herd init` against a genuinely different repo (web server/library, not another shell project); the real abstraction test (§8).
