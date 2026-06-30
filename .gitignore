@@ -5,3 +5,4 @@
 
 # worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo)
 *-trees/
+.claude/settings.local.json   # machine-local permission grants — never commit
