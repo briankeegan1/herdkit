@@ -48,7 +48,9 @@
 # Renders ONLY when the computed frame changes — an idle pane never repaints. Polls every ~4s.
 set -u
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# BASH_SOURCE (not $0) so HERE resolves correctly whether this file is executed or sourced
+# (the hermetic test sources it to exercise the pure merge-decision helper).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
@@ -140,6 +142,19 @@ already_merged() {
   grep -q "^[0-9][0-9]* $1 $2\$" "$STATE" 2>/dev/null
 }
 
+# _should_automerge <mergeStateStatus> — the pure merge-readiness predicate. GitHub computes
+# mergeStateStatus by folding in ALL branch-protection gates, so the watcher auto-merges ONLY when
+# it reports CLEAN (every required review/CODEOWNERS approval present, branch up to date, every
+# required status check green). Any other state is a HOLD, never a human-action error:
+#   BLOCKED  — required reviews / CODEOWNERS not yet satisfied
+#   BEHIND   — branch out of date with base
+#   UNSTABLE — a required status check is pending or failing
+#   plus DIRTY/DRAFT/HAS_HOOKS/UNKNOWN/empty/anything else.
+# Returns 0 (merge) ONLY for CLEAN; non-zero (hold, re-evaluate next tick) otherwise.
+_should_automerge() {
+  [ "${1:-}" = "CLEAN" ]
+}
+
 # resolver_attempted <branch> — the resolve-loop guard.
 resolver_attempted() {
   [ -s "$RESOLVE_STATE" ] || return 1
@@ -196,6 +211,11 @@ print(next((t["tab_id"] for t in d.get("result",{}).get("tabs",[]) if t.get("lab
   return 0
 }
 
+# Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
+# merge-decision predicate _should_automerge — WITHOUT entering the live watch loop. Direct
+# execution runs the loop normally.
+if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
 while true; do
   build_header
   build_landed
@@ -250,7 +270,7 @@ EOF
       DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}${word}${C_RESET}"
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
-    elif [ "$mergeable" = "MERGEABLE" ] && [ "$mstate" = "CLEAN" ]; then
+    elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
       DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}health-check${C_RESET}"
       CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch")
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
@@ -262,6 +282,12 @@ EOF
         DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · conflict${C_RESET}"
         CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch")
       fi
+    elif [ "$mergeable" = "MERGEABLE" ]; then
+      # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
+      # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
+      # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
+      # is transient, NOT a human-action error, so no ⚠️ "needs you".
+      DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
     else
       reason="not mergeable (${mstate})"
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · ${reason}${C_RESET}"
@@ -306,9 +332,15 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       render
       continue
     fi
-    if [ "$rmergeable" != "MERGEABLE" ] || [ "$rmstate" != "CLEAN" ]; then
-      if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
+    if [ "$rmergeable" != "MERGEABLE" ] || ! _should_automerge "$rmstate"; then
+      if [ "$rmergeable" = "MERGEABLE" ]; then
+        # Still conflict-free but a gate regressed since classification (e.g. a required check went
+        # pending, or the branch fell BEHIND): soft-hold, re-evaluate next tick — not a ⚠️.
+        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}blocked · awaiting required checks/reviews (${rmstate:-?})${C_RESET}"
+      else
+        if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
+        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
+      fi
       render
       continue
     fi
