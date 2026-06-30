@@ -6,7 +6,7 @@
 
 ## Now
 
-- 🔜 **Phase 3: feedback loop wiring** — now unblocked by the GitHub-Issues backend: wire the wB coordinator to drain `gh issue list` on the herdkit repo as a backlog source (via `_backend_list_open`), reproduce → fix via its own feature lane → cut a release `vX.Y`; consumers adopt via `herd upgrade`. Closes the cross-repo maintenance loop. *(Natural first task once herdkit self-hosts — it IS the dogfood loop.)*
+- 🔜 **Backend-agnostic `herd report` (cross-repo dispatch optionality)** — the drain side (`herd backlog` / `_backend_list_open`) is now tracker-agnostic (file / GitHub Issues / Linear), but the *dispatch* side `herd report` still hardcodes `gh issue create`. Route it through the same 3-op adapter (`_backend_add_item` on the TARGET tracker, e.g. a `HERD_REPORT_BACKEND` / the engine repo's configured backend) so a cross-repo request can land in GitHub Issues **or Linear/Jira** — matching the agnostic drain. Closes the file-anywhere ↔ drain-anywhere symmetry.
 
 ## Someday / Deferred
 
@@ -15,9 +15,10 @@
 
 ## Recently shipped
 
-- ✅ **Linear backend** — `backends/linear.sh` (`SCRIBE_BACKEND=linear`): 3-op contract over the Linear GraphQL API; key isolated to gitignored `.herd/secrets` (never in config); `herd init` promotes it when a key is supplied. *(PR #6)*
-- ✅ **Watcher honors required checks / CODEOWNERS** — auto-merge now gates on `mergeStateStatus=CLEAN` (folds in required reviews/checks/up-to-date); holds BLOCKED/BEHIND/UNSTABLE instead of merging. *(PR #5)*
-- ✅ **GitHub-Issues backend** — `backends/github.sh` (`SCRIBE_BACKEND=github`): 3-op contract over `gh issue create/comment/close/list`; `herd init` promotes it on `.github/` detection. Live-API smoke verified. *(PR #3)*
-- ✅ **herdr version/contract preflight** — `herd-preflight.sh` fails fast when herdr is missing or its CLI/JSON shape skewed, before any lane touches it. *(PR #2, risk §8)*
-- ✅ **Leak-guard** — healthcheck step + test that fails on any single-consumer literal leaking into the generic engine. *(PR #1, risk §8)*
-- ✅ **Phase 2: scaffold the standalone repo** — generic engine, `herd` CLI (`init`/`upgrade`/`report`), templates, dogfood config + coordinator skill.
+- ✅ **Feedback loop — `herd backlog` drains the active backend** + `herd.sh` launcher: a project's coordinator reads open work from its tracker (file/github/linear) via `_backend_list_open`, so issues become the work source. *(PR #7)*
+- ✅ **Linear backend** — `backends/linear.sh` (`SCRIBE_BACKEND=linear`): 3-op contract over Linear GraphQL; key isolated to gitignored `.herd/secrets`. *(PR #6)*
+- ✅ **Watcher honors required checks / CODEOWNERS** — auto-merge gates on `mergeStateStatus=CLEAN`. *(PR #5)*
+- ✅ **GitHub-Issues backend** — `backends/github.sh`; live-API smoke verified. *(PR #3)*
+- ✅ **herdr version/contract preflight** — fail fast on missing/skewed herdr. *(PR #2, risk §8)*
+- ✅ **Leak-guard** — healthcheck fails on single-consumer literals in the engine. *(PR #1, risk §8)*
+- ✅ **Phase 2: scaffold the standalone repo** — generic engine, `herd` CLI, templates, dogfood config.
