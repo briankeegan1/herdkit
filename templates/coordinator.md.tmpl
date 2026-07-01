@@ -97,6 +97,22 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
+### Approve pending merges (MERGE_POLICY=approve)
+
+When `.herd/config` sets `MERGE_POLICY=approve`, the watcher runs the full healthcheck + review
+pipeline but holds before merging — posting a PR comment and a notification once per commit sha.
+To approve and trigger merge:
+
+```
+bash {{SCRIPTS_DIR}}/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash {{SCRIPTS_DIR}}/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+```
+
+Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
+the prior approval — the gate cycle re-runs and a fresh approval is required. The watcher shows
+`ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
+yet approved.
+
 ## Routing: APP bug vs HERD-ENGINE bug (read every time)
 
 Every reported problem routes to ONE of two places:

@@ -38,9 +38,14 @@
 # escalation preserved — the resolver aborts + escalates semantically-ambiguous conflicts; the
 # watcher NEVER blind-merges a conflict.
 #
-# WATCHER_AUTOMERGE (.herd/config, default "true"): when "false"/"no"/"off"/"0" the watcher runs
-# the full healthcheck + review pipeline but FLAGS the PR for human merge instead of merging
-# automatically — the human-in-the-loop lever.
+# MERGE_POLICY (.herd/config): three-way human-in-the-loop lever.
+#   auto    — current behavior: merge automatically after all gates pass.
+#   approve — run gates, then hold: record an awaiting-approval entry keyed by <pr#>+<headSha>
+#             in .agent-watch-approvals, post a PR comment + notification, and merge ONLY once
+#             an explicit approval record for that exact sha is written by herd-approve.sh.
+#             A new commit (new headSha) invalidates prior approval and restarts the gate cycle.
+#   observe — run gates and report/notify, but NEVER merge under any circumstances.
+# Back-compat: WATCHER_AUTOMERGE is still read when MERGE_POLICY is not set (true→auto, false→approve).
 #
 # DRY-RUN: AGENT_WATCH_DRYRUN=1 does everything EXCEPT the real merge / worktree remove / scribe /
 # ff-pull, and never spawns the reviewer/resolver or writes their state files.
@@ -64,11 +69,33 @@ RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
 # ONCE PER COMMIT — a recorded BLOCK is read back instead of re-spawning the reviewer; a recorded
 # PASS lets a retried merge skip straight to merging. A new commit changes the sha → fresh review.
 REVIEW_STATE="$TREES/.agent-watch-reviewed"
+# Approval ledger (MERGE_POLICY=approve|observe): one line per record, append-only.
+# Format: "<epoch> awaiting <pr#> <headSha>"  — watcher noted gates passed, awaiting human approval
+#         "<epoch> approved <pr#> <headSha>"  — herd-approve.sh wrote explicit approval for this sha
+#         "<epoch> observed <pr#> <headSha>"  — watcher notified in observe mode (dedup guard)
+APPROVALS="$TREES/.agent-watch-approvals"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
-# WATCHER_AUTOMERGE (from .herd/config, default "true"): when falsey, run the full pipeline but
-# flag the PR for human merge instead of merging automatically.
-case "${WATCHER_AUTOMERGE:-true}" in false|no|off|0) AUTOMERGE="" ;; *) AUTOMERGE=1 ;; esac
+
+# _effective_merge_policy — resolve "auto" | "approve" | "observe".
+# MERGE_POLICY takes precedence; falls back to legacy WATCHER_AUTOMERGE when unset/empty.
+_effective_merge_policy() {
+  case "${MERGE_POLICY:-}" in
+    auto|approve|observe) printf '%s' "${MERGE_POLICY}" ;;
+    *)
+      case "${WATCHER_AUTOMERGE:-true}" in
+        false|no|off|0) printf 'approve' ;;
+        *)              printf 'auto' ;;
+      esac ;;
+  esac
+}
+_pol="$(_effective_merge_policy)"
+AUTOMERGE=""; MERGE_OBSERVE=""
+case "$_pol" in
+  auto)    AUTOMERGE=1 ;;
+  observe) MERGE_OBSERVE=1 ;;
+esac
+unset _pol
 # This watcher's own worktree root — never auto-merge/remove the dir we run from.
 SELF_WT="$(cd "$HERE/../.." && pwd)"
 
@@ -183,6 +210,43 @@ record_review() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REVIEW_STATE"
 }
 
+# approval_awaiting_noted <pr#> <headSha> — true if we already recorded an awaiting-approval notice.
+approval_awaiting_noted() {
+  [ -s "$APPROVALS" ] || return 1
+  grep -q "^[0-9]* awaiting $1 $2$" "$APPROVALS" 2>/dev/null
+}
+
+# approval_is_approved <pr#> <headSha> — true if herd-approve.sh wrote an explicit approval.
+approval_is_approved() {
+  [ -s "$APPROVALS" ] || return 1
+  grep -q "^[0-9]* approved $1 $2$" "$APPROVALS" 2>/dev/null
+}
+
+# record_approval_awaiting <pr#> <headSha> — note gates passed; awaiting human approval.
+record_approval_awaiting() {
+  printf '%s awaiting %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
+# observe_noted <pr#> <headSha> — true if we already sent an observe-mode notification.
+observe_noted() {
+  [ -s "$APPROVALS" ] || return 1
+  grep -q "^[0-9]* observed $1 $2$" "$APPROVALS" 2>/dev/null
+}
+
+# record_observe_noted <pr#> <headSha> — note that we notified in observe mode.
+record_observe_noted() {
+  printf '%s observed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
+# _merge_method_flag — return the gh pr merge flag for the configured MERGE_METHOD.
+_merge_method_flag() {
+  case "${MERGE_METHOD:-merge}" in
+    squash) printf '%s' '--squash' ;;
+    rebase) printf '%s' '--rebase' ;;
+    *)      printf '%s' '--merge' ;;
+  esac
+}
+
 # spawn_resolver <slug> <pr#> <branch> — hand a newly-CONFLICTING PR to the isolated resolver.
 # Record-first keeps the loop guard sound; the spawn is best-effort.
 spawn_resolver() {
@@ -197,7 +261,7 @@ do_merge() {
   if [ -n "$DRYRUN" ]; then
     return 0
   fi
-  gh pr merge "$dp" --merge >/dev/null 2>&1 || return 1
+  gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
   # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
   printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
   # 1) enqueue the scribe to reap the backlog item for this slug (slug-match + reap-not-stamp).
@@ -441,12 +505,37 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         continue
       fi
     fi
-    # PASS (just now, or recorded for this sha) → merge, or flag for human if AUTOMERGE=false.
+    # PASS (just now, or recorded for this sha) → proceed based on effective merge policy.
+
+    if [ -n "$MERGE_OBSERVE" ]; then
+      # observe: run all gates, report + notify once per sha, NEVER merge.
+      if ! observe_noted "$prnum" "$rsha"; then
+        record_observe_noted "$prnum" "$rsha"
+        herdr notification show "🐑 PR #${prnum} ready (observe)" --body "${slug}: review passed — observe mode, not merging" --sound default >/dev/null 2>&1 || true
+      fi
+      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · observe mode${C_RESET}"
+      render
+      continue
+    fi
 
     if [ -z "$AUTOMERGE" ]; then
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting human merge${C_RESET}"
+      # approve: require explicit sha-keyed human approval before merging.
+      if approval_is_approved "$prnum" "$rsha"; then
+        DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}merging (approved)${C_RESET}"
+        render
+        do_merge "$slug" "$prnum" "$dir"
+        continue
+      fi
+      # First time gates pass for this sha: record + notify, then hold until approved.
+      if ! approval_awaiting_noted "$prnum" "$rsha"; then
+        record_approval_awaiting "$prnum" "$rsha"
+        gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
+
+Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
+        herdr notification show "🐑 PR #${prnum} awaiting approval" --body "${slug}: gates passed — herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
+      fi
+      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting approval${C_RESET}"
       render
-      herdr notification show "🐑 PR #${prnum} ready to merge" --body "${slug}: review passed — merge when ready" --sound default >/dev/null 2>&1 || true
       continue
     fi
 
