@@ -19,12 +19,12 @@
 
 ## Someday / Deferred
 
-- 🚧 **Platform-agnostic install + shell portability** *(worktree: `platform-agnostic-install`)* — don't assume brew or any one PATH dir. (1) README install: lead with the zero-assumption option (add `bin/` to `PATH`), then "symlink to ANY PATH dir", then brew-tap / curl-installer as conveniences — drop the hardcoded `/usr/local/bin`. Optional `install.sh` that detects a writable PATH dir. (2) Shell-portability audit so it runs on Linux too: `sed -i` (GNU vs BSD), `date`/`stat` flags, confirm the `flock`→mkdir fallback + the symlink-resolution (PR-in-flight) cover the gaps. Real requirement is herdr + claude + gh + git + python3, not the OS/brew.
 - 🔜 **Phase 4: onboard an external consumer** — `herd init` against a genuinely different repo (web server/library); the real abstraction test (§8).
 - 🔜 **Claude-plugin wrapper** — ship the skill as a Claude Code plugin while the CLI stays source of truth (§4).
 
 ## Recently shipped
 
+- ✅ **Platform-agnostic install + shell portability** *(PR #23)*
 - ✅ **Lane-spawned builders can silently stall on the folder-trust prompt** *(PR #22)*
 - ✅ **Watcher singleton spawn-lock + stale reap** *(PR #21)*
 - ✅ **Cross-repo link registry (`.herd/links`)** — foundation for general peer dispatch (A → any project B); each link = name + repo coordinates + backend adapter + tracker target, so `herd report --to <project>` resolves arbitrary linked projects; `tracker_target` wired as `LINEAR_TEAM_ID`. *(PR #14, follow-up e1a6877)*
@@ -34,4 +34,3 @@
 - ✅ **Linear backend** — GraphQL, key in gitignored `.herd/secrets`. *(PR #6)*
 - ✅ **Watcher honors required checks / CODEOWNERS** — auto-merge gates on `mergeStateStatus=CLEAN`. *(PR #5)*
 - ✅ **GitHub-Issues backend** — live-API smoke verified. *(PR #3)*
-- ✅ **herdr version/contract preflight** — fail fast on missing/skewed herdr. *(PR #2)*
