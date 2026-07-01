@@ -6,3 +6,4 @@
 # worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo)
 *-trees/
 .claude/settings.local.json   # machine-local permission grants — never commit
+.claude/settings.json         # machine-local trust marker — auto-written by new-feature.sh

@@ -266,8 +266,23 @@ $rec
 EOF
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
     if [ -z "$prnum" ]; then
-      word="building"; [ "$astatus" != "working" ] && word="idle · no PR"
-      DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}${word}${C_RESET}"
+      if [ "$astatus" != "working" ]; then
+        DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+      else
+        # Stall detection: agent is "working" but has made zero commits for >5 min —
+        # likely stuck on the folder-trust gate or a permissions prompt. Surface a
+        # warning so the user knows to check the pane. The threshold avoids false
+        # positives on agents that spend a few minutes reading before their first commit.
+        _born="$(stat -f '%B' "$dir" 2>/dev/null || echo 0)"
+        _age=$(( $(date +%s) - _born ))
+        _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
+        if [ "$_age" -gt 300 ] && [ "${_commits:-0}" -eq 0 ]; then
+          _mins=$(( _age / 60 ))
+          DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}stalled? · 0 commits (${_mins}m) · check pane${C_RESET}"
+        else
+          DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
+        fi
+      fi
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
