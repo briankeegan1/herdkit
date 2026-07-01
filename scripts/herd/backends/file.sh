@@ -4,10 +4,11 @@
 # The agent edits $BACKLOG_FILE directly in prose; these functions handle the git
 # mechanics that follow. Sourced from scribe-step.sh after herd-config.sh has loaded
 # (so $BACKLOG_FILE, $DEFAULT_BRANCH, $HERD_REMOTE, $HERD_BRANCH_NAME are in scope) and
-# with $REPO as CWD. Every backend implements the same three operations:
+# with $REPO as CWD. Every backend implements the same four-op contract:
 #   _backend_add_item REQ_ID TEXT     — create/commit a new item
 #   _backend_mark_shipped SLUG PR_URL — reap/stamp a shipped item
 #   _backend_list_open                — print open items
+#   _backend_item_state REF           — sets ITEM_STATE=open|closed|in-progress
 
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID); $2 = short commit summary.
@@ -52,4 +53,22 @@ _backend_mark_shipped() {
 _backend_list_open() {
     # Print open backlog items (🔜 queued or 🚧 in-progress).
     grep -E '🔜|🚧' "$BACKLOG_FILE" 2>/dev/null || true
+}
+
+_backend_item_state() {
+    # $1 = <link-name>#<id> or a title slug.  BACKLOG_FILE is already set.
+    # Greps the slug from BACKLOG_FILE; checks for 🔜/🚧/✅ emoji → maps to open/in-progress/closed.
+    # Sets ITEM_STATE=open|closed|in-progress.  Missing slug → open (safe default).
+    local ref="$1" slug line
+    slug="${ref#*#}"
+    line="$(grep -m1 -F "$slug" "$BACKLOG_FILE" 2>/dev/null || true)"
+    if [ -z "$line" ]; then
+        ITEM_STATE="open"
+        return 0
+    fi
+    case "$line" in
+        *✅*) ITEM_STATE="closed"      ;;
+        *🚧*) ITEM_STATE="in-progress" ;;
+        *)    ITEM_STATE="open"         ;;
+    esac
 }

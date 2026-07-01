@@ -166,3 +166,27 @@ nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 for n in nodes:
     print("#%s %s" % (n.get("identifier", ""), n.get("title", "")))' 2>/dev/null || true
 }
+
+_backend_item_state() {
+    # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
+    # Queries issue state.type and sets ITEM_STATE=open|closed|in-progress.
+    # Linear state types: completed/cancelled → closed; started → in-progress; all others → open.
+    local ref="$1" slug resp stype
+    _linear_require_key
+    slug="${ref#*#}"
+    resp="$(_linear_gql \
+        'query State($q: String!) { issueSearch(query: $q, first: 1) { nodes { state { type } } } }' \
+        "$(SLUG="$slug" python3 -c 'import os,json; print(json.dumps({"q": os.environ["SLUG"]}))')")"
+    stype="$(printf '%s' "$resp" | python3 -c '
+import sys, json
+try:    d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issueSearch") or {}).get("nodes")) or []
+print(nodes[0].get("state", {}).get("type", "") if nodes else "")
+' 2>/dev/null || printf '')"
+    case "$stype" in
+        completed|cancelled) ITEM_STATE="closed"      ;;
+        started)             ITEM_STATE="in-progress" ;;
+        *)                   ITEM_STATE="open"         ;;
+    esac
+}
