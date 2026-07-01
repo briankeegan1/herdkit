@@ -8,8 +8,6 @@
 
 - 🔜 **`_backend_item_state <id>` op + dependency-watcher** — a 4th adapter op (`open|closed|in-progress`) so a consumer records `blocked-on: <repo>#<id>`, polls it, and unblocks when the provider closes it. One adapter op across github/linear/devops; native dep-links when a shared Linear/DevOps org, poll-the-adapter when backends are independent.
 - 🔜 **`herd upgrade` versioned migrations** — `migrations/vN→vM.sh` transform a consumer's config/hooks to a new engine contract, so breaking changes are inherited without clobbering custom setup.
-- 🚧 **Cross-repo dependency-loop SIMULATION** *(worktree: `cross-repo-loop-sim`)* — dry-run the full A→B loop (file → build → ship → detect-done → `herd upgrade` → unblock) with existing primitives + thin stand-ins, to validate the design + produce a gap report BEFORE building the machinery above. Doubles as a Phase-4 brownfield test.
-
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
 - 🔜 **Dispatch vs. dependency intent** — `herd report --to B` (fire-and-forget issue, default) vs `--to B --dep` / `herd depend B#id` (records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, never stuck. *(Depends on the link registry above for `--to <project>`.)*
@@ -24,6 +22,7 @@
 
 ## Recently shipped
 
+- ✅ **Cross-repo dependency-loop SIMULATION** *(PR #24)*
 - ✅ **Platform-agnostic install + shell portability** *(PR #23)*
 - ✅ **Lane-spawned builders can silently stall on the folder-trust prompt** *(PR #22)*
 - ✅ **Watcher singleton spawn-lock + stale reap** *(PR #21)*
@@ -33,4 +32,3 @@
 - ✅ **Feedback loop — `herd backlog`** drains the active backend (file/github/linear) as the work source + `herd.sh` launcher. Cross-repo dispatch loop proven end-to-end. *(PR #7, #9)*
 - ✅ **Linear backend** — GraphQL, key in gitignored `.herd/secrets`. *(PR #6)*
 - ✅ **Watcher honors required checks / CODEOWNERS** — auto-merge gates on `mergeStateStatus=CLEAN`. *(PR #5)*
-- ✅ **GitHub-Issues backend** — live-API smoke verified. *(PR #3)*
