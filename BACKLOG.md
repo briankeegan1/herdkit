@@ -4,9 +4,8 @@
 > scribe is the only automated writer. 🔜 planned · 🚧 in progress · ✅ shipped. herdkit is
 > developed *using the herd* (workspace wB) — these items get built through its own lanes.
 
-## Cross-repo orchestration (deferred — validate via a simulation FIRST, don't over-build)
+## Cross-repo orchestration (deferred — validate via a simulation FIRST, don't over-build; link registry foundation ✅ shipped PR #14)
 
-- 🚧 **Cross-repo link registry (`.herd/links`)** — the FOUNDATION for general peer dispatch (A → *any* project B, not just `herd report` → the engine `HERD_REPO`). Each link = name + repo coordinates + backend adapter + tracker target. Lets `herd report --to <project>` and dependency-tracking resolve an arbitrary linked project. Populated by a committed `.herd/links` + an optional `herd link --scan` that reads sibling repos' `.herd/config`. Everything below (peer dispatch, dep-watcher across non-engine repos) depends on this; today `herd report` only targets the engine.
 - 🔜 **`_backend_item_state <id>` op + dependency-watcher** — a 4th adapter op (`open|closed|in-progress`) so a consumer records `blocked-on: <repo>#<id>`, polls it, and unblocks when the provider closes it. One adapter op across github/linear/devops; native dep-links when a shared Linear/DevOps org, poll-the-adapter when backends are independent.
 - 🔜 **`herd upgrade` versioned migrations** — `migrations/vN→vM.sh` transform a consumer's config/hooks to a new engine contract, so breaking changes are inherited without clobbering custom setup.
 - 🔜 **Cross-repo dependency-loop SIMULATION** — dry-run the full A→B loop (file → build → ship → detect-done → `herd upgrade` → unblock) with existing primitives + thin stand-ins, to validate the design + produce a gap report BEFORE building the machinery above. Doubles as a Phase-4 brownfield test.
@@ -31,6 +30,7 @@
 
 ## Recently shipped
 
+- ✅ **Cross-repo link registry (`.herd/links`)** — foundation for general peer dispatch (A → any project B); each link = name + repo coordinates + backend adapter + tracker target, so `herd report --to <project>` resolves arbitrary linked projects; `tracker_target` wired as `LINEAR_TEAM_ID`. *(PR #14, follow-up e1a6877)*
 - ✅ **Multi-tenancy: project-scoped singletons** — coordinator/scribe/researcher tab+agent names suffixed by `WORKSPACE_NAME`, so two projects coexist in one herdr without colliding (tab-close + spawn-locks now per-project). *(PR #11)*
 - ✅ **Harden `herd report`** — backend-agnostic dispatch (`HERD_REPORT_BACKEND` → `_backend_add_item`) + dedup-before-filing. *(PR #10)*
 - ✅ **Feedback loop — `herd backlog`** drains the active backend (file/github/linear) as the work source + `herd.sh` launcher. Cross-repo dispatch loop proven end-to-end. *(PR #7, #9)*
