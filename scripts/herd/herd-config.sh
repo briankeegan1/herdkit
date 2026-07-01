@@ -63,7 +63,9 @@ fi
 : "${COORDINATOR_CMD:="/coordinator"}"  # the generated coordinator skill the control room runs
 : "${HERD_VERSION:="1"}"
 : "${HERD_REPO:=""}"            # <owner>/herdkit — where engine bugs escalate (herd report)
-: "${WATCHER_AUTOMERGE:="true"}"
+: "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
+: "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
+: "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE
 

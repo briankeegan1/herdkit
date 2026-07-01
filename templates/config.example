@@ -35,8 +35,21 @@ REVIEW_CHECKLIST=".herd/review-checklist.md"  # project risk list injected into 
 # the generated coordinator skill the control room launches
 COORDINATOR_CMD="/coordinator"
 
-# human-in-the-loop lever — "true" = auto-merge ready PRs; "false" = run the full
-# healthcheck + review pipeline but flag the PR for a human to merge.
+# merge policy — how the watcher acts after all gates (healthcheck + review) pass.
+#   auto    — merge immediately (default).
+#   approve — hold and notify; run  herd approve <pr#>  (or herd-approve.sh approve <pr#>)
+#             to write an explicit sha-keyed approval. A new commit invalidates prior approval.
+#   observe — run gates and report/notify, but NEVER merge automatically.
+# Takes precedence over WATCHER_AUTOMERGE when set.
+MERGE_POLICY="auto"
+
+# merge method — the gh pr merge strategy applied by do_merge (default: merge commit).
+MERGE_METHOD="merge"    # merge | squash | rebase
+
+# legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
+#   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
+#   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)
+# Prefer MERGE_POLICY for new projects; WATCHER_AUTOMERGE is kept for back-compat only.
 WATCHER_AUTOMERGE="true"
 
 # routing — where engine bugs escalate (herd report files a gh issue here)
