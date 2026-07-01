@@ -18,7 +18,6 @@
 
 > Build order: F1 (merge policy) first; capabilities manifest + template-sync guard as one PR; init detection + flow-preference interview as one PR; herd config last (leans on the manifest for key validation).
 
-- 🚧 **Merge policy + approval queue** *(worktree merge-policy)* — Replace the boolean `WATCHER_AUTOMERGE` (herd-config.sh:66; when `false` the watcher dead-ends at 'ready · awaiting human merge', agent-watch.sh:444-456) with `MERGE_POLICY=auto|approve|observe`: `auto` = today's behavior; `observe` = review+report only, never merge; `approve` = after all gates pass, record 'awaiting approval' in a sha-keyed `.agent-watch-approvals` ledger (mirrors `.agent-watch-reviewed`), comment on the PR + notify, and give the coordinator an 'Approve pending merges' menu action that lists gate-passed PRs and writes approval records; a new commit invalidates approval. Also add `MERGE_METHOD=merge|squash|rebase` (today hardcoded `gh pr merge --merge` at agent-watch.sh:200). Keep `WATCHER_AUTOMERGE` as back-compat alias — first real customer of versioned migrations.
 - 🔜 **Init-time GitHub detection** — `cmd_init` (bin/herd:104-284) makes zero `gh api` calls today; add a detection pass: branch protection on the default branch, required-review count, required checks, CODEOWNERS, allowed merge methods; show findings and derive safe defaults (required reviewers present ⇒ default `MERGE_POLICY=approve`, never `auto`); degrade gracefully without remote/gh.
 - 🔜 **Flow-preference interview + draft-PR flow** — New `herd init` questions → config keys: `PR_FLOW=direct|draft` (draft: lanes instruct builders `gh pr create --draft`; watcher already holds `DRAFT`, agent-watch.sh:157), `PR_READY_WHEN=builder|coordinator|human`, `LOCAL_REVIEW=none|pre-pr` (run the review gate in the worktree BEFORE the PR is public vs today's post-PR review), `MERGE_METHOD`, `DELETE_BRANCH_ON_MERGE`; thread prefs into the lane rules text (herd-quick.sh:58-61, herd-feature.sh:50-53).
 - 🔜 **`herd config` + coordinator Workflow settings mode** — `herd config list|get|set` with key validation, aware of what each change requires: watcher keys ⇒ restart watcher (pid file `.watcher-<slug>.pid`), coordinator-facing keys ⇒ re-render skill (render step at bin/herd:277-278); coordinator menu gains a 'Workflow settings' entry to view/change any workflow pref anytime and relaunch affected pieces — nothing is init-only.
@@ -32,6 +31,7 @@
 
 ## Recently shipped
 
+- ✅ **Merge policy + approval queue** *(PR #26)*
 - ✅ **`_backend_item_state <id>` op + dependency-watcher** *(PR #25)*
 - ✅ **Cross-repo dependency-loop SIMULATION** *(PR #24)*
 - ✅ **Platform-agnostic install + shell portability** *(PR #23)*
@@ -41,4 +41,3 @@
 - ✅ **Multi-tenancy: project-scoped singletons** — coordinator/scribe/researcher tab+agent names suffixed by `WORKSPACE_NAME`, so two projects coexist in one herdr without colliding (tab-close + spawn-locks now per-project). *(PR #11)*
 - ✅ **Harden `herd report`** — backend-agnostic dispatch (`HERD_REPORT_BACKEND` → `_backend_add_item`) + dedup-before-filing. *(PR #10)*
 - ✅ **Feedback loop — `herd backlog`** drains the active backend (file/github/linear) as the work source + `herd.sh` launcher. Cross-repo dispatch loop proven end-to-end. *(PR #7, #9)*
-- ✅ **Linear backend** — GraphQL, key in gitignored `.herd/secrets`. *(PR #6)*
