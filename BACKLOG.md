@@ -24,7 +24,7 @@
 
 ## Someday / Deferred
 
-- 🔜 **Platform-agnostic install + shell portability** — don't assume brew or any one PATH dir. (1) README install: lead with the zero-assumption option (add `bin/` to `PATH`), then "symlink to ANY PATH dir", then brew-tap / curl-installer as conveniences — drop the hardcoded `/usr/local/bin`. Optional `install.sh` that detects a writable PATH dir. (2) Shell-portability audit so it runs on Linux too: `sed -i` (GNU vs BSD), `date`/`stat` flags, confirm the `flock`→mkdir fallback + the symlink-resolution (PR-in-flight) cover the gaps. Real requirement is herdr + claude + gh + git + python3, not the OS/brew.
+- 🚧 **Platform-agnostic install + shell portability** *(worktree: `platform-agnostic-install`)* — don't assume brew or any one PATH dir. (1) README install: lead with the zero-assumption option (add `bin/` to `PATH`), then "symlink to ANY PATH dir", then brew-tap / curl-installer as conveniences — drop the hardcoded `/usr/local/bin`. Optional `install.sh` that detects a writable PATH dir. (2) Shell-portability audit so it runs on Linux too: `sed -i` (GNU vs BSD), `date`/`stat` flags, confirm the `flock`→mkdir fallback + the symlink-resolution (PR-in-flight) cover the gaps. Real requirement is herdr + claude + gh + git + python3, not the OS/brew.
 - 🔜 **Phase 4: onboard an external consumer** — `herd init` against a genuinely different repo (web server/library); the real abstraction test (§8).
 - 🔜 **Claude-plugin wrapper** — ship the skill as a Claude Code plugin while the CLI stays source of truth (§4).
 
