@@ -216,6 +216,47 @@ print(next((t["tab_id"] for t in d.get("result",{}).get("tabs",[]) if t.get("lab
 # execution runs the loop normally.
 if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
+# ── Singleton spawn-lock: exactly one watcher per project ──────────────────────────────────────
+# Keyed by WORKSPACE_NAME (matching the coordinator/scribe/researcher pattern). Prevents duplicate
+# launchers from racing on 'gh pr merge' when the coordinator is relaunched. Stale locks (PID dead
+# from a crashed/ended session) are reaped automatically so the next launch can take over.
+#
+# Two mechanisms, one per environment:
+#   • flock(1) available  — non-blocking exclusive lock (fd 9) held for our lifetime; auto-released
+#                           on any exit (fd close). A second watcher's flock -n fails immediately.
+#   • no flock (macOS)    — atomic-mkdir mutex guards the check+write, then a PID file is held for
+#                           our lifetime and removed on EXIT/INT/TERM.
+mkdir -p "$(dirname "$HERD_WATCHER_LOCK")" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$HERD_WATCHER_LOCK"
+  if ! flock -n 9; then
+    printf '🐑 watcher already running for %s — exiting.\n' "$WORKSPACE_NAME" >&2; exit 0
+  fi
+  printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
+else
+  # Atomic-mkdir mutex (serializes the check+write window; held only for that instant).
+  _wl_mtx="${HERD_WATCHER_LOCK}.d"
+  _wl_tries=0
+  while ! mkdir "$_wl_mtx" 2>/dev/null; do
+    [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
+    _wl_tries=$((_wl_tries + 1)); [ "$_wl_tries" -ge 30 ] && break; sleep 0.1
+  done
+  _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  if [ -n "$_wl_pid" ] && kill -0 "$_wl_pid" 2>/dev/null; then
+    rmdir "$_wl_mtx" 2>/dev/null || true
+    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_pid" >&2; exit 0
+  fi
+  # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
+  _wl_tmp="${HERD_WATCHER_LOCK}.$$"
+  printf '%s\n' "$$" >"$_wl_tmp"; mv "$_wl_tmp" "$HERD_WATCHER_LOCK"
+  rmdir "$_wl_mtx" 2>/dev/null || true
+  unset _wl_mtx _wl_tries _wl_pid _wl_tmp
+  # Clean up the PID file on any exit so the next launch can start cleanly.
+  trap 'rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true' EXIT
+  trap 'rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true; exit 1' INT TERM
+fi
+# ───────────────────────────────────────────────────────────────────────────────────────────────
+
 while true; do
   build_header
   build_landed
