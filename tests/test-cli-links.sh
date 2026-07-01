@@ -114,4 +114,33 @@ grep -q "issue create -R owner/myapp" "$GHLOG" \
   || fail "plain report (no --to) did not file against project HERD_REPO — log: $(cat "$GHLOG")"
 pass
 
+# ── 8. tracker_target wired as LINEAR_TEAM_ID for a linear-backend link ──────────────────────────
+# Append a linear link with an explicit team ID in the 4th field.
+printf 'tasks|myorg/project|linear|team_from_link\n' >> "$P/.herd/links"
+
+# Fake curl: logs all args so we can verify the teamId payload.
+CURLLOG="$T/curl.log"
+cat > "$T/bin/curl" <<EOF
+#!/usr/bin/env bash
+echo "curl \$*" >> "$CURLLOG"
+args="\$*"
+case "\$args" in
+  *issueCreate*) echo '{"data":{"issueCreate":{"success":true,"issue":{"id":"i1","identifier":"ENG-1","url":"https://linear.app/test/issue/ENG-1"}}}}' ;;
+  *"issues("*)   echo '{"data":{"issues":{"nodes":[]}}}' ;;
+  *) echo '{"data":{}}' ;;
+esac
+EOF
+chmod +x "$T/bin/curl"
+: > "$CURLLOG"
+out8="$( cd "$P" \
+           && PATH="$T/bin:$PATH" \
+              HERD_CONFIG_FILE="$P/.herd/config" \
+              HERD_NONINTERACTIVE=1 \
+              LINEAR_API_KEY="lin_test_key" \
+              bash "$HERD" report --to tasks "pipeline stalled" 2>&1 )" \
+  || fail "report --to tasks (linear) exited non-zero: $out8"
+grep -q "team_from_link" "$CURLLOG" \
+  || fail "report --to tasks (linear) did not pass tracker_target as LINEAR_TEAM_ID — log: $(cat "$CURLLOG")"
+pass
+
 echo "ALL PASS ($PASS checks)"

@@ -469,6 +469,13 @@ cmd_report() {
     _herd_resolve_link "$to_name" \
       || die "no link named '$to_name' in .herd/links — run 'herd link list' to see configured links"
     report_backend="${HERD_REPORT_BACKEND:-github}"
+    # Wire tracker_target to the backend-specific routing variable so the link's value
+    # wins over any .herd/secrets default. Currently: linear → LINEAR_TEAM_ID.
+    if [ -n "${HERD_LINK_TARGET:-}" ]; then
+      case "$report_backend" in
+        linear) export LINEAR_TEAM_ID="$HERD_LINK_TARGET" ;;
+      esac
+    fi
   else
     report_backend="${env_backend:-${HERD_REPORT_BACKEND:-github}}"
   fi
