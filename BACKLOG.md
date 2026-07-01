@@ -18,6 +18,10 @@
 - 🔜 **Configurable watcher views** — lenses `mine | all | deps | review-queue` + filters (author/assignee/label/status); default in `.herd/config`.
 - 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + ownership/assignee filter; auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the required-checks gate (PR #5). `solo` default; `team` is a config flip.
 
+## Reliability / safety
+
+- 🔜 **Watcher singleton spawn-lock + stale reap** — `herd-watch.sh`/`agent-watch.sh` has no per-project singleton guard, unlike coordinator/scribe/researcher which received per-project spawn-locks in PR #11. Observed up to 8 concurrent watchers in a single session, all auto-merging and racing on `gh pr merge`. Fix: add a per-project spawn-lock (keyed by `WORKSPACE_NAME`, matching the PR #11 pattern) so exactly one watcher runs per project; detect and reap stale watchers that persist across sessions/days. Ground implementation against `scripts/herd/herd-watch.sh`, `agent-watch.sh`, and the PR #11 spawn-lock mechanism. Safety hazard for all herdkit consumers — duplicate auto-mergers racing on `gh pr merge` is the primary risk.
+
 ## Someday / Deferred
 
 - 🔜 **Platform-agnostic install + shell portability** — don't assume brew or any one PATH dir. (1) README install: lead with the zero-assumption option (add `bin/` to `PATH`), then "symlink to ANY PATH dir", then brew-tap / curl-installer as conveniences — drop the hardcoded `/usr/local/bin`. Optional `install.sh` that detects a writable PATH dir. (2) Shell-portability audit so it runs on Linux too: `sed -i` (GNU vs BSD), `date`/`stat` flags, confirm the `flock`→mkdir fallback + the symlink-resolution (PR-in-flight) cover the gaps. Real requirement is herdr + claude + gh + git + python3, not the OS/brew.
