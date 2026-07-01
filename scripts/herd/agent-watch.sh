@@ -359,12 +359,20 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
     elif [ "$prior" != "PASS" ]; then
       DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}reviewing…${C_RESET}"
       render
-      verdict_line="$(bash "$HERE/herd-review.sh" "$prnum" "$slug" 2>/dev/null | grep -E '^REVIEW: (PASS|BLOCK)' | tail -1)"
+      verdict_line="$(bash "$HERE/herd-review.sh" "$prnum" "$slug" 2>/dev/null | grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' | tail -1)"
       case "$verdict_line" in
-        "REVIEW: PASS") verdict="PASS" ;;
-        "REVIEW: BLOCK"*) verdict="BLOCK" ;;
-        *) verdict="BLOCK" ;;
+        "REVIEW: PASS")        verdict="PASS" ;;
+        "REVIEW: BLOCK"*)      verdict="BLOCK" ;;
+        "REVIEW: INFRA-FAIL"*) verdict="INFRA-FAIL" ;;
+        *)                     verdict="BLOCK" ;;
       esac
+      # INFRA-FAIL means the reviewer could not run — transient, not a real finding. Do NOT persist
+      # it to the ledger (that would permanently wedge the PR). Surface for retry next cycle.
+      if [ "$verdict" = "INFRA-FAIL" ]; then
+        DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}review errored · will retry${C_RESET}"
+        render
+        continue
+      fi
       record_review "$prnum" "$rsha" "$verdict"
       if [ "$verdict" != "PASS" ]; then
         DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · review blocked${C_RESET}"

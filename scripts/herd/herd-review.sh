@@ -25,10 +25,14 @@
 # Synchronous; prints exactly one verdict line to stdout, which the watcher captures:
 #       REVIEW: PASS
 #       REVIEW: BLOCK — <one-line reason>
+#       REVIEW: INFRA-FAIL — <one-line reason>   (transient; watcher retries, never caches)
 # The watcher merges ONLY on PASS. On BLOCK (or ANY failure to obtain a parseable verdict) it must
-# NOT merge — and this script DEFAULTS TO BLOCK when uncertain: if the reviewer dies, times out, or
-# prints no verdict, we emit `REVIEW: BLOCK — …` AND post a fallback PR comment. Exit status
-# mirrors the verdict (0 = PASS, non-zero = BLOCK).
+# NOT merge — and this script DEFAULTS TO BLOCK when uncertain: if the reviewer runs but prints no
+# verdict, we emit `REVIEW: BLOCK — …` AND post a fallback PR comment. INFRA-FAIL is DISTINCT from
+# BLOCK: it means the reviewer COULD NOT RUN (log-alloc failure, claude crash with no output), not
+# that it found a defect. The watcher must NOT persist INFRA-FAIL to the review ledger — it surfaces
+# "review errored · will retry" and retries next cycle. Exit status: 0 = PASS, 1 = BLOCK (genuine
+# finding or default-to-block), 2 = INFRA-FAIL (transient; safe to retry).
 #
 # Env overrides:
 #   HERD_CLAUDE_FLAGS   flags passed to claude (default: --dangerously-skip-permissions — the
@@ -68,7 +72,7 @@ fi
 
 # emit_block <reason> — DEFAULT-TO-BLOCK exit. Posts a fallback PR comment (best-effort) so the
 # watcher can always rely on "a comment was posted", then prints the canonical BLOCK verdict and
-# exits non-zero. Used whenever we cannot trust a PASS.
+# exits 1. Used when the reviewer RAN but we cannot trust a PASS (no verdict, uncertain outcome).
 emit_block() {
   local reason="$1"
   gh pr comment "$PR" --body "🔬 **Pre-merge review gate — BLOCKED.** ${reason} Not merged; needs a human look." >/dev/null 2>&1 || true
@@ -76,12 +80,21 @@ emit_block() {
   exit 1
 }
 
+# emit_infra_fail <reason> — TRANSIENT infrastructure failure. The reviewer COULD NOT RUN; this is
+# NOT a finding. Prints REVIEW: INFRA-FAIL (exit 2) so the watcher knows NOT to cache the result —
+# it will surface "review errored · will retry" and re-attempt next cycle. Does NOT post a PR
+# comment (no finding to report; a comment on every retry would be spammy).
+emit_infra_fail() {
+  printf 'REVIEW: INFRA-FAIL — %s\n' "$1"
+  exit 2
+}
+
 # BSD/macOS mktemp requires X's to be the LAST characters; a trailing suffix like
 # ".log" after XXXXXX is a GNU-only extension that silently produces a literal filename
 # on macOS and collides on any second use.  Drop the suffix — callers don't need it.
 LOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-${PR}-XXXXXX")" \
-  || emit_block "could not allocate review log (mktemp failed)"
-[ -n "$LOG" ] || emit_block "could not allocate review log (empty path)"
+  || emit_infra_fail "could not allocate review log (mktemp failed)"
+[ -n "$LOG" ] || emit_infra_fail "could not allocate review log (empty path)"
 trap 'rm -f "$LOG"' EXIT
 
 # The fixed reviewer task — the coordinator does not hand-tune it (mirrors herd-resolve.sh's
@@ -115,7 +128,12 @@ rc=$?
 [ -n "$TAB" ] && herdr tab close "$TAB" >/dev/null 2>&1 || true
 
 if [ "$rc" -ne 0 ]; then
-  emit_block "reviewer agent exited non-zero (rc=$rc) — could not complete the review"
+  # If claude exited non-zero but left a parseable verdict in the log, honour it — fall through to
+  # verdict parsing below. If there is NO verdict line, the reviewer crashed before reaching a
+  # conclusion; that is a transient infra failure, not a genuine finding (don't cache as BLOCK).
+  if ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LOG" 2>/dev/null; then
+    emit_infra_fail "reviewer agent exited non-zero (rc=$rc) with no verdict — could not complete the review"
+  fi
 fi
 
 # Parse the LAST canonical verdict line the agent printed. Tolerate leading whitespace; require
