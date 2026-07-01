@@ -66,8 +66,6 @@ if [ -n "$_cl_path" ]; then
 $(cat "$_cl_path" 2>/dev/null)"
 fi
 
-LOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-${PR}-XXXXXX.log")"
-
 # emit_block <reason> — DEFAULT-TO-BLOCK exit. Posts a fallback PR comment (best-effort) so the
 # watcher can always rely on "a comment was posted", then prints the canonical BLOCK verdict and
 # exits non-zero. Used whenever we cannot trust a PASS.
@@ -77,6 +75,14 @@ emit_block() {
   printf 'REVIEW: BLOCK — %s\n' "$reason"
   exit 1
 }
+
+# BSD/macOS mktemp requires X's to be the LAST characters; a trailing suffix like
+# ".log" after XXXXXX is a GNU-only extension that silently produces a literal filename
+# on macOS and collides on any second use.  Drop the suffix — callers don't need it.
+LOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-${PR}-XXXXXX")" \
+  || emit_block "could not allocate review log (mktemp failed)"
+[ -n "$LOG" ] || emit_block "could not allocate review log (empty path)"
+trap 'rm -f "$LOG"' EXIT
 
 # The fixed reviewer task — the coordinator does not hand-tune it (mirrors herd-resolve.sh's
 # standard task). Scoped hard to CORRECTNESS; default BLOCK; read-only; one machine verdict.
