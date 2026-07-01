@@ -103,6 +103,11 @@ build_header() {
   RULE=" ${C_DIM}$(python3 -c "print('═'*$cols)")${C_RESET}"
 }
 
+# epoch_to_hhmm <epoch> — HH:MM from a Unix timestamp; BSD/macOS (-r) and GNU/Linux (-d @) safe.
+epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+# reverse_file <path> — print lines in reverse order; tac (GNU/Linux) or tail -r (BSD/macOS).
+reverse_file() { tac "$1" 2>/dev/null || tail -r "$1" 2>/dev/null; }
+
 # build_landed — the pinned "recently landed" rows: the last 3 lines of the state file
 # ("<epoch> <pr#> <slug>"), newest first. Stays visible even when idle.
 build_landed() {
@@ -113,11 +118,11 @@ build_landed() {
   LANDED=""
   while read -r epoch prnum slug; do
     [ -z "${epoch:-}" ] && continue
-    hhmm="$(date -r "$epoch" +%H:%M 2>/dev/null || echo '--:--')"
+    hhmm="$(epoch_to_hhmm "$epoch")"
     pnum="$(printf '#%-4s' "$prnum")"
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
     LANDED="${LANDED}    ${C_GREEN}✅${C_RESET} ${C_DIM}${pnum}${C_RESET} ${C_GREEN}${sl}${C_RESET} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(tail -r "$STATE" 2>/dev/null | head -3)
+  done < <(reverse_file "$STATE" | head -3)
 }
 
 # render — paint the whole rollup card, but ONLY when the computed frame changed.

@@ -34,13 +34,36 @@ The engine is **generic**; everything project-specific is read from a per-projec
 
 ## Install
 
+**Requirements:** `herdr` (the terminal multiplexer), `claude` (Claude Code CLI), `gh`, `git`,
+`python3`, and a modern `bash`. No specific OS or package manager is assumed — these tools work
+on macOS and Linux alike.
+
 ```sh
 git clone https://github.com/briankeegan1/herdkit.git ~/source/herdkit
-ln -s ~/source/herdkit/bin/herd /usr/local/bin/herd   # put `herd` on PATH
 ```
 
-Requires: `herdr` (the multiplexer), the `claude` CLI, `gh`, `git`, `python3`, and a modern
-`bash`. The default **file** work-tracker backend needs no network and no secrets.
+**Option 1 — zero-assumption: add `bin/` to PATH** (no symlink, no write permissions needed):
+
+```sh
+# bash / zsh
+echo 'export PATH="$HOME/source/herdkit/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc
+```
+
+**Option 2 — symlink to any writable directory already on PATH:**
+
+```sh
+# Works with /usr/local/bin, /opt/homebrew/bin, ~/.local/bin, or any other directory on your PATH.
+ln -s ~/source/herdkit/bin/herd ~/.local/bin/herd
+```
+
+**Option 3 — auto-detect install location** (picks the first writable PATH directory for you):
+
+```sh
+bash ~/source/herdkit/install.sh
+```
+
+The default **file** work-tracker backend needs no network and no secrets.
 
 ## Quickstart — `herd init`
 
