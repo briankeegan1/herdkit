@@ -1,0 +1,19 @@
+# .herd/links — cross-repo link registry. Commit this (code-shaped config, zero-secret).
+# Each line defines a named peer repo target for use with:  herd report --to <name>
+#
+# Format:  name|owner/repo|backend|tracker_target
+#
+#   name            short identifier (alphanumeric + hyphens recommended)
+#   owner/repo      repository slug — same format as HERD_REPO and gh -R
+#   backend         adapter to use: github | linear | file | changelog
+#   tracker_target  optional extra routing (e.g. Linear team ID); blank = adapter default
+#
+# Blank lines and # comments are ignored.
+#
+# Run 'herd link list' to inspect active links.
+# Run 'herd report --to <name> "<symptom>"' to file a report against a linked repo.
+#
+# ── Examples ────────────────────────────────────────────────────────────────────────────────────
+# engine|owner/engine-repo|github|
+# ci|myorg/ci-platform|github|
+# tasks|myorg/project-name|linear|<LINEAR_TEAM_ID>
