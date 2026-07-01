@@ -8,7 +8,7 @@
 
 - 🔜 **`_backend_item_state <id>` op + dependency-watcher** — a 4th adapter op (`open|closed|in-progress`) so a consumer records `blocked-on: <repo>#<id>`, polls it, and unblocks when the provider closes it. One adapter op across github/linear/devops; native dep-links when a shared Linear/DevOps org, poll-the-adapter when backends are independent.
 - 🔜 **`herd upgrade` versioned migrations** — `migrations/vN→vM.sh` transform a consumer's config/hooks to a new engine contract, so breaking changes are inherited without clobbering custom setup.
-- 🔜 **Cross-repo dependency-loop SIMULATION** — dry-run the full A→B loop (file → build → ship → detect-done → `herd upgrade` → unblock) with existing primitives + thin stand-ins, to validate the design + produce a gap report BEFORE building the machinery above. Doubles as a Phase-4 brownfield test.
+- 🚧 **Cross-repo dependency-loop SIMULATION** *(worktree: `cross-repo-loop-sim`)* — dry-run the full A→B loop (file → build → ship → detect-done → `herd upgrade` → unblock) with existing primitives + thin stand-ins, to validate the design + produce a gap report BEFORE building the machinery above. Doubles as a Phase-4 brownfield test.
 
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
