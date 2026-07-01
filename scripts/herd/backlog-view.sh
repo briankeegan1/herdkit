@@ -30,15 +30,25 @@ if [ -n "$saved_tty" ]; then
   printf '\033[?25l'  # hide cursor
 fi
 
+# file_mtime / epoch_to_hhmm — portable helpers; detect BSD vs GNU once at startup.
+# GNU/Linux: stat -c %Y, date -d "@<epoch>". BSD/macOS: stat -f %m, date -r <epoch>.
+if stat --version 2>/dev/null | grep -q GNU; then
+  file_mtime()    { stat -c %Y "$1" 2>/dev/null || echo 0; }
+  epoch_to_hhmm() { date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+else
+  file_mtime()    { stat -f %m "$1" 2>/dev/null || echo 0; }
+  epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || echo '--:--'; }
+fi
+
 while true; do
-  cur_mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+  cur_mtime=$(file_mtime "$f")
   ts=$(git -C "$REPO" log -1 --format=%ct -- "$BACKLOG_FILE" 2>/dev/null || echo 0)
   sub=$(git -C "$REPO" log -1 --format=%s -- "$BACKLOG_FILE" 2>/dev/null)
   now=$(date +%s); age=$(( now - ts ))
   if [ "$ts" -gt 0 ] && [ "$age" -lt 90 ]; then
     banner=$(printf '\033[1;42;30m ✍️  JUST SCRIBED \033[0m \033[1m%s\033[0m' "$sub")
   elif [ "$ts" -gt 0 ]; then
-    banner=$(printf '\033[2mlast scribed %s — %s\033[0m' "$(date -r "$ts" +%H:%M)" "$sub")
+    banner=$(printf '\033[2mlast scribed %s — %s\033[0m' "$(epoch_to_hhmm "$ts")" "$sub")
   else
     banner=$(printf '\033[2m(uncommitted working-tree changes)\033[0m')
   fi
