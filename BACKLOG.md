@@ -7,6 +7,7 @@
 ## Cross-repo orchestration (deferred — validate via a simulation FIRST, don't over-build; link registry foundation ✅ shipped PR #14)
 
 - 🔜 **`herd upgrade` versioned migrations** — `migrations/vN→vM.sh` transform a consumer's config/hooks to a new engine contract, so breaking changes are inherited without clobbering custom setup. *(Gap 4 in `docs/gap-report-cross-repo-loop.md`.)*
+
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
 - 🔜 **Dispatch vs. dependency intent** — `herd report --to B` (fire-and-forget issue, default) vs `--to B --dep` / `herd depend B#id` (records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, never stuck. *(Gap 3 in `docs/gap-report-cross-repo-loop.md`: `.herd/deps` schema + `herd depend/deps list/rm`; depends on the link registry above for `--to <project>`.)*
@@ -31,7 +32,7 @@
 
 ## Recently shipped
 
-- ✅ **Merge policy + approval queue** *(PR #26)*
+- ✅ **Merge policy + approval queue** — MERGE_POLICY=auto|approve|observe, MERGE_METHOD, sha-keyed approvals ledger + herd-approve.sh. *(PR #26)*
 - ✅ **`_backend_item_state <id>` op + dependency-watcher** *(PR #25)*
 - ✅ **Cross-repo dependency-loop SIMULATION** *(PR #24)*
 - ✅ **Platform-agnostic install + shell portability** *(PR #23)*
