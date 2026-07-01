@@ -40,6 +40,14 @@ for share in $SHARE_LINKS; do
   link_or_die "$REPO/$share" "$DIR/$share"
 done
 
+# Pre-trust the worktree for Claude Code so agents launched with
+# --dangerously-skip-permissions don't stall on the "Is this a project you trust?"
+# interactive gate. Claude Code treats a project-level .claude/settings.json as a
+# trust marker and skips the prompt. Write a minimal one now, before the agent starts.
+# The file is gitignored (.gitignore: .claude/settings.json) — never committed.
+mkdir -p "$DIR/.claude"
+printf '{}\n' > "$DIR/.claude/settings.json"
+
 echo "✅ Worktree ready: $DIR   (branch $BRANCH, off $DEFAULT_BRANCH @ $(git -C "$REPO" rev-parse --short "$DEFAULT_BRANCH"))"
 echo "   Start an agent here:   cd $DIR && claude"
 echo "   When done:             gh pr create   # then the watcher reviews & merges"
