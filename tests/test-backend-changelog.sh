@@ -22,8 +22,10 @@ export HERD_BRANCH_NAME="main"
 run() {
   ( cd "$T" && . "$BACKEND"
     _BACKEND_RESULT=""
+    ITEM_STATE=""
     "$@"
-    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" )
+    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+    printf 'ITEM_STATE=%s\n' "${ITEM_STATE:-}" )
 }
 
 # 1. add-item appends under [Unreleased] and commits.
@@ -45,5 +47,11 @@ echo "$open" | grep -q "second tracked thing" || fail "list_open missing second 
 before="$(cat "$T/CHANGELOG.md")"
 ( cd "$T" && . "$BACKEND" && _backend_mark_shipped some-slug http://pr ) || fail "mark_shipped errored"
 [ "$before" = "$(cat "$T/CHANGELOG.md")" ] || fail "mark_shipped mutated the changelog (should be no-op)"
+
+# 4. item_state → slug found in [Unreleased] returns open; absent slug returns closed.
+out="$(run _backend_item_state "provider#first tracked thing")"
+echo "$out" | grep -q "ITEM_STATE=open" || fail "item_state: slug in [Unreleased] should return open ($out)"
+out="$(run _backend_item_state "provider#no-such-item")"
+echo "$out" | grep -q "ITEM_STATE=closed" || fail "item_state: missing slug should return closed ($out)"
 
 echo "ALL PASS"

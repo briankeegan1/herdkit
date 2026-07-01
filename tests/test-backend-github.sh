@@ -23,6 +23,17 @@ case "\$1 \$2" in
   "issue list")    printf '%s' '[{"number":7,"title":"first open issue"},{"number":9,"title":"second open issue"}]' ;;
   "issue comment") : ;;
   "issue close")   : ;;
+  "issue view")
+    _vnum=""
+    for _va in "\$@"; do
+      [ -z "\${_va##*[!0-9]*}" ] || { _vnum="\$_va"; break; }
+    done
+    case "\$_vnum" in
+      7)  printf '{"state":"OPEN","number":7}\n'   ;;
+      42) printf '{"state":"CLOSED","number":42}\n' ;;
+      *)  printf '{"state":"OPEN","number":0}\n'    ;;
+    esac
+    ;;
   *) : ;;
 esac
 EOF
@@ -35,8 +46,10 @@ export HERD_REPO="acme/widgets"
 run() {
   ( cd "$T" && . "$BACKEND"
     _BACKEND_RESULT=""
+    ITEM_STATE=""
     "$@"
-    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" )
+    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+    printf 'ITEM_STATE=%s\n' "${ITEM_STATE:-}" )
 }
 
 # 1. add_item → gh issue create with the configured repo, title, and body; returns DONE + URL.
@@ -66,7 +79,19 @@ grep -q -- "--body Shipped via https://github.com/acme/widgets/pull/3" "$GHLOG" 
 grep -q -- "issue close -R acme/widgets 7" "$GHLOG" || fail "mark_shipped did not close issue 7"
 pass
 
-# 4. absent gh degrades loudly (no silent success).
+# 4. item_state → CLOSED issue returns ITEM_STATE=closed.
+: > "$GHLOG"
+out="$(run _backend_item_state "provider-lib#42")"
+echo "$out" | grep -q "ITEM_STATE=closed" || fail "_backend_item_state CLOSED did not return ITEM_STATE=closed ($out)"
+grep -q -- "issue view -R acme/widgets 42" "$GHLOG" || fail "_backend_item_state did not call 'gh issue view'"
+pass
+
+# 5. item_state → OPEN issue returns ITEM_STATE=open.
+out="$(run _backend_item_state "provider-lib#7")"
+echo "$out" | grep -q "ITEM_STATE=open" || fail "_backend_item_state OPEN did not return ITEM_STATE=open ($out)"
+pass
+
+# 6. absent gh degrades loudly (no silent success).
 if ( cd "$T"; export PATH="/nonexistent"; . "$BACKEND"; _backend_list_open ) >/dev/null 2>&1; then
   fail "list_open should fail when gh is absent"
 fi

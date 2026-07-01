@@ -127,37 +127,9 @@ chmod +x "$T/bin/gh"
 
 # ── STUB primitives — simulating missing machinery ─────────────────────────────
 
-# STUB: _backend_item_state — the missing 4th adapter op.
-# Real: would be defined in each backends/*.sh file alongside add/mark/list.
-# Gap:  BACKLOG.md § "_backend_item_state <id> op + dependency-watcher"
-_backend_item_state_stub() {
-  # $1 = "link-name#issue-number" (e.g. "provider-lib#42")
-  # Sets ITEM_STATE=OPEN|CLOSED (would also return IN_PROGRESS in real impl).
-  local ref="$1" number json
-  number="${ref#*#}"
-  json="$(PATH="$T/bin:$PATH" gh issue view "$number" \
-            -R "provider-org/provider-lib" --json state 2>/dev/null \
-         || printf '{"state":"UNKNOWN"}')"
-  ITEM_STATE="$(printf '%s' "$json" \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state","UNKNOWN"))' \
-      2>/dev/null \
-    || printf '%s' "$json" | grep -oE '"state":"[A-Z]+"' | cut -d'"' -f4 \
-    || printf 'UNKNOWN')"
-}
-
-# STUB: one poll cycle of the dependency watcher.
-# Real: a persistent background loop (per-project singleton) calling
-#       _backend_item_state on each recorded dep and signalling unblock on CLOSED.
-# Gap:  BACKLOG.md § "_backend_item_state <id> op + dependency-watcher"
-_dep_watcher_poll_stub() {
-  # $1 = dep ref (e.g. "provider-lib#42"); echoes polled state.
-  _backend_item_state_stub "$1"
-  printf '%s\n' "$ITEM_STATE"
-}
-
 # STUB: record / remove a blocked-on dep in .herd/deps.
 # Real: would be written by "herd depend <link>#<id>" and removed by "herd deps rm".
-# Gap:  BACKLOG.md § "Dispatch vs. dependency intent"
+# Gap:  BACKLOG.md § "Dispatch vs. dependency intent"  (Gap 3 — not yet built)
 DEPS_FILE="$CONSUMER/.herd/deps"
 _record_dep_stub() {
   printf 'blocked-on: %s\n' "$1" >> "$DEPS_FILE"
@@ -214,14 +186,14 @@ fi
 # ── Step 3: Consumer records blocked-on dep ───────────────────────────────────
 step "3" "Consumer records blocked-on: provider-lib#${ISSUE_NUMBER}"
 stub "Writing 'blocked-on: provider-lib#${ISSUE_NUMBER}' to .herd/deps"
-stub "GAP: no 'herd depend' command; no .herd/deps schema; _backend_record_dep op missing"
+stub "GAP: no 'herd depend' command; no .herd/deps schema (Gap 3 — separate backlog item)"
 _record_dep_stub "provider-lib#${ISSUE_NUMBER}"
 ok "Recorded: $(cat "$DEPS_FILE")"
 
 # ── Step 4: Provider builds and ships (closes the issue) ─────────────────────
 step "4" "Provider builds + ships (closes issue #${ISSUE_NUMBER})"
-stub "Simulating provider agent: closing issue #${ISSUE_NUMBER} on provider-org/provider-lib"
-stub "GAP: real flow = provider coordinator/builder runs independently; sim closes issue directly"
+real "provider's coordinator/scribe run normally and close the issue on PR merge (Gap 5 resolved)"
+real "no special ship-signal primitive is needed on the provider side"
 PATH="$T/bin:$PATH" gh issue close "$ISSUE_NUMBER" \
   -R "provider-org/provider-lib" 2>/dev/null || true
 new_state="$(cat "$ISSUE_STATE_FILE")"
@@ -229,26 +201,43 @@ ok "Issue #${ISSUE_NUMBER} state is now: ${new_state}"
 
 # ── Step 5: _backend_item_state polls for closure ─────────────────────────────
 step "5" "Dependency-watcher calls _backend_item_state provider-lib#${ISSUE_NUMBER}"
-stub "_backend_item_state is a MISSING 4th adapter op (would live in each backends/*.sh)"
-stub "Using _backend_item_state_stub → gh issue view --json state"
-_backend_item_state_stub "provider-lib#${ISSUE_NUMBER}"
-ok "_backend_item_state_stub returned: ITEM_STATE=${ITEM_STATE}"
+real "_backend_item_state  →  4th adapter op (backends/github.sh, linear.sh, file.sh, changelog.sh)"
+ITEM_STATE=""
+ITEM_STATE="$(
+    HERD_REPO="provider-org/provider-lib"
+    PATH="$T/bin:$PATH"
+    . "$HERD_SCRIPTS/backends/github.sh"
+    ITEM_STATE=""
+    _backend_item_state "provider-lib#${ISSUE_NUMBER}"
+    printf '%s\n' "$ITEM_STATE"
+)"
+ok "_backend_item_state returned: ITEM_STATE=${ITEM_STATE}"
 
 # ── Step 6: Dep-watcher detects CLOSED, signals consumer ─────────────────────
 step "6" "Dep-watcher detects CLOSED → signals consumer to proceed"
-stub "GAP: no dep-watcher process; no polling loop; no per-dep unblock signal"
-stub "Simulating one poll cycle..."
-polled="$(_dep_watcher_poll_stub "provider-lib#${ISSUE_NUMBER}")"
-if [ "$polled" = "CLOSED" ]; then
-  ok "Poll → CLOSED: watcher would now trigger consumer-app unblock"
+real "dep-watcher.sh  →  per-project singleton with spawn-lock + backoff (scripts/herd/dep-watcher.sh)"
+real "_dw_check_state resolves link, sources backend, calls _backend_item_state in subshell"
+polled="$(
+    HERD_CONFIG_FILE="$CONSUMER/.herd/config"
+    PATH="$T/bin:$PATH"
+    DEP_WATCHER_LIB=1
+    WORKTREES_DIR="$T"
+    DEPS_FILE="$CONSUMER/.herd/deps"
+    export HERD_CONFIG_FILE PATH DEP_WATCHER_LIB WORKTREES_DIR DEPS_FILE
+    # shellcheck source=../dep-watcher.sh
+    . "$HERD_SCRIPTS/dep-watcher.sh"
+    _dw_check_state "provider-lib#${ISSUE_NUMBER}"
+)"
+if [ "$polled" = "closed" ]; then
+  ok "dep-watcher _dw_check_state → closed: consumer-app is unblocked"
 else
-  printf '  %s⚠️%s  Poll → %s (expected CLOSED)\n' "$c_yel" "$c_rst" "$polled"
+  printf '  %s⚠️%s  Poll → %s (expected closed)\n' "$c_yel" "$c_rst" "$polled"
 fi
 
 # ── Step 7: Consumer runs herd upgrade ───────────────────────────────────────
 step "7" "Consumer runs herd upgrade"
 real "herd upgrade  →  re-renders .claude/commands/coordinator.md from current template"
-stub "GAP: migrations/vN→vM.sh don't exist; upgrade has no versioned migration path"
+stub "GAP: migrations/vN→vM.sh don't exist; upgrade has no versioned migration path (Gap 4)"
 mkdir -p "$CONSUMER/.claude/commands"
 upgrade_out="$(cd "$CONSUMER" \
     && HERD_CONFIG_FILE="$CONSUMER/.herd/config" \
@@ -263,7 +252,7 @@ fi
 
 # ── Step 8: Consumer removes blocked-on → unblocked ──────────────────────────
 step "8" "Consumer removes blocked-on annotation → unblocked"
-stub "GAP: no 'herd deps rm' command; no unblock hook; no lane-restart signal"
+stub "GAP: no 'herd deps rm' command; no unblock hook; no lane-restart signal (Gap 3)"
 _remove_dep_stub "provider-lib#${ISSUE_NUMBER}"
 remaining="$(cat "$DEPS_FILE" 2>/dev/null || true)"
 if [ -z "$remaining" ]; then
@@ -282,14 +271,14 @@ printf '\n'
 printf '  %s[REAL] primitives exercised (confirmed working):%s\n' "$c_grn" "$c_rst"
 printf '    1. herd link list       .herd/links registry (PR #14)\n'
 printf '    2. herd report --to     cross-repo issue filing (PR #10, #14)\n'
+printf '    4. provider ship        provider closes issue via normal coordinator/scribe (Gap 5 resolved)\n'
+printf '    5. _backend_item_state  4th adapter op in all backends/*.sh\n'
+printf '    6. dep-watcher          per-project singleton with spawn-lock + backoff\n'
 printf '    7. herd upgrade         coordinator skill re-render\n'
 printf '\n'
 printf '  %s[STUB] gaps (primitives missing — see docs/gap-report-cross-repo-loop.md):%s\n' "$c_yel" "$c_rst"
-printf '    3. blocked-on record    no herd depend / .herd/deps schema\n'
-printf '    4. provider ship        no automated detect/signal from provider\n'
-printf '    5. _backend_item_state  4th adapter op missing from all backends/*.sh\n'
-printf '    6. dep-watcher          no polling loop / per-dep unblock signal\n'
-printf '   7b. migrations/vN→vM    herd upgrade lacks versioned migration scripts\n'
-printf '    8. herd deps rm         no unblock primitive\n'
+printf '    3. blocked-on record    no herd depend / .herd/deps schema (Gap 3)\n'
+printf '   7b. migrations/vN→vM    herd upgrade lacks versioned migration scripts (Gap 4)\n'
+printf '    8. herd deps rm         no unblock primitive (Gap 3)\n'
 printf '\n'
 printf '  Gap report: docs/gap-report-cross-repo-loop.md\n\n'

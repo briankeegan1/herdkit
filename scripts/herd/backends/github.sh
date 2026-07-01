@@ -93,3 +93,20 @@ except Exception: data = []
 for it in data:
     print("#%s %s" % (it.get("number", ""), it.get("title", "")))' 2>/dev/null || true
 }
+
+_backend_item_state() {
+    # $1 = <link-name>#<id> — caller has resolved the link; HERD_REPO is already set.
+    # Queries the issue state and sets ITEM_STATE=open|closed.
+    # GitHub issues have no native in-progress state; OPEN maps to open, CLOSED to closed.
+    local ref="$1" num raw
+    _github_require_gh
+    num="${ref#*#}"
+    raw="$(_gh issue view "$num" --json state 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state","OPEN").upper())' \
+              2>/dev/null \
+            || printf 'OPEN')"
+    case "$raw" in
+        CLOSED) ITEM_STATE="closed" ;;
+        *)      ITEM_STATE="open"   ;;
+    esac
+}

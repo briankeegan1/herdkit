@@ -87,4 +87,6 @@ HERD_AGENT_RESEARCHER="researcher-$_HERD_WS_SLUG"
 HERD_TAB_COORDINATOR="coordinator-$_HERD_WS_SLUG"
 # PID-file path for the per-project watcher singleton (agent-watch.sh spawn-lock).
 HERD_WATCHER_LOCK="$WORKTREES_DIR/.watcher-${_HERD_WS_SLUG}.pid"
+# PID-file path for the per-project dep-watcher singleton (dep-watcher.sh spawn-lock).
+HERD_DEPWATCHER_LOCK="$WORKTREES_DIR/.depwatcher-${_HERD_WS_SLUG}.pid"
 unset _HERD_WS_SLUG

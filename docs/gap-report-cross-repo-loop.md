@@ -17,6 +17,9 @@ acceptance criteria.
 |------|-----------|-----------|
 | 1 | `herd link list` — resolve a named peer from `.herd/links` | PR #14 |
 | 2 | `herd report --to <link>` — file an issue on a peer repo via `_backend_add_item` | PR #10, #14 |
+| 4 | provider ship signal — provider's normal coordinator/scribe close the issue on PR merge | PR #25 (Gap 5 resolved by Gap 1 + Gap 2) |
+| 5 | `_backend_item_state <ref>` — 4th adapter op in all four backends | PR #25 |
+| 6 | dep-watcher singleton — `scripts/herd/dep-watcher.sh` with spawn-lock + backoff | PR #25 |
 | 7 | `herd upgrade` — re-render the coordinator skill from the current engine template | CLI (bin/herd) |
 
 The link registry (`herd-links.sh: _herd_resolve_link`) correctly wires `HERD_REPO` and
@@ -25,13 +28,13 @@ is also confirmed working at step 2.
 
 ---
 
-## Gap 1 — `_backend_item_state` (4th adapter op)
+## ✅ Gap 1 — `_backend_item_state` (4th adapter op) — SHIPPED (PR #25)
 
 **Sim step:** 5  
 **Backlog item:** `_backend_item_state <id> op + dependency-watcher`  
-**What the stub does:** shells out to `gh issue view --json state` and returns OPEN or CLOSED.
+**What the stub did:** shelled out to `gh issue view --json state` and returned OPEN or CLOSED.
 
-### What needs to be built
+### What was built
 
 A fourth op alongside `add_item / mark_shipped / list_open` in every backend adapter:
 
@@ -39,43 +42,38 @@ A fourth op alongside `add_item / mark_shipped / list_open` in every backend ada
 _backend_item_state <ref>   → sets ITEM_STATE=open|closed|in-progress
 ```
 
-**Per-backend work:**
+**Per-backend implementation:**
 
-- `backends/github.sh` — `gh issue view <n> -R "$HERD_REPO" --json state` → map to `open/closed`
-- `backends/linear.sh` — GraphQL `issue(id)` → `state.type` → map to `open/closed/in-progress`
-- `backends/file.sh` — grep `$BACKLOG_FILE` for the item slug; check for 🔜/🚧/✅ → map states
-- `backends/changelog.sh` — check `[Unreleased]` section; items there = `open`; absent = `closed`
+- `backends/github.sh` — `gh issue view <n> -R "$HERD_REPO" --json state` → maps OPEN→open, CLOSED→closed
+- `backends/linear.sh` — GraphQL `issueSearch` → `state.type` → maps completed/cancelled→closed, started→in-progress, others→open
+- `backends/file.sh` — greps `$BACKLOG_FILE` for the item slug; checks 🔜/🚧/✅ emoji → open/in-progress/closed
+- `backends/changelog.sh` — checks `[Unreleased]` section; slug present = `open`; absent = `closed`
 
 **Input format:** `<link-name>#<id>` (e.g. `provider-lib#42`). The caller resolves the link
 to `HERD_REPO` via `_herd_resolve_link` before calling this op.
 
-**Why the sim used a stub:** the current adapter contract has only 3 ops; adding a 4th changes
-the contract for all existing backends simultaneously.
-
 ---
 
-## Gap 2 — Dependency watcher
+## ✅ Gap 2 — Dependency watcher — SHIPPED (PR #25)
 
 **Sim step:** 6  
 **Backlog item:** `_backend_item_state <id> op + dependency-watcher`  
-**What the stub does:** one synchronous poll cycle — calls `_backend_item_state_stub` and
-prints the state.
+**What the stub did:** one synchronous poll cycle — called `_backend_item_state_stub` and printed the state.
 
-### What needs to be built
+### What was built
 
-A persistent per-project background process (singleton, matching the coordinator/scribe
-spawn-lock pattern from PR #11):
+`scripts/herd/dep-watcher.sh` — a persistent per-project background process (singleton):
 
 1. Reads `.herd/deps` to discover all `blocked-on:` entries for this project.
-2. Polls each dep's `_backend_item_state` on an interval (with backoff).
-3. When a dep transitions to `closed`, writes an unblock signal (removes the entry from
-   `.herd/deps`, or triggers a configurable hook).
+2. Polls each dep's `_backend_item_state` on an interval with exponential backoff.
+3. When a dep transitions to `closed`, removes the entry from `.herd/deps` and fires a herdr notification.
 4. Surfaces `stalled` deps (open > TTL) as warnings rather than silent rot.
 
-**Singleton pattern:** follow `scripts/herd/coordinator.sh` / the PR #11 spawn-lock:
-per-project name suffix, `herdr agent list` guard, stale-agent reap.
+**Singleton pattern:** follows the `agent-watch.sh` spawn-lock (PR #21):
+flock(1) when available, atomic-mkdir PID-file otherwise; per-project lock key from
+`HERD_DEPWATCHER_LOCK` (added to `herd-config.sh`).
 
-**Why the sim used a stub:** no background loop exists; polling is synchronous in the sim.
+**Env knobs:** `DEP_POLL_MIN` (default 30s), `DEP_POLL_MAX` (default 300s), `DEP_STALE_TTL` (default 86400s).
 
 ---
 
@@ -145,47 +143,40 @@ to run the right migration — not just re-render the old template.
 
 ---
 
-## Gap 5 — Provider ship signal / detection
+## ✅ Gap 5 — Provider ship signal / detection — RESOLVED (no new primitive)
 
 **Sim step:** 4  
-**Backlog items:** none yet (implicit in the dep-watcher design)  
-**What the stub does:** directly closes the fake issue number without any herdkit involvement.
-
-### What needs to be built
+**Resolved by:** implementing Gap 1 + Gap 2.
 
 The sim reveals that "provider ships" means the provider's OWN coordinator/scribe run normally
 (closing the GitHub issue when the PR merges). The consumer's dep-watcher then detects the
 closure via `_backend_item_state`. No special "ship signal" primitive is required on the
-PROVIDER side — the gap is entirely on the CONSUMER's watcher (Gap 2 above).
-
-**Clarification for the backlog:** this gap does not require a new primitive; it should be
-closed by implementing Gap 1 + Gap 2.
+PROVIDER side.
 
 ---
 
 ## Phase-4 brownfield test protocol
 
-When the primitives above are implemented, run this sequence to verify the real loop:
+When the remaining primitives are implemented, run this sequence to verify the real loop:
 
 1. In a consumer project, add a `.herd/links` entry pointing at a real provider repo.
-2. `herd report --to <provider> "blocked on X"` — verify issue created on provider.
-3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated, watcher started.
-4. `herd deps list` — verify dep shows OPEN state.
-5. On the provider side, close the issue (PR merge or manual close).
-6. `herd deps list` again — verify watcher detected CLOSED.
-7. `herd deps rm <provider>#<issue>` — verify clean removal.
-8. `herd upgrade` — verify coordinator skill re-rendered; any applicable migration ran.
+2. `herd report --to <provider> "blocked on X"` — verify issue created on provider. ✅ REAL
+3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated, watcher started. (Gap 3)
+4. `herd deps list` — verify dep shows OPEN state. (Gap 3)
+5. On the provider side, close the issue (PR merge or manual close). ✅ REAL
+6. `herd deps list` again — verify watcher detected CLOSED. ✅ REAL (dep-watcher.sh)
+7. `herd deps rm <provider>#<issue>` — verify clean removal. (Gap 3)
+8. `herd upgrade` — verify coordinator skill re-rendered; any applicable migration ran. (Gap 4)
 
 **Regression check:** run `bash scripts/herd/sim/cross-repo-loop-sim.sh` and confirm all
-steps still pass. Steps 1, 2, and 7 should remain [REAL]; the gap labels should shrink as
-primitives are shipped.
+steps still pass. Steps 1, 2, 4, 5, 6, and 7 are now [REAL]; only steps 3, 7b, and 8 remain [STUB].
 
 ---
 
 ## Summary of missing primitives by backlog item
 
-| Backlog item | Gaps it closes |
-|---|---|
-| `_backend_item_state <id> op + dependency-watcher` | Gap 1, Gap 2, Gap 5 |
-| `herd upgrade versioned migrations` | Gap 4 |
-| `Dispatch vs. dependency intent` (enterprise section) | Gap 3 |
+| Backlog item | Gaps it closes | Status |
+|---|---|---|
+| `_backend_item_state <id> op + dependency-watcher` | Gap 1, Gap 2, Gap 5 | ✅ Shipped (PR #25) |
+| `herd upgrade versioned migrations` | Gap 4 | Pending |
+| `Dispatch vs. dependency intent` (enterprise section) | Gap 3 | Pending |

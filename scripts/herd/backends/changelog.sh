@@ -63,3 +63,20 @@ _backend_list_open() {
         inblk && /^[*-] / { print }
     ' "$BACKLOG_FILE" 2>/dev/null || true
 }
+
+_backend_item_state() {
+    # $1 = <link-name>#<id> or a text slug.  BACKLOG_FILE is already set.
+    # Slug found under [Unreleased] → open; absent (released or never added) → closed.
+    # Sets ITEM_STATE=open|closed.  (changelog backend has no in-progress concept.)
+    local ref="$1" slug
+    slug="${ref#*#}"
+    if awk '
+        /^## \[Unreleased\]/ { inblk=1; next }
+        /^## / { inblk=0 }
+        inblk { print }
+    ' "$BACKLOG_FILE" 2>/dev/null | grep -qF "$slug" 2>/dev/null; then
+        ITEM_STATE="open"
+    else
+        ITEM_STATE="closed"
+    fi
+}

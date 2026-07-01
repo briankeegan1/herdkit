@@ -23,7 +23,7 @@ echo "curl \$*" >> "$CURLLOG"
 args="\$*"
 case "\$args" in
   *issueCreate*)   echo '{"data":{"issueCreate":{"success":true,"issue":{"id":"iss_1","identifier":"ENG-42","url":"https://linear.app/acme/issue/ENG-42"}}}}' ;;
-  *issueSearch*)   echo '{"data":{"issueSearch":{"nodes":[{"id":"iss_7","team":{"states":{"nodes":[{"id":"state_done"}]}}}]}}}' ;;
+  *issueSearch*)   echo '{"data":{"issueSearch":{"nodes":[{"id":"iss_7","state":{"type":"completed"},"team":{"states":{"nodes":[{"id":"state_done"}]}}}]}}}' ;;
   *issueUpdate*)   echo '{"data":{"issueUpdate":{"success":true}}}' ;;
   *commentCreate*) echo '{"data":{"commentCreate":{"success":true}}}' ;;
   *"issues("*)     echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
@@ -41,8 +41,10 @@ export LINEAR_TEAM_ID="team_xyz"
 run() {
   ( cd "$T" && . "$BACKEND"
     _BACKEND_RESULT=""
+    ITEM_STATE=""
     "$@"
-    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" )
+    printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+    printf 'ITEM_STATE=%s\n' "${ITEM_STATE:-}" )
 }
 
 # 1. add_item → issueCreate mutation carrying the title/body/teamId; returns DONE + the issue URL.
@@ -76,7 +78,14 @@ grep -q "issueUpdate" "$CURLLOG"   || fail "mark_shipped did not move the issue 
 grep -q "state_done" "$CURLLOG"     || fail "mark_shipped did not set the resolved Done stateId"
 pass
 
-# 4. absent key degrades loudly (no silent success), even with a fake curl available.
+# 4. item_state → issueSearch for state.type; maps completed → closed.
+: > "$CURLLOG"
+out="$(run _backend_item_state "provider-lib#ENG-7")"
+echo "$out" | grep -q "ITEM_STATE=closed" || fail "_backend_item_state did not return ITEM_STATE=closed ($out)"
+grep -q "issueSearch" "$CURLLOG" || fail "_backend_item_state did not call issueSearch"
+pass
+
+# 5. absent key degrades loudly (no silent success), even with a fake curl available.
 if ( cd "$T"; unset LINEAR_API_KEY; . "$BACKEND"; _backend_list_open ) >/dev/null 2>&1; then
   fail "list_open should fail when LINEAR_API_KEY is absent"
 fi
