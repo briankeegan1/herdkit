@@ -26,6 +26,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SLUG="${1:?usage: herd-resolve.sh <slug>   (slug = the existing worktree under the worktrees dir)}"
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+# Resolver work is mechanical merge-conflict fixing, not creative — default to the configured
+# resolver model (Sonnet); override with RESOLVER_MODEL=… for a specific run.
+RESOLVER_MODEL="${RESOLVER_MODEL:-$MODEL_RESOLVER}"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. The worktree must already exist — herd-resolve.sh resolves IN PLACE, it never creates one.
@@ -58,7 +61,7 @@ printf 'resolve·%s %s resolve\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 
 SMOKE_STEP=""
 [ -n "$SMOKE_CMD" ] && SMOKE_STEP="the project smoke test ($SMOKE_CMD) AND "
 TASK="You are a CONFLICT RESOLVER for one feature worktree. Goal: make this branch cleanly mergeable into the default branch WITHOUT changing either side's intent. Steps: (1) git fetch $HERD_REMOTE; merge $DEFAULT_BRANCH into this branch (git merge $DEFAULT_BRANCH). (2) If there are conflicts, resolve them PRESERVING BOTH sides' intent — mechanical conflicts (imports, adjacent edits, a helper that moved/was extracted, formatting) you resolve directly. (3) After resolving, run ${SMOKE_STEP}bash $HERE/healthcheck.sh on this worktree ($DIR); both must pass. (4) If everything resolves cleanly AND the checks are green AND you are confident the merge preserved both intents: commit the merge and git push (normal push to the feature branch, NEVER force, NEVER push to $HERD_BRANCH_NAME). The PR will then flip to CLEAN and the auto-merge watcher will merge it. (5) ESCALATION — if any conflict is SEMANTICALLY AMBIGUOUS (the same function/logic was changed two different ways and the correct combined result is unclear), DO NOT GUESS: abort the merge (git merge --abort), post a PR comment via gh pr comment summarizing both sides and what needs a human decision, print a clear line starting with 'ESCALATE:' explaining the ambiguity, and STOP. Never edit $BACKLOG_FILE. Never touch $HERD_BRANCH_NAME directly."
-herdr agent start "resolve·$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude $CLAUDE_FLAGS "$TASK"
+herdr agent start "resolve·$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$RESOLVER_MODEL" $CLAUDE_FLAGS "$TASK"
 
 # 4. LEFT pane (the tab's root): live app preview on a free port — only when configured.
 PORT=""

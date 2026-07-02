@@ -224,6 +224,7 @@ _On every invocation, read live state to surface what is configured:_
 - **MODEL_SCRIBE** — Claude model for the async backlog scribe drainer (default: claude-sonnet-4-6). _When: Override for backlog editing tasks._
 - **MODEL_RESEARCH** — Claude model for the async researcher drainer (default: claude-sonnet-4-6). _When: Override for repo research tasks._
 - **MODEL_REVIEW** — Claude model for the adversarial pre-merge review gate (default: claude-opus-4-8). _When: Override when a different model tier is preferred for correctness review._
+- **MODEL_RESOLVER** — Claude model for the isolated conflict-resolver agent (default: claude-sonnet-4-6). _When: Override for conflict resolution; resolvers do mechanical merge work, so a cheaper tier is usually fine._
 - **APP_PREVIEW_CMD** — Shell command to launch the live app preview pane (blank = no preview pane). _When: For projects with a runnable app; blank restricts lanes to herd-quick.sh only._
 - **HEALTHCHECK_CMD** — Project health command: exit 0 clean, exit 1 code error, exit 2 data/env tolerated. _When: Required for the heavy healthcheck profile; blank falls back to bash -n syntax check only._
 - **HEALTHCHECK_HEAVY_GLOB** — Egrep pattern of diff paths that force the heavy profile; blank means every change is heavy. _When: When only certain changed files need the full test suite (e.g. ^app/ for backend-only heavy runs)._

@@ -84,6 +84,11 @@ Repeat this loop:
    too early. Reserve line breaks for between list items and paragraphs.
    If an Edit fails because lines moved (the user edited concurrently), re-read and re-apply —
    never clobber their change.
+   SHIPPED (✅) items: never DELETE a shipped entry to make room. If a request asks you to cap the
+   "Recently shipped" list or drop the oldest shipped items, just prepend the new ✅ entry and leave
+   the rest in place — the commit step (step 3) AUTOMATICALLY rotates shipped entries beyond the most
+   recent ~10 into $REPO/${BACKLOG_FILE%.md}.archive.md (which the coordinator and builders never
+   read). Do not create or edit that archive file yourself; the commit step owns it.
 3. Run:  bash $HERE/scribe-step.sh commit <path> "<short summary>"
 4. Go to step 1.
 

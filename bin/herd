@@ -137,6 +137,145 @@ scout_repo() {
   printf 'lang=%s\nbacklog=%s\ntracker=%s\n' "$lang" "$backlog" "$tracker_hint"
 }
 
+# ── GitHub detection: repo-aware config defaults from branch protection (init-only) ─────────────
+# When a GitHub remote AND an authenticated gh CLI both exist, query the repo + its default-branch
+# protection to DERIVE SAFE config defaults. The safe direction is human-in-the-loop: a protected
+# default branch that requires PR review ⇒ MERGE_POLICY=approve (NEVER auto — auto-merging without
+# sign-off against a protected branch is the unsafe direction); the repo's allowed merge methods
+# constrain the MERGE_METHOD suggestion; required status checks are surfaced for the watcher's
+# mergeability gate. Everything else keeps today's defaults.
+#
+# detect_github prints a `key=value` contract on stdout — the same shape scout_repo uses, parsed by
+# the interview. It DEGRADES GRACEFULLY: no remote / no gh / unauthenticated ⇒ a single
+# `skip=<reason>` line and nothing else, so init NEVER hard-fails from detection. Every gh call
+# tolerates a non-zero exit (404 no-protection / 403 no-access) — absence of protection is a valid
+# finding, not an error. Bypass entirely with HERD_SKIP_GH_DETECT=1 (tests / offline).
+
+# _gh_repo_slug <root> <default_branch_ref> — resolve owner/repo from the remote behind the default
+# branch (DEFAULT_BRANCH=origin/main → remote 'origin'). Prints owner/repo for a github.com remote
+# (SSH scp-form, ssh://, or https://), empty for a non-GitHub host or no remote.
+_gh_repo_slug() {
+  local root="$1" ref="$2" remote url path owner repo
+  remote="${ref%%/*}"; [ -n "$remote" ] && [ "$remote" != "$ref" ] || remote="origin"
+  url="$(git -C "$root" remote get-url "$remote" 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  case "$url" in *github.com*) ;; *) return 0 ;; esac
+  path="${url#*github.com}"          # strip protocol + host, leaving ':owner/repo.git' or '/owner/repo.git'
+  path="${path#:}"; path="${path#/}" # drop the scp-form ':' or the url path '/'
+  path="${path%.git}"
+  owner="${path%%/*}"; repo="${path#*/}"; repo="${repo%%/*}"
+  [ -n "$owner" ] && [ -n "$repo" ] && [ "$owner" != "$path" ] && printf '%s/%s' "$owner" "$repo"
+}
+
+# _gh_repo_field <json> <key> — echo a top-level string field from repo JSON ('' on miss/bad JSON).
+_gh_repo_field() {
+  printf '%s' "$1" | KEY="$2" python3 -c 'import os,sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+v=d.get(os.environ["KEY"],"") if isinstance(d,dict) else ""
+print(v if v is not None else "")' 2>/dev/null || true
+}
+
+# _gh_merge_methods <repo-json> — echo the allowed merge methods as a comma list (merge,squash,rebase).
+_gh_merge_methods() {
+  printf '%s' "$1" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+if not isinstance(d,dict): d={}
+m=[]
+if d.get("allow_merge_commit"): m.append("merge")
+if d.get("allow_squash_merge"): m.append("squash")
+if d.get("allow_rebase_merge"): m.append("rebase")
+print(",".join(m))' 2>/dev/null || true
+}
+
+# _gh_protection <protection-json> — parse the branch-protection payload into three key=value lines:
+#   reviews_required=<0|1>   the required_pull_request_reviews block is present (human review gated)
+#   reviews=<n>              required_approving_review_count
+#   checks=<c1,c2,...>       required status-check contexts (legacy .contexts and newer .checks)
+_gh_protection() {
+  printf '%s' "$1" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+if not isinstance(d,dict): d={}
+pr=d.get("required_pull_request_reviews")
+req=1 if isinstance(pr,dict) else 0
+cnt=(pr.get("required_approving_review_count") or 0) if isinstance(pr,dict) else 0
+sc=d.get("required_status_checks") or {}
+ctx=[]
+if isinstance(sc,dict):
+    ctx=list(sc.get("contexts") or [])
+    for c in (sc.get("checks") or []):
+        if isinstance(c,dict) and c.get("context"): ctx.append(c["context"])
+seen=[]; [seen.append(c) for c in ctx if c and c not in seen]
+print("reviews_required=%d"%req)
+print("reviews=%d"%int(cnt))
+print("checks=%s"%",".join(seen))' 2>/dev/null || true
+}
+
+detect_github() {
+  local root="$1" ref="$2"
+  [ "${HERD_SKIP_GH_DETECT:-}" = "1" ] && { printf 'skip=detection disabled (HERD_SKIP_GH_DETECT=1)\n'; return 0; }
+
+  local slug; slug="$(_gh_repo_slug "$root" "$ref")"
+  [ -n "$slug" ]                          || { printf 'skip=no GitHub remote found\n'; return 0; }
+  command -v gh >/dev/null 2>&1           || { printf 'skip=gh CLI not installed\n'; return 0; }
+  gh auth status >/dev/null 2>&1          || { printf 'skip=gh not authenticated (run: gh auth login)\n'; return 0; }
+
+  # Default branch: the segment after remote/ in the ref (origin/main → main); the repo API below
+  # overrides it with the canonical name when reachable.
+  local branch="${ref#*/}"; { [ -n "$branch" ] && [ "$branch" != "$ref" ]; } || branch="main"
+
+  # (1) Repo metadata — allowed merge methods + canonical default branch. 403/404 tolerated.
+  local repo_json="" repo_ok=0 mm="" api_branch
+  if repo_json="$(gh api "repos/$slug" 2>/dev/null)"; then
+    repo_ok=1
+    api_branch="$(_gh_repo_field "$repo_json" default_branch)"
+    [ -n "$api_branch" ] && branch="$api_branch"
+    mm="$(_gh_merge_methods "$repo_json")"
+  fi
+
+  # (2) Branch protection on the default branch. A non-zero exit (404 = unprotected, 403 = no access)
+  #     is a valid finding, not an error.
+  local prot_json="" protected=0 reviews_required=0 reviews=0 checks="" parsed
+  if prot_json="$(gh api "repos/$slug/branches/$branch/protection" 2>/dev/null)"; then
+    protected=1
+    parsed="$(_gh_protection "$prot_json")"
+    reviews_required="$(printf '%s' "$parsed" | sed -n 's/^reviews_required=//p')"
+    reviews="$(printf '%s' "$parsed" | sed -n 's/^reviews=//p')"
+    checks="$(printf '%s' "$parsed" | sed -n 's/^checks=//p')"
+  fi
+
+  # (3) CODEOWNERS presence — the local working tree (init runs inside the repo checkout).
+  local codeowners=0 f
+  for f in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do
+    [ -f "$root/$f" ] && { codeowners=1; break; }
+  done
+
+  # (4) Derive SAFE defaults. Required human review ⇒ approve (never auto). Allowed merge methods
+  #     constrain the suggested method (prefer merge > squash > rebase among those allowed); when the
+  #     repo API was unreachable, keep today's default of a merge commit.
+  local policy="auto" method="merge"
+  [ "${reviews_required:-0}" = "1" ] && policy="approve"
+  case ",${mm}," in
+    *,merge,*)  method="merge"  ;;
+    *,squash,*) method="squash" ;;
+    *,rebase,*) method="rebase" ;;
+  esac
+
+  printf 'slug=%s\n'          "$slug"
+  printf 'branch=%s\n'        "$branch"
+  printf 'repo_ok=%s\n'       "$repo_ok"
+  printf 'protected=%s\n'     "$protected"
+  printf 'reviews_required=%s\n' "${reviews_required:-0}"
+  printf 'reviews=%s\n'       "${reviews:-0}"
+  printf 'checks=%s\n'        "$checks"
+  printf 'codeowners=%s\n'    "$codeowners"
+  printf 'merge_methods=%s\n' "$mm"
+  printf 'policy=%s\n'        "$policy"
+  printf 'method=%s\n'        "$method"
+}
+
 cmd_init() {
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
@@ -178,6 +317,45 @@ cmd_init() {
   worktrees="$(ask "WORKTREES_DIR (worktree pool, sibling, never committed)" "${project_root}-trees")"
   default_branch="$(ask "DEFAULT_BRANCH (remote/branch to fork+push)" "origin/$def_branch")"
   workspace="$(ask "WORKSPACE_NAME (herdr label)" "$(basename "$project_root")")"
+
+  # 2b. GitHub detection — repo-aware SAFE defaults from branch protection on the default branch.
+  #     Uses the resolved DEFAULT_BRANCH to find the remote; degrades to today's defaults (auto/merge)
+  #     when there is no remote / no gh / gh is unauthenticated. Never hard-fails init.
+  say ""
+  say "${c_bold}GitHub detection${c_rst}"
+  local det det_policy="auto" det_method="merge" det_skip=""
+  det="$(detect_github "$project_root" "$default_branch")"
+  det_skip="$(printf '%s' "$det" | sed -n 's/^skip=//p')"
+  if [ -n "$det_skip" ]; then
+    say "  ${c_dim}skipped — ${det_skip}; using defaults (MERGE_POLICY=auto, MERGE_METHOD=merge)${c_rst}"
+  else
+    local d_slug d_branch d_protected d_revreq d_reviews d_checks d_codeowners d_methods
+    d_slug="$(printf '%s' "$det" | sed -n 's/^slug=//p')"
+    d_branch="$(printf '%s' "$det" | sed -n 's/^branch=//p')"
+    d_protected="$(printf '%s' "$det" | sed -n 's/^protected=//p')"
+    d_revreq="$(printf '%s' "$det" | sed -n 's/^reviews_required=//p')"
+    d_reviews="$(printf '%s' "$det" | sed -n 's/^reviews=//p')"
+    d_checks="$(printf '%s' "$det" | sed -n 's/^checks=//p')"
+    d_codeowners="$(printf '%s' "$det" | sed -n 's/^codeowners=//p')"
+    d_methods="$(printf '%s' "$det" | sed -n 's/^merge_methods=//p')"
+    det_policy="$(printf '%s' "$det" | sed -n 's/^policy=//p')"; : "${det_policy:=auto}"
+    det_method="$(printf '%s' "$det" | sed -n 's/^method=//p')"; : "${det_method:=merge}"
+    say "  repo:            $d_slug"
+    if [ "$d_protected" = "1" ]; then
+      if [ "${d_revreq:-0}" = "1" ]; then
+        say "  default branch:  $d_branch ${c_grn}(protected · ${d_reviews:-0} required review$([ "${d_reviews:-0}" = "1" ] || printf 's'))${c_rst}"
+      else
+        say "  default branch:  $d_branch ${c_grn}(protected · no required review)${c_rst}"
+      fi
+      say "  required checks: ${d_checks:-none}"
+    else
+      say "  default branch:  $d_branch ${c_dim}(no branch protection detected)${c_rst}"
+    fi
+    say "  CODEOWNERS:      $([ "$d_codeowners" = "1" ] && printf 'present' || printf 'none')"
+    say "  merge methods:   ${d_methods:-unknown}"
+    say "  ${c_bold}→ derived:${c_rst}       MERGE_POLICY=${c_bold}${det_policy}${c_rst}  MERGE_METHOD=${c_bold}${det_method}${c_rst}"
+    [ "$det_policy" = "approve" ] && say "  ${c_dim}(required review ⇒ approve, not auto — merges wait for explicit sign-off)${c_rst}"
+  fi
 
   # 3. Work-tracker discovery dialogue.
   say ""
@@ -247,6 +425,14 @@ cmd_init() {
 
   local herd_repo; herd_repo="$(ask "HERD_REPO (where engine bugs escalate)" "briankeegan1/herdkit")"
 
+  # 4b. Merge policy + method — seeded from GitHub detection (protected + required review ⇒ approve).
+  #     The human can still override either here; detection only chooses the SAFE default.
+  say ""
+  say "${c_bold}Merge policy${c_rst}"
+  local merge_policy merge_method
+  merge_policy="$(ask "MERGE_POLICY (auto merges on green / approve holds for sign-off / observe never merges)" "$det_policy")"
+  merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
+
   # 5. Write .herd/config.
   mkdir -p "$project_root/.herd"
   local cfg="$project_root/.herd/config"
@@ -282,6 +468,12 @@ MODEL_REVIEW="claude-opus-4-8"
 DENY_PATHS="$deny"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
 COORDINATOR_CMD="/coordinator"
+
+# Merge gate — MERGE_POLICY: auto (merge on green) | approve (hold for sign-off) | observe (never).
+# Seeded by 'herd init' GitHub detection: a protected default branch requiring PR review defaults to
+# 'approve' (never 'auto' — merging without human sign-off against a protected branch is unsafe).
+MERGE_POLICY="$merge_policy"
+MERGE_METHOD="$merge_method"
 WATCHER_AUTOMERGE="true"
 HERD_REPO="$herd_repo"
 EOF

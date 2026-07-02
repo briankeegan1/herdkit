@@ -59,6 +59,7 @@ fi
 : "${MODEL_SCRIBE:="claude-sonnet-4-6"}"
 : "${MODEL_RESEARCH:="claude-sonnet-4-6"}"
 : "${MODEL_REVIEW:="claude-opus-4-8"}"
+: "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
