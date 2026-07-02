@@ -58,7 +58,7 @@ fi
 herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null
 
 # 3. Right pane = coordinator Claude, auto-running the generated coordinator skill.
-started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --cwd "$REPO" --tab "$TAB" --split right -- claude "$COORDINATOR_CMD")
+started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --workspace "$WS" --cwd "$REPO" --tab "$TAB" --split right -- claude "$COORDINATOR_CMD")
 AGENT_PANE=$(printf '%s' "$started" | python3 -c \
   'import sys,json; print(json.load(sys.stdin)["result"]["agent"]["pane_id"])')
 

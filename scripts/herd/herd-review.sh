@@ -54,6 +54,7 @@ SLUG="${2:?usage: herd-review.sh <pr> <slug>}"
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
+_WS_ID="$(herd_resolve_workspace_id)"
 
 # Review FROM the feature worktree if it still exists (gives the reviewer the diff's repo context
 # + any AGENTS.md/CLAUDE.md); otherwise fall back to the main checkout. `gh pr diff` works from
@@ -159,7 +160,7 @@ except Exception:
 ' 2>/dev/null || true)"
   [ -n "${_old_tab:-}" ] && herdr tab close "$_old_tab" >/dev/null 2>&1 || true
 
-  created="$(herdr tab create --cwd "$CWD" --label "review·$SLUG" --no-focus 2>/dev/null || true)"
+  created="$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$CWD" --label "review·$SLUG" --no-focus 2>/dev/null || true)"
   read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
     'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
   if [ -n "${ROOT:-}" ]; then
