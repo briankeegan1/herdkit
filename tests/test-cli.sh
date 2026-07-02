@@ -39,4 +39,9 @@ diff -q "$T/skill.before" "$T/.claude/commands/coordinator.md" >/dev/null || fai
 ( cd "$T" && bash "$HERD" upgrade >/dev/null ) || fail "herd upgrade failed"
 grep -qE '^HERD_VERSION=1$' "$T/.herd/config" || fail "upgrade clobbered HERD_VERSION"
 
+# 6. rendered skill carries the cross-session context-persistence tenet (issue #19).
+grep -q "Persist project & domain context" "$T/.claude/commands/coordinator.md" || fail "skill missing context-persistence tenet heading"
+grep -q "local project memory store" "$T/.claude/commands/coordinator.md" || fail "skill missing local project memory store tenet"
+grep -qi "gitignored"                 "$T/.claude/commands/coordinator.md" || fail "skill missing gitignored memory-contract statement"
+
 echo "ALL PASS"
