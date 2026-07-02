@@ -192,5 +192,24 @@ except Exception:
       [ -n "$_td_still" ] && printf '⚠️  herdkit: tab %s (slug: %s) could not be closed after retry — close it manually.\n' "$_td_id" "$_td_slug" >&2
     fi
   done <<< "$_td_ids"
+  # Remove all registry entries for this slug (builder, review·, resolve· variants).
+  local _td_reg="$WORKTREES_DIR/.herd-tabs"
+  if [ -f "$_td_reg" ]; then
+    SLUG="$_td_slug" python3 -c '
+import os, sys
+slug = os.environ["SLUG"]
+mid  = "·"
+to_remove = {slug, "review" + mid + slug, "resolve" + mid + slug}
+path = sys.argv[1]
+try:
+    with open(path) as f: lines = f.readlines()
+    with open(path, "w") as f:
+        for line in lines:
+            parts = line.strip().split(" ", 2)
+            if not (parts and parts[0] in to_remove):
+                f.write(line)
+except Exception: pass
+' "$_td_reg" 2>/dev/null || true
+  fi
   return 0
 }

@@ -288,17 +288,21 @@ do_merge() {
   return 0
 }
 
-# _sweep_orphan_tabs — close any herd-managed tabs whose slug no longer has a live worktree or
+# _sweep_orphan_tabs — close engine-created tabs whose slug no longer has a live worktree or
 # an open PR. Runs every _ORPHAN_SWEEP_INTERVAL ticks (~60 s). Scoped to this project's
 # workspace to avoid touching another project's tabs. Skipped in dry-run mode.
 #
-# "Herd-managed" means the tab label is one of:
-#   review·<slug>   — review-gate visibility tab  (definitely herd-created)
-#   resolve·<slug>  — conflict-resolver tab        (definitely herd-created)
-#   <slug>          — builder tab (bare slug, no middle dot, not the coordinator label)
+# ALLOWLIST model: the sweep ONLY ever considers tabs listed in $TREES/.herd-tabs — a registry
+# written by the lane scripts (herd-feature, herd-resolve, herd-review) when they create a
+# reapable tab. Tabs the engine never created (user tabs like playground-*, watch-*) are simply
+# not in the registry and therefore can never be swept, regardless of their label.
 #
-# A slug is "live" if ANY live worktree has that basename, OR ANY open PR's headRefName ends
-# with that slug (last path component). Orphaned = not live → close.
+# MIGRATION mode (registry file absent): on first run before any engine tab has been recorded,
+# fall back to sweeping review·<slug> / resolve·<slug> labels for dead slugs only — NEVER bare
+# labels. This prevents sweeping user tabs during the transition to the registry model.
+#
+# Self-exclusion: HERD_WATCHER_TAB_ID (set by coordinator.sh via --env) is always excluded even
+# if it somehow appeared in the registry, so the watcher can never sweep its own host tab.
 _sweep_orphan_tabs() {
   [ -n "$DRYRUN" ] && return 0
   command -v herdr >/dev/null 2>&1 || return 0
@@ -334,37 +338,68 @@ except Exception:
   local _sw_live
   _sw_live="$(printf '%s\n%s\n' "$_sw_wt_slugs" "$_sw_pr_slugs" | sort -u | grep -v '^$' || true)"
 
-  # Find orphaned tab IDs and close them. Exclude all per-project singleton tabs
-  # (coordinator, scribe, researcher) — they are bare-label tabs with no worktree
-  # or PR, so without this exclusion the sweep would kill them every ~60 s.
+  local _sw_registry="$TREES/.herd-tabs"
+  local _sw_self_tab="${HERD_WATCHER_TAB_ID:-}"
+
+  # Find orphaned tab IDs.
+  # Allowlist mode (registry file present): only tabs listed in the registry.
+  # Migration mode (no registry): only review·<slug>/resolve·<slug> labels; NEVER bare labels.
   local _sw_orphans
   _sw_orphans="$(printf '%s' "$_sw_tabs" \
-    | WS="$_sw_wsid" LIVE="$_sw_live" \
-      SINGLETONS="${HERD_TAB_COORDINATOR}:${HERD_AGENT_SCRIBE}:${HERD_AGENT_RESEARCHER}" \
+    | WS="$_sw_wsid" LIVE="$_sw_live" SELF_TAB="$_sw_self_tab" \
+      REGISTRY_PATH="$_sw_registry" \
       python3 -c '
 import sys, json, os
-ws         = os.environ.get("WS", "")
-live       = set(os.environ.get("LIVE","").split("\n")) - {""}
-singletons = set(os.environ.get("SINGLETONS","").split(":")) - {""}
-MID        = "·"
+
+ws        = os.environ.get("WS", "")
+live      = set(os.environ.get("LIVE","").split("\n")) - {""}
+self_tab  = os.environ.get("SELF_TAB", "")
+reg_path  = os.environ.get("REGISTRY_PATH", "")
+MID       = "·"
+
+# Load registry (tab_id -> slug).  Absent file → migration mode.
+reg_exists = False
+registry   = {}
+try:
+    with open(reg_path) as rf:
+        reg_exists = True
+        for line in rf:
+            parts = line.strip().split(" ", 2)
+            if len(parts) >= 2:
+                label, tab_id = parts[0], parts[1]
+                if label.startswith("review" + MID):
+                    slug = label[len("review" + MID):]
+                elif label.startswith("resolve" + MID):
+                    slug = label[len("resolve" + MID):]
+                else:
+                    slug = label
+                if tab_id:
+                    registry[tab_id] = slug
+except Exception:
+    pass
+
 try:
   tabs = json.load(sys.stdin).get("result",{}).get("tabs",[])
   for t in tabs:
-    label = t.get("label","") or ""
-    if not label or label in singletons:
-      continue
-    if ws and t.get("workspace_id","") != ws:
-      continue
-    if label.startswith("review" + MID):
-      slug = label[len("review" + MID):]
-    elif label.startswith("resolve" + MID):
-      slug = label[len("resolve" + MID):]
-    elif MID not in label:
-      slug = label
+    tab_id = t.get("tab_id","") or ""
+    label  = t.get("label","") or ""
+    if not tab_id or not label: continue
+    if self_tab and tab_id == self_tab: continue
+    if ws and t.get("workspace_id","") != ws: continue
+    if reg_exists:
+      # Allowlist mode: only registered tabs are candidates.
+      if tab_id not in registry: continue
+      slug = registry[tab_id]
     else:
-      continue
+      # Migration mode: only review·/resolve· labels; never bare labels.
+      if label.startswith("review" + MID):
+        slug = label[len("review" + MID):]
+      elif label.startswith("resolve" + MID):
+        slug = label[len("resolve" + MID):]
+      else:
+        continue
     if slug and slug not in live:
-      print(t["tab_id"])
+      print(tab_id)
 except Exception:
   pass
 ' 2>/dev/null || true)"
@@ -374,6 +409,23 @@ except Exception:
   while IFS= read -r _sw_id; do
     [ -n "$_sw_id" ] || continue
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
+    # Remove the swept tab from the registry so it doesn't accumulate stale entries.
+    if [ -f "$_sw_registry" ]; then
+      TAB_ID="$_sw_id" REGISTRY_PATH="$_sw_registry" python3 -c '
+import os
+path = os.environ.get("REGISTRY_PATH", "")
+tid  = os.environ.get("TAB_ID", "")
+if not path or not tid: exit(0)
+try:
+    with open(path) as f: lines = f.readlines()
+    with open(path, "w") as f:
+        for line in lines:
+            parts = line.strip().split(" ", 2)
+            if not (len(parts) >= 2 and parts[1] == tid):
+                f.write(line)
+except Exception: pass
+' 2>/dev/null || true
+    fi
   done <<< "$_sw_orphans"
 }
 

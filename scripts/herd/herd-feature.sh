@@ -45,6 +45,8 @@ if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
   echo "❌ herdr unavailable (could not create a tab for '$SLUG'); worktree is ready at $DIR but no panes were launched." >&2
   exit 1
 fi
+# Register in the sweep allowlist so only engine-created tabs are ever swept.
+printf '%s %s builder\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 
 # 3. RIGHT pane: the Claude sub-agent (yolo by default). The seeded task plus the standing
 #    workflow rules become its opening prompt.

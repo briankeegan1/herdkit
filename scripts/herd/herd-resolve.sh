@@ -48,6 +48,8 @@ if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
   echo "❌ herdr unavailable (could not create a resolve tab for '$SLUG'); worktree is at $DIR but no panes were launched." >&2
   exit 1
 fi
+# Register in the sweep allowlist so only engine-created tabs are ever swept.
+printf 'resolve·%s %s resolve\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 
 # 3. RIGHT pane: the Claude resolver agent (yolo by default). The STANDARD resolver task is its
 #    opening prompt — fixed, not free-form: the coordinator does not hand-tune it. The smoke step
