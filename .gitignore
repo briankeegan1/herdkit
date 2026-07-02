@@ -1,9 +1,15 @@
 # herdkit — code only. Never commit secrets or per-machine state.
-.herd/secrets          # API-backend credentials (Linear/Jira/DevOps) — gitignored by contract
+# NOTE: git treats an inline "# comment" as part of the pattern, so a commented ignore line
+# silently matches nothing. Keep every comment on its OWN line — patterns stay bare.
+
+# API-backend credentials (Linear/Jira/DevOps) — gitignored by contract.
+.herd/secrets
 *.log
 .DS_Store
 
-# worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo)
+# worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo).
 *-trees/
-.claude/settings.local.json   # machine-local permission grants — never commit
-.claude/settings.json         # machine-local trust marker — auto-written by new-feature.sh
+
+# machine-local Claude Code state — never committed.
+.claude/settings.local.json
+.claude/settings.json

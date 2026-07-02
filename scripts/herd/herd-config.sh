@@ -216,3 +216,96 @@ except Exception: pass
   fi
   return 0
 }
+
+# herd_pretrust_worktree <dir> — mark a worktree as trusted for Claude Code so a builder agent
+# launched in it never stalls on the interactive "Do you trust the files in this folder?" gate and
+# dies with zero commits.
+#
+# Claude Code records folder trust in ~/.claude.json under projects["<abs-path>"].hasTrustDialogAccepted
+# (verified empirically) — NOT in any project-level .claude/settings.json, which is why PR #22's
+# settings-file seeding was ineffective. It cannot be skipped via a launch flag either:
+# --dangerously-skip-permissions bypasses tool-permission prompts but NOT the trust dialog in an
+# interactive/pane session (only fully non-interactive `-p` runs skip it), so we must seed the entry
+# on disk before launch.
+#
+# The write is ADDITIVE and SAFE: it sets only that one boolean on the worktree's own project entry,
+# never touching other projects or any top-level key; it round-trips through a temp file + atomic
+# os.replace so an interrupted write can't truncate ~/.claude.json; it tolerates a missing or
+# malformed file (starting fresh from {}); and it makes a one-time ~/.claude.json.bak before its
+# first modification. Best-effort: any failure warns but returns 0 so it never aborts worktree
+# creation — worst case the agent hits the prompt, which the stalled-builder detector already flags.
+herd_pretrust_worktree() {
+  local _pt_dir="${1:-}"
+  [ -n "$_pt_dir" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '⚠️  herdkit: python3 not found — cannot pre-trust %s for Claude Code (agent may stall on the folder-trust prompt)\n' "$_pt_dir" >&2
+    return 0
+  fi
+  # Key by the PHYSICAL, symlink-resolved absolute path: that is what Claude Code's process.cwd()
+  # records, so keying by a logical path with unresolved symlinks would seed the wrong entry.
+  local _pt_abs
+  _pt_abs="$(cd "$_pt_dir" 2>/dev/null && pwd -P)" || _pt_abs="$_pt_dir"
+  if ! HERD_PRETRUST_DIR="$_pt_abs" python3 - "$HOME/.claude.json" <<'PY'
+import json, os, sys, tempfile
+
+path = sys.argv[1]                        # ~/.claude.json — Claude Code's per-user state file
+proj = os.environ["HERD_PRETRUST_DIR"]    # absolute worktree path to mark trusted
+
+# Read-modify-write, tolerant of a missing OR corrupt file (start fresh from {} in both cases).
+data = {}
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except (ValueError, OSError):
+    data = {}
+
+projects = data.get("projects")
+if not isinstance(projects, dict):
+    projects = {}
+entry = projects.get(proj)
+if not isinstance(entry, dict):
+    entry = {}
+
+# Idempotent: already trusted → touch nothing (no write, no backup churn).
+if entry.get("hasTrustDialogAccepted") is True:
+    sys.exit(0)
+
+# One-time backup before the FIRST modification, so a bad write stays recoverable. Only when an
+# original exists and no backup has been taken yet.
+bak = path + ".bak"
+if os.path.exists(path) and not os.path.exists(bak):
+    try:
+        with open(path, "rb") as src, open(bak, "wb") as dst:
+            dst.write(src.read())
+    except OSError:
+        pass
+
+entry["hasTrustDialogAccepted"] = True
+projects[proj] = entry
+data["projects"] = projects
+
+# Atomic write: temp file in the same dir + os.replace so ~/.claude.json is never seen truncated.
+d = os.path.dirname(path) or "."
+os.makedirs(d, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".claude.json.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    printf '⚠️  herdkit: could not pre-trust %s for Claude Code (agent may hit the folder-trust prompt)\n' "$_pt_abs" >&2
+  fi
+  return 0
+}
