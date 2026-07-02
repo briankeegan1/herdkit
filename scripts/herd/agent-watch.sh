@@ -69,6 +69,10 @@ RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
 # ONCE PER COMMIT — a recorded BLOCK is read back instead of re-spawning the reviewer; a recorded
 # PASS lets a retried merge skip straight to merging. A new commit changes the sha → fresh review.
 REVIEW_STATE="$TREES/.agent-watch-reviewed"
+# Override ledger: one line per human override of a cached BLOCK.
+# Format: "<epoch> override <pr#> <headSha>"
+# Written by herd-approve.sh override <pr#>; keyed by sha so a new commit invalidates the override.
+OVERRIDES="$TREES/.agent-watch-overrides"
 # Approval ledger (MERGE_POLICY=approve|observe): one line per record, append-only.
 # Format: "<epoch> awaiting <pr#> <headSha>"  — watcher noted gates passed, awaiting human approval
 #         "<epoch> approved <pr#> <headSha>"  — herd-approve.sh wrote explicit approval for this sha
@@ -208,6 +212,13 @@ review_verdict() {
 # record_review <pr#> <headSha> <verdict> — append one review record (the instant a verdict known).
 record_review() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REVIEW_STATE"
+}
+
+# override_exists <pr#> <headSha> — true if a human override was recorded for this exact pr+sha.
+# A new commit changes the sha → override does not carry over.
+override_exists() {
+  [ -s "$OVERRIDES" ] || return 1
+  grep -q "^[0-9]* override $1 $2$" "$OVERRIDES" 2>/dev/null
 }
 
 # approval_awaiting_noted <pr#> <headSha> — true if we already recorded an awaiting-approval notice.
@@ -480,10 +491,16 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
     fi
     prior="$(review_verdict "$prnum" "$rsha" || true)"
     if [ "$prior" = "BLOCK" ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review blocked${C_RESET}"
-      render
-      continue
-    elif [ "$prior" != "PASS" ]; then
+      if override_exists "$prnum" "$rsha"; then
+        # Human override recorded for this sha — treat as PASS and proceed to merge path.
+        prior="PASS"
+      else
+        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
+        render
+        continue
+      fi
+    fi
+    if [ "$prior" != "PASS" ]; then
       DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing…${C_RESET}"
       render
       verdict_line="$(bash "$HERE/herd-review.sh" "$prnum" "$slug" 2>/dev/null | grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' | tail -1)"
@@ -502,7 +519,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       fi
       record_review "$prnum" "$rsha" "$verdict"
       if [ "$verdict" != "PASS" ]; then
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review blocked${C_RESET}"
+        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
         render
         continue
       fi
