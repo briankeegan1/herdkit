@@ -22,6 +22,26 @@
 # herd-feature.sh, herd-quick.sh, and used by agent-watch.sh as the pre-merge gate (--oneline by
 # app-monitor.sh for the live status pane).
 #
+# ── Interaction gate (framework-generic; layered on top of either profile) ────────────────────
+# A render smoke ("does the app boot / render?") is blind to broken interactivity: a widget whose
+# value no longer affects output still renders clean and passes. Two OPTIONAL .herd/config keys
+# let a project close that gap WITHOUT the engine hardcoding any UI framework:
+#   • APP_SURFACE_GLOB     — egrep of diff paths that constitute the app surface (e.g. '^app/').
+#                            EMPTY (default) → the gate is OFF entirely: zero behavior change for
+#                            every existing project.
+#   • INTERACTION_TEST_CMD — project command that DRIVES a widget/input and asserts the dependent
+#                            output actually changed (e.g. an `st.testing.v1.AppTest` harness: set
+#                            a value, re-run, assert the output moved). Invoked as
+#                            $INTERACTION_TEST_CMD <worktree-dir> [--oneline]; same exit contract
+#                            as HEALTHCHECK_CMD — 0 clean · 1 code error · 2 data/env (tolerated).
+# When the diff touches APP_SURFACE_GLOB:
+#   · INTERACTION_TEST_CMD set   → run it and GATE (a code error blocks the merge, like the heavy
+#                                  profile; exit 2 is tolerated as a data/env ⚠️).
+#   · INTERACTION_TEST_CMD empty → emit a loud one-line WARNING (flag-the-absence, never red): the
+#                                  render smoke cannot see widget→output causality, so the PR gate
+#                                  trail records the gap instead of silently green-lighting it.
+# The gate is keyed on APP_SURFACE_GLOB alone — independent of the heavy/light HEALTHCHECK_HEAVY_GLOB.
+#
 # Exit: 0 = clean (or only data/env issues) · 1 = real code error.
 set -u
 DIR=""
@@ -133,7 +153,81 @@ EOF
   exit 0
 }
 
-case "$MODE" in
-  heavy) run_heavy ;;
-  light) run_light ;;
+# ── interaction gate: run INTERACTION_TEST_CMD, or flag its absence, for app-surface PRs ──────
+# Keyed on APP_SURFACE_GLOB (independent of the heavy/light profile). Sets:
+#   IG_STATE  = DISABLED | WARN | CLEAN | DATAENV | CODEERROR
+#   IG_REASON = one-line reason (tail of the command output; the fixed warning text for WARN)
+#   IG_FULL   = full command output (empty unless the command actually ran)
+IG_STATE="DISABLED"; IG_REASON=""; IG_FULL=""
+run_interaction_gate() {
+  [ -n "$APP_SURFACE_GLOB" ] || return 0            # feature off → zero behavior change
+  local changed; changed="$(_changed_files)"
+  [ -n "$changed" ] || return 0                     # nothing changed to compare → nothing to gate
+  printf '%s\n' "$changed" | grep -qE "$APP_SURFACE_GLOB" || return 0   # diff misses the app surface
+
+  if [ -z "$INTERACTION_TEST_CMD" ]; then           # app-surface PR, but no interaction tests declared
+    IG_STATE="WARN"
+    IG_REASON="app-surface PR with no interaction tests declared — render smoke cannot see widget→output causality"
+    return 0
+  fi
+
+  local out rc
+  if [ -n "$ONELINE" ]; then
+    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR' --oneline" 2>&1)"; rc=$?
+  else
+    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR'" 2>&1)"; rc=$?
+  fi
+  IG_FULL="$out"; IG_REASON="$(printf '%s' "$out" | tail -1)"
+  case "$rc" in
+    0) IG_STATE="CLEAN" ;;
+    1) IG_STATE="CODEERROR" ;;
+    *) IG_STATE="DATAENV" ;;
+  esac
+}
+
+# ── run the selected profile, then fold the interaction gate into one verdict ─────────────────
+# run_heavy/run_light print their verdict and exit; capture both inside a command substitution so
+# a single coherent healthcheck result can layer the interaction gate on top. (Wrapped in a
+# function because bash 3.2 mis-parses a `case`'s `)` inside `$( … )`.)
+run_profile() {
+  case "$MODE" in
+    heavy) run_heavy ;;
+    light) run_light ;;
+  esac
+}
+MAIN_OUT="$(run_profile)"; MAIN_RC=$?
+
+run_interaction_gate
+
+# Combined exit: a real CODE error on EITHER the profile or the interaction gate blocks the merge.
+RC=0
+[ "$MAIN_RC" -eq 1 ] && RC=1
+[ "$IG_STATE" = "CODEERROR" ] && RC=1
+
+if [ -n "$ONELINE" ]; then
+  # Exactly ONE line — the watcher paints healthcheck --oneline as a single status row.
+  if [ "$RC" -eq 1 ]; then
+    if [ "$MAIN_RC" -eq 1 ]; then printf '%s\n' "$MAIN_OUT"
+    else printf '❌ interaction — %s\n' "$IG_REASON"; fi
+  else
+    case "$IG_STATE" in
+      WARN)    printf '⚠️  %s\n' "$IG_REASON" ;;
+      DATAENV) printf '⚠️  interaction data/env (not a code bug) — %s\n' "$IG_REASON" ;;
+      *)       printf '%s\n' "$MAIN_OUT" ;;
+    esac
+  fi
+  exit "$RC"
+fi
+
+# Full mode: the profile's verdict, then the interaction-gate section.
+printf '%s\n' "$MAIN_OUT"
+case "$IG_STATE" in
+  DISABLED) : ;;
+  CLEAN)     printf '✅ INTERACTION TESTS CLEAN — %s\n' "$IG_REASON" ;;
+  WARN)      printf '⚠️  INTERACTION TESTS: %s\n' "$IG_REASON" ;;
+  DATAENV)   printf '⚠️  INTERACTION TESTS: data/env (not a code bug) — %s\n' "$IG_REASON"
+             [ -n "$IG_FULL" ] && printf '%s\n' "$IG_FULL" ;;
+  CODEERROR) printf '❌ INTERACTION TESTS FAILED — %s\n' "$IG_REASON"
+             [ -n "$IG_FULL" ] && printf '%s\n' "$IG_FULL" ;;
 esac
+exit "$RC"
