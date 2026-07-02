@@ -39,10 +39,11 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/gh"; chmod +x "$BIN/gh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/git"; chmod +x "$BIN/git"
 
 # herdr stub: behaviour controlled per-test via log files and response files.
-#   HERDR_AGENT_LIST_RESP  — JSON for 'herdr agent list'
-#   HERDR_TAB_LIST_RESP    — JSON for 'herdr tab list'
-#   HERDR_AGENT_START_RESP — JSON for 'herdr agent start'
-#   HERDR_CALL_LOG         — appends each herdr call as one line
+#   HERDR_AGENT_LIST_RESP   — JSON for 'herdr agent list'
+#   HERDR_TAB_LIST_RESP     — JSON for 'herdr tab list'
+#   HERDR_AGENT_START_RESP  — JSON for 'herdr agent start'
+#   HERDR_CALL_LOG          — appends each herdr call as one line
+#   HERD_REVIEW_AGENT_TEMP  — (herd-review.sh env) points the script to the test's agent temp
 cat > "$BIN/herdr" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${HERDR_CALL_LOG:-/dev/null}" 2>/dev/null || true
@@ -115,11 +116,14 @@ _agent_list_with_builder
 _tab_list_with_builder
 _agent_start_success
 
-RES="$T/result-1-sha1"
-# Simulate the agent writing the result file 1s after start
-( sleep 1; printf 'REVIEW: PASS\n' > "$RES" ) &
+AGENT_TEMP1="$T/agent-temp-1"   # private temp the "agent" writes to
+RES="$T/result-1-sha1"           # $HERD_REVIEW_RESULT_FILE — atomically written by herd-review.sh
+# Simulate the agent writing its verdict to the private temp 1s after start.
+# herd-review.sh reads this and then atomically writes $RES itself via _emit_verdict.
+( sleep 1; printf 'REVIEW: PASS\n' > "$AGENT_TEMP1" ) &
 
-out="$(HERD_REVIEW_RESULT_FILE="$RES" \
+out="$(HERD_REVIEW_AGENT_TEMP="$AGENT_TEMP1" \
+       HERD_REVIEW_RESULT_FILE="$RES" \
        HERD_REVIEW_AGENT_TIMEOUT=15 HERD_REVIEW_AGENT_POLL=1 \
        bash "$REVIEW" 1 test-slug 2>/dev/null)"
 rc=$?
@@ -181,10 +185,12 @@ _agent_list_with_builder
 _tab_list_with_builder
 _agent_start_success
 
+AGENT_TEMP3="$T/agent-temp-3"
 RES="$T/result-3-sha3"
-( sleep 1; printf 'REVIEW: BLOCK — off by one in the accumulation loop\n' > "$RES" ) &
+( sleep 1; printf 'REVIEW: BLOCK — off by one in the accumulation loop\n' > "$AGENT_TEMP3" ) &
 
-out="$(HERD_REVIEW_RESULT_FILE="$RES" \
+out="$(HERD_REVIEW_AGENT_TEMP="$AGENT_TEMP3" \
+       HERD_REVIEW_RESULT_FILE="$RES" \
        HERD_REVIEW_AGENT_TIMEOUT=15 HERD_REVIEW_AGENT_POLL=1 \
        bash "$REVIEW" 3 test-slug 2>/dev/null)"
 rc=$?
@@ -232,9 +238,11 @@ _agent_list_with_builder
 _tab_list_with_builder
 _agent_start_success
 
+AGENT_TEMP5="$T/agent-temp-5"
 RES="$T/result-5-sha5"
-# Nobody writes $RES — agent pane never completes.
-out="$(HERD_REVIEW_RESULT_FILE="$RES" \
+# Nobody writes $AGENT_TEMP5 — simulates agent pane never completing its verdict.
+out="$(HERD_REVIEW_AGENT_TEMP="$AGENT_TEMP5" \
+       HERD_REVIEW_RESULT_FILE="$RES" \
        HERD_REVIEW_AGENT_TIMEOUT=3 HERD_REVIEW_AGENT_POLL=1 \
        bash "$REVIEW" 5 test-slug 2>/dev/null)"
 rc=$?
@@ -250,6 +258,9 @@ grep -q '^REVIEW: INFRA-FAIL' "$RES" || fail "5: result file should contain REVI
 ok
 # INFRA-FAIL must NOT say 'BLOCK' (it is not a verdict; watcher must not cache it).
 grep -q 'BLOCK' "$RES" && fail "5: INFRA-FAIL result file must not contain BLOCK" || true
+ok
+# On timeout the orphaned reviewer pane must be closed so it cannot later overwrite the verdict.
+grep -q 'pane close reviewPane1' "$HERDR_CALL_LOG" || fail "5: herdr pane close should be called to kill orphaned reviewer on timeout"
 ok
 
 echo "ALL PASS ($pass checks)"

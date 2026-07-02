@@ -95,11 +95,24 @@ _emit_verdict() {
   fi
 }
 
+# _teardown_reviewer — called on every non-success exit path when in agent-pane mode.
+# Closes the detached reviewer pane so it cannot outlive the gate and later overwrite the
+# watcher's result file (e.g. a timed-out agent writing REVIEW: PASS after INFRA-FAIL
+# was already written would appear to the watcher as a fresh verdict, potentially driving
+# a merge from a dead cycle). Also removes the private agent temp.
+_teardown_reviewer() {
+  if [ "${_AGENT_PANE_MODE:-0}" = "1" ] && [ -n "${ROOT:-}" ]; then
+    herdr pane close "$ROOT" >/dev/null 2>&1 || true
+  fi
+  [ -n "${_agent_result_file:-}" ] && rm -f "$_agent_result_file" 2>/dev/null || true
+}
+
 # A SEVERED review (killed by a stray sweep, or its stdout pipe torn down by a dying watcher) is
 # an INFRA failure, NOT a refused verdict: report INFRA-FAIL so the watcher retries instead of
 # caching a bogus BLOCK against the sha. With PIPE trapped, writes to a broken stdout return an
 # error (handled in _emit_verdict) instead of killing us before we can report.
 _severed() {
+  _teardown_reviewer
   _emit_verdict 'REVIEW: INFRA-FAIL — review severed (SIGTERM/SIGPIPE) before a verdict'
   exit 2
 }
@@ -151,8 +164,10 @@ emit_block() {
 # emit_infra_fail <reason> — TRANSIENT infrastructure failure. The reviewer COULD NOT RUN; this is
 # NOT a finding. Prints REVIEW: INFRA-FAIL (exit 2) so the watcher knows NOT to cache the result —
 # it will surface "review errored · will retry" and re-attempt next cycle. Does NOT post a PR
-# comment (no finding to report; a comment on every retry would be spammy).
+# comment (no finding to report; a comment on every retry would be spammy). Kills any detached
+# agent pane first so it cannot outlive the gate and overwrite the INFRA-FAIL verdict.
 emit_infra_fail() {
+  _teardown_reviewer
   _emit_verdict "REVIEW: INFRA-FAIL — $1"
   exit 2
 }
@@ -186,13 +201,16 @@ printf '%s\n' "$LOG" > "$_LOG_TRACK" 2>/dev/null || true
 # one machine verdict printed as the final line (parsed from $LOG).
 TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for PR #${PR} (branch slug '${SLUG}') of the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read THIS PR's diff with 'gh pr diff ${PR}' and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The only write you may do is ONE 'gh pr comment ${PR} --body \"…\"'. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) Post a brief PR comment summarizing your finding via 'gh pr comment ${PR} --body \"…\"' (one tight paragraph: PASS rationale, or the bug + why it's wrong). (5) FINALLY, as the LAST thing you print, output EXACTLY ONE line and nothing after it — either 'REVIEW: PASS' or 'REVIEW: BLOCK — <one-line reason>'. That line is parsed by a machine; do not add markdown, quotes, or extra text around it."
 
-# Agent-pane result file: the agent writes its verdict here as its final action.
-# Use $HERD_REVIEW_RESULT_FILE when set (watcher-dispatch mode); otherwise allocate a
-# temp file (standalone use). $AGENT_TASK below has this path baked in.
-_agent_result_file="${HERD_REVIEW_RESULT_FILE:-}"
+# Private agent temp: the agent writes its verdict here; herd-review.sh (this script) is the
+# SOLE atomic writer of $HERD_REVIEW_RESULT_FILE. The agent NEVER touches the watcher's
+# authoritative file — it only writes to this private temp. herd-review.sh reads the temp,
+# validates the verdict, then emits it atomically via _emit_verdict (temp+mv).
+# HERD_REVIEW_AGENT_TEMP overrides the auto-generated path (used in tests to control the path).
+_agent_result_file="${HERD_REVIEW_AGENT_TEMP:-}"
 if [ -z "$_agent_result_file" ]; then
-  _agent_result_file="$(mktemp "${TMPDIR:-/tmp}/herd-review-agent-verdict-${PR}-XXXXXX" 2>/dev/null || true)"
+  _agent_result_file="$(mktemp "${TMPDIR:-/tmp}/herd-review-agent-${PR}-XXXXXX" 2>/dev/null || true)"
 fi
+[ -n "$_agent_result_file" ] || emit_infra_fail "could not allocate agent temp file (mktemp failed)"
 
 # Agent-pane task: same correctness rules as TASK, but the final instruction tells the agent to
 # WRITE the verdict to $_agent_result_file (not just print it). The agent runs in the TUI so the
@@ -287,13 +305,15 @@ fi
 echo "🔬 Reviewing PR #${PR} ($SLUG) on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass…" >&2
 
 if [ "$_AGENT_PANE_MODE" = "1" ]; then
-  # Agent-pane mode: the reviewer runs in the TUI and writes its verdict to $_agent_result_file.
-  # Poll for the result file (written atomically by the agent as its final act).
+  # Agent-pane mode: the reviewer runs in the TUI and writes its verdict to the private
+  # $_agent_result_file temp. Poll until a parseable verdict line appears — checking for
+  # the verdict (not just file existence) avoids the race where > truncates the file before
+  # writing, which would make us read an empty result on the very next poll tick.
   # Timeout: HERD_REVIEW_AGENT_TIMEOUT seconds (default 1800 = 30 min; override in tests).
   # Poll interval: HERD_REVIEW_AGENT_POLL seconds (default 5; override in tests).
   _poll_deadline=$(( $(date +%s) + ${HERD_REVIEW_AGENT_TIMEOUT:-1800} ))
   _poll_interval="${HERD_REVIEW_AGENT_POLL:-5}"
-  while [ ! -f "$_agent_result_file" ]; do
+  while ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$_poll_deadline" ]; then
       emit_infra_fail "agent-pane reviewer timed out (${HERD_REVIEW_AGENT_TIMEOUT:-1800}s) without writing a verdict to '${_agent_result_file}'"
     fi
