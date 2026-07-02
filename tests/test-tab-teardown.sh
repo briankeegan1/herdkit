@@ -218,13 +218,19 @@ ok
 ! grep -qx "q2" "$CLOSE_LOG" || fail "8: pr-slug builder tab should NOT be closed (open PR exists)"
 ok
 
-# ── 9. Orphan sweep does NOT close the coordinator tab ───────────────────────
-write_tabs "c1:coordinator-herdkit:wA"
+# ── 9. Orphan sweep does NOT close coordinator, scribe, or researcher tabs ────
+# All three are per-project singletons: bare labels, no worktree, no open PR.
+# Without an explicit exclusion list the sweep would kill them every ~60 s.
+write_tabs "c1:coordinator-herdkit:wA" "c2:scribe-herdkit:wA" "c3:researcher-herdkit:wA"
 printf '' > "$WT_OUTPUT"
 printf '[]\n' > "$PR_OUTPUT"
 clear_state
 _sweep_orphan_tabs
 ! grep -qx "c1" "$CLOSE_LOG" || fail "9: coordinator tab should NOT be closed by orphan sweep"
+ok
+! grep -qx "c2" "$CLOSE_LOG" || fail "9: scribe tab should NOT be closed by orphan sweep"
+ok
+! grep -qx "c3" "$CLOSE_LOG" || fail "9: researcher tab should NOT be closed by orphan sweep"
 ok
 
 # ── 10. Orphan sweep closes orphaned bare builder tabs ───────────────────────

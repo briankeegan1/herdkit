@@ -334,20 +334,24 @@ except Exception:
   local _sw_live
   _sw_live="$(printf '%s\n%s\n' "$_sw_wt_slugs" "$_sw_pr_slugs" | sort -u | grep -v '^$' || true)"
 
-  # Find orphaned tab IDs and close them.
+  # Find orphaned tab IDs and close them. Exclude all per-project singleton tabs
+  # (coordinator, scribe, researcher) — they are bare-label tabs with no worktree
+  # or PR, so without this exclusion the sweep would kill them every ~60 s.
   local _sw_orphans
   _sw_orphans="$(printf '%s' "$_sw_tabs" \
-    | WS="$_sw_wsid" LIVE="$_sw_live" COORD="$HERD_TAB_COORDINATOR" python3 -c '
+    | WS="$_sw_wsid" LIVE="$_sw_live" \
+      SINGLETONS="${HERD_TAB_COORDINATOR}:${HERD_AGENT_SCRIBE}:${HERD_AGENT_RESEARCHER}" \
+      python3 -c '
 import sys, json, os
-ws    = os.environ.get("WS", "")
-live  = set(os.environ.get("LIVE","").split("\n")) - {""}
-coord = os.environ.get("COORD","")
-MID   = "·"
+ws         = os.environ.get("WS", "")
+live       = set(os.environ.get("LIVE","").split("\n")) - {""}
+singletons = set(os.environ.get("SINGLETONS","").split(":")) - {""}
+MID        = "·"
 try:
   tabs = json.load(sys.stdin).get("result",{}).get("tabs",[])
   for t in tabs:
     label = t.get("label","") or ""
-    if not label or label == coord:
+    if not label or label in singletons:
       continue
     if ws and t.get("workspace_id","") != ws:
       continue
