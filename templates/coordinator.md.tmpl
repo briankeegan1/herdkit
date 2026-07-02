@@ -164,6 +164,22 @@ It returns immediately and reports back peripherally — the live pane flashes *
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git
 pull`s + reads fresh + makes a targeted edit, so a concurrent manual edit is never clobbered.
 
+## Persist project & domain context (every session)
+
+Continuity is a first-class property of this seat, not optional hygiene. On **every** session,
+actively **build and update the user's project and domain context** in the
+**local project memory store** — what you learned about how this project and its domain work,
+decisions made and why, the domain's vocabulary, and data quirks/gotchas — so the next session
+resumes with that context instead of relearning it from scratch. Prefer updating an existing
+memory entry over adding a duplicate; correct or drop what proves wrong. Never let this context
+survive only as an easily-pruned note in one consumer project — persisting it here is the durable
+contract.
+
+Per the existing memory contract, this context **stays local and gitignored**: it lives only in
+the project's local memory store, never in the committed repo and never under `{{DENY_PATHS}}`.
+Do not weaken that contract — earn cross-session continuity by persisting context while keeping it
+entirely out of version control.
+
 ## Rules
 
 - **You own `{{BACKLOG_FILE}}`.** Sub-agents never edit it. You make every backlog change.
