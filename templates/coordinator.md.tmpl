@@ -126,6 +126,17 @@ Every reported problem routes to ONE of two places:
       herd report "<symptom + which lane>"
   (opens a `gh issue` on `{{HERD_REPO}}`, stamped with this project + the lane + version pin).
 
+## Update the engine
+
+When a fix has landed upstream in herdkit, or the user asks "how do I get the latest engine
+fix", run:
+
+    herd update
+
+It pulls HERDKIT_HOME (fast-forward only), shows the incoming delta, re-renders the coordinator
+skill preserving `.herd/config` answers, and reloads the workspace — all in one step. It refuses
+if the engine checkout is dirty or builders are mid-flight; pass `--force` to proceed anyway.
+
 {{CAPABILITIES}}
 
 ## Backlog writes — enqueue, never edit inline

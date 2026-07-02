@@ -940,6 +940,115 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
   say "  MERGE_POLICY:  ${c_bold}$effective_policy${c_rst}"
 }
 
+cmd_update() {
+  local force=""
+  while true; do
+    case "${1:-}" in
+      --force|-f) force=1; shift ;;
+      *) break ;;
+    esac
+  done
+
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+
+  say "${c_bold}herd update${c_rst} — pull the herdkit engine, upgrade the skill, reload the workspace"
+  say ""
+
+  # Load config (sets PROJECT_ROOT, WORKTREES_DIR, WORKSPACE_NAME, etc.)
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+
+  # Test knob: override which dir gets the git pull (never touches real HERDKIT_HOME in tests).
+  local engine_dir="${HERD_UPDATE_ENGINE_DIR:-$HERDKIT_HOME}"
+
+  # 1. Refuse if the engine checkout is dirty (uncommitted changes would be pulled over).
+  local git_status
+  git_status="$(git -C "$engine_dir" status --porcelain 2>/dev/null || true)"
+  if [ -n "$git_status" ]; then
+    warn "engine checkout at $engine_dir has uncommitted changes:"
+    printf '%s\n' "$git_status" >&2
+    if [ -n "$force" ]; then
+      warn "proceeding anyway (--force)"
+    else
+      die "refusing to pull over a dirty engine checkout — commit or stash changes first, or re-run with --force"
+    fi
+  fi
+
+  # 2. Warn (and require confirmation) if builders are mid-flight: their lane scripts
+  #    reference the engine path live, so a mid-pull engine swap can corrupt a running build.
+  local working_builders=""
+  if command -v herdr >/dev/null 2>&1; then
+    local agents_json wt_list
+    agents_json="$(herdr agent list 2>/dev/null || echo '{}')"
+    wt_list="$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null || true)"
+    working_builders="$(AGENTS_JSON="$agents_json" WT="$wt_list" \
+      MAIN="$PROJECT_ROOT" python3 -c '
+import os, json
+MAIN = os.environ.get("MAIN", "")
+try: agents = (json.loads(os.environ.get("AGENTS_JSON","{}")).get("result") or {}).get("agents") or []
+except Exception: agents = []
+ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
+working = []
+for line in (os.environ.get("WT","")).splitlines():
+    if line.startswith("worktree "):
+        wt = line[9:]
+        if wt and wt != MAIN:
+            slug = os.path.basename(wt)
+            if ag_status.get(slug) == "working":
+                working.append(slug)
+print("\n".join(working))
+' 2>/dev/null || true)"
+  fi
+
+  if [ -n "$working_builders" ]; then
+    warn "builders are mid-flight in this workspace (their lanes reference engine scripts live):"
+    printf '%s\n' "$working_builders" >&2
+    if [ -n "$force" ]; then
+      warn "proceeding anyway (--force) — in-flight builders may pick up engine changes mid-build"
+    elif [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+      local ans; ans="$(ask "Proceed with mid-flight builders? [y/N]" "n")"
+      case "$ans" in y|Y) : ;; *) die "aborted — wait for builders to finish, then re-run 'herd update'"; esac
+    else
+      die "aborting — builders are mid-flight; re-run with --force to proceed anyway"
+    fi
+  fi
+
+  # 3. Pull the engine (fast-forward only — divergence is always a human decision).
+  local old_sha
+  old_sha="$(git -C "$engine_dir" rev-parse HEAD 2>/dev/null || true)"
+  say "  pulling $engine_dir …"
+  local pull_out
+  if ! pull_out="$(git -C "$engine_dir" pull --ff-only 2>&1)"; then
+    printf '%s\n' "$pull_out" >&2
+    die "git pull --ff-only failed — the engine branch may have diverged; run 'git -C $engine_dir fetch && git -C $engine_dir merge --ff-only' to diagnose, then re-run 'herd update'"
+  fi
+  printf '%s\n' "$pull_out"
+
+  # 4. Show what came in.
+  local new_sha
+  new_sha="$(git -C "$engine_dir" rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$old_sha" ] && [ "$old_sha" != "$new_sha" ]; then
+    say ""
+    say "${c_bold}Engine delta (${old_sha:0:7}..${new_sha:0:7}):${c_rst}"
+    git -C "$engine_dir" log --oneline "${old_sha}..${new_sha}" 2>/dev/null || true
+  else
+    say "  (already up to date — no new commits)"
+  fi
+  say ""
+
+  # 5. Upgrade: re-render skill preserving .herd/config answers, bump version, warn on new keys.
+  say "${c_bold}Upgrading skill + config…${c_rst}"
+  cmd_upgrade
+
+  # 6. Reload: stop old watcher, re-render, relaunch watcher + backlog pane.
+  say ""
+  say "${c_bold}Reloading workspace…${c_rst}"
+  cmd_reload
+}
+
 usage() {
   cat <<EOF
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
@@ -953,6 +1062,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       prints a per-component summary + effective MERGE_POLICY.
                                       Never closes the coordinator tab/agent — safe to run
                                       from inside the coordinator
+  herd update [--force]               pull the herdkit engine (git pull --ff-only), upgrade the
+                                      coordinator skill, and reload the workspace in one step;
+                                      refuses if the engine checkout is dirty or builders are
+                                      mid-flight (--force overrides both guards)
   herd backlog                        list open work items via the active backend
   herd report [--to <link>] "<sym>"   file a report on HERD_REPO (or a peer from .herd/links
                                       via --to) using HERD_REPORT_BACKEND (default: github);
@@ -970,6 +1083,7 @@ case "${1:-help}" in
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
+  update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
   link)    shift; cmd_link "$@" ;;
