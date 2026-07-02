@@ -281,14 +281,100 @@ do_merge() {
   git -C "$MAIN" pull --ff-only >/dev/null 2>&1 || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
   git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
-  # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Closing the herdr tab
-  #    terminates the agent's pane (and process). Best-effort each.
-  tabid="$(herdr tab list 2>/dev/null | SLUG="$ds" python3 -c 'import sys,json,os
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(0)
-print(next((t["tab_id"] for t in d.get("result",{}).get("tabs",[]) if t.get("label")==os.environ["SLUG"]), ""))' 2>/dev/null)"
-  [ -n "$tabid" ] && herdr tab close "$tabid" >/dev/null 2>&1 || true
+  # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Close the builder tab,
+  #    review tab (review·slug), and resolver tab (resolve·slug) in one shot. Verifies each
+  #    close and retries once; warns loudly if a tab cannot be closed.
+  herd_teardown_slug "$ds"
   return 0
+}
+
+# _sweep_orphan_tabs — close any herd-managed tabs whose slug no longer has a live worktree or
+# an open PR. Runs every _ORPHAN_SWEEP_INTERVAL ticks (~60 s). Scoped to this project's
+# workspace to avoid touching another project's tabs. Skipped in dry-run mode.
+#
+# "Herd-managed" means the tab label is one of:
+#   review·<slug>   — review-gate visibility tab  (definitely herd-created)
+#   resolve·<slug>  — conflict-resolver tab        (definitely herd-created)
+#   <slug>          — builder tab (bare slug, no middle dot, not the coordinator label)
+#
+# A slug is "live" if ANY live worktree has that basename, OR ANY open PR's headRefName ends
+# with that slug (last path component). Orphaned = not live → close.
+_sweep_orphan_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _sw_wsid; _sw_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  local _sw_tabs; _sw_tabs="$(herdr tab list 2>/dev/null || true)"
+  [ -n "$_sw_tabs" ] || return 0
+
+  # Collect live slugs from worktrees (excluding the main checkout).
+  local _sw_wt_json; _sw_wt_json="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || true)"
+  local _sw_wt_slugs
+  _sw_wt_slugs="$(WT="$_sw_wt_json" MAIN="$MAIN" python3 -c '
+import os
+main = os.environ["MAIN"]
+for line in os.environ.get("WT","").splitlines():
+  if line.startswith("worktree "):
+    p = line[9:]
+    if p != main:
+      print(os.path.basename(p))
+' 2>/dev/null || true)"
+
+  # Collect live slugs from open PRs (headRefName last component).
+  local _sw_pr_slugs
+  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | python3 -c '
+import sys, json
+try:
+  for p in json.load(sys.stdin):
+    b = p.get("headRefName","")
+    if b: print(b.split("/")[-1])
+except Exception:
+  pass
+' 2>/dev/null || true)"
+
+  local _sw_live
+  _sw_live="$(printf '%s\n%s\n' "$_sw_wt_slugs" "$_sw_pr_slugs" | sort -u | grep -v '^$' || true)"
+
+  # Find orphaned tab IDs and close them. Exclude all per-project singleton tabs
+  # (coordinator, scribe, researcher) — they are bare-label tabs with no worktree
+  # or PR, so without this exclusion the sweep would kill them every ~60 s.
+  local _sw_orphans
+  _sw_orphans="$(printf '%s' "$_sw_tabs" \
+    | WS="$_sw_wsid" LIVE="$_sw_live" \
+      SINGLETONS="${HERD_TAB_COORDINATOR}:${HERD_AGENT_SCRIBE}:${HERD_AGENT_RESEARCHER}" \
+      python3 -c '
+import sys, json, os
+ws         = os.environ.get("WS", "")
+live       = set(os.environ.get("LIVE","").split("\n")) - {""}
+singletons = set(os.environ.get("SINGLETONS","").split(":")) - {""}
+MID        = "·"
+try:
+  tabs = json.load(sys.stdin).get("result",{}).get("tabs",[])
+  for t in tabs:
+    label = t.get("label","") or ""
+    if not label or label in singletons:
+      continue
+    if ws and t.get("workspace_id","") != ws:
+      continue
+    if label.startswith("review" + MID):
+      slug = label[len("review" + MID):]
+    elif label.startswith("resolve" + MID):
+      slug = label[len("resolve" + MID):]
+    elif MID not in label:
+      slug = label
+    else:
+      continue
+    if slug and slug not in live:
+      print(t["tab_id"])
+except Exception:
+  pass
+' 2>/dev/null || true)"
+
+  [ -n "$_sw_orphans" ] || return 0
+  local _sw_id
+  while IFS= read -r _sw_id; do
+    [ -n "$_sw_id" ] || continue
+    herdr tab close "$_sw_id" >/dev/null 2>&1 || true
+  done <<< "$_sw_orphans"
 }
 
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
@@ -342,6 +428,9 @@ else
   trap '_watcher_lock_cleanup; exit 1' INT TERM
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
+
+_ORPHAN_SWEEP_TICK=0
+_ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 
 while true; do
   build_header
@@ -584,6 +673,13 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
     render
     spawn_resolver "$slug" "$prnum" "$branch"
   done
+
+  # Orphan sweep: every _ORPHAN_SWEEP_INTERVAL ticks close tabs whose slug is no longer live.
+  _ORPHAN_SWEEP_TICK=$((_ORPHAN_SWEEP_TICK + 1))
+  if [ "$_ORPHAN_SWEEP_TICK" -ge "$_ORPHAN_SWEEP_INTERVAL" ]; then
+    _ORPHAN_SWEEP_TICK=0
+    _sweep_orphan_tabs
+  fi
 
   sleep 4
 done
