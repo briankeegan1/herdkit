@@ -107,6 +107,22 @@ ok
 printf '%s' "$DECOR_BODY" | human_verify_steps | grep -q '^Then check the backlog pane$' || fail "'1.' ordered marker not stripped"
 ok
 
+# Dash- and plus-bulleted markers: a builder naturally writes the whole block as a `-` list
+# ("- HUMAN-VERIFY:" over "- step" lines). These MUST hold — a missing bullet in the marker class
+# fails OPEN (no hold, silent auto-merge), the exact bypass this gate exists to prevent.
+DASH_BODY="$(printf 'Adds a thing.\n\n- HUMAN-VERIFY:\n- run the live smoke test\n- confirm the pane reloads\n')"
+printf '%s' "$DASH_BODY" | human_verify_has || fail "'- HUMAN-VERIFY:' must be a hold (fails open otherwise)"
+ok
+[ "$(printf '%s' "$DASH_BODY" | human_verify_steps | grep -c .)" = "2" ] || fail "'- HUMAN-VERIFY:' block should yield 2 steps"
+ok
+printf '%s' "$DASH_BODY" | human_verify_steps | grep -q '^run the live smoke test$' || fail "'-' marker: step 1 text/de-bullet wrong"
+ok
+PLUS_BODY="$(printf '+ HUMAN-VERIFY: verify the reload refreshes panes\n')"
+printf '%s' "$PLUS_BODY" | human_verify_has || fail "'+ HUMAN-VERIFY:' (inline) must be a hold"
+ok
+printf '%s' "$PLUS_BODY" | human_verify_steps | grep -q '^verify the reload refreshes panes$' || fail "'+' inline marker step text wrong"
+ok
+
 # Absent marker → not a hold, no steps.
 NOMARK_BODY="$(printf 'Just a normal PR body.\nNo manual steps here.\n')"
 ! printf '%s' "$NOMARK_BODY" | human_verify_has || fail "absent marker should NOT be a hold"

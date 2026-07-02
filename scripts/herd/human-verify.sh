@@ -19,8 +19,8 @@
 #   . "$HERE/human-verify.sh"
 #
 # Parse contract:
-#   • The block opens at the first line whose text (after optional markdown bullet/heading/bold
-#     decoration) is `HUMAN-VERIFY:` — case-insensitive. Any text after the colon on that same line
+#   • The block opens at the first line whose text (after optional markdown bullet [- * +], heading,
+#     or bold decoration) is `HUMAN-VERIFY:` — case-insensitive. Any text after the colon on that line
 #     is treated as the first step (supports the one-liner `HUMAN-VERIFY: <single step>` form).
 #   • Following non-blank lines are additional steps, until the first blank line or end of body.
 #   • Each step is de-bulleted (`- `, `* `, `+ `, `1.`, `1)`) and whitespace-trimmed; empties drop.
@@ -35,7 +35,10 @@ human_verify_steps() {
 import sys, re
 lines = sys.stdin.read().splitlines()
 # Marker: optional leading bullet/heading/bold decoration, then HUMAN-VERIFY:, then the rest.
-marker = re.compile(r"^[\s>*#`]*HUMAN-VERIFY\s*:\s*(.*)$", re.IGNORECASE)
+# The class MUST include every markdown bullet the de-bulleter below handles (- * +): a builder
+# naturally formats the whole block as a `-` list ("- HUMAN-VERIFY:" over "- step" lines), and a
+# missing bullet here fails OPEN — no hold, silent auto-merge — the exact bypass this gate prevents.
+marker = re.compile(r"^[\s>*#`+-]*HUMAN-VERIFY\s*:\s*(.*)$", re.IGNORECASE)
 bullet = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 def clean(s):
     s = s.strip()
