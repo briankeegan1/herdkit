@@ -22,7 +22,6 @@
 - 🔜 **Flow-preference interview + draft-PR flow** — New `herd init` questions → config keys: `PR_FLOW=direct|draft` (draft: lanes instruct builders `gh pr create --draft`; watcher already holds `DRAFT`, agent-watch.sh:157), `PR_READY_WHEN=builder|coordinator|human`, `LOCAL_REVIEW=none|pre-pr` (run the review gate in the worktree BEFORE the PR is public vs today's post-PR review), `MERGE_METHOD`, `DELETE_BRANCH_ON_MERGE`; thread prefs into the lane rules text (herd-quick.sh:58-61, herd-feature.sh:50-53).
 - 🔜 **`herd config` + coordinator Workflow settings mode** — `herd config list|get|set` with key validation, aware of what each change requires: watcher keys ⇒ restart watcher (pid file `.watcher-<slug>.pid`), coordinator-facing keys ⇒ re-render skill (render step at bin/herd:277-278); coordinator menu gains a 'Workflow settings' entry to view/change any workflow pref anytime and relaunch affected pieces — nothing is init-only.
 - 🔜 **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17)* — when a PR moves or renames the things that backlog items point at (file paths, function names, section headers, worktree names), affected entries dangle silently after the PR lands. The coordinator / scribe should run a reconcile pass as part of landing such PRs: diff the rename surface, identify backlog entries that reference moved things, and update or flag them so the backlog stays coherent with the live codebase.
-- 🚧 **Per-PR human-verify hold — PR test plans must be visible to the gate** *(user insight on PR #44, worktree `human-verify-hold`)* — a PR whose description contains a manual test step (e.g. 'Live smoke: run coordinator.sh, verify .herd-panes, verify reload refreshes panes') sails through the correctness review and AUTO-MERGES with that step silently unexecuted — the pipeline has no concept of human-required verification. Build: (1) a convention builders emit in the PR body — a `HUMAN-VERIFY:` block listing steps they could not perform themselves — plus lane-rules text instructing builders to declare any such steps; (2) the watcher parses open PRs for the marker and switches just that PR to an approve-style hold (reuse the sha-keyed awaiting/approval ledger from `MERGE_POLICY=approve` — gates still run, merge waits) and shows a console row like `ready · human-verify pending · herd-approve.sh approve <pr#>`; (3) the coordinator surfaces held PRs with their verify steps so the human (or the coordinator itself, when steps are safely executable) can run them and approve; (4) once the sandbox-sim rig exists, steps matching automatable patterns route there instead of a human; (5) capabilities.tsv rows + hermetic tests covering marker parsing, per-PR hold while other PRs auto-merge, and approval release.
 
 ## Reliability / safety
 
@@ -41,6 +40,7 @@
 
 ## Recently shipped
 
+- ✅ **Per-PR human-verify hold — PR test plans must be visible to the gate** *(PR #61)*
 - ✅ **Healthcheck must gate / flag interaction tests for app-facing PRs** *(PR #59)*
 - ✅ **`TOKEN_MODE=eco` — opt-in economy mode** *(PR #58)*
 - ✅ **Analyst seat launch config must include an explicit context-persistence tenet** *(PR #57)*
@@ -50,4 +50,3 @@
 - ✅ **Stall detector: check worktree mtimes before flagging** *(PR #52)*
 - ✅ **`herd pane <watch|backlog|coordinator>` — single-pane restart shortcuts** *(PR #53)*
 - ✅ **Watcher healthcheck gate: serialize or isolate concurrent suite runs** *(PR #51)*
-- ✅ **Mandatory dependency checks in install.sh + a `herd doctor` preflight** *(PR #50)*
