@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # test-cli-reload.sh — hermetic tests for `herd reload`.
 #
-# Uses HERD_RELOAD_SKIP_LAUNCH=1 to suppress the background watcher launch so tests do
-# not leave persistent background processes in CI/test environments.
-#
-# Tests (no network, no herdr, no real watcher):
-#   1. reload renders the coordinator skill from updated .herd/config
-#   2. reload prints the effective MERGE_POLICY (explicit and derived cases)
-#   3. reload removes the lockfile (non-existent PID is harmless)
-#   4. reload kills a live process recorded in the lockfile
-#   5. reload is a no-op kill when there is no lockfile
-#   6. reload fails with a clear error when .herd/config is absent
+# Design principles (mirrors test-watcher-checks.sh / test-merge-policy.sh):
+#   • pgrep is STUBBED on PATH — returns only $FAKE_STRAY_PIDS (colon-separated list).
+#     This prevents the real pgrep from finding actual agent-watch.sh processes in
+#     other workspaces (production or other worktrees), making every test independent of
+#     the ambient process table.
+#   • herdr is STUBBED (exits 1) — forces the background-fallback path without a real
+#     herdr instance.
+#   • HERD_RELOAD_SKIP_LAUNCH=1 suppresses the background watcher launch so no
+#     persistent herd-watch.sh / agent-watch.sh processes are spawned.
+#   • Stray-guard tests use real, innocuous sleep processes whose cwd is controlled by
+#     the test — verifies the kill-discrimination logic without touching real watchers.
 #
 # Run:  bash tests/test-cli-reload.sh
 set -euo pipefail
@@ -22,17 +23,38 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0
 ok(){ pass=$((pass+1)); }
 
+# ── Stub pgrep and herdr on PATH ─────────────────────────────────────────────
+# pgrep stub: echoes each colon-separated PID in $FAKE_STRAY_PIDS.  All other args
+# (e.g. -f "agent-watch.sh") are ignored so the real process table is never consulted.
+# This is the key safety property: cmd_reload never sees production agent-watch PIDs.
+BIN="$T/bin"; mkdir -p "$BIN"
+cat > "$BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+IFS=':' read -ra pids <<< "${FAKE_STRAY_PIDS:-}"
+for p in "${pids[@]}"; do [ -n "$p" ] && printf '%s\n' "$p"; done
+exit 0
+STUB
+chmod +x "$BIN/pgrep"
+
+# herdr stub: always exits 1 — forces the background-fallback path.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+
+export PATH="$BIN:$PATH"
+
 # _make_project ROOT WORKSPACE [extra config lines...]
+# PROJECT_ROOT is set to the canonical (realpath) of ROOT so lsof cwd comparisons
+# match on macOS where /var/folders is a symlink to /private/var/folders.
 _make_project() {
   local r="$1" ws="$2"; shift 2
+  local r_real; r_real="$(cd "$r" && pwd -P)"
   git -C "$r" init -q
   git -C "$r" config user.email t@t.t; git -C "$r" config user.name t
   ( cd "$r" && git commit -q --allow-empty -m init )
   mkdir -p "$r/.herd" "$r/trees"
   cat > "$r/.herd/config" <<CFG
 HERD_VERSION=1
-PROJECT_ROOT="$r"
-WORKTREES_DIR="$r/trees"
+PROJECT_ROOT="$r_real"
+WORKTREES_DIR="$r_real/trees"
 DEFAULT_BRANCH="origin/main"
 WORKSPACE_NAME="$ws"
 BACKLOG_FILE="BACKLOG.md"
@@ -62,28 +84,28 @@ printf '%s' "$out" | grep -q "MERGE_POLICY:" || fail "output missing MERGE_POLIC
 printf '%s' "$out" | grep -q "auto"          || fail "MERGE_POLICY should be 'auto'"
 ok
 
-# ── 2b. MERGE_POLICY=approve is printed ──────────────────────────────────────
+# ── 2b. MERGE_POLICY=approve ──────────────────────────────────────────────────
 P="$T/p2b"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="approve"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
 printf '%s' "$out" | grep -q "approve" || fail "MERGE_POLICY should be 'approve'"
 ok
 
-# ── 2c. MERGE_POLICY=observe is printed ──────────────────────────────────────
+# ── 2c. MERGE_POLICY=observe ──────────────────────────────────────────────────
 P="$T/p2c"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="observe"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
 printf '%s' "$out" | grep -q "observe" || fail "MERGE_POLICY should be 'observe'"
 ok
 
-# ── 2d. WATCHER_AUTOMERGE=false derives approve when MERGE_POLICY is unset ───
+# ── 2d. WATCHER_AUTOMERGE=false → approve when MERGE_POLICY unset ────────────
 P="$T/p2d"; mkdir "$P"
 _make_project "$P" "reloadtest" 'WATCHER_AUTOMERGE="false"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
 printf '%s' "$out" | grep -q "approve" || fail "WATCHER_AUTOMERGE=false should derive approve"
 ok
 
-# ── 2e. Default (WATCHER_AUTOMERGE=true, no MERGE_POLICY) derives auto ───────
+# ── 2e. Default (WATCHER_AUTOMERGE=true, no MERGE_POLICY) → auto ─────────────
 P="$T/p2e"; mkdir "$P"
 _make_project "$P" "reloadtest"
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
@@ -132,5 +154,43 @@ out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 || true )"
 printf '%s' "$out" | grep -qi "herd init\|no .herd/config" \
   || fail "reload should report missing .herd/config clearly"
 ok
+
+# ── 7. Stray guard — OUR workspace: stray cwd == PROJECT_ROOT → killed ───────
+# A process whose current working directory IS our PROJECT_ROOT is treated as a stray
+# watcher belonging to this workspace and must be killed.
+P="$T/p7"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P_REAL="$(cd "$P" && pwd -P)"
+# Start a sleep under the canonical PROJECT_ROOT so lsof -d cwd reports P_REAL.
+( cd "$P_REAL" && exec sleep 9999 ) &
+STRAY_PID=$!
+# pgrep stub will return STRAY_PID (as a stray not in the lockfile).
+( cd "$P" && FAKE_STRAY_PIDS="$STRAY_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$STRAY_PID" 2>/dev/null || true; fail "reload failed (stray-our test)"; }
+sleep 0.3
+kill -0 "$STRAY_PID" 2>/dev/null \
+  && { kill "$STRAY_PID" 2>/dev/null || true; fail "stray in OUR workspace was not killed"; } \
+  || true
+ok
+
+# ── 8. Stray guard — OTHER workspace: stray cwd != PROJECT_ROOT → NOT killed ─
+# A process whose cwd is a DIFFERENT directory must never be killed — this is the
+# guard against cmd_reload touching another workspace's watcher.
+P="$T/p8"; mkdir "$P"
+_make_project "$P" "reloadtest"
+OTHER="$T/other_project"; mkdir -p "$OTHER"
+OTHER_REAL="$(cd "$OTHER" && pwd -P)"
+# Start a sleep from OTHER_REAL (simulates another workspace's watcher).
+( cd "$OTHER_REAL" && exec sleep 9999 ) &
+OTHER_PID=$!
+( cd "$P" && FAKE_STRAY_PIDS="$OTHER_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$OTHER_PID" 2>/dev/null || true; fail "reload failed (stray-other test)"; }
+sleep 0.2
+if kill -0 "$OTHER_PID" 2>/dev/null; then
+  kill "$OTHER_PID" 2>/dev/null || true
+  ok   # process survived — guard worked correctly
+else
+  fail "reload killed a process from another workspace (guard failure)"
+fi
 
 echo "ALL PASS ($pass checks)"
