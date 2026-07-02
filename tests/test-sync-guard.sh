@@ -152,4 +152,15 @@ git -C "$R" add scripts/herd/agent-watch.sh
 git -C "$R" commit -q -m "bugfix agent-watch.sh"
 if sync_guard "$R" "$BASE"; then fail "guard tripped on edit to EXISTING lane (not an addition)"; else ok; fi
 
+# 10. No base ref (tracking branch missing) → git diff fails → guard skips cleanly.
+# Reproduces the set -u unbound-variable bug: if the guard used $DEFAULT_BRANCH (never
+# bound in the healthcheck scope) instead of $_hc_branch, this path would exit 1.
+R="$T/r10"; mkdir "$R"; make_repo "$R"
+# Stage a change that would normally trip the guard, to confirm the skip wins.
+printf '#!/usr/bin/env bash\ncmd_existing() { :; }\ncmd_newfeature() { :; }\n' > "$R/bin/herd"
+git -C "$R" add bin/herd
+git -C "$R" commit -q -m "add cmd_newfeature"
+# "nonexistent-ref" is not a real git ref — git diff returns non-zero, changed is empty.
+if sync_guard "$R" "nonexistent-ref-xyz"; then fail "guard tripped when base ref does not exist"; else ok; fi
+
 echo "ALL PASS ($pass checks)"

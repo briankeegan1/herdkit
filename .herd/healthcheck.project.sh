@@ -126,7 +126,7 @@ if _hc_changed="$(git diff --name-only "$_hc_branch" 2>/dev/null)"; then
     exit 1
   fi
 else
-  caps_note="caps-sync: skipped (no diff against $DEFAULT_BRANCH)"
+  caps_note="caps-sync: skipped (no diff against $_hc_branch)"
 fi
 
 [ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $lg_note"; echo "  $caps_note"; }
