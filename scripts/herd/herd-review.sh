@@ -22,24 +22,35 @@
 #
 # CONTRACT WITH agent-watch.sh (the caller)
 # -----------------------------------------
-# Synchronous; prints exactly one verdict line to stdout, which the watcher captures:
+# Prints exactly one verdict line to stdout as its final output:
 #       REVIEW: PASS
 #       REVIEW: BLOCK — <one-line reason>
 #       REVIEW: INFRA-FAIL — <one-line reason>   (transient; watcher retries, never caches)
 # The watcher merges ONLY on PASS. On BLOCK (or ANY failure to obtain a parseable verdict) it must
 # NOT merge — and this script DEFAULTS TO BLOCK when uncertain: if the reviewer runs but prints no
 # verdict, we emit `REVIEW: BLOCK — …` AND post a fallback PR comment. INFRA-FAIL is DISTINCT from
-# BLOCK: it means the reviewer COULD NOT RUN (log-alloc failure, claude crash with no output), not
-# that it found a defect. The watcher must NOT persist INFRA-FAIL to the review ledger — it surfaces
-# "review errored · will retry" and retries next cycle. Exit status: 0 = PASS, 1 = BLOCK (genuine
-# finding or default-to-block), 2 = INFRA-FAIL (transient; safe to retry).
+# BLOCK: it means the reviewer COULD NOT RUN (log-alloc failure, claude crash with no output, or
+# this process being SEVERED mid-review by SIGTERM/SIGPIPE — a trap converts that death into an
+# INFRA-FAIL report), not that it found a defect. The watcher must NOT persist INFRA-FAIL to the
+# review ledger — it surfaces "review errored · will retry" and retries next cycle. Exit status:
+# 0 = PASS, 1 = BLOCK (genuine finding or default-to-block), 2 = INFRA-FAIL (transient; retry).
+#
+# RESULT FILE (background dispatch — the verdict-file contract shared with Review pane v2):
+# when $HERD_REVIEW_RESULT_FILE is set, the SAME verdict line is also written there ATOMICALLY
+# (temp + mv, never partial) as this script's LAST act — after the log banner, PR comment, and
+# pane rename. agent-watch.sh dispatches reviews in the background with this env set to
+# $WORKTREES_DIR/.review-result-<pr>-<sha> and treats the file's EXISTENCE as review completion;
+# a reviewer that dies without writing one is detected by its dead pid and retried. The file is
+# authoritative only for the pr+sha its name encodes — the watcher discards it if the PR has moved
+# to a newer head.
 #
 # Env overrides:
-#   HERD_CLAUDE_FLAGS   flags passed to claude (default: --dangerously-skip-permissions — the
-#                       reviewer needs gh tool access to read the diff + post a comment; it is
-#                       sandboxed to READ-ONLY by its prompt, never editing/pushing).
-#   HERD_REVIEW_MODEL   review model (default: $MODEL_REVIEW — a STRONG model on purpose).
-#   HERD_NO_PANE=1      skip the live herdr pane (the review still runs headless).
+#   HERD_CLAUDE_FLAGS         flags passed to claude (default: --dangerously-skip-permissions — the
+#                             reviewer needs gh tool access to read the diff + post a comment; it is
+#                             sandboxed to READ-ONLY by its prompt, never editing/pushing).
+#   HERD_REVIEW_MODEL         review model (default: $MODEL_REVIEW — a STRONG model on purpose).
+#   HERD_NO_PANE=1            skip the live herdr pane (the review still runs headless).
+#   HERD_REVIEW_RESULT_FILE   also write the final verdict line here (atomic, last act).
 #
 # Standalone:
 #   herd-review.sh 57 dividend-history
@@ -60,6 +71,30 @@ _WS_ID="$(herd_resolve_workspace_id)"
 # + any AGENTS.md/CLAUDE.md); otherwise fall back to the main checkout. `gh pr diff` works from
 # either, so a missing worktree degrades gracefully rather than aborting the gate.
 CWD="$DIR"; [ -d "$DIR/.git" ] || [ -e "$DIR/.git" ] || CWD="$MAIN"
+
+# _emit_verdict <line> — the single exit channel for the verdict. Prints the line to stdout
+# (the synchronous contract), then — as the LAST act — atomically writes it to
+# $HERD_REVIEW_RESULT_FILE when set (the background contract: temp + mv so the watcher never
+# reads a partial file; its existence signals completion). Every exit path funnels through here.
+_emit_verdict() {
+  printf '%s\n' "$1" 2>/dev/null || true
+  if [ -n "${HERD_REVIEW_RESULT_FILE:-}" ]; then
+    _rf_tmp="${HERD_REVIEW_RESULT_FILE}.tmp.$$"
+    if printf '%s\n' "$1" > "$_rf_tmp" 2>/dev/null; then
+      mv -f "$_rf_tmp" "$HERD_REVIEW_RESULT_FILE" 2>/dev/null || rm -f "$_rf_tmp" 2>/dev/null || true
+    fi
+  fi
+}
+
+# A SEVERED review (killed by a stray sweep, or its stdout pipe torn down by a dying watcher) is
+# an INFRA failure, NOT a refused verdict: report INFRA-FAIL so the watcher retries instead of
+# caching a bogus BLOCK against the sha. With PIPE trapped, writes to a broken stdout return an
+# error (handled in _emit_verdict) instead of killing us before we can report.
+_severed() {
+  _emit_verdict 'REVIEW: INFRA-FAIL — review severed (SIGTERM/SIGPIPE) before a verdict'
+  exit 2
+}
+trap _severed TERM PIPE
 
 # Project risk list: inject $REVIEW_CHECKLIST (committed, repo-relative) when present so the
 # reviewer hunts for THIS project's silently-wrong patterns. Absent → a generic correctness list.
@@ -100,7 +135,7 @@ emit_block() {
   local reason="$1"
   gh pr comment "$PR" --body "🔬 **Pre-merge review gate — BLOCKED.** ${reason} Not merged; needs a human look." >/dev/null 2>&1 || true
   _mark_review_done BLOCK
-  printf 'REVIEW: BLOCK — %s\n' "$reason"
+  _emit_verdict "REVIEW: BLOCK — ${reason}"
   exit 1
 }
 
@@ -109,7 +144,7 @@ emit_block() {
 # it will surface "review errored · will retry" and re-attempt next cycle. Does NOT post a PR
 # comment (no finding to report; a comment on every retry would be spammy).
 emit_infra_fail() {
-  printf 'REVIEW: INFRA-FAIL — %s\n' "$1"
+  _emit_verdict "REVIEW: INFRA-FAIL — $1"
   exit 2
 }
 
@@ -216,12 +251,12 @@ verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LOG" 2>/dev/null |
 case "$verdict_line" in
   "REVIEW: PASS")
     _mark_review_done PASS
-    echo "REVIEW: PASS"
+    _emit_verdict "REVIEW: PASS"
     exit 0
     ;;
   "REVIEW: BLOCK"*)
     _mark_review_done BLOCK
-    printf '%s\n' "$verdict_line"
+    _emit_verdict "$verdict_line"
     exit 1
     ;;
   *)

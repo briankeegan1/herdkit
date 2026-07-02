@@ -12,7 +12,11 @@
 #   🔨 building       — agent working, no PR yet
 #   🩺 health-check    — running healthcheck.sh on its worktree
 #   🔬 reviewing      — health passed: a STRONG model is adversarially correctness-reviewing the
-#                       diff BEFORE merge (herd-review.sh). Merges only on PASS.
+#                       diff BEFORE merge (herd-review.sh). Merges only on PASS. Reviews run in
+#                       the BACKGROUND (up to REVIEW_CONCURRENCY at once, each with its own
+#                       streaming pane), so one slow review never head-of-line-blocks other PRs'
+#                       reviews or merges; verdicts are collected from per-PR result files on
+#                       later ticks. "review queued" = waiting for a concurrency slot.
 #   ⏳ merging         — health passed AND review PASSed, merging now
 #   🔀 resolving …     — PR CONFLICTING for the FIRST time: auto-spawned the isolated, test-gated
 #                       conflict resolver (herd-resolve.sh). Hands-off.
@@ -69,6 +73,13 @@ RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
 # ONCE PER COMMIT — a recorded BLOCK is read back instead of re-spawning the reviewer; a recorded
 # PASS lets a retried merge skip straight to merging. A new commit changes the sha → fresh review.
 REVIEW_STATE="$TREES/.agent-watch-reviewed"
+# Review-retry ledger: one line per TRANSIENT review failure ("<epoch> <pr#> <headSha>") — an
+# INFRA-FAIL verdict, an unparseable result, or a dispatched reviewer that died without writing
+# its result file. Counted per pr+sha to bound re-dispatches (a new commit resets the count);
+# NEVER records a verdict — INFRA failures must not stick to a sha the way BLOCK does.
+REVIEW_RETRIES="$TREES/.agent-watch-review-retries"
+# Max transient failures per pr+sha before the watcher stops re-dispatching and asks for a human.
+_REVIEW_RETRY_MAX=3
 # Override ledger: one line per human override of a cached BLOCK.
 # Format: "<epoch> override <pr#> <headSha>"
 # Written by herd-approve.sh override <pr#>; keyed by sha so a new commit invalidates the override.
@@ -212,6 +223,130 @@ review_verdict() {
 # record_review <pr#> <headSha> <verdict> — append one review record (the instant a verdict known).
 record_review() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REVIEW_STATE"
+}
+
+# ── Background review dispatch ──────────────────────────────────────────────────────────────────
+# The review gate used to run herd-review.sh SYNCHRONOUSLY in the poll loop, so one slow review
+# (~7 min on Opus) head-of-line-blocked every other PR's review AND all merges for that cycle.
+# Reviews now run in the BACKGROUND, bounded by $REVIEW_CONCURRENCY:
+#   .review-inflight-<pr>-<sha>  — dispatch marker holding the reviewer's pid; its existence (with
+#                                  a live pid) is the never-double-dispatch guard, sha-keyed to
+#                                  mirror the review-once ledger semantics.
+#   .review-result-<pr>-<sha>    — the verdict line, written ATOMICALLY by herd-review.sh as its
+#                                  LAST act (via $HERD_REVIEW_RESULT_FILE). The watcher collects
+#                                  these on subsequent ticks, records the ledger exactly as the
+#                                  synchronous gate did, and merges on PASS.
+# Crash-safety: a marker whose pid is dead with no result file = a severed reviewer → reaped and
+# re-dispatched (bounded by $_REVIEW_RETRY_MAX per sha). A result file for a STALE sha (the PR has
+# a newer head) is discarded unread. INFRA-FAIL results are retried, never cached.
+# HERD_REVIEW_BIN is a test seam: the hermetic suite points it at a stub reviewer.
+: "${HERD_REVIEW_BIN:="$HERE/herd-review.sh"}"
+
+_review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
+_review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
+
+# _review_pid_live <inflight-file> — true if the marker records a still-running reviewer pid.
+_review_pid_live() {
+  local pid; pid="$(head -1 "$1" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# _count_live_reviews — number of inflight markers (across ALL PRs) whose reviewer pid is alive.
+# Dead markers are not counted (they are reaped by _review_gate_step), so a crashed reviewer
+# never wedges a concurrency slot.
+_count_live_reviews() {
+  local n=0 f
+  for f in "$TREES"/.review-inflight-*; do
+    [ -e "$f" ] || continue
+    _review_pid_live "$f" && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
+# _review_retry_count <pr#> <headSha> — transient-failure count for this exact pr+sha.
+_review_retry_count() {
+  [ -s "$REVIEW_RETRIES" ] || { printf '0'; return 0; }
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{n++} END{print n+0}' "$REVIEW_RETRIES" 2>/dev/null || printf '0'
+}
+
+# record_review_retry <pr#> <headSha> — note one transient failure (never a verdict).
+record_review_retry() {
+  printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_RETRIES"
+}
+
+# _discard_stale_reviews <pr#> <currentSha> — a result or inflight marker for this PR keyed to
+# ANY OTHER sha is stale (the PR has a newer head; that verdict must never be read). Discard
+# stale results unread; TERM a stale in-flight reviewer (best-effort — herd-review.sh traps TERM
+# and reports INFRA-FAIL to its own stale result file, which lands here next tick) and drop its
+# marker so the concurrency slot frees up.
+_discard_stale_reviews() {
+  local pr="$1" sha="$2" f base
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [ "${base##*-}" = "$sha" ] && continue
+    case "$base" in
+      .review-inflight-*)
+        local pid; pid="$(head -1 "$f" 2>/dev/null || true)"
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true ;;
+    esac
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
+# _dispatch_review <pr#> <slug> <headSha> — launch herd-review.sh in the background, result file
+# wired via $HERD_REVIEW_RESULT_FILE, and write the inflight marker (pid) for this exact pr+sha.
+# Idempotent: an existing result file or live marker means this pr+sha is already handled — never
+# double-dispatch. Callers gate on concurrency/retries; this only guards identity.
+_dispatch_review() {
+  local pr="$1" slug="$2" sha="$3" result inflight
+  result="$(_review_result_file "$pr" "$sha")"
+  inflight="$(_review_inflight_file "$pr" "$sha")"
+  [ -f "$result" ] && return 0
+  [ -f "$inflight" ] && _review_pid_live "$inflight" && return 0
+  HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$inflight"
+}
+
+# _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
+# machine, called once per tick for a candidate with no ledger verdict yet. Echoes one token:
+#   PASS | BLOCK — a result file was just collected; the verdict is now in the ledger
+#   RUNNING      — reviewer in flight (just dispatched or still working)
+#   QUEUED       — all $REVIEW_CONCURRENCY slots busy; will dispatch on a later tick
+#   RETRY        — transient failure (INFRA-FAIL / dead reviewer); re-dispatches next tick
+#   FAILED       — $_REVIEW_RETRY_MAX transient failures for this sha; needs a human
+_review_gate_step() {
+  local pr="$1" slug="$2" sha="$3" result inflight verdict_line
+  _discard_stale_reviews "$pr" "$sha"
+  result="$(_review_result_file "$pr" "$sha")"
+  inflight="$(_review_inflight_file "$pr" "$sha")"
+
+  # Collect a finished verdict: record to the ledger exactly as the synchronous gate did.
+  if [ -f "$result" ]; then
+    verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
+    rm -f "$result" "$inflight" 2>/dev/null || true
+    case "$verdict_line" in
+      "REVIEW: PASS")   record_review "$pr" "$sha" "PASS";  echo PASS;  return 0 ;;
+      "REVIEW: BLOCK"*) record_review "$pr" "$sha" "BLOCK"; echo BLOCK; return 0 ;;
+      *)
+        # INFRA-FAIL or unparseable: transient — never cached to the ledger, retried with a cap.
+        record_review_retry "$pr" "$sha"
+        if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
+        return 0 ;;
+    esac
+  fi
+
+  # In flight and alive → wait. Dead with no result = severed reviewer → reap, count, re-dispatch.
+  if [ -f "$inflight" ]; then
+    if _review_pid_live "$inflight"; then echo RUNNING; return 0; fi
+    rm -f "$inflight" 2>/dev/null || true
+    record_review_retry "$pr" "$sha"
+  fi
+
+  if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
+  if [ "$(_count_live_reviews)" -ge "${REVIEW_CONCURRENCY:-2}" ]; then echo QUEUED; return 0; fi
+  _dispatch_review "$pr" "$slug" "$sha"
+  echo RUNNING
 }
 
 # override_exists <pr#> <headSha> — true if a human override was recorded for this exact pr+sha.
@@ -596,28 +731,33 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       fi
     fi
     if [ "$prior" != "PASS" ]; then
-      DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing…${C_RESET}"
-      render
-      verdict_line="$(bash "$HERE/herd-review.sh" "$prnum" "$slug" 2>/dev/null | grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' | tail -1)"
-      case "$verdict_line" in
-        "REVIEW: PASS")        verdict="PASS" ;;
-        "REVIEW: BLOCK"*)      verdict="BLOCK" ;;
-        "REVIEW: INFRA-FAIL"*) verdict="INFRA-FAIL" ;;
-        *)                     verdict="BLOCK" ;;
+      # BACKGROUND review: advance the non-blocking state machine one step. Reviews for other
+      # PRs run concurrently (bounded by REVIEW_CONCURRENCY) and merges keep flowing — a PR with
+      # a cached PASS never waits behind someone else's in-flight review.
+      step="$(_review_gate_step "$prnum" "$slug" "$rsha")"
+      case "$step" in
+        PASS) : ;;  # verdict just collected + recorded — fall through to the merge path
+        BLOCK)
+          DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
+          render
+          continue ;;
+        QUEUED)
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review queued · ${REVIEW_CONCURRENCY} in flight${C_RESET}"
+          render
+          continue ;;
+        RETRY)
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review errored · will retry${C_RESET}"
+          render
+          continue ;;
+        FAILED)
+          DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review infra failed ${_REVIEW_RETRY_MAX}× for this commit${C_RESET}"
+          render
+          continue ;;
+        *)
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing…${C_RESET}"
+          render
+          continue ;;
       esac
-      # INFRA-FAIL means the reviewer could not run — transient, not a real finding. Do NOT persist
-      # it to the ledger (that would permanently wedge the PR). Surface for retry next cycle.
-      if [ "$verdict" = "INFRA-FAIL" ]; then
-        DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review errored · will retry${C_RESET}"
-        render
-        continue
-      fi
-      record_review "$prnum" "$rsha" "$verdict"
-      if [ "$verdict" != "PASS" ]; then
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
-        render
-        continue
-      fi
     fi
     # PASS (just now, or recorded for this sha) → proceed based on effective merge policy.
 
