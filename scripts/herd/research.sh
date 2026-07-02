@@ -24,6 +24,7 @@ CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # Read-only repo research — fan-out Explore + concise synthesis. Default to the configured
 # research model (Sonnet); override with RESEARCH_MODEL=… for a specific run.
 RESEARCH_MODEL="${RESEARCH_MODEL:-$MODEL_RESEARCH}"
+_WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Generate a short request id. Same stem as the queue filename so the drainer can derive the
 #    id straight from the claimed file, and the coordinator can fetch research-reports/<id>.md.
@@ -62,11 +63,16 @@ echo "🔎 queued: $REQ"
 echo "REQ_ID $REQ_ID"
 echo "report → $REPORTS/$REQ_ID.md  (fetch with: research-get.sh $REQ_ID)"
 
-# 5. Is THIS project's researcher drainer already running? Match the project-scoped name so two
-#    projects in one herdr each spawn their OWN drainer (a global "researcher" match would let
-#    project B see project A's researcher and never start its own → B's queue would never drain).
-if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_RESEARCHER" python3 -c 'import sys,json,os
-sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
+# 5. Is THIS project's researcher drainer already running? Match by name AND workspace_id (when
+#    known) so a researcher in a different workspace is not reused. herdr agent list has no
+#    --workspace flag; filter client-side via the workspace_id field each agent record carries.
+if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_RESEARCHER" WS="$_WS_ID" python3 -c '
+import sys,json,os
+ws=os.environ.get("WS","")
+sys.exit(0 if any(
+  x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
+  for x in json.load(sys.stdin)["result"]["agents"]
+) else 1)'; then
   echo "🔎 researcher already running — it will drain this."; exit 0
 fi
 
@@ -94,7 +100,7 @@ Use research-step.sh for all queue/report mechanics. Read-only always: never wri
 never git, never switch branches.
 EOF
 )
-created=$(herdr tab create --cwd "$REPO" --label "$HERD_AGENT_RESEARCHER" --no-focus)
+created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_RESEARCHER" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herdr agent start "$HERD_AGENT_RESEARCHER" --cwd "$REPO" --tab "$TAB" --no-focus --env "RESEARCH_TAB=$TAB" -- claude --model "$RESEARCH_MODEL" $CLAUDE_FLAGS "$PROMPT"
+herdr agent start "$HERD_AGENT_RESEARCHER" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --tab "$TAB" --no-focus --env "RESEARCH_TAB=$TAB" -- claude --model "$RESEARCH_MODEL" $CLAUDE_FLAGS "$PROMPT"
 echo "🔎 researcher drainer dispatched (tab $TAB). Coordinator is free; fetch the report with research-get.sh $REQ_ID."
