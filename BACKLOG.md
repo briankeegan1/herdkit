@@ -26,6 +26,10 @@
 - 🚧 **Template-sync guard** *(worktree capabilities-manifest)* — Leak-guard-style healthcheck rule: a PR adding a `cmd_*` subcommand, a `herd-config.sh` key, or a lane script without touching the capabilities manifest fails with a `CODE` error, so the capabilities manifest can never drift.
 - 🚧 **Herd-watch console: show PR # on in-flight rows** *(worktree watch-pr-display)* — when an in-flight builder already has an open PR, the in-flight row should display the PR number (like recently-landed rows do), so the user can match builders to PRs at a glance; reuse the PR data the watcher already fetches.
 
+## Reliability / safety
+
+- 🔜 **Pre-trust fix (PR #22) is ineffective — builders still die on the folder-trust prompt** — new-feature.sh:43-49 writes an empty {} to `<worktree>/.claude/settings.json` claiming Claude Code treats any project-level settings file as a trust marker; that premise is wrong (folder trust is recorded in `~/.claude.json` keyed by project path), so freshly-spawned builders can still hit the interactive trust prompt and die/vanish with zero commits — observed with worktree watch-pr-display: agent pane died at startup leaving an empty shell pane, watcher correctly flagged 'idle · no PR'. Real fix candidates, to be verified against how Claude Code actually records trust: seed the project entry in `~/.claude.json` (e.g. `hasTrustDialogAccepted`) before launch, or have the launcher detect the trust prompt in the pane and answer it, or find a supported non-interactive trust flag. The stalled-builder detection half of PR #22 works and stays.
+
 ## Someday / Deferred
 
 - 🔜 **Phase 4: onboard an external consumer** — `herd init` against a genuinely different repo (web server/library); the real abstraction test (§8).
