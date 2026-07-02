@@ -130,3 +130,67 @@ except Exception:
   fi
   printf '%s' "$_wsid"
 }
+
+# herd_teardown_slug <slug> — close ALL tabs for a feature slug on merge/close-out: the builder
+# tab (label==slug), the review tab (label==review·slug), and the resolver tab
+# (label==resolve·slug). Scoped to this project's workspace when the workspace ID is resolvable,
+# to avoid closing identically-named tabs that belong to another project. Verifies each close
+# with a follow-up herdr tab list; retries once on failure, then warns loudly to stderr.
+# Best-effort — never exits non-zero.
+herd_teardown_slug() {
+  local _td_slug="${1:-}"; [ -n "$_td_slug" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _td_wsid; _td_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  local _td_list; _td_list="$(herdr tab list 2>/dev/null || true)"
+  [ -n "$_td_list" ] || return 0
+
+  # Collect tab IDs for all three label variants, filtered to this project's workspace.
+  local _td_ids
+  _td_ids="$(printf '%s' "$_td_list" | SLUG="$_td_slug" WS="$_td_wsid" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+ws   = os.environ.get("WS", "")
+MID  = "·"
+labels = {slug, "review" + MID + slug, "resolve" + MID + slug}
+try:
+  tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+  for t in tabs:
+    if t.get("label") in labels:
+      if not ws or t.get("workspace_id", "") == ws:
+        print(t["tab_id"])
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  [ -n "$_td_ids" ] || return 0
+
+  # Close each tab, verify with a follow-up list, retry once, warn loudly on second failure.
+  local _td_id
+  while IFS= read -r _td_id; do
+    [ -n "$_td_id" ] || continue
+    herdr tab close "$_td_id" >/dev/null 2>&1 || true
+    local _td_still
+    _td_still="$(herdr tab list 2>/dev/null | TAB_ID="$_td_id" python3 -c '
+import sys, json, os
+tid = os.environ["TAB_ID"]
+try:
+  tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+  print(next((t["tab_id"] for t in tabs if t.get("tab_id") == tid), ""))
+except Exception:
+  pass
+' 2>/dev/null || true)"
+    if [ -n "$_td_still" ]; then
+      herdr tab close "$_td_id" >/dev/null 2>&1 || true
+      _td_still="$(herdr tab list 2>/dev/null | TAB_ID="$_td_id" python3 -c '
+import sys, json, os
+tid = os.environ["TAB_ID"]
+try:
+  tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+  print(next((t["tab_id"] for t in tabs if t.get("tab_id") == tid), ""))
+except Exception:
+  pass
+' 2>/dev/null || true)"
+      [ -n "$_td_still" ] && printf '⚠️  herdkit: tab %s (slug: %s) could not be closed after retry — close it manually.\n' "$_td_id" "$_td_slug" >&2
+    fi
+  done <<< "$_td_ids"
+  return 0
+}
