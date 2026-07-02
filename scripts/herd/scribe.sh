@@ -19,6 +19,7 @@ CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # The scribe only edits one markdown file + commits — a light, mechanical job. Default to the
 # configured scribe model (Sonnet); override with SCRIBE_MODEL=… for a specific run.
 SCRIBE_MODEL="${SCRIBE_MODEL:-$MODEL_SCRIBE}"
+_WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Enqueue atomically (temp then mv); name sorts FIFO.
 mkdir -p "$Q"
@@ -51,10 +52,14 @@ else
   trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
 fi
 
-# 3. Is THIS project's scribe drainer already running? Match the project-scoped name so two
-#    projects in one herdr each spawn their OWN drainer (a global "scribe" match would let project
-#    B see project A's scribe and never start its own → B's queue would never drain).
-if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_SCRIBE" python3 -c 'import sys,json,os
+# 3. Is THIS project's scribe drainer already running? Scope the check to our herdr workspace
+#    when the workspace id is known so a stale scribe in a different workspace is not reused.
+if [ -n "$_WS_ID" ]; then
+  _scribe_list="$(herdr agent list --workspace "$_WS_ID" 2>/dev/null || true)"
+else
+  _scribe_list="$(herdr agent list 2>/dev/null || true)"
+fi
+if printf '%s' "$_scribe_list" | NAME="$HERD_AGENT_SCRIBE" python3 -c 'import sys,json,os
 sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
   echo "✍️  scribe already running — it will drain this."; exit 0
 fi
@@ -102,7 +107,7 @@ Use scribe-step.sh for all mechanics. Never edit files or switch branches.
 EOF
 )
 fi
-created=$(herdr tab create --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus)
+created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herdr agent start "$HERD_AGENT_SCRIBE" --cwd "$REPO" --tab "$TAB" --no-focus --env "SCRIBE_TAB=$TAB" -- claude --model "$SCRIBE_MODEL" $CLAUDE_FLAGS "$PROMPT"
+herdr agent start "$HERD_AGENT_SCRIBE" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --tab "$TAB" --no-focus --env "SCRIBE_TAB=$TAB" -- claude --model "$SCRIBE_MODEL" $CLAUDE_FLAGS "$PROMPT"
 echo "✍️  scribe drainer dispatched (tab $TAB). Coordinator is free; watch for the JUST SCRIBED banner."

@@ -26,6 +26,7 @@ TASK="${*:-}"
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 MODEL="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
+_WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Worktree off the latest default branch + SHARE_LINKS symlinks (fails loudly if the slug
 #    already exists — don't clobber in-flight work). Abort here if it can't be created: a herdr
@@ -37,7 +38,7 @@ fi
 
 # 2. New herdr tab rooted in the worktree; grab tab id + root pane id. If herdr is unavailable
 #    the parse yields empty ids and every later 'herdr pane/agent' call fails cryptically — bail.
-created=$(herdr tab create --cwd "$DIR" --label "$SLUG" --no-focus)
+created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --label "$SLUG" --no-focus)
 read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
   'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
 if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
@@ -51,7 +52,7 @@ RULES="[workflow rules] Build ONLY this feature in this worktree. Before running
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
 warnings are fine). Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog."
 if [ -n "$TASK" ]; then TASK="$TASK"$'\n\n'"$RULES"; else TASK="$RULES"; fi
-herdr agent start "$SLUG" --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$TASK"
+herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$TASK"
 
 # 4. LEFT pane (the tab's root): live app preview on a free port — only if a preview command is
 #    configured and not suppressed. Each feature gets its own port so multiple previews coexist.
