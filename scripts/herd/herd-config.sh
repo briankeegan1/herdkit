@@ -64,6 +64,8 @@ fi
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')
+: "${APP_SURFACE_GLOB:=""}"       # diff paths that constitute the app surface (egrep, e.g. '^app/'); empty → interaction gate off
+: "${INTERACTION_TEST_CMD:=""}"   # command that drives widgets and asserts dependent output changes; exit 0 clean, 1 code error, 2 data/env
 : "${SMOKE_CMD:=""}"              # optional resolver smoke gate
 
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
