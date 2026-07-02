@@ -331,9 +331,15 @@ else
   printf '%s\n' "$$" >"$_wl_tmp"; mv "$_wl_tmp" "$HERD_WATCHER_LOCK"
   rmdir "$_wl_mtx" 2>/dev/null || true
   unset _wl_mtx _wl_tries _wl_pid _wl_tmp
-  # Clean up the PID file on any exit so the next launch can start cleanly.
-  trap 'rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true' EXIT
-  trap 'rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true; exit 1' INT TERM
+  # Clean up the PID file on exit — but ONLY if it still contains our own PID.
+  # If cmd_reload confirms us dead, removes our lock, and relaunches a new watcher,
+  # the new watcher writes its PID before we exit; our EXIT trap must not clobber it.
+  _watcher_lock_cleanup() {
+    [ "$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)" = "$$" ] \
+      && rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+  }
+  trap '_watcher_lock_cleanup' EXIT
+  trap '_watcher_lock_cleanup; exit 1' INT TERM
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
