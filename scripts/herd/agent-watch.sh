@@ -100,6 +100,11 @@ OVERRIDES="$TREES/.agent-watch-overrides"
 #         "<epoch> approved <pr#> <headSha>"  — herd-approve.sh wrote explicit approval for this sha
 #         "<epoch> observed <pr#> <headSha>"  — watcher notified in observe mode (dedup guard)
 APPROVALS="$TREES/.agent-watch-approvals"
+# Transcript-growth ledger for the builder stall detector: one line per active worktree slug
+# ("<slug> <transcript-bytes> <newest-mtime>") caching the last poll's Claude session-transcript
+# observation. A grown transcript between polls is a liveness signal that vetoes a would-be stall
+# warning; see the "Builder liveness" helpers below.
+TRANSCRIPT_STATE="$TREES/.agent-watch-transcript"
 # Healthcheck ledger, PARALLEL to the review ledgers: one line per healthcheck ATTEMPT
 # ("<epoch> <pr#> <slug> <attempt> <outcome>"), outcome ∈ clean | dataenv | code-error | flaky-pass.
 # This is the healthcheck analogue of $REVIEW_STATE — an append-only provenance record so a red row
@@ -738,6 +743,130 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
   fi
 }
 
+# ── Builder liveness (pre-PR stall detection) ────────────────────────────────────────────────────
+# A builder with no PR yet used to be flagged "stalled? · check pane" the moment it hit 5 minutes
+# with zero branch commits. But builders normally commit exactly ONCE, at the very end, right
+# before `gh pr create` — so a plain commit-count heuristic falsely alarms on EVERY normal >5-min
+# build while the agent is heads-down editing uncommitted files. Replace it with a liveness ladder,
+# checked in order, that treats an actively-coding builder as building and only warns on a tree
+# that is genuinely quiet:
+#   1. WORKTREE ACTIVITY  — fresh mtime among the worktree's dirty/untracked paths ⇒ building
+#   2. AGENT STATUS       — agent_status=="working" WITH any worktree edits (even stale) ⇒ building
+#   3. TRANSCRIPT GROWTH  — the Claude session transcript grew since the last poll ⇒ building
+#      (a one-way veto: it can only ever RESCUE a builder from a stall, never cause one)
+#   4. otherwise (clean/quiet tree, zero commits, flat transcript) ⇒ the "no activity" warning
+# The genuinely-dead case (agent_status != "working") is handled by the caller as "idle · no PR".
+
+# file_mtime / _file_size — portable stat helpers (GNU stat -c vs BSD/macOS stat -f), detected once
+# at load, mirroring backlog-view.sh's pattern.
+if stat --version 2>/dev/null | grep -q GNU; then
+  file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+  _file_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+else
+  file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+  _file_size() { stat -f %z "$1" 2>/dev/null || echo 0; }
+fi
+
+# _stall_quiet_secs — how long (seconds) a working builder's tree may go quiet before the warning.
+# Configurable via STALL_QUIET_MIN (minutes); non-numeric/unset falls back to a sane 5 minutes.
+_stall_quiet_secs() {
+  case "${STALL_QUIET_MIN:-}" in
+    ''|*[!0-9]*) printf '%s' 300 ;;
+    *)           printf '%s' $(( STALL_QUIET_MIN * 60 )) ;;
+  esac
+}
+
+# _worktree_newest_edit <worktree> — echo the newest mtime (epoch secs) among the worktree's dirty
+# and untracked paths (per `git status --porcelain`); echo nothing if the tree is clean or the path
+# is not a git repo. This is the primary liveness signal: an actively-coding builder is constantly
+# rewriting uncommitted files even though it won't `git commit` until the very end of the build.
+_worktree_newest_edit() {
+  local wt="$1" newest=0 line rel p m
+  git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # porcelain v1: 2 status columns + a space, then the path ("<old> -> <new>" for renames).
+    rel="${line:3}"
+    case "$rel" in *" -> "*) rel="${rel##* -> }" ;; esac
+    case "$rel" in \"*\") rel="${rel#\"}"; rel="${rel%\"}" ;; esac  # de-quote C-quoted odd names
+    p="$wt/$rel"
+    [ -e "$p" ] || continue                                        # a deletion has no path to stat
+    m="$(file_mtime "$p")"
+    [ "${m:-0}" -gt "$newest" ] && newest="$m"
+  done < <(git -C "$wt" status --porcelain 2>/dev/null)
+  [ "$newest" -gt 0 ] && printf '%s' "$newest"
+}
+
+# _transcript_obs <worktree> — echo "<total-bytes> <newest-mtime>" over the Claude session
+# transcript(s) for this worktree, or nothing if none exist. Claude stores them at
+# $HERD_TRANSCRIPT_ROOT/<munged>/*.jsonl where <munged> is the worktree's absolute path with '/'
+# and '.' rewritten to '-'; the transcript grows as the agent works. Root is overridable for tests.
+_transcript_obs() {
+  local wt="$1" root munged d total=0 newest=0 f sz m
+  root="${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}"
+  munged="$(printf '%s' "$wt" | tr '/.' '-')"
+  d="$root/$munged"
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.jsonl; do
+    [ -f "$f" ] || continue
+    sz="$(_file_size "$f")"; total=$(( total + ${sz:-0} ))
+    m="$(file_mtime "$f")"; [ "${m:-0}" -gt "$newest" ] && newest="$m"
+  done
+  [ "$total" -gt 0 ] && printf '%s %s' "$total" "$newest"
+}
+
+# _transcript_growing <slug> <obs> — compare this poll's observation ("<bytes> <mtime>") against the
+# last one cached for this slug in $TRANSCRIPT_STATE; echo "yes" if it grew (more bytes or a newer
+# mtime), "no" if flat (two identical observations), "unknown" if there is no prior observation or
+# no transcript at all. Updates the cache. Only "yes" ever affects the verdict (a one-way veto), so
+# a missing/mismatched transcript can never CAUSE a false stall — it just fails to rescue.
+_transcript_growing() {
+  local slug="$1" obs="$2" prev cur_size cur_mt prev_size prev_mt tmp
+  [ -n "$obs" ] || { printf 'unknown'; return 0; }
+  cur_size="${obs%% *}"; cur_mt="${obs##* }"
+  prev=""
+  [ -f "$TRANSCRIPT_STATE" ] && prev="$(awk -v s="$slug" '$1==s{print $2, $3}' "$TRANSCRIPT_STATE" 2>/dev/null | tail -1)"
+  # Rewrite the cache: drop any prior line for this slug, append the fresh observation (temp+mv).
+  tmp="${TRANSCRIPT_STATE}.$$"
+  { [ -f "$TRANSCRIPT_STATE" ] && grep -v "^${slug} " "$TRANSCRIPT_STATE" 2>/dev/null
+    printf '%s %s %s\n' "$slug" "$cur_size" "$cur_mt"
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$TRANSCRIPT_STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  [ -n "$prev" ] || { printf 'unknown'; return 0; }
+  prev_size="${prev%% *}"; prev_mt="${prev##* }"
+  if [ "${cur_size:-0}" -gt "${prev_size:-0}" ] || [ "${cur_mt:-0}" -gt "${prev_mt:-0}" ]; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
+# _classify_builder <edit-age> <has-changes> <commits> <agent-status> <transcript-growing> <quiet> —
+# the pure verdict for a working, PR-less builder. Echoes exactly one token:
+#   BUILD_UNCOMMITTED — fresh uncommitted edits (actively coding right now)
+#   BUILDING          — heads-down (working + edits, or transcript growing, or already has commits)
+#   STALL             — clean/quiet tree, zero commits, flat transcript ⇒ show the warning
+# <edit-age> is seconds since the newest dirty-file edit, or -1 when the tree has no dirty files.
+_classify_builder() {
+  local age="$1" changes="$2" commits="$3" status="$4" tgrow="$5" quiet="$6"
+  # 1. fresh uncommitted edits ⇒ actively coding right now.
+  if [ "$changes" -eq 1 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$quiet" ]; then
+    printf 'BUILD_UNCOMMITTED'; return 0
+  fi
+  # 2. a *working* agent with ANY worktree edits (even stale) is heads-down, never stalled.
+  if [ "$status" = "working" ] && [ "$changes" -eq 1 ]; then
+    printf 'BUILDING'; return 0
+  fi
+  # 3. transcript still growing ⇒ alive (one-way veto — only ever rescues from a stall).
+  if [ "$tgrow" = "yes" ]; then
+    printf 'BUILDING'; return 0
+  fi
+  # 4. quiet tree: only a commitless build with no other liveness signal earns the warning.
+  if [ "${commits:-0}" -eq 0 ]; then
+    printf 'STALL'; return 0
+  fi
+  printf 'BUILDING'
+}
+
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
 # WHY: every feature worktree shares ONE git object store and one .git/worktrees lock namespace, so
 # two full healthcheck suites running at once race on shared git locks (empirically: concurrent
@@ -958,19 +1087,30 @@ EOF
       if [ "$astatus" != "working" ]; then
         DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
       else
-        # Stall detection: agent is "working" but has made zero commits for >5 min —
-        # likely stuck on the folder-trust gate or a permissions prompt. Surface a
-        # warning so the user knows to check the pane. The threshold avoids false
-        # positives on agents that spend a few minutes reading before their first commit.
-        _born="$(stat -f '%B' "$dir" 2>/dev/null || echo 0)"
-        _age=$(( $(date +%s) - _born ))
+        # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
+        # helpers) instead of the old commit-count heuristic, which false-flagged every normal
+        # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
+        # transcript-growing worktree reads as building; only a clean, commitless, quiet tree
+        # earns the warning.
+        _quiet="$(_stall_quiet_secs)"
+        _now="$(date +%s)"
+        _newest_edit="$(_worktree_newest_edit "$dir")"
+        if [ -n "$_newest_edit" ]; then _changes=1; _edit_age=$(( _now - _newest_edit )); else _changes=0; _edit_age=-1; fi
         _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
-        if [ "$_age" -gt 300 ] && [ "${_commits:-0}" -eq 0 ]; then
-          _mins=$(( _age / 60 ))
-          DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}stalled? · 0 commits (${_mins}m) · check pane${C_RESET}"
-        else
-          DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
-        fi
+        _tgrow="$(_transcript_growing "$slug" "$(_transcript_obs "$dir")")"
+        case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet")" in
+          BUILD_UNCOMMITTED)
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}" ;;
+          STALL)
+            # "No activity" duration: nothing has been produced (zero commits) and the tree is
+            # quiet, so the worktree's own age is the honest floor for how long it's been silent.
+            _born="$(stat -f '%B' "$dir" 2>/dev/null || stat -c '%W' "$dir" 2>/dev/null || echo 0)"
+            [ "${_born:-0}" -gt 0 ] || _born="$(file_mtime "$dir")"
+            _qmins=$(( ( _now - _born ) / 60 ))
+            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}" ;;
+          *)
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}" ;;
+        esac
       fi
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
