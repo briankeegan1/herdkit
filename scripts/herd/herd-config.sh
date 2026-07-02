@@ -90,6 +90,12 @@ fi
 : "${MODEL_REVIEW:="claude-opus-4-8"}"
 : "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
+# MODEL_ESCALATE_GLOB — deterministic model step-up (analogous to HEALTHCHECK_HEAVY_GLOB): when a
+# lane's task text matches this egrep -i pattern, the lane forces the MODEL_FEATURE tier regardless
+# of MODEL_QUICK or any per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override. Empty (default) → off,
+# zero behavior change. See herd-quick.sh / herd-feature.sh for the resolution point.
+: "${MODEL_ESCALATE_GLOB:=""}"
+
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')

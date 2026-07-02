@@ -26,6 +26,16 @@ TASK="${*:-}"
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 MODEL="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
+# Deterministic model step-up: if the coordinator-passed task text matches MODEL_ESCALATE_GLOB
+# (egrep -i, e.g. judgment-heavy engine surface), force the MODEL_FEATURE tier — REGARDLESS of the
+# HERD_FEATURE_MODEL per-spawn override just resolved (a cheaper override cannot survive a matched
+# escalation glob). Empty glob → off (zero behavior change). Announce only when it raises the tier.
+if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep -Eiq "$MODEL_ESCALATE_GLOB"; then
+  if [ "$MODEL" != "$MODEL_FEATURE" ]; then
+    MODEL="$MODEL_FEATURE"
+    echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
+  fi
+fi
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Worktree off the latest default branch + SHARE_LINKS symlinks (fails loudly if the slug

@@ -38,12 +38,12 @@ Keep your own context lean AND keep this window responsive. When you need to **l
 repo**, **enqueue the question on the async research lane** rather than reading a pile of files
 yourself:
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/research.sh "the question"
+    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/research.sh "the question"
 
 It returns **instantly** with a `REQ_ID` and ensures ONE read-only **researcher** drainer is
 running in its own herdr pane. Fetch each result when you need it:
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/research-get.sh THE_REQ_ID
+    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/research-get.sh THE_REQ_ID
 
 It prints the report, or `PENDING` if the drainer hasn't filed it yet. The coordinator window
 stays free. **One exception:** for a tiny instant lookup you need *right now*, do it inline.
@@ -55,14 +55,23 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 3. Spawn the sub-agent — pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
+     bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
      ```
    - **Quick lane** (trivial / non-app change — scripts, docs, config):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-quick.sh <slug> "<task>"
+     bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-quick.sh <slug> "<task>"
      ```
+   **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
+   (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
+   the quick lane; anything touching judgment-heavy engine surface (`bin/herd`, the watcher,
+   review/resolve logic) wants the feature tier — either pick the feature lane or pass a per-spawn
+   override (`HERD_QUICK_MODEL=<model>` / `HERD_FEATURE_MODEL=<model>` in front of the lane command).
+   `MODEL_ESCALATE_GLOB` in `.herd/config` is the deterministic backstop: when a task's text matches
+   it the lane forces the `MODEL_FEATURE` tier on its own (overriding `MODEL_QUICK` and any per-spawn
+   override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
+   catches the costly misjudgments.
 4. Enqueue the status change (don't edit `BACKLOG.md` yourself — see *Backlog writes*):
-   `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
+   `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any.
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `BACKLOG.md`. The
@@ -71,15 +80,31 @@ auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
 Never run more than the user wants in parallel — call out if 4+ agents are already in flight
 (review bandwidth, not spawn capacity, is the real limit).
 
+### Step up a builder mid-flight
+
+`MODEL_ESCALATE_GLOB` only sees the task text at spawn time — it can't know about scope you add
+later. So whenever you **expand a running builder's scope** — sending it addenda that pull in more
+judgment-heavy work than the lane was spawned for — step its model up in the same breath. Claude
+Code switches model mid-session and keeps the builder's context, so send a `/model` line for the
+`MODEL_FEATURE` value from `.herd/config` into the builder's live agent pane BEFORE the new
+instructions:
+
+    herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"
+
+Target the builder's **agent** pane (the `herdr agent list` entry whose name==slug), not the tab's
+root shell pane — text sent to the shell pane vanishes and the agent never wakes. Then deliver the
+expanded task in a separate `herdr pane run`. Sending `/model` and the prompt as one blob risks the
+step-up being swallowed — switch first, confirm the model changed, then re-task.
+
 ## Browse / Add / Curate
 
 - **Browse:** summarize the open work (`herd backlog` for the live, backend-agnostic set;
   `BACKLOG.md` for the file backend's full grouped history). For *real* status (is a 🔜
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
 - **Add:** enqueue it — the scribe does the research + writes the grounded entry:
-  `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
+  `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
-  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
 
 Keep every backlog edit **privacy-safe** — nothing under `.herd/secrets` and no secrets ever
 reach `BACKLOG.md` (it's committed).
@@ -93,7 +118,7 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
 3. For a CONFLICTING PR, **do NOT hand-resolve it here** — spawn the isolated, test-gated resolver:
-   `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-resolve.sh <slug>`
+   `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
@@ -137,8 +162,8 @@ pipeline but holds before merging — posting a PR comment and a notification on
 To approve and trigger merge:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
-bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
 ```
 
 Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
@@ -191,23 +216,23 @@ _On every invocation, read live state to surface what is configured:_
 - **herd report [--to <link>] "<symptom>"** — File a cross-repo issue on HERD_REPO or a peer from .herd/links via --to; deduplicates first. _When: When a HERD-ENGINE bug needs to escalate to the herdkit repo or a registered peer._
 - **herd link list** — List peer repos registered in .herd/links with their backend and routing target. _When: When reviewing cross-repo filing targets or confirming link names for herd report --to._
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/<lane>.sh`)
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/<lane>.sh`)
 - **herd-feature.sh** — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR. _When: App-facing changes where a running preview aids development; APP_PREVIEW_CMD must be set._
 - **herd-quick.sh** — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR. _When: Trivial or non-app changes: scripts, docs, config, engine fixes; no APP_PREVIEW_CMD required._
 - **herd-resolve.sh** — Isolated conflict resolver: merges default branch into worktree, fixes conflicts, verifies, pushes or escalates. _When: When the watcher surfaces a CONFLICTING PR that cannot auto-resolve._
-- **herd-approve.sh** — Approval entry-point for MERGE_POLICY=approve: list gate-passed PRs and write sha-keyed approval records. _When: When MERGE_POLICY=approve and a PR has passed all gates but needs coordinator sign-off before watcher merges._
+- **herd-approve.sh** — Approval entry-point for MERGE_POLICY=approve AND per-PR human-verify holds: list gate-passed PRs (printing any declared HUMAN-VERIFY steps) and write sha-keyed approval records. _When: When MERGE_POLICY=approve, or a PR declared a HUMAN-VERIFY block, and it has passed all gates but needs coordinator sign-off before the watcher merges._
 
 ### Commands (`herd <subcommand>`)
 - **herd-approve.sh why <pr#>** — Print the latest review verdict and block reason from the review ledger and PR comment. _When: When a PR shows 'review blocked' in the watch console and the coordinator needs to understand why before deciding to fix or override._
 - **herd-approve.sh override <pr#>** — Record a sha-keyed human override so the watcher treats a cached BLOCK as passed for the PR's current commit. _When: When the coordinator decides to override a review block; a new commit invalidates the override and triggers re-review._
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/<lane>.sh`)
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/<lane>.sh`)
 - **dep-watcher.sh** — Polls .herd/deps for blocked-on upstream PRs; transitions items to ready when the upstream PR merges. _When: When .herd/deps exists and features are waiting on a peer-repo PR to merge first._
 - **coordinator.sh** — Launches the two-pane herd control room: backlog viewer pane and agent-watch status pane. _When: To start or restart the herd control room for a project._
 - **research.sh** — Enqueue a research question on the async research lane; returns REQ_ID instantly without blocking. _When: When the coordinator needs to look into the repo without occupying its own context window._
 - **research-get.sh** — Fetch a completed research report by REQ_ID; prints PENDING if the drainer has not filed it yet. _When: After enqueueing research with research.sh, to retrieve the result when needed._
 - **scribe.sh** — Enqueue a backlog change; a single async drainer applies it with git pull plus targeted edit so no clobber occurs. _When: Any time the coordinator updates the backlog — never edit BACKLOG_FILE directly._
-- **agent-watch.sh** — Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs. _When: Runs continuously in the watcher pane; coordinator checks its verdicts for blocked or failed PRs._
+- **agent-watch.sh** — Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs; a PR whose body declares a HUMAN-VERIFY block is held for sha-keyed approval instead of auto-merging. _When: Runs continuously in the watcher pane; coordinator checks its verdicts for blocked, held, or failed PRs._
 - **herd-review.sh** — Adversarial pre-merge correctness gate invoked by the watcher before any merge. _When: Automatically invoked by agent-watch.sh; coordinator surfaces CODE failures back to the sub-agent._
 
 ### Config keys (`.herd/config`)
@@ -244,11 +269,15 @@ _On every invocation, read live state to surface what is configured:_
 - **HEALTH_CONCURRENCY** — Maximum healthcheck suites the watcher runs at once (default: 1 = serialize); all feature worktrees share one git object store, so overlapping suites race on shared .git locks and can paint a false-red for a clean PR — the watcher queues a PR ("health-check · queued") until a slot frees. _When: Keep at 1 unless the project's healthcheck is fully worktree-isolated (no shared object store); raise only if suites provably do not contend._
 - **REVIEW_AUTOFIX** — Auto-bounce BLOCK reviews to the builder agent: true | false (default false); when true, the watcher delivers a re-task prompt and re-tasks the idle builder on each new BLOCK sha, up to REFIX_MAX_ROUNDS. _When: Enable to remove the human re-task step after a BLOCK review; disable (default) for projects that prefer explicit coordinator approval before re-work._
 - **REFIX_MAX_ROUNDS** — Maximum auto-refix rounds per PR before escalating to "needs you" (default: 3); counts across all shas for a PR. _When: Raise for longer fix cycles; lower to 1 for a single bounce with immediate escalation; requires REVIEW_AUTOFIX=true._
+- **MODEL_ESCALATE_GLOB** — Egrep -i pattern of task text that forces the MODEL_FEATURE tier in either lane, overriding MODEL_QUICK and any per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override (deterministic model step-up, analogous to HEALTHCHECK_HEAVY_GLOB); blank (default) → off. _When: Set when judgment-heavy engine surfaces keep getting routed through the cheap quick lane and misbuilding, so those tasks deterministically get the feature-tier model without a per-spawn override._
 
 ### State files and levers
 - **.herd/links** — Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list. _When: When filing issues against peer repos or routing engine bugs to specific trackers across services._
 - **.herd/deps** — Cross-repo dependency list polled by dep-watcher.sh; each row marks a feature as blocked-on an upstream PR. _When: When a feature waits on a peer-repo PR to merge first; dep-watcher transitions state when upstream merges._
 - **.herd/secrets** — API-backend credentials (e.g. LINEAR_API_KEY); gitignored and sourced by scribe-step and cmd_backlog. _When: Required for linear or other API backends; never put credentials in the committed .herd/config._
+
+
+- **HUMAN-VERIFY:** — PR-body marker a builder emits to declare manual steps it could not run itself (one step per line); the watcher parses it and holds that PR for sha-keyed approval instead of auto-merging, a new commit re-holds. _When: When a change has a manual/live verification step (smoke test, UI or pane check, running-app dependency) that the automated gates cannot exercise before merge._
 
 ## Backlog writes — enqueue, never edit inline
 
@@ -256,11 +285,27 @@ The backlog is a planning doc, so backlog changes **commit straight to the defau
 PR. But **you never edit `BACKLOG.md` yourself.** You *enqueue* the change and a single async
 **scribe** applies it (one writer ⇒ no clobber, your window stays free):
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "<the change, described in full>"
+    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "<the change, described in full>"
 
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git
 pull`s + reads fresh + makes a targeted edit, so a concurrent manual edit is never clobbered.
+
+## Persist project & domain context (every session)
+
+Continuity is a first-class property of this seat, not optional hygiene. On **every** session,
+actively **build and update the user's project and domain context** in the
+**local project memory store** — what you learned about how this project and its domain work,
+decisions made and why, the domain's vocabulary, and data quirks/gotchas — so the next session
+resumes with that context instead of relearning it from scratch. Prefer updating an existing
+memory entry over adding a duplicate; correct or drop what proves wrong. Never let this context
+survive only as an easily-pruned note in one consumer project — persisting it here is the durable
+contract.
+
+Per the existing memory contract, this context **stays local and gitignored**: it lives only in
+the project's local memory store, never in the committed repo and never under `.herd/secrets`.
+Do not weaken that contract — earn cross-session continuity by persisting context while keeping it
+entirely out of version control.
 
 ## Rules
 

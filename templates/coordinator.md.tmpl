@@ -61,6 +61,15 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
      ```
      bash {{SCRIPTS_DIR}}/herd-quick.sh <slug> "<task>"
      ```
+   **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
+   (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
+   the quick lane; anything touching judgment-heavy engine surface (`bin/herd`, the watcher,
+   review/resolve logic) wants the feature tier — either pick the feature lane or pass a per-spawn
+   override (`HERD_QUICK_MODEL=<model>` / `HERD_FEATURE_MODEL=<model>` in front of the lane command).
+   `MODEL_ESCALATE_GLOB` in `.herd/config` is the deterministic backstop: when a task's text matches
+   it the lane forces the `MODEL_FEATURE` tier on its own (overriding `MODEL_QUICK` and any per-spawn
+   override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
+   catches the costly misjudgments.
 4. Enqueue the status change (don't edit `{{BACKLOG_FILE}}` yourself — see *Backlog writes*):
    `bash {{SCRIPTS_DIR}}/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any.
@@ -70,6 +79,22 @@ auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
 
 Never run more than the user wants in parallel — call out if 4+ agents are already in flight
 (review bandwidth, not spawn capacity, is the real limit).
+
+### Step up a builder mid-flight
+
+`MODEL_ESCALATE_GLOB` only sees the task text at spawn time — it can't know about scope you add
+later. So whenever you **expand a running builder's scope** — sending it addenda that pull in more
+judgment-heavy work than the lane was spawned for — step its model up in the same breath. Claude
+Code switches model mid-session and keeps the builder's context, so send a `/model` line for the
+`MODEL_FEATURE` value from `.herd/config` into the builder's live agent pane BEFORE the new
+instructions:
+
+    herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"
+
+Target the builder's **agent** pane (the `herdr agent list` entry whose name==slug), not the tab's
+root shell pane — text sent to the shell pane vanishes and the agent never wakes. Then deliver the
+expanded task in a separate `herdr pane run`. Sending `/model` and the prompt as one blob risks the
+step-up being swallowed — switch first, confirm the model changed, then re-task.
 
 ## Browse / Add / Curate
 

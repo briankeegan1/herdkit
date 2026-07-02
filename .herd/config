@@ -28,6 +28,14 @@ MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-opus-4-8"
 MODEL_RESOLVER="claude-sonnet-4-6"
 
+# MODEL_ESCALATE_GLOB — deterministic model step-up (analogous to HEALTHCHECK_HEAVY_GLOB): when a
+# lane's task text matches this egrep -i pattern, the lane forces the MODEL_FEATURE tier regardless
+# of MODEL_QUICK or a per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override. These are herdkit's
+# judgment-heavy engine surfaces where the quick lane historically misbuilt (evidence: an engine PR
+# touching cmd_reload/bin/herd routed through MODEL_QUICK=sonnet). Empty → off. (Here MODEL_QUICK is
+# already opus so this is a belt-and-suspenders guard that also protects any cheaper per-spawn override.)
+MODEL_ESCALATE_GLOB='bin/herd|scripts/herd/agent-watch|herd-review|cmd_reload'
+
 DENY_PATHS=".herd/secrets"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
 COORDINATOR_CMD="/coordinator"
