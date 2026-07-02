@@ -535,4 +535,95 @@ printf '%s' "$out" | grep -q "pid $FAKE_PID" \
   || fail "summary pid should come from lockfile (expected pid $FAKE_PID, got: $(printf '%s' "$out" | grep pid || echo none))"
 ok
 
+# ═══ bootstrap / seeding tests (tests 21+) ════════════════════════════════════
+# These cover the gap found in the reload-in-place live-smoke: a long-lived control room
+# that predates coordinator.sh writing .herd-panes has no registry, so reload must
+# SEED it on the first run and REUSE those IDs on every subsequent run.
+
+# ── 21. migration: coordinator tab present, legacy agent name → splits in coordinator tab, registry written ─
+# Simulates a long-lived control room whose coordinator agent has an old name ("coordinator"
+# instead of the workspace-scoped "coordinator-reloadtest"). The fallback agent search must
+# find the agent by tab_id match, use it as anchor for watch/backlog splits inside the
+# coordinator tab, and write the registry — all without creating standalone tabs.
+P="$T/p21"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P21_REAL="$(cd "$P" && pwd -P)"
+S="$T/state21"
+mkdir -p "$S/tabs" "$S/panes/pA" "$S/panes/pL" "$S/panes/pW" "$S/neighbors"
+printf 'coordinator-reloadtest' > "$S/tabs/tC"
+printf 'tC' > "$S/panes/pA/tab"
+printf 'pL' > "$S/neighbors/pA.left"
+printf 'pW' > "$S/neighbors/pA.down"
+# Agent registered under a LEGACY name ("coordinator", not "coordinator-reloadtest").
+printf '%s\n' '{"result":{"agents":[{"name":"coordinator","pane_id":"pA","tab_id":"tC","workspace_id":"w1"}]}}' \
+  > "$S/agents.json"
+# No .herd-panes registry.
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (legacy agent name migration)"
+# Watch and backlog scripts must be placed inside the coordinator tab (not standalone tabs).
+grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null \
+  || fail "migration: watch script not in coordinator-tab pane (should not take standalone path)"
+grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null \
+  || fail "migration: backlog script not in coordinator-tab pane"
+# No standalone watch tab should have been created.
+grep "tab create" "$S/log" 2>/dev/null \
+  | grep -q "watch-reloadtest" && fail "migration: standalone watch tab created — fallback not suppressed" || true
+# Registry must be written with the pane IDs actually used.
+[ -f "$P21_REAL/trees/.herd-panes" ] \
+  || fail "migration: .herd-panes not written after seeding run"
+grep -q "watch" "$P21_REAL/trees/.herd-panes" \
+  || fail "migration: registry missing watch row"
+grep -q "backlog" "$P21_REAL/trees/.herd-panes" \
+  || fail "migration: registry missing backlog row"
+ok
+
+# ── 22. second reload with registry → same pane IDs reused, zero new tabs/panes ─
+# After the first reload writes the registry (path A, coordinator tab present), the second
+# reload must reuse the recorded pane IDs and issue no tab create or pane split calls.
+P="$T/p22"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P22_REAL="$(cd "$P" && pwd -P)"
+S="$T/state22"; _rich_coord_state "$S"
+# First reload: no registry → creates panes via neighbor/split, writes registry.
+_rich_reload "$P" "$S" >/dev/null || fail "first reload failed (second-reload reuse test)"
+[ -f "$P22_REAL/trees/.herd-panes" ] \
+  || fail "first reload did not write the registry"
+# Record tab-create and pane-split call counts after first reload.
+tabs_after_1="$(grep -c "tab create" "$S/log" 2>/dev/null || true)"
+splits_after_1="$(grep -c "pane split" "$S/log" 2>/dev/null || true)"
+# Second reload: registry exists → should reuse pane IDs; no new tabs or splits.
+_rich_reload "$P" "$S" >/dev/null || fail "second reload failed (reuse test)"
+tabs_after_2="$(grep -c "tab create" "$S/log" 2>/dev/null || true)"
+splits_after_2="$(grep -c "pane split" "$S/log" 2>/dev/null || true)"
+[ "$tabs_after_2" -eq "$tabs_after_1" ] \
+  || fail "second reload created new tabs (tab create count: $tabs_after_1 → $tabs_after_2)"
+[ "$splits_after_2" -eq "$splits_after_1" ] \
+  || fail "second reload split new panes (pane split count: $splits_after_1 → $splits_after_2)"
+ok
+
+# ── 23. standalone-tab path writes registry ───────────────────────────────────
+# When coordinator tab is absent, reload takes the standalone-tab path (path B). It must
+# write .herd-panes so the second reload (or a future path-A reload) can reuse those IDs.
+P="$T/p23"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P23_REAL="$(cd "$P" && pwd -P)"
+S="$T/state23"
+mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
+# No coordinator tab; empty agent list → forces standalone-tab path.
+printf '{"result":{"agents":[]}}\n' > "$S/agents.json"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (standalone-tab registry test)"
+# Standalone path must have written the registry.
+[ -f "$P23_REAL/trees/.herd-panes" ] \
+  || fail "standalone path did not write .herd-panes"
+reg="$(cat "$P23_REAL/trees/.herd-panes")"
+printf '%s' "$reg" | grep -q "watch"   || fail "standalone registry missing watch row"
+printf '%s' "$reg" | grep -q "backlog" || fail "standalone registry missing backlog row"
+# The pane IDs in the registry must be the ones that actually received the scripts.
+watch_pane_id="$(awk '$1=="watch"  {print $2}' "$P23_REAL/trees/.herd-panes")"
+backlog_pane_id="$(awk '$1=="backlog" {print $2}' "$P23_REAL/trees/.herd-panes")"
+[ -n "$watch_pane_id" ] && grep -q "herd-watch.sh" "$S/panes/$watch_pane_id/cmd" 2>/dev/null \
+  || fail "registry watch pane did not receive the watch script"
+[ -n "$backlog_pane_id" ] && grep -q "backlog-view.sh" "$S/panes/$backlog_pane_id/cmd" 2>/dev/null \
+  || fail "registry backlog pane did not receive backlog-view.sh"
+ok
+
 echo "ALL PASS ($pass checks)"

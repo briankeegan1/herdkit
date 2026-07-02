@@ -794,6 +794,23 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
       coord_tab="$(_reload_tab_by_label "$ws" "$HERD_TAB_COORDINATOR")"
       [ -n "$coord_tab" ] && agent_pane="$(_reload_agent_pane "$HERD_AGENT_COORDINATOR" "$coord_tab")"
 
+      # Migration/seeding: long-lived control rooms that predate coordinator.sh writing the
+      # .herd-panes registry may have the coordinator agent registered under a legacy name
+      # (e.g. before workspace-scoped naming was introduced) or the agent list may not match
+      # the expected name for any other reason. Find any agent in the coordinator tab as a
+      # fallback anchor so reload can create splits inside the coordinator tab rather than
+      # falling through to standalone tabs. Standalone tabs are the last resort — only when
+      # the coordinator tab itself is gone.
+      if [ -z "$agent_pane" ] && [ -n "$coord_tab" ]; then
+        agent_pane="$(herdr agent list 2>/dev/null | TAB="$coord_tab" python3 -c '
+import sys,json,os
+try: ag=json.load(sys.stdin)["result"]["agents"]
+except Exception: ag=[]
+tab=os.environ.get("TAB","")
+print(next((a.get("pane_id","") for a in ag if not tab or a.get("tab_id")==tab),""),end="")
+' 2>/dev/null || true)"
+      fi
+
       # Close any standalone watch tab from a previous reload: the watcher is re-placed
       # below the coordinator when the control room is up, or recreated fresh below.
       local wlabel="watch-${WORKSPACE_NAME}" existing_watch=""
@@ -880,6 +897,9 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
             fi ;;
         esac
         # Update the registry so future reloads use the current (possibly recreated) pane IDs.
+        # mkdir -p is required: WORKTREES_DIR may not exist yet on a long-lived control room
+        # that predates the first feature build (no worktrees ever created).
+        mkdir -p "$WORKTREES_DIR"
         {
           printf 'coordinator-agent %s %s\n' "$agent_pane" "$coord_tab"
           [ -n "${bPane:-}" ] && printf 'backlog %s %s\n' "$bPane" "$coord_tab"
@@ -920,6 +940,13 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
           backlog_desc="FAILED to create tab $blabel ✗"
           warn "could not create backlog tab $blabel"
         fi
+        # Write registry so the second reload reuses these pane IDs in-place rather than
+        # creating brand-new standalone tabs on every run. Every path must write the registry.
+        mkdir -p "$WORKTREES_DIR"
+        {
+          [ -n "${wPane:-}" ] && printf 'watch %s %s\n' "$wPane" "${wTab:-}"
+          [ -n "${bPane:-}" ] && printf 'backlog %s %s\n' "$bPane" "${bTab:-}"
+        } > "$WORKTREES_DIR/.herd-panes"
       fi
     fi
   fi
