@@ -579,14 +579,34 @@ cmd_reload() {
     lockpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
     if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then
       kill "$lockpid" 2>/dev/null || true
-      # Wait up to 2s for the process to exit and release the flock.
-      local i=0
-      while [ "$i" -lt 10 ] && kill -0 "$lockpid" 2>/dev/null; do
+      # Wait for SIGTERM: the watcher runs long foreground children synchronously
+      # (herd-review.sh can take minutes; healthcheck; gh pr merge) and bash defers
+      # the SIGTERM trap until the child returns. Poll up to HERD_RELOAD_SIGTERM_POLLS
+      # × 0.2s (default 50 = 10s) before escalating. Tests may set a shorter value.
+      local _tp="${HERD_RELOAD_SIGTERM_POLLS:-50}" i=0
+      while [ "$i" -lt "$_tp" ] && kill -0 "$lockpid" 2>/dev/null; do
         sleep 0.2; i=$((i+1))
       done
+      # Escalate to SIGKILL if still alive after the SIGTERM window.
+      if kill -0 "$lockpid" 2>/dev/null; then
+        say "  watcher PID $lockpid still alive — sending SIGKILL"
+        kill -9 "$lockpid" 2>/dev/null || true
+        local j=0
+        while [ "$j" -lt 10 ] && kill -0 "$lockpid" 2>/dev/null; do
+          sleep 0.2; j=$((j+1))
+        done
+      fi
+      # Abort rather than spawn a duplicate watcher: on Linux, rm-ing the lockfile while
+      # the old watcher still holds flock fd 9 lets a new exec 9> open a fresh inode and
+      # succeed while the old owner keeps the unlinked one — defeating the singleton.
+      if kill -0 "$lockpid" 2>/dev/null; then
+        die "watcher PID $lockpid could not be stopped — aborting reload to prevent duplicate watchers (manual: kill -9 $lockpid)"
+      fi
       killed=$((killed+1))
       say "  stopped watcher PID $lockpid (lockfile)"
     fi
+    # Remove the lockfile ONLY after the old watcher is confirmed gone — a live watcher's
+    # EXIT trap (no-flock path) runs rm on this path and must not clobber a successor's lock.
     rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
   fi
 

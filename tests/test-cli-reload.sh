@@ -10,8 +10,10 @@
 #     herdr instance.
 #   • HERD_RELOAD_SKIP_LAUNCH=1 suppresses the background watcher launch so no
 #     persistent herd-watch.sh / agent-watch.sh processes are spawned.
-#   • Stray-guard tests use real, innocuous sleep processes whose cwd is controlled by
-#     the test — verifies the kill-discrimination logic without touching real watchers.
+#   • HERD_RELOAD_SIGTERM_POLLS=3 (3×0.2s) shortens the SIGTERM wait in tests that
+#     kill live processes, so we do not wait the full 10s production window.
+#   • Kill tests use real, innocuous sleep processes as fake watchers — never the real
+#     agent-watch.sh; stray-guard tests control the cwd of those processes.
 #
 # Run:  bash tests/test-cli-reload.sh
 set -euo pipefail
@@ -122,14 +124,15 @@ printf '%s\n' "99999999" > "$lockfile"   # almost certainly a non-existent PID
 [ -f "$lockfile" ] && fail "reload did not remove the lockfile" || true
 ok
 
-# ── 4. reload kills a live process recorded in the lockfile ───────────────────
+# ── 4. reload kills a live process recorded in the lockfile (SIGTERM path) ────
+# HERD_RELOAD_SIGTERM_POLLS=3 (3×0.2s = 0.6s) so we do not wait the full 10s.
 P="$T/p4"; mkdir "$P"
 _make_project "$P" "reloadtest"
 lockfile="$P/trees/.watcher-reloadtest.pid"
 sleep 999 &
 FAKEPID=$!
 printf '%s\n' "$FAKEPID" > "$lockfile"
-( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+( cd "$P" && HERD_RELOAD_SIGTERM_POLLS=3 HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
   || { kill "$FAKEPID" 2>/dev/null || true; fail "reload failed when a live PID was in lockfile"; }
 sleep 0.3
 kill -0 "$FAKEPID" 2>/dev/null \
@@ -192,5 +195,80 @@ if kill -0 "$OTHER_PID" 2>/dev/null; then
 else
   fail "reload killed a process from another workspace (guard failure)"
 fi
+
+# ── 9. SIGKILL escalation: SIGTERM-ignoring process is killed by SIGKILL ──────
+# Verifies the bounded-wait → SIGKILL path: a process that traps and ignores SIGTERM
+# (as a watcher mid-review/merge would via deferred bash SIGTERM) must still be stopped.
+# HERD_RELOAD_SIGTERM_POLLS=3 (0.6s wait) triggers the SIGKILL branch quickly.
+P="$T/p9"; mkdir "$P"
+_make_project "$P" "reloadtest"
+lockfile="$P/trees/.watcher-reloadtest.pid"
+# Fake watcher that ignores SIGTERM (simulates watcher blocked in a long child).
+( trap '' TERM; sleep 9999 ) &
+STUBBORN=$!
+printf '%s\n' "$STUBBORN" > "$lockfile"
+( cd "$P" && HERD_RELOAD_SIGTERM_POLLS=3 HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill -9 "$STUBBORN" 2>/dev/null || true; fail "reload failed (SIGKILL escalation test)"; }
+sleep 0.3
+kill -0 "$STUBBORN" 2>/dev/null \
+  && { kill -9 "$STUBBORN" 2>/dev/null || true; fail "SIGTERM-ignoring process was not killed by SIGKILL"; } \
+  || true
+[ -f "$lockfile" ] && fail "lockfile not removed after SIGKILL" || true
+ok
+
+# ── 10. EXIT trap guard: dying old watcher does not delete new watcher's lock ─
+# The no-flock EXIT trap in agent-watch.sh guards with [ $(cat lockfile) = $$ ].
+# Simulate: old watcher writes its PID, we replace it with a new PID (simulating
+# cmd_reload relaunching a new watcher), then kill the old watcher — its EXIT trap
+# must see the lockfile no longer contains its own PID and leave it alone.
+P="$T/p10"; mkdir "$P"
+_make_project "$P" "reloadtest"
+lockfile="$P/trees/.watcher-reloadtest.pid"
+mkdir -p "$P/trees"
+# Old watcher subprocess with the guarded EXIT trap (mirrors agent-watch.sh exactly).
+(
+  printf '%s\n' "$$" > "$lockfile"
+  _watcher_lock_cleanup() {
+    [ "$(cat "$lockfile" 2>/dev/null)" = "$$" ] \
+      && rm -f "$lockfile" 2>/dev/null || true
+  }
+  trap '_watcher_lock_cleanup' EXIT
+  trap '_watcher_lock_cleanup; exit 1' INT TERM
+  sleep 9999
+) &
+OLD_WATCHER=$!
+sleep 0.15   # let it write its PID
+
+# Simulate cmd_reload removing old lock and new watcher writing its PID.
+rm -f "$lockfile" 2>/dev/null || true
+NEW_PID="77777"
+printf '%s\n' "$NEW_PID" > "$lockfile"
+
+# Kill the old watcher — its EXIT trap fires.
+kill "$OLD_WATCHER" 2>/dev/null || true
+sleep 0.3
+
+# The guarded EXIT trap should have left the lockfile alone (PID mismatch).
+[ -f "$lockfile" ] \
+  || fail "EXIT trap deleted the new watcher's lockfile (guard missing)"
+cur="$(cat "$lockfile" 2>/dev/null || true)"
+[ "$cur" = "$NEW_PID" ] \
+  || fail "EXIT trap modified the new watcher's lockfile (got '$cur', want '$NEW_PID')"
+ok
+
+# Sanity: EXIT trap DOES remove the lock when file still contains the old PID.
+rm -f "$lockfile" 2>/dev/null || true
+(
+  printf '%s\n' "$$" > "$lockfile"
+  _watcher_lock_cleanup() {
+    [ "$(cat "$lockfile" 2>/dev/null)" = "$$" ] \
+      && rm -f "$lockfile" 2>/dev/null || true
+  }
+  trap '_watcher_lock_cleanup' EXIT
+  # Exit naturally — no replacement PID written.
+)
+[ -f "$lockfile" ] \
+  && fail "EXIT trap did not remove lockfile on natural exit (guard too aggressive)" || true
+ok
 
 echo "ALL PASS ($pass checks)"
