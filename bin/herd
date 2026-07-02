@@ -764,20 +764,13 @@ _reload_reparent() {
   [ "$v" = "yes" ]
 }
 
-cmd_reload() {
-  local root; root="$(pwd)"
-  local cfg="$root/.herd/config"
-  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
-
-  say "${c_bold}herd reload${c_rst} — rebuilding the control room around the coordinator (watcher + backlog pane + skill)"
-  say ""
-
-  # Load config: gives us WORKSPACE_NAME, WORKTREES_DIR, HERD_WATCHER_LOCK, PROJECT_ROOT, etc.
-  export HERD_CONFIG_FILE="$cfg"
-  # shellcheck source=/dev/null
-  . "$SCRIPTS_DIR/herd-config.sh"
-
-  # 1. Stop ALL agent-watch.sh processes for this workspace.
+# _stop_project_watcher — stop THIS project's watcher(s) with the SIGTERM-poll-SIGKILL-abort
+# sequence + duplicate-watcher guard. Requires HERD_WATCHER_LOCK and PROJECT_ROOT in scope (loaded
+# from .herd/config). DIES (aborts the caller) when a watcher cannot be stopped, rather than risk
+# spawning a duplicate over a still-live one. Prints one progress line per stopped watcher and says
+# so when none were running. Shared by `herd reload` and `herd pane watch`. Honors
+# HERD_RELOAD_SIGTERM_POLLS (default 50 × 0.2s = 10s) for the SIGTERM window.
+_stop_project_watcher() {
   local lockpid="" killed=0
 
   # Primary: PID from the per-project lockfile.
@@ -806,7 +799,7 @@ cmd_reload() {
       # the old watcher still holds flock fd 9 lets a new exec 9> open a fresh inode and
       # succeed while the old owner keeps the unlinked one — defeating the singleton.
       if kill -0 "$lockpid" 2>/dev/null; then
-        die "watcher PID $lockpid could not be stopped — aborting reload to prevent duplicate watchers (manual: kill -9 $lockpid)"
+        die "watcher PID $lockpid could not be stopped — aborting to prevent duplicate watchers (manual: kill -9 $lockpid)"
       fi
       killed=$((killed+1))
       say "  stopped watcher PID $lockpid (lockfile)"
@@ -847,6 +840,24 @@ cmd_reload() {
   done < <(pgrep -f "agent-watch.sh" 2>/dev/null || true)
 
   [ "$killed" -eq 0 ] && say "  no running watcher found"
+  return 0
+}
+
+cmd_reload() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+
+  say "${c_bold}herd reload${c_rst} — rebuilding the control room around the coordinator (watcher + backlog pane + skill)"
+  say ""
+
+  # Load config: gives us WORKSPACE_NAME, WORKTREES_DIR, HERD_WATCHER_LOCK, PROJECT_ROOT, etc.
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+
+  # 1. Stop this project's watcher(s) — SIGTERM-poll-SIGKILL-abort + duplicate-watcher guard.
+  _stop_project_watcher
   say ""
 
   # 2. Re-render the coordinator skill from the (possibly updated) .herd/config.
@@ -1172,6 +1183,334 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
   say "  MERGE_POLICY:  ${c_bold}$effective_policy${c_rst}"
 }
 
+# ── herd pane <watch|backlog|coordinator>: single-pane restart shortcuts ─────────────────────────
+# Re-run ONE control-room pane in place without a full `herd reload`. Each reuses the reload helpers
+# (observe-before-mutate pane plumbing) and the `.herd-panes` role registry, rewrites that registry
+# from the OBSERVED final state, and prints a one-line per-component outcome like cmd_reload's
+# summary. All refuse when no project `.herd/config` resolves — never the engine dogfood fallback.
+
+# _pane_ws_id <workspace_label> → workspace_id, or empty (mirrors cmd_reload's resolve).
+_pane_ws_id() {
+  herdr workspace list 2>/dev/null | LABEL="$1" python3 -c '
+import sys,json,os
+try: d=json.load(sys.stdin)
+except Exception: d={}
+ws=(d.get("result") or {}).get("workspaces") or []
+print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LABEL","")), ""), end="")
+' 2>/dev/null || true
+}
+
+# _pane_agent_start <name> <workspace> <cwd> <tab> <direction> → new pane_id, or empty. Reuses
+# coordinator.sh's agent-start invocation so the relaunched coordinator runs the same skill.
+_pane_agent_start() {
+  herdr agent start "$1" --workspace "$2" --cwd "$3" --tab "$4" --split "$5" -- claude "$COORDINATOR_CMD" 2>/dev/null \
+    | python3 -c '
+import sys,json
+try: print(json.load(sys.stdin)["result"]["agent"]["pane_id"], end="")
+except Exception: pass
+' 2>/dev/null || true
+}
+
+# _pane_write_registry <agent> <backlog> <watch> — rewrite $WORKTREES_DIR/.herd-panes from the
+# OBSERVED final pane IDs (empty rows omitted). All three rows carry the coordinator tab id.
+_pane_write_registry() {
+  mkdir -p "$WORKTREES_DIR"
+  {
+    [ -n "$1" ] && printf 'coordinator-agent %s %s\n' "$1" "$PANE_COORD_TAB"
+    [ -n "$2" ] && printf 'backlog %s %s\n' "$2" "$PANE_COORD_TAB"
+    [ -n "$3" ] && printf 'watch %s %s\n' "$3" "$PANE_COORD_TAB"
+  } > "$WORKTREES_DIR/.herd-panes"
+}
+
+# _pane_init — shared preamble for the pane subcommands. Resolves and PINS this project's
+# .herd/config (refusing the dogfood fallback), requires herdr, resolves the workspace +
+# coordinator tab + anchor (coordinator) pane, and reads the .herd-panes registry rows. Dies with a
+# clear message when the control room is not up. Sets PANE_* globals for the caller:
+#   PANE_ROOT PANE_CFG PANE_WS PANE_COORD_TAB PANE_AGENT PANE_AGENT_LIVE PANE_REG_A/W/B
+_pane_init() {
+  PANE_ROOT="$(pwd)"
+  PANE_CFG="$PANE_ROOT/.herd/config"
+  [ -f "$PANE_CFG" ] || die "no .herd/config at $PANE_ROOT — run 'herd init' first (refusing the engine dogfood config)"
+  export HERD_CONFIG_FILE="$PANE_CFG"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+
+  command -v herdr >/dev/null 2>&1 \
+    || die "herdr not on PATH — 'herd pane' needs the herdr control room (launch it: bash $SCRIPTS_DIR/coordinator.sh)"
+
+  PANE_WS="$(_pane_ws_id "$WORKSPACE_NAME")"
+  [ -n "$PANE_WS" ] \
+    || die "no herdr workspace '$WORKSPACE_NAME' — launch the control room first: bash $SCRIPTS_DIR/coordinator.sh"
+
+  PANE_COORD_TAB="$(_reload_tab_by_label "$PANE_WS" "$HERD_TAB_COORDINATOR")"
+  [ -n "$PANE_COORD_TAB" ] \
+    || die "no coordinator tab in workspace '$WORKSPACE_NAME' — run 'herd reload' or coordinator.sh to build the control room"
+
+  # Registry rows (coordinator.sh / prior reloads) — hints, validated against the live roster below.
+  PANE_REG_A=""; PANE_REG_W=""; PANE_REG_B=""
+  if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
+    PANE_REG_A="$(awk '$1=="coordinator-agent" {print $2}' "$WORKTREES_DIR/.herd-panes")"
+    PANE_REG_W="$(awk '$1=="watch"   {print $2}' "$WORKTREES_DIR/.herd-panes")"
+    PANE_REG_B="$(awk '$1=="backlog" {print $2}' "$WORKTREES_DIR/.herd-panes")"
+  fi
+
+  # ANCHOR: resolve the coordinator pane — a live agent in the tab (authoritative; also catches
+  # legacy agent names) → the registry coordinator-agent row (validated to still exist) →
+  # inference from the tab's non-backlog panes. This anchors watch/backlog placement and is the
+  # pane `herd pane coordinator` relaunches.
+  PANE_AGENT=""; PANE_AGENT_LIVE=0
+  PANE_AGENT="$(_reload_agent_pane "$HERD_AGENT_COORDINATOR" "$PANE_COORD_TAB")"
+  [ -z "$PANE_AGENT" ] && PANE_AGENT="$(_reload_any_agent_in_tab "$PANE_COORD_TAB")"
+  if [ -n "$PANE_AGENT" ]; then
+    PANE_AGENT_LIVE=1
+  elif [ -n "$PANE_REG_A" ]; then
+    case "$(_reload_pane_state "$PANE_REG_A" "")" in GONE) : ;; *) PANE_AGENT="$PANE_REG_A" ;; esac
+  fi
+  if [ -z "$PANE_AGENT" ]; then
+    local p
+    for p in $(_reload_tab_panes "$PANE_WS" "$PANE_COORD_TAB"); do
+      [ "$p" = "$PANE_REG_W" ] && continue
+      [ "$(_reload_pane_role "$p")" = "backlog" ] && continue
+      PANE_AGENT="$p"; break
+    done
+  fi
+  [ -n "$PANE_AGENT" ] \
+    || die "no coordinator pane in tab $PANE_COORD_TAB — run 'herd reload' to rebuild the control room"
+  return 0
+}
+
+cmd_pane_watch() {
+  _pane_init
+  say "${c_bold}herd pane watch${c_rst} — restarting the watcher in its pane"
+  say ""
+
+  local watch_script="$SCRIPTS_DIR/herd-watch.sh"
+  local watch_match="agent-watch.sh|herd-watch.sh"   # herd-watch.sh execs agent-watch.sh
+
+  # 1. Stop this project's watcher (SIGTERM-poll-SIGKILL-abort; dies if unstoppable).
+  _stop_project_watcher
+  say ""
+
+  # 2. Resolve the watch pane: reuse the registered pane (now BARE, its watcher just stopped),
+  #    else the coordinator's downward neighbor, else recreate it below the coordinator (0.72).
+  local wPane="" recreated=0 geom_changed=0
+  if [ -n "$PANE_REG_W" ]; then
+    case "$(_reload_pane_state "$PANE_REG_W" "$watch_match")" in
+      BARE|RUN*) wPane="$PANE_REG_W" ;;
+    esac
+  fi
+  if [ -z "$wPane" ]; then
+    local nbd; nbd="$(_reload_neighbor "$PANE_AGENT" down)"
+    if [ -n "$nbd" ]; then
+      case "$(_reload_pane_state "$nbd" "$watch_match")" in
+        BARE|RUN*) wPane="$nbd" ;;
+      esac
+    fi
+  fi
+  if [ -z "$wPane" ]; then
+    wPane="$(_reload_split_pane "$PANE_AGENT" down 0.72 "$PANE_ROOT")"
+    [ -n "$wPane" ] && { recreated=1; geom_changed=1; }
+  fi
+
+  # 3. Run the watcher in the pane, verified. On a detached run the watcher still grabs the
+  #    lockfile — surface that loudly rather than double-spawning (the singleton refuses anyway).
+  local wsum="FAILED ✗" watch_pid=""
+  if [ -n "$wPane" ]; then
+    if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
+      wsum="pane $wPane · visible ✓"
+      [ "$recreated" -eq 1 ] && wsum="pane $wPane · recreated ✓"
+      local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
+      while [ "$_kk" -lt "$_lp" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; _kk=$((_kk+1)); done
+      [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    else
+      local zpid=""
+      [ -f "$HERD_WATCHER_LOCK" ] && zpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      if [ -n "$zpid" ] && kill -0 "$zpid" 2>/dev/null; then
+        wsum="DETACHED — running, but NOT visible in pane $wPane"
+        watch_pid="$zpid"
+        warn "watcher PID $zpid is RUNNING but NOT visible in pane $wPane — its pane run detached from the tty; re-run 'herd pane watch' or kill $zpid and inspect the pane"
+      else
+        wsum="pane $wPane · NOT visible ✗"
+        warn "watcher did not appear in pane $wPane"
+      fi
+    fi
+  else
+    warn "could not resolve or create a watch pane below the coordinator"
+  fi
+  [ -n "$watch_pid" ] && wsum="$wsum · pid $watch_pid"
+
+  # REPAINT the width-sensitive backlog viewer if the geometry changed (see cmd_reload).
+  if [ "$geom_changed" -eq 1 ] && [ -n "${BACKLOG_FILE:-}" ] && [ -f "$PANE_ROOT/$BACKLOG_FILE" ]; then
+    touch "$PANE_ROOT/$BACKLOG_FILE" 2>/dev/null || true
+  fi
+
+  # 4. Registry from the observed final state (backlog row preserved from the registry).
+  _pane_write_registry "$PANE_AGENT" "$PANE_REG_B" "$wPane"
+
+  say ""
+  ok "pane watch complete"
+  say "  workspace:  $WORKSPACE_NAME"
+  say "  watcher:    $wsum"
+  return 0
+}
+
+cmd_pane_backlog() {
+  _pane_init
+  say "${c_bold}herd pane backlog${c_rst} — restarting the backlog viewer in its pane"
+  say ""
+
+  local backlog_script="$SCRIPTS_DIR/backlog-view.sh"
+
+  # Resolve the backlog pane: the registered pane if it still serves the role, else the
+  # coordinator's LEFT neighbor, else a scan of the coordinator tab for a live viewer.
+  local bPane="" recreated=0 geom_changed=0
+  if [ -n "$PANE_REG_B" ]; then
+    case "$(_reload_pane_state "$PANE_REG_B" "backlog-view.sh")" in
+      RUN*|BARE) bPane="$PANE_REG_B" ;;
+    esac
+  fi
+  if [ -z "$bPane" ]; then
+    local nb; nb="$(_reload_neighbor "$PANE_AGENT" left)"
+    if [ -n "$nb" ]; then
+      case "$(_reload_pane_state "$nb" "backlog-view.sh")" in
+        RUN*|BARE) bPane="$nb" ;;
+      esac
+    fi
+  fi
+  if [ -z "$bPane" ]; then
+    local p
+    for p in $(_reload_tab_panes "$PANE_WS" "$PANE_COORD_TAB"); do
+      [ "$(_reload_pane_role "$p")" = "backlog" ] && { bPane="$p"; break; }
+    done
+  fi
+
+  if [ -z "$bPane" ]; then
+    # Gone → recreate beside the coordinator and swap into the LEFT slot (canonical shape).
+    bPane="$(_reload_split_pane "$PANE_AGENT" right 0.5 "$PANE_ROOT")"
+    if [ -n "$bPane" ]; then
+      herdr pane swap --source-pane "$bPane" --target-pane "$PANE_AGENT" >/dev/null 2>&1 || true
+      recreated=1; geom_changed=1
+    fi
+  else
+    # In place: interrupt a live viewer safely first. backlog-view.sh traps INT/TERM, restores the
+    # tty, and exits 0, so SIGTERM-ing its foreground pid stops it cleanly (it is stateless — no
+    # loss). A pane run into a still-looping viewer would type into its muted stdin, not execute.
+    local bstate; bstate="$(_reload_pane_state "$bPane" "backlog-view.sh")"
+    case "$bstate" in
+      RUN\ *)
+        local vpid="${bstate#RUN }"
+        [ -n "$vpid" ] && kill "$vpid" 2>/dev/null || true
+        ;;
+    esac
+  fi
+
+  # Rerun the viewer, verified.
+  local bsum="FAILED ✗"
+  if [ -n "$bPane" ]; then
+    if _reload_pane_run_verified "$bPane" "bash $backlog_script" "backlog-view.sh" >/dev/null; then
+      bsum="pane $bPane · visible ✓"
+      [ "$recreated" -eq 1 ] && bsum="pane $bPane · recreated ✓"
+    else
+      bsum="pane $bPane · NOT visible ✗"
+      warn "backlog-view did not appear in pane $bPane"
+    fi
+  else
+    warn "could not resolve or create a backlog pane beside the coordinator"
+  fi
+
+  if [ "$geom_changed" -eq 1 ] && [ -n "${BACKLOG_FILE:-}" ] && [ -f "$PANE_ROOT/$BACKLOG_FILE" ]; then
+    touch "$PANE_ROOT/$BACKLOG_FILE" 2>/dev/null || true
+  fi
+
+  # Registry from the observed final state (watch row preserved from the registry).
+  _pane_write_registry "$PANE_AGENT" "$bPane" "$PANE_REG_W"
+
+  say ""
+  ok "pane backlog complete"
+  say "  workspace:  $WORKSPACE_NAME"
+  say "  backlog:    $bsum"
+  return 0
+}
+
+cmd_pane_coordinator() {
+  local assume_yes=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      *) die "unknown option '$1' for 'herd pane coordinator' (expected --yes)" ;;
+    esac
+  done
+
+  _pane_init
+  say "${c_bold}herd pane coordinator${c_rst} — relaunching the coordinator agent in its pane"
+
+  # DESTRUCTIVE: this KILLS the live coordinator claude session in the anchor pane. Require an
+  # explicit, typed confirmation (or --yes). Non-interactive without --yes always refuses.
+  if [ -z "$assume_yes" ]; then
+    if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+      local ans; ans="$(ask "This KILLS the live coordinator claude in pane $PANE_AGENT and relaunches it — type 'yes' to proceed" "")"
+      [ "$ans" = "yes" ] || die "aborted — coordinator left running (type 'yes' or pass --yes)"
+    else
+      die "refusing to relaunch the coordinator without confirmation — it kills the live coordinator session; re-run with --yes"
+    fi
+  fi
+  say ""
+
+  # Close the old coordinator pane (kills claude), then relaunch the agent with coordinator.sh's
+  # invocation. Keep the watcher canonical by re-parenting it below the fresh coordinator pane.
+  local watch_before="$PANE_REG_W"
+  herdr pane close "$PANE_AGENT" >/dev/null 2>&1 || true
+  local new_pane; new_pane="$(_pane_agent_start "$HERD_AGENT_COORDINATOR" "$PANE_WS" "$PANE_ROOT" "$PANE_COORD_TAB" right)"
+
+  local csum="FAILED ✗"
+  if [ -n "$new_pane" ]; then
+    csum="pane $new_pane · relaunched ✓"
+    if [ -n "$watch_before" ]; then
+      case "$(_reload_pane_state "$watch_before" "")" in
+        GONE) : ;;
+        *) _reload_reparent "$watch_before" "$PANE_COORD_TAB" down "$new_pane" 0.72 || true ;;
+      esac
+    fi
+  else
+    warn "coordinator agent did not start — inspect tab $PANE_COORD_TAB"
+  fi
+
+  # Registry from the observed final state (new coordinator pane; backlog/watch preserved).
+  _pane_write_registry "$new_pane" "$PANE_REG_B" "$watch_before"
+
+  say ""
+  ok "pane coordinator complete"
+  say "  workspace:    $WORKSPACE_NAME"
+  say "  coordinator:  $csum"
+  return 0
+}
+
+_pane_usage() {
+  cat <<EOF
+herd pane <target> — restart ONE control-room pane in place (no full reload)
+
+  herd pane watch          stop this project's watcher and rerun it in the registered watch
+                           pane (recreated below the coordinator if gone), pane visibility verified
+  herd pane backlog        rerun the backlog viewer in the registered backlog pane, interrupting a
+                           live viewer safely first (recreated at canonical geometry if gone)
+  herd pane coordinator    relaunch the coordinator agent pane — KILLS the live coordinator claude
+                           session, so it requires a typed 'yes' or --yes
+    [--yes|-y]             skip the confirmation prompt (still destructive)
+EOF
+}
+
+cmd_pane() {
+  local sub="${1:-}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$sub" in
+    watch)        cmd_pane_watch "$@" ;;
+    backlog)      cmd_pane_backlog "$@" ;;
+    coordinator)  cmd_pane_coordinator "$@" ;;
+    ''|help|-h|--help) _pane_usage ;;
+    *) die "unknown 'herd pane' target '$sub' — expected: watch | backlog | coordinator" ;;
+  esac
+}
+
 cmd_update() {
   local force=""
   while true; do
@@ -1299,6 +1638,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       prints a per-component summary + effective MERGE_POLICY.
                                       Never closes the coordinator tab/agent — safe to run
                                       from inside the coordinator
+  herd pane <target>                  restart ONE control-room pane in place (no full reload):
+                                        watch        stop + rerun the watcher in its pane
+                                        backlog      rerun the backlog viewer in its pane
+                                        coordinator  relaunch the coordinator agent (KILLS the
+                                                     live session; needs a typed yes or --yes)
   herd update [--force]               pull the herdkit engine (git pull --ff-only), upgrade the
                                       coordinator skill, and reload the workspace in one step;
                                       refuses if the engine checkout is dirty or builders are
@@ -1321,6 +1665,7 @@ case "${1:-help}" in
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
+  pane)    shift; cmd_pane "$@" ;;
   update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
