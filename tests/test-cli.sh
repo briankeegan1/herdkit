@@ -13,7 +13,7 @@ git -C "$T" config user.email t@t.t; git -C "$T" config user.name t
 ( cd "$T" && git commit -q --allow-empty -m init )
 
 # 1. init non-interactively (defaults applied via HERD_NONINTERACTIVE).
-( cd "$T" && HERD_NONINTERACTIVE=1 bash "$HERD" init >/dev/null ) || fail "herd init failed"
+( cd "$T" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init >/dev/null ) || fail "herd init failed"
 [ -f "$T/.herd/config" ] || fail "init did not write .herd/config"
 [ -f "$T/.claude/commands/coordinator.md" ] || fail "init did not render the coordinator skill"
 [ -f "$T/BACKLOG.md" ] || fail "init did not seed BACKLOG.md"
