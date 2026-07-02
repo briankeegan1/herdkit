@@ -43,6 +43,46 @@ if command -v shellcheck >/dev/null 2>&1; then
 fi
 
 # 3. Tests — bats if present, else run the hermetic *.sh tests directly.
+#
+# HERMETICITY LEAK-GUARD: a hermetic test must NEVER create a real tab/pane in the user's LIVE
+# herdr workspace. We snapshot the live inventory before and after the suite and FAIL LOUDLY if
+# the suite leaves a new ORPHAN tab behind. This is exactly the class of bug that let a stray
+# 'review·<slug>' tab (with an orphaned 'tail -f') leak from test-review-pane-v2.sh scenario 4
+# and perpetually reappear on every full-suite run. Skipped when herdr is not installed.
+#
+# WHY ORPHANS, not "any tab delta": this workspace is SHARED with real running agents. During the
+# tens of seconds the suite runs, the live coordinator/watcher legitimately spawns and reaps real
+# lane tabs (scribe-*, coordinator-*, feature slugs) and close+recreates tabs on gate cycles — a
+# raw before/after tab diff false-fails on that churn. But every real lane tab is AGENT-BACKED:
+# its agent_status is 'idle' or 'working'. A tab leaked by a hermetic test that escaped its stubs
+# is an ORPHAN — herd-review.sh's standalone fallback creates a bare tab running 'tail -f' with NO
+# controlling agent, so its agent_status is 'unknown' (or missing). So we count only ORPHAN tabs
+# (status not idle/working) and their panes, and fail only on a NET INCREASE. Watcher recreates of
+# an existing orphan net to zero; real lane churn never touches the orphan count. This is immune to
+# concurrent activity while still catching the exact leak this PR fixes. (Residual: a real headless
+# review·<slug> tab spawned by the watcher in this same window is also an orphan and could trip the
+# guard — rare, transient, and self-heals on re-run; a genuine leak persists and re-trips.)
+_hk_orphans() {
+  # Emits 'orphan-tabs:<N>' and 'orphan-panes:<M>' — N = live tabs with no controlling agent
+  # (agent_status not in idle/working), M = their combined pane_count. Empty when herdr absent.
+  # Read-only; never mutates the workspace.
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr tab list 2>/dev/null | python3 -c '
+import sys, json
+try:
+    tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
+    orphans = [t for t in tabs if str(t.get("agent_status", "")) not in ("idle", "working")]
+    print("orphan-tabs:%d" % len(orphans))
+    print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
+    # Emit the orphan labels too so a real leak can be named in the failure message.
+    for lbl in sorted(str(t.get("label", "")) for t in orphans):
+        print("orphan-label:" + lbl)
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+_hk_orphans_before="$(_hk_orphans)"
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   if to="$(bats tests/*.bats 2>&1)"; then t_note="tests: bats pass"; else
@@ -56,6 +96,43 @@ elif ls tests/test-*.sh >/dev/null 2>&1; then
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"
     exit 1
   fi
+fi
+
+# Leak-guard verdict: fail LOUDLY on a NET INCREASE in orphan tabs or orphan panes.
+leak_note="tab-leak-guard: clean"
+if command -v herdr >/dev/null 2>&1; then
+  _hk_orphans_after="$(_hk_orphans)"
+  _hk_leak="$(BEF="$_hk_orphans_before" AFT="$_hk_orphans_after" python3 -c '
+import os
+def parse(s):
+    tabs = panes = 0
+    labels = []
+    for line in s.splitlines():
+        if line.startswith("orphan-tabs:"):  tabs  = int(line.split(":",1)[1] or 0)
+        elif line.startswith("orphan-panes:"): panes = int(line.split(":",1)[1] or 0)
+        elif line.startswith("orphan-label:"): labels.append(line.split(":",1)[1])
+    return tabs, panes, labels
+bt, bp, bl = parse(os.environ["BEF"])
+at, ap, al = parse(os.environ["AFT"])
+if at > bt or ap > bp:
+    # Name the orphan label(s) present after but not before, best-effort.
+    from collections import Counter
+    new = list((Counter(al) - Counter(bl)).elements())
+    print("orphan tabs %d->%d, orphan panes %d->%d%s" % (
+        bt, at, bp, ap, (" — new: " + ", ".join(sorted(new))) if new else ""))
+' 2>/dev/null || true)"
+  if [ -n "$_hk_leak" ]; then
+    if [ -n "$ONELINE" ]; then
+      echo "tab-leak-guard: suite leaked an orphan tab into the live workspace — $_hk_leak"
+    else
+      echo "TAB-LEAK-GUARD: the test suite left an orphan tab/pane in the live workspace"
+      echo "  (a hermetic test escaped its stubs and created a real, agent-less herdr tab)"
+      echo "  $_hk_leak"
+    fi
+    exit 1
+  fi
+else
+  leak_note="tab-leak-guard: skipped (herdr not installed)"
 fi
 
 # 4. leak-guard — no single-consumer (Northstar) literal may leak into the generic engine.
@@ -129,5 +206,5 @@ else
   caps_note="caps-sync: skipped (no diff against $_hc_branch)"
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $lg_note"; echo "  $caps_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $leak_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; }
 exit 0
