@@ -375,6 +375,7 @@ for wt, branch in feats:
 $rec
 EOF
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
         DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
@@ -396,15 +397,15 @@ EOF
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
-      DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}health-check${C_RESET}"
+      DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
       CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch")
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
-      DISPLAY[i]="    ${C_DIM}🔍 ${sl} verifying mergeability…${C_RESET}"
+      DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
       if resolver_attempted "$branch"; then
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · resolver failed${C_RESET}"
+        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
       else
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · conflict${C_RESET}"
+        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
         CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch")
       fi
     elif [ "$mergeable" = "MERGEABLE" ]; then
@@ -412,10 +413,10 @@ EOF
       # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
       # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
       # is transient, NOT a human-action error, so no ⚠️ "needs you".
-      DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
+      DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
     else
       reason="not mergeable (${mstate})"
-      DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · ${reason}${C_RESET}"
+      DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
     fi
     i=$((i + 1))
   done
@@ -428,18 +429,19 @@ EOF
     dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; j=$((j + 1))
     already_merged "$prnum" "$slug" && continue
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    pn=" ${C_DIM}#${prnum}${C_RESET} ·"
 
-    DISPLAY[idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}health-check${C_RESET}"
+    DISPLAY[idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
     render
     hc="$(bash "$HERE/healthcheck.sh" "$dir" --oneline 2>/dev/null)"; rc=$?
     if [ "$rc" -ne 0 ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · ${hc}${C_RESET}"
+      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${hc}${C_RESET}"
       render
       continue
     fi
 
     if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔬 ${sl} [dry-run] would review PR #${prnum} (then merge on PASS)${C_RESET}"
+      DISPLAY[idx]="    ${C_DIM}🔬${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would review PR #${prnum} (then merge on PASS)${C_RESET}"
       render
       continue
     fi
@@ -453,7 +455,7 @@ except Exception: d = {}
 print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), str(d.get("headRefName","")), str(d.get("headRefOid",""))]))
 ')
     if [ "$rbranch" != "$branch" ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · PR #${prnum} no longer maps to ${branch}${C_RESET}"
+      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · PR #${prnum} no longer maps to ${branch}${C_RESET}"
       render
       continue
     fi
@@ -461,10 +463,10 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       if [ "$rmergeable" = "MERGEABLE" ]; then
         # Still conflict-free but a gate regressed since classification (e.g. a required check went
         # pending, or the branch fell BEHIND): soft-hold, re-evaluate next tick — not a ⚠️.
-        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}blocked · awaiting required checks/reviews (${rmstate:-?})${C_RESET}"
+        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${rmstate:-?})${C_RESET}"
       else
         if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
+        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
       fi
       render
       continue
@@ -472,17 +474,17 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
 
     # PRE-MERGE ADVERSARIAL REVIEW GATE. Keyed by PR + head sha so each commit is reviewed once.
     if [ -z "$rsha" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔬 ${sl} awaiting head sha for review…${C_RESET}"
+      DISPLAY[idx]="    ${C_DIM}🔬${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}awaiting head sha for review…${C_RESET}"
       render
       continue
     fi
     prior="$(review_verdict "$prnum" "$rsha" || true)"
     if [ "$prior" = "BLOCK" ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · review blocked${C_RESET}"
+      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review blocked${C_RESET}"
       render
       continue
     elif [ "$prior" != "PASS" ]; then
-      DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}reviewing…${C_RESET}"
+      DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing…${C_RESET}"
       render
       verdict_line="$(bash "$HERE/herd-review.sh" "$prnum" "$slug" 2>/dev/null | grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' | tail -1)"
       case "$verdict_line" in
@@ -494,13 +496,13 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       # INFRA-FAIL means the reviewer could not run — transient, not a real finding. Do NOT persist
       # it to the ledger (that would permanently wedge the PR). Surface for retry next cycle.
       if [ "$verdict" = "INFRA-FAIL" ]; then
-        DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}review errored · will retry${C_RESET}"
+        DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review errored · will retry${C_RESET}"
         render
         continue
       fi
       record_review "$prnum" "$rsha" "$verdict"
       if [ "$verdict" != "PASS" ]; then
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}needs you · review blocked${C_RESET}"
+        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review blocked${C_RESET}"
         render
         continue
       fi
@@ -513,7 +515,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         record_observe_noted "$prnum" "$rsha"
         herdr notification show "🐑 PR #${prnum} ready (observe)" --body "${slug}: review passed — observe mode, not merging" --sound default >/dev/null 2>&1 || true
       fi
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · observe mode${C_RESET}"
+      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · observe mode${C_RESET}"
       render
       continue
     fi
@@ -521,7 +523,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
     if [ -z "$AUTOMERGE" ]; then
       # approve: require explicit sha-keyed human approval before merging.
       if approval_is_approved "$prnum" "$rsha"; then
-        DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}merging (approved)${C_RESET}"
+        DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (approved)${C_RESET}"
         render
         do_merge "$slug" "$prnum" "$dir"
         continue
@@ -534,12 +536,12 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
 Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
         herdr notification show "🐑 PR #${prnum} awaiting approval" --body "${slug}: gates passed — herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
       fi
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting approval${C_RESET}"
+      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · awaiting approval${C_RESET}"
       render
       continue
     fi
 
-    DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}merging${C_RESET}"
+    DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging${C_RESET}"
     render
     do_merge "$slug" "$prnum" "$dir"
   done
@@ -549,12 +551,13 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
     slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; k=$((k + 1))
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔀 ${sl} [dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
+      DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
       render
       continue
     fi
-    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}resolving conflict…${C_RESET}"
+    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
     render
     spawn_resolver "$slug" "$prnum" "$branch"
   done
