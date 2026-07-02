@@ -202,6 +202,8 @@ except Exception:
     herdr pane rename "$ROOT" "review·$SLUG" >/dev/null 2>&1 || true
     herdr pane run "$ROOT" "tail -f '$LOG'" >/dev/null 2>&1 || true
   fi
+  # Register in the sweep allowlist so only engine-created tabs are ever swept.
+  [ -n "${TAB:-}" ] && printf 'review·%s %s review\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 fi
 
 echo "🔬 Reviewing PR #${PR} ($SLUG) on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass…" >&2

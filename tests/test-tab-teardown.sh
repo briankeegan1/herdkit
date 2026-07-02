@@ -7,12 +7,16 @@
 #     4. Gracefully handles an empty tab list
 #     5. Retry + loud warning when a tab survives the first close attempt
 #   Part B: _sweep_orphan_tabs (agent-watch.sh)
-#     6. Closes orphaned review· and resolve· tabs (no live worktree, no open PR)
+#     6. Closes orphaned review· and resolve· tabs — migration mode (no registry)
 #     7. Preserves tabs for live slugs (worktree exists)
 #     8. Preserves tabs for slugs with open PRs
-#     9. Does NOT close the coordinator tab
-#    10. Closes orphaned bare builder tabs
+#     9. Does NOT close singleton tabs (coordinator, scribe, researcher)
+#    10. Migration mode: does NOT close unregistered bare-label tabs
 #    11. Skips entirely in dry-run mode
+#   Part C: allowlist-mode behaviour (registry file present)
+#    12. Closes a registered builder tab whose slug is dead
+#    13. Never closes unregistered user tabs (playground-, watch-, backlog-)
+#    14. Hard-excludes HERD_WATCHER_TAB_ID even when the tab is registered
 #
 # Stubs herdr/gh/git (NETWORK-FREE). Run:  bash tests/test-tab-teardown.sh
 # No `set -e`: some checks assert non-zero returns explicitly.
@@ -233,13 +237,15 @@ ok
 ! grep -qx "c3" "$CLOSE_LOG" || fail "9: researcher tab should NOT be closed by orphan sweep"
 ok
 
-# ── 10. Orphan sweep closes orphaned bare builder tabs ───────────────────────
+# ── 10. Migration mode: unregistered bare-label tabs are NOT swept ────────────
+# Registry file absent → migration mode. Bare labels must never be swept (they could be user tabs).
+rm -f "$T/trees/.herd-tabs"
 write_tabs "b1:old-feat:wA"
 printf '' > "$WT_OUTPUT"
 printf '[]\n' > "$PR_OUTPUT"
 clear_state
 _sweep_orphan_tabs
-grep -qx "b1" "$CLOSE_LOG" || fail "10: orphaned builder tab old-feat should be closed"
+! grep -qx "b1" "$CLOSE_LOG" || fail "10: unregistered bare tab old-feat must NOT be closed in migration mode"
 ok
 
 # ── 11. Orphan sweep skips entirely in dry-run mode ──────────────────────────
@@ -249,5 +255,48 @@ clear_state
 DRYRUN=1 _sweep_orphan_tabs
 [ ! -s "$CLOSE_LOG" ] || fail "11: orphan sweep should make no closes in dry-run mode"
 ok
+
+# ── Part C: allowlist-mode tests (registry file present) ─────────────────────
+
+# ── 12. Registered builder tab with dead slug IS closed (allowlist mode) ─────
+printf 'old-feat b1 builder\n' > "$T/trees/.herd-tabs"
+write_tabs "b1:old-feat:wA"
+printf '' > "$WT_OUTPUT"
+printf '[]\n' > "$PR_OUTPUT"
+clear_state
+_sweep_orphan_tabs
+grep -qx "b1" "$CLOSE_LOG" || fail "12: registered builder tab old-feat should be closed in allowlist mode"
+ok
+rm -f "$T/trees/.herd-tabs"
+
+# ── 13. Unregistered user tabs survive in allowlist mode ─────────────────────
+# Registry contains one registered tab; user tabs (playground-, watch-, backlog-) are absent
+# from the registry and must never be swept.
+printf 'some-feat s1 builder\n' > "$T/trees/.herd-tabs"
+write_tabs "u1:playground-herdkit:wA" "u2:watch-herdkit:wA" "u3:backlog-herdkit:wA" "s1:some-feat:wA"
+printf '' > "$WT_OUTPUT"
+printf '[]\n' > "$PR_OUTPUT"
+clear_state
+_sweep_orphan_tabs
+! grep -qx "u1" "$CLOSE_LOG" || fail "13: playground-herdkit must NOT be closed (never registered)"
+ok
+! grep -qx "u2" "$CLOSE_LOG" || fail "13: watch-herdkit must NOT be closed (never registered)"
+ok
+! grep -qx "u3" "$CLOSE_LOG" || fail "13: backlog-herdkit must NOT be closed (never registered)"
+ok
+grep -qx "s1" "$CLOSE_LOG" || fail "13: registered some-feat should be closed (dead slug)"
+ok
+rm -f "$T/trees/.herd-tabs"
+
+# ── 14. HERD_WATCHER_TAB_ID is hard-excluded even when the tab is registered ─
+printf 'review·dead-slug r1 review\n' > "$T/trees/.herd-tabs"
+write_tabs "r1:review·dead-slug:wA"
+printf '' > "$WT_OUTPUT"
+printf '[]\n' > "$PR_OUTPUT"
+clear_state
+HERD_WATCHER_TAB_ID=r1 _sweep_orphan_tabs
+! grep -qx "r1" "$CLOSE_LOG" || fail "14: watcher's own tab must not be closed even when registered"
+ok
+rm -f "$T/trees/.herd-tabs"
 
 echo "ALL PASS ($pass checks)"

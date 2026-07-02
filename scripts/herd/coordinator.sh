@@ -82,7 +82,8 @@ AGENT_PANE=$(printf '%s' "$started" | python3 -c \
 #    with HERD_NO_WATCH=1; status-only with AGENT_WATCH_DRYRUN=1.
 if [ "${HERD_NO_WATCH:-}" != "1" ]; then
   split=$(herdr pane split "$AGENT_PANE" --direction down --ratio 0.72 \
-            --cwd "$REPO" --env "AGENT_WATCH_DRYRUN=${AGENT_WATCH_DRYRUN:-0}" --no-focus \
+            --cwd "$REPO" --env "AGENT_WATCH_DRYRUN=${AGENT_WATCH_DRYRUN:-0}" \
+            --env "HERD_WATCHER_TAB_ID=$TAB" --no-focus \
             2>"$_CE") || _coord_die "watch pane/split"
   WPANE=$(printf '%s' "$split" | python3 -c \
     'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])' \
