@@ -75,6 +75,8 @@ fi
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
+: "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
+: "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE
 

@@ -80,6 +80,10 @@ REVIEW_STATE="$TREES/.agent-watch-reviewed"
 REVIEW_RETRIES="$TREES/.agent-watch-review-retries"
 # Max transient failures per pr+sha before the watcher stops re-dispatching and asks for a human.
 _REVIEW_RETRY_MAX=3
+# Refix ledger: one line per auto-refix bounce ("<epoch> <pr#> <headSha> <slug>"). Sha-keyed
+# (one bounce per BLOCK per sha; new commit → fresh budget). Total per PR capped at REFIX_MAX_ROUNDS;
+# further BLOCKs after the cap escalate to "needs you".
+REFIX_STATE="$TREES/.agent-watch-refixed"
 # Override ledger: one line per human override of a cached BLOCK.
 # Format: "<epoch> override <pr#> <headSha>"
 # Written by herd-approve.sh override <pr#>; keyed by sha so a new commit invalidates the override.
@@ -564,6 +568,133 @@ except Exception: pass
   done <<< "$_sw_orphans"
 }
 
+# ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
+# Enabled by REVIEW_AUTOFIX=true in .herd/config (default false). When the watcher records a
+# BLOCK verdict for PR <n> (slug S), it finds S's AGENT pane (NOT the tab's root shell pane —
+# text sent there vanishes and the agent never wakes), sends a re-task prompt via herdr pane run,
+# and verifies agent_status flips to "working" within HERD_REFIX_WAIT_TIMEOUT seconds (default 15),
+# retrying once. On persistent failure it surfaces "needs you · auto-refix failed" on the row.
+#
+# Sha-keyed refix-once semantics mirror review-once: one bounce per BLOCK per sha. A new commit
+# changes the sha → a fresh bounce is eligible for the new sha's BLOCK (if any). Total bounces
+# per PR are capped at REFIX_MAX_ROUNDS (default 3); further BLOCKs escalate to "needs you".
+
+# refix_attempted <pr#> <headSha> — true if a bounce was already recorded for this exact pr+sha.
+refix_attempted() {
+  [ -s "$REFIX_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{f=1} END{exit !f}' "$REFIX_STATE" 2>/dev/null
+}
+
+# refix_round_count <pr#> — total bounces recorded for this PR (across all shas).
+refix_round_count() {
+  [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
+  awk -v p="$1" '$2==p{n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+}
+
+# record_refix <pr#> <headSha> <slug> — append one bounce record.
+record_refix() {
+  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REFIX_STATE"
+}
+
+# _find_builder_pane_id <slug> — find the herdr agent pane_id for the builder whose name==slug
+# and whose agent_status is "idle" (idle means it's waiting for a task, not already working).
+# Prints the pane_id to stdout; prints nothing if the agent is absent or already working.
+_find_builder_pane_id() {
+  local _fpid_slug="$1"
+  herdr agent list 2>/dev/null | SLUG="$_fpid_slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+  for a in agents:
+    if a.get("name") == slug and a.get("agent_status") == "idle":
+      print(a.get("pane_id", ""), end="")
+      break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# _agent_status <slug> — current agent_status string for this agent (empty if not found).
+_agent_status() {
+  local _as_slug="$1"
+  herdr agent list 2>/dev/null | SLUG="$_as_slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+  for a in agents:
+    if a.get("name") == slug:
+      print(a.get("agent_status", ""), end="")
+      break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# _wait_agent_working <slug> <timeout-s> — poll herdr agent list until agent_status is "working"
+# or the timeout expires. Returns 0 if the agent woke; 1 if timeout expired.
+_wait_agent_working() {
+  local _waw_slug="$1" _waw_timeout="$2" _waw_deadline
+  _waw_deadline=$(( $(date +%s) + _waw_timeout ))
+  while [ "$(date +%s)" -lt "$_waw_deadline" ]; do
+    [ "$(_agent_status "$_waw_slug")" = "working" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# _handle_block_verdict <pr#> <slug> <headSha> <display-idx>
+# Called when the review verdict for a PR is BLOCK (from the ledger or a fresh gate step). If
+# REVIEW_AUTOFIX=true, attempts to bounce the builder agent; otherwise shows the standard message.
+# Always updates DISPLAY[<idx>]; calls render internally before the blocking wait so the user sees
+# "refixing" while the bounce is in progress.
+_handle_block_verdict() {
+  local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
+  local _hbv_sl _hbv_pn
+  _hbv_sl="$(printf '%-*s' "$SLUGW" "$_hbv_slug")"
+  _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
+
+  if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
+    local _hbv_rounds
+    _hbv_rounds="$(refix_round_count "$_hbv_pr")"
+    if refix_attempted "$_hbv_pr" "$_hbv_sha"; then
+      # Already bounced for this sha; the agent should be working on a fix — wait for a new push.
+      DISPLAY[_hbv_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_YELLOW}review blocked · fix requested · awaiting push${C_RESET}"
+    elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
+      DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
+    else
+      local _hbv_round_num
+      _hbv_round_num="$((_hbv_rounds + 1))"
+      DISPLAY[_hbv_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_CYAN}refixing (round ${_hbv_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+      render
+      # Record BEFORE sending so refix-once holds even if pane lookup or delivery fails.
+      record_refix "$_hbv_pr" "$_hbv_sha" "$_hbv_slug"
+      local _hbv_pane_id
+      _hbv_pane_id="$(_find_builder_pane_id "$_hbv_slug")"
+      if [ -z "$_hbv_pane_id" ]; then
+        DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
+      else
+        local _hbv_prompt
+        _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
+Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
+        herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
+        local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+        if ! _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+          # First wait expired → retry once (re-send the prompt in case pane run dropped it).
+          herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
+          if ! _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+            DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · check pane${C_RESET}"
+          fi
+        fi
+      fi
+    fi
+  else
+    # REVIEW_AUTOFIX disabled or dry-run: show the standard "review blocked" message.
+    DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}review blocked · see PR #${_hbv_pr} comment · herd-approve.sh why ${_hbv_pr}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${_hbv_pr}${C_RESET}"
+  fi
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge — WITHOUT entering the live watch loop. Direct
 # execution runs the loop normally.
@@ -777,7 +908,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         # Human override recorded for this sha — treat as PASS and proceed to merge path.
         prior="PASS"
       else
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
+        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
         render
         continue
       fi
@@ -790,7 +921,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       case "$step" in
         PASS) : ;;  # verdict just collected + recorded — fall through to the merge path
         BLOCK)
-          DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}review blocked · see PR #${prnum} comment · herd-approve.sh why ${prnum}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${prnum}${C_RESET}"
+          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
           render
           continue ;;
         QUEUED)

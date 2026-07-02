@@ -33,3 +33,5 @@ WATCHER_AUTOMERGE="true"
 # auto: watcher merges on its own once all gates (healthcheck + review) pass.
 MERGE_POLICY="auto"
 HERD_REPO="briankeegan1/herdkit"
+# Dogfood: bounce BLOCK reviews straight to the builder agent (3-round cap, sha-keyed).
+REVIEW_AUTOFIX="true"
