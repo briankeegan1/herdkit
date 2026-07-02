@@ -40,4 +40,17 @@ fi
 
 ln -sf "$HERD_BIN" "$TARGET_DIR/herd"
 ok "Installed: $TARGET_DIR/herd -> $HERD_BIN"
-printf 'Run: herd help\n'
+
+# Dependency doctor — advisory at install time. The symlink itself is already usable, so a missing
+# dep never blocks the install; it just surfaces the full picture NOW (rather than as a cryptic
+# control-room failure later). A broken environment is HARD-gated when the user runs 'herd init'.
+if [ -f "$HERE/scripts/herd/herd-preflight.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/scripts/herd/herd-preflight.sh"
+  printf '\n'
+  if ! herd_doctor; then
+    warn "some required dependencies are missing/broken (above) — fix them before running 'herd init'"
+  fi
+fi
+
+printf '\nRun: herd help\n'

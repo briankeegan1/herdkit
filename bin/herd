@@ -135,6 +135,17 @@ scout_repo() {
 cmd_init() {
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
+
+  # Dependency doctor FIRST — catch a broken environment (the issue #31 class: a missing/mis-encoded
+  # load-bearing dep that silently truncates the control room) BEFORE we write any config. HARD-gates
+  # on a missing required dep; HERD_SKIP_DOCTOR=1 bypasses (tests / known-good environments).
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-preflight.sh"
+  if ! herd_doctor; then
+    die "herd doctor found missing/broken required dependencies (above) — fix them, then re-run 'herd init'.  (bypass: HERD_SKIP_DOCTOR=1)"
+  fi
+  say ""
+
   say "${c_bold}herd init${c_rst} — standing up the herd workflow in $root"
   say ""
 
@@ -348,6 +359,16 @@ cmd_render() {
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local skill; skill="$(render_skill "$root" "$cfg")"
   ok "rendered coordinator skill → $skill"
+}
+
+# cmd_doctor — run the one-pass dependency doctor (scripts/herd/herd-preflight.sh). Exposed so a
+# user with a broken/weird setup can self-diagnose anytime; also the gate cmd_init runs before it
+# writes any config, and install.sh runs (advisory) at install time. Exits non-zero when a HARD dep
+# is missing/broken so `herd doctor` is scriptable in CI.
+cmd_doctor() {
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-preflight.sh"
+  herd_doctor || exit 1
 }
 
 cmd_backlog() {
@@ -1265,6 +1286,11 @@ usage() {
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
 
   herd init                           stand up herdkit in the current repo (interview + scout)
+  herd doctor                         one-pass dependency doctor: check git, gh (+auth), claude,
+                                      python3, herdr (+JSON contract) and python3's UTF-8 output;
+                                      report every problem at once with per-platform install hints;
+                                      soft deps (glow, shellcheck, bats) warn only. Exits non-zero
+                                      when a required dep is missing/broken. (bypass: HERD_SKIP_DOCTOR=1)
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd reload                         rebuild the control room around the coordinator: stop +
@@ -1291,6 +1317,7 @@ EOF
 
 case "${1:-help}" in
   init)    shift; cmd_init "$@" ;;
+  doctor)  shift; cmd_doctor "$@" ;;
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
   reload)  shift; cmd_reload "$@" ;;

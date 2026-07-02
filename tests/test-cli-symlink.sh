@@ -22,7 +22,7 @@ proj="$T/project"; mkdir -p "$proj"
 git -C "$proj" init -q
 git -C "$proj" config user.email t@t.t; git -C "$proj" config user.name t
 ( cd "$proj" && git commit -q --allow-empty -m init )
-( cd "$proj" && HERD_NONINTERACTIVE=1 bash "$HERD" init >/dev/null ) || fail "herd init failed"
+( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init >/dev/null ) || fail "herd init failed"
 [ -f "$proj/.herd/config" ] || fail "init did not write .herd/config"
 
 # The documented install: a symlink to the repo's bin/herd, in a prefix OUTSIDE the repo.
