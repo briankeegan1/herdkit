@@ -2,3 +2,4 @@
 
 - ✅ **Reload in-place bootstrap gap (found by unexecuted live smoke)** *(PR #45)*
 - ✅ **`herd reload` anchor on coordinator tab, not live agent** *(PR #46)*
+- ✅ **Review-pane test leaks a real `review·test-slug` tab on machines with herdr installed** *(PR #47)*

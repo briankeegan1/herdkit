@@ -21,7 +21,8 @@ SMOKE_CMD=""
 
 MODEL_COORDINATOR="claude-opus-4-8"
 MODEL_FEATURE="claude-opus-4-8"
-MODEL_QUICK="claude-sonnet-4-6"
+# herdkit has no app lane — "quick" IS the engine lane, so it gets the feature tier.
+MODEL_QUICK="claude-opus-4-8"
 MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-opus-4-8"
