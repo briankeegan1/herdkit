@@ -97,6 +97,19 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
+### Auto-refix BLOCK reviews (REVIEW_AUTOFIX)
+
+When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict
+directly to the builder: it finds the builder's idle agent pane, sends a re-task prompt with
+`gh pr view <n>` instructions to fix and push, and verifies the agent wakes within ~15 s (retrying
+once). Console shows **refixing (round k/3)** while in flight; **fix requested · awaiting push**
+on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent won't wake.
+Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**. Sha-keyed
+semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
+
+When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
+you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane.
+
 ### Approve pending merges (MERGE_POLICY=approve)
 
 When `.herd/config` sets `MERGE_POLICY=approve`, the watcher runs the full healthcheck + review
