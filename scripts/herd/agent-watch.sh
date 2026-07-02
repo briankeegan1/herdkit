@@ -881,6 +881,17 @@ _worktree_newest_edit() {
   [ "$newest" -gt 0 ] && printf '%s' "$newest"
 }
 
+# _worktree_born <worktree> — echo the worktree's creation epoch: birth time where the platform's
+# stat exposes it (macOS `stat -f %B`, GNU `stat -c %W`), else the directory mtime as a floor.
+# This is the quiet-floor for a builder that has produced no dirty files yet — nothing can be
+# "stalled" before its own tree even existed, so a young worktree reads as building, not stalled.
+_worktree_born() {
+  local wt="$1" b
+  b="$(stat -f '%B' "$wt" 2>/dev/null || stat -c '%W' "$wt" 2>/dev/null || echo 0)"
+  [ "${b:-0}" -gt 0 ] || b="$(file_mtime "$wt")"
+  printf '%s' "${b:-0}"
+}
+
 # _transcript_obs <worktree> — echo "<total-bytes> <newest-mtime>" over the Claude session
 # transcript(s) for this worktree, or nothing if none exist. Claude stores them at
 # $HERD_TRANSCRIPT_ROOT/<munged>/*.jsonl where <munged> is the worktree's absolute path with '/'
@@ -899,39 +910,70 @@ _transcript_obs() {
   [ "$total" -gt 0 ] && printf '%s %s' "$total" "$newest"
 }
 
-# _transcript_growing <slug> <obs> — compare this poll's observation ("<bytes> <mtime>") against the
-# last one cached for this slug in $TRANSCRIPT_STATE; echo "yes" if it grew (more bytes or a newer
-# mtime), "no" if flat (two identical observations), "unknown" if there is no prior observation or
-# no transcript at all. Updates the cache. Only "yes" ever affects the verdict (a one-way veto), so
-# a missing/mismatched transcript can never CAUSE a false stall — it just fails to rescue.
+# _transcript_growing <slug> <obs> <now> <quiet> — decide whether this builder's Claude transcript
+# has grown recently enough to count as alive. <obs> is this poll's "<bytes> <mtime>" (from
+# _transcript_obs); <now> is the current epoch and <quiet> the stall window (seconds). Echoes:
+#   "yes"     — the transcript grew within the last <quiet> seconds (this poll OR a recent earlier
+#               one) ⇒ alive, rescues a would-be stall
+#   "no"      — a prior observation exists but the transcript has not grown inside the window
+#   "unknown" — no transcript at all, or no prior observation to compare against
+# WINDOW, NOT ADJACENT-POLL: Claude flushes the session transcript in bursts, so two consecutive
+# polls that land in a pause read byte-identical. Comparing only the immediately-adjacent poll made
+# such a pause momentarily look flat ("no") → a one-tick false STALL → the next poll grew again →
+# BUILDING (the flap). We instead track a per-slug last-grew epoch in $TRANSCRIPT_STATE, updated
+# whenever bytes/mtime increase and carried forward across flat polls, and treat the builder as
+# alive if that epoch is within <quiet>. The one-way-veto property is preserved: this only ever
+# returns "yes" (rescue) or "no"; it never fabricates a stall — that stays the caller's job.
+# Cache line format is "<slug> <bytes> <mtime> <last-grew-epoch>"; a legacy 3-field line (no epoch)
+# is read tolerantly (missing epoch ⇒ treated as "not recently grown" until the next real growth).
 _transcript_growing() {
-  local slug="$1" obs="$2" prev cur_size cur_mt prev_size prev_mt tmp
+  local slug="$1" obs="$2" now="${3:-0}" quiet="${4:-0}"
+  local prev cur_size cur_mt prev_size prev_mt prev_grew lastgrew tmp
   [ -n "$obs" ] || { printf 'unknown'; return 0; }
   cur_size="${obs%% *}"; cur_mt="${obs##* }"
   prev=""
-  [ -f "$TRANSCRIPT_STATE" ] && prev="$(awk -v s="$slug" '$1==s{print $2, $3}' "$TRANSCRIPT_STATE" 2>/dev/null | tail -1)"
-  # Rewrite the cache: drop any prior line for this slug, append the fresh observation (temp+mv).
+  [ -f "$TRANSCRIPT_STATE" ] && prev="$(awk -v s="$slug" '$1==s{print $2, $3, $4}' "$TRANSCRIPT_STATE" 2>/dev/null | tail -1)"
+  prev_size=""; prev_mt=""; prev_grew=""
+  if [ -n "$prev" ]; then
+    read -r prev_size prev_mt prev_grew <<EOF
+$prev
+EOF
+  fi
+  # Update the last-grew epoch: stamp <now> when this poll grew, else carry the prior epoch forward.
+  if [ -n "$prev" ] && { [ "${cur_size:-0}" -gt "${prev_size:-0}" ] || [ "${cur_mt:-0}" -gt "${prev_mt:-0}" ]; }; then
+    lastgrew="$now"
+  else
+    lastgrew="${prev_grew:-}"
+  fi
+  # Rewrite the cache: drop any prior line for this slug, append fresh obs + last-grew epoch (temp+mv).
   tmp="${TRANSCRIPT_STATE}.$$"
   { [ -f "$TRANSCRIPT_STATE" ] && grep -v "^${slug} " "$TRANSCRIPT_STATE" 2>/dev/null
-    printf '%s %s %s\n' "$slug" "$cur_size" "$cur_mt"
+    printf '%s %s %s %s\n' "$slug" "$cur_size" "$cur_mt" "${lastgrew:-}"
   } > "$tmp" 2>/dev/null && mv "$tmp" "$TRANSCRIPT_STATE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   [ -n "$prev" ] || { printf 'unknown'; return 0; }
-  prev_size="${prev%% *}"; prev_mt="${prev##* }"
-  if [ "${cur_size:-0}" -gt "${prev_size:-0}" ] || [ "${cur_mt:-0}" -gt "${prev_mt:-0}" ]; then
+  # Alive iff it grew inside the window. Guard the arithmetic against a missing/legacy epoch.
+  if [ -n "$lastgrew" ] && [ "$(( now - lastgrew ))" -le "$quiet" ]; then
     printf 'yes'
   else
     printf 'no'
   fi
 }
 
-# _classify_builder <edit-age> <has-changes> <commits> <agent-status> <transcript-growing> <quiet> —
-# the pure verdict for a working, PR-less builder. Echoes exactly one token:
+# _classify_builder <edit-age> <has-changes> <commits> <agent-status> <transcript-growing> <quiet>
+#   <quiet-elapsed> — the pure verdict for a working, PR-less builder. Echoes exactly one token:
 #   BUILD_UNCOMMITTED — fresh uncommitted edits (actively coding right now)
-#   BUILDING          — heads-down (working + edits, or transcript growing, or already has commits)
-#   STALL             — clean/quiet tree, zero commits, flat transcript ⇒ show the warning
+#   BUILDING          — heads-down (working + edits, transcript growing, has commits, or still
+#                       inside its quiet floor — e.g. a just-born tree that hasn't produced yet)
+#   STALL             — clean/quiet tree, zero commits, flat transcript, AND quiet for the full
+#                       window ⇒ show the "no activity" warning
 # <edit-age> is seconds since the newest dirty-file edit, or -1 when the tree has no dirty files.
+# <quiet-elapsed> is how long the tree has ACTUALLY been observably quiet: seconds since the newest
+# dirty edit when there are changes, else the worktree AGE (seconds since it was born) when nothing
+# has been produced yet. A commitless builder is NOT called STALL until <quiet-elapsed> ≥ <quiet>;
+# this is what keeps a brand-new, dirty-file-free worktree (agent still reading) from being flagged
+# "no activity 0m" at cold start.
 _classify_builder() {
-  local age="$1" changes="$2" commits="$3" status="$4" tgrow="$5" quiet="$6"
+  local age="$1" changes="$2" commits="$3" status="$4" tgrow="$5" quiet="$6" qelapsed="${7:-0}"
   # 1. fresh uncommitted edits ⇒ actively coding right now.
   if [ "$changes" -eq 1 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$quiet" ]; then
     printf 'BUILD_UNCOMMITTED'; return 0
@@ -940,13 +982,18 @@ _classify_builder() {
   if [ "$status" = "working" ] && [ "$changes" -eq 1 ]; then
     printf 'BUILDING'; return 0
   fi
-  # 3. transcript still growing ⇒ alive (one-way veto — only ever rescues from a stall).
+  # 3. transcript still growing (within the quiet window) ⇒ alive (one-way veto — only rescues).
   if [ "$tgrow" = "yes" ]; then
     printf 'BUILDING'; return 0
   fi
-  # 4. quiet tree: only a commitless build with no other liveness signal earns the warning.
+  # 4. quiet tree: a commitless build earns the warning ONLY once it has actually been quiet for the
+  #    full window. A tree still inside its quiet floor (young worktree with nothing produced, or an
+  #    edit within the window) is just starting up — building, not stalled.
   if [ "${commits:-0}" -eq 0 ]; then
-    printf 'STALL'; return 0
+    if [ "${qelapsed:-0}" -ge "$quiet" ]; then
+      printf 'STALL'; return 0
+    fi
+    printf 'BUILDING'; return 0
   fi
   printf 'BUILDING'
 }
@@ -1190,16 +1237,18 @@ EOF
         _newest_edit="$(_worktree_newest_edit "$dir")"
         if [ -n "$_newest_edit" ]; then _changes=1; _edit_age=$(( _now - _newest_edit )); else _changes=0; _edit_age=-1; fi
         _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
-        _tgrow="$(_transcript_growing "$slug" "$(_transcript_obs "$dir")")"
-        case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet")" in
+        _tgrow="$(_transcript_growing "$slug" "$(_transcript_obs "$dir")" "$_now" "$_quiet")"
+        # How long the tree has ACTUALLY been quiet: since the newest dirty edit if any, else since
+        # the worktree was born (nothing produced yet). This is both the STALL floor and, if it does
+        # stall, the honest "no activity" age.
+        _born="$(_worktree_born "$dir")"
+        if [ "$_changes" -eq 1 ]; then _qelapsed="$_edit_age"; else _qelapsed=$(( _now - _born )); fi
+        case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet" "$_qelapsed")" in
           BUILD_UNCOMMITTED)
             DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}" ;;
           STALL)
-            # "No activity" duration: nothing has been produced (zero commits) and the tree is
-            # quiet, so the worktree's own age is the honest floor for how long it's been silent.
-            _born="$(stat -f '%B' "$dir" 2>/dev/null || stat -c '%W' "$dir" 2>/dev/null || echo 0)"
-            [ "${_born:-0}" -gt 0 ] || _born="$(file_mtime "$dir")"
-            _qmins=$(( ( _now - _born ) / 60 ))
+            # Reached only when _qelapsed ≥ _quiet, so this age is a real, ≥-window duration.
+            _qmins=$(( _qelapsed / 60 ))
             DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}" ;;
           *)
             DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}" ;;
