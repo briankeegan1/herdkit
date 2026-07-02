@@ -6,3 +6,4 @@
 - ✅ **Pre-trust fix (PR #22) is ineffective — builders still die on the folder-trust prompt** *(PR #48)*
 - ✅ **Review gate must distinguish infra death from a refused verdict** *(PR #49)*
 - ✅ **Mandatory dependency checks in install.sh + a `herd doctor` preflight** *(PR #50)*
+- ✅ **Watcher healthcheck gate: serialize or isolate concurrent suite runs** *(PR #51)*
