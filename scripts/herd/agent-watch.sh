@@ -70,6 +70,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
+# HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
+. "$HERE/human-verify.sh"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
@@ -429,6 +431,63 @@ observe_noted() {
 # record_observe_noted <pr#> <headSha> — note that we notified in observe mode.
 record_observe_noted() {
   printf '%s observed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
+# ── Per-PR human-verify hold ──────────────────────────────────────────────────────────────────
+# A PR whose body declares a `HUMAN-VERIFY:` block (see human-verify.sh) names manual steps the
+# builder could not run itself. Under MERGE_POLICY=auto such a PR is individually switched to an
+# approve-style hold: every gate still runs, but the merge WAITS on a sha-keyed approval, REUSING
+# the MERGE_POLICY=approve ledger ($APPROVALS) — no parallel ledger. Sibling PRs without the marker
+# keep auto-merging. Under approve/observe the hold is redundant (those policies already gate every
+# PR), so it is never applied there — avoiding any double-hold.
+
+# _pr_body <pr#> — the PR's body text, or empty on any failure. Isolated so the hermetic tests can
+# stub `gh pr view` and so the (potentially large) body is only fetched when the hold is relevant.
+_pr_body() {
+  gh pr view "$1" --json body -q '.body' 2>/dev/null || true
+}
+
+# pr_human_verify_held <pr#> — true iff the PR body declares a NON-EMPTY HUMAN-VERIFY block.
+pr_human_verify_held() {
+  _pr_body "$1" | human_verify_has
+}
+
+# pr_human_verify_steps <pr#> — print the PR's declared HUMAN-VERIFY steps, one per line.
+pr_human_verify_steps() {
+  _pr_body "$1" | human_verify_steps
+}
+
+# _hold_decision <mode> <hv_hold> <approved> — the pure action selector for a PASS-gated PR.
+#   mode:     auto | approve | observe   (the effective merge policy)
+#   hv_hold:  "1" if the PR declares a human-verify block (only ever set in auto mode), else ""
+#   approved: "1" if a sha-keyed approval record exists for this PR+sha, else ""
+# Echoes exactly one token: MERGE | HOLD | OBSERVE. No side effects — the caller owns the ledger
+# writes, the journal, and the merge. In approve mode hv_hold is ignored (the policy already holds),
+# so a human-verify PR is held exactly ONCE, never doubly.
+_hold_decision() {
+  local mode="$1" hv="$2" approved="$3"
+  case "$mode" in
+    observe) printf 'OBSERVE' ;;
+    approve) [ -n "$approved" ] && printf 'MERGE' || printf 'HOLD' ;;
+    auto)
+      if [ -n "$hv" ]; then
+        [ -n "$approved" ] && printf 'MERGE' || printf 'HOLD'
+      else
+        printf 'MERGE'
+      fi ;;
+    *) printf 'MERGE' ;;
+  esac
+}
+
+# _hold_ready_label <hv_hold> <pr#> — the console phrase for a PASS-gated PR being held. A
+# human-verify hold tells the operator exactly how to release it (and, via herd-approve.sh list,
+# what to run first); a plain approve hold shows the generic wording.
+_hold_ready_label() {
+  if [ -n "$1" ]; then
+    printf 'ready · human-verify pending · herd-approve.sh approve %s' "$2"
+  else
+    printf 'ready · awaiting approval'
+  fi
 }
 
 # _merge_method_flag — return the gh pr merge flag for the configured MERGE_METHOD.
@@ -1276,43 +1335,71 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           continue ;;
       esac
     fi
-    # PASS (just now, or recorded for this sha) → proceed based on effective merge policy.
+    # PASS (just now, or recorded for this sha) → proceed based on the effective merge policy AND,
+    # in auto mode, whether this specific PR declares a HUMAN-VERIFY block (which converts it to an
+    # approve-style hold on top of auto). The parse only runs in auto mode (a body fetch per PASS
+    # candidate) — approve/observe already hold every PR, so the marker is moot there.
+    mode="auto"; [ -z "$AUTOMERGE" ] && mode="approve"; [ -n "$MERGE_OBSERVE" ] && mode="observe"
+    hv_hold=""
+    if [ "$mode" = "auto" ] && pr_human_verify_held "$prnum"; then hv_hold=1; fi
+    hold_kind="approve"; [ -n "$hv_hold" ] && hold_kind="human-verify"
+    # A hold is in effect when the policy holds (approve) OR this PR is human-verify-held.
+    held=""; { [ "$mode" = "approve" ] || [ -n "$hv_hold" ]; } && held=1
+    approved=""; approval_is_approved "$prnum" "$rsha" && approved=1
 
-    if [ -n "$MERGE_OBSERVE" ]; then
-      # observe: run all gates, report + notify once per sha, NEVER merge.
-      if ! observe_noted "$prnum" "$rsha"; then
-        record_observe_noted "$prnum" "$rsha"
-        herdr notification show "🐑 PR #${prnum} ready (observe)" --body "${slug}: review passed — observe mode, not merging" --sound default >/dev/null 2>&1 || true
-      fi
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · observe mode${C_RESET}"
-      render
-      continue
-    fi
-
-    if [ -z "$AUTOMERGE" ]; then
-      # approve: require explicit sha-keyed human approval before merging.
-      if approval_is_approved "$prnum" "$rsha"; then
-        DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (approved)${C_RESET}"
+    case "$(_hold_decision "$mode" "$hv_hold" "$approved")" in
+      OBSERVE)
+        # observe: run all gates, report + notify once per sha, NEVER merge.
+        if ! observe_noted "$prnum" "$rsha"; then
+          record_observe_noted "$prnum" "$rsha"
+          herdr notification show "🐑 PR #${prnum} ready (observe)" --body "${slug}: review passed — observe mode, not merging" --sound default >/dev/null 2>&1 || true
+        fi
+        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · observe mode${C_RESET}"
         render
-        do_merge "$slug" "$prnum" "$dir" "$rsha"
-        continue
-      fi
-      # First time gates pass for this sha: record + notify, then hold until approved.
-      if ! approval_awaiting_noted "$prnum" "$rsha"; then
-        record_approval_awaiting "$prnum" "$rsha"
-        gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
+        continue ;;
+
+      HOLD)
+        # First time gates pass for this sha: record the awaiting entry (reusing the approve
+        # ledger), journal the hold, and post a comment + notification. Sha-keyed, so a new commit
+        # (new sha) records a fresh awaiting entry — re-holding the PR until the new sha is approved.
+        if ! approval_awaiting_noted "$prnum" "$rsha"; then
+          record_approval_awaiting "$prnum" "$rsha"
+          journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
+          if [ -n "$hv_hold" ]; then
+            hv_steps="$(pr_human_verify_steps "$prnum")"
+            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
+
+${hv_steps}
+
+Once verified, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
+            herdr notification show "🐑 PR #${prnum} human-verify pending" --body "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
+          else
+            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
 
 Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
-        herdr notification show "🐑 PR #${prnum} awaiting approval" --body "${slug}: gates passed — herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
-      fi
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · awaiting approval${C_RESET}"
-      render
-      continue
-    fi
+            herdr notification show "🐑 PR #${prnum} awaiting approval" --body "${slug}: gates passed — herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
+          fi
+        fi
+        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$hv_hold" "$prnum")${C_RESET}"
+        render
+        continue ;;
 
-    DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging${C_RESET}"
-    render
-    do_merge "$slug" "$prnum" "$dir" "$rsha"
+      MERGE)
+        if [ -n "$held" ]; then
+          # A held PR (approve policy, or a human-verify hold) that now has a sha-keyed approval.
+          journal_append hold_released pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" reason approved
+          if [ -n "$hv_hold" ]; then
+            DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (human-verified)${C_RESET}"
+          else
+            DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (approved)${C_RESET}"
+          fi
+        else
+          DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging${C_RESET}"
+        fi
+        render
+        do_merge "$slug" "$prnum" "$dir" "$rsha"
+        continue ;;
+    esac
   done
 
   # Resolve pass: auto-spawn the isolated conflict resolver for each NEWLY-conflicting PR.

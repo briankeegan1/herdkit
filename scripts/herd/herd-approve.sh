@@ -22,6 +22,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
+# HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
+. "$HERE/human-verify.sh"
 
 APPROVALS="$WORKTREES_DIR/.agent-watch-approvals"
 REVIEW_STATE="$WORKTREES_DIR/.agent-watch-reviewed"
@@ -32,6 +34,20 @@ shift 2>/dev/null || true
 
 # epoch_to_hhmm <epoch> — HH:MM from a Unix timestamp; BSD/macOS (-r) and GNU/Linux (-d @) safe.
 epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+
+# print_human_verify_steps <pr#> — if the PR declares a HUMAN-VERIFY block, print its steps
+# (indented) so the operator knows exactly what to run before approving. Silent if none.
+print_human_verify_steps() {
+  local _pr="$1" _steps
+  _steps="$(gh pr view "$_pr" --json body -q '.body' 2>/dev/null | human_verify_steps)"
+  [ -n "$_steps" ] || return 0
+  echo "      human-verify — run these, then approve:"
+  while IFS= read -r _s; do
+    [ -n "$_s" ] && printf '        • %s\n' "$_s"
+  done <<EOF
+$_steps
+EOF
+}
 
 case "$cmd" in
 
@@ -51,6 +67,7 @@ case "$cmd" in
       title="$(gh pr view "$prnum" --json title -q '.title' 2>/dev/null || true)"
       [ -z "$title" ] && title="(no title)"
       printf '  PR #%-4s  sha:%.8s  review:%-6s  %s\n' "$prnum" "$sha" "$verdict" "$title"
+      print_human_verify_steps "$prnum"
       found=$((found + 1))
     done < "$APPROVALS"
     if [ "$found" -eq 0 ]; then
@@ -105,6 +122,7 @@ EOF
     fi
     printf 'PR #%s  sha:%.8s  verdict:%s%s  at %s\n\n' \
       "$prnum" "$sha" "$verdict" "$override_note" "$hhmm"
+    print_human_verify_steps "$prnum"
     echo "Latest PR comment:"
     gh pr view "$prnum" --json comments 2>/dev/null \
       | python3 -c '

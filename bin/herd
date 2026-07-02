@@ -1957,6 +1957,10 @@ def describe(o):
         return "auto-refix bounce", "round %s · agent was %s" % (g(o,"round") or "?", g(o,"agent_status_before") or "?")
     if ev == "refix_wake_result":
         return "auto-refix wake", "woke=%s escalated=%s (%s → %s)" % (g(o,"woke") or "?", g(o,"escalated") or "?", g(o,"agent_status_before") or "?", g(o,"agent_status_after") or "?")
+    if ev == "hold_applied":
+        return "hold applied", "%s hold · sha %s" % (g(o,"kind") or "approve", g(o,"sha")[:12] or "?")
+    if ev == "hold_released":
+        return "hold released", "%s hold · sha %s · %s" % (g(o,"kind") or "approve", g(o,"sha")[:12] or "?", g(o,"reason") or "")
     if ev == "merge":
         return "MERGED", "sha %s · %s · %s" % (g(o,"sha")[:12] or "?", g(o,"method") or "?", g(o,"reason") or "")
     if ev == "reap":
