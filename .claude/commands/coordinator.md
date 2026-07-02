@@ -38,12 +38,12 @@ Keep your own context lean AND keep this window responsive. When you need to **l
 repo**, **enqueue the question on the async research lane** rather than reading a pile of files
 yourself:
 
-    bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/research.sh "the question"
+    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/research.sh "the question"
 
 It returns **instantly** with a `REQ_ID` and ensures ONE read-only **researcher** drainer is
 running in its own herdr pane. Fetch each result when you need it:
 
-    bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/research-get.sh THE_REQ_ID
+    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/research-get.sh THE_REQ_ID
 
 It prints the report, or `PENDING` if the drainer hasn't filed it yet. The coordinator window
 stays free. **One exception:** for a tiny instant lookup you need *right now*, do it inline.
@@ -55,14 +55,14 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 3. Spawn the sub-agent — pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
+     bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
      ```
    - **Quick lane** (trivial / non-app change — scripts, docs, config):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/herd-quick.sh <slug> "<task>"
+     bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-quick.sh <slug> "<task>"
      ```
 4. Enqueue the status change (don't edit `BACKLOG.md` yourself — see *Backlog writes*):
-   `bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
+   `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any.
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `BACKLOG.md`. The
@@ -77,9 +77,9 @@ Never run more than the user wants in parallel — call out if 4+ agents are alr
   `BACKLOG.md` for the file backend's full grouped history). For *real* status (is a 🔜
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
 - **Add:** enqueue it — the scribe does the research + writes the grounded entry:
-  `bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
+  `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
-  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
 
 Keep every backlog edit **privacy-safe** — nothing under `.herd/secrets` and no secrets ever
 reach `BACKLOG.md` (it's committed).
@@ -93,9 +93,42 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
 3. For a CONFLICTING PR, **do NOT hand-resolve it here** — spawn the isolated, test-gated resolver:
-   `bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/herd-resolve.sh <slug>`
+   `bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
+
+### Diagnose a gate: "what happened / is it stuck / why did X fail" → `herd why` FIRST
+
+When the user asks **what happened to a PR**, **why a PR is stuck**, or **why a gate / review / merge
+failed**, your FIRST move is the engine journal — not process archaeology, not re-reading panes:
+
+```
+herd why <pr#>      # chronological gate history for ONE PR: every review dispatch, verdict (with
+                    # reviewer/gate_default/infra provenance), healthcheck attempt + outcome, auto-refix
+                    # bounce + wake result, and the merge/reap — the whole story in order
+herd log --pr <n>   # the raw event stream for that PR; add --tail to watch gate activity live
+```
+
+The journal (`/Users/macbookpro/source/herdkit`'s worktree pool → `.herd/journal.jsonl`) is the append-only record
+every engine component writes as it acts. It is authoritative for post-mortems: it captures the
+things that used to vanish — a mid-review Claude death (`infra_event`), a verdict's provenance
+(`verdict_recorded` source=`reviewer|gate_default|infra`), each healthcheck attempt/retry before a red
+row, and an auto-refix bounce that silently failed to wake the builder (`refix_wake_result`
+escalated=true). Read `herd why <pr>` before deciding whether to re-task a builder, override a block,
+or escalate — then act on what the record actually shows.
+
+### Auto-refix BLOCK reviews (REVIEW_AUTOFIX)
+
+When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict
+directly to the builder: it finds the builder's idle agent pane, sends a re-task prompt with
+`gh pr view <n>` instructions to fix and push, and verifies the agent wakes within ~15 s (retrying
+once). Console shows **refixing (round k/3)** while in flight; **fix requested · awaiting push**
+on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent won't wake.
+Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**. Sha-keyed
+semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
+
+When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
+you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane.
 
 ### Approve pending merges (MERGE_POLICY=approve)
 
@@ -104,8 +137,8 @@ pipeline but holds before merging — posting a PR comment and a notification on
 To approve and trigger merge:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
-bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
 ```
 
 Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
@@ -126,6 +159,17 @@ Every reported problem routes to ONE of two places:
       herd report "<symptom + which lane>"
   (opens a `gh issue` on `briankeegan1/herdkit`, stamped with this project + the lane + version pin).
 
+## Update the engine
+
+When a fix has landed upstream in herdkit, or the user asks "how do I get the latest engine
+fix", run:
+
+    herd update
+
+It pulls HERDKIT_HOME (fast-forward only), shows the incoming delta, re-renders the coordinator
+skill preserving `.herd/config` answers, and reloads the workspace — all in one step. It refuses
+if the engine checkout is dirty or builders are mid-flight; pass `--force` to proceed anyway.
+
 ## Herdkit capabilities
 
 _On every invocation, read live state to surface what is configured:_
@@ -135,17 +179,29 @@ _On every invocation, read live state to surface what is configured:_
 
 ### Commands (`herd <subcommand>`)
 - **herd init** — Stand up herdkit in a project: scout, interview, write .herd/config, render coordinator skill. _When: Onboarding a new project to the herd workflow for the first time._
+- **herd doctor** — One-pass dependency doctor: verify git, gh (+auth), claude, python3, herdr (+JSON contract) are present and working and that python3 can emit UTF-8 (Windows cp1252 guard, issue #31); reports every problem at once with per-platform install hints; soft deps (glow, shellcheck, bats) warn only; exits non-zero on any missing/broken hard dep. _When: When a herd command misbehaves, a fresh or Windows environment needs verifying, or the control room came up partially broken — run herd doctor to self-diagnose missing/broken dependencies in one pass._
 - **herd upgrade** — Bump HERD_VERSION and re-render the coordinator skill preserving all .herd/config answers. _When: After a herdkit engine update or when the coordinator template changes._
 - **herd render** — Re-render only the coordinator skill from the current .herd/config without bumping version. _When: When only the template changed and no version bump is needed._
+- **herd reload** — Rebuild the control room minus the coordinator: stop + relaunch the watcher with pane visibility verified, ensure the pinned backlog pane, re-render the coordinator skill; prints a per-component summary and effective MERGE_POLICY; never closes the coordinator tab/agent. _When: When .herd/config changes need to take effect, the watcher or backlog pane died or went invisible, or duplicate watchers must be cleared — safe to run from inside the coordinator._
+- **herd pane <watch|backlog|coordinator>** — Restart ONE control-room pane in place without a full reload: watch stops + reruns the watcher in its registered pane (recreated below the coordinator if gone); backlog reruns the backlog viewer in its pane, interrupting a live viewer safely first; coordinator relaunches the coordinator agent pane (KILLS the live claude session, so it requires a typed 'yes' or --yes). Each rewrites .herd-panes from observed state and prints a per-component outcome; refuses when no project .herd/config resolves. _When: When just one pane died or went stale (watcher stopped, backlog viewer stuck, coordinator session needs a fresh start) and a full 'herd reload' is more than needed — surgically restart that single pane; use 'herd reload' instead when the whole control room needs rebuilding._
+- **herd update [--force]** — Pull the herdkit engine (git pull --ff-only in HERDKIT_HOME), show the incoming delta, re-render the coordinator skill preserving .herd/config answers, and reload the workspace in one step; refuses if the engine checkout is dirty or builders are mid-flight (--force overrides both guards). _When: When a fix has landed upstream in herdkit and you need to bring it in, or when the user asks 'how do I get the latest engine fix' — answer: run herd update._
+- **herd log [--pr N] [--tail]** — Page the append-only engine journal (.herd/journal.jsonl): one readable line per gate event (review dispatch, verdict + provenance, healthcheck attempt/outcome, refix bounce, merge, reap, reload, infra death). --pr N filters to a single PR; --tail follows live. _When: When you want the raw chronological event stream, to watch gate activity live, or to see every recorded event for one PR before drilling in with herd why._
+- **herd why <pr#>** — Summarize ONE PR's full gate history from the journal, chronologically: every dispatch, verdict (with reviewer/gate_default/infra provenance), healthcheck attempt + outcome, auto-refix bounce + wake result, and the merge/reap — the first post-mortem tool for 'what happened to this PR'. _When: FIRST tool to run when the user asks what happened to a PR, why a PR is stuck, or why a gate/review/merge failed — grounds the answer in recorded events instead of process archaeology._
 - **herd backlog** — List open work items via the active SCRIBE_BACKEND (file/github/linear) in a uniform line shape. _When: Any time the coordinator needs the current open work set regardless of backend._
 - **herd report [--to <link>] "<symptom>"** — File a cross-repo issue on HERD_REPO or a peer from .herd/links via --to; deduplicates first. _When: When a HERD-ENGINE bug needs to escalate to the herdkit repo or a registered peer._
 - **herd link list** — List peer repos registered in .herd/links with their backend and routing target. _When: When reviewing cross-repo filing targets or confirming link names for herd report --to._
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/<lane>.sh`)
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/<lane>.sh`)
 - **herd-feature.sh** — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR. _When: App-facing changes where a running preview aids development; APP_PREVIEW_CMD must be set._
 - **herd-quick.sh** — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR. _When: Trivial or non-app changes: scripts, docs, config, engine fixes; no APP_PREVIEW_CMD required._
 - **herd-resolve.sh** — Isolated conflict resolver: merges default branch into worktree, fixes conflicts, verifies, pushes or escalates. _When: When the watcher surfaces a CONFLICTING PR that cannot auto-resolve._
 - **herd-approve.sh** — Approval entry-point for MERGE_POLICY=approve: list gate-passed PRs and write sha-keyed approval records. _When: When MERGE_POLICY=approve and a PR has passed all gates but needs coordinator sign-off before watcher merges._
+
+### Commands (`herd <subcommand>`)
+- **herd-approve.sh why <pr#>** — Print the latest review verdict and block reason from the review ledger and PR comment. _When: When a PR shows 'review blocked' in the watch console and the coordinator needs to understand why before deciding to fix or override._
+- **herd-approve.sh override <pr#>** — Record a sha-keyed human override so the watcher treats a cached BLOCK as passed for the PR's current commit. _When: When the coordinator decides to override a review block; a new commit invalidates the override and triggers re-review._
+
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/<lane>.sh`)
 - **dep-watcher.sh** — Polls .herd/deps for blocked-on upstream PRs; transitions items to ready when the upstream PR merges. _When: When .herd/deps exists and features are waiting on a peer-repo PR to merge first._
 - **coordinator.sh** — Launches the two-pane herd control room: backlog viewer pane and agent-watch status pane. _When: To start or restart the herd control room for a project._
 - **research.sh** — Enqueue a research question on the async research lane; returns REQ_ID instantly without blocking. _When: When the coordinator needs to look into the repo without occupying its own context window._
@@ -169,6 +225,7 @@ _On every invocation, read live state to surface what is configured:_
 - **MODEL_RESEARCH** — Claude model for the async researcher drainer (default: claude-sonnet-4-6). _When: Override for repo research tasks._
 - **MODEL_REVIEW** — Claude model for the adversarial pre-merge review gate (default: claude-opus-4-8). _When: Override when a different model tier is preferred for correctness review._
 - **MODEL_RESOLVER** — Claude model for the isolated conflict-resolver agent (default: claude-sonnet-4-6). _When: Override for conflict resolution; resolvers do mechanical merge work, so a cheaper tier is usually fine._
+- **TOKEN_MODE** — Token-budget mode: standard (default) | eco. eco flips the BUILT-IN model defaults to cheaper tiers (coordinator/feature→claude-sonnet-4-6; quick/scribe/research/resolver→claude-haiku-4-5; review→claude-sonnet-4-6). An explicit MODEL_* key in .herd/config ALWAYS beats eco — eco replaces built-in defaults only, never a user override. _When: Opt in to cut engine token cost. Tradeoffs: the review gate on sonnet may miss subtle logic bugs; the feature builder on sonnet is weaker on complex multi-file work; haiku is fine for mechanical scribe/resolver work. Composes with the model step-up item, which escalates FROM whatever tier eco sets._
 - **APP_PREVIEW_CMD** — Shell command to launch the live app preview pane (blank = no preview pane). _When: For projects with a runnable app; blank restricts lanes to herd-quick.sh only._
 - **HEALTHCHECK_CMD** — Project health command: exit 0 clean, exit 1 code error, exit 2 data/env tolerated. _When: Required for the heavy healthcheck profile; blank falls back to bash -n syntax check only._
 - **HEALTHCHECK_HEAVY_GLOB** — Egrep pattern of diff paths that force the heavy profile; blank means every change is heavy. _When: When only certain changed files need the full test suite (e.g. ^app/ for backend-only heavy runs)._
@@ -183,6 +240,10 @@ _On every invocation, read live state to surface what is configured:_
 - **WATCHER_AUTOMERGE** — Legacy boolean lever (true/false); superseded by MERGE_POLICY when set. _When: Prefer MERGE_POLICY; kept for backwards compatibility with pre-v1 configs._
 - **MERGE_POLICY** — Merge gate policy: auto (watcher merges on pass) | approve (coordinator approval required) | observe (watcher never merges). _When: Primary merge control lever; when approve, coordinator uses herd-approve.sh to sign off PRs._
 - **MERGE_METHOD** — git merge strategy used by the watcher: merge | squash | rebase. _When: Controls how PRs land; merge preserves history, squash condenses, rebase linearizes._
+- **REVIEW_CONCURRENCY** — Maximum pre-merge reviews the watcher dispatches in parallel (default: 2). _When: Raise for review throughput at higher model cost; lower to 1 to serialize reviews._
+- **HEALTH_CONCURRENCY** — Maximum healthcheck suites the watcher runs at once (default: 1 = serialize); all feature worktrees share one git object store, so overlapping suites race on shared .git locks and can paint a false-red for a clean PR — the watcher queues a PR ("health-check · queued") until a slot frees. _When: Keep at 1 unless the project's healthcheck is fully worktree-isolated (no shared object store); raise only if suites provably do not contend._
+- **REVIEW_AUTOFIX** — Auto-bounce BLOCK reviews to the builder agent: true | false (default false); when true, the watcher delivers a re-task prompt and re-tasks the idle builder on each new BLOCK sha, up to REFIX_MAX_ROUNDS. _When: Enable to remove the human re-task step after a BLOCK review; disable (default) for projects that prefer explicit coordinator approval before re-work._
+- **REFIX_MAX_ROUNDS** — Maximum auto-refix rounds per PR before escalating to "needs you" (default: 3); counts across all shas for a PR. _When: Raise for longer fix cycles; lower to 1 for a single bounce with immediate escalation; requires REVIEW_AUTOFIX=true._
 
 ### State files and levers
 - **.herd/links** — Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list. _When: When filing issues against peer repos or routing engine bugs to specific trackers across services._
@@ -195,7 +256,7 @@ The backlog is a planning doc, so backlog changes **commit straight to the defau
 PR. But **you never edit `BACKLOG.md` yourself.** You *enqueue* the change and a single async
 **scribe** applies it (one writer ⇒ no clobber, your window stays free):
 
-    bash /Users/macbookpro/source/herdkit-trees/capabilities-manifest/scripts/herd/scribe.sh "<the change, described in full>"
+    bash /Users/macbookpro/source/herdkit-trees/engine-journal/scripts/herd/scribe.sh "<the change, described in full>"
 
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git

@@ -68,6 +68,8 @@ set -u
 # (the hermetic test sources it to exercise the pure merge-decision helper).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
+# Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
+. "$HERE/journal.sh"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
@@ -261,6 +263,7 @@ review_verdict_source() {
 # only ones eligible to auto-refix a builder — a purely infrastructural death must never stick.
 record_review() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
+  journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
 }
 
 # ── Background review dispatch ──────────────────────────────────────────────────────────────────
@@ -343,7 +346,10 @@ _dispatch_review() {
   [ -f "$result" ] && return 0
   [ -f "$inflight" ] && _review_pid_live "$inflight" && return 0
   HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
-  printf '%s\n' "$!" > "$inflight"
+  local _dr_pid="$!"
+  printf '%s\n' "$_dr_pid" > "$inflight"
+  journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
+    model "${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}" log_path "$result"
 }
 
 # _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
@@ -444,19 +450,21 @@ spawn_resolver() {
 
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
-  ds="$1"; dp="$2"; dd="$3"
+  ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
   if [ -n "$DRYRUN" ]; then
     return 0
   fi
   gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
   # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
   printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
+  journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
   # 1) enqueue the scribe to reap the backlog item for this slug (slug-match + reap-not-stamp).
   bash "$HERE/scribe.sh" "Reap the backlog item for worktree slug '${ds}' (PR #${dp}): (1) grep ${BACKLOG_FILE} for the line containing '(worktree ${ds})' to locate the exact item; (2) if found, REMOVE that item from its active/thematic section entirely; (3) prepend '- ✅ **<title>** *(PR #${dp})*' (substituting the actual item title) immediately after the '## Recently shipped' heading, then drop any trailing entry beyond the 10th to keep the window capped at ~10; (4) if NO line matches that slug, make NO change and report that there is no backlog item for slug '${ds}'." >/dev/null 2>&1 || true
   # 2) fast-forward the MAIN checkout so coordinator + backlog viewer reflect it. Never force.
   git -C "$MAIN" pull --ff-only >/dev/null 2>&1 || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
   git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
+  journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
   # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Close the builder tab,
   #    review tab (review·slug), and resolver tab (resolve·slug) in one shot. Verifies each
   #    close and retries once; warns loudly if a tab cannot be closed.
@@ -585,6 +593,7 @@ except Exception:
   while IFS= read -r _sw_id; do
     [ -n "$_sw_id" ] || continue
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
+    journal_append sweep_closed tab_id "$_sw_id" reason orphan
     # Remove the swept tab from the registry so it doesn't accumulate stale entries.
     if [ -f "$_sw_registry" ]; then
       TAB_ID="$_sw_id" REGISTRY_PATH="$_sw_registry" python3 -c '
@@ -718,24 +727,40 @@ _handle_block_verdict() {
       render
       # Record BEFORE sending so refix-once holds even if pane lookup or delivery fails.
       record_refix "$_hbv_pr" "$_hbv_sha" "$_hbv_slug"
-      local _hbv_pane_id
+      local _hbv_status_before
+      _hbv_status_before="$(_agent_status "$_hbv_slug")"
+      journal_append refix_bounce pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}"
+      local _hbv_pane_id _hbv_woke=0 _hbv_escalated=false
       _hbv_pane_id="$(_find_builder_pane_id "$_hbv_slug")"
       if [ -z "$_hbv_pane_id" ]; then
         DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
+        _hbv_escalated=true
       else
         local _hbv_prompt
         _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
         herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
-        if ! _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+        if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+          _hbv_woke=1
+        else
           # First wait expired → retry once (re-send the prompt in case pane run dropped it).
           herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
-          if ! _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+          if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+            _hbv_woke=1
+          else
             DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · check pane${C_RESET}"
+            _hbv_escalated=true
           fi
         fi
       fi
+      local _hbv_status_after
+      _hbv_status_after="$(_agent_status "$_hbv_slug")"
+      journal_append refix_wake_result pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}" \
+        agent_status_after "${_hbv_status_after:-unknown}" \
+        woke "$_hbv_woke" escalated "$_hbv_escalated"
     fi
   else
     # REVIEW_AUTOFIX disabled or dry-run: show the standard "review blocked" message.
@@ -917,6 +942,12 @@ _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 # record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
 record_healthcheck() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
+  # Journal each attempt: attempt 1 is the initial run, attempt ≥2 is a solo retry-before-red.
+  if [ "${3:-1}" -le 1 ] 2>/dev/null; then
+    journal_append healthcheck_attempted pr "$1" slug "$2" attempt "$3" result "$4"
+  else
+    journal_append healthcheck_retried pr "$1" slug "$2" attempt "$3" result "$4"
+  fi
 }
 
 # _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> — the serialized, retry-before-red
@@ -952,6 +983,7 @@ _healthcheck_gate() {
     esac
     _health_release "$_hg_pr"
     _HC_RESULT="CLEAN"
+    journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CLEAN
     return 0
   fi
 
@@ -968,6 +1000,7 @@ _healthcheck_gate() {
     _health_release "$_hg_pr"
     DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
     _HC_RESULT="FLAKY"
+    journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
     return 0
   fi
   # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
@@ -975,6 +1008,7 @@ _healthcheck_gate() {
   _health_release "$_hg_pr"
   DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_hc2}${C_RESET}"
   _HC_RESULT="CODEERROR"
+  journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_hc2"
   return 0
 }
 
@@ -1260,7 +1294,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       if approval_is_approved "$prnum" "$rsha"; then
         DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (approved)${C_RESET}"
         render
-        do_merge "$slug" "$prnum" "$dir"
+        do_merge "$slug" "$prnum" "$dir" "$rsha"
         continue
       fi
       # First time gates pass for this sha: record + notify, then hold until approved.
@@ -1278,7 +1312,7 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
 
     DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging${C_RESET}"
     render
-    do_merge "$slug" "$prnum" "$dir"
+    do_merge "$slug" "$prnum" "$dir" "$rsha"
   done
 
   # Resolve pass: auto-spawn the isolated conflict resolver for each NEWLY-conflicting PR.

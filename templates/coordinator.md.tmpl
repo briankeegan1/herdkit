@@ -97,6 +97,26 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
+### Diagnose a gate: "what happened / is it stuck / why did X fail" → `herd why` FIRST
+
+When the user asks **what happened to a PR**, **why a PR is stuck**, or **why a gate / review / merge
+failed**, your FIRST move is the engine journal — not process archaeology, not re-reading panes:
+
+```
+herd why <pr#>      # chronological gate history for ONE PR: every review dispatch, verdict (with
+                    # reviewer/gate_default/infra provenance), healthcheck attempt + outcome, auto-refix
+                    # bounce + wake result, and the merge/reap — the whole story in order
+herd log --pr <n>   # the raw event stream for that PR; add --tail to watch gate activity live
+```
+
+The journal (`{{PROJECT_ROOT}}`'s worktree pool → `.herd/journal.jsonl`) is the append-only record
+every engine component writes as it acts. It is authoritative for post-mortems: it captures the
+things that used to vanish — a mid-review Claude death (`infra_event`), a verdict's provenance
+(`verdict_recorded` source=`reviewer|gate_default|infra`), each healthcheck attempt/retry before a red
+row, and an auto-refix bounce that silently failed to wake the builder (`refix_wake_result`
+escalated=true). Read `herd why <pr>` before deciding whether to re-task a builder, override a block,
+or escalate — then act on what the record actually shows.
+
 ### Auto-refix BLOCK reviews (REVIEW_AUTOFIX)
 
 When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict
@@ -163,6 +183,22 @@ PR. But **you never edit `{{BACKLOG_FILE}}` yourself.** You *enqueue* the change
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git
 pull`s + reads fresh + makes a targeted edit, so a concurrent manual edit is never clobbered.
+
+## Persist project & domain context (every session)
+
+Continuity is a first-class property of this seat, not optional hygiene. On **every** session,
+actively **build and update the user's project and domain context** in the
+**local project memory store** — what you learned about how this project and its domain work,
+decisions made and why, the domain's vocabulary, and data quirks/gotchas — so the next session
+resumes with that context instead of relearning it from scratch. Prefer updating an existing
+memory entry over adding a duplicate; correct or drop what proves wrong. Never let this context
+survive only as an easily-pruned note in one consumer project — persisting it here is the durable
+contract.
+
+Per the existing memory contract, this context **stays local and gitignored**: it lives only in
+the project's local memory store, never in the committed repo and never under `{{DENY_PATHS}}`.
+Do not weaken that contract — earn cross-session continuity by persisting context while keeping it
+entirely out of version control.
 
 ## Rules
 

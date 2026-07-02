@@ -53,6 +53,35 @@ fi
 : "${SCRIBE_BACKEND:="file"}"
 : "${SHARE_LINKS:=""}"            # dirs symlinked into each worktree (e.g. "data .venv")
 
+# ── Model tier defaults — TOKEN_MODE-aware ───────────────────────────────────
+# TOKEN_MODE (standard [default] | eco) flips the BUILT-IN model defaults to cheaper tiers.
+#
+# Ordering here is load-bearing and encodes one hard rule: an explicit MODEL_* key set in
+# .herd/config ALWAYS beats the eco tier — eco replaces built-in defaults only, never a user
+# override. That holds because the config file was already sourced above, so any explicit
+# MODEL_* is already set; every assignment below is ':=' (assign-only-if-unset) and therefore
+# cannot clobber it. The eco block runs FIRST so, for keys the user did NOT set, its values win
+# over the standard defaults that follow (those then no-op for anything eco already assigned).
+# When TOKEN_MODE is unset or 'standard' the eco block is skipped and the standard tiers apply
+# unchanged — zero behavior change for existing projects.
+#
+# Composition: the model step-up item escalates FROM whatever tier is resolved here — eco lowers
+# the floor, step-up raises specific lanes off that floor, so the two are orthogonal.
+#
+# eco tiers (research report "Bucket B"): coordinator/feature→sonnet, quick/scribe/research/
+# resolver→haiku, review→sonnet. Quality tradeoffs are documented in the TOKEN_MODE row of
+# templates/capabilities.tsv (and the rendered coordinator skill's Config-keys section).
+: "${TOKEN_MODE:="standard"}"
+if [ "$TOKEN_MODE" = "eco" ]; then
+  : "${MODEL_COORDINATOR:="claude-sonnet-4-6"}"
+  : "${MODEL_FEATURE:="claude-sonnet-4-6"}"
+  : "${MODEL_QUICK:="claude-haiku-4-5"}"
+  : "${MODEL_SCRIBE:="claude-haiku-4-5"}"
+  : "${MODEL_RESEARCH:="claude-haiku-4-5"}"
+  : "${MODEL_REVIEW:="claude-sonnet-4-6"}"
+  : "${MODEL_RESOLVER:="claude-haiku-4-5"}"
+fi
+
 : "${MODEL_COORDINATOR:="claude-opus-4-8"}"
 : "${MODEL_FEATURE:="claude-opus-4-8"}"
 : "${MODEL_QUICK:="claude-sonnet-4-6"}"
