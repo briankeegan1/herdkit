@@ -43,7 +43,9 @@ fi
 while true; do
   cur_mtime=$(file_mtime "$f")
   ts=$(git -C "$REPO" log -1 --format=%ct -- "$BACKLOG_FILE" 2>/dev/null || echo 0)
+  ts=${ts:-0}
   sub=$(git -C "$REPO" log -1 --format=%s -- "$BACKLOG_FILE" 2>/dev/null)
+  sub=${sub:-}
   now=$(date +%s); age=$(( now - ts ))
   if [ "$ts" -gt 0 ] && [ "$age" -lt 90 ]; then
     banner=$(printf '\033[1;42;30m ✍️  JUST SCRIBED \033[0m \033[1m%s\033[0m' "$sub")
