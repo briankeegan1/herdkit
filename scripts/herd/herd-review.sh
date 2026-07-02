@@ -80,6 +80,8 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Engine journal — record log retention + infra deaths (best-effort, never breaks the gate).
+. "$HERE/journal.sh"
 MAIN="$PROJECT_ROOT"
 PR="${1:?usage: herd-review.sh <pr> <slug>}"
 SLUG="${2:?usage: herd-review.sh <pr> <slug>}"
@@ -125,6 +127,8 @@ _teardown_reviewer() {
 # error (handled in _emit_verdict) instead of killing us before we can report.
 _severed() {
   _teardown_reviewer
+  journal_append infra_event component herd-review pr "${PR:-}" slug "${SLUG:-}" exit_code 2 \
+    stderr_tail 'review severed (SIGTERM/SIGPIPE) before a verdict'
   _emit_verdict 'REVIEW: INFRA-FAIL — review severed (SIGTERM/SIGPIPE) before a verdict'
   exit 2
 }
@@ -170,23 +174,25 @@ _mark_review_done() {
 # agent pane first so it cannot outlive the gate and overwrite the INFRA-FAIL verdict.
 emit_infra_fail() {
   _teardown_reviewer
+  journal_append infra_event component herd-review pr "${PR:-}" slug "${SLUG:-}" exit_code 2 \
+    stderr_tail "$1"
   _emit_verdict "REVIEW: INFRA-FAIL — $1"
   exit 2
 }
 
-# Log tracking: each review writes its $LOG path to a slug-keyed tracker so the NEXT
-# review of the same slug can clean up the old log (which may still be tailed by the
-# old pane). The log itself is NOT deleted on EXIT — it must outlive this process so
-# the persistent herdr pane keeps showing the verdict after the review finishes.
+# Log RETENTION: each review writes its $LOG path to a slug-keyed tracker. Historically the tracker
+# held a single path and the NEXT review of the slug DELETED it — but that deleted log is exactly the
+# forensic evidence needed to post-mortem a failed gate (a mid-review Claude death, a bogus verdict).
+# So the tracker is now a rolling LIST (newest last) and we KEEP the last $REVIEW_LOG_KEEP logs per
+# slug, deleting only those that roll off the window. The log itself is still NOT deleted on EXIT — it
+# must outlive this process so the persistent herdr pane keeps tailing the verdict.
 if [ -d "${WORKTREES_DIR:-}" ]; then
   _LOG_TRACK="$WORKTREES_DIR/.review-log-$SLUG"
 else
   _LOG_TRACK="${TMPDIR:-/tmp}/.herd-review-log-$SLUG"
 fi
-if [ -f "$_LOG_TRACK" ]; then
-  _old_log="$(cat "$_LOG_TRACK" 2>/dev/null || true)"
-  [ -n "$_old_log" ] && rm -f "$_old_log" 2>/dev/null || true
-fi
+REVIEW_LOG_KEEP="${REVIEW_LOG_KEEP:-5}"
+case "$REVIEW_LOG_KEEP" in ''|*[!0-9]*) REVIEW_LOG_KEEP=5 ;; esac
 
 # BSD/macOS mktemp requires X's to be the LAST characters; a trailing suffix like
 # ".log" after XXXXXX is a GNU-only extension that silently produces a literal filename
@@ -194,10 +200,28 @@ fi
 LOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-${PR}-XXXXXX")" \
   || emit_infra_fail "could not allocate review log (mktemp failed)"
 [ -n "$LOG" ] || emit_infra_fail "could not allocate review log (empty path)"
-# Save new log path; cleaned up when the next review of this slug starts.
-printf '%s\n' "$LOG" > "$_LOG_TRACK" 2>/dev/null || true
+
+# Roll the tracker: append this log, keep the newest $REVIEW_LOG_KEEP, delete the ones that fall off.
+# Best-effort throughout — a tracker/FS hiccup must never abort the gate.
+_rlt_tmp="${_LOG_TRACK}.tmp.$$"
+{ [ -f "$_LOG_TRACK" ] && cat "$_LOG_TRACK" 2>/dev/null; printf '%s\n' "$LOG"; } 2>/dev/null \
+  | awk 'NF' > "$_rlt_tmp" 2>/dev/null || : > "$_rlt_tmp" 2>/dev/null || true
+if [ -f "$_rlt_tmp" ]; then
+  _rlt_total="$(wc -l < "$_rlt_tmp" 2>/dev/null | tr -cd '0-9')"; _rlt_total="${_rlt_total:-0}"
+  if [ "$_rlt_total" -gt "$REVIEW_LOG_KEEP" ] 2>/dev/null; then
+    _rlt_drop="$(( _rlt_total - REVIEW_LOG_KEEP ))"
+    # Delete the oldest ($_rlt_drop) logs — but never the one we just created.
+    head -n "$_rlt_drop" "$_rlt_tmp" 2>/dev/null | while IFS= read -r _rlt_old; do
+      [ -n "$_rlt_old" ] && [ "$_rlt_old" != "$LOG" ] && rm -f "$_rlt_old" 2>/dev/null || true
+    done
+    tail -n "$REVIEW_LOG_KEEP" "$_rlt_tmp" > "${_rlt_tmp}.2" 2>/dev/null \
+      && mv -f "${_rlt_tmp}.2" "$_rlt_tmp" 2>/dev/null || true
+  fi
+  mv -f "$_rlt_tmp" "$_LOG_TRACK" 2>/dev/null || rm -f "$_rlt_tmp" 2>/dev/null || true
+fi
+journal_append review_log_retained pr "$PR" slug "$SLUG" path "$LOG" keep "$REVIEW_LOG_KEEP"
 # NOTE: intentionally NO 'trap rm -f "$LOG" EXIT' — the herdr pane must keep tailing
-# the log after this process exits. Cleanup happens on the next review of this slug.
+# the log after this process exits. Old logs are reaped by the rolling window above.
 
 # The fixed reviewer task — headless path. Scoped hard to CORRECTNESS; default BLOCK; read-only;
 # one machine verdict printed as the final line (parsed from $LOG).
