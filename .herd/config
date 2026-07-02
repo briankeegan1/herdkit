@@ -25,6 +25,7 @@ MODEL_QUICK="claude-sonnet-4-6"
 MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-opus-4-8"
+MODEL_RESOLVER="claude-sonnet-4-6"
 
 DENY_PATHS=".herd/secrets"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
