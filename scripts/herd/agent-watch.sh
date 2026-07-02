@@ -10,7 +10,12 @@
 # and an "in flight" list — one row per active feature worktree, slug-padded so the state words
 # align:
 #   🔨 building       — agent working, no PR yet
-#   🩺 health-check    — running healthcheck.sh on its worktree
+#   🩺 health-check    — running healthcheck.sh on its worktree. SERIALIZED by a per-repo mutex
+#                       (HEALTH_CONCURRENCY, default 1): feature worktrees share one git object
+#                       store, so overlapping suites race on shared .git locks and can paint a
+#                       false-red — a PR waiting on the slot shows "health-check · queued". A CODE
+#                       error is re-run once (solo) before it can go red: a transient self-heals as
+#                       "flaky · infra (passed on retry)"; only a reproducing failure paints red.
 #   🔬 reviewing      — health passed: a STRONG model is adversarially correctness-reviewing the
 #                       diff BEFORE merge (herd-review.sh). Merges only on PASS. Reviews run in
 #                       the BACKGROUND (up to REVIEW_CONCURRENCY at once, each with its own
@@ -25,8 +30,10 @@
 #                       conflicting ("resolver failed"). NEVER auto-merged; one-line reason.
 #
 # AUTO-MERGE rule (full auto, safety-railed): for a PR that is mergeable==MERGEABLE AND
-# mergeStateStatus==CLEAN, run  healthcheck.sh <worktree>.  Only if it passes (a ⚠️ data/env
-# warning is OK; a ❌ code error is NOT), then RE-VERIFY the PR is STILL MERGEABLE/CLEAN and still
+# mergeStateStatus==CLEAN, run  healthcheck.sh <worktree>  (serialized; retried once solo on a CODE
+# error before it can go red).  Only if it passes (a ⚠️ data/env warning is OK, and a code error
+# that PASSES on the solo retry is treated as flaky/passing; a code error that REPRODUCES is NOT),
+# then RE-VERIFY the PR is STILL MERGEABLE/CLEAN and still
 # maps to the expected branch in the instant before merging — guarding the window between
 # classification and merge — THEN pass the PRE-MERGE REVIEW GATE, and only on a PASS do
 # gh pr merge <n> --merge.
@@ -93,6 +100,14 @@ OVERRIDES="$TREES/.agent-watch-overrides"
 #         "<epoch> approved <pr#> <headSha>"  — herd-approve.sh wrote explicit approval for this sha
 #         "<epoch> observed <pr#> <headSha>"  — watcher notified in observe mode (dedup guard)
 APPROVALS="$TREES/.agent-watch-approvals"
+# Healthcheck ledger, PARALLEL to the review ledgers: one line per healthcheck ATTEMPT
+# ("<epoch> <pr#> <slug> <attempt> <outcome>"), outcome ∈ clean | dataenv | code-error | flaky-pass.
+# This is the healthcheck analogue of $REVIEW_STATE — an append-only provenance record so a red row
+# is always backed by an auditable "code-error reproduced on the solo retry" pair, and a flaky one
+# by a "code-error then flaky-pass" pair. PR #49 gave the review gate provenance via ledger fields;
+# there is no unified engine journal yet, so this mirrors that mechanism and leaves a clean seam for
+# the upcoming journal item to fold these rows in. Never gates behavior — purely a record.
+HEALTH_STATE="$TREES/.agent-watch-healthchecks"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -723,6 +738,117 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
   fi
 }
 
+# ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
+# WHY: every feature worktree shares ONE git object store and one .git/worktrees lock namespace, so
+# two full healthcheck suites running at once race on shared git locks (empirically: concurrent
+# suites trip `Unable to create '.../.git/gc.pid.lock': File exists — Another git process seems to
+# be running`, which a solo run never hits). That race surfaced as a transient "❌ code error" for a
+# clean PR (2026-07-02 ~12:14). Two independent guards make a red row mean VERIFIED-REAL:
+#   (1) SERIALIZE — a per-repo mutex (HEALTH_CONCURRENCY, default 1, mirroring REVIEW_CONCURRENCY)
+#       so the watcher never runs overlapping suites; a PR waiting on the slot shows
+#       "health-check · queued" (visible, never mistaken for a hang).
+#   (2) RETRY-BEFORE-RED — a healthcheck CODE ERROR (rc 1) is re-run ONCE immediately, solo, still
+#       holding the mutex. Passes on retry → "flaky · infra (passed on retry)", proceed as passing.
+#       Only a failure that REPRODUCES on the solo retry paints red. exit-code-2 data/env semantics
+#       are unchanged (healthcheck.sh already collapses 2→rc 0, tolerated).
+# The mutex uses live-pid inflight markers exactly like the review gate's concurrency accounting, so
+# a crashed holder never wedges a slot.
+# HERD_HEALTHCHECK_BIN is a test seam (mirrors HERD_REVIEW_BIN): the hermetic suite points it at a
+# stub healthcheck with a scripted fail-then-pass / fail-then-fail sequence.
+: "${HERD_HEALTHCHECK_BIN:="$HERE/healthcheck.sh"}"
+_health_inflight_file() { printf '%s' "$TREES/.health-inflight-$1"; }
+
+# _health_pid_live <inflight-file> — true if the marker records a still-running holder pid.
+_health_pid_live() {
+  local pid; pid="$(head -1 "$1" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# _count_live_healthchecks — number of inflight markers (across ALL PRs) whose holder pid is alive.
+# Dead markers are not counted (a crashed holder never wedges a slot); mirrors _count_live_reviews.
+_count_live_healthchecks() {
+  local n=0 f
+  for f in "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _health_pid_live "$f" && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
+# _health_slot_free — true if a healthcheck slot is available under HEALTH_CONCURRENCY (default 1).
+_health_slot_free() {
+  [ "$(_count_live_healthchecks)" -lt "${HEALTH_CONCURRENCY:-1}" ]
+}
+
+# _health_acquire <pr#> — claim a slot by writing this process's live pid to the pr's marker.
+_health_acquire() { printf '%s\n' "$$" > "$(_health_inflight_file "$1")"; }
+# _health_release <pr#> — drop the pr's marker, freeing its slot.
+_health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
+
+# record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
+record_healthcheck() {
+  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
+}
+
+# _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> — the serialized, retry-before-red
+# healthcheck. Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns 0 always:
+#   QUEUED    — no slot free (another suite holds the mutex); re-evaluate next tick, do NOT merge
+#   CLEAN     — healthcheck passed (clean or tolerated data/env); proceed to the review/merge path
+#   FLAKY     — first run was a CODE ERROR but the solo retry PASSED; proceed as passing
+#   CODEERROR — CODE ERROR reproduced on the solo retry; red "needs you", do NOT merge
+# Uses render() for the intermediate "health-check" / "retrying" frames, matching _handle_block_verdict.
+_healthcheck_gate() {
+  local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4"
+  local _hg_sl _hg_pn
+  _hg_sl="$(printf '%-*s' "$SLUGW" "$_hg_slug")"
+  _hg_pn=" ${C_DIM}#${_hg_pr}${C_RESET} ·"
+
+  # SERIALIZE: no slot free → queue this PR and defer. Never runs a suite that would overlap.
+  if ! _health_slot_free; then
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · queued${C_RESET}"
+    _HC_RESULT="QUEUED"
+    return 0
+  fi
+  _health_acquire "$_hg_pr"
+
+  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check${C_RESET}"
+  render
+  local _hg_hc _hg_rc
+  _hg_hc="$(bash "$HERD_HEALTHCHECK_BIN" "$_hg_dir" --oneline 2>/dev/null)"; _hg_rc=$?
+  if [ "$_hg_rc" -eq 0 ]; then
+    # Clean, or a tolerated data/env warning (healthcheck.sh already collapsed exit 2 → rc 0).
+    case "$_hg_hc" in
+      "⚠️"*) record_healthcheck "$_hg_pr" "$_hg_slug" 1 "dataenv" ;;
+      *)     record_healthcheck "$_hg_pr" "$_hg_slug" 1 "clean" ;;
+    esac
+    _health_release "$_hg_pr"
+    _HC_RESULT="CLEAN"
+    return 0
+  fi
+
+  # rc 1: a CODE ERROR. RETRY-BEFORE-RED: re-run ONCE, solo, still holding the mutex. A transient
+  # from cross-worktree lock contention self-heals; only a reproducing failure is real.
+  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error"
+  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · code error — retrying once (solo)${C_RESET}"
+  render
+  local _hg_hc2 _hg_rc2
+  _hg_hc2="$(bash "$HERD_HEALTHCHECK_BIN" "$_hg_dir" --oneline 2>/dev/null)"; _hg_rc2=$?
+  if [ "$_hg_rc2" -eq 0 ]; then
+    # Passed on the solo retry → the first failure was infra/contention, NOT a code bug. Never red.
+    record_healthcheck "$_hg_pr" "$_hg_slug" 2 "flaky-pass"
+    _health_release "$_hg_pr"
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
+    _HC_RESULT="FLAKY"
+    return 0
+  fi
+  # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
+  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error"
+  _health_release "$_hg_pr"
+  DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_hc2}${C_RESET}"
+  _HC_RESULT="CODEERROR"
+  return 0
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge — WITHOUT entering the live watch loop. Direct
 # execution runs the loop normally.
@@ -883,14 +1009,17 @@ EOF
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
 
-    DISPLAY[idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+    # SERIALIZED, retry-before-red healthcheck: never runs a suite that overlaps another (they
+    # share one git object store and race on shared .git locks), and only paints red on a CODE
+    # error that REPRODUCES on an immediate solo retry — a transient self-heals as "flaky · infra".
+    _HC_RESULT=""
+    _healthcheck_gate "$prnum" "$slug" "$dir" "$idx"
     render
-    hc="$(bash "$HERE/healthcheck.sh" "$dir" --oneline 2>/dev/null)"; rc=$?
-    if [ "$rc" -ne 0 ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${hc}${C_RESET}"
-      render
-      continue
-    fi
+    case "$_HC_RESULT" in
+      CLEAN|FLAKY) : ;;            # passed (clean, tolerated data/env, or flaky-then-passed) → gate on
+      QUEUED)      continue ;;     # slot busy — re-evaluate next tick, do NOT merge
+      CODEERROR|*) continue ;;     # reproduced code error (red) — held for a human, do NOT merge
+    esac
 
     if [ -n "$DRYRUN" ]; then
       DISPLAY[idx]="    ${C_DIM}🔬${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would review PR #${prnum} (then merge on PASS)${C_RESET}"

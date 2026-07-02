@@ -75,6 +75,7 @@ fi
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
+: "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 
