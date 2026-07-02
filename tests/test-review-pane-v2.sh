@@ -206,30 +206,39 @@ ok
 
 wait 2>/dev/null || true
 
-# ── (4) headless fallback: herdr absent → claude -p pipeline ─────────────────
-# Remove herdr from PATH (keep other stubs).
-BIN_NO_HERDR="$T/bin-no-herdr"; mkdir -p "$BIN_NO_HERDR"
-cp "$BIN/gh"     "$BIN_NO_HERDR/gh"
-cp "$BIN/git"    "$BIN_NO_HERDR/git"
-cp "$BIN/claude" "$BIN_NO_HERDR/claude"
-# No herdr binary in BIN_NO_HERDR — it's absent from PATH.
-
+# ── (4) headless fallback: HERD_NO_PANE=1 forces the headless claude -p pipeline ─
+# What is under test: the headless review pipeline that runs when there is NO live pane surface.
+# We force it with the documented HERD_NO_PANE=1 knob (herd-review.sh:59), which gates the SAME
+# branch as `command -v herdr` (herd-review.sh:226) — so the downstream headless pipeline
+# exercised here is byte-for-byte identical to the 'herdr genuinely absent' case.
+#
+# We do NOT try to make herdr unfindable by stripping PATH: the previous approach stripped only
+# the stub bin dir while KEEPING every system path, so on any machine with herdr actually
+# installed herd-review.sh found the REAL herdr, took the live-pane route, failed to find a
+# builder named 'test-slug', hit the tab-gone fallback, and created a REAL 'review·test-slug' tab
+# (with an orphaned 'tail -f') in the user's live workspace — a hermeticity leak that fired on
+# every full test-suite run. The HERD_NO_PANE knob reaches the identical headless code with zero
+# dependence on PATH contents. (The suite's tab/pane leak-guard in .herd/healthcheck.project.sh
+# now also fails loudly if any test ever escapes its stubs like this again.)
+_reset_logs
 RES="$T/result-4-sha4"
-# Build a PATH that includes $BIN_NO_HERDR (stubs without herdr) + all system paths
-# but NOT $BIN (which has the herdr stub). This ensures herdr is truly absent.
-_PATH4="$BIN_NO_HERDR:$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$BIN" | tr '\n' ':' | sed 's/:$//')"
-out="$(PATH="$_PATH4" \
+out="$(HERD_NO_PANE=1 \
        HERD_REVIEW_RESULT_FILE="$RES" \
        bash "$REVIEW" 4 test-slug 2>/dev/null)"
 rc=$?
 
-[ "$rc" -eq 0 ] || fail "4: headless mode (no herdr) should exit 0 on PASS (got $rc)"
+[ "$rc" -eq 0 ] || fail "4: headless mode (HERD_NO_PANE=1) should exit 0 on PASS (got $rc)"
 ok
 printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "4: headless fallback should produce REVIEW: PASS"
 ok
 [ -f "$RES" ] || fail "4: headless mode should still write the result file"
 ok
 grep -q '^REVIEW: PASS$' "$RES" || fail "4: result file should contain REVIEW: PASS in headless mode"
+ok
+# Hermeticity: the headless path must touch NO pane surface — no live-pane route, no tab create.
+grep -q 'agent start' "$HERDR_CALL_LOG" && fail "4: headless mode must NOT call herdr agent start" || true
+ok
+grep -q 'tab create' "$HERDR_CALL_LOG" && fail "4: headless mode must NOT call herdr tab create" || true
 ok
 
 # ── (5) INFRA retry: agent never writes result file → INFRA-FAIL on timeout ──
