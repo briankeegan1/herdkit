@@ -1093,6 +1093,13 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
 
     if [ -n "$ws" ]; then
       herdr_attempted=1
+      # Bring THIS project's workspace forward before rebuilding it. Every herdr call below is
+      # --no-focus (so the rebuild never yanks focus mid-flight), which means a reload launched
+      # while a SIBLING project's workspace is focused would otherwise rebuild our control room
+      # entirely off-screen — the user sees nothing change, or just one pane (the watcher's
+      # pane run) poke through the other project's layout, and concludes reload "did nothing"
+      # or "grabbed a different project's panes". coordinator.sh focuses for the same reason.
+      herdr workspace focus "$ws" >/dev/null 2>&1 || true
       # `herd reload` must CONVERGE to the canonical control room from ANY starting context —
       # run inside the coordinator claude session, from the coordinator pane's bare shell after
       # Ctrl+C, or from a brand-new external terminal. The recipe: SNAPSHOT the live layout,
