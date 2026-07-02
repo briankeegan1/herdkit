@@ -109,9 +109,9 @@ if _hc_changed="$(git diff --name-only "$_hc_branch" 2>/dev/null)"; then
     fi
   fi
 
-  _hc_new_lanes="$(printf '%s\n' "$_hc_changed" \
+  _hc_added_lanes="$(git diff --diff-filter=A --name-only "$_hc_branch" 2>/dev/null \
     | grep -Ex 'scripts/herd/[^/]+\.sh' | grep -vxE 'scripts/herd/herd-config\.sh' || true)"
-  if [ -n "$_hc_new_lanes" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
+  if [ -n "$_hc_added_lanes" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
     _hc_sync_errs="${_hc_sync_errs}new lane script added: also update templates/capabilities.tsv"$'\n'
   fi
 

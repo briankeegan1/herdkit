@@ -39,7 +39,7 @@ sync_guard() {
     fi
   fi
 
-  new_lanes="$(printf '%s\n' "$changed" \
+  new_lanes="$(git -C "$root" diff --diff-filter=A --name-only "$base" 2>/dev/null \
     | grep -Ex 'scripts/herd/[^/]+\.sh' | grep -vxE 'scripts/herd/herd-config\.sh' || true)"
   if [ -n "$new_lanes" ] && [ "$manifest_touched" -eq 0 ]; then
     return 0
@@ -125,5 +125,31 @@ printf '#!/usr/bin/env bash\n_backend_add_item(){ :; }\n' > "$R/scripts/herd/bac
 git -C "$R" add scripts/herd/backends/newbackend.sh
 git -C "$R" commit -q -m "add new backend"
 if sync_guard "$R" "$BASE"; then fail "guard tripped on scripts/herd/backends/ addition"; else ok; fi
+
+# 9. REGRESSION: editing an existing lane script (not adding a new one) → guard passes.
+R="$T/r9"; mkdir "$R"; make_repo "$R"
+# Seed an existing lane on main so it's tracked before the feature branch.
+printf '#!/usr/bin/env bash\necho old-content\n' > "$R/scripts/herd/agent-watch.sh"
+git -C "$R" add scripts/herd/agent-watch.sh
+git -C "$R" commit -q -m "add existing lane" --allow-empty
+git -C "$R" checkout -q main 2>/dev/null || git -C "$R" checkout -q -b main feat/test
+# Recreate properly: init on main, commit existing lane, then branch.
+R="$T/r9b"; mkdir "$R"
+git -C "$R" init -q
+git -C "$R" config user.email t@t.t
+git -C "$R" config user.name t
+mkdir -p "$R/scripts/herd" "$R/bin" "$R/templates"
+printf '#!/usr/bin/env bash\ncmd_existing() { :; }\n'              > "$R/bin/herd"
+printf ': "${EXISTING_KEY:=val}"\n'                                > "$R/scripts/herd/herd-config.sh"
+printf '#!/usr/bin/env bash\necho old-content\n'                   > "$R/scripts/herd/agent-watch.sh"
+printf 'name\tkind\tdescription\twhen_to_surface\n'               > "$R/templates/capabilities.tsv"
+git -C "$R" add -A
+git -C "$R" commit -q -m init
+git -C "$R" checkout -q -b feat/test
+# Now modify the existing lane (bugfix) — NOT adding it, just editing it.
+printf '#!/usr/bin/env bash\necho new-content\n'                   > "$R/scripts/herd/agent-watch.sh"
+git -C "$R" add scripts/herd/agent-watch.sh
+git -C "$R" commit -q -m "bugfix agent-watch.sh"
+if sync_guard "$R" "$BASE"; then fail "guard tripped on edit to EXISTING lane (not an addition)"; else ok; fi
 
 echo "ALL PASS ($pass checks)"
