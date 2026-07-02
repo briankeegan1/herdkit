@@ -7,7 +7,9 @@
 #     other workspaces (production or other worktrees), making every test independent of
 #     the ambient process table.
 #   • herdr is STUBBED (exits 1) — forces the background-fallback path without a real
-#     herdr instance.
+#     herdr instance. Tests 11+ prepend a RICH herdr stub (file-backed simulation of the
+#     workspace/tab/pane/agent JSON API) to exercise the herdr control-room path — still
+#     hermetic: pane run only records the command, no process is ever spawned.
 #   • HERD_RELOAD_SKIP_LAUNCH=1 suppresses the background watcher launch so no
 #     persistent herd-watch.sh / agent-watch.sh processes are spawned.
 #   • HERD_RELOAD_SIGTERM_POLLS=3 (3×0.2s) shortens the SIGTERM wait in tests that
@@ -269,6 +271,182 @@ rm -f "$lockfile" 2>/dev/null || true
 )
 [ -f "$lockfile" ] \
   && fail "EXIT trap did not remove lockfile on natural exit (guard too aggressive)" || true
+ok
+
+# ═══ herdr control-room path (tests 11+) ═════════════════════════════════════
+# Rich herdr stub: a file-backed simulation of the JSON API surface cmd_reload uses.
+# State lives under $HERDR_STATE:
+#   tabs/<tab_id>            file content = tab label
+#   panes/<pane_id>/cmd      last `pane run` command (recorded, NEVER executed)
+#   panes/<pane_id>/noshow   marker: process-info never shows cmd (invisible-pane bug sim)
+#   neighbors/<pane>.<dir>   neighbor pane id for `pane neighbor`
+#   agents.json              canned `agent list` response
+#   log                      every invocation, one line, for assertions
+# Env: FAKE_WS_LABEL (workspace label), FAKE_RUN_WRITES_LOCK=path:pid (pane run writes
+# pid to path — simulates a detached watcher grabbing the lockfile).
+RICH="$T/richbin"; mkdir -p "$RICH"
+cat > "$RICH/herdr" <<'STUB'
+#!/usr/bin/env bash
+S="${HERDR_STATE:?}"; mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
+echo "$*" >> "$S/log"
+next_id(){ local n=0; [ -f "$S/seq" ] && n="$(cat "$S/seq")"; n=$((n+1)); echo "$n" > "$S/seq"; printf '%s' "$n"; }
+case "${1:-} ${2:-}" in
+  "workspace list")
+    printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"%s"}]}}\n' "${FAKE_WS_LABEL:-}" ;;
+  "tab list")
+    python3 - "$S" <<'PY'
+import sys,os,json
+S=sys.argv[1]; d=os.path.join(S,"tabs")
+tabs=[{"tab_id":t,"label":open(os.path.join(d,t)).read().strip()} for t in sorted(os.listdir(d))]
+print(json.dumps({"result":{"tabs":tabs}}))
+PY
+    ;;
+  "tab create")
+    label=""; shift 2
+    while [ $# -gt 0 ]; do case "$1" in --label) label="${2:-}"; shift 2 ;; *) shift ;; esac; done
+    tid="t$(next_id)"; printf '%s' "$label" > "$S/tabs/$tid"
+    pid="p$(next_id)"; mkdir -p "$S/panes/$pid"; printf '%s' "$tid" > "$S/panes/$pid/tab"
+    printf '{"result":{"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' "$tid" "$pid" ;;
+  "tab close")
+    rm -f "$S/tabs/${3:-}"; printf '{"result":{}}\n' ;;
+  "agent list")
+    if [ -f "$S/agents.json" ]; then cat "$S/agents.json"; else printf '{"result":{"agents":[]}}\n'; fi ;;
+  "pane run")
+    p="${3:-}"; mkdir -p "$S/panes/$p"; printf '%s' "${4:-}" > "$S/panes/$p/cmd"
+    if [ -n "${FAKE_RUN_WRITES_LOCK:-}" ]; then
+      printf '%s\n' "${FAKE_RUN_WRITES_LOCK##*:}" > "${FAKE_RUN_WRITES_LOCK%:*}"
+    fi
+    printf '{"result":{}}\n' ;;
+  "pane process-info")
+    p="${4:-}"
+    if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
+    cmd=""
+    [ -f "$S/panes/$p/cmd" ] && [ ! -f "$S/panes/$p/noshow" ] && cmd="$(cat "$S/panes/$p/cmd")"
+    if [ -n "$cmd" ]; then
+      printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
+    else
+      printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[]}}}\n'
+    fi ;;
+  "pane neighbor")
+    d="${4:-}"; p="${6:-}"; nb=""
+    [ -f "$S/neighbors/$p.$d" ] && nb="$(cat "$S/neighbors/$p.$d")"
+    if [ -n "$nb" ]; then
+      printf '{"result":{"neighbor":{"pane_id":"%s","neighbor_pane_id":"%s"}}}\n' "$p" "$nb"
+    else
+      printf '{"result":{"neighbor":{"pane_id":"%s"}}}\n' "$p"
+    fi ;;
+  "pane split")
+    p="p$(next_id)"; mkdir -p "$S/panes/$p"
+    printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$p" ;;
+  "pane swap")
+    printf '{"result":{}}\n' ;;
+  *) printf '{"result":{}}\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$RICH/herdr"
+
+# _rich_reload PROJECT STATE [env VAR=VAL ...] — run reload against the rich stub.
+# HERD_RELOAD_SKIP_LAUNCH=fallback keeps it hermetic: even if the herdr path fails,
+# no real background watcher is ever spawned.
+_rich_reload() {
+  local proj="$1" state="$2"; shift 2
+  ( cd "$proj" && env PATH="$RICH:$PATH" HERDR_STATE="$state" FAKE_WS_LABEL="reloadtest" \
+      HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 \
+      "$@" bash "$HERD" reload 2>&1 )
+}
+
+# _rich_coord_state STATE — coordinator control-room fixture: tab tC labeled as the
+# coordinator, agent pane pA, bare backlog pane pL left of it, bare watch pane pW below.
+_rich_coord_state() {
+  local S="$1"
+  mkdir -p "$S/tabs" "$S/panes/pA" "$S/panes/pL" "$S/panes/pW" "$S/neighbors"
+  printf 'coordinator-reloadtest' > "$S/tabs/tC"
+  printf 'tC' > "$S/panes/pA/tab"
+  printf 'pL' > "$S/neighbors/pA.left"
+  printf 'pW' > "$S/neighbors/pA.down"
+  printf '%s\n' '{"result":{"agents":[{"name":"coordinator-reloadtest","pane_id":"pA","tab_id":"tC","workspace_id":"w1"}]}}' \
+    > "$S/agents.json"
+}
+
+# ── 11. herdr path, no coordinator → standalone watch + backlog tabs, verified ─
+P="$T/p11"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state11"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (herdr standalone path)"
+printf '%s' "$out" | grep -q "herdr tab watch-reloadtest" || fail "watcher not placed in a standalone watch tab"
+printf '%s' "$out" | grep -q "visible ✓" || fail "watcher visibility not verified/reported"
+printf '%s' "$out" | grep -q "tab backlog-reloadtest" || fail "backlog not placed in a standalone tab"
+grep -rl "herd-watch.sh" "$S/panes" >/dev/null || fail "no pane received the watch script"
+grep -rl "backlog-view.sh" "$S/panes" >/dev/null || fail "no pane received backlog-view.sh"
+ok
+
+# ── 12. coordinator layout: watch below + backlog left reused; coordinator untouched ─
+P="$T/p12"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state12"; _rich_coord_state "$S"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (coordinator layout)"
+grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watch script not run in the pane below the coordinator"
+grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog-view not run in the pane left of the coordinator"
+printf '%s' "$out" | grep -q "pane below coordinator" || fail "output missing 'pane below coordinator'"
+printf '%s' "$out" | grep -q "visible ✓" || fail "watcher visibility not reported (coordinator layout)"
+grep -q "tab close tC" "$S/log" && fail "reload CLOSED the coordinator tab (must never happen)" || true
+grep -q "pane split" "$S/log" && fail "reload split a pane when both panes were reusable" || true
+[ -f "$S/tabs/tC" ] || fail "coordinator tab is gone from state"
+ok
+
+# ── 13. live backlog pane is left completely untouched ────────────────────────
+P="$T/p13"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state13"; _rich_coord_state "$S"
+printf 'bash /somewhere/backlog-view.sh' > "$S/panes/pL/cmd"   # already live
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (live backlog test)"
+printf '%s' "$out" | grep -q "already live ✓" || fail "live backlog pane not reported as already live"
+grep -q "pane run pL" "$S/log" && fail "reload re-ran a command in the LIVE backlog pane" || true
+ok
+
+# ── 14. invisible-watcher bug: run lands detached → retry once, then LOUD report ─
+# The watch pane never shows the command (noshow), but each pane run "starts" a detached
+# watcher that grabs the lockfile (FAKE_RUN_WRITES_LOCK with a live PID). Reload must
+# retry the pane run once, detect the running-but-invisible watcher via the lockfile,
+# and report it loudly — never a silent zombie pane, never a duplicate spawn.
+P="$T/p14"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state14"; _rich_coord_state "$S"
+touch "$S/panes/pW/noshow"
+sleep 999 & ZPID=$!
+lockfile="$P/trees/.watcher-reloadtest.pid"
+out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID")" \
+  || { kill "$ZPID" 2>/dev/null || true; fail "reload failed (invisible-watcher test)"; }
+runs="$(grep -c "pane run pW" "$S/log" || true)"
+[ "$runs" -eq 2 ] || { kill "$ZPID" 2>/dev/null || true; fail "expected exactly 2 pane run attempts (retry once), got $runs"; }
+printf '%s' "$out" | grep -q "RUNNING but NOT visible" \
+  || { kill "$ZPID" 2>/dev/null || true; fail "invisible watcher not reported loudly"; }
+printf '%s' "$out" | grep -q "DETACHED" \
+  || { kill "$ZPID" 2>/dev/null || true; fail "summary missing DETACHED watcher state"; }
+[ "$(cat "$lockfile" 2>/dev/null)" = "$ZPID" ] \
+  || { kill "$ZPID" 2>/dev/null || true; fail "detached watcher's lockfile was clobbered"; }
+kill "$ZPID" 2>/dev/null || true
+ok
+
+# ── 15. missing backlog pane → split coordinator + swap into the LEFT slot ────
+P="$T/p15"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state15"; _rich_coord_state "$S"
+rm -f "$S/neighbors/pA.left"   # user closed the backlog pane
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (missing backlog pane)"
+grep -q "pane split pA --direction right" "$S/log" || fail "missing backlog pane did not split the coordinator pane"
+grep -q "pane swap --source-pane" "$S/log" || fail "recreated backlog pane was not swapped into the left slot"
+printf '%s' "$out" | grep -q "recreated ✓" || fail "recreated backlog pane not verified/reported"
+ok
+
+# ── 16. verify-failure without a detached watcher → loud warning, fallback suppressed ─
+P="$T/p16"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state16"; _rich_coord_state "$S"
+touch "$S/panes/pW/noshow"     # pane run never becomes visible, and nothing grabs the lock
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (verify-failure test)"
+printf '%s' "$out" | grep -q "NOT relaunched" || fail "suppressed fallback not reported after verify failure"
 ok
 
 echo "ALL PASS ($pass checks)"

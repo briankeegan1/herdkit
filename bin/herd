@@ -558,12 +558,122 @@ cmd_report() {
   esac
 }
 
+# ── cmd_reload helpers: herdr JSON plumbing + verified pane launches ─────────
+# `herdr pane run` types the command into the pane's tty. A run submitted before the
+# pane's shell has finished initializing can execute DETACHED from the tty: the process
+# runs (parented to the shell) while the visible pane sits at a bare prompt looking dead
+# — the invisible-watcher bug. Every launch below therefore (a) waits for the pane's
+# shell, (b) runs, (c) VERIFIES the pane's foreground actually shows the script, retrying
+# once, and reports loudly on failure. Never assume a pane run landed.
+
+# _reload_pane_state <pane_id> <match> → GONE | NOSHELL | BARE | BUSY | RUN <pid>
+#   GONE     pane missing or the herdr call failed
+#   NOSHELL  pane exists but its shell has not initialized yet
+#   BARE     shell up, nothing in the foreground — safe to run our script here
+#   RUN      a foreground process matches <match> (|-separated substrings); pid printed
+#   BUSY     something else is running — never hijack this pane
+_reload_pane_state() {
+  herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+import sys,json,os
+try: pi=json.load(sys.stdin)["result"]["process_info"]
+except Exception: print("GONE"); sys.exit(0)
+sh=pi.get("shell_pid") or 0
+if not sh: print("NOSHELL"); sys.exit(0)
+subs=[s for s in os.environ.get("M","").split("|") if s]
+fg=[p for p in (pi.get("foreground_processes") or []) if p.get("pid")!=sh]
+for p in fg:
+    if any(s in (p.get("cmdline") or "") for s in subs):
+        print("RUN", p.get("pid",0)); sys.exit(0)
+print("BUSY" if fg else "BARE")
+' 2>/dev/null || printf 'GONE\n'
+}
+
+# _reload_pane_ready <pane_id> — bounded wait for the pane's shell to initialize.
+_reload_pane_ready() {
+  local pane="$1" tries="${HERD_RELOAD_PANE_POLLS:-25}" i=0 st
+  while [ "$i" -lt "$tries" ]; do
+    st="$(_reload_pane_state "$pane" "")"
+    case "$st" in BARE|BUSY|RUN*) return 0 ;; esac
+    sleep 0.2; i=$((i+1))
+  done
+  return 1
+}
+
+# _reload_pane_run_verified <pane_id> <command> <match> — readiness-gate, run, then verify
+# the pane's foreground shows <match>; retries the whole sequence once. Prints the visible
+# PID on success; callers must treat failure loudly (see invisible-watcher note above).
+_reload_pane_run_verified() {
+  local pane="$1" cmd="$2" match="$3" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i st
+  for attempt in 1 2; do
+    _reload_pane_ready "$pane" || true   # bounded wait; the verify below is the real gate
+    herdr pane run "$pane" "$cmd" >/dev/null 2>&1 || true
+    i=0
+    while [ "$i" -lt "$vp" ]; do
+      st="$(_reload_pane_state "$pane" "$match")"
+      case "$st" in RUN\ *) printf '%s' "${st#RUN }"; return 0 ;; esac
+      sleep 0.2; i=$((i+1))
+    done
+  done
+  return 1
+}
+
+# _reload_neighbor <pane_id> <direction> → adjacent pane_id, or empty when none.
+_reload_neighbor() {
+  herdr pane neighbor --direction "$2" --pane "$1" 2>/dev/null | python3 -c '
+import sys,json
+try: n=json.load(sys.stdin)["result"]["neighbor"]
+except Exception: n={}
+print(n.get("neighbor_pane_id") or "", end="")
+' 2>/dev/null || true
+}
+
+# _reload_split_pane <pane_id> <direction> <ratio> <cwd> → new pane_id, or empty.
+_reload_split_pane() {
+  herdr pane split "$1" --direction "$2" --ratio "$3" --cwd "$4" --no-focus 2>/dev/null | python3 -c '
+import sys,json
+try: print(json.load(sys.stdin)["result"]["pane"]["pane_id"], end="")
+except Exception: pass
+' 2>/dev/null || true
+}
+
+# _reload_tab_by_label <workspace_id> <label> → tab_id, or empty.
+_reload_tab_by_label() {
+  herdr tab list --workspace "$1" 2>/dev/null | LABEL="$2" python3 -c '
+import sys,json,os
+try: tabs=json.load(sys.stdin)["result"]["tabs"]
+except Exception: tabs=[]
+print(next((t.get("tab_id","") for t in tabs if t.get("label")==os.environ["LABEL"]), ""), end="")
+' 2>/dev/null || true
+}
+
+# _reload_tab_create <workspace_id> <cwd> <label> → "tab_id pane_id", or empty.
+_reload_tab_create() {
+  herdr tab create --workspace "$1" --cwd "$2" --label "$3" --no-focus 2>/dev/null | python3 -c '
+import sys,json
+try: d=json.load(sys.stdin)["result"]
+except Exception: d={}
+print(d.get("tab",{}).get("tab_id",""), d.get("root_pane",{}).get("pane_id",""))
+' 2>/dev/null || true
+}
+
+# _reload_agent_pane <agent_name> [tab_id] → pane_id of the named herdr agent, or empty.
+_reload_agent_pane() {
+  herdr agent list 2>/dev/null | NAME="$1" TAB="${2:-}" python3 -c '
+import sys,json,os
+try: ag=json.load(sys.stdin)["result"]["agents"]
+except Exception: ag=[]
+name=os.environ["NAME"]; tab=os.environ.get("TAB","")
+print(next((a.get("pane_id","") for a in ag
+            if a.get("name")==name and (not tab or a.get("tab_id")==tab)), ""), end="")
+' 2>/dev/null || true
+}
+
 cmd_reload() {
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
 
-  say "${c_bold}herd reload${c_rst} — stopping watcher, re-reading config, relaunching"
+  say "${c_bold}herd reload${c_rst} — rebuilding the control room around the coordinator (watcher + backlog pane + skill)"
   say ""
 
   # Load config: gives us WORKSPACE_NAME, WORKTREES_DIR, HERD_WATCHER_LOCK, PROJECT_ROOT, etc.
@@ -648,14 +758,25 @@ cmd_reload() {
   ok "re-rendered coordinator skill → $skill"
   say ""
 
-  # 3. Relaunch the watcher: prefer a herdr pane in our workspace; degrade to background.
-  # HERD_RELOAD_SKIP_LAUNCH=1 suppresses the launch (used by hermetic tests to avoid persistent
-  # background processes in a CI/test environment where the watcher cannot run meaningfully).
+  # 3. Rebuild the control room around the coordinator: relaunch the watcher and ensure the
+  # pinned backlog pane. The coordinator tab/agent is NEVER closed or restarted — `herd reload`
+  # is typically issued FROM the coordinator, so recycling it (as coordinator.sh's full rebuild
+  # does) would kill the session that ran this command.
+  #
+  # Launch knobs (hermetic tests):
+  #   HERD_RELOAD_SKIP_LAUNCH=1         suppress every launch (herdr + background fallback)
+  #   HERD_RELOAD_SKIP_LAUNCH=fallback  suppress only the background fallback, so tests can
+  #                                     exercise the herdr path without spawning a real watcher
   local watch_script="$SCRIPTS_DIR/herd-watch.sh"
-  local launch_desc="background"
+  local backlog_script="$SCRIPTS_DIR/backlog-view.sh"
+  local watch_match="agent-watch.sh|herd-watch.sh"   # herd-watch.sh execs agent-watch.sh
+  local launch_desc="background" watch_pid="" watch_pane=""
+  local backlog_desc="not managed (herdr unavailable)"
+  local herdr_attempted=0
 
   if [ "${HERD_RELOAD_SKIP_LAUNCH:-}" = "1" ]; then
     launch_desc="skipped (HERD_RELOAD_SKIP_LAUNCH=1)"
+    backlog_desc="skipped (HERD_RELOAD_SKIP_LAUNCH=1)"
   elif command -v herdr >/dev/null 2>&1; then
     local ws=""
     ws="$(herdr workspace list 2>/dev/null | LABEL="$WORKSPACE_NAME" python3 -c \
@@ -667,38 +788,129 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
 ' 2>/dev/null || true)"
 
     if [ -n "$ws" ]; then
-      local wlabel="watch-${WORKSPACE_NAME}"
-      # Close any existing reload-watch tab so we start fresh.
-      local existing_watch=""
-      existing_watch="$(herdr tab list --workspace "$ws" 2>/dev/null | LABEL="$wlabel" python3 -c \
-'import sys,json,os
-try: d=json.load(sys.stdin)
-except Exception: d={}
-tabs=(d.get("result") or {}).get("tabs") or []
-print(next((t["tab_id"] for t in tabs if t.get("label")==os.environ.get("LABEL","")), ""))
-' 2>/dev/null || true)"
+      # Locate the coordinator anchor. Found → rebuild coordinator.sh's layout around it;
+      # missing → standalone tabs. Either way the coordinator itself is only ever read.
+      local coord_tab="" agent_pane=""
+      coord_tab="$(_reload_tab_by_label "$ws" "$HERD_TAB_COORDINATOR")"
+      [ -n "$coord_tab" ] && agent_pane="$(_reload_agent_pane "$HERD_AGENT_COORDINATOR" "$coord_tab")"
+
+      # Close any standalone watch tab from a previous reload: the watcher is re-placed
+      # below the coordinator when the control room is up, or recreated fresh below.
+      local wlabel="watch-${WORKSPACE_NAME}" existing_watch=""
+      existing_watch="$(_reload_tab_by_label "$ws" "$wlabel")"
       [ -n "$existing_watch" ] && herdr tab close "$existing_watch" >/dev/null 2>&1 || true
 
-      local created="" wTab="" wPane=""
-      created="$(herdr tab create --workspace "$ws" --cwd "$root" --label "$wlabel" --no-focus 2>/dev/null || true)"
-      if [ -n "$created" ]; then
-        read -r wTab wPane < <(printf '%s' "$created" | python3 -c \
-'import sys,json
-try: d=json.load(sys.stdin)["result"]
-except Exception: d={}
-print(d.get("tab",{}).get("tab_id",""), d.get("root_pane",{}).get("pane_id",""))
-' 2>/dev/null || true)
-      fi
-      if [ -n "${wPane:-}" ]; then
-        herdr pane run "$wPane" "bash $watch_script" >/dev/null 2>&1 || true
-        launch_desc="herdr tab $wlabel"
+      if [ -n "$agent_pane" ]; then
+        herdr_attempted=1
+        # A. Control room is up → coordinator.sh layout: watch pane BELOW the coordinator,
+        # backlog pane LEFT of it.
+        local wPane=""; wPane="$(_reload_neighbor "$agent_pane" down)"
+        if [ -n "$wPane" ]; then
+          case "$(_reload_pane_state "$wPane" "$watch_match")" in
+            BARE|RUN*) : ;;   # dead console (its watcher was killed in step 1) — reuse it
+            *) wPane="" ;;    # BUSY/GONE — never hijack someone else's pane
+          esac
+        fi
+        [ -z "$wPane" ] && wPane="$(_reload_split_pane "$agent_pane" down 0.72 "$root")"
+        if [ -n "$wPane" ]; then
+          watch_pane="$wPane"
+          if watch_pid="$(_reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match")"; then
+            launch_desc="pane below coordinator"
+          fi
+        fi
+
+        # Pinned backlog viewer (coordinator.sh's root pane).
+        local bPane="" bstate=""
+        bPane="$(_reload_neighbor "$agent_pane" left)"
+        [ -n "$bPane" ] && bstate="$(_reload_pane_state "$bPane" "backlog-view.sh")"
+        case "$bstate" in
+          RUN*)
+            backlog_desc="pane $bPane · already live ✓" ;;
+          BARE)
+            if _reload_pane_run_verified "$bPane" "bash $backlog_script" "backlog-view.sh" >/dev/null; then
+              backlog_desc="pane $bPane · relaunched ✓"
+            else
+              backlog_desc="pane $bPane · NOT visible ✗"
+              warn "backlog-view did not appear in pane $bPane — inspect it manually"
+            fi ;;
+          *)
+            # No left pane (or it is running something else): split the coordinator pane and
+            # swap positions so the new pane takes the LEFT slot — the [ backlog | coordinator ]
+            # shape coordinator.sh builds.
+            bPane="$(_reload_split_pane "$agent_pane" right 0.5 "$root")"
+            if [ -n "$bPane" ]; then
+              herdr pane swap --source-pane "$bPane" --target-pane "$agent_pane" >/dev/null 2>&1 || true
+              if _reload_pane_run_verified "$bPane" "bash $backlog_script" "backlog-view.sh" >/dev/null; then
+                backlog_desc="pane $bPane · recreated ✓"
+              else
+                backlog_desc="pane $bPane · NOT visible ✗"
+                warn "backlog-view did not appear in recreated pane $bPane"
+              fi
+            else
+              backlog_desc="FAILED to create pane ✗"
+              warn "could not create a backlog pane beside the coordinator"
+            fi ;;
+        esac
+      else
+        herdr_attempted=1
+        # B. No control room → standalone tabs (nothing safe to anchor a layout to).
+        local created="" wTab="" wPane=""
+        created="$(_reload_tab_create "$ws" "$root" "$wlabel")"
+        read -r wTab wPane <<< "$created"
+        if [ -n "${wPane:-}" ]; then
+          watch_pane="$wPane"
+          if watch_pid="$(_reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match")"; then
+            launch_desc="herdr tab $wlabel"
+          fi
+        fi
+
+        # Backlog viewer gets its own tab too; it is stateless, so recreate it fresh.
+        local blabel="backlog-${WORKSPACE_NAME}" existing_backlog="" bTab="" bPane=""
+        existing_backlog="$(_reload_tab_by_label "$ws" "$blabel")"
+        [ -n "$existing_backlog" ] && herdr tab close "$existing_backlog" >/dev/null 2>&1 || true
+        created="$(_reload_tab_create "$ws" "$root" "$blabel")"
+        read -r bTab bPane <<< "$created"
+        if [ -n "${bPane:-}" ]; then
+          if _reload_pane_run_verified "$bPane" "bash $backlog_script" "backlog-view.sh" >/dev/null; then
+            backlog_desc="tab $blabel · pane $bPane ✓"
+          else
+            backlog_desc="tab $blabel · pane $bPane · NOT visible ✗"
+            warn "backlog-view did not appear in pane $bPane (tab $blabel)"
+          fi
+        else
+          backlog_desc="FAILED to create tab $blabel ✗"
+          warn "could not create backlog tab $blabel"
+        fi
       fi
     fi
   fi
 
+  # Never leave a silent zombie: if pane verification failed, a detached watcher may still
+  # be running invisibly (it grabs the lockfile on start). Say so LOUDLY instead of silently
+  # double-spawning — the singleton in agent-watch.sh would refuse the duplicate anyway.
+  if [ "$launch_desc" = "background" ] && [ "$herdr_attempted" -eq 1 ]; then
+    local zpid=""
+    [ -f "$HERD_WATCHER_LOCK" ] && zpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    if [ -n "$zpid" ] && kill -0 "$zpid" 2>/dev/null; then
+      launch_desc="DETACHED — running, but NOT visible in pane ${watch_pane:-?}"
+      watch_pid="$zpid"
+      warn "watcher PID $zpid is RUNNING but NOT visible in pane ${watch_pane:-?} — its pane run detached from the tty; re-run 'herd reload' or kill $zpid and inspect the pane"
+    fi
+  fi
+
   if [ "$launch_desc" = "background" ]; then
-    ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="$cfg" nohup bash "$watch_script" >/dev/null 2>&1 & )
-    say "  watcher relaunched in background"
+    if [ "${HERD_RELOAD_SKIP_LAUNCH:-}" = "fallback" ]; then
+      launch_desc="NOT relaunched (fallback suppressed)"
+      warn "watcher NOT relaunched — herdr pane launch failed and the background fallback is suppressed (HERD_RELOAD_SKIP_LAUNCH=fallback)"
+    else
+      [ "$herdr_attempted" -eq 1 ] && warn "herdr pane launch failed verification — relaunching the watcher in the BACKGROUND (no visible console)"
+      ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="$cfg" nohup bash "$watch_script" >/dev/null 2>&1 & )
+      say "  watcher relaunched in background"
+      # agent-watch.sh writes its PID to the lockfile on start — bounded poll for the summary.
+      local k=0
+      while [ "$k" -lt 10 ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; k=$((k+1)); done
+      [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    fi
   fi
 
   # 4. Resolve and display the effective merge policy so the human can confirm.
@@ -712,10 +924,19 @@ print(d.get("tab",{}).get("tab_id",""), d.get("root_pane",{}).get("pane_id",""))
       esac ;;
   esac
 
+  # 5. Per-component summary — one line per rebuilt piece so the human can confirm state.
+  local wsum="$launch_desc"
+  [ -n "$watch_pid" ] && wsum="$wsum · pid $watch_pid"
+  case "$launch_desc" in
+    "pane below coordinator"|"herdr tab"*) wsum="$wsum · pane $watch_pane · visible ✓" ;;
+  esac
+
   say ""
   ok "reload complete"
   say "  workspace:     $WORKSPACE_NAME"
-  say "  watcher:       $launch_desc"
+  say "  skill:         $skill"
+  say "  watcher:       $wsum"
+  say "  backlog:       $backlog_desc"
   say "  MERGE_POLICY:  ${c_bold}$effective_policy${c_rst}"
 }
 
@@ -726,9 +947,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd init                           stand up herdkit in the current repo (interview + scout)
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
-  herd reload                         stop the watcher, re-read .herd/config, relaunch watcher
-                                      + re-render the coordinator skill; prints effective
-                                      MERGE_POLICY so you can confirm the new state
+  herd reload                         rebuild the control room around the coordinator: stop +
+                                      relaunch the watcher (pane visibility verified), ensure
+                                      the pinned backlog pane, re-render the coordinator skill;
+                                      prints a per-component summary + effective MERGE_POLICY.
+                                      Never closes the coordinator tab/agent — safe to run
+                                      from inside the coordinator
   herd backlog                        list open work items via the active backend
   herd report [--to <link>] "<sym>"   file a report on HERD_REPO (or a peer from .herd/links
                                       via --to) using HERD_REPORT_BACKEND (default: github);
