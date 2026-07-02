@@ -40,13 +40,13 @@ for share in $SHARE_LINKS; do
   link_or_die "$REPO/$share" "$DIR/$share"
 done
 
-# Pre-trust the worktree for Claude Code so agents launched with
-# --dangerously-skip-permissions don't stall on the "Is this a project you trust?"
-# interactive gate. Claude Code treats a project-level .claude/settings.json as a
-# trust marker and skips the prompt. Write a minimal one now, before the agent starts.
-# The file is gitignored (.gitignore: .claude/settings.json) — never committed.
-mkdir -p "$DIR/.claude"
-printf '{}\n' > "$DIR/.claude/settings.json"
+# Pre-trust the worktree for Claude Code so a builder agent launched here doesn't stall on the
+# interactive "Do you trust the files in this folder?" gate and die with zero commits. Trust is
+# recorded in ~/.claude.json (projects["<abs-path>"].hasTrustDialogAccepted), NOT in any
+# project-level settings file, and --dangerously-skip-permissions does not suppress the dialog in a
+# pane session — so seed the entry now, before the agent starts. See herd_pretrust_worktree in
+# herd-config.sh for the additive/atomic/backup guarantees. Best-effort: never fatal.
+herd_pretrust_worktree "$DIR"
 
 echo "✅ Worktree ready: $DIR   (branch $BRANCH, off $DEFAULT_BRANCH @ $(git -C "$REPO" rev-parse --short "$DEFAULT_BRANCH"))"
 echo "   Start an agent here:   cd $DIR && claude"
