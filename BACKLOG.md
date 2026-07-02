@@ -19,7 +19,6 @@
 
 > Build order: F1 (merge policy) first; capabilities manifest + template-sync guard as one PR; init detection + flow-preference interview as one PR; herd config last (leans on the manifest for key validation).
 
-- 🚧 **Init-time GitHub detection** *(worktree `init-github-detection`)* — `cmd_init` (bin/herd:104-284) makes zero `gh api` calls today; add a detection pass: branch protection on the default branch, required-review count, required checks, CODEOWNERS, allowed merge methods; show findings and derive safe defaults (required reviewers present ⇒ default `MERGE_POLICY=approve`, never `auto`); degrade gracefully without remote/gh.
 - 🔜 **Flow-preference interview + draft-PR flow** — New `herd init` questions → config keys: `PR_FLOW=direct|draft` (draft: lanes instruct builders `gh pr create --draft`; watcher already holds `DRAFT`, agent-watch.sh:157), `PR_READY_WHEN=builder|coordinator|human`, `LOCAL_REVIEW=none|pre-pr` (run the review gate in the worktree BEFORE the PR is public vs today's post-PR review), `MERGE_METHOD`, `DELETE_BRANCH_ON_MERGE`; thread prefs into the lane rules text (herd-quick.sh:58-61, herd-feature.sh:50-53).
 - 🔜 **`herd config` + coordinator Workflow settings mode** — `herd config list|get|set` with key validation, aware of what each change requires: watcher keys ⇒ restart watcher (pid file `.watcher-<slug>.pid`), coordinator-facing keys ⇒ re-render skill (render step at bin/herd:277-278); coordinator menu gains a 'Workflow settings' entry to view/change any workflow pref anytime and relaunch affected pieces — nothing is init-only.
 - 🔜 **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17)* — when a PR moves or renames the things that backlog items point at (file paths, function names, section headers, worktree names), affected entries dangle silently after the PR lands. The coordinator / scribe should run a reconcile pass as part of landing such PRs: diff the rename surface, identify backlog entries that reference moved things, and update or flag them so the backlog stays coherent with the live codebase.
@@ -46,6 +45,7 @@
 
 ## Recently shipped
 
+- ✅ **Init-time GitHub detection** *(PR #55)*
 - ✅ **Token efficiency free wins** *(PR #54)*
 - ✅ **Stall detector: check worktree mtimes before flagging** *(PR #52)*
 - ✅ **`herd pane <watch|backlog|coordinator>` — single-pane restart shortcuts** *(PR #53)*
@@ -55,4 +55,3 @@
 - ✅ **Pre-trust fix (PR #22) is ineffective — builders still die on the folder-trust prompt** *(PR #48)*
 - ✅ **Review-pane test leaks a real `review·test-slug` tab on machines with herdr installed** *(PR #47)*
 - ✅ **`herd reload` anchor on coordinator tab, not live agent** *(PR #46)*
-- ✅ **Reload in-place bootstrap gap (found by unexecuted live smoke)** *(PR #45)*
