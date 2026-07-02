@@ -15,6 +15,14 @@
 #
 # This file is ZERO-SECRET. API-backend credentials live in .herd/secrets (gitignored),
 # sourced separately by scribe-step.sh — never here, never in .herd/config.
+# Force UTF-8 for all python3 subcalls throughout the engine — fixes Windows cp1252
+# UnicodeEncodeError (issue #31). On Windows, piped python3 defaults stdout/stdin to the
+# system codepage (cp1252), which cannot encode non-ASCII characters present in herdr JSON
+# (workspace/tab labels with emoji 🐑) and in watch-console output (box-drawing ═).
+# PYTHONUTF8 is the PEP 540 / Python 3.7+ knob; PYTHONIOENCODING is the pre-3.7 fallback.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
 _herd_find_config() {
