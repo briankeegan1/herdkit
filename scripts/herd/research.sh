@@ -63,15 +63,16 @@ echo "🔎 queued: $REQ"
 echo "REQ_ID $REQ_ID"
 echo "report → $REPORTS/$REQ_ID.md  (fetch with: research-get.sh $REQ_ID)"
 
-# 5. Is THIS project's researcher drainer already running? Scope the check to our herdr workspace
-#    when the workspace id is known so a stale researcher in a different workspace is not reused.
-if [ -n "$_WS_ID" ]; then
-  _researcher_list="$(herdr agent list --workspace "$_WS_ID" 2>/dev/null || true)"
-else
-  _researcher_list="$(herdr agent list 2>/dev/null || true)"
-fi
-if printf '%s' "$_researcher_list" | NAME="$HERD_AGENT_RESEARCHER" python3 -c 'import sys,json,os
-sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
+# 5. Is THIS project's researcher drainer already running? Match by name AND workspace_id (when
+#    known) so a researcher in a different workspace is not reused. herdr agent list has no
+#    --workspace flag; filter client-side via the workspace_id field each agent record carries.
+if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_RESEARCHER" WS="$_WS_ID" python3 -c '
+import sys,json,os
+ws=os.environ.get("WS","")
+sys.exit(0 if any(
+  x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
+  for x in json.load(sys.stdin)["result"]["agents"]
+) else 1)'; then
   echo "🔎 researcher already running — it will drain this."; exit 0
 fi
 

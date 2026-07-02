@@ -52,15 +52,16 @@ else
   trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
 fi
 
-# 3. Is THIS project's scribe drainer already running? Scope the check to our herdr workspace
-#    when the workspace id is known so a stale scribe in a different workspace is not reused.
-if [ -n "$_WS_ID" ]; then
-  _scribe_list="$(herdr agent list --workspace "$_WS_ID" 2>/dev/null || true)"
-else
-  _scribe_list="$(herdr agent list 2>/dev/null || true)"
-fi
-if printf '%s' "$_scribe_list" | NAME="$HERD_AGENT_SCRIBE" python3 -c 'import sys,json,os
-sys.exit(0 if any(x.get("name")==os.environ["NAME"] for x in json.load(sys.stdin)["result"]["agents"]) else 1)'; then
+# 3. Is THIS project's scribe drainer already running? Match by name AND workspace_id (when known)
+#    so a scribe in a different workspace is not reused. herdr agent list has no --workspace flag;
+#    filter client-side via the workspace_id field each agent record already carries.
+if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_SCRIBE" WS="$_WS_ID" python3 -c '
+import sys,json,os
+ws=os.environ.get("WS","")
+sys.exit(0 if any(
+  x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
+  for x in json.load(sys.stdin)["result"]["agents"]
+) else 1)'; then
   echo "✍️  scribe already running — it will drain this."; exit 0
 fi
 
