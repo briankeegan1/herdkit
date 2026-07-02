@@ -10,6 +10,11 @@
 # worktree-pool / queue scratch (lives in a sibling -trees dir, never in the repo).
 *-trees/
 
+# Engine journal — append-only forensic log written to WORKTREES_DIR/.herd/ (already covered by
+# *-trees/, but named explicitly so it stays ignored even if a project keeps .herd inside the tree).
+.herd/journal.jsonl
+.herd/journal-*.jsonl
+
 # machine-local Claude Code state — never committed.
 .claude/settings.local.json
 .claude/settings.json
