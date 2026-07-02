@@ -800,29 +800,58 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
       existing_watch="$(_reload_tab_by_label "$ws" "$wlabel")"
       [ -n "$existing_watch" ] && herdr tab close "$existing_watch" >/dev/null 2>&1 || true
 
+      # Read pane registry written by coordinator.sh on creation — authoritative pane IDs
+      # that let reload refresh control-room panes in-place without geometric neighbor guesses.
+      local reg_wpane="" reg_bpane=""
+      if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
+        reg_wpane="$(awk '$1=="watch"   {print $2}' "$WORKTREES_DIR/.herd-panes")"
+        reg_bpane="$(awk '$1=="backlog" {print $2}' "$WORKTREES_DIR/.herd-panes")"
+      fi
+
       if [ -n "$agent_pane" ]; then
         herdr_attempted=1
         # A. Control room is up → coordinator.sh layout: watch pane BELOW the coordinator,
-        # backlog pane LEFT of it.
-        local wPane=""; wPane="$(_reload_neighbor "$agent_pane" down)"
-        if [ -n "$wPane" ]; then
-          case "$(_reload_pane_state "$wPane" "$watch_match")" in
-            BARE|RUN*) : ;;   # dead console (its watcher was killed in step 1) — reuse it
-            *) wPane="" ;;    # BUSY/GONE — never hijack someone else's pane
+        # backlog pane LEFT of it. Prefer registry pane IDs (written by coordinator.sh on
+        # creation) over geometric neighbor queries — registry is layout-independent.
+        local wPane="" bPane="" bstate=""
+        if [ -n "$reg_wpane" ]; then
+          case "$(_reload_pane_state "$reg_wpane" "$watch_match")" in
+            BARE|RUN*) wPane="$reg_wpane" ;;
+            *) wPane="" ;;
           esac
+        fi
+        if [ -z "$wPane" ]; then
+          wPane="$(_reload_neighbor "$agent_pane" down)"
+          if [ -n "$wPane" ]; then
+            case "$(_reload_pane_state "$wPane" "$watch_match")" in
+              BARE|RUN*) : ;;   # dead console — reuse it
+              *) wPane="" ;;    # BUSY/GONE — never hijack
+            esac
+          fi
         fi
         [ -z "$wPane" ] && wPane="$(_reload_split_pane "$agent_pane" down 0.72 "$root")"
         if [ -n "$wPane" ]; then
           watch_pane="$wPane"
-          if watch_pid="$(_reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match")"; then
+          if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
             launch_desc="pane below coordinator"
+            # Read stable pid from lockfile — process-info can return a transient fork pid.
+            local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
+            while [ "$_kk" -lt "$_lp" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do
+              sleep 0.2; _kk=$((_kk+1))
+            done
+            [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
           fi
         fi
 
-        # Pinned backlog viewer (coordinator.sh's root pane).
-        local bPane="" bstate=""
-        bPane="$(_reload_neighbor "$agent_pane" left)"
-        [ -n "$bPane" ] && bstate="$(_reload_pane_state "$bPane" "backlog-view.sh")"
+        # Pinned backlog viewer: prefer registry pane, fall back to neighbor/split.
+        if [ -n "$reg_bpane" ]; then
+          bstate="$(_reload_pane_state "$reg_bpane" "backlog-view.sh")"
+          case "$bstate" in GONE|BUSY) bPane="" ;; *) bPane="$reg_bpane" ;; esac
+        fi
+        if [ -z "$bPane" ]; then
+          bPane="$(_reload_neighbor "$agent_pane" left)"
+          [ -n "$bPane" ] && bstate="$(_reload_pane_state "$bPane" "backlog-view.sh")"
+        fi
         case "$bstate" in
           RUN*)
             backlog_desc="pane $bPane · already live ✓" ;;
@@ -834,9 +863,8 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
               warn "backlog-view did not appear in pane $bPane — inspect it manually"
             fi ;;
           *)
-            # No left pane (or it is running something else): split the coordinator pane and
-            # swap positions so the new pane takes the LEFT slot — the [ backlog | coordinator ]
-            # shape coordinator.sh builds.
+            # No usable pane: split the coordinator pane and swap so the new pane takes the
+            # LEFT slot — the [ backlog | coordinator ] shape coordinator.sh builds.
             bPane="$(_reload_split_pane "$agent_pane" right 0.5 "$root")"
             if [ -n "$bPane" ]; then
               herdr pane swap --source-pane "$bPane" --target-pane "$agent_pane" >/dev/null 2>&1 || true
@@ -851,6 +879,12 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
               warn "could not create a backlog pane beside the coordinator"
             fi ;;
         esac
+        # Update the registry so future reloads use the current (possibly recreated) pane IDs.
+        {
+          printf 'coordinator-agent %s %s\n' "$agent_pane" "$coord_tab"
+          [ -n "${bPane:-}" ] && printf 'backlog %s %s\n' "$bPane" "$coord_tab"
+          [ -n "${watch_pane:-}" ] && printf 'watch %s %s\n' "$watch_pane" "$coord_tab"
+        } > "$WORKTREES_DIR/.herd-panes"
       else
         herdr_attempted=1
         # B. No control room → standalone tabs (nothing safe to anchor a layout to).
@@ -859,8 +893,13 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
         read -r wTab wPane <<< "$created"
         if [ -n "${wPane:-}" ]; then
           watch_pane="$wPane"
-          if watch_pid="$(_reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match")"; then
+          if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
             launch_desc="herdr tab $wlabel"
+            local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
+            while [ "$_kk" -lt "$_lp" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do
+              sleep 0.2; _kk=$((_kk+1))
+            done
+            [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
           fi
         fi
 

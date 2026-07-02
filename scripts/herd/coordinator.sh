@@ -95,4 +95,13 @@ else
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ]   tab $TAB"
 fi
 
+# Record control-room pane IDs so 'herd reload' can refresh them in-place rather than
+# always creating standalone tabs. Written atomically; reload re-writes on every run.
+mkdir -p "$WORKTREES_DIR"
+{
+  printf 'coordinator-agent %s %s\n' "$AGENT_PANE" "$TAB"
+  printf 'backlog %s %s\n' "$ROOT" "$TAB"
+  [ -n "${WPANE:-}" ] && printf 'watch %s %s\n' "$WPANE" "$TAB"
+} > "$WORKTREES_DIR/.herd-panes"
+
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"

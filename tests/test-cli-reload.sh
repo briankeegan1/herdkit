@@ -353,6 +353,7 @@ _rich_reload() {
   local proj="$1" state="$2"; shift 2
   ( cd "$proj" && env PATH="$RICH:$PATH" HERDR_STATE="$state" FAKE_WS_LABEL="reloadtest" \
       HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 \
+      HERD_RELOAD_LOCKPID_POLLS=1 \
       "$@" bash "$HERD" reload 2>&1 )
 }
 
@@ -447,6 +448,91 @@ S="$T/state16"; _rich_coord_state "$S"
 touch "$S/panes/pW/noshow"     # pane run never becomes visible, and nothing grabs the lock
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (verify-failure test)"
 printf '%s' "$out" | grep -q "NOT relaunched" || fail "suppressed fallback not reported after verify failure"
+ok
+
+# ═══ pane registry path (tests 17+) ══════════════════════════════════════════
+# coordinator.sh writes $WORKTREES_DIR/.herd-panes on creation; reload reads it to
+# refresh panes in-place rather than always creating standalone tabs.
+
+# ── 17. registry panes used in-place; no neighbor query issued ───────────────
+# Pre-populate .herd-panes pointing to pW_r (watch) and pL_r (backlog) — panes
+# that differ from the neighbor-derived pW/pL. If reload reads the registry, it
+# runs the scripts in pW_r / pL_r and never queries pane neighbor at all.
+P="$T/p17"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state17"; _rich_coord_state "$S"
+# Create the registry-specified panes as BARE panes in the stub.
+mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"
+P17_REAL="$(cd "$P" && pwd -P)"
+cat > "$P17_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL_r tC
+watch pW_r tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (registry in-place test)"
+grep -q "pane run pW_r" "$S/log" || fail "watch script not run in registry-specified watch pane"
+grep -q "pane run pL_r" "$S/log" || fail "backlog script not run in registry-specified backlog pane"
+grep -q "pane neighbor" "$S/log" && fail "neighbor query issued when registry panes were usable" || true
+ok
+
+# ── 18. registry watch pane GONE → falls back to neighbor/split; backlog from registry ─
+# The watch pane in the registry no longer exists (pane dir absent = GONE); the
+# registered backlog pane (pL_r) still exists and should be used without a neighbor query.
+P="$T/p18"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state18"; _rich_coord_state "$S"
+mkdir -p "$S/panes/pL_r"   # pW_gone intentionally absent — GONE
+P18_REAL="$(cd "$P" && pwd -P)"
+cat > "$P18_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL_r tC
+watch pW_gone tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (registry watch pane gone)"
+# pW_gone is GONE → reload falls through to neighbor (pA.down=pW) or splits; either way
+# the watch ends up in the coordinator tab.
+printf '%s' "$out" | grep -q "pane below coordinator" \
+  || fail "watch not placed in coordinator tab after registry pane was gone"
+# backlog from registry (pL_r) used without a neighbor query.
+grep -q "pane run pL_r" "$S/log" \
+  || fail "backlog not run in registry pane when registry backlog pane was still valid"
+ok
+
+# ── 19. coordinator tab gone with registry present → standalone tabs ──────────
+# The registry exists but the coordinator tab no longer appears in herdr tab list.
+# Reload must fall through to standalone tabs (no coordinator to anchor to).
+P="$T/p19"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state19"
+mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
+# No coordinator tab in state; agent list is empty → agent_pane lookup fails.
+printf '{"result":{"agents":[]}}\n' > "$S/agents.json"
+P19_REAL="$(cd "$P" && pwd -P)"
+mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"
+cat > "$P19_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL_r tC
+watch pW_r tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (coordinator tab gone)"
+printf '%s' "$out" | grep -q "herdr tab watch-reloadtest" \
+  || fail "expected standalone watch tab when coordinator tab is gone"
+ok
+
+# ── 20. pid in summary comes from lockfile, not transient process-info ────────
+# FAKE_RUN_WRITES_LOCK makes the stub write a specific pid to the lockfile during
+# pane run. The summary must show that pid — not the 5151 returned by process-info —
+# confirming the fix for the transient-fork-pid bug.
+P="$T/p20"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state20"; _rich_coord_state "$S"
+P20_REAL="$(cd "$P" && pwd -P)"
+lockfile="$P20_REAL/trees/.watcher-reloadtest.pid"
+FAKE_PID="55555"
+out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$FAKE_PID")" \
+  || fail "reload failed (lockfile pid test)"
+printf '%s' "$out" | grep -q "pid $FAKE_PID" \
+  || fail "summary pid should come from lockfile (expected pid $FAKE_PID, got: $(printf '%s' "$out" | grep pid || echo none))"
 ok
 
 echo "ALL PASS ($pass checks)"
