@@ -30,6 +30,6 @@ DENY_PATHS=".herd/secrets"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
 COORDINATOR_CMD="/coordinator"
 WATCHER_AUTOMERGE="true"
-# approve: watcher runs all gates but waits for a sha-keyed approval (herd-approve.sh) before merging.
-MERGE_POLICY="approve"
+# auto: watcher merges on its own once all gates (healthcheck + review) pass.
+MERGE_POLICY="auto"
 HERD_REPO="briankeegan1/herdkit"
