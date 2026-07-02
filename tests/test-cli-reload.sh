@@ -308,15 +308,57 @@ PY
     pid="p$(next_id)"; mkdir -p "$S/panes/$pid"; printf '%s' "$tid" > "$S/panes/$pid/tab"
     printf '{"result":{"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' "$tid" "$pid" ;;
   "tab close")
-    rm -f "$S/tabs/${3:-}"; printf '{"result":{}}\n' ;;
+    tid="${3:-}"; rm -f "$S/tabs/$tid"
+    # Closing a tab removes its panes (mirrors herdr: the panes go with the tab).
+    for pd in "$S"/panes/*; do
+      [ -d "$pd" ] || continue
+      [ -f "$pd/tab" ] && [ "$(cat "$pd/tab")" = "$tid" ] && rm -rf "$pd"
+    done
+    printf '{"result":{}}\n' ;;
   "agent list")
     if [ -f "$S/agents.json" ]; then cat "$S/agents.json"; else printf '{"result":{"agents":[]}}\n'; fi ;;
+  "pane list")
+    # Enumerate every pane with its current tab_id (from $S/panes/<id>/tab). --workspace is
+    # accepted and ignored; cmd_reload filters by tab_id itself.
+    python3 - "$S" <<'PY'
+import sys,os,json
+S=sys.argv[1]; d=os.path.join(S,"panes")
+panes=[]
+for p in sorted(os.listdir(d)):
+    tf=os.path.join(d,p,"tab")
+    tab=open(tf).read().strip() if os.path.exists(tf) else ""
+    panes.append({"pane_id":p,"tab_id":tab})
+print(json.dumps({"result":{"panes":panes}}))
+PY
+    ;;
   "pane run")
     p="${3:-}"; mkdir -p "$S/panes/$p"; printf '%s' "${4:-}" > "$S/panes/$p/cmd"
     if [ -n "${FAKE_RUN_WRITES_LOCK:-}" ]; then
       printf '%s\n' "${FAKE_RUN_WRITES_LOCK##*:}" > "${FAKE_RUN_WRITES_LOCK%:*}"
     fi
     printf '{"result":{}}\n' ;;
+  "pane close")
+    rm -rf "$S/panes/${3:-}"; printf '{"result":{}}\n' ;;
+  "pane move")
+    # Forms: pane move <pane> --tab T --split D --target-pane P --ratio R --no-focus
+    #        pane move <pane> --new-tab --no-focus
+    p="${3:-}"; tgt_tab=""; new_tab=0; shift 3 2>/dev/null || shift $#
+    while [ $# -gt 0 ]; do case "$1" in
+      --tab) tgt_tab="${2:-}"; shift 2 ;;
+      --new-tab) new_tab=1; shift ;;
+      *) shift ;;
+    esac; done
+    mkdir -p "$S/panes/$p"
+    cur=""; [ -f "$S/panes/$p/tab" ] && cur="$(cat "$S/panes/$p/tab")"
+    if [ "$new_tab" -eq 1 ]; then
+      tid="t$(next_id)"; printf 'temp-move' > "$S/tabs/$tid"; printf '%s' "$tid" > "$S/panes/$p/tab"
+      printf '{"result":{"changed":true}}\n'
+    elif [ -n "$tgt_tab" ] && [ "$cur" = "$tgt_tab" ]; then
+      printf '{"result":{"changed":false,"reason":"same_tab"}}\n'
+    else
+      printf '%s' "$tgt_tab" > "$S/panes/$p/tab"
+      printf '{"result":{"changed":true}}\n'
+    fi ;;
   "pane process-info")
     p="${4:-}"
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
@@ -336,7 +378,9 @@ PY
       printf '{"result":{"neighbor":{"pane_id":"%s"}}}\n' "$p"
     fi ;;
   "pane split")
-    p="p$(next_id)"; mkdir -p "$S/panes/$p"
+    # New pane inherits the split target's tab (positional target is $3).
+    tgt="${3:-}"; p="p$(next_id)"; mkdir -p "$S/panes/$p"
+    if [ -n "$tgt" ] && [ -f "$S/panes/$tgt/tab" ]; then cp "$S/panes/$tgt/tab" "$S/panes/$p/tab"; fi
     printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$p" ;;
   "pane swap")
     printf '{"result":{}}\n' ;;
@@ -359,27 +403,41 @@ _rich_reload() {
 
 # _rich_coord_state STATE — coordinator control-room fixture: tab tC labeled as the
 # coordinator, agent pane pA, bare backlog pane pL left of it, bare watch pane pW below.
+# All three panes carry tab=tC so the coordinator-tab SNAPSHOT (pane list) sees them.
 _rich_coord_state() {
   local S="$1"
   mkdir -p "$S/tabs" "$S/panes/pA" "$S/panes/pL" "$S/panes/pW" "$S/neighbors"
   printf 'coordinator-reloadtest' > "$S/tabs/tC"
   printf 'tC' > "$S/panes/pA/tab"
+  printf 'tC' > "$S/panes/pL/tab"
+  printf 'tC' > "$S/panes/pW/tab"
   printf 'pL' > "$S/neighbors/pA.left"
   printf 'pW' > "$S/neighbors/pA.down"
   printf '%s\n' '{"result":{"agents":[{"name":"coordinator-reloadtest","pane_id":"pA","tab_id":"tC","workspace_id":"w1"}]}}' \
     > "$S/agents.json"
 }
 
-# ── 11. herdr path, no coordinator → standalone watch + backlog tabs, verified ─
+# ── 11. no coordinator tab → build ONE canonical control room (never standalone tabs) ─
+# When the coordinator tab is entirely gone (e.g. run from a brand-new external terminal with
+# no control room up), reload builds the full canonical tab shape [ backlog | coordinator ⟂
+# watch ] in a SINGLE coordinator-labelled tab. It never creates stray watch-*/backlog-* tabs,
+# and — per its invariant — never starts the coordinator agent; that pane is left with a hint.
 P="$T/p11"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state11"
-out="$(_rich_reload "$P" "$S")" || fail "reload failed (herdr standalone path)"
-printf '%s' "$out" | grep -q "herdr tab watch-reloadtest" || fail "watcher not placed in a standalone watch tab"
-printf '%s' "$out" | grep -q "visible ✓" || fail "watcher visibility not verified/reported"
-printf '%s' "$out" | grep -q "tab backlog-reloadtest" || fail "backlog not placed in a standalone tab"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (canonical rebuild path)"
+printf '%s' "$out" | grep -q "building a fresh canonical control room" || fail "did not announce a canonical rebuild"
+grep -q "tab create .*--label coordinator-reloadtest" "$S/log" || fail "coordinator tab not created"
+grep -q "tab create .*--label watch-reloadtest" "$S/log" && fail "created a stray standalone watch tab" || true
+grep -q "tab create .*--label backlog-reloadtest" "$S/log" && fail "created a stray standalone backlog tab" || true
 grep -rl "herd-watch.sh" "$S/panes" >/dev/null || fail "no pane received the watch script"
 grep -rl "backlog-view.sh" "$S/panes" >/dev/null || fail "no pane received backlog-view.sh"
+printf '%s' "$out" | grep -q "start it yourself" || fail "missing coordinator-agent restart hint"
+# Registry written from the observed rebuilt panes.
+P11_REAL="$(cd "$P" && pwd -P)"
+grep -q "coordinator-agent" "$P11_REAL/trees/.herd-panes" || fail "registry missing coordinator-agent row"
+grep -q "^watch "   "$P11_REAL/trees/.herd-panes" || fail "registry missing watch row"
+grep -q "^backlog " "$P11_REAL/trees/.herd-panes" || fail "registry missing backlog row"
 ok
 
 # ── 12. coordinator layout: watch below + backlog left reused; coordinator untouched ─
@@ -454,15 +512,16 @@ ok
 # coordinator.sh writes $WORKTREES_DIR/.herd-panes on creation; reload reads it to
 # refresh panes in-place rather than always creating standalone tabs.
 
-# ── 17. registry panes used in-place; no neighbor query issued ───────────────
-# Pre-populate .herd-panes pointing to pW_r (watch) and pL_r (backlog) — panes
-# that differ from the neighbor-derived pW/pL. If reload reads the registry, it
-# runs the scripts in pW_r / pL_r and never queries pane neighbor at all.
+# ── 17. registry panes adopted in-place; no duplicate pane/tab created ─────────
+# Pre-populate .herd-panes pointing to pW_r (watch) and pL_r (backlog) — panes that differ
+# from the neighbour-derived pW/pL. Reload must ADOPT the registry panes (run the scripts in
+# pW_r / pL_r) and never split a fresh duplicate or create a tab. (A read-only geometry
+# neighbour check may still run — it is the SPLIT that would strand a duplicate pane.)
 P="$T/p17"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state17"; _rich_coord_state "$S"
-# Create the registry-specified panes as BARE panes in the stub.
-mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"
+# Create the registry-specified panes as BARE panes in the stub, tagged into the coord tab.
+mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"; printf 'tC' > "$S/panes/pW_r/tab"; printf 'tC' > "$S/panes/pL_r/tab"
 P17_REAL="$(cd "$P" && pwd -P)"
 cat > "$P17_REAL/trees/.herd-panes" <<REG
 coordinator-agent pA tC
@@ -472,7 +531,8 @@ REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (registry in-place test)"
 grep -q "pane run pW_r" "$S/log" || fail "watch script not run in registry-specified watch pane"
 grep -q "pane run pL_r" "$S/log" || fail "backlog script not run in registry-specified backlog pane"
-grep -q "pane neighbor" "$S/log" && fail "neighbor query issued when registry panes were usable" || true
+grep -q "pane split" "$S/log" && fail "split a duplicate pane when registry panes were usable" || true
+grep -q "tab create" "$S/log" && fail "created a tab when registry panes were usable" || true
 ok
 
 # ── 18. registry watch pane GONE → falls back to neighbor/split; backlog from registry ─
@@ -498,25 +558,30 @@ grep -q "pane run pL_r" "$S/log" \
   || fail "backlog not run in registry pane when registry backlog pane was still valid"
 ok
 
-# ── 19. coordinator tab gone with registry present → standalone tabs ──────────
-# The registry exists but the coordinator tab no longer appears in herdr tab list.
-# Reload must fall through to standalone tabs (no coordinator to anchor to).
+# ── 19. coordinator tab gone with STALE registry → canonical rebuild, not standalone ─
+# The registry exists but the coordinator tab no longer appears in herdr tab list (its panes
+# are gone too). A stale registry must NOT resurrect standalone tabs: reload rebuilds the full
+# canonical control room in one coordinator tab, ignoring the dead registry pane IDs.
 P="$T/p19"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state19"
 mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
-# No coordinator tab in state; agent list is empty → agent_pane lookup fails.
+# No coordinator tab in state; agent list is empty → no anchor from the live roster.
 printf '{"result":{"agents":[]}}\n' > "$S/agents.json"
 P19_REAL="$(cd "$P" && pwd -P)"
-mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"
 cat > "$P19_REAL/trees/.herd-panes" <<REG
-coordinator-agent pA tC
-backlog pL_r tC
-watch pW_r tC
+coordinator-agent pA_dead tC
+backlog pL_dead tC
+watch pW_dead tC
 REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (coordinator tab gone)"
-printf '%s' "$out" | grep -q "herdr tab watch-reloadtest" \
-  || fail "expected standalone watch tab when coordinator tab is gone"
+printf '%s' "$out" | grep -q "building a fresh canonical control room" \
+  || fail "stale registry: expected a canonical rebuild when the coordinator tab is gone"
+grep -q "tab create .*--label coordinator-reloadtest" "$S/log" \
+  || fail "coordinator tab not rebuilt when tab was gone"
+grep -q "tab create .*--label watch-reloadtest" "$S/log" \
+  && fail "resurrected a standalone watch tab from a stale registry" || true
+grep -rl "herd-watch.sh" "$S/panes" >/dev/null || fail "watcher not placed after rebuild"
 ok
 
 # ── 20. pid in summary comes from lockfile, not transient process-info ────────
@@ -600,23 +665,24 @@ splits_after_2="$(grep -c "pane split" "$S/log" 2>/dev/null || true)"
   || fail "second reload split new panes (pane split count: $splits_after_1 → $splits_after_2)"
 ok
 
-# ── 23. standalone-tab path writes registry ───────────────────────────────────
-# When coordinator tab is absent, reload takes the standalone-tab path (path B). It must
-# write .herd-panes so the second reload (or a future path-A reload) can reuse those IDs.
+# ── 23. canonical-rebuild path writes registry from the OBSERVED rebuilt panes ─────
+# When the coordinator tab is absent, reload rebuilds it and must write .herd-panes with the
+# coordinator-agent / backlog / watch pane IDs it actually created — the panes that received
+# the scripts — so the next reload adopts them in-place.
 P="$T/p23"; mkdir "$P"
 _make_project "$P" "reloadtest"
 P23_REAL="$(cd "$P" && pwd -P)"
 S="$T/state23"
 mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
-# No coordinator tab; empty agent list → forces standalone-tab path.
+# No coordinator tab; empty agent list → forces the canonical-rebuild path.
 printf '{"result":{"agents":[]}}\n' > "$S/agents.json"
-out="$(_rich_reload "$P" "$S")" || fail "reload failed (standalone-tab registry test)"
-# Standalone path must have written the registry.
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (canonical-rebuild registry test)"
 [ -f "$P23_REAL/trees/.herd-panes" ] \
-  || fail "standalone path did not write .herd-panes"
+  || fail "canonical-rebuild path did not write .herd-panes"
 reg="$(cat "$P23_REAL/trees/.herd-panes")"
-printf '%s' "$reg" | grep -q "watch"   || fail "standalone registry missing watch row"
-printf '%s' "$reg" | grep -q "backlog" || fail "standalone registry missing backlog row"
+printf '%s' "$reg" | grep -q "coordinator-agent" || fail "registry missing coordinator-agent row"
+printf '%s' "$reg" | grep -q "watch"   || fail "registry missing watch row"
+printf '%s' "$reg" | grep -q "backlog" || fail "registry missing backlog row"
 # The pane IDs in the registry must be the ones that actually received the scripts.
 watch_pane_id="$(awk '$1=="watch"  {print $2}' "$P23_REAL/trees/.herd-panes")"
 backlog_pane_id="$(awk '$1=="backlog" {print $2}' "$P23_REAL/trees/.herd-panes")"
@@ -624,6 +690,113 @@ backlog_pane_id="$(awk '$1=="backlog" {print $2}' "$P23_REAL/trees/.herd-panes")
   || fail "registry watch pane did not receive the watch script"
 [ -n "$backlog_pane_id" ] && grep -q "backlog-view.sh" "$S/panes/$backlog_pane_id/cmd" 2>/dev/null \
   || fail "registry backlog pane did not receive backlog-view.sh"
+ok
+
+# ═══ convergence tests (tests 24+) — reach the canonical state from ANY context ══
+# The anchor bug: the coordinator tab, its panes, and the registry are all intact, but the
+# coordinator claude was Ctrl+C'd so `herdr agent list` shows no agent in the tab. Reload must
+# still rebuild INSIDE the coordinator tab (adopting the registry anchor) — never fall through
+# to standalone tabs — and leave a hint to restart the agent.
+
+# ── 24. run-from-bare-shell: coordinator tab present, ZERO live agents, registry intact ─
+P="$T/p24"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P24_REAL="$(cd "$P" && pwd -P)"
+S="$T/state24"; _rich_coord_state "$S"
+printf '{"result":{"agents":[]}}\n' > "$S/agents.json"   # claude Ctrl+C'd — no live agent
+printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"     # backlog viewer still running
+cat > "$P24_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL tC
+watch pW tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (bare-shell no-agent path)"
+grep -q "tab create" "$S/log" && fail "no-agent reload created a tab (must rebuild in coordinator tab)" || true
+grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null \
+  || fail "watch not (re)launched in the coordinator-tab watch pane"
+grep -q "pane run pA" "$S/log" && fail "reload ran a command in the coordinator (anchor) pane" || true
+grep -q "pane run pL" "$S/log" && fail "reload re-ran the still-live backlog viewer" || true
+printf '%s' "$out" | grep -q "start it yourself" || fail "missing restart hint for the dead coordinator agent"
+[ -f "$S/tabs/tC" ] || fail "coordinator tab was destroyed"
+# Registry preserved with coordinator-tab pane IDs.
+grep -q "^coordinator-agent pA tC" "$P24_REAL/trees/.herd-panes" || fail "registry coordinator-agent row not preserved"
+grep -q "^watch pW tC"   "$P24_REAL/trees/.herd-panes" || fail "registry watch row not updated to coord-tab pane"
+grep -q "^backlog pL tC" "$P24_REAL/trees/.herd-panes" || fail "registry backlog row not preserved"
+ok
+
+# ── 25. run-with-live-agent / external terminal: adopt, coordinator pane never hijacked ─
+P="$T/p25"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state25"; _rich_coord_state "$S"
+printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"   # live backlog
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (live-agent adopt path)"
+grep -q "pane run pA" "$S/log" && fail "reload wrote into the live coordinator pane" || true
+grep -q "tab create" "$S/log" && fail "reload created a tab when the control room was up" || true
+grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watcher not relaunched below coordinator"
+printf '%s' "$out" | grep -q "already live ✓" || fail "live backlog not adopted"
+printf '%s' "$out" | grep -q "start it yourself" && fail "printed a restart hint while the agent was live" || true
+ok
+
+# ── 26. watch-pane-spanning-bottom geometry repair via re-parent (bounce out/in) ─
+# The watch pane spans the full bottom (it is the downward neighbour of BOTH the backlog and
+# the coordinator), robbing the backlog of its full-height left column. Reload must re-parent
+# it BELOW the coordinator. A same-tab move is a no-op, so the recipe bounces it out to a temp
+# tab (--new-tab) and back (--target-pane pA).
+P="$T/p26"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state26"; _rich_coord_state "$S"
+printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"   # live backlog
+printf 'pW' > "$S/neighbors/pL.down"                    # watch spans below the backlog too
+cat > "$(cd "$P" && pwd -P)/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL tC
+watch pW tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (geometry repair path)"
+grep -q "pane move pW --new-tab" "$S/log" || fail "spanning watch pane not bounced out for re-parenting"
+grep -q "pane move pW --tab tC --split down --target-pane pA" "$S/log" \
+  || fail "watch pane not re-parented below the coordinator"
+ok
+
+# ── 27. duplicate backlog viewer adoption: one adopted, the other closed ──────────
+# A stale registry + missed neighbour query once split a SECOND backlog-view pane beside a
+# still-live one in the same tab. Reload must adopt one and CLOSE the duplicate — never leave
+# two viewers, never split a third.
+P="$T/p27"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state27"; _rich_coord_state "$S"
+mkdir -p "$S/panes/pD"; printf 'tC' > "$S/panes/pD/tab"
+printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"   # viewer 1
+printf 'bash /x/backlog-view.sh' > "$S/panes/pD/cmd"   # viewer 2 (duplicate)
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (duplicate backlog test)"
+closed="$(grep -c "pane close" "$S/log" 2>/dev/null || true)"
+[ "$closed" -eq 1 ] || fail "expected exactly one duplicate backlog pane closed, got $closed"
+grep -q "pane split" "$S/log" && fail "split a new backlog pane when two already existed" || true
+# Exactly one backlog viewer pane survives.
+survivors=0
+for pd in "$S"/panes/*; do
+  [ -f "$pd/cmd" ] && grep -q "backlog-view.sh" "$pd/cmd" 2>/dev/null && survivors=$((survivors+1))
+done
+[ "$survivors" -eq 1 ] || fail "expected exactly one surviving backlog viewer, got $survivors"
+ok
+
+# ── 28. stray standalone tabs folded back into the coordinator tab ────────────────
+# Earlier bad reloads left watch-<ws>/backlog-<ws> standalone tabs. Reload must close them and
+# re-establish both roles inside the coordinator tab.
+P="$T/p28"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state28"; _rich_coord_state "$S"
+# Stray standalone tabs with their own panes.
+printf 'watch-reloadtest'   > "$S/tabs/tW"; mkdir -p "$S/panes/pSW"; printf 'tW' > "$S/panes/pSW/tab"; printf 'bash /x/herd-watch.sh' > "$S/panes/pSW/cmd"
+printf 'backlog-reloadtest' > "$S/tabs/tB"; mkdir -p "$S/panes/pSB"; printf 'tB' > "$S/panes/pSB/tab"; printf 'bash /x/backlog-view.sh' > "$S/panes/pSB/cmd"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (stray fold-back test)"
+grep -q "tab close tW" "$S/log" || fail "stray watch tab not closed"
+grep -q "tab close tB" "$S/log" || fail "stray backlog tab not closed"
+[ ! -f "$S/tabs/tW" ] || fail "stray watch tab still present after fold-back"
+[ ! -f "$S/tabs/tB" ] || fail "stray backlog tab still present after fold-back"
+grep -q "herd-watch.sh"  "$S/panes/pW/cmd" 2>/dev/null || fail "watch role not re-established in coordinator tab"
+grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog role not re-established in coordinator tab"
+[ -f "$S/tabs/tC" ] || fail "coordinator tab was closed during fold-back"
 ok
 
 echo "ALL PASS ($pass checks)"
