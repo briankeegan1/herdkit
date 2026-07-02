@@ -35,14 +35,15 @@
 #       REVIEW: PASS
 #       REVIEW: BLOCK — <one-line reason>
 #       REVIEW: INFRA-FAIL — <one-line reason>   (transient; watcher retries, never caches)
-# The watcher merges ONLY on PASS. On BLOCK (or ANY failure to obtain a parseable verdict) it must
-# NOT merge — and this script DEFAULTS TO BLOCK when uncertain: if the reviewer runs but prints no
-# verdict, we emit `REVIEW: BLOCK — …` AND post a fallback PR comment. INFRA-FAIL is DISTINCT from
-# BLOCK: it means the reviewer COULD NOT RUN (log-alloc failure, claude crash with no output, or
-# this process being SEVERED mid-review by SIGTERM/SIGPIPE — a trap converts that death into an
-# INFRA-FAIL report), not that it found a defect. The watcher must NOT persist INFRA-FAIL to the
-# review ledger — it surfaces "review errored · will retry" and retries next cycle. Exit status:
-# 0 = PASS, 1 = BLOCK (genuine finding or default-to-block), 2 = INFRA-FAIL (transient; retry).
+# The watcher merges ONLY on PASS. A BLOCK is a REVIEWER-BACKED refusal — a genuine finding the
+# reviewer both printed AND (best-effort) posted as a PR comment; only these are cached against the
+# sha and only these may auto-refix a builder. INFRA-FAIL is DISTINCT from BLOCK: the reviewer COULD
+# NOT reach a verdict — log-alloc failure, claude crash/EMPTY output, exit rc=0 WITHOUT a verdict
+# line, or this process being SEVERED mid-review by SIGTERM/SIGPIPE (a trap converts that death into
+# an INFRA-FAIL report). Crucially we NO LONGER default a no-verdict run to BLOCK: an infrastructural
+# death must never masquerade as a refused verdict. The watcher must NOT persist INFRA-FAIL to the
+# review ledger — it surfaces "review infra failed (no verdict) · retrying (k/N)" and re-dispatches
+# next cycle (bounded). Exit status: 0 = PASS, 1 = BLOCK (genuine reviewer finding), 2 = INFRA-FAIL.
 #
 # RESULT FILE (background dispatch — the verdict-file contract shared with Review pane v2):
 # when $HERD_REVIEW_RESULT_FILE is set, the SAME verdict line is also written there ATOMICALLY
@@ -65,6 +66,17 @@
 #   herd-review.sh 57 dividend-history
 # Or driven by agent-watch.sh as the pre-merge gate.
 set -u
+
+# ── Distinctive argv0 so kill-by-pattern sweeps can EXCLUDE the reviewer chain ─────────────────
+# A stray `pkill -f agent-watch.sh` (or a builder testing kill logic) must never sever an in-flight
+# review — a severed review used to cache a bogus BLOCK against the sha. We re-exec ourselves ONCE
+# under a `herd-review-gate-<pr>` argv0 so the reviewer process (and its whole chain) is unmistakably
+# NOT the watcher, and so sweeps can filter it out by name. The guard var makes the re-exec idempotent.
+# Best-effort: if `exec -a` is unavailable we simply continue under the original name.
+if [ "${_HERD_REVIEW_ARGV0:-}" != "1" ] && command -v bash >/dev/null 2>&1; then
+  export _HERD_REVIEW_ARGV0=1
+  exec -a "herd-review-gate-${1:-?}" bash "$0" "$@" || true
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -150,20 +162,10 @@ _mark_review_done() {
   [ -n "${ROOT:-}" ] && herdr pane rename "$ROOT" "$pane_label" >/dev/null 2>&1 || true
 }
 
-# emit_block <reason> — DEFAULT-TO-BLOCK exit. Posts a fallback PR comment (best-effort) so the
-# watcher can always rely on "a comment was posted", then prints the canonical BLOCK verdict and
-# exits 1. Used when the reviewer RAN but we cannot trust a PASS (no verdict, uncertain outcome).
-emit_block() {
-  local reason="$1"
-  gh pr comment "$PR" --body "🔬 **Pre-merge review gate — BLOCKED.** ${reason} Not merged; needs a human look." >/dev/null 2>&1 || true
-  _mark_review_done BLOCK
-  _emit_verdict "REVIEW: BLOCK — ${reason}"
-  exit 1
-}
-
 # emit_infra_fail <reason> — TRANSIENT infrastructure failure. The reviewer COULD NOT RUN; this is
 # NOT a finding. Prints REVIEW: INFRA-FAIL (exit 2) so the watcher knows NOT to cache the result —
-# it will surface "review errored · will retry" and re-attempt next cycle. Does NOT post a PR
+# it will surface "review infra failed (no verdict) · retrying (k/N)" and re-attempt next cycle
+# (bounded by the retry cap). Does NOT post a PR
 # comment (no finding to report; a comment on every retry would be spammy). Kills any detached
 # agent pane first so it cannot outlive the gate and overwrite the INFRA-FAIL verdict.
 emit_infra_fail() {
@@ -377,7 +379,11 @@ for line in sys.stdin:
 fi
 
 # Common verdict handling — same exit contract regardless of whether we used agent-pane or headless.
-# No verdict at all → default to BLOCK.
+# A parseable PASS/BLOCK is the reviewer's genuine, finding-backed verdict. NO verdict at all is an
+# INFRASTRUCTURE failure (the reviewer ran but never reached a conclusion — killed mid-run, buffered
+# output lost, or exited rc=0 without printing the line), NOT a refused verdict: it must be RETRIED,
+# never cached as a sticky BLOCK. (This was the 2026-07-02 rc0-no-verdict bug: a default BLOCK got
+# cached against the sha and even bounced the builder on a "fix" prompt with nothing actionable.)
 case "$verdict_line" in
   "REVIEW: PASS")
     _mark_review_done PASS
@@ -390,6 +396,6 @@ case "$verdict_line" in
     exit 1
     ;;
   *)
-    emit_block "reviewer produced no parseable verdict (defaulting to BLOCK)"
+    emit_infra_fail "reviewer produced no parseable verdict (rc=0, no REVIEW line) — infrastructure failure, not a block; retrying"
     ;;
 esac
