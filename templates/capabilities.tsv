@@ -1,0 +1,46 @@
+name	kind	description	when_to_surface
+herd init	command	Stand up herdkit in a project: scout, interview, write .herd/config, render coordinator skill	Onboarding a new project to the herd workflow for the first time
+herd upgrade	command	Bump HERD_VERSION and re-render the coordinator skill preserving all .herd/config answers	After a herdkit engine update or when the coordinator template changes
+herd render	command	Re-render only the coordinator skill from the current .herd/config without bumping version	When only the template changed and no version bump is needed
+herd backlog	command	List open work items via the active SCRIBE_BACKEND (file/github/linear) in a uniform line shape	Any time the coordinator needs the current open work set regardless of backend
+herd report [--to <link>] "<symptom>"	command	File a cross-repo issue on HERD_REPO or a peer from .herd/links via --to; deduplicates first	When a HERD-ENGINE bug needs to escalate to the herdkit repo or a registered peer
+herd link list	command	List peer repos registered in .herd/links with their backend and routing target	When reviewing cross-repo filing targets or confirming link names for herd report --to
+herd-feature.sh	lane	Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR	App-facing changes where a running preview aids development; APP_PREVIEW_CMD must be set
+herd-quick.sh	lane	Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR	Trivial or non-app changes: scripts, docs, config, engine fixes; no APP_PREVIEW_CMD required
+herd-resolve.sh	lane	Isolated conflict resolver: merges default branch into worktree, fixes conflicts, verifies, pushes or escalates	When the watcher surfaces a CONFLICTING PR that cannot auto-resolve
+herd-approve.sh	lane	Approval entry-point for MERGE_POLICY=approve: list gate-passed PRs and write sha-keyed approval records	When MERGE_POLICY=approve and a PR has passed all gates but needs coordinator sign-off before watcher merges
+dep-watcher.sh	lane	Polls .herd/deps for blocked-on upstream PRs; transitions items to ready when the upstream PR merges	When .herd/deps exists and features are waiting on a peer-repo PR to merge first
+coordinator.sh	lane	Launches the two-pane herd control room: backlog viewer pane and agent-watch status pane	To start or restart the herd control room for a project
+research.sh	lane	Enqueue a research question on the async research lane; returns REQ_ID instantly without blocking	When the coordinator needs to look into the repo without occupying its own context window
+research-get.sh	lane	Fetch a completed research report by REQ_ID; prints PENDING if the drainer has not filed it yet	After enqueueing research with research.sh, to retrieve the result when needed
+scribe.sh	lane	Enqueue a backlog change; a single async drainer applies it with git pull plus targeted edit so no clobber occurs	Any time the coordinator updates the backlog — never edit BACKLOG_FILE directly
+agent-watch.sh	lane	Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs	Runs continuously in the watcher pane; coordinator checks its verdicts for blocked or failed PRs
+herd-review.sh	lane	Adversarial pre-merge correctness gate invoked by the watcher before any merge	Automatically invoked by agent-watch.sh; coordinator surfaces CODE failures back to the sub-agent
+PROJECT_ROOT	config	Absolute path to the project git root; all scripts derive paths from this value	Always required; set by herd init; must point to the repo root
+WORKTREES_DIR	config	Directory where feature worktrees are created; must be a sibling of PROJECT_ROOT and never committed	Always required; must exist outside the project repo before lanes are used
+DEFAULT_BRANCH	config	Remote/branch to fork from and merge PRs into (e.g. origin/main)	Always required; controls PR targets and the scribe git pull/push destination
+WORKSPACE_NAME	config	Human-readable project label used in coordinator title, herdr agent names, and singleton identifiers	Always required; two projects sharing one herdr instance must have distinct names
+BACKLOG_FILE	config	Repo-relative path to the backlog file (default: BACKLOG.md)	Used by the file and changelog backends; can be omitted when SCRIBE_BACKEND=github or linear
+SCRIBE_BACKEND	config	Work-tracker backend adapter: file | github | linear | changelog	Set when items are tracked in GitHub Issues or Linear instead of a markdown file
+SHARE_LINKS	config	Space-separated dirs to symlink into each new worktree (e.g. data .venv)	When worktrees need large shared dirs that should not be duplicated on disk
+MODEL_COORDINATOR	config	Claude model for the coordinator agent (default: claude-opus-4-8)	Override to trade cost for quality on coordination tasks
+MODEL_FEATURE	config	Claude model for full feature lane agents (default: claude-opus-4-8)	Override when a different model tier is preferred for feature implementation
+MODEL_QUICK	config	Claude model for quick lane agents (default: claude-sonnet-4-6)	Override for lightweight task agents
+MODEL_SCRIBE	config	Claude model for the async backlog scribe drainer (default: claude-sonnet-4-6)	Override for backlog editing tasks
+MODEL_RESEARCH	config	Claude model for the async researcher drainer (default: claude-sonnet-4-6)	Override for repo research tasks
+MODEL_REVIEW	config	Claude model for the adversarial pre-merge review gate (default: claude-opus-4-8)	Override when a different model tier is preferred for correctness review
+APP_PREVIEW_CMD	config	Shell command to launch the live app preview pane (blank = no preview pane)	For projects with a runnable app; blank restricts lanes to herd-quick.sh only
+HEALTHCHECK_CMD	config	Project health command: exit 0 clean, exit 1 code error, exit 2 data/env tolerated	Required for the heavy healthcheck profile; blank falls back to bash -n syntax check only
+HEALTHCHECK_HEAVY_GLOB	config	Egrep pattern of diff paths that force the heavy profile; blank means every change is heavy	When only certain changed files need the full test suite (e.g. ^app/ for backend-only heavy runs)
+SMOKE_CMD	config	Optional smoke test run by herd-resolve.sh after a conflict fix before pushing	When a quick integration check is faster than the full healthcheck during conflict resolution
+DENY_PATHS	config	Space-separated paths never committed; scribe and lanes are scoped away from these	For secrets, credentials, or generated dirs that must never reach git (e.g. .herd/secrets)
+REVIEW_CHECKLIST	config	Repo-relative path to a project risk checklist injected into the pre-merge review gate	When the review gate should verify project-specific invariants beyond generic correctness
+COORDINATOR_CMD	config	Slash command name for the rendered coordinator skill (default: /coordinator)	When the project uses a non-default coordinator command name
+HERD_VERSION	config	Engine contract version pinned in .herd/config; herd upgrade reads and bumps this value	Internal version pin; a mismatch triggers a warning on upgrade
+HERD_REPO	config	GitHub repo where engine bugs escalate via herd report (e.g. owner/herdkit)	Required for herd report to file issues against the herdkit engine repo
+WATCHER_AUTOMERGE	config	Legacy boolean lever (true/false); superseded by MERGE_POLICY when set	Prefer MERGE_POLICY; kept for backwards compatibility with pre-v1 configs
+MERGE_POLICY	config	Merge gate policy: auto (watcher merges on pass) | approve (coordinator approval required) | observe (watcher never merges)	Primary merge control lever; when approve, coordinator uses herd-approve.sh to sign off PRs
+MERGE_METHOD	config	git merge strategy used by the watcher: merge | squash | rebase	Controls how PRs land; merge preserves history, squash condenses, rebase linearizes
+.herd/links	lever	Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list	When filing issues against peer repos or routing engine bugs to specific trackers across services
+.herd/deps	lever	Cross-repo dependency list polled by dep-watcher.sh; each row marks a feature as blocked-on an upstream PR	When a feature waits on a peer-repo PR to merge first; dep-watcher transitions state when upstream merges
+.herd/secrets	lever	API-backend credentials (e.g. LINEAR_API_KEY); gitignored and sourced by scribe-step and cmd_backlog	Required for linear or other API backends; never put credentials in the committed .herd/config

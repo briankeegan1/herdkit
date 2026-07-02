@@ -69,6 +69,36 @@ render_skill() {
     local out_dir="$root/.claude/commands"
     mkdir -p "$out_dir"
     local out="$out_dir/$name.md"
+
+    # Build {{CAPABILITIES}} from templates/capabilities.tsv — one row per command/lane/config/lever.
+    local CAPABILITIES _caps_file="$TEMPLATES_DIR/capabilities.tsv"
+    CAPABILITIES=''
+    if [ -f "$_caps_file" ]; then
+      # Preamble: single-quoted so backticks are literal (not command substitution).
+      CAPABILITIES='## Herdkit capabilities
+
+_On every invocation, read live state to surface what is configured:_
+- Run `herd link list` — shows peers in `.herd/links` (enables `herd report --to <name>`)
+- Run `[ -f .herd/deps ] && cat .herd/deps` — upstream blockers tracked by dep-watcher
+- Check `MERGE_POLICY` in `.herd/config`: empty/auto → watcher auto-merges; approve → use `herd-approve.sh`; observe → watcher never merges'
+      local _prev_kind='' _n _k _d _w
+      while IFS=$'\t' read -r _n _k _d _w; do
+        [ "$_n" = "name" ] && continue
+        [ -z "$_n" ] && continue
+        if [ "$_k" != "$_prev_kind" ]; then
+          CAPABILITIES="${CAPABILITIES}"$'\n\n'
+          case "$_k" in
+            command) CAPABILITIES="${CAPABILITIES}### Commands (\`herd <subcommand>\`)" ;;
+            lane)    CAPABILITIES="${CAPABILITIES}### Lanes (\`bash ${SCRIPTS_DIR}/<lane>.sh\`)" ;;
+            config)  CAPABILITIES="${CAPABILITIES}### Config keys (\`.herd/config\`)" ;;
+            lever)   CAPABILITIES="${CAPABILITIES}### State files and levers" ;;
+          esac
+          _prev_kind="$_k"
+        fi
+        CAPABILITIES="${CAPABILITIES}"$'\n'"- **${_n}** — ${_d}. _When: ${_w}._"
+      done < "$_caps_file"
+    fi
+
     local line
     while IFS= read -r line || [ -n "$line" ]; do
       line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
@@ -79,6 +109,7 @@ render_skill() {
       line="${line//\{\{DENY_PATHS\}\}/$DENY_PATHS}"
       line="${line//\{\{HERD_REPO\}\}/$HERD_REPO}"
       line="${line//\{\{COORDINATOR_CMD\}\}/$COORDINATOR_CMD}"
+      line="${line//\{\{CAPABILITIES\}\}/$CAPABILITIES}"
       printf '%s\n' "$line"
     done < "$TEMPLATES_DIR/coordinator.md.tmpl" > "$out"
     printf '%s' "$out"
