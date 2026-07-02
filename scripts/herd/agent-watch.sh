@@ -224,9 +224,23 @@ review_verdict() {
   awk -v p="$1" -v s="$2" '$2==p && $3==s{v=$4} END{if(v){print v} else exit 1}' "$REVIEW_STATE" 2>/dev/null
 }
 
-# record_review <pr#> <headSha> <verdict> — append one review record (the instant a verdict known).
+# review_verdict_source <pr#> <headSha> — echoes the PROVENANCE of the recorded verdict for this
+# exact PR+sha: "reviewer" (a real 'REVIEW: BLOCK/PASS' line from the reviewer, backed by a PR
+# comment/finding), "gate_default" (a gate-generated default verdict with no reviewer finding), or
+# "infra" (an infrastructure death). Legacy rows without a source field, or no row at all, default
+# to "reviewer" so pre-provenance ledgers keep their existing auto-refix behavior. This is the
+# hinge for the auto-refix SAFETY GATE: only "reviewer" verdicts may bounce a builder.
+review_verdict_source() {
+  [ -s "$REVIEW_STATE" ] || { printf 'reviewer'; return 0; }
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{src=$5} END{ if(src==""){src="reviewer"} print src }' "$REVIEW_STATE" 2>/dev/null || printf 'reviewer'
+}
+
+# record_review <pr#> <headSha> <verdict> [source] — append one review record (the instant a verdict
+# is known). <source> is the verdict PROVENANCE (reviewer | gate_default | infra); defaults to
+# "reviewer" when omitted. Only "reviewer" verdicts are ever cached as a sticky BLOCK AND are the
+# only ones eligible to auto-refix a builder — a purely infrastructural death must never stick.
 record_review() {
-  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REVIEW_STATE"
+  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
 }
 
 # ── Background review dispatch ──────────────────────────────────────────────────────────────────
@@ -330,10 +344,13 @@ _review_gate_step() {
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
     rm -f "$result" "$inflight" 2>/dev/null || true
     case "$verdict_line" in
-      "REVIEW: PASS")   record_review "$pr" "$sha" "PASS";  echo PASS;  return 0 ;;
-      "REVIEW: BLOCK"*) record_review "$pr" "$sha" "BLOCK"; echo BLOCK; return 0 ;;
+      # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
+      # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
+      "REVIEW: PASS")   record_review "$pr" "$sha" "PASS"  "reviewer"; echo PASS;  return 0 ;;
+      "REVIEW: BLOCK"*) record_review "$pr" "$sha" "BLOCK" "reviewer"; echo BLOCK; return 0 ;;
       *)
-        # INFRA-FAIL or unparseable: transient — never cached to the ledger, retried with a cap.
+        # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
+        # verdict — never cached to the ledger, retried next poll with a cap.
         record_review_retry "$pr" "$sha"
         if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
         return 0 ;;
@@ -656,6 +673,17 @@ _handle_block_verdict() {
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
+    # SAFETY GATE: only a REVIEWER-BACKED block may bounce a builder. A gate-generated default
+    # verdict (or any non-reviewer provenance) carries no actionable finding — bouncing on it
+    # sends the builder a "fix" prompt with nothing to fix (2026-07-02 incident: a no-verdict
+    # default-BLOCK woke a builder that then worked on noise and had to be stood down by hand).
+    # Provenance lives in the review ledger row's source field; legacy/absent → "reviewer".
+    local _hbv_src
+    _hbv_src="$(review_verdict_source "$_hbv_pr" "$_hbv_sha")"
+    if [ "$_hbv_src" != "reviewer" ]; then
+      DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · review blocked without a reviewer finding (${_hbv_src}) · not auto-refixed · see PR #${_hbv_pr}${C_RESET}"
+      return 0
+    fi
     local _hbv_rounds
     _hbv_rounds="$(refix_round_count "$_hbv_pr")"
     if refix_attempted "$_hbv_pr" "$_hbv_sha"; then
@@ -929,7 +957,10 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           render
           continue ;;
         RETRY)
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review errored · will retry${C_RESET}"
+          # An INFRA death (EMPTY capture / rc0-no-verdict / severed reviewer) — NOT a refused
+          # verdict. Say so plainly and show the bounded retry budget; never "reviewer blocked".
+          _rv_k="$(_review_retry_count "$prnum" "$rsha")"
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review infra failed (no verdict) · retrying (${_rv_k}/${_REVIEW_RETRY_MAX})${C_RESET}"
           render
           continue ;;
         FAILED)
