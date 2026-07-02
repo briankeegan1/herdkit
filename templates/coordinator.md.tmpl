@@ -97,6 +97,26 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
+### Diagnose a gate: "what happened / is it stuck / why did X fail" → `herd why` FIRST
+
+When the user asks **what happened to a PR**, **why a PR is stuck**, or **why a gate / review / merge
+failed**, your FIRST move is the engine journal — not process archaeology, not re-reading panes:
+
+```
+herd why <pr#>      # chronological gate history for ONE PR: every review dispatch, verdict (with
+                    # reviewer/gate_default/infra provenance), healthcheck attempt + outcome, auto-refix
+                    # bounce + wake result, and the merge/reap — the whole story in order
+herd log --pr <n>   # the raw event stream for that PR; add --tail to watch gate activity live
+```
+
+The journal (`{{PROJECT_ROOT}}`'s worktree pool → `.herd/journal.jsonl`) is the append-only record
+every engine component writes as it acts. It is authoritative for post-mortems: it captures the
+things that used to vanish — a mid-review Claude death (`infra_event`), a verdict's provenance
+(`verdict_recorded` source=`reviewer|gate_default|infra`), each healthcheck attempt/retry before a red
+row, and an auto-refix bounce that silently failed to wake the builder (`refix_wake_result`
+escalated=true). Read `herd why <pr>` before deciding whether to re-task a builder, override a block,
+or escalate — then act on what the record actually shows.
+
 ### Auto-refix BLOCK reviews (REVIEW_AUTOFIX)
 
 When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict

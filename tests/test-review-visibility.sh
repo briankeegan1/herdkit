@@ -194,24 +194,46 @@ ok
 printf '%s\n' "$out2" | grep -q "REVIEW: BLOCK" || fail "formatter: result with BLOCK should be printed"
 ok
 
-# ── herd-review.sh: log tracking cleanup ─────────────────────────────────────
-# Verify the log-track file mechanics: old log cleaned up, new path saved.
+# ── herd-review.sh: log RETENTION (rolling window) ───────────────────────────
+# herd-review.sh no longer deletes the previous log on the next review — that log is the forensic
+# evidence a post-mortem needs. The slug-keyed tracker is now a rolling LIST (newest last) and the
+# last $REVIEW_LOG_KEEP logs per slug are KEPT; only those that roll off the window are deleted.
+# Simulate that startup step with REVIEW_LOG_KEEP=2 across three successive reviews.
 _log_track="$T/trees/.review-log-myslug"
-_old_log="$T/old_log.txt"
-printf 'old content\n' > "$_old_log"
-printf '%s\n' "$_old_log" > "$_log_track"
+REVIEW_LOG_KEEP=2
+_l1="$T/log1.txt"; _l2="$T/log2.txt"; _l3="$T/log3.txt"
+printf 'one\n'   > "$_l1"
+printf 'two\n'   > "$_l2"
+printf 'three\n' > "$_l3"
 
-# Simulate what herd-review.sh does at startup: read + delete old log, write new path.
-if [ -f "$_log_track" ]; then
-  _prev="$(cat "$_log_track" 2>/dev/null || true)"
-  [ -n "$_prev" ] && rm -f "$_prev" 2>/dev/null || true
-fi
-[ ! -f "$_old_log" ] || fail "log tracking: old log file should have been deleted"
+# roll_log <new> — mirror herd-review.sh's rolling-window logic against $_log_track.
+roll_log() {
+  local newlog="$1" tmp="${_log_track}.tmp.$$"
+  { [ -f "$_log_track" ] && cat "$_log_track" 2>/dev/null; printf '%s\n' "$newlog"; } 2>/dev/null \
+    | awk 'NF' > "$tmp"
+  local total; total="$(wc -l < "$tmp" | tr -cd '0-9')"; total="${total:-0}"
+  if [ "$total" -gt "$REVIEW_LOG_KEEP" ]; then
+    local drop=$(( total - REVIEW_LOG_KEEP ))
+    head -n "$drop" "$tmp" | while IFS= read -r old; do
+      [ -n "$old" ] && [ "$old" != "$newlog" ] && rm -f "$old" 2>/dev/null || true
+    done
+    tail -n "$REVIEW_LOG_KEEP" "$tmp" > "${tmp}.2" && mv -f "${tmp}.2" "$tmp"
+  fi
+  mv -f "$tmp" "$_log_track"
+}
+
+roll_log "$_l1"   # window: [l1]
+roll_log "$_l2"   # window: [l1, l2] — both kept (≤ keep)
+[ -f "$_l1" ] && [ -f "$_l2" ] || fail "log retention: within-window logs must be kept"
 ok
-
-_new_log="$T/new_log.txt"; printf 'new content\n' > "$_new_log"
-printf '%s\n' "$_new_log" > "$_log_track"
-[ "$(cat "$_log_track")" = "$_new_log" ] || fail "log tracking: track file should contain new log path"
+roll_log "$_l3"   # window rolls: l1 falls off and is deleted, [l2, l3] kept
+[ ! -f "$_l1" ] || fail "log retention: the log that rolled off the window should be deleted"
+ok
+[ -f "$_l2" ] && [ -f "$_l3" ] || fail "log retention: the newest \$REVIEW_LOG_KEEP logs must survive"
+ok
+# Tracker holds exactly the retained window, newest last.
+[ "$(cat "$_log_track")" = "$(printf '%s\n%s' "$_l2" "$_l3")" ] \
+  || fail "log retention: tracker should list the retained window (newest last)"
 ok
 
 echo "ALL PASS ($pass checks)"

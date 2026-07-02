@@ -34,6 +34,11 @@ HERDKIT_HOME="$(cd "$(dirname "$herd_src")/.." && pwd)"
 SCRIPTS_DIR="$HERDKIT_HOME/scripts/herd"
 TEMPLATES_DIR="$HERDKIT_HOME/templates"
 
+# Engine journal helper (best-effort append + reader-path helpers). Defines functions only; the
+# journal path resolves lazily from WORKTREES_DIR at call time, so sourcing before config is safe.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh"
+
 c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
@@ -1366,6 +1371,11 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
     "pane below coordinator"|"herdr tab"*) wsum="$wsum · pane $watch_pane · visible ✓" ;;
   esac
 
+  # Journal the outcome of each rebuilt component so a post-mortem can see when/what a reload touched.
+  journal_append reload_outcome component skill   result rendered
+  journal_append reload_outcome component watcher result "$launch_desc"
+  journal_append reload_outcome component backlog result "$backlog_desc"
+
   say ""
   ok "reload complete"
   say "  workspace:     $WORKSPACE_NAME"
@@ -1812,6 +1822,163 @@ print("\n".join(working))
   cmd_reload
 }
 
+# ── herd log / herd why: read the engine journal ────────────────────────────────────────────────
+# The journal is the append-only forensic record written by the engine components (agent-watch.sh,
+# herd-review.sh, cmd_reload) via scripts/herd/journal.sh. `herd log` pages it; `herd why <pr>`
+# summarizes one PR's full gate history chronologically. Both are READ-ONLY.
+
+# _journal_load_config — resolve WORKTREES_DIR (and thus the journal path) via the shared loader,
+# pinned to this repo's .herd/config when present. Sets the global JOURNAL_MAIN to the live journal.
+_journal_load_config() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] && export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  JOURNAL_MAIN="$WORKTREES_DIR/.herd/journal.jsonl"
+}
+
+# _journal_all_files — print the live journal plus any rotated archives (journal-*.jsonl), oldest
+# first, one path per line. Used by `herd why` to aggregate across a rotation boundary.
+_journal_all_files() {
+  local dir="$WORKTREES_DIR/.herd"
+  [ -d "$dir" ] || return 0
+  # Archives sort chronologically by their -<stamp> suffix; the live journal is newest, so it goes last.
+  ls -1 "$dir"/journal-*.jsonl 2>/dev/null | sort || true
+  [ -f "$JOURNAL_MAIN" ] && printf '%s\n' "$JOURNAL_MAIN"
+}
+
+# The shared JSONL line formatter (python): reads journal lines on stdin, prints one readable line
+# each. HERD_LOG_PR filters to a single PR when set.
+_JOURNAL_FMT='
+import sys, os, json
+want_pr = os.environ.get("HERD_LOG_PR", "")
+def pr_of(o):
+    v = o.get("pr")
+    return "" if v is None else str(v)
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        o = json.loads(raw)
+    except Exception:
+        continue
+    if want_pr and pr_of(o) != want_pr:
+        continue
+    ts = str(o.get("ts", ""))
+    ev = str(o.get("event", "?"))
+    rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event"))
+    print("%s  %-22s %s" % (ts, ev, rest))
+'
+
+cmd_log() {
+  local pr="" tail=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr)   pr="${2:-}"; [ -n "$pr" ] || die "--pr requires a PR number"; shift 2 ;;
+      --pr=*) pr="${1#--pr=}"; shift ;;
+      --tail) tail=1; shift ;;
+      *) die "usage: herd log [--pr N] [--tail]" ;;
+    esac
+  done
+  _journal_load_config
+  if [ ! -f "$JOURNAL_MAIN" ]; then
+    say "no engine journal yet at ${c_dim}$JOURNAL_MAIN${c_rst}"
+    say "  (the watcher and review gate create it on the first gate event)"
+    return 0
+  fi
+  export HERD_LOG_PR="$pr"
+  if [ "$tail" -eq 1 ]; then
+    say "${c_dim}tailing $JOURNAL_MAIN${pr:+ · PR #$pr} — Ctrl-C to stop${c_rst}"
+    tail -n 20 -f "$JOURNAL_MAIN" | python3 -c "$_JOURNAL_FMT"
+  else
+    python3 -c "$_JOURNAL_FMT" < "$JOURNAL_MAIN"
+  fi
+}
+
+cmd_why() {
+  local pr="${1:-}"
+  [ -n "$pr" ] || die "usage: herd why <pr#>"
+  case "$pr" in \#*) pr="${pr#\#}" ;; esac
+  [ -n "$pr" ] && [ -z "${pr//[0-9]/}" ] || die "herd why: <pr#> must be a number (got '$1')"
+  _journal_load_config
+  local files; files="$(_journal_all_files)"
+  if [ -z "$files" ]; then
+    say "no engine journal yet at ${c_dim}$WORKTREES_DIR/.herd/journal.jsonl${c_rst}"
+    return 0
+  fi
+  # Aggregate all events for this PR across the live journal + archives, chronologically.
+  printf '%s\n' "$files" | HERD_WHY_PR="$pr" python3 -c '
+import sys, os, json
+pr = os.environ["HERD_WHY_PR"]
+rows = []
+for path in sys.stdin.read().split("\n"):
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if str(o.get("pr", "")) == pr:
+                rows.append(o)
+rows.sort(key=lambda o: str(o.get("ts", "")))
+if not rows:
+    print("PR #%s — no journal entries found." % pr)
+    sys.exit(0)
+
+def g(o, *ks):
+    return next((str(o[k]) for k in ks if o.get(k) not in (None, "")), "")
+
+def describe(o):
+    ev = o.get("event", "?")
+    if ev == "review_dispatched":
+        return "review dispatched", "sha %s · model %s · pid %s" % (g(o,"sha")[:12] or "?", g(o,"model") or "?", g(o,"pid") or "?")
+    if ev == "verdict_recorded":
+        return "verdict recorded", "%s (%s) · sha %s" % (g(o,"value") or "?", g(o,"source") or "?", g(o,"sha")[:12] or "?")
+    if ev == "healthcheck_attempted":
+        return "healthcheck attempt", "attempt %s → %s" % (g(o,"attempt") or "1", g(o,"result") or "?")
+    if ev == "healthcheck_retried":
+        return "healthcheck retry", "attempt %s → %s" % (g(o,"attempt") or "?", g(o,"result") or "?")
+    if ev == "healthcheck_outcome":
+        d = g(o,"detail")
+        return "healthcheck outcome", g(o,"outcome") + (" · " + d if d else "")
+    if ev == "refix_bounce":
+        return "auto-refix bounce", "round %s · agent was %s" % (g(o,"round") or "?", g(o,"agent_status_before") or "?")
+    if ev == "refix_wake_result":
+        return "auto-refix wake", "woke=%s escalated=%s (%s → %s)" % (g(o,"woke") or "?", g(o,"escalated") or "?", g(o,"agent_status_before") or "?", g(o,"agent_status_after") or "?")
+    if ev == "merge":
+        return "MERGED", "sha %s · %s · %s" % (g(o,"sha")[:12] or "?", g(o,"method") or "?", g(o,"reason") or "")
+    if ev == "reap":
+        return "reaped worktree", "reason %s" % (g(o,"reason") or "?")
+    if ev == "review_log_retained":
+        return "review log kept", g(o,"path")
+    if ev == "infra_event":
+        return "INFRA event", "%s · exit %s · %s" % (g(o,"component") or "?", g(o,"exit_code") or "?", g(o,"stderr_tail") or "")
+    if ev == "sweep_closed":
+        return "tab swept", "%s (%s)" % (g(o,"tab_id") or "?", g(o,"reason") or "?")
+    if ev == "reload_outcome":
+        return "reload", "%s → %s" % (g(o,"component") or "?", g(o,"result") or "?")
+    extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr"))
+    return ev, extra
+
+print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
+for o in rows:
+    label, detail = describe(o)
+    print("  %s  %-20s %s" % (str(o.get("ts","")), label, detail))
+'
+}
+
 usage() {
   cat <<EOF
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
@@ -1839,6 +2006,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       coordinator skill, and reload the workspace in one step;
                                       refuses if the engine checkout is dirty or builders are
                                       mid-flight (--force overrides both guards)
+  herd log [--pr N] [--tail]          page the engine journal (.herd/journal.jsonl): one line per
+                                      gate event; --pr filters to one PR, --tail follows live
+  herd why <pr#>                      summarize one PR's full gate history from the journal —
+                                      dispatches, verdicts (+provenance), health attempts, refixes,
+                                      merge/reap — chronologically; the first post-mortem tool
   herd backlog                        list open work items via the active backend
   herd report [--to <link>] "<sym>"   file a report on HERD_REPO (or a peer from .herd/links
                                       via --to) using HERD_REPORT_BACKEND (default: github);
@@ -1858,6 +2030,8 @@ case "${1:-help}" in
   render)  shift; cmd_render "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
+  log)     shift; cmd_log "$@" ;;
+  why)     shift; cmd_why "$@" ;;
   update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
