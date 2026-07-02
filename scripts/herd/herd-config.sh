@@ -100,3 +100,33 @@ HERD_WATCHER_LOCK="$WORKTREES_DIR/.watcher-${_HERD_WS_SLUG}.pid"
 # PID-file path for the per-project dep-watcher singleton (dep-watcher.sh spawn-lock).
 HERD_DEPWATCHER_LOCK="$WORKTREES_DIR/.depwatcher-${_HERD_WS_SLUG}.pid"
 unset _HERD_WS_SLUG
+
+# herd_resolve_workspace_id — resolve this project's herdr workspace id by matching WORKSPACE_NAME
+# against 'herdr workspace list' labels. Prints the id to stdout (no trailing newline) on success;
+# prints nothing and warns to stderr when herdr is missing, the list call fails, or the label is
+# absent (e.g. coordinator.sh has not yet created the workspace). Call at each spawn site; proceed
+# unpinned (without --workspace) when the return value is empty.
+herd_resolve_workspace_id() {
+  if ! command -v herdr >/dev/null 2>&1; then
+    printf '⚠️  herdkit: herdr not on PATH — spawning without --workspace (tab may land in wrong workspace)\n' >&2
+    return 0
+  fi
+  local _wslist _wsid
+  if ! _wslist="$(herdr workspace list 2>/dev/null)"; then
+    printf '⚠️  herdkit: herdr workspace list failed — spawning without --workspace\n' >&2
+    return 0
+  fi
+  _wsid="$(printf '%s' "$_wslist" | LABEL="$WORKSPACE_NAME" python3 -c '
+import sys,json,os
+try:
+  ws=next((w["workspace_id"] for w in json.load(sys.stdin)["result"]["workspaces"] if w.get("label")==os.environ["LABEL"]),"")
+  print(ws,end="")
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  if [ -z "$_wsid" ]; then
+    printf '⚠️  herdkit: workspace "%s" not found in herdr — spawning without --workspace (run coordinator.sh first)\n' "$WORKSPACE_NAME" >&2
+    return 0
+  fi
+  printf '%s' "$_wsid"
+}
