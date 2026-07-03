@@ -12,3 +12,4 @@
 - ✅ **Token efficiency free wins** *(PR #54)*
 - ✅ **Init-time GitHub detection** *(PR #55)*
 - ✅ **Persistent engine journal — key-step logging for self-maintenance** *(PR #56)*
+- ✅ **Analyst seat launch config must include an explicit context-persistence tenet** *(PR #57)*
