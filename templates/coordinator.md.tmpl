@@ -219,14 +219,14 @@ Every reported problem routes to ONE of two places:
   connector failing). → spin a **worktree in this project** (the normal feature/quick lane above).
 - **HERD-ENGINE bug** — the symptom is in the workflow itself (a lane mislabels state, the watcher
   races, the resolver guesses, a script leaks another project's assumptions). → **escalate OUT to
-  the herdkit repo**; do NOT patch it in this clone (the fix would be lost on the next
+  the engine repo (`{{HERD_REPO}}`)**; do NOT patch it in this clone (the fix would be lost on the next
   `herd upgrade` and never reach other consumers). File it:
       herd report "<symptom + which lane>"
   (opens a `gh issue` on `{{HERD_REPO}}`, stamped with this project + the lane + version pin).
 
 ## Update the engine
 
-When a fix has landed upstream in herdkit, or the user asks "how do I get the latest engine
+When a fix has landed upstream in the engine, or the user asks "how do I get the latest engine
 fix", run:
 
     herd update
