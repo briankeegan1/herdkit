@@ -483,12 +483,15 @@ HEALTHCHECK_HEAVY_GLOB="$heavy_glob"
 APP_PREVIEW_CMD="$preview"
 SMOKE_CMD=""
 
+# model map — eco-leaning STARTER defaults. Opus is now an ESCALATION tier, not a default:
+# reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
+# (review gate), not by paying for it on every quick/feature/review run.
 MODEL_COORDINATOR="claude-opus-4-8"
-MODEL_FEATURE="claude-opus-4-8"
-MODEL_QUICK="claude-sonnet-4-6"
+MODEL_FEATURE="claude-sonnet-4-6"
+MODEL_QUICK="claude-haiku-4-5"
 MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
-MODEL_REVIEW="claude-opus-4-8"
+MODEL_REVIEW="claude-sonnet-4-6"
 
 DENY_PATHS="$deny"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
