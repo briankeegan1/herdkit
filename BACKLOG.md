@@ -16,6 +16,8 @@
 
 > Build order: F1 (merge policy) first; capabilities manifest + template-sync guard as one PR; init detection + flow-preference interview as one PR; herd config last (leans on the manifest for key validation).
 
+- 🚧 **LOCAL_REVIEW=pre-pr behavior wiring** *(follow-up to PR #89 flow-preference, worktree local-review-prepr)* — wire the deferred `LOCAL_REVIEW=pre-pr` branch: when set, the builder runs the adversarial `/code-review` pass in-worktree and resolves all findings before pushing the PR public; `LOCAL_REVIEW=none` remains the default and is unchanged.
+
 ## Reliability / safety
 
 
