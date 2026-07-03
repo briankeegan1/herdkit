@@ -41,9 +41,9 @@
 ## Recently shipped
 
 - ✅ **Coordinator 'Workflow settings' menu entry** *(PR #88)*
-- ✅ **Flow-preference interview + draft-PR flow** *(PR #89)*
+- ✅ **Flow-preference interview + draft-PR flow** *(PR #89)* — bounded first increment; `LOCAL_REVIEW=pre-pr` wiring is an open follow-up
 - ✅ **`herd upgrade` versioned migrations** *(PR #87)*
-- ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85)* — CLI only (`herd config list|get|set` with key validation + restart/re-render awareness); coordinator-menu 'Workflow settings' entry deferred as a follow-up 🔜
+- ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85 CLI · PR #88 menu entry)* — `herd config list|get|set` with key validation + restart/re-render awareness; coordinator-menu 'Workflow settings' entry ✅ shipped in PR #88 — full feature complete
 - ✅ **Layout reconciler — engine must observe the live pane layout before mutating it (eyes-on-layout)** *(PR #76)*
 - ✅ **Claude-plugin wrapper** *(PR #83)*
 - ✅ **Configurable watcher views** *(PR #84)*
