@@ -305,6 +305,10 @@ record_review() {
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
 _review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
 _review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
+# Evidence-triggered escalation arm marker, keyed per-PR (NOT per-sha): armed by _handle_block_verdict
+# when a builder's refix rounds prove the cheap reviewer missed the issue, consumed once by the next
+# review dispatch on that PR (see _maybe_arm_review_escalation / _review_gate_step).
+_review_escalate_file() { printf '%s' "$TREES/.review-escalate-$1"; }
 
 # ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB) ─────────────────────────────────────
 # _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | SKIP.
@@ -480,7 +484,26 @@ _review_gate_step() {
     [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
   fi
 
+  # EVIDENCE-TRIGGERED ESCALATION: if a builder's second refix round still arrived BLOCKed on this PR
+  # (armed per-PR by _handle_block_verdict), the cheap reviewer has demonstrably missed the real issue
+  # across two rounds. Force this NEXT dispatch up to the Opus tier ($REVIEW_MODEL_ESCALATED), overriding
+  # whatever tier the risk classification chose — even the default/STRONG empty-model path. The arm is a
+  # one-shot: it is CONSUMED here (reset), so a later clean commit's review is not needlessly escalated.
+  local _esc_file _esc_armed=""
+  _esc_file="$(_review_escalate_file "$pr")"
+  if [ -f "$_esc_file" ]; then _esc_armed=1; _rt_model="${REVIEW_MODEL_ESCALATED:-claude-opus-4-8}"; fi
+
+  # Consume the arm ONLY when actually dispatching (below) — a QUEUED tick must leave it armed so the
+  # escalation still lands when a concurrency slot frees on a later tick.
   if [ "$(_count_live_reviews)" -ge "${REVIEW_CONCURRENCY:-2}" ]; then echo QUEUED; return 0; fi
+  if [ -n "$_esc_armed" ]; then
+    rm -f "$_esc_file" 2>/dev/null || true
+    # (d) durable record of the review-lane step-up; the caller paints the '⬆️  escalated to …' row.
+    journal_append review_escalated pr "$pr" sha "$sha" model "$_rt_model" \
+      rounds "$(refix_round_count "$pr")" reason "cheap reviewer missed the issue across refix rounds"
+    _dispatch_review "$pr" "$slug" "$sha" "$_rt_model"
+    echo ESCALATED; return 0   # distinct from RUNNING so the console shows the Opus upgrade
+  fi
   _dispatch_review "$pr" "$slug" "$sha" "$_rt_model"
   echo RUNNING
 }
@@ -792,6 +815,17 @@ record_refix() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REFIX_STATE"
 }
 
+# _maybe_arm_review_escalation <pr#> — called right AFTER record_refix. If this PR has now accumulated
+# at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed refix rounds, the cheap reviewer's PASS
+# has been proven wrong across two rounds — arm a one-shot Opus escalation for the PR's NEXT review
+# dispatch. Reuses the shared refix-round accounting (refix_round_count) — no parallel counter.
+_maybe_arm_review_escalation() {
+  local _mare_pr="$1" _mare_rounds
+  _mare_rounds="$(refix_round_count "$_mare_pr")"
+  [ "${_mare_rounds:-0}" -ge "${REVIEW_EVIDENCE_ESCALATE_ROUNDS:-2}" ] 2>/dev/null || return 0
+  : > "$(_review_escalate_file "$_mare_pr")" 2>/dev/null || true
+}
+
 # _find_builder_pane_id <slug> — find the herdr agent pane_id for the builder whose name==slug
 # and whose agent_status is "idle" (idle means it's waiting for a task, not already working).
 # Prints the pane_id to stdout; prints nothing if the agent is absent or already working.
@@ -877,6 +911,9 @@ _handle_block_verdict() {
       render
       # Record BEFORE sending so refix-once holds even if pane lookup or delivery fails.
       record_refix "$_hbv_pr" "$_hbv_sha" "$_hbv_slug"
+      # A 2nd+ failed refix round on this PR is evidence the cheap reviewer missed the real issue —
+      # arm an Opus escalation for the PR's next review dispatch (consumed once, in _review_gate_step).
+      _maybe_arm_review_escalation "$_hbv_pr"
       local _hbv_status_before
       _hbv_status_before="$(_agent_status "$_hbv_slug")"
       journal_append refix_bounce pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
@@ -1862,6 +1899,13 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           continue ;;
         FAILED)
           DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review infra failed ${_REVIEW_RETRY_MAX}× for this commit${C_RESET}"
+          render
+          continue ;;
+        ESCALATED)
+          # (d) The review gate just stepped up to Opus on evidence (a failed refix round proved the
+          # cheap reviewer wrong). Mirror the builder lanes' '⬆️  escalated to $MODEL' step-up on the
+          # REVIEW lane so the console shows the upgrade — reviewing continues as normal underneath.
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing… ⬆️  escalated to ${REVIEW_MODEL_ESCALATED:-claude-opus-4-8} ($(refix_round_count "$prnum") failed refix rounds)${C_RESET}"
           render
           continue ;;
         *)
