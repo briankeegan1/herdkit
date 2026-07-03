@@ -57,7 +57,7 @@ DENY_PATHS	config	Space-separated paths never committed; scribe and lanes are sc
 REVIEW_CHECKLIST	config	Repo-relative path to a project risk checklist injected into the pre-merge review gate	When the review gate should verify project-specific invariants beyond generic correctness	watcher
 COORDINATOR_CMD	config	Slash command name for the rendered coordinator skill (default: /coordinator)	When the project uses a non-default coordinator command name	render
 HERD_VERSION	config	Engine contract version pinned in .herd/config; herd upgrade reads and bumps this value	Internal version pin; a mismatch triggers a warning on upgrade	
-HERD_REPO	config	GitHub repo where engine bugs escalate via herd report (e.g. owner/herdkit)	Required for herd report to file issues against the herdkit engine repo	render
+HERD_REPO	config	GitHub repo where engine bugs escalate via herd report (e.g. owner/herdkit)	Required for github-backed herd report: unset ⇒ it REFUSES rather than defaulting to a stranger's repo (only the herdkit engine repo self-targets)	render
 WATCHER_AUTOMERGE	config	Legacy boolean lever (true/false); superseded by MERGE_POLICY when set	Prefer MERGE_POLICY; kept for backwards compatibility with pre-v1 configs	watcher
 MERGE_POLICY	config	Merge gate policy: auto (watcher merges on pass) | approve (coordinator approval required) | observe (watcher never merges)	Primary merge control lever; when approve, coordinator uses herd-approve.sh to sign off PRs	watcher
 MERGE_METHOD	config	git merge strategy used by the watcher: merge | squash | rebase	Controls how PRs land; merge preserves history, squash condenses, rebase linearizes	watcher
