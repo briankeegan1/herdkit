@@ -48,6 +48,12 @@ done
 # herd-config.sh for the additive/atomic/backup guarantees. Best-effort: never fatal.
 herd_pretrust_worktree "$DIR"
 
+# Configure the per-project rate-limit hook so a builder that freezes on the account usage limit
+# writes a sentinel the watcher polls — the primary, version-robust limit-hit signal that drives
+# auto-resume-in-place via `claude --continue` (agent-watch.sh). Best-effort; the watcher's
+# banner-scrape fallback covers environments where the hook is unavailable. See herd-config.sh.
+herd_write_ratelimit_hook "$DIR"
+
 echo "✅ Worktree ready: $DIR   (branch $BRANCH, off $DEFAULT_BRANCH @ $(git -C "$REPO" rev-parse --short "$DEFAULT_BRANCH"))"
 echo "   Start an agent here:   cd $DIR && claude"
 echo "   When done:             gh pr create   # then the watcher reviews & merges"
