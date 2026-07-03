@@ -25,6 +25,22 @@ INTERACTION_TEST_CMD=""             # optional; drives widgets + asserts output 
 APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
 SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
 
+# app-preview knobs — all optional; the defaults below reproduce today's web-app behavior EXACTLY,
+# so leave them unset unless your preview is a non-web-framework command. Consumed by app-monitor.sh
+# (launch args + health probe) and the feature/resolver lanes (port range).
+#   APP_PREVIEW_SERVER_ARGS: extra args appended to APP_PREVIEW_CMD; {port} is substituted by the
+#     chosen port. Set "" for a command that reads $PORT itself and needs no injected flags.
+#   APP_PREVIEW_HEALTH_CMD:  health probe command (PORT exported; exit 0 = 🟢 serving). Highest
+#     precedence; empty falls through to the HTTP path probe. Set for a CLI / gRPC / non-HTTP preview.
+#   APP_PREVIEW_HEALTH_PATH: HTTP path curled at localhost:$PORT<path> (200 = 🟢). Set "" to DISABLE
+#     the HTTP probe → health shows ⚪ unknown (never a false-red 🔴) when no health CMD is set either.
+#   APP_PREVIEW_PORT_BASE:   base of the lanes' free-port search (base..base+98). Set to your stack's
+#     convention (e.g. 8080, 3000).
+# APP_PREVIEW_SERVER_ARGS="--server.port {port} --server.headless true"
+# APP_PREVIEW_HEALTH_CMD=""
+# APP_PREVIEW_HEALTH_PATH="/"
+# APP_PREVIEW_PORT_BASE="8501"
+
 # model map — role → model. Eco-leaning STARTER defaults: Opus is now an ESCALATION tier, not a
 # default — reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
 # (review gate). An explicit MODEL_* key here ALWAYS beats the starter default (TOKEN_MODE and the
@@ -79,3 +95,13 @@ WATCHER_AUTOMERGE="true"
 
 # routing — where engine bugs escalate (herd report files a gh issue here)
 HERD_REPO="briankeegan1/herdkit"
+
+# dep-watcher poll cadence + stall surfacing (dep-watcher.sh). All optional; the defaults below
+# preserve today's behavior, so leave them unset unless you want to retune.
+#   DEP_POLL_MIN:  initial poll interval (seconds); also the value a state change resets backoff to.
+#   DEP_POLL_MAX:  max poll interval (seconds) after capped-exponential backoff while deps sit idle.
+#   DEP_STALE_TTL: seconds a still-open dep may go without upstream movement before it is surfaced
+#                  as `stalled` (loudly, but still polled — never a freeze); 0 disables stall surfacing.
+# DEP_POLL_MIN="30"
+# DEP_POLL_MAX="300"
+# DEP_STALE_TTL="86400"
