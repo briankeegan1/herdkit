@@ -25,8 +25,9 @@ LOG="$DIR/.app-server.log"
 # reproduces today's dev-server flags EXACTLY, so an existing web-app project is byte-for-byte
 # unchanged. Set it to "" in .herd/config for a command that needs no injected flags (it reads $PORT
 # itself or takes the port another way). See docs/external-consumer-audit.md "Leak C".
-# Read INLINE with a default here (deliberately NOT declared in herd-config.sh / capabilities.tsv);
-# FOLLOW-UP: document APP_PREVIEW_SERVER_ARGS in templates/capabilities.tsv (owned by another PR).
+# Config key (read from .herd/config via herd-config.sh, sourced above); the inline default is the
+# fallback when unset, so an existing web app is unchanged. Documented in templates/capabilities.tsv
+# + templates/config.example.
 _APP_SERVER_ARGS="${APP_PREVIEW_SERVER_ARGS-"--server.port {port} --server.headless true"}"
 _APP_SERVER_ARGS="${_APP_SERVER_ARGS//\{port\}/$PORT}"
 # shellcheck disable=SC2086
@@ -52,8 +53,9 @@ newest() { git ls-files -z 2>/dev/null | xargs -0 stat "${_STAT_MTIME[@]}" 2>/de
 #   • neither (path set to "" AND no cmd) — health UNKNOWN → ⚪, NOT 🔴. "No probe configured" must
 #                               not masquerade as "down" and paint a healthy non-HTTP preview red.
 # APP_PREVIEW_HEALTH_PATH uses ${x-default} (assign-if-UNSET) so an explicit empty value DISABLES the
-# HTTP probe rather than snapping back to "/". Read INLINE with defaults here (NOT in herd-config.sh /
-# capabilities.tsv); FOLLOW-UP: document these keys in templates/capabilities.tsv (owned by another PR).
+# HTTP probe rather than snapping back to "/". Config keys (read from .herd/config via herd-config.sh,
+# sourced above); the inline defaults are the fallback when unset. Documented in
+# templates/capabilities.tsv + templates/config.example.
 _HEALTH_CMD="${APP_PREVIEW_HEALTH_CMD-}"
 _HEALTH_PATH="${APP_PREVIEW_HEALTH_PATH-/}"
 

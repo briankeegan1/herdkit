@@ -26,13 +26,13 @@
 # .herd/deps minimal read format (Gap 3 owns schema/write — this watcher only reads):
 #   blocked-on: <link-name>#<id>
 #
-# Env knobs:
+# Config keys (read from .herd/config via herd-config.sh; each falls back to its inline default below,
+# so behavior is unchanged when unset — documented in templates/capabilities.tsv + templates/config.example):
 #   DEP_POLL_MIN     — initial poll interval in seconds (default: 30)
 #   DEP_POLL_MAX     — maximum poll interval after backoff (default: 300)
 #   DEP_STALE_TTL    — seconds before a still-open dep is surfaced as `stalled` (default: 86400; 0 disables)
+# Env-only knob (test seam, NOT a config key):
 #   DEP_WATCHER_LIB  — set to 1 to source helpers without entering the polling loop (for tests)
-# NOTE: TTL/backoff defaults are hardcoded here for now; a follow-up PR wires them to a
-# capabilities.tsv config key (that file is owned by another builder this cycle, so it is untouched).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +42,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-links.sh"
 
 DEPS_FILE="${DEPS_FILE:-$PROJECT_ROOT/.herd/deps}"
+# Poll-cadence + stall-TTL config keys: herd-config.sh (sourced above) has already applied any value
+# set in .herd/config, so these reads pick it up; the inline default is the fallback when unset.
 DEP_POLL_MIN="${DEP_POLL_MIN:-30}"
 DEP_POLL_MAX="${DEP_POLL_MAX:-300}"
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
