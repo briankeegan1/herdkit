@@ -655,6 +655,16 @@ cmd_upgrade() {
   # Inherit breaking contract changes: run the ordered, pending migrations vCUR→vTARGET, preserving
   # the consumer's custom answers. A no-op when nothing is pending — today's behavior, unchanged.
   run_migrations "$root" "$cfg" "$cur" "$target"
+  # Adopt purely-additive keys the canonical template gained since this project was set up (issue #74).
+  # Sequence matters: migrations ran FIRST (they may rename/transform keys), so we only append keys
+  # STILL missing afterward — never overwriting or reordering a key the consumer already set, and never
+  # touching DENY_PATHS / .herd/secrets. HERD_CONFIG_TEMPLATE overrides the canonical template (test seam).
+  local template="${HERD_CONFIG_TEMPLATE:-$TEMPLATES_DIR/config.example}"
+  local adopted; adopted="$(_config_adopt_additive "$cfg" "$template")"
+  if [ -n "$adopted" ]; then
+    local adopted_n; adopted_n="$(printf '%s' "$adopted" | wc -w | tr -d ' ')"
+    say "herd upgrade: adopted $adopted_n new config keys: $adopted"
+  fi
   # Warn on config keys this contract expects but the project's config is missing (post-migration).
   local expected="HEALTHCHECK_CMD HEALTHCHECK_HEAVY_GLOB SMOKE_CMD SHARE_LINKS REVIEW_CHECKLIST COORDINATOR_CMD WATCHER_AUTOMERGE HERD_REPO"
   local missing="" k
@@ -745,6 +755,72 @@ _config_put_value() {
   done < "$cfg"
   [ "$replaced" -eq 1 ] || printf '%s="%s"\n' "$key" "$val" >> "$tmp"
   mv "$tmp" "$cfg"
+}
+
+# ── Additive config-key adoption on upgrade (issue #74) ───────────────────────────────────────────
+# When an engine update adds new keys to the canonical templates/config.example, a consumer's older
+# .herd/config is MISSING them and silently rides the fallback in herd-config.sh — the operator never
+# sees or tunes the new knob. `herd upgrade` closes that drift: after migrations run, it appends any
+# purely-additive missing key (default value + explanatory comment, verbatim from the template),
+# without overwriting, reordering, or touching anything the consumer already set. These three helpers
+# parse the TEMPLATE only (never re-parse the consumer config beyond a presence grep), reusing the
+# same key-line shape the rest of this file recognizes.
+
+# _config_template_keys <template> — print, in file order, every config KEY the template assigns
+# (leading indentation ignored; comment lines skipped). Exact key names, no values.
+_config_template_keys() {
+  awk '
+    { l=$0; sub(/^[[:space:]]+/,"",l) }
+    l ~ /^[A-Za-z_][A-Za-z0-9_]*=/ { key=l; sub(/=.*/,"",key); print key }' "$1"
+}
+
+# _config_template_block <template> <KEY> — emit, verbatim, the template's adoption text for KEY: the
+# KEY= line PLUS the contiguous comment block directly above it (walking up until a blank line or
+# another key line). That block carries the explanatory comment for KEY; when several keys share a
+# section header (e.g. the model map), only the FIRST key under the header collects it — the rest have
+# a key line directly above, so they carry just their own inline comment. Exits 1 when KEY is absent.
+_config_template_block() {
+  awk -v k="$2" '
+    { lines[NR]=$0 }
+    END {
+      target=0
+      for (i=1;i<=NR;i++){ l=lines[i]; sub(/^[[:space:]]+/,"",l); if (index(l,k "=")==1){ target=i; break } }
+      if (!target) exit 1
+      start=target
+      for (j=target-1;j>=1;j--){ c=lines[j]; sub(/^[[:space:]]+/,"",c); if (c ~ /^#/) start=j; else break }
+      for (i=start;i<=target;i++) print lines[i]
+    }' "$1"
+}
+
+# _config_adopt_additive <cfg> <template> — the #74 core. Append to <cfg> every key the <template>
+# declares that <cfg> is MISSING, using the template's default + comment block verbatim. Purely
+# additive: an existing key (any value, any custom edit) is left byte-for-byte untouched, nothing is
+# reordered or overwritten. NEVER adopts DENY_PATHS (path-scoping) or any secret-shaped key
+# (_config_secret_key) — credentials belong in .herd/secrets, never steered into the committed config.
+# Prints the space-separated names of adopted keys to stdout ('' when none). Idempotent: a second run
+# finds every key already present and adopts nothing, leaving the file unchanged.
+_config_adopt_additive() {
+  local cfg="$1" template="$2"
+  [ -f "$template" ] || return 0
+  # First pass — decide the additive-and-missing keys WITHOUT mutating the file, so a no-adopt run
+  # leaves .herd/config byte-identical (idempotency).
+  local pending="" key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    grep -qE "^[[:space:]]*$key=" "$cfg" && continue     # consumer already has it → preserve verbatim
+    [ "$key" = "DENY_PATHS" ] && continue                # path-scoping key — never auto-adopt
+    _config_secret_key "$key" && continue                # secret-shaped — belongs in .herd/secrets
+    pending="${pending:+$pending }$key"
+  done < <(_config_template_keys "$template")
+  [ -n "$pending" ] || return 0
+  # Ensure the config ends with a newline so the first appended block starts on its own line (a
+  # config whose last line lacks a trailing newline would otherwise get the block glued onto it).
+  [ -n "$(tail -c1 "$cfg" 2>/dev/null)" ] && printf '\n' >> "$cfg"
+  local adopted=""
+  for key in $pending; do
+    _config_template_block "$template" "$key" >> "$cfg" && adopted="${adopted:+$adopted }$key"
+  done
+  printf '%s' "$adopted"
 }
 
 cmd_config() {
