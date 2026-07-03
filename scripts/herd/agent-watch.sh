@@ -76,6 +76,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
+# Token/cost accounting (additive + read-only): sums a merged builder's transcript and journals a
+# `cost` event so `herd cost` can surface cost-per-merged-PR. Sourced after journal.sh (it calls
+# journal_append). Defines functions only; safe to source in lib mode.
+[ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
 MAIN="$PROJECT_ROOT"
@@ -523,6 +527,10 @@ do_merge() {
   # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
   printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
+  # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and journal
+  #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
+  #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.
+  type cost_emit_merge >/dev/null 2>&1 && cost_emit_merge "$dp" "$ds" "$dd"
   # 1) enqueue the scribe to reap the backlog item for this slug (slug-match + reap-not-stamp).
   bash "$HERE/scribe.sh" "Reap the backlog item for worktree slug '${ds}' (PR #${dp}): (1) grep ${BACKLOG_FILE} for the line containing '(worktree ${ds})' to locate the exact item; (2) if found, REMOVE that item from its active/thematic section entirely; (3) prepend '- ✅ **<title>** *(PR #${dp})*' (substituting the actual item title) immediately after the '## Recently shipped' heading, then drop any trailing entry beyond the 10th to keep the window capped at ~10; (4) if NO line matches that slug, make NO change and report that there is no backlog item for slug '${ds}'." >/dev/null 2>&1 || true
   # 2) fast-forward the MAIN checkout so coordinator + backlog viewer reflect it. Never force.

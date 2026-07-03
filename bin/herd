@@ -2127,6 +2127,10 @@ def describe(o):
         return "tab swept", "%s (%s)" % (g(o,"tab_id") or "?", g(o,"reason") or "?")
     if ev == "reload_outcome":
         return "reload", "%s → %s" % (g(o,"component") or "?", g(o,"result") or "?")
+    if ev == "cost":
+        return "cost", "%s · %s · $%s (in %s out %s cache_r %s cache_w %s)" % (
+            g(o,"component") or "?", g(o,"model") or "?", g(o,"usd") or "?",
+            g(o,"in") or "0", g(o,"out") or "0", g(o,"cache_read") or "0", g(o,"cache_write") or "0")
     extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr"))
     return ev, extra
 
@@ -2134,6 +2138,124 @@ print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==
 for o in rows:
     label, detail = describe(o)
     print("  %s  %-20s %s" % (str(o.get("ts","")), label, detail))
+'
+}
+
+# cmd_cost — the token/cost READER: aggregate the journal's `cost` events (written by the watcher
+# at merge time via scripts/herd/cost.sh) into per-PR cost, cost-per-merged-PR, and running totals
+# by component + model. READ-ONLY. `herd cost` shows the full rollup; `herd cost --pr N` drills into
+# one PR's cost lines. The denominator for cost-per-merged-PR is the set of PRs with a builder cost
+# event (a builder cost is emitted only at merge, so those PRs merged).
+cmd_cost() {
+  local pr=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr)   pr="${2:-}"; [ -n "$pr" ] || die "--pr requires a PR number"; shift 2 ;;
+      --pr=*) pr="${1#--pr=}"; shift ;;
+      *) die "usage: herd cost [--pr N]" ;;
+    esac
+  done
+  case "$pr" in \#*) pr="${pr#\#}" ;; esac
+  [ -z "$pr" ] || [ -z "${pr//[0-9]/}" ] || die "herd cost: --pr must be a number (got '$pr')"
+  _journal_load_config
+  local files; files="$(_journal_all_files)"
+  if [ -z "$files" ]; then
+    say "no engine journal yet at ${c_dim}$WORKTREES_DIR/.herd/journal.jsonl${c_rst}"
+    say "  (the watcher writes cost events at merge time — none recorded yet)"
+    return 0
+  fi
+  printf '%s\n' "$files" | HERD_COST_PR="$pr" python3 -c '
+import sys, os, json
+want_pr = os.environ.get("HERD_COST_PR", "")
+rows = []
+for path in sys.stdin.read().split("\n"):
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if o.get("event") != "cost":
+                continue
+            rows.append(o)
+
+def fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+if want_pr:
+    rows = [o for o in rows if str(o.get("pr", "")) == want_pr]
+
+if not rows:
+    if want_pr:
+        print("PR #%s — no cost events recorded." % want_pr)
+    else:
+        print("No cost events recorded yet.")
+        print("  (the watcher journals a `cost` event for each builder at merge time)")
+    sys.exit(0)
+
+if want_pr:
+    print("PR #%s — cost breakdown" % want_pr)
+    total = 0.0
+    for o in sorted(rows, key=lambda o: str(o.get("component",""))):
+        usd = fnum(o.get("usd")); total += usd
+        print("  %-8s %-18s $%9.4f  (in %s out %s cache_r %s cache_w %s · %s msgs)" % (
+            str(o.get("component","?")), str(o.get("model","?")), usd,
+            o.get("in",0), o.get("out",0), o.get("cache_read",0), o.get("cache_write",0), o.get("msgs",0)))
+    print("  %-8s %-18s $%9.4f" % ("TOTAL", "", total))
+    sys.exit(0)
+
+# Full rollup.
+per_pr = {}          # pr -> usd
+by_component = {}     # component -> usd
+by_model = {}         # model -> usd
+merged = set()        # PRs with a builder cost event
+grand = 0.0
+for o in rows:
+    prn = str(o.get("pr", "?"))
+    usd = fnum(o.get("usd"))
+    comp = str(o.get("component", "?"))
+    model = str(o.get("model", "?"))
+    per_pr[prn] = per_pr.get(prn, 0.0) + usd
+    by_component[comp] = by_component.get(comp, 0.0) + usd
+    by_model[model] = by_model.get(model, 0.0) + usd
+    grand += usd
+    if comp == "builder":
+        merged.add(prn)
+
+def _prkey(p):
+    try:
+        return (0, int(p))
+    except ValueError:
+        return (1, p)
+
+print("Cost per PR (%d PR%s with cost events):" % (len(per_pr), "" if len(per_pr)==1 else "s"))
+for prn in sorted(per_pr, key=_prkey):
+    print("  PR #%-6s $%9.4f" % (prn, per_pr[prn]))
+print("")
+print("By component:")
+for comp in sorted(by_component, key=lambda c: -by_component[c]):
+    print("  %-10s $%9.4f" % (comp, by_component[comp]))
+print("By model:")
+for model in sorted(by_model, key=lambda m: -by_model[m]):
+    print("  %-18s $%9.4f" % (model, by_model[model]))
+print("")
+print("Total spend recorded:   $%.4f" % grand)
+print("Merged PRs (billed):     %d" % len(merged))
+if merged:
+    print("Cost per merged PR:      $%.4f" % (grand / len(merged)))
 '
 }
 
@@ -2169,6 +2291,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
+  herd cost [--pr N]                  aggregate the journal's token/cost events (measured per builder
+                                      + review at merge time): per-PR cost, cost-per-merged-PR, and
+                                      running totals by component + model; --pr N drills into one PR.
+                                      Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
   herd backlog                        list open work items via the active backend
   herd report [--to <link>] "<sym>"   file a report on HERD_REPO (or a peer from .herd/links
                                       via --to) using HERD_REPORT_BACKEND (default: github);
@@ -2190,6 +2316,7 @@ case "${1:-help}" in
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;
   why)     shift; cmd_why "$@" ;;
+  cost)    shift; cmd_cost "$@" ;;
   update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
