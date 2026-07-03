@@ -7,3 +7,4 @@
 - ✅ **Review gate must distinguish infra death from a refused verdict** *(PR #49)*
 - ✅ **Mandatory dependency checks in install.sh + a `herd doctor` preflight** *(PR #50)*
 - ✅ **Watcher healthcheck gate: serialize or isolate concurrent suite runs** *(PR #51)*
+- ✅ **`herd pane <watch|backlog|coordinator>` — single-pane restart shortcuts** *(PR #53)*
