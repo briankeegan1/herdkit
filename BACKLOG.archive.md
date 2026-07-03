@@ -35,3 +35,4 @@
 - ✅ **Configurable watcher views** *(PR #84)*
 - ✅ **Claude-plugin wrapper** *(PR #83)*
 - ✅ **Layout reconciler — engine must observe the live pane layout before mutating it (eyes-on-layout)** *(PR #76)*
+- ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85 CLI · PR #88 menu entry)* — `herd config list|get|set` with key validation + restart/re-render awareness; coordinator-menu 'Workflow settings' entry ✅ shipped in PR #88 — full feature complete
