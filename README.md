@@ -28,6 +28,11 @@ pattern — not one project's wiring — can be reused, fixed once, and adopted 
 | **review** | `herd-review.sh` | adversarial pre-merge correctness gate (a strong model, default-to-BLOCK). Reads the PR diff against the project's `REVIEW_CHECKLIST` and prints one machine-parseable verdict: `REVIEW: PASS` / `REVIEW: BLOCK — …`. |
 | **watcher** | `agent-watch.sh` / `herd-watch.sh` | the live status console + auto-merge state machine. Merges only a PR that is MERGEABLE+CLEAN, healthcheck-green, **and** review-PASSed — re-verifying in the instant before merge. Owns teardown after a merge. Safety-railed and idempotent. |
 
+Two threads run through the whole pipeline: an append-only **engine journal**
+(`.herd/journal.jsonl`) records every gate event as a forensic trail — read it back with `herd why`
+and `herd log` — and the watcher's review gate can **auto-bounce a BLOCK back to the builder** to fix
+and push (the refix loop), so a failed review re-tasks itself instead of stalling.
+
 The engine is **generic**; everything project-specific is read from a per-project `.herd/config`.
 
 ---
@@ -95,25 +100,77 @@ Other commands:
 
 ```sh
 herd upgrade                 # bump the engine pin + re-render the skill, keeping your answers
+herd update [--force]        # pull the engine (ff-only), re-render the skill, reload — one step
+herd reload                  # rebuild the control room (watcher + backlog pane + re-render)
+herd pane <watch|backlog|coordinator>   # restart ONE control-room pane in place, no full reload
+herd doctor                  # one-pass dependency doctor (git, gh, claude, python3, herdr …)
 herd backlog                 # list open work items via the active backend (see below)
 herd report "<symptom + lane>"   # file an engine bug as a gh issue on HERD_REPO (see below)
+
+# Forensics — read the append-only engine journal (.herd/journal.jsonl):
+herd log [--pr N] [--tail]   # page the journal: one line per gate event; --tail follows live
+herd why <pr#>               # summarize one PR's full gate history — the first post-mortem tool
+herd cost [--pr N]           # per-builder + review token/$ accounting; cost-per-merged-PR
+herd link list               # list peer repos registered in .herd/links
+
+# Sign off held PRs (MERGE_POLICY=approve or a HUMAN-VERIFY hold):
+bash scripts/herd/herd-approve.sh list           # gate-passed PRs awaiting approval
+bash scripts/herd/herd-approve.sh approve <pr#>  # sha-keyed approval → watcher merges
 ```
 
 ---
 
-## The `WATCHER_AUTOMERGE` lever (human-in-the-loop)
+## Merge control — `MERGE_POLICY` (human-in-the-loop)
 
 The watcher runs the full pipeline — healthcheck, then the adversarial review gate — on every
-ready PR. `WATCHER_AUTOMERGE` in `.herd/config` controls the *last* step:
+ready PR. **`MERGE_POLICY`** in `.herd/config` is the primary lever over the *last* step (merge),
+a three-way switch:
 
-- **`true`** (default) — on a review **PASS**, the watcher calls `gh pr merge` itself. Full auto,
+- **`auto`** — on a review **PASS**, the watcher calls `gh pr merge` itself. Full auto,
   safety-railed: walk away and PRs land.
-- **`false`** — the watcher still runs healthcheck + review, but on PASS it **flags the PR
-  `ready · awaiting human merge`** and notifies you instead of merging. You keep the merge button;
-  the gates still run.
+- **`approve`** — the watcher runs every gate but **holds before merging**, flagging the PR
+  `ready · awaiting approval` and notifying you. It merges only once a coordinator signs off:
+
+  ```sh
+  bash scripts/herd/herd-approve.sh list          # gate-passed PRs awaiting approval (+ verdicts)
+  bash scripts/herd/herd-approve.sh approve <pr#>  # sha-keyed approval → watcher merges next poll
+  ```
+
+  Approval is **sha-keyed**: a commit pushed after the approval was written invalidates it — the
+  gate cycle re-runs and a fresh approval is required.
+- **`observe`** — runs every gate and reports/notifies, but **never merges** under any circumstance.
 
 Either way the watcher never merges a conflict, a BLOCK, an un-reviewed commit, or a PR whose state
 changed under it.
+
+> **`WATCHER_AUTOMERGE` is legacy.** The old boolean is superseded by `MERGE_POLICY` and kept only
+> for back-compat: when `MERGE_POLICY` is unset it derives from `WATCHER_AUTOMERGE` (`true` → `auto`,
+> `false` → `approve`). Prefer `MERGE_POLICY`.
+
+### Per-PR human-verify hold
+
+A builder can't always finish a change end-to-end itself — some steps need a running app, a UI/pane
+check, or human eyes. When that happens the builder declares each such step in a **`HUMAN-VERIFY:`**
+block in the PR body (one step per line). Under `MERGE_POLICY=auto` the watcher then switches *that
+one PR* to an approve-style hold — reusing the same approval ledger — so **all gates still run** but
+the merge waits for a human to run the steps and
+
+```sh
+bash scripts/herd/herd-approve.sh approve <pr#>
+```
+
+Sibling PRs without the marker keep auto-merging. The console shows
+`ready · human-verify pending · herd-approve.sh approve <pr#>`, and `herd-approve.sh list` prints the
+declared steps — so a manual step is never silently skipped. (Under `approve`/`observe` the hold is
+redundant, since those policies already gate every PR.)
+
+### Auto-refix a BLOCK review — `REVIEW_AUTOFIX`
+
+When `.herd/config` sets **`REVIEW_AUTOFIX=true`**, a BLOCK verdict is bounced straight back to the
+builder: the watcher wakes the builder's idle agent with a re-task prompt to fix and push, then the
+gate cycle re-runs on the new commit. This is bounded by **`REFIX_MAX_ROUNDS`** (default 3) bounces
+per PR — after which it escalates to `needs you`. When `REVIEW_AUTOFIX=false` (default), a BLOCK just
+shows the standard `review blocked` row for the coordinator to re-task by hand.
 
 ---
 
