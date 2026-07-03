@@ -38,3 +38,4 @@
 - ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85 CLI · PR #88 menu entry)* — `herd config list|get|set` with key validation + restart/re-render awareness; coordinator-menu 'Workflow settings' entry ✅ shipped in PR #88 — full feature complete
 - ✅ **`herd upgrade` versioned migrations** *(PR #87)*
 - ✅ **Flow-preference interview + draft-PR flow** *(PR #89)* — bounded first increment; `LOCAL_REVIEW=pre-pr` wiring is an open follow-up
+- ✅ **Coordinator 'Workflow settings' menu entry** *(PR #88)*
