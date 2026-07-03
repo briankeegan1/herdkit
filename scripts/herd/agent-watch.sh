@@ -141,6 +141,11 @@ LIMIT_STATE="$TREES/.agent-watch-limit"
 # autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
 # of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
 RECONCILE_STATE="$TREES/.agent-watch-reconciled"
+# Dep-state console surface: dep-watcher.sh rewrites this file each tick with one
+# "<ref> <state> <age-seconds>" line per live blocked-on dep (state ∈ open|in-progress|in-review|
+# stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
+# so a missing/stale file just means "no deps to show". Path mirrors dep-watcher's <lock-stem>.states.
+DEP_STATES_FILE="${DEP_STATES_FILE:-${HERD_DEPWATCHER_LOCK%.pid}.states}"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -181,6 +186,7 @@ last_frame=""
 HDR_LINE=""
 RULE=""
 LANDED=""
+BLOCKED=""
 DISPLAY=()
 
 # build_header — the title row + a full-width rule.
@@ -219,10 +225,52 @@ build_landed() {
   done < <(reverse_file "$STATE" | head -3)
 }
 
+# _dep_state_style <state> — echo "<glyph>\t<color>" for a dep state. Keeps the palette mapping in
+# one place so build_blocked stays a plain formatter. A stalled dep is the only loud (red) one — the
+# rest are calm status colors, because a blocked-on is a status line, not an error.
+_dep_state_style() {
+  case "$1" in
+    stalled)     printf '⏳\t%s' "$C_RED"    ;;
+    in-review)   printf '👀\t%s' "$C_CYAN"   ;;
+    in-progress) printf '🚧\t%s' "$C_YELLOW" ;;
+    open|*)      printf '⛓\t%s'  "$C_DIM"    ;;
+  esac
+}
+
+# build_blocked — the "blocked on" section: one row per live dep from $DEP_STATES_FILE
+# ("<ref> <state> <age-seconds>", written by dep-watcher.sh). Empty (BLOCKED="") when there are no
+# deps or the file is absent, so render omits the section entirely. Purely informational.
+build_blocked() {
+  BLOCKED=""
+  [ -s "$DEP_STATES_FILE" ] || return 0
+  local ref state age glyph color human rows=""
+  while read -r ref state age; do
+    [ -n "${ref:-}" ] || continue
+    IFS=$'\t' read -r glyph color < <(_dep_state_style "$state")
+    human="$(_fmt_age "${age:-0}")"
+    rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${state}${C_RESET} ${C_DIM}${human}${C_RESET}"$'\n'
+  done < "$DEP_STATES_FILE"
+  [ -n "$rows" ] && BLOCKED="$rows"
+}
+
+# _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
+_fmt_age() {
+  local s="${1:-0}"
+  case "$s" in ''|*[!0-9]*) s=0 ;; esac
+  if   [ "$s" -lt 60 ];    then printf '%ss' "$s"
+  elif [ "$s" -lt 3600 ];  then printf '%sm' "$(( s / 60 ))"
+  elif [ "$s" -lt 86400 ]; then printf '%sh' "$(( s / 3600 ))"
+  else                          printf '%sd' "$(( s / 86400 ))"
+  fi
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
+  if [ -n "${BLOCKED:-}" ]; then
+    frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
+  fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
     frame="${frame}    ${C_DIM}— idle —${C_RESET}"$'\n'
@@ -1872,6 +1920,7 @@ _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 while true; do
   build_header
   build_landed
+  build_blocked
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never

@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # dep-watcher.sh — persistent per-project dependency-watcher singleton.
 #
-# Reads .herd/deps for "blocked-on: <link-name>#<id>" entries, polls each dep's
-# _backend_item_state on an interval with exponential backoff, removes closed deps from
-# .herd/deps, and warns on stalled deps (open longer than DEP_STALE_TTL seconds).
+# Reads .herd/deps for "blocked-on: <link-name>#<id>" entries, polls each dep's live upstream state
+# on a capped-exponential-backoff interval, removes closed deps from .herd/deps, and surfaces a
+# richer dep state so a slow enterprise PR is a STATUS LINE — never a workspace freeze.
+#
+# Dep STATE (derived from the upstream PR/issue's live state + how long it's been pending):
+#   open        — upstream is open, not yet picked up
+#   in-progress — upstream work has started (backend reports a started/in-progress state)
+#   in-review   — upstream is out for review (backend reports a review state)
+#   stalled     — upstream is still open/in-progress/in-review but has shown no movement past the TTL
+#                 (surfaced loudly, but still polled — a stall is a warning, not a hard block)
+#   closed      — upstream is done → the dep is removed and the workspace is unblocked
+#
+# BACKOFF: while every open dep is unchanged tick-over-tick the poll interval doubles (capped at
+# DEP_POLL_MAX) so a long-pending dep is polled less aggressively over time rather than hammered
+# every tick; any state change (a dep closing) resets the interval to DEP_POLL_MIN.
+#
+# CONSOLE: each tick writes one "<ref> <state> <age-seconds>" line per live dep to $STATES_FILE
+# (<lock-stem>.states); agent-watch.sh reads it to paint a "blocked on" status section. The file is
+# purely informational — its absence or staleness never gates anything.
 #
 # Uses the same flock/PID-file spawn-lock pattern as agent-watch.sh (PR #21).
 #
@@ -13,8 +29,10 @@
 # Env knobs:
 #   DEP_POLL_MIN     — initial poll interval in seconds (default: 30)
 #   DEP_POLL_MAX     — maximum poll interval after backoff (default: 300)
-#   DEP_STALE_TTL    — seconds before a still-open dep is surfaced as a warning (default: 86400)
+#   DEP_STALE_TTL    — seconds before a still-open dep is surfaced as `stalled` (default: 86400; 0 disables)
 #   DEP_WATCHER_LIB  — set to 1 to source helpers without entering the polling loop (for tests)
+# NOTE: TTL/backoff defaults are hardcoded here for now; a follow-up PR wires them to a
+# capabilities.tsv config key (that file is owned by another builder this cycle, so it is untouched).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +47,9 @@ DEP_POLL_MAX="${DEP_POLL_MAX:-300}"
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
 # Per-project state file: tracks first-seen epoch for stale detection.
 SINCE_FILE="${HERD_DEPWATCHER_LOCK%.pid}.since"
+# Per-project console-surface file: one "<ref> <state> <age>" line per live dep, rewritten each
+# tick. agent-watch.sh reads this to paint the "blocked on" section. Informational only.
+STATES_FILE="${HERD_DEPWATCHER_LOCK%.pid}.states"
 _SECRETS="$PROJECT_ROOT/.herd/secrets"
 # shellcheck source=/dev/null
 [ -f "$_SECRETS" ] && . "$_SECRETS"
@@ -76,7 +97,9 @@ _dw_remove_dep() {
 
 _dw_check_state() {
     # Resolve the link for <ref>, source the backend, call _backend_item_state.
-    # Prints the ITEM_STATE on stdout (open|closed|in-progress|unknown).
+    # Prints the RAW upstream state on stdout: open|in-progress|in-review|closed|unknown.
+    # (Backends that don't distinguish review/progress just report open/closed — the derived
+    # state machine below degrades gracefully.) Tests stub this to script upstream transitions.
     local ref="$1"
     (
         link_name="${ref%%#*}"
@@ -99,6 +122,58 @@ _dw_check_state() {
         _backend_item_state "$ref" 2>/dev/null || true
         printf '%s\n' "${ITEM_STATE:-unknown}"
     )
+}
+
+_dw_derive_state() {
+    # Pure state machine: map a RAW upstream state + how long the dep has been pending onto the
+    # dep STATE surfaced to the operator. A dep that is still open/in-progress/in-review but has
+    # shown no movement past the TTL becomes `stalled` — surfaced loudly, yet still polled (a stall
+    # is a status line, never a freeze). Usage: _dw_derive_state <raw> <age-seconds> <ttl-seconds>.
+    local raw="$1" age="${2:-0}" ttl="${3:-0}"
+    case "$raw" in
+        closed)
+            printf 'closed'
+            ;;
+        open|in-progress|in-review)
+            if [ "$ttl" -gt 0 ] && [ "$age" -gt "$ttl" ]; then
+                printf 'stalled'
+            else
+                printf '%s' "$raw"
+            fi
+            ;;
+        *)
+            printf 'unknown'
+            ;;
+    esac
+}
+
+_dw_next_interval() {
+    # Pure capped-exponential backoff. Usage: _dw_next_interval <current> <min> <max> <widen>.
+    # widen=1 → double the current interval, capped at <max>; anything else → reset to <min>.
+    # Prints the next interval on stdout.
+    local current="$1" min="$2" max="$3" widen="${4:-0}"
+    if [ "$widen" = "1" ]; then
+        local next=$(( current * 2 ))
+        [ "$next" -gt "$max" ] && next="$max"
+        [ "$next" -lt "$min" ] && next="$min"
+        printf '%s' "$next"
+    else
+        printf '%s' "$min"
+    fi
+}
+
+_dw_write_states() {
+    # Atomically rewrite $STATES_FILE from the caller-accumulated $1 (one "<ref> <state> <age>"
+    # line per live dep). Best-effort: a failed write never interrupts the poll loop.
+    local body="$1"
+    [ -n "${STATES_FILE:-}" ] || return 0
+    mkdir -p "$(dirname "$STATES_FILE")" 2>/dev/null || true
+    local tmp; tmp="${STATES_FILE}.$$"
+    if printf '%s' "$body" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$STATES_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
 }
 
 # ── Lib mode: helpers only, no loop (for tests) ───────────────────────────────
@@ -159,11 +234,16 @@ while true; do
     now="$(_dw_epoch)"
     any_open=0
     changed=0
+    states_body=""
 
     for ref in "${refs[@]+"${refs[@]}"}"; do
         _dw_record_since "$ref" "$now"
 
-        state="$(_dw_check_state "$ref" || printf 'unknown')"
+        raw="$(_dw_check_state "$ref" || printf 'unknown')"
+        since="$(_dw_get_since "$ref")"
+        age=0
+        [ -n "$since" ] && age=$(( now - since ))
+        state="$(_dw_derive_state "$raw" "$age" "$DEP_STALE_TTL")"
 
         case "$state" in
             closed)
@@ -173,31 +253,33 @@ while true; do
                     --body "$ref is closed — $WORKSPACE_NAME is unblocked" \
                     --sound done >/dev/null 2>&1 || true
                 changed=1
+                # Closed deps drop off the console surface (they're removed from .herd/deps).
+                continue
                 ;;
-            open|in-progress)
+            stalled)
+                # A stall is a STATUS LINE, never a freeze: surface it loudly but keep polling.
+                _dw_warn "STALLED: $ref — no upstream movement for ${age}s (TTL=${DEP_STALE_TTL}s)"
                 any_open=$((any_open + 1))
-                since="$(_dw_get_since "$ref")"
-                if [ -n "$since" ]; then
-                    age=$(( now - since ))
-                    if [ "$age" -gt "$DEP_STALE_TTL" ]; then
-                        _dw_warn "STALLED: $ref — open for ${age}s (TTL=${DEP_STALE_TTL}s)"
-                    fi
-                fi
+                ;;
+            open|in-progress|in-review)
+                any_open=$((any_open + 1))
                 ;;
             *)
                 _dw_warn "could not resolve state for $ref — will retry"
                 any_open=$((any_open + 1))
                 ;;
         esac
+
+        states_body="${states_body}${ref} ${state} ${age}"$'\n'
     done
 
-    # Backoff: reset to min on a change, double on idle.
-    if [ "$changed" -eq 1 ]; then
-        interval="$DEP_POLL_MIN"
-    elif [ "$any_open" -gt 0 ]; then
-        interval=$(( interval * 2 ))
-        [ "$interval" -gt "$DEP_POLL_MAX" ] && interval="$DEP_POLL_MAX"
-    fi
+    _dw_write_states "$states_body"
+
+    # Backoff: reset to DEP_POLL_MIN on any change; otherwise, while open deps sit unchanged, widen
+    # the interval (capped) so long-pending deps are polled less aggressively over time.
+    widen=0
+    [ "$changed" -eq 0 ] && [ "$any_open" -gt 0 ] && widen=1
+    interval="$(_dw_next_interval "$interval" "$DEP_POLL_MIN" "$DEP_POLL_MAX" "$widen")"
 
     sleep "$interval"
 done
