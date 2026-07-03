@@ -442,3 +442,37 @@ PY
   fi
   return 0
 }
+
+# herd_write_task_spec <spec_file> <spec_content> — externalize a builder's full task spec.
+#
+# Writes <spec_content> (the caller task + the workflow-rules footer) to <spec_file> and, on
+# success, prints a SHORT pointer prompt to stdout for the caller to hand the agent as argv — so a
+# multi-kilobyte spec no longer rides in the `claude … "<TASK>"` command line. <spec_file> lives at
+# $WORKTREES_DIR/<slug>.task.md, a SIBLING of the worktree dir (outside its tracked tree), so the
+# builder never commits it.
+#
+# FAIL-LOUD contract (this is the #69 BLOCK fix — do NOT regress it): a failed OR partial spec write
+# must ABORT before any pointer is emitted, so the caller cannot spawn a builder against a missing or
+# truncated spec. Concretely, the write is checked (`printf … || return 1`) AND the file is asserted
+# non-empty (`[ -s … ] || return 1`) BEFORE the pointer printf. The pointer printf always succeeds,
+# so emitting it first would mask a failed write and return rc=0 — exactly the bug the reviewer hit.
+# Callers invoke as  POINTER="$(herd_write_task_spec "$FILE" "$SPEC")"  under `set -euo pipefail`, so
+# a non-zero return aborts the lane at the assignment, before the `herdr agent start … claude` call.
+herd_write_task_spec() {
+  local _ts_file="${1:?herd_write_task_spec: spec file path required}"
+  local _ts_spec="${2:?herd_write_task_spec: spec content required}"
+  # Write the full spec, fail loud. A failed write (unwritable dir, target is a directory, disk
+  # full, …) returns non-zero HERE — the trailing pointer printf must never paper over it.
+  if ! printf '%s\n' "$_ts_spec" > "$_ts_file"; then
+    printf '❌ herdkit: could not write task spec to %s — aborting before spawning a builder.\n' "$_ts_file" >&2
+    return 1
+  fi
+  # Assert the spec actually landed with content. Guards the partial/truncated-write case where the
+  # printf reported success but the file is empty — abort rather than pointing a builder at nothing.
+  if [ ! -s "$_ts_file" ]; then
+    printf '❌ herdkit: task spec at %s is empty after write — aborting before spawning a builder.\n' "$_ts_file" >&2
+    return 1
+  fi
+  # Spec is safely on disk — only now emit the SHORT pointer the agent receives in place of the spec.
+  printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_ts_file"
+}
