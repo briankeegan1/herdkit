@@ -1,0 +1,18 @@
+{
+  "name": "herdkit",
+  "displayName": "herdkit",
+  "description": "herdkit — the config-driven multi-agent coordinator workflow for Claude Code, built on the herdr terminal multiplexer.",
+  "owner": {
+    "name": "Brian Keegan",
+    "url": "https://github.com/briankeegan1/herdkit"
+  },
+  "plugins": [
+    {
+      "name": "herdkit-coordinator",
+      "source": "./plugin",
+      "description": "Thin wrapper that launches the CLI-rendered herdkit coordinator skill. The herdkit CLI stays canonical — the plugin renders and delegates, it does not fork the coordinator.",
+      "version": "0.1.0",
+      "keywords": ["herdkit", "coordinator", "multi-agent"]
+    }
+  ]
+}
