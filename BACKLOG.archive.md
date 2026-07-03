@@ -39,3 +39,4 @@
 - ✅ **`herd upgrade` versioned migrations** *(PR #87)*
 - ✅ **Flow-preference interview + draft-PR flow** *(PR #89)* — bounded first increment; `LOCAL_REVIEW=pre-pr` wiring is an open follow-up
 - ✅ **Coordinator 'Workflow settings' menu entry** *(PR #88)*
+- ✅ **Dispatch vs. dependency intent** *(PR #90)* — `.herd/deps` schema + `herd depend/deps list/rm`; fire-and-forget `--to B` vs tracked `--dep` with `blocked-on` + reclassify/remove via `herd deps rm|demote`
