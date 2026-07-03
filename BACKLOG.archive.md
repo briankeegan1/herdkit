@@ -22,3 +22,4 @@
 - ✅ **Launch-binding guard — engine scripts must refuse to run against the wrong project** *(PR #67)*
 - ✅ **Per-workspace argv0 marker for the watcher (cross-project kill-safety)** *(PR #65)*
 - ✅ **Auto-refix now resumes a done builder via the shared resume helper** *(PR #71)*
+- ✅ **SHA-cache the healthcheck verdict** *(PR #66)* — implemented as per-sha marker files (`.health-result-<pr>-<sha>`) mirroring the review ledger; `record_health_result` / `_discard_stale_health` / `healthcheck_cache_hit` journal events; head sha threaded via `CAND_SHA` in `agent-watch.sh`; cached CLEAN/FLAKY proceeds as passing, cached CODEERROR re-surfaces without re-running; new commit sha auto-invalidates; always-on (empty sha disables). No `HEALTHCHECK_CACHE` config key or `.agent-watch-health-checked` ledger added.

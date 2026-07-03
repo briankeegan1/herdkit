@@ -12,7 +12,6 @@
 
 - 🔜 **Dispatch vs. dependency intent** — `herd report --to B` (fire-and-forget issue, default) vs `--to B --dep` / `herd depend B#id` (records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, never stuck. *(Gap 3 in `docs/gap-report-cross-repo-loop.md`: `.herd/deps` schema + `herd depend/deps list/rm`; depends on the link registry above for `--to <project>`.)*
 - 🔜 **Watcher flexibility for long-pending deps** — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
-- 🚧 **Configurable watcher views** *(worktree watcher-views)* — lenses `mine | all | deps | review-queue` + filters (author/assignee/label/status); default in `.herd/config`.
 - 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + ownership/assignee filter; auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the required-checks gate (PR #5). `solo` default; `team` is a config flip.
 
 ## Workflow control & discoverability
@@ -46,6 +45,7 @@
 
 ## Recently shipped
 
+- ✅ **Configurable watcher views** *(PR #84)*
 - ✅ **Auto-refix / direct hand-offs bypass backlog reconciliation — link PRs to their backlog item so the reap step can close them** *(PR #82)*
 - ✅ **AUDIT deliverable: end-to-end flow redundancy findings — docs/flow-audit.md** *(PR #77, commit 14f7e42)* — ranked follow-up items from the audit still need triaging into individual backlog items
 - ✅ **Match builder spawn rate to REVIEW_CONCURRENCY** *(PR #79, commit 7ddfb7a)* — `SPAWN_AHEAD` config key; pre-spawn gate defers when `live_reviews + queued_reviews >= REVIEW_CONCURRENCY`; hermetic tests for saturated/cleared/force-spawn/`SPAWN_AHEAD=0` paths
@@ -55,4 +55,3 @@
 - ✅ **REVIEW_ESCALATE_GLOB — risk-tiered pre-merge review gate** *(PR #73, commit 8c15456)* — `agent-watch.sh` classifies diffs as STRONG (engine-surface path matching `MODEL_ESCALATE_GLOB`) or large (≥ `REVIEW_ESCALATE_MAXFILES`) and routes those to Opus (`MODEL_REVIEW`); low-risk diffs use `MODEL_REVIEW_CHEAP`. `REVIEW_RISK_TIER=strict|tiered` config key (default `strict` = today's always-Opus). Hermetic tests for tier selection.
 - ✅ **Token/cost instrumentation — per-builder/review accounting + `herd cost` command** *(commit e2a0ae5)* — `scripts/herd/cost.sh` provides per-builder and per-review token accounting priced to USD and cost-per-merged-PR; wired into the watcher merge path (`agent-watch.sh:610 cost_emit_merge`); `herd cost` (cmd_cost in `bin/herd`) aggregates per-PR cost, cost-per-merged-PR, and running totals. Tests: `tests/test-cost.sh`, `tests/test-token-mode.sh`. This was the gating precursor for the efficiency-lever items and both efficiency EPICs — gate is now lifted.
 - ✅ **Externalize builder task specs to a file (fail-loud), pass a short pointer** *(commit fd74659)* — both lanes call `herd_write_task_spec` (defined in `scripts/herd/herd-config.sh`) to write the full spec (caller task + complete `[workflow rules]` footer) to `$WORKTREES_DIR/$SLUG.task.md` (a sibling file outside the worktree's tracked tree — no risk of committing it) and hand the builder a short pointer prompt; fail-loud: the lane aborts before spawning if the spec write fails. Tests in `tests/test-externalize-task-specs.sh`. Note: spec lives alongside the worktree directory rather than at `.herd/task.md` inside it — safer, fully satisfies the original item.
-- ✅ **SHA-cache the healthcheck verdict** *(PR #66)* — implemented as per-sha marker files (`.health-result-<pr>-<sha>`) mirroring the review ledger; `record_health_result` / `_discard_stale_health` / `healthcheck_cache_hit` journal events; head sha threaded via `CAND_SHA` in `agent-watch.sh`; cached CLEAN/FLAKY proceeds as passing, cached CODEERROR re-surfaces without re-running; new commit sha auto-invalidates; always-on (empty sha disables). No `HEALTHCHECK_CACHE` config key or `.agent-watch-health-checked` ledger added.
