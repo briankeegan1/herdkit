@@ -80,18 +80,22 @@ else
   record "scout-detects-go" "skip" "could not extract scout_repo from bin/herd"
 fi
 
-# ── PROBE 2: the light healthcheck profile silently green-lights a broken .go file ──
-# A generic consumer with no HEALTHCHECK_CMD gets the light profile, which only syntax-checks
-# *.sh / *.py. Break a real .go source and confirm the gate reports CLEAN with exit 0.
+# ── PROBE 2: does the light healthcheck profile silently green-light an unchecked .go file? ──
+# A generic consumer with no HEALTHCHECK_CMD gets the light profile. Leak B was: the light profile
+# only syntax-checked *.sh / *.py, so a broken .go was reported as a confident "✅ light clean (exit
+# 0)" — a silent-green correctness hazard. The fix (healthcheck.sh run_light) flags-the-absence:
+# where gofmt is present it parses the .go and reds a REAL syntax error; where it is absent it emits
+# a loud ⚠️ (unchecked / data-env) instead of a confident ✅. LEAK iff a broken .go still passes as a
+# confident clean (rc 0 AND a ✅-clean verdict); otherwise the leak is CLOSED.
 cp "$FIXTURE/internal/greet/greet.go" "$ARTIFACTS/greet.go.orig"
 printf '\nfunc broken( {  // deliberate Go syntax error\n' >> "$FIXTURE/internal/greet/greet.go"
 LIGHT_OUT="$(HERD_CONFIG_FILE=/dev/null bash "$HEALTHCHECK" "$FIXTURE" --oneline 2>&1)"; LIGHT_RC=$?
 cp "$ARTIFACTS/greet.go.orig" "$FIXTURE/internal/greet/greet.go"   # restore fixture
-if [ "$LIGHT_RC" -eq 0 ] && printf '%s' "$LIGHT_OUT" | grep -qi 'clean'; then
+if [ "$LIGHT_RC" -eq 0 ] && printf '%s' "$LIGHT_OUT" | grep -q '✅'; then
   record "light-profile-ignores-go" "leak" \
-    "broken .go passed the light healthcheck as '$LIGHT_OUT' (exit 0) — the light profile only checks *.sh/*.py (healthcheck.sh:114-153)"
+    "broken .go passed the light healthcheck as a confident clean '$LIGHT_OUT' (exit 0) — silent-green (healthcheck.sh run_light)"
 else
-  record "light-profile-ignores-go" "clean" "light profile did NOT green-light the broken .go (rc=$LIGHT_RC: $LIGHT_OUT)"
+  record "light-profile-ignores-go" "clean" "light profile flags the .go instead of green-lighting it (rc=$LIGHT_RC: $LIGHT_OUT)"
 fi
 
 # ── PROBE 3: the seeded ^app/ heavy/surface globs never match a Go layout ──

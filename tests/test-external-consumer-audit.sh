@@ -64,24 +64,40 @@ d=json.load(open(sys.argv[1]))
 assert d["scenario"]=="external-consumer-abstraction-audit", d["scenario"]
 assert d["result"]=="leaks-confirmed", d["result"]
 assert d["skipped"]==0, ("unexpected skipped probes", d["skipped"])
-assert d["leaks"]>=5, ("expected >=5 leaks", d["leaks"])
-names={p["name"] for p in d["probes"]}
+# Leak B is now CLOSED (light profile flags an unchecked .go instead of green-lighting it), so the
+# remaining abstraction leaks (scout, ^app/ glob, rendered-skill tooling, no-backlog) still confirm.
+assert d["leaks"]>=4, ("expected >=4 remaining leaks", d["leaks"])
+by_name={p["name"]:p for p in d["probes"]}
 for want in ("scout-detects-go","light-profile-ignores-go","app-glob-mismatch","rendered-skill-tooling"):
-    assert want in names, ("missing probe", want)
+    assert want in by_name, ("missing probe", want)
+# The headline light-profile leak (Leak B) must read CLEAN now that the fix flags-the-absence.
+assert by_name["light-profile-ignores-go"]["status"]=="clean", \
+    ("Leak B should be CLOSED (light profile must no longer green-light a broken .go)",
+     by_name["light-profile-ignores-go"])
 for p in d["probes"]:
     assert p["status"] in ("leak","clean","skip"), p
-print("scorecard ok: leaks=%d clean=%d skip=%d" % (d["leaks"],d["clean"],d["skipped"]))
+print("scorecard ok: leaks=%d clean=%d skip=%d (Leak B closed)" % (d["leaks"],d["clean"],d["skipped"]))
 PY
 echo "PASS (b) all documented leaks reproduce — $(sed -n 's/.*"result": *"\([^"]*\)".*/\1/p' "$SC" | head -1)"
 
-# ── (c) THE HEADLINE LEAK, DIRECTLY AGAINST healthcheck.sh ───────────────────────
-# Build a fresh fixture, break a .go file, and confirm the light profile calls it CLEAN.
+# ── (c) THE HEADLINE LEAK, DIRECTLY AGAINST healthcheck.sh — now CLOSED ───────────
+# Build a fresh fixture, break a .go file, and confirm the light profile NO LONGER green-lights it.
+# The invariant is stack-agnostic: with gofmt present the parse error reds it (exit 1); with gofmt
+# absent it is a data/env ⚠️ (exit 0). Either way the confident "✅ light clean" is gone — that
+# silent-green was Leak B. So the assertion is: the verdict is never a plain ✅-clean.
 bash "$FIXTURE" "$T/fx3" >/dev/null || fail "(c) fixture build failed"
 printf '\nfunc broken( {\n' >> "$T/fx3/internal/greet/greet.go"
 out_go="$(HERD_CONFIG_FILE=/dev/null bash "$HEALTHCHECK" "$T/fx3" --oneline 2>&1)"; rc_go=$?
-[ "$rc_go" -eq 0 ] || fail "(c) expected broken .go to pass light profile (exit 0), got rc=$rc_go: $out_go"
-printf '%s' "$out_go" | grep -qi 'clean' || fail "(c) expected 'clean' verdict for broken .go, got: $out_go"
-echo "PASS (c1) broken .go silently passes the light healthcheck: '$out_go' (exit 0)"
+if [ "$rc_go" -eq 0 ]; then
+  printf '%s' "$out_go" | grep -q '✅' \
+    && fail "(c1) broken .go must NOT pass as a confident '✅ light clean' (Leak B): '$out_go'"
+  printf '%s' "$out_go" | grep -q '⚠️' \
+    || fail "(c1) an unchecked broken .go should be flagged with a ⚠️ (got: '$out_go')"
+  echo "PASS (c1) broken .go is FLAGGED (⚠️, gofmt absent), never silently green-lit: '$out_go'"
+else
+  [ "$rc_go" -eq 1 ] || fail "(c1) unexpected rc=$rc_go for broken .go: $out_go"
+  echo "PASS (c1) broken .go is CAUGHT red (exit 1, gofmt present): '$out_go'"
+fi
 
 # Control: an equivalent broken .sh IS caught — proving the gate works, the gap is stack-specific.
 mkdir -p "$T/fx3/scripts"
