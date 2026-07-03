@@ -59,18 +59,48 @@ fi
 # controlling agent, so its agent_status is 'unknown' (or missing). So we count only ORPHAN tabs
 # (status not idle/working) and their panes, and fail only on a NET INCREASE. Watcher recreates of
 # an existing orphan net to zero; real lane churn never touches the orphan count. This is immune to
-# concurrent activity while still catching the exact leak this PR fixes. (Residual: a real headless
-# review·<slug> tab spawned by the watcher in this same window is also an orphan and could trip the
-# guard — rare, transient, and self-heals on re-run; a genuine leak persists and re-trips.)
+# concurrent activity while still catching the exact leak this PR fixes. SCOPING (issue #78): the scan
+# is restricted to THIS project's OWN herdr workspace (WORKSPACE_NAME → workspace_id) so an orphan in a
+# SIBLING project's workspace — or any other workspace entirely — never trips this guard; only a tab
+# leaked into OUR workspace counts. (Residual: a real headless review·<slug> tab spawned by the watcher
+# in this same window is also an orphan and could trip the guard — rare, transient, and self-heals on
+# re-run; a genuine leak persists and re-trips.)
+_hk_workspace_id() {
+  # Resolve THIS project's herdr workspace id (WORKSPACE_NAME → workspace_id via 'herdr workspace
+  # list'). Prints the id (no trailing newline) on success; empty when herdr is absent, the list
+  # call fails, or WORKSPACE_NAME is unset/unmatched (e.g. coordinator has not created the workspace
+  # yet). Used to SCOPE the orphan scan below to our OWN workspace only (issue #78).
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _ws=""
+  [ -f .herd/config ] && _ws="$(. .herd/config 2>/dev/null && printf '%s' "${WORKSPACE_NAME:-}")"
+  [ -n "$_ws" ] || return 0
+  herdr workspace list 2>/dev/null | LABEL="$_ws" python3 -c '
+import sys, json, os
+try:
+    wss = (json.load(sys.stdin).get("result") or {}).get("workspaces") or []
+    print(next((str(w.get("workspace_id", "")) for w in wss
+                if str(w.get("label", "")) == os.environ["LABEL"]), ""), end="")
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+
 _hk_orphans() {
   # Emits 'orphan-tabs:<N>' and 'orphan-panes:<M>' — N = live tabs with no controlling agent
   # (agent_status not in idle/working), M = their combined pane_count. Empty when herdr absent.
-  # Read-only; never mutates the workspace.
+  # SCOPED to $1 (this project's workspace id) when non-empty, so orphans in a SIBLING project's
+  # workspace are never counted (issue #78); falls back to ALL workspaces when $1 is empty (herdr
+  # present but our workspace unresolved — no worse than the pre-#78 behaviour). Read-only; never
+  # mutates the workspace.
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr tab list 2>/dev/null | python3 -c '
-import sys, json
+  herdr tab list 2>/dev/null | WSID="${1:-}" python3 -c '
+import sys, json, os
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
+    wsid = os.environ.get("WSID", "")
+    if wsid:
+        # Scope to THIS project workspace — ignore tabs owned by any other workspace.
+        tabs = [t for t in tabs if str(t.get("workspace_id", "")) == wsid]
     orphans = [t for t in tabs if str(t.get("agent_status", "")) not in ("idle", "working")]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
@@ -81,7 +111,11 @@ except Exception:
     pass
 ' 2>/dev/null || true
 }
-_hk_orphans_before="$(_hk_orphans)"
+# Resolve our workspace ONCE and reuse it for both the before and after snapshots, so the two are
+# scoped identically (issue #78 — the scan must never count another workspace's or sibling project's
+# tab, in either snapshot).
+_hk_wsid="$(_hk_workspace_id)"
+_hk_orphans_before="$(_hk_orphans "$_hk_wsid")"
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
@@ -101,7 +135,7 @@ fi
 # Leak-guard verdict: fail LOUDLY on a NET INCREASE in orphan tabs or orphan panes.
 leak_note="tab-leak-guard: clean"
 if command -v herdr >/dev/null 2>&1; then
-  _hk_orphans_after="$(_hk_orphans)"
+  _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
   _hk_leak="$(BEF="$_hk_orphans_before" AFT="$_hk_orphans_after" python3 -c '
 import os
 def parse(s):
