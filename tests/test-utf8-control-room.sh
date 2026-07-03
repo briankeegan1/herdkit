@@ -80,7 +80,9 @@ chmod +x "$BIN/herdr"
 # Run coordinator.sh under controlled PATH (stub herdr only). Skip the preflight to focus the test
 # on the layout-step error handling (preflight already has its own test in test-preflight.sh).
 # Capture combined stdout+stderr so we can assert on the ERROR message.
-coord_out=$(HERD_SKIP_PREFLIGHT=1 HERD_CONFIG_FILE="$T/.nonexistent" \
+# HERD_ALLOW_FOREIGN_CWD=1: focus this test on the workspace-resolve error path, bypassing the
+# issue #60 launch-binding cwd guard (this test runs from a $T cwd with a nonexistent config).
+coord_out=$(HERD_ALLOW_FOREIGN_CWD=1 HERD_SKIP_PREFLIGHT=1 HERD_CONFIG_FILE="$T/.nonexistent" \
   PATH="$BIN:$SYS" bash "$COORD" 2>&1); coord_rc=$?
 
 [ "$coord_rc" -ne 0 ] \

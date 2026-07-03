@@ -15,8 +15,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
+# rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
+HERD_REQUIRE_PROJECT_CONFIG=1
 . "$HERE/herd-config.sh"
 REPO="$PROJECT_ROOT"
+herd_console_guard "coordinator" || exit 1
 
 # 0. Fail fast if herdr is missing or its CLI/JSON contract has skewed — otherwise the very first
 #    `herdr tab create` below blows up cryptically.

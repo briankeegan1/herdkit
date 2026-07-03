@@ -5,7 +5,11 @@
 # Uses the bundled style if present, else glow dark, else cat.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
+# rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
+HERD_REQUIRE_PROJECT_CONFIG=1
 . "$HERE/herd-config.sh"
+herd_console_guard "backlog viewer" || exit 1
 REPO="$PROJECT_ROOT"
 f="$REPO/$BACKLOG_FILE"
 STYLE="$HERE/tokyonight.json"
