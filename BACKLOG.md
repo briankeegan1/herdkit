@@ -9,7 +9,7 @@
 
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
-- 🔜 **Watcher flexibility for long-pending deps** — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
+- 🚧 **Watcher flexibility for long-pending deps** *(worktree watcher-dep-states)* — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
 - 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + ownership/assignee filter; auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the required-checks gate (PR #5). `solo` default; `team` is a config flip.
 
 ## Workflow control & discoverability
@@ -24,8 +24,8 @@
 
 > Items ranked and sourced from `docs/external-consumer-audit.md` (Phase-4 external-consumer onboard, PR #100). Each entry retains its [P#] priority tag, leak letter, and file:line reference from the audit. 🚧 = in-progress worktree named below; 🔜 = queued.
 
-- 🔜 **[P1] Stack-aware init: thread scout's detected language through to templates, globs, and healthcheck** — ship Go/Rust/Java healthcheck templates; default `HEALTHCHECK_HEAVY_GLOB`/`APP_SURFACE_GLOB` to blank instead of `^app/` so non-Python repos don't inherit a Python-shaped default. *(Leaks D,B · bin/herd:144-157, config.example, capabilities.tsv:52-53)*
-- 🔜 **[P1] App-preview: de-Streamlit the launch+probe** — stop force-appending `--server.port`/`--server.headless` flags; make port range and health-probe endpoint configurable per consumer; treat "no probe configured" as health-unknown (⚠️), not red, so non-Streamlit apps don't trigger false failure. *(Leak C · app-monitor.sh:23,44, herd-feature.sh:124, herd-resolve.sh:71)*
+- 🚧 **[P1] Stack-aware init: thread scout's detected language through to templates, globs, and healthcheck** *(worktree stack-aware-init)* — ship Go/Rust/Java healthcheck templates; default `HEALTHCHECK_HEAVY_GLOB`/`APP_SURFACE_GLOB` to blank instead of `^app/` so non-Python repos don't inherit a Python-shaped default. *(Leaks D,B · bin/herd:144-157, config.example, capabilities.tsv:52-53)*
+- 🚧 **[P1] App-preview: de-Streamlit the launch+probe** *(worktree app-preview-de-streamlit)* — stop force-appending `--server.port`/`--server.headless` flags; make port range and health-probe endpoint configurable per consumer; treat "no probe configured" as health-unknown (⚠️), not red, so non-Streamlit apps don't trigger false failure. *(Leak C · app-monitor.sh:23,44, herd-feature.sh:124, herd-resolve.sh:71)*
 - 🔜 **[P2] De-Streamlit/de-Python the docs and copy** — scrub `st.testing`/`AppTest` wording, `.venv`/`data` `SHARE_LINKS` examples, and dividend-history slugs that appear across capabilities.tsv, config.example, healthcheck.sh, and lane templates so a non-Python consumer reads docs that speak to their stack. *(Leak C)*
 - 🔜 **[P2] De-brand doctor/README/coordinator output** — parameterize the literal `herdkit` name, 🐑 emoji, and `briankeegan1/herdkit` install source so a whitelabel consumer sees their own product name throughout. *(Leaks A,E,F)*
 - 🔜 **[P3] Renderable coordinator skill for non-herdr/non-Claude drivers** — factor the ~25 herdr/claude control incantations in `coordinator.md.tmpl` behind an indirection layer so teams using a different driver (VSCode extension, CI bot, etc.) can swap the control surface without forking the coordinator logic. *(Leak F)*
