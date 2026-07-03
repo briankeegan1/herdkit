@@ -33,3 +33,4 @@
 - ✅ **AUDIT deliverable: end-to-end flow redundancy findings — docs/flow-audit.md** *(PR #77, commit 14f7e42)* — ranked follow-up items from the audit still need triaging into individual backlog items
 - ✅ **Auto-refix / direct hand-offs bypass backlog reconciliation — option (b): link PRs to their backlog item so the reap step can close them** *(PR #82)* — option (a) 🚧 worktree backlog-autoreconcile (post-merge auto-reconcile hook in agent-watch.sh keyed by PR#+worktree-slug); fully ships when (a) merges
 - ✅ **Configurable watcher views** *(PR #84)*
+- ✅ **Claude-plugin wrapper** *(PR #83)*
