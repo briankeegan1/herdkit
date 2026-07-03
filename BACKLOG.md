@@ -17,7 +17,6 @@
 
 > Build order: F1 (merge policy) first; capabilities manifest + template-sync guard as one PR; init detection + flow-preference interview as one PR; herd config last (leans on the manifest for key validation).
 
-- 🚧 **Flow-preference interview + draft-PR flow** *(worktree: flow-preference)* — New `herd init` questions → config keys: `PR_FLOW=direct|draft` (draft: lanes instruct builders `gh pr create --draft`; watcher already holds `DRAFT`, agent-watch.sh:157), `PR_READY_WHEN=builder|coordinator|human`, `LOCAL_REVIEW=none|pre-pr` (run the review gate in the worktree BEFORE the PR is public vs today's post-PR review), `MERGE_METHOD`, `DELETE_BRANCH_ON_MERGE`; thread prefs into the lane rules text (herd-quick.sh:58-61, herd-feature.sh:50-53). **Bounded increment:** this PR covers init questions + config keys (PR_FLOW, PR_READY_WHEN, DELETE_BRANCH_ON_MERGE, LOCAL_REVIEW key-only) + draft-flow threading into the lanes; the LOCAL_REVIEW=pre-pr actual review-gate wiring is DEFERRED to a follow-up (touches the review gate) — keep this item annotated rather than fully closing on merge.
 - 🚧 **Coordinator 'Workflow settings' menu entry** *(worktree: coordinator-workflow-settings)* — coordinator menu gains a 'Workflow settings' entry to view/change any workflow pref anytime and relaunch affected pieces (watcher keys ⇒ restart; coordinator-facing keys ⇒ re-render skill); nothing is init-only. Follow-up to the `herd config` CLI (`list|get|set`) shipped in PR #85; keep this item until the menu entry ships.
 ## Reliability / safety
 
@@ -42,6 +41,7 @@
 
 ## Recently shipped
 
+- ✅ **Flow-preference interview + draft-PR flow** *(PR #89)*
 - ✅ **`herd upgrade` versioned migrations** *(PR #87)*
 - ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85)* — CLI only (`herd config list|get|set` with key validation + restart/re-render awareness); coordinator-menu 'Workflow settings' entry deferred as a follow-up 🔜
 - ✅ **Layout reconciler — engine must observe the live pane layout before mutating it (eyes-on-layout)** *(PR #76)*
@@ -51,4 +51,3 @@
 - ✅ **AUDIT deliverable: end-to-end flow redundancy findings — docs/flow-audit.md** *(PR #77, commit 14f7e42)* — ranked follow-up items from the audit still need triaging into individual backlog items
 - ✅ **Match builder spawn rate to REVIEW_CONCURRENCY** *(PR #79, commit 7ddfb7a)* — `SPAWN_AHEAD` config key; pre-spawn gate defers when `live_reviews + queued_reviews >= REVIEW_CONCURRENCY`; hermetic tests for saturated/cleared/force-spawn/`SPAWN_AHEAD=0` paths
 - ✅ **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17, PR #75, commit 193eb39)* — coordinator/scribe reconcile pass for PRs that rename or move the file paths, function names, or section headers that backlog entries point at
-- ✅ **Evidence-based model escalation — cheap by default, step up on the glob or a failed refix round** *(PR #81)*
