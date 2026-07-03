@@ -19,6 +19,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
 HERD_REQUIRE_PROJECT_CONFIG=1
 . "$HERE/herd-config.sh"
+# Shared eyes-on-layout helper: fold stray tabs + rewrite the .herd-panes registry from OBSERVED
+# state through the same primitives cmd_reload uses (functions only, no side effects on source).
+# shellcheck source=/dev/null
+. "$HERE/layout-reconcile.sh"
 REPO="$PROJECT_ROOT"
 herd_console_guard "coordinator" || exit 1
 
@@ -46,6 +50,10 @@ if [ -n "$WS" ]; then
   #     closing our existing coordinator tab — scoped to THIS workspace via `--workspace`, so we never
   #     close another project's coordinator tab that happens to share the same project-scoped label.
   herdr workspace focus "$WS" >/dev/null 2>&1 || true
+  # OBSERVE before mutating: fold away stray standalone control-room tabs (watch-<ws>/backlog-<ws>)
+  # a prior bad reload may have left — their roles belong inside the coordinator tab rebuilt below,
+  # and leaving them strands duplicate viewers/watchers off to the side.
+  layout_fold_stray_tabs "$WS" "$WORKSPACE_NAME"
   existing=$(herdr tab list --workspace "$WS" 2>"$_CE" | LABEL="$HERD_TAB_COORDINATOR" python3 -c \
     'import sys,json,os; d=json.load(sys.stdin); print(next((t["tab_id"] for t in d["result"]["tabs"] if t.get("label")==os.environ["LABEL"]), ""))' \
     2>>"$_CE") || _coord_die "tab list"
@@ -99,15 +107,10 @@ else
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ]   tab $TAB"
 fi
 
-# Record control-room pane IDs so 'herd reload' can refresh them in-place rather than
-# always creating standalone tabs. Each row is stamped with this workspace_id (4th column) so a
-# later reader can drop a hint that names a foreign workspace (issue #60). Written atomically;
-# reload re-writes on every run.
-mkdir -p "$WORKTREES_DIR"
-{
-  printf 'coordinator-agent %s %s %s\n' "$AGENT_PANE" "$TAB" "$WS"
-  printf 'backlog %s %s %s\n' "$ROOT" "$TAB" "$WS"
-  [ -n "${WPANE:-}" ] && printf 'watch %s %s %s\n' "$WPANE" "$TAB" "$WS"
-} > "$WORKTREES_DIR/.herd-panes"
+# Record control-room pane IDs so 'herd reload' can refresh them in-place rather than always
+# creating standalone tabs — written from the OBSERVED pane IDs this run just created, through the
+# shared writer (each row stamped with this workspace_id as a 4th column so a later reader can drop
+# a hint that names a foreign workspace, issue #60). reload re-writes on every run.
+layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}"
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"

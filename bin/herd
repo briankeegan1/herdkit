@@ -39,6 +39,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh"
 
+# Shared EYES-ON-LAYOUT helper: pane classification (_reload_pane_role/_reload_tab_panes/
+# _reload_tab_by_label), the layout_snapshot scan, layout_reconcile, and the single .herd-panes
+# registry writer. Defines functions only; every pane-mutating path observes the live layout
+# through it. cmd_reload and the herd pane subcommands consume it below; coordinator.sh sources it
+# too, so "observe before you mutate" lives in one place.
+# shellcheck source=/dev/null
+. "$SCRIPTS_DIR/layout-reconcile.sh"
+
 c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
@@ -854,15 +862,7 @@ except Exception: pass
 ' 2>/dev/null || true
 }
 
-# _reload_tab_by_label <workspace_id> <label> → tab_id, or empty.
-_reload_tab_by_label() {
-  herdr tab list --workspace "$1" 2>/dev/null | LABEL="$2" python3 -c '
-import sys,json,os
-try: tabs=json.load(sys.stdin)["result"]["tabs"]
-except Exception: tabs=[]
-print(next((t.get("tab_id","") for t in tabs if t.get("label")==os.environ["LABEL"]), ""), end="")
-' 2>/dev/null || true
-}
+# _reload_tab_by_label lives in layout-reconcile.sh (sourced above) — shared with coordinator.sh.
 
 # _reload_tab_create <workspace_id> <cwd> <label> → "tab_id pane_id", or empty.
 _reload_tab_create() {
@@ -899,40 +899,8 @@ print(next((a.get("pane_id","") for a in ag if not tab or a.get("tab_id")==tab),
 ' 2>/dev/null || true
 }
 
-# _reload_tab_panes <workspace_id> <tab_id> → pane_ids in that tab, one per line. The LIVE pane
-# roster is ground truth; the registry and neighbor queries are only hints that reload validates
-# against this list before trusting them.
-_reload_tab_panes() {
-  herdr pane list --workspace "$1" 2>/dev/null | TAB="$2" python3 -c '
-import sys,json,os
-try: panes=json.load(sys.stdin)["result"]["panes"]
-except Exception: panes=[]
-tab=os.environ["TAB"]
-for p in panes:
-    if p.get("tab_id")==tab and p.get("pane_id"): print(p["pane_id"])
-' 2>/dev/null || true
-}
-
-# _reload_pane_role <pane_id> → backlog|watch|agent|bare|busy|gone. Classifies a pane by the
-# process in its foreground (process-info) — the ground truth the canonical roles map onto: the
-# backlog viewer, the watcher (herd-watch execs agent-watch), a claude agent, an idle shell
-# (BARE, safe to reuse), or something else the human is running (BUSY — never hijacked).
-_reload_pane_role() {
-  herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
-import sys,json
-try: pi=json.load(sys.stdin)["result"]["process_info"]
-except Exception: print("gone"); sys.exit(0)
-sh=pi.get("shell_pid") or 0
-if not sh: print("gone"); sys.exit(0)
-fg=[p for p in (pi.get("foreground_processes") or []) if p.get("pid")!=sh]
-def has(*subs): return any(any(s in (p.get("cmdline") or "") for s in subs) for p in fg)
-if has("backlog-view.sh"): print("backlog")
-elif has("agent-watch.sh","herd-watch.sh"): print("watch")
-elif has("claude"): print("agent")
-elif fg: print("busy")
-else: print("bare")
-' 2>/dev/null || printf 'gone\n'
-}
+# _reload_tab_panes and _reload_pane_role live in layout-reconcile.sh (sourced above) — the shared
+# eyes-on-layout scan/classify primitives, consumed here and by layout_snapshot/layout_reconcile.
 
 # ── .herd-panes per-workspace hint validation (issue #60, failure mode 3) ──────────────────────────
 # Registry rows are `role pane_id tab_id [workspace_id]`. Readers historically trusted a row on the
@@ -1285,24 +1253,20 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
         # Fold away stray standalone control-room tabs left by earlier bad reloads; their roles
         # are re-established inside the coordinator tab below (backlog is stateless, the watcher
         # was already stopped in step 1).
-        local slabel stab
-        for slabel in "watch-${WORKSPACE_NAME}" "backlog-${WORKSPACE_NAME}"; do
-          stab="$(_reload_tab_by_label "$ws" "$slabel")"
-          [ -n "$stab" ] && { herdr tab close "$stab" >/dev/null 2>&1 || true; }
-        done
+        layout_fold_stray_tabs "$ws" "$WORKSPACE_NAME"
 
-        # SNAPSHOT: classify every pane in the coordinator tab by its foreground process. The
-        # live roster — not the registry — is ground truth. Duplicate backlog viewers (a stale
-        # registry once split a SECOND one beside a still-live viewer) are collected for closing.
-        local tab_panes p first_backlog="" dup_backlogs="" cand_panes=""
-        tab_panes="$(_reload_tab_panes "$ws" "$coord_tab")"
-        while IFS= read -r p; do
+        # SNAPSHOT: classify every pane in the coordinator tab by its foreground process (the shared
+        # eyes-on-layout scan). The live roster — not the registry — is ground truth. Duplicate
+        # backlog viewers (a stale registry once split a SECOND one beside a still-live viewer) are
+        # collected for closing.
+        local p first_backlog="" dup_backlogs="" cand_panes="" _role
+        while IFS=$'\t' read -r _role p; do
           [ -n "$p" ] || continue
-          case "$(_reload_pane_role "$p")" in
+          case "$_role" in
             backlog) if [ -z "$first_backlog" ]; then first_backlog="$p"; else dup_backlogs="$dup_backlogs $p"; fi ;;
             *)       cand_panes="$cand_panes $p" ;;
           esac
-        done <<< "$tab_panes"
+        done <<< "$(layout_snapshot "$ws" "$coord_tab")"
 
         # ANCHOR: the coordinator pane is NEVER moved, closed, or restarted — it may be the very
         # shell running this reload. Resolve, in order: a live agent in the tab (authoritative;
@@ -1450,16 +1414,12 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
         warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  claude ${COORDINATOR_CMD}"
       fi
 
-      # REGISTRY: rewrite from the OBSERVED final state on every path, stamping each row with the
-      # resolved workspace_id ($ws) as a 4th column so a later reader can drop a hint that names a
-      # foreign workspace (issue #60). mkdir -p is required — WORKTREES_DIR may not exist yet on a
-      # control room that predates the first feature build.
-      mkdir -p "$WORKTREES_DIR"
-      {
-        [ -n "${agent_pane:-}" ] && printf 'coordinator-agent %s %s %s\n' "$agent_pane" "$coord_tab" "$ws"
-        [ -n "${bPane:-}" ]      && printf 'backlog %s %s %s\n' "$bPane" "$coord_tab" "$ws"
-        [ -n "${wPane:-}" ]      && printf 'watch %s %s %s\n' "$wPane" "$coord_tab" "$ws"
-      } > "$WORKTREES_DIR/.herd-panes"
+      # REGISTRY: rewrite from the OBSERVED final state on every path via the shared writer,
+      # stamping each row with the resolved workspace_id ($ws) so a later reader can drop a hint
+      # that names a foreign workspace (issue #60). The writer mkdir -p's — WORKTREES_DIR may not
+      # exist yet on a control room that predates the first feature build.
+      layout_write_registry "$WORKTREES_DIR/.herd-panes" "$ws" "$coord_tab" \
+        "${agent_pane:-}" "${bPane:-}" "${wPane:-}"
     fi
   fi
 
@@ -1543,15 +1503,11 @@ except Exception: pass
 }
 
 # _pane_write_registry <agent> <backlog> <watch> — rewrite $WORKTREES_DIR/.herd-panes from the
-# OBSERVED final pane IDs (empty rows omitted). All three rows carry the coordinator tab id and the
-# resolved workspace_id (4th column) so a later reader can drop a hint naming a foreign workspace.
+# OBSERVED final pane IDs (empty rows omitted) via the shared writer. All three rows carry the
+# coordinator tab id and the resolved workspace_id (4th column) so a later reader can drop a hint
+# naming a foreign workspace.
 _pane_write_registry() {
-  mkdir -p "$WORKTREES_DIR"
-  {
-    [ -n "$1" ] && printf 'coordinator-agent %s %s %s\n' "$1" "$PANE_COORD_TAB" "$PANE_WS"
-    [ -n "$2" ] && printf 'backlog %s %s %s\n' "$2" "$PANE_COORD_TAB" "$PANE_WS"
-    [ -n "$3" ] && printf 'watch %s %s %s\n' "$3" "$PANE_COORD_TAB" "$PANE_WS"
-  } > "$WORKTREES_DIR/.herd-panes"
+  layout_write_registry "$WORKTREES_DIR/.herd-panes" "$PANE_WS" "$PANE_COORD_TAB" "$1" "$2" "$3"
 }
 
 # _pane_init — shared preamble for the pane subcommands. Resolves and PINS this project's
