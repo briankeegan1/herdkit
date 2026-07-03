@@ -1,0 +1,20 @@
+{
+  "name": "herdkit-coordinator",
+  "displayName": "herdkit coordinator",
+  "version": "0.1.0",
+  "description": "Thin wrapper that launches the herdkit coordinator inside Claude Code. The herdkit CLI (bin/herd) stays the source of truth: on invocation this plugin renders and hands off to the CLI-generated coordinator skill rather than duplicating any coordinator logic.",
+  "author": {
+    "name": "Brian Keegan"
+  },
+  "homepage": "https://github.com/briankeegan1/herdkit",
+  "repository": "https://github.com/briankeegan1/herdkit",
+  "license": "MIT",
+  "keywords": [
+    "herdkit",
+    "coordinator",
+    "multi-agent",
+    "worktree",
+    "backlog",
+    "herdr"
+  ]
+}
