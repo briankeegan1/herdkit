@@ -29,3 +29,4 @@
 - ✅ **Prompt-cache-aware prompt ordering — stable preamble before unique task** *(PR #80)*
 - ✅ **Evidence-based model escalation — cheap by default, step up on the glob or a failed refix round** *(PR #81)*
 - ✅ **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17, PR #75, commit 193eb39)* — coordinator/scribe reconcile pass for PRs that rename or move the file paths, function names, or section headers that backlog entries point at
+- ✅ **Match builder spawn rate to REVIEW_CONCURRENCY** *(PR #79, commit 7ddfb7a)* — `SPAWN_AHEAD` config key; pre-spawn gate defers when `live_reviews + queued_reviews >= REVIEW_CONCURRENCY`; hermetic tests for saturated/cleared/force-spawn/`SPAWN_AHEAD=0` paths
