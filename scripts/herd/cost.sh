@@ -27,12 +27,14 @@
 
 # _COST_REVIEWER_FINGERPRINT — the invariant opening of herd-review.sh's review task (both the
 # agent-pane AGENT_TASK and the headless TASK begin with "You are an ADVERSARIAL PRE-MERGE
-# CORRECTNESS REVIEWER for PR #<n>"). A session whose FIRST user message (its initial task prompt)
-# contains this string is the REVIEW session; everything else in the dir is BUILDER work. We gate
-# on the FIRST user message, NOT any occurrence, because a builder that merely READS herd-review.sh
-# would otherwise be misclassified — the fingerprint shows up in that read's tool_result, but a
-# tool_result is never a session's opening prompt, so first-message gating filters it out.
-_COST_REVIEWER_FINGERPRINT='ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for PR #'
+# CORRECTNESS REVIEWER for the project '<name>'"). A session whose FIRST user message (its initial
+# task prompt) contains this string is the REVIEW session; everything else in the dir is BUILDER
+# work. We gate on the FIRST user message, NOT any occurrence, because a builder that merely READS
+# herd-review.sh would otherwise be misclassified — the fingerprint shows up in that read's
+# tool_result, but a tool_result is never a session's opening prompt, so first-message gating filters
+# it out. NOTE: prompt-cache-aware ordering moved the unique 'PR #<n>' to the prompt's TAIL, so the
+# fingerprint keys on the stable 'for the project' preamble that now leads (not 'for PR #').
+_COST_REVIEWER_FINGERPRINT='ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '
 
 # ── PERISHABLE PRICE TABLE ────────────────────────────────────────────────────────────────────
 # ⚠️ VERIFY AGAINST CURRENT PRICING — as of 2026-06-24.

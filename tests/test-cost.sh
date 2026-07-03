@@ -54,7 +54,7 @@ JNL
 
 # Review session in the SAME dir: user message carries the stable reviewer fingerprint.
 cat > "$DIR/review.jsonl" <<'JNL'
-{"type":"user","message":{"role":"user","content":"You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for PR #42 (branch slug 'slug1')."}}
+{"type":"user","message":{"role":"user","content":"You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project 'herdkit', where a SILENTLY WRONG result is the worst outcome. THIS REVIEW: the pull request under review is PR #42 (branch slug 'slug1')."}}
 {"type":"assistant","message":{"role":"assistant","id":"r1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":500000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
 JNL
 

@@ -88,7 +88,10 @@ If your feature needs a manual step you cannot perform yourself (a live smoke te
 # herd_write_task_spec is FAIL-LOUD: a failed/partial spec write returns non-zero and — under
 # 'set -euo pipefail' — this command substitution aborts the lane BEFORE the 'herdr agent start …
 # claude' call below, so a builder is never spawned against a missing/truncated spec (the #69 fix).
-if [ -n "$TASK" ]; then SPEC="$TASK"$'\n\n'"$RULES"; else SPEC="$RULES"; fi
+# Prompt-cache-aware ordering: the STABLE workflow-rules preamble MUST lead so many close-in-time
+# builder prompts share the cached prefix (Anthropic's cache keys on the longest shared PREFIX,
+# 5-min TTL); the UNIQUE caller task trails. Empty task → rules alone.
+if [ -n "$TASK" ]; then SPEC="$RULES"$'\n\n'"$TASK"; else SPEC="$RULES"; fi
 TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
 herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
