@@ -828,9 +828,22 @@ except Exception: pass
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
 # Enabled by REVIEW_AUTOFIX=true in .herd/config (default false). When the watcher records a
 # BLOCK verdict for PR <n> (slug S), it finds S's AGENT pane (NOT the tab's root shell pane —
-# text sent there vanishes and the agent never wakes), sends a re-task prompt via herdr pane run,
-# and verifies agent_status flips to "working" within HERD_REFIX_WAIT_TIMEOUT seconds (default 15),
-# retrying once. On persistent failure it surfaces "needs you · auto-refix failed" on the row.
+# text sent there vanishes and the agent never wakes) REGARDLESS of whether the agent reads idle
+# or 'done', and submits the re-task prompt via `herdr pane run` — command text + Enter, the one
+# mechanism that actually SUBMITS the prompt (cf. the 'herdr agent send doesn't press Enter' gotcha).
+# A 'done' builder's Claude TUI is still up and waiting, so this raw submit wakes it instantly, the
+# same way a manual `herdr pane run <pane> <text>` does (issue #86). It then verifies agent_status
+# flips to "working" over a BACKED-OFF poll window (several checks across ~HERD_REFIX_WAIT_TIMEOUT
+# seconds, default 15, per attempt), re-sending once before giving up. On persistent failure it
+# surfaces "needs you · auto-refix failed" on the row.
+#
+# HISTORY (issue #86): the bounce used to reserve 'done' builders for a `claude --continue` relaunch
+# (_resume_builder), on the theory their session had ENDED. But a 'done' agent's TUI is still in the
+# pane foreground, so the `cd … && claude --continue …` command line was typed into that TUI as
+# literal prompt text and never re-tasked the agent — the bounce escalated woke=0 (journal:
+# 'auto-refix wake woke=0 escalated=true (done → done)') even though a raw `herdr pane run` nudge
+# wakes the exact same agent. The raw-prompt submit below is now the single wake path for idle AND
+# done builders; _resume_builder remains for the limit-auto-resume scheduler (a truly-frozen session).
 #
 # Sha-keyed refix-once semantics mirror review-once: one bounce per BLOCK per sha. A new commit
 # changes the sha → a fresh bounce is eligible for the new sha's BLOCK (if any). Total bounces
@@ -900,14 +913,19 @@ except Exception:
 ' 2>/dev/null || true
 }
 
-# _wait_agent_working <slug> <timeout-s> — poll herdr agent list until agent_status is "working"
-# or the timeout expires. Returns 0 if the agent woke; 1 if timeout expired.
+# _wait_agent_working <slug> <window-s> — poll `herdr agent list` until the agent's status is
+# "working" or the window expires, on a BACKED-OFF cadence: an immediate check, then 1s, 2s, 3s…
+# capped at 5s between checks. Several spread-out checks across the window catch a builder that
+# takes a few seconds to pick up a freshly-submitted prompt (issue #86 — the wake is not always
+# instant) without hammering herdr every second for the full window. Returns 0 if it woke, 1 if not.
 _wait_agent_working() {
-  local _waw_slug="$1" _waw_timeout="$2" _waw_deadline
-  _waw_deadline=$(( $(date +%s) + _waw_timeout ))
+  local _waw_slug="$1" _waw_window="$2" _waw_deadline _waw_int=1
+  _waw_deadline=$(( $(date +%s) + _waw_window ))
+  [ "$(_agent_status "$_waw_slug")" = "working" ] && return 0
   while [ "$(date +%s)" -lt "$_waw_deadline" ]; do
+    sleep "$_waw_int"
     [ "$(_agent_status "$_waw_slug")" = "working" ] && return 0
-    sleep 1
+    [ "$_waw_int" -lt 5 ] && _waw_int=$(( _waw_int + 1 ))
   done
   return 1
 }
@@ -960,15 +978,20 @@ _handle_block_verdict() {
       local _hbv_prompt
       _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
-      _hbv_pane_id="$(_find_builder_pane_id "$_hbv_slug")"
+      # Target the builder's AGENT pane whether it reads idle OR 'done' (never a 'working' one) —
+      # a 'done' builder's Claude TUI is still up and waiting, so submitting the raw re-task prompt
+      # via `herdr pane run` (command text + Enter) wakes it exactly as a manual nudge does (issue
+      # #86). This is the SINGLE wake path for both states; the old idle-only lookup + `--continue`
+      # resume for 'done' builders never actually re-tasked them (woke=0 → escalated on every BLOCK).
+      _hbv_pane_id="$(_find_builder_pane_id_any "$_hbv_slug")"
       if [ -n "$_hbv_pane_id" ]; then
-        # LIVE, idle builder: type the re-task prompt into its agent pane, verify wake, retry once.
-        herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+        # Submit the prompt via the run/Enter path, then verify wake over a backed-off window; if the
+        # first window expires, re-send once (in case pane run dropped the line) and verify again.
+        herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
         if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
           _hbv_woke=1
         else
-          # First wait expired → retry once (re-send the prompt in case pane run dropped it).
           herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
           if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
             _hbv_woke=1
@@ -978,22 +1001,8 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
           fi
         fi
       else
-        # No IDLE builder pane. The builder's session may have ENDED ('done') — the 2026-07-02
-        # incident where typed nudges could NOT wake it and the bounce escalated woke=0. Resume it
-        # IN PLACE via `claude --continue` (shared _resume_builder), seeding the refix prompt as the
-        # compose turn so the relaunched builder wakes straight onto the fix. The worktree follows
-        # the standing slug↔worktree convention ($WORKTREES_DIR/<slug>).
-        local _hbv_any_pane
-        _hbv_any_pane="$(_find_builder_pane_id_any "$_hbv_slug")"
-        if [ -n "$_hbv_any_pane" ] && _resume_builder "$_hbv_slug" "$TREES/$_hbv_slug" "$_hbv_any_pane" "$_hbv_prompt"; then
-          _hbv_woke=1
-        elif [ -n "$_hbv_any_pane" ]; then
-          DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · resume via --continue did not wake · check pane${C_RESET}"
-          _hbv_escalated=true
-        else
-          DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
-          _hbv_escalated=true
-        fi
+        DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
+        _hbv_escalated=true
       fi
       local _hbv_status_after
       _hbv_status_after="$(_agent_status "$_hbv_slug")"
