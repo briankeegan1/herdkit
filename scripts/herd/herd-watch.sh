@@ -16,4 +16,7 @@
 #     AGENT_WATCH_DRYRUN=1 bash scripts/herd/herd-watch.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# The launch-binding banner + foreign-cwd guard (issue #60) runs inside agent-watch.sh, which this
+# execs into (same process): it sets HERD_REQUIRE_PROJECT_CONFIG, prints the resolved
+# WORKSPACE_NAME/PROJECT_ROOT banner, and refuses a foreign $PWD unless HERD_ALLOW_FOREIGN_CWD=1.
 exec bash "$HERE/agent-watch.sh"

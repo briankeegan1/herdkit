@@ -56,8 +56,10 @@ export WORKSPACE_NAME="herdkit"       # matches the herdr stub's workspace label
 export HERD_SKIP_PREFLIGHT=1           # no real herdr contract to probe
 
 # ── (1) coordinator.sh wires MODEL_COORDINATOR ────────────────────────────────
+# HERD_ALLOW_FOREIGN_CWD=1: PROJECT_ROOT is a $T-scoped stub dir the test never cd's into, so the
+# launch-binding cwd guard (issue #60) would otherwise refuse; this test is about --model wiring.
 export HERDR_CALL_LOG="$T/coord.log"; : > "$HERDR_CALL_LOG"
-HERD_NO_WATCH=1 bash "$COORD" >/dev/null 2>&1 || fail "coordinator.sh exited non-zero under stubs"
+HERD_ALLOW_FOREIGN_CWD=1 HERD_NO_WATCH=1 bash "$COORD" >/dev/null 2>&1 || fail "coordinator.sh exited non-zero under stubs"
 grep -qE 'agent start .*-- claude --model SENTINEL-COORD-MODEL' "$HERDR_CALL_LOG" \
   || fail "coordinator.sh did not pass --model MODEL_COORDINATOR to claude (MODEL_COORDINATOR is dead)"$'\n'"$(cat "$HERDR_CALL_LOG")"
 

@@ -67,6 +67,12 @@ set -u
 # BASH_SOURCE (not $0) so HERE resolves correctly whether this file is executed or sourced
 # (the hermetic test sources it to exercise the pure merge-decision helper).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Launch-binding guard (issue #60): as a long-running console, require a REAL project config —
+# refuse to silently inherit the engine's dogfood config via the rule-3 fallback (enforced inside
+# herd-config.sh). Skipped in lib mode, where the hermetic tests source this file with their own
+# stubbed HERD_CONFIG_FILE and must not be refused. Set BEFORE sourcing so the check sees it; a
+# plain (unexported) var so it never leaks to spawned children, and re-set on each re-exec pass.
+[ "${AGENT_WATCH_LIB:-}" = "1" ] || HERD_REQUIRE_PROJECT_CONFIG=1
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
@@ -1209,6 +1215,14 @@ if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
   export HERD_WATCH_REEXEC=1
   exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
 fi
+
+# ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
+# Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
+# HERD_ALLOW_FOREIGN_CWD=1). Placed AFTER the argv0 re-exec so it prints exactly once, in the final
+# tagged process. The config-source refusal (herd-config.sh) already fired on the first pass if the
+# config was engine-dogfood-only; this catches the complementary case — a real config but a $PWD
+# that is not inside the project it resolves to.
+herd_console_guard "herd watch" || exit 1
 
 # ── Singleton spawn-lock: exactly one watcher per project ──────────────────────────────────────
 # Keyed by WORKSPACE_NAME (matching the coordinator/scribe/researcher pattern). Prevents duplicate
