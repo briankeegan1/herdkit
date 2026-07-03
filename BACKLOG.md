@@ -28,6 +28,8 @@
 - 🔜 **[P2] De-Streamlit/de-Python the docs and copy** — scrub `st.testing`/`AppTest` wording, `.venv`/`data` `SHARE_LINKS` examples, and dividend-history slugs that appear across capabilities.tsv, config.example, healthcheck.sh, and lane templates so a non-Python consumer reads docs that speak to their stack. *(Leak C)*
 - 🔜 **[P2] De-brand doctor/README/coordinator output** — parameterize the literal `herdkit` name, 🐑 emoji, and `briankeegan1/herdkit` install source so a whitelabel consumer sees their own product name throughout. *(Leaks A,E,F)*
 - 🔜 **[P3] Renderable coordinator skill for non-herdr/non-Claude drivers** — factor the ~25 herdr/claude control incantations in `coordinator.md.tmpl` behind an indirection layer so teams using a different driver (VSCode extension, CI bot, etc.) can swap the control surface without forking the coordinator logic. *(Leak F)*
+- 🔜 **capabilities.tsv: document watcher-dep-states config keys** *(follow-up to PR #107)* — the dep-state TTL + backoff thresholds added by the watcher-dep-states PR use hardcoded defaults; expose + document them as named config keys in capabilities.tsv + templates/config.example so external consumers can tune polling cadence and stall detection without reading source.
+- 🔜 **capabilities.tsv: document app-preview probe/port config keys** *(follow-up to PR #108)* — the configurable port range + health probe (path/command) added by app-preview-de-streamlit are read with inline defaults; expose + document them as named config keys in capabilities.tsv + templates/config.example so external consumers can configure their own port range and probe without editing source.
 
 ## Efficiency / cost
 
