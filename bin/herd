@@ -2839,6 +2839,7 @@ cmd_fleet() {
     list)      fleet_list "$@" ;;
     discover)  fleet_discover "$@" ;;
     status)    fleet_status "$@" ;;
+    digest)    fleet_digest "$@" ;;
     upgrade)   fleet_upgrade "$@" ;;
     reload)    fleet_reload "$@" ;;
     ""|-h|--help)
@@ -2850,6 +2851,8 @@ usage: herd fleet <subcommand>
   discover [--register] <root>...
                              scan roots for .herd/config; print (and optionally register) projects
   status                     per-project rollup: branch, open PRs, watcher alive?, last activity
+  digest [--since <dur>]     cross-project standup from each project's journal (shipped / needs-you /
+                             blocked / in-flight / gate failures over a window; default 24h; no LLM)
   upgrade                    run 'herd update' in every registered project (per-project outcomes)
   reload                     run 'herd reload' in every registered project (per-project outcomes)
 
@@ -2926,6 +2929,8 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                             scan roots for .herd/config projects
                                         status              per-project rollup (branch, open PRs,
                                                             watcher alive?, last journal activity)
+                                        digest [--since D]  cross-project standup from journals
+                                                            (shipped/needs-you/blocked/in-flight)
                                         upgrade             run 'herd update' in every project
                                         reload              run 'herd reload' in every project
   herd help                           this help
