@@ -136,6 +136,31 @@ fi
 # zero behavior change. See herd-quick.sh / herd-feature.sh for the resolution point.
 : "${MODEL_ESCALATE_GLOB:=""}"
 
+# ── Risk-tiered pre-merge review (REVIEW_ESCALATE_GLOB) ───────────────────────
+# By DEFAULT the adversarial review gate runs EVERY PR through the full $MODEL_REVIEW (Opus) — the
+# single biggest recurring engine cost. Setting REVIEW_ESCALATE_GLOB opts into RISK-PROPORTIONAL
+# review: the reviewer tier is chosen deterministically from the PR's changed-file paths (via
+# `gh pr diff <pr> --name-only`), analogous to HEALTHCHECK_HEAVY_GLOB / MODEL_ESCALATE_GLOB:
+#   • paths matching this egrep pattern (engine surface)      → STRONG tier ($MODEL_REVIEW, Opus)
+#   • a large diff (> $REVIEW_ESCALATE_MAXFILES files changed) → STRONG tier, even without a match
+#   • a docs/test-only diff (only *.md and tests/ paths)      → review SKIPPED entirely: a PASS is
+#       recorded with provenance source=skipped-low-risk (no reviewer spawned), still sha-keyed so
+#       it is never re-run
+#   • any other small, low-risk diff                          → CHEAP tier ($REVIEW_MODEL_CHEAP)
+# SAFE DEFAULT: leave REVIEW_ESCALATE_GLOB EMPTY (the default) and behavior is UNCHANGED — every PR
+# gets the full $MODEL_REVIEW review, no diff is classified at all. The tiering only activates when
+# the operator opts in by setting the glob.
+# TRADEOFF (must be explicit): a cheaper reviewer can MISS subtle correctness bugs, and glob/size
+# risk-classification can MISJUDGE a risky diff as low-risk. Classification therefore fails SAFE —
+# any uncertainty (unreadable or empty diff) escalates to the STRONG tier, never a downgrade — but
+# a mis-scoped glob is still an operator risk. Reserve the glob for genuinely engine-critical paths.
+: "${REVIEW_ESCALATE_GLOB:=""}"
+# Cheaper reviewer model tier for low-risk diffs when tiering is active (default: claude-sonnet-4-6).
+: "${REVIEW_MODEL_CHEAP:="claude-sonnet-4-6"}"
+# A tiered diff touching MORE than this many files escalates to the STRONG tier regardless of the
+# glob (a large diff is risky even when no single path matches). Default 10. Non-numeric → 10.
+: "${REVIEW_ESCALATE_MAXFILES:="10"}"
+
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')

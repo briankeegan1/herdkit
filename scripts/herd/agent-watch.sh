@@ -304,6 +304,47 @@ record_review() {
 
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
 _review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
+_review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
+
+# ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB) ─────────────────────────────────────
+# _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | SKIP.
+# Only ever called when REVIEW_ESCALATE_GLOB is set (the opt-in); with it empty the caller keeps
+# today's always-$MODEL_REVIEW path and this never runs. Classification is DETERMINISTIC and fails
+# SAFE — any uncertainty (unreadable/empty diff) → STRONG, never a downgrade:
+#   • only *.md / tests/ paths changed                  → SKIP  (no reviewer; PASS recorded low-risk)
+#   • any path matches REVIEW_ESCALATE_GLOB             → STRONG (engine surface)
+#   • more than REVIEW_ESCALATE_MAXFILES files changed  → STRONG (large diff)
+#   • otherwise (small, low-risk)                        → CHEAP  ($REVIEW_MODEL_CHEAP)
+_classify_review_tier() {
+  local pr="$1" paths n max
+  # Changed-file paths for THIS PR's diff. Any failure/empty list → STRONG (never downgrade blind).
+  paths="$(gh pr diff "$pr" --name-only 2>/dev/null | awk 'NF')"
+  [ -n "$paths" ] || { printf STRONG; return 0; }
+  # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ — i.e. NO line fails to match
+  # the docs/test pattern → skip the adversarial review entirely.
+  if ! printf '%s\n' "$paths" | grep -qvE '(\.md$)|(^tests/)'; then printf SKIP; return 0; fi
+  # Engine-surface glob match → full strong review.
+  if printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
+  # Large diff (many files) → strong even without a glob match.
+  n="$(printf '%s\n' "$paths" | grep -c .)"
+  max="${REVIEW_ESCALATE_MAXFILES:-10}"; case "$max" in ''|*[!0-9]*) max=10 ;; esac
+  if [ "$n" -gt "$max" ] 2>/dev/null; then printf STRONG; return 0; fi
+  # Small + low-risk → cheap reviewer tier.
+  printf CHEAP
+}
+
+# _review_tier <pr#> <headSha> — the tier for this exact pr+sha, CACHED sha-keyed (mirroring the
+# review-once ledger) so the `gh pr diff` classification runs at most ONCE per commit even while the
+# review sits QUEUED behind the concurrency cap. The cache is cleaned on verdict collection and on
+# stale-sha discard, exactly like the inflight/result markers.
+_review_tier() {
+  local pr="$1" sha="$2" cache tier
+  cache="$(_review_tier_file "$pr" "$sha")"
+  if [ -s "$cache" ]; then cat "$cache"; return 0; fi
+  tier="$(_classify_review_tier "$pr")"
+  printf '%s' "$tier" > "$cache" 2>/dev/null || true
+  printf '%s' "$tier"
+}
 
 # _review_pid_live <inflight-file> — true if the marker records a still-running reviewer pid.
 _review_pid_live() {
@@ -341,7 +382,7 @@ record_review_retry() {
 # marker so the concurrency slot frees up.
 _discard_stale_reviews() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"*; do
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -359,16 +400,24 @@ _discard_stale_reviews() {
 # Idempotent: an existing result file or live marker means this pr+sha is already handled — never
 # double-dispatch. Callers gate on concurrency/retries; this only guards identity.
 _dispatch_review() {
-  local pr="$1" slug="$2" sha="$3" result inflight
+  local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight
   result="$(_review_result_file "$pr" "$sha")"
   inflight="$(_review_inflight_file "$pr" "$sha")"
   [ -f "$result" ] && return 0
   [ -f "$inflight" ] && _review_pid_live "$inflight" && return 0
-  HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+  # <model> is the risk-tier's chosen reviewer model. EMPTY means "use the default path" — do NOT
+  # set HERD_REVIEW_MODEL, so herd-review.sh resolves $MODEL_REVIEW (and any operator-exported
+  # HERD_REVIEW_MODEL override still wins) exactly as before tiering existed. A non-empty model
+  # (the cheap tier) is passed through so the reviewer runs on that tier.
+  if [ -n "$model" ]; then
+    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+  else
+    HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+  fi
   local _dr_pid="$!"
   printf '%s\n' "$_dr_pid" > "$inflight"
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
-    model "${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}" log_path "$result"
+    model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
 }
 
 # _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
@@ -387,7 +436,7 @@ _review_gate_step() {
   # Collect a finished verdict: record to the ledger exactly as the synchronous gate did.
   if [ -f "$result" ]; then
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
-    rm -f "$result" "$inflight" 2>/dev/null || true
+    rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
@@ -410,8 +459,29 @@ _review_gate_step() {
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
+
+  # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB). Default (glob empty) → the STRONG
+  # tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no diff is classified
+  # at all. When the glob is set, classify this pr+sha's diff ONCE (cached, sha-keyed) and either skip
+  # the reviewer entirely (docs/test-only) or select the cheap vs strong model tier.
+  local _rt_model=""
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ]; then
+    local tier; tier="$(_review_tier "$pr" "$sha")"
+    if [ "$tier" = "SKIP" ]; then
+      # Docs/test-only diff: no reviewer is spawned. Record a sha-keyed PASS so it is never re-run,
+      # with a clear provenance note (source=skipped-low-risk) distinct from a real reviewer PASS.
+      # Decided BEFORE the concurrency gate — a skipped review consumes no reviewer slot, so it must
+      # never queue behind in-flight reviews.
+      record_review "$pr" "$sha" "PASS" "skipped-low-risk"
+      rm -f "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+      journal_append review_skipped pr "$pr" sha "$sha" reason "docs/test-only low-risk diff"
+      echo PASS; return 0
+    fi
+    [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
+  fi
+
   if [ "$(_count_live_reviews)" -ge "${REVIEW_CONCURRENCY:-2}" ]; then echo QUEUED; return 0; fi
-  _dispatch_review "$pr" "$slug" "$sha"
+  _dispatch_review "$pr" "$slug" "$sha" "$_rt_model"
   echo RUNNING
 }
 
