@@ -18,3 +18,6 @@
 - ✅ **Healthcheck must gate / flag interaction tests for app-facing PRs** *(PR #59)*
 - ✅ **Builder liveness: kill the cold-start false STALL flap** *(PR #63)*
 - ✅ **Model step-up + dynamic model selection for builder lanes** *(PR #64)*
+- ✅ **Auto-resume a limit-hit builder (claude --continue)** *(PR #71)*
+- ✅ **Launch-binding guard — engine scripts must refuse to run against the wrong project** *(PR #67)*
+- ✅ **Per-workspace argv0 marker for the watcher (cross-project kill-safety)** *(PR #65)*
