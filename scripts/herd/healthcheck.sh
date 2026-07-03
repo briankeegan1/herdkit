@@ -10,7 +10,10 @@
 #         0 = clean (or only a tolerated data/env issue)
 #         1 = a real CODE error
 #         2 = a data/env issue (tolerated — treated as clean, surfaced as a ⚠️)
-#   • light — no project command: per-changed-file syntax only (bash -n / py_compile). Fast.
+#   • light — no project command: per-changed-file syntax only (bash -n / py_compile / gofmt -e).
+#       Fast. Source types it has NO dependency-free probe for (.rs/.java/.ts/…) are never silently
+#       green-lit — they are flagged-the-absence with a loud ⚠️ (like the interaction gate), so a
+#       diff that only touches an unprobed language reads as ⚠️, never a confident ✅.
 #
 # Profile selection (auto):
 #   * no $HEALTHCHECK_CMD configured        → always light (pure syntax gate)
@@ -111,14 +114,27 @@ run_heavy() {
 }
 
 # ── light profile: per-changed-file syntax ───────────────────────────────────
+# Recognized source types get a syntax-only probe that needs NO project deps — a lone file parses
+# or it doesn't: bash -n (*.sh), py_compile (*.py), gofmt -e (*.go, a pure Go parser that ships with
+# the toolchain). Source types we have no dependency-free probe for (.rs/.java/.ts/…) are NOT
+# silently green: they are flagged-the-absence with a loud ⚠️ and folded into the summary, so a diff
+# that only touches an unprobed language never reads as a confident ✅ (Leak B, external-consumer
+# audit). A missing toolchain (e.g. no gofmt) is a data/env ⚠️ — never red. Non-source files (docs,
+# JSON, config) are ignored exactly as before. Only a REAL parse/syntax error is red (exit 1).
 run_light() {
   changed="$(_changed_files)"
-  sh=(); py=()
+  sh=(); py=(); go=(); unchecked=()
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] || continue
     case "$f" in
       *.sh) sh+=("$f") ;;
       *.py) py+=("$f") ;;
+      *.go) go+=("$f") ;;
+      # Source types with no dependency-free syntax probe here — a real compile would need the
+      # project's deps/toolchain, so we flag their presence rather than risk a false red or a false
+      # green. Extend this list (and add a probe above) as safe single-file checks become available.
+      *.rs|*.java|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.rb|*.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh|*.cs|*.kt|*.kts|*.swift|*.php|*.scala|*.m|*.mm|*.pl|*.lua|*.dart|*.ex|*.exs|*.clj|*.hs)
+        unchecked+=("$f") ;;
     esac
   done <<EOF
 $changed
@@ -136,20 +152,69 @@ EOF
     done
   fi
 
+  # Go: gofmt -e is a pure parser (no build, no deps) and ships with the Go toolchain. Present →
+  # probe and red only on a REAL parse error. Absent → the *.go files are unchecked-for-lack-of-
+  # toolchain, a data/env ⚠️ (never red), and never a confident clean.
+  ngo=${#go[@]}; gofmt_missing=0
+  if [ "$ngo" -gt 0 ]; then
+    if command -v gofmt >/dev/null 2>&1; then
+      for f in "${go[@]:-}"; do
+        [ -n "$f" ] || continue
+        err="$(gofmt -e "$f" 2>&1 >/dev/null)" || syntax_errs="${syntax_errs}gofmt -e $f → $(printf '%s' "$err" | tail -1)"$'\n'
+      done
+    else
+      gofmt_missing=1
+    fi
+  fi
+
   if [ -n "$syntax_errs" ]; then
     if [ -n "$ONELINE" ]; then echo "❌ light syntax — $(printf '%s' "$syntax_errs" | head -1)";
     else echo "❌ LIGHT CHECK: SYNTAX ERROR"; printf '%s' "$syntax_errs"; fi
     exit 1
   fi
 
-  nsh=${#sh[@]}; npy=${#py[@]}
+  nsh=${#sh[@]}; npy=${#py[@]}; nun=${#unchecked[@]}
+  # Per-language breakdown of the unchecked files (bash 3.2 has no assoc arrays → derive with sort):
+  # e.g. "2 rs, 1 java". Deterministic (alphabetical) so the summary line is stable.
+  unchecked_summary=""
+  if [ "$nun" -gt 0 ]; then
+    unchecked_summary="$(printf '%s\n' "${unchecked[@]:-}" | sed -e '/^$/d' -e 's/.*\.//' \
+      | sort | uniq -c | awk '{printf "%s%d %s", (NR>1?", ":""), $1, $2}')"
+  fi
+
+  # A "gap" is anything that stops this from being a confident clean: an unprobed language, or a
+  # probe we could not run (missing toolchain). Either flips the verdict to a loud ⚠️ — exit 0
+  # (a warning, like the interaction gate), never red, never a silent ✅.
+  gap=0
+  [ "$nun" -gt 0 ] && gap=1
+  [ "$gofmt_missing" -eq 1 ] && gap=1
+
   if [ -n "$ONELINE" ]; then
-    echo "✅ light clean — ${nsh} sh, ${npy} py ok"
+    if [ "$gap" -eq 1 ]; then
+      msg="⚠️  light: ${nsh} sh, ${npy} py"
+      [ "$ngo" -gt 0 ] && [ "$gofmt_missing" -eq 0 ] && msg="$msg, ${ngo} go"
+      msg="$msg ok"
+      [ "$nun" -gt 0 ] && msg="$msg · unchecked: ${unchecked_summary} (no light probe)"
+      [ "$gofmt_missing" -eq 1 ] && msg="$msg · ${ngo} go unchecked (gofmt not found — data/env)"
+      echo "$msg"
+    elif [ "$ngo" -gt 0 ]; then
+      echo "✅ light clean — ${nsh} sh, ${npy} py, ${ngo} go ok"
+    else
+      echo "✅ light clean — ${nsh} sh, ${npy} py ok"
+    fi
+    exit 0
+  fi
+
+  if [ "$gap" -eq 1 ]; then
+    echo "⚠️  LIGHT CHECK: UNCHECKED FILE TYPES (flagged, not a confident clean)"
   else
     echo "✅ LIGHT CHECK CLEAN (non-heavy change)"
-    echo "   shell:  ${nsh} changed *.sh — bash -n ok"
-    echo "   python: ${npy} changed *.py — py_compile ok"
   fi
+  echo "   shell:  ${nsh} changed *.sh — bash -n ok"
+  echo "   python: ${npy} changed *.py — py_compile ok"
+  [ "$ngo" -gt 0 ] && [ "$gofmt_missing" -eq 0 ] && echo "   go:     ${ngo} changed *.go — gofmt -e ok"
+  [ "$gofmt_missing" -eq 1 ] && echo "   ⚠️  go: gofmt not found — ${ngo} changed *.go unchecked (data/env, not a code error)"
+  [ "$nun" -gt 0 ] && echo "   ⚠️  unchecked: ${unchecked_summary} files (no light probe) — flagged, never green-lit"
   exit 0
 }
 
