@@ -9,7 +9,7 @@
 
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
-- 🔜 **Dispatch vs. dependency intent** — `herd report --to B` (fire-and-forget issue, default) vs `--to B --dep` / `herd depend B#id` (records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, never stuck. *(Gap 3 in `docs/gap-report-cross-repo-loop.md`: `.herd/deps` schema + `herd depend/deps list/rm`; depends on the link registry above for `--to <project>`.)*
+- 🚧 **Dispatch vs. dependency intent** *(worktree: dispatch-deps)* — `herd report --to B` (fire-and-forget issue, default) vs `--to B --dep` / `herd depend B#id` (records `blocked-on` + watched). Reclassify/remove via `herd deps rm|demote` — a dep is editable data, never stuck. *(Gap 3 in `docs/gap-report-cross-repo-loop.md`: `.herd/deps` schema + `herd depend/deps list/rm`; depends on the link registry above for `--to <project>`.)*
 - 🔜 **Watcher flexibility for long-pending deps** — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
 - 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + ownership/assignee filter; auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the required-checks gate (PR #5). `solo` default; `team` is a config flip.
 
