@@ -6,7 +6,6 @@
 
 ## Cross-repo orchestration (deferred — validate via a simulation FIRST, don't over-build; link registry foundation ✅ shipped PR #14)
 
-- 🚧 **`herd upgrade` versioned migrations** *(worktree herd-upgrade-migrations)* — `migrations/vN→vM.sh` transform a consumer's config/hooks to a new engine contract, so breaking changes are inherited without clobbering custom setup. *(Gap 4 in `docs/gap-report-cross-repo-loop.md`.)*
 
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
@@ -43,6 +42,7 @@
 
 ## Recently shipped
 
+- ✅ **`herd upgrade` versioned migrations** *(PR #87)*
 - ✅ **`herd config` + coordinator Workflow settings mode** *(PR #85)* — CLI only (`herd config list|get|set` with key validation + restart/re-render awareness); coordinator-menu 'Workflow settings' entry deferred as a follow-up 🔜
 - ✅ **Layout reconciler — engine must observe the live pane layout before mutating it (eyes-on-layout)** *(PR #76)*
 - ✅ **Claude-plugin wrapper** *(PR #83)*
@@ -52,4 +52,3 @@
 - ✅ **Match builder spawn rate to REVIEW_CONCURRENCY** *(PR #79, commit 7ddfb7a)* — `SPAWN_AHEAD` config key; pre-spawn gate defers when `live_reviews + queued_reviews >= REVIEW_CONCURRENCY`; hermetic tests for saturated/cleared/force-spawn/`SPAWN_AHEAD=0` paths
 - ✅ **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17, PR #75, commit 193eb39)* — coordinator/scribe reconcile pass for PRs that rename or move the file paths, function names, or section headers that backlog entries point at
 - ✅ **Evidence-based model escalation — cheap by default, step up on the glob or a failed refix round** *(PR #81)*
-- ✅ **Prompt-cache-aware prompt ordering — stable preamble before unique task** *(PR #80)*
