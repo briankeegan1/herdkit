@@ -10,3 +10,4 @@
 - ✅ **`herd pane <watch|backlog|coordinator>` — single-pane restart shortcuts** *(PR #53)*
 - ✅ **Stall detector: check worktree mtimes before flagging** *(PR #52)*
 - ✅ **Token efficiency free wins** *(PR #54)*
+- ✅ **Init-time GitHub detection** *(PR #55)*
