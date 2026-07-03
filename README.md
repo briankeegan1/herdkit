@@ -179,9 +179,12 @@ shows the standard `review blocked` row for the coordinator to re-task by hand.
 herdkit is **one engine, many consumers**. You almost never fork it:
 
 - **Consuming projects customize via `.herd/config` + project override hooks in their own repo** —
-  paths, branch, model map, the health command (`HEALTHCHECK_CMD`), the resolver smoke gate
-  (`SMOKE_CMD`), the review risk list (`REVIEW_CHECKLIST`), privacy paths (`DENY_PATHS`), the
-  work-tracker backend (`SCRIBE_BACKEND`), and the auto-merge lever. The generated skill renders
+  paths, branch, the workflow's own display brand (`WORKSPACE_NAME`, which surfaces in `herd doctor`
+  and the coordinator skill instead of the literal "herdkit"), model map, the health command
+  (`HEALTHCHECK_CMD`), the resolver smoke gate (`SMOKE_CMD`), the review risk list
+  (`REVIEW_CHECKLIST`), privacy paths (`DENY_PATHS`), the work-tracker backend (`SCRIBE_BACKEND`),
+  the engine-bug escalation target (`HERD_REPO` — where `herd report` files; not the herdkit
+  author's repo unless you leave it unset), and the auto-merge lever. The generated skill renders
   these in. **Not a fork.** Engine improvements arrive via `herd upgrade`.
 - **The herdkit owner develops the engine directly** in this repo (branch → PR → merge). herdkit is
   itself developed *using the herd* (its own `.herd/config`, `BACKLOG.md`, and coordinator skill —

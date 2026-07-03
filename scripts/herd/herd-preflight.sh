@@ -21,14 +21,24 @@
 #   HERDR_MIN_VERSION=X.Y   OPT-IN floor on `herdr --version`; empty (default) = shape-probe only.
 #                           Prefer the shape probe — version strings are brittle; this is a backstop.
 
+# _herd_brand — the display brand shown in user-facing doctor/preflight diagnostics. A consumer who
+# has branded their own workflow sees THEIR name instead of the literal "herdkit"; it defaults
+# through the current herdkit values so this repo's own output is byte-unchanged (external-consumer
+# audit, Leak A / ranked follow-up #7). Prefer the EXISTING config identity WORKSPACE_NAME (set in
+# .herd/config, sourced before this file); HERD_BRAND is an explicit override for when the display
+# brand and the workspace name should differ. FOLLOW-UP: a capabilities.tsv row for the brand knob is
+# owned by another PR — do NOT add one here; this inline default keeps herdkit's output unchanged.
+_herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
+
 herd_preflight() {
   [ "${HERD_SKIP_PREFLIGHT:-}" = "1" ] && return 0
+  local brand; brand="$(_herd_brand)"
 
   # (a) herdr must be on PATH at all.
   if ! command -v herdr >/dev/null 2>&1; then
     {
       echo "herdr not found on PATH."
-      echo "  herdr is the terminal/agent multiplexer that herdkit lanes drive (tab create,"
+      echo "  herdr is the terminal/agent multiplexer that $brand lanes drive (tab create,"
       echo "  agent start, pane split, tab list). It is a REQUIRED dependency — without it no"
       echo "  lane can launch a tab or sub-agent."
       echo "  Fix: install herdr and ensure it is on your PATH, then retry."
@@ -78,13 +88,13 @@ print("ok" if g >= m else "bad")
 # On any failure writes an actionable diagnostic to stderr and returns 1; silent + 0 on success.
 # Shared by herd_preflight (fatal guard) and herd_doctor (one-pass report).
 _herd_herdr_contract_probe() {
-  local out diag
+  local out diag brand; brand="$(_herd_brand)"
   if ! out="$(herdr tab list 2>/dev/null)"; then
     {
       echo "herdr CLI contract check failed."
       echo "  expected: a read-only \`herdr tab list\` to succeed and emit JSON"
       echo "  found:    \`herdr tab list\` exited non-zero"
-      echo "  Your herdr looks broken or incompatible with the shape herdkit's lanes parse."
+      echo "  Your herdr looks broken or incompatible with the shape $brand's lanes parse."
       echo "  Fix: upgrade/repair herdr, then retry.   (bypass: HERD_SKIP_PREFLIGHT=1)"
     } >&2
     return 1
@@ -116,7 +126,7 @@ print("OK")
         echo "  expected: \`herdr tab list\` JSON with a top-level result.tabs array"
         echo "            (the envelope lanes parse: result.tabs / result.tab.tab_id / result.root_pane.pane_id)"
         echo "  found:    ${diag#BAD:}"
-        echo "  Your herdr's output shape has skewed from what herdkit's lanes expect."
+        echo "  Your herdr's output shape has skewed from what $brand's lanes expect."
         echo "  Fix: upgrade herdr to a compatible version, then retry.   (bypass: HERD_SKIP_PREFLIGHT=1)"
       } >&2
       return 1
@@ -177,7 +187,7 @@ _herd_doctor_os() {
 # _herd_doctor_hint <tool> <os> — a one-line, copy-pasteable install hint for a missing dep (used by
 # both the REQUIRED and RECOMMENDED tiers).
 _herd_doctor_hint() {
-  local tool="$1" os="$2"
+  local tool="$1" os="$2" brand; brand="$(_herd_brand)"
   case "$tool" in
     git)
       case "$os" in
@@ -203,7 +213,7 @@ _herd_doctor_hint() {
         *)       printf 'install Python 3.7+ — https://python.org' ;;
       esac ;;
     herdr)
-      printf 'install the herdr CLI (the terminal/agent multiplexer herdkit drives) and ensure it is on PATH' ;;
+      printf 'install the herdr CLI (the terminal/agent multiplexer %s drives) and ensure it is on PATH' "$brand" ;;
     *)
       printf 'install %s and ensure it is on PATH' "$tool" ;;
   esac
@@ -258,7 +268,8 @@ _herd_doctor_recommend() {
 herd_doctor() {
   [ "${HERD_SKIP_DOCTOR:-}" = "1" ] && return 0
 
-  local os hard_fail=0 warn=0 tool
+  local os hard_fail=0 warn=0 tool brand
+  brand="$(_herd_brand)"
   os="$(_herd_doctor_os)"
   printf 'herd doctor \xe2\x80\x94 checking dependencies (platform: %s)\n\n' "$os"
 
@@ -298,7 +309,7 @@ herd_doctor() {
       printf '  \xe2\x9c\x93 herdr JSON contract\n'
     else
       printf '  \xe2\x9a\xa0 herdr JSON contract \xe2\x80\x94 `herdr tab list` failed or its JSON shape has skewed\n'
-      printf '      fix: upgrade/repair herdr to a version herdkit lanes can parse\n'
+      printf '      fix: upgrade/repair herdr to a version %s lanes can parse\n' "$brand"
       warn=$((warn+1))
     fi
   else
@@ -319,7 +330,7 @@ herd_doctor() {
       OK)
         printf '  \xe2\x9c\x93 python3 UTF-8 (stdout encoding: %s)\n' "$enc" ;;
       FIXED)
-        printf '  \xe2\x9c\x93 python3 UTF-8 (default encoding %s can'\''t emit UTF-8; herdkit exports PYTHONUTF8=1 to fix it)\n' "$enc" ;;
+        printf '  \xe2\x9c\x93 python3 UTF-8 (default encoding %s can'\''t emit UTF-8; %s exports PYTHONUTF8=1 to fix it)\n' "$enc" "$brand" ;;
       *)
         printf '  \xe2\x9a\xa0 python3 UTF-8 \xe2\x80\x94 cannot emit UTF-8 even with PYTHONUTF8=1 (encoding: %s)\n' "$enc"
         printf '      fix: upgrade to Python 3.7+ \xe2\x80\x94 herd scripts print emoji/box-drawing pane labels through python3\n'
