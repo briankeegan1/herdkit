@@ -48,6 +48,23 @@ MERGE_POLICY="auto"
 # merge method — the gh pr merge strategy applied by do_merge (default: merge commit).
 MERGE_METHOD="merge"    # merge | squash | rebase
 
+# PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
+# a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
+#   PR_FLOW:       direct — open PRs ready to merge (default, today's behavior).
+#                  draft  — builder opens `gh pr create --draft`; the watcher already holds DRAFT
+#                           PRs until they are marked ready.
+#   PR_READY_WHEN: who promotes a DRAFT to ready — builder (self, once the healthcheck passes) |
+#                  coordinator | human. Only consulted when PR_FLOW=draft.
+PR_FLOW="direct"          # direct | draft
+PR_READY_WHEN="builder"   # builder | coordinator | human   (only used when PR_FLOW=draft)
+
+# delete the head branch after a merge. false (default) preserves today's behavior (branches kept).
+DELETE_BRANCH_ON_MERGE="false"   # true | false
+
+# pre-PR local review mode. NOTE: the `pre-pr` behavior is NOT wired yet (it touches the review gate /
+# agent-watch.sh / herd-review.sh, owned by another lane) — documented here but not yet consumed.
+LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-up)
+
 # legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
 #   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
 #   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)

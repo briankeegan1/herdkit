@@ -443,6 +443,18 @@ cmd_init() {
   merge_policy="$(ask "MERGE_POLICY (auto merges on green / approve holds for sign-off / observe never merges)" "$det_policy")"
   merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
 
+  # 4c. PR flow — how builders open PRs. SAFE DEFAULTS preserve today's EXACT behavior: direct PRs
+  #     opened ready, builder-owned readiness, branches retained on merge, and no pre-PR local review.
+  say ""
+  say "${c_bold}PR flow${c_rst}"
+  local pr_flow pr_ready delete_branch local_review
+  pr_flow="$(ask "PR_FLOW (direct = open PRs ready to merge | draft = open as draft, held by the watcher until marked ready)" "direct")"
+  pr_ready="$(ask "PR_READY_WHEN (who marks a DRAFT PR ready: builder = self after healthcheck | coordinator | human; only used when PR_FLOW=draft)" "builder")"
+  delete_branch="$(ask "DELETE_BRANCH_ON_MERGE (delete the head branch after merge: true | false)" "false")"
+  # LOCAL_REVIEW is written + documented here, but its pre-pr behavior is DEFERRED to a follow-up lane
+  # (that wiring touches the review gate / agent-watch.sh / herd-review.sh, owned elsewhere).
+  local_review="$(ask "LOCAL_REVIEW (none | pre-pr — pre-pr wiring is deferred; leave 'none')" "none")"
+
   # 5. Write .herd/config.
   mkdir -p "$project_root/.herd"
   local cfg="$project_root/.herd/config"
@@ -486,6 +498,22 @@ MERGE_POLICY="$merge_policy"
 MERGE_METHOD="$merge_method"
 WATCHER_AUTOMERGE="true"
 HERD_REPO="$herd_repo"
+
+# PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's EXACT behavior:
+# a plain 'gh pr create'. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
+#   PR_FLOW:       direct (open PRs ready, today's behavior) | draft (builder opens 'gh pr create
+#                  --draft'; the watcher already HOLDS draft PRs until they are marked ready).
+#   PR_READY_WHEN: who promotes a DRAFT to ready — builder (self, once the healthcheck passes) |
+#                  coordinator | human. Only consulted when PR_FLOW=draft.
+PR_FLOW="$pr_flow"
+PR_READY_WHEN="$pr_ready"
+# DELETE_BRANCH_ON_MERGE — delete the head branch after a merge. Default false preserves today's
+# behavior (the watcher retains branches on merge).
+DELETE_BRANCH_ON_MERGE="$delete_branch"
+# LOCAL_REVIEW — none (default) | pre-pr. NOTE: the pre-pr review behavior is NOT wired yet (that
+# touches the review gate / agent-watch.sh / herd-review.sh, owned by another lane); this key is
+# documented and written but not yet consumed. Deferred follow-up: wire pre-pr local review.
+LOCAL_REVIEW="$local_review"
 EOF
   ok "wrote $cfg"
 
