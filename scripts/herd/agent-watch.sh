@@ -355,6 +355,21 @@ record_review() {
 # re-dispatched (bounded by $_REVIEW_RETRY_MAX per sha). A result file for a STALE sha (the PR has
 # a newer head) is discarded unread. INFRA-FAIL results are retried, never cached.
 # HERD_REVIEW_BIN is a test seam: the hermetic suite points it at a stub reviewer.
+#
+# LOCAL_REVIEW=pre-pr AND THIS POST-PR GATE (belt-and-suspenders — DELIBERATELY NOT SKIPPED):
+# When LOCAL_REVIEW=pre-pr, the builder lanes (herd-quick.sh / herd-feature.sh) already ran
+# `herd-review.sh --local <slug>` in the worktree and required a 'REVIEW: PASS' BEFORE opening the
+# PR. It is TEMPTING to let a builder-stamped "locally-reviewed PASS @ <sha>" marker make this
+# watcher-side gate TRUST/SKIP the review for that sha and save the second Opus pass. We intentionally
+# do NOT do that: the local pre-PR review is best-effort and UNTRUSTED at the merge boundary — the
+# PR head can differ from what was reviewed locally (a rebase/force-push/amend after the local pass,
+# or an added commit), and a marker is builder-written so a buggy or confused builder could stamp a
+# PASS that never really happened. Skipping a needed review to save tokens is exactly the
+# silently-wrong failure mode this gate exists to prevent, so the post-PR review ALWAYS runs against
+# the ACTUAL PR head sha regardless of any local pre-PR pass. The local review's value is catching a
+# BLOCK earlier + cheaper (in the worktree, before the PR is public), NOT replacing this gate. If a
+# trusted-skip optimization is ever wanted, it must first tie the marker to the exact PR head sha and
+# authenticate it — correctness (never skip a needed review) beats the token saving.
 : "${HERD_REVIEW_BIN:="$HERE/herd-review.sh"}"
 
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }

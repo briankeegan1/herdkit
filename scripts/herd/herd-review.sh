@@ -65,6 +65,15 @@
 # Standalone:
 #   herd-review.sh 57 dividend-history
 # Or driven by agent-watch.sh as the pre-merge gate.
+#
+# LOCAL (pre-PR) MODE:
+#   herd-review.sh --local <slug>
+# Reviews the worktree's LOCAL diff ('git diff DEFAULT_BRANCH...HEAD') BEFORE any PR exists — used by
+# the builder lanes when LOCAL_REVIEW=pre-pr so a correctness BLOCK is caught + fixed locally before
+# the PR is made public. It reuses the EXACT same adversarial correctness prompt + PASS/BLOCK/INFRA-FAIL
+# contract and exit codes (0=PASS, 1=BLOCK, 2=INFRA-FAIL) as PR mode; the only differences are it reads
+# the local diff instead of 'gh pr diff <pr>', posts NO PR comment (there is no PR yet), and runs
+# headless with no herdr pane. The default PR mode is byte-for-byte unchanged.
 set -u
 
 # ── Distinctive argv0 so kill-by-pattern sweeps can EXCLUDE the reviewer chain ─────────────────
@@ -83,8 +92,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Engine journal — record log retention + infra deaths (best-effort, never breaks the gate).
 . "$HERE/journal.sh"
 MAIN="$PROJECT_ROOT"
-PR="${1:?usage: herd-review.sh <pr> <slug>}"
-SLUG="${2:?usage: herd-review.sh <pr> <slug>}"
+# Mode: default PR review (<pr> <slug>); --local reviews the worktree's LOCAL diff (<slug>) BEFORE any
+# PR exists. Local mode reuses the SAME adversarial prompt + PASS/BLOCK/INFRA-FAIL contract below, but
+# reads 'git diff DEFAULT_BRANCH...HEAD' instead of 'gh pr diff <pr>', posts no PR comment, and skips
+# all the herdr-pane / result-file / ledger machinery (that is watcher-only). PR is empty in this mode.
+REVIEW_MODE="pr"
+if [ "${1:-}" = "--local" ]; then REVIEW_MODE="local"; shift; fi
+if [ "$REVIEW_MODE" = "local" ]; then
+  PR=""
+  SLUG="${1:?usage: herd-review.sh --local <slug>}"
+else
+  PR="${1:?usage: herd-review.sh <pr> <slug>}"
+  SLUG="${2:?usage: herd-review.sh <pr> <slug>}"
+fi
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
@@ -144,6 +164,44 @@ if [ -n "$_cl_path" ]; then
 $(cat "$_cl_path" 2>/dev/null)"
 fi
 
+# Shared headless-stream formatter — emits tool name + one-line input summary (bash command, file
+# path, etc.) and the reviewer's reasoning text, never a bare '[tool] Bash'. Used by BOTH the headless
+# PR path and the local (pre-PR) path so their output rendering stays identical. Single-quoted so no
+# shell expansion touches the python; contains no single quotes.
+REVIEW_STREAM_FORMATTER='
+import sys, json
+for line in sys.stdin:
+    line = line.rstrip()
+    if not line: continue
+    try: obj = json.loads(line)
+    except Exception: print(line, flush=True); continue
+    t = obj.get("type", "")
+    if t == "assistant":
+        for b in obj.get("message", {}).get("content", []):
+            if b.get("type") == "text":
+                txt = b.get("text", "").strip()
+                if txt: print("  " + txt.split("\n")[0][:100], flush=True)
+            elif b.get("type") == "tool_use":
+                name = b.get("name", "?")
+                inp  = b.get("input") or {}
+                if name == "Bash":
+                    cmd  = str(inp.get("command") or inp.get("cmd") or "").strip()
+                    hint = cmd.split("\n")[0][:80] if cmd else ""
+                elif name in ("Read", "Write", "Edit"):
+                    hint = str(inp.get("file_path") or inp.get("path") or "")[:80]
+                elif name == "WebFetch":
+                    hint = str(inp.get("url") or "")[:80]
+                elif name == "WebSearch":
+                    hint = str(inp.get("query") or "")[:80]
+                else:
+                    first_val = next(iter(inp.values()), "") if inp else ""
+                    hint = str(first_val)[:80] if first_val else ""
+                print(("  [" + name + "] " + hint) if hint else ("  [" + name + "]"), flush=True)
+    elif t == "result":
+        r = obj.get("result", "")
+        if r: print(r, flush=True)
+'
+
 # _mark_review_done <PASS|BLOCK> — write a persistent verdict banner to $LOG and update the
 # herdr pane label so the user sees the outcome in the tailing pane. Called before every exit
 # so the pane is useful after the review finishes (not just during). Best-effort: any herdr
@@ -179,6 +237,51 @@ emit_infra_fail() {
   _emit_verdict "REVIEW: INFRA-FAIL — $1"
   exit 2
 }
+
+# ── LOCAL (pre-PR) MODE ──────────────────────────────────────────────────────────────────────────
+# When invoked as `herd-review.sh --local <slug>`, review the worktree's LOCAL diff BEFORE any PR
+# exists (the LOCAL_REVIEW=pre-pr path). Same adversarial correctness prompt + PASS/BLOCK/INFRA-FAIL
+# contract + exit codes as PR mode, but: reads 'git diff DEFAULT_BRANCH...HEAD' instead of a PR diff,
+# posts NO PR comment, runs headless (no herdr pane), and uses a transient log (no persistent pane
+# tails it, so it is removed on exit). This block RETURNS via exit — the PR-only machinery below never
+# runs in local mode.
+if [ "$REVIEW_MODE" = "local" ]; then
+  _local_diff_cmd="git diff ${DEFAULT_BRANCH}...HEAD"
+  # Same STABLE adversarial preamble + checklist + RULES as TASK, retargeted at the local diff. The
+  # only rule differences: there is NO PR, so no 'gh' command and no PR comment — just print the verdict.
+  LOCAL_TASK="You are an ADVERSARIAL PRE-PR CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the LOCAL diff of this worktree (with '${_local_diff_cmd}') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. There is NO pull request yet, so DO NOT run any 'gh' command and do NOT post a comment anywhere. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) FINALLY, as the LAST thing you print, output EXACTLY ONE line and nothing after it — either 'REVIEW: PASS' or 'REVIEW: BLOCK — <one-line reason>'. That line is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: review the LOCAL diff of branch slug '${SLUG}' by running '${_local_diff_cmd}'."
+
+  LLOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-local-${SLUG}-XXXXXX")" \
+    || emit_infra_fail "could not allocate local review log (mktemp failed)"
+  # Local log is transient — unlike PR mode there is no persistent herdr pane tailing it, so drop it
+  # on exit. (emit_infra_fail / the verdict handlers below all exit, firing this trap.)
+  trap 'rm -f "$LLOG" 2>/dev/null || true' EXIT
+
+  echo "🔬 Local pre-PR review of '${SLUG}' on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass (${_local_diff_cmd})…" >&2
+
+  # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
+  # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
+  (set -o pipefail; cd "$CWD" 2>/dev/null && \
+    claude -p "$LOCAL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+      --output-format stream-json --verbose 2>&1 | \
+    python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
+  rc=${PIPESTATUS[0]}
+
+  if [ "$rc" -ne 0 ]; then
+    # Non-zero WITH a parseable verdict in the log is honoured below; non-zero with NO verdict is a
+    # transient infra death (reviewer crashed before concluding), NOT a genuine BLOCK.
+    if ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null; then
+      emit_infra_fail "local reviewer exited non-zero (rc=$rc) with no verdict — could not complete the review"
+    fi
+  fi
+
+  verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+  case "$verdict_line" in
+    "REVIEW: PASS")   _emit_verdict "REVIEW: PASS"; exit 0 ;;
+    "REVIEW: BLOCK"*) _emit_verdict "$verdict_line"; exit 1 ;;
+    *) emit_infra_fail "local reviewer produced no parseable verdict (no REVIEW line) — infrastructure failure, not a block" ;;
+  esac
+fi
 
 # Log RETENTION: each review writes its $LOG path to a slug-keyed tracker. Historically the tracker
 # held a single path and the NEXT review of the slug DELETED it — but that deleted log is exactly the
@@ -358,39 +461,7 @@ else
   (set -o pipefail; cd "$CWD" 2>/dev/null && \
     claude -p "$TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
       --output-format stream-json --verbose 2>&1 | \
-    python3 -uc '
-import sys, json
-for line in sys.stdin:
-    line = line.rstrip()
-    if not line: continue
-    try: obj = json.loads(line)
-    except Exception: print(line, flush=True); continue
-    t = obj.get("type", "")
-    if t == "assistant":
-        for b in obj.get("message", {}).get("content", []):
-            if b.get("type") == "text":
-                txt = b.get("text", "").strip()
-                if txt: print("  " + txt.split("\n")[0][:100], flush=True)
-            elif b.get("type") == "tool_use":
-                name = b.get("name", "?")
-                inp  = b.get("input") or {}
-                if name == "Bash":
-                    cmd  = str(inp.get("command") or inp.get("cmd") or "").strip()
-                    hint = cmd.split("\n")[0][:80] if cmd else ""
-                elif name in ("Read", "Write", "Edit"):
-                    hint = str(inp.get("file_path") or inp.get("path") or "")[:80]
-                elif name == "WebFetch":
-                    hint = str(inp.get("url") or "")[:80]
-                elif name == "WebSearch":
-                    hint = str(inp.get("query") or "")[:80]
-                else:
-                    first_val = next(iter(inp.values()), "") if inp else ""
-                    hint = str(first_val)[:80] if first_val else ""
-                print(("  [" + name + "] " + hint) if hint else ("  [" + name + "]"), flush=True)
-    elif t == "result":
-        r = obj.get("result", "")
-        if r: print(r, flush=True)
-') >>"$LOG" 2>&1
+    python3 -uc "$REVIEW_STREAM_FORMATTER") >>"$LOG" 2>&1
   rc=$?
 
   if [ "$rc" -ne 0 ]; then
