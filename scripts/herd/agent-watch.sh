@@ -1601,9 +1601,141 @@ _healthcheck_gate() {
   return 0
 }
 
+# ── Watcher views: lenses + filters ─────────────────────────────────────────────────────────────
+# A "view" narrows WHICH open PRs the watcher SELECTS to display and act on each tick. It is a
+# read-time SELECTION filter only: it NEVER changes the auto-merge safety semantics. A PR the lens
+# hides is simply not considered this tick; a PR the lens shows still passes every existing gate
+# (healthcheck + pre-merge review + re-verify) before anything merges. Narrowing the set can never
+# cause a blind-merge — that team/multi-user concern is a separate backlog item this only plumbs for.
+#
+# DEFAULT = today's exact behavior: WATCHER_VIEW unset (or "all") AND no filters set is a
+# byte-identical passthrough — the base `gh pr list` fields are requested and every open PR flows
+# through untouched, so an existing install with no new config key behaves identically.
+#
+# Config keys (.herd/config):
+#   WATCHER_VIEW            lens: all (default) | mine | deps | review-queue
+#   WATCHER_VIEW_AUTHOR     filter: only PRs authored by this login (also the identity for `mine`)
+#   WATCHER_VIEW_ASSIGNEE   filter: only PRs assigned to this login
+#   WATCHER_VIEW_LABEL      filter: only PRs carrying this label
+#   WATCHER_VIEW_STATUS     filter: only PRs whose mergeStateStatus equals this (e.g. CLEAN, BLOCKED)
+#   WATCHER_VIEW_DEPS_LABEL label marking a dependency PR for the `deps` lens (default: dependencies)
+# Filters AND together and compose with the lens. An unknown lens falls back to `all` + a loud warn.
+
+# Base fields the classifier consumes — UNCHANGED, so the default gh call is identical to before.
+_WATCHER_VIEW_BASE_FIELDS="number,title,headRefName,headRefOid,mergeable,mergeStateStatus"
+# Extra fields needed ONLY to evaluate a lens/filter; requested only when a view is active.
+_WATCHER_VIEW_EXTRA_FIELDS="author,assignees,labels,reviewDecision"
+
+_watcher_view_lens() { printf '%s' "${WATCHER_VIEW:-all}"; }
+
+# Active = anything other than the default (all lens, no filters). Drives whether we fetch the extra
+# gh fields and run the filter at all, keeping the default path byte-for-byte the same as before.
+_watcher_view_active() {
+  case "$(_watcher_view_lens)" in
+    all|"") ;;
+    *) return 0 ;;
+  esac
+  [ -n "${WATCHER_VIEW_AUTHOR:-}" ]   && return 0
+  [ -n "${WATCHER_VIEW_ASSIGNEE:-}" ] && return 0
+  [ -n "${WATCHER_VIEW_LABEL:-}" ]    && return 0
+  [ -n "${WATCHER_VIEW_STATUS:-}" ]   && return 0
+  return 1
+}
+
+# The --json field list for `gh pr list`: the unchanged base set by default; the extended set only
+# when a view is active (so a lens/filter has the data it needs to evaluate).
+_watcher_view_fields() {
+  if _watcher_view_active; then
+    printf '%s,%s' "$_WATCHER_VIEW_BASE_FIELDS" "$_WATCHER_VIEW_EXTRA_FIELDS"
+  else
+    printf '%s' "$_WATCHER_VIEW_BASE_FIELDS"
+  fi
+}
+
+# Loud but deduped warning for a misconfiguration (once per distinct value per process lifetime, so
+# the 4s poll loop never spams the pane). Deduped via a marker file under $TREES.
+_watcher_view_warn_once() {
+  _wvw_msg="$1"; _wvw_key="$2"
+  _wvw_f="${TREES:-${TMPDIR:-/tmp}}/.agent-watch-view-warned"
+  [ "$(cat "$_wvw_f" 2>/dev/null)" = "$_wvw_key" ] && return 0
+  printf '%s\n' "$_wvw_key" >"$_wvw_f" 2>/dev/null || true
+  printf '⚠️  %s\n' "$_wvw_msg" >&2
+}
+
+# Read the PRS JSON on stdin, emit the SELECTED subset as JSON on stdout. Passthrough (exact bytes)
+# when no view is active. Never breaks the pipeline: malformed input degrades to an empty list.
+_watcher_view_filter() {
+  if ! _watcher_view_active; then cat; return 0; fi
+  _wvf_lens="$(_watcher_view_lens)"
+  _wvf_author="${WATCHER_VIEW_AUTHOR:-}"
+  # Validate the lens from shell so the warning fires deterministically (testable) and independently
+  # of python. An unknown lens degrades to `all` — it still shows every PR, never fewer-by-accident.
+  case "$_wvf_lens" in
+    all|mine|deps|review-queue) ;;
+    *)
+      _watcher_view_warn_once "WATCHER_VIEW: unknown lens '$_wvf_lens' — falling back to 'all'" "lens:$_wvf_lens"
+      _wvf_lens="all" ;;
+  esac
+  # `mine` needs an identity: prefer the configured author, else resolve the gh user; if neither is
+  # available, fall back to `all` (loud) rather than silently hiding every PR.
+  if [ "$_wvf_lens" = "mine" ] && [ -z "$_wvf_author" ]; then
+    _wvf_author="$(gh api user -q .login 2>/dev/null || true)"
+    if [ -z "$_wvf_author" ]; then
+      _watcher_view_warn_once "WATCHER_VIEW=mine but no WATCHER_VIEW_AUTHOR set and gh user unresolved — falling back to 'all'" "mine:noauthor"
+      _wvf_lens="all"
+    fi
+  fi
+  WV_LENS="$_wvf_lens" \
+  WV_AUTHOR="$_wvf_author" \
+  WV_ASSIGNEE="${WATCHER_VIEW_ASSIGNEE:-}" \
+  WV_LABEL="${WATCHER_VIEW_LABEL:-}" \
+  WV_STATUS="${WATCHER_VIEW_STATUS:-}" \
+  WV_DEPS_LABEL="${WATCHER_VIEW_DEPS_LABEL:-dependencies}" \
+  python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(sys.stdin.read() or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    # Malformed input: emit an empty list rather than crash the tick.
+    print("[]"); sys.exit(0)
+lens       = os.environ.get("WV_LENS", "all")
+author     = os.environ.get("WV_AUTHOR", "")
+assignee   = os.environ.get("WV_ASSIGNEE", "")
+label      = os.environ.get("WV_LABEL", "")
+status     = os.environ.get("WV_STATUS", "")
+deps_label = os.environ.get("WV_DEPS_LABEL", "dependencies")
+
+def login(d):
+    return d.get("login", "") if isinstance(d, dict) else ""
+def has_label(pr, name):
+    return any((l or {}).get("name") == name for l in (pr.get("labels") or []))
+def assignee_logins(pr):
+    return [login(a) for a in (pr.get("assignees") or [])]
+
+def keep(pr):
+    # Lens narrowing.
+    if lens == "mine":
+        if not author or login(pr.get("author")) != author: return False
+    elif lens == "review-queue":
+        # GitHub'"'"'s canonical "awaiting review" state.
+        if (pr.get("reviewDecision") or "") != "REVIEW_REQUIRED": return False
+    elif lens == "deps":
+        if not has_label(pr, deps_label): return False
+    # Explicit filters (AND). `mine` already applied the author, so skip the duplicate here.
+    if author and lens != "mine" and login(pr.get("author")) != author: return False
+    if assignee and assignee not in assignee_logins(pr): return False
+    if label and not has_label(pr, label): return False
+    if status and (pr.get("mergeStateStatus") or "") != status: return False
+    return True
+
+print(json.dumps([p for p in prs if keep(p)]))
+'
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
-# merge-decision predicate _should_automerge — WITHOUT entering the live watch loop. Direct
-# execution runs the loop normally.
+# merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
+# the live watch loop. Direct execution runs the loop normally.
 if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
 # ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
@@ -1684,7 +1816,12 @@ while true; do
   build_header
   build_landed
 
-  PRS_JSON="$(gh pr list --json number,title,headRefName,headRefOid,mergeable,mergeStateStatus 2>/dev/null || echo '[]')"
+  # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
+  # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
+  # relaxes any merge gate. Default (all lens, no filters) requests the base fields and passes the
+  # JSON through unchanged, preserving today's exact behavior.
+  PRS_JSON="$(gh pr list --json "$(_watcher_view_fields)" 2>/dev/null || echo '[]')"
+  PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
   AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
