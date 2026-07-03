@@ -3,10 +3,11 @@
 # scripts/herd/herd-preflight.sh) and its two integration points (cmd_init gate + install.sh
 # advisory). Builds a FAKE PATH of tool stubs so no real dependency state leaks in, and asserts:
 #   (1) all deps present/healthy        → exit 0, "all required dependencies present"
-#   (2) several HARD deps missing       → exit 1, ALL reported in ONE pass (not fail-on-first)
-#   (3) gh present but not authed       → HARD fail
+#   (2) required git missing (+ others) → exit 1, ALL reported in ONE pass (not fail-on-first)
+#   (3) gh present but not authed       → HARD fail (gh auth is a REQUIRED-tier check)
 #   (4) soft vs hard classification     → a missing SOFT dep warns but never fails the run
-#   (5) python3 UTF-8 FIXED / BROKEN    → PYTHONUTF8 rescue is ✓; truly broken python3 is a HARD fail
+#   (5) python3 UTF-8 FIXED / BROKEN    → PYTHONUTF8 rescue is ✓; broken python3 UTF-8 only WARNS
+#                                         (python3 is a RECOMMENDED dep, checked lazily — not a gate)
 #   (6) per-platform install hints      → HERD_DOCTOR_OS selects the right hint
 #   (7) HERD_SKIP_DOCTOR=1 escape hatch → silent pass even with everything missing
 #   (8) cmd_init gate                   → blocks + writes NO config when a hard dep is missing
@@ -89,10 +90,13 @@ echo "$out" | grep -qiE "(git|gh|claude|python3|herdr) not found" && fail "(1) a
 echo "$out" | grep -qiE "shellcheck.*not found|bats.*not found" || fail "(1/4) soft dep should be reported when absent: $out"
 ok
 
-# ── (2) several HARD deps missing → exit 1 + ALL reported in ONE pass (not fail-on-first) ────────
+# ── (2) required git missing (+ recommended claude/herdr) → exit 1 + ALL reported in ONE pass ─────
+# git is REQUIRED (its miss is the exit-1 condition); claude/herdr are RECOMMENDED (reported +
+# warned, but they alone would NOT fail the run — see the dedicated dep-tiering test). All three
+# must still surface in the single pass, each with an install hint.
 b="$(mkbin s2)"; add_gh_authed "$b"; add_real_python "$b"   # present: gh(authed), python3; MISSING: git, claude, herdr
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
-[ "$RC" -ne 0 ] || fail "(2) missing hard deps should fail (got 0): $out"
+[ "$RC" -ne 0 ] || fail "(2) missing REQUIRED git should fail (got 0): $out"
 echo "$out" | grep -qi "git not found"    || fail "(2) git not reported: $out"
 echo "$out" | grep -qi "claude not found" || fail "(2) claude not reported: $out"
 echo "$out" | grep -qi "herdr not found"  || fail "(2) herdr not reported: $out"
@@ -115,10 +119,13 @@ echo "$out" | grep -qi "PYTHONUTF8=1 to fix it" || fail "(5a) FIXED python3 not 
 echo "$out" | grep -qi "cannot emit UTF-8"      && fail "(5a) FIXED python3 wrongly flagged broken: $out"
 ok
 
-# ── (5b) python3 UTF-8 BROKEN: fails even with PYTHONUTF8=1 → HARD fail ───────────────────────────
+# ── (5b) python3 UTF-8 BROKEN: fails even with PYTHONUTF8=1 → WARNS, does NOT gate init ────────────
+# python3 (and its UTF-8 capability) is a RECOMMENDED dep now, not a REQUIRED one: herdkit's own
+# emoji pane labels are not a generic consumer's concern at init time. With git+gh present the run
+# must still PASS (exit 0), while the broken-UTF-8 message is still reported for `herd doctor`.
 b="$(mkbin s5b)"; add_present "$b" git claude herdr; add_gh_authed "$b"; add_python_broken "$b"
 out="$(run_doctor "$b" PYTHONUTF8=)"; RC=$?
-[ "$RC" -ne 0 ] || fail "(5b) broken python3 UTF-8 should hard-fail (got 0): $out"
+[ "$RC" -eq 0 ] || fail "(5b) broken python3 UTF-8 must WARN, not fail, when git+gh present (got $RC): $out"
 echo "$out" | grep -qi "cannot emit UTF-8 even with PYTHONUTF8=1" || fail "(5b) broken UTF-8 message missing: $out"
 ok
 
