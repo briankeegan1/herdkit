@@ -21,3 +21,4 @@
 - ✅ **Auto-resume a limit-hit builder (claude --continue)** *(PR #71)*
 - ✅ **Launch-binding guard — engine scripts must refuse to run against the wrong project** *(PR #67)*
 - ✅ **Per-workspace argv0 marker for the watcher (cross-project kill-safety)** *(PR #65)*
+- ✅ **Auto-refix now resumes a done builder via the shared resume helper** *(PR #71)*
