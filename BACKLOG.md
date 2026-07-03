@@ -20,6 +20,19 @@
 
 
 
+## External-consumer abstraction fixes (from the Phase-4 audit)
+
+> Items ranked and sourced from `docs/external-consumer-audit.md` (Phase-4 external-consumer onboard, PR #100). Each entry retains its [P#] priority tag, leak letter, and file:line reference from the audit. 🚧 = in-progress worktree named below; 🔜 = queued.
+
+- 🚧 **[P0] Doctor: tier dependencies by what the command needs** — don't hard-gate `herd init` on herdr/claude/python3; require only git+gh, check the rest lazily/as warnings so a new consumer's first run doesn't dead-end on a tool they don't need yet. *(Leak A · herd-preflight.sh:237 · worktree fix-doctor-dep-tiering)*
+- 🚧 **[P0] Light healthcheck must not green-light unchecked languages** — a `.go`/`.rs`/`.java`-only diff currently passes ✅ light clean because no language probes exist for those stacks; add per-language probes or flag the absence as ⚠️ so the gate is never silently vacuous. *(Leak B · healthcheck.sh:114-153 · worktree fix-healthcheck-lang-probes)*
+- 🔜 **[P1] Stack-aware init: thread scout's detected language through to templates, globs, and healthcheck** — ship Go/Rust/Java healthcheck templates; default `HEALTHCHECK_HEAVY_GLOB`/`APP_SURFACE_GLOB` to blank instead of `^app/` so non-Python repos don't inherit a Python-shaped default. *(Leaks D,B · bin/herd:144-157, config.example, capabilities.tsv:52-53)*
+- 🔜 **[P1] App-preview: de-Streamlit the launch+probe** — stop force-appending `--server.port`/`--server.headless` flags; make port range and health-probe endpoint configurable per consumer; treat "no probe configured" as health-unknown (⚠️), not red, so non-Streamlit apps don't trigger false failure. *(Leak C · app-monitor.sh:23,44, herd-feature.sh:124, herd-resolve.sh:71)*
+- 🚧 **[P1] HERD_REPO: no silent briankeegan1/herdkit fallback** — `herd report` must refuse (or self-target for the herdkit engine repo) when `HERD_REPO` is unset, so a consumer's engine-bug reports are never silently filed against the herdkit repo under the consumer's token. *(Leak E · bin/herd:1301 · worktree fix-herd-repo-fallback)*
+- 🔜 **[P2] De-Streamlit/de-Python the docs and copy** — scrub `st.testing`/`AppTest` wording, `.venv`/`data` `SHARE_LINKS` examples, and dividend-history slugs that appear across capabilities.tsv, config.example, healthcheck.sh, and lane templates so a non-Python consumer reads docs that speak to their stack. *(Leak C)*
+- 🔜 **[P2] De-brand doctor/README/coordinator output** — parameterize the literal `herdkit` name, 🐑 emoji, and `briankeegan1/herdkit` install source so a whitelabel consumer sees their own product name throughout. *(Leaks A,E,F)*
+- 🔜 **[P3] Renderable coordinator skill for non-herdr/non-Claude drivers** — factor the ~25 herdr/claude control incantations in `coordinator.md.tmpl` behind an indirection layer so teams using a different driver (VSCode extension, CI bot, etc.) can swap the control surface without forking the coordinator logic. *(Leak F)*
+
 ## Efficiency / cost
 
 > Spin-outs from the deferred [herdkit-vs-harness efficiency EPIC](#someday--deferred) (surfaced 2026-07-02). Token/cost instrumentation — `scripts/herd/cost.sh`, per-builder/review token accounting priced to USD, cost-per-merged-PR, `herd cost` command — is ✅ shipped (commit e2a0ae5); the instrumentation gate is lifted for all items below.
