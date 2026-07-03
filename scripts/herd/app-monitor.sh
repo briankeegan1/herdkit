@@ -17,10 +17,20 @@ LOG="$DIR/.app-server.log"
 [ -n "$APP_PREVIEW_CMD" ] || { echo "app-monitor: no APP_PREVIEW_CMD configured"; exit 1; }
 
 # The preview server in the background — this is what the browser renders. Dies with the pane.
-# The "--server.port / --server.headless" flags follow a common dev-server convention; a project
-# whose preview command takes the port differently can wrap it inside its own APP_PREVIEW_CMD.
+#
+# The extra launch args (port + headless) are a CONFIGURABLE TEMPLATE, not hardcoded: force-appending
+# one web framework's flags to whatever the consumer set CRASHES any command that doesn't accept them
+# (a CLI, a Go/Node/Rust server, `java -jar app.jar`). APP_PREVIEW_SERVER_ARGS is the arg string
+# appended to $APP_PREVIEW_CMD, with a literal {port} token substituted by the chosen port; its DEFAULT
+# reproduces today's dev-server flags EXACTLY, so an existing web-app project is byte-for-byte
+# unchanged. Set it to "" in .herd/config for a command that needs no injected flags (it reads $PORT
+# itself or takes the port another way). See docs/external-consumer-audit.md "Leak C".
+# Read INLINE with a default here (deliberately NOT declared in herd-config.sh / capabilities.tsv);
+# FOLLOW-UP: document APP_PREVIEW_SERVER_ARGS in templates/capabilities.tsv (owned by another PR).
+_APP_SERVER_ARGS="${APP_PREVIEW_SERVER_ARGS-"--server.port {port} --server.headless true"}"
+_APP_SERVER_ARGS="${_APP_SERVER_ARGS//\{port\}/$PORT}"
 # shellcheck disable=SC2086
-$APP_PREVIEW_CMD --server.port "$PORT" --server.headless true >"$LOG" 2>&1 &
+$APP_PREVIEW_CMD $_APP_SERVER_ARGS >"$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null' EXIT INT TERM
 
@@ -33,6 +43,20 @@ else
 fi
 newest() { git ls-files -z 2>/dev/null | xargs -0 stat "${_STAT_MTIME[@]}" 2>/dev/null | sort -rn | head -1; }
 
+# ── Health probe (CONFIGURABLE — see docs/external-consumer-audit.md "Leak C") ───────────────────
+# "Is it up?" is no longer a hardcoded HTTP GET /. Precedence, highest first:
+#   • APP_PREVIEW_HEALTH_CMD  — run it (with PORT exported); exit 0 = 🟢 serving. For a CLI / gRPC /
+#                               non-HTTP or non-root-path server that a curl-GET-/ can never verify.
+#   • APP_PREVIEW_HEALTH_PATH — curl http://localhost:$PORT<path>; HTTP 200 = 🟢 serving. DEFAULT "/"
+#                               reproduces today's probe, so an existing web app is unchanged.
+#   • neither (path set to "" AND no cmd) — health UNKNOWN → ⚪, NOT 🔴. "No probe configured" must
+#                               not masquerade as "down" and paint a healthy non-HTTP preview red.
+# APP_PREVIEW_HEALTH_PATH uses ${x-default} (assign-if-UNSET) so an explicit empty value DISABLES the
+# HTTP probe rather than snapping back to "/". Read INLINE with defaults here (NOT in herd-config.sh /
+# capabilities.tsv); FOLLOW-UP: document these keys in templates/capabilities.tsv (owned by another PR).
+_HEALTH_CMD="${APP_PREVIEW_HEALTH_CMD-}"
+_HEALTH_PATH="${APP_PREVIEW_HEALTH_PATH-/}"
+
 last_sig=""
 verdict="⏳ first check running…"
 while true; do
@@ -41,8 +65,18 @@ while true; do
     verdict="$(bash "$HERE/healthcheck.sh" "$DIR" --oneline 2>/dev/null)"
     last_sig="$sig"
   fi
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/" 2>/dev/null || echo 000)
-  srv=$([ "$code" = "200" ] && echo $'\033[32m🟢 serving\033[0m' || echo $'\033[31m🔴 starting/down\033[0m')
+  if [ -n "$_HEALTH_CMD" ]; then
+    if PORT="$PORT" bash -c "$_HEALTH_CMD" >/dev/null 2>&1; then
+      srv=$'\033[32m🟢 serving\033[0m'
+    else
+      srv=$'\033[31m🔴 starting/down\033[0m'
+    fi
+  elif [ -n "$_HEALTH_PATH" ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT$_HEALTH_PATH" 2>/dev/null || echo 000)
+    srv=$([ "$code" = "200" ] && echo $'\033[32m🟢 serving\033[0m' || echo $'\033[31m🔴 starting/down\033[0m')
+  else
+    srv=$'\033[2m⚪ health unknown (no probe configured)\033[0m'
+  fi
   clear
   printf '\033[1;36m🩺 app preview · :%s\033[0m   %b\n' "$PORT" "$srv"
   printf '\033[2mhttp://localhost:%s\033[0m\n\n' "$PORT"

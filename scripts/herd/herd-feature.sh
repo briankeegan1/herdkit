@@ -119,9 +119,20 @@ herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$
 #    configured and not suppressed. Each feature gets its own port so multiple previews coexist.
 PORT=""
 if [ -n "$APP_PREVIEW_CMD" ] && [ "${HERD_NO_APP:-}" != "1" ]; then
-  PORT=$(python3 - <<'PY'
-import socket
-for p in range(8501, 8600):
+  # Free-port search over a CONFIGURABLE range (docs/external-consumer-audit.md "Leak C"): the default
+  # base 8501 reproduces today's port block (8501-8599), so an existing web app is unchanged;
+  # APP_PREVIEW_PORT_BASE lets an app use its own convention (:8080, :3000). Read INLINE with a default
+  # (NOT declared in herd-config.sh / capabilities.tsv); FOLLOW-UP: document APP_PREVIEW_PORT_BASE in
+  # templates/capabilities.tsv (owned by another PR).
+  _PORT_BASE="${APP_PREVIEW_PORT_BASE:-8501}"
+  case "$_PORT_BASE" in ''|*[!0-9]*) _PORT_BASE=8501 ;; esac
+  PORT=$(PORT_BASE="$_PORT_BASE" python3 - <<'PY'
+import socket, os
+try:
+    base = int(os.environ.get("PORT_BASE") or "8501")
+except ValueError:
+    base = 8501
+for p in range(base, base + 99):
     s = socket.socket()
     try:
         s.bind(("127.0.0.1", p)); s.close(); print(p); break
@@ -134,7 +145,7 @@ PY
     herdr pane run "$ROOT" "bash $HERE/app-monitor.sh $PORT"
   else
     PORT=""
-    echo "⚠️  No free port in 8501-8599 — skipping the app-preview pane for '$SLUG'." >&2
+    echo "⚠️  No free port in $_PORT_BASE-$((_PORT_BASE+98)) — skipping the app-preview pane for '$SLUG'." >&2
   fi
 fi
 
