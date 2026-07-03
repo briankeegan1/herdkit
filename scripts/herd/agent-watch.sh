@@ -1641,7 +1641,17 @@ _healthcheck_gate() {
   # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
   record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error"
   _health_release "$_hg_pr"
-  record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_hc2"
+  # A tab-leak-guard CODEERROR is INFRA/TRANSIENT, not a code bug (issue #78 part 2): a concurrent
+  # SAME-workspace sibling builder tab flickering non-idle during the healthcheck window can trip the
+  # guard on BOTH the initial run and the solo retry, yet self-heals the moment that tab stabilizes
+  # (its own comment promises 'self-heals on re-run'). Like INFRA-FAIL / exit-2 results, it must NEVER
+  # be sha-cached — else the sha-cache (PR #66) replays the transient every tick and FREEZES red until
+  # a human deletes the marker. Skip the cache write so the next tick re-runs the suite fresh and
+  # self-heals; a genuine non-tab-leak code error still gets cached and stays red without re-running.
+  case "$_hg_hc2" in
+    *tab-leak-guard*) : ;;   # transient — do NOT persist to the sha cache (re-runs next tick)
+    *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_hc2" ;;
+  esac
   DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_hc2}${C_RESET}"
   _HC_RESULT="CODEERROR"
   journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_hc2"
