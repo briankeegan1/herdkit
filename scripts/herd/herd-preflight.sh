@@ -126,24 +126,37 @@ print("OK")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # herd_doctor — the COMPREHENSIVE dependency doctor. Unlike herd_preflight (a fast, herdr-only,
-# fail-on-first guard for the lane hot-path), the doctor checks EVERY required dependency in ONE
-# pass and reports them all at once, so a broken environment surfaces its full picture rather than
-# one-error-at-a-time. Run it at install time (advisory) and at the top of `herd init` (hard gate,
-# before any config is written), and expose it as `herd doctor` for on-demand self-diagnosis.
+# fail-on-first guard for the lane hot-path), the doctor checks EVERY dependency in ONE pass and
+# reports them all at once, so a broken environment surfaces its full picture rather than
+# one-error-at-a-time. Run it at install time (advisory) and at the top of `herd init` (gate, before
+# any config is written), and expose it as `herd doctor` for on-demand self-diagnosis.
 #
-# HARD-required (a partially-broken control room without them — the issue #31 class of silent
-# failure): git, gh (+ `gh auth status`), claude, python3, herdr (+ its JSON contract). On top of
-# presence, python3 must be able to emit UTF-8 to a pipe — on Windows it defaults to the cp1252
-# codepage and dies with UnicodeEncodeError on the emoji/box-drawing pane labels herd scripts print
-# through `python3 -c` (issue #31); herdkit exports PYTHONUTF8=1 in herd-config.sh to fix this, and
-# the doctor confirms the fix actually takes.
+# Dependencies are TIERED by what the invoked command actually needs (external-consumer audit,
+# Leak A / ranked follow-up #1). `herd init` only writes config — it does not launch a pane, spawn
+# an agent, or render an emoji label — so it must gate on the truly-required minimum and degrade the
+# rest to warnings, otherwise a Go/Rust/Java consumer who never installed herdkit's own runtime is
+# blocked at the very first step.
 #
-# SOFT (a missing one only degrades ONE feature, never blocks): glow (backlog-view pretty-print),
-# shellcheck + bats (healthcheck lint/tests).
+#   REQUIRED (hard — `herd init` cannot proceed without them, and their absence is the exit-1
+#     condition callers gate on): git, gh (+ `gh auth status`).
 #
-# Returns 0 when every HARD dep is present and healthy; non-zero when any is missing/broken. Prints
-# a per-dependency ✓/✗ report to stdout with per-platform install hints. Human-facing output only —
-# no machine parses it, so the non-ASCII marks are safe here (unlike the JSON-parse paths).
+#   RECOMMENDED (warn — needed to actually RUN the workflow, but checked LAZILY at point-of-use, so
+#     a missing one only warns here and never blocks init): herdr (+ its JSON contract) to launch the
+#     control room & drive panes (guarded by herd_preflight when a lane runs); claude to spawn a
+#     Claude Code agent in a lane; python3 for the JSON/UTF-8 pane helpers. python3's UTF-8 capability
+#     rides in this tier — on Windows it defaults to the cp1252 codepage and dies with
+#     UnicodeEncodeError on the emoji/box-drawing pane labels herd scripts print through `python3 -c`
+#     (issue #31); herdkit exports PYTHONUTF8=1 in herd-config.sh to fix this, and the doctor confirms
+#     the fix takes — but a repo that never renders a herd pane is not blocked from init over it.
+#
+#   OPTIONAL (soft — a missing one only degrades ONE feature, never blocks): glow (backlog-view
+#     pretty-print), shellcheck + bats (healthcheck lint/tests).
+#
+# Returns 0 when every REQUIRED dep is present and healthy (even if RECOMMENDED/OPTIONAL ones are
+# missing — those only warn); non-zero only when a REQUIRED dep is missing/broken. Always prints the
+# FULL one-pass per-dependency ✓/⚠/✗ report with per-platform install hints, so `herd doctor` still
+# surfaces everything regardless of exit status. Human-facing output only — no machine parses it, so
+# the non-ASCII marks are safe here (unlike the JSON-parse paths).
 #
 # Knobs:
 #   HERD_SKIP_DOCTOR=1   bypass the doctor entirely (tests / CI / known-good environments).
@@ -161,7 +174,8 @@ _herd_doctor_os() {
   esac
 }
 
-# _herd_doctor_hint <tool> <os> — a one-line, copy-pasteable install hint for a missing HARD dep.
+# _herd_doctor_hint <tool> <os> — a one-line, copy-pasteable install hint for a missing dep (used by
+# both the REQUIRED and RECOMMENDED tiers).
 _herd_doctor_hint() {
   local tool="$1" os="$2"
   case "$tool" in
@@ -225,16 +239,33 @@ _herd_doctor_soft() {
   fi
 }
 
+# _herd_doctor_recommend <tool> <os> <needed-for> — report a RECOMMENDED dep: ✓ (return 0) when
+# present, else a ⚠ warning naming what the tool is needed FOR plus a per-platform install hint, and
+# return 1 so the caller can bump its warn count (and skip any follow-on probe, e.g. herdr's JSON
+# contract). Deliberately never sets hard_fail — a missing RECOMMENDED dep is checked again lazily at
+# point-of-use (herd_preflight guards herdr for the lanes), so it must not block `herd init`.
+_herd_doctor_recommend() {
+  local tool="$1" os="$2" need="$3"
+  if command -v "$tool" >/dev/null 2>&1; then
+    printf '  \xe2\x9c\x93 %s\n' "$tool"
+    return 0
+  fi
+  printf '  \xe2\x9a\xa0 %s not found \xe2\x80\x94 needed to %s (checked again at point-of-use)\n' "$tool" "$need"
+  printf '      fix: %s\n' "$(_herd_doctor_hint "$tool" "$os")"
+  return 1
+}
+
 herd_doctor() {
   [ "${HERD_SKIP_DOCTOR:-}" = "1" ] && return 0
 
-  local os hard_fail=0 tool
+  local os hard_fail=0 warn=0 tool
   os="$(_herd_doctor_os)"
   printf 'herd doctor \xe2\x80\x94 checking dependencies (platform: %s)\n\n' "$os"
-  printf 'Required:\n'
 
-  # (1) Presence of every HARD tool — collected in one pass (never fail-on-first).
-  for tool in git gh claude python3 herdr; do
+  # ── Tier 1: REQUIRED (git, gh + auth). These, and only these, gate `herd init`; a miss is the
+  #    exit-1 condition. Collected in one pass (never fail-on-first). ────────────────────────────
+  printf 'Required (herd init needs these):\n'
+  for tool in git gh; do
     if command -v "$tool" >/dev/null 2>&1; then
       printf '  \xe2\x9c\x93 %s\n' "$tool"
     else
@@ -243,9 +274,8 @@ herd_doctor() {
       hard_fail=1
     fi
   done
-
-  # (2) gh auth — a present-but-unauthenticated gh breaks every PR/issue lane just as surely as an
-  #     absent one. Only meaningful when gh itself is installed (its absence is already reported).
+  # gh auth — a present-but-unauthenticated gh breaks every PR/issue lane just as surely as an
+  # absent one. Only meaningful when gh itself is installed (its absence is already reported).
   if command -v gh >/dev/null 2>&1; then
     if gh auth status >/dev/null 2>&1; then
       printf '  \xe2\x9c\x93 gh auth (logged in)\n'
@@ -256,9 +286,32 @@ herd_doctor() {
     fi
   fi
 
-  # (3) python3 UTF-8 capability (issue #31). Present-but-cp1252 python3 is the confirmed Windows
-  #     root cause; verify it can actually emit the emoji pane labels the engine prints.
-  if command -v python3 >/dev/null 2>&1; then
+  # ── Tier 2: RECOMMENDED (herdr + JSON contract, claude, python3 + UTF-8). Needed to RUN the
+  #    workflow, but checked lazily at point-of-use — a miss only WARNS here, never blocks init. ──
+  printf '\nRecommended (to run the control room & spawn agents; a missing one only warns \xe2\x80\x94 herd re-checks it at point-of-use):\n'
+
+  # herdr — presence, then (only if present) its JSON contract, since a version-skewed herdr fails
+  # every lane parse cryptically. Reuse the exact preflight probe (its verbose stderr is suppressed
+  # here; the doctor prints its own one-line verdict).
+  if _herd_doctor_recommend herdr "$os" 'launch the control room (coordinator) & drive panes'; then
+    if _herd_herdr_contract_probe 2>/dev/null; then
+      printf '  \xe2\x9c\x93 herdr JSON contract\n'
+    else
+      printf '  \xe2\x9a\xa0 herdr JSON contract \xe2\x80\x94 `herdr tab list` failed or its JSON shape has skewed\n'
+      printf '      fix: upgrade/repair herdr to a version herdkit lanes can parse\n'
+      warn=$((warn+1))
+    fi
+  else
+    warn=$((warn+1))
+  fi
+
+  # claude — only needed when a lane spawns a Claude Code agent.
+  _herd_doctor_recommend claude "$os" 'spawn a Claude Code agent in a lane' || warn=$((warn+1))
+
+  # python3 — the JSON/UTF-8 pane helpers. Presence, then (only if present) its UTF-8 capability
+  # (issue #31): present-but-cp1252 python3 is the confirmed Windows root cause. A broken encoding
+  # now WARNS (herdkit's own emoji pane labels are not a generic consumer's concern at init time).
+  if _herd_doctor_recommend python3 "$os" 'run the JSON/UTF-8 pane helpers'; then
     local utf verdict enc
     utf="$(_herd_doctor_python_utf8 python3)"
     verdict="${utf%% *}"; enc="${utf#* }"
@@ -268,26 +321,15 @@ herd_doctor() {
       FIXED)
         printf '  \xe2\x9c\x93 python3 UTF-8 (default encoding %s can'\''t emit UTF-8; herdkit exports PYTHONUTF8=1 to fix it)\n' "$enc" ;;
       *)
-        printf '  \xe2\x9c\x97 python3 UTF-8 \xe2\x80\x94 cannot emit UTF-8 even with PYTHONUTF8=1 (encoding: %s)\n' "$enc"
+        printf '  \xe2\x9a\xa0 python3 UTF-8 \xe2\x80\x94 cannot emit UTF-8 even with PYTHONUTF8=1 (encoding: %s)\n' "$enc"
         printf '      fix: upgrade to Python 3.7+ \xe2\x80\x94 herd scripts print emoji/box-drawing pane labels through python3\n'
-        hard_fail=1 ;;
+        warn=$((warn+1)) ;;
     esac
+  else
+    warn=$((warn+1))
   fi
 
-  # (4) herdr JSON contract — presence alone is not enough; a version-skewed herdr fails every lane
-  #     parse cryptically. Reuse the exact preflight probe (its verbose stderr is suppressed here;
-  #     the doctor prints its own one-line verdict).
-  if command -v herdr >/dev/null 2>&1; then
-    if _herd_herdr_contract_probe 2>/dev/null; then
-      printf '  \xe2\x9c\x93 herdr JSON contract\n'
-    else
-      printf '  \xe2\x9c\x97 herdr JSON contract \xe2\x80\x94 `herdr tab list` failed or its JSON shape has skewed\n'
-      printf '      fix: upgrade/repair herdr to a version herdkit lanes can parse\n'
-      hard_fail=1
-    fi
-  fi
-
-  # (5) SOFT deps — degrade one feature, never block.
+  # ── Tier 3: OPTIONAL (soft) — degrade one feature, never block. ──────────────────────────────
   printf '\nOptional (a missing one only degrades one feature):\n'
   _herd_doctor_soft glow       'backlog-view.sh renders raw markdown instead of a pretty view'
   _herd_doctor_soft shellcheck 'healthcheck skips shell lint (bash -n still runs)'
@@ -295,9 +337,14 @@ herd_doctor() {
 
   printf '\n'
   if [ "$hard_fail" -ne 0 ]; then
-    printf 'doctor: \xe2\x9c\x97 one or more REQUIRED dependencies are missing or broken (see \xe2\x9c\x97 above).\n'
+    printf 'doctor: \xe2\x9c\x97 a REQUIRED dependency (git / gh) is missing or broken (see \xe2\x9c\x97 above) \xe2\x80\x94 herd init cannot proceed.\n'
     printf '        (bypass this gate in tests/CI with HERD_SKIP_DOCTOR=1)\n'
     return 1
+  fi
+  if [ "$warn" -ne 0 ]; then
+    printf 'doctor: \xe2\x9c\x93 required dependencies (git, gh) present \xe2\x80\x94 herd init can proceed.\n'
+    printf '        \xe2\x9a\xa0 %d recommended dependency check(s) failed (see \xe2\x9a\xa0 above); the herd features that need them stay unavailable until you install them.\n' "$warn"
+    return 0
   fi
   printf 'doctor: \xe2\x9c\x93 all required dependencies present.\n'
   return 0
