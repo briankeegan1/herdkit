@@ -77,6 +77,21 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 The sub-agent only **builds and opens a PR** — it won't merge or edit `{{BACKLOG_FILE}}`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
 
+### Reconcile the backlog after a cutover / extraction / rename PR lands
+
+When a PR **moves or renames the things backlog items point at** — file paths, function names,
+section headers — entries that still reference the OLD name dangle silently once it merges. After
+such a PR lands, run the reconcile pass (it is safe on any PR — a no-op when nothing moved):
+
+    bash {{SCRIPTS_DIR}}/backlog-reconcile.sh run <pr#>
+
+It diffs the PR's rename/move surface (git rename detection for files + defs/headers that existed
+before the PR and are gone after), finds `{{BACKLOG_FILE}}` entries that reference the old
+path/name, and — scribe-driven, like the reap — **enqueues ONE scribe request** to update each
+stale reference to its new location or, when old→new can't be confirmed, append a visible
+`⚠️ (dangling ref …)` flag for a human. It never edits `{{BACKLOG_FILE}}` itself. Preview what it
+would touch first with `backlog-reconcile.sh scan <pr#>` (prints the dangling report, or `NONE`).
+
 Never run more than the user wants in parallel — call out if 4+ agents are already in flight
 (review bandwidth, not spawn capacity, is the real limit).
 
