@@ -1123,6 +1123,22 @@ _healthcheck_gate() {
 # execution runs the loop normally.
 if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
+# ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
+# Re-exec ONCE under a distinctive per-workspace argv0 ($HERD_WATCH_ARGV0, e.g. herd-watch-<slug>)
+# so the process table shows which workspace this watcher serves. Without it, two projects' watchers
+# are indistinguishable in ps (`bash .../agent-watch.sh`) and a good-faith "kill the duplicate
+# watcher" in project A can SIGTERM project B's live watcher. argv0 is visible via ps/pgrep on every
+# platform; an env-var marker is NOT reliably readable via ps on modern macOS — which is why the
+# marker is argv0. _list_project_watchers (bin/herd) reaps ONLY processes whose argv0 equals this
+# exact string. Every launch site (coordinator.sh, cmd_reload's pane-run + background fallback,
+# herd pane watch, herd-watch.sh) ultimately runs agent-watch.sh, so this single re-exec tags them
+# all. The guard env var makes it a one-shot (no infinite re-exec loop); $0/BASH_SOURCE stay the
+# script path so HERE still resolves after the re-exec.
+if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
+  export HERD_WATCH_REEXEC=1
+  exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
+fi
+
 # ── Singleton spawn-lock: exactly one watcher per project ──────────────────────────────────────
 # Keyed by WORKSPACE_NAME (matching the coordinator/scribe/researcher pattern). Prevents duplicate
 # launchers from racing on 'gh pr merge' when the coordinator is relaunched. Stale locks (PID dead

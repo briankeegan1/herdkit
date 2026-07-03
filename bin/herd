@@ -934,6 +934,40 @@ else: print("bare")
 ' 2>/dev/null || printf 'gone\n'
 }
 
+# ── .herd-panes per-workspace hint validation (issue #60, failure mode 3) ──────────────────────────
+# Registry rows are `role pane_id tab_id [workspace_id]`. Readers historically trusted a row on the
+# process-info of its raw pane_id alone — nothing asserted the pane still belonged to THIS workspace,
+# and role was validated for existence but not for WHICH role the pane actually serves. The two
+# helpers below close both gaps; every registry hint passes through them before it is adopted.
+
+# _reg_pane_validated <registry_file> <role> <ws> → the row's pane_id IFF its recorded workspace_id
+# equals <ws> OR the row is LEGACY (no workspace_id column = 'unknown', pre-#60 writers); empty when
+# the row is stamped with a DIFFERENT workspace. This drops a foreign hint here so it can never be
+# validated against a foreign pane by raw id. A legacy row falls through to the existing live-roster
+# validation (its pane_id is still checked for existence/role downstream), preserving back-compat.
+_reg_pane_validated() {
+  [ -f "$1" ] || return 0
+  awk -v role="$2" -v ws="$3" '
+    $1==role {
+      rws=(NF>=4 ? $4 : "")
+      if (rws=="" || rws==ws) printf "%s", $2
+      exit
+    }' "$1" 2>/dev/null || true
+}
+
+# _reg_role_ok <pane_id> <claimed_role> → success UNLESS the pane is LIVE in a DIFFERENT concrete role
+# than the registry claims (the drifted-registry misroute: a `watch` row pointing at a pane that is
+# actually serving the backlog viewer, or vice versa). A bare/gone/busy pane is NOT rejected here —
+# a bare pane is exactly what we want to reuse, and existence/foreground-match checks handle the rest.
+# Roles map: watch↔watch, backlog↔backlog, coordinator-agent↔agent.
+_reg_role_ok() {
+  local live want="$2"
+  live="$(_reload_pane_role "$1")"
+  case "$live" in bare|gone|busy) return 0 ;; esac   # no concrete role conflict
+  case "$want" in coordinator-agent) want="agent" ;; esac
+  [ "$live" = "$want" ]
+}
+
 # _reload_move <pane> <tab> <direction> <target> <ratio> → echoes the move verdict:
 #   yes       the move changed the layout
 #   same_tab  herdr no-ops a move whose source pane already lives in <tab>
@@ -961,12 +995,46 @@ _reload_reparent() {
   [ "$v" = "yes" ]
 }
 
+# _list_project_watchers — enumerate ONLY this project's watcher PIDs, one per line, de-duplicated:
+# the union of (a) the lockfile PID (if alive) and (b) every process whose argv0 is EXACTLY
+# $HERD_WATCH_ARGV0 (herd-watch-<slug>). argv0 is the attribution mechanism — see agent-watch.sh's
+# startup re-exec: it is visible in ps/pgrep on every platform, unlike an env-var marker which modern
+# macOS will not read back via ps. We match argv0 EXACTLY (the ps command's first token), NOT as a
+# pgrep substring, so workspace "north" never captures "northern"'s watcher and "app" never captures
+# "apple"'s. This finds lock-ABSENT strays too (the "no running watcher found while 2 alive" case).
+# UNTAGGED legacy watchers (started before the argv0 marker existed) carry no marker and are NOT
+# returned here — _stop_project_watcher still reaps those via its lsof cwd/lockfile fallback.
+# Requires HERD_WATCHER_LOCK + HERD_WATCH_ARGV0 in scope (from .herd/config).
+_list_project_watchers() {
+  local pid argv0 seen=" "
+  # (a) lockfile PID — the watcher this project recorded.
+  if [ -f "$HERD_WATCHER_LOCK" ]; then
+    pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$pid"; seen="$seen$pid "
+    fi
+  fi
+  # (b) argv0-tagged processes — exact first-token match on the ps command string. pgrep narrows the
+  # candidate set (substring); the ps first-token check makes attribution exact and cross-platform.
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    case "$seen" in *" $pid "*) continue ;; esac
+    # `|| true`: ps on a since-dead pid exits non-zero and, under `set -euo pipefail`, would abort
+    # this function before it reaches later (still-alive) pids — dropping real strays. Neutralize it.
+    argv0="$(ps -o command= -p "$pid" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    [ "$argv0" = "$HERD_WATCH_ARGV0" ] || continue
+    printf '%s\n' "$pid"; seen="$seen$pid "
+  done < <(pgrep -f "$HERD_WATCH_ARGV0" 2>/dev/null || true)
+}
+
 # _stop_project_watcher — stop THIS project's watcher(s) with the SIGTERM-poll-SIGKILL-abort
-# sequence + duplicate-watcher guard. Requires HERD_WATCHER_LOCK and PROJECT_ROOT in scope (loaded
-# from .herd/config). DIES (aborts the caller) when a watcher cannot be stopped, rather than risk
-# spawning a duplicate over a still-live one. Prints one progress line per stopped watcher and says
-# so when none were running. Shared by `herd reload` and `herd pane watch`. Honors
-# HERD_RELOAD_SIGTERM_POLLS (default 50 × 0.2s = 10s) for the SIGTERM window.
+# sequence + duplicate-watcher guard. Requires HERD_WATCHER_LOCK, HERD_WATCH_ARGV0 and PROJECT_ROOT
+# in scope (loaded from .herd/config). DIES (aborts the caller) when a watcher cannot be stopped,
+# rather than risk spawning a duplicate over a still-live one. Reaps this project's lock-absent
+# strays via the argv0 marker and NEVER touches a process whose argv0 belongs to another workspace.
+# Prints one progress line per stopped watcher and says so when none were running. Shared by `herd
+# reload` and `herd pane watch`. Honors HERD_RELOAD_SIGTERM_POLLS (default 50 × 0.2s = 10s) for the
+# SIGTERM window.
 _stop_project_watcher() {
   local lockpid="" killed=0
 
@@ -1006,14 +1074,33 @@ _stop_project_watcher() {
     rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
   fi
 
-  # Strays: any additional agent-watch.sh processes that belong to this workspace.
-  # Guard: only kill processes whose cwd is PROJECT_ROOT (no-flock / macOS) or that hold our
-  # lockfile open (flock / Linux). This prevents killing another workspace's watcher when both
-  # run the same engine script.
+  # Strays, phase 1 — THIS project's watchers by ARGV0 attribution (issue #60). _list_project_watchers
+  # returns the union of the lockfile PID and every process whose argv0 == $HERD_WATCH_ARGV0. This
+  # reaps lock-ABSENT strays too (the "no running watcher found while 2 alive" case) and, because the
+  # argv0 is per-workspace, is provably inert for a sibling project's watcher even though both run the
+  # identical engine script.
+  local wpid
+  while IFS= read -r wpid; do
+    [ -n "$wpid" ] || continue
+    [ "$wpid" = "$lockpid" ] && continue  # already handled by the lockfile path above
+    kill "$wpid" 2>/dev/null || true
+    killed=$((killed+1))
+    say "  stopped stray watcher PID $wpid (argv0 $HERD_WATCH_ARGV0)"
+    journal_append watcher_reaped pid "$wpid" workspace "$WORKSPACE_NAME" via argv0
+  done < <(_list_project_watchers)
+
+  # Strays, phase 2 — UNTAGGED legacy watchers (started before the argv0 marker existed) show as
+  # `bash .../agent-watch.sh` with no marker, so phase 1 misses them. Reap those too, but ONLY when
+  # provably ours: cwd == PROJECT_ROOT (no-flock / macOS) or holding our lockfile open (flock /
+  # Linux). CRITICAL: a process carrying a FOREIGN herd-watch-* argv0 is another workspace's tagged
+  # watcher and is NEVER touched here — the argv0 gate below is the cross-project kill guard.
   local stray
   while IFS= read -r stray; do
     [ -n "$stray" ] || continue
     [ "$stray" = "$lockpid" ] && continue  # already handled above
+    local sargv0; sargv0="$(ps -o command= -p "$stray" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    [ "$sargv0" = "$HERD_WATCH_ARGV0" ] && continue   # already reaped in phase 1 (our tagged watcher)
+    case "$sargv0" in herd-watch-*) continue ;; esac  # FOREIGN tagged watcher — never touch
     local is_ours=0
     if command -v lsof >/dev/null 2>&1; then
       # flock case: watcher holds fd 9 on the lockfile — lsof shows it.
@@ -1032,7 +1119,8 @@ _stop_project_watcher() {
     if [ "$is_ours" -eq 1 ]; then
       kill "$stray" 2>/dev/null || true
       killed=$((killed+1))
-      say "  stopped stray watcher PID $stray"
+      say "  stopped stray watcher PID $stray (legacy · cwd match)"
+      journal_append watcher_reaped pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd
     fi
   done < <(pgrep -f "agent-watch.sh" 2>/dev/null || true)
 
@@ -1077,22 +1165,55 @@ cmd_reload() {
   local launch_desc="background" watch_pid="" watch_pane=""
   local backlog_desc="not managed (herdr unavailable)"
   local herdr_attempted=0
+  # rebuild_desc — the ALWAYS-printed verdict distinguishing a full control-room rebuild from a
+  # skill-only + headless-watcher fallback, so `herd reload`'s outcome is never ambiguous (issue #60,
+  # comment 1). Set to the rebuild summary once the workspace resolves; the fail-loud branches below
+  # leave it as this default so the final summary names exactly what did NOT happen.
+  local rebuild_desc="NOT rebuilt — skill re-rendered + watcher headless only (see warnings above)"
 
   if [ "${HERD_RELOAD_SKIP_LAUNCH:-}" = "1" ]; then
     launch_desc="skipped (HERD_RELOAD_SKIP_LAUNCH=1)"
     backlog_desc="skipped (HERD_RELOAD_SKIP_LAUNCH=1)"
-  elif command -v herdr >/dev/null 2>&1; then
-    local ws=""
-    ws="$(herdr workspace list 2>/dev/null | LABEL="$WORKSPACE_NAME" python3 -c \
+    rebuild_desc="skipped (HERD_RELOAD_SKIP_LAUNCH=1)"
+  elif ! command -v herdr >/dev/null 2>&1; then
+    # herdr NOT installed → we cannot manage panes at all. Give this its OWN line (distinct from a
+    # workspace-not-found miss) instead of sliding silently into the headless background relaunch.
+    warn "herd reload: herdr not found — cannot manage panes; control room NOT rebuilt, watcher will be relaunched headless (no visible console)"
+  else
+    # herdr IS available. Resolve THIS project's workspace by exact label==WORKSPACE_NAME. Capture the
+    # raw list AND its exit status SEPARATELY, so a herdr CLI/parse error is distinguishable from a
+    # genuine no-match — the old `2>/dev/null || true` collapsed both into "empty $ws", turning EVERY
+    # failure (herdr error, workspace closed, label mismatch) into a silent headless relaunch with no
+    # message naming the cause (issue #60, comment 1). Each case below FAILS LOUD.
+    local ws="" ws_list="" ws_rc=0
+    ws_list="$(herdr workspace list 2>/dev/null)" || ws_rc=$?
+    if [ "$ws_rc" -ne 0 ]; then
+      warn "herd reload: 'herdr workspace list' failed (exit $ws_rc) — cannot resolve workspace '${WORKSPACE_NAME}'; control room NOT rebuilt, watcher relaunched headless"
+    else
+      ws="$(printf '%s' "$ws_list" | LABEL="$WORKSPACE_NAME" python3 -c \
 'import sys,json,os
 try: d=json.load(sys.stdin)
 except Exception: d={}
 ws=(d.get("result") or {}).get("workspaces") or []
 print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LABEL","")), ""))
 ' 2>/dev/null || true)"
+      if [ -z "$ws" ]; then
+        # FAIL LOUD: herdr is up and the list parsed, but no OPEN workspace carries our label. Name
+        # the expected label and the observed open labels so the mismatch is unmistakable.
+        local open_labels; open_labels="$(printf '%s' "$ws_list" | python3 -c \
+'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+ws=(d.get("result") or {}).get("workspaces") or []
+print(", ".join(str(w.get("label","?")) for w in ws) or "none")
+' 2>/dev/null || printf 'unknown')"
+        warn "herd reload: no herdr workspace labelled '${WORKSPACE_NAME}' (open: ${open_labels}) — control room NOT rebuilt. Is the workspace open and labelled to match WORKSPACE_NAME? (watcher relaunched headless)"
+      fi
+    fi
 
     if [ -n "$ws" ]; then
       herdr_attempted=1
+      rebuild_desc="rebuilt around the coordinator (herdr workspace ${WORKSPACE_NAME})"
       # Bring THIS project's workspace forward before rebuilding it. Every herdr call below is
       # --no-focus (so the rebuild never yanks focus mid-flight), which means a reload launched
       # while a SIBLING project's workspace is focused would otherwise rebuild our control room
@@ -1108,12 +1229,14 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
       # only HINTS — every one is validated against the live pane roster before it is trusted.
       backlog_desc=""
 
-      # Registry rows (coordinator.sh / prior reloads) — hints, validated below.
+      # Registry rows (coordinator.sh / prior reloads) — hints, validated below. Each pane_id is
+      # taken ONLY when the row's recorded workspace_id matches this workspace (or the row is a legacy
+      # untagged one); a row stamped with a DIFFERENT workspace is dropped here (issue #60).
       local reg_apane="" reg_wpane="" reg_bpane=""
       if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
-        reg_apane="$(awk '$1=="coordinator-agent" {print $2}' "$WORKTREES_DIR/.herd-panes")"
-        reg_wpane="$(awk '$1=="watch"   {print $2}' "$WORKTREES_DIR/.herd-panes")"
-        reg_bpane="$(awk '$1=="backlog" {print $2}' "$WORKTREES_DIR/.herd-panes")"
+        reg_apane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" coordinator-agent "$ws")"
+        reg_wpane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" watch "$ws")"
+        reg_bpane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" backlog "$ws")"
       fi
 
       local coord_tab="" agent_pane="" agent_live=0 bPane="" wPane="" geom_changed=0
@@ -1209,7 +1332,10 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
         if [ -n "$first_backlog" ]; then
           bPane="$first_backlog"
           backlog_desc="pane $bPane · already live ✓ (adopted)"
-        elif [ -n "$reg_bpane" ]; then
+        elif [ -n "$reg_bpane" ] && [ "$reg_bpane" != "$agent_pane" ] && _reg_role_ok "$reg_bpane" backlog; then
+          # Adopt the registry backlog pane only when it is not the anchor and is not LIVE in a
+          # different role (a `backlog` row that actually points at the watch/coordinator pane is
+          # dropped here → recreated below at canonical geometry).
           case "$(_reload_pane_state "$reg_bpane" "backlog-view.sh")" in
             RUN*) bPane="$reg_bpane"; backlog_desc="pane $bPane · already live ✓" ;;
             BARE) bPane="$reg_bpane" ;;
@@ -1261,7 +1387,10 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
 
           # WATCH pane: adopt the registry pane, else the neighbor BELOW the coordinator, else
           # split a fresh one below it (ratio 0.72). BARE/RUN are reusable; BUSY/GONE never are.
-          if [ -n "$reg_wpane" ]; then
+          # Never adopt the anchor pane or a pane LIVE in a different role as the watch (the exact
+          # drift from the incident: a `watch` row pointing at the coordinator pane id) — drop it and
+          # recreate below.
+          if [ -n "$reg_wpane" ] && [ "$reg_wpane" != "$agent_pane" ] && _reg_role_ok "$reg_wpane" watch; then
             case "$(_reload_pane_state "$reg_wpane" "$watch_match")" in
               BARE|RUN*) wPane="$reg_wpane" ;;
             esac
@@ -1321,13 +1450,15 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
         warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  claude ${COORDINATOR_CMD}"
       fi
 
-      # REGISTRY: rewrite from the OBSERVED final state on every path. mkdir -p is required —
-      # WORKTREES_DIR may not exist yet on a control room that predates the first feature build.
+      # REGISTRY: rewrite from the OBSERVED final state on every path, stamping each row with the
+      # resolved workspace_id ($ws) as a 4th column so a later reader can drop a hint that names a
+      # foreign workspace (issue #60). mkdir -p is required — WORKTREES_DIR may not exist yet on a
+      # control room that predates the first feature build.
       mkdir -p "$WORKTREES_DIR"
       {
-        [ -n "${agent_pane:-}" ] && printf 'coordinator-agent %s %s\n' "$agent_pane" "$coord_tab"
-        [ -n "${bPane:-}" ]      && printf 'backlog %s %s\n' "$bPane" "$coord_tab"
-        [ -n "${wPane:-}" ]      && printf 'watch %s %s\n' "$wPane" "$coord_tab"
+        [ -n "${agent_pane:-}" ] && printf 'coordinator-agent %s %s %s\n' "$agent_pane" "$coord_tab" "$ws"
+        [ -n "${bPane:-}" ]      && printf 'backlog %s %s %s\n' "$bPane" "$coord_tab" "$ws"
+        [ -n "${wPane:-}" ]      && printf 'watch %s %s %s\n' "$wPane" "$coord_tab" "$ws"
       } > "$WORKTREES_DIR/.herd-panes"
     fi
   fi
@@ -1382,10 +1513,12 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
   journal_append reload_outcome component skill   result rendered
   journal_append reload_outcome component watcher result "$launch_desc"
   journal_append reload_outcome component backlog result "$backlog_desc"
+  journal_append reload_outcome component control_room result "$rebuild_desc"
 
   say ""
   ok "reload complete"
   say "  workspace:     $WORKSPACE_NAME"
+  say "  control room:  $rebuild_desc"
   say "  skill:         $skill"
   say "  watcher:       $wsum"
   say "  backlog:       $backlog_desc"
@@ -1397,17 +1530,6 @@ print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LAB
 # (observe-before-mutate pane plumbing) and the `.herd-panes` role registry, rewrites that registry
 # from the OBSERVED final state, and prints a one-line per-component outcome like cmd_reload's
 # summary. All refuse when no project `.herd/config` resolves — never the engine dogfood fallback.
-
-# _pane_ws_id <workspace_label> → workspace_id, or empty (mirrors cmd_reload's resolve).
-_pane_ws_id() {
-  herdr workspace list 2>/dev/null | LABEL="$1" python3 -c '
-import sys,json,os
-try: d=json.load(sys.stdin)
-except Exception: d={}
-ws=(d.get("result") or {}).get("workspaces") or []
-print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LABEL","")), ""), end="")
-' 2>/dev/null || true
-}
 
 # _pane_agent_start <name> <workspace> <cwd> <tab> <direction> → new pane_id, or empty. Reuses
 # coordinator.sh's agent-start invocation so the relaunched coordinator runs the same skill.
@@ -1421,13 +1543,14 @@ except Exception: pass
 }
 
 # _pane_write_registry <agent> <backlog> <watch> — rewrite $WORKTREES_DIR/.herd-panes from the
-# OBSERVED final pane IDs (empty rows omitted). All three rows carry the coordinator tab id.
+# OBSERVED final pane IDs (empty rows omitted). All three rows carry the coordinator tab id and the
+# resolved workspace_id (4th column) so a later reader can drop a hint naming a foreign workspace.
 _pane_write_registry() {
   mkdir -p "$WORKTREES_DIR"
   {
-    [ -n "$1" ] && printf 'coordinator-agent %s %s\n' "$1" "$PANE_COORD_TAB"
-    [ -n "$2" ] && printf 'backlog %s %s\n' "$2" "$PANE_COORD_TAB"
-    [ -n "$3" ] && printf 'watch %s %s\n' "$3" "$PANE_COORD_TAB"
+    [ -n "$1" ] && printf 'coordinator-agent %s %s %s\n' "$1" "$PANE_COORD_TAB" "$PANE_WS"
+    [ -n "$2" ] && printf 'backlog %s %s %s\n' "$2" "$PANE_COORD_TAB" "$PANE_WS"
+    [ -n "$3" ] && printf 'watch %s %s %s\n' "$3" "$PANE_COORD_TAB" "$PANE_WS"
   } > "$WORKTREES_DIR/.herd-panes"
 }
 
@@ -1447,20 +1570,42 @@ _pane_init() {
   command -v herdr >/dev/null 2>&1 \
     || die "herdr not on PATH — 'herd pane' needs the herdr control room (launch it: bash $SCRIPTS_DIR/coordinator.sh)"
 
-  PANE_WS="$(_pane_ws_id "$WORKSPACE_NAME")"
-  [ -n "$PANE_WS" ] \
-    || die "no herdr workspace '$WORKSPACE_NAME' — launch the control room first: bash $SCRIPTS_DIR/coordinator.sh"
+  # Resolve THIS project's workspace, distinguishing a herdr CLI/parse error from a genuine no-match
+  # and — on a miss — naming the observed open labels (mirrors cmd_reload's fail-loud, issue #60).
+  local _ws_list="" _ws_rc=0
+  _ws_list="$(herdr workspace list 2>/dev/null)" || _ws_rc=$?
+  [ "$_ws_rc" -eq 0 ] \
+    || die "'herdr workspace list' failed (exit $_ws_rc) — cannot resolve workspace '$WORKSPACE_NAME'; is the herdr control room running? (launch it: bash $SCRIPTS_DIR/coordinator.sh)"
+  PANE_WS="$(printf '%s' "$_ws_list" | LABEL="$WORKSPACE_NAME" python3 -c '
+import sys,json,os
+try: d=json.load(sys.stdin)
+except Exception: d={}
+ws=(d.get("result") or {}).get("workspaces") or []
+print(next((w["workspace_id"] for w in ws if w.get("label")==os.environ.get("LABEL","")), ""), end="")
+' 2>/dev/null || true)"
+  if [ -z "$PANE_WS" ]; then
+    local _open; _open="$(printf '%s' "$_ws_list" | python3 -c '
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: d={}
+ws=(d.get("result") or {}).get("workspaces") or []
+print(", ".join(str(w.get("label","?")) for w in ws) or "none")
+' 2>/dev/null || printf 'unknown')"
+    die "no herdr workspace labelled '$WORKSPACE_NAME' (open: ${_open}) — launch the control room first: bash $SCRIPTS_DIR/coordinator.sh"
+  fi
 
   PANE_COORD_TAB="$(_reload_tab_by_label "$PANE_WS" "$HERD_TAB_COORDINATOR")"
   [ -n "$PANE_COORD_TAB" ] \
     || die "no coordinator tab in workspace '$WORKSPACE_NAME' — run 'herd reload' or coordinator.sh to build the control room"
 
   # Registry rows (coordinator.sh / prior reloads) — hints, validated against the live roster below.
+  # Each pane_id is taken ONLY when the row's recorded workspace_id matches this workspace (or the
+  # row is a legacy untagged one); a row stamped with a DIFFERENT workspace is dropped (issue #60).
   PANE_REG_A=""; PANE_REG_W=""; PANE_REG_B=""
   if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
-    PANE_REG_A="$(awk '$1=="coordinator-agent" {print $2}' "$WORKTREES_DIR/.herd-panes")"
-    PANE_REG_W="$(awk '$1=="watch"   {print $2}' "$WORKTREES_DIR/.herd-panes")"
-    PANE_REG_B="$(awk '$1=="backlog" {print $2}' "$WORKTREES_DIR/.herd-panes")"
+    PANE_REG_A="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" coordinator-agent "$PANE_WS")"
+    PANE_REG_W="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" watch "$PANE_WS")"
+    PANE_REG_B="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" backlog "$PANE_WS")"
   fi
 
   # ANCHOR: resolve the coordinator pane — a live agent in the tab (authoritative; also catches
@@ -1502,8 +1647,9 @@ cmd_pane_watch() {
 
   # 2. Resolve the watch pane: reuse the registered pane (now BARE, its watcher just stopped),
   #    else the coordinator's downward neighbor, else recreate it below the coordinator (0.72).
+  #    Never adopt the anchor pane or a pane LIVE in a different role as the watch (issue #60).
   local wPane="" recreated=0 geom_changed=0
-  if [ -n "$PANE_REG_W" ]; then
+  if [ -n "$PANE_REG_W" ] && [ "$PANE_REG_W" != "$PANE_AGENT" ] && _reg_role_ok "$PANE_REG_W" watch; then
     case "$(_reload_pane_state "$PANE_REG_W" "$watch_match")" in
       BARE|RUN*) wPane="$PANE_REG_W" ;;
     esac
@@ -1571,9 +1717,10 @@ cmd_pane_backlog() {
   local backlog_script="$SCRIPTS_DIR/backlog-view.sh"
 
   # Resolve the backlog pane: the registered pane if it still serves the role, else the
-  # coordinator's LEFT neighbor, else a scan of the coordinator tab for a live viewer.
+  # coordinator's LEFT neighbor, else a scan of the coordinator tab for a live viewer. Never adopt
+  # the anchor pane or a pane LIVE in a different role as the backlog (issue #60).
   local bPane="" recreated=0 geom_changed=0
-  if [ -n "$PANE_REG_B" ]; then
+  if [ -n "$PANE_REG_B" ] && [ "$PANE_REG_B" != "$PANE_AGENT" ] && _reg_role_ok "$PANE_REG_B" backlog; then
     case "$(_reload_pane_state "$PANE_REG_B" "backlog-view.sh")" in
       RUN*|BARE) bPane="$PANE_REG_B" ;;
     esac

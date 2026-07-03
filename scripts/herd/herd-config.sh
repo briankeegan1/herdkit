@@ -141,6 +141,16 @@ HERD_TAB_COORDINATOR="coordinator-$_HERD_WS_SLUG"
 HERD_WATCHER_LOCK="$WORKTREES_DIR/.watcher-${_HERD_WS_SLUG}.pid"
 # PID-file path for the per-project dep-watcher singleton (dep-watcher.sh spawn-lock).
 HERD_DEPWATCHER_LOCK="$WORKTREES_DIR/.depwatcher-${_HERD_WS_SLUG}.pid"
+# argv0 marker for THIS project's watcher process (issue #60 attribution). agent-watch.sh re-execs
+# itself under this distinctive per-workspace argv0 at startup, so its process is attributable to
+# exactly one workspace in ps/pgrep. Two projects running the same engine are otherwise byte-identical
+# in the process table (`bash .../agent-watch.sh` with no project in argv), so a good-faith stray-reap
+# in one project could SIGTERM the other's live watcher. argv0 is visible via ps/pgrep on EVERY
+# platform, whereas an env-var marker is NOT reliably readable via ps on modern macOS — which is why
+# the marker is argv0, not an env var. The re-exec (agent-watch.sh) and the enumerator
+# (_list_project_watchers in bin/herd) both key off this exact string. This SUBSUMES the separate
+# 'per-workspace argv0' backlog goal. Uses the sanitized slug so the marker stays a safe pgrep literal.
+HERD_WATCH_ARGV0="herd-watch-${_HERD_WS_SLUG}"
 unset _HERD_WS_SLUG
 
 # herd_resolve_workspace_id — resolve this project's herdr workspace id by matching WORKSPACE_NAME

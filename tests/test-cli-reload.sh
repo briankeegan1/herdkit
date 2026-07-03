@@ -799,4 +799,157 @@ grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog role no
 [ -f "$S/tabs/tC" ] || fail "coordinator tab was closed during fold-back"
 ok
 
+# ═══ issue #60 fix 1: argv0 watcher attribution across two projects (tests 29+) ══════════════════
+# A fake watcher = an innocuous `sleep` re-exec'd under a distinctive per-workspace argv0
+# (herd-watch-<slug>), exactly as agent-watch.sh tags itself at startup. `ps -o command=` shows that
+# argv0; the pgrep stub returns whichever pids the test declares (FAKE_STRAY_PIDS), and the REAL
+# `ps` argv0 check inside _list_project_watchers / _stop_project_watcher is what distinguishes them.
+# `exec -a M sleep` (NOT `exec -a M bash …`) keeps argv0==M AND lets a plain SIGTERM stop it promptly.
+# Fully hermetic — never touches a real watcher, only sleeps we spawn and reap.
+# Redirect the sleep's std fds so the backgrounded process does NOT hold the command-substitution
+# pipe open (else `$(_spawn_tagged …)` blocks for the full sleep). `exec -a M sleep` keeps argv0==M.
+_spawn_tagged() { ( exec -a "$1" sleep 9999 ) >/dev/null 2>&1 & echo $!; }   # $1 = marker → prints pid
+
+# ── 29. reload in project X reaps X's argv0 watchers (lock + lock-absent stray); Y SURVIVES ──────
+# Two fake projects share the engine. Project X has TWO tagged watchers — one recorded in its
+# lockfile, one a lock-ABSENT stray — plus project Y has its own tagged watcher. `herd reload` in X
+# must SIGTERM both of X's (proving the lock-absent stray is now reaped) and be PROVABLY INERT for
+# Y's, even though all three are the identical `sleep` re-exec differing only in argv0.
+PX="$T/px"; mkdir "$PX"; _make_project "$PX" "projx"
+PY="$T/py"; mkdir "$PY"; _make_project "$PY" "projy"
+X_LOCK="$(_spawn_tagged herd-watch-projx)"     # X's lockfile watcher
+X_STRAY="$(_spawn_tagged herd-watch-projx)"    # X's lock-ABSENT stray (invisible to the old code)
+Y_LIVE="$(_spawn_tagged herd-watch-projy)"     # project Y's live watcher — must never be touched
+sleep 0.3
+printf '%s\n' "$X_LOCK" > "$PX/trees/.watcher-projx.pid"
+# The stubbed pgrep returns all three pids (as a real pgrep across the process table would); the
+# argv0 ps-check does the attribution.
+( cd "$PX" && FAKE_STRAY_PIDS="$X_LOCK:$X_STRAY:$Y_LIVE" HERD_RELOAD_SIGTERM_POLLS=3 \
+    HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$X_LOCK" "$X_STRAY" "$Y_LIVE" 2>/dev/null; fail "reload failed (two-project argv0 test)"; }
+sleep 0.4
+kill -0 "$X_LOCK"  2>/dev/null && { kill "$X_LOCK" "$X_STRAY" "$Y_LIVE" 2>/dev/null; fail "X's lockfile watcher not reaped"; }
+kill -0 "$X_STRAY" 2>/dev/null && { kill "$X_STRAY" "$Y_LIVE" 2>/dev/null; fail "X's lock-ABSENT argv0 stray not reaped (the 'no running watcher while 2 alive' bug)"; }
+kill -0 "$Y_LIVE"  2>/dev/null || fail "project Y's argv0 watcher was reaped by X's reload (cross-project kill)"
+kill "$Y_LIVE" 2>/dev/null || true
+ok
+
+# ── 30. stop is inert for Y even when Y shares X's PROJECT_ROOT cwd — argv0 gate beats cwd ───────
+# A sibling watcher tagged for Y whose cwd happens to match X's PROJECT_ROOT must STILL survive: the
+# foreign-argv0 guard in the legacy cwd fallback skips any herd-watch-* process that is not ours.
+PX2="$T/px2"; mkdir "$PX2"; _make_project "$PX2" "projx"
+PX2_REAL="$(cd "$PX2" && pwd -P)"
+# A Y-tagged watcher whose cwd IS X's root (would be killed by the cwd fallback if argv0 weren't gated).
+( cd "$PX2_REAL" && exec -a "herd-watch-projy" sleep 9999 ) & YCWD=$!
+sleep 0.3
+( cd "$PX2" && FAKE_STRAY_PIDS="$YCWD" HERD_RELOAD_SIGTERM_POLLS=3 \
+    HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$YCWD" 2>/dev/null; fail "reload failed (argv0-beats-cwd test)"; }
+sleep 0.3
+kill -0 "$YCWD" 2>/dev/null || fail "a foreign-argv0 watcher sharing our cwd was killed (argv0 guard failed)"
+kill "$YCWD" 2>/dev/null || true
+ok
+
+# ── 31. legacy UNTAGGED watcher (no argv0 marker) in our cwd is still reaped via the cwd fallback ─
+# Back-compat: a watcher started before the argv0 marker existed shows as a plain `sleep`/`bash`
+# with no herd-watch-* argv0. It must still be reaped when its cwd is our PROJECT_ROOT.
+PX3="$T/px3"; mkdir "$PX3"; _make_project "$PX3" "projx"
+PX3_REAL="$(cd "$PX3" && pwd -P)"
+( cd "$PX3_REAL" && exec sleep 9999 ) & LEGACY=$!   # untagged (argv0 == "sleep")
+sleep 0.3
+( cd "$PX3" && FAKE_STRAY_PIDS="$LEGACY" HERD_RELOAD_SIGTERM_POLLS=3 \
+    HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$LEGACY" 2>/dev/null; fail "reload failed (legacy untagged reap test)"; }
+sleep 0.3
+kill -0 "$LEGACY" 2>/dev/null && { kill "$LEGACY" 2>/dev/null; fail "legacy untagged watcher in our cwd was not reaped"; }
+ok
+
+# ═══ issue #60 fix 2: reload silent no-op → FAIL LOUD (tests 32+) ═════════════════════════════════
+
+# ── 32. herdr present but NO workspace matches WORKSPACE_NAME → fail loud, name the open labels ───
+# The rich stub reports one workspace labelled FAKE_WS_LABEL; we point WORKSPACE_NAME elsewhere so
+# the label lookup misses. Reload must NOT silently slide into a headless relaunch: it names the
+# expected label, lists the observed open labels, and the summary says the control room was NOT
+# rebuilt. HERD_RELOAD_SKIP_LAUNCH=fallback keeps it hermetic (no real background watcher).
+P="$T/p32"; mkdir "$P"; _make_project "$P" "reloadtest"
+S="$T/state32"; mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
+out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="someotherlabel" \
+    HERD_RELOAD_SKIP_LAUNCH=fallback bash "$HERD" reload 2>&1 )" || fail "reload failed (empty-ws fail-loud)"
+printf '%s' "$out" | grep -q "no herdr workspace labelled 'reloadtest'" || fail "empty-ws: expected label not named"
+printf '%s' "$out" | grep -q "someotherlabel" || fail "empty-ws: observed open labels not listed"
+printf '%s' "$out" | grep -qi "control room" || fail "empty-ws: summary missing control-room verdict"
+printf '%s' "$out" | grep -qi "NOT rebuilt" || fail "empty-ws: summary did not flag control room NOT rebuilt"
+ok
+
+# ── 33. herdr CLI/parse error (list exits non-zero) is distinguished from a genuine no-match ──────
+# The basic herdr stub exits 1 for every call. Reload must report the LIST FAILURE explicitly, not
+# collapse it into "no such workspace".
+P="$T/p33"; mkdir "$P"; _make_project "$P" "reloadtest"
+out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=fallback bash "$HERD" reload 2>&1 )" || fail "reload failed (parse-error path)"
+printf '%s' "$out" | grep -qi "workspace list' failed" || fail "herdr list failure not surfaced distinctly"
+printf '%s' "$out" | grep -qi "NOT rebuilt" || fail "parse-error: control room not flagged NOT rebuilt"
+ok
+
+# ── 34. herdr NOT installed → its OWN distinct message (not the no-match one) ─────────────────────
+# Curate a PATH that has every tool EXCEPT herdr (robust on a box that really has herdr installed),
+# with the pgrep stub overriding the real one so the process table is never consulted.
+NOHERDR="$T/noherdr"; mkdir -p "$NOHERDR"
+for d in /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    b="$(basename "$f")"; [ "$b" = "herdr" ] && continue
+    [ -e "$NOHERDR/$b" ] || ln -s "$f" "$NOHERDR/$b" 2>/dev/null || true
+  done
+done
+rm -f "$NOHERDR/pgrep"; cp "$BIN/pgrep" "$NOHERDR/pgrep"; chmod +x "$NOHERDR/pgrep"
+P="$T/p34"; mkdir "$P"; _make_project "$P" "reloadtest"
+out="$( cd "$P" && env -i PATH="$NOHERDR" HOME="$HOME" HERD_RELOAD_SKIP_LAUNCH=fallback \
+    bash "$HERD" reload 2>&1 )" || fail "reload failed (herdr-absent path)"
+printf '%s' "$out" | grep -qi "herdr not found" || fail "herdr-absent: distinct 'herdr not found' message missing"
+printf '%s' "$out" | grep -q "no herdr workspace labelled" && fail "herdr-absent wrongly reported as a no-match" || true
+ok
+
+# ═══ issue #60 fix 3: .herd-panes per-workspace + role validation (tests 35+) ═════════════════════
+
+# ── 35. a registry row stamped with a FOREIGN workspace_id is NOT adopted ────────────────────────
+# The coordinator tab resolves to w1. Registry backlog/watch rows name pL_r/pW_r but are stamped for
+# workspace 'wZZZ' — reload must drop those hints (never run scripts in pL_r/pW_r) and re-establish
+# the roles from the live roster (the coordinator's neighbors pL/pW).
+P="$T/p35"; mkdir "$P"; _make_project "$P" "reloadtest"
+S="$T/state35"; _rich_coord_state "$S"
+mkdir -p "$S/panes/pW_r" "$S/panes/pL_r"; printf 'tC' > "$S/panes/pW_r/tab"; printf 'tC' > "$S/panes/pL_r/tab"
+P35_REAL="$(cd "$P" && pwd -P)"
+cat > "$P35_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC w1
+backlog pL_r tC wZZZ
+watch pW_r tC wZZZ
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (foreign workspace_id test)"
+grep -q "pane run pW_r" "$S/log" && fail "adopted a watch pane stamped for a FOREIGN workspace" || true
+grep -q "pane run pL_r" "$S/log" && fail "adopted a backlog pane stamped for a FOREIGN workspace" || true
+grep -q "herd-watch.sh"  "$S/panes/pW/cmd" 2>/dev/null || fail "watch role not re-established from the live roster"
+grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog role not re-established from the live roster"
+# The rewritten registry must be stamped with THIS workspace (w1) as the 4th column.
+awk '$1=="watch" {print $4}' "$P35_REAL/trees/.herd-panes" | grep -qx "w1" || fail "rewritten watch row not stamped with workspace_id w1"
+ok
+
+# ── 36. a registry row whose pane serves the WRONG role is dropped + recreated ────────────────────
+# The `watch` row points at pX, but pX is LIVE running the backlog viewer (wrong role for a watch
+# pane — the drifted-registry misroute from the incident). Reload must NOT run the watcher into pX;
+# it drops the hint and (re)creates the watcher below the coordinator instead.
+P="$T/p36"; mkdir "$P"; _make_project "$P" "reloadtest"
+S="$T/state36"; _rich_coord_state "$S"
+mkdir -p "$S/panes/pX"; printf 'tC' > "$S/panes/pX/tab"
+printf 'bash /x/backlog-view.sh' > "$S/panes/pX/cmd"   # pX is LIVE in the backlog role
+P36_REAL="$(cd "$P" && pwd -P)"
+cat > "$P36_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC w1
+backlog pL tC w1
+watch pX tC w1
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (wrong-role test)"
+grep -q "herd-watch.sh" "$S/panes/pX/cmd" 2>/dev/null && fail "watcher run into a pane serving the WRONG role (backlog)" || true
+grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watcher not recreated below the coordinator after dropping the wrong-role hint"
+ok
+
 echo "ALL PASS ($pass checks)"
