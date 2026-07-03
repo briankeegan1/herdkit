@@ -29,6 +29,7 @@ in parallel.
    - **Add an item** — research the idea in the repo, then capture a grounded entry
    - **Curate & reprioritize** — prune to what the user needs and reorder by importance
    - **Check running agents** — show status of in-flight sub-agents and the watcher's verdicts
+   - **Workflow settings** — view or change any workflow preference (`.herd/config`) anytime
 
 After completing any action, return to this menu until the user chooses to stop.
 
@@ -123,6 +124,30 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 
 Keep every backlog edit **privacy-safe** — nothing under `{{DENY_PATHS}}` and no secrets ever
 reach `{{BACKLOG_FILE}}` (it's committed).
+
+## Workflow settings
+
+Every workflow preference lives in `.herd/config`, and the user can view or change **any** of them
+at **any** time — nothing is init-only. Drive it entirely through the validated CLI; never hand-edit
+`.herd/config` yourself:
+
+    herd config list              # print every effective key + value (secrets masked)
+    herd config get <KEY>         # read one key
+    herd config set <KEY> <VALUE> # change one key
+
+When the user picks **Workflow settings**, start with `herd config list` so they see the current
+state, then interview them (AskUserQuestion) for what to change and apply it with `herd config set`.
+Surface what the CLI guarantees so the user knows the change is safe and live:
+
+- **Validated keys** — `set` refuses any key not in the capabilities manifest, so a typo can't
+  silently write dead config.
+- **Secrets stay out** — secret-shaped keys are masked in `list`/`get` and refused by `set`;
+  credentials belong in `.herd/secrets`, never the committed config.
+- **Auto-applied, nothing init-only** — after a successful `set` the CLI *does what the change
+  requires*: a **watcher-affecting key** restarts the watcher (via `herd reload`) and a
+  **coordinator-facing key** re-renders this coordinator skill. A key needing neither is just
+  written. **Watcher-affecting changes take effect on the watcher's restart** — the CLI prints
+  which happened, so relay that back.
 
 ## Check running agents / review & merge
 
