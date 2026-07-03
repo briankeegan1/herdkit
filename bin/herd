@@ -2886,8 +2886,10 @@ cmd_fleet() {
     status)    fleet_status "$@" ;;
     digest)    fleet_digest "$@" ;;
     inbox)     fleet_inbox "$@" ;;
+    governance) fleet_governance "$@" ;;
     upgrade)   fleet_upgrade "$@" ;;
     reload)    fleet_reload "$@" ;;
+    set)       fleet_set "$@" ;;
     ""|-h|--help)
       cat <<EOF
 usage: herd fleet <subcommand>
@@ -2902,6 +2904,11 @@ usage: herd fleet <subcommand>
   inbox                      cross-project ATTENTION INBOX: one view of what needs you right now
                              (blocked PRs, human-verify/approval holds, CONFLICTING PRs, failed
                              health gates) per project · PR# · reason · suggested action; no LLM
+  governance                 fleet-wide GLOBAL CONCURRENCY view: total in-flight builders + reviews
+                             summed across all projects (the usage limit is account-wide, so this
+                             helps avoid a fleet-wide limit-hit); read-only, no LLM
+  set <KEY> <VALUE>          propagate a policy across the fleet by delegating to each project's own
+                             VALIDATED 'herd config set' (e.g. MERGE_POLICY / model tier / TOKEN_MODE)
   upgrade                    run 'herd update' in every registered project (per-project outcomes)
   reload                     run 'herd reload' in every registered project (per-project outcomes)
 
@@ -2982,6 +2989,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                             (shipped/needs-you/blocked/in-flight)
                                         inbox               attention inbox: what needs you now
                                                             (blocks/holds/conflicts/failed gates)
+                                        governance          global concurrency: total in-flight
+                                                            builders + reviews across all projects
+                                        set <KEY> <VALUE>   propagate a policy fleet-wide via each
+                                                            project's validated 'herd config set'
                                         upgrade             run 'herd update' in every project
                                         reload              run 'herd reload' in every project
   herd help                           this help
