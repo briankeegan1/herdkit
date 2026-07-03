@@ -315,3 +315,262 @@ _fleet_fanout() {
 
 fleet_upgrade() { _fleet_fanout update upgrade; }
 fleet_reload()  { _fleet_fanout reload  reload;  }
+
+# ── digest / standup (P1) ────────────────────────────────────────────────────
+# A DETERMINISTIC (no-LLM) cross-project rollup: aggregate every REGISTERED project's
+# .herd/journal.jsonl over a time window and print a per-project standup (shipped / needs-you /
+# blocked / in-flight / gate failures) plus one fleet-wide summary line. Read-only — it never
+# writes a journal or mutates a tree. The journal format + the live-plus-archives file set are the
+# SAME ones `herd log`/`herd why` parse (see bin/herd _journal_all_files / _JOURNAL_FMT); this reuses
+# that JSONL contract rather than inventing a new one.
+
+# _fleet_journal_files <worktrees-dir> — print this project's journal files (rotated archives oldest
+# first, then the live journal last), one path per line. Mirrors bin/herd's _journal_all_files, which
+# is coupled to that command's globals; the file layout is identical.
+_fleet_journal_files() {
+  local dir="$1/.herd"
+  [ -d "$dir" ] || return 0
+  ls -1 "$dir"/journal-*.jsonl 2>/dev/null | sort || true
+  [ -f "$dir/journal.jsonl" ] && printf '%s\n' "$dir/journal.jsonl"
+}
+
+# _fleet_digest_project_lines name path repo — emit this project's manifest block for the aggregator:
+#   P<TAB>name<TAB>ok|missing
+#   F<TAB><journal-path>            (0+ lines; absent for a missing/journal-less project)
+# A path that is gone or not a herd project is marked `missing` (reported, never fatal).
+_fleet_digest_project_lines() {
+  local name="$1" path="$2"
+  if [ ! -d "$path" ] || [ ! -f "$path/.herd/config" ]; then
+    printf 'P\t%s\tmissing\n' "$name"
+    return 0
+  fi
+  local row wt
+  row="$(_fleet_read_config "$path")" || row=""
+  wt="$(printf '%s' "$row" | cut -f3)"
+  [ -n "$wt" ] || wt="${path}-trees"
+  printf 'P\t%s\tok\n' "$name"
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && printf 'F\t%s\n' "$f"
+  done < <(_fleet_journal_files "$wt")
+}
+
+# The aggregator (python): reads the P/F manifest on stdin, filters each journal to events at-or-after
+# the window cutoff, reduces per PR to a single standup state (shipped > needs-you > blocked >
+# in-flight), tallies gate-failure events, and prints the per-project blocks + a fleet summary line.
+# Window is HERD_FLEET_SINCE (a duration like 24h/7d/90m/1w; bare number = hours). "Now" is
+# HERD_FLEET_NOW when set (ISO-8601 or epoch seconds; a test seam) else the real UTC clock.
+_FLEET_DIGEST_PY='
+import sys, os, re
+from datetime import datetime, timedelta, timezone
+
+def parse_ts(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    try:
+        # epoch seconds (test seam convenience)
+        if re.fullmatch(r"\d+", s):
+            return datetime.fromtimestamp(int(s), timezone.utc)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def parse_duration(s):
+    s = (s or "24h").strip().lower()
+    m = re.fullmatch(r"(\d+)\s*([smhdw]?)", s)
+    if not m:
+        raise ValueError("bad --since duration: %r (use e.g. 24h, 7d, 90m, 1w)" % s)
+    n = int(m.group(1)); unit = m.group(2) or "h"
+    return timedelta(seconds=n * {"s":1,"m":60,"h":3600,"d":86400,"w":604800}[unit])
+
+# JSON: prefer the stdlib json; every line is one object.
+import json
+
+since_raw = os.environ.get("HERD_FLEET_SINCE", "24h")
+try:
+    window = parse_duration(since_raw)
+except ValueError as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(2)
+
+now_env = os.environ.get("HERD_FLEET_NOW", "")
+now = parse_ts(now_env) if now_env else datetime.now(timezone.utc)
+if now is None:
+    sys.stderr.write("bad HERD_FLEET_NOW: %r\n" % now_env); sys.exit(2)
+cutoff = now - window
+
+# ── read the manifest: ordered projects, each with its journal file list ─────
+projects = []      # [(name, status, [files])]
+cur = None
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    tag = parts[0]
+    if tag == "P":
+        name = parts[1] if len(parts) > 1 else "?"
+        status = parts[2] if len(parts) > 2 else "ok"
+        cur = [name, status, []]
+        projects.append(cur)
+    elif tag == "F" and cur is not None and len(parts) > 1:
+        cur[2].append(parts[1])
+
+FAIL_HC = {"CODEERROR"}   # FLAKY/CLEAN are not code failures
+
+def digest_project(files):
+    # Per-PR event reduction over the window.
+    prs = {}           # pr -> flags dict
+    gate_fails = 0
+    saw_event = False
+    def pr_state(p):
+        return prs.setdefault(p, {"merged":False,"held":False,"escalated":False,
+                                  "blocked":False,"dispatched":False,"reaped":False})
+    rows = []
+    for path in files:
+        try:
+            fh = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    o = json.loads(ln)
+                except Exception:
+                    continue
+                ts = parse_ts(o.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+                rows.append(o)
+    # Process chronologically so held/released toggles resolve in order.
+    rows.sort(key=lambda o: str(o.get("ts", "")))
+    for o in rows:
+        saw_event = True
+        ev = o.get("event", "")
+        pr = o.get("pr")
+        pr = None if pr in (None, "") else str(pr)
+        if ev == "merge" and pr:
+            pr_state(pr)["merged"] = True
+        elif ev == "hold_applied" and pr:
+            pr_state(pr)["held"] = True
+        elif ev == "hold_released" and pr:
+            pr_state(pr)["held"] = False
+        elif ev == "review_escalated" and pr:
+            pr_state(pr)["escalated"] = True
+            gate_fails += 1
+        elif ev == "review_dispatched" and pr:
+            pr_state(pr)["dispatched"] = True
+        elif ev == "reap" and pr:
+            pr_state(pr)["reaped"] = True
+        elif ev == "verdict_recorded" and pr:
+            if str(o.get("value", "")).upper() == "BLOCK":
+                pr_state(pr)["blocked"] = True
+                gate_fails += 1
+        elif ev == "healthcheck_outcome":
+            if str(o.get("outcome", "")).upper() in FAIL_HC:
+                gate_fails += 1
+        elif ev == "infra_event":
+            gate_fails += 1
+
+    shipped, needs, blocked, inflight = [], [], [], []
+    for p, f in prs.items():
+        if f["merged"]:
+            shipped.append(p)
+        elif f["held"] or f["escalated"]:
+            needs.append(p)
+        elif f["blocked"]:
+            blocked.append(p)
+        elif f["dispatched"] and not f["reaped"]:
+            inflight.append(p)
+    def key(p):
+        try: return (0, int(p))
+        except ValueError: return (1, p)
+    for lst in (shipped, needs, blocked, inflight):
+        lst.sort(key=key)
+    return {"shipped":shipped,"needs":needs,"blocked":blocked,"inflight":inflight,
+            "gate_fails":gate_fails,"saw_event":saw_event}
+
+def fmt_prs(lst):
+    return "  (%s)" % ", ".join("#" + p for p in lst) if lst else ""
+
+# Human window label (echo the raw --since; it is already the natural phrase).
+win = since_raw
+print("herd fleet digest — standup over last %s (since %s)" %
+      (win, cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")))
+print("")
+
+tot = {"projects":0,"shipped":0,"needs":0,"blocked":0,"inflight":0,"gate_fails":0,"missing":0}
+for name, status, files in projects:
+    tot["projects"] += 1
+    print(name)
+    if status != "ok":
+        tot["missing"] += 1
+        print("  (unreachable — path or .herd/config missing)")
+        print("")
+        continue
+    d = digest_project(files)
+    tot["shipped"]  += len(d["shipped"])
+    tot["needs"]    += len(d["needs"])
+    tot["blocked"]  += len(d["blocked"])
+    tot["inflight"] += len(d["inflight"])
+    tot["gate_fails"] += d["gate_fails"]
+    if not d["saw_event"]:
+        print("  (no activity in window)")
+        print("")
+        continue
+    print("  shipped:    %3d%s" % (len(d["shipped"]), fmt_prs(d["shipped"])))
+    print("  needs you:  %3d%s" % (len(d["needs"]), fmt_prs(d["needs"])))
+    print("  blocked:    %3d%s" % (len(d["blocked"]), fmt_prs(d["blocked"])))
+    print("  in-flight:  %3d%s" % (len(d["inflight"]), fmt_prs(d["inflight"])))
+    print("  gate fails: %3d" % d["gate_fails"])
+    print("")
+
+miss = (" · %d unreachable" % tot["missing"]) if tot["missing"] else ""
+print("Fleet: %d project%s · %d shipped · %d need you · %d blocked · %d in-flight · %d gate failure%s%s  ·  window: last %s" % (
+    tot["projects"], "" if tot["projects"]==1 else "s",
+    tot["shipped"], tot["needs"], tot["blocked"], tot["inflight"],
+    tot["gate_fails"], "" if tot["gate_fails"]==1 else "s", miss, win))
+'
+
+# fleet_digest [--since <duration>] — the cross-project standup. Default window: last 24h.
+fleet_digest() {
+  local since="24h"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --since)   since="${2:-}"; [ -n "$since" ] || die "--since requires a duration (e.g. 24h, 7d)"; shift 2 ;;
+      --since=*) since="${1#--since=}"; [ -n "$since" ] || die "--since requires a duration (e.g. 24h, 7d)"; shift ;;
+      -h|--help)
+        cat <<EOF
+usage: herd fleet digest [--since <duration>]
+
+  Cross-project DAILY DIGEST / standup, aggregated from every registered project's
+  .herd/journal.jsonl (deterministic, no LLM). Per project over the window:
+  shipped (merged), needs-you (holds/escalations), blocked (BLOCK verdicts),
+  in-flight (active reviews), and gate-failure count; plus a fleet-wide summary.
+
+  --since <duration>   window to roll up (default 24h). Suffixes: s m h d w; a bare
+                       number is hours. Examples: --since 24h, --since 7d, --since 90m
+EOF
+        return 0 ;;
+      *) die "usage: herd fleet digest [--since <duration>]" ;;
+    esac
+  done
+
+  local reg; reg="$(_fleet_registry_file)"
+  if [ ! -f "$reg" ]; then
+    say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
+    return 0
+  fi
+
+  local manifest
+  manifest="$(_fleet_each _fleet_digest_project_lines)" || manifest=""
+  if [ -z "$manifest" ]; then
+    say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
+    return 0
+  fi
+
+  printf '%s\n' "$manifest" | HERD_FLEET_SINCE="$since" python3 -c "$_FLEET_DIGEST_PY"
+}
