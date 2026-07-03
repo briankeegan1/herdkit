@@ -262,12 +262,15 @@ fleet_status() {
 
 # ── upgrade / reload fan-out ─────────────────────────────────────────────────
 
-# _fleet_fanout <herd-subcommand> <verb> — run `herd <subcommand>` inside every registered project
-# and print a per-project outcome table. The delegated command owns all guards (the upgrade guard
-# already refuses on a dirty tree / mid-flight builders), so bulk fan-out inherits that safety.
-# HERD_FLEET_HERD_BIN overrides which herd binary is invoked (test seam); defaults to this engine's.
+# _fleet_fanout <verb> <herd-arg>... — run `herd <herd-arg>...` inside every registered project and
+# print a per-project outcome table. <verb> is the human label for the header/summary; the remaining
+# args are the herd command line delegated verbatim into each project (e.g. `update`, or `config set
+# KEY VALUE`). The delegated command owns all guards (the upgrade guard already refuses on a dirty
+# tree / mid-flight builders; `config set` validates against capabilities.tsv), so bulk fan-out
+# inherits that safety and never reimplements it here. HERD_FLEET_HERD_BIN overrides which herd binary
+# is invoked (test seam); defaults to this engine's.
 _fleet_fanout() {
-  local sub="$1" verb="$2"
+  local verb="$1"; shift
   local herd_bin="${HERD_FLEET_HERD_BIN:-${HERDKIT_HOME:-}/bin/herd}"
   local reg; reg="$(_fleet_registry_file)"
   if [ ! -f "$reg" ]; then
@@ -275,7 +278,7 @@ _fleet_fanout() {
     return 0
   fi
 
-  say "${c_bold}herd fleet $verb${c_rst} — running 'herd $sub' across the fleet"
+  say "${c_bold}herd fleet $verb${c_rst} — running 'herd $*' across the fleet"
   say ""
   printf '%s%-16s %-9s %s%s\n' "$c_bold" "PROJECT" "OUTCOME" "DETAIL" "$c_rst"
 
@@ -293,7 +296,7 @@ _fleet_fanout() {
     # Capture via `if` (not a bare `out=$(...)`) so a non-zero delegated command does not trip the
     # caller's `set -e`; we WANT to record the failure and keep fanning out, not abort the fleet.
     local out rc last
-    if out="$( cd "$path" 2>/dev/null && HERD_NONINTERACTIVE=1 "$herd_bin" "$sub" 2>&1 )"; then
+    if out="$( cd "$path" 2>/dev/null && HERD_NONINTERACTIVE=1 "$herd_bin" "$@" 2>&1 )"; then
       rc=0
     else
       rc=$?
@@ -313,8 +316,25 @@ _fleet_fanout() {
   [ "$fail_n" -eq 0 ]
 }
 
-fleet_upgrade() { _fleet_fanout update upgrade; }
-fleet_reload()  { _fleet_fanout reload  reload;  }
+fleet_upgrade() { _fleet_fanout upgrade update; }
+fleet_reload()  { _fleet_fanout reload  reload; }
+
+# ── policy propagation (P4) ───────────────────────────────────────────────────
+# fleet_set <KEY> <VALUE> — propagate ONE policy across the whole fleet by delegating to each
+# registered project's own `herd config set <KEY> <VALUE>` in that project's directory (deterministic,
+# no LLM). This is the ONLY writing subcommand in the fleet layer, and even it writes NOTHING itself:
+# `herd config set` owns all validation (it rejects unknown keys against capabilities.tsv, refuses
+# DENY_PATHS / secret-shaped keys, and restarts the watcher / re-renders the skill for the keys that
+# need it), so an invalid KEY/VALUE fails PER PROJECT and is reported — never silently applied. Use it
+# to set e.g. MERGE_POLICY / a model tier / TOKEN_MODE fleet-wide in one command; the result is the
+# same per-project outcome table the upgrade/reload fan-out prints.
+fleet_set() {
+  local key="${1:-}"
+  { [ -n "$key" ] && [ "$#" -ge 2 ]; } \
+    || die "usage: herd fleet set <KEY> <VALUE>   (propagates 'herd config set' across the fleet)"
+  local value="$2"
+  _fleet_fanout "set $key" config set "$key" "$value"
+}
 
 # ── digest / standup (P1) ────────────────────────────────────────────────────
 # A DETERMINISTIC (no-LLM) cross-project rollup: aggregate every REGISTERED project's
@@ -853,4 +873,123 @@ EOF
   fi
 
   printf '%s\n' "$manifest" | python3 -c "$_FLEET_INBOX_PY"
+}
+
+# ── governance: global concurrency view (P4) ──────────────────────────────────
+# A READ-ONLY fleet-wide GOVERNANCE view: total in-flight BUILDERS + REVIEWS summed across every
+# registered project. The Claude account usage limit is ACCOUNT-WIDE (observed 2026-07-02: two sibling
+# projects competing for one quota caused a mid-task limit hit), so surfacing the fleet-wide in-flight
+# total in one place is how the operator avoids limit-hits. It aggregates from each project's own
+# watcher/agent STATE — the SAME signals agent-watch.sh itself uses — rather than re-deriving them:
+#   • builders = ACTIVE FEATURE worktrees (git worktree list, main checkout excluded) — exactly the
+#                FEATS set agent-watch.sh renders under "in flight".
+#   • reviews  = live .review-inflight-<pr>-<sha> markers under $WORKTREES_DIR whose reviewer pid is
+#                still alive — mirrors agent-watch.sh's _count_live_reviews (dead markers are reaped by
+#                the owning watcher, so a severed reviewer's stale marker never inflates the count).
+# Read-only: it never spawns, kills, or writes anything. Unreachable projects are reported, not fatal.
+
+# _fleet_count_builders <project-path> — count of ACTIVE FEATURE worktrees for this project (all of
+# its git worktrees minus the main checkout, i.e. one per in-flight builder). '0' when git is absent
+# or the path is not a git repo. Mirrors agent-watch.sh's FEATS enumeration (MAIN excluded).
+_fleet_count_builders() {
+  local path="$1"
+  command -v git >/dev/null 2>&1 || { printf '0'; return; }
+  local main; main="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || { printf '0'; return; }
+  git -C "$path" worktree list --porcelain 2>/dev/null | awk -v main="$main" '
+    /^worktree /{ p = substr($0, 10); if (p != main) n++ }
+    END { print n+0 }'
+}
+
+# _fleet_count_reviews <worktrees-dir> — count of LIVE in-flight reviews: one per .review-inflight-*
+# marker whose recorded reviewer pid is still alive. Byte-for-byte the predicate agent-watch.sh's
+# _count_live_reviews applies, so the fleet total agrees with each project's own concurrency gauge.
+_fleet_count_reviews() {
+  local wt="$1" n=0 f pid
+  for f in "$wt"/.review-inflight-*; do
+    [ -e "$f" ] || continue
+    pid="$(head -1 "$f" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
+# fleet_governance — the cross-project concurrency rollup. No window / no arguments: it reports the
+# CURRENT in-flight state. Per project: builders, reviews, their sum, and whether the watcher is alive
+# (a 'down' watcher means its counts may be stale); plus one fleet-wide total.
+fleet_governance() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+usage: herd fleet governance
+
+  Fleet-wide GLOBAL CONCURRENCY view (deterministic, no LLM, read-only): total in-flight
+  BUILDERS + REVIEWS summed across every registered project. The Claude account usage limit
+  is ACCOUNT-WIDE, so this one number is how you avoid a fleet-wide limit-hit. Per project:
+    BUILDERS   active feature worktrees (git worktree list, main checkout excluded)
+    REVIEWS    live .review-inflight markers (reviewer pid still alive)
+    IN-FLIGHT  builders + reviews for that project
+    WATCHER    is that project's watcher alive? (a 'down' watcher means counts may be stale)
+  plus a fleet-wide total. Counts come from each project's own watcher/agent state — the same
+  signals agent-watch.sh uses. An unreachable project (path/.herd/config gone) is reported,
+  never fatal. Soft in-flight cap: HERD_FLEET_INFLIGHT_SOFTCAP (inline default 6).
+EOF
+        return 0 ;;
+      *) die "usage: herd fleet governance   (no arguments; try: herd fleet governance --help)" ;;
+    esac
+  done
+
+  local reg; reg="$(_fleet_registry_file)"
+  if [ ! -f "$reg" ]; then
+    say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
+    return 0
+  fi
+
+  say "${c_bold}herd fleet governance${c_rst} — in-flight agents across the fleet (usage limit is account-wide)"
+  say ""
+  printf '%s%-16s %8s %8s %9s  %-7s%s\n' "$c_bold" "PROJECT" "BUILDERS" "REVIEWS" "IN-FLIGHT" "WATCHER" "$c_rst"
+
+  local tot_b=0 tot_r=0 nproj=0 nmiss=0 name path repo
+  while IFS='|' read -r name path repo; do
+    case "$name" in ''|'#'*) continue ;; esac
+    [ -n "$path" ] || continue
+
+    if [ ! -d "$path" ] || [ ! -f "$path/.herd/config" ]; then
+      nmiss=$((nmiss+1))
+      printf '%-16s %8s %8s %9s  %b%s%b\n' "$name" "—" "—" "—" "$c_yel" "unreachable" "$c_rst"
+      continue
+    fi
+    nproj=$((nproj+1))
+
+    local row wt; row="$(_fleet_read_config "$path")" || row=""
+    wt="$(printf '%s' "$row" | cut -f3)"; [ -n "$wt" ] || wt="${path}-trees"
+
+    local b r inflight watcher wcol
+    b="$(_fleet_count_builders "$path")"
+    r="$(_fleet_count_reviews "$wt")"
+    inflight=$((b + r))
+    tot_b=$((tot_b + b)); tot_r=$((tot_r + r))
+
+    watcher="$(_fleet_watcher_state "$name")"
+    wcol="$watcher"
+    case "$watcher" in
+      alive) wcol="${c_grn}alive${c_rst}" ;;
+      down)  wcol="${c_red}down${c_rst}" ;;
+    esac
+    printf '%-16s %8s %8s %9s  %-16s\n' "$name" "$b" "$r" "$inflight" "$wcol"
+  done < "$reg"
+
+  local tot=$((tot_b + tot_r))
+  say ""
+  local miss=""; [ "$nmiss" -gt 0 ] && miss=" · ${c_yel}$nmiss unreachable${c_rst}"
+  say "Fleet: ${c_bold}$tot in-flight${c_rst} ($tot_b builder(s) + $tot_r review(s)) across $nproj project(s)$miss"
+
+  # Soft account-wide guard: the usage limit is ONE quota for the whole fleet. This threshold is an
+  # inline default for now — a real FLEET_INFLIGHT_SOFTCAP config key is a deliberate FOLLOW-UP
+  # (another builder owns capabilities.tsv this cycle, so no new key is added here).
+  local softcap="${HERD_FLEET_INFLIGHT_SOFTCAP:-6}"
+  case "$softcap" in ''|*[!0-9]*) softcap=6 ;; esac
+  if [ "$tot" -ge "$softcap" ]; then
+    warn "fleet in-flight ($tot) ≥ soft cap ($softcap) — the Claude usage limit is account-wide; consider pausing new spawns to avoid a limit-hit"
+  fi
 }
