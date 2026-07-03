@@ -22,13 +22,16 @@ INTERACTION_TEST_CMD=""             # optional; drives widgets + asserts output 
 APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
 SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
 
-# model map — role → model
+# model map — role → model. Eco-leaning STARTER defaults: Opus is now an ESCALATION tier, not a
+# default — reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
+# (review gate). An explicit MODEL_* key here ALWAYS beats the starter default (TOKEN_MODE and the
+# escalate globs compose on top of whatever you set).
 MODEL_COORDINATOR="claude-opus-4-8"
-MODEL_FEATURE="claude-opus-4-8"     # real features want the judgment
-MODEL_QUICK="claude-sonnet-4-6"     # trivial lane → cheaper model
+MODEL_FEATURE="claude-sonnet-4-6"   # eco default; escalate to Opus via MODEL_ESCALATE_GLOB
+MODEL_QUICK="claude-haiku-4-5"      # trivial lane → cheapest tier
 MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
-MODEL_REVIEW="claude-opus-4-8"      # the pre-merge gate — a STRONG model on purpose
+MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIEW_ESCALATE_GLOB
 
 # privacy / safety
 DENY_PATHS="data/"                  # never committed; the local lane is scoped here
