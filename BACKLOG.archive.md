@@ -17,3 +17,4 @@
 - ✅ **Per-PR human-verify hold — PR test plans must be visible to the gate** *(PR #61)*
 - ✅ **Healthcheck must gate / flag interaction tests for app-facing PRs** *(PR #59)*
 - ✅ **Builder liveness: kill the cold-start false STALL flap** *(PR #63)*
+- ✅ **Model step-up + dynamic model selection for builder lanes** *(PR #64)*
