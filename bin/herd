@@ -532,30 +532,104 @@ EOF
   say "  Skill: /coordinator (regenerate after an engine bump with: herd upgrade)"
 }
 
+# ── herd upgrade migrations ─────────────────────────────────────────────────────────────────────
+# When the engine contract version bumps vN→vM, breaking changes to a consumer's .herd/config are
+# INHERITED by running ordered migration scripts — one per contract step — so the consumer's custom
+# answers are transformed in place rather than clobbered. Migrations live in $HERDKIT_HOME/migrations
+# (override with HERD_MIGRATIONS_DIR — the hermetic-test seam) and are named `v<N>-to-v<N+1>.sh`.
+#
+# MIGRATION CONTRACT — each script is invoked as:  bash migrations/vN-to-vM.sh <project-root>
+#   • The runner provides, via the environment:
+#       HERD_CONFIG            — absolute path to <project-root>/.herd/config
+#       _config_file_value <cfg> <KEY>          — read a key's value ('' when unset)   [exported fn]
+#       _config_put_value  <cfg> <KEY> <VALUE>  — idempotent, comment-preserving write  [exported fn]
+#     Reuse those helpers — the SAME primitives `herd config` uses — never hand-parse the config.
+#   • MUST make TARGETED, IDEMPOTENT edits to .herd/config only (re-running must be a safe no-op):
+#     add or rewrite specific keys; NEVER delete or overwrite a consumer's custom keys/answers.
+#   • MUST NOT touch DENY_PATHS or .herd/secrets.
+#   • Exit 0 on success (including an already-applied no-op); non-zero on an UNRESOLVABLE conflict —
+#     the runner then RESTORES the pre-upgrade config and aborts the whole upgrade (rollback-safe),
+#     leaving HERD_VERSION un-bumped so a fixed re-run retries the same step.
+_migrations_dir() { printf '%s' "${HERD_MIGRATIONS_DIR:-$HERDKIT_HOME/migrations}"; }
+
+# run_migrations <project-root> <cfg> <old-version> <target-version>
+# Applies every pending migration from old→target in ascending order, exactly once. A contract step
+# with no script is skipped (not every bump needs a config change). old>=target (or a non-numeric
+# version) is a clean no-op — preserving today's no-migration upgrade behavior verbatim.
+run_migrations() {
+  local root="$1" cfg="$2" old="$3" target="$4"
+  # Only ever migrate FORWARD, and only across sane integer versions.
+  case "$old$target" in *[!0-9]*) return 0 ;; esac
+  [ "$old" -lt "$target" ] 2>/dev/null \
+    || { say "  ${c_dim}(already at v${target} — no pending migrations)${c_rst}"; return 0; }
+  local dir; dir="$(_migrations_dir)"
+  [ -d "$dir" ] || { say "  ${c_dim}(no migrations dir at $dir — nothing to migrate)${c_rst}"; return 0; }
+
+  # Discover the pending, PRESENT migration scripts for each contract step in ascending order.
+  local pending="" v mig
+  for (( v=old; v<target; v++ )); do
+    mig="$dir/v$v-to-v$((v+1)).sh"
+    [ -f "$mig" ] && pending="${pending:+$pending }$mig"
+  done
+  if [ -z "$pending" ]; then
+    say "  ${c_dim}(no pending migrations for v${old} -> v${target})${c_rst}"
+    return 0
+  fi
+
+  # Rollback-safe: snapshot the config before any migration runs, restore it if one fails.
+  local backup; backup="$(mktemp)"; cp "$cfg" "$backup"
+  # Hand every migration the config path + the shared read/write primitives (the front-door helpers).
+  export HERD_CONFIG="$cfg"
+  export -f _config_file_value _config_put_value
+
+  say "${c_bold}Applying pending migrations (v${old} -> v${target}):${c_rst}"
+  local failed="" label
+  for mig in $pending; do
+    label="$(basename "$mig" .sh)"
+    if bash "$mig" "$root"; then
+      ok "migration $label applied"
+    else
+      failed="$label"
+      break
+    fi
+  done
+
+  if [ -n "$failed" ]; then
+    cp "$backup" "$cfg"; rm -f "$backup"
+    die "migration $failed failed — restored .herd/config and aborted upgrade (HERD_VERSION un-bumped)"
+  fi
+  rm -f "$backup"
+}
+
 cmd_upgrade() {
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
-  # Preserve answers; bump the version pin in place.
+  # OLD version pinned in the project (BEFORE any bump) and the NEW target this upgrade drives to.
+  # HERD_TARGET_VERSION overrides the CLI's shipped contract version (advanced / hermetic-test seam).
   local cur; cur="$(. "$cfg"; printf '%s' "${HERD_VERSION:-0}")"
+  local target="${HERD_TARGET_VERSION:-$HERDKIT_CONTRACT_VERSION}"
   if [ "$cur" -gt "$HERDKIT_CONTRACT_VERSION" ] 2>/dev/null; then
     warn "project pinned HERD_VERSION=$cur is NEWER than this CLI's contract ($HERDKIT_CONTRACT_VERSION) — upgrade your herdkit install."
   fi
-  # Warn on config keys this contract expects but the project's config is missing.
+  # Inherit breaking contract changes: run the ordered, pending migrations vCUR→vTARGET, preserving
+  # the consumer's custom answers. A no-op when nothing is pending — today's behavior, unchanged.
+  run_migrations "$root" "$cfg" "$cur" "$target"
+  # Warn on config keys this contract expects but the project's config is missing (post-migration).
   local expected="HEALTHCHECK_CMD HEALTHCHECK_HEAVY_GLOB SMOKE_CMD SHARE_LINKS REVIEW_CHECKLIST COORDINATOR_CMD WATCHER_AUTOMERGE HERD_REPO"
   local missing="" k
   for k in $expected; do
     grep -qE "^[[:space:]]*$k=" "$cfg" || missing="${missing:+$missing }$k"
   done
   [ -n "$missing" ] && warn "config is missing keys this version uses (defaults apply; add them to .herd/config): $missing"
-  # Bump HERD_VERSION (or append if absent).
+  # Bump HERD_VERSION to the target (or append if absent).
   if grep -qE '^[[:space:]]*HERD_VERSION=' "$cfg"; then
     local tmp; tmp="$(mktemp)"
-    sed -E "s/^([[:space:]]*HERD_VERSION=).*/\1$HERDKIT_CONTRACT_VERSION/" "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+    sed -E "s/^([[:space:]]*HERD_VERSION=).*/\1$target/" "$cfg" > "$tmp" && mv "$tmp" "$cfg"
   else
-    printf 'HERD_VERSION=%s\n' "$HERDKIT_CONTRACT_VERSION" >> "$cfg"
+    printf 'HERD_VERSION=%s\n' "$target" >> "$cfg"
   fi
-  ok "HERD_VERSION → $HERDKIT_CONTRACT_VERSION"
+  ok "HERD_VERSION → $target"
   local skill; skill="$(render_skill "$root" "$cfg")"
   ok "re-rendered coordinator skill → $skill"
 }
@@ -610,6 +684,27 @@ _config_file_value() {
       if (v ~ /^".*"$/) v=substr(v,2,length(v)-2)
       print v; exit
     }' "$1"
+}
+
+# _config_put_value <cfg> <KEY> <VALUE> — idempotent, targeted in-place write of KEY="VALUE" into the
+# config: replaces the FIRST KEY= line (preserving its leading indentation) or appends when absent,
+# leaving every other line and comment untouched. This is the SAME edit primitive `herd config set`
+# uses; the upgrade migration runner exports it so migration scripts reuse it instead of re-parsing.
+_config_put_value() {
+  local cfg="$1" key="$2" val="$3"
+  local tmp; tmp="$(mktemp)"
+  local replaced=0 line indent
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE "^[[:space:]]*$key="; then
+      indent="$(printf '%s' "$line" | sed -E 's/^([[:space:]]*).*/\1/')"
+      printf '%s%s="%s"\n' "$indent" "$key" "$val" >> "$tmp"
+      replaced=1
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$cfg"
+  [ "$replaced" -eq 1 ] || printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$cfg"
 }
 
 cmd_config() {
@@ -691,19 +786,7 @@ cmd_config_set() {
     ok "$key already = \"$val\" (no change)"
     return 0
   fi
-  local tmp; tmp="$(mktemp)"
-  local replaced=0 line indent
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE "^[[:space:]]*$key="; then
-      indent="$(printf '%s' "$line" | sed -E 's/^([[:space:]]*).*/\1/')"
-      printf '%s%s="%s"\n' "$indent" "$key" "$val" >> "$tmp"
-      replaced=1
-    else
-      printf '%s\n' "$line" >> "$tmp"
-    fi
-  done < "$cfg"
-  [ "$replaced" -eq 1 ] || printf '%s="%s"\n' "$key" "$val" >> "$tmp"
-  mv "$tmp" "$cfg"
+  _config_put_value "$cfg" "$key" "$val"
   ok "set $key = \"$val\" in .herd/config"
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms.
