@@ -14,3 +14,5 @@
 - ✅ **Persistent engine journal — key-step logging for self-maintenance** *(PR #56)*
 - ✅ **Analyst seat launch config must include an explicit context-persistence tenet** *(PR #57)*
 - ✅ **`TOKEN_MODE=eco` — opt-in economy mode** *(PR #58)*
+- ✅ **Per-PR human-verify hold — PR test plans must be visible to the gate** *(PR #61)*
+- ✅ **Healthcheck must gate / flag interaction tests for app-facing PRs** *(PR #59)*
