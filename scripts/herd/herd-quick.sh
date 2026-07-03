@@ -29,8 +29,27 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
-SLUG="${1:?usage: herd-quick.sh <slug> [task...]   (slug must be kebab-case)}"; shift || true
+. "$HERE/herd-spawn-gate.sh"
+# Force-spawn override: a leading --force/-f (or HERD_FORCE_SPAWN=1) bypasses the advisory
+# review-gate saturation check below, for urgent items. Only recognized as the FIRST arg so it can
+# never be confused with task text.
+FORCE_SPAWN="${HERD_FORCE_SPAWN:-}"
+case "${1:-}" in --force|-f) FORCE_SPAWN=1; shift ;; esac
+SLUG="${1:?usage: herd-quick.sh [--force] <slug> [task...]   (slug must be kebab-case)}"; shift || true
 TASK="${*:-}"
+
+# Advisory pre-spawn review-gate check (BEFORE any worktree/tab is created). If the review pipeline
+# is saturated AND builds are already leading past REVIEW_CONCURRENCY + SPAWN_AHEAD, HOLD this spawn
+# rather than adding another PR that will just sit in REVIEW_QUEUED. --force / HERD_FORCE_SPAWN=1
+# bypasses. Advisory: a deferral is a clean no-op (exit 0), not a failure.
+if herd_spawn_gate_saturated; then
+  if [ "$FORCE_SPAWN" = "1" ]; then
+    echo "⚠️  review gate saturated but --force set — spawning '$SLUG' anyway (urgent)."
+  else
+    herd_spawn_gate_emit_defer "$SLUG"
+    exit 0
+  fi
+fi
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 MODEL="${HERD_QUICK_MODEL:-$MODEL_QUICK}"
