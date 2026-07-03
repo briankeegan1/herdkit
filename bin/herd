@@ -658,8 +658,16 @@ cmd_config_set() {
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
 
-  # A value must serialize into a single KEY="VALUE" shell line.
-  case "$val" in *\"*) die "value may not contain a double-quote character" ;; esac
+  # .herd/config is SOURCED AS SHELL (herd-config.sh and render_skill both `. "$cfg"`), but
+  # `herd config get`/`list` read it back with awk (no shell). To keep get == the shell-sourced
+  # value AND to guarantee a stored value can NEVER be expanded or executed at source time, reject
+  # any value containing a shell-active character ($ ` \ ") or a newline — otherwise e.g.
+  # `set WORKSPACE_NAME 'a$(id)'` would be echoed literally by `get` yet run `id` on every source.
+  # Such values are rare in config (e.g. a regex '$' anchor); set them by editing .herd/config.
+  case "$val" in
+    *'$'*|*'`'*|*'\'*|*'"'*)
+      die "value contains a shell-active character (\$, \`, \\, or \") — .herd/config is sourced as shell, so it would be expanded/executed at source time and would diverge from what 'herd config get' reports; edit .herd/config directly for such a value" ;;
+  esac
   case "$val" in *$'\n'*) die "value may not contain a newline" ;; esac
 
   # 1. Safety FIRST (independent of the manifest): never touch the path-scoping key or any
