@@ -96,12 +96,14 @@ else
 fi
 
 # Record control-room pane IDs so 'herd reload' can refresh them in-place rather than
-# always creating standalone tabs. Written atomically; reload re-writes on every run.
+# always creating standalone tabs. Each row is stamped with this workspace_id (4th column) so a
+# later reader can drop a hint that names a foreign workspace (issue #60). Written atomically;
+# reload re-writes on every run.
 mkdir -p "$WORKTREES_DIR"
 {
-  printf 'coordinator-agent %s %s\n' "$AGENT_PANE" "$TAB"
-  printf 'backlog %s %s\n' "$ROOT" "$TAB"
-  [ -n "${WPANE:-}" ] && printf 'watch %s %s\n' "$WPANE" "$TAB"
+  printf 'coordinator-agent %s %s %s\n' "$AGENT_PANE" "$TAB" "$WS"
+  printf 'backlog %s %s %s\n' "$ROOT" "$TAB" "$WS"
+  [ -n "${WPANE:-}" ] && printf 'watch %s %s %s\n' "$WPANE" "$TAB" "$WS"
 } > "$WORKTREES_DIR/.herd-panes"
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"
