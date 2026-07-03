@@ -147,6 +147,7 @@ scout_repo() {
   { [ -f "$root/pyproject.toml" ] || [ -f "$root/requirements.txt" ] || [ -f "$root/setup.py" ]; } && lang="python"
   [ -f "$root/go.mod" ] && lang="go"
   [ -f "$root/Cargo.toml" ] && lang="rust"
+  { [ -f "$root/pom.xml" ] || [ -f "$root/build.gradle" ] || [ -f "$root/build.gradle.kts" ]; } && lang="java"
   for f in BACKLOG.md TODO.md ROADMAP.md CHANGELOG.md; do
     [ -f "$root/$f" ] && backlog="${backlog:+$backlog }$f"
   done
@@ -154,6 +155,22 @@ scout_repo() {
   { grep -rqs -iE 'LINEAR_|linear\.app' "$root" 2>/dev/null; } && tracker_hint="${tracker_hint:+$tracker_hint,}linear?"
   { grep -rqs -iE 'JIRA_|atlassian' "$root" 2>/dev/null; } && tracker_hint="${tracker_hint:+$tracker_hint,}jira?"
   printf 'lang=%s\nbacklog=%s\ntracker=%s\n' "$lang" "$backlog" "$tracker_hint"
+}
+
+# ── stack-aware init: map scout's detected lang → the healthcheck template to seed ──────────────
+# Threads scout's `lang` through to the per-project healthcheck so a non-Python/Node consumer gets a
+# runnable heavy-profile gate in their own toolchain instead of the reference stack's Python example (the
+# single highest-leverage external-consumer fix — see docs/external-consumer-audit.md, leaks D & B).
+# python and unknown BOTH map to the existing healthcheck.project.sh so today's behavior is preserved
+# exactly. Prints the template basename under $TEMPLATES_DIR.
+_healthcheck_template_for() {
+  case "$1" in
+    node)  printf 'healthcheck.node.sh' ;;
+    go)    printf 'healthcheck.go.sh' ;;
+    rust)  printf 'healthcheck.rust.sh' ;;
+    java)  printf 'healthcheck.java.sh' ;;
+    *)     printf 'healthcheck.project.sh' ;;   # python / unknown — unchanged default
+  esac
 }
 
 # ── GitHub detection: repo-aware config defaults from branch protection (init-only) ─────────────
@@ -560,6 +577,21 @@ EOF
 ## Recently shipped
 EOF
     ok "seeded $backlog_file"
+  fi
+
+  # 5b. Seed the per-project healthcheck from the template matching scout's detected lang, so a
+  # Go/Rust/Java (or Node) consumer gets a heavy-profile gate in their OWN toolchain rather than the
+  # reference stack's Python example. Only when HEALTHCHECK_CMD still points at the default path and no script
+  # exists yet — NEVER clobbers a consumer's own healthcheck. python/unknown map to the current
+  # healthcheck.project.sh, so Python consumers are unchanged. (external-consumer-audit.md, leaks D,B.)
+  if [ "$healthcheck" = ".herd/healthcheck.project.sh" ]; then
+    local hc_target="$project_root/.herd/healthcheck.project.sh"
+    local hc_tmpl; hc_tmpl="$(_healthcheck_template_for "$lang")"
+    if [ ! -e "$hc_target" ] && [ -f "$TEMPLATES_DIR/$hc_tmpl" ]; then
+      cp "$TEMPLATES_DIR/$hc_tmpl" "$hc_target"
+      chmod +x "$hc_target" 2>/dev/null || true
+      ok "seeded .herd/healthcheck.project.sh from $hc_tmpl (lang=${lang:-unknown})"
+    fi
   fi
 
   # 6. Render the coordinator skill.
