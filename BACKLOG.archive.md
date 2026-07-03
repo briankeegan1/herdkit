@@ -11,3 +11,4 @@
 - ✅ **Stall detector: check worktree mtimes before flagging** *(PR #52)*
 - ✅ **Token efficiency free wins** *(PR #54)*
 - ✅ **Init-time GitHub detection** *(PR #55)*
+- ✅ **Persistent engine journal — key-step logging for self-maintenance** *(PR #56)*
