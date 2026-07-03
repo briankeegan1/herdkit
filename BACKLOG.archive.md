@@ -42,3 +42,4 @@
 - ✅ **Dispatch vs. dependency intent** *(PR #90)* — `.herd/deps` schema + `herd depend/deps list/rm`; fire-and-forget `--to B` vs tracked `--dep` with `blocked-on` + reclassify/remove via `herd deps rm|demote`
 - ✅ **Evidence-based model escalation — part (a): eco-leaning STARTER defaults for new installs** *(PR #91)*
 - ✅ **Sandbox consumer — a dummy repo + herdr workspace for live workflow simulation, especially pane/tab behavior** *(PR #92)*
+- ✅ **Fleet coordinator P0 — deterministic multi-project fan-out (herd fleet register/list/status/upgrade/reload + project registry)** *(PR #94 · commit be353ee)*
