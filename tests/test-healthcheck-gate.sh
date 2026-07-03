@@ -15,6 +15,14 @@
 #       wording, stub NOT invoked; freeing the slot lets it run
 #   (7) HEALTH_CONCURRENCY override: with one live holder, =2 runs (slot free), =1 queues
 #       and the retry stays SOLO — the stub observes exactly one live healthcheck marker per run
+#   (8) SHA-CACHE (PR #65 every-tick re-run): with a head sha passed, the FULL suite runs exactly
+#       ONCE for a given sha and later ticks REUSE the cached verdict (no re-run):
+#         (a) unchanged sha → run once, then reused (CLEAN); stub invoked once total
+#         (b) a NEW commit sha invalidates the cache and re-runs; stale result marker discarded
+#         (c) retry-before-red + solo mutex for the FIRST run of a sha is unchanged (fail-then-pass
+#             still runs twice and caches FLAKY; the cached FLAKY is then reused without re-running)
+#         (d) a cached CODEERROR keeps showing the red row on later ticks WITHOUT re-running
+#         (e) an empty sha (pre-cache callers) disables the cache — every call runs the suite
 #
 # Sources agent-watch.sh in lib mode with HERD_HEALTHCHECK_BIN pointed at a scripted stub. Stubs
 # gh/git/herdr (NETWORK-FREE); temp WORKTREES_DIR. Run:  bash tests/test-healthcheck-gate.sh
@@ -81,7 +89,7 @@ render() { :; }
 
 # Helper: reset per-scenario state (ledger, invocation log, markers, DISPLAY, sequence file).
 reset_scenario() {
-  rm -f "$HEALTH_STATE" "$STUB_HC_LOG" "$T/trees"/.health-inflight-* 2>/dev/null || true
+  rm -f "$HEALTH_STATE" "$STUB_HC_LOG" "$T/trees"/.health-inflight-* "$T/trees"/.health-result-* 2>/dev/null || true
   : > "$STUB_HC_LOG"
   DISPLAY=(); _HC_RESULT=""
 }
@@ -223,6 +231,105 @@ _healthcheck_gate 11 slug-b "$T/wt" 1
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "two sequential PRs should invoke the healthcheck twice total"
 [ ! -e "$(_health_inflight_file 10)" ] && [ ! -e "$(_health_inflight_file 11)" ] \
   || fail "both PRs must release their markers after running"
+ok
+
+# ── (8) SHA-CACHE: an unchanged commit must NOT re-run the suite (PR #65 every-tick re-run) ───────
+# The helpers exist and are sha-keyed like the review gate's.
+for fn in _health_result_file record_health_result _discard_stale_health; do
+  type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
+done
+[ "$(_health_result_file 42 abc)" = "$T/trees/.health-result-42-abc" ] \
+  || fail "_health_result_file should key by pr+sha (got '$(_health_result_file 42 abc)')"
+ok
+
+# (8a) unchanged sha → full suite runs exactly ONCE; every later tick REUSES the cached CLEAN.
+reset_scenario
+HEALTH_CONCURRENCY=1
+printf '0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8a: first run of a fresh sha should yield CLEAN (got '$_HC_RESULT')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] || fail "8a: first run should invoke the healthcheck exactly once"
+[ -f "$(_health_result_file 1000 deadbeef01)" ] || fail "8a: a terminal CLEAN must be cached for this sha"
+# Two more ticks on the SAME sha — cache hits, suite NEVER re-runs, verdict still CLEAN.
+_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8a: cached sha should REUSE CLEAN (got '$_HC_RESULT')"
+_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8a: cached sha should REUSE CLEAN on every later tick"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] \
+  || fail "8a: an UNCHANGED sha must NOT re-run the suite ($(wc -l < "$STUB_HC_LOG") invocations, expected 1)"
+# Cache reuse must not append phantom attempts to the ledger — still exactly the one real run.
+[ "$(ledger_outcomes 1000)" = "clean" ] \
+  || fail "8a: cache hits must not append ledger attempts (got '$(ledger_outcomes 1000)')"
+ok
+
+# (8b) a NEW commit sha invalidates the cache → full re-run, and the stale marker is discarded.
+printf '0|✅ clean — new commit\n' > "$STUB_HC_SEQ"
+_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "feed123402"
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8b: a new sha should re-run and yield CLEAN (got '$_HC_RESULT')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
+  || fail "8b: a NEW commit sha must invalidate the cache and re-run ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
+[ -f "$(_health_result_file 1000 feed123402)" ] || fail "8b: the new sha's terminal verdict must be cached"
+[ ! -f "$(_health_result_file 1000 deadbeef01)" ] || fail "8b: the stale sha's result marker must be discarded"
+ok
+
+# (8c) retry-before-red + solo mutex is UNCHANGED for the FIRST run of a sha; the FLAKY verdict is
+# then cached and reused without re-running.
+reset_scenario
+HEALTH_CONCURRENCY=1
+export STUB_HC_MARKERCOUNT_LOG="$T/hc-markercount.log"; : > "$STUB_HC_MARKERCOUNT_LOG"
+printf '1|❌ code error — transient\n0|✅ clean — passed solo\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 1001 slug-cflaky "$T/wt" 0 "cafe567803"
+[ "$_HC_RESULT" = "FLAKY" ] || fail "8c: fail-then-pass on a fresh sha should still yield FLAKY (got '$_HC_RESULT')"
+[ "$(ledger_outcomes 1001)" = "code-error flaky-pass" ] \
+  || fail "8c: retry-before-red ledger unchanged (got '$(ledger_outcomes 1001)')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8c: first run of a sha still runs twice (initial + solo retry)"
+# The solo retry stayed solo — the stub saw exactly one live marker on both invocations.
+[ "$(wc -l < "$STUB_HC_MARKERCOUNT_LOG")" -eq 2 ] || fail "8c: stub should have observed two invocations"
+if grep -qvx '1' "$STUB_HC_MARKERCOUNT_LOG"; then
+  fail "8c: healthcheck ran while >1 marker was live — mutex did not keep the first run solo"
+fi
+unset STUB_HC_MARKERCOUNT_LOG
+[ -f "$(_health_result_file 1001 cafe567803)" ] || fail "8c: the FLAKY verdict must be cached for this sha"
+# Next tick, same sha → reuse FLAKY, no re-run, shows the flaky/infra row (never red).
+_HC_RESULT=""; DISPLAY=()
+_healthcheck_gate 1001 slug-cflaky "$T/wt" 0 "cafe567803"
+[ "$_HC_RESULT" = "FLAKY" ] || fail "8c: cached sha should REUSE FLAKY (got '$_HC_RESULT')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8c: reusing a cached FLAKY must NOT re-run the suite"
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q "flaky · infra (passed on retry)" \
+  || fail "8c: reused FLAKY should show the flaky/infra row (got: ${DISPLAY[0]:-})"
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "8c: reused FLAKY must never paint red"
+ok
+
+# (8d) a cached CODEERROR keeps surfacing the red row on later ticks WITHOUT re-running.
+reset_scenario
+HEALTH_CONCURRENCY=1
+printf '1|❌ code error — real bug on line 5\n1|❌ code error — real bug on line 5\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 1002 slug-cred "$T/wt" 0 "face9abc04"
+[ "$_HC_RESULT" = "CODEERROR" ] || fail "8d: fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8d: first run of a red sha runs twice (initial + solo retry)"
+[ -f "$(_health_result_file 1002 face9abc04)" ] || fail "8d: a terminal CODEERROR must be cached"
+# Later ticks on the same sha → reuse CODEERROR, red row stays, suite never re-runs.
+_HC_RESULT=""; DISPLAY=()
+_healthcheck_gate 1002 slug-cred "$T/wt" 0 "face9abc04"
+[ "$_HC_RESULT" = "CODEERROR" ] || fail "8d: cached sha should REUSE CODEERROR (got '$_HC_RESULT')"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
+  || fail "8d: a cached CODEERROR must keep the red row WITHOUT re-running ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
+d="${DISPLAY[0]:-}"
+printf '%s\n' "$d" | grep -q "needs you" || fail "8d: reused CODEERROR must still paint red 'needs you' (got: $d)"
+printf '%s\n' "$d" | grep -q "real bug on line 5" || fail "8d: reused red row should carry the cached oneline reason (got: $d)"
+ok
+
+# (8e) an empty sha disables the cache — the pre-cache behavior (every call runs the suite).
+reset_scenario
+HEALTH_CONCURRENCY=1
+printf '0|✅ clean — no sha\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 1003 slug-nosha "$T/wt" 0 ""
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8e: empty-sha run should yield CLEAN"
+_HC_RESULT=""; _healthcheck_gate 1003 slug-nosha "$T/wt" 0 ""
+[ "$_HC_RESULT" = "CLEAN" ] || fail "8e: empty-sha second run should yield CLEAN"
+[ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
+  || fail "8e: an empty sha must NOT cache — both calls run the suite ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
+[ -z "$(ls "$T/trees"/.health-result-* 2>/dev/null)" ] || fail "8e: an empty sha must not write any result marker"
 ok
 
 echo "ALL PASS ($pass checks)"
