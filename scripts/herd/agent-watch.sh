@@ -134,6 +134,13 @@ HEALTH_STATE="$TREES/.agent-watch-healthchecks"
 # / _handle_limit_blocked). The record is REMOVED (and its hook sentinel cleared) the instant a
 # resume succeeds; a failed-after-retry attempt flips to `failed` and escalates without retrying.
 LIMIT_STATE="$TREES/.agent-watch-limit"
+# Reconcile ledger, PARALLEL to $STATE and the review/health ledgers: one line per POST-MERGE backlog
+# auto-reconcile ENQUEUE ("<epoch> <pr#> <headSha> <slug>"). Keyed by PR *and* head sha (mirroring
+# $REVIEW_STATE / $HEALTH_STATE) so the reconcile scribe request fires EXACTLY ONCE per merged PR: a
+# watcher tick that re-enters the merge-success path for an already-reconciled PR (a retried merge, an
+# autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
+# of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
+RECONCILE_STATE="$TREES/.agent-watch-reconciled"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -617,6 +624,35 @@ spawn_resolver() {
   bash "$HERE/herd-resolve.sh" "$rs" >/dev/null 2>&1 || true
 }
 
+# reconcile_enqueued <pr#> <headSha> — true if a POST-MERGE reconcile was already enqueued for this
+# exact pr+sha. The idempotency guard for reconcile_backlog; mirrors refix_attempted / review_verdict.
+reconcile_enqueued() {
+  [ -s "$RECONCILE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{f=1} END{exit !f}' "$RECONCILE_STATE" 2>/dev/null
+}
+
+# record_reconcile <pr#> <headSha> <slug> — append one reconcile-enqueue record.
+record_reconcile() {
+  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RECONCILE_STATE"
+}
+
+# reconcile_backlog <pr#> <slug> <headSha> — the POST-MERGE auto-reconcile HOOK. Fires on EVERY
+# successful merge (the normal auto-merge path, an autofix bounce that finally lands, and direct
+# hand-off merges — all converge here in do_merge), enqueuing ONE scribe reconcile request keyed by
+# the merged PR number + its branch slug. The scribe matches the 🔜/🚧 backlog item by 'worktree
+# <slug>' OR the PR title (so items the coordinator never slug-tagged still reconcile — the drift the
+# old slug-only reap missed) and marks it ✅ shipped; if none matches it no-ops. IDEMPOTENT: record
+# FIRST against $RECONCILE_STATE (keyed by pr+sha, mirroring the review/health ledgers) so a re-run
+# tick for the same merged PR reads the ledger and never re-enqueues, even if scribe.sh later dies.
+# Best-effort — a failed enqueue never blocks the merge (the advisory sweep is the backstop).
+reconcile_backlog() {
+  local rb_pr="$1" rb_slug="$2" rb_sha="${3:-}"
+  reconcile_enqueued "$rb_pr" "$rb_sha" && return 0
+  record_reconcile "$rb_pr" "$rb_sha" "$rb_slug"
+  bash "$HERE/scribe.sh" "Reconcile: PR #${rb_pr} (worktree ${rb_slug}) merged — find the 🔜/🚧 backlog item matching worktree ${rb_slug} or the PR title and mark it ✅ shipped (PR #${rb_pr}); if none matches, no-op." >/dev/null 2>&1 || true
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -631,8 +667,10 @@ do_merge() {
   #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
   #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.
   type cost_emit_merge >/dev/null 2>&1 && cost_emit_merge "$dp" "$ds" "$dd"
-  # 1) enqueue the scribe to reap the backlog item for this slug (slug-match + reap-not-stamp).
-  bash "$HERE/scribe.sh" "Reap the backlog item for worktree slug '${ds}' (PR #${dp}): (1) grep ${BACKLOG_FILE} for the line containing '(worktree ${ds})' to locate the exact item; (2) if found, REMOVE that item from its active/thematic section entirely; (3) prepend '- ✅ **<title>** *(PR #${dp})*' (substituting the actual item title) immediately after the '## Recently shipped' heading, then drop any trailing entry beyond the 10th to keep the window capped at ~10; (4) if NO line matches that slug, make NO change and report that there is no backlog item for slug '${ds}'." >/dev/null 2>&1 || true
+  # 1) POST-MERGE auto-reconcile hook: enqueue exactly ONE idempotent scribe reconcile request keyed
+  #    by PR# + slug (matches by 'worktree <slug>' OR PR title, so autofix / hand-off items that were
+  #    never slug-tagged still reconcile — the drift the old slug-only reap missed).
+  reconcile_backlog "$dp" "$ds" "$dsha"
   # 2) fast-forward the MAIN checkout so coordinator + backlog viewer reflect it. Never force.
   git -C "$MAIN" pull --ff-only >/dev/null 2>&1 || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
