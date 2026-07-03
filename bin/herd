@@ -12,6 +12,9 @@
 #                   project + the lane involved + the version pin. Dedups before filing.
 #   herd link       manage the cross-repo link registry (.herd/links): list shows all configured
 #                   peer repos. Use a link with: herd report --to <name> "<symptom>".
+#   herd depend     record a WATCHED blocked-on dependency (<link>#<id>) in .herd/deps — dep-watcher
+#                   polls it until the upstream item closes. `herd report --to --dep` files AND deps.
+#   herd deps       list / rm / demote recorded dependencies — a dep is editable data, never stuck.
 #   herd render     (internal) re-render only the coordinator skill from .herd/config.
 #
 # Engine contract version this CLI ships.
@@ -915,6 +918,228 @@ cmd_link() {
   esac
 }
 
+# ── Cross-repo dependency intent (.herd/deps) ────────────────────────────────────────────────────
+# `herd report --to` is fire-and-forget dispatch. `herd depend` records a WATCHED dependency:
+# a "blocked-on: <link>#<id>" row in .herd/deps that dep-watcher.sh polls until the upstream item
+# closes. A dep is EDITABLE DATA — `herd deps list/rm/demote` inspect, drop, or reclassify it into a
+# non-blocking "watch:" row — never stuck. The row format is exactly the one dep-watcher.sh already
+# reads ("blocked-on: <ref>", ref = up to first whitespace); we only APPEND backward-compatible
+# " since=<epoch>" trailing fields the watcher ignores. "watch:" rows (demoted) are invisible to the
+# watcher's blocked-on parser by design, so a demote instantly un-blocks the lane.
+
+_deps_epoch() { date +%s 2>/dev/null || python3 -c 'import time; print(int(time.time()))'; }
+
+# _deps_file_path — the project's .herd/deps (DEPS_FILE override mirrors dep-watcher.sh, for tests).
+_deps_file_path() { printf '%s' "${DEPS_FILE:-$PROJECT_ROOT/.herd/deps}"; }
+
+# _deps_load_ctx — load .herd/config + the links resolver, exactly as cmd_link_list does, so
+# PROJECT_ROOT / _herd_resolve_link are available. Runs in the current shell (vars propagate).
+_deps_load_ctx() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] && export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-links.sh"
+}
+
+# _deps_validate_ref <ref> — a ref is <link-name>#<id>: a '#', non-empty on both sides, no whitespace.
+_deps_validate_ref() {
+  local ref="$1"
+  case "$ref" in *'#'*) ;; *) return 1 ;; esac
+  case "$ref" in *[[:space:]]*) return 1 ;; esac
+  [ -n "${ref%%#*}" ] && [ -n "${ref#*#}" ]
+}
+
+# _deps_ensure_file <file> — create .herd/deps with a self-documenting header if absent.
+_deps_ensure_file() {
+  local f="$1"
+  [ -f "$f" ] && return 0
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  {
+    printf '# .herd/deps — recorded cross-repo dependencies (herd deps). Commit this; zero-secret.\n'
+    printf '# Format: blocked-on: <link>#<id>  since=<epoch>   — watched by dep-watcher.sh\n'
+    printf '#         watch: <link>#<id>  since=<epoch>        — demoted, non-blocking (ignored by the watcher)\n'
+  } > "$f"
+}
+
+# _deps_kind_of <file> <ref> → prints "blocked-on" | "watch" | "" (empty = not present).
+_deps_kind_of() {
+  local f="$1" ref="$2" line r
+  [ -f "$f" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      'blocked-on: '*) r="${line#blocked-on: }" ;;
+      'watch: '*)      r="${line#watch: }" ;;
+      *) continue ;;
+    esac
+    r="${r%%[[:space:]]*}"
+    [ "$r" = "$ref" ] || continue
+    case "$line" in 'blocked-on: '*) printf 'blocked-on' ;; *) printf 'watch' ;; esac
+    return 0
+  done < "$f"
+}
+
+# _deps_set_kind <file> <ref> <new-kind> — rewrite the row's prefix, PRESERVING trailing fields
+# (since=…). Atomic via temp file + mv, the same shape dep-watcher.sh uses.
+_deps_set_kind() {
+  local f="$1" ref="$2" newkind="$3" tmp line rest r
+  [ -f "$f" ] || return 1
+  tmp="${f}.$$"
+  while IFS= read -r line; do
+    case "$line" in
+      'blocked-on: '*) rest="${line#blocked-on: }" ;;
+      'watch: '*)      rest="${line#watch: }" ;;
+      *) printf '%s\n' "$line"; continue ;;
+    esac
+    r="${rest%%[[:space:]]*}"
+    if [ "$r" = "$ref" ]; then printf '%s: %s\n' "$newkind" "$rest"; else printf '%s\n' "$line"; fi
+  done < "$f" > "$tmp"
+  mv "$tmp" "$f"
+}
+
+# _deps_remove <file> <ref> — drop the row (blocked-on OR watch) for <ref>. Returns 0 if one was
+# removed, 1 if the ref was absent. Atomic temp-file + mv.
+_deps_remove() {
+  local f="$1" ref="$2" tmp line r removed=1
+  [ -f "$f" ] || return 1
+  tmp="${f}.$$"
+  while IFS= read -r line; do
+    case "$line" in
+      'blocked-on: '*) r="${line#blocked-on: }" ;;
+      'watch: '*)      r="${line#watch: }" ;;
+      *) printf '%s\n' "$line"; continue ;;
+    esac
+    r="${r%%[[:space:]]*}"
+    if [ "$r" = "$ref" ]; then removed=0; continue; fi
+    printf '%s\n' "$line"
+  done < "$f" > "$tmp"
+  mv "$tmp" "$f"
+  return "$removed"
+}
+
+# _deps_state <ref> — best-effort current state of the upstream item (open|in-progress|closed|
+# unknown). Resolves the link + report backend in a SUBSHELL so HERD_REPO is not clobbered; any
+# failure (no link, no backend, no gh) degrades to "unknown". Never fatal.
+_deps_state() {
+  local ref="$1"
+  (
+    link="${ref%%#*}"
+    _herd_resolve_link "$link" 2>/dev/null || { printf 'unknown'; exit 0; }
+    bf="$SCRIPTS_DIR/backends/${HERD_REPORT_BACKEND:-github}.sh"
+    [ -f "$bf" ] || { printf 'unknown'; exit 0; }
+    # github (the default) shells out to gh; skip when it is absent so we never hit its die path.
+    case "${HERD_REPORT_BACKEND:-github}" in
+      github) command -v gh >/dev/null 2>&1 || { printf 'unknown'; exit 0; } ;;
+    esac
+    ITEM_STATE=""
+    # shellcheck source=/dev/null
+    . "$bf"
+    command -v _backend_item_state >/dev/null 2>&1 || { printf 'unknown'; exit 0; }
+    _backend_item_state "$ref" 2>/dev/null || true
+    printf '%s' "${ITEM_STATE:-unknown}"
+  )
+}
+
+# _deps_record <file> <ref> — append a "blocked-on:" row (idempotent; promotes a demoted "watch:").
+# Prints a one-line human confirmation. Caller has validated <ref> and resolved its link.
+_deps_record() {
+  local f="$1" ref="$2" kind
+  _deps_ensure_file "$f"
+  kind="$(_deps_kind_of "$f" "$ref")"
+  case "$kind" in
+    blocked-on) say "already tracking blocked-on: $ref (herd deps list)"; return 0 ;;
+    watch)      _deps_set_kind "$f" "$ref" "blocked-on"
+                ok "promoted $ref back to a blocking dependency" ;;
+    *)          printf 'blocked-on: %s  since=%s\n' "$ref" "$(_deps_epoch)" >> "$f"
+                ok "recorded blocked-on: $ref — dep-watcher.sh will poll it until the item closes" ;;
+  esac
+}
+
+cmd_depend() {
+  local ref="${1:-}"
+  [ -n "$ref" ] || die "usage: herd depend <link>#<id>   (e.g. herd depend provider-lib#42)"
+  _deps_validate_ref "$ref" \
+    || die "invalid dependency ref '$ref' — expected <link>#<id> (e.g. provider-lib#42)"
+  _deps_load_ctx
+  local link="${ref%%#*}"
+  _herd_resolve_link "$link" \
+    || die "no link named '$link' in .herd/links — run 'herd link list' to see configured peers"
+  _deps_record "$(_deps_file_path)" "$ref"
+}
+
+cmd_deps_list() {
+  _deps_load_ctx
+  local f; f="$(_deps_file_path)"
+  if [ ! -f "$f" ]; then say "no dependencies recorded (.herd/deps absent)"; return 0; fi
+  local any=0 line kind rest ref since state age agestr now
+  now="$(_deps_epoch)"
+  say "Dependencies ($f):"
+  while IFS= read -r line; do
+    case "$line" in
+      'blocked-on: '*) kind="blocked-on"; rest="${line#blocked-on: }" ;;
+      'watch: '*)      kind="watch";      rest="${line#watch: }" ;;
+      *) continue ;;
+    esac
+    ref="${rest%%[[:space:]]*}"
+    [ -n "$ref" ] || continue
+    since=""
+    case "$rest" in *since=*) since="${rest#*since=}"; since="${since%%[[:space:]]*}" ;; esac
+    state="$(_deps_state "$ref" 2>/dev/null || printf 'unknown')"
+    agestr=""
+    case "$since" in ''|*[!0-9]*) ;; *) age=$(( now - since )); agestr="  age=${age}s" ;; esac
+    printf '  %-11s  %-26s  state=%-8s%s\n' "$kind" "$ref" "${state:-unknown}" "$agestr"
+    any=$((any + 1))
+  done < "$f"
+  [ "$any" -eq 0 ] && say "(no dependencies recorded)"
+  return 0
+}
+
+cmd_deps_rm() {
+  local ref="${1:-}"
+  [ -n "$ref" ] || die "usage: herd deps rm <link>#<id>"
+  _deps_load_ctx
+  local f; f="$(_deps_file_path)"
+  [ -f "$f" ] || die "no .herd/deps file — nothing to remove"
+  local kind; kind="$(_deps_kind_of "$f" "$ref")"
+  [ -n "$kind" ] || die "no dependency '$ref' recorded — run 'herd deps list'"
+  # A dep is editable data: always remove, but warn if a blocking one is still open upstream.
+  if [ "$kind" = "blocked-on" ]; then
+    local state; state="$(_deps_state "$ref" 2>/dev/null || printf 'unknown')"
+    case "$state" in
+      open|in-progress) warn "removing $ref while it is still $state upstream — the blocker may not be resolved" ;;
+    esac
+  fi
+  _deps_remove "$f" "$ref" && ok "removed $kind: $ref" || die "failed to remove $ref"
+}
+
+cmd_deps_demote() {
+  local ref="${1:-}"
+  [ -n "$ref" ] || die "usage: herd deps demote <link>#<id>"
+  _deps_load_ctx
+  local f; f="$(_deps_file_path)"
+  [ -f "$f" ] || die "no .herd/deps file — nothing to demote"
+  local kind; kind="$(_deps_kind_of "$f" "$ref")"
+  case "$kind" in
+    blocked-on) _deps_set_kind "$f" "$ref" "watch"
+                ok "demoted $ref to a non-blocking watch — dep-watcher.sh no longer blocks on it" ;;
+    watch)      say "$ref is already a non-blocking watch — nothing to do" ;;
+    *)          die "no blocking dependency '$ref' recorded — run 'herd deps list'" ;;
+  esac
+}
+
+cmd_deps() {
+  local sub="${1:-list}"; shift 2>/dev/null || true
+  case "$sub" in
+    list)         cmd_deps_list "$@" ;;
+    rm)           cmd_deps_rm "$@" ;;
+    demote)       cmd_deps_demote "$@" ;;
+    -h|--help)    say "usage: herd deps list | rm <link>#<id> | demote <link>#<id>" ;;
+    *)            die "unknown 'herd deps' subcommand '$sub' — usage: herd deps list | rm <id> | demote <id>" ;;
+  esac
+}
+
 # ── herd report dedup helpers (pure shell — no LLM dependency) ──────────────────────────────────
 # A semantic/LLM-judged dedup pass could be a later enhancement; these stay heuristic + offline.
 _report_norm() {
@@ -952,7 +1177,7 @@ EOF
 }
 
 cmd_report() {
-  local to_name=""
+  local to_name="" dep_flag=""
   while true; do
     case "${1:-}" in
       --to)
@@ -960,11 +1185,16 @@ cmd_report() {
         [ -n "$to_name" ] || die "--to requires a link name"
         shift 2 ;;
       --to=*) to_name="${1#--to=}"; shift ;;
+      # --dep: after filing, ALSO record a blocked-on dep on the filed item (default stays
+      # fire-and-forget). A dep must name its target peer, so --dep requires --to.
+      --dep) dep_flag=1; shift ;;
       *) break ;;
     esac
   done
   local symptom="${1:-}"
-  [ -n "$symptom" ] || die "usage: herd report [--to <link>] \"<symptom + which lane>\""
+  [ -n "$symptom" ] || die "usage: herd report [--to <link>] [--dep] \"<symptom + which lane>\""
+  [ -z "$dep_flag" ] || [ -n "$to_name" ] \
+    || die "herd report --dep requires --to <link> (a dependency must name the peer it blocks on)"
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   # Load the project's answers through the shared loader (HERD_REPO, WORKSPACE_NAME, HERD_VERSION,
@@ -1046,10 +1276,39 @@ cmd_report() {
 
   say "Filing engine bug on ${c_bold}$HERD_REPO${c_rst} via the ${report_backend} backend…"
   _BACKEND_RESULT=""
-  _backend_add_item "report" "$report_text"
+  # Default path is byte-for-byte unchanged: _backend_add_item prints its result to stdout. For
+  # --dep we must ALSO read that output (the created item's URL) to recover the new item id, so we
+  # capture it to a temp file (NOT a $(subshell) — _BACKEND_RESULT is set by side effect and must
+  # propagate to this shell) and echo it back so the user still sees it.
+  local add_out=""
+  if [ -n "$dep_flag" ]; then
+    local add_file; add_file="$(mktemp)"
+    _backend_add_item "report" "$report_text" > "$add_file"
+    add_out="$(cat "$add_file")"; rm -f "$add_file"
+    [ -n "$add_out" ] && printf '%s\n' "$add_out"
+  else
+    _backend_add_item "report" "$report_text"
+  fi
   case "${_BACKEND_RESULT:-}" in
-    DONE) ok "filed." ;;
-    *)    warn "backend reported no change (${_BACKEND_RESULT:-?}) — nothing filed" ;;
+    DONE)
+      ok "filed."
+      if [ -n "$dep_flag" ]; then
+        # Recover the item id from the backend's result (github prints the issue URL; the id is the
+        # trailing path segment of its last line). Record blocked-on: <link>#<id> in .herd/deps.
+        local last num
+        last="${add_out##*$'\n'}"; num="${last##*/}"
+        case "$num" in
+          ''|*[!0-9]*)
+            warn "--dep: could not parse an item id from the backend result — dependency NOT recorded; run 'herd depend $to_name#<id>' once you have the id" ;;
+          *)
+            _deps_record "$(_deps_file_path)" "$to_name#$num" ;;
+        esac
+      fi
+      ;;
+    *)
+      warn "backend reported no change (${_BACKEND_RESULT:-?}) — nothing filed"
+      [ -n "$dep_flag" ] && warn "--dep: nothing was filed, so no dependency was recorded"
+      ;;
   esac
 }
 
@@ -2528,10 +2787,20 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       running totals by component + model; --pr N drills into one PR.
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
   herd backlog                        list open work items via the active backend
-  herd report [--to <link>] "<sym>"   file a report on HERD_REPO (or a peer from .herd/links
-                                      via --to) using HERD_REPORT_BACKEND (default: github);
-                                      deduplicates first (HERD_REPORT_FORCE=1 to override)
+  herd report [--to <link>] [--dep]   file a report on HERD_REPO (or a peer from .herd/links
+              "<sym>"                 via --to) using HERD_REPORT_BACKEND (default: github);
+                                      deduplicates first (HERD_REPORT_FORCE=1 to override).
+                                      --dep also records the filed item as a blocked-on
+                                      dependency in .herd/deps (requires --to); without it
+                                      report stays fire-and-forget
   herd link list                      list peer repos registered in .herd/links
+  herd depend <link>#<id>             record a blocked-on dependency in .herd/deps (watched by
+                                      dep-watcher.sh until the upstream item closes)
+  herd deps <list|rm|demote>          manage recorded dependencies:
+                                        list                print each dep + its current state
+                                        rm <link>#<id>      drop a dep (editable data, never stuck)
+                                        demote <link>#<id>  reclassify a blocker into a non-
+                                                            blocking watch (un-blocks the lane)
   herd help                           this help
 
 Engine scripts: $SCRIPTS_DIR
@@ -2554,6 +2823,8 @@ case "${1:-help}" in
   backlog) shift; cmd_backlog "$@" ;;
   report)  shift; cmd_report "$@" ;;
   link)    shift; cmd_link "$@" ;;
+  depend)  shift; cmd_depend "$@" ;;
+  deps)    shift; cmd_deps "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 2 ;;
 esac
