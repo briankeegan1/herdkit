@@ -1045,6 +1045,41 @@ _health_acquire() { printf '%s\n' "$$" > "$(_health_inflight_file "$1")"; }
 # _health_release <pr#> — drop the pr's marker, freeing its slot.
 _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 
+# ── Sha-keyed healthcheck result cache (mirrors the review gate's .review-result-<pr>-<sha>) ──────
+# WHY: a held/awaiting-verify/awaiting-approval PR sits on the candidate list every ~90s tick with an
+# UNCHANGED head sha, yet the gate re-ran the FULL suite each tick (PR #65, 2026-07-02: ~8 full runs
+# in 12 min for one commit — one tick even MANUFACTURED its own transient code-error→flaky-pass). The
+# sha did not change, so the verdict cannot change. Cache the TERMINAL verdict keyed by pr+headSha,
+# exactly as the review gate caches its PASS/BLOCK, and REUSE it while the sha is unchanged.
+#   .health-result-<pr>-<sha>  — one line "<verdict>\t<detail>", verdict ∈ CLEAN | FLAKY | CODEERROR,
+#                                written when _healthcheck_gate reaches a terminal outcome for this
+#                                exact commit sha. A cached CLEAN/FLAKY proceeds as passing; a cached
+#                                CODEERROR keeps surfacing the red row — both WITHOUT re-running.
+# A new commit (new sha) invalidates the cache and forces a fresh full run (see _discard_stale_health,
+# mirroring _discard_stale_reviews). A non-terminal/in-flight state is NEVER cached.
+_health_result_file() { printf '%s' "$TREES/.health-result-$1-$2"; }
+
+# record_health_result <pr#> <sha> <verdict> [detail] — cache a TERMINAL health verdict for this exact
+# commit sha. No-op when sha is empty (cache disabled; e.g. head sha not yet known).
+record_health_result() {
+  [ -n "$2" ] || return 0
+  printf '%s\t%s\n' "$3" "${4:-}" > "$(_health_result_file "$1" "$2")"
+}
+
+# _discard_stale_health <pr#> <currentSha> — a cached result for this PR keyed to ANY OTHER sha is
+# stale (the PR has a newer head; that verdict must never be reused). Discard it so the new commit
+# re-runs the full suite. Mirrors _discard_stale_reviews (result markers only — the health mutex
+# marker is keyed by pr alone and released synchronously within the gate, so it is never stale).
+_discard_stale_health() {
+  local pr="$1" sha="$2" f base
+  for f in "$TREES/.health-result-$pr-"*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [ "${base##*-}" = "$sha" ] && continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
 # record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
 record_healthcheck() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
@@ -1056,18 +1091,51 @@ record_healthcheck() {
   fi
 }
 
-# _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> — the serialized, retry-before-red
-# healthcheck. Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns 0 always:
+# _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> [headSha] — the serialized,
+# retry-before-red healthcheck. Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns
+# 0 always:
 #   QUEUED    — no slot free (another suite holds the mutex); re-evaluate next tick, do NOT merge
 #   CLEAN     — healthcheck passed (clean or tolerated data/env); proceed to the review/merge path
 #   FLAKY     — first run was a CODE ERROR but the solo retry PASSED; proceed as passing
 #   CODEERROR — CODE ERROR reproduced on the solo retry; red "needs you", do NOT merge
+# When [headSha] is given, the TERMINAL verdict is sha-cached: a later tick with the SAME sha REUSES
+# it (skipping the suite entirely), and a new commit invalidates it. An empty/absent sha disables the
+# cache (every call runs the suite — the pre-cache behavior).
 # Uses render() for the intermediate "health-check" / "retrying" frames, matching _handle_block_verdict.
 _healthcheck_gate() {
-  local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4"
+  local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4" _hg_sha="${5:-}"
   local _hg_sl _hg_pn
   _hg_sl="$(printf '%-*s' "$SLUGW" "$_hg_slug")"
   _hg_pn=" ${C_DIM}#${_hg_pr}${C_RESET} ·"
+
+  # SHA-CACHE CHECK (before any suite work): an UNCHANGED commit cannot yield a different verdict.
+  # Purge any result for a stale sha (a new commit → full re-run), then REUSE a terminal result
+  # cached for this exact head sha — no mutex, no suite, no fresh ledger attempt; just a journal
+  # 'cache hit' so 'herd why' shows a reused result. Mirrors the review gate's sha-keyed reuse.
+  if [ -n "$_hg_sha" ]; then
+    _discard_stale_health "$_hg_pr" "$_hg_sha"
+    local _hg_cache _hg_cv _hg_cd
+    _hg_cache="$(_health_result_file "$_hg_pr" "$_hg_sha")"
+    if [ -f "$_hg_cache" ]; then
+      IFS=$'\t' read -r _hg_cv _hg_cd < "$_hg_cache"
+      case "$_hg_cv" in
+        CLEAN)
+          _HC_RESULT="CLEAN"
+          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CLEAN
+          return 0 ;;
+        FLAKY)
+          DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
+          _HC_RESULT="FLAKY"
+          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome FLAKY
+          return 0 ;;
+        CODEERROR)
+          DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_cd}${C_RESET}"
+          _HC_RESULT="CODEERROR"
+          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CODEERROR detail "$_hg_cd"
+          return 0 ;;
+      esac
+    fi
+  fi
 
   # SERIALIZE: no slot free → queue this PR and defer. Never runs a suite that would overlap.
   if ! _health_slot_free; then
@@ -1088,6 +1156,7 @@ _healthcheck_gate() {
       *)     record_healthcheck "$_hg_pr" "$_hg_slug" 1 "clean" ;;
     esac
     _health_release "$_hg_pr"
+    record_health_result "$_hg_pr" "$_hg_sha" "CLEAN"
     _HC_RESULT="CLEAN"
     journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CLEAN
     return 0
@@ -1104,6 +1173,7 @@ _healthcheck_gate() {
     # Passed on the solo retry → the first failure was infra/contention, NOT a code bug. Never red.
     record_healthcheck "$_hg_pr" "$_hg_slug" 2 "flaky-pass"
     _health_release "$_hg_pr"
+    record_health_result "$_hg_pr" "$_hg_sha" "FLAKY"
     DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
     _HC_RESULT="FLAKY"
     journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
@@ -1112,6 +1182,7 @@ _healthcheck_gate() {
   # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
   record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error"
   _health_release "$_hg_pr"
+  record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_hc2"
   DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_hc2}${C_RESET}"
   _HC_RESULT="CODEERROR"
   journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_hc2"
@@ -1193,7 +1264,7 @@ while true; do
   build_header
   build_landed
 
-  PRS_JSON="$(gh pr list --json number,title,headRefName,mergeable,mergeStateStatus 2>/dev/null || echo '[]')"
+  PRS_JSON="$(gh pr list --json number,title,headRefName,headRefOid,mergeable,mergeStateStatus 2>/dev/null || echo '[]')"
   AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
@@ -1225,16 +1296,16 @@ for wt, branch in feats:
     print("\x1f".join(str(x) for x in [
         wt, slug, branch or "", pr.get("number", ""),
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
-        ag_status.get(slug, "")]))
+        ag_status.get(slug, ""), pr.get("headRefOid", "")]))
 ')
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
-  CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=()
+  CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha <<EOF
 $rec
 EOF
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
@@ -1274,7 +1345,7 @@ EOF
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
       DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
-      CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch")
+      CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
@@ -1302,7 +1373,7 @@ EOF
   # Action pass: gate + auto-merge each CLEAN/MERGEABLE candidate.
   j=0
   for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}; do
-    dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; j=$((j + 1))
+    dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; candsha="${CAND_SHA[j]}"; j=$((j + 1))
     already_merged "$prnum" "$slug" && continue
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
@@ -1310,8 +1381,10 @@ EOF
     # SERIALIZED, retry-before-red healthcheck: never runs a suite that overlaps another (they
     # share one git object store and race on shared .git locks), and only paints red on a CODE
     # error that REPRODUCES on an immediate solo retry — a transient self-heals as "flaky · infra".
+    # sha-keyed: an UNCHANGED commit reuses the cached terminal verdict (no re-run); a new commit
+    # invalidates the cache and re-runs the full suite. This ends the every-tick re-run of a held PR.
     _HC_RESULT=""
-    _healthcheck_gate "$prnum" "$slug" "$dir" "$idx"
+    _healthcheck_gate "$prnum" "$slug" "$dir" "$idx" "$candsha"
     render
     case "$_HC_RESULT" in
       CLEAN|FLAKY) : ;;            # passed (clean, tolerated data/env, or flaky-then-passed) → gate on
