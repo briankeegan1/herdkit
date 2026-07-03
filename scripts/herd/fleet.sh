@@ -574,3 +574,283 @@ EOF
 
   printf '%s\n' "$manifest" | HERD_FLEET_SINCE="$since" python3 -c "$_FLEET_DIGEST_PY"
 }
+
+# ── attention inbox (P2) ─────────────────────────────────────────────────────
+# A DETERMINISTIC (no-LLM) cross-project ATTENTION INBOX: ONE view of what needs the human RIGHT
+# NOW across every REGISTERED project — blocked PRs (review BLOCK), human-verify / approval holds,
+# CONFLICTING PRs, failed health gates, and escalated reviews. Read-only. It combines two sources
+# per project, REUSING the P0 registry loader + the journal helpers rather than reinventing them:
+#   • that project's .herd/journal.jsonl — the watcher's own record of holds / verdicts / gate
+#     outcomes (the SAME JSONL contract `herd why`/the digest parse), reduced to the CURRENT state
+#     of each PR (a hold that was released, a BLOCK that later passed, or a merged PR clears itself);
+#   • the LIVE open PRs from gh (per project repo) — the authoritative source for CONFLICTING, which
+#     is a mergeability fact gh computes, not a journal event.
+# Every item prints as  project · PR# · reason · suggested action; a project with nothing pending
+# shows as clean; an unreachable project (or one where gh is unavailable) is reported, never fatal.
+
+# _fleet_inbox_gh_prs <project-path> — emit this project's LIVE open PRs for the manifest:
+#   G<TAB><pr><TAB><branch><TAB><mergeable>   (0+ lines)
+#   X<TAB>gh-missing | X<TAB>gh-error         (when gh is absent / unauthed / fails)
+# Never fatal: gh problems become an X note the aggregator surfaces, so journal-derived items still
+# render fully offline. Mirrors _fleet_open_prs' "gh is best-effort" contract, richer fields.
+_fleet_inbox_gh_prs() {
+  local path="$1"
+  command -v gh >/dev/null 2>&1 || { printf 'X\tgh-missing\n'; return 0; }
+  local json rc
+  # Capture via `if` so a non-zero gh (unauthed / offline) does not trip the caller's set -e.
+  if json="$( cd "$path" 2>/dev/null && gh pr list --state open --limit 200 \
+                --json number,headRefName,mergeable 2>/dev/null )"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || { printf 'X\tgh-error\n'; return 0; }
+  [ -n "$json" ] || return 0
+  printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(data, list):
+    sys.exit(0)
+for pr in data:
+    if not isinstance(pr, dict):
+        continue
+    num = pr.get("number", "")
+    if num == "":
+        continue
+    br = str(pr.get("headRefName", "") or "").replace("\t", " ").replace("\n", " ")
+    mg = str(pr.get("mergeable", "") or "").replace("\t", " ").replace("\n", " ")
+    sys.stdout.write("G\t%s\t%s\t%s\n" % (num, br, mg))
+' 2>/dev/null || true
+}
+
+# _fleet_inbox_project_lines name path repo — emit this project's manifest block for the aggregator:
+#   P<TAB>name<TAB>ok|missing
+#   F<TAB><journal-path>            (0+; the same file set the digest reads)
+#   G<TAB><pr><TAB><branch><TAB><mergeable> / X<TAB><note>   (from _fleet_inbox_gh_prs)
+# A path that is gone or not a herd project is marked `missing` (reported, never fatal).
+_fleet_inbox_project_lines() {
+  local name="$1" path="$2"
+  if [ ! -d "$path" ] || [ ! -f "$path/.herd/config" ]; then
+    printf 'P\t%s\tmissing\n' "$name"
+    return 0
+  fi
+  local row wt
+  row="$(_fleet_read_config "$path")" || row=""
+  wt="$(printf '%s' "$row" | cut -f3)"
+  [ -n "$wt" ] || wt="${path}-trees"
+  printf 'P\t%s\tok\n' "$name"
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && printf 'F\t%s\n' "$f"
+  done < <(_fleet_journal_files "$wt")
+  _fleet_inbox_gh_prs "$path"
+}
+
+# The aggregator (python): reads the P/F/G/X manifest on stdin. For each project it reduces the
+# journal to the CURRENT per-PR state (chronologically, so hold_applied→hold_released, BLOCK→PASS,
+# and merge/reap toggles resolve in order), joins that with gh's CONFLICTING PRs, and prints one
+# attention line per (PR, reason) with a suggested action, plus a fleet-wide count.
+_FLEET_INBOX_PY='
+import sys, json
+
+def prkey(p):
+    try:
+        return (0, int(p))
+    except (TypeError, ValueError):
+        return (1, str(p))
+
+# ── read the manifest: ordered projects, each with journal files + gh PRs + notes ─
+projects = []      # list of dicts
+cur = None
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    tag = parts[0]
+    if tag == "P":
+        cur = {"name": parts[1] if len(parts) > 1 else "?",
+               "status": parts[2] if len(parts) > 2 else "ok",
+               "files": [], "gh": [], "notes": []}
+        projects.append(cur)
+    elif tag == "F" and cur is not None and len(parts) > 1:
+        cur["files"].append(parts[1])
+    elif tag == "G" and cur is not None and len(parts) >= 4:
+        cur["gh"].append((parts[1], parts[2], parts[3]))
+    elif tag == "X" and cur is not None and len(parts) > 1:
+        cur["notes"].append(parts[1])
+
+def slug_from_branch(b):
+    # Worktrees live at $WORKTREES_DIR/<slug>; the slug is the last path segment of the branch
+    # (e.g. feat/login-fix -> login-fix), matching agent-watch.sh basename(worktree) convention.
+    return b.rsplit("/", 1)[-1] if b else ""
+
+def reduce_journal(files):
+    rows = []
+    for path in files:
+        try:
+            fh = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    continue
+    rows.sort(key=lambda o: str(o.get("ts", "")))
+    st = {}
+    def S(p):
+        return st.setdefault(p, {"blocked": False, "held": False, "hold_kind": "",
+                                 "escalated": False, "health": False, "done": False, "slug": ""})
+    for o in rows:
+        ev = o.get("event", "")
+        pr = o.get("pr")
+        pr = None if pr in (None, "") else str(pr)
+        if pr is None:
+            continue
+        s = S(pr)
+        sl = o.get("slug")
+        if sl:
+            s["slug"] = str(sl)
+        if ev == "merge" or (ev == "reap" and str(o.get("reason", "")) == "merged"):
+            s["done"] = True
+            s["blocked"] = s["held"] = s["escalated"] = s["health"] = False
+        elif ev == "verdict_recorded":
+            s["blocked"] = str(o.get("value", "")).upper() == "BLOCK"
+            s["escalated"] = False           # a fresh verdict supersedes an earlier escalation
+        elif ev == "review_escalated":
+            s["escalated"] = True
+        elif ev == "review_dispatched":
+            s["escalated"] = False           # a re-review is underway; wait for its verdict
+        elif ev == "hold_applied":
+            s["held"] = True
+            s["hold_kind"] = str(o.get("kind", ""))
+        elif ev == "hold_released":
+            s["held"] = False
+        elif ev == "healthcheck_outcome":
+            oc = str(o.get("outcome", "")).upper()
+            if oc == "CODEERROR":
+                s["health"] = True
+            elif oc in ("CLEAN", "FLAKY"):
+                s["health"] = False
+    return st
+
+def project_items(p):
+    st = reduce_journal(p["files"])
+    conflicts = {}
+    for pr, branch, mergeable in p["gh"]:
+        if str(mergeable).upper() == "CONFLICTING":
+            conflicts[str(pr)] = branch
+    items = []   # (pr, reason, action)
+    for pr, s in st.items():
+        if s["done"]:
+            continue
+        if s["held"]:
+            kind = s["hold_kind"]
+            if kind == "human-verify":
+                reason = "human-verify hold"
+            elif kind == "approve":
+                reason = "approval hold"
+            else:
+                reason = "hold (%s)" % kind if kind else "hold"
+            items.append((pr, reason, "herd-approve.sh approve %s" % pr))
+        if s["blocked"]:
+            items.append((pr, "review BLOCK", "herd why %s" % pr))
+        if s["escalated"]:
+            items.append((pr, "review escalated", "herd why %s" % pr))
+        if s["health"]:
+            items.append((pr, "health gate failed", "herd why %s" % pr))
+    for pr, branch in conflicts.items():
+        sl = st.get(pr, {}).get("slug") or slug_from_branch(branch) or pr
+        items.append((pr, "CONFLICTING", "herd-resolve.sh %s" % sl))
+    items.sort(key=lambda it: (prkey(it[0]), it[1]))
+    return items
+
+print("herd fleet inbox — what needs you right now across the fleet")
+print("")
+
+tot_items = 0
+proj_needy = 0
+clean = 0
+missing = 0
+for p in projects:
+    name = p["name"]
+    print(name)
+    if p["status"] != "ok":
+        missing += 1
+        print("  (unreachable — path or .herd/config missing)")
+        print("")
+        continue
+    gh_down = any(str(n).startswith("gh") for n in p["notes"])
+    items = project_items(p)
+    if not items:
+        clean += 1
+        print("  ✓ clean — nothing pending")
+        if gh_down:
+            print("  (gh unavailable — CONFLICTING PRs not checked)")
+        print("")
+        continue
+    proj_needy += 1
+    for pr, reason, action in items:
+        tot_items += 1
+        print("  #%-5s %-20s → %s" % (pr, reason, action))
+    if gh_down:
+        print("  (gh unavailable — CONFLICTING PRs not checked)")
+    print("")
+
+miss = (" · %d unreachable" % missing) if missing else ""
+print("Fleet: %d item%s need you across %d project%s · %d clean%s" % (
+    tot_items, "" if tot_items == 1 else "s",
+    proj_needy, "" if proj_needy == 1 else "s",
+    clean, miss))
+'
+
+# fleet_inbox — the cross-project attention inbox. No window: it reports the CURRENT state.
+fleet_inbox() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+usage: herd fleet inbox
+
+  Cross-project ATTENTION INBOX (deterministic, no LLM): ONE view of what needs
+  you RIGHT NOW across every registered project. Per project it surfaces each
+  pending item as  PR# · reason · suggested action:
+    review BLOCK          a reviewer blocked the PR          -> herd why <pr>
+    human-verify hold     a HUMAN-VERIFY step is pending     -> herd-approve.sh approve <pr>
+    approval hold         MERGE_POLICY=approve is waiting    -> herd-approve.sh approve <pr>
+    review escalated      the review needs a human call      -> herd why <pr>
+    health gate failed    the healthcheck hit a CODE error   -> herd why <pr>
+    CONFLICTING           the PR no longer merges cleanly    -> herd-resolve.sh <slug>
+  plus a fleet-wide count. Holds/blocks/gates come from each project's journal
+  (current state — a released hold or merged PR clears itself); CONFLICTING comes
+  from live gh. A project with nothing pending shows as clean; an unreachable
+  project (or one where gh is unavailable) is reported, never fatal.
+EOF
+        return 0 ;;
+      *) die "usage: herd fleet inbox   (no arguments; try: herd fleet inbox --help)" ;;
+    esac
+  done
+
+  local reg; reg="$(_fleet_registry_file)"
+  if [ ! -f "$reg" ]; then
+    say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
+    return 0
+  fi
+
+  local manifest
+  manifest="$(_fleet_each _fleet_inbox_project_lines)" || manifest=""
+  if [ -z "$manifest" ]; then
+    say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
+    return 0
+  fi
+
+  printf '%s\n' "$manifest" | python3 -c "$_FLEET_INBOX_PY"
+}
