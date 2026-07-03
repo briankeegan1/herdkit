@@ -28,3 +28,4 @@
 - ✅ **REVIEW_ESCALATE_GLOB — risk-tiered pre-merge review gate** *(PR #73, commit 8c15456)* — `agent-watch.sh` classifies diffs as STRONG (engine-surface path matching `MODEL_ESCALATE_GLOB`) or large (≥ `REVIEW_ESCALATE_MAXFILES`) and routes those to Opus (`MODEL_REVIEW`); low-risk diffs use `MODEL_REVIEW_CHEAP`. `REVIEW_RISK_TIER=strict|tiered` config key (default `strict` = today's always-Opus). Hermetic tests for tier selection.
 - ✅ **Prompt-cache-aware prompt ordering — stable preamble before unique task** *(PR #80)*
 - ✅ **Evidence-based model escalation — cheap by default, step up on the glob or a failed refix round** *(PR #81)*
+- ✅ **Backlog-reconcile step in cutover / extraction / rename PRs** *(issue #17, PR #75, commit 193eb39)* — coordinator/scribe reconcile pass for PRs that rename or move the file paths, function names, or section headers that backlog entries point at
