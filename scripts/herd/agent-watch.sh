@@ -127,6 +127,13 @@ TRANSCRIPT_STATE="$TREES/.agent-watch-transcript"
 # there is no unified engine journal yet, so this mirrors that mechanism and leaves a clean seam for
 # the upcoming journal item to fold these rows in. Never gates behavior — purely a record.
 HEALTH_STATE="$TREES/.agent-watch-healthchecks"
+# Limit-resume ledger: one line per builder blocked on the ACCOUNT usage limit
+# ("<slug> <detected-epoch> <resume-target-epoch> <state>", state ∈ scheduled | failed). The watcher
+# surfaces a distinct "limit-hit · auto-resume at HH:MM" row (NOT a red/stall row) and, at the reset
+# time + a small buffer, relaunches the builder IN PLACE via `claude --continue` (see _resume_builder
+# / _handle_limit_blocked). The record is REMOVED (and its hook sentinel cleared) the instant a
+# resume succeeds; a failed-after-retry attempt flips to `failed` and escalates without retrying.
+LIMIT_STATE="$TREES/.agent-watch-limit"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -805,14 +812,12 @@ _handle_block_verdict() {
       journal_append refix_bounce pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
         round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}"
       local _hbv_pane_id _hbv_woke=0 _hbv_escalated=false
-      _hbv_pane_id="$(_find_builder_pane_id "$_hbv_slug")"
-      if [ -z "$_hbv_pane_id" ]; then
-        DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
-        _hbv_escalated=true
-      else
-        local _hbv_prompt
-        _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
+      local _hbv_prompt
+      _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
+      _hbv_pane_id="$(_find_builder_pane_id "$_hbv_slug")"
+      if [ -n "$_hbv_pane_id" ]; then
+        # LIVE, idle builder: type the re-task prompt into its agent pane, verify wake, retry once.
         herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
         if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
@@ -827,6 +832,23 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
             _hbv_escalated=true
           fi
         fi
+      else
+        # No IDLE builder pane. The builder's session may have ENDED ('done') — the 2026-07-02
+        # incident where typed nudges could NOT wake it and the bounce escalated woke=0. Resume it
+        # IN PLACE via `claude --continue` (shared _resume_builder), seeding the refix prompt as the
+        # compose turn so the relaunched builder wakes straight onto the fix. The worktree follows
+        # the standing slug↔worktree convention ($WORKTREES_DIR/<slug>).
+        local _hbv_any_pane
+        _hbv_any_pane="$(_find_builder_pane_id_any "$_hbv_slug")"
+        if [ -n "$_hbv_any_pane" ] && _resume_builder "$_hbv_slug" "$TREES/$_hbv_slug" "$_hbv_any_pane" "$_hbv_prompt"; then
+          _hbv_woke=1
+        elif [ -n "$_hbv_any_pane" ]; then
+          DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · resume via --continue did not wake · check pane${C_RESET}"
+          _hbv_escalated=true
+        else
+          DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
+          _hbv_escalated=true
+        fi
       fi
       local _hbv_status_after
       _hbv_status_after="$(_agent_status "$_hbv_slug")"
@@ -839,6 +861,275 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
     # REVIEW_AUTOFIX disabled or dry-run: show the standard "review blocked" message.
     DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}review blocked · see PR #${_hbv_pr} comment · herd-approve.sh why ${_hbv_pr}${C_RESET}"$'\n'"       ${C_DIM}└─ new commit auto-re-reviews · override: herd-approve.sh override ${_hbv_pr}${C_RESET}"
   fi
+}
+
+# ── Auto-resume a limit-blocked builder + shared resume-in-place helper ─────────────────────────
+# Real incident (2026-07-02): a builder's Claude session froze on the ACCOUNT usage limit, ended
+# ('done'), and typed `herdr pane run` nudges could NOT revive it — only a `claude --continue`
+# relaunch IN THE WORKTREE preserves context and wakes it. The SAME dead-session gap breaks the
+# auto-refix bounce when the target builder is already 'done'. One shared helper fixes both.
+
+# _now — current epoch, overridable via HERD_NOW_EPOCH (a hermetic-test clock seam). New code uses
+# this; the legacy `date +%s` call sites are intentionally left untouched to minimize churn.
+_now() {
+  if [ -n "${HERD_NOW_EPOCH:-}" ]; then printf '%s' "$HERD_NOW_EPOCH"; else date +%s; fi
+}
+
+# _shq <str> — single-quote a string for safe embedding in a shell command line (POSIX-safe: any
+# embedded single quote becomes the '\'' escape). Used to build the `claude --continue` command.
+_shq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# _find_builder_pane_id_any <slug> — pane_id for the agent named <slug> REGARDLESS of idle/done/ended
+# status, but NEVER a "working" one (resuming a live session would double-drive it). The resume path
+# targets a builder whose session has ENDED, which the idle-only _find_builder_pane_id deliberately
+# misses — and that idle-only miss is exactly why the 2026-07-02 refix bounce to a 'done' builder
+# escalated woke=0. Prints the pane_id; prints nothing if absent or already working.
+_find_builder_pane_id_any() {
+  local _fpa_slug="$1"
+  herdr agent list 2>/dev/null | SLUG="$_fpa_slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+  for a in agents:
+    if a.get("name") == slug and a.get("agent_status") != "working":
+      print(a.get("pane_id", ""), end="")
+      break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# _resume_builder <slug> <worktree> <pane_id> [prompt] — relaunch a builder whose Claude session
+# ENDED, IN PLACE, via `claude --continue` in its worktree (full context preserved), then VERIFY the
+# agent flips to "working" within a bounded poll; retry ONCE. Returns 0 if it woke, 1 otherwise.
+# The CALLER owns journaling, the console row, and the loud escalation on failure — this helper only
+# performs + verifies the relaunch. [prompt] is the compose-turn text (default "continue"); the
+# refix path passes its "fix the review" instructions so the resumed builder wakes straight onto the
+# fix. SHARED by the auto-refix bounce (done builder) and the limit-auto-resume scheduler.
+_resume_builder() {
+  local _rb_slug="$1" _rb_wt="$2" _rb_pane="$3" _rb_prompt="${4:-continue}"
+  [ -n "$_rb_pane" ] || return 1
+  local _rb_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+  # cd into the worktree so `claude --continue` resumes THAT worktree's session even if the pane's
+  # shell drifted; the explicit path also makes the invocation shape assertable in the hermetic tests.
+  local _rb_cmd
+  _rb_cmd="cd $(_shq "$_rb_wt") && claude $_rb_flags --continue $(_shq "$_rb_prompt")"
+  local _rb_wait="${HERD_RESUME_WAIT_TIMEOUT:-${HERD_REFIX_WAIT_TIMEOUT:-15}}"
+  herdr pane run "$_rb_pane" "$_rb_cmd" >/dev/null 2>&1 || true
+  _wait_agent_working "$_rb_slug" "$_rb_wait" && return 0
+  # Bounded retry once (re-send in case pane run dropped the line).
+  herdr pane run "$_rb_pane" "$_rb_cmd" >/dev/null 2>&1 || true
+  _wait_agent_working "$_rb_slug" "$_rb_wait"
+}
+
+# ── Limit-hit detection (hook sentinel — primary; banner scrape — fallback) ─────────────────────
+# _limit_sentinel_file <worktree> — the rate_limit StopFailure hook writes here (see
+# herd_write_ratelimit_hook in herd-config.sh). Its contents, when present, are the reset time from
+# the banner (an epoch or raw "resets 7:30pm" text); an empty sentinel still counts as "limit hit".
+_limit_sentinel_file() { printf '%s' "$1/.herd-limit-sentinel"; }
+
+# _transcript_last_assistant_text <worktree> — text of the LAST assistant message across this
+# worktree's Claude session transcript(s), or nothing. The banner-scrape fallback for environments
+# without the hook. Reads the newest .jsonl (Claude appends one JSON object per line); tolerant of
+# both the nested {"type":"assistant","message":{"content":[…]}} and flat {"role":…,"content":…}.
+_transcript_last_assistant_text() {
+  local wt="$1" root munged d newest=0 f m pick=""
+  root="${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}"
+  munged="$(printf '%s' "$wt" | tr '/.' '-')"
+  d="$root/$munged"
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.jsonl; do
+    [ -f "$f" ] || continue
+    m="$(file_mtime "$f")"; [ "${m:-0}" -gt "$newest" ] && { newest="$m"; pick="$f"; }
+  done
+  [ -n "$pick" ] || return 0
+  python3 - "$pick" <<'PY' 2>/dev/null || true
+import sys, json
+last = ""
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if (o.get("role") or o.get("type")) != "assistant":
+                continue
+            msg = o.get("message", o)
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                txt = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            else:
+                txt = str(content)
+            if txt.strip():
+                last = txt
+except OSError:
+    pass
+sys.stdout.write(last)
+PY
+}
+
+# _parse_reset_epoch <text> — extract a reset time from banner/sentinel text and return the NEXT
+# occurrence as an epoch. Understands an already-numeric epoch, "resets 7:30pm", "7pm", "19:30".
+# Echoes the epoch, or nothing when no time is found. Uses _now so the hermetic clock seam controls
+# "which day"; timezone is local (matching how the banner time is displayed to the user).
+_parse_reset_epoch() {
+  local text="$1" now; now="$(_now)"
+  HERD_RESET_TEXT="$text" HERD_RESET_NOW="$now" python3 - <<'PY' 2>/dev/null || true
+import os, re, sys, datetime
+text = os.environ.get("HERD_RESET_TEXT", "")
+now = int(os.environ.get("HERD_RESET_NOW", "0") or 0)
+m = re.fullmatch(r"\s*(\d{9,})\s*", text)      # an already-numeric epoch (hook may write one)
+if m:
+    sys.stdout.write(m.group(1)); sys.exit(0)
+m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", text, re.I)   # 7:30pm / 7pm / 19:30
+if not m:
+    sys.exit(0)
+hh = int(m.group(1)); mm = int(m.group(2) or 0); ap = (m.group(3) or "").lower()
+if ap == "pm" and hh != 12: hh += 12
+if ap == "am" and hh == 12: hh = 0
+if hh > 23 or mm > 59:
+    sys.exit(0)
+base = datetime.datetime.fromtimestamp(now)
+cand = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+if cand.timestamp() <= now:            # already passed today → the next day's occurrence
+    cand += datetime.timedelta(days=1)
+sys.stdout.write(str(int(cand.timestamp())))
+PY
+}
+
+# _detect_limit_hit <slug> <worktree> — is this builder blocked on the account usage limit?
+# Echoes the reset epoch (0 when the reset time is unknown) and returns 0 when a limit is detected;
+# echoes nothing and returns 1 otherwise. Signal order:
+#   1. HOOK SENTINEL (primary, robust): the rate_limit StopFailure hook wrote _limit_sentinel_file.
+#   2. BANNER SCRAPE (fallback): the last assistant transcript line matches the usage-limit banner.
+# HERD_LIMIT_DETECT=off disables detection entirely (feature kill-switch).
+_detect_limit_hit() {
+  local _dl_slug="$1" _dl_wt="$2" _dl_sent _dl_text _dl_reset=""
+  [ "${HERD_LIMIT_DETECT:-on}" != "off" ] || return 1
+  _dl_sent="$(_limit_sentinel_file "$_dl_wt")"
+  if [ -f "$_dl_sent" ]; then
+    _dl_text="$(cat "$_dl_sent" 2>/dev/null || true)"
+    _dl_reset="$(_parse_reset_epoch "$_dl_text")"
+    printf '%s' "${_dl_reset:-0}"; return 0
+  fi
+  _dl_text="$(_transcript_last_assistant_text "$_dl_wt")"
+  if [ -n "$_dl_text" ] && printf '%s' "$_dl_text" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit'; then
+    _dl_reset="$(_parse_reset_epoch "$_dl_text")"
+    printf '%s' "${_dl_reset:-0}"; return 0
+  fi
+  return 1
+}
+
+# ── Limit-resume ledger + scheduler ─────────────────────────────────────────────────────────────
+# limit_state <slug> — recorded state (scheduled|failed), or empty when no active record.
+limit_state() {
+  [ -s "$LIMIT_STATE" ] || return 0
+  awk -v s="$1" '$1==s{st=$4} END{if(st)print st}' "$LIMIT_STATE" 2>/dev/null || true
+}
+# limit_target_epoch <slug> — recorded resume-target epoch (0 if none).
+limit_target_epoch() {
+  [ -s "$LIMIT_STATE" ] || { printf '0'; return 0; }
+  awk -v s="$1" '$1==s{r=$3} END{print (r==""?0:r)}' "$LIMIT_STATE" 2>/dev/null || printf '0'
+}
+# record_limit <slug> <detected> <target> <state> — upsert (drop any prior line for this slug first).
+record_limit() {
+  local _rl_tmp="${LIMIT_STATE}.$$"
+  { [ -f "$LIMIT_STATE" ] && grep -v "^$1 " "$LIMIT_STATE" 2>/dev/null
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "$4"
+  } > "$_rl_tmp" 2>/dev/null && mv "$_rl_tmp" "$LIMIT_STATE" 2>/dev/null || rm -f "$_rl_tmp" 2>/dev/null
+}
+# clear_limit <slug> [worktree] — drop the slug's record and (when a worktree is given) its sentinel.
+clear_limit() {
+  if [ -s "$LIMIT_STATE" ]; then
+    local _cl_tmp="${LIMIT_STATE}.$$"
+    grep -v "^$1 " "$LIMIT_STATE" 2>/dev/null > "$_cl_tmp"
+    mv "$_cl_tmp" "$LIMIT_STATE" 2>/dev/null || rm -f "$_cl_tmp" 2>/dev/null
+  fi
+  [ -n "${2:-}" ] && rm -f "$(_limit_sentinel_file "$2")" 2>/dev/null || true
+}
+# _limit_buffer_secs — grace after the reset before relaunching (default 60s; HERD_LIMIT_RESUME_BUFFER).
+_limit_buffer_secs() {
+  case "${HERD_LIMIT_RESUME_BUFFER:-}" in
+    ''|*[!0-9]*) printf '%s' 60 ;;
+    *)           printf '%s' "$HERD_LIMIT_RESUME_BUFFER" ;;
+  esac
+}
+# _limit_unknown_wait — how long to hold when the reset time can't be parsed (~5h rolling window;
+# HERD_LIMIT_UNKNOWN_WAIT). Better to wait out one window than to hammer a still-blocked account.
+_limit_unknown_wait() {
+  case "${HERD_LIMIT_UNKNOWN_WAIT:-}" in
+    ''|*[!0-9]*) printf '%s' 18000 ;;
+    *)           printf '%s' "$HERD_LIMIT_UNKNOWN_WAIT" ;;
+  esac
+}
+# _fmt_hhmm <epoch> — local "HH:MM" for a scheduled-resume epoch (best-effort; GNU/BSD date).
+_fmt_hhmm() {
+  local e="${1:-0}"
+  [ "$e" -gt 0 ] 2>/dev/null || { printf '??:??'; return 0; }
+  date -r "$e" +%H:%M 2>/dev/null || date -d "@$e" +%H:%M 2>/dev/null || printf '??:??'
+}
+
+# _handle_limit_blocked <slug> <worktree> <idx> <reset-epoch> — surface + schedule + (at the reset)
+# perform the auto-resume for ONE limit-blocked builder. Sets DISPLAY[idx]. The row is a distinct,
+# NON-RED "limit-hit · auto-resume at HH:MM" — a usage-limit pause is an expected account-wide event,
+# not a code fault or a stall, so it must never read as a red alarm. Mirrors _handle_block_verdict's
+# shape (record-before-act, journal both sides, escalate loudly on failure).
+_handle_limit_blocked() {
+  local _lb_slug="$1" _lb_wt="$2" _lb_idx="$3" _lb_reset="${4:-0}"
+  local _lb_sl _lb_state _lb_now _lb_target
+  _lb_sl="$(printf '%-*s' "$SLUGW" "$_lb_slug")"
+  _lb_now="$(_now)"
+  _lb_state="$(limit_state "$_lb_slug")"
+
+  # First sighting → record + journal the hold and compute the resume target once.
+  if [ -z "$_lb_state" ]; then
+    if [ "$_lb_reset" -gt 0 ] 2>/dev/null; then
+      _lb_target=$(( _lb_reset + $(_limit_buffer_secs) ))
+    else
+      _lb_target=$(( _lb_now + $(_limit_unknown_wait) ))
+    fi
+    record_limit "$_lb_slug" "$_lb_now" "$_lb_target" "scheduled"
+    journal_append limit_detected slug "$_lb_slug" reset_at "$_lb_reset" resume_at "$_lb_target"
+    journal_append limit_resume_scheduled slug "$_lb_slug" resume_at "$_lb_target"
+    _lb_state="scheduled"
+  fi
+
+  # A prior failed attempt stays escalated — never re-attempt every tick.
+  if [ "$_lb_state" = "failed" ]; then
+    DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+    return 0
+  fi
+
+  _lb_target="$(limit_target_epoch "$_lb_slug")"
+  if [ "$_lb_now" -lt "$_lb_target" ] 2>/dev/null; then
+    # Waiting for the reset: distinct cyan hold row (NOT a red/stall row).
+    DISPLAY[_lb_idx]="    ${C_CYAN}⏳${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit-hit · auto-resume at $(_fmt_hhmm "$_lb_target")${C_RESET}"
+    return 0
+  fi
+
+  # Reset reached (+buffer) → resume in place now.
+  DISPLAY[_lb_idx]="    ${C_CYAN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit reset · resuming via --continue…${C_RESET}"
+  render
+  local _lb_pane
+  _lb_pane="$(_find_builder_pane_id_any "$_lb_slug")"
+  journal_append limit_resume_attempt slug "$_lb_slug" pane "${_lb_pane:-none}" target "$_lb_target"
+  if [ -n "$_lb_pane" ] && _resume_builder "$_lb_slug" "$_lb_wt" "$_lb_pane"; then
+    journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false
+    clear_limit "$_lb_slug" "$_lb_wt"
+    DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed via --continue${C_RESET}"
+  else
+    record_limit "$_lb_slug" "$_lb_now" "$_lb_target" "failed"
+    journal_append limit_resume_result slug "$_lb_slug" woke 0 escalated true
+    DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+  fi
+  return 0
 }
 
 # ── Builder liveness (pre-PR stall detection) ────────────────────────────────────────────────────
@@ -1334,8 +1625,22 @@ EOF
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
-        DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+        # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
+        # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
+        # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
+        # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
+        # otherwise it is the benign "idle · no PR". An existing record keeps the row (and the
+        # scheduled resume) alive across ticks even after the transient signal clears.
+        if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
+        if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
+          _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
+        else
+          DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+        fi
       else
+        # A working agent means any earlier limit hold has cleared (a human intervened, or the
+        # scheduled resume flipped it working) — drop a stale limit record + sentinel, then classify.
+        [ -n "$(limit_state "$slug")" ] && clear_limit "$slug" "$dir"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or

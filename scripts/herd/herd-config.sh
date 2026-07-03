@@ -443,6 +443,102 @@ PY
   return 0
 }
 
+# herd_write_ratelimit_hook <worktree> — configure this worktree's project-level Claude Code hook so
+# a turn that ENDS on an account rate-limit writes a sentinel file the watcher polls. This is the
+# PRIMARY, version-robust limit-hit signal (agent-watch.sh _detect_limit_hit) — far better than
+# regex-scraping the banner, which stays as the fallback. The hook writes the reset time (raw banner
+# text) into <worktree>/.herd-limit-sentinel; the watcher parses it to schedule an in-place
+# `claude --continue` resume at the reset.
+#
+# The write is ADDITIVE + SAFE: it merges into an existing .claude/settings.json (never clobbers
+# unrelated keys or other hooks), is idempotent (re-running changes nothing once present), round-
+# trips through a temp file + atomic os.replace, and tolerates a missing/corrupt settings file
+# (starting fresh from {}). Best-effort: any failure warns but returns 0 so it never aborts worktree
+# creation — the fallback banner-scrape still catches the limit hit if the hook is absent.
+#
+# NOTE: the exact hook event name / rate-limit matcher is Claude-Code-version-dependent; the watcher
+# does NOT rely on it firing (the banner-scrape fallback covers hookless environments). Disable with
+# HERD_LIMIT_HOOK=off.
+herd_write_ratelimit_hook() {
+  local _rh_dir="${1:-}"
+  [ -n "$_rh_dir" ] || return 0
+  [ "${HERD_LIMIT_HOOK:-on}" != "off" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then return 0; fi
+  local _rh_abs
+  _rh_abs="$(cd "$_rh_dir" 2>/dev/null && pwd -P)" || _rh_abs="$_rh_dir"
+  local _rh_settings="$_rh_abs/.claude/settings.json"
+  local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
+  mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
+  if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
+import json, os, sys, tempfile
+
+path = os.environ["HERD_RH_SETTINGS"]
+sentinel = os.environ["HERD_RH_SENTINEL"]
+
+# The hook command: write the stop reason (reset banner text, if the harness passes it on stdin) to
+# the sentinel; an empty write still marks "limit hit". Kept dependency-free (sh + cat).
+cmd = "cat > %s 2>/dev/null || : > %s" % (
+    "'" + sentinel.replace("'", "'\\''") + "'",
+    "'" + sentinel.replace("'", "'\\''") + "'",
+)
+entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
+
+data = {}
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except (ValueError, OSError):
+    data = {}
+
+hooks = data.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+arr = hooks.get("StopFailure")
+if not isinstance(arr, list):
+    arr = []
+
+# Idempotent: our rate_limit matcher already present with the same sentinel command → no write.
+for e in arr:
+    if isinstance(e, dict) and e.get("matcher") == "rate_limit":
+        cur = e.get("hooks")
+        if isinstance(cur, list) and any(
+            isinstance(h, dict) and h.get("command") == cmd for h in cur
+        ):
+            sys.exit(0)
+        e["matcher"] = "rate_limit"
+        e["hooks"] = entry["hooks"]
+        break
+else:
+    arr.append(entry)
+
+hooks["StopFailure"] = arr
+data["hooks"] = hooks
+
+d = os.path.dirname(path) or "."
+os.makedirs(d, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    printf '⚠️  herdkit: could not write the rate-limit hook for %s (limit auto-resume falls back to banner-scrape)\n' "$_rh_abs" >&2
+  fi
+  return 0
+}
+
 # herd_write_task_spec <spec_file> <spec_content> — externalize a builder's full task spec.
 #
 # Writes <spec_content> (the caller task + the workflow-rules footer) to <spec_file> and, on
