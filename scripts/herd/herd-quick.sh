@@ -71,11 +71,15 @@ RULES="[workflow rules] Build ONLY this change in this worktree. Before running 
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
 warnings are fine). Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
 If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped."
-if [ -n "$TASK" ]; then TASK="$TASK"$'\n\n'"$RULES"; else TASK="$RULES"; fi
-herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$TASK"
+if [ -n "$TASK" ]; then FULL_SPEC="$TASK"$'\n\n'"$RULES"; else FULL_SPEC="$RULES"; fi
+# Externalize the spec to a file (sibling of the worktree, never inside it) and seed the agent with
+# a SHORT pointer prompt — keeps the spawn's argv tiny and quote-safe. See herd_write_task_spec.
+POINTER="$(herd_write_task_spec "$SLUG" "$FULL_SPEC")"
+TASK_FILE="$WORKTREES_DIR/$SLUG.task.md"
+herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
 
 echo "🐑 Quick sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
-[ -n "$TASK" ] && echo "   seeded task: $TASK"
+echo "   task spec: $TASK_FILE   (pointer: $POINTER)"
 echo "   ⚡ light lane — no app preview; healthcheck auto-runs the light profile unless the diff matches the heavy glob."
 echo "   jump to it:   herdr agent focus $SLUG"
 echo "   when its PR is up: the watcher reviews & merges, then  git worktree remove $DIR"

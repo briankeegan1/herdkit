@@ -442,3 +442,24 @@ PY
   fi
   return 0
 }
+
+# herd_write_task_spec <slug> <full_spec> — EXTERNALIZE a builder's task spec (efficiency lever).
+# Instead of passing the entire multi-KB task text as a positional argv to `claude "<task>"` — which
+# bloats every spawn's argv, forces the task to survive argv/shell quoting, and gets fully
+# re-ingested on any resume — the lane writes the full spec to a FILE and hands the agent a short
+# pointer prompt instead.
+#
+# Writes <full_spec> to $WORKTREES_DIR/<slug>.task.md — deliberately a SIBLING of the worktree dir
+# ($WORKTREES_DIR/<slug>/…), i.e. OUTSIDE the worktree's tracked tree, so the builder can never
+# `git add` it into its PR. Prints to stdout the SHORT pointer prompt the caller passes to the
+# agent; the spec file (which already carries the workflow-rules footer, incl. the healthcheck
+# command) is the single source of truth for what to build. Best-effort mkdir; the write itself is
+# load-bearing so a failure to open the file surfaces via set -e in the caller.
+herd_write_task_spec() {
+  local _ts_slug="${1:?herd_write_task_spec: slug required}"
+  local _ts_spec="${2:-}"
+  local _ts_file="$WORKTREES_DIR/$_ts_slug.task.md"
+  mkdir -p "$WORKTREES_DIR" 2>/dev/null || true
+  printf '%s\n' "$_ts_spec" > "$_ts_file"
+  printf 'Read your task spec at %s and build exactly what it specifies. Do NOT commit or `git add` that file — it lives outside your worktree. Follow AGENTS.md, run the healthcheck the spec names, then `gh pr create`.' "$_ts_file"
+}
