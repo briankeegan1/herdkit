@@ -16,3 +16,4 @@
 - ✅ **`TOKEN_MODE=eco` — opt-in economy mode** *(PR #58)*
 - ✅ **Per-PR human-verify hold — PR test plans must be visible to the gate** *(PR #61)*
 - ✅ **Healthcheck must gate / flag interaction tests for app-facing PRs** *(PR #59)*
+- ✅ **Builder liveness: kill the cold-start false STALL flap** *(PR #63)*
