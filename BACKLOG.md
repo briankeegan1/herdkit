@@ -9,7 +9,7 @@
 
 ## Enterprise / multi-user optionality (deferred — solo is the default today; bank the config seams now)
 
-- 🚧 **Watcher flexibility for long-pending deps** *(worktree watcher-dep-states)* — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
+- ✅ **Watcher flexibility for long-pending deps** *(PR #107)* — backoff polling; richer dep states (`open/in-review/in-progress/stalled/closed`); surface `stalled` + optional TTL so a slow enterprise PR never silently rots. A `blocked-on` is a status line, never a workspace freeze.
 - 🔜 **Multi-user / team mode** — `WATCHER_SCOPE=mine|all` + ownership/assignee filter; auto-merge scoped to OWNED PRs only (never blind-merge teammates'), building on the required-checks gate (PR #5). `solo` default; `team` is a config flip.
 
 ## Workflow control & discoverability
