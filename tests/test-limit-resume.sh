@@ -7,8 +7,9 @@
 #   (4) _handle_limit_blocked scheduler: distinct (non-red) hold row before reset; at reset+buffer
 #       it resumes-in-place, clears the record+sentinel on success; escalates loudly + records
 #       `failed` (no re-attempt) when the agent never wakes; journals limit_detected/scheduled
-#   (5) auto-refix REUSES _resume_builder when the target builder session is 'done' (idle-only
-#       pane lookup misses it) — the 2026-07-02 woke=0 escalation is now a --continue resume
+#   (5) auto-refix wakes a 'done' builder by submitting the raw re-task prompt via `herdr pane run`
+#       (text + Enter), NOT `claude --continue` — issue #86: the --continue command was typed into
+#       the still-present TUI as literal text and never re-tasked the agent (woke=0 → escalated)
 #   (6) herd_write_ratelimit_hook writes a merge-safe, idempotent StopFailure/rate_limit hook
 #
 # Sources agent-watch.sh in lib mode. Stubs herdr/gh/git and pins the clock (HERD_NOW_EPOCH).
@@ -222,31 +223,31 @@ ok
 [ "$(wc -l < "$PANE_LOG")" -eq "$calls_before" ] || fail "4: a failed record must NOT re-attempt resume every tick"
 ok
 
-# ── (5) auto-refix reuses _resume_builder when the builder session is 'done' ──
+# ── (5) auto-refix wakes a 'done' builder via a raw `herdr pane run` submit (issue #86) ──
 rm -f "$REFIX_STATE"; : > "$PANE_LOG"; : > "$JOURNAL_FILE"
-# Agent exists but is 'done' (not idle, not working) → _find_builder_pane_id (idle-only) misses it,
-# _find_builder_pane_id_any finds it → resume-in-place with the refix prompt.
+# Agent exists but is 'done' (not idle, not working) → _find_builder_pane_id_any finds it and the
+# bounce submits the RAW re-task prompt via `herdr pane run` (text + Enter), the mechanism that
+# actually wakes a done builder. It must NOT type a `claude --continue` command line (that was the
+# 2026-07-02 woke=0 escalation: the command was typed into the still-present TUI as literal text).
 export STUB_AGENT_NAME="fix-slug" STUB_AGENT_STATUS="done" STUB_AGENT_PANE_ID="pane-FIX"
 printf '0\n' > "$STUB_WAIT_FILE"
 DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 _handle_block_verdict "70" "fix-slug" "sha-70" "0"
-grep -q -- "--continue" "$PANE_LOG" || fail "5: refix on a 'done' builder must resume via claude --continue (log: $(cat "$PANE_LOG"))"
+grep -q "review-blocked" "$PANE_LOG" || fail "5: refix on a 'done' builder must submit the 'review-blocked' fix prompt (log: $(cat "$PANE_LOG"))"
 ok
-grep -q "review-blocked" "$PANE_LOG" || fail "5: refix resume must carry the 'review-blocked' fix prompt"
-ok
-grep -q "$WORKTREES_DIR/fix-slug" "$PANE_LOG" || fail "5: refix resume must cd into the builder's worktree"
+grep -q -- "--continue" "$PANE_LOG" && fail "5: refix on a 'done' builder must NOT type a claude --continue command (log: $(cat "$PANE_LOG"))"
 ok
 refix_attempted "70" "sha-70" || fail "5: the refix bounce must still be recorded"
 ok
 
-# When the 'done' builder's resume never wakes → escalate (not a silent woke=0).
+# When the 'done' builder never wakes (both submit windows expire) → escalate (not a silent woke=0).
 rm -f "$REFIX_STATE"; : > "$PANE_LOG"
 export STUB_AGENT_NAME="fix-dead" STUB_AGENT_STATUS="done" STUB_AGENT_PANE_ID="pane-DEAD"
 printf '1\n1\n' > "$STUB_WAIT_FILE"
 DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 _handle_block_verdict "71" "fix-dead" "sha-71" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you · auto-refix failed" || fail "5: a resume that never wakes must escalate (got: $d)"
+printf '%s\n' "$d" | grep -q "needs you · auto-refix failed" || fail "5: a submit that never wakes must escalate (got: $d)"
 ok
 
 # ── (6) herd_write_ratelimit_hook: merge-safe + idempotent ───────────────────
