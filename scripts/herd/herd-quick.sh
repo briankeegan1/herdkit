@@ -83,12 +83,31 @@ if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
   exit 1
 fi
 
+# PR flow (draft vs direct) threaded into the LANE RULES below. SAFE DEFAULTS preserve today's exact
+# behavior: PR_FLOW=direct opens PRs the normal way (`gh pr create`), PR_READY_WHEN=builder means the
+# builder owns readiness — together they render the same rules text as before. When PR_FLOW=draft the
+# builder opens `gh pr create --draft` (the watcher already HOLDS draft PRs at agent-watch.sh:157), and
+# PR_READY_WHEN decides who promotes the draft to ready. Unknown values fall back to the safe default.
+# Resolved here (not in herd-config.sh) so the builder prompt is the ONLY surface threaded.
+_pr_flow="${PR_FLOW:-direct}";        case "$_pr_flow"  in draft) ;; *) _pr_flow="direct" ;; esac
+_pr_ready="${PR_READY_WHEN:-builder}"; case "$_pr_ready" in builder|coordinator|human) ;; *) _pr_ready="builder" ;; esac
+if [ "$_pr_flow" = "draft" ]; then
+  PR_CREATE_CMD="gh pr create --draft"
+  case "$_pr_ready" in
+    builder)     PR_READY_RULE=" Open it as a DRAFT; once the healthcheck passes, promote it yourself with 'gh pr ready <pr#>'." ;;
+    coordinator) PR_READY_RULE=" Open it as a DRAFT and leave it in draft — the COORDINATOR promotes it to ready for review; do NOT run 'gh pr ready'." ;;
+    human)       PR_READY_RULE=" Open it as a DRAFT and leave it in draft — a HUMAN promotes it to ready for review; do NOT run 'gh pr ready'." ;;
+  esac
+else
+  PR_CREATE_CMD="gh pr create"; PR_READY_RULE=""
+fi
+
 # 3. The Claude sub-agent — the ONLY pane (no app-preview split). It runs in the tab's root pane
 #    (no --split right). Yolo by default is fine: the worktree is isolated. Seeded task + the
 #    standing workflow rules become its opening prompt.
-RULES="[workflow rules] Build ONLY this change in this worktree. Before running 'gh pr create',
+RULES="[workflow rules] Build ONLY this change in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine). Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
+warnings are fine).$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
 If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped."
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
