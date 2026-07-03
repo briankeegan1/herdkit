@@ -1297,8 +1297,6 @@ cmd_report() {
   local project ver
   project="${WORKSPACE_NAME:-$(basename "$root")}"
   ver="${HERD_VERSION:-?}"
-  # HERD_REPO names the GitHub repo engine bugs escalate to; preserve the historical default.
-  : "${HERD_REPO:=briankeegan1/herdkit}"
 
   # Report backend: when --to is given, resolve the named link from .herd/links, which sets
   # HERD_REPO and HERD_REPORT_BACKEND for the target peer. Without --to the existing precedence
@@ -1320,6 +1318,21 @@ cmd_report() {
   else
     report_backend="${env_backend:-${HERD_REPORT_BACKEND:-github}}"
   fi
+
+  # HERD_REPO routes github-backed reports. It used to fall back to the engine author's own repo
+  # (briankeegan1/herdkit) when unset — silently filing an external consumer's engine-bug reports
+  # against a stranger's repo (external-consumer audit, Leak E). Now, for the github backend, an
+  # unset HERD_REPO REFUSES with an actionable error — UNLESS this project IS the herdkit engine
+  # itself (its origin remote resolves to briankeegan1/herdkit), where the self-target is correct
+  # (this dogfood repo). The --to path has already set HERD_REPO from the resolved link above.
+  if [ "$report_backend" = "github" ] && [ -z "${HERD_REPO:-}" ]; then
+    if [ "$(_gh_repo_slug "$root" origin)" = "briankeegan1/herdkit" ]; then
+      HERD_REPO="briankeegan1/herdkit"
+    else
+      die "HERD_REPO is not set — set it in .herd/config to the repo where engine bugs should be filed, e.g. owner/herdkit"
+    fi
+  fi
+
   local backend_file="$SCRIPTS_DIR/backends/${report_backend}.sh"
   [ -f "$backend_file" ] \
     || die "unknown HERD_REPORT_BACKEND '$report_backend' — no backends/${report_backend}.sh"
