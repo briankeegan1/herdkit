@@ -50,6 +50,12 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 . "$SCRIPTS_DIR/layout-reconcile.sh"
 
+# Fleet fan-out helpers (herd fleet …): the DETERMINISTIC multi-project registry + rollup + bulk
+# update/reload. Defines functions only; they call say/die/colour vars (defined just below) at run
+# time, so sourcing here — before those are defined — is safe. See scripts/herd/fleet.sh.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
+
 c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
@@ -2746,6 +2752,38 @@ if merged:
 '
 }
 
+# ── cmd_fleet — the DETERMINISTIC (no-LLM) multi-project fan-out (P0 of the fleet-coordinator EPIC) ──
+# A parent orchestration layer above the per-project coordinators: a flat project REGISTRY plus a
+# read-mostly rollup (`status`) and bulk delegation of the existing per-project `herd update`/`herd
+# reload` (`upgrade`/`reload`). All logic lives in scripts/herd/fleet.sh; this is just the router.
+cmd_fleet() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    register)  fleet_register "$@" ;;
+    list)      fleet_list "$@" ;;
+    discover)  fleet_discover "$@" ;;
+    status)    fleet_status "$@" ;;
+    upgrade)   fleet_upgrade "$@" ;;
+    reload)    fleet_reload "$@" ;;
+    ""|-h|--help)
+      cat <<EOF
+usage: herd fleet <subcommand>
+
+  register <path>            add a herd project (reads its .herd/config) to the registry
+  list                       list registered projects (name · path · repo)
+  discover [--register] <root>...
+                             scan roots for .herd/config; print (and optionally register) projects
+  status                     per-project rollup: branch, open PRs, watcher alive?, last activity
+  upgrade                    run 'herd update' in every registered project (per-project outcomes)
+  reload                     run 'herd reload' in every registered project (per-project outcomes)
+
+Registry file: $(_fleet_registry_file)
+EOF
+      ;;
+    *) die "unknown fleet subcommand: $sub (try: herd fleet --help)" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
@@ -2804,6 +2842,16 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                         rm <link>#<id>      drop a dep (editable data, never stuck)
                                         demote <link>#<id>  reclassify a blocker into a non-
                                                             blocking watch (un-blocks the lane)
+  herd fleet <sub>                    DETERMINISTIC multi-project fan-out (no LLM) over a project
+                                      registry (default ~/.herd/fleet):
+                                        register <path>     add a herd project to the registry
+                                        list                list registered projects
+                                        discover [--register] <root>...
+                                                            scan roots for .herd/config projects
+                                        status              per-project rollup (branch, open PRs,
+                                                            watcher alive?, last journal activity)
+                                        upgrade             run 'herd update' in every project
+                                        reload              run 'herd reload' in every project
   herd help                           this help
 
 Engine scripts: $SCRIPTS_DIR
@@ -2828,6 +2876,7 @@ case "${1:-help}" in
   link)    shift; cmd_link "$@" ;;
   depend)  shift; cmd_depend "$@" ;;
   deps)    shift; cmd_deps "$@" ;;
+  fleet)   shift; cmd_fleet "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 2 ;;
 esac
