@@ -1838,6 +1838,79 @@ print(json.dumps([p for p in prs if keep(p)]))
 '
 }
 
+# ── Multi-user / team mode: STRICT ownership gate for auto-merge (SAFETY-CRITICAL) ───────────────
+# WATCHER_SCOPE selects WHICH PRs the watcher may AUTO-MERGE. It is a NARROWING gate layered on top
+# of the watcher-view lens above: like the lens it can only ever WITHHOLD a merge, never authorize
+# one the existing gates (healthcheck + pre-merge review + re-verify) would otherwise deny.
+#   mine  (DEFAULT) — today's exact SOLO behavior: auto-merge the operator's own PRs. A solo install
+#                     only ever sees its own local-worktree PRs, so the ownership probe stays DORMANT
+#                     and behavior is byte-identical to before this change.
+#   all             — team mode: teammates' PRs are DISPLAYED, but auto-merge is STRICTLY scoped to
+#                     PRs OWNED by the configured operator. A teammate's PR is surfaced as
+#                     "not mine — manual" and is NEVER auto-merged, even when MERGEABLE+CLEAN+approved.
+# NB: WATCHER_SCOPE is intentionally NOT yet documented in capabilities.tsv — that doc entry is a
+# deliberate follow-up (another builder owns capabilities.tsv this wave); read here with an inline
+# default so a config without the key behaves exactly as the solo default.
+_watcher_scope() {
+  case "${WATCHER_SCOPE:-mine}" in
+    mine|all) printf '%s' "${WATCHER_SCOPE:-mine}" ;;
+    *)
+      _watcher_view_warn_once "WATCHER_SCOPE: unknown value '${WATCHER_SCOPE:-}' — falling back to safe default 'mine'" "scope:${WATCHER_SCOPE:-}"
+      printf 'mine' ;;
+  esac
+}
+
+# team mode = scope 'all'. In team mode the ownership gate is armed; in the default 'mine' scope it
+# is dormant (byte-identical to today's solo watcher).
+_watcher_team_mode() { [ "$(_watcher_scope)" = "all" ]; }
+
+# The configured OPERATOR IDENTITY that owns auto-merge. Resolution order:
+#   WATCHER_OWNER (explicit) → WATCHER_VIEW_AUTHOR (reuse the lens identity) → `gh api user`.
+# Resolved AT MOST ONCE per process and memoized in a GLOBAL — the 4s poll loop must never spawn a gh
+# probe every tick. _resolve_watcher_owner MUST be called directly (never via `$()`), or a subshell
+# would discard the memo; _watcher_owner_login is the read-only accessor. Test seam: setting
+# WATCHER_OWNER (or WATCHER_VIEW_AUTHOR) resolves the identity with no gh call at all.
+_WATCHER_OWNER_CACHE=""
+_WATCHER_OWNER_RESOLVED=""
+_resolve_watcher_owner() {
+  [ -n "$_WATCHER_OWNER_RESOLVED" ] && return 0
+  if   [ -n "${WATCHER_OWNER:-}" ];       then _WATCHER_OWNER_CACHE="$WATCHER_OWNER"
+  elif [ -n "${WATCHER_VIEW_AUTHOR:-}" ]; then _WATCHER_OWNER_CACHE="$WATCHER_VIEW_AUTHOR"
+  else _WATCHER_OWNER_CACHE="$(gh api user -q .login 2>/dev/null || true)"; fi
+  _WATCHER_OWNER_RESOLVED=1
+}
+_watcher_owner_login() { _resolve_watcher_owner; printf '%s' "$_WATCHER_OWNER_CACHE"; }
+
+# _scope_permits_automerge <pr_author_login> — the SAFETY-CRITICAL scope gate. Returns 0 (scope
+# PERMITS auto-merge) / non-zero (scope FORBIDS it — display only, a human merges it). Called DIRECTLY
+# (never in a subshell) so its owner resolution memoizes into the parent shell across ticks.
+#   • scope=mine (default): ALWAYS permits — preserves today's exact solo behavior. No ownership
+#     probe runs; every local-worktree candidate is by construction the operator's own PR.
+#   • scope=all (team mode): permits ONLY when <pr_author_login> equals the resolved operator
+#     identity. FAIL-CLOSED — an empty/unknown author, or an unresolvable operator identity, FORBIDS
+#     the merge: a teammate's PR must never be blind-merged just because we couldn't confirm ownership.
+_scope_permits_automerge() {
+  _spa_author="${1:-}"
+  _watcher_team_mode || return 0            # solo default → unchanged behavior, no ownership probe
+  _resolve_watcher_owner
+  if [ -z "$_WATCHER_OWNER_CACHE" ]; then
+    _watcher_view_warn_once "WATCHER_SCOPE=all but the operator identity is unresolved (set WATCHER_OWNER) — auto-merge WITHHELD for safety" "scope:noowner"
+    return 1                               # fail-closed: cannot confirm ownership → never merge
+  fi
+  [ -n "$_spa_author" ] && [ "$_spa_author" = "$_WATCHER_OWNER_CACHE" ]
+}
+
+# The --json fields for the tick's `gh pr list`. In team mode we additionally need each PR's `author`
+# to enforce the ownership gate even when NO view lens is active; fold it in (deduped). In the default
+# solo scope this is exactly _watcher_view_fields — the base set — so the default gh call is unchanged.
+_watcher_tick_fields() {
+  _wtf="$(_watcher_view_fields)"
+  if _watcher_team_mode; then
+    case ",$_wtf," in *,author,*) ;; *) _wtf="${_wtf},author" ;; esac
+  fi
+  printf '%s' "$_wtf"
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
 # the live watch loop. Direct execution runs the loop normally.
@@ -1926,7 +1999,7 @@ while true; do
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
   # relaxes any merge gate. Default (all lens, no filters) requests the base fields and passes the
   # JSON through unchanged, preserving today's exact behavior.
-  PRS_JSON="$(gh pr list --json "$(_watcher_view_fields)" 2>/dev/null || echo '[]')"
+  PRS_JSON="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null || echo '[]')"
   PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
   AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
@@ -1959,7 +2032,8 @@ for wt, branch in feats:
     print("\x1f".join(str(x) for x in [
         wt, slug, branch or "", pr.get("number", ""),
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
-        ag_status.get(slug, ""), pr.get("headRefOid", "")]))
+        ag_status.get(slug, ""), pr.get("headRefOid", ""),
+        (pr.get("author") or {}).get("login", "")]))
 ')
 
   # Classify each feature into a display line; collect merge candidates separately.
@@ -1968,7 +2042,7 @@ for wt, branch in feats:
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
 $rec
 EOF
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
@@ -2021,8 +2095,15 @@ EOF
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
-      DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
-      CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
+      if _scope_permits_automerge "$prauthor"; then
+        DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
+      else
+        # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,
+        # but it is NOT owned by the configured operator. DISPLAY it so a teammate's progress is
+        # visible, but NEVER add it to the merge-candidate set — a human merges a teammate's PR.
+        DISPLAY[i]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${prauthor:-unknown})${C_RESET}"
+      fi
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
@@ -2076,15 +2157,24 @@ EOF
     fi
 
     # Re-verify in the instant before merging — guard the window between classification and merge.
-    IFS=$'\t' read -r rmergeable rmstate rbranch rsha < <(
-      gh pr view "$prnum" --json mergeable,mergeStateStatus,headRefName,headRefOid 2>/dev/null | python3 -c '
+    IFS=$'\t' read -r rmergeable rmstate rbranch rsha rauthor < <(
+      gh pr view "$prnum" --json mergeable,mergeStateStatus,headRefName,headRefOid,author 2>/dev/null | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
-print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), str(d.get("headRefName","")), str(d.get("headRefOid",""))]))
+print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), str(d.get("headRefName","")), str(d.get("headRefOid","")), str((d.get("author") or {}).get("login",""))]))
 ')
     if [ "$rbranch" != "$branch" ]; then
       DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · PR #${prnum} no longer maps to ${branch}${C_RESET}"
+      render
+      continue
+    fi
+    # SAFETY-CRITICAL defense-in-depth: re-confirm ownership on FRESH author data in the instant
+    # before merging. Even if a teammate's PR reached this candidate path (a classification race, or
+    # an author that resolved only just now), the scope gate blocks the auto-merge here — never
+    # blind-merge a PR the operator does not own.
+    if ! _scope_permits_automerge "$rauthor"; then
+      DISPLAY[idx]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${rauthor:-unknown})${C_RESET}"
       render
       continue
     fi
