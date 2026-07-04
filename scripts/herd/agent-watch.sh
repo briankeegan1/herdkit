@@ -119,6 +119,15 @@ APPROVALS="$TREES/.agent-watch-approvals"
 # observation. A grown transcript between polls is a liveness signal that vetoes a would-be stall
 # warning; see the "Builder liveness" helpers below.
 TRANSCRIPT_STATE="$TREES/.agent-watch-transcript"
+# Dead-builder ledger for the pre-PR liveness reconciliation: one line per active worktree slug that
+# is currently exhibiting the DEAD signature — worktree present, NO live agent in `herdr agent list`,
+# NO open PR, no recent transcript growth. Format "<slug> <first-seen-epoch> <state>", state ∈
+# pending | notified. <first-seen-epoch> is when the watcher FIRST observed the signature; the slug is
+# only surfaced as 💀 DEAD once it has PERSISTED past a grace window (so a just-spawned builder whose
+# agent has not registered yet, or a one-tick blip in `herdr agent list`, is never falsely reaped).
+# Any liveness signal (agent reappears, PR opens, transcript grows) clears the record. See the
+# "Dead-builder detection" helpers below.
+DEAD_STATE="$TREES/.agent-watch-dead"
 # Healthcheck ledger, PARALLEL to the review ledgers: one line per healthcheck ATTEMPT
 # ("<epoch> <pr#> <slug> <attempt> <outcome>"), outcome ∈ clean | dataenv | code-error | flaky-pass.
 # This is the healthcheck analogue of $REVIEW_STATE — an append-only provenance record so a red row
@@ -1520,6 +1529,127 @@ _classify_builder() {
   printf 'BUILDING'
 }
 
+# ── Dead-builder detection (pre-PR liveness reconciliation) ──────────────────────────────────────
+# The stall ladder above only classifies a builder that is WORKING-but-not-progressing, and
+# _sweep_orphan_tabs only reaps a tab whose worktree is GONE. Neither catches a builder whose agent
+# has VANISHED from `herdr agent list` while its worktree STILL EXISTS and it opened NO PR — a
+# silently-DEAD pre-PR builder (REAL INCIDENT 2026-07-03: a spawned builder's agent exited, its pane
+# was destroyed, it made no commits and opened no PR, and nothing surfaced it until a human noticed
+# the empty tab).
+#
+# This reconciliation cross-checks, per active feature worktree slug: {is there a live agent record?
+# is there an open PR? recent transcript growth?} and classifies DEAD only when the FULL signature
+# holds (worktree present + NO live agent + NO open PR + no transcript growth) AND has PERSISTED past
+# a grace window. Detection + LOUD surfacing ONLY — it never auto-respawns (uncommitted-work and
+# respawn-loop edge cases are a noted follow-up); it paints a distinct 💀 row + fires one notification.
+#
+# FALSE-POSITIVE GUARDS: a present agent record (ANY status — the agent is still listed) is a
+# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; an open PR is a
+# liveness signal (a builder that legitimately opened its PR is ALIVE); a growing transcript vetoes
+# death; and the grace window + cross-tick persistence keep a just-spawned builder (agent not yet
+# registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
+
+# _dead_grace_secs — how long the DEAD signature must persist before a slug is surfaced as dead.
+# Configurable via DEAD_GRACE_MIN (minutes); non-numeric/unset falls back to 2 minutes — long enough
+# to cover a slow spawn-to-agent-register gap, short enough that a real death surfaces promptly.
+_dead_grace_secs() {
+  case "${DEAD_GRACE_MIN:-}" in
+    ''|*[!0-9]*) printf '%s' 120 ;;
+    *)           printf '%s' $(( DEAD_GRACE_MIN * 60 )) ;;
+  esac
+}
+
+# dead_first_seen <slug> — echo the recorded first-seen epoch for this slug's DEAD signature, or
+# nothing when there is no active record.
+dead_first_seen() {
+  [ -s "$DEAD_STATE" ] || return 0
+  awk -v s="$1" '$1==s{f=$2} END{if(f!="")print f}' "$DEAD_STATE" 2>/dev/null || true
+}
+# dead_notified <slug> — true iff a 💀 notification has already fired for this slug's current record
+# (dedup guard, so a persistently-dead builder notifies exactly once, not every tick).
+dead_notified() {
+  [ -s "$DEAD_STATE" ] || return 1
+  local st; st="$(awk -v s="$1" '$1==s{st=$3} END{print st}' "$DEAD_STATE" 2>/dev/null)"
+  [ "$st" = "notified" ]
+}
+# _dead_upsert <slug> <first-seen> <state> — drop any prior line for this slug, append the fresh one
+# (temp+mv), mirroring record_limit's upsert.
+_dead_upsert() {
+  local _du_tmp="${DEAD_STATE}.$$"
+  { [ -f "$DEAD_STATE" ] && grep -v "^$1 " "$DEAD_STATE" 2>/dev/null
+    printf '%s %s %s\n' "$1" "$2" "$3"
+  } > "$_du_tmp" 2>/dev/null && mv "$_du_tmp" "$DEAD_STATE" 2>/dev/null || rm -f "$_du_tmp" 2>/dev/null
+}
+# record_dead_seen <slug> <epoch> — first sighting of the signature: record the anchor epoch, pending.
+record_dead_seen() { _dead_upsert "$1" "$2" pending; }
+# record_dead_notified <slug> — flip the record to notified, PRESERVING its original first-seen epoch.
+record_dead_notified() { local _rn_f; _rn_f="$(dead_first_seen "$1")"; _dead_upsert "$1" "${_rn_f:-$(_now)}" notified; }
+# clear_dead <slug> — drop the slug's record (a liveness signal returned; it is no longer dead).
+clear_dead() {
+  [ -s "$DEAD_STATE" ] || return 0
+  local _cd_tmp="${DEAD_STATE}.$$"
+  grep -v "^$1 " "$DEAD_STATE" 2>/dev/null > "$_cd_tmp"
+  mv "$_cd_tmp" "$DEAD_STATE" 2>/dev/null || rm -f "$_cd_tmp" 2>/dev/null
+}
+
+# _classify_dead_builder <has-agent> <has-pr> <transcript-growing> <first-seen> <now> <grace> — the
+# pure verdict for a PR-less builder. Echoes exactly one token:
+#   ALIVE   — a liveness signal is present (live agent record, open PR, OR growing transcript) ⇒
+#             not dead; the caller clears any record
+#   PENDING — the full DEAD signature holds but has NOT yet persisted past <grace> (no prior
+#             first-seen, or now - first-seen < grace) ⇒ hold, do not surface yet
+#   DEAD    — the DEAD signature has held continuously past the grace window ⇒ surface 💀 + notify
+# <has-agent>/<has-pr> are "1"/"0"; <transcript-growing> is yes|no|unknown (only "yes" is a signal);
+# <first-seen> is the recorded anchor epoch (empty when the signature is being seen for the first time).
+_classify_dead_builder() {
+  local has_agent="${1:-0}" has_pr="${2:-0}" tgrow="$3" first_seen="$4" now="${5:-0}" grace="${6:-0}"
+  # Any positive liveness signal ⇒ NOT a dead builder.
+  if [ "$has_agent" = "1" ] || [ "$has_pr" = "1" ] || [ "$tgrow" = "yes" ]; then
+    printf 'ALIVE'; return 0
+  fi
+  # Full dead signature. Require it to persist past the grace window before surfacing, so a just-
+  # spawned builder whose agent has not registered yet — or a one-tick blip — is held as PENDING.
+  if [ -z "$first_seen" ] || [ "$(( now - first_seen ))" -lt "$grace" ]; then
+    printf 'PENDING'; return 0
+  fi
+  printf 'DEAD'
+}
+
+# _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
+# PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD). Called from the tick's
+# no-PR/non-working branch: an EMPTY agent-status means the slug has NO agent record at all (the dead
+# signature); a non-empty status means the agent is still listed (idle/done) and therefore alive.
+# has_pr is 0 here by construction (the caller only reaches this on a PR-less slug). Records the
+# first-seen anchor on the first sighting, clears it the instant any liveness signal returns, and
+# fires exactly one 💀 notification (+ journal event) when a slug crosses into DEAD.
+_reconcile_dead_builder() {
+  local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3"
+  local _rd_now _rd_grace _rd_has_agent _rd_tgrow _rd_first _rd_verdict
+  _rd_now="$(_now)"
+  _rd_grace="$(_dead_grace_secs)"
+  # A present agent record (any status) means the agent is still listed ⇒ alive.
+  [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
+  # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
+  # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
+  _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
+  _rd_first="$(dead_first_seen "$_rd_slug")"
+  _rd_verdict="$(_classify_dead_builder "$_rd_has_agent" 0 "$_rd_tgrow" "${_rd_first:-}" "$_rd_now" "$_rd_grace")"
+  case "$_rd_verdict" in
+    ALIVE)
+      [ -n "$_rd_first" ] && clear_dead "$_rd_slug" ;;
+    PENDING)
+      [ -n "$_rd_first" ] || record_dead_seen "$_rd_slug" "$_rd_now" ;;
+    DEAD)
+      if ! dead_notified "$_rd_slug"; then
+        record_dead_notified "$_rd_slug"
+        journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}"
+        herdr notification show "💀 builder died: ${_rd_slug}" \
+          --body "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" --sound default >/dev/null 2>&1 || true
+      fi ;;
+  esac
+  printf '%s' "$_rd_verdict"
+}
+
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
 # WHY: every feature worktree shares ONE git object store and one .git/worktrees lock namespace, so
 # two full healthcheck suites running at once race on shared git locks (empirically: concurrent
@@ -2074,7 +2204,17 @@ EOF
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
         else
-          DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+          # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
+          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list while
+          # its worktree lives on with no PR. astatus is EMPTY only when the slug has NO agent record
+          # at all — the dead signature; a present-but-idle agent keeps a non-empty status. Surface a
+          # persistently-dead builder LOUDLY (💀 + notification) so it is never silently lost.
+          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus")" in
+            DEAD)
+              DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}" ;;
+            *)
+              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}" ;;
+          esac
         fi
       else
         # A working agent means any earlier limit hold has cleared (a human intervened, or the
