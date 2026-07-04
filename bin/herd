@@ -42,6 +42,12 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh"
 
+# Cost summer/reader helpers (transcript-token pricing). Defines functions + constants only, sourced
+# AFTER journal.sh (its documented order); gives cmd_cost the `herd cost --full` live-scan readers
+# (_cost_transcript_dir + cost_report_full). No side effects at source time.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/cost.sh" ] && . "$SCRIPTS_DIR/cost.sh"
+
 # Shared EYES-ON-LAYOUT helper: pane classification (_reload_pane_role/_reload_tab_panes/
 # _reload_tab_by_label), the layout_snapshot scan, layout_reconcile, and the single .herd-panes
 # registry writer. Defines functions only; every pane-mutating path observes the live layout
@@ -2823,24 +2829,42 @@ for o in rows:
 # one PR's cost lines. The denominator for cost-per-merged-PR is the set of PRs with a builder cost
 # event (a builder cost is emitted only at merge, so those PRs merged).
 cmd_cost() {
-  local pr=""
+  local pr="" full=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --pr)   pr="${2:-}"; [ -n "$pr" ] || die "--pr requires a PR number"; shift 2 ;;
       --pr=*) pr="${1#--pr=}"; shift ;;
-      *) die "usage: herd cost [--pr N]" ;;
+      --full) full=1; shift ;;
+      *) die "usage: herd cost [--pr N] [--full]" ;;
     esac
   done
   case "$pr" in \#*) pr="${pr#\#}" ;; esac
   [ -z "$pr" ] || [ -z "${pr//[0-9]/}" ] || die "herd cost: --pr must be a number (got '$pr')"
+  # --pr drills into one PR's merge-recorded lines; the coordinator/scribe/researcher have no PR, so
+  # --full only augments the full rollup. Ignore --full silently when --pr is given.
+  [ -n "$pr" ] && full=0
   _journal_load_config
+  # `herd cost --full`: ALSO scan the live transcripts of the long-lived session agents (coordinator,
+  # scribe, researcher). All three run with --cwd $PROJECT_ROOT, so they share MAIN's munged
+  # transcript dir. A missing dir is skipped with a note rather than an error.
+  local full_lines="" full_note=""
+  if [ "$full" -eq 1 ]; then
+    local maindir; maindir="$(_cost_transcript_dir "$PROJECT_ROOT")"
+    if [ -d "$maindir" ]; then
+      full_lines="$(cost_report_full "$maindir")"
+      [ -n "$full_lines" ] || full_note="no coordinator/scribe/researcher transcript found in $maindir — nothing to add"
+    else
+      full_note="no transcript dir at $maindir — coordinator/scribe/researcher scan skipped"
+    fi
+  fi
   local files; files="$(_journal_all_files)"
-  if [ -z "$files" ]; then
+  if [ -z "$files" ] && [ "$full" -ne 1 ]; then
     say "no engine journal yet at ${c_dim}$WORKTREES_DIR/.herd/journal.jsonl${c_rst}"
     say "  (the watcher writes cost events at merge time — none recorded yet)"
     return 0
   fi
-  printf '%s\n' "$files" | HERD_COST_PR="$pr" python3 -c '
+  printf '%s\n' "$files" | HERD_COST_PR="$pr" HERD_COST_FULL="$full" \
+    HERD_COST_FULL_LINES="$full_lines" HERD_COST_FULL_NOTE="$full_note" python3 -c '
 import sys, os, json
 want_pr = os.environ.get("HERD_COST_PR", "")
 rows = []
@@ -2871,6 +2895,47 @@ def fnum(v):
     except (TypeError, ValueError):
         return 0.0
 
+# `herd cost --full` augmentation: the live-scanned coordinator/scribe/researcher spend, passed in
+# as pre-formatted "component=.. model=.. in=.. .. usd=.. msgs=.." lines from cost_report_full. This
+# section is APPENDED to the merge-recorded rollup and never alters it, so default `herd cost`
+# (FULL != "1") is byte-for-byte unchanged.
+FULL = os.environ.get("HERD_COST_FULL", "") == "1"
+FULL_LINES = os.environ.get("HERD_COST_FULL_LINES", "")
+FULL_NOTE = os.environ.get("HERD_COST_FULL_NOTE", "")
+
+def _parse_kv_lines(s):
+    out = []
+    for line in s.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        d = {}
+        for kv in line.split():
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                d[k] = v
+        if d.get("component"):
+            out.append(d)
+    return out
+
+def print_full_section(base_usd):
+    # base_usd = the merge-recorded (builder+review) total; the session total sums it with the
+    # live-scanned agents so the operator sees a COMPLETE session figure, not just per-PR spend.
+    print("")
+    print("Live session agents (herd cost --full — scanned live from transcripts):")
+    agents = _parse_kv_lines(FULL_LINES)
+    extra = 0.0
+    if not agents:
+        print("  %s" % (FULL_NOTE or "no coordinator/scribe/researcher transcript found — nothing to add"))
+    else:
+        for d in agents:
+            usd = fnum(d.get("usd")); extra += usd
+            print("  %-11s %-18s $%9.4f  (in %s out %s cache_r %s cache_w %s · %s msgs)" % (
+                d.get("component", "?"), d.get("model", "?"), usd,
+                d.get("in", "0"), d.get("out", "0"), d.get("cache_read", "0"), d.get("cache_write", "0"), d.get("msgs", "0")))
+    print("")
+    print("Session total (builder+review+coordinator+scribe+researcher): $%.4f" % (base_usd + extra))
+
 if want_pr:
     rows = [o for o in rows if str(o.get("pr", "")) == want_pr]
 
@@ -2880,6 +2945,8 @@ if not rows:
     else:
         print("No cost events recorded yet.")
         print("  (the watcher journals a `cost` event for each builder at merge time)")
+        if FULL:
+            print_full_section(0.0)
     sys.exit(0)
 
 if want_pr:
@@ -2932,6 +2999,8 @@ print("Total spend recorded:   $%.4f" % grand)
 print("Merged PRs (billed):     %d" % len(merged))
 if merged:
     print("Cost per merged PR:      $%.4f" % (grand / len(merged)))
+if FULL:
+    print_full_section(grand)
 '
 }
 
@@ -3028,9 +3097,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
-  herd cost [--pr N]                  aggregate the journal's token/cost events (measured per builder
+  herd cost [--pr N] [--full]         aggregate the journal's token/cost events (measured per builder
                                       + review at merge time): per-PR cost, cost-per-merged-PR, and
                                       running totals by component + model; --pr N drills into one PR.
+                                      --full ALSO scans the live coordinator/scribe/researcher
+                                      transcripts and appends their token/USD + a complete session
+                                      total (the default view stays merge-gated + unchanged).
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
   herd backlog                        list open work items via the active backend
   herd report [--to <link>] [--dep]   file a report on HERD_REPO (or a peer from .herd/links

@@ -196,4 +196,89 @@ empty_out="$(cd "$EMPTYP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost 2>&1)";
 printf '%s\n' "$empty_out" | grep -q 'no engine journal yet' || fail "herd cost: empty case should say so\n$empty_out"
 ok
 
+# ── (7) `herd cost --full` ALSO scans the live coordinator/scribe/researcher transcripts ──
+# The coordinator, scribe, and researcher all run with --cwd $PROJECT_ROOT, so their sessions share
+# MAIN's munged transcript dir (unlike builders/reviews, which run from worktrees). --full scans that
+# dir, classifies each session by its first user message, and appends the session-agent spend + a
+# complete session total — WITHOUT changing the default (merge-gated) view. Round prices again so the
+# scanned USD is exact.
+export HERD_COST_PRICE_FILE="$PRICES"                 # opus: $10/1M in, $100/1M out
+FPROJ="$T/fproj"; FTREES="$T/ftrees"
+mkdir -p "$FPROJ/.herd" "$FTREES/.herd"
+cat > "$FPROJ/.herd/config" <<CFG
+PROJECT_ROOT="$FPROJ"
+WORKTREES_DIR="$FTREES"
+WORKSPACE_NAME="ctest3"
+CFG
+# One merge-recorded builder cost ($110) so the default rollup is non-empty and comparable.
+cat > "$FTREES/.herd/journal.jsonl" <<'JNL'
+{"ts":"2026-07-04T09:00:00Z","event":"cost","component":"builder","pr":50,"slug":"slug50","model":"claude-opus-4-8","in":1000000,"out":1000000,"cache_read":0,"cache_write":0,"usd":"110.000000","msgs":2}
+JNL
+# MAIN transcript dir = HERD_TRANSCRIPT_ROOT/<munged PROJECT_ROOT>, matching _cost_transcript_dir.
+FROOT="$T/froot"; FMUNGED="$(printf '%s' "$FPROJ" | tr '/.' '-')"; FMDIR="$FROOT/$FMUNGED"
+mkdir -p "$FMDIR"
+# Coordinator: slash-command first message; out 200000 → $20.
+cat > "$FMDIR/coord.jsonl" <<'JNL'
+{"type":"user","message":{"role":"user","content":"<command-message>coordinator</command-message> <command-name>/coordinator</command-name>"}}
+{"type":"assistant","message":{"role":"assistant","id":"c1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":200000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+JNL
+# Scribe: drainer first message; out 100000 → $10.
+cat > "$FMDIR/scribe.jsonl" <<'JNL'
+{"type":"user","message":{"role":"user","content":"You are the BACKLOG SCRIBE (queue drainer). Drain the backlog queue, one request at a time."}}
+{"type":"assistant","message":{"role":"assistant","id":"sc1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":100000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+JNL
+# A review that fell back to MAIN, and an unrelated manual session — BOTH must be SKIPPED (each has a
+# huge output that, if miscounted, would blow the session total far past $140).
+cat > "$FMDIR/rev.jsonl" <<'JNL'
+{"type":"user","message":{"role":"user","content":"You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project 'herdkit'."}}
+{"type":"assistant","message":{"role":"assistant","id":"rv1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":9000000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+JNL
+cat > "$FMDIR/manual.jsonl" <<'JNL'
+{"type":"user","message":{"role":"user","content":"hey claude, fix this random thing for me"}}
+{"type":"assistant","message":{"role":"assistant","id":"mn1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":9000000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+JNL
+export HERD_TRANSCRIPT_ROOT="$FROOT"
+
+# 7a. cost_report_full (the pure reader) emits coordinator + scribe, skips review + manual.
+full_report="$(cost_report_full "$FMDIR")"
+printf '%s\n' "$full_report" | grep -qE 'component=coordinator .*out=200000 .*usd=20\.000000' || fail "cost_report_full: coordinator line wrong: $full_report"
+printf '%s\n' "$full_report" | grep -qE 'component=scribe .*out=100000 .*usd=10\.000000' || fail "cost_report_full: scribe line wrong: $full_report"
+printf '%s\n' "$full_report" | grep -q 'component=review' && fail "cost_report_full: must skip the fallback review: $full_report"
+printf '%s\n' "$full_report" | grep -qE 'out=9000000' && fail "cost_report_full: leaked a skipped session's tokens: $full_report"
+ok
+
+# 7b. `herd cost --full` appends the session agents + a complete session total (110+20+10 = 140).
+full_out="$(cd "$FPROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost --full 2>&1)"
+printf '%s\n' "$full_out" | grep -q 'Live session agents' || fail "herd cost --full: missing session-agents section\n$full_out"
+printf '%s\n' "$full_out" | grep -qE 'coordinator +claude-opus-4-8 +\$ *20\.0000' || fail "herd cost --full: coordinator \$20 missing\n$full_out"
+printf '%s\n' "$full_out" | grep -qE 'scribe +claude-opus-4-8 +\$ *10\.0000' || fail "herd cost --full: scribe \$10 missing\n$full_out"
+printf '%s\n' "$full_out" | grep -qE 'Session total .*: +\$140\.0000' || fail "herd cost --full: session total should be 140.0000\n$full_out"
+ok
+# The merge-gated rollup is still present and correct within --full (builder \$110 unchanged).
+printf '%s\n' "$full_out" | grep -qE 'Total spend recorded: +\$110\.0000' || fail "herd cost --full: merge-recorded total should stay 110.0000\n$full_out"
+ok
+
+# 7c. DEFAULT `herd cost` is UNCHANGED — no session section, no session total, no coordinator/scribe.
+def_out="$(cd "$FPROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost 2>&1)"
+printf '%s\n' "$def_out" | grep -q 'Live session agents' && fail "herd cost (default) must NOT scan live transcripts\n$def_out"
+printf '%s\n' "$def_out" | grep -q 'Session total' && fail "herd cost (default) must NOT print a session total\n$def_out"
+printf '%s\n' "$def_out" | grep -qiE 'coordinator|scribe' && fail "herd cost (default) must NOT mention session agents\n$def_out"
+printf '%s\n' "$def_out" | grep -qE 'Total spend recorded: +\$110\.0000' || fail "herd cost (default): total should be 110.0000\n$def_out"
+ok
+
+# 7d. --full with NO transcript dir → a graceful note, still exits 0, still shows the rollup.
+NODIRP="$T/nodir"; mkdir -p "$NODIRP/.herd"
+cat > "$NODIRP/.herd/config" <<CFG
+PROJECT_ROOT="$NODIRP"
+WORKTREES_DIR="$FTREES"
+WORKSPACE_NAME="ctest4"
+CFG
+nod_out="$(cd "$NODIRP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost --full 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] || fail "herd cost --full with no transcript dir should exit 0\n$nod_out"
+printf '%s\n' "$nod_out" | grep -q 'Live session agents' || fail "herd cost --full: section should appear even with no dir\n$nod_out"
+printf '%s\n' "$nod_out" | grep -qiE 'no transcript dir|nothing to add' || fail "herd cost --full: should note the missing/empty scan\n$nod_out"
+printf '%s\n' "$nod_out" | grep -qE 'Session total .*: +\$110\.0000' || fail "herd cost --full: with no agents, session total == merge total\n$nod_out"
+ok
+unset HERD_COST_PRICE_FILE HERD_TRANSCRIPT_ROOT
+
 echo "PASS test-cost.sh ($pass checks)"
