@@ -26,7 +26,7 @@ pattern — not one project's wiring — can be reused, fixed once, and adopted 
 | **research** | `research.sh` / `research-step.sh` / `research-get.sh` | read-only repo research queue. Fan-out Explore subagents, one report file per question; never mutates the repo. |
 | **resolver** | `herd-resolve.sh` | isolated, test-gated conflict resolver for a CONFLICTING PR. Merges the default branch in, fixes **mechanical** conflicts, verifies, pushes — or aborts and **`ESCALATE:`**s a semantically-ambiguous one. Never blind-merges. |
 | **review** | `herd-review.sh` | adversarial pre-merge correctness gate (a strong model, default-to-BLOCK). Reads the PR diff against the project's `REVIEW_CHECKLIST` and prints one machine-parseable verdict: `REVIEW: PASS` / `REVIEW: BLOCK — …`. |
-| **watcher** | `agent-watch.sh` / `herd-watch.sh` | the live status console + auto-merge state machine. Merges only a PR that is MERGEABLE+CLEAN, healthcheck-green, **and** review-PASSed — re-verifying in the instant before merge. Owns teardown after a merge. Safety-railed and idempotent. |
+| **watcher** | `agent-watch.sh` / `herd-watch.sh` | the live status console + auto-merge state machine. Merges only a PR that is MERGEABLE+CLEAN, healthcheck-green, **and** review-PASSed — re-verifying in the instant before merge. Owns teardown after a merge. Also surfaces **dead builders** (a worktree whose agent vanished with no PR) and auto-resumes builders paused on the account usage limit. Safety-railed and idempotent. |
 
 Two threads run through the whole pipeline: an append-only **engine journal**
 (`.herd/journal.jsonl`) records every gate event as a forensic trail — read it back with `herd why`
@@ -34,6 +34,11 @@ and `herd log` — and the watcher's review gate can **auto-bounce a BLOCK back 
 and push (the refix loop), so a failed review re-tasks itself instead of stalling.
 
 The engine is **generic**; everything project-specific is read from a per-project `.herd/config`.
+
+> **Looking for the full command + config reference?** See
+> [`docs/capabilities-overview.md`](docs/capabilities-overview.md) — a concise map of every `herd`
+> subcommand and the key `.herd/config` levers, cross-referencing `templates/capabilities.tsv` as
+> the machine-readable source of truth.
 
 ---
 
@@ -79,10 +84,12 @@ cd ~/source/myproject
 herd init          # interviews + scouts the repo, writes .herd/config, renders the skill
 ```
 
-`herd init` **scouts** the repo (language/build, CI, branch protection, existing trackers), runs
-the **work-tracker discovery dialogue** (detects `BACKLOG.md` / `TODO.md` / `CHANGELOG` / GitHub
-Issues; asks whether you use Linear/Jira/DevOps — those are *coming soon*, v1 ships file backends),
-then writes:
+`herd init` **scouts** the repo (language/build, CI, branch protection, existing trackers) — and is
+**stack-aware**: it detects the language (node / python / go / rust / java) and seeds
+`.herd/healthcheck.project.sh` from the matching template, leaving non-Python repos free of
+Python-shaped defaults. It runs the **work-tracker discovery dialogue** (detects `BACKLOG.md` /
+`TODO.md` / `CHANGELOG` / GitHub Issues; asks whether you use Linear/Jira/DevOps — those are
+*coming soon*, v1 ships file backends), then writes:
 
 - **`.herd/config`** — your project's answers (paths, default branch, model map, health/preview
   commands, privacy paths, routing). Committed; **zero-secret**.
@@ -107,11 +114,23 @@ herd doctor                  # one-pass dependency doctor (git, gh, claude, pyth
 herd backlog                 # list open work items via the active backend (see below)
 herd report "<symptom + lane>"   # file an engine bug as a gh issue on HERD_REPO (see below)
 
+# Inspect / change a workflow preference post-init (validated against capabilities.tsv):
+herd config list             # print effective keys + values (secrets masked)
+herd config get <KEY>        # print one validated key's value
+herd config set <KEY> <VAL>  # edit in place, then restart the watcher / re-render the skill
+herd config lint             # flag DUPLICATE keys (shell last-wins can silently disable a gate)
+
 # Forensics — read the append-only engine journal (.herd/journal.jsonl):
 herd log [--pr N] [--tail]   # page the journal: one line per gate event; --tail follows live
 herd why <pr#>               # summarize one PR's full gate history — the first post-mortem tool
 herd cost [--pr N]           # per-builder + review token/$ accounting; cost-per-merged-PR
 herd link list               # list peer repos registered in .herd/links
+
+# Manage several herd projects at once — deterministic, no-LLM fan-out (see below):
+herd fleet status            # per-project rollup: branch, open PRs, watcher alive?, last activity
+herd fleet inbox             # cross-project attention inbox: what needs you right now
+herd fleet digest [--since D]  # cross-project standup from each project's journal
+herd fleet set <KEY> <VAL>   # propagate one policy across the fleet (validated per project)
 
 # Sign off held PRs (MERGE_POLICY=approve or a HUMAN-VERIFY hold):
 bash scripts/herd/herd-approve.sh list           # gate-passed PRs awaiting approval
@@ -171,6 +190,51 @@ builder: the watcher wakes the builder's idle agent with a re-task prompt to fix
 gate cycle re-runs on the new commit. This is bounded by **`REFIX_MAX_ROUNDS`** (default 3) bounces
 per PR — after which it escalates to `needs you`. When `REVIEW_AUTOFIX=false` (default), a BLOCK just
 shows the standard `review blocked` row for the coordinator to re-task by hand.
+
+### Catch a BLOCK before the PR opens — `LOCAL_REVIEW=pre-pr`
+
+By default (`LOCAL_REVIEW=none`) correctness review happens once, post-PR, in the watcher's gate.
+Set **`LOCAL_REVIEW=pre-pr`** and the builder *also* runs an adversarial `herd-review.sh --local`
+pass against its own worktree diff **before** opening the PR, and must reach `REVIEW: PASS` first —
+fixing any BLOCK locally instead of surfacing it as a public gate failure. The post-PR gate still
+runs (belt-and-suspenders), so this shifts a class of BLOCK left without weakening the merge gate.
+
+### Team mode — `WATCHER_SCOPE` (opt-in)
+
+A solo install auto-merges the operator's own PRs, exactly as before (`WATCHER_SCOPE=mine`, the
+default). On a **shared** repo, set **`WATCHER_SCOPE=all`**: teammates' PRs are *displayed* but
+auto-merge is strictly scoped to PRs owned by **`WATCHER_OWNER`** — a teammate's PR shows
+`not mine — manual` and is never auto-merged, even when MERGEABLE+CLEAN+approved. It is a
+**narrowing** gate: it can only ever *withhold* a merge, never authorize one the gates would deny,
+and it fails closed (an unresolvable owner withholds auto-merge). Pairs with the `WATCHER_VIEW` lens
+(`all` / `mine` / `review-queue` / `deps`), which narrows *which* PRs the console even displays.
+
+---
+
+## Manage several projects — `herd fleet`
+
+`herd fleet` is a **deterministic, no-LLM** fan-out over a flat project registry (default
+`~/.herd/fleet`), for running one herd install across many repos at once:
+
+```sh
+herd fleet register <path>       # add a herd project to the registry
+herd fleet status                # per-project rollup: branch, open PRs, watcher alive?, last activity
+herd fleet inbox                 # attention inbox: blocked PRs, holds, conflicts, failed gates — per repo
+herd fleet digest [--since 24h]  # cross-project standup built from each project's journal
+herd fleet governance            # global concurrency: total in-flight builders + reviews (limit is account-wide)
+herd fleet set MERGE_POLICY auto # propagate one policy across the fleet (validated per project)
+herd fleet upgrade | reload      # run 'herd update' / 'herd reload' in every registered project
+```
+
+It never mutates a project's tree beyond what the delegated per-project command already does; a
+missing / dirty / `gh`-unavailable project is reported, not fatal.
+
+> **Experimental / in progress — coordinator auto-resume + watchdog.** The watcher already
+> auto-resumes *builders* paused on the account usage limit, but the **coordinator** itself has no
+> watchdog: if it hits the limit unattended it parks at Claude's interactive menu with nothing to
+> revive it. A watchdog to close that seam is **in progress**, intended to land dormant behind a
+> **default-off, opt-in `COORDINATOR_WATCHDOG` flag**. It is **not yet wired in the current
+> engine** — roadmap, not a lever you can set today (tracked in `BACKLOG.md`).
 
 ---
 
@@ -254,14 +318,15 @@ API backends read credentials from `.herd/secrets` (gitignored); the file backen
 ## Layout
 
 ```
-bin/herd                       the CLI (init / upgrade / report / render)
+bin/herd                       the CLI (init / doctor / upgrade / config / fleet / report / …)
 scripts/herd/                   the generic engine (sources .herd/config via herd-config.sh)
   coordinator.sh  herd-feature.sh  herd-quick.sh  new-feature.sh
   scribe.sh  scribe-step.sh  research.sh  research-step.sh  research-get.sh
-  healthcheck.sh  app-monitor.sh  backlog-view.sh
+  healthcheck.sh  app-monitor.sh  backlog-view.sh  dep-watcher.sh  fleet.sh
   herd-resolve.sh  herd-review.sh  agent-watch.sh  herd-watch.sh
   backends/{file,changelog}.sh  the work-tracker adapters
-templates/                      coordinator.md.tmpl, config.example, healthcheck examples
+templates/                      coordinator.md.tmpl, config.example, capabilities.tsv, healthcheck examples
+docs/                           reference + research docs (capabilities-overview.md, …)
 tests/                          hermetic shell tests + a bats wrapper
 .herd/                          herdkit's OWN dogfood config + healthcheck + review checklist
 ```
