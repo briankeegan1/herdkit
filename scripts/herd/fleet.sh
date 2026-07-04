@@ -92,10 +92,14 @@ _fleet_repo_slug() {
   p="${p##*://}"           # strip a scheme:// prefix (https://, ssh://, git://)
   p="${p#*@}"              # strip a user@ prefix (git@…)
   p="${p/:/\/}"            # scp-form host:owner → host/owner (first ':' only)
+  # Require an owner segment: a slash must separate owner from repo. A single-segment URL (a bare
+  # `myrepo` with no owner) is rejected here — NOT via owner==repo, which would wrongly blank valid
+  # matching-name slugs like eslint/eslint or prettier/prettier (issue #128 review).
+  case "$p" in */*) ;; *) return 0 ;; esac
   repo="${p##*/}"          # last path segment is the repo
   p="${p%/*}"              # …strip it, leaving …/owner (host, if any, precedes owner)
   owner="${p##*/}"         # the segment before the repo is the owner (host drops away)
-  [ -n "$owner" ] && [ -n "$repo" ] && [ "$owner" != "$repo" ] && printf '%s/%s' "$owner" "$repo"
+  [ -n "$owner" ] && [ -n "$repo" ] && printf '%s/%s' "$owner" "$repo"
 }
 
 # ── register / list / discover ───────────────────────────────────────────────

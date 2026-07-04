@@ -225,6 +225,30 @@ grep -q "^alpha|$ALPHA|acme/alpha$" "$REG14" \
 grep -q "caller/elsewhere" "$REG14" && fail "caller's cwd remote leaked into the registry (issue #128)"
 ok
 
+# ── 14b. issue #128 review: an owner==repo slug (eslint/eslint) must NOT be blanked ──────────────
+SAME="$T/proj/samename"
+mkdir -p "$SAME/.herd" "$T/proj/samename-trees/.herd"
+git -C "$SAME" init -q
+git -C "$SAME" config user.email t@t.t
+git -C "$SAME" config user.name t
+git -C "$SAME" remote add origin "git@github.com:eslint/eslint.git"   # owner and repo names identical
+( cd "$SAME" && git commit -q --allow-empty -m init )
+same_real="$(cd "$SAME" && pwd -P)"
+cat > "$SAME/.herd/config" <<CFG
+PROJECT_ROOT="$same_real"
+WORKTREES_DIR="$same_real-trees"
+DEFAULT_BRANCH="origin/main"
+WORKSPACE_NAME="samename"
+HERD_REPO="me/samename"
+CFG
+REG14B="$T/registry14b/fleet"
+note14b="$(HERD_FLEET_FILE="$REG14B" bash "$HERD" fleet register "$same_real" 2>&1 >/dev/null)"
+grep -q "^samename|$same_real|eslint/eslint$" "$REG14B" \
+  || fail "owner==repo slug must record eslint/eslint, got: $(grep '^samename|' "$REG14B" || true)"
+printf '%s' "$note14b" | grep -qi "no parseable origin remote" \
+  && fail "owner==repo slug must NOT emit the 'no parseable origin remote' note, got: $note14b"
+ok
+
 # ── 15. a remote-less target records an empty repo field + emits a note ──────────────────────────
 NOREMOTE="$T/proj/noremote"
 mkdir -p "$NOREMOTE/.herd" "$T/proj/noremote-trees/.herd"
