@@ -73,6 +73,37 @@ _fleet_each() {
   [ "$seen" -eq 1 ]
 }
 
+# _fleet_repo_slug <target-path> — resolve owner/repo from the TARGET path's OWN `origin` remote,
+# ALWAYS via `git -C "$target"` so it reads the registered tree's remote and never the caller's cwd
+# remote (issue #128: registering project B from inside project A's checkout must record B's repo).
+# Normalizes the common git URL forms — scp-form `git@host:owner/repo.git`, `ssh://…`, `https://…`,
+# `git://…` — down to `owner/repo`, mirroring bin/herd's _gh_repo_slug stripping. Prints EMPTY (and
+# the caller records an empty field + a note) when the target has no origin remote, git is absent, or
+# the URL cannot be parsed into an owner/repo pair. This is a repo IDENTITY (the project's own code
+# repo), distinct from the config's HERD_REPO (where ENGINE bugs escalate — herdkit for every project,
+# which is exactly what used to leak into every registry row).
+_fleet_repo_slug() {
+  local path="$1" url p owner repo
+  command -v git >/dev/null 2>&1 || return 0
+  url="$(git -C "$path" remote get-url origin 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  p="${url%.git}"          # drop a trailing .git
+  p="${p%/}"               # drop a trailing slash
+  p="${p##*://}"           # strip a scheme:// prefix (https://, ssh://, git://)
+  p="${p#*@}"              # strip a user@ prefix (git@…)
+  p="${p/://}"             # scp-form host:owner → host/owner (first ':' only). NB: the replacement is
+                           # a bare '/', NOT '\/' — bash keeps the backslash verbatim in ${v/p/repl},
+                           # which would corrupt a bare-SSH slug (git@host:proj → host\/proj).
+  # Require an owner segment: a slash must separate owner from repo. A single-segment URL (a bare
+  # `myrepo` with no owner) is rejected here — NOT via owner==repo, which would wrongly blank valid
+  # matching-name slugs like eslint/eslint or prettier/prettier (issue #128 review).
+  case "$p" in */*) ;; *) return 0 ;; esac
+  repo="${p##*/}"          # last path segment is the repo
+  p="${p%/*}"              # …strip it, leaving …/owner (host, if any, precedes owner)
+  owner="${p##*/}"         # the segment before the repo is the owner (host drops away)
+  [ -n "$owner" ] && [ -n "$repo" ] && printf '%s/%s' "$owner" "$repo"
+}
+
 # ── register / list / discover ───────────────────────────────────────────────
 
 # fleet_register <path> — resolve <path>, read its .herd/config, and append (or refresh) its
@@ -89,9 +120,12 @@ fleet_register() {
   local name repo pr
   name="$(_fleet_sanitize "$(printf '%s' "$row" | cut -f1)")"
   pr="$(printf '%s' "$row" | cut -f2)"       # resolved PROJECT_ROOT — canonical registry path
-  repo="$(_fleet_sanitize "$(printf '%s' "$row" | cut -f5)")"
   [ -n "$pr" ] && path="$pr"
   path="$(_fleet_sanitize "$path")"
+  # Repo IDENTITY comes from the TARGET tree's own origin remote (issue #128) — NOT the config's
+  # HERD_REPO (that is the engine-escalation repo, herdkit for every project) and NOT the caller's cwd.
+  repo="$(_fleet_sanitize "$(_fleet_repo_slug "$path")")"
+  [ -n "$repo" ] || warn "no parseable origin remote at $path — registered with an empty repo field"
 
   local reg; reg="$(_fleet_registry_file)"
   mkdir -p "$(dirname "$reg")" 2>/dev/null || die "cannot create registry dir: $(dirname "$reg")"
@@ -211,7 +245,9 @@ fleet_discover() {
       local name repo
       name="$(printf '%s' "$row" | cut -f1)"
       proj="$(printf '%s' "$row" | cut -f2)"
-      repo="$(printf '%s' "$row" | cut -f5)"
+      # Same repo-identity source as register: the project's OWN origin remote (issue #128), so the
+      # discover table's REPO column matches what --register would store — never the config's HERD_REPO.
+      repo="$(_fleet_repo_slug "$proj")"
       found=$((found+1))
 
       local status
