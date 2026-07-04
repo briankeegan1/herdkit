@@ -148,6 +148,16 @@ esac
 : "${SCRIBE_BACKEND:="file"}"
 : "${SHARE_LINKS:=""}"            # dirs symlinked into each worktree (e.g. "data .venv")
 
+# BACKLOG_VIEW_EXTRAS — view-only backlog-pane extra section. Default "" (off) → the pane output is
+# byte-identical to before. Set "github-issues" and the backlog viewer renders a SECOND, clearly
+# labeled '📥 incoming (github issues)' section BENEATH the primary work queue, listing this repo's
+# open GitHub issues (the herd-report inbox). Strictly ADDITIVE display: it never merges into the
+# primary list and never feeds `herd backlog` or work-selection — SCRIBE_BACKEND stays the single
+# source of truth. Defaulted here so every path that sources viewer config (render/reload, the
+# viewer itself under `set -u`) sees it. Applied on the backlog pane's next launch (herd pane
+# backlog / herd reload).
+: "${BACKLOG_VIEW_EXTRAS:=""}"
+
 # ── Model tier defaults — TOKEN_MODE-aware ───────────────────────────────────
 # TOKEN_MODE (standard [default] | eco) flips the BUILT-IN model defaults to cheaper tiers.
 #
