@@ -269,6 +269,77 @@ _herd_doctor_recommend() {
   return 1
 }
 
+# _herd_doctor_run_timeout <secs> <cmd> [args...] — run <cmd> under a HARD wall-clock timeout,
+# portable across macOS/Linux. Prefers coreutils `timeout` (GNU/Linux) or `gtimeout` (macOS +
+# coreutils); otherwise falls back to a pure-shell watchdog: background the command, poll up to
+# <secs>, then SIGTERM→SIGKILL. stdout/stderr are suppressed. Returns 124 on timeout (matching
+# coreutils' convention), else the command's own exit code. Every kill/wait/sleep is guarded so the
+# helper can never abort a caller running under `set -e`. This is what stops a quarantined, hung
+# claude (issue #137: com.apple.quarantine makes every exec hang in _dyld_start, `--version`
+# included) from hanging the doctor itself — a timeout is REPORTED instead.
+_herd_doctor_run_timeout() {
+  local secs="$1"; shift
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  # Pure-shell fallback (stock macOS has neither timeout nor gtimeout). It needs a working `sleep` to
+  # enforce the wall-clock bound; if `sleep` is somehow unavailable, degrade to an un-timed direct run
+  # rather than busy-spin into a FALSE timeout. `sleep` is present on every real macOS/Linux (/bin,
+  # /usr/bin), so this degradation only bites an artificially stripped PATH — never a live host.
+  if ! sleep 0 2>/dev/null; then
+    "$@" >/dev/null 2>&1 || rc=$?
+    return "$rc"
+  fi
+  "$@" >/dev/null 2>&1 &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited+1))
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# _herd_doctor_realpath <path> — resolve a symlink chain to its final target WITHOUT `readlink -f`
+# (GNU-only; stock macOS lacks it). Follows the brew shim/symlink chain (e.g.
+# /opt/homebrew/bin/claude → ../Caskroom/claude-code/<ver>/bin/claude) to the real Caskroom binary so
+# the quarantine check below inspects the actual on-disk file, not the shim. Bounded to 40 hops to
+# defuse a symlink loop. Echoes the resolved path (or the input unchanged when it is not a symlink).
+_herd_doctor_realpath() {
+  local p="$1" n=0 target
+  while [ -L "$p" ] && [ "$n" -lt 40 ]; do
+    target="$(readlink "$p" 2>/dev/null)" || break
+    [ -n "$target" ] || break
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+    n=$((n+1))
+  done
+  printf '%s' "$p"
+}
+
+# _herd_doctor_has_quarantine <path> — true when the file carries the com.apple.quarantine xattr,
+# the macOS Gatekeeper flag that (after a `brew upgrade --cask`) hangs every new exec of the binary
+# in _dyld_start (issue #137). Lists xattr names one-per-line and matches the exact attribute name;
+# the caller guards `xattr`'s availability (darwin-only, but present on all macOS).
+_herd_doctor_has_quarantine() {
+  xattr "$1" 2>/dev/null | grep -q '^com\.apple\.quarantine$'
+}
+
 # _herd_doctor_find_config — resolve the project's .herd/config the way herd-config.sh does
 # (HERD_CONFIG_FILE env, else walk up from $PWD). Prints the path, or nothing when no project config
 # is found. No dogfood fallback: if a project has no config there is nothing to lint.
@@ -333,8 +404,50 @@ herd_doctor() {
     warn=$((warn+1))
   fi
 
-  # claude — only needed when a lane spawns a Claude Code agent.
-  _herd_doctor_recommend claude "$os" 'spawn a Claude Code agent in a lane' || warn=$((warn+1))
+  # claude — needed when a lane spawns a Claude Code agent. Beyond mere presence, RUN a probe under a
+  # HARD TIMEOUT: a quarantined binary (com.apple.quarantine after a `brew upgrade --cask`) hangs
+  # EVERY exec in _dyld_start — even `claude --version` never returns — so an un-timed probe would
+  # hang the doctor itself and every spawned builder/scribe sits idle with a blank pane (issue #137).
+  # The timeout turns that hang into a REPORTED failure with a fix. On darwin also xattr-check the
+  # RESOLVED binary (follow the brew shim/symlink chain to the Caskroom target) and print the exact
+  # one-line un-quarantine command. All of this stays in the RECOMMENDED tier (warns, never gates
+  # init) — but a hang/quarantine is surfaced loudly with its remedy.
+  if _herd_doctor_recommend claude "$os" 'spawn a Claude Code agent in a lane'; then
+    local claude_secs="${HERD_DOCTOR_CLAUDE_TIMEOUT:-5}" claude_rc=0
+    if _herd_doctor_run_timeout "$claude_secs" claude --version; then
+      printf '  \xe2\x9c\x93 claude responds (claude --version returned within %ss)\n' "$claude_secs"
+    else
+      claude_rc=$?
+      if [ "$claude_rc" -eq 124 ]; then
+        printf '  \xe2\x9a\xa0 claude HUNG \xe2\x80\x94 `claude --version` did not return within %ss; the binary never finishes starting (hangs in _dyld_start), so spawned agents sit idle with blank panes\n' "$claude_secs"
+        if [ "$os" = darwin ]; then
+          printf '      likely the com.apple.quarantine hang after a `brew upgrade --cask` (issue #137) \xe2\x80\x94 see the quarantine line below for the exact fix\n'
+        else
+          printf '      fix: reinstall/repair the claude binary \xe2\x80\x94 %s\n' "$(_herd_doctor_hint claude "$os")"
+        fi
+        warn=$((warn+1))
+      else
+        printf '  \xe2\x9a\xa0 claude \xe2\x80\x94 `claude --version` exited non-zero (rc=%s); the binary may be broken\n' "$claude_rc"
+        printf '      fix: %s\n' "$(_herd_doctor_hint claude "$os")"
+        warn=$((warn+1))
+      fi
+    fi
+    # darwin quarantine xattr check on the resolved Caskroom binary (guarded on `xattr` presence).
+    if [ "$os" = darwin ] && command -v xattr >/dev/null 2>&1; then
+      local claude_bin
+      claude_bin="$(_herd_doctor_realpath "$(command -v claude)")"
+      if _herd_doctor_has_quarantine "$claude_bin"; then
+        printf '  \xe2\x9a\xa0 claude binary is QUARANTINED (com.apple.quarantine) \xe2\x80\x94 %s\n' "$claude_bin"
+        printf '      new claude execs can hang in _dyld_start (spawned agents sit idle with blank panes, issue #137)\n'
+        printf '      fix: xattr -d com.apple.quarantine %s\n' "$claude_bin"
+        warn=$((warn+1))
+      else
+        printf '  \xe2\x9c\x93 claude binary not quarantined\n'
+      fi
+    fi
+  else
+    warn=$((warn+1))
+  fi
 
   # python3 — the JSON/UTF-8 pane helpers. Presence, then (only if present) its UTF-8 capability
   # (issue #31): present-but-cp1252 python3 is the confirmed Windows root cause. A broken encoding
