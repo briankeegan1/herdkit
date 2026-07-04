@@ -1071,3 +1071,149 @@ EOF
     warn "fleet in-flight ($tot) ≥ soft cap ($softcap) — the Claude usage limit is account-wide; consider pausing new spawns to avoid a limit-hit"
   fi
 }
+
+# ── room — the NL MASTER-COORDINATOR agent (P3 of the fleet-coordinator EPIC) ─────────────────────
+# A launcher that opens the natural-language master-coordinator in its OWN meta-workspace, THIN over
+# the shipped deterministic `herd fleet` helpers (register/status/digest/inbox/set/upgrade/reload/
+# discover) plus each project's own read-only `herd why/log/status`. It renders a skill from the live
+# registry and starts ONE herdr tab running `claude --model $MODEL_COORDINATOR /fleet-coordinator` in
+# a dedicated fleet workspace — no watcher/backlog panes (that is per-project control-room furniture;
+# the master only rolls up and delegates DOWN to each project's coordinator/watcher).
+
+# _fleet_room_dir — the meta-workspace cwd that holds the rendered fleet skill (its
+# .claude/commands/fleet-coordinator.md). Default: a `fleet-room` sibling of the registry file (so
+# it moves with HERD_FLEET_FILE and stays under ~/.herd by default). HERD_FLEET_ROOM_DIR overrides.
+_fleet_room_dir() { printf '%s' "${HERD_FLEET_ROOM_DIR:-$(dirname "$(_fleet_registry_file)")/fleet-room}"; }
+
+# render_fleet_skill — render templates/fleet-coordinator.md.tmpl into the room's
+# .claude/commands/fleet-coordinator.md, substituting the LIVE registry (project bullet list, count,
+# registry path) plus the model tier and engine paths. Pure bash string replacement, exactly like
+# render_skill — so a project path containing / & | is safe. Prints the rendered file's path.
+render_fleet_skill() {
+  local tmpl="${HERD_FLEET_SKILL_TMPL:-$TEMPLATES_DIR/fleet-coordinator.md.tmpl}"
+  [ -f "$tmpl" ] || die "fleet skill template missing: $tmpl"
+  local room; room="$(_fleet_room_dir)"
+  local out_dir="$room/.claude/commands"
+  mkdir -p "$out_dir" || die "cannot create fleet room commands dir: $out_dir"
+  local out="$out_dir/fleet-coordinator.md"
+
+  # Build {{FLEET_PROJECTS}} — one bullet per registered project (name · path · repo).
+  local reg; reg="$(_fleet_registry_file)"
+  local FLEET_PROJECTS='' count=0 name path repo
+  if [ -f "$reg" ]; then
+    while IFS='|' read -r name path repo; do
+      case "$name" in ''|'#'*) continue ;; esac
+      [ -n "$path" ] || continue
+      count=$((count+1))
+      FLEET_PROJECTS="${FLEET_PROJECTS}"$'\n'"- **${name}** — \`${path}\`${repo:+  (${repo})}"
+    done < "$reg"
+  fi
+  FLEET_PROJECTS="${FLEET_PROJECTS#$'\n'}"   # drop the leading newline for a clean first bullet
+  [ -n "$FLEET_PROJECTS" ] || FLEET_PROJECTS="_(registry empty)_"
+
+  local model="${MODEL_COORDINATOR:-claude-opus-4-8}"
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line//\{\{FLEET_PROJECTS\}\}/$FLEET_PROJECTS}"
+    line="${line//\{\{FLEET_COUNT\}\}/$count}"
+    line="${line//\{\{FLEET_REGISTRY\}\}/$reg}"
+    line="${line//\{\{FLEET_ROOM_DIR\}\}/$room}"
+    line="${line//\{\{MODEL_COORDINATOR\}\}/$model}"
+    line="${line//\{\{SCRIPTS_DIR\}\}/$SCRIPTS_DIR}"
+    printf '%s\n' "$line"
+  done < "$tmpl" > "$out"
+  printf '%s' "$out"
+}
+
+# fleet_room — render the fleet skill and open (or refocus) the master-coordinator agent in its own
+# herdr workspace. Refuses (non-zero) on an empty registry, pointing at register/discover. Every
+# herdr interaction goes through the `herdr` CLI on PATH so it is stubbable in tests.
+fleet_room() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+usage: herd fleet room
+
+  Open the NL MASTER-COORDINATOR agent in its own meta-workspace: an LLM seat that manages every
+  registered project THROUGH the shipped 'herd fleet' rollups + each project's read-only 'herd
+  why/log/status', and delegates work DOWN to each project's coordinator (via 'herdr pane run').
+  It NEVER edits a project's files and NEVER merges — always delegates.
+
+  Renders templates/fleet-coordinator.md.tmpl from the live registry, then launches ONE herdr tab
+  running:  claude --model \$MODEL_COORDINATOR /fleet-coordinator
+  Refuses when the registry is empty — add projects with 'herd fleet register' / 'herd fleet discover'.
+
+  Model:     ${MODEL_COORDINATOR:-claude-opus-4-8}
+  Room cwd:  $(_fleet_room_dir)
+  Registry:  $(_fleet_registry_file)
+EOF
+        return 0 ;;
+      *) die "usage: herd fleet room   (no arguments; try: herd fleet room --help)" ;;
+    esac
+  done
+
+  # Refuse gracefully on an empty registry — the master has nothing to manage.
+  local nproj; nproj="$(_fleet_registered_paths | grep -c . || true)"
+  if [ "${nproj:-0}" -eq 0 ]; then
+    say "no projects registered — the fleet room needs at least one project."
+    say "  add one:     herd fleet register <path>"
+    say "  auto-find:   herd fleet discover --register"
+    return 1
+  fi
+
+  command -v herdr   >/dev/null 2>&1 || die "herdr not found — the fleet room needs the herdr CLI on PATH"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found — required to parse herdr JSON output"
+
+  local room; room="$(_fleet_room_dir)"
+  local skill; skill="$(render_fleet_skill)" || die "could not render the fleet skill"
+  local model="${MODEL_COORDINATOR:-claude-opus-4-8}"
+  local label="${HERD_FLEET_WS_LABEL:-fleet}"
+  local tab_label="fleet-room"
+  local agent_name="fleet-coordinator"
+  local cmd="/fleet-coordinator"
+
+  # Resolve the fleet's OWN herdr workspace (labeled $label) — reuse if it already exists, else
+  # create a dedicated one. We only ever touch a workspace with our own fleet label, never the
+  # ambient/focused one (the same multi-tenancy discipline coordinator.sh uses per project).
+  local WS TAB
+  WS="$(herdr workspace list 2>/dev/null | LABEL="$label" python3 -c \
+    'import sys,json,os; d=json.load(sys.stdin); print(next((w["workspace_id"] for w in (d.get("result") or {}).get("workspaces",[]) if w.get("label")==os.environ["LABEL"]), ""))' \
+    2>/dev/null)" || WS=""
+
+  if [ -n "$WS" ]; then
+    # REUSE: focus our workspace, close any existing fleet-room tab for a clean relaunch, open fresh.
+    herdr workspace focus "$WS" >/dev/null 2>&1 || true
+    local existing
+    existing="$(herdr tab list --workspace "$WS" 2>/dev/null | LABEL="$tab_label" python3 -c \
+      'import sys,json,os; d=json.load(sys.stdin); print(next((t["tab_id"] for t in (d.get("result") or {}).get("tabs",[]) if t.get("label")==os.environ["LABEL"]), ""))' \
+      2>/dev/null)" || existing=""
+    [ -n "$existing" ] && herdr tab close "$existing" >/dev/null 2>&1 || true
+    local created
+    created="$(herdr tab create --workspace "$WS" --cwd "$room" --label "$tab_label" --focus 2>/dev/null)" \
+      || die "could not create the fleet-room tab"
+    TAB="$(printf '%s' "$created" | python3 -c \
+      'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])' 2>/dev/null)" \
+      || die "could not parse the fleet-room tab id from herdr"
+  else
+    # CREATE: no fleet workspace yet. Create it labeled up front; its root tab becomes the room tab.
+    local created
+    created="$(herdr workspace create --cwd "$room" --label "$label" --focus 2>/dev/null)" \
+      || die "could not create the fleet workspace"
+    local parsed
+    parsed="$(printf '%s' "$created" | python3 -c \
+      'import sys,json; d=json.load(sys.stdin)["result"]; print(d["workspace"]["workspace_id"], d["tab"]["tab_id"])' 2>/dev/null)" \
+      || die "could not parse the fleet workspace create result from herdr"
+    read -r WS TAB <<< "$parsed"
+    herdr tab rename "$TAB" "$tab_label" >/dev/null 2>&1 || true
+  fi
+
+  # The NL master-coordinator agent: ONE tab, running the rendered skill. No watcher/backlog panes.
+  herdr agent start "$agent_name" --workspace "$WS" --cwd "$room" --tab "$TAB" \
+    -- claude --model "$model" "$cmd" >/dev/null 2>&1 \
+    || die "could not start the fleet-coordinator agent"
+
+  ok "fleet room up — ${c_bold}$agent_name${c_rst} managing $nproj project(s) via $cmd"
+  say "   skill:     $skill"
+  say "   focus it:  herdr agent focus $agent_name"
+}
