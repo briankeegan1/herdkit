@@ -56,6 +56,13 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
 
+# `herd status` helpers: the DETERMINISTIC, READ-ONLY one-shot health snapshot for THIS project
+# (watcher liveness, in-flight builders + DEAD detection, open PRs + gate state, backlog counts).
+# Defines functions only — its _status_watcher_pids late-binds _list_project_watchers (defined far
+# below), so sourcing here is safe. See scripts/herd/status.sh.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/status.sh" ] && . "$SCRIPTS_DIR/status.sh"
+
 c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
@@ -999,6 +1006,25 @@ cmd_doctor() {
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-preflight.sh"
   herd_doctor || exit 1
+}
+
+cmd_status() {
+  # ONE-SHOT, READ-ONLY control-room health snapshot for THIS project — human- and cron-friendly,
+  # DETERMINISTIC, no LLM, no mutation. Prints: (a) watcher alive? (b) in-flight builders +
+  # DEAD detection, (c) open PRs + gate state, (d) backlog counts. Exits NON-ZERO when something
+  # needs attention (a DEAD builder, a CONFLICTING PR, or a review-blocked PR); 0 when healthy.
+  # All the work lives in scripts/herd/status.sh (sourced at startup); this just loads config and
+  # runs it, mirroring cmd_backlog's loader so `herd status` binds to THIS repo's project.
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  command -v _status_run >/dev/null 2>&1 || die "status helpers not loaded (scripts/herd/status.sh missing)"
+  local rc=0
+  _status_run || rc=$?
+  return "$rc"
 }
 
 cmd_backlog() {
@@ -2995,6 +3021,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       mid-flight (--force overrides both guards)
   herd log [--pr N] [--tail]          page the engine journal (.herd/journal.jsonl): one line per
                                       gate event; --pr filters to one PR, --tail follows live
+  herd status                         one-shot READ-ONLY control-room snapshot for THIS project:
+                                      watcher alive?, in-flight builders (+ DEAD detection), open
+                                      PRs + gate state, backlog counts. Deterministic, no LLM, no
+                                      mutation; exits non-zero when something needs attention
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
@@ -3053,6 +3083,7 @@ case "${1:-help}" in
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;
+  status)  shift; cmd_status "$@" ;;
   why)     shift; cmd_why "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
   update)  shift; cmd_update "$@" ;;
