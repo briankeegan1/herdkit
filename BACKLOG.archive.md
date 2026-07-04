@@ -45,3 +45,4 @@
 - ✅ **Fleet coordinator P0 — deterministic multi-project fan-out (herd fleet register/list/status/upgrade/reload + project registry)** *(PR #94 · commit be353ee)*
 - ✅ **Auto-refix / direct hand-offs bypass backlog reconciliation — option (a): post-merge auto-reconcile hook in agent-watch.sh keyed by PR#+worktree-slug** *(PR #93)*
 - ✅ **Positioning thesis — herdkit vs raw Claude harness (docs/positioning-thesis.md)** *(PR #95)*
+- ✅ **COMPETITIVE LANDSCAPE & PRIOR-ART RESEARCH — cited, timestamped docs/fleet-landscape.md; AI-agent orchestration platforms, IDPs, monorepo tooling, and cross-project rollup tools vs. the fleet-coordinator vision** *(PR #96)*
