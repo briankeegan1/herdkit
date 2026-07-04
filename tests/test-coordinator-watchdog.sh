@@ -13,6 +13,11 @@
 #   (8) bounded-retry-then-escalate: a resume that never wakes → state 'failed', and the NEXT tick
 #       does not re-attempt
 #   (9) coordinator.sh installs the rate_limit hook on the coordinator repo (herd_write_ratelimit_hook)
+#  (10) SELF-RESOLVED at target (issue #135): a scheduled resume reaches its target but the coordinator
+#       is WORKING again → record + sentinel cleared SILENTLY, self-resolved journaled, NO resume, NO
+#       notification, and the outcome+target-check are journaled (never the spurious 'failed' escalation)
+#  (11) journal outcome coverage: the target-check event carries the live status; failed/self-resolved
+#       outcomes are distinguishable in the journal
 #
 # Sources agent-watch.sh in lib mode. Stubs herdr/gh/git, pins the clock (HERD_NOW_EPOCH), overrides
 # MAIN to a temp "coordinator repo". NETWORK-FREE; launches no real claude; touches no live panes.
@@ -42,11 +47,23 @@ cat > "$BIN/herdr" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "agent list")
+    # A status SEQUENCE file (one status per line) lets a single tick observe a status FLIP between
+    # the top-of-tick read and the target-time re-check — the exact race issue #135 hinges on. Each
+    # `agent list` call pops the next line; the file empties to the static STUB_AGENT_STATUS fallback.
+    _st="${STUB_AGENT_STATUS:-idle}"
+    if [ -n "${STUB_AGENT_STATUS_SEQ:-}" ] && [ -s "${STUB_AGENT_STATUS_SEQ}" ]; then
+      _st="$(head -1 "$STUB_AGENT_STATUS_SEQ")"
+      { tail -n +2 "$STUB_AGENT_STATUS_SEQ" 2>/dev/null || true; } > "${STUB_AGENT_STATUS_SEQ}.tmp" \
+        && mv "${STUB_AGENT_STATUS_SEQ}.tmp" "$STUB_AGENT_STATUS_SEQ"
+    fi
     printf '{"result":{"agents":[{"name":"%s","agent_status":"%s","pane_id":"%s"}]}}\n' \
-      "${STUB_AGENT_NAME:-}" "${STUB_AGENT_STATUS:-idle}" "${STUB_AGENT_PANE_ID:-pane-000}"
+      "${STUB_AGENT_NAME:-}" "$_st" "${STUB_AGENT_PANE_ID:-pane-000}"
     ;;
   "pane run")
     [ -n "${STUB_PANE_RUN_LOG:-}" ] && printf '%s\n' "$4" >> "$STUB_PANE_RUN_LOG"
+    ;;
+  "notification show")
+    [ -n "${STUB_NOTIFY_LOG:-}" ] && printf '%s\n' "$3" >> "$STUB_NOTIFY_LOG"
     ;;
   *) exit 0 ;;
 esac
@@ -83,6 +100,13 @@ _wait_agent_working() {
 
 PANE_LOG="$T/pane-run.log"
 export STUB_PANE_RUN_LOG="$PANE_LOG"
+NOTIFY_LOG="$T/notify.log"
+export STUB_NOTIFY_LOG="$NOTIFY_LOG"
+# Per-call status sequence file (empty by default ⇒ static STUB_AGENT_STATUS). Tests that need a
+# within-tick flip write one status per line here.
+STATUS_SEQ="$T/status-seq.txt"
+export STUB_AGENT_STATUS_SEQ="$STATUS_SEQ"
+: > "$STATUS_SEQ"
 
 # The watchdog checks $MAIN (the coordinator's repo) for the limit sentinel. Point it at a temp dir
 # so the test never pollutes the real checkout, and drive the coordinator agent via the herdr stub.
@@ -92,7 +116,7 @@ SENT="$(_limit_sentinel_file "$MAIN")"
 # The launch lock path is derived from HERD_WATCHER_LOCK; make sure its parent exists.
 mkdir -p "$(dirname "$COORD_LAUNCH_LOCK")" 2>/dev/null || true
 
-reset_state() { rm -f "$LIMIT_STATE" "$SENT"; rmdir "$COORD_LAUNCH_LOCK" 2>/dev/null || true; : > "$PANE_LOG"; : > "$JOURNAL_FILE"; }
+reset_state() { rm -f "$LIMIT_STATE" "$SENT"; rmdir "$COORD_LAUNCH_LOCK" 2>/dev/null || true; : > "$PANE_LOG"; : > "$JOURNAL_FILE"; : > "$NOTIFY_LOG"; : > "$STATUS_SEQ"; }
 
 # ── (2) DEFAULT OFF is byte-inert ─────────────────────────────────────────────
 reset_state
@@ -177,6 +201,14 @@ grep -q '"event":"coordinator_resume_result"' "$JOURNAL_FILE" || fail "6: coordi
 ok
 grep -q '"woke":1' "$JOURNAL_FILE" || fail "6: successful resume must journal woke:1"
 ok
+# The target-time status re-check (issue #135) is journaled with the observed status before any resume.
+grep -q '"event":"coordinator_watchdog_target_check"' "$JOURNAL_FILE" \
+  || fail "6: the target-time status check must be journaled"
+ok
+# A genuine (non-working) resume must NOT be misrecorded as self-resolved.
+grep -q '"outcome":"self-resolved"' "$JOURNAL_FILE" \
+  && fail "6: a genuine resume must never journal a self-resolved outcome"
+ok
 # The launch lock must be RELEASED after a successful resume.
 [ ! -d "$COORD_LAUNCH_LOCK" ] || fail "6: launch lock must be released after resume"
 ok
@@ -206,6 +238,13 @@ _handle_coordinator_watchdog
 ok
 grep -q '"woke":0' "$JOURNAL_FILE" || fail "8: a failed resume must journal woke:0"
 ok
+# A genuinely-parked coordinator (never wakes) is a REAL escalation → notification IS sent, and the
+# outcome is 'failed'/escalated — never the silent self-resolved path.
+[ -s "$NOTIFY_LOG" ] || fail "8: a genuinely-failed resume must escalate via a notification"
+ok
+grep -q '"outcome":"self-resolved"' "$JOURNAL_FILE" \
+  && fail "8: a genuine failure must never journal self-resolved"
+ok
 calls_before="$(wc -l < "$PANE_LOG")"
 printf '0\n' > "$STUB_WAIT_FILE"
 _handle_coordinator_watchdog                                 # next tick: state=failed → no re-attempt
@@ -215,6 +254,45 @@ ok
 # ── (9) coordinator.sh installs the rate_limit hook on the coordinator repo ────
 grep -q 'herd_write_ratelimit_hook "\$REPO"' "$COORD" \
   || fail "9: coordinator.sh must install the rate_limit hook via herd_write_ratelimit_hook \"\$REPO\""
+ok
+
+# ── (10) SELF-RESOLVED at target: healthy coordinator must NOT be recorded 'failed' (issue #135) ──
+# The live incident: a scheduled resume reaches its target, but by then the coordinator is WORKING
+# again (its own native auto-resume won, or the sentinel was stale/transient). The relaunch invariant
+# already refuses to drive a working agent (_coordinator_pane_id is empty), so the old code fell
+# through to the 'failed' branch and fired a spurious "resume by hand" alarm on a HEALTHY session.
+# We reproduce the within-tick race with a status SEQUENCE: NOT working at the top-of-tick read (so
+# FAIL-SAFE #1 doesn't short-circuit), then working at the target-time re-check.
+reset_state
+printf '4000000000' > "$SENT"
+record_limit "$CO" "1000000" "1005060" "scheduled"           # scheduled target already in the past
+export STUB_AGENT_STATUS="working"                            # fallback once the sequence drains
+export HERD_NOW_EPOCH=1006000
+printf 'idle\nworking\n' > "$STATUS_SEQ"                      # top read: idle → target re-check: working
+_handle_coordinator_watchdog
+[ -z "$(limit_state "$CO")" ] || fail "10: a working-at-target coordinator must clear the ledger record (not record 'failed')"
+ok
+[ "$(limit_state "$CO")" = "failed" ] && fail "10: a healthy coordinator must NEVER be recorded 'failed'"
+ok
+[ ! -f "$SENT" ] || fail "10: self-resolved must drop the limit sentinel"
+ok
+[ ! -s "$PANE_LOG" ] || fail "10: self-resolved must never fire a resume (no pane run)"
+ok
+[ ! -s "$NOTIFY_LOG" ] || fail "10: self-resolved must be SILENT — no notification (this was the false alarm)"
+ok
+
+# ── (11) self-resolved journal coverage: target-check + self-resolved outcome, no failure signal ──
+grep -q '"event":"coordinator_watchdog_target_check"' "$JOURNAL_FILE" \
+  || fail "11: the target-time status check must be journaled on the self-resolved path"
+ok
+grep -q '"status":"working"' "$JOURNAL_FILE" \
+  || fail "11: the target-check journal must record the observed 'working' status"
+ok
+grep -q '"outcome":"self-resolved"' "$JOURNAL_FILE" \
+  || fail "11: a self-resolved outcome must be journaled so herd why/log can reconstruct it"
+ok
+grep -q '"woke":0' "$JOURNAL_FILE" \
+  && fail "11: self-resolved must not journal a failed resume result (woke:0)"
 ok
 
 echo "ALL PASS ($pass checks)"

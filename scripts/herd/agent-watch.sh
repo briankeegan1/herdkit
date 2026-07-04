@@ -1544,9 +1544,14 @@ _handle_coordinator_watchdog() {
   _cw_status="$(_agent_status "$HERD_AGENT_COORDINATOR")"
 
   # FAIL-SAFE #1: a 'working' coordinator is healthy — NEVER touch it. Drop any stale record+sentinel
-  # (a human intervened, or a prior scheduled resume flipped it back to working).
+  # (a human intervened, or a prior scheduled resume flipped it back to working). Journal the drop as
+  # a self-resolved outcome ONLY when a record actually existed — a bare healthy tick (no ledger row)
+  # must stay silent so the journal isn't flooded on every normal poll.
   if [ "$_cw_status" = "working" ]; then
-    if [ -n "$(limit_state "$HERD_AGENT_COORDINATOR")" ]; then clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"; fi
+    if [ -n "$(limit_state "$HERD_AGENT_COORDINATOR")" ]; then
+      clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"
+      journal_append coordinator_watchdog agent "$HERD_AGENT_COORDINATOR" outcome self-resolved phase pre-schedule
+    fi
     # The coordinator name is a SINGLETON reused across parks, so a stale clean-select record must be
     # dropped the moment it is back to working — otherwise it would gate a future park's clean attempt.
     clear_sendkeys "$HERD_AGENT_COORDINATOR"
@@ -1594,7 +1599,24 @@ _handle_coordinator_watchdog() {
   # Still before the reset (+buffer) → hold; nothing to do this tick.
   [ "$_cw_now" -lt "$_cw_target" ] 2>/dev/null && return 0
 
-  # Reset reached → resume in place now, under the launch lock so we NEVER double-launch.
+  # TARGET REACHED — re-check the coordinator's LIVE status BEFORE touching anything. A scheduled
+  # resume can be reached long after the sentinel was written; in the meantime the coordinator may
+  # already be back (Claude's native auto-resume via the clean-menu path, a human `claude --continue`,
+  # or a stale/transient sentinel that never reflected a real park). FAIL-SAFE #3: a coordinator that
+  # is WORKING at target is HEALTHY and SELF-RESOLVED — the relaunch invariant already forbids driving
+  # it (_coordinator_pane_id is empty for a working agent), so the old code fell straight through the
+  # `-n "$_cw_pane"` guard into the `failed` branch: it recorded 'failed' and fired a spurious
+  # "resume by hand" alarm on a healthy session (LIVE 2026-07-04, issue #135). Instead clear the
+  # ledger record + sentinel SILENTLY, journal the self-resolved outcome, and send NO notification.
+  _cw_status="$(_agent_status "$HERD_AGENT_COORDINATOR")"
+  journal_append coordinator_watchdog_target_check agent "$HERD_AGENT_COORDINATOR" status "${_cw_status:-unknown}" target "$_cw_target"
+  if [ "$_cw_status" = "working" ]; then
+    clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"; clear_sendkeys "$HERD_AGENT_COORDINATOR"
+    journal_append coordinator_watchdog agent "$HERD_AGENT_COORDINATOR" outcome self-resolved target "$_cw_target"
+    return 0
+  fi
+
+  # Genuinely not working at target → resume in place now, under the launch lock so we NEVER double-launch.
   _coordinator_launch_lock_acquire || return 0   # another relaunch already in flight → skip this tick
   _cw_pane="$(_coordinator_pane_id)"
   journal_append coordinator_resume_attempt agent "$HERD_AGENT_COORDINATOR" pane "${_cw_pane:-none}" target "$_cw_target"
