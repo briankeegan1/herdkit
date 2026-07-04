@@ -15,7 +15,7 @@
 #   HERD_NO_APP=1       skip the app-preview pane
 #
 # Standalone:
-#   herd-feature.sh dividend-history "Add a dividend income history tab"
+#   herd-feature.sh search-filters "Add a search filter panel"
 # Or driven by the /coordinator skill.
 set -euo pipefail
 
