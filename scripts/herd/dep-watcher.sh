@@ -40,6 +40,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # shellcheck source=herd-links.sh
 . "$HERE/herd-links.sh"
+# Runtime driver shim — notifications route through the active HERD_DRIVER so the dep-watcher's
+# "unblocked" alert fires with OR without herdr panes (headless → notifications.log + native).
+# shellcheck source=driver.sh
+. "$HERE/driver.sh"
 
 DEPS_FILE="${DEPS_FILE:-$PROJECT_ROOT/.herd/deps}"
 # Poll-cadence + stall-TTL config keys: herd-config.sh (sourced above) has already applied any value
@@ -251,9 +255,8 @@ while true; do
             closed)
                 _dw_log "dep CLOSED: $ref — unblocking"
                 _dw_remove_dep "$ref"
-                herdr notification show "🔓 Dep unblocked" \
-                    --body "$ref is closed — $WORKSPACE_NAME is unblocked" \
-                    --sound done >/dev/null 2>&1 || true
+                herd_driver_notify "🔓 Dep unblocked" \
+                    "$ref is closed — $WORKSPACE_NAME is unblocked" done
                 changed=1
                 # Closed deps drop off the console surface (they're removed from .herd/deps).
                 continue
