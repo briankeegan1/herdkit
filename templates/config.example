@@ -12,7 +12,7 @@ WORKSPACE_NAME="myproject"                     # herdr workspace label
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
-SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "data .venv")
+SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
 # health + preview — the two big project-specific commands.
 # `herd init` seeds .herd/healthcheck.project.sh from the template matching scout's detected stack
@@ -21,7 +21,7 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 HEALTHCHECK_CMD=".herd/healthcheck.project.sh"  # exit 0 clean/data-env, 1 code error, 2 data/env
 HEALTHCHECK_HEAVY_GLOB=""            # egrep of diff paths that force the heavy profile; BLANK (default) → every change is heavy. Set a layout-specific value (e.g. "^app/", "^cmd/|^internal/", "^src/") only if some changes can skip the full suite.
 APP_SURFACE_GLOB=""                 # optional; egrep of diff paths that are the app surface (e.g. "^app/", "^cmd/", "^src/"); BLANK (default) → interaction gate off
-INTERACTION_TEST_CMD=""             # optional; drives widgets + asserts output changed (0 clean/1 code/2 data-env); e.g. an st.testing.v1.AppTest harness
+INTERACTION_TEST_CMD=""             # optional; drives an input + asserts the dependent output changed (0 clean/1 code/2 data-env); e.g. a UI test harness that sets a value, re-runs, and asserts the output moved
 APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
 SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
 
@@ -92,6 +92,19 @@ LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-u
 #   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)
 # Prefer MERGE_POLICY for new projects; WATCHER_AUTOMERGE is kept for back-compat only.
 WATCHER_AUTOMERGE="true"
+
+# team mode — multi-user auto-merge ownership gate (agent-watch.sh). Both optional; the defaults
+# below preserve today's exact SOLO behavior, so leave them unset for a single-operator install.
+#   WATCHER_SCOPE:  mine (default) — auto-merge the operator's own PRs, byte-identical to today's solo
+#     watcher (the ownership probe stays dormant) | all — team mode: teammates' PRs are DISPLAYED but
+#     auto-merge is STRICTLY scoped to WATCHER_OWNER's PRs (a teammate's PR shows "not mine — manual"
+#     and is never auto-merged, even when MERGEABLE+CLEAN+approved). A NARROWING gate layered on the
+#     watcher lens: it can only ever WITHHOLD a merge, never authorize one the gates would deny.
+#   WATCHER_OWNER:  operator GitHub login that owns auto-merge when WATCHER_SCOPE=all. Resolution
+#     order: WATCHER_OWNER → WATCHER_VIEW_AUTHOR → `gh api user`. Fail-closed: if it cannot resolve
+#     in team mode, auto-merge is WITHHELD for safety (a teammate's PR is never blind-merged).
+# WATCHER_SCOPE="mine"
+# WATCHER_OWNER=""
 
 # routing — where engine bugs escalate (herd report files a gh issue here)
 HERD_REPO="briankeegan1/herdkit"

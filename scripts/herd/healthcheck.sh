@@ -33,8 +33,8 @@
 #                            EMPTY (default) → the gate is OFF entirely: zero behavior change for
 #                            every existing project.
 #   • INTERACTION_TEST_CMD — project command that DRIVES a widget/input and asserts the dependent
-#                            output actually changed (e.g. an `st.testing.v1.AppTest` harness: set
-#                            a value, re-run, assert the output moved). Invoked as
+#                            output actually changed (e.g. a UI test harness: set an input, re-run,
+#                            assert the dependent output moved). Invoked as
 #                            $INTERACTION_TEST_CMD <worktree-dir> [--oneline]; same exit contract
 #                            as HEALTHCHECK_CMD — 0 clean · 1 code error · 2 data/env (tolerated).
 # When the diff touches APP_SURFACE_GLOB:
