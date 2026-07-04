@@ -128,6 +128,13 @@ TRANSCRIPT_STATE="$TREES/.agent-watch-transcript"
 # Any liveness signal (agent reappears, PR opens, transcript grows) clears the record. See the
 # "Dead-builder detection" helpers below.
 DEAD_STATE="$TREES/.agent-watch-dead"
+# Dead-builder AUTO-RESPAWN ledger, PARALLEL to $DEAD_STATE and keyed by SLUG (NOT cleared when the
+# dead record clears): one line per slug the watcher has auto-respawned — "<slug> <epoch> <state>",
+# state ∈ respawned | escalated. This is the AT-MOST-ONCE budget: a slug with a `respawned` line is
+# never auto-respawned again, so a builder that dies a SECOND time after its one respawn escalates
+# instead of looping. Only written when DEAD_BUILDER_AUTORESPAWN is opted in (byte-inert when off).
+# See the "Dead-builder AUTO-RESPAWN" helpers below.
+DEAD_RESPAWN_STATE="$TREES/.agent-watch-respawn"
 # Healthcheck ledger, PARALLEL to the review ledgers: one line per healthcheck ATTEMPT
 # ("<epoch> <pr#> <slug> <attempt> <outcome>"), outcome ∈ clean | dataenv | code-error | flaky-pass.
 # This is the healthcheck analogue of $REVIEW_STATE — an append-only provenance record so a red row
@@ -1759,9 +1766,143 @@ _reconcile_dead_builder() {
         journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}"
         herdr notification show "💀 builder died: ${_rd_slug}" \
           --body "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" --sound default >/dev/null 2>&1 || true
+        # Bounded, opt-in AUTO-RESPAWN fires exactly here — once per DEAD crossing (guarded by the
+        # dead_notified dedup), AFTER the unconditional 💀 surface. Byte-inert when the flag is off.
+        _maybe_autorespawn_dead_builder "$_rd_slug" "$_rd_wt" >/dev/null
       fi ;;
   esac
   printf '%s' "$_rd_verdict"
+}
+
+# ── Dead-builder AUTO-RESPAWN (bounded, opt-in) ──────────────────────────────────────────────────
+# Follow-up to the dead-builder DETECT+SURFACE above (PR #117 shipped detection only). When a slug
+# crosses into DEAD and DEAD_BUILDER_AUTORESPAWN is opted in, surgically restart a FRESH agent in the
+# EXISTING worktree pointed at the SAME $WORKTREES_DIR/<slug>.task.md — but only when it is SAFE and
+# BOUNDED. Three invariants, each independently guarded so the feature can never destroy work or loop:
+#   • DEFAULT OFF — byte-inert until opted in. _maybe_autorespawn_dead_builder early-returns when the
+#     flag is off (no ledger, no git probe, no extra notification), so the off-path is exactly today's
+#     detect+surface behavior.
+#   • NEVER blow away work — respawn ONLY when the worktree has NO commits ahead of base AND no
+#     staged/unstaged/untracked changes. A dead builder that produced ANYTHING escalates (surfaced,
+#     never restarted-over) so a human can recover it.
+#   • AT MOST ONCE per slug — the $DEAD_RESPAWN_STATE ledger records each respawn keyed by slug; a
+#     slug that dies AGAIN after its one respawn escalates and is never respawned a second time.
+# The respawn is SURGICAL — it reuses the herd-feature spawn pattern (a fresh herdr tab rooted in the
+# worktree + `herdr agent start … claude "<pointer>"`) but does NOT re-run the lane: no new
+# worktree/branch (new-feature.sh), no app-preview pane. The pointer mirrors herd_write_task_spec's
+# (the spec file already exists on disk; we only re-point a fresh agent at it, never rewrite it).
+
+# _dead_autorespawn_on — true iff DEAD_BUILDER_AUTORESPAWN opts in. DEFAULT OFF: only on|true|yes|1
+# enable it; unset, "off", or any other value stays off (the byte-inert default).
+_dead_autorespawn_on() {
+  case "${DEAD_BUILDER_AUTORESPAWN:-off}" in
+    on|true|yes|1) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# respawn_recorded <slug> — true iff this slug has already been auto-respawned once (its at-most-once
+# budget is spent). Reads the $DEAD_RESPAWN_STATE ledger.
+respawn_recorded() {
+  [ -s "$DEAD_RESPAWN_STATE" ] || return 1
+  awk -v s="$1" '$1==s{f=1} END{exit f?0:1}' "$DEAD_RESPAWN_STATE" 2>/dev/null
+}
+# record_respawn <slug> <epoch> <state> — append a ledger line (state ∈ respawned | escalated).
+# Append-only; a slug is looked up by presence, so the FIRST respawned line is the budget marker.
+record_respawn() { printf '%s %s %s\n' "$1" "$2" "$3" >> "$DEAD_RESPAWN_STATE" 2>/dev/null || true; }
+
+# _worktree_has_work <worktree> — true iff the worktree holds work we must NEVER blow away: either
+# commits ahead of the base branch OR a dirty tree (staged/unstaged/untracked). A git failure is
+# treated as "has work" (fail SAFE — never respawn over a tree we could not inspect).
+_worktree_has_work() {
+  local _hw_wt="$1" _hw_commits
+  _hw_commits="$(git -C "$_hw_wt" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null)" || return 0
+  case "$_hw_commits" in ''|*[!0-9]*) _hw_commits=0 ;; esac
+  [ "$_hw_commits" -gt 0 ] && return 0
+  [ -n "$(git -C "$_hw_wt" status --porcelain 2>/dev/null)" ] && return 0
+  return 1
+}
+
+# _classify_respawn <autorespawn-on:0|1> <has-work:0|1> <already-respawned:0|1> — the PURE verdict for
+# a slug that has just crossed into DEAD. Echoes exactly one token:
+#   OFF          — the flag is off ⇒ do nothing (never respawn; byte-inert)
+#   SKIP_ALREADY — the slug already spent its one respawn ⇒ it died AGAIN ⇒ escalate, never re-respawn
+#   SKIP_WORK    — the worktree has commits/dirty changes ⇒ escalate, never blow away work
+#   RESPAWN      — on + clean worktree + budget unspent ⇒ respawn a fresh agent once
+# Order matters: OFF first (nothing else can override the opt-out); then the die-AGAIN check BEFORE
+# the work check, so a second death always escalates as "died again" regardless of tree state.
+_classify_respawn() {
+  local on="${1:-0}" has_work="${2:-0}" already="${3:-0}"
+  [ "$on" = "1" ] || { printf 'OFF'; return 0; }
+  [ "$already" = "1" ] && { printf 'SKIP_ALREADY'; return 0; }
+  [ "$has_work" = "1" ] && { printf 'SKIP_WORK'; return 0; }
+  printf 'RESPAWN'
+}
+
+# _respawn_builder_in_worktree <slug> <worktree> — surgically restart a FRESH builder agent in the
+# EXISTING worktree, pointed at the EXISTING $WORKTREES_DIR/<slug>.task.md. Returns 0 iff a tab AND
+# agent were started. Mirrors the herd-feature spawn WITHOUT re-running the lane (no new-feature.sh,
+# no app-preview pane). Never invoked under DRYRUN — the caller guards.
+_respawn_builder_in_worktree() {
+  local _rw_slug="$1" _rw_wt="$2"
+  local _rw_spec="$TREES/$_rw_slug.task.md"
+  # The builder was spawned against this externalized spec; if it has vanished we cannot re-point a
+  # fresh agent at it — bail (the caller escalates rather than respawning against nothing).
+  [ -s "$_rw_spec" ] || { printf '⚠️  herdkit: task spec %s missing — cannot auto-respawn %s\n' "$_rw_spec" "$_rw_slug" >&2; return 1; }
+  local _rw_model="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
+  local _rw_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
+  # SHORT pointer prompt — byte-identical to herd_write_task_spec's (the spec is already on disk).
+  local _rw_ptr
+  _rw_ptr="$(printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_rw_spec")"
+  local _rw_wsid; _rw_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  local _rw_created _rw_tab _rw_root
+  _rw_created="$(herdr tab create ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --label "$_rw_slug" --no-focus 2>/dev/null || true)"
+  read -r _rw_tab _rw_root < <(printf '%s' "$_rw_created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+  [ -n "$_rw_tab" ] || { printf '⚠️  herdkit: could not create a tab to auto-respawn %s\n' "$_rw_slug" >&2; return 1; }
+  # Register in the sweep allowlist so only engine-created tabs are ever swept (mirrors the lane).
+  printf '%s %s builder\n' "$_rw_slug" "$_rw_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
+  # shellcheck disable=SC2086  # $_rw_flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS).
+  herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1
+}
+
+# _maybe_autorespawn_dead_builder <slug> <worktree> — drive the bounded auto-respawn for ONE slug that
+# has just crossed into DEAD. Echoes the verdict (OFF | SKIP_ALREADY | SKIP_WORK | RESPAWN) for tests
+# and callers; fires at most one notification (+ journal event) per invocation. Called ONCE per DEAD
+# crossing from _reconcile_dead_builder (guarded by the dead_notified dedup).
+_maybe_autorespawn_dead_builder() {
+  local _ar_slug="$1" _ar_wt="$2" _ar_on=0 _ar_work=0 _ar_done=0 _ar_verdict
+  _dead_autorespawn_on && _ar_on=1
+  # OFF ⇒ byte-inert: no git probe, no ledger, no extra notification. The 💀 surface already fired.
+  [ "$_ar_on" = "1" ] || { printf 'OFF'; return 0; }
+  _worktree_has_work "$_ar_wt" && _ar_work=1
+  respawn_recorded "$_ar_slug" && _ar_done=1
+  _ar_verdict="$(_classify_respawn "$_ar_on" "$_ar_work" "$_ar_done")"
+  case "$_ar_verdict" in
+    RESPAWN)
+      # DRYRUN: log intent, but never spawn or spend the budget (mirrors the watcher's mutation guards).
+      if [ -n "${DRYRUN:-}" ]; then
+        printf '🐑 (dry-run) would auto-respawn dead builder %s in %s\n' "$_ar_slug" "$_ar_wt" >&2
+      elif _respawn_builder_in_worktree "$_ar_slug" "$_ar_wt"; then
+        record_respawn "$_ar_slug" "$(_now)" respawned
+        journal_append builder_respawned slug "$_ar_slug"
+        herdr notification show "♻️ builder auto-respawned: ${_ar_slug}" \
+          --body "${_ar_slug}: dead + clean worktree — a fresh agent was restarted in place (once)" --sound default >/dev/null 2>&1 || true
+      else
+        journal_append builder_respawn_failed slug "$_ar_slug"
+        herdr notification show "💀 auto-respawn failed: ${_ar_slug}" \
+          --body "${_ar_slug}: could not start a fresh agent — restart by hand" --sound default >/dev/null 2>&1 || true
+      fi ;;
+    SKIP_WORK)
+      journal_append builder_dead_has_work slug "$_ar_slug"
+      herdr notification show "💀 builder died (has work): ${_ar_slug}" \
+        --body "${_ar_slug}: dead but the worktree has commits/uncommitted changes — NOT auto-respawned; recover by hand" --sound default >/dev/null 2>&1 || true ;;
+    SKIP_ALREADY)
+      journal_append builder_dead_again slug "$_ar_slug"
+      herdr notification show "💀 builder died again: ${_ar_slug}" \
+        --body "${_ar_slug}: died again after its one auto-respawn — escalating, will NOT respawn again" --sound default >/dev/null 2>&1 || true ;;
+  esac
+  printf '%s' "$_ar_verdict"
 }
 
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────

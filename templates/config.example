@@ -132,3 +132,17 @@ HERD_REPO="briankeegan1/herdkit"
 # ACTIVATION is a deliberate two-part operator step: set COORDINATOR_WATCHDOG=on AND restart the
 # watcher (this flag is read at watcher launch). Recommended for unattended/overnight runs.
 # COORDINATOR_WATCHDOG="off"   # off (default) | on
+
+# dead-builder AUTO-RESPAWN — opt-in restart of a silently-dead pre-PR builder (agent-watch.sh).
+# DEFAULT off: with it unset or off the watcher only DETECTS + surfaces a dead builder (a 💀 row +
+# one notification), byte-identical to today. A dead builder is one whose agent has VANISHED from
+# `herdr agent list` while its worktree still exists and it opened NO PR — nothing revives it, so an
+# empty worktree strands until a human notices. Set to on and the watcher also RESTARTS it, surgically
+# and once: it starts a FRESH agent in the EXISTING worktree pointed at the same
+# $WORKTREES_DIR/<slug>.task.md (it reuses the spawn pattern, NOT the full lane — no new
+# worktree/branch, no app-preview pane). Two hard safety rails: it respawns ONLY when the worktree has
+# NO commits ahead of base AND no staged/unstaged/untracked changes (it never blows away work — a dead
+# builder that produced anything escalates via notification instead), and AT MOST ONCE per slug (a
+# slug-keyed ledger; a builder that dies AGAIN after its one respawn escalates and is never respawned
+# a second time, so it can never loop). Recommended for unattended/overnight runs.
+# DEAD_BUILDER_AUTORESPAWN="off"   # off (default) | on
