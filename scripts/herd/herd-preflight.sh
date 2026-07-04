@@ -265,10 +265,23 @@ _herd_doctor_recommend() {
   return 1
 }
 
+# _herd_doctor_find_config — resolve the project's .herd/config the way herd-config.sh does
+# (HERD_CONFIG_FILE env, else walk up from $PWD). Prints the path, or nothing when no project config
+# is found. No dogfood fallback: if a project has no config there is nothing to lint.
+_herd_doctor_find_config() {
+  if [ -n "${HERD_CONFIG_FILE:-}" ]; then printf '%s' "$HERD_CONFIG_FILE"; return 0; fi
+  local d="$PWD"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    [ -f "$d/.herd/config" ] && { printf '%s' "$d/.herd/config"; return 0; }
+    d="$(dirname "$d")"
+  done
+  return 0
+}
+
 herd_doctor() {
   [ "${HERD_SKIP_DOCTOR:-}" = "1" ] && return 0
 
-  local os hard_fail=0 warn=0 tool brand
+  local os hard_fail=0 warn=0 cfg_dup=0 tool brand
   brand="$(_herd_brand)"
   os="$(_herd_doctor_os)"
   printf 'herd doctor \xe2\x80\x94 checking dependencies (platform: %s)\n\n' "$os"
@@ -346,7 +359,34 @@ herd_doctor() {
   _herd_doctor_soft shellcheck 'healthcheck skips shell lint (bash -n still runs)'
   _herd_doctor_soft bats       'healthcheck runs the *.sh test suite directly instead of via bats'
 
+  # ── Config lint: duplicate keys in .herd/config (issue #115). .herd/config is shell-sourced, so a
+  #    KEY assigned twice silently last-wins and can disable a gate — catch it PROACTIVELY here.
+  #    Advisory (⚠ only; does NOT change the doctor's required-dep exit contract — `herd config lint`
+  #    is the dedicated non-zero gate). Runs only when the scanner is available (herd-config.sh
+  #    sourced, e.g. via `herd doctor`) and a project config exists. ─────────────────────────────
+  if command -v _herd_config_dup_keys >/dev/null 2>&1; then
+    local _dc_cfg; _dc_cfg="$(_herd_doctor_find_config)"
+    if [ -n "$_dc_cfg" ] && [ -f "$_dc_cfg" ]; then
+      printf '\nConfig (.herd/config):\n'
+      local _dc_dupes; _dc_dupes="$(_herd_config_dup_keys "$_dc_cfg")"
+      if [ -n "$_dc_dupes" ]; then
+        printf '  \xe2\x9a\xa0 duplicate key(s) \xe2\x80\x94 shell last-wins silently overrides earlier values (can disable a gate, issue #115):\n'
+        local _dc_k
+        while IFS= read -r _dc_k; do
+          [ -n "$_dc_k" ] && printf '      \xe2\x80\xa2 %s (last assignment wins)\n' "$_dc_k"
+        done <<< "$_dc_dupes"
+        printf '      fix: delete the stale duplicate line(s), or run `herd config lint`\n'
+        cfg_dup=1
+      else
+        printf '  \xe2\x9c\x93 no duplicate keys\n'
+      fi
+    fi
+  fi
+
   printf '\n'
+  if [ "$cfg_dup" -ne 0 ]; then
+    printf 'doctor: \xe2\x9a\xa0 .herd/config has duplicate key(s) (see Config above) \xe2\x80\x94 run `herd config lint`; shell last-wins can silently disable a gate (issue #115).\n'
+  fi
   if [ "$hard_fail" -ne 0 ]; then
     printf 'doctor: \xe2\x9c\x97 a REQUIRED dependency (git / gh) is missing or broken (see \xe2\x9c\x97 above) \xe2\x80\x94 herd init cannot proceed.\n'
     printf '        (bypass this gate in tests/CI with HERD_SKIP_DOCTOR=1)\n'

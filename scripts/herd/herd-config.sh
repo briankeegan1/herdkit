@@ -23,6 +23,57 @@
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
+# ── Duplicate-key lint for .herd/config (issue #115) ─────────────────────────
+# .herd/config is SHELL-SOURCED (the `. "$_HERD_CONFIG_FILE"` below), so a KEY assigned more than
+# once silently LAST-WINS with no warning — a stale/empty duplicate landing AFTER a good value
+# silently flips engine behavior. Real incident: a stale `INTERACTION_TEST_CMD=""`
+# placeholder left in the file after a merged PR also added the real
+# `INTERACTION_TEST_CMD=.herd/_interaction.sh` → on source the empty one won → the widget-interaction
+# gate was SILENTLY DISABLED. The fix below only SURFACES duplicates loudly; it does NOT change value
+# resolution (shell last-wins is kept — auto-dedup is out of scope), it just makes last-wins non-silent.
+#
+# _herd_config_dup_keys <file> — print each key assigned more than once in <file>, one per line, in
+# the order each first became a duplicate. Pure/read-only: skips blank lines + comments, handles both
+# `KEY=...` and `export KEY=...`, and prints nothing (returns 0) for a clean or missing file. Shared
+# by the source-time warning (below), `herd config lint`, and `herd doctor`.
+_herd_config_dup_keys() {
+  local _dk_file="${1:-}"
+  [ -n "$_dk_file" ] && [ -f "$_dk_file" ] || return 0
+  awk '
+    {
+      s = $0
+      sub(/^[ \t]+/, "", s)                       # strip leading whitespace
+      if (s == "" || s ~ /^#/) next               # skip blank lines and comments
+      sub(/^export[ \t]+/, "", s)                 # tolerate an `export ` prefix
+      if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) next   # only KEY=... assignment lines
+      k = s; sub(/=.*/, "", k)
+      if (++count[k] == 2) order[++n] = k
+    }
+    END { for (i = 1; i <= n; i++) print order[i] }
+  ' "$_dk_file"
+}
+
+# _herd_config_warn_dupes <file> — emit ONE loud stderr WARNING when <file> has duplicate keys. Guarded
+# by an exported once-per-process marker so it fires at most once (and is spared in spawned children),
+# so it is never spammy across every command. A clean config re-checks cheaply and stays silent; the
+# authoritative reports (`herd config lint`, `herd doctor`) re-scan unconditionally.
+_herd_config_warn_dupes() {
+  case "${_HERD_CONFIG_DUP_WARNED:-}" in ""|0) ;; *) return 0 ;; esac
+  local _wd_dupes; _wd_dupes="$(_herd_config_dup_keys "${1:-}")"
+  [ -n "$_wd_dupes" ] || return 0
+  export _HERD_CONFIG_DUP_WARNED=1
+  {
+    printf '\n⚠️  herdkit: duplicate key(s) in %s — shell last-wins SILENTLY overrides the earlier\n' "${1:-}"
+    printf '   assignment(s), which can disable a gate (issue #115). Duplicated key(s):\n'
+    local _wd_k
+    while IFS= read -r _wd_k; do
+      [ -n "$_wd_k" ] && printf '     • %s  (last assignment wins)\n' "$_wd_k"
+    done <<< "$_wd_dupes"
+    printf '   Fix: delete the stale duplicate line(s). Diagnose with `herd config lint`.\n\n'
+  } >&2
+  return 0
+}
+
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
 # _herd_find_config records HOW the config resolved into _HERD_CONFIG_SOURCE (env | walkup |
@@ -50,6 +101,10 @@ unset -f _herd_find_config
 if [ -f "$_HERD_CONFIG_FILE" ]; then
   # shellcheck source=/dev/null
   . "$_HERD_CONFIG_FILE"
+  # Issue #115: surface a duplicate KEY= (silent shell last-wins can disable a gate) — at most once
+  # per process. Runs AFTER the source so a broken source still fails as before; value resolution is
+  # unchanged (the config was already sourced with normal last-wins semantics above).
+  _herd_config_warn_dupes "$_HERD_CONFIG_FILE"
 fi
 
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
