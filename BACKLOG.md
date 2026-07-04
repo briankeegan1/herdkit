@@ -20,7 +20,7 @@
 
 ## Reliability / safety
 
-
+- 🚧 **Dead-builder detection — surface a spawned builder whose agent process vanished** *(worktree dead-builder-detection)* — detect the case where a worktree is present, no live agent exists in `herdr agent list`, and no open PR has been filed; emit a loud console row + notification so the operator knows the builder died silently. Motivated by the 2026-07-03 de-streamlit-docs builder silently dying (agent gone, pane destroyed, no PR, no commits) — found only when the operator noticed an empty tab. The watcher already handles (a) transcript-growth STALL for working-but-stuck builders (~line 1352), (b) `_sweep_orphan_tabs` for tabs with no worktree/PR (~line 749), (c) limit-hit auto-resume (~line 132) — the dead-pre-PR case falls through all of them. First increment: DETECT + loud alert only; auto-respawn deferred (edge cases: uncommitted work, respawn loops). Extends existing builder-liveness section without duplicating it. A broader control-room health sweep (watcher + backlog viewer + coordinator panes all alive) is a possible follow-up; cross-refs fleet EPIC's WATCHER HEARTBEAT MONITOR (feature f).
 
 ## External-consumer abstraction fixes (from the Phase-4 audit)
 
