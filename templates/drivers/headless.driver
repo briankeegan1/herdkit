@@ -1,0 +1,45 @@
+# templates/drivers/headless.driver — the HEADLESS driver:
+#   multiplexer = none (no herdr panes) · agent runtime = Claude Code, detached.
+#
+# The second shipped driver (HERD-7). Its design principle: PANES BECOME A VIEW, NOT A DEPENDENCY.
+# Everything load-bearing — the watcher's merge gating, journal writes, notifications, and limit
+# detection — must run correctly with NO herdr panes at all, so herdkit works on Windows / CI /
+# headless Linux where no herdr control room exists. The herdr cockpit becomes an OPTIONAL view.
+#
+# See docs/driver-abstraction.md for the capability model and templates/drivers/herdr-claude.driver
+# for the default binding. Selected per project by `.herd/config` key HERD_DRIVER=headless.
+#
+# CONTRACT (same as every driver): shell-sourceable KEY=value, COMMITTED, ZERO-SECRET — command
+# SHAPES only, never credentials or absolute paths ({{SCRIPTS_DIR}} is resolved at render time).
+#
+# CAPABILITY SEMANTICS — each capability gets EITHER a real headless equivalent OR explicit,
+# documented view-only / no-op semantics that FAIL SOFT (a missing pane never stops load-bearing
+# work). The runtime shim scripts/herd/driver.sh implements each one; the values below are the
+# incantations rendered into the coordinator skill so the coordinator drives the SAME surface.
+#
+#   list-agents  REAL   — a detached-agent registry under $WORKTREES_DIR/.herd/agents (pid/status
+#                         per slug); `driver.sh list-agents` emits herdr-compatible JSON so the
+#                         watcher's liveness checks (dead-builder reconciliation) work with no panes.
+#   read-pane    REAL   — tails the detached agent's captured log (its stdout/stderr on disk).
+#   send-text    BEST-EFFORT — appends to the agent's input queue file; a bare `claude` process does
+#                         not drain it, so for the default runtime this is a documented no-op seam an
+#                         SDK/headless runtime can consume. Never fails.
+#   start-agent  REAL   — the same lane script; under headless it launches a DETACHED background
+#                         `claude` (nohup) writing to the registry, instead of a herdr tab + pane.
+#   switch-model BEST-EFFORT — a `/model` line via send-text (same seam + caveat as send-text).
+#   focus-agent  VIEW   — no pane to focus; prints the agent's log path so a human can tail it.
+#   create-tab   NO-OP  — headless has no tabs (the lane spawns detached); a fail-soft view stub.
+#   send-keys    NO-OP  — raw keystrokes are a pane concept; nothing to receive them. Fail-soft.
+
+# ── Capabilities the coordinator skill binds INLINE (greppable as DRIVER:<cap> in the skill) ──────
+DRIVER_LIST_AGENTS='bash {{SCRIPTS_DIR}}/driver.sh list-agents'
+DRIVER_FOCUS_AGENT='bash {{SCRIPTS_DIR}}/driver.sh focus <slug>'
+DRIVER_SEND_TEXT='bash {{SCRIPTS_DIR}}/driver.sh send-text <slug> "<text>"'
+DRIVER_SWITCH_MODEL='bash {{SCRIPTS_DIR}}/driver.sh send-text <builder-slug> "/model <MODEL_FEATURE value>"'
+
+# ── Capabilities the LANE SCRIPTS + watcher exercise (bound here so the driver covers the FULL
+#    runtime surface). start-agent is the same lane, made driver-aware; the rest go through the shim.
+DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
+DRIVER_CREATE_TAB='bash {{SCRIPTS_DIR}}/driver.sh create-tab <slug>'
+DRIVER_READ_PANE='bash {{SCRIPTS_DIR}}/driver.sh read-pane <slug>'
+DRIVER_SEND_KEYS='bash {{SCRIPTS_DIR}}/driver.sh send-keys <slug> <keys>'

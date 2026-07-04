@@ -61,9 +61,12 @@ COORDINATOR_CMD="/coordinator"
 
 # driver — the runtime-specific control surface (multiplexer + agent runtime) the coordinator skill
 # is bound to. Selects templates/drivers/<name>.driver, whose DRIVER_* incantations are substituted
-# into the rendered coordinator skill. herdr-claude (herdr multiplexer + Claude Code) is the ONLY
-# driver shipped and the default; it renders the skill functionally identical to before the driver
-# abstraction. An unknown value fails `herd render` loudly, listing the available drivers.
+# into the rendered coordinator skill. Two drivers ship:
+#   herdr-claude (default) — herdr multiplexer + Claude Code; renders the skill functionally
+#     identical to before the driver abstraction (the byte-identical default).
+#   headless — NO herdr panes: agents run detached, panes become a VIEW not a dependency, and the
+#     watcher / journal / notifications / limit detection run headless (Windows / CI / headless Linux).
+# An unknown value fails `herd render` loudly, listing the available drivers.
 HERD_DRIVER="herdr-claude"
 
 # merge policy — how the watcher acts after all gates (healthcheck + review) pass.
