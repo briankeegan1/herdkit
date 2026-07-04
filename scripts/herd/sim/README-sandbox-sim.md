@@ -50,6 +50,54 @@ SANDBOX_FORCE_GATE_FAIL=1 bash scripts/herd/sim/sandbox-scenario.sh --artifacts 
 
 `status` is one of `pass` / `fail` / `skip`. `result` is `pass` iff `failed == 0`.
 
+## Falsification benchmark — `benchmark-drain.sh` (stub mode)
+
+`benchmark-drain.sh` is **step 3** of the *herdkit vs the raw Claude harness* EPIC (see
+`docs/positioning-thesis.md` + `BACKLOG.md`). The thesis names exactly one workload the raw harness
+**architecturally cannot complete**: *drain an N-item backlog, unattended, surviving interruptions.*
+A single Workflow invocation dies with its session — both its execution and its memory of what was
+done vanish, so there is nothing durable to resume from. This harness exercises that claim **in stub
+mode** (deterministic tiny changes, **no model call**) so the real overnight run later is just this
+same harness with real builders + real limit resets swapped in.
+
+It reuses `sandbox-fixture.sh` and runs the full herdkit flow per item with a **stub builder**:
+`worktree branch off main → deterministic stub change → local pr.json → fixture health gate → merge
+→ teardown → mark the backlog item ✅` (editing the fixture `BACKLOG.md` exactly as the scribe would).
+
+The restart-survival test is the point: `--kill-at K` **hard-exits (SIGKILL)** the harness after the
+K-th item, and a plain re-run against the **same `--state` dir** must resume from **durable state
+alone** (worktrees / branches / backlog on disk — no in-memory carryover), completing the remaining
+items **without duplicating** any already-shipped one.
+
+```sh
+# Fresh N=4 drain (state dir is DURABLE — never auto-deleted):
+bash scripts/herd/sim/benchmark-drain.sh --state /tmp/bench -n 4
+cat /tmp/bench/scorecard.json
+
+# Restart survival: hard-exit after item 2, then resume from disk alone (0 duplicates):
+bash scripts/herd/sim/benchmark-drain.sh --state /tmp/bench-kr -n 4 --kill-at 2   # exits 137
+bash scripts/herd/sim/benchmark-drain.sh --state /tmp/bench-kr -n 4               # resumes → 4 shipped
+
+# Fault-injection seed — break one item's gate so it fails LOUDLY and is never merged (stays 🔜):
+BENCH_GATE_FAIL_ITEM=02 bash scripts/herd/sim/benchmark-drain.sh --state /tmp/bench-gf -n 3
+
+# Live-run placeholder (prints and exits — see EPIC):
+bash scripts/herd/sim/benchmark-drain.sh --real-builders
+```
+
+The scorecard mirrors `sandbox-scenario.sh`'s JSON and **adds** the EPIC's drain fields:
+`backlog_size`, `items_drained` (cumulative ✅), `drained_this_run`, `remaining`,
+`resumed_after_kill` (bool), `duplicates` (**must be 0**), `gate_failures`, `wall_clock_s`.
+
+Flags: `--state DIR` (durable state/artifacts; `--artifacts` alias), `-n/--items N` (default 10),
+`--kill-at K`, `--fresh` (wipe + re-seed), `--real-builders` (live-run placeholder). Hermetic proof:
+`../../../tests/test-benchmark-drain.sh` (happy N=4 drain, scorecard shape, and the kill-at-2→resume
+restart-survival path with 0 duplicates).
+
+> **Still stub-mode.** Like `sandbox-scenario.sh`, this is local-only: no hosted repo, no herdr
+> panes, no model. The `--real-builders` flag is a deliberate placeholder — the live overnight run
+> (real builders + real usage-limit resets + operator hand-off) is the EPIC's step for later.
+
 ## Explicitly DEFERRED to P1+ (backlog follow-up note)
 
 > The coordinator owns `BACKLOG.md`; this P0 does not edit it. Fold the follow-ups below into the
