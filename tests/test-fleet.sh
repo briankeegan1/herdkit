@@ -249,6 +249,31 @@ printf '%s' "$note14b" | grep -qi "no parseable origin remote" \
   && fail "owner==repo slug must NOT emit the 'no parseable origin remote' note, got: $note14b"
 ok
 
+# ── 14c. issue #128 review: a bare-SSH self-hosted remote must NOT corrupt the slug with a backslash ─
+# git@host:project.git (gitolite/cgit/plain bare repos, no owner namespace). The scp colon→slash
+# rewrite must yield host/project cleanly — a literal backslash (host\/project) is silently-wrong data.
+BARE="$T/proj/baressh"
+mkdir -p "$BARE/.herd" "$T/proj/baressh-trees/.herd"
+git -C "$BARE" init -q
+git -C "$BARE" config user.email t@t.t
+git -C "$BARE" config user.name t
+git -C "$BARE" remote add origin "git@myserver:myproject.git"
+( cd "$BARE" && git commit -q --allow-empty -m init )
+bare_real="$(cd "$BARE" && pwd -P)"
+cat > "$BARE/.herd/config" <<CFG
+PROJECT_ROOT="$bare_real"
+WORKTREES_DIR="$bare_real-trees"
+DEFAULT_BRANCH="origin/main"
+WORKSPACE_NAME="baressh"
+HERD_REPO="me/baressh"
+CFG
+REG14C="$T/registry14c/fleet"
+HERD_FLEET_FILE="$REG14C" bash "$HERD" fleet register "$bare_real" >/dev/null 2>&1
+grep -q "^baressh|$bare_real|myserver/myproject$" "$REG14C" \
+  || fail "bare-SSH remote must record myserver/myproject cleanly, got: $(grep '^baressh|' "$REG14C" || true)"
+grep -q '\\' "$REG14C" && fail "registry contains a backslash — scp colon→slash rewrite corrupted the slug"
+ok
+
 # ── 15. a remote-less target records an empty repo field + emits a note ──────────────────────────
 NOREMOTE="$T/proj/noremote"
 mkdir -p "$NOREMOTE/.herd" "$T/proj/noremote-trees/.herd"

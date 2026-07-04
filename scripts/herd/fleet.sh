@@ -91,7 +91,9 @@ _fleet_repo_slug() {
   p="${p%/}"               # drop a trailing slash
   p="${p##*://}"           # strip a scheme:// prefix (https://, ssh://, git://)
   p="${p#*@}"              # strip a user@ prefix (git@…)
-  p="${p/:/\/}"            # scp-form host:owner → host/owner (first ':' only)
+  p="${p/://}"             # scp-form host:owner → host/owner (first ':' only). NB: the replacement is
+                           # a bare '/', NOT '\/' — bash keeps the backslash verbatim in ${v/p/repl},
+                           # which would corrupt a bare-SSH slug (git@host:proj → host\/proj).
   # Require an owner segment: a slash must separate owner from repo. A single-segment URL (a bare
   # `myrepo` with no owner) is rejected here — NOT via owner==repo, which would wrongly blank valid
   # matching-name slugs like eslint/eslint or prettier/prettier (issue #128 review).
