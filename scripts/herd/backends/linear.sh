@@ -16,16 +16,18 @@
 #
 # Credentials: LINEAR_API_KEY is read from .herd/secrets (gitignored) — NEVER from .herd/config.
 # Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID (also from .herd/secrets) names
-# the team new issues are filed under. When set it ALSO scopes issue resolution (mark_shipped /
-# item_state) and, critically, the open-issue list — so a second private team's issues never leak
-# into 'herd backlog'. When unset, the first team the key can see files new issues and the open
-# list spans every team the key can see (legacy all-teams behavior).
+# the team new issues are filed under and, critically, scopes the open-issue list — so a second
+# private team's issues never leak into 'herd backlog'. It deliberately does NOT scope issue
+# resolution (mark_shipped / item_state); that is keyed off the identifier's own team (see below).
+# When unset, the first team the key can see files new issues and the open list spans every team the
+# key can see (legacy all-teams behavior).
 #
 # Issue resolution uses issues(filter: { number, team }) — Linear DEPRECATED and removed the
 # issueSearch endpoint (2026-07: every call returns errors[0].message='deprecated', HTTP 400), so
-# mark_shipped/item_state parse the issue number out of the identifier slug (e.g. HERD-5 -> 5) and
-# look it up by number, scoped by team id (LINEAR_TEAM_ID) or, failing that, by the team key parsed
-# from the identifier prefix (HERD).
+# mark_shipped/item_state parse BOTH the number and the team key out of the identifier slug (e.g.
+# HERD-5 -> number 5, team key HERD) and look it up by number scoped to that team key. Issue numbers
+# are unique only within a team, so resolving by the identifier's own team (not LINEAR_TEAM_ID) is
+# what keeps a cross-team reference from matching the wrong same-numbered local issue.
 #
 # Every HTTP round-trip is funneled through the single internal _linear_gql so a test can stub the
 # network by overriding _linear_gql or by putting a fake `curl` on PATH.
@@ -78,31 +80,29 @@ _linear_issue_query() {
     # Build the issues(filter:) lookup that replaces the deprecated issueSearch. $1 = issue slug
     # (identifier, e.g. HERD-5 — a leading '#' is tolerated); $2 = the GraphQL sub-selection to
     # request inside `nodes { ... }`. On success sets globals _LQ_QUERY and _LQ_VARS ready for
-    # _linear_gql and returns 0; returns 1 (setting neither) when the slug has no numeric suffix to
-    # look up. When LINEAR_TEAM_ID is set the filter scopes by team id; otherwise it falls back to
-    # the team key parsed from the identifier prefix so lookups still resolve without a configured
-    # team.
+    # _linear_gql and returns 0; returns 1 (setting neither) when the slug is not a TEAMKEY-NUMBER
+    # identifier.
+    #
+    # Resolution is keyed off the identifier ITSELF — team key from the prefix + number — and MUST
+    # NOT be scoped by LINEAR_TEAM_ID. A Linear issue number is unique only within its own team, and
+    # the identifier already names that team (ENG-7 == team ENG, issue 7). Scoping by a configured
+    # LINEAR_TEAM_ID would, for any cross-team reference (e.g. a dep 'blocked-on: lib#ENG-7' while
+    # LINEAR_TEAM_ID is a different team), resolve the local same-numbered issue and mislabel state —
+    # silently unblocking a dep whose real upstream is still open. LINEAR_TEAM_ID only scopes the ops
+    # that carry no identifier (list_open / add_item).
     local slug="${1#\#}" fields="$2" num key
+    case "$slug" in *-*) ;; *) return 1 ;; esac
     num="${slug##*-}"
     key="${slug%-*}"
     case "$num" in ''|*[!0-9]*) return 1 ;; esac
-    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
-        _LQ_QUERY="$(printf 'query R($n: Float!, $team: ID!) {
-  issues(filter: { number: { eq: $n }, team: { id: { eq: $team } } }, first: 1) {
-    nodes { %s }
-  }
-}' "$fields")"
-        _LQ_VARS="$(N="$num" TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
-print(json.dumps({"n": float(os.environ["N"]), "team": os.environ["TEAM"]}))')"
-    else
-        _LQ_QUERY="$(printf 'query R($n: Float!, $key: String!) {
+    [ -n "$key" ] || return 1
+    _LQ_QUERY="$(printf 'query R($n: Float!, $key: String!) {
   issues(filter: { number: { eq: $n }, team: { key: { eq: $key } } }, first: 1) {
     nodes { %s }
   }
 }' "$fields")"
-        _LQ_VARS="$(N="$num" KEY="$key" python3 -c 'import os, json
+    _LQ_VARS="$(N="$num" KEY="$key" python3 -c 'import os, json
 print(json.dumps({"n": float(os.environ["N"]), "key": os.environ["KEY"]}))')"
-    fi
 }
 
 _backend_add_item() {

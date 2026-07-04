@@ -102,6 +102,10 @@ grep -q "issues(filter" "$GQLLOG"  || fail "mark_shipped did not resolve the iss
 grep -q "issueSearch" "$GQLLOG"    && fail "mark_shipped must NOT use the deprecated issueSearch endpoint"
 grep -q 'number: { eq: $n }' "$GQLLOG" || fail "mark_shipped did not look the issue up by parsed number"
 grep -q '"n": 7' "$GQLLOG"         || fail "mark_shipped did not parse the number (7) out of the ENG-7 slug"
+grep -q 'team: { key: { eq: $key }' "$GQLLOG" || fail "mark_shipped did not resolve by the identifier's team key"
+grep -q '"key": "ENG"' "$GQLLOG"   || fail "mark_shipped did not scope resolution to team ENG parsed from the ENG-7 slug"
+grep -q 'team: { id:' "$GQLLOG"    && fail "mark_shipped must resolve by the identifier's team key, not by team id"
+grep -q 'team_xyz' "$GQLLOG"       && fail "mark_shipped must NOT scope resolution by the configured LINEAR_TEAM_ID (cross-team collision)"
 grep -q "commentCreate" "$GQLLOG"  || fail "mark_shipped did not comment the PR link (commentCreate)"
 grep -q "Shipped via https://github.com/acme/widgets/pull/3" "$GQLLOG" \
   || fail "mark_shipped did not link the PR in the comment body"
@@ -123,6 +127,21 @@ echo "$out" | grep -q "ITEM_STATE=closed" || fail "_backend_item_state did not r
 grep -q "issues(filter" "$GQLLOG" || fail "_backend_item_state did not resolve via issues(filter:)"
 grep -q "issueSearch" "$GQLLOG"   && fail "_backend_item_state must NOT use the deprecated issueSearch endpoint"
 grep -q "state { type }" "$GQLLOG" || fail "_backend_item_state did not request the issue state.type"
+grep -q 'team: { key: { eq: $key }' "$GQLLOG" || fail "_backend_item_state did not resolve by the identifier's team key"
+grep -q '"key": "ENG"' "$GQLLOG"  || fail "_backend_item_state did not scope resolution to team ENG from the ENG-7 slug"
+grep -q 'team_xyz' "$GQLLOG"      && fail "_backend_item_state must NOT scope resolution by the configured LINEAR_TEAM_ID"
+pass
+
+# 4b. CROSS-TEAM (the dep-watcher case): with LINEAR_TEAM_ID set, an identifier from a DIFFERENT team
+#     must resolve against ITS OWN team key — never the configured team, whose same-numbered issue
+#     would otherwise be silently mislabeled (premature unblock). This is the exact divergence the
+#     ENG-7-under-team_xyz cases above now also cover, made explicit with a distinct team + number.
+: > "$GQLLOG"
+out="$(run _backend_item_state "provider-lib#PROV-42")"
+grep -q '"key": "PROV"' "$GQLLOG" || fail "cross-team item_state did not resolve against the identifier's own team key (PROV)"
+grep -q '"n": 42' "$GQLLOG"       || fail "cross-team item_state did not look the issue up by its own number (42)"
+grep -q 'team_xyz' "$GQLLOG"      && fail "cross-team item_state leaked the configured LINEAR_TEAM_ID into resolution"
+grep -q 'team: { id:' "$GQLLOG"   && fail "cross-team item_state must resolve by team key, not team id"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.
