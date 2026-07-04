@@ -66,7 +66,9 @@ ALPHA="$(_mkproj alpha)"
 BETA="$(_mkproj beta)"
 
 # alpha's journal — a mix that reduces to: #11 human-verify hold, #12 review BLOCK, #13 health gate
-# failed, #20 hold released (cleared), #30 blocked-then-merged (cleared).
+# failed, #20 hold released (cleared), #30 blocked-then-merged (cleared), and #69 a STALE BLOCK on a
+# PR that is no longer open (closed out of band, so the journal never saw a merge to clear it —
+# issue #131). #11/#12/#13 are ALSO in alpha's live open-PR set below so they still surface.
 cat > "$T/proj/alpha-trees/.herd/journal.jsonl" <<'JL'
 {"ts":"2026-07-03T07:00:00Z","event":"verdict_recorded","pr":12,"value":"BLOCK","source":"reviewer"}
 {"ts":"2026-07-03T08:00:00Z","event":"hold_applied","pr":11,"kind":"human-verify","slug":"login-fix"}
@@ -75,11 +77,17 @@ cat > "$T/proj/alpha-trees/.herd/journal.jsonl" <<'JL'
 {"ts":"2026-07-03T05:30:00Z","event":"hold_released","pr":20,"kind":"approve","reason":"approved"}
 {"ts":"2026-07-03T04:00:00Z","event":"verdict_recorded","pr":30,"value":"BLOCK"}
 {"ts":"2026-07-03T09:00:00Z","event":"merge","pr":30,"slug":"shipped"}
+{"ts":"2026-07-01T04:00:00Z","event":"verdict_recorded","pr":69,"value":"BLOCK"}
 JL
 
-# alpha's live PRs (gh): #14 CONFLICTING (attention), #8 MERGEABLE (no attention).
+# alpha's live PRs (gh): #11/#12/#13 are the OPEN PRs the journal items above pertain to, #14
+# CONFLICTING (attention), #8 MERGEABLE (no attention). #69 is deliberately ABSENT — it is closed, so
+# its stale journal BLOCK must be filtered out of the inbox.
 cat > "$FAKE_GH_DIR/alpha.json" <<'J'
-[{"number":14,"headRefName":"feat/widget","mergeable":"CONFLICTING"},
+[{"number":11,"headRefName":"feat/login-fix","mergeable":"MERGEABLE"},
+ {"number":12,"headRefName":"feat/blocked","mergeable":"MERGEABLE"},
+ {"number":13,"headRefName":"feat/api-gate","mergeable":"MERGEABLE"},
+ {"number":14,"headRefName":"feat/widget","mergeable":"CONFLICTING"},
  {"number":8,"headRefName":"feat/clean","mergeable":"MERGEABLE"}]
 J
 
@@ -127,6 +135,10 @@ printf '%s' "$alpha_block" | grep -q '#20' && fail "#20 hold was released → mu
 printf '%s' "$alpha_block" | grep -q '#30' && fail "#30 was merged → must not appear (blocked-then-merged clears)"
 ok
 
+# ── 6b. a STALE BLOCK on a since-CLOSED PR (#69, not in the live open set) is filtered (#131) ──
+printf '%s' "$alpha_block" | grep -q '#69' && fail "#69 is closed (not in gh open set) → stale BLOCK must be filtered"
+ok
+
 # ── 7. a clean project shows nothing pending, not items ───────────────────────
 printf '%s' "$beta_block" | grep -qi 'clean'  || fail "beta (empty) should report clean"
 printf '%s' "$beta_block" | grep -q '#'       && fail "clean project beta must list no PR items"
@@ -138,6 +150,21 @@ summary="$(printf '%s' "$out" | grep '^Fleet:')"
 printf '%s' "$summary" | grep -q '4 items'          || fail "summary should tally 4 items, got: $summary"
 printf '%s' "$summary" | grep -q 'across 1 project'  || fail "summary should count 1 needy project"
 printf '%s' "$summary" | grep -q '1 clean'           || fail "summary should count 1 clean project"
+ok
+
+# ── 8b. a project whose ONLY journal rows are stale (closed PRs) shows CLEAN (#131) ──
+# gamma has a BLOCK on #77 but NO open PRs → the stale row is filtered and the project reads clean.
+GAMMA="$(_mkproj gamma)"
+printf '{"ts":"2026-07-01T04:00:00Z","event":"verdict_recorded","pr":77,"value":"BLOCK"}\n' \
+  > "$T/proj/gamma-trees/.herd/journal.jsonl"
+echo '[]' > "$FAKE_GH_DIR/gamma.json"
+bash "$HERD" fleet register "$GAMMA" >/dev/null
+out_g="$(bash "$HERD" fleet inbox)"
+gamma_block="$(printf '%s' "$out_g" | awk '/^gamma$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
+printf '%s' "$gamma_block" | grep -qi 'clean' || fail "gamma (only stale closed-PR rows) should read clean"
+printf '%s' "$gamma_block" | grep -q '#77'    && fail "gamma's stale BLOCK on closed #77 must not surface"
+# deregister gamma so the summary counts in later assertions stay stable
+grep -v "|$GAMMA|" "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 ok
 
 # ── 9. an UNREACHABLE (missing) project is reported, not fatal ─────────────────

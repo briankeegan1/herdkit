@@ -147,6 +147,83 @@ grep -q "tab create" "$HERDR_LOG" || fail "reuse path should open a fresh fleet-
 grep -q "agent start fleet-coordinator" "$HERDR_LOG" || fail "reuse path should still start the agent"
 ok
 
+# ── 6b. ADOPT: a fleet-coordinator agent already running → exit 0, no re-start (#132) ──
+# herdr agent list reports the coordinator already up; the launcher must adopt it (refresh the skill,
+# point the human at it) WITHOUT creating a workspace/tab or starting a second agent.
+cat > "$BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HERDR_LOG:?}"
+case "$1 $2" in
+  "agent list")       echo '{"result":{"agents":[{"name":"fleet-coordinator","agent_status":"idle","pane_id":"apane-1"}]}}' ;;
+  "workspace list")   echo '{"result":{"workspaces":[{"workspace_id":"ws-fleet","label":"fleet"}]}}' ;;
+  *)                  echo '{"result":{}}' ;;
+esac
+exit 0
+STUB
+chmod +x "$BIN/herdr"
+
+: > "$HERDR_LOG"
+out="$(bash "$HERD" fleet room 2>&1)" || fail "adopt path (existing agent) should exit 0"
+printf '%s' "$out" | grep -qi "already up" || fail "adopt path should report the room is already up"
+printf '%s' "$out" | grep -q "herdr agent focus fleet-coordinator" || fail "adopt path should point at 'herdr agent focus fleet-coordinator'"
+if grep -q "agent start" "$HERDR_LOG"; then fail "adopt path must NOT start a second agent"; fi
+if grep -q "workspace create" "$HERDR_LOG"; then fail "adopt path must NOT create a workspace"; fi
+if grep -q "tab close" "$HERDR_LOG"; then fail "adopt path must NOT tear down the running room's tab"; fi
+[ -f "$SKILL" ] || fail "adopt path should still (re-)render the fleet skill so it is fresh"
+ok
+
+# ── 6c. GENUINE start failure (no existing agent, agent start fails) → non-zero + clearer error ──
+cat > "$BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HERDR_LOG:?}"
+case "$1 $2" in
+  "agent list")       echo '{"result":{"agents":[]}}' ;;
+  "workspace list")   echo '{"result":{"workspaces":[{"workspace_id":"ws-fleet","label":"fleet"}]}}' ;;
+  "workspace focus")  echo '{"result":{}}' ;;
+  "tab list")         echo '{"result":{"tabs":[]}}' ;;
+  "tab create")       echo '{"result":{"tab":{"tab_id":"tab-9"},"root_pane":{"pane_id":"pane-9"}}}' ;;
+  "tab rename")       echo '{"result":{}}' ;;
+  "agent start")      echo '{"error":"boom"}' >&2; exit 1 ;;
+  *)                  echo '{"result":{}}' ;;
+esac
+exit 0
+STUB
+chmod +x "$BIN/herdr"
+
+: > "$HERDR_LOG"
+set +e
+out="$(bash "$HERD" fleet room 2>&1)"; rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "a genuine agent-start failure should exit non-zero"
+printf '%s' "$out" | grep -qi "could not start" || fail "genuine failure should report it could not start the agent"
+grep -q "agent start fleet-coordinator" "$HERDR_LOG" || fail "genuine failure must have actually attempted the start"
+ok
+
+# restore the reuse stub for any later cases
+cat > "$BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HERDR_LOG:?}"
+case "$1 $2" in
+  "workspace list")   echo '{"result":{"workspaces":[{"workspace_id":"ws-fleet","label":"fleet"}]}}' ;;
+  "workspace focus")  echo '{"result":{}}' ;;
+  "tab list")         echo '{"result":{"tabs":[]}}' ;;
+  "tab create")       echo '{"result":{"tab":{"tab_id":"tab-2"},"root_pane":{"pane_id":"pane-2"}}}' ;;
+  "tab rename")       echo '{"result":{}}' ;;
+  "agent start")      echo '{"result":{"agent":{"pane_id":"apane-2"}}}' ;;
+  *)                  echo '{"result":{}}' ;;
+esac
+exit 0
+STUB
+chmod +x "$BIN/herdr"
+
+# ── 6d. launch output documents the interactive permission posture (#132b) ────
+: > "$HERDR_LOG"
+out="$(bash "$HERD" fleet room 2>&1)" || fail "launch should succeed"
+printf '%s' "$out" | grep -qi "interactive" || fail "launch output should note the seat runs interactive claude"
+printf '%s' "$out" | grep -qi "approval\|approve" || fail "launch output should note the first fleet-CLI call asks for approval"
+if grep -q -- "--dangerously-skip-permissions" "$HERDR_LOG"; then fail "the room must NOT pass --dangerously-skip-permissions"; fi
+ok
+
 # ── 7. unknown argument fails loudly ─────────────────────────────────────────
 if bash "$HERD" fleet room bogus >/dev/null 2>&1; then
   fail "fleet room should reject unexpected arguments"

@@ -878,6 +878,14 @@ def reduce_journal(files):
 
 def project_items(p):
     st = reduce_journal(p["files"])
+    # gh gives the AUTHORITATIVE set of currently-open PRs. A journal-derived attention item
+    # (BLOCK / hold / escalation / failed health gate) for a PR that is no longer open — closed or
+    # merged OUT OF BAND, so the journal never saw a merge/reap to clear it — is STALE and must be
+    # dropped (issue #131: a 2-day-old BLOCK row kept surfacing on a since-CLOSED PR). When gh is
+    # UNAVAILABLE we cannot prove a PR is closed, so we FAIL OPEN and keep journal items (same
+    # best-effort posture the CONFLICTING check already takes offline).
+    gh_down = any(str(n).startswith("gh") for n in p["notes"])
+    open_prs = set(str(pr) for pr, branch, mergeable in p["gh"])
     conflicts = {}
     for pr, branch, mergeable in p["gh"]:
         if str(mergeable).upper() == "CONFLICTING":
@@ -885,6 +893,9 @@ def project_items(p):
     items = []   # (pr, reason, action)
     for pr, s in st.items():
         if s["done"]:
+            continue
+        # Cross-check against the live open-PR set — drop stale rows for closed/merged PRs.
+        if not gh_down and pr not in open_prs:
             continue
         if s["held"]:
             kind = s["hold_kind"]
@@ -1121,6 +1132,25 @@ EOF
 # it moves with HERD_FLEET_FILE and stays under ~/.herd by default). HERD_FLEET_ROOM_DIR overrides.
 _fleet_room_dir() { printf '%s' "${HERD_FLEET_ROOM_DIR:-$(dirname "$(_fleet_registry_file)")/fleet-room}"; }
 
+# _fleet_room_agent_exists <agent-name> — 'yes' if a herdr agent whose name EXACTLY equals the fleet
+# coordinator name is already running, else empty. Reuses the SAME `herdr agent list` JSON contract
+# agent-watch.sh parses ({"result":{"agents":[{"name":…}]}}). Never fatal: if herdr/python3 is absent
+# or the list can't be parsed it prints nothing, so the caller treats "unknown" as "not up" and takes
+# the normal launch path (issue #132: an already-running room must be ADOPTED, not re-started).
+_fleet_room_agent_exists() {
+  local name="$1"
+  herdr agent list 2>/dev/null | NAME="$name" python3 -c '
+import sys, json, os
+name = os.environ["NAME"]
+try:
+    agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+    if any(a.get("name") == name for a in agents):
+        sys.stdout.write("yes")
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+
 # render_fleet_skill — render templates/fleet-coordinator.md.tmpl into the room's
 # .claude/commands/fleet-coordinator.md, substituting the LIVE registry (project bullet list, count,
 # registry path) plus the model tier and engine paths. Pure bash string replacement, exactly like
@@ -1209,6 +1239,17 @@ EOF
   local agent_name="fleet-coordinator"
   local cmd="/fleet-coordinator"
 
+  # ADOPT an already-running room instead of failing (issue #132). If a fleet-coordinator agent is
+  # already up, `herdr agent start` would refuse — which used to surface as the misleading "could not
+  # start the fleet-coordinator agent". Detect it FIRST (before we touch any workspace/tab), leave its
+  # live session untouched, and just refresh the skill (already re-rendered above) so a re-run picks up
+  # a changed registry. Then point the human at it and exit clean.
+  if [ "$(_fleet_room_agent_exists "$agent_name")" = "yes" ]; then
+    ok "room already up — herdr agent focus $agent_name"
+    say "   skill refreshed: $skill"
+    return 0
+  fi
+
   # Resolve the fleet's OWN herdr workspace (labeled $label) — reuse if it already exists, else
   # create a dedicated one. We only ever touch a workspace with our own fleet label, never the
   # ambient/focused one (the same multi-tenancy discipline coordinator.sh uses per project).
@@ -1245,11 +1286,17 @@ EOF
   fi
 
   # The NL master-coordinator agent: ONE tab, running the rendered skill. No watcher/backlog panes.
+  # No existing room was found above, so this is a GENUINE start failure — report it with a clearer,
+  # actionable message (not the old bare "could not start …"), pointing at the likely herdr cause.
   herdr agent start "$agent_name" --workspace "$WS" --cwd "$room" --tab "$TAB" \
     -- claude --model "$model" "$cmd" >/dev/null 2>&1 \
-    || die "could not start the fleet-coordinator agent"
+    || die "could not start the fleet-coordinator agent in workspace $WS — herdr agent start failed (check 'herdr agent list' / that herdr is healthy). No existing room was detected, so this is a real launch failure."
 
   ok "fleet room up — ${c_bold}$agent_name${c_rst} managing $nproj project(s) via $cmd"
   say "   skill:     $skill"
   say "   focus it:  herdr agent focus $agent_name"
+  # Permission posture (issue #132b): the fleet seat is a HUMAN seat by design — it runs INTERACTIVE
+  # claude, so its first fleet-CLI call will prompt for approval. That is intentional; we do NOT pass
+  # --dangerously-skip-permissions to the room (the master delegates DOWN and must stay human-gated).
+  say "   note:      interactive seat — first fleet-CLI call will ask for approval (human seat by design)"
 }
