@@ -24,6 +24,15 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # (herd pane backlog / herd reload).
 # BACKLOG_VIEW_EXTRAS=""              # "" (off, default) | github-issues
 
+# TASK_PANE_VIEW — builder-tab task-spec viewer. DEFAULT on: the builder lanes (herd-quick.sh /
+# herd-feature.sh) render the builder's live task spec ($WORKTREES_DIR/<slug>.task.md) in the tab's
+# OTHERWISE-IDLE root pane via task-spec-view.sh (glow + the bundled tokyonight style, repaint on
+# mtime, a quiet dim 'task spec removed' line when the file is reaped — never red), so a human sees
+# WHAT the agent was told to build instead of a bare shell. Strictly ADDITIVE UX: the pane is unused
+# today, so off restores the bare shell exactly. Launched only when the root pane is not hosting the
+# app preview, and never under the headless driver (no panes → clean no-op).
+# TASK_PANE_VIEW="on"                 # on (default) | off
+
 # health + preview — the two big project-specific commands.
 # `herd init` seeds .herd/healthcheck.project.sh from the template matching scout's detected stack
 # (Go → healthcheck.go.sh, Rust → healthcheck.rust.sh, Java → healthcheck.java.sh, Node →

@@ -97,15 +97,26 @@ incoming_block() {
 # Everything below is inert for the file backend (the dispatch at the bottom only enters it when
 # SCRIBE_BACKEND is a non-file value). Kept as functions so the historical file loop stays verbatim.
 
-# list_to_md — turn `herd backlog` output into a markdown bullet list so glow renders it nicely.
-# File-backend lines already begin with "- "; tracker backends emit bare "#<id> <title>" lines, so
-# prefix those with "- " (never "#…", which glow would balloon into an H1 heading). Blank in → blank.
+# list_to_md — turn `herd backlog` output into a markdown bullet list so glow renders it with REAL
+# visual hierarchy (not a flat, monochrome wall the tokyonight theme has nothing to color). Tracker
+# backends emit bare "#<id> <title>" lines; a flat "- #HERD-n title" bullet gives glow one
+# undifferentiated run of body text. Instead we shape each item so glow+style paints it like the loved
+# file-backend
+# view: the identifier as an inline CODE chip (a distinct themed color/background — a tag that pops)
+# and the title in BOLD (the theme's strong color), with a blank line between entries so they divide
+# visually. This is PURE markdown-shaping — glow + the style do ALL the coloring (no ANSI hand-coding),
+# and the plain-text `cat` fallback (which prints the raw list, not this) stays readable. An optional
+# leading "- " is stripped first so a bullet a backend already added is reshaped uniformly, never
+# doubled. A bare "#…" is never emitted (glow would balloon it into an H1). Blank in → blank out.
 list_to_md() {
   printf '%s\n' "$1" | while IFS= read -r ln; do
+    case "$ln" in '- '*) ln="${ln#- }" ;; esac   # normalize a pre-existing bullet so shaping is uniform
     case "$ln" in
-      '')      printf '\n' ;;
-      '- '*)   printf '%s\n' "$ln" ;;
-      *)       printf -- '- %s\n' "$ln" ;;
+      '')          printf '\n' ;;
+      '#'*' '*)    # "#<id> <title>": code-chip id (themed tag) + bold title, then a blank line to divide
+                   printf -- '- `%s` **%s**\n\n' "${ln%% *}" "${ln#* }" ;;
+      '#'*)        printf -- '- `%s`\n\n' "$ln" ;;               # id-only line → just the chip
+      *)           printf -- '- **%s**\n\n' "$ln" ;;             # no id → bold the whole line
     esac
   done
 }

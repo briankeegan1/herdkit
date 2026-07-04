@@ -152,6 +152,16 @@ else
   herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
 fi
 
+# 3b. Task-spec viewer in the tab's OTHERWISE-IDLE root pane (TASK_PANE_VIEW, default on). The quick
+# lane's agent runs in its own pane, leaving ROOT sitting at a bare shell — so this is strictly
+# additive UX: it renders $TASK_SPEC_FILE live via task-spec-view.sh; TASK_PANE_VIEW=off restores the
+# bare shell exactly. Sent through the driver's send-text surface (the `herdr pane run` equivalent),
+# which fails SOFT if the pane is gone. HEADLESS has no panes → skip cleanly (panes are a view, not a
+# dependency), so the whole block is gated on the non-headless driver.
+if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
+  herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+fi
+
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
   echo "🐑 Quick sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS)   dir: $DIR"
   echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"

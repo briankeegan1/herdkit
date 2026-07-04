@@ -182,6 +182,16 @@ PY
   fi
 fi
 
+# 5. Task-spec viewer in the root pane — ONLY when it is NOT hosting the app preview (never hijack a
+# live process). PORT is non-empty EXACTLY when app-monitor.sh was launched into ROOT above; empty
+# means the root pane is otherwise unused (no APP_PREVIEW_CMD, HERD_NO_APP=1, or no free port found),
+# so the viewer fills it with $TASK_SPEC_FILE live via task-spec-view.sh. TASK_PANE_VIEW default on;
+# off restores the bare shell. Sent through the driver's send-text surface (the `herdr pane run`
+# equivalent), which fails SOFT if the pane is gone. HEADLESS has no panes → skip cleanly.
+if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ -z "$PORT" ] && [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
+  herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+fi
+
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
   echo "🐑 Sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS)   dir: $DIR"
   echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
