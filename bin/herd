@@ -2932,8 +2932,10 @@ usage: herd fleet <subcommand>
 
   register <path>            add a herd project (reads its .herd/config) to the registry
   list                       list registered projects (name · path · repo)
-  discover [--register] <root>...
-                             scan roots for .herd/config; print (and optionally register) projects
+  discover [--register|--yes] [<root>...]
+                             scan roots (default: sensible parent dirs) for .herd/config; print each
+                             project + whether it is already registered; --register adds the new ones
+                             (dry-run by default — writes nothing)
   status                     per-project rollup: branch, open PRs, watcher alive?, last activity
   digest [--since <dur>]     cross-project standup from each project's journal (shipped / needs-you /
                              blocked / in-flight / gate failures over a window; default 24h; no LLM)
@@ -3019,8 +3021,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       registry (default ~/.herd/fleet):
                                         register <path>     add a herd project to the registry
                                         list                list registered projects
-                                        discover [--register] <root>...
-                                                            scan roots for .herd/config projects
+                                        discover [--register] [<root>...]
+                                                            scan roots (default: sensible parents) for
+                                                            .herd/config projects; dedups already-
+                                                            registered; --register adds the new ones
                                         status              per-project rollup (branch, open PRs,
                                                             watcher alive?, last journal activity)
                                         digest [--since D]  cross-project standup from journals

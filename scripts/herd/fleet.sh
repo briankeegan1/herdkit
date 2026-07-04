@@ -137,18 +137,72 @@ fleet_list() {
   fi
 }
 
-# fleet_discover [--register] <root>... — scan the given roots for .herd/config files and print the
-# herd projects found (workspace / path / repo). With --register, also add each to the registry.
-# This is the auto-discovery helper; `herdr workspace list` separately enumerates the LIVE ones.
+# _fleet_registered_paths — print the canonical PROJECT_ROOT of every registered project, one per
+# line (skipping blanks/comments). Discover uses this to DEDUP projects already in the registry, and
+# to derive its default scan roots. The registry stores the SAME resolved PROJECT_ROOT that
+# _fleet_read_config yields, so a discovered project's path matches its registry line byte-for-byte.
+_fleet_registered_paths() {
+  local reg; reg="$(_fleet_registry_file)"
+  [ -f "$reg" ] || return 0
+  local n p r
+  while IFS='|' read -r n p r; do
+    case "$n" in ''|'#'*) continue ;; esac
+    [ -n "$p" ] && printf '%s\n' "$p"
+  done < "$reg"
+}
+
+# _fleet_discover_default_roots — the scan roots `discover` uses when given none: "sensible parents"
+# (the EPIC's phrase for auto-discovery). HERD_FLEET_DISCOVER_ROOTS (colon-separated) overrides — a
+# test seam AND the inline default until a real scan-roots CONFIG KEY lands. (FOLLOW-UP: a
+# HERD_FLEET_DISCOVER_ROOTS / scan-roots key in capabilities.tsv — the config schema is locked this
+# wave, so no new key is added here.) Otherwise: the parent dir of each already-registered project
+# (to surface its untracked siblings) plus the parent of PROJECT_ROOT / CWD. Order-preserving +
+# de-duplicated; callers still skip any entry that is not a directory.
+_fleet_discover_default_roots() {
+  if [ -n "${HERD_FLEET_DISCOVER_ROOTS:-}" ]; then
+    printf '%s' "$HERD_FLEET_DISCOVER_ROOTS" | tr ':' '\n' | awk 'NF && !seen[$0]++'
+    return 0
+  fi
+  {
+    local p
+    while IFS= read -r p; do
+      [ -n "$p" ] && dirname "$p"
+    done < <(_fleet_registered_paths)
+    dirname "${PROJECT_ROOT:-$PWD}"
+  } | awk 'NF && !seen[$0]++'
+}
+
+# fleet_discover [--register|--yes] [<root>...] — scan the given roots (default: the sensible parents
+# from _fleet_discover_default_roots) for .herd/config files and print each herd project found
+# (workspace / path / repo / STATUS). A project ALREADY in the registry is listed but marked
+# `registered` and never re-offered (dedup); a not-yet-registered one is marked `new`. With
+# --register / --yes each NEW project is added to the registry. Default is a DRY RUN — it writes
+# nothing. This is the auto-discovery helper; `herdr workspace list` separately enumerates the LIVE
+# ones. Non-directory roots and roots with no projects are handled gracefully (warn / friendly note).
 fleet_discover() {
   local do_register=""
-  case "${1:-}" in --register|-r) do_register=1; shift ;; esac
-  [ "$#" -gt 0 ] || die "usage: herd fleet discover [--register] <root>..."
+  case "${1:-}" in --register|-r|--yes|-y) do_register=1; shift ;; esac
 
-  local root found=0
-  printf '%s%-16s %-44s %s%s\n' "$c_bold" "PROJECT" "PATH" "REPO" "$c_rst"
-  for root in "$@"; do
+  # Roots: explicit args win; otherwise fall back to the sensible-parents default so a bare
+  # `herd fleet discover` still does something useful.
+  local roots=()
+  if [ "$#" -gt 0 ]; then
+    roots=("$@")
+  else
+    local d
+    while IFS= read -r d; do [ -n "$d" ] && roots+=("$d"); done < <(_fleet_discover_default_roots)
+  fi
+  [ "${#roots[@]}" -gt 0 ] \
+    || die "usage: herd fleet discover [--register] [<root>...]  (no default roots could be resolved)"
+
+  # Snapshot the already-registered canonical paths once, for dedup lookups in the scan loop.
+  local registered_paths; registered_paths="$(_fleet_registered_paths)"
+
+  local root found=0 new=0 already=0
+  printf '%s%-16s %-40s %-14s %s%s\n' "$c_bold" "PROJECT" "PATH" "REPO" "STATUS" "$c_rst"
+  for root in "${roots[@]}"; do
     [ -d "$root" ] || { warn "not a directory, skipping: $root"; continue; }
+    local rootabs; rootabs="$(cd "$root" 2>/dev/null && pwd -P)" || { warn "cannot enter: $root"; continue; }
     # Bounded scan for .herd/config; the project root is the dir that OWNS the .herd dir.
     while IFS= read -r cfg; do
       [ -n "$cfg" ] || continue
@@ -159,16 +213,40 @@ fleet_discover() {
       proj="$(printf '%s' "$row" | cut -f2)"
       repo="$(printf '%s' "$row" | cut -f5)"
       found=$((found+1))
-      printf '%-16s %-44s %s\n' "$name" "$proj" "${repo:-—}"
-      [ -n "$do_register" ] && fleet_register "$proj" >/dev/null 2>&1
-    done < <(find "$root" -maxdepth "${HERD_FLEET_DISCOVER_DEPTH:-5}" -type f -path '*/.herd/config' 2>/dev/null | sort -u)
+
+      local status
+      if printf '%s\n' "$registered_paths" | grep -qxF "$proj"; then
+        already=$((already+1))
+        status="${c_dim}registered${c_rst}"
+      else
+        new=$((new+1))
+        status="${c_grn}new${c_rst}"
+        if [ -n "$do_register" ]; then
+          # Subshell so a stray die() inside fleet_register (e.g. config vanished mid-scan) cannot
+          # abort the whole discover run — we record the failure per project and keep going.
+          if ( fleet_register "$proj" ) >/dev/null 2>&1; then
+            status="${c_grn}registered ✓${c_rst}"
+          else
+            status="${c_red}register failed${c_rst}"
+          fi
+        fi
+      fi
+      printf '%-16s %-40s %-14s %s\n' "$name" "$proj" "${repo:-—}" "$status"
+    done < <(find "$rootabs" -maxdepth "${HERD_FLEET_DISCOVER_DEPTH:-5}" -type f -path '*/.herd/config' 2>/dev/null | sort -u)
   done
+
   say ""
   if [ "$found" -eq 0 ]; then
-    say "no herd projects found under: $*"
+    say "no herd projects found under: ${roots[*]}"
+  elif [ -n "$do_register" ]; then
+    say "$found project(s) found ($new newly registered, $already already in registry)"
   else
-    say "$found project(s) found${do_register:+ (registered)}"
+    say "$found project(s) found ($new new, $already already registered)"
+    if [ "$new" -gt 0 ]; then
+      say "register the new one(s) with: herd fleet discover --register <root>..."
+    fi
   fi
+  return 0
 }
 
 # ── status rollup ────────────────────────────────────────────────────────────
