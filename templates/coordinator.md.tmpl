@@ -22,7 +22,7 @@ in parallel.
    planned/shipped (✅) prose history.
 2. Get current state of in-flight work (run both, they're fast):
    - `git worktree list` — existing feature worktrees
-   - `herdr agent list` — which sub-agents are running / idle / blocked
+   - `herdr agent list` — which sub-agents are running / idle / blocked <!-- DRIVER:list-agents -->
 3. Present the menu with **AskUserQuestion**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo
@@ -32,6 +32,40 @@ in parallel.
    - **Workflow settings** — view or change any workflow preference (`.herd/config`) anytime
 
 After completing any action, return to this menu until the user chooses to stop.
+
+## Driver commands (herdr + Claude Code)
+
+This skill drives two **runtime-specific** surfaces: the **multiplexer** (`herdr`, which owns
+tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into
+a pane). Everything else the coordinator runs — `herd …`, `gh …`, the lane scripts under
+`{{SCRIPTS_DIR}}` — is runtime-independent and stays the same regardless of driver.
+
+The incantations below are the **only** places this skill is bound to the herdr + Claude Code
+driver. They are the single source for that surface: every driver use elsewhere in this skill
+carries a matching `DRIVER:<capability>` marker, so the whole surface is greppable in one pass
+(`grep DRIVER:`). Behavior is **unchanged** for today's driver — this is a readability/factoring
+restructure. A future runtime swap replaces each capability's incantation in one place rather than
+forking this skill; the design is written up in `docs/driver-abstraction.md` (phase 2: a driver
+definition file + render-time token substitution via the same machinery that fills the other tokens
+in this file).
+
+Capabilities this skill uses directly:
+
+- **`DRIVER:list-agents`** — `herdr agent list` — enumerate sub-agents with running / idle / blocked
+  status; also used to match agents to open PRs.
+- **`DRIVER:focus-agent`** — `herdr agent focus <slug>` — jump to (and hand off to) a builder's
+  agent by its slug.
+- **`DRIVER:send-text`** — `herdr pane run <agent-pane> "<text>"` — send a prompt or command to a
+  builder's **agent** pane; Claude Code auto-submits it (no separate keystroke). Always target the
+  agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
+  where text vanishes and the agent never wakes.
+- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code
+  runtime's model mid-session (the escalate / step-up flow).
+
+Adjacent driver capabilities the *workflow* uses but this skill does not invoke inline — the lane
+scripts spawn builders (**start-agent** / **create-tab**) and the watcher reads panes
+(**read-pane**, **send-keys**) — are catalogued in `docs/driver-abstraction.md` so phase 2 covers
+the full surface.
 
 ## How you research (important)
 
@@ -73,7 +107,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    catches the costly misjudgments.
 4. Enqueue the status change (don't edit `{{BACKLOG_FILE}}` yourself — see *Backlog writes*):
    `bash {{SCRIPTS_DIR}}/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
-5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any.
+5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any. <!-- DRIVER:focus-agent -->
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `{{BACKLOG_FILE}}`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
@@ -97,6 +131,7 @@ Never run more than the user wants in parallel — call out if 4+ agents are alr
 (review bandwidth, not spawn capacity, is the real limit).
 
 ### Step up a builder mid-flight
+<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands (herdr + Claude Code)" -->
 
 `MODEL_ESCALATE_GLOB` only sees the task text at spawn time — it can't know about scope you add
 later. So whenever you **expand a running builder's scope** — sending it addenda that pull in more
@@ -153,7 +188,7 @@ Surface what the CLI guarantees so the user knows the change is safe and live:
 
 You own **all** backlog updates — sub-agents build + open PRs, the auto-merge watcher merges them.
 
-1. `herdr agent list` + `gh pr list` to match agents to open PRs.
+1. `herdr agent list` + `gh pr list` to match agents to open PRs. <!-- DRIVER:list-agents -->
 2. **The watcher merges ready PRs automatically** — MERGEABLE+CLEAN → healthcheck + review gate →
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
@@ -193,7 +228,7 @@ Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you
 semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
 
 When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
-you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane.
+you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane. <!-- DRIVER:focus-agent -->
 
 ### Approve pending merges (MERGE_POLICY=approve)
 
