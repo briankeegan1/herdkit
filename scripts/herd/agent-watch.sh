@@ -150,6 +150,17 @@ HEALTH_STATE="$TREES/.agent-watch-healthchecks"
 # / _handle_limit_blocked). The record is REMOVED (and its hook sentinel cleared) the instant a
 # resume succeeds; a failed-after-retry attempt flips to `failed` and escalates without retrying.
 LIMIT_STATE="$TREES/.agent-watch-limit"
+# Clean-menu-select ledger, PARALLEL to $LIMIT_STATE and keyed by SLUG: one line per limit-parked
+# session the watcher has tried to resume the CLEAN way — by sending the limit menu's "Stop and wait
+# for limit to reset" keystrokes via `herdr pane send-keys` so Claude's NATIVE wait-and-auto-resume
+# takes over (see _try_clean_limit_menu_select). Format "<slug> <epoch> <state>", state ∈
+# cleared | fallback. cleared = the menu was confirmed GONE after the keystrokes (native resume owns
+# the wait); fallback = the send-keys select could not clear the menu within a bounded couple of
+# attempts, so the EXISTING scheduled `claude --continue` backstop (below) still runs. This is a
+# per-park DEDUP so the keystrokes are attempted AT MOST ONCE per park (not re-sent every ~4s tick);
+# it NEVER gates the backstop off — the backstop always remains, so worst case is today's behavior.
+# Kept SEPARATE from $LIMIT_STATE so that ledger's format/semantics stay untouched.
+SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 # Reconcile ledger, PARALLEL to $STATE and the review/health ledgers: one line per POST-MERGE backlog
 # auto-reconcile ENQUEUE ("<epoch> <pr#> <headSha> <slug>"). Keyed by PR *and* head sha (mirroring
 # $REVIEW_STATE / $HEALTH_STATE) so the reconcile scribe request fires EXACTLY ONCE per merged PR: a
@@ -1309,6 +1320,88 @@ _fmt_hhmm() {
   date -r "$e" +%H:%M 2>/dev/null || date -d "@$e" +%H:%M 2>/dev/null || printf '??:??'
 }
 
+# ── Clean limit-menu resume via `herdr pane send-keys` (builders + coordinator) ───────────────────
+# When a session hits the account usage limit it parks at Claude's interactive arrow-menu
+# (option 1 "Upgrade your plan" HIGHLIGHTED / option 2 "Stop and wait for limit to reset"). Selecting
+# option 2 triggers Claude's OWN native wait-and-auto-resume, which preserves in-progress work and
+# continues with full context — strictly better than the watcher firing `claude --continue` at a
+# (possibly-misparsed) reset time INTO a still-menu-parked pane. `herdr pane send-keys <pane> <key…>`
+# lets us pick option 2 by sending Down then Enter.
+#
+# DEFENSIVE / ADDITIVE by construction — the send-keys key vocabulary is UNVERIFIED against a live
+# limit-park (no park to test yet):
+#   • VERIFY it took — after sending the keys, re-read the pane and confirm the menu text is GONE.
+#   • BOUNDED — a couple of attempts, then give up.
+#   • FALLBACK — the EXISTING scheduled `claude --continue` backstop (_resume_builder) is NEVER
+#     removed; on any send-keys failure the caller simply lets it run, so worst case = today.
+# HERD_LIMIT_MENU_SELECT=off is a kill-switch that skips the clean path entirely (straight to backstop).
+
+# sendkeys_state <slug> — recorded clean-select outcome (cleared|fallback), or empty when none.
+sendkeys_state() {
+  [ -s "$SENDKEYS_STATE" ] || return 0
+  awk -v s="$1" '$1==s{st=$3} END{if(st)print st}' "$SENDKEYS_STATE" 2>/dev/null || true
+}
+# record_sendkeys <slug> <epoch> <state> — upsert (drop any prior line for this slug first).
+record_sendkeys() {
+  local _sk_tmp="${SENDKEYS_STATE}.$$"
+  { [ -f "$SENDKEYS_STATE" ] && grep -v "^$1 " "$SENDKEYS_STATE" 2>/dev/null
+    printf '%s %s %s\n' "$1" "$2" "$3"
+  } > "$_sk_tmp" 2>/dev/null && mv "$_sk_tmp" "$SENDKEYS_STATE" 2>/dev/null || rm -f "$_sk_tmp" 2>/dev/null
+}
+# clear_sendkeys <slug> — drop the slug's clean-select record (park fully resolved / session working).
+clear_sendkeys() {
+  [ -s "$SENDKEYS_STATE" ] || return 0
+  local _cs_tmp="${SENDKEYS_STATE}.$$"
+  grep -v "^$1 " "$SENDKEYS_STATE" 2>/dev/null > "$_cs_tmp"
+  mv "$_cs_tmp" "$SENDKEYS_STATE" 2>/dev/null || rm -f "$_cs_tmp" 2>/dev/null
+}
+
+# _limit_menu_keys — the menu-select key tokens (space-separated). Default "Down Enter" selects
+# option 2 ("Stop and wait for limit to reset") and confirms it. Kept EASILY ADJUSTABLE: override via
+# HERD_LIMIT_MENU_KEYS (e.g. "Down Return") without a code edit, in case a live park reveals the TUI
+# wants a different key name — the vocabulary is UNVERIFIED until a real limit-park confirms it.
+_limit_menu_keys() { printf '%s' "${HERD_LIMIT_MENU_KEYS:-Down Enter}"; }
+
+# _pane_shows_limit_menu <pane_id> — true iff the pane's visible content STILL shows the usage-limit
+# arrow-menu ("Upgrade your plan" / "Stop and wait for limit to reset"). Reads the pane via
+# `herdr pane read`. FAILS SAFE: an empty read (herdr absent, no such pane, capture failed) is treated
+# as "menu still present" (return 0) so we NEVER falsely declare the clean select a success on no
+# evidence — the caller then keeps the backstop.
+_pane_shows_limit_menu() {
+  local _pm_pane="$1" _pm_txt
+  _pm_txt="$(herdr pane read "$_pm_pane" --source visible 2>/dev/null || true)"
+  [ -n "$_pm_txt" ] || return 0   # no evidence → assume still parked (fail safe)
+  printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
+}
+
+# _try_clean_limit_menu_select <slug> <worktree> [pane_id] — the CLEAN limit-resume path. Sends the
+# menu-select keystrokes (Down, Enter) via `herdr pane send-keys` to pick "Stop and wait for limit to
+# reset" — handing the wait to Claude's NATIVE auto-resume — then VERIFIES the menu is gone by
+# re-reading the pane. Bounded to a couple of attempts. Returns 0 iff the menu is confirmed GONE;
+# 1 otherwise (caller keeps / falls back to the existing _resume_builder backstop). Never itself
+# schedules or clears the limit ledger — purely the keystroke+verify step.
+_try_clean_limit_menu_select() {
+  local _cs_slug="$1" _cs_wt="$2" _cs_pane="${3:-}"
+  [ "${HERD_LIMIT_MENU_SELECT:-on}" != "off" ] || return 1   # kill-switch → straight to backstop
+  command -v herdr >/dev/null 2>&1 || return 1
+  [ -n "$_cs_pane" ] || _cs_pane="$(_find_builder_pane_id_any "$_cs_slug")"
+  [ -n "$_cs_pane" ] || return 1
+  local _cs_keys _cs_max _cs_i
+  # shellcheck disable=SC2206
+  read -r -a _cs_keys <<<"$(_limit_menu_keys)"
+  [ "${#_cs_keys[@]}" -gt 0 ] || return 1
+  _cs_max="${HERD_LIMIT_MENU_ATTEMPTS:-2}"; case "$_cs_max" in ''|*[!0-9]*) _cs_max=2 ;; esac
+  for (( _cs_i=1; _cs_i<=_cs_max; _cs_i++ )); do
+    herdr pane send-keys "$_cs_pane" "${_cs_keys[@]}" >/dev/null 2>&1 || true
+    if ! _pane_shows_limit_menu "$_cs_pane"; then
+      journal_append limit_menu_selected slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempt "$_cs_i"
+      return 0
+    fi
+  done
+  journal_append limit_menu_select_failed slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempts "$_cs_max"
+  return 1
+}
+
 # _handle_limit_blocked <slug> <worktree> <idx> <reset-epoch> — surface + schedule + (at the reset)
 # perform the auto-resume for ONE limit-blocked builder. Sets DISPLAY[idx]. The row is a distinct,
 # NON-RED "limit-hit · auto-resume at HH:MM" — a usage-limit pause is an expected account-wide event,
@@ -1332,6 +1425,17 @@ _handle_limit_blocked() {
     journal_append limit_detected slug "$_lb_slug" reset_at "$_lb_reset" resume_at "$_lb_target"
     journal_append limit_resume_scheduled slug "$_lb_slug" resume_at "$_lb_target"
     _lb_state="scheduled"
+    # CLEAN PATH (preferred, additive): the pane is parked at the limit menu right now — try picking
+    # "Stop and wait for limit to reset" via send-keys so Claude's NATIVE auto-resume handles the wait.
+    # Attempted ONCE per park; the scheduled `claude --continue` backstop above stays in place, so on
+    # failure we simply degrade to today's behavior (see the reset-reached branch's working-guard).
+    if [ -z "$(sendkeys_state "$_lb_slug")" ]; then
+      if _try_clean_limit_menu_select "$_lb_slug" "$_lb_wt"; then
+        record_sendkeys "$_lb_slug" "$_lb_now" "cleared"
+      else
+        record_sendkeys "$_lb_slug" "$_lb_now" "fallback"
+      fi
+    fi
   fi
 
   # A prior failed attempt stays escalated — never re-attempt every tick.
@@ -1342,12 +1446,27 @@ _handle_limit_blocked() {
 
   _lb_target="$(limit_target_epoch "$_lb_slug")"
   if [ "$_lb_now" -lt "$_lb_target" ] 2>/dev/null; then
-    # Waiting for the reset: distinct cyan hold row (NOT a red/stall row).
-    DISPLAY[_lb_idx]="    ${C_CYAN}⏳${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit-hit · auto-resume at $(_fmt_hhmm "$_lb_target")${C_RESET}"
+    # Waiting for the reset: distinct cyan hold row (NOT a red/stall row). When the clean menu-select
+    # took, say so — Claude's native auto-resume is driving the wait, not our scheduled backstop.
+    if [ "$(sendkeys_state "$_lb_slug")" = "cleared" ]; then
+      DISPLAY[_lb_idx]="    ${C_CYAN}⏳${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit-hit · native auto-resume (backstop $(_fmt_hhmm "$_lb_target"))${C_RESET}"
+    else
+      DISPLAY[_lb_idx]="    ${C_CYAN}⏳${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit-hit · auto-resume at $(_fmt_hhmm "$_lb_target")${C_RESET}"
+    fi
     return 0
   fi
 
-  # Reset reached (+buffer) → resume in place now.
+  # Reset reached (+buffer). If the agent is ALREADY working, a resume already took hold — Claude's
+  # native auto-resume from the earlier clean menu-select, or a human — so do NOT fire a second
+  # `claude --continue` into a live session. Treat it as resolved and clear the ledgers.
+  if [ "$(_agent_status "$_lb_slug")" = "working" ]; then
+    journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false reason native_or_manual
+    clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
+    DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed (native auto-resume)${C_RESET}"
+    return 0
+  fi
+
+  # Otherwise the backstop: resume in place now via `claude --continue`.
   DISPLAY[_lb_idx]="    ${C_CYAN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_CYAN}limit reset · resuming via --continue…${C_RESET}"
   render
   local _lb_pane
@@ -1355,7 +1474,7 @@ _handle_limit_blocked() {
   journal_append limit_resume_attempt slug "$_lb_slug" pane "${_lb_pane:-none}" target "$_lb_target"
   if [ -n "$_lb_pane" ] && _resume_builder "$_lb_slug" "$_lb_wt" "$_lb_pane"; then
     journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false
-    clear_limit "$_lb_slug" "$_lb_wt"
+    clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
     DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed via --continue${C_RESET}"
   else
     record_limit "$_lb_slug" "$_lb_now" "$_lb_target" "failed"
@@ -1427,7 +1546,10 @@ _handle_coordinator_watchdog() {
   # FAIL-SAFE #1: a 'working' coordinator is healthy — NEVER touch it. Drop any stale record+sentinel
   # (a human intervened, or a prior scheduled resume flipped it back to working).
   if [ "$_cw_status" = "working" ]; then
-    [ -n "$(limit_state "$HERD_AGENT_COORDINATOR")" ] && clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"
+    if [ -n "$(limit_state "$HERD_AGENT_COORDINATOR")" ]; then clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"; fi
+    # The coordinator name is a SINGLETON reused across parks, so a stale clean-select record must be
+    # dropped the moment it is back to working — otherwise it would gate a future park's clean attempt.
+    clear_sendkeys "$HERD_AGENT_COORDINATOR"
     return 0
   fi
 
@@ -1451,6 +1573,18 @@ _handle_coordinator_watchdog() {
     journal_append coordinator_limit_detected agent "$HERD_AGENT_COORDINATOR" reset_at "${_cw_reset:-0}" resume_at "$_cw_target"
     journal_append coordinator_resume_scheduled agent "$HERD_AGENT_COORDINATOR" resume_at "$_cw_target"
     _cw_state="scheduled"
+    # CLEAN PATH (preferred, additive): the coordinator pane is parked at the limit menu right now —
+    # try picking "Stop and wait for limit to reset" via send-keys so Claude's NATIVE auto-resume
+    # handles the wait. Attempted ONCE per park; the scheduled `claude --continue` backstop stays in
+    # place (the working-check at the top of this function short-circuits it if native resume wins).
+    if [ -z "$(sendkeys_state "$HERD_AGENT_COORDINATOR")" ]; then
+      if _try_clean_limit_menu_select "$HERD_AGENT_COORDINATOR" "$MAIN" "$(_coordinator_pane_id)"; then
+        record_sendkeys "$HERD_AGENT_COORDINATOR" "$_cw_now" "cleared"
+        journal_append coordinator_limit_menu_selected agent "$HERD_AGENT_COORDINATOR" keys "$(_limit_menu_keys)"
+      else
+        record_sendkeys "$HERD_AGENT_COORDINATOR" "$_cw_now" "fallback"
+      fi
+    fi
   fi
 
   # A prior failed attempt stays escalated — never re-attempt every tick (bounded-retry-then-escalate).
@@ -1466,7 +1600,7 @@ _handle_coordinator_watchdog() {
   journal_append coordinator_resume_attempt agent "$HERD_AGENT_COORDINATOR" pane "${_cw_pane:-none}" target "$_cw_target"
   if [ -n "$_cw_pane" ] && _resume_builder "$HERD_AGENT_COORDINATOR" "$MAIN" "$_cw_pane"; then
     journal_append coordinator_resume_result agent "$HERD_AGENT_COORDINATOR" woke 1 escalated false
-    clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"
+    clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"; clear_sendkeys "$HERD_AGENT_COORDINATOR"
     herdr notification show "🛰 coordinator resumed" \
       --body "coordinator limit reset — resumed in place via claude --continue" --sound default >/dev/null 2>&1 || true
   else
