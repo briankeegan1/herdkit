@@ -65,23 +65,49 @@ case "$cmd" in
       done < <(ls -1 "$Q"/*.req 2>/dev/null | sort)
       if [ -n "$claimed" ]; then
         ( cd "$REPO" && git pull --ff-only --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null ) || true
-        echo "CLAIMED $claimed"; cat "$claimed"; exit 0
+        # Emit the ACTIVE backend (SCRIBE_BACKEND was sourced fresh THIS invocation, so it reflects
+        # any mid-session flip) so the drainer applies each request via the backend live at DRAIN
+        # time — not whatever was set when the drainer was spawned (issue #139).
+        echo "CLAIMED $claimed"; echo "BACKEND $SCRIBE_BACKEND"; cat "$claimed"; exit 0
       fi
       [ "$waited" -ge "$POLL" ] && { echo "EMPTY"; exit 0; }
       sleep 2; waited=$((waited+2))
     done
     ;;
   commit)
+    # File-backend apply: the agent has already edited $BACKLOG_FILE; stage+commit+push it.
     mine="${2:?claimed path}"; sum="${3:?summary}"
     cd "$REPO" || exit 1
     _BACKEND_RESULT=""
-    _backend_add_item "$mine" "$sum"
-    _report_and_cleanup "$mine" "$sum" "$_BACKEND_RESULT"
+    if [ "$SCRIBE_BACKEND" = "file" ]; then
+      _backend_add_item "$mine" "$sum"
+      _report_and_cleanup "$mine" "$sum" "$_BACKEND_RESULT"
+    else
+      # STALE-DRAINER GUARD (issue #139): a file-mode 'commit' arrived while the ACTIVE backend is
+      # NON-file — a drainer spawned before a mid-session SCRIBE_BACKEND flip is still running with a
+      # backend-conditional prompt from the old mode. The old bug filed the short SUMMARY as a backend
+      # item (the junk 'no-op:' issues). Instead: discard the drainer's stray $BACKLOG_FILE edit and
+      # dispatch the ORIGINAL request text (still in the claimed file) through the ACTIVE backend, so
+      # the item lands correctly. Warn LOUDLY so the operator retires the stale drainer.
+      echo "scribe-step: SCRIBE_BACKEND='$SCRIBE_BACKEND' but a file-mode 'commit' arrived — a stale file-mode drainer is running (retire it). Discarding its $BACKLOG_FILE edit and dispatching the request via the active backend. [issue #139]" >&2
+      git checkout -- "$BACKLOG_FILE" 2>/dev/null || true
+      _stale_text="$(cat "$mine" 2>/dev/null)"; [ -n "$_stale_text" ] || _stale_text="$sum"
+      _backend_add_item "$mine" "$_stale_text"
+      _report_and_cleanup "$mine" "$_stale_text" "$_BACKEND_RESULT"
+    fi
     ;;
   add-item)
     # API/changelog path: the agent did NOT edit any file — dispatch the text to the backend.
     mine="${2:?claimed path}"; text="${3:?item text}"
     cd "$REPO" || exit 1
+    if [ "$SCRIBE_BACKEND" = "file" ]; then
+      # Reverse of the #139 flip: a non-file drainer (spawned before a flip TO 'file') is draining.
+      # The file backend needs a creative $BACKLOG_FILE edit this step script cannot synthesize, so a
+      # bare dispatch cannot place the item (file's _backend_add_item finds no staged edit → NOCHANGE).
+      # Warn LOUDLY (never silent) — retire the stale drainer so a fresh file-mode drainer edits
+      # $BACKLOG_FILE for this request. [issue #139]
+      echo "scribe-step: SCRIBE_BACKEND='file' but an 'add-item' dispatch arrived — a stale non-file drainer is running (retire it); this request needs a file-mode drainer to edit $BACKLOG_FILE. [issue #139]" >&2
+    fi
     _BACKEND_RESULT=""
     _backend_add_item "$mine" "$text"
     _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"

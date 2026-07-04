@@ -65,54 +65,43 @@ sys.exit(0 if any(
   echo "✍️  scribe already running — it will drain this."; exit 0
 fi
 
-# 4. Otherwise spawn the single drainer. The prompt is backend-conditional: the file backend
-#    edits $BACKLOG_FILE directly; an API/changelog backend instead calls scribe-step.sh
-#    add-item so the step script dispatches to the backend without any file editing.
-if [ "$SCRIBE_BACKEND" = "file" ]; then
+# 4. Otherwise spawn the single drainer. The prompt is BACKEND-AGNOSTIC (issue #139): it is emitted
+#    IDENTICALLY regardless of the spawn-time SCRIBE_BACKEND. scribe-step.sh 'next' reports the
+#    ACTIVE backend (resolved fresh each drain) on a "BACKEND <name>" line and the drainer branches
+#    on THAT per request — so a mid-session SCRIBE_BACKEND flip is honored on the very next drained
+#    request instead of being drained in the stale spawn-time mode (the old junk 'no-op:' issues).
 PROMPT=$(cat <<EOF
 You are the BACKLOG SCRIBE (queue drainer). Drain the backlog queue, one request at a time.
 Repeat this loop:
 
 1. Run:  bash $HERE/scribe-step.sh next
-   • It prints "CLAIMED <path>" then the request text (repo already pulled & current), OR "EMPTY".
+   • It prints "CLAIMED <path>", then "BACKEND <name>" (the ACTIVE backend, read NOW), then the
+     request text (repo already pulled & current). OR it prints "EMPTY".
    • If EMPTY: run  bash $HERE/scribe-step.sh finish . STOP -> end your turn (done).
      MORE -> go back to step 1.
-2. Apply the request, editing ONLY $REPO/$BACKLOG_FILE. Need to look into the repo first? dispatch
-   an Explore subagent (do not read piles of files yourself). Make a TARGETED, privacy-safe edit.
-   Write prose paragraphs as ONE physical line (no hard wraps mid-paragraph) so the glow viewer
-   and GitHub both reflow them to the pane width — wrapped lines miscount emoji width and break
-   too early. Reserve line breaks for between list items and paragraphs.
-   If an Edit fails because lines moved (the user edited concurrently), re-read and re-apply —
-   never clobber their change.
-   SHIPPED (✅) items: never DELETE a shipped entry to make room. If a request asks you to cap the
-   "Recently shipped" list or drop the oldest shipped items, just prepend the new ✅ entry and leave
-   the rest in place — the commit step (step 3) AUTOMATICALLY rotates shipped entries beyond the most
-   recent ~10 into $REPO/${BACKLOG_FILE%.md}.archive.md (which the coordinator and builders never
-   read). Do not create or edit that archive file yourself; the commit step owns it.
-3. Run:  bash $HERE/scribe-step.sh commit <path> "<short summary>"
-4. Go to step 1.
-
-Only touch $BACKLOG_FILE; use scribe-step.sh for all git/queue/report mechanics. Never merge,
-switch branches, or edit any other file.
-EOF
-)
-else
-PROMPT=$(cat <<EOF
-You are the BACKLOG SCRIBE (queue drainer). Drain the backlog queue, one request at a time.
-Repeat this loop:
-
-1. Run:  bash $HERE/scribe-step.sh next
-   • It prints "CLAIMED <path>" then the request text (repo already pulled & current), OR "EMPTY".
-   • If EMPTY: run  bash $HERE/scribe-step.sh finish . STOP -> end your turn (done).
-     MORE -> go back to step 1.
-2. Call:  bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
-   Do NOT edit any files — the step script dispatches to the $SCRIBE_BACKEND backend.
+2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend
+   can change mid-session, so ALWAYS use the one printed for THIS request — never an earlier value:
+   • BACKEND is "file": edit ONLY $REPO/$BACKLOG_FILE. Need to look into the repo first? dispatch an
+     Explore subagent (do not read piles of files yourself). Make a TARGETED, privacy-safe edit.
+     Write prose paragraphs as ONE physical line (no hard wraps mid-paragraph) so the glow viewer and
+     GitHub both reflow them to the pane width — wrapped lines miscount emoji width and break too
+     early. Reserve line breaks for between list items and paragraphs. If an Edit fails because lines
+     moved (the user edited concurrently), re-read and re-apply — never clobber their change.
+     SHIPPED (✅) items: never DELETE a shipped entry to make room. If a request asks you to cap the
+     "Recently shipped" list or drop the oldest shipped items, just prepend the new ✅ entry and leave
+     the rest in place — the commit step AUTOMATICALLY rotates shipped entries beyond the most recent
+     ~10 into $REPO/${BACKLOG_FILE%.md}.archive.md (which the coordinator and builders never read).
+     Do not create or edit that archive file yourself; the commit step owns it.
+     Then run:  bash $HERE/scribe-step.sh commit <path> "<short summary>"
+   • BACKEND is anything else (github/linear/changelog/…): do NOT edit any file — run
+     bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
+     The step script dispatches the item to the active backend.
 3. Go to step 1.
 
-Use scribe-step.sh for all mechanics. Never edit files or switch branches.
+Use scribe-step.sh for all git/queue/report mechanics. Never merge, switch branches, or edit any
+file other than $BACKLOG_FILE (and only when the active backend is "file").
 EOF
 )
-fi
 created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
 herdr agent start "$HERD_AGENT_SCRIBE" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --tab "$TAB" --no-focus --env "SCRIBE_TAB=$TAB" -- claude --model "$SCRIBE_MODEL" $CLAUDE_FLAGS "$PROMPT"
