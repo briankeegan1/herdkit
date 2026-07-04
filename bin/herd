@@ -861,9 +861,39 @@ cmd_config() {
     list)         cmd_config_list "$@" ;;
     get)          cmd_config_get "$@" ;;
     set)          cmd_config_set "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set <KEY> <VALUE>" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set <KEY> <VALUE>" ;;
+    lint)         _config_lint "$@" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set <KEY> <VALUE> | lint" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set <KEY> <VALUE> | lint" ;;
   esac
+}
+
+# _config_lint — surface DUPLICATE keys in .herd/config (issue #115), the handler behind
+# `herd config lint`. The config is shell-sourced, so a key assigned twice silently LAST-WINS and can
+# disable a gate; this lists every duplicated key and exits NON-ZERO when any exist (a scriptable
+# gate), while a clean config is silent and exits 0. It does NOT edit the file — value resolution
+# (shell last-wins) is unchanged; this only surfaces it. (Named `_config_*` like the other private
+# config helpers, not `cmd_config_*`: it is a subcommand handler, not a new top-level command.)
+_config_lint() {
+  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  # The scanner lives in herd-config.sh. Pre-set the once-per-process marker so sourcing the loader
+  # does not ALSO emit its passive dup warning — this command is the authoritative report.
+  _HERD_CONFIG_DUP_WARNED=1
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  local dupes; dupes="$(_herd_config_dup_keys "$cfg")"
+  if [ -z "$dupes" ]; then
+    ok "no duplicate keys in .herd/config ($cfg)"
+    return 0
+  fi
+  say "${c_bold}duplicate key(s) in .herd/config${c_rst}  ($cfg)"
+  local k
+  while IFS= read -r k; do
+    [ -n "$k" ] && printf '  %s%s%s — assigned more than once; shell last-wins (the LAST assignment silently overrides the earlier one)\n' "$c_bold" "$k" "$c_rst"
+  done <<< "$dupes"
+  say ""
+  warn "shell last-wins can SILENTLY disable a gate (issue #115) — delete the stale duplicate line(s) in $cfg (value resolution is unchanged; herd does not auto-dedup)."
+  exit 1
 }
 
 cmd_config_list() {
@@ -960,6 +990,12 @@ cmd_config_set() {
 # writes any config, and install.sh runs (advisory) at install time. Exits non-zero when a HARD dep
 # is missing/broken so `herd doctor` is scriptable in CI.
 cmd_doctor() {
+  # Source the config loader too: herd_doctor's config-dup check (issue #115) uses its scanner
+  # (_herd_config_dup_keys). Pre-set the once-per-process marker so the loader's PASSIVE dup warning
+  # stays silent here — the doctor reports duplicates itself in its own Config section.
+  _HERD_CONFIG_DUP_WARNED=1
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-preflight.sh"
   herd_doctor || exit 1
@@ -2931,13 +2967,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       when a required dep is missing/broken. (bypass: HERD_SKIP_DOCTOR=1)
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
-  herd config <list|get|set>          view/validate/set .herd/config keys (key set + metadata from
+  herd config <list|get|set|lint>     view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
                                         set <KEY> <V> validate against capabilities.tsv, edit in place,
                                                       then restart the watcher (watcher keys) or
                                                       re-render the coordinator skill (coordinator keys);
                                                       never touches DENY_PATHS / .herd/secrets
+                                        lint          flag DUPLICATE keys (silent shell last-wins can
+                                                      disable a gate); exits non-zero if any exist
   herd reload                         rebuild the control room around the coordinator: stop +
                                       relaunch the watcher (pane visibility verified), ensure
                                       the pinned backlog pane, re-render the coordinator skill;
