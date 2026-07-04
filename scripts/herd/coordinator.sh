@@ -83,6 +83,16 @@ fi
 herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null 2>"$_CE" \
   || _coord_die "backlog-view pane"
 
+# 2b. Install the rate_limit StopFailure hook on the COORDINATOR's repo, exactly as new-feature.sh
+#     does for each builder worktree (herd_write_ratelimit_hook, from the herd-config.sh sourced
+#     above). A coordinator turn that ends on the account usage limit then writes
+#     $REPO/.herd-limit-sentinel — the same version-robust limit-hit signal the watcher already polls
+#     for builders. This closes the coordinator's hook gap: without it, a limit-parked coordinator
+#     leaves NO sentinel and the (opt-in) COORDINATOR_WATCHDOG has only the banner-scrape fallback.
+#     Harmless + inert on its own (it only ever writes a sentinel file), so it is UNCONDITIONAL — the
+#     watchdog that consumes the sentinel is what stays gated behind COORDINATOR_WATCHDOG. Best-effort.
+herd_write_ratelimit_hook "$REPO"
+
 # 3. Right pane = coordinator Claude, auto-running the generated coordinator skill.
 started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --workspace "$WS" --cwd "$REPO" --tab "$TAB" --split right \
   -- claude --model "$MODEL_COORDINATOR" "$COORDINATOR_CMD" 2>"$_CE") || _coord_die "coordinator agent"

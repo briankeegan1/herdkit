@@ -1358,6 +1358,120 @@ _handle_limit_blocked() {
   return 0
 }
 
+# ── Coordinator watchdog (OPT-IN: COORDINATOR_WATCHDOG=on; DEFAULT off ⇒ byte-inert) ─────────────
+# The builder auto-resume path above revives a limit-parked BUILDER, but the COORDINATOR
+# (coordinator.sh → plain `claude --model … /coordinator`, running from $MAIN) gets no such coverage:
+# the tick's feature-worktree loop excludes $MAIN, so a limit-parked or dead coordinator is NEVER
+# seen or revived — the self-resume paradox (a paused session cannot resume itself; only a detached
+# process like this watcher can). coordinator.sh now installs the same rate_limit hook the builders
+# get, so a limit-hit coordinator writes $MAIN/.herd-limit-sentinel; this watchdog consumes it.
+#
+# ACTIVATION IS A DELIBERATE OPERATOR STEP: the entire path below is gated on COORDINATOR_WATCHDOG=on
+# AND requires restarting the watcher (config is read at launch). When the flag is off/unset (the
+# default), _handle_coordinator_watchdog returns before doing ANYTHING — no herdr call, no ledger
+# write, no relaunch — so merging this feature is completely inert until a user opts in.
+#
+# FAIL-SAFE by construction (mirrors _handle_limit_blocked / _resume_builder):
+#   • CONFIRM before acting — relaunch ONLY a coordinator whose agent is NOT 'working' AND that shows
+#     a real limit signal (sentinel/banner via _detect_limit_hit). A 'working' coordinator is never
+#     touched (and any stale record is dropped); a merely-idle coordinator with no limit signal is
+#     left alone (blind-resuming a healthy idle session is exactly the untested auto-recovery we
+#     refuse). An existing scheduled record keeps the resume alive across ticks after the signal clears.
+#   • NEVER double-launch — the relaunch is guarded by an atomic-mkdir launch lock keyed by the same
+#     WORKSPACE_NAME slug as the watcher's own singleton lock, so a concurrent coordinator.sh relaunch
+#     (or a stray second watcher) can never fire a second `claude --continue` at the same pane.
+#   • BOUND retries then escalate — _resume_builder retries the submit once internally; a resume that
+#     still fails flips the record to `failed` (no re-attempt on later ticks) and escalates via a
+#     notification. Never loops.
+# The limit ledger is keyed by $HERD_AGENT_COORDINATOR (a singleton name that can never collide with a
+# feature slug), reusing the tested record_limit/limit_state/limit_target_epoch/clear_limit helpers.
+
+# Launch lock dir — mirrors the watcher's WORKSPACE_NAME-keyed singleton lock path (HERD_WATCHER_LOCK)
+# so exactly one coordinator relaunch can be in flight at a time.
+COORD_LAUNCH_LOCK="${HERD_WATCHER_LOCK%.pid}.coordinator-launch.d"
+
+# _coordinator_pane_id — pane_id of the coordinator agent when it is NOT 'working' (resuming a live
+# session would double-drive it); empty when the agent is absent or working. Reuses the same
+# any-status-but-working lookup the limit/refix resume paths use for builders.
+_coordinator_pane_id() { _find_builder_pane_id_any "$HERD_AGENT_COORDINATOR"; }
+
+# _coordinator_launch_lock_acquire / _release — atomic-mkdir mutex held ONLY across the relaunch
+# instant. acquire returns 0 iff it took the lock. A lock left behind by a watcher that crashed
+# mid-relaunch (older than the reap window) is reclaimed once so the watchdog never wedges forever.
+_coordinator_launch_lock_acquire() {
+  mkdir "$COORD_LAUNCH_LOCK" 2>/dev/null && return 0
+  # Stale lock reap: only if the dir has not been touched within the reap window (~2 min).
+  if [ -z "$(find "$COORD_LAUNCH_LOCK" -prune -mmin -2 2>/dev/null)" ]; then
+    rmdir "$COORD_LAUNCH_LOCK" 2>/dev/null || true
+    mkdir "$COORD_LAUNCH_LOCK" 2>/dev/null && return 0
+  fi
+  return 1
+}
+_coordinator_launch_lock_release() { rmdir "$COORD_LAUNCH_LOCK" 2>/dev/null || true; }
+
+# _handle_coordinator_watchdog — ONE per-tick coordinator-liveness step. No DISPLAY row (the
+# coordinator is not a feature worktree); it works quietly via the journal + a notification on
+# resume/escalation. Returns immediately unless COORDINATOR_WATCHDOG=on.
+_handle_coordinator_watchdog() {
+  [ "${COORDINATOR_WATCHDOG:-off}" = "on" ] || return 0
+  local _cw_status _cw_reset _cw_hit _cw_now _cw_state _cw_target _cw_pane
+  _cw_status="$(_agent_status "$HERD_AGENT_COORDINATOR")"
+
+  # FAIL-SAFE #1: a 'working' coordinator is healthy — NEVER touch it. Drop any stale record+sentinel
+  # (a human intervened, or a prior scheduled resume flipped it back to working).
+  if [ "$_cw_status" = "working" ]; then
+    [ -n "$(limit_state "$HERD_AGENT_COORDINATOR")" ] && clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"
+    return 0
+  fi
+
+  # FAIL-SAFE #2: CONFIRM the limit park before acting. Require a real limit signal on the
+  # coordinator's repo ($MAIN) — sentinel (primary) or banner scrape (fallback). With no signal AND
+  # no existing scheduled record, do nothing: a non-working coordinator with no limit signal is just
+  # idle-waiting for the user, not a fault. An existing record keeps the scheduled resume alive.
+  if _cw_reset="$(_detect_limit_hit "$HERD_AGENT_COORDINATOR" "$MAIN")"; then _cw_hit=1; else _cw_hit=0; fi
+  _cw_state="$(limit_state "$HERD_AGENT_COORDINATOR")"
+  { [ "$_cw_hit" = "1" ] || [ -n "$_cw_state" ]; } || return 0
+
+  _cw_now="$(_now)"
+  # First sighting → record + journal the hold and compute the resume target once (mirrors builders).
+  if [ -z "$_cw_state" ]; then
+    if [ "${_cw_reset:-0}" -gt 0 ] 2>/dev/null; then
+      _cw_target=$(( _cw_reset + $(_limit_buffer_secs) ))
+    else
+      _cw_target=$(( _cw_now + $(_limit_unknown_wait) ))
+    fi
+    record_limit "$HERD_AGENT_COORDINATOR" "$_cw_now" "$_cw_target" "scheduled"
+    journal_append coordinator_limit_detected agent "$HERD_AGENT_COORDINATOR" reset_at "${_cw_reset:-0}" resume_at "$_cw_target"
+    journal_append coordinator_resume_scheduled agent "$HERD_AGENT_COORDINATOR" resume_at "$_cw_target"
+    _cw_state="scheduled"
+  fi
+
+  # A prior failed attempt stays escalated — never re-attempt every tick (bounded-retry-then-escalate).
+  [ "$_cw_state" = "failed" ] && return 0
+
+  _cw_target="$(limit_target_epoch "$HERD_AGENT_COORDINATOR")"
+  # Still before the reset (+buffer) → hold; nothing to do this tick.
+  [ "$_cw_now" -lt "$_cw_target" ] 2>/dev/null && return 0
+
+  # Reset reached → resume in place now, under the launch lock so we NEVER double-launch.
+  _coordinator_launch_lock_acquire || return 0   # another relaunch already in flight → skip this tick
+  _cw_pane="$(_coordinator_pane_id)"
+  journal_append coordinator_resume_attempt agent "$HERD_AGENT_COORDINATOR" pane "${_cw_pane:-none}" target "$_cw_target"
+  if [ -n "$_cw_pane" ] && _resume_builder "$HERD_AGENT_COORDINATOR" "$MAIN" "$_cw_pane"; then
+    journal_append coordinator_resume_result agent "$HERD_AGENT_COORDINATOR" woke 1 escalated false
+    clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"
+    herdr notification show "🛰 coordinator resumed" \
+      --body "coordinator limit reset — resumed in place via claude --continue" --sound default >/dev/null 2>&1 || true
+  else
+    record_limit "$HERD_AGENT_COORDINATOR" "$_cw_now" "$_cw_target" "failed"
+    journal_append coordinator_resume_result agent "$HERD_AGENT_COORDINATOR" woke 0 escalated true
+    herdr notification show "🛰 coordinator resume FAILED" \
+      --body "coordinator did not wake after the limit reset — resume by hand (claude --continue in the coordinator pane)" --sound default >/dev/null 2>&1 || true
+  fi
+  _coordinator_launch_lock_release
+  return 0
+}
+
 # ── Builder liveness (pre-PR stall detection) ────────────────────────────────────────────────────
 # A builder with no PR yet used to be flagged "stalled? · check pane" the moment it hit 5 minutes
 # with zero branch commits. But builders normally commit exactly ONCE, at the very end, right
@@ -2484,6 +2598,10 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
     render
     spawn_resolver "$slug" "$prnum" "$branch"
   done
+
+  # Coordinator watchdog: ONE per-tick liveness check of the coordinator itself (which the feature
+  # loop above never sees — it runs from $MAIN, not a worktree). Byte-inert unless COORDINATOR_WATCHDOG=on.
+  _handle_coordinator_watchdog
 
   # Orphan sweep: every _ORPHAN_SWEEP_INTERVAL ticks close tabs whose slug is no longer live.
   _ORPHAN_SWEEP_TICK=$((_ORPHAN_SWEEP_TICK + 1))
