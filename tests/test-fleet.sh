@@ -64,6 +64,10 @@ _make_project() {
   git -C "$root" config user.email t@t.t
   git -C "$root" config user.name t
   ( cd "$root" && git commit -q --allow-empty -m init && git branch -M "feat/$name" )
+  # The TARGET's OWN origin remote — this (not HERD_REPO) is what the registry repo field must record
+  # (issue #128). Deliberately DIFFERENT from the config's HERD_REPO below so the test proves the fix
+  # resolves the remote, not the config value.
+  git -C "$root" remote add origin "git@github.com:acme/$name.git"
   local root_real; root_real="$(cd "$root" && pwd -P)"
   cat > "$root/.herd/config" <<CFG
 PROJECT_ROOT="$root_real"
@@ -88,9 +92,12 @@ bash "$HERD" fleet register "$BETA"  >/dev/null
 out="$(bash "$HERD" fleet list)"
 printf '%s' "$out" | grep -q "alpha" || fail "list missing registered project alpha"
 printf '%s' "$out" | grep -q "beta"  || fail "list missing registered project beta"
-printf '%s' "$out" | grep -q "me/alpha" || fail "list missing alpha's repo"
-grep -q "^alpha|$ALPHA|me/alpha$" "$HERD_FLEET_FILE" \
-  || fail "registry line for alpha not in name|path|repo form"
+# The registry repo field is the TARGET's own origin remote (acme/alpha), NOT its config HERD_REPO
+# (me/alpha) — issue #128. Assert the remote won and HERD_REPO did NOT leak in.
+printf '%s' "$out" | grep -q "acme/alpha" || fail "list missing alpha's repo (from its origin remote)"
+grep -q "|me/alpha$" "$HERD_FLEET_FILE" && fail "config HERD_REPO leaked into the registry repo field"
+grep -q "^alpha|$ALPHA|acme/alpha$" "$HERD_FLEET_FILE" \
+  || fail "registry line for alpha not in name|path|repo form with the remote-derived repo"
 ok
 
 # ── 2. register is idempotent (re-register does not duplicate) ────────────────
@@ -199,6 +206,46 @@ ok
 if bash "$HERD" fleet bogus >/dev/null 2>&1; then
   fail "unknown fleet subcommand should exit non-zero"
 fi
+ok
+
+# ── 14. issue #128: register resolves the TARGET's remote, not the CALLER's cwd remote ───────────
+# Register alpha from INSIDE a different git checkout whose own origin remote is caller/elsewhere.
+# The recorded repo must be the TARGET (acme/alpha), never the caller's (caller/elsewhere).
+CALLER="$T/caller"
+mkdir -p "$CALLER"
+git -C "$CALLER" init -q
+git -C "$CALLER" config user.email t@t.t
+git -C "$CALLER" config user.name t
+git -C "$CALLER" remote add origin "https://github.com/caller/elsewhere.git"
+( cd "$CALLER" && git commit -q --allow-empty -m init )
+REG14="$T/registry14/fleet"
+( cd "$CALLER" && HERD_FLEET_FILE="$REG14" bash "$HERD" fleet register "$ALPHA" >/dev/null )
+grep -q "^alpha|$ALPHA|acme/alpha$" "$REG14" \
+  || fail "register from a foreign cwd must record the TARGET's repo (acme/alpha), got: $(grep '^alpha|' "$REG14" || true)"
+grep -q "caller/elsewhere" "$REG14" && fail "caller's cwd remote leaked into the registry (issue #128)"
+ok
+
+# ── 15. a remote-less target records an empty repo field + emits a note ──────────────────────────
+NOREMOTE="$T/proj/noremote"
+mkdir -p "$NOREMOTE/.herd" "$T/proj/noremote-trees/.herd"
+git -C "$NOREMOTE" init -q
+git -C "$NOREMOTE" config user.email t@t.t
+git -C "$NOREMOTE" config user.name t
+( cd "$NOREMOTE" && git commit -q --allow-empty -m init )        # NO origin remote added
+noremote_real="$(cd "$NOREMOTE" && pwd -P)"
+cat > "$NOREMOTE/.herd/config" <<CFG
+PROJECT_ROOT="$noremote_real"
+WORKTREES_DIR="$noremote_real-trees"
+DEFAULT_BRANCH="origin/main"
+WORKSPACE_NAME="noremote"
+HERD_REPO="me/noremote"
+CFG
+REG15="$T/registry15/fleet"
+note="$(HERD_FLEET_FILE="$REG15" bash "$HERD" fleet register "$noremote_real" 2>&1 >/dev/null)"
+grep -q "^noremote|$noremote_real|$" "$REG15" \
+  || fail "remote-less target should record an EMPTY repo field, got: $(grep '^noremote|' "$REG15" || true)"
+printf '%s' "$note" | grep -qi "empty repo\|origin remote" \
+  || fail "remote-less register should emit a note about the empty repo field, got: $note"
 ok
 
 echo "ALL PASS ($pass checks)"
