@@ -118,3 +118,17 @@ HERD_REPO="briankeegan1/herdkit"
 # DEP_POLL_MIN="30"
 # DEP_POLL_MAX="300"
 # DEP_STALE_TTL="86400"
+
+# coordinator watchdog — opt-in coordinator auto-resume (agent-watch.sh). DEFAULT off: with it unset
+# or off the watcher never touches the coordinator, byte-identical to today. Builders already get a
+# rate_limit hook + auto-resume; the coordinator (coordinator.sh → `claude … /coordinator`, running
+# from the main checkout) does not — so if it hits the account usage limit unattended it parks at
+# Claude's interactive menu and ALL orchestration halts until a human resumes it. Set to on and this
+# watcher revives it the same way it revives a builder: at the reset (+HERD_LIMIT_RESUME_BUFFER) it
+# relaunches the coordinator in place via `claude --continue` in the coordinator pane. Safety rails:
+# it acts ONLY on a CONFIRMED park (a limit sentinel/banner AND the coordinator agent is not
+# 'working'), never relaunches a healthy/working coordinator, takes a WORKSPACE_NAME-keyed launch
+# lock so it never double-launches, and escalates a failed resume via notification without looping.
+# ACTIVATION is a deliberate two-part operator step: set COORDINATOR_WATCHDOG=on AND restart the
+# watcher (this flag is read at watcher launch). Recommended for unattended/overnight runs.
+# COORDINATOR_WATCHDOG="off"   # off (default) | on
