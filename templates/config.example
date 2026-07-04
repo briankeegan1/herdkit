@@ -14,6 +14,16 @@ BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
 SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
+# BACKLOG_VIEW_EXTRAS — VIEW-ONLY backlog-pane extra section. Default "" (off) → the pane output is
+# byte-identical to today. Set "github-issues" and the backlog viewer renders a SECOND, clearly
+# labeled '📥 incoming (github issues)' section BENEATH the primary work queue, listing this repo's
+# open GitHub issues (the herd-report incoming inbox) via `gh issue list`. Strictly ADDITIVE: never
+# merged into the primary list, never feeds `herd backlog` or coordinator work-selection —
+# SCRIBE_BACKEND stays the single source of truth for planned work. Fails SOFT on any gh error (a
+# quiet 'incoming unavailable' note, never a red row). Takes effect on the backlog pane's next launch
+# (herd pane backlog / herd reload).
+# BACKLOG_VIEW_EXTRAS=""              # "" (off, default) | github-issues
+
 # health + preview — the two big project-specific commands.
 # `herd init` seeds .herd/healthcheck.project.sh from the template matching scout's detected stack
 # (Go → healthcheck.go.sh, Rust → healthcheck.rust.sh, Java → healthcheck.java.sh, Node →

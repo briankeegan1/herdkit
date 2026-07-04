@@ -59,6 +59,40 @@ else
 fi
 now_hhmm() { date +%H:%M 2>/dev/null || echo '--:--'; }
 
+# ── incoming (github issues) — optional additive section (BACKLOG_VIEW_EXTRAS) ─
+# When BACKLOG_VIEW_EXTRAS=github-issues this prints a SECOND, clearly-labeled section listing THIS
+# repo's OPEN GitHub issues (the herd-report incoming inbox) — to be appended BENEATH the primary
+# work queue in either render mode. It is STRICTLY additive & view-only: it never merges into the
+# primary list and never feeds `herd backlog` or work-selection (SCRIBE_BACKEND stays the single
+# source of truth for planned work).
+#
+# Off / any other value → prints NOTHING (return 0), so today's output is byte-identical.
+#
+# Fails SOFT per the no-false-red rule: gh missing, unauthenticated, offline, or any non-zero exit
+# renders ONE dim 'incoming unavailable' line — never a red/alarming row, and it never breaks the
+# primary section. gh's stderr (which can carry an API error body or auth token) is DISCARDED, so no
+# secret or raw error body ever reaches the pane; the note is a fixed one-liner.
+incoming_block() {
+  [ "${BACKLOG_VIEW_EXTRAS:-}" = "github-issues" ] || return 0
+  printf '\n\033[1;35m📥 incoming (github issues)\033[0m\n'
+  if ! command -v gh >/dev/null 2>&1; then
+    printf '\033[2m  incoming unavailable\033[0m\n'
+    return 0
+  fi
+  local issues rc
+  # Ask for a clean '#<n> <title>' line shape via gh's built-in --jq; run from $REPO so gh binds to
+  # this project's repo. stdout only — stderr discarded (secrets / error bodies never reach the pane).
+  issues="$(cd "$REPO" 2>/dev/null && gh issue list --state open --limit 30 \
+              --json number,title --jq '.[] | "#\(.number) \(.title)"' 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '\033[2m  incoming unavailable\033[0m\n'
+  elif [ -n "$issues" ]; then
+    printf '%s\n' "$issues" | while IFS= read -r iln; do printf '  %s\n' "$iln"; done
+  else
+    printf '\033[2m  (no open issues)\033[0m\n'
+  fi
+}
+
 # ── non-file backend viewer ───────────────────────────────────────────────────
 # Everything below is inert for the file backend (the dispatch at the bottom only enters it when
 # SCRIBE_BACKEND is a non-file value). Kept as functions so the historical file loop stays verbatim.
@@ -76,12 +110,13 @@ list_to_md() {
   done
 }
 
-# render_backend_frame <list> <degraded 0|1> <since HH:MM> <refreshed HH:MM>
+# render_backend_frame <list> <degraded 0|1> <since HH:MM> <refreshed HH:MM> <incoming>
 # Clears + repaints the pane: styled header, then the list (glow if available, else plain text), then
-# — only when degraded — one dim last-good warning line. Returns non-zero if the body render failed so
+# — only when degraded — one dim last-good warning line, then the optional additive <incoming> block
+# (empty when BACKLOG_VIEW_EXTRAS is off → no change). Returns non-zero if the body render failed so
 # the caller can leave last_frame unlatched and retry (mirrors the file loop's success-latch).
 render_backend_frame() {
-  local list="$1" degraded="$2" since="$3" refreshed="$4"
+  local list="$1" degraded="$2" since="$3" refreshed="$4" incoming="${5:-}"
   local hhmm="${refreshed:---:--}" rc=0
   clear
   # e.g. '📋 herdkit · linear · live · 15:42'
@@ -102,6 +137,8 @@ render_backend_frame() {
   if [ "$degraded" -eq 1 ]; then
     printf '\033[2m⚠ backend unreachable since %s (showing last good)\033[0m\n' "$since"
   fi
+  # Strictly-additive incoming section (empty unless BACKLOG_VIEW_EXTRAS=github-issues).
+  [ -n "$incoming" ] && printf '%s\n' "$incoming"
   return "$rc"
 }
 
@@ -126,6 +163,12 @@ run_backend_mode() {
     raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
     trimmed="$(printf '%s' "$raw" | tr -d '[:space:]')"
 
+    # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS is on; its
+    # content is folded into the frame key so a change in the incoming list also triggers a repaint.
+    local incoming inc_hash
+    incoming="$(incoming_block)"
+    inc_hash="$(printf '%s' "$incoming" | cksum)"
+
     if [ "$rc" -eq 0 ] && [ -n "$trimmed" ]; then
       # Healthy poll. Re-render only when the list content actually changed (hash it).
       degraded=0; since=""
@@ -133,16 +176,16 @@ run_backend_mode() {
       if [ "$cur_hash" != "$last_hash" ]; then
         last_hash="$cur_hash"; last_good="$raw"; refreshed="$(now_hhmm)"
       fi
-      frame="ok|$last_hash|$refreshed"
+      frame="ok|$last_hash|$refreshed|$inc_hash"
     else
       # Degraded poll (error or empty). Keep the last good list; never blank, never red. Stamp the
       # unreachable-since time once, on the transition into degraded.
       if [ "$degraded" -eq 0 ]; then degraded=1; since="$(now_hhmm)"; fi
-      frame="down|$last_hash|$since"
+      frame="down|$last_hash|$since|$inc_hash"
     fi
 
     if [ "$frame" != "$last_frame" ]; then
-      if render_backend_frame "$last_good" "$degraded" "$since" "$refreshed"; then
+      if render_backend_frame "$last_good" "$degraded" "$since" "$refreshed" "$incoming"; then
         last_frame="$frame"
       fi
     fi
@@ -165,6 +208,13 @@ if [ "${SCRIBE_BACKEND:-file}" != "file" ]; then
   exit 0
 fi
 
+# Incoming-section refresh cadence for the file loop. The file loop ticks every 2s (mtime/banner
+# watch), but `gh issue list` must NOT run that often — refresh the incoming list on its own interval
+# (default 30s, override via BACKLOG_VIEW_POLL_SECS) and reuse the cached block between refreshes. Off
+# by default: when BACKLOG_VIEW_EXTRAS is unset the block stays empty and gh is never invoked.
+inc_poll="${BACKLOG_VIEW_POLL_SECS:-30}"; case "$inc_poll" in ''|*[!0-9]*) inc_poll=30 ;; esac
+incoming=""; inc_next=0
+
 while true; do
   cur_mtime=$(file_mtime "$f")
   ts=$(git -C "$REPO" log -1 --format=%ct -- "$BACKLOG_FILE" 2>/dev/null || echo 0)
@@ -180,8 +230,17 @@ while true; do
     banner=$(printf '\033[2m(uncommitted working-tree changes)\033[0m')
   fi
 
-  # render only when the file or banner state changes -> idle pane never repaints
-  frame="$cur_mtime|$banner"
+  # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS=github-issues
+  # → zero change to today's output; its content is folded into the frame key so a change in the
+  # incoming list also triggers a repaint. Refreshed at most every $inc_poll secs (cached in between)
+  # so the 2s file-watch tick never hammers `gh`.
+  if [ "${BACKLOG_VIEW_EXTRAS:-}" = "github-issues" ] && [ "$now" -ge "$inc_next" ]; then
+    incoming="$(incoming_block)"
+    inc_next=$(( now + inc_poll ))
+  fi
+
+  # render only when the file, banner, or incoming state changes -> idle pane never repaints
+  frame="$cur_mtime|$banner|$(printf '%s' "$incoming" | cksum)"
   if [ "$frame" != "$last_frame" ]; then
     clear
     printf '\033[1;36m📋 %s\033[0m  \033[2m(live)\033[0m\n' "$BACKLOG_FILE"
@@ -190,10 +249,15 @@ while true; do
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then glow -s "$STYLE" -w "$w" "$f"
     elif command -v glow >/dev/null 2>&1;                    then glow -s dark     -w "$w" "$f"
     else cat "$f"; fi
+    # Capture the render outcome BEFORE printing the additive section so latching still keys off the
+    # primary render (a failed glow/cat must not be masked by the incoming block's exit status).
+    render_rc=$?
+    # Strictly-additive incoming section, beneath the primary queue (empty when the key is off).
+    [ -n "$incoming" ] && printf '%s\n' "$incoming"
     # Only latch this frame once the render actually succeeded. If glow (or cat) fails / paints
     # nothing, leave last_frame unchanged so the next 2s tick retries instead of sticking on
     # stale/blank content until mtime or banner changes again.
-    if [ $? -eq 0 ]; then last_frame="$frame"; fi
+    if [ "$render_rc" -eq 0 ]; then last_frame="$frame"; fi
   fi
   sleep 2
 done
