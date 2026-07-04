@@ -61,6 +61,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backend-aware backlog-view test passes" {
+  run bash "$REPO/tests/test-backlog-view-backend.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]
