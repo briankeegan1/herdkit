@@ -1,7 +1,10 @@
 # Driver abstraction for the coordinator skill
 
-**Status:** phase 1 (this document + a factoring restructure of `templates/coordinator.md.tmpl`).
-Phase 2 (an actual second runtime) is **designed here, not built**.
+**Status:** phase 1 (this document + a factoring restructure of `templates/coordinator.md.tmpl`) and
+phase 2 (the render-time `{{DRIVER_*}}` token machinery + `HERD_DRIVER` config key) have **shipped**.
+Phase 3 — an actual second driver, **`headless`** — has now shipped too; see
+[Phase 3: the headless driver](#phase-3-the-headless-driver-shipped) at the end of this document.
+The sections below (originally written for phase 1) describe the design that phases 2–3 realized.
 
 **Origin:** Leak F in [`external-consumer-audit.md`](external-consumer-audit.md) and the backlog item
 *"[P3] Renderable coordinator skill for non-herdr/non-Claude drivers."* The rendered coordinator
@@ -159,3 +162,69 @@ exactly as other coordinator-facing keys already do.
 Building an actual second driver (VS Code / CI), abstracting the lane scripts' own internals, or
 touching the watcher's pane I/O. Phase 2 is only: *definition file + token substitution + config key*,
 so that a future driver is a data file, not a fork.
+
+---
+
+## Phase 3: the headless driver (shipped)
+
+Phase 2's token machinery makes the coordinator *skill* driver-swappable at render time. But the
+capability model above also names four capabilities the **watcher** and **lane scripts** exercise at
+*runtime* — `start-agent`, `create-tab`, `read-pane`, `send-keys` — plus notifications and
+`list-agents`, all still hard-wired to herdr. Phase 3 (HERD-7) adds the first non-herdr driver,
+**`headless`**, and the runtime plumbing those capabilities need.
+
+**Design principle: panes become a view, not a dependency.** Everything load-bearing — the watcher's
+merge gating, journal writes, notifications, and limit detection — must run correctly with **no herdr
+panes at all**. The herdr control room becomes an *optional* cockpit. This unlocks Windows / CI /
+headless Linux, where no herdr exists.
+
+### 1. The driver definition — `templates/drivers/headless.driver`
+
+Binds all eight capabilities (same keys as `herdr-claude.driver`) to headless incantations. Selected
+by `HERD_DRIVER=headless`; `herd render` then substitutes them into the coordinator skill exactly as
+for any driver. Zero-secret, command-shapes only — same contract as every driver file.
+
+### 2. The runtime shim — `scripts/herd/driver.sh`
+
+The runtime counterpart to render-time tokenization: one seam that binds each capability to a
+concrete implementation, dispatched on `HERD_DRIVER`. It is **sourced** (functions only, no side
+effects — lib-safe) by `agent-watch.sh`, `dep-watcher.sh`, and the lane scripts after
+`herd-config.sh`, and is also **runnable as a CLI** (`bash driver.sh <cap> …`) so the rendered
+headless coordinator skill drives the same surface. Two hard guarantees:
+
+- **Fail soft.** Every capability returns `0` (or a safe empty result) on any failure — a missing
+  pane, a missing herdr, a missing registry never aborts a caller under `set -euo pipefail`. A
+  missing pane must never stop load-bearing work.
+- **Byte-identical default.** For `HERD_DRIVER=herdr-claude` every capability runs the *exact* herdr
+  command it replaces, so the default driver's behavior is unchanged.
+
+### 3. Capability semantics under headless
+
+Each capability gets **either a real headless equivalent or explicit, documented view-only / no-op
+semantics** — always fail-soft:
+
+| Capability     | Headless implementation                                                                 |
+| -------------- | --------------------------------------------------------------------------------------- |
+| `start-agent`  | REAL — a **detached** background `claude` (nohup), stdout+stderr → a registry log        |
+| `list-agents`  | REAL — a **detached-agent registry** (`$WORKTREES_DIR/.herd/agents/<slug>/`) rendered in herdr's JSON shape, so dead-builder reconciliation works with no panes |
+| `read-pane`    | REAL — tails the detached agent's captured log                                           |
+| notifications  | REAL — a durable `.herd/notifications.log` sink (+ best-effort native `osascript`/`notify-send`) |
+| `send-text`    | BEST-EFFORT — appends to the agent's `input` queue file (a headless runtime may drain it) |
+| `switch-model` | BEST-EFFORT — a `/model` line via `send-text` (same seam)                                |
+| `focus-agent`  | VIEW — prints how to tail the agent's log (no pane to focus)                             |
+| `create-tab`   | NO-OP — headless has no tabs                                                             |
+| `send-keys`    | NO-OP — raw keystrokes are a pane concept                                                |
+
+The **detached-agent registry** is the key to correctness: `list-agents` reports only live pids
+(`kill -0`), so the watcher's dead-builder reconciliation — which keys off "agent vanished while the
+worktree lives on with no PR" — behaves the same with or without panes, instead of falsely reaping
+every builder because `herdr agent list` is empty.
+
+### 4. What the watcher's load-bearing core does NOT depend on
+
+Merge gating (`gh` + `healthcheck.sh` + the review gate) and journal writes were already
+runtime-independent; phase 3 only had to route the pane-coupled bits — `list-agents` (liveness),
+notifications, the limit-menu pane read/keys, and the auto-respawn spawn — through the shim, and make
+each fail soft. Limit *detection* is primarily a hook-sentinel file (already headless-friendly); the
+herdr clean-menu-select path is a pane concept, so under headless it falls straight through to the
+existing `claude --continue` backstop.

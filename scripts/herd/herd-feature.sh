@@ -22,6 +22,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 . "$HERE/herd-spawn-gate.sh"
+# Runtime driver shim: this lane IS the start-agent capability. Under HERD_DRIVER=headless it spawns
+# a DETACHED background agent (no herdr tab/pane) via herd_driver_start_agent; the default herdr-claude
+# driver keeps the herdr tab + agent-start path below byte-identical.
+. "$HERE/driver.sh"
+_HERD_DRIVER_NAME="$(herd_driver_name)"
 # Force-spawn override: a leading --force/-f (or HERD_FORCE_SPAWN=1) bypasses the advisory
 # review-gate saturation check below, for urgent items. Only recognized as the FIRST arg so it can
 # never be confused with task text.
@@ -67,15 +72,19 @@ fi
 
 # 2. New herdr tab rooted in the worktree; grab tab id + root pane id. If herdr is unavailable
 #    the parse yields empty ids and every later 'herdr pane/agent' call fails cryptically — bail.
-created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --label "$SLUG" --no-focus)
-read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
-  'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
-if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
-  echo "❌ herdr unavailable (could not create a tab for '$SLUG'); worktree is ready at $DIR but no panes were launched." >&2
-  exit 1
+#    SKIPPED under the headless driver: there are no tabs/panes (the agent is launched detached below).
+TAB=""; ROOT=""
+if [ "$_HERD_DRIVER_NAME" != "headless" ]; then
+  created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --label "$SLUG" --no-focus)
+  read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+  if [ -z "$TAB" ] || [ -z "$ROOT" ]; then
+    echo "❌ herdr unavailable (could not create a tab for '$SLUG'); worktree is ready at $DIR but no panes were launched." >&2
+    exit 1
+  fi
+  # Register in the sweep allowlist so only engine-created tabs are ever swept.
+  printf '%s %s builder\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 fi
-# Register in the sweep allowlist so only engine-created tabs are ever swept.
-printf '%s %s builder\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 
 # PR flow (draft vs direct) threaded into the LANE RULES below. SAFE DEFAULTS preserve today's exact
 # behavior: PR_FLOW=direct opens PRs the normal way (`gh pr create`), PR_READY_WHEN=builder means the
@@ -127,12 +136,22 @@ If your feature needs a manual step you cannot perform yourself (a live smoke te
 if [ -n "$TASK" ]; then SPEC="$RULES"$'\n\n'"$TASK"; else SPEC="$RULES"; fi
 TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
-herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
+if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
+  # Headless: launch a DETACHED background agent (no herdr pane) into the registry. Fail-loud so a
+  # spawn that cannot start does not masquerade as success (mirrors the herdr bail above).
+  if ! herd_driver_start_agent "$SLUG" "$DIR" "$MODEL" "$CLAUDE_FLAGS" "$POINTER"; then
+    echo "❌ headless: could not start a detached agent for '$SLUG'; worktree is ready at $DIR." >&2
+    exit 1
+  fi
+else
+  herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
+fi
 
 # 4. LEFT pane (the tab's root): live app preview on a free port — only if a preview command is
 #    configured and not suppressed. Each feature gets its own port so multiple previews coexist.
+#    SKIPPED under headless: no root pane to host the preview (panes-as-a-view).
 PORT=""
-if [ -n "$APP_PREVIEW_CMD" ] && [ "${HERD_NO_APP:-}" != "1" ]; then
+if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ -n "$APP_PREVIEW_CMD" ] && [ "${HERD_NO_APP:-}" != "1" ]; then
   # Free-port search over a CONFIGURABLE range (docs/external-consumer-audit.md "Leak C"): the default
   # base 8501 reproduces today's port block (8501-8599), so an existing web app is unchanged;
   # APP_PREVIEW_PORT_BASE lets an app use its own convention (:8080, :3000). Read INLINE with a default
@@ -163,8 +182,15 @@ PY
   fi
 fi
 
-echo "🐑 Sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
-echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
-[ -n "$PORT" ] && echo "   🌐 app preview: http://localhost:$PORT   (hot-reloads as the agent edits)"
-echo "   jump to it:   herdr agent focus $SLUG"
-echo "   when its PR is up: the watcher reviews & merges, then  git worktree remove $DIR"
+if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
+  echo "🐑 Sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS)   dir: $DIR"
+  echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
+  echo "   tail its log:  bash $HERE/driver.sh read-pane $SLUG   (or: tail -f $WORKTREES_DIR/.herd/agents/$SLUG/log)"
+  echo "   when its PR is up: the watcher reviews & merges, then  git worktree remove $DIR"
+else
+  echo "🐑 Sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
+  echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
+  [ -n "$PORT" ] && echo "   🌐 app preview: http://localhost:$PORT   (hot-reloads as the agent edits)"
+  echo "   jump to it:   herdr agent focus $SLUG"
+  echo "   when its PR is up: the watcher reviews & merges, then  git worktree remove $DIR"
+fi

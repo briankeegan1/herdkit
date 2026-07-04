@@ -82,6 +82,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
+# Runtime driver shim — binds each runtime-specific control-surface capability (list-agents,
+# read-pane, send-keys, notifications, start-agent) to the active HERD_DRIVER. Makes the watcher's
+# load-bearing core run with NO herdr panes under HERD_DRIVER=headless (panes-as-a-view); the default
+# herdr-claude driver delegates to the exact same herdr commands. Defines functions only; lib-safe.
+. "$HERE/driver.sh"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
@@ -1369,7 +1374,7 @@ _limit_menu_keys() { printf '%s' "${HERD_LIMIT_MENU_KEYS:-Down Enter}"; }
 # evidence — the caller then keeps the backstop.
 _pane_shows_limit_menu() {
   local _pm_pane="$1" _pm_txt
-  _pm_txt="$(herdr pane read "$_pm_pane" --source visible 2>/dev/null || true)"
+  _pm_txt="$(herd_driver_read_pane "$_pm_pane" visible)"
   [ -n "$_pm_txt" ] || return 0   # no evidence → assume still parked (fail safe)
   printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
 }
@@ -1383,6 +1388,9 @@ _pane_shows_limit_menu() {
 _try_clean_limit_menu_select() {
   local _cs_slug="$1" _cs_wt="$2" _cs_pane="${3:-}"
   [ "${HERD_LIMIT_MENU_SELECT:-on}" != "off" ] || return 1   # kill-switch → straight to backstop
+  # Headless has no pane to drive the arrow-menu — go straight to the _resume_builder backstop
+  # (claude --continue), which needs no keystrokes. The clean-select path is a herdr-pane concept.
+  if [ "$(herd_driver_name)" = "headless" ]; then return 1; fi
   command -v herdr >/dev/null 2>&1 || return 1
   [ -n "$_cs_pane" ] || _cs_pane="$(_find_builder_pane_id_any "$_cs_slug")"
   [ -n "$_cs_pane" ] || return 1
@@ -1392,7 +1400,7 @@ _try_clean_limit_menu_select() {
   [ "${#_cs_keys[@]}" -gt 0 ] || return 1
   _cs_max="${HERD_LIMIT_MENU_ATTEMPTS:-2}"; case "$_cs_max" in ''|*[!0-9]*) _cs_max=2 ;; esac
   for (( _cs_i=1; _cs_i<=_cs_max; _cs_i++ )); do
-    herdr pane send-keys "$_cs_pane" "${_cs_keys[@]}" >/dev/null 2>&1 || true
+    herd_driver_send_keys "$_cs_pane" "${_cs_keys[@]}"
     if ! _pane_shows_limit_menu "$_cs_pane"; then
       journal_append limit_menu_selected slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempt "$_cs_i"
       return 0
@@ -1623,13 +1631,13 @@ _handle_coordinator_watchdog() {
   if [ -n "$_cw_pane" ] && _resume_builder "$HERD_AGENT_COORDINATOR" "$MAIN" "$_cw_pane"; then
     journal_append coordinator_resume_result agent "$HERD_AGENT_COORDINATOR" woke 1 escalated false
     clear_limit "$HERD_AGENT_COORDINATOR" "$MAIN"; clear_sendkeys "$HERD_AGENT_COORDINATOR"
-    herdr notification show "🛰 coordinator resumed" \
-      --body "coordinator limit reset — resumed in place via claude --continue" --sound default >/dev/null 2>&1 || true
+    herd_driver_notify "🛰 coordinator resumed" \
+      "coordinator limit reset — resumed in place via claude --continue" default
   else
     record_limit "$HERD_AGENT_COORDINATOR" "$_cw_now" "$_cw_target" "failed"
     journal_append coordinator_resume_result agent "$HERD_AGENT_COORDINATOR" woke 0 escalated true
-    herdr notification show "🛰 coordinator resume FAILED" \
-      --body "coordinator did not wake after the limit reset — resume by hand (claude --continue in the coordinator pane)" --sound default >/dev/null 2>&1 || true
+    herd_driver_notify "🛰 coordinator resume FAILED" \
+      "coordinator did not wake after the limit reset — resume by hand (claude --continue in the coordinator pane)" default
   fi
   _coordinator_launch_lock_release
   return 0
@@ -1920,8 +1928,8 @@ _reconcile_dead_builder() {
       if ! dead_notified "$_rd_slug"; then
         record_dead_notified "$_rd_slug"
         journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}"
-        herdr notification show "💀 builder died: ${_rd_slug}" \
-          --body "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" --sound default >/dev/null 2>&1 || true
+        herd_driver_notify "💀 builder died: ${_rd_slug}" \
+          "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
         # Bounded, opt-in AUTO-RESPAWN fires exactly here — once per DEAD crossing (guarded by the
         # dead_notified dedup), AFTER the unconditional 💀 surface. Byte-inert when the flag is off.
         _maybe_autorespawn_dead_builder "$_rd_slug" "$_rd_wt" >/dev/null
@@ -2010,6 +2018,12 @@ _respawn_builder_in_worktree() {
   # SHORT pointer prompt — byte-identical to herd_write_task_spec's (the spec is already on disk).
   local _rw_ptr
   _rw_ptr="$(printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_rw_spec")"
+  # Headless: no tabs/panes — restart a DETACHED agent in the registry via the driver shim. FAILS
+  # SOFT (returns non-zero if it cannot start), so the caller's escalation notification still fires.
+  if [ "$(herd_driver_name)" = "headless" ]; then
+    herd_driver_start_agent "$_rw_slug" "$_rw_wt" "$_rw_model" "$_rw_flags" "$_rw_ptr"
+    return $?
+  fi
   local _rw_wsid; _rw_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
   local _rw_created _rw_tab _rw_root
   _rw_created="$(herdr tab create ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --label "$_rw_slug" --no-focus 2>/dev/null || true)"
@@ -2042,21 +2056,21 @@ _maybe_autorespawn_dead_builder() {
       elif _respawn_builder_in_worktree "$_ar_slug" "$_ar_wt"; then
         record_respawn "$_ar_slug" "$(_now)" respawned
         journal_append builder_respawned slug "$_ar_slug"
-        herdr notification show "♻️ builder auto-respawned: ${_ar_slug}" \
-          --body "${_ar_slug}: dead + clean worktree — a fresh agent was restarted in place (once)" --sound default >/dev/null 2>&1 || true
+        herd_driver_notify "♻️ builder auto-respawned: ${_ar_slug}" \
+          "${_ar_slug}: dead + clean worktree — a fresh agent was restarted in place (once)" default
       else
         journal_append builder_respawn_failed slug "$_ar_slug"
-        herdr notification show "💀 auto-respawn failed: ${_ar_slug}" \
-          --body "${_ar_slug}: could not start a fresh agent — restart by hand" --sound default >/dev/null 2>&1 || true
+        herd_driver_notify "💀 auto-respawn failed: ${_ar_slug}" \
+          "${_ar_slug}: could not start a fresh agent — restart by hand" default
       fi ;;
     SKIP_WORK)
       journal_append builder_dead_has_work slug "$_ar_slug"
-      herdr notification show "💀 builder died (has work): ${_ar_slug}" \
-        --body "${_ar_slug}: dead but the worktree has commits/uncommitted changes — NOT auto-respawned; recover by hand" --sound default >/dev/null 2>&1 || true ;;
+      herd_driver_notify "💀 builder died (has work): ${_ar_slug}" \
+        "${_ar_slug}: dead but the worktree has commits/uncommitted changes — NOT auto-respawned; recover by hand" default ;;
     SKIP_ALREADY)
       journal_append builder_dead_again slug "$_ar_slug"
-      herdr notification show "💀 builder died again: ${_ar_slug}" \
-        --body "${_ar_slug}: died again after its one auto-respawn — escalating, will NOT respawn again" --sound default >/dev/null 2>&1 || true ;;
+      herd_driver_notify "💀 builder died again: ${_ar_slug}" \
+        "${_ar_slug}: died again after its one auto-respawn — escalating, will NOT respawn again" default ;;
   esac
   printf '%s' "$_ar_verdict"
 }
@@ -2557,7 +2571,10 @@ while true; do
   # JSON through unchanged, preserving today's exact behavior.
   PRS_JSON="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null || echo '[]')"
   PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
-  AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
+  # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
+  # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
+  # reconciliation keys off, so it must reflect real liveness with OR without panes.
+  AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
   # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record
@@ -2830,7 +2847,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         # observe: run all gates, report + notify once per sha, NEVER merge.
         if ! observe_noted "$prnum" "$rsha"; then
           record_observe_noted "$prnum" "$rsha"
-          herdr notification show "🐑 PR #${prnum} ready (observe)" --body "${slug}: review passed — observe mode, not merging" --sound default >/dev/null 2>&1 || true
+          herd_driver_notify "🐑 PR #${prnum} ready (observe)" "${slug}: review passed — observe mode, not merging" default
         fi
         DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · observe mode${C_RESET}"
         render
@@ -2850,12 +2867,12 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
 ${hv_steps}
 
 Once verified, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
-            herdr notification show "🐑 PR #${prnum} human-verify pending" --body "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
+            herd_driver_notify "🐑 PR #${prnum} human-verify pending" "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" default
           else
             gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
 
 Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
-            herdr notification show "🐑 PR #${prnum} awaiting approval" --body "${slug}: gates passed — herd approve ${prnum}" --sound default >/dev/null 2>&1 || true
+            herd_driver_notify "🐑 PR #${prnum} awaiting approval" "${slug}: gates passed — herd approve ${prnum}" default
           fi
         fi
         DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$hv_hold" "$prnum")${C_RESET}"

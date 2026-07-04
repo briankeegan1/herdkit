@@ -32,6 +32,10 @@ _herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
 
 herd_preflight() {
   [ "${HERD_SKIP_PREFLIGHT:-}" = "1" ] && return 0
+  # The headless driver has NO herdr dependency (agents run detached; panes are a view). Every check
+  # below probes the herdr CLI/JSON contract, so under HERD_DRIVER=headless the whole preflight is
+  # inapplicable — return clean rather than falsely failing the lane for a missing multiplexer.
+  [ "${HERD_DRIVER:-herdr-claude}" = "headless" ] && return 0
   local brand; brand="$(_herd_brand)"
 
   # (a) herdr must be on PATH at all.
