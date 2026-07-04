@@ -12,10 +12,22 @@
 #   _backend_add_item REQ_ID TEXT     — issueCreate; sets _BACKEND_RESULT=DONE|NOCHANGE
 #   _backend_mark_shipped SLUG PR_URL — comment PR link + issueUpdate into the Done state
 #   _backend_list_open                — open issues, one "#<identifier> <title>" line each
+# plus _backend_item_state REF for the link-state watcher.
 #
 # Credentials: LINEAR_API_KEY is read from .herd/secrets (gitignored) — NEVER from .herd/config.
 # Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID (also from .herd/secrets) names
-# the team new issues are filed under; if unset, the first team the key can see is used.
+# the team new issues are filed under and, critically, scopes the open-issue list — so a second
+# private team's issues never leak into 'herd backlog'. It deliberately does NOT scope issue
+# resolution (mark_shipped / item_state); that is keyed off the identifier's own team (see below).
+# When unset, the first team the key can see files new issues and the open list spans every team the
+# key can see (legacy all-teams behavior).
+#
+# Issue resolution uses issues(filter: { number, team }) — Linear DEPRECATED and removed the
+# issueSearch endpoint (2026-07: every call returns errors[0].message='deprecated', HTTP 400), so
+# mark_shipped/item_state parse BOTH the number and the team key out of the identifier slug (e.g.
+# HERD-5 -> number 5, team key HERD) and look it up by number scoped to that team key. Issue numbers
+# are unique only within a team, so resolving by the identifier's own team (not LINEAR_TEAM_ID) is
+# what keeps a cross-team reference from matching the wrong same-numbered local issue.
 #
 # Every HTTP round-trip is funneled through the single internal _linear_gql so a test can stub the
 # network by overriding _linear_gql or by putting a fake `curl` on PATH.
@@ -64,6 +76,35 @@ nodes = (((d.get("data") or {}).get("teams") or {}).get("nodes")) or []
 print(nodes[0]["id"] if nodes else "")' 2>/dev/null
 }
 
+_linear_issue_query() {
+    # Build the issues(filter:) lookup that replaces the deprecated issueSearch. $1 = issue slug
+    # (identifier, e.g. HERD-5 — a leading '#' is tolerated); $2 = the GraphQL sub-selection to
+    # request inside `nodes { ... }`. On success sets globals _LQ_QUERY and _LQ_VARS ready for
+    # _linear_gql and returns 0; returns 1 (setting neither) when the slug is not a TEAMKEY-NUMBER
+    # identifier.
+    #
+    # Resolution is keyed off the identifier ITSELF — team key from the prefix + number — and MUST
+    # NOT be scoped by LINEAR_TEAM_ID. A Linear issue number is unique only within its own team, and
+    # the identifier already names that team (ENG-7 == team ENG, issue 7). Scoping by a configured
+    # LINEAR_TEAM_ID would, for any cross-team reference (e.g. a dep 'blocked-on: lib#ENG-7' while
+    # LINEAR_TEAM_ID is a different team), resolve the local same-numbered issue and mislabel state —
+    # silently unblocking a dep whose real upstream is still open. LINEAR_TEAM_ID only scopes the ops
+    # that carry no identifier (list_open / add_item).
+    local slug="${1#\#}" fields="$2" num key
+    case "$slug" in *-*) ;; *) return 1 ;; esac
+    num="${slug##*-}"
+    key="${slug%-*}"
+    case "$num" in ''|*[!0-9]*) return 1 ;; esac
+    [ -n "$key" ] || return 1
+    _LQ_QUERY="$(printf 'query R($n: Float!, $key: String!) {
+  issues(filter: { number: { eq: $n }, team: { key: { eq: $key } } }, first: 1) {
+    nodes { %s }
+  }
+}' "$fields")"
+    _LQ_VARS="$(N="$num" KEY="$key" python3 -c 'import os, json
+print(json.dumps({"n": float(os.environ["N"]), "key": os.environ["KEY"]}))')"
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
     # Title = the first line of the request; description = the full text. Sets _BACKEND_RESULT=DONE
@@ -103,27 +144,24 @@ print("%s\t%s\t%s" % ("1" if ic.get("success") else "0", iss.get("identifier", "
 }
 
 _backend_mark_shipped() {
-    # $1 = item slug (Linear issue identifier, e.g. ENG-42, or any issueSearch term); $2 = PR URL.
-    # Resolve the issue to its id + its team's Done (completed) workflow state, comment the PR link,
-    # then move it into that state. Mirrors how the github backend comments-then-closes. Sets
+    # $1 = item slug (Linear issue identifier, e.g. ENG-42); $2 = PR URL.
+    # Resolve the issue to its id + its team's Done (completed) workflow state via issues(filter:)
+    # — issueSearch was deprecated/removed by Linear (2026-07) — comment the PR link, then move it
+    # into that state. Mirrors how the github backend comments-then-closes. Sets
     # _BACKEND_RESULT=DONE|NOCHANGE.
-    local slug="$1" pr="$2" resolve resp issue_id state_id
+    local slug="$1" pr="$2" resp issue_id state_id
     _linear_require_key
-    resolve='query Resolve($q: String!) {
-  issueSearch(query: $q, first: 1) {
-    nodes {
-      id
-      team { states(filter: { type: { eq: "completed" } }, first: 1) { nodes { id } } }
-    }
-  }
-}'
-    resp="$(_linear_gql "$resolve" "$(SLUG="$slug" python3 -c 'import os, json
-print(json.dumps({"q": os.environ["SLUG"]}))')")"
+    if ! _linear_issue_query "$slug" 'id identifier title team { states(filter: { type: { eq: "completed" } }, first: 1) { nodes { id } } }'; then
+        echo "linear backend: no issue matching '$slug' — nothing to ship" >&2
+        _BACKEND_RESULT="NOCHANGE"
+        return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
     read -r issue_id state_id <<EOF
 $(printf '%s' "$resp" | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
-nodes = (((d.get("data") or {}).get("issueSearch") or {}).get("nodes")) or []
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 if not nodes:
     print("\t")
 else:
@@ -154,12 +192,27 @@ print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/d
 _backend_list_open() {
     # Print open issues (any state whose type is not completed/canceled) as one
     # "#<identifier> <title>" line each — the same shape the file/github backends emit.
+    # When LINEAR_TEAM_ID is set the query is scoped to that team so a second private team's issues
+    # never leak into 'herd backlog'; unset lists every team the key can see.
     _linear_require_key
-    _linear_gql 'query {
+    local query vars
+    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
+        query='query L($team: ID!) {
+  issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
+    nodes { identifier title }
+  }
+}'
+        vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
+print(json.dumps({"team": os.environ["TEAM"]}))')"
+    else
+        query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
     nodes { identifier title }
   }
-}' | python3 -c 'import sys, json
+}'
+        vars=""
+    fi
+    _linear_gql "$query" "$vars" | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
@@ -169,24 +222,27 @@ for n in nodes:
 
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
-    # Queries issue state.type and sets ITEM_STATE=open|closed|in-progress.
-    # Linear state types: completed/cancelled → closed; started → in-progress; all others → open.
+    # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)
+    # and reads state.type, setting ITEM_STATE=open|closed|in-progress.
+    # Linear state types: completed/canceled → closed; started → in-progress; all others → open.
     local ref="$1" slug resp stype
     _linear_require_key
     slug="${ref#*#}"
-    resp="$(_linear_gql \
-        'query State($q: String!) { issueSearch(query: $q, first: 1) { nodes { state { type } } } }' \
-        "$(SLUG="$slug" python3 -c 'import os,json; print(json.dumps({"q": os.environ["SLUG"]}))')")"
+    if ! _linear_issue_query "$slug" 'state { type }'; then
+        ITEM_STATE="open"
+        return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
     stype="$(printf '%s' "$resp" | python3 -c '
 import sys, json
 try:    d = json.load(sys.stdin)
 except Exception: d = {}
-nodes = (((d.get("data") or {}).get("issueSearch") or {}).get("nodes")) or []
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 print(nodes[0].get("state", {}).get("type", "") if nodes else "")
 ' 2>/dev/null || printf '')"
     case "$stype" in
-        completed|cancelled) ITEM_STATE="closed"      ;;
-        started)             ITEM_STATE="in-progress" ;;
-        *)                   ITEM_STATE="open"         ;;
+        completed|canceled|cancelled) ITEM_STATE="closed"      ;;
+        started)                      ITEM_STATE="in-progress" ;;
+        *)                            ITEM_STATE="open"         ;;
     esac
 }
