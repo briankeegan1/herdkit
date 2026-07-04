@@ -1,0 +1,27 @@
+# templates/drivers/herdr-claude.driver — the DEFAULT (and only shipped) driver:
+#   multiplexer = herdr · agent runtime = Claude Code.
+#
+# A "driver" binds each runtime-specific coordinator capability to a concrete command incantation.
+# render_skill() (bin/herd) sources the driver selected by the HERD_DRIVER config key
+# (default: herdr-claude) and substitutes each {{DRIVER_*}} token in templates/coordinator.md.tmpl
+# with the value below — the SAME {{TOKEN}} machinery that fills {{WORKSPACE_NAME}}, {{SCRIPTS_DIR}},
+# {{CAPABILITIES}}, … See docs/driver-abstraction.md for the capability model + phase-2 design.
+#
+# CONTRACT (mirrors .herd/config): shell-sourceable KEY=value, COMMITTED, ZERO-SECRET — command
+# SHAPES only, never credentials. With HERD_DRIVER unset/default the rendered coordinator skill is
+# FUNCTIONALLY IDENTICAL to before this abstraction existed (the render-equivalence test is the rail).
+# A different runtime ships its own <name>.driver binding these same keys to its control surface;
+# a driver missing a key the template tokenizes fails the render loudly (an unrendered {{DRIVER_*}}).
+
+# ── Capabilities the coordinator skill binds INLINE (greppable as DRIVER:<cap> in the skill) ──────
+DRIVER_LIST_AGENTS='herdr agent list'
+DRIVER_FOCUS_AGENT='herdr agent focus <slug>'
+DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"'
+DRIVER_SWITCH_MODEL='herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"'
+
+# ── Capabilities the LANE SCRIPTS + watcher exercise (not inline skill text) — bound here so a
+#    phase-2 driver covers the FULL runtime surface, not just the four the skill names inline. ──────
+DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
+DRIVER_CREATE_TAB='herdr tab create --workspace <ws>'
+DRIVER_READ_PANE='herdr pane read <pane>'
+DRIVER_SEND_KEYS='herdr pane send-keys <pane> <keys>'
