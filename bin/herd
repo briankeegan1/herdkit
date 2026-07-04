@@ -105,6 +105,31 @@ render_skill() {
     mkdir -p "$out_dir"
     local out="$out_dir/$name.md"
 
+    # ── Driver: the runtime-specific control surface (multiplexer + agent runtime). HERD_DRIVER
+    # (default herdr-claude, the only driver shipped) selects templates/drivers/<driver>.driver,
+    # whose DRIVER_* bindings are substituted into the {{DRIVER_*}} tokens below — the SAME token
+    # machinery as the other keys. Default renders the skill functionally identical to before the
+    # abstraction (see docs/driver-abstraction.md). Unknown value ⇒ loud error listing what ships.
+    : "${HERD_DRIVER:=herdr-claude}"
+    local _drivers_dir="${HERD_DRIVERS_DIR:-$TEMPLATES_DIR/drivers}"
+    local _driver_file="$_drivers_dir/$HERD_DRIVER.driver"
+    if [ ! -f "$_driver_file" ]; then
+      local _avail=''
+      if [ -d "$_drivers_dir" ]; then
+        local _f
+        for _f in "$_drivers_dir"/*.driver; do
+          [ -e "$_f" ] || continue
+          _f="${_f##*/}"; _avail="${_avail:+$_avail, }${_f%.driver}"
+        done
+      fi
+      die "unknown HERD_DRIVER '$HERD_DRIVER' — no driver definition at $_driver_file. Available drivers: ${_avail:-<none>}"
+    fi
+    # shellcheck source=/dev/null
+    . "$_driver_file"
+    # The DRIVER_* keys the sourced driver actually defines — a driver missing one the template
+    # tokenizes leaves its {{DRIVER_*}} token unsubstituted, caught by the completeness lint below.
+    local _dvars; _dvars="$(compgen -v DRIVER_ 2>/dev/null || true)"
+
     # Build {{CAPABILITIES}} from templates/capabilities.tsv — one row per command/lane/config/lever.
     local CAPABILITIES _caps_file="${HERD_CAPABILITIES_FILE:-$TEMPLATES_DIR/capabilities.tsv}"
     CAPABILITIES=''
@@ -136,8 +161,14 @@ _On every invocation, read live state to surface what is configured:_
       done < "$_caps_file"
     fi
 
-    local line
+    local line _dk
     while IFS= read -r line || [ -n "$line" ]; do
+      # Driver tokens FIRST, so a driver value that itself contains a {{TOKEN}} (e.g. {{SCRIPTS_DIR}})
+      # is resolved by the passes below. Only keys the driver defined are substituted; a token whose
+      # capability the driver omits survives to the completeness lint.
+      for _dk in $_dvars; do
+        line="${line//\{\{$_dk\}\}/${!_dk}}"
+      done
       line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
       line="${line//\{\{PROJECT_ROOT\}\}/$PROJECT_ROOT}"
       line="${line//\{\{DEFAULT_BRANCH\}\}/$DEFAULT_BRANCH}"
@@ -149,6 +180,14 @@ _On every invocation, read live state to surface what is configured:_
       line="${line//\{\{CAPABILITIES\}\}/$CAPABILITIES}"
       printf '%s\n' "$line"
     done < "$TEMPLATES_DIR/coordinator.md.tmpl" > "$out"
+
+    # Completeness lint: no {{TOKEN}} may survive — a driver missing a tokenized capability, or an
+    # unknown config token, must fail LOUDLY here rather than emit a broken skill (mirrors the
+    # hermetic "no leftover {{tokens}}" render check).
+    if grep -qE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$out"; then
+      local _left; _left="$(grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$out" | sort -u | tr '\n' ' ')"
+      die "coordinator render left unsubstituted token(s): ${_left}— driver '$HERD_DRIVER' or .herd/config is missing a binding for them"
+    fi
     printf '%s' "$out"
   )
 }
