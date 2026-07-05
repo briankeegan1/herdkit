@@ -158,6 +158,14 @@ esac
 # backlog / herd reload).
 : "${BACKLOG_VIEW_EXTRAS:=""}"
 
+# TASK_PANE_VIEW — builder-tab task-spec viewer. Default "on": the builder lanes (herd-quick.sh /
+# herd-feature.sh) render $WORKTREES_DIR/<slug>.task.md live in the tab's OTHERWISE-IDLE root pane via
+# task-spec-view.sh, so a human sees WHAT the agent was told to build instead of a bare shell. The
+# pane is unused today, so this is strictly additive UX — "off" restores the bare shell exactly. The
+# lanes launch it ONLY when the root pane is not hosting the app preview (never over a live process)
+# and NEVER under the headless driver (no panes). Defaulted here so the lanes see it under `set -u`.
+: "${TASK_PANE_VIEW:="on"}"
+
 # ── Model tier defaults — TOKEN_MODE-aware ───────────────────────────────────
 # TOKEN_MODE (standard [default] | eco) flips the BUILT-IN model defaults to cheaper tiers.
 #
