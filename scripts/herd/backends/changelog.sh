@@ -55,6 +55,14 @@ _backend_mark_shipped() {
     :
 }
 
+_backend_update_state() {
+    # Append-only tracker: entries move from [Unreleased] to a versioned heading out of band at
+    # release time, so there is no in-place state transition to perform. Honor the intent-dispatch
+    # contract (gh #139) as an explicit NOCHANGE no-op — crucially, never a fallback that files a new
+    # entry for a "mark done" request. $1 = ref, $2 = state (both unused).
+    _BACKEND_RESULT="NOCHANGE"
+}
+
 _backend_list_open() {
     # Everything under [Unreleased] (until the next "## " heading) is "open".
     awk '

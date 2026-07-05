@@ -7,8 +7,16 @@
 #   commit <path> "<sum>"  file backend: add/commit/push $BACKLOG_FILE (pull-rebase retry on
 #                          reject), write the live-view receipt, append to the inbox, fire a
 #                          herdr notification, remove the claimed file.
-#   add-item <path> "<t>"  API/changelog backend: dispatch the item to the backend (no file
+#   add-item <path> "<t>"  API/changelog backend: dispatch a NEW item to the backend (no file
 #                          edit by the agent), then the same receipt/inbox/notify/cleanup.
+#   update-state <path> <ref> <state>
+#                          API backend: transition an EXISTING item (done/in-progress/canceled)
+#                          via _backend_update_state instead of filing a new issue — the second
+#                          half of the intent-dispatch fix (gh #139): a "mark X done" / watcher
+#                          "Reconcile: PR #N merged …" request must NOT become a brand-new issue.
+#   skip <path> "<why>"    The drainer classified the request as unmappable to any backend verb:
+#                          record a LOUD line in the scribe report and drop the claim, filing
+#                          NOTHING (never a junk new issue).
 #   finish                 race-safe stop: if the queue is now empty, close the scribe tab
 #                          ($SCRIBE_TAB) and print STOP; else print MORE (keep draining).
 set -euo pipefail
@@ -20,12 +28,15 @@ _SECRETS="$PROJECT_ROOT/.herd/secrets"
 # shellcheck source=/dev/null
 [ -f "$_SECRETS" ] && . "$_SECRETS"
 unset _SECRETS
-# Source the pluggable backend implementation keyed on SCRIBE_BACKEND (default: file).
-_BACKEND_FILE="$HERE/backends/${SCRIBE_BACKEND}.sh"
-[ -f "$_BACKEND_FILE" ] || { echo "scribe-step: unknown SCRIBE_BACKEND '${SCRIBE_BACKEND}' — no backends/${SCRIBE_BACKEND}.sh" >&2; exit 1; }
+# Source the pluggable backend implementation keyed on SCRIBE_BACKEND (default: file). The backend
+# directory is $HERE/backends in production; SCRIBE_BACKEND_DIR overrides it so a hermetic test can
+# point at a fake backend that records which _backend_* op fired per request (dispatch-table test).
+_BACKEND_DIR="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+_BACKEND_FILE="$_BACKEND_DIR/${SCRIBE_BACKEND}.sh"
+[ -f "$_BACKEND_FILE" ] || { echo "scribe-step: unknown SCRIBE_BACKEND '${SCRIBE_BACKEND}' — no ${_BACKEND_DIR}/${SCRIBE_BACKEND}.sh" >&2; exit 1; }
 # shellcheck source=backends/file.sh
 . "$_BACKEND_FILE"
-unset _BACKEND_FILE
+unset _BACKEND_FILE _BACKEND_DIR
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
@@ -112,10 +123,48 @@ case "$cmd" in
     _backend_add_item "$mine" "$text"
     _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"
     ;;
+  update-state)
+    # Intent-dispatch path (gh #139, second half): transition an EXISTING item's state instead of
+    # filing a new issue. The agent did NOT edit any file — the backend resolves <ref> (an identifier
+    # like HERD-22 / #42, or a conservative title match) and moves it to <state> ∈ done|in-progress|
+    # canceled. This is what the watcher's "Reconcile: PR #N merged …" and reap requests route to;
+    # before this verb existed the drainer's only non-file option was add-item → a junk new issue.
+    mine="${2:?claimed path}"; ref="${3:?item ref}"; state="${4:?target state (done|in-progress|canceled)}"
+    cd "$REPO" || exit 1
+    if [ "$SCRIBE_BACKEND" = "file" ]; then
+      # The file backend records state IN the file: a state change is a $BACKLOG_FILE edit + commit,
+      # not a dispatch. Reaching here means a stale non-file drainer was routed under the file backend
+      # (the #139 mid-session-flip class). Warn LOUDLY and file NOTHING — never a junk issue.
+      echo "scribe-step: SCRIBE_BACKEND='file' but an 'update-state' dispatch arrived — the file backend records state by editing $BACKLOG_FILE; retire the stale drainer so a file-mode drainer edits it. [issue #139]" >&2
+      _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): $ref → $state — file backend edits $BACKLOG_FILE" "SKIP"
+      exit 0
+    fi
+    if ! command -v _backend_update_state >/dev/null 2>&1; then
+      # A backend with no state-transition op (defensive — every API backend defines one). Never
+      # fall through to add-item: skip loudly so a state change is not mis-filed as a new item.
+      echo "scribe-step: backend '$SCRIBE_BACKEND' defines no _backend_update_state op — cannot mark '$ref' $state (skipping, not filing)" >&2
+      _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): $ref → $state — backend '$SCRIBE_BACKEND' has no update-state op" "SKIP"
+      exit 0
+    fi
+    _BACKEND_RESULT=""
+    _backend_update_state "$ref" "$state"
+    sum="$ref → $state"
+    [ "$_BACKEND_RESULT" = "DONE" ] || sum="$sum (no matching item — nothing changed)"
+    _report_and_cleanup "$mine" "$sum" "${_BACKEND_RESULT:-NOCHANGE}"
+    ;;
+  skip)
+    # The drainer classified the request as unmappable to any backend verb (neither a NEW item nor a
+    # state change). Record it LOUDLY in the scribe report and drop the claim — NEVER file it as a new
+    # issue. This is the safety valve that closes the junk-issue path for good. [issue #139]
+    mine="${2:?claimed path}"; reason="${3:-unmappable request}"
+    cd "$REPO" || exit 1
+    echo "scribe-step: SKIPPED (not filed) — $reason" >&2
+    _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): $reason" "SKIP"
+    ;;
   finish)
     if ls "$Q"/*.req >/dev/null 2>&1; then echo "MORE"; exit 0; fi
     [ -n "${SCRIBE_TAB:-}" ] && herdr tab close "$SCRIBE_TAB" >/dev/null 2>&1 || true
     echo "STOP"
     ;;
-  *) echo "usage: scribe-step.sh next | commit <path> <sum> | add-item <path> <text> | finish" >&2; exit 2 ;;
+  *) echo "usage: scribe-step.sh next | commit <path> <sum> | add-item <path> <text> | update-state <path> <ref> <state> | skip <path> <why> | finish" >&2; exit 2 ;;
 esac

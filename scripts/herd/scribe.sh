@@ -81,21 +81,37 @@ Repeat this loop:
      MORE -> go back to step 1.
 2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend
    can change mid-session, so ALWAYS use the one printed for THIS request — never an earlier value:
-   • BACKEND is "file": edit ONLY $REPO/$BACKLOG_FILE. Need to look into the repo first? dispatch an
-     Explore subagent (do not read piles of files yourself). Make a TARGETED, privacy-safe edit.
-     Write prose paragraphs as ONE physical line (no hard wraps mid-paragraph) so the glow viewer and
-     GitHub both reflow them to the pane width — wrapped lines miscount emoji width and break too
-     early. Reserve line breaks for between list items and paragraphs. If an Edit fails because lines
-     moved (the user edited concurrently), re-read and re-apply — never clobber their change.
+   • BACKEND is "file": edit ONLY $REPO/$BACKLOG_FILE. This covers BOTH new items AND state changes —
+     marking an item done/in-progress/canceled is just editing its 🔜/🚧/✅ emoji (and, when done,
+     moving it under "## Recently shipped"). Need to look into the repo first? dispatch an Explore
+     subagent (do not read piles of files yourself). Make a TARGETED, privacy-safe edit. Write prose
+     paragraphs as ONE physical line (no hard wraps mid-paragraph) so the glow viewer and GitHub both
+     reflow them to the pane width — wrapped lines miscount emoji width and break too early. Reserve
+     line breaks for between list items and paragraphs. If an Edit fails because lines moved (the user
+     edited concurrently), re-read and re-apply — never clobber their change.
      SHIPPED (✅) items: never DELETE a shipped entry to make room. If a request asks you to cap the
      "Recently shipped" list or drop the oldest shipped items, just prepend the new ✅ entry and leave
      the rest in place — the commit step AUTOMATICALLY rotates shipped entries beyond the most recent
      ~10 into $REPO/${BACKLOG_FILE%.md}.archive.md (which the coordinator and builders never read).
      Do not create or edit that archive file yourself; the commit step owns it.
      Then run:  bash $HERE/scribe-step.sh commit <path> "<short summary>"
-   • BACKEND is anything else (github/linear/changelog/…): do NOT edit any file — run
-     bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
-     The step script dispatches the item to the active backend.
+   • BACKEND is anything else (github/linear/changelog/…): do NOT edit any file. First CLASSIFY the
+     request into exactly ONE of these, then run the matching verb — NEVER file a new issue for a
+     request that is not actually a new backlog item (that mis-file is the junk-issue bug):
+       – ADD / create / file a NEW backlog item →
+           bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
+       – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
+         "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →
+           bash $HERE/scribe-step.sh update-state "<claimed_path>" "<ref>" "<state>"
+         <ref> = the item identifier when the request names one (e.g. HERD-22, or a bare issue number
+         for the github backend), otherwise a distinctive title phrase to match. <state> = one of
+         done | in-progress | canceled. For a reconcile request that gives only a PR number, work out
+         the matching item identifier/title from the request text; if you cannot confidently pin it to
+         ONE item, SKIP (next bullet) — never guess, never file a new issue.
+       – ANYTHING you cannot map to an add or a state change →
+           bash $HERE/scribe-step.sh skip "<claimed_path>" "<one-line reason>"
+         skip records a loud line in the scribe report and files NOTHING. When in doubt between
+         update-state and skip, prefer skip over add-item — a wrongly-filed issue is the exact bug.
 3. Go to step 1.
 
 Use scribe-step.sh for all git/queue/report mechanics. Never merge, switch branches, or edit any

@@ -144,6 +144,45 @@ grep -q 'team_xyz' "$GQLLOG"      && fail "cross-team item_state leaked the conf
 grep -q 'team: { id:' "$GQLLOG"   && fail "cross-team item_state must resolve by team key, not team id"
 pass
 
+# 4c. update_state (done) → resolves the issue by the identifier's OWN team key via issues(filter:)
+#     (never the deprecated issueSearch, never LINEAR_TEAM_ID), requests a workflow state of the
+#     MAPPED type (done→completed), then issueUpdate moves it there. It must NOT issueCreate — a
+#     state change is not a new item (the gh #139 junk-issue bug this closes).
+: > "$GQLLOG"
+us="$(run _backend_update_state ENG-7 done)"
+echo "$us" | grep -q "RESULT=DONE" || fail "update_state did not report DONE ($us)"
+grep -q "issues(filter" "$GQLLOG"          || fail "update_state did not resolve via issues(filter:)"
+grep -q "issueSearch" "$GQLLOG"            && fail "update_state must NOT use the deprecated issueSearch endpoint"
+grep -q 'type: { eq: "completed" }' "$GQLLOG" || fail "update_state (done) did not map to the completed workflow-state type"
+grep -q '"key": "ENG"' "$GQLLOG"           || fail "update_state did not resolve by the identifier's team key (ENG)"
+grep -q 'team_xyz' "$GQLLOG"               && fail "update_state must NOT scope resolution by the configured LINEAR_TEAM_ID"
+grep -q "issueUpdate" "$GQLLOG"            || fail "update_state did not move the issue (issueUpdate)"
+grep -q "state_done" "$GQLLOG"             || fail "update_state did not set the resolved target stateId"
+grep -q "issueCreate" "$GQLLOG"           && fail "update_state must NOT file a new issue (the #139 junk-issue bug)"
+pass
+
+# 4d. update_state maps in-progress→started and canceled→canceled (the workflow-state TYPE filter).
+: > "$GQLLOG"; run _backend_update_state ENG-7 in-progress >/dev/null
+grep -q 'type: { eq: "started" }' "$GQLLOG"  || fail "update_state (in-progress) did not map to the started type"
+: > "$GQLLOG"; run _backend_update_state ENG-7 canceled >/dev/null
+grep -q 'type: { eq: "canceled" }' "$GQLLOG" || fail "update_state (canceled) did not map to the canceled type"
+pass
+
+# 4e. update_state with an UNKNOWN target state → NOCHANGE, and no round-trip at all (files nothing).
+: > "$GQLLOG"
+us2="$(run _backend_update_state ENG-7 frobnicate 2>/dev/null)"
+echo "$us2" | grep -q "RESULT=NOCHANGE" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
+grep -q "issues(" "$GQLLOG" && fail "update_state on an unknown state should issue no query"
+pass
+
+# 4f. update_state falls back to a CONSERVATIVE title match (containsIgnoreCase) when the ref carries
+#     no identifier — so a reconcile request that names an item by title still transitions it.
+: > "$GQLLOG"
+us3="$(run _backend_update_state "first open issue" done)"
+grep -q "containsIgnoreCase" "$GQLLOG" || fail "update_state (no identifier) did not fall back to a title match"
+echo "$us3" | grep -q "RESULT=DONE"    || fail "update_state title match did not transition the unique match ($us3)"
+pass
+
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.
 if ( cd "$T"; unset LINEAR_API_KEY; . "$BACKEND"; _backend_list_open ) >/dev/null 2>&1; then
   fail "list_open should fail when LINEAR_API_KEY is absent"
