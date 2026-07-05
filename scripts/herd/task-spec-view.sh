@@ -48,6 +48,15 @@ if [ -n "$saved_tty" ]; then
   printf '\033[?25l'  # hide cursor
 fi
 
+# glow_pane <glow-args...> — paint the pane TTY with glow under a PINNED color profile so every
+# repaint renders identically without re-detecting the terminal, and with stdin detached from the
+# keyboard-muted pane tty (mirrors backlog-view.sh). COLORTERM=truecolor + CLICOLOR_FORCE=1 lock
+# glamour to the tokyonight TRUECOLOR palette — a pane that doesn't propagate COLORTERM would
+# otherwise leave termenv to downsample the theme to flat 256-color — and </dev/null keeps glow
+# from blocking on or misreading the muted tty during its terminal-capability probe (color still
+# applies: glamour keys color off stdOUT and CLICOLOR_FORCE forces it on regardless of stdin).
+glow_pane() { CLICOLOR_FORCE=1 COLORTERM=truecolor glow "$@" </dev/null; }
+
 # file_mtime — portable helper; detect BSD vs GNU once at startup (mirrors backlog-view.sh).
 if stat --version 2>/dev/null | grep -q GNU; then
   file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
@@ -69,8 +78,8 @@ while true; do
     if [ "$present" -eq 1 ]; then
       w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
       render_rc=0
-      if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then glow -s "$STYLE" -w "$w" "$SPEC" || render_rc=$?
-      elif command -v glow >/dev/null 2>&1;                    then glow -s dark     -w "$w" "$SPEC" || render_rc=$?
+      if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then glow_pane -s "$STYLE" -w "$w" "$SPEC" || render_rc=$?
+      elif command -v glow >/dev/null 2>&1;                    then glow_pane -s dark     -w "$w" "$SPEC" || render_rc=$?
       else cat "$SPEC" || render_rc=$?
       fi
       # Latch this frame ONLY on a successful render; a transient glow/cat failure leaves last_frame

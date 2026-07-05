@@ -71,11 +71,21 @@ grep -aq $'\033\\[2m' "$T/v-missing.out"         || fail "(1) viewer's missing-s
 pass; echo "PASS (1b) missing/reaped spec → quiet DIM 'task spec removed' line, never red"
 
 # Wired to glow + the bundled tokyonight style (the theming requirement), with a cat fallback.
-grep -Eq 'glow -s "\$STYLE"' "$VIEWER"           || fail "(1) viewer does not render via glow -s \"\$STYLE\" (tokyonight)"
+# glow is invoked through the glow_pane wrapper (pins a truecolor profile + detaches the muted
+# tty), so accept either the bare `glow` or the `glow_pane` form.
+grep -Eq 'glow(_pane)? -s "\$STYLE"' "$VIEWER"   || fail "(1) viewer does not render via glow -s \"\$STYLE\" (tokyonight)"
 grep -q 'STYLE="$HERE/tokyonight.json"' "$VIEWER" || fail "(1) viewer does not use the bundled tokyonight.json style"
-grep -Eq 'glow -s dark' "$VIEWER"                || fail "(1) viewer lacks the glow -s dark fallback"
+grep -Eq 'glow(_pane)? -s dark' "$VIEWER"        || fail "(1) viewer lacks the glow -s dark fallback"
 grep -Eq 'cat "\$SPEC"' "$VIEWER"                || fail "(1) viewer lacks the plain cat fallback"
 pass; echo "PASS (1c) viewer renders via glow + tokyonight style (else glow -s dark, else cat)"
+
+# The glow_pane wrapper must PIN a color profile so repeated repaints render identically without
+# re-detecting the terminal (CLICOLOR_FORCE + COLORTERM=truecolor), and detach glow's stdin from the
+# keyboard-muted pane tty (</dev/null) so glow never blocks on/misreads its capability probe.
+grep -Eq 'glow_pane\(\)' "$VIEWER"                        || fail "(1) viewer lacks the glow_pane wrapper"
+grep -Eq 'CLICOLOR_FORCE=1.*COLORTERM=truecolor' "$VIEWER" || fail "(1) glow_pane does not pin a truecolor profile"
+grep -q '</dev/null' "$VIEWER"                            || fail "(1) glow_pane does not detach stdin from the muted tty"
+pass; echo "PASS (1d) glow_pane pins a truecolor profile + detaches the muted tty"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # 2. LANES — viewer sent into ROOT via the driver send-text surface; off/app-preview/headless gates

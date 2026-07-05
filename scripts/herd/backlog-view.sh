@@ -121,6 +121,18 @@ list_to_md() {
   done
 }
 
+# glow_pane <glow-args...> — paint the pane TTY with glow under a PINNED color profile so every
+# repaint renders identically without re-detecting the terminal, and with stdin detached from the
+# (muted) pane tty. Two robustness fixes for the backend viewer's execution context:
+#   • COLORTERM=truecolor + CLICOLOR_FORCE=1 lock glamour to the tokyonight TRUECOLOR palette. A
+#     pane that doesn't propagate COLORTERM (e.g. env stripped down the herd-config path) would
+#     otherwise leave termenv to guess from TERM alone and downsample the theme to flat 256-color
+#     (the '38;5;…' monochrome look) — pinning the profile keeps the truecolor chip/title/bullets.
+#   • </dev/null detaches glow's stdin from the keyboard-muted pane tty, so glow never blocks on or
+#     misreads that tty during its terminal-capability probe. Color still applies because glamour
+#     keys color off stdOUT (the pane) and CLICOLOR_FORCE forces it on regardless of stdin.
+glow_pane() { CLICOLOR_FORCE=1 COLORTERM=truecolor glow "$@" </dev/null; }
+
 # render_backend_frame <list> <degraded 0|1> <since HH:MM> <refreshed HH:MM> <incoming>
 # Clears + repaints the pane: styled header, then the list (glow if available, else plain text), then
 # — only when degraded — one dim last-good warning line, then the optional additive <incoming> block
@@ -136,9 +148,9 @@ render_backend_frame() {
   local w; w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
   if [ -n "$list" ]; then
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then
-      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     elif command -v glow >/dev/null 2>&1; then
-      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     else
       printf '%s\n' "$list" || rc=$?
     fi
@@ -164,7 +176,20 @@ run_backend_mode() {
   local poll="${BACKLOG_VIEW_POLL_SECS:-30}"
   case "$poll" in ''|*[!0-9]*) poll=30 ;; esac
 
+  # Scratch file glow renders. It MUST end in .md: glow picks its renderer from the file extension,
+  # and a no-suffix temp file is guessed to be SOURCE CODE — so glow runs it through chroma and
+  # syntax-highlights the RAW markdown (literal '**'/backticks, flat '38;5;…' 256-color) instead of
+  # glamour-rendering it (the exact backend-mode corruption this fixes; the file-loop branch never
+  # hit it because it renders the real BACKLOG.md). mktemp can't portably add a suffix (GNU has
+  # --suffix, BSD does not), so mktemp for the secure unique name, then rename to add .md. If the
+  # rename fails we keep the original name (degraded render, but never a crash).
   BACKLOG_VIEW_TMP="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/herd-backlog-view.$$.md")"
+  case "$BACKLOG_VIEW_TMP" in
+    *.md) : ;;  # fallback path already carries .md
+    *)    if mv "$BACKLOG_VIEW_TMP" "$BACKLOG_VIEW_TMP.md" 2>/dev/null; then
+            BACKLOG_VIEW_TMP="$BACKLOG_VIEW_TMP.md"
+          fi ;;
+  esac
 
   local last_good="" last_hash="" degraded=0 since="" refreshed="" frame="" polls=0
   while true; do
