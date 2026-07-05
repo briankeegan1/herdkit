@@ -1035,6 +1035,16 @@ cmd_config_set() {
       say "  ${c_dim}(no watcher restart or skill re-render required for $key)${c_rst}"
       ;;
   esac
+
+  # 5. SCRIBE_BACKEND change-awareness (issue #139): flipping the backend does NOT retire an already
+  #    running backlog scribe drainer. That idle/done drainer was spawned under the OLD backend and,
+  #    if left running, will drain queued requests via the stale mode. scribe-step.sh now guards
+  #    against filing junk, but a stale drainer still can't place file-backend items — so warn the
+  #    operator to retire it now, so the next request spawns a fresh drainer on the new backend.
+  if [ "$key" = "SCRIBE_BACKEND" ]; then
+    say ""
+    warn "SCRIBE_BACKEND changed ${cur:+from \"$cur\" }to \"$val\" — an idle backlog scribe drainer spawned under the OLD backend may still be running and would drain queued requests in the stale mode. RETIRE it now (close its 'scribe-<workspace>' tab, e.g. 'herdr agent stop scribe-<workspace>') so the next request spawns a fresh drainer on the new backend."
+  fi
 }
 
 # cmd_doctor — run the one-pass dependency doctor (scripts/herd/herd-preflight.sh). Exposed so a
