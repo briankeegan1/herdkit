@@ -24,6 +24,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
 . "$HERE/human-verify.sh"
+# CLI palette for the `list` verdict column — themed via HERD_THEME (default tokyonight). Pre-set to
+# "" so the surface degrades to plain (byte-identical to before this coloring) under NO_COLOR, a
+# non-TTY stdout, or a missing theme.sh.
+c_grn=""; c_red=""; c_dim=""; c_rst=""
+# shellcheck source=/dev/null
+[ -f "$HERE/theme.sh" ] && { . "$HERE/theme.sh"; herd_theme_load_cli; }
 
 APPROVALS="$WORKTREES_DIR/.agent-watch-approvals"
 REVIEW_STATE="$WORKTREES_DIR/.agent-watch-reviewed"
@@ -66,7 +72,11 @@ case "$cmd" in
         "$REVIEW_STATE" 2>/dev/null || echo "unknown")"
       title="$(gh pr view "$prnum" --json title -q '.title' 2>/dev/null || true)"
       [ -z "$title" ] && title="(no title)"
-      printf '  PR #%-4s  sha:%.8s  review:%-6s  %s\n' "$prnum" "$sha" "$verdict" "$title"
+      # Themed verdict: PASS→green, BLOCK→red, anything else (unknown/held)→dim. The color codes are
+      # separate printf args so the %-6s padding still aligns on the verdict TEXT, not the escapes.
+      vcol="$c_dim"
+      case "$verdict" in PASS) vcol="$c_grn" ;; BLOCK) vcol="$c_red" ;; esac
+      printf '  PR #%-4s  sha:%.8s  review:%s%-6s%s  %s\n' "$prnum" "$sha" "$vcol" "$verdict" "$c_rst" "$title"
       print_human_verify_steps "$prnum"
       found=$((found + 1))
     done < "$APPROVALS"

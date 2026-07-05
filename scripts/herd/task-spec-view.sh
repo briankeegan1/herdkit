@@ -25,7 +25,14 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SPEC="${1:?usage: task-spec-view.sh <task-spec-file>}"
-STYLE="$HERE/tokyonight.json"
+# Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
+# tokyonight.json). This viewer takes no config-binding guard (it renders whatever file it is handed),
+# so it resolves the theme from the environment: HERD_THEME (exported by herd-config.sh, default
+# tokyonight) and PROJECT_ROOT if present. theme.sh fails soft to the tokyonight built-in, and glow
+# already drops color for a non-TTY, so an unset/unknown theme still renders cleanly.
+# shellcheck source=/dev/null
+. "$HERE/theme.sh"
+STYLE="$(herd_theme_glow_style)"
 BASENAME="$(basename "$SPEC")"
 last_frame=""
 

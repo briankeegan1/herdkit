@@ -33,6 +33,17 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # app preview, and never under the headless driver (no panes → clean no-op).
 # TASK_PANE_VIEW="on"                 # on (default) | off
 
+# HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
+# Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
+# theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color
+# CLI overrides) and glow.json (the glamour style). Resolution order, per file: .herd/themes/<name>/
+# (your own, project-local) -> templates/themes/<name>/ (engine built-ins) -> tokyonight fallback. An
+# unknown or broken theme warns once and falls back — it never breaks a console. Fails soft: a missing
+# theme file uses the built-in default, and NO_COLOR or a non-TTY renders plain. To add your own theme:
+# copy templates/themes/tokyonight/ to .herd/themes/mytheme/, edit palette.sh + glow.json, set
+# HERD_THEME="mytheme". See docs/theming.md.
+# HERD_THEME="tokyonight"             # tokyonight (default) | any dir under templates/themes/ or .herd/themes/
+
 # health + preview — the two big project-specific commands.
 # `herd init` seeds .herd/healthcheck.project.sh from the template matching scout's detected stack
 # (Go → healthcheck.go.sh, Rust → healthcheck.rust.sh, Java → healthcheck.java.sh, Node →

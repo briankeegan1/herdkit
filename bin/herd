@@ -69,7 +69,17 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/status.sh" ] && . "$SCRIPTS_DIR/status.sh"
 
-c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_red=$'\033[31m'; c_rst=$'\033[0m'
+# CLI palette — themed via HERD_THEME (default tokyonight, byte-identical to the historical 16-color
+# c_* set). theme.sh + herd_theme_load_cli set c_bold/c_dim/c_grn/c_yel/c_red/c_rst; the config-loading
+# readers (status/cost/why) re-invoke herd_theme_load_cli after loading .herd/config so a project's
+# HERD_THEME recolors them. Blanked to "" under NO_COLOR or a non-TTY stdout (plain output). If
+# theme.sh is somehow absent the vars stay empty and every surface degrades to plain — never a crash.
+c_bold=""; c_dim=""; c_grn=""; c_yel=""; c_red=""; c_rst=""
+if [ -f "$SCRIPTS_DIR/theme.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/theme.sh"
+  herd_theme_load_cli
+fi
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '%s✅ %s%s\n' "$c_grn" "$*" "$c_rst"; }
 warn() { printf '%s⚠️  %s%s\n' "$c_yel" "$*" "$c_rst" >&2; }
@@ -1076,6 +1086,8 @@ cmd_status() {
   export HERD_CONFIG_FILE="$cfg"
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-config.sh"
+  # Re-theme the CLI palette from THIS project's HERD_THEME (startup default was tokyonight).
+  if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   command -v _status_run >/dev/null 2>&1 || die "status helpers not loaded (scripts/herd/status.sh missing)"
   local rc=0
   _status_run || rc=$?
@@ -2788,6 +2800,7 @@ cmd_why() {
   case "$pr" in \#*) pr="${pr#\#}" ;; esac
   [ -n "$pr" ] && [ -z "${pr//[0-9]/}" ] || die "herd why: <pr#> must be a number (got '$1')"
   _journal_load_config
+  if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   local files; files="$(_journal_all_files)"
   if [ -z "$files" ]; then
     say "no engine journal yet at ${c_dim}$WORKTREES_DIR/.herd/journal.jsonl${c_rst}"
@@ -2893,6 +2906,7 @@ cmd_cost() {
   # --full only augments the full rollup. Ignore --full silently when --pr is given.
   [ -n "$pr" ] && full=0
   _journal_load_config
+  if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   # `herd cost --full`: ALSO scan the live transcripts of the long-lived session agents (coordinator,
   # scribe, researcher). All three run with --cwd $PROJECT_ROOT, so they share MAIN's munged
   # transcript dir. A missing dir is skipped with a note rather than an error.

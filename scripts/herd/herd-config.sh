@@ -196,6 +196,18 @@ esac
 # and NEVER under the headless driver (no panes). Defaulted here so the lanes see it under `set -u`.
 : "${TASK_PANE_VIEW:="on"}"
 
+# HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
+# built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
+# directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)
+# and glow.json (the glamour style for glow-rendered surfaces). Resolution order (per file, so a
+# theme may supply only one): .herd/themes/<name>/ (user, project-local) → templates/themes/<name>/
+# (engine built-ins) → tokyonight fallback. An unknown/broken theme warns loudly once and falls back —
+# it never breaks a console. Consumed via scripts/herd/theme.sh by agent-watch.sh (console palette),
+# backlog-view.sh + task-spec-view.sh (glow.json), and bin/herd/status/fleet/cost/why +
+# herd-approve.sh (CLI palette). Exported so child processes (e.g. the task-spec viewer) inherit it.
+: "${HERD_THEME:="tokyonight"}"
+export HERD_THEME
+
 # ── Model tier defaults — TOKEN_MODE-aware ───────────────────────────────────
 # TOKEN_MODE (standard [default] | eco) flips the BUILT-IN model defaults to cheaper tiers.
 #
