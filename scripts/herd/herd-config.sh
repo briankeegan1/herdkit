@@ -74,6 +74,28 @@ _herd_config_warn_dupes() {
   return 0
 }
 
+# _herd_main_worktree <dir> — print the MAIN working tree for <dir>. When an engine component runs
+# from INSIDE a builder worktree (a linked git worktree living at <pool>/<slug>), <dir> is that
+# worktree; git's common dir still points back at the owning repo, whose MAIN working tree git lists
+# FIRST in `worktree list`. Binding the fallback PROJECT_ROOT to that main tree keeps the derived
+# ${PROJECT_ROOT}-trees journal/state default anchored to the REAL project, instead of fabricating a
+# phantom <pool>/<slug>-trees/ from the worktree path and stranding builder-side gate events there,
+# lost from `herd why`/`herd log` post-mortems (issue #144). Read-only, best-effort: echoes <dir>
+# unchanged when git is absent, <dir> is not a repo, or <dir> already IS the main working tree.
+_herd_main_worktree() {
+  local _mw_dir="${1:-}"
+  [ -n "$_mw_dir" ] || return 0
+  command -v git >/dev/null 2>&1 || { printf '%s' "$_mw_dir"; return 0; }
+  local _mw_main
+  _mw_main="$(git -C "$_mw_dir" worktree list --porcelain 2>/dev/null \
+             | awk '/^worktree /{print substr($0, 10); exit}')"
+  if [ -n "$_mw_main" ] && [ -d "$_mw_main" ]; then
+    printf '%s' "$_mw_main"
+  else
+    printf '%s' "$_mw_dir"
+  fi
+}
+
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
 # _herd_find_config records HOW the config resolved into _HERD_CONFIG_SOURCE (env | walkup |
@@ -108,9 +130,17 @@ if [ -f "$_HERD_CONFIG_FILE" ]; then
 fi
 
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
-# PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if
-# none, the repo the engine lives in). Everything else derives from it.
-: "${PROJECT_ROOT:="$_HERD_REPO_DEFAULT"}"
+# PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if none, the repo
+# the engine lives in). Everything else derives from it. Computed with an explicit unset-guard rather
+# than the `: "${PROJECT_ROOT:=…}"` idiom for two reasons: (a) the git resolve stays LAZY — it fires
+# ONLY on the fallback (no config set PROJECT_ROOT), so the normal `herd <cmd>` path pays no git call;
+# (b) this tweaks how an EXISTING key's fallback is computed, so keeping it off the `:=` line avoids
+# the caps-sync heuristic misreading it as a NEW config key. On the fallback it re-anchors a
+# builder-worktree path to the MAIN working tree so WORKTREES_DIR below never derives the phantom
+# <pool>/<slug>-trees/ (issue #144).
+if [ -z "${PROJECT_ROOT:-}" ]; then
+  PROJECT_ROOT="$(_herd_main_worktree "$_HERD_REPO_DEFAULT")"
+fi
 : "${WORKTREES_DIR:="${PROJECT_ROOT}-trees"}"
 : "${DEFAULT_BRANCH:="origin/main"}"
 : "${WORKSPACE_NAME:="$(basename "$PROJECT_ROOT")"}"

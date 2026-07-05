@@ -31,10 +31,28 @@ type _healthcheck_gate >/dev/null 2>&1 || fail "_healthcheck_gate not defined af
 
 # Redirect all cache/state I/O into the temp dir and silence the frame renderer (it would clear the
 # screen). These override whatever the sourced config resolved.
+#
+# Issue #144: the gate calls journal_append, which resolves its path from WORKTREES_DIR (via
+# journal.sh's _journal_file), NOT from TREES. Overriding only TREES (as this test used to) left the
+# journal bound to the FALLBACK ${PROJECT_ROOT}-trees — a REAL path outside the sandbox — so every run
+# of this hermetic test wrote healthcheck events into <pool>/<slug>-trees/.herd/journal.jsonl. Pin
+# BOTH WORKTREES_DIR (the derived-path source) and JOURNAL_FILE (journal.sh's explicit seam) into $T
+# so no journal write can escape the sandbox by EITHER route.
 TREES="$T"
+WORKTREES_DIR="$T"
+export JOURNAL_FILE="$T/journal.jsonl"
 HEALTH_STATE="$T/.agent-watch-healthchecks"
 render() { :; }
 declare -a DISPLAY=()
+
+# Hermetic-seal guard (issue #144): assert the journal writer is bound INSIDE the sandbox before any
+# gate runs. If a future edit drops the WORKTREES_DIR/JOURNAL_FILE overrides above, _journal_file
+# resolves back to the real derived path and this fails loudly instead of silently leaking again.
+_jf_seal="$(_journal_file)"
+case "$_jf_seal" in
+  "$T"/*) : ;;
+  *) fail "journal path escapes the sandbox: '$_jf_seal' (issue #144 — WORKTREES_DIR/JOURNAL_FILE not pinned into \$T)" ;;
+esac
 
 # Stub the healthcheck binary: emit $HC_ONELINE and exit $HC_RC. _healthcheck_gate runs it twice (the
 # initial run + the solo retry-before-red); returning rc 1 both times reproduces a terminal CODEERROR.
@@ -79,6 +97,12 @@ ok
 run_gate 3 "" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "clean run → _HC_RESULT should be CLEAN (got '$_HC_RESULT')"
 [ -f "$(_health_result_file 3 "$SHA")" ] || fail "a CLEAN verdict must still be cached"
+ok
+
+# ── 4. issue #144: the gates above DID journal — and every event landed in the sandbox, not a real
+#      derived path. Positive proof the seam captured the writes rather than merely suppressing them. ─
+[ -s "$JOURNAL_FILE" ] || fail "gate journaling produced no sandbox journal at $JOURNAL_FILE (issue #144)"
+grep -q '"event":"healthcheck_' "$JOURNAL_FILE" || fail "sandbox journal missing healthcheck gate events (issue #144)"
 ok
 
 echo "ALL PASS ($pass checks)"
