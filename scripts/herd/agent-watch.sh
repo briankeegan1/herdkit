@@ -2556,6 +2556,65 @@ else
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
+# ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
+# _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
+# ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
+# lane advisory gate: REVIEW_CONCURRENCY + SPAWN_AHEAD total active builders. FEATS (the live
+# worktree roster) is computed earlier this tick, so active count is its length.
+#
+# Fail-soft: a malformed or again-claimed intent is skipped with a logged warning — never crashes
+# the watcher loop. Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
+_drain_spawn_queue() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _dsq_q="$TREES/spawn-queue"
+  [ -d "$_dsq_q" ] || return 0
+  ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+
+  # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
+  local _dsq_cap _dsq_budget
+  _dsq_cap=$(( ${REVIEW_CONCURRENCY:-2} + ${SPAWN_AHEAD:-1} ))
+  _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
+  [ "$_dsq_budget" -le 0 ] && return 0
+
+  local _dsq_n=0
+  while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
+    # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_task=""
+    {
+      IFS= read -r _dsq_line1
+      IFS= read -r _dsq_slug
+      IFS= read -r _dsq_lane
+      IFS= read -r _dsq_task
+    } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
+
+    case "${_dsq_line1:-}" in
+      EMPTY|'') break ;;
+      CLAIMED*)
+        local _dsq_claimed="${_dsq_line1#CLAIMED }"
+        # Fail-soft: validate slug and lane before launching.
+        if [ -z "$_dsq_slug" ] || [ -z "$_dsq_lane" ]; then
+          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "empty slug or lane" >/dev/null 2>&1 || true
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
+        case "$_dsq_lane" in
+          quick|feature) ;;
+          *)
+            bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "unknown lane '$_dsq_lane'" >/dev/null 2>&1 || true
+            _dsq_n=$(( _dsq_n + 1 )); continue ;;
+        esac
+        # Launch the matching lane in the background; mark intent done before the next iteration.
+        if [ "$_dsq_lane" = "feature" ]; then
+          bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" >/dev/null 2>&1 &
+        else
+          bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" >/dev/null 2>&1 &
+        fi
+        bash "$HERE/spawn-step.sh" done "$_dsq_claimed" >/dev/null 2>&1 || true
+        _dsq_n=$(( _dsq_n + 1 ))
+        ;;
+    esac
+  done
+}
+
 _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 
@@ -2911,6 +2970,9 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
     render
     spawn_resolver "$slug" "$prnum" "$branch"
   done
+
+  # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
+  _drain_spawn_queue
 
   # Coordinator watchdog: ONE per-tick liveness check of the coordinator itself (which the feature
   # loop above never sees — it runs from $MAIN, not a worktree). Byte-inert unless COORDINATOR_WATCHDOG=on.

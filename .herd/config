@@ -42,6 +42,12 @@ COORDINATOR_CMD="/coordinator"
 WATCHER_AUTOMERGE="true"
 # auto: watcher merges on its own once all gates (healthcheck + review) pass.
 MERGE_POLICY="auto"
+
+# Spawn-queue drain concurrency cap: the watcher pops at most
+# (REVIEW_CONCURRENCY + SPAWN_AHEAD - active_builders) intents from the durable spawn queue
+# each tick (spawn.sh → spawn-step.sh). Raise SPAWN_AHEAD to keep more builders ahead of the
+# review gate; lower to 0 for strict no-surplus (never build past REVIEW_CONCURRENCY in-flight).
+SPAWN_AHEAD=1
 HERD_REPO="briankeegan1/herdkit"
 # Dogfood: bounce BLOCK reviews straight to the builder agent (3-round cap, sha-keyed).
 REVIEW_AUTOFIX="true"
