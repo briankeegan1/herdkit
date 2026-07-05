@@ -189,6 +189,90 @@ print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/d
     _BACKEND_RESULT="DONE"
 }
 
+_linear_state_type_for() {
+    # Map a requested scribe state to a Linear workflow-state TYPE. Linear groups every workflow
+    # state under a type; we move the issue to the FIRST state of the mapped type for its own team.
+    # A few common synonyms are tolerated so the drainer's phrasing does not have to be exact.
+    # Prints the type (empty for an unmappable request — the caller then SKIPs, never files).
+    case "$1" in
+        done|complete|completed|shipped|merged|closed|resolved) printf 'completed' ;;
+        in-progress|inprogress|in_progress|started|doing|wip|active) printf 'started' ;;
+        cancel|canceled|cancelled|wontfix|"won't fix"|declined|dropped|obsolete) printf 'canceled' ;;
+        *) printf '' ;;
+    esac
+}
+
+_linear_resolve_by_title() {
+    # Fallback resolution when the request names no identifier: match OPEN-ish issues by a title
+    # substring (case-insensitive). $1 = title text; $2 = target state type (inlined into the states
+    # sub-filter, exactly as the identifier path builds it). Prints the same
+    # {"data":{"issues":{"nodes":[…]}}} shape as the identifier query so ONE parser handles both.
+    # Deliberately CONSERVATIVE: first:2 so the caller can require a UNIQUE match and never mislabel
+    # the wrong issue when a phrase is ambiguous.
+    local title="$1" stype="$2" q v
+    q="$(printf 'query T($t: String!) {
+  issues(filter: { title: { containsIgnoreCase: $t } }, first: 2) {
+    nodes { id identifier title team { states(filter: { type: { eq: "%s" } }, first: 1) { nodes { id } } } }
+  }
+}' "$stype")"
+    v="$(T="$title" python3 -c 'import os, json
+print(json.dumps({"t": os.environ["T"]}))')"
+    _linear_gql "$q" "$v"
+}
+
+_backend_update_state() {
+    # $1 = item ref (Linear identifier e.g. HERD-22, a leading '#' tolerated — or a title phrase when
+    # no identifier is present); $2 = target state (done|in-progress|canceled + synonyms).
+    # Resolve the issue + a workflow state of the mapped type for its OWN team, then issueUpdate it
+    # into that state — reusing the same issues(filter:) + issueUpdate machinery as _backend_mark_shipped
+    # (issueSearch was deprecated/removed by Linear 2026-07). Sets _BACKEND_RESULT=DONE|NOCHANGE.
+    # This is the intent-dispatch path (gh #139): a "mark HERD-22 done" request transitions the EXISTING
+    # issue instead of filing a brand-new one. NOCHANGE (no unique match / no such state) files nothing.
+    local ref="$1" want="$2" stype fields resp issue_id state_id
+    _linear_require_key
+    stype="$(_linear_state_type_for "$want")"
+    if [ -z "$stype" ]; then
+        echo "linear backend: unknown target state '$want' — expected done|in-progress|canceled (skipping, not filing)" >&2
+        _BACKEND_RESULT="NOCHANGE"
+        return 0
+    fi
+    fields="$(printf 'id identifier title team { states(filter: { type: { eq: "%s" } }, first: 1) { nodes { id } } }' "$stype")"
+    if _linear_issue_query "$ref" "$fields"; then
+        resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"          # identifier path (HERD-22 → number+team)
+    else
+        resp="$(_linear_resolve_by_title "$ref" "$stype")"      # conservative title match
+    fi
+    # ONE parser for both shapes: require EXACTLY ONE matching node (uniqueness = conservatism), then
+    # read its id + the first workflow-state id of the mapped type.
+    read -r issue_id state_id <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if len(nodes) != 1:
+    print("\t")
+else:
+    n = nodes[0]
+    states = (((n.get("team") or {}).get("states") or {}).get("nodes")) or []
+    print("%s\t%s" % (n.get("id", ""), states[0]["id"] if states else ""))' 2>/dev/null)
+EOF
+    if [ -z "$issue_id" ]; then
+        echo "linear backend: no unique issue matching '$ref' — state unchanged (skipping, not filing)" >&2
+        _BACKEND_RESULT="NOCHANGE"
+        return 0
+    fi
+    if [ -z "$state_id" ]; then
+        echo "linear backend: issue '$ref' has no '$stype' workflow state — cannot mark it '$want'" >&2
+        _BACKEND_RESULT="NOCHANGE"
+        return 0
+    fi
+    _linear_gql 'mutation Move($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
+    _BACKEND_RESULT="DONE"
+}
+
 _backend_list_open() {
     # Print open issues (any state whose type is not completed/canceled) as one
     # "#<identifier> <title>" line each — the same shape the file/github backends emit.

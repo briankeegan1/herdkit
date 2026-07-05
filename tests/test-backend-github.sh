@@ -91,6 +91,36 @@ out="$(run _backend_item_state "provider-lib#7")"
 echo "$out" | grep -q "ITEM_STATE=open" || fail "_backend_item_state OPEN did not return ITEM_STATE=open ($out)"
 pass
 
+# 5b. update_state (done) → closes the resolved issue with reason "completed"; never creates one.
+#     (Intent dispatch, gh #139: a state change transitions the EXISTING issue, not a new one.)
+: > "$GHLOG"
+us="$(run _backend_update_state 7 done)"
+echo "$us" | grep -q "RESULT=DONE" || fail "update_state did not report DONE ($us)"
+grep -q -- "issue close -R acme/widgets 7 --reason completed" "$GHLOG" || fail "update_state (done) did not close issue 7 as completed"
+grep -q -- "issue create" "$GHLOG" && fail "update_state must NOT file a new issue (the #139 junk-issue bug)"
+pass
+
+# 5c. update_state (canceled) → closes with reason "not planned".
+: > "$GHLOG"; run _backend_update_state 7 canceled >/dev/null
+grep -q -- "issue close -R acme/widgets 7 --reason not planned" "$GHLOG" || fail "update_state (canceled) did not close as not planned"
+pass
+
+# 5d. update_state (in-progress) → GitHub has no in-progress state, so ensure the issue is OPEN
+#     (reopen) plus a marker comment; never a close.
+: > "$GHLOG"; run _backend_update_state 7 in-progress >/dev/null
+grep -q -- "issue reopen -R acme/widgets 7" "$GHLOG"  || fail "update_state (in-progress) did not reopen the issue"
+grep -q -- "issue comment -R acme/widgets 7" "$GHLOG" || fail "update_state (in-progress) did not leave a marker comment"
+grep -q -- "issue close" "$GHLOG"                     && fail "update_state (in-progress) must not close the issue"
+pass
+
+# 5e. update_state with an UNKNOWN target state → NOCHANGE, no close/reopen (files nothing).
+: > "$GHLOG"
+us2="$(run _backend_update_state 7 frobnicate 2>/dev/null)"
+echo "$us2" | grep -q "RESULT=NOCHANGE" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
+grep -q -- "issue close"  "$GHLOG" && fail "update_state on an unknown state should not close the issue"
+grep -q -- "issue reopen" "$GHLOG" && fail "update_state on an unknown state should not reopen the issue"
+pass
+
 # 6. absent gh degrades loudly (no silent success).
 if ( cd "$T"; export PATH="/nonexistent"; . "$BACKEND"; _backend_list_open ) >/dev/null 2>&1; then
   fail "list_open should fail when gh is absent"

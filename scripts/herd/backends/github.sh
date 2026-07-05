@@ -82,6 +82,39 @@ _backend_mark_shipped() {
     _BACKEND_RESULT="DONE"
 }
 
+_backend_update_state() {
+    # $1 = item ref (issue number, "#42", or a title to search); $2 = target state
+    # (done|in-progress|canceled + synonyms). Intent-dispatch path (gh #139): transition an EXISTING
+    # issue instead of filing a new one. GitHub issues are open/closed only, so:
+    #   done      → close with reason "completed"
+    #   canceled  → close with reason "not planned"
+    #   in-progress → ensure the issue is OPEN (reopen if closed) + a marker comment; GitHub has no
+    #                 native in-progress state, and item_state maps only open/closed.
+    # Sets _BACKEND_RESULT=DONE|NOCHANGE; an unknown state or no matching issue files NOTHING.
+    local ref="$1" want="$2" num
+    _github_require_gh
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then
+        echo "github backend: no open issue matching '$ref' — state unchanged (skipping, not filing)" >&2
+        _BACKEND_RESULT="NOCHANGE"
+        return 0
+    fi
+    case "$want" in
+        done|complete|completed|shipped|merged|closed|resolved)
+            _gh issue close "$num" --reason completed >/dev/null 2>&1 || true ;;
+        cancel|canceled|cancelled|wontfix|"won't fix"|declined|dropped|obsolete)
+            _gh issue close "$num" --reason "not planned" >/dev/null 2>&1 || true ;;
+        in-progress|inprogress|in_progress|started|doing|wip|active)
+            _gh issue reopen "$num" >/dev/null 2>&1 || true
+            _gh issue comment "$num" --body "Marked in-progress" >/dev/null 2>&1 || true ;;
+        *)
+            echo "github backend: unknown target state '$want' — expected done|in-progress|canceled (skipping, not filing)" >&2
+            _BACKEND_RESULT="NOCHANGE"
+            return 0 ;;
+    esac
+    _BACKEND_RESULT="DONE"
+}
+
 _backend_list_open() {
     # Print open issues as one "#<number> <title>" line each — the same human-readable one-line
     # shape the file/changelog backends emit, so the coordinator's issue-source reads them alike.
