@@ -24,7 +24,12 @@ HERD_REQUIRE_PROJECT_CONFIG=1
 herd_console_guard "backlog viewer" || exit 1
 REPO="$PROJECT_ROOT"
 f="$REPO/$BACKLOG_FILE"
-STYLE="$HERE/tokyonight.json"
+# Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
+# tokyonight.json). theme.sh resolves .herd/themes/<name>/glow.json → templates/themes/<name>/ →
+# tokyonight, failing soft to the built-in default; glow itself already drops color for a non-TTY.
+# shellcheck source=/dev/null
+. "$HERE/theme.sh"
+STYLE="$(herd_theme_glow_style)"
 last_frame=""
 BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 

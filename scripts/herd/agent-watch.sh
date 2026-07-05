@@ -203,14 +203,13 @@ unset _pol
 # This watcher's own worktree root — never auto-merge/remove the dir we run from.
 SELF_WT="$(cd "$HERE/../.." && pwd)"
 
-# Tokyo Night palette (truecolor — this is a status console, not markdown).
-C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
-C_BLUE=$'\033[38;2;122;162;247m'
-C_CYAN=$'\033[38;2;125;207;255m'
-C_GREEN=$'\033[38;2;158;206;106m'
-C_YELLOW=$'\033[38;2;224;175;104m'
-C_RED=$'\033[38;2;247;118;142m'
-C_DIM=$'\033[38;2;86;95;137m'
+# Console palette — themed via HERD_THEME (default tokyonight, byte-identical to the old hardcoded
+# truecolor block). theme.sh resolves .herd/themes/<name>/palette.sh → templates/themes/<name>/ →
+# tokyonight, warns-once-and-falls-back on an unknown/broken theme, and renders plain under NO_COLOR
+# or a non-TTY stdout. This is a status console (a pane), not markdown, so it uses the truecolor C_*.
+# shellcheck source=/dev/null
+. "$HERE/theme.sh"
+herd_theme_load_console
 
 SLUGW=28               # slug column width — pads slugs so the state words align.
 

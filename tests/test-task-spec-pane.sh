@@ -70,14 +70,16 @@ fi
 grep -aq $'\033\\[2m' "$T/v-missing.out"         || fail "(1) viewer's missing-spec notice is not dim (\\033[2m)"
 pass; echo "PASS (1b) missing/reaped spec → quiet DIM 'task spec removed' line, never red"
 
-# Wired to glow + the bundled tokyonight style (the theming requirement), with a cat fallback.
-# glow is invoked through the glow_pane wrapper (pins a truecolor profile + detaches the muted
-# tty), so accept either the bare `glow` or the `glow_pane` form.
-grep -Eq 'glow(_pane)? -s "\$STYLE"' "$VIEWER"   || fail "(1) viewer does not render via glow -s \"\$STYLE\" (tokyonight)"
-grep -q 'STYLE="$HERE/tokyonight.json"' "$VIEWER" || fail "(1) viewer does not use the bundled tokyonight.json style"
+# Wired to glow + the ACTIVE THEME's glow.json (HERD_THEME, default tokyonight), with a cat fallback.
+# glow is invoked through the glow_pane wrapper (pins a truecolor profile + detaches the muted tty),
+# so accept either the bare `glow` or the `glow_pane` form. The style path is now resolved via the
+# theme resolver (theme.sh), not a hardcoded tokyonight.json path.
+grep -Eq 'glow(_pane)? -s "\$STYLE"' "$VIEWER"   || fail "(1) viewer does not render via glow -s \"\$STYLE\""
+grep -q '\. "\$HERE/theme.sh"' "$VIEWER"          || fail "(1) viewer does not source the theme resolver (theme.sh)"
+grep -q 'STYLE="\$(herd_theme_glow_style)"' "$VIEWER" || fail "(1) viewer does not resolve its glow style via the theme (HERD_THEME)"
 grep -Eq 'glow(_pane)? -s dark' "$VIEWER"        || fail "(1) viewer lacks the glow -s dark fallback"
 grep -Eq 'cat "\$SPEC"' "$VIEWER"                || fail "(1) viewer lacks the plain cat fallback"
-pass; echo "PASS (1c) viewer renders via glow + tokyonight style (else glow -s dark, else cat)"
+pass; echo "PASS (1c) viewer renders via glow + the themed glow.json (else glow -s dark, else cat)"
 
 # The glow_pane wrapper must PIN a color profile so repeated repaints render identically without
 # re-detecting the terminal (CLICOLOR_FORCE + COLORTERM=truecolor), and detach glow's stdin from the
