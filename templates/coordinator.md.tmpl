@@ -161,6 +161,24 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 Keep every backlog edit **privacy-safe** — nothing under `{{DENY_PATHS}}` and no secrets ever
 reach `{{BACKLOG_FILE}}` (it's committed).
 
+## Switching work-tracker backends
+
+When the operator asks to move work tracking (markdown file ↔ GitHub Issues ↔ Linear), do NOT
+hand-edit `.herd/config` or `.herd/secrets` — run the one guided command and relay its prompts:
+
+    herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]
+
+It preflights credentials BEFORE changing anything (linear: asks for the API key on a tty, stores
+it in `.herd/secrets` — gitignored, never in config — and proves it with a live API round-trip;
+github: checks `gh auth`), flips `SCRIBE_BACKEND` through the validated config-set path, offers to
+replay the old backend's open items into the new one (idempotent; titles get a
+"(migrated from …)" provenance suffix), stamps `{{BACKLOG_FILE}}` as a FROZEN ARCHIVE when leaving
+the file backend, restarts the backlog pane, and journals `backend_switched`. Everything downstream
+— the scribe drainer, `herd backlog`, the watcher's mark-shipped, this skill — follows
+`SCRIBE_BACKEND` automatically. Two operator-facing footnotes to pass along: retire any idle scribe
+drainer spawned under the OLD backend (the flip warns about this), and secrets NEVER go in
+`.herd/config` or the backlog file.
+
 ## Workflow settings
 
 Every workflow preference lives in `.herd/config`, and the user can view or change **any** of them
