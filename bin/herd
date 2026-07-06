@@ -100,9 +100,13 @@ ask()  { # ask "<prompt>" "<default>" → echoes the answer (default on empty / 
 # replacement (no sed) so values containing / & | are safe.
 render_skill() {
   local root="$1" cfg="$2"
-  # Load the config in a subshell-safe way: source it to read the answers.
+  # Load the config in a subshell-safe way: source it to read the answers. HERD-47: after the
+  # committed baseline, also source the sibling per-user overlay .herd/config.local (when present) so
+  # the rendered skill reflects the EFFECTIVE config — matching herd-config.sh's baseline-then-overlay
+  # precedence, so a machine-scoped render key (e.g. HERD_DRIVER) set with `config set` is honored.
   # shellcheck source=/dev/null
   ( . "$cfg"
+    _rs_local="$(dirname "$cfg")/config.local"; [ -f "$_rs_local" ] && . "$_rs_local"
     : "${WORKSPACE_NAME:=$(basename "$root")}"
     : "${PROJECT_ROOT:=$root}"
     : "${DEFAULT_BRANCH:=origin/main}"
@@ -196,6 +200,15 @@ _On every invocation, read live state to surface what is configured:_
       done
     fi
 
+    # bash 5.2 turned ON `patsub_replacement` by default: an unquoted `&` in the REPLACEMENT string of
+    # a `${var//pat/repl}` expansion now expands to the MATCHED text (sed-like), where every earlier
+    # bash treated it literally. The token substitutions below feed values that legitimately contain
+    # `&` (e.g. the {{CAPABILITIES}} index carries `[ -f .herd/deps ] && cat …`), so on bash 5.2 each
+    # `&` was rewritten to the matched `{{CAPABILITIES}}` token — re-injecting the very token the
+    # completeness lint then flags, breaking `herd render` on Git Bash / any bash ≥ 5.2. Disable the
+    # option here (subshell-scoped) so these replacements stay LITERAL on every bash. Guarded so it is a
+    # harmless no-op on bash < 5.2 where the option does not exist.
+    shopt -u patsub_replacement 2>/dev/null || true
     local line _dk
     while IFS= read -r line || [ -n "$line" ]; do
       # Driver tokens FIRST, so a driver value that itself contains a {{TOKEN}} (e.g. {{SCRIPTS_DIR}})
@@ -847,6 +860,18 @@ _config_key_requires() {
     END { exit(found?0:1) }' "$1"
 }
 
+# _config_key_scope <caps> <KEY> → print the key's WRITE SCOPE (HERD-47): "machine" for keys that
+# hold per-user/per-machine state and therefore DEFAULT to the gitignored .herd/config.local overlay
+# (driver binding, model tiers / token budget, operator-posture opt-ins), or "project" for keys that
+# belong in the committed .herd/config baseline. Read from the OPTIONAL 6th column of
+# capabilities.tsv; a config row without it — or any non-config/unknown key — is "project" (the safe,
+# backward-compatible default: writes still land in the shared baseline unless --local is passed).
+_config_key_scope() {
+  local s
+  s="$(awk -F'\t' -v k="$2" '$2=="config" && $1==k { s=$6; gsub(/[[:space:]]+$/,"",s); print s; exit }' "$1")"
+  case "$s" in machine) printf 'machine' ;; *) printf 'project' ;; esac
+}
+
 # ── herd config sync support (HERD-38) ────────────────────────────────────────────────────────────
 # Canonical defaults template (KEY=value / commented-default lines with the real default VALUES that
 # capabilities.tsv only documents in prose). HERD_CONFIG_EXAMPLE_FILE overrides it for tests, mirroring
@@ -931,6 +956,23 @@ _config_put_value() {
   mv "$tmp" "$cfg"
 }
 
+# _config_ensure_local <local_cfg> — create the per-user overlay .herd/config.local with an
+# explanatory header if it does not exist yet (HERD-47), so `herd config set --local` (and machine-
+# scoped sets) have a file to write into. Idempotent: an existing overlay is left untouched. The
+# header mirrors the comment-preserving style of the baseline setter and documents the file's role.
+_config_ensure_local() {
+  local f="$1"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<'HDR'
+# .herd/config.local — per-user / per-machine overlay for .herd/config (gitignored, HERD-47).
+# Sourced AFTER .herd/config by scripts/herd/herd-config.sh, so keys set HERE OVERRIDE the committed
+# baseline — the settings.json/settings.local.json convention. Put per-machine state here (driver,
+# model tiers, operator-posture opt-ins) so it never diverges the shared project baseline or dirties
+# the ff-only `herd update` pull. ZERO-SECRET: credentials live in .herd/secrets, never here.
+# Managed by `herd config set --local KEY VALUE`; `herd config list` shows each value's source.
+HDR
+}
+
 # ── Additive config-key adoption on upgrade (issue #74) ───────────────────────────────────────────
 # When an engine update adds new keys to the canonical templates/config.example, a consumer's older
 # .herd/config is MISSING them and silently rides the fallback in herd-config.sh — the operator never
@@ -1005,8 +1047,8 @@ cmd_config() {
     set)          cmd_config_set "$@" ;;
     sync)         cmd_config_sync "$@" ;;
     lint)         _config_lint "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set <KEY> <VALUE> | sync | lint" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set <KEY> <VALUE> | sync | lint" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
   esac
 }
 
@@ -1040,18 +1082,42 @@ _config_lint() {
 }
 
 cmd_config_list() {
-  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
-  say "${c_bold}.herd/config${c_rst}  ($cfg)"
-  local line key val
+  # HERD-47: show each EFFECTIVE value AND its provenance — baseline (.herd/config) vs the per-user
+  # overlay (.herd/config.local, which wins). A key set in both shows the overriding local value
+  # tagged [local]; a key only in the overlay is tagged [local-only]; everything else is [baseline].
+  if [ -f "$local_cfg" ]; then
+    say "${c_bold}.herd/config${c_rst}  ($cfg)  ${c_dim}+ .herd/config.local overlay${c_rst}"
+  else
+    say "${c_bold}.herd/config${c_rst}  ($cfg)"
+  fi
+  local line key val src
+  # Baseline keys, in file order; a key also assigned in the overlay shows the OVERRIDING local value.
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
     key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
-    val="$(_config_file_value "$cfg" "$key")"
+    if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg"; then
+      val="$(_config_file_value "$local_cfg" "$key")"; src="local"
+    else
+      val="$(_config_file_value "$cfg" "$key")"; src="baseline"
+    fi
     _config_secret_key "$key" && val='********'
-    printf '  %-24s %s\n' "$key" "$val"
+    printf '  %-24s %-28s %s[%s]%s\n' "$key" "$val" "$c_dim" "$src" "$c_rst"
   done < "$cfg"
+  # Keys present ONLY in the overlay (never assigned in the baseline).
+  if [ -f "$local_cfg" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
+      key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
+      grep -qE "^[[:space:]]*$key=" "$cfg" && continue   # already shown above as a baseline override
+      val="$(_config_file_value "$local_cfg" "$key")"
+      _config_secret_key "$key" && val='********'
+      printf '  %-24s %-28s %s[local-only]%s\n' "$key" "$val" "$c_dim" "$c_rst"
+    done < "$local_cfg"
+  fi
 }
 
 cmd_config_get() {
@@ -1068,9 +1134,13 @@ cmd_config_get() {
 }
 
 cmd_config_set() {
+  # HERD-47: an optional leading `--local` forces the write into the per-user overlay .herd/config.local
+  # instead of the committed baseline .herd/config. Parsed before the positional KEY/VALUE.
+  local force_local=0
+  if [ "${1:-}" = "--local" ]; then force_local=1; shift; fi
   local key="${1:-}" val="${2:-}"
-  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set <KEY> <VALUE>"
-  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set [--local] <KEY> <VALUE>"
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
 
@@ -1099,16 +1169,33 @@ cmd_config_set() {
   requires="$(_config_key_requires "$caps" "$key")" \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
 
-  # 3. Idempotent targeted edit: replace the first KEY= line in place (preserving leading whitespace
-  #    and every other line/comment) or append when absent. A no-op set skips the write AND the
-  #    restart/re-render, so re-running the same set is inert.
-  local cur; cur="$(_config_file_value "$cfg" "$key")"
-  if [ "$cur" = "$val" ] && grep -qE "^[[:space:]]*$key=" "$cfg"; then
-    ok "$key already = \"$val\" (no change)"
+  # 2b. Decide the TARGET file (HERD-47). A write lands in the per-user overlay .herd/config.local
+  #     when EITHER --local was passed OR the key is machine-scoped in the manifest (scope=machine:
+  #     driver, model tiers, operator-posture opt-ins — per-user state that must not diverge the
+  #     shared baseline). Otherwise it lands in the committed baseline .herd/config. The overlay is
+  #     created on demand (with its documenting header) only when it is actually the target.
+  local scope target target_label
+  scope="$(_config_key_scope "$caps" "$key")"
+  if [ "$force_local" -eq 1 ] || [ "$scope" = "machine" ]; then
+    _config_ensure_local "$local_cfg"
+    target="$local_cfg"; target_label=".herd/config.local"
+  else
+    target="$cfg"; target_label=".herd/config"
+  fi
+
+  # 3. Idempotent targeted edit against the TARGET file: replace the first KEY= line in place
+  #    (preserving leading whitespace and every other line/comment) or append when absent. A no-op
+  #    set skips the write AND the restart/re-render, so re-running the same set is inert. The
+  #    idempotency probe reads the TARGET, so a machine key already at VALUE in the overlay is a
+  #    no-op even when the baseline holds a different value (the overlay is what wins at load time).
+  local cur; cur="$(_config_file_value "$target" "$key")"
+  if [ "$cur" = "$val" ] && grep -qE "^[[:space:]]*$key=" "$target"; then
+    ok "$key already = \"$val\" in $target_label (no change)"
     return 0
   fi
-  _config_put_value "$cfg" "$key" "$val"
-  ok "set $key = \"$val\" in .herd/config"
+  _config_put_value "$target" "$key" "$val"
+  ok "set $key = \"$val\" in $target_label"
+  [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms.
   case "$requires" in

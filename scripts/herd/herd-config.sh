@@ -129,6 +129,26 @@ if [ -f "$_HERD_CONFIG_FILE" ]; then
   _herd_config_warn_dupes "$_HERD_CONFIG_FILE"
 fi
 
+# ── Per-user overlay: .herd/config.local (HERD-47) ───────────────────────────
+# Split the single tracked .herd/config into a COMMITTED project baseline (sourced just above) plus
+# an OPTIONAL, gitignored per-user/per-machine overlay sourced HERE, AFTER it — mirroring the
+# settings.json / settings.local.json (and .env / .env.local) convention Claude Code itself uses.
+# Both files are plain shell-sourced KEY=value, so a LATER assignment wins: any key set in
+# config.local OVERRIDES the baseline, keys it leaves unset keep the baseline value, and the engine
+# fallbacks below still fill anything neither file set. This is the whole precedence rule — baseline
+# first, overlay second. When config.local is ABSENT this block is inert and the effective config is
+# BYTE-IDENTICAL to a single-file setup (backward-compatible). The overlay is the SIBLING of the
+# resolved baseline (.herd/config.local next to .herd/config), and it is ZERO-SECRET exactly like the
+# baseline: credentials still live only in .herd/secrets, which is never sourced here. It intentionally
+# does NOT participate in the console launch-binding guard (_HERD_CONFIG_SOURCE tracks the BASELINE
+# resolution only) — the overlay tunes values, it never re-binds which project's config was found.
+_HERD_CONFIG_LOCAL_FILE="$(dirname "$_HERD_CONFIG_FILE")/config.local"
+if [ -f "$_HERD_CONFIG_LOCAL_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$_HERD_CONFIG_LOCAL_FILE"
+  _herd_config_warn_dupes "$_HERD_CONFIG_LOCAL_FILE"
+fi
+
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
 # PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if none, the repo
 # the engine lives in). Everything else derives from it. Computed with an explicit unset-guard rather
@@ -304,7 +324,7 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 
-unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE
+unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE _HERD_CONFIG_LOCAL_FILE
 
 # Derived helpers — split DEFAULT_BRANCH (e.g. "origin/main") for push/pull commands.
 HERD_REMOTE="${DEFAULT_BRANCH%%/*}"
