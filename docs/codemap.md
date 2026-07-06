@@ -106,6 +106,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `APP_SURFACE_GLOB` → `healthcheck.sh`
 - `BACKLOG_FILE` → `bin/herd`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
+- `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`

@@ -147,12 +147,15 @@ _cm_render() {
   # 2. Who sources whom (edges to real engine scripts only; sorted by sourcer then target).
   printf '\n## Who sources whom\n\n'
   printf 'Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).\n\n'
-  declare -A _isscript
-  for f in scripts/herd/*.sh; do _isscript["${f##*/}"]=1; done
+  # Membership set of real engine-script basenames. bash 3.2 has no associative arrays (the project's
+  # portability floor — see healthcheck.sh), so carry it as a space-delimited string and test with a
+  # glob `case`; basenames never contain spaces, so the padded match is exact.
+  local _isscript=" "
+  for f in scripts/herd/*.sh; do _isscript="${_isscript}${f##*/} "; done
   cur=""; targets=""
   while IFS=$'\t' read -r path tgt; do
     [ -n "$path" ] || continue
-    [ -n "${_isscript[$tgt]:-}" ] || continue
+    case "$_isscript" in *" $tgt "*) ;; *) continue ;; esac
     if [ "$path" != "$cur" ]; then
       if [ -n "$cur" ] && [ -n "$targets" ]; then
         case "$cur" in bin/herd) lbl="bin/herd" ;; *) lbl="${cur##*/}" ;; esac
@@ -178,28 +181,64 @@ _cm_render() {
       case "$f" in scripts/herd/herd-config.sh) continue ;; esac
       scan+=("$f")
     done
-    declare -A _cons
-    while IFS=$'\t' read -r key path; do
-      [ -n "$key" ] || continue
-      case "$path" in bin/herd) lbl="bin/herd" ;; *) lbl="${path##*/}" ;; esac
-      _cons["$key"]="${_cons[$key]:+${_cons[$key]}, }\`$lbl\`"
-    done < <(_cm_config_pairs "$caps" "${scan[@]}" | sort)
-    # Emit every config key in sorted order (a key with no consumer shows an em-dash).
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      printf -- '- `%s` → %s\n' "$key" "${_cons[$key]:-—}"
-    done < <(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u)
+    # Group consumers per key. bash 3.2 has no associative arrays, so do the grouping in awk (awk
+    # always has them): over the path-sorted pairs, accumulate a comma-joined `label` list per key in
+    # the same order the old assoc-array loop emitted (labels follow the path sort). Emit "key<TAB>
+    # joined" per key that has ≥1 consumer.
+    local consmap keys
+    consmap="$(_cm_config_pairs "$caps" "${scan[@]}" | sort | awk -F'\t' '
+      function base(p,  n,a){ n=split(p,a,"/"); return a[n] }
+      { lbl=($2=="bin/herd")?"bin/herd":base($2)
+        if ($1 in c) c[$1]=c[$1] ", `" lbl "`"; else c[$1]="`" lbl "`" }
+      END { for (k in c) print k "\t" c[k] }
+    ')"
+    # Full config-key list (sorted). Join it against the consumer map in ONE awk (a key with no
+    # consumer shows an em-dash), reproducing the old `- \`key\` → consumers` lines byte-for-byte.
+    keys="$(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u)"
+    awk -F'\t' '
+      NR==FNR { if ($1!="") cons[$1]=$2; next }
+      $1!="" { printf "- `%s` \342\206\222 %s\n", $1, ($1 in cons ? cons[$1] : "\342\200\224") }
+    ' <(printf '%s\n' "$consmap") <(printf '%s\n' "$keys")
   fi
 }
 
-# ── Refresh: write only when the content changed; report what happened ────────────────────────────
+# ── Refresh (default) / --check (read-only staleness probe) ────────────────────────────────────────
+# main [--check]
+#   (no arg) REFRESH: regenerate the map and write $OUT only when its content actually changed.
+#   --check  PROBE:   regenerate to a temp file and diff it against the committed $OUT WITHOUT ever
+#                     writing $OUT (or creating its directory) — exit 0 when the committed map is
+#                     byte-identical to a fresh scan (fresh), non-zero when it is missing or drifted
+#                     (stale). The cheap, side-effect-free guard the watcher's post-merge auto-refresh
+#                     and `herd status`' informational freshness row both build on.
 main() {
-  local tmp outlabel delta
+  local mode="refresh" tmp outlabel delta
+  case "${1:-}" in
+    --check) mode="check" ;;
+    "")      : ;;
+    *)       printf 'codemap.sh: unknown argument: %s (expected --check or none)\n' "$1" >&2; return 2 ;;
+  esac
+
   tmp="$(mktemp)"
   ( cd "$ROOT" && _cm_render ) > "$tmp"
-  mkdir -p "$(dirname "$OUT")"
   outlabel="${OUT#"$ROOT"/}"
 
+  if [ "$mode" = "check" ]; then
+    # READ-ONLY: never write $OUT, never mkdir its dir. Report fresh/stale and set the exit code.
+    if [ -f "$OUT" ] && cmp -s "$tmp" "$OUT"; then
+      rm -f "$tmp"
+      printf '%s — fresh\n' "$outlabel"
+      return 0
+    fi
+    rm -f "$tmp"
+    if [ -f "$OUT" ]; then
+      printf '%s — STALE (out of date; run `herd codemap` to refresh)\n' "$outlabel" >&2
+    else
+      printf '%s — STALE (missing; run `herd codemap` to generate)\n' "$outlabel" >&2
+    fi
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$OUT")"
   if [ -f "$OUT" ] && cmp -s "$tmp" "$OUT"; then
     rm -f "$tmp"
     printf '%s — up to date\n' "$outlabel"

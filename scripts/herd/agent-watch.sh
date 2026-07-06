@@ -824,6 +824,57 @@ reconcile_backlog() {
   return 0
 }
 
+# refresh_codemap <pr#> — POST-MERGE codemap freshness hook (best-effort, NEVER blocks/fails the
+# merge). After a PR lands on the default branch and $MAIN is fast-forwarded, regenerate the
+# committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan actually changed its
+# content, commit the refresh STRAIGHT to the default branch — no PR, mirroring the BACKLOG.md
+# generated-artifact convention — and push ff-safe. Every failure mode fails SOFT and journals a
+# `codemap_refresh` event so a drift audit can see what happened; nothing here can ever return
+# non-zero into do_merge.
+#
+# Gated by CODEMAP_AUTOREFRESH: off → byte-inert (we never run the scan, never touch the tree).
+# Race-guarded three ways: (1) only when the project has already ADOPTED the codemap (the committed
+# docs/codemap.md exists — never materialize a new one); (2) skip if that path already carries an
+# uncommitted change (a concurrent writer owns it this tick — never clobber or bundle their edit);
+# (3) codemap.sh rewrites the file ONLY when content changed, so a clean tree after regen = fresh,
+# nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
+refresh_codemap() {
+  local rc_pr="${1:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh"
+  case "$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|off|no|disable|disabled)
+      journal_append codemap_refresh pr "$rc_pr" result skipped reason disabled; return 0 ;;
+  esac
+  [ -f "$rc_script" ]      || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-script;  return 0; }
+  [ -f "$MAIN/$rc_out" ]   || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-codemap; return 0; }
+  # A pending change already on docs/codemap.md means someone else is mid-edit — leave it alone.
+  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+    journal_append codemap_refresh pr "$rc_pr" result skipped reason dirty-path; return 0
+  fi
+  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+  if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
+    journal_append codemap_refresh pr "$rc_pr" result error reason regen-failed; return 0
+  fi
+  # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
+  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+    journal_append codemap_refresh pr "$rc_pr" result fresh; return 0
+  fi
+  # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
+  # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+  if ! git -C "$MAIN" commit -q -m "chore: refresh codemap after PR #${rc_pr}" -- "$rc_out" >/dev/null 2>&1; then
+    journal_append codemap_refresh pr "$rc_pr" result error reason commit-failed; return 0
+  fi
+  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes; return 0
+  fi
+  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
+     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes-after-rebase; return 0
+  fi
+  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+  journal_append codemap_refresh pr "$rc_pr" result committed pushed no
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -844,6 +895,11 @@ do_merge() {
   reconcile_backlog "$dp" "$ds" "$dsha"
   # 2) fast-forward the MAIN checkout so coordinator + backlog viewer reflect it. Never force.
   git -C "$MAIN" pull --ff-only >/dev/null 2>&1 || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
+  # 2b) POST-MERGE codemap refresh: regenerate the committed docs/codemap.md against the freshly ff'd
+  #     $MAIN and, only when it actually changed, commit it direct to the default branch (no PR,
+  #     BACKLOG.md-style) and push ff-safe. Gated by CODEMAP_AUTOREFRESH; fully fail-soft — a codemap
+  #     problem never blocks or fails the merge (mirrors the reconcile hook's best-effort posture).
+  refresh_codemap "$dp"
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
   git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
   journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
