@@ -12,9 +12,10 @@
 # glamour's ANSI — deterministic, and no glow install required.
 #
 # Coverage:
-#   1. rich TSV   — grouped headers with counts, started-first, chip + bold-title-only, indented
-#                   plain description (de-duplicated from a title-repeating description), long
-#                   titles split at a word boundary with the spill joining the body.
+#   1. rich TSV   — grouped headers with counts, started-first, chip + bold-title-only, plain
+#                   top-level description paragraph (de-duplicated from a title-repeating
+#                   description), long titles split at a word boundary with the spill joining
+#                   the body.
 #   2. plain list — tab-free `--rich` answer renders the legacy `- \`#id\` **title**` shape.
 #   3. old CLI    — `backlog --rich` exiting non-zero falls back to a plain `backlog` call.
 #
@@ -94,18 +95,18 @@ grep -q '## 🔜 queued (2)' <<<"$out1"      || fail "missing queued group heade
 # started renders first
 first_group="$(grep -n '##' <<<"$out1" | head -n1)"
 grep -q 'in progress' <<<"$first_group" || fail "in-progress group must render before queued ($first_group)"
-# chip + bold TITLE ONLY + italic state name; description is a plain indented line, never bold
+# chip + bold TITLE ONLY + italic state name; description is a plain top-level paragraph line, never bold
 grep -q -- '- `#HERD-8` \*\*Externalized work queue\*\* _(In Progress)_' <<<"$out1" \
   || fail "in-progress item shape wrong (chip/bold-title/state) ($out1)"
-grep -q '^  Coordinator writes spawn intents, watcher drains them\.$' <<<"$out1" \
-  || fail "description must be a plain indented continuation line"
+grep -q '^Coordinator writes spawn intents, watcher drains them\.$' <<<"$out1" \
+  || fail "description must be a plain top-level paragraph (unindented: glamour glues an indented continuation onto the item)"
 # title-repeating description is de-duplicated out of the body
-grep -q '^  Show live status in the pane\.$' <<<"$out1" \
+grep -q '^Show live status in the pane\.$' <<<"$out1" \
   || fail "body must strip the description's leading title repetition"
 # paragraph-length title: bold head caps at a word boundary, spill continues as plain body
 grep -q -- '- `#HERD-36` \*\*Code map for agent context: graphify the codebase so coordinators and builders start grounded instead of\*\*' <<<"$out1" \
   || fail "long title was not split at a word boundary into a bold head ($out1)"
-grep -q '^  re-exploring the repository every session which is expensive$' <<<"$out1" \
+grep -q '^re-exploring the repository every session which is expensive$' <<<"$out1" \
   || fail "long-title spill must continue as plain body text"
 pass
 

@@ -107,8 +107,12 @@ incoming_block() {
 # "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>") into markdown that renders with the loved
 # file-backend hierarchy: items GROUPED under H2 state headers (🚧 in progress / 🔜 queued /
 # ❓ triage — the theme's H2 purple bar), the id as a code chip, ONLY the title in bold (the
-# theme's strong orange), and the description as a plain continuation paragraph (the theme's body
-# color) — so status is visible at a glance and the pane is no longer a wall of bold. Overlong
+# theme's strong orange), and the description as a plain TOP-LEVEL paragraph between bullets (the
+# theme's body color) — so status is visible at a glance and the pane is no longer a wall of bold.
+# The paragraph is deliberately NOT indented under the bullet: glamour merges a list item's
+# indented continuation paragraph INTO the item's own flow with no separator (title and body glue
+# together as '…(In Progress)DESC…'), while a bare paragraph renders on its own line at the item
+# margin — the exact visual break of the loved file-backend view. Overlong
 # titles are split at a word boundary: the head stays bold, the spill joins the body text (fixes
 # paragraph-length tracker titles rendering entirely bold). A description that merely repeats the
 # title (the scribe files title = first line of the full text) is de-duplicated. PURE markdown
@@ -155,7 +159,7 @@ for g in ORDER:
         state = " _(%s)_" % sname if (stype == "started" and sname) else ""
         out.append("- `%s` **%s**%s\n" % (ident, head, state))
         if body:
-            out.append("  %s\n" % body)
+            out.append("%s\n" % body)
 out.append("")
 sys.stdout.write("\n".join(out))
 '
