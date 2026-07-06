@@ -18,19 +18,34 @@
 #     raw error body ever reaches the pane; the warning is a fixed one-liner.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
-# rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
-HERD_REQUIRE_PROJECT_CONFIG=1
-. "$HERE/herd-config.sh"
-herd_console_guard "backlog viewer" || exit 1
-REPO="$PROJECT_ROOT"
-f="$REPO/$BACKLOG_FILE"
-# Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
-# tokyonight.json). theme.sh resolves .herd/themes/<name>/glow.json → templates/themes/<name>/ →
-# tokyonight, failing soft to the built-in default; glow itself already drops color for a non-TTY.
-# shellcheck source=/dev/null
-. "$HERE/theme.sh"
-STYLE="$(herd_theme_glow_style)"
+
+# ── one-shot shaping seam (--emit-md) ──────────────────────────────────────────
+# `backlog-view.sh --emit-md` reads a `herd backlog[ --rich]` list on STDIN and writes the EXACT
+# markdown the live pane hands to glow (shape_md) to STDOUT, then exits 0. It is deterministic and
+# TTY-/backend-/glow-independent — the seam the render tests assert on, because scraping the live
+# pane paint is not portable: glow paints straight to the pane TTY, so on a non-TTY capture the
+# shaped item markdown never reaches stdout. The heavy viewer bootstrap below (project config,
+# console guard, theme, TTY muting, poll loop) is SKIPPED in this mode — pure shaping needs none of
+# it, and its TTY escape codes / cursor-restore would otherwise corrupt the emitted markdown. The
+# actual emit happens once shape_md is defined (dispatch just below the shaping helpers).
+EMIT_MD=0
+case "${1:-}" in --emit-md) EMIT_MD=1 ;; esac
+
+if [ "$EMIT_MD" = 0 ]; then
+  # Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
+  # rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
+  HERD_REQUIRE_PROJECT_CONFIG=1
+  . "$HERE/herd-config.sh"
+  herd_console_guard "backlog viewer" || exit 1
+  REPO="$PROJECT_ROOT"
+  f="$REPO/$BACKLOG_FILE"
+  # Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
+  # tokyonight.json). theme.sh resolves .herd/themes/<name>/glow.json → templates/themes/<name>/ →
+  # tokyonight, failing soft to the built-in default; glow itself already drops color for a non-TTY.
+  # shellcheck source=/dev/null
+  . "$HERE/theme.sh"
+  STYLE="$(herd_theme_glow_style)"
+fi
 last_frame=""
 BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 
@@ -38,20 +53,22 @@ BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 # onto the rendered view, corrupting it. Disabling stdin reads is NOT enough — echo happens in the
 # kernel regardless — so we mute the tty itself with stty, then restore it (and the cursor) on any
 # exit so the terminal is never left in a broken state.
-saved_tty=""
-if [ -r /dev/tty ]; then
-  saved_tty=$(stty -g </dev/tty 2>/dev/null) || saved_tty=""
-fi
-restore_tty() {
-  [ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
-  printf '\033[?25h'  # show cursor
-  [ -n "$BACKLOG_VIEW_TMP" ] && rm -f "$BACKLOG_VIEW_TMP" 2>/dev/null
-}
-trap 'restore_tty; exit 0' INT TERM
-trap restore_tty EXIT
-if [ -n "$saved_tty" ]; then
-  stty -echo -icanon </dev/tty 2>/dev/null
-  printf '\033[?25l'  # hide cursor
+if [ "$EMIT_MD" = 0 ]; then
+  saved_tty=""
+  if [ -r /dev/tty ]; then
+    saved_tty=$(stty -g </dev/tty 2>/dev/null) || saved_tty=""
+  fi
+  restore_tty() {
+    [ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+    printf '\033[?25h'  # show cursor
+    [ -n "$BACKLOG_VIEW_TMP" ] && rm -f "$BACKLOG_VIEW_TMP" 2>/dev/null
+  }
+  trap 'restore_tty; exit 0' INT TERM
+  trap restore_tty EXIT
+  if [ -n "$saved_tty" ]; then
+    stty -echo -icanon </dev/tty 2>/dev/null
+    printf '\033[?25l'  # hide cursor
+  fi
 fi
 
 # file_mtime / epoch_to_hhmm — portable helpers; detect BSD vs GNU once at startup.
@@ -115,7 +132,12 @@ incoming_block() {
 # margin — the exact visual break of the loved file-backend view. Overlong
 # titles are split at a word boundary: the head stays bold, the spill joins the body text (fixes
 # paragraph-length tracker titles rendering entirely bold). A description that merely repeats the
-# title (the scribe files title = first line of the full text) is de-duplicated. PURE markdown
+# title (the scribe files title = first line of the full text) is de-duplicated. Emphasis markers
+# are kept SANE so glow never leaks a literal '**': the bolded head has any internal ** stripped
+# (the template already bolds it), and the body's inline **bold** is balanced — an upstream desc cap
+# (linear.sh truncates at 280), our BODY_MAX cut, or the title-spill join can split a **…** span and
+# orphan one marker, which glow renders as a stray literal '**' (the backend-mode render bug,
+# follow-on to #152/#153). PURE markdown
 # shaping — glow + the theme style do ALL the coloring, no ANSI hand-coding.
 rich_to_md() {
   printf '%s\n' "$1" | python3 -c '
@@ -124,6 +146,23 @@ import sys
 TITLE_MAX, BODY_MAX = 110, 300
 GROUP = {"started": "🚧 in progress", "unstarted": "🔜 queued", "backlog": "🔜 queued", "triage": "❓ triage"}
 ORDER = ["🚧 in progress", "🔜 queued", "❓ triage"]
+
+def strip_bold(s):
+    # HEAD text is wholly emphasized by the item template (**%s**). Any ** already inside it would
+    # nest/break that span (glow then leaks a literal **), so drop internal markers outright — the
+    # template supplies the bold.
+    return s.replace("**", "")
+
+def balance_bold(s):
+    # BODY text keeps its own inline **bold** (rendered as a plain paragraph, not template-bolded),
+    # but a **…** span can be split by an upstream desc cap (linear.sh truncates at 280), our own
+    # BODY_MAX cut, or the title-spill join — orphaning one marker. glow then renders that lone ** as
+    # literal text (often stranded on its own wrapped line: the backend-mode render bug). Drop only
+    # the unmatched marker so legitimate, balanced bold still renders while no orphan reaches glow.
+    while s.count("**") % 2:
+        i = s.rfind("**")
+        s = s[:i] + s[i + 2:]
+    return s
 
 groups = {}
 for ln in sys.stdin.read().splitlines():
@@ -156,6 +195,8 @@ for g in ORDER:
             body = (spill + " " + body).strip() if body else spill
         if len(body) > BODY_MAX:
             body = body[:BODY_MAX - 1].rstrip() + "…"
+        head = strip_bold(head)          # head is bolded by the template — no internal ** allowed
+        body = balance_bold(body)        # keep balanced bold, drop any wrap/cut-orphaned marker
         state = " _(%s)_" % sname if (stype == "started" and sname) else ""
         out.append("- `%s` **%s**%s\n" % (ident, head, state))
         if body:
@@ -199,6 +240,14 @@ list_to_md() {
     esac
   done
 }
+
+# ── one-shot shaping seam dispatch ─────────────────────────────────────────────
+# (See the --emit-md note near the top.) With both shaping helpers now defined, emit the shaped
+# markdown for the list on STDIN and exit — before any viewer/config/glow/TTY code runs.
+if [ "$EMIT_MD" = 1 ]; then
+  shape_md "$(cat)"
+  exit 0
+fi
 
 # glow_pane <glow-args...> — paint the pane TTY with glow under a PINNED color profile so every
 # repaint renders identically without re-detecting the terminal, and with stdin detached from the
