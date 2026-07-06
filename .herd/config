@@ -8,7 +8,7 @@ DEFAULT_BRANCH="origin/main"
 WORKSPACE_NAME="herdkit"
 
 BACKLOG_FILE="BACKLOG.md"
-SCRIBE_BACKEND="file"
+SCRIBE_BACKEND="linear"
 SHARE_LINKS=""
 
 # HEALTHCHECK = shellcheck over the scripts + bats over the tests (degrades to bash -n + the
@@ -51,3 +51,86 @@ SPAWN_AHEAD=1
 HERD_REPO="briankeegan1/herdkit"
 # Dogfood: bounce BLOCK reviews straight to the builder agent (3-round cap, sha-keyed).
 REVIEW_AUTOFIX="true"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Explicitly materialized config (2026-07-06). Every key below is written at its
+# documented default from templates/capabilities.tsv EXCEPT the two overnight
+# opt-ins at the bottom — so this block is behavior-neutral vs. leaving them unset,
+# it just makes the full surface visible. Trade-off: these no longer track future
+# engine-default changes; re-check after a `herd upgrade`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# — Backlog / token —
+# off; no github-issues incoming inbox beneath the queue
+BACKLOG_VIEW_EXTRAS=""
+# standard | eco (eco flips built-in defaults to cheaper tiers)
+TOKEN_MODE="standard"
+
+# — App preview (herdkit has NO app lane; all inert while APP_PREVIEW_CMD is blank) —
+APP_PREVIEW_SERVER_ARGS="--server.port {port} --server.headless true"
+APP_PREVIEW_HEALTH_CMD=""
+APP_PREVIEW_HEALTH_PATH="/"
+APP_PREVIEW_PORT_BASE="8501"
+# blank → interaction gate disabled (zero behavior change)
+APP_SURFACE_GLOB=""
+INTERACTION_TEST_CMD=""
+
+# — Runtime driver: herdr multiplexer + Claude Code runtime (this box has herdr) —
+HERD_DRIVER="herdr-claude"
+
+# — PR flow / merge —
+# merge | squash | rebase
+MERGE_METHOD="merge"
+# direct (open ready) | draft
+PR_FLOW="direct"
+# only consulted when PR_FLOW=draft
+PR_READY_WHEN="builder"
+# retain merged feature branches (today's behavior)
+DELETE_BRANCH_ON_MERGE="false"
+# pre-pr mode not wired yet; keep none
+LOCAL_REVIEW="none"
+
+# — Watcher lens / scope (solo defaults; unset behaves identically) —
+WATCHER_VIEW="all"
+WATCHER_VIEW_AUTHOR=""
+WATCHER_VIEW_ASSIGNEE=""
+WATCHER_VIEW_LABEL=""
+WATCHER_VIEW_STATUS=""
+WATCHER_VIEW_DEPS_LABEL="dependencies"
+# solo: auto-merge own PRs; all = team mode (needs WATCHER_OWNER)
+WATCHER_SCOPE="mine"
+WATCHER_OWNER=""
+
+# — Review concurrency / tiering —
+REVIEW_CONCURRENCY="2"
+# keep 1: worktrees share one git object store
+HEALTH_CONCURRENCY="1"
+REFIX_MAX_ROUNDS="3"
+# blank → every PR gets the full MODEL_REVIEW (Opus)
+REVIEW_ESCALATE_GLOB=""
+# only used once REVIEW_ESCALATE_GLOB is set
+REVIEW_MODEL_CHEAP="claude-sonnet-4-6"
+REVIEW_ESCALATE_MAXFILES="10"
+
+# — Dependency watcher / usage-limit resume —
+DEP_POLL_MIN="30"
+DEP_POLL_MAX="300"
+# 24h; 0 disables stall surfacing
+DEP_STALE_TTL="86400"
+# seconds after parsed reset before relaunch
+HERD_LIMIT_RESUME_BUFFER="60"
+# ~5h window when reset time can't be parsed
+HERD_LIMIT_UNKNOWN_WAIT="18000"
+
+# — Builder-tab UX / theme —
+TASK_PANE_VIEW="on"
+HERD_THEME="tokyonight"
+
+# ── HERD-6 overnight-run opt-ins (NON-default: deliberately ON) ───────────────
+# Unattended posture for the falsification run. Both ship DORMANT by default;
+# activation requires a watcher restart (herd reload), so these are INERT until
+# the control room is (re)launched. Turn OFF again after the overnight run.
+# auto-resume a limit-parked coordinator at reset+buffer
+COORDINATOR_WATCHDOG="on"
+# restart a silently-dead EMPTY builder once (never blows away work)
+DEAD_BUILDER_AUTORESPAWN="on"
