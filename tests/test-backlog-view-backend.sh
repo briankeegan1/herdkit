@@ -157,4 +157,27 @@ grep -q "held-item" <<<"$out5"                 || fail "empty-result: last good 
 grep -q "backend unreachable since" <<<"$out5" || fail "empty-result: missing last-good warning line"
 pass
 
+# ── Case 6: manual-refresh wait (HERD-48) — poll_wait's no-tty fallback is bounded & non-blocking ─
+# The plain `sleep "$poll"` is now poll_wait, which lets an interactive pane force an instant refresh
+# with r/R. With a REAL (non-zero) poll and NO interactive tty (this hermetic harness has none) it
+# MUST fall back to a plain sleep: the loop still advances, renders, and TERMINATES at MAX_POLLS — it
+# must never block waiting for a keystroke (the no-false-red fail-soft contract). Run 2 polls @1s in
+# the background and assert it exits on its own inside a watchdog window; a hang means the tty read
+# was not fail-softed.
+P6="$T/proj-refresh"; make_project "$P6" "linear"
+: > "$LOG"
+env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+  HERD_CONFIG_FILE="$P6/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 HERD_FAKE_LOG="$LOG" \
+  BACKLOG_VIEW_MAX_POLLS=2 BACKLOG_VIEW_POLL_SECS=1 HERD_FAKE_OUT="#R-1 refresh-item" \
+  bash "$SCRIPT" </dev/null >"$T/out6" 2>/dev/null & vpid=$!
+alive=1
+for _ in $(seq 1 16); do kill -0 "$vpid" 2>/dev/null || { alive=0; break; }; sleep 0.5; done
+if [ "$alive" -eq 1 ]; then
+  kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
+  fail "poll_wait blocked — the loop did not terminate at MAX_POLLS (no-tty fallback broken)"
+fi
+wait "$vpid" 2>/dev/null
+grep -q "refresh-item" "$T/out6" || fail "refresh-wait: loop did not render the list through poll_wait"
+pass
+
 echo "ALL PASS ($PASS checks)"

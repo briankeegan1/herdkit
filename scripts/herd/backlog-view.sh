@@ -65,6 +65,45 @@ else
 fi
 now_hhmm() { date +%H:%M 2>/dev/null || echo '--:--'; }
 
+# poll_wait <secs> — the poll interval's wait, made interruptible for the manual-refresh key
+# (HERD-48). Normally waits <secs> and returns 0; if the pane tty is interactive and the user presses
+# 'r'/'R' during the wait, it returns 10 at once so the caller can force an immediate refetch+repaint.
+# Every OTHER key is ignored — we keep waiting out the REMAINING interval, so a stray keystroke never
+# shortens the poll cadence nor hammers the backend. The read IS the sleep: its timeout equals the
+# poll interval, so with no key pressed the cadence is byte-identical to the old plain `sleep`.
+#
+# FAIL-SOFT per the no-false-red rule: with no usable pane tty (headless driver, CI, tests — saved_tty
+# empty or /dev/tty unreadable) it degrades to a plain `sleep` and never touches the tty at all. The
+# read never crashes and never busy-loops: `read -t` returns >128 on timeout (full interval elapsed)
+# and 1..128 on EOF/error; only rc 0 carries a key. On a wedged tty (EOF/error) we sleep out the
+# remainder instead of spinning.
+poll_wait() {
+  local secs="$1" key rc deadline now rem
+  case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  if [ -z "$saved_tty" ] || [ ! -r /dev/tty ]; then
+    [ "$secs" -gt 0 ] && sleep "$secs"
+    return 0
+  fi
+  now=$(date +%s); deadline=$(( now + secs )); rem="$secs"
+  while [ "$rem" -gt 0 ]; do
+    if IFS= read -r -t "$rem" -n 1 key </dev/tty; then
+      case "$key" in r|R) return 10 ;; esac
+      # any other key → fall through and keep waiting out the remaining interval
+    else
+      rc=$?
+      # rc>128 → the read timed out (interval elapsed): normal, done. rc 1..128 → EOF/error on the
+      # tty: don't spin — sleep any time left in the interval, then return.
+      if [ "$rc" -le 128 ]; then
+        now=$(date +%s); rem=$(( deadline - now ))
+        [ "$rem" -gt 0 ] && sleep "$rem"
+      fi
+      return 0
+    fi
+    now=$(date +%s); rem=$(( deadline - now ))
+  done
+  return 0
+}
+
 # ── incoming (github issues) — optional additive section (BACKLOG_VIEW_EXTRAS) ─
 # When BACKLOG_VIEW_EXTRAS=github-issues this prints a SECOND, clearly-labeled section listing THIS
 # repo's OPEN GitHub issues (the herd-report incoming inbox) — to be appended BENEATH the primary
@@ -242,6 +281,9 @@ render_backend_frame() {
   fi
   # Strictly-additive incoming section (empty unless BACKLOG_VIEW_EXTRAS=github-issues).
   [ -n "$incoming" ] && printf '%s\n' "$incoming"
+  # HERD-48 hint — only when the pane tty is interactive (a key can actually be pressed); omitted on
+  # the headless/CI/test fallback so that path stays byte-identical. Does not affect the frame key.
+  [ -n "$saved_tty" ] && printf '\033[2mr = refresh\033[0m\n'
   return "$rc"
 }
 
@@ -318,7 +360,10 @@ run_backend_mode() {
     if [ -n "${BACKLOG_VIEW_MAX_POLLS:-}" ] && [ "$polls" -ge "$BACKLOG_VIEW_MAX_POLLS" ]; then
       break
     fi
-    sleep "$poll"
+    # Wait out the poll interval — but let the user force an instant refresh with r/R (HERD-48). On
+    # refresh, clear last_hash so the NEXT poll re-fetches and repaints even when the backend list is
+    # byte-for-byte unchanged (the fresh refreshed-HH:MM stamp changes the frame key → a repaint).
+    poll_wait "$poll" || last_hash=""
   done
 }
 
@@ -376,10 +421,15 @@ while true; do
     render_rc=$?
     # Strictly-additive incoming section, beneath the primary queue (empty when the key is off).
     [ -n "$incoming" ] && printf '%s\n' "$incoming"
+    # HERD-48 hint — only when the pane tty is interactive; omitted headless so that path is unchanged.
+    [ -n "$saved_tty" ] && printf '\033[2mr = refresh\033[0m\n'
     # Only latch this frame once the render actually succeeded. If glow (or cat) fails / paints
     # nothing, leave last_frame unchanged so the next 2s tick retries instead of sticking on
     # stale/blank content until mtime or banner changes again.
     if [ "$render_rc" -eq 0 ]; then last_frame="$frame"; fi
   fi
-  sleep 2
+  # Wait out the 2s tick — interruptible by the manual-refresh key (HERD-48). On r/R, bust the frame
+  # latch so the next iteration force-repaints with a fresh git-log freshness read even when the file
+  # (and banner) are unchanged.
+  poll_wait 2 || last_frame=""
 done
