@@ -304,6 +304,27 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 
+# ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
+# CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
+# herd-feature.sh) run BEFORE creating a worktree, via scripts/herd/herd-claim.sh. It exists to
+# stop two operators working the same repo from double-building one backlog item: today picking is
+# check-then-act (a coordinator reads `herd backlog`, spawns a builder, THEN enqueues an async
+# `mark in-progress` the scribe drains minutes later — a second coordinator can pick the same item
+# inside that window and the idempotent scribe never rejects the duplicate).
+#
+# OFF by default → today's behavior EXACTLY (no claim; the async scribe mark-in-progress path is the
+# only state write). When ON, and ONLY when a tracker id is present (HERD_CLAIM_ID, else the
+# HERD_ITEM_REF the coordinator already threads for tracked items), the lane reads the item's CURRENT
+# state+assignee synchronously through the active SCRIBE_BACKEND's _backend_claim_item op, sets it
+# In Progress + assigned to the operator identity (WATCHER_OWNER, else `gh api user`), and RE-READS to
+# verify the claim stuck. An item already claimed by ANOTHER identity aborts the spawn loudly (no
+# worktree, no agent). No-id / unclaimed spawns still pass through to the async scribe unchanged, and a
+# backend that is unreachable FAILS SOFT (warn + proceed) so a solo operator is never hard-blocked.
+# Linear/GitHub have no compare-and-swap, so claim-verify NARROWS the race from minutes to seconds
+# rather than eliminating it; the file backend's claim is a git-committed state flip made atomic by
+# push serialization (the loser's push is rejected, a re-pull shows the item claimed, and it aborts).
+: "${CLAIM_REQUIRED:="off"}"     # off (default) → no claim, today's async-scribe behavior; on → claim id-bearing spawns
+
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE
 
 # Derived helpers — split DEFAULT_BRANCH (e.g. "origin/main") for push/pull commands.
