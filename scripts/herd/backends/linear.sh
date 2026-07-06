@@ -304,6 +304,96 @@ for n in nodes:
     print("#%s %s" % (n.get("identifier", ""), n.get("title", "")))' 2>/dev/null || true
 }
 
+_backend_list_open_rich() {
+    # OPTIONAL rich variant of _backend_list_open (the plain op above stays the cross-backend
+    # contract and is byte-identical). Emits one TAB-separated line per open issue:
+    #   #<identifier> \t <state-type> \t <state-name> \t <title> \t <desc-snippet>
+    # state-type is Linear's workflow-state TYPE (started|unstarted|backlog|triage) — the machine
+    # key a viewer groups on; state-name is the human label ("In Progress", "In Review", …). The
+    # description snippet is whitespace-flattened (tabs/newlines → spaces, so the TSV shape can
+    # never be corrupted by field content) and capped at 280 chars. Lines are sorted started-first
+    # (in-progress work surfaces at the top), then unstarted, backlog, triage — stable within each
+    # group (API order preserved). Consumed by `herd backlog --rich` → backlog-view.sh's rich
+    # renderer; callers that don't know this op exists keep using _backend_list_open unchanged.
+    _linear_require_key
+    local query vars
+    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
+        query='query L($team: ID!) {
+  issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
+    nodes { identifier title description state { name type } }
+  }
+}'
+        vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
+print(json.dumps({"team": os.environ["TEAM"]}))')"
+    else
+        query='query {
+  issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
+    nodes { identifier title description state { name type } }
+  }
+}'
+        vars=""
+    fi
+    _linear_gql "$query" "$vars" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+rank = {"started": 0, "unstarted": 1, "backlog": 2, "triage": 3}
+def flat(s):
+    return " ".join((s or "").split())
+rows = []
+for i, n in enumerate(nodes):
+    st = n.get("state") or {}
+    rows.append((rank.get(st.get("type") or "", 4), i, n, st))
+rows.sort(key=lambda r: (r[0], r[1]))
+for _, _, n, st in rows:
+    desc = flat(n.get("description"))
+    if len(desc) > 280:
+        desc = desc[:279].rstrip() + "…"
+    print("#%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
+                                   flat(st.get("name")), flat(n.get("title")), desc))' 2>/dev/null || true
+}
+
+_backend_show_item() {
+    # OPTIONAL single-item detail op: $1 = issue identifier (HERD-8; a leading '#' is tolerated).
+    # Prints a plain-text detail block — identifier + live state on the first line, then title,
+    # full (untruncated) description, and the issue URL — for `herd backlog show <id>` and the
+    # fzf preview pane of `herd backlog browse`. Plain text on purpose: the preview pane and a
+    # bare terminal render it identically, no glow required. Non-zero + stderr when the ref
+    # doesn't parse or the issue can't be found (callers print their own soft fallback).
+    local ref="$1" resp
+    _linear_require_key
+    if ! _linear_issue_query "$ref" 'identifier title description url updatedAt state { name type }'; then
+        echo "linear backend: '$ref' is not a TEAMKEY-NUMBER identifier" >&2
+        return 1
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if not nodes:
+    sys.exit(1)
+n = nodes[0]
+st = n.get("state") or {}
+print("#%s · %s (%s)" % (n.get("identifier", ""), st.get("name") or "?", st.get("type") or "?"))
+print()
+print(n.get("title") or "(untitled)")
+desc = (n.get("description") or "").strip()
+if desc:
+    print()
+    print(desc)
+print()
+meta = n.get("url") or ""
+upd = (n.get("updatedAt") or "")[:10]
+if upd:
+    meta = ("%s · updated %s" % (meta, upd)) if meta else ("updated %s" % upd)
+if meta:
+    print(meta)' 2>/dev/null || {
+        echo "linear backend: no unique issue matching '$ref'" >&2
+        return 1
+    }
+}
+
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
     # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)

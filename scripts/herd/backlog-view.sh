@@ -8,7 +8,8 @@
 #   • file (or unset) — the historical path: render $BACKLOG_FILE with glow + git-log freshness.
 #     BYTE-IDENTICAL to before; the file branch below is untouched.
 #   • non-file (github/linear/…) — $BACKLOG_FILE is a frozen archive, not the live queue. Poll the
-#     live open list via `herd backlog` on an interval (BACKLOG_VIEW_POLL_SECS, default 30s), render
+#     live open list via `herd backlog --rich` (falling back to plain `herd backlog` on an older
+#     CLI) on an interval (BACKLOG_VIEW_POLL_SECS, default 30s), render
 #     it under a styled header (workspace · backend · live · HH:MM), and re-render only when the list
 #     content actually changes (hashed). Fails SOFT (no-false-red rule): if `herd backlog` errors or
 #     comes back empty (API/network trouble), keep the last good list on screen and append one dim
@@ -102,6 +103,75 @@ incoming_block() {
 # Everything below is inert for the file backend (the dispatch at the bottom only enters it when
 # SCRIBE_BACKEND is a non-file value). Kept as functions so the historical file loop stays verbatim.
 
+# rich_to_md — turn `herd backlog --rich` TSV (see backends/linear.sh _backend_list_open_rich:
+# "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>") into markdown that renders with the loved
+# file-backend hierarchy: items GROUPED under H2 state headers (🚧 in progress / 🔜 queued /
+# ❓ triage — the theme's H2 purple bar), the id as a code chip, ONLY the title in bold (the
+# theme's strong orange), and the description as a plain continuation paragraph (the theme's body
+# color) — so status is visible at a glance and the pane is no longer a wall of bold. Overlong
+# titles are split at a word boundary: the head stays bold, the spill joins the body text (fixes
+# paragraph-length tracker titles rendering entirely bold). A description that merely repeats the
+# title (the scribe files title = first line of the full text) is de-duplicated. PURE markdown
+# shaping — glow + the theme style do ALL the coloring, no ANSI hand-coding.
+rich_to_md() {
+  printf '%s\n' "$1" | python3 -c '
+import sys
+
+TITLE_MAX, BODY_MAX = 110, 300
+GROUP = {"started": "🚧 in progress", "unstarted": "🔜 queued", "backlog": "🔜 queued", "triage": "❓ triage"}
+ORDER = ["🚧 in progress", "🔜 queued", "❓ triage"]
+
+groups = {}
+for ln in sys.stdin.read().splitlines():
+    if not ln.strip():
+        continue
+    p = ln.split("\t")
+    ident = p[0]
+    stype = p[1] if len(p) > 1 else ""
+    sname = p[2] if len(p) > 2 else ""
+    title = p[3] if len(p) > 3 else ""
+    desc  = p[4] if len(p) > 4 else ""
+    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc))
+
+out = []
+for g in ORDER:
+    items = groups.get(g)
+    if not items:
+        continue
+    out.append("## %s (%d)\n" % (g, len(items)))
+    for ident, stype, sname, title, desc in items:
+        body = desc
+        if title and body.startswith(title):
+            body = body[len(title):].lstrip(" .·—-")
+        head = title or ident
+        if len(head) > TITLE_MAX:
+            cut = head.rfind(" ", 60, TITLE_MAX)
+            if cut < 0:
+                cut = TITLE_MAX
+            head, spill = head[:cut].rstrip(), head[cut:].strip()
+            body = (spill + " " + body).strip() if body else spill
+        if len(body) > BODY_MAX:
+            body = body[:BODY_MAX - 1].rstrip() + "…"
+        state = " _(%s)_" % sname if (stype == "started" and sname) else ""
+        out.append("- `%s` **%s**%s\n" % (ident, head, state))
+        if body:
+            out.append("  %s\n" % body)
+out.append("")
+sys.stdout.write("\n".join(out))
+'
+}
+
+# shape_md — pick the renderer from the list content itself: any TAB means the backend answered
+# --rich with the TSV shape; a tab-free list is the plain "#<id> <title>" contract (older engine,
+# or a backend with no rich op — `herd backlog --rich` falls back to the plain list there).
+_TAB="$(printf '\t')"
+shape_md() {
+  case "$1" in
+    *"$_TAB"*) rich_to_md "$1" ;;
+    *)         list_to_md "$1" ;;
+  esac
+}
+
 # list_to_md — turn `herd backlog` output into a markdown bullet list so glow renders it with REAL
 # visual hierarchy (not a flat, monochrome wall the tokyonight theme has nothing to color). Tracker
 # backends emit bare "#<id> <title>" lines; a flat "- #HERD-n title" bullet gives glow one
@@ -153,11 +223,12 @@ render_backend_frame() {
   local w; w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
   if [ -n "$list" ]; then
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then
-      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      shape_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     elif command -v glow >/dev/null 2>&1; then
-      list_to_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      shape_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     else
-      printf '%s\n' "$list" || rc=$?
+      # No glow: print the raw list, taming rich TSV's tabs into readable spacing.
+      printf '%s\n' "$list" | tr '\t' ' ' || rc=$?
     fi
   else
     printf '\033[2m(no open items yet)\033[0m\n'
@@ -200,8 +271,14 @@ run_backend_mode() {
   while true; do
     # Capture stdout only; DISCARD stderr — it may carry the backend's raw API error body or headers
     # (secrets). Run from $REPO so `herd backlog` finds this project's .herd/config.
+    # Ask for --rich first (state-grouped TSV when the backend supports it; backends without the
+    # op serve the plain list under the same flag). A herd that predates --rich rejects the flag
+    # non-zero — retry plain so the viewer never degrades just because the CLI is older.
     local raw rc trimmed cur_hash
-    raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
+    raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog --rich 2>/dev/null)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
+    fi
     trimmed="$(printf '%s' "$raw" | tr -d '[:space:]')"
 
     # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS is on; its

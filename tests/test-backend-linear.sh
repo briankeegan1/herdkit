@@ -52,6 +52,8 @@ run() {
         *issueUpdate*)      echo '{"data":{"issueUpdate":{"success":true}}}' ;;
         *"states(filter"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"first open issue","team":{"states":{"nodes":[{"id":"state_done"}]}}}]}}}' ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
+        *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
+        *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","state":{"name":"Todo","type":"unstarted"}},{"identifier":"ENG-9","title":"second open issue","description":null,"state":{"name":"In Progress","type":"started"}}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -91,6 +93,41 @@ open2="$( unset LINEAR_TEAM_ID; run _backend_list_open )"
 grep -q "issues(" "$GQLLOG" || fail "list_open (no team) did not issue an 'issues' query"
 grep -q 'team: { id:' "$GQLLOG" && fail "list_open (no team) must NOT scope by team — it leaked a team filter"
 echo "$open2" | grep -q "^#ENG-7 first open issue$" || fail "list_open (no team) missing '#ENG-7 first open issue' ($open2)"
+pass
+
+# 2c. list_open_rich → same open filter as list_open but also requests state {name type} +
+#     description, emits TSV ("#<id>\t<state-type>\t<state-name>\t<title>\t<desc>"), sorts
+#     started-first, and flattens description whitespace (a raw newline would corrupt the TSV).
+TAB="$(printf '\t')"
+: > "$GQLLOG"
+rich="$(run _backend_list_open_rich)"
+grep -q "description state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + state name/type"
+grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open_rich (team set) did not scope the query to the team"
+echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
+  || fail "list_open_rich did not sort the started (in-progress) issue first ($rich)"
+echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}$" \
+  || fail "list_open_rich TSV shape wrong for ENG-9 (empty desc must still close the line) ($rich)"
+echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.$" \
+  || fail "list_open_rich did not flatten the multi-line description into one TSV field ($rich)"
+pass
+
+# 2d. show_item → single-issue detail via issues(filter:) (never issueSearch): identifier + live
+#     state on line 1, then title, the UNtruncated description, and url + updated date.
+: > "$GQLLOG"
+det="$(run _backend_show_item "#ENG-7")"
+grep -q "issueSearch" "$GQLLOG" && fail "show_item must NOT use the deprecated issueSearch endpoint"
+grep -q '"n": 7' "$GQLLOG" || fail "show_item did not resolve by the parsed issue number"
+echo "$det" | grep -q "^#ENG-7 · In Progress (started)$" || fail "show_item missing the id · state header ($det)"
+echo "$det" | grep -q "Full spec body here." || fail "show_item did not print the full description body"
+echo "$det" | grep -q "linear.app/acme/issue/ENG-7 · updated 2026-07-06" || fail "show_item missing url + updated date"
+pass
+
+# 2e. show_item on an unparseable ref → loud stderr, no network round-trip. (Exit code is not
+#     asserted: `run` wraps the op in a subshell that always appends its RESULT/ITEM_STATE report.)
+: > "$GQLLOG"
+err="$(run _backend_show_item "nodashhere" 2>&1 >/dev/null || true)"
+echo "$err" | grep -q "not a TEAMKEY-NUMBER" || fail "show_item on an unparseable ref should say so on stderr ($err)"
+grep -q "issues(" "$GQLLOG" && fail "show_item on an unparseable ref should not issue any query"
 pass
 
 # 3. mark_shipped → resolves the issue via issues(filter:) (NOT the deprecated issueSearch),
