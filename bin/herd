@@ -1185,6 +1185,178 @@ cmd_backlog() {
   esac
 }
 
+# ── herd backend: guided work-tracker backend switching ─────────────────────────────────────────
+# cmd_backend_switch — the PROCESS around flipping SCRIBE_BACKEND, in gate order:
+#   1. PREFLIGHT (loud, before ANY change): target adapter exists; linear → LINEAR_API_KEY present
+#      (prompted interactively when on a tty, stored in .herd/secrets chmod 600 + gitignored,
+#      never echoed, never in .herd/config) AND a live viewer{} API round-trip proves it works;
+#      github → gh installed + authenticated. A failed preflight changes NOTHING.
+#   2. FLIP via cmd_config_set — inherits key validation, the #139 stale-drainer warning, and the
+#      coordinator-skill re-render.
+#   3. MIGRATE (optional): replay the OLD backend's open items into the NEW one via its
+#      _backend_add_item, skipping items whose title already appears in the new backend's open
+#      list (idempotent re-runs). --migrate / --no-migrate decide non-interactively; a tty is
+#      asked. Titles carry a '(migrated from <old>)' suffix so provenance survives.
+#   4. FREEZE: leaving the file backend stamps $BACKLOG_FILE with a dated frozen-archive banner —
+#      the file becomes history, not the work source, and should say so to every future reader.
+#   5. RESTART the backlog viewer pane (best-effort — it binds its backend at process start) and
+#      journal a backend_switched event.
+cmd_backend() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    switch) cmd_backend_switch "$@" ;;
+    *) die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate] [--yes]" ;;
+  esac
+}
+
+cmd_backend_switch() {
+  local target="" migrate=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --migrate)    migrate=1 ;;
+      --no-migrate) migrate=0 ;;
+      -*)           die "herd backend switch: unknown flag '$1'" ;;
+      *)            [ -z "$target" ] && target="$1" || die "herd backend switch: one backend name only" ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]"
+
+  # Load the project (mirrors cmd_backlog's loader).
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  local secrets="$PROJECT_ROOT/.herd/secrets"
+  # shellcheck source=/dev/null
+  [ -f "$secrets" ] && . "$secrets"
+
+  local target_file="$SCRIPTS_DIR/backends/${target}.sh"
+  [ -f "$target_file" ] || die "unknown backend '$target' — no backends/${target}.sh"
+  local current="${SCRIBE_BACKEND:-file}"
+  if [ "$target" = "$current" ]; then
+    say "already on SCRIBE_BACKEND=$current — nothing to do"
+    return 0
+  fi
+
+  # ── 1. preflight — fail loud BEFORE any change ─────────────────────────────────────────────────
+  case "$target" in
+    linear)
+      if [ -z "${LINEAR_API_KEY:-}" ]; then
+        if [ -t 0 ]; then
+          printf 'Linear API key (stored in %s, gitignored; input hidden): ' "$secrets" >&2
+          local _key=""; IFS= read -rs _key </dev/tty || true; printf '\n' >&2
+          [ -n "$_key" ] || die "no key entered — nothing was changed"
+          touch "$secrets" && chmod 600 "$secrets"
+          printf 'LINEAR_API_KEY="%s"\n' "$_key" >> "$secrets"
+          local gi="$PROJECT_ROOT/.gitignore"
+          if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
+            printf '.herd/secrets\n' >> "$gi"
+          fi
+          LINEAR_API_KEY="$_key"; export LINEAR_API_KEY
+        else
+          die "LINEAR_API_KEY missing — add LINEAR_API_KEY=\"lin_api_…\" to $secrets (gitignored) and re-run; nothing was changed"
+        fi
+      fi
+      # Live round-trip: prove the key works before touching config. viewer{} is the cheapest
+      # authenticated query; any error/HTML/empty response fails the grep.
+      # shellcheck source=/dev/null
+      . "$target_file"
+      _linear_gql 'query { viewer { id } }' 2>/dev/null | grep -q '"id"' \
+        || die "Linear API round-trip FAILED (bad key or network) — nothing was changed"
+      say "✓ Linear API reachable (viewer check passed)"
+      ;;
+    github)
+      command -v gh >/dev/null 2>&1 || die "github backend needs the gh CLI — install it first; nothing was changed"
+      gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth login') — nothing was changed"
+      say "✓ gh authenticated"
+      ;;
+  esac
+
+  # Capture the OLD backend's open items BEFORE the flip (subshell: keep its functions out of
+  # this process, where the target backend may already be sourced).
+  local old_open=""
+  old_open="$(
+    # shellcheck source=/dev/null
+    cd "$PROJECT_ROOT" && . "$SCRIPTS_DIR/backends/${current}.sh" 2>/dev/null && _backend_list_open 2>/dev/null
+  )" || true
+
+  # ── 2. flip (validation + #139 stale-drainer warning + skill re-render live in config set) ────
+  cmd_config set SCRIBE_BACKEND "$target"
+
+  # ── 3. optional migration of open items ───────────────────────────────────────────────────────
+  local n_old=0
+  [ -n "$old_open" ] && n_old="$(printf '%s\n' "$old_open" | grep -c .)"
+  if [ "$n_old" -gt 0 ] && [ -z "$migrate" ]; then
+    if [ -t 0 ]; then
+      printf 'Migrate %s open item(s) from %s into %s? [y/N] ' "$n_old" "$current" "$target" >&2
+      local _ans=""; IFS= read -r _ans </dev/tty || true
+      case "$_ans" in y|Y|yes) migrate=1 ;; *) migrate=0 ;; esac
+    else
+      migrate=0
+      say "(non-interactive: NOT migrating $n_old open item(s) — re-run with --migrate to replay them)"
+    fi
+  fi
+  if [ "${migrate:-0}" = "1" ] && [ "$n_old" -gt 0 ]; then
+    # New backend's current open titles, for idempotent dedup on re-runs.
+    local new_open=""
+    new_open="$(
+      # shellcheck source=/dev/null
+      cd "$PROJECT_ROOT" && . "$target_file" 2>/dev/null && _backend_list_open 2>/dev/null
+    )" || true
+    local migrated=0 skipped=0 ln text
+    while IFS= read -r ln; do
+      [ -n "$ln" ] || continue
+      # Normalize to a clean title: drop list bullets and the file backend's state emoji; keep a
+      # tracker line's '#id ' prefix out of the new title but preserve it as provenance.
+      text="$(printf '%s' "$ln" | sed -e 's/^[-*] *//' -e 's/^🔜 *//' -e 's/^🚧 *//')"
+      case "$text" in
+        '#'*' '*) text="${text#* } (migrated from ${current} ${ln%% *})" ;;
+        *)        text="$text (migrated from ${current})" ;;
+      esac
+      if [ -n "$new_open" ] && printf '%s\n' "$new_open" | grep -qF -- "${text%% (migrated*}"; then
+        skipped=$((skipped + 1)); continue
+      fi
+      if (
+        # shellcheck source=/dev/null
+        cd "$PROJECT_ROOT" && . "$target_file" 2>/dev/null
+        _BACKEND_RESULT=""
+        _backend_add_item "MIGRATE" "$text" >/dev/null 2>&1
+        [ "${_BACKEND_RESULT:-}" = "DONE" ]
+      ); then migrated=$((migrated + 1)); else
+        warn "could not migrate: $text"
+      fi
+    done <<EOF
+$old_open
+EOF
+    say "migrated $migrated item(s) into $target${skipped:+ ($skipped already present, skipped)}"
+  fi
+
+  # ── 4. frozen-archive banner when leaving the file backend ────────────────────────────────────
+  if [ "$current" = "file" ] && [ "$target" != "file" ] && [ -f "$PROJECT_ROOT/$BACKLOG_FILE" ] \
+     && ! grep -q 'FROZEN ARCHIVE' "$PROJECT_ROOT/$BACKLOG_FILE"; then
+    local _tmp; _tmp="$(mktemp)"
+    {
+      printf '> ⚠️ **FROZEN ARCHIVE (%s)** — the live work queue moved to the **%s** backend\n' "$(date +%Y-%m-%d)" "$target"
+      printf '> (`herd backend switch %s`). This file is history; see `herd backlog` for open work.\n\n' "$target"
+      cat "$PROJECT_ROOT/$BACKLOG_FILE"
+    } > "$_tmp" && mv "$_tmp" "$PROJECT_ROOT/$BACKLOG_FILE"
+    say "stamped $BACKLOG_FILE as a frozen archive"
+  fi
+
+  # ── 5. restart the backlog viewer + journal ───────────────────────────────────────────────────
+  # The viewer binds SCRIBE_BACKEND at process start; best-effort restart, loud hint if it can't.
+  if ! "$HERDKIT_HOME/bin/herd" pane backlog >/dev/null 2>&1; then
+    warn "could not restart the backlog pane — run 'herd pane backlog' (and if it still shows the old backend, close the stale viewer process first)"
+  fi
+  # shellcheck source=/dev/null
+  { . "$SCRIPTS_DIR/journal.sh" 2>/dev/null && journal_append backend_switched from "$current" to "$target"; } || true
+  say ""
+  say "✅ SCRIBE_BACKEND: $current → $target (scribe drainer, herd backlog, watcher mark-shipped, and the coordinator skill all follow this key)"
+}
+
 # ── herd link: registry of peer repos for cross-project filing ──────────────────────────────────
 cmd_link_list() {
   local root; root="$(pwd)"
@@ -3237,6 +3409,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
               [show <#id>]            one item's full detail (state, description, URL)
               [browse]                interactive fzf picker with a live detail preview
                                       (soft-degrades to the plain list without fzf)
+  herd backend switch <name>          guided work-tracker switch (file|github|linear|changelog):
+              [--migrate|--no-migrate]  preflight creds FIRST (linear: prompts for the API key on
+                                      a tty → .herd/secrets + live viewer{} check; github: gh
+                                      auth) — a failed preflight changes nothing; then flips
+                                      SCRIBE_BACKEND via config set, optionally replays the old
+                                      backend's open items into the new one (idempotent), stamps
+                                      a frozen-archive banner on BACKLOG.md when leaving the file
+                                      backend, restarts the backlog pane, journals the switch
   herd report [--to <link>] [--dep]   file a report on HERD_REPO (or a peer from .herd/links
               "<sym>"                 via --to) using HERD_REPORT_BACKEND (default: github);
                                       deduplicates first (HERD_REPORT_FORCE=1 to override).
@@ -3295,6 +3475,7 @@ case "${1:-help}" in
   cost)    shift; cmd_cost "$@" ;;
   update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
+  backend) shift; cmd_backend "$@" ;;
   report)  shift; cmd_report "$@" ;;
   link)    shift; cmd_link "$@" ;;
   depend)  shift; cmd_depend "$@" ;;
