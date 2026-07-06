@@ -226,10 +226,44 @@ ok
 # ── C3 — placeholder ref (unfilled PR-template line) is treated as NO ref → fuzzy ──
 reset_state
 BODY_PH="$T/body-placeholder.md"
-printf '## Refs\n\nRefs: <tracker-id, e.g. HERD-39 — or remove this line if none>\n' > "$BODY_PH"
+printf '## Refs\n\nRefs: <tracker-id — or delete this line if none>\n' > "$BODY_PH"
 GH_PR_BODY_FILE="$BODY_PH" reconcile_backlog 504 some-slug sha504
 [ "$(backend_calls)" -eq 0 ] || fail "C3: an unfilled template placeholder must not be dispatched as a ref (got $(backend_calls))"
 [ "$(scribe_calls)"  -eq 1 ] || fail "C3: placeholder ref should fall back to fuzzy (got $(scribe_calls))"
+ok
+
+# ── C3b — the REAL PULL_REQUEST_TEMPLATE.md left unchanged (untracked PR) must NOT extract a ref ──
+# gh pr view returns the raw body INCLUDING HTML comments; the template carries example text inside a
+# <!-- --> block. An untracked PR opened from the template and left as-is must fall back to fuzzy —
+# never silently mark an unrelated item shipped. This reproduces the review BLOCK on #156 directly.
+reset_state
+PRT="$REPO/.github/PULL_REQUEST_TEMPLATE.md"
+[ -f "$PRT" ] || fail "C3b: PULL_REQUEST_TEMPLATE.md not found at $PRT"
+GH_PR_BODY_FILE="$PRT" reconcile_backlog 505 template-slug sha505
+[ "$(backend_calls)" -eq 0 ] || fail "C3b: unchanged PR template must NOT dispatch a backend ref (got $(backend_calls)) — comment-embedded example poisoned the extractor"
+[ "$(scribe_calls)"  -eq 1 ] || fail "C3b: unchanged PR template should fall back to fuzzy (got $(scribe_calls))"
+grep -q '"resolution":"fuzzy"' "$JOURNAL_FILE" || fail "C3b: unchanged template should journal resolution=fuzzy"
+ok
+
+# ── C3c — a 'Refs:' line buried in an HTML comment is stripped before extraction (defense-in-depth) ──
+# Even if a comment example were a bare line-start 'Refs: WRONG-1', the comment strip removes it; the
+# only REAL ref (outside comments) is the one that wins.
+reset_state
+BODY_CMT="$T/body-comment.md"
+printf '## Refs\n\n<!--\nexample only, do not treat as real:\nRefs: WRONG-1\n-->\n\nRefs: RIGHT-2\n' > "$BODY_CMT"
+GH_PR_BODY_FILE="$BODY_CMT" reconcile_backlog 506 cmt-slug sha506
+[ "$(backend_calls)" -eq 1 ] || fail "C3c: expected exactly 1 backend call (the real ref), got $(backend_calls)"
+grep -q '^update-state RIGHT-2 done$' "$STUB_BACKEND_LOG" || fail "C3c: must resolve the REAL ref RIGHT-2, not the comment example"$'\n'"$(cat "$STUB_BACKEND_LOG")"
+grep -q 'WRONG-1' "$STUB_BACKEND_LOG" && fail "C3c: a comment-embedded 'Refs:' must NEVER be extracted"
+ok
+
+# ── C3d — a commented-out ref with NO real ref elsewhere → no dispatch, fuzzy fallback ──
+reset_state
+BODY_CMTONLY="$T/body-comment-only.md"
+printf '## Refs\n\n<!-- Refs: GHOST-9 -->\n\n(no real tracker item)\n' > "$BODY_CMTONLY"
+GH_PR_BODY_FILE="$BODY_CMTONLY" reconcile_backlog 507 ghost-slug sha507
+[ "$(backend_calls)" -eq 0 ] || fail "C3d: a ref that exists ONLY inside a comment must not be dispatched (got $(backend_calls))"
+[ "$(scribe_calls)"  -eq 1 ] || fail "C3d: comment-only ref should fall back to fuzzy (got $(scribe_calls))"
 ok
 
 # ── C4 — _reconcile_via_ref returns non-zero when the active backend has NO update-state op ──

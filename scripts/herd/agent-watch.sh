@@ -736,11 +736,23 @@ record_reconcile() {
 # or the value is still the template placeholder ('<...>' / none / n/a). Best-effort + fail-soft: a
 # missing 'gh', an offline run, or a body-less PR all yield an empty ref, so the caller cleanly falls
 # back to the fuzzy path — never a hard error on the merge tail.
+#
+# CRITICAL: `gh pr view --json body` returns the raw markdown WITH HTML comments intact — GitHub does
+# not strip `<!-- … -->` from a classic PR template. So we FIRST strip every HTML comment block (the
+# PULL_REQUEST_TEMPLATE.md carries example/instruction text inside a comment) before grepping; without
+# this an example 'Refs:' line buried in the template's own comment would poison the extractor and
+# silently mark an unrelated tracker item shipped on every merge of an untracked PR.
 _reconcile_pr_ref() {
   local body ref
   body="$(gh pr view "$1" --json body -q .body 2>/dev/null || true)"
   [ -n "$body" ] || return 0
-  # First 'Refs:' line, case-insensitive; take the first whitespace-delimited token after the colon.
+  # Strip HTML comment blocks (possibly multi-line) so template instructions/examples can't be read as
+  # a real ref. python3 is already a hard dependency here; if it is somehow unavailable, fall back to
+  # the raw body (the line-start anchor + placeholder guard below are still a partial defense).
+  body="$(printf '%s' "$body" | python3 -c 'import sys,re
+sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 2>/dev/null || printf '%s' "$body")"
+  # First real 'Refs:' line, case-insensitive, anchored at line start; take the first
+  # whitespace-delimited token after the colon.
   ref="$(printf '%s\n' "$body" \
     | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
     | head -n1 \
