@@ -70,4 +70,36 @@ fi
 grep -qiE '[0-9]{4}-[0-9]{2}-[0-9]{2}' "$OUT" && fail "codemap leaked a date/timestamp (breaks determinism)"
 ok
 
+# ── 6. `--check`: read-only staleness probe (HERD-46) ────────────────────────────────────────────
+# FRESH: $OUT already matches a fresh scan (steps 1-2 regenerated it) → exit 0 and touch nothing.
+cp "$OUT" "$T/before-check.md"
+chk_out="$(bash "$CODEMAP" --check </dev/null 2>&1)" || fail "--check reported STALE on an up-to-date map: $chk_out"
+case "$chk_out" in *fresh*) ;; *) fail "--check fresh run should say 'fresh', got: $chk_out" ;; esac
+cmp -s "$T/before-check.md" "$OUT" || fail "--check must NOT modify the committed map (fresh case)"
+ok
+
+# STALE (drifted): corrupt the committed map → --check exits non-zero, says STALE, and does NOT
+# rewrite the committed file (the hard read-only contract the watcher + status row depend on).
+printf 'stale sentinel line\n' >> "$OUT"
+cp "$OUT" "$T/dirty.md"
+if bash "$CODEMAP" --check </dev/null >/dev/null 2>&1; then
+  fail "--check should exit non-zero on a drifted map"
+fi
+cmp -s "$T/dirty.md" "$OUT" || fail "--check must NOT rewrite the committed map (stale case)"
+ok
+
+# STALE (missing): no committed map at all → --check exits non-zero and creates nothing.
+rm -f "$OUT"
+if bash "$CODEMAP" --check </dev/null >/dev/null 2>&1; then
+  fail "--check should exit non-zero when the committed map is missing"
+fi
+[ -f "$OUT" ] && fail "--check must NOT create the committed map when missing"
+ok
+
+# Unknown argument is rejected (exit 2) without writing the map.
+bash "$CODEMAP" --bogus </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] || fail "an unknown argument should exit 2, got $rc"
+[ -f "$OUT" ] && fail "a rejected argument must not write the map"
+ok
+
 echo "PASS ($pass assertions)"
