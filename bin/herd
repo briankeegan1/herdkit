@@ -1306,7 +1306,7 @@ cmd_backend_switch() {
       # shellcheck source=/dev/null
       cd "$PROJECT_ROOT" && . "$target_file" 2>/dev/null && _backend_list_open 2>/dev/null
     )" || true
-    local migrated=0 skipped=0 ln text
+    local migrated=0 skipped=0 ln text _mig_title
     while IFS= read -r ln; do
       [ -n "$ln" ] || continue
       # Normalize to a clean title: drop list bullets and the file backend's state emoji; keep a
@@ -1316,7 +1316,18 @@ cmd_backend_switch() {
         '#'*' '*) text="${text#* } (migrated from ${current} ${ln%% *})" ;;
         *)        text="$text (migrated from ${current})" ;;
       esac
-      if [ -n "$new_open" ] && printf '%s\n' "$new_open" | grep -qF -- "${text%% (migrated*}"; then
+      # Idempotency dedup: EXACT normalized-title equality, never a substring test. A substring
+      # match (grep -F without -x) silently DROPS a genuine open item whenever its title happens
+      # to be contained in any unrelated pre-existing target item — e.g. file item 'add login'
+      # vs existing issue '#7 Fix the add login flow crash' (review-gate finding on this PR).
+      # Normalize both sides identically: the candidate is the clean title with its
+      # '(migrated from …)' provenance stripped; each target line drops its '#id ' prefix,
+      # bullets/state emoji, and any provenance suffix from an earlier partial migration.
+      # -x anchors the comparison to the WHOLE line.
+      _mig_title="${text%% (migrated*}"
+      if [ -n "$new_open" ] && printf '%s\n' "$new_open" \
+           | sed -e 's/^#[^ ]* //' -e 's/^[-*] *//' -e 's/^🔜 *//' -e 's/^🚧 *//' -e 's/ (migrated from [^)]*)$//' \
+           | grep -qxF -- "$_mig_title"; then
         skipped=$((skipped + 1)); continue
       fi
       if (

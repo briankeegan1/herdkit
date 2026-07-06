@@ -34,7 +34,7 @@ cat > "$BIN/gh" <<'FAKE'
 echo "gh $*" >> "$GH_FAKE_LOG"
 case "$1 ${2:-}" in
   "auth status")  [ "${GH_FAKE_AUTH_FAIL:-0}" = "1" ] && exit 1 || exit 0 ;;
-  "issue list")   printf '[]' ;;
+  "issue list")   printf '%s' "${GH_FAKE_LIST:-[]}" ;;
   "issue create") exit 0 ;;
 esac
 exit 0
@@ -64,14 +64,21 @@ EOF
 run_switch(){ ( cd "$P" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" "$@" bash "$HERD" backend switch "${ARGS[@]}" </dev/null 2>&1 ); }
 
 # ── Case 1: file → github --migrate ─────────────────────────────────────────────────────────────
+# The target repo ALREADY has: issue #7 whose title merely CONTAINS an old item's title (the
+# review-gate substring false-skip repro — it must NOT suppress migration) and issue #8 whose
+# title EXACTLY equals an old item's normalized title (a true duplicate — it MUST be skipped).
+export GH_FAKE_LIST='[{"number":7,"title":"Fix the wiring the feedback loop crash"},{"number":8,"title":"add a dark-mode toggle"}]'
 : > "$GHLOG"
 ARGS=(github --migrate)
 out="$(run_switch)" || fail "file→github switch exited non-zero: $out"
 grep -q 'SCRIBE_BACKEND="github"' "$P/.herd/config" || fail "config was not flipped to github"
 grep -q "issue create" "$GHLOG" || fail "migration did not create issues via gh"
-grep -q "wiring the feedback loop (migrated from file)" "$GHLOG" || fail "🚧 item not migrated with provenance suffix ($(cat "$GHLOG"))"
-grep -q "add a dark-mode toggle (migrated from file)" "$GHLOG" || fail "🔜 item not migrated with provenance suffix"
+grep -q "wiring the feedback loop (migrated from file)" "$GHLOG" \
+  || fail "substring false-skip regression: an unrelated issue containing the title suppressed migration ($(cat "$GHLOG"))"
+grep -q "add a dark-mode toggle (migrated from file)" "$GHLOG" && fail "exact-duplicate item must be SKIPPED, not re-created"
+grep -q "1 already present" <<<"$out" || fail "skip count for the exact duplicate missing from output ($out)"
 grep -q "already done" "$GHLOG" && fail "✅ shipped item must NOT be migrated"
+unset GH_FAKE_LIST
 grep -q "FROZEN ARCHIVE" "$P/BACKLOG.md" || fail "BACKLOG.md missing the frozen-archive banner"
 [ "$(grep -c 'FROZEN ARCHIVE' "$P/BACKLOG.md")" = "1" ] || fail "banner must be stamped exactly once"
 pass
