@@ -12,6 +12,10 @@
 #                     Or print "EMPTY" when the queue has no pending intents. Returns immediately
 #                     (no polling wait — the watcher calls this on every tick).
 #   done <path>       Remove the claimed intent file (intent was successfully launched).
+#   release <path>    Put a claimed intent BACK in the queue (.req.mine → .req) untouched — used
+#                     when the lane's advisory saturation gate deferred the spawn (held, not
+#                     failed): the intent must survive for a later tick, not be consumed. This is
+#                     what makes the queue's durability guarantee hold under a saturated gate.
 #   skip <path> <why> Warn to stderr and remove the claimed file (malformed or bad intent).
 #                     The watcher loop continues; the watcher never crashes on a bad intent.
 #
@@ -51,11 +55,15 @@ case "$cmd" in
     mine="${2:?usage: spawn-step.sh done <claimed-path>}"
     rm -f "$mine" 2>/dev/null || true
     ;;
+  release)
+    mine="${2:?usage: spawn-step.sh release <claimed-path>}"
+    mv -f "$mine" "${mine%.mine}" 2>/dev/null || true
+    ;;
   skip)
     mine="${2:?usage: spawn-step.sh skip <claimed-path> <reason>}"
     reason="${3:-malformed intent}"
     printf 'spawn-step: WARNING — skipping intent %s: %s\n' "$(basename "${mine%.req.mine}")" "$reason" >&2
     rm -f "$mine" 2>/dev/null || true
     ;;
-  *) printf 'usage: spawn-step.sh next | done <path> | skip <path> <reason>\n' >&2; exit 2 ;;
+  *) printf 'usage: spawn-step.sh next | done <path> | release <path> | skip <path> <reason>\n' >&2; exit 2 ;;
 esac
