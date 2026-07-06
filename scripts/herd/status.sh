@@ -279,6 +279,22 @@ EOF
       "$b" "$x" "$d" "${SCRIBE_BACKEND}" "$x"
   fi
 
+  # (e) CODEMAP — freshness of the committed docs/codemap.md. INFORMATIONAL ONLY: always dim, never
+  #     red, and NEVER an attention condition (per the no-false-red rule — a stale doc is not a broken
+  #     build). Shown only when the project has adopted the codemap (the committed file exists). Uses
+  #     the read-only `codemap.sh --check` probe (exit 0 fresh / non-zero stale) which never writes
+  #     the committed file. Independent of CODEMAP_AUTOREFRESH.
+  local cm_dir cm_script cm_out
+  cm_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  cm_script="$cm_dir/codemap.sh"; cm_out="$root/docs/codemap.md"
+  if [ -f "$cm_out" ] && [ -f "$cm_script" ]; then
+    if HERD_CODEMAP_ROOT="$root" HERD_CODEMAP_OUT="$cm_out" bash "$cm_script" --check >/dev/null 2>&1; then
+      printf '  %sCODEMAP%s   %sfresh%s\n' "$b" "$x" "$d" "$x"
+    else
+      printf '  %sCODEMAP%s   %sstale · run `herd codemap` to refresh%s\n' "$b" "$x" "$d" "$x"
+    fi
+  fi
+
   # Verdict line + exit code.
   printf '\n'
   if [ "$attention" = 1 ]; then

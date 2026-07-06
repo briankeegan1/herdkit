@@ -72,7 +72,7 @@ run_view() {
   local dir="$1"; shift
   env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
-    HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 "$@" \
+    HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null
 }
 

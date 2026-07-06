@@ -198,14 +198,43 @@ _cm_render() {
   fi
 }
 
-# ── Refresh: write only when the content changed; report what happened ────────────────────────────
+# ── Refresh (default) / --check (read-only staleness probe) ────────────────────────────────────────
+# main [--check]
+#   (no arg) REFRESH: regenerate the map and write $OUT only when its content actually changed.
+#   --check  PROBE:   regenerate to a temp file and diff it against the committed $OUT WITHOUT ever
+#                     writing $OUT (or creating its directory) — exit 0 when the committed map is
+#                     byte-identical to a fresh scan (fresh), non-zero when it is missing or drifted
+#                     (stale). The cheap, side-effect-free guard the watcher's post-merge auto-refresh
+#                     and `herd status`' informational freshness row both build on.
 main() {
-  local tmp outlabel delta
+  local mode="refresh" tmp outlabel delta
+  case "${1:-}" in
+    --check) mode="check" ;;
+    "")      : ;;
+    *)       printf 'codemap.sh: unknown argument: %s (expected --check or none)\n' "$1" >&2; return 2 ;;
+  esac
+
   tmp="$(mktemp)"
   ( cd "$ROOT" && _cm_render ) > "$tmp"
-  mkdir -p "$(dirname "$OUT")"
   outlabel="${OUT#"$ROOT"/}"
 
+  if [ "$mode" = "check" ]; then
+    # READ-ONLY: never write $OUT, never mkdir its dir. Report fresh/stale and set the exit code.
+    if [ -f "$OUT" ] && cmp -s "$tmp" "$OUT"; then
+      rm -f "$tmp"
+      printf '%s — fresh\n' "$outlabel"
+      return 0
+    fi
+    rm -f "$tmp"
+    if [ -f "$OUT" ]; then
+      printf '%s — STALE (out of date; run `herd codemap` to refresh)\n' "$outlabel" >&2
+    else
+      printf '%s — STALE (missing; run `herd codemap` to generate)\n' "$outlabel" >&2
+    fi
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$OUT")"
   if [ -f "$OUT" ] && cmp -s "$tmp" "$OUT"; then
     rm -f "$tmp"
     printf '%s — up to date\n' "$outlabel"
