@@ -730,6 +730,55 @@ record_reconcile() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RECONCILE_STATE"
 }
 
+# _reconcile_pr_ref <pr#> — deterministic tracker linkage (HERD-39): read the merged PR body and
+# print the explicit 'Refs: <ID>' tracker reference the builder carried (lanes REQUIRE it when the
+# coordinator spawned with HERD_ITEM_REF). Empty when the PR carries no ref, the body is unreadable,
+# or the value is still the template placeholder ('<...>' / none / n/a). Best-effort + fail-soft: a
+# missing 'gh', an offline run, or a body-less PR all yield an empty ref, so the caller cleanly falls
+# back to the fuzzy path — never a hard error on the merge tail.
+_reconcile_pr_ref() {
+  local body ref
+  body="$(gh pr view "$1" --json body -q .body 2>/dev/null || true)"
+  [ -n "$body" ] || return 0
+  # First 'Refs:' line, case-insensitive; take the first whitespace-delimited token after the colon.
+  ref="$(printf '%s\n' "$body" \
+    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
+    | head -n1 \
+    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//' 2>/dev/null || true)"
+  case "$ref" in
+    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;  # placeholder / unset → no explicit ref
+  esac
+  printf '%s' "$ref"
+}
+
+# _reconcile_via_ref <ref> — resolve the backlog item for an EXPLICIT tracker ref through the ACTIVE
+# backend's update-state op, marking it 'done'. Sources the backend exactly the way scribe-step.sh
+# does (SCRIBE_BACKEND + optional SCRIBE_BACKEND_DIR override; secrets from .herd/secrets) but inside
+# a SUBSHELL so the _backend_* functions never leak into the watcher's namespace. Returns 0 ONLY when
+# the backend reports a real transition (_BACKEND_RESULT=DONE); any of {no update-state op (the default
+# 'file' backend records state by editing $BACKLOG_FILE, not via dispatch), unknown backend, or a
+# NOCHANGE/no-match} returns non-zero so the caller falls back to the fuzzy scribe path — this is what
+# guarantees the ref-less / file-backend behavior never regresses.
+_reconcile_via_ref() {
+  local ref="$1" _bdir _bfile _secrets result
+  _bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _bfile="$_bdir/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_bfile" ] || return 1
+  result="$(
+    _secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_secrets" ] && . "$_secrets"
+    # shellcheck source=/dev/null
+    . "$_bfile" 2>/dev/null || exit 1
+    command -v _backend_update_state >/dev/null 2>&1 || exit 1
+    cd "$MAIN" 2>/dev/null || true
+    _BACKEND_RESULT=""
+    _backend_update_state "$ref" done >/dev/null 2>&1 || true
+    printf '%s' "$_BACKEND_RESULT"
+  )"
+  [ "$result" = "DONE" ]
+}
+
 # reconcile_backlog <pr#> <slug> <headSha> — the POST-MERGE auto-reconcile HOOK. Fires on EVERY
 # successful merge (the normal auto-merge path, an autofix bounce that finally lands, and direct
 # hand-off merges — all converge here in do_merge), enqueuing ONE scribe reconcile request keyed by
@@ -740,9 +789,25 @@ record_reconcile() {
 # tick for the same merged PR reads the ledger and never re-enqueues, even if scribe.sh later dies.
 # Best-effort — a failed enqueue never blocks the merge (the advisory sweep is the backstop).
 reconcile_backlog() {
-  local rb_pr="$1" rb_slug="$2" rb_sha="${3:-}"
+  local rb_pr="$1" rb_slug="$2" rb_sha="${3:-}" rb_ref
   reconcile_enqueued "$rb_pr" "$rb_sha" && return 0
   record_reconcile "$rb_pr" "$rb_sha" "$rb_slug"
+  # EXPLICIT-REF path FIRST (HERD-39): if the merged PR carries a 'Refs: <ID>' line, resolve the
+  # backlog item by that exact ref via the active backend's update-state — deterministic, no fuzzy
+  # slug/title guessing and no scribe LLM. Only when there is no ref line OR it fails to resolve
+  # (backend has no update-state op, e.g. the default file backend, or reports no match) do we fall
+  # back to today's fuzzy scribe enqueue — so ref-less PRs behave EXACTLY as before. Journal which
+  # path resolved so a drift audit can tell explicit-ref links from fuzzy ones.
+  rb_ref="$(_reconcile_pr_ref "$rb_pr")"
+  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref"; then
+    journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution explicit-ref
+    return 0
+  fi
+  if [ -n "$rb_ref" ]; then
+    journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution fuzzy
+  else
+    journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" resolution fuzzy
+  fi
   bash "$HERE/scribe.sh" "Reconcile: PR #${rb_pr} (worktree ${rb_slug}) merged — find the 🔜/🚧 backlog item matching worktree ${rb_slug} or the PR title and mark it ✅ shipped (PR #${rb_pr}); if none matches, no-op." >/dev/null 2>&1 || true
   return 0
 }
