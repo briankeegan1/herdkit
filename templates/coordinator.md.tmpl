@@ -289,6 +289,18 @@ It pulls HERDKIT_HOME (fast-forward only), shows the incoming delta, re-renders 
 skill preserving `.herd/config` answers, and reloads the workspace — all in one step. It refuses
 if the engine checkout is dirty or builders are mid-flight; pass `--force` to proceed anyway.
 
+**After an engine update**, an update can add new config keys the engine now understands but this
+project has not set — it silently rides their built-in defaults. `herd update`/`herd upgrade` print
+the summary automatically, or run it anytime:
+
+    herd config sync   # READ-ONLY: lists each engine key missing from .herd/config, its default + when to set it
+
+For **each missing key the operator cares about**, interview them with **AskUserQuestion** (show the
+default and its when-to-surface guidance), then apply the chosen value with `herd config set <KEY>
+<VALUE>`. **Never auto-write** — `herd config sync` only reports; the operator decides, and only the
+validated `herd config set` ever changes `.herd/config`. A key they don't care about stays on its
+default, untouched.
+
 {{CAPABILITIES}}
 
 ## Backlog writes — enqueue, never edit inline
