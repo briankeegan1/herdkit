@@ -18,19 +18,34 @@
 #     raw error body ever reaches the pane; the warning is a fixed one-liner.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
-# rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
-HERD_REQUIRE_PROJECT_CONFIG=1
-. "$HERE/herd-config.sh"
-herd_console_guard "backlog viewer" || exit 1
-REPO="$PROJECT_ROOT"
-f="$REPO/$BACKLOG_FILE"
-# Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
-# tokyonight.json). theme.sh resolves .herd/themes/<name>/glow.json → templates/themes/<name>/ →
-# tokyonight, failing soft to the built-in default; glow itself already drops color for a non-TTY.
-# shellcheck source=/dev/null
-. "$HERE/theme.sh"
-STYLE="$(herd_theme_glow_style)"
+
+# ── one-shot shaping seam (--emit-md) ──────────────────────────────────────────
+# `backlog-view.sh --emit-md` reads a `herd backlog[ --rich]` list on STDIN and writes the EXACT
+# markdown the live pane hands to glow (shape_md) to STDOUT, then exits 0. It is deterministic and
+# TTY-/backend-/glow-independent — the seam the render tests assert on, because scraping the live
+# pane paint is not portable: glow paints straight to the pane TTY, so on a non-TTY capture the
+# shaped item markdown never reaches stdout. The heavy viewer bootstrap below (project config,
+# console guard, theme, TTY muting, poll loop) is SKIPPED in this mode — pure shaping needs none of
+# it, and its TTY escape codes / cursor-restore would otherwise corrupt the emitted markdown. The
+# actual emit happens once shape_md is defined (dispatch just below the shaping helpers).
+EMIT_MD=0
+case "${1:-}" in --emit-md) EMIT_MD=1 ;; esac
+
+if [ "$EMIT_MD" = 0 ]; then
+  # Launch-binding guard (issue #60): require a real project config (refuse the engine-dogfood
+  # rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
+  HERD_REQUIRE_PROJECT_CONFIG=1
+  . "$HERE/herd-config.sh"
+  herd_console_guard "backlog viewer" || exit 1
+  REPO="$PROJECT_ROOT"
+  f="$REPO/$BACKLOG_FILE"
+  # Glamour style — themed via HERD_THEME (default tokyonight, byte-identical to the bundled
+  # tokyonight.json). theme.sh resolves .herd/themes/<name>/glow.json → templates/themes/<name>/ →
+  # tokyonight, failing soft to the built-in default; glow itself already drops color for a non-TTY.
+  # shellcheck source=/dev/null
+  . "$HERE/theme.sh"
+  STYLE="$(herd_theme_glow_style)"
+fi
 last_frame=""
 BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 
@@ -38,20 +53,22 @@ BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 # onto the rendered view, corrupting it. Disabling stdin reads is NOT enough — echo happens in the
 # kernel regardless — so we mute the tty itself with stty, then restore it (and the cursor) on any
 # exit so the terminal is never left in a broken state.
-saved_tty=""
-if [ -r /dev/tty ]; then
-  saved_tty=$(stty -g </dev/tty 2>/dev/null) || saved_tty=""
-fi
-restore_tty() {
-  [ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
-  printf '\033[?25h'  # show cursor
-  [ -n "$BACKLOG_VIEW_TMP" ] && rm -f "$BACKLOG_VIEW_TMP" 2>/dev/null
-}
-trap 'restore_tty; exit 0' INT TERM
-trap restore_tty EXIT
-if [ -n "$saved_tty" ]; then
-  stty -echo -icanon </dev/tty 2>/dev/null
-  printf '\033[?25l'  # hide cursor
+if [ "$EMIT_MD" = 0 ]; then
+  saved_tty=""
+  if [ -r /dev/tty ]; then
+    saved_tty=$(stty -g </dev/tty 2>/dev/null) || saved_tty=""
+  fi
+  restore_tty() {
+    [ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+    printf '\033[?25h'  # show cursor
+    [ -n "$BACKLOG_VIEW_TMP" ] && rm -f "$BACKLOG_VIEW_TMP" 2>/dev/null
+  }
+  trap 'restore_tty; exit 0' INT TERM
+  trap restore_tty EXIT
+  if [ -n "$saved_tty" ]; then
+    stty -echo -icanon </dev/tty 2>/dev/null
+    printf '\033[?25l'  # hide cursor
+  fi
 fi
 
 # file_mtime / epoch_to_hhmm — portable helpers; detect BSD vs GNU once at startup.
@@ -223,6 +240,14 @@ list_to_md() {
     esac
   done
 }
+
+# ── one-shot shaping seam dispatch ─────────────────────────────────────────────
+# (See the --emit-md note near the top.) With both shaping helpers now defined, emit the shaped
+# markdown for the list on STDIN and exit — before any viewer/config/glow/TTY code runs.
+if [ "$EMIT_MD" = 1 ]; then
+  shape_md "$(cat)"
+  exit 0
+fi
 
 # glow_pane <glow-args...> — paint the pane TTY with glow under a PINNED color profile so every
 # repaint renders identically without re-detecting the terminal, and with stdin detached from the
