@@ -136,6 +136,31 @@ LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-u
 # prompt-cache-shared STABLE prefix, never interleaved with per-task text.
 CONTEXT_PROVISION=""      # e.g. "codemap"  (space-separate multiple sources)
 
+# builder MCP tool provisioning (HERD-41) — the TOOLS sibling of CONTEXT_PROVISION. A SPACE-SEPARATED
+# list of MCP server names wired into every spawned builder worktree's project-level
+# .claude/settings.json (its mcpServers block), so a builder can use those tools with no per-session
+# setup. EMPTY (default) → nothing written, settings.json byte-identical to today. The write is
+# ADDITIVE + NON-CLOBBER (an existing/user-authored server of the same name is never overwritten),
+# idempotent, and atomic — the same guarantees as the rate-limit hook it merges alongside.
+# Each name resolves to a {command,args,env} entry from a BUILT-IN default, overridable per server via
+#   MCP_<NAME>_COMMAND / MCP_<NAME>_ARGS / MCP_<NAME>_ENV
+# (NAME = the server name upper-cased with -/. → _; e.g. context7 → MCP_CONTEXT7_*). These per-server
+# keys are DYNAMIC (not registered for `herd config set`) — set them by editing THIS file directly. A
+# name with no built-in and no _COMMAND override is ignored (forward-compatible), never an error.
+# PRIVACY — credentials are NEVER written here or into the generated settings.json. MCP_<NAME>_ENV is a
+# space-separated list of env-var NAMES to pass through; only the reference string "${VAR}" is written,
+# and Claude Code expands it at launch from the runtime environment (populated from .herd/secrets).
+# Put the actual secret in .herd/secrets (gitignored), never in this committed file.
+# Built-in examples:
+#   context7      — up-to-date library docs (npx -y @upstash/context7-mcp; passes CONTEXT7_API_KEY
+#                   through). Valuable on real code CONSUMER projects herdkit runs on; low-value in
+#                   bash herdkit itself — the MECHANISM is the deliverable.
+#   graphify-mcp  — a LOCAL example server (the `graphify` codemap tool's MCP surface, if installed).
+# Example (uncomment to wire context7, with the API key living in .herd/secrets):
+#   MCP_PROVISION="context7"
+#   # MCP_CONTEXT7_ARGS="-y @upstash/context7-mcp@latest"   # override the built-in args if needed
+MCP_PROVISION=""          # e.g. "context7"  (space-separate multiple servers)
+
 # legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
 #   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
 #   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)

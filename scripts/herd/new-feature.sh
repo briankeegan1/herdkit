@@ -54,6 +54,14 @@ herd_pretrust_worktree "$DIR"
 # banner-scrape fallback covers environments where the hook is unavailable. See herd-config.sh.
 herd_write_ratelimit_hook "$DIR"
 
+# Wire any project-configured MCP servers (MCP_PROVISION) into this worktree's project-level
+# settings.json so the builder can reach them as needed — the tools SIBLING of the context-provisioning
+# surface. Same ADDITIVE / NON-CLOBBER / atomic guarantees as the rate-limit hook above (it merges into
+# the very same settings.json without clobbering that hook). Empty MCP_PROVISION (the default) → a
+# no-op and settings.json stays byte-identical. Secrets are never written — only "${VAR}" passthrough
+# references. Best-effort; never fatal to worktree creation. See herd_write_mcp_servers in herd-config.sh.
+herd_write_mcp_servers "$DIR"
+
 echo "✅ Worktree ready: $DIR   (branch $BRANCH, off $DEFAULT_BRANCH @ $(git -C "$REPO" rev-parse --short "$DEFAULT_BRANCH"))"
 echo "   Start an agent here:   cd $DIR && claude"
 echo "   When done:             gh pr create   # then the watcher reviews & merges"
