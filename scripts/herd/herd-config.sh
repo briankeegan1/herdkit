@@ -129,6 +129,26 @@ if [ -f "$_HERD_CONFIG_FILE" ]; then
   _herd_config_warn_dupes "$_HERD_CONFIG_FILE"
 fi
 
+# ── Per-user overlay: .herd/config.local (HERD-47) ───────────────────────────
+# Split the single tracked .herd/config into a COMMITTED project baseline (sourced just above) plus
+# an OPTIONAL, gitignored per-user/per-machine overlay sourced HERE, AFTER it — mirroring the
+# settings.json / settings.local.json (and .env / .env.local) convention Claude Code itself uses.
+# Both files are plain shell-sourced KEY=value, so a LATER assignment wins: any key set in
+# config.local OVERRIDES the baseline, keys it leaves unset keep the baseline value, and the engine
+# fallbacks below still fill anything neither file set. This is the whole precedence rule — baseline
+# first, overlay second. When config.local is ABSENT this block is inert and the effective config is
+# BYTE-IDENTICAL to a single-file setup (backward-compatible). The overlay is the SIBLING of the
+# resolved baseline (.herd/config.local next to .herd/config), and it is ZERO-SECRET exactly like the
+# baseline: credentials still live only in .herd/secrets, which is never sourced here. It intentionally
+# does NOT participate in the console launch-binding guard (_HERD_CONFIG_SOURCE tracks the BASELINE
+# resolution only) — the overlay tunes values, it never re-binds which project's config was found.
+_HERD_CONFIG_LOCAL_FILE="$(dirname "$_HERD_CONFIG_FILE")/config.local"
+if [ -f "$_HERD_CONFIG_LOCAL_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$_HERD_CONFIG_LOCAL_FILE"
+  _herd_config_warn_dupes "$_HERD_CONFIG_LOCAL_FILE"
+fi
+
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
 # PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if none, the repo
 # the engine lives in). Everything else derives from it. Computed with an explicit unset-guard rather
@@ -304,7 +324,7 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 
-unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE
+unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE _HERD_CONFIG_LOCAL_FILE
 
 # Derived helpers — split DEFAULT_BRANCH (e.g. "origin/main") for push/pull commands.
 HERD_REMOTE="${DEFAULT_BRANCH%%/*}"
@@ -684,6 +704,43 @@ PY
     printf '⚠️  herdkit: could not write the rate-limit hook for %s (limit auto-resume falls back to banner-scrape)\n' "$_rh_abs" >&2
   fi
   return 0
+}
+
+# ── Builder context-provisioning surface (HERD-40) ───────────────────────────────────────────────
+# herd_context_provision_preamble — emit the grounding block injected into the STABLE region of a
+# builder's task-spec preamble, so spawned builders start GROUNDED instead of re-exploring the repo
+# every session. Driven by the CONTEXT_PROVISION config key: a SPACE-SEPARATED list of grounding
+# sources to inject. Empty/unset (the DEFAULT) → this prints NOTHING and the task spec stays
+# byte-identical to today (zero behavior change).
+#
+# Contract the lanes rely on (herd-quick.sh / herd-feature.sh):
+#   • The output is a run of ' '-prefixed sentences the lane appends to the STABLE workflow-rules
+#     preamble — NEVER interleaved with the per-task text, so the prompt-cache prefix that many
+#     close-in-time spawns share stays intact. The block is project-config-constant (same for every
+#     spawn of a project), so it lives entirely inside the cached region.
+#   • It is placed BEFORE the per-item-unique trailer ($REFS_RULE) so the shared cache prefix stays
+#     maximal — same cache-aware discipline as the SPEC ordering in the lanes.
+#
+# EXTENSIBLE by design: each token maps to ONE case below that appends its pointer, so future
+# grounding sources (project context notes, MCP tool hints) plug in as new cases without reworking the
+# lanes. An UNKNOWN token is IGNORED (forward-compatible: an operator whose engine predates a source
+# they configured just gets no injection for it, never an error).
+#
+# FIRST supported source — 'codemap': the deterministic engine-tree map produced by `herd codemap`
+# (scripts/herd/codemap.sh) and committed at docs/codemap.md. The pointer tells the builder to read it
+# FIRST to orient (module roles, source edges, config-key → consumer wiring) instead of re-scanning.
+herd_context_provision_preamble() {
+  local _cp="${CONTEXT_PROVISION:-}"
+  [ -n "$_cp" ] || return 0     # off (default) → emit nothing; task specs are byte-identical to today
+  local _out="" _src
+  for _src in $_cp; do
+    case "$_src" in
+      codemap)
+        _out="$_out A deterministic map of this repo's engine tree is committed at docs/codemap.md (module roles, who-sources-whom, and config-key→consumer wiring; regenerate with 'herd codemap'). READ IT FIRST to orient — it lets you skip re-exploring the tree." ;;
+      *) : ;;   # unknown grounding source — ignore (forward-compatible)
+    esac
+  done
+  printf '%s' "$_out"
 }
 
 # herd_write_task_spec <spec_file> <spec_content> — externalize a builder's full task spec.

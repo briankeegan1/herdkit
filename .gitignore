@@ -18,3 +18,8 @@
 # machine-local Claude Code state — never committed.
 .claude/settings.local.json
 .claude/settings.json
+
+# Per-user / per-machine .herd/config overlay (HERD-47) — sourced AFTER .herd/config so its keys
+# override the committed baseline; gitignored so a collaborator's local tuning never diverges main
+# or dirties the ff-only `herd update` pull. The baseline .herd/config stays tracked.
+.herd/config.local

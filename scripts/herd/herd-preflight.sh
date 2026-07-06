@@ -497,6 +497,12 @@ herd_doctor() {
       else
         printf '  \xe2\x9c\x93 no duplicate keys\n'
       fi
+      # HERD-47: note when a per-user overlay is layered on top of the baseline, so the effective
+      # config is not a mystery. Purely informational (never gates); `herd config list` shows which
+      # file each effective value came from.
+      if [ -f "$(dirname "$_dc_cfg")/config.local" ]; then
+        printf '  \xe2\x9c\x93 config.local overlay present \xe2\x80\x94 per-user keys override the baseline (see `herd config list` for provenance)\n'
+      fi
     fi
   fi
 

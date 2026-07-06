@@ -3,6 +3,13 @@
 # It must be ZERO-SECRET: API-backend credentials go in .herd/secrets (gitignored), never here.
 # `herd init` writes this for you; every key has a generic fallback in herd-config.sh, so only
 # set what differs from the defaults.
+#
+# PER-USER OVERLAY (HERD-47): keep this file for SHARED project policy and put per-user/per-machine
+# state (driver binding, model-tier & token-budget choices, operator-posture opt-ins) in a sibling
+# .herd/config.local — gitignored, sourced AFTER this file so its keys OVERRIDE the baseline
+# (settings.json/settings.local.json convention). Absent ⇒ behavior is identical to this single file.
+# Write it via `herd config set --local KEY VALUE` (machine-scoped keys route there automatically);
+# `herd config list` shows whether each effective value came from the baseline or the local overlay.
 HERD_VERSION=1                       # engine contract version (herd upgrade bumps this)
 
 PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
@@ -126,6 +133,15 @@ DELETE_BRANCH_ON_MERGE="false"   # true | false
 # pre-PR local review mode. NOTE: the `pre-pr` behavior is NOT wired yet (it touches the review gate /
 # agent-watch.sh / herd-review.sh, owned by another lane) — documented here but not yet consumed.
 LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-up)
+
+# builder context provisioning (HERD-40) — a SPACE-SEPARATED list of grounding sources injected into
+# the STABLE preamble of every spawned builder's task spec, so builders start grounded instead of
+# re-exploring the repo each session. EMPTY (default) → nothing injected, task specs byte-identical to
+# today. First source: `codemap` → injects a pointer to the deterministic engine-tree map committed at
+# docs/codemap.md (run `herd codemap` to generate it) so the builder reads the map first. Extensible:
+# future sources plug in as new tokens; an unknown token is ignored. Injected grounding stays in the
+# prompt-cache-shared STABLE prefix, never interleaved with per-task text.
+CONTEXT_PROVISION=""      # e.g. "codemap"  (space-separate multiple sources)
 
 # legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
 #   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
