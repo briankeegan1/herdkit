@@ -3,6 +3,13 @@
 # It must be ZERO-SECRET: API-backend credentials go in .herd/secrets (gitignored), never here.
 # `herd init` writes this for you; every key has a generic fallback in herd-config.sh, so only
 # set what differs from the defaults.
+#
+# PER-USER OVERLAY (HERD-47): keep this file for SHARED project policy and put per-user/per-machine
+# state (driver binding, model-tier & token-budget choices, operator-posture opt-ins) in a sibling
+# .herd/config.local — gitignored, sourced AFTER this file so its keys OVERRIDE the baseline
+# (settings.json/settings.local.json convention). Absent ⇒ behavior is identical to this single file.
+# Write it via `herd config set --local KEY VALUE` (machine-scoped keys route there automatically);
+# `herd config list` shows whether each effective value came from the baseline or the local overlay.
 HERD_VERSION=1                       # engine contract version (herd upgrade bumps this)
 
 PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
