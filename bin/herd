@@ -140,35 +140,60 @@ render_skill() {
     # tokenizes leaves its {{DRIVER_*}} token unsubstituted, caught by the completeness lint below.
     local _dvars; _dvars="$(compgen -v DRIVER_ 2>/dev/null || true)"
 
-    # Build {{CAPABILITIES}} from templates/capabilities.tsv — one row per command/lane/config/lever.
+    # Build {{CAPABILITIES}} from templates/capabilities.tsv as a COMPACT one-line-per-item index
+    # (name + a terse gloss) rather than the full catalog. The verbose description + when_to_surface
+    # for every row is inlined on EVERY coordinator session otherwise (~50KB / ~12.5K tokens, ~72% of
+    # the rendered skill); this index cuts that recurring per-session tax while keeping the full
+    # reference REACHABLE via the pointer below (docs/capabilities-overview.md + capabilities.tsv,
+    # which carries the same when_to_surface column). A coordinator loads this index by default and
+    # reads the full doc only when it needs the detail. Deterministic + byte-stable for a manifest.
     local CAPABILITIES _caps_file="${HERD_CAPABILITIES_FILE:-$TEMPLATES_DIR/capabilities.tsv}"
+    local _caps_ref="$TEMPLATES_DIR/capabilities.tsv"
+    local _caps_doc="$HERDKIT_HOME/docs/capabilities-overview.md"
     CAPABILITIES=''
     if [ -f "$_caps_file" ]; then
-      # Preamble: single-quoted so backticks are literal (not command substitution).
-      CAPABILITIES='## Herdkit capabilities
+      # Preamble: pointer to the full reference, then the live-state surface. Interpolates the two
+      # absolute doc paths; the rest is written so its backticks stay literal.
+      CAPABILITIES='## Herdkit capabilities — compact index
+
+_A one-line index of every command, lane, config key, lever, convention, env var, and reference. For
+the full description **and** when-to-use guidance of any item, read `'"$_caps_doc"'`
+(curated narrative) or its machine-readable source of truth `'"$_caps_ref"'`
+(one row per item, with a `when_to_surface` column). Load those only when you need the detail — this
+index is enough to know what exists._
 
 _On every invocation, read live state to surface what is configured:_
 - Run `herd link list` — shows peers in `.herd/links` (enables `herd report --to <name>`)
 - Run `[ -f .herd/deps ] && cat .herd/deps` — upstream blockers tracked by dep-watcher
 - Check `MERGE_POLICY` in `.herd/config`: empty/auto → watcher auto-merges; approve → use `herd-approve.sh`; observe → watcher never merges'
-      local _prev_kind='' _n _k _d _w _req
-      # _req absorbs the optional 5th "requires" column (config rows only) so it never leaks into
-      # the rendered "When:" text; the coordinator skill is unchanged by the new metadata column.
-      while IFS=$'\t' read -r _n _k _d _w _req; do
-        [ "$_n" = "name" ] && continue
-        [ -z "$_n" ] && continue
-        if [ "$_k" != "$_prev_kind" ]; then
-          CAPABILITIES="${CAPABILITIES}"$'\n\n'
-          case "$_k" in
-            command) CAPABILITIES="${CAPABILITIES}### Commands (\`herd <subcommand>\`)" ;;
-            lane)    CAPABILITIES="${CAPABILITIES}### Lanes (\`bash ${SCRIPTS_DIR}/<lane>.sh\`)" ;;
-            config)  CAPABILITIES="${CAPABILITIES}### Config keys (\`.herd/config\`)" ;;
-            lever)   CAPABILITIES="${CAPABILITIES}### State files and levers" ;;
-          esac
-          _prev_kind="$_k"
-        fi
-        CAPABILITIES="${CAPABILITIES}"$'\n'"- **${_n}** — ${_d}. _When: ${_w}._"
-      done < "$_caps_file"
+      # Group by kind in a fixed order (one header per section), each row a terse bullet. _req absorbs
+      # the optional 5th "requires" column so it never leaks into the gloss.
+      local _kind _hdr _section _n _k _d _w _req _g
+      for _kind in command lane config lever convention env reference; do
+        case "$_kind" in
+          command)    _hdr="### Commands (\`herd <subcommand>\`)" ;;
+          lane)       _hdr="### Lanes (\`bash ${SCRIPTS_DIR}/<lane>.sh\`)" ;;
+          config)     _hdr="### Config keys (\`.herd/config\`)" ;;
+          lever)      _hdr="### State files and levers" ;;
+          convention) _hdr="### Conventions" ;;
+          env)        _hdr="### Environment variables" ;;
+          reference)  _hdr="### Reference" ;;
+        esac
+        _section=''
+        while IFS=$'\t' read -r _n _k _d _w _req; do
+          [ "$_n" = "name" ] && continue
+          [ -z "$_n" ] && continue
+          [ "$_k" != "$_kind" ] && continue
+          # Terse gloss: first sentence of the description, capped at 120 chars on a word boundary.
+          _g="${_d%%. *}"
+          # A first-sentence split lands mid-abbreviation on "e.g."/"i.e." — detect the dangling
+          # fragment and fall back to a hard cap of the full description instead.
+          case "$_g" in *[Ee].[Gg]|*[Ii].[Ee]) _g="$_d" ;; esac
+          if [ "${#_g}" -gt 120 ]; then _g="${_g:0:120}"; _g="${_g% *}"; _g="${_g}…"; fi
+          _section="${_section}"$'\n'"- \`${_n}\` — ${_g}"
+        done < "$_caps_file"
+        [ -n "$_section" ] && CAPABILITIES="${CAPABILITIES}"$'\n\n'"${_hdr}${_section}"
+      done
     fi
 
     local line _dk
