@@ -145,14 +145,17 @@ _cm_render() {
   fi
 
   # 2. Who sources whom (edges to real engine scripts only; sorted by sourcer then target).
+  # Membership is a space-delimited basename list, NOT an associative array: macOS ships bash 3.2
+  # (no declare -A), and under 3.2 an assoc subscript like agent-watch.sh is arithmetic-evaluated —
+  # an unbound-variable abort mid-render. Basenames never contain spaces, so the case match is exact.
   printf '\n## Who sources whom\n\n'
   printf 'Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).\n\n'
-  declare -A _isscript
-  for f in scripts/herd/*.sh; do _isscript["${f##*/}"]=1; done
+  local _scripts=" "
+  for f in scripts/herd/*.sh; do _scripts="${_scripts}${f##*/} "; done
   cur=""; targets=""
   while IFS=$'\t' read -r path tgt; do
     [ -n "$path" ] || continue
-    [ -n "${_isscript[$tgt]:-}" ] || continue
+    case "$_scripts" in *" $tgt "*) ;; *) continue ;; esac
     if [ "$path" != "$cur" ]; then
       if [ -n "$cur" ] && [ -n "$targets" ]; then
         case "$cur" in bin/herd) lbl="bin/herd" ;; *) lbl="${cur##*/}" ;; esac
@@ -178,17 +181,26 @@ _cm_render() {
       case "$f" in scripts/herd/herd-config.sh) continue ;; esac
       scan+=("$f")
     done
-    declare -A _cons
-    while IFS=$'\t' read -r key path; do
-      [ -n "$key" ] || continue
-      case "$path" in bin/herd) lbl="bin/herd" ;; *) lbl="${path##*/}" ;; esac
-      _cons["$key"]="${_cons[$key]:+${_cons[$key]}, }\`$lbl\`"
-    done < <(_cm_config_pairs "$caps" "${scan[@]}" | sort)
-    # Emit every config key in sorted order (a key with no consumer shows an em-dash).
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      printf -- '- `%s` → %s\n' "$key" "${_cons[$key]:-—}"
-    done < <(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u)
+    # Aggregate consumers per key and emit every config key in sorted order (a key with no consumer
+    # shows an em-dash). The aggregation lives in awk, not a bash associative array: macOS bash 3.2
+    # has no declare -A (see the who-sources-whom note above). PAIR rows (sorted key→path pairs)
+    # stream in first to build each key's consumer list; KEY rows (the sorted manifest keys) then
+    # emit one line per key, preserving the exact output shape.
+    { _cm_config_pairs "$caps" "${scan[@]}" | sort | awk '{print "PAIR\t" $0}'
+      awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u \
+        | awk '{print "KEY\t" $0}'
+    } | awk -F'\t' '
+      $1=="PAIR" {
+        lbl=$3
+        if (lbl!="bin/herd") { n=split(lbl,a,"/"); lbl=a[n] }
+        cons[$2] = (cons[$2]=="" ? "" : cons[$2] ", ") "`" lbl "`"
+        next
+      }
+      $1=="KEY" {
+        c=cons[$2]; if (c=="") c="—"
+        printf "- `%s` → %s\n", $2, c
+      }
+    '
   fi
 }
 
