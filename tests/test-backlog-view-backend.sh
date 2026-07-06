@@ -157,18 +157,4 @@ grep -q "held-item" <<<"$out5"                 || fail "empty-result: last good 
 grep -q "backend unreachable since" <<<"$out5" || fail "empty-result: missing last-good warning line"
 pass
 
-# ── Case 6: poll_wait keeps the loop bounded (HERD-48) ───────────────────────────────────────────
-# The plain `sleep "$poll"` is now poll_wait (it lets an interactive pane force an instant refresh with
-# r/R — driven end-to-end in tests/test-backlog-view-refresh-key.sh). Here we assert the mechanical
-# invariant that matters for THIS loop: with a real (non-zero) poll, poll_wait's wait is always bounded
-# and the loop still renders and TERMINATES on its own at MAX_POLLS — it never turns into a blocking
-# read. Run it in the FOREGROUND (2 polls @1s) so the check is deterministic on every runner (no
-# backgrounding, no watchdog, no timing race); a bounded wait means run_view returns and rendered.
-P6="$T/proj-refresh"; make_project "$P6" "linear"
-: > "$LOG"
-out6="$(run_view "$P6" BACKLOG_VIEW_MAX_POLLS=2 BACKLOG_VIEW_POLL_SECS=1 HERD_FAKE_OUT="#R-1 refresh-item")"; rc6=$?
-[ "$rc6" -eq 0 ]                  || fail "poll_wait: backend loop did not exit cleanly at MAX_POLLS (rc=$rc6)"
-grep -q "refresh-item" <<<"$out6" || fail "poll_wait: loop did not render the list through the bounded wait"
-pass
-
 echo "ALL PASS ($PASS checks)"

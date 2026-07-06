@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 # test-backlog-view-refresh-key.sh — hermetic, network-free test of the manual-refresh key (HERD-48).
 #
-# backlog-view.sh's poll loop now waits via poll_wait, which lets the coordinator's backlog pane force
-# an immediate refetch+repaint when the user presses r/R instead of waiting out the poll interval. Two
-# behaviours need proving, and both are driven from a small python harness (deterministic on every
-# runner — no backgrounding, no watchdog, no timing races):
+# The coordinator's backlog pane lets the user press r/R to force an immediate refetch+repaint instead
+# of waiting out the poll interval. Driving that for real needs a controlling tty and a keystroke — but
+# the suite runs INSIDE a live pane, and reading its /dev/tty wedges the gate. So this test never
+# touches the real terminal: it points the viewer's tty at /dev/null (BACKLOG_VIEW_TTY, which is not a
+# tty → the no-tty code path) and injects keypresses through the BACKLOG_VIEW_KEY_CMD hook — the one
+# seam where poll_wait reads a key. Everything runs FOREGROUND with a fixed poll; no pty, no
+# backgrounding, no timing races.
 #
-#   A. no-tty fallback — with NO controlling tty (the child is spawned in its own session), poll_wait
-#      must degrade to a plain sleep: the loop still renders and TERMINATES at MAX_POLLS, never blocks
-#      on a tty read, and the 'r = refresh' footer hint is OMITTED (byte-identical to pre-HERD-48).
-#   B. keypress refresh — under a REAL pty (so /dev/tty resolves to the pty), pressing 'r' forces a
-#      SECOND repaint of BYTE-FOR-BYTE UNCHANGED backlog content. That can ONLY happen if the key
-#      cleared last_hash (unchanged content is otherwise latched by the content hash → no repaint), so
-#      a second rendered header is unambiguous proof the key fired. The footer hint IS shown here.
+# The FAKE `herd` emits a FIXED list, so backlog content never changes between polls — which makes the
+# assertions unambiguous: a repaint of unchanged content can happen ONLY when a keypress cleared the
+# render latch (content is otherwise hashed and NOT repainted). Each repaint prints exactly one header
+# line (contains 'live ·'), so counting headers counts repaints.
 #
-# Fails SOFT: if python3, os.forkpty, or new-session spawning is unavailable, the affected scenario
-# SKIPS (never a false red).
+# Coverage:
+#   1. refresh    — 'r' forces a SECOND repaint of unchanged content (2 headers).
+#   2. other key  — 'x' is ignored: unchanged content is NOT repainted (1 header), cadence unchanged.
+#   3. no-tty     — no key source (no hook, tty=/dev/null): plain-sleep fallback renders, terminates,
+#                   and OMITS the 'r = refresh' footer — byte-identical to the pre-HERD-48 frame.
 #
 # Run:  bash tests/test-backlog-view-refresh-key.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/../scripts/herd/backlog-view.sh"
-command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0; }
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+PASS=0
+fail(){ echo "FAIL: $1" >&2; exit 1; }
+pass(){ PASS=$((PASS+1)); }
+
 BIN="$T/bin"; mkdir -p "$BIN"; LOG="$T/herd.log"
 
-# FAKE `herd` — emits a FIXED backlog list, so content never changes between polls (the whole point of
-# scenario B: a repaint of unchanged content can only come from the key clearing last_hash).
+# FAKE `herd` — logs calls; for `backlog` prints a FIXED list (content is constant across polls).
 cat > "$BIN/herd" <<'FAKE'
 #!/usr/bin/env bash
 echo "herd $*" >> "$HERD_FAKE_LOG"
@@ -36,119 +41,68 @@ printf '%s\n' "${HERD_FAKE_OUT:-}"
 FAKE
 chmod +x "$BIN/herd"
 
-mkdir -p "$T/p/.herd"
-cat > "$T/p/.herd/config" <<EOF
-PROJECT_ROOT="$T/p"
+# Key hooks (the BACKLOG_VIEW_KEY_CMD contract: print the pressed key + exit 0, or exit >128 for a
+# timeout). key-r presses 'r' once. key-x presses a non-refresh key 'x' once, then behaves like the
+# real read after a keystroke — it waits out the remaining interval and times out (so poll_wait can
+# never busy-spin on it).
+cat > "$BIN/key-r" <<'EOF'
+#!/usr/bin/env bash
+printf 'r'
+EOF
+cat > "$BIN/key-x" <<'EOF'
+#!/usr/bin/env bash
+c="${KEYCMD_COUNTER:?}"; n=$(cat "$c" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$c"
+if [ "$n" -eq 1 ]; then printf 'x'; exit 0; fi
+sleep "${1:-0}"; exit 142
+EOF
+chmod +x "$BIN/key-r" "$BIN/key-x"
+
+# Project with a non-file (linear) backend so the backend-poll loop runs.
+P="$T/proj"; mkdir -p "$P/.herd"
+cat > "$P/.herd/config" <<EOF
+PROJECT_ROOT="$P"
 WORKSPACE_NAME="testws"
 BACKLOG_FILE="BACKLOG.md"
 SCRIBE_BACKEND="linear"
 EOF
+
+# run_view [extra env KEY=VAL ...] — run the viewer against $P with the fake herd on PATH, the tty
+# pointed at /dev/null (never the real terminal), and the console cwd-guard bypassed. Prints stdout.
+run_view() {
+  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+    HERD_CONFIG_FILE="$P/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 HERD_FAKE_LOG="$LOG" \
+    BACKLOG_VIEW_TTY=/dev/null "$@" \
+    bash "$SCRIPT" 2>/dev/null </dev/null
+}
+headers(){ grep -c 'live ·' <<<"$1" || true; }
+
+# ── Case 1: 'r' forces a repaint of UNCHANGED content ────────────────────────────────────────────
 : > "$LOG"
+out1="$(run_view BACKLOG_VIEW_KEY_CMD="$BIN/key-r" BACKLOG_VIEW_MAX_POLLS=2 BACKLOG_VIEW_POLL_SECS=1 \
+        HERD_FAKE_OUT="#R-1 refresh-item")"
+grep -q "refresh-item" <<<"$out1"      || fail "refresh: backlog list never rendered"
+h1="$(headers "$out1")"
+[ "$h1" -eq 2 ] || fail "refresh: 'r' did not repaint unchanged content (expected 2 headers, got $h1):
+$out1"
+pass
 
-# The python harness — written to a temp file (avoids heredoc-inside-\$() quoting hazards) and run.
-cat > "$T/drive.py" <<'PY'
-import os, sys, time, select, subprocess
+# ── Case 2: a non-refresh key is IGNORED — unchanged content is NOT repainted ─────────────────────
+: > "$LOG"; : > "$T/kc"
+out2="$(run_view BACKLOG_VIEW_KEY_CMD="$BIN/key-x" KEYCMD_COUNTER="$T/kc" BACKLOG_VIEW_MAX_POLLS=2 \
+        BACKLOG_VIEW_POLL_SECS=1 HERD_FAKE_OUT="#R-1 refresh-item")"
+grep -q "refresh-item" <<<"$out2"      || fail "other-key: backlog list never rendered"
+h2="$(headers "$out2")"
+[ "$h2" -eq 1 ] || fail "other-key: 'x' should be ignored (expected 1 header, got $h2):
+$out2"
+pass
 
-SCRIPT = os.environ["SCRIPT"]
-MARK   = b"live \xc2\xb7"   # the header printf's 'live \xc2\xb7' marker — exactly one per repaint
+# ── Case 3: no key source → plain-sleep fallback, footer omitted, byte-identical frame ────────────
+: > "$LOG"
+out3="$(run_view BACKLOG_VIEW_MAX_POLLS=2 BACKLOG_VIEW_POLL_SECS=1 HERD_FAKE_OUT="#R-1 refresh-item")"
+grep -q "refresh-item" <<<"$out3"          || fail "no-tty: fallback did not render the list"
+grep -q "r = refresh" <<<"$out3"           && fail "no-tty: footer hint shown though there is no tty (not byte-identical)"
+h3="$(headers "$out3")"
+[ "$h3" -eq 1 ] || fail "no-tty: unchanged content must not repaint in the fallback (expected 1 header, got $h3)"
+pass
 
-def base_env(poll, maxp):
-    return {
-        "HOME": os.environ["HOME"],
-        "PATH": os.environ["BIN"] + ":/usr/bin:/bin:/usr/sbin:/sbin",
-        "TERM": "xterm",
-        "HERD_CONFIG_FILE": os.environ["CFG"],
-        "HERD_ALLOW_FOREIGN_CWD": "1",
-        "HERD_FAKE_LOG": os.environ["LOG"],
-        "HERD_FAKE_OUT": "#R-1 refresh-item",
-        "BACKLOG_VIEW_MAX_POLLS": maxp,
-        "BACKLOG_VIEW_POLL_SECS": poll,
-    }
-
-def scenario_no_tty():
-    # No controlling tty (start_new_session=os.setsid) → poll_wait must take the plain-sleep fallback.
-    env = base_env(poll="1", maxp="2")
-    try:
-        p = subprocess.Popen(["bash", SCRIPT], env=env, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
-    except OSError as e:
-        return ("no-tty", None, "spawn unavailable: %s" % e)
-    try:
-        out, _ = p.communicate(timeout=25)
-    except subprocess.TimeoutExpired:
-        p.kill(); p.communicate()
-        return ("no-tty", False, "loop did not terminate — poll_wait blocked with no tty")
-    if p.returncode != 0:
-        return ("no-tty", False, "non-zero exit %d in the no-tty fallback" % p.returncode)
-    if b"refresh-item" not in out:
-        return ("no-tty", False, "list never rendered in the no-tty fallback")
-    if b"r = refresh" in out:
-        return ("no-tty", False, "footer hint shown though there is no interactive tty")
-    return ("no-tty", True, "clean exit, rendered, no footer")
-
-def scenario_keypress():
-    try:
-        pid, fd = os.forkpty()
-    except (OSError, AttributeError) as e:
-        return ("keypress", None, "forkpty unavailable: %s" % e)
-    if pid == 0:
-        env = base_env(poll="5", maxp="2")   # long poll: unchanged content would NOT repaint on its own
-        try:
-            os.execve("/bin/bash", ["bash", SCRIPT], env)
-        finally:
-            os._exit(127)
-
-    buf = b""; deadline = time.time() + 20; sent = False
-    while time.time() < deadline:
-        try:
-            r, _, _ = select.select([fd], [], [], 0.3)
-        except (OSError, ValueError):
-            break
-        if not r:
-            continue
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break            # EIO on the master == slave closed (child exited)
-        if not chunk:
-            break            # EOF
-        buf += chunk
-        if not sent and buf.count(MARK) >= 1:
-            time.sleep(0.2)
-            try:
-                os.write(fd, b"r")
-            except OSError:
-                pass
-            sent = True
-    try:
-        os.waitpid(pid, 0)
-    except OSError:
-        pass
-
-    heads = buf.count(MARK)
-    if not sent:
-        return ("keypress", False, "harness never saw the first render to press 'r' on")
-    if b"refresh-item" not in buf:
-        return ("keypress", False, "list never rendered under the pty")
-    if b"r = refresh" not in buf:
-        return ("keypress", False, "footer hint missing on the interactive tty")
-    if heads < 2:
-        return ("keypress", False, "'r' did not repaint unchanged content (rendered headers=%d)" % heads)
-    return ("keypress", True, "'r' forced a repaint of unchanged content (headers=%d)" % heads)
-
-ok = True
-for name, passed, msg in (scenario_no_tty(), scenario_keypress()):
-    if passed is None:
-        sys.stdout.write("SKIP[%s]: %s\n" % (name, msg))
-    elif passed:
-        sys.stdout.write("PASS[%s]: %s\n" % (name, msg))
-    else:
-        sys.stdout.write("FAIL[%s]: %s\n" % (name, msg)); ok = False
-sys.exit(0 if ok else 1)
-PY
-
-out="$(SCRIPT="$SCRIPT" BIN="$BIN" CFG="$T/p/.herd/config" LOG="$LOG" HOME="$HOME" python3 "$T/drive.py")"; rc=$?
-printf '%s\n' "$out"
-[ "$rc" -eq 0 ] || { echo "FAIL: refresh-key harness reported a failure (see above)"; exit 1; }
-echo "ALL PASS (refresh-key: no-tty fallback + live keypress refresh)"
+echo "ALL PASS ($PASS checks)"
