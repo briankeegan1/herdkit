@@ -127,6 +127,15 @@ DELETE_BRANCH_ON_MERGE="false"   # true | false
 # agent-watch.sh / herd-review.sh, owned by another lane) — documented here but not yet consumed.
 LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-up)
 
+# builder context provisioning (HERD-40) — a SPACE-SEPARATED list of grounding sources injected into
+# the STABLE preamble of every spawned builder's task spec, so builders start grounded instead of
+# re-exploring the repo each session. EMPTY (default) → nothing injected, task specs byte-identical to
+# today. First source: `codemap` → injects a pointer to the deterministic engine-tree map committed at
+# docs/codemap.md (run `herd codemap` to generate it) so the builder reads the map first. Extensible:
+# future sources plug in as new tokens; an unknown token is ignored. Injected grounding stays in the
+# prompt-cache-shared STABLE prefix, never interleaved with per-task text.
+CONTEXT_PROVISION=""      # e.g. "codemap"  (space-separate multiple sources)
+
 # legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
 #   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
 #   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)

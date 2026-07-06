@@ -134,12 +134,21 @@ else
   REFS_RULE=""
 fi
 
+# Context-provisioning grounding (HERD-40): CONTEXT_PROVISION lists grounding sources to inject into
+# the STABLE task-spec preamble so builders start grounded instead of re-exploring the repo each
+# session (first source: 'codemap' → a pointer to the committed docs/codemap.md). Empty/unset (the
+# default) → GROUNDING_RULE is empty and the rules text is byte-for-byte unchanged. Built by the shared
+# herd_context_provision_preamble helper (herd-config.sh) so both lanes inject identically and the
+# surface is extensible. Threaded into the STABLE region BELOW, BEFORE $REFS_RULE (the per-item unique
+# trailer) so the shared prompt-cache prefix stays maximal — same discipline as the SPEC ordering.
+GROUNDING_RULE="$(herd_context_provision_preamble)"
+
 # 3. RIGHT pane: the Claude sub-agent (yolo by default). The seeded task plus the standing
 #    workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this feature in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
 warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
-If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$REFS_RULE"
+If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
 # herd_write_task_spec is FAIL-LOUD: a failed/partial spec write returns non-zero and — under

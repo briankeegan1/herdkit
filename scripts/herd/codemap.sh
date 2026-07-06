@@ -147,11 +147,10 @@ _cm_render() {
   # 2. Who sources whom (edges to real engine scripts only; sorted by sourcer then target).
   printf '\n## Who sources whom\n\n'
   printf 'Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).\n\n'
-  # Membership set of real engine-script basenames. bash 3.2 has no associative arrays (the project's
-  # portability floor — see healthcheck.sh), so carry it as a space-delimited string and test with a
-  # glob `case`; basenames never contain spaces, so the padded match is exact.
+  # Set of engine-script basenames as a space-delimited string (bash 3.2 has no associative arrays;
+  # basenames never contain spaces, so a padded ' name ' glob is an exact membership test).
   local _isscript=" "
-  for f in scripts/herd/*.sh; do _isscript="${_isscript}${f##*/} "; done
+  for f in scripts/herd/*.sh; do _isscript="$_isscript${f##*/} "; done
   cur=""; targets=""
   while IFS=$'\t' read -r path tgt; do
     [ -n "$path" ] || continue
@@ -181,24 +180,21 @@ _cm_render() {
       case "$f" in scripts/herd/herd-config.sh) continue ;; esac
       scan+=("$f")
     done
-    # Group consumers per key. bash 3.2 has no associative arrays, so do the grouping in awk (awk
-    # always has them): over the path-sorted pairs, accumulate a comma-joined `label` list per key in
-    # the same order the old assoc-array loop emitted (labels follow the path sort). Emit "key<TAB>
-    # joined" per key that has ≥1 consumer.
-    local consmap keys
-    consmap="$(_cm_config_pairs "$caps" "${scan[@]}" | sort | awk -F'\t' '
-      function base(p,  n,a){ n=split(p,a,"/"); return a[n] }
-      { lbl=($2=="bin/herd")?"bin/herd":base($2)
-        if ($1 in c) c[$1]=c[$1] ", `" lbl "`"; else c[$1]="`" lbl "`" }
-      END { for (k in c) print k "\t" c[k] }
-    ')"
-    # Full config-key list (sorted). Join it against the consumer map in ONE awk (a key with no
-    # consumer shows an em-dash), reproducing the old `- \`key\` → consumers` lines byte-for-byte.
-    keys="$(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u)"
+    # Accumulate consumers per key AND emit every manifest config key (sorted; a key with no
+    # consumer shows an em-dash) in ONE awk over two inputs — awk arrays are always associative and
+    # portable, so this replaces the bash-4-only `declare -A` map with no output change. Input 1 is
+    # the full sorted config-key list (never empty when caps has config rows, so the NR==FNR split is
+    # unambiguous); input 2 is the sorted key<TAB>path consumer pairs, appended in sorted order.
     awk -F'\t' '
-      NR==FNR { if ($1!="") cons[$1]=$2; next }
-      $1!="" { printf "- `%s` \342\206\222 %s\n", $1, ($1 in cons ? cons[$1] : "\342\200\224") }
-    ' <(printf '%s\n' "$consmap") <(printf '%s\n' "$keys")
+      NR==FNR { keys[++n]=$1; next }                     # input 1: manifest config keys, sorted
+      {                                                   # input 2: key<TAB>path consumer pairs
+        if ($1=="") next
+        if ($2=="bin/herd") lbl="bin/herd"; else { lbl=$2; sub(/.*\//,"",lbl) }
+        cons[$1] = (cons[$1]=="" ? "" : cons[$1] ", ") "`" lbl "`"
+      }
+      END { for (i=1;i<=n;i++) print "- `" keys[i] "` \342\206\222 " (cons[keys[i]]=="" ? "\342\200\224" : cons[keys[i]]) }
+    ' <(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u) \
+      <(_cm_config_pairs "$caps" "${scan[@]}" | sort)
   fi
 }
 
