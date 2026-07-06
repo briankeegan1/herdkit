@@ -143,3 +143,62 @@ _backend_item_state() {
         *)      ITEM_STATE="open"   ;;
     esac
 }
+
+# _backend_claim_item REF WHO — atomic-ish pre-spawn claim (HERD-50). The claim marker on GitHub is
+# the issue ASSIGNEE. Read state+assignees SYNCHRONOUSLY; abort if the issue is closed (already
+# shipped) or already assigned to a DIFFERENT login; else add WHO as an assignee and RE-READ to verify
+# the claim stuck. GitHub has no compare-and-swap AND allows multiple assignees, so the re-read is what
+# narrows a concurrent-claim race: if a competing assignee appeared in the window we back off. Sets:
+#   _CLAIM_RESULT = CLAIMED | SELF (already assigned to us) | ALREADY (closed / another assignee) |
+#                   UNREACHABLE (no matching issue / gh read failed → caller fails soft)
+#   _CLAIM_OWNER  = the blocking login (for the abort message)
+# RESIDUAL RACE (documented honestly): two claimers can both add themselves as assignees between the
+# read and the verify; the verify catches the common case (the other landed first) and backs off, but
+# a truly simultaneous double-assign can leave both assigned — the window is a couple of API
+# round-trips (seconds), not the async-scribe minutes.
+_backend_claim_item() {
+    local ref="$1" who="$2" num info parsed state other mine
+    _CLAIM_RESULT=""; _CLAIM_OWNER=""
+    _github_require_gh
+    [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+    [ -n "$who" ] || who="@me"
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then _CLAIM_RESULT="UNREACHABLE"; return 0; fi
+
+    info="$(_gh issue view "$num" --json state,assignees 2>/dev/null)" || { _CLAIM_RESULT="UNREACHABLE"; return 0; }
+    [ -n "$info" ] || { _CLAIM_RESULT="UNREACHABLE"; return 0; }
+    # "<STATE>\t<other-assignee>\t<mine 0|1>": other = first assignee that is NOT us (a competing claim).
+    parsed="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+st = (d.get("state") or "OPEN").upper()
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+other = next((a for a in asg if a and a != who), "")
+mine = "1" if who in asg else "0"
+print("%s\t%s\t%s" % (st, other, mine))' 2>/dev/null)"
+    state="${parsed%%	*}"; parsed="${parsed#*	}"
+    other="${parsed%%	*}"; mine="${parsed##*	}"
+
+    if [ "$state" = "CLOSED" ]; then _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${other:-closed}"; return 0; fi
+    if [ -n "$other" ];       then _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="$other";           return 0; fi
+    if [ "$mine" = "1" ];     then _CLAIM_RESULT="SELF";    _CLAIM_OWNER="$who";              return 0; fi
+
+    # Open + unassigned → claim it: assign ourselves.
+    if ! _gh issue edit "$num" --add-assignee "$who" >/dev/null 2>&1; then
+        _CLAIM_RESULT="UNREACHABLE"; return 0
+    fi
+    # CLAIM-VERIFY: re-read to confirm no competing assignee slipped in during the window.
+    info="$(_gh issue view "$num" --json state,assignees 2>/dev/null)" || { _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"; return 0; }
+    parsed="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+print(next((a for a in asg if a and a != who), ""))' 2>/dev/null)"
+    if [ -n "$parsed" ]; then
+        _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="$parsed"
+    else
+        _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"
+    fi
+}
