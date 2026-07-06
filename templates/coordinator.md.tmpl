@@ -97,6 +97,15 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
      ```
      bash {{SCRIPTS_DIR}}/herd-quick.sh <slug> "<task>"
      ```
+   **Link a tracked item back to its tracker.** When the item you picked carries a tracker id (the
+   `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
+   `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
+   merge-time reconcile resolves the exact backlog item by that ref instead of fuzzy slug/title
+   matching. Omit it for a file-backend item with no id (the reconcile falls back to fuzzy matching,
+   exactly as before):
+   ```
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"
+   ```
    **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
    (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
    the quick lane; anything touching judgment-heavy engine surface (`bin/herd`, the watcher,

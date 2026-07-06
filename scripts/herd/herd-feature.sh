@@ -119,12 +119,27 @@ else
   LOCAL_REVIEW_RULE=""
 fi
 
+# Tracker linkage (HERD-39): when the coordinator spawns from a TRACKED item it prefixes the lane
+# command with HERD_ITEM_REF=<id>. When set, the LANE RULES below REQUIRE the builder to carry an
+# explicit 'Refs: <id>' line in its PR body, so merge-time reconcile (agent-watch.sh) resolves the
+# backlog item by that EXACT ref instead of fuzzy slug/title matching. Unset → REFS_RULE is empty and
+# the prompt is byte-for-byte unchanged (zero behavior change). Appended at the END of the rules text
+# (it is per-item unique) so the STABLE cached prefix stays maximal — same cache-aware discipline as
+# the SPEC ordering below. Resolved here (not in herd-config.sh) so the builder prompt is the only
+# surface threaded — same pattern as PR_FLOW / LOCAL_REVIEW above.
+_item_ref="${HERD_ITEM_REF:-}"
+if [ -n "$_item_ref" ]; then
+  REFS_RULE=" This item is tracked as $_item_ref — you MUST include a line 'Refs: $_item_ref' in the PR body so the merge-time reconcile links it back to the tracker by that exact ref."
+else
+  REFS_RULE=""
+fi
+
 # 3. RIGHT pane: the Claude sub-agent (yolo by default). The seeded task plus the standing
 #    workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this feature in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
 warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
-If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped."
+If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
 # herd_write_task_spec is FAIL-LOUD: a failed/partial spec write returns non-zero and — under
