@@ -2556,6 +2556,99 @@ else
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
+# ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
+# _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
+# ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
+# lane advisory gate: REVIEW_CONCURRENCY + SPAWN_AHEAD total active builders. FEATS (the live
+# worktree roster) is computed earlier this tick, so active count is its length.
+#
+# DURABILITY CONTRACT (review gate, PR #151): an intent is consumed (`done`, rm) ONLY after its
+# lane observably spawned. The lane runs in the FOREGROUND with output captured, because the lanes
+# have TWO no-builder exits the old backgrounded launch could never see:
+#   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
+#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
+#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
+#     stops for this tick (siblings would also defer against the same gate);
+#   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
+#     is dropped LOUDLY (skip + journal), never silently.
+# Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
+# post-mortem can answer "why did nothing spawn?" from `herd log` alone.
+#
+# The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
+# multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
+#
+# Fail-soft: a malformed intent is skipped with a logged warning — never crashes the watcher loop.
+# Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
+_drain_spawn_queue() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _dsq_q="$TREES/spawn-queue"
+  [ -d "$_dsq_q" ] || return 0
+  ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+
+  # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
+  local _dsq_cap _dsq_budget
+  _dsq_cap=$(( ${REVIEW_CONCURRENCY:-2} + ${SPAWN_AHEAD:-1} ))
+  _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
+  [ "$_dsq_budget" -le 0 ] && return 0
+
+  local _dsq_n=0
+  while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
+    # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
+    # Slug and lane are the first two payload lines; the task is EVERYTHING after them.
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_task=""
+    {
+      IFS= read -r _dsq_line1
+      IFS= read -r _dsq_slug
+      IFS= read -r _dsq_lane
+      _dsq_task="$(cat)"
+    } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
+
+    case "${_dsq_line1:-}" in
+      EMPTY|'') break ;;
+      CLAIMED*)
+        local _dsq_claimed="${_dsq_line1#CLAIMED }"
+        # Fail-soft: validate slug and lane before launching.
+        if [ -z "$_dsq_slug" ] || [ -z "$_dsq_lane" ]; then
+          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "empty slug or lane" >/dev/null 2>&1 || true
+          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "empty slug or lane"
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
+        case "$_dsq_lane" in
+          quick|feature) ;;
+          *)
+            bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "unknown lane '$_dsq_lane'" >/dev/null 2>&1 || true
+            journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "unknown lane"
+            _dsq_n=$(( _dsq_n + 1 )); continue ;;
+        esac
+        # Launch the lane in the FOREGROUND and observe the outcome before consuming the intent.
+        local _dsq_out="" _dsq_rc=0
+        if [ "$_dsq_lane" = "feature" ]; then
+          _dsq_out="$(bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+        else
+          _dsq_out="$(bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+        fi
+        if [ "$_dsq_rc" -eq 0 ] && printf '%s' "$_dsq_out" | grep -q 'review-gate saturated'; then
+          # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent
+          # back for a later tick and stop draining — siblings would defer against the same gate.
+          bash "$HERE/spawn-step.sh" release "$_dsq_claimed" >/dev/null 2>&1 || true
+          journal_append spawn_deferred slug "$_dsq_slug" lane "$_dsq_lane"
+          break
+        elif [ "$_dsq_rc" -ne 0 ]; then
+          # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the
+          # journal records why, so a lost spawn is always visible in `herd log`.
+          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "lane exited $_dsq_rc" >/dev/null 2>&1 || true
+          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "lane exited $_dsq_rc"
+        else
+          # Spawned: only now is the intent consumed.
+          bash "$HERE/spawn-step.sh" done "$_dsq_claimed" >/dev/null 2>&1 || true
+          journal_append spawn_launched slug "$_dsq_slug" lane "$_dsq_lane"
+        fi
+        _dsq_n=$(( _dsq_n + 1 ))
+        ;;
+    esac
+  done
+}
+
 _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 
@@ -2911,6 +3004,9 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
     render
     spawn_resolver "$slug" "$prnum" "$branch"
   done
+
+  # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
+  _drain_spawn_queue
 
   # Coordinator watchdog: ONE per-tick liveness check of the coordinator itself (which the feature
   # loop above never sees — it runs from $MAIN, not a worktree). Byte-inert unless COORDINATOR_WATCHDOG=on.
