@@ -76,7 +76,7 @@ run_view() {
   local dir="$1"; shift
   env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
-    HERD_FAKE_LOG="$HERDLOG" GH_FAKE_LOG="$GHLOG" "$@" \
+    HERD_FAKE_LOG="$HERDLOG" GH_FAKE_LOG="$GHLOG" BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null
 }
 
@@ -86,7 +86,7 @@ run_view_file() {
   local dir="$1" out="$2"; shift 2
   env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
-    HERD_FAKE_LOG="$HERDLOG" GH_FAKE_LOG="$GHLOG" "$@" \
+    HERD_FAKE_LOG="$HERDLOG" GH_FAKE_LOG="$GHLOG" BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" </dev/null >"$out" 2>/dev/null & local vpid=$!
   sleep 1; kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
 }
