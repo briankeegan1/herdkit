@@ -115,7 +115,12 @@ incoming_block() {
 # margin — the exact visual break of the loved file-backend view. Overlong
 # titles are split at a word boundary: the head stays bold, the spill joins the body text (fixes
 # paragraph-length tracker titles rendering entirely bold). A description that merely repeats the
-# title (the scribe files title = first line of the full text) is de-duplicated. PURE markdown
+# title (the scribe files title = first line of the full text) is de-duplicated. Emphasis markers
+# are kept SANE so glow never leaks a literal '**': the bolded head has any internal ** stripped
+# (the template already bolds it), and the body's inline **bold** is balanced — an upstream desc cap
+# (linear.sh truncates at 280), our BODY_MAX cut, or the title-spill join can split a **…** span and
+# orphan one marker, which glow renders as a stray literal '**' (the backend-mode render bug,
+# follow-on to #152/#153). PURE markdown
 # shaping — glow + the theme style do ALL the coloring, no ANSI hand-coding.
 rich_to_md() {
   printf '%s\n' "$1" | python3 -c '
@@ -124,6 +129,23 @@ import sys
 TITLE_MAX, BODY_MAX = 110, 300
 GROUP = {"started": "🚧 in progress", "unstarted": "🔜 queued", "backlog": "🔜 queued", "triage": "❓ triage"}
 ORDER = ["🚧 in progress", "🔜 queued", "❓ triage"]
+
+def strip_bold(s):
+    # HEAD text is wholly emphasized by the item template (**%s**). Any ** already inside it would
+    # nest/break that span (glow then leaks a literal **), so drop internal markers outright — the
+    # template supplies the bold.
+    return s.replace("**", "")
+
+def balance_bold(s):
+    # BODY text keeps its own inline **bold** (rendered as a plain paragraph, not template-bolded),
+    # but a **…** span can be split by an upstream desc cap (linear.sh truncates at 280), our own
+    # BODY_MAX cut, or the title-spill join — orphaning one marker. glow then renders that lone ** as
+    # literal text (often stranded on its own wrapped line: the backend-mode render bug). Drop only
+    # the unmatched marker so legitimate, balanced bold still renders while no orphan reaches glow.
+    while s.count("**") % 2:
+        i = s.rfind("**")
+        s = s[:i] + s[i + 2:]
+    return s
 
 groups = {}
 for ln in sys.stdin.read().splitlines():
@@ -156,6 +178,8 @@ for g in ORDER:
             body = (spill + " " + body).strip() if body else spill
         if len(body) > BODY_MAX:
             body = body[:BODY_MAX - 1].rstrip() + "…"
+        head = strip_bold(head)          # head is bolded by the template — no internal ** allowed
+        body = balance_bold(body)        # keep balanced bold, drop any wrap/cut-orphaned marker
         state = " _(%s)_" % sname if (stype == "started" and sname) else ""
         out.append("- `%s` **%s**%s\n" % (ident, head, state))
         if body:
