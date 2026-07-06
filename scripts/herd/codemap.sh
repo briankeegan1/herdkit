@@ -147,12 +147,14 @@ _cm_render() {
   # 2. Who sources whom (edges to real engine scripts only; sorted by sourcer then target).
   printf '\n## Who sources whom\n\n'
   printf 'Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).\n\n'
-  declare -A _isscript
-  for f in scripts/herd/*.sh; do _isscript["${f##*/}"]=1; done
+  # Set of engine-script basenames as a space-delimited string (bash 3.2 has no associative arrays;
+  # basenames never contain spaces, so a padded ' name ' glob is an exact membership test).
+  local _isscript=" "
+  for f in scripts/herd/*.sh; do _isscript="$_isscript${f##*/} "; done
   cur=""; targets=""
   while IFS=$'\t' read -r path tgt; do
     [ -n "$path" ] || continue
-    [ -n "${_isscript[$tgt]:-}" ] || continue
+    case "$_isscript" in *" $tgt "*) ;; *) continue ;; esac
     if [ "$path" != "$cur" ]; then
       if [ -n "$cur" ] && [ -n "$targets" ]; then
         case "$cur" in bin/herd) lbl="bin/herd" ;; *) lbl="${cur##*/}" ;; esac
@@ -178,17 +180,21 @@ _cm_render() {
       case "$f" in scripts/herd/herd-config.sh) continue ;; esac
       scan+=("$f")
     done
-    declare -A _cons
-    while IFS=$'\t' read -r key path; do
-      [ -n "$key" ] || continue
-      case "$path" in bin/herd) lbl="bin/herd" ;; *) lbl="${path##*/}" ;; esac
-      _cons["$key"]="${_cons[$key]:+${_cons[$key]}, }\`$lbl\`"
-    done < <(_cm_config_pairs "$caps" "${scan[@]}" | sort)
-    # Emit every config key in sorted order (a key with no consumer shows an em-dash).
-    while IFS= read -r key; do
-      [ -n "$key" ] || continue
-      printf -- '- `%s` → %s\n' "$key" "${_cons[$key]:-—}"
-    done < <(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u)
+    # Accumulate consumers per key AND emit every manifest config key (sorted; a key with no
+    # consumer shows an em-dash) in ONE awk over two inputs — awk arrays are always associative and
+    # portable, so this replaces the bash-4-only `declare -A` map with no output change. Input 1 is
+    # the full sorted config-key list (never empty when caps has config rows, so the NR==FNR split is
+    # unambiguous); input 2 is the sorted key<TAB>path consumer pairs, appended in sorted order.
+    awk -F'\t' '
+      NR==FNR { keys[++n]=$1; next }                     # input 1: manifest config keys, sorted
+      {                                                   # input 2: key<TAB>path consumer pairs
+        if ($1=="") next
+        if ($2=="bin/herd") lbl="bin/herd"; else { lbl=$2; sub(/.*\//,"",lbl) }
+        cons[$1] = (cons[$1]=="" ? "" : cons[$1] ", ") "`" lbl "`"
+      }
+      END { for (i=1;i<=n;i++) print "- `" keys[i] "` \342\206\222 " (cons[keys[i]]=="" ? "\342\200\224" : cons[keys[i]]) }
+    ' <(awk -F'\t' '$2=="config" && $1!="name" && $1!="" {print $1}' "$caps" | sort -u) \
+      <(_cm_config_pairs "$caps" "${scan[@]}" | sort)
   fi
 }
 
