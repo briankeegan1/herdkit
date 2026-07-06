@@ -686,6 +686,43 @@ PY
   return 0
 }
 
+# ── Builder context-provisioning surface (HERD-40) ───────────────────────────────────────────────
+# herd_context_provision_preamble — emit the grounding block injected into the STABLE region of a
+# builder's task-spec preamble, so spawned builders start GROUNDED instead of re-exploring the repo
+# every session. Driven by the CONTEXT_PROVISION config key: a SPACE-SEPARATED list of grounding
+# sources to inject. Empty/unset (the DEFAULT) → this prints NOTHING and the task spec stays
+# byte-identical to today (zero behavior change).
+#
+# Contract the lanes rely on (herd-quick.sh / herd-feature.sh):
+#   • The output is a run of ' '-prefixed sentences the lane appends to the STABLE workflow-rules
+#     preamble — NEVER interleaved with the per-task text, so the prompt-cache prefix that many
+#     close-in-time spawns share stays intact. The block is project-config-constant (same for every
+#     spawn of a project), so it lives entirely inside the cached region.
+#   • It is placed BEFORE the per-item-unique trailer ($REFS_RULE) so the shared cache prefix stays
+#     maximal — same cache-aware discipline as the SPEC ordering in the lanes.
+#
+# EXTENSIBLE by design: each token maps to ONE case below that appends its pointer, so future
+# grounding sources (project context notes, MCP tool hints) plug in as new cases without reworking the
+# lanes. An UNKNOWN token is IGNORED (forward-compatible: an operator whose engine predates a source
+# they configured just gets no injection for it, never an error).
+#
+# FIRST supported source — 'codemap': the deterministic engine-tree map produced by `herd codemap`
+# (scripts/herd/codemap.sh) and committed at docs/codemap.md. The pointer tells the builder to read it
+# FIRST to orient (module roles, source edges, config-key → consumer wiring) instead of re-scanning.
+herd_context_provision_preamble() {
+  local _cp="${CONTEXT_PROVISION:-}"
+  [ -n "$_cp" ] || return 0     # off (default) → emit nothing; task specs are byte-identical to today
+  local _out="" _src
+  for _src in $_cp; do
+    case "$_src" in
+      codemap)
+        _out="$_out A deterministic map of this repo's engine tree is committed at docs/codemap.md (module roles, who-sources-whom, and config-key→consumer wiring; regenerate with 'herd codemap'). READ IT FIRST to orient — it lets you skip re-exploring the tree." ;;
+      *) : ;;   # unknown grounding source — ignore (forward-compatible)
+    esac
+  done
+  printf '%s' "$_out"
+}
+
 # herd_write_task_spec <spec_file> <spec_content> — externalize a builder's full task spec.
 #
 # Writes <spec_content> (the caller task + the workflow-rules footer) to <spec_file> and, on
