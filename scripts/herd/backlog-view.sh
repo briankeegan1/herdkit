@@ -361,9 +361,11 @@ run_backend_mode() {
       break
     fi
     # Wait out the poll interval — but let the user force an instant refresh with r/R (HERD-48). On
-    # refresh, clear last_hash so the NEXT poll re-fetches and repaints even when the backend list is
-    # byte-for-byte unchanged (the fresh refreshed-HH:MM stamp changes the frame key → a repaint).
-    poll_wait "$poll" || last_hash=""
+    # refresh clear last_hash (so the NEXT poll treats the re-fetch as new → refreshes last_good and the
+    # HH:MM stamp) AND bust last_frame (so the repaint actually happens): the frame key is content-hash
+    # + HH:MM + incoming, so unchanged content polled twice inside the same minute is otherwise latched
+    # as an identical frame and would NOT repaint. Busting last_frame guarantees the requested repaint.
+    poll_wait "$poll" || { last_hash=""; last_frame=""; }
   done
 }
 

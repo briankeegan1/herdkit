@@ -67,6 +67,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backlog-view manual-refresh key (HERD-48) test passes" {
+  run bash "$REPO/tests/test-backlog-view-refresh-key.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]
