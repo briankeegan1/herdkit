@@ -1100,6 +1100,27 @@ cmd_backlog() {
   # the github backend runs `gh issue list`, the linear backend queries Linear; every backend
   # emits the same "#<id> <title>" line shape via _backend_list_open, so a non-file-backend
   # project surfaces its issue tracker as actionable work rather than a tracked file.
+  #
+  # Modes (default output is byte-identical to before — the plain list IS the contract):
+  #   herd backlog              plain "#<id> <title>" lines (_backend_list_open)
+  #   herd backlog --rich       TSV lines with workflow state + description snippet when the
+  #                             backend defines _backend_list_open_rich (linear); backends
+  #                             without the op fall back to the plain list, so a consumer can
+  #                             always ask for --rich and key its rendering off the line shape
+  #   herd backlog show <#id>   one item's full detail (_backend_show_item) — state, title,
+  #                             untruncated description, URL
+  #   herd backlog browse       interactive fzf picker over the open list with a live detail
+  #                             preview pane; ENTER prints the selection's full detail. Without
+  #                             fzf it degrades soft: plain list + a one-line install hint
+  local mode="plain" ref=""
+  case "${1:-}" in
+    --rich) mode="rich" ;;
+    show)   mode="show"; ref="${2:-}"
+            [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
+    browse) mode="browse" ;;
+    '')     ;;
+    *)      die "usage: herd backlog [--rich | show <#id> | browse]" ;;
+  esac
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
@@ -1123,7 +1144,45 @@ cmd_backlog() {
   # Run the op from the project root: the file backend greps $BACKLOG_FILE (repo-relative); the
   # tracker backends ignore cwd. A backend with a missing dep (no gh / no key) fails loud + non-zero.
   cd "$PROJECT_ROOT" 2>/dev/null || true
-  _backend_list_open
+  case "$mode" in
+    plain)
+      _backend_list_open ;;
+    rich)
+      # Rich is opt-in per backend; a backend without the op serves the plain list so the caller
+      # (backlog-view.sh) can always request --rich and detect the shape from the output itself.
+      if command -v _backend_list_open_rich >/dev/null 2>&1; then
+        _backend_list_open_rich
+      else
+        _backend_list_open
+      fi ;;
+    show)
+      if command -v _backend_show_item >/dev/null 2>&1; then
+        _backend_show_item "$ref"
+      else
+        # No detail op (file/github today): grep the plain list for the id so `show` still answers.
+        _backend_list_open | grep -F -- "${ref#\#}" \
+          || { echo "no open item matching '$ref' (backend '$SCRIBE_BACKEND' has no detail op)" >&2; return 1; }
+      fi ;;
+    browse)
+      local list self sel
+      list="$(_backend_list_open)" || true
+      if [ -z "$list" ]; then echo "(no open items)"; return 0; fi
+      if command -v fzf >/dev/null 2>&1; then
+        # {1} is the '#<id>' token of the highlighted line; the preview pane runs `backlog show`
+        # on it live. Invoke ourselves via an absolute path — fzf's preview shell has no
+        # guarantee this herd is first on PATH (or on PATH at all).
+        self="$HERDKIT_HOME/bin/herd"
+        sel="$(printf '%s\n' "$list" | fzf --no-sort \
+                 --prompt='backlog> ' \
+                 --header='enter: print full detail · esc: quit' \
+                 --preview="$self backlog show {1}" \
+                 --preview-window=right,60%,wrap)" || return 0
+        [ -n "$sel" ] && cmd_backlog show "${sel%% *}"
+      else
+        printf '%s\n' "$list"
+        echo "herd backlog browse: fzf not found — showing the plain list (brew install fzf / apt install fzf for interactive browsing)" >&2
+      fi ;;
+  esac
 }
 
 # ── herd link: registry of peer repos for cross-project filing ──────────────────────────────────
@@ -3173,6 +3232,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       total (the default view stays merge-gated + unchanged).
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
   herd backlog                        list open work items via the active backend
+              [--rich]                TSV with workflow state + description (backends that
+                                      support it; others fall back to the plain list)
+              [show <#id>]            one item's full detail (state, description, URL)
+              [browse]                interactive fzf picker with a live detail preview
+                                      (soft-degrades to the plain list without fzf)
   herd report [--to <link>] [--dep]   file a report on HERD_REPO (or a peer from .herd/links
               "<sym>"                 via --to) using HERD_REPORT_BACKEND (default: github);
                                       deduplicates first (HERD_REPORT_FORCE=1 to override).

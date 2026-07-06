@@ -68,6 +68,33 @@ echo "$out2" | grep -q "🔜 add a dark-mode toggle"   || fail "file backlog mis
 echo "$out2" | grep -q "already done"                && fail "file backlog should not list ✅ shipped items"
 pass
 
+# ── Case 2b: --rich on a backend with no rich op (file) → falls back to the plain list ──────────
+out2b="$( cd "$P2" && bash "$HERD" backlog --rich )" || fail "herd backlog --rich (file) exited non-zero"
+[ "$out2b" = "$out2" ] || fail "--rich on the file backend must serve the plain list unchanged ($out2b)"
+pass
+
+# ── Case 2c: show on a backend with no detail op (file) → greps the plain list for the ref ──────
+out2c="$( cd "$P2" && bash "$HERD" backlog show "dark-mode" )" || fail "herd backlog show (file) exited non-zero"
+echo "$out2c" | grep -q "add a dark-mode toggle" || fail "show fallback did not surface the matching open line ($out2c)"
+if ( cd "$P2" && bash "$HERD" backlog show "no-such-item" ) >/dev/null 2>&1; then
+  fail "show with no matching item should exit non-zero"
+fi
+pass
+
+# ── Case 2d: browse without fzf → soft fallback: plain list on stdout + install hint on stderr ──
+# PATH is restricted so fzf can never be found even on a dev machine that has it installed.
+out2d="$( cd "$P2" && env PATH="/usr/bin:/bin:/usr/sbin:/sbin" bash "$HERD" backlog browse 2>"$T/browse.err" )" \
+  || fail "herd backlog browse (no fzf) exited non-zero"
+echo "$out2d" | grep -q "🔜 add a dark-mode toggle" || fail "browse fallback did not print the plain list ($out2d)"
+grep -q "fzf not found" "$T/browse.err" || fail "browse fallback missing the fzf install hint on stderr"
+pass
+
+# ── Case 2e: unknown flag → loud usage error, non-zero ──────────────────────────────────────────
+if ( cd "$P2" && bash "$HERD" backlog --bogus ) >/dev/null 2>&1; then
+  fail "herd backlog --bogus should fail loudly with usage"
+fi
+pass
+
 # ── Case 3: missing config → loud error, non-zero ────────────────────────────────────────────────
 if ( cd "$T" && bash "$HERD" backlog ) >/dev/null 2>&1; then
   fail "herd backlog should fail loudly with no .herd/config"
