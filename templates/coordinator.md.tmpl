@@ -236,10 +236,38 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 - **Browse:** summarize the open work (`herd backlog` for the live, backend-agnostic set;
   `{{BACKLOG_FILE}}` for the file backend's full grouped history). For *real* status (is a 🔜
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
-- **Add:** enqueue it — the scribe does the research + writes the grounded entry:
+- **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
+  writes the grounded entry:
   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
   Keep/Cut/Defer plan, get approval, THEN enqueue: `bash {{SCRIPTS_DIR}}/scribe.sh "Apply this approved curation: <the full plan>"`.
+
+### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
+
+A backlog item is a task spec in waiting: whatever you leave out here, a builder has to guess at spawn
+time. Before you hand an Add to the scribe, walk these six — the first that fails sends you back to the
+repo/journal, not to the scribe:
+
+1. **GROUNDED.** The gap is real — verified against **live code / the journal**, not memory. Cite the
+   dated evidence (a file+line, a `herd why <pr>` line, a journal event) so a stale or already-shipped
+   idea never gets filed. If you can't point at the gap, research it first (research lane) — don't file.
+2. **SHAPE.** A short **title line** (< 80 chars) FIRST, then the body — the tracker takes line 1 as the
+   title. Never open with a run-on paragraph (that files a giant duplicated title).
+3. **FIX + SURFACE.** The body names a **fix sketch AND its file surface** — the exact scripts/functions
+   the change lands in. "Fix the watcher race" is not a spec; "guard the sha-cache write in
+   `agent-watch.sh` gate loop" is.
+4. **SEQUENCING.** Call out **explicit conflicts with in-flight / queued items** — same file surface,
+   dependent order, or a rename that would dangle it. Cross it against `git worktree list` + the open
+   queue (and the pre-spawn graphify read) so it isn't filed into a collision.
+5. **VERIFICATION PLAN.** Decide up front **how the change will be proven**, and write it into the item
+   so it flows into the builder task spec at spawn. If it touches a **gate / merge / concurrency /
+   limit-park / pane** seam, name the exact **sandbox sim scenario + the seam** it exercises (see
+   *Verify GATE / MERGE …* above) — a green scorecard is the proof. Otherwise name the **test surface**
+   (which `tests/*.sh` or unit covers it). An item with no verification plan ships the builder blind.
+6. **CONVENTIONS.** Bake in the engine defaults: **fail-soft** (a missing optional tool skips silently,
+   never a red row), **ship-dormant / default-off** (new behavior rides behind a config key, off by
+   default), and **byte-identical-when-off** (with the flag off the rendered/observed output is
+   unchanged). Say which apply so the builder doesn't have to infer them.
 
 Keep every backlog edit **privacy-safe** — nothing under `{{DENY_PATHS}}` and no secrets ever
 reach `{{BACKLOG_FILE}}` (it's committed).
