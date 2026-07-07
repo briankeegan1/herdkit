@@ -171,11 +171,11 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → —
 - `WATCHER_AUTOMERGE` → `bin/herd`, `agent-watch.sh`
-- `WATCHER_OWNER` → `agent-watch.sh`, `herd-claim.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
-- `WATCHER_VIEW_AUTHOR` → `agent-watch.sh`, `herd-claim.sh`
+- `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `WATCHER_VIEW_DEPS_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
