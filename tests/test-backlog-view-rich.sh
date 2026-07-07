@@ -32,6 +32,17 @@ pass(){ PASS=$((PASS+1)); }
 BIN="$T/bin"; mkdir -p "$BIN"
 LOG="$T/herd.log"
 
+# ── Portability shims (HERD-53) ───────────────────────────────────────────────────────────────────
+# env -i below is deliberately hermetic, but on Git Bash that bites twice: python3 lives under AppData
+# (off the fixed PATH) so backlog-view.sh's bare `python3` (rich_to_md) can't resolve, and env -i
+# strips LANG/LC_* so the emoji grep assertions run byte-blind. Resolve the real python3 once (pre
+# env -i, like scripts/herd/healthcheck.sh) and shim it into $BIN, and pin a UTF-8 locale (fallback C)
+# in every env -i. Both are no-ops on Linux — python3 already sits on the fixed PATH and the shimmed
+# output is byte-identical.
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] && { printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$PY" > "$BIN/python3"; chmod +x "$BIN/python3"; }
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
 # FAKE `herd` — logs every call. `backlog --rich` prints $HERD_FAKE_RICH_OUT (exit 1 when
 # HERD_FAKE_RICH_REJECT=1, emulating an older CLI that doesn't know the flag); plain `backlog`
 # prints $HERD_FAKE_OUT.
@@ -70,7 +81,7 @@ EOF
 
 run_view() {
   local dir="$1"; shift
-  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+  env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
     HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null
@@ -125,6 +136,26 @@ out3="$(run_view "$P3" HERD_FAKE_RICH_REJECT=1 HERD_FAKE_OUT='#OLD-1 legacy item
 grep -q "herd backlog --rich" "$LOG" || fail "old-CLI case: rich attempt missing from the call log"
 grep -q "^herd backlog$" "$LOG"      || fail "old-CLI case: plain retry missing from the call log"
 grep -q -- '- `#OLD-1` \*\*legacy item\*\*' <<<"$out3" || fail "old-CLI case did not render the plain list ($out3)"
+pass
+
+# ── Case 4: assignee rendering ─────────────────────────────────────────────────────────────────────
+# started item with assignee  → '_(In Progress · Chase)_' state suffix
+# unstarted item with assignee → '@Name' between the chip and the bold title
+# unassigned item             → no @-name anywhere on that item's line
+P4="$T/proj-assignee"; make_project "$P4"
+RICH4="#HERD-1${TAB}started${TAB}In Progress${TAB}Do the thing${TAB}Body text${TAB}Chase
+#HERD-2${TAB}unstarted${TAB}Todo${TAB}Other task${TAB}${TAB}Jordan
+#HERD-3${TAB}unstarted${TAB}Todo${TAB}Free task${TAB}${TAB}"
+: > "$LOG"
+out4="$(run_view "$P4" HERD_FAKE_RICH_OUT="$RICH4")"
+grep -q -- '- `#HERD-1` \*\*Do the thing\*\* _(In Progress · Chase)_' <<<"$out4" \
+  || fail "started item with assignee must render '_(In Progress · Chase)_' ($out4)"
+grep -q -- '- `#HERD-2` @Jordan \*\*Other task\*\*' <<<"$out4" \
+  || fail "unstarted item with assignee must render '@Name' between chip and bold title ($out4)"
+grep -q -- '- `#HERD-3` \*\*Free task\*\*' <<<"$out4" \
+  || fail "unassigned unstarted item must have no @-name ($out4)"
+! grep -q '@' <<<"$(grep '#HERD-3' <<<"$out4")" \
+  || fail "unassigned item must not emit any @-name on its line"
 pass
 
 echo "ALL PASS ($PASS checks)"

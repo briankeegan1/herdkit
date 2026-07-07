@@ -40,6 +40,15 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # app preview, and never under the headless driver (no panes → clean no-op).
 # TASK_PANE_VIEW="on"                 # on (default) | off
 
+# DOCTOR_STARTUP_HINT — PROACTIVE soft-dependency surfacing on control-room startup (herd reload /
+# coordinator launch). Default "off": startup prints nothing extra, byte-identical to today. Set "on"
+# and startup emits one DIM line per MISSING soft dep (glow -> raw backlog pane, shellcheck -> no lint,
+# bats -> direct test run), each naming what it degrades, then a dim pointer to `herd doctor` for the
+# install command. Never red, never blocks (soft deps only degrade; the no-false-red rule). So you
+# learn what's missing at startup instead of when the degradation bites. Takes effect on the next
+# herd reload / coordinator launch.
+# DOCTOR_STARTUP_HINT="off"           # off (default) | on
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color

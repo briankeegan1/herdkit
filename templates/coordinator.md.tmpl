@@ -274,6 +274,28 @@ the prior approval — the gate cycle re-runs and a fresh approval is required. 
 `ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
 yet approved.
 
+## Troubleshooting: setup problems or a wrong-rendering pane → `herd doctor` FIRST
+
+When something in the control room looks wrong at the environment level — a command misbehaves on a
+fresh or Windows machine, or a pane renders wrong (e.g. the backlog pane shows raw markdown / literal
+`**` and backticks instead of the pretty view) — **run `herd doctor` before anything else.** It is a
+one-pass dependency check that reports every problem at once with per-platform install hints:
+
+    herd doctor
+
+Read its output by tier:
+
+- **Hard deps block.** A missing/broken REQUIRED dep (git, gh + auth, claude, python3, herdr) is a
+  ✗ — `herd init` and the lanes cannot proceed until you install/fix it. Follow the printed `fix:` hint.
+- **Soft deps each degrade ONE named feature** (a ⚠, never a block) — install the tool to restore it:
+  - `glow` missing → the backlog pane renders **raw markdown** instead of the pretty view.
+  - `shellcheck` missing → the healthcheck **skips shell lint** (`bash -n` still runs).
+  - `bats` missing → the healthcheck runs the `*.sh` **test suite directly** instead of via bats.
+
+A degraded pane is almost always a missing soft dep, not a code bug — `herd doctor` names which one and
+how to install it. (Opt-in: set `DOCTOR_STARTUP_HINT=on` to have startup surface missing soft deps for
+you on every `herd reload` / coordinator launch.)
+
 ## Routing: APP bug vs HERD-ENGINE bug (read every time)
 
 Every reported problem routes to ONE of two places:

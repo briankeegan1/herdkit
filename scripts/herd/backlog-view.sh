@@ -225,12 +225,13 @@ for ln in sys.stdin.read().splitlines():
     if not ln.strip():
         continue
     p = ln.split("\t")
-    ident = p[0]
-    stype = p[1] if len(p) > 1 else ""
-    sname = p[2] if len(p) > 2 else ""
-    title = p[3] if len(p) > 3 else ""
-    desc  = p[4] if len(p) > 4 else ""
-    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc))
+    ident    = p[0]
+    stype    = p[1] if len(p) > 1 else ""
+    sname    = p[2] if len(p) > 2 else ""
+    title    = p[3] if len(p) > 3 else ""
+    desc     = p[4] if len(p) > 4 else ""
+    assignee = p[5].strip() if len(p) > 5 else ""
+    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc, assignee))
 
 out = []
 for g in ORDER:
@@ -238,7 +239,7 @@ for g in ORDER:
     if not items:
         continue
     out.append("## %s (%d)\n" % (g, len(items)))
-    for ident, stype, sname, title, desc in items:
+    for ident, stype, sname, title, desc, assignee in items:
         body = desc
         if title and body.startswith(title):
             body = body[len(title):].lstrip(" .·—-")
@@ -253,8 +254,14 @@ for g in ORDER:
             body = body[:BODY_MAX - 1].rstrip() + "…"
         head = strip_bold(head)          # head is bolded by the template — no internal ** allowed
         body = balance_bold(body)        # keep balanced bold, drop any wrap/cut-orphaned marker
-        state = " _(%s)_" % sname if (stype == "started" and sname) else ""
-        out.append("- `%s` **%s**%s\n" % (ident, head, state))
+        if stype == "started" and sname:
+            state = " _(%s · %s)_" % (sname, assignee) if assignee else " _(%s)_" % sname
+        else:
+            state = ""
+        prefix = "`%s`" % ident
+        if assignee and stype != "started":
+            prefix += " @%s" % assignee
+        out.append("- %s **%s**%s\n" % (prefix, head, state))
         if body:
             out.append("%s\n" % body)
 out.append("")
@@ -338,6 +345,11 @@ render_backend_frame() {
     else
       # No glow: print the raw list, taming rich TSV's tabs into readable spacing.
       printf '%s\n' "$list" | tr '\t' ' ' || rc=$?
+      # SELF-DIAGNOSING degraded render (HERD-45): glow is what paints the pretty pane; without it
+      # the frame above is raw markdown. Point the user straight at the fix at the exact moment they
+      # hit the degradation — one dim informational line, never red (no-false-red rule). Mirrors the
+      # fzf self-hint in `herd backlog browse`; does not touch $rc (a bad hint must never fail render).
+      printf '\033[2mglow not found — showing raw markdown; run herd doctor for the install command\033[0m\n'
     fi
   else
     printf '\033[2m(no open items yet)\033[0m\n'

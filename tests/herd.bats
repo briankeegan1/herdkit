@@ -55,6 +55,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic generalized start-agent seam (driver launch-agent) test passes" {
+  run bash "$REPO/tests/test-driver-launch-agent.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic backlog-archive rotation test passes" {
   run bash "$REPO/tests/test-backlog-archive.sh"
   [ "$status" -eq 0 ]
@@ -83,6 +89,12 @@ setup() {
   run bash "$REPO/tests/test-plugin-manifest.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS"* ]]
+}
+
+@test "hermetic tab-leak-guard engine-whitelist test passes" {
+  run bash "$REPO/tests/test-tab-leak-whitelist.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
 }
 
 @test "herd render produces no leftover template tokens for this repo" {

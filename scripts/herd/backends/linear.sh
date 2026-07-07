@@ -320,7 +320,7 @@ _backend_list_open_rich() {
     if [ -n "${LINEAR_TEAM_ID:-}" ]; then
         query='query L($team: ID!) {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
-    nodes { identifier title description state { name type } }
+    nodes { identifier title description state { name type } assignee { displayName } }
   }
 }'
         vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
@@ -328,7 +328,7 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
     else
         query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
-    nodes { identifier title description state { name type } }
+    nodes { identifier title description state { name type } assignee { displayName } }
   }
 }'
         vars=""
@@ -349,8 +349,9 @@ for _, _, n, st in rows:
     desc = flat(n.get("description"))
     if len(desc) > 280:
         desc = desc[:279].rstrip() + "…"
-    print("#%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
-                                   flat(st.get("name")), flat(n.get("title")), desc))' 2>/dev/null || true
+    assignee = flat((n.get("assignee") or {}).get("displayName") or "")
+    print("#%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
+                                        flat(st.get("name")), flat(n.get("title")), desc, assignee))' 2>/dev/null || true
 }
 
 _backend_show_item() {
@@ -362,7 +363,7 @@ _backend_show_item() {
     # doesn't parse or the issue can't be found (callers print their own soft fallback).
     local ref="$1" resp
     _linear_require_key
-    if ! _linear_issue_query "$ref" 'identifier title description url updatedAt state { name type }'; then
+    if ! _linear_issue_query "$ref" 'identifier title description url updatedAt state { name type } assignee { displayName }'; then
         echo "linear backend: '$ref' is not a TEAMKEY-NUMBER identifier" >&2
         return 1
     fi
@@ -375,7 +376,11 @@ if not nodes:
     sys.exit(1)
 n = nodes[0]
 st = n.get("state") or {}
-print("#%s · %s (%s)" % (n.get("identifier", ""), st.get("name") or "?", st.get("type") or "?"))
+aname = ((n.get("assignee") or {}).get("displayName") or "").strip()
+header = "#%s · %s (%s)" % (n.get("identifier", ""), st.get("name") or "?", st.get("type") or "?")
+if aname:
+    header += " · " + aname
+print(header)
 print()
 print(n.get("title") or "(untitled)")
 desc = (n.get("description") or "").strip()

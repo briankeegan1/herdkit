@@ -32,6 +32,18 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS+1)); }
 
 BIN="$T/bin"; mkdir -p "$BIN"
+
+# ── Portability shims (HERD-53) ───────────────────────────────────────────────────────────────────
+# env -i below is deliberately hermetic, but on Git Bash that bites twice: python3 lives under AppData
+# (off the fixed PATH) so backlog-view.sh's bare `python3` (rich_to_md) can't resolve, and env -i
+# strips LANG/LC_* so the emoji grep assertions run byte-blind. Resolve the real python3 once (pre
+# env -i, like scripts/herd/healthcheck.sh) and shim it into $BIN, and pin a UTF-8 locale (fallback C)
+# in every env -i (see COMMON_ENV). Both are no-ops on Linux — python3 already sits on the fixed PATH
+# and the shimmed output is byte-identical.
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] && { printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$PY" > "$BIN/python3"; chmod +x "$BIN/python3"; }
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
 # Stub `herd backlog` — emits a fixed two-item open list. The titles carry NO backticks or asterisks
 # of their own, so any '`' or '**' in the rendered frame can ONLY be an un-rendered shaping marker.
 cat > "$BIN/herd" <<'FAKE'
@@ -66,7 +78,7 @@ assert_glamour() {
 # Shared env for one capped poll. glow's dir is on PATH so the styled branch runs (without it the
 # viewer would fall back to plain `cat` and vacuously pass). HERD_ALLOW_FOREIGN_CWD bypasses the
 # console cwd-guard; TERM lets `clear` work.
-COMMON_ENV=(HOME="$HOME" PATH="$BIN:$GLOW_DIR:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm-256color
+COMMON_ENV=(LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:$GLOW_DIR:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm-256color
             HERD_CONFIG_FILE="$P/.herd/config" HERD_ALLOW_FOREIGN_CWD=1
             BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0)
 

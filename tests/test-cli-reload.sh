@@ -27,6 +27,11 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0
 ok(){ pass=$((pass+1)); }
 
+# Portability (HERD-53): the one env -i below strips LANG/LC_*; pin a UTF-8 locale (fallback C) so the
+# harness stays byte-consistent with the rest of the suite on Git Bash. Byte-identical on Linux. (That
+# env -i exercises the herdr-absent bail, which returns before any python3 subcall, so no shim needed.)
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
 # ── Stub pgrep and herdr on PATH ─────────────────────────────────────────────
 # pgrep stub: echoes each colon-separated PID in $FAKE_STRAY_PIDS.  All other args
 # (e.g. -f "agent-watch.sh") are ignored so the real process table is never consulted.
@@ -903,7 +908,7 @@ for d in /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin; do
 done
 rm -f "$NOHERDR/pgrep"; cp "$BIN/pgrep" "$NOHERDR/pgrep"; chmod +x "$NOHERDR/pgrep"
 P="$T/p34"; mkdir "$P"; _make_project "$P" "reloadtest"
-out="$( cd "$P" && env -i PATH="$NOHERDR" HOME="$HOME" HERD_RELOAD_SKIP_LAUNCH=fallback \
+out="$( cd "$P" && env -i LC_ALL="$UTF8_LOCALE" PATH="$NOHERDR" HOME="$HOME" HERD_RELOAD_SKIP_LAUNCH=fallback \
     bash "$HERD" reload 2>&1 )" || fail "reload failed (herdr-absent path)"
 printf '%s' "$out" | grep -qi "herdr not found" || fail "herdr-absent: distinct 'herdr not found' message missing"
 printf '%s' "$out" | grep -q "no herdr workspace labelled" && fail "herdr-absent wrongly reported as a no-match" || true
