@@ -348,6 +348,30 @@ the prior approval — the gate cycle re-runs and a fresh approval is required. 
 `ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
 yet approved.
 
+## Verify GATE / MERGE / CONCURRENCY / LIMIT-PARK / PANE behavior → reproduce in the sim FIRST
+
+When you are investigating or verifying **gate / merge / concurrency / limit-park / pane** behavior —
+or before you **trust an engine change** that touches any of those seams — reproduce it in the matching
+**sandbox sim scenario FIRST**, never against the live watcher. The sims run at **zero quota** (stub
+builders, no model call) and reset to a **byte-identical** fixture, so every run is deterministic; the
+concurrency / limit / pane scenarios drive the **shipped** watcher code in lib mode, so a green
+scorecard is real signal — they break if that code regresses:
+
+```
+bash {{SCRIPTS_DIR}}/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
+bash {{SCRIPTS_DIR}}/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
+bash {{SCRIPTS_DIR}}/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
+bash {{SCRIPTS_DIR}}/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
+SANDBOX_FORCE_GATE_FAIL=1 bash {{SCRIPTS_DIR}}/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
+```
+
+Each writes a machine-readable `scorecard.json` (`result: pass` iff `failed == 0`) — read it, don't
+eyeball the console. `{{SCRIPTS_DIR}}/sim/README-sandbox-sim.md` catalogs the full tier table and each
+scenario's invariants. **Thread this into the builder task spec whenever you spawn a watcher-touching
+item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
+tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
+before opening the PR, so the engine change is proven against the real gate loop, not just unit tests.
+
 ## Troubleshooting: setup problems or a wrong-rendering pane → `herd doctor` FIRST
 
 When something in the control room looks wrong at the environment level — a command misbehaves on a
