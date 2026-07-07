@@ -1057,8 +1057,8 @@ cmd_config() {
     set)          cmd_config_set "$@" ;;
     sync)         cmd_config_sync "$@" ;;
     lint)         _config_lint "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
   esac
 }
 
@@ -1144,12 +1144,30 @@ cmd_config_get() {
 }
 
 cmd_config_set() {
-  # HERD-47: an optional leading `--local` forces the write into the per-user overlay .herd/config.local
-  # instead of the committed baseline .herd/config. Parsed before the positional KEY/VALUE.
-  local force_local=0
-  if [ "${1:-}" = "--local" ]; then force_local=1; shift; fi
+  # Optional leading flags, parsed before the positional KEY/VALUE:
+  #   --local  (HERD-47) force the write into the per-user overlay .herd/config.local (gitignored),
+  #            never the committed baseline.
+  #   --shared (HERD-62) apply a PROJECT-scoped change to the committed baseline .herd/config AND
+  #            open a tiny single-file PR (branch config/<key>) proposing it to every operator, so a
+  #            coordinator who cannot push to the default branch still propagates policy the normal
+  #            gated way. Refused for machine-scoped keys (they must never be committed) and mutually
+  #            exclusive with --local.
+  #   --reason <why>  free-text rationale carried into the --shared PR body (ignored otherwise).
+  local force_local=0 force_shared=0 reason=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --local)  force_local=1; shift ;;
+      --shared) force_shared=1; shift ;;
+      --reason) reason="${2:-}"; shift; [ "$#" -gt 0 ] && shift || true ;;
+      --)       shift; break ;;
+      -?*)      die "unknown flag '$1' — usage: herd config set [--local|--shared] [--reason <why>] <KEY> <VALUE>" ;;
+      *)        break ;;
+    esac
+  done
+  { [ "$force_local" -eq 1 ] && [ "$force_shared" -eq 1 ]; } \
+    && die "--local and --shared are mutually exclusive: --local keeps a per-user override OUT of git; --shared proposes a committed baseline change to every operator"
   local key="${1:-}" val="${2:-}"
-  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set [--local] <KEY> <VALUE>"
+  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set [--local|--shared] [--reason <why>] <KEY> <VALUE>"
   local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
@@ -1186,7 +1204,13 @@ cmd_config_set() {
   #     created on demand (with its documenting header) only when it is actually the target.
   local scope target target_label
   scope="$(_config_key_scope "$caps" "$key")"
-  if [ "$force_local" -eq 1 ] || [ "$scope" = "machine" ]; then
+  # HERD-62: --shared forces the committed baseline AND a propagation PR — so it is meaningless (and
+  #          dangerous) for a machine-scoped key, whose per-user value must never be committed. Refuse
+  #          rather than silently downgrade, so the operator picks --local for such a key instead.
+  if [ "$force_shared" -eq 1 ] && [ "$scope" = "machine" ]; then
+    die "refusing to --shared machine-scoped key '$key' — its value is per-user/per-machine and must never be committed to the baseline; use 'herd config set --local $key ...' instead"
+  fi
+  if [ "$force_local" -eq 1 ] || { [ "$scope" = "machine" ] && [ "$force_shared" -eq 0 ]; }; then
     _config_ensure_local "$local_cfg"
     target="$local_cfg"; target_label=".herd/config.local"
   else
@@ -1198,16 +1222,28 @@ cmd_config_set() {
   #    set skips the write AND the restart/re-render, so re-running the same set is inert. The
   #    idempotency probe reads the TARGET, so a machine key already at VALUE in the overlay is a
   #    no-op even when the baseline holds a different value (the overlay is what wins at load time).
-  local cur; cur="$(_config_file_value "$target" "$key")"
+  #    EXCEPTION (HERD-62): a --shared set never short-circuits, so it can (re)open the propagation
+  #    PR even when the local baseline already holds VALUE — the whole point of --shared is that OTHER
+  #    operators may not have it yet.
+  local cur changed=1; cur="$(_config_file_value "$target" "$key")"
   if [ "$cur" = "$val" ] && grep -qE "^[[:space:]]*$key=" "$target"; then
+    changed=0
+  fi
+  if [ "$changed" -eq 0 ] && [ "$force_shared" -eq 0 ]; then
     ok "$key already = \"$val\" in $target_label (no change)"
     return 0
   fi
-  _config_put_value "$target" "$key" "$val"
-  ok "set $key = \"$val\" in $target_label"
-  [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
+  if [ "$changed" -eq 1 ]; then
+    _config_put_value "$target" "$key" "$val"
+    ok "set $key = \"$val\" in $target_label"
+    [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
+  else
+    ok "$key already = \"$val\" in $target_label (local change already applied)"
+  fi
 
-  # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms.
+  # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
+  #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
+  if [ "$changed" -eq 1 ]; then
   case "$requires" in
     watcher)
       say ""
@@ -1223,16 +1259,143 @@ cmd_config_set() {
       say "  ${c_dim}(no watcher restart or skill re-render required for $key)${c_rst}"
       ;;
   esac
+  fi
+
+  # 4b. HERD-62 propagation: open (or refresh) the single-file config PR so every operator receives
+  #     this baseline change through the normal watcher gate + `git pull`/`herd update` sync loop.
+  if [ "$force_shared" -eq 1 ]; then
+    _config_open_shared_pr "$root" "$cfg" "$key" "$cur" "$val" "$reason"
+  fi
 
   # 5. SCRIBE_BACKEND change-awareness (issue #139): flipping the backend does NOT retire an already
   #    running backlog scribe drainer. That idle/done drainer was spawned under the OLD backend and,
   #    if left running, will drain queued requests via the stale mode. scribe-step.sh now guards
   #    against filing junk, but a stale drainer still can't place file-backend items — so warn the
   #    operator to retire it now, so the next request spawns a fresh drainer on the new backend.
-  if [ "$key" = "SCRIBE_BACKEND" ]; then
+  if [ "$key" = "SCRIBE_BACKEND" ] && [ "$changed" -eq 1 ]; then
     say ""
     warn "SCRIBE_BACKEND changed ${cur:+from \"$cur\" }to \"$val\" — an idle backlog scribe drainer spawned under the OLD backend may still be running and would drain queued requests in the stale mode. RETIRE it now (close its 'scribe-<workspace>' tab, e.g. 'herdr agent stop scribe-<workspace>') so the next request spawns a fresh drainer on the new backend."
   fi
+}
+
+# _config_open_shared_pr <root> <cfg> <key> <old> <new> <reason> — HERD-62. Open (or refresh) a tiny
+# single-file PR that carries the just-applied PROJECT-scoped baseline change to every operator via
+# the normal watcher gate. The local baseline (.herd/config) is ALREADY edited by the caller; this
+# only proposes the SAME one-key change on a dedicated branch so a coordinator who cannot push to the
+# default branch still propagates policy the gated way. It works from a THROWAWAY git worktree so the
+# operator's current checkout/branch is never switched or dirtied, bases the branch off the committed
+# DEFAULT_BRANCH tip (so the diff is exactly old->new for this one key), pushes branch config/<key>,
+# and runs `gh pr create`. DEGRADES GRACEFULLY: a missing gh, an unpushable/non-GitHub remote, or any
+# git/gh failure warns with copy-paste manual steps instead of dying — the local change already stuck.
+_config_open_shared_pr() {
+  local root="$1" cfg="$2" key="$3" old="$4" new="$5" reason="$6"
+  local branch="config/$key"
+
+  # Resolve the default branch's remote + base from the committed baseline (no shell-sourcing side
+  # effects): DEFAULT_BRANCH=origin/main → remote 'origin', base 'main'. Fall back to origin/main.
+  local default_branch remote base
+  default_branch="$(_config_file_value "$cfg" DEFAULT_BRANCH)"; : "${default_branch:=origin/main}"
+  remote="${default_branch%%/*}"; base="${default_branch#*/}"
+  { [ -n "$remote" ] && [ "$remote" != "$default_branch" ]; } || { remote="origin"; base="${default_branch#origin/}"; }
+  [ -n "$base" ] || base="main"
+
+  say ""
+  say "${c_bold}→ --shared: opening a config PR so every operator receives $key=$new${c_rst}"
+
+  # gh is needed to actually open the PR. Its absence is a valid, non-fatal finding — the change is
+  # applied locally; tell the operator how to finish by hand. The repo slug (best-effort, for gh's
+  # --repo) is derived from the default-branch remote; when it cannot be resolved (non-GitHub URL)
+  # gh is instead run FROM the worktree so it can infer the repo from that checkout's origin remote.
+  local slug; slug="$(_gh_repo_slug "$root" "$default_branch")"
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "cannot auto-open the config PR — gh CLI not found. The change is APPLIED to .herd/config locally; commit it on a branch and open the PR by hand so other operators receive it:
+    git switch -c $branch && git commit -am 'config: set $key=$new' && git push -u $remote $branch && gh pr create --base $base"
+    return 0
+  fi
+
+  # Base the throwaway worktree off the committed default-branch tip when it resolves, else the local
+  # HEAD — so the branch diff is a clean single-key change against what everyone else has.
+  local base_ref="$default_branch"
+  git -C "$root" rev-parse --verify --quiet "$default_branch^{commit}" >/dev/null 2>&1 || base_ref="HEAD"
+
+  local wt; wt="$(mktemp -d)"
+  # -B (re)creates or resets the branch to base_ref, so re-running `set --shared` for the same key
+  # refreshes the SAME PR branch with the newest value instead of failing on an existing branch.
+  if ! git -C "$root" worktree add -q -B "$branch" "$wt" "$base_ref" 2>/dev/null; then
+    rm -rf "$wt"
+    warn "could not create a work branch for the config PR (git worktree add -B $branch failed) — the change is applied locally; open the PR by hand (branch $branch off $base)."
+    return 0
+  fi
+
+  # Apply the SAME one-key edit in the worktree's baseline copy (the committed, pre-change value), so
+  # the branch carries exactly old->new for this key and nothing else. Reuse the shared edit primitive.
+  local push_ok=0
+  if [ -f "$wt/.herd/config" ]; then
+    _config_put_value "$wt/.herd/config" "$key" "$new"
+    if ! git -C "$wt" diff --quiet -- .herd/config; then
+      git -C "$wt" add .herd/config
+      git -C "$wt" commit -q -m "config: set $key=$new (herd config set --shared)" \
+        -m "Propagate a PROJECT-scoped policy change to every operator (HERD-62)." 2>/dev/null || true
+      # --force: the config/<key> branch is owned entirely by this command (one branch per key), so a
+      # re-run legitimately replaces its own prior proposal; -B reset above makes the history diverge.
+      if git -C "$wt" push -q --force "$remote" "$branch" 2>/dev/null; then
+        push_ok=1
+      fi
+    else
+      # Baseline tip already carries this value — nothing to propose (already merged upstream).
+      ok "the default branch already has $key=$new — no config PR needed"
+      git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rm -rf "$wt"
+      return 0
+    fi
+  else
+    warn ".herd/config is not committed on $base — cannot build a single-file config PR; commit the baseline first."
+  fi
+
+  if [ "$push_ok" -eq 1 ]; then
+    local title body reason_line
+    title="config: set $key=$new"
+    [ -n "$reason" ] && reason_line="**Why:** $reason" || reason_line="**Why:** _(none given — pass \`--reason\` to record one)_"
+    body="Shared config change opened by \`herd config set --shared\` (HERD-62).
+
+**Key:** \`$key\`
+**Change:** \`${old:-<unset>}\` → \`$new\`
+$reason_line
+
+Applies a PROJECT-scoped policy change to the committed \`.herd/config\` baseline so every operator
+picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the normal watcher gate
+(healthcheck + review) merges it."
+    # Run gh FROM the worktree so it can infer the repo from that checkout's origin remote; pass
+    # --repo too when a slug resolved (belt-and-suspenders, and lets a non-default remote name work).
+    # No bash arrays here — an empty-array expansion under `set -u` aborts on bash 3.2 (macOS).
+    local created=0 exists=0
+    if [ -n "$slug" ]; then
+      ( cd "$wt" && gh pr create --repo "$slug" --base "$base" --head "$branch" --title "$title" --body "$body" ) >/dev/null 2>&1 && created=1
+    else
+      ( cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" ) >/dev/null 2>&1 && created=1
+    fi
+    if [ "$created" -eq 1 ]; then
+      ok "opened config PR for $branch → merges the change to every operator (watcher-gated)"
+    else
+      # A PR for this branch may already be open (re-run) — the force push above updated its diff.
+      if [ -n "$slug" ]; then
+        ( cd "$wt" && gh pr view "$branch" --repo "$slug" ) >/dev/null 2>&1 && exists=1
+      else
+        ( cd "$wt" && gh pr view "$branch" ) >/dev/null 2>&1 && exists=1
+      fi
+      if [ "$exists" -eq 1 ]; then
+        ok "refreshed the existing config PR for $branch with $key=$new"
+      else
+        warn "pushed branch $branch but 'gh pr create' failed — open the PR manually: gh pr create ${slug:+--repo $slug }--base $base --head $branch"
+      fi
+    fi
+  elif [ -f "$wt/.herd/config" ]; then
+    warn "could not push $branch to $remote (permission or network) — the change is applied locally; push $branch and open the PR by hand."
+  fi
+
+  git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -rf "$wt"
+  return 0
 }
 
 # ── herd config sync: surface engine config keys missing from this project's .herd/config (HERD-38) ─
