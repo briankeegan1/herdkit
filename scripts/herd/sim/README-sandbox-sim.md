@@ -98,6 +98,71 @@ restart-survival path with 0 duplicates).
 > panes, no model. The `--real-builders` flag is a deliberate placeholder — the live overnight run
 > (real builders + real usage-limit resets + operator hand-off) is the EPIC's step for later.
 
+## P1 — scripted CONCURRENCY scenario — `sandbox-concurrency-scenario.sh`
+
+Where the P0 `sandbox-scenario.sh` walks **one** PR through a re-implemented gate, this P1 scenario
+opens **N≥3 stub-builder PRs simultaneously** and drives the **REAL watcher gate loop** against them.
+It sources `scripts/herd/agent-watch.sh` in **lib mode** (`AGENT_WATCH_LIB=1`) and calls the shipped
+gate functions — `_healthcheck_gate`, `_review_gate_step`, `_count_live_reviews`, `do_merge`,
+`already_merged` — in the exact order the watcher's action pass runs them (`agent-watch.sh:2941`–3123),
+tick by tick until the queue drains. So the concurrency accounting under test **is the production
+code's**; the sim breaks if that code regresses.
+
+Each PR is a real local worktree/branch off the fixture `main` with a deterministic tiny change
+(**no model call**). The seams are stubbed hermetically: `gh` on `PATH` (records each merge), the
+documented `HERD_REVIEW_BIN` / `HERD_HEALTHCHECK_BIN` test seams, `HERD_DRIVER=headless` (no herdr
+panes/tabs ever created), an **isolated** `WORKSPACE_NAME` + temp `WORKTREES_DIR`. It never touches
+the real herdkit repo's PRs, panes, or journal, and the tab-leak-guard cannot miscount it.
+
+It asserts, as scorecard checkpoints:
+
+- **(a) `REVIEW_CONCURRENCY` respected** — the observed peak of simultaneous in-flight reviews never
+  exceeds the cap, and the cap **actively gated** (≥1 PR reported `QUEUED` while slots were full).
+- **(b) `HEALTH_CONCURRENCY=1` serializes** — the stub healthcheck records the live
+  `.health-inflight-*` marker count on every run and it is **always exactly 1** (no interleaving);
+  a planted-holder probe additionally proves a second healthcheck **QUEUEs** rather than running.
+- **(c) no double-merge, no skipped PR** — each PR's `gh pr merge` fires exactly once
+  (`do_merge`'s `STATE` record makes `already_merged` idempotent) and every PR ends merged.
+- **(d) the queue drains fully** — all PRs merged within the tick budget; worktrees reaped.
+
+**Verification artifacts** (into the artifacts dir):
+
+- `pane-<checkpoint>.txt` — the watcher console frame captured back **through the real driver
+  read-pane surface** (`herd_driver_read_pane`, headless → tails the agent log). The frame carries
+  the 🩺 health-check rows the real `_healthcheck_gate` paints — not a re-render.
+- `screenshots/watcher-<checkpoint>.png` — macOS `screencapture` at key checkpoints. **Degrades
+  gracefully** (no-false-red): skips with a note — never fails — when headless, not macOS,
+  `screencapture` is absent, Screen Recording permission is missing (empty/failed capture), or
+  `SANDBOX_NO_SCREENSHOT=1` is set.
+
+```sh
+# Drain 3 simultaneous stub PRs through the real gate loop; inspect the scorecard:
+bash scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc-run
+cat /tmp/conc-run/scorecard.json
+
+# Wider fan-out with a bigger review cap (5 PRs, 3 concurrent reviews):
+REVIEW_CONCURRENCY=3 bash scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc5 -n 5
+
+# Headless / CI: skip screenshots (they’d otherwise skip themselves, but this is explicit):
+SANDBOX_NO_SCREENSHOT=1 bash scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc-ci
+```
+
+The scorecard mirrors `sandbox-scenario.sh`'s JSON and **adds** the concurrency fields: `prs`,
+`review_concurrency`, `health_concurrency`, `peak_reviews_in_flight`, `reviews_queued`,
+`health_runs`, `max_health_in_flight` (**must be 1**), `merges`, `double_merges` (**must be 0**),
+`skipped_prs` (**must be 0**), `queue_drained`, `ticks`, `pane_captures`, `screenshots`.
+
+Flags: `--artifacts DIR` (repo + scorecard + artifacts; `--keep` implied), `--keep`, `-n/--prs N`
+(default 3, min 3). Env: `REVIEW_CONCURRENCY` (default 2), `SANDBOX_REVIEW_DELAY` (default 1 s — how
+long each stub review stays in flight so the cap is observable), `SANDBOX_NO_SCREENSHOT`. Hermetic
+proof: `../../../tests/test-sandbox-concurrency.sh` (drain + scorecard shape, the review cap, health
+serialization, no-double-merge/no-skip/drain, artifact capture + graceful screenshot skip, and a
+cap=3 parameterized run).
+
+> This lands three of the P0 follow-ups below in **stub mode**: driving the real watcher loop, the
+> concurrency-invariant assertions, and visual/pane confirmation. A hosted repo + a real herdr
+> control room with live panes remain P1+ proper.
+
 ## Explicitly DEFERRED to P1+ (backlog follow-up note)
 
 > The coordinator owns `BACKLOG.md`; this P0 does not edit it. Fold the follow-ups below into the
