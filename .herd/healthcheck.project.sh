@@ -62,9 +62,14 @@ fi
 # concurrent activity while still catching the exact leak this PR fixes. SCOPING (issue #78): the scan
 # is restricted to THIS project's OWN herdr workspace (WORKSPACE_NAME → workspace_id) so an orphan in a
 # SIBLING project's workspace — or any other workspace entirely — never trips this guard; only a tab
-# leaked into OUR workspace counts. (Residual: a real headless review·<slug> tab spawned by the watcher
-# in this same window is also an orphan and could trip the guard — rare, transient, and self-heals on
-# re-run; a genuine leak persists and re-trips.)
+# leaked into OUR workspace counts. ENGINE WHITELIST (HERD-51): status idle/working is necessary but
+# not sufficient — a concurrent engine tab (resolve·*, scribe-*, research*, herd-watch*/backlog*/
+# coordinator*) spawned by unrelated activity can be caught mid-spawn in 'unknown'/'blocked' and, by
+# status alone, look like a net-new orphan (three real false-reds, incl. PR #162's resolve·codemap-
+# freshness). _hk_orphans() therefore also drops any tab whose LABEL matches that known-engine
+# whitelist from the orphan set, symmetrically in both snapshots. (Residual: a real headless
+# review·<slug> tab spawned by the watcher in this same window is NOT whitelisted, so it can still
+# trip the guard — rare, transient, and self-heals on re-run; a genuine leak persists and re-trips.)
 _hk_workspace_id() {
   # Resolve THIS project's herdr workspace id (WORKSPACE_NAME → workspace_id via 'herdr workspace
   # list'). Prints the id (no trailing newline) on success; empty when herdr is absent, the list
@@ -92,16 +97,33 @@ _hk_orphans() {
   # workspace are never counted (issue #78); falls back to ALL workspaces when $1 is empty (herdr
   # present but our workspace unresolved — no worse than the pre-#78 behaviour). Read-only; never
   # mutates the workspace.
+  #
+  # ENGINE-LABEL WHITELIST (HERD-51): a legitimate engine tab spawned CONCURRENTLY by unrelated
+  # activity during the suite window — a resolve·<slug> conflict-resolver, a scribe-* drainer, a
+  # research/researcher drainer, or a control-room pane (herd-watch*/backlog*/coordinator*) — can be
+  # caught mid-spawn in an 'unknown'/'blocked' state and, by the raw status test alone, would count
+  # as a net-new orphan and false-red the guard (three real false-reds to date, incl. PR #162's
+  # "resolve·codemap-freshness"). We EXCLUDE tabs whose label matches this whitelist from the orphan
+  # set — symmetrically, in BOTH the before and after snapshots, since this one function computes
+  # both — so concurrent engine churn never skews the diff. A genuinely suite-leaked, agent-less tab
+  # (label NOT matching the whitelist, e.g. herd-review's standalone review·<slug> running tail -f)
+  # is still an orphan and still reds.
   command -v herdr >/dev/null 2>&1 || return 0
   herdr tab list 2>/dev/null | WSID="${1:-}" python3 -c '
-import sys, json, os
+import sys, json, os, re
+# Known engine tab/agent label prefixes. The character after "resolve" is a literal middot
+# U+00B7 (the label is "resolve·<slug>"), matching the engine that mints those tabs. "research"
+# also covers "researcher"/"research·*".
+_ENGINE = re.compile(r"^(scribe-|resolve·|research|herd-watch|backlog|coordinator)")
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
     wsid = os.environ.get("WSID", "")
     if wsid:
         # Scope to THIS project workspace — ignore tabs owned by any other workspace.
         tabs = [t for t in tabs if str(t.get("workspace_id", "")) == wsid]
-    orphans = [t for t in tabs if str(t.get("agent_status", "")) not in ("idle", "working")]
+    orphans = [t for t in tabs
+               if str(t.get("agent_status", "")) not in ("idle", "working")
+               and not _ENGINE.match(str(t.get("label", "")))]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
     # Emit the orphan labels too so a real leak can be named in the failure message.

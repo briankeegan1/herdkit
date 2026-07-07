@@ -66,13 +66,19 @@ except Exception:
 _hk_orphans() {
   command -v herdr >/dev/null 2>&1 || return 0
   herdr tab list 2>/dev/null | WSID="${1:-}" python3 -c '
-import sys, json, os
+import sys, json, os, re
+# LOCKSTEP with .herd/healthcheck.project.sh: known-engine label prefixes (HERD-51) are excluded
+# from the orphan set so concurrent engine churn never skews the diff. Kept here so this scope test
+# exercises the SAME orphan definition the real guard uses.
+_ENGINE = re.compile(r"^(scribe-|resolve·|research|herd-watch|backlog|coordinator)")
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
     wsid = os.environ.get("WSID", "")
     if wsid:
         tabs = [t for t in tabs if str(t.get("workspace_id", "")) == wsid]
-    orphans = [t for t in tabs if str(t.get("agent_status", "")) not in ("idle", "working")]
+    orphans = [t for t in tabs
+               if str(t.get("agent_status", "")) not in ("idle", "working")
+               and not _ENGINE.match(str(t.get("label", "")))]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
     for lbl in sorted(str(t.get("label", "")) for t in orphans):
@@ -109,29 +115,35 @@ guard_trips() {
 }
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────────────────────────
-# BEFORE: northstar coordinator (wC) is idle; our workspace (wE) has a working coordinator +
-# a working sibling builder + a pre-existing 'done' orphan that is present in BOTH snapshots.
+# NOTE: the churning orphans here use NON-engine labels (review·<slug>) on purpose. Since HERD-51 the
+# guard whitelists known-engine labels (scribe-/resolve·/research/herd-watch/backlog/coordinator) in
+# EVERY workspace, so an engine label would be filtered by the whitelist, not by scoping — which would
+# not exercise this test's axis. A non-engine review·<slug> orphan is filtered ONLY by workspace
+# scoping, so it isolates the issue #78 behaviour cleanly. (The engine whitelist itself is covered by
+# test-tab-leak-whitelist.sh.)
+#
+# BEFORE: a sibling project's headless review tab (wC) is idle; our workspace (wE) has a working
+# coordinator + a working builder + a pre-existing NON-engine 'done' orphan present in BOTH snapshots.
 BEFORE='{"id":"cli:tab:list","result":{"type":"tab_list","tabs":[
-  {"agent_status":"idle","label":"coordinator-northstar","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
+  {"agent_status":"idle","label":"review·northstar-stale","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
   {"agent_status":"working","label":"coordinator-herdkit","pane_count":3,"tab_id":"wE:t1","workspace_id":"wE"},
   {"agent_status":"working","label":"fleet-coordinator-p0","pane_count":2,"tab_id":"wE:tB0","workspace_id":"wE"},
-  {"agent_status":"done","label":"backlog-autoreconcile","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"}]}}'
+  {"agent_status":"done","label":"review·preexisting-orphan","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"}]}}'
 
-# AFTER_SIBLING: the ONLY change is the northstar coordinator (wC) going non-idle ("done"), plus the
-# sibling builder churning working->done in OUR workspace... no — keep our workspace identical here so
-# the sole delta is cross-workspace. This is the exact issue #78 repro.
+# AFTER_SIBLING: the ONLY change is the sibling review tab (wC) going non-idle ("done"); OUR workspace
+# (wE) is byte-identical, so the sole delta is cross-workspace. This is the exact issue #78 repro.
 AFTER_SIBLING='{"id":"cli:tab:list","result":{"type":"tab_list","tabs":[
-  {"agent_status":"done","label":"coordinator-northstar","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
+  {"agent_status":"done","label":"review·northstar-stale","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
   {"agent_status":"working","label":"coordinator-herdkit","pane_count":3,"tab_id":"wE:t1","workspace_id":"wE"},
   {"agent_status":"working","label":"fleet-coordinator-p0","pane_count":2,"tab_id":"wE:tB0","workspace_id":"wE"},
-  {"agent_status":"done","label":"backlog-autoreconcile","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"}]}}'
+  {"agent_status":"done","label":"review·preexisting-orphan","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"}]}}'
 
 # AFTER_LEAK: a genuine leak INTO OUR workspace — a new agent-less 'review·' orphan tab appears in wE.
 AFTER_LEAK='{"id":"cli:tab:list","result":{"type":"tab_list","tabs":[
-  {"agent_status":"idle","label":"coordinator-northstar","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
+  {"agent_status":"idle","label":"review·northstar-stale","pane_count":3,"tab_id":"wC:t1G","workspace_id":"wC"},
   {"agent_status":"working","label":"coordinator-herdkit","pane_count":3,"tab_id":"wE:t1","workspace_id":"wE"},
   {"agent_status":"working","label":"fleet-coordinator-p0","pane_count":2,"tab_id":"wE:tB0","workspace_id":"wE"},
-  {"agent_status":"done","label":"backlog-autoreconcile","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"},
+  {"agent_status":"done","label":"review·preexisting-orphan","pane_count":3,"tab_id":"wE:tAQ","workspace_id":"wE"},
   {"agent_status":"unknown","label":"review·leaky-test","pane_count":2,"tab_id":"wE:tZ9","workspace_id":"wE"}]}}'
 
 # ── Assertions ───────────────────────────────────────────────────────────────────────────────────
