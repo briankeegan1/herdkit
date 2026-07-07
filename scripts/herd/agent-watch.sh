@@ -173,6 +173,15 @@ SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 # autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
 # of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
 RECONCILE_STATE="$TREES/.agent-watch-reconciled"
+# Tracker-state self-heal surfaces (HERD-86). The periodic tracker-state sweep (tracker-state-sweep.sh)
+# re-asserts Done for a recently-merged PR whose tracker item drifted (stuck open after merge — the
+# HERD-67/HERD-69 incidents). TRACKER_SWEEP_LEDGER records refs already confirmed Done so the sweep
+# never re-reads a clean ref (steady-state cost = one `gh pr list`, zero backend reads). The heal
+# NOTE surface holds one "<epoch> <status> <ref> <pr> <found-state>" line per heal action (status ∈
+# healed|failed); build_tracker_drift renders its tail so a heal — or a stuck failure — is VISIBLE in
+# the console, never a silent correction.
+TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
+TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
 # Dep-state console surface: dep-watcher.sh rewrites this file each tick with one
 # "<ref> <state> <age-seconds>" line per live blocked-on dep (state ∈ open|in-progress|in-review|
 # stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
@@ -244,6 +253,7 @@ HDR_LINE=""
 RULE=""
 LANDED=""
 BLOCKED=""
+TRACKER_DRIFT=""
 DISPLAY=()
 
 # build_header — the title row + a full-width rule.
@@ -310,6 +320,27 @@ build_blocked() {
   [ -n "$rows" ] && BLOCKED="$rows"
 }
 
+# build_tracker_drift — the "tracker healed" section: the last 3 heal actions from $TRACKER_HEAL_FILE
+# ("<epoch> <status> <ref> <pr> <found-state>", written by tracker-state-sweep.sh), newest first.
+# Empty (TRACKER_DRIFT="") when the file is absent/empty so render omits the section. A `healed` row
+# is calm green (drift was auto-corrected); a `failed` row is loud red (still stuck, retries next
+# sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86).
+build_tracker_drift() {
+  TRACKER_DRIFT=""
+  [ -s "$TRACKER_HEAL_FILE" ] || return 0
+  local epoch status ref pr state hhmm glyph color rows=""
+  while read -r epoch status ref pr state; do
+    [ -n "${ref:-}" ] || continue
+    hhmm="$(epoch_to_hhmm "$epoch")"
+    case "$status" in
+      healed) glyph='🩹'; color="$C_GREEN" ;;
+      *)      glyph='⚠️'; color="$C_RED"   ;;
+    esac
+    rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${status}${C_RESET} ${C_DIM}#${pr} was ${state} · ${hhmm}${C_RESET}"$'\n'
+  done < <(reverse_file "$TRACKER_HEAL_FILE" | head -3)
+  [ -n "$rows" ] && TRACKER_DRIFT="$rows"
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -327,6 +358,9 @@ render() {
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
   if [ -n "${BLOCKED:-}" ]; then
     frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
+  fi
+  if [ -n "${TRACKER_DRIFT:-}" ]; then
+    frame="${frame}  ${C_DIM}tracker healed${C_RESET}"$'\n'"${TRACKER_DRIFT}"$'\n'
   fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
@@ -1196,6 +1230,23 @@ except Exception: pass
 ' 2>/dev/null || true
     fi
   done <<< "$_sw_orphans"
+}
+
+# _sweep_tracker_state — HERD-86 tracker-state self-heal. Runs every _TRACKER_SWEEP_INTERVAL ticks
+# (low frequency; the drift it catches is a rare merge-tail failure, not a per-tick condition). Shells
+# out to the standalone tracker-state-sweep.sh, pointing its ledger + heal-note surfaces at THIS
+# watcher's $TREES files so build_tracker_drift renders any heal. The sweep re-asserts Done for a
+# recently-merged PR whose tracker item drifted (the HERD-67/HERD-69 pattern: stuck open after merge),
+# journals a tracker_state_healed event (component=sweep, HERD-85 attribution), and appends a console
+# note. BEST-EFFORT: it can never fail or slow a tick — inert in dry-run, byte-inert when the backend
+# has no update-state op (the file backend), and cheap when clean (one `gh pr list`, no backend read
+# for any ref already confirmed Done in the ledger). Never merges, never edits BACKLOG.md.
+_sweep_tracker_state() {
+  [ -n "$DRYRUN" ] && return 0
+  [ -f "$HERE/tracker-state-sweep.sh" ] || return 0
+  HERD_TSWEEP_LEDGER="$TRACKER_SWEEP_LEDGER" \
+  HERD_TSWEEP_NOTE_FILE="$TRACKER_HEAL_FILE" \
+    bash "$HERE/tracker-state-sweep.sh" >/dev/null 2>&1 || true
 }
 
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
@@ -3008,11 +3059,14 @@ _drain_spawn_queue() {
 
 _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
+_TRACKER_SWEEP_TICK=0
+_TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
 
 while true; do
   build_header
   build_landed
   build_blocked
+  build_tracker_drift
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
@@ -3414,6 +3468,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   if [ "$_ORPHAN_SWEEP_TICK" -ge "$_ORPHAN_SWEEP_INTERVAL" ]; then
     _ORPHAN_SWEEP_TICK=0
     _sweep_orphan_tabs
+  fi
+
+  # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
+  # recently-merged PR whose tracker item drifted (stuck open after merge). Cheap + advisory.
+  _TRACKER_SWEEP_TICK=$((_TRACKER_SWEEP_TICK + 1))
+  if [ "$_TRACKER_SWEEP_TICK" -ge "$_TRACKER_SWEEP_INTERVAL" ]; then
+    _TRACKER_SWEEP_TICK=0
+    _sweep_tracker_state
   fi
 
   sleep 4
