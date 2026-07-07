@@ -42,12 +42,18 @@ shift 2>/dev/null || true
 epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
 
 # print_human_verify_steps <pr#> — if the PR declares a HUMAN-VERIFY block, print its steps
-# (indented) so the operator knows exactly what to run before approving. Silent if none.
+# (indented) so the operator knows exactly what to run before approving. Silent if none. Reflects the
+# effective HUMAN_VERIFY_POLICY (HERD-59): under =coordinator the hold is flagged coordinator-actionable
+# so a coordinator/agent knows it may run the steps and sign off itself. (=auto never reaches the
+# approve ledger — those PRs are merged as informational, so this surfaces the hold/coordinator cases.)
 print_human_verify_steps() {
   local _pr="$1" _steps
   _steps="$(gh pr view "$_pr" --json body -q '.body' 2>/dev/null | human_verify_steps)"
   [ -n "$_steps" ] || return 0
-  echo "      human-verify — run these, then approve:"
+  case "${HUMAN_VERIFY_POLICY:-hold}" in
+    coordinator) echo "      human-verify (coordinator-actionable) — a coordinator/agent runs these, then approves:" ;;
+    *)           echo "      human-verify — run these, then approve:" ;;
+  esac
   while IFS= read -r _s; do
     [ -n "$_s" ] && printf '        • %s\n' "$_s"
   done <<EOF

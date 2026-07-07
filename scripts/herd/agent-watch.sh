@@ -200,6 +200,32 @@ case "$_pol" in
   observe) MERGE_OBSERVE=1 ;;
 esac
 unset _pol
+
+# _effective_human_verify_policy — resolve HUMAN_VERIFY_POLICY (HERD-59) to hold | coordinator | auto.
+# It shapes ONLY how a PR that declares a HUMAN-VERIFY: block is handled under MERGE_POLICY=auto:
+#   hold        default; today's EXACT behavior — a sha-keyed approve-style hold released by
+#               herd-approve.sh approve. Byte-identical when the key is unset.
+#   coordinator keep the hold but notify loudly and flag it coordinator-actionable, so a coordinator/
+#               agent runs the declared steps then approves via herd-approve.sh approve.
+#   auto        treat the declared steps as INFORMATIONAL only — journal + PR-comment them and merge
+#               on green gates (the standing human-verify authorization codified as an engine switch).
+# Unknown/empty → hold (fail safe). Pure; the launch-time resolution below surfaces a bad value once.
+_effective_human_verify_policy() {
+  case "${HUMAN_VERIFY_POLICY:-}" in
+    hold|coordinator|auto) printf '%s' "${HUMAN_VERIFY_POLICY}" ;;
+    *)                     printf 'hold' ;;
+  esac
+}
+HV_POLICY="$(_effective_human_verify_policy)"
+# An explicitly-set but UNRECOGNIZED value fails safe to hold — journal it once at launch so a typo
+# (HUMAN_VERIFY_POLICY=cordinator) never silently rides the default. Skipped in lib mode so sourcing
+# for the pure helpers never writes a journal line.
+if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
+  case "${HUMAN_VERIFY_POLICY:-}" in
+    ''|hold|coordinator|auto) ;;
+    *) journal_append human_verify_policy_invalid value "$HUMAN_VERIFY_POLICY" fell_back_to hold 2>/dev/null || true ;;
+  esac
+fi
 # This watcher's own worktree root — never auto-merge/remove the dir we run from.
 SELF_WT="$(cd "$HERE/../.." && pwd)"
 
@@ -644,6 +670,20 @@ record_observe_noted() {
   printf '%s observed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
 }
 
+# hv_informed_noted <pr#> <headSha> — true if we already journaled+commented a HUMAN_VERIFY_POLICY=auto
+# PR's declared steps as informational (dedup guard so the note fires once per sha, not every tick).
+# Reuses the $APPROVALS ledger with its own 'hv-informed' state word — herd-approve.sh's `list` only
+# reads 'awaiting' lines, so this never appears as a pending approval.
+hv_informed_noted() {
+  [ -s "$APPROVALS" ] || return 1
+  grep -q "^[0-9]* hv-informed $1 $2$" "$APPROVALS" 2>/dev/null
+}
+
+# record_hv_informed <pr#> <headSha> — note the informational HUMAN-VERIFY steps were recorded.
+record_hv_informed() {
+  printf '%s hv-informed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
 # ── Per-PR human-verify hold ──────────────────────────────────────────────────────────────────
 # A PR whose body declares a `HUMAN-VERIFY:` block (see human-verify.sh) names manual steps the
 # builder could not run itself. Under MERGE_POLICY=auto such a PR is individually switched to an
@@ -668,20 +708,23 @@ pr_human_verify_steps() {
   _pr_body "$1" | human_verify_steps
 }
 
-# _hold_decision <mode> <hv_hold> <approved> — the pure action selector for a PASS-gated PR.
-#   mode:     auto | approve | observe   (the effective merge policy)
-#   hv_hold:  "1" if the PR declares a human-verify block (only ever set in auto mode), else ""
-#   approved: "1" if a sha-keyed approval record exists for this PR+sha, else ""
+# _hold_decision <mode> <hv_hold> <approved> [hv_policy] — the pure action selector for a PASS-gated PR.
+#   mode:      auto | approve | observe   (the effective merge policy)
+#   hv_hold:   "1" if the PR declares a human-verify block (only ever set in auto mode), else ""
+#   approved:  "1" if a sha-keyed approval record exists for this PR+sha, else ""
+#   hv_policy: HUMAN_VERIFY_POLICY (hold | coordinator | auto); default "hold" for legacy 3-arg callers.
 # Echoes exactly one token: MERGE | HOLD | OBSERVE. No side effects — the caller owns the ledger
 # writes, the journal, and the merge. In approve mode hv_hold is ignored (the policy already holds),
-# so a human-verify PR is held exactly ONCE, never doubly.
+# so a human-verify PR is held exactly ONCE, never doubly. Under hv_policy=auto a human-verify PR is
+# treated as informational and NOT held (the caller journals + comments the steps before merging);
+# hold and coordinator both HOLD (they differ only in how the caller surfaces the hold).
 _hold_decision() {
-  local mode="$1" hv="$2" approved="$3"
+  local mode="$1" hv="$2" approved="$3" hvpol="${4:-hold}"
   case "$mode" in
     observe) printf 'OBSERVE' ;;
     approve) [ -n "$approved" ] && printf 'MERGE' || printf 'HOLD' ;;
     auto)
-      if [ -n "$hv" ]; then
+      if [ -n "$hv" ] && [ "$hvpol" != "auto" ]; then
         [ -n "$approved" ] && printf 'MERGE' || printf 'HOLD'
       else
         printf 'MERGE'
@@ -690,12 +733,17 @@ _hold_decision() {
   esac
 }
 
-# _hold_ready_label <hv_hold> <pr#> — the console phrase for a PASS-gated PR being held. A
+# _hold_ready_label <hv_hold> <pr#> [hv_policy] — the console phrase for a PASS-gated PR being held. A
 # human-verify hold tells the operator exactly how to release it (and, via herd-approve.sh list,
-# what to run first); a plain approve hold shows the generic wording.
+# what to run first); a plain approve hold shows the generic wording. Under HUMAN_VERIFY_POLICY=
+# coordinator the hold is flagged coordinator-actionable so a coordinator/agent knows to run the steps.
 _hold_ready_label() {
   if [ -n "$1" ]; then
-    printf 'ready · human-verify pending · herd-approve.sh approve %s' "$2"
+    if [ "${3:-hold}" = "coordinator" ]; then
+      printf 'ready · human-verify (coordinator-actionable) · run steps then herd-approve.sh approve %s' "$2"
+    else
+      printf 'ready · human-verify pending · herd-approve.sh approve %s' "$2"
+    fi
   else
     printf 'ready · awaiting approval'
   fi
@@ -3063,11 +3111,18 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
     hv_hold=""
     if [ "$mode" = "auto" ] && pr_human_verify_held "$prnum"; then hv_hold=1; fi
     hold_kind="approve"; [ -n "$hv_hold" ] && hold_kind="human-verify"
-    # A hold is in effect when the policy holds (approve) OR this PR is human-verify-held.
-    held=""; { [ "$mode" = "approve" ] || [ -n "$hv_hold" ]; } && held=1
+    # A hold is in effect when the policy holds (approve) OR this PR is human-verify-held AND
+    # HUMAN_VERIFY_POLICY still HOLDS (hold|coordinator). Under HUMAN_VERIFY_POLICY=auto (HERD-59) a
+    # human-verify PR is NOT held — its declared steps are recorded as informational, then it merges.
+    held=""
+    if [ "$mode" = "approve" ]; then
+      held=1
+    elif [ -n "$hv_hold" ] && [ "$HV_POLICY" != "auto" ]; then
+      held=1
+    fi
     approved=""; approval_is_approved "$prnum" "$rsha" && approved=1
 
-    case "$(_hold_decision "$mode" "$hv_hold" "$approved")" in
+    case "$(_hold_decision "$mode" "$hv_hold" "$approved" "$HV_POLICY")" in
       OBSERVE)
         # observe: run all gates, report + notify once per sha, NEVER merge.
         if ! observe_noted "$prnum" "$rsha"; then
@@ -3084,8 +3139,20 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         # (new sha) records a fresh awaiting entry — re-holding the PR until the new sha is approved.
         if ! approval_awaiting_noted "$prnum" "$rsha"; then
           record_approval_awaiting "$prnum" "$rsha"
-          journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
-          if [ -n "$hv_hold" ]; then
+          if [ "$HV_POLICY" = "coordinator" ] && [ -n "$hv_hold" ]; then
+            # HUMAN_VERIFY_POLICY=coordinator: still a hold, but journaled with the policy + surfaced
+            # loudly as coordinator-actionable so a coordinator/agent runs the steps then approves.
+            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" human_verify_policy coordinator
+            hv_steps="$(pr_human_verify_steps "$prnum")"
+            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual steps and \`HUMAN_VERIFY_POLICY=coordinator\`, so it is held as **coordinator-actionable**: a coordinator/agent should execute these steps, then approve:
+
+${hv_steps}
+
+Once executed, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
+            herd_driver_notify "🐑 PR #${prnum} human-verify — coordinator action needed" "${slug}: gates passed — a coordinator/agent should run the steps then herd approve ${prnum}" default
+          elif [ -n "$hv_hold" ]; then
+            # HUMAN_VERIFY_POLICY=hold (default): byte-identical to today's per-PR human-verify hold.
+            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
             hv_steps="$(pr_human_verify_steps "$prnum")"
             gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
 
@@ -3094,17 +3161,31 @@ ${hv_steps}
 Once verified, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
             herd_driver_notify "🐑 PR #${prnum} human-verify pending" "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" default
           else
+            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
             gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
 
 Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
             herd_driver_notify "🐑 PR #${prnum} awaiting approval" "${slug}: gates passed — herd approve ${prnum}" default
           fi
         fi
-        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$hv_hold" "$prnum")${C_RESET}"
+        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$hv_hold" "$prnum" "$HV_POLICY")${C_RESET}"
         render
         continue ;;
 
       MERGE)
+        # HUMAN_VERIFY_POLICY=auto (HERD-59): a PR that declared HUMAN-VERIFY steps merges on green,
+        # with the declared steps recorded as INFORMATIONAL — journaled + PR-commented exactly once per
+        # sha. The journal line makes it explicit + auditable that the steps were NOT human-executed.
+        if [ -n "$hv_hold" ] && [ "$HV_POLICY" = "auto" ] && ! hv_informed_noted "$prnum" "$rsha"; then
+          record_hv_informed "$prnum" "$rsha"
+          hv_steps="$(pr_human_verify_steps "$prnum")"
+          journal_append human_verify_policy pr "$prnum" sha "$rsha" slug "$slug" policy auto action merged-with-declared-steps
+          gh pr comment "$prnum" --body "🐑 **herd watch** · \`HUMAN_VERIFY_POLICY=auto\` — this PR declared manual verify steps, treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These steps were NOT executed before merge:
+
+${hv_steps}
+
+Recorded in the engine journal as \`human_verify_policy=auto merged-with-declared-steps\`." >/dev/null 2>&1 || true
+        fi
         if [ -n "$held" ]; then
           # A held PR (approve policy, or a human-verify hold) that now has a sha-keyed approval.
           journal_append hold_released pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" reason approved
