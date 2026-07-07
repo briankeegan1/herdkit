@@ -62,33 +62,33 @@ b="$(mkbin sA)"; add_present "$b" git; add_gh_authed "$b"   # NO herdr / claude 
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
 # (A/B) the whole point: init is NOT gated on the herdkit runtime — this must PASS.
 [ "$RC" -eq 0 ] || fail "(A) doctor must pass with only git+gh present (got $RC): $out"
-echo "$out" | grep -qi "herd init can proceed" || fail "(B) summary should say init can proceed: $out"
+grep -qi "herd init can proceed" <<<"$out" || fail "(B) summary should say init can proceed: $out"
 # (B/C) …yet every RECOMMENDED miss is still REPORTED (doctor lists everything in one pass).
-echo "$out" | grep -qi "herdr not found"   || fail "(B) missing herdr not reported: $out"
-echo "$out" | grep -qi "claude not found"  || fail "(C) missing claude not reported: $out"
-echo "$out" | grep -qi "python3 not found" || fail "(C) missing python3 not reported: $out"
+grep -qi "herdr not found" <<<"$out"   || fail "(B) missing herdr not reported: $out"
+grep -qi "claude not found" <<<"$out"  || fail "(C) missing claude not reported: $out"
+grep -qi "python3 not found" <<<"$out" || fail "(C) missing python3 not reported: $out"
 # …and each carries a warn marker + an install hint, and is NOT dressed up as a hard ✗-required miss.
-echo "$out" | grep -qi "fix:" || fail "(D) recommended miss printed no install hint: $out"
+grep -qi "fix:" <<<"$out" || fail "(D) recommended miss printed no install hint: $out"
 # (D) the tiered section headers all render (full one-pass report preserved).
-echo "$out" | grep -qi "Required (herd init needs these)"      || fail "(D) Required header missing: $out"
-echo "$out" | grep -qi "Recommended"                           || fail "(D) Recommended header missing: $out"
-echo "$out" | grep -qi "Optional (a missing one only degrades" || fail "(D) Optional header missing: $out"
+grep -qi "Required (herd init needs these)" <<<"$out"      || fail "(D) Required header missing: $out"
+grep -qi "Recommended" <<<"$out"                           || fail "(D) Recommended header missing: $out"
+grep -qi "Optional (a missing one only degrades" <<<"$out" || fail "(D) Optional header missing: $out"
 ok
 
 # ── (B2) herdr the ONLY missing dep → still just a warning, init proceeds ──────────────────────────
 b="$(mkbin sB2)"; add_present "$b" git claude; add_gh_authed "$b"; add_real_python "$b"   # NO herdr
 out="$(run_doctor "$b")"; RC=$?
 [ "$RC" -eq 0 ] || fail "(B2) a lone-missing herdr must not block init (got $RC): $out"
-echo "$out" | grep -qi "herdr not found"        || fail "(B2) missing herdr not reported: $out"
-echo "$out" | grep -qi "recommended dependency check" || fail "(B2) warn summary line missing: $out"
+grep -qi "herdr not found" <<<"$out"        || fail "(B2) missing herdr not reported: $out"
+grep -qi "recommended dependency check" <<<"$out" || fail "(B2) warn summary line missing: $out"
 ok
 
 # ── (E) git STILL a hard gate → proves the tier boundary is real (doctor is not "never fail") ─────
 b="$(mkbin sE)"; add_gh_authed "$b"; add_present "$b" claude; add_herdr_healthy "$b"; add_real_python "$b"  # git MISSING
 out="$(run_doctor "$b")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(E) missing REQUIRED git must still hard-fail (got 0): $out"
-echo "$out" | grep -qi "git not found"        || fail "(E) git miss not reported: $out"
-echo "$out" | grep -qi "herd init cannot proceed" || fail "(E) hard-fail summary missing: $out"
+grep -qi "git not found" <<<"$out"        || fail "(E) git miss not reported: $out"
+grep -qi "herd init cannot proceed" <<<"$out" || fail "(E) hard-fail summary missing: $out"
 ok
 
 # ── (F) end-to-end cmd_init: git+gh(+python3) present, herdr+claude ABSENT → init PROCEEDS ────────
