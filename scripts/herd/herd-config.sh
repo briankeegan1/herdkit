@@ -356,6 +356,25 @@ fi
 # push serialization (the loser's push is rejected, a re-pull shows the item claimed, and it aborts).
 : "${CLAIM_REQUIRED:="off"}"     # off (default) → no claim, today's async-scribe behavior; on → claim id-bearing spawns
 
+# ── Tracker-routed spawn enforcement (HERD-64) ───────────────────────────────
+# TRACKED_SPAWNS makes "every builder is traceable to a tracked work item" a PROJECT POLICY the
+# committed baseline binds on all operators, instead of a convention the coordinator is merely asked
+# to follow. It gates the lanes (herd-quick.sh / herd-feature.sh) and the durable spawn queue
+# (spawn.sh) on the presence of a tracker ref, via herd_tracked_spawn_or_abort below.
+#
+# off (DEFAULT) → today's behavior EXACTLY: no gate, spawns proceed with or without a ref.
+# required      → a spawn carrying NO tracker ref (HERD_CLAIM_ID, else the HERD_ITEM_REF the
+#                 coordinator threads for tracked items) is REFUSED with a loud one-line reason and
+#                 creates nothing. HERD_FORCE_SPAWN=1 (or the lanes' --force) is the explicit escape
+#                 hatch: it lets an unref'd spawn through and JOURNALS the bypass (tracked_spawn_bypassed).
+# Any value other than "required" is treated as off (safe default).
+#
+# INTERPLAY with CLAIM_REQUIRED (HERD-50): the ref set is IDENTICAL (HERD_CLAIM_ID:-HERD_ITEM_REF), so
+# with BOTH on the same id both satisfies this gate AND is atomically CLAIMED before the worktree —
+# every spawn is then visible in the tracker AND raced-safe. The two are orthogonal: TRACKED_SPAWNS
+# enforces VISIBILITY (a ref exists), CLAIM_REQUIRED enforces EXCLUSIVITY (no double-build).
+: "${TRACKED_SPAWNS:="off"}"     # off (default) → today's behavior; required → refuse a ref-less spawn
+
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE _HERD_CONFIG_LOCAL_FILE
 
 # Derived helpers — split DEFAULT_BRANCH (e.g. "origin/main") for push/pull commands.
@@ -773,6 +792,44 @@ herd_context_provision_preamble() {
     esac
   done
   printf '%s' "$_out"
+}
+
+# ── Tracker-routed spawn enforcement (HERD-64) ───────────────────────────────────────────────────
+# herd_tracked_spawn_or_abort <slug> [forced] — the shared gate the spawn surfaces (herd-quick.sh /
+# herd-feature.sh / spawn.sh) call BEFORE creating anything, to make tracker-routed spawns a project
+# POLICY rather than an operator convention. Driven by the TRACKED_SPAWNS config key.
+#
+# CONTRACT (returns 0 to PROCEED, non-zero to ABORT):
+#   • TRACKED_SPAWNS anything but 'required' (default 'off') → return 0 immediately. Byte-for-byte
+#     today's behavior — no gate, nothing printed.
+#   • required + a tracker ref present (HERD_CLAIM_ID, else the HERD_ITEM_REF the coordinator threads)
+#     → return 0. The SAME ref set herd-claim.sh uses, so one id satisfies both gates.
+#   • required + NO ref + NOT forced → print ONE loud reason to stderr and return NON-ZERO. The caller
+#     exits before creating a worktree/agent/queue-intent.
+#   • required + NO ref + forced (arg2 truthy OR HERD_FORCE_SPAWN=1) → JOURNAL the bypass
+#     (tracked_spawn_bypassed) if journal_append is available, print a loud one-line notice, return 0.
+#
+# forced (arg2) lets a lane pass its already-resolved --force/-f state; HERD_FORCE_SPAWN=1 in the
+# environment is honored regardless (the escape hatch spawn.sh, which parses no flags, relies on).
+herd_tracked_spawn_or_abort() {
+  local _tk_slug="${1:-?}" _tk_forced="${2:-}"
+  case "${TRACKED_SPAWNS:-off}" in
+    required) ;;
+    *) return 0 ;;
+  esac
+  local _tk_id="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
+  [ -n "$_tk_id" ] && return 0
+  # No tracker ref under an active policy. Forced by the lane arg OR the env escape hatch?
+  case "$_tk_forced"          in 1|true|yes|on) _tk_forced=1 ;; *) _tk_forced="" ;; esac
+  case "${HERD_FORCE_SPAWN:-}" in 1|true|yes|on) _tk_forced=1 ;; esac
+  if [ "$_tk_forced" = "1" ]; then
+    command -v journal_append >/dev/null 2>&1 \
+      && journal_append tracked_spawn_bypassed slug "$_tk_slug" reason "no tracker ref; HERD_FORCE_SPAWN bypass"
+    echo "⚠️  TRACKED_SPAWNS=required but '$_tk_slug' carries no tracker ref — HERD_FORCE_SPAWN set, spawning anyway (bypass journaled)." >&2
+    return 0
+  fi
+  echo "🛑 TRACKED_SPAWNS=required: refusing to spawn '$_tk_slug' with no tracker ref — thread HERD_ITEM_REF=<id> (or HERD_CLAIM_ID) on the spawn, or set HERD_FORCE_SPAWN=1 to bypass (bypass is journaled)." >&2
+  return 1
 }
 
 # ── Builder MCP tool provisioning (HERD-41) ──────────────────────────────────────────────────────

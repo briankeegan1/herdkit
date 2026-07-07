@@ -103,8 +103,8 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
    `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
    merge-time reconcile resolves the exact backlog item by that ref instead of fuzzy slug/title
-   matching. Omit it for a file-backend item with no id (the reconcile falls back to fuzzy matching,
-   exactly as before):
+   matching. Under *Tracker-routed spawns* (below) you thread it on **every** spawn — file a tracker
+   item first so there is always a ref; a raw file-backend item with no id falls back to fuzzy matching:
    ```
    HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"
    ```
@@ -123,6 +123,39 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `{{BACKLOG_FILE}}`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
+
+### Tracker-routed spawns — file first, then spawn (always)
+
+**Every builder you spawn must trace back to a tracked work item — no off-book spawns.** This is
+project policy, not a nicety: it keeps the tracker the single truthful picture of what is being built
+and lets merge-time reconcile link each PR to its item by an exact ref.
+
+The rule is **file-then-spawn**:
+
+1. **Ensure a tracker item exists BEFORE you spawn.** Reuse the item you picked, or — for anything not
+   already tracked — enqueue it on the scribe FIRST and use that item:
+   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
+   refactor, a config tweak, a docs pass, a flake fix all get an item too. If it is worth a worktree
+   and a PR, it is worth a one-line tracker entry.
+2. **Thread `HERD_ITEM_REF=<id>` on EVERY lane invocation** — feature, quick, and `spawn.sh` alike:
+   ```
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-quick.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/spawn.sh <slug> quick "<task>"
+   ```
+   The builder then carries a `Refs: <id>` line in its PR body (the exact-ref reconcile), and with
+   `CLAIM_REQUIRED` on the same id atomically **claims** the item so two operators can't double-build it.
+3. **Engine bugs get a tracker mirror.** When you escalate a HERD-ENGINE bug OUT to `{{HERD_REPO}}`
+   via `herd report` (see *Routing* below), also **mirror it as a local tracker item** (scribe-add)
+   if you intend to build the fix here, so the fix-spawn is tracked like any other — the escalation
+   filing alone is not a spawnable tracked item.
+
+**Enforcement (`TRACKED_SPAWNS`).** By default this is a discipline the coordinator follows. Set
+`TRACKED_SPAWNS=required` in `.herd/config` and the lanes + `spawn.sh` **refuse** a spawn that carries
+no tracker ref, with a loud reason — the escape hatch is `HERD_FORCE_SPAWN=1` (it journals the bypass).
+Turn it on for shared / multi-operator repos where an off-book spawn must be impossible, not merely
+discouraged; pair it with `CLAIM_REQUIRED` so every spawn is both **visible** in the tracker and
+**claimed** against a double-build.
 
 ### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
 

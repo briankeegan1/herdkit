@@ -2775,12 +2775,14 @@ _drain_spawn_queue() {
   local _dsq_n=0
   while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
     # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
-    # Slug and lane are the first two payload lines; the task is EVERYTHING after them.
-    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_task=""
+    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), then the
+    # task as EVERYTHING after them. The ref line is ALWAYS present so this positional read stays fixed.
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_task=""
     {
       IFS= read -r _dsq_line1
       IFS= read -r _dsq_slug
       IFS= read -r _dsq_lane
+      IFS= read -r _dsq_ref
       _dsq_task="$(cat)"
     } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
 
@@ -2802,11 +2804,15 @@ _drain_spawn_queue() {
             _dsq_n=$(( _dsq_n + 1 )); continue ;;
         esac
         # Launch the lane in the FOREGROUND and observe the outcome before consuming the intent.
+        # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
+        # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
+        # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
+        # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
         local _dsq_out="" _dsq_rc=0
         if [ "$_dsq_lane" = "feature" ]; then
-          _dsq_out="$(bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
         else
-          _dsq_out="$(bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
         fi
         if [ "$_dsq_rc" -eq 0 ] && printf '%s' "$_dsq_out" | grep -q 'review-gate saturated'; then
           # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent

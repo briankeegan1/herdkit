@@ -4,14 +4,17 @@
 #
 # Subcommands:
 #   next              Reclaim stale claims (>5 min old); atomically claim the oldest pending
-#                     intent via a rename (.req → .req.mine); print four lines:
+#                     intent via a rename (.req → .req.mine); print:
 #                       "CLAIMED <path>"
 #                       <slug>
 #                       <lane>
+#                       <tracker ref>    (HERD-64; the $INTENT_ID.ref sidecar, EMPTY line when absent)
 #                       <task text>
 #                     Or print "EMPTY" when the queue has no pending intents. Returns immediately
-#                     (no polling wait — the watcher calls this on every tick).
-#   done <path>       Remove the claimed intent file (intent was successfully launched).
+#                     (no polling wait — the watcher calls this on every tick). The ref line is
+#                     ALWAYS emitted (empty for an untracked / older-engine intent) so the drain's
+#                     positional read stays fixed; the watcher re-exports it as HERD_ITEM_REF.
+#   done <path>       Remove the claimed intent file (intent was successfully launched) + its ref sidecar.
 #   release <path>    Put a claimed intent BACK in the queue (.req.mine → .req) untouched — used
 #                     when the lane's advisory saturation gate deferred the spawn (held, not
 #                     failed): the intent must survive for a later tick, not be consumed. This is
@@ -46,24 +49,30 @@ case "$cmd" in
       printf 'CLAIMED %s\n' "$claimed"
       head -1 "$claimed"        # line 1: slug
       sed -n '2p' "$claimed"    # line 2: lane
-      tail -n +3 "$claimed"     # line 3+: task text
+      # line 3: tracker ref (HERD-64) — from the $INTENT_ID.ref sidecar, keyed off the claim path.
+      # ALWAYS one line: the sidecar's first line when present, else an empty line (untracked / older
+      # intent). The task follows on subsequent lines, so this keeps the reader's positional parse fixed.
+      _ref="${claimed%.req.mine}.ref"
+      if [ -f "$_ref" ]; then head -1 "$_ref"; else printf '\n'; fi
+      tail -n +3 "$claimed"     # line 3+ of the .req: task text
       exit 0
     fi
     printf 'EMPTY\n'; exit 0
     ;;
   done)
     mine="${2:?usage: spawn-step.sh done <claimed-path>}"
-    rm -f "$mine" 2>/dev/null || true
+    rm -f "$mine" "${mine%.req.mine}.ref" 2>/dev/null || true   # intent + its ref sidecar (HERD-64)
     ;;
   release)
     mine="${2:?usage: spawn-step.sh release <claimed-path>}"
+    # Put the intent back for a later tick; KEEP the ref sidecar so the re-queued intent stays tracked.
     mv -f "$mine" "${mine%.mine}" 2>/dev/null || true
     ;;
   skip)
     mine="${2:?usage: spawn-step.sh skip <claimed-path> <reason>}"
     reason="${3:-malformed intent}"
     printf 'spawn-step: WARNING — skipping intent %s: %s\n' "$(basename "${mine%.req.mine}")" "$reason" >&2
-    rm -f "$mine" 2>/dev/null || true
+    rm -f "$mine" "${mine%.req.mine}.ref" 2>/dev/null || true   # drop the bad intent + its ref sidecar
     ;;
   *) printf 'usage: spawn-step.sh next | done <path> | release <path> | skip <path> <reason>\n' >&2; exit 2 ;;
 esac
