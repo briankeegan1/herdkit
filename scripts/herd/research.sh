@@ -15,6 +15,10 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the researcher drainer launch through herd_driver_launch_agent so
+# HERD_DRIVER=headless spawns a detached researcher; herdr-claude emits the identical argv below.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 REPO="$PROJECT_ROOT"
 TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
@@ -102,5 +106,7 @@ EOF
 )
 created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_RESEARCHER" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herdr agent start "$HERD_AGENT_RESEARCHER" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --tab "$TAB" --no-focus --env "RESEARCH_TAB=$TAB" -- claude --model "$RESEARCH_MODEL" $CLAUDE_FLAGS "$PROMPT"
+herd_driver_launch_agent \
+  name="$HERD_AGENT_RESEARCHER" workspace="$_WS_ID" cwd="$REPO" tab="$TAB" env="RESEARCH_TAB=$TAB" \
+  model="$RESEARCH_MODEL" flags="$CLAUDE_FLAGS" pointer="$PROMPT"
 echo "🔎 researcher drainer dispatched (tab $TAB). Coordinator is free; fetch the report with research-get.sh $REQ_ID."

@@ -1288,8 +1288,12 @@ EOF
   # The NL master-coordinator agent: ONE tab, running the rendered skill. No watcher/backlog panes.
   # No existing room was found above, so this is a GENUINE start failure — report it with a clearer,
   # actionable message (not the old bare "could not start …"), pointing at the likely herdr cause.
-  herdr agent start "$agent_name" --workspace "$WS" --cwd "$room" --tab "$TAB" \
-    -- claude --model "$model" "$cmd" >/dev/null 2>&1 \
+  # Routed through the driver seam (herd_driver_launch_agent) so HERD_DRIVER=headless spawns a detached
+  # fleet-coordinator; the default herdr-claude driver emits the identical argv. HUMAN seat by design:
+  # no flags (interactive, human-gated) and focus=yes (omit --no-focus) — byte-identical to the old call.
+  herd_driver_launch_agent \
+    name="$agent_name" workspace="$WS" cwd="$room" tab="$TAB" focus=yes \
+    model="$model" pointer="$cmd" >/dev/null 2>&1 \
     || die "could not start the fleet-coordinator agent in workspace $WS — herdr agent start failed (check 'herdr agent list' / that herdr is healthy). No existing room was detected, so this is a real launch failure."
 
   ok "fleet room up — ${c_bold}$agent_name${c_rst} managing $nproj project(s) via $cmd"
