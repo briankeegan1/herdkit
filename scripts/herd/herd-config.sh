@@ -216,6 +216,15 @@ esac
 # and NEVER under the headless driver (no panes). Defaulted here so the lanes see it under `set -u`.
 : "${TASK_PANE_VIEW:="on"}"
 
+# DOCTOR_STARTUP_HINT — proactive soft-dependency surfacing on control-room startup (herd reload /
+# coordinator launch). Default "off": startup prints NOTHING extra, so every startup path stays
+# byte-identical unless the operator opts in. Set "on" and startup emits ONE dim line per MISSING
+# soft dep (glow, shellcheck, bats), each naming the single feature it degrades, then a dim pointer
+# to `herd doctor` for the install command — never red, never blocking (soft deps only degrade; the
+# no-false-red rule). Any value other than "on" is treated as off. Defaulted here so the startup
+# paths see it under `set -u`.
+: "${DOCTOR_STARTUP_HINT:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)

@@ -124,3 +124,9 @@ fi
 layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}"
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"
+
+# PROACTIVE soft-dep surfacing (HERD-45) — opt-in via DOCTOR_STARTUP_HINT (loaded from .herd/config
+# above); a no-op / byte-identical launch unless it is "on". When on, surface any missing soft dep +
+# the `herd doctor` fix now, at control-room startup, rather than waiting for the degradation to bite.
+# _herd_soft_dep_startup_notice comes from herd-preflight.sh (already sourced above).
+_herd_soft_dep_startup_notice

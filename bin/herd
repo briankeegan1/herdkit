@@ -2368,6 +2368,10 @@ cmd_reload() {
   export HERD_CONFIG_FILE="$cfg"
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-config.sh"
+  # Side-effect-free source: defines _herd_soft_dep_startup_notice for the opt-in soft-dep reminder
+  # printed at the end of the summary below (no-op unless DOCTOR_STARTUP_HINT=on).
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-preflight.sh"
 
   # 1. Stop this project's watcher(s) — SIGTERM-poll-SIGKILL-abort + duplicate-watcher guard.
   _stop_project_watcher
@@ -2743,6 +2747,10 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   say "  watcher:       $wsum"
   say "  backlog:       $backlog_desc"
   say "  MERGE_POLICY:  ${c_bold}$effective_policy${c_rst}"
+
+  # PROACTIVE soft-dep surfacing (HERD-45) — opt-in via DOCTOR_STARTUP_HINT; a no-op (byte-identical
+  # summary) unless it is "on". Surfaces any missing soft dep + the `herd doctor` fix at startup.
+  _herd_soft_dep_startup_notice
 }
 
 # ── herd pane <watch|backlog|coordinator>: single-pane restart shortcuts ─────────────────────────

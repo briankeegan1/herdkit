@@ -338,6 +338,11 @@ render_backend_frame() {
     else
       # No glow: print the raw list, taming rich TSV's tabs into readable spacing.
       printf '%s\n' "$list" | tr '\t' ' ' || rc=$?
+      # SELF-DIAGNOSING degraded render (HERD-45): glow is what paints the pretty pane; without it
+      # the frame above is raw markdown. Point the user straight at the fix at the exact moment they
+      # hit the degradation — one dim informational line, never red (no-false-red rule). Mirrors the
+      # fzf self-hint in `herd backlog browse`; does not touch $rc (a bad hint must never fail render).
+      printf '\033[2mglow not found — showing raw markdown; run herd doctor for the install command\033[0m\n'
     fi
   else
     printf '\033[2m(no open items yet)\033[0m\n'
