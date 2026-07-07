@@ -838,11 +838,13 @@ cmd_render() {
   ok "rendered coordinator skill → $skill"
 }
 
-# ── herd codemap: regenerate docs/codemap.md, the native map of the herdkit engine tree ──────────
-# Delegates to scripts/herd/codemap.sh, which scans THIS engine repo (bin/herd + scripts/herd/*.sh +
-# templates/) and regenerates the committed, deterministic docs/codemap.md — module roles,
-# who-sources-whom, and config-key → consumer wiring — for coordinator/builder agents to load as
-# context instead of re-exploring the repo. Idempotent; maps the engine, so it needs no .herd/config.
+# ── herd codemap: regenerate docs/codemap.md, a native map of the repo's tree ────────────────────
+# Delegates to scripts/herd/codemap.sh, which regenerates the committed, deterministic docs/codemap.md
+# — module roles, who-imports/sources-whom, and config-key → consumer wiring — for coordinator/builder
+# agents to load as context instead of re-exploring the repo. It auto-detects the tree it is run in
+# (HERD-79): in the herdkit ENGINE repo it maps the engine (bin/herd + scripts/herd/*.sh + templates/)
+# byte-identically to before; in a CONSUMING project it maps THAT project's own source tree,
+# language-aware (node/python/go/rust/java). Idempotent; no .herd/config value is required either way.
 # `herd codemap --check` is a read-only staleness probe: it regenerates to a temp file and diffs it
 # against the committed map WITHOUT writing it, exiting 0 when fresh / non-zero when stale.
 cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
@@ -3867,7 +3869,8 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
-                                        engine tree (module roles, who-sources-whom, config→consumer);
+                                        repo (engine tree here, or a consuming project's own source
+                                        tree; module roles, who-imports/sources-whom, config→consumer);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
   herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
                                         def→caller index of the engine tree (who-defines / who-calls);
