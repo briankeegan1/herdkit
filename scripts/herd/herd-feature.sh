@@ -26,6 +26,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # CLAIM_REQUIRED is on AND a tracker id is present, claims the item synchronously so two operators
 # can't double-build it. Off/no-id → returns 0 immediately (today's behavior).
 . "$HERE/herd-claim.sh"
+# Journal (HERD-64): sourced so herd_tracked_spawn_or_abort can record a TRACKED_SPAWNS bypass.
+# Best-effort + always-0; a no-op when TRACKED_SPAWNS is off (the default).
+. "$HERE/journal.sh"
 # Runtime driver shim: this lane IS the start-agent capability. Under HERD_DRIVER=headless it spawns
 # a DETACHED background agent (no herdr tab/pane) via herd_driver_start_agent; the default herdr-claude
 # driver keeps the herdr tab + agent-start path below byte-identical.
@@ -38,6 +41,13 @@ FORCE_SPAWN="${HERD_FORCE_SPAWN:-}"
 case "${1:-}" in --force|-f) FORCE_SPAWN=1; shift ;; esac
 SLUG="${1:?usage: herd-feature.sh [--force] <slug> [task...]   (slug must be kebab-case)}"; shift || true
 TASK="${*:-}"
+
+# Tracked-spawn policy gate (HERD-64) — BEFORE anything else. When TRACKED_SPAWNS=required a spawn
+# carrying no tracker ref (HERD_CLAIM_ID / HERD_ITEM_REF) is REFUSED here, creating nothing; --force /
+# HERD_FORCE_SPAWN=1 bypasses and journals it. Off (default) → returns 0, byte-identical to today.
+if ! herd_tracked_spawn_or_abort "$SLUG" "$FORCE_SPAWN"; then
+  exit 1
+fi
 
 # Advisory pre-spawn review-gate check (BEFORE any worktree/tab is created). If the review pipeline
 # is saturated AND builds are already leading past REVIEW_CONCURRENCY + SPAWN_AHEAD, HOLD this spawn

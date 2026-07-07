@@ -225,6 +225,18 @@ WATCHER_AUTOMERGE="true"
 # WATCHER_SCOPE="mine"
 # WATCHER_OWNER=""
 
+# tracker-routed spawn enforcement (HERD-64) — make "every builder is traceable to a tracked work
+# item" a PROJECT POLICY, not just a coordinator convention. DEFAULT off: the spawn surfaces
+# (herd-quick.sh / herd-feature.sh / spawn.sh) impose no gate, byte-identical to today.
+#   required → a spawn carrying NO tracker ref (HERD_CLAIM_ID, else the HERD_ITEM_REF the coordinator
+#              threads for a tracked item) is REFUSED with a loud one-line reason and creates nothing.
+#              HERD_FORCE_SPAWN=1 (or a lane's --force) is the explicit escape hatch — it lets the
+#              spawn through and JOURNALS the bypass (visible in `herd log`).
+# Composes with CLAIM_REQUIRED (HERD-50): the ref set is identical, so with BOTH on every spawn is
+# atomically CLAIMED (no double-build) AND visible in the tracker. TRACKED_SPAWNS enforces VISIBILITY,
+# CLAIM_REQUIRED enforces EXCLUSIVITY. Recommended for shared / multi-operator repos.
+# TRACKED_SPAWNS="off"   # off (default) | required
+
 # routing — where engine bugs escalate (herd report files a gh issue here)
 HERD_REPO="briankeegan1/herdkit"
 
