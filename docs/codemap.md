@@ -124,6 +124,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`
 - `DEP_STALE_TTL` → `dep-watcher.sh`
+- `DOCS_ONLY_GLOB` → `agent-watch.sh`
 - `DOCTOR_STARTUP_HINT` → `herd-preflight.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
 - `GRAPHIFY_BIN` → `codemap.sh`
@@ -160,6 +161,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_ESCALATE_GLOB` → `agent-watch.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`
 - `REVIEW_MODEL_CHEAP` → `agent-watch.sh`
+- `REVIEW_MODEL_DOCS` → `agent-watch.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SHARE_LINKS` → `bin/herd`, `new-feature.sh`
