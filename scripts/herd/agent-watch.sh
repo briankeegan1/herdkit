@@ -1130,6 +1130,24 @@ refresh_symbol_index() {
   return 0
 }
 
+# _reap_slug <slug> <dir> <pr#> <sha> [reason] — the IDEMPOTENT worktree-teardown primitive shared by
+# the merge path (do_merge) and the startup reap-sweep (_startup_reap_sweep). Runs the three reap
+# steps in the same order do_merge always has: (1) force-remove the worktree (the SHARE_LINKS
+# symlinks make a non-force remove fail); (2) reap the per-worktree tracker-ref marker (HERD-92 — the
+# ref lives on in the $STATE row for "recently landed"); (3) journal a `reap` event carrying the
+# supplied reason (default 'merged'); (4) close the builder/review/resolver tabs + prune their
+# .herd-tabs rows via herd_teardown_slug. Every step is fail-soft and idempotent — a worktree already
+# gone, a marker already reaped, a tab already closed all no-op — so a second call (a re-run merge
+# tick OR a startup sweep over a worktree do_merge already reaped) is harmless.
+_reap_slug() {
+  local _rp_slug="$1" _rp_dir="$2" _rp_pr="${3:-}" _rp_sha="${4:-}" _rp_reason="${5:-merged}"
+  git -C "$MAIN" worktree remove --force "$_rp_dir" >/dev/null 2>&1 || true
+  rm -f "$(_slug_ref_file "$_rp_slug")" 2>/dev/null || true
+  journal_append reap pr "$_rp_pr" slug "$_rp_slug" sha "$_rp_sha" reason "$_rp_reason"
+  herd_teardown_slug "$_rp_slug"
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -1173,17 +1191,117 @@ do_merge() {
   # 2c) POST-MERGE symbol-index refresh: same posture as 2b but for the function-level def→caller
   #     index (docs/symbol-index.md). Shares the CODEMAP_AUTOREFRESH lever; fully fail-soft.
   refresh_symbol_index "$dp"
-  # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
-  git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
-  # HERD-92: reap the per-worktree tracker-ref marker now that the worktree is gone (the ref lives on
-  # in the $STATE row for "recently landed"). Fail-soft; an orphaned marker is harmless — a reused
-  # slug simply overwrites it at its next spawn.
-  rm -f "$(_slug_ref_file "$ds")" 2>/dev/null || true
-  journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
-  # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Close the builder tab,
-  #    review tab (review·slug), and resolver tab (resolve·slug) in one shot. Verifies each
-  #    close and retries once; warns loudly if a tab cannot be closed.
-  herd_teardown_slug "$ds"
+  # 3+4) IDEMPOTENT teardown (the WATCHER's job — sub-agents NEVER self-close): force-remove the
+  #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
+  #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup
+  #      reap-sweep so a merge that crashed BEFORE this point (PR #208) is resumed on restart.
+  _reap_slug "$ds" "$dd" "$dp" "$dsha" merged
+  return 0
+}
+
+# _srs_gh_view <branch-or-pr#> — echo "state<TAB>headRefOid<TAB>number" for a PR resolved by branch
+# name OR number, or nothing on any error (no PR, deleted branch, gh down). One network call. The head
+# OID is what makes the sweep SAFE (see _startup_reap_sweep) — never reap without it.
+_srs_gh_view() {
+  gh pr view "$1" --json state,number,headRefOid \
+    -q '.state+"\t"+((.headRefOid)//"")+"\t"+(((.number)//0)|tostring)' 2>/dev/null || true
+}
+
+# _startup_reap_sweep — RESUME teardown for a merged-but-unreaped worktree (HERD-91). Reaps are
+# merge-EVENT-driven: do_merge writes the merge ledger row FIRST, then runs the post-merge sequence
+# (reconcile → ff → codemap/symbol-index refresh → worktree remove + tab close). A watcher killed
+# mid-sequence (PR #208: a restart 2 s after a merge) lands the merge but never reaps, stranding the
+# worktree + its idle builder tab with NO red anywhere — and because the merge is already ledgered,
+# the restarted watcher never retries. This one-shot startup sweep closes that gap: it walks the live
+# feature worktrees and, for any that is PROVABLY the head of an ALREADY-MERGED PR, runs the SAME
+# idempotent reap path do_merge does (worktree remove, marker reap, tab close, .herd-tabs prune) —
+# journaling the reap with reason=startup-sweep so a post-mortem can tell a resumed teardown apart.
+#
+# SAFETY — never reap a live builder (data-integrity): a slug is a coordinator-chosen kebab name that
+# gets re-spawned (a follow-up on the same feature), the merge ledger ($STATE) is append-only and
+# never pruned, and a builder opens its PR DURING the run (not at spawn). So a fresh, actively-building
+# worktree can carry a minutes-old stale ledger row AND have no PR yet — the exact PR #208 restart
+# window this targets. A slug/branch-name match alone (or a "gh silent + in ledger" fallback) would
+# force-remove that live worktree and silently lose uncommitted work. The invariant that makes the
+# reap safe is therefore NOT the slug but the COMMIT: we reap a worktree ONLY when its current HEAD sha
+# equals the headRefOid of a MERGED PR — i.e. every committed thing in the worktree is already in a
+# merged PR, so there is nothing to lose. Concretely, per worktree:
+#   1. resolve the worktree's HEAD sha locally (git rev-parse); no HEAD ⇒ can't verify ⇒ SKIP.
+#   2. look up the PR by branch name; if it is MERGED and its headRefOid == HEAD ⇒ reap candidate.
+#   3. else, if the slug is in the ledger, look up THAT PR by number; MERGED and headRefOid == HEAD
+#      ⇒ reap candidate (covers a stranded worktree whose branch was deleted at merge, without
+#      trusting the stale ledger row blindly — the sha still has to match).
+#   4. otherwise SKIP. A reused slug with a fresh commit (or none yet), a still-OPEN PR, an
+#      unreachable gh, all fail the sha match and are left untouched.
+#   5. defense-in-depth: even with a HEAD match, refuse to force-remove a worktree with UNCOMMITTED
+#      changes — a merged worktree is clean, so a dirty tree is not the stranded case; journal a skip.
+# Idempotent + fully fail-soft (the reap primitive no-ops on an already-gone worktree / closed tab),
+# so a re-run is harmless; the SELF worktree is always excluded. Skipped entirely in dry-run. Zero
+# stranded worktrees ⇒ zero action (no reap, no journal line) — the common, healthy startup.
+_startup_reap_sweep() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _srs_wt; _srs_wt="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || true)"
+  [ -n "$_srs_wt" ] || return 0
+  # Slugs the reap ledger already records as merged (col 3 of each $STATE row: 'ts pr slug [ref]').
+  local _srs_ledger=""
+  [ -f "$STATE" ] && _srs_ledger="$(awk 'NF>=3{print $3}' "$STATE" 2>/dev/null || true)"
+  local _srs_dir _srs_slug _srs_branch _srs_n=0
+  while IFS=$'\x1f' read -r _srs_dir _srs_slug _srs_branch; do
+    [ -n "$_srs_slug" ] || continue
+    [ "$_srs_dir" = "$SELF_WT" ] && continue        # never reap the coordinator's own checkout
+    [ -d "$_srs_dir" ] || continue
+    # (1) The worktree's CURRENT HEAD sha — the anchor the reap decision must match against.
+    local _srs_head
+    _srs_head="$(git -C "$_srs_dir" rev-parse HEAD 2>/dev/null || true)"
+    [ -n "$_srs_head" ] || continue                  # no resolvable HEAD → cannot verify → SKIP
+    # (2) Resolve a MERGED PR whose headRefOid == this worktree's HEAD. Try the branch name first…
+    local _srs_pr="" _srs_st _srs_oid _srs_num
+    if [ -n "$_srs_branch" ]; then
+      IFS=$'\t' read -r _srs_st _srs_oid _srs_num <<EOF
+$(_srs_gh_view "$_srs_branch")
+EOF
+      if [ "$_srs_st" = "MERGED" ] && [ -n "$_srs_oid" ] && [ "$_srs_oid" = "$_srs_head" ]; then
+        _srs_pr="$_srs_num"
+      fi
+    fi
+    # (3) …else fall back to the ledger's PR NUMBER (covers a branch deleted at merge). The sha match
+    #     is STILL required, so a stale ledger row for a re-spawned slug can never reap a live worktree.
+    if [ -z "$_srs_pr" ] && [ -n "$_srs_ledger" ] && printf '%s\n' "$_srs_ledger" | grep -qxF "$_srs_slug"; then
+      local _srs_ledger_pr
+      _srs_ledger_pr="$(awk -v s="$_srs_slug" 'NF>=3 && $3==s{p=$2} END{if(p!="")print p}' "$STATE" 2>/dev/null || true)"
+      if [ -n "$_srs_ledger_pr" ]; then
+        IFS=$'\t' read -r _srs_st _srs_oid _srs_num <<EOF
+$(_srs_gh_view "$_srs_ledger_pr")
+EOF
+        if [ "$_srs_st" = "MERGED" ] && [ -n "$_srs_oid" ] && [ "$_srs_oid" = "$_srs_head" ]; then
+          _srs_pr="$_srs_ledger_pr"
+        fi
+      fi
+    fi
+    # (4) No MERGED PR whose head is this worktree's HEAD → not stranded (in-flight / reused / gh down).
+    [ -n "$_srs_pr" ] || continue
+    # (5) Defense-in-depth: never force-remove a worktree carrying uncommitted work.
+    if [ -n "$(git -C "$_srs_dir" status --porcelain 2>/dev/null)" ]; then
+      journal_append startup_reap_skip slug "$_srs_slug" pr "$_srs_pr" reason dirty-worktree
+      continue
+    fi
+    _reap_slug "$_srs_slug" "$_srs_dir" "$_srs_pr" "$_srs_head" startup-sweep
+    _srs_n=$(( _srs_n + 1 ))
+  done < <(WT="$_srs_wt" MAIN="$MAIN" python3 -c '
+import os
+MAIN = os.environ["MAIN"]
+def emit(wt, branch):
+    if wt and wt != MAIN:
+        print("\x1f".join([wt, os.path.basename(wt), branch or ""]))
+wt = None; branch = None
+for line in (os.environ.get("WT") or "").splitlines():
+    if line.startswith("worktree "):
+        emit(wt, branch); wt = line[9:]; branch = None
+    elif line.startswith("branch "):
+        branch = line[7:].replace("refs/heads/", "")
+emit(wt, branch)
+' 2>/dev/null)
+  [ "$_srs_n" -eq 0 ] || journal_append startup_reap_sweep reaped "$_srs_n"
   return 0
 }
 
@@ -3158,6 +3276,11 @@ _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0
 _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+
+# One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
+# (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
+# stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
+_startup_reap_sweep
 
 while true; do
   build_header
