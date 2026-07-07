@@ -847,6 +847,15 @@ cmd_render() {
 # against the committed map WITHOUT writing it, exiting 0 when fresh / non-zero when stale.
 cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
 
+# ── herd symbol-index: regenerate docs/symbol-index.md, the native def→caller index ──────────────
+# The function-level companion to `herd codemap`. Delegates to scripts/herd/symbol-index.sh, which
+# scans THIS engine repo (bin/herd + scripts/herd/**) and regenerates the committed, deterministic
+# docs/symbol-index.md — every shell function's definition site(s) and cross-file call sites — so a
+# builder can answer "who calls _backend_update_state" with one lookup and the coordinator can
+# sharpen its overlap read to symbol level. Idempotent; maps the engine, needs no .herd/config.
+# `herd symbol-index --check` is a read-only staleness probe (0 fresh / non-zero stale), like codemap.
+cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -3824,6 +3833,9 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
                                         engine tree (module roles, who-sources-whom, config→consumer);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
+  herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
+                                        def→caller index of the engine tree (who-defines / who-calls);
+                                        --check probes staleness read-only (0 fresh / non-zero stale)
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -3931,6 +3943,7 @@ case "${1:-help}" in
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
   codemap) shift; cmd_codemap "$@" ;;
+  symbol-index) shift; cmd_symbol_index "$@" ;;
   config)  shift; cmd_config "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;

@@ -48,6 +48,7 @@ Role summarized from each file's top-of-file comment.
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
 - `spawn.sh` — spawn.sh <slug> <lane> <task> — ENQUEUE a builder spawn intent to the durable spawn queue and
 - `status.sh` — pure helpers + the orchestrator behind `herd status`, a ONE-SHOT, READ-ONLY,
+- `symbol-index.sh` — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
 
@@ -92,6 +93,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `scribe.sh` → `driver.sh`, `herd-config.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
+- `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 
 ## Config key → consumers

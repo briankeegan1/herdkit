@@ -923,6 +923,54 @@ refresh_codemap() {
   return 0
 }
 
+# refresh_symbol_index <pr#> — POST-MERGE symbol-index freshness hook, the function-level twin of
+# refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd $MAIN and,
+# ONLY when the deterministic scan actually changed its content, commits the refresh STRAIGHT to the
+# default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and byte-inert on every
+# failure mode; journals a `symbol_index_refresh` event; can never return non-zero into do_merge.
+#
+# Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
+# and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
+# (the committed docs/symbol-index.md exists — never materialize a new one); (2) skip if that path
+# already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
+# changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
+refresh_symbol_index() {
+  local rs_pr="${1:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh"
+  case "$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|off|no|disable|disabled)
+      journal_append symbol_index_refresh pr "$rs_pr" result skipped reason disabled; return 0 ;;
+  esac
+  [ -f "$rs_script" ]    || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-script; return 0; }
+  [ -f "$MAIN/$rs_out" ] || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-index;  return 0; }
+  # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
+  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+    journal_append symbol_index_refresh pr "$rs_pr" result skipped reason dirty-path; return 0
+  fi
+  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+  if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result error reason regen-failed; return 0
+  fi
+  # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
+  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+    journal_append symbol_index_refresh pr "$rs_pr" result fresh; return 0
+  fi
+  # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
+  # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+  if ! git -C "$MAIN" commit -q -m "chore: refresh symbol-index after PR #${rs_pr}" -- "$rs_out" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result error reason commit-failed; return 0
+  fi
+  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes; return 0
+  fi
+  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
+     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes-after-rebase; return 0
+  fi
+  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+  journal_append symbol_index_refresh pr "$rs_pr" result committed pushed no
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -948,6 +996,9 @@ do_merge() {
   #     BACKLOG.md-style) and push ff-safe. Gated by CODEMAP_AUTOREFRESH; fully fail-soft — a codemap
   #     problem never blocks or fails the merge (mirrors the reconcile hook's best-effort posture).
   refresh_codemap "$dp"
+  # 2c) POST-MERGE symbol-index refresh: same posture as 2b but for the function-level def→caller
+  #     index (docs/symbol-index.md). Shares the CODEMAP_AUTOREFRESH lever; fully fail-soft.
+  refresh_symbol_index "$dp"
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
   git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
   journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
