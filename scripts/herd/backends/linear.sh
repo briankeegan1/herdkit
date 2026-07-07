@@ -180,14 +180,21 @@ EOF
   commentCreate(input: { issueId: $issueId, body: $body }) { success }
 }' "$(ID="$issue_id" BODY="Shipped via ${pr}" python3 -c 'import os, json
 print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" >/dev/null 2>&1 || true
-    # Move to the Done state.
+    # Move to the Done state — reporting DONE only on a CONFIRMED success:true. A transiently-failed
+    # (or errored) issueUpdate returns NOCHANGE so the watcher's fuzzy-scribe retry path re-attempts,
+    # rather than the old optimistic DONE that mislabeled a failed write as a verified ship
+    # (PR #187/HERD-67 stayed In Progress after merge, 2026-07-07). When no completed state resolved
+    # there is no move to verify, so behavior is unchanged (the PR-link comment already posted).
     if [ -n "$state_id" ]; then
-        _linear_gql 'mutation Ship($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
-}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
-print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
+        if _linear_issue_update_state_verified "$issue_id" "$state_id"; then
+            _BACKEND_RESULT="DONE"
+        else
+            echo "linear backend: issueUpdate shipping '$slug' to Done was not confirmed (success≠true) — leaving it for retry (skipping, not filing)" >&2
+            _BACKEND_RESULT="NOCHANGE"
+        fi
+    else
+        _BACKEND_RESULT="DONE"
     fi
-    _BACKEND_RESULT="DONE"
 }
 
 _linear_state_type_for() {
@@ -265,6 +272,27 @@ print(json.dumps({"t": os.environ["T"]}))')"
     _linear_gql "$q" "$v"
 }
 
+_linear_issue_update_state_verified() {
+    # Fire the issueUpdate(stateId:) transition and VERIFY it actually landed before a caller may
+    # report DONE. $1 = issue id; $2 = target workflow-state id. Returns 0 ONLY when the response
+    # parses data.issueUpdate.success == true; returns 1 on any transport failure, GraphQL error, or
+    # success:false. Callers translate a non-zero return into _BACKEND_RESULT=NOCHANGE so agent-watch's
+    # fuzzy-scribe retry path re-attempts — instead of the old optimistic ">/dev/null 2>&1 || true"
+    # followed by an unconditional DONE, which reported a transiently-failed write as a verified
+    # transition and made _reconcile_via_ref journal resolution=explicit-ref and SKIP the retry
+    # (real incident: PR #187/HERD-67 stayed In Progress after merge, 2026-07-07).
+    local id="$1" state_id="$2" resp ok
+    resp="$(_linear_gql 'mutation Move($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}' "$(ID="$id" SID="$state_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" 2>/dev/null)" || return 1
+    ok="$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print("1" if (((d.get("data") or {}).get("issueUpdate") or {}).get("success")) else "0")' 2>/dev/null)"
+    [ "$ok" = "1" ]
+}
+
 _backend_update_state() {
     # $1 = item ref (Linear identifier e.g. HERD-22, a leading '#' tolerated — or a title phrase when
     # no identifier is present); $2 = target state (done|in-progress|canceled + synonyms).
@@ -314,11 +342,16 @@ EOF
         _BACKEND_RESULT="NOCHANGE"
         return 0
     fi
-    _linear_gql 'mutation Move($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
-}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
-print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
-    _BACKEND_RESULT="DONE"
+    # Transition the issue — reporting DONE only when the issueUpdate is CONFIRMED (success:true). A
+    # transiently-failed mutation returns NOCHANGE so agent-watch's _reconcile_via_ref does NOT journal
+    # resolution=explicit-ref and skip the fuzzy-scribe fallback that would retry — the exact failure
+    # behind PR #187/HERD-67 staying In Progress after merge (2026-07-07).
+    if _linear_issue_update_state_verified "$issue_id" "$state_id"; then
+        _BACKEND_RESULT="DONE"
+    else
+        echo "linear backend: issueUpdate for '$ref' → '$want' was not confirmed (success≠true) — state left unresolved for retry (skipping, not filing)" >&2
+        _BACKEND_RESULT="NOCHANGE"
+    fi
 }
 
 _backend_list_open() {
