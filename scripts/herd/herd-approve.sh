@@ -34,12 +34,25 @@ c_grn=""; c_red=""; c_dim=""; c_rst=""
 APPROVALS="$WORKTREES_DIR/.agent-watch-approvals"
 REVIEW_STATE="$WORKTREES_DIR/.agent-watch-reviewed"
 OVERRIDES="$WORKTREES_DIR/.agent-watch-overrides"
+# Merge/reap ledger the watcher appends to in do_merge ("<epoch> <pr#> <slug>"). Used as the
+# offline, authoritative source for the HERD-90 display backstop below.
+MERGED_STATE="$WORKTREES_DIR/.agent-watch-merged"
 
 cmd="${1:-list}"
 shift 2>/dev/null || true
 
 # epoch_to_hhmm <epoch> — HH:MM from a Unix timestamp; BSD/macOS (-r) and GNU/Linux (-d @) safe.
 epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+
+# pr_merged <pr#> — HERD-90 display-level backstop: is this PR already merged? A merged PR's stale
+# 'awaiting' rows are phantom holds and must never surface in `list`. Checks the watcher's
+# merge/reap ledger first (offline, authoritative for engine merges — the exact case that leaks the
+# old-sha row), then falls back to a cheap `gh` state probe (catches PRs merged out-of-band, e.g. a
+# human merging on GitHub). Fail-soft: no ledger + no gh ⇒ not-merged, so the row still shows.
+pr_merged() {
+  grep -q "^[0-9][0-9]* $1 " "$MERGED_STATE" 2>/dev/null && return 0
+  [ "$(gh pr view "$1" --json state -q '.state' 2>/dev/null)" = "MERGED" ]
+}
 
 # print_human_verify_steps <pr#> — if the PR declares a HUMAN-VERIFY block, print its steps
 # (indented) so the operator knows exactly what to run before approving. Silent if none. Reflects the
@@ -73,6 +86,9 @@ case "$cmd" in
       [ "$state" = "awaiting" ] || continue
       # Skip if already approved for this exact sha.
       grep -q "^[0-9]* approved $prnum $sha$" "$APPROVALS" 2>/dev/null && continue
+      # HERD-90 backstop: skip a merged PR's stale awaiting rows (phantom hold). Guards the window
+      # before do_merge's purge runs, and PRs merged out-of-band that the purge never saw.
+      pr_merged "$prnum" && continue
       # Look up the review verdict recorded for this PR + sha.
       verdict="$(awk -v p="$prnum" -v s="$sha" '$2==p && $3==s{v=$4} END{if(v) print v; else print "unknown"}' \
         "$REVIEW_STATE" 2>/dev/null || echo "unknown")"
