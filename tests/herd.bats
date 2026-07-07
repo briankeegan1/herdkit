@@ -73,6 +73,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backlog-view manual-refresh key (HERD-48) test passes" {
+  run bash "$REPO/tests/test-backlog-view-refresh-key.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]
@@ -83,6 +89,12 @@ setup() {
   run bash "$REPO/tests/test-plugin-manifest.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS"* ]]
+}
+
+@test "hermetic tab-leak-guard engine-whitelist test passes" {
+  run bash "$REPO/tests/test-tab-leak-whitelist.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
 }
 
 @test "herd render produces no leftover template tokens for this repo" {

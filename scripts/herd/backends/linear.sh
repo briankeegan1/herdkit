@@ -320,7 +320,7 @@ _backend_list_open_rich() {
     if [ -n "${LINEAR_TEAM_ID:-}" ]; then
         query='query L($team: ID!) {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
-    nodes { identifier title description state { name type } }
+    nodes { identifier title description state { name type } assignee { displayName } }
   }
 }'
         vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
@@ -328,7 +328,7 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
     else
         query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
-    nodes { identifier title description state { name type } }
+    nodes { identifier title description state { name type } assignee { displayName } }
   }
 }'
         vars=""
@@ -349,8 +349,9 @@ for _, _, n, st in rows:
     desc = flat(n.get("description"))
     if len(desc) > 280:
         desc = desc[:279].rstrip() + "…"
-    print("#%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
-                                   flat(st.get("name")), flat(n.get("title")), desc))' 2>/dev/null || true
+    assignee = flat((n.get("assignee") or {}).get("displayName") or "")
+    print("#%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
+                                        flat(st.get("name")), flat(n.get("title")), desc, assignee))' 2>/dev/null || true
 }
 
 _backend_show_item() {
@@ -362,7 +363,7 @@ _backend_show_item() {
     # doesn't parse or the issue can't be found (callers print their own soft fallback).
     local ref="$1" resp
     _linear_require_key
-    if ! _linear_issue_query "$ref" 'identifier title description url updatedAt state { name type }'; then
+    if ! _linear_issue_query "$ref" 'identifier title description url updatedAt state { name type } assignee { displayName }'; then
         echo "linear backend: '$ref' is not a TEAMKEY-NUMBER identifier" >&2
         return 1
     fi
@@ -375,7 +376,11 @@ if not nodes:
     sys.exit(1)
 n = nodes[0]
 st = n.get("state") or {}
-print("#%s · %s (%s)" % (n.get("identifier", ""), st.get("name") or "?", st.get("type") or "?"))
+aname = ((n.get("assignee") or {}).get("displayName") or "").strip()
+header = "#%s · %s (%s)" % (n.get("identifier", ""), st.get("name") or "?", st.get("type") or "?")
+if aname:
+    header += " · " + aname
+print(header)
 print()
 print(n.get("title") or "(untitled)")
 desc = (n.get("description") or "").strip()
@@ -419,4 +424,88 @@ print(nodes[0].get("state", {}).get("type", "") if nodes else "")
         started)                      ITEM_STATE="in-progress" ;;
         *)                            ITEM_STATE="open"         ;;
     esac
+}
+
+# _backend_claim_item REF WHO — atomic-ish pre-spawn claim (HERD-50). On Linear the claim marker is
+# the issue ASSIGNEE plus a move into a 'started' workflow state. The claimant identity is the API
+# key's OWN user (viewer{}), not WHO — WHO is informational only, since Linear identifies actors by
+# their user id, not a login string. Read state.type + assignee SYNCHRONOUSLY; abort if the issue is
+# completed/canceled (shipped) or already assigned to a DIFFERENT user; else set assignee=viewer +
+# move to a started state and RE-READ to verify. Linear has no compare-and-swap, so claim-verify
+# narrows (not eliminates) the race to a couple of round-trips (seconds). Sets:
+#   _CLAIM_RESULT = CLAIMED | SELF (already ours) | ALREADY (closed / another assignee) |
+#                   UNREACHABLE (unresolvable ref / no started state → caller fails soft)
+#   _CLAIM_OWNER  = the blocking assignee's name (for the abort message)
+_backend_claim_item() {
+    local ref="$1" who="$2" me me_id resp issue_id assignee_id assignee_name stype state_id
+    _CLAIM_RESULT=""; _CLAIM_OWNER=""
+    _linear_require_key
+    # viewer = the API key's user — the Linear-side claimant identity.
+    me="$(_linear_gql 'query { viewer { id name } }' | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+v = (d.get("data") or {}).get("viewer") or {}
+print("%s\t%s" % (v.get("id", ""), v.get("name", "")))' 2>/dev/null)"
+    me_id="${me%%	*}"
+    if [ -z "$me_id" ]; then _CLAIM_RESULT="UNREACHABLE"; return 0; fi
+
+    if ! _linear_issue_query "$ref" 'id identifier assignee { id name } state { type } team { states(filter: { type: { eq: "started" } }, first: 1) { nodes { id } } }'; then
+        _CLAIM_RESULT="UNREACHABLE"; return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    # "<issue_id>\t<assignee_id>\t<assignee_name>\t<state_type>\t<started_state_id>" — split on TAB
+    # only, so an assignee display name containing spaces (e.g. "Other Op") stays one field.
+    IFS=$'\t' read -r issue_id assignee_id assignee_name stype state_id <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if not nodes:
+    print("\t\t\t\t")
+else:
+    n = nodes[0]
+    a = n.get("assignee") or {}
+    st = n.get("state") or {}
+    states = (((n.get("team") or {}).get("states") or {}).get("nodes")) or []
+    print("%s\t%s\t%s\t%s\t%s" % (n.get("id", ""), a.get("id", ""), (a.get("name") or "").replace("\t"," "),
+                                  st.get("type", ""), states[0]["id"] if states else ""))' 2>/dev/null)
+EOF
+    if [ -z "$issue_id" ]; then _CLAIM_RESULT="UNREACHABLE"; return 0; fi
+    case "$stype" in
+        completed|canceled|cancelled) _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${assignee_name:-a completed issue}"; return 0 ;;
+    esac
+    if [ -n "$assignee_id" ] && [ "$assignee_id" != "$me_id" ]; then
+        _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${assignee_name:-another operator}"; return 0
+    fi
+    if [ "$assignee_id" = "$me_id" ] && [ "$stype" = "started" ]; then
+        _CLAIM_RESULT="SELF"; _CLAIM_OWNER="${assignee_name:-$who}"; return 0
+    fi
+    # Unassigned/ours-but-not-started → claim: assign viewer + move to a started state (when the team
+    # has one; assignment alone still claims it if not).
+    _linear_gql 'mutation Claim($id: String!, $assignee: String!) {
+  issueUpdate(id: $id, input: { assigneeId: $assignee }) { success }
+}' "$(ID="$issue_id" A="$me_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "assignee": os.environ["A"]}))')" >/dev/null 2>&1 || true
+    if [ -n "$state_id" ]; then
+        _linear_gql 'mutation Start($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
+    fi
+    # CLAIM-VERIFY: re-read the assignee and confirm the claim landed on us (not a racer).
+    if ! _linear_issue_query "$ref" 'assignee { id name }'; then _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"; return 0; fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    IFS=$'\t' read -r assignee_id assignee_name <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+a = (nodes[0].get("assignee") or {}) if nodes else {}
+print("%s\t%s" % (a.get("id", ""), (a.get("name") or "").replace("\t"," ")))' 2>/dev/null)
+EOF
+    if [ -n "$assignee_id" ] && [ "$assignee_id" != "$me_id" ]; then
+        _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${assignee_name:-another operator}"
+    else
+        _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"
+    fi
 }

@@ -148,3 +148,112 @@ _backend_item_state() {
         *)    ITEM_STATE="open"         ;;
     esac
 }
+
+# _backend_claim_item REF WHO — atomic-ish pre-spawn claim (HERD-50). The file backend has no API
+# assignee field, so the claim is a git-committed STATE FLIP on $BACKLOG_FILE: flip the item's line
+# 🔜 → 🚧 and stamp "(claimed by <WHO>)". ATOMICITY comes from git PUSH SERIALIZATION — two operators
+# who both flip the same line commit different edits, and only ONE push lands; the loser's push is
+# rejected, the rebase CONFLICTS on that line, so the loser discards its edit, re-pulls the winner's
+# claim, and RE-READS to find the item 🚧 owned by someone else → ALREADY. Sets:
+#   _CLAIM_RESULT = CLAIMED (we own it) | SELF (already ours — a re-spawn) | ALREADY (another owner /
+#                   shipped) | UNREACHABLE (no backlog / item not found → caller fails soft)
+#   _CLAIM_OWNER  = the winning/blocking identity (for the abort message)
+#
+# RESIDUAL RACE (documented honestly): two claimers that both pull-then-read BEFORE either pushes will
+# both attempt the flip; push serialization then lets exactly one win and forces the other to abort
+# here. The window is one push round-trip (seconds), not the async-scribe minutes. This is the file
+# backend's compare-and-swap equivalent; Linear/GitHub (no CAS) rely on claim-verify instead.
+_backend_claim_item() {
+    local ref="$1" who="$2" slug parsed status owner
+    _CLAIM_RESULT=""; _CLAIM_OWNER=""
+    slug="${ref#*#}"
+    [ -n "$who" ] || who="unknown-operator"
+    [ -f "$BACKLOG_FILE" ] || { _CLAIM_RESULT="UNREACHABLE"; return 0; }
+
+    # Sync to the remote tip first so a competing claim that already landed is visible BEFORE we read
+    # and decide. Fail-soft: an offline/failed pull just means we claim against local state (a solo
+    # operator with no remote is never blocked by this).
+    git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+
+    # Classify the item's current line and, for an OPEN item, flip it to 🚧 + stamp the claimant IN
+    # PLACE. Prints "<status>\t<owner>" with status ∈ FLIP|SELF|ALREADY|MISSING (MISSING = slug not in
+    # the backlog; ALREADY covers both a 🚧 line owned by another and a ✅ shipped line).
+    parsed="$(BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" python3 - <<'PY'
+import os, re
+backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]; who = os.environ["WHO"]
+with open(backlog, encoding="utf-8") as f:
+    lines = f.readlines()
+idx = next((i for i, l in enumerate(lines) if slug in l), None)
+if idx is None:
+    print("MISSING\t"); raise SystemExit
+line = lines[idx]
+m = re.search(r"\(claimed by ([^)]*)\)", line)
+owner = m.group(1).strip() if m else ""
+if "✅" in line:                      # ✅ shipped — cannot claim a done item
+    print("ALREADY\t" + (owner or "a completed item")); raise SystemExit
+if owner:                             # an explicit claim marker already exists (any emoji state)
+    print(("SELF\t" + owner) if owner == who else ("ALREADY\t" + owner)); raise SystemExit
+if "\U0001f6a7" in line:                   # 🚧 in-progress but no claim marker → owned by someone else
+    print("ALREADY\tanother operator"); raise SystemExit
+# 🔜 open (or a line with no state emoji) → claim it: flip the queue emoji and stamp the claimant.
+new = line.replace("\U0001f51c", "\U0001f6a7", 1) if "\U0001f51c" in line else line  # 🔜 → 🚧
+if "(claimed by" not in new:
+    new = new.rstrip("\n") + " (claimed by %s)\n" % who
+lines[idx] = new
+with open(backlog, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+print("FLIP\t" + who)
+PY
+)"
+    status="${parsed%%	*}"; owner="${parsed#*	}"
+    case "$status" in
+        MISSING) _CLAIM_RESULT="UNREACHABLE"; return 0 ;;
+        SELF)    _CLAIM_RESULT="SELF";    _CLAIM_OWNER="$owner"; return 0 ;;
+        ALREADY) _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="$owner"; return 0 ;;
+        FLIP)    : ;;   # our edit is staged in the working tree — commit + push below
+        *)       _CLAIM_RESULT="UNREACHABLE"; return 0 ;;
+    esac
+
+    # Commit the claim and push. If a competitor's claim landed first, the push is rejected; we rebase
+    # onto their tip — a same-line conflict (both flipped it) means we LOST, so abort the rebase and
+    # hard-reset to their tip (discarding OUR claim commit; on the default branch the ONLY local-ahead
+    # commit is this claim). Then re-read to see who actually owns the 🚧 line.
+    git add "$BACKLOG_FILE" 2>/dev/null || true
+    git diff --cached --quiet || git commit -q -m "Claim: $slug → in-progress ($who)" 2>/dev/null || true
+    if [ -n "$(git rev-list "$DEFAULT_BRANCH..HEAD" 2>/dev/null)" ]; then
+        if ! git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then
+            git fetch -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+            if ! git rebase -q "$HERD_REMOTE/$HERD_BRANCH_NAME" 2>/dev/null; then
+                git rebase --abort >/dev/null 2>&1 || true
+                git reset --hard "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1 || true
+            fi
+            # Still ahead (rebase succeeded, no conflict) → retry the push; a lost claim was reset away
+            # and leaves nothing to push.
+            if [ -n "$(git rev-list "$HERD_REMOTE/$HERD_BRANCH_NAME..HEAD" 2>/dev/null)" ]; then
+                git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # CLAIM-VERIFY: re-read the (now-synced) backlog. Whoever it names as owner of the 🚧 line is the
+    # real winner — this is what turns a lost push into an honest ALREADY.
+    _file_claim_verify "$slug" "$who"
+}
+
+# _file_claim_verify SLUG WHO — re-read $BACKLOG_FILE and set _CLAIM_RESULT/_CLAIM_OWNER from the
+# item's CURRENT owner: 🚧 stamped with WHO (or unstamped, i.e. our own just-made flip) → CLAIMED;
+# 🚧 stamped with a different identity → ALREADY. Used as the post-push verification step.
+_file_claim_verify() {
+    local slug="$1" who="$2" line owner
+    line="$(grep -m1 -F "$slug" "$BACKLOG_FILE" 2>/dev/null || true)"
+    case "$line" in
+        *🚧*)
+            owner="$(printf '%s' "$line" | sed -n 's/.*(claimed by \([^)]*\)).*/\1/p')"
+            if [ -z "$owner" ] || [ "$owner" = "$who" ]; then
+                _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"
+            else
+                _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="$owner"
+            fi ;;
+        *) _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who" ;;
+    esac
+}

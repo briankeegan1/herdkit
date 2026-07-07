@@ -22,6 +22,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 . "$HERE/herd-spawn-gate.sh"
+# Atomic pre-spawn claim (HERD-50): herd_claim_or_abort runs BEFORE worktree creation and, only when
+# CLAIM_REQUIRED is on AND a tracker id is present, claims the item synchronously so two operators
+# can't double-build it. Off/no-id → returns 0 immediately (today's behavior).
+. "$HERE/herd-claim.sh"
 # Runtime driver shim: this lane IS the start-agent capability. Under HERD_DRIVER=headless it spawns
 # a DETACHED background agent (no herdr tab/pane) via herd_driver_start_agent; the default herdr-claude
 # driver keeps the herdr tab + agent-start path below byte-identical.
@@ -61,6 +65,13 @@ if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep
   fi
 fi
 _WS_ID="$(herd_resolve_workspace_id)"
+
+# 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if
+#    the tracked item is already claimed by another operator; proceeds otherwise (including the
+#    off/no-id/backend-unreachable fail-soft paths). Must come before new-feature.sh below.
+if ! herd_claim_or_abort "$SLUG"; then
+  exit 1
+fi
 
 # 1. Worktree off the latest default branch + SHARE_LINKS symlinks (fails loudly if the slug
 #    already exists — don't clobber in-flight work). Abort here if it can't be created: a herdr

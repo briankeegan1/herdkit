@@ -88,3 +88,12 @@ _backend_item_state() {
         ITEM_STATE="closed"
     fi
 }
+
+# _backend_claim_item REF WHO — atomic-ish pre-spawn claim (HERD-50). An append-only changelog has
+# NO per-item state or assignee to flip (entries only move from [Unreleased] to a versioned heading at
+# release time, out of band), so there is nothing to claim atomically. Honor the op contract as an
+# explicit FAIL-SOFT no-op: report UNREACHABLE so herd-claim.sh proceeds as unclaimed (the async
+# scribe path is unchanged) rather than ever hard-blocking a spawn on a backend that cannot claim.
+_backend_claim_item() {
+    _CLAIM_RESULT="UNREACHABLE"; _CLAIM_OWNER=""
+}

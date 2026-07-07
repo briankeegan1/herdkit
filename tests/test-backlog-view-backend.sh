@@ -70,7 +70,7 @@ run_view() {
   local dir="$1"; shift
   env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
-    HERD_FAKE_LOG="$LOG" "$@" \
+    HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null
 }
 
@@ -84,10 +84,12 @@ cat > "$P1/BACKLOG.md" <<'EOF'
 EOF
 git -C "$P1" add -A; git -C "$P1" commit -q -m init
 : > "$LOG"
-# The file loop has no MAX_POLLS hook (it is byte-identical to before) — run it briefly, then stop.
+# The file loop has no MAX_POLLS hook — run it briefly, then stop. BACKLOG_VIEW_TTY=/dev/null keeps it
+# hermetic: the backgrounded viewer must NEVER read the pane's real /dev/tty (the suite runs inside a
+# live pane, where a backgrounded read wedges the gate) — it falls back to the plain sleep instead.
 env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
   HERD_CONFIG_FILE="$P1/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 HERD_FAKE_LOG="$LOG" \
-  bash "$SCRIPT" </dev/null >"$T/out1" 2>/dev/null & vpid=$!
+  BACKLOG_VIEW_TTY=/dev/null bash "$SCRIPT" </dev/null >"$T/out1" 2>/dev/null & vpid=$!
 sleep 1; kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
 grep -q "📋 BACKLOG.md" "$T/out1"          || fail "file-mode header '📋 BACKLOG.md' missing"
 grep -q "file-mode-sentinel-item" "$T/out1" || fail "file-mode did not render the backlog file content"
