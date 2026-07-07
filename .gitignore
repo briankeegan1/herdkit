@@ -23,3 +23,8 @@
 # override the committed baseline; gitignored so a collaborator's local tuning never diverges main
 # or dirties the ff-only `herd update` pull. The baseline .herd/config stays tracked.
 .herd/config.local
+
+# graphify call-graph output (HERD-61) — the coordinator's pre-spawn impact/conflict analysis runs
+# `graphify update --no-cluster` in the main checkout, which writes this machine-local, regenerable
+# graph here. Never committed; keeps the analysis from dirtying the working tree.
+graphify-out/
