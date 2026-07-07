@@ -67,6 +67,13 @@ run() {
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
         *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","url":"https://linear.app/acme/issue/ENG-7","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"url":"https://linear.app/acme/issue/ENG-9","state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
+        # HERD-52 planned markers: unqueue resolves id + comment ids/bodies; list_queued reads
+        # per-issue comment bodies; commentDelete removes a marker; queue resolves just id+identifier.
+        # These specific comment/id shapes MUST precede the generic issues( fallthrough below.
+        *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"},{"id":"cmt_other","body":"an unrelated comment"}]}}]}}}' ;;
+        *"comments { nodes { body } }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]}},{"identifier":"ENG-9","comments":{"nodes":[{"body":"just a regular note"}]}}]}}}' ;;
+        *commentDelete*)    echo '{"data":{"commentDelete":{"success":true}}}' ;;
+        *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7"}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -387,6 +394,61 @@ out="$(
 )"
 echo "$out" | grep -q "RESULT=DONE" || fail "update_state must still succeed with journal_append undefined ($out)"
 [ ! -s "$JLOG" ] || fail "no tracker_write should be written when journal_append is undefined ($(cat "$JLOG"))"
+pass
+
+# 8. HERD-52 queue_item → resolves the issue id, then commentCreate's a 📌 planned marker carrying
+#    who + "sequenced after <blocker>" + a [<epoch>] timestamp. Reports DONE.
+: > "$GQLLOG"
+q="$(run _backend_queue_item ENG-7 alice ENG-9)"
+echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
+grep -q "commentCreate" "$GQLLOG" || fail "queue_item did not post the marker via commentCreate"
+grep -q "queued by alice" "$GQLLOG" || fail "queue_item marker did not name the operator (who)"
+grep -q "sequenced after ENG-9" "$GQLLOG" || fail "queue_item marker did not record the blocker"
+grep -qE '\[[0-9]+\]' "$GQLLOG" || fail "queue_item marker did not embed a [<epoch>] timestamp"
+pass
+
+# 8a. queue_item with NO blocker → marker says "sequenced next", still DONE.
+: > "$GQLLOG"
+qn="$(run _backend_queue_item ENG-7 alice "")"
+echo "$qn" | grep -q "RESULT=DONE" || fail "queue_item (no blocker) did not report DONE ($qn)"
+grep -q "sequenced next" "$GQLLOG" || fail "queue_item (no blocker) did not fall back to 'sequenced next'"
+pass
+
+# 8b. queue_item on an unparseable ref → NOCHANGE, no commentCreate (nothing to mark).
+: > "$GQLLOG"
+qbad="$(run _backend_queue_item nodashhere alice ENG-9 2>/dev/null)"
+echo "$qbad" | grep -q "RESULT=NOCHANGE" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
+grep -q "commentCreate" "$GQLLOG" && fail "queue_item on an unparseable ref should post no comment"
+pass
+
+# 8c. list_queued → reads each open issue's comments and prints ONE TSV line per 📌 marker
+#     ("#<id>\t<who>\t<detail>\t<epoch>"); a non-marker comment (ENG-9's) is ignored.
+: > "$GQLLOG"
+lq="$(run _backend_list_queued)"
+grep -q "comments { nodes { body } }" "$GQLLOG" || fail "list_queued did not request per-issue comment bodies"
+echo "$lq" | grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" \
+  || fail "list_queued did not emit the parsed marker TSV for ENG-7 ($lq)"
+echo "$lq" | grep -q "^#ENG-9" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
+pass
+
+# 8d. unqueue_item → resolves the issue's comments and commentDelete's ONLY the 📌 marker (cmt_mark),
+#     never the unrelated comment (cmt_other). Reports DONE.
+: > "$GQLLOG"
+uq="$(run _backend_unqueue_item ENG-7 alice)"
+echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
+grep -q "commentDelete" "$GQLLOG" || fail "unqueue_item did not delete the marker via commentDelete"
+grep -q '"id": "cmt_mark"' "$GQLLOG" || fail "unqueue_item did not target the 📌 marker comment (cmt_mark)"
+grep -q '"id": "cmt_other"' "$GQLLOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
+pass
+
+# 8e. HERD-85 attribution — a queue write journals ONE tracker_write with requested 'queued' and the
+#     component from HERD_COMPONENT (the CLI sets it to 'plan').
+: > "$JLOG"
+HERD_COMPONENT=plan run _backend_queue_item ENG-7 alice ENG-9 >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "requested queued"   || fail "queue_item tracker_write missing 'requested queued' ($tw)"
+echo "$tw" | grep -q "component plan"      || fail "queue_item did not attribute the 'plan' component ($tw)"
+echo "$tw" | grep -q "result DONE"         || fail "queue_item did not record the result ($tw)"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.

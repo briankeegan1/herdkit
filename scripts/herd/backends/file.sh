@@ -10,6 +10,23 @@
 #   _backend_list_open                — print open items
 #   _backend_item_state REF           — sets ITEM_STATE=open|closed|in-progress
 
+# _backend_tw_journal — HERD-85 tracker-write attribution (mirror of the linear/github backends'). Emit
+# ONE journal event per tracker STATE WRITE so `herd log | grep tracker_write` attributes it in one
+# line. Attribution is the caller's HERD_COMPONENT ('manual' by default). FAIL-SOFT: a silent no-op when
+# journal.sh was never sourced (journal_append undefined) — a journal problem never blocks the write.
+# Args: <ref> <requested-state> <result> [pr]   (pr falls back to $HERD_TW_PR when the arg is omitted).
+_backend_tw_journal() {
+    command -v journal_append >/dev/null 2>&1 || return 0
+    local ref="$1" requested="$2" result="$3" pr="${4:-${HERD_TW_PR:-}}"
+    if [ -n "$pr" ]; then
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend file result "$result" pr "$pr"
+    else
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend file result "$result"
+    fi
+}
+
 # _backend_archive_shipped — keep BACKLOG.md lean by rotating shipped (✅) entries out of the
 # "## Recently shipped" section once it grows past the most recent SHIPPED_KEEP (default 10).
 # Overflow entries move to <BACKLOG_FILE stem>.archive.md (e.g. BACKLOG.archive.md) — a committed
@@ -256,4 +273,115 @@ _file_claim_verify() {
             fi ;;
         *) _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who" ;;
     esac
+}
+
+# ── Planned-work markers (HERD-52) — cross-operator plan-time visibility ─────────────────────────
+# The plan-time complement to the pre-spawn CLAIM (_backend_claim_item, HERD-50): when a coordinator
+# SEQUENCES an item to spawn NEXT but hasn't spawned it yet, it publishes a lightweight PLANNED marker
+# so a second operator doesn't grab the same item during that window. For the file backend the marker
+# is a git-committed ANNOTATION appended to the item's $BACKLOG_FILE line, of the shared shape
+# "📌 queued by <who>: sequenced after <blocker> [<epoch>]" (unix seconds so a reader can age it out at
+# 24h). Because the annotation lands ON the item line it also shows up verbatim in `herd backlog`.
+# Serialization/atomicity is git push, exactly like the file-backend claim; all ops are FAIL-SOFT (a
+# missing backlog / unknown item / offline remote is NOCHANGE, never a hard error — a plan is advisory).
+_backend_queue_item() {
+    # $1 = item ref (a #id or a title slug), $2 = WHO, $3 = BLOCKER (may be empty). Appends/refreshes
+    # the 📌 marker on the item's line and commits+pushes it. Sets _BACKEND_RESULT=DONE|NOCHANGE.
+    local ref="$1" who="$2" blocker="$3" slug ts detail
+    _BACKEND_RESULT="NOCHANGE"
+    slug="${ref#*#}"
+    [ -n "$who" ] || who="unknown-operator"
+    [ -f "$BACKLOG_FILE" ] || return 0
+    ts="$(date +%s 2>/dev/null || echo 0)"
+    if [ -n "$blocker" ]; then detail="sequenced after $blocker"; else detail="sequenced next"; fi
+    git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" DETAIL="$detail" TS="$ts" python3 - <<'PY'
+import os, re, sys
+backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]; who = os.environ["WHO"]
+detail = os.environ["DETAIL"]; ts = os.environ["TS"]
+marker = "\U0001f4cc queued by %s: %s [%s]" % (who, detail, ts)
+with open(backlog, encoding="utf-8") as f:
+    lines = f.readlines()
+idx = next((i for i, l in enumerate(lines) if slug in l), None)
+if idx is None:
+    sys.exit(1)                                   # item not found → NOCHANGE
+line = lines[idx].rstrip("\n")
+# Strip any pre-existing 📌 marker (refresh in place), then append the fresh one.
+line = re.sub(r"\s*\U0001f4cc queued by .*?\[\d+\]", "", line).rstrip()
+lines[idx] = line + " " + marker + "\n"
+with open(backlog, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
+    then
+        _file_marker_commit "Queue: $slug planned by $who" && _BACKEND_RESULT="DONE"
+    fi
+    _backend_tw_journal "$ref" queued "$_BACKEND_RESULT"
+}
+
+_backend_unqueue_item() {
+    # $1 = item ref, $2 = WHO (informational). Strips the 📌 marker off the item's line and
+    # commits+pushes. Sets _BACKEND_RESULT=DONE (a marker was removed) | NOCHANGE (none present).
+    local ref="$1" who="$2" slug
+    _BACKEND_RESULT="NOCHANGE"
+    slug="${ref#*#}"
+    [ -f "$BACKLOG_FILE" ] || return 0
+    git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" python3 - <<'PY'
+import os, re, sys
+backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]
+with open(backlog, encoding="utf-8") as f:
+    lines = f.readlines()
+idx = next((i for i, l in enumerate(lines) if slug in l), None)
+if idx is None:
+    sys.exit(1)
+line = lines[idx]
+new = re.sub(r"\s*\U0001f4cc queued by .*?\[\d+\]", "", line.rstrip("\n")).rstrip() + "\n"
+if new == line:
+    sys.exit(1)                                   # no marker to clear → NOCHANGE
+lines[idx] = new
+with open(backlog, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
+    then
+        _file_marker_commit "Unqueue: $slug plan cleared" && _BACKEND_RESULT="DONE"
+    fi
+    _backend_tw_journal "$ref" unqueued "$_BACKEND_RESULT"
+}
+
+# _backend_list_queued — print every live planned marker in $BACKLOG_FILE, one TAB-separated line
+# each: "<item-text>\t<who>\t<detail>\t<epoch>". <item-text> is the line's leading descriptor with the
+# marker stripped (there is no stable id on the file backend). The reader applies the 24h-advisory rule.
+_backend_list_queued() {
+    [ -f "$BACKLOG_FILE" ] || return 0
+    BACKLOG_FILE="$BACKLOG_FILE" python3 - <<'PY' 2>/dev/null || true
+import os, re
+backlog = os.environ["BACKLOG_FILE"]
+rx = re.compile(r"\U0001f4cc queued by (.*?): (.*?) \[(\d+)\]")
+with open(backlog, encoding="utf-8") as f:
+    for line in f:
+        m = rx.search(line)
+        if not m:
+            continue
+        text = rx.sub("", line).strip().lstrip("-").strip()
+        print("%s\t%s\t%s\t%s" % (text, m.group(1).strip(), m.group(2).strip(), m.group(3)))
+PY
+}
+
+# _file_marker_commit MSG — stage $BACKLOG_FILE, commit MSG (nothing to commit → return 1), and push
+# with the same rebase-on-reject discipline as the file-backend claim. Shared by queue/unqueue.
+_file_marker_commit() {
+    local msg="$1"
+    git add "$BACKLOG_FILE" 2>/dev/null || true
+    git diff --cached --quiet && return 1
+    git commit -q -m "$msg" 2>/dev/null || true
+    if [ -n "$(git rev-list "$DEFAULT_BRANCH..HEAD" 2>/dev/null)" ]; then
+        if ! git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then
+            if git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then
+                git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+            else
+                git rebase --abort >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    return 0
 }
