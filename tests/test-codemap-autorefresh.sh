@@ -90,7 +90,7 @@ CODEMAP_AUTOREFRESH=true refresh_codemap 7
                                                              || fail "(2) commit message wrong: $(git -C "$MAIN" log -1 --format=%s)"
 # Only docs/codemap.md was in the commit (scoped) — exactly one path changed.
 [ "$(git -C "$MAIN" show --stat --format= HEAD | grep -c '|')" = "1" ] || fail "(2) commit not scoped to a single path"
-git -C "$MAIN" show --stat --format= HEAD | grep -q 'docs/codemap.md' || fail "(2) commit did not touch docs/codemap.md"
+grep -q 'docs/codemap.md' < <(git -C "$MAIN" show --stat --format= HEAD) || fail "(2) commit did not touch docs/codemap.md"
 # Pushed ff-safe: origin advanced to HEAD.
 [ "$(git -C "$MAIN" rev-parse HEAD)" = "$(git -C "$MAIN" rev-parse origin/main)" ] || fail "(2) commit was not pushed to origin"
 jhas 'result committed pushed yes' || fail "(2) did not journal committed/pushed: $(cat "$JLOG")"
