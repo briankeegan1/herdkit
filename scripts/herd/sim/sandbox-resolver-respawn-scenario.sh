@@ -25,6 +25,8 @@
 #   (3) dead_respawn       — resolver dies (agent gone, no verdict) → RE-dispatch for the same sha.
 #   (4) new_commit_respawn — a NEW head sha → RE-dispatch for the new sha (journaled resolver_respawn).
 #   (5) respawn_capped     — after REFIX_MAX_ROUNDS dispatches, NO further dispatch; row = "gave up".
+#   (5b) new_commit_holds_while_alive — a NEW sha while the prior resolver is STILL alive HOLDS (never
+#        double-dispatches onto the same worktree); re-dispatches only after that resolver has exited.
 #   (6) escalate_terminal  — an ESCALATE verdict is terminal for its sha: recorded + never re-dispatched.
 #   (7) journal_trail      — every respawn emitted a resolver_respawn journal event with old/new sha.
 #
@@ -227,6 +229,29 @@ if [ "$_d5" -eq 3 ] && printf '%s' "$(last_row)" | grep -q 'gave up'; then
   checkpoint respawn_capped pass "cap reached: no 4th dispatch; row=resolver gave up (3 rounds)"
 else
   checkpoint respawn_capped fail "expected cap at 3 dispatches, got count=$_d5 row='$(last_row)'"
+fi
+
+# (5b) NEW COMMIT WHILE ALIVE HOLDS — the reviewer's race: a NEW head sha lands while the prior
+#      resolver is STILL alive. The watcher must HOLD (never a second resolver on the same worktree),
+#      and only re-dispatch once that resolver has exited. Fresh PR so the cap sequence is untouched.
+PR=103; SLUG="feat-race"; BRANCH="sim/$SLUG"
+export STUB_RESOLVE_VERDICT=""
+RA1="fffffff1"; RA2="ggggggg2"
+set_roster 0
+run_conflict_tick "$RA1"                 # first dispatch for RA1 (count 1)
+_rc1="$(dispatch_count)"
+set_roster 1
+run_conflict_tick "$RA2"                 # NEW sha RA2 while resolver ALIVE → must HOLD, no dispatch
+_rc2="$(dispatch_count)"
+_race_row="$(last_row)"
+set_roster 0
+run_conflict_tick "$RA2"                 # resolver now GONE → re-dispatch for RA2
+_rc3="$(dispatch_count)"
+if [ "$_rc1" -eq 1 ] && [ "$_rc2" -eq 1 ] && [ "$_rc3" -eq 2 ] \
+   && printf '%s' "$_race_row" | grep -q 'resolving conflict'; then
+  checkpoint new_commit_holds_while_alive pass "new commit while resolver alive HELD (no double-dispatch), re-dispatched only after it exited"
+else
+  checkpoint new_commit_holds_while_alive fail "expected hold-then-respawn (counts $_rc1/$_rc2/$_rc3, row='$_race_row')"
 fi
 
 # (6) ESCALATE TERMINAL — a FRESH PR whose resolver ESCALATES: recorded terminal + never re-dispatched.

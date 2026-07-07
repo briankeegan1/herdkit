@@ -48,7 +48,7 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCARD" || fail "(a)
 [ "$(sc "$SCARD" scenario)" = "resolver-respawn" ] || fail "(a) unexpected scenario name"
 [ "$(sc "$SCARD" result)" = "pass" ]               || fail "(a) result should be pass"$'\n'"$(cat "$T/out")"
 [ "$(sc "$SCARD" failed)" -eq 0 ]                  || fail "(a) failed should be 0 (got $(sc "$SCARD" failed))"
-[ "$(sc "$SCARD" passed)" -ge 7 ]                  || fail "(a) passed should be >= 7"
+[ "$(sc "$SCARD" passed)" -ge 8 ]                  || fail "(a) passed should be >= 8"
 echo "PASS (a) end-to-end drain + scorecard shape"
 
 # ── (b) THE RESPAWN CHAIN ───────────────────────────────────────────────────────
@@ -57,10 +57,11 @@ for c in first_dispatch dead_respawn new_commit_respawn respawn_capped; do
 done
 echo "PASS (b) dispatch -> death respawn -> new-sha respawn -> cap"
 
-# ── (c) TERMINAL RAILS ──────────────────────────────────────────────────────────
-[ "$(cp_status "$SCARD" escalate_terminal)" = "pass" ] || fail "(c) escalate_terminal not pass"
-[ "$(cp_status "$SCARD" alive_holds)" = "pass" ]       || fail "(c) alive_holds not pass"
-echo "PASS (c) escalate terminal + live-resolver hold"
+# ── (c) NO-DOUBLE-DISPATCH RAILS + terminal escalate ────────────────────────────
+[ "$(cp_status "$SCARD" escalate_terminal)" = "pass" ]            || fail "(c) escalate_terminal not pass"
+[ "$(cp_status "$SCARD" alive_holds)" = "pass" ]                  || fail "(c) alive_holds not pass"
+[ "$(cp_status "$SCARD" new_commit_holds_while_alive)" = "pass" ] || fail "(c) new_commit_holds_while_alive not pass (double-dispatch race)"
+echo "PASS (c) escalate terminal + no double-dispatch (alive holds on same-sha AND new-commit)"
 
 # ── (d) JOURNAL TRAIL ───────────────────────────────────────────────────────────
 [ "$(cp_status "$SCARD" journal_trail)" = "pass" ]        || fail "(d) journal_trail not pass"

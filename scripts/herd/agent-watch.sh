@@ -475,10 +475,12 @@ resolver_escalated_sha() {
   awk -v p="$1" -v s="$2" '$2==p && $5==s && $6=="escalated"{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
 }
 
-# resolver_dispatch_epoch <pr#> <sha> — epoch of the most-recent DISPATCH for this pr+sha (empty if none).
-resolver_dispatch_epoch() {
+# resolver_last_dispatch_epoch <pr#> — epoch of the most-recent DISPATCH for this PR across ALL shas
+# (empty if none). Used to give a just-spawned resolver a startup grace before it's declared dead —
+# regardless of which sha it was dispatched for (so a new commit can't reap a still-registering resolver).
+resolver_last_dispatch_epoch() {
   [ -s "$RESOLVE_STATE" ] || return 0
-  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
+  awk -v p="$1" '$2==p && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
 }
 
 # resolver_last_sha <pr#> — the most-recently DISPATCHED sha for this PR (empty if none / legacy row).
@@ -998,6 +1000,21 @@ sys.exit(1)
 ' 2>/dev/null
 }
 
+# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING:
+# a live resolve·<slug> agent in the roster, OR the PR's most-recent dispatch is younger than the
+# startup grace (a freshly-spawned resolver whose pid has not yet registered). This is the SINGLE
+# guard that prevents a double-dispatch — a second resolver on the same worktree would race the first
+# on `git merge`/`git push`. Both the same-sha (dead-resolver) and new-commit respawn paths consult it,
+# so a respawn only ever fires once the prior resolver is provably gone.
+_resolver_in_flight() {
+  local _rif_slug="$1" _rif_pr="$2" _rif_last _rif_now _rif_age
+  _resolver_agent_alive "$_rif_slug" && return 0
+  _rif_last="$(resolver_last_dispatch_epoch "$_rif_pr")"
+  [ -n "$_rif_last" ] || return 1
+  _rif_now="$(date +%s)"; _rif_age=$(( _rif_now - _rif_last ))
+  [ "$_rif_age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]
+}
+
 # spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
 # to <sha>. Record-first keeps the respawn budget sound; the spawn is best-effort. The resolver is
 # told (via $HERD_RESOLVE_RESULT_FILE) to write its terminal verdict to the sha-scoped result file.
@@ -1021,7 +1038,7 @@ spawn_resolver() {
 # sha + reason. Never spawns here — the resolve pass does that so it stays render-ordered + dry-runnable.
 _classify_conflict() {
   local ci="$1" cpr="$2" cslug="$3" cbranch="$4" csha="$5"
-  local sl pn cap count now dispe age
+  local sl pn cap count
   # Normalize an absent head sha to "-" so it keys consistently across the ledger + result file.
   [ -n "$csha" ] || csha="-"
   sl="$(_slug_cell "$cslug")"; pn=" ${C_DIM}#${cpr}${C_RESET} ·"
@@ -1048,15 +1065,9 @@ _classify_conflict() {
         DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
         return ;;
     esac
-    if _resolver_agent_alive "$cslug"; then
-      DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
-      return
-    fi
-    # Dispatched for this sha, no verdict written, and the resolver agent is GONE. Give a freshly
-    # spawned resolver a grace window to register its pid before declaring it dead (no double-dispatch).
-    now="$(date +%s)"; dispe="$(resolver_dispatch_epoch "$cpr" "$csha")"
-    if [ -n "$dispe" ]; then age=$(( now - dispe )); else age=$(( _RESOLVER_DEAD_GRACE + 1 )); fi
-    if [ "$age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]; then
+    # Dispatched for this sha, no verdict yet. If the resolver is still in flight (agent alive, or a
+    # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
+    if _resolver_in_flight "$cslug" "$cpr"; then
       DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
       return
     fi
@@ -1078,6 +1089,14 @@ _classify_conflict() {
     return
   fi
   # A resolver ran on an OLDER sha and this PR got a NEW commit that reshaped the conflict surface.
+  # CRITICAL: the prior resolver (dispatched for the old sha) may STILL be running — a resolver runs
+  # for minutes while ticks are seconds. Re-dispatching now would put a second resolver on the SAME
+  # worktree, racing the first on `git merge`/`git push`. So HOLD while it is in flight; the respawn
+  # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
+  if _resolver_in_flight "$cslug" "$cpr"; then
+    DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    return
+  fi
   if [ "$count" -ge "$cap" ]; then
     DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
     return
