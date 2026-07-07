@@ -22,6 +22,12 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# journal.sh gives backend state-writes their attribution record (HERD-85): a tracker_write event per
+# transition. Best-effort — the sourced journal_append can never break a caller. Attribute every
+# backend dispatch from this drainer to the 'scribe' component (the explicit-ref reconcile path in
+# agent-watch attributes its own writes 'reconcile' before this ever runs).
+. "$HERE/journal.sh"
+export HERD_COMPONENT="${HERD_COMPONENT:-scribe}"
 # API backends read credentials from .herd/secrets (gitignored). The file/changelog backends
 # never touch it — sourcing is best-effort and absent-file-safe so the zero-secret case is clean.
 _SECRETS="$PROJECT_ROOT/.herd/secrets"

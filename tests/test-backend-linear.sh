@@ -19,6 +19,10 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS+1)); }
 
 GQLLOG="$T/gql.log"
+# HERD-85: a stub journal_append lets us assert the tracker_write attribution event WITHOUT sourcing
+# the real journal.sh — mirroring how _linear_gql is stubbed. Each call logs its raw args (one line),
+# so a test can grep the event name, ref, requested state, component, result, and pr.
+JLOG="$T/journal.log"
 
 # Default workflow-state nodes the states(filter:) stub returns. A test can override it by setting
 # STATES_NODES in the environment (used to script a workspace with MULTIPLE started/completed states).
@@ -50,6 +54,9 @@ export LINEAR_TEAM_ID="team_xyz"
 # matched BEFORE the generic issues( fallthrough.
 run() {
   ( cd "$T" && . "$BACKEND"
+    # Stub journal_append (HERD-85): record each tracker_write call's args so the attribution shape is
+    # assertable. Defined here so the backend's `command -v journal_append` guard sees it and fires.
+    journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
     _linear_gql() {
       printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
       case "$1" in
@@ -316,6 +323,70 @@ shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://gith
 echo "$shipf" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
 grep -q "commentCreate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still post the PR-link comment"
 grep -q "issueUpdate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still ATTEMPT the Done-move issueUpdate"
+pass
+
+# 7. HERD-85 attribution — a state write journals ONE tracker_write event carrying the ref, the
+#    requested state, the component (from HERD_COMPONENT), the result, and the backend. update_state
+#    under HERD_COMPONENT=reconcile with a PR in $HERD_TW_PR must record all of it.
+: > "$GQLLOG"; : > "$JLOG"
+HERD_COMPONENT=reconcile HERD_TW_PR=42 run _backend_update_state ENG-7 done >/dev/null
+[ "$(grep -c '^tracker_write ' "$JLOG")" = "1" ] || fail "update_state must journal EXACTLY ONE tracker_write event ($(cat "$JLOG"))"
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "ref ENG-7"           || fail "tracker_write missing 'ref ENG-7' ($tw)"
+echo "$tw" | grep -q "requested done"      || fail "tracker_write missing 'requested done' ($tw)"
+echo "$tw" | grep -q "component reconcile" || fail "tracker_write did not attribute the component from HERD_COMPONENT ($tw)"
+echo "$tw" | grep -q "result DONE"         || fail "tracker_write did not record the verified result ($tw)"
+echo "$tw" | grep -q "backend linear"      || fail "tracker_write missing the backend field ($tw)"
+echo "$tw" | grep -q "pr 42"               || fail "tracker_write did not carry the PR from HERD_TW_PR ($tw)"
+pass
+
+# 7b. Attribution defaults to 'manual' when no HERD_COMPONENT is set (a hand-run backend op), and
+#     omits the pr field when neither a pr arg nor $HERD_TW_PR is present.
+: > "$JLOG"
+( unset HERD_COMPONENT HERD_TW_PR; run _backend_update_state ENG-7 in-progress ) >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "component manual"  || fail "tracker_write did not default the component to 'manual' ($tw)"
+echo "$tw" | grep -q "requested in-progress" || fail "tracker_write did not record the requested in-progress state ($tw)"
+echo "$tw" | grep -q " pr "               && fail "tracker_write must omit the pr field when no PR is known ($tw)"
+pass
+
+# 7c. A NON-confirmed write (issueUpdate success:false) still journals — with result NOCHANGE — so a
+#     failed transition is attributable, not silent (the HERD-67 In-Progress-after-merge diagnosis gap).
+: > "$JLOG"
+HERD_COMPONENT=scribe ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done >/dev/null 2>&1
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "component scribe" || fail "tracker_write did not attribute the scribe component ($tw)"
+echo "$tw" | grep -q "result NOCHANGE"  || fail "an unconfirmed write must journal result NOCHANGE ($tw)"
+pass
+
+# 7d. mark_shipped journals a tracker_write with the PR link and requested 'shipped'.
+: > "$JLOG"
+HERD_COMPONENT=reconcile run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/3 >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "requested shipped" || fail "mark_shipped tracker_write missing 'requested shipped' ($tw)"
+echo "$tw" | grep -q "pr https://github.com/acme/widgets/pull/3" || fail "mark_shipped tracker_write did not carry the PR ($tw)"
+echo "$tw" | grep -q "component reconcile" || fail "mark_shipped did not attribute the component ($tw)"
+pass
+
+# 7e. FAIL-SOFT: when journal_append is UNDEFINED (journal.sh never sourced), the write still succeeds
+#     and nothing is journaled — a journal problem never blocks or alters the state write. Source the
+#     backend WITHOUT a journal_append stub so the backend's `command -v journal_append` guard finds none.
+: > "$JLOG"
+out="$(
+  cd "$T" && . "$BACKEND"
+  _linear_gql() {
+    if [ "${1#*states\(filter}" != "$1" ]; then
+      echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"team\":{\"states\":{\"nodes\":$DEFAULT_STATE_NODES}}}]}}}"
+    else
+      echo '{"data":{"issueUpdate":{"success":true}}}'
+    fi
+  }
+  _BACKEND_RESULT=""
+  _backend_update_state ENG-7 done
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+echo "$out" | grep -q "RESULT=DONE" || fail "update_state must still succeed with journal_append undefined ($out)"
+[ ! -s "$JLOG" ] || fail "no tracker_write should be written when journal_append is undefined ($(cat "$JLOG"))"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.
