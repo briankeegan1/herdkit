@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 453 (defined in >1 file: 14) · with cross-file callers: 70
+- Functions indexed: 454 (defined in >1 file: 14) · with cross-file callers: 70
 
 ## Functions (def → cross-file callers)
 
@@ -395,7 +395,7 @@ this scan cannot see).
 - `herd_driver_send_text` — def `scripts/herd/driver.sh:146` — callers: `scripts/herd/herd-feature.sh:237`, `scripts/herd/herd-quick.sh:207`
 - `herd_driver_start_agent` — def `scripts/herd/driver.sh:202` — callers: `scripts/herd/agent-watch.sh:2298`
 - `herd_preflight` — def `scripts/herd/herd-preflight.sh:33` — callers: `scripts/herd/coordinator.sh:37`, `scripts/herd/new-feature.sh:13`
-- `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:596` — callers: `scripts/herd/new-feature.sh:49`
+- `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:596` — callers: `scripts/herd/new-feature.sh:70`
 - `herd_resolve_workspace_id` — def `scripts/herd/herd-config.sh:471` — callers: `scripts/herd/agent-watch.sh:1073`, `scripts/herd/agent-watch.sh:2301`, `scripts/herd/driver.sh:225`, `scripts/herd/driver.sh:311`, `scripts/herd/herd-feature.sh:77`, `scripts/herd/herd-quick.sh:85`, `scripts/herd/herd-resolve.sh:36`, `scripts/herd/herd-review.sh:115`, `scripts/herd/research.sh:31`, `scripts/herd/scribe.sh:26`
 - `herd_spawn_gate_emit_defer` — def `scripts/herd/herd-spawn-gate.sh:153` — callers: `scripts/herd/herd-feature.sh:60`, `scripts/herd/herd-quick.sh:67`
 - `herd_spawn_gate_saturated` — def `scripts/herd/herd-spawn-gate.sh:135` — callers: —
@@ -404,8 +404,8 @@ this scan cannot see).
 - `herd_theme_load_cli` — def `scripts/herd/theme.sh:119` — callers: `bin/herd:89`, `bin/herd:1537`, `bin/herd:3537`, `bin/herd:3643`, `scripts/herd/herd-approve.sh:32`
 - `herd_theme_load_console` — def `scripts/herd/theme.sh:106` — callers: `scripts/herd/agent-watch.sh:238`
 - `herd_tracked_spawn_or_abort` — def `scripts/herd/herd-config.sh:824` — callers: —
-- `herd_write_mcp_servers` — def `scripts/herd/herd-config.sh:879` — callers: `scripts/herd/new-feature.sh:63`
-- `herd_write_ratelimit_hook` — def `scripts/herd/herd-config.sh:688` — callers: `scripts/herd/coordinator.sh:99`, `scripts/herd/new-feature.sh:55`
+- `herd_write_mcp_servers` — def `scripts/herd/herd-config.sh:879` — callers: `scripts/herd/new-feature.sh:84`
+- `herd_write_ratelimit_hook` — def `scripts/herd/herd-config.sh:688` — callers: `scripts/herd/coordinator.sh:99`, `scripts/herd/new-feature.sh:76`
 - `herd_write_task_spec` — def `scripts/herd/herd-config.sh:1008` — callers: `scripts/herd/herd-feature.sh:183`, `scripts/herd/herd-quick.sh:189`
 - `human_verify_has` — def `scripts/herd/human-verify.sh:72` — callers: `scripts/herd/agent-watch.sh:746`
 - `human_verify_steps` — def `scripts/herd/human-verify.sh:33` — callers: `scripts/herd/agent-watch.sh:751`, `scripts/herd/herd-approve.sh:51`
@@ -473,6 +473,7 @@ this scan cannot see).
 - `scout_repo` — def `bin/herd:252` — callers: —
 - `sendkeys_state` — def `scripts/herd/agent-watch.sh:1619` — callers: —
 - `shape_md` — def `scripts/herd/backlog-view.sh:313` — callers: —
+- `share_exposes_secrets` — def `scripts/herd/new-feature.sh:47` — callers: —
 - `spawn_resolver` — def `scripts/herd/agent-watch.sh:806` — callers: —
 - `usage` — def `bin/herd:3857` — callers: `scripts/herd/agent-watch.sh:1546`, `scripts/herd/backlog-reconcile-sweep.sh:53`, `scripts/herd/fleet.sh:681`, `scripts/herd/fleet.sh:966`, `scripts/herd/fleet.sh:1049`, `scripts/herd/fleet.sh:1073`, `scripts/herd/fleet.sh:1202`, `scripts/herd/healthcheck.sh:59`
 - `warn` — def `bin/herd:93` — callers: `scripts/herd/fleet.sh:128`, `scripts/herd/fleet.sh:238`, `scripts/herd/fleet.sh:239`, `scripts/herd/fleet.sh:1118`, `scripts/herd/herd-preflight.sh:428`, `scripts/herd/herd-preflight.sh:431`, `scripts/herd/herd-preflight.sh:455`, `scripts/herd/herd-preflight.sh:459`, `scripts/herd/herd-preflight.sh:470`, `scripts/herd/herd-preflight.sh:476`, `scripts/herd/herd-preflight.sh:494`, `scripts/herd/herd-preflight.sh:497`
