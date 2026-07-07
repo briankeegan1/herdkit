@@ -98,6 +98,15 @@ if ! bash "$HERE/new-feature.sh" "$SLUG"; then
   exit 1
 fi
 
+# HERD-92: persist the tracker ref → slug pairing as a cheap per-worktree marker so the watcher can
+# render this builder's console row as '<ref> <slug>' every tick with NO gh/backend call — matching
+# the tracker id shown in the "tracker healed" section. Written only when spawned from a TRACKED item
+# (HERD_ITEM_REF set); an untracked spawn leaves no marker and renders the plain slug, unchanged.
+# Fail-soft: a write error never blocks the spawn (the console falls back to the slug).
+if [ -n "${HERD_ITEM_REF:-}" ]; then
+  printf '%s\n' "$HERD_ITEM_REF" > "$WORKTREES_DIR/.herd-ref-$SLUG" 2>/dev/null || true
+fi
+
 # 2. New herdr tab rooted in the worktree; grab tab id + root pane id. If herdr is unavailable
 #    the parse yields empty ids — bail loudly instead of failing cryptically.
 #    SKIPPED under the headless driver: no tabs/panes (the agent is launched detached below).

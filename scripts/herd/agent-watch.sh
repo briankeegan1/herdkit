@@ -275,19 +275,61 @@ epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev
 # reverse_file <path> — print lines in reverse order; tac (GNU/Linux) or tail -r (BSD/macOS).
 reverse_file() { tac "$1" 2>/dev/null || tail -r "$1" 2>/dev/null; }
 
+# ── Tracker-ref → slug console labelling (HERD-92) ────────────────────────────────────────────────
+# Operators saw TWO naming systems on the console: healed rows show the TRACKER ID (HERD-nn) while
+# in-flight / recently-landed rows showed only the worktree SLUG — no way to correlate at a glance.
+# The fix is DISPLAY-ONLY (branches/slugs are never renamed — the slug keys worktrees, agent names,
+# tab labels and PR↔worktree matching): render every row as "<ref> <slug>" wherever a tracker ref is
+# known, and the plain slug (byte-identical to before) when it is not.
+#
+# Ref source, read per tick with NO gh/backend call:
+#   • in-flight — a cheap per-worktree marker "$TREES/.herd-ref-<slug>" holding the HERD_ITEM_REF the
+#     lane spawned with (written once by herd-feature.sh / herd-quick.sh; absent for an untracked or
+#     pre-HERD-92 spawn).
+#   • recently-landed — the ref captured into the $STATE row at merge time (do_merge), from the marker
+#     or the merged PR's 'Refs:' body line.
+_slug_ref_file() { printf '%s' "$TREES/.herd-ref-$1"; }
+
+# _slug_ref <slug> — echo the tracker ref recorded for this slug's worktree marker, or nothing. Reads
+# only the FIRST whitespace-delimited token so a malformed marker can never inject spaces/newlines
+# into a console row. Empty (fail-soft) whenever the marker is absent/blank — the plain-slug path.
+_slug_ref() {
+  local f ref; f="$(_slug_ref_file "$1")"
+  [ -s "$f" ] || return 0
+  read -r ref _ < "$f" 2>/dev/null || return 0
+  printf '%s' "${ref:-}"
+}
+
+# _slug_cell <slug> [ref] — the padded slug column for a console row. When a tracker ref is known
+# (passed explicitly for landed rows, else looked up from the per-worktree marker for in-flight
+# rows) the cell renders "<ref> <slug>"; with no ref it is BYTE-IDENTICAL to the pre-HERD-92 plain
+# slug column. Padded to SLUGW so the state words still align; a ref+slug wider than the column is
+# simply not padded (the same graceful overflow a long slug has today). The caller wraps the cell in
+# its own color, so the ref inherits the row's slug styling for a single, consistent label.
+_slug_cell() {
+  local slug="$1" ref="${2-}"
+  [ -n "$ref" ] || ref="$(_slug_ref "$slug")"
+  if [ -n "$ref" ]; then
+    printf '%-*s' "$SLUGW" "$ref $slug"
+  else
+    printf '%-*s' "$SLUGW" "$slug"
+  fi
+}
+
 # build_landed — the pinned "recently landed" rows: the last 3 lines of the state file
-# ("<epoch> <pr#> <slug>"), newest first. Stays visible even when idle.
+# ("<epoch> <pr#> <slug> [ref]"), newest first. Stays visible even when idle. The optional 4th field
+# is the tracker ref captured at merge (HERD-92); pre-HERD-92 rows have none and render the plain slug.
 build_landed() {
   if [ ! -s "$STATE" ]; then
     LANDED="    ${C_DIM}nothing yet${C_RESET}"$'\n'
     return 0
   fi
   LANDED=""
-  while read -r epoch prnum slug; do
+  while read -r epoch prnum slug ref; do
     [ -z "${epoch:-}" ] && continue
     hhmm="$(epoch_to_hhmm "$epoch")"
     pnum="$(printf '#%-4s' "$prnum")"
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug" "$ref")"
     LANDED="${LANDED}    ${C_GREEN}✅${C_RESET} ${C_DIM}${pnum}${C_RESET} ${C_GREEN}${sl}${C_RESET} ${C_DIM}${hhmm}${C_RESET}"$'\n'
   done < <(reverse_file "$STATE" | head -3)
 }
@@ -374,10 +416,12 @@ render() {
   fi
 }
 
-# already_merged <pr#> <slug> — idempotency guard against the persistent state file.
+# already_merged <pr#> <slug> — idempotency guard against the persistent state file. Matches the
+# "<epoch> <pr#> <slug>" prefix followed by end-of-line OR a space (a HERD-92 4th tracker-ref field),
+# so appending the ref never regresses this guard.
 already_merged() {
   [ -s "$STATE" ] || return 1
-  grep -q "^[0-9][0-9]* $1 $2\$" "$STATE" 2>/dev/null
+  grep -qE "^[0-9]+ $1 $2( |\$)" "$STATE" 2>/dev/null
 }
 
 # _should_automerge <mergeStateStatus> — the pure merge-readiness predicate. GitHub computes
@@ -1093,8 +1137,18 @@ do_merge() {
     return 0
   fi
   gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
-  # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
-  printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
+  # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
+  # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
+  # body line. Empty for an untracked PR → the row renders the plain slug, exactly as before.
+  _dm_ref="$(_slug_ref "$ds")"
+  [ -n "$_dm_ref" ] || _dm_ref="$(_reconcile_pr_ref "$dp" 2>/dev/null || true)"
+  # Record FIRST: even if a later cleanup step dies, we never re-merge this PR. Omit the 4th field
+  # entirely when there is no ref so a ref-less row stays byte-identical to the pre-HERD-92 format.
+  if [ -n "$_dm_ref" ]; then
+    printf '%s %s %s %s\n' "$(date +%s)" "$dp" "$ds" "$_dm_ref" >> "$STATE"
+  else
+    printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
+  fi
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
   # HERD-90: purge every approval-ledger row for this PR (all shas) now that it is merged. Without
   # this, an OLD-sha 'awaiting' row from a re-applied HUMAN-VERIFY hold lingers as a phantom pending
@@ -1121,6 +1175,10 @@ do_merge() {
   refresh_symbol_index "$dp"
   # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
   git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
+  # HERD-92: reap the per-worktree tracker-ref marker now that the worktree is gone (the ref lives on
+  # in the $STATE row for "recently landed"). Fail-soft; an orphaned marker is harmless — a reused
+  # slug simply overwrites it at its next spawn.
+  rm -f "$(_slug_ref_file "$ds")" 2>/dev/null || true
   journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
   # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Close the builder tab,
   #    review tab (review·slug), and resolver tab (resolve·slug) in one shot. Verifies each
@@ -1401,7 +1459,7 @@ _wait_agent_working() {
 _handle_block_verdict() {
   local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
   local _hbv_sl _hbv_pn
-  _hbv_sl="$(printf '%-*s' "$SLUGW" "$_hbv_slug")"
+  _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
@@ -1786,7 +1844,7 @@ _try_clean_limit_menu_select() {
 _handle_limit_blocked() {
   local _lb_slug="$1" _lb_wt="$2" _lb_idx="$3" _lb_reset="${4:-0}"
   local _lb_sl _lb_state _lb_now _lb_target
-  _lb_sl="$(printf '%-*s' "$SLUGW" "$_lb_slug")"
+  _lb_sl="$(_slug_cell "$_lb_slug")"
   _lb_now="$(_now)"
   _lb_state="$(limit_state "$_lb_slug")"
 
@@ -2612,7 +2670,7 @@ record_healthcheck() {
 _healthcheck_gate() {
   local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4" _hg_sha="${5:-}"
   local _hg_sl _hg_pn
-  _hg_sl="$(printf '%-*s' "$SLUGW" "$_hg_slug")"
+  _hg_sl="$(_slug_cell "$_hg_slug")"
   _hg_pn=" ${C_DIM}#${_hg_pr}${C_RESET} ·"
 
   # SHA-CACHE CHECK (before any suite work): an UNCHANGED commit cannot yield a different verdict.
@@ -3160,7 +3218,7 @@ for wt, branch in feats:
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
 $rec
 EOF
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
@@ -3258,7 +3316,7 @@ EOF
   for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}; do
     dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; candsha="${CAND_SHA[j]}"; j=$((j + 1))
     already_merged "$prnum" "$slug" && continue
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
 
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
@@ -3483,7 +3541,7 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   k=0
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
     slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; k=$((k + 1))
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -n "$DRYRUN" ]; then
       DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
