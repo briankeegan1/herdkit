@@ -775,6 +775,26 @@ record_hv_informed() {
   printf '%s hv-informed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
 }
 
+# purge_pr_approvals <pr#> — on merge/reap, drop EVERY approval-ledger row for this PR number
+# (awaiting/approved/observed/hv-informed) regardless of sha. HERD-90: when a HUMAN-VERIFY hold
+# re-applies at a NEW sha and the PR is merged at that sha, the OLD sha's 'awaiting' row was never
+# cleaned — so `herd-approve.sh list` kept surfacing a phantom hold for a long-merged PR and
+# `approve` no-op'd with "already approved", causing false coordinator wakes. A merge is terminal:
+# no approval state for this PR is ever needed again, so we purge all of its rows. The row format is
+# "<epoch> <state> <pr#> <sha>", so the PR number is field 3; exact string compare avoids clobbering
+# a different PR whose number is a substring (e.g. 9 vs 90). Atomic rewrite via a temp file; fully
+# fail-soft — an approvals-ledger hiccup must never fail the merge.
+purge_pr_approvals() {
+  local _pr="$1" _tmp
+  [ -s "$APPROVALS" ] || return 0
+  _tmp="$(mktemp "$APPROVALS.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v p="$_pr" '$3 != p' "$APPROVALS" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$APPROVALS" 2>/dev/null || rm -f "$_tmp"
+  else
+    rm -f "$_tmp"
+  fi
+}
+
 # ── Per-PR human-verify hold ──────────────────────────────────────────────────────────────────
 # A PR whose body declares a `HUMAN-VERIFY:` block (see human-verify.sh) names manual steps the
 # builder could not run itself. Under MERGE_POLICY=auto such a PR is individually switched to an
@@ -1076,6 +1096,11 @@ do_merge() {
   # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
   printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
+  # HERD-90: purge every approval-ledger row for this PR (all shas) now that it is merged. Without
+  # this, an OLD-sha 'awaiting' row from a re-applied HUMAN-VERIFY hold lingers as a phantom pending
+  # approval in `herd-approve.sh list`. Done right after the merge record so a later cleanup crash
+  # can never leave the phantom behind.
+  purge_pr_approvals "$dp"
   # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and journal
   #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
   #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.

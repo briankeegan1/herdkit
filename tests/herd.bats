@@ -115,6 +115,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic approval-purge (HERD-90) test passes" {
+  run bash "$REPO/tests/test-approval-purge.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-mode codemap test passes" {
   run bash "$REPO/tests/test-codemap-project.sh"
   [ "$status" -eq 0 ]
