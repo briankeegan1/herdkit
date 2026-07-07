@@ -101,6 +101,12 @@ WATCHER_VIEW_DEPS_LABEL="dependencies"
 WATCHER_SCOPE="mine"
 WATCHER_OWNER=""
 
+# — Claiming / builder context (multi-operator baseline) —
+# two operators active — spawns carrying a tracker id claim atomically
+CLAIM_REQUIRED="on"
+# builders ground on the committed docs/codemap.md
+CONTEXT_PROVISION="codemap"
+
 # — Review concurrency / tiering —
 REVIEW_CONCURRENCY="2"
 # keep 1: worktrees share one git object store
