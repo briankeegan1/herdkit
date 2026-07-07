@@ -356,26 +356,66 @@ fi
 # the UNIQUE per-PR content (PR number, slug, and the private result-file path) TRAILS.
 AGENT_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The ONLY writes you may do are: ONE 'gh pr comment <PR> --body \"…\"' and the result-file write described in rule 5. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) Post a brief PR comment summarizing your finding via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: PASS rationale, or the bug + why it's wrong). (5) FINALLY, as your absolute LAST action, write the machine verdict the merge gate reads — this step is MANDATORY — by running exactly one of these commands: printf 'REVIEW: PASS\n' > '<RESULT_FILE>' OR printf 'REVIEW: BLOCK — <one-line reason>\n' > '<RESULT_FILE>', where <RESULT_FILE> is the path given below. Do not skip this step. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'. The <RESULT_FILE> path for rule 5 is: ${_agent_result_file}."
 
+# _purge_stale_review_tab — close any STANDALONE review·<slug> tab left by a prior dispatch (the
+# fallback path) and drop its sweep-allowlist registry line. Idempotent + best-effort: called on
+# every dispatch so repeated re-reviews never accumulate tabs OR stale registry rows, and so
+# alternating placement modes (builder-tab split ↔ standalone tab) never orphans a tab in the
+# .herd-tabs allowlist. (The stale in-tab review SPLIT is a different beast — an agent named
+# review·<slug>, closed by pane_id before the re-split below; this handles the standalone TAB.)
+_purge_stale_review_tab() {
+  local _old
+  _old="$(SLUG="$SLUG" herdr tab list ${_WS_ID:+--workspace "$_WS_ID"} 2>/dev/null | python3 -c '
+import sys, json, os
+slug = "review·" + os.environ.get("SLUG", "")
+try:
+    tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+    print(next((t["tab_id"] for t in tabs if t.get("label","").startswith(slug)), ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [ -n "${_old:-}" ] && herdr tab close "$_old" >/dev/null 2>&1 || true
+  # Drop any prior registry line(s) for this slug so a later append stays idempotent. grep -v may
+  # exit non-zero when it filters out ALL lines (an allowlist that held only this slug) — that is
+  # success (an empty result), so don't gate the mv on grep's status.
+  local _reg="$WORKTREES_DIR/.herd-tabs"
+  if [ -f "$_reg" ]; then
+    grep -vF "review·$SLUG " "$_reg" > "${_reg}.tmp.$$" 2>/dev/null || true
+    mv -f "${_reg}.tmp.$$" "$_reg" 2>/dev/null || rm -f "${_reg}.tmp.$$" 2>/dev/null || true
+  fi
+}
+
 # --- Pane placement (Review pane v2) ---
 # Preferred: bottom split inside the builder's existing tab so the review appears WITH the work,
-# and the human watches the genuine Claude TUI. Fallback: standalone review·<slug> tab when the
-# builder tab is gone, when herdr is unavailable, or when the agent start fails.
+# and the human watches the genuine Claude TUI. On a RE-REVIEW (e.g. the round-2 pass after an
+# auto-refix bounce) we REUSE that tab: the stale round-1 review split is closed first so the new
+# split lands back inside the builder's tab instead of falling through to a fresh tail tab.
+# Fallback: standalone review·<slug> tab when the builder tab is genuinely gone, when herdr is
+# unavailable, or when the agent start fails.
 TAB="" ROOT="" _AGENT_PANE_MODE=0
 if [ "${HERD_NO_PANE:-}" != "1" ] && command -v herdr >/dev/null 2>&1 && [ -n "$_agent_result_file" ]; then
 
-  # Find the builder's agent pane_id (agent named $SLUG; any status — it may be idle after PR).
-  _builder_pane="$(herdr agent list 2>/dev/null | SLUG="$SLUG" python3 -c '
+  # One agent-list read, parsed twice: the builder's own pane (agent named $SLUG) and any STALE
+  # review pane (agent named review·$SLUG) still occupying the builder's tab from a prior round.
+  # `herdr agent start "review·$SLUG"` cannot re-split while that same-named agent still holds the
+  # tab — the failure that dropped PR #195's round-2 review into a brand-new tab (HERD-81) — so we
+  # find the stale pane here and close it before re-splitting.
+  _agents_json="$(herdr agent list 2>/dev/null || true)"
+  _pane_by_agent_name() {
+    printf '%s' "$_agents_json" | NAME="$1" python3 -c '
 import sys, json, os
-slug = os.environ["SLUG"]
+name = os.environ["NAME"]
 try:
     agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
     for a in agents:
-        if a.get("name") == slug:
+        if a.get("name") == name:
             print(a.get("pane_id", ""), end="")
             break
 except Exception:
     pass
-' 2>/dev/null || true)"
+' 2>/dev/null || true
+  }
+  _builder_pane="$(_pane_by_agent_name "$SLUG")"
+  _stale_review_pane="$(_pane_by_agent_name "review·$SLUG")"
 
   # Find the builder's tab_id (tab labeled exactly $SLUG in this workspace).
   _builder_tab="$(herdr tab list ${_WS_ID:+--workspace "$_WS_ID"} 2>/dev/null | SLUG="$SLUG" python3 -c '
@@ -389,6 +429,16 @@ except Exception:
 ' 2>/dev/null || true)"
 
   if [ -n "${_builder_pane:-}" ] && [ -n "${_builder_tab:-}" ]; then
+    # REUSE-NOT-RECREATE: a stale review·<slug> split from a prior round still holds this tab and
+    # blocks `herdr agent start` (duplicate agent name / no room). Close it FIRST so the re-review
+    # reuses the builder's tab — pane count stays stable (close one, open one) instead of leaking a
+    # fresh tail tab per round. Best-effort: a close hiccup just falls through to the standalone
+    # fallback below, which is the pre-HERD-81 behaviour.
+    [ -n "${_stale_review_pane:-}" ] && herdr pane close "$_stale_review_pane" >/dev/null 2>&1 || true
+    # Also retire any standalone review·<slug> fallback tab (+ its registry line) from an earlier
+    # round, so flipping from standalone back to builder-tab placement never orphans a tab.
+    _purge_stale_review_tab
+
     # Try to start the review agent as a bottom split inside the builder's tab. Routed through the
     # driver seam so HERD_DRIVER=headless spawns a detached reviewer; herdr-claude emits the identical
     # `herdr agent start … --split down --no-focus -- claude …` argv.
@@ -414,17 +464,9 @@ except Exception:
 
   if [ "$_AGENT_PANE_MODE" = "0" ]; then
     # Fallback: standalone review·<slug> tab, tailing the headless review log.
-    # Close any existing review tab for this slug so we don't accumulate tabs.
-    _old_tab="$(SLUG="$SLUG" herdr tab list 2>/dev/null | python3 -c '
-import sys, json, os
-slug = "review·" + os.environ.get("SLUG", "")
-try:
-    tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
-    print(next((t["tab_id"] for t in tabs if t.get("label","").startswith(slug)), ""))
-except Exception:
-    pass
-' 2>/dev/null || true)"
-    [ -n "${_old_tab:-}" ] && herdr tab close "$_old_tab" >/dev/null 2>&1 || true
+    # Retire any existing review·<slug> tab (+ its stale registry line) for this slug so repeated
+    # dispatches reuse one standalone tab's worth of screen instead of accumulating tabs/rows.
+    _purge_stale_review_tab
 
     created="$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$CWD" --label "review·$SLUG" --no-focus 2>/dev/null || true)"
     read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \

@@ -5,6 +5,8 @@
 #   (3) agent-pane BLOCK: BLOCK verdict collected from result file written by the agent
 #   (4) headless fallback: herdr absent → falls back to headless claude -p (verdict captured)
 #   (5) INFRA retry: agent never writes result file → INFRA-FAIL emitted on timeout
+#   (6) re-review REUSE (HERD-81): a stale review·<slug> split in the builder tab is closed and
+#       the re-review re-splits into the SAME tab — no new tail tab, pane count stays stable
 #
 # Stubs herdr/gh/git/claude (NETWORK-FREE). Run:  bash tests/test-review-pane-v2.sh
 # No `set -e`: some checks assert non-zero returns explicitly.
@@ -271,5 +273,47 @@ ok
 # On timeout the orphaned reviewer pane must be closed so it cannot later overwrite the verdict.
 grep -q 'pane close reviewPane1' "$HERDR_CALL_LOG" || fail "5: herdr pane close should be called to kill orphaned reviewer on timeout"
 ok
+
+# ── (6) re-review REUSES the builder tab: stale review·<slug> split closed, no new tab ───────
+# HERD-81: a round-2 dispatch while the round-1 review·<slug> pane still occupies the builder
+# tab. `herdr agent start "review·<slug>"` can't re-split under the duplicate agent name, so the
+# pre-fix code fell through to `herdr tab create` — a brand-new tail tab per round (observed on
+# PR #195). The fix closes the stale pane first and re-splits into the SAME builder tab, so the
+# net pane count is stable across the two dispatches (close one, open one) — never a new tab.
+_reset_logs
+# Agent list now carries BOTH the builder AND a stale review pane left by the prior round.
+printf '{"result":{"agents":[{"name":"test-slug","pane_id":"builderPane1","agent_status":"idle"},{"name":"review·test-slug","pane_id":"staleReviewPane1","agent_status":"idle"}]}}\n' \
+  > "$HERDR_AGENT_LIST_RESP"
+_tab_list_with_builder
+_agent_start_success
+
+AGENT_TEMP6="$T/agent-temp-6"
+RES="$T/result-6-sha6"
+( sleep 1; printf 'REVIEW: PASS\n' > "$AGENT_TEMP6" ) &
+
+out="$(HERD_REVIEW_AGENT_TEMP="$AGENT_TEMP6" \
+       HERD_REVIEW_RESULT_FILE="$RES" \
+       HERD_REVIEW_AGENT_TIMEOUT=15 HERD_REVIEW_AGENT_POLL=1 \
+       bash "$REVIEW" 6 test-slug 2>/dev/null)"
+rc=$?
+
+# The stale round-1 review pane is closed BEFORE the re-split (this is what frees the tab).
+grep -q 'pane close staleReviewPane1' "$HERDR_CALL_LOG" || fail "6: stale review·<slug> pane should be closed before re-splitting"
+ok
+# The re-review re-splits into the SAME builder tab (reuse) …
+grep -q 'split down' "$HERDR_CALL_LOG" || fail "6: re-review should re-split into the builder tab (--split down)"
+ok
+grep -q 'builderTab1' "$HERDR_CALL_LOG" || fail "6: re-review split should target the builder tab"
+ok
+# … and must NOT open a brand-new tab while the builder tab is still there.
+grep -q 'tab create' "$HERDR_CALL_LOG" && fail "6: re-review must NOT open a new tab when the builder tab exists" || true
+ok
+# Verdict still collected, PASS.
+[ "$rc" -eq 0 ] || fail "6: re-review should exit 0 on PASS (got $rc)"
+ok
+grep -q '^REVIEW: PASS$' "$RES" || fail "6: re-review result file should contain REVIEW: PASS"
+ok
+
+wait 2>/dev/null || true
 
 echo "ALL PASS ($pass checks)"
