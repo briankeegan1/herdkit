@@ -103,6 +103,12 @@ MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIEW_ESCALATE_GLOB
 
+# docs-only review tier (HERD-89) — route pure-docs diffs to the cheapest reviewer. Leave both blank
+# (default) for byte-identical behavior; set DOCS_ONLY_GLOB to opt in. ESCALATION WINS: a docs diff
+# also matching REVIEW_ESCALATE_GLOB or over REVIEW_ESCALATE_MAXFILES files stays on the STRONG tier.
+# DOCS_ONLY_GLOB='\.(md|txt)$'        # every changed path matches → $REVIEW_MODEL_DOCS review
+# REVIEW_MODEL_DOCS="claude-haiku-4-5"  # cheapest tier for pure-docs diffs
+
 # privacy / safety
 DENY_PATHS="data/"                  # never committed; the local lane is scoped here
 REVIEW_CHECKLIST=".herd/review-checklist.md"  # project risk list injected into the review gate

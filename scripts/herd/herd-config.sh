@@ -299,6 +299,7 @@ fi
 #   • a docs/test-only diff (only *.md and tests/ paths)      → review SKIPPED entirely: a PASS is
 #       recorded with provenance source=skipped-low-risk (no reviewer spawned), still sha-keyed so
 #       it is never re-run
+#   • every path matches DOCS_ONLY_GLOB (opt-in, below)       → DOCS tier ($REVIEW_MODEL_DOCS, cheapest)
 #   • any other small, low-risk diff                          → CHEAP tier ($REVIEW_MODEL_CHEAP)
 # SAFE DEFAULT: leave REVIEW_ESCALATE_GLOB EMPTY (the default) and behavior is UNCHANGED — every PR
 # gets the full $MODEL_REVIEW review, no diff is classified at all. The tiering only activates when
@@ -313,6 +314,20 @@ fi
 # A tiered diff touching MORE than this many files escalates to the STRONG tier regardless of the
 # glob (a large diff is risky even when no single path matches). Default 10. Non-numeric → 10.
 : "${REVIEW_ESCALATE_MAXFILES:="10"}"
+# ── Docs-only review tier (DOCS_ONLY_GLOB, HERD-89) ──────────────────────────
+# A pure-docs diff carries near-zero correctness risk for the adversarial gate, yet under
+# REVIEW_ESCALATE_GLOB tiering a docs diff the hardcoded *.md/tests SKIP doesn't cover (e.g. *.txt, or
+# a mixed *.md + *.txt diff) still falls through to the CHEAP ($REVIEW_MODEL_CHEAP) tier. Set
+# DOCS_ONLY_GLOB (an egrep pattern) to route diffs where EVERY changed path matches it to the cheapest
+# reviewer model ($REVIEW_MODEL_DOCS). This activates the tiering on its own — REVIEW_ESCALATE_GLOB
+# need not be set. ESCALATION STILL WINS: a docs diff that also matches REVIEW_ESCALATE_GLOB, or that
+# exceeds REVIEW_ESCALATE_MAXFILES files, is classified STRONG regardless. Suggested value:
+# '\.(md|txt)$' — and pin any docs living under an engine dir (e.g. templates/) into REVIEW_ESCALATE_GLOB
+# so those escalate rather than downgrade. SAFE DEFAULT: EMPTY → dormant, behavior byte-identical.
+: "${DOCS_ONLY_GLOB:=""}"
+# Cheapest reviewer model tier for pure-docs diffs (default: claude-haiku-4-5); ignored when
+# DOCS_ONLY_GLOB is blank.
+: "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
