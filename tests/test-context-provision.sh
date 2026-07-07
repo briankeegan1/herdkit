@@ -35,6 +35,8 @@ command -v git    >/dev/null 2>&1 || fail "git required to run this test"
 BIG_TASK="SENTINEL_TASK_BODY build the context-provisioning thing"$'\n'"line-two SENTINEL_TASK_L2"
 # The exact codemap-pointer marker herd_context_provision_preamble injects (a stable substring of it).
 CODEMAP_MARK="committed at docs/codemap.md"
+# The symbol-index-pointer marker (a stable substring of the symbol-index case's sentence).
+SYMIDX_MARK="committed at docs/symbol-index.md"
 
 # ── Stubs (mirror tests/test-externalize-task-specs.sh) ────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"
@@ -146,5 +148,37 @@ refs_ln=$(grep -n "Refs: HERD-999"    "$spec" | head -1 | cut -d: -f1)
 [ -n "$refs_ln" ] || fail "cp-refs: Refs trailer missing (HERD_ITEM_REF not threaded?)"
 [ "$mark_ln" -le "$refs_ln" ] || fail "cp-refs: grounding ($mark_ln) came AFTER the unique Refs trailer ($refs_ln) — breaks the maximal cache prefix"
 pass; echo "PASS (d) grounding precedes the per-item Refs trailer (cache-prefix discipline)"
+
+# ── (e) ON (symbol-index) → its pointer in the STABLE preamble, no codemap leak, argv externalized ──
+write_cfg "symbol-index"
+for pair in "quick $QUICK" "feat $FEATURE"; do
+  set -- $pair; slug="si-on-$1"; script="$2"
+  run_lane "$script" "$slug"
+  spec="$TREES/$slug.task.md"
+  grep -q "$SYMIDX_MARK"  "$spec" || fail "$slug: ON but the symbol-index pointer is missing from the spec"
+  grep -q "$CODEMAP_MARK" "$spec" && fail "$slug: symbol-index only, but the codemap pointer leaked in"
+  # The grounding lives in the STABLE preamble region: it must appear BEFORE the per-task body.
+  mark_ln=$(grep -n "$SYMIDX_MARK"       "$spec" | head -1 | cut -d: -f1)
+  body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  [ -n "$mark_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate grounding/body lines"
+  [ "$mark_ln" -lt "$body_ln" ] || fail "$slug: grounding ($mark_ln) is NOT before the per-task body ($body_ln) — not in the stable preamble"
+  # The externalization contract still holds: argv carries ONLY the short pointer, not the spec/grounding.
+  line="$(agent_start_line "$slug")"
+  case "$line" in *"Read your task spec at $spec"*) : ;; *) fail "$slug: agent-start argv lacks the spec-file pointer"$'\n'"$line" ;; esac
+  case "$line" in *"$SYMIDX_MARK"*) fail "$slug: grounding leaked into the agent-start argv (should stay in the spec file)"$'\n'"$line" ;; esac
+done
+pass; echo "PASS (e) CONTEXT_PROVISION=symbol-index → pointer in STABLE preamble, argv still externalized"
+
+# ── (f) BOTH sources → each pointer lands, both precede the per-task body (space-separated list) ─────
+write_cfg "codemap symbol-index"
+run_lane "$QUICK" "si-both"
+spec="$TREES/si-both.task.md"
+grep -q "$CODEMAP_MARK" "$spec" || fail "si-both: codemap pointer missing when both sources configured"
+grep -q "$SYMIDX_MARK"  "$spec" || fail "si-both: symbol-index pointer missing when both sources configured"
+cm_ln=$(grep -n "$CODEMAP_MARK"       "$spec" | head -1 | cut -d: -f1)
+si_ln=$(grep -n "$SYMIDX_MARK"        "$spec" | head -1 | cut -d: -f1)
+body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+[ "$cm_ln" -lt "$body_ln" ] && [ "$si_ln" -lt "$body_ln" ] || fail "si-both: a grounding pointer landed after the per-task body — not in the stable preamble"
+pass; echo "PASS (f) both grounding sources inject together, each in the STABLE preamble"
 
 echo "ALL PASS ($PASS groups)"
