@@ -108,7 +108,12 @@ Repeat this loop:
            (< 80 chars). If the request is a run-on paragraph with no title line, SYNTHESIZE one:
            write a concise title as the first line, then the full request as the body beneath it —
            never pass a whole paragraph as the first line (that files a giant title duplicated in
-           the description). Then run:
+           the description).
+           If the request carries NO verification plan (how the change will be proven — a named
+           sandbox sim scenario for a gate/merge/concurrency/limit-park/pane seam, or the test
+           surface otherwise), file it AS-IS — never block or synthesize one — but append a
+           "⚠️ no verification plan" marker line to the body so the flag rides into the item AND
+           its scribe report line, and the coordinator sees which items shipped unplanned. Then run:
            bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
        – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
          "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →
