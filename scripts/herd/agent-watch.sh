@@ -2337,6 +2337,39 @@ _discard_stale_health() {
   done
 }
 
+# ── Cache-hit journal de-dup (HERD-72) ──────────────────────────────────────────────────────────────
+# A held/awaiting-verify PR sits on the candidate list every ~6s poll tick with an UNCHANGED head sha,
+# so _healthcheck_gate replays the SAME terminal cache hit each tick (20-60 identical
+# healthcheck_cache_hit lines per PR measured 2026-07-07). That drowns 'herd why <pr>'. The verdict for
+# a fixed sha is terminal and cannot change, so all those repeats carry zero new information.
+# Fix: journal the cache hit only on a TRANSITION — the FIRST hit for a (pr,sha) or any change in the
+# outcome/detail — and suppress identical repeats. A per-PR marker records the last hit we journaled as
+# "<sha>\t<outcome>\t<detail>"; a new commit (different sha) or a changed verdict differs from it and
+# re-journals, an identical replay matches and is skipped. Keyed by PR alone, so it self-overwrites (no
+# stale-marker sweep needed). The emitted event's shape/fields are IDENTICAL to the pre-dedup call, so
+# 'herd why' / 'herd log' parsing is unaffected — this only removes duplicate lines.
+_health_cachehit_file() { printf '%s' "$TREES/.health-cachehit-$1"; }
+
+# _journal_cache_hit <pr#> <slug> <sha> <outcome> [detail] — emit healthcheck_cache_hit ONCE per
+# transition (see above). Best-effort like journal_append itself; a marker it cannot write just means
+# the next identical hit re-journals (fail toward MORE logging, never toward a broken gate).
+_journal_cache_hit() {
+  local _jc_pr="$1" _jc_slug="$2" _jc_sha="$3" _jc_outcome="$4" _jc_detail="${5:-}"
+  local _jc_marker _jc_cur _jc_prev
+  _jc_marker="$(_health_cachehit_file "$_jc_pr")"
+  _jc_cur="$_jc_sha"$'\t'"$_jc_outcome"$'\t'"$_jc_detail"
+  if [ -f "$_jc_marker" ]; then
+    IFS= read -r _jc_prev < "$_jc_marker" 2>/dev/null || _jc_prev=""
+    [ "$_jc_prev" = "$_jc_cur" ] && return 0
+  fi
+  if [ -n "$_jc_detail" ]; then
+    journal_append healthcheck_cache_hit pr "$_jc_pr" slug "$_jc_slug" sha "$_jc_sha" outcome "$_jc_outcome" detail "$_jc_detail"
+  else
+    journal_append healthcheck_cache_hit pr "$_jc_pr" slug "$_jc_slug" sha "$_jc_sha" outcome "$_jc_outcome"
+  fi
+  printf '%s\n' "$_jc_cur" > "$_jc_marker" 2>/dev/null || true
+}
+
 # record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
 record_healthcheck() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
@@ -2378,17 +2411,17 @@ _healthcheck_gate() {
       case "$_hg_cv" in
         CLEAN)
           _HC_RESULT="CLEAN"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CLEAN
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" CLEAN
           return 0 ;;
         FLAKY)
           DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
           _HC_RESULT="FLAKY"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome FLAKY
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" FLAKY
           return 0 ;;
         CODEERROR)
           DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_cd}${C_RESET}"
           _HC_RESULT="CODEERROR"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CODEERROR detail "$_hg_cd"
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" CODEERROR "$_hg_cd"
           return 0 ;;
       esac
     fi
