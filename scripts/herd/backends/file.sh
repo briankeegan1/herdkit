@@ -148,13 +148,40 @@ _backend_list_open() {
     grep -E '🔜|🚧' "$BACKLOG_FILE" 2>/dev/null || true
 }
 
+# _FILE_MARK_RE — the 📌 planned-marker region on a backlog line (HERD-52). It is the FIRST thing that
+# writes ANOTHER item's slug (…sequenced after <blocker>…) verbatim onto an item's line, so it MUST be
+# stripped before any `slug in line` substring test — otherwise a blocker slug embedded in one item's
+# marker is a false match surface for that blocker's own claim/state lookup, silently flipping the
+# wrong item (the file-backend CLAIM-poisoning bug). Non-greedy up to the marker's own [<epoch>] so a
+# trailing "(claimed by …)" is preserved. A Python-`re` pattern (used both inline and via $MARK_RE env).
+_FILE_MARK_RE='\s*\U0001f4cc queued by .*?\[\d+\]'
+
+# _file_line_for_slug SLUG — print the FIRST $BACKLOG_FILE line whose DESCRIPTOR (📌 marker stripped)
+# contains SLUG, returning the ORIGINAL line (marker intact). Empty when no match / no file. Uses
+# python (UTF-8 safe), NOT `grep -F`, so a marker that names another item is never a false match
+# surface — the shared, marker-aware replacement for the old first-substring-hit grep.
+_file_line_for_slug() {
+    BACKLOG_FILE="$BACKLOG_FILE" SLUG="$1" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY' 2>/dev/null || true
+import os, re, sys
+try:
+    with open(os.environ["BACKLOG_FILE"], encoding="utf-8") as f:
+        lines = f.readlines()
+except OSError:
+    raise SystemExit
+slug = os.environ["SLUG"]; mark = re.compile(os.environ["MARK_RE"])
+for l in lines:
+    if slug in mark.sub("", l):
+        sys.stdout.write(l); break
+PY
+}
+
 _backend_item_state() {
     # $1 = <link-name>#<id> or a title slug.  BACKLOG_FILE is already set.
-    # Greps the slug from BACKLOG_FILE; checks for 🔜/🚧/✅ emoji → maps to open/in-progress/closed.
-    # Sets ITEM_STATE=open|closed|in-progress.  Missing slug → open (safe default).
+    # Finds the slug's line (📌-marker-aware) in BACKLOG_FILE; checks for 🔜/🚧/✅ emoji → maps to
+    # open/in-progress/closed. Sets ITEM_STATE=open|closed|in-progress.  Missing slug → open (safe default).
     local ref="$1" slug line
     slug="${ref#*#}"
-    line="$(grep -m1 -F "$slug" "$BACKLOG_FILE" 2>/dev/null || true)"
+    line="$(_file_line_for_slug "$slug")"
     if [ -z "$line" ]; then
         ITEM_STATE="open"
         return 0
@@ -195,12 +222,16 @@ _backend_claim_item() {
     # Classify the item's current line and, for an OPEN item, flip it to 🚧 + stamp the claimant IN
     # PLACE. Prints "<status>\t<owner>" with status ∈ FLIP|SELF|ALREADY|MISSING (MISSING = slug not in
     # the backlog; ALREADY covers both a 🚧 line owned by another and a ✅ shipped line).
-    parsed="$(BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" python3 - <<'PY'
+    parsed="$(BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY'
 import os, re
 backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]; who = os.environ["WHO"]
+mark = re.compile(os.environ["MARK_RE"])
 with open(backlog, encoding="utf-8") as f:
     lines = f.readlines()
-idx = next((i for i, l in enumerate(lines) if slug in l), None)
+# Match on the DESCRIPTOR (marker stripped) so a blocker slug inside a SIBLING item marker is never a
+# false match surface for this claim (HERD-52 CLAIM-poisoning fix). (No apostrophes in this heredoc:
+# bash 3.2 mis-parses a quote inside a heredoc nested in $() — the whole block lives in parsed="$(...)".)
+idx = next((i for i, l in enumerate(lines) if slug in mark.sub("", l)), None)
 if idx is None:
     print("MISSING\t"); raise SystemExit
 line = lines[idx]
@@ -262,7 +293,7 @@ PY
 # 🚧 stamped with a different identity → ALREADY. Used as the post-push verification step.
 _file_claim_verify() {
     local slug="$1" who="$2" line owner
-    line="$(grep -m1 -F "$slug" "$BACKLOG_FILE" 2>/dev/null || true)"
+    line="$(_file_line_for_slug "$slug")"
     case "$line" in
         *🚧*)
             owner="$(printf '%s' "$line" | sed -n 's/.*(claimed by \([^)]*\)).*/\1/p')"
@@ -295,19 +326,22 @@ _backend_queue_item() {
     ts="$(date +%s 2>/dev/null || echo 0)"
     if [ -n "$blocker" ]; then detail="sequenced after $blocker"; else detail="sequenced next"; fi
     git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
-    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" DETAIL="$detail" TS="$ts" python3 - <<'PY'
+    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" DETAIL="$detail" TS="$ts" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY'
 import os, re, sys
 backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]; who = os.environ["WHO"]
 detail = os.environ["DETAIL"]; ts = os.environ["TS"]
+mark = re.compile(os.environ["MARK_RE"])
 marker = "\U0001f4cc queued by %s: %s [%s]" % (who, detail, ts)
 with open(backlog, encoding="utf-8") as f:
     lines = f.readlines()
-idx = next((i for i, l in enumerate(lines) if slug in l), None)
+# Match on the DESCRIPTOR (📌 marker stripped) so another item's marker naming THIS slug as its blocker
+# can't be a false match surface (HERD-52 CLAIM-poisoning fix).
+idx = next((i for i, l in enumerate(lines) if slug in mark.sub("", l)), None)
 if idx is None:
     sys.exit(1)                                   # item not found → NOCHANGE
 line = lines[idx].rstrip("\n")
 # Strip any pre-existing 📌 marker (refresh in place), then append the fresh one.
-line = re.sub(r"\s*\U0001f4cc queued by .*?\[\d+\]", "", line).rstrip()
+line = mark.sub("", line).rstrip()
 lines[idx] = line + " " + marker + "\n"
 with open(backlog, "w", encoding="utf-8") as f:
     f.writelines(lines)
@@ -326,16 +360,18 @@ _backend_unqueue_item() {
     slug="${ref#*#}"
     [ -f "$BACKLOG_FILE" ] || return 0
     git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
-    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" python3 - <<'PY'
+    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY'
 import os, re, sys
 backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]
+mark = re.compile(os.environ["MARK_RE"])
 with open(backlog, encoding="utf-8") as f:
     lines = f.readlines()
-idx = next((i for i, l in enumerate(lines) if slug in l), None)
+# Match on the DESCRIPTOR (📌 marker stripped) — see the CLAIM-poisoning note in queue_item.
+idx = next((i for i, l in enumerate(lines) if slug in mark.sub("", l)), None)
 if idx is None:
     sys.exit(1)
 line = lines[idx]
-new = re.sub(r"\s*\U0001f4cc queued by .*?\[\d+\]", "", line.rstrip("\n")).rstrip() + "\n"
+new = mark.sub("", line.rstrip("\n")).rstrip() + "\n"
 if new == line:
     sys.exit(1)                                   # no marker to clear → NOCHANGE
 lines[idx] = new

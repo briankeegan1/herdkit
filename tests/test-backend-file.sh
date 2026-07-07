@@ -35,6 +35,14 @@ run_op() {
     printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" )
 }
 
+# run_claim REF WHO — run the pre-spawn claim in the repo, echoing its result contract.
+run_claim() {
+  ( cd "$T" && . "$BACKEND"
+    _CLAIM_RESULT=""; _CLAIM_OWNER=""
+    _backend_claim_item "$1" "$2"
+    printf 'CLAIM=%s OWNER=%s\n' "${_CLAIM_RESULT:-}" "${_CLAIM_OWNER:-}" )
+}
+
 # Write a fake BACKLOG.md with items in each emoji state.
 cat > "$BACKLOG_FILE" <<'BACKLOG'
 ## Backlog
@@ -112,6 +120,29 @@ grep -q '📌' "$BACKLOG_FILE" && fail "unqueue_item left a 📌 marker behind (
 grep -q "🔜 open-feature — a queued item" "$BACKLOG_FILE" || fail "unqueue_item did not restore the item's line cleanly"
 out2="$(run_op _backend_unqueue_item repo#open-feature alice)"
 echo "$out2" | grep -q "RESULT=NOCHANGE" || fail "unqueue_item with no marker should be NOCHANGE ($out2)"
+pass
+
+# 11. CLAIM-poisoning regression (reviewer BLOCK): a queue marker embeds ANOTHER item's slug
+#     (…sequenced after <blocker>…). That must NOT become a match surface for the blocker's own claim.
+#     Repro: hold alpha behind beta (queue alpha --after beta), then spawn the blocker → claim beta.
+#     BETA must be the one claimed; ALPHA must stay 🔜.
+printf -- '- 🔜 alpha — first\n- 🔜 beta — second\n' >> "$BACKLOG_FILE"
+git -C "$T" add BACKLOG.md; git -C "$T" commit -q -m "add alpha/beta"
+run_op _backend_queue_item repo#alpha alice beta >/dev/null
+grep -qE '🔜 alpha .*📌 queued by alice: sequenced after beta' "$BACKLOG_FILE" \
+  || fail "queue did not mark alpha with the beta blocker ($(grep alpha "$BACKLOG_FILE"))"
+cl="$(run_claim repo#beta bob)"
+echo "$cl" | grep -q "CLAIM=CLAIMED" || fail "claim of beta did not report CLAIMED ($cl)"
+grep -qE '🚧 beta .*\(claimed by bob\)' "$BACKLOG_FILE" \
+  || fail "claim did not flip BETA to 🚧 owned by bob ($(grep -E 'alpha|beta' "$BACKLOG_FILE"))"
+grep -qE '🚧 alpha' "$BACKLOG_FILE" && fail "claim of beta wrongly flipped ALPHA — marker-poisoning regression"
+grep -qE '🔜 alpha' "$BACKLOG_FILE" || fail "alpha should remain 🔜 open after claiming beta"
+pass
+
+# 12. item_state is marker-aware too: alpha's line names beta in its marker, but item_state repo#beta
+#     must read BETA's own state (in-progress after the claim), never alpha's.
+st="$( cd "$T" && . "$BACKEND"; ITEM_STATE=""; _backend_item_state repo#beta; printf '%s\n' "${ITEM_STATE:-}" )"
+[ "$st" = "in-progress" ] || fail "item_state repo#beta should be in-progress after the claim, got '$st'"
 pass
 
 echo "ALL PASS ($PASS checks)"
