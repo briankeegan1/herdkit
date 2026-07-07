@@ -796,6 +796,8 @@ herd_context_provision_preamble() {
     case "$_src" in
       codemap)
         _out="$_out A deterministic map of this repo's engine tree is committed at docs/codemap.md (module roles, who-sources-whom, and config-key→consumer wiring; regenerate with 'herd codemap'). READ IT FIRST to orient — it lets you skip re-exploring the tree." ;;
+      symbol-index)
+        _out="$_out A function-level symbol index (definition sites + cross-file callers for functions under bin/ and scripts/herd/) is committed at docs/symbol-index.md; use it to jump to a function's def or its likely callers instead of grepping, and regenerate with 'herd symbol-index'. HONEST SCOPE: a heuristic token scan, not ground truth — same-name defs and dynamic dispatch are ambiguous." ;;
       *) : ;;   # unknown grounding source — ignore (forward-compatible)
     esac
   done
