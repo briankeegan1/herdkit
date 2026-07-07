@@ -1612,23 +1612,114 @@ except Exception:
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
     journal_append sweep_closed tab_id "$_sw_id" reason orphan
     # Remove the swept tab from the registry so it doesn't accumulate stale entries.
-    if [ -f "$_sw_registry" ]; then
-      TAB_ID="$_sw_id" REGISTRY_PATH="$_sw_registry" python3 -c '
+    _herd_tabs_drop_row "$_sw_registry" "$_sw_id"
+  done <<< "$_sw_orphans"
+}
+
+# _herd_tabs_drop_row <registry-file> <tab_id> — remove the single row for <tab_id> (field 2) from the
+# $TREES/.herd-tabs registry, leaving every other row byte-identical. Shared by _sweep_orphan_tabs and
+# the stale-resolve-tab sweep so a swept tab never lingers as a stale registry entry. Fail-soft: a
+# missing file / absent python3 / unwritable path just no-ops.
+_herd_tabs_drop_row() {
+  local _dr_reg="$1" _dr_tab="$2"
+  [ -n "$_dr_reg" ] && [ -n "$_dr_tab" ] || return 0
+  [ -f "$_dr_reg" ] || return 0
+  TAB_ID="$_dr_tab" REGISTRY_PATH="$_dr_reg" python3 -c '
 import os
 path = os.environ.get("REGISTRY_PATH", "")
 tid  = os.environ.get("TAB_ID", "")
-if not path or not tid: exit(0)
+if not path or not tid: raise SystemExit(0)
 try:
-    with open(path) as f: lines = f.readlines()
-    with open(path, "w") as f:
+    with open(path, encoding="utf-8") as f: lines = f.readlines()
+    with open(path, "w", encoding="utf-8") as f:
         for line in lines:
             parts = line.strip().split(" ", 2)
             if not (len(parts) >= 2 and parts[1] == tid):
                 f.write(line)
 except Exception: pass
 ' 2>/dev/null || true
-    fi
-  done <<< "$_sw_orphans"
+}
+
+# _sweep_stale_resolve_tabs — proactively close STALE resolve·<slug> conflict-resolver tabs (HERD-54).
+# herd-resolve.sh opens a resolve·<slug> tab (registered in $TREES/.herd-tabs) when a PR goes
+# CONFLICTING. Once the resolver DIES/FINISHES and the conflict is gone (the PR merged, closed, or its
+# mergeable state went clean), that tab just lingers — clutter that can also catch the tab-leak-guard's
+# before/after snapshot mid-flap and false-red an innocent PR. This sweep closes such tabs.
+#
+# A resolve tab is STALE only when BOTH hold:
+#   (1) no LIVE resolver agent for its slug — checked via _resolver_agent_alive, the SAME liveness
+#       helper the resolver-respawn path (HERD-55) uses, so the two features never disagree on
+#       "is a resolver alive for this slug"; AND
+#   (2) the slug's PR is no longer CONFLICTING — it is merged/closed (absent from the open-PR list) or
+#       its mergeable state is clean (MERGEABLE). A CONFLICTING PR still needs the resolver, and an
+#       UNKNOWN state (GitHub still computing) is treated conservatively as "still relevant" — neither
+#       is swept.
+# SAFETY MIRRORS HERD-91's OID-guard philosophy: never tear down a live worker. A tab whose resolver
+# agent is still in the roster (working OR just-registered) is ALWAYS spared, so an in-flight resolve —
+# including a fresh respawn — is never closed out from under itself.
+#
+# Runs at startup and before each leak-guard-relevant healthcheck snapshot. Requires AGENTS_JSON to be
+# populated (the tick sets it; the startup call primes it). Idempotent + fully fail-soft: no registry,
+# no herdr, or dry-run ⇒ zero action. One `gh pr list` per invocation; cheap when there are no resolve
+# rows (the common case) — it returns before any network call.
+_sweep_stale_resolve_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _srt_reg="$TREES/.herd-tabs"
+  [ -f "$_srt_reg" ] || return 0
+
+  # (1) resolve·<slug> rows from the tab registry → "slug<TAB>tab_id" lines. No rows ⇒ nothing to do
+  #     (return BEFORE the gh call — the sweep is byte-inert on a workspace with no resolve tabs).
+  local _srt_rows
+  _srt_rows="$(REG="$_srt_reg" python3 -c '
+import os
+prefix = "resolve·"   # the resolve-tab label prefix (middot separator)
+try:
+    with open(os.environ["REG"], encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ")
+            if len(parts) < 2: continue
+            label, tab_id = parts[0], parts[1]
+            if label.startswith(prefix) and tab_id:
+                slug = label[len(prefix):]
+                if slug:
+                    print(slug + "\t" + tab_id)
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [ -n "$_srt_rows" ] || return 0
+
+  # (2) One gh call: map each OPEN PR's slug → its mergeable state. A slug ABSENT from this map has no
+  #     open PR (merged/closed/never-existed) → its conflict is definitively gone.
+  local _srt_prs
+  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | python3 -c '
+import sys, json
+try:
+    for p in json.load(sys.stdin):
+        b = p.get("headRefName","")
+        if b:
+            print(b.split("/")[-1] + "\t" + (p.get("mergeable","") or ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+
+  local _srt_slug _srt_tab _srt_merge _srt_n=0
+  while IFS=$'\t' read -r _srt_slug _srt_tab; do
+    [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
+    # SAFETY: a live resolver agent for this slug is NEVER closed (shared liveness with HERD-55).
+    _resolver_agent_alive "$_srt_slug" && continue
+    # PR still CONFLICTING (or UNKNOWN — GitHub still computing) → the resolve tab is still relevant.
+    _srt_merge="$(printf '%s\n' "$_srt_prs" | awk -F'\t' -v s="$_srt_slug" '$1==s{print $2; exit}')"
+    case "$_srt_merge" in
+      CONFLICTING|UNKNOWN) continue ;;
+    esac
+    # STALE: dead resolver + PR merged/closed/clean → close the tab, prune its registry row, journal.
+    herdr tab close "$_srt_tab" >/dev/null 2>&1 || true
+    journal_append reap_resolve_tab tab_id "$_srt_tab" slug "$_srt_slug" reason stale-sweep
+    _herd_tabs_drop_row "$_srt_reg" "$_srt_tab"
+    _srt_n=$(( _srt_n + 1 ))
+  done <<< "$_srt_rows"
+  return 0
 }
 
 # _sweep_tracker_state — HERD-86 tracker-state self-heal. Runs every _TRACKER_SWEEP_INTERVAL ticks
@@ -3012,6 +3103,12 @@ _healthcheck_gate() {
   fi
   _health_acquire "$_hg_pr"
 
+  # LEAK-GUARD SNAPSHOT POINT (HERD-54): the healthcheck suite's tab-leak-guard snapshots the live
+  # workspace BEFORE it runs, so proactively close any stale resolve·<slug> tab first — a dead/finished
+  # resolver whose PR is no longer CONFLICTING must not sit in that before-snapshot (clutter / flap).
+  # Fail-soft; a live resolver is always spared (shared liveness with the resolver-respawn path).
+  _sweep_stale_resolve_tabs
+
   DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check${C_RESET}"
   render
   local _hg_hc _hg_rc
@@ -3465,6 +3562,12 @@ _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sl
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
 # stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
 _startup_reap_sweep
+
+# One-shot at STARTUP: proactively close any STALE resolve·<slug> conflict-resolver tab (HERD-54) —
+# a resolver that died/finished for a slug whose PR is no longer CONFLICTING. Prime AGENTS_JSON first
+# so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
+AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
+_sweep_stale_resolve_tabs
 
 while true; do
   build_header
