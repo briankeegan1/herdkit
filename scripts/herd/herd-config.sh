@@ -198,6 +198,15 @@ esac
 : "${SCRIBE_BACKEND:="file"}"
 : "${SHARE_LINKS:=""}"            # dirs symlinked into each worktree (e.g. "data .venv")
 
+# SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the backlog drainer empties the queue
+# and `scribe-step.sh next` would return EMPTY, the drainer keeps polling for this many extra seconds
+# before it finishes and its session exits, so a burst of requests arriving with idle gaps between
+# them is drained by ONE scribe session instead of paying a fresh MODEL_SCRIBE cold-start per gap.
+# Default 0 → today's behavior byte-identical (next's total wait stays == SCRIBE_POLL). Suggest 90.
+# Defaulted here so scribe.sh (which expands it into the drainer prompt under `set -u`) and
+# scribe-step.sh both see it.
+: "${SCRIBE_LINGER_SECS:=0}"
+
 # BACKLOG_VIEW_EXTRAS — view-only backlog-pane extra section. Default "" (off) → the pane output is
 # byte-identical to before. Set "github-issues" and the backlog viewer renders a SECOND, clearly
 # labeled '📥 incoming (github issues)' section BENEATH the primary work queue, listing this repo's
