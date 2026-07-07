@@ -157,3 +157,4 @@ HERD_THEME="tokyonight"
 COORDINATOR_WATCHDOG="on"
 # restart a silently-dead EMPTY builder once (never blows away work)
 DEAD_BUILDER_AUTORESPAWN="on"
+DOCTOR_STARTUP_HINT="on"
