@@ -19,6 +19,11 @@ WORKSPACE_NAME="myproject"                     # herdr workspace label
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
+# SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the scribe empties the queue, the
+# drainer keeps polling this many extra seconds before its session exits, so a burst of backlog
+# updates arriving with short idle gaps is drained by ONE scribe session instead of paying a fresh
+# MODEL_SCRIBE cold-start per gap. Default 0 → byte-identical to today; 90 is a good burst-sharing value.
+# SCRIBE_LINGER_SECS="90"
 SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
 # BACKLOG_VIEW_EXTRAS — VIEW-ONLY backlog-pane extra section. Default "" (off) → the pane output is

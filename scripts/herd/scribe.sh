@@ -78,9 +78,12 @@ PROMPT=$(cat <<EOF
 You are the BACKLOG SCRIBE (queue drainer). Drain the backlog queue, one request at a time.
 Repeat this loop:
 
-1. Run:  bash $HERE/scribe-step.sh next
+1. Run:  bash $HERE/scribe-step.sh next --linger $SCRIBE_LINGER_SECS
    • It prints "CLAIMED <path>", then "BACKEND <name>" (the ACTIVE backend, read NOW), then the
      request text (repo already pulled & current). OR it prints "EMPTY".
+   • The --linger window makes 'next' keep polling for $SCRIBE_LINGER_SECS extra seconds once the
+     queue empties before it returns EMPTY, so a burst of requests arriving with idle gaps between
+     them is drained by THIS one session — the mechanic does the waiting; you never sleep yourself.
    • If EMPTY: run  bash $HERE/scribe-step.sh finish . STOP -> end your turn (done).
      MORE -> go back to step 1.
 2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # scribe-step.sh — queue/git/report mechanics for the backlog drainer. The scribe Claude
 # calls these so it only does the creative edit. Subcommands:
-#   next                   reclaim stale claims (>5 min); wait up to $SCRIBE_POLL s for a
+#   next [--linger <secs>] reclaim stale claims (>5 min); wait up to $SCRIBE_POLL s for a
 #                          request; atomically claim the oldest; git pull; print
-#                          "CLAIMED <path>" + the request text, or "EMPTY".
+#                          "CLAIMED <path>" + the request text, or "EMPTY". LINGER (HERD-88): when
+#                          the base $SCRIBE_POLL wait finds the queue empty, keep polling for
+#                          SCRIBE_LINGER_SECS more seconds (overridable via --linger) before
+#                          returning EMPTY, so a burst with idle gaps is drained by ONE session
+#                          instead of a fresh cold-start per gap. Default 0 → total wait == $SCRIBE_POLL.
 #   commit <path> "<sum>"  file backend: add/commit/push $BACKLOG_FILE (pull-rebase retry on
 #                          reject), write the live-view receipt, append to the inbox, fire a
 #                          herdr notification, remove the claimed file.
@@ -66,6 +70,16 @@ _report_and_cleanup() {
 
 case "$cmd" in
   next)
+    # LINGER window (HERD-88): after the base $POLL wait empties the queue, keep polling for
+    # SCRIBE_LINGER_SECS more seconds before returning EMPTY so a burst of requests arriving with
+    # idle gaps between them is drained by ONE session instead of paying a fresh MODEL_SCRIBE
+    # cold-start per gap. `--linger <secs>` overrides the config default. Default 0 → deadline ==
+    # $POLL, byte-identical to today's poll. A request enqueued DURING the linger is claimed by the
+    # SAME loop below with no special-casing; the single-drainer mkdir-mutex (in scribe.sh) is untouched.
+    linger="${SCRIBE_LINGER_SECS:-0}"
+    if [ "${2:-}" = "--linger" ]; then linger="${3:-0}"; fi
+    case "$linger" in ''|*[!0-9]*) linger=0 ;; esac
+    deadline=$((POLL + linger))
     # reclaim claims abandoned by a dead drainer
     find "$Q" -name '*.mine' -mmin +5 -exec sh -c 'mv -f "$1" "${1%.mine}"' _ {} \; 2>/dev/null || true
     waited=0
@@ -87,7 +101,7 @@ case "$cmd" in
         # time — not whatever was set when the drainer was spawned (issue #139).
         echo "CLAIMED $claimed"; echo "BACKEND $SCRIBE_BACKEND"; cat "$claimed"; exit 0
       fi
-      [ "$waited" -ge "$POLL" ] && { echo "EMPTY"; exit 0; }
+      [ "$waited" -ge "$deadline" ] && { echo "EMPTY"; exit 0; }
       sleep 2; waited=$((waited+2))
     done
     ;;
