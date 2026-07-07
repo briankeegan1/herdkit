@@ -471,15 +471,18 @@ _review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
 # review dispatch on that PR (see _maybe_arm_review_escalation / _review_gate_step).
 _review_escalate_file() { printf '%s' "$TREES/.review-escalate-$1"; }
 
-# ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB) ─────────────────────────────────────
-# _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | SKIP.
-# Only ever called when REVIEW_ESCALATE_GLOB is set (the opt-in); with it empty the caller keeps
-# today's always-$MODEL_REVIEW path and this never runs. Classification is DETERMINISTIC and fails
-# SAFE — any uncertainty (unreadable/empty diff) → STRONG, never a downgrade:
+# ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
+# _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | DOCS | SKIP.
+# Only ever called when REVIEW_ESCALATE_GLOB or DOCS_ONLY_GLOB is set (the opt-in); with BOTH empty the
+# caller keeps today's always-$MODEL_REVIEW path and this never runs. Classification is DETERMINISTIC and
+# fails SAFE — any uncertainty (unreadable/empty diff) → STRONG, never a downgrade:
 #   • only *.md / tests/ paths changed                  → SKIP  (no reviewer; PASS recorded low-risk)
-#   • any path matches REVIEW_ESCALATE_GLOB             → STRONG (engine surface)
-#   • more than REVIEW_ESCALATE_MAXFILES files changed  → STRONG (large diff)
+#   • any path matches REVIEW_ESCALATE_GLOB             → STRONG (engine surface; escalation wins)
+#   • more than REVIEW_ESCALATE_MAXFILES files changed  → STRONG (large diff; escalation wins)
+#   • every path matches DOCS_ONLY_GLOB (opt-in)        → DOCS   ($REVIEW_MODEL_DOCS, cheapest tier)
 #   • otherwise (small, low-risk)                        → CHEAP  ($REVIEW_MODEL_CHEAP)
+# ESCALATION WINS: the REVIEW_ESCALATE_GLOB / MAXFILES checks run BEFORE the DOCS_ONLY_GLOB check, so a
+# docs-only diff that ALSO touches an engine-critical path (or is large) still gets the STRONG tier.
 _classify_review_tier() {
   local pr="$1" paths n max
   # Changed-file paths for THIS PR's diff. Any failure/empty list → STRONG (never downgrade blind).
@@ -488,12 +491,20 @@ _classify_review_tier() {
   # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ — i.e. NO line fails to match
   # the docs/test pattern → skip the adversarial review entirely.
   if ! printf '%s\n' "$paths" | grep -qvE '(\.md$)|(^tests/)'; then printf SKIP; return 0; fi
-  # Engine-surface glob match → full strong review.
-  if printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
-  # Large diff (many files) → strong even without a glob match.
+  # Engine-surface glob match → full strong review (escalation wins over the docs tier). The -n guard
+  # keeps this classifier safe when only DOCS_ONLY_GLOB opted in: an empty REVIEW_ESCALATE_GLOB would
+  # make `grep -qE ""` match every path and wrongly force STRONG.
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] && printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
+  # Large diff (many files) → strong even without a glob match (escalation wins over the docs tier).
   n="$(printf '%s\n' "$paths" | grep -c .)"
   max="${REVIEW_ESCALATE_MAXFILES:-10}"; case "$max" in ''|*[!0-9]*) max=10 ;; esac
   if [ "$n" -gt "$max" ] 2>/dev/null; then printf STRONG; return 0; fi
+  # DOCS-ONLY (opt-in via DOCS_ONLY_GLOB): every changed path matches the operator's docs pattern → the
+  # cheapest reviewer tier ($REVIEW_MODEL_DOCS). Distinct from SKIP: a real (cheap) adversarial review
+  # still runs — for doc formats the hardcoded *.md/tests SKIP above doesn't cover (e.g. *.txt).
+  if [ -n "${DOCS_ONLY_GLOB:-}" ] && ! printf '%s\n' "$paths" | grep -qvE "$DOCS_ONLY_GLOB"; then
+    printf DOCS; return 0
+  fi
   # Small + low-risk → cheap reviewer tier.
   printf CHEAP
 }
@@ -625,12 +636,13 @@ _review_gate_step() {
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
 
-  # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB). Default (glob empty) → the STRONG
-  # tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no diff is classified
-  # at all. When the glob is set, classify this pr+sha's diff ONCE (cached, sha-keyed) and either skip
-  # the reviewer entirely (docs/test-only) or select the cheap vs strong model tier.
+  # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB and/or DOCS_ONLY_GLOB). Default (BOTH
+  # empty) → the STRONG tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no
+  # diff is classified at all. When either glob is set, classify this pr+sha's diff ONCE (cached,
+  # sha-keyed) and either skip the reviewer entirely (docs/test-only) or select the docs/cheap/strong
+  # model tier.
   local _rt_model=""
-  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ]; then
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] || [ -n "${DOCS_ONLY_GLOB:-}" ]; then
     local tier; tier="$(_review_tier "$pr" "$sha")"
     if [ "$tier" = "SKIP" ]; then
       # Docs/test-only diff: no reviewer is spawned. Record a sha-keyed PASS so it is never re-run,
@@ -643,6 +655,8 @@ _review_gate_step() {
       echo PASS; return 0
     fi
     [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
+    # DOCS-only diff (opt-in via DOCS_ONLY_GLOB): a real adversarial review on the cheapest tier.
+    [ "$tier" = "DOCS" ]  && _rt_model="$REVIEW_MODEL_DOCS"
   fi
 
   # EVIDENCE-TRIGGERED ESCALATION: if a builder's second refix round still arrived BLOCKed on this PR
