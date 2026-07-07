@@ -17,3 +17,6 @@ adversarially for these in a PR's diff:
 - **destructive git**: a force-push, a push to the default branch, or a `worktree remove` of the
   wrong dir (including the watcher's own worktree).
 - a **config key read without a fallback**, so a project that hasn't set it breaks cryptically.
+- a **tracker mutation from a builder diff**: any call that writes work-tracker state — a Linear
+  issue update (`issueUpdate`, `stateId`/`assigneeId`/label mutation), a `gh issue edit/close/reopen`,
+  or a read of `.herd/secrets` — the coordinator owns ALL item states; builders must never touch them.

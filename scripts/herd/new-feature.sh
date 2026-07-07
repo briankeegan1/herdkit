@@ -36,7 +36,28 @@ link_or_die() {
     exit 1
   fi
 }
+# Secrets-isolation guard (HERD-87): a SHARE_LINK must never expose .herd/secrets — the tracker's
+# workspace API credentials — into a builder worktree. Builders run --dangerously-skip-permissions,
+# so a symlink to .herd (which holds secrets) or to .herd/secrets itself would let a builder read the
+# API key and mutate tracker state, violating "the coordinator owns all backlog/tracker updates".
+# Refuse any share that IS, CONTAINS, or SITS UNDER the secrets path — loudly, then skip it (fail-soft:
+# the worktree is still built; only the dangerous link is dropped). main-checkout filesystem perms are
+# out of scope; this closes only the lane-provisioned vector.
+_SECRETS_REL=".herd/secrets"
+share_exposes_secrets() {
+  local s="${1#./}"; s="${s%/}"   # normalize ./x and trailing slash
+  case "$s" in
+    "$_SECRETS_REL"|"$_SECRETS_REL"/*) return 0 ;;  # the secrets file, or anything under it
+    ""|.|.herd) return 0 ;;                         # the repo root or the whole .herd dir contains it
+  esac
+  return 1
+}
 for share in $SHARE_LINKS; do
+  if share_exposes_secrets "$share"; then
+    echo "🚫 refusing SHARE_LINK '$share': it would expose .herd/secrets into the builder worktree (HERD-87)." >&2
+    echo "   Builders must never reach tracker credentials; the coordinator owns all tracker state. Skipping this link." >&2
+    continue
+  fi
   link_or_die "$REPO/$share" "$DIR/$share"
 done
 
