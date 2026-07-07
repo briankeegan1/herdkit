@@ -55,7 +55,7 @@ run() {
       case "$1" in
         *issueCreate*)      echo '{"data":{"issueCreate":{"success":true,"issue":{"id":"iss_1","identifier":"ENG-42","url":"https://linear.app/acme/issue/ENG-42"}}}}' ;;
         *commentCreate*)    echo '{"data":{"commentCreate":{"success":true}}}' ;;
-        *issueUpdate*)      echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+        *issueUpdate*)      echo "{\"data\":{\"issueUpdate\":{\"success\":${ISSUEUPDATE_SUCCESS:-true}}}}" ;;
         *"states(filter"*)  echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"identifier\":\"ENG-7\",\"title\":\"first open issue\",\"team\":{\"states\":{\"nodes\":${STATES_NODES:-$DEFAULT_STATE_NODES}}}}]}}}" ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
@@ -259,6 +259,26 @@ us6="$( STATES_NODES='[{"id":"st_dup","name":"Duplicate","position":2},{"id":"st
 echo "$us6" | grep -q "RESULT=DONE" || fail "update_state (multi completed) did not report DONE ($us6)"
 grep -q "st_done" "$GQLLOG" || fail "update_state (multi completed) did not pick the 'Done' state by NAME (gh #169)"
 grep -q "st_dup"  "$GQLLOG" && fail "update_state (multi completed) picked 'Duplicate' — gh #169 regression"
+pass
+
+# 4j. VERIFIED MUTATION (HERD-70): update_state reports DONE only when the final issueUpdate CONFIRMS
+#     success:true. A transiently-FAILED mutation (stub returns success:false) must be NOCHANGE — NOT an
+#     optimistic DONE — so agent-watch's _reconcile_via_ref returns non-zero and falls back to the fuzzy
+#     scribe retry instead of journaling a false verified transition (the PR #187/HERD-67 incident).
+: > "$GQLLOG"
+usf="$( ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done 2>/dev/null )"
+echo "$usf" | grep -q "RESULT=NOCHANGE" || fail "update_state must return NOCHANGE when issueUpdate is not confirmed ($usf)"
+grep -q "issueUpdate" "$GQLLOG" || fail "update_state (failed mutation) should still ATTEMPT the issueUpdate before reporting NOCHANGE"
+grep -q "issueCreate" "$GQLLOG" && fail "update_state (failed mutation) must NOT fall back to filing a new issue"
+pass
+
+# 4k. HERD-70: the same verification guards mark_shipped — a failed Done-move issueUpdate is NOCHANGE,
+#     never a false 'shipped', even though the PR-link comment already posted.
+: > "$GQLLOG"
+shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
+echo "$shipf" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
+grep -q "commentCreate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still post the PR-link comment"
+grep -q "issueUpdate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still ATTEMPT the Done-move issueUpdate"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.
