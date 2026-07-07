@@ -103,6 +103,12 @@ Repeat this loop:
      request into exactly ONE of these, then run the matching verb — NEVER file a new issue for a
      request that is not actually a new backlog item (that mis-file is the junk-issue bug):
        – ADD / create / file a NEW backlog item →
+           The backend takes the FIRST LINE of the text as the tracker title and keeps the WHOLE
+           text as the description. So make sure the text STARTS WITH A SHORT ONE-LINE TITLE
+           (< 80 chars). If the request is a run-on paragraph with no title line, SYNTHESIZE one:
+           write a concise title as the first line, then the full request as the body beneath it —
+           never pass a whole paragraph as the first line (that files a giant title duplicated in
+           the description). Then run:
            bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
        – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
          "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →
