@@ -139,6 +139,17 @@ MERGE_POLICY="auto"
 # merge method — the gh pr merge strategy applied by do_merge (default: merge commit).
 MERGE_METHOD="merge"    # merge | squash | rebase
 
+# gate dispatch (HERD-73) — WHEN the watcher fires the pre-merge review relative to the healthcheck.
+#   serial   default — byte-identical to today: the review dispatches only AFTER the healthcheck
+#            outcome lands, so gate wall-clock = health + review.
+#   parallel dispatch the review at the same tick the healthcheck STARTS, so the two gates overlap
+#            (wall-clock ≈ max(health, review)). The MERGE decision is UNCHANGED — a merge still
+#            requires BOTH gates green; REVIEW_CONCURRENCY + the sha-keyed review-once semantics are
+#            respected, and a health code-error mid-review never kills the reviewer. Tradeoff: a
+#            health-failed sha wastes one review run (cheap under REVIEW_ESCALATE_GLOB tiering).
+# Opt-in only; watcher-affecting (takes effect on the next watcher restart).
+# GATE_DISPATCH="serial"   # serial (default) | parallel
+
 # PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
 # a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
 #   PR_FLOW:       direct — open PRs ready to merge (default, today's behavior).

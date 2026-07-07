@@ -331,6 +331,14 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
+# the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
+# byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is
+# health + review. parallel → dispatch the review at the same action-pass tick the healthcheck starts,
+# so the two gates overlap. The MERGE decision is UNCHANGED either way (still requires BOTH gates green);
+# only the wall-clock overlaps. Tradeoff: a health-failed sha wastes one review run (cheap under
+# REVIEW_ESCALATE_GLOB tiering). Unknown value → serial (fail safe). Consumed by agent-watch.sh.
+: "${GATE_DISPATCH:="serial"}"   # serial (default) | parallel — see capabilities.tsv / agent-watch.sh
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
