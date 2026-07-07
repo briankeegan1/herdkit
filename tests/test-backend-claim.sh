@@ -106,6 +106,7 @@ lin_claim() {
   ( cd "$T" && . "$BACKENDS/linear.sh"
     _linear_gql() {
       # $node is the scripted issue node (dynamic scope — visible from lin_claim's locals).
+      [ -z "${CLAIMLOG:-}" ] || printf 'Q<<%s>>V<<%s>>\n' "$1" "${2:-}" >> "$CLAIMLOG"
       case "$1" in
         *viewer*)      echo '{"data":{"viewer":{"id":"me-uid","name":"Me"}}}' ;;
         *issueUpdate*) echo '{"data":{"issueUpdate":{"success":true}}}' ;;
@@ -140,6 +141,30 @@ pass
 node='{"id":"iss1","identifier":"HERD-50","assignee":{"id":"me-uid","name":"Me"},"state":{"type":"started"},"team":{"states":{"nodes":[{"id":"st_started"}]}}}'
 out="$(lin_claim "HERD-50" alice "$node")"
 echo "$out" | grep -q "^SELF" || fail "linear self: expected SELF, got '$out'"
+pass
+
+# 10. gh #169: claiming into a workspace with MULTIPLE started-type states must move the issue to the
+#     state NAMED 'In Progress', never whichever started state the API returns first ('In Review').
+#     CLAIMLOG captures the stateId the Start mutation carries. 'In Review' is listed first AND has a
+#     higher position, so only a NAME-first picker lands the claim on 'In Progress'.
+CLAIMLOG="$T/claim.log"; export CLAIMLOG
+node='{"id":"iss1","identifier":"HERD-50","assignee":null,"state":{"type":"unstarted"},"team":{"states":{"nodes":[{"id":"st_review","name":"In Review","position":2},{"id":"st_progress","name":"In Progress","position":1}]}}}'
+: > "$CLAIMLOG"
+out="$(lin_claim "HERD-50" alice "$node")"
+echo "$out" | grep -q "^CLAIMED" || fail "linear claim (multi started): expected CLAIMED, got '$out'"
+grep -q "st_progress" "$CLAIMLOG" || fail "linear claim (multi started) did not start into 'In Progress' by NAME (gh #169)"
+grep -q "st_review" "$CLAIMLOG" && fail "linear claim (multi started) started into 'In Review' — the exact gh #169 regression"
+pass
+
+# 11. gh #169 fallback for claim: no started state named 'In Progress' → lowest-position started state,
+#     still never a higher-position 'In Review'.
+node='{"id":"iss1","identifier":"HERD-50","assignee":null,"state":{"type":"unstarted"},"team":{"states":{"nodes":[{"id":"st_review","name":"In Review","position":2},{"id":"st_doing","name":"Doing","position":1}]}}}'
+: > "$CLAIMLOG"
+out="$(lin_claim "HERD-50" alice "$node")"
+echo "$out" | grep -q "^CLAIMED" || fail "linear claim (position fallback): expected CLAIMED, got '$out'"
+grep -q "st_doing" "$CLAIMLOG" || fail "linear claim (position fallback) did not start into the LOWEST-position started state (gh #169)"
+grep -q "st_review" "$CLAIMLOG" && fail "linear claim (position fallback) started into higher-position 'In Review' — gh #169 regression"
+unset CLAIMLOG
 pass
 
 # ============================== changelog backend (no claim concept) ==================================

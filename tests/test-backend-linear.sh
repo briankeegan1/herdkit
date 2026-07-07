@@ -20,6 +20,12 @@ pass(){ PASS=$((PASS+1)); }
 
 GQLLOG="$T/gql.log"
 
+# Default workflow-state nodes the states(filter:) stub returns. A test can override it by setting
+# STATES_NODES in the environment (used to script a workspace with MULTIPLE started/completed states).
+# Kept in its own variable, NOT inlined into ${STATES_NODES:-...}, because the '}' in the JSON would
+# prematurely close the parameter expansion.
+DEFAULT_STATE_NODES='[{"id":"state_done"}]'
+
 # Fake curl for the transport test only: logs its args and emits a trivial response.
 CURLLOG="$T/curl.log"
 mkdir -p "$T/bin"
@@ -50,7 +56,7 @@ run() {
         *issueCreate*)      echo '{"data":{"issueCreate":{"success":true,"issue":{"id":"iss_1","identifier":"ENG-42","url":"https://linear.app/acme/issue/ENG-42"}}}}' ;;
         *commentCreate*)    echo '{"data":{"commentCreate":{"success":true}}}' ;;
         *issueUpdate*)      echo '{"data":{"issueUpdate":{"success":true}}}' ;;
-        *"states(filter"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"first open issue","team":{"states":{"nodes":[{"id":"state_done"}]}}}]}}}' ;;
+        *"states(filter"*)  echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"identifier\":\"ENG-7\",\"title\":\"first open issue\",\"team\":{\"states\":{\"nodes\":${STATES_NODES:-$DEFAULT_STATE_NODES}}}}]}}}" ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
         *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
@@ -220,6 +226,38 @@ pass
 us3="$(run _backend_update_state "first open issue" done)"
 grep -q "containsIgnoreCase" "$GQLLOG" || fail "update_state (no identifier) did not fall back to a title match"
 echo "$us3" | grep -q "RESULT=DONE"    || fail "update_state title match did not transition the unique match ($us3)"
+pass
+
+# 4g. gh #169: a workspace with MULTIPLE started-type states must resolve 'in-progress' to the state
+#     NAMED 'In Progress', never whichever started state the API returns first. STATES_NODES feeds the
+#     stub BOTH started states with 'In Review' listed first AND at a higher position — name wins.
+: > "$GQLLOG"
+us4="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_progress","name":"In Progress","position":1}]' \
+        run _backend_update_state ENG-7 in-progress )"
+echo "$us4" | grep -q "RESULT=DONE" || fail "update_state (multi started) did not report DONE ($us4)"
+grep -q "issueUpdate" "$GQLLOG" || fail "update_state (multi started) did not move the issue"
+grep -q "st_progress" "$GQLLOG" || fail "update_state (multi started) did not pick the 'In Progress' state by NAME (gh #169)"
+grep -q "st_review"  "$GQLLOG" && fail "update_state (multi started) picked 'In Review' — the exact gh #169 regression"
+pass
+
+# 4h. gh #169 fallback: when NO started state is named 'In Progress', pick the one with the LOWEST
+#     position (Linear's canonical order = the earliest started state), still never 'In Review'.
+: > "$GQLLOG"
+us5="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_doing","name":"Doing","position":1}]' \
+        run _backend_update_state ENG-7 in-progress )"
+echo "$us5" | grep -q "RESULT=DONE" || fail "update_state (position fallback) did not report DONE ($us5)"
+grep -q "st_doing" "$GQLLOG" || fail "update_state (position fallback) did not pick the LOWEST-position started state (gh #169)"
+grep -q "st_review" "$GQLLOG" && fail "update_state (position fallback) picked the higher-position 'In Review' — gh #169 regression"
+pass
+
+# 4i. gh #169 for DONE too: with several completed-type states, prefer the one named 'Done', else the
+#     lowest-position one — never an arbitrary completed state (e.g. 'Duplicate').
+: > "$GQLLOG"
+us6="$( STATES_NODES='[{"id":"st_dup","name":"Duplicate","position":2},{"id":"st_done","name":"Done","position":1}]' \
+        run _backend_update_state ENG-7 done )"
+echo "$us6" | grep -q "RESULT=DONE" || fail "update_state (multi completed) did not report DONE ($us6)"
+grep -q "st_done" "$GQLLOG" || fail "update_state (multi completed) did not pick the 'Done' state by NAME (gh #169)"
+grep -q "st_dup"  "$GQLLOG" && fail "update_state (multi completed) picked 'Duplicate' — gh #169 regression"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.

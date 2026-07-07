@@ -151,14 +151,15 @@ _backend_mark_shipped() {
     # _BACKEND_RESULT=DONE|NOCHANGE.
     local slug="$1" pr="$2" resp issue_id state_id
     _linear_require_key
-    if ! _linear_issue_query "$slug" 'id identifier title team { states(filter: { type: { eq: "completed" } }, first: 1) { nodes { id } } }'; then
+    if ! _linear_issue_query "$slug" "id identifier title team { $(_linear_states_field completed) }"; then
         echo "linear backend: no issue matching '$slug' — nothing to ship" >&2
         _BACKEND_RESULT="NOCHANGE"
         return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
     read -r issue_id state_id <<EOF
-$(printf '%s' "$resp" | python3 -c 'import sys, json
+$(printf '%s' "$resp" | PREF="$(_linear_preferred_state_name completed)" python3 -c "$_LINEAR_PICK_STATE_PY"'
+import sys, json, os
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
@@ -167,7 +168,7 @@ if not nodes:
 else:
     n = nodes[0]
     states = (((n.get("team") or {}).get("states") or {}).get("nodes")) or []
-    print("%s\t%s" % (n.get("id", ""), states[0]["id"] if states else ""))' 2>/dev/null)
+    print("%s\t%s" % (n.get("id", ""), _pick_state(states, os.environ.get("PREF", ""))))' 2>/dev/null)
 EOF
     if [ -z "$issue_id" ]; then
         echo "linear backend: no issue matching '$slug' — nothing to ship" >&2
@@ -202,6 +203,50 @@ _linear_state_type_for() {
     esac
 }
 
+_linear_preferred_state_name() {
+    # Given a resolved workflow-state TYPE, print the human state NAME the resolver should PREFER when
+    # a team has MORE THAN ONE state of that type. Linear groups states under a type, and a workspace
+    # can legitimately have several 'started' states ('In Progress' AND 'In Review') — the original
+    # 'first state of the type' logic then picked whichever the API returned first, landing work in
+    # 'In Review' (gh #169). We name the canonical target so it wins regardless of API order; an empty
+    # name means "no preference — fall back to the lowest-position state of the type".
+    case "$1" in
+        completed) printf 'Done' ;;
+        started)   printf 'In Progress' ;;
+        canceled)  printf 'Canceled' ;;
+        *)         printf '' ;;
+    esac
+}
+
+_linear_states_field() {
+    # GraphQL sub-selection for a team's workflow states of TYPE $1. Deliberately NOT first:1 — the
+    # name-first-then-position picker (gh #169) must see EVERY state of the type, plus each one's name
+    # and position, to avoid Linear handing back 'In Review' ahead of 'In Progress'.
+    printf 'states(filter: { type: { eq: "%s" } }) { nodes { id name position } }' "$1"
+}
+
+# Shared Python helper (a function def) prepended to every parser that must choose ONE workflow state
+# of a resolved type. Given that type's states (each {id,name,position}) and the preferred human name
+# (via $PREF in the env), _pick_state returns the id of the state whose name equals PREF
+# case-insensitively; failing that, the state with the LOWEST position — Linear's canonical ordering,
+# so the earliest started state ('In Progress') wins and 'In Review' is never silently chosen. This is
+# the gh #169 fix for a workspace with several started-type (or completed/canceled-type) states.
+_LINEAR_PICK_STATE_PY='
+def _pick_state(states, preferred):
+    states = states or []
+    if not states:
+        return ""
+    if preferred:
+        p = preferred.strip().lower()
+        for s in states:
+            if (s.get("name") or "").strip().lower() == p:
+                return s.get("id") or ""
+    def _pos(s):
+        v = s.get("position")
+        return v if isinstance(v, (int, float)) else float("inf")
+    return min(states, key=_pos).get("id") or ""
+'
+
 _linear_resolve_by_title() {
     # Fallback resolution when the request names no identifier: match OPEN-ish issues by a title
     # substring (case-insensitive). $1 = title text; $2 = target state type (inlined into the states
@@ -210,11 +255,11 @@ _linear_resolve_by_title() {
     # Deliberately CONSERVATIVE: first:2 so the caller can require a UNIQUE match and never mislabel
     # the wrong issue when a phrase is ambiguous.
     local title="$1" stype="$2" q v
-    q="$(printf 'query T($t: String!) {
-  issues(filter: { title: { containsIgnoreCase: $t } }, first: 2) {
-    nodes { id identifier title team { states(filter: { type: { eq: "%s" } }, first: 1) { nodes { id } } } }
+    q="query T(\$t: String!) {
+  issues(filter: { title: { containsIgnoreCase: \$t } }, first: 2) {
+    nodes { id identifier title team { $(_linear_states_field "$stype") } }
   }
-}' "$stype")"
+}"
     v="$(T="$title" python3 -c 'import os, json
 print(json.dumps({"t": os.environ["T"]}))')"
     _linear_gql "$q" "$v"
@@ -228,7 +273,7 @@ _backend_update_state() {
     # (issueSearch was deprecated/removed by Linear 2026-07). Sets _BACKEND_RESULT=DONE|NOCHANGE.
     # This is the intent-dispatch path (gh #139): a "mark HERD-22 done" request transitions the EXISTING
     # issue instead of filing a brand-new one. NOCHANGE (no unique match / no such state) files nothing.
-    local ref="$1" want="$2" stype fields resp issue_id state_id
+    local ref="$1" want="$2" stype pref fields resp issue_id state_id
     _linear_require_key
     stype="$(_linear_state_type_for "$want")"
     if [ -z "$stype" ]; then
@@ -236,16 +281,19 @@ _backend_update_state() {
         _BACKEND_RESULT="NOCHANGE"
         return 0
     fi
-    fields="$(printf 'id identifier title team { states(filter: { type: { eq: "%s" } }, first: 1) { nodes { id } } }' "$stype")"
+    pref="$(_linear_preferred_state_name "$stype")"
+    fields="id identifier title team { $(_linear_states_field "$stype") }"
     if _linear_issue_query "$ref" "$fields"; then
         resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"          # identifier path (HERD-22 → number+team)
     else
         resp="$(_linear_resolve_by_title "$ref" "$stype")"      # conservative title match
     fi
     # ONE parser for both shapes: require EXACTLY ONE matching node (uniqueness = conservatism), then
-    # read its id + the first workflow-state id of the mapped type.
+    # read its id + the mapped-type state id chosen name-first-then-lowest-position (gh #169), so a
+    # workspace with both 'In Progress' and 'In Review' started states resolves to 'In Progress'.
     read -r issue_id state_id <<EOF
-$(printf '%s' "$resp" | python3 -c 'import sys, json
+$(printf '%s' "$resp" | PREF="$pref" python3 -c "$_LINEAR_PICK_STATE_PY"'
+import sys, json, os
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
@@ -254,7 +302,7 @@ if len(nodes) != 1:
 else:
     n = nodes[0]
     states = (((n.get("team") or {}).get("states") or {}).get("nodes")) or []
-    print("%s\t%s" % (n.get("id", ""), states[0]["id"] if states else ""))' 2>/dev/null)
+    print("%s\t%s" % (n.get("id", ""), _pick_state(states, os.environ.get("PREF", ""))))' 2>/dev/null)
 EOF
     if [ -z "$issue_id" ]; then
         echo "linear backend: no unique issue matching '$ref' — state unchanged (skipping, not filing)" >&2
@@ -449,26 +497,33 @@ print("%s\t%s" % (v.get("id", ""), v.get("name", "")))' 2>/dev/null)"
     me_id="${me%%	*}"
     if [ -z "$me_id" ]; then _CLAIM_RESULT="UNREACHABLE"; return 0; fi
 
-    if ! _linear_issue_query "$ref" 'id identifier assignee { id name } state { type } team { states(filter: { type: { eq: "started" } }, first: 1) { nodes { id } } }'; then
+    if ! _linear_issue_query "$ref" "id identifier assignee { id name } state { type } team { $(_linear_states_field started) }"; then
         _CLAIM_RESULT="UNREACHABLE"; return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
-    # "<issue_id>\t<assignee_id>\t<assignee_name>\t<state_type>\t<started_state_id>" — split on TAB
-    # only, so an assignee display name containing spaces (e.g. "Other Op") stays one field.
-    IFS=$'\t' read -r issue_id assignee_id assignee_name stype state_id <<EOF
-$(printf '%s' "$resp" | python3 -c 'import sys, json
+    # "<issue_id>|<assignee_id>|<assignee_name>|<state_type>|<started_state_id>" — split on the ASCII
+    # unit separator (\x1f), NOT a tab: tab is IFS-whitespace, so `read` would COLLAPSE the empty
+    # fields of an unassigned issue (assignee null → id/name empty) and shift every column left,
+    # misreading a claimable issue as already-taken. \x1f never appears in a display name and is not
+    # whitespace, so empty fields are preserved. The started state is chosen name-first-then-lowest-
+    # position (gh #169): a workspace with both 'In Progress' and 'In Review' started states claims
+    # into 'In Progress', never 'In Review'.
+    IFS=$'\x1f' read -r issue_id assignee_id assignee_name stype state_id <<EOF
+$(printf '%s' "$resp" | PREF="$(_linear_preferred_state_name started)" python3 -c "$_LINEAR_PICK_STATE_PY"'
+import sys, json, os
+SEP = "\x1f"
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 if not nodes:
-    print("\t\t\t\t")
+    print(SEP * 4)
 else:
     n = nodes[0]
     a = n.get("assignee") or {}
     st = n.get("state") or {}
     states = (((n.get("team") or {}).get("states") or {}).get("nodes")) or []
-    print("%s\t%s\t%s\t%s\t%s" % (n.get("id", ""), a.get("id", ""), (a.get("name") or "").replace("\t"," "),
-                                  st.get("type", ""), states[0]["id"] if states else ""))' 2>/dev/null)
+    print(SEP.join([n.get("id", ""), a.get("id", ""), (a.get("name") or "").replace(SEP, " "),
+                    st.get("type", ""), _pick_state(states, os.environ.get("PREF", ""))]))' 2>/dev/null)
 EOF
     if [ -z "$issue_id" ]; then _CLAIM_RESULT="UNREACHABLE"; return 0; fi
     case "$stype" in
