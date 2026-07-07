@@ -123,6 +123,19 @@ HERD_DRIVER="herdr-claude"
 # Takes precedence over WATCHER_AUTOMERGE when set.
 MERGE_POLICY="auto"
 
+# human-verify policy (HERD-59) — how the watcher handles a PR that declares a HUMAN-VERIFY: block
+# under MERGE_POLICY=auto. A builder that could not itself run a manual step (a live smoke test, a
+# UI/pane check) declares it under a HUMAN-VERIFY: marker in the PR body; today such a PR is ALWAYS
+# held for a sha-keyed approval, even under auto. This lever changes that, opt-in only:
+#   hold        default — today's EXACT behavior, byte-identical when unset: the PR is held and
+#               released by  herd-approve.sh approve <pr#>  after the steps are verified.
+#   coordinator keep the hold, but notify loudly and flag it coordinator-actionable — a coordinator/
+#               agent executes the declared steps and approves via  herd-approve.sh approve <pr#>.
+#   auto        treat the declared steps as INFORMATIONAL: journal them + comment them on the PR, and
+#               merge on green gates (the standing human-verify authorization, codified as a switch).
+# Unknown/empty falls back to hold. Watcher-affecting: takes effect on the next watcher restart.
+# HUMAN_VERIFY_POLICY="hold"   # hold (default) | coordinator | auto
+
 # merge method — the gh pr merge strategy applied by do_merge (default: merge commit).
 MERGE_METHOD="merge"    # merge | squash | rebase
 

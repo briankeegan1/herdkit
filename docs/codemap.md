@@ -129,6 +129,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_REPO` → `bin/herd`, `fleet.sh`, `herd-links.sh`
 - `HERD_THEME` → `theme.sh`
 - `HERD_VERSION` → `bin/herd`
+- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `MCP_PROVISION` → —
