@@ -1561,14 +1561,28 @@ cmd_backlog() {
   #   herd backlog browse       interactive fzf picker over the open list with a live detail
   #                             preview pane; ENTER prints the selection's full detail. Without
   #                             fzf it degrades soft: plain list + a one-line install hint
-  local mode="plain" ref=""
+  #   herd backlog queued       list live PLANNED-work markers (HERD-52): items a coordinator has
+  #                             sequenced-to-spawn-next but not yet spawned, so a second operator
+  #                             sees plan-time intent. Markers older than 24h are flagged ADVISORY.
+  #   herd backlog queue <#id> [--after <blocker>]
+  #                             publish such a marker (I'm building this next, after <blocker>)
+  #   herd backlog unqueue <#id>  clear my marker (plan dropped; a spawn's claim supersedes it too)
+  # queue/unqueue/queued are BACKEND-OPTIONAL: a backend without the op prints a soft note (or an
+  # empty list) and exits 0 — a plan marker is advisory, never a gate.
+  local mode="plain" ref="" blocker=""
   case "${1:-}" in
-    --rich) mode="rich" ;;
-    show)   mode="show"; ref="${2:-}"
-            [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
-    browse) mode="browse" ;;
-    '')     ;;
-    *)      die "usage: herd backlog [--rich | show <#id> | browse]" ;;
+    --rich)  mode="rich" ;;
+    show)    mode="show"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
+    browse)  mode="browse" ;;
+    queued)  mode="queued" ;;
+    queue)   mode="queue"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog queue <#id> [--after <blocker>]"
+             case "${3:-}" in --after) blocker="${4:-}" ;; '') ;; *) blocker="${3:-}" ;; esac ;;
+    unqueue) mode="unqueue"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog unqueue <#id>" ;;
+    '')      ;;
+    *)       die "usage: herd backlog [--rich | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
   esac
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -1631,6 +1645,56 @@ cmd_backlog() {
         printf '%s\n' "$list"
         echo "herd backlog browse: fzf not found — showing the plain list (brew install fzf / apt install fzf for interactive browsing)" >&2
       fi ;;
+    queued)
+      # Print live planned markers, readable, with a >24h ADVISORY flag computed off the epoch.
+      # A backend without the op simply prints nothing (no markers exist there).
+      command -v _backend_list_queued >/dev/null 2>&1 || return 0
+      local now; now="$(date +%s 2>/dev/null || echo 0)"
+      _backend_list_queued | NOW="$now" python3 -c 'import sys, os
+now = int(os.environ.get("NOW") or 0)
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) < 4:
+        continue
+    ref, who, detail, ts = parts[0], parts[1], parts[2], parts[3]
+    try: age = now - int(ts)
+    except ValueError: age = -1
+    if age < 0:
+        when = ""
+    elif age >= 86400:
+        when = " (%dh ago — ADVISORY: >24h stale)" % (age // 3600)
+    elif age >= 3600:
+        when = " (%dh ago)" % (age // 3600)
+    else:
+        when = " (%dm ago)" % (age // 60)
+    print("%s — queued by %s: %s%s" % (ref, who, detail, when))' 2>/dev/null || true ;;
+    queue|unqueue)
+      # Publish / clear a planned marker synchronously (like a claim, unlike the async scribe) so a
+      # second operator sees the plan promptly. Resolve the operator identity the same order the
+      # claimant does, and attribute the tracker_write to the 'plan' component (HERD-85).
+      if ! command -v "_backend_${mode}_item" >/dev/null 2>&1; then
+        echo "herd backlog $mode: backend '$SCRIBE_BACKEND' has no planned-marker op — skipping (advisory feature, fail-soft)." >&2
+        return 0
+      fi
+      local who="${WATCHER_OWNER:-}"
+      [ -n "$who" ] || who="${WATCHER_VIEW_AUTHOR:-}"
+      [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+      [ -n "$who" ] || who="unknown-operator"
+      export HERD_COMPONENT="plan"
+      _BACKEND_RESULT=""
+      if [ "$mode" = "queue" ]; then
+        _backend_queue_item "$ref" "$who" "$blocker"
+      else
+        _backend_unqueue_item "$ref" "$who"
+      fi
+      case "${_BACKEND_RESULT:-}" in
+        DONE) [ "$mode" = "queue" ] \
+                && echo "📌 queued $ref as '$who'${blocker:+ (after $blocker)} — visible to other operators via 'herd backlog queued'." \
+                || echo "🧹 cleared the planned marker on $ref." ;;
+        *)    [ "$mode" = "queue" ] \
+                && echo "herd backlog queue: no change (item '$ref' not resolvable, or already marked) — see stderr above." >&2 \
+                || echo "herd backlog unqueue: no planned marker on '$ref' to clear." >&2 ;;
+      esac ;;
   esac
 }
 

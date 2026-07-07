@@ -43,6 +43,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic file-backend test passes" {
+  run bash "$REPO/tests/test-backend-file.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic planned-work-visibility test passes" {
+  run bash "$REPO/tests/test-planned-work-visibility.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]

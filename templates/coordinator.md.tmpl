@@ -86,7 +86,17 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 ## Implement an item
 
-1. List the 🔜 items and let the user pick one (AskUserQuestion).
+1. List the 🔜 items and let the user pick one (AskUserQuestion). **Before you offer an item, screen
+   out what another operator has already taken or planned** (two operators now share this tracker):
+   - **In flight** — skip anything already assigned / 🚧 in progress (the tracker's own state, and
+     `git worktree list`). A pre-spawn **claim** (`CLAIM_REQUIRED`, below) is the hard guard here.
+   - **Planned but not yet spawned** — run `herd backlog queued` and skip any item another operator
+     has published a 📌 marker for. This is the *plan-time* complement to claiming: it surfaces work a
+     coordinator has **sequenced to spawn next** but hasn't spawned yet, which otherwise lives only in
+     that coordinator's conversation. A marker flagged `ADVISORY: >24h stale` is **advisory only** —
+     an abandoned plan never becomes a soft lock, so you MAY pick it (say so out loud). You may also
+     override a fresh marker with an explicit reason (e.g. the other operator asked you to take it).
+     A marker is auto-superseded once the item is spawned (the claim takes over).
 2. Derive a short **kebab-case slug** (e.g. "Card CSV importer" → `card-csv-importer`). Confirm.
 3. **Before you spawn**, run the *pre-spawn impact/conflict analysis* below if graphify is available
    on this machine — it reads whether the candidate's file surface collides with work already in
@@ -157,6 +167,38 @@ Turn it on for shared / multi-operator repos where an off-book spawn must be imp
 discouraged; pair it with `CLAIM_REQUIRED` so every spawn is both **visible** in the tracker and
 **claimed** against a double-build.
 
+### Planned-work visibility — publish what you've sequenced next (HERD-52)
+
+Claiming (`CLAIM_REQUIRED`) closes the *spawn-time* race, but there is an earlier one: once you
+**sequence** an item to spawn next — decided, but waiting on a blocker to merge or on review
+bandwidth — that plan lives only in *your* conversation. A second operator reading the same tracker
+sees the item still open and can grab it. Close that plan-time window by publishing a lightweight
+**📌 planned marker**:
+
+    herd backlog queue <#id> --after <blocker>     # "I'm building this next, after <blocker>"
+    herd backlog queued                            # list every operator's live planned markers
+    herd backlog unqueue <#id>                     # clear it (plan dropped)
+
+**When to publish.** Whenever you decide to build an item but don't spawn it *right now* — you're
+holding it behind an in-flight worktree (the graphify *Sequence or warn* step above), waiting on
+review capacity, or lining up a batch. Publish before you move on, so the other operator's next
+`herd backlog queued` shows it.
+
+**Lifecycle (so a marker never rots into a lock).**
+- **Superseded on spawn.** When you actually spawn the item, the pre-spawn **claim** takes over as
+  the authoritative signal (assignee + 🚧). You don't have to unqueue by hand — but do it if the
+  backend keeps the marker around and it's noise.
+- **Cleared on drop.** Change your mind? `herd backlog unqueue <#id>` removes it.
+- **Advisory after 24h.** `herd backlog queued` flags any marker older than 24h `ADVISORY: >24h
+  stale`. A stale plan is informational only — never treat it as a lock; pick the item if the plan
+  was clearly abandoned.
+
+**Backend-optional + fail-soft.** On the file backend the marker is a 📌 annotation committed onto
+the item's `{{BACKLOG_FILE}}` line (so it also shows inline in `herd backlog`); on Linear it's a 📌
+comment on the issue. A backend that doesn't support markers prints a soft note and no-ops — the
+feature is advisory, so a missing op is never an error and never blocks a spawn. Each marker write is
+journaled (`herd log | grep tracker_write`, component `plan`) for attribution.
+
 ### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
 
 Before spawning a builder — and periodically while several are in flight — check whether the
@@ -187,7 +229,9 @@ move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no Claud
 
 4. **Sequence or warn.** On a real overlap, prefer to **hold the colliding candidate** until the
    in-flight worktree merges, or spawn it with an explicit note in the task so the builder expects a
-   rebase. Non-overlapping items spawn freely in parallel.
+   rebase. Non-overlapping items spawn freely in parallel. When you **hold** a candidate to sequence
+   it after the blocker, **publish that plan** so a second operator sees it (next section) —
+   `herd backlog queue <#id> --after <blocker>`.
 
 **Honest scope — file-level only.** graphify's bash **cross-file call** resolution is weak (measured
 2026-07-06: **0** cross-file call links among the big engine scripts; the ~136 repo-wide cross-file
