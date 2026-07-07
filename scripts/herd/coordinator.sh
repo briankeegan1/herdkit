@@ -19,6 +19,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # rule-3 fallback) and refuse a foreign $PWD — set BEFORE sourcing so herd-config.sh enforces it.
 HERD_REQUIRE_PROJECT_CONFIG=1
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the coordinator agent launch through herd_driver_start_agent's seam so
+# HERD_DRIVER=headless spawns a DETACHED coordinator (no herdr pane); the default herdr-claude driver
+# emits the identical `herdr agent start … -- claude` below. Functions only — no side effects.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 # Shared eyes-on-layout helper: fold stray tabs + rewrite the .herd-panes registry from OBSERVED
 # state through the same primitives cmd_reload uses (functions only, no side effects on source).
 # shellcheck source=/dev/null
@@ -94,8 +99,9 @@ herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null 2>"$_CE" \
 herd_write_ratelimit_hook "$REPO"
 
 # 3. Right pane = coordinator Claude, auto-running the generated coordinator skill.
-started=$(herdr agent start "$HERD_AGENT_COORDINATOR" --workspace "$WS" --cwd "$REPO" --tab "$TAB" --split right \
-  -- claude --model "$MODEL_COORDINATOR" "$COORDINATOR_CMD" 2>"$_CE") || _coord_die "coordinator agent"
+started=$(herd_driver_launch_agent \
+  name="$HERD_AGENT_COORDINATOR" workspace="$WS" cwd="$REPO" tab="$TAB" split=right focus=yes \
+  model="$MODEL_COORDINATOR" pointer="$COORDINATOR_CMD" 2>"$_CE") || _coord_die "coordinator agent"
 AGENT_PANE=$(printf '%s' "$started" | python3 -c \
   'import sys,json; print(json.load(sys.stdin)["result"]["agent"]["pane_id"])' \
   2>"$_CE") || _coord_die "coordinator agent/parse"

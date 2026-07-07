@@ -62,6 +62,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
 
+# Runtime driver shim: the ONE seam binding the runtime-specific control surface (multiplexer + agent
+# runtime) to a concrete backend, dispatched on HERD_DRIVER. Defines functions only (side-effect-free),
+# and — like fleet.sh — late-binds herd_resolve_workspace_id / WORKTREES_DIR at call time, so sourcing
+# here before those are wired is safe. Lets the coordinator relaunch (_pane_agent_start) and the fleet
+# room route their agent launches through herd_driver_launch_agent instead of raw `herdr agent start`.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/driver.sh" ] && . "$SCRIPTS_DIR/driver.sh"
+
 # `herd status` helpers: the DETERMINISTIC, READ-ONLY one-shot health snapshot for THIS project
 # (watcher liveness, in-flight builders + DEAD detection, open PRs + gate state, backlog counts).
 # Defines functions only — its _status_watcher_pids late-binds _list_project_watchers (defined far
@@ -2754,7 +2762,8 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
 # _pane_agent_start <name> <workspace> <cwd> <tab> <direction> → new pane_id, or empty. Reuses
 # coordinator.sh's agent-start invocation so the relaunched coordinator runs the same skill.
 _pane_agent_start() {
-  herdr agent start "$1" --workspace "$2" --cwd "$3" --tab "$4" --split "$5" -- claude "$COORDINATOR_CMD" 2>/dev/null \
+  herd_driver_launch_agent name="$1" workspace="$2" cwd="$3" tab="$4" split="$5" focus=yes \
+    pointer="$COORDINATOR_CMD" 2>/dev/null \
     | python3 -c '
 import sys,json
 try: print(json.load(sys.stdin)["result"]["agent"]["pane_id"], end="")

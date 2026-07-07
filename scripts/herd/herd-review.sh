@@ -89,6 +89,10 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the review agent launch through herd_driver_launch_agent so
+# HERD_DRIVER=headless spawns a detached reviewer; herdr-claude emits the identical argv below.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 # Engine journal — record log retention + infra deaths (best-effort, never breaks the gate).
 . "$HERE/journal.sh"
 MAIN="$PROJECT_ROOT"
@@ -385,14 +389,12 @@ except Exception:
 ' 2>/dev/null || true)"
 
   if [ -n "${_builder_pane:-}" ] && [ -n "${_builder_tab:-}" ]; then
-    # Try to start the review agent as a bottom split inside the builder's tab.
-    _agent_start_out="$(herdr agent start "review·$SLUG" \
-      ${_WS_ID:+--workspace "$_WS_ID"} \
-      --cwd "$CWD" \
-      --tab "$_builder_tab" \
-      --split down \
-      --no-focus \
-      -- claude --model "$REVIEW_MODEL" $CLAUDE_FLAGS "$AGENT_TASK" 2>/dev/null || true)"
+    # Try to start the review agent as a bottom split inside the builder's tab. Routed through the
+    # driver seam so HERD_DRIVER=headless spawns a detached reviewer; herdr-claude emits the identical
+    # `herdr agent start … --split down --no-focus -- claude …` argv.
+    _agent_start_out="$(herd_driver_launch_agent \
+      name="review·$SLUG" workspace="$_WS_ID" cwd="$CWD" tab="$_builder_tab" split=down \
+      model="$REVIEW_MODEL" flags="$CLAUDE_FLAGS" pointer="$AGENT_TASK" 2>/dev/null || true)"
     ROOT="$(printf '%s' "${_agent_start_out:-}" | python3 -c '
 import sys, json
 try:
