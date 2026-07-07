@@ -325,6 +325,35 @@ scorecard shape, the `--sweep` no-op, and hermeticity. The suite **never** sets
 > (disposable, auto-deleted), completing the fidelity ladder from stub → real-watcher → real-panes →
 > real-remote.
 
+## HERD-74 — SHARED-CONFIG ADOPTION scenario — `sandbox-shared-config-scenario.sh`
+
+Closes the gate gap for `herd config set --shared`. That command opens its `config/<key>` PR from a
+branch with **no worktree** — and agent-watch.sh discovers work via `git worktree list`, **not** open
+PRs — so before the fix the config PR sat **ungated forever** (observed 2026-07-07: PRs #190/#191 had
+zero journal entries and needed hand-merging). The fix makes `set --shared` **leave its throwaway
+worktree in the pool** (`WORKTREES_DIR`) so the standard discovery → gate → merge → reap machinery
+adopts it like any feature worktree — no bespoke watcher PR-discovery path.
+
+This scenario drives **both halves against real code**, hermetically:
+
+- it runs the **real** `bin/herd config set --shared <KEY> <VALUE>` against a fixture that has its own
+  bare origin (gh stubbed) — the production path that now leaves the adoptable worktree + opens the PR
+  (`shared_pr_opened`, `worktree_persisted`);
+- it then sources the **real** `agent-watch.sh` (lib mode) and drives the SHIPPED gate functions
+  (`_healthcheck_gate`, `_review_gate_step`, `review_verdict`, `do_merge`, `already_merged`) over the
+  worktree it **discovers from the real `git worktree list`** — the exact discovery input the watcher's
+  action pass parses — proving the `config/<key>` branch with no pre-existing worktree gets
+  **adopted** (`discovered_by_watcher`), **gated + merged once** (`gated_and_merged`), and **reaped**
+  (`reaped`, via `do_merge`'s real `git worktree remove`).
+
+```sh
+bash scripts/herd/sim/sandbox-shared-config-scenario.sh --artifacts /tmp/sharedcfg-run
+cat /tmp/sharedcfg-run/scorecard.json
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds**: `key`, `branch`, `pr`, `merges`,
+`healthcheck_runs`, `merged`. Hermetic proof: `../../../tests/test-sandbox-shared-config.sh`.
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -335,6 +364,7 @@ scorecard shape, the `--sweep` no-op, and hermeticity. The suite **never** sets
 | **P2a** | `sandbox-limit-resume-scenario.sh` | the **real** watcher limit path | limit-park **detect → park → scheduled → resume → complete** + kill-switch |
 | **P2b** | `sandbox-real-panes-scenario.sh` | a **real** disposable herdr control room | pane/tab existence + labels, agent `idle→working→done`, **clean teardown (0 leaks)** |
 | **P2c** | `sandbox-real-remote-scenario.sh` | a **real** disposable GitHub repo (opt-in) | real `gh pr create` / watcher poll / `gh pr merge`, **guaranteed repo cleanup** |
+| **HERD-74** | `sandbox-shared-config-scenario.sh` | real `config set --shared` **+** the real watcher gate | a `config/<key>` branch with **no worktree** is **adopted → gated → merged → reaped** |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique

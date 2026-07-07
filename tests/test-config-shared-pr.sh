@@ -139,10 +139,19 @@ grep -q 'ARGS:.*\[pr\] \[create\]' "$GHLOG" || fail "(1) gh pr create was not ca
 BODY="$(cat "$GHSTATE/body-config_CLAIM_REQUIRED")"
 printf '%s' "$BODY" | grep -q 'off' && printf '%s' "$BODY" | grep -q 'on' || fail "(1) PR body missing old->new ($BODY)"
 printf '%s' "$BODY" | grep -q 'enforce claims before builds' || fail "(1) PR body missing the --reason ($BODY)"
-# the operator's own checkout is untouched: still on main, and NO leaked worktree remains
+# the operator's own checkout is untouched: still on main.
 [ "$(git -C "$P" symbolic-ref --short HEAD)" = "main" ] || fail "(1) operator checkout was switched off main"
-[ "$(git -C "$P" worktree list | wc -l | tr -d ' ')" = "1" ] || fail "(1) a throwaway worktree leaked ($(git -C "$P" worktree list))"
+# HERD-74: the config worktree now PERSISTS in the pool (WORKTREES_DIR) so the STANDARD watcher gate
+# discovers + gates + merges + reaps it (agent-watch.sh finds work via `git worktree list`, not open
+# PRs). It used to be a throwaway removed at the end — which left the PR ungated forever (PRs #190/#191).
+CWT="$P/trees/config-CLAIM_REQUIRED"
+[ -d "$CWT" ] || fail "(1) config worktree not left in the pool for watcher adoption ($(git -C "$P" worktree list))"
+[ "$(git -C "$CWT" symbolic-ref --short HEAD)" = "config/CLAIM_REQUIRED" ] || fail "(1) config worktree not checked out on config/CLAIM_REQUIRED ($(git -C "$CWT" symbolic-ref --short HEAD 2>&1))"
+grep -qE '^CLAIM_REQUIRED="on"' "$CWT/.herd/config" || fail "(1) config worktree does not carry the change"
+# exactly two worktrees now: the operator's main checkout + the one adopted config worktree (no leak).
+[ "$(git -C "$P" worktree list | wc -l | tr -d ' ')" = "2" ] || fail "(1) unexpected worktree set ($(git -C "$P" worktree list))"
 printf '%s\n' "$OUT" | grep -qi 'opened config PR' || fail "(1) output did not confirm the PR ($OUT)"
+printf '%s\n' "$OUT" | grep -qi 'watcher gates' || fail "(1) output did not flag the worktree left for the watcher ($OUT)"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +161,10 @@ run "$P" config set --shared CLAIM_REQUIRED on
 [ "$RC" -eq 0 ] || fail "(2) re-run --shared failed (rc=$RC): $OUT"
 printf '%s\n' "$OUT" | grep -qi 'no change' && fail "(2) --shared wrongly short-circuited as a plain no-op ($OUT)"
 printf '%s\n' "$OUT" | grep -qi 'refreshed the existing config PR' || fail "(2) re-run did not refresh the existing PR ($OUT)"
+# HERD-74: re-run must not choke on the persisted worktree from run (1) — it re-adds it in place and
+# leaves it again (still exactly two worktrees: main + the refreshed config worktree, no accumulation).
+[ -d "$CWT" ] || fail "(2) config worktree missing after re-run ($(git -C "$P" worktree list))"
+[ "$(git -C "$P" worktree list | wc -l | tr -d ' ')" = "2" ] || fail "(2) re-run accumulated worktrees ($(git -C "$P" worktree list))"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1327,18 +1327,41 @@ _config_open_shared_pr() {
   local base_ref="$default_branch"
   git -C "$root" rev-parse --verify --quiet "$default_branch^{commit}" >/dev/null 2>&1 || base_ref="HEAD"
 
-  local wt; wt="$(mktemp -d)"
+  # HERD-74: the config PR's worktree must PERSIST under WORKTREES_DIR so the STANDARD watcher gate
+  # adopts it. agent-watch.sh discovers work via `git worktree list` (NOT open PRs), so a config/<key>
+  # branch with no worktree is invisible and sits ungated forever (observed: PRs #190/#191 required
+  # hand-merging). Creating the worktree in the worktree pool and LEAVING it for the watcher lets the
+  # existing discovery → healthcheck+review gate → merge → reap machinery drive it exactly like a
+  # feature worktree — no bespoke PR-discovery path, and reap-on-merge (do_merge) reuses the same
+  # `git worktree remove`. It is only removed here on a DEGRADE path (no PR opened → nothing to gate).
+  # Resolve WORKTREES_DIR the way the watcher does (a subshell-source expands $HOME etc. in the value),
+  # falling back to the herd-config.sh default of "<PROJECT_ROOT>-trees".
+  local wt_dir; wt_dir="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
+  if [ -z "$wt_dir" ]; then
+    local proj_root; proj_root="$( ( . "$cfg" 2>/dev/null; printf '%s' "${PROJECT_ROOT:-}" ) )"
+    wt_dir="${proj_root:-$root}-trees"
+  fi
+  mkdir -p "$wt_dir" 2>/dev/null || true
+  local wt="$wt_dir/config-$key"
+  # Idempotent re-run: a prior `set --shared` for this key left its worktree here (checked out on
+  # $branch). Drop any prior worktree/registration for it before re-adding, else `worktree add -B`
+  # fails on the existing dir / already-checked-out branch. Safe — it is throwaway and the branch ref
+  # survives on origin (the refreshed branch is force-pushed below). Unconditional: a no-op when absent.
+  git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -rf "$wt" 2>/dev/null || true
+  git -C "$root" worktree prune >/dev/null 2>&1 || true
   # -B (re)creates or resets the branch to base_ref, so re-running `set --shared` for the same key
   # refreshes the SAME PR branch with the newest value instead of failing on an existing branch.
   if ! git -C "$root" worktree add -q -B "$branch" "$wt" "$base_ref" 2>/dev/null; then
-    rm -rf "$wt"
+    git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt" 2>/dev/null || true
     warn "could not create a work branch for the config PR (git worktree add -B $branch failed) — the change is applied locally; open the PR by hand (branch $branch off $base)."
     return 0
   fi
 
   # Apply the SAME one-key edit in the worktree's baseline copy (the committed, pre-change value), so
   # the branch carries exactly old->new for this key and nothing else. Reuse the shared edit primitive.
-  local push_ok=0
+  local push_ok=0 keep_wt=0
   if [ -f "$wt/.herd/config" ]; then
     _config_put_value "$wt/.herd/config" "$key" "$new"
     if ! git -C "$wt" diff --quiet -- .herd/config; then
@@ -1384,6 +1407,7 @@ picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the no
       ( cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" ) >/dev/null 2>&1 && created=1
     fi
     if [ "$created" -eq 1 ]; then
+      keep_wt=1
       ok "opened config PR for $branch → merges the change to every operator (watcher-gated)"
     else
       # A PR for this branch may already be open (re-run) — the force push above updated its diff.
@@ -1393,6 +1417,7 @@ picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the no
         ( cd "$wt" && gh pr view "$branch" ) >/dev/null 2>&1 && exists=1
       fi
       if [ "$exists" -eq 1 ]; then
+        keep_wt=1
         ok "refreshed the existing config PR for $branch with $key=$new"
       else
         warn "pushed branch $branch but 'gh pr create' failed — open the PR manually: gh pr create ${slug:+--repo $slug }--base $base --head $branch"
@@ -1402,8 +1427,19 @@ picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the no
     warn "could not push $branch to $remote (permission or network) — the change is applied locally; push $branch and open the PR by hand."
   fi
 
-  git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
-  rm -rf "$wt"
+  # HERD-74: a PR is open → LEAVE the worktree in the pool for the watcher to adopt (discover → gate →
+  # merge → reap). Otherwise (any degrade path: no PR opened) remove it so no orphan worktree lingers.
+  if [ "$keep_wt" -eq 1 ]; then
+    # Best-effort handoff marker so the adoption is auditable in the engine journal (fail-soft: a
+    # missing WORKTREES_DIR just drops the event). The watcher journals the eventual merge + reap.
+    { type journal_append >/dev/null 2>&1 && WORKTREES_DIR="$wt_dir" journal_append config_pr_adopt \
+        slug "config-$key" branch "$branch" key "$key" reason left_for_watcher_gate; } >/dev/null 2>&1 || true
+    say "  ${c_dim}(worktree left in the pool → the watcher gates + merges + reaps it like a feature)${c_rst}"
+  else
+    git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt" 2>/dev/null || true
+    git -C "$root" worktree prune >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
