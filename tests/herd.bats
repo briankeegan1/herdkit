@@ -109,6 +109,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
+  run bash "$REPO/tests/test-tab-leak-deflake.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic builder-secrets-isolation test passes" {
   run bash "$REPO/tests/test-builder-secrets-isolation.sh"
   [ "$status" -eq 0 ]
