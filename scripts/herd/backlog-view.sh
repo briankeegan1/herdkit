@@ -138,6 +138,16 @@ poll_wait() {
   return 0
 }
 
+# _osc8 <url> <text> — wrap <text> in an OSC 8 terminal hyperlink to <url> and print it (no newline).
+# OSC 8 (ESC ]8;;URL ST … ESC ]8;; ST, ST = ESC \) is orthogonal to SGR color, so a caller's themed
+# styling is untouched; terminals without OSC 8 support ignore the sequence and show <text> plain
+# (clean fail-soft, no false red). Empty <url> → <text> verbatim. Shared by the incoming section here
+# and mirrored by rich_to_md's python osc8() for the primary list. (HERD-49)
+_osc8() {
+  if [ -z "${1:-}" ]; then printf '%s' "${2:-}"; return 0; fi
+  printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+}
+
 # ── incoming (github issues) — optional additive section (BACKLOG_VIEW_EXTRAS) ─
 # When BACKLOG_VIEW_EXTRAS=github-issues this prints a SECOND, clearly-labeled section listing THIS
 # repo's OPEN GitHub issues (the herd-report incoming inbox) — to be appended BENEATH the primary
@@ -158,15 +168,26 @@ incoming_block() {
     printf '\033[2m  incoming unavailable\033[0m\n'
     return 0
   fi
-  local issues rc
-  # Ask for a clean '#<n> <title>' line shape via gh's built-in --jq; run from $REPO so gh binds to
-  # this project's repo. stdout only — stderr discarded (secrets / error bodies never reach the pane).
+  local issues rc tab; tab="$(printf '\t')"
+  # Ask for a '#<n> \t <title> \t <url>' line shape via gh's built-in --jq; run from $REPO so gh binds
+  # to this project's repo. stdout only — stderr discarded (secrets / error bodies never reach the
+  # pane). The URL makes the id chip an OSC 8 clickable hyperlink to the issue (HERD-49); a gh too old
+  # to know --json url, or any line without the three tab fields, falls back to a plain unlinked row.
   issues="$(cd "$REPO" 2>/dev/null && gh issue list --state open --limit 30 \
-              --json number,title --jq '.[] | "#\(.number) \(.title)"' 2>/dev/null)"; rc=$?
+              --json number,title,url --jq '.[] | "#\(.number)\t\(.title)\t\(.url)"' 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     printf '\033[2m  incoming unavailable\033[0m\n'
   elif [ -n "$issues" ]; then
-    printf '%s\n' "$issues" | while IFS= read -r iln; do printf '  %s\n' "$iln"; done
+    printf '%s\n' "$issues" | while IFS="$tab" read -r inum ititle iurl; do
+      if [ -n "$iurl" ]; then
+        # id chip → OSC 8 hyperlink (issue URL); title follows plain. OSC 8 is ignored by terminals
+        # without support, so this stays a clean fallback to the same '#<n> <title>' text.
+        printf '  %s %s\n' "$(_osc8 "$iurl" "$inum")" "$ititle"
+      else
+        # No url field (older gh, or a non-TSV line) — print the row verbatim, taming any stray tabs.
+        printf '  %s\n' "$(printf '%s' "$inum${ititle:+ $ititle}" | tr '\t' ' ')"
+      fi
+    done
   else
     printf '\033[2m  (no open issues)\033[0m\n'
   fi
@@ -177,7 +198,7 @@ incoming_block() {
 # SCRIBE_BACKEND is a non-file value). Kept as functions so the historical file loop stays verbatim.
 
 # rich_to_md — turn `herd backlog --rich` TSV (see backends/linear.sh _backend_list_open_rich:
-# "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>") into markdown that renders with the loved
+# "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>") into markdown that renders with the loved
 # file-backend hierarchy: items GROUPED under H2 state headers (🚧 in progress / 🔜 queued /
 # ❓ triage — the theme's H2 purple bar), the id as a code chip, ONLY the title in bold (the
 # theme's strong orange), and the description as a plain TOP-LEVEL paragraph between bullets (the
@@ -188,7 +209,11 @@ incoming_block() {
 # margin — the exact visual break of the loved file-backend view. Overlong
 # titles are split at a word boundary: the head stays bold, the spill joins the body text (fixes
 # paragraph-length tracker titles rendering entirely bold). A description that merely repeats the
-# title (the scribe files title = first line of the full text) is de-duplicated. Emphasis markers
+# title (the scribe files title = first line of the full text) is de-duplicated. When the TSV carries
+# the optional 7th <url> field (linear rich data), the id chip is wrapped in an OSC 8 terminal
+# hyperlink to that issue URL (HERD-49) — SGR color and OSC 8 are orthogonal, so glow's purple chip
+# styling is preserved exactly and a terminal without OSC 8 support just shows the id plain (clean
+# fail-soft). Emphasis markers
 # are kept SANE so glow never leaks a literal '**': the bolded head has any internal ** stripped
 # (the template already bolds it), and the body's inline **bold** is balanced — an upstream desc cap
 # (linear.sh truncates at 280), our BODY_MAX cut, or the title-spill join can split a **…** span and
@@ -208,6 +233,17 @@ def strip_bold(s):
     # nest/break that span (glow then leaks a literal **), so drop internal markers outright — the
     # template supplies the bold.
     return s.replace("**", "")
+
+def osc8(text, url):
+    # Wrap TEXT in an OSC 8 terminal hyperlink to URL: ESC ]8;;URL ST TEXT ESC ]8;; ST (ST = ESC \).
+    # Empty url → TEXT unchanged (fail-soft when the backend surfaced no URL). OSC 8 is orthogonal to
+    # the SGR color glow paints around the chip, so the themed chip styling is preserved; glow passes
+    # these raw escapes straight through, and a terminal without OSC 8 support ignores them. The url
+    # is already whitespace-flattened upstream, so it can carry no control char that would break out.
+    if not url:
+        return text
+    esc = "\x1b"; st = esc + "\\"
+    return esc + "]8;;" + url + st + text + esc + "]8;;" + st
 
 def balance_bold(s):
     # BODY text keeps its own inline **bold** (rendered as a plain paragraph, not template-bolded),
@@ -231,7 +267,8 @@ for ln in sys.stdin.read().splitlines():
     title    = p[3] if len(p) > 3 else ""
     desc     = p[4] if len(p) > 4 else ""
     assignee = p[5].strip() if len(p) > 5 else ""
-    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc, assignee))
+    url      = p[6].strip() if len(p) > 6 else ""
+    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc, assignee, url))
 
 out = []
 for g in ORDER:
@@ -239,7 +276,7 @@ for g in ORDER:
     if not items:
         continue
     out.append("## %s (%d)\n" % (g, len(items)))
-    for ident, stype, sname, title, desc, assignee in items:
+    for ident, stype, sname, title, desc, assignee, url in items:
         body = desc
         if title and body.startswith(title):
             body = body[len(title):].lstrip(" .·—-")
@@ -258,7 +295,7 @@ for g in ORDER:
             state = " _(%s · %s)_" % (sname, assignee) if assignee else " _(%s)_" % sname
         else:
             state = ""
-        prefix = "`%s`" % ident
+        prefix = "`%s`" % osc8(ident, url)
         if assignee and stype != "started":
             prefix += " @%s" % assignee
         out.append("- %s **%s**%s\n" % (prefix, head, state))
