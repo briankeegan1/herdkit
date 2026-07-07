@@ -120,6 +120,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DEP_POLL_MIN` → `dep-watcher.sh`
 - `DEP_STALE_TTL` → `dep-watcher.sh`
 - `DOCTOR_STARTUP_HINT` → `herd-preflight.sh`
+- `GRAPHIFY_BIN` → —
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
