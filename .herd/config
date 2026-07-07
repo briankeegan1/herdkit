@@ -130,7 +130,7 @@ REVIEW_CONCURRENCY="2"
 HEALTH_CONCURRENCY="1"
 REFIX_MAX_ROUNDS="3"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
-REVIEW_ESCALATE_GLOB=""
+REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"
 # only used once REVIEW_ESCALATE_GLOB is set
 REVIEW_MODEL_CHEAP="claude-sonnet-4-6"
 REVIEW_ESCALATE_MAXFILES="10"
