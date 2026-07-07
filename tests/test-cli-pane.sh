@@ -154,7 +154,12 @@ PY
     p="${4:-}"
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
     cmd=""
-    [ -f "$S/panes/$p/cmd" ] && [ ! -f "$S/panes/$p/noshow" ] && cmd="$(cat "$S/panes/$p/cmd")"
+    # junk marker: process-info reports this literal foreground cmdline regardless of `pane run`,
+    # simulating a dead viewer's typed-ahead concatenating onto our launch so the script never
+    # actually started (2026-07-06 incident). Used to prove the strict liveness gate rejects it.
+    if [ -f "$S/panes/$p/junk" ]; then
+      cmd="$(cat "$S/panes/$p/junk")"
+    elif [ -f "$S/panes/$p/cmd" ] && [ ! -f "$S/panes/$p/noshow" ]; then cmd="$(cat "$S/panes/$p/cmd")"; fi
     if [ -n "$cmd" ]; then
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
     else
@@ -347,6 +352,49 @@ out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog failed (recreate when
 grep -q "pane split pA --direction right" "$S/log" || fail "gone backlog pane not recreated by splitting the coordinator"
 grep -q "pane swap --source-pane" "$S/log" || fail "recreated backlog pane not swapped into the left slot"
 printf '%s' "$out" | grep -q "recreated ✓" || fail "recreated backlog pane not reported"
+ok
+
+# ── 5b. restart CLEARS pending input before injecting the command (2026-07-06 incident) ───────────
+# A dead viewer can leave buffered keystrokes on the shell prompt; the restart must flush them
+# (ctrl+c ctrl+u) BEFORE `pane run`, else the typed-ahead junk concatenates onto our command and the
+# shell rejects the malformed line — the viewer never starts. Assert the send-keys clear is issued
+# to the backlog pane and lands BEFORE the pane run.
+P="$T/p5b"; mkdir "$P"; _make_project "$P" "panetest"; R5B="$(cd "$P" && pwd -P)"
+S="$T/s5b"; _coord_state "$S" "$R5B"
+printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"
+out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog failed (input-clear path)"
+grep -q "pane send-keys pL ctrl+c ctrl+u" "$S/log" || fail "restart did not flush pending input (ctrl+c ctrl+u) on the backlog pane"
+# Ordering: the clear must precede the run in the invocation log.
+clear_ln="$(grep -n "pane send-keys pL ctrl+c ctrl+u" "$S/log" | head -1 | cut -d: -f1)"
+run_ln="$(grep -n "pane run pL" "$S/log" | head -1 | cut -d: -f1)"
+[ -n "$clear_ln" ] && [ -n "$run_ln" ] && [ "$clear_ln" -lt "$run_ln" ] \
+  || fail "input clear did not precede the pane run (clear=$clear_ln run=$run_ln)"
+printf '%s' "$out" | grep -q "visible ✓" || fail "backlog restart with input-clear did not report visible"
+ok
+
+# ── 5c. NO false ✓: a stale shell echoing the script token is NOT accepted as a live viewer ───────
+# The junk marker makes process-info report 'rrrr…bash …/backlog-view.sh' (typed-ahead glued onto
+# our launch) as the foreground cmdline no matter what `pane run` recorded — i.e. the viewer never
+# really started. The strict liveness gate must REJECT it and report LOUDLY, not paint a false ✓.
+P="$T/p5c"; mkdir "$P"; _make_project "$P" "panetest"; R5C="$(cd "$P" && pwd -P)"
+S="$T/s5c"; _coord_state "$S" "$R5C"
+printf 'rrrrbash /x/scripts/herd/backlog-view.sh' > "$S/panes/pL/junk"
+out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog exited non-zero on the junk-liveness path"
+printf '%s' "$out" | grep -q "NOT visible ✗" || fail "stale-shell junk earned a false ✓ instead of a loud failure"
+printf '%s' "$out" | grep -qi "backlog-view did not appear" || fail "loud warn missing for the never-started viewer"
+printf '%s' "$out" | grep -q "visible ✓" && fail "reported a viewer visible when only junk was present" || true
+ok
+
+# ── 5d. watch restart likewise flushes input AND strictly verifies the watcher process ────────────
+P="$T/p5d"; mkdir "$P"; _make_project "$P" "panetest"; R5D="$(cd "$P" && pwd -P)"
+S="$T/s5d"; _coord_state "$S" "$R5D"
+printf 'rrrrbash /x/scripts/herd/herd-watch.sh' > "$S/panes/pW/junk"   # never-started watcher
+set +e
+out="$(_pane_run "$P" "$S" watch)"
+set -e
+grep -q "pane send-keys pW ctrl+c ctrl+u" "$S/log" || fail "watch restart did not flush pending input on the watch pane"
+printf '%s' "$out" | grep -qE "NOT visible|DETACHED" || fail "junk watcher not surfaced loudly"
+printf '%s' "$out" | grep -q "visible ✓" && fail "watcher reported visible off a stale shell echo" || true
 ok
 
 # ═══ herd pane coordinator ═══════════════════════════════════════════════════════════════════════

@@ -2082,6 +2082,32 @@ print("BUSY" if fg else "BARE")
 ' 2>/dev/null || printf 'GONE\n'
 }
 
+# _reload_pane_alive <pane_id> <match> → prints "<pid>" and returns 0 iff a foreground process in
+# the pane is a GENUINE `bash …/<script>` invocation of the expected viewer; returns 1 otherwise.
+# This is the STRICT post-launch liveness gate (vs _reload_pane_state's loose readiness substring):
+# it demands the script name sit on a real argv-token boundary — `bash` led by start/space/slash,
+# whitespace, then a path ending in the script. A stale shell whose buffered/typed-ahead text merely
+# CONTAINS the token — e.g. 'rrrr…bash …/backlog-view.sh' glued onto junk, the real 2026-07-06
+# incident where a dead viewer's leftover keystrokes concatenated onto our run — is rejected, so a
+# false ✓ can't survive. <match> is a '|'-separated set of accepted script names.
+_reload_pane_alive() {
+  herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+import sys,json,os,re
+try: pi=json.load(sys.stdin)["result"]["process_info"]
+except Exception: sys.exit(1)
+sh=pi.get("shell_pid") or 0
+subs=[s for s in os.environ.get("M","").split("|") if s]
+if not subs: sys.exit(1)
+pats=[re.compile(r"(?:^|[\s/])bash\s+\S*"+re.escape(s)+r"(?:\s|$)") for s in subs]
+for p in (pi.get("foreground_processes") or []):
+    if p.get("pid")==sh: continue
+    cl=p.get("cmdline") or ""
+    if any(pat.search(cl) for pat in pats):
+        print(p.get("pid",0)); sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
 # _reload_pane_ready <pane_id> — bounded wait for the pane's shell to initialize.
 _reload_pane_ready() {
   local pane="$1" tries="${HERD_RELOAD_PANE_POLLS:-25}" i=0 st
@@ -2093,18 +2119,28 @@ _reload_pane_ready() {
   return 1
 }
 
-# _reload_pane_run_verified <pane_id> <command> <match> — readiness-gate, run, then verify
-# the pane's foreground shows <match>; retries the whole sequence once. Prints the visible
-# PID on success; callers must treat failure loudly (see invisible-watcher note above).
+# _reload_pane_run_verified <pane_id> <command> <match> — readiness-gate, clear stale input, run,
+# then STRICTLY verify the pane's foreground is a real invocation of <match>; retries the whole
+# sequence once. Prints the visible PID on success; callers must treat failure loudly (see
+# invisible-watcher note above). The pre-run ctrl+c/ctrl+u clears any typed-ahead junk a dead viewer
+# left on the prompt, so `herdr pane run` can't concatenate onto it (2026-07-06 incident); the
+# post-run gate is _reload_pane_alive (strict), not _reload_pane_state (loose), so a stale shell that
+# merely echoes the script token never earns a false ✓.
 _reload_pane_run_verified() {
-  local pane="$1" cmd="$2" match="$3" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i st
+  local pane="$1" cmd="$2" match="$3" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i pid
   for attempt in 1 2; do
     _reload_pane_ready "$pane" || true   # bounded wait; the verify below is the real gate
+    # Flush any pending/typed-ahead input BEFORE injecting the command: ctrl+c aborts a partial
+    # line, ctrl+u kills the line buffer back to a clean prompt. Otherwise a dead viewer's buffered
+    # keystrokes prepend onto our run and the shell rejects the malformed line — the viewer never
+    # starts, yet the old loose poll reported success off the stale shell.
+    herdr pane send-keys "$pane" ctrl+c ctrl+u >/dev/null 2>&1 || true
     herdr pane run "$pane" "$cmd" >/dev/null 2>&1 || true
     i=0
     while [ "$i" -lt "$vp" ]; do
-      st="$(_reload_pane_state "$pane" "$match")"
-      case "$st" in RUN\ *) printf '%s' "${st#RUN }"; return 0 ;; esac
+      if pid="$(_reload_pane_alive "$pane" "$match")" && [ -n "$pid" ]; then
+        printf '%s' "$pid"; return 0
+      fi
       sleep 0.2; i=$((i+1))
     done
   done
