@@ -147,6 +147,33 @@ grep -q '^HERD-88 done sweep 188$' "$STUB_UPDATES" || fail "retry did not heal t
 awk '$2=="HERD-88"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "successful retry should ledger the ref"
 pass
 
+# ── (5b) REAL gh-output parse path: a MULTI-LINE PR body with a mid-body 'Refs:' line ──
+# Regression guard for the live-repo defect the PRS_FILE seam masked: gh returns MULTI-LINE bodies, so
+# a line-oriented parse only ever saw each body's first line and dropped the deeper 'Refs:' line (a
+# repo of ref-carrying merges scanned 0). Feed the RAW `gh pr list --json` JSON through the real parse.
+: > "$HERD_TSWEEP_LEDGER"; : > "$STUB_UPDATES"; : > "$HERD_TSWEEP_NOTE_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-91 in-progress
+S
+# Realistic bodies: PR #211's 'Refs:' is buried under many lines (and a decoy in an HTML comment);
+# PR #212 carries no ref at all.
+python3 - "$T/prs.json" <<'PY'
+import sys, json
+prs = [
+  {"number": 211, "body": "## What\n\nHeal drift.\n\n<!-- Refs: HERD-DECOY (template example, must be ignored) -->\n\nMore prose here.\nAnd another line.\n\nRefs: HERD-91\n\n🤖 Generated with Claude Code\n"},
+  {"number": 212, "body": "## What\n\nUnrelated change with a multi-line body\nbut no Refs line at all.\n"},
+]
+open(sys.argv[1], "w").write(json.dumps(prs))
+PY
+out="$(HERD_TSWEEP_PRS_JSON_FILE="$T/prs.json" bash "$SCRIPT")" || fail "json-parse sweep exited non-zero: $out"
+printf '%s\n' "$out" | grep -q 'healed 1' || fail "json-parse run did not report the single heal ($out)"
+grep -q '^HERD-91 done sweep 211$' "$STUB_UPDATES" \
+  || fail "multi-line body: mid-body 'Refs: HERD-91' was not parsed/healed from real gh JSON ($(cat "$STUB_UPDATES"))"
+# The HTML-comment decoy ref must never be healed, and the ref-less PR must be skipped.
+grep -q 'HERD-DECOY' "$STUB_UPDATES" && fail "an HTML-comment decoy Refs was wrongly parsed"
+[ "$(grep -c . "$STUB_UPDATES")" -eq 1 ] || fail "expected exactly ONE heal from the JSON path, got $(grep -c . "$STUB_UPDATES")"
+pass
+
 # ── (6) the file backend (no update-state op) makes the sweep byte-inert ───────
 cat > "$REPO/.herd/config" <<EOF
 PROJECT_ROOT="$REPO"

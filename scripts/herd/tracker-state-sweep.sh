@@ -28,7 +28,9 @@
 #     --limit N   how many recent merged PRs to look back over (default 50).
 #
 # Hermetic seams (default to the real gh/backend; the tests override them):
-#   HERD_TSWEEP_PRS_FILE   file of "<pr#>\t<ref>" lines to use instead of `gh pr list` + body-parse.
+#   HERD_TSWEEP_PRS_FILE      file of "<pr#>\t<ref>" lines, bypassing gh AND the body-parse entirely.
+#   HERD_TSWEEP_PRS_JSON_FILE file of RAW `gh pr list --json number,body` output — exercises the real
+#                             multi-line-body parse path (the seam the line-oriented bug had escaped).
 #   SCRIBE_BACKEND[_DIR]   the active backend + its dir (same seam scribe-step.sh / _reconcile use).
 #   HERD_TSWEEP_LEDGER     confirmed-Done ledger path (default $WORKTREES_DIR/.agent-watch-tracker-swept).
 #   HERD_TSWEEP_NOTE_FILE  console-note surface the watcher renders (default …/.agent-watch-tracker-heals).
@@ -84,17 +86,33 @@ _tsweep_backend_supported() {
 # would otherwise poison the extractor), then the first line-anchored `Refs:` token is taken, and
 # template placeholders (<...>, none, n/a) are dropped. Best-effort + fail-soft: no gh / offline /
 # body-less all yield fewer (or zero) lines, never a hard error.
+#
+# CRITICAL: PR bodies are MULTI-LINE. We take the RAW JSON array (gh --json, NO -q) and parse it with
+# python's json.load — NOT a jq `\(.number)\t\(.body)` template piped line-by-line, which spills each
+# body across many stdout lines so only the body's first line carries the number+tab and the deeper
+# `Refs:` line arrives tab-less and is dropped (the live-repo defect the PRS_FILE seam masked: a repo
+# of ref-carrying merges scanned 0). json.load keeps each PR's body intact as one field.
 _merged_refs() {
   if [ -n "${HERD_TSWEEP_PRS_FILE:-}" ]; then cat "$HERD_TSWEEP_PRS_FILE"; return 0; fi
-  command -v gh >/dev/null 2>&1 || return 0
-  (cd "$REPO" && gh pr list --state merged --limit "$LIMIT" --json number,body \
-      -q '.[] | "\(.number)\t\(.body)"' 2>/dev/null) \
-    | python3 -c '
-import sys, re
-for raw in sys.stdin:
-    if "\t" not in raw:
+  local json
+  if [ -n "${HERD_TSWEEP_PRS_JSON_FILE:-}" ]; then          # test seam: raw `gh pr list --json` output
+    json="$(cat "$HERD_TSWEEP_PRS_JSON_FILE")"
+  else
+    command -v gh >/dev/null 2>&1 || return 0
+    json="$(cd "$REPO" && gh pr list --state merged --limit "$LIMIT" --json number,body 2>/dev/null)" || return 0
+  fi
+  [ -n "$json" ] || return 0
+  printf '%s' "$json" | python3 -c '
+import sys, re, json
+try:
+    prs = json.load(sys.stdin)
+except Exception:
+    prs = []
+for pr in prs if isinstance(prs, list) else []:
+    num  = pr.get("number")
+    body = pr.get("body") or ""
+    if num is None:
         continue
-    num, body = raw.rstrip("\n").split("\t", 1)
     body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)   # strip template comments first
     ref = ""
     for ln in body.splitlines():
@@ -103,7 +121,7 @@ for raw in sys.stdin:
             ref = m.group(1)
             break
     if ref and not (ref.startswith("<") or ref.lower() in ("none", "n/a", "na")):
-        print("%s\t%s" % (num.strip(), ref))
+        print("%s\t%s" % (num, ref))
 ' 2>/dev/null || true
 }
 
