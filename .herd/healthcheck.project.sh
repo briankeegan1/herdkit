@@ -15,6 +15,11 @@ DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--oneline]}"
 ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
+# Resolve python3 ONCE (mirrors scripts/herd/healthcheck.sh) instead of calling bare `python3` in the
+# leak-guard helpers below: on Git Bash python3 is a Windows AppData install that a bare name may not
+# resolve, so pin the absolute interpreter. The leak-guard only runs when herdr is present anyway.
+PY="$(command -v python3 || true)"
+
 errs=""
 
 # 1. bash -n over all shell scripts (engine + CLI + tests + templates).
@@ -74,7 +79,7 @@ _hk_workspace_id() {
   local _ws=""
   [ -f .herd/config ] && _ws="$(. .herd/config 2>/dev/null && printf '%s' "${WORKSPACE_NAME:-}")"
   [ -n "$_ws" ] || return 0
-  herdr workspace list 2>/dev/null | LABEL="$_ws" python3 -c '
+  herdr workspace list 2>/dev/null | LABEL="$_ws" "$PY" -c '
 import sys, json, os
 try:
     wss = (json.load(sys.stdin).get("result") or {}).get("workspaces") or []
@@ -93,7 +98,7 @@ _hk_orphans() {
   # present but our workspace unresolved — no worse than the pre-#78 behaviour). Read-only; never
   # mutates the workspace.
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr tab list 2>/dev/null | WSID="${1:-}" python3 -c '
+  herdr tab list 2>/dev/null | WSID="${1:-}" "$PY" -c '
 import sys, json, os
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
@@ -136,7 +141,7 @@ fi
 leak_note="tab-leak-guard: clean"
 if command -v herdr >/dev/null 2>&1; then
   _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
-  _hk_leak="$(BEF="$_hk_orphans_before" AFT="$_hk_orphans_after" python3 -c '
+  _hk_leak="$(BEF="$_hk_orphans_before" AFT="$_hk_orphans_after" "$PY" -c '
 import os
 def parse(s):
     tabs = panes = 0

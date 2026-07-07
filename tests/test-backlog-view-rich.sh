@@ -32,6 +32,17 @@ pass(){ PASS=$((PASS+1)); }
 BIN="$T/bin"; mkdir -p "$BIN"
 LOG="$T/herd.log"
 
+# ── Portability shims (HERD-53) ───────────────────────────────────────────────────────────────────
+# env -i below is deliberately hermetic, but on Git Bash that bites twice: python3 lives under AppData
+# (off the fixed PATH) so backlog-view.sh's bare `python3` (rich_to_md) can't resolve, and env -i
+# strips LANG/LC_* so the emoji grep assertions run byte-blind. Resolve the real python3 once (pre
+# env -i, like scripts/herd/healthcheck.sh) and shim it into $BIN, and pin a UTF-8 locale (fallback C)
+# in every env -i. Both are no-ops on Linux — python3 already sits on the fixed PATH and the shimmed
+# output is byte-identical.
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] && { printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$PY" > "$BIN/python3"; chmod +x "$BIN/python3"; }
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
 # FAKE `herd` — logs every call. `backlog --rich` prints $HERD_FAKE_RICH_OUT (exit 1 when
 # HERD_FAKE_RICH_REJECT=1, emulating an older CLI that doesn't know the flag); plain `backlog`
 # prints $HERD_FAKE_OUT.
@@ -70,7 +81,7 @@ EOF
 
 run_view() {
   local dir="$1"; shift
-  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+  env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
     HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null

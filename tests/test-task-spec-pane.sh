@@ -41,14 +41,33 @@ done
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 command -v git     >/dev/null 2>&1 || fail "git required"
 
+# Portability (HERD-53): env -i strips LANG/LC_*, so the emoji grep assertions on the viewer's output
+# (e.g. "📋 task spec") run byte-blind on Git Bash. Pin a UTF-8 locale (fallback C) in every env -i
+# below. Byte-identical on Linux. (The env -i'd viewer calls no python3, so no interpreter shim here.)
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
+# A curated bin dir with glow REMOVED — a hardcoded PATH="/usr/bin:/bin" only keeps glow off PATH on a
+# box that installs glow elsewhere; on a box with glow in /usr/bin (or Git Bash, where the standard
+# tools and any glow share a dir) the styled branch runs and the cat-fallback assertions below never
+# fire. Symlink every standard tool EXCEPT glow into NOGLOW (mirrors NOHERDR in test-cli-reload.sh) so
+# the deterministic cat branch is exercised regardless of where glow lives.
+NOGLOW="$T/noglow"; mkdir -p "$NOGLOW"
+for d in /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    b="$(basename "$f")"; [ "$b" = "glow" ] && continue
+    [ -e "$NOGLOW/$b" ] || ln -s "$f" "$NOGLOW/$b" 2>/dev/null || true
+  done
+done
+
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # 1. VIEWER SCRIPT — present render, missing-file soft note, tokyonight wiring
 # ════════════════════════════════════════════════════════════════════════════════════════════════
-# Run with glow OFF PATH so the deterministic cat branch is exercised (glow's TTY colors are stripped
-# when captured anyway). MAX_TICKS caps the loop; TICK_SECS=0 keeps it instant.
+# Run with glow OFF PATH (via $NOGLOW) so the deterministic cat branch is exercised (glow's TTY colors
+# are stripped when captured anyway). MAX_TICKS caps the loop; TICK_SECS=0 keeps it instant.
 run_viewer() {
   local spec="$1" out="$2"
-  env -i HOME="$HOME" PATH="/usr/bin:/bin" TERM=xterm \
+  env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$NOGLOW" TERM=xterm \
     TASK_PANE_VIEW_MAX_TICKS=1 TASK_PANE_VIEW_TICK_SECS=0 \
     bash "$VIEWER" "$spec" </dev/null >"$out" 2>/dev/null || true
 }

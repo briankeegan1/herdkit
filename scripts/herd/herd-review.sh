@@ -392,7 +392,7 @@ except Exception:
       --tab "$_builder_tab" \
       --split down \
       --no-focus \
-      2>/dev/null -- claude --model "$REVIEW_MODEL" $CLAUDE_FLAGS "$AGENT_TASK" 2>/dev/null || true)"
+      -- claude --model "$REVIEW_MODEL" $CLAUDE_FLAGS "$AGENT_TASK" 2>/dev/null || true)"
     ROOT="$(printf '%s' "${_agent_start_out:-}" | python3 -c '
 import sys, json
 try:
