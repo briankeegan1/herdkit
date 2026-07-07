@@ -103,6 +103,40 @@ ask()  { # ask "<prompt>" "<default>" → echoes the answer (default on empty / 
   printf '%s' "${ans:-$def}"
 }
 
+# _ground_interactive — true when the grounding interview should prompt: a real stdin TTY (or the
+# HERD_GROUND_ASSUME_TTY test seam, which lets a hermetic non-tty test drive scripted answers), and
+# NOT the HERD_NONINTERACTIVE scripted-init mode. A plain non-tty scripted `herd init` is false, so
+# the interview is skipped cleanly (zero prompts) — matching ask()'s own interactivity contract.
+_ground_interactive() {
+  { [ -t 0 ] || [ -n "${HERD_GROUND_ASSUME_TTY:-}" ]; } && [ -z "${HERD_NONINTERACTIVE:-}" ]
+}
+
+# _ground_ask <prompt> <default> — like ask(), but interactive under _ground_interactive (so the
+# grounding interview reads scripted answers from stdin under the HERD_GROUND_ASSUME_TTY test seam
+# even without a real TTY). Returns the default without reading when non-interactive.
+_ground_ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if _ground_interactive; then
+    printf '%s%s%s' "$c_bold" "$prompt" "$c_rst" >&2
+    [ -n "$def" ] && printf ' %s[%s]%s' "$c_dim" "$def" "$c_rst" >&2
+    printf ': ' >&2
+    read -r ans || true
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+# _ground_yes <answer> — success for an affirmative interview answer (y / yes, case-insensitive).
+_ground_yes() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; *) return 1 ;; esac; }
+
+# _ensure_gitignored <project_root> <pattern> — append <pattern> to the project's .gitignore unless
+# already present (idempotent). Used for per-machine / secret files that must never be committed.
+_ensure_gitignored() {
+  local gi="$1/.gitignore" pat="$2"
+  { [ -f "$gi" ] && grep -qxF "$pat" "$gi"; } && return 0
+  printf '%s\n' "$pat" >> "$gi"
+  ok "added $pat to .gitignore"
+}
+
 # render_skill <project_root> <config_file> — render templates/coordinator.md.tmpl into the
 # project's .claude/commands/<name>.md, substituting {{TOKENS}} from the config. Pure bash string
 # replacement (no sed) so values containing / & | are safe.
@@ -420,6 +454,76 @@ detect_github() {
   printf 'method=%s\n'        "$method"
 }
 
+# ── init grounding interview (HERD-80) ────────────────────────────────────────────────────────────
+# Nothing at `herd init` tells a new project that builder grounding (codemap / CONTEXT_PROVISION),
+# coordinator tooling (graphify / GRAPHIFY_BIN), builder MCP wiring (MCP_PROVISION), or the efficiency
+# levers even EXIST — the operator only finds them by reading capabilities.tsv. This closes that gap
+# with the SAME suggest-never-auto-write contract as `herd config sync`: every source is OFFERED, and
+# applied ONLY on an explicit yes, ONLY through the validated `herd config set` (manifest validation,
+# machine-scope routing, secret refusal). Nothing here is auto-written. Runs LAST in cmd_init, after
+# the config exists (config set requires it). A scripted / non-tty init skips the whole block cleanly
+# (_ground_interactive false) so `herd init` stays fully non-interactive for automation.
+_init_grounding_interview() {
+  local project_root="$1"
+  _ground_interactive || return 0   # scripted / non-tty init: skip cleanly, zero prompts, nothing written
+
+  say ""
+  say "${c_bold}Grounding & tooling${c_rst} ${c_dim}(all optional — nothing is written unless you say yes)${c_rst}"
+
+  # (a) Builder grounding: generate THIS project's code map now (consumer-project mode, HERD-79) and
+  #     point every spawned builder at it via CONTEXT_PROVISION=codemap, so builders load the committed
+  #     map instead of re-exploring the tree each session. The map is only pointed-to once it exists.
+  say ""
+  say "  ${c_dim}Builders re-explore the repo each session unless you ground them with a code map.${c_rst}"
+  if _ground_yes "$(_ground_ask "Generate docs/codemap.md now and set CONTEXT_PROVISION=codemap? (y/N)" "n")"; then
+    if ( cd "$project_root" && cmd_codemap </dev/null ) && [ -f "$project_root/docs/codemap.md" ]; then
+      ( cd "$project_root" && cmd_config_set CONTEXT_PROVISION codemap )
+    else
+      warn "codemap generation did not produce docs/codemap.md — leaving CONTEXT_PROVISION unset; run 'herd codemap' then 'herd config set CONTEXT_PROVISION codemap' later"
+    fi
+  else
+    say "  ${c_dim}skipped — later: herd codemap && herd config set CONTEXT_PROVISION codemap${c_rst}"
+  fi
+
+  # (b) Coordinator tooling: graphify powers the coordinator's pre-spawn cross-worktree overlap read.
+  #     If it is on PATH, offer to pin GRAPHIFY_BIN — a MACHINE-scoped key, so `herd config set` routes
+  #     it to the gitignored .herd/config.local (we also ensure that overlay is gitignored in the
+  #     consumer). If absent, print the PyPI install hint instead of writing anything.
+  say ""
+  local gpath; gpath="$(command -v graphify 2>/dev/null || true)"
+  if [ -n "$gpath" ]; then
+    if _ground_yes "$(_ground_ask "graphify found at $gpath — set GRAPHIFY_BIN (per-machine → .herd/config.local) for the coordinator's pre-spawn overlap read? (y/N)" "n")"; then
+      ( cd "$project_root" && cmd_config_set GRAPHIFY_BIN "$gpath" )
+      _ensure_gitignored "$project_root" '.herd/config.local'
+    else
+      say "  ${c_dim}skipped — later: herd config set GRAPHIFY_BIN $gpath${c_rst}"
+    fi
+  else
+    say "  ${c_dim}graphify not on PATH — the coordinator's pre-spawn overlap read stays off (optional accelerator).${c_rst}"
+    say "  ${c_dim}Install: pipx install graphifyy  (PyPI 'graphifyy'), then: herd config set GRAPHIFY_BIN ~/.local/bin/graphify${c_rst}"
+  fi
+
+  # (c) Builder MCP tools: wire an MCP server into every builder worktree (context7 = live library
+  #     docs, most valuable on real code CONSUMER projects). Blank keeps today's byte-identical
+  #     settings.json. Applied via the validated setter (MCP_PROVISION), committed baseline.
+  say ""
+  local mcp; mcp="$(_ground_ask "MCP_PROVISION — wire an MCP server into each builder worktree (e.g. 'context7' for live library docs; blank = none)" "")"
+  if [ -n "$mcp" ]; then
+    ( cd "$project_root" && cmd_config_set MCP_PROVISION "$mcp" )
+  else
+    say "  ${c_dim}skipped — later: herd config set MCP_PROVISION context7${c_rst}"
+  fi
+
+  # (d) Efficiency levers — SURFACE ONLY (one-line measured rationale each). Never auto-set: two are
+  #     watcher-affecting (a set would restart a not-yet-running control room mid-init), and the point
+  #     here is awareness. Each is applied later with the same validated `herd config set`.
+  say ""
+  say "  ${c_bold}Efficiency levers${c_rst} ${c_dim}(surface-only — set any later with 'herd config set <KEY> <VALUE>'):${c_rst}"
+  say "  ${c_dim}• REVIEW_ESCALATE_GLOB — reserve the expensive Opus review for engine-critical paths; docs/test-only diffs skip review. The single biggest recurring engine cost.${c_rst}"
+  say "  ${c_dim}• HEALTHCHECK_HEAVY_GLOB — blank runs the full suite on every diff; scope it to your source globs so trivial diffs take the light profile.${c_rst}"
+  say "  ${c_dim}• DOCTOR_STARTUP_HINT=on — reminds you at control-room startup which optional tools are missing and what each degrades.${c_rst}"
+}
+
 cmd_init() {
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
@@ -663,11 +767,7 @@ EOF
     } > "$secrets"
     chmod 600 "$secrets" 2>/dev/null || true
     ok "wrote $secrets (gitignored)"
-    local gi="$project_root/.gitignore"
-    if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
-      printf '.herd/secrets\n' >> "$gi"
-      ok "added .herd/secrets to .gitignore"
-    fi
+    _ensure_gitignored "$project_root" '.herd/secrets'
   fi
 
   # Seed a BACKLOG.md if we promised to create one.
@@ -705,6 +805,11 @@ EOF
   # 6. Render the coordinator skill.
   local skill; skill="$(render_skill "$project_root" "$cfg")"
   ok "rendered coordinator skill → $skill"
+
+  # 7. Grounding interview (HERD-80): OFFER codemap/CONTEXT_PROVISION, graphify/GRAPHIFY_BIN, MCP wiring
+  #    and surface the efficiency levers. Suggest-never-auto-write — applies only on an explicit yes via
+  #    the validated `herd config set`. Skipped cleanly on a scripted / non-tty init.
+  _init_grounding_interview "$project_root"
 
   say ""
   ok "herd init complete."
