@@ -323,6 +323,28 @@ fi
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
+: "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
+
+# ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
+# CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
+# herd-feature.sh) run BEFORE creating a worktree, via scripts/herd/herd-claim.sh. It exists to
+# stop two operators working the same repo from double-building one backlog item: today picking is
+# check-then-act (a coordinator reads `herd backlog`, spawns a builder, THEN enqueues an async
+# `mark in-progress` the scribe drains minutes later — a second coordinator can pick the same item
+# inside that window and the idempotent scribe never rejects the duplicate).
+#
+# OFF by default → today's behavior EXACTLY (no claim; the async scribe mark-in-progress path is the
+# only state write). When ON, and ONLY when a tracker id is present (HERD_CLAIM_ID, else the
+# HERD_ITEM_REF the coordinator already threads for tracked items), the lane reads the item's CURRENT
+# state+assignee synchronously through the active SCRIBE_BACKEND's _backend_claim_item op, sets it
+# In Progress + assigned to the operator identity (WATCHER_OWNER, else `gh api user`), and RE-READS to
+# verify the claim stuck. An item already claimed by ANOTHER identity aborts the spawn loudly (no
+# worktree, no agent). No-id / unclaimed spawns still pass through to the async scribe unchanged, and a
+# backend that is unreachable FAILS SOFT (warn + proceed) so a solo operator is never hard-blocked.
+# Linear/GitHub have no compare-and-swap, so claim-verify NARROWS the race from minutes to seconds
+# rather than eliminating it; the file backend's claim is a git-committed state flip made atomic by
+# push serialization (the loser's push is rejected, a re-pull shows the item claimed, and it aborts).
+: "${CLAIM_REQUIRED:="off"}"     # off (default) → no claim, today's async-scribe behavior; on → claim id-bearing spawns
 
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE _HERD_CONFIG_LOCAL_FILE
 
@@ -741,6 +763,154 @@ herd_context_provision_preamble() {
     esac
   done
   printf '%s' "$_out"
+}
+
+# ── Builder MCP tool provisioning (HERD-41) ──────────────────────────────────────────────────────
+# herd_write_mcp_servers <worktree> — wire the project-configured MCP servers into THIS worktree's
+# project-level Claude Code settings (<worktree>/.claude/settings.json → the `mcpServers` block), so a
+# spawned builder can reach them as needed without any per-session setup. The SIBLING of
+# herd_context_provision_preamble (HERD-40): that surface grounds a builder with repo CONTEXT; this
+# one provisions its TOOLS. Driven by the MCP_PROVISION config key: a SPACE-SEPARATED list of MCP
+# server names to wire. Empty/unset (the DEFAULT) → this touches NOTHING and settings.json stays
+# byte-identical to today (zero behavior change). Disable regardless of config with HERD_MCP_PROVISION=off.
+#
+# The write reuses the EXACT discipline of herd_write_ratelimit_hook — ADDITIVE + SAFE:
+#   • Merges into an existing .claude/settings.json (never clobbers the rate-limit hook, unrelated
+#     keys, or any OTHER mcpServers entry). NON-CLOBBER is per-ENTRY: a server already present in the
+#     file (a user/hand-authored one, same name) is LEFT UNTOUCHED — we only ADD servers not there yet.
+#   • Idempotent: re-running once a server is wired changes nothing (byte-identical, no rewrite).
+#   • Atomic: round-trips through a temp file + os.replace; tolerates a missing/corrupt settings file.
+#   • Best-effort: any failure warns but returns 0, so it never aborts worktree creation.
+#
+# EACH server name resolves to a {command, args, env} entry from a BUILT-IN default (below) that a
+# per-server config override can replace: MCP_<NAME>_COMMAND / MCP_<NAME>_ARGS / MCP_<NAME>_ENV, where
+# <NAME> is the server name upper-cased with '-'/'.' → '_' (context7 → MCP_CONTEXT7_*, graphify-mcp →
+# MCP_GRAPHIFY_MCP_*). A name with NO built-in AND no _COMMAND override is IGNORED (forward-compatible:
+# an operator naming a server this engine predates gets no wiring for it, never an error).
+#
+# PRIVACY — credentials are NEVER written into the generated settings.json. MCP_<NAME>_ENV (and the
+# built-in env list) is a SPACE-SEPARATED list of env-var NAMES to pass through; we write only the
+# reference string "${VAR}" into the server's env block, which Claude Code expands from the runtime
+# environment at launch (populated from .herd/secrets via passthrough). No secret value ever lands in
+# a committed or generated file, and DENY_PATHS stays honored (we only ever write under .claude/).
+#
+# BUILT-IN examples:
+#   • context7 — up-to-date library docs (npx -y @upstash/context7-mcp; passes CONTEXT7_API_KEY through
+#     from the environment). VALUABLE for CONSUMER projects herdkit runs on (a real code app querying
+#     live library docs); herdkit itself is bash, so it is LOW-VALUE here — the MECHANISM is the point.
+#   • graphify-mcp — a LOCAL example server (the `graphify` codemap tool's MCP surface, if installed).
+herd_write_mcp_servers() {
+  local _mp_dir="${1:-}"
+  [ -n "$_mp_dir" ] || return 0
+  [ "${HERD_MCP_PROVISION:-on}" != "off" ] || return 0
+  local _mp_list="${MCP_PROVISION:-}"
+  [ -n "$_mp_list" ] || return 0     # off (default) → touch nothing; settings.json byte-identical to today
+  if ! command -v python3 >/dev/null 2>&1; then return 0; fi
+  local _mp_abs
+  _mp_abs="$(cd "$_mp_dir" 2>/dev/null && pwd -P)" || _mp_abs="$_mp_dir"
+  local _mp_settings="$_mp_abs/.claude/settings.json"
+  mkdir -p "$_mp_abs/.claude" 2>/dev/null || return 0
+
+  # Resolve each name → a TAB-separated  name<TAB>command<TAB>args<TAB>env  row (built-in default,
+  # then per-server config override). Python parses this spec and builds the JSON safely. Args/env are
+  # space-separated; the `-__UNSET__` default distinguishes an explicit empty override ("") from unset.
+  local _mp_spec="" _mp_name _mp_up _mp_cmd _mp_args _mp_env _mp_ov
+  for _mp_name in $_mp_list; do
+    _mp_up="$(printf '%s' "$_mp_name" | tr '[:lower:].-' '[:upper:]__')"
+    _mp_cmd=""; _mp_args=""; _mp_env=""
+    case "$_mp_name" in
+      context7)     _mp_cmd="npx"; _mp_args="-y @upstash/context7-mcp"; _mp_env="CONTEXT7_API_KEY" ;;
+      graphify-mcp) _mp_cmd="graphify-mcp"; _mp_args="";                _mp_env="" ;;
+      *) : ;;   # no built-in — only a _COMMAND override can wire it (else ignored below)
+    esac
+    eval "_mp_ov=\"\${MCP_${_mp_up}_COMMAND:-}\"";        [ -n "$_mp_ov" ]            && _mp_cmd="$_mp_ov"
+    eval "_mp_ov=\"\${MCP_${_mp_up}_ARGS-__UNSET__}\"";   [ "$_mp_ov" != "__UNSET__" ] && _mp_args="$_mp_ov"
+    eval "_mp_ov=\"\${MCP_${_mp_up}_ENV-__UNSET__}\"";    [ "$_mp_ov" != "__UNSET__" ] && _mp_env="$_mp_ov"
+    [ -n "$_mp_cmd" ] || continue   # unknown server, no override → skip (forward-compatible)
+    _mp_spec="${_mp_spec}${_mp_name}	${_mp_cmd}	${_mp_args}	${_mp_env}
+"
+  done
+  [ -n "$_mp_spec" ] || return 0    # nothing resolvable → no write (settings.json stays byte-identical)
+
+  if ! HERD_MCP_SETTINGS="$_mp_settings" HERD_MCP_SPEC="$_mp_spec" python3 - <<'PY'
+import json, os, shlex, sys, tempfile
+
+path = os.environ["HERD_MCP_SETTINGS"]
+spec = os.environ.get("HERD_MCP_SPEC", "")
+
+# Parse the bash-built spec: one  name<TAB>command<TAB>args<TAB>env  row per line.
+want = {}
+for line in spec.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    while len(parts) < 4:
+        parts.append("")
+    name, cmd, args, env = parts[0], parts[1], parts[2], parts[3]
+    if not name or not cmd:
+        continue
+    entry = {"command": cmd}
+    arglist = shlex.split(args) if args.strip() else []
+    if arglist:
+        entry["args"] = arglist
+    envnames = env.split()
+    if envnames:
+        # PRIVACY: never embed a secret VALUE. Write only "${VAR}" reference strings; Claude Code
+        # expands them from the runtime env (populated from .herd/secrets via passthrough) at launch.
+        entry["env"] = {v: "${%s}" % v for v in envnames}
+    want[name] = entry
+
+if not want:
+    sys.exit(0)
+
+data = {}
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except (ValueError, OSError):
+    data = {}
+
+block = data.get("mcpServers")
+if not isinstance(block, dict):
+    block = {}
+
+# NON-CLOBBER, per entry: a server already present (a user/hand-authored one, same name) is LEFT
+# UNTOUCHED — we only ADD servers not already there. Idempotent: nothing new → no rewrite.
+changed = False
+for name, entry in want.items():
+    if name in block:
+        continue
+    block[name] = entry
+    changed = True
+
+if not changed:
+    sys.exit(0)
+
+data["mcpServers"] = block
+
+d = os.path.dirname(path) or "."
+os.makedirs(d, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.json.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    printf '⚠️  herdkit: could not write MCP server wiring for %s (builder proceeds without it)\n' "$_mp_abs" >&2
+  fi
+  return 0
 }
 
 # herd_write_task_spec <spec_file> <spec_content> — externalize a builder's full task spec.

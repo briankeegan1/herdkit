@@ -53,20 +53,25 @@ BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 # onto the rendered view, corrupting it. Disabling stdin reads is NOT enough — echo happens in the
 # kernel regardless — so we mute the tty itself with stty, then restore it (and the cursor) on any
 # exit so the terminal is never left in a broken state.
+# The pane tty. Overridable via BACKLOG_VIEW_TTY (default /dev/tty) so tests never touch the real
+# controlling terminal: the suite runs INSIDE a live pane, where reading its /dev/tty wedges. Tests set
+# this to /dev/null (which is not a tty → saved_tty stays empty → the no-tty path) and inject keypresses
+# through the BACKLOG_VIEW_KEY_CMD hook below. In real use it is unset → /dev/tty, byte-identical.
+HERD_VIEW_TTY="${BACKLOG_VIEW_TTY:-/dev/tty}"
 if [ "$EMIT_MD" = 0 ]; then
   saved_tty=""
-  if [ -r /dev/tty ]; then
-    saved_tty=$(stty -g </dev/tty 2>/dev/null) || saved_tty=""
+  if [ -r "$HERD_VIEW_TTY" ]; then
+    saved_tty=$(stty -g <"$HERD_VIEW_TTY" 2>/dev/null) || saved_tty=""
   fi
   restore_tty() {
-    [ -n "$saved_tty" ] && stty "$saved_tty" </dev/tty 2>/dev/null
+    [ -n "$saved_tty" ] && stty "$saved_tty" <"$HERD_VIEW_TTY" 2>/dev/null
     printf '\033[?25h'  # show cursor
     [ -n "$BACKLOG_VIEW_TMP" ] && rm -f "$BACKLOG_VIEW_TMP" 2>/dev/null
   }
   trap 'restore_tty; exit 0' INT TERM
   trap restore_tty EXIT
   if [ -n "$saved_tty" ]; then
-    stty -echo -icanon </dev/tty 2>/dev/null
+    stty -echo -icanon <"$HERD_VIEW_TTY" 2>/dev/null
     printf '\033[?25l'  # hide cursor
   fi
 fi
@@ -81,6 +86,57 @@ else
   epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || echo '--:--'; }
 fi
 now_hhmm() { date +%H:%M 2>/dev/null || echo '--:--'; }
+
+# _poll_read_key <secs> — wait up to <secs> for ONE keypress from the pane tty; sets $_poll_key to the
+# key (empty when none) and returns 0 when a key was read, >128 on timeout, other non-zero on EOF/error
+# (mirroring `read -t`). This is the ONLY place the tty is read, so tests override it via the
+# BACKLOG_VIEW_KEY_CMD hook (invoked as `<cmd> <secs>`, same contract) to drive the refresh logic
+# WITHOUT ever touching a real /dev/tty. Unset in real use → the plain single-char tty read.
+_poll_key=""
+_poll_read_key() {
+  _poll_key=""
+  if [ -n "${BACKLOG_VIEW_KEY_CMD:-}" ]; then
+    _poll_key="$($BACKLOG_VIEW_KEY_CMD "$1")"; return $?
+  fi
+  IFS= read -r -t "$1" -n 1 _poll_key <"$HERD_VIEW_TTY"
+}
+
+# poll_wait <secs> — the poll interval's wait, made interruptible for the manual-refresh key
+# (HERD-48). Normally waits <secs> and returns 0; if the pane is interactive and the user presses
+# 'r'/'R' during the wait, it returns 10 at once so the caller can force an immediate refetch+repaint.
+# Every OTHER key is ignored — we keep waiting out the REMAINING interval, so a stray keystroke never
+# shortens the poll cadence nor hammers the backend. The read IS the sleep: its timeout equals the
+# poll interval, so with no key pressed the cadence is byte-identical to the old plain `sleep`.
+#
+# FAIL-SOFT per the no-false-red rule: with no usable pane tty (headless driver, CI, tests — saved_tty
+# empty or the tty unreadable, and no key hook) it degrades to a plain `sleep` and never touches the
+# tty at all. The read never crashes and never busy-loops: rc >128 = timeout (interval elapsed), rc
+# 1..128 = EOF/error; only rc 0 carries a key. On a wedged tty (EOF/error) we sleep the remainder.
+poll_wait() {
+  local secs="$1" rc deadline now rem
+  case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  if [ -z "${BACKLOG_VIEW_KEY_CMD:-}" ] && { [ -z "$saved_tty" ] || [ ! -r "$HERD_VIEW_TTY" ]; }; then
+    [ "$secs" -gt 0 ] && sleep "$secs"
+    return 0
+  fi
+  now=$(date +%s); deadline=$(( now + secs )); rem="$secs"
+  while [ "$rem" -gt 0 ]; do
+    _poll_read_key "$rem"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      case "$_poll_key" in r|R) return 10 ;; esac
+      # any other key → keep waiting out the remaining interval
+    elif [ "$rc" -gt 128 ]; then
+      return 0            # timed out — full interval elapsed
+    else
+      # EOF/error on the source: don't spin — sleep any time left in the interval, then return.
+      now=$(date +%s); rem=$(( deadline - now ))
+      [ "$rem" -gt 0 ] && sleep "$rem"
+      return 0
+    fi
+    now=$(date +%s); rem=$(( deadline - now ))
+  done
+  return 0
+}
 
 # ── incoming (github issues) — optional additive section (BACKLOG_VIEW_EXTRAS) ─
 # When BACKLOG_VIEW_EXTRAS=github-issues this prints a SECOND, clearly-labeled section listing THIS
@@ -169,12 +225,13 @@ for ln in sys.stdin.read().splitlines():
     if not ln.strip():
         continue
     p = ln.split("\t")
-    ident = p[0]
-    stype = p[1] if len(p) > 1 else ""
-    sname = p[2] if len(p) > 2 else ""
-    title = p[3] if len(p) > 3 else ""
-    desc  = p[4] if len(p) > 4 else ""
-    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc))
+    ident    = p[0]
+    stype    = p[1] if len(p) > 1 else ""
+    sname    = p[2] if len(p) > 2 else ""
+    title    = p[3] if len(p) > 3 else ""
+    desc     = p[4] if len(p) > 4 else ""
+    assignee = p[5].strip() if len(p) > 5 else ""
+    groups.setdefault(GROUP.get(stype, "🔜 queued"), []).append((ident, stype, sname, title, desc, assignee))
 
 out = []
 for g in ORDER:
@@ -182,7 +239,7 @@ for g in ORDER:
     if not items:
         continue
     out.append("## %s (%d)\n" % (g, len(items)))
-    for ident, stype, sname, title, desc in items:
+    for ident, stype, sname, title, desc, assignee in items:
         body = desc
         if title and body.startswith(title):
             body = body[len(title):].lstrip(" .·—-")
@@ -197,8 +254,14 @@ for g in ORDER:
             body = body[:BODY_MAX - 1].rstrip() + "…"
         head = strip_bold(head)          # head is bolded by the template — no internal ** allowed
         body = balance_bold(body)        # keep balanced bold, drop any wrap/cut-orphaned marker
-        state = " _(%s)_" % sname if (stype == "started" and sname) else ""
-        out.append("- `%s` **%s**%s\n" % (ident, head, state))
+        if stype == "started" and sname:
+            state = " _(%s · %s)_" % (sname, assignee) if assignee else " _(%s)_" % sname
+        else:
+            state = ""
+        prefix = "`%s`" % ident
+        if assignee and stype != "started":
+            prefix += " @%s" % assignee
+        out.append("- %s **%s**%s\n" % (prefix, head, state))
         if body:
             out.append("%s\n" % body)
 out.append("")
@@ -291,6 +354,9 @@ render_backend_frame() {
   fi
   # Strictly-additive incoming section (empty unless BACKLOG_VIEW_EXTRAS=github-issues).
   [ -n "$incoming" ] && printf '%s\n' "$incoming"
+  # HERD-48 hint — only when the pane tty is interactive (a key can actually be pressed); omitted on
+  # the headless/CI/test fallback so that path stays byte-identical. Does not affect the frame key.
+  [ -n "$saved_tty" ] && printf '\033[2mr = refresh\033[0m\n'
   return "$rc"
 }
 
@@ -367,7 +433,12 @@ run_backend_mode() {
     if [ -n "${BACKLOG_VIEW_MAX_POLLS:-}" ] && [ "$polls" -ge "$BACKLOG_VIEW_MAX_POLLS" ]; then
       break
     fi
-    sleep "$poll"
+    # Wait out the poll interval — but let the user force an instant refresh with r/R (HERD-48). On
+    # refresh clear last_hash (so the NEXT poll treats the re-fetch as new → refreshes last_good and the
+    # HH:MM stamp) AND bust last_frame (so the repaint actually happens): the frame key is content-hash
+    # + HH:MM + incoming, so unchanged content polled twice inside the same minute is otherwise latched
+    # as an identical frame and would NOT repaint. Busting last_frame guarantees the requested repaint.
+    poll_wait "$poll" || { last_hash=""; last_frame=""; }
   done
 }
 
@@ -425,10 +496,15 @@ while true; do
     render_rc=$?
     # Strictly-additive incoming section, beneath the primary queue (empty when the key is off).
     [ -n "$incoming" ] && printf '%s\n' "$incoming"
+    # HERD-48 hint — only when the pane tty is interactive; omitted headless so that path is unchanged.
+    [ -n "$saved_tty" ] && printf '\033[2mr = refresh\033[0m\n'
     # Only latch this frame once the render actually succeeded. If glow (or cat) fails / paints
     # nothing, leave last_frame unchanged so the next 2s tick retries instead of sticking on
     # stale/blank content until mtime or banner changes again.
     if [ "$render_rc" -eq 0 ]; then last_frame="$frame"; fi
   fi
-  sleep 2
+  # Wait out the 2s tick — interruptible by the manual-refresh key (HERD-48). On r/R, bust the frame
+  # latch so the next iteration force-repaints with a fresh git-log freshness read even when the file
+  # (and banner) are unchanged.
+  poll_wait 2 || last_frame=""
 done
