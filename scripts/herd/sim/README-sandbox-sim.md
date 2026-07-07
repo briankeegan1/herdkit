@@ -163,6 +163,77 @@ cap=3 parameterized run).
 > concurrency-invariant assertions, and visual/pane confirmation. A hosted repo + a real herdr
 > control room with live panes remain P1+ proper.
 
+## P2a — end-to-end LIMIT-PARK / AUTO-RESUME scenario — `sandbox-limit-resume-scenario.sh`
+
+The **auto-resume moat**, proven end-to-end and hermetically. Where the P1 concurrency scenario
+drives the real watcher **gate** loop, this P2a scenario drives the real watcher **limit** path
+(`agent-watch.sh`, sourced in lib mode): a stub builder hits the account usage limit, the watcher
+**detects** the park via the hook sentinel, **schedules** an in-place resume honoring
+`HERD_LIMIT_RESUME_BUFFER`, and at the reset **relaunches** the builder via `claude --continue`.
+Every step is the shipped code — `_detect_limit_hit`, `_handle_limit_blocked`, `_resume_builder`,
+`record_limit`/`clear_limit`, `limit_state`/`limit_target_epoch` — called in the exact order and
+under the exact guard the watcher's action pass uses (`agent-watch.sh:2910`–2913). This is the e2e
+proof of the auto-resume moat that HERD-42's A/B run invokes.
+
+Only the two things that would be a live account + a live Claude session are stubbed, both through
+documented seams: the rate-limit **sentinel is written by the ACTUAL `StopFailure`/`rate_limit` hook
+command** (`herd_write_ratelimit_hook` installs it; a near-future reset epoch is fed on stdin exactly
+as the harness would — so the injected sentinel matches the hook's format byte for byte), and
+**`claude` is a stub shim on `PATH`** that records its invocation (argv + cwd), completes the parked
+task deterministically (implements + commits the pending feature, no model call), and flips the agent
+to `working` so the watcher's wake-verify observes the resume. The `herdr` agent surface is a
+file-driven stub (the same seam the unit tests stub).
+
+It asserts, as scorecard checkpoints:
+
+- **`detect`** — `_detect_limit_hit` returns the reset epoch parsed from the injected hook sentinel.
+- **`park`** — the first sighting records a `scheduled` hold + a **distinct NON-RED** console row (a
+  usage limit is an expected account event, never a red alarm) + journals `limit_detected`.
+- **`scheduled`** — the resume target honors `HERD_LIMIT_RESUME_BUFFER`: `target == reset + buffer`,
+  asserted at a **non-default** buffer so the knob is proven, not the fallback.
+- **`resume`** — at `reset + buffer` the backstop relaunches via `claude --continue` **in the
+  worktree**; the shim's invocation is recorded, the journal logs `limit_resume_result` `woke:1`.
+- **`complete`** — the resumed builder's deterministic task landed (feature committed on its branch)
+  and the limit ledger + sentinel were cleared.
+- **`negative_no_park`** — with `HERD_LIMIT_DETECT=off` the **same** injected sentinel yields no
+  detection, no ledger record, and no `claude` relaunch (the feature kill-switch holds).
+
+Verification artifacts mirror the concurrency scenario: `pane-<checkpoint>.txt` (the watcher's real
+limit rows, captured back through `herd_driver_read_pane`) and `screenshots/watcher-<checkpoint>.png`
+(macOS `screencapture`, **degrades gracefully** — skips, never fails).
+
+```sh
+# Drive the full limit-park → auto-resume path; inspect the scorecard:
+bash scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr-run
+cat /tmp/lr-run/scorecard.json
+
+# Headless / CI: skip screenshots (they'd skip themselves, but this is explicit):
+SANDBOX_NO_SCREENSHOT=1 bash scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr-ci
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds** the limit fields: `reset_epoch`,
+`resume_buffer`, `resume_target` (**must equal** `reset_epoch + resume_buffer`), `claude_relaunches`
+(**must be 1**), `task_completed` (**must be true**), `pane_captures`, `screenshots`.
+
+Flags: `--artifacts DIR` (repo + scorecard + artifacts; `--keep` implied), `--keep`. Env:
+`HERD_LIMIT_RESUME_BUFFER` (default 120 here — asserted), `SANDBOX_NO_SCREENSHOT`. Hermetic proof:
+`../../../tests/test-sandbox-limit-resume.sh` (the five moat checkpoints, the buffer assertion, the
+negative kill-switch path, artifact capture + graceful screenshot skip, hermeticity, and determinism
+across two runs). Unit-level coverage of the same pieces lives in `../../../tests/test-limit-resume.sh`.
+
+## Simulation tiers at a glance
+
+| Tier | Scenario | Drives | Proves |
+| --- | --- | --- | --- |
+| **P0** | `sandbox-scenario.sh` | a re-implemented one-PR gate | happy path + gate-fault isolation |
+| **P0** | `benchmark-drain.sh` | the full herdkit flow per item (stub) | unattended N-item drain **survives a hard kill** (0 duplicates) |
+| **P1** | `sandbox-concurrency-scenario.sh` | the **real** watcher gate loop, N≥3 PRs | `REVIEW_CONCURRENCY` / `HEALTH_CONCURRENCY=1` / no double-merge / drain |
+| **P2a** | `sandbox-limit-resume-scenario.sh` | the **real** watcher limit path | limit-park **detect → park → scheduled → resume → complete** + kill-switch |
+
+> Every tier is stub-mode and hermetic (local git only, no hosted repo, no herdr panes, no model). A
+> hosted sandbox repo (P2b) and a real herdr control room with live panes (P2c) remain the follow-ups
+> below.
+
 ## Explicitly DEFERRED to P1+ (backlog follow-up note)
 
 > The coordinator owns `BACKLOG.md`; this P0 does not edit it. Fold the follow-ups below into the
