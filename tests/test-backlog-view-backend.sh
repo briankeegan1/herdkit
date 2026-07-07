@@ -27,6 +27,17 @@ pass(){ PASS=$((PASS+1)); }
 BIN="$T/bin"; mkdir -p "$BIN"
 LOG="$T/herd.log"
 
+# ── Portability shims (HERD-53) ───────────────────────────────────────────────────────────────────
+# env -i below is deliberately hermetic, but on Git Bash that bites twice: python3 lives under AppData
+# (off the fixed PATH) so backlog-view.sh's bare `python3` (rich_to_md) can't resolve, and env -i
+# strips LANG/LC_* so the emoji grep assertions run byte-blind. Resolve the real python3 once (pre
+# env -i, like scripts/herd/healthcheck.sh) and shim it into $BIN, and pin a UTF-8 locale (fallback C)
+# in every env -i. Both are no-ops on Linux — python3 already sits on the fixed PATH and the shimmed
+# output is byte-identical.
+PY="$(command -v python3 || true)"
+[ -n "$PY" ] && { printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$PY" > "$BIN/python3"; chmod +x "$BIN/python3"; }
+UTF8_LOCALE=C; [ "$(LC_ALL=C.UTF-8 locale charmap 2>/dev/null)" = "UTF-8" ] && UTF8_LOCALE=C.UTF-8
+
 # FAKE `herd` — logs every call; for `backlog` emits scripted output. Two modes:
 #   • HERD_FAKE_OUT (static)  — print it and exit 0.
 #   • HERD_FAKE_SEQDIR (seq)  — a per-call counter picks $SEQDIR/<n>; its content is printed, unless
@@ -68,7 +79,7 @@ EOF
 # Prints the captured STDOUT (stderr is discarded — the pane's stderr is never asserted on).
 run_view() {
   local dir="$1"; shift
-  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+  env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
     HERD_FAKE_LOG="$LOG" BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" 2>/dev/null </dev/null
@@ -87,7 +98,7 @@ git -C "$P1" add -A; git -C "$P1" commit -q -m init
 # The file loop has no MAX_POLLS hook — run it briefly, then stop. BACKLOG_VIEW_TTY=/dev/null keeps it
 # hermetic: the backgrounded viewer must NEVER read the pane's real /dev/tty (the suite runs inside a
 # live pane, where a backgrounded read wedges the gate) — it falls back to the plain sleep instead.
-env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
+env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
   HERD_CONFIG_FILE="$P1/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 HERD_FAKE_LOG="$LOG" \
   BACKLOG_VIEW_TTY=/dev/null bash "$SCRIPT" </dev/null >"$T/out1" 2>/dev/null & vpid=$!
 sleep 1; kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
