@@ -272,6 +272,59 @@ full flow + teardown accounting — plus the scorecard shape and hermeticity che
 > This lands the P1 follow-ups *"real herdr control room"* and *"visual confirmation"* below, in
 > stub-builder mode. A hosted sandbox GitHub repo (the other P1/P2 follow-up) remains open.
 
+## P2c — opt-in EPHEMERAL REAL-REMOTE (GitHub) tier — `sandbox-real-remote-scenario.sh`
+
+The **hosted-repo tier** that P0/P1/P2a/P2b explicitly skip (all of them PATH-stub `gh` and never
+touch a hosted repo). This P2c scenario adds the one tier that runs `gh` for **REAL** against a live
+remote — behind an **env opt-in** so it stays off by default and off in CI:
+
+- with `SANDBOX_REAL_REMOTE=1` **and** a real, **authenticated** `gh`, it provisions a **DISPOSABLE
+  private** repo under the authenticated account (a clearly-sandboxed name `herd-sim-<ts>-<pid>`),
+  pushes the local fixture to it, and drives the herd PR flow — `gh pr create`, the watcher's PR
+  polling (`gh pr view --json mergeable,mergeStateStatus`), and `gh pr merge` — against that live
+  remote;
+- **DEFAULT (env unset) is byte-identical hermetic STUB** behavior: a self-contained `gh` PATH stub
+  records create/merge and answers view/list, and **no network/repo is ever touched**;
+- the real tier fires **only** when opted-in AND gh is authenticated — otherwise it degrades to a
+  clean **SKIP** (`result "skip"`, exit 0). This **dual guard** is what keeps the hermetic CI suite
+  off the real tier: even `SANDBOX_REAL_REMOTE=1` with an unauthenticated gh **skips** rather than
+  reaching out (proven by the test's guard case, which asserts **zero** `gh repo create` attempts).
+
+**GUARANTEED cleanup, including failure paths.** A disposable repo on a live account is never
+stranded: an **EXIT/INT/TERM trap** runs `gh repo delete` on the provisioned repo no matter how the
+run exits; if deletion fails it emits a **LOUD warning naming the repo** and appends it to a stable
+leftover log (`$TMPDIR/herd-sim-leftover-repos.log`); and a **`--sweep`** helper lists (with `--yes`,
+deletes) any lingering `herd-sim-*` repos on the account to mop up after a crash.
+
+```sh
+# DEFAULT — hermetic stub tier (no network, no repo); inspect the scorecard:
+bash scripts/herd/sim/sandbox-real-remote-scenario.sh --artifacts /tmp/rr-stub
+cat /tmp/rr-stub/scorecard.json
+
+# OPT-IN — real disposable GitHub repo (requires `gh auth login`); repo is deleted on teardown:
+SANDBOX_REAL_REMOTE=1 bash scripts/herd/sim/sandbox-real-remote-scenario.sh --artifacts /tmp/rr-real
+
+# Mop up any stray sandbox repos a crashed run could not delete:
+bash scripts/herd/sim/sandbox-real-remote-scenario.sh --sweep          # dry-run list
+bash scripts/herd/sim/sandbox-real-remote-scenario.sh --sweep --yes    # actually delete
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds** the real-remote fields: `remote`
+(**`real`|`stub`**), `real_remote_ran` (bool), `repo_slug`, `repo_created`, `repo_deleted`,
+`pr_number`, `pr_merged`.
+
+Flags: `--artifacts DIR` (repo + scorecard + artifacts; `--keep` implied), `--keep`, `--sweep`
+(+ `--yes`). Env: `SANDBOX_REAL_REMOTE=1` (opt in to the real tier), `SANDBOX_REPO_PREFIX` (disposable
+repo-name prefix, default `herd-sim`). Hermetic proof: `../../../tests/test-sandbox-real-remote.sh`
+drives the DEFAULT stub path (full flow, no repo create) and the **real-requested-but-unauthenticated
+GUARD** path (clean skip, zero `gh repo create` attempts — CI can never reach GitHub), plus the
+scorecard shape, the `--sweep` no-op, and hermeticity. The suite **never** sets
+`SANDBOX_REAL_REMOTE=1` against a real gh — the live-remote run is a **HUMAN-VERIFY** step.
+
+> This lands the last open P1 follow-up — a **hosted sandbox repo** — as an opt-in ephemeral tier
+> (disposable, auto-deleted), completing the fidelity ladder from stub → real-watcher → real-panes →
+> real-remote.
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -281,21 +334,27 @@ full flow + teardown accounting — plus the scorecard shape and hermeticity che
 | **P1** | `sandbox-concurrency-scenario.sh` | the **real** watcher gate loop, N≥3 PRs | `REVIEW_CONCURRENCY` / `HEALTH_CONCURRENCY=1` / no double-merge / drain |
 | **P2a** | `sandbox-limit-resume-scenario.sh` | the **real** watcher limit path | limit-park **detect → park → scheduled → resume → complete** + kill-switch |
 | **P2b** | `sandbox-real-panes-scenario.sh` | a **real** disposable herdr control room | pane/tab existence + labels, agent `idle→working→done`, **clean teardown (0 leaks)** |
+| **P2c** | `sandbox-real-remote-scenario.sh` | a **real** disposable GitHub repo (opt-in) | real `gh pr create` / watcher poll / `gh pr merge`, **guaranteed repo cleanup** |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique
-> workspace, closed on teardown) and **degrades to a clean skip** when herdr is unavailable. A hosted
-> sandbox GitHub repo remains the open follow-up below.
+> workspace, closed on teardown) and **degrades to a clean skip** when herdr is unavailable. **P2c**
+> is the hosted-repo tier: **opt-in** (`SANDBOX_REAL_REMOTE=1`), it provisions a **disposable** private
+> GitHub repo (auto-deleted on teardown, incl. failure paths) and, without the opt-in or a real
+> authenticated gh, is **byte-identical hermetic stub** / a clean skip — so CI never touches GitHub.
 
 ## Explicitly DEFERRED to P1+ (backlog follow-up note)
 
 > The coordinator owns `BACKLOG.md`; this P0 does not edit it. Fold the follow-ups below into the
 > existing *"Sandbox consumer …"* backlog item when scheduling P1.
 
-- **P1 — hosted sandbox repo.** Provision a real `herdkit-sandbox` GitHub repo and a `herd sim
-  init` that deterministically resets its remote state (fresh branch, clean worktrees, seeded
-  issues). `sandbox-scenario.sh`'s local `pr.json` record becomes a real `gh pr create`.
-  (Grep for `TODO(P1)` in `sandbox-fixture.sh` / `sandbox-scenario.sh`.)
+- ~~**P1 — hosted sandbox repo.**~~ **DONE (P2c — `sandbox-real-remote-scenario.sh`).** Instead of a
+  single persistent `herdkit-sandbox` repo, the opt-in P2c tier provisions a **disposable** private
+  repo per run (`herd-sim-<ts>-<pid>`), pushes the fixture, runs a real `gh pr create` / watcher poll
+  / `gh pr merge`, and **deletes the repo on teardown** (trap-guaranteed, with a `--sweep` mop-up and
+  a loud leftover warning). Default (env unset) stays byte-identical hermetic stub. (The `TODO(P1)`
+  markers in `sandbox-fixture.sh` / `sandbox-scenario.sh` still note where a *persistent* seeded repo
+  would slot in, if ever wanted.)
 - ~~**P1 — real herdr control room.**~~ **DONE (P2b — `sandbox-real-panes-scenario.sh`).** A
   disposable `sandbox-realpanes-sim-<pid>` workspace where the scenario spins up a REAL control room
   and asserts placement/labels/agent-status/teardown via `herdr tab list` / `pane list` / `agent
