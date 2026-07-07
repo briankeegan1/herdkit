@@ -23,11 +23,13 @@
 #                       reviews or merges; verdicts are collected from per-PR result files on
 #                       later ticks. "review queued" = waiting for a concurrency slot.
 #   ⏳ merging         — health passed AND review PASSed, merging now
-#   🔀 resolving …     — PR CONFLICTING for the FIRST time: auto-spawned the isolated, test-gated
-#                       conflict resolver (herd-resolve.sh). Hands-off.
+#   🔀 resolving …     — PR CONFLICTING: auto-spawned the isolated, test-gated conflict resolver
+#                       (herd-resolve.sh). Hands-off. "re-resolving (round N)" = a RESPAWN (HERD-55)
+#                       after a new commit reshaped the conflict or the prior resolver died.
 #   ⚠️ needs you · …   — PR CONFLICTING OR healthcheck returned a CODE error (❌), OR the review
-#                       gate returned BLOCK, OR the auto-resolver already ran and it's STILL
-#                       conflicting ("resolver failed"). NEVER auto-merged; one-line reason.
+#                       gate returned BLOCK, OR the resolver ran and it's STILL conflicting
+#                       ("resolver failed"), OR the resolver ESCALATED a semantically-ambiguous
+#                       conflict, OR respawns hit the cap ("resolver gave up"). NEVER auto-merged.
 #
 # AUTO-MERGE rule (full auto, safety-railed): for a PR that is mergeable==MERGEABLE AND
 # mergeStateStatus==CLEAN, run  healthcheck.sh <worktree>  (serialized; retried once solo on a CODE
@@ -44,10 +46,14 @@
 # and record the merge in a persistent state file so "recently landed" survives re-renders.
 #
 # AUTO-RESOLVE rule (full auto, safety-railed): when a PR FIRST goes CONFLICTING, the watcher
-# auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>). Two hard rails: (1)
-# resolve-loop guard — a branch that already has a recorded attempt is NEVER re-spawned; (2)
-# escalation preserved — the resolver aborts + escalates semantically-ambiguous conflicts; the
-# watcher NEVER blind-merges a conflict.
+# auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>), keyed to the head sha. HERD-55
+# adds sha-keyed RESPAWN: if a CONFLICTING PR gets a NEW commit (its sha changes → the conflict
+# surface changed) OR the dispatched resolver DIES without clearing it, and no resolver agent for the
+# slug is alive, the watcher re-dispatches a fresh resolver for the new sha (journaling
+# resolver_respawn). Hard rails: (1) respawn budget — dispatches per PR are capped at REFIX_MAX_ROUNDS,
+# then the PR surfaces "resolver gave up · needs you" (never an infinite resolver loop); (2) escalation
+# preserved + terminal — the resolver aborts + escalates semantically-ambiguous conflicts, and an
+# ESCALATE is TERMINAL for that sha (no respawn until a new commit); the watcher NEVER blind-merges.
 #
 # MERGE_POLICY (.herd/config): three-way human-in-the-loop lever.
 #   auto    — current behavior: merge automatically after all gates pass.
@@ -90,9 +96,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
-# Resolve-attempt ledger, PARALLEL to $STATE: one line per conflict-resolver SPAWN
-# ("<epoch> <pr#> <slug> <branch>"). A branch that already has a recorded attempt is NEVER given a
-# second resolver (a failed/escalated resolve leaves the PR CONFLICTING; re-spawning would loop).
+# Resolve-attempt ledger, PARALLEL to $STATE: one line per conflict-resolver DISPATCH or terminal
+# OUTCOME. Format "<epoch> <pr#> <slug> <branch> <sha> <outcome>", outcome ∈ dispatched | escalated.
+# Sha-keyed like the review-once ledger (HERD-55): a resolver is dispatched at most ONCE per head
+# sha, but a NEW commit (sha change) that reshapes the conflict — or a resolver that DIED without
+# clearing it — re-spawns a fresh resolver for the new sha. dispatched records are the per-PR RESPAWN
+# BUDGET (capped at REFIX_MAX_ROUNDS); an `escalated` marker is TERMINAL for that sha (the resolver
+# judged the conflict semantically ambiguous) and is NOT a dispatch, so it never consumes the budget.
+# Legacy 4-field rows (pre-HERD-55, no sha/outcome) read as a dispatch with an empty sha.
 RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
 # Review ledger, PARALLEL to $STATE/$RESOLVE_STATE: one line per PRE-MERGE REVIEW
 # ("<epoch> <pr#> <headSha> <verdict>"). Keyed by PR *and* head sha so a PR is reviewed at most
@@ -437,15 +448,55 @@ _should_automerge() {
   [ "${1:-}" = "CLEAN" ]
 }
 
-# resolver_attempted <branch> — the resolve-loop guard.
+# resolver_attempted <branch> — legacy branch-keyed guard (kept for back-compat; the sha-keyed
+# helpers below drive the HERD-55 respawn logic). True if ANY dispatch exists for this branch.
 resolver_attempted() {
   [ -s "$RESOLVE_STATE" ] || return 1
   awk -v b="$1" '$4==b{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
 }
 
-# record_resolve_attempt <pr#> <slug> <branch> — append one spawn record (BEFORE the spawn).
+# resolver_dispatch_count <pr#> — total resolver DISPATCHES for this PR across all shas. This is the
+# per-PR respawn budget (capped at REFIX_MAX_ROUNDS); `escalated` markers are not dispatches.
+resolver_dispatch_count() {
+  [ -s "$RESOLVE_STATE" ] || { printf '0'; return 0; }
+  awk -v p="$1" '$2==p && $6!="escalated"{n++} END{print n+0}' "$RESOLVE_STATE" 2>/dev/null || printf '0'
+}
+
+# resolver_dispatched_sha <pr#> <sha> — true if a resolver was already DISPATCHED for this exact pr+sha.
+resolver_dispatched_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6!="escalated"{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_escalated_sha <pr#> <sha> — true if the resolver ESCALATED this exact pr+sha. TERMINAL:
+# an ambiguous conflict is never re-dispatched until a NEW commit changes the sha.
+resolver_escalated_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6=="escalated"{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_dispatch_epoch <pr#> <sha> — epoch of the most-recent DISPATCH for this pr+sha (empty if none).
+resolver_dispatch_epoch() {
+  [ -s "$RESOLVE_STATE" ] || return 0
+  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_last_sha <pr#> — the most-recently DISPATCHED sha for this PR (empty if none / legacy row).
+resolver_last_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 0
+  awk -v p="$1" '$2==p && $6!="escalated" && $5!=""{s=$5} END{if(s)print s}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# record_resolve_attempt <pr#> <slug> <branch> <sha> — append one DISPATCH record (BEFORE the spawn).
+# An empty sha is normalized to "-" so the 6 whitespace-separated columns never collapse (awk-safe).
 record_resolve_attempt() {
-  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RESOLVE_STATE"
+  printf '%s %s %s %s %s dispatched\n' "$(date +%s)" "$1" "$2" "$3" "${4:--}" >> "$RESOLVE_STATE"
+}
+
+# record_resolve_escalated <pr#> <slug> <branch> <sha> — mark a resolver ESCALATE terminal for this sha.
+record_resolve_escalated() {
+  printf '%s %s %s %s %s escalated\n' "$(date +%s)" "$1" "$2" "$3" "${4:--}" >> "$RESOLVE_STATE"
+  journal_append resolver_escalated pr "$1" slug "$2" sha "${4:--}"
 }
 
 # review_verdict <pr#> <headSha> — the review-once-per-commit guard. Echoes the recorded verdict
@@ -913,12 +964,126 @@ _merge_method_flag() {
   esac
 }
 
-# spawn_resolver <slug> <pr#> <branch> — hand a newly-CONFLICTING PR to the isolated resolver.
-# Record-first keeps the loop guard sound; the spawn is best-effort.
+# HERD_RESOLVE_BIN is a test seam mirroring HERD_REVIEW_BIN: the hermetic suite points it at a stub
+# resolver so the dispatch → death → respawn → cap loop is driven WITHOUT a real Claude agent.
+: "${HERD_RESOLVE_BIN:="$HERE/herd-resolve.sh"}"
+# _resolve_result_file <pr#> <sha> — the sha-scoped file the resolver writes its verdict to as its
+# LAST act (mirroring $HERD_REVIEW_RESULT_FILE): a line containing ESCALATE (ambiguous → terminal) or
+# DONE. Its ABSENCE while the resolver agent is gone is the DEAD-resolver signal that drives a respawn.
+_resolve_result_file() { printf '%s' "$TREES/.resolve-result-$1-$2"; }
+
+# _resolve_result <pr#> <sha> — echo the recorded resolver verdict token for this pr+sha (ESCALATE |
+# DONE), read from the sha-scoped result file. Returns non-zero (echoes nothing) when no file exists.
+_resolve_result() {
+  local f; f="$(_resolve_result_file "$1" "$2")"
+  [ -f "$f" ] || return 1
+  if grep -qi 'ESCALATE' "$f" 2>/dev/null; then printf 'ESCALATE'; else printf 'DONE'; fi
+}
+
+# _resolver_agent_alive <slug> — true if a live resolve·<slug> resolver agent is present in the tick's
+# driver roster ($AGENTS_JSON). A vanished resolver = it died/finished → eligible for a respawn.
+_resolver_agent_alive() {
+  [ -n "${AGENTS_JSON:-}" ] || return 1
+  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+import sys, json, os
+name = os.environ["NAME"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+except Exception:
+  agents = []
+for a in agents:
+  if a.get("name") == name:
+    sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
+# spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
+# to <sha>. Record-first keeps the respawn budget sound; the spawn is best-effort. The resolver is
+# told (via $HERD_RESOLVE_RESULT_FILE) to write its terminal verdict to the sha-scoped result file.
 spawn_resolver() {
-  rs="$1"; rp="$2"; rb="$3"
-  record_resolve_attempt "$rp" "$rs" "$rb"
-  bash "$HERE/herd-resolve.sh" "$rs" >/dev/null 2>&1 || true
+  rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
+  record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
+  HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
+    bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || true
+}
+
+# Grace window (seconds) before a resolver dispatched-for-this-sha whose agent is not yet visible in
+# the roster is treated as DEAD (rather than "just starting up"). Prevents a double-dispatch race when
+# a freshly-spawned resolver has not yet registered its pid. Overridable so the sim can zero it out.
+: "${_RESOLVER_DEAD_GRACE:=90}"
+
+# _classify_conflict <idx> <pr#> <slug> <branch> <headsha> — decide what to do with a CONFLICTING PR
+# (HERD-55). Sha-keyed like the review-once gate: first conflict → auto-spawn the resolver; a NEW
+# commit that reshapes the conflict, or a resolver that DIED without clearing it, → RE-spawn for the
+# new sha; an ESCALATE verdict is TERMINAL for that sha; respawns are capped at REFIX_MAX_ROUNDS then
+# surface needs-you. Sets DISPLAY[idx]; queues a (re)spawn by appending to the CONF_* arrays with the
+# sha + reason. Never spawns here — the resolve pass does that so it stays render-ordered + dry-runnable.
+_classify_conflict() {
+  local ci="$1" cpr="$2" cslug="$3" cbranch="$4" csha="$5"
+  local sl pn cap count now dispe age
+  # Normalize an absent head sha to "-" so it keys consistently across the ledger + result file.
+  [ -n "$csha" ] || csha="-"
+  sl="$(_slug_cell "$cslug")"; pn=" ${C_DIM}#${cpr}${C_RESET} ·"
+  cap="${REFIX_MAX_ROUNDS:-3}"
+  count="$(resolver_dispatch_count "$cpr")"
+
+  # ESCALATE already recorded for THIS sha → terminal; hold for a human, never re-dispatch.
+  if resolver_escalated_sha "$cpr" "$csha"; then
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver escalated (ambiguous conflict)${C_RESET}"
+    return
+  fi
+
+  if resolver_dispatched_sha "$cpr" "$csha"; then
+    # A resolver already ran (or is running) against THIS exact commit.
+    case "$(_resolve_result "$cpr" "$csha" || true)" in
+      ESCALATE)
+        # Promote the resolver's ESCALATE verdict to a terminal marker for this sha.
+        record_resolve_escalated "$cpr" "$cslug" "$cbranch" "$csha"
+        DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver escalated (ambiguous conflict)${C_RESET}"
+        return ;;
+      DONE)
+        # Resolver reported done yet the PR is STILL conflicting — it could not clear it. Do NOT
+        # re-spawn on the same sha (that would loop); wait for a new commit or a human.
+        DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
+        return ;;
+    esac
+    if _resolver_agent_alive "$cslug"; then
+      DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+      return
+    fi
+    # Dispatched for this sha, no verdict written, and the resolver agent is GONE. Give a freshly
+    # spawned resolver a grace window to register its pid before declaring it dead (no double-dispatch).
+    now="$(date +%s)"; dispe="$(resolver_dispatch_epoch "$cpr" "$csha")"
+    if [ -n "$dispe" ]; then age=$(( now - dispe )); else age=$(( _RESOLVER_DEAD_GRACE + 1 )); fi
+    if [ "$age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]; then
+      DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+      return
+    fi
+    # DEAD resolver — re-spawn for the same sha if budget remains, else surface needs-you.
+    if [ "$count" -ge "$cap" ]; then
+      DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+      return
+    fi
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("dead-resolver")
+    return
+  fi
+
+  # No resolver dispatched for THIS sha.
+  if [ "$count" -eq 0 ]; then
+    # First-ever conflict on this PR — today's hands-off auto-resolve path.
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("first")
+    return
+  fi
+  # A resolver ran on an OLDER sha and this PR got a NEW commit that reshaped the conflict surface.
+  if [ "$count" -ge "$cap" ]; then
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+    return
+  fi
+  DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+  CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit")
 }
 
 # reconcile_enqueued <pr#> <headSha> — true if a POST-MERGE reconcile was already enqueued for this
@@ -3335,7 +3500,7 @@ for wt, branch in feats:
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=()
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
@@ -3413,12 +3578,9 @@ EOF
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
-      if resolver_attempted "$branch"; then
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
-      else
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
-        CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch")
-      fi
+      # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
+      # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
+      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
     elif [ "$mergeable" = "MERGEABLE" ]; then
       # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
       # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
@@ -3660,20 +3822,33 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     esac
   done
 
-  # Resolve pass: auto-spawn the isolated conflict resolver for each NEWLY-conflicting PR.
+  # Resolve pass: auto-(re)spawn the isolated conflict resolver for each queued CONFLICTING PR. A
+  # `first` reason is today's newly-conflicting spawn; `new-commit` / `dead-resolver` are HERD-55
+  # RESPAWNS (a new sha reshaped the conflict, or the prior resolver died) — journaled resolver_respawn.
   k=0
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
-    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; k=$((k + 1))
+    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
     sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
+      if [ "$creason" = "first" ]; then
+        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
+      else
+        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would re-spawn resolver for PR #${prnum} (${creason})${C_RESET}"
+      fi
       render
       continue
     fi
-    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    if [ "$creason" != "first" ]; then
+      _rr_round="$(( $(resolver_dispatch_count "$prnum") + 1 ))"
+      journal_append resolver_respawn pr "$prnum" slug "$slug" \
+        old_sha "$(resolver_last_sha "$prnum")" new_sha "$csha" reason "$creason" round "$_rr_round"
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}re-resolving conflict (round ${_rr_round})…${C_RESET}"
+    else
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    fi
     render
-    spawn_resolver "$slug" "$prnum" "$branch"
+    spawn_resolver "$slug" "$prnum" "$branch" "$csha"
   done
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
