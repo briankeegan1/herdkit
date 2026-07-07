@@ -81,6 +81,43 @@ grep -q "add a dark-mode toggle" "$GQLLOG" || fail "add_item did not pass the re
 grep -q "team_xyz" "$GQLLOG" || fail "add_item did not target the configured team (teamId)"
 pass
 
+# 1b. HERD-77 (short titles): a long single-line add must yield a SHORT title (<=100 chars) but keep
+#     the FULL text as the description — never the old "first-line-as-essay" where a one-paragraph
+#     request became a giant title duplicated in the body (user complaint 2026-07-07; 7 hand-renames).
+#     Build a 500+char single line, run add_item, then parse the issueCreate VARS out of the log and
+#     assert BOTH halves.
+: > "$GQLLOG"
+BIG="$(python3 -c 'print("Add a really important feature " + "x"*470)')"   # 501 chars, no newline
+out="$(run _backend_add_item REQ2 "$BIG")"
+echo "$out" | grep -q "RESULT=DONE" || fail "add_item (long) did not report DONE ($out)"
+python3 - "$GQLLOG" <<'PY' || fail "add_item (long) title/description lengths wrong"
+import sys, json, re
+log = open(sys.argv[1]).read()           # one issueCreate round-trip; QUERY text is multi-line
+m = re.findall(r"VARS<<(.*?)>>", log, re.S)
+assert m, "no issueCreate VARS logged"
+v = json.loads(m[-1])
+title, desc = v["title"], v["description"]
+assert len(title) <= 100, "title too long: %d chars" % len(title)
+assert len(desc) >= 500, "description not full-length: %d chars" % len(desc)
+assert len(desc) > len(title), "description must be the FULL text, not the truncated title"
+PY
+pass
+
+# 1c. HERD-77: a long first line with a clause boundary derives the title from the FIRST clause
+#     (split on ' — '), not a blind mid-word cut — the title reads as a real summary.
+: > "$GQLLOG"
+CLAUSE="Backends derive a short title — $(python3 -c 'print("y"*300)')"
+run _backend_add_item REQ3 "$CLAUSE" >/dev/null
+python3 - "$GQLLOG" <<'PY' || fail "add_item clause-split title wrong"
+import sys, json, re
+m = re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)
+assert m, "no issueCreate VARS logged"
+t = json.loads(m[-1])["title"]
+assert t.startswith("Backends derive a short title"), "clause not used as title: %r" % t
+assert len(t) <= 100, "clause title too long: %d chars" % len(t)
+PY
+pass
+
 # 2. list_open (team scoped ON) → an issues() query filtered to the configured team, parsed to
 #    "#<identifier> <title>" lines. Privacy: the team filter MUST be present so other teams' issues
 #    can't leak in.

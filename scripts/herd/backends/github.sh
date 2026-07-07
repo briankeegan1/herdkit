@@ -49,13 +49,38 @@ except Exception: d = []
 print(d[0]["number"] if d else "")' 2>/dev/null
 }
 
+_github_short_title() {
+    # Derive a SHORT issue title from the full request text (HERD-77). The title SUMMARIZES the
+    # request; it NEVER replaces the body (the caller still stores the full text). A first line that
+    # is already short (<=100 chars) is the title verbatim. A long first line — the
+    # "first-line-as-essay" complaint (2026-07-07): a one-paragraph request became a giant title
+    # duplicated in the body — is reduced to its first sentence/clause (split on ' — ', ': ', or
+    # '. ') and hard-capped at 100 chars with an ellipsis. $1 = full text; prints the derived title.
+    TEXT="$1" python3 -c 'import os
+MAX = 100
+first = os.environ["TEXT"].split("\n", 1)[0].strip()
+if len(first) <= MAX:
+    print(first)
+else:
+    cut = len(first)
+    for d in (" — ", ": ", ". "):
+        i = first.find(d)
+        if i != -1:
+            cut = min(cut, i)
+    clause = first[:cut].strip()
+    if not clause or len(clause) > MAX - 1:
+        clause = first[:MAX - 1].rstrip()
+    print(clause + "…")'
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
-    # Title = the first line of the request; body = the full text. Sets _BACKEND_RESULT=DONE on a
-    # created issue, NOCHANGE if gh declines (so the scribe receipt still reports honestly).
+    # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
+    # essay); body = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue, NOCHANGE if gh
+    # declines (so the scribe receipt still reports honestly).
     local text="$2" title body url
     _github_require_gh
-    title="$(printf '%s' "$text" | head -n1)"
+    title="$(_github_short_title "$text")"
     body="$text"
     if url="$(_gh issue create --title "$title" --body "$body" 2>/dev/null)"; then
         _BACKEND_RESULT="DONE"
