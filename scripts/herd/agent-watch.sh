@@ -661,11 +661,20 @@ _gate_dispatch_mode() {
 # next tick collects/records the verdict rather than killing the in-flight reviewer — the sha is blocked
 # by health anyway, so the finished verdict is recorded but never acted on. The echoed token is
 # intentionally discarded; the console row for this tick is owned by the healthcheck gate.
+#
+# LEDGER PRECONDITION (mirrors the merge path's `if [ "$prior" != "PASS" ]` guard): _review_gate_step's
+# contract is "called once per tick for a candidate with NO ledger verdict yet". Once a PASS/BLOCK is
+# recorded for pr+sha the review is DONE for that commit and its result/inflight/tier markers are gone;
+# calling _review_gate_step again would find no markers and DISPATCH A BRAND-NEW review every tick — the
+# review-once invariant broken for any candidate that stays a candidate WITHOUT merging (health error,
+# approve/observe hold, human-verify hold, branch-protection block, a mergeability regression). So skip
+# the kick entirely when a verdict already exists; a new commit changes the sha and gets a fresh review.
 _predispatch_review_if_parallel() {
   [ "$(_gate_dispatch_mode)" = "parallel" ] || return 0
   [ -z "$DRYRUN" ] || return 0
   local pr="$1" slug="$2" sha="$3"
   [ -n "$sha" ] || return 0
+  review_verdict "$pr" "$sha" >/dev/null 2>&1 && return 0
   _review_gate_step "$pr" "$slug" "$sha" >/dev/null 2>&1 || true
 }
 

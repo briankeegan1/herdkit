@@ -159,6 +159,27 @@ GATE_DISPATCH=parallel _predispatch_review_if_parallel 5 slug-e eee555   # colle
 [ "$(grep -c '^5 slug-e$' "$STUB_SPAWN_LOG")" -eq 1 ] || fail "health-blocked review was re-dispatched (should run exactly once)"
 ok
 
+# ── (5b) REVIEW-ONCE across MANY ticks: a candidate that stays a candidate but NEVER merges (health
+# error, approve/observe/human-verify hold, branch-protection block) must NOT re-dispatch once its
+# verdict is recorded. Before the ledger-precondition guard, the early kick found the collected markers
+# gone and dispatched a brand-new (Opus) review every tick — spawns + duplicate ledger rows climbing
+# 1→2→3. Re-enter the early kick several ticks AFTER the PASS was recorded and assert it stays at one.
+for _ in 1 2 3 4; do GATE_DISPATCH=parallel _predispatch_review_if_parallel 5 slug-e eee555; done
+[ "$(grep -c '^5 slug-e$' "$STUB_SPAWN_LOG")" -eq 1 ] || fail "held candidate re-dispatched the review after its verdict (spawns should stay 1)"
+[ "$(awk -v p=5 -v s=eee555 '$2==p && $3==s' "$REVIEW_STATE" | grep -c .)" -eq 1 ] || fail "duplicate review-ledger rows accumulated for pr5+sha (review-once broken)"
+ok
+# Same for a BLOCK verdict: a blocked+held candidate must not re-review its sha either.
+rm -f "$STUB_SPAWN_LOG"; : > "$STUB_SPAWN_LOG"
+wait_for 8 _no_live || fail "reviews never drained before the BLOCK case"
+export STUB_DELAY=0 STUB_VERDICT="REVIEW: BLOCK — held"
+GATE_DISPATCH=parallel _predispatch_review_if_parallel 11 slug-k kkk111        # dispatch
+wait_for 5 test -f "$(_review_result_file 11 kkk111)" || fail "pr11 result never arrived"
+GATE_DISPATCH=parallel _predispatch_review_if_parallel 11 slug-k kkk111        # collect → record BLOCK
+[ "$(review_verdict 11 kkk111)" = "BLOCK" ] || fail "BLOCK not recorded for pr11"
+for _ in 1 2 3; do GATE_DISPATCH=parallel _predispatch_review_if_parallel 11 slug-k kkk111; done
+[ "$(grep -c '^11 slug-k$' "$STUB_SPAWN_LOG")" -eq 1 ] || fail "blocked candidate re-dispatched after its BLOCK (spawns should stay 1)"
+ok
+
 # ── (6) DRY-RUN: early kick is a no-op even under parallel ────────────────────
 rm -f "$REVIEW_STATE"; : > "$STUB_SPAWN_LOG"
 export DRYRUN=1
