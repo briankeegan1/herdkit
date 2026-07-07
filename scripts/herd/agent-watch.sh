@@ -2464,14 +2464,43 @@ _journal_cache_hit() {
   printf '%s\n' "$_jc_cur" > "$_jc_marker" 2>/dev/null || true
 }
 
-# record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
+# _health_fail_identity <healthcheck-oneline> — distil WHICH test/step failed from a healthcheck
+# --oneline CODE-ERROR line, so a FLAKY run (fail-then-pass) still records its offender before the
+# passing retry's output would otherwise be all that survives (HERD-76). The runner only ever
+# captures the single --oneline row, so that row IS the failing run's output — this just extracts
+# the salient identity from it (no extra suite work, zero gate behavior change):
+#   • strip the leading glyph + classifier prefix ("❌ code error — ", "light syntax — ", …) to the
+#     failing REASON after the first em-dash;
+#   • prefer concrete test/source file token(s) named in that reason (deduped, comma-joined) — the
+#     "failed=<file>" the deflake investigation needs;
+#   • fall back to the reason text itself (the failing STEP) for a non-test error that names no file.
+# Bounded to 200 chars so a pathological reason can never bloat a journal line past PIPE_BUF.
+_health_fail_identity() {
+  local _hf_line="$1" _hf_reason _hf_files
+  _hf_reason="${_hf_line#*— }"                       # everything after the first "— " separator …
+  [ "$_hf_reason" = "$_hf_line" ] && _hf_reason="$_hf_line"   # … or the whole line if there is none
+  _hf_files="$(printf '%s\n' "$_hf_reason" \
+    | grep -oE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null \
+    | awk '!seen[$0]++' | paste -sd, - 2>/dev/null)"
+  local _hf_id="${_hf_files:-$_hf_reason}"
+  # Collapse any stray newlines and trim surrounding whitespace, then cap the length.
+  _hf_id="$(printf '%s' "$_hf_id" | tr '\n' ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "${_hf_id:0:200}"
+}
+
+# record_healthcheck <pr#> <slug> <attempt> <outcome> [failed-identity] — append one attempt to the
+# ledger. When the outcome is a code error, [failed-identity] carries WHICH test/step failed (from
+# _health_fail_identity) and is journaled as failed=<id> so a later FLAKY-collapsed offender is still
+# identifiable. The ledger line is unchanged (5 fields) — identity lives in the journal only.
 record_healthcheck() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
   # Journal each attempt: attempt 1 is the initial run, attempt ≥2 is a solo retry-before-red.
-  if [ "${3:-1}" -le 1 ] 2>/dev/null; then
-    journal_append healthcheck_attempted pr "$1" slug "$2" attempt "$3" result "$4"
+  local _rh_event=healthcheck_attempted
+  [ "${3:-1}" -le 1 ] 2>/dev/null || _rh_event=healthcheck_retried
+  if [ -n "${5:-}" ]; then
+    journal_append "$_rh_event" pr "$1" slug "$2" attempt "$3" result "$4" failed "$5"
   else
-    journal_append healthcheck_retried pr "$1" slug "$2" attempt "$3" result "$4"
+    journal_append "$_rh_event" pr "$1" slug "$2" attempt "$3" result "$4"
   fi
 }
 
@@ -2548,7 +2577,11 @@ _healthcheck_gate() {
 
   # rc 1: a CODE ERROR. RETRY-BEFORE-RED: re-run ONCE, solo, still holding the mutex. A transient
   # from cross-worktree lock contention self-heals; only a reproducing failure is real.
-  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error"
+  # Capture WHICH test/step failed NOW, from this attempt's output, BEFORE the retry overwrites it —
+  # else a FLAKY collapse (pass on retry) leaves only 'result=code-error' and the offender is lost
+  # (HERD-76: this blocked the deflake investigation for #185/#188).
+  local _hg_failed; _hg_failed="$(_health_fail_identity "$_hg_hc")"
+  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_failed"
   DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · code error — retrying once (solo)${C_RESET}"
   render
   local _hg_hc2 _hg_rc2
@@ -2560,11 +2593,17 @@ _healthcheck_gate() {
     record_health_result "$_hg_pr" "$_hg_sha" "FLAKY"
     DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
     _HC_RESULT="FLAKY"
-    journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
+    # Carry the offender captured from the FAILING attempt onto the FLAKY outcome — the whole point
+    # of HERD-76: a passing retry must not erase which test flaked.
+    if [ -n "$_hg_failed" ]; then
+      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY failed "$_hg_failed"
+    else
+      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
+    fi
     return 0
   fi
   # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
-  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error"
+  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error" "$(_health_fail_identity "$_hg_hc2")"
   _health_release "$_hg_pr"
   # A tab-leak-guard CODEERROR is INFRA/TRANSIENT, not a code bug (issue #78 part 2): a concurrent
   # SAME-workspace sibling builder tab flickering non-idle during the healthcheck window can trip the

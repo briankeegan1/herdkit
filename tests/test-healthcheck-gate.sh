@@ -81,6 +81,7 @@ export HERD_HEALTHCHECK_BIN="$STUB_HC"
 export STUB_HC_SEQ="$T/hc-seq.txt"
 export STUB_HC_LOG="$T/hc-invocations.log"
 export STUB_HC_TREES="$T/trees"
+export JOURNAL_FILE="$T/journal.jsonl"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
@@ -91,6 +92,7 @@ render() { :; }
 reset_scenario() {
   rm -f "$HEALTH_STATE" "$STUB_HC_LOG" "$T/trees"/.health-inflight-* "$T/trees"/.health-result-* 2>/dev/null || true
   : > "$STUB_HC_LOG"
+  : > "$JOURNAL_FILE"
   DISPLAY=(); _HC_RESULT=""
 }
 # Helper: outcome tokens recorded in the ledger for a given PR, space-joined in order.
@@ -161,6 +163,54 @@ ok
   || fail "ledger should record 'code-error code-error' (got '$(ledger_outcomes 4)')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "real failure should invoke healthcheck exactly twice — never a third retry"
 [ ! -e "$(_health_inflight_file 4)" ] || fail "real failure must still release its mutex marker"
+ok
+
+# ── (5b) HERD-76: the FLAKY offender's identity is persisted before the passing retry ─────────────
+# A fail-then-pass run must record WHICH test failed on the code-error attempt into the journal —
+# on the healthcheck_attempted event AND the FLAKY outcome — so a retry-that-passes can no longer
+# erase the flaky offender (which blocked deflaking #185/#188).
+type _health_fail_identity >/dev/null 2>&1 || fail "_health_fail_identity not defined after sourcing"
+ok
+# The extractor prefers a concrete test-file token, dedupes, and falls back to the failing step.
+[ "$(_health_fail_identity '❌ code error — app/greet.test.sh: assertion failed')" = "app/greet.test.sh" ] \
+  || fail "identity should extract the test file (got '$(_health_fail_identity '❌ code error — app/greet.test.sh: assertion failed')')"
+[ "$(_health_fail_identity '❌ light syntax — bash -n scripts/foo.sh → line 3: syntax error')" = "scripts/foo.sh" ] \
+  || fail "identity should extract the syntax-erroring file"
+[ "$(_health_fail_identity '❌ code error — TESTS FAILED: 27 assertions')" = "TESTS FAILED: 27 assertions" ] \
+  || fail "identity should fall back to the failing step when no file is named"
+ok
+reset_scenario
+printf '1|❌ code error — tests/test-widget.sh: FAILED\n0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 30 slug-flakyid "$T/wt" 0
+[ "$_HC_RESULT" = "FLAKY" ] || fail "5b: fail-then-pass should yield FLAKY (got '$_HC_RESULT')"
+# The failing attempt's journal event carries failed=<file> …
+grep -q '"event":"healthcheck_attempted"' "$JOURNAL_FILE" || fail "5b: expected a healthcheck_attempted event"
+python3 - "$JOURNAL_FILE" <<'PY' || fail "5b: healthcheck_attempted must carry failed=tests/test-widget.sh"
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+a=[r for r in rows if r.get("event")=="healthcheck_attempted" and r.get("result")=="code-error"]
+assert a and a[-1].get("failed")=="tests/test-widget.sh", a
+PY
+ok
+# … and the FLAKY outcome carries the offender too — a passing retry no longer erases it.
+python3 - "$JOURNAL_FILE" <<'PY' || fail "5b: FLAKY outcome must carry failed=tests/test-widget.sh"
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+o=[r for r in rows if r.get("event")=="healthcheck_outcome" and r.get("outcome")=="FLAKY"]
+assert o and o[-1].get("failed")=="tests/test-widget.sh", o
+PY
+ok
+# A reproduced (fail-then-fail) code error also records the offender on the retry attempt.
+reset_scenario
+printf '1|❌ code error — tests/test-broken.sh: line 5\n1|❌ code error — tests/test-broken.sh: line 5\n' > "$STUB_HC_SEQ"
+_healthcheck_gate 31 slug-realid "$T/wt" 0
+[ "$_HC_RESULT" = "CODEERROR" ] || fail "5b: fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
+python3 - "$JOURNAL_FILE" <<'PY' || fail "5b: retry code-error attempt must carry failed=tests/test-broken.sh"
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+r2=[r for r in rows if r.get("event")=="healthcheck_retried" and r.get("result")=="code-error"]
+assert r2 and r2[-1].get("failed")=="tests/test-broken.sh", r2
+PY
 ok
 
 # ── (6) mutex serialization: a live holder → QUEUED, stub not invoked ─────────
