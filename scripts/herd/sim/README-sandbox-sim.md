@@ -221,6 +221,57 @@ Flags: `--artifacts DIR` (repo + scorecard + artifacts; `--keep` implied), `--ke
 negative kill-switch path, artifact capture + graceful screenshot skip, hermeticity, and determinism
 across two runs). Unit-level coverage of the same pieces lives in `../../../tests/test-limit-resume.sh`.
 
+## P2b — disposable REAL-HERDR-PANES scenario — `sandbox-real-panes-scenario.sh`
+
+The **pane/TUI layer** that P0/P1/P2a explicitly skip (all three run `HERD_DRIVER=headless` —
+panes-as-a-view, *no herdr tabs/panes ever created*). This P2b scenario is the one tier that stands
+up a **REAL, disposable herdr control room** against the local fixture and asserts the pane surface
+itself via herdr's JSON output:
+
+- a control-room **tab** with a **watcher pane + a backlog pane** (labels asserted via `pane list`);
+- a **builder tab** with a **stub builder** (a file/CLI-driven agent via `herdr pane report-agent` —
+  no model call);
+- **agent-status transitions** `idle → working → done`, each observed via `herdr agent list`;
+- **CLEAN TEARDOWN** — the disposable workspace is closed and **NO tab or pane is leaked** afterward
+  (`leaked_tabs` **must be 0**), so the result satisfies the tab-leak-guard.
+
+**Runner-context safety (tab-leak-guard / PR #180).** Because it creates *real* panes, the scenario
+never touches an existing workspace: it creates its **own disposable workspace** with a UNIQUE label
+(`sandbox-realpanes-sim-<pid>`), distinct from any project's `WORKSPACE_NAME`, drives only the
+tabs/panes it created there, and closes that whole workspace on teardown (also from an **EXIT trap**,
+so a mid-run failure still cleans up). The healthcheck's tab-leak-guard is **scoped** to the project's
+own workspace (`.herd/healthcheck.project.sh`), so a disposable workspace with a different label is
+never counted — running this **from inside a builder tab cannot false-red the guard** on the runner's
+own tab.
+
+**No-false-red / headless CI.** herdr is a hard dependency for the real-pane path only. When herdr is
+unavailable — not installed, no running server, or forced off via `SANDBOX_NO_HERDR=1` — the scenario
+**skips the pane checkpoints loudly-but-cleanly** (`result: "skip"`, exit 0) rather than failing. An
+expected absence is never a red alarm.
+
+```sh
+# Stand up a real disposable control room, drive it, tear it down; inspect the scorecard:
+bash scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp-run
+cat /tmp/rp-run/scorecard.json
+
+# Headless / CI (or anywhere without a live herdr server): degrades to a clean SKIP, never a red:
+SANDBOX_NO_HERDR=1 bash scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp-ci
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds** the real-pane fields: `herdr_available`
+(bool), `workspace_label`, `tabs_created`, `panes_created`, `agent_transitions` (**must be**
+`["idle","working","done"]`), `leaked_tabs` (**must be 0**), `pane_captures`, `screenshots`.
+
+Flags: `--artifacts DIR` (repo + scorecard + artifacts; `--keep` implied), `--keep`, `--label NAME`
+(workspace label prefix, default `sandbox-realpanes-sim`). Env: `SANDBOX_NO_HERDR=1` (force the clean
+skip), `SANDBOX_NO_SCREENSHOT=1`. Hermetic proof: `../../../tests/test-sandbox-real-panes.sh` drives
+the scenario two ways WITHOUT ever touching the real herdr server — the SKIP path (clean skip, 0
+fails) and a **FILE-BACKED stub `herdr`** (a JSON state machine, no real panes) that exercises the
+full flow + teardown accounting — plus the scorecard shape and hermeticity checks.
+
+> This lands the P1 follow-ups *"real herdr control room"* and *"visual confirmation"* below, in
+> stub-builder mode. A hosted sandbox GitHub repo (the other P1/P2 follow-up) remains open.
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -229,10 +280,12 @@ across two runs). Unit-level coverage of the same pieces lives in `../../../test
 | **P0** | `benchmark-drain.sh` | the full herdkit flow per item (stub) | unattended N-item drain **survives a hard kill** (0 duplicates) |
 | **P1** | `sandbox-concurrency-scenario.sh` | the **real** watcher gate loop, N≥3 PRs | `REVIEW_CONCURRENCY` / `HEALTH_CONCURRENCY=1` / no double-merge / drain |
 | **P2a** | `sandbox-limit-resume-scenario.sh` | the **real** watcher limit path | limit-park **detect → park → scheduled → resume → complete** + kill-switch |
+| **P2b** | `sandbox-real-panes-scenario.sh` | a **real** disposable herdr control room | pane/tab existence + labels, agent `idle→working→done`, **clean teardown (0 leaks)** |
 
-> Every tier is stub-mode and hermetic (local git only, no hosted repo, no herdr panes, no model). A
-> hosted sandbox repo (P2b) and a real herdr control room with live panes (P2c) remain the follow-ups
-> below.
+> P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
+> model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique
+> workspace, closed on teardown) and **degrades to a clean skip** when herdr is unavailable. A hosted
+> sandbox GitHub repo remains the open follow-up below.
 
 ## Explicitly DEFERRED to P1+ (backlog follow-up note)
 
@@ -243,11 +296,14 @@ across two runs). Unit-level coverage of the same pieces lives in `../../../test
   init` that deterministically resets its remote state (fresh branch, clean worktrees, seeded
   issues). `sandbox-scenario.sh`'s local `pr.json` record becomes a real `gh pr create`.
   (Grep for `TODO(P1)` in `sandbox-fixture.sh` / `sandbox-scenario.sh`.)
-- **P1 — real herdr control room.** A dedicated `sandbox` workspace where scenarios spin up a REAL
-  control room; assert placement/layout/labels/teardown via `herdr tab list` / `pane list` /
-  `agent list` JSON at each checkpoint. P0 asserts git/file state only.
-- **P1 — visual confirmation.** Capture pane contents / OS screenshots at checkpoints and have a
-  vision-capable judge assert observable truths ("3 panes present", "watch console painting rows").
+- ~~**P1 — real herdr control room.**~~ **DONE (P2b — `sandbox-real-panes-scenario.sh`).** A
+  disposable `sandbox-realpanes-sim-<pid>` workspace where the scenario spins up a REAL control room
+  and asserts placement/labels/agent-status/teardown via `herdr tab list` / `pane list` / `agent
+  list` JSON at each checkpoint.
+- **P1 — visual confirmation.** *(Partially P2b.)* P2b captures the builder pane's contents via
+  `herdr pane read` and an OS `screencapture` at the control-room checkpoint (both degrade
+  gracefully). Still open: a **vision-capable judge** that asserts observable truths from those
+  captures ("3 panes present", "watch console painting rows").
 - **P1 — fault-injection scenarios.** Grow the `SANDBOX_FORCE_GATE_FAIL` seed into the full
   2026-07-02 bug-class matrix: kill-watcher-mid-review (INFRA retry, not cached BLOCK),
   never-committed backlog file, `PYTHONIOENCODING=ascii` (cp1252), missing optional deps (glow),
