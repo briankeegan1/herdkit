@@ -80,8 +80,8 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `driver.sh` → `herd-config.sh`
 - `healthcheck.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `theme.sh`
-- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`
-- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`
+- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
+- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
 - `herd-review.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
@@ -91,7 +91,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `scribe-step.sh` → `herd-config.sh`
 - `scribe.sh` → `driver.sh`, `herd-config.sh`
 - `spawn-step.sh` → `herd-config.sh`
-- `spawn.sh` → `herd-config.sh`
+- `spawn.sh` → `herd-config.sh`, `journal.sh`
 - `task-spec-view.sh` → `theme.sh`
 
 ## Config key → consumers
@@ -160,6 +160,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
 - `TOKEN_MODE` → `bin/herd`
+- `TRACKED_SPAWNS` → —
 - `WATCHER_AUTOMERGE` → `bin/herd`, `agent-watch.sh`
 - `WATCHER_OWNER` → `agent-watch.sh`, `herd-claim.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`
