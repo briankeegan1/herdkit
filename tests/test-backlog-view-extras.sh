@@ -54,7 +54,13 @@ if [ "${1:-}" = "issue" ] && [ "${2:-}" = "list" ]; then
     echo "HTTP 401: Bad credentials — Authorization: token gho_LEAKED-SECRET-TOKEN" >&2
     exit 1
   fi
-  printf '%s\n' "${GH_FAKE_OUT:-}"
+  # When GH_FAKE_URL is set, emit the TAB-separated '#<n>\t<title>\t<url>' shape the real gh --jq
+  # produces (so the OSC 8 chip-link path is exercised); otherwise the legacy space-joined line.
+  if [ -n "${GH_FAKE_URL:-}" ]; then
+    printf '%b\n' "${GH_FAKE_OUT:-}"
+  else
+    printf '%s\n' "${GH_FAKE_OUT:-}"
+  fi
   exit 0
 fi
 exit 0
@@ -161,6 +167,30 @@ grep -q "📥 incoming (github issues)" <<<"$out4"   || fail "gh-fail: incoming 
 grep -q "incoming unavailable" <<<"$out4"         || fail "gh-fail: missing quiet 'incoming unavailable' note"
 grep -q "gho_LEAKED-SECRET-TOKEN" <<<"$out4"      && fail "SECRET LEAK: gh error body reached the pane"
 grep -q "Bad credentials" <<<"$out4"              && fail "gh-fail: raw error body must be sanitized, not shown"
+pass
+
+# ── Case 5: incoming issue id chip is an OSC 8 hyperlink to the issue URL (HERD-49) ──────────────
+# gh's --jq gives '#<n>\t<title>\t<url>'; the incoming section wraps the id chip in an OSC 8
+# hyperlink (ESC ]8;;URL ST #<n> ESC ]8;; ST) with the title following plain. A row without a url
+# field degrades to the plain unlinked '#<n> <title>' text (fail-soft).
+P5="$T/proj-linear-link"; make_project "$P5" "linear" "github-issues"
+ESC="$(printf '\033')"; TAB="$(printf '\t')"
+: > "$GHLOG"; : > "$HERDLOG"
+out5="$(run_view "$P5" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 \
+        HERD_FAKE_OUT="#ABC-3 planned-ticket" GH_FAKE_URL=1 \
+        GH_FAKE_OUT="#7${TAB}incoming-linked-issue${TAB}https://github.com/acme/repo/issues/7")"
+grep -q -- "${ESC}]8;;https://github.com/acme/repo/issues/7${ESC}\\\\#7${ESC}]8;;${ESC}\\\\ incoming-linked-issue" <<<"$out5" \
+  || fail "incoming issue chip was not wrapped in an OSC 8 hyperlink ($(cat -v <<<"$out5"))"
+grep -q "gh issue list" "$GHLOG" || fail "link case: did not invoke 'gh issue list'"
+pass
+
+# ── Case 6: incoming falls back to plain text when gh yields no url field (older gh) ──────────────
+P6="$T/proj-linear-nourl"; make_project "$P6" "linear" "github-issues"
+: > "$GHLOG"; : > "$HERDLOG"
+out6="$(run_view "$P6" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 \
+        HERD_FAKE_OUT="#ABC-4 planned-ticket" GH_FAKE_OUT="#8 legacy-plain-issue")"
+grep -q "legacy-plain-issue" <<<"$out6" || fail "no-url incoming issue title missing ($out6)"
+! grep -q ']8;;' <<<"$out6" || fail "no-url incoming row must not emit an OSC 8 sequence ($(cat -v <<<"$out6"))"
 pass
 
 echo "ALL PASS ($PASS checks)"

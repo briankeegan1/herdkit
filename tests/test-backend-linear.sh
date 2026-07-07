@@ -59,7 +59,7 @@ run() {
         *"states(filter"*)  echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"identifier\":\"ENG-7\",\"title\":\"first open issue\",\"team\":{\"states\":{\"nodes\":${STATES_NODES:-$DEFAULT_STATE_NODES}}}}]}}}" ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
-        *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
+        *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","url":"https://linear.app/acme/issue/ENG-7","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"url":"https://linear.app/acme/issue/ENG-9","state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -102,21 +102,22 @@ echo "$open2" | grep -q "^#ENG-7 first open issue$" || fail "list_open (no team)
 pass
 
 # 2c. list_open_rich → same open filter as list_open but also requests state {name type} +
-#     description + assignee {displayName}, emits TSV
-#     ("#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>"), sorts
-#     started-first, and flattens description whitespace (a raw newline would corrupt the TSV).
+#     description + url + assignee {displayName}, emits TSV
+#     ("#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>"), sorts
+#     started-first, and flattens description whitespace (a raw newline would corrupt the TSV). The
+#     trailing <url> (HERD-49) feeds backlog-view.sh's OSC 8 chip hyperlink.
 TAB="$(printf '\t')"
 : > "$GQLLOG"
 rich="$(run _backend_list_open_rich)"
-grep -q "description state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + state name/type"
+grep -q "description url state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + url + state name/type"
 grep -q "assignee { displayName }" "$GQLLOG" || fail "list_open_rich did not request assignee displayName"
 grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open_rich (team set) did not scope the query to the team"
 echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
   || fail "list_open_rich did not sort the started (in-progress) issue first ($rich)"
-echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase$" \
-  || fail "list_open_rich TSV shape wrong for ENG-9 (should have assignee Chase as 6th field) ($rich)"
-echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}$" \
-  || fail "list_open_rich did not flatten the multi-line description; unassigned item must have empty trailing field ($rich)"
+echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://linear.app/acme/issue/ENG-9$" \
+  || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th field, url 7th field) ($rich)"
+echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}${TAB}https://linear.app/acme/issue/ENG-7$" \
+  || fail "list_open_rich did not flatten desc / place empty assignee then url; ENG-7 shape wrong ($rich)"
 pass
 
 # 2d. show_item → single-issue detail via issues(filter:) (never issueSearch): identifier + live

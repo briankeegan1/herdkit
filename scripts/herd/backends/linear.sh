@@ -355,11 +355,14 @@ for n in nodes:
 _backend_list_open_rich() {
     # OPTIONAL rich variant of _backend_list_open (the plain op above stays the cross-backend
     # contract and is byte-identical). Emits one TAB-separated line per open issue:
-    #   #<identifier> \t <state-type> \t <state-name> \t <title> \t <desc-snippet>
+    #   #<identifier> \t <state-type> \t <state-name> \t <title> \t <desc-snippet> \t <assignee> \t <url>
     # state-type is Linear's workflow-state TYPE (started|unstarted|backlog|triage) — the machine
     # key a viewer groups on; state-name is the human label ("In Progress", "In Review", …). The
     # description snippet is whitespace-flattened (tabs/newlines → spaces, so the TSV shape can
-    # never be corrupted by field content) and capped at 280 chars. Lines are sorted started-first
+    # never be corrupted by field content) and capped at 280 chars. The trailing <url> is the issue's
+    # canonical Linear URL (whitespace-flattened, so it can never carry a TAB) — backlog-view.sh wraps
+    # the id chip in an OSC 8 hyperlink to it (HERD-49); older consumers that read only the first six
+    # fields ignore it. Lines are sorted started-first
     # (in-progress work surfaces at the top), then unstarted, backlog, triage — stable within each
     # group (API order preserved). Consumed by `herd backlog --rich` → backlog-view.sh's rich
     # renderer; callers that don't know this op exists keep using _backend_list_open unchanged.
@@ -368,7 +371,7 @@ _backend_list_open_rich() {
     if [ -n "${LINEAR_TEAM_ID:-}" ]; then
         query='query L($team: ID!) {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
-    nodes { identifier title description state { name type } assignee { displayName } }
+    nodes { identifier title description url state { name type } assignee { displayName } }
   }
 }'
         vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
@@ -376,7 +379,7 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
     else
         query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
-    nodes { identifier title description state { name type } assignee { displayName } }
+    nodes { identifier title description url state { name type } assignee { displayName } }
   }
 }'
         vars=""
@@ -398,8 +401,9 @@ for _, _, n, st in rows:
     if len(desc) > 280:
         desc = desc[:279].rstrip() + "…"
     assignee = flat((n.get("assignee") or {}).get("displayName") or "")
-    print("#%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
-                                        flat(st.get("name")), flat(n.get("title")), desc, assignee))' 2>/dev/null || true
+    url = flat(n.get("url") or "")
+    print("#%s\t%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
+                                            flat(st.get("name")), flat(n.get("title")), desc, assignee, url))' 2>/dev/null || true
 }
 
 _backend_show_item() {
