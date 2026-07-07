@@ -127,4 +127,24 @@ grep -q "^herd backlog$" "$LOG"      || fail "old-CLI case: plain retry missing 
 grep -q -- '- `#OLD-1` \*\*legacy item\*\*' <<<"$out3" || fail "old-CLI case did not render the plain list ($out3)"
 pass
 
+# ── Case 4: assignee rendering ─────────────────────────────────────────────────────────────────────
+# started item with assignee  → '_(In Progress · Chase)_' state suffix
+# unstarted item with assignee → '@Name' between the chip and the bold title
+# unassigned item             → no @-name anywhere on that item's line
+P4="$T/proj-assignee"; make_project "$P4"
+RICH4="#HERD-1${TAB}started${TAB}In Progress${TAB}Do the thing${TAB}Body text${TAB}Chase
+#HERD-2${TAB}unstarted${TAB}Todo${TAB}Other task${TAB}${TAB}Jordan
+#HERD-3${TAB}unstarted${TAB}Todo${TAB}Free task${TAB}${TAB}"
+: > "$LOG"
+out4="$(run_view "$P4" HERD_FAKE_RICH_OUT="$RICH4")"
+grep -q -- '- `#HERD-1` \*\*Do the thing\*\* _(In Progress · Chase)_' <<<"$out4" \
+  || fail "started item with assignee must render '_(In Progress · Chase)_' ($out4)"
+grep -q -- '- `#HERD-2` @Jordan \*\*Other task\*\*' <<<"$out4" \
+  || fail "unstarted item with assignee must render '@Name' between chip and bold title ($out4)"
+grep -q -- '- `#HERD-3` \*\*Free task\*\*' <<<"$out4" \
+  || fail "unassigned unstarted item must have no @-name ($out4)"
+! grep -q '@' <<<"$(grep '#HERD-3' <<<"$out4")" \
+  || fail "unassigned item must not emit any @-name on its line"
+pass
+
 echo "ALL PASS ($PASS checks)"
