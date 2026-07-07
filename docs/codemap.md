@@ -114,7 +114,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
 - `CLAIM_REQUIRED` → `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
-- `CONTEXT_PROVISION` → —
+- `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
@@ -125,9 +125,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DEP_POLL_MIN` → `dep-watcher.sh`
 - `DEP_STALE_TTL` → `dep-watcher.sh`
 - `DOCS_ONLY_GLOB` → `agent-watch.sh`
-- `DOCTOR_STARTUP_HINT` → `herd-preflight.sh`
+- `DOCTOR_STARTUP_HINT` → `bin/herd`, `herd-preflight.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
-- `GRAPHIFY_BIN` → `codemap.sh`
+- `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
@@ -140,7 +140,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
-- `MCP_PROVISION` → —
+- `MCP_PROVISION` → `bin/herd`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
@@ -158,7 +158,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_AUTOFIX` → `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `agent-watch.sh`, `herd-spawn-gate.sh`
-- `REVIEW_ESCALATE_GLOB` → `agent-watch.sh`
+- `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`
 - `REVIEW_MODEL_CHEAP` → `agent-watch.sh`
 - `REVIEW_MODEL_DOCS` → `agent-watch.sh`
