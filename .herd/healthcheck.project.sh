@@ -72,9 +72,22 @@ fi
 # coordinator*) spawned by unrelated activity can be caught mid-spawn in 'unknown'/'blocked' and, by
 # status alone, look like a net-new orphan (three real false-reds, incl. PR #162's resolve·codemap-
 # freshness). _hk_orphans() therefore also drops any tab whose LABEL matches that known-engine
-# whitelist from the orphan set, symmetrically in both snapshots. (Residual: a real headless
-# review·<slug> tab spawned by the watcher in this same window is NOT whitelisted, so it can still
-# trip the guard — rare, transient, and self-heals on re-run; a genuine leak persists and re-trips.)
+# whitelist from the orphan set, symmetrically in both snapshots.
+#
+# DEFLAKE (HERD-93): two further mitigations kill the last recurring false-red — the guard reddening
+# on normal control-room churn (builder/review/scribe tabs flipping state mid-suite is EXPECTED on a
+# busy day), which cost a wasted full-suite run + retry on most busy-day PRs:
+#   (a) .herd-tabs REGISTRATION WHITELIST — every engine-minted tab (builder/review·/resolve·) is
+#       recorded by tab_id in $WORKTREES_DIR/.herd-tabs when the engine spawns it. _hk_orphans() drops
+#       any tab whose tab_id is registered there, so a legit watcher-spawned review·<slug> tab (the
+#       LABEL whitelist above does NOT cover 'review·') no longer trips the guard. This is an EXACT
+#       tab_id match, read fresh at each snapshot, so it never masks a hermetic test's escaped tab: a
+#       leaked tab is created outside the engine and is NOT in the registry, so it still reds.
+#   (b) SETTLE-RETRY — a leak detected on the first post-suite snapshot may be transient churn (a tab
+#       caught mid-spawn/mid-reap or a state flip). Before reddening we sleep a short settle window
+#       (HERD_LEAKGUARD_SETTLE_SECS, default 4s) and re-snapshot; we red ONLY if the leak is STILL
+#       present. Transient churn clears; a genuinely leaked, agent-less tab persists and re-trips.
+# Both preserve no-false-green: a real leak is neither engine-registered nor transient, so it reds.
 _hk_workspace_id() {
   # Resolve THIS project's herdr workspace id (WORKSPACE_NAME → workspace_id via 'herdr workspace
   # list'). Prints the id (no trailing newline) on success; empty when herdr is absent, the list
@@ -93,6 +106,18 @@ try:
 except Exception:
     pass
 ' 2>/dev/null || true
+}
+
+_hk_regtabs() {
+  # Emit the tab_ids the engine has REGISTERED in $WORKTREES_DIR/.herd-tabs, one per line — the
+  # builder/review·/resolve· tabs it minted and owns (field 2 of each '<label> <tab_id> <kind>' row).
+  # These are engine-created expected churn, so _hk_orphans() drops them from the orphan set (HERD-93
+  # registration whitelist). Read FRESH at each snapshot so a review·<slug> tab the watcher registers
+  # mid-suite is honored. Empty when WORKTREES_DIR is unset or the registry does not exist yet.
+  local _tree=""
+  [ -f .herd/config ] && _tree="$(. .herd/config 2>/dev/null && printf '%s' "${WORKTREES_DIR:-}")"
+  [ -n "$_tree" ] && [ -f "$_tree/.herd-tabs" ] || return 0
+  awk 'NF>=2 {print $2}' "$_tree/.herd-tabs" 2>/dev/null || true
 }
 
 _hk_orphans() {
@@ -114,12 +139,16 @@ _hk_orphans() {
   # (label NOT matching the whitelist, e.g. herd-review's standalone review·<slug> running tail -f)
   # is still an orphan and still reds.
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr tab list 2>/dev/null | WSID="${1:-}" "$PY" -c '
+  herdr tab list 2>/dev/null | WSID="${1:-}" REGTABS="$(_hk_regtabs)" "$PY" -c '
 import sys, json, os, re
 # Known engine tab/agent label prefixes. The character after "resolve" is a literal middot
 # U+00B7 (the label is "resolve·<slug>"), matching the engine that mints those tabs. "research"
 # also covers "researcher"/"research·*".
 _ENGINE = re.compile(r"^(scribe-|resolve·|research|herd-watch|backlog|coordinator)")
+# HERD-93 registration whitelist: tab_ids the engine recorded in .herd-tabs (builder/review·/resolve·)
+# are engine-owned expected churn — drop them from the orphan set. EXACT match, so a hermetic test'"'"'s
+# escaped tab (never engine-registered) still counts as an orphan and still reds.
+_REGTABS = set(filter(None, (os.environ.get("REGTABS", "") or "").split()))
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
     wsid = os.environ.get("WSID", "")
@@ -128,7 +157,8 @@ try:
         tabs = [t for t in tabs if str(t.get("workspace_id", "")) == wsid]
     orphans = [t for t in tabs
                if str(t.get("agent_status", "")) not in ("idle", "working")
-               and not _ENGINE.match(str(t.get("label", "")))]
+               and not _ENGINE.match(str(t.get("label", "")))
+               and str(t.get("tab_id", "")) not in _REGTABS]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
     # Emit the orphan labels too so a real leak can be named in the failure message.
@@ -136,6 +166,31 @@ try:
         print("orphan-label:" + lbl)
 except Exception:
     pass
+' 2>/dev/null || true
+}
+
+_hk_leak_delta() {
+  # Print a non-empty leak description IFF the AFTER snapshot ($2) shows MORE orphan tabs or panes
+  # than the BEFORE snapshot ($1); empty (clean) otherwise. Shared by the initial check and the
+  # settle-retry re-check so both use identical delta semantics.
+  BEF="$1" AFT="$2" "$PY" -c '
+import os
+def parse(s):
+    tabs = panes = 0
+    labels = []
+    for line in s.splitlines():
+        if line.startswith("orphan-tabs:"):  tabs  = int(line.split(":",1)[1] or 0)
+        elif line.startswith("orphan-panes:"): panes = int(line.split(":",1)[1] or 0)
+        elif line.startswith("orphan-label:"): labels.append(line.split(":",1)[1])
+    return tabs, panes, labels
+bt, bp, bl = parse(os.environ["BEF"])
+at, ap, al = parse(os.environ["AFT"])
+if at > bt or ap > bp:
+    # Name the orphan label(s) present after but not before, best-effort.
+    from collections import Counter
+    new = list((Counter(al) - Counter(bl)).elements())
+    print("orphan tabs %d->%d, orphan panes %d->%d%s" % (
+        bt, at, bp, ap, (" — new: " + ", ".join(sorted(new))) if new else ""))
 ' 2>/dev/null || true
 }
 # Resolve our workspace ONCE and reuse it for both the before and after snapshots, so the two are
@@ -163,25 +218,19 @@ fi
 leak_note="tab-leak-guard: clean"
 if command -v herdr >/dev/null 2>&1; then
   _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
-  _hk_leak="$(BEF="$_hk_orphans_before" AFT="$_hk_orphans_after" "$PY" -c '
-import os
-def parse(s):
-    tabs = panes = 0
-    labels = []
-    for line in s.splitlines():
-        if line.startswith("orphan-tabs:"):  tabs  = int(line.split(":",1)[1] or 0)
-        elif line.startswith("orphan-panes:"): panes = int(line.split(":",1)[1] or 0)
-        elif line.startswith("orphan-label:"): labels.append(line.split(":",1)[1])
-    return tabs, panes, labels
-bt, bp, bl = parse(os.environ["BEF"])
-at, ap, al = parse(os.environ["AFT"])
-if at > bt or ap > bp:
-    # Name the orphan label(s) present after but not before, best-effort.
-    from collections import Counter
-    new = list((Counter(al) - Counter(bl)).elements())
-    print("orphan tabs %d->%d, orphan panes %d->%d%s" % (
-        bt, at, bp, ap, (" — new: " + ", ".join(sorted(new))) if new else ""))
-' 2>/dev/null || true)"
+  _hk_leak="$(_hk_leak_delta "$_hk_orphans_before" "$_hk_orphans_after")"
+  if [ -n "$_hk_leak" ]; then
+    # SETTLE-RETRY (HERD-93): a leak on the FIRST post-suite snapshot may be transient control-room
+    # churn (a tab caught mid-spawn/mid-reap or a state flip) rather than a real suite leak. Sleep a
+    # short settle window and re-snapshot; keep the red ONLY if the leak is STILL present. Transient
+    # churn clears within the window; a genuinely leaked, agent-less tab persists and re-trips. The
+    # settle delay is HERD_LEAKGUARD_SETTLE_SECS (default 4s; set 0 in hermetic tests to skip the wait).
+    _hk_settle="${HERD_LEAKGUARD_SETTLE_SECS:-4}"
+    case "$_hk_settle" in ''|*[!0-9]*) _hk_settle=4 ;; esac
+    [ "$_hk_settle" -gt 0 ] && sleep "$_hk_settle"
+    _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
+    _hk_leak="$(_hk_leak_delta "$_hk_orphans_before" "$_hk_orphans_after")"
+  fi
   if [ -n "$_hk_leak" ]; then
     if [ -n "$ONELINE" ]; then
       echo "tab-leak-guard: suite leaked an orphan tab into the live workspace — $_hk_leak"
