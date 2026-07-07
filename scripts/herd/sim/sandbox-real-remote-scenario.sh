@@ -16,6 +16,13 @@
 # it did, an unauthenticated/absent gh makes the real path SKIP instead of reaching out (proven by
 # tests/test-sandbox-real-remote.sh's guard case).
 #
+# DELETE-SCOPE PREFLIGHT. gh's default token grant (gist/read:org/repo) does NOT include `delete_repo`,
+# so a naive run would CREATE the disposable repo and only discover at teardown that it cannot delete it
+# — a guaranteed leftover + red run on an env limitation. Before `gh repo create`, we probe the token
+# scopes and, when `delete_repo` is definitively absent, FAIL up front creating NOTHING, naming the exact
+# remedy: `gh auth refresh -h github.com -s delete_repo`. (The loud-leftover backstop below still guards
+# against scope loss mid-run.)
+#
 # GUARANTEED CLEANUP (incl. failure paths). A disposable repo on a live account MUST NEVER be stranded:
 #   • an EXIT/INT/TERM trap runs `gh repo delete` on the provisioned repo no matter how we exit;
 #   • if deletion FAILS, we emit a LOUD warning naming the repo and append it to a stable leftover log
@@ -160,6 +167,26 @@ real_remote_available() {
   gh auth status >/dev/null 2>&1       || return 1
 }
 
+# delete_repo_scope_probe — PREFLIGHT the ability to DELETE a repo BEFORE we create one. gh's default
+# grant is gist/read:org/repo — it does NOT include `delete_repo`. Without this probe we'd create the
+# disposable repo and only discover at teardown that we cannot delete it: a guaranteed leftover + a red
+# run on an env limitation. We read the token scopes off `gh auth status` (which prints a
+# "Token scopes: '…', '…'" line) and classify:
+#   return 0 → delete_repo is present (safe to provision)
+#   return 1 → a scopes line exists but delete_repo is ABSENT (definitively unsafe — fail up front)
+#   return 2 → no scopes line found (e.g. a fine-grained token exposes no classic scopes) → indeterminate;
+#              proceed and let the loud-leftover teardown backstop guard against a strand.
+delete_repo_scope_probe() {
+  local out line
+  out="$(gh auth status 2>&1 || true)"
+  line="$(printf '%s\n' "$out" | grep -iE 'Token scopes:' | head -n1)"
+  [ -n "$line" ] || return 2
+  case "$line" in
+    *delete_repo*) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 printf '%s══ Sandbox REAL-REMOTE scenario: %s (remote=%s) ══%s\n' "$c_bold" "$SCENARIO" "$REMOTE" "$c_rst"
 printf '  artifacts: %s\n' "$ART"
@@ -240,26 +267,43 @@ GH
 else
   # ══ REAL EPHEMERAL GITHUB TIER (opt-in) ════════════════════════════════════════════════════════
   REAL_RAN=true
-  ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)"
-  REPO_NAME="${REPO_PREFIX}-${ts}-$$"
-  owner="$(gh api user --jq .login 2>/dev/null || true)"
-  step provision "provision a DISPOSABLE private repo ($REPO_NAME) and push the fixture"
-  if [ -z "$owner" ]; then
-    checkpoint remote_provisioned fail "could not resolve gh account (gh api user)"
-  elif gh repo create "$owner/$REPO_NAME" --private --disable-issues --disable-wiki >/dev/null 2>&1; then
-    REPO_SLUG="$owner/$REPO_NAME"; REPO_CREATED=true
-    info "created disposable repo: $REPO_SLUG (private)"
-    # Push main + the builder branch to the live remote using gh's git credentials.
-    push_url="$(gh repo view "$REPO_SLUG" --json url --jq .url 2>/dev/null).git"
-    git -C "$REPO" remote add origin "$push_url" 2>/dev/null || git -C "$REPO" remote set-url origin "$push_url"
-    if git -C "$REPO" push -q -u origin main 2>/dev/null \
-       && git -C "$REPO" push -q origin "$BUILDER_BRANCH" 2>/dev/null; then
-      checkpoint remote_provisioned pass "created $REPO_SLUG and pushed main + $BUILDER_BRANCH to the live remote"
-    else
-      checkpoint remote_provisioned fail "repo created ($REPO_SLUG) but push failed (repo will still be cleaned up)"
-    fi
+
+  # ── PREFLIGHT: the token must be able to DELETE the repo BEFORE we create it ──────────────────
+  # gh's default grant (gist/read:org/repo) lacks `delete_repo`, so a naive run creates the disposable
+  # repo and only fails at teardown — a guaranteed leftover on a live account. Probe up front and, when
+  # the scope is definitively absent, fail here CREATING NOTHING and name the exact remedy.
+  step preflight "preflight the delete_repo scope BEFORE creating anything (gh's default grant lacks it)"
+  delete_repo_scope_probe; _scope_rc=$?
+  if [ "$_scope_rc" -eq 1 ]; then
+    checkpoint delete_repo_scope fail "gh token lacks the 'delete_repo' scope — refusing to provision (creating it now would strand a repo we cannot delete). Grant it and retry: gh auth refresh -h github.com -s delete_repo"
+    checkpoint remote_provisioned skip "no delete_repo scope — nothing was provisioned (see delete_repo_scope)"
   else
-    checkpoint remote_provisioned fail "gh repo create failed for $owner/$REPO_NAME"
+    if [ "$_scope_rc" -eq 2 ]; then
+      checkpoint delete_repo_scope pass "delete_repo scope not determinable from gh auth status (e.g. a fine-grained token) — proceeding; the loud-leftover teardown backstop still guards against a strand"
+    else
+      checkpoint delete_repo_scope pass "gh token carries the delete_repo scope — safe to provision a disposable repo"
+    fi
+    ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)"
+    REPO_NAME="${REPO_PREFIX}-${ts}-$$"
+    owner="$(gh api user --jq .login 2>/dev/null || true)"
+    step provision "provision a DISPOSABLE private repo ($REPO_NAME) and push the fixture"
+    if [ -z "$owner" ]; then
+      checkpoint remote_provisioned fail "could not resolve gh account (gh api user)"
+    elif gh repo create "$owner/$REPO_NAME" --private --disable-issues --disable-wiki >/dev/null 2>&1; then
+      REPO_SLUG="$owner/$REPO_NAME"; REPO_CREATED=true
+      info "created disposable repo: $REPO_SLUG (private)"
+      # Push main + the builder branch to the live remote using gh's git credentials.
+      push_url="$(gh repo view "$REPO_SLUG" --json url --jq .url 2>/dev/null).git"
+      git -C "$REPO" remote add origin "$push_url" 2>/dev/null || git -C "$REPO" remote set-url origin "$push_url"
+      if git -C "$REPO" push -q -u origin main 2>/dev/null \
+         && git -C "$REPO" push -q origin "$BUILDER_BRANCH" 2>/dev/null; then
+        checkpoint remote_provisioned pass "created $REPO_SLUG and pushed main + $BUILDER_BRANCH to the live remote"
+      else
+        checkpoint remote_provisioned fail "repo created ($REPO_SLUG) but push failed (repo will still be cleaned up)"
+      fi
+    else
+      checkpoint remote_provisioned fail "gh repo create failed for $owner/$REPO_NAME"
+    fi
   fi
 fi
 

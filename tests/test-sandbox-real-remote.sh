@@ -123,6 +123,46 @@ grep -qi 'not authenticated\|nothing to do' "$T/sweep.out" \
 [ ! -s "$CANARY" ] || fail "(D) --sweep must not create repos"
 echo "PASS (D) --sweep clean no-op without authenticated gh"
 
+# ── (F) AUTHENTICATED-BUT-MISSING-SCOPE — the delete_repo preflight refuses to provision ──────────
+# A fake gh that IS authenticated but whose token scopes LACK delete_repo (gh's default grant). The
+# scenario must PREFLIGHT the scope BEFORE `gh repo create`, FAIL up front creating NO repo (canary
+# stays empty), and surface the exact remedy — so an env limitation can never strand a live repo.
+BIN2="$T/bin-noscope"; mkdir -p "$BIN2"
+CANARY2="$T/repo-create-canary-noscope.log"; : > "$CANARY2"
+cat > "$BIN2/gh" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "auth status")
+    # authenticated (exit 0), but the token scopes intentionally omit delete_repo
+    cat >&2 <<'STATUS'
+github.com
+  ✓ Logged in to github.com account tester (keyring)
+  - Token scopes: 'gist', 'read:org', 'repo'
+STATUS
+    exit 0 ;;
+  "repo create") printf '%s\n' "\$*" >> "$CANARY2"; exit 0 ;;   # canary: MUST never be hit
+  "api user") echo tester ;;
+esac
+exit 0
+EOF
+chmod +x "$BIN2/gh"
+ARTF="$T/noscope"
+PATH="$BIN2:$PATH" SANDBOX_REAL_REMOTE=1 \
+  bash "$SCENARIO" --artifacts "$ARTF" >"$T/noscope.out" 2>&1
+rcF=$?
+SCF="$ARTF/scorecard.json"
+[ -f "$SCF" ] || fail "(F) scorecard.json not emitted at $SCF"
+[ "$rcF" -eq 1 ]                                        || fail "(F) missing-scope run must exit 1 (fail), got $rcF"$'\n'"$(cat "$T/noscope.out")"
+[ "$(sc "$SCF" result)" = "fail" ]                     || fail "(F) result should be fail (got $(sc "$SCF" result))"
+[ "$(cp_status "$SCF" delete_repo_scope)" = "fail" ]   || fail "(F) delete_repo_scope checkpoint should fail (got $(cp_status "$SCF" delete_repo_scope))"
+[ "$(sc "$SCF" repo_created)" = "False" ]              || fail "(F) no repo may be created without the delete_repo scope"
+# THE GUARD: the preflight fires BEFORE any create → the canary stays empty.
+[ ! -s "$CANARY2" ] || fail "(F) GUARD BREACH: provisioned a repo without delete_repo scope:"$'\n'"$(cat "$CANARY2")"
+# The exact remedy must be surfaced to the operator.
+grep -q 'gh auth refresh -h github.com -s delete_repo' "$T/noscope.out" \
+  || fail "(F) missing the exact remedy line (gh auth refresh -h github.com -s delete_repo)"
+echo "PASS (F) authenticated-but-missing-scope → preflight fails up front, creates nothing, names the remedy"
+
 # ── (E) HERMETIC — nothing leaked into the real repo tree by any path ────────────────────────────
 NOW_STATUS="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sort || true)"
 NEW_ENTRIES="$(comm -13 <(printf '%s\n' "$BASELINE_STATUS") <(printf '%s\n' "$NOW_STATUS") | grep -v '^$' || true)"
