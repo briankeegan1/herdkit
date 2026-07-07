@@ -81,6 +81,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `driver.sh` → `herd-config.sh`
 - `healthcheck.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `theme.sh`
+- `herd-claim.sh` → `journal.sh`
 - `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
 - `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
@@ -89,7 +90,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `research-get.sh` → `herd-config.sh`
 - `research-step.sh` → `herd-config.sh`
 - `research.sh` → `driver.sh`, `herd-config.sh`
-- `scribe-step.sh` → `herd-config.sh`
+- `scribe-step.sh` → `herd-config.sh`, `journal.sh`
 - `scribe.sh` → `driver.sh`, `herd-config.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
