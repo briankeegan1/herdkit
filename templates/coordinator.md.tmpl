@@ -88,7 +88,9 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 1. List the 🔜 items and let the user pick one (AskUserQuestion).
 2. Derive a short **kebab-case slug** (e.g. "Card CSV importer" → `card-csv-importer`). Confirm.
-3. Spawn the sub-agent — pick the lane:
+3. **Before you spawn**, run the *pre-spawn impact/conflict analysis* below if graphify is available
+   on this machine — it reads whether the candidate's file surface collides with work already in
+   flight so you can sequence instead of spawning into a conflict. Then pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
      bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
@@ -121,6 +123,45 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `{{BACKLOG_FILE}}`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
+
+### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
+
+Before spawning a builder — and periodically while several are in flight — check whether the
+candidate item's file surface **overlaps** work already underway, so you can *sequence* colliding
+items instead of spawning them into a merge conflict. This is the **coordinator-side third leg** of
+the graphify integration: `CONTEXT_PROVISION=codemap` grounds each *builder* in the committed
+`docs/codemap.md`, `MCP_PROVISION=graphify-mcp` gives a *builder* the graphify MCP tools, and this
+move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no Claude quota).
+
+1. **Resolve the binary, fail soft.** graphify is machine-local (PyPI `graphifyy`, usually at
+   `~/.local/bin/graphify`). Resolve it from `GRAPHIFY_BIN` in `.herd/config` — a **machine-scoped**
+   key, so set it per-machine with `herd config set GRAPHIFY_BIN <path>` (it routes to the gitignored
+   `.herd/config.local`, never the committed baseline) — falling back to `graphify` on `PATH`. If it
+   does not resolve (`command -v` fails), **skip this analysis silently**: no note, no warning, no red
+   row. It is an optional accelerator, and a missing tool is never an error — spawn as you normally
+   would.
+
+2. **Rebuild the graph LLM-free.** From `{{PROJECT_ROOT}}` run `"$GRAPHIFY_BIN" update --no-cluster`
+   — it writes `graphify-out/graph.json` (gitignored) with **zero** model calls, so it is cheap to
+   re-run on every spawn or periodic tick.
+
+3. **Cross the file surfaces.** For each in-flight worktree (`git worktree list`), take its changed
+   files (`git -C <worktree> diff --name-only {{DEFAULT_BRANCH}}`) and intersect: (a) each worktree's
+   set against every other worktree's, and (b) all of them against the candidate item's *likely* file
+   surface (the files the item names, plus what `docs/codemap.md` maps its subsystem to). `graph.json`
+   adds *within-file* structure — which symbols in a shared file each side touches — to sharpen a
+   same-file hit.
+
+4. **Sequence or warn.** On a real overlap, prefer to **hold the colliding candidate** until the
+   in-flight worktree merges, or spawn it with an explicit note in the task so the builder expects a
+   rebase. Non-overlapping items spawn freely in parallel.
+
+**Honest scope — file-level only.** graphify's bash **cross-file call** resolution is weak (measured
+2026-07-06: **0** cross-file call links among the big engine scripts; the ~136 repo-wide cross-file
+links are mostly imports/`contains`, not calls). Trust this for **file-level overlap detection and
+within-file structure only** — do NOT treat it as a cross-script call graph. When two items touch
+disjoint files it will not surface a call-level coupling between them; fall back to `docs/codemap.md`
+(who-sources-whom) and your own read for that.
 
 ### Reconcile the backlog after a cutover / extraction / rename PR lands
 
