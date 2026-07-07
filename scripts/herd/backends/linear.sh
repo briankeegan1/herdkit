@@ -48,6 +48,27 @@ _linear_require_curl() {
     }
 }
 
+# _backend_tw_journal — HERD-85 tracker-write attribution. Emit ONE journal event per tracker STATE
+# WRITE so `herd log | grep tracker_write` answers "which component moved <ref> to <state> on <pr>" in
+# one line — the record that did NOT exist when HERD-67/HERD-69 showed In Progress after their PRs
+# merged and diagnosing it needed Linear-history + transcript archaeology. Attribution is the
+# HERD_COMPONENT the caller set (claim|scribe|reconcile), defaulting to 'manual' for a hand-run backend
+# op. FAIL-SOFT by contract: journal_append is itself best-effort, and when journal.sh was never
+# sourced into this context (so journal_append is undefined) this is a silent no-op — a journal problem
+# must NEVER block or alter the state write (ZERO gate behavior change).
+# Args: <ref> <requested-state> <result> [pr]   (pr falls back to $HERD_TW_PR when the arg is omitted).
+_backend_tw_journal() {
+    command -v journal_append >/dev/null 2>&1 || return 0
+    local ref="$1" requested="$2" result="$3" pr="${4:-${HERD_TW_PR:-}}"
+    if [ -n "$pr" ]; then
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend linear result "$result" pr "$pr"
+    else
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend linear result "$result"
+    fi
+}
+
 _linear_gql() {
     # The one HTTP entry point. $1 = GraphQL query/mutation text; $2 = JSON variables (optional).
     # Builds the {"query","variables"} envelope with python3 (so titles/bodies with quotes or
@@ -221,6 +242,9 @@ print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" 
     else
         _BACKEND_RESULT="DONE"
     fi
+    # HERD-85: journal the ship as a tracker_write (requested 'shipped', with the PR link) so the
+    # component that closed the item is attributable in one `herd log` line. Fail-soft.
+    _backend_tw_journal "$slug" shipped "$_BACKEND_RESULT" "$pr"
 }
 
 _linear_state_type_for() {
@@ -378,6 +402,9 @@ EOF
         echo "linear backend: issueUpdate for '$ref' → '$want' was not confirmed (success≠true) — state left unresolved for retry (skipping, not filing)" >&2
         _BACKEND_RESULT="NOCHANGE"
     fi
+    # HERD-85: journal the write we just attempted (result = the verified outcome) so attribution is a
+    # one-line `herd log` lookup instead of transcript archaeology. Fail-soft; never affects the result.
+    _backend_tw_journal "$ref" "$want" "$_BACKEND_RESULT"
 }
 
 _backend_list_open() {
@@ -611,7 +638,7 @@ print(json.dumps({"id": os.environ["ID"], "assignee": os.environ["A"]}))')" >/de
 print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
     fi
     # CLAIM-VERIFY: re-read the assignee and confirm the claim landed on us (not a racer).
-    if ! _linear_issue_query "$ref" 'assignee { id name }'; then _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"; return 0; fi
+    if ! _linear_issue_query "$ref" 'assignee { id name }'; then _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"; _backend_tw_journal "$ref" in-progress CLAIMED; return 0; fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
     IFS=$'\t' read -r assignee_id assignee_name <<EOF
 $(printf '%s' "$resp" | python3 -c 'import sys, json
@@ -625,5 +652,7 @@ EOF
         _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${assignee_name:-another operator}"
     else
         _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"
+        # HERD-85: a claim moves the issue into a started (in-progress) state — journal that write.
+        _backend_tw_journal "$ref" in-progress CLAIMED
     fi
 }

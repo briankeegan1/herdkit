@@ -863,7 +863,7 @@ sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 
 # NOCHANGE/no-match} returns non-zero so the caller falls back to the fuzzy scribe path — this is what
 # guarantees the ref-less / file-backend behavior never regresses.
 _reconcile_via_ref() {
-  local ref="$1" _bdir _bfile _secrets result
+  local ref="$1" pr="${2:-}" _bdir _bfile _secrets result
   _bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
   _bfile="$_bdir/${SCRIBE_BACKEND:-file}.sh"
   [ -f "$_bfile" ] || return 1
@@ -875,6 +875,10 @@ _reconcile_via_ref() {
     . "$_bfile" 2>/dev/null || exit 1
     command -v _backend_update_state >/dev/null 2>&1 || exit 1
     cd "$MAIN" 2>/dev/null || true
+    # HERD-85: attribute this explicit-ref state write to the 'reconcile' component and carry the
+    # merged PR into the tracker_write event (journal_append is inherited from agent-watch's top-level
+    # source of journal.sh; the backend's _backend_tw_journal reads these two env vars).
+    export HERD_COMPONENT="reconcile" HERD_TW_PR="$pr"
     _BACKEND_RESULT=""
     _backend_update_state "$ref" done >/dev/null 2>&1 || true
     printf '%s' "$_BACKEND_RESULT"
@@ -902,7 +906,7 @@ reconcile_backlog() {
   # back to today's fuzzy scribe enqueue — so ref-less PRs behave EXACTLY as before. Journal which
   # path resolved so a drift audit can tell explicit-ref links from fuzzy ones.
   rb_ref="$(_reconcile_pr_ref "$rb_pr")"
-  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref"; then
+  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref" "$rb_pr"; then
     journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution explicit-ref
     return 0
   fi
