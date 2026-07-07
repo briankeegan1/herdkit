@@ -253,6 +253,33 @@ _herd_doctor_soft() {
   fi
 }
 
+# _herd_soft_dep_startup_notice — OPT-IN proactive soft-dep reminder shown once on control-room
+# startup (herd reload / coordinator launch). Gated behind the DOCTOR_STARTUP_HINT config key
+# (HERD-45): default/unset "off" prints NOTHING, so every startup path is byte-identical unless the
+# operator turns it on. When "on", print one DIM line per MISSING soft dep — each naming the single
+# feature it degrades — then a dim pointer to `herd doctor` for the install command. Never red, never
+# blocks (soft deps only degrade; the no-false-red rule). Mirrors the soft-dep set + degradation
+# notes the doctor itself reports (_herd_doctor_soft above). Callers source herd-config.sh first, so
+# the config value is already in the environment; any value other than "on" is treated as off. Always
+# returns 0 — a startup reminder must never fail the launch it rides on.
+_herd_soft_dep_startup_notice() {
+  [ "${DOCTOR_STARTUP_HINT:-off}" = "on" ] || return 0
+  local found=0 tool note
+  # tool|degradation-note — one named feature each, mirroring _herd_doctor_soft's notes below.
+  while IFS='|' read -r tool note; do
+    [ -n "$tool" ] || continue
+    command -v "$tool" >/dev/null 2>&1 && continue
+    printf '\033[2m\xe2\x9a\xa0 %s not found \xe2\x80\x94 %s\033[0m\n' "$tool" "$note"
+    found=1
+  done <<'SOFTDEPS'
+glow|backlog pane renders raw markdown instead of the pretty view
+shellcheck|healthcheck skips shell lint
+bats|healthcheck runs the *.sh test suite directly instead of via bats
+SOFTDEPS
+  [ "$found" -eq 1 ] && printf '\033[2m  run herd doctor for the install command\033[0m\n'
+  return 0
+}
+
 # _herd_doctor_recommend <tool> <os> <needed-for> — report a RECOMMENDED dep: ✓ (return 0) when
 # present, else a ⚠ warning naming what the tool is needed FOR plus a per-platform install hint, and
 # return 1 so the caller can bump its warn count (and skip any follow-on probe, e.g. herdr's JSON
