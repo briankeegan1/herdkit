@@ -159,6 +159,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`
 - `REVIEW_MODEL_CHEAP` → `agent-watch.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`
+- `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SHARE_LINKS` → `bin/herd`, `new-feature.sh`
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
