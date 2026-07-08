@@ -430,6 +430,16 @@ fi
 # is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
 : "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
 : "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
+# Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
+# before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
+# claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang
+# it cannot see. When armed, the watcher probes `claude --version` under a HARD timeout ONCE per tick
+# before dispatching; a timeout HOLDS review/refix for that tick with a loud row + a journal infra_event
+# (the doctor's own `claude responds` probe reports the same hang at diagnosis time). 0 = OFF (byte-inert;
+# no probe exec, no journal, behavior byte-identical); N>=1 = probe timeout in seconds. Consumed by
+# agent-watch.sh. Only a genuine timeout counts as a hang — a broken/absent claude is fail-soft (never
+# holds the queue). A small value like 5 is a conservative arm for unattended runs.
+: "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
