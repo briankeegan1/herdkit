@@ -155,6 +155,26 @@ assert any("acceptance suite" in r for r in v["abort_reasons"]), v
 PY
 ok
 
+# ── (4c) ABORT DOMINANCE: abort fires (suite_total==0) AND bare would otherwise dominate — both
+#    falsified and herdkit_thesis_confirmed MUST stay false (an aborted run is never a win/loss). ──
+# herd arm: suite_total=0 (abort #2), but both arms crossed a limit and bare beats herd on merges +
+# interventions with an equal (valid-float) escape rate, so bare_dominates would compute True.
+echo '{"suite_total":0,"escaped":0}' > herd-def-zero.json
+echo '{"merged_tasks":3,"usd_total":6.0,"human_interventions":0,"limit_events":2}' > bare-dom.json
+echo '{"suite_total":3,"escaped":0}' > bare-dom-def.json
+bash "$SCORER" --herd-journal herd.jsonl --herd-defects herd-def-zero.json \
+  --bare-ledger bare-dom.json --bare-defects bare-dom-def.json --out got-abort3.json >/dev/null \
+  || fail "(4c) scorer exited non-zero"
+python3 - got-abort3.json <<'PY' || fail "(4c) abort must suppress falsified/confirmed"
+import sys, json
+v = json.load(open(sys.argv[1]))["verdict"]
+assert v["abort"] is True, v
+assert v["falsified"] is False, v
+assert v["herdkit_thesis_confirmed"] is False, v
+assert any("acceptance suite" in r for r in v["abort_reasons"]), v
+PY
+ok
+
 # ── (5) input validation ──
 if bash "$SCORER" --herd-journal herd.jsonl --herd-defects herd-def.json \
      --bare-ledger bare.json --out got.json >/dev/null 2>&1; then

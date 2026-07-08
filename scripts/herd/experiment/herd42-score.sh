@@ -121,7 +121,10 @@ with jf:
         ev = o.get("event")
         if ev == "merge":
             # A merge event marks a change landed on main. Dedup by pr so a re-journaled merge of the
-            # same PR is never double-counted; a merge with no pr still counts as one landed change.
+            # SAME PR is never double-counted (every engine merge carries a pr — agent-watch.sh do_merge).
+            # A merge with NO pr is a degenerate case: it still counts as one landed change, but it
+            # cannot be deduped by identity (the fallback key is unique per occurrence), so two
+            # no-pr merge lines count as two. That is acceptable because the engine never emits one.
             merged_prs.add(str(o.get("pr", "__nopr_%d__" % len(merged_prs))))
         elif ev == "cost":
             try:
@@ -216,6 +219,12 @@ if herd_merged == 0 and bare_merged == 0:
 if not (herd_spanned or bare_spanned):
     abort_reasons.append("no usage-limit window was exercised by either arm — limit-park/auto-resume untested")
 
+# A None operand (an undefined per-merged cost / escape rate when an arm merged 0 tasks) makes both
+# comparisons False, so a zero-merge arm can never satisfy a domination test. Consequence: if herd
+# merged 0 and bare merged several, neither dominates → the verdict is "mixed" (falsified and
+# confirmed both false), not an intuitive herd loss. That matches the written protocol rules (§8) — a
+# 0-merge herd arm across a crossed window is left as a mixed result and read from the comparison
+# block — so we intentionally do NOT special-case it here.
 def le(a, b):
     return a is not None and b is not None and a <= b
 
@@ -238,8 +247,12 @@ herd_dominates = (
     le(herd_interventions, bare_interventions)
 )
 
-falsified = bool(both_spanned and bare_dominates)
-herd_confirmed = bool(both_spanned and herd_dominates and not bare_dominates)
+# An ABORTED run yields NO valid win/loss verdict (protocol §8: "An aborted run is NOT a herdkit
+# win or loss"). So BOTH flags are gated on abort_reasons being empty — otherwise abort=True and
+# falsified=True could co-occur (e.g. suite_total==0 aborts, yet defect_escape_rate = escaped/merged
+# is still a valid float, so bare_dominates could compute True on garbage). Gate first, decide second.
+falsified = bool(not abort_reasons and both_spanned and bare_dominates)
+herd_confirmed = bool(not abort_reasons and both_spanned and herd_dominates and not bare_dominates)
 
 verdict = {
     "both_spanned_limit_window": both_spanned,
