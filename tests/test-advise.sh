@@ -65,8 +65,12 @@ advise_via_cli() {
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   args=("$@")
+  # bash 3.2 (system /bin/bash) treats "${arr[@]}" of an EMPTY array as an unbound-variable
+  # error under `set -u` — which fired on the missing-question case (empty args) and killed this
+  # subshell with exit 1 before `herd advise` ran, masking its real exit-2 contract. The
+  # ${arr[@]+"${arr[@]}"} idiom expands to nothing when empty on every bash, restoring the probe.
   ( cd "$P" && PATH="$BIN:$PATH" HERD_CONFIG_FILE="$P/.herd/config" \
-      FAKE_MODE="$mode" env "${envs[@]}" bash "$HERD" advise "${args[@]}" )
+      FAKE_MODE="$mode" env ${envs[@]+"${envs[@]}"} bash "$HERD" advise ${args[@]+"${args[@]}"} )
 }
 
 # ── (A) arg parsing ──────────────────────────────────────────────────────────────────────────────
