@@ -123,7 +123,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`
-- `DEP_STALE_TTL` → `dep-watcher.sh`
+- `DEP_STALE_TTL` → `agent-watch.sh`, `dep-watcher.sh`
 - `DOCS_ONLY_GLOB` → `agent-watch.sh`
 - `DOCTOR_STARTUP_HINT` → `bin/herd`, `herd-preflight.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
