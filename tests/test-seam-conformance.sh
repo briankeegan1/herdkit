@@ -77,9 +77,9 @@ RAW_ANSI_PATTERN='\\(033|e|x1b|u001b)\['
 # raw-runtime: the lanes/consoles that still hard-wire herdr (driver-portability migration P2–P5).
 GF_raw_runtime="agent-watch.sh bin/herd coordinator.sh fleet.sh herd-feature.sh herd-resolve.sh herd-review.sh"
 
-# config-source: bin/herd reads a specific project's REVIEW_CHECKLIST inline; fleet.sh reads FOREIGN
-# projects' configs during fan-out (a legitimate cross-project read the current-project loader can't do).
-GF_config_source="bin/herd fleet.sh"
+# config-source: bin/herd reads a specific project's REVIEW_CHECKLIST inline. (fleet.sh's foreign-config
+# read is now routed through herd-config.sh's _herd_read_project_config, so it is no longer grandfathered.)
+GF_config_source="bin/herd"
 
 # raw-ansi: the view/preview panes + preflight that still emit raw escapes rather than theme.sh C_*.
 GF_raw_ansi="app-monitor.sh backlog-view.sh coordinator.sh herd-preflight.sh task-spec-view.sh"
