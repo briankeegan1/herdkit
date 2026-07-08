@@ -245,3 +245,16 @@ herd conformance <report|run>	unit	tests/test-conformance.sh
 MODEL_* ref <driver>:<model>	unit	tests/test-model-matrix.sh
 templates/models.tsv	unit	tests/test-model-matrix.sh
 herd config models	unit	tests/test-model-matrix.sh
+#
+# ── POSTURE MATRIX (HERD-153) — posture-qualified sim proofs ─────────────────────────────────
+# scripts/herd/sim/sandbox-posture-matrix.sh runs the SHIPPED gate loop under each canonical
+# posture (templates/postures.tsv) and emits ONE scorecard per posture; the hermetic driver is
+# tests/test-sandbox-posture-matrix.sh. Each row maps the capability a posture EXERCISES to that
+# matrix proof (the posture is noted alongside): the matrix is the posture-qualified proof that
+# these levers hold their invariant under their posture. An explicit nightly-candidate run, not a
+# per-merge gate.
+templates/postures.tsv	sim	tests/test-sandbox-posture-matrix.sh
+MERGE_POLICY	sim	tests/test-sandbox-posture-matrix.sh
+HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix.sh
+PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh
+.herd/steps.tsv	sim	tests/test-sandbox-posture-matrix.sh
