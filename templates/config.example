@@ -24,6 +24,13 @@ SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | cha
 # updates arriving with short idle gaps is drained by ONE scribe session instead of paying a fresh
 # MODEL_SCRIBE cold-start per gap. Default 0 → byte-identical to today; 90 is a good burst-sharing value.
 # SCRIBE_LINGER_SECS="90"
+# DRAINER_HEARTBEAT_TIMEOUT — drainer singleton liveness window in seconds (HERD-109). The scribe and
+# researcher drainers are per-project singletons; a same-named drainer already in `herdr agent list`
+# makes an enqueue short-circuit. A LISTED but HUNG drainer would then block the queue forever, so the
+# *-step.sh drainers heartbeat on every drain step and the enqueue path reclaims the singleton (spawns a
+# fresh drainer) when the heartbeat is staler than this. The queue's atomic per-request claim prevents
+# double-draining. Default 900 (15 min) → byte-identical to today; set 0 to disable liveness reclaim.
+# DRAINER_HEARTBEAT_TIMEOUT="900"
 SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
 # BACKLOG_VIEW_EXTRAS — VIEW-ONLY backlog-pane extra section. Default "" (off) → the pane output is

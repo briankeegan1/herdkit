@@ -169,6 +169,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic drainer singleton liveness (HERD-109) test passes" {
+  run bash "$REPO/tests/test-drainer-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic builder handoff summary (HERD-106) test passes" {
   run bash "$REPO/tests/test-handoff-summary.sh"
   [ "$status" -eq 0 ]
