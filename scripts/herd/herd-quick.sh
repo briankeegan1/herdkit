@@ -89,6 +89,10 @@ if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
   fi
 fi
+# Resolve an optionally runtime-qualified model ref (HERD-151) → bare model. Loud-fails at spawn time
+# on an unknown driver prefix; byte-identical for a bare model id. (Idempotent when this lane later
+# routes through herd_driver_start_agent under headless — a bare model resolves to itself.)
+MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if

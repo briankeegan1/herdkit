@@ -28,6 +28,110 @@ herd_driver_name() { printf '%s' "${HERD_DRIVER:-herdr-claude}"; }
 # _herd_driver_is_headless — success iff the active driver is the headless driver.
 _herd_driver_is_headless() { [ "$(herd_driver_name)" = "headless" ]; }
 
+# ── MODEL matrix: runtime-qualified model refs (HERD-151) ─────────────────────────────────────────
+# Every MODEL_* config key accepts an OPTIONALLY runtime-qualified ref '<driver>:<model>', so an
+# operator can pin a role's agent to a specific RUNTIME (a shipped templates/drivers/<name>.driver)
+# AND model, not just Claude. A BARE value (no '<driver>:' prefix) resolves to the DEFAULT driver with
+# the whole value as the model — so every existing bare-claude config is BYTE-IDENTICAL.
+#
+# WHY THIS SEAM (driver.sh, not herd-config.sh): a model ref binds a role to a RUNTIME, and the runtime
+# surface is exactly what PR #264's DRIVER_AGENT_* audit factored into the .driver files. The valid
+# driver set IS the templates/drivers/*.driver enumeration render_skill() already validates HERD_DRIVER
+# against; keeping the resolver here reuses that ground truth and sits it next to the exec bindings the
+# routing phases (HERD-150 P2–P5) will thread the resolved (driver,model) through. driver.sh is already
+# sourced by every spawn lane (feature/quick/resolve/review/scribe/research) + bin/herd, so one helper
+# covers the whole spawn surface. herd-config.sh only sets defaults and is sourced everywhere — a loud
+# resolver there would be the wrong altitude (config load must never abort; a spawn MUST, on a bad ref).
+#
+# CONTRACT EXCEPTION to driver.sh's fail-soft rule: an UNKNOWN driver prefix is a LOUD hard error
+# (stderr + non-zero), NEVER a silent claude fallback — that is the whole point of the format. This is
+# deliberate: fail-soft protects the pane/mux capabilities so a missing herdr never blocks the merge
+# gate; a misconfigured MODEL ref is an OPERATOR ERROR that must stop the spawn, not silently downgrade
+# to the wrong runtime. All the resolver functions are still pure (no side effects on source).
+
+# _herd_drivers_dir — the templates/drivers directory holding the shipped <name>.driver files, the
+# authoritative valid-driver set. HERD_DRIVERS_DIR overrides it (the same knob bin/herd + the driver
+# tests use). Resolved relative to THIS file (scripts/herd/driver.sh → ../../templates/drivers) so it
+# works in both the vendored dogfood layout and a global install where scripts/ and templates/ are
+# siblings under HERDKIT_HOME.
+_herd_drivers_dir() {
+  if [ -n "${HERD_DRIVERS_DIR:-}" ]; then printf '%s' "$HERD_DRIVERS_DIR"; return 0; fi
+  local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || true)"
+  printf '%s/../../templates/drivers' "$here"
+}
+
+# herd_driver_known <name> — success iff <name> is a shipped driver (a templates/drivers/<name>.driver
+# file exists). The valid-driver oracle the qualified-ref resolver checks a '<driver>:' prefix against.
+herd_driver_known() {
+  local name="${1:-}" dir
+  [ -n "$name" ] || return 1
+  dir="$(_herd_drivers_dir)"
+  [ -f "$dir/$name.driver" ]
+}
+
+# _herd_known_drivers — space-separated list of the shipped driver names (for the loud error message),
+# or '<none>' when the drivers dir cannot be read.
+_herd_known_drivers() {
+  local dir f out=""; dir="$(_herd_drivers_dir)"
+  if [ -d "$dir" ]; then
+    for f in "$dir"/*.driver; do
+      [ -e "$f" ] || continue
+      f="${f##*/}"; out="${out:+$out }${f%.driver}"
+    done
+  fi
+  printf '%s' "${out:-<none>}"
+}
+
+# herd_model_resolve <ref> — resolve an optionally runtime-qualified MODEL_* value into its concrete
+# driver + model. On success echoes two TAB-separated tokens "<driver>\t<model>" and returns 0:
+#   • BARE (no colon)                → "<default-driver>\t<ref>"  (herd_driver_name; byte-identical)
+#   • '<known-driver>:<model>'       → "<driver>\t<model>"        (split on the FIRST colon)
+#   • EMPTY ref                      → "<default-driver>\t"        (empty model = no --model; unchanged)
+# On an UNKNOWN driver prefix, or a '<known-driver>:' with an EMPTY model, it prints a LOUD one-line
+# error to stderr and returns 1 — never a silent fallback. Splitting on the FIRST colon lets the model
+# id itself contain colons (e.g. a qualified 'ollama:llama3:8b' → driver ollama, model 'llama3:8b').
+herd_model_resolve() {
+  local ref="${1:-}"
+  case "$ref" in
+    *:*) ;;                                              # candidate qualified ref (has a colon)
+    *) printf '%s\t%s' "$(herd_driver_name)" "$ref"; return 0 ;;   # bare (incl. empty) → default driver
+  esac
+  local drv="${ref%%:*}" mdl="${ref#*:}"
+  if ! herd_driver_known "$drv"; then
+    printf '❌ herd: MODEL ref %s names an unknown runtime driver %s — no templates/drivers/%s.driver. Known drivers: %s. Use a bare model (default driver) or a known <driver>:<model> ref; a bad ref never silently falls back to claude.\n' \
+      "'$ref'" "'$drv'" "$drv" "$(_herd_known_drivers)" >&2
+    return 1
+  fi
+  if [ -z "$mdl" ]; then
+    printf "❌ herd: MODEL ref %s has an empty model after the '%s:' driver prefix — write %s or a bare model id.\n" \
+      "'$ref'" "$drv" "'$drv:<model>'" >&2
+    return 1
+  fi
+  printf '%s\t%s' "$drv" "$mdl"
+}
+
+# herd_model_for_spawn <ref> — the LANE convenience: resolve <ref> and echo ONLY the bare model to pass
+# to the runtime (e.g. `claude --model <model>`). An empty ref stays empty (no --model). On an unknown
+# driver / empty-model ref it prints the loud error (via herd_model_resolve) and returns 1, so a lane
+# aborts with `MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1` instead of spawning on a bad ref.
+# BYTE-IDENTICAL for every bare value: a bare model resolves to itself.
+herd_model_for_spawn() {
+  local ref="${1:-}" out
+  [ -n "$ref" ] || { printf ''; return 0; }
+  out="$(herd_model_resolve "$ref")" || return 1
+  printf '%s' "${out#*$'\t'}"
+}
+
+# herd_model_driver_for <ref> — echo just the resolved DRIVER for a ref (default driver for a bare
+# value). Fail-soft companion for callers that only want the runtime side and must not abort: an
+# unknown-driver ref echoes nothing and returns 1 (no loud message — herd_model_for_spawn owns the
+# loud path at spawn time). The routing phases (HERD-150 P2–P5) consume this to pick the runtime.
+herd_model_driver_for() {
+  local ref="${1:-}" out
+  out="$(herd_model_resolve "$ref" 2>/dev/null)" || return 1
+  printf '%s' "${out%%$'\t'*}"
+}
+
 # ── Headless detached-agent registry ─────────────────────────────────────────────────────────────
 # Panes-as-a-view means the headless driver needs its own liveness surface. Each builder slug gets a
 # directory under $WORKTREES_DIR/.herd/agents/<slug>/ holding:
@@ -510,6 +614,9 @@ herd_driver_focus_agent() {
 # list-agents can report its liveness. Returns 0 iff an agent was started.
 herd_driver_start_agent() {
   local slug="${1:-}" wt="${2:-}" model="${3:-}" flags="${4:-}" pointer="${5:-}" split="${6:-}"
+  # Resolve an optionally runtime-qualified model ref (HERD-151) → bare model. Loud-fails (never a
+  # silent claude fallback) on an unknown driver prefix; byte-identical for a bare value.
+  model="$(herd_model_for_spawn "$model")" || return 1
   if _herd_driver_is_headless; then
     _herd_headless_start_agent "$slug" "$wt" "$model" "$flags" "$pointer"
   else
@@ -600,6 +707,10 @@ herd_driver_launch_agent() {
     esac
   done
   [ -n "$sa_name" ] || { printf '⚠️  driver: launch-agent called with no name\n' >&2; return 1; }
+  # Resolve an optionally runtime-qualified model ref (HERD-151) → bare model, once, before either
+  # backend builds its argv. Loud-fails on an unknown driver prefix; byte-identical for a bare value
+  # (incl. the empty model the human seats / coordinator relaunch pass → no --model).
+  sa_model="$(herd_model_for_spawn "$sa_model")" || return 1
 
   if _herd_driver_is_headless; then
     [ -d "$sa_cwd" ] || { printf '⚠️  headless: bad cwd for launch-agent %s (%s)\n' "$sa_name" "$sa_cwd" >&2; return 1; }
@@ -663,7 +774,9 @@ _herd_driver_cli() {
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
+    resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
+    model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 
