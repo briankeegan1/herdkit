@@ -24,6 +24,13 @@ SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | cha
 # updates arriving with short idle gaps is drained by ONE scribe session instead of paying a fresh
 # MODEL_SCRIBE cold-start per gap. Default 0 → byte-identical to today; 90 is a good burst-sharing value.
 # SCRIBE_LINGER_SECS="90"
+# DRAINER_HEARTBEAT_TIMEOUT — drainer singleton liveness window in seconds (HERD-109). The scribe and
+# researcher drainers are per-project singletons; a same-named drainer already in `herdr agent list`
+# makes an enqueue short-circuit. A LISTED but HUNG drainer would then block the queue forever, so the
+# *-step.sh drainers heartbeat on every drain step and the enqueue path reclaims the singleton (spawns a
+# fresh drainer) when the heartbeat is staler than this. The queue's atomic per-request claim prevents
+# double-draining. Default 900 (15 min) → byte-identical to today; set 0 to disable liveness reclaim.
+# DRAINER_HEARTBEAT_TIMEOUT="900"
 SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
 # BACKLOG_VIEW_EXTRAS — VIEW-ONLY backlog-pane extra section. Default "" (off) → the pane output is
@@ -161,6 +168,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 #            health-failed sha wastes one review run (cheap under REVIEW_ESCALATE_GLOB tiering).
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
+
+# INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
+# environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
+# an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After
+# INFRA_BREAKER_MAX in a row the breaker OPENS: new review/health dispatch stops, a loud
+# 'infra circuit open — environment looks dead' status row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds it goes HALF-OPEN for a SINGLE probe (a real verdict closes it, another
+# death re-opens it). CRITICAL: a real code BLOCK/PASS verdict proves the env is alive and RESETS the
+# counter — it never trips the breaker; only non-verdict deaths do. Ships OFF (byte-inert): default 0.
+# INFRA_BREAKER_MAX="0"          # 0 (default, off) | N>=1 = open after N consecutive INFRA (non-verdict) failures
+# INFRA_BREAKER_COOLDOWN="300"   # seconds OPEN before a single half-open probe retry (non-numeric → 300)
 
 # PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
 # a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.

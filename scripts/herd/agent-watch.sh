@@ -922,6 +922,147 @@ _dispatch_review() {
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
 }
 
+# ── INFRA-timeout circuit breaker (HERD-110) ─────────────────────────────────────────────────────
+# The watcher re-dispatches a review for a candidate every tick until a verdict lands. When the
+# ENVIRONMENT itself is dead (a claude exec-hang, an env failure, a reviewer that dies WITHOUT writing
+# a verdict), that re-dispatch burns cycles forever against a corpse — and across N PRs it multiplies.
+# This breaker tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — the RETRY/FAILED path,
+# NEVER a real PASS/BLOCK verdict) GLOBALLY across all PRs; after INFRA_BREAKER_MAX in a row it OPENS:
+# new review/health dispatch stops, a loud 'infra circuit open' row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds it goes HALF-OPEN for a SINGLE probe. A probe that yields ANY real
+# outcome CLOSES it (env recovered); another non-verdict death RE-OPENS it (fresh cooldown).
+#
+# CRITICAL — an INFRA failure (dead env) is NOT a code BLOCK verdict. A BLOCK proves the reviewer RAN
+# and produced a verdict, i.e. the env is ALIVE — so a BLOCK (exactly like a PASS) RESETS the
+# consecutive counter and never trips the breaker. Only a non-verdict death counts against it.
+#
+# BYTE-INERT BY DEFAULT: INFRA_BREAKER_MAX defaults to 0 (off). With it 0/empty/non-numeric every
+# function below is an immediate no-op — no ledger writes, no journal, no gating — so behavior is
+# byte-identical to before this feature whenever the key is unset.
+INFRA_BREAKER_STATE="$TREES/.agent-watch-infra-breaker"   # one line: "<state> <fails> <opened_epoch> <probe_pr>"
+
+# _breaker_enabled — true iff INFRA_BREAKER_MAX is a positive integer (opt-in). Default/0/garbage → off.
+_breaker_enabled() {
+  case "${INFRA_BREAKER_MAX:-0}" in
+    ''|*[!0-9]*|0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# _breaker_cooldown — INFRA_BREAKER_COOLDOWN seconds (empty/non-numeric → 300).
+_breaker_cooldown() {
+  case "${INFRA_BREAKER_COOLDOWN:-300}" in
+    ''|*[!0-9]*) printf '300' ;;
+    *) printf '%s' "$INFRA_BREAKER_COOLDOWN" ;;
+  esac
+}
+
+# _breaker_read — echo "<state> <fails> <opened> <probe_pr>" (state ∈ closed|open|probing). A missing
+# or legacy (short) ledger reads as "closed 0 0 -". This is the single source of truth read on every
+# gate/record call, so the state survives across ticks AND across the command-substitution subshells
+# the action pass calls _breaker_gate from (a file write persists; a shell variable would not).
+_breaker_read() {
+  local st="" fa="" op="" pb=""
+  if [ -s "$INFRA_BREAKER_STATE" ]; then
+    read -r st fa op pb < "$INFRA_BREAKER_STATE" 2>/dev/null || true
+  fi
+  printf '%s %s %s %s' "${st:-closed}" "${fa:-0}" "${op:-0}" "${pb:--}"
+}
+
+# _breaker_write <state> <fails> <opened> <probe_pr> — persist the one-line state (small truncating write).
+_breaker_write() {
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "${4:--}" > "$INFRA_BREAKER_STATE" 2>/dev/null || true
+}
+
+# _breaker_record_infra — one non-verdict INFRA death was just observed. Increment the consecutive
+# counter; on reaching INFRA_BREAKER_MAX (from CLOSED) OPEN with a fresh cooldown; any death while
+# already OPEN/probing re-arms the cooldown (a probe that died again). The trip/re-open is journaled
+# LOUDLY once per transition.
+_breaker_record_infra() {
+  _breaker_enabled || return 0
+  local st fa op pb now max
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  now="$(date +%s)"; max="$INFRA_BREAKER_MAX"
+  fa=$(( ${fa:-0} + 1 ))
+  if [ "$st" = "closed" ]; then
+    if [ "$fa" -ge "$max" ]; then
+      _breaker_write open "$fa" "$now" -
+      journal_append infra_breaker_open scope global fails "$fa" threshold "$max" cooldown "$(_breaker_cooldown)"
+    else
+      _breaker_write closed "$fa" "${op:-0}" -
+    fi
+  else
+    # Already open or mid-probe and it died again → re-arm the cooldown, drop any probe claim.
+    _breaker_write open "$fa" "$now" -
+    journal_append infra_breaker_reopen scope global fails "$fa" threshold "$max" cooldown "$(_breaker_cooldown)"
+  fi
+}
+
+# _breaker_record_ok — a REAL verdict landed (a PASS or a BLOCK): the env is provably alive. Reset the
+# consecutive counter; if the breaker was open/probing, CLOSE it and journal the recovery. Cheap no-op
+# (no ledger churn) when already closed with a zero counter.
+_breaker_record_ok() {
+  _breaker_enabled || return 0
+  local st fa op pb
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  if [ "$st" != "closed" ]; then
+    _breaker_write closed 0 0 -
+    journal_append infra_breaker_close scope global recovered_via verdict
+  elif [ "${fa:-0}" != "0" ]; then
+    _breaker_write closed 0 0 -
+  fi
+}
+
+# _breaker_gate <pr#> — per-candidate dispatch decision, called at the TOP of the action-pass loop
+# body (before any health/review dispatch). Echoes one token:
+#   PASS    — breaker closed → dispatch normally
+#   PROBE   — breaker half-open and THIS candidate is the single recovery probe → dispatch normally
+#   BLOCKED — breaker open (cooling down), or another candidate is already the in-flight probe
+# Half-open is entered by transitioning OPEN→probing once the cooldown elapses: the FIRST candidate to
+# reach the gate CLAIMS itself as the probe (its PR persisted in the ledger) and gets PROBE; every
+# other candidate reads state=probing and, not being the claimed PR, gets BLOCKED — so exactly ONE
+# probe runs. The claimed probe keeps getting PROBE across ticks (so it can dispatch on one tick and
+# COLLECT its verdict on the next) until the probe resolves: a real verdict CLOSEs the breaker, another
+# death RE-OPENs it. A probe that never resolves within a second cooldown window is re-claimed (self-heal
+# against a wedged probe). Byte-inert (always PASS) when disabled.
+_breaker_gate() {
+  _breaker_enabled || { printf PASS; return 0; }
+  local pr="${1:-}" st fa op pb now cd
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  if [ "$st" = "open" ] || [ "$st" = "probing" ]; then
+    now="$(date +%s)"; cd="$(_breaker_cooldown)"
+    if [ $(( now - ${op:-0} )) -ge "$cd" ]; then
+      # Cooldown elapsed (or a wedged probe aged out) → (re)claim THIS candidate as the single probe.
+      _breaker_write probing "$fa" "$now" "$pr"
+      printf PROBE; return 0
+    fi
+    # Still cooling down: only the already-claimed probe PR may dispatch; everyone else waits.
+    if [ "$st" = "probing" ] && [ -n "$pr" ] && [ "$pr" = "$pb" ]; then printf PROBE; return 0; fi
+    printf BLOCKED; return 0
+  fi
+  printf PASS
+}
+
+# _breaker_cooldown_remaining — seconds left before an OPEN breaker admits a probe (0 if elapsed / not
+# open). Purely for the status row.
+_breaker_cooldown_remaining() {
+  local st fa op pb now cd rem
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  [ "$st" = "open" ] || { printf '0'; return 0; }
+  now="$(date +%s)"; cd="$(_breaker_cooldown)"
+  rem=$(( ${op:-0} + cd - now ))
+  [ "$rem" -lt 0 ] && rem=0
+  printf '%s' "$rem"
+}
+
 # _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
 # machine, called once per tick for a candidate with no ledger verdict yet. Echoes one token:
 #   PASS | BLOCK — a result file was just collected; the verdict is now in the ledger
@@ -947,22 +1088,27 @@ _review_gate_step() {
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
+      # A real PASS verdict proves the env is ALIVE → reset the infra breaker's counter (HERD-110).
       # PASS may carry a HERD-105 'advisory:' tail (' — advisory: …'); a bare 'REVIEW: PASS' has
       # none. Either way the merge proceeds on PASS — the advisory notes are journalled (never
       # gate). Match both shapes; the record + echo are identical for a finding-free PASS.
       "REVIEW: PASS"|"REVIEW: PASS "*)
+        _breaker_record_ok
         record_review "$pr" "$sha" "PASS" "reviewer"
         _record_advisory_notes "$pr" "$sha" "$verdict_line"
         echo PASS; return 0 ;;
       "REVIEW: BLOCK"*)
+        _breaker_record_ok
         record_review "$pr" "$sha" "BLOCK" "reviewer"
         # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
         _persist_block_fields "$pr" "$sha" "$verdict_line"
         echo BLOCK; return 0 ;;
       *)
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
-        # verdict — never cached to the ledger, retried next poll with a cap.
+        # verdict — never cached to the ledger, retried next poll with a cap. Counts against the
+        # global INFRA circuit breaker (HERD-110): a run of these across PRs means the env is dead.
         record_review_retry "$pr" "$sha"
+        _breaker_record_infra
         if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
         return 0 ;;
     esac
@@ -972,11 +1118,13 @@ _review_gate_step() {
   if [ -f "$inflight" ]; then
     if _review_pid_live "$inflight"; then echo RUNNING; return 0; fi
     rm -f "$inflight" 2>/dev/null || true
-    # The poller died without a verdict. If its pane somehow survived (a herdr reload orphaned it), retire
-    # it now so the re-dispatch below never runs alongside a still-live reviewer (HERD-113). No-op if the
-    # pane is already gone; drops the registry row either way so the fresh dispatch starts clean.
+    # A reviewer that died WITHOUT writing a verdict is another non-verdict INFRA death (HERD-110).
+    # If its pane somehow survived (a herdr reload orphaned it), retire it now so the re-dispatch
+    # below never runs alongside a still-live reviewer (HERD-113). No-op if the pane is already
+    # gone; drops the registry row either way so the fresh dispatch starts clean.
     _retire_reviewer_pane "$pr" "$sha" orphaned-poller-dead
     record_review_retry "$pr" "$sha"
+    _breaker_record_infra
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
@@ -4146,6 +4294,22 @@ EOF
     already_merged "$prnum" "$slug" && continue
     sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+
+    # INFRA CIRCUIT BREAKER (HERD-110): when consecutive non-verdict reviewer deaths (a claude
+    # exec-hang / env failure — NEVER a real BLOCK verdict) have tripped the GLOBAL breaker, STOP
+    # dispatching new gates into a dead env. Byte-inert unless INFRA_BREAKER_MAX is set. A BLOCKED
+    # candidate is skipped entirely (no health, no review) with a loud row; a PROBE (half-open) falls
+    # through to dispatch normally as the single recovery probe.
+    case "$(_breaker_gate "$prnum")" in
+      BLOCKED)
+        DISPLAY[idx]="    ${C_RED}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}infra circuit open — environment looks dead · cooldown $(_breaker_cooldown_remaining)s${C_RESET}"
+        render
+        continue ;;
+      PROBE)
+        DISPLAY[idx]="    ${C_YELLOW}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}infra circuit half-open · probing environment…${C_RESET}"
+        render ;;
+      *) : ;;
+    esac
 
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
     # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap

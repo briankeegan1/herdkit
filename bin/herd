@@ -1234,31 +1234,60 @@ cmd_config_list() {
   else
     say "${c_bold}.herd/config${c_rst}  ($cfg)"
   fi
-  local line key val src
-  # Baseline keys, in file order; a key also assigned in the overlay shows the OVERRIDING local value.
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue ;; esac
-    printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
-    key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
-    if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg"; then
-      val="$(_config_file_value "$local_cfg" "$key")"; src="local"
-    else
-      val="$(_config_file_value "$cfg" "$key")"; src="baseline"
-    fi
-    _config_secret_key "$key" && val='********'
-    printf '  %-24s %-28s %s[%s]%s\n' "$key" "$val" "$c_dim" "$src" "$c_rst"
-  done < "$cfg"
-  # Keys present ONLY in the overlay (never assigned in the baseline).
+  # HERD-47 regression fix (Windows hang): resolve every key's effective value AND provenance in a
+  # SINGLE awk pass instead of the old per-key loop. That loop forked ~5 short-lived subprocesses per
+  # key (a `printf|grep`, a `sed`, an overlay `grep`, an awk `_config_file_value` in `$(...)`, and
+  # `_config_secret_key`) — ~300 processes over 65 keys, enough to deadlock Git-bash on Windows under
+  # the fork load, so `herd config list` printed ~10 keys then HUNG. awk reads .herd/config once (and
+  # .herd/config.local once, when present) and emits byte-identical rows: baseline keys in file order
+  # (a key also assigned in the overlay shows the OVERRIDING local value tagged [local]), then
+  # overlay-only keys tagged [local-only]. Value parsing mirrors _config_file_value (first assignment,
+  # one layer of surrounding double-quotes stripped) and masking mirrors _config_secret_key.
+  local prog='
+    function stripws(s) { sub(/^[[:space:]]+/, "", s); return s }
+    function keyof(s,   k) {
+      s = stripws(s)
+      if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) return ""
+      k = s; sub(/=.*/, "", k); return k
+    }
+    function valof(s, k,   v) {
+      s = stripws(s); v = substr(s, length(k) + 2)
+      if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+      return v
+    }
+    function is_secret(k) {
+      return (k ~ /SECRET/ || k ~ /TOKEN/ || k ~ /PASSWORD/ || k ~ /PASSWD/ || k ~ /APIKEY/ || k ~ /_KEY$/ || k ~ /_PAT$/)
+    }
+    # Overlay is passed FIRST (ARGV order): record each key it assigns, first assignment only.
+    FILENAME == localfile {
+      k = keyof($0)
+      if (k != "" && !(k in localval)) { localval[k] = valof($0, k); lorder[++ln] = k }
+      next
+    }
+    # Baseline: one row per key line, in file order; overridden keys show the local value tagged [local].
+    {
+      k = keyof($0)
+      if (k == "") next
+      if (!(k in basefirst)) basefirst[k] = valof($0, k)
+      baseseen[k] = 1
+      if (k in localval) { v = localval[k]; src = "local" } else { v = basefirst[k]; src = "baseline" }
+      if (is_secret(k)) v = "********"
+      printf "  %-24s %-28s %s[%s]%s\n", k, v, dim, src, rst
+    }
+    # Keys present ONLY in the overlay (never assigned in the baseline), in overlay file order.
+    END {
+      for (i = 1; i <= ln; i++) {
+        k = lorder[i]
+        if (k in baseseen) continue
+        v = localval[k]
+        if (is_secret(k)) v = "********"
+        printf "  %-24s %-28s %s[local-only]%s\n", k, v, dim, rst
+      }
+    }'
   if [ -f "$local_cfg" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in ''|'#'*) continue ;; esac
-      printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
-      key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
-      grep -qE "^[[:space:]]*$key=" "$cfg" && continue   # already shown above as a baseline override
-      val="$(_config_file_value "$local_cfg" "$key")"
-      _config_secret_key "$key" && val='********'
-      printf '  %-24s %-28s %s[local-only]%s\n' "$key" "$val" "$c_dim" "$c_rst"
-    done < "$local_cfg"
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="$local_cfg" "$prog" "$local_cfg" "$cfg"
+  else
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="" "$prog" "$cfg"
   fi
 }
 
