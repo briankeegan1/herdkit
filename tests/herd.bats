@@ -127,6 +127,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic coordinator progress-ledger (HERD-103) test passes" {
+  run bash "$REPO/tests/test-ledger.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-mode codemap test passes" {
   run bash "$REPO/tests/test-codemap-project.sh"
   [ "$status" -eq 0 ]
