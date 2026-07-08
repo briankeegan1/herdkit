@@ -33,10 +33,13 @@
 #   • Every step execution journals a `step_run` event carrying name + outcome (pass|warn|fail|held).
 #
 # ── hold=approve reuses the sha-keyed herd-approve ledger ─────────────────────────────────────────
-# Sequenced AFTER HERD-123 (PUSH_GATE=human), this reuses the SAME sha-keyed hold plumbing as the
-# push-gate / merge-approval holds: a per-slug ledger with awaiting/approved/released records, released
-# by herd-approve.sh, invalidated by a new commit (the sha changes). One live approve-hold per slug at
-# a time (a held step stops the pipeline), so approve <slug> unambiguously targets it.
+# Sequenced AFTER HERD-123 (PUSH_GATE=human), this reuses the SAME hold plumbing as the push-gate /
+# merge-approval holds: a per-slug ledger with awaiting/approved/released records, released by
+# herd-approve.sh, invalidated by a new commit (the sha changes). Records are keyed by (slug, sha,
+# STEP-NAME) — NOT (slug, sha) alone — so N distinct hold=approve steps at ONE sha each get their own
+# awaiting/approved/released triple and each requires its OWN approval (approving one never consumes
+# another's gate). Steps hold SEQUENTIALLY (a held step stops the pipeline), so at most one is live at a
+# time and approve <slug> unambiguously targets the current (earliest still-live) one.
 #
 # Dual-purpose, like the engine's other shared helpers: SOURCE it for the steps_* functions
 # (herd-approve.sh releases holds; agent-watch.sh runs the pre/post-merge seams; the lanes thread the
@@ -46,14 +49,14 @@
 #   . "$HERE/journal.sh"
 #   . "$HERE/steps.sh"
 #
-# ── Ledger + record layout (mirrors .agent-watch-push-holds so it parses identically) ─────────────
+# ── Ledger + record layout ─────────────────────────────────────────────────────────────────────
 # Ledger  $WORKTREES_DIR/.agent-watch-step-holds — append-only, one space-separated record per line,
-# sha-last:
-#     <epoch> awaiting <slug> <sha>     — a step with hold=approve is holding this sha
-#     <epoch> approved <slug> <sha>     — a human approved this exact sha (herd-approve.sh approve)
-#     <epoch> released <slug> <sha>     — the hold was released + the pipeline resumed past the step
-# Detail  $WORKTREES_DIR/.agent-watch-step-hold-<slug> — KEY=value metadata resume needs (rewritten
-# on each hold): the held step's name, seam (at), worktree dir, and sha.
+# STEP-last (so a step name never collides with the sha column):
+#     <epoch> awaiting <slug> <sha> <step>   — the hold=approve step <step> is holding this sha
+#     <epoch> approved <slug> <sha> <step>   — a human approved this exact (sha, step)
+#     <epoch> released <slug> <sha> <step>   — that hold was released + the pipeline resumed past <step>
+# Detail  $WORKTREES_DIR/.agent-watch-step-hold-<slug>-<step> — KEY=value metadata resume needs (one
+# file PER held step): the held step's name, seam (at), worktree dir, and sha.
 
 # The four legal seams, in pipeline order. The ONE source of truth every validator/runner checks.
 STEPS_SEAMS="post-build post-healthcheck pre-merge post-merge"
@@ -164,74 +167,92 @@ steps_builder_rule() {
 
 # ── hold=approve ledger (mirrors push-gate's .agent-watch-push-holds) ─────────────────────────────
 steps_hold_ledger() { [ -n "${WORKTREES_DIR:-}" ] || return 1; printf '%s' "$WORKTREES_DIR/.agent-watch-step-holds"; }
-steps_hold_detail() { [ -n "${WORKTREES_DIR:-}" ] || return 1; printf '%s' "$WORKTREES_DIR/.agent-watch-step-hold-$1"; }
+# _steps_detail_key <step> — filesystem-safe rendering of a step name for the per-step detail filename.
+_steps_detail_key() { local s="$1"; printf '%s' "${s//[^A-Za-z0-9._-]/_}"; }
+# steps_hold_detail <slug> <step> — the per-(slug,step) detail file. <step> is required so distinct
+# hold=approve steps at one sha never share (and clobber) a detail file.
+steps_hold_detail() { [ -n "${WORKTREES_DIR:-}" ] || return 1; printf '%s' "$WORKTREES_DIR/.agent-watch-step-hold-$1-$(_steps_detail_key "${2:-}")"; }
 
 _steps_epoch() { date +%s 2>/dev/null || echo 0; }
 _steps_worktree_sha() { git -C "$1" rev-parse HEAD 2>/dev/null || true; }
 
-# _steps_current <slug> — the sha of the latest 'awaiting' record for <slug> not yet 'released'. Empty
-# when there is no live hold. Last-write-wins, mirroring push-gate's _pg_current.
-_steps_current() {
+# _steps_live_hold <slug> — echo "<sha><TAB><step>" of the EARLIEST still-live approve-hold for <slug>
+# (an 'awaiting' record with no matching 'released' for the same sha+step), or empty. Steps hold
+# sequentially so at most one is live at a time; earliest-in-file-order is the one a human approves next.
+_steps_live_hold() {
   local slug="$1" ledger; ledger="$(steps_hold_ledger)" || return 0
   [ -f "$ledger" ] || return 0
-  local awaiting="" released="" state s sha
-  while read -r _ state s sha; do
+  local _ state s sha step released_keys=""
+  # Pass 1: collect the released (sha,step) keys for this slug.
+  while read -r _ state s sha step; do
     [ "$s" = "$slug" ] || continue
-    case "$state" in
-      awaiting) awaiting="$sha" ;;
-      released) released="$sha" ;;
-    esac
+    [ "$state" = "released" ] && released_keys="$released_keys|$sha $step|"
   done < "$ledger"
-  [ -n "$awaiting" ] || return 0
-  [ "$released" = "$awaiting" ] && return 0        # released ⇒ the hold is cleared
-  printf '%s' "$awaiting"
+  # Pass 2: the first awaiting whose (sha,step) is not in the released set is the live hold.
+  while read -r _ state s sha step; do
+    [ "$s" = "$slug" ] || continue
+    [ "$state" = "awaiting" ] || continue
+    case "$released_keys" in *"|$sha $step|"*) continue ;; esac
+    printf '%s\t%s' "$sha" "$step"
+    return 0
+  done < "$ledger"
+  return 0
+}
+
+# _steps_current <slug> — the sha of the earliest still-live hold for <slug>, or empty. (Step-agnostic
+# convenience over _steps_live_hold; the public probe below builds on it.)
+_steps_current() {
+  local lh; lh="$(_steps_live_hold "$1")" || return 0
+  [ -n "$lh" ] || return 0
+  printf '%s' "${lh%%$'\t'*}"
 }
 
 # steps_hold_awaiting_sha <slug> — PUBLIC single-slug probe: the sha this slug currently holds for
 # step approval, or empty. herd-approve.sh selects the step-approval path on a non-empty result.
 steps_hold_awaiting_sha() { _steps_current "$1"; }
 
-# steps_hold_is_approved <slug> <sha> — 0 iff an approval record exists for this exact sha.
+# steps_hold_is_approved <slug> <sha> <step> — 0 iff an approval record exists for this exact (sha,step).
 steps_hold_is_approved() {
   local ledger; ledger="$(steps_hold_ledger)" || return 1
-  grep -q "^[0-9]* approved $1 $2$" "$ledger" 2>/dev/null
+  grep -q "^[0-9]* approved $1 $2 $3$" "$ledger" 2>/dev/null
 }
-# steps_hold_is_released <slug> <sha> — 0 iff a released record exists for this exact sha.
+# steps_hold_is_released <slug> <sha> <step> — 0 iff a released record exists for this exact (sha,step).
 steps_hold_is_released() {
   local ledger; ledger="$(steps_hold_ledger)" || return 1
-  grep -q "^[0-9]* released $1 $2$" "$ledger" 2>/dev/null
+  grep -q "^[0-9]* released $1 $2 $3$" "$ledger" 2>/dev/null
 }
 
-# steps_hold_list — print every LIVE step-hold as: <slug> <sha> <step> <dir>. Skips holds whose latest
-# state is released. Used by herd-approve.sh `list`.
+# steps_hold_list — print every LIVE step-hold as: <slug> <sha> <step> <dir>. One row per slug (steps
+# hold sequentially, so a slug has at most one live hold). Skips released holds. Used by herd-approve.sh.
 steps_hold_list() {
   local ledger; ledger="$(steps_hold_ledger)" || return 0
   [ -f "$ledger" ] || return 0
-  local slugs slug sha detail dir step
+  local slugs slug lh sha step detail dir
   slugs="$(awk '{print $3}' "$ledger" 2>/dev/null | awk '!seen[$0]++')"
   while IFS= read -r slug; do
     [ -n "$slug" ] || continue
-    sha="$(_steps_current "$slug")" || true
-    [ -n "$sha" ] || continue
-    dir=""; step=""
-    detail="$(steps_hold_detail "$slug")" || true
-    if [ -f "$detail" ]; then
-      dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"
-      step="$(sed -n 's/^step=//p' "$detail" 2>/dev/null | head -1)"
-    fi
+    lh="$(_steps_live_hold "$slug")" || true
+    [ -n "$lh" ] || continue
+    sha="${lh%%$'\t'*}"; step="${lh##*$'\t'}"
+    dir=""
+    detail="$(steps_hold_detail "$slug" "$step")" || true
+    [ -f "$detail" ] && dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"
     printf '%s %s %s %s\n' "$slug" "$sha" "${step:-?}" "$dir"
   done <<EOF
 $slugs
 EOF
 }
 
-# _steps_hold_record <slug> <step> <at> <dir> <sha> — record the awaiting hold + its detail file.
-# Idempotent: re-recording the same live sha does not append a duplicate 'awaiting'.
+# _steps_hold_record <slug> <step> <at> <dir> <sha> — record the awaiting hold + its detail file, keyed
+# by (slug, sha, step). Idempotent + BOUNDED: at most ONE 'awaiting' row per (slug, sha, step) EVER —
+# whether still live OR already released (a released hold is terminal for that step; a new hold needs a
+# new commit ⇒ a new sha). That per-step ceiling keeps the ledger from growing across the watcher's
+# per-tick re-runs of the pre-merge seam, AND lets N distinct approve-steps at one sha each hold once.
 _steps_hold_record() {
   local slug="$1" step="$2" at="$3" dir="$4" sha="$5"
   local ledger detail tmp
   ledger="$(steps_hold_ledger)" || { echo "🛑 steps: WORKTREES_DIR unset — cannot record a hold." >&2; return 1; }
-  detail="$(steps_hold_detail "$slug")"
+  detail="$(steps_hold_detail "$slug" "$step")"
   tmp="$detail.tmp.$$"
   {
     printf 'sha=%s\n' "$sha"
@@ -241,55 +262,52 @@ _steps_hold_record() {
     printf 'dir=%s\n' "$dir"
   } > "$tmp" 2>/dev/null || { echo "🛑 steps: cannot write hold detail for '$slug'." >&2; return 1; }
   mv -f "$tmp" "$detail" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo "🛑 steps: cannot install hold detail for '$slug'." >&2; return 1; }
-  # Idempotent + BOUNDED: at most ONE 'awaiting' row per (slug, sha) EVER. Skip the append if an
-  # awaiting record for this EXACT sha already exists — whether still live OR already released. A
-  # released hold is CONSUMED (terminal for this sha; a new hold needs a new commit ⇒ a new sha), so
-  # never re-append after release — that is what keeps the ledger from growing unbounded across the
-  # watcher's per-tick re-runs of the pre-merge seam. grep (not _steps_current) so a degenerate empty
-  # sha still records on its first hold.
-  if grep -q "^[0-9]* awaiting $slug $sha$" "$ledger" 2>/dev/null; then
+  # grep (not _steps_live_hold) so a degenerate empty sha still records on its first hold for the step.
+  if grep -q "^[0-9]* awaiting $slug $sha $step$" "$ledger" 2>/dev/null; then
     return 0
   fi
-  printf '%s awaiting %s %s\n' "$(_steps_epoch)" "$slug" "$sha" >> "$ledger" 2>/dev/null \
+  printf '%s awaiting %s %s %s\n' "$(_steps_epoch)" "$slug" "$sha" "$step" >> "$ledger" 2>/dev/null \
     || { echo "🛑 steps: cannot append to the step-hold ledger." >&2; return 1; }
   command -v journal_append >/dev/null 2>&1 && journal_append step_hold_awaiting slug "$slug" step "$step" at "$at" sha "$sha" dir "$dir" || true
   return 0
 }
 
-# steps_hold_approve <slug> — record a human approval for <slug>'s current awaiting sha. Idempotent.
-# Echoes the approved sha (empty + non-zero when there is no live hold).
+# steps_hold_approve <slug> — record a human approval for <slug>'s CURRENT (earliest still-live) hold,
+# keyed by its (sha, step). Idempotent. Echoes the approved sha (empty + non-zero when no live hold).
 steps_hold_approve() {
-  local slug="$1" sha ledger
-  sha="$(_steps_current "$slug")" || true
-  [ -n "$sha" ] || { echo "steps: no live step-hold for '$slug' to approve." >&2; return 1; }
+  local slug="$1" lh sha step ledger
+  lh="$(_steps_live_hold "$slug")" || true
+  [ -n "$lh" ] || { echo "steps: no live step-hold for '$slug' to approve." >&2; return 1; }
+  sha="${lh%%$'\t'*}"; step="${lh##*$'\t'}"
   ledger="$(steps_hold_ledger)" || return 1
-  if ! steps_hold_is_approved "$slug" "$sha"; then
-    printf '%s approved %s %s\n' "$(_steps_epoch)" "$slug" "$sha" >> "$ledger" 2>/dev/null \
+  if ! steps_hold_is_approved "$slug" "$sha" "$step"; then
+    printf '%s approved %s %s %s\n' "$(_steps_epoch)" "$slug" "$sha" "$step" >> "$ledger" 2>/dev/null \
       || { echo "steps: cannot record approval for '$slug'." >&2; return 1; }
-    command -v journal_append >/dev/null 2>&1 && journal_append step_hold_approved slug "$slug" sha "$sha" || true
+    command -v journal_append >/dev/null 2>&1 && journal_append step_hold_approved slug "$slug" step "$step" sha "$sha" || true
   fi
   printf '%s' "$sha"
 }
 
 # steps_hold_release <slug> — the RESUME step herd-approve.sh runs after recording approval: verify the
-# hold is intact + approved for the CURRENT worktree HEAD, mark it released, then RESUME the pipeline —
-# re-running the held step's seam from the step AFTER the held one. FAIL-SOFT: a stale (new-commit),
-# corrupt, or unapproved hold refuses LOUDLY and resumes NOTHING. Returns the resumed seam's rc (0 when
-# the remaining steps pass or there is no watcher-driven seam to resume).
+# CURRENT (earliest still-live) hold is intact + approved for the CURRENT worktree HEAD, mark THAT
+# (sha, step) released, then RESUME the pipeline from the step AFTER the released one. A sha with several
+# approve-steps releases them ONE AT A TIME: resuming past step-a re-holds on step-b, and the next
+# approve targets step-b. FAIL-SOFT: a stale (new-commit), corrupt, or unapproved hold refuses LOUDLY
+# and resumes NOTHING. Returns the resumed seam's rc (0 when the remaining steps pass or there is none).
 steps_hold_release() {
   local slug="$1"
-  local sha detail step at dir head ledger
-  sha="$(_steps_current "$slug")" || true
-  if [ -z "$sha" ]; then
+  local lh sha step detail at dir head ledger
+  lh="$(_steps_live_hold "$slug")" || true
+  if [ -z "$lh" ]; then
     echo "🛑 steps: no live step-hold for '$slug' — nothing to release." >&2
     return 1
   fi
-  detail="$(steps_hold_detail "$slug")" || return 1
+  sha="${lh%%$'\t'*}"; step="${lh##*$'\t'}"
+  detail="$(steps_hold_detail "$slug" "$step")" || return 1
   if [ ! -f "$detail" ]; then
-    echo "🛑 steps: hold record for '$slug' is missing its detail file ($detail) — REFUSING to resume a corrupt hold." >&2
+    echo "🛑 steps: hold record for '$slug' step '$step' is missing its detail file ($detail) — REFUSING to resume a corrupt hold." >&2
     return 1
   fi
-  step="$(sed -n 's/^step=//p' "$detail" | head -1)"
   at="$(sed -n 's/^at=//p' "$detail" | head -1)"
   dir="$(sed -n 's/^dir=//p' "$detail" | head -1)"
   if [ -z "$step" ] || [ -z "$at" ]; then
@@ -305,17 +323,19 @@ steps_hold_release() {
       return 1
     fi
   fi
-  if ! steps_hold_is_approved "$slug" "$sha"; then
-    echo "🛑 steps: '$slug' (sha $sha) is not approved — run 'herd-approve.sh approve $slug' first." >&2
+  if ! steps_hold_is_approved "$slug" "$sha" "$step"; then
+    echo "🛑 steps: '$slug' step '$step' (sha $sha) is not approved — run 'herd-approve.sh approve $slug' first." >&2
     return 1
   fi
   ledger="$(steps_hold_ledger)" || return 1
-  if ! steps_hold_is_released "$slug" "$sha"; then
-    printf '%s released %s %s\n' "$(_steps_epoch)" "$slug" "$sha" >> "$ledger" 2>/dev/null || true
+  if ! steps_hold_is_released "$slug" "$sha" "$step"; then
+    printf '%s released %s %s %s\n' "$(_steps_epoch)" "$slug" "$sha" "$step" >> "$ledger" 2>/dev/null || true
     command -v journal_append >/dev/null 2>&1 && journal_append step_hold_released slug "$slug" step "$step" at "$at" sha "$sha" || true
   fi
   echo "▶️  steps: '$slug' step '$step' approved — resuming the $at pipeline past it…"
-  # Resume the remaining steps of that seam (the built-in gates already passed for this stage).
+  # Resume the remaining steps of that seam (the built-in gates already passed for this stage). If a
+  # LATER approve-step at this sha exists, the resume re-holds on it (return 20) and it needs its own
+  # approval — a sha with N approve-steps requires N approvals.
   steps_run_at "$at" --slug "$slug" ${dir:+--dir "$dir"} --sha "$sha" --resume-after "$step"
 }
 
@@ -396,18 +416,20 @@ steps_run_at() {
       [ "$name" = "$resume_after" ] && skipping=0   # resume with the step AFTER the held one
       continue
     fi
-    # An approve-hold is idempotent + resumable: check the ledger BEFORE (re-)executing.
+    # An approve-hold is idempotent + resumable: check the ledger for THIS (slug,sha,step) BEFORE
+    # (re-)executing. Every check is per-step so N approve-steps at one sha each gate independently.
     if [ "$hold" = "approve" ] && [ -n "$sha" ]; then
-      # RELEASED ⇒ this (slug,sha) hold was approved + CONSUMED: skip past it WITHOUT re-executing or
-      # re-recording. This branch — NOT the _steps_current gate below (which is empty once released,
-      # steps.sh _steps_current) — is what lets the watcher-owned seam proceed: do_merge re-runs
-      # steps_run_at pre-merge from the top every tick with no --resume-after, so the released hold must
-      # be recognised here or it re-executes and re-holds forever (the merge never lands).
-      if steps_hold_is_released "$slug" "$sha"; then
+      # RELEASED ⇒ THIS step's (slug,sha,step) hold was approved + CONSUMED: skip past it WITHOUT
+      # re-executing or re-recording. Keyed by step name — NOT (slug,sha) alone — so approving ONE
+      # approve-step never consumes a SIBLING approve-step's gate at the same sha. This branch is what
+      # lets the watcher-owned seam proceed: do_merge re-runs steps_run_at pre-merge from the top every
+      # tick with no --resume-after, so a released hold must be recognised here or it re-holds forever.
+      if steps_hold_is_released "$slug" "$sha" "$name"; then
         continue
       fi
-      # Still AWAITING for this exact sha ⇒ HELD, without re-running the step.
-      if [ "$(_steps_current "$slug")" = "$sha" ]; then
+      # Already AWAITING for this exact (slug,sha,step) ⇒ this step ran + held on an earlier pass ⇒ still
+      # HELD, without re-running the step (idempotent; keeps the ledger bounded to one awaiting per step).
+      if grep -q "^[0-9]* awaiting $slug $sha $name$" "$(steps_hold_ledger)" 2>/dev/null; then
         command -v journal_append >/dev/null 2>&1 && journal_append step_run name "$name" at "$seam" kind "$kind" slug "$slug" sha "$sha" outcome held || true
         return 20
       fi

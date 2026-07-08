@@ -465,14 +465,17 @@ fi
 # a throwaway fixture with its OWN step list (HERD_STEPS_FILE), a throwaway trees dir for the hold
 # ledger + journal, and HERD_CONFIG_FILE pointed at a non-existent path so herd-config.sh never walks up
 # into herdkit's OWN .herd/config. A fixture step list of THREE post-build steps — one blocking (on_fail
-# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Seven assertions: (A) the
+# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Eight assertions: (A) the
 # blocking step runs then the approve step HOLDS (the skill step has NOT run yet); (B) the hold surfaces
 # in herd-approve.sh list with the worktree path; (C) approve RELEASES + resumes, running the skill
 # step; (D) EXECUTION ORDER holds in the journal (block < approve < skill); (E) a FAILING block step
 # blocks its seam (a later step never runs); (F) an ABSENT step list is byte-identical (no journal, rc 0);
 # (G) the WATCHER-OWNED pre-merge seam: after approve, a FRESH steps_run_at pre-merge (what do_merge
 # re-runs every tick, no --resume-after) SKIPS the consumed hold (rc 0 ⇒ merge proceeds) and never
-# re-holds or re-appends an awaiting row (the #249 liveness/ledger-growth regression).
+# re-holds or re-appends an awaiting row (the #249 round-1 liveness/ledger-growth regression);
+# (H) TWO hold=approve steps at ONE sha gate INDEPENDENTLY — each holds on its own turn, approving the
+# first does NOT release the second, and the merge (rc 0) proceeds only after BOTH are approved (the
+# #249 round-2 per-sha-keying safety-rail-bypass regression).
 step pipeline-steps "steps.tsv stages — order, approve-hold + release, step_run journal, byte-identical off"
 ST_ENGINE="$HERE/.."
 if [ ! -f "$ST_ENGINE/steps.sh" ] || [ ! -f "$ST_ENGINE/herd-approve.sh" ]; then
@@ -616,6 +619,59 @@ else
     checkpoint pipeline_steps_merge_resume pass "approved pre-merge hold is CONSUMED: watcher re-tick returns 0 (merge proceeds), ledger stays at 1 awaiting row (bounded)"
   else
     checkpoint pipeline_steps_merge_resume fail "approved pre-merge hold not consumed by the watcher re-tick (rc1=$_stm_rc1 rc2=$_stm_rc2 rc3=$_stm_rc3 awaiting before/final=$_stm_await_before/$_stm_await_final)"
+  fi
+
+  # (H) TWO hold=approve steps at ONE sha gate INDEPENDENTLY — the per-sha-keying safety-rail-bypass
+  #     regression (review BLOCK on PR #249, round 2). Records keyed by (slug,sha) alone meant approving
+  #     step 1 consumed the sha's record so step 2's hold silently never fired — a merge that skips a
+  #     configured human gate. With per-(slug,sha,step) keying each approve-step must be approved on its
+  #     own. Fixture: two pre-merge hold=approve steps (check-a, check-b) around a final plain step.
+  ST_STEPS_2="$ART/st-steps-two.tsv"; ST_JN_2="$ART/st-journal-two.jsonl"; : > "$ST_JN_2"
+  ST_TREES_2="$ART/st-trees-two"; mkdir -p "$ST_TREES_2"
+  {
+    printf 'check-a\tpre-merge\techo check-a ran\tblock\tapprove\n'
+    printf 'check-b\tpre-merge\techo check-b ran\tblock\tapprove\n'
+    printf 'final-gate\tpre-merge\techo final-gate ok\tblock\tnone\n'
+  } > "$ST_STEPS_2"
+  st2_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES_2" \
+        HERD_STEPS_FILE="$ST_STEPS_2" JOURNAL_FILE="$ST_JN_2" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  _st2_hold="$ST_TREES_2/.agent-watch-step-holds"
+  _st2_ok=1
+  # H1: first pass HOLDS on check-a (rc 20); check-b has NOT held yet (independent, sequential).
+  _st2_rc1=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc1=$?
+  [ "$_st2_rc1" -eq 20 ] || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-a$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-b$' "$_st2_hold" 2>/dev/null && _st2_ok=0   # check-b must NOT be holding yet
+  # H2: approve check-a. It RELEASES check-a and resumes → check-b now HOLDS. Approving one must NOT
+  #     release the other: check-a released, check-b awaiting-but-NOT-released.
+  st2_env bash "$ST_ENGINE/herd-approve.sh" approve demo-two >/dev/null 2>&1
+  grep -q 'released demo-two .* check-a$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-b$'  "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'released demo-two .* check-b$'  "$_st2_hold" 2>/dev/null && _st2_ok=0   # check-b NOT released by approving check-a
+  # H3: the WATCHER RE-TICK (fresh pre-merge, no --resume-after) MUST still HOLD on check-b (rc 20) —
+  #     the merge does NOT proceed while a second gate is unapproved (before the fix this returned 0 and
+  #     the merge bypassed check-b).
+  _st2_rc2=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc2=$?
+  [ "$_st2_rc2" -eq 20 ] || _st2_ok=0
+  # H4: approve check-b, then a fresh pre-merge pass returns 0 — BOTH gates cleared, merge proceeds, and
+  #     final-gate (the plain step after both holds) ran.
+  st2_env bash "$ST_ENGINE/herd-approve.sh" approve demo-two >/dev/null 2>&1
+  grep -q 'released demo-two .* check-b$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  _st2_rc3=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc3=$?
+  [ "$_st2_rc3" -eq 0 ] || _st2_ok=0
+  grep -q '"name":"final-gate".*"outcome":"pass"' "$ST_JN_2" 2>/dev/null || _st2_ok=0
+  # Ledger stays bounded: exactly one awaiting row per step (two total), no per-tick growth.
+  _st2_await_ct="$(grep -c 'awaiting demo-two' "$_st2_hold" 2>/dev/null)"; _st2_await_ct="${_st2_await_ct:-0}"
+  [ "$_st2_await_ct" = "2" ] || _st2_ok=0
+  if [ "$_st2_ok" -eq 1 ]; then
+    checkpoint pipeline_steps_two_approve pass "two hold=approve steps gate independently: approving check-a does NOT release check-b; merge proceeds (rc 0) only after BOTH approved; ledger bounded (2 awaiting rows)"
+  else
+    checkpoint pipeline_steps_two_approve fail "independent double-approve gate failed (rc1=$_st2_rc1 rc2=$_st2_rc2 rc3=$_st2_rc3 awaiting_ct=$_st2_await_ct)"
   fi
 fi
 
