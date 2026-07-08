@@ -13,7 +13,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 herd_preflight || exit 1
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
-BRANCH="feat/$NAME"
+# BRANCH_TEMPLATE (HERD-120): render the lane's branch name through the ONE shared helper instead of
+# hardcoding feat/<name>. Default 'feat/{slug}' → byte-identical to before. When the coordinator
+# spawned from a TRACKED item it exports HERD_ITEM_REF, feeding the optional {ref} token.
+BRANCH="$(herd_branch_render "$NAME" "${HERD_ITEM_REF:-}")"
 DIR="$TREES/$NAME"
 
 git -C "$REPO" fetch -q "$HERD_REMOTE"
