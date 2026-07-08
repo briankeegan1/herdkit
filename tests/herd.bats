@@ -241,6 +241,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic native-burst fan-out seam (HERD-107) test passes" {
+  run bash "$REPO/tests/test-native-burst.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-defined branch naming (HERD-120) test passes" {
   run bash "$REPO/tests/test-branch-template.sh"
   [ "$status" -eq 0 ]
@@ -294,6 +300,7 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS"* ]]
 }
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render

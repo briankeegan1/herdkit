@@ -107,6 +107,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/driver.sh"
 # Engine journal — record log retention + infra deaths (best-effort, never breaks the gate).
 . "$HERE/journal.sh"
+# Native-burst seam (HERD-107): the bounded read-only FAN-OUT helper. Sourced so the pre-merge review
+# can optionally run a bounded REVIEW PANEL — several concurrent read-only reviewer passes over the same
+# diff — when NATIVE_BURST=on. Off (or REVIEW_PANEL<=1) → a single reviewer, byte-identical to before.
+# shellcheck source=/dev/null
+. "$HERE/burst.sh"
 MAIN="$PROJECT_ROOT"
 # Mode: default PR review (<pr> <slug>); --local reviews the worktree's LOCAL diff (<slug>) BEFORE any
 # PR exists. Local mode reuses the SAME adversarial prompt + PASS/BLOCK/INFRA-FAIL contract below, but
@@ -125,6 +130,13 @@ DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
 _WS_ID="$(herd_resolve_workspace_id)"
+
+# REVIEW PANEL size (HERD-107, native-burst): number of CONCURRENT read-only reviewer passes over this
+# diff. herd_burst_bound returns 1 when NATIVE_BURST is off (or REVIEW_PANEL<=1), so the DEFAULT is a
+# single reviewer — byte-identical to before. When >1, the panel runs on the HEADLESS reviewer path
+# (agent-pane placement is skipped) and its verdicts are combined fail-safe (any BLOCK ⇒ BLOCK).
+_PANEL_N="$(herd_burst_bound "${REVIEW_PANEL:-1}")"
+case "$_PANEL_N" in ''|*[!0-9]*) _PANEL_N=1 ;; esac
 
 # Review FROM the feature worktree if it still exists (gives the reviewer the diff's repo context
 # + any AGENTS.md/CLAUDE.md); otherwise fall back to the main checkout. `gh pr diff` works from
@@ -224,6 +236,51 @@ for line in sys.stdin:
         if r: print(r, flush=True)
 '
 
+# ── Review panel (HERD-107, native-burst) ────────────────────────────────────────────────────────
+# _combine_verdicts <file>… — fold the per-member verdict files of a review PANEL into ONE verdict,
+# FAIL-SAFE for a merge gate: read each file's LAST 'REVIEW: PASS|BLOCK' line and
+#   • ANY member BLOCK  → echo that BLOCK (a single reviewer finding a real bug must block the merge);
+#   • else ANY PASS     → echo that PASS (one clean review is the same bar as today's single reviewer);
+#   • else (no verdict) → echo nothing + return 1 → the caller reports INFRA-FAIL (every member died).
+# This can only ever be STRICTER than a single reviewer: extra panel members add chances to BLOCK, never
+# a way to turn a BLOCK into a PASS. Pure (reads files, no side effects) so it is unit-tested directly.
+_combine_verdicts() {
+  local f line block="" pass=""
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$f" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+    [ -n "$line" ] || continue
+    case "$line" in
+      "REVIEW: BLOCK"*) [ -z "$block" ] && block="$line" ;;
+      "REVIEW: PASS"|"REVIEW: PASS "*) [ -z "$pass" ] && pass="$line" ;;
+    esac
+  done
+  if [ -n "$block" ]; then printf '%s' "$block"; return 0; fi
+  if [ -n "$pass" ];  then printf '%s' "$pass";  return 0; fi
+  return 1
+}
+
+# _panel_member <index> — one read-only reviewer pass, run in a background subshell by herd_burst.
+# It streams `claude -p "$_PANEL_TASK"` (a NO-COMMENT, print-one-verdict task; the panel posts a single
+# combined PR comment itself) through the shared formatter and captures the output — including the final
+# 'REVIEW:' line — into this member's private file $_PANEL_DIR/m.<index>. Any failure is swallowed: a
+# dead member simply leaves no verdict, and _combine_verdicts treats it as absent (fail-safe).
+_panel_member() {
+  local i="$1"
+  local mfile="$_PANEL_DIR/m.$i"
+  ( cd "$CWD" 2>/dev/null && \
+    claude -p "$_PANEL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+      --output-format stream-json --verbose 2>/dev/null \
+    | python3 -uc "$REVIEW_STREAM_FORMATTER" ) > "$mfile" 2>/dev/null || true
+}
+
+# _panel_indices <n> — echo "0 1 … n-1" (space-separated) for the herd_burst worklist.
+_panel_indices() {
+  local n="$1" i=0 out=""
+  while [ "$i" -lt "$n" ]; do out="$out $i"; i=$((i+1)); done
+  printf '%s' "$out"
+}
+
 # _mark_review_done <PASS|BLOCK> — write a persistent verdict banner to $LOG and update the
 # herdr pane label so the user sees the outcome in the tailing pane. Called before every exit
 # so the pane is useful after the review finishes (not just during). Best-effort: any herdr
@@ -279,25 +336,43 @@ if [ "$REVIEW_MODE" = "local" ]; then
   # on exit. (emit_infra_fail / the verdict handlers below all exit, firing this trap.)
   trap 'rm -f "$LLOG" 2>/dev/null || true' EXIT
 
-  echo "🔬 Local pre-PR review of '${SLUG}' on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass (${_local_diff_cmd})…" >&2
+  if [ "$_PANEL_N" -gt 1 ] 2>/dev/null; then
+    # NATIVE-BURST review PANEL: fan out $_PANEL_N concurrent read-only reviewer passes over the SAME
+    # local diff (bounded by herd_burst), each writing its verdict to a private per-member file; then
+    # combine fail-safe (any BLOCK ⇒ BLOCK). LOCAL_TASK is already the no-comment print-one-verdict task,
+    # so it doubles as the panel-member task verbatim. A total infra wipeout (no member left a verdict)
+    # → INFRA-FAIL, exactly as a single dead reviewer would.
+    echo "🔬 Local pre-PR review of '${SLUG}' — bounded PANEL (${_PANEL_N}× ${REVIEW_MODEL}) adversarial correctness pass (${_local_diff_cmd})…" >&2
+    _PANEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herd-review-panel-${SLUG}-XXXXXX")" \
+      || emit_infra_fail "could not allocate local panel dir (mktemp -d failed)"
+    trap 'rm -f "$LLOG" 2>/dev/null || true; rm -rf "$_PANEL_DIR" 2>/dev/null || true' EXIT
+    _PANEL_TASK="$LOCAL_TASK"
+    # shellcheck disable=SC2086  # $(_panel_indices) is an intentional space-separated worklist
+    herd_burst "$_PANEL_N" _panel_member $(_panel_indices "$_PANEL_N")
+    verdict_line="$(_combine_verdicts "$_PANEL_DIR"/m.* 2>/dev/null || true)"
+    [ -n "$verdict_line" ] \
+      || emit_infra_fail "local panel review produced no verdict from any of ${_PANEL_N} members — infrastructure failure, not a block"
+  else
+    echo "🔬 Local pre-PR review of '${SLUG}' on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass (${_local_diff_cmd})…" >&2
 
-  # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
-  # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
-  (set -o pipefail; cd "$CWD" 2>/dev/null && \
-    claude -p "$LOCAL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
-      --output-format stream-json --verbose 2>&1 | \
-    python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
-  rc=${PIPESTATUS[0]}
+    # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
+    # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
+    (set -o pipefail; cd "$CWD" 2>/dev/null && \
+      claude -p "$LOCAL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+        --output-format stream-json --verbose 2>&1 | \
+      python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
+    rc=${PIPESTATUS[0]}
 
-  if [ "$rc" -ne 0 ]; then
-    # Non-zero WITH a parseable verdict in the log is honoured below; non-zero with NO verdict is a
-    # transient infra death (reviewer crashed before concluding), NOT a genuine BLOCK.
-    if ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null; then
-      emit_infra_fail "local reviewer exited non-zero (rc=$rc) with no verdict — could not complete the review"
+    if [ "$rc" -ne 0 ]; then
+      # Non-zero WITH a parseable verdict in the log is honoured below; non-zero with NO verdict is a
+      # transient infra death (reviewer crashed before concluding), NOT a genuine BLOCK.
+      if ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null; then
+        emit_infra_fail "local reviewer exited non-zero (rc=$rc) with no verdict — could not complete the review"
+      fi
     fi
-  fi
 
-  verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+    verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+  fi
   case "$verdict_line" in
     # PASS, with or without a HERD-105 'advisory:' tail (' — advisory: …'). A bare 'REVIEW: PASS'
     # is emitted verbatim (byte-identical to before); a PASS carrying advisory notes is passed
@@ -357,6 +432,13 @@ journal_append review_log_retained pr "$PR" slug "$SLUG" path "$LOG" keep "$REVI
 # close-in-time PR reviews share the cached prefix (Anthropic's cache keys on the longest shared
 # PREFIX, 5-min TTL); the UNIQUE per-PR content (PR number, branch slug, diff instruction) TRAILS.
 TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The only write you may do is ONE 'gh pr comment <PR> --body \"…\"'. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) Post a brief PR comment summarizing your findings via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: the blocking bug + why it's wrong, or the PASS rationale; then list any ADVISORY style/hardening findings separately as clearly-labelled NON-BLOCKING notes). (5) FINALLY, as the LAST thing you print, output EXACTLY ONE verdict line and nothing after it. BLOCK if and only if you have at least one CORRECTNESS finding — a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>' (those three ' | '-separated fields, rule/why/location). Otherwise PASS: print exactly 'REVIEW: PASS' when you found NO issues at all, or, when you found ONLY advisory (non-correctness) issues, 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>' with one ' advisory:' segment per advisory finding. Keep it to that single line; it is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'."
+
+# PANEL-member task (HERD-107, native-burst): a NO-COMMENT variant of the reviewer task used only when
+# $_PANEL_N>1. Each of the $_PANEL_N concurrent members reads the SAME PR diff and PRINTS one verdict
+# line — but does NOT post a PR comment (the panel posts a single combined comment once, so N members
+# never spam N comments). Same STABLE preamble/checklist/RULES as TASK for cache-sharing; only the
+# comment rule differs and the diff instruction trails. Byte-inert unless the panel actually engages.
+PR_PANEL_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge, and DO NOT run any 'gh' command that writes — in particular DO NOT post a PR comment (the review harness posts one combined comment for the whole panel). (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) FINALLY, as the LAST thing you print, output EXACTLY ONE verdict line and nothing after it. BLOCK if and only if you have at least one CORRECTNESS finding — a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>' (those three ' | '-separated fields, rule/why/location). Otherwise PASS: print exactly 'REVIEW: PASS' when you found NO issues at all, or, when you found ONLY advisory (non-correctness) issues, 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>' with one ' advisory:' segment per advisory finding. Keep it to that single line; it is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}'."
 
 # Private agent temp: the agent writes its verdict here; herd-review.sh (this script) is the
 # SOLE atomic writer of $HERD_REVIEW_RESULT_FILE. The agent NEVER touches the watcher's
@@ -446,7 +528,10 @@ except Exception:
 # Fallback: standalone review·<slug> tab when the builder tab is genuinely gone, when herdr is
 # unavailable, or when the agent start fails.
 TAB="" ROOT="" _AGENT_PANE_MODE=0
-if [ "${HERD_NO_PANE:-}" != "1" ] && command -v herdr >/dev/null 2>&1 && [ -n "$_agent_result_file" ]; then
+# NATIVE-BURST (HERD-107): when a review PANEL is requested ($_PANEL_N>1) the review runs on the HEADLESS
+# fan-out path (N concurrent claude -p passes), so skip the single-agent-pane placement entirely. The
+# default ($_PANEL_N==1) keeps today's exact pane behavior — this guard is inert unless the panel engages.
+if [ "$_PANEL_N" -le 1 ] 2>/dev/null && [ "${HERD_NO_PANE:-}" != "1" ] && command -v herdr >/dev/null 2>&1 && [ -n "$_agent_result_file" ]; then
 
   # One agent-list read, parsed twice: the builder's own pane (agent named $SLUG) and any STALE
   # review pane (agent named review·$SLUG) still occupying the builder's tab from a prior round.
@@ -583,6 +668,29 @@ if [ "$_AGENT_PANE_MODE" = "1" ]; then
   # Normal exact-path exit re-reads the verdict here (byte-identical to before); a near-miss
   # consumed above has already populated verdict_line, so leave it untouched in that case.
   [ -n "$verdict_line" ] || verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+elif [ "$_PANEL_N" -gt 1 ] 2>/dev/null; then
+  # NATIVE-BURST review PANEL (headless): fan out $_PANEL_N concurrent read-only reviewer passes over the
+  # SAME PR diff (bounded by herd_burst), each PRINTING its verdict (no PR comment) into a private member
+  # file; then combine fail-safe (any member BLOCK ⇒ BLOCK, else any PASS ⇒ PASS, else INFRA-FAIL). ONE
+  # combined PR comment is posted by the harness (best-effort), so N members never spam N comments.
+  _PANEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herd-review-panel-${PR}-XXXXXX")" \
+    || emit_infra_fail "could not allocate panel dir (mktemp -d failed)"
+  # $LOG is still the persistent forensic log; note the panel there. $_PANEL_DIR is cleaned on exit.
+  trap 'rm -rf "$_PANEL_DIR" 2>/dev/null || true' EXIT
+  _PANEL_TASK="$PR_PANEL_TASK"
+  printf '─── native-burst review panel: %s× %s ───\n' "$_PANEL_N" "$REVIEW_MODEL" >> "$LOG" 2>/dev/null || true
+  # shellcheck disable=SC2086  # $(_panel_indices) is an intentional space-separated worklist
+  herd_burst "$_PANEL_N" _panel_member $(_panel_indices "$_PANEL_N")
+  # Fold the members into the log for forensics, then combine.
+  cat "$_PANEL_DIR"/m.* >> "$LOG" 2>/dev/null || true
+  verdict_line="$(_combine_verdicts "$_PANEL_DIR"/m.* 2>/dev/null || true)"
+  [ -n "$verdict_line" ] \
+    || emit_infra_fail "review panel produced no verdict from any of ${_PANEL_N} members — infrastructure failure, not a block"
+  # ONE combined, non-authoritative PR comment (best-effort; the verdict line is the authority). Skipped
+  # silently when gh is unavailable/unauthenticated — the merge gate never depends on the comment landing.
+  if command -v gh >/dev/null 2>&1; then
+    gh pr comment "$PR" --body "🔬 Native-burst review panel (${_PANEL_N}× ${REVIEW_MODEL}) — combined verdict: ${verdict_line}" >/dev/null 2>&1 || true
+  fi
 else
   # Headless mode: stream claude -p into $LOG with an informative formatter.
   # The formatter emits: tool name + one-line input summary (bash command, file path, etc.)

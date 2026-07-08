@@ -181,6 +181,18 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
 
+# native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
+#   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.
+#   on   read-only work may BURST — fan out several CONCURRENT calls bounded by REVIEW_CONCURRENCY (the
+#        ceiling): research.sh hints the drainer a bounded concurrent-Explore width, and herd-review.sh
+#        may run a bounded REVIEW PANEL (see REVIEW_PANEL). WRITE lanes (scribe/backlog/merge) NEVER
+#        burst — they stay strictly serial. Additive + opt-in; unknown/blank → off (fail safe).
+# NATIVE_BURST="off"       # off (default) | on
+# review panel size — CONCURRENT read-only reviewer passes over the SAME diff when NATIVE_BURST=on;
+# effective size is min(REVIEW_PANEL, REVIEW_CONCURRENCY). Default 1 = single reviewer (byte-identical).
+# Combination is fail-safe: ANY member's BLOCK blocks the merge; a merge needs >=1 PASS and zero BLOCKs.
+# REVIEW_PANEL="1"         # concurrent reviewer passes when NATIVE_BURST=on (default 1)
+
 # post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
 # health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
 # broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited
