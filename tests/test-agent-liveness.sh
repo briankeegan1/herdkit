@@ -6,7 +6,8 @@
 # bounce would have typed a re-task into a dead pane and failed the 15s wake. This suite drives the
 # SHIPPED helpers against a file-backed herdr stub whose pane process-info can be flipped from a live
 # `claude` foreground to a BARE shell (the killed-process signature), and asserts:
-#   (A) herd_driver_agent_liveness — herdr-claude (claude→alive, bare→dead, gone/absent→unknown) AND
+#   (A) herd_driver_agent_liveness — herdr-claude (claude→alive, bare→dead, delisted-but-labelled-pane
+#       →dead via the label fallback, no agent + no labelled pane→MISSING, unreadable pane→unknown) AND
 #       headless (live pid→alive, dead pid→dead, no record→unknown).
 #   (B) _status_classify_builder — liveness='dead' ⇒ 'agentdead' (even with an open PR), never over a
 #       WORKING agent, and byte-identical (unchanged bucket) when liveness is empty/unknown/alive.
@@ -69,7 +70,10 @@ PY
     p="${4:-}"
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
     cmd=""; [ -f "$S/panes/$p/cmd" ] && cmd="$(cat "$S/panes/$p/cmd")"
-    if [ -n "$cmd" ]; then
+    if [ -f "$S/panes/$p/root" ] && [ -n "$cmd" ]; then
+      # claude launched AS the pane ROOT (no wrapping shell): shell_pid == the foreground process pid.
+      printf '{"result":{"process_info":{"shell_pid":5151,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
+    elif [ -n "$cmd" ]; then
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
     else
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[]}}}\n'
@@ -80,8 +84,10 @@ import sys,os,json
 S=sys.argv[1]; d=os.path.join(S,"panes"); panes=[]
 if os.path.isdir(d):
     for p in sorted(os.listdir(d)):
-        tf=os.path.join(d,p,"tab")
-        panes.append({"pane_id":p,"tab_id":(open(tf).read().strip() if os.path.exists(tf) else "")})
+        tf=os.path.join(d,p,"tab"); lf=os.path.join(d,p,"label")
+        panes.append({"pane_id":p,
+                      "tab_id":(open(tf).read().strip() if os.path.exists(tf) else ""),
+                      "label":(open(lf).read().strip() if os.path.exists(lf) else "")})
 print(json.dumps({"result":{"panes":panes}}))
 PY
     ;;
@@ -109,7 +115,8 @@ export HERDR_STATE="$S"
 # helpers to mutate stub state
 set_agent()  { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$S/agents.tsv"; }   # name pane status
 reset_agents(){ : > "$S/agents.tsv"; }
-mk_pane()    { mkdir -p "$S/panes/$1"; printf '%s' "${3:-}" > "$S/panes/$1/tab"; printf '%s' "${2:-}" > "$S/panes/$1/cmd"; }  # id cmd tab
+mk_pane()    { mkdir -p "$S/panes/$1"; printf '%s' "${3:-}" > "$S/panes/$1/tab"; printf '%s' "${2:-}" > "$S/panes/$1/cmd"; [ -n "${4:-}" ] && printf '%s' "$4" > "$S/panes/$1/label" || true; }  # id cmd tab [label]
+mk_pane_root(){ mk_pane "$1" "$2" "$3"; : > "$S/panes/$1/root"; }  # id cmd tab — claude launched AS the pane root (shell_pid == fg pid)
 mk_tab()     { printf '%s' "$2" > "$S/tabs/$1"; }   # id label
 
 # ── source the libs in lib mode ───────────────────────────────────────────────
@@ -138,13 +145,28 @@ ok
 mk_pane pane-live "" tab-b            # flip the same pane to bare
 [ "$(herd_driver_agent_liveness bob)" = "dead" ] || fail "A2: bare pane (claude gone) ⇒ dead"
 ok
+# herdr-claude: claude launched AS the pane ROOT (shell_pid == the claude pid — the lane runs claude
+# with NO wrapping shell). The pane-shell exclusion must NOT drop this entry: it is POSITIVE alive
+# evidence, not a bare shell. Regression guard for the fabricated-death false-positive (PR #260 review).
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane_root pane-croot "claude --model claude-opus-4-8 --dangerously-skip-permissions" tab-cr
+set_agent crootbob pane-croot idle
+[ "$(herd_driver_agent_liveness crootbob)" = "alive" ] || fail "A2b: claude-as-pane-root (shell_pid==claude pid) ⇒ alive (never a fabricated death)"
+ok
 # herdr-claude: a gone pane (no process-info) ⇒ unknown (fail-soft, never a fabricated death)
 reset_agents; set_agent gonezo pane-absent done
 [ "$(herd_driver_agent_liveness gonezo)" = "unknown" ] || fail "A3: gone pane ⇒ unknown"
 ok
-# herdr-claude: no agent record at all ⇒ unknown
-reset_agents
-[ "$(herd_driver_agent_liveness nobody)" = "unknown" ] || fail "A4: no agent record ⇒ unknown"
+# herdr-claude: no agent record AND no pane carries the slug label ⇒ MISSING — herdr answered, so the
+# agent pane is positively ABSENT (distinct from probe-blind 'unknown'). HERD-135.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+[ "$(herd_driver_agent_liveness nobody)" = "missing" ] || fail "A4: no agent + no labelled pane ⇒ missing"
+ok
+# herdr-claude: agent DELISTED from the roster but its pane persists LABELLED '<slug>' (bare shell) ⇒
+# dead via the label fallback (found even though the roster dropped it), never mis-read as missing.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane pane-ghost "" tab-g ghost      # bare pane (claude gone), labelled 'ghost', no agent record
+[ "$(herd_driver_agent_liveness ghost)" = "dead" ] || fail "A4b: delisted agent, labelled pane present (bare) ⇒ dead"
 ok
 # _agent_liveness wrapper mirrors the driver seam
 mk_pane pane-live "claude foo" tab-b; reset_agents; set_agent bob pane-live done
@@ -208,6 +230,23 @@ before="$(grep -c 'refix_escalated_dead' "$JOURNAL_FILE")"
 DISPLAY=(); _handle_block_verdict "220" "deadbob" "sha-220" "0"
 after="$(grep -c 'refix_escalated_dead' "$JOURNAL_FILE")"
 [ "$before" = "$after" ] || fail "C1: the dead escalation must journal only once per (pr,sha) ($before→$after)"
+ok
+
+# C1b: a MISSING agent (no roster entry, no labelled pane) → escalate 'agent missing', NO pane run,
+# journal refix_escalated_missing once, no round burned (HERD-135). Same "never wake nobody" guarantee
+# as the dead path, but a distinct cause: the pane vanished entirely rather than a killed process.
+: > "$CALLS"; : > "$JOURNAL_FILE"; rm -f "$REFIX_STATE"
+rm -rf "$S/panes"; mkdir -p "$S/panes"; reset_agents
+DISPLAY=()
+_handle_block_verdict "222" "ghostbob" "sha-222" "0"
+d="${DISPLAY[0]:-}"
+printf '%s\n' "$d" | grep -q "agent missing" || fail "C1b: a missing agent must escalate to 'agent missing' (got: $d)"
+ok
+[ "$(wc -l < "$CALLS")" -eq 0 ] || fail "C1b: a missing agent must NOT be sent a wake (herdr pane run calls=$(wc -l < "$CALLS"))"
+ok
+grep -q 'refix_escalated_missing' "$JOURNAL_FILE" || fail "C1b: must journal refix_escalated_missing"
+ok
+refix_attempted "222" "sha-222" && fail "C1b: a missing-agent escalation must NOT burn a refix round"
 ok
 
 # C2: a LIVE agent falls through to the NORMAL refix (a pane run IS attempted, row shows 'refixing').

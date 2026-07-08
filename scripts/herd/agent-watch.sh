@@ -2490,7 +2490,7 @@ _wait_agent_working() {
 # "refixing" while the bounce is in progress.
 _handle_block_verdict() {
   local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
-  local _hbv_sl _hbv_pn
+  local _hbv_sl _hbv_pn _hbv_live
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
@@ -2513,22 +2513,34 @@ _handle_block_verdict() {
       DISPLAY[_hbv_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_YELLOW}review blocked · fix requested · awaiting push${C_RESET}"
     elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
-    elif [ "$(_agent_liveness "$_hbv_slug")" = "dead" ]; then
-      # HERD-114 PREFLIGHT — the auto-refix bounce wakes the builder by typing the re-task prompt into
-      # its agent pane. If that agent SESSION is DEAD (its process was killed — e.g. a herdr server stop
-      # — while the pane/worktree persist and herdr still reports a stale 'done'), typing into the dead
-      # pane can only fail the 15s wake poll. Detect it up front and escalate LOUDLY (needs you · agent
-      # dead) WITHOUT burning a refix round on a guaranteed-failed wake. Only a POSITIVE 'dead' escalates
-      # here; 'unknown'/'alive' fell through the elif above to the normal bounce, so the path is
+    elif _hbv_live="$(_agent_liveness "$_hbv_slug")"; [ "$_hbv_live" = "dead" ] || [ "$_hbv_live" = "missing" ]; then
+      # HERD-114/HERD-135 PREFLIGHT — the auto-refix bounce wakes the builder by typing the re-task
+      # prompt into its agent pane. If that agent SESSION is DEAD (process killed — e.g. a herdr server
+      # stop — while the pane/worktree persist and herdr still reports a stale 'done') OR the agent pane
+      # is MISSING entirely (the pane vanished and cleanup closed the leftover shell — the 2026-07-08
+      # PR #249 incident), typing a wake can only hit nobody. Detect it up front and escalate LOUDLY
+      # WITHOUT burning a refix round on a guaranteed-failed wake. Only a POSITIVE 'dead'/'missing'
+      # escalates here; 'unknown'/'alive' fell through to the normal bounce below, so the path is
       # byte-identical whenever the agent is live OR the probe cannot see the truth (no false-red).
-      DISPLAY[_hbv_idx]="    ${C_RED}💀${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent dead · session unwakeable — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      if [ "$_hbv_live" = "missing" ]; then
+        DISPLAY[_hbv_idx]="    ${C_RED}🫥${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent missing (no agent pane) — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      else
+        DISPLAY[_hbv_idx]="    ${C_RED}💀${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent dead · session unwakeable — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      fi
       # Journal + notify ONCE per (pr,sha) — this path re-enters every tick while the PR stays blocked.
       if ! _refix_dead_seen "$_hbv_pr" "$_hbv_sha"; then
         _record_refix_dead "$_hbv_pr" "$_hbv_sha"
-        journal_append refix_escalated_dead pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
-          reason "agent session dead — wake would fail; escalated for human"
-        herd_driver_notify "💀 agent dead: ${_hbv_slug}" \
-          "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
+        if [ "$_hbv_live" = "missing" ]; then
+          journal_append refix_escalated_missing pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+            reason "agent pane missing — no agent to wake; escalated for human"
+          herd_driver_notify "🫥 agent missing: ${_hbv_slug}" \
+            "PR #${_hbv_pr} review-blocked but the builder has no agent pane (vanished) — re-task by hand" default
+        else
+          journal_append refix_escalated_dead pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+            reason "agent session dead — wake would fail; escalated for human"
+          herd_driver_notify "💀 agent dead: ${_hbv_slug}" \
+            "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
+        fi
       fi
     else
       local _hbv_round_num

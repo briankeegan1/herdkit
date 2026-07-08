@@ -311,11 +311,18 @@ herd_driver_pane_alive() {
 # session was dead. Echoes exactly one token:
 #   alive   — POSITIVE evidence the session process runs (headless: a live registry pid; herdr-claude:
 #             the agent's pane still has a foreground `claude` process)
-#   dead    — POSITIVE evidence it is GONE (headless: a pid recorded but not running; herdr-claude: the
-#             pane EXISTS but runs NO claude — a bare shell left behind after the process was killed)
-#   unknown — cannot tell (no pane id resolvable, herdr/process-info absent or unparseable, pane gone,
-#             no registry record). FAIL-SOFT: a probe that cannot see the truth NEVER fabricates a
-#             death, so a caller degrades to its prior behavior and never false-reds (no-false-red).
+#   dead    — POSITIVE evidence it is GONE but a pane REMAINS (headless: a pid recorded but not running;
+#             herdr-claude: the pane EXISTS but runs NO claude — a bare shell left behind after the
+#             process was killed). "agent dead" = pane present, session unresponsive.
+#   missing — POSITIVE evidence the tab has NO agent pane AT ALL (herdr-claude only): herdr answered but
+#             the agent is neither in the roster NOR does any pane carry its '<slug>' label — the
+#             pane vanished entirely (HERD-135). Distinct from 'dead' (pane present) so a caller can
+#             surface 'agent missing' and never bounce a refix into nobody. Only ever returned when
+#             herdr responded, so it is never a fabricated absence. Headless never returns this (its
+#             liveness is registry-pid based, not pane based — a gone record reads 'unknown').
+#   unknown — cannot tell (herdr/process-info absent or unparseable, pane gone, no registry record).
+#             FAIL-SOFT: a probe that cannot see the truth NEVER fabricates a death/absence, so a
+#             caller degrades to its prior behavior and never false-reds (no-false-red).
 herd_driver_agent_liveness() {
   local slug="${1:-}" pane="${2:-}"
   [ -n "$slug" ] || { printf 'unknown'; return 0; }
@@ -345,12 +352,38 @@ except Exception:
   pass
 ' 2>/dev/null || true)"
   fi
-  [ -n "$pane" ] || { printf 'unknown'; return 0; }
+  # HERD-135: an agent DELISTED from the roster (its process died and herdr dropped the registration)
+  # may still own its pane — LABELLED '<slug>' by the lane at spawn. Consult that label so a
+  # delisted-but-present pane is still classified (dead/alive) rather than mis-read as gone. Best-effort;
+  # a driver/pane with no label just yields no match and we fall through to the 'missing' verdict below.
+  if [ -z "$pane" ]; then
+    pane="$(herdr pane list 2>/dev/null | SLUG="$slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for p in (json.load(sys.stdin).get("result") or {}).get("panes") or []:
+    if str(p.get("label", "")) == slug:
+      print(p.get("pane_id", "") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  fi
+  # No agent in the roster AND no pane carries its label: herdr answered (checked above) yet the agent
+  # pane is positively ABSENT — the tab has NO agent pane at all. Return 'missing' (distinct from the
+  # probe-blind 'unknown') so a caller surfaces 'agent missing' and never bounces a refix into nobody.
+  [ -n "$pane" ] || { printf 'missing'; return 0; }
   # Classify the pane by the process in its FOREGROUND — the same ground-truth eyes layout-reconcile
   # uses: a live `claude` ⇒ alive; a shell with no claude foreground ⇒ dead (the process was killed
   # but the pane persists as a bare shell); missing/opaque process-info or a gone pane ⇒ unknown.
+  #
+  # The pane's OWN shell (shell_pid) is normally excluded so an idle BARE shell reads 'dead' — but the
+  # lane launches claude AS the pane ROOT (no wrapping shell), so shell_pid == the claude pid. Blindly
+  # dropping the shell_pid entry then filters the live claude out and fabricates a death (a live idle
+  # builder read '💀 AGENT DEAD'). So we exclude the shell_pid entry ONLY when it is a real shell
+  # WRAPPER (no claude in its cmdline): a claude-as-root pane keeps its own entry and reads 'alive'.
   herdr pane process-info --pane "$pane" 2>/dev/null | python3 -c '
 import sys, json
+def has_claude(p): return "claude" in (p.get("cmdline") or "")
 try:
   pi = (json.load(sys.stdin).get("result") or {}).get("process_info")
 except Exception:
@@ -360,8 +393,10 @@ if not pi:
 sh = pi.get("shell_pid") or 0
 if not sh:
   print("unknown"); sys.exit(0)
-fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh]
-print("alive" if any("claude" in (p.get("cmdline") or "") for p in fg) else "dead")
+# Keep any foreground process that is NOT the pane shell, OR that IS the shell_pid entry but is itself
+# claude (claude launched as the pane root) — the latter is POSITIVE alive evidence, never a wrapper.
+fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh or has_claude(p)]
+print("alive" if any(has_claude(p) for p in fg) else "dead")
 ' 2>/dev/null || printf 'unknown'
 }
 
@@ -376,6 +411,71 @@ herd_driver_send_keys() {
     herdr pane send-keys "$target" "$@" >/dev/null 2>&1 || true
   fi
   return 0
+}
+
+# ── pane rename / role labelling (HERD-135) ─────────────────────────────────────────────────────────
+# herd_driver_pane_rename <pane> <label> — set a pane's role LABEL. The builder lanes call this at
+# spawn to name each pane by role ('<slug>' for the agent pane, 'task-spec·<slug>' for the viewer,
+# 'shell·<slug>' for the bare root shell) so the dead-agent-eyes probe (herd_driver_agent_liveness)
+# and the coordinator READ a pane's role instead of guessing from position/cmdline — the fix for the
+# 2026-07-08 incident where a `claude --continue` was typed into the task-spec viewer pane. herdr-claude:
+# `herdr pane rename`. headless: NO-OP (panes-as-a-view — nothing to label). FAIL-SOFT: a missing
+# herdr / gone pane / driver that does not support rename is a clean no-op, so the probe simply falls
+# back to today's heuristic (no red row). NEVER fails.
+herd_driver_pane_rename() {
+  local target="${1:-}" label="${2:-}"
+  [ -n "$target" ] && [ -n "$label" ] || return 0
+  if _herd_driver_is_headless; then
+    : # no-op: view-only — headless has no pane to label
+  else
+    herdr pane rename "$target" "$label" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# herd_driver_agent_pane_id <slug> — echo the pane_id herdr currently associates with this agent
+# (matched on the `name` OR `agent` identity key, the same breadth the liveness probe uses), so the
+# lane can LABEL the freshly-created agent pane. Empty (no output) when headless / herdr absent / the
+# agent is not yet listed. FAIL-SOFT: never aborts a caller under set -euo pipefail.
+herd_driver_agent_pane_id() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr agent list 2>/dev/null | SLUG="$slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if a.get("name") == slug or a.get("agent") == slug:
+      print(a.get("pane_id", "") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# herd_driver_pane_id_from_agent_start <json> — best-effort extract of the agent pane id from an
+# `herdr agent start` result. Tolerates the shapes herdr uses (result.agent.pane_id /
+# result.pane.pane_id / result.pane_id) so a lane can label the pane WITHOUT a second `agent list`
+# round-trip. PURE (no herdr call — safe on captured stdout); empty on any parse failure.
+herd_driver_pane_id_from_agent_start() {
+  local json="${1:-}"
+  [ -n "$json" ] || return 0
+  printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+  r = (json.load(sys.stdin).get("result") or {})
+  pid = ""
+  for k in ("agent", "pane"):
+    v = r.get(k)
+    if isinstance(v, dict) and v.get("pane_id"):
+      pid = v["pane_id"]; break
+  if not pid and r.get("pane_id"):
+    pid = r["pane_id"]
+  sys.stdout.write(str(pid or ""))
+except Exception:
+  pass
+' 2>/dev/null || true
 }
 
 # ── create-tab ───────────────────────────────────────────────────────────────────────────────────
@@ -548,13 +648,15 @@ _herd_driver_cli() {
     close-pane)  herd_driver_close_pane "$@" ;;
     close-verified) herd_close_pane_verified "$@" ;;
     pane-identity)  herd_driver_pane_identity "$@"; echo ;;
+    pane-rename)    herd_driver_pane_rename "$@" ;;
+    agent-pane)     herd_driver_agent_pane_id "$@"; echo ;;
     pane-alive)  herd_driver_pane_alive "$@" ;;
     agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
     create-tab)  herd_driver_create_tab "$@" ;;
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
   esac
 }
 
