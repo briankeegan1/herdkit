@@ -175,6 +175,7 @@ PR_READY_WHEN	unit	tests/test-flow-preference.sh
 PUSH_GATE	sim	tests/test-sandbox-governance.sh
 DELETE_BRANCH_ON_MERGE	none-yet	unit: no test asserts branch deletion after merge; only the init default write is tested
 LOCAL_REVIEW	unit	tests/test-local-review-prepr.sh
+LOCAL_REVIEW_GLOB	unit	tests/test-risk-scoped-prpr-review.sh
 CONTEXT_PROVISION	unit	tests/test-context-provision.sh
 WATCHER_VIEW	unit	tests/test-watcher-views.sh
 WATCHER_VIEW_AUTHOR	unit	tests/test-watcher-views.sh

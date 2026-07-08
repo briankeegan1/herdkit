@@ -235,9 +235,18 @@ PUSH_GATE=""              # "" (default, off) | human
 # delete the head branch after a merge. false (default) preserves today's behavior (branches kept).
 DELETE_BRANCH_ON_MERGE="false"   # true | false
 
-# pre-PR local review mode. NOTE: the `pre-pr` behavior is NOT wired yet (it touches the review gate /
-# agent-watch.sh / herd-review.sh, owned by another lane) — documented here but not yet consumed.
-LOCAL_REVIEW="none"       # none | pre-pr  (pre-pr wiring deferred to a follow-up)
+# pre-PR local review mode: none (default) | pre-pr | risk-scoped. pre-pr makes every builder pass a
+# local adversarial correctness review (herd-review.sh --local) BEFORE opening its PR. risk-scoped
+# runs that review ONLY when the builder's diff surface matches LOCAL_REVIEW_GLOB below — low-risk
+# diffs skip straight to the PR (the watcher's post-PR review gate stays authoritative), so review
+# quota is spent only where round-1 BLOCKs cluster. Either way the post-PR gate is unchanged.
+LOCAL_REVIEW="none"       # none | pre-pr | risk-scoped
+# Egrep pattern of changed-file paths (git diff DEFAULT_BRANCH...HEAD --name-only) that make a
+# LOCAL_REVIEW=risk-scoped builder run the pre-PR local review; a diff touching no matching path skips
+# it. Same egrep semantics as REVIEW_ESCALATE_GLOB / HEALTHCHECK_HEAVY_GLOB; a DEDICATED key so the
+# pre-PR risk surface is scoped independently of the post-PR review tiering. Blank (default) → with
+# risk-scoped it fails SOFT to unconditional pre-pr (loud warn); ignored under none/pre-pr.
+LOCAL_REVIEW_GLOB=""      # e.g. '^scripts/herd/|^bin/'  — engine paths where pre-PR review pays off
 
 # builder context provisioning (HERD-40) — a SPACE-SEPARATED list of grounding sources injected into
 # the STABLE preamble of every spawned builder's task spec, so builders start grounded instead of
