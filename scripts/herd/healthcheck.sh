@@ -63,6 +63,7 @@ done
 [ -n "$DIR" ] || { echo "usage: healthcheck.sh <worktree-dir> [--oneline] [--heavy|--light|--auto]"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+. "$HERE/commit-lint.sh"
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -218,6 +219,28 @@ EOF
   exit 0
 }
 
+# ── attribution lint: scan PR commits for AI co-author markers (HERD-121) ──────────────────────
+# Keyed on ATTRIBUTION_POLICY (independent of the heavy/light profile and the interaction gate). Sets:
+#   AL_STATE  = DISABLED | CLEAN | CODEERROR
+#   AL_REASON = first offending "sha:line" (empty when not CODEERROR)
+#   AL_FULL   = all offending "sha:line" pairs, newline-separated (empty unless CODEERROR)
+AL_STATE="DISABLED"; AL_REASON=""; AL_FULL=""
+run_attribution_lint() {
+  case "${ATTRIBUTION_POLICY:-}" in
+    no-ai-coauthor) ;;
+    *) return 0 ;;   # off (default "") or unknown value → zero behavior change
+  esac
+  local _al_violations
+  _al_violations="$(_herd_attr_scan "$DEFAULT_BRANCH")"
+  if [ -z "$_al_violations" ]; then
+    AL_STATE="CLEAN"
+    return 0
+  fi
+  AL_STATE="CODEERROR"
+  AL_REASON="$(printf '%s' "$_al_violations" | head -1)"
+  AL_FULL="$_al_violations"
+}
+
 # ── interaction gate: run INTERACTION_TEST_CMD, or flag its absence, for app-surface PRs ──────
 # Keyed on APP_SURFACE_GLOB (independent of the heavy/light profile). Sets:
 #   IG_STATE  = DISABLED | WARN | CLEAN | DATAENV | CODEERROR
@@ -263,17 +286,20 @@ run_profile() {
 MAIN_OUT="$(run_profile)"; MAIN_RC=$?
 
 run_interaction_gate
+run_attribution_lint
 
-# Combined exit: a real CODE error on EITHER the profile or the interaction gate blocks the merge.
+# Combined exit: a real CODE error on ANY gate blocks the merge.
 RC=0
 [ "$MAIN_RC" -eq 1 ] && RC=1
 [ "$IG_STATE" = "CODEERROR" ] && RC=1
+[ "$AL_STATE" = "CODEERROR" ] && RC=1
 
 if [ -n "$ONELINE" ]; then
   # Exactly ONE line — the watcher paints healthcheck --oneline as a single status row.
   if [ "$RC" -eq 1 ]; then
     if [ "$MAIN_RC" -eq 1 ]; then printf '%s\n' "$MAIN_OUT"
-    else printf '❌ interaction — %s\n' "$IG_REASON"; fi
+    elif [ "$IG_STATE" = "CODEERROR" ]; then printf '❌ interaction — %s\n' "$IG_REASON"
+    else printf '❌ attribution — %s\n' "$AL_REASON"; fi
   else
     case "$IG_STATE" in
       WARN)    printf '⚠️  %s\n' "$IG_REASON" ;;
@@ -284,7 +310,7 @@ if [ -n "$ONELINE" ]; then
   exit "$RC"
 fi
 
-# Full mode: the profile's verdict, then the interaction-gate section.
+# Full mode: the profile's verdict, then the interaction-gate section, then the attribution lint.
 printf '%s\n' "$MAIN_OUT"
 case "$IG_STATE" in
   DISABLED) : ;;
@@ -294,5 +320,11 @@ case "$IG_STATE" in
              [ -n "$IG_FULL" ] && printf '%s\n' "$IG_FULL" ;;
   CODEERROR) printf '❌ INTERACTION TESTS FAILED — %s\n' "$IG_REASON"
              [ -n "$IG_FULL" ] && printf '%s\n' "$IG_FULL" ;;
+esac
+case "$AL_STATE" in
+  DISABLED) : ;;
+  CLEAN)    printf '✅ ATTRIBUTION LINT CLEAN\n' ;;
+  CODEERROR) printf '❌ ATTRIBUTION LINT: AI co-author marker found\n'
+             [ -n "$AL_FULL" ] && printf '%s\n' "$AL_FULL" ;;
 esac
 exit "$RC"
