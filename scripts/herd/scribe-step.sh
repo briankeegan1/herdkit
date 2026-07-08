@@ -82,6 +82,93 @@ _report_and_cleanup() {
   echo "$out $short"
 }
 
+# ── HERD-183: MECHANICAL planned-marker from an EXPLICIT sequencing clause ────────────────────────
+# When a NEW item's body carries a machine-checkable "sequenced after HERD-<n>" contract, publishing
+# the 📌 marker should not depend on the author (or the drainer) also remembering to run
+# `herd backlog queue`: markers are the ONLY machine-readable sequencing signal, and a batch filed
+# with sequencing in PROSE ONLY once let another operator legitimately pick an item up out of order.
+# So after filing an Add, scribe-step parses the body for a CONSERVATIVE, ANCHORED pattern set and,
+# if matched, auto-publishes the marker itself. Default-on is safe: it only publishes a plan the
+# author already wrote in the body. Fail-soft everywhere; byte-identical when no clause is present.
+
+# _scribe_seq_blocker <body> — echo the blocker's canonical HERD-id when <body> carries an EXPLICIT,
+# ANCHORED sequencing clause; else echo nothing. CONSERVATIVE by design: only these HERD-id-anchored
+# forms match (never fuzzy prose), each on a leading word boundary so "unblocked on HERD-9" and the
+# like never false-fire. A bare "after HERD-<n>" does NOT match — only "after HERD-<n> merges" does.
+#     hard-after HERD-<n> | sequence[d] after HERD-<n> | after HERD-<n> merges | blocked on HERD-<n>
+# First match in reading order wins; the id is normalized to upper-case HERD-<n>.
+_scribe_seq_blocker() {
+  printf '%s' "$1" | python3 -c '
+import sys, re
+body = sys.stdin.read()
+pats = [
+    r"hard-after\s+HERD-(\d+)",
+    r"sequenced?\s+after\s+HERD-(\d+)",
+    r"after\s+HERD-(\d+)\s+merges",
+    r"blocked\s+on\s+HERD-(\d+)",
+]
+best = None
+for p in pats:
+    # (?<![A-Za-z0-9]) = a leading word boundary so a keyword embedded in a longer word never matches.
+    for m in re.finditer(r"(?<![A-Za-z0-9])" + p, body, re.IGNORECASE):
+        if best is None or m.start() < best[0]:
+            best = (m.start(), m.group(1))
+if best:
+    sys.stdout.write("HERD-" + best[1])
+' 2>/dev/null || true
+}
+
+# _scribe_new_item_ref <add-stdout-file> — print a queue-able ref for the item a backend just created,
+# extracted from that backend's add stdout. Linear/Jira surface an identifier (HERD-184 / PROJ-12) —
+# either bare or inside the issue URL; GitHub surfaces an issue URL (…/issues/42 → #42). Nothing
+# recognizable (e.g. the file backend, which surfaces no id) → empty, and the caller fails soft.
+_scribe_new_item_ref() {
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import sys, re
+try:
+    txt = open(sys.argv[1], encoding="utf-8").read()
+except OSError:
+    sys.exit(0)
+m = re.search(r"\b([A-Z][A-Z0-9]*-\d+)\b", txt)   # linear/jira key (also matches inside a URL)
+if m:
+    sys.stdout.write(m.group(1)); sys.exit(0)
+m = re.search(r"/issues/(\d+)\b", txt)            # github issue URL
+if m:
+    sys.stdout.write("#" + m.group(1))
+PY
+}
+
+# _scribe_auto_marker <backend> <add-result> <add-stdout-file> <blocker> — after an Add whose body
+# carried an anchored sequencing clause, publish the 📌 planned-marker on the NEW item by shelling out
+# to the real `herd backlog queue <new-id> --after <blocker>` (the same command a coordinator runs by
+# hand). FAIL-SOFT throughout — the item is already filed; the marker is advisory:
+#   - only runs when the Add actually created an item (add-result = DONE);
+#   - needs a machine id for the new item (from the backend's add stdout); none surfaced → soft note;
+#   - a missing herd CLI, a backend with no queue op, or a non-zero queue exit → soft note on stderr.
+# HERD_CLI overrides the herd binary (test seam, mirroring SCRIBE_BACKEND_DIR); production resolves the
+# engine's own bin/herd (this script lives at scripts/herd/), then falls back to herd on PATH.
+_scribe_auto_marker() {
+  local backend="$1" result="$2" out_file="$3" blocker="$4" new_id herd_bin
+  [ "$result" = "DONE" ] || return 0
+  new_id="$(_scribe_new_item_ref "$out_file")"
+  if [ -z "$new_id" ]; then
+    echo "scribe-step: sequencing clause 'after $blocker' found but backend '$backend' surfaced no id for the new item — 📌 marker not auto-published. [HERD-183]" >&2
+    return 0
+  fi
+  herd_bin="${HERD_CLI:-}"
+  [ -n "$herd_bin" ] || herd_bin="$HERE/../../bin/herd"
+  [ -x "$herd_bin" ] || herd_bin="$(command -v herd 2>/dev/null || true)"
+  if [ -z "$herd_bin" ] || { [ ! -x "$herd_bin" ] && ! command -v "$herd_bin" >/dev/null 2>&1; }; then
+    echo "scribe-step: no herd CLI on PATH — cannot auto-publish 📌 marker for $new_id after $blocker. [HERD-183]" >&2
+    return 0
+  fi
+  if "$herd_bin" backlog queue "$new_id" --after "$blocker" >/dev/null 2>&1; then
+    echo "📌 sequenced $new_id after $blocker (auto-published from the item's sequencing clause). [HERD-183]"
+  else
+    echo "scribe-step: auto-marker 'herd backlog queue $new_id --after $blocker' did not publish (queue op absent/unsupported, or item unresolved) — item already filed, skipping. [HERD-183]" >&2
+  fi
+}
+
 case "$cmd" in
   next)
     # LINGER window (HERD-88): after the base $POLL wait empties the queue, keep polling for
@@ -155,7 +242,22 @@ case "$cmd" in
       echo "scribe-step: SCRIBE_BACKEND='file' but an 'add-item' dispatch arrived — a stale non-file drainer is running (retire it); this request needs a file-mode drainer to edit $BACKLOG_FILE. [issue #139]" >&2
     fi
     _BACKEND_RESULT=""
-    _backend_add_item "$mine" "$text"
+    # HERD-183: parse the body FIRST (pure text). With no explicit sequencing clause we take the
+    # unchanged path below — byte-identical to before, nothing extra published.
+    _seq_blocker="$(_scribe_seq_blocker "$text")"
+    if [ -n "$_seq_blocker" ]; then
+      # A clause is present: capture the backend's add stdout so we can read the NEW item's id and
+      # queue it after the blocker. Redirecting a plain function call keeps _BACKEND_RESULT in THIS
+      # shell (a $()/pipe would run _backend_add_item in a subshell and lose it); we replay the
+      # captured stdout verbatim so the drainer's output is unchanged.
+      _add_out="$TREES/.scribe-add-out.$$"
+      _backend_add_item "$mine" "$text" > "$_add_out"
+      cat "$_add_out"
+      _scribe_auto_marker "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_seq_blocker"
+      rm -f "$_add_out"
+    else
+      _backend_add_item "$mine" "$text"
+    fi
     _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"
     ;;
   update-state)
