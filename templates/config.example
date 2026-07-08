@@ -185,6 +185,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
 # MAIN_HEALTH_TICK="off"   # off (default) | on
 
+# Watcher-console FLAIR pack (HERD-147) — an ADDITIVE cosmetic layer on the live 'herd watch' console.
+# ON → (a) a merge CELEBRATION: the status tick after a merge prints one theme-colored line
+# '🐑 #<pr> joins the flock · <n> grazing'; (b) a PASTURE HEADER: one line rendering the in-flight herd
+# by state — 🐑 grazing (building), 💤 idle, ✅ in the pen (done). Colors come only from the active
+# theme (theme.sh C_* vars); NO_COLOR / non-tty renders plain. HARD RULE: flair NEVER softens a
+# red/dead/needs-you state — a 💀 dead or ⚠️ needs-you builder is exactly as loud as today, and it never
+# touches a gate or a merge decision. Ships OFF (byte-inert: every console byte identical to before).
+# WATCHER_FLAIR="off"      # off (default) | on
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After

@@ -287,7 +287,10 @@ LANDED=""
 BLOCKED=""
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
+CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
+PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
+FLAIR_STATE=()         # HERD-147 flair: one state-token per DISPLAY row (parallel index), read by build_pasture
 
 # build_header — the title row + a full-width rule.
 build_header() {
@@ -487,6 +490,90 @@ _fmt_age() {
   fi
 }
 
+# ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
+# An ADDITIVE cosmetic layer, gated by WATCHER_FLAIR (default off). Two surfaces, both assembled from
+# state the watcher already computes, both colored ONLY via theme.sh's C_* vars (so NO_COLOR / non-tty
+# renders plain):
+#   • merge CELEBRATION — the status tick after a merge prints one line '🐑 #<pr> joins the flock ·
+#     <n> grazing' (n = builders still building this tick). do_merge drops a self-clearing marker;
+#     build_celebrate turns it into the line and consumes it, so it shows exactly once.
+#   • PASTURE HEADER — one line rendering the in-flight herd by state, one glyph per builder in the
+#     same order as the "in flight" rows below it (🐑 grazing = building, 💤 idle, ✅ in the pen = done).
+# HARD RULE (proven by the sim + units): flair NEVER softens a red/dead/needs-you state. A dead builder
+# is 💀 red and a needs-you builder is ⚠️ red in the header — exactly as loud as their rows — and OFF is
+# byte-inert: build_celebrate/build_pasture leave CELEBRATE/PASTURE empty so render() emits nothing new.
+FLAIR_CELEBRATE_STATE="$TREES/.agent-watch-flair-celebrate"   # pending merged-PR numbers, one per line
+
+# _flair_enabled — true iff WATCHER_FLAIR opts in. Default OFF (mirrors _main_health_enabled); any
+# unrecognized value reads as off (fail toward the byte-identical console).
+_flair_enabled() {
+  case "$(printf '%s' "${WATCHER_FLAIR:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _flair_glyph <state-token> — echo the theme-colored glyph for one builder state. The calm states get
+# the cozy flair glyphs; every attention/dead state keeps its LOUD color+glyph (never softened). An
+# unknown token falls back to a dim 🐑 (a benign herd member), never a colored alarm.
+_flair_glyph() {
+  case "$1" in
+    grazing)   printf '%s🐑%s' "$C_GREEN"  "$C_RESET" ;;   # building
+    idle)      printf '%s💤%s' "$C_DIM"    "$C_RESET" ;;   # idle · no PR
+    pen)       printf '%s✅%s' "$C_GREEN"  "$C_RESET" ;;   # done / ready
+    dead)      printf '%s💀%s' "$C_RED"    "$C_RESET" ;;   # dead builder — LOUD, byte-as-today
+    attention) printf '%s⚠️%s'  "$C_RED"    "$C_RESET" ;;   # needs-you / not-mergeable / failed — LOUD
+    warn)      printf '%s⚠️%s'  "$C_YELLOW" "$C_RESET" ;;   # stalled "no activity · check pane"
+    busy)      printf '%s🩺%s' "$C_YELLOW" "$C_RESET" ;;   # in-progress gate (health-check / resolving / limit-resume / waiting)
+    verify)    printf '%s🔍%s' "$C_DIM"    "$C_RESET" ;;   # verifying mergeability
+    other)     printf '%s👥%s' "$C_DIM"    "$C_RESET" ;;   # not mine — manual (team mode)
+    self)      printf '%s🐑%s' "$C_DIM"    "$C_RESET" ;;   # the watcher's own worktree
+    *)         printf '%s🐑%s' "$C_DIM"    "$C_RESET" ;;
+  esac
+}
+
+# _flair_celebration_line <pr#> <n-grazing> — the pure formatter for ONE merge-celebration line
+# (no trailing newline). Themed: a green 🐑 headline + a dim tail. NO_COLOR/non-tty → the C_* are blank
+# so it degrades to plain text. Kept pure (no I/O, no globals) so the unit test can pin its exact bytes.
+_flair_celebration_line() {
+  printf '  %s🐑 #%s joins the flock%s %s· %s grazing%s' \
+    "$C_GREEN" "$1" "$C_RESET" "$C_DIM" "$2" "$C_RESET"
+}
+
+# build_celebrate <n-grazing> — set CELEBRATE from the pending-merge marker (one celebration line per
+# just-merged PR), then CONSUME the marker so each merge is celebrated exactly once. Empty (byte-inert)
+# when flair is off or nothing merged since the last tick — so render() adds nothing.
+build_celebrate() {
+  CELEBRATE=""
+  _flair_enabled || return 0
+  [ -s "$FLAIR_CELEBRATE_STATE" ] || return 0
+  local _bc_n="${1:-0}" pr rows=""
+  case "$_bc_n" in ''|*[!0-9]*) _bc_n=0 ;; esac
+  while read -r pr _; do
+    case "$pr" in ''|*[!0-9]*) continue ;; esac
+    rows="${rows}$(_flair_celebration_line "$pr" "$_bc_n")"$'\n'
+  done < "$FLAIR_CELEBRATE_STATE"
+  rm -f "$FLAIR_CELEBRATE_STATE" 2>/dev/null || true
+  CELEBRATE="$rows"
+}
+
+# build_pasture — set PASTURE to a single header line rendering each in-flight builder by state, one
+# glyph per FLAIR_STATE[] entry (parallel-indexed to DISPLAY[], populated in the classification loop),
+# in row order. Empty (byte-inert) when flair is off OR there are no builders — so a byte-identical
+# console when the feature is unused and no "empty pasture" line when the herd is idle.
+build_pasture() {
+  PASTURE=""
+  _flair_enabled || return 0
+  [ "${#FLAIR_STATE[@]}" -gt 0 ] || return 0
+  local st glyphs=""
+  for st in "${FLAIR_STATE[@]}"; do
+    [ -n "$st" ] || st=grazing
+    glyphs="${glyphs}$(_flair_glyph "$st") "
+  done
+  [ -n "$glyphs" ] || return 0
+  PASTURE="  ${C_DIM}pasture${C_RESET}  ${glyphs% }"$'\n'
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -494,6 +581,11 @@ render() {
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
   if [ -n "${MAIN_HEALTH:-}" ]; then
     frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH}"$'\n'
+  fi
+  # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
+  # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
+  if [ -n "${CELEBRATE:-}" ]; then
+    frame="${frame}${CELEBRATE}"$'\n'
   fi
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
   if [ -n "${BLOCKED:-}" ]; then
@@ -504,6 +596,11 @@ render() {
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
+  # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
+  # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
+  if [ -n "${PASTURE:-}" ]; then
+    frame="${frame}${PASTURE}"
   fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
@@ -1477,6 +1574,9 @@ _classify_conflict() {
   sl="$(_slug_cell "$cslug")"; pn=" ${C_DIM}#${cpr}${C_RESET} ·"
   cap="${REFIX_MAX_ROUNDS:-3}"
   count="$(resolver_dispatch_count "$cpr")"
+  # HERD-147 flair default: a conflict is a needs-you/red state → 'attention' in the pasture header
+  # (never softened). The in-progress "resolving conflict…" outcomes below downgrade it to 'busy'.
+  FLAIR_STATE[ci]="attention"
 
   # ESCALATE already recorded for THIS sha → terminal; hold for a human, never re-dispatch.
   if resolver_escalated_sha "$cpr" "$csha"; then
@@ -1502,6 +1602,7 @@ _classify_conflict() {
     # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
     if _resolver_in_flight "$cslug" "$cpr"; then
       DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+      FLAIR_STATE[ci]="busy"
       return
     fi
     # DEAD resolver — re-spawn for the same sha if budget remains, else surface needs-you.
@@ -1528,6 +1629,7 @@ _classify_conflict() {
   # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
   if _resolver_in_flight "$cslug" "$cpr"; then
     DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    FLAIR_STATE[ci]="busy"
     return
   fi
   if [ "$count" -ge "$cap" ]; then
@@ -1915,6 +2017,10 @@ do_merge() {
     printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
   fi
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
+  # HERD-147 flair: queue a merge CELEBRATION for the NEXT status tick (build_celebrate renders + clears
+  # it). Gated on WATCHER_FLAIR so the marker is never written when flair is off → do_merge stays
+  # byte-identical to before this feature. Additive + fail-soft: a marker write that fails is ignored.
+  _flair_enabled && printf '%s\n' "$dp" >> "$FLAIR_CELEBRATE_STATE" 2>/dev/null || true
   # HERD-90: purge every approval-ledger row for this PR (all shas) now that it is merged. Without
   # this, an OLD-sha 'awaiting' row from a re-applied HUMAN-VERIFY hold lingers as a phantom pending
   # approval in `herd-approve.sh list`. Done right after the merge record so a later cleanup crash
@@ -2924,6 +3030,10 @@ _handle_limit_blocked() {
   _lb_sl="$(_slug_cell "$_lb_slug")"
   _lb_now="$(_now)"
   _lb_state="$(limit_state "$_lb_slug")"
+  # HERD-147 flair default: a limit-hit auto-resume is an in-progress ('busy') state in the pasture
+  # header. The failed outcomes below escalate it to 'attention' (red, never softened); a confirmed
+  # resume flips it to 'grazing' (building again).
+  FLAIR_STATE[_lb_idx]="busy"
 
   # First sighting → record + journal the hold and compute the resume target once.
   if [ -z "$_lb_state" ]; then
@@ -2952,6 +3062,7 @@ _handle_limit_blocked() {
   # A prior failed attempt stays escalated — never re-attempt every tick.
   if [ "$_lb_state" = "failed" ]; then
     DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+    FLAIR_STATE[_lb_idx]="attention"
     return 0
   fi
 
@@ -2974,6 +3085,7 @@ _handle_limit_blocked() {
     journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false reason native_or_manual
     clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
     DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed (native auto-resume)${C_RESET}"
+    FLAIR_STATE[_lb_idx]="grazing"
     return 0
   fi
 
@@ -2987,10 +3099,12 @@ _handle_limit_blocked() {
     journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false
     clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
     DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed via --continue${C_RESET}"
+    FLAIR_STATE[_lb_idx]="grazing"
   else
     record_limit "$_lb_slug" "$_lb_now" "$_lb_target" "failed"
     journal_append limit_resume_result slug "$_lb_slug" woke 0 escalated true
     DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+    FLAIR_STATE[_lb_idx]="attention"
   fi
   return 0
 }
@@ -4436,6 +4550,7 @@ for wt, branch in feats:
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
+  FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
@@ -4453,6 +4568,7 @@ EOF
       # path would otherwise mis-flag as died. Presence-driven: no hold record → this branch is skipped
       # and the console is byte-identical to before the feature.
       DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
+      FLAIR_STATE[i]="pen"
     elif [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
@@ -4478,9 +4594,11 @@ EOF
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
               else
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
-              fi ;;
+              fi
+              FLAIR_STATE[i]="dead" ;;
             *)
-              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}" ;;
+              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+              FLAIR_STATE[i]="idle" ;;
           esac
         fi
       else
@@ -4505,29 +4623,36 @@ EOF
         if [ "$_changes" -eq 1 ]; then _qelapsed="$_edit_age"; else _qelapsed=$(( _now - _born )); fi
         case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet" "$_qelapsed")" in
           BUILD_UNCOMMITTED)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}" ;;
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
           STALL)
             # Reached only when _qelapsed ≥ _quiet, so this age is a real, ≥-window duration.
             _qmins=$(( _qelapsed / 60 ))
-            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}" ;;
+            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}"
+            FLAIR_STATE[i]="warn" ;;
           *)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}" ;;
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
         esac
       fi
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
+      FLAIR_STATE[i]="self"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
       if _scope_permits_automerge "$prauthor"; then
         DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        FLAIR_STATE[i]="busy"
         CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
       else
         # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,
         # but it is NOT owned by the configured operator. DISPLAY it so a teammate's progress is
         # visible, but NEVER add it to the merge-candidate set — a human merges a teammate's PR.
         DISPLAY[i]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${prauthor:-unknown})${C_RESET}"
+        FLAIR_STATE[i]="other"
       fi
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
+      FLAIR_STATE[i]="verify"
     elif [ "$mergeable" = "CONFLICTING" ]; then
       # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
       # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
@@ -4538,12 +4663,25 @@ EOF
       # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
       # is transient, NOT a human-action error, so no ⚠️ "needs you".
       DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
+      FLAIR_STATE[i]="busy"
     else
       reason="not mergeable (${mstate})"
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
+      FLAIR_STATE[i]="attention"
     fi
     i=$((i + 1))
   done
+
+  # HERD-147 flair — assemble the pasture header + any queued merge celebration from THIS tick's herd
+  # snapshot, BEFORE render. Both no-op (leave PASTURE/CELEBRATE empty) when WATCHER_FLAIR is off, so
+  # the frame is byte-identical to before the feature. The celebration's "<n> grazing" count is the
+  # number of builders classified as building this tick.
+  _flair_grazing=0
+  for _fs in ${FLAIR_STATE[@]+"${FLAIR_STATE[@]}"}; do
+    [ "$_fs" = "grazing" ] && _flair_grazing=$((_flair_grazing + 1))
+  done
+  build_celebrate "$_flair_grazing"
+  build_pasture
 
   render
 
