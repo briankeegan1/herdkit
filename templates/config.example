@@ -180,6 +180,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # INFRA_BREAKER_MAX="0"          # 0 (default, off) | N>=1 = open after N consecutive INFRA (non-verdict) failures
 # INFRA_BREAKER_COOLDOWN="300"   # seconds OPEN before a single half-open probe retry (non-numeric → 300)
 
+# Claude exec-hang probe (HERD-108) — detect a WEDGED claude up front instead of feeding dead
+# dispatches. On some environments `claude` hangs on invocation (every exec stalls before the process
+# finishes starting — e.g. the macOS com.apple.quarantine _dyld_start hang); a wedged claude makes every
+# review/refix spawn a corpse and the poll loop burns cycles against a hang it cannot see. When armed,
+# the watcher probes `claude --version` under a HARD timeout ONCE per tick before dispatching; a timeout
+# HOLDS that tick's review/refix with a loud 'claude exec-hang' row + a journal infra_event (run
+# `herd doctor` — its own `claude responds` check reports the same hang with a fix). Only a genuine
+# timeout counts as a hang; a broken/absent claude is fail-soft and never holds the queue. Ships OFF
+# (byte-inert): default 0 → no probe exec, no journal, behavior byte-identical.
+# WATCH_CLAUDE_PROBE_TIMEOUT="0"  # 0 (default, off) | N>=1 = `claude --version` probe timeout in seconds
+
 # PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
 # a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
 #   PR_FLOW:       direct — open PRs ready to merge (default, today's behavior).

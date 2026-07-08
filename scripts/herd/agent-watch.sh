@@ -1063,6 +1063,98 @@ EOF
   printf '%s' "$rem"
 }
 
+# ── Claude exec-hang probe (HERD-108) ─────────────────────────────────────────────────────────────
+# On some environments `claude` WEDGES on invocation — every exec hangs before the process finishes
+# starting (e.g. the macOS com.apple.quarantine _dyld_start hang, issue #137). A wedged claude makes
+# every review/refix dispatch spawn a corpse: the reviewer never writes a verdict and an auto-refix
+# bounce lands on a dead session, so the poll loop burns cycles forever against an exec-hang it cannot
+# see. This probe DETECTS the wedge DIRECTLY — a trivial `claude --version` under a HARD timeout, run
+# ONCE per tick before dispatch — so the watcher can HOLD review/refix and surface the hang LOUDLY (+ a
+# journal infra_event) instead of feeding a dead binary. It COMPLEMENTS the HERD-110 breaker (which
+# only reacts AFTER reviewers die without a verdict): the probe catches the wedge up front, before a
+# single reviewer is spawned. `herd doctor`'s own `claude responds` check reports the same hang at
+# diagnosis time (scripts/herd/herd-preflight.sh).
+#
+# BYTE-INERT BY DEFAULT: WATCH_CLAUDE_PROBE_TIMEOUT defaults to 0 (off). With it 0/empty/non-numeric
+# the probe is a no-op — no claude exec, no journal, no gating — so behavior is byte-identical to before
+# this feature. Set it to a small positive integer (seconds; 5 is a conservative arm) to enable.
+CLAUDE_HANG_STATE="$TREES/.agent-watch-claude-hang"   # one line: "<epoch-of-current-hang-episode>" (absent when healthy)
+
+# _claude_probe_secs — the armed timeout in seconds (echoed), or return 1 when the probe is disabled
+# (0/unset/non-numeric → OFF, fail-safe parse). Mirrors _breaker_enabled's opt-in shape.
+_claude_probe_secs() {
+  case "${WATCH_CLAUDE_PROBE_TIMEOUT:-0}" in
+    ''|*[!0-9]*|0) return 1 ;;
+    *) printf '%s' "$WATCH_CLAUDE_PROBE_TIMEOUT"; return 0 ;;
+  esac
+}
+
+# _claude_probe_run_timeout <secs> <cmd> [args...] — run <cmd> under a HARD wall-clock timeout, portable
+# across macOS/Linux: prefers coreutils `timeout` / `gtimeout`, else a pure-shell watchdog (background,
+# poll, SIGTERM→SIGKILL). stdout/stderr suppressed. Returns 124 on timeout (coreutils convention), else
+# the command's own rc. Every kill/wait/sleep is guarded so it can never abort a caller under `set -e`.
+# Mirrors herd-preflight.sh's doctor timeout runner (not sourced here — the watcher stays self-contained).
+_claude_probe_run_timeout() {
+  local secs="$1"; shift
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@" >/dev/null 2>&1 || rc=$?; return "$rc"; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" >/dev/null 2>&1 || rc=$?; return "$rc"; fi
+  # Pure-shell fallback (stock macOS has neither). Needs a working `sleep`; if absent, degrade to an
+  # un-timed direct run rather than busy-spin into a FALSE timeout (only bites an artificially stripped PATH).
+  if ! sleep 0 2>/dev/null; then "$@" >/dev/null 2>&1 || rc=$?; return "$rc"; fi
+  "$@" >/dev/null 2>&1 &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null || true; sleep 1; kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true; return 124
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# _claude_exec_hung — probe claude ONCE and echo this tick's verdict:
+#   HUNG  — `claude --version` did not return within the armed timeout (a real exec-wedge)
+#   OK    — probe disabled, OR claude responded in time / exited non-zero (broken-but-not-wedged) /
+#           is absent — every NON-hang outcome: the queue is NOT held on them (fail-soft)
+# On the FIRST HUNG of a hang episode it journals ONE loud infra_event (deduped via CLAUDE_HANG_STATE so
+# a persistent wedge does not spam the journal every tick); any non-hang outcome CLEARS the marker (and
+# journals a one-line recovery when a hang had been on record) so a later relapse journals afresh. A
+# broken/absent claude is deliberately NOT a hang: claude may simply not be installed (the doctor reports
+# that) and a non-zero `--version` is a different fault — neither should stall an otherwise-live queue.
+_claude_exec_hung() {
+  local secs rc
+  secs="$(_claude_probe_secs)" || { printf OK; return 0; }
+  if ! command -v claude >/dev/null 2>&1; then
+    _claude_hang_clear
+    printf OK; return 0
+  fi
+  rc=0
+  _claude_probe_run_timeout "$secs" claude --version || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    if [ ! -s "$CLAUDE_HANG_STATE" ]; then
+      journal_append infra_event component agent-watch reason claude-exec-hang \
+        detail "claude --version did not return within ${secs}s (exec-hang) — holding review/refix dispatch" \
+        timeout_secs "$secs"
+      printf '%s\n' "$(date +%s)" > "$CLAUDE_HANG_STATE" 2>/dev/null || true
+    fi
+    printf HUNG; return 0
+  fi
+  _claude_hang_clear
+  printf OK; return 0
+}
+
+# _claude_hang_clear — drop the hang-episode marker; if a hang HAD been on record, journal one recovery
+# line so the episode's open/close is visible. Cheap no-op when no hang was recorded.
+_claude_hang_clear() {
+  [ -s "$CLAUDE_HANG_STATE" ] || return 0
+  rm -f "$CLAUDE_HANG_STATE" 2>/dev/null || true
+  journal_append infra_event component agent-watch reason claude-exec-hang-cleared \
+    detail "claude --version responded again — resuming review/refix dispatch"
+}
+
 # _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
 # machine, called once per tick for a candidate with no ledger verdict yet. Echoes one token:
 #   PASS | BLOCK — a result file was just collected; the verdict is now in the ledger
@@ -4231,6 +4323,13 @@ EOF
 
   render
 
+  # CLAUDE EXEC-HANG PROBE (HERD-108): before dispatching any review/refix into a possibly-wedged claude,
+  # probe it ONCE per tick under a hard timeout. A wedge (probe times out) sets $_claude_hung, which the
+  # per-candidate guard below uses to HOLD review/refix (a cached-PASS PR still merges). Byte-inert unless
+  # WATCH_CLAUDE_PROBE_TIMEOUT is armed; the probe only runs when there is at least one candidate to protect.
+  _claude_hung=""
+  if [ -n "${CAND_IDX[*]:-}" ] && [ "$(_claude_exec_hung)" = "HUNG" ]; then _claude_hung=1; fi
+
   # Action pass: gate + auto-merge each CLEAN/MERGEABLE candidate.
   j=0
   for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}; do
@@ -4324,6 +4423,16 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       continue
     fi
     prior="$(review_verdict "$prnum" "$rsha" || true)"
+    # CLAUDE EXEC-HANG GUARD (HERD-108): claude is wedged this tick (the per-tick probe timed out). A
+    # review dispatch would spawn a reviewer that hangs; an auto-refix bounce would land on a dead
+    # session. HOLD both — but ONLY when this candidate actually needs claude: a cached PASS (or a
+    # BLOCK the operator has overridden) falls straight through to the merge path below, so healthy
+    # already-reviewed PRs keep flowing. The probe already journaled the infra_event (once per episode).
+    if [ -n "${_claude_hung:-}" ] && [ "$prior" != "PASS" ] && ! { [ "$prior" = "BLOCK" ] && override_exists "$prnum" "$rsha"; }; then
+      DISPLAY[idx]="    ${C_RED}🧟${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}claude exec-hang — probe timed out; holding review/refix (fix: herd doctor)${C_RESET}"
+      render
+      continue
+    fi
     if [ "$prior" = "BLOCK" ]; then
       if override_exists "$prnum" "$rsha"; then
         # Human override recorded for this sha — treat as PASS and proceed to merge path.
