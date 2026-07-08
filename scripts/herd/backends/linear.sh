@@ -542,23 +542,30 @@ if meta:
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
     # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)
-    # and reads state.type, setting ITEM_STATE=open|closed|in-progress.
+    # and reads state.type, setting ITEM_STATE=open|closed|in-progress. Also sets ITEM_UPDATED to the
+    # issue's last-updated day (YYYY-MM-DD, best-effort — empty if absent), used by the HERD-117 claim
+    # guard as evidence when it refuses a stale (Done/Canceled) pick.
     # Linear state types: completed/canceled → closed; started → in-progress; all others → open.
-    local ref="$1" slug resp stype
+    local ref="$1" slug resp parsed stype
     _linear_require_key
     slug="${ref#*#}"
-    if ! _linear_issue_query "$slug" 'state { type }'; then
+    ITEM_UPDATED=""
+    if ! _linear_issue_query "$slug" 'state { type } updatedAt'; then
         ITEM_STATE="open"
         return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
-    stype="$(printf '%s' "$resp" | python3 -c '
+    # Emit "<type>\t<updated-day>" so a single parse yields both the state class and the evidence stamp.
+    parsed="$(printf '%s' "$resp" | python3 -c '
 import sys, json
 try:    d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
-print(nodes[0].get("state", {}).get("type", "") if nodes else "")
-' 2>/dev/null || printf '')"
+n = nodes[0] if nodes else {}
+print("%s\t%s" % ((n.get("state") or {}).get("type", ""), (n.get("updatedAt") or "")[:10]))
+' 2>/dev/null || printf '\t')"
+    stype="${parsed%%$'\t'*}"
+    ITEM_UPDATED="${parsed#*$'\t'}"
     case "$stype" in
         completed|canceled|cancelled) ITEM_STATE="closed"      ;;
         started)                      ITEM_STATE="in-progress" ;;
