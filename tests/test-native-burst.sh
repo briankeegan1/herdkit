@@ -253,8 +253,10 @@ grep -q 'herd_burst ' "$REVIEW"                 || fail "7d: herd-review.sh must
 grep -q '_combine_verdicts' "$REVIEW"           || fail "7e: herd-review.sh must combine panel verdicts"
 grep -qE '^: "\$\{NATIVE_BURST:="off"\}"' "$CONFIG" || fail "7f: herd-config.sh must default NATIVE_BURST to off"
 grep -qE '^: "\$\{REVIEW_PANEL:="1"\}"'    "$CONFIG" || fail "7g: herd-config.sh must default REVIEW_PANEL to 1"
-grep -qP '^NATIVE_BURST\tconfig' "$CAPS"       || fail "7h: capabilities.tsv must document NATIVE_BURST"
-grep -qP '^REVIEW_PANEL\tconfig' "$CAPS"        || fail "7i: capabilities.tsv must document REVIEW_PANEL"
+# Portable tab-delimited column check (BSD grep has no -P/PCRE, and \t is not a tab in BRE/ERE) —
+# match the manifest's own `name<TAB>kind` columns via awk, the repo's canonical tsv-assert style.
+awk -F'\t' '$1=="NATIVE_BURST" && $2=="config"{f=1} END{exit f?0:1}' "$CAPS" || fail "7h: capabilities.tsv must document NATIVE_BURST"
+awk -F'\t' '$1=="REVIEW_PANEL" && $2=="config"{f=1} END{exit f?0:1}' "$CAPS" || fail "7i: capabilities.tsv must document REVIEW_PANEL"
 ok
 
 echo "ALL PASS ($pass checks)"
