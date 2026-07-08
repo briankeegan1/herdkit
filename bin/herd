@@ -883,10 +883,30 @@ cmd_init() {
 
   # 4b. Merge policy + method — seeded from GitHub detection (protected + required review ⇒ approve).
   #     The human can still override either here; detection only chooses the SAFE default.
+  #
+  #     CONSEQUENCE-LOUD (HERD-140): MERGE_POLICY decides whether the watcher merges PRs with NO
+  #     human in the loop, so it must NEVER be seeded silently. We always print, in the flow, what
+  #     each value DOES before asking — an operator can't unknowingly end up on 'auto'. On a
+  #     non-interactive / no-tty init (where we can't prompt) we seed the default but print a LOUD
+  #     notice of exactly what was chosen instead of a single dim line — and never hang the script.
   say ""
-  say "${c_bold}Merge policy${c_rst}"
+  say "${c_bold}Merge policy${c_rst} ${c_dim}— does the watcher merge PRs for you, or hold them?${c_rst}"
+  say "  ${c_bold}auto${c_rst}     the watcher MERGES every gate-passed PR with ${c_bold}no human in the loop${c_rst}"
+  say "  ${c_bold}approve${c_rst}  the watcher HOLDS each PR for an explicit human sign-off before merging"
+  say "  ${c_bold}observe${c_rst}  the watcher NEVER merges — it only reports; you merge by hand"
   local merge_policy merge_method
-  merge_policy="$(ask "MERGE_POLICY (auto merges on green / approve holds for sign-off / observe never merges)" "$det_policy")"
+  if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+    merge_policy="$(ask "MERGE_POLICY (auto | approve | observe)" "$det_policy")"
+  else
+    # Non-interactive: seed the (suggested) default, but say loudly what it means — auto especially,
+    # since a silent auto is the exact footgun HERD-140 fixes.
+    merge_policy="$det_policy"
+    if [ "$merge_policy" = "auto" ]; then
+      warn "MERGE_POLICY defaulted to 'auto' (non-interactive init): the watcher will MERGE every gate-passed PR with NO human sign-off. To hold PRs for review instead, run 'herd config set MERGE_POLICY approve'."
+    else
+      say "  ${c_bold}→ MERGE_POLICY=${merge_policy}${c_rst} ${c_dim}(non-interactive init — seeded default; change with 'herd config set MERGE_POLICY ...')${c_rst}"
+    fi
+  fi
   merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
 
   # 4c. PR flow — how builders open PRs. SAFE DEFAULTS preserve today's EXACT behavior: direct PRs
