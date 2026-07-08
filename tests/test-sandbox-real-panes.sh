@@ -151,6 +151,13 @@ if cmd == "pane split":
                 save(s); emit({"pane": {"pane_id": pid, "tab_id": tid, "workspace_id": wid}})
     emit({})
 
+if cmd == "pane close":
+    pane = args[2]
+    for w in s["workspaces"].values():
+        for t in w["tabs"].values():
+            t["panes"].pop(pane, None)
+    save(s); emit({"type": "ok"})
+
 if cmd == "pane list":
     wid = opt("--workspace")
     panes = []
@@ -211,9 +218,12 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Two tabs (control room + builder) and three panes (watcher, backlog, builder) created.
+# Two tabs (control room + builder) and four panes (watcher, backlog, builder, + the reviewer split
+# stood up for the reviewer-pane-lifecycle checkpoint, which is then retired on verdict consumption).
 [ "$(sc "$SCR" tabs_created)" -eq 2 ]  || fail "(B) tabs_created should be 2 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 3 ] || fail "(B) panes_created should be 3 (got $(sc "$SCR" panes_created))"
+[ "$(sc "$SCR" panes_created)" -eq 4 ] || fail "(B) panes_created should be 4 (got $(sc "$SCR" panes_created))"
+# The reviewer pane is retired on verdict consumption (HERD-113).
+[ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.
 [ "$(sc "$SCR" leaked_tabs)" -eq 0 ] || fail "(B) leaked_tabs must be 0 (got $(sc "$SCR" leaked_tabs))"
 LEFT="$(python3 -c 'import json; print(len(json.load(open("'"$STATE"'"))["workspaces"]))')"

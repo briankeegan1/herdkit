@@ -116,6 +116,9 @@ ok; echo "PASS (2) unknown driver → loud error listing herdr-claude AND headle
   # no-ops: rc 0, never touch herdr.
   herd_driver_send_keys somepane Down Enter || { echo "FAIL: send-keys rc"; exit 1; }
   herd_driver_create_tab --workspace x     || { echo "FAIL: create-tab rc"; exit 1; }
+  herd_driver_close_pane somepane          || { echo "FAIL: close-pane rc"; exit 1; }
+  # pane-alive: headless has no panes → always NOT alive (liveness there is the registry pid).
+  herd_driver_pane_alive somepane          && { echo "FAIL: headless pane-alive should be false"; exit 1; }
 
   # read-pane: empty on no log, tails a real log.
   [ -z "$(herd_driver_read_pane nosuch)" ] || { echo "FAIL: read-pane not empty for missing agent"; exit 1; }
@@ -150,10 +153,14 @@ chmod +x "$BIN/herdr"
   herd_driver_agent_list_json >/dev/null
   herd_driver_read_pane "%p1" visible >/dev/null
   herd_driver_send_keys "%p2" Down Enter
+  herd_driver_close_pane "%p3"
+  herd_driver_pane_alive "%p4" >/dev/null
   grep -qF 'HERDR: [notification] [show] [🐑 title] [--body] [the body] [--sound] [default]' "$HERDR_LOG" || { echo "FAIL: notify not byte-identical"; cat "$HERDR_LOG"; exit 1; }
   grep -qF 'HERDR: [agent] [list]' "$HERDR_LOG" || { echo "FAIL: agent list not delegated"; exit 1; }
   grep -qF 'HERDR: [pane] [read] [%p1] [--source] [visible]' "$HERDR_LOG" || { echo "FAIL: read-pane not byte-identical"; cat "$HERDR_LOG"; exit 1; }
   grep -qF 'HERDR: [pane] [send-keys] [%p2] [Down] [Enter]' "$HERDR_LOG" || { echo "FAIL: send-keys not byte-identical"; cat "$HERDR_LOG"; exit 1; }
+  grep -qF 'HERDR: [pane] [close] [%p3]' "$HERDR_LOG" || { echo "FAIL: close-pane not byte-identical"; cat "$HERDR_LOG"; exit 1; }
+  grep -qF 'HERDR: [pane] [read] [%p4]' "$HERDR_LOG" || { echo "FAIL: pane-alive not delegated to pane read"; cat "$HERDR_LOG"; exit 1; }
   exit 0
 ) || fail "herdr-claude delegation not byte-identical (see FAIL above)"
 ok; echo "PASS (4) herdr-claude driver delegates to the EXACT herdr command (byte-identical default)"

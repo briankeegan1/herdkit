@@ -154,6 +154,9 @@ _teardown_reviewer() {
   if [ "${_AGENT_PANE_MODE:-0}" = "1" ] && [ -n "${ROOT:-}" ]; then
     herdr pane close "$ROOT" >/dev/null 2>&1 || true
   fi
+  # We closed our own pane here, so drop the dispatch-registry row too (HERD-113) — nothing survives
+  # this exit path for the watcher to retire. Best-effort; a missing file is fine.
+  [ -n "${HERD_REVIEW_REGISTRY_FILE:-}" ] && rm -f "$HERD_REVIEW_REGISTRY_FILE" 2>/dev/null || true
   [ -n "${_agent_result_file:-}" ] && rm -f "$_agent_result_file" 2>/dev/null || true
 }
 
@@ -474,6 +477,18 @@ except Exception:
       _AGENT_PANE_MODE=1
       # Review pane is inside the builder's tab — no separate registry entry needed; tearing
       # down the builder tab (on merge) will close this split automatically.
+      # DISPATCH REGISTRY (HERD-113): record this reviewer's (pid, pane id) for the watcher, so on
+      # verdict CONSUMPTION it can retire this pane, and a dispatch after a watcher/herdr restart can
+      # ADOPT the still-live pane instead of spawning a duplicate reviewer. $$ is the poller pid the
+      # watcher recorded in the inflight marker (exec -a preserves it across the argv0 re-exec). Written
+      # here — after the pane is confirmed up — so the pane id is real. Best-effort; a failed write only
+      # costs the retire-on-consume convenience (the pid guard + startup sweep still prevent duplicates).
+      if [ -n "${HERD_REVIEW_REGISTRY_FILE:-}" ]; then
+        _reg_tmp="${HERD_REVIEW_REGISTRY_FILE}.tmp.$$"
+        if printf '%s %s\n' "$$" "$ROOT" > "$_reg_tmp" 2>/dev/null; then
+          mv -f "$_reg_tmp" "$HERD_REVIEW_REGISTRY_FILE" 2>/dev/null || rm -f "$_reg_tmp" 2>/dev/null || true
+        fi
+      fi
     fi
   fi
 
