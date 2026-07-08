@@ -301,6 +301,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic stale-duplicate gate (HERD-188) unit test passes" {
+  run bash "$REPO/tests/test-stale-dup-detect.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
