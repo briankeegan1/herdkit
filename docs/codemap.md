@@ -122,6 +122,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
 - `CLAIM_REQUIRED` → `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
+- `COMMIT_CONVENTION` → `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
