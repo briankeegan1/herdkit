@@ -313,6 +313,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
+  run bash "$REPO/tests/test-triggers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic operator inbox (HERD-184) unit test passes" {
   run bash "$REPO/tests/test-operator-inbox.sh"
   [ "$status" -eq 0 ]
