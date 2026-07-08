@@ -294,11 +294,21 @@ take_screenshot() {
   fi
 }
 
-# Build a watcher-console frame from the REAL DISPLAY[] rows the gate functions populate.
+# Build a watcher-console frame from the REAL DISPLAY[] rows the gate functions populate. Flair-aware
+# exactly as the shipped render() is (HERD-147): it prepends the merge CELEBRATION + the PASTURE HEADER
+# assembled by the REAL build_celebrate/build_pasture helpers. Byte-inert when WATCHER_FLAIR is off
+# (the default the whole drive loop runs under), so the pane captures above are unchanged.
 DISPLAY=()
+FLAIR_STATE=()
 console_frame() {
   local title="$1"
+  local _grazing=0 _fs
+  for _fs in ${FLAIR_STATE[@]+"${FLAIR_STATE[@]}"}; do [ "$_fs" = grazing ] && _grazing=$((_grazing+1)); done
+  build_celebrate "$_grazing"   # sets CELEBRATE (empty when off/none); consumes the pending marker
+  build_pasture                 # sets PASTURE   (empty when off/idle)
   printf '🐑 herd watch · %s · %s\n' "$WORKSPACE_NAME" "$title"
+  [ -n "${CELEBRATE:-}" ] && printf '%s' "$CELEBRATE"
+  [ -n "${PASTURE:-}" ] && printf '%s' "$PASTURE"
   printf '   in flight\n'
   local r
   for r in ${DISPLAY[@]+"${DISPLAY[@]}"}; do [ -n "$r" ] && printf '%s\n' "$r"; done
@@ -626,6 +636,56 @@ else
 fi
 
 
+# ── WATCHER FLAIR PACK (HERD-147): OFF byte-identical · ON adds the pasture header · dead rows LOUD ──
+# Drives the REAL flair helpers (build_celebrate/build_pasture, sourced above in lib mode) through the
+# flair-aware console_frame — the same surface the drive loop's pane captures use. Proves the two
+# invariants the feature ships on: (1) WATCHER_FLAIR=off is byte-identical to a no-flag run (no pasture
+# header, no celebration); (2) WATCHER_FLAIR=on adds a pasture header AND keeps the 💀 dead row
+# byte-identical (never softened), and a pending merge renders one 'joins the flock' celebration line.
+step flair "flair pack (HERD-147): OFF byte-identical · ON adds a pasture header, dead rows unchanged"
+DISPLAY=(); FLAIR_STATE=()
+DISPLAY+=("    ${c_red:-}💀${c_rst:-} dead-builder · builder died (no agent, no PR) · re-spawn"); FLAIR_STATE+=("dead")
+DISPLAY+=("    🔨 graze-a · building");                                                          FLAIR_STATE+=("grazing")
+DISPLAY+=("    🔨 nap-b · idle · no PR");                                                        FLAIR_STATE+=("idle")
+DISPLAY+=("    ✅ pen-c · ready · awaiting push approval");                                       FLAIR_STATE+=("pen")
+_DEAD_ROW="${DISPLAY[0]}"
+
+# (1) OFF byte-identical: a no-flag run (WATCHER_FLAIR unset → default off) and an explicit off run must
+#     produce the SAME frame, and neither may leak a pasture header.
+unset WATCHER_FLAIR;      _f_noflag="$(console_frame 'flair check')"
+export WATCHER_FLAIR=off; _f_off="$(console_frame 'flair check')"
+if [ "$_f_noflag" = "$_f_off" ] && ! printf '%s' "$_f_off" | grep -q 'pasture'; then
+  checkpoint flair_off_byte_identical pass "off frame byte-identical to a no-flag run; no pasture header, no celebration"
+else
+  checkpoint flair_off_byte_identical fail "off-mode frame diverged from the no-flag run or leaked flair"
+fi
+
+# (2a) ON adds the pasture header (one glyph per builder by state).
+export WATCHER_FLAIR=on; _f_on="$(console_frame 'flair check')"
+if printf '%s' "$_f_on" | grep -q 'pasture' && printf '%s' "$_f_on" | grep -q '🐑'; then
+  checkpoint flair_on_header_present pass "on renders the pasture header (🐑 grazing / 💤 idle / ✅ in the pen)"
+else
+  checkpoint flair_on_header_present fail "on-mode frame is missing the pasture header"
+fi
+
+# (2b) HARD RULE — the 💀 dead builder's row is byte-IDENTICAL in both modes (flair never touches DISPLAY).
+if printf '%s\n' "$_f_off" | grep -qxF "$_DEAD_ROW" && printf '%s\n' "$_f_on" | grep -qxF "$_DEAD_ROW"; then
+  checkpoint flair_dead_row_unchanged pass "💀 dead-builder row byte-identical in both modes (never softened)"
+else
+  checkpoint flair_dead_row_unchanged fail "dead-builder row changed between off/on — flair softened a loud state"
+fi
+
+# (2c) Merge CELEBRATION — a pending marker turns into exactly one 'joins the flock' line next frame.
+printf '4242\n' > "$FLAIR_CELEBRATE_STATE"
+_f_cel="$(console_frame 'flair check')"
+if printf '%s' "$_f_cel" | grep -q '#4242 joins the flock'; then
+  checkpoint flair_merge_celebration pass "post-merge celebration rendered ('🐑 #4242 joins the flock · N grazing')"
+else
+  checkpoint flair_merge_celebration fail "merge celebration line missing under WATCHER_FLAIR=on"
+fi
+unset WATCHER_FLAIR
+DISPLAY=(); FLAIR_STATE=()
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"
@@ -653,6 +713,7 @@ write_scorecard() {
     printf '  "skipped_prs": %d,\n' "$_skipped"
     printf '  "queue_drained": %s,\n' "$([ "$_merged_ct" -eq "$NPRS" ] && echo true || echo false)"
     printf '  "ticks": %d,\n' "$TICKS"
+    printf '  "flair_tested": true,\n'
     printf '  "infra_breaker_tested": true,\n'
     printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
     printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"
