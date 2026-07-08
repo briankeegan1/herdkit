@@ -127,6 +127,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backlog-view OSC 8 id-chip hyperlink (HERD-49) test passes" {
+  run bash "$REPO/tests/test-backlog-view-osc8.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic backlog-view rich-render test passes" {
+  run bash "$REPO/tests/test-backlog-view-rich.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]
@@ -141,6 +153,12 @@ setup() {
 
 @test "hermetic tab-leak-guard engine-whitelist test passes" {
   run bash "$REPO/tests/test-tab-leak-whitelist.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic sha-keyed resolver re-spawn test passes" {
+  run bash "$REPO/tests/test-watcher-respawn-resolver.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

@@ -362,6 +362,26 @@ fi
 # DOCS_ONLY_GLOB is blank.
 : "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
+# ── Risk-scoped pre-PR local review (LOCAL_REVIEW=risk-scoped + LOCAL_REVIEW_GLOB, HERD-100) ──────
+# LOCAL_REVIEW=pre-pr makes EVERY builder run the cheap local adversarial correctness review before
+# it opens its PR. Journal analysis shows round-1 review BLOCKs cluster on the high-churn engine
+# files, so a BLANKET pre-PR review wastes quota reviewing low-risk diffs that never block. The
+# risk-scoped mode fixes that: LOCAL_REVIEW=risk-scoped runs the local review ONLY when the builder's
+# OWN diff surface (git diff DEFAULT_BRANCH...HEAD --name-only) matches this egrep pattern; a diff
+# that touches no matching path skips straight to the PR (the watcher's post-PR review gate is
+# UNCHANGED and remains the authoritative correctness check, so a skipped low-risk pre-PR review is a
+# cost saving, never a safety hole — same fail-open-is-safe rationale as skipping is backstopped
+# post-PR). A DEDICATED key (not a reuse of REVIEW_ESCALATE_GLOB) on purpose: the PRE-PR risk surface
+# — where builder-side round-1 BLOCKs cluster — is chosen independently of the POST-PR review-tiering
+# surface, so operators can scope the two separately; leave it equal to REVIEW_ESCALATE_GLOB if the
+# same pattern fits both. Reuses REVIEW_ESCALATE_GLOB / HEALTHCHECK_HEAVY_GLOB egrep semantics.
+# SAFE DEFAULT: EMPTY (default) → dormant. Only LOCAL_REVIEW=risk-scoped consults it; with pre-pr or
+# none the key is inert. FAIL-SOFT (mirrors the HEALTHCHECK_HEAVY_GLOB hardening): risk-scoped with an
+# EMPTY or INVALID glob falls back — LOUDLY — to unconditional pre-pr (review everything), never to a
+# silent skip, so a misconfigured glob can only OVER-review, never UNDER-review. Consumed inline by
+# herd-quick.sh / herd-feature.sh (the builder prompt is the only surface threaded), same as LOCAL_REVIEW.
+: "${LOCAL_REVIEW_GLOB:=""}"
+
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')
@@ -436,6 +456,16 @@ fi
 # is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
 : "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
 : "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
+# Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
+# before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
+# claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang
+# it cannot see. When armed, the watcher probes `claude --version` under a HARD timeout ONCE per tick
+# before dispatching; a timeout HOLDS review/refix for that tick with a loud row + a journal infra_event
+# (the doctor's own `claude responds` probe reports the same hang at diagnosis time). 0 = OFF (byte-inert;
+# no probe exec, no journal, behavior byte-identical); N>=1 = probe timeout in seconds. Consumed by
+# agent-watch.sh. Only a genuine timeout counts as a hang — a broken/absent claude is fail-soft (never
+# holds the queue). A small value like 5 is a conservative arm for unattended runs.
+: "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
@@ -790,17 +820,29 @@ herd_write_ratelimit_hook() {
   local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
   mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
   if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
-import json, os, sys, tempfile
+import json, os, shlex, sys, tempfile
 
 path = os.environ["HERD_RH_SETTINGS"]
 sentinel = os.environ["HERD_RH_SENTINEL"]
 
-# The hook command: write the stop reason (reset banner text, if the harness passes it on stdin) to
-# the sentinel; an empty write still marks "limit hit". Kept dependency-free (sh + cat).
-cmd = "cat > %s 2>/dev/null || : > %s" % (
-    "'" + sentinel.replace("'", "'\\''") + "'",
-    "'" + sentinel.replace("'", "'\\''") + "'",
-)
+# The hook command. HERD-155 F3: a StopFailure/rate_limit hook's stdin is the harness EVENT — a JSON
+# blob (session_id, transcript_path, a reason/message, …), NOT the bare reset banner. The old `cat >`
+# wrote that whole blob, so a stray numeric field (a token count, an id fragment) could be misparsed
+# downstream as a reset clock time. Instead EXTRACT just the usage-limit banner text — the anchored
+# "reset at/in <time>" phrase, else any "usage/session limit" line — from whatever arrives (JSON or
+# raw) and write only that. An empty write still marks "limit hit" (→ HERD_LIMIT_UNKNOWN_WAIT). If
+# python3 is unavailable at hook time, the `|| : >` fallback writes an empty sentinel — never lost.
+_extract = r'''import sys, re
+raw = sys.stdin.read()
+m = re.search(r'[^\n"]*reset[s]? (?:at|in)[^\n"]*', raw, re.I)
+out = (m.group(0) if m else "").strip()
+if not out:
+    m = re.search(r'[^\n"]*(?:usage|session) limit[^\n"]*', raw, re.I)
+    out = (m.group(0) if m else "").strip()
+sys.stdout.write(out)
+'''
+q_sentinel = "'" + sentinel.replace("'", "'\\''") + "'"
+cmd = "python3 -c %s > %s 2>/dev/null || : > %s" % (shlex.quote(_extract), q_sentinel, q_sentinel)
 entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
 
 data = {}

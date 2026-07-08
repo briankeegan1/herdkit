@@ -58,7 +58,15 @@ case "$1 $2" in
     if [ -n "${STUB_SENDKEYS_LOG:-}" ]; then shift 2; printf '%s\n' "$*" >> "$STUB_SENDKEYS_LOG"; fi
     ;;
   "pane read")
-    printf '%s\n' "${STUB_PANE_READ_TEXT:-}"
+    # A faithful TUI evolves: the pane shows the limit MENU, then (after a correct select) a native
+    # wait/working surface. STUB_PANE_READ_SEQ, when set + non-empty, pops ONE line per read to model
+    # that transition; otherwise the constant STUB_PANE_READ_TEXT is returned for every read.
+    if [ -n "${STUB_PANE_READ_SEQ:-}" ] && [ -s "${STUB_PANE_READ_SEQ}" ]; then
+      head -1 "${STUB_PANE_READ_SEQ}"
+      { tail -n +2 "${STUB_PANE_READ_SEQ}" > "${STUB_PANE_READ_SEQ}.tmp" && mv "${STUB_PANE_READ_SEQ}.tmp" "${STUB_PANE_READ_SEQ}"; } 2>/dev/null || true
+    else
+      printf '%s\n' "${STUB_PANE_READ_TEXT:-}"
+    fi
     ;;
   *) exit 0 ;;
 esac
@@ -87,12 +95,22 @@ _wait_agent_working() {
 
 PANE_LOG="$T/pane-run.log";      export STUB_PANE_RUN_LOG="$PANE_LOG"
 KEYS_LOG="$T/send-keys.log";     export STUB_SENDKEYS_LOG="$KEYS_LOG"
+SEQ_FILE="$T/pane-read-seq.txt"; export STUB_PANE_READ_SEQ=""
 MENU_TEXT="1. Upgrade your plan   2. Stop and wait for limit to reset"
 CLEAR_TEXT="esc to interrupt · Claude is working…"
+# The native "Stop and wait for limit to reset" surface AFTER a correct option-2 select — a parked
+# wait banner with NO menu options. This is the POSITIVE outcome evidence the hardened select requires.
+WAIT_TEXT="Waiting for your usage limit to reset — auto-resuming at 7:30pm"
+# The DISASTER surface: selecting option 1 ("Upgrade your plan") also clears the menu but strands the
+# session at a login/upgrade screen. Menu-gone must NOT be read as success when this is what shows.
+UPGRADE_TEXT="Sign in to upgrade your plan — https://claude.ai/login"
+# seq_reads <line>... — arm the pane-read stub to return these snapshots, one per successive read.
+seq_reads() { printf '%s\n' "$@" > "$SEQ_FILE"; export STUB_PANE_READ_SEQ="$SEQ_FILE"; }
+seq_off()   { export STUB_PANE_READ_SEQ=""; }
 
 # ── (1) New helpers defined ───────────────────────────────────────────────────
-for fn in _limit_menu_keys _pane_shows_limit_menu _try_clean_limit_menu_select \
-          sendkeys_state record_sendkeys clear_sendkeys; do
+for fn in _limit_menu_keys _pane_shows_limit_menu _pane_menu_confirmed _pane_confirms_limit_wait \
+          _try_clean_limit_menu_select sendkeys_state record_sendkeys clear_sendkeys; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 ok
@@ -103,24 +121,64 @@ ok
 [ "$(HERD_LIMIT_MENU_KEYS='Down Return' _limit_menu_keys)" = "Down Return" ] || fail "2: HERD_LIMIT_MENU_KEYS must override"
 ok
 
-# ── (3) _pane_shows_limit_menu ────────────────────────────────────────────────
+# ── (3) _pane_shows_limit_menu (fail-SAFE) + _pane_menu_confirmed (needs EVIDENCE) ────────────────
 STUB_PANE_READ_TEXT="$MENU_TEXT" _pane_shows_limit_menu "pane-X" || fail "3: menu text present → should report menu still showing"
 ok
 STUB_PANE_READ_TEXT="$CLEAR_TEXT" _pane_shows_limit_menu "pane-X" && fail "3: menu-gone text → should report NO menu"
 ok
 STUB_PANE_READ_TEXT="" _pane_shows_limit_menu "pane-X" || fail "3: EMPTY read must FAIL SAFE (assume menu still present)"
 ok
+# _pane_menu_confirmed is the OPPOSITE fail-direction: it demands positive evidence.
+STUB_PANE_READ_TEXT="$MENU_TEXT" _pane_menu_confirmed "pane-X" || fail "3: menu text present → confirmed"
+ok
+STUB_PANE_READ_TEXT="$CLEAR_TEXT" _pane_menu_confirmed "pane-X" && fail "3: a normal REPL must NOT be confirmed a menu"
+ok
+STUB_PANE_READ_TEXT="" _pane_menu_confirmed "pane-X" && fail "3: EMPTY read must NOT be confirmed a menu (no evidence)"
+ok
+# _pane_confirms_limit_wait: the DISTINCT post-select outcome check.
+STUB_PANE_READ_TEXT="$WAIT_TEXT" _pane_confirms_limit_wait "pane-X" || fail "3: a native wait banner → outcome confirmed"
+ok
+STUB_PANE_READ_TEXT="$CLEAR_TEXT" _pane_confirms_limit_wait "pane-X" || fail "3: the working spinner → outcome confirmed"
+ok
+STUB_PANE_READ_TEXT="$MENU_TEXT" _pane_confirms_limit_wait "pane-X" && fail "3: a still-present menu is NOT a confirmed wait outcome"
+ok
+STUB_PANE_READ_TEXT="$UPGRADE_TEXT" _pane_confirms_limit_wait "pane-X" && fail "3: an upgrade/login surface (option-1 disaster) must NOT confirm success"
+ok
+STUB_PANE_READ_TEXT="" _pane_confirms_limit_wait "pane-X" && fail "3: EMPTY read → outcome UNVERIFIED (not a success)"
+ok
 
-# ── (4) _try_clean_limit_menu_select ──────────────────────────────────────────
+# ── (4) _try_clean_limit_menu_select (HERD-155 F2: confirm menu BEFORE keys; verify OUTCOME after) ──
 export STUB_AGENT_NAME="cs-slug" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-CS"
-# 4a. Success: after keys, the pane read shows NO menu → returns 0, keys sent, journal recorded.
+# 4a. Success: menu CONFIRMED present before keys, then the re-read shows the native WAIT banner →
+# returns 0, keys sent, journal recorded. Menu→wait is the faithful TUI transition.
 : > "$KEYS_LOG"; : > "$JOURNAL_FILE"
-STUB_PANE_READ_TEXT="$CLEAR_TEXT" _try_clean_limit_menu_select "cs-slug" "$T/trees/cs-slug" \
-  || fail "4a: clean select should return 0 when the re-read pane shows no menu"
+seq_reads "$MENU_TEXT" "$WAIT_TEXT"
+_try_clean_limit_menu_select "cs-slug" "$T/trees/cs-slug" \
+  || fail "4a: clean select should return 0 when the menu is present then the wait surface confirms"
+seq_off
 ok
 grep -qi "Down Enter" "$KEYS_LOG" || fail "4a: the menu-select keys (Down Enter) must be sent (log: $(cat "$KEYS_LOG"))"
 ok
 grep -q '"event":"limit_menu_selected"' "$JOURNAL_FILE" || fail "4a: a cleared select must journal limit_menu_selected"
+ok
+# 4a-guard. If the menu is NOT present up front (a normal REPL), NO keys are sent — never type blind.
+: > "$KEYS_LOG"; : > "$JOURNAL_FILE"
+STUB_PANE_READ_TEXT="$CLEAR_TEXT" _try_clean_limit_menu_select "cs-slug" "$T/trees/cs-slug" \
+  && fail "4a-guard: no menu present → clean select must return 1"
+ok
+[ ! -s "$KEYS_LOG" ] || fail "4a-guard: no menu present → NO keys may be sent (log: $(cat "$KEYS_LOG"))"
+ok
+grep -q '"event":"limit_menu_absent"' "$JOURNAL_FILE" || fail "4a-guard: an absent menu must journal limit_menu_absent"
+ok
+# 4a-disaster. Menu present, but after keys the pane shows an UPGRADE/login screen (option-1 selected
+# by mistake) → menu is 'gone' yet this is NOT success; keys were sent but outcome is unverified.
+: > "$KEYS_LOG"; : > "$JOURNAL_FILE"
+seq_reads "$MENU_TEXT" "$UPGRADE_TEXT" "$MENU_TEXT" "$UPGRADE_TEXT"
+_try_clean_limit_menu_select "cs-slug" "$T/trees/cs-slug" \
+  && fail "4a-disaster: a cleared-to-upgrade screen must NOT be reported as a clean select"
+seq_off
+ok
+grep -q '"event":"limit_menu_outcome_unverified"' "$JOURNAL_FILE" || fail "4a-disaster: an unconfirmed outcome must journal limit_menu_outcome_unverified"
 ok
 # 4b. Persist: pane read STILL shows the menu → returns 1 after the bounded attempts; keys attempted.
 : > "$KEYS_LOG"; : > "$JOURNAL_FILE"
@@ -131,7 +189,7 @@ ok
 ok
 [ "$(wc -l < "$KEYS_LOG")" -le 2 ] || fail "4b: attempts must be BOUNDED (default 2)"
 ok
-grep -q '"event":"limit_menu_select_failed"' "$JOURNAL_FILE" || fail "4b: a persistent menu must journal limit_menu_select_failed"
+grep -q '"event":"limit_menu_outcome_unverified"' "$JOURNAL_FILE" || fail "4b: a persistent menu must journal limit_menu_outcome_unverified"
 ok
 # 4c. Kill-switch: HERD_LIMIT_MENU_SELECT=off → immediate 1, NO keys sent.
 : > "$KEYS_LOG"
@@ -155,7 +213,9 @@ export HERD_NOW_EPOCH=1000000
 export STUB_AGENT_NAME="lim-ok" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-OK"
 rm -f "$LIMIT_STATE" "$SENDKEYS_STATE"; : > "$KEYS_LOG"; : > "$JOURNAL_FILE"
 DISPLAY=()
-STUB_PANE_READ_TEXT="$CLEAR_TEXT" _handle_limit_blocked "lim-ok" "$T/trees/lim-ok" "0" "1005000"
+seq_reads "$MENU_TEXT" "$WAIT_TEXT"
+_handle_limit_blocked "lim-ok" "$T/trees/lim-ok" "0" "1005000"
+seq_off
 [ "$(sendkeys_state "lim-ok")" = "cleared" ] || fail "5: a successful clean select must record sendkeys 'cleared'"
 ok
 grep -qi "Down Enter" "$KEYS_LOG" || fail "5: first sighting must attempt the clean menu-select"
@@ -232,7 +292,9 @@ COORD="$HERD_AGENT_COORDINATOR"
 printf '3005000' > "$(_limit_sentinel_file "$MAIN")"
 export STUB_AGENT_NAME="$COORD" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-COORD"
 rm -f "$LIMIT_STATE" "$SENDKEYS_STATE"; : > "$KEYS_LOG"; : > "$JOURNAL_FILE"
-STUB_PANE_READ_TEXT="$CLEAR_TEXT" _handle_coordinator_watchdog
+seq_reads "$MENU_TEXT" "$WAIT_TEXT"
+_handle_coordinator_watchdog
+seq_off
 grep -qi "Down Enter" "$KEYS_LOG" || fail "8: coordinator first sighting must attempt the clean menu-select (log: $(cat "$KEYS_LOG"))"
 ok
 [ "$(sendkeys_state "$COORD")" = "cleared" ] || fail "8: coordinator clean select success must record 'cleared'"
@@ -246,5 +308,33 @@ _handle_coordinator_watchdog
 [ -z "$(sendkeys_state "$COORD")" ] || fail "8: a working coordinator must clear the stale sendkeys record"
 ok
 unset COORDINATOR_WATCHDOG
+
+# ── (9) HERD-155 F1: _resume_builder REFUSES to type `claude --continue` into a menu-parked pane ──
+# Override _wait_agent_working so the test never really sleeps (return 0 = "woke").
+STUB_WAIT_FILE="$T/wait-codes.txt"
+export STUB_AGENT_NAME="rb-x" STUB_AGENT_STATUS="done" STUB_AGENT_PANE_ID="pane-RBX"
+# 9a. Pane POSITIVELY shows the limit menu → refuse: return 1, NO pane run, journal the refusal.
+: > "$PANE_LOG"; : > "$JOURNAL_FILE"; printf '0\n' > "$STUB_WAIT_FILE"
+STUB_PANE_READ_TEXT="$MENU_TEXT" _resume_builder "rb-x" "$T/trees/rb-x" "pane-RBX" \
+  && fail "9a: _resume_builder must REFUSE (return 1) when the pane is parked at the limit menu"
+ok
+[ ! -s "$PANE_LOG" ] || fail "9a: a refused resume must NOT type a claude --continue into the menu (log: $(cat "$PANE_LOG"))"
+ok
+grep -q '"event":"limit_resume_refused"' "$JOURNAL_FILE" || fail "9a: the refusal must be journaled limit_resume_refused"
+ok
+# 9b. Pane shows a normal REPL (no menu) → the backstop proceeds and fires exactly once.
+: > "$PANE_LOG"; printf '0\n' > "$STUB_WAIT_FILE"
+STUB_PANE_READ_TEXT="$CLEAR_TEXT" _resume_builder "rb-x" "$T/trees/rb-x" "pane-RBX" \
+  || fail "9b: _resume_builder must proceed when the pane is a normal REPL"
+ok
+grep -q -- "--continue" "$PANE_LOG" || fail "9b: a non-menu pane must get the claude --continue backstop"
+ok
+# 9c. Blind/empty read → NOT confirmed a menu → backstop still proceeds (pane-less env safety).
+: > "$PANE_LOG"; printf '0\n' > "$STUB_WAIT_FILE"
+STUB_PANE_READ_TEXT="" _resume_builder "rb-x" "$T/trees/rb-x" "pane-RBX" \
+  || fail "9c: an empty read must NOT block the backstop"
+ok
+grep -q -- "--continue" "$PANE_LOG" || fail "9c: empty read → backstop still fires"
+ok
 
 echo "ALL PASS ($pass checks)"
