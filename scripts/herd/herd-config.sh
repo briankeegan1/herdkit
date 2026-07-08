@@ -207,6 +207,19 @@ esac
 # scribe-step.sh both see it.
 : "${SCRIBE_LINGER_SECS:=0}"
 
+# DRAINER_HEARTBEAT_TIMEOUT — drainer singleton liveness window in seconds (HERD-109). The scribe and
+# researcher drainers are per-project singletons: an enqueue that finds a drainer of that name already
+# in `herdr agent list` short-circuits with "already running" and spawns nothing. That is a liveness
+# blind spot — a LISTED but HUNG drainer (wedged claude session / stuck step) never drains, blocking the
+# queue forever. When set, the *-step.sh drainers heartbeat on every drain step; if the enqueue path
+# then finds a "running" drainer whose heartbeat is older than this many seconds, it treats it as HUNG,
+# RECLAIMS the singleton, and spawns a FRESH drainer. The queue's atomic per-request claim keeps this
+# from double-draining. Conservative default 900 (15 min) — far above any single legitimate drain step,
+# so a healthy drainer is never falsely reclaimed and behavior is byte-identical to before. Set 0 to
+# DISABLE (never reclaim on liveness — pure legacy behavior). Non-numeric → treated as 0 (off). Shared
+# by scribe/research; defaulted here so scribe.sh / research.sh (which read it under `set -u`) both see it.
+: "${DRAINER_HEARTBEAT_TIMEOUT:=900}"
+
 # BACKLOG_VIEW_EXTRAS — view-only backlog-pane extra section. Default "" (off) → the pane output is
 # byte-identical to before. Set "github-issues" and the backlog viewer renders a SECOND, clearly
 # labeled '📥 incoming (github issues)' section BENEATH the primary work queue, listing this repo's

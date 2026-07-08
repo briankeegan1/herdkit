@@ -31,6 +31,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # backend dispatch from this drainer to the 'scribe' component (the explicit-ref reconcile path in
 # agent-watch attributes its own writes 'reconcile' before this ever runs).
 . "$HERE/journal.sh"
+# Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed drainer can be
+# detected and reclaimed by scribe.sh. Best-effort; never affects this script's stdout.
+. "$HERE/drainer-liveness.sh"
 export HERD_COMPONENT="${HERD_COMPONENT:-scribe}"
 # API backends read credentials from .herd/secrets (gitignored). The file/changelog backends
 # never touch it — sourcing is best-effort and absent-file-safe so the zero-secret case is clean.
@@ -53,8 +56,13 @@ Q="$TREES/backlog-queue"
 INBOX="$TREES/.scribe-reports"
 RECEIPT="$TREES/.backlog-last-scribe"
 POLL="${SCRIBE_POLL:-25}"
+# Liveness heartbeat file for THIS project's scribe drainer (HERD-109). scribe.sh reads the SAME path
+# to tell a hung drainer from a live one. Beat once here so EVERY subcommand (next/commit/finish/…) is
+# a progress signal, and again each poll-loop iteration below so a long poll stays fresh.
+HEARTBEAT="$TREES/.scribe.heartbeat"
 mkdir -p "$Q"
 cmd="${1:-}"
+herd_drainer_heartbeat "$HEARTBEAT"
 
 # _report_and_cleanup <claimed-path> <summary> <result> — shared post-write tail for both
 # commit (file) and add-item (api/changelog): live-view receipt, inbox line, notify, unclaim.
@@ -103,6 +111,7 @@ case "$cmd" in
       fi
       [ "$waited" -ge "$deadline" ] && { echo "EMPTY"; exit 0; }
       sleep 2; waited=$((waited+2))
+      herd_drainer_heartbeat "$HEARTBEAT"   # keep the beat fresh across a long poll/linger wait
     done
     ;;
   commit)
