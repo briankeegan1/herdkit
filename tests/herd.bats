@@ -43,6 +43,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic jira-backend test passes" {
+  run bash "$REPO/tests/test-backend-jira.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic cli backend-switch test passes" {
+  run bash "$REPO/tests/test-cli-backend-switch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic file-backend test passes" {
   run bash "$REPO/tests/test-backend-file.sh"
   [ "$status" -eq 0 ]
