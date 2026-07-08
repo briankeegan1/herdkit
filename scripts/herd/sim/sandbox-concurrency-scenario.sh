@@ -55,6 +55,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=scripts/herd/sim/sandbox-fixture.sh
 . "$HERE/sandbox-fixture.sh"
+# shellcheck source=scripts/herd/sim/posture-lib.sh
+. "$HERE/posture-lib.sh"   # canonical config postures (HERD-153) — see templates/postures.tsv
 
 # ── output helpers (mirror sandbox-scenario.sh's style) ─────────────────────────────────────────
 c_bold=$'\033[1m'; c_dim=$'\033[2m'
@@ -66,16 +68,36 @@ skip() { printf '  %s–%s %s\n' "$c_yel" "$c_rst" "$*"; }
 info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 
 # ── args ────────────────────────────────────────────────────────────────────────
-ART=""; KEEP=""; NPRS=3
+# --posture <name> selects a canonical config posture (HERD-153, templates/postures.tsv). This
+# scenario owns the MERGE-POLICY postures (solo-auto | team-approve | observe-only): each sets its
+# .herd/config keys, drives the SHIPPED watcher gate loop at zero quota, and asserts the posture's
+# merge invariant. An ABSENT --posture is byte-identical to today's single-posture run (POSTURE="" →
+# every gate function and the whole assert path below is unchanged). --posture solo-auto runs the SAME
+# drain, only tagging the scorecard with the posture field.
+ART=""; KEEP=""; NPRS=3; POSTURE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
     -n|--prs)    NPRS="${2:-3}"; shift 2 ;;
+    --posture)   POSTURE="${2:-}"; shift 2 ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-concurrency-scenario: unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+if [ -n "$POSTURE" ]; then
+  posture_exists "$POSTURE" || { echo "sandbox-concurrency-scenario: unknown posture: $POSTURE" >&2; exit 1; }
+  # This scenario only proves the MERGE-POLICY postures; push/steps postures are proven by the sibling
+  # sandbox-scenario.sh. Refuse the others LOUDLY so the matrix wrapper's routing can never silently
+  # run a posture through the wrong scenario.
+  case "$POSTURE" in
+    solo-auto|team-approve|observe-only) : ;;
+    *) echo "sandbox-concurrency-scenario: posture '$POSTURE' is not a merge-policy posture (use sandbox-scenario.sh)" >&2; exit 1 ;;
+  esac
+  # Apply the posture's real config keys BEFORE agent-watch.sh is sourced, so its module-level
+  # _effective_merge_policy (which reads MERGE_POLICY once at source time) resolves under the posture.
+  posture_apply "$POSTURE"
+fi
 case "$NPRS" in ''|*[!0-9]*) echo "sandbox-concurrency-scenario: -n must be an integer" >&2; exit 1 ;; esac
 [ "$NPRS" -ge 3 ] || NPRS=3   # the scenario is only meaningful with >= 3 simultaneous PRs
 if [ -z "$ART" ]; then ART="$(mktemp -d)"; fi
@@ -215,7 +237,9 @@ export WORKSPACE_NAME="sandbox-conc-sim"          # isolated name (tab-leak-guar
 export PROJECT_ROOT="$REPO"                        # → MAIN for do_merge's git ops
 export WORKTREES_DIR="$TREES"                      # → TREES: all ledgers/markers/journal land here
 export DEFAULT_BRANCH="main"
-export MERGE_POLICY="auto"
+# MERGE_POLICY defaults to auto (today's behavior) but a --posture may already have set it
+# (team-approve→approve, observe-only→observe) via posture_apply above; never clobber that.
+export MERGE_POLICY="${MERGE_POLICY:-auto}"
 export REVIEW_CONCURRENCY HEALTH_CONCURRENCY
 export HERD_REVIEW_BIN="$STUB_REVIEW"
 export HERD_HEALTHCHECK_BIN="$STUB_HC"
@@ -223,6 +247,9 @@ export STUB_SPAWN_LOG="$ART/review-spawns.log"; : > "$STUB_SPAWN_LOG"
 export STUB_HC_MARKERCOUNT_LOG="$ART/health-markercount.log"; : > "$STUB_HC_MARKERCOUNT_LOG"
 export STUB_HC_TREES="$TREES"
 export SANDBOX_REVIEW_DELAY="$REVIEW_DELAY"
+# Capture the engine dir (scripts/herd) BEFORE sourcing agent-watch.sh — sourcing it OVERWRITES this
+# script's $HERE with agent-watch's own (scripts/herd), so any post-source path must not rely on $HERE.
+ENGINE_DIR="$(cd "$HERE/.." && pwd)"
 WATCH="$HERE/../agent-watch.sh"
 [ -f "$WATCH" ] || { bad "agent-watch.sh not found at $WATCH"; exit 1; }
 # shellcheck source=/dev/null
@@ -375,10 +402,40 @@ run_tick() {
       esac
     fi
 
-    # (c) MERGE — real do_merge (gh pr merge stub + STATE record + real worktree reap).
-    do_merge "$slug" "$pr" "$dir" "$sha"
-    DISPLAY[$k]="    ${c_grn}✅${c_rst} $(printf '%-14s' "$slug") ${c_dim}#${pr}${c_rst} · ${c_grn}merged${c_rst}"
+    # (c) MERGE — real do_merge (gh pr merge stub + STATE record + real worktree reap). Under a
+    # --posture the merge is gated by the SHIPPED policy decision (the exact action-pass logic:
+    # _hold_decision over the effective mode + sha-keyed approval), so team-approve HOLDs and
+    # observe-only OBSERVEs instead of merging. When POSTURE is empty the decision is skipped entirely
+    # and this is byte-identical to today (always MERGE → do_merge → merged row).
+    _pdec=MERGE
+    [ -n "$POSTURE" ] && _pdec="$(_posture_merge_decision "$pr" "$sha")"
+    case "$_pdec" in
+      MERGE)
+        do_merge "$slug" "$pr" "$dir" "$sha"
+        DISPLAY[$k]="    ${c_grn}✅${c_rst} $(printf '%-14s' "$slug") ${c_dim}#${pr}${c_rst} · ${c_grn}merged${c_rst}"
+        ;;
+      HOLD)
+        approval_awaiting_noted "$pr" "$sha" || record_approval_awaiting "$pr" "$sha"
+        DISPLAY[$k]="    ${c_yel}⏸${c_rst} $(printf '%-14s' "$slug") ${c_dim}#${pr}${c_rst} · ${c_yel}held · awaiting approval${c_rst}"
+        ;;
+      OBSERVE)
+        observe_noted "$pr" "$sha" || record_observe_noted "$pr" "$sha"
+        DISPLAY[$k]="    ${c_grn}✅${c_rst} $(printf '%-14s' "$slug") ${c_dim}#${pr}${c_rst} · ${c_dim}ready · observe mode${c_rst}"
+        ;;
+    esac
   done
+}
+
+# _posture_merge_decision <pr#> <sha> — echo MERGE | HOLD | OBSERVE for a PASS-gated PR under the
+# effective merge policy, mirroring agent-watch.sh's action pass EXACTLY: derive the mode from the
+# module vars agent-watch.sh set at source time (AUTOMERGE / MERGE_OBSERVE), read the sha-keyed
+# approval, and defer to the SHIPPED _hold_decision. hv_hold is "" (the concurrency stubs open no
+# HUMAN-VERIFY PRs), so auto → MERGE and the empty-POSTURE path never calls this.
+_posture_merge_decision() {
+  local pr="$1" sha="$2" mode approved=""
+  mode=auto; [ -z "$AUTOMERGE" ] && mode=approve; [ -n "$MERGE_OBSERVE" ] && mode=observe
+  approval_is_approved "$pr" "$sha" && approved=1
+  _hold_decision "$mode" "" "$approved" "$HV_POLICY"
 }
 
 # Inter-tick wait must outlast a review's in-flight window so dispatched reviewers finish and their
@@ -386,6 +443,135 @@ run_tick() {
 INTER_TICK=$((REVIEW_DELAY + 1))
 MAX_TICKS=$((NPRS + 5))
 TICKS=0
+
+# ── POSTURE BRANCH: merge-policy postures that do NOT auto-drain (team-approve, observe-only) ─────────
+# solo-auto (and the empty-POSTURE default) fall THROUGH to the standard drain loop below unchanged.
+# team-approve and observe-only never merge on their own, so the drain-oriented asserts do not apply;
+# each runs its own bounded gate-loop drive, asserts its merge invariant against the SHIPPED gate, emits
+# a posture-tagged scorecard, and exits here (isolating posture logic from the pristine drain path).
+if [ -n "$POSTURE" ] && { [ "$POSTURE" = team-approve ] || [ "$POSTURE" = observe-only ]; }; then
+  # write_posture_scorecard <result> — machine-readable scorecard for a merge-policy posture. Carries
+  # the posture + the merge-gating fields the wrapper asserts on (posture-specific), NOT the drain
+  # fields. Reuses the CP_* arrays that checkpoint() populates.
+  write_posture_scorecard() {
+    local out="$ART/scorecard.json" result="$1" skipped=0 i n; n=${#CP_NAMES[@]}
+    for ((i=0; i<n; i++)); do [ "${CP_STATUS[$i]}" = "skip" ] && skipped=$((skipped+1)); done
+    {
+      printf '{\n'
+      printf '  "scenario": "%s",\n' "$SCENARIO"
+      printf '  "posture": "%s",\n' "$POSTURE"
+      printf '  "artifacts_dir": "%s",\n' "$ART"
+      printf '  "repo_dir": "%s",\n' "$REPO"
+      printf '  "fixture_sha": "%s",\n' "$FIXTURE_SHA"
+      printf '  "result": "%s",\n' "$result"
+      printf '  "passed": %d,\n' "$_pass"
+      printf '  "failed": %d,\n' "$_fail"
+      printf '  "skipped": %d,\n' "$skipped"
+      printf '  "prs": %d,\n' "$NPRS"
+      printf '  "merge_policy": "%s",\n' "${MERGE_POLICY:-}"
+      printf '  "merges": %d,\n' "$_PM_MERGES"
+      printf '  "merges_before_approval": %d,\n' "$_PM_MERGES_PREAPPROVAL"
+      printf '  "checkpoints": [\n'
+      for ((i=0; i<n; i++)); do
+        printf '    {"name": "%s", "status": "%s", "detail": "%s"}' \
+          "${CP_NAMES[$i]}" "${CP_STATUS[$i]}" "${CP_DETAIL[$i]}"
+        [ "$i" -lt "$((n-1))" ] && printf ',\n' || printf '\n'
+      done
+      printf '  ]\n'
+      printf '}\n'
+    } > "$out"
+    printf '%s' "$out"
+  }
+  _merge_count() { [ -s "$MERGE_LOG" ] && wc -l < "$MERGE_LOG" | tr -d ' ' || printf 0; }
+  # Bounded drive: tick until every PR has SETTLED (held or observed) or the tick budget is spent. Each
+  # tick runs the real health→review→policy gate; nothing merges under either posture.
+  _all_settled() {
+    local k pr sha
+    for k in $(seq 0 "$NIDX"); do
+      pr="${PR_NUM[$k]}"; sha="${PR_SHA[$k]}"
+      if [ "$POSTURE" = observe-only ]; then observe_noted "$pr" "$sha" || return 1
+      else approval_awaiting_noted "$pr" "$sha" || return 1; fi
+    done
+    return 0
+  }
+  step drive "posture=$POSTURE — drive the SHIPPED gate loop (no auto-merge); assert the merge invariant"
+  t=1
+  while [ "$t" -le "$MAX_TICKS" ]; do
+    TICKS="$t"; run_tick
+    [ "$t" -eq 1 ] && capture_pane "posture-tick1" "$(console_frame "posture $POSTURE · tick 1 · gates running, no merge")"
+    _all_settled && break
+    sleep "$INTER_TICK"; t=$((t+1))
+  done
+  _PM_MERGES_PREAPPROVAL="$(_merge_count)"
+
+  step assert "posture=$POSTURE — assert the merge invariant from the observed run"
+  # Common leg: every PR reached a PASS-gated settle (held/observed) — the gate actually ran (so the
+  # zero-merge result is a real GATE decision, not a stalled queue that never reached the merge seam).
+  if _all_settled; then
+    checkpoint posture_gates_settled pass "all $NPRS PRs reached the merge seam (gated PASS) under posture=$POSTURE"
+  else
+    checkpoint posture_gates_settled fail "not all PRs reached the merge seam within $TICKS ticks (gate did not run for every PR)"
+  fi
+
+  if [ "$POSTURE" = observe-only ]; then
+    # observe-only invariant: NOTHING merges, ever — not even after an approval attempt.
+    _obs_noted=0; for k in $(seq 0 "$NIDX"); do observe_noted "${PR_NUM[$k]}" "${PR_SHA[$k]}" && _obs_noted=$((_obs_noted+1)); done
+    # Adversarial probe: record an explicit approval for one PR, then re-tick. observe must IGNORE it
+    # (observe mode never merges, approval or not) — a real safety property, not a vacuous "no approval".
+    printf '%s approved %s %s\n' "0" "${PR_NUM[0]}" "${PR_SHA[0]}" >> "$APPROVALS"
+    run_tick
+    _PM_MERGES="$(_merge_count)"
+    if [ "$_PM_MERGES" -eq 0 ] && [ "$_obs_noted" -eq "$NPRS" ]; then
+      checkpoint posture_observe_never_merges pass "observe: 0 merges across the whole run ($NPRS PRs observe-noted); an injected approval did NOT cause a merge"
+    else
+      checkpoint posture_observe_never_merges fail "observe merged something (merges=$_PM_MERGES) or not all observed (observed=$_obs_noted/$NPRS)"
+    fi
+  else
+    # team-approve invariant: NOTHING merges without a sha-keyed approval. Pre-approval merges must be 0.
+    if [ "$_PM_MERGES_PREAPPROVAL" -eq 0 ]; then
+      checkpoint posture_approve_no_merge_preapproval pass "team-approve: 0 merges before any approval ($NPRS PRs held awaiting)"
+    else
+      checkpoint posture_approve_no_merge_preapproval fail "team-approve merged $_PM_MERGES_PREAPPROVAL PR(s) with NO approval on record"
+    fi
+    # Approve exactly ONE PR via the SHIPPED herd-approve.sh, re-tick: EXACTLY that PR merges, others hold.
+    env HERD_CONFIG_FILE="$HERD_CONFIG_FILE" WORKTREES_DIR="$TREES" PROJECT_ROOT="$REPO" \
+        DEFAULT_BRANCH=main NO_COLOR=1 HERD_DRIVER=headless \
+        bash "$ENGINE_DIR/herd-approve.sh" approve "${PR_NUM[0]}" >/dev/null 2>&1 || true
+    run_tick
+    _after_one="$(_merge_count)"
+    _first_merged=0; already_merged "${PR_NUM[0]}" "${PR_SLUG[0]}" && _first_merged=1
+    if [ "$_after_one" -eq 1 ] && [ "$_first_merged" -eq 1 ]; then
+      checkpoint posture_approve_merges_only_approved pass "team-approve: after approving #${PR_NUM[0]} only IT merged (merges=1); the other $((NPRS-1)) still held"
+    else
+      checkpoint posture_approve_merges_only_approved fail "approving one PR did not merge exactly it (merges=$_after_one, first_merged=$_first_merged)"
+    fi
+    # Approve the rest and drain, proving the hold is releasable and no double-merge slips through.
+    for k in $(seq 1 "$NIDX"); do
+      env HERD_CONFIG_FILE="$HERD_CONFIG_FILE" WORKTREES_DIR="$TREES" PROJECT_ROOT="$REPO" \
+          DEFAULT_BRANCH=main NO_COLOR=1 HERD_DRIVER=headless \
+          bash "$ENGINE_DIR/herd-approve.sh" approve "${PR_NUM[$k]}" >/dev/null 2>&1 || true
+    done
+    t=1; while [ "$t" -le "$MAX_TICKS" ]; do run_tick; all_merged && break; sleep "$INTER_TICK"; t=$((t+1)); done
+    _PM_MERGES="$(_merge_count)"
+    _dupes="$(sort "$MERGE_LOG" 2>/dev/null | uniq -d | grep -c . || true)"
+    if all_merged && [ "$_PM_MERGES" -eq "$NPRS" ] && [ "$_dupes" -eq 0 ]; then
+      checkpoint posture_approve_drains_after_approval pass "team-approve: all $NPRS merged only after approval; no double-merge"
+    else
+      checkpoint posture_approve_drains_after_approval fail "post-approval drain wrong (merges=$_PM_MERGES/$NPRS, dupes=$_dupes)"
+    fi
+  fi
+  capture_pane "posture-drained" "$(console_frame "posture $POSTURE · settled in $TICKS ticks")"
+
+  RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
+  SCARD="$(write_posture_scorecard "$RESULT")"
+  printf '\n%s══ posture scorecard (%s) ══%s\n' "$c_bold" "$POSTURE" "$c_rst"
+  printf '  result:        %s\n' "$RESULT"
+  printf '  passed/failed: %d / %d\n' "$_pass" "$_fail"
+  printf '  merges:        %d (pre-approval %d)\n' "${_PM_MERGES:-0}" "$_PM_MERGES_PREAPPROVAL"
+  printf '  scorecard:     %s\n' "$SCARD"
+  [ "$RESULT" = "pass" ] && exit 0 || exit 1
+fi
+
 t=1
 while [ "$t" -le "$MAX_TICKS" ]; do
   TICKS="$t"
@@ -694,6 +880,9 @@ write_scorecard() {
   {
     printf '{\n'
     printf '  "scenario": "%s",\n' "$SCENARIO"
+    # POSTURE is empty on the default (no --posture) run → this line is omitted, keeping the scorecard
+    # BYTE-IDENTICAL to today's. --posture solo-auto runs this SAME drain and only adds the tag.
+    [ -n "$POSTURE" ] && printf '  "posture": "%s",\n' "$POSTURE"
     printf '  "artifacts_dir": "%s",\n' "$ART"
     printf '  "repo_dir": "%s",\n' "$REPO"
     printf '  "fixture_sha": "%s",\n' "$FIXTURE_SHA"

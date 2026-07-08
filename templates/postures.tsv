@@ -1,0 +1,30 @@
+# templates/postures.tsv — the CANONICAL CONFIG POSTURES (HERD-153): the committed, authoritative
+# set of named operating postures for a herd control room. A "posture" is a small, human-named bundle
+# of .herd/config KEY=VALUE settings that together select one coherent governance stance (who merges,
+# whether a human approves, whether a push is gated, what pipeline steps run). This file is the SINGLE
+# SOURCE OF TRUTH for those bundles: the posture-matrix sim (scripts/herd/sim/sandbox-posture-matrix.sh)
+# proves the gate loop under each posture here, and HERD-141 (init v2 posture profiles, queued) will
+# CONSUME this file to offer these postures at `herd init` time and render the chosen bundle into a
+# project's .herd/config. Keep it authoritative: add a posture here (not in the sim or the installer)
+# and every consumer picks it up.
+#
+# Format — one TAB-SEPARATED row per posture (columns separated by a literal tab, NOT spaces):
+#     name <TAB> keys <TAB> intent
+#
+#   name    kebab-case posture id — stable; used as the sim/scorecard key and the HERD-141 profile id.
+#   keys    the posture's config bundle: a SPACE-separated list of KEY=VALUE pairs, each an existing
+#           .herd/config key (see templates/capabilities.tsv / templates/config.example). An empty or
+#           absent key falls back to its engine default, so a posture lists ONLY the keys it changes.
+#           The special token STEPS_PROFILE=<id> is NOT a config key: it names a pipeline-steps profile
+#           (a templates/steps.example-shaped .herd/steps.tsv) that HERD-141 renders and the sim builds
+#           as a fixture — it is how a posture pulls in a steps.tsv stage without inlining the TSV here.
+#   intent  one-line human description of the stance — what this posture is FOR (surfaced by HERD-141).
+#
+# Blank lines and lines whose first field starts with '#' are ignored; the columns are tab-separated.
+# The five rows below are the canonical postures the posture-matrix sim asserts an invariant for.
+name	keys	intent
+solo-auto	MERGE_POLICY=auto	Solo operator, full autonomy: the watcher runs every gate and auto-merges — today's fixture default, no human in the merge loop.
+team-approve	MERGE_POLICY=approve HUMAN_VERIFY_POLICY=hold	Team review: gates run to green, then the merge HOLDS for a sha-keyed human approval — nothing lands without an explicit approve.
+gated-push	PUSH_GATE=human PR_FLOW=draft	Locked-down egress: a finished builder HOLDS before pushing; a human approves the push, and PRs open as drafts — nothing reaches the remote unreviewed.
+custom-steps	STEPS_PROFILE=approve-stage	Operator-defined pipeline: a .herd/steps.tsv adds an approve-stage the lane must hold on and a human must release, on top of the built-in review/health floor.
+observe-only	MERGE_POLICY=observe	Watch-only shadow mode: the watcher runs every gate and reports/notifies but NEVER merges — for dry-running the loop against a repo you do not yet let it land into.

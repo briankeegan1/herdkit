@@ -166,7 +166,15 @@ _status_run() {
   #     read-only replica of the watcher's signature. gh/herdr absence degrades gracefully.
   local wt_porcelain agents_json prs_json
   wt_porcelain="$(git -C "$root" worktree list --porcelain 2>/dev/null || true)"
-  agents_json="$(herdr agent list 2>/dev/null || printf '{}')"
+  # Builder roster via the driver seam (herdr-claude → `herdr agent list`; headless → the detached-agent
+  # registry), the same seam agent-watch.sh reads. Guarded like the liveness probe below so a standalone
+  # source (the hermetic test) — where driver.sh is not loaded — degrades to an empty roster instead of a
+  # raw herdr call.
+  if declare -f herd_driver_agent_list_json >/dev/null 2>&1; then
+    agents_json="$(herd_driver_agent_list_json 2>/dev/null || printf '{}')"
+  else
+    agents_json='{}'
+  fi
   prs_json="$( (cd "$root" 2>/dev/null && gh pr list --json number,title,headRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision 2>/dev/null) || printf '[]')"
 
   # Emit one record per feature worktree: wt \x1f slug \x1f branch \x1f prnum \x1f mergeable \x1f

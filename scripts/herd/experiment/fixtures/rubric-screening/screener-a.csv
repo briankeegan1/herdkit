@@ -1,0 +1,16 @@
+item_id,criterion,verdict,reason,confidence
+item-01,scoped,pass,"single flag, clearly bounded",0.95
+item-01,testable,pass,"can assert nothing is written in dry-run",0.9
+item-01,safe,pass,"--dry-run only prints",0.98
+item-02,scoped,unsure,"no scope given — cannot tell",0.3
+item-02,testable,unsure,"no acceptance criteria stated",0.25
+item-02,safe,pass,"nothing destructive described",0.6
+item-03,scoped,pass,"one cache + one test",0.9
+item-03,testable,pass,"explicit unit test named",0.95
+item-03,safe,pass,"pure read-path optimization",0.85
+item-04,scoped,pass,"one nightly job",0.8
+item-04,testable,pass,"can assert stale rows gone",0.7
+item-04,safe,fail,"purge deletes rows — destructive path",0.75
+item-05,scoped,pass,"rename only",0.95
+item-05,testable,pass,"existing tests still cover it",0.9
+item-05,safe,pass,"no behavior change",0.95

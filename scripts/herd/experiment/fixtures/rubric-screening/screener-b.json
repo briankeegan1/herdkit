@@ -1,0 +1,17 @@
+[
+  {"item_id": "item-01", "criterion": "scoped",   "verdict": "pass",   "reason": "bounded flag addition",                "confidence": 0.9},
+  {"item_id": "item-01", "criterion": "testable",  "verdict": "pass",   "reason": "dry-run output is observable",          "confidence": 0.88},
+  {"item_id": "item-01", "criterion": "safe",      "verdict": "pass",   "reason": "no writes in dry-run",                  "confidence": 0.97},
+  {"item_id": "item-02", "criterion": "scoped",    "verdict": "unsure", "reason": "too vague to scope",                    "confidence": 0.2},
+  {"item_id": "item-02", "criterion": "testable",  "verdict": "unsure", "reason": "no way to tell it works",               "confidence": 0.2},
+  {"item_id": "item-02", "criterion": "safe",      "verdict": "pass",   "reason": "no destructive path mentioned",         "confidence": 0.55},
+  {"item_id": "item-03", "criterion": "scoped",    "verdict": "pass",   "reason": "single cache change",                   "confidence": 0.92},
+  {"item_id": "item-03", "criterion": "testable",  "verdict": "pass",   "reason": "hit assertion is testable",             "confidence": 0.93},
+  {"item_id": "item-03", "criterion": "safe",      "verdict": "pass",   "reason": "read-path only",                        "confidence": 0.8},
+  {"item_id": "item-04", "criterion": "scoped",    "verdict": "pass",   "reason": "one scheduled job",                     "confidence": 0.78},
+  {"item_id": "item-04", "criterion": "testable",  "verdict": "pass",   "reason": "row count is observable",               "confidence": 0.72},
+  {"item_id": "item-04", "criterion": "safe",      "verdict": "pass",   "reason": "routine reversible retention job",      "confidence": 0.6},
+  {"item_id": "item-05", "criterion": "scoped",    "verdict": "pass",   "reason": "rename only",                           "confidence": 0.96},
+  {"item_id": "item-05", "criterion": "testable",  "verdict": "pass",   "reason": "covered by existing tests",             "confidence": 0.9},
+  {"item_id": "item-05", "criterion": "safe",      "verdict": "pass",   "reason": "no behavior change",                    "confidence": 0.94}
+]

@@ -34,6 +34,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/sandbox-fixture.sh"
 # shellcheck source=scripts/herd/sim/sim-notify-stub.sh
 . "$HERE/sim-notify-stub.sh"   # notify hermeticity (HERD-139) — installed after $ART is known
+# shellcheck source=scripts/herd/sim/posture-lib.sh
+. "$HERE/posture-lib.sh"       # canonical config postures (HERD-153) — see templates/postures.tsv
 
 # ── output helpers (mirror cross-repo-loop-sim.sh's style) ──────────────────────────────────────
 c_bold=$'\033[1m'; c_dim=$'\033[2m'
@@ -45,15 +47,29 @@ skip() { printf '  %s–%s %s\n' "$c_yel" "$c_rst" "$*"; }
 info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 
 # ── args ────────────────────────────────────────────────────────────────────────
-ART=""; KEEP=""
+# --posture <name> selects a canonical config posture (HERD-153, templates/postures.tsv). This
+# scenario owns the PUSH / STEPS postures (gated-push | custom-steps): it drives the SHIPPED push-gate
+# and pipeline-steps seams (below) and, when a posture is given, asserts that posture's invariant as a
+# posture_invariant checkpoint + a posture-tagged scorecard field. An ABSENT --posture is byte-identical
+# to today's run (POSTURE="" → no posture field, no posture phase).
+ART=""; KEEP=""; POSTURE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
+    --posture)   POSTURE="${2:-}"; shift 2 ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-scenario: unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+if [ -n "$POSTURE" ]; then
+  posture_exists "$POSTURE" || { echo "sandbox-scenario: unknown posture: $POSTURE" >&2; exit 1; }
+  case "$POSTURE" in
+    gated-push|custom-steps) : ;;
+    *) echo "sandbox-scenario: posture '$POSTURE' is not a push/steps posture (merge-policy postures run through sandbox-concurrency-scenario.sh)" >&2; exit 1 ;;
+  esac
+  posture_apply "$POSTURE"
+fi
 if [ -z "$ART" ]; then ART="$(mktemp -d)"; fi
 mkdir -p "$ART"
 if [ -z "$KEEP" ]; then trap 'rm -rf "$ART"' EXIT; fi
@@ -120,6 +136,8 @@ write_scorecard() {
   {
     printf '{\n'
     printf '  "scenario": "%s",\n' "$SCENARIO"
+    # POSTURE is empty on the default run → line omitted → scorecard BYTE-IDENTICAL to today's.
+    [ -n "$POSTURE" ] && printf '  "posture": "%s",\n' "$POSTURE"
     printf '  "artifacts_dir": "%s",\n' "$ART"
     printf '  "repo_dir": "%s",\n' "$REPO"
     printf '  "fixture_sha": "%s",\n' "$fixture_sha"
@@ -722,6 +740,96 @@ else
     checkpoint pipeline_steps_two_approve pass "two hold=approve steps gate independently: approving check-a does NOT release check-b; merge proceeds (rc 0) only after BOTH approved; ledger bounded (2 awaiting rows)"
   else
     checkpoint pipeline_steps_two_approve fail "independent double-approve gate failed (rc1=$_st2_rc1 rc2=$_st2_rc2 rc3=$_st2_rc3 awaiting_ct=$_st2_await_ct)"
+  fi
+fi
+
+# ── POSTURE INVARIANT (HERD-153) — asserted only under --posture; byte-inert otherwise ────────────
+# gated-push and custom-steps assert the invariant the posture exists for, on top of the phases above.
+# The check is a SINGLE posture_invariant checkpoint so the matrix wrapper reads one verdict per posture,
+# and — for custom-steps — SANDBOX_FORCE_STEPS_FAULT=1 injects the PR #249 defect class (a steps ledger
+# that DOUBLE-releases / releases a STALE sha) so the sim's release-once guard is proven to catch it RED
+# (the fault-injection self-check convention from PR #274: the forced fault flips EXACTLY this checkpoint).
+if [ -n "$POSTURE" ]; then
+  # _cp_status <name> — echo the recorded status of an already-emitted checkpoint (empty if absent).
+  _cp_status() {
+    local want="$1" i n; n=${#CP_NAMES[@]}
+    for ((i=0; i<n; i++)); do [ "${CP_NAMES[$i]}" = "$want" ] && { printf '%s' "${CP_STATUS[$i]}"; return 0; }; done
+  }
+  if [ "$POSTURE" = gated-push ]; then
+    step posture "posture=gated-push — invariant: nothing reaches the remote before a human approves the push"
+    # The push-gate phase already drove the SHIPPED PUSH_GATE=human seam. The posture invariant is
+    # exactly its two egress-safety checkpoints: a finished builder HELD with NOTHING pushed, and a
+    # stale (new-commit) approval REFUSED with nothing pushed. Both green ⇒ the invariant holds.
+    if [ "$(_cp_status push_gate_held_no_push)" = pass ] && [ "$(_cp_status push_gate_stale_refused)" = pass ]; then
+      checkpoint posture_invariant pass "gated-push: no branch reached origin before approval (held+no-push) and a stale-sha approval was refused"
+    else
+      checkpoint posture_invariant fail "gated-push egress invariant broke (held_no_push=$(_cp_status push_gate_held_no_push), stale_refused=$(_cp_status push_gate_stale_refused))"
+    fi
+  elif [ "$POSTURE" = custom-steps ]; then
+    step posture "posture=custom-steps — invariant: an approve-stage hold RELEASES exactly once per (sha,step)"
+    PS_ENGINE="$HERE/.."
+    if [ ! -f "$PS_ENGINE/steps.sh" ] || [ ! -f "$PS_ENGINE/herd-approve.sh" ]; then
+      checkpoint posture_invariant skip "steps.sh / herd-approve.sh not found — custom-steps posture invariant skipped"
+    else
+      PS_REPO="$ART/ps-repo"; PS_TREES="$ART/ps-trees"; mkdir -p "$PS_TREES"
+      PS_STEPS="$ART/ps-steps.tsv"; PS_JN="$ART/ps-journal.jsonl"; : > "$PS_JN"
+      sandbox_fixture_build "$PS_REPO" >/dev/null 2>&1
+      # The STEPS_PROFILE=approve-stage fixture: two pre-merge hold=approve stages around a plain gate.
+      {
+        printf 'rel-a\tpre-merge\techo rel-a ran\tblock\tapprove\n'
+        printf 'rel-b\tpre-merge\techo rel-b ran\tblock\tapprove\n'
+        printf 'final\tpre-merge\techo final ok\tblock\tnone\n'
+      } > "$PS_STEPS"
+      ps_env() {
+        env HERD_CONFIG_FILE="$ART/.ps-no-config" PROJECT_ROOT="$PS_REPO" WORKTREES_DIR="$PS_TREES" \
+            HERD_STEPS_FILE="$PS_STEPS" JOURNAL_FILE="$PS_JN" NO_COLOR=1 HERD_DRIVER=headless "$@"
+      }
+      _ps_hold="$PS_TREES/.agent-watch-step-holds"
+      # Drive the real approve-stage flow to completion: hold rel-a → approve → hold rel-b → approve →
+      # final passes. Each hold releases exactly once; the ledger records one 'released' per (sha,step).
+      ps_env bash "$PS_ENGINE/steps.sh" run pre-merge --slug ps-demo --dir "$PS_REPO" >/dev/null 2>&1 || true
+      ps_env bash "$PS_ENGINE/herd-approve.sh" approve ps-demo >/dev/null 2>&1 || true
+      ps_env bash "$PS_ENGINE/steps.sh" run pre-merge --slug ps-demo --dir "$PS_REPO" >/dev/null 2>&1 || true
+      ps_env bash "$PS_ENGINE/herd-approve.sh" approve ps-demo >/dev/null 2>&1 || true
+      ps_env bash "$PS_ENGINE/steps.sh" run pre-merge --slug ps-demo --dir "$PS_REPO" >/dev/null 2>&1 || true
+
+      # REGRESSION INJECTION (PR #249 defect class): a buggy steps ledger that DOUBLE-releases a (sha,step)
+      # AND records a release keyed to a STALE sha. The release-once guard below must catch either.
+      if [ "${SANDBOX_FORCE_STEPS_FAULT:-}" = "1" ]; then
+        _ps_cur="$(grep 'awaiting ps-demo ' "$_ps_hold" 2>/dev/null | tail -1 | awk '{print $4}')"
+        {
+          printf '0 released ps-demo %s rel-a\n' "$_ps_cur"                 # double-release of (cur,rel-a)
+          printf '0 released ps-demo deadbeefstalesha0000000000000000000000 rel-a\n'  # stale-sha release
+        } >> "$_ps_hold"
+        info "fault injected: double-release + stale-sha release appended to the step-holds ledger"
+      fi
+
+      # release-once guard: for slug ps-demo, every 'released (sha,step)' must appear EXACTLY once, and
+      # every released sha must be the CURRENT (last-awaited) sha — no stale-sha release. Reads the real
+      # ledger the shipped steps.sh wrote (plus any injected defect).
+      if python3 - "$_ps_hold" ps-demo <<'PY'
+import sys
+led, slug = sys.argv[1], sys.argv[2]
+released, cur = {}, None
+try:
+    for line in open(led):
+        p = line.split()
+        if len(p) < 5 or p[2] != slug: continue
+        state, sha, step = p[1], p[3], p[4]
+        if state == 'awaiting': cur = sha
+        elif state == 'released': released[(sha, step)] = released.get((sha, step), 0) + 1
+except FileNotFoundError:
+    sys.exit(1)
+ok = bool(released) and all(v == 1 for v in released.values()) \
+     and all(sha == cur for (sha, _s) in released)
+sys.exit(0 if ok else 1)
+PY
+      then
+        checkpoint posture_invariant pass "custom-steps: each approve-stage hold released exactly once per (sha,step); no stale-sha release"
+      else
+        checkpoint posture_invariant fail "custom-steps release-once invariant broke — a (sha,step) double-released or a stale sha was released (PR #249 defect class)"
+      fi
+    fi
   fi
 fi
 

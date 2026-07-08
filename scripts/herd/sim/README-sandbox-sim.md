@@ -163,6 +163,46 @@ cap=3 parameterized run).
 > concurrency-invariant assertions, and visual/pane confirmation. A hosted repo + a real herdr
 > control room with live panes remain P1+ proper.
 
+## POSTURE MATRIX — `sandbox-posture-matrix.sh` (HERD-153)
+
+Where the scenarios above each prove **one** governance stance, the posture matrix proves the shipped
+gate loop under **every canonical posture** at once. The postures are committed, authoritative data in
+[`templates/postures.tsv`](../../../templates/postures.tsv) — the SINGLE source of truth (HERD-141 init
+v2 will consume the same file). Each posture is a small named bundle of `.herd/config` keys:
+
+| Posture | Keys | Invariant the sim asserts |
+|---|---|---|
+| `solo-auto` | `MERGE_POLICY=auto` | drains fully — **byte-identical** to today's single-posture run |
+| `team-approve` | `MERGE_POLICY=approve` `HUMAN_VERIFY_POLICY=hold` | **nothing merges without a sha-keyed approval** |
+| `gated-push` | `PUSH_GATE=human` `PR_FLOW=draft` | **nothing reaches the remote** before the push is approved |
+| `custom-steps` | `STEPS_PROFILE=approve-stage` | an approve-stage hold **releases exactly once per (sha,step)** |
+| `observe-only` | `MERGE_POLICY=observe` | **nothing merges, ever** |
+
+Each posture routes to the scenario that structurally exercises its invariant and runs it with the new
+`--posture` flag (the merge-policy postures through `sandbox-concurrency-scenario.sh`, which drives the
+real `do_merge` gate loop; the push/steps postures through `sandbox-scenario.sh`, which drives the real
+`push-gate.sh` + `steps.sh` seams). The matrix emits **one scorecard per posture** under
+`<artifacts>/<posture>/scorecard.json` and a combined `<artifacts>/matrix.json`.
+
+```bash
+# Run the whole matrix (one scorecard per posture + matrix.json):
+SANDBOX_NO_SCREENSHOT=1 bash scripts/herd/sim/sandbox-posture-matrix.sh --artifacts /tmp/posture-matrix
+
+# A single posture through its scenario:
+bash scripts/herd/sim/sandbox-concurrency-scenario.sh --posture team-approve --artifacts /tmp/ta
+bash scripts/herd/sim/sandbox-scenario.sh --posture gated-push --artifacts /tmp/gp
+
+# Regression self-check — the injected PR #249 defect (a steps ledger that double-releases / releases a
+# stale sha) MUST come back RED, flipping exactly the posture_invariant checkpoint:
+SANDBOX_FORCE_STEPS_FAULT=1 bash scripts/herd/sim/sandbox-scenario.sh --posture custom-steps --artifacts /tmp/csf
+```
+
+The default (no `--posture`) invocation of either scenario is **byte-identical** to today — the posture
+logic is inert when unset, so the per-merge sims stay cheap. The matrix is an **explicit** invocation
+(a nightly candidate, not a per-merge gate). Hermetic proof:
+[`../../../tests/test-sandbox-posture-matrix.sh`](../../../tests/test-sandbox-posture-matrix.sh) — the
+five posture invariants, the caught fault, and the byte-identical solo-auto check.
+
 ## P2a — end-to-end LIMIT-PARK / AUTO-RESUME scenario — `sandbox-limit-resume-scenario.sh`
 
 The **auto-resume moat**, proven end-to-end and hermetically. Where the P1 concurrency scenario
