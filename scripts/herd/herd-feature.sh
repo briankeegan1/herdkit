@@ -283,9 +283,8 @@ PORT=""
 if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ -n "$APP_PREVIEW_CMD" ] && [ "${HERD_NO_APP:-}" != "1" ]; then
   # Free-port search over a CONFIGURABLE range (docs/external-consumer-audit.md "Leak C"): the default
   # base 8501 reproduces today's port block (8501-8599), so an existing web app is unchanged;
-  # APP_PREVIEW_PORT_BASE lets an app use its own convention (:8080, :3000). Read INLINE with a default
-  # (NOT declared in herd-config.sh / capabilities.tsv); FOLLOW-UP: document APP_PREVIEW_PORT_BASE in
-  # templates/capabilities.tsv (owned by another PR).
+  # APP_PREVIEW_PORT_BASE lets an app use its own convention (:8080, :3000). A declared config key
+  # (templates/capabilities.tsv), read INLINE here with the shipped 8501 default as its fallback.
   _PORT_BASE="${APP_PREVIEW_PORT_BASE:-8501}"
   case "$_PORT_BASE" in ''|*[!0-9]*) _PORT_BASE=8501 ;; esac
   PORT=$(PORT_BASE="$_PORT_BASE" python3 - <<'PY'

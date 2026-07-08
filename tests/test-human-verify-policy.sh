@@ -61,12 +61,16 @@ export PATH="$BIN:$PATH"
 export WORKTREES_DIR="$T/trees"; mkdir -p "$WORKTREES_DIR"
 export HERD_CONFIG_FILE="$T/no-such-config"
 
-# ── 1. capabilities.tsv: HUMAN_VERIFY_POLICY documented as a watcher-affecting, machine-scoped key ─
-row="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print NF"|"$5"|"$6; exit}' "$CAPS")"
+# ── 1. capabilities.tsv: HUMAN_VERIFY_POLICY = watcher-affecting, PROJECT-scoped, GOVERNANCE key ───
+# Reclassified in HERD-161: it is a MERGE-GATE policy (how a HUMAN-VERIFY hold resolves under auto-
+# merge), a project-wide decision like MERGE_POLICY — NOT a per-machine operator posture — so scope is
+# project (empty) and governance=governance, not machine.
+row="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print NF"|"$5"|"$6"|"$7; exit}' "$CAPS")"
 [ -n "$row" ] || fail "(1) HUMAN_VERIFY_POLICY missing from capabilities.tsv (kind=config)"
-[ "${row%%|*}" = "6" ] || fail "(1) HUMAN_VERIFY_POLICY row should have 6 columns, got: $row"
-[ "$(echo "$row" | cut -d'|' -f2)" = "watcher" ] || fail "(1) HUMAN_VERIFY_POLICY requires must be 'watcher', got: $row"
-[ "$(echo "$row" | cut -d'|' -f3)" = "machine" ] || fail "(1) HUMAN_VERIFY_POLICY scope must be 'machine' (posture opt-in), got: $row"
+[ "${row%%|*}" = "7" ] || fail "(1) HUMAN_VERIFY_POLICY row should have 7 columns, got: $row"
+[ "$(echo "$row" | cut -d'|' -f2)" = "watcher" ]    || fail "(1) HUMAN_VERIFY_POLICY requires must be 'watcher', got: $row"
+[ "$(echo "$row" | cut -d'|' -f3)" = "" ]           || fail "(1) HUMAN_VERIFY_POLICY scope must be project (empty), got: $row"
+[ "$(echo "$row" | cut -d'|' -f4)" = "governance" ] || fail "(1) HUMAN_VERIFY_POLICY governance must be 'governance', got: $row"
 ok
 # when_to_surface (col 4) present and mentions all three values so the manifest is self-documenting.
 wts="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY"{print $4; exit}' "$CAPS")"

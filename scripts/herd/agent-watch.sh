@@ -1610,6 +1610,17 @@ _merge_method_flag() {
   esac
 }
 
+# _delete_branch_flag — '--delete-branch' when DELETE_BRANCH_ON_MERGE is true, else empty. Composed
+# UNQUOTED into the `gh pr merge` line (alongside the always-present _merge_method_flag) so on the
+# default false it contributes NO argument and the merge is byte-identical to before; on true, gh
+# deletes the merged head branch instead of letting merged feature branches accumulate on the remote.
+_delete_branch_flag() {
+  case "${DELETE_BRANCH_ON_MERGE:-false}" in
+    1|true|yes|on) printf '%s' '--delete-branch' ;;
+    *)             : ;;
+  esac
+}
+
 # HERD_RESOLVE_BIN is a test seam mirroring HERD_REVIEW_BIN: the hermetic suite points it at a stub
 # resolver so the dispatch → death → respawn → cap loop is driven WITHOUT a real Claude agent.
 : "${HERD_RESOLVE_BIN:="$HERE/herd-resolve.sh"}"
@@ -2132,12 +2143,12 @@ do_merge() {
   # for a legacy caller that threaded no sha; there we fall back to the unpinned merge (byte-identical to
   # before this change) rather than refuse a merge we cannot pin.
   if [ -n "$dsha" ]; then
-    if ! gh pr merge "$dp" "$(_merge_method_flag)" --match-head-commit "$dsha" >/dev/null 2>&1; then
+    if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
       journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
       return 1
     fi
   else
-    gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
+    gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1 || return 1
   fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
@@ -4379,9 +4390,8 @@ print(json.dumps([p for p in prs if keep(p)]))
 #   all             — team mode: teammates' PRs are DISPLAYED, but auto-merge is STRICTLY scoped to
 #                     PRs OWNED by the configured operator. A teammate's PR is surfaced as
 #                     "not mine — manual" and is NEVER auto-merged, even when MERGEABLE+CLEAN+approved.
-# NB: WATCHER_SCOPE is intentionally NOT yet documented in capabilities.tsv — that doc entry is a
-# deliberate follow-up (another builder owns capabilities.tsv this wave); read here with an inline
-# default so a config without the key behaves exactly as the solo default.
+# WATCHER_SCOPE is a declared config key (templates/capabilities.tsv, governance-classified); read
+# here with an inline default so a config without the key behaves exactly as the solo default.
 _watcher_scope() {
   case "${WATCHER_SCOPE:-mine}" in
     mine|all) printf '%s' "${WATCHER_SCOPE:-mine}" ;;

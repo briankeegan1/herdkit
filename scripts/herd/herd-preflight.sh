@@ -26,8 +26,8 @@
 # through the current herdkit values so this repo's own output is byte-unchanged (external-consumer
 # audit, Leak A / ranked follow-up #7). Prefer the EXISTING config identity WORKSPACE_NAME (set in
 # .herd/config, sourced before this file); HERD_BRAND is an explicit override for when the display
-# brand and the workspace name should differ. FOLLOW-UP: a capabilities.tsv row for the brand knob is
-# owned by another PR — do NOT add one here; this inline default keeps herdkit's output unchanged.
+# brand and the workspace name should differ. HERD_BRAND is a declared config key
+# (templates/capabilities.tsv); this inline default keeps herdkit's own output byte-unchanged.
 _herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
 
 herd_preflight() {
