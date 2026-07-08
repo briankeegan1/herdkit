@@ -103,6 +103,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic drainer one-shot exec seam (HERD-150 P3) test passes" {
+  run bash "$REPO/tests/test-oneshot-exec-seam.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic model-matrix (HERD-151) test passes" {
   run bash "$REPO/tests/test-model-matrix.sh"
   [ "$status" -eq 0 ]
