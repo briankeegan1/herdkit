@@ -335,9 +335,25 @@ _hk_dh_verdict() {
   [ -n "$_hk_dh_dir" ] && rm -rf "$_hk_dh_dir"
 }
 
+# ── HERD-192 PER-TEST TIMEOUT + NO-TTY STDIN ─────────────────────────────────────────────────────
+# A single test that hangs must become a FAST, NAMED failure — never a silent multi-hour hang that
+# leaks watchers (the 'hermetic cli backend-switch' test once read /dev/tty in a backgrounded suite
+# and hung 63 min before it was killed by hand). Two defenses, applied to EVERY bats/suite run below:
+#   (1) BATS_TEST_TIMEOUT — bats-core (≥1.5, here 1.13) natively kills any single test exceeding this
+#       many seconds and reports THAT test's name, so a hang turns into one fast named failure. The
+#       slowest legit test measured ~5.5s, so 60s is generous headroom yet still bounds a true hang
+#       to a minute. Overridable: export BATS_TEST_TIMEOUT=<n> to raise/lower it.
+#   (2) stdin from /dev/null — a backgrounded gate has no controlling terminal, so a test that reads
+#       /dev/tty would block forever; /dev/null gives it immediate EOF instead. Also wraps the
+#       hermetic *.sh suite (which bats itself is unavailable) in `timeout` for the same per-test bound.
+# Byte-identical for a normal fast suite: nothing changes unless a test would otherwise hang.
+export BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-60}"
+_hk_suite_timeout=""
+command -v timeout >/dev/null 2>&1 && _hk_suite_timeout="timeout ${BATS_TEST_TIMEOUT}"
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  to="$(PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" bats tests/*.bats 2>&1)" && _hk_bats_rc=0 || _hk_bats_rc=$?
+  to="$(PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" bats tests/*.bats </dev/null 2>&1)" && _hk_bats_rc=0 || _hk_bats_rc=$?
   _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the HERD-187 env-only tolerance below
   if [ "$_hk_bats_rc" -eq 0 ]; then
     t_note="tests: bats pass"
@@ -361,7 +377,7 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then
   fails=0
-  for t in tests/test-*.sh; do PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" bash "$t" >/dev/null 2>&1 || fails=$((fails+1)); done
+  for t in tests/test-*.sh; do PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" $_hk_suite_timeout bash "$t" </dev/null >/dev/null 2>&1 || fails=$((fails+1)); done
   _hk_dh_verdict
   if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"

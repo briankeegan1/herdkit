@@ -113,11 +113,14 @@ fi
 run_heavy() {
   if [ -z "$HEALTHCHECK_CMD" ]; then run_light; return; fi
   # Resolve the command relative to the worktree (it's a committed project file).
+  # HERD-192: stdin is redirected from /dev/null so a project health command that (directly or via a
+  # test it runs) reads /dev/tty gets EOF instead of blocking forever on the absent terminal — a
+  # backgrounded gate has no tty, and a tty-reading test once hung 63 min and leaked watchers.
   local out rc
   if [ -n "$ONELINE" ]; then
-    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1)"; rc=$?
+    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" </dev/null 2>&1)"; rc=$?
   else
-    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1)"; rc=$?
+    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" </dev/null 2>&1)"; rc=$?
   fi
   local last; last="$(printf '%s' "$out" | tail -1)"
   case "$rc" in
@@ -304,11 +307,13 @@ run_interaction_gate() {
     return 0
   fi
 
+  # HERD-192: same no-tty defense as run_heavy — the interaction command drives tests too, so its
+  # stdin comes from /dev/null and a /dev/tty read can never block this backgrounded gate.
   local out rc
   if [ -n "$ONELINE" ]; then
-    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR' --oneline" 2>&1)"; rc=$?
+    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR' --oneline" </dev/null 2>&1)"; rc=$?
   else
-    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR'" 2>&1)"; rc=$?
+    out="$(bash -c "cd '$DIR' && $INTERACTION_TEST_CMD '$DIR'" </dev/null 2>&1)"; rc=$?
   fi
   IG_FULL="$out"; IG_REASON="$(printf '%s' "$out" | tail -1)"
   case "$rc" in
