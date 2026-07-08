@@ -66,16 +66,35 @@ for k in ("scenario","artifacts_dir","repo_dir","fixture_sha","result","passed",
     assert k in d, "missing field: %s" % k
 assert d["result"] == "pass", "result != pass: %r" % d["result"]
 assert d["failed"] == 0, "failed != 0: %r" % d["failed"]
+# S1/S2: a clean happy run must have ZERO skipped checkpoints — a skip here would mean a whole phase
+# silently didn't run (a missing lib), which now degrades the result to "pass-with-skips". Pinning
+# skipped==0 AND every phase checkpoint below is what turns a silent-skip into a LOUD wrapper failure.
+assert d["skipped"] == 0, "happy run must skip nothing (a skipped phase = coverage gap): %r" % d["skipped"]
 assert isinstance(d["checkpoints"], list) and d["checkpoints"], "no checkpoints"
 names = {c["name"]: c["status"] for c in d["checkpoints"]}
-for req in ("fixture_built","builder_committed","pr_opened","gate_passed","merged","torn_down"):
-    assert names.get(req) == "pass", "checkpoint %s not pass: %r" % (req, names.get(req))
-# HERD-139 notify hermeticity: the main-health forced-red leg must surface its MAIN RED + recovery
-# notifications ONLY to the durable sink (never the desktop), and the whole run must leak zero native
-# desktop notifications.
-assert names.get("main_health_notify_sink") == "pass", "main_health_notify_sink not pass: %r" % names.get("main_health_notify_sink")
-assert names.get("notify_hermetic") == "pass", "notify_hermetic not pass: %r" % names.get("notify_hermetic")
-print("scorecard OK: %d passed / %d failed" % (d["passed"], d["failed"]))
+# Pin EVERY phase-level checkpoint the happy path emits (push_gate_* and pipeline_steps_* included), so
+# a phase that stops emitting its checkpoint — e.g. a *_lib skip because a lib went missing — is caught
+# here as a MISSING pinned name rather than sliding through as a still-green scorecard.
+EXPECTED = (
+  "fixture_built", "fixture_clean",
+  "builder_committed",
+  "pr_opened",
+  "gate_passed",
+  "merged",
+  "torn_down", "final_clean",
+  "main_health_dormant", "main_health_green", "main_health_red", "main_health_recovery",
+  "main_health_notify_sink", "main_health_nonheavy_red",
+  "push_gate_held_no_push", "push_gate_listed", "push_gate_resumed", "push_gate_stale_refused",
+  "pipeline_steps_held", "pipeline_steps_listed", "pipeline_steps_released", "pipeline_steps_order",
+  "pipeline_steps_block", "pipeline_steps_off", "pipeline_steps_merge_resume", "pipeline_steps_two_approve",
+  "notify_hermetic",
+)
+for req in EXPECTED:
+    assert names.get(req) == "pass", "phase checkpoint %s not pass (missing/skipped?): %r" % (req, names.get(req))
+# And nothing UNEXPECTED slipped in (keeps the pin exhaustive — a new phase must be added here too).
+extra = sorted(set(names) - set(EXPECTED))
+assert not extra, "unpinned checkpoint(s) appeared — add them to EXPECTED: %r" % extra
+print("scorecard OK: %d passed / %d failed / %d checkpoints all pinned" % (d["passed"], d["failed"], len(names)))
 PY
 
 # HERD-139: prove notify hermeticity from the OUTSIDE too — the run's captured-attempts log must
@@ -108,12 +127,18 @@ python3 - "$SCF" <<'PY' || fail "(d) fault scorecard assertions failed"
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["result"] == "fail", "result != fail: %r" % d["result"]
-assert d["failed"] >= 1, "expected >=1 failed checkpoint"
+# FAULT-INJECTION SELF-CHECK (convention, model: test-sandbox-governance.sh:87-89): forcing ONE fault
+# must flip EXACTLY one checkpoint — no more (a broad flip would mean the force flag has side effects)
+# and no fewer. The flipped one must be gate_passed specifically.
+assert d["failed"] == 1, "forced fault must flip EXACTLY 1 checkpoint: %r" % d["failed"]
 names = {c["name"]: c["status"] for c in d["checkpoints"]}
-assert names.get("gate_passed") == "fail", "gate_passed should be fail: %r" % names.get("gate_passed")
+flipped = [c["name"] for c in d["checkpoints"] if c["status"] == "fail"]
+assert flipped == ["gate_passed"], "the single flipped checkpoint must be gate_passed: %r" % flipped
+# The gate-failed branch SKIPS the merge (designed, optional skip → still recorded status "skip") and
+# proves the broken change stayed isolated off main.
 assert names.get("merged") == "skip", "merged should be skip: %r" % names.get("merged")
 assert names.get("change_isolated") == "pass", "change_isolated should be pass: %r" % names.get("change_isolated")
-print("fault scorecard OK")
+print("fault scorecard OK — exactly 1 flip (gate_passed), merge skipped, change isolated")
 PY
 
 # The broken change must NOT be on main (a failing gate never merges).

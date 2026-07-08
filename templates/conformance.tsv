@@ -45,7 +45,7 @@ APP_PREVIEW_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_SERVER_ARGS	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_PATH	unit	tests/test-app-preview-config.sh
-APP_PREVIEW_PORT_BASE	unit	tests/test-app-preview-config.sh
+APP_PREVIEW_PORT_BASE	none-yet	unit: no test asserts the free-port base-scan (herd-feature.sh:260 / herd-resolve.sh) — test-app-preview-config.sh drives app-monitor launch+probe only, never APP_PREVIEW_PORT_BASE
 #
 # ── BACKFILL wave 1 (HERD-152): every remaining capability, mapped or noted ──────────────────────
 herd init	unit	tests/test-cli.sh
@@ -155,7 +155,7 @@ MODEL_ADVISE	unit	tests/test-advise.sh
 TOKEN_MODE	unit	tests/test-token-mode.sh
 TOKEN_MODE	unit	tests/test-eco-starter-defaults.sh
 HEALTHCHECK_CMD	unit	tests/test-healthcheck-interaction.sh
-HEALTHCHECK_HEAVY_GLOB	none-yet	unit: no test drives --auto with a glob pattern to assert the heavy-vs-light profile selection (only ever set blank)
+HEALTHCHECK_HEAVY_GLOB	unit	tests/test-healthcheck-routing.sh
 APP_SURFACE_GLOB	unit	tests/test-healthcheck-interaction.sh
 INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh
 SMOKE_CMD	none-yet	unit: no test asserts herd-resolve.sh runs $SMOKE_CMD before push (real consumer, zero test references)
