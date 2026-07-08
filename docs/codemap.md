@@ -97,9 +97,9 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
 - `research-get.sh` → `herd-config.sh`
 - `research-step.sh` → `drainer-liveness.sh`, `herd-config.sh`
-- `research.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`
+- `research.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `scribe-step.sh` → `drainer-liveness.sh`, `herd-config.sh`, `journal.sh`
-- `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`
+- `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
 - `symbol-index.sh` → `herd-config.sh`
