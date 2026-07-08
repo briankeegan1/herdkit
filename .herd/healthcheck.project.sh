@@ -8,8 +8,10 @@
 #   2) shellcheck over them IF installed                    (best-effort lint)
 #   3) the hermetic test suite (tests/*.sh) + bats IF present
 #
-# CONTRACT: exit 0 = clean · 1 = code error · 2 = data/env (tolerated). herdkit has no data/env
-# axis, so it only ever returns 0 or 1.
+# CONTRACT: exit 0 = clean · 1 = code error · 2 = data/env (tolerated). herdkit's only data/env axis
+# is one KNOWN env-only bats failure (HERD-187): the project-mode codemap test failing because the real
+# repo can't be resolved as the ENGINE tree (a mis-pointed .herd/config PROJECT_ROOT) → exit 2. Every
+# other outcome is 0 or 1; a genuine code error is NEVER downgraded to 2.
 set -u
 DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--oneline]}"
 ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
@@ -238,9 +240,77 @@ _hk_wsid="$(_hk_workspace_id)"
 _hk_wtslugs="$(_hk_worktree_slugs)"
 _hk_orphans_before="$(_hk_orphans "$_hk_wsid" "$_hk_wtslugs")"
 
+# ── ENV-vs-CODE bats classification (HERD-187) ────────────────────────────────────────────────
+# A failing bats run is a CODE error (exit 1) by default — EXCEPT one KNOWN data/env condition that
+# must be TOLERATED (exit 2) instead of blocking merges: the project-mode codemap test failing because
+# the REAL repo can't be resolved as the herdkit ENGINE tree (e.g. .herd/config PROJECT_ROOT points at
+# a path that is NOT this engine checkout, so codemap.sh maps it as a PROJECT). That is an ENV
+# misconfiguration of the box, not a code bug — today it returned CODEERROR(1) and blocked merges.
+# We NEVER downgrade a genuine code error: the tolerance applies ONLY when (a) the codemap test is the
+# SOLE failing test AND (b) re-running it confirms the failure is the real-repo/ENGINE (env-dependent)
+# assertion — NOT a hermetic-fixture assertion, which would be a real codemap.sh regression and stays
+# exit 1. When there is no env-only failure, behaviour is byte-identical to before.
+_HK_ENV_TEST="hermetic project-mode codemap test passes"
+
+_hk_bats_notok() {
+  # Emit the description of every failing test in bats TAP output ($1) — the text after 'not ok N '.
+  printf '%s\n' "$1" | sed -n 's/^not ok [0-9][0-9]* //p'
+}
+
+_hk_bats_notok_line() {
+  # Emit the FULL 'not ok N <desc>' line whose description contains $2 — the REAL failing line to quote
+  # in the detail, NOT the adjacent diagnostic comment / next 'ok' that a bare `tail -1` used to grab.
+  printf '%s\n' "$1" | grep -E "^not ok [0-9]+ .*$2" | head -1
+}
+
+_hk_codemap_failure_is_env() {
+  # Confirm the codemap test's failure is the ENV-dependent real-repo/ENGINE assertion (tolerable),
+  # NOT a hermetic-fixture regression (a genuine codemap.sh code bug). Re-run the test directly:
+  #   • it now PASSES          → the bats failure was not this / transient → treat as genuine (return 1)
+  #   • fails with a real-repo/ENGINE message (all hermetic assertions passed first, since fail() exits
+  #     at the first failure)  → env-dependent (return 0)
+  #   • fails on anything else → genuine codemap regression → return 1 (never downgrade a code error)
+  local t="tests/test-codemap-project.sh" o
+  [ -f "$t" ] || return 1
+  o="$(bash "$t" 2>&1)" && return 1
+  printf '%s\n' "$o" | grep -qiE 'FAIL:.*real.?repo'
+}
+
+_hk_bats_env_only() {
+  # Return 0 IFF the bats failure ($1) is EXACTLY the tolerated env condition: the codemap test is the
+  # ONLY failing test AND its failure is confirmed env-dependent. Any other failing test, or an
+  # absent/unparseable failure, is genuine (return 1) — we never downgrade a real code error.
+  local to="$1" descs saw_env=0 other=0 f
+  descs="$(_hk_bats_notok "$to")"
+  [ -n "$descs" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ "$f" = "$_HK_ENV_TEST" ]; then saw_env=1; else other=1; fi
+  done <<EOF
+$descs
+EOF
+  [ "$saw_env" -eq 1 ] && [ "$other" -eq 0 ] || return 1
+  _hk_codemap_failure_is_env
+}
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   if to="$(bats tests/*.bats 2>&1)"; then t_note="tests: bats pass"; else
+    if _hk_bats_env_only "$to"; then
+      # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
+      _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
+      if [ -n "$ONELINE" ]; then
+        echo "bats: env-only data/env (not a code bug) — $_hk_notok"
+      else
+        echo "BATS: DATA/ENV FAILURE (tolerated, not a code bug)"
+        echo "  $_hk_notok"
+        echo "  ($_HK_ENV_TEST — the real repo did not resolve as the herdkit ENGINE tree"
+        echo "   (e.g. .herd/config PROJECT_ROOT is not this engine checkout); env, not code.)"
+        printf '%s\n' "$to"
+      fi
+      exit 2
+    fi
+    # Genuine code error — original behaviour (byte-identical when there is no env-only failure).
     [ -n "$ONELINE" ] && echo "bats: $(printf '%s' "$to" | tail -1)" || { echo "BATS FAILED"; printf '%s\n' "$to"; }
     exit 1
   fi

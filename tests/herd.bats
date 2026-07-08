@@ -211,6 +211,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic healthcheck env-vs-code classification (HERD-187) test passes" {
+  run bash "$REPO/tests/test-healthcheck-env-classify.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic reviewer-pane lifecycle (HERD-113) test passes" {
   run bash "$REPO/tests/test-reviewer-pane-lifecycle.sh"
   [ "$status" -eq 0 ]
