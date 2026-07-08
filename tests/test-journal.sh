@@ -288,4 +288,65 @@ ok
 printf '%s\n' "$log_empty" | grep -q "no engine journal yet" || fail "herd log: empty case should say so"
 ok
 
+# ── (8) timestamp invariants: ONE UTC writer, injectable clock, monotone-nondecreasing (HERD-137) ──
+# The engine journal once carried a future, Z-suffixed *local* timestamp on the auto-refix bounce
+# path (a writer that used `date` without -u but stamped Z). All ts now come from journal.sh's single
+# _journal_ts helper (UTC, injectable via HERD_JOURNAL_NOW). These guard that contract.
+
+# (8a) the injectable clock seam: an injected fake UTC time is what lands in ts, verbatim — proven on
+# the refix path's own event (refix_bounce), the writer named in the incident.
+export JOURNAL_FILE="$T/j8/journal.jsonl"
+FAKE_TS="2026-07-08T08:04:44Z"
+HERD_JOURNAL_NOW="$FAKE_TS" journal_append refix_bounce pr 137 sha cafe1234 slug feat-x round 1 agent_status_before idle
+[ "$(_field "$JOURNAL_FILE" 0 ts)" = "$FAKE_TS" ] \
+  || fail "refix path ts must equal the injected UTC clock (got '$(_field "$JOURNAL_FILE" 0 ts)')"
+ok
+# The refix wake result — the second incident event — honours the same clock.
+HERD_JOURNAL_NOW="$FAKE_TS" journal_append refix_wake_result pr 137 sha cafe1234 slug feat-x round 1 \
+  agent_status_before idle agent_status_after working woke 1 escalated false
+[ "$(_field "$JOURNAL_FILE" 1 ts)" = "$FAKE_TS" ] \
+  || fail "refix wake ts must equal the injected UTC clock (got '$(_field "$JOURNAL_FILE" 1 ts)')"
+ok
+
+# (8b) with no seam, _journal_ts emits real UTC (Z-suffixed, and NOT ahead of an independent date -u
+# reading — a local-clock-with-Z writer in a +hh timezone would stamp the future). Sourced helper is
+# in scope from section (1).
+type _journal_ts >/dev/null 2>&1 || fail "_journal_ts helper not defined after sourcing journal.sh"
+ok
+now_ts="$(_journal_ts)"
+printf '%s' "$now_ts" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+  || fail "_journal_ts must emit ISO-8601 UTC (got '$now_ts')"
+ok
+ref_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Lexical compare is valid for fixed-width ISO-8601 UTC: the helper's stamp must not be AFTER an
+# independent UTC reading taken just after it (a local+Z writer east of UTC would be strictly greater).
+[ "$now_ts" \> "$ref_utc" ] && fail "_journal_ts stamped a future/local time ($now_ts > $ref_utc) — not UTC"
+ok
+
+# (8c) monotone-nondecreasing invariant over a single writer's stream. Drive the clock forward through
+# the seam so the assertion is deterministic (real second-resolution appends could tie or, on a
+# buggy local-clock writer, jump), then parse the fixture and assert ts never decreases.
+export JOURNAL_FILE="$T/j8b/journal.jsonl"
+for t in 2026-07-08T08:00:00Z 2026-07-08T08:00:00Z 2026-07-08T08:00:01Z 2026-07-08T08:04:44Z 2026-07-08T09:15:00Z; do
+  HERD_JOURNAL_NOW="$t" journal_append refix_bounce pr 137 sha cafe1234 slug feat-x round 1 agent_status_before idle
+done
+python3 -c '
+import sys, json
+prev = None
+n = 0
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line: continue
+    ts = json.loads(line)["ts"]
+    assert ts.endswith("Z"), "ts not Z-suffixed UTC: %r" % ts
+    if prev is not None:
+        assert ts >= prev, "journal ts went backwards: %r after %r" % (ts, prev)
+    prev = ts
+    n += 1
+assert n == 5, "expected 5 events, got %d" % n
+print("monotone OK")
+' "$JOURNAL_FILE" >/dev/null || fail "single-writer journal ts must be monotone-nondecreasing"
+ok
+unset JOURNAL_FILE
+
 echo "ALL PASS ($pass checks)"
