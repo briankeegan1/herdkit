@@ -1,0 +1,104 @@
+name: CI
+
+# Cross-platform hermetic-suite gate (HERD-167). Runs the herdkit test suite on
+# ubuntu, macOS, and Windows so a change that only passes on the maintainer's macOS
+# box can't silently break the second operator's Git Bash / a headless Linux CI box.
+#
+# The suite is HERMETIC (stubs claude/herdr/gh, no network) — see scripts/ci/run-suite.sh,
+# which mirrors .herd/healthcheck.project.sh's own fallback (bats where available, else the
+# tests/test-*.sh scripts directly) and marks KNOWN env-sensitive Windows tests as XFAIL
+# instead of hacking them green (tests/known-env-sensitive.tsv, docs/windows.md).
+#
+# ubuntu + macOS are REQUIRED green. Windows is documented-partial (allow_failure) while the
+# Git Bash story matures — WSL2 is the recommended path (docs/windows.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per ref; a new push cancels the previous.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash on every leg — on Windows this is Git Bash, exactly the second operator's env.
+    shell: bash
+
+jobs:
+  suite:
+    name: suite (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: ubuntu
+            allow_failure: false
+          - os: macos-latest
+            platform: macos
+            allow_failure: false
+          - os: windows-latest
+            platform: windows
+            allow_failure: true
+    env:
+      # UTF-8 so the suite's emoji greps (✅/❌/🟢) match on every locale, incl. Git Bash.
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      HERD_CI_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Windows — provide a python3 shim (docs/windows.md)
+        if: runner.os == 'Windows'
+        run: |
+          # Git Bash ships no `python3`; the suite (and `herd doctor`) expect one. Mirror the
+          # /usr/bin/python3 shim from docs/windows.md so the hermetic tests can find it.
+          py="$(command -v python || command -v py || true)"
+          if [ -n "$py" ]; then
+            mkdir -p "$HOME/bin"
+            printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$py" > "$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          fi
+          python3 --version || python --version || true
+
+      - name: Show environment
+        run: |
+          echo "platform: $HERD_CI_PLATFORM   uname: $(uname -a)"
+          echo "bash:     $BASH_VERSION"
+          command -v python3 && python3 --version || echo "python3: not found"
+          locale 2>/dev/null | head -3 || true
+
+      - name: Run hermetic suite (direct — all tests/test-*.sh)
+        run: bash scripts/ci/run-suite.sh
+
+  bats:
+    # Exercise the OTHER branch of the healthcheck fallback: bats where available.
+    name: bats (ubuntu)
+    runs-on: ubuntu-latest
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      HERD_CI_PLATFORM: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Run suite via bats (runner auto-selects the bats path)
+        run: bash scripts/ci/run-suite.sh

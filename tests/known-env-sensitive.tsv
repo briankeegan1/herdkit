@@ -1,0 +1,27 @@
+# tests/known-env-sensitive.tsv — the per-platform allowlist of hermetic tests that are
+# KNOWN to fail for ENVIRONMENT reasons (not code defects) on a given CI leg.
+#
+# Read by scripts/ci/run-suite.sh: a listed test that fails on a matching platform is
+# reported as XFAIL (env-sensitive) and does NOT fail the leg; an UNLISTED failure is a
+# real red. This keeps the Windows leg honest — env limits are documented and marked,
+# never silently skipped and never hacked green (docs/windows.md, PR #274 convention).
+#
+# Columns (TAB-separated):
+#   name        the test file basename, e.g. test-doctor-point-of-need.sh
+#   platforms   CSV of ubuntu|macos|windows (or `all`) the allowance applies to
+#   reason      one-line why-it's-env-sensitive (shown in the CI log)
+#
+# ubuntu + macos are expected FULLY GREEN — keep no allowances for them. WSL2 (the
+# recommended Windows path, docs/windows.md) presents as ubuntu and is likewise green.
+name	platforms	reason
+# These rebuild a minimal PATH via `env -i ... PATH=/usr/bin:/bin` to prove behavior under
+# a stripped environment; python3 lives there on Linux/macOS but NOT under Git-for-Windows,
+# so the reconstructed env cannot find python3. Fixed by WSL2 or a /usr/bin/python3 shim.
+test-backlog-view-backend.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-backlog-view-refresh-key.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-backlog-view-render.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-backlog-view-extras.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-backlog-view-rich.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-cli-reload.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-doctor-point-of-need.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
+test-task-spec-pane.sh	windows	env -i rebuilds PATH without Git Bash's python3 location
