@@ -24,6 +24,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
 . "$HERE/human-verify.sh"
+# PUSH_GATE=human (HERD-123) — push-hold helpers so list/approve gain PRE-push hold coverage: a
+# finished builder that stopped before push/PR create is listed here, and `approve <slug>` resumes
+# its push + PR creation. Sourcing only defines functions (CLI dispatch is $0-guarded).
+. "$HERE/push-gate.sh"
+# Journal (best-effort) so the push-hold approve/resume path can emit events like the watcher does.
+# shellcheck source=scripts/herd/journal.sh
+[ -f "$HERE/journal.sh" ] && . "$HERE/journal.sh"
 # CLI palette for the `list` verdict column — themed via HERD_THEME (default tokyonight). Pre-set to
 # "" so the surface degrades to plain (byte-identical to before this coloring) under NO_COLOR, a
 # non-TTY stdout, or a missing theme.sh.
@@ -77,8 +84,24 @@ EOF
 case "$cmd" in
 
   list)
+    # PUSH_GATE=human (HERD-123): finished builders holding for human review BEFORE push — no PR yet,
+    # so they live in the push-hold ledger, not $APPROVALS. Surface them FIRST (a human reviews the
+    # LOCAL diff at the printed worktree path, then approves to resume push + PR creation). Presence-
+    # driven: nothing is printed when the feature is unused. Rendered before the PR-approval list.
+    push_found=0
+    while read -r ph_slug ph_sha ph_dir; do
+      [ -n "$ph_slug" ] || continue
+      if [ "$push_found" -eq 0 ]; then echo "Builders awaiting PUSH approval (pre-PR, review the LOCAL diff):"; fi
+      printf '  %s  sha:%.8s  %s\n' "$ph_slug" "$ph_sha" "${ph_dir:-(worktree path unknown)}"
+      [ -n "$ph_dir" ] && printf '      review:  git -C %s diff origin/HEAD...HEAD    approve:  bash %s/herd-approve.sh approve %s\n' "$ph_dir" "$HERE" "$ph_slug"
+      push_found=$((push_found + 1))
+    done <<EOF
+$(push_gate_list 2>/dev/null || true)
+EOF
+    [ "$push_found" -gt 0 ] && echo
+
     if [ ! -s "$APPROVALS" ]; then
-      echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && echo "No PRs awaiting approval."
       exit 0
     fi
     found=0
@@ -103,7 +126,7 @@ case "$cmd" in
       found=$((found + 1))
     done < "$APPROVALS"
     if [ "$found" -eq 0 ]; then
-      echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && echo "No PRs awaiting approval."
     else
       printf '\nRun:  bash %s/herd-approve.sh approve <pr#>  to approve a PR for merge.\n' "$HERE"
     fi
@@ -111,7 +134,17 @@ case "$cmd" in
 
   approve)
     prnum="${1:-}"
-    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#>" >&2; exit 1; }
+    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#|slug>" >&2; exit 1; }
+    # PUSH_GATE=human (HERD-123): if the argument names a builder with a LIVE push-hold (pre-PR), this
+    # is a PUSH approval, not a merge approval — record it and RESUME (push + PR creation). A PR number
+    # is numeric and a builder slug is kebab-case, so a live push-hold for "$prnum" unambiguously
+    # selects this path; otherwise fall through to the existing PR-merge approval below. push_gate_resume
+    # is fail-soft: a stale (new-commit) or corrupt hold refuses LOUDLY and pushes nothing.
+    if [ -n "$(push_gate_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      _pg_approved_sha="$(push_gate_approve "$prnum")" || { echo "❌ Could not record push approval for '$prnum'." >&2; exit 1; }
+      printf '✅ Push approval recorded for %s (%.8s) — resuming push + PR creation…\n' "$prnum" "$_pg_approved_sha"
+      push_gate_resume "$prnum"; exit $?
+    fi
     if [ ! -s "$APPROVALS" ]; then
       echo "No awaiting approval record found for PR #${prnum}." >&2; exit 1
     fi

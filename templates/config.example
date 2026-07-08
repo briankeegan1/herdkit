@@ -206,6 +206,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 PR_FLOW="direct"          # direct | draft
 PR_READY_WHEN="builder"   # builder | coordinator | human   (only used when PR_FLOW=draft)
 
+# PUSH_GATE (HERD-123) — gate-then-upload: hold a FINISHED builder for human review BEFORE anything
+# reaches GitHub. The missing seam: PR_FLOW=draft gates AFTER the push (PR already public);
+# MERGE_POLICY=approve gates AFTER review (PR exists); PUSH_GATE=human gates BEFORE the push, while the
+# diff is still only local. With =human the builder completes work + healthcheck but STOPS before
+# `git push` / `gh pr create`, recording a sha-keyed hold the watcher shows as 'ready · awaiting push
+# approval' with the worktree path; a human reviews the LOCAL diff and runs `herd-approve.sh approve
+# <slug>`, which resumes the push + PR creation. A new commit after the hold invalidates a prior
+# approval. SAFE DEFAULT: '' (off) → lanes byte-identical, this gate never fires.
+PUSH_GATE=""              # "" (default, off) | human
+
 # delete the head branch after a merge. false (default) preserves today's behavior (branches kept).
 DELETE_BRANCH_ON_MERGE="false"   # true | false
 

@@ -88,6 +88,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
+# PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
+# the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
+# dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
+. "$HERE/push-gate.sh"
 # Runtime driver shim — binds each runtime-specific control-surface capability (list-agents,
 # read-pane, send-keys, notifications, start-agent) to the active HERD_DRIVER. Makes the watcher's
 # load-bearing core run with NO herdr panes under HERD_DRIVER=headless (panes-as-a-view); the default
@@ -4383,7 +4387,15 @@ $rec
 EOF
     sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
-    if [ -z "$prnum" ]; then
+    if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
+      # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
+      # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
+      # worktree PATH so a human reviews the LOCAL diff, and short-circuit the idle/dead/building
+      # classification below — a push-held builder's agent has exited CLEANLY, which the dead-builder
+      # path would otherwise mis-flag as died. Presence-driven: no hold record → this branch is skipped
+      # and the console is byte-identical to before the feature.
+      DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
+    elif [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
         # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it

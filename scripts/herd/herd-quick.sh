@@ -154,6 +154,19 @@ else
   LOCAL_REVIEW_RULE=""
 fi
 
+# PUSH_GATE=human (HERD-123) — hold this FINISHED builder for human review BEFORE anything reaches
+# GitHub (gate-then-upload). SAFE DEFAULT: PUSH_GATE unset/'' → PUSH_GATE_RULE empty, rules text
+# byte-for-byte unchanged and the builder pushes + opens its PR normally. When =human the builder does
+# ALL its work + healthcheck but must NOT run '$PR_CREATE_CMD' / 'git push' — instead it records a
+# sha-keyed push-hold via push-gate.sh; a human reviews the LOCAL diff and approves, which resumes the
+# push + PR creation. Unknown value → off (fail safe). Normalized inline, same pattern as PR_FLOW.
+_push_gate="${PUSH_GATE:-}"; case "$_push_gate" in human) ;; *) _push_gate="" ;; esac
+if [ "$_push_gate" = "human" ]; then
+  PUSH_GATE_RULE=" PUSH GATE (human review BEFORE upload): this project holds finished builders for human review before ANYTHING reaches GitHub. Do NOT run '$PR_CREATE_CMD' and do NOT 'git push' yourself. Instead, once your work is committed and the healthcheck passes, write your intended PR body (including any 'Refs:' line) to a file and run:  bash $HERE/push-gate.sh hold $SLUG --title \"<your PR title>\" --body-file <that-file>  — this records a sha-keyed hold and STOPS. A human then reviews your LOCAL diff and runs 'herd-approve.sh approve $SLUG', which resumes the push + PR creation for you. Nothing you build reaches GitHub until a human approves; a new commit after the hold invalidates a prior approval, so re-run the hold if you change anything."
+else
+  PUSH_GATE_RULE=""
+fi
+
 # Tracker linkage (HERD-39): when the coordinator spawns from a TRACKED item it prefixes the lane
 # command with HERD_ITEM_REF=<id>. When set, the LANE RULES below REQUIRE the builder to carry an
 # explicit 'Refs: <id>' line in its PR body, so merge-time reconcile (agent-watch.sh) resolves the
@@ -183,7 +196,7 @@ GROUNDING_RULE="$(herd_context_provision_preamble)"
 #    standing workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this change in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
+warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
 If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
