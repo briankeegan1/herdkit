@@ -528,6 +528,53 @@ record_review() {
   journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
 }
 
+# ── Structured BLOCK verdicts (HERD-104) ────────────────────────────────────────────────────────
+# herd-review.sh now emits a BLOCK as 'REVIEW: BLOCK — rule: <rule> | why: <why> | location: <loc>'.
+# These helpers PARSE that line into its three fields and CACHE them sha-keyed so the auto-refix
+# bounce can hand the builder an actionable finding. Both are FAIL-SOFT + BACKWARD-COMPATIBLE: a
+# legacy/unstructured 'REVIEW: BLOCK — <freeform reason>' yields why=<freeform>, rule/location empty.
+
+# _blk_trim <text> — echo <text> with leading/trailing whitespace stripped (no trailing newline).
+_blk_trim() { printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
+
+# _parse_block_fields <verdict-line> — parse a 'REVIEW: BLOCK — …' line, setting three globals:
+#   _BLK_RULE _BLK_WHY _BLK_LOCATION  (any absent field is left empty).
+# The payload is everything after the em-dash separator, split on ' | ' into segments; each segment
+# is classified by an explicit 'rule:'/'why:'/'location:' key (case-insensitive). The FIRST unkeyed
+# segment falls back to 'why' so a legacy freeform reason still populates why. Values are capped so a
+# pathological line can never bloat a downstream prompt/journal.
+_parse_block_fields() {
+  local line="$1" payload seg
+  _BLK_RULE=""; _BLK_WHY=""; _BLK_LOCATION=""
+  case "$line" in
+    *"—"*) payload="${line#*—}" ;;     # text after the em-dash separator
+    *)     payload="${line#*REVIEW: BLOCK}" ;;  # no separator → tail after the tag (fail-soft)
+  esac
+  payload="$(_blk_trim "$payload")"
+  while [ -n "$payload" ]; do
+    if [ "$payload" = "${payload#* | }" ]; then seg="$payload"; payload=""      # last (or only) segment
+    else seg="${payload%% | *}"; payload="${payload#* | }"; fi
+    case "$seg" in
+      [Rr]ule:*)     _BLK_RULE="$(_blk_trim "${seg#*:}")" ;;
+      [Ww]hy:*)      _BLK_WHY="$(_blk_trim "${seg#*:}")" ;;
+      [Ll]ocation:*) _BLK_LOCATION="$(_blk_trim "${seg#*:}")" ;;
+      *) [ -z "$_BLK_WHY" ] && _BLK_WHY="$(_blk_trim "$seg")" ;;  # legacy freeform → why
+    esac
+  done
+  # Cap each field (mirrors the 200-char cap used elsewhere) so one bad line can't bloat a prompt.
+  _BLK_RULE="${_BLK_RULE:0:200}"; _BLK_WHY="${_BLK_WHY:0:200}"; _BLK_LOCATION="${_BLK_LOCATION:0:200}"
+}
+
+# _persist_block_fields <pr#> <sha> <verdict-line> — parse the BLOCK line and cache its three fields
+# (rule / why / location, one per line, fixed order) for this exact pr+sha. Best-effort: a write
+# hiccup just means the bounce falls back to the legacy "read the PR" prompt.
+_persist_block_fields() {
+  local pr="$1" sha="$2"
+  _parse_block_fields "$3"
+  { printf '%s\n%s\n%s\n' "$_BLK_RULE" "$_BLK_WHY" "$_BLK_LOCATION"; } \
+    > "$(_review_block_file "$pr" "$sha")" 2>/dev/null || true
+}
+
 # ── Background review dispatch ──────────────────────────────────────────────────────────────────
 # The review gate used to run herd-review.sh SYNCHRONOUSLY in the poll loop, so one slow review
 # (~7 min on Opus) head-of-line-blocked every other PR's review AND all merges for that cycle.
@@ -563,6 +610,11 @@ record_review() {
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
 _review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
 _review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
+# Structured-BLOCK detail cache (HERD-104): the reviewer's rule/why/location for THIS exact pr+sha,
+# written when a BLOCK verdict is collected (see _persist_block_fields) so the auto-refix bounce can
+# surface an ACTIONABLE finding instead of "read the PR". Sha-keyed like the markers above; a newer
+# head sha discards it via _discard_stale_reviews. Three lines, fixed order: rule, why, location.
+_review_block_file()    { printf '%s' "$TREES/.review-block-$1-$2"; }
 # Evidence-triggered escalation arm marker, keyed per-PR (NOT per-sha): armed by _handle_block_verdict
 # when a builder's refix rounds prove the cheap reviewer missed the issue, consumed once by the next
 # review dispatch on that PR (see _maybe_arm_review_escalation / _review_gate_step).
@@ -655,7 +707,7 @@ record_review_retry() {
 # marker so the concurrency slot frees up.
 _discard_stale_reviews() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"*; do
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -714,7 +766,11 @@ _review_gate_step() {
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
       "REVIEW: PASS")   record_review "$pr" "$sha" "PASS"  "reviewer"; echo PASS;  return 0 ;;
-      "REVIEW: BLOCK"*) record_review "$pr" "$sha" "BLOCK" "reviewer"; echo BLOCK; return 0 ;;
+      "REVIEW: BLOCK"*)
+        record_review "$pr" "$sha" "BLOCK" "reviewer"
+        # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
+        _persist_block_fields "$pr" "$sha" "$verdict_line"
+        echo BLOCK; return 0 ;;
       *)
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
         # verdict — never cached to the ledger, retried next poll with a cap.
@@ -1886,11 +1942,27 @@ _handle_block_verdict() {
       _maybe_arm_review_escalation "$_hbv_pr"
       local _hbv_status_before
       _hbv_status_before="$(_agent_status "$_hbv_slug")"
+      # Structured finding (HERD-104): surface the reviewer's rule/why/location so the bounce is
+      # ACTIONABLE — the builder sees WHAT rule broke, WHY, and WHERE, not just "read the PR". Read
+      # the sha-keyed cache written when the BLOCK was collected; fail-soft when it is absent
+      # (legacy ledger row, or an unstructured verdict) — the prompt then omits the finding line.
+      local _hbv_finding="" _hbv_blk _hbv_rule="" _hbv_why="" _hbv_loc=""
+      _hbv_blk="$(_review_block_file "$_hbv_pr" "$_hbv_sha")"
+      if [ -s "$_hbv_blk" ]; then
+        _hbv_rule="$(sed -n 1p "$_hbv_blk" 2>/dev/null)"
+        _hbv_why="$(sed -n 2p "$_hbv_blk" 2>/dev/null)"
+        _hbv_loc="$(sed -n 3p "$_hbv_blk" 2>/dev/null)"
+        [ -n "$_hbv_rule" ] && _hbv_finding="${_hbv_finding}Rule violated: ${_hbv_rule}"$'\n'
+        [ -n "$_hbv_why" ]  && _hbv_finding="${_hbv_finding}Why: ${_hbv_why}"$'\n'
+        [ -n "$_hbv_loc" ]  && _hbv_finding="${_hbv_finding}Location: ${_hbv_loc}"$'\n'
+      fi
       journal_append refix_bounce pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
-        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}"
+        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}" \
+        rule "${_hbv_rule:-}" location "${_hbv_loc:-}"
       local _hbv_pane_id _hbv_woke=0 _hbv_escalated=false
       local _hbv_prompt
-      _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
+      _hbv_prompt="PR #${_hbv_pr} was review-blocked.
+${_hbv_finding}Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
       # Target the builder's AGENT pane whether it reads idle OR 'done' (never a 'working' one) —
       # a 'done' builder's Claude TUI is still up and waiting, so submitting the raw re-task prompt
