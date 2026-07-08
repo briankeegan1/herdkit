@@ -1,0 +1,108 @@
+name: CI
+
+# Cross-platform hermetic-suite gate (HERD-167).
+#
+# WSL2-FIRST POLICY (2026-07-08): the supported way to run herdkit on Windows is WSL2, not
+# native Git Bash (bash/locale/python3 divergences make Git Bash too spotty to gate on — see
+# docs/windows.md). WSL2 semantics ARE Linux semantics, so the `ubuntu` leg below IS the
+# Windows/WSL2 coverage. Consequently:
+#   • ubuntu + macOS   — run the hermetic suite; REQUIRED green. ubuntu doubles as WSL2.
+#   • windows-latest   — a MINIMAL advisory smoke (scripts/ci/windows-smoke.sh): LF/.gitattributes
+#                        + docs sanity + `bash -n`. NOT the full suite chasing Git Bash greens,
+#                        and it does NOT spin up nested WSL inside the runner. Advisory only.
+#
+# The suite is HERMETIC (stubs claude/herdr/gh, no network). scripts/ci/run-suite.sh runs the SAME
+# curated set the auto-merge watcher gates on (the tests/test-*.sh files tests/herd.bats wraps),
+# but DIRECTLY — one `timeout N bash test.sh` per test — rather than via `bats`, which hangs on a
+# headless leg when a hermetic test leaks a background process holding bats's FD 3 (see the runner's
+# header). Known env-sensitive tests are marked XFAIL via tests/known-env-sensitive.tsv (never hacked
+# green); any other failure — including a per-test timeout — is a real red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Deterministic terminal so tput-cols-driven rendering behaves the same on every leg (a runner
+  # with no TERM makes `tput cols` diverge from the maintainer's box).
+  TERM: xterm
+
+jobs:
+  suite:
+    name: suite (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
+            platform: ubuntu
+            locale: C.UTF-8         # glibc ships C.UTF-8
+          - os: macos-latest
+            platform: macos
+            locale: en_US.UTF-8     # BSD libc has no C.UTF-8 — use a real UTF-8 locale
+    env:
+      HERD_CI_PLATFORM: ${{ matrix.platform }}
+      LANG: ${{ matrix.locale }}
+      LC_ALL: ${{ matrix.locale }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        # The suite is tested against a mature Python; the runner default (3.14) regresses the
+        # codemap + rich-render tests. Pin a stable version that matches the maintainer's engine.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: macOS — GNU coreutils/grep/sed/awk on PATH (match the maintainer's Homebrew env)
+        if: runner.os == 'macOS'
+        run: |
+          # The suite assumes GNU tools (e.g. `grep -P` in test-native-burst, UTF-8-safe sed/awk in
+          # backlog rendering) — present on the maintainer's macOS via Homebrew, absent from a clean
+          # runner's BSD userland. Install them and put their gnubin dirs first on PATH.
+          brew install grep gnu-sed gawk coreutils
+          for p in grep gnu-sed gawk coreutils; do
+            echo "$(brew --prefix)/opt/$p/libexec/gnubin" >> "$GITHUB_PATH"
+          done
+      - name: Configure git identity (runners ship none; hermetic tests commit)
+        run: |
+          git config --global user.name  "herdkit CI"
+          git config --global user.email "ci@herdkit.local"
+          git config --global init.defaultBranch main
+      - name: Point the dogfood PROJECT_ROOT at the checkout
+        run: |
+          # .herd/config hardcodes PROJECT_ROOT="$HOME/source/herdkit" (the maintainer's layout).
+          # A few tests run engine commands against the REAL repo (e.g. test-codemap-project's
+          # "real repo maps as ENGINE") and read that config; on a runner the path doesn't exist, so
+          # codemap picks the wrong root and mis-detects PROJECT mode. Make the path resolve here.
+          mkdir -p "$HOME/source"
+          ln -sfn "$GITHUB_WORKSPACE" "$HOME/source/herdkit"
+      - name: Show environment
+        run: |
+          echo "platform: $HERD_CI_PLATFORM   uname: $(uname -a)"
+          echo "bash: $BASH_VERSION   TERM: $TERM   cols: $(tput cols 2>/dev/null || echo n/a)   LC_ALL: $LC_ALL"
+          python3 --version; command -v grep; grep --version | head -1
+      - name: Run hermetic suite
+        run: bash scripts/ci/run-suite.sh
+
+  windows-smoke:
+    # WSL2-first: Windows gets a fast ADVISORY smoke, not the full suite. continue-on-error so a
+    # Git Bash quirk never blocks a merge — the ubuntu leg is the authoritative Windows/WSL2 gate.
+    name: windows-smoke (advisory)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Windows advisory smoke
+        run: bash scripts/ci/windows-smoke.sh

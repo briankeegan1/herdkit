@@ -217,7 +217,10 @@ _herd_doctor_hint() {
         *)       printf 'install Python 3.7+ — https://python.org' ;;
       esac ;;
     herdr)
-      printf 'install the herdr CLI (the terminal/agent multiplexer %s drives) and ensure it is on PATH' "$brand" ;;
+      case "$os" in
+        windows) printf 'run %s under WSL2 (the supported Windows path) and install the herdr CLI there — see docs/windows.md; native Git Bash is best-effort only' "$brand" ;;
+        *)       printf 'install the herdr CLI (the terminal/agent multiplexer %s drives) and ensure it is on PATH' "$brand" ;;
+      esac ;;
     *)
       printf 'install %s and ensure it is on PATH' "$tool" ;;
   esac

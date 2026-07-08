@@ -1,0 +1,48 @@
+{
+  "name": "herdkit",
+  "version": "0.1.0",
+  "description": "One-command installer/wrapper for herdkit — the config-driven multi-agent coordinator workflow for Claude Code, built on the herdr terminal multiplexer. This npm package bootstraps the bash engine (bin/herd) and puts `herd` on PATH.",
+  "keywords": [
+    "herdkit",
+    "coordinator",
+    "multi-agent",
+    "worktree",
+    "backlog",
+    "herdr",
+    "claude-code",
+    "cli"
+  ],
+  "homepage": "https://github.com/briankeegan1/herdkit#readme",
+  "bugs": {
+    "url": "https://github.com/briankeegan1/herdkit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/briankeegan1/herdkit.git"
+  },
+  "license": "MIT",
+  "author": "Brian Keegan",
+  "type": "commonjs",
+  "bin": {
+    "herd": "bin/herd.cjs"
+  },
+  "files": [
+    "bin/herd.cjs",
+    "scripts/postinstall.cjs",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.cjs"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
