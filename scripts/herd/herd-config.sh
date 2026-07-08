@@ -784,17 +784,29 @@ herd_write_ratelimit_hook() {
   local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
   mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
   if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
-import json, os, sys, tempfile
+import json, os, shlex, sys, tempfile
 
 path = os.environ["HERD_RH_SETTINGS"]
 sentinel = os.environ["HERD_RH_SENTINEL"]
 
-# The hook command: write the stop reason (reset banner text, if the harness passes it on stdin) to
-# the sentinel; an empty write still marks "limit hit". Kept dependency-free (sh + cat).
-cmd = "cat > %s 2>/dev/null || : > %s" % (
-    "'" + sentinel.replace("'", "'\\''") + "'",
-    "'" + sentinel.replace("'", "'\\''") + "'",
-)
+# The hook command. HERD-155 F3: a StopFailure/rate_limit hook's stdin is the harness EVENT — a JSON
+# blob (session_id, transcript_path, a reason/message, …), NOT the bare reset banner. The old `cat >`
+# wrote that whole blob, so a stray numeric field (a token count, an id fragment) could be misparsed
+# downstream as a reset clock time. Instead EXTRACT just the usage-limit banner text — the anchored
+# "reset at/in <time>" phrase, else any "usage/session limit" line — from whatever arrives (JSON or
+# raw) and write only that. An empty write still marks "limit hit" (→ HERD_LIMIT_UNKNOWN_WAIT). If
+# python3 is unavailable at hook time, the `|| : >` fallback writes an empty sentinel — never lost.
+_extract = r'''import sys, re
+raw = sys.stdin.read()
+m = re.search(r'[^\n"]*reset[s]? (?:at|in)[^\n"]*', raw, re.I)
+out = (m.group(0) if m else "").strip()
+if not out:
+    m = re.search(r'[^\n"]*(?:usage|session) limit[^\n"]*', raw, re.I)
+    out = (m.group(0) if m else "").strip()
+sys.stdout.write(out)
+'''
+q_sentinel = "'" + sentinel.replace("'", "'\\''") + "'"
+cmd = "python3 -c %s > %s 2>/dev/null || : > %s" % (shlex.quote(_extract), q_sentinel, q_sentinel)
 entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
 
 data = {}
