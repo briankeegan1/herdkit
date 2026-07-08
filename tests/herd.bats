@@ -43,6 +43,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic file-backend test passes" {
+  run bash "$REPO/tests/test-backend-file.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic planned-work-visibility test passes" {
+  run bash "$REPO/tests/test-planned-work-visibility.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]
@@ -99,6 +111,78 @@ setup() {
 
 @test "hermetic sha-keyed resolver re-spawn test passes" {
   run bash "$REPO/tests/test-watcher-respawn-resolver.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
+  run bash "$REPO/tests/test-tab-leak-deflake.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic tab-leak-guard worktree-slug whitelist (HERD-115) test passes" {
+  run bash "$REPO/tests/test-tab-leak-worktree-whitelist.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic builder-secrets-isolation test passes" {
+  run bash "$REPO/tests/test-builder-secrets-isolation.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic approval-purge (HERD-90) test passes" {
+  run bash "$REPO/tests/test-approval-purge.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic coordinator progress-ledger (HERD-103) test passes" {
+  run bash "$REPO/tests/test-ledger.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic mid-flight advisor (HERD-101) test passes" {
+  run bash "$REPO/tests/test-advise.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic project-mode codemap test passes" {
+  run bash "$REPO/tests/test-codemap-project.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
+@test "hermetic dependency-aware spawn queue (HERD-94) test passes" {
+  run bash "$REPO/tests/test-spawn-queue-deps.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic reviewer-pane lifecycle (HERD-113) test passes" {
+  run bash "$REPO/tests/test-reviewer-pane-lifecycle.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic coordinator startup-restore probe (HERD-112) test passes" {
+  run bash "$REPO/tests/test-startup-restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
+@test "hermetic drainer singleton liveness (HERD-109) test passes" {
+  run bash "$REPO/tests/test-drainer-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic builder handoff summary (HERD-106) test passes" {
+  run bash "$REPO/tests/test-handoff-summary.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

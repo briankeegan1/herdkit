@@ -92,6 +92,8 @@ done
 [ "$REVIEW_MODEL_CHEAP" = "claude-sonnet-4-6" ] || fail "REVIEW_MODEL_CHEAP default wrong ($REVIEW_MODEL_CHEAP)"
 [ "$REVIEW_ESCALATE_MAXFILES" = "10" ]          || fail "REVIEW_ESCALATE_MAXFILES default wrong"
 [ -z "${REVIEW_ESCALATE_GLOB:-}" ]              || fail "REVIEW_ESCALATE_GLOB should default empty"
+[ "$REVIEW_MODEL_DOCS" = "claude-haiku-4-5" ]   || fail "REVIEW_MODEL_DOCS default wrong ($REVIEW_MODEL_DOCS)"
+[ -z "${DOCS_ONLY_GLOB:-}" ]                     || fail "DOCS_ONLY_GLOB should default empty"
 ok
 
 export STUB_SPAWN_LOG="$T/spawns.log"; : > "$STUB_SPAWN_LOG"
@@ -137,6 +139,48 @@ export STUB_DIFF_PATHS=""
 [ "$(_classify_review_tier 104)" = "STRONG" ] || fail "empty diff must fail SAFE to STRONG"
 ok
 
+# ── UNIT: DOCS tier (DOCS_ONLY_GLOB, HERD-89) ────────────────────────────────
+# A docs pattern the hardcoded *.md/tests SKIP does NOT cover (e.g. *.txt, or a mixed *.md+*.txt diff)
+# routes to the DOCS tier when EVERY changed path matches DOCS_ONLY_GLOB. Escalation still wins.
+DOCS_GLOB='\.(md|txt)$'
+DOCS_ONLY_GLOB="$DOCS_GLOB"
+
+# (e) every path matches the docs glob (a *.txt the SKIP misses) → DOCS
+export STUB_DIFF_PATHS=$'CHANGELOG.txt\nnotes.txt'
+[ "$(_classify_review_tier 110)" = "DOCS" ] || fail "(e) all-docs .txt diff should be DOCS"
+ok
+# a MIXED *.md + *.txt diff (SKIP needs all-.md/tests, so it falls through) → DOCS
+export STUB_DIFF_PATHS=$'README.md\nnotes.txt'
+[ "$(_classify_review_tier 110)" = "DOCS" ] || fail "(e) mixed .md+.txt docs diff should be DOCS"
+ok
+# a single NON-docs path defeats DOCS → CHEAP (small, low-risk, no glob match)
+export STUB_DIFF_PATHS=$'notes.txt\nscripts/herd/journal.sh'
+[ "$(_classify_review_tier 110)" = "CHEAP" ] || fail "(e) a non-docs path must defeat DOCS → CHEAP"
+ok
+
+# (f) ESCALATION WINS over the docs tier: a docs-glob path (a *.txt, so the *.md/tests SKIP doesn't
+# fire) that ALSO matches REVIEW_ESCALATE_GLOB → STRONG, not DOCS.
+REVIEW_ESCALATE_GLOB="$GLOB"
+export STUB_DIFF_PATHS=$'scripts/herd/agent-watch-notes.txt'
+[ "$(_classify_review_tier 111)" = "STRONG" ] || fail "(f) escalate-glob match must beat DOCS → STRONG"
+ok
+# …and a docs-only diff over REVIEW_ESCALATE_MAXFILES files → STRONG even though every path is docs
+bigdocs="$(for i in $(seq 1 15); do printf 'doc%02d.txt\n' "$i"; done)"
+export STUB_DIFF_PATHS="$bigdocs"
+[ "$(_classify_review_tier 111)" = "STRONG" ] || fail "(f) large docs diff must escalate to STRONG"
+ok
+
+# (g) DOCS_ONLY_GLOB activates tiering ON ITS OWN — REVIEW_ESCALATE_GLOB empty must NOT force STRONG
+# (an empty escalate glob would make `grep -qE ""` match every path; the -n guard prevents that).
+REVIEW_ESCALATE_GLOB=""
+export STUB_DIFF_PATHS=$'guide.txt\nhandbook.txt'
+[ "$(_classify_review_tier 112)" = "DOCS" ] || fail "(g) DOCS_ONLY_GLOB alone must classify DOCS, not STRONG"
+ok
+
+# Restore glob state for the integration section (docs tiering off unless a scenario opts in).
+DOCS_ONLY_GLOB=""
+REVIEW_ESCALATE_GLOB="$GLOB"
+
 # ── INTEGRATION: _review_gate_step dispatches the right tier / skips ─────────
 rm -f "$REVIEW_STATE" "$REVIEW_RETRIES"; : > "$STUB_SPAWN_LOG"
 export STUB_DELAY=0 STUB_VERDICT="REVIEW: PASS"
@@ -177,6 +221,19 @@ ok
 # The tier decision is CACHED sha-keyed (one gh classification per commit).
 [ -s "$(_review_tier_file 202 shaC)" ] || fail "tier decision should be cached"
 [ "$(cat "$(_review_tier_file 202 shaC)")" = "CHEAP" ] || fail "cached tier should be CHEAP"
+ok
+
+# (e-int) DOCS: a pure-docs diff (all paths match DOCS_ONLY_GLOB) → reviewer dispatched on $REVIEW_MODEL_DOCS.
+: > "$STUB_SPAWN_LOG"
+DOCS_ONLY_GLOB="$DOCS_GLOB"
+export STUB_DIFF_PATHS=$'CHANGELOG.txt\nnotes.txt'
+s="$(_review_gate_step 203 slug-docs shaX)"
+[ "$s" = "RUNNING" ] || fail "(e-int) DOCS diff should dispatch (got $s)"
+wait_for 5 grep -q '^203 ' "$STUB_SPAWN_LOG" || fail "(e-int) DOCS reviewer never spawned"
+[ "$(awk '$1==203{print $2}' "$STUB_SPAWN_LOG")" = "$REVIEW_MODEL_DOCS" ] \
+  || fail "(e-int) DOCS must dispatch on $REVIEW_MODEL_DOCS, got $(awk '$1==203{print $2}' "$STUB_SPAWN_LOG")"
+[ "$(cat "$(_review_tier_file 203 shaX)")" = "DOCS" ] || fail "(e-int) cached tier should be DOCS"
+DOCS_ONLY_GLOB=""   # docs tiering off again for the regression guard below
 ok
 
 # ── (d) REGRESSION GUARD: glob empty → UNCHANGED always-$MODEL_REVIEW behavior ─

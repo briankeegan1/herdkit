@@ -198,6 +198,28 @@ esac
 : "${SCRIBE_BACKEND:="file"}"
 : "${SHARE_LINKS:=""}"            # dirs symlinked into each worktree (e.g. "data .venv")
 
+# SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the backlog drainer empties the queue
+# and `scribe-step.sh next` would return EMPTY, the drainer keeps polling for this many extra seconds
+# before it finishes and its session exits, so a burst of requests arriving with idle gaps between
+# them is drained by ONE scribe session instead of paying a fresh MODEL_SCRIBE cold-start per gap.
+# Default 0 → today's behavior byte-identical (next's total wait stays == SCRIBE_POLL). Suggest 90.
+# Defaulted here so scribe.sh (which expands it into the drainer prompt under `set -u`) and
+# scribe-step.sh both see it.
+: "${SCRIBE_LINGER_SECS:=0}"
+
+# DRAINER_HEARTBEAT_TIMEOUT — drainer singleton liveness window in seconds (HERD-109). The scribe and
+# researcher drainers are per-project singletons: an enqueue that finds a drainer of that name already
+# in `herdr agent list` short-circuits with "already running" and spawns nothing. That is a liveness
+# blind spot — a LISTED but HUNG drainer (wedged claude session / stuck step) never drains, blocking the
+# queue forever. When set, the *-step.sh drainers heartbeat on every drain step; if the enqueue path
+# then finds a "running" drainer whose heartbeat is older than this many seconds, it treats it as HUNG,
+# RECLAIMS the singleton, and spawns a FRESH drainer. The queue's atomic per-request claim keeps this
+# from double-draining. Conservative default 900 (15 min) — far above any single legitimate drain step,
+# so a healthy drainer is never falsely reclaimed and behavior is byte-identical to before. Set 0 to
+# DISABLE (never reclaim on liveness — pure legacy behavior). Non-numeric → treated as 0 (off). Shared
+# by scribe/research; defaulted here so scribe.sh / research.sh (which read it under `set -u`) both see it.
+: "${DRAINER_HEARTBEAT_TIMEOUT:=900}"
+
 # BACKLOG_VIEW_EXTRAS — view-only backlog-pane extra section. Default "" (off) → the pane output is
 # byte-identical to before. Set "github-issues" and the backlog viewer renders a SECOND, clearly
 # labeled '📥 incoming (github issues)' section BENEATH the primary work queue, listing this repo's
@@ -274,6 +296,14 @@ fi
 : "${MODEL_REVIEW:="claude-opus-4-8"}"
 : "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
+# MODEL_ADVISE — the STRONG advisor model behind `herd advise` (HERD-101): a builder pulls a one-shot
+# second opinion on a hard decision from this tier WITHOUT escalating its whole lane. Defaults to
+# whatever MODEL_FEATURE resolved to just above (the Opus tier under standard TOKEN_MODE, sonnet under
+# eco) — so the advisor tracks the feature tier by default and eco lowers it in lockstep. Set it
+# explicitly to pin the advisor to a specific strong model regardless of the feature tier. Assigned
+# AFTER MODEL_FEATURE so its default sees the fully-resolved value; ':=' means an explicit key wins.
+: "${MODEL_ADVISE:="$MODEL_FEATURE"}"
+
 # MODEL_ESCALATE_GLOB — deterministic model step-up (analogous to HEALTHCHECK_HEAVY_GLOB): when a
 # lane's task text matches this egrep -i pattern, the lane forces the MODEL_FEATURE tier regardless
 # of MODEL_QUICK or any per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override. Empty (default) → off,
@@ -290,6 +320,7 @@ fi
 #   • a docs/test-only diff (only *.md and tests/ paths)      → review SKIPPED entirely: a PASS is
 #       recorded with provenance source=skipped-low-risk (no reviewer spawned), still sha-keyed so
 #       it is never re-run
+#   • every path matches DOCS_ONLY_GLOB (opt-in, below)       → DOCS tier ($REVIEW_MODEL_DOCS, cheapest)
 #   • any other small, low-risk diff                          → CHEAP tier ($REVIEW_MODEL_CHEAP)
 # SAFE DEFAULT: leave REVIEW_ESCALATE_GLOB EMPTY (the default) and behavior is UNCHANGED — every PR
 # gets the full $MODEL_REVIEW review, no diff is classified at all. The tiering only activates when
@@ -304,6 +335,20 @@ fi
 # A tiered diff touching MORE than this many files escalates to the STRONG tier regardless of the
 # glob (a large diff is risky even when no single path matches). Default 10. Non-numeric → 10.
 : "${REVIEW_ESCALATE_MAXFILES:="10"}"
+# ── Docs-only review tier (DOCS_ONLY_GLOB, HERD-89) ──────────────────────────
+# A pure-docs diff carries near-zero correctness risk for the adversarial gate, yet under
+# REVIEW_ESCALATE_GLOB tiering a docs diff the hardcoded *.md/tests SKIP doesn't cover (e.g. *.txt, or
+# a mixed *.md + *.txt diff) still falls through to the CHEAP ($REVIEW_MODEL_CHEAP) tier. Set
+# DOCS_ONLY_GLOB (an egrep pattern) to route diffs where EVERY changed path matches it to the cheapest
+# reviewer model ($REVIEW_MODEL_DOCS). This activates the tiering on its own — REVIEW_ESCALATE_GLOB
+# need not be set. ESCALATION STILL WINS: a docs diff that also matches REVIEW_ESCALATE_GLOB, or that
+# exceeds REVIEW_ESCALATE_MAXFILES files, is classified STRONG regardless. Suggested value:
+# '\.(md|txt)$' — and pin any docs living under an engine dir (e.g. templates/) into REVIEW_ESCALATE_GLOB
+# so those escalate rather than downgrade. SAFE DEFAULT: EMPTY → dormant, behavior byte-identical.
+: "${DOCS_ONLY_GLOB:=""}"
+# Cheapest reviewer model tier for pure-docs diffs (default: claude-haiku-4-5); ignored when
+# DOCS_ONLY_GLOB is blank.
+: "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
@@ -331,9 +376,26 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
+# the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
+# byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is
+# health + review. parallel → dispatch the review at the same action-pass tick the healthcheck starts,
+# so the two gates overlap. The MERGE decision is UNCHANGED either way (still requires BOTH gates green);
+# only the wall-clock overlaps. Tradeoff: a health-failed sha wastes one review run (cheap under
+# REVIEW_ESCALATE_GLOB tiering). Unknown value → serial (fail safe). Consumed by agent-watch.sh.
+: "${GATE_DISPATCH:="serial"}"   # serial (default) | parallel — see capabilities.tsv / agent-watch.sh
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
+# INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
+# environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
+# exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health
+# dispatch stops, a loud 'infra circuit open' row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds the breaker goes HALF-OPEN for a single probe retry (a real verdict
+# closes it, another death re-opens it). Default 0 = OFF → every breaker path is a no-op and behavior
+# is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
+: "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
+: "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
@@ -355,6 +417,25 @@ fi
 # rather than eliminating it; the file backend's claim is a git-committed state flip made atomic by
 # push serialization (the loser's push is rejected, a re-pull shows the item claimed, and it aborts).
 : "${CLAIM_REQUIRED:="off"}"     # off (default) → no claim, today's async-scribe behavior; on → claim id-bearing spawns
+
+# ── Tracker-routed spawn enforcement (HERD-64) ───────────────────────────────
+# TRACKED_SPAWNS makes "every builder is traceable to a tracked work item" a PROJECT POLICY the
+# committed baseline binds on all operators, instead of a convention the coordinator is merely asked
+# to follow. It gates the lanes (herd-quick.sh / herd-feature.sh) and the durable spawn queue
+# (spawn.sh) on the presence of a tracker ref, via herd_tracked_spawn_or_abort below.
+#
+# off (DEFAULT) → today's behavior EXACTLY: no gate, spawns proceed with or without a ref.
+# required      → a spawn carrying NO tracker ref (HERD_CLAIM_ID, else the HERD_ITEM_REF the
+#                 coordinator threads for tracked items) is REFUSED with a loud one-line reason and
+#                 creates nothing. HERD_FORCE_SPAWN=1 (or the lanes' --force) is the explicit escape
+#                 hatch: it lets an unref'd spawn through and JOURNALS the bypass (tracked_spawn_bypassed).
+# Any value other than "required" is treated as off (safe default).
+#
+# INTERPLAY with CLAIM_REQUIRED (HERD-50): the ref set is IDENTICAL (HERD_CLAIM_ID:-HERD_ITEM_REF), so
+# with BOTH on the same id both satisfies this gate AND is atomically CLAIMED before the worktree —
+# every spawn is then visible in the tracker AND raced-safe. The two are orthogonal: TRACKED_SPAWNS
+# enforces VISIBILITY (a ref exists), CLAIM_REQUIRED enforces EXCLUSIVITY (no double-build).
+: "${TRACKED_SPAWNS:="off"}"     # off (default) → today's behavior; required → refuse a ref-less spawn
 
 unset _HERD_SCRIPT_DIR _HERD_REPO_DEFAULT _HERD_CONFIG_FILE _HERD_CONFIG_SOURCE _HERD_CONFIG_LOCAL_FILE
 
@@ -769,10 +850,50 @@ herd_context_provision_preamble() {
     case "$_src" in
       codemap)
         _out="$_out A deterministic map of this repo's engine tree is committed at docs/codemap.md (module roles, who-sources-whom, and config-key→consumer wiring; regenerate with 'herd codemap'). READ IT FIRST to orient — it lets you skip re-exploring the tree." ;;
+      symbol-index)
+        _out="$_out A function-level symbol index (definition sites + cross-file callers for functions under bin/ and scripts/herd/) is committed at docs/symbol-index.md; use it to jump to a function's def or its likely callers instead of grepping, and regenerate with 'herd symbol-index'. HONEST SCOPE: a heuristic token scan, not ground truth — same-name defs and dynamic dispatch are ambiguous." ;;
       *) : ;;   # unknown grounding source — ignore (forward-compatible)
     esac
   done
   printf '%s' "$_out"
+}
+
+# ── Tracker-routed spawn enforcement (HERD-64) ───────────────────────────────────────────────────
+# herd_tracked_spawn_or_abort <slug> [forced] — the shared gate the spawn surfaces (herd-quick.sh /
+# herd-feature.sh / spawn.sh) call BEFORE creating anything, to make tracker-routed spawns a project
+# POLICY rather than an operator convention. Driven by the TRACKED_SPAWNS config key.
+#
+# CONTRACT (returns 0 to PROCEED, non-zero to ABORT):
+#   • TRACKED_SPAWNS anything but 'required' (default 'off') → return 0 immediately. Byte-for-byte
+#     today's behavior — no gate, nothing printed.
+#   • required + a tracker ref present (HERD_CLAIM_ID, else the HERD_ITEM_REF the coordinator threads)
+#     → return 0. The SAME ref set herd-claim.sh uses, so one id satisfies both gates.
+#   • required + NO ref + NOT forced → print ONE loud reason to stderr and return NON-ZERO. The caller
+#     exits before creating a worktree/agent/queue-intent.
+#   • required + NO ref + forced (arg2 truthy OR HERD_FORCE_SPAWN=1) → JOURNAL the bypass
+#     (tracked_spawn_bypassed) if journal_append is available, print a loud one-line notice, return 0.
+#
+# forced (arg2) lets a lane pass its already-resolved --force/-f state; HERD_FORCE_SPAWN=1 in the
+# environment is honored regardless (the escape hatch spawn.sh, which parses no flags, relies on).
+herd_tracked_spawn_or_abort() {
+  local _tk_slug="${1:-?}" _tk_forced="${2:-}"
+  case "${TRACKED_SPAWNS:-off}" in
+    required) ;;
+    *) return 0 ;;
+  esac
+  local _tk_id="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
+  [ -n "$_tk_id" ] && return 0
+  # No tracker ref under an active policy. Forced by the lane arg OR the env escape hatch?
+  case "$_tk_forced"          in 1|true|yes|on) _tk_forced=1 ;; *) _tk_forced="" ;; esac
+  case "${HERD_FORCE_SPAWN:-}" in 1|true|yes|on) _tk_forced=1 ;; esac
+  if [ "$_tk_forced" = "1" ]; then
+    command -v journal_append >/dev/null 2>&1 \
+      && journal_append tracked_spawn_bypassed slug "$_tk_slug" reason "no tracker ref; HERD_FORCE_SPAWN bypass"
+    echo "⚠️  TRACKED_SPAWNS=required but '$_tk_slug' carries no tracker ref — HERD_FORCE_SPAWN set, spawning anyway (bypass journaled)." >&2
+    return 0
+  fi
+  echo "🛑 TRACKED_SPAWNS=required: refusing to spawn '$_tk_slug' with no tracker ref — thread HERD_ITEM_REF=<id> (or HERD_CLAIM_ID) on the spawn, or set HERD_FORCE_SPAWN=1 to bypass (bypass is journaled)." >&2
+  return 1
 }
 
 # ── Builder MCP tool provisioning (HERD-41) ──────────────────────────────────────────────────────

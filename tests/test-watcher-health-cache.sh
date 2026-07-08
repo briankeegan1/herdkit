@@ -7,6 +7,8 @@
 # Caching it FREEZES the row red until a human deletes the marker. This test asserts:
 #   • a tab-leak-guard CODEERROR is NOT written to the sha health-result cache (next tick re-runs) …
 #   • … while a NORMAL (non-tab-leak) code-error IS cached (stays red without re-running).
+# It also covers HERD-72: the cache hit is journaled only on a TRANSITION (first hit per (pr,sha), or an
+# outcome change), so identical replays every ~6s poll tick no longer drown 'herd why <pr>'.
 # It sources agent-watch.sh's helpers via the AGENT_WATCH_LIB guard (no live loop), stubs the
 # healthcheck binary on disk (NETWORK-FREE, no herdr, no repo), and inspects the on-disk cache marker.
 # Run:  bash tests/test-watcher-health-cache.sh
@@ -103,6 +105,59 @@ ok
 #      derived path. Positive proof the seam captured the writes rather than merely suppressing them. ─
 [ -s "$JOURNAL_FILE" ] || fail "gate journaling produced no sandbox journal at $JOURNAL_FILE (issue #144)"
 grep -q '"event":"healthcheck_' "$JOURNAL_FILE" || fail "sandbox journal missing healthcheck gate events (issue #144)"
+ok
+
+# ── 5. HERD-72: an unchanged (pr,sha) replayed every poll tick journals healthcheck_cache_hit ONCE ────
+# The sha-cache replays the SAME terminal verdict each ~6s tick while a PR waits on review; before the
+# fix that emitted 20-60 identical healthcheck_cache_hit lines per PR, drowning 'herd why'. Prove the
+# de-dup: prime a terminal CLEAN cache, then hit it repeatedly and assert exactly one event is journaled.
+CH_PR=42
+CH_SHA="cafed00dface"
+rm -f "$(_health_result_file "$CH_PR" "$CH_SHA")" "$(_health_cachehit_file "$CH_PR")" 2>/dev/null || true
+: > "$JOURNAL_FILE"
+
+# Prime: the FIRST full run for this (pr,sha) misses the cache — it runs the suite, writes the sha
+# result, and journals healthcheck_outcome (NOT a cache hit yet).
+rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+export HC_ONELINE="" HC_RC=0
+_HC_RESULT=""
+_healthcheck_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
+[ "$_HC_RESULT" = "CLEAN" ] || fail "prime run should be CLEAN (got '$_HC_RESULT')"
+[ "$(grep -c '"event":"healthcheck_cache_hit"' "$JOURNAL_FILE")" -eq 0 ] || \
+  fail "the priming full run must NOT journal a cache hit (it ran the suite)"
+
+# Replay the SAME (pr,sha) five times: each takes the cache-hit path. Only the FIRST transition journals.
+for _ in 1 2 3 4 5; do
+  rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+  _HC_RESULT=""
+  _healthcheck_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
+  [ "$_HC_RESULT" = "CLEAN" ] || fail "cache replay should stay CLEAN (got '$_HC_RESULT')"
+done
+n_hits="$(grep -c '"event":"healthcheck_cache_hit"' "$JOURNAL_FILE")"
+[ "$n_hits" -eq 1 ] || \
+  fail "five identical cache replays over an unchanged (pr,sha) must journal EXACTLY ONE healthcheck_cache_hit (got $n_hits)"
+ok
+
+# ── 6. HERD-72: a CHANGED outcome for the same PR re-journals (a transition, not a repeat) ────────────
+# Flip the cached terminal verdict to CODEERROR (as a re-evaluation / new head would), hit the cache,
+# and assert a NEW event is emitted carrying the changed outcome — 'herd why' must still see transitions.
+record_health_result "$CH_PR" "$CH_SHA" CODEERROR "pytest: 1 failed in tests/test_thing.py"
+rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+_HC_RESULT=""
+_healthcheck_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
+[ "$_HC_RESULT" = "CODEERROR" ] || fail "changed cache verdict should surface CODEERROR (got '$_HC_RESULT')"
+n_hits2="$(grep -c '"event":"healthcheck_cache_hit"' "$JOURNAL_FILE")"
+[ "$n_hits2" -eq 2 ] || fail "an outcome change must emit a NEW healthcheck_cache_hit (expected 2 total, got $n_hits2)"
+grep -q '"event":"healthcheck_cache_hit".*"outcome":"CODEERROR"' "$JOURNAL_FILE" || \
+  fail "the changed-outcome cache hit must carry outcome CODEERROR (event shape unchanged for 'herd why')"
+ok
+
+# ── 7. HERD-72: repeating the CHANGED outcome is again suppressed (dedup tracks the CURRENT state) ─────
+rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+_HC_RESULT=""
+_healthcheck_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
+n_hits3="$(grep -c '"event":"healthcheck_cache_hit"' "$JOURNAL_FILE")"
+[ "$n_hits3" -eq 2 ] || fail "repeating the CHANGED outcome must stay suppressed (expected 2, got $n_hits3)"
 ok
 
 echo "ALL PASS ($pass checks)"

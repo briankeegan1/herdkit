@@ -15,6 +15,10 @@
 .herd/journal.jsonl
 .herd/journal-*.jsonl
 
+# Coordinator progress ledger (HERD-103) — durable, per-machine coordinator state written to
+# WORKTREES_DIR/.herd/ (covered by *-trees/, but named explicitly for a .herd-inside-the-tree layout).
+.herd/ledger.jsonl
+
 # machine-local Claude Code state — never committed.
 .claude/settings.local.json
 .claude/settings.json
@@ -23,3 +27,8 @@
 # override the committed baseline; gitignored so a collaborator's local tuning never diverges main
 # or dirties the ff-only `herd update` pull. The baseline .herd/config stays tracked.
 .herd/config.local
+
+# graphify call-graph output (HERD-61) — the coordinator's pre-spawn impact/conflict analysis runs
+# `graphify update --no-cluster` in the main checkout, which writes this machine-local, regenerable
+# graph here. Never committed; keeps the analysis from dirtying the working tree.
+graphify-out/

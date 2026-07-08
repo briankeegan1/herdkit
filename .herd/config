@@ -12,10 +12,27 @@ SCRIBE_BACKEND="linear"
 SHARE_LINKS=""
 
 # HEALTHCHECK = shellcheck over the scripts + bats over the tests (degrades to bash -n + the
-# hermetic queue tests when those tools are absent). No app preview — every lane is the quick
-# lane, so HEALTHCHECK_HEAVY_GLOB is empty (every change runs the full healthcheck).
+# hermetic queue tests when those tools are absent).
 HEALTHCHECK_CMD=".herd/healthcheck.project.sh"
-HEALTHCHECK_HEAVY_GLOB=""
+# HEALTHCHECK_HEAVY_GLOB (HERD-65) — egrep of changed diff paths (repo-root-relative) that force the
+# heavy profile; no match → the light per-file syntax gate (bash -n / py_compile). Chosen so
+# engine-critical paths stay heavy while docs-only *.md and .herd/config VALUE-only diffs skip the
+# ~9-min full suite (evidence: PR #179, a 2-line .herd/config diff, ran the hermetic suite twice).
+#   HEAVY  : bin/ · scripts/ · tests/ · templates/ · .herd/healthcheck.project.sh (the gate itself)
+#   light  : .herd/config value tweaks · docs/*.md (incl. the auto-committed docs/codemap.md refresh)
+#            · README/BACKLOG/LICENSE · root install.sh/herd.sh (light still bash -n's changed *.sh)
+# Matched by `printf '%s\n' "$changed" | grep -qE "$HEALTHCHECK_HEAVY_GLOB"` in scripts/herd/healthcheck.sh.
+#
+# CONFIG VALIDATION STAYS GATED. The config-validation MACHINERY — herd-config.sh (scripts/), its
+# capabilities.tsv + config.example contract (templates/), and the test-config-*.sh suite (tests/) —
+# is entirely under heavy paths, so any change to how config is parsed/validated (e.g. adding a key,
+# which the caps-sync guard requires be mirrored into templates/capabilities.tsv) runs the full suite.
+# A pure .herd/config value edit touches none of that machinery, so it is safe to run light. Note
+# (verified): NEITHER profile fast-fails on a syntactically-broken .herd/config — healthcheck.sh
+# sources it non-fatally — so routing value edits to light loses no value-level gate that ever existed;
+# a broken config surfaces immediately at the next `herd` command. Keep this glob narrow: widen it
+# (not shrink it) if a new engine surface lands outside these paths.
+HEALTHCHECK_HEAVY_GLOB='^(bin|scripts|tests|templates)/|^\.herd/healthcheck\.project\.sh$'
 APP_PREVIEW_CMD=""
 SMOKE_CMD=""
 
@@ -113,7 +130,7 @@ REVIEW_CONCURRENCY="2"
 HEALTH_CONCURRENCY="1"
 REFIX_MAX_ROUNDS="3"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
-REVIEW_ESCALATE_GLOB=""
+REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"
 # only used once REVIEW_ESCALATE_GLOB is set
 REVIEW_MODEL_CHEAP="claude-sonnet-4-6"
 REVIEW_ESCALATE_MAXFILES="10"
@@ -140,3 +157,4 @@ HERD_THEME="tokyonight"
 COORDINATOR_WATCHDOG="on"
 # restart a silently-dead EMPTY builder once (never blows away work)
 DEAD_BUILDER_AUTORESPAWN="on"
+DOCTOR_STARTUP_HINT="on"

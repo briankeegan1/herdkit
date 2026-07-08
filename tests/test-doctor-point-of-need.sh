@@ -63,9 +63,9 @@ out1="$(env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm
 grep -q "alpha render item" <<<"$out1" || fail "no-glow render did not print the backlog list ($out1)"
 grep -qF "$HINT" <<<"$out1"            || fail "no-glow render missing the self-diagnosing doctor hint ($out1)"
 # Dim, NEVER red: the hint line must carry the dim SGR (\033[2m) and NO red foreground (31/91).
-hintline="$(printf '%s\n' "$out1" | grep -F "$HINT" | head -1)"
-printf '%s' "$hintline" | grep -q $'\033\[2m' || fail "hint line is not dim (missing \\033[2m): $(printf %q "$hintline")"
-printf '%s' "$hintline" | grep -qE $'\033\[[0-9;]*(31|91)[;m]' && fail "hint line is RED — violates the no-false-red rule"
+hintline="$(grep -F "$HINT" <<<"$out1" | head -1)"
+grep -q $'\033\[2m' <<<"$hintline" || fail "hint line is not dim (missing \\033[2m): $(printf %q "$hintline")"
+grep -qE $'\033\[[0-9;]*(31|91)[;m]' <<<"$hintline" && fail "hint line is RED — violates the no-false-red rule"
 pass
 
 # ── Case 2: startup notice — sourceable + side-effect-free, SILENT unless opted in ────────────────
@@ -96,8 +96,8 @@ grep -q "shellcheck not found" <<<"$o_on" || fail "notice(on) must surface missi
 grep -q "bats not found"       <<<"$o_on" || fail "notice(on) must surface missing bats ($o_on)"
 grep -q "run herd doctor"      <<<"$o_on" || fail "notice(on) must point at 'herd doctor' ($o_on)"
 [ "$(grep -c "run herd doctor" <<<"$o_on")" -eq 1 ] || fail "notice(on) must print the doctor pointer exactly once ($o_on)"
-printf '%s' "$o_on" | grep -q $'\033\[2m' || fail "notice(on) output is not dim (missing \\033[2m)"
-printf '%s' "$o_on" | grep -qE $'\033\[[0-9;]*(31|91)[;m]' && fail "notice(on) output is RED — violates the no-false-red rule"
+grep -q $'\033\[2m' <<<"$o_on" || fail "notice(on) output is not dim (missing \\033[2m)"
+grep -qE $'\033\[[0-9;]*(31|91)[;m]' <<<"$o_on" && fail "notice(on) output is RED — violates the no-false-red rule"
 # return status is always 0 (a reminder must never fail the launch it rides on)
 ( DOCTOR_STARTUP_HINT=on PATH="$EMPTYBIN" _herd_soft_dep_startup_notice >/dev/null ) || fail "notice must return 0 even with missing deps"
 pass

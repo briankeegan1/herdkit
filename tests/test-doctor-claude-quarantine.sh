@@ -76,27 +76,27 @@ run_doctor() {
 b="$(mkbin s1)"; add_present "$b" git; add_gh_authed "$b"; add_claude_hung "$b"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin HERD_DOCTOR_CLAUDE_TIMEOUT=2)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(1) a hung claude is a RECOMMENDED-tier warn, not a gate (got $RC): $out"
-echo "$out" | grep -qi "claude HUNG"        || fail "(1) hung claude not reported as HUNG: $out"
-echo "$out" | grep -qi "did not return within 2s" || fail "(1) timeout not surfaced with the probe window: $out"
-echo "$out" | grep -qi "_dyld_start"        || fail "(1) hang not tied to the _dyld_start symptom: $out"
-echo "$out" | grep -qi "issue #137"         || fail "(1) hung-claude report should point at the quarantine fix (#137): $out"
+grep -qi "claude HUNG" <<<"$out"        || fail "(1) hung claude not reported as HUNG: $out"
+grep -qi "did not return within 2s" <<<"$out" || fail "(1) timeout not surfaced with the probe window: $out"
+grep -qi "_dyld_start" <<<"$out"        || fail "(1) hang not tied to the _dyld_start symptom: $out"
+grep -qi "issue #137" <<<"$out"         || fail "(1) hung-claude report should point at the quarantine fix (#137): $out"
 ok
 
 # ── (2) darwin + QUARANTINED binary → ⚠ + the EXACT one-line un-quarantine fix, naming the binary ──
 b="$(mkbin s2)"; add_present "$b" git claude; add_gh_authed "$b"; add_xattr_quarantined "$b"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(2) quarantine is a RECOMMENDED-tier warn, not a gate (got $RC): $out"
-echo "$out" | grep -qi "QUARANTINED"                              || fail "(2) quarantine not flagged: $out"
-echo "$out" | grep -qi "com.apple.quarantine"                    || fail "(2) xattr name not named: $out"
-echo "$out" | grep -qE "fix: xattr -d com\.apple\.quarantine .*/claude" || fail "(2) exact one-line fix (with the binary path) missing: $out"
+grep -qi "QUARANTINED" <<<"$out"                              || fail "(2) quarantine not flagged: $out"
+grep -qi "com.apple.quarantine" <<<"$out"                    || fail "(2) xattr name not named: $out"
+grep -qE "fix: xattr -d com\.apple\.quarantine .*/claude" <<<"$out" || fail "(2) exact one-line fix (with the binary path) missing: $out"
 ok
 
 # ── (3) darwin + CLEAN binary → ✓ not quarantined; no false alarm ─────────────────────────────────
 b="$(mkbin s3)"; add_present "$b" git claude; add_gh_authed "$b"; add_xattr_clean "$b"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(3) clean binary should pass (got $RC): $out"
-echo "$out" | grep -qi "claude binary not quarantined" || fail "(3) clean binary not reported as ✓: $out"
-echo "$out" | grep -qi "is QUARANTINED"                && fail "(3) false quarantine alarm on a clean binary: $out"
+grep -qi "claude binary not quarantined" <<<"$out" || fail "(3) clean binary not reported as ✓: $out"
+grep -qi "is QUARANTINED" <<<"$out"                && fail "(3) false quarantine alarm on a clean binary: $out"
 ok
 
 # ── (4) symlink/shim resolution → the fix names the RESOLVED Caskroom target, not the /bin shim ────
@@ -107,16 +107,16 @@ add_present "$CASK" claude   # the REAL (resolved) binary
 b="$(mkbin s4)"; add_present "$b" git; add_gh_authed "$b"; add_xattr_quarantined "$b"
 ln -sf "$CASK/claude" "$b/claude"   # /bin shim → Caskroom target
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
-echo "$out" | grep -qF "$CASK/claude"     || fail "(4) fix did not resolve the shim to the Caskroom binary: $out"
-echo "$out" | grep -qF "fix: xattr -d com.apple.quarantine $CASK/claude" || fail "(4) fix should target the resolved Caskroom path: $out"
+grep -qF "$CASK/claude" <<<"$out"     || fail "(4) fix did not resolve the shim to the Caskroom binary: $out"
+grep -qF "fix: xattr -d com.apple.quarantine $CASK/claude" <<<"$out" || fail "(4) fix should target the resolved Caskroom path: $out"
 ok
 
 # ── (5) HEALTHY claude → ✓ responds; no hang/quarantine noise ─────────────────────────────────────
 b="$(mkbin s5)"; add_present "$b" git claude; add_gh_authed "$b"; add_xattr_clean "$b"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(5) healthy claude should pass (got $RC): $out"
-echo "$out" | grep -qi "claude responds"  || fail "(5) healthy claude not reported as responsive: $out"
-echo "$out" | grep -qi "claude HUNG"      && fail "(5) healthy claude wrongly flagged as hung: $out"
+grep -qi "claude responds" <<<"$out"  || fail "(5) healthy claude not reported as responsive: $out"
+grep -qi "claude HUNG" <<<"$out"      && fail "(5) healthy claude wrongly flagged as hung: $out"
 ok
 
 # ── (6) non-darwin → the xattr/quarantine check is SKIPPED (macOS-only concern) ───────────────────
@@ -124,9 +124,9 @@ ok
 b="$(mkbin s6)"; add_present "$b" git claude; add_gh_authed "$b"; add_xattr_quarantined "$b"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=linux)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(6) linux run should pass (got $RC): $out"
-echo "$out" | grep -qi "is QUARANTINED"         && fail "(6) quarantine check must not run off darwin: $out"
-echo "$out" | grep -qi "claude binary not quarantined" && fail "(6) quarantine ✓ line must not print off darwin: $out"
-echo "$out" | grep -qi "claude responds"        || fail "(6) probe should still run + pass on linux: $out"
+grep -qi "is QUARANTINED" <<<"$out"         && fail "(6) quarantine check must not run off darwin: $out"
+grep -qi "claude binary not quarantined" <<<"$out" && fail "(6) quarantine ✓ line must not print off darwin: $out"
+grep -qi "claude responds" <<<"$out"        || fail "(6) probe should still run + pass on linux: $out"
 ok
 
 echo "ALL PASS ($pass checks)"

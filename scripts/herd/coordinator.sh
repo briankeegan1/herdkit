@@ -131,6 +131,25 @@ layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"
 
+# STARTUP-RESTORE health probe (HERD-112) — after (re)building the control room, verify it actually
+# came UP: the watcher grabbed its lock (the same $HERD_WATCHER_LOCK pid + kill -0 signal `herd
+# status` uses) and the backlog/watch panes are in the role registry we just wrote. A room that came
+# up DEGRADED (a pane run that fell back headless, a watcher that never started) is surfaced LOUDLY
+# with the one-line `herd reload` restore hint. Deterministic + no-LLM + fail-soft: when everything
+# is healthy this prints NOTHING (a clean launch stays byte-identical to before); the hint appears
+# ONLY on a real down state. Skipped when the watch console was suppressed (HERD_NO_WATCH=1) — then
+# there is no watcher to be "down". _herd_control_room_down_reason comes from herd-preflight.sh.
+if [ "${HERD_NO_WATCH:-}" != "1" ]; then
+  # agent-watch.sh writes its PID to the lockfile shortly after `pane run` starts it — bounded poll
+  # so a still-initialising watcher is not mis-read as down (mirrors cmd_reload's lock poll).
+  _crk=0
+  while [ "$_crk" -lt "${HERD_STARTUP_LOCK_POLLS:-15}" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do
+    sleep 0.2; _crk=$((_crk+1))
+  done
+  _down="$(_herd_control_room_down_reason "$WORKTREES_DIR/.herd-panes")"
+  [ -n "$_down" ] && printf '\033[1;31m⚠ control room looks down — run herd reload\033[0m (%s)\n' "$_down"
+fi
+
 # PROACTIVE soft-dep surfacing (HERD-45) — opt-in via DOCTOR_STARTUP_HINT (loaded from .herd/config
 # above); a no-op / byte-identical launch unless it is "on". When on, surface any missing soft dep +
 # the `herd doctor` fix now, at control-room startup, rather than waiting for the degradation to bite.

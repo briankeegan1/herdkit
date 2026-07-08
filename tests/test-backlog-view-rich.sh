@@ -158,4 +158,25 @@ grep -q -- '- `#HERD-3` \*\*Free task\*\*' <<<"$out4" \
   || fail "unassigned item must not emit any @-name on its line"
 pass
 
+# ── Case 5: OSC 8 chip hyperlink from the rich TSV's 7th <url> field (HERD-49) ───────────────────
+# A rich line carrying a url makes the id chip a clickable OSC 8 hyperlink (ESC ]8;;URL ST … ST)
+# WRAPPED INSIDE the code-chip backticks, so glow's chip styling is untouched and the sequence is
+# ignored by terminals without OSC 8 support. A line with NO url field stays a plain unlinked chip
+# (fail-soft). The fake glow cats the shaped markdown, so we assert on the injected escape directly.
+P5="$T/proj-link"; make_project "$P5"
+ESC="$(printf '\033')"
+RICH5="#HERD-49${TAB}started${TAB}In Progress${TAB}Clickable ids${TAB}${TAB}${TAB}https://linear.app/acme/issue/HERD-49
+#HERD-50${TAB}unstarted${TAB}Todo${TAB}No url item${TAB}${TAB}${TAB}"
+: > "$LOG"
+out5="$(run_view "$P5" HERD_FAKE_RICH_OUT="$RICH5")"
+# The chip identifier is wrapped in an OSC 8 open (…]8;;<url>ST) + close (…]8;;ST), still inside `…`.
+grep -q -- "\`${ESC}]8;;https://linear.app/acme/issue/HERD-49${ESC}\\\\#HERD-49${ESC}]8;;${ESC}\\\\\`" <<<"$out5" \
+  || fail "rich item with a url did not wrap the chip in an OSC 8 hyperlink ($(cat -v <<<"$out5"))"
+# Styling untouched: the bold title still renders as its own markdown next to the linked chip.
+grep -q -- '\*\*Clickable ids\*\*' <<<"$out5" || fail "OSC 8 wrapping disturbed the bold title ($out5)"
+# The url-less item keeps a plain, un-escaped chip.
+grep -q -- '- `#HERD-50` \*\*No url item\*\*' <<<"$out5" \
+  || fail "url-less rich item must keep a plain unlinked chip ($(cat -v <<<"$out5"))"
+pass
+
 echo "ALL PASS ($PASS checks)"

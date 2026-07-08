@@ -86,9 +86,21 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 ## Implement an item
 
-1. List the 🔜 items and let the user pick one (AskUserQuestion).
+1. List the 🔜 items and let the user pick one (AskUserQuestion). **Before you offer an item, screen
+   out what another operator has already taken or planned** (two operators now share this tracker):
+   - **In flight** — skip anything already assigned / 🚧 in progress (the tracker's own state, and
+     `git worktree list`). A pre-spawn **claim** (`CLAIM_REQUIRED`, below) is the hard guard here.
+   - **Planned but not yet spawned** — run `herd backlog queued` and skip any item another operator
+     has published a 📌 marker for. This is the *plan-time* complement to claiming: it surfaces work a
+     coordinator has **sequenced to spawn next** but hasn't spawned yet, which otherwise lives only in
+     that coordinator's conversation. A marker flagged `ADVISORY: >24h stale` is **advisory only** —
+     an abandoned plan never becomes a soft lock, so you MAY pick it (say so out loud). You may also
+     override a fresh marker with an explicit reason (e.g. the other operator asked you to take it).
+     A marker is auto-superseded once the item is spawned (the claim takes over).
 2. Derive a short **kebab-case slug** (e.g. "Card CSV importer" → `card-csv-importer`). Confirm.
-3. Spawn the sub-agent — pick the lane:
+3. **Before you spawn**, run the *pre-spawn impact/conflict analysis* below if graphify is available
+   on this machine — it reads whether the candidate's file surface collides with work already in
+   flight so you can sequence instead of spawning into a conflict. Then pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
      bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
@@ -101,8 +113,8 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
    `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
    merge-time reconcile resolves the exact backlog item by that ref instead of fuzzy slug/title
-   matching. Omit it for a file-backend item with no id (the reconcile falls back to fuzzy matching,
-   exactly as before):
+   matching. Under *Tracker-routed spawns* (below) you thread it on **every** spawn — file a tracker
+   item first so there is always a ref; a raw file-backend item with no id falls back to fuzzy matching:
    ```
    HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"
    ```
@@ -121,6 +133,112 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `{{BACKLOG_FILE}}`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
+
+### Tracker-routed spawns — file first, then spawn (always)
+
+**Every builder you spawn must trace back to a tracked work item — no off-book spawns.** This is
+project policy, not a nicety: it keeps the tracker the single truthful picture of what is being built
+and lets merge-time reconcile link each PR to its item by an exact ref.
+
+The rule is **file-then-spawn**:
+
+1. **Ensure a tracker item exists BEFORE you spawn.** Reuse the item you picked, or — for anything not
+   already tracked — enqueue it on the scribe FIRST and use that item:
+   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
+   refactor, a config tweak, a docs pass, a flake fix all get an item too. If it is worth a worktree
+   and a PR, it is worth a one-line tracker entry.
+2. **Thread `HERD_ITEM_REF=<id>` on EVERY lane invocation** — feature, quick, and `spawn.sh` alike:
+   ```
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-quick.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash {{SCRIPTS_DIR}}/spawn.sh <slug> quick "<task>"
+   ```
+   The builder then carries a `Refs: <id>` line in its PR body (the exact-ref reconcile), and with
+   `CLAIM_REQUIRED` on the same id atomically **claims** the item so two operators can't double-build it.
+3. **Engine bugs get a tracker mirror.** When you escalate a HERD-ENGINE bug OUT to `{{HERD_REPO}}`
+   via `herd report` (see *Routing* below), also **mirror it as a local tracker item** (scribe-add)
+   if you intend to build the fix here, so the fix-spawn is tracked like any other — the escalation
+   filing alone is not a spawnable tracked item.
+
+**Enforcement (`TRACKED_SPAWNS`).** By default this is a discipline the coordinator follows. Set
+`TRACKED_SPAWNS=required` in `.herd/config` and the lanes + `spawn.sh` **refuse** a spawn that carries
+no tracker ref, with a loud reason — the escape hatch is `HERD_FORCE_SPAWN=1` (it journals the bypass).
+Turn it on for shared / multi-operator repos where an off-book spawn must be impossible, not merely
+discouraged; pair it with `CLAIM_REQUIRED` so every spawn is both **visible** in the tracker and
+**claimed** against a double-build.
+
+### Planned-work visibility — publish what you've sequenced next (HERD-52)
+
+Claiming (`CLAIM_REQUIRED`) closes the *spawn-time* race, but there is an earlier one: once you
+**sequence** an item to spawn next — decided, but waiting on a blocker to merge or on review
+bandwidth — that plan lives only in *your* conversation. A second operator reading the same tracker
+sees the item still open and can grab it. Close that plan-time window by publishing a lightweight
+**📌 planned marker**:
+
+    herd backlog queue <#id> --after <blocker>     # "I'm building this next, after <blocker>"
+    herd backlog queued                            # list every operator's live planned markers
+    herd backlog unqueue <#id>                     # clear it (plan dropped)
+
+**When to publish.** Whenever you decide to build an item but don't spawn it *right now* — you're
+holding it behind an in-flight worktree (the graphify *Sequence or warn* step above), waiting on
+review capacity, or lining up a batch. Publish before you move on, so the other operator's next
+`herd backlog queued` shows it.
+
+**Lifecycle (so a marker never rots into a lock).**
+- **Superseded on spawn.** When you actually spawn the item, the pre-spawn **claim** takes over as
+  the authoritative signal (assignee + 🚧). You don't have to unqueue by hand — but do it if the
+  backend keeps the marker around and it's noise.
+- **Cleared on drop.** Change your mind? `herd backlog unqueue <#id>` removes it.
+- **Advisory after 24h.** `herd backlog queued` flags any marker older than 24h `ADVISORY: >24h
+  stale`. A stale plan is informational only — never treat it as a lock; pick the item if the plan
+  was clearly abandoned.
+
+**Backend-optional + fail-soft.** On the file backend the marker is a 📌 annotation committed onto
+the item's `{{BACKLOG_FILE}}` line (so it also shows inline in `herd backlog`); on Linear it's a 📌
+comment on the issue. A backend that doesn't support markers prints a soft note and no-ops — the
+feature is advisory, so a missing op is never an error and never blocks a spawn. Each marker write is
+journaled (`herd log | grep tracker_write`, component `plan`) for attribution.
+
+### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
+
+Before spawning a builder — and periodically while several are in flight — check whether the
+candidate item's file surface **overlaps** work already underway, so you can *sequence* colliding
+items instead of spawning them into a merge conflict. This is the **coordinator-side third leg** of
+the graphify integration: `CONTEXT_PROVISION=codemap` grounds each *builder* in the committed
+`docs/codemap.md`, `MCP_PROVISION=graphify-mcp` gives a *builder* the graphify MCP tools, and this
+move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no Claude quota).
+
+1. **Resolve the binary, fail soft.** graphify is machine-local (PyPI `graphifyy`, usually at
+   `~/.local/bin/graphify`). Resolve it from `GRAPHIFY_BIN` in `.herd/config` — a **machine-scoped**
+   key, so set it per-machine with `herd config set GRAPHIFY_BIN <path>` (it routes to the gitignored
+   `.herd/config.local`, never the committed baseline) — falling back to `graphify` on `PATH`. If it
+   does not resolve (`command -v` fails), **skip this analysis silently**: no note, no warning, no red
+   row. It is an optional accelerator, and a missing tool is never an error — spawn as you normally
+   would.
+
+2. **Rebuild the graph LLM-free.** From `{{PROJECT_ROOT}}` run `"$GRAPHIFY_BIN" update --no-cluster`
+   — it writes `graphify-out/graph.json` (gitignored) with **zero** model calls, so it is cheap to
+   re-run on every spawn or periodic tick.
+
+3. **Cross the file surfaces.** For each in-flight worktree (`git worktree list`), take its changed
+   files (`git -C <worktree> diff --name-only {{DEFAULT_BRANCH}}`) and intersect: (a) each worktree's
+   set against every other worktree's, and (b) all of them against the candidate item's *likely* file
+   surface (the files the item names, plus what `docs/codemap.md` maps its subsystem to). `graph.json`
+   adds *within-file* structure — which symbols in a shared file each side touches — to sharpen a
+   same-file hit.
+
+4. **Sequence or warn.** On a real overlap, prefer to **hold the colliding candidate** until the
+   in-flight worktree merges, or spawn it with an explicit note in the task so the builder expects a
+   rebase. Non-overlapping items spawn freely in parallel. When you **hold** a candidate to sequence
+   it after the blocker, **publish that plan** so a second operator sees it (next section) —
+   `herd backlog queue <#id> --after <blocker>`.
+
+**Honest scope — file-level only.** graphify's bash **cross-file call** resolution is weak (measured
+2026-07-06: **0** cross-file call links among the big engine scripts; the ~136 repo-wide cross-file
+links are mostly imports/`contains`, not calls). Trust this for **file-level overlap detection and
+within-file structure only** — do NOT treat it as a cross-script call graph. When two items touch
+disjoint files it will not surface a call-level coupling between them; fall back to `docs/codemap.md`
+(who-sources-whom) and your own read for that.
 
 ### Reconcile the backlog after a cutover / extraction / rename PR lands
 
@@ -162,10 +280,38 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 - **Browse:** summarize the open work (`herd backlog` for the live, backend-agnostic set;
   `{{BACKLOG_FILE}}` for the file backend's full grouped history). For *real* status (is a 🔜
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
-- **Add:** enqueue it — the scribe does the research + writes the grounded entry:
+- **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
+  writes the grounded entry:
   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
   Keep/Cut/Defer plan, get approval, THEN enqueue: `bash {{SCRIPTS_DIR}}/scribe.sh "Apply this approved curation: <the full plan>"`.
+
+### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
+
+A backlog item is a task spec in waiting: whatever you leave out here, a builder has to guess at spawn
+time. Before you hand an Add to the scribe, walk these six — the first that fails sends you back to the
+repo/journal, not to the scribe:
+
+1. **GROUNDED.** The gap is real — verified against **live code / the journal**, not memory. Cite the
+   dated evidence (a file+line, a `herd why <pr>` line, a journal event) so a stale or already-shipped
+   idea never gets filed. If you can't point at the gap, research it first (research lane) — don't file.
+2. **SHAPE.** A short **title line** (< 80 chars) FIRST, then the body — the tracker takes line 1 as the
+   title. Never open with a run-on paragraph (that files a giant duplicated title).
+3. **FIX + SURFACE.** The body names a **fix sketch AND its file surface** — the exact scripts/functions
+   the change lands in. "Fix the watcher race" is not a spec; "guard the sha-cache write in
+   `agent-watch.sh` gate loop" is.
+4. **SEQUENCING.** Call out **explicit conflicts with in-flight / queued items** — same file surface,
+   dependent order, or a rename that would dangle it. Cross it against `git worktree list` + the open
+   queue (and the pre-spawn graphify read) so it isn't filed into a collision.
+5. **VERIFICATION PLAN.** Decide up front **how the change will be proven**, and write it into the item
+   so it flows into the builder task spec at spawn. If it touches a **gate / merge / concurrency /
+   limit-park / pane** seam, name the exact **sandbox sim scenario + the seam** it exercises (see
+   *Verify GATE / MERGE …* above) — a green scorecard is the proof. Otherwise name the **test surface**
+   (which `tests/*.sh` or unit covers it). An item with no verification plan ships the builder blind.
+6. **CONVENTIONS.** Bake in the engine defaults: **fail-soft** (a missing optional tool skips silently,
+   never a red row), **ship-dormant / default-off** (new behavior rides behind a config key, off by
+   default), and **byte-identical-when-off** (with the flag off the rendered/observed output is
+   unchanged). Say which apply so the builder doesn't have to infer them.
 
 Keep every backlog edit **privacy-safe** — nothing under `{{DENY_PATHS}}` and no secrets ever
 reach `{{BACKLOG_FILE}}` (it's committed).
@@ -273,6 +419,30 @@ Approval is **sha-keyed**: a new commit pushed after the awaiting record was wri
 the prior approval — the gate cycle re-runs and a fresh approval is required. The watcher shows
 `ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
 yet approved.
+
+## Verify GATE / MERGE / CONCURRENCY / LIMIT-PARK / PANE behavior → reproduce in the sim FIRST
+
+When you are investigating or verifying **gate / merge / concurrency / limit-park / pane** behavior —
+or before you **trust an engine change** that touches any of those seams — reproduce it in the matching
+**sandbox sim scenario FIRST**, never against the live watcher. The sims run at **zero quota** (stub
+builders, no model call) and reset to a **byte-identical** fixture, so every run is deterministic; the
+concurrency / limit / pane scenarios drive the **shipped** watcher code in lib mode, so a green
+scorecard is real signal — they break if that code regresses:
+
+```
+bash {{SCRIPTS_DIR}}/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
+bash {{SCRIPTS_DIR}}/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
+bash {{SCRIPTS_DIR}}/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
+bash {{SCRIPTS_DIR}}/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
+SANDBOX_FORCE_GATE_FAIL=1 bash {{SCRIPTS_DIR}}/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
+```
+
+Each writes a machine-readable `scorecard.json` (`result: pass` iff `failed == 0`) — read it, don't
+eyeball the console. `{{SCRIPTS_DIR}}/sim/README-sandbox-sim.md` catalogs the full tier table and each
+scenario's invariants. **Thread this into the builder task spec whenever you spawn a watcher-touching
+item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
+tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
+before opening the PR, so the engine change is proven against the real gate loop, not just unit tests.
 
 ## Troubleshooting: setup problems or a wrong-rendering pane → `herd doctor` FIRST
 

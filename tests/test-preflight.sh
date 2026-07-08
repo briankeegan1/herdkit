@@ -48,8 +48,8 @@ run_preflight() {
 emptybin="$T/nopath"; mkdir -p "$emptybin"
 out="$(run_preflight "$emptybin:$SYS")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(a) missing herdr should return non-zero (got 0)"
-echo "$out" | grep -qi "herdr" || fail "(a) missing: message does not mention herdr"
-echo "$out" | grep -qiE "required|install|PATH|dependency" || fail "(a) missing: no remediation text"
+grep -qi "herdr" <<<"$out" || fail "(a) missing: message does not mention herdr"
+grep -qiE "required|install|PATH|dependency" <<<"$out" || fail "(a) missing: no remediation text"
 ok
 
 # ── (b) HEALTHY shape → silent pass ──────────────────────────────────────────
@@ -71,8 +71,8 @@ case "$1 $2" in
 esac')"
 out="$(run_preflight "$skew:$SYS")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(c1) skewed shape should return non-zero (got 0)"
-echo "$out" | grep -qiE "skew|contract|expected" || fail "(c1) skew: no skew/contract message ($out)"
-echo "$out" | grep -q "result.tabs" || fail "(c1) skew: message should name result.tabs"
+grep -qiE "skew|contract|expected" <<<"$out" || fail "(c1) skew: no skew/contract message ($out)"
+grep -q "result.tabs" <<<"$out" || fail "(c1) skew: message should name result.tabs"
 ok
 
 # ── (c2) SKEW: not JSON at all → non-zero ────────────────────────────────────
@@ -80,7 +80,7 @@ notjson="$(write_stub notjson '#!/usr/bin/env bash
 echo "herdr: unknown subcommand" >&2; echo "garbage not json"')"
 out="$(run_preflight "$notjson:$SYS")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(c2) non-JSON output should return non-zero (got 0)"
-echo "$out" | grep -qiE "skew|contract|JSON" || fail "(c2) non-JSON: no contract message ($out)"
+grep -qiE "skew|contract|JSON" <<<"$out" || fail "(c2) non-JSON: no contract message ($out)"
 ok
 
 # ── (c3) SKEW: herdr exits non-zero on the probe → non-zero ──────────────────
@@ -88,7 +88,7 @@ exiterr="$(write_stub exiterr '#!/usr/bin/env bash
 exit 3')"
 out="$(run_preflight "$exiterr:$SYS")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(c3) herdr exiting non-zero should fail preflight (got 0)"
-echo "$out" | grep -qiE "contract|non-zero|skew" || fail "(c3) exit-nonzero: no contract message ($out)"
+grep -qiE "contract|non-zero|skew" <<<"$out" || fail "(c3) exit-nonzero: no contract message ($out)"
 ok
 
 # ── escape hatch: HERD_SKIP_PREFLIGHT=1 bypasses even with NO herdr ───────────
@@ -109,7 +109,7 @@ ok
 # Floor too high (0.7.1 < 9.9.9) → fail with version message.
 out="$(run_preflight "$verstub:$SYS" HERDR_MIN_VERSION=9.9.9)"; RC=$?
 [ "$RC" -ne 0 ] || fail "min-version unmet should fail (got 0)"
-echo "$out" | grep -qiE "version" || fail "min-version: no version message ($out)"
+grep -qiE "version" <<<"$out" || fail "min-version: no version message ($out)"
 ok
 
 echo "ALL PASS ($pass checks)"

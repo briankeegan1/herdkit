@@ -103,6 +103,40 @@ ask()  { # ask "<prompt>" "<default>" → echoes the answer (default on empty / 
   printf '%s' "${ans:-$def}"
 }
 
+# _ground_interactive — true when the grounding interview should prompt: a real stdin TTY (or the
+# HERD_GROUND_ASSUME_TTY test seam, which lets a hermetic non-tty test drive scripted answers), and
+# NOT the HERD_NONINTERACTIVE scripted-init mode. A plain non-tty scripted `herd init` is false, so
+# the interview is skipped cleanly (zero prompts) — matching ask()'s own interactivity contract.
+_ground_interactive() {
+  { [ -t 0 ] || [ -n "${HERD_GROUND_ASSUME_TTY:-}" ]; } && [ -z "${HERD_NONINTERACTIVE:-}" ]
+}
+
+# _ground_ask <prompt> <default> — like ask(), but interactive under _ground_interactive (so the
+# grounding interview reads scripted answers from stdin under the HERD_GROUND_ASSUME_TTY test seam
+# even without a real TTY). Returns the default without reading when non-interactive.
+_ground_ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if _ground_interactive; then
+    printf '%s%s%s' "$c_bold" "$prompt" "$c_rst" >&2
+    [ -n "$def" ] && printf ' %s[%s]%s' "$c_dim" "$def" "$c_rst" >&2
+    printf ': ' >&2
+    read -r ans || true
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+# _ground_yes <answer> — success for an affirmative interview answer (y / yes, case-insensitive).
+_ground_yes() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; *) return 1 ;; esac; }
+
+# _ensure_gitignored <project_root> <pattern> — append <pattern> to the project's .gitignore unless
+# already present (idempotent). Used for per-machine / secret files that must never be committed.
+_ensure_gitignored() {
+  local gi="$1/.gitignore" pat="$2"
+  { [ -f "$gi" ] && grep -qxF "$pat" "$gi"; } && return 0
+  printf '%s\n' "$pat" >> "$gi"
+  ok "added $pat to .gitignore"
+}
+
 # render_skill <project_root> <config_file> — render templates/coordinator.md.tmpl into the
 # project's .claude/commands/<name>.md, substituting {{TOKENS}} from the config. Pure bash string
 # replacement (no sed) so values containing / & | are safe.
@@ -420,6 +454,76 @@ detect_github() {
   printf 'method=%s\n'        "$method"
 }
 
+# ── init grounding interview (HERD-80) ────────────────────────────────────────────────────────────
+# Nothing at `herd init` tells a new project that builder grounding (codemap / CONTEXT_PROVISION),
+# coordinator tooling (graphify / GRAPHIFY_BIN), builder MCP wiring (MCP_PROVISION), or the efficiency
+# levers even EXIST — the operator only finds them by reading capabilities.tsv. This closes that gap
+# with the SAME suggest-never-auto-write contract as `herd config sync`: every source is OFFERED, and
+# applied ONLY on an explicit yes, ONLY through the validated `herd config set` (manifest validation,
+# machine-scope routing, secret refusal). Nothing here is auto-written. Runs LAST in cmd_init, after
+# the config exists (config set requires it). A scripted / non-tty init skips the whole block cleanly
+# (_ground_interactive false) so `herd init` stays fully non-interactive for automation.
+_init_grounding_interview() {
+  local project_root="$1"
+  _ground_interactive || return 0   # scripted / non-tty init: skip cleanly, zero prompts, nothing written
+
+  say ""
+  say "${c_bold}Grounding & tooling${c_rst} ${c_dim}(all optional — nothing is written unless you say yes)${c_rst}"
+
+  # (a) Builder grounding: generate THIS project's code map now (consumer-project mode, HERD-79) and
+  #     point every spawned builder at it via CONTEXT_PROVISION=codemap, so builders load the committed
+  #     map instead of re-exploring the tree each session. The map is only pointed-to once it exists.
+  say ""
+  say "  ${c_dim}Builders re-explore the repo each session unless you ground them with a code map.${c_rst}"
+  if _ground_yes "$(_ground_ask "Generate docs/codemap.md now and set CONTEXT_PROVISION=codemap? (y/N)" "n")"; then
+    if ( cd "$project_root" && cmd_codemap </dev/null ) && [ -f "$project_root/docs/codemap.md" ]; then
+      ( cd "$project_root" && cmd_config_set CONTEXT_PROVISION codemap )
+    else
+      warn "codemap generation did not produce docs/codemap.md — leaving CONTEXT_PROVISION unset; run 'herd codemap' then 'herd config set CONTEXT_PROVISION codemap' later"
+    fi
+  else
+    say "  ${c_dim}skipped — later: herd codemap && herd config set CONTEXT_PROVISION codemap${c_rst}"
+  fi
+
+  # (b) Coordinator tooling: graphify powers the coordinator's pre-spawn cross-worktree overlap read.
+  #     If it is on PATH, offer to pin GRAPHIFY_BIN — a MACHINE-scoped key, so `herd config set` routes
+  #     it to the gitignored .herd/config.local (we also ensure that overlay is gitignored in the
+  #     consumer). If absent, print the PyPI install hint instead of writing anything.
+  say ""
+  local gpath; gpath="$(command -v graphify 2>/dev/null || true)"
+  if [ -n "$gpath" ]; then
+    if _ground_yes "$(_ground_ask "graphify found at $gpath — set GRAPHIFY_BIN (per-machine → .herd/config.local) for the coordinator's pre-spawn overlap read? (y/N)" "n")"; then
+      ( cd "$project_root" && cmd_config_set GRAPHIFY_BIN "$gpath" )
+      _ensure_gitignored "$project_root" '.herd/config.local'
+    else
+      say "  ${c_dim}skipped — later: herd config set GRAPHIFY_BIN $gpath${c_rst}"
+    fi
+  else
+    say "  ${c_dim}graphify not on PATH — the coordinator's pre-spawn overlap read stays off (optional accelerator).${c_rst}"
+    say "  ${c_dim}Install: pipx install graphifyy  (PyPI 'graphifyy'), then: herd config set GRAPHIFY_BIN ~/.local/bin/graphify${c_rst}"
+  fi
+
+  # (c) Builder MCP tools: wire an MCP server into every builder worktree (context7 = live library
+  #     docs, most valuable on real code CONSUMER projects). Blank keeps today's byte-identical
+  #     settings.json. Applied via the validated setter (MCP_PROVISION), committed baseline.
+  say ""
+  local mcp; mcp="$(_ground_ask "MCP_PROVISION — wire an MCP server into each builder worktree (e.g. 'context7' for live library docs; blank = none)" "")"
+  if [ -n "$mcp" ]; then
+    ( cd "$project_root" && cmd_config_set MCP_PROVISION "$mcp" )
+  else
+    say "  ${c_dim}skipped — later: herd config set MCP_PROVISION context7${c_rst}"
+  fi
+
+  # (d) Efficiency levers — SURFACE ONLY (one-line measured rationale each). Never auto-set: two are
+  #     watcher-affecting (a set would restart a not-yet-running control room mid-init), and the point
+  #     here is awareness. Each is applied later with the same validated `herd config set`.
+  say ""
+  say "  ${c_bold}Efficiency levers${c_rst} ${c_dim}(surface-only — set any later with 'herd config set <KEY> <VALUE>'):${c_rst}"
+  say "  ${c_dim}• REVIEW_ESCALATE_GLOB — reserve the expensive Opus review for engine-critical paths; docs/test-only diffs skip review. The single biggest recurring engine cost.${c_rst}"
+  say "  ${c_dim}• HEALTHCHECK_HEAVY_GLOB — blank runs the full suite on every diff; scope it to your source globs so trivial diffs take the light profile.${c_rst}"
+  say "  ${c_dim}• DOCTOR_STARTUP_HINT=on — reminds you at control-room startup which optional tools are missing and what each degrades.${c_rst}"
+}
+
 cmd_init() {
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
@@ -663,11 +767,7 @@ EOF
     } > "$secrets"
     chmod 600 "$secrets" 2>/dev/null || true
     ok "wrote $secrets (gitignored)"
-    local gi="$project_root/.gitignore"
-    if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
-      printf '.herd/secrets\n' >> "$gi"
-      ok "added .herd/secrets to .gitignore"
-    fi
+    _ensure_gitignored "$project_root" '.herd/secrets'
   fi
 
   # Seed a BACKLOG.md if we promised to create one.
@@ -705,6 +805,11 @@ EOF
   # 6. Render the coordinator skill.
   local skill; skill="$(render_skill "$project_root" "$cfg")"
   ok "rendered coordinator skill → $skill"
+
+  # 7. Grounding interview (HERD-80): OFFER codemap/CONTEXT_PROVISION, graphify/GRAPHIFY_BIN, MCP wiring
+  #    and surface the efficiency levers. Suggest-never-auto-write — applies only on an explicit yes via
+  #    the validated `herd config set`. Skipped cleanly on a scripted / non-tty init.
+  _init_grounding_interview "$project_root"
 
   say ""
   ok "herd init complete."
@@ -838,14 +943,41 @@ cmd_render() {
   ok "rendered coordinator skill → $skill"
 }
 
-# ── herd codemap: regenerate docs/codemap.md, the native map of the herdkit engine tree ──────────
-# Delegates to scripts/herd/codemap.sh, which scans THIS engine repo (bin/herd + scripts/herd/*.sh +
-# templates/) and regenerates the committed, deterministic docs/codemap.md — module roles,
-# who-sources-whom, and config-key → consumer wiring — for coordinator/builder agents to load as
-# context instead of re-exploring the repo. Idempotent; maps the engine, so it needs no .herd/config.
+# ── herd codemap: regenerate docs/codemap.md, a native map of the repo's tree ────────────────────
+# Delegates to scripts/herd/codemap.sh, which regenerates the committed, deterministic docs/codemap.md
+# — module roles, who-imports/sources-whom, and config-key → consumer wiring — for coordinator/builder
+# agents to load as context instead of re-exploring the repo. It auto-detects the tree it is run in
+# (HERD-79): in the herdkit ENGINE repo it maps the engine (bin/herd + scripts/herd/*.sh + templates/)
+# byte-identically to before; in a CONSUMING project it maps THAT project's own source tree,
+# language-aware (node/python/go/rust/java). Idempotent; no .herd/config value is required either way.
 # `herd codemap --check` is a read-only staleness probe: it regenerates to a temp file and diffs it
 # against the committed map WITHOUT writing it, exiting 0 when fresh / non-zero when stale.
 cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
+
+# ── herd symbol-index: regenerate docs/symbol-index.md, the native def→caller index ──────────────
+# The function-level companion to `herd codemap`. Delegates to scripts/herd/symbol-index.sh, which
+# scans THIS engine repo (bin/herd + scripts/herd/**) and regenerates the committed, deterministic
+# docs/symbol-index.md — every shell function's definition site(s) and cross-file call sites — so a
+# builder can answer "who calls _backend_update_state" with one lookup and the coordinator can
+# sharpen its overlap read to symbol level. Idempotent; maps the engine, needs no .herd/config.
+# `herd symbol-index --check` is a read-only staleness probe (0 fresh / non-zero stale), like codemap.
+cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
+
+# ── herd ledger: the coordinator progress ledger read/write surface (HERD-103) ───────────────────
+# Durable, cross-session coordinator state (per work-item: slug/worktree/PR, sequencing, planned
+# markers) keyed by tracker id, so a coordinator or a second operator RESUMES with an accurate
+# picture instead of re-deriving it every session. Coordinator-side only — NOT a watcher gate.
+# Delegates to scripts/herd/ledger.sh; state lives in the local (never-committed) worktree pool at
+# WORKTREES_DIR/.herd/ledger.jsonl. Default-dormant: with no writes, no file exists and nothing runs.
+cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
+
+# ── herd advise: a mid-flight strong-model second opinion for a builder (HERD-101) ───────────────
+# A builder on a cheaper tier calls `herd advise "<question>" [context…]` to pull a ONE-SHOT read
+# from a strong advisor model (MODEL_ADVISE, default the MODEL_FEATURE/Opus tier) WITHOUT escalating
+# its whole lane. The advice is printed to stdout for the builder to read; no agent, no tab, no repo
+# mutation. Delegates to scripts/herd/herd-advise.sh, which is ADDITIVE + FAIL-SOFT: an absent
+# advisor model or a failed model call degrades to a clear one-line message, never a hard error.
+cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
 
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
@@ -1057,8 +1189,8 @@ cmd_config() {
     set)          cmd_config_set "$@" ;;
     sync)         cmd_config_sync "$@" ;;
     lint)         _config_lint "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local] <KEY> <VALUE> | sync | lint" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
   esac
 }
 
@@ -1102,31 +1234,60 @@ cmd_config_list() {
   else
     say "${c_bold}.herd/config${c_rst}  ($cfg)"
   fi
-  local line key val src
-  # Baseline keys, in file order; a key also assigned in the overlay shows the OVERRIDING local value.
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue ;; esac
-    printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
-    key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
-    if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg"; then
-      val="$(_config_file_value "$local_cfg" "$key")"; src="local"
-    else
-      val="$(_config_file_value "$cfg" "$key")"; src="baseline"
-    fi
-    _config_secret_key "$key" && val='********'
-    printf '  %-24s %-28s %s[%s]%s\n' "$key" "$val" "$c_dim" "$src" "$c_rst"
-  done < "$cfg"
-  # Keys present ONLY in the overlay (never assigned in the baseline).
+  # HERD-47 regression fix (Windows hang): resolve every key's effective value AND provenance in a
+  # SINGLE awk pass instead of the old per-key loop. That loop forked ~5 short-lived subprocesses per
+  # key (a `printf|grep`, a `sed`, an overlay `grep`, an awk `_config_file_value` in `$(...)`, and
+  # `_config_secret_key`) — ~300 processes over 65 keys, enough to deadlock Git-bash on Windows under
+  # the fork load, so `herd config list` printed ~10 keys then HUNG. awk reads .herd/config once (and
+  # .herd/config.local once, when present) and emits byte-identical rows: baseline keys in file order
+  # (a key also assigned in the overlay shows the OVERRIDING local value tagged [local]), then
+  # overlay-only keys tagged [local-only]. Value parsing mirrors _config_file_value (first assignment,
+  # one layer of surrounding double-quotes stripped) and masking mirrors _config_secret_key.
+  local prog='
+    function stripws(s) { sub(/^[[:space:]]+/, "", s); return s }
+    function keyof(s,   k) {
+      s = stripws(s)
+      if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) return ""
+      k = s; sub(/=.*/, "", k); return k
+    }
+    function valof(s, k,   v) {
+      s = stripws(s); v = substr(s, length(k) + 2)
+      if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+      return v
+    }
+    function is_secret(k) {
+      return (k ~ /SECRET/ || k ~ /TOKEN/ || k ~ /PASSWORD/ || k ~ /PASSWD/ || k ~ /APIKEY/ || k ~ /_KEY$/ || k ~ /_PAT$/)
+    }
+    # Overlay is passed FIRST (ARGV order): record each key it assigns, first assignment only.
+    FILENAME == localfile {
+      k = keyof($0)
+      if (k != "" && !(k in localval)) { localval[k] = valof($0, k); lorder[++ln] = k }
+      next
+    }
+    # Baseline: one row per key line, in file order; overridden keys show the local value tagged [local].
+    {
+      k = keyof($0)
+      if (k == "") next
+      if (!(k in basefirst)) basefirst[k] = valof($0, k)
+      baseseen[k] = 1
+      if (k in localval) { v = localval[k]; src = "local" } else { v = basefirst[k]; src = "baseline" }
+      if (is_secret(k)) v = "********"
+      printf "  %-24s %-28s %s[%s]%s\n", k, v, dim, src, rst
+    }
+    # Keys present ONLY in the overlay (never assigned in the baseline), in overlay file order.
+    END {
+      for (i = 1; i <= ln; i++) {
+        k = lorder[i]
+        if (k in baseseen) continue
+        v = localval[k]
+        if (is_secret(k)) v = "********"
+        printf "  %-24s %-28s %s[local-only]%s\n", k, v, dim, rst
+      }
+    }'
   if [ -f "$local_cfg" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in ''|'#'*) continue ;; esac
-      printf '%s' "$line" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' || continue
-      key="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/')"
-      grep -qE "^[[:space:]]*$key=" "$cfg" && continue   # already shown above as a baseline override
-      val="$(_config_file_value "$local_cfg" "$key")"
-      _config_secret_key "$key" && val='********'
-      printf '  %-24s %-28s %s[local-only]%s\n' "$key" "$val" "$c_dim" "$c_rst"
-    done < "$local_cfg"
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="$local_cfg" "$prog" "$local_cfg" "$cfg"
+  else
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="" "$prog" "$cfg"
   fi
 }
 
@@ -1144,12 +1305,30 @@ cmd_config_get() {
 }
 
 cmd_config_set() {
-  # HERD-47: an optional leading `--local` forces the write into the per-user overlay .herd/config.local
-  # instead of the committed baseline .herd/config. Parsed before the positional KEY/VALUE.
-  local force_local=0
-  if [ "${1:-}" = "--local" ]; then force_local=1; shift; fi
+  # Optional leading flags, parsed before the positional KEY/VALUE:
+  #   --local  (HERD-47) force the write into the per-user overlay .herd/config.local (gitignored),
+  #            never the committed baseline.
+  #   --shared (HERD-62) apply a PROJECT-scoped change to the committed baseline .herd/config AND
+  #            open a tiny single-file PR (branch config/<key>) proposing it to every operator, so a
+  #            coordinator who cannot push to the default branch still propagates policy the normal
+  #            gated way. Refused for machine-scoped keys (they must never be committed) and mutually
+  #            exclusive with --local.
+  #   --reason <why>  free-text rationale carried into the --shared PR body (ignored otherwise).
+  local force_local=0 force_shared=0 reason=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --local)  force_local=1; shift ;;
+      --shared) force_shared=1; shift ;;
+      --reason) reason="${2:-}"; shift; [ "$#" -gt 0 ] && shift || true ;;
+      --)       shift; break ;;
+      -?*)      die "unknown flag '$1' — usage: herd config set [--local|--shared] [--reason <why>] <KEY> <VALUE>" ;;
+      *)        break ;;
+    esac
+  done
+  { [ "$force_local" -eq 1 ] && [ "$force_shared" -eq 1 ]; } \
+    && die "--local and --shared are mutually exclusive: --local keeps a per-user override OUT of git; --shared proposes a committed baseline change to every operator"
   local key="${1:-}" val="${2:-}"
-  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set [--local] <KEY> <VALUE>"
+  { [ -n "$key" ] && [ "$#" -ge 2 ]; } || die "usage: herd config set [--local|--shared] [--reason <why>] <KEY> <VALUE>"
   local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
@@ -1186,7 +1365,13 @@ cmd_config_set() {
   #     created on demand (with its documenting header) only when it is actually the target.
   local scope target target_label
   scope="$(_config_key_scope "$caps" "$key")"
-  if [ "$force_local" -eq 1 ] || [ "$scope" = "machine" ]; then
+  # HERD-62: --shared forces the committed baseline AND a propagation PR — so it is meaningless (and
+  #          dangerous) for a machine-scoped key, whose per-user value must never be committed. Refuse
+  #          rather than silently downgrade, so the operator picks --local for such a key instead.
+  if [ "$force_shared" -eq 1 ] && [ "$scope" = "machine" ]; then
+    die "refusing to --shared machine-scoped key '$key' — its value is per-user/per-machine and must never be committed to the baseline; use 'herd config set --local $key ...' instead"
+  fi
+  if [ "$force_local" -eq 1 ] || { [ "$scope" = "machine" ] && [ "$force_shared" -eq 0 ]; }; then
     _config_ensure_local "$local_cfg"
     target="$local_cfg"; target_label=".herd/config.local"
   else
@@ -1198,16 +1383,28 @@ cmd_config_set() {
   #    set skips the write AND the restart/re-render, so re-running the same set is inert. The
   #    idempotency probe reads the TARGET, so a machine key already at VALUE in the overlay is a
   #    no-op even when the baseline holds a different value (the overlay is what wins at load time).
-  local cur; cur="$(_config_file_value "$target" "$key")"
+  #    EXCEPTION (HERD-62): a --shared set never short-circuits, so it can (re)open the propagation
+  #    PR even when the local baseline already holds VALUE — the whole point of --shared is that OTHER
+  #    operators may not have it yet.
+  local cur changed=1; cur="$(_config_file_value "$target" "$key")"
   if [ "$cur" = "$val" ] && grep -qE "^[[:space:]]*$key=" "$target"; then
+    changed=0
+  fi
+  if [ "$changed" -eq 0 ] && [ "$force_shared" -eq 0 ]; then
     ok "$key already = \"$val\" in $target_label (no change)"
     return 0
   fi
-  _config_put_value "$target" "$key" "$val"
-  ok "set $key = \"$val\" in $target_label"
-  [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
+  if [ "$changed" -eq 1 ]; then
+    _config_put_value "$target" "$key" "$val"
+    ok "set $key = \"$val\" in $target_label"
+    [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
+  else
+    ok "$key already = \"$val\" in $target_label (local change already applied)"
+  fi
 
-  # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms.
+  # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
+  #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
+  if [ "$changed" -eq 1 ]; then
   case "$requires" in
     watcher)
       say ""
@@ -1223,16 +1420,179 @@ cmd_config_set() {
       say "  ${c_dim}(no watcher restart or skill re-render required for $key)${c_rst}"
       ;;
   esac
+  fi
+
+  # 4b. HERD-62 propagation: open (or refresh) the single-file config PR so every operator receives
+  #     this baseline change through the normal watcher gate + `git pull`/`herd update` sync loop.
+  if [ "$force_shared" -eq 1 ]; then
+    _config_open_shared_pr "$root" "$cfg" "$key" "$cur" "$val" "$reason"
+  fi
 
   # 5. SCRIBE_BACKEND change-awareness (issue #139): flipping the backend does NOT retire an already
   #    running backlog scribe drainer. That idle/done drainer was spawned under the OLD backend and,
   #    if left running, will drain queued requests via the stale mode. scribe-step.sh now guards
   #    against filing junk, but a stale drainer still can't place file-backend items — so warn the
   #    operator to retire it now, so the next request spawns a fresh drainer on the new backend.
-  if [ "$key" = "SCRIBE_BACKEND" ]; then
+  if [ "$key" = "SCRIBE_BACKEND" ] && [ "$changed" -eq 1 ]; then
     say ""
     warn "SCRIBE_BACKEND changed ${cur:+from \"$cur\" }to \"$val\" — an idle backlog scribe drainer spawned under the OLD backend may still be running and would drain queued requests in the stale mode. RETIRE it now (close its 'scribe-<workspace>' tab, e.g. 'herdr agent stop scribe-<workspace>') so the next request spawns a fresh drainer on the new backend."
   fi
+}
+
+# _config_open_shared_pr <root> <cfg> <key> <old> <new> <reason> — HERD-62. Open (or refresh) a tiny
+# single-file PR that carries the just-applied PROJECT-scoped baseline change to every operator via
+# the normal watcher gate. The local baseline (.herd/config) is ALREADY edited by the caller; this
+# only proposes the SAME one-key change on a dedicated branch so a coordinator who cannot push to the
+# default branch still propagates policy the gated way. It works from a THROWAWAY git worktree so the
+# operator's current checkout/branch is never switched or dirtied, bases the branch off the committed
+# DEFAULT_BRANCH tip (so the diff is exactly old->new for this one key), pushes branch config/<key>,
+# and runs `gh pr create`. DEGRADES GRACEFULLY: a missing gh, an unpushable/non-GitHub remote, or any
+# git/gh failure warns with copy-paste manual steps instead of dying — the local change already stuck.
+_config_open_shared_pr() {
+  local root="$1" cfg="$2" key="$3" old="$4" new="$5" reason="$6"
+  local branch="config/$key"
+
+  # Resolve the default branch's remote + base from the committed baseline (no shell-sourcing side
+  # effects): DEFAULT_BRANCH=origin/main → remote 'origin', base 'main'. Fall back to origin/main.
+  local default_branch remote base
+  default_branch="$(_config_file_value "$cfg" DEFAULT_BRANCH)"; : "${default_branch:=origin/main}"
+  remote="${default_branch%%/*}"; base="${default_branch#*/}"
+  { [ -n "$remote" ] && [ "$remote" != "$default_branch" ]; } || { remote="origin"; base="${default_branch#origin/}"; }
+  [ -n "$base" ] || base="main"
+
+  say ""
+  say "${c_bold}→ --shared: opening a config PR so every operator receives $key=$new${c_rst}"
+
+  # gh is needed to actually open the PR. Its absence is a valid, non-fatal finding — the change is
+  # applied locally; tell the operator how to finish by hand. The repo slug (best-effort, for gh's
+  # --repo) is derived from the default-branch remote; when it cannot be resolved (non-GitHub URL)
+  # gh is instead run FROM the worktree so it can infer the repo from that checkout's origin remote.
+  local slug; slug="$(_gh_repo_slug "$root" "$default_branch")"
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "cannot auto-open the config PR — gh CLI not found. The change is APPLIED to .herd/config locally; commit it on a branch and open the PR by hand so other operators receive it:
+    git switch -c $branch && git commit -am 'config: set $key=$new' && git push -u $remote $branch && gh pr create --base $base"
+    return 0
+  fi
+
+  # Base the throwaway worktree off the committed default-branch tip when it resolves, else the local
+  # HEAD — so the branch diff is a clean single-key change against what everyone else has.
+  local base_ref="$default_branch"
+  git -C "$root" rev-parse --verify --quiet "$default_branch^{commit}" >/dev/null 2>&1 || base_ref="HEAD"
+
+  # HERD-74: the config PR's worktree must PERSIST under WORKTREES_DIR so the STANDARD watcher gate
+  # adopts it. agent-watch.sh discovers work via `git worktree list` (NOT open PRs), so a config/<key>
+  # branch with no worktree is invisible and sits ungated forever (observed: PRs #190/#191 required
+  # hand-merging). Creating the worktree in the worktree pool and LEAVING it for the watcher lets the
+  # existing discovery → healthcheck+review gate → merge → reap machinery drive it exactly like a
+  # feature worktree — no bespoke PR-discovery path, and reap-on-merge (do_merge) reuses the same
+  # `git worktree remove`. It is only removed here on a DEGRADE path (no PR opened → nothing to gate).
+  # Resolve WORKTREES_DIR the way the watcher does (a subshell-source expands $HOME etc. in the value),
+  # falling back to the herd-config.sh default of "<PROJECT_ROOT>-trees".
+  local wt_dir; wt_dir="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
+  if [ -z "$wt_dir" ]; then
+    local proj_root; proj_root="$( ( . "$cfg" 2>/dev/null; printf '%s' "${PROJECT_ROOT:-}" ) )"
+    wt_dir="${proj_root:-$root}-trees"
+  fi
+  mkdir -p "$wt_dir" 2>/dev/null || true
+  local wt="$wt_dir/config-$key"
+  # Idempotent re-run: a prior `set --shared` for this key left its worktree here (checked out on
+  # $branch). Drop any prior worktree/registration for it before re-adding, else `worktree add -B`
+  # fails on the existing dir / already-checked-out branch. Safe — it is throwaway and the branch ref
+  # survives on origin (the refreshed branch is force-pushed below). Unconditional: a no-op when absent.
+  git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -rf "$wt" 2>/dev/null || true
+  git -C "$root" worktree prune >/dev/null 2>&1 || true
+  # -B (re)creates or resets the branch to base_ref, so re-running `set --shared` for the same key
+  # refreshes the SAME PR branch with the newest value instead of failing on an existing branch.
+  if ! git -C "$root" worktree add -q -B "$branch" "$wt" "$base_ref" 2>/dev/null; then
+    git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt" 2>/dev/null || true
+    warn "could not create a work branch for the config PR (git worktree add -B $branch failed) — the change is applied locally; open the PR by hand (branch $branch off $base)."
+    return 0
+  fi
+
+  # Apply the SAME one-key edit in the worktree's baseline copy (the committed, pre-change value), so
+  # the branch carries exactly old->new for this key and nothing else. Reuse the shared edit primitive.
+  local push_ok=0 keep_wt=0
+  if [ -f "$wt/.herd/config" ]; then
+    _config_put_value "$wt/.herd/config" "$key" "$new"
+    if ! git -C "$wt" diff --quiet -- .herd/config; then
+      git -C "$wt" add .herd/config
+      git -C "$wt" commit -q -m "config: set $key=$new (herd config set --shared)" \
+        -m "Propagate a PROJECT-scoped policy change to every operator (HERD-62)." 2>/dev/null || true
+      # --force: the config/<key> branch is owned entirely by this command (one branch per key), so a
+      # re-run legitimately replaces its own prior proposal; -B reset above makes the history diverge.
+      if git -C "$wt" push -q --force "$remote" "$branch" 2>/dev/null; then
+        push_ok=1
+      fi
+    else
+      # Baseline tip already carries this value — nothing to propose (already merged upstream).
+      ok "the default branch already has $key=$new — no config PR needed"
+      git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rm -rf "$wt"
+      return 0
+    fi
+  else
+    warn ".herd/config is not committed on $base — cannot build a single-file config PR; commit the baseline first."
+  fi
+
+  if [ "$push_ok" -eq 1 ]; then
+    local title body reason_line
+    title="config: set $key=$new"
+    [ -n "$reason" ] && reason_line="**Why:** $reason" || reason_line="**Why:** _(none given — pass \`--reason\` to record one)_"
+    body="Shared config change opened by \`herd config set --shared\` (HERD-62).
+
+**Key:** \`$key\`
+**Change:** \`${old:-<unset>}\` → \`$new\`
+$reason_line
+
+Applies a PROJECT-scoped policy change to the committed \`.herd/config\` baseline so every operator
+picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the normal watcher gate
+(healthcheck + review) merges it."
+    # Run gh FROM the worktree so it can infer the repo from that checkout's origin remote; pass
+    # --repo too when a slug resolved (belt-and-suspenders, and lets a non-default remote name work).
+    # No bash arrays here — an empty-array expansion under `set -u` aborts on bash 3.2 (macOS).
+    local created=0 exists=0
+    if [ -n "$slug" ]; then
+      ( cd "$wt" && gh pr create --repo "$slug" --base "$base" --head "$branch" --title "$title" --body "$body" ) >/dev/null 2>&1 && created=1
+    else
+      ( cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" ) >/dev/null 2>&1 && created=1
+    fi
+    if [ "$created" -eq 1 ]; then
+      keep_wt=1
+      ok "opened config PR for $branch → merges the change to every operator (watcher-gated)"
+    else
+      # A PR for this branch may already be open (re-run) — the force push above updated its diff.
+      if [ -n "$slug" ]; then
+        ( cd "$wt" && gh pr view "$branch" --repo "$slug" ) >/dev/null 2>&1 && exists=1
+      else
+        ( cd "$wt" && gh pr view "$branch" ) >/dev/null 2>&1 && exists=1
+      fi
+      if [ "$exists" -eq 1 ]; then
+        keep_wt=1
+        ok "refreshed the existing config PR for $branch with $key=$new"
+      else
+        warn "pushed branch $branch but 'gh pr create' failed — open the PR manually: gh pr create ${slug:+--repo $slug }--base $base --head $branch"
+      fi
+    fi
+  elif [ -f "$wt/.herd/config" ]; then
+    warn "could not push $branch to $remote (permission or network) — the change is applied locally; push $branch and open the PR by hand."
+  fi
+
+  # HERD-74: a PR is open → LEAVE the worktree in the pool for the watcher to adopt (discover → gate →
+  # merge → reap). Otherwise (any degrade path: no PR opened) remove it so no orphan worktree lingers.
+  if [ "$keep_wt" -eq 1 ]; then
+    # Best-effort handoff marker so the adoption is auditable in the engine journal (fail-soft: a
+    # missing WORKTREES_DIR just drops the event). The watcher journals the eventual merge + reap.
+    { type journal_append >/dev/null 2>&1 && WORKTREES_DIR="$wt_dir" journal_append config_pr_adopt \
+        slug "config-$key" branch "$branch" key "$key" reason left_for_watcher_gate; } >/dev/null 2>&1 || true
+    say "  ${c_dim}(worktree left in the pool → the watcher gates + merges + reaps it like a feature)${c_rst}"
+  else
+    git -C "$root" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt" 2>/dev/null || true
+    git -C "$root" worktree prune >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 # ── herd config sync: surface engine config keys missing from this project's .herd/config (HERD-38) ─
@@ -1351,14 +1711,28 @@ cmd_backlog() {
   #   herd backlog browse       interactive fzf picker over the open list with a live detail
   #                             preview pane; ENTER prints the selection's full detail. Without
   #                             fzf it degrades soft: plain list + a one-line install hint
-  local mode="plain" ref=""
+  #   herd backlog queued       list live PLANNED-work markers (HERD-52): items a coordinator has
+  #                             sequenced-to-spawn-next but not yet spawned, so a second operator
+  #                             sees plan-time intent. Markers older than 24h are flagged ADVISORY.
+  #   herd backlog queue <#id> [--after <blocker>]
+  #                             publish such a marker (I'm building this next, after <blocker>)
+  #   herd backlog unqueue <#id>  clear my marker (plan dropped; a spawn's claim supersedes it too)
+  # queue/unqueue/queued are BACKEND-OPTIONAL: a backend without the op prints a soft note (or an
+  # empty list) and exits 0 — a plan marker is advisory, never a gate.
+  local mode="plain" ref="" blocker=""
   case "${1:-}" in
-    --rich) mode="rich" ;;
-    show)   mode="show"; ref="${2:-}"
-            [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
-    browse) mode="browse" ;;
-    '')     ;;
-    *)      die "usage: herd backlog [--rich | show <#id> | browse]" ;;
+    --rich)  mode="rich" ;;
+    show)    mode="show"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
+    browse)  mode="browse" ;;
+    queued)  mode="queued" ;;
+    queue)   mode="queue"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog queue <#id> [--after <blocker>]"
+             case "${3:-}" in --after) blocker="${4:-}" ;; '') ;; *) blocker="${3:-}" ;; esac ;;
+    unqueue) mode="unqueue"; ref="${2:-}"
+             [ -n "$ref" ] || die "usage: herd backlog unqueue <#id>" ;;
+    '')      ;;
+    *)       die "usage: herd backlog [--rich | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
   esac
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -1421,6 +1795,56 @@ cmd_backlog() {
         printf '%s\n' "$list"
         echo "herd backlog browse: fzf not found — showing the plain list (brew install fzf / apt install fzf for interactive browsing)" >&2
       fi ;;
+    queued)
+      # Print live planned markers, readable, with a >24h ADVISORY flag computed off the epoch.
+      # A backend without the op simply prints nothing (no markers exist there).
+      command -v _backend_list_queued >/dev/null 2>&1 || return 0
+      local now; now="$(date +%s 2>/dev/null || echo 0)"
+      _backend_list_queued | NOW="$now" python3 -c 'import sys, os
+now = int(os.environ.get("NOW") or 0)
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) < 4:
+        continue
+    ref, who, detail, ts = parts[0], parts[1], parts[2], parts[3]
+    try: age = now - int(ts)
+    except ValueError: age = -1
+    if age < 0:
+        when = ""
+    elif age >= 86400:
+        when = " (%dh ago — ADVISORY: >24h stale)" % (age // 3600)
+    elif age >= 3600:
+        when = " (%dh ago)" % (age // 3600)
+    else:
+        when = " (%dm ago)" % (age // 60)
+    print("%s — queued by %s: %s%s" % (ref, who, detail, when))' 2>/dev/null || true ;;
+    queue|unqueue)
+      # Publish / clear a planned marker synchronously (like a claim, unlike the async scribe) so a
+      # second operator sees the plan promptly. Resolve the operator identity the same order the
+      # claimant does, and attribute the tracker_write to the 'plan' component (HERD-85).
+      if ! command -v "_backend_${mode}_item" >/dev/null 2>&1; then
+        echo "herd backlog $mode: backend '$SCRIBE_BACKEND' has no planned-marker op — skipping (advisory feature, fail-soft)." >&2
+        return 0
+      fi
+      local who="${WATCHER_OWNER:-}"
+      [ -n "$who" ] || who="${WATCHER_VIEW_AUTHOR:-}"
+      [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+      [ -n "$who" ] || who="unknown-operator"
+      export HERD_COMPONENT="plan"
+      _BACKEND_RESULT=""
+      if [ "$mode" = "queue" ]; then
+        _backend_queue_item "$ref" "$who" "$blocker"
+      else
+        _backend_unqueue_item "$ref" "$who"
+      fi
+      case "${_BACKEND_RESULT:-}" in
+        DONE) [ "$mode" = "queue" ] \
+                && echo "📌 queued $ref as '$who'${blocker:+ (after $blocker)} — visible to other operators via 'herd backlog queued'." \
+                || echo "🧹 cleared the planned marker on $ref." ;;
+        *)    [ "$mode" = "queue" ] \
+                && echo "herd backlog queue: no change (item '$ref' not resolvable, or already marked) — see stderr above." >&2 \
+                || echo "herd backlog unqueue: no planned marker on '$ref' to clear." >&2 ;;
+      esac ;;
   esac
 }
 
@@ -3659,8 +4083,29 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
-                                        engine tree (module roles, who-sources-whom, config→consumer);
+                                        repo (engine tree here, or a consuming project's own source
+                                        tree; module roles, who-imports/sources-whom, config→consumer);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
+  herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
+                                        def→caller index of the engine tree (who-defines / who-calls);
+                                        --check probes staleness read-only (0 fresh / non-zero stale)
+  herd ledger <set|get|list|rm|compact|path>  coordinator PROGRESS LEDGER — durable, cross-session
+                                      per-work-item state (slug/worktree/PR, sequencing, planned
+                                      markers) keyed by tracker id, so you resume with an accurate
+                                      picture instead of re-deriving it. Coordinator-side only (no
+                                      watcher gate); local + never committed. Default-dormant:
+                                        set <id> [k v]...  append/update an item's fields
+                                        get <id> [--json]  print one item's folded state
+                                        list [--json]      list live items ([--planned] filters)
+                                        rm <id>            tombstone an item out of get/list
+                                        compact            fold history to one line per live item
+                                        path               print the ledger file path
+  herd advise "<question>" [context…] mid-flight ADVISOR: a builder pulls a ONE-SHOT second opinion
+                                      from a strong advisor model (MODEL_ADVISE, default the
+                                      MODEL_FEATURE/Opus tier) on a hard decision WITHOUT escalating
+                                      its whole lane; prints the advice to stdout. Extra args (and
+                                      piped stdin) are appended as context. Additive + fail-soft: an
+                                      absent model or a failed call degrades to a clear message
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -3768,6 +4213,9 @@ case "${1:-help}" in
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
   codemap) shift; cmd_codemap "$@" ;;
+  symbol-index) shift; cmd_symbol_index "$@" ;;
+  ledger)  shift; cmd_ledger "$@" ;;
+  advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;

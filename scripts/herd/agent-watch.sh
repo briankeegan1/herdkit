@@ -23,14 +23,13 @@
 #                       reviews or merges; verdicts are collected from per-PR result files on
 #                       later ticks. "review queued" = waiting for a concurrency slot.
 #   ⏳ merging         — health passed AND review PASSed, merging now
-#   🔀 resolving …     — PR CONFLICTING and NO resolver has run for its CURRENT head sha: auto-spawned
-#                       the isolated, test-gated conflict resolver (herd-resolve.sh). Hands-off. Reads
-#                       "resolving conflict…" on a first conflict, or "resolving (retry · new commit)"
-#                       when a NEW commit re-conflicted after a prior (stale) attempt at an older sha.
+#   🔀 resolving …     — PR CONFLICTING: auto-spawned the isolated, test-gated conflict resolver
+#                       (herd-resolve.sh). Hands-off. "re-resolving (round N)" = a RESPAWN (HERD-55)
+#                       after a new commit reshaped the conflict or the prior resolver died.
 #   ⚠️ needs you · …   — PR CONFLICTING OR healthcheck returned a CODE error (❌), OR the review
-#                       gate returned BLOCK, OR the auto-resolver already ran for THIS head sha and it's
-#                       STILL conflicting ("resolver failed"), OR the cross-sha resolver retry cap is hit
-#                       ("resolver failed (retry cap)"). NEVER auto-merged; one-line reason.
+#                       gate returned BLOCK, OR the resolver ran and it's STILL conflicting
+#                       ("resolver failed"), OR the resolver ESCALATED a semantically-ambiguous
+#                       conflict, OR respawns hit the cap ("resolver gave up"). NEVER auto-merged.
 #
 # AUTO-MERGE rule (full auto, safety-railed): for a PR that is mergeable==MERGEABLE AND
 # mergeStateStatus==CLEAN, run  healthcheck.sh <worktree>  (serialized; retried once solo on a CODE
@@ -46,16 +45,15 @@
 # if it can't ff — never force), (3) git worktree remove --force <wt>, (4) close its herdr tab,
 # and record the merge in a persistent state file so "recently landed" survives re-renders.
 #
-# AUTO-RESOLVE rule (full auto, safety-railed): when a PR goes CONFLICTING, the watcher auto-spawns the
-# EXISTING isolated resolver (herd-resolve.sh <slug>). The resolve-attempt ledger is SHA-KEYED, so a
-# resolver runs AT MOST ONCE per (branch, head-sha). Three hard rails: (1) same-sha anti-loop — a
-# branch+sha that already has a recorded attempt is NEVER re-spawned for that sha (a failed/escalated
-# resolve leaves the PR CONFLICTING at an unchanged head); (2) escalation preserved — the resolver aborts
-# + escalates semantically-ambiguous conflicts (git merge --abort, no push, sha unchanged) so it stays a
-# terminal needs-you; the watcher NEVER blind-merges a conflict; (3) stale-attempt re-spawn (HERD-55) —
-# when a NEW commit lands on a still-conflicting PR (builder, human, or a partial resolver push), the head
-# sha CHANGES → the prior attempt is stale → the resolver is RE-spawned for the new sha, bounded by a
-# cross-sha cap ($_RESOLVE_RETRY_MAX distinct shas) so a chronically-conflicting branch can't churn forever.
+# AUTO-RESOLVE rule (full auto, safety-railed): when a PR FIRST goes CONFLICTING, the watcher
+# auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>), keyed to the head sha. HERD-55
+# adds sha-keyed RESPAWN: if a CONFLICTING PR gets a NEW commit (its sha changes → the conflict
+# surface changed) OR the dispatched resolver DIES without clearing it, and no resolver agent for the
+# slug is alive, the watcher re-dispatches a fresh resolver for the new sha (journaling
+# resolver_respawn). Hard rails: (1) respawn budget — dispatches per PR are capped at REFIX_MAX_ROUNDS,
+# then the PR surfaces "resolver gave up · needs you" (never an infinite resolver loop); (2) escalation
+# preserved + terminal — the resolver aborts + escalates semantically-ambiguous conflicts, and an
+# ESCALATE is TERMINAL for that sha (no respawn until a new commit); the watcher NEVER blind-merges.
 #
 # MERGE_POLICY (.herd/config): three-way human-in-the-loop lever.
 #   auto    — current behavior: merge automatically after all gates pass.
@@ -98,16 +96,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
-# Resolve-attempt ledger, PARALLEL to $STATE and SHA-KEYED like $REVIEW_STATE/$HEALTH_STATE: one line
-# per conflict-resolver SPAWN ("<epoch> <pr#> <slug> <branch> <headSha>"). The head sha keys the
-# anti-loop guard so a resolver runs AT MOST ONCE per (branch, head-sha): a branch+sha that already has
-# a recorded attempt is NEVER given a second resolver for that SAME sha (a failed/escalated resolve
-# leaves the PR CONFLICTING at an unchanged head; re-spawning would loop — and an ESCALATE: abort does
-# `git merge --abort` with NO push, so the sha is unchanged and the escalation stays surfaced as
-# needs-you). But when a NEW commit lands on a still-CONFLICTING PR (builder, human, or a PARTIAL
-# resolver push that moved the head yet left conflicts), the head sha CHANGES → the prior attempt is
-# stale → the resolver is RE-spawned for the new sha (HERD-55). A bounded cross-sha cap
-# ($_RESOLVE_RETRY_MAX distinct shas per branch) stops pathological churn and asks for a human.
+# Resolve-attempt ledger, PARALLEL to $STATE: one line per conflict-resolver DISPATCH or terminal
+# OUTCOME. Format "<epoch> <pr#> <slug> <branch> <sha> <outcome>", outcome ∈ dispatched | escalated.
+# Sha-keyed like the review-once ledger (HERD-55): a resolver is dispatched at most ONCE per head
+# sha, but a NEW commit (sha change) that reshapes the conflict — or a resolver that DIED without
+# clearing it — re-spawns a fresh resolver for the new sha. dispatched records are the per-PR RESPAWN
+# BUDGET (capped at REFIX_MAX_ROUNDS); an `escalated` marker is TERMINAL for that sha (the resolver
+# judged the conflict semantically ambiguous) and is NOT a dispatch, so it never consumes the budget.
+# Legacy 4-field rows (pre-HERD-55, no sha/outcome) read as a dispatch with an empty sha.
 RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
 # Max DISTINCT head shas a resolver may be spawned for on one branch before the watcher stops
 # re-spawning across new commits and escalates to "needs you" (the cross-sha anti-churn cap).
@@ -191,11 +187,32 @@ SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 # autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
 # of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
 RECONCILE_STATE="$TREES/.agent-watch-reconciled"
+# Tracker-state self-heal surfaces (HERD-86). The periodic tracker-state sweep (tracker-state-sweep.sh)
+# re-asserts Done for a recently-merged PR whose tracker item drifted (stuck open after merge — the
+# HERD-67/HERD-69 incidents). TRACKER_SWEEP_LEDGER records refs already confirmed Done so the sweep
+# never re-reads a clean ref (steady-state cost = one `gh pr list`, zero backend reads). The heal
+# NOTE surface holds one "<epoch> <status> <ref> <pr> <found-state>" line per heal action (status ∈
+# healed|failed); build_tracker_drift renders its tail so a heal — or a stuck failure — is VISIBLE in
+# the console, never a silent correction.
+TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
+TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
 # Dep-state console surface: dep-watcher.sh rewrites this file each tick with one
 # "<ref> <state> <age-seconds>" line per live blocked-on dep (state ∈ open|in-progress|in-review|
 # stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
 # so a missing/stale file just means "no deps to show". Path mirrors dep-watcher's <lock-stem>.states.
 DEP_STATES_FILE="${DEP_STATES_FILE:-${HERD_DEPWATCHER_LOCK%.pid}.states}"
+# Spawn-hold surface (HERD-94): the durable spawn queue supports an OPTIONAL per-intent after=<slug|pr#>
+# dependency. The drainer (_drain_spawn_queue) HOLDS such an intent until the dependency shows MERGED
+# (reap ledger $STATE, one gh fallback), then releases it FIFO. One line per currently-held intent —
+# "<intent_id> <first_held_epoch> <slug> <lane> <after>" — persists across ticks so spawn_held journals
+# ONCE (not per tick) and the stall TTL accrues from the FIRST hold. A held intent whose dependency
+# hasn't moved after DEP_STALE_TTL surfaces as a LOUD stalled console row (build_spawn_holds) — never a
+# silent forever-hold. Rows for vanished intents (spawned / skipped / operator-cleared) are pruned by
+# build_spawn_holds so the ledger cannot grow unbounded.
+SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
+# Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
+# DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
+DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -262,6 +279,8 @@ HDR_LINE=""
 RULE=""
 LANDED=""
 BLOCKED=""
+TRACKER_DRIFT=""
+SPAWN_HOLDS=""
 DISPLAY=()
 
 # build_header — the title row + a full-width rule.
@@ -283,19 +302,61 @@ epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev
 # reverse_file <path> — print lines in reverse order; tac (GNU/Linux) or tail -r (BSD/macOS).
 reverse_file() { tac "$1" 2>/dev/null || tail -r "$1" 2>/dev/null; }
 
+# ── Tracker-ref → slug console labelling (HERD-92) ────────────────────────────────────────────────
+# Operators saw TWO naming systems on the console: healed rows show the TRACKER ID (HERD-nn) while
+# in-flight / recently-landed rows showed only the worktree SLUG — no way to correlate at a glance.
+# The fix is DISPLAY-ONLY (branches/slugs are never renamed — the slug keys worktrees, agent names,
+# tab labels and PR↔worktree matching): render every row as "<ref> <slug>" wherever a tracker ref is
+# known, and the plain slug (byte-identical to before) when it is not.
+#
+# Ref source, read per tick with NO gh/backend call:
+#   • in-flight — a cheap per-worktree marker "$TREES/.herd-ref-<slug>" holding the HERD_ITEM_REF the
+#     lane spawned with (written once by herd-feature.sh / herd-quick.sh; absent for an untracked or
+#     pre-HERD-92 spawn).
+#   • recently-landed — the ref captured into the $STATE row at merge time (do_merge), from the marker
+#     or the merged PR's 'Refs:' body line.
+_slug_ref_file() { printf '%s' "$TREES/.herd-ref-$1"; }
+
+# _slug_ref <slug> — echo the tracker ref recorded for this slug's worktree marker, or nothing. Reads
+# only the FIRST whitespace-delimited token so a malformed marker can never inject spaces/newlines
+# into a console row. Empty (fail-soft) whenever the marker is absent/blank — the plain-slug path.
+_slug_ref() {
+  local f ref; f="$(_slug_ref_file "$1")"
+  [ -s "$f" ] || return 0
+  read -r ref _ < "$f" 2>/dev/null || return 0
+  printf '%s' "${ref:-}"
+}
+
+# _slug_cell <slug> [ref] — the padded slug column for a console row. When a tracker ref is known
+# (passed explicitly for landed rows, else looked up from the per-worktree marker for in-flight
+# rows) the cell renders "<ref> <slug>"; with no ref it is BYTE-IDENTICAL to the pre-HERD-92 plain
+# slug column. Padded to SLUGW so the state words still align; a ref+slug wider than the column is
+# simply not padded (the same graceful overflow a long slug has today). The caller wraps the cell in
+# its own color, so the ref inherits the row's slug styling for a single, consistent label.
+_slug_cell() {
+  local slug="$1" ref="${2-}"
+  [ -n "$ref" ] || ref="$(_slug_ref "$slug")"
+  if [ -n "$ref" ]; then
+    printf '%-*s' "$SLUGW" "$ref $slug"
+  else
+    printf '%-*s' "$SLUGW" "$slug"
+  fi
+}
+
 # build_landed — the pinned "recently landed" rows: the last 3 lines of the state file
-# ("<epoch> <pr#> <slug>"), newest first. Stays visible even when idle.
+# ("<epoch> <pr#> <slug> [ref]"), newest first. Stays visible even when idle. The optional 4th field
+# is the tracker ref captured at merge (HERD-92); pre-HERD-92 rows have none and render the plain slug.
 build_landed() {
   if [ ! -s "$STATE" ]; then
     LANDED="    ${C_DIM}nothing yet${C_RESET}"$'\n'
     return 0
   fi
   LANDED=""
-  while read -r epoch prnum slug; do
+  while read -r epoch prnum slug ref; do
     [ -z "${epoch:-}" ] && continue
     hhmm="$(epoch_to_hhmm "$epoch")"
     pnum="$(printf '#%-4s' "$prnum")"
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug" "$ref")"
     LANDED="${LANDED}    ${C_GREEN}✅${C_RESET} ${C_DIM}${pnum}${C_RESET} ${C_GREEN}${sl}${C_RESET} ${C_DIM}${hhmm}${C_RESET}"$'\n'
   done < <(reverse_file "$STATE" | head -3)
 }
@@ -328,6 +389,70 @@ build_blocked() {
   [ -n "$rows" ] && BLOCKED="$rows"
 }
 
+# build_tracker_drift — the "tracker healed" section: the last 3 heal actions from $TRACKER_HEAL_FILE
+# ("<epoch> <status> <ref> <pr> <found-state>", written by tracker-state-sweep.sh), newest first.
+# Empty (TRACKER_DRIFT="") when the file is absent/empty so render omits the section. A `healed` row
+# is calm green (drift was auto-corrected); a `failed` row is loud red (still stuck, retries next
+# sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86).
+build_tracker_drift() {
+  TRACKER_DRIFT=""
+  [ -s "$TRACKER_HEAL_FILE" ] || return 0
+  local epoch status ref pr state hhmm glyph color rows=""
+  while read -r epoch status ref pr state; do
+    [ -n "${ref:-}" ] || continue
+    hhmm="$(epoch_to_hhmm "$epoch")"
+    case "$status" in
+      healed) glyph='🩹'; color="$C_GREEN" ;;
+      *)      glyph='⚠️'; color="$C_RED"   ;;
+    esac
+    rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${status}${C_RESET} ${C_DIM}#${pr} was ${state} · ${hhmm}${C_RESET}"$'\n'
+  done < <(reverse_file "$TRACKER_HEAL_FILE" | head -3)
+  [ -n "$rows" ] && TRACKER_DRIFT="$rows"
+}
+
+# build_spawn_holds — the "spawn holds" section (HERD-94): one row per intent the durable-queue
+# drainer is HOLDING on an unmet after=<dep> dependency, read from $SPAWN_HELD_STATE
+# ("<intent_id> <first_held_epoch> <slug> <lane> <after>", written by _drain_spawn_queue). Empty
+# (SPAWN_HOLDS="") when nothing is held so render omits the section — BYTE-IDENTICAL console when the
+# after= feature is unused.
+#
+# A hold OLDER than DEP_STALE_TTL is LOUD (red ⏳ stalled) — the never-silent-forever-hold surface an
+# operator must act on (clear = remove the intent's .req; force = drop its .after sidecar). A fresh
+# hold is a calm yellow ⏳ waiting line. DEP_STALE_TTL=0 disables the stalled escalation (all holds
+# stay calm) exactly as it disables dep-watcher's stall surfacing.
+#
+# GC: this is the once-per-tick garbage-collector for $SPAWN_HELD_STATE — a row whose intent no longer
+# exists in the queue (spawned, skipped, or operator-cleared between ticks) is dropped, so the ledger
+# never accumulates stale holds. Runs each tick alongside the other build_* surfaces.
+build_spawn_holds() {
+  SPAWN_HOLDS=""
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  local _bsh_q="$TREES/spawn-queue" now rows="" kept id epoch slug lane after age human color glyph label sl
+  now="$(date +%s)"
+  kept="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null || true)"
+  while read -r id epoch slug lane after; do
+    [ -n "${id:-}" ] || continue
+    # Prune a hold whose intent is gone (spawned / skipped / operator-cleared its .req).
+    if [ ! -e "$_bsh_q/$id.req" ] && [ ! -e "$_bsh_q/$id.req.mine" ]; then
+      continue
+    fi
+    [ -n "$kept" ] && printf '%s %s %s %s %s\n' "$id" "$epoch" "$slug" "$lane" "$after" >> "$kept"
+    case "${epoch:-}" in ''|*[!0-9]*) epoch="$now" ;; esac
+    age=$(( now - epoch )); [ "$age" -lt 0 ] && age=0
+    human="$(_fmt_age "$age")"
+    if [ "${DEP_STALE_TTL:-0}" -gt 0 ] && [ "$age" -gt "$DEP_STALE_TTL" ]; then
+      color="$C_RED"; glyph='⏳'; label="stalled"
+    else
+      color="$C_YELLOW"; glyph='⏳'; label="waiting"
+    fi
+    sl="$(_slug_cell "$slug")"
+    rows="${rows}    ${color}${glyph}${C_RESET} ${color}${sl}${C_RESET} ${color}${label}${C_RESET} ${C_DIM}after ${after} · ${human}${C_RESET}"$'\n'
+  done < "$SPAWN_HELD_STATE"
+  # Swap in the pruned ledger (drops rows for vanished intents) so it can't grow unbounded.
+  if [ -n "$kept" ]; then mv -f "$kept" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$kept" 2>/dev/null; fi
+  [ -n "$rows" ] && SPAWN_HOLDS="$rows"
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -346,6 +471,12 @@ render() {
   if [ -n "${BLOCKED:-}" ]; then
     frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
   fi
+  if [ -n "${TRACKER_DRIFT:-}" ]; then
+    frame="${frame}  ${C_DIM}tracker healed${C_RESET}"$'\n'"${TRACKER_DRIFT}"$'\n'
+  fi
+  if [ -n "${SPAWN_HOLDS:-}" ]; then
+    frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
     frame="${frame}    ${C_DIM}— idle —${C_RESET}"$'\n'
@@ -358,10 +489,12 @@ render() {
   fi
 }
 
-# already_merged <pr#> <slug> — idempotency guard against the persistent state file.
+# already_merged <pr#> <slug> — idempotency guard against the persistent state file. Matches the
+# "<epoch> <pr#> <slug>" prefix followed by end-of-line OR a space (a HERD-92 4th tracker-ref field),
+# so appending the ref never regresses this guard.
 already_merged() {
   [ -s "$STATE" ] || return 1
-  grep -q "^[0-9][0-9]* $1 $2\$" "$STATE" 2>/dev/null
+  grep -qE "^[0-9]+ $1 $2( |\$)" "$STATE" 2>/dev/null
 }
 
 # _should_automerge <mergeStateStatus> — the pure merge-readiness predicate. GitHub computes
@@ -377,11 +510,8 @@ _should_automerge() {
   [ "${1:-}" = "CLEAN" ]
 }
 
-# resolver_attempted <branch> <headSha> — the SAME-sha anti-loop guard. True iff a resolver was ALREADY
-# spawned for this branch at this EXACT head sha. A resolver that failed/escalated leaves the PR
-# CONFLICTING at an UNCHANGED head, so this stays true and the caller never re-spawns for that sha
-# (preserving the escalation as a terminal needs-you). A NEW commit changes the sha → this returns
-# false → the caller RE-spawns for the fresh sha (HERD-55).
+# resolver_attempted <branch> — legacy branch-keyed guard (kept for back-compat; the sha-keyed
+# helpers below drive the HERD-55 respawn logic). True if ANY dispatch exists for this branch.
 resolver_attempted() {
   [ -s "$RESOLVE_STATE" ] || return 1
   awk -v b="$1" -v s="$2" '$4==b && $5==s{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
@@ -395,19 +525,50 @@ resolver_ever_attempted() {
   awk -v b="$1" '$4==b{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
 }
 
-# resolve_attempt_count <branch> — number of DISTINCT head shas a resolver has been spawned for on this
-# branch: the cross-sha retry budget. Counting distinct shas (not raw lines) makes it robust against a
-# double-record for the same sha, and mirrors "one review per commit" arithmetic. Compared against
-# $_RESOLVE_RETRY_MAX to cap pathological re-spawn churn across a long chain of still-conflicting commits.
-resolve_attempt_count() {
+# resolver_dispatch_count <pr#> — total resolver DISPATCHES for this PR across all shas. This is the
+# per-PR respawn budget (capped at REFIX_MAX_ROUNDS); `escalated` markers are not dispatches.
+resolver_dispatch_count() {
   [ -s "$RESOLVE_STATE" ] || { printf '0'; return 0; }
-  awk -v b="$1" '$4==b{seen[$5]=1} END{n=0; for(k in seen) n++; print n}' "$RESOLVE_STATE" 2>/dev/null || printf '0'
+  awk -v p="$1" '$2==p && $6!="escalated"{n++} END{print n+0}' "$RESOLVE_STATE" 2>/dev/null || printf '0'
 }
 
-# record_resolve_attempt <pr#> <slug> <branch> <headSha> — append one spawn record (BEFORE the spawn),
-# keyed by the head sha so resolver_attempted can gate re-spawns per commit.
+# resolver_dispatched_sha <pr#> <sha> — true if a resolver was already DISPATCHED for this exact pr+sha.
+resolver_dispatched_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6!="escalated"{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_escalated_sha <pr#> <sha> — true if the resolver ESCALATED this exact pr+sha. TERMINAL:
+# an ambiguous conflict is never re-dispatched until a NEW commit changes the sha.
+resolver_escalated_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $5==s && $6=="escalated"{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_last_dispatch_epoch <pr#> — epoch of the most-recent DISPATCH for this PR across ALL shas
+# (empty if none). Used to give a just-spawned resolver a startup grace before it's declared dead —
+# regardless of which sha it was dispatched for (so a new commit can't reap a still-registering resolver).
+resolver_last_dispatch_epoch() {
+  [ -s "$RESOLVE_STATE" ] || return 0
+  awk -v p="$1" '$2==p && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_last_sha <pr#> — the most-recently DISPATCHED sha for this PR (empty if none / legacy row).
+resolver_last_sha() {
+  [ -s "$RESOLVE_STATE" ] || return 0
+  awk -v p="$1" '$2==p && $6!="escalated" && $5!=""{s=$5} END{if(s)print s}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# record_resolve_attempt <pr#> <slug> <branch> <sha> — append one DISPATCH record (BEFORE the spawn).
+# An empty sha is normalized to "-" so the 6 whitespace-separated columns never collapse (awk-safe).
 record_resolve_attempt() {
-  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$RESOLVE_STATE"
+  printf '%s %s %s %s %s dispatched\n' "$(date +%s)" "$1" "$2" "$3" "${4:--}" >> "$RESOLVE_STATE"
+}
+
+# record_resolve_escalated <pr#> <slug> <branch> <sha> — mark a resolver ESCALATE terminal for this sha.
+record_resolve_escalated() {
+  printf '%s %s %s %s %s escalated\n' "$(date +%s)" "$1" "$2" "$3" "${4:--}" >> "$RESOLVE_STATE"
+  journal_append resolver_escalated pr "$1" slug "$2" sha "${4:--}"
 }
 
 # review_verdict <pr#> <headSha> — the review-once-per-commit guard. Echoes the recorded verdict
@@ -435,6 +596,83 @@ review_verdict_source() {
 record_review() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
   journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
+}
+
+# ── Structured BLOCK verdicts (HERD-104) ────────────────────────────────────────────────────────
+# herd-review.sh now emits a BLOCK as 'REVIEW: BLOCK — rule: <rule> | why: <why> | location: <loc>'.
+# These helpers PARSE that line into its three fields and CACHE them sha-keyed so the auto-refix
+# bounce can hand the builder an actionable finding. Both are FAIL-SOFT + BACKWARD-COMPATIBLE: a
+# legacy/unstructured 'REVIEW: BLOCK — <freeform reason>' yields why=<freeform>, rule/location empty.
+
+# _blk_trim <text> — echo <text> with leading/trailing whitespace stripped (no trailing newline).
+_blk_trim() { printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
+
+# _parse_block_fields <verdict-line> — parse a 'REVIEW: BLOCK — …' line, setting three globals:
+#   _BLK_RULE _BLK_WHY _BLK_LOCATION  (any absent field is left empty).
+# The payload is everything after the em-dash separator, split on ' | ' into segments; each segment
+# is classified by an explicit 'rule:'/'why:'/'location:' key (case-insensitive). The FIRST unkeyed
+# segment falls back to 'why' so a legacy freeform reason still populates why. Values are capped so a
+# pathological line can never bloat a downstream prompt/journal.
+_parse_block_fields() {
+  local line="$1" payload seg
+  _BLK_RULE=""; _BLK_WHY=""; _BLK_LOCATION=""
+  case "$line" in
+    *"—"*) payload="${line#*—}" ;;     # text after the em-dash separator
+    *)     payload="${line#*REVIEW: BLOCK}" ;;  # no separator → tail after the tag (fail-soft)
+  esac
+  payload="$(_blk_trim "$payload")"
+  while [ -n "$payload" ]; do
+    if [ "$payload" = "${payload#* | }" ]; then seg="$payload"; payload=""      # last (or only) segment
+    else seg="${payload%% | *}"; payload="${payload#* | }"; fi
+    case "$seg" in
+      [Rr]ule:*)     _BLK_RULE="$(_blk_trim "${seg#*:}")" ;;
+      [Ww]hy:*)      _BLK_WHY="$(_blk_trim "${seg#*:}")" ;;
+      [Ll]ocation:*) _BLK_LOCATION="$(_blk_trim "${seg#*:}")" ;;
+      *) [ -z "$_BLK_WHY" ] && _BLK_WHY="$(_blk_trim "$seg")" ;;  # legacy freeform → why
+    esac
+  done
+  # Cap each field (mirrors the 200-char cap used elsewhere) so one bad line can't bloat a prompt.
+  _BLK_RULE="${_BLK_RULE:0:200}"; _BLK_WHY="${_BLK_WHY:0:200}"; _BLK_LOCATION="${_BLK_LOCATION:0:200}"
+}
+
+# _persist_block_fields <pr#> <sha> <verdict-line> — parse the BLOCK line and cache its three fields
+# (rule / why / location, one per line, fixed order) for this exact pr+sha. Best-effort: a write
+# hiccup just means the bounce falls back to the legacy "read the PR" prompt.
+_persist_block_fields() {
+  local pr="$1" sha="$2"
+  _parse_block_fields "$3"
+  { printf '%s\n%s\n%s\n' "$_BLK_RULE" "$_BLK_WHY" "$_BLK_LOCATION"; } \
+    > "$(_review_block_file "$pr" "$sha")" 2>/dev/null || true
+}
+
+# ── Advisory (non-blocking) notes on a PASS (HERD-105) ────────────────────────────────────────────
+# The correctness-only gate BLOCKs only on a correctness finding; style/hardening/nitpick findings
+# ride a PASS verdict as ' | '-separated 'advisory:' notes after the em-dash:
+#   REVIEW: PASS — advisory: <note> | advisory: <note>
+# This helper surfaces each such note to the JOURNAL (the reviewer already posted them on the PR
+# comment) so an advisory finding is recorded but NEVER gates the merge. FAIL-SOFT + BYTE-IDENTICAL
+# when unused: a bare 'REVIEW: PASS' has no em-dash tail, so this returns immediately with zero
+# journal writes — the pre-HERD-105 behaviour is unchanged.
+#
+# _record_advisory_notes <pr#> <sha> <pass-verdict-line> — journal one review_advisory event per
+# advisory note carried on the PASS line. Best-effort; a malformed tail simply yields no notes.
+_record_advisory_notes() {
+  local pr="$1" sha="$2" line="$3" payload seg note
+  case "$line" in
+    *"—"*) payload="${line#*—}" ;;   # text after the em-dash tail
+    *) return 0 ;;                    # bare 'REVIEW: PASS' → no advisory notes (byte-identical)
+  esac
+  payload="$(_blk_trim "$payload")"
+  while [ -n "$payload" ]; do
+    if [ "$payload" = "${payload#* | }" ]; then seg="$payload"; payload=""      # last (or only) segment
+    else seg="${payload%% | *}"; payload="${payload#* | }"; fi
+    case "$seg" in
+      [Aa]dvisory:*)
+        note="$(_blk_trim "${seg#*:}")"; note="${note:0:200}"
+        [ -n "$note" ] && journal_append review_advisory pr "$pr" sha "$sha" note "$note" ;;
+    esac
+  done
+  return 0
 }
 
 # ── Background review dispatch ──────────────────────────────────────────────────────────────────
@@ -472,20 +710,38 @@ record_review() {
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
 _review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
 _review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
+# Structured-BLOCK detail cache (HERD-104): the reviewer's rule/why/location for THIS exact pr+sha,
+# written when a BLOCK verdict is collected (see _persist_block_fields) so the auto-refix bounce can
+# surface an ACTIONABLE finding instead of "read the PR". Sha-keyed like the markers above; a newer
+# head sha discards it via _discard_stale_reviews. Three lines, fixed order: rule, why, location.
+_review_block_file()    { printf '%s' "$TREES/.review-block-$1-$2"; }
 # Evidence-triggered escalation arm marker, keyed per-PR (NOT per-sha): armed by _handle_block_verdict
 # when a builder's refix rounds prove the cheap reviewer missed the issue, consumed once by the next
 # review dispatch on that PR (see _maybe_arm_review_escalation / _review_gate_step).
 _review_escalate_file() { printf '%s' "$TREES/.review-escalate-$1"; }
+# Reviewer dispatch registry (HERD-113): one row per (pr,sha) recording the reviewer's POLLER PID and
+# its PANE ID — "<pid> <pane_id>" (pane_id is "-" until the reviewer's agent pane is up, and stays "-"
+# for the headless / no-pane path). Persisted BESIDE the review ledger so it survives a watcher/herdr
+# restart. Two jobs: (a) on VERDICT CONSUMPTION the watcher retires the pane via the driver so a reviewer
+# session can't sit idle for 30+ min after its verdict was read; (b) DISPATCH consults it to ADOPT/skip a
+# still-live reviewer for the same (pr,sha) instead of spawning a duplicate (the 2026-07-08 double-Opus
+# incident: a herdr death+reload re-dispatched PR #221's review while the prior reviewer was still live).
+# Written cooperatively: _dispatch_review lays down "<pid> -" at spawn; herd-review.sh overwrites it with
+# the real pane id once the agent pane exists. Sha-keyed like the markers above; discarded on a newer head.
+_review_registry_file() { printf '%s' "$TREES/.review-registry-$1-$2"; }
 
-# ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB) ─────────────────────────────────────
-# _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | SKIP.
-# Only ever called when REVIEW_ESCALATE_GLOB is set (the opt-in); with it empty the caller keeps
-# today's always-$MODEL_REVIEW path and this never runs. Classification is DETERMINISTIC and fails
-# SAFE — any uncertainty (unreadable/empty diff) → STRONG, never a downgrade:
+# ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
+# _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | DOCS | SKIP.
+# Only ever called when REVIEW_ESCALATE_GLOB or DOCS_ONLY_GLOB is set (the opt-in); with BOTH empty the
+# caller keeps today's always-$MODEL_REVIEW path and this never runs. Classification is DETERMINISTIC and
+# fails SAFE — any uncertainty (unreadable/empty diff) → STRONG, never a downgrade:
 #   • only *.md / tests/ paths changed                  → SKIP  (no reviewer; PASS recorded low-risk)
-#   • any path matches REVIEW_ESCALATE_GLOB             → STRONG (engine surface)
-#   • more than REVIEW_ESCALATE_MAXFILES files changed  → STRONG (large diff)
+#   • any path matches REVIEW_ESCALATE_GLOB             → STRONG (engine surface; escalation wins)
+#   • more than REVIEW_ESCALATE_MAXFILES files changed  → STRONG (large diff; escalation wins)
+#   • every path matches DOCS_ONLY_GLOB (opt-in)        → DOCS   ($REVIEW_MODEL_DOCS, cheapest tier)
 #   • otherwise (small, low-risk)                        → CHEAP  ($REVIEW_MODEL_CHEAP)
+# ESCALATION WINS: the REVIEW_ESCALATE_GLOB / MAXFILES checks run BEFORE the DOCS_ONLY_GLOB check, so a
+# docs-only diff that ALSO touches an engine-critical path (or is large) still gets the STRONG tier.
 _classify_review_tier() {
   local pr="$1" paths n max
   # Changed-file paths for THIS PR's diff. Any failure/empty list → STRONG (never downgrade blind).
@@ -494,12 +750,20 @@ _classify_review_tier() {
   # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ — i.e. NO line fails to match
   # the docs/test pattern → skip the adversarial review entirely.
   if ! printf '%s\n' "$paths" | grep -qvE '(\.md$)|(^tests/)'; then printf SKIP; return 0; fi
-  # Engine-surface glob match → full strong review.
-  if printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
-  # Large diff (many files) → strong even without a glob match.
+  # Engine-surface glob match → full strong review (escalation wins over the docs tier). The -n guard
+  # keeps this classifier safe when only DOCS_ONLY_GLOB opted in: an empty REVIEW_ESCALATE_GLOB would
+  # make `grep -qE ""` match every path and wrongly force STRONG.
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] && printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
+  # Large diff (many files) → strong even without a glob match (escalation wins over the docs tier).
   n="$(printf '%s\n' "$paths" | grep -c .)"
   max="${REVIEW_ESCALATE_MAXFILES:-10}"; case "$max" in ''|*[!0-9]*) max=10 ;; esac
   if [ "$n" -gt "$max" ] 2>/dev/null; then printf STRONG; return 0; fi
+  # DOCS-ONLY (opt-in via DOCS_ONLY_GLOB): every changed path matches the operator's docs pattern → the
+  # cheapest reviewer tier ($REVIEW_MODEL_DOCS). Distinct from SKIP: a real (cheap) adversarial review
+  # still runs — for doc formats the hardcoded *.md/tests SKIP above doesn't cover (e.g. *.txt).
+  if [ -n "${DOCS_ONLY_GLOB:-}" ] && ! printf '%s\n' "$paths" | grep -qvE "$DOCS_ONLY_GLOB"; then
+    printf DOCS; return 0
+  fi
   # Small + low-risk → cheap reviewer tier.
   printf CHEAP
 }
@@ -546,14 +810,72 @@ record_review_retry() {
   printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_RETRIES"
 }
 
+# _reviewer_registry_live <pr#> <headSha> — success iff the dispatch registry records a still-LIVE
+# reviewer for this exact pr+sha: its poller pid is alive, OR (across a poller death) its pane still
+# exists in the control surface. This is the never-duplicate-into-a-live-reviewer guard (HERD-113);
+# a dead poller with no surviving pane is NOT live (returns false) so a clean re-dispatch can proceed.
+_reviewer_registry_live() {
+  local reg pid pane
+  reg="$(_review_registry_file "$1" "$2")"
+  [ -f "$reg" ] || return 1
+  read -r pid pane < "$reg" 2>/dev/null || true
+  if [ -n "${pid:-}" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+  [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"
+}
+
+# _retire_reviewer_pane <pr#> <headSha> [reason] — the reviewer-pane lifecycle teardown (HERD-113).
+# Reads the dispatch-registry row and, if it still names a LIVE pane, closes it via the driver and
+# journals a reviewer_pane_retired event; then drops the registry row unconditionally. Called when a
+# verdict is CONSUMED (the pane has done its job) and by the startup sweep (orphaned/completed panes).
+# FAIL-SOFT + byte-quiet: no registry row, no pane, or an already-gone pane ⇒ no console output and no
+# journal line — a workspace with no orphaned reviewer panes sees zero change.
+_retire_reviewer_pane() {
+  local pr="$1" sha="$2" reason="${3:-verdict-consumed}" reg pid pane
+  reg="$(_review_registry_file "$pr" "$sha")"
+  [ -f "$reg" ] || return 0
+  read -r pid pane < "$reg" 2>/dev/null || true
+  if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
+    herd_driver_close_pane "$pane"
+    journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+  fi
+  rm -f "$reg" 2>/dev/null || true
+}
+
+# _sweep_reviewer_registry — one-shot STARTUP reconcile of the dispatch registry against live
+# pids/panes (HERD-113 requirement 3). For each (pr,sha) row: a still-alive poller is a genuinely live
+# reviewer → left untouched (a later dispatch ADOPTS it). A dead poller whose PANE still exists is an
+# ORPHAN (nobody will collect its verdict) → the pane is retired and its inflight marker dropped so a
+# clean re-dispatch can happen. A row with a pending result file is left for the normal gate step to
+# collect + retire. Idempotent, dry-run-inert, and byte-quiet when there are no orphans.
+_sweep_reviewer_registry() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local f base rest pr sha pid pane
+  for f in "$TREES"/.review-registry-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"; rest="${base#.review-registry-}"
+    pr="${rest%-*}"; sha="${rest##*-}"
+    [ -n "$pr" ] && [ -n "$sha" ] || continue
+    # A finished reviewer's verdict is still waiting — let the normal gate step collect it and retire
+    # the pane through the verdict-consumption path (which also records the ledger). Don't pre-empt it.
+    [ -f "$(_review_result_file "$pr" "$sha")" ] && continue
+    read -r pid pane < "$f" 2>/dev/null || true
+    # Poller still alive → a live reviewer; adopt (leave the row + inflight marker as-is).
+    if [ -n "${pid:-}" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    # Poller dead: retire any surviving (orphaned) pane, then drop the row + inflight marker so the
+    # (pr,sha) can be cleanly re-dispatched — never left running alongside a fresh reviewer.
+    _retire_reviewer_pane "$pr" "$sha" startup-sweep-orphan
+    rm -f "$(_review_inflight_file "$pr" "$sha")" 2>/dev/null || true
+  done
+}
+
 # _discard_stale_reviews <pr#> <currentSha> — a result or inflight marker for this PR keyed to
 # ANY OTHER sha is stale (the PR has a newer head; that verdict must never be read). Discard
 # stale results unread; TERM a stale in-flight reviewer (best-effort — herd-review.sh traps TERM
-# and reports INFRA-FAIL to its own stale result file, which lands here next tick) and drop its
-# marker so the concurrency slot frees up.
+# and reports INFRA-FAIL to its own stale result file, which lands here next tick), retire its pane
+# (HERD-113 — a stale reviewer's pane must not linger), and drop its markers so the slot frees up.
 _discard_stale_reviews() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"*; do
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"* "$TREES/.review-registry-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -561,6 +883,12 @@ _discard_stale_reviews() {
       .review-inflight-*)
         local pid; pid="$(head -1 "$f" 2>/dev/null || true)"
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true ;;
+      .review-registry-*)
+        # Retire the stale reviewer's pane before dropping the row (the trailing sha in the filename
+        # is this marker's other-sha key). _retire_reviewer_pane rm's the row itself, so skip the rm below.
+        local _sreg_stale_sha="${base##*-}"
+        _retire_reviewer_pane "$pr" "$_sreg_stale_sha" stale-sha
+        continue ;;
     esac
     rm -f "$f" 2>/dev/null || true
   done
@@ -571,24 +899,179 @@ _discard_stale_reviews() {
 # Idempotent: an existing result file or live marker means this pr+sha is already handled — never
 # double-dispatch. Callers gate on concurrency/retries; this only guards identity.
 _dispatch_review() {
-  local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight
+  local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight registry
   result="$(_review_result_file "$pr" "$sha")"
   inflight="$(_review_inflight_file "$pr" "$sha")"
+  registry="$(_review_registry_file "$pr" "$sha")"
   [ -f "$result" ] && return 0
   [ -f "$inflight" ] && _review_pid_live "$inflight" && return 0
+  # ADOPT, never duplicate (HERD-113): a live reviewer for this exact pr+sha — poller pid alive OR its
+  # pane still present after a poller death — means one is already on it. Skip rather than spawn a second
+  # (the 2026-07-08 double-Opus incident). The startup sweep retires a genuinely orphaned pane (dead
+  # poller, no verdict) so a later tick re-dispatches cleanly; here we only refuse to double up on a LIVE one.
+  if _reviewer_registry_live "$pr" "$sha"; then
+    journal_append reviewer_adopted pr "$pr" sha "$sha" reason "live reviewer already dispatched for pr+sha"
+    return 0
+  fi
   # <model> is the risk-tier's chosen reviewer model. EMPTY means "use the default path" — do NOT
   # set HERD_REVIEW_MODEL, so herd-review.sh resolves $MODEL_REVIEW (and any operator-exported
   # HERD_REVIEW_MODEL override still wins) exactly as before tiering existed. A non-empty model
-  # (the cheap tier) is passed through so the reviewer runs on that tier.
+  # (the cheap tier) is passed through so the reviewer runs on that tier. HERD_REVIEW_REGISTRY_FILE is
+  # the seam herd-review.sh writes its pane id back through (see the registry helpers above).
   if [ -n "$model" ]; then
-    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
   else
-    HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
   fi
   local _dr_pid="$!"
   printf '%s\n' "$_dr_pid" > "$inflight"
+  # Lay down the registry row NOW (pane id unknown yet → "-"); herd-review.sh overwrites it with the
+  # real pane id once its agent pane is up. The pid alone already lets a post-restart dispatch adopt
+  # this reviewer even before its pane exists.
+  printf '%s -\n' "$_dr_pid" > "$registry" 2>/dev/null || true
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
+}
+
+# ── INFRA-timeout circuit breaker (HERD-110) ─────────────────────────────────────────────────────
+# The watcher re-dispatches a review for a candidate every tick until a verdict lands. When the
+# ENVIRONMENT itself is dead (a claude exec-hang, an env failure, a reviewer that dies WITHOUT writing
+# a verdict), that re-dispatch burns cycles forever against a corpse — and across N PRs it multiplies.
+# This breaker tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — the RETRY/FAILED path,
+# NEVER a real PASS/BLOCK verdict) GLOBALLY across all PRs; after INFRA_BREAKER_MAX in a row it OPENS:
+# new review/health dispatch stops, a loud 'infra circuit open' row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds it goes HALF-OPEN for a SINGLE probe. A probe that yields ANY real
+# outcome CLOSES it (env recovered); another non-verdict death RE-OPENS it (fresh cooldown).
+#
+# CRITICAL — an INFRA failure (dead env) is NOT a code BLOCK verdict. A BLOCK proves the reviewer RAN
+# and produced a verdict, i.e. the env is ALIVE — so a BLOCK (exactly like a PASS) RESETS the
+# consecutive counter and never trips the breaker. Only a non-verdict death counts against it.
+#
+# BYTE-INERT BY DEFAULT: INFRA_BREAKER_MAX defaults to 0 (off). With it 0/empty/non-numeric every
+# function below is an immediate no-op — no ledger writes, no journal, no gating — so behavior is
+# byte-identical to before this feature whenever the key is unset.
+INFRA_BREAKER_STATE="$TREES/.agent-watch-infra-breaker"   # one line: "<state> <fails> <opened_epoch> <probe_pr>"
+
+# _breaker_enabled — true iff INFRA_BREAKER_MAX is a positive integer (opt-in). Default/0/garbage → off.
+_breaker_enabled() {
+  case "${INFRA_BREAKER_MAX:-0}" in
+    ''|*[!0-9]*|0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# _breaker_cooldown — INFRA_BREAKER_COOLDOWN seconds (empty/non-numeric → 300).
+_breaker_cooldown() {
+  case "${INFRA_BREAKER_COOLDOWN:-300}" in
+    ''|*[!0-9]*) printf '300' ;;
+    *) printf '%s' "$INFRA_BREAKER_COOLDOWN" ;;
+  esac
+}
+
+# _breaker_read — echo "<state> <fails> <opened> <probe_pr>" (state ∈ closed|open|probing). A missing
+# or legacy (short) ledger reads as "closed 0 0 -". This is the single source of truth read on every
+# gate/record call, so the state survives across ticks AND across the command-substitution subshells
+# the action pass calls _breaker_gate from (a file write persists; a shell variable would not).
+_breaker_read() {
+  local st="" fa="" op="" pb=""
+  if [ -s "$INFRA_BREAKER_STATE" ]; then
+    read -r st fa op pb < "$INFRA_BREAKER_STATE" 2>/dev/null || true
+  fi
+  printf '%s %s %s %s' "${st:-closed}" "${fa:-0}" "${op:-0}" "${pb:--}"
+}
+
+# _breaker_write <state> <fails> <opened> <probe_pr> — persist the one-line state (small truncating write).
+_breaker_write() {
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "${4:--}" > "$INFRA_BREAKER_STATE" 2>/dev/null || true
+}
+
+# _breaker_record_infra — one non-verdict INFRA death was just observed. Increment the consecutive
+# counter; on reaching INFRA_BREAKER_MAX (from CLOSED) OPEN with a fresh cooldown; any death while
+# already OPEN/probing re-arms the cooldown (a probe that died again). The trip/re-open is journaled
+# LOUDLY once per transition.
+_breaker_record_infra() {
+  _breaker_enabled || return 0
+  local st fa op pb now max
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  now="$(date +%s)"; max="$INFRA_BREAKER_MAX"
+  fa=$(( ${fa:-0} + 1 ))
+  if [ "$st" = "closed" ]; then
+    if [ "$fa" -ge "$max" ]; then
+      _breaker_write open "$fa" "$now" -
+      journal_append infra_breaker_open scope global fails "$fa" threshold "$max" cooldown "$(_breaker_cooldown)"
+    else
+      _breaker_write closed "$fa" "${op:-0}" -
+    fi
+  else
+    # Already open or mid-probe and it died again → re-arm the cooldown, drop any probe claim.
+    _breaker_write open "$fa" "$now" -
+    journal_append infra_breaker_reopen scope global fails "$fa" threshold "$max" cooldown "$(_breaker_cooldown)"
+  fi
+}
+
+# _breaker_record_ok — a REAL verdict landed (a PASS or a BLOCK): the env is provably alive. Reset the
+# consecutive counter; if the breaker was open/probing, CLOSE it and journal the recovery. Cheap no-op
+# (no ledger churn) when already closed with a zero counter.
+_breaker_record_ok() {
+  _breaker_enabled || return 0
+  local st fa op pb
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  if [ "$st" != "closed" ]; then
+    _breaker_write closed 0 0 -
+    journal_append infra_breaker_close scope global recovered_via verdict
+  elif [ "${fa:-0}" != "0" ]; then
+    _breaker_write closed 0 0 -
+  fi
+}
+
+# _breaker_gate <pr#> — per-candidate dispatch decision, called at the TOP of the action-pass loop
+# body (before any health/review dispatch). Echoes one token:
+#   PASS    — breaker closed → dispatch normally
+#   PROBE   — breaker half-open and THIS candidate is the single recovery probe → dispatch normally
+#   BLOCKED — breaker open (cooling down), or another candidate is already the in-flight probe
+# Half-open is entered by transitioning OPEN→probing once the cooldown elapses: the FIRST candidate to
+# reach the gate CLAIMS itself as the probe (its PR persisted in the ledger) and gets PROBE; every
+# other candidate reads state=probing and, not being the claimed PR, gets BLOCKED — so exactly ONE
+# probe runs. The claimed probe keeps getting PROBE across ticks (so it can dispatch on one tick and
+# COLLECT its verdict on the next) until the probe resolves: a real verdict CLOSEs the breaker, another
+# death RE-OPENs it. A probe that never resolves within a second cooldown window is re-claimed (self-heal
+# against a wedged probe). Byte-inert (always PASS) when disabled.
+_breaker_gate() {
+  _breaker_enabled || { printf PASS; return 0; }
+  local pr="${1:-}" st fa op pb now cd
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  if [ "$st" = "open" ] || [ "$st" = "probing" ]; then
+    now="$(date +%s)"; cd="$(_breaker_cooldown)"
+    if [ $(( now - ${op:-0} )) -ge "$cd" ]; then
+      # Cooldown elapsed (or a wedged probe aged out) → (re)claim THIS candidate as the single probe.
+      _breaker_write probing "$fa" "$now" "$pr"
+      printf PROBE; return 0
+    fi
+    # Still cooling down: only the already-claimed probe PR may dispatch; everyone else waits.
+    if [ "$st" = "probing" ] && [ -n "$pr" ] && [ "$pr" = "$pb" ]; then printf PROBE; return 0; fi
+    printf BLOCKED; return 0
+  fi
+  printf PASS
+}
+
+# _breaker_cooldown_remaining — seconds left before an OPEN breaker admits a probe (0 if elapsed / not
+# open). Purely for the status row.
+_breaker_cooldown_remaining() {
+  local st fa op pb now cd rem
+  read -r st fa op pb <<EOF
+$(_breaker_read)
+EOF
+  [ "$st" = "open" ] || { printf '0'; return 0; }
+  now="$(date +%s)"; cd="$(_breaker_cooldown)"
+  rem=$(( ${op:-0} + cd - now ))
+  [ "$rem" -lt 0 ] && rem=0
+  printf '%s' "$rem"
 }
 
 # _review_gate_step <pr#> <slug> <headSha> — one NON-BLOCKING step of the background review state
@@ -608,15 +1091,35 @@ _review_gate_step() {
   if [ -f "$result" ]; then
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
     rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+    # VERDICT CONSUMED → retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane
+    # OPEN with an idle session showing the verdict banner; now that the watcher has read the verdict
+    # that pane has done its job, so close it (and drop the registry row). No-op when there is no live
+    # pane (headless, or an INFRA-FAIL reviewer that already tore down its own pane).
+    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
-      "REVIEW: PASS")   record_review "$pr" "$sha" "PASS"  "reviewer"; echo PASS;  return 0 ;;
-      "REVIEW: BLOCK"*) record_review "$pr" "$sha" "BLOCK" "reviewer"; echo BLOCK; return 0 ;;
+      # A real PASS verdict proves the env is ALIVE → reset the infra breaker's counter (HERD-110).
+      # PASS may carry a HERD-105 'advisory:' tail (' — advisory: …'); a bare 'REVIEW: PASS' has
+      # none. Either way the merge proceeds on PASS — the advisory notes are journalled (never
+      # gate). Match both shapes; the record + echo are identical for a finding-free PASS.
+      "REVIEW: PASS"|"REVIEW: PASS "*)
+        _breaker_record_ok
+        record_review "$pr" "$sha" "PASS" "reviewer"
+        _record_advisory_notes "$pr" "$sha" "$verdict_line"
+        echo PASS; return 0 ;;
+      "REVIEW: BLOCK"*)
+        _breaker_record_ok
+        record_review "$pr" "$sha" "BLOCK" "reviewer"
+        # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
+        _persist_block_fields "$pr" "$sha" "$verdict_line"
+        echo BLOCK; return 0 ;;
       *)
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
-        # verdict — never cached to the ledger, retried next poll with a cap.
+        # verdict — never cached to the ledger, retried next poll with a cap. Counts against the
+        # global INFRA circuit breaker (HERD-110): a run of these across PRs means the env is dead.
         record_review_retry "$pr" "$sha"
+        _breaker_record_infra
         if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
         return 0 ;;
     esac
@@ -626,17 +1129,24 @@ _review_gate_step() {
   if [ -f "$inflight" ]; then
     if _review_pid_live "$inflight"; then echo RUNNING; return 0; fi
     rm -f "$inflight" 2>/dev/null || true
+    # A reviewer that died WITHOUT writing a verdict is another non-verdict INFRA death (HERD-110).
+    # If its pane somehow survived (a herdr reload orphaned it), retire it now so the re-dispatch
+    # below never runs alongside a still-live reviewer (HERD-113). No-op if the pane is already
+    # gone; drops the registry row either way so the fresh dispatch starts clean.
+    _retire_reviewer_pane "$pr" "$sha" orphaned-poller-dead
     record_review_retry "$pr" "$sha"
+    _breaker_record_infra
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
 
-  # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB). Default (glob empty) → the STRONG
-  # tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no diff is classified
-  # at all. When the glob is set, classify this pr+sha's diff ONCE (cached, sha-keyed) and either skip
-  # the reviewer entirely (docs/test-only) or select the cheap vs strong model tier.
+  # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB and/or DOCS_ONLY_GLOB). Default (BOTH
+  # empty) → the STRONG tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no
+  # diff is classified at all. When either glob is set, classify this pr+sha's diff ONCE (cached,
+  # sha-keyed) and either skip the reviewer entirely (docs/test-only) or select the docs/cheap/strong
+  # model tier.
   local _rt_model=""
-  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ]; then
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] || [ -n "${DOCS_ONLY_GLOB:-}" ]; then
     local tier; tier="$(_review_tier "$pr" "$sha")"
     if [ "$tier" = "SKIP" ]; then
       # Docs/test-only diff: no reviewer is spawned. Record a sha-keyed PASS so it is never re-run,
@@ -649,6 +1159,8 @@ _review_gate_step() {
       echo PASS; return 0
     fi
     [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
+    # DOCS-only diff (opt-in via DOCS_ONLY_GLOB): a real adversarial review on the cheapest tier.
+    [ "$tier" = "DOCS" ]  && _rt_model="$REVIEW_MODEL_DOCS"
   fi
 
   # EVIDENCE-TRIGGERED ESCALATION: if a builder's second refix round still arrived BLOCKed on this PR
@@ -673,6 +1185,49 @@ _review_gate_step() {
   fi
   _dispatch_review "$pr" "$slug" "$sha" "$_rt_model"
   echo RUNNING
+}
+
+# ── Parallel gate dispatch (GATE_DISPATCH, HERD-73) ──────────────────────────────────────────────
+# _gate_dispatch_mode — resolve GATE_DISPATCH to "serial" | "parallel". Unknown/empty → serial, so
+# the default (and any typo) preserves today's EXACT serial behavior — the review dispatches only
+# after the healthcheck outcome lands.
+_gate_dispatch_mode() {
+  case "${GATE_DISPATCH:-serial}" in
+    parallel) printf parallel ;;
+    *)        printf serial ;;
+  esac
+}
+
+# _predispatch_review_if_parallel <pr#> <slug> <headSha> — under GATE_DISPATCH=parallel ONLY, advance
+# the background review state machine for (pr,sha) NOW, at the same action-pass tick the healthcheck
+# starts, so the pre-merge review runs CONCURRENTLY with the healthcheck instead of only after it
+# lands. A strict NO-OP under the default serial mode (and in dry-run, or when the head sha is not yet
+# known) so today's behavior is byte-identical.
+#
+# This ONLY kicks the reviewer off early — it never merges. The merge decision downstream is unchanged
+# and still requires BOTH gates green: the merge-path review gate re-reads the SAME sha-keyed ledger /
+# inflight marker this shares, so the dispatch is idempotent (a (pr,sha) is still reviewed at most once,
+# REVIEW_CONCURRENCY is still honored — an over-cap review reports QUEUED here exactly as in the merge
+# path). Because the reviewer is keyed to the head sha, a health CODE-ERROR does NOT touch it: the
+# candidate simply `continue`s without reaching the merge-path gate, and this same-sha re-entry on the
+# next tick collects/records the verdict rather than killing the in-flight reviewer — the sha is blocked
+# by health anyway, so the finished verdict is recorded but never acted on. The echoed token is
+# intentionally discarded; the console row for this tick is owned by the healthcheck gate.
+#
+# LEDGER PRECONDITION (mirrors the merge path's `if [ "$prior" != "PASS" ]` guard): _review_gate_step's
+# contract is "called once per tick for a candidate with NO ledger verdict yet". Once a PASS/BLOCK is
+# recorded for pr+sha the review is DONE for that commit and its result/inflight/tier markers are gone;
+# calling _review_gate_step again would find no markers and DISPATCH A BRAND-NEW review every tick — the
+# review-once invariant broken for any candidate that stays a candidate WITHOUT merging (health error,
+# approve/observe hold, human-verify hold, branch-protection block, a mergeability regression). So skip
+# the kick entirely when a verdict already exists; a new commit changes the sha and gets a fresh review.
+_predispatch_review_if_parallel() {
+  [ "$(_gate_dispatch_mode)" = "parallel" ] || return 0
+  [ -z "$DRYRUN" ] || return 0
+  local pr="$1" slug="$2" sha="$3"
+  [ -n "$sha" ] || return 0
+  review_verdict "$pr" "$sha" >/dev/null 2>&1 && return 0
+  _review_gate_step "$pr" "$slug" "$sha" >/dev/null 2>&1 || true
 }
 
 # override_exists <pr#> <headSha> — true if a human override was recorded for this exact pr+sha.
@@ -722,6 +1277,26 @@ hv_informed_noted() {
 # record_hv_informed <pr#> <headSha> — note the informational HUMAN-VERIFY steps were recorded.
 record_hv_informed() {
   printf '%s hv-informed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
+# purge_pr_approvals <pr#> — on merge/reap, drop EVERY approval-ledger row for this PR number
+# (awaiting/approved/observed/hv-informed) regardless of sha. HERD-90: when a HUMAN-VERIFY hold
+# re-applies at a NEW sha and the PR is merged at that sha, the OLD sha's 'awaiting' row was never
+# cleaned — so `herd-approve.sh list` kept surfacing a phantom hold for a long-merged PR and
+# `approve` no-op'd with "already approved", causing false coordinator wakes. A merge is terminal:
+# no approval state for this PR is ever needed again, so we purge all of its rows. The row format is
+# "<epoch> <state> <pr#> <sha>", so the PR number is field 3; exact string compare avoids clobbering
+# a different PR whose number is a substring (e.g. 9 vs 90). Atomic rewrite via a temp file; fully
+# fail-soft — an approvals-ledger hiccup must never fail the merge.
+purge_pr_approvals() {
+  local _pr="$1" _tmp
+  [ -s "$APPROVALS" ] || return 0
+  _tmp="$(mktemp "$APPROVALS.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v p="$_pr" '$3 != p' "$APPROVALS" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$APPROVALS" 2>/dev/null || rm -f "$_tmp"
+  else
+    rm -f "$_tmp"
+  fi
 }
 
 # ── Per-PR human-verify hold ──────────────────────────────────────────────────────────────────
@@ -798,12 +1373,143 @@ _merge_method_flag() {
   esac
 }
 
-# spawn_resolver <slug> <pr#> <branch> <headSha> — hand a (re-)CONFLICTING PR to the isolated resolver.
-# Record-first (keyed by the head sha) keeps the loop guard sound; the spawn is best-effort.
+# HERD_RESOLVE_BIN is a test seam mirroring HERD_REVIEW_BIN: the hermetic suite points it at a stub
+# resolver so the dispatch → death → respawn → cap loop is driven WITHOUT a real Claude agent.
+: "${HERD_RESOLVE_BIN:="$HERE/herd-resolve.sh"}"
+# _resolve_result_file <pr#> <sha> — the sha-scoped file the resolver writes its verdict to as its
+# LAST act (mirroring $HERD_REVIEW_RESULT_FILE): a line containing ESCALATE (ambiguous → terminal) or
+# DONE. Its ABSENCE while the resolver agent is gone is the DEAD-resolver signal that drives a respawn.
+_resolve_result_file() { printf '%s' "$TREES/.resolve-result-$1-$2"; }
+
+# _resolve_result <pr#> <sha> — echo the recorded resolver verdict token for this pr+sha (ESCALATE |
+# DONE), read from the sha-scoped result file. Returns non-zero (echoes nothing) when no file exists.
+_resolve_result() {
+  local f; f="$(_resolve_result_file "$1" "$2")"
+  [ -f "$f" ] || return 1
+  if grep -qi 'ESCALATE' "$f" 2>/dev/null; then printf 'ESCALATE'; else printf 'DONE'; fi
+}
+
+# _resolver_agent_alive <slug> — true if a live resolve·<slug> resolver agent is present in the tick's
+# driver roster ($AGENTS_JSON). A vanished resolver = it died/finished → eligible for a respawn.
+_resolver_agent_alive() {
+  [ -n "${AGENTS_JSON:-}" ] || return 1
+  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+import sys, json, os
+name = os.environ["NAME"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+except Exception:
+  agents = []
+for a in agents:
+  if a.get("name") == name:
+    sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
+# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING:
+# a live resolve·<slug> agent in the roster, OR the PR's most-recent dispatch is younger than the
+# startup grace (a freshly-spawned resolver whose pid has not yet registered). This is the SINGLE
+# guard that prevents a double-dispatch — a second resolver on the same worktree would race the first
+# on `git merge`/`git push`. Both the same-sha (dead-resolver) and new-commit respawn paths consult it,
+# so a respawn only ever fires once the prior resolver is provably gone.
+_resolver_in_flight() {
+  local _rif_slug="$1" _rif_pr="$2" _rif_last _rif_now _rif_age
+  _resolver_agent_alive "$_rif_slug" && return 0
+  _rif_last="$(resolver_last_dispatch_epoch "$_rif_pr")"
+  [ -n "$_rif_last" ] || return 1
+  _rif_now="$(date +%s)"; _rif_age=$(( _rif_now - _rif_last ))
+  [ "$_rif_age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]
+}
+
+# spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
+# to <sha>. Record-first keeps the respawn budget sound; the spawn is best-effort. The resolver is
+# told (via $HERD_RESOLVE_RESULT_FILE) to write its terminal verdict to the sha-scoped result file.
 spawn_resolver() {
-  rs="$1"; rp="$2"; rb="$3"; rsha="$4"
+  rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
-  bash "$HERE/herd-resolve.sh" "$rs" >/dev/null 2>&1 || true
+  HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
+    bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || true
+}
+
+# Grace window (seconds) before a resolver dispatched-for-this-sha whose agent is not yet visible in
+# the roster is treated as DEAD (rather than "just starting up"). Prevents a double-dispatch race when
+# a freshly-spawned resolver has not yet registered its pid. Overridable so the sim can zero it out.
+: "${_RESOLVER_DEAD_GRACE:=90}"
+
+# _classify_conflict <idx> <pr#> <slug> <branch> <headsha> — decide what to do with a CONFLICTING PR
+# (HERD-55). Sha-keyed like the review-once gate: first conflict → auto-spawn the resolver; a NEW
+# commit that reshapes the conflict, or a resolver that DIED without clearing it, → RE-spawn for the
+# new sha; an ESCALATE verdict is TERMINAL for that sha; respawns are capped at REFIX_MAX_ROUNDS then
+# surface needs-you. Sets DISPLAY[idx]; queues a (re)spawn by appending to the CONF_* arrays with the
+# sha + reason. Never spawns here — the resolve pass does that so it stays render-ordered + dry-runnable.
+_classify_conflict() {
+  local ci="$1" cpr="$2" cslug="$3" cbranch="$4" csha="$5"
+  local sl pn cap count
+  # Normalize an absent head sha to "-" so it keys consistently across the ledger + result file.
+  [ -n "$csha" ] || csha="-"
+  sl="$(_slug_cell "$cslug")"; pn=" ${C_DIM}#${cpr}${C_RESET} ·"
+  cap="${REFIX_MAX_ROUNDS:-3}"
+  count="$(resolver_dispatch_count "$cpr")"
+
+  # ESCALATE already recorded for THIS sha → terminal; hold for a human, never re-dispatch.
+  if resolver_escalated_sha "$cpr" "$csha"; then
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver escalated (ambiguous conflict)${C_RESET}"
+    return
+  fi
+
+  if resolver_dispatched_sha "$cpr" "$csha"; then
+    # A resolver already ran (or is running) against THIS exact commit.
+    case "$(_resolve_result "$cpr" "$csha" || true)" in
+      ESCALATE)
+        # Promote the resolver's ESCALATE verdict to a terminal marker for this sha.
+        record_resolve_escalated "$cpr" "$cslug" "$cbranch" "$csha"
+        DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver escalated (ambiguous conflict)${C_RESET}"
+        return ;;
+      DONE)
+        # Resolver reported done yet the PR is STILL conflicting — it could not clear it. Do NOT
+        # re-spawn on the same sha (that would loop); wait for a new commit or a human.
+        DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
+        return ;;
+    esac
+    # Dispatched for this sha, no verdict yet. If the resolver is still in flight (agent alive, or a
+    # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
+    if _resolver_in_flight "$cslug" "$cpr"; then
+      DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+      return
+    fi
+    # DEAD resolver — re-spawn for the same sha if budget remains, else surface needs-you.
+    if [ "$count" -ge "$cap" ]; then
+      DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+      return
+    fi
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("dead-resolver")
+    return
+  fi
+
+  # No resolver dispatched for THIS sha.
+  if [ "$count" -eq 0 ]; then
+    # First-ever conflict on this PR — today's hands-off auto-resolve path.
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("first")
+    return
+  fi
+  # A resolver ran on an OLDER sha and this PR got a NEW commit that reshaped the conflict surface.
+  # CRITICAL: the prior resolver (dispatched for the old sha) may STILL be running — a resolver runs
+  # for minutes while ticks are seconds. Re-dispatching now would put a second resolver on the SAME
+  # worktree, racing the first on `git merge`/`git push`. So HOLD while it is in flight; the respawn
+  # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
+  if _resolver_in_flight "$cslug" "$cpr"; then
+    DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    return
+  fi
+  if [ "$count" -ge "$cap" ]; then
+    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+    return
+  fi
+  DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+  CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit")
 }
 
 # reconcile_enqueued <pr#> <headSha> — true if a POST-MERGE reconcile was already enqueued for this
@@ -860,7 +1566,7 @@ sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 
 # NOCHANGE/no-match} returns non-zero so the caller falls back to the fuzzy scribe path — this is what
 # guarantees the ref-less / file-backend behavior never regresses.
 _reconcile_via_ref() {
-  local ref="$1" _bdir _bfile _secrets result
+  local ref="$1" pr="${2:-}" _bdir _bfile _secrets result
   _bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
   _bfile="$_bdir/${SCRIBE_BACKEND:-file}.sh"
   [ -f "$_bfile" ] || return 1
@@ -872,6 +1578,10 @@ _reconcile_via_ref() {
     . "$_bfile" 2>/dev/null || exit 1
     command -v _backend_update_state >/dev/null 2>&1 || exit 1
     cd "$MAIN" 2>/dev/null || true
+    # HERD-85: attribute this explicit-ref state write to the 'reconcile' component and carry the
+    # merged PR into the tracker_write event (journal_append is inherited from agent-watch's top-level
+    # source of journal.sh; the backend's _backend_tw_journal reads these two env vars).
+    export HERD_COMPONENT="reconcile" HERD_TW_PR="$pr"
     _BACKEND_RESULT=""
     _backend_update_state "$ref" done >/dev/null 2>&1 || true
     printf '%s' "$_BACKEND_RESULT"
@@ -899,7 +1609,7 @@ reconcile_backlog() {
   # back to today's fuzzy scribe enqueue — so ref-less PRs behave EXACTLY as before. Journal which
   # path resolved so a drift audit can tell explicit-ref links from fuzzy ones.
   rb_ref="$(_reconcile_pr_ref "$rb_pr")"
-  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref"; then
+  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref" "$rb_pr"; then
     journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution explicit-ref
     return 0
   fi
@@ -963,6 +1673,72 @@ refresh_codemap() {
   return 0
 }
 
+# refresh_symbol_index <pr#> — POST-MERGE symbol-index freshness hook, the function-level twin of
+# refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd $MAIN and,
+# ONLY when the deterministic scan actually changed its content, commits the refresh STRAIGHT to the
+# default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and byte-inert on every
+# failure mode; journals a `symbol_index_refresh` event; can never return non-zero into do_merge.
+#
+# Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
+# and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
+# (the committed docs/symbol-index.md exists — never materialize a new one); (2) skip if that path
+# already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
+# changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
+refresh_symbol_index() {
+  local rs_pr="${1:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh"
+  case "$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|off|no|disable|disabled)
+      journal_append symbol_index_refresh pr "$rs_pr" result skipped reason disabled; return 0 ;;
+  esac
+  [ -f "$rs_script" ]    || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-script; return 0; }
+  [ -f "$MAIN/$rs_out" ] || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-index;  return 0; }
+  # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
+  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+    journal_append symbol_index_refresh pr "$rs_pr" result skipped reason dirty-path; return 0
+  fi
+  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+  if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result error reason regen-failed; return 0
+  fi
+  # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
+  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+    journal_append symbol_index_refresh pr "$rs_pr" result fresh; return 0
+  fi
+  # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
+  # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+  if ! git -C "$MAIN" commit -q -m "chore: refresh symbol-index after PR #${rs_pr}" -- "$rs_out" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result error reason commit-failed; return 0
+  fi
+  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes; return 0
+  fi
+  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
+     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes-after-rebase; return 0
+  fi
+  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+  journal_append symbol_index_refresh pr "$rs_pr" result committed pushed no
+  return 0
+}
+
+# _reap_slug <slug> <dir> <pr#> <sha> [reason] — the IDEMPOTENT worktree-teardown primitive shared by
+# the merge path (do_merge) and the startup reap-sweep (_startup_reap_sweep). Runs the three reap
+# steps in the same order do_merge always has: (1) force-remove the worktree (the SHARE_LINKS
+# symlinks make a non-force remove fail); (2) reap the per-worktree tracker-ref marker (HERD-92 — the
+# ref lives on in the $STATE row for "recently landed"); (3) journal a `reap` event carrying the
+# supplied reason (default 'merged'); (4) close the builder/review/resolver tabs + prune their
+# .herd-tabs rows via herd_teardown_slug. Every step is fail-soft and idempotent — a worktree already
+# gone, a marker already reaped, a tab already closed all no-op — so a second call (a re-run merge
+# tick OR a startup sweep over a worktree do_merge already reaped) is harmless.
+_reap_slug() {
+  local _rp_slug="$1" _rp_dir="$2" _rp_pr="${3:-}" _rp_sha="${4:-}" _rp_reason="${5:-merged}"
+  git -C "$MAIN" worktree remove --force "$_rp_dir" >/dev/null 2>&1 || true
+  rm -f "$(_slug_ref_file "$_rp_slug")" 2>/dev/null || true
+  journal_append reap pr "$_rp_pr" slug "$_rp_slug" sha "$_rp_sha" reason "$_rp_reason"
+  herd_teardown_slug "$_rp_slug"
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -970,9 +1746,24 @@ do_merge() {
     return 0
   fi
   gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
-  # Record FIRST: even if a later cleanup step dies, we never re-merge this PR.
-  printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
+  # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
+  # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
+  # body line. Empty for an untracked PR → the row renders the plain slug, exactly as before.
+  _dm_ref="$(_slug_ref "$ds")"
+  [ -n "$_dm_ref" ] || _dm_ref="$(_reconcile_pr_ref "$dp" 2>/dev/null || true)"
+  # Record FIRST: even if a later cleanup step dies, we never re-merge this PR. Omit the 4th field
+  # entirely when there is no ref so a ref-less row stays byte-identical to the pre-HERD-92 format.
+  if [ -n "$_dm_ref" ]; then
+    printf '%s %s %s %s\n' "$(date +%s)" "$dp" "$ds" "$_dm_ref" >> "$STATE"
+  else
+    printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
+  fi
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
+  # HERD-90: purge every approval-ledger row for this PR (all shas) now that it is merged. Without
+  # this, an OLD-sha 'awaiting' row from a re-applied HUMAN-VERIFY hold lingers as a phantom pending
+  # approval in `herd-approve.sh list`. Done right after the merge record so a later cleanup crash
+  # can never leave the phantom behind.
+  purge_pr_approvals "$dp"
   # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and journal
   #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
   #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.
@@ -988,13 +1779,120 @@ do_merge() {
   #     BACKLOG.md-style) and push ff-safe. Gated by CODEMAP_AUTOREFRESH; fully fail-soft — a codemap
   #     problem never blocks or fails the merge (mirrors the reconcile hook's best-effort posture).
   refresh_codemap "$dp"
-  # 3) remove the worktree (force: the SHARE_LINKS symlinks make a non-force remove fail).
-  git -C "$MAIN" worktree remove --force "$dd" >/dev/null 2>&1 || true
-  journal_append reap pr "$dp" slug "$ds" sha "$dsha" reason merged
-  # 4) TEARDOWN is the WATCHER's job — sub-agents NEVER self-close. Close the builder tab,
-  #    review tab (review·slug), and resolver tab (resolve·slug) in one shot. Verifies each
-  #    close and retries once; warns loudly if a tab cannot be closed.
-  herd_teardown_slug "$ds"
+  # 2c) POST-MERGE symbol-index refresh: same posture as 2b but for the function-level def→caller
+  #     index (docs/symbol-index.md). Shares the CODEMAP_AUTOREFRESH lever; fully fail-soft.
+  refresh_symbol_index "$dp"
+  # 3+4) IDEMPOTENT teardown (the WATCHER's job — sub-agents NEVER self-close): force-remove the
+  #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
+  #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup
+  #      reap-sweep so a merge that crashed BEFORE this point (PR #208) is resumed on restart.
+  _reap_slug "$ds" "$dd" "$dp" "$dsha" merged
+  return 0
+}
+
+# _srs_gh_view <branch-or-pr#> — echo "state<TAB>headRefOid<TAB>number" for a PR resolved by branch
+# name OR number, or nothing on any error (no PR, deleted branch, gh down). One network call. The head
+# OID is what makes the sweep SAFE (see _startup_reap_sweep) — never reap without it.
+_srs_gh_view() {
+  gh pr view "$1" --json state,number,headRefOid \
+    -q '.state+"\t"+((.headRefOid)//"")+"\t"+(((.number)//0)|tostring)' 2>/dev/null || true
+}
+
+# _startup_reap_sweep — RESUME teardown for a merged-but-unreaped worktree (HERD-91). Reaps are
+# merge-EVENT-driven: do_merge writes the merge ledger row FIRST, then runs the post-merge sequence
+# (reconcile → ff → codemap/symbol-index refresh → worktree remove + tab close). A watcher killed
+# mid-sequence (PR #208: a restart 2 s after a merge) lands the merge but never reaps, stranding the
+# worktree + its idle builder tab with NO red anywhere — and because the merge is already ledgered,
+# the restarted watcher never retries. This one-shot startup sweep closes that gap: it walks the live
+# feature worktrees and, for any that is PROVABLY the head of an ALREADY-MERGED PR, runs the SAME
+# idempotent reap path do_merge does (worktree remove, marker reap, tab close, .herd-tabs prune) —
+# journaling the reap with reason=startup-sweep so a post-mortem can tell a resumed teardown apart.
+#
+# SAFETY — never reap a live builder (data-integrity): a slug is a coordinator-chosen kebab name that
+# gets re-spawned (a follow-up on the same feature), the merge ledger ($STATE) is append-only and
+# never pruned, and a builder opens its PR DURING the run (not at spawn). So a fresh, actively-building
+# worktree can carry a minutes-old stale ledger row AND have no PR yet — the exact PR #208 restart
+# window this targets. A slug/branch-name match alone (or a "gh silent + in ledger" fallback) would
+# force-remove that live worktree and silently lose uncommitted work. The invariant that makes the
+# reap safe is therefore NOT the slug but the COMMIT: we reap a worktree ONLY when its current HEAD sha
+# equals the headRefOid of a MERGED PR — i.e. every committed thing in the worktree is already in a
+# merged PR, so there is nothing to lose. Concretely, per worktree:
+#   1. resolve the worktree's HEAD sha locally (git rev-parse); no HEAD ⇒ can't verify ⇒ SKIP.
+#   2. look up the PR by branch name; if it is MERGED and its headRefOid == HEAD ⇒ reap candidate.
+#   3. else, if the slug is in the ledger, look up THAT PR by number; MERGED and headRefOid == HEAD
+#      ⇒ reap candidate (covers a stranded worktree whose branch was deleted at merge, without
+#      trusting the stale ledger row blindly — the sha still has to match).
+#   4. otherwise SKIP. A reused slug with a fresh commit (or none yet), a still-OPEN PR, an
+#      unreachable gh, all fail the sha match and are left untouched.
+#   5. defense-in-depth: even with a HEAD match, refuse to force-remove a worktree with UNCOMMITTED
+#      changes — a merged worktree is clean, so a dirty tree is not the stranded case; journal a skip.
+# Idempotent + fully fail-soft (the reap primitive no-ops on an already-gone worktree / closed tab),
+# so a re-run is harmless; the SELF worktree is always excluded. Skipped entirely in dry-run. Zero
+# stranded worktrees ⇒ zero action (no reap, no journal line) — the common, healthy startup.
+_startup_reap_sweep() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _srs_wt; _srs_wt="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || true)"
+  [ -n "$_srs_wt" ] || return 0
+  # Slugs the reap ledger already records as merged (col 3 of each $STATE row: 'ts pr slug [ref]').
+  local _srs_ledger=""
+  [ -f "$STATE" ] && _srs_ledger="$(awk 'NF>=3{print $3}' "$STATE" 2>/dev/null || true)"
+  local _srs_dir _srs_slug _srs_branch _srs_n=0
+  while IFS=$'\x1f' read -r _srs_dir _srs_slug _srs_branch; do
+    [ -n "$_srs_slug" ] || continue
+    [ "$_srs_dir" = "$SELF_WT" ] && continue        # never reap the coordinator's own checkout
+    [ -d "$_srs_dir" ] || continue
+    # (1) The worktree's CURRENT HEAD sha — the anchor the reap decision must match against.
+    local _srs_head
+    _srs_head="$(git -C "$_srs_dir" rev-parse HEAD 2>/dev/null || true)"
+    [ -n "$_srs_head" ] || continue                  # no resolvable HEAD → cannot verify → SKIP
+    # (2) Resolve a MERGED PR whose headRefOid == this worktree's HEAD. Try the branch name first…
+    local _srs_pr="" _srs_st _srs_oid _srs_num
+    if [ -n "$_srs_branch" ]; then
+      IFS=$'\t' read -r _srs_st _srs_oid _srs_num <<EOF
+$(_srs_gh_view "$_srs_branch")
+EOF
+      if [ "$_srs_st" = "MERGED" ] && [ -n "$_srs_oid" ] && [ "$_srs_oid" = "$_srs_head" ]; then
+        _srs_pr="$_srs_num"
+      fi
+    fi
+    # (3) …else fall back to the ledger's PR NUMBER (covers a branch deleted at merge). The sha match
+    #     is STILL required, so a stale ledger row for a re-spawned slug can never reap a live worktree.
+    if [ -z "$_srs_pr" ] && [ -n "$_srs_ledger" ] && printf '%s\n' "$_srs_ledger" | grep -qxF "$_srs_slug"; then
+      local _srs_ledger_pr
+      _srs_ledger_pr="$(awk -v s="$_srs_slug" 'NF>=3 && $3==s{p=$2} END{if(p!="")print p}' "$STATE" 2>/dev/null || true)"
+      if [ -n "$_srs_ledger_pr" ]; then
+        IFS=$'\t' read -r _srs_st _srs_oid _srs_num <<EOF
+$(_srs_gh_view "$_srs_ledger_pr")
+EOF
+        if [ "$_srs_st" = "MERGED" ] && [ -n "$_srs_oid" ] && [ "$_srs_oid" = "$_srs_head" ]; then
+          _srs_pr="$_srs_ledger_pr"
+        fi
+      fi
+    fi
+    # (4) No MERGED PR whose head is this worktree's HEAD → not stranded (in-flight / reused / gh down).
+    [ -n "$_srs_pr" ] || continue
+    # (5) Defense-in-depth: never force-remove a worktree carrying uncommitted work.
+    if [ -n "$(git -C "$_srs_dir" status --porcelain 2>/dev/null)" ]; then
+      journal_append startup_reap_skip slug "$_srs_slug" pr "$_srs_pr" reason dirty-worktree
+      continue
+    fi
+    _reap_slug "$_srs_slug" "$_srs_dir" "$_srs_pr" "$_srs_head" startup-sweep
+    _srs_n=$(( _srs_n + 1 ))
+  done < <(WT="$_srs_wt" MAIN="$MAIN" python3 -c '
+import os
+MAIN = os.environ["MAIN"]
+def emit(wt, branch):
+    if wt and wt != MAIN:
+        print("\x1f".join([wt, os.path.basename(wt), branch or ""]))
+wt = None; branch = None
+for line in (os.environ.get("WT") or "").splitlines():
+    if line.startswith("worktree "):
+        emit(wt, branch); wt = line[9:]; branch = None
+    elif line.startswith("branch "):
+        branch = line[7:].replace("refs/heads/", "")
+emit(wt, branch)
+' 2>/dev/null)
+  [ "$_srs_n" -eq 0 ] || journal_append startup_reap_sweep reaped "$_srs_n"
   return 0
 }
 
@@ -1121,23 +2019,131 @@ except Exception:
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
     journal_append sweep_closed tab_id "$_sw_id" reason orphan
     # Remove the swept tab from the registry so it doesn't accumulate stale entries.
-    if [ -f "$_sw_registry" ]; then
-      TAB_ID="$_sw_id" REGISTRY_PATH="$_sw_registry" python3 -c '
+    _herd_tabs_drop_row "$_sw_registry" "$_sw_id"
+  done <<< "$_sw_orphans"
+}
+
+# _herd_tabs_drop_row <registry-file> <tab_id> — remove the single row for <tab_id> (field 2) from the
+# $TREES/.herd-tabs registry, leaving every other row byte-identical. Shared by _sweep_orphan_tabs and
+# the stale-resolve-tab sweep so a swept tab never lingers as a stale registry entry. Fail-soft: a
+# missing file / absent python3 / unwritable path just no-ops.
+_herd_tabs_drop_row() {
+  local _dr_reg="$1" _dr_tab="$2"
+  [ -n "$_dr_reg" ] && [ -n "$_dr_tab" ] || return 0
+  [ -f "$_dr_reg" ] || return 0
+  TAB_ID="$_dr_tab" REGISTRY_PATH="$_dr_reg" python3 -c '
 import os
 path = os.environ.get("REGISTRY_PATH", "")
 tid  = os.environ.get("TAB_ID", "")
-if not path or not tid: exit(0)
+if not path or not tid: raise SystemExit(0)
 try:
-    with open(path) as f: lines = f.readlines()
-    with open(path, "w") as f:
+    with open(path, encoding="utf-8") as f: lines = f.readlines()
+    with open(path, "w", encoding="utf-8") as f:
         for line in lines:
             parts = line.strip().split(" ", 2)
             if not (len(parts) >= 2 and parts[1] == tid):
                 f.write(line)
 except Exception: pass
 ' 2>/dev/null || true
-    fi
-  done <<< "$_sw_orphans"
+}
+
+# _sweep_stale_resolve_tabs — proactively close STALE resolve·<slug> conflict-resolver tabs (HERD-54).
+# herd-resolve.sh opens a resolve·<slug> tab (registered in $TREES/.herd-tabs) when a PR goes
+# CONFLICTING. Once the resolver DIES/FINISHES and the conflict is gone (the PR merged, closed, or its
+# mergeable state went clean), that tab just lingers — clutter that can also catch the tab-leak-guard's
+# before/after snapshot mid-flap and false-red an innocent PR. This sweep closes such tabs.
+#
+# A resolve tab is STALE only when BOTH hold:
+#   (1) no LIVE resolver agent for its slug — checked via _resolver_agent_alive, the SAME liveness
+#       helper the resolver-respawn path (HERD-55) uses, so the two features never disagree on
+#       "is a resolver alive for this slug"; AND
+#   (2) the slug's PR is no longer CONFLICTING — it is merged/closed (absent from the open-PR list) or
+#       its mergeable state is clean (MERGEABLE). A CONFLICTING PR still needs the resolver, and an
+#       UNKNOWN state (GitHub still computing) is treated conservatively as "still relevant" — neither
+#       is swept.
+# SAFETY MIRRORS HERD-91's OID-guard philosophy: never tear down a live worker. A tab whose resolver
+# agent is still in the roster (working OR just-registered) is ALWAYS spared, so an in-flight resolve —
+# including a fresh respawn — is never closed out from under itself.
+#
+# Runs at startup and before each leak-guard-relevant healthcheck snapshot. Requires AGENTS_JSON to be
+# populated (the tick sets it; the startup call primes it). Idempotent + fully fail-soft: no registry,
+# no herdr, or dry-run ⇒ zero action. One `gh pr list` per invocation; cheap when there are no resolve
+# rows (the common case) — it returns before any network call.
+_sweep_stale_resolve_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _srt_reg="$TREES/.herd-tabs"
+  [ -f "$_srt_reg" ] || return 0
+
+  # (1) resolve·<slug> rows from the tab registry → "slug<TAB>tab_id" lines. No rows ⇒ nothing to do
+  #     (return BEFORE the gh call — the sweep is byte-inert on a workspace with no resolve tabs).
+  local _srt_rows
+  _srt_rows="$(REG="$_srt_reg" python3 -c '
+import os
+prefix = "resolve·"   # the resolve-tab label prefix (middot separator)
+try:
+    with open(os.environ["REG"], encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ")
+            if len(parts) < 2: continue
+            label, tab_id = parts[0], parts[1]
+            if label.startswith(prefix) and tab_id:
+                slug = label[len(prefix):]
+                if slug:
+                    print(slug + "\t" + tab_id)
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [ -n "$_srt_rows" ] || return 0
+
+  # (2) One gh call: map each OPEN PR's slug → its mergeable state. A slug ABSENT from this map has no
+  #     open PR (merged/closed/never-existed) → its conflict is definitively gone.
+  local _srt_prs
+  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | python3 -c '
+import sys, json
+try:
+    for p in json.load(sys.stdin):
+        b = p.get("headRefName","")
+        if b:
+            print(b.split("/")[-1] + "\t" + (p.get("mergeable","") or ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+
+  local _srt_slug _srt_tab _srt_merge _srt_n=0
+  while IFS=$'\t' read -r _srt_slug _srt_tab; do
+    [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
+    # SAFETY: a live resolver agent for this slug is NEVER closed (shared liveness with HERD-55).
+    _resolver_agent_alive "$_srt_slug" && continue
+    # PR still CONFLICTING (or UNKNOWN — GitHub still computing) → the resolve tab is still relevant.
+    _srt_merge="$(printf '%s\n' "$_srt_prs" | awk -F'\t' -v s="$_srt_slug" '$1==s{print $2; exit}')"
+    case "$_srt_merge" in
+      CONFLICTING|UNKNOWN) continue ;;
+    esac
+    # STALE: dead resolver + PR merged/closed/clean → close the tab, prune its registry row, journal.
+    herdr tab close "$_srt_tab" >/dev/null 2>&1 || true
+    journal_append reap_resolve_tab tab_id "$_srt_tab" slug "$_srt_slug" reason stale-sweep
+    _herd_tabs_drop_row "$_srt_reg" "$_srt_tab"
+    _srt_n=$(( _srt_n + 1 ))
+  done <<< "$_srt_rows"
+  return 0
+}
+
+# _sweep_tracker_state — HERD-86 tracker-state self-heal. Runs every _TRACKER_SWEEP_INTERVAL ticks
+# (low frequency; the drift it catches is a rare merge-tail failure, not a per-tick condition). Shells
+# out to the standalone tracker-state-sweep.sh, pointing its ledger + heal-note surfaces at THIS
+# watcher's $TREES files so build_tracker_drift renders any heal. The sweep re-asserts Done for a
+# recently-merged PR whose tracker item drifted (the HERD-67/HERD-69 pattern: stuck open after merge),
+# journals a tracker_state_healed event (component=sweep, HERD-85 attribution), and appends a console
+# note. BEST-EFFORT: it can never fail or slow a tick — inert in dry-run, byte-inert when the backend
+# has no update-state op (the file backend), and cheap when clean (one `gh pr list`, no backend read
+# for any ref already confirmed Done in the ledger). Never merges, never edits BACKLOG.md.
+_sweep_tracker_state() {
+  [ -n "$DRYRUN" ] && return 0
+  [ -f "$HERE/tracker-state-sweep.sh" ] || return 0
+  HERD_TSWEEP_LEDGER="$TRACKER_SWEEP_LEDGER" \
+  HERD_TSWEEP_NOTE_FILE="$TRACKER_HEAL_FILE" \
+    bash "$HERE/tracker-state-sweep.sh" >/dev/null 2>&1 || true
 }
 
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
@@ -1253,7 +2259,7 @@ _wait_agent_working() {
 _handle_block_verdict() {
   local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
   local _hbv_sl _hbv_pn
-  _hbv_sl="$(printf '%-*s' "$SLUGW" "$_hbv_slug")"
+  _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
@@ -1287,11 +2293,27 @@ _handle_block_verdict() {
       _maybe_arm_review_escalation "$_hbv_pr"
       local _hbv_status_before
       _hbv_status_before="$(_agent_status "$_hbv_slug")"
+      # Structured finding (HERD-104): surface the reviewer's rule/why/location so the bounce is
+      # ACTIONABLE — the builder sees WHAT rule broke, WHY, and WHERE, not just "read the PR". Read
+      # the sha-keyed cache written when the BLOCK was collected; fail-soft when it is absent
+      # (legacy ledger row, or an unstructured verdict) — the prompt then omits the finding line.
+      local _hbv_finding="" _hbv_blk _hbv_rule="" _hbv_why="" _hbv_loc=""
+      _hbv_blk="$(_review_block_file "$_hbv_pr" "$_hbv_sha")"
+      if [ -s "$_hbv_blk" ]; then
+        _hbv_rule="$(sed -n 1p "$_hbv_blk" 2>/dev/null)"
+        _hbv_why="$(sed -n 2p "$_hbv_blk" 2>/dev/null)"
+        _hbv_loc="$(sed -n 3p "$_hbv_blk" 2>/dev/null)"
+        [ -n "$_hbv_rule" ] && _hbv_finding="${_hbv_finding}Rule violated: ${_hbv_rule}"$'\n'
+        [ -n "$_hbv_why" ]  && _hbv_finding="${_hbv_finding}Why: ${_hbv_why}"$'\n'
+        [ -n "$_hbv_loc" ]  && _hbv_finding="${_hbv_finding}Location: ${_hbv_loc}"$'\n'
+      fi
       journal_append refix_bounce pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
-        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}"
+        round "$_hbv_round_num" agent_status_before "${_hbv_status_before:-unknown}" \
+        rule "${_hbv_rule:-}" location "${_hbv_loc:-}"
       local _hbv_pane_id _hbv_woke=0 _hbv_escalated=false
       local _hbv_prompt
-      _hbv_prompt="PR #${_hbv_pr} was review-blocked. Read the full review: gh pr view ${_hbv_pr}
+      _hbv_prompt="PR #${_hbv_pr} was review-blocked.
+${_hbv_finding}Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
       # Target the builder's AGENT pane whether it reads idle OR 'done' (never a 'working' one) —
       # a 'done' builder's Claude TUI is still up and waiting, so submitting the raw re-task prompt
@@ -1638,7 +2660,7 @@ _try_clean_limit_menu_select() {
 _handle_limit_blocked() {
   local _lb_slug="$1" _lb_wt="$2" _lb_idx="$3" _lb_reset="${4:-0}"
   local _lb_sl _lb_state _lb_now _lb_target
-  _lb_sl="$(printf '%-*s' "$SLUGW" "$_lb_slug")"
+  _lb_sl="$(_slug_cell "$_lb_slug")"
   _lb_now="$(_now)"
   _lb_state="$(limit_state "$_lb_slug")"
 
@@ -2377,14 +3399,76 @@ _discard_stale_health() {
   done
 }
 
-# record_healthcheck <pr#> <slug> <attempt> <outcome> — append one attempt to the ledger.
+# ── Cache-hit journal de-dup (HERD-72) ──────────────────────────────────────────────────────────────
+# A held/awaiting-verify PR sits on the candidate list every ~6s poll tick with an UNCHANGED head sha,
+# so _healthcheck_gate replays the SAME terminal cache hit each tick (20-60 identical
+# healthcheck_cache_hit lines per PR measured 2026-07-07). That drowns 'herd why <pr>'. The verdict for
+# a fixed sha is terminal and cannot change, so all those repeats carry zero new information.
+# Fix: journal the cache hit only on a TRANSITION — the FIRST hit for a (pr,sha) or any change in the
+# outcome/detail — and suppress identical repeats. A per-PR marker records the last hit we journaled as
+# "<sha>\t<outcome>\t<detail>"; a new commit (different sha) or a changed verdict differs from it and
+# re-journals, an identical replay matches and is skipped. Keyed by PR alone, so it self-overwrites (no
+# stale-marker sweep needed). The emitted event's shape/fields are IDENTICAL to the pre-dedup call, so
+# 'herd why' / 'herd log' parsing is unaffected — this only removes duplicate lines.
+_health_cachehit_file() { printf '%s' "$TREES/.health-cachehit-$1"; }
+
+# _journal_cache_hit <pr#> <slug> <sha> <outcome> [detail] — emit healthcheck_cache_hit ONCE per
+# transition (see above). Best-effort like journal_append itself; a marker it cannot write just means
+# the next identical hit re-journals (fail toward MORE logging, never toward a broken gate).
+_journal_cache_hit() {
+  local _jc_pr="$1" _jc_slug="$2" _jc_sha="$3" _jc_outcome="$4" _jc_detail="${5:-}"
+  local _jc_marker _jc_cur _jc_prev
+  _jc_marker="$(_health_cachehit_file "$_jc_pr")"
+  _jc_cur="$_jc_sha"$'\t'"$_jc_outcome"$'\t'"$_jc_detail"
+  if [ -f "$_jc_marker" ]; then
+    IFS= read -r _jc_prev < "$_jc_marker" 2>/dev/null || _jc_prev=""
+    [ "$_jc_prev" = "$_jc_cur" ] && return 0
+  fi
+  if [ -n "$_jc_detail" ]; then
+    journal_append healthcheck_cache_hit pr "$_jc_pr" slug "$_jc_slug" sha "$_jc_sha" outcome "$_jc_outcome" detail "$_jc_detail"
+  else
+    journal_append healthcheck_cache_hit pr "$_jc_pr" slug "$_jc_slug" sha "$_jc_sha" outcome "$_jc_outcome"
+  fi
+  printf '%s\n' "$_jc_cur" > "$_jc_marker" 2>/dev/null || true
+}
+
+# _health_fail_identity <healthcheck-oneline> — distil WHICH test/step failed from a healthcheck
+# --oneline CODE-ERROR line, so a FLAKY run (fail-then-pass) still records its offender before the
+# passing retry's output would otherwise be all that survives (HERD-76). The runner only ever
+# captures the single --oneline row, so that row IS the failing run's output — this just extracts
+# the salient identity from it (no extra suite work, zero gate behavior change):
+#   • strip the leading glyph + classifier prefix ("❌ code error — ", "light syntax — ", …) to the
+#     failing REASON after the first em-dash;
+#   • prefer concrete test/source file token(s) named in that reason (deduped, comma-joined) — the
+#     "failed=<file>" the deflake investigation needs;
+#   • fall back to the reason text itself (the failing STEP) for a non-test error that names no file.
+# Bounded to 200 chars so a pathological reason can never bloat a journal line past PIPE_BUF.
+_health_fail_identity() {
+  local _hf_line="$1" _hf_reason _hf_files
+  _hf_reason="${_hf_line#*— }"                       # everything after the first "— " separator …
+  [ "$_hf_reason" = "$_hf_line" ] && _hf_reason="$_hf_line"   # … or the whole line if there is none
+  _hf_files="$(printf '%s\n' "$_hf_reason" \
+    | grep -oE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null \
+    | awk '!seen[$0]++' | paste -sd, - 2>/dev/null)"
+  local _hf_id="${_hf_files:-$_hf_reason}"
+  # Collapse any stray newlines and trim surrounding whitespace, then cap the length.
+  _hf_id="$(printf '%s' "$_hf_id" | tr '\n' ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "${_hf_id:0:200}"
+}
+
+# record_healthcheck <pr#> <slug> <attempt> <outcome> [failed-identity] — append one attempt to the
+# ledger. When the outcome is a code error, [failed-identity] carries WHICH test/step failed (from
+# _health_fail_identity) and is journaled as failed=<id> so a later FLAKY-collapsed offender is still
+# identifiable. The ledger line is unchanged (5 fields) — identity lives in the journal only.
 record_healthcheck() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HEALTH_STATE"
   # Journal each attempt: attempt 1 is the initial run, attempt ≥2 is a solo retry-before-red.
-  if [ "${3:-1}" -le 1 ] 2>/dev/null; then
-    journal_append healthcheck_attempted pr "$1" slug "$2" attempt "$3" result "$4"
+  local _rh_event=healthcheck_attempted
+  [ "${3:-1}" -le 1 ] 2>/dev/null || _rh_event=healthcheck_retried
+  if [ -n "${5:-}" ]; then
+    journal_append "$_rh_event" pr "$1" slug "$2" attempt "$3" result "$4" failed "$5"
   else
-    journal_append healthcheck_retried pr "$1" slug "$2" attempt "$3" result "$4"
+    journal_append "$_rh_event" pr "$1" slug "$2" attempt "$3" result "$4"
   fi
 }
 
@@ -2402,7 +3486,7 @@ record_healthcheck() {
 _healthcheck_gate() {
   local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4" _hg_sha="${5:-}"
   local _hg_sl _hg_pn
-  _hg_sl="$(printf '%-*s' "$SLUGW" "$_hg_slug")"
+  _hg_sl="$(_slug_cell "$_hg_slug")"
   _hg_pn=" ${C_DIM}#${_hg_pr}${C_RESET} ·"
 
   # SHA-CACHE CHECK (before any suite work): an UNCHANGED commit cannot yield a different verdict.
@@ -2418,17 +3502,17 @@ _healthcheck_gate() {
       case "$_hg_cv" in
         CLEAN)
           _HC_RESULT="CLEAN"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CLEAN
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" CLEAN
           return 0 ;;
         FLAKY)
           DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
           _HC_RESULT="FLAKY"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome FLAKY
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" FLAKY
           return 0 ;;
         CODEERROR)
           DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_cd}${C_RESET}"
           _HC_RESULT="CODEERROR"
-          journal_append healthcheck_cache_hit pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" outcome CODEERROR detail "$_hg_cd"
+          _journal_cache_hit "$_hg_pr" "$_hg_slug" "$_hg_sha" CODEERROR "$_hg_cd"
           return 0 ;;
       esac
     fi
@@ -2441,6 +3525,12 @@ _healthcheck_gate() {
     return 0
   fi
   _health_acquire "$_hg_pr"
+
+  # LEAK-GUARD SNAPSHOT POINT (HERD-54): the healthcheck suite's tab-leak-guard snapshots the live
+  # workspace BEFORE it runs, so proactively close any stale resolve·<slug> tab first — a dead/finished
+  # resolver whose PR is no longer CONFLICTING must not sit in that before-snapshot (clutter / flap).
+  # Fail-soft; a live resolver is always spared (shared liveness with the resolver-respawn path).
+  _sweep_stale_resolve_tabs
 
   DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check${C_RESET}"
   render
@@ -2461,7 +3551,11 @@ _healthcheck_gate() {
 
   # rc 1: a CODE ERROR. RETRY-BEFORE-RED: re-run ONCE, solo, still holding the mutex. A transient
   # from cross-worktree lock contention self-heals; only a reproducing failure is real.
-  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error"
+  # Capture WHICH test/step failed NOW, from this attempt's output, BEFORE the retry overwrites it —
+  # else a FLAKY collapse (pass on retry) leaves only 'result=code-error' and the offender is lost
+  # (HERD-76: this blocked the deflake investigation for #185/#188).
+  local _hg_failed; _hg_failed="$(_health_fail_identity "$_hg_hc")"
+  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_failed"
   DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · code error — retrying once (solo)${C_RESET}"
   render
   local _hg_hc2 _hg_rc2
@@ -2473,11 +3567,17 @@ _healthcheck_gate() {
     record_health_result "$_hg_pr" "$_hg_sha" "FLAKY"
     DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
     _HC_RESULT="FLAKY"
-    journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
+    # Carry the offender captured from the FAILING attempt onto the FLAKY outcome — the whole point
+    # of HERD-76: a passing retry must not erase which test flaked.
+    if [ -n "$_hg_failed" ]; then
+      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY failed "$_hg_failed"
+    else
+      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
+    fi
     return 0
   fi
   # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
-  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error"
+  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error" "$(_health_fail_identity "$_hg_hc2")"
   _health_release "$_hg_pr"
   # A tab-leak-guard CODEERROR is INFRA/TRANSIENT, not a code bug (issue #78 part 2): a concurrent
   # SAME-workspace sibling builder tab flickering non-idle during the healthcheck window can trip the
@@ -2777,6 +3877,63 @@ else
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
+# ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
+# _spawn_dep_merged <after> — is a spawn intent's after=<slug|pr#> dependency MERGED? Returns 0 (met)
+# for an EMPTY dependency (an intent with no after= is trivially releasable — the byte-identical path).
+# Otherwise consult the SAME source _startup_reap_sweep trusts: the reap ledger $STATE, whose rows are
+# "<epoch> <pr#> <slug> [ref]". A numeric dependency matches the PR column ($2); a slug matches the
+# slug column ($3). If the ledger has no record (e.g. a collaborator/main-checkout merge this watcher
+# never ledgered), FALL BACK to exactly one gh check: a PR number by itself, a slug by its feat/<slug>
+# branch. Any non-MERGED / gh-unreachable result => not met (0/return 1) so the intent stays held —
+# a held intent is loud (the stalled row), never a silently-dropped one.
+_spawn_dep_merged() {
+  local _sdm_after="${1:-}"
+  [ -n "$_sdm_after" ] || return 0
+  if [ -s "$STATE" ]; then
+    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then
+      awk -v p="$_sdm_after" 'NF>=2 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    else
+      awk -v s="$_sdm_after" 'NF>=3 && $3==s{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    fi
+  fi
+  # Fallback: one gh state read (the ledger is authoritative for THIS watcher's merges but blind to a
+  # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
+  [ -z "${DRYRUN:-}" ] || return 1
+  local _sdm_target
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="feat/$_sdm_after"; fi
+  [ "$(gh pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
+  return 1
+}
+
+# _spawn_held_epoch <intent_id> — echo the first-held epoch recorded for this intent (empty if none).
+_spawn_held_epoch() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  awk -v id="$1" '$1==id{e=$2} END{if(e)print e}' "$SPAWN_HELD_STATE" 2>/dev/null
+}
+
+# _spawn_mark_held <intent_id> <slug> <lane> <after> — record a hold the FIRST time only, journaling
+# spawn_held ONCE with the dependency named. Idempotent across ticks: a row already present (the intent
+# was held on a prior tick and released back to .req) is left untouched, so the stall TTL keeps accruing
+# from the original hold and spawn_held is never re-journaled tick-over-tick.
+_spawn_mark_held() {
+  local _smh_id="$1" _smh_slug="$2" _smh_lane="$3" _smh_after="$4"
+  [ -n "$(_spawn_held_epoch "$_smh_id")" ] && return 0
+  printf '%s %s %s %s %s\n' "$_smh_id" "$(date +%s)" "$_smh_slug" "$_smh_lane" "$_smh_after" >> "$SPAWN_HELD_STATE"
+  journal_append spawn_held slug "$_smh_slug" lane "$_smh_lane" after "$_smh_after"
+}
+
+# _spawn_clear_held <intent_id> — drop this intent's hold row (dependency met / spawned / skipped). A
+# no-op when no row exists, so calling it on an intent that was never held is harmless.
+_spawn_clear_held() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  local _sch_tmp; _sch_tmp="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v id="$1" '$1!=id' "$SPAWN_HELD_STATE" > "$_sch_tmp" 2>/dev/null; then
+    mv -f "$_sch_tmp" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$_sch_tmp" 2>/dev/null
+  else
+    rm -f "$_sch_tmp" 2>/dev/null
+  fi
+}
+
 # ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
 # _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
 # ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
@@ -2795,6 +3952,15 @@ fi
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
 # post-mortem can answer "why did nothing spawn?" from `herd log` alone.
 #
+# DEPENDENCY ORDERING (HERD-94): an intent may carry an after=<slug|pr#> (the .after sidecar, surfaced
+# as the 4th claim line). While that dependency is NOT yet MERGED the intent is HELD: it stays claimed
+# (.req.mine) for THIS tick so `next` skips past it to younger, independent intents — one stalled
+# dependency never freezes the whole queue — and every held intent is RELEASED back to .req at the end
+# of the tick to be re-checked next time. The hold is journaled spawn_held ONCE (via $SPAWN_HELD_STATE)
+# and surfaces on the console (build_spawn_holds), going LOUD (stalled) past DEP_STALE_TTL. When the
+# dependency finally merges the intent spawns in the same FIFO order it would have without after=, and
+# spawn_released is journaled. Intents with NO after= are byte-identical to the pre-HERD-94 path.
+#
 # The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
 # multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
 #
@@ -2812,15 +3978,19 @@ _drain_spawn_queue() {
   _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
   [ "$_dsq_budget" -le 0 ] && return 0
 
-  local _dsq_n=0
+  local _dsq_n=0 _dsq_held=()
   while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
     # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
-    # Slug and lane are the first two payload lines; the task is EVERYTHING after them.
-    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_task=""
+    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), after
+    # dependency (HERD-94; empty for none), then the task as EVERYTHING after them. The ref AND after
+    # lines are ALWAYS present so this positional read stays fixed.
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_after="" _dsq_task=""
     {
       IFS= read -r _dsq_line1
       IFS= read -r _dsq_slug
       IFS= read -r _dsq_lane
+      IFS= read -r _dsq_ref
+      IFS= read -r _dsq_after
       _dsq_task="$(cat)"
     } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
 
@@ -2841,12 +4011,32 @@ _drain_spawn_queue() {
             journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "unknown lane"
             _dsq_n=$(( _dsq_n + 1 )); continue ;;
         esac
+        # HERD-94 dependency hold: an intent with after=<slug|pr#> waits until that dependency shows
+        # MERGED. Unmet → DEFER: keep the claim (so this tick's later `next` calls skip it) and stash it
+        # for an end-of-tick release; record + journal the hold ONCE. Crucially we do NOT spend budget
+        # (_dsq_n unchanged) or `break`, so independent younger intents keep draining past a held one.
+        local _dsq_id; _dsq_id="$(basename "${_dsq_claimed%.req.mine}")"
+        if [ -n "$_dsq_after" ] && ! _spawn_dep_merged "$_dsq_after"; then
+          _spawn_mark_held "$_dsq_id" "$_dsq_slug" "$_dsq_lane" "$_dsq_after"
+          _dsq_held+=("$_dsq_claimed")
+          continue
+        fi
+        # Dependency met (or none). If this intent had been held on a prior tick, announce the release
+        # (spawn_released, dependency named) and clear its hold row before it spawns below.
+        if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
+          journal_append spawn_released slug "$_dsq_slug" lane "$_dsq_lane" after "$_dsq_after"
+          _spawn_clear_held "$_dsq_id"
+        fi
         # Launch the lane in the FOREGROUND and observe the outcome before consuming the intent.
+        # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
+        # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
+        # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
+        # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
         local _dsq_out="" _dsq_rc=0
         if [ "$_dsq_lane" = "feature" ]; then
-          _dsq_out="$(bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
         else
-          _dsq_out="$(bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
+          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
         fi
         if [ "$_dsq_rc" -eq 0 ] && printf '%s' "$_dsq_out" | grep -q 'review-gate saturated'; then
           # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent
@@ -2868,15 +4058,46 @@ _drain_spawn_queue() {
         ;;
     esac
   done
+  # Release every dependency-held intent back to .req for a later tick. They were kept claimed only so
+  # `next` skipped them this tick; releasing preserves the .after (+ .ref) sidecar so the hold — and its
+  # accruing stall TTL — survives. Order is preserved: they re-enter under their original INTENT_ID
+  # filenames, which sort oldest-first, so FIFO among releasable intents holds.
+  if [ "${#_dsq_held[@]}" -gt 0 ]; then
+    local _dsq_h
+    for _dsq_h in "${_dsq_held[@]}"; do
+      bash "$HERE/spawn-step.sh" release "$_dsq_h" >/dev/null 2>&1 || true
+    done
+  fi
 }
 
 _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
+_TRACKER_SWEEP_TICK=0
+_TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+
+# One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
+# (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
+# stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
+_startup_reap_sweep
+
+# One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
+# or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
+# panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
+# Byte-inert when there are no reviewer rows (the common startup) — no journal line, no pane touched.
+_sweep_reviewer_registry
+
+# One-shot at STARTUP: proactively close any STALE resolve·<slug> conflict-resolver tab (HERD-54) —
+# a resolver that died/finished for a slug whose PR is no longer CONFLICTING. Prime AGENTS_JSON first
+# so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
+AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
+_sweep_stale_resolve_tabs
 
 while true; do
   build_header
   build_landed
   build_blocked
+  build_tracker_drift
+  build_spawn_holds
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
@@ -2925,13 +4146,13 @@ for wt, branch in feats:
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=()
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
 $rec
 EOF
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     if [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
@@ -3003,24 +4224,9 @@ EOF
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
-      if resolver_attempted "$branch" "$headsha"; then
-        # A resolver ALREADY ran for THIS exact head sha and the PR is still conflicting → terminal for
-        # this commit (the resolve failed, or it ESCALATE:d a semantically-ambiguous conflict and aborted
-        # without pushing, so the head is unchanged). Never re-spawn on the same sha — a new commit is
-        # what unsticks it.
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
-      elif [ "$(resolve_attempt_count "$branch")" -ge "$_RESOLVE_RETRY_MAX" ]; then
-        # Cross-sha retry cap hit: a resolver has already run across $_RESOLVE_RETRY_MAX distinct commits
-        # and each new head is STILL conflicting. Stop churning and ask a human rather than re-spawning
-        # for every fresh sha forever.
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed (retry cap)${C_RESET}"
-      else
-        # Either the FIRST conflict for this branch, or a NEW commit landed on a still-conflicting PR
-        # after a prior (now-stale) attempt at a different sha. Either way (re-)spawn the resolver for
-        # this sha — the resolve pass paints the fresh vs retry reason and records the attempt.
-        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
-        CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch"); CONF_SHA+=("$headsha")
-      fi
+      # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
+      # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
+      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
     elif [ "$mergeable" = "MERGEABLE" ]; then
       # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
       # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
@@ -3041,8 +4247,31 @@ EOF
   for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}; do
     dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; candsha="${CAND_SHA[j]}"; j=$((j + 1))
     already_merged "$prnum" "$slug" && continue
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+
+    # INFRA CIRCUIT BREAKER (HERD-110): when consecutive non-verdict reviewer deaths (a claude
+    # exec-hang / env failure — NEVER a real BLOCK verdict) have tripped the GLOBAL breaker, STOP
+    # dispatching new gates into a dead env. Byte-inert unless INFRA_BREAKER_MAX is set. A BLOCKED
+    # candidate is skipped entirely (no health, no review) with a loud row; a PROBE (half-open) falls
+    # through to dispatch normally as the single recovery probe.
+    case "$(_breaker_gate "$prnum")" in
+      BLOCKED)
+        DISPLAY[idx]="    ${C_RED}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}infra circuit open — environment looks dead · cooldown $(_breaker_cooldown_remaining)s${C_RESET}"
+        render
+        continue ;;
+      PROBE)
+        DISPLAY[idx]="    ${C_YELLOW}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}infra circuit half-open · probing environment…${C_RESET}"
+        render ;;
+      *) : ;;
+    esac
+
+    # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
+    # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap
+    # instead of running serially (review only after health lands). Byte-inert under the default serial
+    # mode. The merge decision downstream is UNCHANGED — it still requires BOTH the healthcheck AND a
+    # review PASS; this only overlaps their wall-clock. See _predispatch_review_if_parallel.
+    _predispatch_review_if_parallel "$prnum" "$slug" "$candsha"
 
     # SERIALIZED, retry-before-red healthcheck: never runs a suite that overlaps another (they
     # share one git object store and race on shared .git locks), and only paints red on a CODE
@@ -3255,13 +4484,13 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     esac
   done
 
-  # Resolve pass: auto-spawn the isolated conflict resolver for each (re-)conflicting PR. A PR reaches
-  # here only when NO resolver has run for its CURRENT head sha (the same-sha guard filters it out in
-  # the classify pass), so this is either a first conflict or a stale prior attempt at an older sha.
+  # Resolve pass: auto-(re)spawn the isolated conflict resolver for each queued CONFLICTING PR. A
+  # `first` reason is today's newly-conflicting spawn; `new-commit` / `dead-resolver` are HERD-55
+  # RESPAWNS (a new sha reshaped the conflict, or the prior resolver died) — journaled resolver_respawn.
   k=0
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
-    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; consha="${CONF_SHA[k]}"; k=$((k + 1))
-    sl="$(printf '%-*s' "$SLUGW" "$slug")"
+    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
+    sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
     # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
@@ -3269,13 +4498,24 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     _retry_reason="resolving conflict…"
     resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
     if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum} (${_retry_reason})${C_RESET}"
+      if [ "$creason" = "first" ]; then
+        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
+      else
+        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would re-spawn resolver for PR #${prnum} (${creason})${C_RESET}"
+      fi
       render
       continue
     fi
-    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}${_retry_reason}${C_RESET}"
+    if [ "$creason" != "first" ]; then
+      _rr_round="$(( $(resolver_dispatch_count "$prnum") + 1 ))"
+      journal_append resolver_respawn pr "$prnum" slug "$slug" \
+        old_sha "$(resolver_last_sha "$prnum")" new_sha "$csha" reason "$creason" round "$_rr_round"
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}re-resolving conflict (round ${_rr_round})…${C_RESET}"
+    else
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    fi
     render
-    spawn_resolver "$slug" "$prnum" "$branch" "$consha"
+    spawn_resolver "$slug" "$prnum" "$branch" "$csha"
   done
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
@@ -3290,6 +4530,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   if [ "$_ORPHAN_SWEEP_TICK" -ge "$_ORPHAN_SWEEP_INTERVAL" ]; then
     _ORPHAN_SWEEP_TICK=0
     _sweep_orphan_tabs
+  fi
+
+  # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
+  # recently-merged PR whose tracker item drifted (stuck open after merge). Cheap + advisory.
+  _TRACKER_SWEEP_TICK=$((_TRACKER_SWEEP_TICK + 1))
+  if [ "$_TRACKER_SWEEP_TICK" -ge "$_TRACKER_SWEEP_INTERVAL" ]; then
+    _TRACKER_SWEEP_TICK=0
+    _sweep_tracker_state
   fi
 
   sleep 4

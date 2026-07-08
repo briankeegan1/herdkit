@@ -19,6 +19,10 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS+1)); }
 
 GQLLOG="$T/gql.log"
+# HERD-85: a stub journal_append lets us assert the tracker_write attribution event WITHOUT sourcing
+# the real journal.sh — mirroring how _linear_gql is stubbed. Each call logs its raw args (one line),
+# so a test can grep the event name, ref, requested state, component, result, and pr.
+JLOG="$T/journal.log"
 
 # Default workflow-state nodes the states(filter:) stub returns. A test can override it by setting
 # STATES_NODES in the environment (used to script a workspace with MULTIPLE started/completed states).
@@ -50,16 +54,26 @@ export LINEAR_TEAM_ID="team_xyz"
 # matched BEFORE the generic issues( fallthrough.
 run() {
   ( cd "$T" && . "$BACKEND"
+    # Stub journal_append (HERD-85): record each tracker_write call's args so the attribution shape is
+    # assertable. Defined here so the backend's `command -v journal_append` guard sees it and fires.
+    journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
     _linear_gql() {
       printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
       case "$1" in
         *issueCreate*)      echo '{"data":{"issueCreate":{"success":true,"issue":{"id":"iss_1","identifier":"ENG-42","url":"https://linear.app/acme/issue/ENG-42"}}}}' ;;
         *commentCreate*)    echo '{"data":{"commentCreate":{"success":true}}}' ;;
-        *issueUpdate*)      echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+        *issueUpdate*)      echo "{\"data\":{\"issueUpdate\":{\"success\":${ISSUEUPDATE_SUCCESS:-true}}}}" ;;
         *"states(filter"*)  echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"identifier\":\"ENG-7\",\"title\":\"first open issue\",\"team\":{\"states\":{\"nodes\":${STATES_NODES:-$DEFAULT_STATE_NODES}}}}]}}}" ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
-        *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
+        *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","url":"https://linear.app/acme/issue/ENG-7","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"url":"https://linear.app/acme/issue/ENG-9","state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
+        # HERD-52 planned markers: unqueue resolves id + comment ids/bodies; list_queued reads
+        # per-issue comment bodies; commentDelete removes a marker; queue resolves just id+identifier.
+        # These specific comment/id shapes MUST precede the generic issues( fallthrough below.
+        *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"},{"id":"cmt_other","body":"an unrelated comment"}]}}]}}}' ;;
+        *"comments { nodes { body } }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]}},{"identifier":"ENG-9","comments":{"nodes":[{"body":"just a regular note"}]}}]}}}' ;;
+        *commentDelete*)    echo '{"data":{"commentDelete":{"success":true}}}' ;;
+        *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7"}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -79,6 +93,43 @@ echo "$out" | grep -q "https://linear.app/acme/issue/ENG-42" || fail "add_item d
 grep -q "issueCreate" "$GQLLOG" || fail "add_item did not issue an 'issueCreate' mutation"
 grep -q "add a dark-mode toggle" "$GQLLOG" || fail "add_item did not pass the request text as the issue title/body"
 grep -q "team_xyz" "$GQLLOG" || fail "add_item did not target the configured team (teamId)"
+pass
+
+# 1b. HERD-77 (short titles): a long single-line add must yield a SHORT title (<=100 chars) but keep
+#     the FULL text as the description — never the old "first-line-as-essay" where a one-paragraph
+#     request became a giant title duplicated in the body (user complaint 2026-07-07; 7 hand-renames).
+#     Build a 500+char single line, run add_item, then parse the issueCreate VARS out of the log and
+#     assert BOTH halves.
+: > "$GQLLOG"
+BIG="$(python3 -c 'print("Add a really important feature " + "x"*470)')"   # 501 chars, no newline
+out="$(run _backend_add_item REQ2 "$BIG")"
+echo "$out" | grep -q "RESULT=DONE" || fail "add_item (long) did not report DONE ($out)"
+python3 - "$GQLLOG" <<'PY' || fail "add_item (long) title/description lengths wrong"
+import sys, json, re
+log = open(sys.argv[1]).read()           # one issueCreate round-trip; QUERY text is multi-line
+m = re.findall(r"VARS<<(.*?)>>", log, re.S)
+assert m, "no issueCreate VARS logged"
+v = json.loads(m[-1])
+title, desc = v["title"], v["description"]
+assert len(title) <= 100, "title too long: %d chars" % len(title)
+assert len(desc) >= 500, "description not full-length: %d chars" % len(desc)
+assert len(desc) > len(title), "description must be the FULL text, not the truncated title"
+PY
+pass
+
+# 1c. HERD-77: a long first line with a clause boundary derives the title from the FIRST clause
+#     (split on ' — '), not a blind mid-word cut — the title reads as a real summary.
+: > "$GQLLOG"
+CLAUSE="Backends derive a short title — $(python3 -c 'print("y"*300)')"
+run _backend_add_item REQ3 "$CLAUSE" >/dev/null
+python3 - "$GQLLOG" <<'PY' || fail "add_item clause-split title wrong"
+import sys, json, re
+m = re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)
+assert m, "no issueCreate VARS logged"
+t = json.loads(m[-1])["title"]
+assert t.startswith("Backends derive a short title"), "clause not used as title: %r" % t
+assert len(t) <= 100, "clause title too long: %d chars" % len(t)
+PY
 pass
 
 # 2. list_open (team scoped ON) → an issues() query filtered to the configured team, parsed to
@@ -102,21 +153,22 @@ echo "$open2" | grep -q "^#ENG-7 first open issue$" || fail "list_open (no team)
 pass
 
 # 2c. list_open_rich → same open filter as list_open but also requests state {name type} +
-#     description + assignee {displayName}, emits TSV
-#     ("#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>"), sorts
-#     started-first, and flattens description whitespace (a raw newline would corrupt the TSV).
+#     description + url + assignee {displayName}, emits TSV
+#     ("#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>"), sorts
+#     started-first, and flattens description whitespace (a raw newline would corrupt the TSV). The
+#     trailing <url> (HERD-49) feeds backlog-view.sh's OSC 8 chip hyperlink.
 TAB="$(printf '\t')"
 : > "$GQLLOG"
 rich="$(run _backend_list_open_rich)"
-grep -q "description state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + state name/type"
+grep -q "description url state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + url + state name/type"
 grep -q "assignee { displayName }" "$GQLLOG" || fail "list_open_rich did not request assignee displayName"
 grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open_rich (team set) did not scope the query to the team"
 echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
   || fail "list_open_rich did not sort the started (in-progress) issue first ($rich)"
-echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase$" \
-  || fail "list_open_rich TSV shape wrong for ENG-9 (should have assignee Chase as 6th field) ($rich)"
-echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}$" \
-  || fail "list_open_rich did not flatten the multi-line description; unassigned item must have empty trailing field ($rich)"
+echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://linear.app/acme/issue/ENG-9$" \
+  || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th field, url 7th field) ($rich)"
+echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}${TAB}https://linear.app/acme/issue/ENG-7$" \
+  || fail "list_open_rich did not flatten desc / place empty assignee then url; ENG-7 shape wrong ($rich)"
 pass
 
 # 2d. show_item → single-issue detail via issues(filter:) (never issueSearch): identifier + live
@@ -258,6 +310,145 @@ us6="$( STATES_NODES='[{"id":"st_dup","name":"Duplicate","position":2},{"id":"st
 echo "$us6" | grep -q "RESULT=DONE" || fail "update_state (multi completed) did not report DONE ($us6)"
 grep -q "st_done" "$GQLLOG" || fail "update_state (multi completed) did not pick the 'Done' state by NAME (gh #169)"
 grep -q "st_dup"  "$GQLLOG" && fail "update_state (multi completed) picked 'Duplicate' — gh #169 regression"
+pass
+
+# 4j. VERIFIED MUTATION (HERD-70): update_state reports DONE only when the final issueUpdate CONFIRMS
+#     success:true. A transiently-FAILED mutation (stub returns success:false) must be NOCHANGE — NOT an
+#     optimistic DONE — so agent-watch's _reconcile_via_ref returns non-zero and falls back to the fuzzy
+#     scribe retry instead of journaling a false verified transition (the PR #187/HERD-67 incident).
+: > "$GQLLOG"
+usf="$( ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done 2>/dev/null )"
+echo "$usf" | grep -q "RESULT=NOCHANGE" || fail "update_state must return NOCHANGE when issueUpdate is not confirmed ($usf)"
+grep -q "issueUpdate" "$GQLLOG" || fail "update_state (failed mutation) should still ATTEMPT the issueUpdate before reporting NOCHANGE"
+grep -q "issueCreate" "$GQLLOG" && fail "update_state (failed mutation) must NOT fall back to filing a new issue"
+pass
+
+# 4k. HERD-70: the same verification guards mark_shipped — a failed Done-move issueUpdate is NOCHANGE,
+#     never a false 'shipped', even though the PR-link comment already posted.
+: > "$GQLLOG"
+shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
+echo "$shipf" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
+grep -q "commentCreate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still post the PR-link comment"
+grep -q "issueUpdate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still ATTEMPT the Done-move issueUpdate"
+pass
+
+# 7. HERD-85 attribution — a state write journals ONE tracker_write event carrying the ref, the
+#    requested state, the component (from HERD_COMPONENT), the result, and the backend. update_state
+#    under HERD_COMPONENT=reconcile with a PR in $HERD_TW_PR must record all of it.
+: > "$GQLLOG"; : > "$JLOG"
+HERD_COMPONENT=reconcile HERD_TW_PR=42 run _backend_update_state ENG-7 done >/dev/null
+[ "$(grep -c '^tracker_write ' "$JLOG")" = "1" ] || fail "update_state must journal EXACTLY ONE tracker_write event ($(cat "$JLOG"))"
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "ref ENG-7"           || fail "tracker_write missing 'ref ENG-7' ($tw)"
+echo "$tw" | grep -q "requested done"      || fail "tracker_write missing 'requested done' ($tw)"
+echo "$tw" | grep -q "component reconcile" || fail "tracker_write did not attribute the component from HERD_COMPONENT ($tw)"
+echo "$tw" | grep -q "result DONE"         || fail "tracker_write did not record the verified result ($tw)"
+echo "$tw" | grep -q "backend linear"      || fail "tracker_write missing the backend field ($tw)"
+echo "$tw" | grep -q "pr 42"               || fail "tracker_write did not carry the PR from HERD_TW_PR ($tw)"
+pass
+
+# 7b. Attribution defaults to 'manual' when no HERD_COMPONENT is set (a hand-run backend op), and
+#     omits the pr field when neither a pr arg nor $HERD_TW_PR is present.
+: > "$JLOG"
+( unset HERD_COMPONENT HERD_TW_PR; run _backend_update_state ENG-7 in-progress ) >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "component manual"  || fail "tracker_write did not default the component to 'manual' ($tw)"
+echo "$tw" | grep -q "requested in-progress" || fail "tracker_write did not record the requested in-progress state ($tw)"
+echo "$tw" | grep -q " pr "               && fail "tracker_write must omit the pr field when no PR is known ($tw)"
+pass
+
+# 7c. A NON-confirmed write (issueUpdate success:false) still journals — with result NOCHANGE — so a
+#     failed transition is attributable, not silent (the HERD-67 In-Progress-after-merge diagnosis gap).
+: > "$JLOG"
+HERD_COMPONENT=scribe ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done >/dev/null 2>&1
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "component scribe" || fail "tracker_write did not attribute the scribe component ($tw)"
+echo "$tw" | grep -q "result NOCHANGE"  || fail "an unconfirmed write must journal result NOCHANGE ($tw)"
+pass
+
+# 7d. mark_shipped journals a tracker_write with the PR link and requested 'shipped'.
+: > "$JLOG"
+HERD_COMPONENT=reconcile run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/3 >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "requested shipped" || fail "mark_shipped tracker_write missing 'requested shipped' ($tw)"
+echo "$tw" | grep -q "pr https://github.com/acme/widgets/pull/3" || fail "mark_shipped tracker_write did not carry the PR ($tw)"
+echo "$tw" | grep -q "component reconcile" || fail "mark_shipped did not attribute the component ($tw)"
+pass
+
+# 7e. FAIL-SOFT: when journal_append is UNDEFINED (journal.sh never sourced), the write still succeeds
+#     and nothing is journaled — a journal problem never blocks or alters the state write. Source the
+#     backend WITHOUT a journal_append stub so the backend's `command -v journal_append` guard finds none.
+: > "$JLOG"
+out="$(
+  cd "$T" && . "$BACKEND"
+  _linear_gql() {
+    if [ "${1#*states\(filter}" != "$1" ]; then
+      echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"team\":{\"states\":{\"nodes\":$DEFAULT_STATE_NODES}}}]}}}"
+    else
+      echo '{"data":{"issueUpdate":{"success":true}}}'
+    fi
+  }
+  _BACKEND_RESULT=""
+  _backend_update_state ENG-7 done
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+echo "$out" | grep -q "RESULT=DONE" || fail "update_state must still succeed with journal_append undefined ($out)"
+[ ! -s "$JLOG" ] || fail "no tracker_write should be written when journal_append is undefined ($(cat "$JLOG"))"
+pass
+
+# 8. HERD-52 queue_item → resolves the issue id, then commentCreate's a 📌 planned marker carrying
+#    who + "sequenced after <blocker>" + a [<epoch>] timestamp. Reports DONE.
+: > "$GQLLOG"
+q="$(run _backend_queue_item ENG-7 alice ENG-9)"
+echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
+grep -q "commentCreate" "$GQLLOG" || fail "queue_item did not post the marker via commentCreate"
+grep -q "queued by alice" "$GQLLOG" || fail "queue_item marker did not name the operator (who)"
+grep -q "sequenced after ENG-9" "$GQLLOG" || fail "queue_item marker did not record the blocker"
+grep -qE '\[[0-9]+\]' "$GQLLOG" || fail "queue_item marker did not embed a [<epoch>] timestamp"
+pass
+
+# 8a. queue_item with NO blocker → marker says "sequenced next", still DONE.
+: > "$GQLLOG"
+qn="$(run _backend_queue_item ENG-7 alice "")"
+echo "$qn" | grep -q "RESULT=DONE" || fail "queue_item (no blocker) did not report DONE ($qn)"
+grep -q "sequenced next" "$GQLLOG" || fail "queue_item (no blocker) did not fall back to 'sequenced next'"
+pass
+
+# 8b. queue_item on an unparseable ref → NOCHANGE, no commentCreate (nothing to mark).
+: > "$GQLLOG"
+qbad="$(run _backend_queue_item nodashhere alice ENG-9 2>/dev/null)"
+echo "$qbad" | grep -q "RESULT=NOCHANGE" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
+grep -q "commentCreate" "$GQLLOG" && fail "queue_item on an unparseable ref should post no comment"
+pass
+
+# 8c. list_queued → reads each open issue's comments and prints ONE TSV line per 📌 marker
+#     ("#<id>\t<who>\t<detail>\t<epoch>"); a non-marker comment (ENG-9's) is ignored.
+: > "$GQLLOG"
+lq="$(run _backend_list_queued)"
+grep -q "comments { nodes { body } }" "$GQLLOG" || fail "list_queued did not request per-issue comment bodies"
+echo "$lq" | grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" \
+  || fail "list_queued did not emit the parsed marker TSV for ENG-7 ($lq)"
+echo "$lq" | grep -q "^#ENG-9" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
+pass
+
+# 8d. unqueue_item → resolves the issue's comments and commentDelete's ONLY the 📌 marker (cmt_mark),
+#     never the unrelated comment (cmt_other). Reports DONE.
+: > "$GQLLOG"
+uq="$(run _backend_unqueue_item ENG-7 alice)"
+echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
+grep -q "commentDelete" "$GQLLOG" || fail "unqueue_item did not delete the marker via commentDelete"
+grep -q '"id": "cmt_mark"' "$GQLLOG" || fail "unqueue_item did not target the 📌 marker comment (cmt_mark)"
+grep -q '"id": "cmt_other"' "$GQLLOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
+pass
+
+# 8e. HERD-85 attribution — a queue write journals ONE tracker_write with requested 'queued' and the
+#     component from HERD_COMPONENT (the CLI sets it to 'plan').
+: > "$JLOG"
+HERD_COMPONENT=plan run _backend_queue_item ENG-7 alice ENG-9 >/dev/null
+tw="$(grep '^tracker_write ' "$JLOG")"
+echo "$tw" | grep -q "requested queued"   || fail "queue_item tracker_write missing 'requested queued' ($tw)"
+echo "$tw" | grep -q "component plan"      || fail "queue_item did not attribute the 'plan' component ($tw)"
+echo "$tw" | grep -q "result DONE"         || fail "queue_item did not record the result ($tw)"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.

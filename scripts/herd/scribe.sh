@@ -15,6 +15,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # HERD_DRIVER=headless spawns a detached scribe; herdr-claude emits the identical argv below.
 # shellcheck source=/dev/null
 . "$HERE/driver.sh"
+# Drainer singleton liveness (HERD-109): herd_drainer_hung lets the singleton check below tell a
+# HUNG-but-listed drainer from a live one, so a wedged drainer can't block the queue forever.
+# shellcheck source=/dev/null
+. "$HERE/drainer-liveness.sh"
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
@@ -66,7 +70,18 @@ sys.exit(0 if any(
   x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
   for x in json.load(sys.stdin)["result"]["agents"]
 ) else 1)'; then
-  echo "✍️  scribe already running — it will drain this."; exit 0
+  # A drainer of this name is LISTED. Normally we short-circuit (it will drain this). But a listed
+  # drainer can be HUNG (wedged claude session / stuck step): its heartbeat ($HEARTBEAT, written by
+  # scribe-step.sh on every drain step) goes stale. If it is stale beyond DRAINER_HEARTBEAT_TIMEOUT,
+  # RECLAIM the singleton and fall through to spawn a fresh drainer (HERD-109) — the queue's atomic
+  # per-request claim keeps this from double-draining. Heartbeat fresh (or feature off / absent
+  # heartbeat) → the exact legacy path, byte-identical.
+  HEARTBEAT="$TREES/.scribe.heartbeat"
+  if herd_drainer_hung "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT"; then
+    echo "⚠️  scribe drainer appears HUNG (no heartbeat for >${DRAINER_HEARTBEAT_TIMEOUT}s) — reclaiming the singleton and spawning a fresh drainer (per-request atomic claim prevents double-draining)."
+  else
+    echo "✍️  scribe already running — it will drain this."; exit 0
+  fi
 fi
 
 # 4. Otherwise spawn the single drainer. The prompt is BACKEND-AGNOSTIC (issue #139): it is emitted
@@ -78,9 +93,12 @@ PROMPT=$(cat <<EOF
 You are the BACKLOG SCRIBE (queue drainer). Drain the backlog queue, one request at a time.
 Repeat this loop:
 
-1. Run:  bash $HERE/scribe-step.sh next
+1. Run:  bash $HERE/scribe-step.sh next --linger $SCRIBE_LINGER_SECS
    • It prints "CLAIMED <path>", then "BACKEND <name>" (the ACTIVE backend, read NOW), then the
      request text (repo already pulled & current). OR it prints "EMPTY".
+   • The --linger window makes 'next' keep polling for $SCRIBE_LINGER_SECS extra seconds once the
+     queue empties before it returns EMPTY, so a burst of requests arriving with idle gaps between
+     them is drained by THIS one session — the mechanic does the waiting; you never sleep yourself.
    • If EMPTY: run  bash $HERE/scribe-step.sh finish . STOP -> end your turn (done).
      MORE -> go back to step 1.
 2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend
@@ -103,6 +121,17 @@ Repeat this loop:
      request into exactly ONE of these, then run the matching verb — NEVER file a new issue for a
      request that is not actually a new backlog item (that mis-file is the junk-issue bug):
        – ADD / create / file a NEW backlog item →
+           The backend takes the FIRST LINE of the text as the tracker title and keeps the WHOLE
+           text as the description. So make sure the text STARTS WITH A SHORT ONE-LINE TITLE
+           (< 80 chars). If the request is a run-on paragraph with no title line, SYNTHESIZE one:
+           write a concise title as the first line, then the full request as the body beneath it —
+           never pass a whole paragraph as the first line (that files a giant title duplicated in
+           the description).
+           If the request carries NO verification plan (how the change will be proven — a named
+           sandbox sim scenario for a gate/merge/concurrency/limit-park/pane seam, or the test
+           surface otherwise), file it AS-IS — never block or synthesize one — but append a
+           "⚠️ no verification plan" marker line to the body so the flag rides into the item AND
+           its scribe report line, and the coordinator sees which items shipped unplanned. Then run:
            bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
        – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
          "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →

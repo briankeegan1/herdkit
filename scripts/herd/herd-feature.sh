@@ -26,6 +26,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # CLAIM_REQUIRED is on AND a tracker id is present, claims the item synchronously so two operators
 # can't double-build it. Off/no-id → returns 0 immediately (today's behavior).
 . "$HERE/herd-claim.sh"
+# Journal (HERD-64): sourced so herd_tracked_spawn_or_abort can record a TRACKED_SPAWNS bypass.
+# Best-effort + always-0; a no-op when TRACKED_SPAWNS is off (the default).
+. "$HERE/journal.sh"
 # Runtime driver shim: this lane IS the start-agent capability. Under HERD_DRIVER=headless it spawns
 # a DETACHED background agent (no herdr tab/pane) via herd_driver_start_agent; the default herdr-claude
 # driver keeps the herdr tab + agent-start path below byte-identical.
@@ -38,6 +41,13 @@ FORCE_SPAWN="${HERD_FORCE_SPAWN:-}"
 case "${1:-}" in --force|-f) FORCE_SPAWN=1; shift ;; esac
 SLUG="${1:?usage: herd-feature.sh [--force] <slug> [task...]   (slug must be kebab-case)}"; shift || true
 TASK="${*:-}"
+
+# Tracked-spawn policy gate (HERD-64) — BEFORE anything else. When TRACKED_SPAWNS=required a spawn
+# carrying no tracker ref (HERD_CLAIM_ID / HERD_ITEM_REF) is REFUSED here, creating nothing; --force /
+# HERD_FORCE_SPAWN=1 bypasses and journals it. Off (default) → returns 0, byte-identical to today.
+if ! herd_tracked_spawn_or_abort "$SLUG" "$FORCE_SPAWN"; then
+  exit 1
+fi
 
 # Advisory pre-spawn review-gate check (BEFORE any worktree/tab is created). If the review pipeline
 # is saturated AND builds are already leading past REVIEW_CONCURRENCY + SPAWN_AHEAD, HOLD this spawn
@@ -79,6 +89,15 @@ fi
 if ! bash "$HERE/new-feature.sh" "$SLUG"; then
   echo "❌ new-feature.sh failed for '$SLUG' — worktree/branch not created; not spawning a herdr tab." >&2
   exit 1
+fi
+
+# HERD-92: persist the tracker ref → slug pairing as a cheap per-worktree marker so the watcher can
+# render this builder's console row as '<ref> <slug>' every tick with NO gh/backend call — matching
+# the tracker id shown in the "tracker healed" section. Written only when the coordinator spawned
+# from a TRACKED item (HERD_ITEM_REF set); an untracked spawn leaves no marker and renders the plain
+# slug, unchanged. Fail-soft: a write error never blocks the spawn (the console falls back to slug).
+if [ -n "${HERD_ITEM_REF:-}" ]; then
+  printf '%s\n' "$HERD_ITEM_REF" > "$WORKTREES_DIR/.herd-ref-$SLUG" 2>/dev/null || true
 fi
 
 # 2. New herdr tab rooted in the worktree; grab tab id + root pane id. If herdr is unavailable
@@ -158,7 +177,7 @@ GROUNDING_RULE="$(herd_context_provision_preamble)"
 #    workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this feature in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog.
+warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
 If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.

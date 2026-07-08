@@ -29,6 +29,11 @@
 # Resolve this script's own dir so the backend lookup works no matter what HERE the caller set.
 _HERD_CLAIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
+# journal.sh provides journal_append, which the backend's _backend_tw_journal uses to record a claim
+# as a tracker_write (HERD-85). Source it only if a caller (the lane) has not already — best-effort,
+# so a standalone claim without WORKTREES_DIR simply drops the entry and never blocks the claim.
+command -v journal_append >/dev/null 2>&1 || . "$_HERD_CLAIM_DIR/journal.sh" 2>/dev/null || true
+
 # _herd_claim_identity — the operator identity a claim is stamped with. WATCHER_OWNER wins (an
 # explicit, gh-free identity), then WATCHER_VIEW_AUTHOR (reuse the watcher-lens identity, same order
 # agent-watch.sh resolves), else the authenticated `gh api user` login. Empty when none resolves —
@@ -60,6 +65,8 @@ _herd_claim_dispatch() {
     . "$bfile" 2>/dev/null || { printf 'UNREACHABLE\t'; exit 0; }
     command -v _backend_claim_item >/dev/null 2>&1 || { printf 'UNREACHABLE\t'; exit 0; }
     [ -n "${PROJECT_ROOT:-}" ] && cd "$PROJECT_ROOT" 2>/dev/null
+    # Attribute the claim's tracker_write (HERD-85) to the 'claim' component.
+    export HERD_COMPONENT="claim"
     _CLAIM_RESULT=""; _CLAIM_OWNER=""
     _backend_claim_item "$id" "$who" 2>/dev/null || true
     printf '%s\t%s' "${_CLAIM_RESULT:-UNREACHABLE}" "${_CLAIM_OWNER:-}"

@@ -280,6 +280,47 @@ SOFTDEPS
   return 0
 }
 
+# _herd_control_room_down_reason [panes-registry] — the DETERMINISTIC, no-LLM control-room health
+# probe behind the HERD-112 startup-restore hint. Echoes a ONE-LINE human reason when the control
+# room looks DOWN/degraded, and NOTHING (empty) when it looks healthy. It signals two conditions:
+#
+#   (a) watcher not alive / lockfile stale — the SAME liveness signal `herd status` and
+#       _list_project_watchers use: the watcher is alive iff $HERD_WATCHER_LOCK holds a pid that
+#       `kill -0` accepts. A missing lock, an empty/garbage pid, or a pid that no longer exists = down.
+#   (b) backlog or watch pane missing — the role registry ($WORKTREES_DIR/.herd-panes, rewritten from
+#       the OBSERVED panes by coordinator.sh / `herd reload`) has no `backlog ` / `watch ` row, so the
+#       rebuild failed to establish that pane (e.g. a pane run that fell back headless).
+#
+# FAIL-SOFT + DEFAULT-SAFE (the no-false-red rule): the pane checks run ONLY when the registry file
+# exists (its absence — a fresh room, a headless driver, a suppressed watch console — is NOT a down
+# signal); any probe error degrades to "not down"; and it ALWAYS returns 0, so a startup summary can
+# call it inline under `set -euo pipefail` with no risk of aborting the launch it rides on. The
+# caller decides WHEN to probe (e.g. skip it under HERD_NO_WATCH, where no watcher is expected).
+_herd_control_room_down_reason() {
+  local reg="${1:-${WORKTREES_DIR:-}/.herd-panes}"
+
+  # (a) Watcher liveness — mirror `herd status`: lockfile pid + kill -0.
+  local lock="${HERD_WATCHER_LOCK:-}" wpid=""
+  [ -n "$lock" ] && [ -f "$lock" ] && wpid="$(cat "$lock" 2>/dev/null || true)"
+  if [ -z "$wpid" ] || ! kill -0 "$wpid" 2>/dev/null; then
+    if [ -n "$wpid" ]; then
+      printf 'watcher not alive (stale lock pid %s)' "$wpid"
+    else
+      printf 'watcher not alive (no watcher lock/pid)'
+    fi
+    return 0
+  fi
+
+  # (b) Pane roles — only when the OBSERVED registry exists (else no signal, never a false-red).
+  if [ -n "$reg" ] && [ -f "$reg" ]; then
+    grep -q '^backlog ' "$reg" 2>/dev/null || { printf 'backlog pane missing from the control room'; return 0; }
+    grep -q '^watch '   "$reg" 2>/dev/null || { printf 'watch pane missing from the control room';   return 0; }
+  fi
+
+  # Healthy (or not enough signal to call it down) → say nothing.
+  return 0
+}
+
 # _herd_doctor_recommend <tool> <os> <needed-for> — report a RECOMMENDED dep: ✓ (return 0) when
 # present, else a ⚠ warning naming what the tool is needed FOR plus a per-platform install hint, and
 # return 1 so the caller can bump its warn count (and skip any follow-on probe, e.g. herdr's JSON

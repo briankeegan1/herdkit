@@ -12,7 +12,9 @@
 #   _backend_add_item REQ_ID TEXT     — issueCreate; sets _BACKEND_RESULT=DONE|NOCHANGE
 #   _backend_mark_shipped SLUG PR_URL — comment PR link + issueUpdate into the Done state
 #   _backend_list_open                — open issues, one "#<identifier> <title>" line each
-# plus _backend_item_state REF for the link-state watcher.
+# plus _backend_item_state REF for the link-state watcher, and the OPTIONAL planned-work markers
+# (HERD-52): _backend_queue_item / _backend_unqueue_item / _backend_list_queued for cross-operator
+# plan-time visibility (a 📌 comment naming who sequenced the item after what, and when).
 #
 # Credentials: LINEAR_API_KEY is read from .herd/secrets (gitignored) — NEVER from .herd/config.
 # Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID (also from .herd/secrets) names
@@ -46,6 +48,27 @@ _linear_require_curl() {
         echo "linear backend: 'curl' not found — required to reach the Linear GraphQL API" >&2
         exit 1
     }
+}
+
+# _backend_tw_journal — HERD-85 tracker-write attribution. Emit ONE journal event per tracker STATE
+# WRITE so `herd log | grep tracker_write` answers "which component moved <ref> to <state> on <pr>" in
+# one line — the record that did NOT exist when HERD-67/HERD-69 showed In Progress after their PRs
+# merged and diagnosing it needed Linear-history + transcript archaeology. Attribution is the
+# HERD_COMPONENT the caller set (claim|scribe|reconcile), defaulting to 'manual' for a hand-run backend
+# op. FAIL-SOFT by contract: journal_append is itself best-effort, and when journal.sh was never
+# sourced into this context (so journal_append is undefined) this is a silent no-op — a journal problem
+# must NEVER block or alter the state write (ZERO gate behavior change).
+# Args: <ref> <requested-state> <result> [pr]   (pr falls back to $HERD_TW_PR when the arg is omitted).
+_backend_tw_journal() {
+    command -v journal_append >/dev/null 2>&1 || return 0
+    local ref="$1" requested="$2" result="$3" pr="${4:-${HERD_TW_PR:-}}"
+    if [ -n "$pr" ]; then
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend linear result "$result" pr "$pr"
+    else
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend linear result "$result"
+    fi
 }
 
 _linear_gql() {
@@ -105,13 +128,39 @@ _linear_issue_query() {
 print(json.dumps({"n": float(os.environ["N"]), "key": os.environ["KEY"]}))')"
 }
 
+_linear_short_title() {
+    # Derive a SHORT tracker title from the full request text (HERD-77). The title SUMMARIZES the
+    # request; it NEVER replaces the description (the caller still stores the full text). A first line
+    # that is already short (<=100 chars) is the title verbatim. A long first line — the
+    # "first-line-as-essay" complaint (2026-07-07): a one-paragraph request became a giant title
+    # duplicated in the description, and seven issues had to be hand-renamed — is reduced to its first
+    # sentence/clause (split on ' — ', ': ', or '. ') and hard-capped at 100 chars with an ellipsis.
+    # $1 = full text; prints the derived title.
+    TEXT="$1" python3 -c 'import os
+MAX = 100
+first = os.environ["TEXT"].split("\n", 1)[0].strip()
+if len(first) <= MAX:
+    print(first)
+else:
+    cut = len(first)
+    for d in (" — ", ": ", ". "):
+        i = first.find(d)
+        if i != -1:
+            cut = min(cut, i)
+    clause = first[:cut].strip()
+    if not clause or len(clause) > MAX - 1:
+        clause = first[:MAX - 1].rstrip()
+    print(clause + "…")'
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
-    # Title = the first line of the request; description = the full text. Sets _BACKEND_RESULT=DONE
-    # on a created issue (and surfaces its URL), NOCHANGE if Linear declines or no team is available.
+    # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
+    # essay); description = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue (and surfaces
+    # its URL), NOCHANGE if Linear declines or no team is available.
     local text="$2" title team mut vars resp parsed ok ident url
     _linear_require_key
-    title="$(printf '%s' "$text" | head -n1)"
+    title="$(_linear_short_title "$text")"
     team="$(_linear_team_id)"
     if [ -z "$team" ]; then
         echo "linear backend: no team available to create the issue in (set LINEAR_TEAM_ID in .herd/secrets)" >&2
@@ -180,14 +229,24 @@ EOF
   commentCreate(input: { issueId: $issueId, body: $body }) { success }
 }' "$(ID="$issue_id" BODY="Shipped via ${pr}" python3 -c 'import os, json
 print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" >/dev/null 2>&1 || true
-    # Move to the Done state.
+    # Move to the Done state — reporting DONE only on a CONFIRMED success:true. A transiently-failed
+    # (or errored) issueUpdate returns NOCHANGE so the watcher's fuzzy-scribe retry path re-attempts,
+    # rather than the old optimistic DONE that mislabeled a failed write as a verified ship
+    # (PR #187/HERD-67 stayed In Progress after merge, 2026-07-07). When no completed state resolved
+    # there is no move to verify, so behavior is unchanged (the PR-link comment already posted).
     if [ -n "$state_id" ]; then
-        _linear_gql 'mutation Ship($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
-}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
-print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
+        if _linear_issue_update_state_verified "$issue_id" "$state_id"; then
+            _BACKEND_RESULT="DONE"
+        else
+            echo "linear backend: issueUpdate shipping '$slug' to Done was not confirmed (success≠true) — leaving it for retry (skipping, not filing)" >&2
+            _BACKEND_RESULT="NOCHANGE"
+        fi
+    else
+        _BACKEND_RESULT="DONE"
     fi
-    _BACKEND_RESULT="DONE"
+    # HERD-85: journal the ship as a tracker_write (requested 'shipped', with the PR link) so the
+    # component that closed the item is attributable in one `herd log` line. Fail-soft.
+    _backend_tw_journal "$slug" shipped "$_BACKEND_RESULT" "$pr"
 }
 
 _linear_state_type_for() {
@@ -265,6 +324,27 @@ print(json.dumps({"t": os.environ["T"]}))')"
     _linear_gql "$q" "$v"
 }
 
+_linear_issue_update_state_verified() {
+    # Fire the issueUpdate(stateId:) transition and VERIFY it actually landed before a caller may
+    # report DONE. $1 = issue id; $2 = target workflow-state id. Returns 0 ONLY when the response
+    # parses data.issueUpdate.success == true; returns 1 on any transport failure, GraphQL error, or
+    # success:false. Callers translate a non-zero return into _BACKEND_RESULT=NOCHANGE so agent-watch's
+    # fuzzy-scribe retry path re-attempts — instead of the old optimistic ">/dev/null 2>&1 || true"
+    # followed by an unconditional DONE, which reported a transiently-failed write as a verified
+    # transition and made _reconcile_via_ref journal resolution=explicit-ref and SKIP the retry
+    # (real incident: PR #187/HERD-67 stayed In Progress after merge, 2026-07-07).
+    local id="$1" state_id="$2" resp ok
+    resp="$(_linear_gql 'mutation Move($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}' "$(ID="$id" SID="$state_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" 2>/dev/null)" || return 1
+    ok="$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print("1" if (((d.get("data") or {}).get("issueUpdate") or {}).get("success")) else "0")' 2>/dev/null)"
+    [ "$ok" = "1" ]
+}
+
 _backend_update_state() {
     # $1 = item ref (Linear identifier e.g. HERD-22, a leading '#' tolerated — or a title phrase when
     # no identifier is present); $2 = target state (done|in-progress|canceled + synonyms).
@@ -314,11 +394,19 @@ EOF
         _BACKEND_RESULT="NOCHANGE"
         return 0
     fi
-    _linear_gql 'mutation Move($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
-}' "$(ID="$issue_id" SID="$state_id" python3 -c 'import os, json
-print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
-    _BACKEND_RESULT="DONE"
+    # Transition the issue — reporting DONE only when the issueUpdate is CONFIRMED (success:true). A
+    # transiently-failed mutation returns NOCHANGE so agent-watch's _reconcile_via_ref does NOT journal
+    # resolution=explicit-ref and skip the fuzzy-scribe fallback that would retry — the exact failure
+    # behind PR #187/HERD-67 staying In Progress after merge (2026-07-07).
+    if _linear_issue_update_state_verified "$issue_id" "$state_id"; then
+        _BACKEND_RESULT="DONE"
+    else
+        echo "linear backend: issueUpdate for '$ref' → '$want' was not confirmed (success≠true) — state left unresolved for retry (skipping, not filing)" >&2
+        _BACKEND_RESULT="NOCHANGE"
+    fi
+    # HERD-85: journal the write we just attempted (result = the verified outcome) so attribution is a
+    # one-line `herd log` lookup instead of transcript archaeology. Fail-soft; never affects the result.
+    _backend_tw_journal "$ref" "$want" "$_BACKEND_RESULT"
 }
 
 _backend_list_open() {
@@ -355,11 +443,14 @@ for n in nodes:
 _backend_list_open_rich() {
     # OPTIONAL rich variant of _backend_list_open (the plain op above stays the cross-backend
     # contract and is byte-identical). Emits one TAB-separated line per open issue:
-    #   #<identifier> \t <state-type> \t <state-name> \t <title> \t <desc-snippet>
+    #   #<identifier> \t <state-type> \t <state-name> \t <title> \t <desc-snippet> \t <assignee> \t <url>
     # state-type is Linear's workflow-state TYPE (started|unstarted|backlog|triage) — the machine
     # key a viewer groups on; state-name is the human label ("In Progress", "In Review", …). The
     # description snippet is whitespace-flattened (tabs/newlines → spaces, so the TSV shape can
-    # never be corrupted by field content) and capped at 280 chars. Lines are sorted started-first
+    # never be corrupted by field content) and capped at 280 chars. The trailing <url> is the issue's
+    # canonical Linear URL (whitespace-flattened, so it can never carry a TAB) — backlog-view.sh wraps
+    # the id chip in an OSC 8 hyperlink to it (HERD-49); older consumers that read only the first six
+    # fields ignore it. Lines are sorted started-first
     # (in-progress work surfaces at the top), then unstarted, backlog, triage — stable within each
     # group (API order preserved). Consumed by `herd backlog --rich` → backlog-view.sh's rich
     # renderer; callers that don't know this op exists keep using _backend_list_open unchanged.
@@ -368,7 +459,7 @@ _backend_list_open_rich() {
     if [ -n "${LINEAR_TEAM_ID:-}" ]; then
         query='query L($team: ID!) {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
-    nodes { identifier title description state { name type } assignee { displayName } }
+    nodes { identifier title description url state { name type } assignee { displayName } }
   }
 }'
         vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
@@ -376,7 +467,7 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
     else
         query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
-    nodes { identifier title description state { name type } assignee { displayName } }
+    nodes { identifier title description url state { name type } assignee { displayName } }
   }
 }'
         vars=""
@@ -398,8 +489,9 @@ for _, _, n, st in rows:
     if len(desc) > 280:
         desc = desc[:279].rstrip() + "…"
     assignee = flat((n.get("assignee") or {}).get("displayName") or "")
-    print("#%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
-                                        flat(st.get("name")), flat(n.get("title")), desc, assignee))' 2>/dev/null || true
+    url = flat(n.get("url") or "")
+    print("#%s\t%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
+                                            flat(st.get("name")), flat(n.get("title")), desc, assignee, url))' 2>/dev/null || true
 }
 
 _backend_show_item() {
@@ -548,7 +640,7 @@ print(json.dumps({"id": os.environ["ID"], "assignee": os.environ["A"]}))')" >/de
 print(json.dumps({"id": os.environ["ID"], "stateId": os.environ["SID"]}))')" >/dev/null 2>&1 || true
     fi
     # CLAIM-VERIFY: re-read the assignee and confirm the claim landed on us (not a racer).
-    if ! _linear_issue_query "$ref" 'assignee { id name }'; then _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"; return 0; fi
+    if ! _linear_issue_query "$ref" 'assignee { id name }'; then _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"; _backend_tw_journal "$ref" in-progress CLAIMED; return 0; fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
     IFS=$'\t' read -r assignee_id assignee_name <<EOF
 $(printf '%s' "$resp" | python3 -c 'import sys, json
@@ -562,5 +654,125 @@ EOF
         _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="${assignee_name:-another operator}"
     else
         _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="${me#*	}"
+        # HERD-85: a claim moves the issue into a started (in-progress) state — journal that write.
+        _backend_tw_journal "$ref" in-progress CLAIMED
     fi
+}
+
+# ── Planned-work markers (HERD-52) — cross-operator plan-time visibility ─────────────────────────
+# A coordinator that has SEQUENCED an item to spawn NEXT (but not yet spawned it) publishes a
+# lightweight PLANNED marker so a second operator sees it and doesn't grab the same item. This
+# complements the pre-spawn CLAIM (_backend_claim_item, HERD-50, which covers spawn-time): the marker
+# covers PLAN-time, the window between "I've decided to build this next" and the claim. On Linear the
+# marker is a COMMENT of the shared shape "📌 queued by <who>: sequenced after <blocker> [<epoch>]"
+# (an ISO-ish unix timestamp so a reader can age it out). All three ops are BACKEND-OPTIONAL and
+# FAIL-SOFT: an unresolvable ref, a missing key, or a transport hiccup is NOCHANGE/empty, never a hard
+# error — a plan marker is advisory, never a gate.
+_LINEAR_QUEUE_MARK_RE='📌 queued by (.*?): (.*?) \[(\d+)\]'
+
+# _backend_queue_item REF WHO BLOCKER — publish a planned marker comment on the issue. BLOCKER is the
+# item this one is sequenced after (may be empty → "sequenced next"). Sets _BACKEND_RESULT=DONE|NOCHANGE.
+_backend_queue_item() {
+    local ref="$1" who="$2" blocker="$3" resp issue_id ok ts detail body
+    _linear_require_key
+    [ -n "$who" ] || who="unknown-operator"
+    ts="$(date +%s 2>/dev/null || echo 0)"
+    if [ -n "$blocker" ]; then detail="sequenced after $blocker"; else detail="sequenced next"; fi
+    if ! _linear_issue_query "$ref" "id identifier"; then
+        echo "linear backend: '$ref' is not a resolvable identifier — cannot publish a queued marker" >&2
+        _BACKEND_RESULT="NOCHANGE"; return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    issue_id="$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+print(nodes[0].get("id", "") if nodes else "")' 2>/dev/null)"
+    if [ -z "$issue_id" ]; then
+        echo "linear backend: no issue matching '$ref' — nothing to queue" >&2
+        _BACKEND_RESULT="NOCHANGE"; return 0
+    fi
+    body="$(printf '📌 queued by %s: %s [%s]' "$who" "$detail" "$ts")"
+    ok="$(_linear_gql 'mutation Q($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) { success }
+}' "$(ID="$issue_id" BODY="$body" python3 -c 'import os, json
+print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" 2>/dev/null \
+      | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print("1" if (((d.get("data") or {}).get("commentCreate") or {}).get("success")) else "0")' 2>/dev/null)"
+    if [ "$ok" = "1" ]; then _BACKEND_RESULT="DONE"; else _BACKEND_RESULT="NOCHANGE"; fi
+    # HERD-85: journal the plan-time write (component=plan set by the caller). Fail-soft.
+    _backend_tw_journal "$ref" queued "$_BACKEND_RESULT"
+}
+
+# _backend_unqueue_item REF WHO — clear the planned marker(s) on the issue (plan dropped, or the item
+# was spawned and the claim now supersedes it). WHO is informational. Deletes every 📌-marker comment
+# on the issue via commentDelete. Sets _BACKEND_RESULT=DONE (≥1 deleted) | NOCHANGE (none present).
+_backend_unqueue_item() {
+    local ref="$1" who="$2" resp ids id deleted=0
+    _linear_require_key
+    if ! _linear_issue_query "$ref" "id comments { nodes { id body } }"; then
+        _BACKEND_RESULT="NOCHANGE"; return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    ids="$(printf '%s' "$resp" | RE="$_LINEAR_QUEUE_MARK_RE" python3 -c 'import sys, json, os, re
+rx = re.compile(os.environ["RE"])
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if nodes:
+    for c in (((nodes[0].get("comments") or {}).get("nodes")) or []):
+        if rx.search(c.get("body") or ""):
+            print(c.get("id", ""))' 2>/dev/null)"
+    for id in $ids; do
+        [ -n "$id" ] || continue
+        if _linear_gql 'mutation D($id: String!) { commentDelete(id: $id) { success } }' \
+             "$(ID="$id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"]}))')" 2>/dev/null \
+           | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+sys.exit(0 if (((d.get("data") or {}).get("commentDelete") or {}).get("success")) else 1)' 2>/dev/null; then
+            deleted=$((deleted+1))
+        fi
+    done
+    if [ "$deleted" -gt 0 ]; then _BACKEND_RESULT="DONE"; else _BACKEND_RESULT="NOCHANGE"; fi
+    _backend_tw_journal "$ref" unqueued "$_BACKEND_RESULT"
+}
+
+# _backend_list_queued — print every live planned marker across the open issue set, one TAB-separated
+# line each: "#<identifier>\t<who>\t<detail>\t<epoch>". The reader (the coordinator / `herd backlog
+# queued`) applies the 24h-advisory convention off <epoch>. Team-scoped exactly like _backend_list_open
+# so a second private team's markers never leak in.
+_backend_list_queued() {
+    _linear_require_key
+    local query vars
+    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
+        query='query L($team: ID!) {
+  issues(filter: { state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
+    nodes { identifier comments { nodes { body } } }
+  }
+}'
+        vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
+print(json.dumps({"team": os.environ["TEAM"]}))')"
+    else
+        query='query {
+  issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
+    nodes { identifier comments { nodes { body } } }
+  }
+}'
+        vars=""
+    fi
+    _linear_gql "$query" "$vars" | RE="$_LINEAR_QUEUE_MARK_RE" python3 -c 'import sys, json, os, re
+rx = re.compile(os.environ["RE"])
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+for n in nodes:
+    ident = n.get("identifier", "")
+    for c in (((n.get("comments") or {}).get("nodes")) or []):
+        m = rx.search(c.get("body") or "")
+        if m:
+            print("#%s\t%s\t%s\t%s" % (ident, m.group(1).strip(), m.group(2).strip(), m.group(3)))' 2>/dev/null || true
 }

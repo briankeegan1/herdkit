@@ -19,6 +19,18 @@ WORKSPACE_NAME="myproject"                     # herdr workspace label
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
+# SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the scribe empties the queue, the
+# drainer keeps polling this many extra seconds before its session exits, so a burst of backlog
+# updates arriving with short idle gaps is drained by ONE scribe session instead of paying a fresh
+# MODEL_SCRIBE cold-start per gap. Default 0 → byte-identical to today; 90 is a good burst-sharing value.
+# SCRIBE_LINGER_SECS="90"
+# DRAINER_HEARTBEAT_TIMEOUT — drainer singleton liveness window in seconds (HERD-109). The scribe and
+# researcher drainers are per-project singletons; a same-named drainer already in `herdr agent list`
+# makes an enqueue short-circuit. A LISTED but HUNG drainer would then block the queue forever, so the
+# *-step.sh drainers heartbeat on every drain step and the enqueue path reclaims the singleton (spawns a
+# fresh drainer) when the heartbeat is staler than this. The queue's atomic per-request claim prevents
+# double-draining. Default 900 (15 min) → byte-identical to today; set 0 to disable liveness reclaim.
+# DRAINER_HEARTBEAT_TIMEOUT="900"
 SHARE_LINKS=""                      # gitignored dirs symlinked into each worktree (e.g. "node_modules target")
 
 # BACKLOG_VIEW_EXTRAS — VIEW-ONLY backlog-pane extra section. Default "" (off) → the pane output is
@@ -97,6 +109,13 @@ MODEL_QUICK="claude-haiku-4-5"      # trivial lane → cheapest tier
 MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIEW_ESCALATE_GLOB
+# MODEL_ADVISE="claude-opus-4-8"    # `herd advise` one-shot advisor; defaults to the MODEL_FEATURE tier
+
+# docs-only review tier (HERD-89) — route pure-docs diffs to the cheapest reviewer. Leave both blank
+# (default) for byte-identical behavior; set DOCS_ONLY_GLOB to opt in. ESCALATION WINS: a docs diff
+# also matching REVIEW_ESCALATE_GLOB or over REVIEW_ESCALATE_MAXFILES files stays on the STRONG tier.
+# DOCS_ONLY_GLOB='\.(md|txt)$'        # every changed path matches → $REVIEW_MODEL_DOCS review
+# REVIEW_MODEL_DOCS="claude-haiku-4-5"  # cheapest tier for pure-docs diffs
 
 # privacy / safety
 DENY_PATHS="data/"                  # never committed; the local lane is scoped here
@@ -138,6 +157,28 @@ MERGE_POLICY="auto"
 
 # merge method — the gh pr merge strategy applied by do_merge (default: merge commit).
 MERGE_METHOD="merge"    # merge | squash | rebase
+
+# gate dispatch (HERD-73) — WHEN the watcher fires the pre-merge review relative to the healthcheck.
+#   serial   default — byte-identical to today: the review dispatches only AFTER the healthcheck
+#            outcome lands, so gate wall-clock = health + review.
+#   parallel dispatch the review at the same tick the healthcheck STARTS, so the two gates overlap
+#            (wall-clock ≈ max(health, review)). The MERGE decision is UNCHANGED — a merge still
+#            requires BOTH gates green; REVIEW_CONCURRENCY + the sha-keyed review-once semantics are
+#            respected, and a health code-error mid-review never kills the reviewer. Tradeoff: a
+#            health-failed sha wastes one review run (cheap under REVIEW_ESCALATE_GLOB tiering).
+# Opt-in only; watcher-affecting (takes effect on the next watcher restart).
+# GATE_DISPATCH="serial"   # serial (default) | parallel
+
+# INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
+# environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
+# an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After
+# INFRA_BREAKER_MAX in a row the breaker OPENS: new review/health dispatch stops, a loud
+# 'infra circuit open — environment looks dead' status row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds it goes HALF-OPEN for a SINGLE probe (a real verdict closes it, another
+# death re-opens it). CRITICAL: a real code BLOCK/PASS verdict proves the env is alive and RESETS the
+# counter — it never trips the breaker; only non-verdict deaths do. Ships OFF (byte-inert): default 0.
+# INFRA_BREAKER_MAX="0"          # 0 (default, off) | N>=1 = open after N consecutive INFRA (non-verdict) failures
+# INFRA_BREAKER_COOLDOWN="300"   # seconds OPEN before a single half-open probe retry (non-numeric → 300)
 
 # PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
 # a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
@@ -190,6 +231,22 @@ CONTEXT_PROVISION=""      # e.g. "codemap"  (space-separate multiple sources)
 #   # MCP_CONTEXT7_ARGS="-y @upstash/context7-mcp@latest"   # override the built-in args if needed
 MCP_PROVISION=""          # e.g. "context7"  (space-separate multiple servers)
 
+# coordinator-side graphify (HERD-61) — the THIRD LEG of the graphify integration, sibling to the two
+# builder-side keys above: CONTEXT_PROVISION=codemap grounds each BUILDER in docs/codemap.md, and
+# MCP_PROVISION graphify-mcp gives a BUILDER the graphify MCP tools; this key gives the COORDINATOR a
+# pre-spawn/periodic overlap read. graphify is machine-local (PyPI `graphifyy`, usually at
+# ~/.local/bin/graphify). Point this at the binary on THIS machine so the coordinator can rebuild
+# graphify-out/graph.json LLM-free (`graphify update --no-cluster`, zero Claude quota) and cross the
+# changed-file surfaces of in-flight worktrees before spawning a colliding item.
+#   • MACHINE-scoped (HERD-47): the path is per-machine — set it with `herd config set GRAPHIFY_BIN
+#     <path>`, which routes to the gitignored .herd/config.local, NOT this committed baseline.
+#   • FAIL-SOFT: unset falls back to `graphify` on PATH; if neither resolves, the coordinator SKIPS the
+#     analysis SILENTLY (no warning, no red row) — it is an optional accelerator, never required.
+#   • HONEST SCOPE: FILE-level overlap + within-file structure only — graphify's bash cross-file CALL
+#     resolution is weak, so this is not a cross-script call graph (see the skill for the detail).
+# Example (per-machine, in .herd/config.local — not here):
+#   GRAPHIFY_BIN="$HOME/.local/bin/graphify"
+
 # legacy back-compat lever — still read when MERGE_POLICY is unset/empty.
 #   true  → equivalent to MERGE_POLICY=auto    (merge automatically)
 #   false → equivalent to MERGE_POLICY=approve (hold for explicit human approval)
@@ -208,6 +265,18 @@ WATCHER_AUTOMERGE="true"
 #     in team mode, auto-merge is WITHHELD for safety (a teammate's PR is never blind-merged).
 # WATCHER_SCOPE="mine"
 # WATCHER_OWNER=""
+
+# tracker-routed spawn enforcement (HERD-64) — make "every builder is traceable to a tracked work
+# item" a PROJECT POLICY, not just a coordinator convention. DEFAULT off: the spawn surfaces
+# (herd-quick.sh / herd-feature.sh / spawn.sh) impose no gate, byte-identical to today.
+#   required → a spawn carrying NO tracker ref (HERD_CLAIM_ID, else the HERD_ITEM_REF the coordinator
+#              threads for a tracked item) is REFUSED with a loud one-line reason and creates nothing.
+#              HERD_FORCE_SPAWN=1 (or a lane's --force) is the explicit escape hatch — it lets the
+#              spawn through and JOURNALS the bypass (visible in `herd log`).
+# Composes with CLAIM_REQUIRED (HERD-50): the ref set is identical, so with BOTH on every spawn is
+# atomically CLAIMED (no double-build) AND visible in the tracker. TRACKED_SPAWNS enforces VISIBILITY,
+# CLAIM_REQUIRED enforces EXCLUSIVITY. Recommended for shared / multi-operator repos.
+# TRACKED_SPAWNS="off"   # off (default) | required
 
 # routing — where engine bugs escalate (herd report files a gh issue here)
 HERD_REPO="briankeegan1/herdkit"

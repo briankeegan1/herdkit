@@ -22,6 +22,25 @@ _github_require_gh() {
     }
 }
 
+# _backend_tw_journal — HERD-85 tracker-write attribution (mirror of the linear backend's). Emit ONE
+# journal event per tracker STATE WRITE so `herd log | grep tracker_write` answers "which component
+# moved <ref> to <state> on <pr>" in one line — the record missing when HERD-67/HERD-69 showed In
+# Progress after merge. Attribution is the caller's HERD_COMPONENT (claim|scribe|reconcile), 'manual'
+# by default. FAIL-SOFT: journal_append is best-effort and this is a silent no-op when journal.sh was
+# never sourced — a journal problem must never block or alter the state write.
+# Args: <ref> <requested-state> <result> [pr]   (pr falls back to $HERD_TW_PR when the arg is omitted).
+_backend_tw_journal() {
+    command -v journal_append >/dev/null 2>&1 || return 0
+    local ref="$1" requested="$2" result="$3" pr="${4:-${HERD_TW_PR:-}}"
+    if [ -n "$pr" ]; then
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend github result "$result" pr "$pr"
+    else
+        journal_append tracker_write ref "$ref" requested "$requested" \
+            component "${HERD_COMPONENT:-manual}" backend github result "$result"
+    fi
+}
+
 _gh() {
     # Run a `gh <noun> <verb> …` command with the configured repo flag injected right after the
     # verb. When $HERD_REPO is empty, gh uses the current repo's default. Keeping the -R injection
@@ -49,13 +68,38 @@ except Exception: d = []
 print(d[0]["number"] if d else "")' 2>/dev/null
 }
 
+_github_short_title() {
+    # Derive a SHORT issue title from the full request text (HERD-77). The title SUMMARIZES the
+    # request; it NEVER replaces the body (the caller still stores the full text). A first line that
+    # is already short (<=100 chars) is the title verbatim. A long first line — the
+    # "first-line-as-essay" complaint (2026-07-07): a one-paragraph request became a giant title
+    # duplicated in the body — is reduced to its first sentence/clause (split on ' — ', ': ', or
+    # '. ') and hard-capped at 100 chars with an ellipsis. $1 = full text; prints the derived title.
+    TEXT="$1" python3 -c 'import os
+MAX = 100
+first = os.environ["TEXT"].split("\n", 1)[0].strip()
+if len(first) <= MAX:
+    print(first)
+else:
+    cut = len(first)
+    for d in (" — ", ": ", ". "):
+        i = first.find(d)
+        if i != -1:
+            cut = min(cut, i)
+    clause = first[:cut].strip()
+    if not clause or len(clause) > MAX - 1:
+        clause = first[:MAX - 1].rstrip()
+    print(clause + "…")'
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
-    # Title = the first line of the request; body = the full text. Sets _BACKEND_RESULT=DONE on a
-    # created issue, NOCHANGE if gh declines (so the scribe receipt still reports honestly).
+    # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
+    # essay); body = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue, NOCHANGE if gh
+    # declines (so the scribe receipt still reports honestly).
     local text="$2" title body url
     _github_require_gh
-    title="$(printf '%s' "$text" | head -n1)"
+    title="$(_github_short_title "$text")"
     body="$text"
     if url="$(_gh issue create --title "$title" --body "$body" 2>/dev/null)"; then
         _BACKEND_RESULT="DONE"
@@ -80,6 +124,7 @@ _backend_mark_shipped() {
     _gh issue comment "$num" --body "Shipped via ${pr}" >/dev/null 2>&1 || true
     _gh issue close "$num" --reason completed >/dev/null 2>&1 || true
     _BACKEND_RESULT="DONE"
+    _backend_tw_journal "$slug" shipped "$_BACKEND_RESULT" "$pr"   # HERD-85 attribution
 }
 
 _backend_update_state() {
@@ -113,6 +158,7 @@ _backend_update_state() {
             return 0 ;;
     esac
     _BACKEND_RESULT="DONE"
+    _backend_tw_journal "$ref" "$want" "$_BACKEND_RESULT"   # HERD-85 attribution
 }
 
 _backend_list_open() {
@@ -189,7 +235,7 @@ print("%s\t%s\t%s" % (st, other, mine))' 2>/dev/null)"
         _CLAIM_RESULT="UNREACHABLE"; return 0
     fi
     # CLAIM-VERIFY: re-read to confirm no competing assignee slipped in during the window.
-    info="$(_gh issue view "$num" --json state,assignees 2>/dev/null)" || { _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"; return 0; }
+    info="$(_gh issue view "$num" --json state,assignees 2>/dev/null)" || { _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"; _backend_tw_journal "$ref" in-progress CLAIMED; return 0; }
     parsed="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
 who = os.environ["WHO"]
 try: d = json.load(sys.stdin)
@@ -200,5 +246,6 @@ print(next((a for a in asg if a and a != who), ""))' 2>/dev/null)"
         _CLAIM_RESULT="ALREADY"; _CLAIM_OWNER="$parsed"
     else
         _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"
+        _backend_tw_journal "$ref" in-progress CLAIMED   # HERD-85: a claim writes in-progress
     fi
 }

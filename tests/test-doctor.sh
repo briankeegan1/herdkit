@@ -84,10 +84,10 @@ run_doctor() {
 b="$(mkbin s1)"; add_present "$b" git claude; add_gh_authed "$b"; add_herdr_healthy "$b"; add_real_python "$b"
 out="$(run_doctor "$b")"; RC=$?
 [ "$RC" -eq 0 ] || fail "(1) all-healthy should pass (got $RC): $out"
-echo "$out" | grep -qi "all required dependencies present" || fail "(1) missing success line: $out"
-echo "$out" | grep -qiE "(git|gh|claude|python3|herdr) not found" && fail "(1) a hard dep wrongly reported missing: $out"
+grep -qi "all required dependencies present" <<<"$out" || fail "(1) missing success line: $out"
+grep -qiE "(git|gh|claude|python3|herdr) not found" <<<"$out" && fail "(1) a hard dep wrongly reported missing: $out"
 # soft deps (glow/shellcheck/bats) are NOT stubbed → they warn, but the run still passes. (4)
-echo "$out" | grep -qiE "shellcheck.*not found|bats.*not found" || fail "(1/4) soft dep should be reported when absent: $out"
+grep -qiE "shellcheck.*not found|bats.*not found" <<<"$out" || fail "(1/4) soft dep should be reported when absent: $out"
 ok
 
 # ── (2) required git missing (+ recommended claude/herdr) → exit 1 + ALL reported in ONE pass ─────
@@ -97,26 +97,26 @@ ok
 b="$(mkbin s2)"; add_gh_authed "$b"; add_real_python "$b"   # present: gh(authed), python3; MISSING: git, claude, herdr
 out="$(run_doctor "$b" HERD_DOCTOR_OS=darwin)"; RC=$?
 [ "$RC" -ne 0 ] || fail "(2) missing REQUIRED git should fail (got 0): $out"
-echo "$out" | grep -qi "git not found"    || fail "(2) git not reported: $out"
-echo "$out" | grep -qi "claude not found" || fail "(2) claude not reported: $out"
-echo "$out" | grep -qi "herdr not found"  || fail "(2) herdr not reported: $out"
-echo "$out" | grep -qi "fix:"             || fail "(2) no install hint printed: $out"
+grep -qi "git not found" <<<"$out"    || fail "(2) git not reported: $out"
+grep -qi "claude not found" <<<"$out" || fail "(2) claude not reported: $out"
+grep -qi "herdr not found" <<<"$out"  || fail "(2) herdr not reported: $out"
+grep -qi "fix:" <<<"$out"             || fail "(2) no install hint printed: $out"
 ok
 
 # ── (3) gh present but NOT authenticated → hard fail naming gh auth ───────────────────────────────
 b="$(mkbin s3)"; add_present "$b" git claude; add_gh_unauthed "$b"; add_herdr_healthy "$b"; add_real_python "$b"
 out="$(run_doctor "$b")"; RC=$?
 [ "$RC" -ne 0 ] || fail "(3) unauthenticated gh should fail (got 0): $out"
-echo "$out" | grep -qi "gh auth"          || fail "(3) gh auth not named: $out"
-echo "$out" | grep -qiE "not authenticated|gh auth login" || fail "(3) no auth remediation: $out"
+grep -qi "gh auth" <<<"$out"          || fail "(3) gh auth not named: $out"
+grep -qiE "not authenticated|gh auth login" <<<"$out" || fail "(3) no auth remediation: $out"
 ok
 
 # ── (5a) python3 UTF-8 FIXED: cp1252 default but PYTHONUTF8=1 rescues → reported as OK (a ✓) ──────
 # herdr absent here (so no contract probe hits the fake python3); assert on the python3-UTF8 line.
 b="$(mkbin s5a)"; add_present "$b" git claude; add_gh_authed "$b"; add_python_fixed "$b"
 out="$(run_doctor "$b" PYTHONUTF8=)"; RC=$?
-echo "$out" | grep -qi "PYTHONUTF8=1 to fix it" || fail "(5a) FIXED python3 not reported as rescued: $out"
-echo "$out" | grep -qi "cannot emit UTF-8"      && fail "(5a) FIXED python3 wrongly flagged broken: $out"
+grep -qi "PYTHONUTF8=1 to fix it" <<<"$out" || fail "(5a) FIXED python3 not reported as rescued: $out"
+grep -qi "cannot emit UTF-8" <<<"$out"      && fail "(5a) FIXED python3 wrongly flagged broken: $out"
 ok
 
 # ── (5b) python3 UTF-8 BROKEN: fails even with PYTHONUTF8=1 → WARNS, does NOT gate init ────────────
@@ -126,15 +126,15 @@ ok
 b="$(mkbin s5b)"; add_present "$b" git claude herdr; add_gh_authed "$b"; add_python_broken "$b"
 out="$(run_doctor "$b" PYTHONUTF8=)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(5b) broken python3 UTF-8 must WARN, not fail, when git+gh present (got $RC): $out"
-echo "$out" | grep -qi "cannot emit UTF-8 even with PYTHONUTF8=1" || fail "(5b) broken UTF-8 message missing: $out"
+grep -qi "cannot emit UTF-8 even with PYTHONUTF8=1" <<<"$out" || fail "(5b) broken UTF-8 message missing: $out"
 ok
 
 # ── (6) per-platform install hints: same missing git, different HERD_DOCTOR_OS → different hint ───
 b="$(mkbin s6)"; add_gh_authed "$b"; add_real_python "$b"; add_present "$b" claude herdr   # git MISSING
 out="$(run_doctor "$b" HERD_DOCTOR_OS=windows)"; RC=$?
-echo "$out" | grep -qi "winget install Git.Git" || fail "(6) windows git hint missing: $out"
+grep -qi "winget install Git.Git" <<<"$out" || fail "(6) windows git hint missing: $out"
 out="$(run_doctor "$b" HERD_DOCTOR_OS=linux)"; RC=$?
-echo "$out" | grep -qi "apt install git"        || fail "(6) linux git hint missing: $out"
+grep -qi "apt install git" <<<"$out"        || fail "(6) linux git hint missing: $out"
 ok
 
 # ── (7) escape hatch: HERD_SKIP_DOCTOR=1 passes silently even with everything missing ────────────
@@ -155,7 +155,7 @@ git -C "$proj" init -q; git -C "$proj" config user.email t@t.t; git -C "$proj" c
 out="$(cd "$proj" && PATH="$SAFE" HERD_NONINTERACTIVE=1 bash "$HERD" init 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] || fail "(8) init should fail when a hard dep is missing (got 0): $out"
 [ ! -f "$proj/.herd/config" ] || fail "(8) init wrote .herd/config despite the doctor gate — config must not be written on a broken env"
-echo "$out" | grep -qi "herd doctor found" || fail "(8) init did not surface the doctor gate: $out"
+grep -qi "herd doctor found" <<<"$out" || fail "(8) init did not surface the doctor gate: $out"
 # ...and HERD_SKIP_DOCTOR=1 bypasses the gate so init proceeds to write config.
 out="$(cd "$proj" && PATH="$SAFE" HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(8) init with HERD_SKIP_DOCTOR=1 should proceed (got $RC): $out"
@@ -167,7 +167,7 @@ prefix="$T/optbin"; mkdir -p "$prefix"
 out="$(PATH="$SAFE" bash "$INSTALL" --dir "$prefix" 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(9) install.sh must not be blocked by missing deps (got $RC): $out"
 [ -L "$prefix/herd" ] || fail "(9) install.sh did not create the herd symlink: $out"
-echo "$out" | grep -qiE "missing|broken" || fail "(9) install.sh did not warn about missing deps: $out"
+grep -qiE "missing|broken" <<<"$out" || fail "(9) install.sh did not warn about missing deps: $out"
 ok
 
 echo "ALL PASS ($pass checks)"
