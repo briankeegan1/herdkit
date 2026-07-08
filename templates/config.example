@@ -213,6 +213,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # touches a gate or a merge decision. Ships OFF (byte-inert: every console byte identical to before).
 # WATCHER_FLAIR="off"      # off (default) | on
 
+# Cross-seat OPERATOR INBOX (HERD-184) — so coordination messages left as comments reach an autonomous
+# coordinator automatically. ON → each watcher tick surfaces NEW comments by OTHER authors as a
+# 'operator inbox' console section (needs-you-adjacent) plus one notify-once per comment: (a) a
+# PR-COMMENT feed — new comments on the open PRs this seat authored or is gating (e.g. a "don't
+# self-merge, main broke" left on a PR); (b) a TRACKER feed — new comments by other operators on items
+# this seat claimed/marked, read via the active SCRIBE_BACKEND's optional comment reader (linear).
+# ADDITIVE + FAIL-SOFT: a missing reader / api error / no credentials = empty inbox, NEVER a red row;
+# it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
+# OPERATOR_INBOX="off"     # off (default) | on
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After

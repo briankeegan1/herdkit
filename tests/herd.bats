@@ -301,6 +301,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic operator inbox (HERD-184) unit test passes" {
+  run bash "$REPO/tests/test-operator-inbox.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
