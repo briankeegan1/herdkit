@@ -91,6 +91,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic agent-runtime exec-surface bindings (HERD-150 P1) test passes" {
+  run bash "$REPO/tests/test-driver-agent-exec.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic HERD-42 A/B scorer test passes" {
   run bash "$REPO/tests/test-herd42-score.sh"
   [ "$status" -eq 0 ]
