@@ -83,8 +83,15 @@ printf '%s\n' "$OUT" | _slugs | grep -qx main             && fail "\$MAIN must n
 ok
 
 # ── The legit builder's record is byte-identical to the pre-fix 9-field format. ─────────────────────
+# The emitted dir is git's CANONICAL worktree path (`git worktree list --porcelain`), which git stores
+# symlink-RESOLVED — on macOS the $TMPDIR symlink /var/folders/… becomes /private/var/folders/…. $TREES
+# is the UNRESOLVED symlink, so build the expected dir through the SAME physical-path resolution git
+# applied (`cd … && pwd -P`), else the byte-compare splits on /var vs /private/var. That split is exactly
+# how this test (inherited from #290) first failed on macOS CI though it passes where $TMPDIR is unresolved;
+# normalizing the one machine-specific field keeps the record byte-exact AND env-robust.
 REC="$(printf '%s\n' "$OUT" | grep -F "$(printf 'feat-alpha')")"
-EXPECT="$(printf '%s\037%s\037%s\037\037\037\037\037\037' "$TREES/feat-alpha" "feat-alpha" "feat/alpha")"
+ALPHA_DIR="$(cd "$TREES/feat-alpha" && pwd -P)"
+EXPECT="$(printf '%s\037%s\037%s\037\037\037\037\037\037' "$ALPHA_DIR" "feat-alpha" "feat/alpha")"
 [ "$REC" = "$EXPECT" ] || fail "legit builder record not byte-identical.
   want: $(printf '%s' "$EXPECT" | cat -v)
   got:  $(printf '%s' "$REC" | cat -v)"
