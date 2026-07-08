@@ -198,6 +198,18 @@ TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
 # stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
 # so a missing/stale file just means "no deps to show". Path mirrors dep-watcher's <lock-stem>.states.
 DEP_STATES_FILE="${DEP_STATES_FILE:-${HERD_DEPWATCHER_LOCK%.pid}.states}"
+# Spawn-hold surface (HERD-94): the durable spawn queue supports an OPTIONAL per-intent after=<slug|pr#>
+# dependency. The drainer (_drain_spawn_queue) HOLDS such an intent until the dependency shows MERGED
+# (reap ledger $STATE, one gh fallback), then releases it FIFO. One line per currently-held intent —
+# "<intent_id> <first_held_epoch> <slug> <lane> <after>" — persists across ticks so spawn_held journals
+# ONCE (not per tick) and the stall TTL accrues from the FIRST hold. A held intent whose dependency
+# hasn't moved after DEP_STALE_TTL surfaces as a LOUD stalled console row (build_spawn_holds) — never a
+# silent forever-hold. Rows for vanished intents (spawned / skipped / operator-cleared) are pruned by
+# build_spawn_holds so the ledger cannot grow unbounded.
+SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
+# Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
+# DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
+DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -265,6 +277,7 @@ RULE=""
 LANDED=""
 BLOCKED=""
 TRACKER_DRIFT=""
+SPAWN_HOLDS=""
 DISPLAY=()
 
 # build_header — the title row + a full-width rule.
@@ -394,6 +407,49 @@ build_tracker_drift() {
   [ -n "$rows" ] && TRACKER_DRIFT="$rows"
 }
 
+# build_spawn_holds — the "spawn holds" section (HERD-94): one row per intent the durable-queue
+# drainer is HOLDING on an unmet after=<dep> dependency, read from $SPAWN_HELD_STATE
+# ("<intent_id> <first_held_epoch> <slug> <lane> <after>", written by _drain_spawn_queue). Empty
+# (SPAWN_HOLDS="") when nothing is held so render omits the section — BYTE-IDENTICAL console when the
+# after= feature is unused.
+#
+# A hold OLDER than DEP_STALE_TTL is LOUD (red ⏳ stalled) — the never-silent-forever-hold surface an
+# operator must act on (clear = remove the intent's .req; force = drop its .after sidecar). A fresh
+# hold is a calm yellow ⏳ waiting line. DEP_STALE_TTL=0 disables the stalled escalation (all holds
+# stay calm) exactly as it disables dep-watcher's stall surfacing.
+#
+# GC: this is the once-per-tick garbage-collector for $SPAWN_HELD_STATE — a row whose intent no longer
+# exists in the queue (spawned, skipped, or operator-cleared between ticks) is dropped, so the ledger
+# never accumulates stale holds. Runs each tick alongside the other build_* surfaces.
+build_spawn_holds() {
+  SPAWN_HOLDS=""
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  local _bsh_q="$TREES/spawn-queue" now rows="" kept id epoch slug lane after age human color glyph label sl
+  now="$(date +%s)"
+  kept="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null || true)"
+  while read -r id epoch slug lane after; do
+    [ -n "${id:-}" ] || continue
+    # Prune a hold whose intent is gone (spawned / skipped / operator-cleared its .req).
+    if [ ! -e "$_bsh_q/$id.req" ] && [ ! -e "$_bsh_q/$id.req.mine" ]; then
+      continue
+    fi
+    [ -n "$kept" ] && printf '%s %s %s %s %s\n' "$id" "$epoch" "$slug" "$lane" "$after" >> "$kept"
+    case "${epoch:-}" in ''|*[!0-9]*) epoch="$now" ;; esac
+    age=$(( now - epoch )); [ "$age" -lt 0 ] && age=0
+    human="$(_fmt_age "$age")"
+    if [ "${DEP_STALE_TTL:-0}" -gt 0 ] && [ "$age" -gt "$DEP_STALE_TTL" ]; then
+      color="$C_RED"; glyph='⏳'; label="stalled"
+    else
+      color="$C_YELLOW"; glyph='⏳'; label="waiting"
+    fi
+    sl="$(_slug_cell "$slug")"
+    rows="${rows}    ${color}${glyph}${C_RESET} ${color}${sl}${C_RESET} ${color}${label}${C_RESET} ${C_DIM}after ${after} · ${human}${C_RESET}"$'\n'
+  done < "$SPAWN_HELD_STATE"
+  # Swap in the pruned ledger (drops rows for vanished intents) so it can't grow unbounded.
+  if [ -n "$kept" ]; then mv -f "$kept" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$kept" 2>/dev/null; fi
+  [ -n "$rows" ] && SPAWN_HOLDS="$rows"
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -414,6 +470,9 @@ render() {
   fi
   if [ -n "${TRACKER_DRIFT:-}" ]; then
     frame="${frame}  ${C_DIM}tracker healed${C_RESET}"$'\n'"${TRACKER_DRIFT}"$'\n'
+  fi
+  if [ -n "${SPAWN_HOLDS:-}" ]; then
+    frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
   fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
@@ -3454,6 +3513,63 @@ else
 fi
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
+# ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
+# _spawn_dep_merged <after> — is a spawn intent's after=<slug|pr#> dependency MERGED? Returns 0 (met)
+# for an EMPTY dependency (an intent with no after= is trivially releasable — the byte-identical path).
+# Otherwise consult the SAME source _startup_reap_sweep trusts: the reap ledger $STATE, whose rows are
+# "<epoch> <pr#> <slug> [ref]". A numeric dependency matches the PR column ($2); a slug matches the
+# slug column ($3). If the ledger has no record (e.g. a collaborator/main-checkout merge this watcher
+# never ledgered), FALL BACK to exactly one gh check: a PR number by itself, a slug by its feat/<slug>
+# branch. Any non-MERGED / gh-unreachable result => not met (0/return 1) so the intent stays held —
+# a held intent is loud (the stalled row), never a silently-dropped one.
+_spawn_dep_merged() {
+  local _sdm_after="${1:-}"
+  [ -n "$_sdm_after" ] || return 0
+  if [ -s "$STATE" ]; then
+    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then
+      awk -v p="$_sdm_after" 'NF>=2 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    else
+      awk -v s="$_sdm_after" 'NF>=3 && $3==s{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    fi
+  fi
+  # Fallback: one gh state read (the ledger is authoritative for THIS watcher's merges but blind to a
+  # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
+  [ -z "${DRYRUN:-}" ] || return 1
+  local _sdm_target
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="feat/$_sdm_after"; fi
+  [ "$(gh pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
+  return 1
+}
+
+# _spawn_held_epoch <intent_id> — echo the first-held epoch recorded for this intent (empty if none).
+_spawn_held_epoch() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  awk -v id="$1" '$1==id{e=$2} END{if(e)print e}' "$SPAWN_HELD_STATE" 2>/dev/null
+}
+
+# _spawn_mark_held <intent_id> <slug> <lane> <after> — record a hold the FIRST time only, journaling
+# spawn_held ONCE with the dependency named. Idempotent across ticks: a row already present (the intent
+# was held on a prior tick and released back to .req) is left untouched, so the stall TTL keeps accruing
+# from the original hold and spawn_held is never re-journaled tick-over-tick.
+_spawn_mark_held() {
+  local _smh_id="$1" _smh_slug="$2" _smh_lane="$3" _smh_after="$4"
+  [ -n "$(_spawn_held_epoch "$_smh_id")" ] && return 0
+  printf '%s %s %s %s %s\n' "$_smh_id" "$(date +%s)" "$_smh_slug" "$_smh_lane" "$_smh_after" >> "$SPAWN_HELD_STATE"
+  journal_append spawn_held slug "$_smh_slug" lane "$_smh_lane" after "$_smh_after"
+}
+
+# _spawn_clear_held <intent_id> — drop this intent's hold row (dependency met / spawned / skipped). A
+# no-op when no row exists, so calling it on an intent that was never held is harmless.
+_spawn_clear_held() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  local _sch_tmp; _sch_tmp="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v id="$1" '$1!=id' "$SPAWN_HELD_STATE" > "$_sch_tmp" 2>/dev/null; then
+    mv -f "$_sch_tmp" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$_sch_tmp" 2>/dev/null
+  else
+    rm -f "$_sch_tmp" 2>/dev/null
+  fi
+}
+
 # ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
 # _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
 # ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
@@ -3472,6 +3588,15 @@ fi
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
 # post-mortem can answer "why did nothing spawn?" from `herd log` alone.
 #
+# DEPENDENCY ORDERING (HERD-94): an intent may carry an after=<slug|pr#> (the .after sidecar, surfaced
+# as the 4th claim line). While that dependency is NOT yet MERGED the intent is HELD: it stays claimed
+# (.req.mine) for THIS tick so `next` skips past it to younger, independent intents — one stalled
+# dependency never freezes the whole queue — and every held intent is RELEASED back to .req at the end
+# of the tick to be re-checked next time. The hold is journaled spawn_held ONCE (via $SPAWN_HELD_STATE)
+# and surfaces on the console (build_spawn_holds), going LOUD (stalled) past DEP_STALE_TTL. When the
+# dependency finally merges the intent spawns in the same FIFO order it would have without after=, and
+# spawn_released is journaled. Intents with NO after= are byte-identical to the pre-HERD-94 path.
+#
 # The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
 # multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
 #
@@ -3489,17 +3614,19 @@ _drain_spawn_queue() {
   _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
   [ "$_dsq_budget" -le 0 ] && return 0
 
-  local _dsq_n=0
+  local _dsq_n=0 _dsq_held=()
   while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
     # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
-    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), then the
-    # task as EVERYTHING after them. The ref line is ALWAYS present so this positional read stays fixed.
-    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_task=""
+    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), after
+    # dependency (HERD-94; empty for none), then the task as EVERYTHING after them. The ref AND after
+    # lines are ALWAYS present so this positional read stays fixed.
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_after="" _dsq_task=""
     {
       IFS= read -r _dsq_line1
       IFS= read -r _dsq_slug
       IFS= read -r _dsq_lane
       IFS= read -r _dsq_ref
+      IFS= read -r _dsq_after
       _dsq_task="$(cat)"
     } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
 
@@ -3520,6 +3647,22 @@ _drain_spawn_queue() {
             journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "unknown lane"
             _dsq_n=$(( _dsq_n + 1 )); continue ;;
         esac
+        # HERD-94 dependency hold: an intent with after=<slug|pr#> waits until that dependency shows
+        # MERGED. Unmet → DEFER: keep the claim (so this tick's later `next` calls skip it) and stash it
+        # for an end-of-tick release; record + journal the hold ONCE. Crucially we do NOT spend budget
+        # (_dsq_n unchanged) or `break`, so independent younger intents keep draining past a held one.
+        local _dsq_id; _dsq_id="$(basename "${_dsq_claimed%.req.mine}")"
+        if [ -n "$_dsq_after" ] && ! _spawn_dep_merged "$_dsq_after"; then
+          _spawn_mark_held "$_dsq_id" "$_dsq_slug" "$_dsq_lane" "$_dsq_after"
+          _dsq_held+=("$_dsq_claimed")
+          continue
+        fi
+        # Dependency met (or none). If this intent had been held on a prior tick, announce the release
+        # (spawn_released, dependency named) and clear its hold row before it spawns below.
+        if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
+          journal_append spawn_released slug "$_dsq_slug" lane "$_dsq_lane" after "$_dsq_after"
+          _spawn_clear_held "$_dsq_id"
+        fi
         # Launch the lane in the FOREGROUND and observe the outcome before consuming the intent.
         # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
         # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
@@ -3551,6 +3694,16 @@ _drain_spawn_queue() {
         ;;
     esac
   done
+  # Release every dependency-held intent back to .req for a later tick. They were kept claimed only so
+  # `next` skipped them this tick; releasing preserves the .after (+ .ref) sidecar so the hold — and its
+  # accruing stall TTL — survives. Order is preserved: they re-enter under their original INTENT_ID
+  # filenames, which sort oldest-first, so FIFO among releasable intents holds.
+  if [ "${#_dsq_held[@]}" -gt 0 ]; then
+    local _dsq_h
+    for _dsq_h in "${_dsq_held[@]}"; do
+      bash "$HERE/spawn-step.sh" release "$_dsq_h" >/dev/null 2>&1 || true
+    done
+  fi
 }
 
 _ORPHAN_SWEEP_TICK=0
@@ -3574,6 +3727,7 @@ while true; do
   build_landed
   build_blocked
   build_tracker_drift
+  build_spawn_holds
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
