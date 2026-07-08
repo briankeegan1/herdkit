@@ -67,6 +67,7 @@ Role summarized from each file's top-of-file comment.
 
 - `capabilities.tsv` — (tab-separated manifest — no header comment)
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
+- `conformance.tsv` — (tab-separated manifest — no header comment)
 - `coordinator.md.tmpl` — (render template — no header comment)
 - `fleet-coordinator.md.tmpl` — (render template — no header comment)
 - `governance-map.tsv` — templates/governance-map.tsv — the DETERMINISTIC governance-adoption pattern table (HERD-119).
