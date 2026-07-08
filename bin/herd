@@ -1460,6 +1460,17 @@ _config_file_value() {
     }' "$1"
 }
 
+# _config_file_has_key <cfg> <KEY> → exit 0 when KEY is ASSIGNED in the config file (first assignment;
+# comments ignored, same parse as _config_file_value), 1 otherwise. Presence, not value — it lets
+# cmd_config_get honor an overlay key that overrides the baseline even when the overlay assigns it the
+# EMPTY string (shell-source last-wins), which a bare value read cannot distinguish from "unset".
+_config_file_has_key() {
+  awk -v k="$2" '
+    { line=$0; sub(/^[[:space:]]+/,"",line) }
+    index(line, k "=")==1 { found=1; exit }
+    END { exit(found?0:1) }' "$1"
+}
+
 # _config_put_value <cfg> <KEY> <VALUE> — idempotent, targeted in-place write of KEY="VALUE" into the
 # config: replaces the FIRST KEY= line (preserving its leading indentation) or appends when absent,
 # leaving every other line and comment untouched. This is the SAME edit primitive `herd config set`
@@ -1677,12 +1688,20 @@ cmd_config_list() {
 cmd_config_get() {
   local key="${1:-}"
   [ -n "$key" ] || die "usage: herd config get <KEY>"
-  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
   _config_key_requires "$caps" "$key" >/dev/null \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
+  # HERD-142: resolve through the SAME baseline+overlay precedence herd-config.sh sources at runtime
+  # (HERD-47 contract) — baseline first, then the per-user overlay .herd/config.local OVERRIDES it. A
+  # key the overlay assigns wins even when set to the empty string (shell-source last-wins), hence the
+  # presence check rather than a non-empty test. When config.local is absent, or is present but does
+  # not assign this key, the baseline value stands and output is byte-identical to before.
   local val; val="$(_config_file_value "$cfg" "$key")"
+  if [ -f "$local_cfg" ] && _config_file_has_key "$local_cfg" "$key"; then
+    val="$(_config_file_value "$local_cfg" "$key")"
+  fi
   { _config_secret_key "$key" && [ -n "$val" ]; } && val='********'
   printf '%s\n' "$val"
 }
