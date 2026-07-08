@@ -376,3 +376,33 @@ never touches them — the rendered skill is unchanged. No runtime script reads 
 is a before/after `herd render` diff (empty) plus `tests/test-driver-agent-exec.sh`, which asserts
 both `.driver` files parse with the extended format, every class is bound in **both** drivers, the
 bindings are zero-secret, and none of their values leak into a rendered skill.
+
+### Model matrix — runtime-qualified `MODEL_*` refs (HERD-151)
+
+Building on P1's audit, every `MODEL_*` config value accepts an optionally runtime-qualified ref
+**`<driver>:<model>`**: a **bare** model id (no colon) resolves to the **default driver**
+(`herd_driver_name`) — byte-identical to before — while a `<driver>:` prefix pins that role's agent to
+a shipped runtime driver (`templates/drivers/<name>.driver`) **and** model. This is the config surface
+that will let the P2–P5 routing send different roles to different runtimes.
+
+**Seam: `scripts/herd/driver.sh`, not `herd-config.sh`.** A model ref binds a role to a *runtime*, and
+the runtime surface is exactly what the P1 `DRIVER_AGENT_*` audit factored into the `.driver` files.
+The valid-driver set *is* the `templates/drivers/*.driver` enumeration `render_skill()` already
+validates `HERD_DRIVER` against, so the resolver reuses that ground truth and sits next to the exec
+bindings the routing phases will thread the resolved `(driver, model)` through. `driver.sh` is already
+sourced by every spawn lane and by `bin/herd`, so one helper covers the whole spawn surface;
+`herd-config.sh` only sets defaults and is sourced *everywhere*, where a loud resolver would be the
+wrong altitude (config load must never abort — a spawn must, on a bad ref).
+
+The resolver (`herd_model_resolve` / `herd_model_for_spawn`) is a **deliberate exception** to
+`driver.sh`'s fail-soft rule: an **unknown driver prefix is a LOUD hard error at spawn time**, never a
+silent `claude` fallback — a misconfigured ref is an operator error that must stop the spawn, not
+downgrade to the wrong runtime. Fail-soft still protects the pane/mux capabilities (a missing `herdr`
+never blocks the merge gate). The spawn lanes wrap their finalized model as
+`MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1`; the driver shims (`herd_driver_start_agent` /
+`herd_driver_launch_agent`) resolve centrally so every routed lane is covered.
+
+An advisory **suggestions catalog** (`templates/models.tsv`, browsable via `herd config models`) backs
+`herd config set MODEL_*` with a tier/role-fit hint; it never refuses a model. `cost.sh` surfaces an
+unknown/foreign model as an explicit `unpriced` marker rather than a silent `$0`. Proof:
+`tests/test-model-matrix.sh`.

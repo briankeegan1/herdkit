@@ -79,6 +79,11 @@ if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
   fi
 fi
+# Resolve an optionally runtime-qualified model ref (HERD-151) into the bare model this lane spawns
+# `claude --model` on. Loud-fails at spawn time on an unknown driver prefix (never a silent claude
+# fallback); byte-identical for a bare model id. This lane builds the herdr argv directly (not via the
+# start-agent shim), so it resolves here.
+MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if

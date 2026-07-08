@@ -1,0 +1,27 @@
+model_ref	tier	role_fit	as_of
+# templates/models.tsv — the MODEL SUGGESTIONS CATALOG (HERD-151): an ADVISORY, perishable list of
+# model refs an operator can point a MODEL_* role at, with a coarse tier judgment, a role-fit hint, and
+# an as-of date. `herd config set MODEL_*` reads this to SUGGEST a fit (and to soft-note a ref that is
+# not catalogued) — it NEVER refuses an operator's model: an unknown ref is allowed with a soft note,
+# because CLAUDE.md/catalog/manual-set are COEQUAL sources, none required (the standing directive).
+#
+# Perishable like cost.sh's price table: model ids, tiers, and role-fit drift as runtimes ship — bump
+# a row's as_of when you revisit it. NOT a gate: a stale/missing row never blocks a spawn or a merge.
+#
+# A value may be runtime-qualified '<driver>:<model>' (a role on a non-Claude runtime); the catalog is
+# keyed by the BARE model id, and the '<driver>:' prefix is validated against templates/drivers/ at
+# SPAWN time (driver.sh), not here. Add a row to catalog a foreign model (and to price it, add it to
+# cost.sh's table too, else it surfaces as `unpriced` in `herd cost`).
+#
+# TAB-separated. Blank and '#'-prefixed lines are ignored; the first line is the header.
+# tier vocabulary (coarse fit bucket): judgment | balanced | cheap | docs.
+#   judgment  strongest reasoning — coordinator, feature/review ESCALATION tiers, hard judgment calls
+#   balanced  default-tier feature/review/scribe/research work — good cost/quality tradeoff
+#   cheap     mechanical / trivial lanes — quick + resolver, and the cheapest reviewer tier
+#   docs      pure-docs review (DOCS_ONLY_GLOB / REVIEW_MODEL_DOCS) — cheapest adversarial pass
+claude-opus-4-8	judgment	coordinator; feature/review escalation tier; the strongest judgment	2026-07-08
+claude-opus-4-7	judgment	prior Opus — judgment work when 4-8 is unavailable	2026-07-08
+claude-fable-5	judgment	premium long-form / creative reasoning; specialized judgment	2026-07-08
+claude-sonnet-5	balanced	strong balanced tier for feature build and pre-merge review	2026-07-08
+claude-sonnet-4-6	balanced	default feature / review / scribe / research tier; balanced cost/quality	2026-07-08
+claude-haiku-4-5	cheap	quick + resolver lanes; also the docs-tier reviewer (REVIEW_MODEL_DOCS)	2026-07-08

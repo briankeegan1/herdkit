@@ -36,3 +36,6 @@ APP_PREVIEW_SERVER_ARGS	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_PATH	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_PORT_BASE	unit	tests/test-app-preview-config.sh
+MODEL_* ref <driver>:<model>	unit	tests/test-model-matrix.sh
+templates/models.tsv	unit	tests/test-model-matrix.sh
+herd config models	unit	tests/test-model-matrix.sh

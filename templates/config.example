@@ -108,6 +108,13 @@ SMOKE_CMD=""                        # optional; an extra smoke gate used by the 
 # default — reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
 # (review gate). An explicit MODEL_* key here ALWAYS beats the starter default (TOKEN_MODE and the
 # escalate globs compose on top of whatever you set).
+#
+# Every MODEL_* value accepts an optionally runtime-qualified ref '<driver>:<model>' (HERD-151): a BARE
+# model id (as below) runs on the default driver — byte-identical to before — while a '<driver>:' prefix
+# pins that role to a shipped runtime driver (templates/drivers/<name>.driver), e.g.
+# MODEL_QUICK="headless:claude-haiku-4-5". An unknown driver prefix FAILS LOUDLY at spawn time (never a
+# silent fallback). 'herd config set MODEL_*' suggests from templates/models.tsv (see 'herd config
+# models'); an uncatalogued model is allowed with a soft note — your model is never refused.
 MODEL_COORDINATOR="claude-opus-4-8"
 MODEL_FEATURE="claude-sonnet-4-6"   # eco default; escalate to Opus via MODEL_ESCALATE_GLOB
 MODEL_QUICK="claude-haiku-4-5"      # trivial lane → cheapest tier
