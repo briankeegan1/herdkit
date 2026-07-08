@@ -70,9 +70,25 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] \
   # failed assertion line). Older bats-core lacks the flag → fall back to a plain run.
   bats_flags="--tap"
   bats --print-output-on-failure --version >/dev/null 2>&1 && bats_flags="--tap --print-output-on-failure"
+  # HANG-PROOFING (a headless CI leg once stalled for 25 min):
+  #   • Redirect bats to a FILE, never a $(...) capture — a test that leaks a background process
+  #     inheriting the capture pipe's write end makes command substitution block on EOF forever,
+  #     even after bats itself exits. A file redirect only waits on bats (its direct child).
+  #   • BATS_TEST_TIMEOUT kills any single wedged test so bats keeps going (it becomes `not ok`).
+  #   • An overall `timeout` wrapper (when available) bounds the whole run as a last-resort backstop.
+  #   • stdin from /dev/null so nothing blocks reading a tty that isn't there.
+  bats_tap="$(mktemp 2>/dev/null || echo /tmp/herd-bats.$$.tap)"
+  TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 900"
+  command -v timeout >/dev/null 2>&1 || { command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 900"; }
   # shellcheck disable=SC2086
-  bats_out="$(bats $bats_flags "$TESTS_DIR"/*.bats 2>&1)"; bats_rc=$?
-  printf '%s\n' "$bats_out"
+  BATS_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-180}" $TO bats $bats_flags "$TESTS_DIR"/*.bats </dev/null >"$bats_tap" 2>&1
+  bats_rc=$?
+  cat "$bats_tap"
+  bats_out="$(cat "$bats_tap")"
+  if [ "$bats_rc" -eq 124 ]; then
+    echo "❌ CI SUITE FAILED (bats) on ${PLATFORM}: overall run exceeded the 900s cap (a test likely leaked a background process). Last TAP line: $(tail -1 "$bats_tap")"
+    exit 1
+  fi
   if [ "$bats_rc" -eq 0 ]; then
     echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM}"
     exit 0
@@ -86,7 +102,8 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] \
       "not ok "*) : ;;
       *) continue ;;
     esac
-    desc="$(printf '%s' "$line" | sed -E 's/^not ok [0-9]+ //')"
+    # Strip the leading `not ok <n> ` and any trailing TAP directive (` # timeout after …`, ` # SKIP …`).
+    desc="$(printf '%s' "$line" | sed -E 's/^not ok [0-9]+ //; s/ # .*$//')"
     if reason="$(allow_reason "$desc")"; then
       xf=$((xf+1)); echo "⚠️  XFAIL (env-sensitive) bats: $desc — $reason"
     else
