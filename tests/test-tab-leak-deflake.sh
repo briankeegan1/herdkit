@@ -61,10 +61,13 @@ _hk_regtabs() {
 
 _hk_orphans() {
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr tab list 2>/dev/null | WSID="${1:-}" REGTABS="$(_hk_regtabs)" python3 -c '
+  herdr tab list 2>/dev/null | WSID="${1:-}" REGTABS="$(_hk_regtabs)" WLSLUGS="${2:-}" python3 -c '
 import sys, json, os, re
 _ENGINE = re.compile(r"^(scribe-|resolve·|research|herd-watch|backlog|coordinator)")
 _REGTABS = set(filter(None, (os.environ.get("REGTABS", "") or "").split()))
+# HERD-115 worktree-slug whitelist (in LOCKSTEP with .herd/healthcheck.project.sh; unused by these
+# fixtures — always empty here — kept so this mirror matches the real _hk_orphans signature exactly).
+_WLSLUGS = set(filter(None, (os.environ.get("WLSLUGS", "") or "").splitlines()))
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
     wsid = os.environ.get("WSID", "")
@@ -73,7 +76,8 @@ try:
     orphans = [t for t in tabs
                if str(t.get("agent_status", "")) not in ("idle", "working")
                and not _ENGINE.match(str(t.get("label", "")))
-               and str(t.get("tab_id", "")) not in _REGTABS]
+               and str(t.get("tab_id", "")) not in _REGTABS
+               and str(t.get("label", "")) not in _WLSLUGS]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
     for lbl in sorted(str(t.get("label", "")) for t in orphans):
