@@ -133,6 +133,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic mid-flight advisor (HERD-101) test passes" {
+  run bash "$REPO/tests/test-advise.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-mode codemap test passes" {
   run bash "$REPO/tests/test-codemap-project.sh"
   [ "$status" -eq 0 ]

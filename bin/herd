@@ -971,6 +971,14 @@ cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
 # WORKTREES_DIR/.herd/ledger.jsonl. Default-dormant: with no writes, no file exists and nothing runs.
 cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
 
+# ── herd advise: a mid-flight strong-model second opinion for a builder (HERD-101) ───────────────
+# A builder on a cheaper tier calls `herd advise "<question>" [context…]` to pull a ONE-SHOT read
+# from a strong advisor model (MODEL_ADVISE, default the MODEL_FEATURE/Opus tier) WITHOUT escalating
+# its whole lane. The advice is printed to stdout for the builder to read; no agent, no tab, no repo
+# mutation. Delegates to scripts/herd/herd-advise.sh, which is ADDITIVE + FAIL-SOFT: an absent
+# advisor model or a failed model call degrades to a clear one-line message, never a hard error.
+cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -4063,6 +4071,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                         rm <id>            tombstone an item out of get/list
                                         compact            fold history to one line per live item
                                         path               print the ledger file path
+  herd advise "<question>" [context…] mid-flight ADVISOR: a builder pulls a ONE-SHOT second opinion
+                                      from a strong advisor model (MODEL_ADVISE, default the
+                                      MODEL_FEATURE/Opus tier) on a hard decision WITHOUT escalating
+                                      its whole lane; prints the advice to stdout. Extra args (and
+                                      piped stdin) are appended as context. Additive + fail-soft: an
+                                      absent model or a failed call degrades to a clear message
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -4172,6 +4186,7 @@ case "${1:-help}" in
   codemap) shift; cmd_codemap "$@" ;;
   symbol-index) shift; cmd_symbol_index "$@" ;;
   ledger)  shift; cmd_ledger "$@" ;;
+  advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
