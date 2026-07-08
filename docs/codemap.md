@@ -57,6 +57,7 @@ Role summarized from each file's top-of-file comment.
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
 - `spawn.sh` — spawn.sh <slug> <lane> <task> — ENQUEUE a builder spawn intent to the durable spawn queue and
 - `status.sh` — pure helpers + the orchestrator behind `herd status`, a ONE-SHOT, READ-ONLY,
+- `steps.sh` — the shared PIPELINE STEPS runner (HERD-132): operator-defined lane stages with
 - `symbol-index.sh` — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
@@ -75,13 +76,14 @@ Role summarized from each file's top-of-file comment.
 - `healthcheck.project.sh` — healthcheck.project.sh (EXAMPLE) — the per-project health command the generic
 - `healthcheck.rust.sh` — healthcheck.rust.sh (EXAMPLE) — a per-project health command for a Rust (Cargo) project.
 - `links.example` — .herd/links — cross-repo link registry. Commit this (code-shaped config, zero-secret).
+- `steps.example` — .herd/steps.tsv — declarative PIPELINE STEP LIST (HERD-132). Commit this (code-shaped config,
 
 ## Who sources whom
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
 - `bin/herd` → `cost.sh`, `driver.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `status.sh`, `theme.sh`
-- `agent-watch.sh` → `cost.sh`, `driver.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `theme.sh`
+- `agent-watch.sh` → `cost.sh`, `driver.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -93,10 +95,10 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
 - `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
 - `herd-advise.sh` → `herd-config.sh`
-- `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `theme.sh`
+- `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
-- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
-- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
+- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
 - `herd-review.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
@@ -109,6 +111,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
+- `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `herd-config.sh`, `journal.sh`
@@ -173,7 +176,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MODEL_RESOLVER` → `herd-resolve.sh`
 - `MODEL_REVIEW` → `bin/herd`, `agent-watch.sh`, `herd-review.sh`
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
-- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `theme.sh`, `tracker-state-sweep.sh`
+- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `push-gate.sh`
@@ -203,4 +206,4 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `fleet.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `tracker-state-sweep.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `fleet.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`
