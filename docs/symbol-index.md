@@ -53,7 +53,7 @@ this scan cannot see).
 - `_breaker_record_ok` — def `scripts/herd/agent-watch.sh:1140` — callers: —
 - `_breaker_write` — def `scripts/herd/agent-watch.sh:1107` — callers: —
 - `_build_request` — def `scripts/herd/backlog-reconcile-sweep.sh:304`, `scripts/herd/backlog-reconcile.sh:145` — callers: —
-- `_changed_files` — def `scripts/herd/healthcheck.sh:73` — callers: —
+- `_changed_files` — def `scripts/herd/healthcheck.sh:74` — callers: —
 - `_changelog_ensure_unreleased` — def `scripts/herd/backends/changelog.sh:13` — callers: —
 - `_classify_builder` — def `scripts/herd/agent-watch.sh:3440` — callers: —
 - `_classify_conflict` — def `scripts/herd/agent-watch.sh:1580` — callers: —
@@ -226,12 +226,12 @@ this scan cannot see).
 - `_healthcheck_template_for` — def `bin/herd:316` — callers: —
 - `_herd_agent_dir` — def `scripts/herd/driver.sh:146` — callers: —
 - `_herd_agents_dir` — def `scripts/herd/driver.sh:142` — callers: —
-- `_herd_attr_scan` — def `scripts/herd/commit-lint.sh:21` — callers: `scripts/herd/healthcheck.sh:234`
+- `_herd_attr_scan` — def `scripts/herd/commit-lint.sh:21` — callers: `scripts/herd/healthcheck.sh:247`
 - `_herd_branch_template` — def `scripts/herd/herd-config.sh:1131` — callers: —
 - `_herd_brand` — def `scripts/herd/herd-preflight.sh:31` — callers: —
 - `_herd_claim_dispatch` — def `scripts/herd/herd-claim.sh:63` — callers: —
 - `_herd_claim_identity` — def `scripts/herd/herd-claim.sh:51` — callers: —
-- `_herd_commit_convention_scan` — def `scripts/herd/commit-lint.sh:47` — callers: `scripts/herd/healthcheck.sh:266`
+- `_herd_commit_convention_scan` — def `scripts/herd/commit-lint.sh:47` — callers: `scripts/herd/healthcheck.sh:279`
 - `_herd_commit_shas` — def `scripts/herd/commit-lint.sh:10` — callers: —
 - `_herd_config_dup_keys` — def `scripts/herd/herd-config.sh:39` — callers: `bin/herd:1678`, `scripts/herd/herd-preflight.sh:556`
 - `_herd_config_warn_dupes` — def `scripts/herd/herd-config.sh:60` — callers: —
@@ -695,14 +695,14 @@ this scan cannot see).
 - `review_verdict` — def `scripts/herd/agent-watch.sh:693` — callers: —
 - `review_verdict_source` — def `scripts/herd/agent-watch.sh:704` — callers: —
 - `rich_to_md` — def `scripts/herd/backlog-view.sh:223` — callers: —
-- `run_attribution_lint` — def `scripts/herd/healthcheck.sh:228` — callers: —
+- `run_attribution_lint` — def `scripts/herd/healthcheck.sh:241` — callers: —
 - `run_backend_mode` — def `scripts/herd/backlog-view.sh:406` — callers: —
-- `run_commit_convention_lint` — def `scripts/herd/healthcheck.sh:254` — callers: —
-- `run_heavy` — def `scripts/herd/healthcheck.sh:100` — callers: —
-- `run_interaction_gate` — def `scripts/herd/healthcheck.sh:282` — callers: —
-- `run_light` — def `scripts/herd/healthcheck.sh:125` — callers: —
+- `run_commit_convention_lint` — def `scripts/herd/healthcheck.sh:267` — callers: —
+- `run_heavy` — def `scripts/herd/healthcheck.sh:113` — callers: —
+- `run_interaction_gate` — def `scripts/herd/healthcheck.sh:295` — callers: —
+- `run_light` — def `scripts/herd/healthcheck.sh:138` — callers: —
 - `run_migrations` — def `bin/herd:1090` — callers: —
-- `run_profile` — def `scripts/herd/healthcheck.sh:312` — callers: —
+- `run_profile` — def `scripts/herd/healthcheck.sh:325` — callers: —
 - `say` — def `bin/herd:99` — callers: `scripts/herd/fleet.sh:156`, `scripts/herd/fleet.sh:167`, `scripts/herd/fleet.sh:169`, `scripts/herd/fleet.sh:170`, `scripts/herd/fleet.sh:274`, `scripts/herd/fleet.sh:276`, `scripts/herd/fleet.sh:278`, `scripts/herd/fleet.sh:280`, `scripts/herd/fleet.sh:282`, `scripts/herd/fleet.sh:372`, `scripts/herd/fleet.sh:391`, `scripts/herd/fleet.sh:395`, `scripts/herd/fleet.sh:396`, `scripts/herd/fleet.sh:428`, `scripts/herd/fleet.sh:429`, `scripts/herd/fleet.sh:714`, `scripts/herd/fleet.sh:721`, `scripts/herd/fleet.sh:1005`, `scripts/herd/fleet.sh:1012`, `scripts/herd/fleet.sh:1085`, `scripts/herd/fleet.sh:1089`, `scripts/herd/fleet.sh:1090`, `scripts/herd/fleet.sh:1124`, `scripts/herd/fleet.sh:1126`, `scripts/herd/fleet.sh:1241`, `scripts/herd/fleet.sh:1242`, `scripts/herd/fleet.sh:1243`, `scripts/herd/fleet.sh:1265`, `scripts/herd/fleet.sh:1316`, `scripts/herd/fleet.sh:1317`, `scripts/herd/fleet.sh:1321`
 - `scanq` — def `scripts/herd/codemap.sh:477` — callers: —
 - `scout_repo` — def `bin/herd:294` — callers: —
@@ -730,6 +730,6 @@ this scan cannot see).
 - `steps_validate` — def `scripts/herd/steps.sh:95` — callers: —
 - `stripws` — def `bin/herd:1772` — callers: —
 - `trim` — def `scripts/herd/codemap.sh:278` — callers: —
-- `usage` — def `bin/herd:5208` — callers: `scripts/herd/agent-watch.sh:2913`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/fleet.sh:697`, `scripts/herd/fleet.sh:982`, `scripts/herd/fleet.sh:1065`, `scripts/herd/fleet.sh:1089`, `scripts/herd/fleet.sh:1218`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:59`, `scripts/herd/herd-approve.sh:163`, `scripts/herd/tracker-state-sweep.sh:56`
+- `usage` — def `bin/herd:5208` — callers: `scripts/herd/agent-watch.sh:2913`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/fleet.sh:697`, `scripts/herd/fleet.sh:982`, `scripts/herd/fleet.sh:1065`, `scripts/herd/fleet.sh:1089`, `scripts/herd/fleet.sh:1218`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:60`, `scripts/herd/herd-approve.sh:163`, `scripts/herd/tracker-state-sweep.sh:56`
 - `valof` — def `bin/herd:1778` — callers: —
 - `warn` — def `bin/herd:101` — callers: `scripts/herd/agent-watch.sh:526`, `scripts/herd/fleet.sh:128`, `scripts/herd/fleet.sh:238`, `scripts/herd/fleet.sh:239`, `scripts/herd/fleet.sh:1134`, `scripts/herd/herd-preflight.sh:469`, `scripts/herd/herd-preflight.sh:472`, `scripts/herd/herd-preflight.sh:496`, `scripts/herd/herd-preflight.sh:500`, `scripts/herd/herd-preflight.sh:511`, `scripts/herd/herd-preflight.sh:517`, `scripts/herd/herd-preflight.sh:535`, `scripts/herd/herd-preflight.sh:538`, `scripts/herd/steps.sh:109`, `scripts/herd/steps.sh:131`
