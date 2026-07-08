@@ -515,6 +515,39 @@ _fmt_age() {
   fi
 }
 
+# ── Closed operator-facing console vocabulary (HERD-172) ──────────────────────────────────────────
+# An operator scans this console for the ONE row that needs THEM. A row that just says "idle" defeats
+# that scan: it has no OWNER (whose move is it?) and no AGE (fresh-and-fine, or forgotten-and-stuck?),
+# so it reads identically whether the herd is healthy-and-waiting or quietly wedged. The word is BANNED
+# from operator-facing rows. Every non-working row instead names its owner and carries an age, drawn
+# from this closed set (the states #289's async dispatch/collect machinery already tracks — this layer
+# only gives them a consistent, honest vocabulary):
+#   • working                            — the HERD's move; a builder/gate is making progress
+#                                          (building… · health-check · running 3m · review · running …).
+#   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, no PR.
+#                                          Carries the idle age so a just-freed spare (0s) reads apart
+#                                          from a forgotten one (2h, reap it). Calm — benign, not an alarm.
+#   • parked · <cause> · retry <eta>     — the HERD's move; auto-recovering on its own (a limit-hit
+#                                          auto-resume names its reset ETA; see _handle_limit_blocked).
+#   • needs-you · <blocker> · <remedy>   — YOUR move; a red hold that will NOT clear itself (dead
+#                                          builder, not-mergeable, stale/duplicate, review-infra failed).
+# A closed-vocabulary guard test greps this file's DISPLAY[…] assignments and fails on any 'idle' word,
+# so the ban is a ratchet, not a convention. FLAIR_STATE tokens are INTERNAL enums (they map to pasture
+# glyphs, never to operator text), so 'idle' survives there unchanged — the flair frame stays byte-exact.
+
+# _row_awaiting_task <slug-cell> <worktree> — the closed-vocabulary console row for a live, non-working
+# builder that has no PR: a spare awaiting a task. Renders (calm/dim — benign, never a red alarm) the
+# owner (yours: assign work or retire the worktree) and the age since the worktree was born, so the row
+# answers whose-move-is-it AND how long it has waited. Replaces the banned, ownerless, ageless
+# "idle · no PR". Age uses _now_epoch (HERD_FAKE_NOW-overridable) so it is deterministic under test.
+_row_awaiting_task() {
+  local _sl="$1" _wt="$2" _age _born
+  _born="$(_worktree_born "$_wt")"
+  _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
+  printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
+    "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
 # ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
 # An ADDITIVE cosmetic layer, gated by WATCHER_FLAIR (default off). Two surfaces, both assembled from
 # state the watcher already computes, both colored ONLY via theme.sh's C_* vars (so NO_COLOR / non-tty
@@ -544,7 +577,7 @@ _flair_enabled() {
 _flair_glyph() {
   case "$1" in
     grazing)   printf '%s🐑%s' "$C_GREEN"  "$C_RESET" ;;   # building
-    idle)      printf '%s💤%s' "$C_DIM"    "$C_RESET" ;;   # idle · no PR
+    idle)      printf '%s💤%s' "$C_DIM"    "$C_RESET" ;;   # awaiting task (spare builder, no PR)
     pen)       printf '%s✅%s' "$C_GREEN"  "$C_RESET" ;;   # done / ready
     dead)      printf '%s💀%s' "$C_RED"    "$C_RESET" ;;   # dead builder — LOUD, byte-as-today
     attention) printf '%s⚠️%s'  "$C_RED"    "$C_RESET" ;;   # needs-you / not-mergeable / failed — LOUD
@@ -3862,7 +3895,7 @@ _handle_coordinator_watchdog() {
 #   3. TRANSCRIPT GROWTH  — the Claude session transcript grew since the last poll ⇒ building
 #      (a one-way veto: it can only ever RESCUE a builder from a stall, never cause one)
 #   4. otherwise (clean/quiet tree, zero commits, flat transcript) ⇒ the "no activity" warning
-# The genuinely-dead case (agent_status != "working") is handled by the caller as "idle · no PR".
+# The genuinely-dead case (agent_status != "working") is handled by the caller as "awaiting task".
 
 # file_mtime / _file_size — portable stat helpers (GNU stat -c vs BSD/macOS stat -f), detected once
 # at load, mirroring backlog-view.sh's pattern.
@@ -5415,7 +5448,7 @@ EOF
         # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
         # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
         # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
-        # otherwise it is the benign "idle · no PR". An existing record keeps the row (and the
+        # otherwise it is the benign "awaiting task" spare row. An existing record keeps the row (and the
         # scheduled resume) alive across ticks even after the transient signal clears.
         if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
@@ -5437,7 +5470,10 @@ EOF
               fi
               FLAIR_STATE[i]="dead" ;;
             *)
-              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+              # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
+              # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
+              # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
+              DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
               FLAIR_STATE[i]="idle" ;;
           esac
         fi

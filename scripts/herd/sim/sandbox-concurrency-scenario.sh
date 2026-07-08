@@ -832,7 +832,7 @@ step flair "flair pack (HERD-147): OFF byte-identical · ON adds a pasture heade
 DISPLAY=(); FLAIR_STATE=()
 DISPLAY+=("    ${c_red:-}💀${c_rst:-} dead-builder · builder died (no agent, no PR) · re-spawn"); FLAIR_STATE+=("dead")
 DISPLAY+=("    🔨 graze-a · building");                                                          FLAIR_STATE+=("grazing")
-DISPLAY+=("    🔨 nap-b · idle · no PR");                                                        FLAIR_STATE+=("idle")
+DISPLAY+=("$(_row_awaiting_task 'nap-b' "$REPO")");                                             FLAIR_STATE+=("idle")
 DISPLAY+=("    ✅ pen-c · ready · awaiting push approval");                                       FLAIR_STATE+=("pen")
 _DEAD_ROW="${DISPLAY[0]}"
 
@@ -859,6 +859,17 @@ if printf '%s\n' "$_f_off" | grep -qxF "$_DEAD_ROW" && printf '%s\n' "$_f_on" | 
   checkpoint flair_dead_row_unchanged pass "💀 dead-builder row byte-identical in both modes (never softened)"
 else
   checkpoint flair_dead_row_unchanged fail "dead-builder row changed between off/on — flair softened a loud state"
+fi
+
+# (2d) CLOSED VOCABULARY (HERD-172) — the spare-builder row (built above from the SHIPPED
+#      _row_awaiting_task) must name whose move it is (awaiting task · assign or retire) and carry an
+#      age, and the banned ownerless 'idle' state word must never reach an operator-facing frame.
+if printf '%s' "$_f_on" | grep -q 'awaiting task · assign or retire' \
+   && printf '%s' "$_f_on" | grep -qE 'assign or retire · [0-9]+[smhd]' \
+   && ! printf '%s' "$_f_on" | grep -qw 'idle'; then
+  checkpoint console_vocab_closed pass "spare-builder row uses the closed vocabulary (awaiting task · owner · age); no banned 'idle' word"
+else
+  checkpoint console_vocab_closed fail "console frame leaked the banned 'idle' word or is missing the awaiting-task vocabulary/age"
 fi
 
 # (2c) Merge CELEBRATION — a pending marker turns into exactly one 'joins the flock' line next frame.
