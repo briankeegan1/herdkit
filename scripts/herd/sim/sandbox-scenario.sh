@@ -465,11 +465,14 @@ fi
 # a throwaway fixture with its OWN step list (HERD_STEPS_FILE), a throwaway trees dir for the hold
 # ledger + journal, and HERD_CONFIG_FILE pointed at a non-existent path so herd-config.sh never walks up
 # into herdkit's OWN .herd/config. A fixture step list of THREE post-build steps — one blocking (on_fail
-# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Six assertions: (A) the
+# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Seven assertions: (A) the
 # blocking step runs then the approve step HOLDS (the skill step has NOT run yet); (B) the hold surfaces
 # in herd-approve.sh list with the worktree path; (C) approve RELEASES + resumes, running the skill
 # step; (D) EXECUTION ORDER holds in the journal (block < approve < skill); (E) a FAILING block step
-# blocks its seam (a later step never runs); (F) an ABSENT step list is byte-identical (no journal, rc 0).
+# blocks its seam (a later step never runs); (F) an ABSENT step list is byte-identical (no journal, rc 0);
+# (G) the WATCHER-OWNED pre-merge seam: after approve, a FRESH steps_run_at pre-merge (what do_merge
+# re-runs every tick, no --resume-after) SKIPS the consumed hold (rc 0 ⇒ merge proceeds) and never
+# re-holds or re-appends an awaiting row (the #249 liveness/ledger-growth regression).
 step pipeline-steps "steps.tsv stages — order, approve-hold + release, step_run journal, byte-identical off"
 ST_ENGINE="$HERE/.."
 if [ ! -f "$ST_ENGINE/steps.sh" ] || [ ! -f "$ST_ENGINE/herd-approve.sh" ]; then
@@ -572,6 +575,47 @@ else
     checkpoint pipeline_steps_off pass "absent step list ⇒ byte-identical no-op (rc 0, zero journal events)"
   else
     checkpoint pipeline_steps_off fail "absent step list was NOT inert (rc=$_st_orc, journal bytes=$( wc -c < "$ST_JN_OFF" 2>/dev/null ))"
+  fi
+
+  # (G) WATCHER-OWNED pre-merge approve-hold — the do_merge re-tick regression (review BLOCK on PR #249).
+  #     The watcher runs `steps_run_at pre-merge` FRESH every tick with NO --resume-after (agent-watch.sh
+  #     do_merge). After a human approves a pre-merge hold=approve step, the NEXT such fresh pass MUST
+  #     recognise the released hold and SKIP past it (rc 0 ⇒ do_merge proceeds to merge) — NOT re-execute
+  #     + re-hold (rc 20) forever. It must also NOT re-append an 'awaiting' row (the ledger stays bounded
+  #     across ticks). This drives the exact seam the post-build assertions (A–D) could not: a fresh
+  #     seam re-invocation after release, which is what the watcher does — the regression's blind spot.
+  ST_STEPS_M="$ART/st-steps-merge.tsv"; ST_JN_M="$ART/st-journal-merge.jsonl"; : > "$ST_JN_M"
+  ST_TREES_M="$ART/st-trees-merge"; mkdir -p "$ST_TREES_M"
+  {
+    printf 'pre-gate\tpre-merge\techo pre-gate ok\tblock\tnone\n'
+    printf 'human-check\tpre-merge\techo human-check ran\tblock\tapprove\n'
+    printf 'post-gate\tpre-merge\techo post-gate ok\tblock\tnone\n'
+  } > "$ST_STEPS_M"
+  stm_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES_M" \
+        HERD_STEPS_FILE="$ST_STEPS_M" JOURNAL_FILE="$ST_JN_M" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  _stm_hold="$ST_TREES_M/.agent-watch-step-holds"
+  # G1: the first pre-merge pass HOLDS on human-check (rc 20).
+  _stm_rc1=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc1=$?
+  # G2: human approves (records approved + released, resumes the remaining steps in-process).
+  stm_env bash "$ST_ENGINE/herd-approve.sh" approve demo-merge >/dev/null 2>&1
+  _stm_await_before="$(grep -c 'awaiting demo-merge' "$_stm_hold" 2>/dev/null)"; _stm_await_before="${_stm_await_before:-0}"
+  # G3: the WATCHER RE-TICK — a fresh pre-merge pass from the top (no --resume-after), exactly what
+  #     do_merge runs on the next tick. MUST return 0 (the merge would now proceed).
+  _stm_rc2=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc2=$?
+  # G4: a THIRD re-tick stays byte-stable (still rc 0, still one awaiting row) — the loop + ledger growth
+  #     are both gone (before the fix rc2/rc3 were 20 and the awaiting count grew by one per tick).
+  _stm_rc3=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc3=$?
+  _stm_await_final="$(grep -c 'awaiting demo-merge' "$_stm_hold" 2>/dev/null)"; _stm_await_final="${_stm_await_final:-0}"
+  if [ "$_stm_rc1" -eq 20 ] && [ "$_stm_rc2" -eq 0 ] && [ "$_stm_rc3" -eq 0 ] \
+     && [ "$_stm_await_before" = "1" ] && [ "$_stm_await_final" = "1" ]; then
+    checkpoint pipeline_steps_merge_resume pass "approved pre-merge hold is CONSUMED: watcher re-tick returns 0 (merge proceeds), ledger stays at 1 awaiting row (bounded)"
+  else
+    checkpoint pipeline_steps_merge_resume fail "approved pre-merge hold not consumed by the watcher re-tick (rc1=$_stm_rc1 rc2=$_stm_rc2 rc3=$_stm_rc3 awaiting before/final=$_stm_await_before/$_stm_await_final)"
   fi
 fi
 

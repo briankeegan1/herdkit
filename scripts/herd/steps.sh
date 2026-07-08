@@ -241,9 +241,13 @@ _steps_hold_record() {
     printf 'dir=%s\n' "$dir"
   } > "$tmp" 2>/dev/null || { echo "🛑 steps: cannot write hold detail for '$slug'." >&2; return 1; }
   mv -f "$tmp" "$detail" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; echo "🛑 steps: cannot install hold detail for '$slug'." >&2; return 1; }
-  # Idempotent: skip the append only if an un-released awaiting record for this EXACT sha already
-  # exists (grep, not _steps_current, so a degenerate empty sha still records on first hold).
-  if grep -q "^[0-9]* awaiting $slug $sha$" "$ledger" 2>/dev/null && ! steps_hold_is_released "$slug" "$sha"; then
+  # Idempotent + BOUNDED: at most ONE 'awaiting' row per (slug, sha) EVER. Skip the append if an
+  # awaiting record for this EXACT sha already exists — whether still live OR already released. A
+  # released hold is CONSUMED (terminal for this sha; a new hold needs a new commit ⇒ a new sha), so
+  # never re-append after release — that is what keeps the ledger from growing unbounded across the
+  # watcher's per-tick re-runs of the pre-merge seam. grep (not _steps_current) so a degenerate empty
+  # sha still records on its first hold.
+  if grep -q "^[0-9]* awaiting $slug $sha$" "$ledger" 2>/dev/null; then
     return 0
   fi
   printf '%s awaiting %s %s\n' "$(_steps_epoch)" "$slug" "$sha" >> "$ledger" 2>/dev/null \
@@ -393,13 +397,19 @@ steps_run_at() {
       continue
     fi
     # An approve-hold is idempotent + resumable: check the ledger BEFORE (re-)executing.
-    if [ "$hold" = "approve" ]; then
-      if [ "$(_steps_current "$slug")" = "$sha" ] && [ -n "$sha" ]; then
-        if steps_hold_is_released "$slug" "$sha"; then
-          continue                                 # already approved+released ⇒ resume past it
-        fi
+    if [ "$hold" = "approve" ] && [ -n "$sha" ]; then
+      # RELEASED ⇒ this (slug,sha) hold was approved + CONSUMED: skip past it WITHOUT re-executing or
+      # re-recording. This branch — NOT the _steps_current gate below (which is empty once released,
+      # steps.sh _steps_current) — is what lets the watcher-owned seam proceed: do_merge re-runs
+      # steps_run_at pre-merge from the top every tick with no --resume-after, so the released hold must
+      # be recognised here or it re-executes and re-holds forever (the merge never lands).
+      if steps_hold_is_released "$slug" "$sha"; then
+        continue
+      fi
+      # Still AWAITING for this exact sha ⇒ HELD, without re-running the step.
+      if [ "$(_steps_current "$slug")" = "$sha" ]; then
         command -v journal_append >/dev/null 2>&1 && journal_append step_run name "$name" at "$seam" kind "$kind" slug "$slug" sha "$sha" outcome held || true
-        return 20                                  # still awaiting ⇒ HELD, without re-running
+        return 20
       fi
     fi
     # Redirect the step's stdin from /dev/null: the loop reads its row list on fd 0 (the heredoc
