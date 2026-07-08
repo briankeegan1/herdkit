@@ -150,4 +150,22 @@ _gate_status_blessed anySha && fail "(6) no status must NOT read as blessed"
 _gate_status_blessed "" && fail "(6) empty sha must NOT read as blessed"
 ok
 
+# ── (7) deadlock fix: a BLOCKED-but-unblessed PR is gate-eligible ───────────────
+# Under `require herd/gates` protection an unblessed PR reports mergeStateStatus=BLOCKED, never CLEAN.
+# _gate_bless_eligible must make it gate-eligible so the watcher can run gates + post the blessing;
+# once success is recorded it must STOP re-gating (else a PR blocked by something else re-gates forever).
+reset
+_gate_bless_eligible 5 shaBlk BLOCKED || fail "(7) BLOCKED+unblessed must be gate-eligible"
+# other non-CLEAN states are NOT force-gated (only the missing-required-check state qualifies)
+_gate_bless_eligible 5 shaBlk UNSTABLE && fail "(7) UNSTABLE must not be force-gated"
+_gate_bless_eligible 5 shaBlk BEHIND   && fail "(7) BEHIND must not be force-gated"
+_gate_bless_eligible 5 shaBlk CLEAN    && fail "(7) CLEAN takes the normal path, not force-gated"
+_gate_bless_eligible 5 ""     BLOCKED  && fail "(7) empty sha must not be gate-eligible"
+# after we post success for the sha, it is no longer gate-eligible (no per-tick re-gate)
+post_gate_status 5 shaBlk success
+_gate_bless_eligible 5 shaBlk BLOCKED && fail "(7) an already-blessed sha must NOT re-gate"
+# GATE_STATUS=off → no deadlock machinery → never force-gates
+GATE_STATUS=off _gate_bless_eligible 5 shaOther BLOCKED && fail "(7) GATE_STATUS=off must not force-gate"
+ok
+
 echo "PASS test-gate-status.sh ($pass checks)"

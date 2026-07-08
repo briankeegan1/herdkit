@@ -36,6 +36,18 @@ becomes fail-safe:
 `--match-head-commit` in the watcher's merge path stays as a belt-and-suspenders guard against a race
 where a new commit lands between the blessing and the merge.
 
+### No bootstrap deadlock
+
+Requiring `herd/gates` creates an obvious chicken-and-egg: a PR whose head sha has no
+`herd/gates=success` reports `mergeStateStatus=BLOCKED` (a missing *required* check is not `CLEAN`),
+and the watcher's merge path only acts on `CLEAN` PRs — so nothing would ever post the status that
+clears the block. The watcher avoids this by treating a **`BLOCKED` PR it has not yet blessed for this
+sha** as *gate-eligible*: it runs the gates and posts `herd/gates` **without** merging (the merge still
+requires `CLEAN`). Once the blessing lands GitHub recomputes the PR to `CLEAN`, and a later tick takes
+the normal merge path. So applying the protection rule to a repo with open PRs just blesses them on the
+next tick — it never strands them. (A PR that stays `BLOCKED` for some *other* reason — a required
+human review — is gated at most once per sha, then simply waits.)
+
 ## One-time branch-protection recipe (operator applies in GitHub settings)
 
 Apply this **once per repo**, in GitHub → **Settings → Branches → Branch protection rules** for your

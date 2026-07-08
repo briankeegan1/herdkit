@@ -1808,6 +1808,27 @@ _gate_status_blessed() {
   [ "$state" = "success" ]
 }
 
+# _gate_bless_eligible <pr#> <sha> <mergeStateStatus> — true when a MERGEABLE-but-not-CLEAN PR must
+# STILL be gated so the watcher can post its herd/gates blessing. This is the fix for the deadlock that
+# `require herd/gates` branch protection otherwise creates (HERD-194): a PR whose head sha has no
+# herd/gates=success reports mergeStateStatus=BLOCKED — a missing REQUIRED check is NOT CLEAN — so it
+# would never become a merge candidate, and the watcher that must post the blessing never runs. We
+# therefore treat a BLOCKED PR we have NOT yet blessed for this sha as gate-eligible: run the gates,
+# post success, and let GitHub recompute to CLEAN on a later tick — the ACTUAL merge still requires
+# CLEAN (re-verified below), so this only unblocks the blessing, never the merge decision. Guards:
+#   • GATE_STATUS on (off → no gate-status machinery, so no deadlock to break → return false).
+#   • ONLY BLOCKED qualifies — the state a missing/pending required check produces. UNSTABLE (a
+#     non-required check failing) and BEHIND (out of date) soft-hold UNCHANGED.
+#   • Once we have posted success for this sha the local ledger stops re-gating it, so a PR that stays
+#     BLOCKED for SOME OTHER reason (a required human review) is gated AT MOST ONCE per sha, then
+#     soft-holds like before — no per-tick re-gate, no wasted review loop.
+_gate_bless_eligible() {
+  _gate_status_enabled || return 1
+  [ "${3:-}" = "BLOCKED" ] || return 1
+  [ -n "${2:-}" ] || return 1
+  ! _gate_status_posted "$1" "$2" success
+}
+
 # ── Parallel gate dispatch (GATE_DISPATCH, HERD-73) ──────────────────────────────────────────────
 # _gate_dispatch_mode — resolve GATE_DISPATCH to "serial" | "parallel". Unknown/empty → serial, so
 # the default (and any typo) preserves today's EXACT serial behavior — the review dispatches only
@@ -5606,9 +5627,17 @@ EOF
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
       FLAIR_STATE[i]="self"
-    elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
+    elif [ "$mergeable" = "MERGEABLE" ] && { _should_automerge "$mstate" || _gate_bless_eligible "$prnum" "$headsha" "$mstate"; }; then
+      # CLEAN → a normal merge candidate (run gates, then merge). BLOCKED-but-unblessed (HERD-194) → a
+      # GATE-ONLY candidate: run the gates + post herd/gates so branch protection can clear, but the
+      # merge itself still waits for CLEAN (re-verified in the action pass). Without this a PR under
+      # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
       if _scope_permits_automerge "$prauthor"; then
-        DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        if _should_automerge "$mstate"; then
+          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        else
+          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
+        fi
         FLAIR_STATE[i]="busy"
         CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
       else
@@ -5770,17 +5799,29 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       render
       continue
     fi
+    # bless_only (HERD-194): this candidate is MERGEABLE but NOT CLEAN, held BLOCKED only because its
+    # herd/gates blessing is not yet posted. We still run the gates below and post the blessing, but we
+    # must NOT merge (still not CLEAN) — the merge is skipped right after the success post. Empty for a
+    # normal CLEAN candidate, which flows through to the merge decision unchanged.
+    bless_only=""
     if [ "$rmergeable" != "MERGEABLE" ] || ! _should_automerge "$rmstate"; then
-      if [ "$rmergeable" = "MERGEABLE" ]; then
+      if [ "$rmergeable" = "MERGEABLE" ] && _gate_bless_eligible "$prnum" "$rsha" "$rmstate"; then
+        # Blocked only by the missing herd/gates check (unblessed for this sha): fall through to run the
+        # gates + post the blessing. The merge stays gated on CLEAN (enforced after the success post).
+        bless_only=1
+      elif [ "$rmergeable" = "MERGEABLE" ]; then
         # Still conflict-free but a gate regressed since classification (e.g. a required check went
-        # pending, or the branch fell BEHIND): soft-hold, re-evaluate next tick — not a ⚠️.
+        # pending, or the branch fell BEHIND), or we already blessed this sha and it is blocked by
+        # something else: soft-hold, re-evaluate next tick — not a ⚠️.
         DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${rmstate:-?})${C_RESET}"
+        render
+        continue
       else
         if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
         DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
+        render
+        continue
       fi
-      render
-      continue
     fi
 
     # PRE-MERGE STALE / DUPLICATE GATE (HERD-188). BEFORE the (expensive) review + the merge: refuse to
@@ -5885,6 +5926,16 @@ This PR appears to re-implement already-shipped work, or sits on a base stale en
     # must be on the head sha before do_merge so the watcher's own `gh pr merge` clears branch
     # protection. Once per sha via the ledger; a new commit re-runs the gates and posts afresh.
     post_gate_status "$prnum" "$rsha" success
+
+    # GATE-ONLY candidate (HERD-194): this PR reached here only to be BLESSED — it is MERGEABLE but not
+    # CLEAN (blocked by the required herd/gates check we just satisfied). The blessing is posted; the
+    # actual merge stays gated on CLEAN, so STOP here. GitHub recomputes mergeStateStatus once the status
+    # lands; a later tick sees CLEAN and takes the normal merge path. Never merge a non-CLEAN PR.
+    if [ -n "${bless_only:-}" ]; then
+      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}gates green · herd/gates blessed · awaiting branch-protection recheck${C_RESET}"
+      render
+      continue
+    fi
 
     # PASS (just now, or recorded for this sha) → proceed based on the effective merge policy AND,
     # in auto mode, whether this specific PR declares a HUMAN-VERIFY block (which converts it to an
