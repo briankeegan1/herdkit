@@ -41,6 +41,7 @@ delete.{0,20}(the )?(head |feature )?branch(es)?.{0,20}(after|on|once|when).{0,1
 (open|create|submit).{0,25}(pr|prs|pull request).{0,15}(as|in).{0,10}draft|draft.{0,10}(pr|prs|pull request)	config-key	PR_FLOW=draft	Open pull requests as drafts
 (never|no|not|don.?t|do not).{0,30}(co.?author|coauthor).{0,20}(claude|ai|assistant|bot|model)|no.?ai.?co.?author	config-key	ATTRIBUTION_POLICY=no-ai-coauthor	Never add an AI co-author trailer to commits
 (use|follow|adopt).{0,20}conventional.?.?commit	config-key	COMMIT_CONVENTION=^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)	Use Conventional Commits for commit messages
+(branch|branches).{0,25}(feat/|feature/|convention|naming|prefix|named|start with)	config-key	BRANCH_TEMPLATE=feat/{slug}	Feature branches follow the feat/<slug> naming convention (HERD-120)
 (run|execute).{0,25}(the )?(lint|linter|format|prettier|test|tests|suite).{0,25}(before|prior|ahead).{0,15}(commit|committing|push|pushing|merge)	hook	pre-action:run-checks	Run checks (lint/test/format) before committing or pushing
 (format|reformat|run .*formatter|prettier).{0,25}(before|on).{0,15}(commit|committing|save|saving)	hook	pre-action:format	Format code before committing
 (never|no|not|don.?t|do not).{0,30}(co.?author|coauthor).{0,20}(claude|ai|assistant|bot|model)|no.?ai.?co.?author	hook	pre-commit:no-ai-coauthor	Block a commit carrying an AI attribution trailer (session-time; complements ATTRIBUTION_POLICY)
