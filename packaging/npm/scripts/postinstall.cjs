@@ -41,7 +41,7 @@ function guide(msg) {
 
 try {
   if (!have('git')) { guide('git not found — cannot bootstrap the engine.'); process.exit(0); }
-  if (!have('bash')) { guide('bash not found — herdkit needs bash (on Windows use Git Bash or WSL2; see docs/windows.md).'); process.exit(0); }
+  if (!have('bash')) { guide('bash not found — herdkit needs bash (on Windows, run under WSL2 — the supported path; see docs/windows.md).'); process.exit(0); }
 
   if (fs.existsSync(path.join(HOME, '.git'))) {
     console.log(`[herdkit] Updating engine checkout at ${HOME} …`);

@@ -151,7 +151,8 @@ disposable herdr workspace and **degrades to a clean skip** where herdr is unava
 
 **Requirements:** `herdr` (the terminal multiplexer), `claude` (Claude Code CLI), `gh`, `git`,
 `python3`, and a modern `bash`. No specific OS or package manager is assumed — these tools work
-on macOS and Linux alike.
+on macOS and Linux alike. **On Windows, run herdkit under WSL2** (Ubuntu) — the supported path;
+native Git Bash is best-effort only. See [`docs/windows.md`](docs/windows.md).
 
 > **Running unattended on macOS?** macOS **TCC** permission prompts (Full Disk Access, Automation)
 > can silently pause a builder that touches a protected resource with no one there to click Allow.

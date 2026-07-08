@@ -26,7 +26,7 @@ if (!fs.existsSync(ENGINE)) {
 const r = spawnSync('bash', [ENGINE, ...process.argv.slice(2)], { stdio: 'inherit' });
 if (r.error) {
   console.error(`[herdkit] failed to launch bash: ${r.error.message}`);
-  console.error('[herdkit] On Windows install Git Bash or WSL2 — see docs/windows.md.');
+  console.error('[herdkit] On Windows, run under WSL2 (the supported path) — see docs/windows.md.');
   process.exit(127);
 }
 process.exit(r.status === null ? 1 : r.status);

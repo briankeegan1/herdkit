@@ -1,95 +1,126 @@
 # herdkit on Windows
 
-herdkit is a bash engine. It runs on Windows two ways:
+**WSL2 is the supported way to run herdkit on Windows — and the only one we recommend.**
 
-1. **WSL2 (Ubuntu) — recommended.** A real Linux userland: `python3`, a UTF-8 locale, and
-   `/usr/bin/python3` are all where the engine expects them. The hermetic suite is green here
-   exactly as on Linux/macOS, and the CI matrix's WSL2-equivalent leg is `ubuntu-latest`.
-2. **Git Bash (Git for Windows) — supported, best-effort.** Works for the core CLI and the
-   headless driver, but three environment gaps need one-time fixes (below). The CI `windows`
-   leg runs under Git Bash and is **documented-partial**: known env-only failures are marked
-   XFAIL, not hacked green (see [`tests/known-env-sensitive.tsv`](../tests/known-env-sensitive.tsv)).
+herdkit is a bash engine with deep Unix assumptions (a POSIX shell, `python3` at the usual
+locations, a UTF-8 locale, real ttys). Native **Git Bash** diverges from all of these enough that
+we no longer recommend it: it works for the core CLI in a pinch, but the full workflow is spotty.
+Run herdkit under **WSL2 (Ubuntu)**, where it behaves exactly as on Linux.
 
-If you can install WSL2, do — it sidesteps every issue below. `wsl --install -d Ubuntu` from an
-elevated PowerShell, then clone and run herdkit from inside the Ubuntu shell.
+> The CI matrix reflects this: the `ubuntu` leg **is** the Windows/WSL2 coverage (WSL2 semantics
+> are Linux semantics), and the `windows` leg is a small advisory smoke, not a full-suite gate.
 
 ---
 
-## Git Bash: the three fixes
+## Setup (WSL2 — the supported path)
 
-These are grounded in a second operator's real Git Bash environment — the failure modes are
-concrete, not hypothetical.
+From an elevated PowerShell:
 
-### 1. Line endings — already handled by `.gitattributes`
-
-A CRLF checkout breaks every `*.sh` (a trailing `\r` rides the shebang → `bash\r: No such file`),
-every `*.driver` (corrupts sourced KEY=value), and every `*.tsv` (breaks the exact-literal greps
-the caps-sync / conformance gates rely on). The repo's [`.gitattributes`](../.gitattributes) forces
-`eol=lf` on all engine files, so a fresh clone is correct regardless of your global
-`core.autocrlf`. If you cloned **before** `.gitattributes` landed, renormalize once:
-
-```bash
-git rm --cached -r . >/dev/null
-git reset --hard
-# or, to renormalize without discarding local edits:
-git add --renormalize .
+```powershell
+wsl --install -d Ubuntu
 ```
 
-### 2. `python3` shim — Git Bash ships no `python3`
-
-herdkit (and `herd doctor`, and several hermetic tests that rebuild a minimal `PATH` via
-`env -i … PATH=/usr/bin:/bin`) call **`python3`**. Git for Windows has no `python3` on `PATH`
-even when Python is installed as `python` / `py`. Add a shim once:
+Reboot if prompted, launch **Ubuntu** from the Start menu, then inside the WSL2 shell run the
+**standard Linux quickstart** — nothing Windows-specific:
 
 ```bash
-# Point python3 at your real interpreter. Adjust the target to `py` if that's what you have.
-mkdir -p ~/bin
-printf '#!/usr/bin/env bash\nexec python "$@"\n' > ~/bin/python3
-chmod +x ~/bin/python3
-# Ensure ~/bin is early on PATH (add to ~/.bashrc to persist):
-export PATH="$HOME/bin:$PATH"
-python3 --version   # should now work
+# one-command install (clones to ~/.herdkit, wires PATH, runs the dependency doctor)
+curl -fsSL https://raw.githubusercontent.com/briankeegan1/herdkit/main/install.sh | bash
+
+# then, from the project you want to herd:
+cd your-project
+herd init
+herd doctor      # verify git, gh (+auth), claude, python3
 ```
 
-The CI `windows` leg installs this exact shim before running the suite. Tests that reconstruct
-`PATH` as `/usr/bin:/bin` (which has no Windows Python) still can't see it and are the XFAIL set
-in [`tests/known-env-sensitive.tsv`](../tests/known-env-sensitive.tsv) — WSL2 fixes them outright.
+Keep your repos on the Linux filesystem (`~/…` inside WSL2), not `/mnt/c/…`, for correct
+permissions and speed.
 
-### 3. `LANG=C.UTF-8` — for the emoji greps
+---
 
-Many surfaces (status banners, backlog views, tests) grep for `✅ ❌ 🟢`. Under a non-UTF-8 Git
-Bash locale those bytes don't match and you get spurious failures. Export a UTF-8 locale:
+## What works today in WSL2 — an honest status
 
-```bash
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
-# persist it:
-echo 'export LANG=C.UTF-8'   >> ~/.bashrc
-echo 'export LC_ALL=C.UTF-8' >> ~/.bashrc
-```
+WSL2 is the **direction** and the supported Windows path. Not every surface is feature-complete
+inside it yet; here is the accurate picture as of 2026-07-08.
 
-The CI matrix sets `LANG=C.UTF-8` / `LC_ALL=C.UTF-8` on every leg for the same reason.
+### The headless automation runs today
 
-### 4. Terminal spawn — the herdr cockpit
+Set `HERD_DRIVER=headless` in `.herd/config`. In this mode the **load-bearing automation runs with
+no herdr panes at all** — the watcher's merge gating, the engine journal, notifications, and
+usage-limit detection all work headless, and **builder** agents run detached. This is the part of
+herdkit that actually merges PRs, and it works in WSL2 today (see
+[`templates/drivers/headless.driver`](../templates/drivers/headless.driver) and
+[`docs/macos-unattended-permissions.md`](docs/macos-unattended-permissions.md) for the headless
+model).
 
-The full herdr control room (panes/tabs) is a Unix-terminal surface and is **not** the supported
-Windows path — use the **headless driver** (`HERD_DRIVER=headless` in `.herd/config`), which is
-designed so every load-bearing behavior (watcher merge gating, journal, notifications, limit
-detection) runs with **no herdr panes at all** (see
-[`templates/drivers/headless.driver`](../templates/drivers/headless.driver)). The herdr cockpit
-becomes an optional *view* you run from WSL2 or another host, not a dependency.
+### Two things are still herdr-bound — tracked, not yet done
+
+1. **The full control-room *view* (herdr panes/tabs) needs a Linux `herdr` build.** herdkit drives
+   the [`herdr`](../README.md) terminal multiplexer for its live cockpit. This repo does not ship or
+   reference a Linux `herdr` binary, so **the full paneled control room in WSL2 is pending a herdr
+   Linux build.** Until then, use the headless driver above — the cockpit is an optional *view*, not
+   a dependency.
+
+2. **Six coordinator-side lanes still shell out to `herdr agent start`.** Per
+   [`docs/audit-2026-07-06.md`](audit-2026-07-06.md) **finding D1**, the `coordinator`, `resolver`,
+   `reviewer`, `scribe`, `researcher`, and `fleet` lanes hardcode `herdr agent start … -- claude`,
+   so under `HERD_DRIVER=headless` today they still require herdr — only **builders** are fully
+   paneless. Routing those six launch sites through `driver.sh start-agent` (the registry and
+   fail-soft semantics already exist) is the tracked follow-up that closes the headless/WSL2 gap.
+
+**In short:** WSL2 is the only supported Windows path; the headless watcher + builders work there
+now; full feature-completeness inside WSL2 is gated on a Linux `herdr` build and audit finding D1,
+both tracked as engine items — not claims of current fact.
 
 ---
 
 ## Verify your setup
 
 ```bash
-herd doctor                 # one-pass dependency check with per-platform hints
-bash scripts/ci/run-suite.sh   # run the hermetic suite the way CI does
+herd doctor                       # one-pass dependency check with per-platform install hints
+bash scripts/ci/run-suite.sh      # run the hermetic suite the way CI does
 ```
 
-`herd doctor` already guards the Windows cp1252/UTF-8 case and reports every missing/broken
-dependency at once with install hints. On Git Bash, expect the
-[`known-env-sensitive`](../tests/known-env-sensitive.tsv) tests to report as `XFAIL` — that's
-correct, not a regression. If anything **outside** that list fails, it's a real bug; please report
-it.
+`herd doctor` reports every missing/broken dependency at once and (on a missing `herdr`) points
+Windows users at WSL2.
+
+---
+
+## Appendix — Git Bash (unsupported / best-effort)
+
+> Native Git Bash is **not supported**. It has no `python3`, a non-UTF-8 default locale, and no real
+> tty for the cockpit — divergences that make the hermetic suite structurally red under Git Bash
+> (the concrete tests are catalogued in
+> [`tests/known-env-sensitive.tsv`](../tests/known-env-sensitive.tsv)). If you cannot use WSL2, the
+> fixes below get the **core CLI** working best-effort. Prefer WSL2.
+
+**1. Line endings — handled by `.gitattributes`.** A CRLF checkout breaks bash (a trailing `\r`
+rides every shebang), sourced `*.driver` bindings, and the exact-literal greps over `*.tsv`. The
+repo's [`.gitattributes`](../.gitattributes) forces `eol=lf` on all engine files, so a fresh clone
+is correct regardless of `core.autocrlf`. If you cloned before it landed:
+`git add --renormalize .`.
+
+**2. `python3` shim — Git Bash ships none.** herdkit and `herd doctor` call `python3`:
+
+```bash
+mkdir -p ~/bin
+printf '#!/usr/bin/env bash\nexec python "$@"\n' > ~/bin/python3   # or: exec py "$@"
+chmod +x ~/bin/python3
+export PATH="$HOME/bin:$PATH"        # add to ~/.bashrc to persist
+```
+
+Tests that rebuild a minimal `PATH` as `/usr/bin:/bin` still can't see it (that path has no Windows
+Python) — those are the Git-Bash XFAIL set in `tests/known-env-sensitive.tsv`. WSL2 avoids the
+problem entirely.
+
+**3. `LANG=C.UTF-8` — for the emoji greps.** Surfaces grep for `✅ ❌ 🟢`; a non-UTF-8 locale breaks
+the match:
+
+```bash
+echo 'export LANG=C.UTF-8'   >> ~/.bashrc
+echo 'export LC_ALL=C.UTF-8' >> ~/.bashrc
+```
+
+**4. Terminal / cockpit.** The herdr paneled cockpit is a Unix-terminal surface and is not the
+Windows path at all — use `HERD_DRIVER=headless` (above), which runs the load-bearing pipeline with
+no panes.

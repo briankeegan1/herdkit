@@ -137,6 +137,14 @@ out="$(run_doctor "$b" HERD_DOCTOR_OS=linux)"; RC=$?
 grep -qi "apt install git" <<<"$out"        || fail "(6) linux git hint missing: $out"
 ok
 
+# ── (6b) herdr missing + windows → WSL2-first hint (not a bare "install herdr") ───────────────────
+b="$(mkbin s6b)"; add_present "$b" git claude; add_gh_authed "$b"; add_real_python "$b"  # herdr MISSING
+out="$(run_doctor "$b" HERD_DOCTOR_OS=windows)"; RC=$?
+grep -qi "WSL2" <<<"$out"      || fail "(6b) windows herdr hint should point to WSL2: $out"
+out="$(run_doctor "$b" HERD_DOCTOR_OS=linux)"; RC=$?
+grep -qi "on PATH" <<<"$out"   || fail "(6b) linux herdr hint should keep the generic on-PATH text: $out"
+ok
+
 # ── (7) escape hatch: HERD_SKIP_DOCTOR=1 passes silently even with everything missing ────────────
 b="$(mkbin s7)"   # empty bindir: no deps at all
 out="$(run_doctor "$b" HERD_SKIP_DOCTOR=1)"; RC=$?

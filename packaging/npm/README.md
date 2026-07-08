@@ -20,7 +20,8 @@ install — fix the environment, then `npm rebuild -g herdkit`.
 
 ## Requirements
 
-- **bash + git** — load-bearing. On Windows use **Git Bash or WSL2** (see
+- **bash + git** — load-bearing. On Windows, run under **WSL2** (the supported path; native Git
+  Bash is best-effort only — see
   [docs/windows.md](https://github.com/briankeegan1/herdkit/blob/main/docs/windows.md)).
 - **claude** (Claude Code CLI), **gh** (authenticated GitHub CLI) — for the agent/PR surfaces.
 - **herdr** — optional; the headless driver runs without it.
