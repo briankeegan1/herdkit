@@ -156,6 +156,37 @@ herd_driver_send_text() {
 }
 
 # ── send-keys ────────────────────────────────────────────────────────────────────────────────────
+# herd_driver_close_pane <pane-id> — RETIRE a pane (the reviewer-pane lifecycle, HERD-113). herdr-claude:
+# `herdr pane close`. headless: NO-OP (panes-as-a-view — a detached reviewer has no pane to close; its
+# process lifecycle is the registry pid, not a pane). FAIL-SOFT: a missing herdr / already-gone pane is
+# a clean no-op that never aborts a caller — retiring a reviewer pane must never block the merge gate.
+herd_driver_close_pane() {
+  local target="${1:-}"
+  [ -n "$target" ] || return 0
+  if _herd_driver_is_headless; then
+    : # no-op: view-only — headless has no pane to close
+  else
+    herdr pane close "$target" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# herd_driver_pane_alive <pane-id> — success iff the pane still EXISTS in the live control surface.
+# The reviewer-adoption / orphan-sweep liveness probe (HERD-113): after a herdr server death + reload a
+# reviewer PANE can outlive its poller pid, so "is the pane still there?" is the signal that must gate a
+# re-dispatch (never duplicate into a live reviewer). herdr-claude: `herdr pane read` succeeds only for
+# a live pane. headless: always FALSE (no panes; liveness there is the registry pid, checked separately).
+# FAIL-SOFT: a missing herdr / unreadable pane → not-alive, so the caller degrades to the pid guard.
+herd_driver_pane_alive() {
+  local target="${1:-}"
+  [ -n "$target" ] || return 1
+  if _herd_driver_is_headless; then
+    return 1
+  fi
+  command -v herdr >/dev/null 2>&1 || return 1
+  herdr pane read "$target" >/dev/null 2>&1
+}
+
 # herd_driver_send_keys <pane> <keys…> — send raw control keystrokes. herdr-claude:
 # `herdr pane send-keys`. headless: NO-OP (raw keystrokes are a pane concept; nothing receives them).
 # NEVER fails.
@@ -336,11 +367,13 @@ _herd_driver_cli() {
     read-pane)   herd_driver_read_pane "$@" ;;
     send-text)   herd_driver_send_text "$@" ;;
     send-keys)   herd_driver_send_keys "$@" ;;
+    close-pane)  herd_driver_close_pane "$@" ;;
+    pane-alive)  herd_driver_pane_alive "$@" ;;
     create-tab)  herd_driver_create_tab "$@" ;;
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|pane-alive <pane>|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
   esac
 }
 

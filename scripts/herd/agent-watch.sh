@@ -678,6 +678,16 @@ _review_block_file()    { printf '%s' "$TREES/.review-block-$1-$2"; }
 # when a builder's refix rounds prove the cheap reviewer missed the issue, consumed once by the next
 # review dispatch on that PR (see _maybe_arm_review_escalation / _review_gate_step).
 _review_escalate_file() { printf '%s' "$TREES/.review-escalate-$1"; }
+# Reviewer dispatch registry (HERD-113): one row per (pr,sha) recording the reviewer's POLLER PID and
+# its PANE ID — "<pid> <pane_id>" (pane_id is "-" until the reviewer's agent pane is up, and stays "-"
+# for the headless / no-pane path). Persisted BESIDE the review ledger so it survives a watcher/herdr
+# restart. Two jobs: (a) on VERDICT CONSUMPTION the watcher retires the pane via the driver so a reviewer
+# session can't sit idle for 30+ min after its verdict was read; (b) DISPATCH consults it to ADOPT/skip a
+# still-live reviewer for the same (pr,sha) instead of spawning a duplicate (the 2026-07-08 double-Opus
+# incident: a herdr death+reload re-dispatched PR #221's review while the prior reviewer was still live).
+# Written cooperatively: _dispatch_review lays down "<pid> -" at spawn; herd-review.sh overwrites it with
+# the real pane id once the agent pane exists. Sha-keyed like the markers above; discarded on a newer head.
+_review_registry_file() { printf '%s' "$TREES/.review-registry-$1-$2"; }
 
 # ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
 # _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | DOCS | SKIP.
@@ -759,14 +769,72 @@ record_review_retry() {
   printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_RETRIES"
 }
 
+# _reviewer_registry_live <pr#> <headSha> — success iff the dispatch registry records a still-LIVE
+# reviewer for this exact pr+sha: its poller pid is alive, OR (across a poller death) its pane still
+# exists in the control surface. This is the never-duplicate-into-a-live-reviewer guard (HERD-113);
+# a dead poller with no surviving pane is NOT live (returns false) so a clean re-dispatch can proceed.
+_reviewer_registry_live() {
+  local reg pid pane
+  reg="$(_review_registry_file "$1" "$2")"
+  [ -f "$reg" ] || return 1
+  read -r pid pane < "$reg" 2>/dev/null || true
+  if [ -n "${pid:-}" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+  [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"
+}
+
+# _retire_reviewer_pane <pr#> <headSha> [reason] — the reviewer-pane lifecycle teardown (HERD-113).
+# Reads the dispatch-registry row and, if it still names a LIVE pane, closes it via the driver and
+# journals a reviewer_pane_retired event; then drops the registry row unconditionally. Called when a
+# verdict is CONSUMED (the pane has done its job) and by the startup sweep (orphaned/completed panes).
+# FAIL-SOFT + byte-quiet: no registry row, no pane, or an already-gone pane ⇒ no console output and no
+# journal line — a workspace with no orphaned reviewer panes sees zero change.
+_retire_reviewer_pane() {
+  local pr="$1" sha="$2" reason="${3:-verdict-consumed}" reg pid pane
+  reg="$(_review_registry_file "$pr" "$sha")"
+  [ -f "$reg" ] || return 0
+  read -r pid pane < "$reg" 2>/dev/null || true
+  if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
+    herd_driver_close_pane "$pane"
+    journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+  fi
+  rm -f "$reg" 2>/dev/null || true
+}
+
+# _sweep_reviewer_registry — one-shot STARTUP reconcile of the dispatch registry against live
+# pids/panes (HERD-113 requirement 3). For each (pr,sha) row: a still-alive poller is a genuinely live
+# reviewer → left untouched (a later dispatch ADOPTS it). A dead poller whose PANE still exists is an
+# ORPHAN (nobody will collect its verdict) → the pane is retired and its inflight marker dropped so a
+# clean re-dispatch can happen. A row with a pending result file is left for the normal gate step to
+# collect + retire. Idempotent, dry-run-inert, and byte-quiet when there are no orphans.
+_sweep_reviewer_registry() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local f base rest pr sha pid pane
+  for f in "$TREES"/.review-registry-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"; rest="${base#.review-registry-}"
+    pr="${rest%-*}"; sha="${rest##*-}"
+    [ -n "$pr" ] && [ -n "$sha" ] || continue
+    # A finished reviewer's verdict is still waiting — let the normal gate step collect it and retire
+    # the pane through the verdict-consumption path (which also records the ledger). Don't pre-empt it.
+    [ -f "$(_review_result_file "$pr" "$sha")" ] && continue
+    read -r pid pane < "$f" 2>/dev/null || true
+    # Poller still alive → a live reviewer; adopt (leave the row + inflight marker as-is).
+    if [ -n "${pid:-}" ] && [ "$pid" != "-" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    # Poller dead: retire any surviving (orphaned) pane, then drop the row + inflight marker so the
+    # (pr,sha) can be cleanly re-dispatched — never left running alongside a fresh reviewer.
+    _retire_reviewer_pane "$pr" "$sha" startup-sweep-orphan
+    rm -f "$(_review_inflight_file "$pr" "$sha")" 2>/dev/null || true
+  done
+}
+
 # _discard_stale_reviews <pr#> <currentSha> — a result or inflight marker for this PR keyed to
 # ANY OTHER sha is stale (the PR has a newer head; that verdict must never be read). Discard
 # stale results unread; TERM a stale in-flight reviewer (best-effort — herd-review.sh traps TERM
-# and reports INFRA-FAIL to its own stale result file, which lands here next tick) and drop its
-# marker so the concurrency slot frees up.
+# and reports INFRA-FAIL to its own stale result file, which lands here next tick), retire its pane
+# (HERD-113 — a stale reviewer's pane must not linger), and drop its markers so the slot frees up.
 _discard_stale_reviews() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"*; do
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"* "$TREES/.review-registry-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -774,6 +842,12 @@ _discard_stale_reviews() {
       .review-inflight-*)
         local pid; pid="$(head -1 "$f" 2>/dev/null || true)"
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true ;;
+      .review-registry-*)
+        # Retire the stale reviewer's pane before dropping the row (the trailing sha in the filename
+        # is this marker's other-sha key). _retire_reviewer_pane rm's the row itself, so skip the rm below.
+        local _sreg_stale_sha="${base##*-}"
+        _retire_reviewer_pane "$pr" "$_sreg_stale_sha" stale-sha
+        continue ;;
     esac
     rm -f "$f" 2>/dev/null || true
   done
@@ -784,22 +858,36 @@ _discard_stale_reviews() {
 # Idempotent: an existing result file or live marker means this pr+sha is already handled — never
 # double-dispatch. Callers gate on concurrency/retries; this only guards identity.
 _dispatch_review() {
-  local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight
+  local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight registry
   result="$(_review_result_file "$pr" "$sha")"
   inflight="$(_review_inflight_file "$pr" "$sha")"
+  registry="$(_review_registry_file "$pr" "$sha")"
   [ -f "$result" ] && return 0
   [ -f "$inflight" ] && _review_pid_live "$inflight" && return 0
+  # ADOPT, never duplicate (HERD-113): a live reviewer for this exact pr+sha — poller pid alive OR its
+  # pane still present after a poller death — means one is already on it. Skip rather than spawn a second
+  # (the 2026-07-08 double-Opus incident). The startup sweep retires a genuinely orphaned pane (dead
+  # poller, no verdict) so a later tick re-dispatches cleanly; here we only refuse to double up on a LIVE one.
+  if _reviewer_registry_live "$pr" "$sha"; then
+    journal_append reviewer_adopted pr "$pr" sha "$sha" reason "live reviewer already dispatched for pr+sha"
+    return 0
+  fi
   # <model> is the risk-tier's chosen reviewer model. EMPTY means "use the default path" — do NOT
   # set HERD_REVIEW_MODEL, so herd-review.sh resolves $MODEL_REVIEW (and any operator-exported
   # HERD_REVIEW_MODEL override still wins) exactly as before tiering existed. A non-empty model
-  # (the cheap tier) is passed through so the reviewer runs on that tier.
+  # (the cheap tier) is passed through so the reviewer runs on that tier. HERD_REVIEW_REGISTRY_FILE is
+  # the seam herd-review.sh writes its pane id back through (see the registry helpers above).
   if [ -n "$model" ]; then
-    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
   else
-    HERD_REVIEW_RESULT_FILE="$result" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
   fi
   local _dr_pid="$!"
   printf '%s\n' "$_dr_pid" > "$inflight"
+  # Lay down the registry row NOW (pane id unknown yet → "-"); herd-review.sh overwrites it with the
+  # real pane id once its agent pane is up. The pid alone already lets a post-restart dispatch adopt
+  # this reviewer even before its pane exists.
+  printf '%s -\n' "$_dr_pid" > "$registry" 2>/dev/null || true
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
 }
@@ -821,6 +909,11 @@ _review_gate_step() {
   if [ -f "$result" ]; then
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
     rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+    # VERDICT CONSUMED → retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane
+    # OPEN with an idle session showing the verdict banner; now that the watcher has read the verdict
+    # that pane has done its job, so close it (and drop the registry row). No-op when there is no live
+    # pane (headless, or an INFRA-FAIL reviewer that already tore down its own pane).
+    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
@@ -843,6 +936,10 @@ _review_gate_step() {
   if [ -f "$inflight" ]; then
     if _review_pid_live "$inflight"; then echo RUNNING; return 0; fi
     rm -f "$inflight" 2>/dev/null || true
+    # The poller died without a verdict. If its pane somehow survived (a herdr reload orphaned it), retire
+    # it now so the re-dispatch below never runs alongside a still-live reviewer (HERD-113). No-op if the
+    # pane is already gone; drops the registry row either way so the fresh dispatch starts clean.
+    _retire_reviewer_pane "$pr" "$sha" orphaned-poller-dead
     record_review_retry "$pr" "$sha"
   fi
 
@@ -3787,6 +3884,12 @@ _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sl
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
 # stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
 _startup_reap_sweep
+
+# One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
+# or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
+# panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
+# Byte-inert when there are no reviewer rows (the common startup) — no journal line, no pane touched.
+_sweep_reviewer_registry
 
 # One-shot at STARTUP: proactively close any STALE resolve·<slug> conflict-resolver tab (HERD-54) —
 # a resolver that died/finished for a slug whose PR is no longer CONFLICTING. Prime AGENTS_JSON first
