@@ -168,4 +168,59 @@ echo "$out" | grep -q "RC=0" || fail "HERD_ITEM_REF path: expected rc 0, got '$o
 grep -q "🚧 item-a.*(claimed by jill)" "$T/lane_ref/BACKLOG.md" || fail "HERD_ITEM_REF path: item not claimed via threaded ref"
 pass
 
+# ==================== HERD-117 claim guard: never claim (reopen) a Done/Canceled item ================
+# A stale pick of a shipped (✅) item must be REFUSED before the claim — never silently reopened. The
+# 2026-07-08 double-build: a second operator's stale pick reclaimed HERD-55 minutes after it merged,
+# flipping Done → In Progress and spawning a duplicate PR that arrived already conflicting. The guard
+# reads the item's CURRENT state up front and refuses a closed one LOUDLY + journaled, aborting the lane.
+
+# Seed a bare origin whose item-a is already SHIPPED (✅); item-b stays open (🔜). Idempotent per id.
+seed_done_origin() {
+  local id="$1"
+  local og="$T/$id.git"
+  [ -d "$og" ] && return 0
+  git init -q --bare "$og"
+  git clone -q "$og" "$T/seed-$id"
+  ( cd "$T/seed-$id"
+    git checkout -q -b main
+    printf '## Backlog\n\n✅ item-a — shipped last night\n🔜 item-b — still queued\n' > BACKLOG.md
+    git add BACKLOG.md && git commit -q -m "seed shipped backlog"
+    git push -q -u origin main )
+  rm -rf "$T/seed-$id"
+}
+
+# ── 12. claiming a ✅ (Done) item → REFUSE loudly + journal claim_refused, abort (rc 1), never reopen ──
+seed_done_origin done1; clone_from done1 "$T/lane_done"
+out="$(JOURNAL_FILE="$T/j-done.jsonl" CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=kai lane_claim "$T/lane_done")"
+echo "$out" | grep -q "RC=1" || fail "done-refuse: expected rc 1 (abort), got '$out'"
+echo "$out" | grep -q "refusing to claim repo#item-a" || fail "done-refuse: missing loud refusal ($out)"
+echo "$out" | grep -qi "Done/Canceled" || fail "done-refuse: refusal must name the Done/Canceled state ($out)"
+echo "$out" | grep -q "HERD_FORCE_SPAWN=1" || fail "done-refuse: refusal must name the override escape hatch ($out)"
+echo "$out" | grep -qi "herd backlog" || fail "done-refuse: refusal must point at re-grounding the pick ($out)"
+grep -q "^✅ item-a" "$T/lane_done/BACKLOG.md" || fail "done-refuse: item must stay ✅ (never reopened)"
+grep -q "🚧 item-a" "$T/lane_done/BACKLOG.md" && fail "done-refuse: item must NOT flip 🚧 (Done→In Progress is forbidden)"
+grep -q "(claimed by" "$T/lane_done/BACKLOG.md" && fail "done-refuse: item must NOT be stamped with a claim"
+grep -q '"event":"claim_refused"' "$T/j-done.jsonl" || fail "done-refuse: claim_refused not journaled ($(cat "$T/j-done.jsonl" 2>/dev/null))"
+grep -q '"reason":"already-done"' "$T/j-done.jsonl" || fail "done-refuse: journal missing reason=already-done"
+pass
+
+# ── 13. claiming a 🔜 (open) item is BYTE-IDENTICAL with the guard present: flip+stamp, no refusal ────
+seed_origin guard_open; clone_from guard_open "$T/lane_gopen"
+out="$(JOURNAL_FILE="$T/j-open.jsonl" CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=lena lane_claim "$T/lane_gopen")"
+echo "$out" | grep -q "RC=0" || fail "guard open: expected rc 0, got '$out'"
+echo "$out" | grep -q "🔒 claimed repo#item-a as 'lena'" || fail "guard open: open item not claimed identically ($out)"
+grep -q "🚧 item-a.*(claimed by lena)" "$T/lane_gopen/BACKLOG.md" || fail "guard open: open item not flipped/stamped identically"
+[ -f "$T/j-open.jsonl" ] && grep -q "claim_refused" "$T/j-open.jsonl" && fail "guard open: an OPEN claim must NOT journal claim_refused"
+pass
+
+# ── 14. HERD_FORCE_SPAWN=1 on a ✅ item → proceed (rc 0) WITHOUT reopening, journal claim_forced ──────
+seed_done_origin done2; clone_from done2 "$T/lane_force"
+out="$(JOURNAL_FILE="$T/j-force.jsonl" CLAIM_REQUIRED=on HERD_FORCE_SPAWN=1 HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=mo lane_claim "$T/lane_force")"
+echo "$out" | grep -q "RC=0" || fail "force-spawn: expected rc 0 (build anyway), got '$out'"
+echo "$out" | grep -q "HERD_FORCE_SPAWN=1" || fail "force-spawn: missing override note ($out)"
+grep -q "^✅ item-a" "$T/lane_force/BACKLOG.md" || fail "force-spawn: item must stay ✅ (force must NOT reopen it)"
+grep -q "🚧 item-a" "$T/lane_force/BACKLOG.md" && fail "force-spawn: force must NOT flip Done→In Progress"
+grep -q '"event":"claim_forced"' "$T/j-force.jsonl" || fail "force-spawn: claim_forced not journaled ($(cat "$T/j-force.jsonl" 2>/dev/null))"
+pass
+
 echo "ALL PASS ($PASS checks)"
