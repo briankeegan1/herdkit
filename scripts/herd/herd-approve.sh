@@ -28,6 +28,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # finished builder that stopped before push/PR create is listed here, and `approve <slug>` resumes
 # its push + PR creation. Sourcing only defines functions (CLI dispatch is $0-guarded).
 . "$HERE/push-gate.sh"
+# Pipeline steps (HERD-132) — the step-hold helper. Sourced so `list` surfaces a step waiting at an
+# approve-HOLD and `approve <slug>` releases it (resuming the pipeline past the held step). Sourcing
+# only DEFINES functions (its CLI dispatch is $0-guarded); inert until a step recorded a hold.
+. "$HERE/steps.sh"
 # Journal (best-effort) so the push-hold approve/resume path can emit events like the watcher does.
 # shellcheck source=scripts/herd/journal.sh
 [ -f "$HERE/journal.sh" ] && . "$HERE/journal.sh"
@@ -100,8 +104,23 @@ $(push_gate_list 2>/dev/null || true)
 EOF
     [ "$push_found" -gt 0 ] && echo
 
+    # PIPELINE STEPS (HERD-132): steps stopped at an approve-HOLD — no PR gate involved, so they live in
+    # the step-hold ledger. Surface them next (a human reviews at the printed worktree, then approves to
+    # resume the pipeline past the held step). Presence-driven: nothing prints when unused.
+    step_found=0
+    while read -r sh_slug sh_sha sh_step sh_dir; do
+      [ -n "$sh_slug" ] || continue
+      if [ "$step_found" -eq 0 ]; then echo "Builders awaiting STEP approval (a hold=approve pipeline step):"; fi
+      printf '  %s  step:%s  sha:%.8s  %s\n' "$sh_slug" "$sh_step" "$sh_sha" "${sh_dir:-(worktree path unknown)}"
+      printf '      approve:  bash %s/herd-approve.sh approve %s\n' "$HERE" "$sh_slug"
+      step_found=$((step_found + 1))
+    done <<EOF
+$(steps_hold_list 2>/dev/null || true)
+EOF
+    [ "$step_found" -gt 0 ] && echo
+
     if [ ! -s "$APPROVALS" ]; then
-      [ "$push_found" -eq 0 ] && echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && [ "$step_found" -eq 0 ] && echo "No PRs awaiting approval."
       exit 0
     fi
     found=0
@@ -126,7 +145,7 @@ EOF
       found=$((found + 1))
     done < "$APPROVALS"
     if [ "$found" -eq 0 ]; then
-      [ "$push_found" -eq 0 ] && echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && [ "$step_found" -eq 0 ] && echo "No PRs awaiting approval."
     else
       printf '\nRun:  bash %s/herd-approve.sh approve <pr#>  to approve a PR for merge.\n' "$HERE"
     fi
@@ -144,6 +163,16 @@ EOF
       _pg_approved_sha="$(push_gate_approve "$prnum")" || { echo "❌ Could not record push approval for '$prnum'." >&2; exit 1; }
       printf '✅ Push approval recorded for %s (%.8s) — resuming push + PR creation…\n' "$prnum" "$_pg_approved_sha"
       push_gate_resume "$prnum"; exit $?
+    fi
+    # PIPELINE STEPS (HERD-132): if the argument names a builder/slug with a LIVE step-hold (a
+    # hold=approve step stopped the pipeline), this is a STEP approval — record it and RELEASE, which
+    # resumes the pipeline past the held step. Keyed by slug (kebab) like the push-hold, so a numeric PR
+    # number never selects this path; checked after the push-hold (a builder hits a push-hold only once,
+    # after its step holds). steps_hold_release is fail-soft: a stale/corrupt hold refuses LOUDLY.
+    if [ -n "$(steps_hold_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      _st_approved_sha="$(steps_hold_approve "$prnum")" || { echo "❌ Could not record step approval for '$prnum'." >&2; exit 1; }
+      printf '✅ Step approval recorded for %s (%.8s) — resuming the pipeline past the held step…\n' "$prnum" "$_st_approved_sha"
+      steps_hold_release "$prnum"; exit $?
     fi
     if [ ! -s "$APPROVALS" ]; then
       echo "No awaiting approval record found for PR #${prnum}." >&2; exit 1

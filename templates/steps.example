@@ -1,0 +1,30 @@
+# .herd/steps.tsv — declarative PIPELINE STEP LIST (HERD-132). Commit this (code-shaped config,
+# zero-secret). It lets an operator plug their OWN skill or shell command in as a pipeline stage —
+# a peer-review skill, a documentation pass, an arbitrary "run this and STOP and show me" checkpoint —
+# instead of being limited to the built-in seams' fixed contents.
+#
+# Format — one TAB-SEPARATED row per step (columns separated by a literal tab, NOT spaces):
+#     name <TAB> at <TAB> run <TAB> on_fail <TAB> hold
+#
+#   name     kebab-ish label; shown in the console/journal and used as the approve-hold key.
+#   at       WHEN it runs — one of:  post-build | post-healthcheck | pre-merge | post-merge
+#            post-build / post-healthcheck run in the BUILDER's Claude Code session (skill: steps work
+#            there); pre-merge / post-merge run in the WATCHER's merge sequence (shell steps).
+#   run      a shell command, OR 'skill:<name>' — a repo .claude/skills skill invoked in the builder
+#            session (the repo's .claude/skills travels with the worktree).
+#   on_fail  block (default) — a non-zero step BLOCKS the lane at that seam · warn — journal + continue.
+#   hold     none (default) — proceed · notify — journal + notify but continue · approve — record a
+#            sha-keyed hold and STOP until a human runs 'herd-approve.sh approve <slug>'.
+#
+# Blank lines and lines whose first field starts with '#' are ignored. Validate with:
+#     bash scripts/herd/steps.sh validate
+#
+# HARD RULES: an EMPTY or ABSENT list ⇒ a byte-identical pipeline (this feature ships dormant). Steps
+# ADD checks; they NEVER replace or bypass the built-in review/healthcheck floor. Every step is
+# fail-soft (a missing command routes through on_fail, never a wedged lane) and journals a step_run.
+#
+# ── Examples (all commented out; uncomment + adapt) ───────────────────────────────────────────────
+# peer-review<TAB>pre-merge<TAB>skill:my-codex-review<TAB>block<TAB>approve
+# doc-pass<TAB>post-healthcheck<TAB>skill:doc-writer<TAB>warn<TAB>none
+# changelog<TAB>post-merge<TAB>scripts/update-changelog.sh<TAB>warn<TAB>none
+# checkpoint<TAB>post-build<TAB>echo review the diff before I open a PR<TAB>block<TAB>approve

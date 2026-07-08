@@ -92,6 +92,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
 # dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
 . "$HERE/push-gate.sh"
+# Pipeline steps (HERD-132) — the step-runner. Sourced for steps_run_at, which the merge sequence
+# (do_merge) calls at the pre-merge and post-merge seams. Sourcing DEFINES functions only (CLI dispatch
+# is $0-guarded); byte-inert until a project ships a non-empty .herd/steps.tsv, so a project with no
+# step list runs a byte-identical merge sequence.
+. "$HERE/steps.sh"
 # Runtime driver shim — binds each runtime-specific control-surface capability (list-agents,
 # read-pane, send-keys, notifications, start-agent) to the active HERD_DRIVER. Makes the watcher's
 # load-bearing core run with NO herdr panes under HERD_DRIVER=headless (panes-as-a-view); the default
@@ -1873,6 +1878,23 @@ do_merge() {
   if [ -n "$DRYRUN" ]; then
     return 0
   fi
+  # Pipeline steps (HERD-132) — PRE-MERGE seam. Operator-defined pre-merge steps run HERE, AFTER the
+  # built-in review + health gates have already passed (this PR only reaches do_merge on green gates),
+  # so they ADD a gate, never bypass the floor. A block-step failure (rc 1) or an approve-HOLD (rc 20)
+  # leaves the PR UNMERGED — we return WITHOUT writing the $STATE merge row, so the watcher retries next
+  # tick (a block re-runs; an approve-hold re-surfaces until 'herd-approve.sh approve <slug>' releases
+  # it). Byte-inert when .herd/steps.tsv is absent (steps_run_at returns 0 immediately).
+  if command -v steps_run_at >/dev/null 2>&1; then
+    local _st_rc=0
+    steps_run_at pre-merge --slug "$ds" --dir "$dd" --sha "$dsha" || _st_rc=$?
+    if [ "$_st_rc" -ne 0 ]; then
+      case "$_st_rc" in
+        20) journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam pre-merge action held ;;
+        *)  journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam pre-merge action blocked ;;
+      esac
+      return 1
+    fi
+  fi
   gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
@@ -1915,6 +1937,14 @@ do_merge() {
   #     a broken combination). Gated by MAIN_HEALTH_TICK (default off → byte-inert). An ALARM only:
   #     fully fail-soft, never blocks/reverts/re-merges — like 2b/2c it can never fail the merge.
   main_health_tick "$dp"
+  # 2e) POST-MERGE pipeline steps (HERD-132): operator-defined post-merge steps run here, BEFORE the
+  #     worktree is reaped (so a step can still inspect it). ALARM-class like 2b–2d: the merge has
+  #     already landed, so this can NEVER revert or re-merge — a failing block-step / an approve-hold
+  #     journals loudly but the merge stands. Byte-inert when no steps.tsv. Never fails the merge.
+  if command -v steps_run_at >/dev/null 2>&1; then
+    steps_run_at post-merge --slug "$ds" --dir "$dd" --sha "$dsha" \
+      || journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam post-merge action nonzero
+  fi
   # 3+4) IDEMPOTENT teardown (the WATCHER's job — sub-agents NEVER self-close): force-remove the
   #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
   #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup

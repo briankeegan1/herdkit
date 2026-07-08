@@ -460,6 +460,121 @@ PRCMD
   fi
 fi
 
+# ── pipeline steps (HERD-132): operator-defined stages with hold/approve semantics ───────────────
+# Proves the seam the item exists for, driving the REAL steps.sh + herd-approve.sh entry points against
+# a throwaway fixture with its OWN step list (HERD_STEPS_FILE), a throwaway trees dir for the hold
+# ledger + journal, and HERD_CONFIG_FILE pointed at a non-existent path so herd-config.sh never walks up
+# into herdkit's OWN .herd/config. A fixture step list of THREE post-build steps — one blocking (on_fail
+# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Six assertions: (A) the
+# blocking step runs then the approve step HOLDS (the skill step has NOT run yet); (B) the hold surfaces
+# in herd-approve.sh list with the worktree path; (C) approve RELEASES + resumes, running the skill
+# step; (D) EXECUTION ORDER holds in the journal (block < approve < skill); (E) a FAILING block step
+# blocks its seam (a later step never runs); (F) an ABSENT step list is byte-identical (no journal, rc 0).
+step pipeline-steps "steps.tsv stages — order, approve-hold + release, step_run journal, byte-identical off"
+ST_ENGINE="$HERE/.."
+if [ ! -f "$ST_ENGINE/steps.sh" ] || [ ! -f "$ST_ENGINE/herd-approve.sh" ]; then
+  checkpoint pipeline_steps_lib skip "steps.sh / herd-approve.sh not found — pipeline-steps phase skipped"
+else
+  ST_REPO="$ART/st-repo"; ST_TREES="$ART/st-trees"; mkdir -p "$ST_TREES"
+  ST_STEPS="$ART/st-steps.tsv"; ST_JN="$ART/st-journal.jsonl"; : > "$ST_JN"
+  # Build the fixture worktree the steps run against + the skill the skill-step resolves.
+  sandbox_fixture_build "$ST_REPO" >/dev/null 2>&1
+  mkdir -p "$ST_REPO/.claude/skills/demo-review"
+  # st_env <cmd…> — run a steps.sh / herd-approve.sh CLI hermetically: HERD_STEPS_FILE points at the
+  # fixture list, the ledger lives in a throwaway trees dir, the journal is redirected via JOURNAL_FILE,
+  # and HERD_CONFIG_FILE is a non-existent path so no real project config bleeds in.
+  st_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES" \
+        HERD_STEPS_FILE="$ST_STEPS" JOURNAL_FILE="$ST_JN" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  # The three-step fixture list (all post-build so ORDER is unambiguous): block → approve-HOLD → skill.
+  {
+    printf 'gate-lint\tpost-build\techo gate-lint ok\tblock\tnone\n'
+    printf 'peer-review\tpost-build\techo peer-review ran\tblock\tapprove\n'
+    printf 'doc-pass\tpost-build\tskill:demo-review\twarn\tnone\n'
+  } > "$ST_STEPS"
+
+  # (A) RUN the post-build seam. Assert: rc 20 (HELD), the block step + approve step journaled a pass,
+  #     an awaiting hold exists, and the skill step has NOT run yet (nothing proceeds past the hold).
+  _st_rc=0
+  st_env bash "$ST_ENGINE/steps.sh" run post-build --slug demo-steps --dir "$ST_REPO" >/dev/null 2>&1 || _st_rc=$?
+  _st_hold="$ST_TREES/.agent-watch-step-holds"
+  if [ "$_st_rc" -eq 20 ] \
+     && grep -q '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null \
+     && grep -q '"name":"peer-review".*"outcome":"held"' "$ST_JN" 2>/dev/null \
+     && grep -q "awaiting demo-steps" "$_st_hold" 2>/dev/null \
+     && ! grep -q '"name":"doc-pass"' "$ST_JN" 2>/dev/null; then
+    checkpoint pipeline_steps_held pass "block step ran, approve step HELD (rc 20), skill step not yet run, hold recorded"
+  else
+    checkpoint pipeline_steps_held fail "post-build seam did not hold correctly (rc=$_st_rc)"
+  fi
+
+  # (B) LIST surfaces the step-hold with the worktree path (what the human reviews).
+  ST_LIST="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
+  if printf '%s' "$ST_LIST" | grep -q 'demo-steps' \
+     && printf '%s' "$ST_LIST" | grep -q 'peer-review' \
+     && printf '%s' "$ST_LIST" | grep -q "$ST_REPO"; then
+    checkpoint pipeline_steps_listed pass "herd-approve.sh list shows the step-hold (step + worktree path)"
+  else
+    checkpoint pipeline_steps_listed fail "herd-approve.sh list did not surface the step-hold"
+  fi
+
+  # (C) APPROVE releases + resumes: the skill step now runs. Assert: released record, skill step passed,
+  #     and no live hold remains (list no longer shows demo-steps).
+  st_env bash "$ST_ENGINE/herd-approve.sh" approve demo-steps >/dev/null 2>&1
+  ST_LIST2="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
+  if grep -q "released demo-steps" "$_st_hold" 2>/dev/null \
+     && grep -q '"name":"doc-pass".*"kind":"skill".*"outcome":"pass"' "$ST_JN" 2>/dev/null \
+     && ! printf '%s' "$ST_LIST2" | grep -q 'demo-steps'; then
+    checkpoint pipeline_steps_released pass "approve released the hold and resumed: skill step ran, hold cleared"
+  else
+    checkpoint pipeline_steps_released fail "approve did not release + resume the pipeline (skill step / released record missing)"
+  fi
+
+  # (D) EXECUTION ORDER: in the journal, the block step's step_run precedes the approve step's, which
+  #     precedes the skill step's — the declared file order, honored across the hold/resume boundary.
+  _ln_gate="$(grep -n '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  _ln_peer="$(grep -n '"name":"peer-review".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  _ln_doc="$(grep -n '"name":"doc-pass".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  if [ -n "$_ln_gate" ] && [ -n "$_ln_peer" ] && [ -n "$_ln_doc" ] \
+     && [ "$_ln_gate" -lt "$_ln_peer" ] && [ "$_ln_peer" -lt "$_ln_doc" ]; then
+    checkpoint pipeline_steps_order pass "step_run journal order held: gate-lint < peer-review < doc-pass"
+  else
+    checkpoint pipeline_steps_order fail "execution order not preserved (gate=$_ln_gate peer=$_ln_peer doc=$_ln_doc)"
+  fi
+
+  # (E) FAILING block step blocks its seam: a two-step list where the first (on_fail=block) exits
+  #     non-zero must RETURN non-zero and NEVER run the second step (block ADDS a gate, never bypasses).
+  ST_STEPS_B="$ART/st-steps-block.tsv"; ST_JN_B="$ART/st-journal-block.jsonl"; : > "$ST_JN_B"
+  {
+    printf 'will-fail\tpost-build\tfalse\tblock\tnone\n'
+    printf 'must-not-run\tpost-build\techo LEAKED\tblock\tnone\n'
+  } > "$ST_STEPS_B"
+  _st_brc=0
+  env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ART/st-trees-b" \
+      HERD_STEPS_FILE="$ST_STEPS_B" JOURNAL_FILE="$ST_JN_B" NO_COLOR=1 HERD_DRIVER=headless \
+      bash "$ST_ENGINE/steps.sh" run post-build --slug demo-block --dir "$ST_REPO" >/dev/null 2>&1 || _st_brc=$?
+  if [ "$_st_brc" -eq 1 ] \
+     && grep -q '"name":"will-fail".*"outcome":"fail"' "$ST_JN_B" 2>/dev/null \
+     && ! grep -q '"name":"must-not-run"' "$ST_JN_B" 2>/dev/null; then
+    checkpoint pipeline_steps_block pass "a failing on_fail=block step blocked the seam (rc 1); the next step never ran"
+  else
+    checkpoint pipeline_steps_block fail "on_fail=block did not block correctly (rc=$_st_brc)"
+  fi
+
+  # (F) BYTE-IDENTICAL OFF: with an ABSENT step list the runner is inert — rc 0, zero journal events.
+  ST_JN_OFF="$ART/st-journal-off.jsonl"; : > "$ST_JN_OFF"
+  _st_orc=0
+  env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ART/st-trees-off" \
+      HERD_STEPS_FILE="$ART/st-absent.tsv" JOURNAL_FILE="$ST_JN_OFF" NO_COLOR=1 HERD_DRIVER=headless \
+      bash "$ST_ENGINE/steps.sh" run post-build --slug demo-off --dir "$ST_REPO" >/dev/null 2>&1 || _st_orc=$?
+  if [ "$_st_orc" -eq 0 ] && [ ! -s "$ST_JN_OFF" ]; then
+    checkpoint pipeline_steps_off pass "absent step list ⇒ byte-identical no-op (rc 0, zero journal events)"
+  else
+    checkpoint pipeline_steps_off fail "absent step list was NOT inert (rc=$_st_orc, journal bytes=$( wc -c < "$ST_JN_OFF" 2>/dev/null ))"
+  fi
+fi
+
 # ── scorecard ───────────────────────────────────────────────────────────────────
 RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT" "$FIXTURE_SHA")"
