@@ -1213,12 +1213,15 @@ _review_gate_step() {
   # Collect a finished verdict: record to the ledger exactly as the synchronous gate did.
   if [ -f "$result" ]; then
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
-    rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
-    # VERDICT CONSUMED → retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane
-    # OPEN with an idle session showing the verdict banner; now that the watcher has read the verdict
-    # that pane has done its job, so close it (and drop the registry row). No-op when there is no live
-    # pane (headless, or an INFRA-FAIL reviewer that already tore down its own pane).
-    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    # HERD-156 (record-before-rm): DURABLY record the verdict to the ledger FIRST, and only THEN remove
+    # the reviewer's scratch files. The old order (rm → record) had a fatal seam: a crash BETWEEN the rm
+    # and the record deleted the result file with NO ledger row to show for it, permanently losing a
+    # collected PASS/BLOCK — the next tick, finding neither result nor verdict, would dispatch a
+    # brand-new review from scratch. Recording first makes the collect at-least-once: a crash after the
+    # record simply re-reads the still-present result file next tick and re-records it (duplicate ledger
+    # rows are last-wins = safe). The rm + pane-retire below are pure cleanup that a re-run repeats
+    # harmlessly.
+    local _rgs_echo=""
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
@@ -1230,22 +1233,30 @@ _review_gate_step() {
         _breaker_record_ok
         record_review "$pr" "$sha" "PASS" "reviewer"
         _record_advisory_notes "$pr" "$sha" "$verdict_line"
-        echo PASS; return 0 ;;
+        _rgs_echo=PASS ;;
       "REVIEW: BLOCK"*)
         _breaker_record_ok
         record_review "$pr" "$sha" "BLOCK" "reviewer"
         # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
         _persist_block_fields "$pr" "$sha" "$verdict_line"
-        echo BLOCK; return 0 ;;
+        _rgs_echo=BLOCK ;;
       *)
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
         # verdict — never cached to the ledger, retried next poll with a cap. Counts against the
         # global INFRA circuit breaker (HERD-110): a run of these across PRs means the env is dead.
         record_review_retry "$pr" "$sha"
         _breaker_record_infra
-        if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
-        return 0 ;;
+        if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then _rgs_echo=FAILED; else _rgs_echo=RETRY; fi
+        ;;
     esac
+    # Verdict is now durably in the ledger → drop the reviewer's scratch files. VERDICT CONSUMED →
+    # retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane OPEN with an idle
+    # session showing the verdict banner; now that the watcher has read the verdict that pane has done
+    # its job, so close it (and drop the registry row). No-op when there is no live pane (headless, or
+    # an INFRA-FAIL reviewer that already tore down its own pane).
+    rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    echo "$_rgs_echo"; return 0
   fi
 
   # In flight and alive → wait. Dead with no result = severed reviewer → reap, count, re-dispatch.
@@ -2003,7 +2014,23 @@ do_merge() {
       return 1
     fi
   fi
-  gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
+  # HERD-156: PIN the merge to the gate-verified sha. Everything upstream — the re-verify tick, the
+  # PR-body fetch, the pre-merge steps seam above — opens a window in which a NEW commit could be
+  # pushed to the head branch AFTER the review + health gates passed on $dsha. --match-head-commit makes
+  # gh REFUSE the merge unless the remote head is still exactly $dsha, so a commit that landed during
+  # that window can NEVER merge unreviewed. On a moved head gh exits non-zero; we journal it and return
+  # WITHOUT writing the $STATE merge row, so the next tick re-gates (re-review + re-health) the NEW sha
+  # through the existing machinery — no new state, and the merge stays at-most-once. $dsha is empty only
+  # for a legacy caller that threaded no sha; there we fall back to the unpinned merge (byte-identical to
+  # before this change) rather than refuse a merge we cannot pin.
+  if [ -n "$dsha" ]; then
+    if ! gh pr merge "$dp" "$(_merge_method_flag)" --match-head-commit "$dsha" >/dev/null 2>&1; then
+      journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+      return 1
+    fi
+  else
+    gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
+  fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
   # body line. Empty for an untracked PR → the row renders the plain slug, exactly as before.
