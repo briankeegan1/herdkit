@@ -66,7 +66,12 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] \
    && command -v bats >/dev/null 2>&1 \
    && ls "$TESTS_DIR"/*.bats >/dev/null 2>&1; then
   echo "▶ bats: running $TESTS_DIR/*.bats on ${PLATFORM}"
-  if bats "$TESTS_DIR"/*.bats; then
+  # --print-output-on-failure surfaces the wrapped test's own stderr (bats otherwise shows only the
+  # failed assertion line). Older bats-core lacks the flag → fall back to a plain run.
+  bats_flags=""
+  bats --print-output-on-failure --version >/dev/null 2>&1 && bats_flags="--print-output-on-failure"
+  # shellcheck disable=SC2086
+  if bats $bats_flags "$TESTS_DIR"/*.bats; then
     echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM}"
     exit 0
   else
@@ -86,10 +91,12 @@ fi
 
 pass=0; real_fail=0; xfail=0
 real_names=(); xfail_names=()
+LOGDIR="$(mktemp -d 2>/dev/null || echo /tmp/herd-ci-logs.$$)"; mkdir -p "$LOGDIR"
 echo "▶ direct: running ${#tests[@]} hermetic tests on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
-  if bash "$t" >/dev/null 2>&1; then
+  log="$LOGDIR/$name.log"
+  if bash "$t" >"$log" 2>&1; then
     pass=$((pass+1))
   else
     if reason="$(allow_reason "$name")"; then
@@ -97,7 +104,8 @@ for t in "${tests[@]}"; do
       echo "⚠️  XFAIL (env-sensitive) $name: $reason"
     else
       real_fail=$((real_fail+1)); real_names+=("$name")
-      echo "❌ FAIL $name"
+      echo "❌ FAIL $name — last lines:"
+      tail -n 6 "$log" | sed 's/^/      │ /'
     fi
   fi
 done

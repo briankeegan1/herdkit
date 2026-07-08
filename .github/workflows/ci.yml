@@ -1,23 +1,27 @@
 name: CI
 
-# Cross-platform hermetic-suite gate (HERD-167). Runs the herdkit test suite on
-# ubuntu, macOS, and Windows so a change that only passes on the maintainer's macOS
-# box can't silently break the second operator's Git Bash / a headless Linux CI box.
+# Cross-platform hermetic-suite gate (HERD-167).
 #
-# The suite is HERMETIC (stubs claude/herdr/gh, no network) — see scripts/ci/run-suite.sh,
-# which mirrors .herd/healthcheck.project.sh's own fallback (bats where available, else the
-# tests/test-*.sh scripts directly) and marks KNOWN env-sensitive Windows tests as XFAIL
-# instead of hacking them green (tests/known-env-sensitive.tsv, docs/windows.md).
+# WSL2-FIRST POLICY (2026-07-08): the supported way to run herdkit on Windows is WSL2, not
+# native Git Bash (bash/locale/python3 divergences make Git Bash too spotty to gate on — see
+# docs/windows.md). WSL2 semantics ARE Linux semantics, so the `ubuntu` leg below IS the
+# Windows/WSL2 coverage. Consequently:
+#   • ubuntu + macOS   — run the hermetic suite; REQUIRED green. ubuntu doubles as WSL2.
+#   • windows-latest   — a MINIMAL advisory smoke (scripts/ci/windows-smoke.sh): LF/.gitattributes
+#                        + docs sanity + `bash -n`. NOT the full suite chasing Git Bash greens,
+#                        and it does NOT spin up nested WSL inside the runner. Advisory only.
 #
-# ubuntu + macOS are REQUIRED green. Windows is documented-partial (allow_failure) while the
-# Git Bash story matures — WSL2 is the recommended path (docs/windows.md).
+# The suite is HERMETIC (stubs claude/herdr/gh, no network). scripts/ci/run-suite.sh mirrors
+# .herd/healthcheck.project.sh's own fallback: with bats installed (as below, and as on the
+# auto-merge watcher) it runs the curated `tests/*.bats` gate — the SAME authoritative set the
+# watcher gates on; without bats it runs tests/test-*.sh directly, marking KNOWN env-sensitive
+# tests XFAIL via tests/known-env-sensitive.tsv (never hacked green).
 
 on:
   push:
     branches: [main]
   pull_request:
 
-# One in-flight run per ref; a new push cancels the previous.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -27,78 +31,59 @@ permissions:
 
 defaults:
   run:
-    # bash on every leg — on Windows this is Git Bash, exactly the second operator's env.
     shell: bash
+
+env:
+  # Deterministic terminal + locale so tput-cols-driven rendering and emoji greps behave the
+  # same on every leg (a runner with no TERM makes `tput cols` diverge from the maintainer's box).
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  TERM: xterm
 
 jobs:
   suite:
     name: suite (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow_failure }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-latest   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
             platform: ubuntu
-            allow_failure: false
           - os: macos-latest
             platform: macos
-            allow_failure: false
-          - os: windows-latest
-            platform: windows
-            allow_failure: true
     env:
-      # UTF-8 so the suite's emoji greps (✅/❌/🟢) match on every locale, incl. Git Bash.
-      LANG: C.UTF-8
-      LC_ALL: C.UTF-8
       HERD_CI_PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-
-      - name: Windows — provide a python3 shim (docs/windows.md)
-        if: runner.os == 'Windows'
+      - name: Install bats (curated gate — mirrors the auto-merge watcher)
         run: |
-          # Git Bash ships no `python3`; the suite (and `herd doctor`) expect one. Mirror the
-          # /usr/bin/python3 shim from docs/windows.md so the hermetic tests can find it.
-          py="$(command -v python || command -v py || true)"
-          if [ -n "$py" ]; then
-            mkdir -p "$HOME/bin"
-            printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$py" > "$HOME/bin/python3"
-            chmod +x "$HOME/bin/python3"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
-          python3 --version || python --version || true
-
+          if [ "${{ runner.os }}" = "macOS" ]; then brew install bats-core; else sudo apt-get update && sudo apt-get install -y bats; fi
+          bats --version
+      - name: Configure git identity (runners ship none; hermetic tests commit)
+        run: |
+          git config --global user.name  "herdkit CI"
+          git config --global user.email "ci@herdkit.local"
+          git config --global init.defaultBranch main
       - name: Show environment
         run: |
           echo "platform: $HERD_CI_PLATFORM   uname: $(uname -a)"
-          echo "bash:     $BASH_VERSION"
-          command -v python3 && python3 --version || echo "python3: not found"
-          locale 2>/dev/null | head -3 || true
-
-      - name: Run hermetic suite (direct — all tests/test-*.sh)
+          echo "bash: $BASH_VERSION   TERM: $TERM   cols: $(tput cols 2>/dev/null || echo n/a)"
+          python3 --version || echo "python3: not found"
+      - name: Run hermetic suite
         run: bash scripts/ci/run-suite.sh
 
-  bats:
-    # Exercise the OTHER branch of the healthcheck fallback: bats where available.
-    name: bats (ubuntu)
-    runs-on: ubuntu-latest
-    env:
-      LANG: C.UTF-8
-      LC_ALL: C.UTF-8
-      HERD_CI_PLATFORM: ubuntu
+  windows-smoke:
+    # WSL2-first: Windows gets a fast ADVISORY smoke, not the full suite. continue-on-error so a
+    # Git Bash quirk never blocks a merge — the ubuntu leg is the authoritative Windows/WSL2 gate.
+    name: windows-smoke (advisory)
+    runs-on: windows-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-      - name: Install bats
-        run: sudo apt-get update && sudo apt-get install -y bats
-      - name: Run suite via bats (runner auto-selects the bats path)
-        run: bash scripts/ci/run-suite.sh
+      - name: Run Windows advisory smoke
+        run: bash scripts/ci/windows-smoke.sh
