@@ -241,6 +241,38 @@ run_attribution_lint() {
   AL_FULL="$_al_violations"
 }
 
+# ── commit-convention lint: every PR commit subject must match COMMIT_CONVENTION (HERD-124) ──────
+# Keyed on COMMIT_CONVENTION (an egrep pattern; independent of the heavy/light profile and the other
+# gates). Default '' → the lint never runs and output is byte-identical. Every commit subject on
+# <DEFAULT_BRANCH>..HEAD must match the pattern; a non-matching subject is a code-error naming the
+# sha + subject + pattern. Fail-soft: an INVALID regex warns and skips the lint (never a false red).
+# Sets:
+#   CC_STATE  = DISABLED | CLEAN | WARN | CODEERROR
+#   CC_REASON = first offending "sha:subject" (CODEERROR); the fixed warning text (WARN)
+#   CC_FULL   = all offending "sha:subject" pairs, newline-separated (empty unless CODEERROR)
+CC_STATE="DISABLED"; CC_REASON=""; CC_FULL=""
+run_commit_convention_lint() {
+  local _cc_pat="${COMMIT_CONVENTION:-}"
+  [ -n "$_cc_pat" ] || return 0     # off (default "") → zero behavior change
+  # Fail-soft regex validation: probe the pattern against empty input. A VALID egrep yields no match
+  # (exit 1); an INVALID one makes grep exit ≥2. Never red on a bad pattern — warn and skip.
+  grep -qE "$_cc_pat" </dev/null 2>/dev/null
+  if [ "$?" -ge 2 ]; then
+    CC_STATE="WARN"
+    CC_REASON="invalid COMMIT_CONVENTION regex (lint skipped): $_cc_pat"
+    return 0
+  fi
+  local _cc_violations
+  _cc_violations="$(_herd_commit_convention_scan "$DEFAULT_BRANCH" "$_cc_pat")"
+  if [ -z "$_cc_violations" ]; then
+    CC_STATE="CLEAN"
+    return 0
+  fi
+  CC_STATE="CODEERROR"
+  CC_REASON="$(printf '%s' "$_cc_violations" | head -1)"
+  CC_FULL="$_cc_violations"
+}
+
 # ── interaction gate: run INTERACTION_TEST_CMD, or flag its absence, for app-surface PRs ──────
 # Keyed on APP_SURFACE_GLOB (independent of the heavy/light profile). Sets:
 #   IG_STATE  = DISABLED | WARN | CLEAN | DATAENV | CODEERROR
@@ -287,24 +319,28 @@ MAIN_OUT="$(run_profile)"; MAIN_RC=$?
 
 run_interaction_gate
 run_attribution_lint
+run_commit_convention_lint
 
 # Combined exit: a real CODE error on ANY gate blocks the merge.
 RC=0
 [ "$MAIN_RC" -eq 1 ] && RC=1
 [ "$IG_STATE" = "CODEERROR" ] && RC=1
 [ "$AL_STATE" = "CODEERROR" ] && RC=1
+[ "$CC_STATE" = "CODEERROR" ] && RC=1
 
 if [ -n "$ONELINE" ]; then
   # Exactly ONE line — the watcher paints healthcheck --oneline as a single status row.
   if [ "$RC" -eq 1 ]; then
     if [ "$MAIN_RC" -eq 1 ]; then printf '%s\n' "$MAIN_OUT"
     elif [ "$IG_STATE" = "CODEERROR" ]; then printf '❌ interaction — %s\n' "$IG_REASON"
-    else printf '❌ attribution — %s\n' "$AL_REASON"; fi
+    elif [ "$AL_STATE" = "CODEERROR" ]; then printf '❌ attribution — %s\n' "$AL_REASON"
+    else printf '❌ commit-convention — %s\n' "$CC_REASON"; fi
   else
     case "$IG_STATE" in
       WARN)    printf '⚠️  %s\n' "$IG_REASON" ;;
       DATAENV) printf '⚠️  interaction data/env (not a code bug) — %s\n' "$IG_REASON" ;;
-      *)       printf '%s\n' "$MAIN_OUT" ;;
+      *)       if [ "$CC_STATE" = "WARN" ]; then printf '⚠️  commit-convention — %s\n' "$CC_REASON"
+               else printf '%s\n' "$MAIN_OUT"; fi ;;
     esac
   fi
   exit "$RC"
@@ -326,5 +362,12 @@ case "$AL_STATE" in
   CLEAN)    printf '✅ ATTRIBUTION LINT CLEAN\n' ;;
   CODEERROR) printf '❌ ATTRIBUTION LINT: AI co-author marker found\n'
              [ -n "$AL_FULL" ] && printf '%s\n' "$AL_FULL" ;;
+esac
+case "$CC_STATE" in
+  DISABLED) : ;;
+  CLEAN)    printf '✅ COMMIT CONVENTION LINT CLEAN\n' ;;
+  WARN)     printf '⚠️  COMMIT CONVENTION LINT: %s\n' "$CC_REASON" ;;
+  CODEERROR) printf '❌ COMMIT CONVENTION LINT: subject does not match /%s/\n' "$COMMIT_CONVENTION"
+             [ -n "$CC_FULL" ] && printf '%s\n' "$CC_FULL" ;;
 esac
 exit "$RC"

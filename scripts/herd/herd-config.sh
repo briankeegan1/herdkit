@@ -365,6 +365,14 @@ fi
 # with it set the healthcheck enforces it deterministically and cannot be silently violated.
 : "${ATTRIBUTION_POLICY:=""}"     # '' (default, off) | no-ai-coauthor
 
+# COMMIT_CONVENTION — commit-message convention lint gate (HERD-124). Ships dormant: default ''
+# (empty) → lint absent, byte-identical to before. Set to an egrep pattern that every commit
+# subject on <DEFAULT_BRANCH>..HEAD must match; a non-conforming subject fails the healthcheck as a
+# code-error naming the offending sha + subject + pattern. Fail-soft: an invalid regex warns and
+# skips the lint (never a false red). E.g. Conventional Commits:
+#   '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
+: "${COMMIT_CONVENTION:=""}"      # '' (default, off) | egrep pattern every commit subject must match
+
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
 : "${REVIEW_CHECKLIST:=""}"     # project risk list injected into the review gate
 

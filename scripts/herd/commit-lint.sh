@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # commit-lint.sh — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
-# Sourced by healthcheck.sh; the future COMMIT_CONVENTION lint sources this too.
+# Sourced by healthcheck.sh; the COMMIT_CONVENTION lint (HERD-124) sources it too.
+
+# _herd_commit_shas <base_ref> — emit the full SHA of every commit on <base_ref>..HEAD, one per
+# line (topo/reverse-chronological — git's default). The single commit-walking primitive shared by
+# every lint gate below: the attribution scan and the commit-convention scan both range over it, so
+# the "which commits does this PR add?" definition lives in exactly one place. Empty stdout → the
+# branch is not ahead of <base_ref> (or the ref does not resolve). Returns 0 always.
+_herd_commit_shas() {
+  git log "${1:-origin/main}..HEAD" --format="%H" 2>/dev/null
+}
 
 # _herd_attr_scan <base_ref> — walk commits between <base_ref> and HEAD.
 # Prints "SHORT_SHA:LINE" for each commit body line matching an AI attribution marker.
@@ -23,6 +32,28 @@ _herd_attr_scan() {
           ;;
       esac
     done <<< "$_as_body"
-  done < <(git log "$_as_base..HEAD" --format="%H" 2>/dev/null)
+  done < <(_herd_commit_shas "$_as_base")
   printf '%s' "$_as_out"
+}
+
+# _herd_commit_convention_scan <base_ref> <egrep_pattern> — walk commits between <base_ref> and
+# HEAD (via the shared _herd_commit_shas primitive). Prints "SHORT_SHA:SUBJECT" for each commit
+# whose SUBJECT line (git %s) does NOT match <egrep_pattern>. Empty stdout → every subject conforms.
+# Returns 0 always; caller checks stdout.
+#
+# The pattern MUST already be a valid egrep (the caller fail-soft-validates it before calling —
+# an invalid regex makes grep exit 2, which would spuriously flag every commit). An empty pattern
+# is a no-op (nothing to enforce → clean).
+_herd_commit_convention_scan() {
+  local _cc_base="${1:-origin/main}" _cc_pat="${2:-}"
+  local _cc_sha _cc_subj _cc_out=""
+  [ -n "$_cc_pat" ] || { printf ''; return 0; }
+  while IFS= read -r _cc_sha; do
+    [ -n "$_cc_sha" ] || continue
+    _cc_subj="$(git log -1 --format="%s" "$_cc_sha" 2>/dev/null)"
+    if ! printf '%s' "$_cc_subj" | grep -qE "$_cc_pat" 2>/dev/null; then
+      _cc_out="${_cc_out}$(printf '%.12s' "$_cc_sha"):${_cc_subj}"$'\n'
+    fi
+  done < <(_herd_commit_shas "$_cc_base")
+  printf '%s' "$_cc_out"
 }
