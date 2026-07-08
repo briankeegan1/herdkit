@@ -90,10 +90,28 @@ render() { :; }
 
 # Helper: reset per-scenario state (ledger, invocation log, markers, DISPLAY, sequence file).
 reset_scenario() {
-  rm -f "$HEALTH_STATE" "$STUB_HC_LOG" "$T/trees"/.health-inflight-* "$T/trees"/.health-result-* 2>/dev/null || true
+  rm -f "$HEALTH_STATE" "$STUB_HC_LOG" "$T/trees"/.health-inflight-* "$T/trees"/.health-result-* \
+        "$T/trees"/.health-dispatch-* 2>/dev/null || true
   : > "$STUB_HC_LOG"
   : > "$JOURNAL_FILE"
   DISPLAY=(); _HC_RESULT=""
+}
+
+# hc_run <pr> <slug> <dir> <idx> [sha] — drive the now-ASYNC gate (HERD-185) to a TERMINAL verdict:
+# dispatch, then poll for the background worker's dispatch result and RE-ENTER the gate to collect it.
+# Leaves _HC_RESULT + DISPLAY exactly as the collecting call did. This mirrors how the watcher tick
+# re-enters _healthcheck_gate across successive ticks, compressed into one blocking helper so the
+# assertions below can stay verdict-oriented. A cache hit or a QUEUED slot returns immediately (nothing
+# to await); a RUNNING dispatch is awaited then collected.
+hc_run() {
+  local _p="$1" _s="$2" _d="$3" _i="$4" _sha="${5:-}" _key _disp _n=0
+  _HC_RESULT=""
+  _healthcheck_gate "$_p" "$_s" "$_d" "$_i" "$_sha"
+  case "$_HC_RESULT" in CLEAN|FLAKY|CODEERROR|QUEUED) return 0 ;; esac   # terminal/queued → done
+  _key="${_p}-${_sha}"; _disp="$(_health_dispatch_file "$_key")"
+  while [ "$_n" -lt 500 ]; do [ -f "$_disp" ] && break; sleep 0.02; _n=$((_n + 1)); done
+  _HC_RESULT=""
+  _healthcheck_gate "$_p" "$_s" "$_d" "$_i" "$_sha"    # collect
 }
 # Helper: outcome tokens recorded in the ledger for a given PR, space-joined in order.
 ledger_outcomes() { awk -v p="$1" '$2==p{print $5}' "$HEALTH_STATE" 2>/dev/null | paste -sd' ' -; }
@@ -113,19 +131,19 @@ ok
 # ── (2) clean pass → CLEAN, ledger 'clean', not red ──────────────────────────
 reset_scenario
 printf '0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 1 slug-clean "$T/wt" 0
+hc_run 1 slug-clean "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "clean healthcheck should yield CLEAN (got '$_HC_RESULT')"
 ok
 [ "$(ledger_outcomes 1)" = "clean" ] || fail "ledger should record 'clean' (got '$(ledger_outcomes 1)')"
 printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "clean run must not paint 'needs you'"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] || fail "clean run should invoke healthcheck exactly once"
-[ ! -e "$(_health_inflight_file 1)" ] || fail "clean run must release its mutex marker"
+[ ! -e "$(_health_inflight_file "1-")" ] || fail "clean run must release its mutex marker"
 ok
 
 # ── (3) tolerated data/env (rc 0, ⚠️ prefix) → CLEAN, ledger 'dataenv' ────────
 reset_scenario
 printf '0|⚠️  data/env (not a code bug) — missing fixture\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 2 slug-env "$T/wt" 0
+hc_run 2 slug-env "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "data/env (rc 0) should yield CLEAN (got '$_HC_RESULT')"
 [ "$(ledger_outcomes 2)" = "dataenv" ] || fail "ledger should record 'dataenv' (got '$(ledger_outcomes 2)')"
 printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "data/env run must not paint 'needs you'"
@@ -134,7 +152,7 @@ ok
 # ── (4) FLAKY: fail-then-pass → flaky/infra, NOT red, proceeds as passing ─────
 reset_scenario
 printf '1|❌ code error — TESTS FAILED: 27\n0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 3 slug-flaky "$T/wt" 0
+hc_run 3 slug-flaky "$T/wt" 0
 [ "$_HC_RESULT" = "FLAKY" ] || fail "fail-then-pass should yield FLAKY (got '$_HC_RESULT')"
 ok
 d="${DISPLAY[0]:-}"
@@ -145,13 +163,13 @@ ok
 [ "$(ledger_outcomes 3)" = "code-error flaky-pass" ] \
   || fail "ledger should record 'code-error flaky-pass' (got '$(ledger_outcomes 3)')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "flaky run should invoke healthcheck exactly twice (initial + solo retry)"
-[ ! -e "$(_health_inflight_file 3)" ] || fail "flaky run must release its mutex marker"
+[ ! -e "$(_health_inflight_file "3-")" ] || fail "flaky run must release its mutex marker"
 ok
 
 # ── (5) REAL: fail-then-fail → red 'needs you', CODEERROR, exactly two runs ───
 reset_scenario
 printf '1|❌ code error — real bug on line 5\n1|❌ code error — real bug on line 5\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 4 slug-real "$T/wt" 0
+hc_run 4 slug-real "$T/wt" 0
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
 ok
 d="${DISPLAY[0]:-}"
@@ -162,7 +180,7 @@ ok
 [ "$(ledger_outcomes 4)" = "code-error code-error" ] \
   || fail "ledger should record 'code-error code-error' (got '$(ledger_outcomes 4)')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "real failure should invoke healthcheck exactly twice — never a third retry"
-[ ! -e "$(_health_inflight_file 4)" ] || fail "real failure must still release its mutex marker"
+[ ! -e "$(_health_inflight_file "4-")" ] || fail "real failure must still release its mutex marker"
 ok
 
 # ── (5b) HERD-76: the FLAKY offender's identity is persisted before the passing retry ─────────────
@@ -181,7 +199,7 @@ ok
 ok
 reset_scenario
 printf '1|❌ code error — tests/test-widget.sh: FAILED\n0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 30 slug-flakyid "$T/wt" 0
+hc_run 30 slug-flakyid "$T/wt" 0
 [ "$_HC_RESULT" = "FLAKY" ] || fail "5b: fail-then-pass should yield FLAKY (got '$_HC_RESULT')"
 # The failing attempt's journal event carries failed=<file> …
 grep -q '"event":"healthcheck_attempted"' "$JOURNAL_FILE" || fail "5b: expected a healthcheck_attempted event"
@@ -203,7 +221,7 @@ ok
 # A reproduced (fail-then-fail) code error also records the offender on the retry attempt.
 reset_scenario
 printf '1|❌ code error — tests/test-broken.sh: line 5\n1|❌ code error — tests/test-broken.sh: line 5\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 31 slug-realid "$T/wt" 0
+hc_run 31 slug-realid "$T/wt" 0
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "5b: fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
 python3 - "$JOURNAL_FILE" <<'PY' || fail "5b: retry code-error attempt must carry failed=tests/test-broken.sh"
 import json,sys
@@ -221,17 +239,17 @@ printf '0|✅ clean — should not run while queued\n' > "$STUB_HC_SEQ"
 printf '%s\n' "$$" > "$(_health_inflight_file 999)"
 [ "$(_count_live_healthchecks)" -eq 1 ] || fail "planted holder should count as 1 live healthcheck"
 _health_slot_free && fail "no slot should be free while a holder is live at HEALTH_CONCURRENCY=1"
-_healthcheck_gate 5 slug-queued "$T/wt" 0
+hc_run 5 slug-queued "$T/wt" 0
 [ "$_HC_RESULT" = "QUEUED" ] || fail "PR should QUEUE while the slot is busy (got '$_HC_RESULT')"
 ok
 printf '%s\n' "${DISPLAY[0]:-}" | grep -q "health-check · queued" \
   || fail "queued PR should show 'health-check · queued' (got: ${DISPLAY[0]:-})"
 [ ! -s "$STUB_HC_LOG" ] || fail "a queued PR must NOT invoke the healthcheck"
-[ ! -e "$(_health_inflight_file 5)" ] || fail "a queued PR must not claim a marker"
+[ ! -e "$(_health_inflight_file "5-")" ] || fail "a queued PR must not claim a marker"
 ok
 # Free the slot → the PR now runs to CLEAN.
 _health_release 999
-_healthcheck_gate 5 slug-queued "$T/wt" 0
+hc_run 5 slug-queued "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "once the slot frees, the queued PR should run (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] || fail "freed PR should invoke the healthcheck exactly once"
 ok
@@ -242,7 +260,7 @@ reset_scenario
 printf '%s\n' "$$" > "$(_health_inflight_file 998)"
 HEALTH_CONCURRENCY=2
 printf '0|✅ clean — override lets it run\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 6 slug-override "$T/wt" 0
+hc_run 6 slug-override "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "HEALTH_CONCURRENCY=2 with one holder should still run (got '$_HC_RESULT')"
 ok
 # Now HEALTH_CONCURRENCY=1 with the same holder → queues.
@@ -250,7 +268,7 @@ reset_scenario
 printf '%s\n' "$$" > "$(_health_inflight_file 998)"
 HEALTH_CONCURRENCY=1
 printf '0|✅ clean\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 7 slug-override2 "$T/wt" 0
+hc_run 7 slug-override2 "$T/wt" 0
 [ "$_HC_RESULT" = "QUEUED" ] || fail "HEALTH_CONCURRENCY=1 with one holder should queue (got '$_HC_RESULT')"
 _health_release 998
 ok
@@ -260,7 +278,7 @@ reset_scenario
 export STUB_HC_MARKERCOUNT_LOG="$T/hc-markercount.log"; : > "$STUB_HC_MARKERCOUNT_LOG"
 HEALTH_CONCURRENCY=1
 printf '1|❌ code error — transient\n0|✅ clean — passed solo\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 8 slug-solo "$T/wt" 0
+hc_run 8 slug-solo "$T/wt" 0
 [ "$_HC_RESULT" = "FLAKY" ] || fail "solo-retry scenario should end FLAKY (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_MARKERCOUNT_LOG")" -eq 2 ] || fail "stub should have observed two invocations"
 if grep -qvx '1' "$STUB_HC_MARKERCOUNT_LOG"; then
@@ -273,13 +291,13 @@ ok
 reset_scenario
 HEALTH_CONCURRENCY=1
 printf '0|✅ clean\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 10 slug-a "$T/wt" 0
+hc_run 10 slug-a "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "PR 10 should run clean"
 printf '0|✅ clean\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 11 slug-b "$T/wt" 1
+hc_run 11 slug-b "$T/wt" 1
 [ "$_HC_RESULT" = "CLEAN" ] || fail "PR 11 should run clean after PR 10 released the slot"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "two sequential PRs should invoke the healthcheck twice total"
-[ ! -e "$(_health_inflight_file 10)" ] && [ ! -e "$(_health_inflight_file 11)" ] \
+[ ! -e "$(_health_inflight_file "10-")" ] && [ ! -e "$(_health_inflight_file "11-")" ] \
   || fail "both PRs must release their markers after running"
 ok
 
@@ -296,14 +314,14 @@ ok
 reset_scenario
 HEALTH_CONCURRENCY=1
 printf '0|✅ clean — 30 sh, 0 py ok\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+hc_run 1000 slug-cache "$T/wt" 0 "deadbeef01"
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8a: first run of a fresh sha should yield CLEAN (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] || fail "8a: first run should invoke the healthcheck exactly once"
 [ -f "$(_health_result_file 1000 deadbeef01)" ] || fail "8a: a terminal CLEAN must be cached for this sha"
 # Two more ticks on the SAME sha — cache hits, suite NEVER re-runs, verdict still CLEAN.
-_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+_HC_RESULT=""; hc_run 1000 slug-cache "$T/wt" 0 "deadbeef01"
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8a: cached sha should REUSE CLEAN (got '$_HC_RESULT')"
-_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "deadbeef01"
+_HC_RESULT=""; hc_run 1000 slug-cache "$T/wt" 0 "deadbeef01"
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8a: cached sha should REUSE CLEAN on every later tick"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] \
   || fail "8a: an UNCHANGED sha must NOT re-run the suite ($(wc -l < "$STUB_HC_LOG") invocations, expected 1)"
@@ -314,7 +332,7 @@ ok
 
 # (8b) a NEW commit sha invalidates the cache → full re-run, and the stale marker is discarded.
 printf '0|✅ clean — new commit\n' > "$STUB_HC_SEQ"
-_HC_RESULT=""; _healthcheck_gate 1000 slug-cache "$T/wt" 0 "feed123402"
+_HC_RESULT=""; hc_run 1000 slug-cache "$T/wt" 0 "feed123402"
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8b: a new sha should re-run and yield CLEAN (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
   || fail "8b: a NEW commit sha must invalidate the cache and re-run ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
@@ -328,7 +346,7 @@ reset_scenario
 HEALTH_CONCURRENCY=1
 export STUB_HC_MARKERCOUNT_LOG="$T/hc-markercount.log"; : > "$STUB_HC_MARKERCOUNT_LOG"
 printf '1|❌ code error — transient\n0|✅ clean — passed solo\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 1001 slug-cflaky "$T/wt" 0 "cafe567803"
+hc_run 1001 slug-cflaky "$T/wt" 0 "cafe567803"
 [ "$_HC_RESULT" = "FLAKY" ] || fail "8c: fail-then-pass on a fresh sha should still yield FLAKY (got '$_HC_RESULT')"
 [ "$(ledger_outcomes 1001)" = "code-error flaky-pass" ] \
   || fail "8c: retry-before-red ledger unchanged (got '$(ledger_outcomes 1001)')"
@@ -342,7 +360,7 @@ unset STUB_HC_MARKERCOUNT_LOG
 [ -f "$(_health_result_file 1001 cafe567803)" ] || fail "8c: the FLAKY verdict must be cached for this sha"
 # Next tick, same sha → reuse FLAKY, no re-run, shows the flaky/infra row (never red).
 _HC_RESULT=""; DISPLAY=()
-_healthcheck_gate 1001 slug-cflaky "$T/wt" 0 "cafe567803"
+hc_run 1001 slug-cflaky "$T/wt" 0 "cafe567803"
 [ "$_HC_RESULT" = "FLAKY" ] || fail "8c: cached sha should REUSE FLAKY (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8c: reusing a cached FLAKY must NOT re-run the suite"
 printf '%s\n' "${DISPLAY[0]:-}" | grep -q "flaky · infra (passed on retry)" \
@@ -354,13 +372,13 @@ ok
 reset_scenario
 HEALTH_CONCURRENCY=1
 printf '1|❌ code error — real bug on line 5\n1|❌ code error — real bug on line 5\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 1002 slug-cred "$T/wt" 0 "face9abc04"
+hc_run 1002 slug-cred "$T/wt" 0 "face9abc04"
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "8d: fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8d: first run of a red sha runs twice (initial + solo retry)"
 [ -f "$(_health_result_file 1002 face9abc04)" ] || fail "8d: a terminal CODEERROR must be cached"
 # Later ticks on the same sha → reuse CODEERROR, red row stays, suite never re-runs.
 _HC_RESULT=""; DISPLAY=()
-_healthcheck_gate 1002 slug-cred "$T/wt" 0 "face9abc04"
+hc_run 1002 slug-cred "$T/wt" 0 "face9abc04"
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "8d: cached sha should REUSE CODEERROR (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
   || fail "8d: a cached CODEERROR must keep the red row WITHOUT re-running ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
@@ -373,9 +391,9 @@ ok
 reset_scenario
 HEALTH_CONCURRENCY=1
 printf '0|✅ clean — no sha\n' > "$STUB_HC_SEQ"
-_healthcheck_gate 1003 slug-nosha "$T/wt" 0 ""
+hc_run 1003 slug-nosha "$T/wt" 0 ""
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8e: empty-sha run should yield CLEAN"
-_HC_RESULT=""; _healthcheck_gate 1003 slug-nosha "$T/wt" 0 ""
+_HC_RESULT=""; hc_run 1003 slug-nosha "$T/wt" 0 ""
 [ "$_HC_RESULT" = "CLEAN" ] || fail "8e: empty-sha second run should yield CLEAN"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
   || fail "8e: an empty sha must NOT cache — both calls run the suite ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"

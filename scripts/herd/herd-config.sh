@@ -441,6 +441,12 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
+# seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
+# mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well
+# above any legitimate run so a healthy worker is never killed. Non-numeric → the built-in 1800 default.
+: "${REVIEW_INFLIGHT_TIMEOUT:="1800"}"   # HERD-185: seconds before an in-flight reviewer is timed out + reaped (default 1800 = 30m)
+: "${HEALTH_INFLIGHT_TIMEOUT:="1800"}"   # HERD-185: seconds before an in-flight healthcheck suite is timed out + reaped (default 1800 = 30m)
 # GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
 # the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
 # byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is

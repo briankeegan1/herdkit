@@ -274,9 +274,11 @@ else
   echo "❌ code error — app/greet.test.sh → greet.test FAIL"; exit 1
 fi
 HCSTUB
-  # Driver: source agent-watch.sh in lib mode, run main_health_tick + build_main_health, print the
-  # rendered row on stdout. HERD_DRIVER=headless routes any notification to a log (never the live
-  # herdr workspace); NO_COLOR keeps the row plain-text so the assertions can grep it.
+  # Driver: source agent-watch.sh in lib mode, DISPATCH main_health_tick (now ASYNC — HERD-185), AWAIT
+  # the backgrounded suite, COLLECT it, then build + print the rendered row on stdout. This mirrors the
+  # real watcher loop, whose tick top runs _collect_main_health before build_main_health, except we
+  # block here (bounded) so the one-shot driver observes the settled outcome. HERD_DRIVER=headless routes
+  # any notification to a log (never the live herdr workspace); NO_COLOR keeps the row plain-text to grep.
   MH_DRIVER="$ART/mh-driver.sh"
   cat > "$MH_DRIVER" <<'DRV'
 #!/usr/bin/env bash
@@ -289,6 +291,15 @@ export HERD_CONFIG_FILE="$2/.no-such-config"
 # shellcheck source=/dev/null
 . "$7" >/dev/null 2>&1 || { echo "SRC_FAIL" >&2; exit 3; }
 main_health_tick "$4" >/dev/null 2>&1
+# ASYNC await: wait for the backgrounded suite's dispatch result (bounded). If nothing was dispatched
+# (feature OFF, or no slot/bin), there is no inflight marker either → stop immediately (stays inert).
+_n=0
+while [ "$_n" -lt 200 ]; do
+  ls "$2"/.health-dispatch-main-* >/dev/null 2>&1 && break
+  ls "$2"/.health-inflight-main-* >/dev/null 2>&1 || break
+  sleep 0.05; _n=$((_n + 1))
+done
+_collect_main_health >/dev/null 2>&1
 build_main_health >/dev/null 2>&1
 printf '%s' "${MAIN_HEALTH:-}"
 DRV

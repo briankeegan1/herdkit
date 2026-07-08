@@ -181,6 +181,14 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
 
+# restart-safe inflight timeouts (HERD-185) — reviews AND healthchecks run in BACKGROUND workers that
+# hold a concurrency slot via an on-disk marker (pid + start-time + dispatch ts). The every-tick corpse
+# sweep frees a slot the moment its worker dies/recycles OR outlives the timeout (age read from the
+# marker, so a RESTARTED watcher still enforces it — no in-process timer to orphan). Well above any real
+# run so a healthy worker is never killed; non-numeric → the 1800 default.
+# REVIEW_INFLIGHT_TIMEOUT="1800"   # seconds before an in-flight reviewer is SIGTERMed + reaped (default 1800 = 30m)
+# HEALTH_INFLIGHT_TIMEOUT="1800"   # seconds before an in-flight healthcheck suite is SIGTERMed + reaped (default 1800 = 30m)
+
 # native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
 #   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.
 #   on   read-only work may BURST — fan out several CONCURRENT calls bounded by REVIEW_CONCURRENCY (the

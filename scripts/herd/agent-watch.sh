@@ -858,6 +858,71 @@ _review_escalate_file() { printf '%s' "$TREES/.review-escalate-$1"; }
 # the real pane id once the agent pane exists. Sha-keyed like the markers above; discarded on a newer head.
 _review_registry_file() { printf '%s' "$TREES/.review-registry-$1-$2"; }
 
+# ── Restart-safe gate-dispatch substrate (HERD-185) ──────────────────────────────────────────────
+# BOTH gate families (review + health) hold a concurrency slot with an on-disk INFLIGHT MARKER while a
+# dispatched worker runs. A marker that outlives its worker — the worker died mid-run, or the whole
+# watcher was killed/restarted mid-suite — used to hold that slot until a human deleted it (the
+# 2026-07-08 corpse incidents: a dead reviewer's .review-inflight-278 held a review slot ~1h; a dead
+# main-health run's .health-inflight-main-<sha> held the single health slot ~1h, six PRs queued behind
+# two corpses). The fix is three RESTART-SAFE properties, SHARED by both families so there is ONE
+# dispatch/collect/sweep pattern, not two divergent copies:
+#   • the marker records pid + pid-START-TIME + dispatch-TIMESTAMP (a 3-line body; LINE 1 stays the
+#     bare pid so every legacy `head -1` reader — including the sim's marker-count probe — keeps working);
+#   • liveness = the pid is alive AND its CURRENT start-time still matches the recorded one
+#     (PID-RECYCLING GUARD — a dead pid whose number a new, unrelated process reused is NOT the same
+#     worker and must not be mistaken for a live slot holder);
+#   • age is computed FROM THE MARKER'S OWN TIMESTAMP, so ANY watcher instance — even one that just
+#     started and never saw the dispatch — can time a run out; never an in-process timer a restart drops.
+# The every-tick corpse sweep (_sweep_gate_corpses) uses these to free a slot the SAME tick a worker
+# dies or blows its deadline, so no marker corpse can ever hold a slot again.
+
+# _now_epoch — seconds since the epoch (a seam: HERD_FAKE_NOW lets a unit test pin time deterministically).
+_now_epoch() { printf '%s' "${HERD_FAKE_NOW:-$(date +%s)}"; }
+
+# _pid_starttime <pid> — a STABLE per-process start-time token: constant for a process's whole life,
+# different for a pid a later process recycled. `ps -o lstart=` is portable across macOS/BSD + Linux;
+# whitespace is squeezed so the token compares byte-for-byte. Empty when the pid is gone or ps cannot
+# answer — callers then fall back to a bare liveness check rather than over-reaping a live worker.
+# HERD_PID_STARTTIME_CMD is a test seam (a stub can force a controlled/mismatched token).
+_pid_starttime() {
+  local p="${1:-}"; [ -n "$p" ] || return 0
+  if [ -n "${HERD_PID_STARTTIME_CMD:-}" ]; then "$HERD_PID_STARTTIME_CMD" "$p" 2>/dev/null; return 0; fi
+  ps -o lstart= -p "$p" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
+}
+
+# _marker_write <file> <pid> — lay down a restart-safe inflight marker: pid, its start-time, dispatch ts.
+_marker_write() {
+  local f="$1" p="$2"
+  { printf '%s\n' "$p"; printf '%s\n' "$(_pid_starttime "$p")"; printf '%s\n' "$(_now_epoch)"; } \
+    > "$f" 2>/dev/null || true
+}
+
+# _marker_pid / _marker_starttime / _marker_dispatch_ts <file> — read one field (line 1/2/3); empty if absent.
+_marker_pid()         { sed -n '1p' "$1" 2>/dev/null; }
+_marker_starttime()   { sed -n '2p' "$1" 2>/dev/null; }
+_marker_dispatch_ts() { sed -n '3p' "$1" 2>/dev/null; }
+
+# _marker_live <file> — true iff the marker's pid is alive AND (recycling guard) its current start-time
+# still matches the recorded one. A marker with NO recorded start-time (a legacy pid-only marker, or a
+# hand-planted holder) falls back to a bare kill -0; an unreadable CURRENT start-time also trusts kill -0
+# so a transient ps hiccup never over-reaps a genuinely live worker (fail toward NOT reaping).
+_marker_live() {
+  local f="$1" pid st cur
+  pid="$(_marker_pid "$f")"; [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  st="$(_marker_starttime "$f")"; [ -n "$st" ] || return 0
+  cur="$(_pid_starttime "$pid")"; [ -n "$cur" ] || return 0
+  [ "$cur" = "$st" ]
+}
+
+# _marker_age <file> — seconds since the marker's dispatch ts, or -1 when no ts is recorded (a legacy
+# pid-only marker has no deadline — the corpse sweep still reaps it the moment its pid dies/recycles).
+_marker_age() {
+  local ts now; ts="$(_marker_dispatch_ts "$1")"
+  case "$ts" in ''|*[!0-9]*) printf -- '-1'; return 0 ;; esac
+  now="$(_now_epoch)"; printf '%s' "$(( now - ts ))"
+}
+
 # ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
 # _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | DOCS | SKIP.
 # Only ever called when REVIEW_ESCALATE_GLOB or DOCS_ONLY_GLOB is set (the opt-in); with BOTH empty the
@@ -909,11 +974,9 @@ _review_tier() {
   printf '%s' "$tier"
 }
 
-# _review_pid_live <inflight-file> — true if the marker records a still-running reviewer pid.
-_review_pid_live() {
-  local pid; pid="$(head -1 "$1" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
-}
+# _review_pid_live <inflight-file> — true if the marker records a still-running reviewer (its recorded
+# pid is alive AND, via the recycling guard, is still the SAME process the marker was written for).
+_review_pid_live() { _marker_live "$1"; }
 
 # _count_live_reviews — number of inflight markers (across ALL PRs) whose reviewer pid is alive.
 # Dead markers are not counted (they are reaped by _review_gate_step), so a crashed reviewer
@@ -1058,11 +1121,13 @@ _dispatch_review() {
     HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
   fi
   local _dr_pid="$!"
-  printf '%s\n' "$_dr_pid" > "$inflight"
-  # Lay down the registry row NOW (pane id unknown yet → "-"); herd-review.sh overwrites it with the
-  # real pane id once its agent pane is up. The pid alone already lets a post-restart dispatch adopt
-  # this reviewer even before its pane exists.
+  # Lay down the registry row FIRST (pane id unknown yet → "-"), before the slower restart-safe marker
+  # write below, so this placeholder lands in the narrowest possible window after launch — herd-review.sh
+  # (or the stub) overwrites it with the real pane id once its agent pane is up, and must not race the
+  # placeholder in behind it. The pid alone already lets a post-restart dispatch adopt this reviewer.
   printf '%s -\n' "$_dr_pid" > "$registry" 2>/dev/null || true
+  # Restart-safe marker: pid + start-time (recycling guard) + dispatch ts (deadline any watcher can time).
+  _marker_write "$inflight" "$_dr_pid"
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
 }
@@ -2015,6 +2080,37 @@ _main_health_enabled() {
 # a main sha whose marker exists has ALREADY been ticked, so a re-entrant merge tick / watcher restart
 # never re-runs the suite for the same commit.
 _main_health_marker() { printf '%s' "$TREES/.main-health-$1"; }
+# _main_health_pr_file <sha> — sidecar recording the MERGING pr# for an in-flight main-health run, so
+# the collector (a later, possibly RESTARTED tick) can attribute the 'since #N' / recovery correctly
+# even though the pr# is not in the sha-keyed marker/dispatch filenames.
+_main_health_pr_file() { printf '%s' "$TREES/.main-health-pr-$1"; }
+
+# _main_health_worker <sha> <dispatch-file> <log-file> — the ASYNC main-health suite, run in the
+# BACKGROUND by main_health_tick so a post-merge heavy suite (the LONGEST the watcher runs) never blocks
+# the tick. Runs the FULL (heavy) suite against $MAIN STREAMING to the tailable log, with the same
+# retry-before-red the pre-merge gate uses, then writes "<rc>\t<detail>" atomically for the collector to
+# route. On a reproduced red, <detail> is the FIRST 'not ok' TAP line (HERD-173 honest label; the
+# tab-leak-guard line is preserved when present so the collector's transient exemption still fires).
+# (see the always-heavy note below)
+_main_health_worker() {
+  local _mw_sha="$1" _mw_out="$2" _mw_log="$3" _mw_rc _mw_detail
+  bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
+  if [ "$_mw_rc" -eq 1 ]; then
+    bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
+    mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
+  fi
+  if [ "$_mw_rc" -eq 1 ]; then
+    if grep -q 'tab-leak-guard' "$_mw_log" 2>/dev/null; then
+      _mw_detail="$(grep -m1 'tab-leak-guard' "$_mw_log" 2>/dev/null)"
+    else
+      _mw_detail="$(_health_first_notok "$_mw_log")"; [ -n "$_mw_detail" ] || _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
+    fi
+  else
+    _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
+  fi
+  _mw_detail="$(printf '%s' "$_mw_detail" | tr '\t\n' '  ')"; _mw_detail="${_mw_detail:0:200}"
+  printf '%s\t%s\n' "$_mw_rc" "$_mw_detail" > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+}
 
 # WHY the tick is ALWAYS heavy (never light) — a review-caught correctness trap. The 'light' profile
 # derives its file set from healthcheck.sh's `git diff --name-only $DEFAULT_BRANCH` run INSIDE the dir
@@ -2060,43 +2156,70 @@ _main_health_set_red() {
   fi
 }
 
-# main_health_tick <pr#> — the post-merge hook (called from do_merge). Runs the healthcheck suite
-# against the current default-branch HEAD ONCE per sha and routes the outcome to _main_health_clear /
-# _main_health_set_red. Byte-inert when disabled; ALWAYS returns 0 (an alarm can never fail a merge).
+# main_health_tick <pr#> — the post-merge hook (called from do_merge). DISPATCHES the main-health suite
+# ASYNCHRONOUSLY: it backgrounds the heavy suite (_main_health_worker) holding a HEALTH_CONCURRENCY slot,
+# and returns immediately so the merge tick NEVER blocks on a ~9-min suite (the .health-inflight-main-<sha>
+# = watcher pid freeze). The outcome is COLLECTED on a later tick by _collect_main_health, which routes
+# it to _main_health_clear / _main_health_set_red. Sha-keyed run-once; byte-inert when disabled; ALWAYS
+# returns 0 (an alarm can never fail a merge).
 main_health_tick() {
   _main_health_enabled || return 0
-  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_out _mh_rc
+  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_key _mh_inflight _mh_disp _mh_wpid
   _mh_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_mh_sha" ] || { journal_append main_health pr "$_mh_pr" result infra_event reason no-head; return 0; }
   _mh_marker="$(_main_health_marker "$_mh_sha")"
   [ -e "$_mh_marker" ] && return 0                        # this main sha already ticked — run ONCE
-  # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared mutex (all
+  _mh_key="main-$_mh_sha"
+  _mh_inflight="$(_health_inflight_file "$_mh_key")"
+  _mh_disp="$(_health_dispatch_file "$_mh_key")"
+  # Idempotent dispatch: a live worker for this sha, or a result already pending collection, means this
+  # sha is handled — never double-dispatch (a re-entrant merge tick / restart re-enters here).
+  { [ -f "$_mh_inflight" ] && _health_pid_live "$_mh_inflight"; } && return 0
+  [ -f "$_mh_disp" ] && return 0
+  # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared slot cap (all
   # worktrees + $MAIN share one git object store, so overlapping suites race on .git locks and paint
   # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so a later
   # merge tick re-attempts it; never run an overlapping suite.
   _health_slot_free || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-slot; return 0; }
   [ -f "$HERD_HEALTHCHECK_BIN" ] || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-bin; return 0; }
-  _health_acquire "main-$_mh_sha"
-  # ALWAYS --heavy: a 'light' check against $MAIN is a zero-file vacuous green (see the note above), so
-  # it could silently CLEAR a real MAIN RED. The full suite is the only meaningful main-health check.
-  _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
-  # RETRY-BEFORE-RED: a lone rc-1 may be transient cross-worktree git-lock contention — the exact
-  # false-red the pre-merge gate's solo retry defends against. Re-run once, still holding the mutex.
-  if [ "$_mh_rc" -eq 1 ]; then
-    _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
-  fi
-  _health_release "main-$_mh_sha"
-  : > "$_mh_marker" 2>/dev/null || true                   # the suite ran against this sha — mark run-once
-  case "$_mh_rc" in
-    0) _main_health_clear "$_mh_pr" "$_mh_sha" ;;          # clean (or tolerated data/env) → green
-    1) case "$_mh_out" in
-         *tab-leak-guard*)                                 # transient control-room churn, NOT a code bug (issue #78)
-           journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason tab-leak-guard ;;
-         *) _main_health_set_red "$_mh_pr" "$_mh_sha" "$_mh_out" ;;
-       esac ;;
-    *) journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason "rc-$_mh_rc" ;;
-  esac
+  # Background the heavy suite STREAMING to the tailable log; write the restart-safe inflight marker with
+  # the WORKER'S pid so a corpse sweep can free the slot if it dies, and record the merging pr# for the
+  # collector.
+  local _mh_log; _mh_log="$(_health_log_file "$_mh_key")"
+  ( _main_health_worker "$_mh_sha" "$_mh_disp" "$_mh_log" ) &
+  _mh_wpid="$!"
+  _marker_write "$_mh_inflight" "$_mh_wpid"
+  _rotate_health_logs
+  printf '%s\n' "$_mh_pr" > "$(_main_health_pr_file "$_mh_sha")" 2>/dev/null || true
+  journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" log_path "$_mh_log"
   return 0
+}
+
+# _collect_main_health — per-tick collector for finished ASYNC main-health suites (mirrors the review
+# gate's verdict collect). For each pending .health-dispatch-main-<sha>: record run-once FIRST (so a
+# crash mid-collect never re-runs the sha), then route "<rc>\t<oneline>" to green/red/infra exactly as
+# the old synchronous tick did, then free the slot. Called at the top of every tick; byte-quiet when
+# nothing finished. A tab-leak-guard rc-1 is the same INFRA transient the pre-merge gate tolerates.
+_collect_main_health() {
+  local _cm_f _cm_base _cm_sha _cm_rc _cm_out _cm_pr
+  for _cm_f in "$TREES"/.health-dispatch-main-*; do
+    [ -e "$_cm_f" ] || continue
+    _cm_base="${_cm_f##*/}"; _cm_sha="${_cm_base#.health-dispatch-main-}"
+    [ -n "$_cm_sha" ] || continue
+    IFS=$'\t' read -r _cm_rc _cm_out < "$_cm_f"
+    _cm_pr="$(cat "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true)"; [ -n "$_cm_pr" ] || _cm_pr="?"
+    : > "$(_main_health_marker "$_cm_sha")" 2>/dev/null || true   # run-once BEFORE routing (crash-safe)
+    case "$_cm_rc" in
+      0) _main_health_clear "$_cm_pr" "$_cm_sha" ;;               # clean (or tolerated data/env) → green
+      1) case "$_cm_out" in
+           *tab-leak-guard*)                                      # transient control-room churn (issue #78)
+             journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard ;;
+           *) _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out" ;;
+         esac ;;
+      *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
+    esac
+    rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true
+  done
 }
 
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
@@ -3976,13 +4099,52 @@ _maybe_autorespawn_dead_builder() {
 # HERD_HEALTHCHECK_BIN is a test seam (mirrors HERD_REVIEW_BIN): the hermetic suite points it at a
 # stub healthcheck with a scripted fail-then-pass / fail-then-fail sequence.
 : "${HERD_HEALTHCHECK_BIN:="$HERE/healthcheck.sh"}"
+# _health_inflight_file <key> — the slot-holder marker for a health run. <key> is <pr>-<sha> for the
+# async per-PR gate, main-<sha> for the async main-health tick, or a bare token for a hand-planted
+# probe holder. Globbed as .health-inflight-* by the slot accounting + corpse sweep (both families).
 _health_inflight_file() { printf '%s' "$TREES/.health-inflight-$1"; }
+# _health_dispatch_file <key> — the ASYNC suite's result, written by the backgrounded health worker as
+# its LAST act (atomic temp+mv) and collected on a later tick — the health analogue of the reviewer's
+# .review-result file. Keyed to match its inflight marker so collect/sweep stay in lock-step.
+_health_dispatch_file() { printf '%s' "$TREES/.health-dispatch-$1"; }
+# _health_log_file <key> — the LIVE, TAILABLE full-output log a health worker streams its suite into, so
+# an operator can `tail -f` a running suite instead of staring at a black box (HERD-185 observability).
+# Kept after collection (rotated, newest 5) as post-hoc forensics. Keyed like the marker/dispatch files.
+_health_log_file() { printf '%s' "$TREES/.health-log-$1"; }
 
-# _health_pid_live <inflight-file> — true if the marker records a still-running holder pid.
-_health_pid_live() {
-  local pid; pid="$(head -1 "$1" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+# _rotate_health_logs — keep only the 5 newest .health-log-* files (mirrors how review logs are capped),
+# so an operator always has the last handful of suites to read without the dir growing unbounded.
+_rotate_health_logs() {
+  local _rl_f _rl_n=0
+  for _rl_f in $(ls -t "$TREES"/.health-log-* 2>/dev/null); do
+    _rl_n=$((_rl_n + 1))
+    [ "$_rl_n" -gt 5 ] && rm -f "$_rl_f" 2>/dev/null || true
+  done
 }
+
+# _health_first_notok <log> — the FIRST 'not ok' TAP line from a suite log, whitespace-collapsed. This is
+# the HONEST failure label (HERD-173: the old --oneline tail often quoted a passing 'ok NN' summary line
+# instead of the failing test). Empty when the log has no TAP 'not ok' (a non-bats failure).
+_health_first_notok() {
+  [ -f "$1" ] || return 0
+  grep -m1 -E '^not ok( |$)' "$1" 2>/dev/null | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
+# _health_progress <log> — cheap live progress from a bats/TAP stream: "<done>/<plan>" parsed from the
+# '1..N' plan line + the count of ok/not-ok result lines so far. Empty when the log has no TAP plan (the
+# suite isn't TAP, or hasn't emitted its plan yet) — the running row then shows just elapsed time.
+_health_progress() {
+  [ -f "$1" ] || return 0
+  local _hp_plan _hp_done
+  _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+$')"
+  [ -n "$_hp_plan" ] || return 0
+  _hp_done="$(grep -cE '^(ok|not ok) ' "$1" 2>/dev/null || printf 0)"
+  [ "${_hp_done:-0}" -gt 0 ] 2>/dev/null && printf 'test %s/%s' "$_hp_done" "$_hp_plan"
+}
+
+# _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
+# via the recycling guard, still the SAME process). Shares the restart-safe substrate with the review side.
+_health_pid_live() { _marker_live "$1"; }
 
 # _count_live_healthchecks — number of inflight markers (across ALL PRs) whose holder pid is alive.
 # Dead markers are not counted (a crashed holder never wedges a slot); mirrors _count_live_reviews.
@@ -4113,27 +4275,79 @@ record_healthcheck() {
   fi
 }
 
-# _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> [headSha] — the serialized,
-# retry-before-red healthcheck. Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns
-# 0 always:
-#   QUEUED    — no slot free (another suite holds the mutex); re-evaluate next tick, do NOT merge
-#   CLEAN     — healthcheck passed (clean or tolerated data/env); proceed to the review/merge path
-#   FLAKY     — first run was a CODE ERROR but the solo retry PASSED; proceed as passing
-#   CODEERROR — CODE ERROR reproduced on the solo retry; red "needs you", do NOT merge
-# When [headSha] is given, the TERMINAL verdict is sha-cached: a later tick with the SAME sha REUSES
-# it (skipping the suite entirely), and a new commit invalidates it. An empty/absent sha disables the
-# cache (every call runs the suite — the pre-cache behavior).
-# Uses render() for the intermediate "health-check" / "retrying" frames, matching _handle_block_verdict.
+# _health_worker <worktree-dir> <dispatch-file> <log-file> — the ASYNC healthcheck suite, run in the
+# BACKGROUND by _healthcheck_gate so the watcher tick NEVER blocks on a ~9-min suite (the root cause of
+# tonight's global freezes: a synchronous suite inside the tick starved verdict collection / merges for
+# every other PR). Two observability wins over the old black-box gate (HERD-185):
+#   • it runs the suite in FULL (non --oneline) mode STREAMING to <log-file>, so an operator can
+#     `tail -f` a live run and read the whole TAP stream after — no more staring at a frozen row;
+#   • the CODE-ERROR detail is the FIRST 'not ok' TAP line from that log (HERD-173: the old --oneline
+#     tail routinely quoted a passing 'ok NN' summary line, mislabelling which test actually failed).
+# It keeps the SAME retry-before-red (a rc-1 code error is re-run ONCE, solo) and writes its TERMINAL
+# verdict atomically (temp+mv, mirroring herd-review.sh) as one line "<verdict>\t<detail>":
+#   CLEAN\t{clean|dataenv}      — passed (clean, or a tolerated data/env ⚠️ first line)
+#   FLAKY\t<fail-identity>      — first run code-errored but the solo retry PASSED (HERD-76 offender)
+#   CODEERROR\t<first-not-ok>   — code error reproduced (or the tab-leak-guard line, preserved so the
+#                                 collector's transient-exemption still fires); drives the red row.
+# The collector (_healthcheck_gate) records the ledger + journal + sha-cache from this line — keeping
+# every ledger write in the tick process, ordered. Runs in a subshell fork so all helpers are in scope.
+_health_worker() {
+  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line
+  # FULL run streamed to the live log (redirect = tailable as it runs); rc drives the verdict class.
+  bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
+  _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
+  if [ "$_hw_rc" -eq 0 ]; then
+    case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
+  else
+    _hw_notok="$(_health_first_notok "$_hw_log")"; [ -n "$_hw_notok" ] || _hw_notok="$_hw_first"
+    _hw_id="$(_health_fail_identity "$_hw_notok")"
+    # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
+    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    if [ "$_hw_rc2" -eq 0 ]; then
+      rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
+      _hw_line="FLAKY"$'\t'"$_hw_id"
+    else
+      mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
+      if grep -q 'tab-leak-guard' "$_hw_log" 2>/dev/null; then
+        _hw_detail="$(grep -m1 'tab-leak-guard' "$_hw_log" 2>/dev/null | tr '\t\n' '  ')"
+      else
+        _hw_notok2="$(_health_first_notok "$_hw_log")"; [ -n "$_hw_notok2" ] || _hw_notok2="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
+        _hw_detail="$_hw_notok2"
+      fi
+      # keep the detail single-line + bounded so the "<verdict>\t<detail>" contract can't be broken.
+      _hw_detail="$(printf '%s' "$_hw_detail" | tr '\t\n' '  ')"; _hw_detail="${_hw_detail:0:200}"
+      _hw_line="CODEERROR"$'\t'"$_hw_detail"
+    fi
+  fi
+  printf '%s\n' "$_hw_line" > "$_hw_out.tmp.$$" 2>/dev/null && mv "$_hw_out.tmp.$$" "$_hw_out" 2>/dev/null || true
+}
+
+# _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> [headSha] — the serialized, ASYNC,
+# retry-before-red healthcheck as a NON-BLOCKING dispatch/collect state machine (unified with the review
+# gate — see _review_gate_step). Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns 0
+# always. The suite runs in a BACKGROUND worker (_health_worker) holding a slot via its inflight marker;
+# the tick never blocks on it. Tokens:
+#   RUNNING   — a suite was just dispatched, or one is in flight for this pr+sha; re-evaluate next tick
+#   QUEUED    — no slot free (HEALTH_CONCURRENCY reached); re-evaluate next tick, do NOT merge
+#   CLEAN     — a finished suite verdict was collected: passed (clean or tolerated data/env)
+#   FLAKY     — collected: first run was a CODE ERROR but the solo retry PASSED; proceed as passing
+#   CODEERROR — collected: CODE ERROR reproduced on the solo retry; red "needs you", do NOT merge
+# When [headSha] is given the TERMINAL verdict is sha-cached (a later tick with the SAME sha REUSES it
+# with no suite; a new commit invalidates it). The marker/dispatch files are keyed by pr+sha so the
+# collect + corpse sweep stay in lock-step; an empty sha disables the cache (a re-dispatch each call).
 _healthcheck_gate() {
   local _hg_pr="$1" _hg_slug="$2" _hg_dir="$3" _hg_idx="$4" _hg_sha="${5:-}"
-  local _hg_sl _hg_pn
+  local _hg_sl _hg_pn _hg_key _hg_inflight _hg_disp _hg_log
   _hg_sl="$(_slug_cell "$_hg_slug")"
   _hg_pn=" ${C_DIM}#${_hg_pr}${C_RESET} ·"
+  _hg_key="${_hg_pr}-${_hg_sha}"
+  _hg_inflight="$(_health_inflight_file "$_hg_key")"
+  _hg_disp="$(_health_dispatch_file "$_hg_key")"
+  _hg_log="$(_health_log_file "$_hg_key")"
 
-  # SHA-CACHE CHECK (before any suite work): an UNCHANGED commit cannot yield a different verdict.
-  # Purge any result for a stale sha (a new commit → full re-run), then REUSE a terminal result
-  # cached for this exact head sha — no mutex, no suite, no fresh ledger attempt; just a journal
-  # 'cache hit' so 'herd why' shows a reused result. Mirrors the review gate's sha-keyed reuse.
+  # SHA-CACHE CHECK (before any dispatch/collect): an UNCHANGED commit cannot yield a different verdict.
+  # Purge any result for a stale sha (a new commit → full re-run), then REUSE a terminal result cached
+  # for this exact head sha — no slot, no suite; just a journal 'cache hit'. Mirrors the review gate.
   if [ -n "$_hg_sha" ]; then
     _discard_stale_health "$_hg_pr" "$_hg_sha"
     local _hg_cache _hg_cv _hg_cd
@@ -4159,82 +4373,173 @@ _healthcheck_gate() {
     fi
   fi
 
-  # SERIALIZE: no slot free → queue this PR and defer. Never runs a suite that would overlap.
+  # COLLECT: a finished background worker left its terminal verdict — record it exactly as the old
+  # synchronous gate did (ledger + journal + sha-cache), then free the slot. This is the at-least-once
+  # collect: the dispatch file + inflight marker are removed AFTER the durable records, so a crash
+  # mid-collect simply re-reads the still-present dispatch file next tick.
+  if [ -f "$_hg_disp" ]; then
+    local _hg_v _hg_d
+    IFS=$'\t' read -r _hg_v _hg_d < "$_hg_disp"
+    case "$_hg_v" in
+      CLEAN)
+        case "$_hg_d" in dataenv) record_healthcheck "$_hg_pr" "$_hg_slug" 1 "dataenv" ;; *) record_healthcheck "$_hg_pr" "$_hg_slug" 1 "clean" ;; esac
+        record_health_result "$_hg_pr" "$_hg_sha" "CLEAN"
+        _HC_RESULT="CLEAN"
+        journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CLEAN ;;
+      FLAKY)
+        # Reconstruct the two-attempt ledger + journal the old synchronous gate wrote: attempt 1
+        # code-error CARRYING the HERD-76 offender the worker captured in <detail>, then attempt 2
+        # flaky-pass. The worker's <detail> is already the _health_fail_identity of the failing attempt.
+        record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_d"
+        record_healthcheck "$_hg_pr" "$_hg_slug" 2 "flaky-pass"
+        record_health_result "$_hg_pr" "$_hg_sha" "FLAKY"
+        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
+        _HC_RESULT="FLAKY"
+        # HERD-76: a passing retry must not erase which test flaked — carry the offender onto FLAKY.
+        if [ -n "$_hg_d" ]; then
+          journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY failed "$_hg_d"
+        else
+          journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
+        fi ;;
+      CODEERROR)
+        # Reconstruct the two-attempt code-error ledger + journal (the offender extracted from the
+        # reproduced oneline lands on BOTH the initial healthcheck_attempted and the healthcheck_retried).
+        local _hg_id; _hg_id="$(_health_fail_identity "$_hg_d")"
+        record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_id"
+        record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error" "$_hg_id"
+        # A tab-leak-guard CODE ERROR is INFRA/TRANSIENT (issue #78 part 2), never a code bug: it must
+        # NEVER be sha-cached, else the cache replays the transient every tick and FREEZES red. Skip the
+        # cache so the next tick re-dispatches fresh + self-heals; a genuine code error caches + stays red.
+        case "$_hg_d" in
+          *tab-leak-guard*) : ;;
+          *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d" ;;
+        esac
+        DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_d}${C_RESET}"
+        _HC_RESULT="CODEERROR"
+        journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_d" ;;
+      *)
+        # Unparseable / truncated worker output → an infra death, NOT a verdict. Never cache; free the
+        # slot and re-dispatch on the next tick (bounded implicitly by the sha-cache once it succeeds).
+        _HC_RESULT="RUNNING"
+        journal_append infra_event component agent-watch reason health_bad_result key "$_hg_key" ;;
+    esac
+    rm -f "$_hg_disp" "$_hg_inflight" 2>/dev/null || true
+    return 0
+  fi
+
+  # IN FLIGHT: a worker is still running for this pr+sha. Show WHICH stage + how long (console honesty —
+  # never a bare 'health-check' that a review-stage wait could be confused with). A dead marker with no
+  # dispatch result is a severed worker → drop it (the corpse sweep also reaps it) and fall through to
+  # re-dispatch below.
+  if [ -f "$_hg_inflight" ]; then
+    if _health_pid_live "$_hg_inflight"; then
+      # Elapsed + (cheap, if the log is a TAP stream) live progress: 'running 3m · test 41/168'.
+      local _hg_prog; _hg_prog="$(_health_progress "$_hg_log")"
+      if [ -n "$_hg_prog" ]; then
+        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hg_inflight")") · ${_hg_prog}${C_RESET}"
+      else
+        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running ($(_fmt_age "$(_marker_age "$_hg_inflight")"))${C_RESET}"
+      fi
+      _HC_RESULT="RUNNING"
+      return 0
+    fi
+    rm -f "$_hg_inflight" 2>/dev/null || true
+    journal_append infra_event component agent-watch reason health_died key "$_hg_key"
+  fi
+
+  # DISPATCH: needs a free slot (HEALTH_CONCURRENCY). No slot → queue this PR, honestly naming how many
+  # suites are ahead of it. Never runs a suite that would overlap another (shared git object store).
   if ! _health_slot_free; then
-    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · queued${C_RESET}"
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · queued ($(_count_live_healthchecks) ahead)${C_RESET}"
     _HC_RESULT="QUEUED"
     return 0
   fi
-  _health_acquire "$_hg_pr"
 
-  # LEAK-GUARD SNAPSHOT POINT (HERD-54): the healthcheck suite's tab-leak-guard snapshots the live
-  # workspace BEFORE it runs, so proactively close any stale resolve·<slug> tab first — a dead/finished
-  # resolver whose PR is no longer CONFLICTING must not sit in that before-snapshot (clutter / flap).
-  # Fail-soft; a live resolver is always spared (shared liveness with the resolver-respawn path).
+  # LEAK-GUARD SNAPSHOT POINT (HERD-54): the suite's tab-leak-guard snapshots the workspace BEFORE it
+  # runs, so proactively close any stale resolve·<slug> tab first. Fail-soft; a live resolver is spared.
   _sweep_stale_resolve_tabs
 
-  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check${C_RESET}"
-  render
-  local _hg_hc _hg_rc
-  _hg_hc="$(bash "$HERD_HEALTHCHECK_BIN" "$_hg_dir" --oneline 2>/dev/null)"; _hg_rc=$?
-  if [ "$_hg_rc" -eq 0 ]; then
-    # Clean, or a tolerated data/env warning (healthcheck.sh already collapsed exit 2 → rc 0).
-    case "$_hg_hc" in
-      "⚠️"*) record_healthcheck "$_hg_pr" "$_hg_slug" 1 "dataenv" ;;
-      *)     record_healthcheck "$_hg_pr" "$_hg_slug" 1 "clean" ;;
-    esac
-    _health_release "$_hg_pr"
-    record_health_result "$_hg_pr" "$_hg_sha" "CLEAN"
-    _HC_RESULT="CLEAN"
-    journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CLEAN
-    return 0
-  fi
-
-  # rc 1: a CODE ERROR. RETRY-BEFORE-RED: re-run ONCE, solo, still holding the mutex. A transient
-  # from cross-worktree lock contention self-heals; only a reproducing failure is real.
-  # Capture WHICH test/step failed NOW, from this attempt's output, BEFORE the retry overwrites it —
-  # else a FLAKY collapse (pass on retry) leaves only 'result=code-error' and the offender is lost
-  # (HERD-76: this blocked the deflake investigation for #185/#188).
-  local _hg_failed; _hg_failed="$(_health_fail_identity "$_hg_hc")"
-  record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_failed"
-  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · code error — retrying once (solo)${C_RESET}"
-  render
-  local _hg_hc2 _hg_rc2
-  _hg_hc2="$(bash "$HERD_HEALTHCHECK_BIN" "$_hg_dir" --oneline 2>/dev/null)"; _hg_rc2=$?
-  if [ "$_hg_rc2" -eq 0 ]; then
-    # Passed on the solo retry → the first failure was infra/contention, NOT a code bug. Never red.
-    record_healthcheck "$_hg_pr" "$_hg_slug" 2 "flaky-pass"
-    _health_release "$_hg_pr"
-    record_health_result "$_hg_pr" "$_hg_sha" "FLAKY"
-    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}flaky · infra (passed on retry)${C_RESET}"
-    _HC_RESULT="FLAKY"
-    # Carry the offender captured from the FAILING attempt onto the FLAKY outcome — the whole point
-    # of HERD-76: a passing retry must not erase which test flaked.
-    if [ -n "$_hg_failed" ]; then
-      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY failed "$_hg_failed"
-    else
-      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome FLAKY
-    fi
-    return 0
-  fi
-  # Reproduced on the solo retry → VERIFIED-REAL code error. Paint red.
-  record_healthcheck "$_hg_pr" "$_hg_slug" 2 "code-error" "$(_health_fail_identity "$_hg_hc2")"
-  _health_release "$_hg_pr"
-  # A tab-leak-guard CODEERROR is INFRA/TRANSIENT, not a code bug (issue #78 part 2): a concurrent
-  # SAME-workspace sibling builder tab flickering non-idle during the healthcheck window can trip the
-  # guard on BOTH the initial run and the solo retry, yet self-heals the moment that tab stabilizes
-  # (its own comment promises 'self-heals on re-run'). Like INFRA-FAIL / exit-2 results, it must NEVER
-  # be sha-cached — else the sha-cache (PR #66) replays the transient every tick and FREEZES red until
-  # a human deletes the marker. Skip the cache write so the next tick re-runs the suite fresh and
-  # self-heals; a genuine non-tab-leak code error still gets cached and stays red without re-running.
-  case "$_hg_hc2" in
-    *tab-leak-guard*) : ;;   # transient — do NOT persist to the sha cache (re-runs next tick)
-    *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_hc2" ;;
-  esac
-  DISPLAY[_hg_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_RED}needs you · ${_hg_hc2}${C_RESET}"
-  _HC_RESULT="CODEERROR"
-  journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_hc2"
+  # Background the suite, STREAMING its full output to the live log (tailable) for this pr+sha. Write the
+  # restart-safe inflight marker with the WORKER'S pid (so a corpse sweep can detect it dying) + start-time
+  # + dispatch ts SYNCHRONOUSLY here, so a same-tick sibling sees the slot taken and QUEUEs (never a second
+  # overlapping suite). Mirrors _dispatch_review.
+  ( _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log" ) &
+  local _hg_wpid="$!"
+  _marker_write "$_hg_inflight" "$_hg_wpid"
+  _rotate_health_logs
+  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
+  _HC_RESULT="RUNNING"
+  # healthcheck_started (not just a later 'outcome'): the record shows runs IN FLIGHT — so a suite that
+  # never finishes (killed, restart) is visible in the journal, and log_path points at the tailable log.
+  journal_append healthcheck_started pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" pid "$_hg_wpid" log_path "$_hg_log"
   return 0
+}
+
+# ── Every-tick gate corpse sweep (HERD-185) ──────────────────────────────────────────────────────
+# The AUTHORITATIVE reaper for BOTH inflight-marker families, run at the TOP of every tick BEFORE the
+# action pass. For each marker it frees the slot the SAME tick when the worker is:
+#   • a CORPSE — pid dead or recycled (see _marker_live) with NO result/dispatch file waiting: journal
+#     an infra_event <family>_died, drop the marker (+ registry / dispatch scratch), and — for reviews —
+#     count the existing retry budget + feed the INFRA breaker, exactly as the gate step's dead-marker
+#     branch does (so a severed reviewer's accounting is unchanged; whichever runs first wins, once);
+#   • PAST ITS RESTART-SAFE DEADLINE — pid still live but the marker's age exceeds the family timeout:
+#     SIGTERM the run, journal <family>_timeout, reap, and (reviews) count the retry + breaker. The age
+#     comes from the marker's OWN dispatch ts, so a watcher that RESTARTED mid-run still times it out —
+#     no in-process timer to orphan. A holder pid equal to THIS process ($$) is never TERMed (a legacy
+#     in-process synchronous holder is us; killing it would kill the watcher).
+# Crucially independent of the candidate list: a marker whose PR merged/closed/changed-sha — the exact
+# corpse that held a slot for ~1h on 2026-07-08 — is swept too, because nothing else would ever revisit
+# it. Idempotent, dry-run-inert, and byte-quiet when there are no corpses.
+_sweep_gate_corpses() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local f base rest pr sha age pid
+  # ── review family: .review-inflight-<pr>-<sha> ──
+  for f in "$TREES"/.review-inflight-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"; rest="${base#.review-inflight-}"
+    pr="${rest%-*}"; sha="${rest##*-}"
+    [ -n "$pr" ] && [ -n "$sha" ] || continue
+    # A finished reviewer's verdict is waiting — leave it for the gate step to collect + record.
+    [ -f "$(_review_result_file "$pr" "$sha")" ] && continue
+    if _marker_live "$f"; then
+      age="$(_marker_age "$f")"
+      case "$age" in ''|-1|*[!0-9]*) continue ;; esac         # no deadline recorded → let it run
+      [ "$age" -lt "${REVIEW_INFLIGHT_TIMEOUT:-1800}" ] 2>/dev/null && continue
+      pid="$(_marker_pid "$f")"
+      [ "$pid" = "$$" ] && continue                            # never TERM the watcher itself
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+      _retire_reviewer_pane "$pr" "$sha" timeout-term
+      rm -f "$f" "$(_review_registry_file "$pr" "$sha")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason review_timeout pr "$pr" sha "$sha" age "$age"
+      record_review_retry "$pr" "$sha"; _breaker_record_infra
+    else
+      _retire_reviewer_pane "$pr" "$sha" corpse-swept
+      rm -f "$f" "$(_review_registry_file "$pr" "$sha")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason review_died pr "$pr" sha "$sha"
+      record_review_retry "$pr" "$sha"; _breaker_record_infra
+    fi
+  done
+  # ── health family: .health-inflight-<key>  (key = <pr>-<sha> | main-<sha> | a planted probe token) ──
+  for f in "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"; rest="${base#.health-inflight-}"
+    [ -n "$rest" ] || continue
+    # A finished suite's dispatch result is waiting — leave it for the collector.
+    [ -f "$(_health_dispatch_file "$rest")" ] && continue
+    if _marker_live "$f"; then
+      age="$(_marker_age "$f")"
+      case "$age" in ''|-1|*[!0-9]*) continue ;; esac
+      [ "$age" -lt "${HEALTH_INFLIGHT_TIMEOUT:-1800}" ] 2>/dev/null && continue
+      pid="$(_marker_pid "$f")"
+      [ "$pid" = "$$" ] && continue
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+      rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason health_timeout key "$rest" age "$age"
+    else
+      rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason health_died key "$rest"
+    fi
+  done
 }
 
 # ── Watcher views: lenses + filters ─────────────────────────────────────────────────────────────
@@ -4738,6 +5043,13 @@ AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
 
 while true; do
+  # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
+  # review or health worker (corpse sweep), then collect any finished ASYNC main-health suite. Both run
+  # BEFORE the candidate pass so a freed slot is available to dispatch this same tick and a landed
+  # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
+  _sweep_gate_corpses
+  _collect_main_health
+
   build_header
   build_landed
   build_blocked
@@ -5061,7 +5373,9 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           render
           continue ;;
         QUEUED)
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review queued · ${REVIEW_CONCURRENCY} in flight${C_RESET}"
+          # Console honesty (HERD-185): name the STAGE (review) + WHY it waits (how many are ahead of
+          # it holding the cap) — never a bare gate label a health-stage wait could be confused with.
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
           render
           continue ;;
         RETRY)
@@ -5083,7 +5397,9 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           render
           continue ;;
         *)
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing…${C_RESET}"
+          # RUNNING — a reviewer is in flight. Console honesty: name the STAGE + how long it's been
+          # running (from the inflight marker's dispatch ts — an age any restarted watcher can read).
+          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · running ($(_fmt_age "$(_marker_age "$(_review_inflight_file "$prnum" "$rsha")")"))${C_RESET}"
           render
           continue ;;
       esac

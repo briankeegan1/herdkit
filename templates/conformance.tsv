@@ -189,6 +189,8 @@ REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_CONCURRENCY	unit	tests/test-gate-dispatch.sh
 SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
+REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
+HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh

@@ -69,13 +69,26 @@ export HERD_HEALTHCHECK_BIN="$HC_STUB"
 
 SHA="deadbeefcafe"
 
+# drive_gate <pr#> <slug> <dir> <idx> <sha> — drive the now-ASYNC gate (HERD-185) to a TERMINAL verdict:
+# dispatch, await the background worker's dispatch result, then re-enter the gate to COLLECT it (a cache
+# hit / QUEUED returns immediately). Mirrors the watcher tick re-entering the gate across ticks.
+drive_gate() {
+  local _p="$1" _s="$2" _d="$3" _i="$4" _sha="$5" _disp _n=0
+  _HC_RESULT=""
+  _healthcheck_gate "$_p" "$_s" "$_d" "$_i" "$_sha"
+  case "$_HC_RESULT" in CLEAN|FLAKY|CODEERROR|QUEUED) return 0 ;; esac
+  _disp="$(_health_dispatch_file "${_p}-${_sha}")"
+  while [ "$_n" -lt 500 ]; do [ -f "$_disp" ] && break; sleep 0.02; _n=$((_n + 1)); done
+  _HC_RESULT=""
+  _healthcheck_gate "$_p" "$_s" "$_d" "$_i" "$_sha"
+}
+
 # run_gate <pr#> <oneline> <rc> — drive the gate once with a fresh cache slate for this pr+sha.
 run_gate() {
   rm -f "$(_health_result_file "$1" "$SHA")" 2>/dev/null || true
-  rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+  rm -f "$TREES"/.health-inflight-* "$TREES"/.health-dispatch-* 2>/dev/null || true
   export HC_ONELINE="$2" HC_RC="$3"
-  _HC_RESULT=""
-  _healthcheck_gate "$1" "slug$1" "$T/wt" 0 "$SHA"
+  drive_gate "$1" "slug$1" "$T/wt" 0 "$SHA"
 }
 
 # ── 1. tab-leak-guard CODEERROR → verdict red THIS tick, but NOT cached (self-heals next tick) ──────
@@ -118,10 +131,9 @@ rm -f "$(_health_result_file "$CH_PR" "$CH_SHA")" "$(_health_cachehit_file "$CH_
 
 # Prime: the FIRST full run for this (pr,sha) misses the cache — it runs the suite, writes the sha
 # result, and journals healthcheck_outcome (NOT a cache hit yet).
-rm -f "$TREES"/.health-inflight-* 2>/dev/null || true
+rm -f "$TREES"/.health-inflight-* "$TREES"/.health-dispatch-* 2>/dev/null || true
 export HC_ONELINE="" HC_RC=0
-_HC_RESULT=""
-_healthcheck_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
+drive_gate "$CH_PR" "slug$CH_PR" "$T/wt" 0 "$CH_SHA"
 [ "$_HC_RESULT" = "CLEAN" ] || fail "prime run should be CLEAN (got '$_HC_RESULT')"
 [ "$(grep -c '"event":"healthcheck_cache_hit"' "$JOURNAL_FILE")" -eq 0 ] || \
   fail "the priming full run must NOT journal a cache hit (it ran the suite)"
