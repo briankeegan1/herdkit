@@ -2028,6 +2028,15 @@ record_refix() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REFIX_STATE"
 }
 
+# Dead-agent refix escalation dedup (HERD-114): the review-block path re-enters every tick while a PR
+# stays blocked, so a builder whose agent SESSION died would re-journal + re-notify each tick. This
+# tiny per-(pr,sha) marker fires the journal event + notification EXACTLY ONCE per dead escalation
+# (mirroring the dead-builder ledger's notify-once), while the red console row is (idempotently) re-set
+# every tick. A new commit changes the sha → a fresh escalation is eligible if the new agent is dead too.
+_refix_dead_marker()  { printf '%s' "$TREES/.agent-watch-refix-dead-$1-$2"; }
+_refix_dead_seen()    { [ -f "$(_refix_dead_marker "$1" "$2")" ]; }
+_record_refix_dead()  { : > "$(_refix_dead_marker "$1" "$2")" 2>/dev/null || true; }
+
 # _maybe_arm_review_escalation <pr#> — called right AFTER record_refix. If this PR has now accumulated
 # at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed refix rounds, the cheap reviewer's PASS
 # has been proven wrong across two rounds — arm a one-shot Opus escalation for the PR's NEXT review
@@ -2073,6 +2082,15 @@ try:
 except Exception:
   pass
 ' 2>/dev/null || true
+}
+
+# _agent_liveness <slug> — three-valued liveness (alive|dead|unknown) of this builder's agent SESSION
+# via the driver seam (herd_driver_agent_liveness): is its underlying PROCESS actually running, as
+# opposed to a stale agent_status word herdr keeps reporting after a crash killed it (HERD-114)? Only a
+# POSITIVE 'dead' ever changes a caller's behavior; 'unknown' (probe blind) preserves prior behavior so
+# the console stays byte-identical whenever every agent is live OR the probe cannot see the truth.
+_agent_liveness() {
+  herd_driver_agent_liveness "$1" 2>/dev/null || printf 'unknown'
 }
 
 # _wait_agent_working <slug> <window-s> — poll `herdr agent list` until the agent's status is
@@ -2122,6 +2140,23 @@ _handle_block_verdict() {
       DISPLAY[_hbv_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_YELLOW}review blocked · fix requested · awaiting push${C_RESET}"
     elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
+    elif [ "$(_agent_liveness "$_hbv_slug")" = "dead" ]; then
+      # HERD-114 PREFLIGHT — the auto-refix bounce wakes the builder by typing the re-task prompt into
+      # its agent pane. If that agent SESSION is DEAD (its process was killed — e.g. a herdr server stop
+      # — while the pane/worktree persist and herdr still reports a stale 'done'), typing into the dead
+      # pane can only fail the 15s wake poll. Detect it up front and escalate LOUDLY (needs you · agent
+      # dead) WITHOUT burning a refix round on a guaranteed-failed wake. Only a POSITIVE 'dead' escalates
+      # here; 'unknown'/'alive' fell through the elif above to the normal bounce, so the path is
+      # byte-identical whenever the agent is live OR the probe cannot see the truth (no false-red).
+      DISPLAY[_hbv_idx]="    ${C_RED}💀${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent dead · session unwakeable — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      # Journal + notify ONCE per (pr,sha) — this path re-enters every tick while the PR stays blocked.
+      if ! _refix_dead_seen "$_hbv_pr" "$_hbv_sha"; then
+        _record_refix_dead "$_hbv_pr" "$_hbv_sha"
+        journal_append refix_escalated_dead pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+          reason "agent session dead — wake would fail; escalated for human"
+        herd_driver_notify "💀 agent dead: ${_hbv_slug}" \
+          "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
+      fi
     else
       local _hbv_round_num
       _hbv_round_num="$((_hbv_rounds + 1))"
@@ -2991,12 +3026,20 @@ _classify_dead_builder() {
 # first-seen anchor on the first sighting, clears it the instant any liveness signal returns, and
 # fires exactly one 💀 notification (+ journal event) when a slug crosses into DEAD.
 _reconcile_dead_builder() {
-  local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3"
+  local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3" _rd_liveness="${4:-}"
   local _rd_now _rd_grace _rd_has_agent _rd_tgrow _rd_first _rd_verdict
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
-  # A present agent record (any status) means the agent is still listed ⇒ alive.
-  [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
+  # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
+  # crash can leave the agent LISTED with a stale status while its PROCESS is dead (HERD-114); a
+  # POSITIVE liveness='dead' probe (pane exists but runs no claude) overrides the listing and counts as
+  # NO live agent, so a listed-but-unwakeable builder crosses into DEAD just like a vanished one. Only
+  # a positive 'dead' overrides; 'unknown'/'alive'/empty preserve the prior listing-based signal.
+  if [ "$_rd_liveness" = "dead" ]; then
+    _rd_has_agent=0
+  else
+    [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
+  fi
   # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
   # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
   _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
@@ -3010,9 +3053,16 @@ _reconcile_dead_builder() {
     DEAD)
       if ! dead_notified "$_rd_slug"; then
         record_dead_notified "$_rd_slug"
-        journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}"
-        herd_driver_notify "💀 builder died: ${_rd_slug}" \
-          "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
+        journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}" \
+          cause "$([ "$_rd_liveness" = "dead" ] && printf 'session-dead' || printf 'vanished')"
+        # Wording reflects the actual cause: a listed-but-unwakeable session vs a fully vanished agent.
+        if [ "$_rd_liveness" = "dead" ]; then
+          herd_driver_notify "💀 builder died: ${_rd_slug}" \
+            "${_rd_slug}: agent session dead (unwakeable, no PR) — re-spawn" default
+        else
+          herd_driver_notify "💀 builder died: ${_rd_slug}" \
+            "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
+        fi
         # Bounded, opt-in AUTO-RESPAWN fires exactly here — once per DEAD crossing (guarded by the
         # dead_notified dedup), AFTER the unconditional 💀 surface. Byte-inert when the flag is off.
         _maybe_autorespawn_dead_builder "$_rd_slug" "$_rd_wt" >/dev/null
@@ -4008,13 +4058,19 @@ EOF
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
         else
           # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
-          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list while
-          # its worktree lives on with no PR. astatus is EMPTY only when the slug has NO agent record
-          # at all — the dead signature; a present-but-idle agent keeps a non-empty status. Surface a
-          # persistently-dead builder LOUDLY (💀 + notification) so it is never silently lost.
-          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus")" in
+          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list — OR is
+          # still LISTED but whose PROCESS is dead (HERD-114: a herdr crash leaves a stale 'idle'/'done'
+          # over a killed session) — while its worktree lives on with no PR. astatus is EMPTY only when
+          # the slug has NO agent record; the liveness probe additionally catches a listed-but-dead
+          # session. Surface a persistently-dead builder LOUDLY (💀 + notification) so it is never lost.
+          _live="$(_agent_liveness "$slug")"
+          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
             DEAD)
-              DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}" ;;
+              if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
+              else
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
+              fi ;;
             *)
               DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}" ;;
           esac

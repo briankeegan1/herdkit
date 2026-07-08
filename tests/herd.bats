@@ -163,6 +163,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
+  run bash "$REPO/tests/test-agent-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]

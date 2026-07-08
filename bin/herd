@@ -2958,6 +2958,15 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
         # was already stopped in step 1).
         layout_fold_stray_tabs "$ws" "$WORKSPACE_NAME"
 
+        # HERD-114 eyes sweep: flag single-pane drainer/reviewer tabs a crash stranded as a bare shell
+        # (agent process gone, tab+pane persist). INFORMATIONAL ONLY — surfaced for a human, never
+        # auto-closed here (a false close could kill a legitimately-quiet agent tab). Best-effort.
+        local _st_tab _st_label _st_role
+        while IFS="$(printf '\t')" read -r _st_tab _st_label _st_role; do
+          [ -n "$_st_tab" ] || continue
+          warn "stale ${_st_label} tab (${_st_role} — agent session dead) left by a crash: tab ${_st_tab} · retire with 'herdr tab close ${_st_tab}'"
+        done <<< "$(layout_stale_agent_tabs "$ws" 2>/dev/null || true)"
+
         # SNAPSHOT: classify every pane in the coordinator tab by its foreground process (the shared
         # eyes-on-layout scan). The live roster — not the registry — is ground truth. Duplicate
         # backlog viewers (a stale registry once split a SECOND one beside a still-live viewer) are
