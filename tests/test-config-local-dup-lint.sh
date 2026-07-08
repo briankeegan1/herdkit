@@ -20,6 +20,14 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0; okc(){ pass=$((pass+1)); }
 
+# HERMETIC STUB: `herd doctor` probes `claude --version` and touches the LIVE herdr when both are on
+# PATH. Shadow them with benign no-ops so the overlay dup-lint/doctor assertions are unchanged and
+# nothing reaches the real control room.
+BIN="$T/bin"; mkdir -p "$BIN"
+printf '#!/usr/bin/env bash\necho '"'"'{}'"'"'\nexit 0\n'      > "$BIN/herdr";  chmod +x "$BIN/herdr"
+printf '#!/usr/bin/env bash\necho '"'"'claude 0.0.0'"'"'\nexit 0\n' > "$BIN/claude"; chmod +x "$BIN/claude"
+export PATH="$BIN:$PATH"
+
 # ── 1. `herd config lint` flags a duplicate INSIDE config.local (baseline clean) ──────────────────
 PROJ="$T/proj"; mkdir -p "$PROJ/.herd"
 cat > "$PROJ/.herd/config" <<'EOF'

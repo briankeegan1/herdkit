@@ -15,6 +15,13 @@ export RESEARCH_INBOX="$T/.research-reports"
 export RESEARCH_POLL=0   # don't block when the queue is empty
 export RESEARCH_TAB=""   # finish must not call herdr
 
+# HERMETIC STUB: `report` fires herd_driver_notify → `herdr notification show` regardless of
+# RESEARCH_TAB, which would hit the LIVE control room (a real desktop notification). Shadow herdr
+# with a no-op on PATH so no assertion changes and nothing reaches the real workspace.
+BIN="$T/bin"; mkdir -p "$BIN"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+export PATH="$BIN:$PATH"
+
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 
 # 1. Enqueue a fake request with a known id (mirrors research.sh's "<id>.req" naming).

@@ -293,34 +293,82 @@ EOF
   _hk_codemap_failure_is_env
 }
 
+# ── HERD-189 DAEMON-HERMETICITY SANDBOX ──────────────────────────────────────────────────────────
+# No test may launch a real watcher/daemon/agent against the live control room. We run the WHOLE suite
+# with the live agent-spawn surface (herdr/claude/codex) shadowed by benign tripwire stubs that RECORD
+# (never break) any reach, and with HERD_HERMETIC_GUARD armed so any watcher a test spawns records the
+# leak and EXITS at agent-watch.sh's choke point instead of running a real daemon. A non-empty log ⇒ a
+# test touched the live workspace or spawned a real daemon. The stubs shadow ONLY the suite subshell
+# (inline env on the run command), so the tab-leak snapshots above/below still use the REAL herdr.
+# Kept IN LOCKSTEP with tests/test-daemon-hermeticity.sh (which self-tests this guard). INERT if a tmp
+# dir can't be made (falls back to the pre-HERD-189 unsandboxed run).
+_hk_dh_dir="$(mktemp -d 2>/dev/null || echo '')"
+_hk_dh_log=""; _hk_dh_pp=""
+if [ -n "$_hk_dh_dir" ]; then
+  _hk_dh_log="$_hk_dh_dir/leaks.log"; mkdir -p "$_hk_dh_dir/bin"; : > "$_hk_dh_log"
+  for _dhc in herdr claude codex; do
+    { printf '#!/usr/bin/env bash\n'
+      printf 'printf '\''%%s\\t%%s\\t%%s\\n'\'' "${HERMETIC_TEST:-suite}" "%s" "$*" >> "%s"\n' "$_dhc" "$_hk_dh_log"
+      case "$_dhc" in herdr) printf 'echo '\''{}'\''\n' ;; claude) printf 'echo '\''claude 0.0.0'\''\n' ;; esac
+      printf 'exit 0\n'; } > "$_hk_dh_dir/bin/$_dhc"
+    chmod +x "$_hk_dh_dir/bin/$_dhc"
+  done
+  _hk_dh_pp="$_hk_dh_dir/bin:"
+fi
+dh_note="daemon-hermeticity: clean"
+
+_hk_dh_verdict() {
+  # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
+  # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
+  # BEFORE the env classification. Cleans up the sandbox dir on the way out (leak or clean).
+  if [ -n "$_hk_dh_log" ] && [ -s "$_hk_dh_log" ]; then
+    if [ -n "$ONELINE" ]; then
+      echo "daemon-hermeticity: a test touched the live control room / spawned a real daemon — $(sort -u "$_hk_dh_log" | head -1)"
+    else
+      echo "DAEMON-HERMETICITY: a test reached the LIVE control room or spawned a real watcher/daemon"
+      echo "  (a hermetic test must stub herdr/claude and never launch agent-watch.sh against real state)"
+      sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
+    fi
+    rm -rf "$_hk_dh_dir"
+    exit 1
+  fi
+  [ -n "$_hk_dh_dir" ] && rm -rf "$_hk_dh_dir"
+}
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  if to="$(bats tests/*.bats 2>&1)"; then t_note="tests: bats pass"; else
-    if _hk_bats_env_only "$to"; then
-      # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
-      _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
-      if [ -n "$ONELINE" ]; then
-        echo "bats: env-only data/env (not a code bug) — $_hk_notok"
-      else
-        echo "BATS: DATA/ENV FAILURE (tolerated, not a code bug)"
-        echo "  $_hk_notok"
-        echo "  ($_HK_ENV_TEST — the real repo did not resolve as the herdkit ENGINE tree"
-        echo "   (e.g. .herd/config PROJECT_ROOT is not this engine checkout); env, not code.)"
-        printf '%s\n' "$to"
-      fi
-      exit 2
+  to="$(PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" bats tests/*.bats 2>&1)" && _hk_bats_rc=0 || _hk_bats_rc=$?
+  _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the HERD-187 env-only tolerance below
+  if [ "$_hk_bats_rc" -eq 0 ]; then
+    t_note="tests: bats pass"
+  elif _hk_bats_env_only "$to"; then
+    # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
+    _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
+    if [ -n "$ONELINE" ]; then
+      echo "bats: env-only data/env (not a code bug) — $_hk_notok"
+    else
+      echo "BATS: DATA/ENV FAILURE (tolerated, not a code bug)"
+      echo "  $_hk_notok"
+      echo "  ($_HK_ENV_TEST — the real repo did not resolve as the herdkit ENGINE tree"
+      echo "   (e.g. .herd/config PROJECT_ROOT is not this engine checkout); env, not code.)"
+      printf '%s\n' "$to"
     fi
+    exit 2
+  else
     # Genuine code error — original behaviour (byte-identical when there is no env-only failure).
     [ -n "$ONELINE" ] && echo "bats: $(printf '%s' "$to" | tail -1)" || { echo "BATS FAILED"; printf '%s\n' "$to"; }
     exit 1
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then
   fails=0
-  for t in tests/test-*.sh; do bash "$t" >/dev/null 2>&1 || fails=$((fails+1)); done
+  for t in tests/test-*.sh; do PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" bash "$t" >/dev/null 2>&1 || fails=$((fails+1)); done
+  _hk_dh_verdict
   if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"
     exit 1
   fi
+else
+  _hk_dh_verdict
 fi
 
 # Leak-guard verdict: fail LOUDLY on a NET INCREASE in orphan tabs or orphan panes.
@@ -425,5 +473,5 @@ else
   caps_note="caps-sync: skipped (no diff against $_hc_branch)"
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $leak_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; }
 exit 0
