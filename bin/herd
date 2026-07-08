@@ -62,6 +62,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
 
+# Shared governance EXTRACTION + MAPPING helpers (_gov_map_file / _gov_statements / _gov_match). The
+# read-only half of the HERD-119 adoption pass, factored out so the HERD-125 drift sweep re-extracts a
+# CLAUDE.md/AGENTS.md change EXACTLY as init imported it. Defines functions only (TEMPLATES_DIR is set
+# above, so _gov_map_file resolves the same table it always has). The init-only mutators + LLM
+# fallback stay in this file, below.
+# shellcheck source=/dev/null
+. "$SCRIPTS_DIR/governance.sh"
+
 # Runtime driver shim: the ONE seam binding the runtime-specific control surface (multiplexer + agent
 # runtime) to a concrete backend, dispatched on HERD_DRIVER. Defines functions only (side-effect-free),
 # and — like fleet.sh — late-binds herd_resolve_workspace_id / WORKTREES_DIR at call time, so sourcing
@@ -524,6 +532,185 @@ _init_grounding_interview() {
   say "  ${c_dim}• DOCTOR_STARTUP_HINT=on — reminds you at control-room startup which optional tools are missing and what each degrades.${c_rst}"
 }
 
+# ── governance adoption (HERD-119) ────────────────────────────────────────────────────────────────
+# `herd init`'s OPT-IN adoption pass imports gates/conventions from an OPTIONAL CLAUDE.md / AGENTS.md.
+# BINDING CONSTRAINT: CLAUDE.md is ONE source among many (defaults, interview, profile, manual
+# `herd config set`) — never required, never load-bearing. No file present ⇒ the pass returns before
+# any prompt or write, so init is BYTE-IDENTICAL. Every accepted proposal applies ONLY through the
+# validated `herd config set` (or an append to the REVIEW_CHECKLIST file); declining all leaves the
+# config exactly as the interview wrote it. Deterministic-first (templates/governance-map.tsv), with a
+# cleanly-stubbable LLM fallback for fuzzy phrasing. Fail-soft: unparseable prose is silently skipped.
+#
+# The read-only extraction + mapping half (_gov_map_file / _gov_statements / _gov_match) lives in
+# scripts/herd/governance.sh, sourced near the top of this file and SHARED with the HERD-125 drift
+# sweep. The init-only mutators + the default-off LLM fallback below are NOT shared.
+
+# _gov_llm_classify <statement> — LLM FALLBACK for fuzzy phrasing the deterministic table missed.
+# CLEANLY STUBBABLE and DEFAULT-OFF: unless HERD_GOV_LLM=1 AND `claude` is on PATH it prints nothing,
+# so extraction is fully deterministic (and hermetic tests get a stable, model-free mapping). When
+# enabled it asks the model to map the sentence to at most one surface, echoing the SAME
+# "surface<TAB>target<TAB>label" contract the table uses; any non-conforming reply is dropped.
+_gov_llm_classify() {
+  [ "${HERD_GOV_LLM:-}" = "1" ] || return 0
+  command -v claude >/dev/null 2>&1 || return 0
+  local stmt="$1" reply surface rest
+  reply="$(claude -p "Map this project-governance sentence to AT MOST ONE herd enforcement surface, or reply NONE. Reply with a single line: '<surface>\t<target>\t<label>' where surface is one of config-key|provisioning|hook. config-key target is SPACE-separated KEY=VALUE using only these keys: PUSH_GATE MERGE_POLICY MERGE_METHOD PR_FLOW PR_READY_WHEN DELETE_BRANCH_ON_MERGE ATTRIBUTION_POLICY COMMIT_CONVENTION. provisioning target is 'review-checklist'. Reply NONE if unsure. Sentence: $stmt" 2>/dev/null || true)"
+  reply="$(printf '%s' "$reply" | head -1)"
+  case "$reply" in ''|NONE|none) return 0 ;; esac
+  surface="${reply%%$'\t'*}"; rest="${reply#*$'\t'}"
+  case "$surface" in
+    config-key|provisioning|hook) [ "$rest" != "$reply" ] && printf '%s' "$reply" ;;
+  esac
+  return 0
+}
+
+# _gov_is_convention <statement> — deterministic heuristic distinguishing an unmatched coding/STYLE
+# convention (→ provisioning) from noise (→ gap report). Only reached AFTER the table and the LLM
+# fallback both miss.
+_gov_is_convention() {
+  printf '%s' "$1" | grep -qiE '\b(prefer|preferred|use|using|avoid|style|format|formatting|naming|indent|indentation|tabs?|spaces|convention|conventions|docstring|comment|comments|type[- ]?hint|typed|snake_case|camelcase|line[- ]length|import|imports)\b' 2>/dev/null
+}
+
+# _gov_review_checklist_path <project_root> — the repo-relative REVIEW_CHECKLIST path from .herd/config
+# (default .herd/review-checklist.md when unset).
+_gov_review_checklist_path() {
+  local root="$1" p=""
+  # shellcheck source=/dev/null
+  [ -f "$root/.herd/config" ] && p="$( . "$root/.herd/config" 2>/dev/null; printf '%s' "${REVIEW_CHECKLIST:-}" )"
+  printf '%s' "${p:-.herd/review-checklist.md}"
+}
+
+# _gov_apply_config <project_root> <KEY=VALUE...> — apply each accepted config-key pair through the
+# VALIDATED setter. HERD_INIT_DEFER_APPLY suppresses the watcher-restart / re-render side-effect: init
+# runs BEFORE the control room exists, so the value is simply written and takes effect on first launch.
+_gov_apply_config() {
+  local root="$1" pairs="$2" kv key val
+  for kv in $pairs; do
+    key="${kv%%=*}"; val="${kv#*=}"
+    { [ -n "$key" ] && [ "$key" != "$kv" ]; } || continue
+    ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set "$key" "$val" ) || true
+  done
+}
+
+# _gov_apply_provision <project_root> <statement> — route an unmappable coding/style convention into
+# the REVIEW_CHECKLIST file (created with a header on first use), so the pre-merge review gate verifies
+# it. The provisioning surface's session-grounding sibling (CONTEXT_PROVISION notes) plugs in here later.
+_gov_apply_provision() {
+  local root="$1" line="$2" rel dest
+  rel="$(_gov_review_checklist_path "$root")"
+  dest="$root/$rel"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  if [ ! -f "$dest" ]; then
+    {
+      printf '# Review checklist\n\n'
+      printf '> Project risk checklist injected into the pre-merge review gate (REVIEW_CHECKLIST).\n'
+      printf '> Seeded by governance adoption from an adopted CLAUDE.md/AGENTS.md convention.\n\n'
+    } > "$dest"
+  fi
+  printf -- '- [ ] %s\n' "$line" >> "$dest"
+  ok "appended convention to $rel"
+}
+
+# _init_governance_adoption <project_root> — the opt-in adoption pass. Runs AFTER the config exists
+# (config set requires it) and only under _ground_interactive (a scripted/non-tty init skips cleanly).
+# No CLAUDE.md/AGENTS.md ⇒ returns before any prompt or write (byte-identical init).
+_init_governance_adoption() {
+  local root="$1"
+  _ground_interactive || return 0
+
+  # Collect the OPTIONAL governance sources actually present. None ⇒ nothing to do, zero output.
+  # (No bash arrays anywhere in this function — an empty-array expansion under `set -u` aborts on
+  # bash 3.2 / macOS; the file's established idiom is newline-delimited strings.)
+  local names=""
+  [ -f "$root/CLAUDE.md" ] && names="CLAUDE.md"
+  [ -f "$root/AGENTS.md" ] && names="${names:+$names, }AGENTS.md"
+  [ -n "$names" ] || return 0
+
+  say ""
+  say "${c_bold}Governance adoption${c_rst} ${c_dim}(optional — CLAUDE.md/AGENTS.md is ONE source; nothing is written unless you accept a proposal)${c_rst}"
+  if ! _ground_yes "$(_ground_ask "Found $names — scan for governance rules to propose as herd config? (y/N)" "n")"; then
+    say "  ${c_dim}skipped — later: re-run 'herd init' or set gates manually with 'herd config set'${c_rst}"
+    return 0
+  fi
+
+  # Deterministic-first extraction. Each statement → a (surface,target,label,evidence) proposal, a
+  # style-convention (→ provisioning), or a gap. Proposals accumulate as newline-delimited TAB records
+  # (no arrays), deduped by surface+target (first evidence kept) so the same gate is proposed once.
+  local proposals="" gaps="" seen="" stmt m surface target label
+  while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    m="$(_gov_match "$stmt")"
+    [ -n "$m" ] || m="$(_gov_llm_classify "$stmt")"
+    if [ -z "$m" ]; then
+      if _gov_is_convention "$stmt"; then
+        m="$(printf 'provisioning\treview-checklist\tCoding/style convention')"
+      else
+        gaps="${gaps}${stmt}"$'\n'
+        continue
+      fi
+    fi
+    surface="${m%%$'\t'*}"; m="${m#*$'\t'}"
+    target="${m%%$'\t'*}"; label="${m#*$'\t'}"
+    case "$seen" in *"|${surface}::${target}|"*) continue ;; esac
+    seen="${seen}|${surface}::${target}|"
+    proposals="${proposals}$(printf '%s\t%s\t%s\t%s' "$surface" "$target" "$label" "$stmt")"$'\n'
+  done <<< "$(_gov_statements "$root/CLAUDE.md" "$root/AGENTS.md")"
+
+  # Present each proposal: QUOTE the source sentence as evidence; per-proposal accept / edit / decline.
+  # config-key applies via the validated setter; provisioning appends to REVIEW_CHECKLIST; hook rows
+  # are RECOGNIZED but not applied (the 'Governance hook-rendering' follow-up consumes them). Iterate by
+  # line INDEX (not a pipe/here-string around the loop) so _ground_ask keeps reading the real stdin.
+  local applied=0 deferred="" rec evidence ans i np
+  np="$(printf '%s' "$proposals" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$proposals" | sed -n "${i}p")"
+    IFS=$'\t' read -r surface target label evidence <<< "$rec"
+    [ -n "$surface" ] || continue
+    say ""
+    say "  ${c_bold}${label}${c_rst}"
+    say "  ${c_dim}evidence: \"${evidence}\"${c_rst}"
+    case "$surface" in
+      config-key)
+        say "  ${c_dim}→ proposes (config-key surface): herd config set ${target}${c_rst}"
+        ans="$(_ground_ask "  accept / edit / decline? (a/e/N)" "n")"
+        case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+          a|accept) _gov_apply_config "$root" "$target"; applied=$((applied+1)) ;;
+          e|edit)
+            local edited; edited="$(_ground_ask "  enter KEY=VALUE pair(s)" "$target")"
+            if [ -n "$edited" ]; then _gov_apply_config "$root" "$edited"; applied=$((applied+1)); else say "  ${c_dim}declined (empty)${c_rst}"; fi ;;
+          *) say "  ${c_dim}declined${c_rst}" ;;
+        esac ;;
+      provisioning)
+        say "  ${c_dim}→ proposes (provisioning surface): append to the REVIEW_CHECKLIST risk checklist${c_rst}"
+        ans="$(_ground_ask "  accept / decline? (a/N)" "n")"
+        case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+          a|accept) _gov_apply_provision "$root" "$evidence"; applied=$((applied+1)) ;;
+          *) say "  ${c_dim}declined${c_rst}" ;;
+        esac ;;
+      hook)
+        say "  ${c_dim}→ hook surface (session-time Claude Code hook) — recognized; rendering ships in the 'Governance hook-rendering' follow-up, not applied here${c_rst}"
+        deferred="${deferred}  • ${label} (hook: ${target})"$'\n' ;;
+    esac
+  done
+
+  if [ -n "$deferred" ]; then
+    say ""
+    say "  ${c_bold}Recognized hook rules${c_rst} ${c_dim}(deferred to 'Governance hook-rendering'):${c_rst}"
+    printf '%s' "$deferred" | while IFS= read -r d; do [ -n "$d" ] && say "  ${c_dim}${d}${c_rst}"; done
+  fi
+
+  # Gap report — statements that mapped to NO governance surface, left as prose.
+  if [ -n "$gaps" ]; then
+    say ""
+    local gapn; gapn="$(printf '%s' "$gaps" | grep -c . || true)"
+    say "  ${c_bold}Gap report${c_rst} ${c_dim}— ${gapn} statement(s) mapped to no governance surface (left as prose):${c_rst}"
+    printf '%s' "$gaps" | while IFS= read -r g; do [ -n "$g" ] && say "  ${c_dim}• ${g}${c_rst}"; done
+  fi
+
+  say ""
+  if [ "$applied" -gt 0 ]; then ok "governance adoption: applied $applied proposal(s)"; else say "  ${c_dim}governance adoption: nothing applied${c_rst}"; fi
+}
+
 cmd_init() {
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
@@ -806,6 +993,12 @@ EOF
   local skill; skill="$(render_skill "$project_root" "$cfg")"
   ok "rendered coordinator skill → $skill"
 
+  # 6b. Governance adoption (HERD-119): OPT-IN import of gates/conventions from an OPTIONAL CLAUDE.md /
+  #     AGENTS.md. One source among many — suggest-never-auto-write, applied only through the validated
+  #     `herd config set` on accept. No such file ⇒ returns silently (byte-identical init). Skipped on a
+  #     scripted / non-tty init. Fail-soft: any internal error never aborts init.
+  _init_governance_adoption "$project_root" || true
+
   # 7. Grounding interview (HERD-80): OFFER codemap/CONTEXT_PROVISION, graphify/GRAPHIFY_BIN, MCP wiring
   #    and surface the efficiency levers. Suggest-never-auto-write — applies only on an explicit yes via
   #    the validated `herd config set`. Skipped cleanly on a scripted / non-tty init.
@@ -941,6 +1134,175 @@ cmd_render() {
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local skill; skill="$(render_skill "$root" "$cfg")"
   ok "rendered coordinator skill → $skill"
+}
+
+# ── herd governance hooks render: emit SESSION-TIME Claude Code hooks from the governance map (HERD-131)
+# Dual-surface enforcement: the governance rules the merge-time watcher gate enforces ALSO bind
+# session-time as Claude Code PreToolUse hooks — blocking a violation at the keyboard, early and cheap.
+# Consumes EVERY surface==hook row of templates/governance-map.tsv (HERD-119); each rendered hook runs
+# scripts/herd/governance-hook.sh <target> against the tool payload. PROPOSE-then-write like every
+# governance write: each hook is shown, the operator accepts per-hook, and accepted entries MERGE into
+# .claude/settings.local.json (or --shared → .claude/settings.json) preserving ALL existing entries.
+# Every generated matcher-group carries a "herd-governance" marker key, so a re-render strips ONLY its
+# own prior entries and re-adds the current selection — idempotent, never clobbering user hooks.
+# Fail-soft: no map / no hook rows / non-interactive → clean no-op, no file written.
+_GOV_HOOK_MARKER="herd-governance"
+
+cmd_governance() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    hooks) _gov_hooks "$@" ;;
+    ''|help|-h|--help)
+      say "usage: herd governance hooks render [--shared]"
+      say "  Render session-time Claude Code hooks from the governance map's hook rows: propose each,"
+      say "  accept per-hook, and merge accepted entries into .claude/settings.local.json (default) or"
+      say "  .claude/settings.json (--shared), preserving existing entries. Idempotent re-render." ;;
+    *) die "unknown: herd governance $sub (try: herd governance hooks render)" ;;
+  esac
+}
+
+_gov_hooks() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    render) _gov_hooks_render "$@" ;;
+    ''|help|-h|--help) say "usage: herd governance hooks render [--shared]" ;;
+    *) die "unknown: herd governance hooks $action (try: herd governance hooks render)" ;;
+  esac
+}
+
+_gov_hooks_render() {
+  local shared="" a
+  for a in "$@"; do
+    case "$a" in
+      --shared) shared=1 ;;
+      -*) die "unknown flag: $a (usage: herd governance hooks render [--shared])" ;;
+      *)  die "unexpected argument: $a (usage: herd governance hooks render [--shared])" ;;
+    esac
+  done
+
+  local root map
+  root="$(pwd)"
+  map="$(_gov_map_file)"
+  # Fail-soft: no map → clean no-op (byte-identical for projects that never provisioned one).
+  [ -f "$map" ] || { say "  ${c_dim}governance hooks: no map at $map — nothing to render${c_rst}"; return 0; }
+
+  # Collect surface==hook rows as target<TAB>label, in file order. The renderer consumes EVERY hook
+  # row (unlike adoption's first-match _gov_match); the pattern column is irrelevant here.
+  local rows="" pattern surface target label
+  while IFS=$'\t' read -r pattern surface target label; do
+    case "$pattern" in ''|'#'*|'pattern') continue ;; esac
+    [ "$surface" = "hook" ] || continue
+    [ -n "$target" ] || continue
+    rows="${rows}${target}"$'\t'"${label}"$'\n'
+  done < "$map"
+
+  if [ -z "$rows" ]; then
+    say "  ${c_dim}governance hooks: no hook rows in the map — nothing to render${c_rst}"
+    return 0
+  fi
+
+  # Target settings file: the per-machine local overlay by default; --shared → the committed baseline.
+  local relfile settings
+  if [ -n "$shared" ]; then relfile=".claude/settings.json"; else relfile=".claude/settings.local.json"; fi
+  settings="$root/$relfile"
+
+  # PROPOSE-then-write: writes REQUIRE an interactive operator (never auto-write). Non-interactive →
+  # clean no-op so a scripted/CI invocation changes nothing.
+  if ! _ground_interactive; then
+    say "  ${c_dim}governance hooks: non-interactive — nothing written (run from a terminal to accept per-hook)${c_rst}"
+    return 0
+  fi
+
+  say ""
+  say "${c_bold}Governance hooks${c_rst} ${c_dim}(session-time Claude Code hooks — propose-then-write; merged into ${relfile}, existing entries preserved)${c_rst}"
+
+  local accepted="" np i rec cmd ans
+  np="$(printf '%s' "$rows" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$rows" | sed -n "${i}p")"
+    IFS=$'\t' read -r target label <<< "$rec"
+    [ -n "$target" ] || continue
+    cmd="bash $SCRIPTS_DIR/governance-hook.sh $target"
+    say ""
+    say "  ${c_bold}${label}${c_rst}"
+    say "  ${c_dim}→ PreToolUse[Bash] hook: ${cmd}${c_rst}"
+    ans="$(_ground_ask "  accept? (a/N)" "n")"
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      a|accept|y|yes) accepted="${accepted}${target}"$'\n'; say "  ${c_dim}accepted${c_rst}" ;;
+      *) say "  ${c_dim}declined${c_rst}" ;;
+    esac
+  done
+
+  say ""
+  # Write when there is something to add, OR when the file already carries our marker (so declining a
+  # previously-accepted hook cleanly removes it). A fresh decline-all never creates a file.
+  if [ -n "$accepted" ] || { [ -f "$settings" ] && grep -q "$_GOV_HOOK_MARKER" "$settings" 2>/dev/null; }; then
+    _gov_hooks_merge "$settings" "$accepted"
+  else
+    say "  ${c_dim}governance hooks: nothing accepted — no file written${c_rst}"
+  fi
+}
+
+# _gov_hooks_merge <settings-file> <accepted-targets-newline> — merge the accepted hook targets into
+# the settings JSON, preserving every existing entry. Strips our previously-rendered marker groups
+# from every hook event first (idempotent re-render), then re-adds the current selection in a stable
+# (sorted) order. A malformed settings file is refused, never clobbered.
+_gov_hooks_merge() {
+  local settings="$1" accepted="$2"
+  command -v python3 >/dev/null 2>&1 || die "governance hooks render requires python3"
+  mkdir -p "$(dirname "$settings")" 2>/dev/null || true
+  SETTINGS="$settings" MARKER="$_GOV_HOOK_MARKER" HOOKSCRIPT="$SCRIPTS_DIR/governance-hook.sh" \
+  ACCEPTED="$accepted" python3 -c '
+import json, os, shlex, sys
+settings = os.environ["SETTINGS"]
+marker   = os.environ["MARKER"]
+hookscript = os.environ["HOOKSCRIPT"]
+accepted = [t for t in os.environ.get("ACCEPTED", "").splitlines() if t.strip()]
+try:
+    with open(settings) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except Exception:
+    sys.stderr.write("governance hooks: %s is not valid JSON — refusing to overwrite\n" % settings)
+    sys.exit(1)
+hooks = data.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+# Strip our previously-rendered marker groups from every event (idempotent re-render); drop an event
+# that we emptied so re-render stays byte-stable.
+for ev in list(hooks.keys()):
+    arr = hooks.get(ev)
+    if not isinstance(arr, list):
+        continue
+    kept = [g for g in arr if not (isinstance(g, dict) and marker in g)]
+    if kept:
+        hooks[ev] = kept
+    else:
+        del hooks[ev]
+for target in sorted(set(accepted)):
+    cmd = "bash %s %s" % (shlex.quote(hookscript), shlex.quote(target))
+    hooks.setdefault("PreToolUse", []).append({
+        "matcher": "Bash",
+        marker: target,
+        "hooks": [{"type": "command", "command": cmd}],
+    })
+if hooks:
+    data["hooks"] = hooks
+elif "hooks" in data:
+    del data["hooks"]
+with open(settings, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' || die "governance hooks: merge into $settings failed"
+  local nacc; nacc="$(printf '%s' "$accepted" | grep -c . || true)"
+  if [ "$nacc" -gt 0 ]; then
+    ok "governance hooks: merged $nacc hook(s) → $settings"
+  else
+    say "  ${c_dim}governance hooks: removed prior generated entries → $settings${c_rst}"
+  fi
 }
 
 # ── herd codemap: regenerate docs/codemap.md, a native map of the repo's tree ────────────────────
@@ -1404,7 +1766,12 @@ cmd_config_set() {
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
   #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
-  if [ "$changed" -eq 1 ]; then
+  #    HERD_INIT_DEFER_APPLY (set only by `herd init`'s governance adoption, HERD-119) suppresses the
+  #    watcher-restart / re-render: init runs BEFORE the control room exists, so the value is written
+  #    and simply takes effect on first launch — no watcher to restart, no premature headless spawn.
+  if [ "$changed" -eq 1 ] && [ "${HERD_INIT_DEFER_APPLY:-}" = "1" ]; then
+    say "  ${c_dim}(init: watcher restart / skill re-render deferred — takes effect when the control room launches)${c_rst}"
+  elif [ "$changed" -eq 1 ]; then
   case "$requires" in
     watcher)
       say ""
@@ -4127,6 +4494,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd governance hooks render        render SESSION-TIME Claude Code hooks from the governance map's
+              [--shared]              hook rows (dual-surface: the same rules the merge gate enforces,
+                                      now blocking at the keyboard). Propose-then-write, per-hook
+                                      accept; merges into .claude/settings.local.json (or
+                                      .claude/settings.json with --shared) preserving existing entries;
+                                      marker-keyed so re-render is idempotent. No hook rows → no-op
   herd reload                         rebuild the control room around the coordinator: stop +
                                       relaunch the watcher (pane visibility verified), ensure
                                       the pinned backlog pane, re-render the coordinator skill;
@@ -4226,6 +4599,7 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;

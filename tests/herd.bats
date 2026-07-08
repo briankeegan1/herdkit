@@ -205,6 +205,24 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic governance adoption from CLAUDE.md (HERD-119) test passes" {
+  run bash "$REPO/tests/test-init-governance-adoption.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance hook-rendering (HERD-131) test passes" {
+  run bash "$REPO/tests/test-governance-hooks-render.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance-drift sweep (HERD-125) test passes" {
+  run bash "$REPO/tests/test-governance-drift.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]
