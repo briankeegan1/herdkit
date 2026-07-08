@@ -77,6 +77,7 @@ Role summarized from each file's top-of-file comment.
 - `healthcheck.project.sh` — healthcheck.project.sh (EXAMPLE) — the per-project health command the generic
 - `healthcheck.rust.sh` — healthcheck.rust.sh (EXAMPLE) — a per-project health command for a Rust (Cargo) project.
 - `links.example` — .herd/links — cross-repo link registry. Commit this (code-shaped config, zero-secret).
+- `models.tsv` — (tab-separated manifest — no header comment)
 - `steps.example` — .herd/steps.tsv — declarative PIPELINE STEP LIST (HERD-132). Commit this (code-shaped config,
 
 ## Who sources whom
@@ -170,7 +171,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
-- `MODEL_ESCALATE_GLOB` → `herd-feature.sh`, `herd-quick.sh`
+- `MODEL_ESCALATE_GLOB` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_QUICK` → `bin/herd`, `herd-quick.sh`
 - `MODEL_RESEARCH` → `bin/herd`, `research.sh`
