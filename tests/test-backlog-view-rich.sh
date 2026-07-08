@@ -89,6 +89,11 @@ run_view() {
 
 TAB="$(printf '\t')"
 
+# strip8 — remove OSC 8 hyperlink wrappers (HERD-49) from a captured frame so the shaping assertions
+# below test the markdown chip/title shape itself, independent of the id→Linear link the linear
+# backend now wraps each chip in. The link presence is asserted separately (see case 1).
+strip8() { sed $'s/\033]8;;[^\033]*\033\\\\//g'; }
+
 # ── Case 1: rich TSV → state-grouped markdown ────────────────────────────────────────────────────
 # Three items: a started one (must render FIRST under 🚧 with its state name), an unstarted one
 # whose description repeats its title (the repeat must be stripped from the body), and a backlog
@@ -99,43 +104,49 @@ RICH="#HERD-8${TAB}started${TAB}In Progress${TAB}Externalized work queue${TAB}Co
 #HERD-12${TAB}unstarted${TAB}Todo${TAB}Backlog polish${TAB}Backlog polish. Show live status in the pane.
 #HERD-36${TAB}backlog${TAB}Icebox${TAB}${LONGTITLE}${TAB}"
 : > "$LOG"
-out1="$(run_view "$P1" HERD_FAKE_RICH_OUT="$RICH")"
+out1="$(run_view "$P1" HERD_FAKE_RICH_OUT="$RICH")"; out1s="$(strip8 <<<"$out1")"
 grep -q "herd backlog --rich" "$LOG" || fail "viewer did not ask for the rich list"
-grep -q '## 🚧 in progress (1)' <<<"$out1" || fail "missing in-progress group header ($out1)"
-grep -q '## 🔜 queued (2)' <<<"$out1"      || fail "missing queued group header (unstarted+backlog merged)"
+grep -q '## 🚧 in progress (1)' <<<"$out1s" || fail "missing in-progress group header ($out1s)"
+grep -q '## 🔜 queued (2)' <<<"$out1s"      || fail "missing queued group header (unstarted+backlog merged)"
 # started renders first
-first_group="$(grep -n '##' <<<"$out1" | head -n1)"
+first_group="$(grep -n '##' <<<"$out1s" | head -n1)"
 grep -q 'in progress' <<<"$first_group" || fail "in-progress group must render before queued ($first_group)"
 # chip + bold TITLE ONLY + italic state name; description is a plain top-level paragraph line, never bold
-grep -q -- '- `#HERD-8` \*\*Externalized work queue\*\* _(In Progress)_' <<<"$out1" \
-  || fail "in-progress item shape wrong (chip/bold-title/state) ($out1)"
-grep -q '^Coordinator writes spawn intents, watcher drains them\.$' <<<"$out1" \
+grep -q -- '- `#HERD-8` \*\*Externalized work queue\*\* _(In Progress)_' <<<"$out1s" \
+  || fail "in-progress item shape wrong (chip/bold-title/state) ($out1s)"
+grep -q '^Coordinator writes spawn intents, watcher drains them\.$' <<<"$out1s" \
   || fail "description must be a plain top-level paragraph (unindented: glamour glues an indented continuation onto the item)"
 # title-repeating description is de-duplicated out of the body
-grep -q '^Show live status in the pane\.$' <<<"$out1" \
+grep -q '^Show live status in the pane\.$' <<<"$out1s" \
   || fail "body must strip the description's leading title repetition"
 # paragraph-length title: bold head caps at a word boundary, spill continues as plain body
-grep -q -- '- `#HERD-36` \*\*Code map for agent context: graphify the codebase so coordinators and builders start grounded instead of\*\*' <<<"$out1" \
-  || fail "long title was not split at a word boundary into a bold head ($out1)"
-grep -q '^re-exploring the repository every session which is expensive$' <<<"$out1" \
+grep -q -- '- `#HERD-36` \*\*Code map for agent context: graphify the codebase so coordinators and builders start grounded instead of\*\*' <<<"$out1s" \
+  || fail "long title was not split at a word boundary into a bold head ($out1s)"
+grep -q '^re-exploring the repository every session which is expensive$' <<<"$out1s" \
   || fail "long-title spill must continue as plain body text"
+# HERD-49: each chip is wrapped in an OSC 8 hyperlink to the issue in Linear (raw frame, pre-strip).
+grep -q $'\033]8;;https://linear.app/testws/issue/HERD-8\033\\\\#HERD-8\033]8;;\033\\\\' <<<"$out1" \
+  || fail "chip #HERD-8 is not wrapped in an OSC 8 hyperlink to Linear ($out1)"
+grep -q 'https://linear.app/testws/issue/HERD-36' <<<"$out1" \
+  || fail "long-title chip #HERD-36 missing its OSC 8 Linear hyperlink"
 pass
 
 # ── Case 2: tab-free answer under --rich → legacy flat-bullet shape (backward compat) ────────────
 P2="$T/proj-plain"; make_project "$P2"
 : > "$LOG"
-out2="$(run_view "$P2" HERD_FAKE_RICH_OUT='#ABC-1 alpha ticket')"
-grep -q -- '- `#ABC-1` \*\*alpha ticket\*\*' <<<"$out2" || fail "plain shape must keep the legacy bullet form ($out2)"
-grep -q '##' <<<"$out2" && fail "plain shape must not invent group headers"
+out2="$(run_view "$P2" HERD_FAKE_RICH_OUT='#ABC-1 alpha ticket')"; out2s="$(strip8 <<<"$out2")"
+grep -q -- '- `#ABC-1` \*\*alpha ticket\*\*' <<<"$out2s" || fail "plain shape must keep the legacy bullet form ($out2s)"
+grep -q '##' <<<"$out2s" && fail "plain shape must not invent group headers"
+grep -q 'https://linear.app/testws/issue/ABC-1' <<<"$out2" || fail "plain-shape chip #ABC-1 missing its OSC 8 Linear hyperlink"
 pass
 
 # ── Case 3: older CLI rejects --rich → retried as plain `herd backlog`, still renders ────────────
 P3="$T/proj-old"; make_project "$P3"
 : > "$LOG"
-out3="$(run_view "$P3" HERD_FAKE_RICH_REJECT=1 HERD_FAKE_OUT='#OLD-1 legacy item')"
+out3="$(run_view "$P3" HERD_FAKE_RICH_REJECT=1 HERD_FAKE_OUT='#OLD-1 legacy item')"; out3s="$(strip8 <<<"$out3")"
 grep -q "herd backlog --rich" "$LOG" || fail "old-CLI case: rich attempt missing from the call log"
 grep -q "^herd backlog$" "$LOG"      || fail "old-CLI case: plain retry missing from the call log"
-grep -q -- '- `#OLD-1` \*\*legacy item\*\*' <<<"$out3" || fail "old-CLI case did not render the plain list ($out3)"
+grep -q -- '- `#OLD-1` \*\*legacy item\*\*' <<<"$out3s" || fail "old-CLI case did not render the plain list ($out3s)"
 pass
 
 # ── Case 4: assignee rendering ─────────────────────────────────────────────────────────────────────
@@ -147,14 +158,14 @@ RICH4="#HERD-1${TAB}started${TAB}In Progress${TAB}Do the thing${TAB}Body text${T
 #HERD-2${TAB}unstarted${TAB}Todo${TAB}Other task${TAB}${TAB}Jordan
 #HERD-3${TAB}unstarted${TAB}Todo${TAB}Free task${TAB}${TAB}"
 : > "$LOG"
-out4="$(run_view "$P4" HERD_FAKE_RICH_OUT="$RICH4")"
-grep -q -- '- `#HERD-1` \*\*Do the thing\*\* _(In Progress · Chase)_' <<<"$out4" \
-  || fail "started item with assignee must render '_(In Progress · Chase)_' ($out4)"
-grep -q -- '- `#HERD-2` @Jordan \*\*Other task\*\*' <<<"$out4" \
-  || fail "unstarted item with assignee must render '@Name' between chip and bold title ($out4)"
-grep -q -- '- `#HERD-3` \*\*Free task\*\*' <<<"$out4" \
-  || fail "unassigned unstarted item must have no @-name ($out4)"
-! grep -q '@' <<<"$(grep '#HERD-3' <<<"$out4")" \
+out4="$(run_view "$P4" HERD_FAKE_RICH_OUT="$RICH4")"; out4s="$(strip8 <<<"$out4")"
+grep -q -- '- `#HERD-1` \*\*Do the thing\*\* _(In Progress · Chase)_' <<<"$out4s" \
+  || fail "started item with assignee must render '_(In Progress · Chase)_' ($out4s)"
+grep -q -- '- `#HERD-2` @Jordan \*\*Other task\*\*' <<<"$out4s" \
+  || fail "unstarted item with assignee must render '@Name' between chip and bold title ($out4s)"
+grep -q -- '- `#HERD-3` \*\*Free task\*\*' <<<"$out4s" \
+  || fail "unassigned unstarted item must have no @-name ($out4s)"
+! grep -q '@' <<<"$(grep '#HERD-3' <<<"$out4s")" \
   || fail "unassigned item must not emit any @-name on its line"
 pass
 
