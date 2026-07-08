@@ -1136,6 +1136,175 @@ cmd_render() {
   ok "rendered coordinator skill → $skill"
 }
 
+# ── herd governance hooks render: emit SESSION-TIME Claude Code hooks from the governance map (HERD-131)
+# Dual-surface enforcement: the governance rules the merge-time watcher gate enforces ALSO bind
+# session-time as Claude Code PreToolUse hooks — blocking a violation at the keyboard, early and cheap.
+# Consumes EVERY surface==hook row of templates/governance-map.tsv (HERD-119); each rendered hook runs
+# scripts/herd/governance-hook.sh <target> against the tool payload. PROPOSE-then-write like every
+# governance write: each hook is shown, the operator accepts per-hook, and accepted entries MERGE into
+# .claude/settings.local.json (or --shared → .claude/settings.json) preserving ALL existing entries.
+# Every generated matcher-group carries a "herd-governance" marker key, so a re-render strips ONLY its
+# own prior entries and re-adds the current selection — idempotent, never clobbering user hooks.
+# Fail-soft: no map / no hook rows / non-interactive → clean no-op, no file written.
+_GOV_HOOK_MARKER="herd-governance"
+
+cmd_governance() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    hooks) _gov_hooks "$@" ;;
+    ''|help|-h|--help)
+      say "usage: herd governance hooks render [--shared]"
+      say "  Render session-time Claude Code hooks from the governance map's hook rows: propose each,"
+      say "  accept per-hook, and merge accepted entries into .claude/settings.local.json (default) or"
+      say "  .claude/settings.json (--shared), preserving existing entries. Idempotent re-render." ;;
+    *) die "unknown: herd governance $sub (try: herd governance hooks render)" ;;
+  esac
+}
+
+_gov_hooks() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    render) _gov_hooks_render "$@" ;;
+    ''|help|-h|--help) say "usage: herd governance hooks render [--shared]" ;;
+    *) die "unknown: herd governance hooks $action (try: herd governance hooks render)" ;;
+  esac
+}
+
+_gov_hooks_render() {
+  local shared="" a
+  for a in "$@"; do
+    case "$a" in
+      --shared) shared=1 ;;
+      -*) die "unknown flag: $a (usage: herd governance hooks render [--shared])" ;;
+      *)  die "unexpected argument: $a (usage: herd governance hooks render [--shared])" ;;
+    esac
+  done
+
+  local root map
+  root="$(pwd)"
+  map="$(_gov_map_file)"
+  # Fail-soft: no map → clean no-op (byte-identical for projects that never provisioned one).
+  [ -f "$map" ] || { say "  ${c_dim}governance hooks: no map at $map — nothing to render${c_rst}"; return 0; }
+
+  # Collect surface==hook rows as target<TAB>label, in file order. The renderer consumes EVERY hook
+  # row (unlike adoption's first-match _gov_match); the pattern column is irrelevant here.
+  local rows="" pattern surface target label
+  while IFS=$'\t' read -r pattern surface target label; do
+    case "$pattern" in ''|'#'*|'pattern') continue ;; esac
+    [ "$surface" = "hook" ] || continue
+    [ -n "$target" ] || continue
+    rows="${rows}${target}"$'\t'"${label}"$'\n'
+  done < "$map"
+
+  if [ -z "$rows" ]; then
+    say "  ${c_dim}governance hooks: no hook rows in the map — nothing to render${c_rst}"
+    return 0
+  fi
+
+  # Target settings file: the per-machine local overlay by default; --shared → the committed baseline.
+  local relfile settings
+  if [ -n "$shared" ]; then relfile=".claude/settings.json"; else relfile=".claude/settings.local.json"; fi
+  settings="$root/$relfile"
+
+  # PROPOSE-then-write: writes REQUIRE an interactive operator (never auto-write). Non-interactive →
+  # clean no-op so a scripted/CI invocation changes nothing.
+  if ! _ground_interactive; then
+    say "  ${c_dim}governance hooks: non-interactive — nothing written (run from a terminal to accept per-hook)${c_rst}"
+    return 0
+  fi
+
+  say ""
+  say "${c_bold}Governance hooks${c_rst} ${c_dim}(session-time Claude Code hooks — propose-then-write; merged into ${relfile}, existing entries preserved)${c_rst}"
+
+  local accepted="" np i rec cmd ans
+  np="$(printf '%s' "$rows" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$rows" | sed -n "${i}p")"
+    IFS=$'\t' read -r target label <<< "$rec"
+    [ -n "$target" ] || continue
+    cmd="bash $SCRIPTS_DIR/governance-hook.sh $target"
+    say ""
+    say "  ${c_bold}${label}${c_rst}"
+    say "  ${c_dim}→ PreToolUse[Bash] hook: ${cmd}${c_rst}"
+    ans="$(_ground_ask "  accept? (a/N)" "n")"
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      a|accept|y|yes) accepted="${accepted}${target}"$'\n'; say "  ${c_dim}accepted${c_rst}" ;;
+      *) say "  ${c_dim}declined${c_rst}" ;;
+    esac
+  done
+
+  say ""
+  # Write when there is something to add, OR when the file already carries our marker (so declining a
+  # previously-accepted hook cleanly removes it). A fresh decline-all never creates a file.
+  if [ -n "$accepted" ] || { [ -f "$settings" ] && grep -q "$_GOV_HOOK_MARKER" "$settings" 2>/dev/null; }; then
+    _gov_hooks_merge "$settings" "$accepted"
+  else
+    say "  ${c_dim}governance hooks: nothing accepted — no file written${c_rst}"
+  fi
+}
+
+# _gov_hooks_merge <settings-file> <accepted-targets-newline> — merge the accepted hook targets into
+# the settings JSON, preserving every existing entry. Strips our previously-rendered marker groups
+# from every hook event first (idempotent re-render), then re-adds the current selection in a stable
+# (sorted) order. A malformed settings file is refused, never clobbered.
+_gov_hooks_merge() {
+  local settings="$1" accepted="$2"
+  command -v python3 >/dev/null 2>&1 || die "governance hooks render requires python3"
+  mkdir -p "$(dirname "$settings")" 2>/dev/null || true
+  SETTINGS="$settings" MARKER="$_GOV_HOOK_MARKER" HOOKSCRIPT="$SCRIPTS_DIR/governance-hook.sh" \
+  ACCEPTED="$accepted" python3 -c '
+import json, os, shlex, sys
+settings = os.environ["SETTINGS"]
+marker   = os.environ["MARKER"]
+hookscript = os.environ["HOOKSCRIPT"]
+accepted = [t for t in os.environ.get("ACCEPTED", "").splitlines() if t.strip()]
+try:
+    with open(settings) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except Exception:
+    sys.stderr.write("governance hooks: %s is not valid JSON — refusing to overwrite\n" % settings)
+    sys.exit(1)
+hooks = data.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+# Strip our previously-rendered marker groups from every event (idempotent re-render); drop an event
+# that we emptied so re-render stays byte-stable.
+for ev in list(hooks.keys()):
+    arr = hooks.get(ev)
+    if not isinstance(arr, list):
+        continue
+    kept = [g for g in arr if not (isinstance(g, dict) and marker in g)]
+    if kept:
+        hooks[ev] = kept
+    else:
+        del hooks[ev]
+for target in sorted(set(accepted)):
+    cmd = "bash %s %s" % (shlex.quote(hookscript), shlex.quote(target))
+    hooks.setdefault("PreToolUse", []).append({
+        "matcher": "Bash",
+        marker: target,
+        "hooks": [{"type": "command", "command": cmd}],
+    })
+if hooks:
+    data["hooks"] = hooks
+elif "hooks" in data:
+    del data["hooks"]
+with open(settings, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' || die "governance hooks: merge into $settings failed"
+  local nacc; nacc="$(printf '%s' "$accepted" | grep -c . || true)"
+  if [ "$nacc" -gt 0 ]; then
+    ok "governance hooks: merged $nacc hook(s) → $settings"
+  else
+    say "  ${c_dim}governance hooks: removed prior generated entries → $settings${c_rst}"
+  fi
+}
+
 # ── herd codemap: regenerate docs/codemap.md, a native map of the repo's tree ────────────────────
 # Delegates to scripts/herd/codemap.sh, which regenerates the committed, deterministic docs/codemap.md
 # — module roles, who-imports/sources-whom, and config-key → consumer wiring — for coordinator/builder
@@ -4325,6 +4494,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd governance hooks render        render SESSION-TIME Claude Code hooks from the governance map's
+              [--shared]              hook rows (dual-surface: the same rules the merge gate enforces,
+                                      now blocking at the keyboard). Propose-then-write, per-hook
+                                      accept; merges into .claude/settings.local.json (or
+                                      .claude/settings.json with --shared) preserving existing entries;
+                                      marker-keyed so re-render is idempotent. No hook rows → no-op
   herd reload                         rebuild the control room around the coordinator: stop +
                                       relaunch the watcher (pane visibility verified), ensure
                                       the pinned backlog pane, re-render the coordinator skill;
@@ -4424,6 +4599,7 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;

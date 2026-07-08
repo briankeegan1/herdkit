@@ -211,6 +211,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic governance hook-rendering (HERD-131) test passes" {
+  run bash "$REPO/tests/test-governance-hooks-render.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic governance-drift sweep (HERD-125) test passes" {
   run bash "$REPO/tests/test-governance-drift.sh"
   [ "$status" -eq 0 ]
