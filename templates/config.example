@@ -173,8 +173,9 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
 # broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited
 # it). ON → after every merge the watcher runs the healthcheck against the freshly ff'd default-branch
-# HEAD (sha-keyed so each main sha runs once; profile from the merged diff via HEALTHCHECK_HEAVY_GLOB;
-# honors HEALTH_CONCURRENCY) and, on a reproduced red, raises a LOUD persistent 'MAIN RED — <failing
+# HEAD (sha-keyed so each main sha runs once; runs the FULL heavy suite — a light check against the
+# default-branch checkout is a zero-file vacuous green; honors HEALTH_CONCURRENCY) and, on a
+# reproduced red, raises a LOUD persistent 'MAIN RED — <failing
 # test> (since #N)' console row + a notification, cleared when a later sha goes green. An ALARM only —
 # never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
 # MAIN_HEALTH_TICK="off"   # off (default) | on

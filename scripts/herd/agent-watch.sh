@@ -453,10 +453,13 @@ build_spawn_holds() {
 # build_main_health — the post-merge main-health ALARM row (HERD-129). One LOUD persistent red line
 # while the default branch is red, read from $MAIN_HEALTH_STATE ("<sha> <since_pr> <failing test…>",
 # written by _main_health_set_red and cleared by _main_health_clear). Empty (MAIN_HEALTH="") when the
-# file is absent — so a green main, OR the feature disabled (the file is never created), renders
-# NOTHING: the console is BYTE-IDENTICAL to before this feature whenever MAIN_HEALTH_TICK is unset.
+# file is absent — so a green main renders NOTHING. Also GATED on the lever: if an operator flips
+# MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no tick is left to
+# clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature whenever the
+# feature is off, red state file or not.
 build_main_health() {
   MAIN_HEALTH=""
+  _main_health_enabled || return 0
   [ -s "$MAIN_HEALTH_STATE" ] || return 0
   local _bm_sha _bm_since _bm_fail
   read -r _bm_sha _bm_since _bm_fail < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
@@ -1777,23 +1780,16 @@ _main_health_enabled() {
 # never re-runs the suite for the same commit.
 _main_health_marker() { printf '%s' "$TREES/.main-health-$1"; }
 
-# _main_health_profile <sha> — echo '--heavy' or '--light' for the healthcheck run, selected from the
-# MERGED diff (this sha vs its first parent) against HEALTHCHECK_HEAVY_GLOB — the SAME rule
-# healthcheck.sh applies to a worktree diff, but computed here because $MAIN's diff-vs-default-branch
-# is empty (it IS the default branch). No cmd configured → light; can't tell what changed or no glob
-# set → heavy (the thorough side); the glob matches the merged paths → heavy, else light.
-_main_health_profile() {
-  local _mp_sha="$1" _mp_changed
-  [ -n "${HEALTHCHECK_CMD:-}" ] || { printf -- '--light'; return 0; }
-  _mp_changed="$(git -C "$MAIN" diff --name-only "${_mp_sha}^" "$_mp_sha" 2>/dev/null || true)"
-  if [ -z "$_mp_changed" ]; then printf -- '--heavy'; return 0; fi
-  if [ -z "${HEALTHCHECK_HEAVY_GLOB:-}" ]; then printf -- '--heavy'; return 0; fi
-  if printf '%s\n' "$_mp_changed" | grep -qE "$HEALTHCHECK_HEAVY_GLOB"; then
-    printf -- '--heavy'
-  else
-    printf -- '--light'
-  fi
-}
+# WHY the tick is ALWAYS heavy (never light) — a review-caught correctness trap. The 'light' profile
+# derives its file set from healthcheck.sh's `git diff --name-only $DEFAULT_BRANCH` run INSIDE the dir
+# it checks; against $MAIN — which IS the default-branch checkout — that diff is EMPTY, so light checks
+# ZERO files and returns a vacuous rc-0 ("✅ light clean — 0 sh, 0 py ok") no matter what state main is
+# actually in. Routing that vacuous rc-0 to _main_health_clear would WIPE a real MAIN RED and fire a
+# false 'recovered' the next time a docs/BACKLOG/config merge (any diff not matching
+# HEALTHCHECK_HEAVY_GLOB) landed. A light subset is categorically meaningless on a zero-diff tree, so a
+# main-health tick must run the FULL suite every time: we pass --heavy unconditionally. (For a project
+# with no HEALTHCHECK_CMD, healthcheck.sh's --heavy falls back to light anyway — but such a project
+# also never paints red, so there is nothing to falsely clear.)
 
 # _main_health_clear <pr#> <sha> — a main sha went GREEN. Drop any standing red state (which removes
 # the console row), journal the green result, and on a RED→green TRANSITION notify recovery once.
@@ -1833,7 +1829,7 @@ _main_health_set_red() {
 # _main_health_set_red. Byte-inert when disabled; ALWAYS returns 0 (an alarm can never fail a merge).
 main_health_tick() {
   _main_health_enabled || return 0
-  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_prof _mh_out _mh_rc
+  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_out _mh_rc
   _mh_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_mh_sha" ] || { journal_append main_health pr "$_mh_pr" result infra_event reason no-head; return 0; }
   _mh_marker="$(_main_health_marker "$_mh_sha")"
@@ -1845,12 +1841,13 @@ main_health_tick() {
   _health_slot_free || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-slot; return 0; }
   [ -f "$HERD_HEALTHCHECK_BIN" ] || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-bin; return 0; }
   _health_acquire "main-$_mh_sha"
-  _mh_prof="$(_main_health_profile "$_mh_sha")"
-  _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline $_mh_prof 2>/dev/null)"; _mh_rc=$?
+  # ALWAYS --heavy: a 'light' check against $MAIN is a zero-file vacuous green (see the note above), so
+  # it could silently CLEAR a real MAIN RED. The full suite is the only meaningful main-health check.
+  _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
   # RETRY-BEFORE-RED: a lone rc-1 may be transient cross-worktree git-lock contention — the exact
   # false-red the pre-merge gate's solo retry defends against. Re-run once, still holding the mutex.
   if [ "$_mh_rc" -eq 1 ]; then
-    _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline $_mh_prof 2>/dev/null)"; _mh_rc=$?
+    _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
   fi
   _health_release "main-$_mh_sha"
   : > "$_mh_marker" 2>/dev/null || true                   # the suite ran against this sha — mark run-once

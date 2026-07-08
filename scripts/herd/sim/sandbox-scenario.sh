@@ -232,12 +232,18 @@ WATCH_SH="$HERE/../agent-watch.sh"
 if [ ! -f "$WATCH_SH" ]; then
   checkpoint main_health_lib skip "agent-watch.sh not found at $WATCH_SH — main-health phase skipped"
 else
-  # Stub healthcheck bin: run the fixture's REAL gate against <dir>, emit healthcheck.sh --oneline
-  # shape (0 clean / 1 code error). A broken greet.sh fails greet.test.sh → rc 1 → main red.
+  # Stub healthcheck bin — EMULATES healthcheck.sh's profile semantics against $MAIN, so the review's
+  # correctness trap is reproducible end-to-end: --light derives its file set from an EMPTY
+  # $MAIN-vs-default-branch diff → a zero-file vacuous green (rc 0 regardless of real state); --heavy
+  # (the profile the tick must always use) runs the fixture's REAL gate, so a broken greet.sh → rc 1.
+  # If main_health_tick ever regressed to passing --light, sub-check (E) would falsely go green.
   MH_HC="$ART/mh-healthcheck.sh"
   cat > "$MH_HC" <<'HCSTUB'
 #!/usr/bin/env bash
-dir="$1"
+dir="$1"; shift
+mode="heavy"
+for a in "$@"; do case "$a" in --light) mode="light" ;; --heavy) mode="heavy" ;; esac; done
+if [ "$mode" = "light" ]; then echo "✅ light clean — 0 sh, 0 py ok"; exit 0; fi
 if ( cd "$dir" && bash app/greet.test.sh ) >/dev/null 2>&1; then
   echo "✅ clean — greet.test PASS"; exit 0
 else
@@ -280,6 +286,14 @@ BROKEN
     _sf_git_env
     sandbox_fixture_files "$1"                       # rewrite the pristine (passing) greet.sh
     git -C "$1" add -A && git -C "$1" commit -q -m "fix greet (main-health fixture)"
+  }
+  # mh_docs_commit <repo> — a docs-only commit (touches BACKLOG.md, NOT app/) so HEAD's merged diff
+  # does NOT match HEALTHCHECK_HEAVY_GLOB='^app/' — the routine merge the review showed would be
+  # mis-classified '--light' and vacuously cleared. Advances HEAD to a new (docs-only) sha.
+  mh_docs_commit() {
+    _sf_git_env
+    printf '\n- 🔜 **Doc note** — non-app change (main-health regression fixture).\n' >> "$1/BACKLOG.md"
+    git -C "$1" add -A && git -C "$1" commit -q -m "docs: touch BACKLOG (non-heavy diff)"
   }
   _mh_state() { printf '%s' "$1/.agent-watch-main-health"; }
   _mh_no_event()  { ! grep -q '"event":"main_health"' "$1" 2>/dev/null; }
@@ -330,6 +344,19 @@ BROKEN
     checkpoint main_health_recovery pass "a later green sha clears the MAIN RED row (state removed, row empty)"
   else
     checkpoint main_health_recovery fail "green sha did NOT clear the alarm (row='$ROW_D', state=$( [ -f "$(_mh_state "$TR_CD")" ] && echo present || echo absent ))"
+  fi
+
+  # (E) NON-HEAVY MERGE ON A BROKEN MAIN (review regression guard): break main, then land a docs-only
+  #     merge whose diff does NOT match HEALTHCHECK_HEAVY_GLOB. The tick must run the FULL (heavy) suite
+  #     and STILL see red — never mis-classify it as a zero-file '--light' vacuous green that would
+  #     falsely clear the alarm. With the bug present the stub returns '✅ light clean' → this fails.
+  MH_E="$ART/mh-e"; TR_E="$ART/tr-e"; JN_E="$ART/jn-e.jsonl"; mkdir -p "$TR_E"; : > "$JN_E"
+  sandbox_fixture_build "$MH_E" >/dev/null 2>&1 && mh_break "$MH_E" >/dev/null 2>&1 && mh_docs_commit "$MH_E" >/dev/null 2>&1
+  ROW_E="$(mh_drive "$MH_E" "$TR_E" "$JN_E" 300 on)"
+  if _mh_has_result "$JN_E" red && [ -s "$(_mh_state "$TR_E")" ] && printf '%s' "$ROW_E" | grep -q 'MAIN RED'; then
+    checkpoint main_health_nonheavy_red pass "a docs-only (non-heavy-glob) merge on a broken main still runs the full suite and reds — not a vacuous light green"
+  else
+    checkpoint main_health_nonheavy_red fail "non-heavy merge on a broken main did NOT red (would falsely clear a real MAIN RED); row='$ROW_E'"
   fi
 fi
 
