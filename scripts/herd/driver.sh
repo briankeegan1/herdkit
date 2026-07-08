@@ -171,6 +171,121 @@ herd_driver_close_pane() {
   return 0
 }
 
+# ── guarded pane close (HERD-134) ──────────────────────────────────────────────────────────────────
+# The reviewer-pane lifecycle, the review re-dispatch split-close, and the sweeps all close panes by a
+# CAPTURED pane id or agent name. A stale/recycled/wrong id kills an innocent NEIGHBOUR — the
+# 2026-07-08 incident where a reviewer retire (registry pane id) plus a re-dispatch's purge-old-split
+# close vaporised PR #249's live BUILDER pane sharing that tab ("agent session dead" → failed refix
+# wakes → hand re-tasking). Same hazard class as cross-project watcher kills (argv0 tagging) and reap
+# safety. The fix: verify a pane's LIVE identity at close time and REFUSE when it is not what the
+# caller believes it is — loud (a journaled pane_close_refused), never silent.
+
+# herd_driver_pane_identity <pane-id> — read a pane's LIVE identity as a single token, the ground truth
+# the guarded close proves a pane against before closing it. Three sources, in priority order — the
+# same eyes layout-reconcile / agent-liveness use:
+#   agent:<name>  a registered agent (herdr carries the identity in `name` OR `agent`, matched by
+#                 pane_id) — e.g. agent:review·<slug>, agent:<builder-slug>. The agent-pane reviewer.
+#   pane:<label>  a pane's own LABEL (herdr pane rename / --label), matched by pane_id — the identity
+#                 of a NON-agent named pane, e.g. the standalone review·<slug> tail pane.
+#   argv:<cmd>    an unlabelled non-agent pane, classified by its FOREGROUND process cmdline (the
+#                 scribe drainer, the task-spec viewer, a tail, …)
+# Echoes NOTHING when the identity cannot be read (headless — no panes; herdr absent; a gone/opaque
+# pane). FAIL-SOFT: a probe that cannot see the truth returns empty so the guard REFUSES rather than
+# closing blind — it never fabricates an identity.
+herd_driver_pane_identity() {
+  local pane="${1:-}"
+  [ -n "$pane" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  # 1) An agent pane: match this pane_id in the roster. Tolerate BOTH identity keys (`name` for an
+  #    `herdr agent start` agent, `agent` for a `herdr pane report-agent` one) — the same breadth
+  #    herd_driver_agent_liveness uses so the probe finds the identity however it was registered.
+  local name
+  name="$(herdr agent list 2>/dev/null | PANE="$pane" python3 -c '
+import sys, json, os
+pane = os.environ["PANE"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if str(a.get("pane_id","")) == pane:
+      print("agent:" + (a.get("name") or a.get("agent") or ""), end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  if [ -n "$name" ]; then printf '%s' "$name"; return 0; fi
+  # 2) A named non-agent pane: match this pane_id in the pane roster and read its label (what
+  #    `herdr pane rename` / `--label` set) — the identity of the standalone-fallback review pane.
+  local label
+  label="$(herdr pane list 2>/dev/null | PANE="$pane" python3 -c '
+import sys, json, os
+pane = os.environ["PANE"]
+try:
+  for p in (json.load(sys.stdin).get("result") or {}).get("panes") or []:
+    if str(p.get("pane_id","")) == pane:
+      lbl = p.get("label") or ""
+      if lbl: print("pane:" + lbl, end="")
+      break
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  if [ -n "$label" ]; then printf '%s' "$label"; return 0; fi
+  # 3) An unlabelled non-agent pane: classify by the foreground cmdline (excluding the pane's own shell).
+  herdr pane process-info --pane "$pane" 2>/dev/null | python3 -c '
+import sys, json
+try:
+  pi = (json.load(sys.stdin).get("result") or {}).get("process_info")
+except Exception:
+  sys.exit(0)
+if not pi:
+  sys.exit(0)
+sh = pi.get("shell_pid") or 0
+fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh]
+cmd = " ".join((p.get("cmdline") or "") for p in fg).strip()
+if cmd:
+  sys.stdout.write("argv:" + cmd)
+' 2>/dev/null || true
+}
+
+# _herd_pane_close_refused_journal <pane> <expected> <actual> <reason> — record a REFUSED close. The
+# pane_close_refused event is the forensic ALARM (herd why / herd log) that a close was withheld
+# because the pane was NOT what the caller expected — carrying BOTH the expected and actual identities.
+# journal.sh is sourced by both engine surfaces that call the guard (agent-watch.sh + herd-review.sh);
+# when it is NOT in scope (driver.sh sourced standalone / the CLI) this degrades to a silent no-op so
+# driver.sh keeps its zero-dependency, no-side-effect sourcing contract.
+_herd_pane_close_refused_journal() {
+  command -v journal_append >/dev/null 2>&1 || return 0
+  journal_append pane_close_refused pane "${1:-}" expected "${2:-}" actual "${3:-}" reason "${4:-}"
+}
+
+# herd_close_pane_verified <pane-id> <expected-kind> — the ONE guarded pane-close every engine actor
+# routes through (HERD-134). Reads the pane's LIVE identity (herd_driver_pane_identity) and closes it
+# ONLY when that identity CONTAINS <expected-kind> (e.g. "review·" for a reviewer split/pane). On a
+# mismatch — the pane id is stale/recycled and now names an innocent neighbour (the builder kill) — it
+# REFUSES the close and journals pane_close_refused with BOTH identities. On an unreadable identity it
+# also refuses (fail-soft: never close blind, journal and move on). Returns 0 IFF the pane was closed.
+# BYTE-IDENTICAL when identities match: a normal retire closes exactly as before.
+herd_close_pane_verified() {
+  local pane="${1:-}" kind="${2:-}"
+  [ -n "$pane" ] || return 1
+  # Headless has no panes to verify OR close: defer to the (no-op) driver close so behaviour is
+  # byte-identical to the pre-guard path (which never reached a close under headless anyway).
+  if _herd_driver_is_headless; then herd_driver_close_pane "$pane"; return 0; fi
+  # A missing expected-kind would substring-match anything — refuse rather than close indiscriminately.
+  [ -n "$kind" ] || { _herd_pane_close_refused_journal "$pane" "$kind" "" no-expected-kind; return 1; }
+  local ident; ident="$(herd_driver_pane_identity "$pane" 2>/dev/null || true)"
+  if [ -z "$ident" ]; then
+    _herd_pane_close_refused_journal "$pane" "$kind" "" identity-unreadable
+    return 1
+  fi
+  case "$ident" in
+    *"$kind"*)
+      herd_driver_close_pane "$pane"
+      return 0 ;;
+    *)
+      _herd_pane_close_refused_journal "$pane" "$kind" "$ident" identity-mismatch
+      return 1 ;;
+  esac
+}
+
 # herd_driver_pane_alive <pane-id> — success iff the pane still EXISTS in the live control surface.
 # The reviewer-adoption / orphan-sweep liveness probe (HERD-113): after a herdr server death + reload a
 # reviewer PANE can outlive its poller pid, so "is the pane still there?" is the signal that must gate a
@@ -431,13 +546,15 @@ _herd_driver_cli() {
     send-text)   herd_driver_send_text "$@" ;;
     send-keys)   herd_driver_send_keys "$@" ;;
     close-pane)  herd_driver_close_pane "$@" ;;
+    close-verified) herd_close_pane_verified "$@" ;;
+    pane-identity)  herd_driver_pane_identity "$@"; echo ;;
     pane-alive)  herd_driver_pane_alive "$@" ;;
     agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
     create-tab)  herd_driver_create_tab "$@" ;;
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
   esac
 }
 
