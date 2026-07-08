@@ -19,6 +19,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-reconcile.sh` — keep BACKLOG.md coherent when a PR MOVES or RENAMES the things backlog
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
+- `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
 - `coordinator.sh` — (re)launch the coordinator herdr tab as a 2-pane control room:
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
@@ -84,7 +85,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
 - `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`
-- `healthcheck.sh` → `herd-config.sh`
+- `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
 - `herd-advise.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
@@ -116,6 +117,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `APP_PREVIEW_PORT_BASE` → `herd-feature.sh`, `herd-resolve.sh`
 - `APP_PREVIEW_SERVER_ARGS` → `app-monitor.sh`
 - `APP_SURFACE_GLOB` → `healthcheck.sh`
+- `ATTRIBUTION_POLICY` → `healthcheck.sh`
 - `BACKLOG_FILE` → `bin/herd`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
 - `CLAIM_REQUIRED` → `herd-claim.sh`
