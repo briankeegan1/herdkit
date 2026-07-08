@@ -124,4 +124,87 @@ printf '%s\n' "$out" | grep -qi 'no probably-shipped\|no HIGH-confidence candida
 [ -z "$(ls -A "$REQDIR" 2>/dev/null)" ] || fail "no-match run must NOT enqueue anything"
 pass
 
+# ── (6) EXACT-REF pass: the HERD-49 / PR #185 regression (HERD-138) ────────────
+# The proven gap (2026-07-08): HERD-49 sat OPEN while merged PR #185 was literally titled
+# "feat(HERD-49): …" 25h earlier — fuzzy title match + a short recent-PR window BOTH missed it.
+# Model that exactly: the id-bearing PR is OLD (last in the full history) and is ABSENT from the
+# recent fuzzy window, and the item's TITLE shares no key terms with any merged work. Only an
+# exact-ref grep over the FULL merged history can catch it.
+JOURNAL="$T/journal.jsonl"; export JOURNAL_FILE="$JOURNAL"; rm -f "$JOURNAL"
+cat > "$REPO/BACKLOG.md" <<'B'
+# project backlog
+
+## Planned
+- 🔜 **Add exact-ref pass before fuzzy title matching** *(HERD-49)* — scan merged PR titles for the item id.
+- 🔜 **Some unrelated future idea about quantum widgets** *(HERD-77)* — nothing merged mentions this.
+
+## Recently shipped
+- ✅ **Prior work** — already done
+B
+
+# Recent fuzzy window (HERD_SWEEP_PRS_FILE) — does NOT contain #185, and matches nothing by terms.
+cat > "$T/prs-recent.tsv" <<'P'
+310	chore: bump dependency pins for the monthly refresh
+309	docs: clarify the onboarding runbook wording
+P
+# FULL merged history for the exact pass — #185 is OLD (bottom of the list, well outside the window).
+cat > "$T/prs-full.tsv" <<'P'
+310	chore: bump dependency pins for the monthly refresh
+309	docs: clarify the onboarding runbook wording
+250	feat: assorted small cleanups
+185	feat(HERD-49): reorder the prompt cache prefix so cached tokens stay contiguous
+P
+export HERD_SWEEP_PRS_FILE="$T/prs-recent.tsv"
+export HERD_SWEEP_EXACT_PRS_FILE="$T/prs-full.tsv"
+export HERD_SWEEP_COMMITS_FILE="$T/commits.tsv"   # bookkeeping/merge noise, matches nothing here
+
+out="$(bash "$SCRIPT")" || fail "exact-ref default run exited non-zero ($out)"
+printf '%s\n' "$out" | grep -q 'Add exact-ref pass before fuzzy title matching' \
+  || fail "exact pass did not surface the HERD-49 item ($out)"
+printf '%s\n' "$out" | grep -qi 'exact' \
+  || fail "exact pass did not mark the HERD-49 item as an exact-ref match ($out)"
+printf '%s\n' "$out" | grep -q 'PR #185' \
+  || fail "exact pass did not cite the OLD matching PR #185 ($out)"
+printf '%s\n' "$out" | grep -q 'HERD-49' \
+  || fail "exact pass did not name the matched tracker id HERD-49 ($out)"
+# The item with no matching PR must be left untouched.
+printf '%s\n' "$out" | grep -q 'quantum widgets' && fail "exact pass false-flagged the unmatched HERD-77 item"
+pass
+
+# ── (7) EXACT-REF --enqueue: one verify-first request citing PR #185 ───────────
+rm -f "$REQDIR"/*.txt "$JOURNAL"
+out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" --enqueue)" \
+  || fail "exact-ref --enqueue run exited non-zero ($out)"
+printf '%s\n' "$out" | grep -q 'enqueued 1 scribe reconcile request' \
+  || fail "exact --enqueue did not report enqueuing the single exact candidate ($out)"
+reqs=( "$REQDIR"/*.txt )
+[ "${#reqs[@]}" -eq 1 ] || fail "expected exactly ONE scribe request (the exact-ref item), got ${#reqs[@]}"
+REQ="${reqs[0]}"
+grep -q 'HERD-49'               "$REQ" || fail "exact request lacks the tracker id HERD-49"
+grep -q 'PR #185'              "$REQ" || fail "exact request lacks the matching PR #185"
+grep -q 'gh pr view 185'      "$REQ" || fail "exact request lacks the verify command"
+grep -qi 'VERIFY FIRST'       "$REQ" || fail "exact request lacks the verify-first rule"
+grep -q 'Edit ONLY BACKLOG.md' "$REQ" || fail "exact request lacks the edit-only guard"
+grep -q 'exact-ref match'     "$REQ" || fail "exact request should state it is an exact-ref match, not a term overlap"
+pass
+
+# ── (8) audit journal: a summary event is written on EVERY run (even a silent one) ──
+grep -q '"event":"backlog_reconcile_sweep"' "$JOURNAL" \
+  || fail "no backlog_reconcile_sweep summary event was journaled ($(cat "$JOURNAL" 2>/dev/null))"
+grep -q '"exact_hits":1' "$JOURNAL" || fail "journal summary did not record the exact hit ($(cat "$JOURNAL"))"
+# A silent 'nothing to reconcile' run must ALSO journal, so it is auditable.
+cat > "$REPO/BACKLOG.md" <<'B'
+# project backlog
+
+## Planned
+- 🔜 **A totally novel unshipped idea about quantum widgets** — nothing merged resembles this.
+B
+rm -f "$JOURNAL"
+bash "$SCRIPT" >/dev/null 2>&1 || fail "silent run exited non-zero"
+grep -q '"event":"backlog_reconcile_sweep"' "$JOURNAL" \
+  || fail "a silent run must still journal a summary event for auditability"
+grep -q '"exact_hits":0' "$JOURNAL" || fail "silent run should journal zero exact hits ($(cat "$JOURNAL"))"
+pass
+unset JOURNAL_FILE HERD_SWEEP_EXACT_PRS_FILE
+
 echo "ALL PASS ($PASS checks)"
