@@ -434,18 +434,34 @@ fleet_upgrade() { _fleet_fanout upgrade update; }
 fleet_reload()  { _fleet_fanout reload  reload; }
 
 # ── policy propagation (P4) ───────────────────────────────────────────────────
-# fleet_set <KEY> <VALUE> — propagate ONE policy across the whole fleet by delegating to each
-# registered project's own `herd config set <KEY> <VALUE>` in that project's directory (deterministic,
-# no LLM). This is the ONLY writing subcommand in the fleet layer, and even it writes NOTHING itself:
-# `herd config set` owns all validation (it rejects unknown keys against capabilities.tsv, refuses
-# DENY_PATHS / secret-shaped keys, and restarts the watcher / re-renders the skill for the keys that
-# need it), so an invalid KEY/VALUE fails PER PROJECT and is reported — never silently applied. Use it
-# to set e.g. MERGE_POLICY / a model tier / TOKEN_MODE fleet-wide in one command; the result is the
-# same per-project outcome table the upgrade/reload fan-out prints.
+# fleet_set <KEY> <VALUE>  |  fleet_set --profile <file> — propagate policy across the whole fleet by
+# delegating to each registered project's OWN validated herd command in that project's directory
+# (deterministic, no LLM). This is the ONLY writing subcommand in the fleet layer, and even it writes
+# NOTHING itself:
+#   • <KEY> <VALUE>      → `herd config set <KEY> <VALUE>` per project (rejects unknown keys against
+#                          capabilities.tsv, refuses DENY_PATHS / secret keys, restarts / re-renders).
+#   • --profile <file>   → a GOVERNANCE PROFILE (HERD-126): `herd governance apply --yes <file>` per
+#                          project, so a whole governance stance (merge / gate / PR / attribution /
+#                          commit policy) rolls out in one command. apply owns the malformed-profile
+#                          refusal and the structural secret/machine exclusion, so an invalid profile
+#                          fails PER PROJECT and is reported — never silently or partially applied.
+# The profile path is resolved to ABSOLUTE first, since the fan-out cd's into each project directory
+# before delegating. Either form prints the same per-project outcome table as upgrade/reload.
 fleet_set() {
+  case "${1:-}" in
+    --profile|--governance)
+      local file="${2:-}"
+      [ -n "$file" ] || die "usage: herd fleet set --profile <file>   (applies a governance profile across the fleet)"
+      [ -f "$file" ] || die "no such governance profile: $file"
+      local abs; abs="$(cd "$(dirname "$file")" 2>/dev/null && pwd)/$(basename "$file")"
+      [ -f "$abs" ] || die "could not resolve governance profile path: $file"
+      _fleet_fanout "governance" governance apply --yes "$abs"
+      return $?
+      ;;
+  esac
   local key="${1:-}"
   { [ -n "$key" ] && [ "$#" -ge 2 ]; } \
-    || die "usage: herd fleet set <KEY> <VALUE>   (propagates 'herd config set' across the fleet)"
+    || die "usage: herd fleet set <KEY> <VALUE>  |  herd fleet set --profile <file>"
   local value="$2"
   _fleet_fanout "set $key" config set "$key" "$value"
 }
