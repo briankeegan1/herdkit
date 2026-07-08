@@ -40,6 +40,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Runtime driver shim: under HERD_DRIVER=headless this lane spawns a DETACHED agent (no herdr tab)
 # via herd_driver_start_agent; the default herdr-claude driver keeps the herdr path below unchanged.
 . "$HERE/driver.sh"
+# Pipeline steps (HERD-132) — the shared step-runner. Sourced for steps_has_seam so the BUILDER-seam
+# rule (post-build / post-healthcheck) is threaded into the prompt below only when the project defines
+# such steps; the watcher owns the pre/post-merge seams. Sourcing DEFINES functions only (CLI dispatch
+# is $0-guarded), so this is byte-inert when .herd/steps.tsv is absent/empty.
+. "$HERE/steps.sh"
 _HERD_DRIVER_NAME="$(herd_driver_name)"
 # Force-spawn override: a leading --force/-f (or HERD_FORCE_SPAWN=1) bypasses the advisory
 # review-gate saturation check below, for urgent items. Only recognized as the FIRST arg so it can
@@ -167,6 +172,13 @@ else
   PUSH_GATE_RULE=""
 fi
 
+# Pipeline steps (HERD-132) — the BUILDER-seam rule (post-build / post-healthcheck), threaded ONLY
+# when the project defines such steps in .herd/steps.tsv (else EMPTY → prompt byte-identical). The
+# watcher runs the pre/post-merge seams itself, so they are never mentioned to the builder. Built by
+# the shared steps_builder_rule helper so both lanes inject identical text — same opt-in pattern as
+# PUSH_GATE_RULE above.
+STEPS_RULE="$(steps_builder_rule "$SLUG" "$DIR" "$HERE" "$PR_CREATE_CMD")"
+
 # Tracker linkage (HERD-39): when the coordinator spawns from a TRACKED item it prefixes the lane
 # command with HERD_ITEM_REF=<id>. When set, the LANE RULES below REQUIRE the builder to carry an
 # explicit 'Refs: <id>' line in its PR body, so merge-time reconcile (agent-watch.sh) resolves the
@@ -196,7 +208,7 @@ GROUNDING_RULE="$(herd_context_provision_preamble)"
 #    standing workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this change in this worktree. Before running '$PR_CREATE_CMD',
 run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
+warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE$STEPS_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
 If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.

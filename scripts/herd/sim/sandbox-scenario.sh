@@ -460,6 +460,221 @@ PRCMD
   fi
 fi
 
+# ── pipeline steps (HERD-132): operator-defined stages with hold/approve semantics ───────────────
+# Proves the seam the item exists for, driving the REAL steps.sh + herd-approve.sh entry points against
+# a throwaway fixture with its OWN step list (HERD_STEPS_FILE), a throwaway trees dir for the hold
+# ledger + journal, and HERD_CONFIG_FILE pointed at a non-existent path so herd-config.sh never walks up
+# into herdkit's OWN .herd/config. A fixture step list of THREE post-build steps — one blocking (on_fail
+# =block), one hold=approve, one skill:<name> — plus a 2-step block fixture. Eight assertions: (A) the
+# blocking step runs then the approve step HOLDS (the skill step has NOT run yet); (B) the hold surfaces
+# in herd-approve.sh list with the worktree path; (C) approve RELEASES + resumes, running the skill
+# step; (D) EXECUTION ORDER holds in the journal (block < approve < skill); (E) a FAILING block step
+# blocks its seam (a later step never runs); (F) an ABSENT step list is byte-identical (no journal, rc 0);
+# (G) the WATCHER-OWNED pre-merge seam: after approve, a FRESH steps_run_at pre-merge (what do_merge
+# re-runs every tick, no --resume-after) SKIPS the consumed hold (rc 0 ⇒ merge proceeds) and never
+# re-holds or re-appends an awaiting row (the #249 round-1 liveness/ledger-growth regression);
+# (H) TWO hold=approve steps at ONE sha gate INDEPENDENTLY — each holds on its own turn, approving the
+# first does NOT release the second, and the merge (rc 0) proceeds only after BOTH are approved (the
+# #249 round-2 per-sha-keying safety-rail-bypass regression).
+step pipeline-steps "steps.tsv stages — order, approve-hold + release, step_run journal, byte-identical off"
+ST_ENGINE="$HERE/.."
+if [ ! -f "$ST_ENGINE/steps.sh" ] || [ ! -f "$ST_ENGINE/herd-approve.sh" ]; then
+  checkpoint pipeline_steps_lib skip "steps.sh / herd-approve.sh not found — pipeline-steps phase skipped"
+else
+  ST_REPO="$ART/st-repo"; ST_TREES="$ART/st-trees"; mkdir -p "$ST_TREES"
+  ST_STEPS="$ART/st-steps.tsv"; ST_JN="$ART/st-journal.jsonl"; : > "$ST_JN"
+  # Build the fixture worktree the steps run against + the skill the skill-step resolves.
+  sandbox_fixture_build "$ST_REPO" >/dev/null 2>&1
+  mkdir -p "$ST_REPO/.claude/skills/demo-review"
+  # st_env <cmd…> — run a steps.sh / herd-approve.sh CLI hermetically: HERD_STEPS_FILE points at the
+  # fixture list, the ledger lives in a throwaway trees dir, the journal is redirected via JOURNAL_FILE,
+  # and HERD_CONFIG_FILE is a non-existent path so no real project config bleeds in.
+  st_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES" \
+        HERD_STEPS_FILE="$ST_STEPS" JOURNAL_FILE="$ST_JN" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  # The three-step fixture list (all post-build so ORDER is unambiguous): block → approve-HOLD → skill.
+  {
+    printf 'gate-lint\tpost-build\techo gate-lint ok\tblock\tnone\n'
+    printf 'peer-review\tpost-build\techo peer-review ran\tblock\tapprove\n'
+    printf 'doc-pass\tpost-build\tskill:demo-review\twarn\tnone\n'
+  } > "$ST_STEPS"
+
+  # (A) RUN the post-build seam. Assert: rc 20 (HELD), the block step + approve step journaled a pass,
+  #     an awaiting hold exists, and the skill step has NOT run yet (nothing proceeds past the hold).
+  _st_rc=0
+  st_env bash "$ST_ENGINE/steps.sh" run post-build --slug demo-steps --dir "$ST_REPO" >/dev/null 2>&1 || _st_rc=$?
+  _st_hold="$ST_TREES/.agent-watch-step-holds"
+  if [ "$_st_rc" -eq 20 ] \
+     && grep -q '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null \
+     && grep -q '"name":"peer-review".*"outcome":"held"' "$ST_JN" 2>/dev/null \
+     && grep -q "awaiting demo-steps" "$_st_hold" 2>/dev/null \
+     && ! grep -q '"name":"doc-pass"' "$ST_JN" 2>/dev/null; then
+    checkpoint pipeline_steps_held pass "block step ran, approve step HELD (rc 20), skill step not yet run, hold recorded"
+  else
+    checkpoint pipeline_steps_held fail "post-build seam did not hold correctly (rc=$_st_rc)"
+  fi
+
+  # (B) LIST surfaces the step-hold with the worktree path (what the human reviews).
+  ST_LIST="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
+  if printf '%s' "$ST_LIST" | grep -q 'demo-steps' \
+     && printf '%s' "$ST_LIST" | grep -q 'peer-review' \
+     && printf '%s' "$ST_LIST" | grep -q "$ST_REPO"; then
+    checkpoint pipeline_steps_listed pass "herd-approve.sh list shows the step-hold (step + worktree path)"
+  else
+    checkpoint pipeline_steps_listed fail "herd-approve.sh list did not surface the step-hold"
+  fi
+
+  # (C) APPROVE releases + resumes: the skill step now runs. Assert: released record, skill step passed,
+  #     and no live hold remains (list no longer shows demo-steps).
+  st_env bash "$ST_ENGINE/herd-approve.sh" approve demo-steps >/dev/null 2>&1
+  ST_LIST2="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
+  if grep -q "released demo-steps" "$_st_hold" 2>/dev/null \
+     && grep -q '"name":"doc-pass".*"kind":"skill".*"outcome":"pass"' "$ST_JN" 2>/dev/null \
+     && ! printf '%s' "$ST_LIST2" | grep -q 'demo-steps'; then
+    checkpoint pipeline_steps_released pass "approve released the hold and resumed: skill step ran, hold cleared"
+  else
+    checkpoint pipeline_steps_released fail "approve did not release + resume the pipeline (skill step / released record missing)"
+  fi
+
+  # (D) EXECUTION ORDER: in the journal, the block step's step_run precedes the approve step's, which
+  #     precedes the skill step's — the declared file order, honored across the hold/resume boundary.
+  _ln_gate="$(grep -n '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  _ln_peer="$(grep -n '"name":"peer-review".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  _ln_doc="$(grep -n '"name":"doc-pass".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  if [ -n "$_ln_gate" ] && [ -n "$_ln_peer" ] && [ -n "$_ln_doc" ] \
+     && [ "$_ln_gate" -lt "$_ln_peer" ] && [ "$_ln_peer" -lt "$_ln_doc" ]; then
+    checkpoint pipeline_steps_order pass "step_run journal order held: gate-lint < peer-review < doc-pass"
+  else
+    checkpoint pipeline_steps_order fail "execution order not preserved (gate=$_ln_gate peer=$_ln_peer doc=$_ln_doc)"
+  fi
+
+  # (E) FAILING block step blocks its seam: a two-step list where the first (on_fail=block) exits
+  #     non-zero must RETURN non-zero and NEVER run the second step (block ADDS a gate, never bypasses).
+  ST_STEPS_B="$ART/st-steps-block.tsv"; ST_JN_B="$ART/st-journal-block.jsonl"; : > "$ST_JN_B"
+  {
+    printf 'will-fail\tpost-build\tfalse\tblock\tnone\n'
+    printf 'must-not-run\tpost-build\techo LEAKED\tblock\tnone\n'
+  } > "$ST_STEPS_B"
+  _st_brc=0
+  env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ART/st-trees-b" \
+      HERD_STEPS_FILE="$ST_STEPS_B" JOURNAL_FILE="$ST_JN_B" NO_COLOR=1 HERD_DRIVER=headless \
+      bash "$ST_ENGINE/steps.sh" run post-build --slug demo-block --dir "$ST_REPO" >/dev/null 2>&1 || _st_brc=$?
+  if [ "$_st_brc" -eq 1 ] \
+     && grep -q '"name":"will-fail".*"outcome":"fail"' "$ST_JN_B" 2>/dev/null \
+     && ! grep -q '"name":"must-not-run"' "$ST_JN_B" 2>/dev/null; then
+    checkpoint pipeline_steps_block pass "a failing on_fail=block step blocked the seam (rc 1); the next step never ran"
+  else
+    checkpoint pipeline_steps_block fail "on_fail=block did not block correctly (rc=$_st_brc)"
+  fi
+
+  # (F) BYTE-IDENTICAL OFF: with an ABSENT step list the runner is inert — rc 0, zero journal events.
+  ST_JN_OFF="$ART/st-journal-off.jsonl"; : > "$ST_JN_OFF"
+  _st_orc=0
+  env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ART/st-trees-off" \
+      HERD_STEPS_FILE="$ART/st-absent.tsv" JOURNAL_FILE="$ST_JN_OFF" NO_COLOR=1 HERD_DRIVER=headless \
+      bash "$ST_ENGINE/steps.sh" run post-build --slug demo-off --dir "$ST_REPO" >/dev/null 2>&1 || _st_orc=$?
+  if [ "$_st_orc" -eq 0 ] && [ ! -s "$ST_JN_OFF" ]; then
+    checkpoint pipeline_steps_off pass "absent step list ⇒ byte-identical no-op (rc 0, zero journal events)"
+  else
+    checkpoint pipeline_steps_off fail "absent step list was NOT inert (rc=$_st_orc, journal bytes=$( wc -c < "$ST_JN_OFF" 2>/dev/null ))"
+  fi
+
+  # (G) WATCHER-OWNED pre-merge approve-hold — the do_merge re-tick regression (review BLOCK on PR #249).
+  #     The watcher runs `steps_run_at pre-merge` FRESH every tick with NO --resume-after (agent-watch.sh
+  #     do_merge). After a human approves a pre-merge hold=approve step, the NEXT such fresh pass MUST
+  #     recognise the released hold and SKIP past it (rc 0 ⇒ do_merge proceeds to merge) — NOT re-execute
+  #     + re-hold (rc 20) forever. It must also NOT re-append an 'awaiting' row (the ledger stays bounded
+  #     across ticks). This drives the exact seam the post-build assertions (A–D) could not: a fresh
+  #     seam re-invocation after release, which is what the watcher does — the regression's blind spot.
+  ST_STEPS_M="$ART/st-steps-merge.tsv"; ST_JN_M="$ART/st-journal-merge.jsonl"; : > "$ST_JN_M"
+  ST_TREES_M="$ART/st-trees-merge"; mkdir -p "$ST_TREES_M"
+  {
+    printf 'pre-gate\tpre-merge\techo pre-gate ok\tblock\tnone\n'
+    printf 'human-check\tpre-merge\techo human-check ran\tblock\tapprove\n'
+    printf 'post-gate\tpre-merge\techo post-gate ok\tblock\tnone\n'
+  } > "$ST_STEPS_M"
+  stm_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES_M" \
+        HERD_STEPS_FILE="$ST_STEPS_M" JOURNAL_FILE="$ST_JN_M" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  _stm_hold="$ST_TREES_M/.agent-watch-step-holds"
+  # G1: the first pre-merge pass HOLDS on human-check (rc 20).
+  _stm_rc1=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc1=$?
+  # G2: human approves (records approved + released, resumes the remaining steps in-process).
+  stm_env bash "$ST_ENGINE/herd-approve.sh" approve demo-merge >/dev/null 2>&1
+  _stm_await_before="$(grep -c 'awaiting demo-merge' "$_stm_hold" 2>/dev/null)"; _stm_await_before="${_stm_await_before:-0}"
+  # G3: the WATCHER RE-TICK — a fresh pre-merge pass from the top (no --resume-after), exactly what
+  #     do_merge runs on the next tick. MUST return 0 (the merge would now proceed).
+  _stm_rc2=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc2=$?
+  # G4: a THIRD re-tick stays byte-stable (still rc 0, still one awaiting row) — the loop + ledger growth
+  #     are both gone (before the fix rc2/rc3 were 20 and the awaiting count grew by one per tick).
+  _stm_rc3=0
+  stm_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-merge --dir "$ST_REPO" >/dev/null 2>&1 || _stm_rc3=$?
+  _stm_await_final="$(grep -c 'awaiting demo-merge' "$_stm_hold" 2>/dev/null)"; _stm_await_final="${_stm_await_final:-0}"
+  if [ "$_stm_rc1" -eq 20 ] && [ "$_stm_rc2" -eq 0 ] && [ "$_stm_rc3" -eq 0 ] \
+     && [ "$_stm_await_before" = "1" ] && [ "$_stm_await_final" = "1" ]; then
+    checkpoint pipeline_steps_merge_resume pass "approved pre-merge hold is CONSUMED: watcher re-tick returns 0 (merge proceeds), ledger stays at 1 awaiting row (bounded)"
+  else
+    checkpoint pipeline_steps_merge_resume fail "approved pre-merge hold not consumed by the watcher re-tick (rc1=$_stm_rc1 rc2=$_stm_rc2 rc3=$_stm_rc3 awaiting before/final=$_stm_await_before/$_stm_await_final)"
+  fi
+
+  # (H) TWO hold=approve steps at ONE sha gate INDEPENDENTLY — the per-sha-keying safety-rail-bypass
+  #     regression (review BLOCK on PR #249, round 2). Records keyed by (slug,sha) alone meant approving
+  #     step 1 consumed the sha's record so step 2's hold silently never fired — a merge that skips a
+  #     configured human gate. With per-(slug,sha,step) keying each approve-step must be approved on its
+  #     own. Fixture: two pre-merge hold=approve steps (check-a, check-b) around a final plain step.
+  ST_STEPS_2="$ART/st-steps-two.tsv"; ST_JN_2="$ART/st-journal-two.jsonl"; : > "$ST_JN_2"
+  ST_TREES_2="$ART/st-trees-two"; mkdir -p "$ST_TREES_2"
+  {
+    printf 'check-a\tpre-merge\techo check-a ran\tblock\tapprove\n'
+    printf 'check-b\tpre-merge\techo check-b ran\tblock\tapprove\n'
+    printf 'final-gate\tpre-merge\techo final-gate ok\tblock\tnone\n'
+  } > "$ST_STEPS_2"
+  st2_env() {
+    env HERD_CONFIG_FILE="$ART/.st-no-config" PROJECT_ROOT="$ST_REPO" WORKTREES_DIR="$ST_TREES_2" \
+        HERD_STEPS_FILE="$ST_STEPS_2" JOURNAL_FILE="$ST_JN_2" NO_COLOR=1 HERD_DRIVER=headless "$@"
+  }
+  _st2_hold="$ST_TREES_2/.agent-watch-step-holds"
+  _st2_ok=1
+  # H1: first pass HOLDS on check-a (rc 20); check-b has NOT held yet (independent, sequential).
+  _st2_rc1=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc1=$?
+  [ "$_st2_rc1" -eq 20 ] || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-a$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-b$' "$_st2_hold" 2>/dev/null && _st2_ok=0   # check-b must NOT be holding yet
+  # H2: approve check-a. It RELEASES check-a and resumes → check-b now HOLDS. Approving one must NOT
+  #     release the other: check-a released, check-b awaiting-but-NOT-released.
+  st2_env bash "$ST_ENGINE/herd-approve.sh" approve demo-two >/dev/null 2>&1
+  grep -q 'released demo-two .* check-a$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'awaiting demo-two .* check-b$'  "$_st2_hold" 2>/dev/null || _st2_ok=0
+  grep -q 'released demo-two .* check-b$'  "$_st2_hold" 2>/dev/null && _st2_ok=0   # check-b NOT released by approving check-a
+  # H3: the WATCHER RE-TICK (fresh pre-merge, no --resume-after) MUST still HOLD on check-b (rc 20) —
+  #     the merge does NOT proceed while a second gate is unapproved (before the fix this returned 0 and
+  #     the merge bypassed check-b).
+  _st2_rc2=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc2=$?
+  [ "$_st2_rc2" -eq 20 ] || _st2_ok=0
+  # H4: approve check-b, then a fresh pre-merge pass returns 0 — BOTH gates cleared, merge proceeds, and
+  #     final-gate (the plain step after both holds) ran.
+  st2_env bash "$ST_ENGINE/herd-approve.sh" approve demo-two >/dev/null 2>&1
+  grep -q 'released demo-two .* check-b$' "$_st2_hold" 2>/dev/null || _st2_ok=0
+  _st2_rc3=0
+  st2_env bash "$ST_ENGINE/steps.sh" run pre-merge --slug demo-two --dir "$ST_REPO" >/dev/null 2>&1 || _st2_rc3=$?
+  [ "$_st2_rc3" -eq 0 ] || _st2_ok=0
+  grep -q '"name":"final-gate".*"outcome":"pass"' "$ST_JN_2" 2>/dev/null || _st2_ok=0
+  # Ledger stays bounded: exactly one awaiting row per step (two total), no per-tick growth.
+  _st2_await_ct="$(grep -c 'awaiting demo-two' "$_st2_hold" 2>/dev/null)"; _st2_await_ct="${_st2_await_ct:-0}"
+  [ "$_st2_await_ct" = "2" ] || _st2_ok=0
+  if [ "$_st2_ok" -eq 1 ]; then
+    checkpoint pipeline_steps_two_approve pass "two hold=approve steps gate independently: approving check-a does NOT release check-b; merge proceeds (rc 0) only after BOTH approved; ledger bounded (2 awaiting rows)"
+  else
+    checkpoint pipeline_steps_two_approve fail "independent double-approve gate failed (rc1=$_st2_rc1 rc2=$_st2_rc2 rc3=$_st2_rc3 awaiting_ct=$_st2_await_ct)"
+  fi
+fi
+
 # ── scorecard ───────────────────────────────────────────────────────────────────
 RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT" "$FIXTURE_SHA")"
