@@ -87,6 +87,19 @@ allow_reason() {
 tests=()
 if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
   MODE="curated"
+  # PARSE GUARD (HERD-172): curated mode only greps test-*.sh NAMES out of herd.bats and runs them
+  # DIRECTLY — it never parses herd.bats AS bats. So a bats PARSE error (an unclosed / merged @test
+  # block) is invisible here and only dies later in the full-suite health gate; that is exactly how a
+  # corrupted herd.bats once rode a green CI. Reject it cheaply. A raw .bats file is NOT valid bash
+  # (its bare `}` close a `{` that bash never saw in command position), so approximate bats's own
+  # transform — rewrite each `@test "…" {` header into a function opener — then `bash -n` the result.
+  # A block left unclosed leaves an unbalanced brace, which surfaces as an EOF syntax error: fail CI
+  # here instead of silently skipping. Well-formed @tests transform to balanced functions and pass.
+  if ! sed -E 's/^[[:space:]]*@test[[:space:]].*\{[[:space:]]*$/__herd_bats_test() {/' "$CURATED_SRC" | bash -n 2>/dev/null; then
+    echo "❌ $CURATED_SRC does not parse as bats (unclosed / merged @test block) — the full-suite health gate would die on it." >&2
+    echo "   Reproduce:  sed -E 's/^[[:space:]]*@test .*\\{\$/f() {/' \"$CURATED_SRC\" | bash -n" >&2
+    exit 2
+  fi
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$TESTS_DIR/$f" ] && tests+=("$TESTS_DIR/$f")
   done < <(grep -oE 'test-[a-z0-9-]+\.sh' "$CURATED_SRC" | sort -u)

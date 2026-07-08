@@ -345,8 +345,16 @@ setup() {
 
 @test "hermetic stale-duplicate gate (HERD-188) unit test passes" {
   run bash "$REPO/tests/test-stale-dup-detect.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
   run bash "$REPO/tests/test-watcher-discovery-scope.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
   run bash "$REPO/tests/test-triggers.sh"
   [ "$status" -eq 0 ]
