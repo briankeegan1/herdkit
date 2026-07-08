@@ -450,6 +450,23 @@ build_spawn_holds() {
   [ -n "$rows" ] && SPAWN_HOLDS="$rows"
 }
 
+# build_main_health — the post-merge main-health ALARM row (HERD-129). One LOUD persistent red line
+# while the default branch is red, read from $MAIN_HEALTH_STATE ("<sha> <since_pr> <failing test…>",
+# written by _main_health_set_red and cleared by _main_health_clear). Empty (MAIN_HEALTH="") when the
+# file is absent — so a green main renders NOTHING. Also GATED on the lever: if an operator flips
+# MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no tick is left to
+# clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature whenever the
+# feature is off, red state file or not.
+build_main_health() {
+  MAIN_HEALTH=""
+  _main_health_enabled || return 0
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0
+  local _bm_sha _bm_since _bm_fail
+  read -r _bm_sha _bm_since _bm_fail < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  [ -n "${_bm_fail:-}" ] || _bm_fail="unknown"
+  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(since #${_bm_since})${C_RESET}"$'\n'
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -464,6 +481,11 @@ _fmt_age() {
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # Post-merge main-health ALARM (HERD-129) — pinned at the TOP so a red default branch is the first
+  # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
+  if [ -n "${MAIN_HEALTH:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH}"$'\n'
+  fi
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
   if [ -n "${BLOCKED:-}" ]; then
     frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
@@ -1728,6 +1750,119 @@ _reap_slug() {
   return 0
 }
 
+# ── Post-merge main-health tick (HERD-129) ─────────────────────────────────────────────────────────
+# Catch a RED default branch AT MERGE TIME. The pre-merge health gate proves each PR green in
+# ISOLATION, but two independently-green PRs can merge into a broken COMBINATION — the #226 advise
+# exit-code collision (2026-07-08) left main red ~2h, found only when later unrelated PRs #238/#239
+# inherited the failure. So after every merge we run the healthcheck suite against the freshly ff'd
+# default-branch HEAD and, on a reproduced red, raise a LOUD persistent 'MAIN RED' console row +
+# notification — cleared the moment a later sha goes green.
+#
+# This is an ALARM, never a gate: it runs AFTER the merge has landed and never blocks, reverts, or
+# re-merges anything (mirrors the 2b/2c codemap/symbol-index hooks' best-effort posture). Gated by
+# MAIN_HEALTH_TICK (default off) → byte-inert when unset: no suite, no journal, no state file, so
+# build_main_health finds nothing and the console renders byte-identically. Fully fail-soft: a suite
+# that cannot even run (no HEAD, no slot, no bin) journals an infra_event and never paints a red row,
+# and a tab-leak-guard trip is treated as the same transient the pre-merge gate already tolerates.
+MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"   # one line while RED: "<sha> <since_pr> <failing test…>"
+
+# _main_health_enabled — true iff MAIN_HEALTH_TICK opts in. Default OFF (the inverse of the
+# CODEMAP_AUTOREFRESH default-on lever); any unrecognized value reads as off (fail toward dormant).
+_main_health_enabled() {
+  case "$(printf '%s' "${MAIN_HEALTH_TICK:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _main_health_marker <sha> — the per-sha run-once marker (mirrors the sha-keyed .health-result cache):
+# a main sha whose marker exists has ALREADY been ticked, so a re-entrant merge tick / watcher restart
+# never re-runs the suite for the same commit.
+_main_health_marker() { printf '%s' "$TREES/.main-health-$1"; }
+
+# WHY the tick is ALWAYS heavy (never light) — a review-caught correctness trap. The 'light' profile
+# derives its file set from healthcheck.sh's `git diff --name-only $DEFAULT_BRANCH` run INSIDE the dir
+# it checks; against $MAIN — which IS the default-branch checkout — that diff is EMPTY, so light checks
+# ZERO files and returns a vacuous rc-0 ("✅ light clean — 0 sh, 0 py ok") no matter what state main is
+# actually in. Routing that vacuous rc-0 to _main_health_clear would WIPE a real MAIN RED and fire a
+# false 'recovered' the next time a docs/BACKLOG/config merge (any diff not matching
+# HEALTHCHECK_HEAVY_GLOB) landed. A light subset is categorically meaningless on a zero-diff tree, so a
+# main-health tick must run the FULL suite every time: we pass --heavy unconditionally. (For a project
+# with no HEALTHCHECK_CMD, healthcheck.sh's --heavy falls back to light anyway — but such a project
+# also never paints red, so there is nothing to falsely clear.)
+
+# _main_health_clear <pr#> <sha> — a main sha went GREEN. Drop any standing red state (which removes
+# the console row), journal the green result, and on a RED→green TRANSITION notify recovery once.
+_main_health_clear() {
+  local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0
+  [ -s "$MAIN_HEALTH_STATE" ] && _mc_wasred=1
+  rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
+  if [ "$_mc_wasred" -eq 1 ]; then
+    herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
+  fi
+}
+
+# _main_health_set_red <pr#> <sha> <healthcheck-oneline> — a main sha REPRODUCED a red. Persist the
+# red state (which drives the console row), journal the failing test via the HERD-76 identity
+# extraction, and notify ONCE on the green→red transition. The 'since #N' PR is STICKY: if main was
+# already red, keep the FIRST offending PR so a run of red merges all point back to where main broke.
+_main_health_set_red() {
+  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_fail _sr_since _sr_wasred=0 _sr_pv_sha _sr_pv_since _sr_rest
+  _sr_fail="$(_health_fail_identity "$_sr_out")"
+  [ -n "$_sr_fail" ] || _sr_fail="$_sr_out"
+  _sr_since="$_sr_pr"
+  if [ -s "$MAIN_HEALTH_STATE" ]; then
+    _sr_wasred=1
+    read -r _sr_pv_sha _sr_pv_since _sr_rest < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+    [ -n "${_sr_pv_since:-}" ] && _sr_since="$_sr_pv_since"
+  fi
+  printf '%s %s %s\n' "$_sr_sha" "$_sr_since" "$_sr_fail" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_fail" since "$_sr_since"
+  if [ "$_sr_wasred" -eq 0 ]; then
+    herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_fail} (since #${_sr_since})" default
+  fi
+}
+
+# main_health_tick <pr#> — the post-merge hook (called from do_merge). Runs the healthcheck suite
+# against the current default-branch HEAD ONCE per sha and routes the outcome to _main_health_clear /
+# _main_health_set_red. Byte-inert when disabled; ALWAYS returns 0 (an alarm can never fail a merge).
+main_health_tick() {
+  _main_health_enabled || return 0
+  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_out _mh_rc
+  _mh_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_mh_sha" ] || { journal_append main_health pr "$_mh_pr" result infra_event reason no-head; return 0; }
+  _mh_marker="$(_main_health_marker "$_mh_sha")"
+  [ -e "$_mh_marker" ] && return 0                        # this main sha already ticked — run ONCE
+  # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared mutex (all
+  # worktrees + $MAIN share one git object store, so overlapping suites race on .git locks and paint
+  # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so a later
+  # merge tick re-attempts it; never run an overlapping suite.
+  _health_slot_free || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-slot; return 0; }
+  [ -f "$HERD_HEALTHCHECK_BIN" ] || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-bin; return 0; }
+  _health_acquire "main-$_mh_sha"
+  # ALWAYS --heavy: a 'light' check against $MAIN is a zero-file vacuous green (see the note above), so
+  # it could silently CLEAR a real MAIN RED. The full suite is the only meaningful main-health check.
+  _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
+  # RETRY-BEFORE-RED: a lone rc-1 may be transient cross-worktree git-lock contention — the exact
+  # false-red the pre-merge gate's solo retry defends against. Re-run once, still holding the mutex.
+  if [ "$_mh_rc" -eq 1 ]; then
+    _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
+  fi
+  _health_release "main-$_mh_sha"
+  : > "$_mh_marker" 2>/dev/null || true                   # the suite ran against this sha — mark run-once
+  case "$_mh_rc" in
+    0) _main_health_clear "$_mh_pr" "$_mh_sha" ;;          # clean (or tolerated data/env) → green
+    1) case "$_mh_out" in
+         *tab-leak-guard*)                                 # transient control-room churn, NOT a code bug (issue #78)
+           journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason tab-leak-guard ;;
+         *) _main_health_set_red "$_mh_pr" "$_mh_sha" "$_mh_out" ;;
+       esac ;;
+    *) journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason "rc-$_mh_rc" ;;
+  esac
+  return 0
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -1771,6 +1906,11 @@ do_merge() {
   # 2c) POST-MERGE symbol-index refresh: same posture as 2b but for the function-level def→caller
   #     index (docs/symbol-index.md). Shares the CODEMAP_AUTOREFRESH lever; fully fail-soft.
   refresh_symbol_index "$dp"
+  # 2d) POST-MERGE main-health tick (HERD-129): run the healthcheck suite against the freshly ff'd
+  #     default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into
+  #     a broken combination). Gated by MAIN_HEALTH_TICK (default off → byte-inert). An ALARM only:
+  #     fully fail-soft, never blocks/reverts/re-merges — like 2b/2c it can never fail the merge.
+  main_health_tick "$dp"
   # 3+4) IDEMPOTENT teardown (the WATCHER's job — sub-agents NEVER self-close): force-remove the
   #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
   #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup
@@ -4137,6 +4277,7 @@ while true; do
   build_blocked
   build_tracker_drift
   build_spawn_holds
+  build_main_health
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
