@@ -205,6 +205,18 @@ RECONCILE_STATE="$TREES/.agent-watch-reconciled"
 # ONCE per sha instead of every tick (the console row itself is re-rendered every tick from the live
 # re-check). Keyed by pr+sha like the review/health ledgers, so a new commit re-evaluates fresh.
 STALE_DUP_STATE="$TREES/.agent-watch-stale-dup"
+# herd/gates commit-status ledger (HERD-194): one line "<epoch> <pr#> <sha> <conclusion>" per commit
+# STATUS this watcher successfully POSTED, conclusion ∈ pending | success | failure. Keyed by
+# pr+sha+conclusion (mirroring the review/health once-per-sha ledgers) so each (pr,sha,conclusion)
+# posts EXACTLY ONCE — the GitHub Statuses API is itself idempotent per (sha,context), but this ledger
+# stops us re-POSTing (a network write) on every 4 s tick. A row is written ONLY after the API write
+# succeeds, so a transient failure re-tries next tick (fail-safe: the status MUST land, since its
+# ABSENCE is exactly what keeps a PR unmergeable under `require herd/gates` branch protection).
+GATE_STATUS_STATE="$TREES/.agent-watch-gate-status"
+# The commit-status context the watcher posts + the operator requires in branch protection. Kept as a
+# constant (not a config key) so the protection recipe in docs/governance-gates.md and the watcher can
+# never drift apart — the whole fail-safe rests on both naming the SAME context.
+GATE_STATUS_CONTEXT="herd/gates"
 # Tracker-state self-heal surfaces (HERD-86). The periodic tracker-state sweep (tracker-state-sweep.sh)
 # re-asserts Done for a recently-merged PR whose tracker item drifted (stuck open after merge — the
 # HERD-67/HERD-69 incidents). TRACKER_SWEEP_LEDGER records refs already confirmed Done so the sweep
@@ -1724,6 +1736,78 @@ _review_gate_step() {
   echo RUNNING
 }
 
+# ── herd/gates commit status (HERD-194) ──────────────────────────────────────────────────────────
+# The watcher is the ONLY thing that runs the gates (healthcheck + adversarial review). When it clears
+# a (pr,sha) it posts a `herd/gates` commit status; the operator wires `require herd/gates` into
+# GitHub branch protection (recipe: docs/governance-gates.md). That makes the gate FAIL-SAFE across
+# seats and collaborators: anyone MAY merge, but nothing UNGATED can — the status is posted ONLY by a
+# watcher that actually ran the gates, so its ABSENCE (no watcher blessed this commit) leaves the PR
+# unmergeable under protection. --match-head-commit in do_merge stays as the belt-and-suspenders guard.
+#
+# State machine per (pr,sha): pending (gates dispatched) → success (both gates green) | failure
+# (reproduced healthcheck CODEERROR, or a review BLOCK). Each conclusion posts EXACTLY ONCE (sha-keyed
+# $GATE_STATUS_STATE ledger), and the whole surface is best-effort + fail-soft — every helper returns 0
+# and never breaks the gate loop.
+
+# _gate_status_enabled — master lever. GATE_STATUS=off disables posting entirely (byte-inert: no read,
+# no post, no ledger); any other value (default) → on. Mirrors STALE_DUP_DETECT's on|off shape.
+_gate_status_enabled() { [ "${GATE_STATUS:-on}" != "off" ]; }
+
+# _gate_status_posted <pr#> <sha> <conclusion> — true if THIS watcher already recorded a successful
+# post of this exact (pr,sha,conclusion). The at-most-once guard for the network write.
+_gate_status_posted() {
+  [ -s "$GATE_STATUS_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" -v c="$3" '$2==p && $3==s && $4==c{f=1} END{exit f?0:1}' "$GATE_STATUS_STATE" 2>/dev/null
+}
+
+# _record_gate_status <pr#> <sha> <conclusion> — append one ledger row (only after a successful post).
+_record_gate_status() {
+  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$GATE_STATUS_STATE"
+}
+
+# _gate_status_desc <conclusion> — the default human-facing description shown on the GitHub check row.
+_gate_status_desc() {
+  case "$1" in
+    pending) printf 'herd watch is running the gates (healthcheck + review)' ;;
+    success) printf 'healthcheck + adversarial review passed' ;;
+    failure) printf 'a gate failed — see the PR for the healthcheck/review finding' ;;
+    *)       printf 'herd/gates' ;;
+  esac
+}
+
+# post_gate_status <pr#> <sha> <conclusion> [description] — post the herd/gates commit status for this
+# (pr,sha) via the GitHub Statuses API, at most ONCE per (pr,sha,conclusion). conclusion maps 1:1 to
+# the API `state`: pending | success | failure. No-op when GATE_STATUS=off, the sha is empty, the
+# conclusion is unrecognized, or this conclusion was already posted. Under --dry-run it is a pure
+# no-op (no network, no ledger). The ledger row is written ONLY on a successful API write, so a failed
+# post re-tries next tick — the status MUST land for the fail-safe to hold. Always returns 0.
+post_gate_status() {
+  local pr="$1" sha="$2" state="$3" desc="${4:-}"
+  _gate_status_enabled || return 0
+  [ -n "$sha" ] || return 0
+  case "$state" in pending|success|failure) ;; *) return 0 ;; esac
+  _gate_status_posted "$pr" "$sha" "$state" && return 0
+  [ -n "$DRYRUN" ] && return 0
+  [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
+  if gh api "repos/{owner}/{repo}/statuses/$sha" -f state="$state" -f context="$GATE_STATUS_CONTEXT" -f description="$desc" >/dev/null 2>&1; then
+    _record_gate_status "$pr" "$sha" "$state"
+    journal_append gate_status pr "$pr" sha "$sha" state "$state" context "$GATE_STATUS_CONTEXT"
+  fi
+  return 0
+}
+
+# _gate_status_blessed <sha> — true if the head sha ALREADY carries a herd/gates=success commit status
+# (posted by THIS seat or another operator's watcher). Reads the live GitHub statuses for the sha; the
+# /statuses list is newest-first, so the [0] of the herd/gates-context entries is the current state.
+# Fail-soft: empty sha, offline gh, or no such status → false (not blessed) so the gates run normally.
+_gate_status_blessed() {
+  local sha="$1" state
+  [ -n "$sha" ] || return 1
+  state="$(gh api "repos/{owner}/{repo}/commits/$sha/statuses" \
+             --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0].state" 2>/dev/null || true)"
+  [ "$state" = "success" ]
+}
+
 # ── Parallel gate dispatch (GATE_DISPATCH, HERD-73) ──────────────────────────────────────────────
 # _gate_dispatch_mode — resolve GATE_DISPATCH to "serial" | "parallel". Unknown/empty → serial, so
 # the default (and any typo) preserves today's EXACT serial behavior — the review dispatches only
@@ -3116,6 +3200,11 @@ _handle_block_verdict() {
   local _hbv_sl _hbv_pn _hbv_live
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
+
+  # herd/gates → failure (HERD-194). A BLOCK verdict is a hard review-gate fail; post it once per sha
+  # (ledger-deduped) at this single BLOCK choke point, so the PR is unmergeable under branch protection
+  # even while an auto-refix bounce is in flight. A later PASS on a NEW sha posts a fresh success.
+  post_gate_status "$_hbv_pr" "$_hbv_sha" failure "review: BLOCK"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
     # HARDENING (HERD-155 F5): NEVER pane-run a re-task prompt into a LIMIT-PARKED builder. A builder
@@ -5609,6 +5698,25 @@ EOF
       *) : ;;
     esac
 
+    # CROSS-SEAT GATE DEDUP (HERD-194). BEFORE dispatching our own (expensive) gates, check whether the
+    # head sha already carries a herd/gates=success status posted by ANOTHER operator's watcher — the
+    # multi-op audit's "don't both run the gates on a shared PR". Team mode only (WATCHER_SCOPE=all): in
+    # the solo default no other seat sees this PR, so no per-tick status read runs (byte-inert). Our OWN
+    # blessing (already in $GATE_STATUS_STATE) never triggers this — we posted it, so we fall through to
+    # our merge path. A sha another seat has blessed is theirs to gate + merge; we skip it this tick.
+    if _gate_status_enabled && _watcher_team_mode \
+       && ! _gate_status_posted "$prnum" "$candsha" success \
+       && _gate_status_blessed "$candsha"; then
+      DISPLAY[idx]="    ${C_DIM}🤝${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}gates blessed by another seat — skipping${C_RESET}"
+      render
+      continue
+    fi
+
+    # herd/gates → pending (HERD-194): we are about to run the gates for this (pr,sha). Post the pending
+    # status once per sha so a watcher-in-progress is visible on the PR (and so branch protection shows
+    # the required check as pending, not missing). Fail-soft + at-most-once via $GATE_STATUS_STATE.
+    post_gate_status "$prnum" "$candsha" pending
+
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
     # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap
     # instead of running serially (review only after health lands). Byte-inert under the default serial
@@ -5627,7 +5735,11 @@ EOF
     case "$_HC_RESULT" in
       CLEAN|FLAKY) : ;;            # passed (clean, tolerated data/env, or flaky-then-passed) → gate on
       QUEUED)      continue ;;     # slot busy — re-evaluate next tick, do NOT merge
-      CODEERROR|*) continue ;;     # reproduced code error (red) — held for a human, do NOT merge
+      CODEERROR)                   # reproduced code error (red) — held for a human, do NOT merge
+        # herd/gates → failure (HERD-194): a REPRODUCED healthcheck code error is a hard gate fail.
+        post_gate_status "$prnum" "$candsha" failure "healthcheck: reproduced code error"
+        continue ;;
+      *) continue ;;              # unknown/empty result — hold, do NOT merge (no status either way)
     esac
 
     if [ -n "$DRYRUN" ]; then
@@ -5766,6 +5878,14 @@ This PR appears to re-implement already-shipped work, or sits on a base stale en
           continue ;;
       esac
     fi
+    # herd/gates → success (HERD-194). Both gates are now green for this (pr,sha): the healthcheck
+    # passed above (CLEAN/FLAKY) and the review verdict is PASS. Post the success status BEFORE the
+    # merge-policy decision below — the blessing reflects the GATE outcome, independent of any
+    # approve/observe/human-verify HOLD (a hold is a merge-policy choice, not a gate failure), and it
+    # must be on the head sha before do_merge so the watcher's own `gh pr merge` clears branch
+    # protection. Once per sha via the ledger; a new commit re-runs the gates and posts afresh.
+    post_gate_status "$prnum" "$rsha" success
+
     # PASS (just now, or recorded for this sha) → proceed based on the effective merge policy AND,
     # in auto mode, whether this specific PR declares a HUMAN-VERIFY block (which converts it to an
     # approve-style hold on top of auto). The parse only runs in auto mode (a body fetch per PASS

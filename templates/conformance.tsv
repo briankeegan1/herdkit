@@ -194,6 +194,7 @@ HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
+GATE_STATUS	unit	tests/test-gate-status.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
