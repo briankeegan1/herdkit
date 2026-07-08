@@ -73,6 +73,11 @@ run() {
         *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"},{"id":"cmt_other","body":"an unrelated comment"}]}}]}}}' ;;
         *"comments { nodes { body } }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]}},{"identifier":"ENG-9","comments":{"nodes":[{"body":"just a regular note"}]}}]}}}' ;;
         *commentDelete*)    echo '{"data":{"commentDelete":{"success":true}}}' ;;
+        # HERD-184 operator-inbox reader: viewer id + per-issue comments with author + id. Must precede
+        # the generic issues( fallthrough. The comment set mixes a cross-operator comment, the viewer's
+        # OWN comment (must be excluded), and a 📌 planned marker (must be skipped).
+        *"viewer { id }"*)  echo '{"data":{"viewer":{"id":"me_viewer"}}}' ;;
+        *"comments(first: 50)"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"id":"cin_1","body":"please rebase before we merge","user":{"id":"other_op","name":"Dana"}},{"id":"cin_self","body":"my own note","user":{"id":"me_viewer","name":"Me"}},{"id":"cin_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]","user":{"id":"other_op","name":"Dana"}}]}}]}}}' ;;
         *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7"}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
@@ -463,6 +468,19 @@ echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($u
 grep -q "commentDelete" "$GQLLOG" || fail "unqueue_item did not delete the marker via commentDelete"
 grep -q '"id": "cmt_mark"' "$GQLLOG" || fail "unqueue_item did not target the 📌 marker comment (cmt_mark)"
 grep -q '"id": "cmt_other"' "$GQLLOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
+pass
+
+# 8d-inbox. HERD-184 list_inbox_comments → reads comments on issues assigned to the viewer (isMe) and
+#     prints ONE TSV line ("#<id>\t<author>\t<comment-id>\t<snippet>") per comment by ANOTHER operator,
+#     excluding the viewer's OWN comment (cin_self) and the 📌 planned marker (cin_mark).
+: > "$GQLLOG"
+ic="$(run _backend_list_inbox_comments)"
+grep -q 'assignee: { isMe: { eq: true }' "$GQLLOG" || fail "list_inbox_comments did not scope to the viewer's own assigned items"
+grep -q "comments(first: 50)" "$GQLLOG" || fail "list_inbox_comments did not request per-issue comments with author + id"
+echo "$ic" | grep -q "^#ENG-7${TAB}Dana${TAB}cin_1${TAB}please rebase before we merge$" \
+  || fail "list_inbox_comments did not emit the cross-operator comment TSV ($ic)"
+echo "$ic" | grep -q "cin_self" && fail "list_inbox_comments surfaced the viewer's OWN comment ($ic)"
+echo "$ic" | grep -q "cin_mark" && fail "list_inbox_comments surfaced a 📌 planned marker ($ic)"
 pass
 
 # 8e. HERD-85 attribution — a queue write journals ONE tracker_write with requested 'queued' and the

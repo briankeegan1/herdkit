@@ -307,6 +307,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic operator inbox (HERD-184) unit test passes" {
+  run bash "$REPO/tests/test-operator-inbox.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 
 @test "hermetic connector seams edges (HERD-170) test passes" {
   run bash "$REPO/tests/test-connector-seams.sh"

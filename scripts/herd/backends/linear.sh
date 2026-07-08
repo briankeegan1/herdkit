@@ -822,3 +822,71 @@ for n in nodes:
         if m:
             print("#%s\t%s\t%s\t%s" % (ident, m.group(1).strip(), m.group(2).strip(), m.group(3)))' 2>/dev/null || true
 }
+
+# ── Operator-inbox comment reader (HERD-184) — OPTIONAL, cross-backend contract addition ─────────────
+# _backend_list_inbox_comments — print every comment left by ANOTHER operator on an issue THIS seat
+# claimed (assigned to the API key's own viewer), one TAB-separated line each:
+#   #<identifier>\t<author>\t<comment-id>\t<snippet>
+# The TRACKER half of the operator inbox: an autonomous coordinator polls this each inbox tick and
+# surfaces new comments (deduped by <comment-id>) as inbox entries — the cross-seat "reply on my item"
+# channel the engine never read before. This is BACKEND-OPTIONAL: only linear implements it; file/
+# github/jira have no such op, so the watcher's `command -v _backend_list_inbox_comments` probe finds
+# nothing and the tracker feed is simply EMPTY (fail-soft, never an error).
+#
+# Scope + filtering, all done so the reader never has to know Linear's shape:
+#   • issues assigned to the viewer (assignee.isMe) that are not completed/canceled — "items I claimed",
+#     the same not-done set _backend_list_open uses; LINEAR_TEAM_ID narrows it exactly like list_open.
+#   • comments whose author is NOT the viewer (my own replies are not inbound mail).
+#   • the 📌 planned-work markers (_LINEAR_QUEUE_MARK_RE) are skipped — they are plan-time bookkeeping,
+#     not a human message, and already have their own surface (herd backlog queued).
+# The snippet is whitespace-flattened (tabs/newlines → spaces so the TSV shape can never be corrupted)
+# and capped at 200 chars. Author names are flattened the same way. Fail-soft: any transport/parse
+# error prints nothing and returns 0.
+_backend_list_inbox_comments() {
+    _linear_require_key
+    local viewer_id query vars
+    viewer_id="$(_linear_gql 'query { viewer { id } }' | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print(((d.get("data") or {}).get("viewer") or {}).get("id") or "")' 2>/dev/null)"
+    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
+        query='query L($team: ID!) {
+  issues(filter: { assignee: { isMe: { eq: true } }, state: { type: { nin: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 100) {
+    nodes { identifier comments(first: 50) { nodes { id body user { id name } } } }
+  }
+}'
+        vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
+print(json.dumps({"team": os.environ["TEAM"]}))')"
+    else
+        query='query {
+  issues(filter: { assignee: { isMe: { eq: true } }, state: { type: { nin: ["completed", "canceled"] } } }, first: 100) {
+    nodes { identifier comments(first: 50) { nodes { id body user { id name } } } }
+  }
+}'
+        vars=""
+    fi
+    _linear_gql "$query" "$vars" | VIEWER="$viewer_id" RE="$_LINEAR_QUEUE_MARK_RE" python3 -c 'import sys, json, os, re
+rx = re.compile(os.environ.get("RE") or r"(?!)")
+viewer = os.environ.get("VIEWER") or ""
+def flat(s):
+    return " ".join((s or "").split())
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+for n in nodes:
+    ident = n.get("identifier", "")
+    for c in (((n.get("comments") or {}).get("nodes")) or []):
+        body = c.get("body") or ""
+        if rx.search(body):
+            continue
+        u = c.get("user") or {}
+        if viewer and (u.get("id") or "") == viewer:
+            continue
+        cid = c.get("id") or ""
+        if not cid:
+            continue
+        snip = flat(body)
+        if len(snip) > 200:
+            snip = snip[:199].rstrip() + "…"
+        print("#%s\t%s\t%s\t%s" % (ident, flat(u.get("name") or "operator"), cid, snip))' 2>/dev/null || true
+}

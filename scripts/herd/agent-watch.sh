@@ -222,6 +222,18 @@ SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
 # Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
 # DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
+# Operator-inbox surfaces (HERD-184). Two files, both under $TREES, both untouched when OPERATOR_INBOX
+# is off (byte-inert):
+#   • INBOX_LEDGER — one TAB-separated entry per surfaced cross-seat comment
+#     ("<epoch>\t<source>\t<ref>\t<author>\t<snippet>", source ∈ pr|tracker), appended by _inbox_scan
+#     and rendered newest-first by build_operator_inbox. Capped to the most recent entries so it can
+#     never grow unbounded.
+#   • INBOX_SEEN_STATE — the DEDUP ledger of comment ids already surfaced ("pr:<id>" / "tr:<id>", one
+#     per line) so each comment lands in the inbox AND notifies exactly ONCE, not every scan tick.
+INBOX_LEDGER="$TREES/.agent-watch-inbox"
+INBOX_SEEN_STATE="$TREES/.agent-watch-inbox-seen"
+INBOX_LEDGER_MAX=50    # most-recent entries kept in the ledger
+INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounded)
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -290,6 +302,7 @@ LANDED=""
 BLOCKED=""
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
+OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -577,6 +590,180 @@ build_pasture() {
   PASTURE="  ${C_DIM}pasture${C_RESET}  ${glyphs% }"$'\n'
 }
 
+# ── Operator inbox (HERD-184) ─────────────────────────────────────────────────────────────────────
+# Cross-seat coordination messages were being left as PR/tracker comments, but NO engine feature read
+# incoming comments — so an autonomous coordinator never saw a "don't self-merge, main broke" reply.
+# This ADDITIVE reader surfaces NEW comments by OTHER authors as a needs-you-adjacent console section
+# plus one notify-once per comment. TWO feeds, one surface:
+#   (1) PR-COMMENT feed — new comments by non-self authors on the open PRs this seat authors/gates
+#       (the tick's ALREADY-FETCHED PR set — the core tick's `gh pr list --json` fields are unchanged;
+#       comments are pulled by a SEPARATE, gated `gh pr view --json comments`, only when enabled).
+#   (2) TRACKER feed — new comments by other operators on items this seat claimed, via the active
+#       backend's OPTIONAL _backend_list_inbox_comments op (linear only; absent elsewhere → feed empty).
+# CONTRACT: default-off / ship-dormant, fail-soft (a missing reader / api error / no creds = empty
+# inbox, never a red row), byte-identical when off. It is DISPLAY + NOTIFY only — it never touches the
+# gate loop or a merge decision. _inbox_scan does the (gated, interval-throttled) fetch + dedup +
+# notify + ledger append; build_operator_inbox is a pure renderer of the ledger tail.
+
+# _operator_inbox_enabled — true iff OPERATOR_INBOX opts in. Default OFF (mirrors _flair_enabled); any
+# unrecognized value reads as off (fail toward the byte-identical console).
+_operator_inbox_enabled() {
+  case "$(printf '%s' "${OPERATOR_INBOX:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _inbox_flatten <text> — whitespace-flatten + cap a comment snippet so it can never inject a TAB /
+# newline into the ledger's TSV shape or blow up a console row. Prints at most 120 chars.
+_inbox_flatten() {
+  TEXT="${1:-}" python3 -c 'import os
+s = " ".join((os.environ.get("TEXT") or "").split())
+print(s if len(s) <= 120 else s[:119].rstrip() + "…")' 2>/dev/null || true
+}
+
+# _inbox_seen <key> — 0 if this comment key ("pr:<id>" / "tr:<id>") was already surfaced. Fail-soft
+# (no ledger → not seen).
+_inbox_seen() {
+  [ -s "$INBOX_SEEN_STATE" ] || return 1
+  grep -qxF -- "$1" "$INBOX_SEEN_STATE" 2>/dev/null
+}
+
+# _inbox_mark_seen <key> — record a comment key as surfaced, then trim the dedup ledger to its most
+# recent INBOX_SEEN_MAX ids so it can never grow without bound.
+_inbox_mark_seen() {
+  printf '%s\n' "$1" >> "$INBOX_SEEN_STATE" 2>/dev/null || return 0
+  local n; n="$(wc -l < "$INBOX_SEEN_STATE" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -gt "$INBOX_SEEN_MAX" ]; then
+    local keep; keep="$(mktemp "${INBOX_SEEN_STATE}.XXXXXX" 2>/dev/null || true)"
+    [ -n "$keep" ] || return 0
+    tail -n "$INBOX_SEEN_MAX" "$INBOX_SEEN_STATE" > "$keep" 2>/dev/null && mv -f "$keep" "$INBOX_SEEN_STATE" 2>/dev/null || rm -f "$keep" 2>/dev/null
+  fi
+}
+
+# _inbox_record <source> <ref> <author> <snippet> — append ONE ledger entry (epoch-stamped) and trim
+# the ledger to its most recent INBOX_LEDGER_MAX rows. TAB-separated so a snippet with spaces is safe.
+_inbox_record() {
+  local src="$1" ref="$2" author="$3" snip="$4" now
+  now="$(date +%s 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$now" "$src" "$ref" "${author:-operator}" "$snip" >> "$INBOX_LEDGER" 2>/dev/null || return 0
+  local n; n="$(wc -l < "$INBOX_LEDGER" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -gt "$INBOX_LEDGER_MAX" ]; then
+    local keep; keep="$(mktemp "${INBOX_LEDGER}.XXXXXX" 2>/dev/null || true)"
+    [ -n "$keep" ] || return 0
+    tail -n "$INBOX_LEDGER_MAX" "$INBOX_LEDGER" > "$keep" 2>/dev/null && mv -f "$keep" "$INBOX_LEDGER" 2>/dev/null || rm -f "$keep" 2>/dev/null
+  fi
+}
+
+# _inbox_fetch_pr_comments <pr#> — the ONE network call of the PR feed, isolated so a test can stub it
+# (or the `gh` it calls). Prints the PR's comments as JSON ({"comments":[…]}); empty JSON on any error
+# (fail-soft — a gh hiccup yields an empty inbox, never a red row).
+_inbox_fetch_pr_comments() {
+  gh pr view "$1" --json comments 2>/dev/null || printf '{"comments":[]}'
+}
+
+# _inbox_extract_pr_comments — pure filter: read a `gh pr view --json comments` JSON on stdin and,
+# for every comment whose author is present AND is NOT $OWNER, print "<id>\t<login>\t<snippet>". The
+# self-exclusion is what makes it "comments by OTHER authors"; an empty OWNER excludes nothing (still
+# fail-soft). Kept a pure stdin→stdout filter so the unit test can pin its behavior with a fixture.
+_inbox_extract_pr_comments() {
+  OWNER="${1:-}" python3 -c 'import sys, json, os
+owner = os.environ.get("OWNER") or ""
+def flat(s):
+    s = " ".join((s or "").split())
+    return s if len(s) <= 120 else s[:119].rstrip() + "…"
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+for c in (d.get("comments") or []):
+    login = ((c.get("author") or {}).get("login") or "").strip()
+    if not login or (owner and login == owner):
+        continue
+    cid = str(c.get("id") or c.get("url") or "").strip()
+    if not cid:
+        continue
+    print("%s\t%s\t%s" % (cid, login, flat(c.get("body"))))' 2>/dev/null || true
+}
+
+# _inbox_pr_numbers — pure filter: read the tick's `gh pr list` JSON on stdin, print one open PR
+# number per line. (The "open PRs this seat authors or is gating" set is exactly the tick's viewed
+# PRs; surfacing comments by OTHERS on them covers both "a PR I opened" and "a PR I'm gating".)
+_inbox_pr_numbers() {
+  python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = []
+for p in (d or []):
+    n = p.get("number")
+    if n not in (None, ""):
+        print(n)' 2>/dev/null || true
+}
+
+# _inbox_scan <prs_json> — refresh both feeds. GATED (no-op unless enabled) and only invoked on the
+# throttled inbox interval, so the 4s repaint never triggers a network fetch. For each NEW (unseen)
+# comment by another author it appends a ledger entry and fires ONE notification. Every step is
+# fail-soft: a gh error, a missing backend op, or absent creds simply yields fewer/zero entries.
+_inbox_scan() {
+  _operator_inbox_enabled || return 0
+  local prs_json="${1:-[]}" owner prnum cid author snip line
+  _resolve_watcher_owner
+  owner="$(_watcher_owner_login)"
+
+  # (1) PR-COMMENT feed — comments by OTHERS on the tick's open PRs.
+  while IFS= read -r prnum; do
+    [ -n "$prnum" ] || continue
+    while IFS=$'\t' read -r cid author snip; do
+      [ -n "$cid" ] || continue
+      _inbox_seen "pr:$cid" && continue
+      _inbox_mark_seen "pr:$cid"
+      _inbox_record pr "#$prnum" "$author" "$snip"
+      herd_driver_notify "📬 inbox · PR #${prnum}" "${author}: ${snip}" default
+    done < <(_inbox_fetch_pr_comments "$prnum" | _inbox_extract_pr_comments "$owner")
+  done < <(printf '%s' "$prs_json" | _inbox_pr_numbers)
+
+  # (2) TRACKER feed — comments by OTHER operators on items this seat claimed, via the backend's
+  # OPTIONAL comment reader (linear only). Sourced in a SUBSHELL (secrets + backend, exactly the
+  # _reconcile_via_ref pattern) so the _backend_* helpers never leak into the watcher namespace; a
+  # backend with no such op prints nothing. Output: "#<ref>\t<author>\t<comment-id>\t<snippet>".
+  local _bdir _bfile ref
+  _bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _bfile="$_bdir/${SCRIBE_BACKEND:-file}.sh"
+  if [ -f "$_bfile" ]; then
+    while IFS=$'\t' read -r ref author cid snip; do
+      [ -n "$cid" ] || continue
+      _inbox_seen "tr:$cid" && continue
+      _inbox_mark_seen "tr:$cid"
+      _inbox_record tracker "$ref" "$author" "$(_inbox_flatten "$snip")"
+      herd_driver_notify "📬 inbox · ${ref}" "${author}: ${snip}" default
+    done < <(
+      _secrets="$MAIN/.herd/secrets"
+      # shellcheck source=/dev/null
+      [ -f "$_secrets" ] && . "$_secrets"
+      # shellcheck source=/dev/null
+      . "$_bfile" 2>/dev/null || exit 0
+      command -v _backend_list_inbox_comments >/dev/null 2>&1 || exit 0
+      cd "$MAIN" 2>/dev/null || exit 0
+      _backend_list_inbox_comments 2>/dev/null || true
+    )
+  fi
+}
+
+# build_operator_inbox — the "operator inbox" section: the most recent INBOX ledger entries, newest
+# first, one row each. Empty (OPERATOR_INBOX_ROWS="") when the feature is off OR the ledger is
+# absent/empty, so render() omits the section and the console is byte-identical when unused. A pure
+# renderer — no fetch, no network (that is _inbox_scan's job). Themed via C_* (plain under NO_COLOR).
+build_operator_inbox() {
+  OPERATOR_INBOX_ROWS=""
+  _operator_inbox_enabled || return 0
+  [ -s "$INBOX_LEDGER" ] || return 0
+  local epoch source ref author snip hhmm glyph rows=""
+  while IFS=$'\t' read -r epoch source ref author snip; do
+    [ -n "${ref:-}" ] || continue
+    hhmm="$(epoch_to_hhmm "$epoch")"
+    case "$source" in tracker) glyph='🗂' ;; *) glyph='📬' ;; esac
+    rows="${rows}    ${C_CYAN}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${C_DIM}@${author}${C_RESET} ${snip} ${C_DIM}${hhmm}${C_RESET}"$'\n'
+  done < <(reverse_file "$INBOX_LEDGER" | head -5)
+  [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -599,6 +786,12 @@ render() {
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
+  # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
+  # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
+  # byte-identical when the feature is unused.
+  if [ -n "${OPERATOR_INBOX_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}operator inbox${C_RESET}"$'\n'"${OPERATOR_INBOX_ROWS}"$'\n'
   fi
   # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
   # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
@@ -4729,6 +4922,9 @@ _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0
 _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+_INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
+                            # reads (gh pr comments + tracker) never ride the 4 s repaint
+_INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
 
 # One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
@@ -4936,6 +5132,20 @@ EOF
   done
   build_celebrate "$_flair_grazing"
   build_pasture
+
+  # HERD-184 operator inbox — refresh the cross-seat inbox on the throttled interval (network reads
+  # never ride the 4 s repaint), then render the section from its ledger. _inbox_scan self-gates on
+  # OPERATOR_INBOX (no-op when off), and build_operator_inbox leaves OPERATOR_INBOX_ROWS empty when
+  # off/none, so the frame is byte-identical to before the feature. PRS_JSON is the tick's already-
+  # fetched open-PR set — no extra `gh pr list`.
+  if _operator_inbox_enabled; then
+    _INBOX_SCAN_TICK=$((_INBOX_SCAN_TICK + 1))
+    if [ "$_INBOX_SCAN_TICK" -ge "$_INBOX_SCAN_INTERVAL" ]; then
+      _INBOX_SCAN_TICK=0
+      _inbox_scan "$PRS_JSON"
+    fi
+  fi
+  build_operator_inbox
 
   render
 
