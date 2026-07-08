@@ -1,0 +1,45 @@
+# .herd/triggers.tsv — declarative SCHEDULED / TRIGGERED RUNS (HERD-169). Commit this (code-shaped
+# config, zero-secret). A cron-style trigger spawns a defined workflow (a named backlog-item template
+# or a steps.tsv pipeline — whatever the task text names) on schedule by ENQUEUEING spawn intents onto
+# the SAME durable spawn queue the coordinator uses (scripts/herd/spawn.sh). It never bypasses a gate:
+# every spawned intent runs the normal builder → healthcheck → review → merge pipeline.
+#
+# Format — one TAB-SEPARATED row per trigger (columns separated by a literal tab, NOT spaces):
+#     name <TAB> schedule <TAB> lane <TAB> task <TAB> input
+#
+#   name      kebab-ish label; the snapshot key, the journal key, and the spawn slug prefix.
+#   schedule  the cadence a tick fires this trigger on — one of:
+#               @hourly | @daily | @weekly | every:<N>[smhd] (e.g. every:30m, every:6h, every:2d) | manual
+#             'manual' NEVER auto-fires on a tick; fire it explicitly with 'triggers.sh fire <name>'.
+#   lane      quick | feature — the durable-queue lane each spawned intent runs in.
+#   task      the task text handed to each spawned builder (its "workflow"). Tokens substituted PER
+#             spawn:  {item} → the delta input line that triggered it · {name} → the trigger name.
+#   input     a shell command whose STDOUT lines are the INPUT SET (one item per line). Each fire diffs
+#             this set against the previous run's snapshot and spawns work ONLY for the DELTA (new
+#             lines). An empty input set spawns nothing.
+#
+# ── DIFF-AGAINST-LAST-RUN ──────────────────────────────────────────────────────────────────────────
+# A per-trigger last-run input snapshot is stored under .herd/trigger-state/<name>.snapshot (runtime
+# state; gitignored). On each fire:
+#   • FIRST RUN (no snapshot) ⇒ FULL RUN: every line spawns, loudly labelled.
+#   • UNCHANGED input          ⇒ no delta ⇒ nothing spawns.
+#   • CHANGED input            ⇒ only the added lines spawn.
+# FAIL-SOFT: if the input command errors, nothing spawns, the snapshot is kept, and the next tick
+# retries. Validate with:
+#     bash scripts/herd/triggers.sh validate
+#
+# The tick CADENCE is external (an operator cron or scheduler runs 'triggers.sh tick'); the schedule
+# column decides which triggers are DUE when a tick lands. Fire one now with 'triggers.sh fire <name>'.
+#
+# HARD RULE: an EMPTY or ABSENT list ⇒ a byte-identical engine (this feature ships DORMANT / default-off).
+# Blank lines and lines whose first field starts with '#' are ignored.
+#
+# ── Examples (all commented out; uncomment + adapt) ───────────────────────────────────────────────
+# Nightly: open a quick fix for each file flagged by a linter that wasn't flagged yesterday.
+# lint-sweep<TAB>@daily<TAB>quick<TAB>Fix the lint finding in {item} and open a PR.<TAB>scripts/lint.sh --list-files
+#
+# Hourly: spawn a feature build for each new open issue label since the last run.
+# issue-triage<TAB>@hourly<TAB>feature<TAB>Triage and address issue {item} (see the issue-triage backlog template).<TAB>gh issue list --label ready --json number -q '.[].number'
+#
+# Manual: re-run the release-notes pipeline on demand (never auto-fires).
+# release-notes<TAB>manual<TAB>quick<TAB>Regenerate release notes for {item}.<TAB>git tag --points-at HEAD
