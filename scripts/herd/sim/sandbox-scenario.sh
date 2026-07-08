@@ -360,6 +360,106 @@ BROKEN
   fi
 fi
 
+# ── push-gate (HERD-123): PUSH_GATE=human — hold BEFORE push, approve to resume push + PR ────────
+# Proves the seam the item exists for, driving the REAL push-gate.sh + herd-approve.sh entry points
+# against a throwaway fixture with a LOCAL bare 'origin' remote (so a real `git push` works with no
+# network; the PR-create step is stubbed via HERD_PUSH_GATE_PR_CMD, mirroring how the main-health phase
+# stubs HERD_HEALTHCHECK_BIN). Four assertions: (A) a finished builder records a sha-keyed hold and
+# NOTHING is pushed; (B) the hold surfaces in herd-approve.sh list with the worktree path; (C) approve
+# resumes push + PR + the health gate; (D) a new commit after the hold invalidates a prior approval.
+step push-gate "PUSH_GATE=human — no push before approval, approve resumes push+PR, stale-sha refused"
+PG_ENGINE="$HERE/.."
+if [ ! -f "$PG_ENGINE/push-gate.sh" ] || [ ! -f "$PG_ENGINE/herd-approve.sh" ]; then
+  checkpoint push_gate_lib skip "push-gate.sh / herd-approve.sh not found — push-gate phase skipped"
+else
+  # Stub `gh pr create`: the resume's PR step is overridable via HERD_PUSH_GATE_PR_CMD. It writes a
+  # local pr.json from the HERD_PG_* env push-gate.sh exports, so the PR step needs no gh/network.
+  PG_PR_JSON="$ART/pg-pr.json"
+  PG_PR_CMD="$ART/pg-pr-create.sh"
+  cat > "$PG_PR_CMD" <<PRCMD
+#!/usr/bin/env bash
+# Stub gh pr create — record the PR locally from the HERD_PG_* env push-gate.sh passes.
+cat > "$PG_PR_JSON" <<JSON
+{ "branch": "\${HERD_PG_BRANCH:-}", "base": "\${HERD_PG_BASE:-}", "title": "\${HERD_PG_TITLE:-}", "hosted": true }
+JSON
+PRCMD
+
+  PG_REPO="$ART/pg-repo"; PG_BARE="$ART/pg-origin.git"; PG_TREES="$ART/pg-trees"; mkdir -p "$PG_TREES"
+  PG_LEDGER="$PG_TREES/.agent-watch-push-holds"
+  # pg_env <repo> <cmd…> — run a push-gate/herd-approve CLI hermetically: the ledger lives in a
+  # throwaway trees dir, HERD_CONFIG_FILE points at a NON-existent path so herd-config.sh never walks
+  # up into herdkit's OWN .herd/config, DEFAULT_BRANCH gives HERD_REMOTE=origin, PR step stubbed.
+  pg_env() {
+    local _pg_root="$1"; shift
+    env HERD_CONFIG_FILE="$ART/.pg-no-config" WORKTREES_DIR="$PG_TREES" PROJECT_ROOT="$_pg_root" \
+        DEFAULT_BRANCH="origin/main" NO_COLOR=1 HERD_DRIVER=headless \
+        HERD_PUSH_GATE_PR_CMD="$PG_PR_CMD" "$@"
+  }
+
+  # Build the builder worktree + a bare 'origin' it can push to; seed main on origin, then a committed
+  # change on a feature branch (the "finished" work the builder would push).
+  sandbox_fixture_build "$PG_REPO" >/dev/null 2>&1
+  git init -q --bare "$PG_BARE"
+  git -C "$PG_REPO" remote add origin "$PG_BARE"
+  _sf_git_env
+  git -C "$PG_REPO" push -q origin main 2>/dev/null || true
+  PG_BRANCH="feat/pg-demo"
+  git -C "$PG_REPO" checkout -q -b "$PG_BRANCH"
+  printf '\nfarewell() { printf "goodbye, %%s!\\n" "${1:-world}"; }\n' >> "$PG_REPO/app/greet.sh"
+  git -C "$PG_REPO" add -A && git -C "$PG_REPO" commit -q -m "pg: add farewell (finished work)"
+  PG_SHA="$(git -C "$PG_REPO" rev-parse HEAD)"
+  PG_BODY="$ART/pg-body.md"; printf 'Add farewell.\n\nRefs: HERD-123\n' > "$PG_BODY"
+
+  # (A) HOLD instead of push. Assert: awaiting record written AND the branch is NOT on origin.
+  pg_env "$PG_REPO" bash "$PG_ENGINE/push-gate.sh" hold pg-demo --dir "$PG_REPO" --branch "$PG_BRANCH" \
+      --base main --title "pg: add farewell" --body-file "$PG_BODY" >/dev/null 2>&1
+  if grep -q "awaiting pg-demo $PG_SHA" "$PG_LEDGER" 2>/dev/null && _branch_absent "$PG_BARE" "$PG_BRANCH"; then
+    checkpoint push_gate_held_no_push pass "hold recorded (awaiting ${PG_SHA}); NOTHING pushed to origin"
+  else
+    checkpoint push_gate_held_no_push fail "hold not recorded or branch leaked to origin before approval"
+  fi
+
+  # (B) LIST surfaces the pre-PR hold with the worktree path (what the human reviews).
+  PG_LIST="$(pg_env "$PG_REPO" bash "$PG_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
+  if printf '%s' "$PG_LIST" | grep -q 'pg-demo' && printf '%s' "$PG_LIST" | grep -q "$PG_REPO"; then
+    checkpoint push_gate_listed pass "herd-approve.sh list shows the pre-PR hold + worktree path"
+  else
+    checkpoint push_gate_listed fail "herd-approve.sh list did not surface the push-hold"
+  fi
+
+  # (C) APPROVE resumes: push + PR proceed. Assert: branch NOW on origin, pr.json written, ledger
+  #     marked pushed, and the fixture health gate runs green on the resumed branch (gates proceed).
+  pg_env "$PG_REPO" bash "$PG_ENGINE/herd-approve.sh" approve pg-demo >/dev/null 2>&1
+  _pg_gate_rc=0
+  ( cd "$PG_REPO" && bash app/greet.test.sh ) >/dev/null 2>&1 || _pg_gate_rc=$?
+  if _branch_exists "$PG_BARE" "$PG_BRANCH" && [ -f "$PG_PR_JSON" ] \
+     && grep -q "pushed pg-demo $PG_SHA" "$PG_LEDGER" 2>/dev/null && [ "$_pg_gate_rc" -eq 0 ]; then
+    checkpoint push_gate_resumed pass "approve resumed: branch pushed to origin, PR created, gate green"
+  else
+    checkpoint push_gate_resumed fail "approve did not resume push+PR+gate (branch/pr.json/pushed/gate missing)"
+  fi
+
+  # (D) STALE-SHA GUARD: a NEW commit after the hold invalidates a prior approval. A second builder
+  #     holds sha1, then commits sha2 WITHOUT re-holding; approve must REFUSE at resume and push NOTHING.
+  PG_REPO2="$ART/pg-repo2"; PG_BARE2="$ART/pg-origin2.git"
+  sandbox_fixture_build "$PG_REPO2" >/dev/null 2>&1
+  git init -q --bare "$PG_BARE2"
+  git -C "$PG_REPO2" remote add origin "$PG_BARE2"
+  _sf_git_env; git -C "$PG_REPO2" push -q origin main 2>/dev/null || true
+  git -C "$PG_REPO2" checkout -q -b feat/pg-stale
+  printf '\n# v1\n' >> "$PG_REPO2/app/greet.sh"; git -C "$PG_REPO2" add -A && git -C "$PG_REPO2" commit -q -m "pg-stale v1"
+  pg_env "$PG_REPO2" bash "$PG_ENGINE/push-gate.sh" hold pg-stale --dir "$PG_REPO2" --branch feat/pg-stale \
+      --base main --title "pg stale" >/dev/null 2>&1
+  printf '\n# v2\n' >> "$PG_REPO2/app/greet.sh"; git -C "$PG_REPO2" add -A && git -C "$PG_REPO2" commit -q -m "pg-stale v2"
+  _pg_stale_rc=0
+  pg_env "$PG_REPO2" bash "$PG_ENGINE/herd-approve.sh" approve pg-stale >/dev/null 2>&1 || _pg_stale_rc=$?
+  if [ "$_pg_stale_rc" -ne 0 ] && _branch_absent "$PG_BARE2" "feat/pg-stale"; then
+    checkpoint push_gate_stale_refused pass "a new commit after the hold invalidated the approval — resume refused, nothing pushed"
+  else
+    checkpoint push_gate_stale_refused fail "stale (new-commit) approval was NOT refused (rc=$_pg_stale_rc) or branch leaked to origin"
+  fi
+fi
+
 # ── scorecard ───────────────────────────────────────────────────────────────────
 RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT" "$FIXTURE_SHA")"

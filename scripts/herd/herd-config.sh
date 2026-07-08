@@ -388,6 +388,16 @@ fi
 : "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh
+# PUSH_GATE (HERD-123) — hold a FINISHED builder for human review BEFORE anything reaches GitHub. The
+# missing gate-then-upload seam: PR_FLOW=draft gates AFTER the push (PR already public), MERGE_POLICY=
+# approve gates AFTER review (PR exists); PUSH_GATE=human gates BEFORE the push, while the diff is only
+# local. With =human, the builder lane completes work + healthcheck but STOPS before git push / gh pr
+# create, recording a sha-keyed awaiting-push hold (push-gate.sh) the watcher surfaces as 'ready ·
+# awaiting push approval'; herd-approve.sh approve resumes push + PR creation. A new commit invalidates
+# a prior approval (sha-keyed, same semantics as merge approval). Default '' (off) → lanes byte-
+# identical, byte-inert. Unknown value → off (fail safe). Consumed by herd-quick.sh / herd-feature.sh
+# (lane rules), herd-approve.sh (list/approve/resume), agent-watch.sh (console row), via push-gate.sh.
+: "${PUSH_GATE:=""}"              # '' (default, off) | human
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
 # SPAWN_AHEAD — advisory spawn-rate lead over the review gate (herd-spawn-gate.sh, sourced by the
