@@ -387,6 +387,7 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
+: "${MAIN_HEALTH_TICK:="off"}"   # HERD-129: after a PR merges, run the healthcheck against the freshly ff'd default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into a broken combination). on → a loud persistent 'MAIN RED' alarm row + notification, cleared when a later sha goes green. ALARM only — never gates/reverts/re-merges. off (default) → byte-inert: no suite, no journal, no row
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health

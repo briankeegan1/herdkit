@@ -169,6 +169,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
 
+# post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
+# health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
+# broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited
+# it). ON → after every merge the watcher runs the healthcheck against the freshly ff'd default-branch
+# HEAD (sha-keyed so each main sha runs once; profile from the merged diff via HEALTHCHECK_HEAVY_GLOB;
+# honors HEALTH_CONCURRENCY) and, on a reproduced red, raises a LOUD persistent 'MAIN RED — <failing
+# test> (since #N)' console row + a notification, cleared when a later sha goes green. An ALARM only —
+# never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
+# MAIN_HEALTH_TICK="off"   # off (default) | on
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After

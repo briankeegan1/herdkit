@@ -220,6 +220,119 @@ git -C "$REPO" branch -q -D "$BUILDER_BRANCH" >/dev/null 2>&1 || true
 assert torn_down _branch_absent "$REPO" "$BUILDER_BRANCH"
 assert final_clean _tree_clean "$REPO"
 
+# ── main-health tick (HERD-129): post-merge default-branch tripwire ─────────────────────────────
+# The stub merge above proves the PRE-merge gate blocks a broken PR in isolation. This phase proves
+# the POST-merge main_health_tick — the tripwire for the OTHER failure class: two independently-green
+# PRs merging into a broken COMBINATION, which no per-PR gate can see. We drive the REAL function from
+# scripts/herd/agent-watch.sh (sourced in AGENT_WATCH_LIB mode) against a throwaway fixture 'main',
+# with a stub HERD_HEALTHCHECK_BIN that runs the fixture's own gate — so a genuinely broken fixture
+# test is what turns main red. Four assertions: dormant-when-unset, green silence, red alarm, recovery.
+step main-health "post-merge main_health_tick — dormant/off, green silence, red alarm, recovery"
+WATCH_SH="$HERE/../agent-watch.sh"
+if [ ! -f "$WATCH_SH" ]; then
+  checkpoint main_health_lib skip "agent-watch.sh not found at $WATCH_SH — main-health phase skipped"
+else
+  # Stub healthcheck bin: run the fixture's REAL gate against <dir>, emit healthcheck.sh --oneline
+  # shape (0 clean / 1 code error). A broken greet.sh fails greet.test.sh → rc 1 → main red.
+  MH_HC="$ART/mh-healthcheck.sh"
+  cat > "$MH_HC" <<'HCSTUB'
+#!/usr/bin/env bash
+dir="$1"
+if ( cd "$dir" && bash app/greet.test.sh ) >/dev/null 2>&1; then
+  echo "✅ clean — greet.test PASS"; exit 0
+else
+  echo "❌ code error — app/greet.test.sh → greet.test FAIL"; exit 1
+fi
+HCSTUB
+  # Driver: source agent-watch.sh in lib mode, run main_health_tick + build_main_health, print the
+  # rendered row on stdout. HERD_DRIVER=headless routes any notification to a log (never the live
+  # herdr workspace); NO_COLOR keeps the row plain-text so the assertions can grep it.
+  MH_DRIVER="$ART/mh-driver.sh"
+  cat > "$MH_DRIVER" <<'DRV'
+#!/usr/bin/env bash
+set -u
+export AGENT_WATCH_LIB=1 HERD_DRIVER=headless NO_COLOR=1
+export PROJECT_ROOT="$1" WORKTREES_DIR="$2" JOURNAL_FILE="$3"
+export MAIN_HEALTH_TICK="$5" HERD_HEALTHCHECK_BIN="$6"
+export HEALTHCHECK_CMD="app/greet.test.sh" HEALTHCHECK_HEAVY_GLOB='^app/' DEFAULT_BRANCH="main"
+export HERD_CONFIG_FILE="$2/.no-such-config"
+# shellcheck source=/dev/null
+. "$7" >/dev/null 2>&1 || { echo "SRC_FAIL" >&2; exit 3; }
+main_health_tick "$4" >/dev/null 2>&1
+build_main_health >/dev/null 2>&1
+printf '%s' "${MAIN_HEALTH:-}"
+DRV
+  # mh_drive <main-repo> <trees> <journal> <pr#> <on|off> — run the driver; echo the rendered row.
+  mh_drive() { bash "$MH_DRIVER" "$1" "$2" "$3" "$4" "$5" "$MH_HC" "$WATCH_SH" 2>/dev/null; }
+  # mh_break <repo> — commit a broken greet.sh (fails greet.test.sh); advances HEAD to a new sha.
+  mh_break() {
+    _sf_git_env
+    cat > "$1/app/greet.sh" <<'BROKEN'
+#!/usr/bin/env bash
+# greet.sh — broken by the main-health fixture (wrong output → greet.test.sh fails).
+greet() { printf 'HOWDY, %s.\n' "${1:-world}"; }
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then greet "$@"; fi
+BROKEN
+    git -C "$1" add -A && git -C "$1" commit -q -m "break greet (main-health fixture)"
+  }
+  # mh_fix <repo> — restore greet.sh to a passing state; advances HEAD to a NEW green sha.
+  mh_fix() {
+    _sf_git_env
+    sandbox_fixture_files "$1"                       # rewrite the pristine (passing) greet.sh
+    git -C "$1" add -A && git -C "$1" commit -q -m "fix greet (main-health fixture)"
+  }
+  _mh_state() { printf '%s' "$1/.agent-watch-main-health"; }
+  _mh_no_event()  { ! grep -q '"event":"main_health"' "$1" 2>/dev/null; }
+  _mh_has_result(){ grep -q "\"event\":\"main_health\".*\"result\":\"$2\"" "$1" 2>/dev/null; }
+
+  # (A) DORMANT: feature OFF against a BROKEN main → byte-inert. No journal event, no state file, no row.
+  MH_A="$ART/mh-a"; TR_A="$ART/tr-a"; JN_A="$ART/jn-a.jsonl"; mkdir -p "$TR_A"; : > "$JN_A"
+  sandbox_fixture_build "$MH_A" >/dev/null 2>&1 && mh_break "$MH_A" >/dev/null 2>&1
+  ROW_A="$(mh_drive "$MH_A" "$TR_A" "$JN_A" 900 off)"
+  if _mh_no_event "$JN_A" && [ ! -f "$(_mh_state "$TR_A")" ] && [ -z "$ROW_A" ]; then
+    checkpoint main_health_dormant pass "MAIN_HEALTH_TICK=off on a broken main is byte-inert (no event, no state, no row)"
+  else
+    checkpoint main_health_dormant fail "disabled tick was NOT inert (event/state/row leaked: row='$ROW_A')"
+  fi
+
+  # (B) GREEN SILENCE: feature ON against a GREEN main → green journal, NO red, no state file, empty row.
+  MH_B="$ART/mh-b"; TR_B="$ART/tr-b"; JN_B="$ART/jn-b.jsonl"; mkdir -p "$TR_B"; : > "$JN_B"
+  sandbox_fixture_build "$MH_B" >/dev/null 2>&1
+  ROW_B="$(mh_drive "$MH_B" "$TR_B" "$JN_B" 901 on)"
+  if _mh_has_result "$JN_B" green && ! _mh_has_result "$JN_B" red && [ ! -f "$(_mh_state "$TR_B")" ] && [ -z "$ROW_B" ]; then
+    checkpoint main_health_green pass "green merge journals green and stays SILENT (no red, no state, no row)"
+  else
+    checkpoint main_health_green fail "green merge was not silent (row='$ROW_B')"
+  fi
+
+  # (C) RED ALARM: feature ON against a BROKEN main → red journal (failed=app/greet.test.sh, since #N),
+  #     a state file, and a LOUD 'MAIN RED — <test> (since #N)' row. Shares its trees with (D).
+  MH_CD="$ART/mh-cd"; TR_CD="$ART/tr-cd"; JN_C="$ART/jn-c.jsonl"; mkdir -p "$TR_CD"; : > "$JN_C"
+  sandbox_fixture_build "$MH_CD" >/dev/null 2>&1 && mh_break "$MH_CD" >/dev/null 2>&1
+  ROW_C="$(mh_drive "$MH_CD" "$TR_CD" "$JN_C" 226 on)"
+  if _mh_has_result "$JN_C" red \
+     && grep -q '"failed":"app/greet.test.sh"' "$JN_C" 2>/dev/null \
+     && grep -Eq '"since":"?226"?' "$JN_C" 2>/dev/null \
+     && [ -s "$(_mh_state "$TR_CD")" ] \
+     && printf '%s' "$ROW_C" | grep -q 'MAIN RED' \
+     && printf '%s' "$ROW_C" | grep -q 'app/greet.test.sh' \
+     && printf '%s' "$ROW_C" | grep -q 'since #226'; then
+    checkpoint main_health_red pass "broken main → red journal + state + row: ${ROW_C}"
+  else
+    checkpoint main_health_red fail "broken main did NOT raise the alarm (row='$ROW_C')"
+  fi
+
+  # (D) RECOVERY: a LATER green sha (same trees, HEAD advanced) clears the state file → empty row + green.
+  : > "$JN_C"                                        # reuse the journal for the recovery assertion
+  mh_fix "$MH_CD" >/dev/null 2>&1
+  ROW_D="$(mh_drive "$MH_CD" "$TR_CD" "$JN_C" 227 on)"
+  if _mh_has_result "$JN_C" green && [ ! -f "$(_mh_state "$TR_CD")" ] && [ -z "$ROW_D" ]; then
+    checkpoint main_health_recovery pass "a later green sha clears the MAIN RED row (state removed, row empty)"
+  else
+    checkpoint main_health_recovery fail "green sha did NOT clear the alarm (row='$ROW_D', state=$( [ -f "$(_mh_state "$TR_CD")" ] && echo present || echo absent ))"
+  fi
+fi
+
 # ── scorecard ───────────────────────────────────────────────────────────────────
 RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT" "$FIXTURE_SHA")"

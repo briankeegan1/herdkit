@@ -128,6 +128,10 @@ CONTEXT_PROVISION="codemap"
 REVIEW_CONCURRENCY="2"
 # keep 1: worktrees share one git object store
 HEALTH_CONCURRENCY="1"
+# HERD-129: run the healthcheck against fresh default-branch HEAD after each merge and raise a loud
+# 'MAIN RED' alarm row + notification on a red main (alarm only — never gates/reverts). Enabled here
+# because herdkit dogfoods its own merge-time tripwire; ships OFF for other consumers.
+MAIN_HEALTH_TICK="on"
 REFIX_MAX_ROUNDS="3"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
 REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"
