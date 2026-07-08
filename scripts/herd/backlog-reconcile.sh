@@ -33,6 +33,29 @@ PY="$(command -v python3 || true)"
 _recon_die() { echo "backlog-reconcile: $1" >&2; exit "${2:-1}"; }
 [ -n "$PY" ] || _recon_die "python3 is required" 1
 
+# ── backend gating (mirror tracker-state-sweep.sh:66-78, inverted) ────────────
+# backlog-reconcile updates BACKLOG.md's prose references — the FILE backend's domain. A backend that
+# dispatches state to an EXTERNAL tracker (linear/github/changelog: it defines _backend_update_state)
+# is the source of truth instead of BACKLOG.md, so there are no dangling prose references to reconcile
+# and the reconcile is INERT there — exactly _reconcile_via_ref's / tracker-state-sweep's backend-
+# scoping, inverted (the sweep runs FOR tracker backends; reconcile runs AGAINST the file backend).
+# SCRIBE_BACKEND_DIR overrides the backend dir (the same seam scribe-step.sh / tracker-state-sweep use).
+BACKEND_DIR="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+BACKEND_FILE="$BACKEND_DIR/${SCRIBE_BACKEND:-file}.sh"
+
+# _recon_backend_manages_backlog — success (run) iff the active backend keeps BACKLOG.md as its source
+# of truth (the file backend: no _backend_update_state op). A tracker backend (op present) → failure
+# (inert). Sourced in an isolated subshell so the _backend_* funcs never leak. An unreadable/absent
+# backend impl assumes the file-shaped default (run) so today's behaviour is unchanged for it.
+_recon_backend_manages_backlog() {
+  [ -f "$BACKEND_FILE" ] || return 0
+  ! (
+    # shellcheck source=/dev/null
+    . "$BACKEND_FILE" 2>/dev/null || exit 1
+    command -v _backend_update_state >/dev/null 2>&1
+  )
+}
+
 # _resolve_range <arg> — turn a PR number or a git range into a range `git diff` understands.
 # A bare/`#`-prefixed integer is a PR number: ask gh for its base..head oids (the PR's true change
 # surface, merge-method-independent); fall back to a merge/commit whose message names the PR.
@@ -185,6 +208,12 @@ case "$cmd" in
     _scan "$range" ;;
   run)
     arg="${1:?usage: backlog-reconcile.sh run <pr#|range>}"
+    # Backend-gate BEFORE any work: a tracker backend has no BACKLOG.md prose to reconcile, so go inert
+    # (never enqueue a file-edit scribe request the tracker backend would only mis-file or skip).
+    if ! _recon_backend_manages_backlog; then
+      echo "backlog-reconcile: backend '${SCRIBE_BACKEND:-file}' is a tracker backend (BACKLOG.md is not its source of truth) — nothing to reconcile; inert."
+      exit 0
+    fi
     range="$(_resolve_range "$arg")"
     # A human-readable label + the command the scribe uses to confirm new targets.
     case "$arg" in

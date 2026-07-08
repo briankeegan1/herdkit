@@ -130,6 +130,8 @@ if [ "$_HERD_DRIVER_NAME" != "headless" ]; then
     echo "❌ herdr unavailable (could not create a tab for '$SLUG'); worktree is ready at $DIR but no panes were launched." >&2
     exit 1
   fi
+  # Register in the sweep allowlist so only engine-created tabs are ever swept (mirror herd-feature.sh).
+  printf '%s %s builder\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
 fi
 
 # PR flow (draft vs direct) threaded into the LANE RULES below. SAFE DEFAULTS preserve today's exact

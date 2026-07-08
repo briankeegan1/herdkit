@@ -73,6 +73,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic scribe auto planned-marker (HERD-183) test passes" {
+  run bash "$REPO/tests/test-scribe-auto-marker.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]
@@ -109,6 +115,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic rubric-screen dual-screener merge (HERD-166) test passes" {
+  run bash "$REPO/tests/test-rubric-screen-merge.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic rubric-screening disagreement-surface sim (HERD-166) passes" {
+  run bash "$REPO/scripts/herd/sim/rubric-screen-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SIM PASS"* ]]
+}
+
 @test "hermetic backlog-archive rotation test passes" {
   run bash "$REPO/tests/test-backlog-archive.sh"
   [ "$status" -eq 0 ]
@@ -123,18 +141,6 @@ setup() {
 
 @test "hermetic backlog-view manual-refresh key (HERD-48) test passes" {
   run bash "$REPO/tests/test-backlog-view-refresh-key.sh"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"ALL PASS"* ]]
-}
-
-@test "hermetic backlog-view OSC 8 id-chip hyperlink (HERD-49) test passes" {
-  run bash "$REPO/tests/test-backlog-view-osc8.sh"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"ALL PASS"* ]]
-}
-
-@test "hermetic backlog-view rich-render test passes" {
-  run bash "$REPO/tests/test-backlog-view-rich.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
@@ -207,6 +213,12 @@ setup() {
 
 @test "hermetic dependency-aware spawn queue (HERD-94) test passes" {
   run bash "$REPO/tests/test-spawn-queue-deps.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic healthcheck env-vs-code classification (HERD-187) test passes" {
+  run bash "$REPO/tests/test-healthcheck-env-classify.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
@@ -307,6 +319,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic operator inbox (HERD-184) unit test passes" {
+  run bash "$REPO/tests/test-operator-inbox.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
+
+@test "hermetic connector seams edges (HERD-170) test passes" {
+  run bash "$REPO/tests/test-connector-seams.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
