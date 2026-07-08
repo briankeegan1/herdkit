@@ -96,6 +96,34 @@ _herd_main_worktree() {
   fi
 }
 
+# _herd_read_project_config <project-path> — source a project's .herd/config in an ISOLATED subshell
+# (so its vars never leak into the caller or bleed between projects) and print one TAB-delimited row:
+#   workspace<TAB>project_root<TAB>worktrees_dir<TAB>default_branch<TAB>repo
+# Applies the SAME fallbacks the main loader below does. This is the ONE seam that reads a FOREIGN
+# project's config from OUTSIDE the current-project load path (the `herd fleet` fan-out) — so the direct
+# `. .herd/config` lives HERE in the config module, never scattered across engine scripts (the
+# seam-conformance config-source rule). Returns non-zero when there is no config to read.
+_herd_read_project_config() {
+  local path="$1" cfg="$1/.herd/config"
+  [ -f "$cfg" ] || return 1
+  (
+    set +eu 2>/dev/null || true
+    PROJECT_ROOT=""; WORKTREES_DIR=""; WORKSPACE_NAME=""; DEFAULT_BRANCH=""; HERD_REPO=""
+    # shellcheck source=/dev/null
+    . "$cfg" 2>/dev/null || exit 1
+    # Apply the SAME fallbacks the main loader does. Written as explicit `-n` guards (the vars are
+    # pre-initialised to "" just above), NOT the `: "${KEY:=…}"` idiom: the caps-sync gate greps THIS
+    # file for `: "${KEY:=…}"` as its "new config key" heuristic, so the `:=` form here would false-trip
+    # it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids `:=`.
+    [ -n "$PROJECT_ROOT" ]   || PROJECT_ROOT="$path"
+    [ -n "$WORKTREES_DIR" ]  || WORKTREES_DIR="${PROJECT_ROOT}-trees"
+    [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="origin/main"
+    [ -n "$WORKSPACE_NAME" ] || WORKSPACE_NAME="$(basename "$PROJECT_ROOT")"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$WORKSPACE_NAME" "$PROJECT_ROOT" "$WORKTREES_DIR" "$DEFAULT_BRANCH" "$HERD_REPO"
+  )
+}
+
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
 # _herd_find_config records HOW the config resolved into _HERD_CONFIG_SOURCE (env | walkup |

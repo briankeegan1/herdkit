@@ -36,25 +36,22 @@ _fleet_slug() {
 # into a registry record, so a stray char can never corrupt the one-record-per-line format.
 _fleet_sanitize() { printf '%s' "$1" | tr -d '|\r\n'; }
 
-# _fleet_read_config <project-path> — source that project's .herd/config in an ISOLATED subshell
-# (so its vars never leak into the fleet process or bleed between projects) and print one TAB-
-# delimited row:  workspace<TAB>project_root<TAB>worktrees_dir<TAB>default_branch<TAB>repo
-# Applies the SAME fallbacks herd-config.sh does. Returns non-zero if there is no config to read.
+# _fleet_read_config <project-path> — read that project's .herd/config and print one TAB-delimited row:
+#   workspace<TAB>project_root<TAB>worktrees_dir<TAB>default_branch<TAB>repo
+# Thin adopter of the shared _herd_read_project_config seam (scripts/herd/herd-config.sh), which owns
+# the isolated-subshell source + the fallbacks — so the direct `. .herd/config` lives in the config
+# module, not here. `herd fleet` does NOT globally load the config module (loading the CURRENT project's
+# config would clobber ambient env, e.g. fleet_room's MODEL_COORDINATOR), so lazily source the seam's
+# sibling module HERE, only when the reader is not already defined — confined to the read path fleet_room
+# never touches. The source runs inside this function's `$(…)` subshell, so it never leaks globals into
+# the fleet process. Returns non-zero if there is no config to read.
 _fleet_read_config() {
-  local path="$1" cfg="$1/.herd/config"
-  [ -f "$cfg" ] || return 1
-  (
-    set +eu 2>/dev/null || true
-    PROJECT_ROOT=""; WORKTREES_DIR=""; WORKSPACE_NAME=""; DEFAULT_BRANCH=""; HERD_REPO=""
+  if ! declare -f _herd_read_project_config >/dev/null 2>&1; then
+    local _frc_dir; _frc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # shellcheck source=/dev/null
-    . "$cfg" 2>/dev/null || exit 1
-    : "${PROJECT_ROOT:="$path"}"
-    : "${WORKTREES_DIR:="${PROJECT_ROOT}-trees"}"
-    : "${DEFAULT_BRANCH:="origin/main"}"
-    : "${WORKSPACE_NAME:="$(basename "$PROJECT_ROOT")"}"
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-      "$WORKSPACE_NAME" "$PROJECT_ROOT" "$WORKTREES_DIR" "$DEFAULT_BRANCH" "$HERD_REPO"
-  )
+    . "$_frc_dir/herd-config.sh"
+  fi
+  _herd_read_project_config "$1"
 }
 
 # _fleet_each REGISTRY-CALLBACK — read the registry and call `$1 name path repo` per valid record,

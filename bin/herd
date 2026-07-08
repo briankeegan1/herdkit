@@ -1668,25 +1668,39 @@ cmd_config() {
 # (shell last-wins) is unchanged; this only surfaces it. (Named `_config_*` like the other private
 # config helpers, not `cmd_config_*`: it is a subcommand handler, not a new top-level command.)
 _config_lint() {
-  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   # The scanner lives in herd-config.sh. Pre-set the once-per-process marker so sourcing the loader
   # does not ALSO emit its passive dup warning — this command is the authoritative report.
   _HERD_CONFIG_DUP_WARNED=1
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-config.sh"
-  local dupes; dupes="$(_herd_config_dup_keys "$cfg")"
-  if [ -z "$dupes" ]; then
+  # Lint BOTH files (HERD-47): the committed baseline AND the sibling per-user overlay .herd/config.local
+  # are each shell-sourced with last-wins, so a duplicate WITHIN either file can silently disable a gate.
+  # (A key set in BOTH files is an intentional override, not a duplicate — each file is scanned on its
+  # own.) A dup in EITHER fails the lint.
+  local dupes local_dupes; dupes="$(_herd_config_dup_keys "$cfg")"
+  local_dupes=""; [ -f "$local_cfg" ] && local_dupes="$(_herd_config_dup_keys "$local_cfg")"
+  if [ -z "$dupes" ] && [ -z "$local_dupes" ]; then
     ok "no duplicate keys in .herd/config ($cfg)"
+    [ -f "$local_cfg" ] && ok "no duplicate keys in .herd/config.local ($local_cfg)"
     return 0
   fi
-  say "${c_bold}duplicate key(s) in .herd/config${c_rst}  ($cfg)"
   local k
-  while IFS= read -r k; do
-    [ -n "$k" ] && printf '  %s%s%s — assigned more than once; shell last-wins (the LAST assignment silently overrides the earlier one)\n' "$c_bold" "$k" "$c_rst"
-  done <<< "$dupes"
+  if [ -n "$dupes" ]; then
+    say "${c_bold}duplicate key(s) in .herd/config${c_rst}  ($cfg)"
+    while IFS= read -r k; do
+      [ -n "$k" ] && printf '  %s%s%s — assigned more than once; shell last-wins (the LAST assignment silently overrides the earlier one)\n' "$c_bold" "$k" "$c_rst"
+    done <<< "$dupes"
+  fi
+  if [ -n "$local_dupes" ]; then
+    say "${c_bold}duplicate key(s) in .herd/config.local${c_rst}  ($local_cfg)"
+    while IFS= read -r k; do
+      [ -n "$k" ] && printf '  %s%s%s — assigned more than once; shell last-wins (the LAST assignment silently overrides the earlier one)\n' "$c_bold" "$k" "$c_rst"
+    done <<< "$local_dupes"
+  fi
   say ""
-  warn "shell last-wins can SILENTLY disable a gate (issue #115) — delete the stale duplicate line(s) in $cfg (value resolution is unchanged; herd does not auto-dedup)."
+  warn "shell last-wins can SILENTLY disable a gate (issue #115) — delete the stale duplicate line(s) (value resolution is unchanged; herd does not auto-dedup)."
   exit 1
 }
 

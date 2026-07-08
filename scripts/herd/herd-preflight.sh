@@ -565,11 +565,24 @@ herd_doctor() {
       else
         printf '  \xe2\x9c\x93 no duplicate keys\n'
       fi
-      # HERD-47: note when a per-user overlay is layered on top of the baseline, so the effective
-      # config is not a mystery. Purely informational (never gates); `herd config list` shows which
-      # file each effective value came from.
-      if [ -f "$(dirname "$_dc_cfg")/config.local" ]; then
-        printf '  \xe2\x9c\x93 config.local overlay present \xe2\x80\x94 per-user keys override the baseline (see `herd config list` for provenance)\n'
+      # HERD-47: the per-user overlay .herd/config.local is ALSO shell-sourced with last-wins, so scan
+      # it for duplicate keys too (a dup WITHIN the overlay silently disables a gate exactly like one in
+      # the baseline; a key set in BOTH files is an intentional override, not a dup). Note its presence
+      # so the effective config is not a mystery (`herd config list` shows per-key provenance).
+      local _dc_local="$(dirname "$_dc_cfg")/config.local"
+      if [ -f "$_dc_local" ]; then
+        local _dc_local_dupes; _dc_local_dupes="$(_herd_config_dup_keys "$_dc_local")"
+        if [ -n "$_dc_local_dupes" ]; then
+          printf '  \xe2\x9a\xa0 duplicate key(s) in config.local overlay \xe2\x80\x94 shell last-wins silently overrides earlier values (can disable a gate, issue #115):\n'
+          local _dc_lk
+          while IFS= read -r _dc_lk; do
+            [ -n "$_dc_lk" ] && printf '      \xe2\x80\xa2 %s (last assignment wins)\n' "$_dc_lk"
+          done <<< "$_dc_local_dupes"
+          printf '      fix: delete the stale duplicate line(s), or run `herd config lint`\n'
+          cfg_dup=1
+        else
+          printf '  \xe2\x9c\x93 config.local overlay present, no duplicate keys \xe2\x80\x94 per-user keys override the baseline (see `herd config list` for provenance)\n'
+        fi
       fi
     fi
   fi
