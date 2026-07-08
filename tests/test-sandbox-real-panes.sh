@@ -72,6 +72,10 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCS" || fail "(A) s
 [ "$(cp_count_status "$SCS" skip)" -ge 5 ]   || fail "(A) skip path should loudly skip the pane checkpoints"
 # The fixture still builds locally even with no herdr.
 [ "$(cp_status "$SCS" fixture_built)" = "pass" ] || fail "(A) fixture_built should still pass with no herdr"
+# HERD-139: the notify-hermeticity invariant holds even on the skip path (nothing ran → nothing leaked),
+# and the notify-stub checkpoint is loudly skipped (never a false fail) when there is no herdr.
+[ "$(cp_status "$SCS" notify_hermetic)" = "pass" ] || fail "(A) notify_hermetic should pass on the skip path"
+[ "$(cp_status "$SCS" notify_stubbed)" = "skip" ]  || fail "(A) notify_stubbed should be skip with no herdr"
 echo "PASS (A) SANDBOX_NO_HERDR=1 → clean loud skip (result=skip, exit 0, 0 fails)"
 
 # ── build a FILE-BACKED stub `herdr` (a JSON state machine — no real panes, no server) ────────────

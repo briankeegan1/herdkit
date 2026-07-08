@@ -46,6 +46,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=scripts/herd/sim/sandbox-fixture.sh
 . "$HERE/sandbox-fixture.sh"
+# shellcheck source=scripts/herd/sim/sim-notify-stub.sh
+. "$HERE/sim-notify-stub.sh"   # notify hermeticity (HERD-139) — installed after the herdr probe
 
 # ── output helpers (mirror the sandbox-sim family's style) ──────────────────────────────────────
 c_bold=$'\033[1m'; c_dim=$'\033[2m'
@@ -184,7 +186,7 @@ else
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
-            pane_captured reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
+            pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
             builder_agent_dead builder_refix_escalates_on_dead teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
@@ -309,6 +311,29 @@ except Exception:
     fi
     # Optional screenshot at the 'done' checkpoint; degrades gracefully (no-false-red).
     take_screenshot "control-room"
+  fi
+
+  # ── notify hermeticity (HERD-139): stub ONLY notify, keep REAL panes ───────────────────────────
+  # The lib-mode phases that follow (reviewer-retire, dead-eyes refix) run the DEFAULT herdr-claude
+  # driver and call herd_driver_notify → a REAL `herdr notification show` on the operator's desktop
+  # (the dead-eyes refix genuinely fires a '💀 agent dead' alarm). Install the shared notify stub HERE
+  # — AFTER the timing-sensitive agent-status transition phase above, so the real herdr answers those
+  # polls with no added latency (verdicts byte-identical) — a PATH-stubbed `herdr` that intercepts ONLY
+  # the `notification` subcommand and FORWARDS every other subcommand to the real herdr. Prove it: a
+  # probe notification is CAPTURED (never delivered) while real herdr still answers non-notify calls.
+  step notify "real-panes tier stubs ONLY notify (real panes kept; notification captured, not delivered)"
+  sim_notify_install "$ART"
+  # shellcheck source=scripts/herd/driver.sh
+  . "$HERE/../driver.sh"   # herd_driver_notify (functions only; no side effects)
+  _rp_before="$(sim_notify_captured_count 'RP NOTIFY PROBE')"
+  ( unset HERD_DRIVER; herd_driver_notify "🔔 RP NOTIFY PROBE" "real-panes notify must be stubbed, not delivered" default )
+  _rp_after="$(sim_notify_captured_count 'RP NOTIFY PROBE')"
+  _rp_herdr_live=no; herdr workspace list >/dev/null 2>&1 && _rp_herdr_live=yes   # forwarded to REAL herdr
+  _rp_native="$(sim_notify_native_attempts)"
+  if [ "$_rp_after" -gt "$_rp_before" ] && [ "$_rp_herdr_live" = yes ] && [ "$_rp_native" = 0 ]; then
+    checkpoint notify_stubbed pass "herdr notification INTERCEPTED to the sink (captured=$_rp_after); real herdr still answers non-notify commands; zero native desktop notifications"
+  else
+    checkpoint notify_stubbed fail "real-panes notify stub failed (captured before=$_rp_before after=$_rp_after; herdr_live=$_rp_herdr_live; native=$_rp_native)"
   fi
 
   # ── REVIEWER-PANE LIFECYCLE (HERD-113): the reviewer pane is GONE after its verdict is consumed ──
@@ -546,6 +571,18 @@ except Exception:
       checkpoint teardown_clean fail "teardown left residue (workspace=$WS_GONE, leaked_tabs=$LEAKED_TABS)"
     fi
   fi
+fi
+
+# ── notify hermeticity invariant (HERD-139) ─────────────────────────────────────────────────────
+# Across the whole run (every lib-mode escalation the phases drove) not one notification may have
+# reached a real desktop channel. The notify stub captures any native osascript/notify-send attempt;
+# with the fix this is 0 — a non-zero count means a real-pane phase leaked an alarm to the desktop.
+step notify-invariant "harness invariant — zero notifications delivered outside the sink"
+_notify_native="$(sim_notify_native_attempts)"
+if [ "$_notify_native" = 0 ]; then
+  checkpoint notify_hermetic pass "no native desktop notification fired during the run (all notifications captured to the sink)"
+else
+  checkpoint notify_hermetic fail "$_notify_native native desktop notification(s) LEAKED outside the sink (see ${SIM_NOTIFY_CAPTURED:-unset})"
 fi
 
 # ── SCORECARD emitter (machine-readable JSON; mirrors the sandbox-sim family + real-pane fields) ──
