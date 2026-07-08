@@ -82,7 +82,7 @@ echo "report → $REPORTS/$REQ_ID.md  (fetch with: research-get.sh $REQ_ID)"
 #    Capture the roster ONCE so the liveness corroboration below reads the SAME snapshot (no second
 #    call / TOCTOU).
 HEARTBEAT="${RESEARCH_HEARTBEAT:-$TREES/.research.heartbeat}"
-AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
+AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 if printf '%s' "$AGENTS_JSON" | NAME="$HERD_AGENT_RESEARCHER" WS="$_WS_ID" python3 -c '
 import sys,json,os
 ws=os.environ.get("WS","")

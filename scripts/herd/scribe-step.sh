@@ -32,6 +32,10 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the "scribed" notification through herd_driver_notify so a headless run
+# records it in the durable notifications.log sink instead of firing a real desktop notification.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 # journal.sh gives backend state-writes their attribution record (HERD-85): a tracker_write event per
 # transition. Best-effort — the sourced journal_append can never break a caller. Attribute every
 # backend dispatch from this drainer to the 'scribe' component (the explicit-ref reconcile path in
@@ -77,7 +81,7 @@ _report_and_cleanup() {
   short=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '-------')
   printf '%s · %s\n' "$sum" "$short" > "$RECEIPT"
   printf '[%s] %s · %s\n' "$(date '+%H:%M')" "$sum" "$short" >> "$INBOX"
-  herdr notification show "✍️ Backlog scribed" --body "$sum" --sound done >/dev/null 2>&1 || true
+  herd_driver_notify "✍️ Backlog scribed" "$sum" done
   rm -f "$mine"
   echo "$out $short"
 }

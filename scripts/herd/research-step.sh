@@ -16,6 +16,10 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the "research ready" notification through herd_driver_notify so a headless
+# run records it in the durable notifications.log sink instead of firing a real desktop notification.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 # Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed researcher drainer can
 # be detected and reclaimed by research.sh. Best-effort; never affects this script's stdout.
 . "$HERE/drainer-liveness.sh"
@@ -67,7 +71,7 @@ case "$cmd" in
     mkdir -p "$REPORTS"
     mv -f "$findings" "$REPORTS/$id.md"
     printf '[%s] %s · %s\n' "$(date '+%H:%M')" "$id" "$question" >> "$INBOX"
-    herdr notification show "🔎 Research ready" --body "$id: $question" --sound done >/dev/null 2>&1 || true
+    herd_driver_notify "🔎 Research ready" "$id: $question" done
     rm -f "$mine"
     echo "DONE $id → $REPORTS/$id.md"
     ;;

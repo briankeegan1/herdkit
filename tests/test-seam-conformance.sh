@@ -75,7 +75,7 @@ RAW_ANSI_PATTERN='\\(033|e|x1b|u001b)\['
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 # raw-runtime: the lanes/consoles that still hard-wire herdr (driver-portability migration P2–P5).
-GF_raw_runtime="agent-watch.sh bin/herd coordinator.sh fleet.sh herd-feature.sh herd-resolve.sh herd-review.sh research-step.sh research.sh scribe-step.sh scribe.sh status.sh"
+GF_raw_runtime="agent-watch.sh bin/herd coordinator.sh fleet.sh herd-feature.sh herd-resolve.sh herd-review.sh status.sh"
 
 # config-source: bin/herd reads a specific project's REVIEW_CHECKLIST inline; fleet.sh reads FOREIGN
 # projects' configs during fan-out (a legitimate cross-project read the current-project loader can't do).
