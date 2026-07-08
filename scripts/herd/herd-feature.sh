@@ -223,7 +223,16 @@ if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
     exit 1
   fi
 else
-  _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"
+  # HERD-136: guard the launch so a failed 'agent start' (e.g. a residual agent_name_taken race) never
+  # aborts the lane leaving the tab we just created above as an empty corpse tab that nothing reaps.
+  # Close the just-created tab on the failure path and journal the reap before bailing (fail-soft; the
+  # success path is byte-identical — the same argv is captured whether or not it is wrapped in `if`).
+  if ! _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"; then
+    herdr tab close "$TAB" >/dev/null 2>&1 || true
+    journal_append infra_event component builder agent "$SLUG" reason spawn_agent_failed tab "$TAB"
+    echo "❌ herdr: could not start the builder agent for '$SLUG' — closed the empty tab; worktree is ready at $DIR." >&2
+    exit 1
+  fi
   # HERD-135: LABEL the freshly-created agent pane with the slug so the dead-agent-eyes probe reads its
   # role by label (and can still find it if the agent is later delisted) instead of positional/cmdline
   # guessing. Best-effort: parse the pane id from the start result, else resolve via the roster; a

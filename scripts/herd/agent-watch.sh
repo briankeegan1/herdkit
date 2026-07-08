@@ -3551,7 +3551,17 @@ _respawn_builder_in_worktree() {
   # Register in the sweep allowlist so only engine-created tabs are ever swept (mirrors the lane).
   printf '%s %s builder\n' "$_rw_slug" "$_rw_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
   # shellcheck disable=SC2086  # $_rw_flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS).
-  herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1
+  if herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1; then
+    return 0
+  fi
+  # agent start FAILED after the tab was already created — the exact HERD-136 corpse-tab shape: a
+  # residual 'agent_name_taken' race (the dead builder's agent name still held in herdr) leaves the
+  # just-created tab as empty shrapnel that nothing reaps (the observed wE:tMP/tMQ corpses). Close it
+  # on the failure path and journal the reap; the caller escalates via its 💀 notification and does NOT
+  # spend the at-most-once budget (mirrors the drainers' agent_name_taken cleanup in research/scribe.sh).
+  herdr tab close "$_rw_tab" >/dev/null 2>&1 || true
+  journal_append builder_respawn_tab_reaped slug "$_rw_slug" tab "$_rw_tab"
+  return 1
 }
 
 # _maybe_autorespawn_dead_builder <slug> <worktree> — drive the bounded auto-respawn for ONE slug that

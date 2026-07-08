@@ -34,12 +34,17 @@ cat > "$BIN/herdr" <<'STUB'
 #   notification show <title> …  → append <title> to $HERDR_NOTIFY_LOG
 #   workspace list               → empty workspace set (spawn proceeds unpinned, no --workspace)
 #   tab create …                 → valid JSON with a fake tab + root pane id
-#   agent start <slug> …         → append the whole invocation to $HERDR_AGENT_LOG (proof of respawn)
+#   agent start <slug> …         → append the whole invocation to $HERDR_AGENT_LOG (proof of respawn);
+#                                  exits NON-ZERO when HERDR_AGENT_START_FAIL is set (simulates the
+#                                  residual agent_name_taken race the HERD-136 cleanup path guards).
+#   tab close <id>               → append <id> to $HERDR_TAB_CLOSE_LOG (proof the corpse tab is reaped)
 case "${1:-}/${2:-}" in
   notification/show) printf '%s\n' "${3:-}" >> "${HERDR_NOTIFY_LOG:?HERDR_NOTIFY_LOG unset}" ;;
   workspace/list)    printf '%s\n' '{"result":{"workspaces":[]}}' ;;
   tab/create)        printf '%s\n' '{"result":{"tab":{"tab_id":"tab-fake"},"root_pane":{"pane_id":"pane-fake"}}}' ;;
-  agent/start)       printf '%s\n' "$*" >> "${HERDR_AGENT_LOG:?HERDR_AGENT_LOG unset}" ;;
+  tab/close)         printf '%s\n' "${3:-}" >> "${HERDR_TAB_CLOSE_LOG:-/dev/null}" ;;
+  agent/start)       printf '%s\n' "$*" >> "${HERDR_AGENT_LOG:?HERDR_AGENT_LOG unset}"
+                     [ -n "${HERDR_AGENT_START_FAIL:-}" ] && exit 1 ;;
 esac
 exit 0
 STUB
@@ -63,6 +68,7 @@ DEAD_RESPAWN_STATE="$T/.agent-watch-respawn"
 DEFAULT_BRANCH="main"                    # local base ref (no origin/ in this hermetic repo)
 export HERDR_NOTIFY_LOG="$T/notify.log"; : > "$HERDR_NOTIFY_LOG"
 export HERDR_AGENT_LOG="$T/agent.log";   : > "$HERDR_AGENT_LOG"
+export HERDR_TAB_CLOSE_LOG="$T/tabclose.log"; : > "$HERDR_TAB_CLOSE_LOG"
 export JOURNAL_FILE="$T/journal.log"     # keep journal_append writes inside the temp dir if honored
 NOW=1000000000
 
@@ -111,7 +117,7 @@ ok
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # End-to-end reconciliation via _maybe_autorespawn_dead_builder (the DEAD-crossing entry point).
 # reset — truncate every captured surface between scenarios.
-reset() { : > "$HERDR_NOTIFY_LOG"; : > "$HERDR_AGENT_LOG"; : > "$DEAD_RESPAWN_STATE"; }
+reset() { : > "$HERDR_NOTIFY_LOG"; : > "$HERDR_AGENT_LOG"; : > "$DEAD_RESPAWN_STATE"; : > "$HERDR_TAB_CLOSE_LOG"; : > "$JOURNAL_FILE"; }
 
 # ── (1) OFF never respawns — byte-inert: no spawn, no ledger, no notification ──────────────────────
 reset
@@ -178,6 +184,20 @@ v="$(DRYRUN=1 DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$NOW" _maybe_autorespa
 [ "$v" = "RESPAWN" ]                   || fail "(5) dry-run still classifies RESPAWN, got $v"
 [ -s "$HERDR_AGENT_LOG" ]             && fail "(5) DRYRUN must NOT start an agent"
 respawn_recorded dry-slug             && fail "(5) DRYRUN must NOT write the ledger"
+ok
+
+# ── (6) HERD-136: ON + clean but agent start FAILS after the tab was created (a residual
+#        agent_name_taken race) → the just-created tab MUST be closed (no corpse-tab shrapnel like the
+#        observed wE:tMP/tMQ), the reap MUST be journaled, and the at-most-once budget is NOT spent. ──
+reset
+mkrepo "$T/wt-taken" clean; printf 'spec\n' > "$TREES/taken-slug.task.md"
+v="$(HERDR_AGENT_START_FAIL=1 DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$NOW" _maybe_autorespawn_dead_builder taken-slug "$T/wt-taken" 2>/dev/null)"
+[ "$v" = "RESPAWN" ]                                    || fail "(6) verdict is still RESPAWN (the spawn ATTEMPT is what fails), got $v"
+grep -q "agent start taken-slug" "$HERDR_AGENT_LOG"    || fail "(6) the respawn must have ATTEMPTED an agent start"
+grep -q "tab-fake" "$HERDR_TAB_CLOSE_LOG"              || fail "(6) a failed agent start MUST close the just-created tab (no corpse tab)"
+grep -q "builder_respawn_tab_reaped" "$JOURNAL_FILE"  || fail "(6) the corpse-tab cleanup must be journaled"
+respawn_recorded taken-slug                            && fail "(6) a failed respawn must NOT spend the at-most-once budget"
+grep -q "auto-respawn failed: taken-slug" "$HERDR_NOTIFY_LOG" || fail "(6) a failed respawn should still escalate"
 ok
 
 echo "ALL PASS ($pass checks)"
