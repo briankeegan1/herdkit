@@ -541,7 +541,14 @@ _herd_herdr_start_agent() {
   printf '%s %s builder\n' "$slug" "$tab" >> "${WORKTREES_DIR:-.}/.herd-tabs" 2>/dev/null || true
   : "${flags:=--dangerously-skip-permissions}"
   # shellcheck disable=SC2086  # $wsid/$flags intentionally word-split (mirror the lane's args)
-  herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- claude --model "$model" $flags "$pointer" >/dev/null 2>&1
+  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- claude --model "$model" $flags "$pointer" >/dev/null 2>&1; then
+    return 0
+  fi
+  # HERD-136: agent start failed after we created the tab — close it so no empty corpse tab lingers,
+  # then journal the reap (guarded: not every caller of this helper sources journal.sh).
+  herdr tab close "$tab" >/dev/null 2>&1 || true
+  command -v journal_append >/dev/null 2>&1 && journal_append infra_event component builder agent "$slug" reason spawn_agent_failed tab "$tab"
+  return 1
 }
 
 # ── start-agent (generalized) ──────────────────────────────────────────────────────────────────────
