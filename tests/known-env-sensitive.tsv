@@ -18,15 +18,14 @@
 #   platforms   CSV of ubuntu|macos|windows (or `all`) the allowance applies to
 #   reason      one-line why-it's-env-sensitive (shown in the CI log)
 name	platforms	reason
-# ── bats-path rows: keyed by the bats TEST DESCRIPTION (not a filename) ──────────────────────────
 # test-backlog-view-rich case 5 asserts the rich OSC 8 chip is wrapped ONCE (the item's own url),
 # but render_backend_frame pipes rich output — already self-wrapped by rich_to_md — through
 # osc8_linkify a second time, double-wrapping the chip. This FAILS on origin/main too, on every
 # environment I can reproduce (python 3.9/3.12/3.14, BSD + GNU tools, C/UTF-8 locales); it passes
 # only on the maintainer's blessed box. Pre-existing engine fragility, NOT introduced by HERD-167 —
 # documented here rather than hacked green or chased with an engine-render change this PR cannot validate.
-hermetic backlog-view rich-render test passes	ubuntu,macos	pre-existing OSC8 rich-render double-wrap; fails on origin/main outside the maintainer's env (not this PR)
-# ── direct-path rows: keyed by the test FILE basename ────────────────────────────────────────────
+test-backlog-view-rich.sh	ubuntu,macos	pre-existing OSC8 rich-render double-wrap; fragile outside the maintainer's env (safety-net row — not this PR; typically passes on a clean no-herdr CI runner)
+# ── the rows below rebuild a minimal PATH via `env -i` — Git-Bash-only, kept as reference ─────────
 # These rebuild a minimal PATH via `env -i ... PATH=/usr/bin:/bin` to prove behavior under
 # a stripped environment; python3 lives there on Linux/macOS but NOT under Git-for-Windows,
 # so the reconstructed env cannot find python3. WSL2 fixes them outright.

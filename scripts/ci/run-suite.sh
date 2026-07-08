@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
 # scripts/ci/run-suite.sh — the cross-platform CI test-suite runner.
 #
-# Mirrors the fallback in .herd/healthcheck.project.sh (the authoritative merge gate):
-# run `bats tests/*.bats` when bats is installed and *.bats exist, otherwise run the
-# hermetic `tests/test-*.sh` suite directly. The CI matrix (ubuntu/macos/windows) calls
-# THIS so all three legs share one runner and one notion of "green".
+# Runs the CURATED hermetic suite — the exact tests/test-*.sh files the auto-merge watcher's
+# gate (tests/herd.bats) wraps — directly, one process per test, each with a per-test timeout.
 #
-# The one thing this adds over the healthcheck runner: honest handling of KNOWN
-# ENV-SENSITIVE tests. Some hermetic tests assume a Unix layout that Git Bash on Windows
-# does not provide — e.g. they rebuild a minimal PATH as `env -i ... PATH=/usr/bin:/bin`,
-# where python3 lives on real Linux/macOS but NOT under Git-for-Windows (docs/windows.md).
-# Those are listed, per-platform, in an allowlist. A listed test that fails is reported as
-# XFAIL (env-sensitive) and does NOT fail the leg; an UNLISTED failure is a real red. This
-# is the pass-with-skips convention (PR #274): mark, never silently skip, never hack green.
+# WHY DIRECT AND NOT `bats`: a `bats` run over this suite HANGS on a headless CI leg. A hermetic
+# test that leaks a background process (a watcher/drainer that outlives the test) inherits bats's
+# internal FD 3, and bats blocks on that FD's EOF forever — after the test itself has passed, so
+# BATS_TEST_TIMEOUT can't catch it. Running each test as `timeout N bash test.sh >logfile` is
+# immune: the shell waits only on its DIRECT child (bash), never on a leaked grandchild, and the
+# leaked process writes to a plain file, not a pipe anyone reads. (The watcher still gates on bats
+# on the maintainer's box, where herdr is present and nothing leaks — this runner mirrors WHICH
+# tests it runs, not the harness.) NOTE: herd.bats's 3 INLINE structural @tests (bash -n clean,
+# no-single-consumer-literal, render-no-leftover-tokens) are not wrapped test files and so are not
+# run here; they are covered by the healthcheck (bash -n) and the watcher's heavy gate.
+#
+# HONEST env-sensitive handling: some tests only pass in the maintainer's blessed environment (see
+# tests/known-env-sensitive.tsv). A listed test that fails on a matching platform is reported as
+# XFAIL and does NOT fail the leg; an UNLISTED failure (incl. a timeout) is a real red. Mark, never
+# silently skip, never hack green (the PR #274 convention).
 #
 # Exit: 0 = no real failures (env-sensitive XFAILs allowed) · 1 = a real failure · 2 = usage/setup.
 #
 # Env knobs (used by the CI workflow and by tests/test-ci-run-suite.sh):
 #   HERD_CI_PLATFORM     ubuntu | macos | windows   (default: derived from uname)
 #   HERD_CI_TESTS_DIR    directory holding the tests (default: <repo>/tests)
-#   HERD_CI_TEST_GLOB    test filename glob          (default: test-*.sh)
+#   HERD_CI_TEST_GLOB    test filename glob for ALL-mode (default: test-*.sh)
 #   HERD_CI_ALLOWLIST    env-sensitive allowlist tsv (default: <tests>/known-env-sensitive.tsv)
-#   HERD_CI_FORCE_DIRECT 1 = never use bats, always run *.sh directly (deterministic in tests)
+#   HERD_CI_TEST_TIMEOUT per-test timeout seconds    (default: 180; needs coreutils timeout/gtimeout)
+#   HERD_CI_FORCE_DIRECT 1 = run ALL test-*.sh (the glob), not just the curated herd.bats subset
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +37,16 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 TESTS_DIR="${HERD_CI_TESTS_DIR:-$ROOT/tests}"
 TEST_GLOB="${HERD_CI_TEST_GLOB:-test-*.sh}"
 ALLOWLIST="${HERD_CI_ALLOWLIST:-$TESTS_DIR/known-env-sensitive.tsv}"
+CURATED_SRC="$TESTS_DIR/herd.bats"
+PER_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-120}"
+
+# `herd reload` (exercised by test-cli-backend-switch and others) relaunches a HEADLESS background
+# watcher when herdr is absent — which a clean CI runner always is. That daemon lingers, holding the
+# test's output pipe open, so the test's own `$(herd reload …)` never returns (hang) or the test runs
+# for minutes retrying. HERD_RELOAD_SKIP_LAUNCH=1 is the engine's built-in test/CI knob that skips the
+# watcher launch (the reload still re-renders the skill + reports "skipped"); with it the suite runs
+# clean in ~70s with no leaked daemons. Harmless where herdr IS present (nothing to leak).
+export HERD_RELOAD_SKIP_LAUNCH="${HERD_RELOAD_SKIP_LAUNCH:-1}"
 
 # ── platform detection (overridable so tests are deterministic) ──────────────────
 detect_platform() {
@@ -43,14 +60,19 @@ detect_platform() {
 }
 PLATFORM="$(detect_platform)"
 
+# ── a per-test timeout wrapper, if the coreutils binary is present (else run bare) ─
+TO=""
+for _c in timeout gtimeout; do
+  if command -v "$_c" >/dev/null 2>&1; then TO="$_c $PER_TEST_TIMEOUT"; break; fi
+done
+
 # ── allowlist lookup ─────────────────────────────────────────────────────────────
 # A test is env-sensitive on this platform if a row `name<TAB>platforms<TAB>reason`
-# lists it with either the current platform or the literal `all` in the CSV platforms
-# column. Returns the reason on stdout (rc 0) or nothing (rc 1).
+# lists it (by test-file basename) with either the current platform or `all` in the CSV
+# platforms column. Returns the reason on stdout (rc 0) or nothing (rc 1).
 allow_reason() {
   local name="$1"
   [ -f "$ALLOWLIST" ] || return 1
-  # Read tab-separated rows, skip blanks and comments.
   while IFS=$'\t' read -r a_name a_plats a_reason; do
     case "$a_name" in ''|'#'*) continue ;; esac
     [ "$a_name" = "$name" ] || continue
@@ -61,100 +83,55 @@ allow_reason() {
   return 1
 }
 
-# ── bats path (mirror the healthcheck) ───────────────────────────────────────────
-if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] \
-   && command -v bats >/dev/null 2>&1 \
-   && ls "$TESTS_DIR"/*.bats >/dev/null 2>&1; then
-  echo "▶ bats: running $TESTS_DIR/*.bats on ${PLATFORM}"
-  # --print-output-on-failure surfaces the wrapped test's own stderr (bats otherwise shows only the
-  # failed assertion line). Older bats-core lacks the flag → fall back to a plain run.
-  bats_flags="--tap"
-  bats --print-output-on-failure --version >/dev/null 2>&1 && bats_flags="--tap --print-output-on-failure"
-  # HANG-PROOFING (a headless CI leg once stalled for 25 min):
-  #   • Redirect bats to a FILE, never a $(...) capture — a test that leaks a background process
-  #     inheriting the capture pipe's write end makes command substitution block on EOF forever,
-  #     even after bats itself exits. A file redirect only waits on bats (its direct child).
-  #   • BATS_TEST_TIMEOUT kills any single wedged test so bats keeps going (it becomes `not ok`).
-  #   • An overall `timeout` wrapper (when available) bounds the whole run as a last-resort backstop.
-  #   • stdin from /dev/null so nothing blocks reading a tty that isn't there.
-  bats_tap="$(mktemp 2>/dev/null || echo /tmp/herd-bats.$$.tap)"
-  TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 900"
-  command -v timeout >/dev/null 2>&1 || { command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 900"; }
-  # shellcheck disable=SC2086
-  BATS_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-180}" $TO bats $bats_flags "$TESTS_DIR"/*.bats </dev/null >"$bats_tap" 2>&1
-  bats_rc=$?
-  cat "$bats_tap"
-  bats_out="$(cat "$bats_tap")"
-  if [ "$bats_rc" -eq 124 ]; then
-    echo "❌ CI SUITE FAILED (bats) on ${PLATFORM}: overall run exceeded the 900s cap (a test likely leaked a background process). Last TAP line: $(tail -1 "$bats_tap")"
-    exit 1
-  fi
-  if [ "$bats_rc" -eq 0 ]; then
-    echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM}"
-    exit 0
-  fi
-  # A failure: classify each TAP `not ok <n> <description>` against the allowlist (keyed by the bats
-  # DESCRIPTION for the bats path). An allowlisted failure on this platform is an XFAIL; any other is
-  # a real red. Same honest convention as the direct path — mark, never silently pass.
-  real=0; xf=0
-  while IFS= read -r line; do
-    case "$line" in
-      "not ok "*) : ;;
-      *) continue ;;
-    esac
-    # Strip the leading `not ok <n> ` and any trailing TAP directive (` # timeout after …`, ` # SKIP …`).
-    desc="$(printf '%s' "$line" | sed -E 's/^not ok [0-9]+ //; s/ # .*$//')"
-    if reason="$(allow_reason "$desc")"; then
-      xf=$((xf+1)); echo "⚠️  XFAIL (env-sensitive) bats: $desc — $reason"
-    else
-      real=$((real+1)); echo "❌ real bats failure: $desc"
-    fi
-  done <<EOF
-$bats_out
-EOF
-  if [ "$real" -eq 0 ] && [ "$xf" -gt 0 ]; then
-    echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM} ($xf env-sensitive XFAIL, 0 real)"
-    exit 0
-  fi
-  echo "❌ CI SUITE FAILED (bats) on ${PLATFORM} ($real real failure(s), $xf XFAIL)"
-  exit 1
+# ── select the test files: curated (herd.bats subset) by default, else the glob ──
+tests=()
+if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
+  MODE="curated"
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$TESTS_DIR/$f" ] && tests+=("$TESTS_DIR/$f")
+  done < <(grep -oE 'test-[a-z0-9-]+\.sh' "$CURATED_SRC" | sort -u)
+else
+  MODE="all"
+  shopt -s nullglob
+  tests=( "$TESTS_DIR"/$TEST_GLOB )
+  shopt -u nullglob
 fi
-
-# ── direct path: run every hermetic tests/test-*.sh, classify each result ─────────
-shopt -s nullglob
-tests=( "$TESTS_DIR"/$TEST_GLOB )
-shopt -u nullglob
 if [ "${#tests[@]}" -eq 0 ]; then
-  echo "❌ no tests matched $TESTS_DIR/$TEST_GLOB" >&2
+  echo "❌ no tests selected (mode=$MODE, dir=$TESTS_DIR)" >&2
   exit 2
 fi
 
+# ── run each test in its own process, classify the result ────────────────────────
 pass=0; real_fail=0; xfail=0
 real_names=(); xfail_names=()
 LOGDIR="$(mktemp -d 2>/dev/null || echo /tmp/herd-ci-logs.$$)"; mkdir -p "$LOGDIR"
-echo "▶ direct: running ${#tests[@]} hermetic tests on ${PLATFORM}"
+[ -n "$TO" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
+echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, timeout=${TO:-none}) on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
-  if bash "$t" >"$log" 2>&1; then
-    pass=$((pass+1))
+  # shellcheck disable=SC2086
+  $TO bash "$t" </dev/null >"$log" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pass=$((pass+1)); continue
+  fi
+  timedout=""; [ "$rc" -eq 124 ] && timedout=" (TIMEOUT after ${PER_TEST_TIMEOUT}s)"
+  if reason="$(allow_reason "$name")"; then
+    xfail=$((xfail+1)); xfail_names+=("$name — $reason")
+    echo "⚠️  XFAIL (env-sensitive) $name$timedout: $reason"
   else
-    if reason="$(allow_reason "$name")"; then
-      xfail=$((xfail+1)); xfail_names+=("$name — $reason")
-      echo "⚠️  XFAIL (env-sensitive) $name: $reason"
-    else
-      real_fail=$((real_fail+1)); real_names+=("$name")
-      echo "❌ FAIL $name — last lines:"
-      tail -n 6 "$log" | sed 's/^/      │ /'
-    fi
+    real_fail=$((real_fail+1)); real_names+=("$name$timedout")
+    echo "❌ FAIL $name$timedout — last lines:"
+    tail -n 6 "$log" | sed 's/^/      │ /'
   fi
 done
 
 echo
-echo "── CI suite summary (${PLATFORM}) ─────────────────────────────"
-echo "   passed:              $pass"
+echo "── CI suite summary (${PLATFORM}, mode=$MODE) ─────────────────"
+echo "   passed:                $pass"
 echo "   XFAIL (env-sensitive): $xfail"
-echo "   real failures:       $real_fail"
+echo "   real failures:         $real_fail"
 if [ "$xfail" -gt 0 ]; then
   printf '   · %s\n' "${xfail_names[@]}"
 fi

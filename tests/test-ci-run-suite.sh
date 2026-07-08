@@ -41,15 +41,15 @@ run() {  # run(platform) -> sets RC + OUT
 # (1) ubuntu: the env-sensitive test is NOT allowlisted here → counts as a real failure → rc 1.
 run ubuntu
 [ "$RC" -eq 1 ] || fail "ubuntu: expected rc 1 (real failures), got $RC"
-printf '%s\n' "$OUT" | grep -q "real failures:       2" || fail "ubuntu: expected 2 real failures.  Got:\n$OUT"
-printf '%s\n' "$OUT" | grep -q "passed:              1" || fail "ubuntu: expected 1 pass.  Got:\n$OUT"
+printf '%s\n' "$OUT" | grep -qE "real failures: +2" || fail "ubuntu: expected 2 real failures.  Got:\n$OUT"
+printf '%s\n' "$OUT" | grep -qE "passed: +1" || fail "ubuntu: expected 1 pass.  Got:\n$OUT"
 pass
 
 # (2) windows: test-flaky-env.sh is allowlisted → XFAIL, only test-red.sh is a real failure → rc 1.
 run windows
 [ "$RC" -eq 1 ] || fail "windows: expected rc 1 (one real failure remains), got $RC"
 printf '%s\n' "$OUT" | grep -q "XFAIL (env-sensitive) test-flaky-env.sh" || fail "windows: expected XFAIL line.  Got:\n$OUT"
-printf '%s\n' "$OUT" | grep -q "real failures:       1" || fail "windows: expected 1 real failure.  Got:\n$OUT"
+printf '%s\n' "$OUT" | grep -qE "real failures: +1" || fail "windows: expected 1 real failure.  Got:\n$OUT"
 pass
 
 # (3) an all-green suite exits 0 on every platform.

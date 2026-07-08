@@ -11,11 +11,12 @@ name: CI
 #                        + docs sanity + `bash -n`. NOT the full suite chasing Git Bash greens,
 #                        and it does NOT spin up nested WSL inside the runner. Advisory only.
 #
-# The suite is HERMETIC (stubs claude/herdr/gh, no network). scripts/ci/run-suite.sh mirrors
-# .herd/healthcheck.project.sh's own fallback: with bats installed (as below, and as on the
-# auto-merge watcher) it runs the curated `tests/*.bats` gate — the SAME authoritative set the
-# watcher gates on; without bats it runs tests/test-*.sh directly, marking KNOWN env-sensitive
-# tests XFAIL via tests/known-env-sensitive.tsv (never hacked green).
+# The suite is HERMETIC (stubs claude/herdr/gh, no network). scripts/ci/run-suite.sh runs the SAME
+# curated set the auto-merge watcher gates on (the tests/test-*.sh files tests/herd.bats wraps),
+# but DIRECTLY — one `timeout N bash test.sh` per test — rather than via `bats`, which hangs on a
+# headless leg when a hermetic test leaks a background process holding bats's FD 3 (see the runner's
+# header). Known env-sensitive tests are marked XFAIL via tests/known-env-sensitive.tsv (never hacked
+# green); any other failure — including a per-test timeout — is a real red.
 
 on:
   push:
@@ -64,10 +65,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install bats (curated gate — mirrors the auto-merge watcher)
-        run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then brew install bats-core; else sudo apt-get update && sudo apt-get install -y bats; fi
-          bats --version
       - name: macOS — GNU coreutils/grep/sed/awk on PATH (match the maintainer's Homebrew env)
         if: runner.os == 'macOS'
         run: |
