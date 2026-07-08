@@ -187,6 +187,8 @@ WATCHER_SCOPE	unit	tests/test-team-mode.sh
 WATCHER_OWNER	unit	tests/test-team-mode.sh
 REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_CONCURRENCY	unit	tests/test-gate-dispatch.sh
+NATIVE_BURST	unit	tests/test-native-burst.sh
+REVIEW_PANEL	unit	tests/test-native-burst.sh
 SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
