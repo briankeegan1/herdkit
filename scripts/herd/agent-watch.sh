@@ -4667,6 +4667,73 @@ _watcher_tick_fields() {
   printf '%s' "$_wtf"
 }
 
+# ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
+# _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
+# record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
+# slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits records on stdout,
+# one per line, in the exact field order the tick loop consumes.
+#
+# DISCOVERY SCOPE (HERD-182): a worktree is a builder candidate ONLY when BOTH hold —
+#   1. it lives UNDER $WORKTREES_DIR ($TREES) — every builder worktree is $WORKTREES_DIR/<slug>,
+#      including this watcher's own SELF_WT; and
+#   2. it is on a BRANCH, not a detached HEAD — builders are always spawned onto a branch, so a
+#      detached-HEAD worktree is never a builder.
+# A worktree failing EITHER test (a stray `git worktree add --detach HEAD /tmp/hk-base`, or any
+# worktree outside the herd tree) is a PHANTOM: it has no agent and no PR, so the old parse rendered
+# it as a spurious 💀 dead-builder row and confused the operator (GROUNDED: a detached HEAD at
+# /tmp/hk-base surfaced as a phantom dead-builder row). Filtering it here keeps it out of the roster
+# entirely, so it never reaches the dead-builder reconciliation. FAIL-SOFT: when $TREES is empty
+# (unconfigured), the scope test is skipped and behavior falls back to today's (MAIN-excluded, plus
+# the detached filter which alone catches the grounded incident). Paths are realpath-normalized before
+# comparison so a symlinked $WORKTREES_DIR still matches git's canonicalized worktree paths — a
+# legitimate builder row is NEVER dropped, and its emitted record is byte-identical to before.
+_discover_feature_worktrees() {
+  PRS_JSON="${PRS_JSON:-}" AGENTS_JSON="${AGENTS_JSON:-}" WT="${WT:-}" MAIN="${MAIN:-}" TREES="${TREES:-}" python3 -c '
+import os, json
+MAIN = os.environ.get("MAIN", "")
+TREES = os.environ.get("TREES", "")
+def _real(p):
+    try: return os.path.realpath(p)
+    except Exception: return p
+main_real = _real(MAIN) if MAIN else ""
+trees_real = _real(TREES) if TREES else ""
+def _under_trees(p):
+    # Fail-soft: no $WORKTREES_DIR configured → do not scope (detached filter still applies).
+    if not trees_real: return True
+    pr = _real(p)
+    return pr == trees_real or pr.startswith(trees_real + os.sep)
+try: prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+except Exception: prs = []
+try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") or {}).get("agents") or []
+except Exception: agents = []
+pr_by_branch = {p.get("headRefName"): p for p in prs}
+ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
+feats = []; wt = None; branch = None; detached = False
+def _emit(wt, branch, detached):
+    # A builder candidate is UNDER $WORKTREES_DIR, on a BRANCH (not detached), and not $MAIN.
+    if not wt: return
+    if MAIN and _real(wt) == main_real: return
+    if detached or not branch: return
+    if not _under_trees(wt): return
+    feats.append((wt, branch))
+for line in (os.environ.get("WT") or "").splitlines():
+    if line.startswith("worktree "): wt = line[9:]; branch = None; detached = False
+    elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
+    elif line == "detached": detached = True
+    elif line == "":
+        _emit(wt, branch, detached); wt = None; branch = None; detached = False
+_emit(wt, branch, detached)
+for wt, branch in feats:
+    slug = os.path.basename(wt)
+    pr = pr_by_branch.get(branch or "", {})
+    print("\x1f".join(str(x) for x in [
+        wt, slug, branch or "", pr.get("number", ""),
+        pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
+        ag_status.get(slug, ""), pr.get("headRefOid", ""),
+        (pr.get("author") or {}).get("login", "")]))
+'
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
 # the live watch loop. Direct execution runs the loop normally.
@@ -4985,37 +5052,14 @@ while true; do
   AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
-  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record
-  # per active feature worktree (the main checkout excluded).
+  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
+  # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
+  # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
+  # the main checkout is excluded as before. See _discover_feature_worktrees.
   FEATS=()
   while IFS= read -r rec; do
     [ -n "$rec" ] && FEATS+=("$rec")
-  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" python3 -c '
-import os, json
-MAIN = os.environ["MAIN"]
-try: prs = json.loads(os.environ.get("PRS_JSON") or "[]")
-except Exception: prs = []
-try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") or {}).get("agents") or []
-except Exception: agents = []
-pr_by_branch = {p.get("headRefName"): p for p in prs}
-ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
-feats = []; wt = None; branch = None
-for line in (os.environ.get("WT") or "").splitlines():
-    if line.startswith("worktree "): wt = line[9:]; branch = None
-    elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
-    elif line == "":
-        if wt and wt != MAIN: feats.append((wt, branch))
-        wt = None; branch = None
-if wt and wt != MAIN: feats.append((wt, branch))
-for wt, branch in feats:
-    slug = os.path.basename(wt)
-    pr = pr_by_branch.get(branch or "", {})
-    print("\x1f".join(str(x) for x in [
-        wt, slug, branch or "", pr.get("number", ""),
-        pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
-        ag_status.get(slug, ""), pr.get("headRefOid", ""),
-        (pr.get("author") or {}).get("login", "")]))
-')
+  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
