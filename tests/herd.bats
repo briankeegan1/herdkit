@@ -313,6 +313,8 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
+  run bash "$REPO/tests/test-watcher-discovery-scope.sh"
 @test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
   run bash "$REPO/tests/test-triggers.sh"
   [ "$status" -eq 0 ]
