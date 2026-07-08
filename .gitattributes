@@ -1,0 +1,46 @@
+# .gitattributes — force LF line endings on every engine file.
+#
+# WHY: herdkit is a bash engine. A CRLF checkout (the Git-for-Windows default,
+# `core.autocrlf=true`) silently breaks load-bearing files:
+#   • *.sh / bin/herd / install.sh — a trailing \r rides on the shebang and on every
+#     line, so `bash` reports `\r: command not found` or mis-parses `set -e`; sourced
+#     helpers fail the same way.
+#   • *.driver — shell-sourceable KEY=value driver bindings (templates/drivers/*.driver);
+#     CRLF appends \r to each rendered command SHAPE and corrupts the sourced values.
+#   • *.tsv — capabilities/conformance/models/governance manifests are read by exact-literal
+#     greps (e.g. the caps-sync gate, `herd conformance`); a \r on the last column breaks
+#     the match and the ratchet.
+#   • *.tmpl / *.example / *.bats — rendered or sourced as shell; same failure mode.
+# See docs/windows.md for the Git Bash / WSL2 story this normalization underpins.
+#
+# `text=auto eol=lf` normalizes any git-detected text file to LF in the working tree on
+# every platform; the explicit rules below pin the engine surfaces regardless of detection.
+* text=auto eol=lf
+
+# Shell + engine entrypoints (incl. the extensionless CLI).
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.bats      text eol=lf
+bin/herd    text eol=lf
+herd        text eol=lf
+
+# Sourced / rendered config surfaces that must stay LF-clean.
+*.driver    text eol=lf
+*.tsv       text eol=lf
+*.tmpl      text eol=lf
+*.example   text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+
+# True binaries: never normalize (defensive — the repo ships none today).
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.gz    binary
+*.zip   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
