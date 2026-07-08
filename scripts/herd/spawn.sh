@@ -13,6 +13,7 @@
 # Usage:
 #   spawn.sh <slug> quick  "<task text>"
 #   spawn.sh <slug> feature "<task text>"
+#   HERD_SPAWN_AFTER=<slug|pr#> spawn.sh <slug> feature "<task>"   # HELD until the dep merges (HERD-94)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -42,6 +43,16 @@ fi
 # Same ref set as the gate; empty when none (untracked spawn under an off/bypass policy).
 ITEM_REF="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
 
+# Dependency ordering (HERD-94): an OPTIONAL after=<slug|pr#> makes the watcher's drainer HOLD this
+# intent until that dependency shows MERGED (spawn B only after A lands), so a coordinator's wave plan
+# survives without the coordinator's live session. Sourced from HERD_SPAWN_AFTER (env). A leading '#'
+# on a PR number is stripped so 'after=#123' and 'after=123' are identical. Empty when unset — the
+# intent drains immediately, BYTE-IDENTICAL to a pre-HERD-94 spawn. Recorded in a SIDECAR
+# ($INTENT_ID.after), mirroring the .ref sidecar, so the positional slug/lane/task parse is unchanged
+# and an intent enqueued by an OLDER engine (no sidecar) still drains correctly (empty = no dependency).
+AFTER="${HERD_SPAWN_AFTER:-}"
+AFTER="${AFTER#\#}"
+
 # Enqueue atomically (temp then mv); filename sorts FIFO so oldest is drained first. The tracker ref
 # rides in a SIDECAR ($INTENT_ID.ref) rather than the .req body, so the positional slug/lane/task
 # parse (spawn-step.sh) is unchanged and an intent enqueued by an OLDER engine (no sidecar) still
@@ -50,9 +61,10 @@ ITEM_REF="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
 INTENT_ID="$(date +%s)-$$-$RANDOM"
 mkdir -p "$Q"
 [ -n "$ITEM_REF" ] && printf '%s\n' "$ITEM_REF" > "$Q/$INTENT_ID.ref"
+[ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
 tmp=$(mktemp "$Q/.tmp.XXXXXX")
 printf '%s\n%s\n%s\n' "$SLUG" "$LANE" "$TASK" > "$tmp"
 mv "$tmp" "$Q/$INTENT_ID.req"
 
-printf '🚀 queued: %s (%s)%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}"
+printf '🚀 queued: %s (%s)%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}"
 printf 'INTENT_ID %s\n' "$INTENT_ID"

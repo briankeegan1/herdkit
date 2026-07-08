@@ -9,12 +9,14 @@
 #                       <slug>
 #                       <lane>
 #                       <tracker ref>    (HERD-64; the $INTENT_ID.ref sidecar, EMPTY line when absent)
+#                       <after dep>      (HERD-94; the $INTENT_ID.after sidecar, EMPTY line when absent)
 #                       <task text>
 #                     Or print "EMPTY" when the queue has no pending intents. Returns immediately
-#                     (no polling wait — the watcher calls this on every tick). The ref line is
-#                     ALWAYS emitted (empty for an untracked / older-engine intent) so the drain's
-#                     positional read stays fixed; the watcher re-exports it as HERD_ITEM_REF.
-#   done <path>       Remove the claimed intent file (intent was successfully launched) + its ref sidecar.
+#                     (no polling wait — the watcher calls this on every tick). The ref AND after lines
+#                     are ALWAYS emitted (empty for an untracked / no-dependency / older-engine intent)
+#                     so the drain's positional read stays fixed; the watcher re-exports the ref as
+#                     HERD_ITEM_REF and HOLDS the intent while the after dependency is unmet (HERD-94).
+#   done <path>       Remove the claimed intent file (intent was successfully launched) + its sidecars.
 #   release <path>    Put a claimed intent BACK in the queue (.req.mine → .req) untouched — used
 #                     when the lane's advisory saturation gate deferred the spawn (held, not
 #                     failed): the intent must survive for a later tick, not be consumed. This is
@@ -54,6 +56,11 @@ case "$cmd" in
       # intent). The task follows on subsequent lines, so this keeps the reader's positional parse fixed.
       _ref="${claimed%.req.mine}.ref"
       if [ -f "$_ref" ]; then head -1 "$_ref"; else printf '\n'; fi
+      # after dependency (HERD-94) — from the $INTENT_ID.after sidecar, keyed off the claim path.
+      # ALWAYS one line: the sidecar's first line when present, else an empty line (no dependency /
+      # older intent). Keeps the reader's positional parse fixed just as the ref line above does.
+      _after="${claimed%.req.mine}.after"
+      if [ -f "$_after" ]; then head -1 "$_after"; else printf '\n'; fi
       tail -n +3 "$claimed"     # line 3+ of the .req: task text
       exit 0
     fi
@@ -61,18 +68,22 @@ case "$cmd" in
     ;;
   done)
     mine="${2:?usage: spawn-step.sh done <claimed-path>}"
-    rm -f "$mine" "${mine%.req.mine}.ref" 2>/dev/null || true   # intent + its ref sidecar (HERD-64)
+    # intent + its sidecars: ref (HERD-64) and after-dependency (HERD-94)
+    rm -f "$mine" "${mine%.req.mine}.ref" "${mine%.req.mine}.after" 2>/dev/null || true
     ;;
   release)
     mine="${2:?usage: spawn-step.sh release <claimed-path>}"
-    # Put the intent back for a later tick; KEEP the ref sidecar so the re-queued intent stays tracked.
+    # Put the intent back for a later tick; KEEP both sidecars (.ref, .after) so the re-queued intent
+    # stays tracked AND keeps its dependency hold (HERD-94) — a dependency-held intent is released to
+    # .req every tick until its dep merges, and must not lose its after= on the round-trip.
     mv -f "$mine" "${mine%.mine}" 2>/dev/null || true
     ;;
   skip)
     mine="${2:?usage: spawn-step.sh skip <claimed-path> <reason>}"
     reason="${3:-malformed intent}"
     printf 'spawn-step: WARNING — skipping intent %s: %s\n' "$(basename "${mine%.req.mine}")" "$reason" >&2
-    rm -f "$mine" "${mine%.req.mine}.ref" 2>/dev/null || true   # drop the bad intent + its ref sidecar
+    # drop the bad intent + its sidecars: ref (HERD-64) and after-dependency (HERD-94)
+    rm -f "$mine" "${mine%.req.mine}.ref" "${mine%.req.mine}.after" 2>/dev/null || true
     ;;
   *) printf 'usage: spawn-step.sh next | done <path> | release <path> | skip <path> <reason>\n' >&2; exit 2 ;;
 esac
