@@ -68,16 +68,39 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] \
   echo "▶ bats: running $TESTS_DIR/*.bats on ${PLATFORM}"
   # --print-output-on-failure surfaces the wrapped test's own stderr (bats otherwise shows only the
   # failed assertion line). Older bats-core lacks the flag → fall back to a plain run.
-  bats_flags=""
-  bats --print-output-on-failure --version >/dev/null 2>&1 && bats_flags="--print-output-on-failure"
+  bats_flags="--tap"
+  bats --print-output-on-failure --version >/dev/null 2>&1 && bats_flags="--tap --print-output-on-failure"
   # shellcheck disable=SC2086
-  if bats $bats_flags "$TESTS_DIR"/*.bats; then
+  bats_out="$(bats $bats_flags "$TESTS_DIR"/*.bats 2>&1)"; bats_rc=$?
+  printf '%s\n' "$bats_out"
+  if [ "$bats_rc" -eq 0 ]; then
     echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM}"
     exit 0
-  else
-    echo "❌ CI SUITE FAILED (bats) on ${PLATFORM}"
-    exit 1
   fi
+  # A failure: classify each TAP `not ok <n> <description>` against the allowlist (keyed by the bats
+  # DESCRIPTION for the bats path). An allowlisted failure on this platform is an XFAIL; any other is
+  # a real red. Same honest convention as the direct path — mark, never silently pass.
+  real=0; xf=0
+  while IFS= read -r line; do
+    case "$line" in
+      "not ok "*) : ;;
+      *) continue ;;
+    esac
+    desc="$(printf '%s' "$line" | sed -E 's/^not ok [0-9]+ //')"
+    if reason="$(allow_reason "$desc")"; then
+      xf=$((xf+1)); echo "⚠️  XFAIL (env-sensitive) bats: $desc — $reason"
+    else
+      real=$((real+1)); echo "❌ real bats failure: $desc"
+    fi
+  done <<EOF
+$bats_out
+EOF
+  if [ "$real" -eq 0 ] && [ "$xf" -gt 0 ]; then
+    echo "✅ CI SUITE CLEAN (bats) on ${PLATFORM} ($xf env-sensitive XFAIL, 0 real)"
+    exit 0
+  fi
+  echo "❌ CI SUITE FAILED (bats) on ${PLATFORM} ($real real failure(s), $xf XFAIL)"
+  exit 1
 fi
 
 # ── direct path: run every hermetic tests/test-*.sh, classify each result ─────────

@@ -34,10 +34,8 @@ defaults:
     shell: bash
 
 env:
-  # Deterministic terminal + locale so tput-cols-driven rendering and emoji greps behave the
-  # same on every leg (a runner with no TERM makes `tput cols` diverge from the maintainer's box).
-  LANG: C.UTF-8
-  LC_ALL: C.UTF-8
+  # Deterministic terminal so tput-cols-driven rendering behaves the same on every leg (a runner
+  # with no TERM makes `tput cols` diverge from the maintainer's box).
   TERM: xterm
 
 jobs:
@@ -50,20 +48,36 @@ jobs:
         include:
           - os: ubuntu-latest   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
             platform: ubuntu
+            locale: C.UTF-8         # glibc ships C.UTF-8
           - os: macos-latest
             platform: macos
+            locale: en_US.UTF-8     # BSD libc has no C.UTF-8 — use a real UTF-8 locale
     env:
       HERD_CI_PLATFORM: ${{ matrix.platform }}
+      LANG: ${{ matrix.locale }}
+      LC_ALL: ${{ matrix.locale }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: Set up Python 3.12
+        # The suite is tested against a mature Python; the runner default (3.14) regresses the
+        # codemap + rich-render tests. Pin a stable version that matches the maintainer's engine.
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - name: Install bats (curated gate — mirrors the auto-merge watcher)
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then brew install bats-core; else sudo apt-get update && sudo apt-get install -y bats; fi
           bats --version
+      - name: macOS — GNU coreutils/grep/sed/awk on PATH (match the maintainer's Homebrew env)
+        if: runner.os == 'macOS'
+        run: |
+          # The suite assumes GNU tools (e.g. `grep -P` in test-native-burst, UTF-8-safe sed/awk in
+          # backlog rendering) — present on the maintainer's macOS via Homebrew, absent from a clean
+          # runner's BSD userland. Install them and put their gnubin dirs first on PATH.
+          brew install grep gnu-sed gawk coreutils
+          for p in grep gnu-sed gawk coreutils; do
+            echo "$(brew --prefix)/opt/$p/libexec/gnubin" >> "$GITHUB_PATH"
+          done
       - name: Configure git identity (runners ship none; hermetic tests commit)
         run: |
           git config --global user.name  "herdkit CI"
@@ -72,8 +86,8 @@ jobs:
       - name: Show environment
         run: |
           echo "platform: $HERD_CI_PLATFORM   uname: $(uname -a)"
-          echo "bash: $BASH_VERSION   TERM: $TERM   cols: $(tput cols 2>/dev/null || echo n/a)"
-          python3 --version || echo "python3: not found"
+          echo "bash: $BASH_VERSION   TERM: $TERM   cols: $(tput cols 2>/dev/null || echo n/a)   LC_ALL: $LC_ALL"
+          python3 --version; command -v grep; grep --version | head -1
       - name: Run hermetic suite
         run: bash scripts/ci/run-suite.sh
 
