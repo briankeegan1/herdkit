@@ -301,6 +301,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
+  run bash "$REPO/tests/test-triggers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
