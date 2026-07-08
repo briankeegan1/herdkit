@@ -44,7 +44,10 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/git"; chmod +x "$BIN/git"
 
 # herdr stub: `pane read <id>` succeeds ONLY when <id> is listed in $ALIVE_PANES (the liveness surface
 # herd_driver_pane_alive probes). `pane close <id>` appends to $CLOSE_LOG and REMOVES it from alive.
-# Everything else is a safe no-op. Byte-simple: this is the whole control surface the lifecycle touches.
+# `agent list` reports every ALIVE pane as the review agent occupying it (name "review·stub") — the
+# identity the HERD-134 guarded close verifies before retiring a reviewer pane; in production the
+# reviewer pane is exactly such a review·<slug> agent. Everything else is a safe no-op. Byte-simple:
+# this is the whole control surface the lifecycle touches.
 ALIVE_PANES="$T/alive-panes"; : > "$ALIVE_PANES"
 CLOSE_LOG="$T/close.log"; : > "$CLOSE_LOG"
 cat > "$BIN/herdr" <<'STUB'
@@ -59,6 +62,21 @@ case "$1 $2" in
     printf '%s\n' "$id" >> "${CLOSE_LOG:-/dev/null}" 2>/dev/null || true
     # a closed pane is no longer alive
     if [ -f "${ALIVE_PANES:-}" ]; then grep -vxF "$id" "$ALIVE_PANES" > "$ALIVE_PANES.tmp" 2>/dev/null || true; mv -f "$ALIVE_PANES.tmp" "$ALIVE_PANES" 2>/dev/null || true; fi
+    exit 0 ;;
+  "agent list")
+    # Each alive pane IS the review agent occupying it — the identity herd_close_pane_verified checks.
+    python3 -c '
+import os, json
+seen = []
+try:
+  with open(os.environ.get("ALIVE_PANES","")) as f:
+    for l in f:
+      p = l.strip()
+      if p and p not in seen: seen.append(p)
+except Exception:
+  pass
+print(json.dumps({"result": {"agents": [{"name": "review·stub", "pane_id": p, "agent_status": "working"} for p in seen]}}))
+' 2>/dev/null || echo '{"result":{"agents":[]}}'
     exit 0 ;;
   *) exit 0 ;;
 esac

@@ -184,8 +184,8 @@ else
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
-            pane_captured reviewer_pane_retired_on_verdict builder_agent_dead \
-            builder_refix_escalates_on_dead teardown_clean; do
+            pane_captured reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
+            builder_agent_dead builder_refix_escalates_on_dead teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -369,6 +369,63 @@ except Exception:
       fi
     else
       checkpoint reviewer_pane_retired_on_verdict fail "could not stand up the review split pane (RV_PANE='$RV_PANE')"
+    fi
+  fi
+
+  # ── GUARDED PANE CLOSE (HERD-134): a stale/recycled registry pane id must NEVER kill a neighbour ──
+  # Model the 2026-07-08 incident directly: plant a reviewer dispatch-registry row that points at the
+  # BUILDER's OWN pane (exactly as a stale/recycled id would), then drive the SHIPPED verdict-consumption
+  # path (_retire_reviewer_pane via _review_gate_step). The guarded close reads the pane's LIVE identity
+  # (agent:rp-builder — NOT a reviewer) and must REFUSE: assert the builder pane SURVIVES, a
+  # pane_close_refused is journaled with both identities, and NO reviewer_pane_retired is emitted (the
+  # decoy was never retired). The reviewpane checkpoint above already proves a genuine reviewer still
+  # closes — together they show the guard is byte-identical on a match and loud-refusing on a mismatch.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step guardedclose "a stale registry id pointing at the builder is REFUSED, not closed (HERD-134)"
+    _bp_present() {
+      pane_json "$WSID" | BPP="$1" python3 -c '
+import sys,json,os
+bpp=os.environ["BPP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==bpp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    if [ "$(_bp_present "$BUILD_PANE")" = yes ]; then
+      GDT="$ART/guardtrees"; mkdir -p "$GDT/.herd"
+      GD_PR=556; GD_SHA="gdsha556"; GD_SLUG="rp-builder"
+      GD_JOURNAL="$ART/gd-journal.jsonl"; : > "$GD_JOURNAL"
+      # Registry row points at the BUILDER pane (the stale/recycled-id hazard); a PASS verdict waits.
+      printf '%s %s\n' "$$" "$BUILD_PANE" > "$GDT/.review-registry-$GD_PR-$GD_SHA"
+      printf 'REVIEW: PASS\n'            > "$GDT/.review-result-$GD_PR-$GD_SHA"
+      # Drive the SHIPPED path in a subshell (same isolation the reviewpane step uses). HERD_DRIVER
+      # defaults to herdr-claude → a REAL identity probe + `herdr pane close` behind the guard.
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$GDT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-guardedclose-sim" JOURNAL_FILE="$GD_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        _review_gate_step "$GD_PR" "$GD_SLUG" "$GD_SHA" >/dev/null 2>&1 || true
+      )
+      # Assert the builder pane SURVIVES across a short window (a wrong close would remove it).
+      _bp_survived=yes; _i=0
+      while [ "$_i" -lt 12 ]; do
+        [ "$(_bp_present "$BUILD_PANE")" = yes ] || { _bp_survived=no; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _gd_refused=no; grep -q '"event":"pane_close_refused"' "$GD_JOURNAL" 2>/dev/null && _gd_refused=yes
+      _gd_retired=no; grep -q '"event":"reviewer_pane_retired"' "$GD_JOURNAL" 2>/dev/null && _gd_retired=yes
+      if [ "$_bp_survived" = yes ] && [ "$_gd_refused" = yes ] && [ "$_gd_retired" = no ]; then
+        checkpoint reviewer_pane_close_refused_on_mismatch pass \
+          "stale registry id → builder pane $BUILD_PANE SURVIVED; pane_close_refused journaled; no false retire"
+      else
+        checkpoint reviewer_pane_close_refused_on_mismatch fail \
+          "guard did not refuse as expected (builder_survived=$_bp_survived refused=$_gd_refused false_retire=$_gd_retired)"
+      fi
+    else
+      checkpoint reviewer_pane_close_refused_on_mismatch fail "builder pane not present to serve as decoy (BUILD_PANE='$BUILD_PANE')"
     fi
   fi
 

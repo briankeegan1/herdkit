@@ -152,7 +152,10 @@ _emit_verdict() {
 # a merge from a dead cycle). Also removes the private agent temp.
 _teardown_reviewer() {
   if [ "${_AGENT_PANE_MODE:-0}" = "1" ] && [ -n "${ROOT:-}" ]; then
-    herdr pane close "$ROOT" >/dev/null 2>&1 || true
+    # GUARDED CLOSE (HERD-134): ROOT is our own review split inside the builder's SHARED tab. Verify it
+    # is still a reviewer pane before closing so a stale/recycled id cannot vaporise the builder pane on
+    # our way out; a mismatch REFUSES + journals pane_close_refused rather than killing a neighbour.
+    herd_close_pane_verified "$ROOT" "review·" || true
   fi
   # We closed our own pane here, so drop the dispatch-registry row too (HERD-113) — nothing survives
   # this exit path for the watcher to retire. Best-effort; a missing file is fine.
@@ -485,7 +488,11 @@ except Exception:
     # reuses the builder's tab — pane count stays stable (close one, open one) instead of leaking a
     # fresh tail tab per round. Best-effort: a close hiccup just falls through to the standalone
     # fallback below, which is the pre-HERD-81 behaviour.
-    [ -n "${_stale_review_pane:-}" ] && herdr pane close "$_stale_review_pane" >/dev/null 2>&1 || true
+    # GUARDED CLOSE (HERD-134): _stale_review_pane was resolved by agent name earlier in this tick, but
+    # the id can go stale/recycled before we close it — and it lives INSIDE the builder's shared tab,
+    # so a wrong id vaporises the live builder pane. Verify it is still a reviewer before closing; on a
+    # mismatch the guard REFUSES + journals pane_close_refused instead of killing a neighbour.
+    [ -n "${_stale_review_pane:-}" ] && herd_close_pane_verified "$_stale_review_pane" "review·" || true
     # Also retire any standalone review·<slug> fallback tab (+ its registry line) from an earlier
     # round, so flipping from standalone back to builder-tab placement never orphans a tab.
     _purge_stale_review_tab
