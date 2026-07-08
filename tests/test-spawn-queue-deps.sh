@@ -210,4 +210,46 @@ holds="$(run_holds 1)"
 grep -q "int-old" "$SPAWN_HELD_STATE" 2>/dev/null && fail "build_spawn_holds must GC the vanished intent's row"
 pass
 
+# ── Case 7 (HERD-116): an aged, dependency-held intent must NOT spin the drain ──────────────────────
+# Regression for the watcher freeze. spawn-step.sh `next` reclaims abandoned `.mine` claims via
+# `find -mmin +5`, but `mv` preserves mtime — so an intent enqueued >5 min ago (a dependency-held one
+# lingers for exactly this long) used to be reclaimed-and-re-served on EVERY `next` within a single
+# drain tick: claim → dep-check → held/continue → the next `next` sees a >5min `.mine`, resurrects it,
+# re-serves the SAME intent — an unbounded loop with a `gh pr view` per pass that starved the watcher.
+# The fix: `next` touches the claim on claim and `release` touches on release, so `-mmin +5` measures
+# CLAIM age, not enqueue age. One tick now serves an aged held intent EXACTLY ONCE, then releases it;
+# a genuinely abandoned claim still ages past 5 min from its last touch (legitimate reclaim preserved).
+rm -f "$T/trees/spawn-queue"/* "$STATE" "$SPAWN_HELD_STATE"
+HERD_SPAWN_AFTER="dep-unmerged" enqueue slug-aged feature "aged held intent, older than the stale TTL"
+# Backdate the intent + sidecars well past the 5-minute stale window (fixed epoch — no date math, so
+# this is identical on macOS/BSD and Linux) to reproduce the exact "enqueued long ago, still held" case.
+touch -t 202001010000 "$T/trees/spawn-queue"/*.req "$T/trees/spawn-queue"/*.after
+# Counting gh: log every dep-check. After a small safety cap it reports MERGED so that if the spin is
+# ever reintroduced the tick TERMINATES (and these assertions fail loudly) instead of hanging forever.
+GHCOUNT="$T/gh.count"; : > "$GHCOUNT"; export GHCOUNT
+cat > "$BIN/gh" <<'GH'
+#!/usr/bin/env bash
+echo x >> "$GHCOUNT"
+[ "$(wc -l < "$GHCOUNT")" -gt 2 ] && { echo MERGED; exit 0; }  # break any reintroduced spin
+exit 0   # empty = dependency not merged
+GH
+chmod +x "$BIN/gh"
+: > "$LANELOG"; : > "$JLOG"
+run_drain   # must return; on the buggy code the safety cap trips and the assertions below catch it
+[ "$(wc -l < "$GHCOUNT")" -eq 1 ] || fail "aged held intent triggered $(wc -l < "$GHCOUNT") dep-checks in one tick — expected exactly 1 (stale-reclaim spin)"
+grep -q "herd-feature.sh slug-aged" "$LANELOG" && fail "an aged, dependency-held intent must NOT spawn while its dep is unmerged"
+ls "$T/trees/spawn-queue"/*.req >/dev/null 2>&1 || fail "aged held intent should be released back to .req at tick end"
+ls "$T/trees/spawn-queue"/*.after >/dev/null 2>&1 || fail "aged held intent lost its .after sidecar — the dependency hold would be dropped"
+find "$T/trees/spawn-queue" -name '*.req' -mmin +5 | grep -q . && fail "released intent is still >5min stale — the claim/release touch did not restart the stale clock"
+grep -q "spawn_held slug slug-aged lane feature after dep-unmerged" "$JLOG" || fail "aged held intent should journal spawn_held once ($(cat "$JLOG"))"
+# Restore the shared not-merged gh stub for any later cases.
+cat > "$BIN/gh" <<'GH'
+#!/usr/bin/env bash
+target="$3"
+for m in $GH_MERGED; do [ "$m" = "$target" ] && { echo MERGED; exit 0; }; done
+exit 0
+GH
+chmod +x "$BIN/gh"
+pass
+
 echo "ALL PASS ($PASS checks)"
