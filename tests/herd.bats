@@ -157,6 +157,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic sha-keyed resolver re-spawn test passes" {
+  run bash "$REPO/tests/test-watcher-respawn-resolver.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]

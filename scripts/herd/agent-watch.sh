@@ -114,6 +114,9 @@ STATE="$TREES/.agent-watch-merged"
 # judged the conflict semantically ambiguous) and is NOT a dispatch, so it never consumes the budget.
 # Legacy 4-field rows (pre-HERD-55, no sha/outcome) read as a dispatch with an empty sha.
 RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
+# Max DISTINCT head shas a resolver may be spawned for on one branch before the watcher stops
+# re-spawning across new commits and escalates to "needs you" (the cross-sha anti-churn cap).
+_RESOLVE_RETRY_MAX=3
 # Review ledger, PARALLEL to $STATE/$RESOLVE_STATE: one line per PRE-MERGE REVIEW
 # ("<epoch> <pr#> <headSha> <verdict>"). Keyed by PR *and* head sha so a PR is reviewed at most
 # ONCE PER COMMIT — a recorded BLOCK is read back instead of re-spawning the reviewer; a recorded
@@ -638,6 +641,14 @@ _should_automerge() {
 # resolver_attempted <branch> — legacy branch-keyed guard (kept for back-compat; the sha-keyed
 # helpers below drive the HERD-55 respawn logic). True if ANY dispatch exists for this branch.
 resolver_attempted() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v b="$1" -v s="$2" '$4==b && $5==s{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_ever_attempted <branch> — true iff ANY resolver was spawned for this branch at ANY sha.
+# Distinguishes a FIRST-ever conflict (fresh spawn) from a cross-sha RE-spawn on a new commit so the
+# console can read 'resolving (retry · new commit)' vs the initial 'resolving conflict…'.
+resolver_ever_attempted() {
   [ -s "$RESOLVE_STATE" ] || return 1
   awk -v b="$1" '$4==b{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
 }
@@ -5185,6 +5196,11 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
     sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
+    # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
+    # spawn_resolver, so this read still sees only prior ticks' attempts.
+    _retry_reason="resolving conflict…"
+    resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
     if [ -n "$DRYRUN" ]; then
       if [ "$creason" = "first" ]; then
         DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
