@@ -73,6 +73,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic HERD-42 A/B scorer test passes" {
+  run bash "$REPO/tests/test-herd42-score.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic backlog-archive rotation test passes" {
   run bash "$REPO/tests/test-backlog-archive.sh"
   [ "$status" -eq 0 ]
