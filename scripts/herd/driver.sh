@@ -375,8 +375,15 @@ except Exception:
   # Classify the pane by the process in its FOREGROUND — the same ground-truth eyes layout-reconcile
   # uses: a live `claude` ⇒ alive; a shell with no claude foreground ⇒ dead (the process was killed
   # but the pane persists as a bare shell); missing/opaque process-info or a gone pane ⇒ unknown.
+  #
+  # The pane's OWN shell (shell_pid) is normally excluded so an idle BARE shell reads 'dead' — but the
+  # lane launches claude AS the pane ROOT (no wrapping shell), so shell_pid == the claude pid. Blindly
+  # dropping the shell_pid entry then filters the live claude out and fabricates a death (a live idle
+  # builder read '💀 AGENT DEAD'). So we exclude the shell_pid entry ONLY when it is a real shell
+  # WRAPPER (no claude in its cmdline): a claude-as-root pane keeps its own entry and reads 'alive'.
   herdr pane process-info --pane "$pane" 2>/dev/null | python3 -c '
 import sys, json
+def has_claude(p): return "claude" in (p.get("cmdline") or "")
 try:
   pi = (json.load(sys.stdin).get("result") or {}).get("process_info")
 except Exception:
@@ -386,8 +393,10 @@ if not pi:
 sh = pi.get("shell_pid") or 0
 if not sh:
   print("unknown"); sys.exit(0)
-fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh]
-print("alive" if any("claude" in (p.get("cmdline") or "") for p in fg) else "dead")
+# Keep any foreground process that is NOT the pane shell, OR that IS the shell_pid entry but is itself
+# claude (claude launched as the pane root) — the latter is POSITIVE alive evidence, never a wrapper.
+fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh or has_claude(p)]
+print("alive" if any(has_claude(p) for p in fg) else "dead")
 ' 2>/dev/null || printf 'unknown'
 }
 

@@ -70,7 +70,10 @@ PY
     p="${4:-}"
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
     cmd=""; [ -f "$S/panes/$p/cmd" ] && cmd="$(cat "$S/panes/$p/cmd")"
-    if [ -n "$cmd" ]; then
+    if [ -f "$S/panes/$p/root" ] && [ -n "$cmd" ]; then
+      # claude launched AS the pane ROOT (no wrapping shell): shell_pid == the foreground process pid.
+      printf '{"result":{"process_info":{"shell_pid":5151,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
+    elif [ -n "$cmd" ]; then
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
     else
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[]}}}\n'
@@ -113,6 +116,7 @@ export HERDR_STATE="$S"
 set_agent()  { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$S/agents.tsv"; }   # name pane status
 reset_agents(){ : > "$S/agents.tsv"; }
 mk_pane()    { mkdir -p "$S/panes/$1"; printf '%s' "${3:-}" > "$S/panes/$1/tab"; printf '%s' "${2:-}" > "$S/panes/$1/cmd"; [ -n "${4:-}" ] && printf '%s' "$4" > "$S/panes/$1/label" || true; }  # id cmd tab [label]
+mk_pane_root(){ mk_pane "$1" "$2" "$3"; : > "$S/panes/$1/root"; }  # id cmd tab — claude launched AS the pane root (shell_pid == fg pid)
 mk_tab()     { printf '%s' "$2" > "$S/tabs/$1"; }   # id label
 
 # ── source the libs in lib mode ───────────────────────────────────────────────
@@ -140,6 +144,14 @@ ok
 # herdr-claude: a bare shell (process killed) ⇒ dead
 mk_pane pane-live "" tab-b            # flip the same pane to bare
 [ "$(herd_driver_agent_liveness bob)" = "dead" ] || fail "A2: bare pane (claude gone) ⇒ dead"
+ok
+# herdr-claude: claude launched AS the pane ROOT (shell_pid == the claude pid — the lane runs claude
+# with NO wrapping shell). The pane-shell exclusion must NOT drop this entry: it is POSITIVE alive
+# evidence, not a bare shell. Regression guard for the fabricated-death false-positive (PR #260 review).
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane_root pane-croot "claude --model claude-opus-4-8 --dangerously-skip-permissions" tab-cr
+set_agent crootbob pane-croot idle
+[ "$(herd_driver_agent_liveness crootbob)" = "alive" ] || fail "A2b: claude-as-pane-root (shell_pid==claude pid) ⇒ alive (never a fabricated death)"
 ok
 # herdr-claude: a gone pane (no process-info) ⇒ unknown (fail-soft, never a fabricated death)
 reset_agents; set_agent gonezo pane-absent done

@@ -11,9 +11,11 @@
 #   • PANE ROLE LABELS at spawn (HERD-135): the agent pane is named by its slug via the driver, and the
 #     label is asserted queryable — the role the dead-agent-eyes probe consumes instead of guessing;
 #   • agent-status transitions idle → working → done, each observed via `herdr agent list`;
-#   • DEAD-vs-MISSING dead-agent eyes: kill the pane process ⇒ 'dead' (pane present, unresponsive), then
-#     REMOVE the agent pane entirely ⇒ 'missing' (HERD-135) — the SHIPPED status classifier reads
-#     'agentmissing' (NOT done) for an open-PR builder with no agent (the #249 false-'done' incident);
+#   • ALIVE/DEAD/MISSING dead-agent eyes, all three verdicts against REAL panes: claude launched AS the
+#     pane root (shell_pid == claude pid) ⇒ 'alive' — never a fabricated death (PR #260 review); kill
+#     the pane process ⇒ 'dead' (pane present, unresponsive); REMOVE the agent pane entirely ⇒ 'missing'
+#     (HERD-135) — the SHIPPED status classifier reads 'agentmissing' (NOT done) for an open-PR builder
+#     with no agent (the #249 false-'done' incident);
 #   • CLEAN TEARDOWN — the disposable workspace is closed and NO tab or pane is leaked afterward
 #     (so the result satisfies the tab-leak-guard).
 #
@@ -192,7 +194,8 @@ else
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
-            builder_agent_dead builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
+            builder_agent_alive_claude_root builder_agent_dead builder_refix_escalates_on_dead \
+            builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -486,6 +489,54 @@ except Exception:
     else
       checkpoint reviewer_pane_close_refused_on_mismatch fail "builder pane not present to serve as decoy (BUILD_PANE='$BUILD_PANE')"
     fi
+  fi
+
+  # ── CLAUDE-AS-ROOT LIVENESS (PR #260 review): the lane launches claude DIRECTLY as the pane ROOT
+  # (`herdr agent start … -- claude`, no wrapping shell), so the pane's shell_pid IS the claude pid. The
+  # probe excludes the pane's shell so a BARE shell reads 'dead' — but it must NOT drop the shell_pid
+  # entry when that entry is ITSELF claude, or it fabricates a death for a live idle builder ('💀 AGENT
+  # DEAD'). Stand up a REAL claude-as-root pane via the lane's exact incantation and assert the SHIPPED
+  # probe reads 'alive'. The killed-pane 'dead' + removed-pane 'missing' checkpoints below cover the
+  # other two liveness verdicts; together the three prove the classifier end to end.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
+    step clauderoot "claude launched AS the pane root (shell_pid == claude pid) reads 'alive', not a fabricated death"
+    CR_BIN="$ART/clauderootbin"; mkdir -p "$CR_BIN"
+    # A resident fake claude whose cmdline retains 'claude' (a bash script — NOT exec'd, so the process
+    # name stays '…/claude', exactly the argv the real binary carries). It sleeps until we kill it.
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CR_BIN/claude"; chmod +x "$CR_BIN/claude"
+    CR_START="$(herdr agent start cair-root-builder --workspace "$WSID" --cwd "$REPO" --tab "$BUILD_TAB" --split down --no-focus -- "$CR_BIN/claude" 2>/dev/null || true)"
+    CR_PANE="$(printf '%s' "$CR_START" | hj 'd["result"]["agent"]["pane_id"]')"
+    [ -z "$CR_PANE" ] && CR_PANE="$(herd_driver_agent_pane_id cair-root-builder 2>/dev/null || true)"
+    [ -n "$CR_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))
+    # Poll until the probe sees the live claude root.
+    _cr_live="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(herd_driver_agent_liveness cair-root-builder "$CR_PANE" 2>/dev/null)" = "alive" ] && { _cr_live=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    # NON-VACUOUS: prove the pane really IS claude-as-root — the shell_pid appears AMONG the foreground
+    # processes with 'claude' in its cmdline (the exact shape that fooled the pre-fix classifier).
+    _cr_isroot="$(herdr pane process-info --pane "$CR_PANE" 2>/dev/null | python3 -c '
+import sys,json
+pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+sh=pi.get("shell_pid"); fps=pi.get("foreground_processes") or []
+print("yes" if any(p.get("pid")==sh and "claude" in (p.get("cmdline") or "") for p in fps) else "no")
+' 2>/dev/null || true)"
+    _cr_pgid="$(herdr pane process-info --pane "$CR_PANE" 2>/dev/null | python3 -c '
+import sys,json
+pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+print(pi.get("foreground_process_group_id") or "")
+' 2>/dev/null || true)"
+    if [ "$_cr_live" = yes ] && [ "$_cr_isroot" = yes ]; then
+      checkpoint builder_agent_alive_claude_root pass \
+        "claude-as-root pane $CR_PANE (shell_pid == claude pid) reads 'alive' — the pane-shell exclusion did not fabricate a death"
+    else
+      checkpoint builder_agent_alive_claude_root fail \
+        "claude-as-root liveness wrong (live=$_cr_live is_root=$_cr_isroot pane=$CR_PANE)"
+    fi
+    # Cleanup: kill the detached claude process GROUP + close its pane (never leak a sleep or a pane).
+    [ -n "$_cr_pgid" ] && kill -TERM -"$_cr_pgid" >/dev/null 2>&1 || true
+    [ -n "$CR_PANE" ] && herdr pane close "$CR_PANE" >/dev/null 2>&1 || true
   fi
 
   # ── DEAD-AGENT EYES (HERD-114): kill the builder's pane process, assert the liveness probe flips to
