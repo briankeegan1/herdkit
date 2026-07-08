@@ -109,6 +109,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic rubric-screen dual-screener merge (HERD-166) test passes" {
+  run bash "$REPO/tests/test-rubric-screen-merge.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic rubric-screening disagreement-surface sim (HERD-166) passes" {
+  run bash "$REPO/scripts/herd/sim/rubric-screen-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SIM PASS"* ]]
+}
+
 @test "hermetic backlog-archive rotation test passes" {
   run bash "$REPO/tests/test-backlog-archive.sh"
   [ "$status" -eq 0 ]
