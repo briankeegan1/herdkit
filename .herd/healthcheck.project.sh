@@ -295,7 +295,34 @@ EOF
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  if to="$(bats tests/*.bats 2>&1)"; then t_note="tests: bats pass"; else
+  # HANG-PROOF SUITE (HERD-185): a single test that prompts for input or otherwise wedges used to HANG
+  # THE WHOLE SUITE FOREVER when run headless (tonight a backgrounded run sat 63 min on one, 13 min on
+  # another) — the watcher's own async health worker runs suites with NO controlling terminal, exactly
+  # how an interactive prompt stalls a slot. Three layered guards, most-portable-last:
+  #   • `</dev/null` — a STDIN prompt takes its default / fails fast instead of blocking on a missing tty.
+  #   • BATS_TEST_TIMEOUT — bats self-kills a wedged test after ~120s WITH ITS NAME (per-test naming).
+  #   • an OUTER `timeout` (when available) — the GUARANTEED backstop: BATS_TEST_TIMEOUT does NOT reap a
+  #     test that detaches a `/dev/tty`-reading grandchild into its own process group (verified: bats runs
+  #     past the per-test limit waiting on the inherited output pipe), so we also bound the WHOLE suite
+  #     and — critically — write to a TEMP FILE, never `$(bats …)`, because a surviving grandchild holding
+  #     the command-substitution pipe would hang the capture even after bats is killed. Env-overridable.
+  _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
+  BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+  if command -v timeout >/dev/null 2>&1; then
+    BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+  else
+    BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+  fi
+  _hk_bats_rc=$?
+  to="$(cat "$_hk_bats_out" 2>/dev/null)"; rm -f "$_hk_bats_out" 2>/dev/null || true
+  # A timeout-killed suite (rc 124) is an infrastructure hang, not a code error: surface it as data/env.
+  if [ "$_hk_bats_rc" = 124 ]; then
+    _hk_hung="$(printf '%s' "$to" | grep -m1 -E '^(ok|not ok) ' | tail -1)"
+    echo "bats: suite timed out (>${HEALTHCHECK_SUITE_TIMEOUT:-1800}s) — a wedged/tty-reading test, not a code bug${_hk_hung:+ — last: $_hk_hung}"
+    [ -z "$ONELINE" ] && printf '%s\n' "$to"
+    exit 2
+  fi
+  if [ "$_hk_bats_rc" = 0 ]; then t_note="tests: bats pass"; else
     if _hk_bats_env_only "$to"; then
       # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
       _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
