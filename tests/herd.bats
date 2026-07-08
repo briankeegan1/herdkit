@@ -229,6 +229,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic init merge-policy consequence-loud ask (HERD-140) test passes" {
+  run bash "$REPO/tests/test-init-merge-policy-ask.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic governance profiles export/apply (HERD-126) test passes" {
   run bash "$REPO/tests/test-governance-profiles.sh"
   [ "$status" -eq 0 ]
@@ -257,6 +263,12 @@ setup() {
   run bash "$REPO/tests/test-conformance.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic watcher-flair pack (HERD-147) unit test passes" {
+  run bash "$REPO/tests/test-watcher-flair.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
 }
 
 @test "herd render produces no leftover template tokens for this repo" {

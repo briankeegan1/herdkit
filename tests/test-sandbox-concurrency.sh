@@ -122,6 +122,17 @@ grep -q 'health-check' "$ART/pane-tick1-cap-bites.txt" || fail "(e) tick1 pane t
 [ "$(sc "$SCARD" screenshots)" -eq 0 ] || fail "(e) screenshots should be 0 under the opt-out"
 echo "PASS (e) pane text captured via driver read-pane; screenshots degraded gracefully"
 
+# ── (h) WATCHER FLAIR PACK (HERD-147) — OFF byte-identical, ON adds the pasture header, dead LOUD ──
+# The scenario drives the REAL flair helpers through the flair-aware console_frame. Lock in that all
+# four flair invariants passed: off is byte-identical to a no-flag run, on renders the pasture header,
+# the 💀 dead row is byte-identical in both modes (never softened), and a pending merge celebrates.
+[ "$(sc "$SCARD" flair_tested)" = "True" ]                             || fail "(h) flair_tested flag not set"
+[ "$(cp_status "$SCARD" flair_off_byte_identical)" = "pass" ]          || fail "(h) flair_off_byte_identical not pass"
+[ "$(cp_status "$SCARD" flair_on_header_present)" = "pass" ]           || fail "(h) flair_on_header_present not pass"
+[ "$(cp_status "$SCARD" flair_dead_row_unchanged)" = "pass" ]          || fail "(h) flair_dead_row_unchanged not pass (a red/dead row must never be softened)"
+[ "$(cp_status "$SCARD" flair_merge_celebration)" = "pass" ]           || fail "(h) flair_merge_celebration not pass"
+echo "PASS (h) flair pack: off byte-identical, on adds pasture header, dead rows unchanged, merge celebrated"
+
 # ── (f) HERMETIC — nothing leaked into the real repo tree ────────────────────────
 # The scenario writes only under its --artifacts dir. Compare against the baseline captured before
 # any run: no NEW working-tree entry may appear because of the scenario.
