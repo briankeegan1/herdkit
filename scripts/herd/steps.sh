@@ -176,22 +176,38 @@ steps_hold_detail() { [ -n "${WORKTREES_DIR:-}" ] || return 1; printf '%s' "$WOR
 _steps_epoch() { date +%s 2>/dev/null || echo 0; }
 _steps_worktree_sha() { git -C "$1" rev-parse HEAD 2>/dev/null || true; }
 
-# _steps_live_hold <slug> — echo "<sha><TAB><step>" of the EARLIEST still-live approve-hold for <slug>
-# (an 'awaiting' record with no matching 'released' for the same sha+step), or empty. Steps hold
-# sequentially so at most one is live at a time; earliest-in-file-order is the one a human approves next.
+# _steps_live_hold <slug> — echo "<sha><TAB><step>" of the live approve-hold for <slug>, or empty.
+#
+# LATEST-sha-wins with explicit supersession of stale-sha rows. This MIRRORS push-gate.sh _pg_current's
+# last-write-wins semantic (the correct sibling): the sha of the LAST 'awaiting' record in file order is
+# the CURRENT sha, and any 'awaiting' rows at an OLDER sha are SUPERSEDED — a new commit pushed during a
+# live hold appends a fresh awaiting row for the new sha, so the old sha's row must never be what a human
+# approves. An earliest-in-file-order rule (the #249-family defect this fixes) would keep selecting the
+# stale sha whose HEAD no longer matches, wedging `steps_hold_release` on the sha-invalidation guard
+# FOREVER — approval could never target the current commit. WITHIN the current sha, steps hold
+# sequentially, so the EARLIEST awaiting row at that sha whose (sha,step) is not released is the one a
+# human approves next (an already-released sibling step at the same sha is skipped).
 _steps_live_hold() {
   local slug="$1" ledger; ledger="$(steps_hold_ledger)" || return 0
   [ -f "$ledger" ] || return 0
-  local _ state s sha step released_keys=""
-  # Pass 1: collect the released (sha,step) keys for this slug.
+  local _ state s sha step released_keys="" cur_sha=""
+  # Pass 1: collect the released (sha,step) keys AND track the CURRENT sha = the sha of the last
+  # 'awaiting' record for this slug in file order (last-write-wins). A newer commit's awaiting row,
+  # appended later, thereby SUPERSEDES older stale-sha awaiting rows.
   while read -r _ state s sha step; do
     [ "$s" = "$slug" ] || continue
-    [ "$state" = "released" ] && released_keys="$released_keys|$sha $step|"
+    case "$state" in
+      released) released_keys="$released_keys|$sha $step|" ;;
+      awaiting) cur_sha="$sha" ;;
+    esac
   done < "$ledger"
-  # Pass 2: the first awaiting whose (sha,step) is not in the released set is the live hold.
+  [ -n "$cur_sha" ] || return 0
+  # Pass 2: among awaiting rows AT the current sha only (stale-sha rows are superseded), the first whose
+  # (sha,step) is not released is the live hold. All current-sha steps released ⇒ no live hold.
   while read -r _ state s sha step; do
     [ "$s" = "$slug" ] || continue
     [ "$state" = "awaiting" ] || continue
+    [ "$sha" = "$cur_sha" ] || continue
     case "$released_keys" in *"|$sha $step|"*) continue ;; esac
     printf '%s\t%s' "$sha" "$step"
     return 0
@@ -220,6 +236,61 @@ steps_hold_is_approved() {
 steps_hold_is_released() {
   local ledger; ledger="$(steps_hold_ledger)" || return 1
   grep -q "^[0-9]* released $1 $2 $3$" "$ledger" 2>/dev/null
+}
+
+# ── non-approve step memoization (once-per-(slug,sha,step)) ────────────────────────────────────────
+# The watcher re-runs the pre-merge seam every ~4s (do_merge, no --resume-after). Without a memo, a
+# non-approve step (hold=none/notify) would RE-EXECUTE + re-journal + re-notify on EVERY tick, spamming
+# the operator and re-running side effects. A 'done' record memoizes a non-approve step that has already
+# fired at a given sha so it fires EXACTLY ONCE per (slug,sha,step). Keyed by sha, so a new commit (new
+# sha) legitimately re-fires it. approve-holds are NOT memoized here — they use the awaiting/released
+# ledger; block-FAILS are NOT memoized — they must keep re-running until the cause is fixed.
+# steps_step_memoized <slug> <sha> <step> — 0 iff this (sha,step) already fired (a 'done' record exists).
+steps_step_memoized() {
+  local ledger; ledger="$(steps_hold_ledger)" || return 1
+  grep -q "^[0-9]* done $1 $2 $3$" "$ledger" 2>/dev/null
+}
+# _steps_memo_record <slug> <sha> <step> — record the 'done' memo for a non-approve step that just fired.
+# Idempotent + fail-soft. A degenerate empty sha is not memoized (can't key stably) ⇒ per-tick fallback.
+_steps_memo_record() {
+  local slug="$1" sha="$2" step="$3" ledger
+  [ -n "$sha" ] || return 0
+  ledger="$(steps_hold_ledger)" || return 0
+  grep -q "^[0-9]* done $slug $sha $step$" "$ledger" 2>/dev/null && return 0
+  printf '%s done %s %s %s\n' "$(_steps_epoch)" "$slug" "$sha" "$step" >> "$ledger" 2>/dev/null || true
+}
+
+# steps_hold_purge <slug> — F9 backstop (HERD-157): drop EVERY step-hold ledger row for <slug> and remove
+# its per-step detail files. A merged/reaped PR is terminal — its holds are phantom, and a lingering
+# 'awaiting' row would haunt `herd-approve.sh list` / steps_hold_list forever (the step-hold analogue of
+# purge_pr_approvals). Called from the reap path (_reap_slug), so both a merge and the startup sweep
+# clear it. Fully fail-soft + idempotent: an absent ledger / already-purged slug no-ops.
+steps_hold_purge() {
+  local slug="$1" ledger tmp step detail steps_seen
+  [ -n "$slug" ] || return 0
+  ledger="$(steps_hold_ledger)" || return 0
+  [ -f "$ledger" ] || return 0
+  # Remove the EXACT per-step detail files first, derived from this slug's ledger rows — never a glob,
+  # so a sibling slug that shares a filename prefix (e.g. 'foo' vs 'foo-bar') is never clobbered.
+  steps_seen="$(awk -v s="$slug" '$3==s {print $5}' "$ledger" 2>/dev/null | awk 'NF && !seen[$0]++')"
+  while IFS= read -r step; do
+    [ -n "$step" ] || continue
+    detail="$(steps_hold_detail "$slug" "$step")" || continue
+    rm -f "$detail" 2>/dev/null || true
+  done <<EOF
+$steps_seen
+EOF
+  # Then drop every ledger row for this slug (slug is field 3; exact compare so a substring slug is
+  # never clobbered). Atomic rewrite via temp+mv; a hiccup leaves the ledger untouched.
+  if [ -s "$ledger" ]; then
+    tmp="$(mktemp "$ledger.XXXXXX" 2>/dev/null)" || return 0
+    if awk -v s="$slug" '$3 != s' "$ledger" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$ledger" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+  return 0
 }
 
 # steps_hold_list — print every LIVE step-hold as: <slug> <sha> <step> <dir>. One row per slug (steps
@@ -316,6 +387,14 @@ steps_hold_release() {
   fi
   # Sha invalidation: if the worktree still resolves, HEAD must equal the held/approved sha. A new
   # commit after the hold changes HEAD ⇒ the approval is stale (same semantics as push-gate / merge).
+  # A worktree that was RECORDED (non-empty dir) but is now GONE must NOT silently bypass this check
+  # (HERD-157): we can no longer confirm HEAD==sha, and a vanished worktree means the PR merged/reaped
+  # — its holds should be PURGED (steps_hold_purge in the reap path), never resumed. Refuse LOUDLY so a
+  # phantom hold can't be released against a commit nobody can verify.
+  if [ -n "$dir" ] && [ ! -d "$dir" ]; then
+    echo "🛑 steps: '$slug' worktree ($dir) is gone — cannot verify HEAD against the held sha ($sha). REFUSING to resume a hold whose sha can't be confirmed (a merged/reaped PR's holds are purged, not resumed)." >&2
+    return 1
+  fi
   if [ -n "$dir" ] && [ -d "$dir" ]; then
     head="$(_steps_worktree_sha "$dir")"
     if [ -n "$head" ] && [ "$head" != "$sha" ]; then
@@ -416,6 +495,13 @@ steps_run_at() {
       [ "$name" = "$resume_after" ] && skipping=0   # resume with the step AFTER the held one
       continue
     fi
+    # Non-approve steps fire ONCE per (slug,sha,step): the watcher re-runs the pre-merge seam every
+    # ~4s, and without this memo a pass/notify step would re-execute + re-journal + re-notify every
+    # tick. Once memoized (already fired at this sha) skip it silently. Keyed by sha ⇒ a new commit
+    # re-fires it. approve-holds are handled by the ledger branch below, not memoized here.
+    if [ "$hold" != "approve" ] && [ -n "$sha" ] && steps_step_memoized "$slug" "$sha" "$name"; then
+      continue
+    fi
     # An approve-hold is idempotent + resumable: check the ledger for THIS (slug,sha,step) BEFORE
     # (re-)executing. Every check is per-step so N approve-steps at one sha each gate independently.
     if [ "$hold" = "approve" ] && [ -n "$sha" ]; then
@@ -440,6 +526,9 @@ steps_run_at() {
     if [ "$rc" -ne 0 ]; then
       if [ "$onfail" = "warn" ]; then
         command -v journal_append >/dev/null 2>&1 && journal_append step_run name "$name" at "$seam" kind "$kind" slug "$slug" sha "$sha" outcome warn rc "$rc" || true
+        # Memoize the warn so it doesn't re-warn every tick (a block-FAIL below is NOT memoized — it
+        # must keep re-running until fixed).
+        [ "$hold" != "approve" ] && _steps_memo_record "$slug" "$sha" "$name"
         continue
       fi
       command -v journal_append >/dev/null 2>&1 && journal_append step_run name "$name" at "$seam" kind "$kind" slug "$slug" sha "$sha" outcome fail rc "$rc" || true
@@ -459,6 +548,9 @@ steps_run_at() {
         return 20
         ;;
     esac
+    # Memoize a non-approve step that PASSED (none/notify) so it fires once per (slug,sha,step). An
+    # approve-hold returned 20 above and never reaches here; a block-fail returned 1 and is not memoized.
+    [ "$hold" != "approve" ] && _steps_memo_record "$slug" "$sha" "$name"
   done <<EOF
 $(steps_list "$seam")
 EOF
@@ -484,8 +576,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     holds)    steps_hold_list ;;
     approve)  steps_hold_approve "$@" >/dev/null && steps_hold_release "$@" ;;
     release)  steps_hold_release "$@" ;;
+    purge)    steps_hold_purge "$@" ;;
     enabled)  steps_enabled ;;
     file)     steps_file; echo ;;
-    *) echo "Usage: steps.sh [run <seam> [--slug S --dir D --sha SHA --resume-after STEP] | validate | list [seam] | holds | approve <slug> | release <slug> | enabled | file]" >&2; exit 1 ;;
+    *) echo "Usage: steps.sh [run <seam> [--slug S --dir D --sha SHA --resume-after STEP] | validate | list [seam] | holds | approve <slug> | release <slug> | purge <slug> | enabled | file]" >&2; exit 1 ;;
   esac
 fi

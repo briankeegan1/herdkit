@@ -1396,6 +1396,58 @@ cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
 # Capabilities manifest path (key set + metadata); HERD_CAPABILITIES_FILE overrides it for tests.
 _config_caps_file() { printf '%s' "${HERD_CAPABILITIES_FILE:-$TEMPLATES_DIR/capabilities.tsv}"; }
 
+# ── Model suggestions catalog (HERD-151) ──────────────────────────────────────────────────────────
+# templates/models.tsv is an ADVISORY, perishable list of model refs with a tier + role-fit hint.
+# `herd config set MODEL_*` reads it to SUGGEST a fit and to soft-note an uncatalogued ref — never to
+# refuse one (catalog / CLAUDE.md / manual set are coequal, none required). HERD_MODELS_CATALOG_FILE
+# overrides the path for tests, mirroring HERD_CAPABILITIES_FILE.
+_models_catalog_file() { printf '%s' "${HERD_MODELS_CATALOG_FILE:-$TEMPLATES_DIR/models.tsv}"; }
+
+# _config_is_model_key <KEY> — success iff KEY holds a MODEL REF value (so `config set` should consult
+# the catalog). Covers the MODEL_* role tiers and the REVIEW_MODEL_* reviewer tiers, but EXCLUDES
+# MODEL_ESCALATE_GLOB (an egrep pattern, not a model id).
+_config_is_model_key() {
+  case "$1" in
+    MODEL_ESCALATE_GLOB) return 1 ;;
+    MODEL_*|REVIEW_MODEL_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _models_catalog_row <catalog> <model-id> — print the catalog row (tier<TAB>role_fit<TAB>as_of) for
+# an EXACT bare model id, or nothing (exit 1) when it is not catalogued. Skips the header + comments.
+_models_catalog_row() {
+  awk -F'\t' -v m="$2" '
+    NR==1 { next }                                  # header
+    { s=$0; sub(/^[[:space:]]+/,"",s) }
+    s ~ /^#/ || s=="" { next }                      # comments / blanks
+    $1==m { printf "%s\t%s\t%s", $2, $3, $4; found=1; exit }
+    END { exit(found?0:1) }' "$1"
+}
+
+# _models_catalog_lint <catalog> — validate every data row: exactly 4 tab columns, a tier in the
+# controlled vocabulary {judgment,balanced,cheap,docs}, and an as_of date shaped YYYY-MM-DD. Prints one
+# problem per line (empty when clean) and exits non-zero when any row is malformed. Pure/read-only.
+_models_catalog_lint() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || { echo "no models catalog at ${f:-<unset>}"; return 1; }
+  awk -F'\t' '
+    NR==1 { next }                                  # header
+    { s=$0; sub(/^[[:space:]]+/,"",s) }
+    s ~ /^#/ || s=="" { next }                      # comments / blanks
+    {
+      rows++
+      if (NF != 4) { print "row " NR ": expected 4 tab-separated columns, got " NF; bad++; next }
+      tier=$2
+      if (tier != "judgment" && tier != "balanced" && tier != "cheap" && tier != "docs")
+        { print "row " NR " (" $1 "): invalid tier \"" tier "\" — want judgment|balanced|cheap|docs"; bad++ }
+      if ($4 !~ /^[0-9][0-9][0-9][0-9]-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/)
+        { print "row " NR " (" $1 "): invalid as_of \"" $4 "\" — want YYYY-MM-DD"; bad++ }
+      if ($1 == "") { print "row " NR ": empty model_ref"; bad++ }
+    }
+    END { if (rows==0) { print "catalog has no data rows"; bad++ } exit(bad?1:0) }' "$f"
+}
+
 # _config_key_requires <caps> <KEY> → prints the requires token (watcher | render | '') for the
 # matching kind==config row; prints nothing and exits 1 when KEY is NOT a known config key. Exact
 # key match, so REVIEW_CONCURRENCY never matches REVIEW_CONCURRENCY_X.
@@ -1603,8 +1655,9 @@ cmd_config() {
     set)          cmd_config_set "$@" ;;
     sync)         cmd_config_sync "$@" ;;
     lint)         _config_lint "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
+    models)       cmd_config_models "$@" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint | models [lint]" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint | models [lint]" ;;
   esac
 }
 
@@ -1635,6 +1688,64 @@ _config_lint() {
   say ""
   warn "shell last-wins can SILENTLY disable a gate (issue #115) — delete the stale duplicate line(s) in $cfg (value resolution is unchanged; herd does not auto-dedup)."
   exit 1
+}
+
+# cmd_config_models [lint] — the model SUGGESTIONS CATALOG surface (HERD-151). With no argument it
+# prints the catalog (tier · role-fit · as-of) an operator can pick a MODEL_* value from; `lint`
+# validates the catalog (tier + date per row) and exits non-zero on any malformed row. Read-only.
+cmd_config_models() {
+  local sub="${1:-}" cat; cat="$(_models_catalog_file)"
+  [ -f "$cat" ] || die "no model catalog at $cat"
+  case "$sub" in
+    lint)
+      local out; out="$(_models_catalog_lint "$cat")" || {
+        say "${c_bold}model catalog problems${c_rst}  ($cat)"
+        printf '%s\n' "$out" | while IFS= read -r l; do [ -n "$l" ] && say "  $l"; done
+        exit 1
+      }
+      ok "model catalog is well-formed ($cat)"
+      ;;
+    ""|list)
+      say "${c_bold}model suggestions catalog${c_rst}  ($cat)  ${c_dim}advisory — never a gate; unknown refs are always allowed${c_rst}"
+      awk -F'\t' '
+        NR==1 { next }
+        { s=$0; sub(/^[[:space:]]+/,"",s) }
+        s ~ /^#/ || s=="" { next }
+        { printf "  %-20s %-9s %s  (as of %s)\n", $1, $2, $3, $4 }' "$cat"
+      ;;
+    *) die "usage: herd config models [lint]" ;;
+  esac
+}
+
+# _config_model_suggest <ref> — print an ADVISORY note (never an error) for a MODEL_* ref just set:
+# whether its (bare) model is in the suggestions catalog, and — for a runtime-qualified '<driver>:<model>'
+# ref — whether the driver is a shipped one. NEVER refuses: an uncatalogued model is allowed with a soft
+# note; an unknown driver is soft-noted here (it hard-fails only at SPAWN time, by design).
+_config_model_suggest() {
+  local ref="${1:-}" cat mdl drv=""
+  [ -n "$ref" ] || return 0
+  cat="$(_models_catalog_file)"; [ -f "$cat" ] || return 0
+  case "$ref" in
+    *:*) drv="${ref%%:*}"; mdl="${ref#*:}"
+         if command -v herd_driver_known >/dev/null 2>&1 && herd_driver_known "$drv"; then
+           say "  ${c_dim}(runtime-qualified ref → driver '$drv', model '$mdl')${c_rst}"
+         else
+           say "  ${c_dim}note: '$drv' is not a shipped driver (templates/drivers/) — this ref will FAIL at spawn time; use a bare model or a known <driver>:<model>${c_rst}"
+         fi ;;
+    *)   mdl="$ref" ;;
+  esac
+  # `_models_catalog_row` exits 1 when the model is not catalogued — guard the command sub so that
+  # (expected, non-error) miss never trips `set -e` and swallows the soft note below.
+  local row; row="$(_models_catalog_row "$cat" "$mdl" || true)"
+  if [ -n "$row" ]; then
+    local tier hint
+    tier="$(printf '%s' "$row" | cut -f1)"
+    hint="$(printf '%s' "$row" | cut -f2)"
+    say "  ${c_dim}(catalog: tier=$tier — $hint)${c_rst}"
+  else
+    say "  ${c_dim}('$mdl' is not in the suggestions catalog templates/models.tsv — allowed; add a row to catalog it. See 'herd config models')${c_rst}"
+  fi
+  return 0
 }
 
 cmd_config_list() {
@@ -1823,6 +1934,10 @@ cmd_config_set() {
   else
     ok "$key already = \"$val\" in $target_label (local change already applied)"
   fi
+  # HERD-151: for a MODEL_* / REVIEW_MODEL_* key, consult the suggestions catalog — an ADVISORY note on
+  # the model's tier/role-fit (or a soft note for an uncatalogued model / unshipped driver prefix).
+  # Never refuses: the operator's chosen model always stands.
+  _config_is_model_key "$key" && _config_model_suggest "$val"
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
   #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
@@ -5019,6 +5134,12 @@ for comp in sorted(by_component, key=lambda c: -by_component[c]):
 print("By model:")
 for model in sorted(by_model, key=lambda m: -by_model[m]):
     print("  %-18s $%9.4f" % (model, by_model[model]))
+# HERD-151: surface any UNPRICED model explicitly so a foreign/runtime-qualified ref that priced at $0
+# is never read as free. A ?-flagged model id (or a journaled unpriced>0) is the signal.
+_unpriced_models = sorted({m for m in by_model if m.endswith("?")})
+if _unpriced_models or any(fnum(o.get("unpriced", 0)) > 0 for o in rows):
+    print("  [!] unpriced (no price in the cost table, counted at $0): %s"
+          % (", ".join(_unpriced_models) or "see model? flags above"))
 print("")
 print("Total spend recorded:   $%.4f" % grand)
 print("Merged PRs (billed):     %d" % len(merged))

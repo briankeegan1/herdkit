@@ -1873,6 +1873,11 @@ _reap_slug() {
   local _rp_slug="$1" _rp_dir="$2" _rp_pr="${3:-}" _rp_sha="${4:-}" _rp_reason="${5:-merged}"
   git -C "$MAIN" worktree remove --force "$_rp_dir" >/dev/null 2>&1 || true
   rm -f "$(_slug_ref_file "$_rp_slug")" 2>/dev/null || true
+  # HERD-157 F9 backstop: purge any step-hold rows + detail files for this reaped slug. A reaped
+  # worktree is terminal, so a lingering 'awaiting' step-hold row would haunt `herd-approve.sh list`
+  # forever (the step-hold analogue of purge_pr_approvals). Fail-soft + idempotent; no-op when steps
+  # are unused. Done before teardown so a teardown hiccup can't strand the phantom hold.
+  command -v steps_hold_purge >/dev/null 2>&1 && steps_hold_purge "$_rp_slug" || true
   journal_append reap pr "$_rp_pr" slug "$_rp_slug" sha "$_rp_sha" reason "$_rp_reason"
   herd_teardown_slug "$_rp_slug"
   return 0
