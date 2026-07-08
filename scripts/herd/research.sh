@@ -23,6 +23,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # HUNG-but-listed researcher drainer from a live one, so a wedged drainer can't block the queue forever.
 # shellcheck source=/dev/null
 . "$HERE/drainer-liveness.sh"
+# Native-burst seam (HERD-107): the bounded read-only FAN-OUT helper. Sourced so this READ-ONLY lane
+# can hint the drainer a BOUNDED concurrent-Explore width when NATIVE_BURST=on. Off → no hint, the
+# drainer prompt is byte-identical to before.
+# shellcheck source=/dev/null
+. "$HERE/burst.sh"
 REPO="$PROJECT_ROOT"
 TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
@@ -119,6 +124,22 @@ Use research-step.sh for all queue/report mechanics. Read-only always: never wri
 never git, never switch branches.
 EOF
 )
+# NATIVE-BURST (HERD-107): when the bounded read-only fan-out seam is ON, hint the drainer a CONCRETE
+# concurrent-Explore cap (bounded by REVIEW_CONCURRENCY via herd_burst_bound) so a request's reading
+# fans out to cut wall-clock — while staying BOUNDED. This is read-only fan-out: the per-request
+# report WRITE stays serial (one report per request). OFF → this block is skipped and the prompt is
+# byte-identical to before (default preserves today's un-hinted serial behavior).
+if herd_burst_enabled; then
+  _BURST_N="$(herd_burst_bound)"
+  if [ "${_BURST_N:-1}" -gt 1 ] 2>/dev/null; then
+    PROMPT="$PROMPT
+
+NATIVE-BURST (bounded read-only fan-out): to cut wall-clock you MAY dispatch up to ${_BURST_N} Explore
+subagents CONCURRENTLY while researching a request — but keep it BOUNDED: never exceed ${_BURST_N} in
+flight at once. This concurrency is for READING only; you still write exactly ONE findings report per
+request (that write stays serial), and you remain strictly read-only against the repo."
+  fi
+fi
 created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_RESEARCHER" --no-focus)
 TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
 herd_driver_launch_agent \

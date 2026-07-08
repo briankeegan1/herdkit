@@ -368,6 +368,19 @@ fi
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
+# NATIVE_BURST (HERD-107) — off (default) | on. The master switch for the bounded read-only FAN-OUT
+# seam (scripts/herd/burst.sh). OFF → today's EXACT serial behavior, byte-identical: the research
+# drainer's Explore fan-out is un-hinted and the review runs as a single reviewer. ON → read-only work
+# (repo research, the review PANEL) may BURST — fan out several CONCURRENT calls bounded by
+# REVIEW_CONCURRENCY (the ceiling) — while WRITE lanes (scribe/backlog/merge) stay strictly serial.
+# Purely additive + config-gated; unknown/blank → off (fail safe). Consumed by research.sh + herd-review.sh.
+: "${NATIVE_BURST:="off"}"       # off (default) | on — see capabilities.tsv / burst.sh
+# REVIEW_PANEL (HERD-107) — how many CONCURRENT read-only reviewer passes the pre-merge review runs
+# over the SAME diff when NATIVE_BURST=on (a bounded "review panel": more eyes catch more bugs). The
+# effective panel size is min(REVIEW_PANEL, REVIEW_CONCURRENCY). Default 1 → a single reviewer, i.e.
+# today's byte-identical behavior (the panel only engages at >1 AND with NATIVE_BURST=on). Combination
+# is fail-safe: ANY member's BLOCK blocks the merge; a merge needs at least one PASS and zero BLOCKs.
+: "${REVIEW_PANEL:="1"}"         # concurrent reviewer passes when NATIVE_BURST=on (default 1 = single reviewer)
 # SPAWN_AHEAD — advisory spawn-rate lead over the review gate (herd-spawn-gate.sh, sourced by the
 # lanes). When the review pipeline is saturated (live+queued reviews ≥ REVIEW_CONCURRENCY), a lane
 # HOLDS a new spawn once in-flight builders already exceed REVIEW_CONCURRENCY + SPAWN_AHEAD — so the

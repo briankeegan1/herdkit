@@ -169,6 +169,18 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
 
+# native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
+#   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.
+#   on   read-only work may BURST — fan out several CONCURRENT calls bounded by REVIEW_CONCURRENCY (the
+#        ceiling): research.sh hints the drainer a bounded concurrent-Explore width, and herd-review.sh
+#        may run a bounded REVIEW PANEL (see REVIEW_PANEL). WRITE lanes (scribe/backlog/merge) NEVER
+#        burst — they stay strictly serial. Additive + opt-in; unknown/blank → off (fail safe).
+# NATIVE_BURST="off"       # off (default) | on
+# review panel size — CONCURRENT read-only reviewer passes over the SAME diff when NATIVE_BURST=on;
+# effective size is min(REVIEW_PANEL, REVIEW_CONCURRENCY). Default 1 = single reviewer (byte-identical).
+# Combination is fail-safe: ANY member's BLOCK blocks the merge; a merge needs >=1 PASS and zero BLOCKs.
+# REVIEW_PANEL="1"         # concurrent reviewer passes when NATIVE_BURST=on (default 1)
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After
