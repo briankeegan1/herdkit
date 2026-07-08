@@ -70,8 +70,24 @@ assert isinstance(d["checkpoints"], list) and d["checkpoints"], "no checkpoints"
 names = {c["name"]: c["status"] for c in d["checkpoints"]}
 for req in ("fixture_built","builder_committed","pr_opened","gate_passed","merged","torn_down"):
     assert names.get(req) == "pass", "checkpoint %s not pass: %r" % (req, names.get(req))
+# HERD-139 notify hermeticity: the main-health forced-red leg must surface its MAIN RED + recovery
+# notifications ONLY to the durable sink (never the desktop), and the whole run must leak zero native
+# desktop notifications.
+assert names.get("main_health_notify_sink") == "pass", "main_health_notify_sink not pass: %r" % names.get("main_health_notify_sink")
+assert names.get("notify_hermetic") == "pass", "notify_hermetic not pass: %r" % names.get("notify_hermetic")
 print("scorecard OK: %d passed / %d failed" % (d["passed"], d["failed"]))
 PY
+
+# HERD-139: prove notify hermeticity from the OUTSIDE too — the run's captured-attempts log must
+# record ZERO native desktop-notification attempts (osascript / notify-send). The durable sink DID
+# capture the MAIN RED alarm (turned the leak into signal), but nothing reached a real desktop channel.
+CAP="$ART/notify-captured.log"
+if [ -f "$CAP" ] && grep -Eq '^(osascript|notify-send)\b' "$CAP"; then
+  fail "(c) native desktop notification LEAKED during the sim run:"$'\n'"$(cat "$CAP")"
+fi
+grep -q 'MAIN RED' "$ART/tr-cd/.herd/notifications.log" 2>/dev/null \
+  || fail "(c) the forced-red leg did not record a MAIN RED line in the durable notify sink"
+echo "PASS (c') notify hermeticity — MAIN RED captured to the sink, zero native desktop leaks"
 
 # The stub change landed on main and the builder branch was torn down.
 git -C "$ART/repo" cat-file -e main:app/farewell.sh 2>/dev/null \

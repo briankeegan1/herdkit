@@ -31,6 +31,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=scripts/herd/sim/sandbox-fixture.sh
 . "$HERE/sandbox-fixture.sh"
+# shellcheck source=scripts/herd/sim/sim-notify-stub.sh
+. "$HERE/sim-notify-stub.sh"   # notify hermeticity (HERD-139) — installed after $ART is known
 
 # ── output helpers (mirror cross-repo-loop-sim.sh's style) ──────────────────────────────────────
 c_bold=$'\033[1m'; c_dim=$'\033[2m'
@@ -54,6 +56,13 @@ done
 if [ -z "$ART" ]; then ART="$(mktemp -d)"; fi
 mkdir -p "$ART"
 if [ -z "$KEEP" ]; then trap 'rm -rf "$ART"' EXIT; fi
+
+# ── notify hermeticity (HERD-139) ───────────────────────────────────────────────────────────────
+# The engine paths this scenario drives (notably the main-health forced-red leg below) call
+# herd_driver_notify, which pops a REAL desktop notification. Install the shared notify stub NOW so
+# every notification lands only in a durable sink (headless notifications.log / the captured herdr
+# stub), never the operator's screen — and so the run can ASSERT the sink and prove zero native leaks.
+sim_notify_install "$ART"
 
 SCENARIO="stub-happy-path"
 [ "${SANDBOX_FORCE_GATE_FAIL:-}" = "1" ] && SCENARIO="stub-gate-fault"
@@ -344,6 +353,21 @@ BROKEN
     checkpoint main_health_recovery pass "a later green sha clears the MAIN RED row (state removed, row empty)"
   else
     checkpoint main_health_recovery fail "green sha did NOT clear the alarm (row='$ROW_D', state=$( [ -f "$(_mh_state "$TR_CD")" ] && echo present || echo absent ))"
+  fi
+
+  # (C/D) NOTIFY SINK (HERD-139): the forced-red + recovery legs above are exactly the 2026-07-08
+  # cry-wolf incident — main_health_tick fires herd_driver_notify. With the notify stub installed the
+  # notification is CAPTURED in the durable headless sink instead of the operator's desktop, so we can
+  # ASSERT it: the shared TR_CD sink must hold EXACTLY ONE '🚨 MAIN RED' line (green→red transition,
+  # leg C) and the '✅ main green' recovery line (red→green transition, leg D). Turns the leak into
+  # covered signal — notification behaviour is now tested, not leaked.
+  MH_SINK="$(sim_notify_sink "$TR_CD")"
+  _mh_red_n="$(sim_notify_count "$MH_SINK" 'MAIN RED')"
+  _mh_grn_n="$(sim_notify_count "$MH_SINK" 'main green')"
+  if [ "$_mh_red_n" = 1 ] && [ "$_mh_grn_n" -ge 1 ]; then
+    checkpoint main_health_notify_sink pass "forced-red leg surfaced exactly one MAIN RED + a recovery line to the durable sink (red=$_mh_red_n green=$_mh_grn_n), never the desktop"
+  else
+    checkpoint main_health_notify_sink fail "notify sink mismatch (want 1 MAIN RED + >=1 main green; got red=$_mh_red_n green=$_mh_grn_n; sink=$MH_SINK)"
   fi
 
   # (E) NON-HEAVY MERGE ON A BROKEN MAIN (review regression guard): break main, then land a docs-only
@@ -673,6 +697,19 @@ else
   else
     checkpoint pipeline_steps_two_approve fail "independent double-approve gate failed (rc1=$_st2_rc1 rc2=$_st2_rc2 rc3=$_st2_rc3 awaiting_ct=$_st2_await_ct)"
   fi
+fi
+
+# ── notify hermeticity invariant (HERD-139) ─────────────────────────────────────────────────────
+# Every notification any phase produced must have landed in the sink, NEVER a real desktop channel.
+# The notify stub captures any native osascript/notify-send attempt; with the fix in place that count
+# is 0 for the whole run — a non-zero count means a scenario leaked an alarm onto the operator's
+# screen (the exact 2026-07-08 cry-wolf regression this guards against).
+step notify "harness invariant — zero notifications delivered outside the sink"
+_notify_native="$(sim_notify_native_attempts)"
+if [ "$_notify_native" = 0 ]; then
+  checkpoint notify_hermetic pass "no native desktop notification fired during the run (all notifications captured to the sink)"
+else
+  checkpoint notify_hermetic fail "$_notify_native native desktop notification(s) LEAKED outside the sink (see $SIM_NOTIFY_CAPTURED)"
 fi
 
 # ── scorecard ───────────────────────────────────────────────────────────────────
