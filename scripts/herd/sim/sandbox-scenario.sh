@@ -25,7 +25,8 @@
 #                               must record gate=fail, SKIP the merge, and end with result=fail
 #                               (proving a broken change is never silently merged).
 #
-# Exit: 0 = every checkpoint passed · 1 = at least one checkpoint failed (or a hard error).
+# Exit: 0 = nothing failed (result pass, or pass-with-skips when a non-optional phase could not run) ·
+#       1 = at least one checkpoint failed (or a hard error).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -71,20 +72,34 @@ BUILDER_BRANCH="sim/stub-builder"
 
 # ── checkpoint recording (bash 3.2: parallel indexed arrays, no assoc arrays) ───────────────────
 CP_NAMES=(); CP_STATUS=(); CP_DETAIL=()
-_pass=0; _fail=0
+_pass=0; _fail=0; _skip_req=0
 
-# checkpoint <name> <status: pass|fail|skip> <detail...>
+# checkpoint <name> <status> <detail...>
+#   status:
+#     pass          — the checkpoint held.
+#     fail          — the checkpoint did not hold (drives result=fail, exit 1).
+#     skip          — a NON-OPTIONAL skip: a phase that was EXPECTED to run but could NOT (e.g. a
+#                     required lib was absent). It is a real COVERAGE GAP, so it degrades the scorecard
+#                     result to "pass-with-skips" — a silently-skipped phase must never read as a clean
+#                     pass (S1: sim scorecards were green even when whole phases skipped).
+#     skip-optional — an EXPECTED, designed skip: a conditional branch that is SUPPOSED to skip (e.g.
+#                     "merge correctly SKIPPED because the gate failed"). Recorded as a skip in the
+#                     scorecard, but does NOT degrade the result — it is the scenario working as designed.
+#   Any UNKNOWN/typo'd status is counted as a FAIL (default arm) so a broken checkpoint call can never
+#   silently vanish from the tally.
 checkpoint() {
   local name="$1" status="$2"; shift 2
-  local detail="$*"
+  local detail="$*" stored
   # Sanitize detail for embedding in JSON: strip the two chars that would break a bare string.
   detail="$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')"
-  CP_NAMES+=("$name"); CP_STATUS+=("$status"); CP_DETAIL+=("$detail")
   case "$status" in
-    pass) _pass=$((_pass+1)); ok "$name — $detail" ;;
-    fail) _fail=$((_fail+1)); bad "$name — $detail" ;;
-    skip) skip "$name — $detail" ;;
+    pass)          _pass=$((_pass+1));         stored=pass; ok   "$name — $detail" ;;
+    fail)          _fail=$((_fail+1));         stored=fail; bad  "$name — $detail" ;;
+    skip)          _skip_req=$((_skip_req+1)); stored=skip; skip "$name — $detail (non-optional → pass-with-skips)" ;;
+    skip-optional) stored=skip;                             skip "$name — $detail" ;;
+    *)             _fail=$((_fail+1));         stored=fail; bad  "$name — UNKNOWN status '$status' (counted as fail): $detail" ;;
   esac
+  CP_NAMES+=("$name"); CP_STATUS+=("$stored"); CP_DETAIL+=("$detail")
 }
 
 # assert <name> <predicate-cmd...> — run predicate; pass if exit 0, fail otherwise.
@@ -214,7 +229,7 @@ if [ "$gate_rc" -eq 0 ]; then
     assert merged _path_on_ref "$REPO" main "app/farewell.sh"
   fi
 else
-  checkpoint merged skip "merge correctly SKIPPED because the gate failed"
+  checkpoint merged skip-optional "merge correctly SKIPPED because the gate failed"
   # And prove the broken change never reached main.
   if git -C "$REPO" merge-base --is-ancestor "$BUILDER_BRANCH" main 2>/dev/null; then
     checkpoint change_isolated fail "broken builder commit leaked onto main"
@@ -713,7 +728,12 @@ else
 fi
 
 # ── scorecard ───────────────────────────────────────────────────────────────────
-RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
+# A non-optional skip (an expected phase that could NOT run) degrades a clean "pass" to
+# "pass-with-skips" so a silently-skipped phase never masquerades as full coverage. A real failure
+# still dominates (result=fail). "skip-optional" (designed conditional skips) never degrades.
+RESULT="pass"
+[ "$_skip_req" -gt 0 ] && RESULT="pass-with-skips"
+[ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT" "$FIXTURE_SHA")"
 printf '\n%s══ scorecard ══%s\n' "$c_bold" "$c_rst"
 printf '  scenario:   %s\n' "$SCENARIO"
@@ -723,4 +743,6 @@ printf '  failed:     %d\n' "$_fail"
 printf '  scorecard:  %s\n' "$SCARD"
 printf '  artifacts:  %s\n' "$ART"
 
-[ "$RESULT" = "pass" ] && exit 0 || exit 1
+# Exit 1 only on a real FAILURE; pass and pass-with-skips both exit 0 (nothing FAILED — the skip gap
+# is flagged in the scorecard RESULT and enforced by the wrapper, which pins every phase checkpoint).
+[ "$RESULT" = "fail" ] && exit 1 || exit 0

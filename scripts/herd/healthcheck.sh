@@ -19,6 +19,7 @@
 #   * no $HEALTHCHECK_CMD configured        → always light (pure syntax gate)
 #   * $HEALTHCHECK_HEAVY_GLOB set + matches → heavy;  set + no match → light
 #   * $HEALTHCHECK_HEAVY_GLOB empty + a cmd → always heavy (e.g. a project with no "app" axis)
+#   * $HEALTHCHECK_HEAVY_GLOB is an INVALID regex → LOUD warning + heavy (never silently under-gate)
 #   * can't tell what changed                → heavy (the thorough side)
 #
 # --heavy / --light force a profile; --auto (default) detects from the diff. Shared by
@@ -88,10 +89,22 @@ if [ "$MODE" = "auto" ]; then
       MODE="heavy"                     # can't tell what changed → thorough
     elif [ -z "$HEALTHCHECK_HEAVY_GLOB" ]; then
       MODE="heavy"                     # no "app" axis → every change is heavy
-    elif printf '%s\n' "$changed" | grep -qE "$HEALTHCHECK_HEAVY_GLOB"; then
-      MODE="heavy"
     else
-      MODE="light"
+      # Validate the glob up front, exactly as the commit-convention lint validates COMMIT_CONVENTION
+      # (see run_commit_convention_lint below): probe the pattern against empty input — a VALID egrep
+      # yields no match (exit 1), an INVALID one makes grep exit ≥2. An invalid glob must NOT silently
+      # route to LIGHT: the bucketing `grep -qE` below would itself error ≥2 (read by `-q` as "no
+      # match" → light), UNDER-gating a change on a broken operator glob. Instead fail LOUD toward
+      # HEAVY (the thorough side) so a malformed HEALTHCHECK_HEAVY_GLOB can never weaken the gate.
+      grep -qE "$HEALTHCHECK_HEAVY_GLOB" </dev/null 2>/dev/null
+      if [ "$?" -ge 2 ]; then
+        echo "⚠️  invalid HEALTHCHECK_HEAVY_GLOB regex (routing to HEAVY): $HEALTHCHECK_HEAVY_GLOB" >&2
+        MODE="heavy"
+      elif printf '%s\n' "$changed" | grep -qE "$HEALTHCHECK_HEAVY_GLOB"; then
+        MODE="heavy"
+      else
+        MODE="light"
+      fi
     fi
   fi
 fi
