@@ -62,6 +62,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
 
+# Shared governance EXTRACTION + MAPPING helpers (_gov_map_file / _gov_statements / _gov_match). The
+# read-only half of the HERD-119 adoption pass, factored out so the HERD-125 drift sweep re-extracts a
+# CLAUDE.md/AGENTS.md change EXACTLY as init imported it. Defines functions only (TEMPLATES_DIR is set
+# above, so _gov_map_file resolves the same table it always has). The init-only mutators + LLM
+# fallback stay in this file, below.
+# shellcheck source=/dev/null
+. "$SCRIPTS_DIR/governance.sh"
+
 # Runtime driver shim: the ONE seam binding the runtime-specific control surface (multiplexer + agent
 # runtime) to a concrete backend, dispatched on HERD_DRIVER. Defines functions only (side-effect-free),
 # and — like fleet.sh — late-binds herd_resolve_workspace_id / WORKTREES_DIR at call time, so sourcing
@@ -532,59 +540,10 @@ _init_grounding_interview() {
 # validated `herd config set` (or an append to the REVIEW_CHECKLIST file); declining all leaves the
 # config exactly as the interview wrote it. Deterministic-first (templates/governance-map.tsv), with a
 # cleanly-stubbable LLM fallback for fuzzy phrasing. Fail-soft: unparseable prose is silently skipped.
-
-# _gov_map_file — the deterministic pattern table (test seam: HERD_GOVERNANCE_MAP).
-_gov_map_file() { printf '%s' "${HERD_GOVERNANCE_MAP:-$TEMPLATES_DIR/governance-map.tsv}"; }
-
-# _gov_statements <file...> — emit candidate governance statements, one per line, from the given
-# markdown sources. Deterministic + fail-soft: strips fenced code, headings and bullet/number markers,
-# splits prose on sentence boundaries, trims, and drops trivially short fragments. A missing/unreadable
-# file contributes nothing.
-_gov_statements() {
-  local f
-  for f in "$@"; do
-    { [ -f "$f" ] && [ -r "$f" ]; } || continue
-    awk '
-      /^[[:space:]]*```/ { infence = !infence; next }
-      infence { next }
-      {
-        line = $0
-        sub(/^[[:space:]]*([-*+]|[0-9]+[.)])[[:space:]]+/, "", line)   # drop a leading bullet/number
-      }
-      line ~ /^[[:space:]]*#/ { next }                                 # skip headings
-      {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-      }
-      line == "" { next }
-      {
-        n = split(line, parts, /\.[[:space:]]+/)                       # split prose into sentences
-        for (i = 1; i <= n; i++) {
-          s = parts[i]
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
-          sub(/[.;:]+$/, "", s)
-          if (length(s) >= 10) print s
-        }
-      }
-    ' "$f" 2>/dev/null || true
-  done
-}
-
-# _gov_match <statement> — against the pattern table, echo "surface<TAB>target<TAB>label" for the
-# FIRST matching row (case-insensitive), or nothing. Comment/header rows are skipped. Fail-soft.
-_gov_match() {
-  local stmt="$1" map pattern surface target label
-  map="$(_gov_map_file)"
-  [ -f "$map" ] || return 0
-  while IFS=$'\t' read -r pattern surface target label; do
-    case "$pattern" in ''|'#'*|'pattern') continue ;; esac
-    [ -n "$surface" ] || continue
-    if printf '%s' "$stmt" | grep -qiE "$pattern" 2>/dev/null; then
-      printf '%s\t%s\t%s' "$surface" "$target" "$label"
-      return 0
-    fi
-  done < "$map"
-  return 0
-}
+#
+# The read-only extraction + mapping half (_gov_map_file / _gov_statements / _gov_match) lives in
+# scripts/herd/governance.sh, sourced near the top of this file and SHARED with the HERD-125 drift
+# sweep. The init-only mutators + the default-off LLM fallback below are NOT shared.
 
 # _gov_llm_classify <statement> — LLM FALLBACK for fuzzy phrasing the deterministic table missed.
 # CLEANLY STUBBABLE and DEFAULT-OFF: unless HERD_GOV_LLM=1 AND `claude` is on PATH it prints nothing,
