@@ -80,6 +80,14 @@ jobs:
           git config --global user.name  "herdkit CI"
           git config --global user.email "ci@herdkit.local"
           git config --global init.defaultBranch main
+      - name: Point the dogfood PROJECT_ROOT at the checkout
+        run: |
+          # .herd/config hardcodes PROJECT_ROOT="$HOME/source/herdkit" (the maintainer's layout).
+          # A few tests run engine commands against the REAL repo (e.g. test-codemap-project's
+          # "real repo maps as ENGINE") and read that config; on a runner the path doesn't exist, so
+          # codemap picks the wrong root and mis-detects PROJECT mode. Make the path resolve here.
+          mkdir -p "$HOME/source"
+          ln -sfn "$GITHUB_WORKSPACE" "$HOME/source/herdkit"
       - name: Show environment
         run: |
           echo "platform: $HERD_CI_PLATFORM   uname: $(uname -a)"
