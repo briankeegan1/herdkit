@@ -187,6 +187,69 @@ herd_driver_pane_alive() {
   herdr pane read "$target" >/dev/null 2>&1
 }
 
+# herd_driver_agent_liveness <slug> [pane_id] — THREE-VALUED liveness of a builder's agent SESSION:
+# whether its underlying agent PROCESS is actually running, as opposed to a stale agent_status word
+# herdr keeps reporting after a crash killed it (HERD-114). This is DISTINCT from mere pane EXISTENCE
+# (herd_driver_pane_alive) and from the status word: the 2026-07-08 incident had a herdr server stop
+# KILL both builders' claude processes while their tabs/panes/worktrees persisted and `herdr agent
+# list` still reported a stale 'done' — so neither pane-alive nor the status word could tell the
+# session was dead. Echoes exactly one token:
+#   alive   — POSITIVE evidence the session process runs (headless: a live registry pid; herdr-claude:
+#             the agent's pane still has a foreground `claude` process)
+#   dead    — POSITIVE evidence it is GONE (headless: a pid recorded but not running; herdr-claude: the
+#             pane EXISTS but runs NO claude — a bare shell left behind after the process was killed)
+#   unknown — cannot tell (no pane id resolvable, herdr/process-info absent or unparseable, pane gone,
+#             no registry record). FAIL-SOFT: a probe that cannot see the truth NEVER fabricates a
+#             death, so a caller degrades to its prior behavior and never false-reds (no-false-red).
+herd_driver_agent_liveness() {
+  local slug="${1:-}" pane="${2:-}"
+  [ -n "$slug" ] || { printf 'unknown'; return 0; }
+  if _herd_driver_is_headless; then
+    local pidf pid
+    pidf="$(_herd_agent_dir "$slug")/pid"
+    [ -f "$pidf" ] || { printf 'unknown'; return 0; }
+    pid="$(cat "$pidf" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+    if kill -0 "$pid" 2>/dev/null; then printf 'alive'; else printf 'dead'; fi
+    return 0
+  fi
+  command -v herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  # Resolve the agent's pane when the caller didn't pass one. herdr carries the identity in EITHER
+  # `name` (a builder started via `herdr agent start <slug>`) or `agent` (one reported via
+  # `herdr pane report-agent --agent <slug>`), so match both — the same tolerance herdr's own consumers
+  # use — so the probe finds the pane however the agent was registered.
+  if [ -z "$pane" ]; then
+    pane="$(herdr agent list 2>/dev/null | SLUG="$slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if a.get("name") == slug or a.get("agent") == slug:
+      print(a.get("pane_id", "") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true)"
+  fi
+  [ -n "$pane" ] || { printf 'unknown'; return 0; }
+  # Classify the pane by the process in its FOREGROUND — the same ground-truth eyes layout-reconcile
+  # uses: a live `claude` ⇒ alive; a shell with no claude foreground ⇒ dead (the process was killed
+  # but the pane persists as a bare shell); missing/opaque process-info or a gone pane ⇒ unknown.
+  herdr pane process-info --pane "$pane" 2>/dev/null | python3 -c '
+import sys, json
+try:
+  pi = (json.load(sys.stdin).get("result") or {}).get("process_info")
+except Exception:
+  print("unknown"); sys.exit(0)
+if not pi:
+  print("unknown"); sys.exit(0)
+sh = pi.get("shell_pid") or 0
+if not sh:
+  print("unknown"); sys.exit(0)
+fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh]
+print("alive" if any("claude" in (p.get("cmdline") or "") for p in fg) else "dead")
+' 2>/dev/null || printf 'unknown'
+}
+
 # herd_driver_send_keys <pane> <keys…> — send raw control keystrokes. herdr-claude:
 # `herdr pane send-keys`. headless: NO-OP (raw keystrokes are a pane concept; nothing receives them).
 # NEVER fails.
@@ -369,11 +432,12 @@ _herd_driver_cli() {
     send-keys)   herd_driver_send_keys "$@" ;;
     close-pane)  herd_driver_close_pane "$@" ;;
     pane-alive)  herd_driver_pane_alive "$@" ;;
+    agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
     create-tab)  herd_driver_create_tab "$@" ;;
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|pane-alive <pane>|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name}\n' >&2; return 2 ;;
   esac
 }
 

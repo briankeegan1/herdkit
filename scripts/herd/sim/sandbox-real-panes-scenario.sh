@@ -184,7 +184,8 @@ else
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
-            pane_captured reviewer_pane_retired_on_verdict teardown_clean; do
+            pane_captured reviewer_pane_retired_on_verdict builder_agent_dead \
+            builder_refix_escalates_on_dead teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -368,6 +369,92 @@ except Exception:
       fi
     else
       checkpoint reviewer_pane_retired_on_verdict fail "could not stand up the review split pane (RV_PANE='$RV_PANE')"
+    fi
+  fi
+
+  # ── DEAD-AGENT EYES (HERD-114): kill the builder's pane process, assert the liveness probe flips to
+  # 'dead' and a refix bounce ESCALATES (needs you · agent dead) instead of waking a dead pane. Models
+  # the 2026-07-08 incident where a herdr server stop killed a builder's claude while its pane/PR
+  # persisted and a REVIEW_AUTOFIX bounce would have typed a re-task into the dead pane. Drives the
+  # SHIPPED probe (herd_driver_agent_liveness) + the SHIPPED refix path (_handle_block_verdict, sourced
+  # in lib mode) against REAL panes. The stub builder has no real claude, so we stand up a long-lived
+  # foreground process WITH a 'claude' argv0 as the live session, then kill it to strand a bare pane.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step deadeyes "kill the builder pane process → agent-dead; a refix bounce escalates, never wakes"
+    # shellcheck source=scripts/herd/driver.sh
+    . "$HERE/../driver.sh"   # herd_driver_agent_liveness (functions only; no side effects)
+
+    # the pane's foreground PROCESS GROUP id (the running job; == shell_pid when the shell is idle)
+    _fg_pgid() {
+      herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
+import sys,json
+try: pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+except Exception: pi={}
+print(pi.get("foreground_process_group_id") or "")
+' 2>/dev/null
+    }
+    _live_of() { herd_driver_agent_liveness rp-builder "$BUILD_PANE" 2>/dev/null; }
+
+    # 1) Stand up the "live session": the stub builder has no real claude, so run a long-lived
+    #    foreground process whose cmdline contains 'claude' (an executable literally named `claude`
+    #    that sleeps) — the same signal herd_driver_agent_liveness reads for a real builder. NOT
+    #    exec'd, so the pane's shell stays the parent and returns to a bare prompt once we kill the job.
+    CLAUDE_BIN="$ART/claudebin"; mkdir -p "$CLAUDE_BIN"
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CLAUDE_BIN/claude"; chmod +x "$CLAUDE_BIN/claude"
+    _pgid_before=""
+    herdr pane run "$BUILD_PANE" "$CLAUDE_BIN/claude" >/dev/null 2>&1 || true
+    _alive="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(_live_of)" = "alive" ] && { _alive=yes; _pgid_before="$(_fg_pgid "$BUILD_PANE")"; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+
+    if [ "$_alive" = yes ]; then
+      # 2) Kill the pane's foreground JOB (whole process group) → the pane falls back to a bare shell.
+      [ -n "$_pgid_before" ] && kill -TERM -"$_pgid_before" >/dev/null 2>&1 || true
+      _dead="no"; _i=0
+      while [ "$_i" -lt 25 ]; do [ "$(_live_of)" = "dead" ] && { _dead=yes; break; }; _i=$((_i+1)); sleep 0.2; done
+      if [ "$_dead" = yes ]; then
+        checkpoint builder_agent_dead pass "killed pane process; herd_driver_agent_liveness flipped alive→dead"
+      else
+        checkpoint builder_agent_dead fail "liveness did not flip to dead after the pane process was killed (got '$(_live_of)')"
+      fi
+    else
+      checkpoint builder_agent_dead fail "could not stand up a live 'claude' foreground to kill (liveness='$(_live_of)')"
+    fi
+
+    # 3) Drive the SHIPPED refix bounce against the now-dead builder and assert it ESCALATES (needs you
+    #    · agent dead) and never wakes. Isolated trees/journal + REVIEW_AUTOFIX on. A subshell so
+    #    agent-watch.sh's globals never clobber the scenario's.
+    if [ "${_dead:-no}" = yes ]; then
+      BVT="$ART/deadtrees"; mkdir -p "$BVT"
+      BV_JOURNAL="$ART/bv-journal.jsonl"; : > "$BV_JOURNAL"
+      BV_DISPLAY="$ART/bv-display.txt"; : > "$BV_DISPLAY"
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$BVT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-deadeyes-sim" JOURNAL_FILE="$BV_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        render() { :; }
+        REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+        DISPLAY=()
+        _handle_block_verdict "600" "rp-builder" "deadsha600" "0" || true
+        printf '%s' "${DISPLAY[0]:-}" > "$BV_DISPLAY"
+      ) ; BV_RC=$?
+      _bv_disp="$(cat "$BV_DISPLAY" 2>/dev/null || true)"
+      _bv_escalated=no; printf '%s' "$_bv_disp" | grep -q "agent dead" && _bv_escalated=yes
+      _bv_journaled=no; grep -q '"event":"refix_escalated_dead"' "$BV_JOURNAL" 2>/dev/null && _bv_journaled=yes
+      # "escalates instead of waking": the escalation event is present AND the wake-result event is NOT.
+      _bv_no_wake=no; grep -q '"event":"refix_wake_result"' "$BV_JOURNAL" 2>/dev/null || _bv_no_wake=yes
+      if [ "$BV_RC" = 0 ] && [ "$_bv_escalated" = yes ] && [ "$_bv_journaled" = yes ] && [ "$_bv_no_wake" = yes ]; then
+        checkpoint builder_refix_escalates_on_dead pass \
+          "refix bounce escalated to 'agent dead' (refix_escalated_dead journaled; no wake attempted)"
+      else
+        checkpoint builder_refix_escalates_on_dead fail \
+          "refix bounce did not escalate cleanly (rc=$BV_RC escalated=$_bv_escalated journaled=$_bv_journaled no_wake=$_bv_no_wake disp='$_bv_disp')"
+      fi
+    else
+      checkpoint builder_refix_escalates_on_dead fail "skipped refix assertion — the pane process was not confirmed dead"
     fi
   fi
 

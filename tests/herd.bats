@@ -163,6 +163,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
+  run bash "$REPO/tests/test-agent-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic coordinator startup-restore probe (HERD-112) test passes" {
   run bash "$REPO/tests/test-startup-restore.sh"
   [ "$status" -eq 0 ]
