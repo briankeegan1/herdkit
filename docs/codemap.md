@@ -85,7 +85,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `bin/herd` → `cost.sh`, `driver.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `status.sh`, `theme.sh`
 - `agent-watch.sh` → `cost.sh`, `driver.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
-- `backlog-reconcile-sweep.sh` → `herd-config.sh`
+- `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
 - `backlog-view.sh` → `herd-config.sh`, `theme.sh`
 - `codemap.sh` → `herd-config.sh`
