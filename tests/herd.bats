@@ -301,6 +301,12 @@ setup() {
   [[ "$output" == *"PASS"* ]]
 }
 
+@test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
+  run bash "$REPO/tests/test-watcher-discovery-scope.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
