@@ -2929,12 +2929,18 @@ PY
 # _text_is_limit_banner <text> — 0 iff <text> looks like Claude's actual usage-limit BANNER, not a
 # builder merely DISCUSSING usage limits. HERD-155 F4: this repo's builders BUILD limit features, so
 # the bare phrase "usage limit" shows up in perfectly normal assistant output (task specs, PR bodies,
-# code comments — this very sentence). The banner-scrape FALLBACK must key on the banner SHAPE — a
-# "limit reached" / "limit will reset at <time>" status line — never the bare phrase, or the watcher
+# code comments — this very sentence). Detection now requires BOTH:
+#   1. the canonical usage-limit PHRASE — kept VERBATIM as the driver's DRIVER_AGENT_LIMIT_PATTERN
+#      mirror (the cross-driver conformance audit in test-driver-agent-exec.sh asserts this exact
+#      string is still present here), AND
+#   2. the banner SHAPE — a "limit reached" / "limit will reset" / "reset at|in <time>" STATUS line.
+# Discussion carries the phrase but not the shape, so the transcript-scrape fallback no longer
 # self-triggers a phantom park on a limit-feature builder's own words. The hook sentinel (primary
-# signal) is unaffected; this only tightens the transcript fallback.
+# signal) is unaffected — this only tightens the fallback.
 _text_is_limit_banner() {
-  printf '%s' "$1" | grep -qiE '(usage|session|[0-9]+-?hour) limit reached|your (usage |session )?limit will reset|reached your (usage|session) limit|limit[^.]{0,40}reset[s]? (at|in) '
+  local _tb="$1"
+  printf '%s' "$_tb" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit' || return 1
+  printf '%s' "$_tb" | grep -qiE 'limit reached|will reset|reset[s]? (at|in) |reached your (usage|session) limit'
 }
 
 # _detect_limit_hit <slug> <worktree> — is this builder blocked on the account usage limit?
