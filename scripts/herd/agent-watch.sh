@@ -634,6 +634,36 @@ _persist_block_fields() {
     > "$(_review_block_file "$pr" "$sha")" 2>/dev/null || true
 }
 
+# ── Advisory (non-blocking) notes on a PASS (HERD-105) ────────────────────────────────────────────
+# The correctness-only gate BLOCKs only on a correctness finding; style/hardening/nitpick findings
+# ride a PASS verdict as ' | '-separated 'advisory:' notes after the em-dash:
+#   REVIEW: PASS — advisory: <note> | advisory: <note>
+# This helper surfaces each such note to the JOURNAL (the reviewer already posted them on the PR
+# comment) so an advisory finding is recorded but NEVER gates the merge. FAIL-SOFT + BYTE-IDENTICAL
+# when unused: a bare 'REVIEW: PASS' has no em-dash tail, so this returns immediately with zero
+# journal writes — the pre-HERD-105 behaviour is unchanged.
+#
+# _record_advisory_notes <pr#> <sha> <pass-verdict-line> — journal one review_advisory event per
+# advisory note carried on the PASS line. Best-effort; a malformed tail simply yields no notes.
+_record_advisory_notes() {
+  local pr="$1" sha="$2" line="$3" payload seg note
+  case "$line" in
+    *"—"*) payload="${line#*—}" ;;   # text after the em-dash tail
+    *) return 0 ;;                    # bare 'REVIEW: PASS' → no advisory notes (byte-identical)
+  esac
+  payload="$(_blk_trim "$payload")"
+  while [ -n "$payload" ]; do
+    if [ "$payload" = "${payload#* | }" ]; then seg="$payload"; payload=""      # last (or only) segment
+    else seg="${payload%% | *}"; payload="${payload#* | }"; fi
+    case "$seg" in
+      [Aa]dvisory:*)
+        note="$(_blk_trim "${seg#*:}")"; note="${note:0:200}"
+        [ -n "$note" ] && journal_append review_advisory pr "$pr" sha "$sha" note "$note" ;;
+    esac
+  done
+  return 0
+}
+
 # ── Background review dispatch ──────────────────────────────────────────────────────────────────
 # The review gate used to run herd-review.sh SYNCHRONOUSLY in the poll loop, so one slow review
 # (~7 min on Opus) head-of-line-blocked every other PR's review AND all merges for that cycle.
@@ -824,7 +854,13 @@ _review_gate_step() {
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
-      "REVIEW: PASS")   record_review "$pr" "$sha" "PASS"  "reviewer"; echo PASS;  return 0 ;;
+      # PASS may carry a HERD-105 'advisory:' tail (' — advisory: …'); a bare 'REVIEW: PASS' has
+      # none. Either way the merge proceeds on PASS — the advisory notes are journalled (never
+      # gate). Match both shapes; the record + echo are identical for a finding-free PASS.
+      "REVIEW: PASS"|"REVIEW: PASS "*)
+        record_review "$pr" "$sha" "PASS" "reviewer"
+        _record_advisory_notes "$pr" "$sha" "$verdict_line"
+        echo PASS; return 0 ;;
       "REVIEW: BLOCK"*)
         record_review "$pr" "$sha" "BLOCK" "reviewer"
         # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
