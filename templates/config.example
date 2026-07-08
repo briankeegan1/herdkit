@@ -161,6 +161,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Opt-in only; watcher-affecting (takes effect on the next watcher restart).
 # GATE_DISPATCH="serial"   # serial (default) | parallel
 
+# INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
+# environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
+# an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After
+# INFRA_BREAKER_MAX in a row the breaker OPENS: new review/health dispatch stops, a loud
+# 'infra circuit open — environment looks dead' status row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds it goes HALF-OPEN for a SINGLE probe (a real verdict closes it, another
+# death re-opens it). CRITICAL: a real code BLOCK/PASS verdict proves the env is alive and RESETS the
+# counter — it never trips the breaker; only non-verdict deaths do. Ships OFF (byte-inert): default 0.
+# INFRA_BREAKER_MAX="0"          # 0 (default, off) | N>=1 = open after N consecutive INFRA (non-verdict) failures
+# INFRA_BREAKER_COOLDOWN="300"   # seconds OPEN before a single half-open probe retry (non-numeric → 300)
+
 # PR flow — how builders open PRs. SAFE DEFAULTS (direct + builder) preserve today's exact behavior:
 # a plain `gh pr create`. Only the LANE RULES text (herd-quick.sh / herd-feature.sh) reads these.
 #   PR_FLOW:       direct — open PRs ready to merge (default, today's behavior).

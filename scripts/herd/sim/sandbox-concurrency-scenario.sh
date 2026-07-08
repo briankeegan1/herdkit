@@ -232,7 +232,8 @@ WATCH="$HERE/../agent-watch.sh"
 _missing=""
 for fn in _healthcheck_gate _review_gate_step _count_live_reviews _count_live_healthchecks \
           _health_slot_free _health_inflight_file _review_inflight_file do_merge already_merged \
-          review_verdict _predispatch_review_if_parallel _gate_dispatch_mode; do
+          review_verdict _predispatch_review_if_parallel _gate_dispatch_mode \
+          _breaker_gate _breaker_record_infra _breaker_record_ok _breaker_read; do
   type "$fn" >/dev/null 2>&1 || _missing="$_missing $fn"
 done
 if [ -z "$_missing" ]; then
@@ -327,6 +328,14 @@ run_tick() {
   for k in $(seq 0 "$NIDX"); do
     pr="${PR_NUM[$k]}"; slug="${PR_SLUG[$k]}"; dir="${PR_DIR[$k]}"; sha="${PR_SHA[$k]}"
     already_merged "$pr" "$slug" && continue
+
+    # INFRA CIRCUIT BREAKER (HERD-110) — mirror the watcher's action pass: a BLOCKED candidate skips
+    # ALL dispatch this tick. Byte-inert (always PASS) under the default INFRA_BREAKER_MAX=0, so the
+    # happy-path drain below proves the gate is transparent when the breaker is off.
+    case "$(_breaker_gate "$pr")" in
+      BLOCKED) continue ;;
+      *) : ;;
+    esac
 
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel) — mirror the watcher's action pass: kick the
     # review off CONCURRENTLY with the healthcheck via the SHIPPED helper. A strict no-op under serial
@@ -463,6 +472,112 @@ else
   checkpoint pane_text_captured fail "driver read-pane surface produced no pane text"
 fi
 
+# ── FAULT-INJECTED DEAD-ENV PATH: INFRA circuit breaker (HERD-110) ──────────────────────────────
+# The happy path above ran with the breaker OFF (INFRA_BREAKER_MAX unset → 0), proving it is byte-inert.
+# Now inject a DEAD ENVIRONMENT: reviewers that die WITHOUT writing a verdict (INFRA-FAIL / non-verdict
+# death), across multiple PRs, and drive the SHIPPED functions (_review_gate_step → _breaker_record_infra
+# → _breaker_gate) to assert the breaker: (1) OPENs after INFRA_BREAKER_MAX consecutive non-verdict
+# deaths and SUPPRESSes further dispatch; (2) NEVER trips on a real BLOCK verdict (the INFRA-vs-verdict
+# distinction the whole feature hinges on); (3) HALF-OPENs after the cooldown for a single probe that a
+# real verdict CLOSEs; (4) is byte-inert when disabled. Uses the real watcher functions in lib mode.
+step deadenv "fault-inject a dead reviewer environment and assert the INFRA circuit breaker (HERD-110)"
+
+BRK_MAX=3
+export INFRA_BREAKER_MAX="$BRK_MAX"
+export INFRA_BREAKER_COOLDOWN=2
+: > "$REVIEW_RETRIES" 2>/dev/null || true
+rm -f "$INFRA_BREAKER_STATE" 2>/dev/null || true
+
+# _plant_and_step <pr> <sha> <verdict-line> — write a reviewer result file exactly as herd-review.sh
+# would (atomic-ish), then run the SHIPPED review gate step which collects it. <verdict-line> of
+# 'REVIEW: INFRA-FAIL' models a reviewer that died with no real verdict; 'REVIEW: BLOCK …' / 'REVIEW:
+# PASS' model real verdicts. Echoes the gate token.
+_plant_and_step() {
+  local pr="$1" sha="$2" line="$3" rf
+  rf="$(_review_result_file "$pr" "$sha")"
+  printf '%s\n' "$line" > "$rf.tmp.$$"; mv "$rf.tmp.$$" "$rf"
+  _review_gate_step "$pr" "dead-$pr" "$sha"
+}
+
+# (1) N consecutive non-verdict deaths across DISTINCT PRs → breaker OPENs, dispatch suppressed.
+_brk_opened=""; _brk_gate_before=""; _brk_gate_after=""
+_brk_gate_before="$(_breaker_gate 901)"          # closed → PASS
+d=1
+while [ "$d" -le "$BRK_MAX" ]; do
+  pr=$((900 + d)); _tok="$(_plant_and_step "$pr" "deadsha$pr" 'REVIEW: INFRA-FAIL')"
+  info "dead-env death $d/$BRK_MAX: PR #$pr review gate → $_tok · breaker=[$(_breaker_read)]"
+  d=$((d + 1))
+done
+_brk_gate_after="$(_breaker_gate 999)"           # open (cooling down) → BLOCKED
+read -r _bs _bf _bo _bp <<EOF
+$(_breaker_read)
+EOF
+if [ "$_bs" = "open" ] && [ "$_brk_gate_before" = "PASS" ] && [ "$_brk_gate_after" = "BLOCKED" ]; then
+  _brk_opened=1
+  checkpoint infra_breaker_opens pass "breaker OPEN after $BRK_MAX consecutive non-verdict deaths; dispatch suppressed (gate PASS→BLOCKED)"
+else
+  checkpoint infra_breaker_opens fail "expected OPEN+BLOCKED (state=$_bs, gate before=$_brk_gate_before after=$_brk_gate_after)"
+fi
+
+# (2) CRITICAL: a real BLOCK verdict must NEVER trip the breaker. Reset and feed BRK_MAX+2 real BLOCK
+# verdicts — the breaker must stay CLOSED the whole time (a BLOCK proves the env is alive).
+: > "$REVIEW_RETRIES" 2>/dev/null || true
+rm -f "$INFRA_BREAKER_STATE" 2>/dev/null || true
+_blk_tripped=""
+b=1; _blk_lim=$((BRK_MAX + 2))
+while [ "$b" -le "$_blk_lim" ]; do
+  pr=$((920 + b)); _tok="$(_plant_and_step "$pr" "blksha$pr" 'REVIEW: BLOCK — rule: r | why: w | location: l')"
+  read -r _bs _ _ _ <<EOF
+$(_breaker_read)
+EOF
+  [ "$_bs" != "closed" ] && _blk_tripped=1
+  b=$((b + 1))
+done
+if [ -z "$_blk_tripped" ] && [ "$(_breaker_gate 999)" = "PASS" ]; then
+  checkpoint infra_breaker_ignores_block pass "$_blk_lim real BLOCK verdicts never tripped the breaker (stayed CLOSED — INFRA≠verdict)"
+else
+  checkpoint infra_breaker_ignores_block fail "a real BLOCK verdict tripped the breaker (state=$(_breaker_read)) — MUST NOT happen"
+fi
+
+# (3) HALF-OPEN single probe + recovery: re-open on deaths, wait the cooldown, then exactly ONE
+# candidate is admitted as the probe (PROBE) while siblings are BLOCKED; a real verdict CLOSEs it.
+: > "$REVIEW_RETRIES" 2>/dev/null || true
+rm -f "$INFRA_BREAKER_STATE" 2>/dev/null || true
+d=1
+while [ "$d" -le "$BRK_MAX" ]; do
+  pr=$((940 + d)); _plant_and_step "$pr" "resha$pr" 'REVIEW: INFRA-FAIL' >/dev/null; d=$((d + 1))
+done
+sleep 3   # outlast INFRA_BREAKER_COOLDOWN=2
+_probe="$(_breaker_gate 941)"     # first candidate claims the single probe
+_sib1="$(_breaker_gate 942)"      # sibling blocked (one probe only)
+_sib2="$(_breaker_gate 943)"
+_probe_again="$(_breaker_gate 941)"   # same probe PR keeps PROBE across ticks (dispatch then collect)
+# Probe yields a real PASS verdict → breaker CLOSEs, normal dispatch resumes.
+_plant_and_step 941 "resha941ok" 'REVIEW: PASS' >/dev/null
+_closed="$(_breaker_read)"; _gate_recovered="$(_breaker_gate 942)"
+if [ "$_probe" = "PROBE" ] && [ "$_sib1" = "BLOCKED" ] && [ "$_sib2" = "BLOCKED" ] \
+   && [ "$_probe_again" = "PROBE" ] && [ "${_closed%% *}" = "closed" ] && [ "$_gate_recovered" = "PASS" ]; then
+  checkpoint infra_breaker_halfopen_recovers pass "half-open admitted exactly ONE probe (siblings BLOCKED); a real verdict CLOSEd the breaker and dispatch resumed"
+else
+  checkpoint infra_breaker_halfopen_recovers fail "half-open/recovery wrong (probe=$_probe sib1=$_sib1 sib2=$_sib2 again=$_probe_again closed=[$_closed] recovered=$_gate_recovered)"
+fi
+
+# (4) BYTE-INERT when disabled: the SAME dead-env sequence with INFRA_BREAKER_MAX=0 must write NO
+# breaker ledger and the gate must always PASS.
+export INFRA_BREAKER_MAX=0
+: > "$REVIEW_RETRIES" 2>/dev/null || true
+rm -f "$INFRA_BREAKER_STATE" 2>/dev/null || true
+d=1
+while [ "$d" -le "$((BRK_MAX + 1))" ]; do
+  pr=$((960 + d)); _plant_and_step "$pr" "offsha$pr" 'REVIEW: INFRA-FAIL' >/dev/null; d=$((d + 1))
+done
+if [ ! -f "$INFRA_BREAKER_STATE" ] && [ "$(_breaker_gate 999)" = "PASS" ]; then
+  checkpoint infra_breaker_byte_inert pass "disabled (INFRA_BREAKER_MAX=0): no breaker ledger written, gate always PASS (byte-inert)"
+else
+  checkpoint infra_breaker_byte_inert fail "disabled breaker was not byte-inert (ledger exists=$([ -f "$INFRA_BREAKER_STATE" ] && echo yes || echo no), gate=$(_breaker_gate 999))"
+fi
+unset INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"
@@ -490,6 +605,9 @@ write_scorecard() {
     printf '  "skipped_prs": %d,\n' "$_skipped"
     printf '  "queue_drained": %s,\n' "$([ "$_merged_ct" -eq "$NPRS" ] && echo true || echo false)"
     printf '  "ticks": %d,\n' "$TICKS"
+    printf '  "infra_breaker_tested": true,\n'
+    printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
+    printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"
     printf '  "pane_captures": %d,\n' "$PANE_CAPTURES"
     printf '  "screenshots": %d,\n' "$SHOTS_TAKEN"
     printf '  "checkpoints": [\n'
