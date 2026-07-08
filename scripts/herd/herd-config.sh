@@ -294,12 +294,18 @@ if [ "$TOKEN_MODE" = "eco" ]; then
   : "${MODEL_RESOLVER:="claude-haiku-4-5"}"
 fi
 
+# Eco-leaning STARTER defaults (HERD-161): Opus is now an ESCALATION tier reached via
+# MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB (review gate), NOT a bare default — so the
+# unset-fallbacks below match the manifest, config.example, and the `herd init` seed (feature→sonnet,
+# quick→haiku, review→sonnet). The persistent coordinator stays Opus. An explicit MODEL_* in
+# .herd/config always wins (':=' can't clobber it), and TOKEN_MODE=eco (above) further lowers the
+# support lanes. This finishes the eco-defaults migration that had left this fallback on Opus.
 : "${MODEL_COORDINATOR:="claude-opus-4-8"}"
-: "${MODEL_FEATURE:="claude-opus-4-8"}"
-: "${MODEL_QUICK:="claude-sonnet-4-6"}"
+: "${MODEL_FEATURE:="claude-sonnet-4-6"}"
+: "${MODEL_QUICK:="claude-haiku-4-5"}"
 : "${MODEL_SCRIBE:="claude-sonnet-4-6"}"
 : "${MODEL_RESEARCH:="claude-sonnet-4-6"}"
-: "${MODEL_REVIEW:="claude-opus-4-8"}"
+: "${MODEL_REVIEW:="claude-sonnet-4-6"}"
 : "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
 # MODEL_ADVISE — the STRONG advisor model behind `herd advise` (HERD-101): a builder pulls a one-shot

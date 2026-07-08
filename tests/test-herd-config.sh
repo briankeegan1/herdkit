@@ -32,9 +32,10 @@ echo HERD_BRANCH_NAME=\$HERD_BRANCH_NAME" )
 out="$(load_vars "$T/.nonexistent")"
 echo "$out" | grep -qx "SCRIBE_BACKEND=file"            || fail "default SCRIBE_BACKEND wrong ($out)"
 echo "$out" | grep -qx "BACKLOG_FILE=BACKLOG.md"        || fail "default BACKLOG_FILE wrong"
-echo "$out" | grep -qx "MODEL_FEATURE=claude-opus-4-8"  || fail "default MODEL_FEATURE wrong"
-echo "$out" | grep -qx "MODEL_QUICK=claude-sonnet-4-6"  || fail "default MODEL_QUICK wrong"
-echo "$out" | grep -qx "MODEL_REVIEW=claude-opus-4-8"   || fail "default MODEL_REVIEW wrong"
+# Eco-leaning starter fallbacks (HERD-161): Opus is an escalation tier, not a bare default.
+echo "$out" | grep -qx "MODEL_FEATURE=claude-sonnet-4-6" || fail "default MODEL_FEATURE wrong"
+echo "$out" | grep -qx "MODEL_QUICK=claude-haiku-4-5"    || fail "default MODEL_QUICK wrong"
+echo "$out" | grep -qx "MODEL_REVIEW=claude-sonnet-4-6"  || fail "default MODEL_REVIEW wrong"
 echo "$out" | grep -qx "WATCHER_AUTOMERGE=true"         || fail "default WATCHER_AUTOMERGE wrong"
 echo "$out" | grep -qx "HERD_VERSION=1"                 || fail "default HERD_VERSION wrong"
 echo "$out" | grep -qx "COORDINATOR_CMD=/coordinator"   || fail "default COORDINATOR_CMD wrong"
