@@ -201,8 +201,13 @@ GROUNDING_RULE="$(herd_context_provision_preamble)"
 # 3. RIGHT pane: the Claude sub-agent (yolo by default). The seeded task plus the standing
 #    workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this feature in this worktree. Before running '$PR_CREATE_CMD',
-run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE$STEPS_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
+verify YOUR change's OWN surface — you do NOT run the full heavy suite yourself. Run
+ bash $HERE/healthcheck.sh \"$DIR\" --light  (per-changed-file syntax) PLUS any test you added or
+changed, and get a clean pass (fix any CODE errors; data/env warnings are fine). DESCOPED, on purpose:
+the whole-project heavy profile (healthcheck.sh --heavy / the full test suite) is NOT required of you
+here — the auto-merge watcher re-runs that FULL profile as the AUTHORITATIVE merge gate, so a blanket
+local heavy run only duplicates it and burns turns. If your change is broad or risky you MAY still run
+it yourself with  bash $HERE/healthcheck.sh \"$DIR\" --heavy  (descoped = optional, not forbidden).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE$STEPS_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
 If your feature needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
