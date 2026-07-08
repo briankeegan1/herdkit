@@ -73,6 +73,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic scribe auto planned-marker (HERD-183) test passes" {
+  run bash "$REPO/tests/test-scribe-auto-marker.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]
