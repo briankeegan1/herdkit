@@ -65,6 +65,7 @@ Role summarized from each file's top-of-file comment.
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
 - `coordinator.md.tmpl` — (render template — no header comment)
 - `fleet-coordinator.md.tmpl` — (render template — no header comment)
+- `governance-map.tsv` — templates/governance-map.tsv — the DETERMINISTIC governance-adoption pattern table (HERD-119).
 - `healthcheck.go.sh` — healthcheck.go.sh (EXAMPLE) — a per-project health command for a Go project.
 - `healthcheck.java.sh` — healthcheck.java.sh (EXAMPLE) — a per-project health command for a Java project (Maven or Gradle).
 - `healthcheck.node.sh` — healthcheck.node.sh (EXAMPLE) — a per-project health command for a Node project.
@@ -119,13 +120,13 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `APP_PREVIEW_PORT_BASE` → `herd-feature.sh`, `herd-resolve.sh`
 - `APP_PREVIEW_SERVER_ARGS` → `app-monitor.sh`
 - `APP_SURFACE_GLOB` → `healthcheck.sh`
-- `ATTRIBUTION_POLICY` → `healthcheck.sh`
+- `ATTRIBUTION_POLICY` → `bin/herd`, `healthcheck.sh`
 - `BACKLOG_FILE` → `bin/herd`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `CLAIM_REQUIRED` → `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
-- `COMMIT_CONVENTION` → `healthcheck.sh`
+- `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
@@ -171,7 +172,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `theme.sh`, `tracker-state-sweep.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
-- `PUSH_GATE` → `herd-feature.sh`, `herd-quick.sh`, `push-gate.sh`
+- `PUSH_GATE` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `push-gate.sh`
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `REVIEW_AUTOFIX` → `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
