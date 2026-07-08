@@ -387,6 +387,15 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
+# INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
+# environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
+# exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health
+# dispatch stops, a loud 'infra circuit open' row + journal event surface, and after
+# INFRA_BREAKER_COOLDOWN seconds the breaker goes HALF-OPEN for a single probe retry (a real verdict
+# closes it, another death re-opens it). Default 0 = OFF → every breaker path is a no-op and behavior
+# is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
+: "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
+: "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
