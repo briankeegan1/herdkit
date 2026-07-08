@@ -963,6 +963,14 @@ cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
 # `herd symbol-index --check` is a read-only staleness probe (0 fresh / non-zero stale), like codemap.
 cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
 
+# ── herd ledger: the coordinator progress ledger read/write surface (HERD-103) ───────────────────
+# Durable, cross-session coordinator state (per work-item: slug/worktree/PR, sequencing, planned
+# markers) keyed by tracker id, so a coordinator or a second operator RESUMES with an accurate
+# picture instead of re-deriving it every session. Coordinator-side only — NOT a watcher gate.
+# Delegates to scripts/herd/ledger.sh; state lives in the local (never-committed) worktree pool at
+# WORKTREES_DIR/.herd/ledger.jsonl. Default-dormant: with no writes, no file exists and nothing runs.
+cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -4044,6 +4052,17 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
                                         def→caller index of the engine tree (who-defines / who-calls);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
+  herd ledger <set|get|list|rm|compact|path>  coordinator PROGRESS LEDGER — durable, cross-session
+                                      per-work-item state (slug/worktree/PR, sequencing, planned
+                                      markers) keyed by tracker id, so you resume with an accurate
+                                      picture instead of re-deriving it. Coordinator-side only (no
+                                      watcher gate); local + never committed. Default-dormant:
+                                        set <id> [k v]...  append/update an item's fields
+                                        get <id> [--json]  print one item's folded state
+                                        list [--json]      list live items ([--planned] filters)
+                                        rm <id>            tombstone an item out of get/list
+                                        compact            fold history to one line per live item
+                                        path               print the ledger file path
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -4152,6 +4171,7 @@ case "${1:-help}" in
   render)  shift; cmd_render "$@" ;;
   codemap) shift; cmd_codemap "$@" ;;
   symbol-index) shift; cmd_symbol_index "$@" ;;
+  ledger)  shift; cmd_ledger "$@" ;;
   config)  shift; cmd_config "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
