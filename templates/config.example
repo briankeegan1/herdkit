@@ -201,6 +201,14 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Combination is fail-safe: ANY member's BLOCK blocks the merge; a merge needs >=1 PASS and zero BLOCKs.
 # REVIEW_PANEL="1"         # concurrent reviewer passes when NATIVE_BURST=on (default 1)
 
+# stale-duplicate gate (HERD-188) — on (default) | off. on → the watcher HOLDS (never auto-merges,
+# loud 🛑 row + one PR comment) any PROVABLE stale duplicate BEFORE review/merge: a PR whose tracked
+# 'Refs: <ID>' item already shipped via another merged PR, OR whose touched files were materially
+# changed on DEFAULT_BRANCH by a merge the branch predates (a stale base a merge would silently
+# clobber). Provable-only + fail-soft (no ref / offline gh / bad worktree → no hold), so default-on
+# never false-holds a legit PR. off → byte-inert. Watcher-affecting (next watcher restart).
+# STALE_DUP_DETECT="on"    # on (default) | off
+
 # post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
 # health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
 # broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited

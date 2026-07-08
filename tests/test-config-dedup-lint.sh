@@ -25,6 +25,15 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0; okc(){ pass=$((pass+1)); }
 
+# HERMETIC STUB: `herd doctor` probes `claude --version`, and `herd config set` (case 5) restarts the
+# backlog pane via the LIVE herdr — both reach the real control room when herdr/claude are on PATH.
+# Shadow both with benign no-ops so the dup-lint/doctor assertions are unchanged and nothing touches
+# the real workspace. (These probe lines are separate from the Config dup section this test asserts on.)
+BIN="$T/bin"; mkdir -p "$BIN"
+printf '#!/usr/bin/env bash\necho '"'"'{}'"'"'\nexit 0\n'      > "$BIN/herdr";  chmod +x "$BIN/herdr"
+printf '#!/usr/bin/env bash\necho '"'"'claude 0.0.0'"'"'\nexit 0\n' > "$BIN/claude"; chmod +x "$BIN/claude"
+export PATH="$BIN:$PATH"
+
 # ── A config WITH duplicates: mixed `export`/plain forms, a commented-out line that must be ignored,
 #    and the real-incident INTERACTION_TEST_CMD stale-empty-after-good case. ────────────────────────
 DUP="$T/dup.config"

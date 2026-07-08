@@ -55,6 +55,25 @@ echo '{"accountId":"acc_1","displayName":"Herd Bot"}'
 FAKE
 chmod +x "$BIN/curl"
 
+# HERMETIC STUB: step 5 of `backend switch` restarts the backlog pane via `herd pane backlog`, which
+# calls the LIVE herdr (agent/tab/workspace list) whenever herdr is on PATH. The header assumes herdr
+# is ABSENT, but on a dev box it is present — so shadow it with a no-op returning empty JSON. The pane
+# restart is best-effort (no assertion depends on it), so outcomes are unchanged and nothing touches
+# the real control room.
+cat > "$BIN/herdr" <<'FAKE'
+#!/usr/bin/env bash
+echo '{}'
+exit 0
+FAKE
+chmod +x "$BIN/herdr"
+
+# HERMETIC GUARD: the backend flip runs `herd pane backlog`, whose reload path can fall back to
+# spawning a REAL `nohup bash agent-watch.sh` watcher against this temp repo (which then hangs the
+# switch and leaks a live daemon). Suppress the background relaunch, and make any watcher that IS
+# launched inert (AGENT_WATCH_LIB returns before the loop). Neither is asserted, so outcomes hold.
+export HERD_RELOAD_SKIP_LAUNCH=fallback
+export AGENT_WATCH_LIB=1
+
 # Temp project on the file backend with a mixed backlog.
 P="$T/proj"; mkdir -p "$P/.herd"
 cat > "$P/.herd/config" <<EOF

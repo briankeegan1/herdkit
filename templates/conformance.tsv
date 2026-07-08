@@ -246,6 +246,8 @@ MCP_PROVISION	unit	tests/test-mcp-provision.sh
 GRAPHIFY_BIN	unit	tests/test-init-grounding-interview.sh
 GRAPHIFY_BIN	unit	tests/test-codemap-project.sh
 .herd/steps.tsv	sim	tests/test-sandbox-sim.sh
+triggers.sh	unit	tests/test-triggers.sh
+.herd/triggers.tsv	unit	tests/test-triggers.sh
 herd conformance <report|run>	unit	tests/test-conformance.sh
 MODEL_* ref <driver>:<model>	unit	tests/test-model-matrix.sh
 templates/models.tsv	unit	tests/test-model-matrix.sh

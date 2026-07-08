@@ -88,6 +88,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
+# STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped
+# work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
+# gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
+. "$HERE/stale-dup-gate.sh"
 # PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
 # the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
 # dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
@@ -196,6 +200,11 @@ SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 # autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
 # of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
 RECONCILE_STATE="$TREES/.agent-watch-reconciled"
+# Stale-duplicate hold ledger (HERD-188): one line "<epoch> <pr#> <sha> <kind>" per PR+sha the
+# pre-merge stale-dup gate HELD, so the loud PR comment + notification + journal event fire EXACTLY
+# ONCE per sha instead of every tick (the console row itself is re-rendered every tick from the live
+# re-check). Keyed by pr+sha like the review/health ledgers, so a new commit re-evaluates fresh.
+STALE_DUP_STATE="$TREES/.agent-watch-stale-dup"
 # Tracker-state self-heal surfaces (HERD-86). The periodic tracker-state sweep (tracker-state-sweep.sh)
 # re-asserts Done for a recently-merged PR whose tracker item drifted (stuck open after merge — the
 # HERD-67/HERD-69 incidents). TRACKER_SWEEP_LEDGER records refs already confirmed Done so the sweep
@@ -1772,6 +1781,19 @@ hv_informed_noted() {
 # record_hv_informed <pr#> <headSha> — note the informational HUMAN-VERIFY steps were recorded.
 record_hv_informed() {
   printf '%s hv-informed %s %s\n' "$(date +%s)" "$1" "$2" >> "$APPROVALS"
+}
+
+# stale_dup_held_noted <pr#> <headSha> — true if the stale-dup gate already fired its once-per-sha
+# side effects (PR comment + notification + journal) for this exact commit. Guards against re-spamming
+# the PR every tick while a held stale/duplicate PR lingers; the console row is still re-rendered live.
+stale_dup_held_noted() {
+  [ -s "$STALE_DUP_STATE" ] || return 1
+  grep -qE "^[0-9]+ $1 $2( |\$)" "$STALE_DUP_STATE" 2>/dev/null
+}
+
+# record_stale_dup_held <pr#> <headSha> <kind> — record that the stale-dup hold fired for this pr+sha.
+record_stale_dup_held() {
+  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "${3:-}" >> "$STALE_DUP_STATE"
 }
 
 # purge_pr_approvals <pr#> — on merge/reap, drop EVERY approval-ledger row for this PR number
@@ -4950,10 +4972,92 @@ _watcher_tick_fields() {
   printf '%s' "$_wtf"
 }
 
+# ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
+# _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
+# record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
+# slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits records on stdout,
+# one per line, in the exact field order the tick loop consumes.
+#
+# DISCOVERY SCOPE (HERD-182): a worktree is a builder candidate ONLY when BOTH hold —
+#   1. it lives UNDER $WORKTREES_DIR ($TREES) — every builder worktree is $WORKTREES_DIR/<slug>,
+#      including this watcher's own SELF_WT; and
+#   2. it is on a BRANCH, not a detached HEAD — builders are always spawned onto a branch, so a
+#      detached-HEAD worktree is never a builder.
+# A worktree failing EITHER test (a stray `git worktree add --detach HEAD /tmp/hk-base`, or any
+# worktree outside the herd tree) is a PHANTOM: it has no agent and no PR, so the old parse rendered
+# it as a spurious 💀 dead-builder row and confused the operator (GROUNDED: a detached HEAD at
+# /tmp/hk-base surfaced as a phantom dead-builder row). Filtering it here keeps it out of the roster
+# entirely, so it never reaches the dead-builder reconciliation. FAIL-SOFT: when $TREES is empty
+# (unconfigured), the scope test is skipped and behavior falls back to today's (MAIN-excluded, plus
+# the detached filter which alone catches the grounded incident). Paths are realpath-normalized before
+# comparison so a symlinked $WORKTREES_DIR still matches git's canonicalized worktree paths — a
+# legitimate builder row is NEVER dropped, and its emitted record is byte-identical to before.
+_discover_feature_worktrees() {
+  PRS_JSON="${PRS_JSON:-}" AGENTS_JSON="${AGENTS_JSON:-}" WT="${WT:-}" MAIN="${MAIN:-}" TREES="${TREES:-}" python3 -c '
+import os, json
+MAIN = os.environ.get("MAIN", "")
+TREES = os.environ.get("TREES", "")
+def _real(p):
+    try: return os.path.realpath(p)
+    except Exception: return p
+main_real = _real(MAIN) if MAIN else ""
+trees_real = _real(TREES) if TREES else ""
+def _under_trees(p):
+    # Fail-soft: no $WORKTREES_DIR configured → do not scope (detached filter still applies).
+    if not trees_real: return True
+    pr = _real(p)
+    return pr == trees_real or pr.startswith(trees_real + os.sep)
+try: prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+except Exception: prs = []
+try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") or {}).get("agents") or []
+except Exception: agents = []
+pr_by_branch = {p.get("headRefName"): p for p in prs}
+ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
+feats = []; wt = None; branch = None; detached = False
+def _emit(wt, branch, detached):
+    # A builder candidate is UNDER $WORKTREES_DIR, on a BRANCH (not detached), and not $MAIN.
+    if not wt: return
+    if MAIN and _real(wt) == main_real: return
+    if detached or not branch: return
+    if not _under_trees(wt): return
+    feats.append((wt, branch))
+for line in (os.environ.get("WT") or "").splitlines():
+    if line.startswith("worktree "): wt = line[9:]; branch = None; detached = False
+    elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
+    elif line == "detached": detached = True
+    elif line == "":
+        _emit(wt, branch, detached); wt = None; branch = None; detached = False
+_emit(wt, branch, detached)
+for wt, branch in feats:
+    slug = os.path.basename(wt)
+    pr = pr_by_branch.get(branch or "", {})
+    print("\x1f".join(str(x) for x in [
+        wt, slug, branch or "", pr.get("number", ""),
+        pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
+        ag_status.get(slug, ""), pr.get("headRefOid", ""),
+        (pr.get("author") or {}).get("login", "")]))
+'
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
 # the live watch loop. Direct execution runs the loop normally.
 if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+# ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
+# The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
+# run (the dogfood healthcheck, or any test) may set HERD_HERMETIC_GUARD to a log-file path; any
+# watcher that reaches this point — spawned via cmd_reload's pane-run/background fallback, `herd pane
+# watch`, herd-watch.sh, coordinator.sh, or direct execution — records the leak and EXITS BEFORE the
+# argv0 re-exec and the loop. So a test that forgot to stub a watcher spawn is caught LOUDLY (the
+# healthcheck fails on a non-empty log) instead of silently leaving a real daemon behind. This is the
+# single choke point every launch path funnels through. INERT in production: with the var unset this
+# is byte-identical to before (the real console-room watcher never sets it).
+if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
+  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
+    >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
+  exit 0
+fi
 
 # ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
 # Re-exec ONCE under a distinctive per-workspace argv0 ($HERD_WATCH_ARGV0, e.g. herd-watch-<slug>)
@@ -5275,37 +5379,14 @@ while true; do
   AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
-  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record
-  # per active feature worktree (the main checkout excluded).
+  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
+  # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
+  # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
+  # the main checkout is excluded as before. See _discover_feature_worktrees.
   FEATS=()
   while IFS= read -r rec; do
     [ -n "$rec" ] && FEATS+=("$rec")
-  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" python3 -c '
-import os, json
-MAIN = os.environ["MAIN"]
-try: prs = json.loads(os.environ.get("PRS_JSON") or "[]")
-except Exception: prs = []
-try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") or {}).get("agents") or []
-except Exception: agents = []
-pr_by_branch = {p.get("headRefName"): p for p in prs}
-ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
-feats = []; wt = None; branch = None
-for line in (os.environ.get("WT") or "").splitlines():
-    if line.startswith("worktree "): wt = line[9:]; branch = None
-    elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
-    elif line == "":
-        if wt and wt != MAIN: feats.append((wt, branch))
-        wt = None; branch = None
-if wt and wt != MAIN: feats.append((wt, branch))
-for wt, branch in feats:
-    slug = os.path.basename(wt)
-    pr = pr_by_branch.get(branch or "", {})
-    print("\x1f".join(str(x) for x in [
-        wt, slug, branch or "", pr.get("number", ""),
-        pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
-        ag_status.get(slug, ""), pr.get("headRefOid", ""),
-        (pr.get("author") or {}).get("login", "")]))
-')
+  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
@@ -5550,6 +5631,31 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
         DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
       fi
+      render
+      continue
+    fi
+
+    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188). BEFORE the (expensive) review + the merge: refuse to
+    # auto-merge a PR that re-implements already-shipped work. HOLDS + surfaces LOUDLY when the PR's
+    # tracked item ref is already Done via ANOTHER merged PR (a duplicate), or when the files it touches
+    # were materially changed on the base branch by a merge this branch predates (a stale base that a
+    # clean merge would silently clobber — the #236 → revert-#280 incident). Provable-only + fail-soft:
+    # off (STALE_DUP_DETECT=off), no item ref, an offline gh, or a bad worktree → proceed exactly as
+    # before. Placed ahead of the review gate so a provable duplicate never wastes an Opus review. The
+    # console row re-renders every tick from this live re-check; the PR comment/notify/journal fire once
+    # per sha (stale_dup_held_noted). NEVER auto-merges — always a needs-you hold for a human to resolve.
+    if [ -n "$rsha" ] && ! stale_dup_check "$prnum" "$slug" "$dir" "$rsha" "$DEFAULT_BRANCH"; then
+      if ! stale_dup_held_noted "$prnum" "$rsha"; then
+        record_stale_dup_held "$prnum" "$rsha" "$_STALE_DUP_KIND"
+        journal_append stale_dup_hold pr "$prnum" sha "$rsha" slug "$slug" kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
+        gh pr comment "$prnum" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
+
+**Why:** ${_STALE_DUP_REASON}
+
+This PR appears to re-implement already-shipped work, or sits on a base stale enough that merging it would silently clobber newer \`${DEFAULT_BRANCH}\`. A human must resolve it: rebase onto \`${DEFAULT_BRANCH}\` and confirm the change is still needed, or close it as a duplicate. (Disable this gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
+        herd_driver_notify "🛑 PR #${prnum} held — stale/duplicate" "${slug}: ${_STALE_DUP_REASON}" default
+      fi
+      DISPLAY[idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · stale/duplicate (${_STALE_DUP_KIND}) — held · ${_STALE_DUP_REASON}${C_RESET}"
       render
       continue
     fi

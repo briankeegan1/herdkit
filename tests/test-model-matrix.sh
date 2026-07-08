@@ -92,6 +92,16 @@ EOF
 R="$T/repo"; seed_repo "$R"
 # The real drivers dir must back `herd config set`'s driver-known check, so 'headless' is recognized.
 unset HERD_DRIVERS_DIR
+# HERMETIC GUARD: MODEL_FEATURE is watcher-affecting, so `herd config set` would restart the watcher —
+# `cmd_reload` spawns a REAL `nohup bash agent-watch.sh` daemon against this temp repo. Defer that
+# side-effect (the designed knob; the set/get round-trip this test asserts is unchanged) so no real
+# watcher launches. Also shadow herdr/claude with benign no-ops (the header promises "NO herdr, NO
+# claude") to cover the doctor probe and any residual control-room reach.
+export HERD_INIT_DEFER_APPLY=1
+BIN="$T/bin"; mkdir -p "$BIN"
+printf '#!/usr/bin/env bash\necho '"'"'{}'"'"'\nexit 0\n'      > "$BIN/herdr";  chmod +x "$BIN/herdr"
+printf '#!/usr/bin/env bash\necho '"'"'claude 0.0.0'"'"'\nexit 0\n' > "$BIN/claude"; chmod +x "$BIN/claude"
+export PATH="$BIN:$PATH"
 run_herd(){ ( cd "$R" && "$HERD" "$@" ); }
 
 run_herd config set --local MODEL_FEATURE "claude-opus-4-8" >/dev/null 2>&1 \

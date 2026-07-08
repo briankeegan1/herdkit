@@ -187,6 +187,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic daemon-hermeticity guard (HERD-189) test passes" {
+  run bash "$REPO/tests/test-daemon-hermeticity.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic approval-purge (HERD-90) test passes" {
   run bash "$REPO/tests/test-approval-purge.sh"
   [ "$status" -eq 0 ]
@@ -335,6 +341,16 @@ setup() {
   run bash "$REPO/tests/test-watcher-flair.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS"* ]]
+}
+
+@test "hermetic stale-duplicate gate (HERD-188) unit test passes" {
+  run bash "$REPO/tests/test-stale-dup-detect.sh"
+@test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
+  run bash "$REPO/tests/test-watcher-discovery-scope.sh"
+@test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
+  run bash "$REPO/tests/test-triggers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
 }
 
 @test "hermetic operator inbox (HERD-184) unit test passes" {
