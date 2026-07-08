@@ -337,8 +337,34 @@ _hk_dh_verdict() {
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  to="$(PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" bats tests/*.bats 2>&1)" && _hk_bats_rc=0 || _hk_bats_rc=$?
-  _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the HERD-187 env-only tolerance below
+  # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189): run bats under BOTH guards.
+  # HERD-189: the live agent-spawn surface (herdr/claude/codex) is shadowed by the tripwire stubs
+  # prepended to PATH ($_hk_dh_pp) and HERD_HERMETIC_GUARD arms agent-watch.sh's choke point, so any test
+  # that reaches the live control room / spawns a real daemon RECORDS a leak (a HARD fail via _hk_dh_verdict).
+  # HERD-185: a test that prompts for input or reads /dev/tty used to hang the WHOLE suite forever headless
+  # (the watcher's async health worker has no controlling terminal — exactly how a prompt stalls a slot),
+  # so `</dev/null` fails a stdin prompt fast, BATS_TEST_TIMEOUT names a per-test wedge, and an OUTER
+  # `timeout` writing to a TEMP FILE (never `$(bats …)`, which a surviving /dev/tty grandchild would hang
+  # on even after bats is killed) is the guaranteed backstop. All env-overridable.
+  _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
+  BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+  if command -v timeout >/dev/null 2>&1; then
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+      timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+  else
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+      bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+  fi
+  _hk_bats_rc=$?
+  to="$(cat "$_hk_bats_out" 2>/dev/null)"; rm -f "$_hk_bats_out" 2>/dev/null || true
+  _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the timeout / env tolerances below
+  if [ "$_hk_bats_rc" = 124 ]; then
+    # HERD-185: a timeout-killed suite is an infrastructure hang (a wedged/tty-reading test), not a code bug.
+    _hk_hung="$(printf '%s' "$to" | grep -m1 -E '^(ok|not ok) ' | tail -1)"
+    echo "bats: suite timed out (>${HEALTHCHECK_SUITE_TIMEOUT:-1800}s) — a wedged/tty-reading test, not a code bug${_hk_hung:+ — last: $_hk_hung}"
+    [ -z "$ONELINE" ] && printf '%s\n' "$to"
+    exit 2
+  fi
   if [ "$_hk_bats_rc" -eq 0 ]; then
     t_note="tests: bats pass"
   elif _hk_bats_env_only "$to"; then

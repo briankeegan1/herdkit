@@ -32,8 +32,16 @@ ok(){ pass=$((pass+1)); }
 # herd-config.sh falls back to its generic defaults — fully hermetic, no repo/.herd walk-up.
 export AGENT_WATCH_LIB=1
 export HERD_CONFIG_FILE="$T/no-such-config"
+# Issue #144: record_resolve_escalated journals via journal.sh's _journal_file, which resolves from
+# WORKTREES_DIR (NOT the TREES override below). Pin BOTH WORKTREES_DIR and JOURNAL_FILE into $T so the
+# resolver-ledger journal writes can never escape the sandbox into the REAL derived journal (a live
+# .herd/journal.jsonl got polluted with fixture 'resolver_escalated' rows exactly this way).
+export WORKTREES_DIR="$T"
+export JOURNAL_FILE="$T/journal.jsonl"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
+# Hermetic seal: the journal writer must resolve INSIDE the sandbox before any ledger call runs.
+case "$(_journal_file)" in "$T"/*) : ;; *) fail "journal path escapes the sandbox: '$(_journal_file)' (issue #144)" ;; esac
 for fn in resolver_dispatched_sha resolver_escalated_sha resolver_dispatch_count \
            record_resolve_attempt record_resolve_escalated resolver_ever_attempted \
            resolver_last_sha; do
