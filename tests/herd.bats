@@ -229,6 +229,30 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic restart-safe gate dispatch (HERD-185) test passes" {
+  run bash "$REPO/tests/test-restart-safe-dispatch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic health-run observability (HERD-185) test passes" {
+  run bash "$REPO/tests/test-health-observability.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic async healthcheck gate test passes" {
+  run bash "$REPO/tests/test-healthcheck-gate.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic healthcheck sha-cache test passes" {
+  run bash "$REPO/tests/test-watcher-health-cache.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
   run bash "$REPO/tests/test-agent-liveness.sh"
   [ "$status" -eq 0 ]
