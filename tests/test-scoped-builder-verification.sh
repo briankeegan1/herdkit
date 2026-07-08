@@ -108,6 +108,9 @@ for pair in "quick $QUICK" "feat $FEATURE"; do
   grep -q "AUTHORITATIVE merge gate"     "$spec"       || fail "$slug: the 'watcher re-runs the authoritative full profile' pointer is missing"
   grep -q 'healthcheck.sh ".*" --heavy'  "$spec"       || fail "$slug: the still-available --heavy escape hatch is missing (descoped must mean optional, not forbidden)"
 
+  # ── (a2) the conformance-map builder convention rides in the same STABLE preamble (HERD-152) ────
+  grep -q "templates/conformance.tsv" "$spec"          || fail "$slug: the conformance-map convention (add a proof/none-yet row for a new capability) is missing from the preamble"
+
   # ── (b) the blanket full-suite instruction is GONE ─────────────────────────────────────────────
   # The old preamble ran the profile-less 'healthcheck.sh "<dir>"  and get a clean pass' (auto → heavy
   # on a heavy-glob diff). A bare invocation with no --light/--heavy flag directly followed by "and
