@@ -33,16 +33,17 @@ else
   bad ".gitattributes missing or does not pin *.sh eol=lf"
 fi
 
-# 2. No CRLF in tracked shell/tsv/driver/entrypoint files (proves the LF normalization took).
-crlf="$(git ls-files -- '*.sh' '*.tsv' '*.driver' 'bin/herd' 'install.sh' 'herd.sh' \
-        | while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            if grep -Iq $'\r' "$f" 2>/dev/null; then printf '%s\n' "$f"; fi
-          done)"
+# 2. The working tree honored .gitattributes eol=lf (proves the LF normalization took on THIS
+#    Windows checkout). Ask git itself — `git ls-files --eol` reports the working-tree eol git
+#    resolved from the index + attributes (`w/lf` or `w/crlf`) — rather than grepping bytes, which
+#    on Git Bash false-positives. Flag any tracked shell/tsv/driver file whose working tree is CRLF.
+crlf="$(git ls-files --eol -- '*.sh' '*.tsv' '*.driver' 'bin/herd' 'install.sh' 'herd.sh' 2>/dev/null \
+        | awk '$2 == "w/crlf" { print $NF }')"
 if [ -z "$crlf" ]; then
-  ok "no CRLF in tracked engine files"
+  ok "working tree is LF for all tracked shell/tsv/driver files (.gitattributes honored)"
 else
-  bad "CRLF found in: $(printf '%s ' $crlf)"
+  n="$(printf '%s\n' "$crlf" | grep -c .)"
+  bad "working tree has CRLF in $n tracked file(s) (.gitattributes eol=lf not applied): $(printf '%s ' $crlf | cut -c1-200)…"
 fi
 
 # 3. Windows docs exist and lead with WSL2 (the supported path).
