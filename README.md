@@ -153,6 +153,11 @@ disposable herdr workspace and **degrades to a clean skip** where herdr is unava
 `python3`, and a modern `bash`. No specific OS or package manager is assumed — these tools work
 on macOS and Linux alike.
 
+> **Running unattended on macOS?** macOS **TCC** permission prompts (Full Disk Access, Automation)
+> can silently pause a builder that touches a protected resource with no one there to click Allow.
+> Pre-grant the right permissions and run headless so a hidden consent dialog never stalls the herd —
+> see [`docs/macos-unattended-permissions.md`](docs/macos-unattended-permissions.md).
+
 ### One command (recommended)
 
 ```sh
