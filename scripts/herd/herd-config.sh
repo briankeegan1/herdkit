@@ -96,6 +96,34 @@ _herd_main_worktree() {
   fi
 }
 
+# _herd_read_project_config <project-path> — source a project's .herd/config in an ISOLATED subshell
+# (so its vars never leak into the caller or bleed between projects) and print one TAB-delimited row:
+#   workspace<TAB>project_root<TAB>worktrees_dir<TAB>default_branch<TAB>repo
+# Applies the SAME fallbacks the main loader below does. This is the ONE seam that reads a FOREIGN
+# project's config from OUTSIDE the current-project load path (the `herd fleet` fan-out) — so the direct
+# `. .herd/config` lives HERE in the config module, never scattered across engine scripts (the
+# seam-conformance config-source rule). Returns non-zero when there is no config to read.
+_herd_read_project_config() {
+  local path="$1" cfg="$1/.herd/config"
+  [ -f "$cfg" ] || return 1
+  (
+    set +eu 2>/dev/null || true
+    PROJECT_ROOT=""; WORKTREES_DIR=""; WORKSPACE_NAME=""; DEFAULT_BRANCH=""; HERD_REPO=""
+    # shellcheck source=/dev/null
+    . "$cfg" 2>/dev/null || exit 1
+    # Apply the SAME fallbacks the main loader does. Written as explicit `-n` guards (the vars are
+    # pre-initialised to "" just above), NOT the `: "${KEY:=…}"` idiom: the caps-sync gate greps THIS
+    # file for `: "${KEY:=…}"` as its "new config key" heuristic, so the `:=` form here would false-trip
+    # it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids `:=`.
+    [ -n "$PROJECT_ROOT" ]   || PROJECT_ROOT="$path"
+    [ -n "$WORKTREES_DIR" ]  || WORKTREES_DIR="${PROJECT_ROOT}-trees"
+    [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="origin/main"
+    [ -n "$WORKSPACE_NAME" ] || WORKSPACE_NAME="$(basename "$PROJECT_ROOT")"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$WORKSPACE_NAME" "$PROJECT_ROOT" "$WORKTREES_DIR" "$DEFAULT_BRANCH" "$HERD_REPO"
+  )
+}
+
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
 # _herd_find_config records HOW the config resolved into _HERD_CONFIG_SOURCE (env | walkup |
@@ -294,12 +322,18 @@ if [ "$TOKEN_MODE" = "eco" ]; then
   : "${MODEL_RESOLVER:="claude-haiku-4-5"}"
 fi
 
+# Eco-leaning STARTER defaults (HERD-161): Opus is now an ESCALATION tier reached via
+# MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB (review gate), NOT a bare default — so the
+# unset-fallbacks below match the manifest, config.example, and the `herd init` seed (feature→sonnet,
+# quick→haiku, review→sonnet). The persistent coordinator stays Opus. An explicit MODEL_* in
+# .herd/config always wins (':=' can't clobber it), and TOKEN_MODE=eco (above) further lowers the
+# support lanes. This finishes the eco-defaults migration that had left this fallback on Opus.
 : "${MODEL_COORDINATOR:="claude-opus-4-8"}"
-: "${MODEL_FEATURE:="claude-opus-4-8"}"
-: "${MODEL_QUICK:="claude-sonnet-4-6"}"
+: "${MODEL_FEATURE:="claude-sonnet-4-6"}"
+: "${MODEL_QUICK:="claude-haiku-4-5"}"
 : "${MODEL_SCRIBE:="claude-sonnet-4-6"}"
 : "${MODEL_RESEARCH:="claude-sonnet-4-6"}"
-: "${MODEL_REVIEW:="claude-opus-4-8"}"
+: "${MODEL_REVIEW:="claude-sonnet-4-6"}"
 : "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
 # MODEL_ADVISE — the STRONG advisor model behind `herd advise` (HERD-101): a builder pulls a one-shot
@@ -454,6 +488,7 @@ fi
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
 : "${MAIN_HEALTH_TICK:="off"}"   # HERD-129: after a PR merges, run the healthcheck against the freshly ff'd default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into a broken combination). on → a loud persistent 'MAIN RED' alarm row + notification, cleared when a later sha goes green. ALARM only — never gates/reverts/re-merges. off (default) → byte-inert: no suite, no journal, no row
 : "${WATCHER_FLAIR:="off"}"      # HERD-147: watcher-console flair pack — on → a post-merge celebration line + a pasture header rendering the in-flight herd by state (🐑 grazing / 💤 idle / ✅ in the pen); off (default) → byte-inert: every console byte identical to before. ADDITIVE cosmetic only — NEVER softens a red/dead/needs-you row, never touches a gate/merge
+: "${OPERATOR_INBOX:="off"}"     # HERD-184: cross-seat OPERATOR INBOX — on → the watcher surfaces NEW comments by OTHER authors (PR comments on open PRs this seat authors/gates + tracker comments on items this seat claimed, via the active SCRIBE_BACKEND's optional comment reader) as a 'operator inbox' console section + one notify-once per comment. off (default) → byte-inert: no reader runs, no fetch, no section, every console byte identical to before. ADDITIVE + FAIL-SOFT (missing/api error = empty inbox, never a red row); never touches a gate/merge
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health

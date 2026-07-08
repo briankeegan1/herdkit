@@ -45,21 +45,6 @@ if [ "$EMIT_MD" = 0 ]; then
   # shellcheck source=/dev/null
   . "$HERE/theme.sh"
   STYLE="$(herd_theme_glow_style)"
-
-  # ── OSC 8 hyperlink base (HERD-49) ──────────────────────────────────────────
-  # Each #KEY-NN id chip becomes a CLICKABLE OSC 8 terminal hyperlink to the issue in Linear, WITHOUT
-  # touching the chip's themed styling (SGR color and OSC 8 are orthogonal — glow paints the chip's
-  # 95;44 color and passes the wrapping ]8;; escapes straight through; terminals without OSC 8 support
-  # ignore the sequence → clean fail-soft, no-false-red compliant). Only the linear backend has
-  # linear.app URLs, so linking is gated to it; the slug comes from LINEAR_WORKSPACE_SLUG (set it in
-  # .herd/config when the Linear workspace URL key differs from the project name) else a lowercased,
-  # url-safe WORKSPACE_NAME. Empty base (any other backend, or no slug) → osc8_linkify is a passthrough.
-  OSC8_LINK_BASE=""
-  if [ "${SCRIBE_BACKEND:-file}" = "linear" ]; then
-    _osc8_slug="${LINEAR_WORKSPACE_SLUG:-}"
-    [ -n "$_osc8_slug" ] || _osc8_slug="$(printf '%s' "$WORKSPACE_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
-    [ -n "$_osc8_slug" ] && OSC8_LINK_BASE="https://linear.app/${_osc8_slug}/issue/"
-  fi
 fi
 last_frame=""
 BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
@@ -332,27 +317,6 @@ shape_md() {
   esac
 }
 
-# osc8_linkify — wrap every Linear id token (#KEY-NN) on STDIN in an OSC 8 hyperlink to the issue in
-# Linear (ESC ]8;;URL ST  #KEY-NN  ESC ]8;; ST), writing to STDOUT. Applied to the SHAPED markdown
-# just before glow (glow/glamour passes the raw ]8;; escapes straight through — verified — and paints
-# the chip's SGR color independently, so the themed chip is preserved EXACTLY while the id text becomes
-# clickable). Matches ONLY the tracker id shape (uppercase key, dash, number), so a github incoming
-# '#42' numeric id is never mislinked. Fails SOFT per the no-false-red rule: no link base (non-linear
-# backend / unresolved slug) or no python3 → a pure passthrough (byte-identical), never an error.
-# NOT applied on the --emit-md shaping seam (that stays deterministic markdown for the render tests).
-osc8_linkify() {
-  if [ -z "${OSC8_LINK_BASE:-}" ] || ! command -v python3 >/dev/null 2>&1; then cat; return; fi
-  OSC8_BASE="$OSC8_LINK_BASE" python3 -c '
-import sys, os, re
-base = os.environ.get("OSC8_BASE", "")
-ESC, ST = "\033", "\033\\"          # OSC 8 opener ESC]8;; … terminated by ST (ESC \)
-pat = re.compile(r"#([A-Z][A-Z0-9]*-[0-9]+)")
-def wrap(m):
-    return "%s]8;;%s%s%s%s%s]8;;%s" % (ESC, base, m.group(1), ST, m.group(0), ESC, ST)
-sys.stdout.write(pat.sub(wrap, sys.stdin.read()))
-' 2>/dev/null
-}
-
 # list_to_md — turn `herd backlog` output into a markdown bullet list so glow renders it with REAL
 # visual hierarchy (not a flat, monochrome wall the tokyonight theme has nothing to color). Tracker
 # backends emit bare "#<id> <title>" lines; a flat "- #HERD-n title" bullet gives glow one
@@ -412,12 +376,12 @@ render_backend_frame() {
   local w; w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
   if [ -n "$list" ]; then
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then
-      shape_md "$list" | osc8_linkify > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      shape_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     elif command -v glow >/dev/null 2>&1; then
-      shape_md "$list" | osc8_linkify > "$BACKLOG_VIEW_TMP" && glow_pane -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
+      shape_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s dark -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
     else
-      # No glow: print the raw list, taming rich TSV's tabs into readable spacing (still OSC 8-linked).
-      printf '%s\n' "$list" | tr '\t' ' ' | osc8_linkify || rc=$?
+      # No glow: print the raw list, taming rich TSV's tabs into readable spacing.
+      printf '%s\n' "$list" | tr '\t' ' ' || rc=$?
       # SELF-DIAGNOSING degraded render (HERD-45): glow is what paints the pretty pane; without it
       # the frame above is raw markdown. Point the user straight at the fix at the exact moment they
       # hit the degradation — one dim informational line, never red (no-false-red rule). Mirrors the
@@ -430,9 +394,8 @@ render_backend_frame() {
   if [ "$degraded" -eq 1 ]; then
     printf '\033[2m⚠ backend unreachable since %s (showing last good)\033[0m\n' "$since"
   fi
-  # Strictly-additive incoming section (empty unless BACKLOG_VIEW_EXTRAS=github-issues). Linkified too
-  # (HERD-49) so any tracker-shaped id here is clickable; a github '#42' numeric id never matches.
-  [ -n "$incoming" ] && printf '%s\n' "$incoming" | osc8_linkify
+  # Strictly-additive incoming section (empty unless BACKLOG_VIEW_EXTRAS=github-issues).
+  [ -n "$incoming" ] && printf '%s\n' "$incoming"
   # HERD-48 hint — only when the pane tty is interactive (a key can actually be pressed); omitted on
   # the headless/CI/test fallback so that path stays byte-identical. Does not affect the frame key.
   [ -n "$saved_tty" ] && printf '\033[2mr = refresh\033[0m\n'

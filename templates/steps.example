@@ -28,3 +28,4 @@
 # doc-pass<TAB>post-healthcheck<TAB>skill:doc-writer<TAB>warn<TAB>none
 # changelog<TAB>post-merge<TAB>scripts/update-changelog.sh<TAB>warn<TAB>none
 # checkpoint<TAB>post-build<TAB>echo review the diff before I open a PR<TAB>block<TAB>approve
+# connector-post<TAB>post-merge<TAB>bash .herd/connector-post.sh<TAB>warn<TAB>none  # POST edge (docs/connector-seams.md)

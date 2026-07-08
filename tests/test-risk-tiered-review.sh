@@ -88,7 +88,7 @@ for fn in _classify_review_tier _review_tier _review_gate_step _dispatch_review 
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 # Defaults resolved from herd-config.sh (no project config present).
-[ "$MODEL_REVIEW" = "claude-opus-4-8" ]        || fail "MODEL_REVIEW default changed ($MODEL_REVIEW)"
+[ "$MODEL_REVIEW" = "claude-sonnet-4-6" ]      || fail "MODEL_REVIEW default changed ($MODEL_REVIEW)"  # HERD-161: eco-leaning default
 [ "$REVIEW_MODEL_CHEAP" = "claude-sonnet-4-6" ] || fail "REVIEW_MODEL_CHEAP default wrong ($REVIEW_MODEL_CHEAP)"
 [ "$REVIEW_ESCALATE_MAXFILES" = "10" ]          || fail "REVIEW_ESCALATE_MAXFILES default wrong"
 [ -z "${REVIEW_ESCALATE_GLOB:-}" ]              || fail "REVIEW_ESCALATE_GLOB should default empty"
