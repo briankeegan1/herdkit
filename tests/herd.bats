@@ -55,6 +55,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic scribe AMEND verb (HERD-128) test passes" {
+  run bash "$REPO/tests/test-scribe-amend.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]

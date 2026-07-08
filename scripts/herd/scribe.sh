@@ -123,6 +123,14 @@ Repeat this loop:
      MORE -> go back to step 1.
 2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend
    can change mid-session, so ALWAYS use the one printed for THIS request — never an earlier value:
+   • AMEND (any backend): if the request only APPENDS a clarification/comment/note to an EXISTING item
+     — not a new item, not a state change, not a title/description rewrite — do NOT hand-edit the file.
+     Run:  bash $HERE/scribe-step.sh amend "<claimed_path>" "<ref>" "<note>"
+     It attaches the note first-class (file backend: a dated "↳ note" line under the item entry;
+     github/linear: an issue comment) and NEVER changes state or title. <ref> = the item identifier
+     when the request names one (HERD-22, or a bare issue number for github), otherwise a distinctive
+     title phrase to match. If you cannot pin the request to exactly ONE existing item, SKIP (next
+     verb) — never guess which item to amend.
    • BACKEND is "file": edit ONLY $REPO/$BACKLOG_FILE. This covers BOTH new items AND state changes —
      marking an item done/in-progress/canceled is just editing its 🔜/🚧/✅ emoji (and, when done,
      moving it under "## Recently shipped"). Need to look into the repo first? dispatch an Explore
@@ -161,7 +169,11 @@ Repeat this loop:
          done | in-progress | canceled. For a reconcile request that gives only a PR number, work out
          the matching item identifier/title from the request text; if you cannot confidently pin it to
          ONE item, SKIP (next bullet) — never guess, never file a new issue.
-       – ANYTHING you cannot map to an add or a state change →
+       – APPEND a clarification/comment/note to an EXISTING item (NOT a new item, NOT a state change) →
+           bash $HERE/scribe-step.sh amend "<claimed_path>" "<ref>" "<note>"
+         Posts an issue comment; never changes state or title. If you cannot pin it to ONE existing
+         item, SKIP (next bullet) — never guess, never file a new issue.
+       – ANYTHING you cannot map to an add, a state change, or an amend →
            bash $HERE/scribe-step.sh skip "<claimed_path>" "<one-line reason>"
          skip records a loud line in the scribe report and files NOTHING. When in doubt between
          update-state and skip, prefer skip over add-item — a wrongly-filed issue is the exact bug.

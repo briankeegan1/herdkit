@@ -143,6 +143,67 @@ _backend_mark_shipped() {
     :
 }
 
+_backend_amend() {
+    # $1 = item ref (a #id or a title/slug phrase); $2 = the note to append.
+    # HERD-128 AMEND: attach a clarification/comment to an EXISTING item by appending an indented,
+    # dated "↳ <note>" line directly beneath the item's $BACKLOG_FILE entry — first-class, no creative
+    # drainer edit needed. NEVER touches the item's 🔜/🚧/✅ state or its title. Conservative by design:
+    # the ref must resolve to EXACTLY ONE item line (📌-marker aware, like every other file-backend
+    # lookup). Zero or multiple matches → NOCHANGE + a LOUD reason on stderr (skip-over-guess), so
+    # scribe-step records a SKIP and NOTHING is written. Serialization/atomicity is git push, exactly
+    # like the file-backend claim/marker ops. Sets _BACKEND_RESULT=DONE (note appended + pushed) |
+    # NOCHANGE (no unique match / no file).
+    local ref="$1" note="$2" slug day rc
+    _BACKEND_RESULT="NOCHANGE"
+    slug="${ref#*#}"
+    if [ ! -f "$BACKLOG_FILE" ]; then
+        echo "file backend: no $BACKLOG_FILE — cannot amend '$ref' (skipping, nothing written)" >&2
+        _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"
+        return 0
+    fi
+    day="$(date +%Y-%m-%d 2>/dev/null || echo '')"
+    # Sync to the remote tip first so the amend lands beneath the item's CURRENT line (another scribe
+    # may have edited it). Fail-soft: an offline/failed pull just amends against local state.
+    git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+    if BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" NOTE="$note" DAY="$day" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY'
+import os, re, sys
+backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]
+note = os.environ["NOTE"]; day = os.environ["DAY"]
+mark = re.compile(os.environ["MARK_RE"])
+with open(backlog, encoding="utf-8") as f:
+    lines = f.readlines()
+# Match on the DESCRIPTOR (📌 marker stripped) so a blocker slug embedded in a SIBLING item's marker
+# is never a false match surface (HERD-52 CLAIM-poisoning fix). Require EXACTLY ONE match — an
+# ambiguous ref must SKIP, never guess which item the operator meant.
+idxs = [i for i, l in enumerate(lines) if slug in mark.sub("", l)]
+if len(idxs) != 1:
+    sys.exit(2 if len(idxs) > 1 else 1)   # 2 = ambiguous, 1 = not found
+idx = idxs[0]
+# Insert AFTER the item line and after any indented child lines already beneath it (prior ↳ notes or
+# continuations) so successive amends stack in chronological order under the SAME item.
+j = idx + 1
+while j < len(lines) and (lines[j].startswith(" ") or lines[j].startswith("\t")):
+    j += 1
+stamp = ("[%s] " % day) if day else ""
+lines.insert(j, "  ↳ %s%s\n" % (stamp, note))
+with open(backlog, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
+    then
+        _file_marker_commit "Amend: note on $slug" && _BACKEND_RESULT="DONE"
+    else
+        rc=$?
+        if [ "$rc" -eq 2 ]; then
+            echo "file backend: '$ref' matches MORE THAN ONE backlog item — skipping (ambiguous ref; not guessing which to amend)" >&2
+        else
+            echo "file backend: no backlog item matching '$ref' — nothing to amend (skipping, nothing written)" >&2
+        fi
+    fi
+    # HERD-85: journal the amend attempt (result = the verified outcome) so attribution is a one-line
+    # `herd log` lookup. Fail-soft; never affects the result.
+    _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"
+}
+
 _backend_list_open() {
     # Print open backlog items (🔜 queued or 🚧 in-progress).
     grep -E '🔜|🚧' "$BACKLOG_FILE" 2>/dev/null || true
