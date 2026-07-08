@@ -2326,6 +2326,248 @@ cmd_config_sync() {
   _config_sync_report "$cfg" "$(_config_caps_file)" "$(_config_example_file)"
 }
 
+# ── herd conformance: the capability CONFORMANCE MATRIX (HERD-144) ─────────────────────────────────
+# `herd conformance report [--json]` joins the capabilities manifest (templates/capabilities.tsv, the
+# same file `herd config` reads) against the committed proof map (templates/conformance.tsv) and
+# reports, DETERMINISTICALLY and WITHOUT an LLM: every capability with NO proof mapping (a GAP) and
+# every mapping whose proof_ref no longer exists (ROT). `herd conformance run [--kind unit]` executes
+# the mapped proofs and writes conformance.json (capability → verdict → sha → timestamp) — the
+# whole-surface analog of the sim scorecard. FAIL-SOFT: an absent proof map is a soft note (every
+# capability reads as a gap), never a hard error; REPORT-ONLY — nothing here is a merge gate. The proof
+# map is a SIBLING of capabilities.tsv (keyed by capability NAME) so the manifest stays byte-identical
+# for its other consumers (herd config/upgrade/codemap and the queued HERD-140/141/143).
+#
+# All paths are overridable for hermetic tests: the manifest is _config_caps_file (shared with `herd
+# config`); the proof map is _conformance_map_file; proof_refs resolve relative to _conformance_root
+# (the repo root); `run` output goes to _conformance_out.
+_conformance_map_file() { printf '%s' "${HERD_CONFORMANCE_FILE:-$TEMPLATES_DIR/conformance.tsv}"; }
+_conformance_root()     { printf '%s' "${HERD_CONFORMANCE_ROOT:-$HERDKIT_HOME}"; }
+_conformance_out()      { printf '%s' "${HERD_CONFORMANCE_OUT:-$(_conformance_root)/.herd/conformance.json}"; }
+
+# _conformance_analyze <caps> <map> <root> — emit ONE analysis row per capability (in manifest order),
+# TAB-separated: "<capability>\t<status>\t<proofs>", where status ∈ mapped|gap|rot and <proofs> is a
+# ';'-joined list of "kind|ref|exists" (exists = 1|0), empty for a gap. A capability is MAPPED when at
+# least one of its proof_refs exists, GAP when it carries no mapping row at all, and ROT when it has
+# mappings but NONE of their refs exist. (An individual dangling ref on an otherwise-mapped capability
+# still shows exists=0 in <proofs>, so the caller can enumerate every dangling mapping.) Deterministic:
+# manifest order for capabilities, map-file order for proofs, no timestamps. Absent map → all gaps.
+_conformance_analyze() {
+  local caps="$1" map="$2" root="$3"
+  local tmp exf mapf; tmp="$(mktemp -d)"
+  exf="$tmp/exists.tsv"; mapf="$map"
+  # An absent/empty proof map is fail-soft: substitute an empty file so every capability reads as a gap.
+  [ -f "$mapf" ] || { mapf="$tmp/empty.tsv"; : > "$mapf"; }
+  # Precompute proof_ref existence in the shell ([ -e ] is not awk-portable), one row per unique ref.
+  awk -F'\t' 'NF>=3 && $1!~/^#/ && $1!="capability" && $1!="" {print $3}' "$mapf" | sort -u \
+    | while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        if [ -e "$root/$ref" ]; then printf '%s\t1\n' "$ref"; else printf '%s\t0\n' "$ref"; fi
+      done > "$exf"
+  awk -F'\t' -v exf="$exf" -v mapf="$mapf" -v capf="$caps" '
+    FILENAME==exf  { ex[$1]=$2; next }
+    FILENAME==mapf {
+      if ($0 ~ /^#/ || $1=="capability" || NF<3 || $1=="") next
+      cap=$1; n=++pc[cap]; pk[cap,n]=$2; pr[cap,n]=$3; next
+    }
+    FILENAME==capf {
+      if ($1=="name" || $1=="" ) next          # header / blank
+      cap=$1; if (seen[cap]++) next             # first occurrence wins; dedupe defensively
+      order[++cn]=cap
+    }
+    END {
+      for (i=1;i<=cn;i++){
+        cap=order[i]; cnt=pc[cap]+0
+        if (cnt==0){ print cap "\t" "gap" "\t"; continue }
+        anyexist=0; enc=""
+        for (j=1;j<=cnt;j++){
+          r=pr[cap,j]; k=pk[cap,j]; e=(r in ex)?ex[r]:0
+          if (e==1) anyexist=1
+          enc=enc (j>1?";":"") k "|" r "|" e
+        }
+        print cap "\t" (anyexist?"mapped":"rot") "\t" enc
+      }
+    }' "$exf" "$mapf" "$caps"
+  rm -rf "$tmp"
+}
+
+# cmd_conformance_report [--json] — the deterministic gap/rot report. Human text by default; --json
+# emits a machine-ingestable object. Exits NON-ZERO only when ROT is present (a proof_ref no longer
+# exists — a real, actionable breakage); GAPS alone never fail (an unmapped capability is the honest
+# starting state, surfaced loudly but never a red row). An absent proof map is a soft note, exit 0.
+cmd_conformance_report() {
+  local as_json=0 a
+  for a in "$@"; do case "$a" in --json) as_json=1 ;; -h|--help) say "usage: herd conformance report [--json]"; return 0 ;; *) die "unknown 'herd conformance report' flag: $a" ;; esac; done
+  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  [ -f "$caps" ] || die "no capabilities manifest at $caps"
+  local analysis; analysis="$(_conformance_analyze "$caps" "$map" "$root")"
+  local map_present=1; [ -f "$map" ] || map_present=0
+
+  if [ "$as_json" -eq 1 ]; then
+    ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    python3 -c '
+import os, json, sys
+caps = []
+gaps = []
+rot = []
+counts = {"mapped": 0, "gap": 0, "rot": 0, "dangling_refs": 0}
+for line in os.environ.get("ANALYSIS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    cap = parts[0]
+    status = parts[1] if len(parts) > 1 else "gap"
+    enc = parts[2] if len(parts) > 2 else ""
+    proofs = []
+    for tok in (enc.split(";") if enc else []):
+        k, r, e = (tok.split("|", 2) + ["", "", "0"])[:3]
+        exists = (e == "1")
+        proofs.append({"kind": k, "ref": r, "exists": exists})
+        if not exists:
+            counts["dangling_refs"] += 1
+            rot.append({"capability": cap, "kind": k, "ref": r})
+    if status == "gap":
+        gaps.append(cap)
+    counts[status] = counts.get(status, 0) + 1
+    caps.append({"capability": cap, "status": status, "proofs": proofs})
+out = {
+    "source": os.environ.get("CAPS_BASE", ""),
+    "map": os.environ.get("MAP_BASE", ""),
+    "map_present": os.environ.get("MAP_PRESENT", "1") == "1",
+    "total": len(caps),
+    "counts": counts,
+    "capabilities": caps,
+    "gaps": gaps,
+    "rot": rot,
+}
+json.dump(out, sys.stdout, indent=2)
+print()
+'
+  else
+    ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    python3 -c '
+import os
+mapped = gapl = rotl = dangling = 0
+gaps = []
+rots = []
+for line in os.environ.get("ANALYSIS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    cap = parts[0]; status = parts[1] if len(parts) > 1 else "gap"; enc = parts[2] if len(parts) > 2 else ""
+    if status == "mapped": mapped += 1
+    elif status == "rot": rotl += 1
+    else: gapl += 1
+    for tok in (enc.split(";") if enc else []):
+        k, r, e = (tok.split("|", 2) + ["", "", "0"])[:3]
+        if e != "1":
+            dangling += 1
+            rots.append((cap, k, r))
+    if status == "gap":
+        gaps.append(cap)
+total = mapped + gapl + rotl
+print("Conformance report — %s vs %s" % (os.environ.get("CAPS_BASE",""), os.environ.get("MAP_BASE","")))
+if os.environ.get("MAP_PRESENT","1") != "1":
+    print("  ⚠️  no proof map found — every capability reads as a gap (fail-soft)")
+print("  %d capabilities · %d mapped · %d gap · %d rot   (%d dangling refs)"
+      % (total, mapped, gapl, rotl, dangling))
+if rots:
+    print("")
+    print("  ROT (mapping whose proof_ref no longer exists):")
+    for cap, k, r in rots:
+        print("    - %s  →  %s:%s  (missing)" % (cap, k, r))
+if gaps:
+    print("")
+    print("  GAP (no proof mapped — none-yet):")
+    for cap in gaps:
+        print("    - %s" % cap)
+'
+  fi
+
+  # Exit status: rot present → non-zero (actionable dangling ref); gaps alone → 0 (report-only).
+  printf '%s\n' "$analysis" | awk -F'\t' '$2=="rot"{r=1} $3 ~ /\|0(;|$)/ {r=1} END{exit(r?1:0)}'
+}
+
+# cmd_conformance_run [--kind KIND] [--out FILE] — execute the mapped proofs and write conformance.json
+# (capability → verdict → sha → timestamp). Each mapping is run in the repo root: proof_kind=unit →
+# `bash <ref>` (0=pass, else fail); a missing ref → verdict "missing"; any non-unit kind (or a unit
+# mapping filtered out by --kind) → "skipped" (no runner). Deterministic file except the recorded sha +
+# timestamp. Exits non-zero when any proof FAILS. REPORT-ONLY — not wired into any merge gate.
+cmd_conformance_run() {
+  local kind="" out="" a
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --kind) kind="${2:-}"; shift 2 ;;
+      --kind=*) kind="${1#--kind=}"; shift ;;
+      --out) out="${2:-}"; shift 2 ;;
+      --out=*) out="${1#--out=}"; shift ;;
+      -h|--help) say "usage: herd conformance run [--kind unit] [--out FILE]"; return 0 ;;
+      *) die "unknown 'herd conformance run' arg: $1" ;;
+    esac
+  done
+  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  [ -f "$caps" ] || die "no capabilities manifest at $caps"
+  [ -n "$out" ] || out="$(_conformance_out)"
+  if [ ! -f "$map" ]; then warn "no proof map at $map — nothing to run (fail-soft)"; fi
+
+  local sha ts; sha="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+
+  # Execute each mapping and stream "<cap>\t<kind>\t<ref>\t<verdict>" for the JSON writer.
+  local results; results="$(
+    awk -F'\t' 'NF>=3 && $1!~/^#/ && $1!="capability" && $1!="" {print $1 "\t" $2 "\t" $3}' "$map" 2>/dev/null \
+    | while IFS=$'\t' read -r cap pkind pref; do
+        [ -n "$cap" ] || continue
+        verdict=""
+        if [ -n "$kind" ] && [ "$pkind" != "$kind" ]; then
+          verdict="skipped"
+        elif [ ! -e "$root/$pref" ]; then
+          verdict="missing"
+        elif [ "$pkind" = "unit" ]; then
+          if ( cd "$root" && bash "$pref" ) >/dev/null 2>&1; then verdict="pass"; else verdict="fail"; fi
+        else
+          verdict="skipped"
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$cap" "$pkind" "$pref" "$verdict"
+      done
+  )"
+
+  mkdir -p "$(dirname "$out")"
+  RESULTS="$results" SHA="$sha" TS="$ts" KIND="${kind:-}" OUT="$out" python3 -c '
+import os, json, sys
+results = []
+summary = {"pass": 0, "fail": 0, "skipped": 0, "missing": 0}
+for line in os.environ.get("RESULTS", "").splitlines():
+    if not line:
+        continue
+    cap, k, r, v = (line.split("\t", 3) + ["", "", "", ""])[:4]
+    results.append({"capability": cap, "kind": k, "ref": r, "verdict": v})
+    summary[v] = summary.get(v, 0) + 1
+out = {
+    "sha": os.environ.get("SHA", "unknown"),
+    "timestamp": os.environ.get("TS", "unknown"),
+    "kind_filter": os.environ.get("KIND", "") or None,
+    "summary": summary,
+    "results": results,
+}
+with open(os.environ["OUT"], "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+print("wrote %s — %d pass · %d fail · %d skipped · %d missing"
+      % (os.environ["OUT"], summary["pass"], summary["fail"], summary["skipped"], summary["missing"]))
+sys.exit(1 if summary["fail"] else 0)
+'
+}
+
+cmd_conformance() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    report)       cmd_conformance_report "$@" ;;
+    run)          cmd_conformance_run "$@" ;;
+    ""|-h|--help) say "usage: herd conformance report [--json] | run [--kind unit] [--out FILE]" ;;
+    *)            die "unknown 'herd conformance' subcommand '$sub' — usage: herd conformance report [--json] | run [--kind unit]" ;;
+  esac
+}
+
 # cmd_doctor — run the one-pass dependency doctor (scripts/herd/herd-preflight.sh). Exposed so a
 # user with a broken/weird setup can self-diagnose anytime; also the gate cmd_init runs before it
 # writes any config, and install.sh runs (advisory) at install time. Exits non-zero when a HARD dep
@@ -2538,7 +2780,7 @@ cmd_backend() {
   local sub="${1:-}"; [ "$#" -gt 0 ] && shift
   case "$sub" in
     switch) cmd_backend_switch "$@" ;;
-    *) die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate] [--yes]" ;;
+    *) die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate] [--yes]" ;;
   esac
 }
 
@@ -2553,7 +2795,7 @@ cmd_backend_switch() {
     esac
     shift
   done
-  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]"
+  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate]"
 
   # Load the project (mirrors cmd_backlog's loader).
   local root; root="$(pwd)"
@@ -2605,6 +2847,46 @@ cmd_backend_switch() {
       command -v gh >/dev/null 2>&1 || die "github backend needs the gh CLI — install it first; nothing was changed"
       gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth login') — nothing was changed"
       say "✓ gh authenticated"
+      ;;
+    jira)
+      # Basic-auth creds live in .herd/secrets ONLY (gitignored, never .herd/config). Prompt for any
+      # missing one on a tty (stored chmod 600 + gitignored, token hidden); fail loud off a tty.
+      if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+        if [ -t 0 ]; then
+          touch "$secrets" && chmod 600 "$secrets"
+          local gi="$PROJECT_ROOT/.gitignore"
+          if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
+            printf '.herd/secrets\n' >> "$gi"
+          fi
+          if [ -z "${JIRA_BASE_URL:-}" ]; then
+            printf 'Jira base URL (e.g. https://acme.atlassian.net): ' >&2
+            local _url=""; IFS= read -r _url </dev/tty || true
+            [ -n "$_url" ] || die "no base URL entered — nothing was changed"
+            printf 'JIRA_BASE_URL="%s"\n' "$_url" >> "$secrets"; JIRA_BASE_URL="$_url"; export JIRA_BASE_URL
+          fi
+          if [ -z "${JIRA_EMAIL:-}" ]; then
+            printf 'Jira account email: ' >&2
+            local _email=""; IFS= read -r _email </dev/tty || true
+            [ -n "$_email" ] || die "no email entered — nothing was changed"
+            printf 'JIRA_EMAIL="%s"\n' "$_email" >> "$secrets"; JIRA_EMAIL="$_email"; export JIRA_EMAIL
+          fi
+          if [ -z "${JIRA_API_TOKEN:-}" ]; then
+            printf 'Jira API token (stored in %s, gitignored; input hidden): ' "$secrets" >&2
+            local _tok=""; IFS= read -rs _tok </dev/tty || true; printf '\n' >&2
+            [ -n "$_tok" ] || die "no token entered — nothing was changed"
+            printf 'JIRA_API_TOKEN="%s"\n' "$_tok" >> "$secrets"; JIRA_API_TOKEN="$_tok"; export JIRA_API_TOKEN
+          fi
+        else
+          die "JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN missing — add them to $secrets (gitignored) and re-run; nothing was changed"
+        fi
+      fi
+      # Live round-trip: prove the creds work before touching config. /myself is the cheapest
+      # authenticated call; any error/HTML/empty response fails the grep.
+      # shellcheck source=/dev/null
+      . "$target_file"
+      _jira_api GET /rest/api/3/myself 2>/dev/null | grep -q '"accountId"' \
+        || die "Jira API round-trip FAILED (bad creds or network) — nothing was changed"
+      say "✓ Jira API reachable (myself check passed)"
       ;;
   esac
 
@@ -4799,6 +5081,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd conformance <report|run>       the capability CONFORMANCE MATRIX — join capabilities.tsv against
+                                        the committed proof map templates/conformance.tsv:
+                                        report [--json]  DETERMINISTIC, no-LLM: every capability with NO
+                                                      proof mapping (gap) + every mapping whose proof_ref
+                                                      no longer exists (rot); non-zero only on rot
+                                        run [--kind unit]  execute the mapped proofs, write
+                                                      conformance.json (capability→verdict→sha→timestamp)
+                                      Fail-soft (absent map = soft note) + report-only (no merge gate)
   herd governance <export|apply>      export/apply a project's governance as a portable, versioned
                                         export [--file <path>]  write the governance-scoped config key
                                                       subset (secrets/machine keys never travel) to a
@@ -4851,10 +5141,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
               [show <#id>]            one item's full detail (state, description, URL)
               [browse]                interactive fzf picker with a live detail preview
                                       (soft-degrades to the plain list without fzf)
-  herd backend switch <name>          guided work-tracker switch (file|github|linear|changelog):
+  herd backend switch <name>          guided work-tracker switch (file|github|linear|jira|changelog):
               [--migrate|--no-migrate]  preflight creds FIRST (linear: prompts for the API key on
-                                      a tty → .herd/secrets + live viewer{} check; github: gh
-                                      auth) — a failed preflight changes nothing; then flips
+                                      a tty → .herd/secrets + live viewer{} check; jira: prompts
+                                      for base URL/email/token → .herd/secrets + live /myself
+                                      check; github: gh auth) — a failed preflight changes
+                                      nothing; then flips
                                       SCRIBE_BACKEND via config set, optionally replays the old
                                       backend's open items into the new one (idempotent), stamps
                                       a frozen-archive banner on BACKLOG.md when leaving the file
@@ -4913,6 +5205,7 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  conformance) shift; cmd_conformance "$@" ;;
   governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;

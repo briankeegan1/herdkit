@@ -43,6 +43,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic jira-backend test passes" {
+  run bash "$REPO/tests/test-backend-jira.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic cli backend-switch test passes" {
+  run bash "$REPO/tests/test-cli-backend-switch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic file-backend test passes" {
   run bash "$REPO/tests/test-backend-file.sh"
   [ "$status" -eq 0 ]
@@ -75,6 +87,12 @@ setup() {
 
 @test "hermetic generalized start-agent seam (driver launch-agent) test passes" {
   run bash "$REPO/tests/test-driver-launch-agent.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic agent-runtime exec-surface bindings (HERD-150 P1) test passes" {
+  run bash "$REPO/tests/test-driver-agent-exec.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
@@ -231,6 +249,12 @@ setup() {
 
 @test "hermetic end-to-end governance sim (HERD-127) test passes" {
   run bash "$REPO/tests/test-sandbox-governance.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic capability conformance matrix (HERD-144) test passes" {
+  run bash "$REPO/tests/test-conformance.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

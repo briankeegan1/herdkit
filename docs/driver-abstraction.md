@@ -6,6 +6,12 @@ Phase 3 — an actual second driver, **`headless`** — has now shipped too; see
 [Phase 3: the headless driver](#phase-3-the-headless-driver-shipped) at the end of this document.
 The sections below (originally written for phase 1) describe the design that phases 2–3 realized.
 
+A follow-on **agent-runtime portability epic (HERD-150)** extends the same `.driver` format to the
+`claude`-specific *exec* surface (spawn / one-shot / resume / model-switch / limit-detection /
+cost-parse). Its **phase 1 — the exec-surface audit + capability bindings — has shipped**; see
+[Agent-runtime portability epic](#agent-runtime-portability-epic-herd-150) at the end. Phases 2–4
+(routing the call sites through the new bindings) are not built yet.
+
 **Origin:** Leak F in [`external-consumer-audit.md`](external-consumer-audit.md) and the backlog item
 *"[P3] Renderable coordinator skill for non-herdr/non-Claude drivers."* The rendered coordinator
 skill hard-codes the herdr multiplexer and the Claude Code agent runtime as its control surface, so
@@ -228,3 +234,145 @@ notifications, the limit-menu pane read/keys, and the auto-respawn spawn — thr
 each fail soft. Limit *detection* is primarily a hook-sentinel file (already headless-friendly); the
 herdr clean-menu-select path is a pane concept, so under headless it falls straight through to the
 existing `claude --continue` backstop.
+
+---
+
+## Agent-runtime portability epic (HERD-150)
+
+Phases 1–3 above made the **multiplexer** (herdr → panes) swappable — the coordinator *skill*
+renders per-driver, and the runtime shim (`scripts/herd/driver.sh`) routes the pane surface. But the
+**agent runtime** — Claude Code itself — is still hard-wired: the lanes spawn `claude --model … "$prompt"`,
+the drainers shell out to `claude -p …`, the watcher resumes with `claude --continue`, limit
+detection greps the Claude usage-limit banner, and `cost.sh` parses Claude's transcript JSON. Swap
+Claude for another agent runtime (an SDK loop, a different CLI) and every one of those breaks.
+
+This epic factors the **agent-exec surface** out of the code and into the `.driver` file, the same
+way phases 1–3 did the mux surface. It is scoped in **6 phases**; this document tracks P1, which has
+shipped. **P1 is a pure data + docs change and routes NOTHING** — it only (a) audits every
+claude-specific incantation into capability *classes* (the table below is the P2–P4 work map), and
+(b) adds a binding per class to both shipped `.driver` files (`DRIVER_AGENT_*`), carrying today's
+**exact** strings. Because no template token and no runtime call site consumes the new bindings yet,
+`herd render` output and all runtime behavior are **byte-identical** — the safety rail is the
+before/after render diff plus the parse/completeness unit test (`tests/test-driver-agent-exec.sh`).
+
+### Phase status
+
+| Phase | Scope                                                                                  | Status      |
+| ----- | -------------------------------------------------------------------------------------- | ----------- |
+| P1    | Audit the exec surface into capability classes; add `DRIVER_AGENT_*` bindings (data + docs, byte-identical) | **shipped** |
+| P2    | Route the **spawn** classes (interactive-spawn, one-shot-exec, permission flag) through the bindings | not built   |
+| P3    | Route **resume + model-switch** through the bindings                                    | not built   |
+| P4    | Route **limit-detection + session-identity + cost/telemetry** through the bindings      | not built   |
+| P5    | Ship a second, non-Claude agent-runtime driver binding the exec surface                 | not built   |
+| P6    | Drop the last direct `claude`/transcript reference from the engine tree                 | not built   |
+
+### The exec surface: capability classes → call sites (the P2–P4 work map)
+
+Every direct `claude`-specific incantation in `scripts/herd/*.sh` + `bin/herd`, grouped by the
+capability class it belongs to. Each class has one `DRIVER_AGENT_*` binding (right column) carrying
+the exact string herdr-claude uses today. `file:line` refs are the routing targets for P2–P4.
+(Comment/prose mentions of these strings are excluded — only live call sites are listed.)
+
+#### 1. interactive-spawn — `DRIVER_AGENT_INTERACTIVE_SPAWN`
+
+Spawn an agent into a tab/pane on an opening prompt: `claude --model <model> --dangerously-skip-permissions "<prompt>"`.
+
+| Site                                   | Role                                                      |
+| -------------------------------------- | -------------------------------------------------------- |
+| `scripts/herd/herd-feature.sh:230`     | builder lane (herdr `agent start … -- claude`)           |
+| `scripts/herd/herd-quick.sh:235`       | quick-builder lane                                        |
+| `scripts/herd/herd-resolve.sh:77`      | conflict-resolver lane (via `herd_driver_launch_agent`)  |
+| `scripts/herd/herd-review.sh:505`      | agent-pane reviewer (via `herd_driver_launch_agent`)     |
+| `scripts/herd/scribe.sh:205`           | scribe drainer agent-pane                                |
+| `scripts/herd/research.sh:162`         | research drainer agent-pane                              |
+| `scripts/herd/agent-watch.sh:3554`     | dead-builder auto-respawn (herdr)                        |
+| `scripts/herd/driver.sh:544`           | herdr start-agent shim (positional argv)                 |
+| `scripts/herd/driver.sh:641`           | herdr launch-agent shim (generalized argv)               |
+| `scripts/herd/driver.sh:528`, `:616`   | headless start/launch (detached `nohup claude …`)        |
+
+#### 2. one-shot-exec — `DRIVER_AGENT_ONESHOT_EXEC`
+
+Headless one-shot query, no pane: `claude -p "<prompt>" --model <model> --dangerously-skip-permissions`.
+
+| Site                               | Role                                          |
+| ---------------------------------- | --------------------------------------------- |
+| `scripts/herd/herd-advise.sh:113`  | mid-flight strong-model advisor               |
+| `scripts/herd/herd-review.sh:287`  | local pre-merge review (headless `-p`)        |
+| `scripts/herd/herd-review.sh:591`  | headless PR review (`-p`)                      |
+| `bin/herd:557`                     | governance-sentence → enforcement-surface map |
+| `bin/herd:764`                     | repo scout pass (interview defaults)          |
+
+#### 3. resume — `DRIVER_AGENT_RESUME`
+
+Resume an ended session in place with full context: `claude <flags> --continue "<prompt>"`.
+
+| Site                                  | Role                                                             |
+| ------------------------------------- | --------------------------------------------------------------- |
+| `scripts/herd/agent-watch.sh:2671`    | builder in-place limit resume (`cd <wt> && claude … --continue`)|
+| `scripts/herd/agent-watch.sh:3113+`   | coordinator limit-resume watchdog backstop (`claude --continue`)|
+
+#### 4. model-switch — `DRIVER_AGENT_MODEL_SWITCH`
+
+Switch model mid-session by sending `/model <model>` into a live session (delivered via the mux
+`DRIVER_SEND_TEXT`). Render-time token: `{{DRIVER_SWITCH_MODEL}}`.
+
+| Site                                  | Role                                       |
+| ------------------------------------- | ------------------------------------------ |
+| `templates/coordinator.md.tmpl:271`   | coordinator builder step-up (`/model` line)|
+
+#### 5. permission-mode flag — `DRIVER_AGENT_PERMISSION_FLAG`
+
+The tool-permission-bypass flag, defaulted by every lane: `--dangerously-skip-permissions`
+(`HERD_CLAUDE_FLAGS` override).
+
+| Site                                                                                        | Role                          |
+| ------------------------------------------------------------------------------------------- | ----------------------------- |
+| `herd-feature.sh:70`, `herd-quick.sh:77`, `herd-resolve.sh:32`, `herd-review.sh:125`        | builder / reviewer lane default |
+| `herd-advise.sh:77`, `scribe.sh:31`, `research.sh:36`                                        | drainer / advisor default     |
+| `agent-watch.sh:2667`, `agent-watch.sh:3535`                                                 | resume / respawn default      |
+| `scripts/herd/driver.sh:525`, `:542`, `:609`                                                 | shim fallback default         |
+
+#### 6. limit-detection pattern — `DRIVER_AGENT_LIMIT_PATTERN`
+
+The Claude usage-limit signals: transcript banner regex, clean-menu regex, hook sentinel, menu keys.
+
+| Site                                  | Role                                                              |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| `scripts/herd/agent-watch.sh:2775`    | banner scrape regex `usage limit\|session limit\|hit your …`     |
+| `scripts/herd/agent-watch.sh:2882`    | clean-menu detect regex `Upgrade your plan\|Stop and wait\|…`    |
+| `scripts/herd/agent-watch.sh:2684`    | hook sentinel file `.herd-limit-sentinel`                        |
+| `scripts/herd/agent-watch.sh:2871`    | limit-menu keystrokes (`Down Enter`)                             |
+| `scripts/herd/herd-config.sh:775`     | `rate_limit` StopFailure hook writer (sentinel source)           |
+
+`DRIVER_AGENT_LIMIT_PATTERN` binds the primary banner regex; P4 lifts the menu regex + keys + hook
+matcher alongside it.
+
+#### 7. session-identity — `DRIVER_AGENT_SESSION_ID`
+
+Where a runtime session's transcript lives and how a session is fingerprinted:
+`$HERD_TRANSCRIPT_ROOT` (default `$HOME/.claude/projects`) `/<cwd with / and . → ->/*.jsonl`.
+
+| Site                                        | Role                                                     |
+| ------------------------------------------- | -------------------------------------------------------- |
+| `scripts/herd/cost.sh:272`                  | transcript-dir munge (`_cost_transcript_dir`)            |
+| `scripts/herd/agent-watch.sh:2693`, `:3221` | same munge (limit-banner read / idle-token gauge)        |
+| `scripts/herd/cost.sh:56`–`58`              | first-message fingerprints (coordinator/scribe/researcher) |
+
+#### 8. cost/telemetry parse — `DRIVER_AGENT_COST_USAGE_KEYS`
+
+The Claude transcript usage JSON fields `cost.sh` sums + prices.
+
+| Site                              | Role                                                                        |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `scripts/herd/cost.sh:183`–`186`  | usage keys `input_tokens/output_tokens/cache_creation_input_tokens/cache_read_input_tokens` |
+| `scripts/herd/cost.sh:195`–`196`  | `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`                   |
+| `scripts/herd/cost.sh:63`–`67`    | model→USD price table (Claude model ids)                                    |
+
+### Why byte-identical (the P1 guarantee)
+
+The new `DRIVER_AGENT_*` keys are sourced by `render_skill()` (they match `compgen -v DRIVER_`), but
+`templates/coordinator.md.tmpl` contains **no** `{{DRIVER_AGENT_*}}` token, so the substitution loop
+never touches them — the rendered skill is unchanged. No runtime script reads them either. The proof
+is a before/after `herd render` diff (empty) plus `tests/test-driver-agent-exec.sh`, which asserts
+both `.driver` files parse with the extended format, every class is bound in **both** drivers, the
+bindings are zero-secret, and none of their values leak into a rendered skill.

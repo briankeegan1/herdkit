@@ -1,0 +1,38 @@
+capability	proof_kind	proof_ref
+# templates/conformance.tsv — the CAPABILITY CONFORMANCE MATRIX (HERD-144): the committed proof map
+# that binds each row of templates/capabilities.tsv to the proof(s) that exercise it, so coverage is
+# accountable PER FEATURE. Read by `herd conformance` (bin/herd): `report` lists every capability with
+# NO mapping (a gap) and every mapping whose proof_ref no longer exists (rot); `run` executes the mapped
+# proofs and emits conformance.json. A SIBLING file, keyed by capability name, so templates/capabilities.tsv
+# stays BYTE-IDENTICAL (its consumers — herd config/upgrade/codemap and the queued HERD-140/141/143 — are
+# unaffected). TAB-separated; blank and '#'-prefixed lines ignored; the first line is the header.
+#
+# Columns:
+#   capability   MUST match column 1 of templates/capabilities.tsv EXACTLY (the join key).
+#   proof_kind   unit | sim | render — how the proof exercises the capability.
+#                  unit   = a hermetic tests/*.sh (or *.bats) the healthcheck suite already runs.
+#                  sim    = a scenario/simulation harness under tests/ (fidelity-ladder sims).
+#                  render = a template/skill render assertion (the coordinator/hook render surface).
+#   proof_ref    repo-root-relative path to the proof. `run --kind unit` executes it as `bash <ref>`.
+#
+# A capability may carry SEVERAL rows (several proofs); it is MAPPED when at least one proof_ref exists,
+# GAP when it has no rows at all, and its individual missing-ref rows surface as ROT. UNMAPPED rows are
+# NOT listed here — that is the point: the gap report derives them from capabilities.tsv MINUS this file,
+# so they surface LOUDLY as none-yet rather than being silently omitted.
+#
+# SEED (HERD-144): the config-key family only, so the gap report starts HONEST — every other capability
+# reads as an explicit gap until its own proof mapping lands. Grow this file as coverage is claimed.
+herd config <list|get|set>	unit	tests/test-cli-config.sh
+herd config <list|get|set>	unit	tests/test-config-local-overlay.sh
+herd config <list|get|set>	unit	tests/test-cli-config-sync.sh
+herd config <list|get|set>	unit	tests/test-config-dedup-lint.sh
+herd config <list|get|set>	unit	tests/test-config-shared-pr.sh
+.herd/config.local	unit	tests/test-config-local-overlay.sh
+BRANCH_TEMPLATE	unit	tests/test-branch-template.sh
+ATTRIBUTION_POLICY	unit	tests/test-attribution-lint.sh
+COMMIT_CONVENTION	unit	tests/test-commit-convention-lint.sh
+APP_PREVIEW_CMD	unit	tests/test-app-preview-config.sh
+APP_PREVIEW_SERVER_ARGS	unit	tests/test-app-preview-config.sh
+APP_PREVIEW_HEALTH_CMD	unit	tests/test-app-preview-config.sh
+APP_PREVIEW_HEALTH_PATH	unit	tests/test-app-preview-config.sh
+APP_PREVIEW_PORT_BASE	unit	tests/test-app-preview-config.sh
