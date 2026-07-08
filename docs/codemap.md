@@ -198,6 +198,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → —
 - `WATCHER_AUTOMERGE` → `bin/herd`, `agent-watch.sh`
+- `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`
 - `WATCHER_VIEW` → `agent-watch.sh`
