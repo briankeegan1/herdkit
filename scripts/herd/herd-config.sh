@@ -283,6 +283,14 @@ fi
 : "${MODEL_REVIEW:="claude-opus-4-8"}"
 : "${MODEL_RESOLVER:="claude-sonnet-4-6"}"  # conflict resolver — mechanical merge work, not creative
 
+# MODEL_ADVISE — the STRONG advisor model behind `herd advise` (HERD-101): a builder pulls a one-shot
+# second opinion on a hard decision from this tier WITHOUT escalating its whole lane. Defaults to
+# whatever MODEL_FEATURE resolved to just above (the Opus tier under standard TOKEN_MODE, sonnet under
+# eco) — so the advisor tracks the feature tier by default and eco lowers it in lockstep. Set it
+# explicitly to pin the advisor to a specific strong model regardless of the feature tier. Assigned
+# AFTER MODEL_FEATURE so its default sees the fully-resolved value; ':=' means an explicit key wins.
+: "${MODEL_ADVISE:="$MODEL_FEATURE"}"
+
 # MODEL_ESCALATE_GLOB — deterministic model step-up (analogous to HEALTHCHECK_HEAVY_GLOB): when a
 # lane's task text matches this egrep -i pattern, the lane forces the MODEL_FEATURE tier regardless
 # of MODEL_QUICK or any per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override. Empty (default) → off,

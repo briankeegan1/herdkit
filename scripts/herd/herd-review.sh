@@ -33,13 +33,20 @@
 # -----------------------------------------
 # Prints exactly one verdict line to stdout as its final output:
 #       REVIEW: PASS
+#       REVIEW: PASS — advisory: <note> | advisory: <note>
 #       REVIEW: BLOCK — rule: <rule> | why: <reasoning> | location: <file:line or function>
 #       REVIEW: INFRA-FAIL — <one-line reason>   (transient; watcher retries, never caches)
 # STRUCTURED BLOCK (HERD-104): a BLOCK carries three ' | '-separated fields after the em-dash —
 # rule (which correctness rule was violated), why (the reasoning), and location (file:line or
 # function) — so an auto-refix bounce is ACTIONABLE. This is BACKWARD-COMPATIBLE + FAIL-SOFT: a
 # legacy/unstructured 'REVIEW: BLOCK — <freeform reason>' still parses (the whole tail becomes
-# 'why'; rule/location stay empty). PASS is byte-identical to before — no field is ever appended.
+# 'why'; rule/location stay empty).
+# CORRECTNESS-ONLY BLOCK (HERD-105): the reviewer classifies every finding as CORRECTNESS (blocking)
+# or ADVISORY (style/hardening/nitpick — non-blocking) and BLOCKs only when there is >=1 correctness
+# finding; otherwise it PASSes, carrying any advisory findings as ' | '-separated 'advisory:' notes
+# after the em-dash so they surface in the PR comment + journal WITHOUT gating the merge. A finding-
+# free PASS is still the byte-identical bare 'REVIEW: PASS' — the advisory tail is appended ONLY when
+# there is at least one non-blocking note, so the default (no advisories) is unchanged from before.
 # The watcher merges ONLY on PASS. A BLOCK is a REVIEWER-BACKED refusal — a genuine finding the
 # reviewer both printed AND (best-effort) posted as a PR comment; only these are cached against the
 # sha and only these may auto-refix a builder. INFRA-FAIL is DISTINCT from BLOCK: the reviewer COULD
@@ -147,6 +154,9 @@ _teardown_reviewer() {
   if [ "${_AGENT_PANE_MODE:-0}" = "1" ] && [ -n "${ROOT:-}" ]; then
     herdr pane close "$ROOT" >/dev/null 2>&1 || true
   fi
+  # We closed our own pane here, so drop the dispatch-registry row too (HERD-113) — nothing survives
+  # this exit path for the watcher to retire. Best-effort; a missing file is fine.
+  [ -n "${HERD_REVIEW_REGISTRY_FILE:-}" ] && rm -f "$HERD_REVIEW_REGISTRY_FILE" 2>/dev/null || true
   [ -n "${_agent_result_file:-}" ] && rm -f "$_agent_result_file" 2>/dev/null || true
 }
 
@@ -258,7 +268,7 @@ if [ "$REVIEW_MODE" = "local" ]; then
   _local_diff_cmd="git diff ${DEFAULT_BRANCH}...HEAD"
   # Same STABLE adversarial preamble + checklist + RULES as TASK, retargeted at the local diff. The
   # only rule differences: there is NO PR, so no 'gh' command and no PR comment — just print the verdict.
-  LOCAL_TASK="You are an ADVERSARIAL PRE-PR CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the LOCAL diff of this worktree (with '${_local_diff_cmd}') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. There is NO pull request yet, so DO NOT run any 'gh' command and do NOT post a comment anywhere. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) FINALLY, as the LAST thing you print, output EXACTLY ONE line and nothing after it — either 'REVIEW: PASS' or, to block, a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>'. Keep it to that single line with those three ' | '-separated fields (rule, why, location); that line is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: review the LOCAL diff of branch slug '${SLUG}' by running '${_local_diff_cmd}'."
+  LOCAL_TASK="You are an ADVERSARIAL PRE-PR CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the LOCAL diff of this worktree (with '${_local_diff_cmd}') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. There is NO pull request yet, so DO NOT run any 'gh' command and do NOT post a comment anywhere. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) FINALLY, as the LAST thing you print, output EXACTLY ONE verdict line and nothing after it. BLOCK if and only if you have at least one CORRECTNESS finding — a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>' (those three ' | '-separated fields, rule/why/location). Otherwise PASS: print exactly 'REVIEW: PASS' when you found NO issues at all, or, when you found ONLY advisory (non-correctness) issues, 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>' with one ' advisory:' segment per advisory finding. Keep it to that single line; it is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: review the LOCAL diff of branch slug '${SLUG}' by running '${_local_diff_cmd}'."
 
   LLOG="$(mktemp "${TMPDIR:-/tmp}/herd-review-local-${SLUG}-XXXXXX")" \
     || emit_infra_fail "could not allocate local review log (mktemp failed)"
@@ -286,7 +296,10 @@ if [ "$REVIEW_MODE" = "local" ]; then
 
   verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
   case "$verdict_line" in
-    "REVIEW: PASS")   _emit_verdict "REVIEW: PASS"; exit 0 ;;
+    # PASS, with or without a HERD-105 'advisory:' tail (' — advisory: …'). A bare 'REVIEW: PASS'
+    # is emitted verbatim (byte-identical to before); a PASS carrying advisory notes is passed
+    # through unchanged so the non-blocking findings survive to the builder.
+    "REVIEW: PASS"|"REVIEW: PASS "*) _emit_verdict "$verdict_line"; exit 0 ;;
     "REVIEW: BLOCK"*) _emit_verdict "$verdict_line"; exit 1 ;;
     *) emit_infra_fail "local reviewer produced no parseable verdict (no REVIEW line) — infrastructure failure, not a block" ;;
   esac
@@ -340,7 +353,7 @@ journal_append review_log_retained pr "$PR" slug "$SLUG" path "$LOG" keep "$REVI
 # Prompt-cache-aware ordering: the STABLE reviewer preamble + risk checklist + RULES lead so many
 # close-in-time PR reviews share the cached prefix (Anthropic's cache keys on the longest shared
 # PREFIX, 5-min TTL); the UNIQUE per-PR content (PR number, branch slug, diff instruction) TRAILS.
-TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The only write you may do is ONE 'gh pr comment <PR> --body \"…\"'. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) Post a brief PR comment summarizing your finding via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: PASS rationale, or the bug + why it's wrong). (5) FINALLY, as the LAST thing you print, output EXACTLY ONE line and nothing after it — either 'REVIEW: PASS' or, to block, a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>'. Keep it to that single line with those three ' | '-separated fields (rule, why, location); that line is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'."
+TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The only write you may do is ONE 'gh pr comment <PR> --body \"…\"'. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) Post a brief PR comment summarizing your findings via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: the blocking bug + why it's wrong, or the PASS rationale; then list any ADVISORY style/hardening findings separately as clearly-labelled NON-BLOCKING notes). (5) FINALLY, as the LAST thing you print, output EXACTLY ONE verdict line and nothing after it. BLOCK if and only if you have at least one CORRECTNESS finding — a STRUCTURED verdict of exactly this shape: 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>' (those three ' | '-separated fields, rule/why/location). Otherwise PASS: print exactly 'REVIEW: PASS' when you found NO issues at all, or, when you found ONLY advisory (non-correctness) issues, 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>' with one ' advisory:' segment per advisory finding. Keep it to that single line; it is parsed by a machine; do not add markdown, quotes, or extra text around it. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'."
 
 # Private agent temp: the agent writes its verdict here; herd-review.sh (this script) is the
 # SOLE atomic writer of $HERD_REVIEW_RESULT_FILE. The agent NEVER touches the watcher's
@@ -359,7 +372,7 @@ fi
 # (polling in the background) captures the machine verdict.
 # Prompt-cache-aware ordering (see the TASK note above): STABLE preamble + checklist + RULES lead;
 # the UNIQUE per-PR content (PR number, slug, and the private result-file path) TRAILS.
-AGENT_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) SCOPE = CORRECTNESS ONLY. Ignore style, naming, formatting, test coverage, and subjective design — those are NOT grounds to block. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The ONLY writes you may do are: ONE 'gh pr comment <PR> --body \"…\"' and the result-file write described in rule 5. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct. (4) Post a brief PR comment summarizing your finding via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: PASS rationale, or the bug + why it's wrong). (5) FINALLY, as your absolute LAST action, write the machine verdict the merge gate reads — this step is MANDATORY — by running exactly one of these commands: printf 'REVIEW: PASS\n' > '<RESULT_FILE>' OR, to block, a STRUCTURED verdict of exactly this shape: printf 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>\n' > '<RESULT_FILE>' (that one line carries three ' | '-separated fields — rule, why, location — and is parsed by a machine), where <RESULT_FILE> is the path given below. Do not skip this step. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'. The <RESULT_FILE> path for rule 5 is: ${_agent_result_file}."
+AGENT_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The ONLY writes you may do are: ONE 'gh pr comment <PR> --body \"…\"' and the result-file write described in rule 5. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) Post a brief PR comment summarizing your findings via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: the blocking bug + why it's wrong, or the PASS rationale; then list any ADVISORY style/hardening findings separately as clearly-labelled NON-BLOCKING notes). (5) FINALLY, as your absolute LAST action, write the machine verdict the merge gate reads — this step is MANDATORY — by running exactly one of these commands. To BLOCK (only when you have at least one CORRECTNESS finding), a STRUCTURED verdict of exactly this shape: printf 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>\n' > '<RESULT_FILE>' (three ' | '-separated fields — rule, why, location — parsed by a machine). Otherwise PASS: printf 'REVIEW: PASS\n' > '<RESULT_FILE>' when you found NO issues, or printf 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>\n' > '<RESULT_FILE>' when you found ONLY advisory (non-correctness) issues (one ' advisory:' segment per finding), where <RESULT_FILE> is the path given below. Do not skip this step. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'. The <RESULT_FILE> path for rule 5 is: ${_agent_result_file}."
 
 # _purge_stale_review_tab — close any STANDALONE review·<slug> tab left by a prior dispatch (the
 # fallback path) and drop its sweep-allowlist registry line. Idempotent + best-effort: called on
@@ -464,6 +477,18 @@ except Exception:
       _AGENT_PANE_MODE=1
       # Review pane is inside the builder's tab — no separate registry entry needed; tearing
       # down the builder tab (on merge) will close this split automatically.
+      # DISPATCH REGISTRY (HERD-113): record this reviewer's (pid, pane id) for the watcher, so on
+      # verdict CONSUMPTION it can retire this pane, and a dispatch after a watcher/herdr restart can
+      # ADOPT the still-live pane instead of spawning a duplicate reviewer. $$ is the poller pid the
+      # watcher recorded in the inflight marker (exec -a preserves it across the argv0 re-exec). Written
+      # here — after the pane is confirmed up — so the pane id is real. Best-effort; a failed write only
+      # costs the retire-on-consume convenience (the pid guard + startup sweep still prevent duplicates).
+      if [ -n "${HERD_REVIEW_REGISTRY_FILE:-}" ]; then
+        _reg_tmp="${HERD_REVIEW_REGISTRY_FILE}.tmp.$$"
+        if printf '%s %s\n' "$$" "$ROOT" > "$_reg_tmp" 2>/dev/null; then
+          mv -f "$_reg_tmp" "$HERD_REVIEW_REGISTRY_FILE" 2>/dev/null || rm -f "$_reg_tmp" 2>/dev/null || true
+        fi
+      fi
     fi
   fi
 
@@ -534,9 +559,12 @@ fi
 # never cached as a sticky BLOCK. (This was the 2026-07-02 rc0-no-verdict bug: a default BLOCK got
 # cached against the sha and even bounced the builder on a "fix" prompt with nothing actionable.)
 case "$verdict_line" in
-  "REVIEW: PASS")
+  # PASS, with or without a HERD-105 'advisory:' tail. Bare 'REVIEW: PASS' is emitted verbatim
+  # (byte-identical); a PASS carrying advisory notes is passed through unchanged so the watcher
+  # can surface the non-blocking findings to the journal without gating the merge.
+  "REVIEW: PASS"|"REVIEW: PASS "*)
     _mark_review_done PASS
-    _emit_verdict "REVIEW: PASS"
+    _emit_verdict "$verdict_line"
     exit 0
     ;;
   "REVIEW: BLOCK"*)

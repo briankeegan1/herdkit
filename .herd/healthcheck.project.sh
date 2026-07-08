@@ -87,7 +87,18 @@ fi
 #       caught mid-spawn/mid-reap or a state flip). Before reddening we sleep a short settle window
 #       (HERD_LEAKGUARD_SETTLE_SECS, default 4s) and re-snapshot; we red ONLY if the leak is STILL
 #       present. Transient churn clears; a genuinely leaked, agent-less tab persists and re-trips.
-# Both preserve no-false-green: a real leak is neither engine-registered nor transient, so it reds.
+#   (c) WORKTREE-SLUG WHITELIST (HERD-115) — the .herd-tabs registration whitelist (a) covers the
+#       IN-TAB run, but the WATCHER invokes this suite against a live builder worktree where that
+#       registry is not always resolvable at snapshot time, so an in-flight builder's OWN tab — whose
+#       LABEL is its worktree slug (the slug keys worktrees, agent names AND tab labels alike) — flips
+#       out of idle/working mid-suite and is counted as a net-new orphan. Every watcher-side
+#       healthcheck for PRs #217/#218/#219 hit exactly this ("new: <the PR's own builder tab>"),
+#       reddening attempt=1 then settling FLAKY. We therefore derive an additional whitelist from the
+#       LIVE worktree slugs ('git worktree list', basename of each) at suite start — INVOCATION-ORIGIN
+#       INDEPENDENT, since every worktree shares one .git and lists them all — and drop any tab whose
+#       LABEL matches a live slug. A FOREIGN leaked tab carries no live-worktree label, so it still reds.
+# All three preserve no-false-green: a real leak is neither engine-registered, transient, nor labelled
+# with a live worktree slug, so it reds.
 _hk_workspace_id() {
   # Resolve THIS project's herdr workspace id (WORKSPACE_NAME → workspace_id via 'herdr workspace
   # list'). Prints the id (no trailing newline) on success; empty when herdr is absent, the list
@@ -120,6 +131,25 @@ _hk_regtabs() {
   awk 'NF>=2 {print $2}' "$_tree/.herd-tabs" 2>/dev/null || true
 }
 
+_hk_worktree_slugs() {
+  # HERD-115 worktree-slug whitelist: emit the LIVE feature-worktree slugs, one per line — the
+  # basename of every 'git worktree list' path. An in-flight builder's OWN tab carries its worktree
+  # slug as its LABEL, so a tab whose label matches a live slug is that builder's own tab, NOT a suite
+  # leak — _hk_orphans() drops it from the orphan set. Unlike the .herd-tabs registry (a), this is
+  # INVOCATION-ORIGIN INDEPENDENT: every worktree shares one .git, so 'git worktree list' enumerates
+  # them all whether the suite runs in-tab or via the watcher against a builder worktree. Empty when
+  # git is absent or this is not a git checkout (fail-soft → falls back to the (a)/(b) mitigations).
+  command -v git >/dev/null 2>&1 || return 0
+  git worktree list --porcelain 2>/dev/null | "$PY" -c '
+import sys, os
+for line in sys.stdin:
+    if line.startswith("worktree "):
+        p = line[len("worktree "):].strip()
+        if p:
+            print(os.path.basename(p))
+' 2>/dev/null || true
+}
+
 _hk_orphans() {
   # Emits 'orphan-tabs:<N>' and 'orphan-panes:<M>' — N = live tabs with no controlling agent
   # (agent_status not in idle/working), M = their combined pane_count. Empty when herdr absent.
@@ -139,7 +169,7 @@ _hk_orphans() {
   # (label NOT matching the whitelist, e.g. herd-review's standalone review·<slug> running tail -f)
   # is still an orphan and still reds.
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr tab list 2>/dev/null | WSID="${1:-}" REGTABS="$(_hk_regtabs)" "$PY" -c '
+  herdr tab list 2>/dev/null | WSID="${1:-}" REGTABS="$(_hk_regtabs)" WLSLUGS="${2:-}" "$PY" -c '
 import sys, json, os, re
 # Known engine tab/agent label prefixes. The character after "resolve" is a literal middot
 # U+00B7 (the label is "resolve·<slug>"), matching the engine that mints those tabs. "research"
@@ -149,6 +179,11 @@ _ENGINE = re.compile(r"^(scribe-|resolve·|research|herd-watch|backlog|coordinat
 # are engine-owned expected churn — drop them from the orphan set. EXACT match, so a hermetic test'"'"'s
 # escaped tab (never engine-registered) still counts as an orphan and still reds.
 _REGTABS = set(filter(None, (os.environ.get("REGTABS", "") or "").split()))
+# HERD-115 worktree-slug whitelist: labels matching a LIVE worktree slug are in-flight builders own
+# tabs — drop them so a builder tab flipped out of idle/working mid-suite is never counted as a leak
+# in the watcher path. A FOREIGN leaked tab has no live-worktree label, so it still reds (no false-
+# green). Newline-separated, EXACT match on the full label.
+_WLSLUGS = set(filter(None, (os.environ.get("WLSLUGS", "") or "").splitlines()))
 try:
     tabs = (json.load(sys.stdin).get("result") or {}).get("tabs") or []
     wsid = os.environ.get("WSID", "")
@@ -158,7 +193,8 @@ try:
     orphans = [t for t in tabs
                if str(t.get("agent_status", "")) not in ("idle", "working")
                and not _ENGINE.match(str(t.get("label", "")))
-               and str(t.get("tab_id", "")) not in _REGTABS]
+               and str(t.get("tab_id", "")) not in _REGTABS
+               and str(t.get("label", "")) not in _WLSLUGS]
     print("orphan-tabs:%d" % len(orphans))
     print("orphan-panes:%d" % sum(int(t.get("pane_count", 0) or 0) for t in orphans))
     # Emit the orphan labels too so a real leak can be named in the failure message.
@@ -197,7 +233,10 @@ if at > bt or ap > bp:
 # scoped identically (issue #78 — the scan must never count another workspace's or sibling project's
 # tab, in either snapshot).
 _hk_wsid="$(_hk_workspace_id)"
-_hk_orphans_before="$(_hk_orphans "$_hk_wsid")"
+# HERD-115: derive the live worktree-slug whitelist ONCE at suite start and reuse it for both the
+# before and after snapshots, so an in-flight builder's own tab is dropped identically in both.
+_hk_wtslugs="$(_hk_worktree_slugs)"
+_hk_orphans_before="$(_hk_orphans "$_hk_wsid" "$_hk_wtslugs")"
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
@@ -217,7 +256,7 @@ fi
 # Leak-guard verdict: fail LOUDLY on a NET INCREASE in orphan tabs or orphan panes.
 leak_note="tab-leak-guard: clean"
 if command -v herdr >/dev/null 2>&1; then
-  _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
+  _hk_orphans_after="$(_hk_orphans "$_hk_wsid" "$_hk_wtslugs")"
   _hk_leak="$(_hk_leak_delta "$_hk_orphans_before" "$_hk_orphans_after")"
   if [ -n "$_hk_leak" ]; then
     # SETTLE-RETRY (HERD-93): a leak on the FIRST post-suite snapshot may be transient control-room
@@ -228,7 +267,7 @@ if command -v herdr >/dev/null 2>&1; then
     _hk_settle="${HERD_LEAKGUARD_SETTLE_SECS:-4}"
     case "$_hk_settle" in ''|*[!0-9]*) _hk_settle=4 ;; esac
     [ "$_hk_settle" -gt 0 ] && sleep "$_hk_settle"
-    _hk_orphans_after="$(_hk_orphans "$_hk_wsid")"
+    _hk_orphans_after="$(_hk_orphans "$_hk_wsid" "$_hk_wtslugs")"
     _hk_leak="$(_hk_leak_delta "$_hk_orphans_before" "$_hk_orphans_after")"
   fi
   if [ -n "$_hk_leak" ]; then

@@ -578,6 +578,54 @@ else
 fi
 unset INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
 
+# ── (e) REVIEWER-PANE LIFECYCLE (HERD-113): exactly ONE reviewer per (pr,sha) survives a mid-review
+#        watcher restart — the reviewer is NEVER duplicated. Reproduces the 2026-07-08 double-Opus
+#        incident's shape against the SHIPPED gate: dispatch a review that stays in flight, then model a
+#        watcher restart by re-running the startup registry sweep AND re-entering the review gate for the
+#        SAME (pr,sha) while the reviewer is still live. The dispatch-registry adopt guard + the inflight
+#        pid guard must make that a NO-OP — the stub reviewer is spawned exactly ONCE across the restart.
+step restart "mid-review watcher restart: exactly one reviewer per (pr,sha) survives (never duplicated)"
+RS_PR=900; RS_SLUG="feat-restart"; RS_SHA="restartsha900"
+_rs_spawns() { grep -c "^$RS_PR $RS_SLUG\$" "$STUB_SPAWN_LOG" 2>/dev/null || printf 0; }
+# Keep this reviewer in flight long enough to straddle the simulated restart (captured at spawn).
+export SANDBOX_REVIEW_DELAY=30
+_rs_step="$(_review_gate_step "$RS_PR" "$RS_SLUG" "$RS_SHA")"
+# The reviewer spawns and its registry row + inflight marker land on disk (survives a restart). Poll
+# briefly for the async spawn to register (the stub logs its spawn as its first act, then sleeps).
+_rs_ok=1; _rs_deadline=$(( $(date +%s) + 6 ))
+while [ "$(_rs_spawns)" -lt 1 ]; do
+  [ "$(date +%s)" -ge "$_rs_deadline" ] && { _rs_ok=0; break; }
+  sleep 0.2
+done
+[ -f "$(_review_registry_file "$RS_PR" "$RS_SHA")" ] || _rs_ok=0
+[ -f "$(_review_inflight_file "$RS_PR" "$RS_SHA")" ] || _rs_ok=0
+_rs_after_dispatch="$(_rs_spawns)"
+
+# ── SIMULATE THE WATCHER RESTART ──
+# The watcher is stateless between restarts except for these on-disk markers, so a restart is faithfully
+# modeled by re-running the one-shot startup registry sweep and then re-entering the review gate for the
+# same candidate — exactly what a restarted watcher's action pass does on its first tick.
+_sweep_reviewer_registry                                   # startup sweep: a LIVE poller is adopted, left alone
+_review_gate_step "$RS_PR" "$RS_SLUG" "$RS_SHA" >/dev/null  # restarted action pass re-scans this PR…
+_review_gate_step "$RS_PR" "$RS_SLUG" "$RS_SHA" >/dev/null  # …and again a tick later
+_rs_after_restart="$(_rs_spawns)"
+
+# Tear the lingering reviewer down so the 30 s sleeper never outlives the scenario (kill the poller and
+# drop its markers directly — no re-dispatch).
+_rs_pid="$(head -1 "$(_review_inflight_file "$RS_PR" "$RS_SHA")" 2>/dev/null || true)"
+[ -n "${_rs_pid:-}" ] && kill "$_rs_pid" 2>/dev/null || true
+rm -f "$(_review_inflight_file "$RS_PR" "$RS_SHA")" "$(_review_registry_file "$RS_PR" "$RS_SHA")" \
+      "$(_review_result_file "$RS_PR" "$RS_SHA")" 2>/dev/null || true
+
+if [ "$_rs_ok" = 1 ] && [ "$_rs_after_dispatch" = "1" ] && [ "$_rs_after_restart" = "1" ]; then
+  checkpoint one_reviewer_survives_restart pass \
+    "reviewer for (#$RS_PR,$RS_SHA) spawned exactly once and was ADOPTED (not duplicated) across the restart"
+else
+  checkpoint one_reviewer_survives_restart fail \
+    "reviewer duplicated across restart (dispatch=$_rs_after_dispatch, after-restart=$_rs_after_restart, setup_ok=$_rs_ok, first_step=$_rs_step)"
+fi
+
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"

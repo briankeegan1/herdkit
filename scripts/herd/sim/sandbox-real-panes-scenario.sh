@@ -184,7 +184,7 @@ else
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
-            pane_captured teardown_clean; do
+            pane_captured reviewer_pane_retired_on_verdict teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -308,6 +308,67 @@ except Exception:
     fi
     # Optional screenshot at the 'done' checkpoint; degrades gracefully (no-false-red).
     take_screenshot "control-room"
+  fi
+
+  # ── REVIEWER-PANE LIFECYCLE (HERD-113): the reviewer pane is GONE after its verdict is consumed ──
+  # Stand up a REAL review split pane inside the builder's tab (the agent-pane placement herd-review.sh
+  # uses), register it in a dispatch-registry row with a waiting PASS verdict, then drive the SHIPPED
+  # watcher verdict-consumption path (_review_gate_step, sourced from agent-watch.sh in lib mode) and
+  # assert the pane is CLOSED afterward — the fix for the 2026-07-08 incident where a reviewer session
+  # sat idle 30+ min after its verdict was read. Exercises the real herdr pane close via the driver seam.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step reviewpane "reviewer pane is retired on verdict consumption (shipped path, real pane)"
+    RV_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    RV_PANE="$(printf '%s' "$RV_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    [ -n "$RV_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); herdr pane rename "$RV_PANE" "review·rp-builder" >/dev/null 2>&1 || true; }
+    # Confirm the review pane actually exists before we assert it later disappears (non-vacuous).
+    _rv_present() {
+      pane_json "$WSID" | RVP="$1" python3 -c '
+import sys,json,os
+rvp=os.environ["RVP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==rvp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    if [ -n "$RV_PANE" ] && [ "$(_rv_present "$RV_PANE")" = yes ]; then
+      # Isolated trees + registry row + a waiting PASS verdict for a synthetic (pr,sha).
+      RVT="$ART/reviewtrees"; mkdir -p "$RVT/.herd"
+      RV_PR=555; RV_SHA="rvsha555"; RV_SLUG="rp-builder"
+      RV_JOURNAL="$ART/rv-journal.jsonl"; : > "$RV_JOURNAL"
+      printf '%s %s\n' "$$" "$RV_PANE" > "$RVT/.review-registry-$RV_PR-$RV_SHA"
+      printf 'REVIEW: PASS\n'          > "$RVT/.review-result-$RV_PR-$RV_SHA"
+      # Drive the SHIPPED verdict-consumption path in a subshell so agent-watch.sh's globals/functions
+      # never clobber this scenario's. HERD_DRIVER defaults to herdr-claude → a REAL `herdr pane close`.
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$RVT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-reviewpane-sim" JOURNAL_FILE="$RV_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        v="$(_review_gate_step "$RV_PR" "$RV_SLUG" "$RV_SHA" 2>/dev/null)"
+        [ "$v" = "PASS" ] || exit 4
+      ) ; RV_RC=$?
+      # Give herdr a beat to reflect the close, then assert the pane is GONE, the registry row was
+      # dropped, and the retirement was journaled.
+      _rv_gone="no"; _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_rv_present "$RV_PANE")" = no ] && { _rv_gone=yes; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _rv_reg_dropped=no; [ ! -f "$RVT/.review-registry-$RV_PR-$RV_SHA" ] && _rv_reg_dropped=yes
+      _rv_journaled=no; grep -q '"event":"reviewer_pane_retired"' "$RV_JOURNAL" 2>/dev/null && _rv_journaled=yes
+      if [ "$RV_RC" = 0 ] && [ "$_rv_gone" = yes ] && [ "$_rv_reg_dropped" = yes ] && [ "$_rv_journaled" = yes ]; then
+        checkpoint reviewer_pane_retired_on_verdict pass \
+          "review pane $RV_PANE closed on verdict consumption; registry row dropped; reviewer_pane_retired journaled"
+      else
+        checkpoint reviewer_pane_retired_on_verdict fail \
+          "pane not retired as expected (gate_rc=$RV_RC pane_gone=$_rv_gone reg_dropped=$_rv_reg_dropped journaled=$_rv_journaled)"
+      fi
+    else
+      checkpoint reviewer_pane_retired_on_verdict fail "could not stand up the review split pane (RV_PANE='$RV_PANE')"
+    fi
   fi
 
   # ── CLEAN TEARDOWN: close the disposable workspace; assert nothing leaks ────────────────────────

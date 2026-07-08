@@ -115,6 +115,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic tab-leak-guard worktree-slug whitelist (HERD-115) test passes" {
+  run bash "$REPO/tests/test-tab-leak-worktree-whitelist.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic builder-secrets-isolation test passes" {
   run bash "$REPO/tests/test-builder-secrets-isolation.sh"
   [ "$status" -eq 0 ]
@@ -133,6 +139,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic mid-flight advisor (HERD-101) test passes" {
+  run bash "$REPO/tests/test-advise.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-mode codemap test passes" {
   run bash "$REPO/tests/test-codemap-project.sh"
   [ "$status" -eq 0 ]
@@ -141,6 +153,12 @@ setup() {
 
 @test "hermetic dependency-aware spawn queue (HERD-94) test passes" {
   run bash "$REPO/tests/test-spawn-queue-deps.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic reviewer-pane lifecycle (HERD-113) test passes" {
+  run bash "$REPO/tests/test-reviewer-pane-lifecycle.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

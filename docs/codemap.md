@@ -25,6 +25,7 @@ Role summarized from each file's top-of-file comment.
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
 - `healthcheck.sh` — healthcheck.sh <worktree-dir> [--oneline] [--heavy|--light|--auto] — is the change clean?
+- `herd-advise.sh` — herd-advise.sh "<question>" [context…] — a MID-FLIGHT strong-model ADVISOR a builder calls for a
 - `herd-approve.sh` — approval entry-point for MERGE_POLICY=approve.
 - `herd-claim.sh` — atomic-ish work-item claiming (HERD-50). Sourced by the builder lanes
 - `herd-config.sh` — source this from any scripts/herd/* script to load the consuming
@@ -39,6 +40,7 @@ Role summarized from each file's top-of-file comment.
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
 - `journal.sh` — the herdkit engine journal: an append-only JSONL record of every key gate event
 - `layout-reconcile.sh` — the shared EYES-ON-LAYOUT helper for the herd control room.
+- `ledger.sh` — the COORDINATOR PROGRESS LEDGER (HERD-103): durable, cross-session coordinator state so
 - `new-feature.sh` — new-feature.sh <name> — spin up an isolated worktree off the latest default branch.
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
@@ -81,12 +83,14 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`
 - `healthcheck.sh` → `herd-config.sh`
+- `herd-advise.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
 - `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
 - `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
 - `herd-review.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
+- `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
 - `research-get.sh` → `herd-config.sh`
 - `research-step.sh` → `herd-config.sh`
@@ -143,6 +147,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`
+- `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
 - `MODEL_ESCALATE_GLOB` → `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `herd-feature.sh`, `herd-quick.sh`
@@ -180,4 +185,4 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `fleet.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `new-feature.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `tracker-state-sweep.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `fleet.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `tracker-state-sweep.sh`
