@@ -9,19 +9,29 @@ capability	proof_kind	proof_ref
 #
 # Columns:
 #   capability   MUST match column 1 of templates/capabilities.tsv EXACTLY (the join key).
-#   proof_kind   unit | sim | render — how the proof exercises the capability.
-#                  unit   = a hermetic tests/*.sh (or *.bats) the healthcheck suite already runs.
-#                  sim    = a scenario/simulation harness under tests/ (fidelity-ladder sims).
-#                  render = a template/skill render assertion (the coordinator/hook render surface).
-#   proof_ref    repo-root-relative path to the proof. `run --kind unit` executes it as `bash <ref>`.
+#   proof_kind   unit | sim | render | none-yet — how the proof exercises the capability.
+#                  unit     = a hermetic tests/*.sh (or *.bats) the healthcheck suite already runs.
+#                  sim      = a scenario/simulation harness under tests/ (fidelity-ladder sims); the
+#                             proof_ref is the tests/test-sandbox-*.sh that DRIVES the scenario.
+#                  render   = a template/skill render assertion (the coordinator/hook render surface).
+#                  none-yet = NO proof exists YET. The third column is a free-text NOTE (not a path):
+#                             a one-line "unit|sim: no test asserts <behavior>". A none-yet row is NEVER
+#                             existence-checked and NEVER rots — it keeps the capability an explicit,
+#                             noted gap instead of an invisible one.
+#   proof_ref    repo-root-relative path to the proof (unit|sim|render), OR the note text (none-yet).
+#                `run --kind unit` executes a unit ref as `bash <ref>`; none-yet rows are skipped.
 #
-# A capability may carry SEVERAL rows (several proofs); it is MAPPED when at least one proof_ref exists,
-# GAP when it has no rows at all, and its individual missing-ref rows surface as ROT. UNMAPPED rows are
-# NOT listed here — that is the point: the gap report derives them from capabilities.tsv MINUS this file,
-# so they surface LOUDLY as none-yet rather than being silently omitted.
+# A capability may carry SEVERAL rows (several proofs). Its status in `herd conformance report`:
+#   MAPPED   — ≥1 real proof_ref (unit|sim|render) that EXISTS.
+#   ROT      — real proof rows but NONE of their refs exist (a dangling ref; drives a non-zero exit).
+#   NONE-YET — only none-yet note row(s): an explicit, documented missing-proof gap.
+#   UNMAPPED — NO row at all. The no-new-unmapped RATCHET: once every capability is backfilled, an
+#              unmapped row means a capability was ADDED since mapping began without a proof or a note —
+#              surfaced as a LOUD ADVISORY (never a gate). Add a proof row or a none-yet note to clear it.
 #
-# SEED (HERD-144): the config-key family only, so the gap report starts HONEST — every other capability
-# reads as an explicit gap until its own proof mapping lands. Grow this file as coverage is claimed.
+# BACKFILL (HERD-152): every capabilities.tsv row now carries either a real proof or a none-yet note, so
+# the report's unmapped count is ~0 and the ratchet catches only genuinely new, unproven capabilities.
+# Grow this file as coverage is claimed: when a none-yet's proof lands, replace the note row with it.
 herd config <list|get|set>	unit	tests/test-cli-config.sh
 herd config <list|get|set>	unit	tests/test-config-local-overlay.sh
 herd config <list|get|set>	unit	tests/test-cli-config-sync.sh
@@ -36,3 +46,198 @@ APP_PREVIEW_SERVER_ARGS	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_PATH	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_PORT_BASE	unit	tests/test-app-preview-config.sh
+#
+# ── BACKFILL wave 1 (HERD-152): every remaining capability, mapped or noted ──────────────────────
+herd init	unit	tests/test-cli.sh
+herd init	unit	tests/test-stack-aware-init.sh
+herd init	unit	tests/test-init-grounding-interview.sh
+herd doctor	unit	tests/test-doctor.sh
+herd upgrade	unit	tests/test-cli.sh
+herd upgrade	unit	tests/test-upgrade-migrations.sh
+herd upgrade	unit	tests/test-upgrade-config-adoption.sh
+herd render	unit	tests/test-cli.sh
+herd codemap	unit	tests/test-codemap.sh
+herd symbol-index	unit	tests/test-symbol-index.sh
+herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
+herd advise "<question>" [context…]	unit	tests/test-advise.sh
+herd reload	unit	tests/test-cli-reload.sh
+herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
+herd update [--force]	unit	tests/test-cli-update.sh
+herd log [--pr N] [--tail]	unit	tests/test-journal.sh
+herd why <pr#>	unit	tests/test-journal.sh
+herd status	unit	tests/test-status.sh
+herd cost [--pr N]	unit	tests/test-cost.sh
+herd backlog	unit	tests/test-cli-backlog.sh
+herd backend switch	unit	tests/test-cli-backend-switch.sh
+herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
+herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-links.sh
+herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-dispatch-deps.sh
+herd link list	unit	tests/test-cli-links.sh
+herd depend <link>#<id>	unit	tests/test-dispatch-deps.sh
+herd deps <list|rm|demote>	unit	tests/test-dispatch-deps.sh
+herd governance <export|apply>	unit	tests/test-governance-profiles.sh
+herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet.sh
+herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-digest.sh
+herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-inbox.sh
+herd governance hooks render [--shared]	unit	tests/test-governance-hooks-render.sh
+fleet.sh	unit	tests/test-fleet.sh
+fleet.sh	unit	tests/test-fleet-discover.sh
+fleet.sh	unit	tests/test-fleet-digest.sh
+herd-feature.sh	unit	tests/test-scoped-builder-verification.sh
+herd-feature.sh	unit	tests/test-flow-preference.sh
+herd-feature.sh	unit	tests/test-app-preview-config.sh
+herd-quick.sh	unit	tests/test-scoped-builder-verification.sh
+herd-quick.sh	unit	tests/test-flow-preference.sh
+herd-quick.sh	unit	tests/test-context-provision.sh
+herd-resolve.sh	sim	tests/test-sandbox-resolver-respawn.sh
+herd-resolve.sh	unit	tests/test-model-flags.sh
+herd-approve.sh	unit	tests/test-human-verify-hold.sh
+herd-approve.sh	unit	tests/test-approval-purge.sh
+herd-approve.sh	unit	tests/test-human-verify-policy.sh
+push-gate.sh	sim	tests/test-sandbox-governance.sh
+governance-hook.sh	unit	tests/test-governance-hooks-render.sh
+steps.sh	sim	tests/test-sandbox-sim.sh
+herd-approve.sh why <pr#>	unit	tests/test-review-visibility.sh
+herd-approve.sh override <pr#>	unit	tests/test-review-visibility.sh
+dep-watcher.sh	unit	tests/test-dep-watcher.sh
+dep-watcher.sh	unit	tests/test-dep-states.sh
+dep-watcher.sh	unit	tests/test-dispatch-deps.sh
+coordinator.sh	unit	tests/test-launch-binding-guard.sh
+coordinator.sh	unit	tests/test-model-flags.sh
+coordinator.sh	unit	tests/test-utf8-control-room.sh
+research.sh	none-yet	unit: no test invokes research.sh; test-research-step.sh drives research-step.sh, never research.sh's enqueue/REQ_ID
+research-get.sh	unit	tests/test-research-step.sh
+scribe.sh	unit	tests/test-scribe-linger.sh
+scribe.sh	unit	tests/test-scribe-intent-dispatch.sh
+scribe.sh	unit	tests/test-scribe-backend-flip.sh
+spawn.sh	unit	tests/test-spawn-queue-drain.sh
+spawn.sh	unit	tests/test-tracked-spawns.sh
+spawn.sh	unit	tests/test-spawn-queue-deps.sh
+spawn-step.sh	unit	tests/test-tracked-spawns.sh
+spawn-step.sh	unit	tests/test-spawn-queue-drain.sh
+spawn-step.sh	unit	tests/test-spawn-queue-deps.sh
+backlog-reconcile.sh	unit	tests/test-backlog-reconcile.sh
+backlog-reconcile-sweep.sh	unit	tests/test-backlog-reconcile-sweep.sh
+governance-drift-sweep.sh	unit	tests/test-governance-drift.sh
+agent-watch.sh	unit	tests/test-human-verify-hold.sh
+agent-watch.sh	unit	tests/test-healthcheck-gate.sh
+agent-watch.sh	unit	tests/test-merge-policy.sh
+herd-review.sh	unit	tests/test-correctness-only-block.sh
+herd-review.sh	unit	tests/test-review-verdict-integrity.sh
+herd-review.sh	unit	tests/test-structured-block-verdict.sh
+PROJECT_ROOT	unit	tests/test-launch-binding-guard.sh
+WORKTREES_DIR	unit	tests/test-branch-template.sh
+WORKTREES_DIR	unit	tests/test-builder-secrets-isolation.sh
+DEFAULT_BRANCH	none-yet	unit: no test isolates DEFAULT_BRANCH's fork/PR-base/diff-base effect (it is fixed plumbing set to origin/main, never varied)
+WORKSPACE_NAME	unit	tests/test-de-brand-output.sh
+WORKSPACE_NAME	unit	tests/test-launch-binding-guard.sh
+BACKLOG_FILE	unit	tests/test-backend-file.sh
+BACKLOG_FILE	unit	tests/test-backend-changelog.sh
+SCRIBE_BACKEND	unit	tests/test-scribe-backend-flip.sh
+SCRIBE_LINGER_SECS	unit	tests/test-scribe-linger.sh
+DRAINER_HEARTBEAT_TIMEOUT	unit	tests/test-drainer-liveness.sh
+BACKLOG_VIEW_EXTRAS	unit	tests/test-backlog-view-extras.sh
+SHARE_LINKS	unit	tests/test-builder-secrets-isolation.sh
+MODEL_COORDINATOR	unit	tests/test-model-flags.sh
+MODEL_COORDINATOR	unit	tests/test-token-mode.sh
+MODEL_COORDINATOR	unit	tests/test-eco-starter-defaults.sh
+MODEL_FEATURE	unit	tests/test-token-mode.sh
+MODEL_FEATURE	unit	tests/test-eco-starter-defaults.sh
+MODEL_QUICK	unit	tests/test-token-mode.sh
+MODEL_QUICK	unit	tests/test-eco-starter-defaults.sh
+MODEL_SCRIBE	unit	tests/test-token-mode.sh
+MODEL_RESEARCH	unit	tests/test-token-mode.sh
+MODEL_REVIEW	unit	tests/test-token-mode.sh
+MODEL_REVIEW	unit	tests/test-eco-starter-defaults.sh
+MODEL_RESOLVER	unit	tests/test-model-flags.sh
+MODEL_RESOLVER	unit	tests/test-token-mode.sh
+MODEL_ADVISE	unit	tests/test-advise.sh
+TOKEN_MODE	unit	tests/test-token-mode.sh
+TOKEN_MODE	unit	tests/test-eco-starter-defaults.sh
+HEALTHCHECK_CMD	unit	tests/test-healthcheck-interaction.sh
+HEALTHCHECK_HEAVY_GLOB	none-yet	unit: no test drives --auto with a glob pattern to assert the heavy-vs-light profile selection (only ever set blank)
+APP_SURFACE_GLOB	unit	tests/test-healthcheck-interaction.sh
+INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh
+SMOKE_CMD	none-yet	unit: no test asserts herd-resolve.sh runs $SMOKE_CMD before push (real consumer, zero test references)
+DENY_PATHS	none-yet	unit: no test asserts scribe/lane path-scoping away from DENY_PATHS (only the config-set refusal is tested)
+REVIEW_CHECKLIST	none-yet	unit: no test asserts the checklist injection into the pre-merge review gate (herd-review.sh)
+COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
+HERD_DRIVER	render	tests/test-driver-abstraction.sh
+HERD_DRIVER	unit	tests/test-headless-driver.sh
+HERD_VERSION	unit	tests/test-upgrade-migrations.sh
+HERD_REPO	unit	tests/test-report-repo-guard.sh
+WATCHER_AUTOMERGE	unit	tests/test-merge-policy.sh
+MERGE_POLICY	unit	tests/test-merge-policy.sh
+HUMAN_VERIFY_POLICY	unit	tests/test-human-verify-policy.sh
+MERGE_METHOD	unit	tests/test-merge-policy.sh
+PR_FLOW	unit	tests/test-flow-preference.sh
+PR_READY_WHEN	unit	tests/test-flow-preference.sh
+PUSH_GATE	sim	tests/test-sandbox-governance.sh
+DELETE_BRANCH_ON_MERGE	none-yet	unit: no test asserts branch deletion after merge; only the init default write is tested
+LOCAL_REVIEW	unit	tests/test-local-review-prepr.sh
+CONTEXT_PROVISION	unit	tests/test-context-provision.sh
+WATCHER_VIEW	unit	tests/test-watcher-views.sh
+WATCHER_VIEW_AUTHOR	unit	tests/test-watcher-views.sh
+WATCHER_VIEW_ASSIGNEE	unit	tests/test-watcher-views.sh
+WATCHER_VIEW_LABEL	unit	tests/test-watcher-views.sh
+WATCHER_VIEW_STATUS	unit	tests/test-watcher-views.sh
+WATCHER_VIEW_DEPS_LABEL	unit	tests/test-watcher-views.sh
+WATCHER_SCOPE	unit	tests/test-team-mode.sh
+WATCHER_OWNER	unit	tests/test-team-mode.sh
+REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
+REVIEW_CONCURRENCY	unit	tests/test-gate-dispatch.sh
+SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
+HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
+GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
+INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
+INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
+REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
+REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
+MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
+WATCHER_FLAIR	unit	tests/test-watcher-flair.sh
+MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh
+REVIEW_ESCALATE_GLOB	unit	tests/test-risk-tiered-review.sh
+REVIEW_MODEL_CHEAP	unit	tests/test-risk-tiered-review.sh
+REVIEW_ESCALATE_MAXFILES	unit	tests/test-risk-tiered-review.sh
+DOCS_ONLY_GLOB	unit	tests/test-risk-tiered-review.sh
+REVIEW_MODEL_DOCS	unit	tests/test-risk-tiered-review.sh
+DEP_POLL_MIN	unit	tests/test-dep-states.sh
+DEP_POLL_MAX	unit	tests/test-dep-states.sh
+DEP_STALE_TTL	unit	tests/test-dep-states.sh
+.herd/links	unit	tests/test-cli-links.sh
+.herd/deps	unit	tests/test-dep-watcher.sh
+.herd/secrets	unit	tests/test-cli-backend-switch.sh
+.herd/secrets	unit	tests/test-builder-secrets-isolation.sh
+HUMAN-VERIFY:	unit	tests/test-human-verify-hold.sh
+herd-watch-<workspace>	unit	tests/test-cli-reload.sh
+HERD_REQUIRE_PROJECT_CONFIG	unit	tests/test-launch-binding-guard.sh
+HERD_ALLOW_FOREIGN_CWD	unit	tests/test-launch-binding-guard.sh
+scripts/herd/cost.sh	unit	tests/test-cost.sh
+.herd-limit-sentinel	unit	tests/test-limit-resume.sh
+.herd-limit-sentinel	sim	tests/test-sandbox-limit-resume.sh
+HERD_LIMIT_HOOK	unit	tests/test-limit-resume.sh
+HERD_LIMIT_DETECT	unit	tests/test-limit-resume.sh
+HERD_LIMIT_DETECT	sim	tests/test-sandbox-limit-resume.sh
+HERD_FORCE_SPAWN	unit	tests/test-spawn-rate-match.sh
+HERD_FORCE_SPAWN	unit	tests/test-tracked-spawns.sh
+HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
+HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
+HERD_LIMIT_UNKNOWN_WAIT	none-yet	unit: no test references HERD_LIMIT_UNKNOWN_WAIT or asserts the unparseable-reset blind-resume wait
+COORDINATOR_WATCHDOG	unit	tests/test-coordinator-watchdog.sh
+DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh
+scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
+TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh
+DOCTOR_STARTUP_HINT	unit	tests/test-doctor-point-of-need.sh
+scripts/herd/task-spec-view.sh	unit	tests/test-task-spec-pane.sh
+HERD_THEME	unit	tests/test-theme.sh
+scripts/herd/theme.sh	unit	tests/test-theme.sh
+.herd/themes	unit	tests/test-theme.sh
+CLAIM_REQUIRED	unit	tests/test-claim.sh
+TRACKED_SPAWNS	unit	tests/test-tracked-spawns.sh
+herd-claim.sh	unit	tests/test-claim.sh
+MCP_PROVISION	unit	tests/test-mcp-provision.sh
+GRAPHIFY_BIN	unit	tests/test-init-grounding-interview.sh
+GRAPHIFY_BIN	unit	tests/test-codemap-project.sh
+.herd/steps.tsv	sim	tests/test-sandbox-sim.sh
+herd conformance <report|run>	unit	tests/test-conformance.sh
