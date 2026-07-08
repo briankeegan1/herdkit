@@ -4650,6 +4650,21 @@ _watcher_tick_fields() {
 # the live watch loop. Direct execution runs the loop normally.
 if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
+# ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
+# The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
+# run (the dogfood healthcheck, or any test) may set HERD_HERMETIC_GUARD to a log-file path; any
+# watcher that reaches this point — spawned via cmd_reload's pane-run/background fallback, `herd pane
+# watch`, herd-watch.sh, coordinator.sh, or direct execution — records the leak and EXITS BEFORE the
+# argv0 re-exec and the loop. So a test that forgot to stub a watcher spawn is caught LOUDLY (the
+# healthcheck fails on a non-empty log) instead of silently leaving a real daemon behind. This is the
+# single choke point every launch path funnels through. INERT in production: with the var unset this
+# is byte-identical to before (the real console-room watcher never sets it).
+if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
+  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
+    >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
+  exit 0
+fi
+
 # ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
 # Re-exec ONCE under a distinctive per-workspace argv0 ($HERD_WATCH_ARGV0, e.g. herd-watch-<slug>)
 # so the process table shows which workspace this watcher serves. Without it, two projects' watchers
