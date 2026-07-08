@@ -2519,7 +2519,7 @@ cmd_backend() {
   local sub="${1:-}"; [ "$#" -gt 0 ] && shift
   case "$sub" in
     switch) cmd_backend_switch "$@" ;;
-    *) die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate] [--yes]" ;;
+    *) die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate] [--yes]" ;;
   esac
 }
 
@@ -2534,7 +2534,7 @@ cmd_backend_switch() {
     esac
     shift
   done
-  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]"
+  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate]"
 
   # Load the project (mirrors cmd_backlog's loader).
   local root; root="$(pwd)"
@@ -2586,6 +2586,46 @@ cmd_backend_switch() {
       command -v gh >/dev/null 2>&1 || die "github backend needs the gh CLI — install it first; nothing was changed"
       gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth login') — nothing was changed"
       say "✓ gh authenticated"
+      ;;
+    jira)
+      # Basic-auth creds live in .herd/secrets ONLY (gitignored, never .herd/config). Prompt for any
+      # missing one on a tty (stored chmod 600 + gitignored, token hidden); fail loud off a tty.
+      if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+        if [ -t 0 ]; then
+          touch "$secrets" && chmod 600 "$secrets"
+          local gi="$PROJECT_ROOT/.gitignore"
+          if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
+            printf '.herd/secrets\n' >> "$gi"
+          fi
+          if [ -z "${JIRA_BASE_URL:-}" ]; then
+            printf 'Jira base URL (e.g. https://acme.atlassian.net): ' >&2
+            local _url=""; IFS= read -r _url </dev/tty || true
+            [ -n "$_url" ] || die "no base URL entered — nothing was changed"
+            printf 'JIRA_BASE_URL="%s"\n' "$_url" >> "$secrets"; JIRA_BASE_URL="$_url"; export JIRA_BASE_URL
+          fi
+          if [ -z "${JIRA_EMAIL:-}" ]; then
+            printf 'Jira account email: ' >&2
+            local _email=""; IFS= read -r _email </dev/tty || true
+            [ -n "$_email" ] || die "no email entered — nothing was changed"
+            printf 'JIRA_EMAIL="%s"\n' "$_email" >> "$secrets"; JIRA_EMAIL="$_email"; export JIRA_EMAIL
+          fi
+          if [ -z "${JIRA_API_TOKEN:-}" ]; then
+            printf 'Jira API token (stored in %s, gitignored; input hidden): ' "$secrets" >&2
+            local _tok=""; IFS= read -rs _tok </dev/tty || true; printf '\n' >&2
+            [ -n "$_tok" ] || die "no token entered — nothing was changed"
+            printf 'JIRA_API_TOKEN="%s"\n' "$_tok" >> "$secrets"; JIRA_API_TOKEN="$_tok"; export JIRA_API_TOKEN
+          fi
+        else
+          die "JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN missing — add them to $secrets (gitignored) and re-run; nothing was changed"
+        fi
+      fi
+      # Live round-trip: prove the creds work before touching config. /myself is the cheapest
+      # authenticated call; any error/HTML/empty response fails the grep.
+      # shellcheck source=/dev/null
+      . "$target_file"
+      _jira_api GET /rest/api/3/myself 2>/dev/null | grep -q '"accountId"' \
+        || die "Jira API round-trip FAILED (bad creds or network) — nothing was changed"
+      say "✓ Jira API reachable (myself check passed)"
       ;;
   esac
 
@@ -4832,10 +4872,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
               [show <#id>]            one item's full detail (state, description, URL)
               [browse]                interactive fzf picker with a live detail preview
                                       (soft-degrades to the plain list without fzf)
-  herd backend switch <name>          guided work-tracker switch (file|github|linear|changelog):
+  herd backend switch <name>          guided work-tracker switch (file|github|linear|jira|changelog):
               [--migrate|--no-migrate]  preflight creds FIRST (linear: prompts for the API key on
-                                      a tty → .herd/secrets + live viewer{} check; github: gh
-                                      auth) — a failed preflight changes nothing; then flips
+                                      a tty → .herd/secrets + live viewer{} check; jira: prompts
+                                      for base URL/email/token → .herd/secrets + live /myself
+                                      check; github: gh auth) — a failed preflight changes
+                                      nothing; then flips
                                       SCRIBE_BACKEND via config set, optionally replays the old
                                       backend's open items into the new one (idempotent), stamps
                                       a frozen-archive banner on BACKLOG.md when leaving the file

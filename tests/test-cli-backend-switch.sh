@@ -11,8 +11,11 @@
 #      suffix (✅ lines are NOT migrated), BACKLOG.md gains the FROZEN ARCHIVE banner exactly once.
 #   2. idempotence: re-running the same switch is a no-op ("already on").
 #   3. failed preflight changes NOTHING: linear without a key (non-tty) dies loudly and the
-#      config still says github; unauthenticated gh dies the same way from file.
+#      config still says github; unauthenticated gh dies the same way from file; jira without creds
+#      dies too. curl is FAKED for the jira /myself round-trip.
 #   4. unknown backend name dies before any change.
+#   5. file → jira with creds: the /myself round-trip passes (fake curl), the config flips and the
+#      frozen-archive banner is stamped; a jira round-trip that FAILS leaves the config on file.
 #
 # Run:  bash tests/test-cli-backend-switch.sh
 set -uo pipefail
@@ -41,6 +44,17 @@ exit 0
 FAKE
 chmod +x "$BIN/gh"
 
+# FAKE curl: the jira preflight round-trip (_jira_api GET /myself) posts through curl. Log args and
+# return a myself payload (honoring $CURL_FAKE_FAIL to simulate a bad-cred/network round-trip).
+CURLLOG="$T/curl.log"
+cat > "$BIN/curl" <<'FAKE'
+#!/usr/bin/env bash
+echo "curl $*" >> "$CURL_FAKE_LOG"
+[ "${CURL_FAKE_FAIL:-0}" = "1" ] && { echo '{"errorMessages":["Unauthorized"]}'; exit 0; }
+echo '{"accountId":"acc_1","displayName":"Herd Bot"}'
+FAKE
+chmod +x "$BIN/curl"
+
 # Temp project on the file backend with a mixed backlog.
 P="$T/proj"; mkdir -p "$P/.herd"
 cat > "$P/.herd/config" <<EOF
@@ -61,7 +75,7 @@ cat > "$P/BACKLOG.md" <<'EOF'
 - ✅ already done (must NOT migrate)
 EOF
 
-run_switch(){ ( cd "$P" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" "$@" bash "$HERD" backend switch "${ARGS[@]}" </dev/null 2>&1 ); }
+run_switch(){ ( cd "$P" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" CURL_FAKE_LOG="$CURLLOG" "$@" bash "$HERD" backend switch "${ARGS[@]}" </dev/null 2>&1 ); }
 
 # ── Case 1: file → github --migrate ─────────────────────────────────────────────────────────────
 # The target repo ALREADY has: issue #7 whose title merely CONTAINS an old item's title (the
@@ -115,10 +129,60 @@ fi
 grep -q 'SCRIBE_BACKEND="file"' "$P2/.herd/config" || fail "failed gh preflight must leave the config on file"
 pass
 
-# ── Case 4: unknown backend dies before any change ──────────────────────────────────────────────
+# ── Case 3c: jira without creds (non-tty) → loud death, config unchanged ────────────────────────
 ARGS=(jira)
+out3c="$(run_switch)" && fail "jira switch without creds must die"
+grep -q 'JIRA_' <<<"$out3c" || fail "jira no-creds death must name the missing JIRA_* keys ($out3c)"
+grep -q 'SCRIBE_BACKEND="github"' "$P/.herd/config" || fail "failed jira preflight must leave the config UNCHANGED"
+pass
+
+# ── Case 4: unknown backend dies before any change ──────────────────────────────────────────────
+ARGS=(zzz-nope)
 if run_switch >/dev/null; then fail "unknown backend must die"; fi
 grep -q 'SCRIBE_BACKEND="github"' "$P/.herd/config" || fail "unknown-backend attempt must not touch the config"
+pass
+
+# ── Case 5: file → jira with creds present → preflight round-trip passes, config flips, frozen banner
+#    stamped. Creds live in .herd/secrets (sourced by the switch); the fake curl proves the /myself
+#    round-trip without a real network.
+P3="$T/proj3"; mkdir -p "$P3/.herd" "$T/trees3"
+cat > "$P3/.herd/config" <<EOF
+PROJECT_ROOT="$P3"
+WORKSPACE_NAME="testws3"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$T/trees3"
+EOF
+cat > "$P3/.herd/secrets" <<'EOF'
+JIRA_BASE_URL="https://acme.atlassian.net"
+JIRA_EMAIL="bot@acme.io"
+JIRA_API_TOKEN="jira_test_token"
+JIRA_PROJECT_KEY="ENG"
+EOF
+: > "$P3/BACKLOG.md"
+: > "$CURLLOG"
+out5="$( cd "$P3" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" CURL_FAKE_LOG="$CURLLOG" bash "$HERD" backend switch jira --no-migrate </dev/null 2>&1 )" \
+  || fail "file→jira switch exited non-zero: $out5"
+grep -q 'SCRIBE_BACKEND="jira"' "$P3/.herd/config" || fail "config was not flipped to jira ($out5)"
+grep -q "myself" "$CURLLOG" || fail "jira preflight did not perform the live /myself round-trip"
+grep -q "FROZEN ARCHIVE" "$P3/BACKLOG.md" || fail "leaving the file backend must stamp the frozen-archive banner"
+pass
+
+# ── Case 5b: file → jira whose round-trip FAILS (bad creds) → loud death, config stays on file ───
+P4="$T/proj4"; mkdir -p "$P4/.herd" "$T/trees4"
+cat > "$P4/.herd/config" <<EOF
+PROJECT_ROOT="$P4"
+WORKSPACE_NAME="testws4"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$T/trees4"
+EOF
+cp "$P3/.herd/secrets" "$P4/.herd/secrets"
+: > "$P4/BACKLOG.md"
+if ( cd "$P4" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" CURL_FAKE_LOG="$CURLLOG" CURL_FAKE_FAIL=1 bash "$HERD" backend switch jira </dev/null ) >/dev/null 2>&1; then
+  fail "jira switch whose /myself round-trip fails must die"
+fi
+grep -q 'SCRIBE_BACKEND="file"' "$P4/.herd/config" || fail "failed jira round-trip must leave the config on file"
 pass
 
 echo "ALL PASS ($PASS checks)"
