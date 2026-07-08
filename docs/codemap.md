@@ -25,6 +25,7 @@ Role summarized from each file's top-of-file comment.
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
 - `healthcheck.sh` — healthcheck.sh <worktree-dir> [--oneline] [--heavy|--light|--auto] — is the change clean?
+- `herd-advise.sh` — herd-advise.sh "<question>" [context…] — a MID-FLIGHT strong-model ADVISOR a builder calls for a
 - `herd-approve.sh` — approval entry-point for MERGE_POLICY=approve.
 - `herd-claim.sh` — atomic-ish work-item claiming (HERD-50). Sourced by the builder lanes
 - `herd-config.sh` — source this from any scripts/herd/* script to load the consuming
@@ -82,6 +83,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`
 - `healthcheck.sh` → `herd-config.sh`
+- `herd-advise.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
 - `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`
@@ -145,6 +147,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`
+- `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
 - `MODEL_ESCALATE_GLOB` → `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `herd-feature.sh`, `herd-quick.sh`
