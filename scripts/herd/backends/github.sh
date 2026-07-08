@@ -161,6 +161,27 @@ _backend_update_state() {
     _backend_tw_journal "$ref" "$want" "$_BACKEND_RESULT"   # HERD-85 attribution
 }
 
+_backend_amend() {
+    # $1 = item ref (issue number, "#42", or a title to search); $2 = the note to post.
+    # HERD-128 AMEND: attach a clarification/comment to an EXISTING issue via `gh issue comment` —
+    # first-class, WITHOUT touching the issue's state (open/closed) or its title. Conservative: no
+    # matching issue → NOCHANGE + a LOUD reason (skip-over-guess), nothing posted. Sets
+    # _BACKEND_RESULT=DONE|NOCHANGE.
+    local ref="$1" note="$2" num
+    _BACKEND_RESULT="NOCHANGE"
+    _github_require_gh
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then
+        echo "github backend: no open issue matching '$ref' — nothing to amend (skipping, not posting)" >&2
+        _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution (records the attempt)
+        return 0
+    fi
+    if _gh issue comment "$num" --body "$note" >/dev/null 2>&1; then
+        _BACKEND_RESULT="DONE"
+    fi
+    _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution
+}
+
 _backend_list_open() {
     # Print open issues as one "#<number> <title>" line each — the same human-readable one-line
     # shape the file/changelog backends emit, so the coordinator's issue-source reads them alike.

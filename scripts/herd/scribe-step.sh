@@ -18,6 +18,12 @@
 #                          via _backend_update_state instead of filing a new issue — the second
 #                          half of the intent-dispatch fix (gh #139): a "mark X done" / watcher
 #                          "Reconcile: PR #N merged …" request must NOT become a brand-new issue.
+#   amend <path> <ref> <note>
+#                          HERD-128: append a clarification/comment to an EXISTING item WITHOUT
+#                          touching its state or title. file backend appends an indented dated
+#                          "↳ note" line under the item's BACKLOG.md entry; linear/github post an
+#                          issue comment; a backend with no amend op fails soft (skip, nothing
+#                          posted). Ambiguous/unmatched <ref> → loud SKIP (skip-over-guess).
 #   skip <path> "<why>"    The drainer classified the request as unmappable to any backend verb:
 #                          record a LOUD line in the scribe report and drop the claim, filing
 #                          NOTHING (never a junk new issue).
@@ -181,6 +187,34 @@ case "$cmd" in
     [ "$_BACKEND_RESULT" = "DONE" ] || sum="$sum (no matching item — nothing changed)"
     _report_and_cleanup "$mine" "$sum" "${_BACKEND_RESULT:-NOCHANGE}"
     ;;
+  amend)
+    # First-class AMEND (HERD-128): append a clarification/comment to an EXISTING item WITHOUT
+    # changing its state or title. The drainer classified the request as "append this note to item
+    # <ref>". Unlike update-state this is supported by EVERY backend that defines the op, INCLUDING
+    # file (the append is mechanical + deterministic, so scribe-step owns it rather than the drainer's
+    # creative edit): linear/github post an issue comment; the file backend appends an indented dated
+    # "↳ note" line under the item's BACKLOG.md entry. An ambiguous or unmatched <ref> is a LOUD SKIP
+    # (skip-over-guess) — NOTHING is posted. Every amend journals a tracker_write requested=amend
+    # (component=scribe) via the backend's _backend_tw_journal (HERD-85 attribution contract).
+    mine="${2:?claimed path}"; ref="${3:?item ref}"; note="${4:?note text}"
+    cd "$REPO" || exit 1
+    if ! command -v _backend_amend >/dev/null 2>&1; then
+      # A backend with no amend op (e.g. changelog — an append-only tracker with no per-item comment
+      # surface). FAIL-SOFT: print a soft note and record a skip; never file or post anything.
+      echo "scribe-step: backend '$SCRIBE_BACKEND' has no amend op — cannot attach a note to '$ref' (skipping, nothing posted)" >&2
+      _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): amend $ref — backend '$SCRIBE_BACKEND' has no amend op" "SKIP"
+      exit 0
+    fi
+    _BACKEND_RESULT=""
+    _backend_amend "$ref" "$note"
+    if [ "$_BACKEND_RESULT" = "DONE" ]; then
+      _report_and_cleanup "$mine" "↳ amended $ref" "DONE"
+    else
+      # No unique matching item (ambiguous or not found): the backend already warned loudly on stderr
+      # and posted nothing. Record a SKIP so the report is honest — never a silent no-op.
+      _report_and_cleanup "$mine" "⚠️ SKIPPED (not posted): amend $ref — no unique matching item (ambiguous or not found)" "SKIP"
+    fi
+    ;;
   skip)
     # The drainer classified the request as unmappable to any backend verb (neither a NEW item nor a
     # state change). Record it LOUDLY in the scribe report and drop the claim — NEVER file it as a new
@@ -195,5 +229,5 @@ case "$cmd" in
     [ -n "${SCRIBE_TAB:-}" ] && herdr tab close "$SCRIBE_TAB" >/dev/null 2>&1 || true
     echo "STOP"
     ;;
-  *) echo "usage: scribe-step.sh next | commit <path> <sum> | add-item <path> <text> | update-state <path> <ref> <state> | skip <path> <why> | finish" >&2; exit 2 ;;
+  *) echo "usage: scribe-step.sh next | commit <path> <sum> | add-item <path> <text> | update-state <path> <ref> <state> | amend <path> <ref> <note> | skip <path> <why> | finish" >&2; exit 2 ;;
 esac
