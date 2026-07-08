@@ -855,8 +855,14 @@ _retire_reviewer_pane() {
   [ -f "$reg" ] || return 0
   read -r pid pane < "$reg" 2>/dev/null || true
   if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
-    herd_driver_close_pane "$pane"
-    journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+    # GUARDED CLOSE (HERD-134): the registry pane id can be stale/recycled and now name the BUILDER (or
+    # another neighbour) sharing this tab. Verify the pane is still a reviewer BEFORE closing; on a
+    # mismatch the guard REFUSES and journals pane_close_refused, so we journal reviewer_pane_retired
+    # ONLY on a real close. The registry row is dropped unconditionally below either way — a row that
+    # pointed at the wrong pane must not linger to be retried.
+    if herd_close_pane_verified "$pane" "review·"; then
+      journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+    fi
   fi
   rm -f "$reg" 2>/dev/null || true
 }
