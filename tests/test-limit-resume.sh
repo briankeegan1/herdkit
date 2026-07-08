@@ -136,9 +136,9 @@ r="$(_detect_limit_hit "lim-a" "$WT_A")" || fail "3a: sentinel present should de
 [ "$r" = "4000000000" ] || fail "3a: numeric-epoch reset should pass through (got '$r')"
 ok
 
-# 3b. Banner-scrape fallback: no sentinel, last assistant line is the usage-limit banner.
+# 3b. Banner-scrape fallback: no sentinel, last assistant line is the real usage-limit BANNER shape.
 WT_B="$T/trees/lim-b"; mkdir -p "$WT_B"
-mk_transcript "$WT_B" "You have hit your usage limit - resets 7:30pm"
+mk_transcript "$WT_B" "You have hit your usage limit - resets at 7:30pm"
 r="$(_detect_limit_hit "lim-b" "$WT_B")" || fail "3b: banner in transcript should detect (return 0)"
 ok
 
@@ -146,6 +146,19 @@ ok
 WT_C="$T/trees/lim-c"; mkdir -p "$WT_C"
 mk_transcript "$WT_C" "All done, opening a PR now."
 r="$(_detect_limit_hit "lim-c" "$WT_C")" && fail "3c: clean transcript must not detect a limit"
+ok
+
+# 3c-immune (HERD-155 F4). This repo's builders BUILD limit features, so a builder's own output
+# DISCUSSES usage/session limits. The banner-scrape must NOT self-trigger on such discussion — it must
+# require the banner SHAPE ("limit reached" / "limit will reset at <time>"), not the bare phrase.
+WT_CI="$T/trees/lim-ci"; mkdir -p "$WT_CI"
+mk_transcript "$WT_CI" "I hardened the usage-limit auto-resume actuator and added session limit handling; the reset scheduler now anchors on the banner."
+r="$(_detect_limit_hit "lim-ci" "$WT_CI")" && fail "3c-immune: a builder DISCUSSING usage limits must not be detected as a limit hit"
+ok
+# The genuine banner IS still detected (positive control for the tightened matcher).
+_text_is_limit_banner "Claude usage limit reached. Your limit will reset at 3pm." || fail "3c-immune: the real banner shape must still match"
+ok
+_text_is_limit_banner "I added a usage limit handler to the session limit module." && fail "3c-immune: mere discussion must NOT match the banner shape"
 ok
 
 # 3d. HERD_LIMIT_DETECT=off kill-switch → never detects even with a sentinel.
@@ -157,6 +170,20 @@ ok
 ok
 [ -z "$(_parse_reset_epoch "no time here at all")" ] || fail "3e: text with no time must yield empty"
 ok
+# 3e-anchor (HERD-155 F3). A clock time is trusted ONLY inside an anchored "reset at/in" context — a
+# stray digit anywhere else (a JSON stdin blob, a token count) must NEVER be misparsed as a reset time.
+export HERD_NOW_EPOCH=1000000
+[ -n "$(_parse_reset_epoch "Your limit will reset at 7:30pm")" ] || fail "3e-anchor: an anchored 'reset at 7:30pm' must parse"
+ok
+[ -z "$(_parse_reset_epoch '{"session_id":"a1","n_tokens":8,"duration":42}')" ] || fail "3e-anchor: a JSON blob with stray digits must NOT parse a reset time"
+ok
+[ -z "$(_parse_reset_epoch "2 files changed, 7 insertions at line 30")" ] || fail "3e-anchor: unrelated numbers (no reset anchor) must not parse"
+ok
+[ -z "$(_parse_reset_epoch "your limit will reset in 5 hours")" ] || fail "3e-anchor: a bare 'reset in N hours' duration (no clock) must fall to unknown-wait (empty)"
+ok
+[ -n "$(_parse_reset_epoch "reset at 19:30 tonight")" ] || fail "3e-anchor: a 24h clock after the anchor must parse"
+ok
+unset HERD_NOW_EPOCH
 
 # ── (4) Scheduler _handle_limit_blocked ──────────────────────────────────────
 rm -f "$LIMIT_STATE" "$JOURNAL_FILE"
@@ -280,5 +307,68 @@ WT_OFF="$T/wt-off"; mkdir -p "$WT_OFF"
 HERD_LIMIT_HOOK=off herd_write_ratelimit_hook "$WT_OFF"
 [ ! -f "$WT_OFF/.claude/settings.json" ] || fail "6: HERD_LIMIT_HOOK=off must not write a hook"
 ok
+
+# 6-writer (HERD-155 F3): the hook COMMAND must extract the banner TEXT from a JSON stdin blob, NOT
+# write the raw blob (whose stray numeric fields would misparse as a reset time). Execute the exact
+# command the writer installed against realistic stdin and inspect what lands in the sentinel.
+HOOK_CMD="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print([h["command"] for e in d["hooks"]["StopFailure"] if e.get("matcher")=="rate_limit" for h in e["hooks"]][0])' "$S")"
+printf '%s' '{"session_id":"abc","transcript_path":"/x.jsonl","reason":"Claude usage limit reached. Your limit will reset at 7:30pm.","n_tokens":48213}' | bash -c "$HOOK_CMD"
+SENT="$WT_H/.herd-limit-sentinel"
+grep -q "reset at 7:30pm" "$SENT" || fail "6-writer: the sentinel must capture the reset banner text (got: $(cat "$SENT"))"
+ok
+grep -q "session_id" "$SENT" && fail "6-writer: the sentinel must NOT contain the raw JSON stdin blob (got: $(cat "$SENT"))"
+ok
+# Its extracted text round-trips through the anchored parser to a real epoch (no misparse from n_tokens=48213).
+export HERD_NOW_EPOCH=1000000
+[ -n "$(_parse_reset_epoch "$(cat "$SENT")")" ] || fail "6-writer: the captured banner must parse to a reset epoch"
+ok
+# A blob with NO limit/reset phrase → empty sentinel (still marks the hit → unknown-wait), never a stray digit.
+printf '%s' '{"session_id":"9999999999","n_tokens":42,"stop_hook_active":true}' | bash -c "$HOOK_CMD"
+[ ! -s "$SENT" ] || fail "6-writer: a reset-less blob must yield an EMPTY sentinel, not a numeric field (got: $(cat "$SENT"))"
+ok
+unset HERD_NOW_EPOCH
+
+# ── (7) HERD-155 F4: a working builder's stale sentinel is cleared unconditionally ───────────────
+# The tick's working-branch now calls clear_limit + clear_sendkeys UNCONDITIONALLY (not gated on an
+# existing ledger row), so a sentinel left behind with NO ledger record can never re-trigger a false
+# park on a later idle tick. Verify the clear removes a record-less sentinel and detection then fails.
+WT_W="$T/trees/lim-w"; mkdir -p "$WT_W"
+rm -f "$LIMIT_STATE" "$SENDKEYS_STATE"
+printf '4000000000' > "$(_limit_sentinel_file "$WT_W")"
+[ -z "$(limit_state "lim-w")" ] || fail "7: precondition — no ledger record for lim-w"
+_detect_limit_hit "lim-w" "$WT_W" >/dev/null || fail "7: precondition — the stale sentinel is detectable before the clear"
+clear_limit "lim-w" "$WT_W"; clear_sendkeys "lim-w"   # what the working-tick branch now does unconditionally
+[ ! -f "$(_limit_sentinel_file "$WT_W")" ] || fail "7: a working tick must remove the stale sentinel even with no ledger record"
+ok
+_detect_limit_hit "lim-w" "$WT_W" && fail "7: after the clear, a later tick must NOT re-detect a phantom limit"
+ok
+
+# ── (8) HERD-155 F5: a LIMIT-PARKED post-PR builder is never typed into by the auto-refix bounce ──
+# A builder that hit the usage limit AFTER opening its PR is parked at the limit menu. The review-block
+# bounce must NOT `herdr pane run` the fix prompt into that menu — it must route to the park/resume
+# handler instead (schedule the resume; leave refix-once unburned so the bounce fires once it is back).
+rm -f "$REFIX_STATE" "$LIMIT_STATE" "$SENDKEYS_STATE"; : > "$PANE_LOG"; : > "$JOURNAL_FILE"
+export HERD_NOW_EPOCH=1000000
+WT_PK="$T/trees/fix-parked"; mkdir -p "$WT_PK"
+printf '4000000000' > "$(_limit_sentinel_file "$WT_PK")"   # future reset → schedules a hold, no immediate resume
+export STUB_AGENT_NAME="fix-parked" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-PK"
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+# The F5 limit guard sits at the TOP of the REVIEW_AUTOFIX block — ahead of the provenance/round
+# checks — so a parked builder is diverted before any refix bookkeeping runs.
+_handle_block_verdict "80" "fix-parked" "sha-80" "0" "$WT_PK"
+[ ! -s "$PANE_LOG" ] || fail "8: a limit-parked builder must NOT be typed a refix prompt (log: $(cat "$PANE_LOG"))"
+ok
+[ "$(limit_state "fix-parked")" = "scheduled" ] || fail "8: a limit-parked builder must be routed to the scheduled resume path"
+ok
+refix_attempted "80" "sha-80" && fail "8: refix-once must NOT be burned while the builder is limit-parked"
+ok
+grep -q '"event":"refix_deferred_limit"' "$JOURNAL_FILE" || fail "8: the deferral must be journaled refix_deferred_limit"
+ok
+d="${DISPLAY[0]:-}"
+printf '%s\n' "$d" | grep -q "limit-hit" || fail "8: the row must show the limit-hold, not a refix row (got: $d)"
+ok
+unset HERD_NOW_EPOCH
 
 echo "ALL PASS ($pass checks)"

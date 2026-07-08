@@ -2622,12 +2622,27 @@ _wait_agent_working() {
 # Always updates DISPLAY[<idx>]; calls render internally before the blocking wait so the user sees
 # "refixing" while the bounce is in progress.
 _handle_block_verdict() {
-  local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
+  local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4" _hbv_wt="${5:-}"
   local _hbv_sl _hbv_pn _hbv_live
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
+    # HARDENING (HERD-155 F5): NEVER pane-run a re-task prompt into a LIMIT-PARKED builder. A builder
+    # that hit the account usage limit AFTER opening its PR is parked at the limit arrow-menu (or a
+    # frozen session); the bounce below types the fix prompt via `herdr pane run`, which would land in
+    # the menu — exactly the keystroke-into-a-menu hazard this change closes. Consult the SAME limit
+    # detector the idle path uses and, on a hit, route to the park/resume handler (surface the hold +
+    # schedule the resume) instead of typing. refix-once is NOT burned, so the bounce fires normally
+    # once the builder is back. Inert when the worktree is unknown or there is no limit signal.
+    if [ -n "$_hbv_wt" ]; then
+      local _hbv_lreset
+      if _hbv_lreset="$(_detect_limit_hit "$_hbv_slug" "$_hbv_wt")"; then
+        journal_append refix_deferred_limit pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" reset_at "${_hbv_lreset:-0}"
+        _handle_limit_blocked "$_hbv_slug" "$_hbv_wt" "$_hbv_idx" "${_hbv_lreset:-0}"
+        return 0
+      fi
+    fi
     # SAFETY GATE: only a REVIEWER-BACKED block may bounce a builder. A gate-generated default
     # verdict (or any non-reviewer provenance) carries no actionable finding — bouncing on it
     # sends the builder a "fix" prompt with nothing to fix (2026-07-02 incident: a no-verdict
@@ -2797,6 +2812,17 @@ except Exception:
 _resume_builder() {
   local _rb_slug="$1" _rb_wt="$2" _rb_pane="$3" _rb_prompt="${4:-continue}"
   [ -n "$_rb_pane" ] || return 1
+  # HARDENING (HERD-155 F1): NEVER type `cd … && claude --continue` into a pane still parked at the
+  # limit ARROW-MENU — the command line would be captured as MENU input (worst case: it lands on
+  # "Upgrade your plan" and strands the session at a login screen). The `--continue` backstop is only
+  # valid for a session that has actually ENDED (a normal REPL). Fire ONLY when a menu is NOT CONFIRMED
+  # present; a confirmed menu means the clean-select degraded, so REFUSE and let the CALLER escalate
+  # (record 'failed' + loud row / notification) rather than type blind. Empty/blind read → not a menu
+  # → proceed (headless & pane-less environments keep working, backstop unchanged).
+  if _pane_menu_confirmed "$_rb_pane"; then
+    journal_append limit_resume_refused slug "$_rb_slug" pane "$_rb_pane" reason menu_parked
+    return 1
+  fi
   local _rb_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
   # cd into the worktree so `claude --continue` resumes THAT worktree's session even if the pane's
   # shell drifted; the explicit path also makes the invocation shape assertable in the hermetic tests.
@@ -2870,11 +2896,22 @@ _parse_reset_epoch() {
 import os, re, sys, datetime
 text = os.environ.get("HERD_RESET_TEXT", "")
 now = int(os.environ.get("HERD_RESET_NOW", "0") or 0)
-m = re.fullmatch(r"\s*(\d{9,})\s*", text)      # an already-numeric epoch (hook may write one)
+m = re.fullmatch(r"\s*(\d{9,})\s*", text)      # a WHOLE-string numeric epoch (hook may write one)
 if m:
     sys.stdout.write(m.group(1)); sys.exit(0)
-m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", text, re.I)   # 7:30pm / 7pm / 19:30
+# HERD-155 F3: require an ANCHORED "reset at/in" context before trusting any clock time. A stray 1-2
+# digit number floating anywhere in the text — a JSON stdin blob, a token count, a session-id fragment,
+# a "2 files changed" from a builder discussing limits — must NEVER be misread as a reset clock, which
+# would schedule a bogus resume. Only parse a time that FOLLOWS the anchor.
+am = re.search(r"reset[s]?\s+(?:at|in)\b(.*)", text, re.I | re.S)
+if not am:
+    sys.exit(0)
+m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", am.group(1), re.I)   # reset at 7:30pm / 7pm / 19:30
 if not m:
+    sys.exit(0)
+# Demand a REAL clock token: an am/pm marker OR an explicit :MM. A bare integer after the anchor
+# ("reset in 5 hours") is a DURATION, not a wall-clock time — don't guess it; fall to unknown-wait.
+if not (m.group(3) or m.group(2)):
     sys.exit(0)
 hh = int(m.group(1)); mm = int(m.group(2) or 0); ap = (m.group(3) or "").lower()
 if ap == "pm" and hh != 12: hh += 12
@@ -2887,6 +2924,17 @@ if cand.timestamp() <= now:            # already passed today → the next day's
     cand += datetime.timedelta(days=1)
 sys.stdout.write(str(int(cand.timestamp())))
 PY
+}
+
+# _text_is_limit_banner <text> — 0 iff <text> looks like Claude's actual usage-limit BANNER, not a
+# builder merely DISCUSSING usage limits. HERD-155 F4: this repo's builders BUILD limit features, so
+# the bare phrase "usage limit" shows up in perfectly normal assistant output (task specs, PR bodies,
+# code comments — this very sentence). The banner-scrape FALLBACK must key on the banner SHAPE — a
+# "limit reached" / "limit will reset at <time>" status line — never the bare phrase, or the watcher
+# self-triggers a phantom park on a limit-feature builder's own words. The hook sentinel (primary
+# signal) is unaffected; this only tightens the transcript fallback.
+_text_is_limit_banner() {
+  printf '%s' "$1" | grep -qiE '(usage|session|[0-9]+-?hour) limit reached|your (usage |session )?limit will reset|reached your (usage|session) limit|limit[^.]{0,40}reset[s]? (at|in) '
 }
 
 # _detect_limit_hit <slug> <worktree> — is this builder blocked on the account usage limit?
@@ -2905,7 +2953,7 @@ _detect_limit_hit() {
     printf '%s' "${_dl_reset:-0}"; return 0
   fi
   _dl_text="$(_transcript_last_assistant_text "$_dl_wt")"
-  if [ -n "$_dl_text" ] && printf '%s' "$_dl_text" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit'; then
+  if [ -n "$_dl_text" ] && _text_is_limit_banner "$_dl_text"; then
     _dl_reset="$(_parse_reset_epoch "$_dl_text")"
     printf '%s' "${_dl_reset:-0}"; return 0
   fi
@@ -3015,6 +3063,46 @@ _pane_shows_limit_menu() {
   printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
 }
 
+# ── Shared actuator surface-guards (HERD-155): never a keystroke without VERIFIED pane content ──────
+# The two guards below read the pane and confirm the EXPECTED surface before/after acting. They fail
+# in OPPOSITE directions on purpose, because the two actuators they protect need opposite safe defaults.
+#
+# _pane_menu_confirmed <pane_id> — 0 ONLY on POSITIVE evidence: a NON-EMPTY pane read whose content
+# matches the usage-limit arrow-menu. Unlike _pane_shows_limit_menu (which fails SAFE toward "still
+# parked" so a blind read never declares the clean-select a false SUCCESS), this REQUIRES evidence and
+# returns 1 on an empty/blind read. Used by the two guards that must only act on a CONFIRMED menu:
+#   • BEFORE a menu-select keystroke — send "Down Enter" ONLY when the menu is confirmed present, so a
+#     stray keystroke is never typed into a normal REPL / unknown surface.
+#   • BEFORE a `claude --continue` prompt — REFUSE only when a menu is confirmed present, so the
+#     backstop still fires where the pane can't be read (empty read → not-a-menu → proceed).
+_pane_menu_confirmed() {
+  local _pmc_pane="$1" _pmc_txt
+  [ -n "$_pmc_pane" ] || return 1
+  _pmc_txt="$(herd_driver_read_pane "$_pmc_pane" visible)"
+  [ -n "$_pmc_txt" ] || return 1   # no evidence → NOT confirmed a menu
+  printf '%s' "$_pmc_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
+}
+
+# _pane_confirms_limit_wait <pane_id> [slug] — the DISTINCT post-select outcome check. "Menu gone" is
+# NOT success: selecting option 1 ("Upgrade your plan") ALSO clears the menu but strands the session at
+# a login/upgrade screen — a disaster we must never misreport as a clean resume. Success requires
+# POSITIVE evidence the WAIT/RESUME path was taken:
+#   • the agent flipped to "working" (native auto-resume kicked straight in), OR
+#   • the pane shows Claude's native limit-wait / working surface (a parked "waiting for reset" banner
+#     or the working spinner) AND shows neither the menu options nor an upgrade/login surface.
+# Fails SAFE: an empty/blind read, a residual menu, or an upgrade/login surface → 1 (outcome
+# UNVERIFIED → caller journals limit_menu_outcome_unverified and keeps the scheduled backstop).
+_pane_confirms_limit_wait() {
+  local _pw_pane="$1" _pw_slug="${2:-}" _pw_txt
+  [ -n "$_pw_slug" ] && [ "$(_agent_status "$_pw_slug")" = "working" ] && return 0
+  _pw_txt="$(herd_driver_read_pane "$_pw_pane" visible)"
+  [ -n "$_pw_txt" ] || return 1                                            # no evidence → unverified
+  # Wrong selection (option 1) or a still-present menu OPTION line → never a success.
+  printf '%s' "$_pw_txt" | grep -qiE 'Upgrade your plan|Stop and wait|/login|Sign ?in|Choose .*plan' && return 1
+  # Positive wait/working evidence that the "stop and wait" path took.
+  printf '%s' "$_pw_txt" | grep -qiE 'waiting.*(reset|limit)|limit.*will reset|resuming|auto-resume|esc to interrupt|Claude is working|working[.…]'
+}
+
 # _try_clean_limit_menu_select <slug> <worktree> [pane_id] — the CLEAN limit-resume path. Sends the
 # menu-select keystrokes (Down, Enter) via `herdr pane send-keys` to pick "Stop and wait for limit to
 # reset" — handing the wait to Claude's NATIVE auto-resume — then VERIFIES the menu is gone by
@@ -3036,13 +3124,25 @@ _try_clean_limit_menu_select() {
   [ "${#_cs_keys[@]}" -gt 0 ] || return 1
   _cs_max="${HERD_LIMIT_MENU_ATTEMPTS:-2}"; case "$_cs_max" in ''|*[!0-9]*) _cs_max=2 ;; esac
   for (( _cs_i=1; _cs_i<=_cs_max; _cs_i++ )); do
+    # HARDENING (HERD-155 F2, before): confirm the EXPECTED surface — the limit menu — is actually
+    # present BEFORE sending any keystroke, so a stray "Down Enter" is never typed into a normal REPL
+    # or an unknown/blind surface. On unexpected content, journal + bail (never type on no evidence).
+    if ! _pane_menu_confirmed "$_cs_pane"; then
+      journal_append limit_menu_absent slug "$_cs_slug" pane "$_cs_pane" attempt "$_cs_i"
+      return 1
+    fi
     herd_driver_send_keys "$_cs_pane" "${_cs_keys[@]}"
-    if ! _pane_shows_limit_menu "$_cs_pane"; then
+    # HARDENING (HERD-155 F2, after): verify the SPECIFIC expected OUTCOME — positive evidence the
+    # wait/resume path was selected (agent working, or a native limit-wait banner) — NOT merely
+    # "the menu text is gone" (option 1 clears the menu too, straight into an upgrade/login screen).
+    if _pane_confirms_limit_wait "$_cs_pane" "$_cs_slug"; then
       journal_append limit_menu_selected slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempt "$_cs_i"
       return 0
     fi
   done
-  journal_append limit_menu_select_failed slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempts "$_cs_max"
+  # Keys were sent but the wait/resume outcome could not be confirmed — do NOT claim a clean select.
+  # The caller keeps the scheduled `claude --continue` backstop (which itself refuses a still-menu pane).
+  journal_append limit_menu_outcome_unverified slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempts "$_cs_max"
   return 1
 }
 
@@ -4630,8 +4730,11 @@ EOF
         fi
       else
         # A working agent means any earlier limit hold has cleared (a human intervened, or the
-        # scheduled resume flipped it working) — drop a stale limit record + sentinel, then classify.
-        [ -n "$(limit_state "$slug")" ] && clear_limit "$slug" "$dir"
+        # scheduled resume flipped it working). HERD-155 F4: a working agent is DEFINITIVELY not
+        # limit-parked, so clear the ledger record AND any stale hook sentinel UNCONDITIONALLY (both
+        # clears no-op when absent) — a leftover sentinel must never survive to re-trigger a false park
+        # on a later idle tick. Also drop any stale clean-select record (the same singleton could re-park).
+        clear_limit "$slug" "$dir"; clear_sendkeys "$slug"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
@@ -4810,7 +4913,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         # Human override recorded for this sha — treat as PASS and proceed to merge path.
         prior="PASS"
       else
-        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
+        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
         render
         continue
       fi
@@ -4823,7 +4926,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       case "$step" in
         PASS) : ;;  # verdict just collected + recorded — fall through to the merge path
         BLOCK)
-          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
+          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
           render
           continue ;;
         QUEUED)
