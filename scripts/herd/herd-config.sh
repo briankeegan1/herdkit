@@ -357,6 +357,14 @@ fi
 : "${INTERACTION_TEST_CMD:=""}"   # command that drives widgets and asserts dependent output changes; exit 0 clean, 1 code error, 2 data/env
 : "${SMOKE_CMD:=""}"              # optional resolver smoke gate
 
+# ATTRIBUTION_POLICY — commit-attribution lint gate (HERD-121). Ships dormant: default ''
+# (empty) → lint absent, byte-identical to before. Set to no-ai-coauthor to scan the PR's
+# commits (git log <DEFAULT_BRANCH>..HEAD) for AI co-author markers (Co-Authored-By: Claude*,
+# 'Generated with Claude' lines) and fail as a healthcheck code-error naming the offending
+# sha+line. The 'Never co-author Claude' rule in AGENTS.md is advisory prose without this;
+# with it set the healthcheck enforces it deterministically and cannot be silently violated.
+: "${ATTRIBUTION_POLICY:=""}"     # '' (default, off) | no-ai-coauthor
+
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
 : "${REVIEW_CHECKLIST:=""}"     # project risk list injected into the review gate
 
