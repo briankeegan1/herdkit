@@ -150,14 +150,38 @@ fi
 # is byte-for-byte unchanged and the ONLY correctness review is the watcher's post-PR gate. When
 # LOCAL_REVIEW=pre-pr the builder must run herd-review.sh --local against its worktree diff and get a
 # 'REVIEW: PASS' BEFORE opening the PR (a BLOCK → fix locally + re-review), so a correctness bug is
-# caught before the PR is public. Unknown values fall back to none. Resolved here (not in
+# caught before the PR is public. LOCAL_REVIEW=risk-scoped (HERD-100) does the SAME but only when the
+# builder's diff surface matches LOCAL_REVIEW_GLOB — low-risk diffs skip straight to the PR, so scarce
+# review quota is spent only where round-1 BLOCKs actually cluster (the watcher's post-PR gate stays
+# authoritative for the skipped diffs). Unknown values fall back to none. Resolved here (not in
 # herd-config.sh) so the builder prompt is the only surface threaded — same pattern as PR_FLOW above.
-_local_review="${LOCAL_REVIEW:-none}"; case "$_local_review" in pre-pr) ;; *) _local_review="none" ;; esac
-if [ "$_local_review" = "pre-pr" ]; then
-  LOCAL_REVIEW_RULE=" Then, before running '$PR_CREATE_CMD', you MUST pass a LOCAL adversarial correctness review of your worktree diff: run  bash $HERE/herd-review.sh --local \"$SLUG\"  and proceed to open the PR ONLY on a final 'REVIEW: PASS' line. On 'REVIEW: BLOCK — <reason>', FIX the issue in this worktree and re-run the local review until it PASSes — do NOT open the PR while it BLOCKs."
-else
-  LOCAL_REVIEW_RULE=""
+_local_review="${LOCAL_REVIEW:-none}"; case "$_local_review" in pre-pr|risk-scoped) ;; *) _local_review="none" ;; esac
+# risk-scoped needs a USABLE glob. FAIL-SOFT toward always-review (mirrors the HEALTHCHECK_HEAVY_GLOB
+# hardening in healthcheck.sh): an EMPTY glob, or one that is not a valid egrep (probe against empty
+# input — a valid pattern exits 0/1, an invalid one ≥2), degrades LOUDLY to unconditional pre-pr so a
+# misconfigured glob can only OVER-review, never silently skip a review it should have run.
+_lr_glob="${LOCAL_REVIEW_GLOB:-}"
+if [ "$_local_review" = "risk-scoped" ]; then
+  if [ -z "$_lr_glob" ]; then
+    echo "⚠️  LOCAL_REVIEW=risk-scoped but LOCAL_REVIEW_GLOB is empty — falling back to unconditional pre-pr local review." >&2
+    _local_review="pre-pr"
+  else
+    # Probe validity against empty input; capture rc WITHOUT tripping `set -e` (valid-no-match = 1).
+    _lr_probe=0; grep -qE "$_lr_glob" </dev/null 2>/dev/null || _lr_probe=$?
+    if [ "$_lr_probe" -ge 2 ]; then
+      echo "⚠️  invalid LOCAL_REVIEW_GLOB regex (falling back to unconditional pre-pr local review): $_lr_glob" >&2
+      _local_review="pre-pr"
+    fi
+  fi
 fi
+case "$_local_review" in
+  pre-pr)
+    LOCAL_REVIEW_RULE=" Then, before running '$PR_CREATE_CMD', you MUST pass a LOCAL adversarial correctness review of your worktree diff: run  bash $HERE/herd-review.sh --local \"$SLUG\"  and proceed to open the PR ONLY on a final 'REVIEW: PASS' line. On 'REVIEW: BLOCK — <reason>', FIX the issue in this worktree and re-run the local review until it PASSes — do NOT open the PR while it BLOCKs." ;;
+  risk-scoped)
+    LOCAL_REVIEW_RULE=" Then, before running '$PR_CREATE_CMD', RISK-SCOPE a local correctness review to your diff surface: list your changed files with  git diff ${DEFAULT_BRANCH}...HEAD --name-only  and test them (egrep) against the risk pattern  $_lr_glob . IF ANY changed path matches, you MUST pass a LOCAL adversarial correctness review before opening the PR: run  bash $HERE/herd-review.sh --local \"$SLUG\"  and proceed ONLY on a final 'REVIEW: PASS' line — on 'REVIEW: BLOCK — <reason>', FIX it in this worktree and re-run the local review until it PASSes; do NOT open the PR while it BLOCKs. IF NO changed path matches, your diff is low-risk: SKIP the local review and open the PR directly — the watcher's post-PR review gate still reviews it authoritatively." ;;
+  *)
+    LOCAL_REVIEW_RULE="" ;;
+esac
 
 # PUSH_GATE=human (HERD-123) — hold this FINISHED builder for human review BEFORE anything reaches
 # GitHub (gate-then-upload). SAFE DEFAULT: PUSH_GATE unset/'' → PUSH_GATE_RULE empty, rules text

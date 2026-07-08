@@ -356,6 +356,26 @@ fi
 # DOCS_ONLY_GLOB is blank.
 : "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
+# ── Risk-scoped pre-PR local review (LOCAL_REVIEW=risk-scoped + LOCAL_REVIEW_GLOB, HERD-100) ──────
+# LOCAL_REVIEW=pre-pr makes EVERY builder run the cheap local adversarial correctness review before
+# it opens its PR. Journal analysis shows round-1 review BLOCKs cluster on the high-churn engine
+# files, so a BLANKET pre-PR review wastes quota reviewing low-risk diffs that never block. The
+# risk-scoped mode fixes that: LOCAL_REVIEW=risk-scoped runs the local review ONLY when the builder's
+# OWN diff surface (git diff DEFAULT_BRANCH...HEAD --name-only) matches this egrep pattern; a diff
+# that touches no matching path skips straight to the PR (the watcher's post-PR review gate is
+# UNCHANGED and remains the authoritative correctness check, so a skipped low-risk pre-PR review is a
+# cost saving, never a safety hole — same fail-open-is-safe rationale as skipping is backstopped
+# post-PR). A DEDICATED key (not a reuse of REVIEW_ESCALATE_GLOB) on purpose: the PRE-PR risk surface
+# — where builder-side round-1 BLOCKs cluster — is chosen independently of the POST-PR review-tiering
+# surface, so operators can scope the two separately; leave it equal to REVIEW_ESCALATE_GLOB if the
+# same pattern fits both. Reuses REVIEW_ESCALATE_GLOB / HEALTHCHECK_HEAVY_GLOB egrep semantics.
+# SAFE DEFAULT: EMPTY (default) → dormant. Only LOCAL_REVIEW=risk-scoped consults it; with pre-pr or
+# none the key is inert. FAIL-SOFT (mirrors the HEALTHCHECK_HEAVY_GLOB hardening): risk-scoped with an
+# EMPTY or INVALID glob falls back — LOUDLY — to unconditional pre-pr (review everything), never to a
+# silent skip, so a misconfigured glob can only OVER-review, never UNDER-review. Consumed inline by
+# herd-quick.sh / herd-feature.sh (the builder prompt is the only surface threaded), same as LOCAL_REVIEW.
+: "${LOCAL_REVIEW_GLOB:=""}"
+
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')
@@ -400,6 +420,19 @@ fi
 : "${PUSH_GATE:=""}"              # '' (default, off) | human
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
+# NATIVE_BURST (HERD-107) — off (default) | on. The master switch for the bounded read-only FAN-OUT
+# seam (scripts/herd/burst.sh). OFF → today's EXACT serial behavior, byte-identical: the research
+# drainer's Explore fan-out is un-hinted and the review runs as a single reviewer. ON → read-only work
+# (repo research, the review PANEL) may BURST — fan out several CONCURRENT calls bounded by
+# REVIEW_CONCURRENCY (the ceiling) — while WRITE lanes (scribe/backlog/merge) stay strictly serial.
+# Purely additive + config-gated; unknown/blank → off (fail safe). Consumed by research.sh + herd-review.sh.
+: "${NATIVE_BURST:="off"}"       # off (default) | on — see capabilities.tsv / burst.sh
+# REVIEW_PANEL (HERD-107) — how many CONCURRENT read-only reviewer passes the pre-merge review runs
+# over the SAME diff when NATIVE_BURST=on (a bounded "review panel": more eyes catch more bugs). The
+# effective panel size is min(REVIEW_PANEL, REVIEW_CONCURRENCY). Default 1 → a single reviewer, i.e.
+# today's byte-identical behavior (the panel only engages at >1 AND with NATIVE_BURST=on). Combination
+# is fail-safe: ANY member's BLOCK blocks the merge; a merge needs at least one PASS and zero BLOCKs.
+: "${REVIEW_PANEL:="1"}"         # concurrent reviewer passes when NATIVE_BURST=on (default 1 = single reviewer)
 # SPAWN_AHEAD — advisory spawn-rate lead over the review gate (herd-spawn-gate.sh, sourced by the
 # lanes). When the review pipeline is saturated (live+queued reviews ≥ REVIEW_CONCURRENCY), a lane
 # HOLDS a new spawn once in-flight builders already exceed REVIEW_CONCURRENCY + SPAWN_AHEAD — so the
@@ -430,6 +463,16 @@ fi
 # is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
 : "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
 : "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
+# Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
+# before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
+# claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang
+# it cannot see. When armed, the watcher probes `claude --version` under a HARD timeout ONCE per tick
+# before dispatching; a timeout HOLDS review/refix for that tick with a loud row + a journal infra_event
+# (the doctor's own `claude responds` probe reports the same hang at diagnosis time). 0 = OFF (byte-inert;
+# no probe exec, no journal, behavior byte-identical); N>=1 = probe timeout in seconds. Consumed by
+# agent-watch.sh. Only a genuine timeout counts as a hang — a broken/absent claude is fail-soft (never
+# holds the queue). A small value like 5 is a conservative arm for unattended runs.
+: "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
