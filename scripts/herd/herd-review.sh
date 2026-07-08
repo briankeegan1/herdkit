@@ -366,13 +366,46 @@ if [ -z "$_agent_result_file" ]; then
 fi
 [ -n "$_agent_result_file" ] || emit_infra_fail "could not allocate agent temp file (mktemp failed)"
 
+# _consume_nearmiss_verdict — belt-and-braces for HERD-133 (PR #249's reviewer wrote its verdict to
+# 'herd-review-agent-249-Iw1smh.' — the expected path plus the trailing sentence period — so the
+# wrapper polled the dotless path for the full 1800s, declared an infra timeout, and double-dispatched
+# a second review). Before the poll loop gives up, look for a result file that is a NEAR-MISS of the
+# expected path: the exact path with a suffix made up ENTIRELY of trailing dots and/or whitespace (the
+# ways a model folds following punctuation into an unquoted filename). If exactly such a file holds a
+# parseable verdict, adopt it. Sets _nearmiss_verdict + _nearmiss_path and returns 0 on a hit; returns
+# 1 (leaving both empty) when there is no near-miss. Fail-soft: a glob that matches nothing, or a
+# candidate with no verdict, simply yields no hit. The exact-path flow never calls this (the poll loop
+# returns first on the exact file), so the normal path stays byte-identical.
+_nearmiss_verdict="" _nearmiss_path=""
+_consume_nearmiss_verdict() {
+  _nearmiss_verdict="" _nearmiss_path=""
+  [ -n "${_agent_result_file:-}" ] || return 1
+  local _cand _suffix _v
+  for _cand in "${_agent_result_file}"*; do
+    # nullglob is off: an unmatched glob yields the literal pattern, which is not a real file.
+    [ -f "$_cand" ] || continue
+    # Skip the exact path itself (empty, still being polled) — only true near-misses qualify.
+    [ "$_cand" = "$_agent_result_file" ] && continue
+    _suffix="${_cand#"$_agent_result_file"}"
+    # The extra suffix must be ONLY trailing dots/spaces/tabs — never a different file that merely
+    # shares this prefix. Strip those chars; a non-empty remainder means it is a distinct file.
+    [ -z "${_suffix//[$' \t.']/}" ] || continue
+    _v="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_cand" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+    if [ -n "$_v" ]; then
+      _nearmiss_verdict="$_v"; _nearmiss_path="$_cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Agent-pane task: same correctness rules as TASK, but the final instruction tells the agent to
 # WRITE the verdict to $_agent_result_file (not just print it). The agent runs in the TUI so the
 # human sees genuine Opus reasoning in the builder's tab; the result file is how herd-review.sh
 # (polling in the background) captures the machine verdict.
 # Prompt-cache-aware ordering (see the TASK note above): STABLE preamble + checklist + RULES lead;
 # the UNIQUE per-PR content (PR number, slug, and the private result-file path) TRAILS.
-AGENT_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The ONLY writes you may do are: ONE 'gh pr comment <PR> --body \"…\"' and the result-file write described in rule 5. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) Post a brief PR comment summarizing your findings via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: the blocking bug + why it's wrong, or the PASS rationale; then list any ADVISORY style/hardening findings separately as clearly-labelled NON-BLOCKING notes). (5) FINALLY, as your absolute LAST action, write the machine verdict the merge gate reads — this step is MANDATORY — by running exactly one of these commands. To BLOCK (only when you have at least one CORRECTNESS finding), a STRUCTURED verdict of exactly this shape: printf 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>\n' > '<RESULT_FILE>' (three ' | '-separated fields — rule, why, location — parsed by a machine). Otherwise PASS: printf 'REVIEW: PASS\n' > '<RESULT_FILE>' when you found NO issues, or printf 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>\n' > '<RESULT_FILE>' when you found ONLY advisory (non-correctness) issues (one ' advisory:' segment per finding), where <RESULT_FILE> is the path given below. Do not skip this step. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'. The <RESULT_FILE> path for rule 5 is: ${_agent_result_file}."
+AGENT_TASK="You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project '${WORKSPACE_NAME}', where a SILENTLY WRONG result is the worst outcome (it doesn't crash, it just produces bad output/data). Your ONLY job: read the diff of the pull request under review (with 'gh pr diff <PR>') and hunt HARD for a concrete CORRECTNESS or DATA-INTEGRITY bug introduced by the diff. Look especially for: ${CHECKLIST_TEXT}. RULES: (1) BLOCK ON CORRECTNESS ONLY. Classify EVERY finding as either CORRECTNESS (a real bug that makes the code produce wrong output/data, crash, corrupt state, or violate an invariant — BLOCKING) or ADVISORY (style, naming, formatting, test coverage, hardening, defensiveness, or subjective design — NON-BLOCKING). ONLY a correctness finding may block the merge; advisory findings are surfaced as non-blocking notes and must NEVER gate the merge. (2) You are READ-ONLY: DO NOT edit any file, DO NOT commit, push, or merge. The ONLY writes you may do are: ONE 'gh pr comment <PR> --body \"…\"' and the result-file write described in rule 5. (3) DEFAULT TO BLOCK WHEN UNCERTAIN: if you find a real correctness/data-integrity bug, OR you cannot convince yourself the diff is correct, BLOCK. Only PASS when you are confident the diff is correct — a purely advisory finding is NOT a reason to block. (4) Post a brief PR comment summarizing your findings via 'gh pr comment <PR> --body \"…\"' (one tight paragraph: the blocking bug + why it's wrong, or the PASS rationale; then list any ADVISORY style/hardening findings separately as clearly-labelled NON-BLOCKING notes). (5) FINALLY, as your absolute LAST action, write the machine verdict the merge gate reads — this step is MANDATORY — by running exactly one of these commands. To BLOCK (only when you have at least one CORRECTNESS finding), a STRUCTURED verdict of exactly this shape: printf 'REVIEW: BLOCK — rule: <which correctness rule was violated> | why: <the reasoning> | location: <file:line or function>\n' > '<RESULT_FILE>' (three ' | '-separated fields — rule, why, location — parsed by a machine). Otherwise PASS: printf 'REVIEW: PASS\n' > '<RESULT_FILE>' when you found NO issues, or printf 'REVIEW: PASS — advisory: <one-line note> | advisory: <one-line note>\n' > '<RESULT_FILE>' when you found ONLY advisory (non-correctness) issues (one ' advisory:' segment per finding), where <RESULT_FILE> is the path given below. Do not skip this step. THIS REVIEW: the pull request under review is PR #${PR} (branch slug '${SLUG}'); read its diff with 'gh pr diff ${PR}' and post your one comment with 'gh pr comment ${PR} --body \"…\"'. The <RESULT_FILE> path for rule 5 is: '${_agent_result_file}' (use it exactly, quotes included — do not append the trailing period of this sentence to the filename)."
 
 # _purge_stale_review_tab — close any STANDALONE review·<slug> tab left by a prior dispatch (the
 # fallback path) and drop its sweep-allowlist registry line. Idempotent + best-effort: called on
@@ -521,13 +554,28 @@ if [ "$_AGENT_PANE_MODE" = "1" ]; then
   # Poll interval: HERD_REVIEW_AGENT_POLL seconds (default 5; override in tests).
   _poll_deadline=$(( $(date +%s) + ${HERD_REVIEW_AGENT_TIMEOUT:-1800} ))
   _poll_interval="${HERD_REVIEW_AGENT_POLL:-5}"
+  verdict_line=""
   while ! grep -qE '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null; do
     if [ "$(date +%s)" -ge "$_poll_deadline" ]; then
+      # Belt-and-braces (HERD-133): before declaring an infra timeout and burning a re-dispatch,
+      # glob for a NEAR-MISS result file. A reviewer that absorbs trailing prompt punctuation (the
+      # sentence period) or whitespace into an unquoted path writes its verdict one character off —
+      # to e.g. "${_agent_result_file}." — leaving the exact path empty forever. If such a variant
+      # holds a parseable verdict, CONSUME it as the verdict and journal a warning instead of
+      # timing out. When there is NO near-miss, this is a no-op and the timeout proceeds unchanged.
+      if _consume_nearmiss_verdict; then
+        journal_append verdict_path_nearmiss pr "${PR:-}" slug "${SLUG:-}" \
+          expected "$_agent_result_file" actual "$_nearmiss_path" verdict "$_nearmiss_verdict"
+        verdict_line="$_nearmiss_verdict"
+        break
+      fi
       emit_infra_fail "agent-pane reviewer timed out (${HERD_REVIEW_AGENT_TIMEOUT:-1800}s) without writing a verdict to '${_agent_result_file}'"
     fi
     sleep "$_poll_interval"
   done
-  verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+  # Normal exact-path exit re-reads the verdict here (byte-identical to before); a near-miss
+  # consumed above has already populated verdict_line, so leave it untouched in that case.
+  [ -n "$verdict_line" ] || verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
 else
   # Headless mode: stream claude -p into $LOG with an informative formatter.
   # The formatter emits: tool name + one-line input summary (bash command, file path, etc.)
