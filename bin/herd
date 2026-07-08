@@ -712,8 +712,29 @@ _init_governance_adoption() {
 }
 
 cmd_init() {
+  # Optional flags. --governance <file> SEEDS this fresh install from a portable governance profile
+  # (HERD-126): validated up front (a malformed profile aborts BEFORE any config is written), then
+  # applied non-interactively after the interview writes .herd/config. One optional source among many
+  # — it composes with the interview and the CLAUDE.md adoption pass; it never overrides them blindly.
+  local gov_profile=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --governance) gov_profile="${2:-}"; [ -n "$gov_profile" ] || die "usage: herd init [--governance <file>]"; shift 2 ;;
+      --)           shift; break ;;
+      -?*)          die "unknown flag '$1' — usage: herd init [--governance <file>]" ;;
+      *)            break ;;
+    esac
+  done
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
+
+  # Validate a --governance profile NOW, before doing any init work, so a bad file fails fast with
+  # zero side-effects rather than after the interview has already written config.
+  if [ -n "$gov_profile" ]; then
+    { [ -f "$gov_profile" ] && [ -r "$gov_profile" ]; } || die "no readable governance profile at $gov_profile"
+    _gov_parse_and_validate "$gov_profile" "$(_config_caps_file)" >/dev/null \
+      || die "herd init --governance: the profile is malformed; aborting before any changes (see the reason above)"
+  fi
 
   # Dependency doctor FIRST — catch a broken environment (the issue #31 class: a missing/mis-encoded
   # load-bearing dep that silently truncates the control room) BEFORE we write any config. HARD-gates
@@ -993,6 +1014,18 @@ EOF
   local skill; skill="$(render_skill "$project_root" "$cfg")"
   ok "rendered coordinator skill → $skill"
 
+  # 6a. Governance profile seeding (HERD-126): when `herd init --governance <file>` was given, apply the
+  #     (already-validated) profile through the same validated setter the standalone `governance apply`
+  #     uses. HERD_INIT_DEFER_APPLY=1 defers the watcher-restart / re-render (the control room does not
+  #     exist yet — the values take effect on first launch) and suppresses the reload hint. A profile is
+  #     ONE governance source: the CLAUDE.md adoption pass below still runs and composes on top.
+  if [ -n "$gov_profile" ]; then
+    say ""
+    say "${c_bold}Seeding governance from profile${c_rst} ${c_dim}($(basename "$gov_profile"))${c_rst}"
+    local _gp_pairs; _gp_pairs="$(_gov_parse_and_validate "$gov_profile" "$(_config_caps_file)")" || _gp_pairs=""
+    HERD_INIT_DEFER_APPLY=1 _gov_apply_pairs "$project_root" "$cfg" "$(_config_caps_file)" "$_gp_pairs" 1 "$gov_profile"
+  fi
+
   # 6b. Governance adoption (HERD-119): OPT-IN import of gates/conventions from an OPTIONAL CLAUDE.md /
   #     AGENTS.md. One source among many — suggest-never-auto-write, applied only through the validated
   #     `herd config set` on accept. No such file ⇒ returns silently (byte-identical init). Skipped on a
@@ -1148,18 +1181,6 @@ cmd_render() {
 # Fail-soft: no map / no hook rows / non-interactive → clean no-op, no file written.
 _GOV_HOOK_MARKER="herd-governance"
 
-cmd_governance() {
-  local sub="${1:-}"; shift || true
-  case "$sub" in
-    hooks) _gov_hooks "$@" ;;
-    ''|help|-h|--help)
-      say "usage: herd governance hooks render [--shared]"
-      say "  Render session-time Claude Code hooks from the governance map's hook rows: propose each,"
-      say "  accept per-hook, and merge accepted entries into .claude/settings.local.json (default) or"
-      say "  .claude/settings.json (--shared), preserving existing entries. Idempotent re-render." ;;
-    *) die "unknown: herd governance $sub (try: herd governance hooks render)" ;;
-  esac
-}
 
 _gov_hooks() {
   local action="${1:-}"; shift || true
@@ -1766,11 +1787,12 @@ cmd_config_set() {
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
   #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
-  #    HERD_INIT_DEFER_APPLY (set only by `herd init`'s governance adoption, HERD-119) suppresses the
-  #    watcher-restart / re-render: init runs BEFORE the control room exists, so the value is written
-  #    and simply takes effect on first launch — no watcher to restart, no premature headless spawn.
+  #    HERD_INIT_DEFER_APPLY (set by `herd init`'s governance adoption/seeding, HERD-119/HERD-126, and
+  #    by `herd governance apply`'s multi-key loop) suppresses the watcher-restart / re-render: the
+  #    caller applies possibly-many keys at once and drives ONE reload afterward (or, during init, the
+  #    value simply takes effect on first launch) — no per-key restart, no premature headless spawn.
   if [ "$changed" -eq 1 ] && [ "${HERD_INIT_DEFER_APPLY:-}" = "1" ]; then
-    say "  ${c_dim}(init: watcher restart / skill re-render deferred — takes effect when the control room launches)${c_rst}"
+    say "  ${c_dim}(watcher restart / skill re-render deferred — takes effect on the next control-room launch or 'herd reload')${c_rst}"
   elif [ "$changed" -eq 1 ]; then
   case "$requires" in
     watcher)
@@ -2014,6 +2036,268 @@ _config_sync_report() {
     [ -n "$whn" ] && printf '    %s↳ %s%s\n' "$c_dim" "$whn" "$c_rst"
   done
   return 1
+}
+
+# ── herd governance: export / apply a project's governance as a portable profile (HERD-126) ───────
+# A governance profile makes a project's GOVERNANCE STANCE — its merge / gate / PR / attribution /
+# commit policy — a portable, versioned artifact. `herd governance export` writes the governance-scoped
+# .herd/config key subset; `herd governance apply` PROPOSES each key back through the validated `herd
+# config set` (never a blind overwrite); `herd init --governance` seeds a fresh install; and `herd
+# fleet set --profile` rides the existing fleet fan-out to roll a profile across the registry.
+#
+# SINGLE SOURCE OF TRUTH for WHICH keys travel: the `governance` tag in templates/capabilities.tsv's
+# 7th column. STRUCTURAL EXCLUSIONS are enforced on BOTH export and apply (never merely trusted from
+# the tag): a SECRET-shaped key (_config_secret_key) and a MACHINE-scoped key (_config_key_scope ==
+# machine — e.g. GRAPHIFY_BIN, model tiers) NEVER travel, even if a row were mis-tagged.
+#
+# BINDING CONSTRAINT: a profile is ONE optional governance source among several (defaults, interview,
+# CLAUDE.md adoption, manual `herd config set`). apply COMPOSES — it proposes, it never overwrites;
+# declining every key leaves .herd/config byte-identical. A malformed profile is refused LOUDLY with
+# ZERO partial writes: the WHOLE file is validated before a single key is applied.
+
+# _gov_profile_version — the profile format version this herd writes and understands. A profile that
+# declares an unsupported version is refused rather than guessed at (forward-compatible).
+_gov_profile_version() { printf '1'; }
+
+# _gov_profile_marker — the version-marker key a profile header carries. It is NOT a .herd/config key,
+# so it is recognized specially by the parser and never proposed as a config set.
+_gov_profile_marker() { printf 'HERD_GOVERNANCE_PROFILE'; }
+
+# _gov_travels <caps> <KEY> — success when KEY may travel in a profile: a kind==config row tagged
+# `governance` in the 7th column of capabilities.tsv, AND not machine-scoped, AND not secret-shaped.
+# This is the ONE predicate both export (which keys to emit) and apply (which keys to accept) consult,
+# so the traveling set can never diverge between the two directions.
+_gov_travels() {
+  local caps="$1" key="$2" tag
+  tag="$(awk -F'\t' -v k="$key" '$2=="config" && $1==k { t=$7; gsub(/[[:space:]]+$/,"",t); print t; exit }' "$caps")"
+  [ "$tag" = "governance" ] || return 1
+  _config_secret_key "$key" && return 1                       # secret-shaped → belongs in .herd/secrets
+  [ "$(_config_key_scope "$caps" "$key")" = "machine" ] && return 1   # per-user/per-machine → never travels
+  return 0
+}
+
+# _gov_profile_keys <caps> — every traveling governance key, in manifest order (one per line).
+_gov_profile_keys() {
+  local caps="$1" key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    _gov_travels "$caps" "$key" && printf '%s\n' "$key"
+  done < <(_config_manifest_config_keys "$caps")
+}
+
+# _gov_collect_pairs <cfg> <local_cfg> <caps> — print each SET traveling governance key as
+# KEY<TAB>VALUE in manifest order. Effective value: the per-user overlay (.herd/config.local) wins
+# over the baseline, mirroring how herd-config.sh sources config. A key UNSET in both files is skipped
+# — a profile carries the project's DELIBERATE governance stance, not the defaults every install rides.
+_gov_collect_pairs() {
+  local cfg="$1" local_cfg="$2" caps="$3" key val
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg"; then
+      val="$(_config_file_value "$local_cfg" "$key")"
+    elif grep -qE "^[[:space:]]*$key=" "$cfg"; then
+      val="$(_config_file_value "$cfg" "$key")"
+    else
+      continue
+    fi
+    printf '%s\t%s\n' "$key" "$val"
+  done < <(_gov_profile_keys "$caps")
+}
+
+cmd_governance() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    export)       cmd_governance_export "$@" ;;
+    apply)        cmd_governance_apply "$@" ;;
+    hooks)        _gov_hooks "$@" ;;
+    ""|-h|--help) say "usage: herd governance export [--file <path>] | apply [--yes] <file> | hooks render [--shared]" ;;
+    *)            die "unknown 'herd governance' subcommand '$sub' — usage: herd governance export [--file <path>] | apply [--yes] <file> | hooks render [--shared]" ;;
+  esac
+}
+
+cmd_governance_export() {
+  local out_file=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --file) out_file="${2:-}"; [ -n "$out_file" ] || die "usage: herd governance export [--file <path>]"; shift 2 ;;
+      --)     shift; break ;;
+      -?*)    die "unknown flag '$1' — usage: herd governance export [--file <path>]" ;;
+      *)      die "unexpected argument '$1' — usage: herd governance export [--file <path>]" ;;
+    esac
+  done
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local caps; caps="$(_config_caps_file)"
+
+  local pairs; pairs="$(_gov_collect_pairs "$cfg" "$local_cfg" "$caps")"
+  local n; n="$(printf '%s' "$pairs" | grep -c . || true)"
+  local ws; ws="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKSPACE_NAME:-}" ) )"
+
+  # Emit the commented, versioned profile. Header first (what it is + how to apply), then the version
+  # marker, then one KEY="VALUE" per SET governance key. Values are double-quoted so a profile is a
+  # drop-in shell-sourceable snippet AND identical in shape to a .herd/config assignment.
+  _gov_emit() {
+    printf '# herd governance profile (v%s)%s\n' "$(_gov_profile_version)" "${ws:+ — exported from $ws}"
+    printf '#\n'
+    printf '# A PORTABLE, VERSIONED snapshot of this project'\''s governance stance (merge / gate / PR /\n'
+    printf '# attribution / commit policy). Generated by '\''herd governance export'\'' (HERD-126). Each\n'
+    printf '# KEY="VALUE" line is a governance-scoped .herd/config key; secrets and machine-scoped keys\n'
+    printf '# NEVER travel in a profile. Apply with '\''herd governance apply <file>'\'' (proposes each key;\n'
+    printf '# --yes for automation), seed a fresh install with '\''herd init --governance <file>'\'', or roll\n'
+    printf '# out across a fleet with '\''herd fleet set --profile <file>'\''.\n'
+    printf '%s=%s\n' "$(_gov_profile_marker)" "$(_gov_profile_version)"
+    # `|| [ -n "$k" ]`: command substitution strips the trailing newline, so the LAST pair would be
+    # dropped by a bare `read` (which returns non-zero on an unterminated final line).
+    printf '%s' "$pairs" | while IFS=$'\t' read -r k v || [ -n "$k" ]; do
+      [ -n "$k" ] || continue
+      printf '%s="%s"\n' "$k" "$v"
+    done
+  }
+
+  if [ -n "$out_file" ]; then
+    _gov_emit > "$out_file" || die "could not write governance profile to $out_file"
+    ok "wrote governance profile → $out_file ${c_dim}($n governance key$([ "$n" = "1" ] || printf 's'))${c_rst}"
+  else
+    _gov_emit
+  fi
+}
+
+# _gov_parse_and_validate <file> <caps> — the SINGLE validation gate for a profile. Proves <file> is a
+# well-formed vN profile and prints one KEY<TAB>VALUE line per governance assignment to STDOUT on
+# success. On ANY defect it prints a reason to STDERR, returns non-zero, and has written NOTHING to
+# stdout — so a caller that applies stdout applies ZERO keys on a malformed profile. Refuses: a
+# missing/unsupported version marker; a non-KEY=VALUE line; a key that is not a TRAVELING governance
+# key (unknown / non-governance / machine / secret); a value with a shell-active char (the same rule
+# `herd config set` enforces, since .herd/config is shell-sourced).
+_gov_parse_and_validate() {
+  local file="$1" caps="$2"
+  local marker; marker="$(_gov_profile_marker)"
+  local line t key val ver="" seenmarker=0 pairs="" lineno=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno+1))
+    t="${line#"${line%%[![:space:]]*}"}"          # strip leading whitespace
+    case "$t" in ''|'#'*) continue ;; esac         # blank / comment
+    case "$t" in
+      [A-Za-z_]*=*) : ;;
+      *) printf 'malformed profile at line %d: not a KEY=VALUE assignment: %s\n' "$lineno" "$line" >&2; return 1 ;;
+    esac
+    key="${t%%=*}"; val="${t#*=}"
+    case "$val" in \"*\") val="${val#\"}"; val="${val%\"}" ;; esac   # strip one layer of surrounding quotes
+    if [ "$key" = "$marker" ]; then ver="$val"; seenmarker=1; continue; fi
+    case "$key" in
+      *[!A-Za-z0-9_]*) printf 'malformed profile at line %d: bad key name "%s"\n' "$lineno" "$key" >&2; return 1 ;;
+    esac
+    if ! _gov_travels "$caps" "$key"; then
+      printf 'refusing profile: line %d key "%s" is not a traveling governance key (unknown, non-governance, machine-scoped, or secret) — nothing applied\n' "$lineno" "$key" >&2
+      return 1
+    fi
+    case "$val" in
+      *'$'*|*'`'*|*'\'*|*'"'*) printf 'refusing profile: line %d value for "%s" contains a shell-active character ($ ` \\ or ") — nothing applied\n' "$lineno" "$key" >&2; return 1 ;;
+    esac
+    pairs="${pairs}$(printf '%s\t%s' "$key" "$val")"$'\n'
+  done < "$file"
+  if [ "$seenmarker" -ne 1 ]; then
+    printf 'refusing profile: missing the %s version marker — is %s a governance profile? nothing applied\n' "$marker" "$file" >&2
+    return 1
+  fi
+  if [ "$ver" != "$(_gov_profile_version)" ]; then
+    printf 'refusing profile: unsupported %s version "%s" — this herd understands v%s; nothing applied\n' "$marker" "$ver" "$(_gov_profile_version)" >&2
+    return 1
+  fi
+  printf '%s' "$pairs"
+  return 0
+}
+
+# _gov_apply_pairs <root> <cfg> <caps> <pairs> <assume_yes> <file> — apply already-validated KEY<TAB>VALUE
+# pairs. With assume_yes=1 every key is applied non-interactively (journaled); otherwise each key is
+# PROPOSED with the profile line as evidence and a current→proposed diff, accept / edit / decline.
+# Every write goes through cmd_config_set under HERD_INIT_DEFER_APPLY=1, so a multi-key profile never
+# triggers N watcher restarts mid-apply; a single 'herd reload' hint is printed at the end when any
+# applied key is watcher/render-affecting (suppressed under init, which launches fresh). Declining
+# every key leaves .herd/config byte-identical. Iterates by line INDEX (not a here-string wrapping the
+# loop) so _ground_ask keeps reading the REAL stdin for the interactive prompts.
+_gov_apply_pairs() {
+  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6"
+  local applied=0 needs_reload=0 np i rec key val cur requires ans
+  np="$(printf '%s' "$pairs" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+    IFS=$'\t' read -r key val <<< "$rec"
+    [ -n "$key" ] || continue
+    cur="$(_config_file_value "$cfg" "$key")"
+    if [ "$assume_yes" -ne 1 ]; then
+      say ""
+      say "  ${c_bold}${key}${c_rst}"
+      say "  ${c_dim}evidence: ${key}=\"${val}\"  (from $(basename "$file"))${c_rst}"
+      if [ "$cur" = "$val" ]; then
+        say "  ${c_dim}→ already ${key}=\"${val}\" — no change${c_rst}"
+        continue
+      fi
+      say "  ${c_dim}→ proposes: ${key} \"${cur}\" → \"${val}\"  (via the validated herd config set)${c_rst}"
+      ans="$(_ground_ask "  accept / edit / decline? (a/e/N)" "n")"
+      case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+        a|accept) : ;;
+        e|edit)
+          local edited; edited="$(_ground_ask "  enter value for $key" "$val")"
+          if [ -n "$edited" ]; then val="$edited"; else say "  ${c_dim}declined (empty)${c_rst}"; continue; fi ;;
+        *) say "  ${c_dim}declined${c_rst}"; continue ;;
+      esac
+    fi
+    requires="$(_config_key_requires "$caps" "$key" 2>/dev/null || true)"
+    if ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set "$key" "$val" >/dev/null 2>&1 ); then
+      applied=$((applied+1))
+      case "$requires" in watcher|render) needs_reload=1 ;; esac
+      ok "applied ${key}=\"${val}\""
+      if [ "$assume_yes" -eq 1 ]; then
+        local wt; wt="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
+        { type journal_append >/dev/null 2>&1 && WORKTREES_DIR="$wt" journal_append governance_applied key "$key" value "$val" profile "$(basename "$file")"; } || true
+      fi
+    else
+      warn "could not apply ${key}=\"${val}\" — 'herd config set' rejected it; skipped (other keys unaffected)"
+    fi
+  done
+
+  say ""
+  if [ "$applied" -gt 0 ]; then
+    ok "governance apply: applied $applied key(s)"
+    [ "$needs_reload" -eq 1 ] && [ "${HERD_INIT_DEFER_APPLY:-}" != "1" ] \
+      && say "  ${c_dim}→ run 'herd reload' to apply the watcher/skill changes to a running control room${c_rst}"
+  else
+    say "  ${c_dim}governance apply: nothing applied (config untouched)${c_rst}"
+  fi
+  return 0
+}
+
+cmd_governance_apply() {
+  local assume_yes=0 file=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --yes|-y) assume_yes=1; shift ;;
+      --)       shift; break ;;
+      -?*)      die "unknown flag '$1' — usage: herd governance apply [--yes] <file>" ;;
+      *)        file="$1"; shift; break ;;
+    esac
+  done
+  [ -n "$file" ] || die "usage: herd governance apply [--yes] <file>"
+  { [ -f "$file" ] && [ -r "$file" ]; } || die "no readable governance profile at $file"
+  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local caps; caps="$(_config_caps_file)"
+
+  # Validate the ENTIRE profile before ANY write — a malformed profile is refused here, zero writes.
+  local pairs
+  pairs="$(_gov_parse_and_validate "$file" "$caps")" \
+    || die "herd governance apply refused — the profile is malformed; nothing was written (see the reason above)"
+
+  local n; n="$(printf '%s' "$pairs" | grep -c . || true)"
+  if [ "$n" -eq 0 ]; then
+    ok "governance profile carries no traveling keys — nothing to apply (config untouched)"
+    return 0
+  fi
+
+  say "${c_bold}herd governance apply${c_rst} ${c_dim}— $n governance key(s) from $(basename "$file")${c_rst}"
+  say "  ${c_dim}(each proposal applies ONLY through the validated 'herd config set'; nothing is overwritten unless you accept it)${c_rst}"
+  _gov_apply_pairs "$root" "$cfg" "$caps" "$pairs" "$assume_yes" "$file"
 }
 
 cmd_config_sync() {
@@ -4436,6 +4720,8 @@ usage: herd fleet <subcommand>
                              when the registry is empty. (herd fleet room --help for details)
   set <KEY> <VALUE>          propagate a policy across the fleet by delegating to each project's own
                              VALIDATED 'herd config set' (e.g. MERGE_POLICY / model tier / TOKEN_MODE)
+  set --profile <file>       apply a GOVERNANCE PROFILE across the fleet (delegates 'herd governance
+                             apply --yes <file>' per project; malformed profile refused per project)
   upgrade                    run 'herd update' in every registered project (per-project outcomes)
   reload                     run 'herd reload' in every registered project (per-project outcomes)
 
@@ -4494,6 +4780,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd governance <export|apply>      export/apply a project's governance as a portable, versioned
+                                        export [--file <path>]  write the governance-scoped config key
+                                                      subset (secrets/machine keys never travel) to a
+                                                      file or stdout
+                                        apply [--yes] <file>    propose each key via the validated
+                                                      'herd config set' (never a blind overwrite; --yes
+                                                      applies all, journaled); malformed → refused,
+                                                      zero writes. Also: herd init --governance <file>,
+                                                      herd fleet set --profile <file>
   herd governance hooks render        render SESSION-TIME Claude Code hooks from the governance map's
               [--shared]              hook rows (dual-surface: the same rules the merge gate enforces,
                                       now blocking at the keyboard). Propose-then-write, per-hook

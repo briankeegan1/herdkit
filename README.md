@@ -259,6 +259,12 @@ herd config set <KEY> <VAL>  # edit in place, then restart the watcher / re-rend
 herd config set --shared <KEY> <VAL>   # project-scoped change via a tiny config/<key> PR (multi-operator)
 herd config lint             # flag DUPLICATE keys (shell last-wins can silently disable a gate)
 
+# Export / apply a project's GOVERNANCE (merge/gate/PR/attribution/commit policy) as a portable profile:
+herd governance export --file gov.profile   # write the governance-scoped keys (secrets/machine keys never travel)
+herd governance apply gov.profile           # propose each key via the validated 'herd config set' (--yes for automation)
+herd init --governance gov.profile          # seed a fresh install from a profile
+herd fleet set --profile gov.profile        # roll a profile out across every registered project
+
 # Forensics — read the append-only engine journal (.herd/journal.jsonl):
 herd log [--pr N] [--tail]   # page the journal: one line per gate event; --tail follows live
 herd why <pr#>               # summarize one PR's full gate history — the first post-mortem tool
