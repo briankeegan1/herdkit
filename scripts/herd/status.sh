@@ -25,16 +25,21 @@
 
 # _status_classify_builder <has_agent 0|1> <agent_status> <has_pr 0|1> <commits> [liveness] — the
 # deterministic bucket for one feature worktree. Echoes exactly one token:
-#   agentdead — the agent SESSION is confirmed DEAD (its process is gone though herdr may still list it,
-#               and even when an open PR exists): the HERD-114 signature. Surfaced distinctly instead of
-#               a misleading done/idle so a review bounce is never sent into a dead pane. Only a POSITIVE
-#               liveness='dead' triggers it, and never over a WORKING agent (a live process can't be dead
-#               — the probe raced); an empty/unknown/alive liveness preserves the exact prior bucket.
+#   agentdead    — the agent SESSION is confirmed DEAD (its process is gone though herdr may still list
+#                  it, and even when an open PR exists): the HERD-114 signature. Surfaced distinctly
+#                  instead of a misleading done/idle so a review bounce is never sent into a dead pane.
+#                  Only a POSITIVE liveness='dead' triggers it, and never over a WORKING agent (a live
+#                  process can't be dead — the probe raced); empty/unknown/alive preserves prior bucket.
+#   agentmissing — the tab has NO agent in the roster AT ALL, yet work was already produced (an open PR
+#                  or commits): the agent VANISHED after finishing (HERD-135). 'done' REQUIRES a live
+#                  session, so a vanished agent over real work is NOT 'done' — it is 'agent missing'
+#                  (distinct from 'agent dead' = pane present but unresponsive), so a refix bounce is
+#                  never attempted against nobody and the operator sees the truth (the #249 incident).
 #   dead     — no live agent record + no open PR + zero commits: the watcher's DEAD signature,
 #              replicated READ-ONLY (a silently-exited pre-PR builder that produced nothing).
 #   building — a live agent is WORKING on it (no PR yet).
-#   done     — an open PR exists, the agent reports done, OR commits were produced (work landed;
-#              the agent may have legitimately exited).
+#   done     — a LIVE agent is present and it reached its finish line (an open PR, agent-reported done,
+#              or commits produced). REQUIRES a live session in the roster (has_agent=1) — HERD-135.
 #   idle     — a live agent is present but not working and has produced no PR/commits yet.
 _status_classify_builder() {
   local has_agent="${1:-0}" astatus="${2:-}" has_pr="${3:-0}" commits="${4:-0}" liveness="${5:-}"
@@ -44,20 +49,22 @@ _status_classify_builder() {
   if [ "$liveness" = "dead" ] && [ "$astatus" != "working" ]; then
     printf 'agentdead'; return 0
   fi
-  # An open PR is an unambiguous liveness signal — the builder reached its finish line.
-  [ "$has_pr" = "1" ] && { printf 'done'; return 0; }
-  if [ "$has_agent" = "1" ]; then
-    case "$astatus" in
-      working) printf 'building'; return 0 ;;
-      done)    printf 'done';     return 0 ;;
-    esac
-    # Present but idle/other: done if it already produced commits, else genuinely idle.
-    [ "$commits" -gt 0 ] && { printf 'done'; return 0; }
-    printf 'idle'; return 0
+  # HERD-135: NO agent in the roster at all. 'done' requires a LIVE session, so a vanished agent is
+  # never 'done'. If it produced work (open PR or commits) the tab lost its agent pane AFTER finishing:
+  # 'agent missing' — a refix would hit nobody. Nothing produced → the classic pre-PR 'dead' signature.
+  if [ "$has_agent" != "1" ]; then
+    { [ "$has_pr" = "1" ] || [ "$commits" -gt 0 ]; } && { printf 'agentmissing'; return 0; }
+    printf 'dead'; return 0
   fi
-  # No agent record at all — the dead signature UNLESS commits were already produced.
+  # From here a LIVE agent is present (has_agent=1). An open PR is an unambiguous finish-line signal.
+  [ "$has_pr" = "1" ] && { printf 'done'; return 0; }
+  case "$astatus" in
+    working) printf 'building'; return 0 ;;
+    done)    printf 'done';     return 0 ;;
+  esac
+  # Present but idle/other: done if it already produced commits, else genuinely idle.
   [ "$commits" -gt 0 ] && { printf 'done'; return 0; }
-  printf 'dead'
+  printf 'idle'
 }
 
 # _status_latest_review <ledger-file> <pr> <sha> — echo the MOST-RECENT recorded review verdict
@@ -229,6 +236,8 @@ EOF
       idle)      n_idle=$((n_idle+1));   rows="${rows}    ${d}💤 ${sl} idle · no PR${x}"$'\n' ;;
       agentdead) n_dead=$((n_dead+1));   attention=1; reasons="${reasons} agent-dead:${slug}"
                  rows="${rows}    ${r}💀 ${b}${sl}${x} ${r}AGENT DEAD (session unwakeable${prnum:+ · PR #$prnum}) — re-task by hand${x}"$'\n' ;;
+      agentmissing) n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-missing:${slug}"
+                 rows="${rows}    ${r}🫥 ${b}${sl}${x} ${r}AGENT MISSING (no agent pane${prnum:+ · PR #$prnum}) — re-task by hand${x}"$'\n' ;;
       dead)      n_dead=$((n_dead+1));   attention=1; reasons="${reasons} dead-builder:${slug}"
                  rows="${rows}    ${r}💀 ${b}${sl}${x} ${r}DEAD (no agent, no PR, no commits)${x}"$'\n' ;;
     esac

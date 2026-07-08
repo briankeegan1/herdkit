@@ -167,6 +167,28 @@ if cmd == "pane list":
                       "label": p["label"], "agent_status": p["agent_status"]})
     emit({"panes": panes})
 
+if cmd == "pane process-info":
+    # Report the pane's FOREGROUND from the pid `pane run` recorded (below): a still-running pid ⇒ that
+    # command is the live foreground (the deadeyes 'claude' sleeper); a gone pid ⇒ a bare shell. shell_pid
+    # is kept DISTINCT from the fg pid so the driver's "drop the shell" filter never discards the fg. A
+    # gone pane ⇒ no process_info at all — the HERD-135 'missing' signal.
+    pane = opt("--pane")
+    for _, _, p_id, p in all_panes(s):
+        if p_id == pane:
+            fg_pid = p.get("fg_pid"); fg_cmd = p.get("fg_cmd", "")
+            alive = False
+            if isinstance(fg_pid, int):
+                try: os.kill(fg_pid, 0); alive = True
+                except OSError: alive = False
+            shell = (fg_pid + 1000000) if isinstance(fg_pid, int) else 4242
+            if alive:
+                emit({"process_info": {"shell_pid": shell, "foreground_process_group_id": fg_pid,
+                                       "foreground_processes": [{"pid": fg_pid, "cmdline": fg_cmd}]}})
+            else:
+                emit({"process_info": {"shell_pid": shell, "foreground_process_group_id": shell,
+                                       "foreground_processes": []}})
+    emit({})
+
 if cmd == "pane rename":
     for _, _, p_id, p in all_panes(s):
         if p_id == args[2]: p["label"] = args[3]
@@ -180,7 +202,25 @@ if cmd == "pane report-agent":
     save(s); emit({"type": "ok"})
 
 if cmd == "pane run":
-    sys.exit(0)   # no-op: nothing to execute in the stub
+    # Model a foreground process so `pane process-info` (above) can report live/gone foreground exactly
+    # as a real pane would (the dead-vs-missing eyes flow). Launch the command DETACHED in its OWN
+    # session (pgid == pid) and record the pid in pane state: a resident command (the deadeyes 'claude'
+    # sleeper) stays alive until the scenario kills its process GROUP; a printf exits at once ⇒ gone.
+    pane = args[2] if len(args) > 2 else ""
+    runcmd = args[3] if len(args) > 3 else ""
+    if pane and runcmd:
+        import subprocess
+        for _, _, p_id, p in all_panes(s):
+            if p_id == pane:
+                try:
+                    proc = subprocess.Popen(["/bin/sh", "-c", runcmd], start_new_session=True,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    p["fg_pid"] = proc.pid; p["fg_cmd"] = runcmd
+                    save(s)
+                except Exception:
+                    pass
+    sys.exit(0)
 
 if cmd == "pane read":
     print("rp stub builder: done"); sys.exit(0)
@@ -211,8 +251,11 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 [ "$(sc "$SCR" result)" = "pass" ]                  || fail "(B) result should be pass (got $(sc "$SCR" result))"
 [ "$(sc "$SCR" failed)" -eq 0 ]                     || fail "(B) failed should be 0"
 [ "$(sc "$SCR" herdr_available)" = "True" ]         || fail "(B) herdr_available should be True with stub herdr"
-# The pane/tab/agent checkpoints all pass.
-for cpn in workspace_created control_room builder_tab agent_idle agent_working agent_done teardown_clean; do
+# The pane/tab/agent checkpoints all pass — including the HERD-135 role-label + dead-vs-missing eyes
+# (the stub models `pane process-info` off a detached `pane run` process, so the deadeyes kill flips
+# liveness alive→dead and removing the pane flips it to 'missing').
+for cpn in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working \
+           agent_done builder_agent_dead builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
 # The observed transitions are exactly idle → working → done.

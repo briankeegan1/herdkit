@@ -223,7 +223,14 @@ if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
     exit 1
   fi
 else
-  herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
+  _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"
+  # HERD-135: LABEL the freshly-created agent pane with the slug so the dead-agent-eyes probe reads its
+  # role by label (and can still find it if the agent is later delisted) instead of positional/cmdline
+  # guessing. Best-effort: parse the pane id from the start result, else resolve via the roster; a
+  # rename the driver can't do just leaves the probe on its fallback heuristic (fail-soft, no red row).
+  _AGENT_PANE="$(herd_driver_pane_id_from_agent_start "$_agent_start_out")"
+  [ -z "$_AGENT_PANE" ] && _AGENT_PANE="$(herd_driver_agent_pane_id "$SLUG")"
+  [ -n "$_AGENT_PANE" ] && herd_driver_pane_rename "$_AGENT_PANE" "$SLUG"
 fi
 
 # 4. LEFT pane (the tab's root): live app preview on a free port — only if a preview command is
@@ -267,8 +274,19 @@ fi
 # so the viewer fills it with $TASK_SPEC_FILE live via task-spec-view.sh. TASK_PANE_VIEW default on;
 # off restores the bare shell. Sent through the driver's send-text surface (the `herdr pane run`
 # equivalent), which fails SOFT if the pane is gone. HEADLESS has no panes → skip cleanly.
-if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ -z "$PORT" ] && [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
-  herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+#
+# HERD-135: name the root pane's ROLE via the driver so the coordinator (human AND agent) never
+# mistakes it for the agent pane again (the #249 incident). The app-preview case already labelled it
+# 'app·$PORT' at step 4; here we label the viewer 'task-spec·$SLUG' and a bare shell 'shell·$SLUG'.
+if [ "$_HERD_DRIVER_NAME" != "headless" ]; then
+  if [ -n "$PORT" ]; then
+    : # ROOT hosts the live app preview — already labelled 'app·$PORT'; never relabel/hijack it.
+  elif [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
+    herd_driver_pane_rename "$ROOT" "task-spec·$SLUG"
+    herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+  else
+    herd_driver_pane_rename "$ROOT" "shell·$SLUG"
+  fi
 fi
 
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then

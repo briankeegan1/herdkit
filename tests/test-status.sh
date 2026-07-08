@@ -3,7 +3,8 @@
 # Sources status.sh standalone (it defines functions only, no live loop), points every ledger/backlog
 # path at a temp dir, and asserts the deterministic classifiers + ledger readers without touching git,
 # gh, herdr, or any real ledger:
-#   • _status_classify_builder  — building / done / idle / DEAD buckets (DEAD = no agent + no PR + no commits)
+#   • _status_classify_builder  — building / done / idle / DEAD / agentdead / agentmissing buckets
+#                                  (DEAD = no agent + no PR + no commits; agentmissing = no agent but work exists)
 #   • _status_latest_review     — latest PASS/BLOCK for a PR+sha from the append-only review ledger
 #   • _status_latest_health     — latest healthcheck outcome for a PR from the health ledger
 #   • _status_pr_attention      — CONFLICTING / review-BLOCK / CHANGES_REQUESTED ⇒ needs a human
@@ -36,10 +37,15 @@ done
 [ "$(_status_classify_builder 1 working   0 0)" = "building" ] || fail "working agent → building"
 [ "$(_status_classify_builder 1 idle      0 0)" = "idle" ]     || fail "present idle agent, nothing produced → idle"
 [ "$(_status_classify_builder 1 done      0 0)" = "done" ]     || fail "agent reports done → done"
-[ "$(_status_classify_builder 0 ''        1 0)" = "done" ]     || fail "open PR → done (finished)"
-[ "$(_status_classify_builder 0 ''        0 3)" = "done" ]     || fail "no agent but commits exist → done, not dead"
-[ "$(_status_classify_builder 1 idle      0 2)" = "done" ]     || fail "idle agent with commits → done"
-[ "$(_status_classify_builder 1 working   1 5)" = "done" ]     || fail "PR present dominates → done"
+# HERD-135: 'done' REQUIRES a live session. A vanished agent (has_agent=0) over real work is NOT
+# 'done' — it's 'agent missing' (a refix would hit nobody), so a review bounce is never sent to no one.
+[ "$(_status_classify_builder 0 ''        1 0)" = "agentmissing" ] || fail "open PR but NO agent → agent missing (not done)"
+[ "$(_status_classify_builder 0 ''        0 3)" = "agentmissing" ] || fail "commits but NO agent → agent missing (not done)"
+[ "$(_status_classify_builder 1 idle      0 2)" = "done" ]     || fail "LIVE idle agent with commits → done"
+[ "$(_status_classify_builder 1 idle      1 0)" = "done" ]     || fail "LIVE idle agent with a PR → done"
+[ "$(_status_classify_builder 1 working   1 5)" = "done" ]     || fail "LIVE agent + PR dominates → done"
+# agentmissing never fires over a LIVE agent; agentdead still wins when the process is confirmed gone.
+[ "$(_status_classify_builder 1 done      1 0 dead)" = "agentdead" ] || fail "confirmed-dead session with a PR → agentdead"
 ok
 
 # ── _status_latest_review: latest verdict per PR+sha from the append-only ledger ──────────────────

@@ -8,7 +8,12 @@
 # asserts the pane surface itself via herdr's JSON output:
 #   • a control-room TAB with a watcher pane + a backlog pane (labels asserted);
 #   • a builder TAB with a stub builder (a file/CLI-driven agent — no model call);
+#   • PANE ROLE LABELS at spawn (HERD-135): the agent pane is named by its slug via the driver, and the
+#     label is asserted queryable — the role the dead-agent-eyes probe consumes instead of guessing;
 #   • agent-status transitions idle → working → done, each observed via `herdr agent list`;
+#   • DEAD-vs-MISSING dead-agent eyes: kill the pane process ⇒ 'dead' (pane present, unresponsive), then
+#     REMOVE the agent pane entirely ⇒ 'missing' (HERD-135) — the SHIPPED status classifier reads
+#     'agentmissing' (NOT done) for an open-PR builder with no agent (the #249 false-'done' incident);
 #   • CLEAN TEARDOWN — the disposable workspace is closed and NO tab or pane is leaked afterward
 #     (so the result satisfies the tab-leak-guard).
 #
@@ -183,15 +188,20 @@ else
   command -v herdr >/dev/null 2>&1 || reason="herdr not installed"
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
-  for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
+  for cp in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
-            builder_agent_dead builder_refix_escalates_on_dead teardown_clean; do
+            builder_agent_dead builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
 
 # ── the real-pane path (only when herdr is up) ───────────────────────────────────────────────────
 if [ "$HERDR_OK" = true ]; then
+
+  # driver seam (functions only; no side effects) — herd_driver_pane_rename / herd_driver_agent_liveness
+  # power the HERD-135 role-label + agent-missing checkpoints below.
+  # shellcheck source=scripts/herd/driver.sh
+  . "$HERE/../driver.sh"
 
   # ── workspace: a fresh, disposable, ISOLATED workspace (unique label) ──────────────────────────
   step workspace "create a disposable isolated herdr workspace ($WS_LABEL)"
@@ -262,6 +272,30 @@ except Exception:
       checkpoint builder_tab pass "builder tab $BUILD_TAB (label rp-builder), builder pane $BUILD_PANE"
     else
       checkpoint builder_tab fail "builder tab not created as expected (tab='$BUILD_TAB' pane='$BUILD_PANE' ok=$BUILD_OK)"
+    fi
+  fi
+
+  # ── PANE ROLE LABELS AT SPAWN (HERD-135): the lane names each pane by role via the driver so the
+  # coordinator (and the dead-agent-eyes probe) read a pane's role by LABEL instead of guessing from
+  # position/cmdline — the fix for the #249 incident where a `claude --continue` was typed into the
+  # task-spec viewer pane. Exercise the SHIPPED driver call the lanes use (herd_driver_pane_rename) to
+  # label the builder's agent pane with its slug, then assert the label is queryable via herdr JSON.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step labels "name the agent pane by role via the driver (herd_driver_pane_rename)"
+    herd_driver_pane_rename "$BUILD_PANE" "rp-builder"
+    LBL_OK="$(pane_json "$WSID" | BP="$BUILD_PANE" python3 -c '
+import sys,json,os
+bp=os.environ["BP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print(next((str(p.get("label","")) for p in panes if str(p.get("pane_id",""))==bp), ""))
+except Exception:
+    print("err")
+' 2>/dev/null)"
+    if [ "$LBL_OK" = "rp-builder" ]; then
+      checkpoint pane_labels_on_spawn pass "agent pane $BUILD_PANE labelled 'rp-builder' via the driver (role readable by the probe)"
+    else
+      checkpoint pane_labels_on_spawn fail "agent pane label not set as expected (got '$LBL_OK')"
     fi
   fi
 
@@ -512,6 +546,47 @@ print(pi.get("foreground_process_group_id") or "")
       fi
     else
       checkpoint builder_refix_escalates_on_dead fail "skipped refix assertion — the pane process was not confirmed dead"
+    fi
+  fi
+
+  # ── AGENT MISSING (HERD-135): the tab has NO agent pane AT ALL. The deadeyes step above left the
+  # builder pane a BARE shell (process killed, pane present ⇒ 'dead'); now CLOSE that pane entirely so
+  # the agent is neither in the roster NOR does any pane carry its label. Assert the SHIPPED probe reads
+  # 'missing' (NOT dead, NOT alive) and the SHIPPED status classifier buckets it 'agentmissing' (NOT
+  # done) for an open-PR builder — the #249 incident where 'done · PR #249' hid a tab with zero agents.
+  # A refix would then have nobody to wake; the operator sees the truth. Complements the dead-vs-missing
+  # split: 'dead' = pane present but unresponsive; 'missing' = no agent pane at all.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step missingeyes "remove the agent pane entirely → agent-missing; status reads 'agent missing', never done"
+    # shellcheck source=scripts/herd/status.sh
+    . "$HERE/../status.sh"   # _status_classify_builder (functions only; no side effects)
+    _mp_present() {
+      pane_json "$WSID" | MP="$1" python3 -c '
+import sys,json,os
+mp=os.environ["MP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==mp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    herdr pane close "$BUILD_PANE" >/dev/null 2>&1 || true
+    _mp_gone="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(_mp_present "$BUILD_PANE")" = no ] && { _mp_gone=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    # The SHIPPED probe: no agent in the roster AND no pane carries its label ⇒ 'missing'.
+    _mp_live="$(herd_driver_agent_liveness rp-builder 2>/dev/null || printf 'unknown')"
+    # The SHIPPED classifier: has_agent=0, an open PR (has_pr=1) + commits ⇒ 'agentmissing', NEVER done.
+    _mp_bucket="$(_status_classify_builder 0 "" 1 1 "" 2>/dev/null || true)"
+    if [ "$_mp_gone" = yes ] && [ "$_mp_live" = "missing" ] && [ "$_mp_bucket" = "agentmissing" ]; then
+      checkpoint builder_agent_missing pass \
+        "agent pane removed → liveness 'missing' (not dead/alive); status classifier reads 'agentmissing' (not done) for an open-PR builder with no agent"
+    else
+      checkpoint builder_agent_missing fail \
+        "agent-missing not surfaced as expected (pane_gone=$_mp_gone liveness='$_mp_live' bucket='$_mp_bucket')"
     fi
   fi
 
