@@ -229,6 +229,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic init merge-policy consequence-loud ask (HERD-140) test passes" {
+  run bash "$REPO/tests/test-init-merge-policy-ask.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic governance profiles export/apply (HERD-126) test passes" {
   run bash "$REPO/tests/test-governance-profiles.sh"
   [ "$status" -eq 0 ]
