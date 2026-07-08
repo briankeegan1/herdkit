@@ -97,6 +97,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic sha-keyed resolver re-spawn test passes" {
+  run bash "$REPO/tests/test-watcher-respawn-resolver.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]

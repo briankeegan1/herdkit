@@ -23,11 +23,14 @@
 #                       reviews or merges; verdicts are collected from per-PR result files on
 #                       later ticks. "review queued" = waiting for a concurrency slot.
 #   ⏳ merging         — health passed AND review PASSed, merging now
-#   🔀 resolving …     — PR CONFLICTING for the FIRST time: auto-spawned the isolated, test-gated
-#                       conflict resolver (herd-resolve.sh). Hands-off.
+#   🔀 resolving …     — PR CONFLICTING and NO resolver has run for its CURRENT head sha: auto-spawned
+#                       the isolated, test-gated conflict resolver (herd-resolve.sh). Hands-off. Reads
+#                       "resolving conflict…" on a first conflict, or "resolving (retry · new commit)"
+#                       when a NEW commit re-conflicted after a prior (stale) attempt at an older sha.
 #   ⚠️ needs you · …   — PR CONFLICTING OR healthcheck returned a CODE error (❌), OR the review
-#                       gate returned BLOCK, OR the auto-resolver already ran and it's STILL
-#                       conflicting ("resolver failed"). NEVER auto-merged; one-line reason.
+#                       gate returned BLOCK, OR the auto-resolver already ran for THIS head sha and it's
+#                       STILL conflicting ("resolver failed"), OR the cross-sha resolver retry cap is hit
+#                       ("resolver failed (retry cap)"). NEVER auto-merged; one-line reason.
 #
 # AUTO-MERGE rule (full auto, safety-railed): for a PR that is mergeable==MERGEABLE AND
 # mergeStateStatus==CLEAN, run  healthcheck.sh <worktree>  (serialized; retried once solo on a CODE
@@ -43,11 +46,16 @@
 # if it can't ff — never force), (3) git worktree remove --force <wt>, (4) close its herdr tab,
 # and record the merge in a persistent state file so "recently landed" survives re-renders.
 #
-# AUTO-RESOLVE rule (full auto, safety-railed): when a PR FIRST goes CONFLICTING, the watcher
-# auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>). Two hard rails: (1)
-# resolve-loop guard — a branch that already has a recorded attempt is NEVER re-spawned; (2)
-# escalation preserved — the resolver aborts + escalates semantically-ambiguous conflicts; the
-# watcher NEVER blind-merges a conflict.
+# AUTO-RESOLVE rule (full auto, safety-railed): when a PR goes CONFLICTING, the watcher auto-spawns the
+# EXISTING isolated resolver (herd-resolve.sh <slug>). The resolve-attempt ledger is SHA-KEYED, so a
+# resolver runs AT MOST ONCE per (branch, head-sha). Three hard rails: (1) same-sha anti-loop — a
+# branch+sha that already has a recorded attempt is NEVER re-spawned for that sha (a failed/escalated
+# resolve leaves the PR CONFLICTING at an unchanged head); (2) escalation preserved — the resolver aborts
+# + escalates semantically-ambiguous conflicts (git merge --abort, no push, sha unchanged) so it stays a
+# terminal needs-you; the watcher NEVER blind-merges a conflict; (3) stale-attempt re-spawn (HERD-55) —
+# when a NEW commit lands on a still-conflicting PR (builder, human, or a partial resolver push), the head
+# sha CHANGES → the prior attempt is stale → the resolver is RE-spawned for the new sha, bounded by a
+# cross-sha cap ($_RESOLVE_RETRY_MAX distinct shas) so a chronically-conflicting branch can't churn forever.
 #
 # MERGE_POLICY (.herd/config): three-way human-in-the-loop lever.
 #   auto    — current behavior: merge automatically after all gates pass.
@@ -90,10 +98,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
-# Resolve-attempt ledger, PARALLEL to $STATE: one line per conflict-resolver SPAWN
-# ("<epoch> <pr#> <slug> <branch>"). A branch that already has a recorded attempt is NEVER given a
-# second resolver (a failed/escalated resolve leaves the PR CONFLICTING; re-spawning would loop).
+# Resolve-attempt ledger, PARALLEL to $STATE and SHA-KEYED like $REVIEW_STATE/$HEALTH_STATE: one line
+# per conflict-resolver SPAWN ("<epoch> <pr#> <slug> <branch> <headSha>"). The head sha keys the
+# anti-loop guard so a resolver runs AT MOST ONCE per (branch, head-sha): a branch+sha that already has
+# a recorded attempt is NEVER given a second resolver for that SAME sha (a failed/escalated resolve
+# leaves the PR CONFLICTING at an unchanged head; re-spawning would loop — and an ESCALATE: abort does
+# `git merge --abort` with NO push, so the sha is unchanged and the escalation stays surfaced as
+# needs-you). But when a NEW commit lands on a still-CONFLICTING PR (builder, human, or a PARTIAL
+# resolver push that moved the head yet left conflicts), the head sha CHANGES → the prior attempt is
+# stale → the resolver is RE-spawned for the new sha (HERD-55). A bounded cross-sha cap
+# ($_RESOLVE_RETRY_MAX distinct shas per branch) stops pathological churn and asks for a human.
 RESOLVE_STATE="$TREES/.agent-watch-resolve-attempts"
+# Max DISTINCT head shas a resolver may be spawned for on one branch before the watcher stops
+# re-spawning across new commits and escalates to "needs you" (the cross-sha anti-churn cap).
+_RESOLVE_RETRY_MAX=3
 # Review ledger, PARALLEL to $STATE/$RESOLVE_STATE: one line per PRE-MERGE REVIEW
 # ("<epoch> <pr#> <headSha> <verdict>"). Keyed by PR *and* head sha so a PR is reviewed at most
 # ONCE PER COMMIT — a recorded BLOCK is read back instead of re-spawning the reviewer; a recorded
@@ -359,15 +377,37 @@ _should_automerge() {
   [ "${1:-}" = "CLEAN" ]
 }
 
-# resolver_attempted <branch> — the resolve-loop guard.
+# resolver_attempted <branch> <headSha> — the SAME-sha anti-loop guard. True iff a resolver was ALREADY
+# spawned for this branch at this EXACT head sha. A resolver that failed/escalated leaves the PR
+# CONFLICTING at an UNCHANGED head, so this stays true and the caller never re-spawns for that sha
+# (preserving the escalation as a terminal needs-you). A NEW commit changes the sha → this returns
+# false → the caller RE-spawns for the fresh sha (HERD-55).
 resolver_attempted() {
+  [ -s "$RESOLVE_STATE" ] || return 1
+  awk -v b="$1" -v s="$2" '$4==b && $5==s{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_ever_attempted <branch> — true iff ANY resolver was spawned for this branch at ANY sha.
+# Distinguishes a FIRST-ever conflict (fresh spawn) from a cross-sha RE-spawn on a new commit so the
+# console can read 'resolving (retry · new commit)' vs the initial 'resolving conflict…'.
+resolver_ever_attempted() {
   [ -s "$RESOLVE_STATE" ] || return 1
   awk -v b="$1" '$4==b{f=1} END{exit !f}' "$RESOLVE_STATE" 2>/dev/null
 }
 
-# record_resolve_attempt <pr#> <slug> <branch> — append one spawn record (BEFORE the spawn).
+# resolve_attempt_count <branch> — number of DISTINCT head shas a resolver has been spawned for on this
+# branch: the cross-sha retry budget. Counting distinct shas (not raw lines) makes it robust against a
+# double-record for the same sha, and mirrors "one review per commit" arithmetic. Compared against
+# $_RESOLVE_RETRY_MAX to cap pathological re-spawn churn across a long chain of still-conflicting commits.
+resolve_attempt_count() {
+  [ -s "$RESOLVE_STATE" ] || { printf '0'; return 0; }
+  awk -v b="$1" '$4==b{seen[$5]=1} END{n=0; for(k in seen) n++; print n}' "$RESOLVE_STATE" 2>/dev/null || printf '0'
+}
+
+# record_resolve_attempt <pr#> <slug> <branch> <headSha> — append one spawn record (BEFORE the spawn),
+# keyed by the head sha so resolver_attempted can gate re-spawns per commit.
 record_resolve_attempt() {
-  printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RESOLVE_STATE"
+  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$RESOLVE_STATE"
 }
 
 # review_verdict <pr#> <headSha> — the review-once-per-commit guard. Echoes the recorded verdict
@@ -758,11 +798,11 @@ _merge_method_flag() {
   esac
 }
 
-# spawn_resolver <slug> <pr#> <branch> — hand a newly-CONFLICTING PR to the isolated resolver.
-# Record-first keeps the loop guard sound; the spawn is best-effort.
+# spawn_resolver <slug> <pr#> <branch> <headSha> — hand a (re-)CONFLICTING PR to the isolated resolver.
+# Record-first (keyed by the head sha) keeps the loop guard sound; the spawn is best-effort.
 spawn_resolver() {
-  rs="$1"; rp="$2"; rb="$3"
-  record_resolve_attempt "$rp" "$rs" "$rb"
+  rs="$1"; rp="$2"; rb="$3"; rsha="$4"
+  record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   bash "$HERE/herd-resolve.sh" "$rs" >/dev/null 2>&1 || true
 }
 
@@ -2885,7 +2925,7 @@ for wt, branch in feats:
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=()
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
@@ -2963,11 +3003,23 @@ EOF
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
     elif [ "$mergeable" = "CONFLICTING" ]; then
-      if resolver_attempted "$branch"; then
+      if resolver_attempted "$branch" "$headsha"; then
+        # A resolver ALREADY ran for THIS exact head sha and the PR is still conflicting → terminal for
+        # this commit (the resolve failed, or it ESCALATE:d a semantically-ambiguous conflict and aborted
+        # without pushing, so the head is unchanged). Never re-spawn on the same sha — a new commit is
+        # what unsticks it.
         DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
+      elif [ "$(resolve_attempt_count "$branch")" -ge "$_RESOLVE_RETRY_MAX" ]; then
+        # Cross-sha retry cap hit: a resolver has already run across $_RESOLVE_RETRY_MAX distinct commits
+        # and each new head is STILL conflicting. Stop churning and ask a human rather than re-spawning
+        # for every fresh sha forever.
+        DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed (retry cap)${C_RESET}"
       else
+        # Either the FIRST conflict for this branch, or a NEW commit landed on a still-conflicting PR
+        # after a prior (now-stale) attempt at a different sha. Either way (re-)spawn the resolver for
+        # this sha — the resolve pass paints the fresh vs retry reason and records the attempt.
         DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
-        CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch")
+        CONF_IDX+=("$i"); CONF_SLUG+=("$slug"); CONF_PR+=("$prnum"); CONF_BRANCH+=("$branch"); CONF_SHA+=("$headsha")
       fi
     elif [ "$mergeable" = "MERGEABLE" ]; then
       # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
@@ -3203,20 +3255,27 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     esac
   done
 
-  # Resolve pass: auto-spawn the isolated conflict resolver for each NEWLY-conflicting PR.
+  # Resolve pass: auto-spawn the isolated conflict resolver for each (re-)conflicting PR. A PR reaches
+  # here only when NO resolver has run for its CURRENT head sha (the same-sha guard filters it out in
+  # the classify pass), so this is either a first conflict or a stale prior attempt at an older sha.
   k=0
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
-    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; k=$((k + 1))
+    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; consha="${CONF_SHA[k]}"; k=$((k + 1))
     sl="$(printf '%-*s' "$SLUGW" "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
+    # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
+    # spawn_resolver, so this read still sees only prior ticks' attempts.
+    _retry_reason="resolving conflict…"
+    resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
     if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
+      DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum} (${_retry_reason})${C_RESET}"
       render
       continue
     fi
-    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}${_retry_reason}${C_RESET}"
     render
-    spawn_resolver "$slug" "$prnum" "$branch"
+    spawn_resolver "$slug" "$prnum" "$branch" "$consha"
   done
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
