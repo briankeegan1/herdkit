@@ -153,6 +153,30 @@ disposable herdr workspace and **degrades to a clean skip** where herdr is unava
 `python3`, and a modern `bash`. No specific OS or package manager is assumed — these tools work
 on macOS and Linux alike.
 
+### One command (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/briankeegan1/herdkit/main/install.sh | bash
+```
+
+This clones herdkit to `~/.herdkit`, symlinks the `herd` entrypoint into the first writable
+directory on your `PATH` (or prints the exact `export PATH=…` line to add if none is writable),
+runs `herd doctor` to flag any missing dependencies with per-platform install hints, and finishes
+with the two-step quickstart. It is **idempotent**: re-run it any time to fast-forward-update the
+engine (`git pull --ff-only`) and re-verify — it never clobbers local state, and refuses politely
+on a dirty engine checkout (commit/stash first, or pass `--force`). Only `bash`, `git`, and `curl`
+are needed to bootstrap. Install elsewhere with `HERDKIT_HOME=/path bash install.sh` (or pipe as
+above with the env var set).
+
+Then:
+
+```sh
+cd your-project
+herd init
+```
+
+### Manual — clone + wire PATH yourself
+
 ```sh
 git clone https://github.com/briankeegan1/herdkit.git ~/source/herdkit
 ```
