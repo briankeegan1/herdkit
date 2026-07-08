@@ -152,16 +152,43 @@ EOF
     ;;
 
   approve)
-    prnum="${1:-}"
-    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#|slug>" >&2; exit 1; }
+    # Optional --sha <sha> PINS the approval to a specific commit: a human who saw a commit in `list`
+    # can assert "approve THIS sha" so a hold that was superseded by a new push (the sha moved) is
+    # refused instead of silently approving a different commit than the operator reviewed (HERD-157).
+    prnum=""; pin_sha=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --sha) pin_sha="${2:-}"; shift 2 ;;
+        --sha=*) pin_sha="${1#--sha=}"; shift ;;
+        -*) echo "herd-approve.sh approve: unknown flag: $1 (usage: approve <pr#|slug> [--sha <sha>])" >&2; exit 1 ;;
+        *) [ -z "$prnum" ] && prnum="$1"; shift ;;
+      esac
+    done
+    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#|slug> [--sha <sha>]" >&2; exit 1; }
+    # pin_matches <live-sha> — 0 unless --sha was given and disagrees with the live hold's sha. A
+    # PREFIX match counts (list shows the short 8-char sha a human copies; git-style prefixes against
+    # the single known live sha are unambiguous). On a real mismatch it prints a LOUD refusal (the
+    # operator asked to approve a commit that is no longer what is held) and returns 1 so the caller
+    # bails before recording anything.
+    pin_matches() {
+      local live="$1"
+      [ -z "$pin_sha" ] && return 0
+      [ "$pin_sha" = "$live" ] && return 0
+      case "$live" in "$pin_sha"*) return 0 ;; esac
+      printf '🛑 Refusing: you asked to approve sha %s, but %s is currently holding %s.\n' "$pin_sha" "$prnum" "$live" >&2
+      printf '   A newer commit may have superseded the one you reviewed. Re-check `herd-approve.sh list` and retry.\n' >&2
+      return 1
+    }
     # PUSH_GATE=human (HERD-123): if the argument names a builder with a LIVE push-hold (pre-PR), this
     # is a PUSH approval, not a merge approval — record it and RESUME (push + PR creation). A PR number
     # is numeric and a builder slug is kebab-case, so a live push-hold for "$prnum" unambiguously
     # selects this path; otherwise fall through to the existing PR-merge approval below. push_gate_resume
     # is fail-soft: a stale (new-commit) or corrupt hold refuses LOUDLY and pushes nothing.
     if [ -n "$(push_gate_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      pin_matches "$(push_gate_awaiting_sha "$prnum")" || exit 1
       _pg_approved_sha="$(push_gate_approve "$prnum")" || { echo "❌ Could not record push approval for '$prnum'." >&2; exit 1; }
-      printf '✅ Push approval recorded for %s (%.8s) — resuming push + PR creation…\n' "$prnum" "$_pg_approved_sha"
+      printf '✅ Push approval recorded for %s — approved commit %s.\n' "$prnum" "$_pg_approved_sha"
+      printf '   Resuming push + PR creation…\n'
       push_gate_resume "$prnum"; exit $?
     fi
     # PIPELINE STEPS (HERD-132): if the argument names a builder/slug with a LIVE step-hold (a
@@ -170,8 +197,10 @@ EOF
     # number never selects this path; checked after the push-hold (a builder hits a push-hold only once,
     # after its step holds). steps_hold_release is fail-soft: a stale/corrupt hold refuses LOUDLY.
     if [ -n "$(steps_hold_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      pin_matches "$(steps_hold_awaiting_sha "$prnum")" || exit 1
       _st_approved_sha="$(steps_hold_approve "$prnum")" || { echo "❌ Could not record step approval for '$prnum'." >&2; exit 1; }
-      printf '✅ Step approval recorded for %s (%.8s) — resuming the pipeline past the held step…\n' "$prnum" "$_st_approved_sha"
+      printf '✅ Step approval recorded for %s — approved commit %s.\n' "$prnum" "$_st_approved_sha"
+      printf '   Resuming the pipeline past the held step…\n'
       steps_hold_release "$prnum"; exit $?
     fi
     if [ ! -s "$APPROVALS" ]; then
@@ -185,12 +214,13 @@ EOF
     if [ -z "$sha" ]; then
       printf 'No awaiting approval record found for PR #%s.\n' "$prnum" >&2; exit 1
     fi
+    pin_matches "$sha" || exit 1
     # Idempotent: don't double-write if already approved for this sha.
     if grep -q "^[0-9]* approved $prnum $sha$" "$APPROVALS" 2>/dev/null; then
-      printf 'PR #%s commit %.8s is already approved.\n' "$prnum" "$sha"; exit 0
+      printf 'PR #%s commit %s is already approved.\n' "$prnum" "$sha"; exit 0
     fi
     printf '%s approved %s %s\n' "$(date +%s)" "$prnum" "$sha" >> "$APPROVALS"
-    printf '✅ Approved PR #%s (%.8s) — the watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
+    printf '✅ Approved PR #%s — approved commit %s. The watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
     ;;
 
   why)
