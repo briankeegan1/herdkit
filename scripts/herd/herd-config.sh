@@ -356,6 +356,26 @@ fi
 # DOCS_ONLY_GLOB is blank.
 : "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
+# ── Risk-scoped pre-PR local review (LOCAL_REVIEW=risk-scoped + LOCAL_REVIEW_GLOB, HERD-100) ──────
+# LOCAL_REVIEW=pre-pr makes EVERY builder run the cheap local adversarial correctness review before
+# it opens its PR. Journal analysis shows round-1 review BLOCKs cluster on the high-churn engine
+# files, so a BLANKET pre-PR review wastes quota reviewing low-risk diffs that never block. The
+# risk-scoped mode fixes that: LOCAL_REVIEW=risk-scoped runs the local review ONLY when the builder's
+# OWN diff surface (git diff DEFAULT_BRANCH...HEAD --name-only) matches this egrep pattern; a diff
+# that touches no matching path skips straight to the PR (the watcher's post-PR review gate is
+# UNCHANGED and remains the authoritative correctness check, so a skipped low-risk pre-PR review is a
+# cost saving, never a safety hole — same fail-open-is-safe rationale as skipping is backstopped
+# post-PR). A DEDICATED key (not a reuse of REVIEW_ESCALATE_GLOB) on purpose: the PRE-PR risk surface
+# — where builder-side round-1 BLOCKs cluster — is chosen independently of the POST-PR review-tiering
+# surface, so operators can scope the two separately; leave it equal to REVIEW_ESCALATE_GLOB if the
+# same pattern fits both. Reuses REVIEW_ESCALATE_GLOB / HEALTHCHECK_HEAVY_GLOB egrep semantics.
+# SAFE DEFAULT: EMPTY (default) → dormant. Only LOCAL_REVIEW=risk-scoped consults it; with pre-pr or
+# none the key is inert. FAIL-SOFT (mirrors the HEALTHCHECK_HEAVY_GLOB hardening): risk-scoped with an
+# EMPTY or INVALID glob falls back — LOUDLY — to unconditional pre-pr (review everything), never to a
+# silent skip, so a misconfigured glob can only OVER-review, never UNDER-review. Consumed inline by
+# herd-quick.sh / herd-feature.sh (the builder prompt is the only surface threaded), same as LOCAL_REVIEW.
+: "${LOCAL_REVIEW_GLOB:=""}"
+
 : "${APP_PREVIEW_CMD:=""}"        # empty → no preview pane (quick-only project, e.g. herdkit)
 : "${HEALTHCHECK_CMD:=""}"        # project health command; exit 0 clean/data-env, 1 code error
 : "${HEALTHCHECK_HEAVY_GLOB:=""}" # diff paths that force the heavy profile (egrep, e.g. '^app/')

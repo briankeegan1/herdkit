@@ -99,8 +99,8 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-advise.sh` → `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
-- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
-- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
 - `herd-review.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
@@ -140,7 +140,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
-- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `healthcheck.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`
+- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
@@ -165,6 +165,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
+- `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
