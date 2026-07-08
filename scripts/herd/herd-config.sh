@@ -164,6 +164,12 @@ fi
 : "${WORKTREES_DIR:="${PROJECT_ROOT}-trees"}"
 : "${DEFAULT_BRANCH:="origin/main"}"
 : "${WORKSPACE_NAME:="$(basename "$PROJECT_ROOT")"}"
+# Project-defined branch naming for the builder lanes (HERD-120). The DEFAULT 'feat/{slug}' renders
+# byte-identical to the historically-hardcoded feat/<slug>, so an unset key is zero behavior change.
+# Tokens: {slug} (required — the coordinator-chosen kebab name) and optional {ref} (the tracker id).
+# ONE shared render+parse helper (herd_branch_render / herd_branch_parse, below) routes every branch
+# construction AND parse site through this so naming stays consistent end-to-end.
+: "${BRANCH_TEMPLATE:="feat/{slug}"}"
 
 # ── Console-strict config binding (issue #60 launch-binding guard) ───────────
 # A long-running CONSOLE (agent-watch / herd-watch / backlog-view / coordinator) sets
@@ -1093,4 +1099,73 @@ herd_write_task_spec() {
   fi
   # Spec is safely on disk — only now emit the SHORT pointer the agent receives in place of the spec.
   printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_ts_file"
+}
+
+# ── Project-defined branch naming (BRANCH_TEMPLATE, HERD-120) ─────────────────────────────────────
+# feat/<slug> was hardcoded across the lanes (new-feature.sh), the resolver, and the watcher's
+# dep-check fallback. These two helpers are the SINGLE seam every branch construction AND parse site
+# routes through, so a project can rename its lanes' branches without the pieces drifting out of sync.
+#
+# The template lives in BRANCH_TEMPLATE (default 'feat/{slug}', byte-identical to the old hardcoded
+# name when unset). Tokens: {slug} (required) and optional {ref} (the tracker id, e.g. HERD-120).
+# FAIL-SOFT: a malformed template (missing {slug}) warns once and falls back to the default rather
+# than producing an unusable branch — the no-false-red / never-strand-work discipline.
+#
+# render and parse are exact inverses for any template whose {slug} is delimited from its {ref}/prefix
+# by a literal separator (e.g. 'feat/{slug}', '{ref}/{slug}', 'wip/{slug}', 'feat/{slug}-exp'), which
+# covers every realistic naming scheme. The round-trip is locked by tests/test-branch-template.sh.
+
+# _herd_branch_template — the effective template, with the malformed-template fallback applied ONCE.
+# Warns to stderr (not stdout, so a render's captured output is never polluted) when it falls back.
+_herd_branch_template() {
+  # NB: never use ${BRANCH_TEMPLATE:-feat/{slug}} — the '}' inside the default word closes the
+  # expansion early and appends a stray '}'. Resolve the default on its own line instead.
+  local _bt="${BRANCH_TEMPLATE:-}"
+  [ -n "$_bt" ] || _bt='feat/{slug}'
+  case "$_bt" in
+    *'{slug}'*) printf '%s' "$_bt" ;;
+    *) echo "⚠️  BRANCH_TEMPLATE='$_bt' has no {slug} token — falling back to 'feat/{slug}'." >&2
+       printf '%s' 'feat/{slug}' ;;
+  esac
+}
+
+# herd_branch_render <slug> [ref] — echo the branch name for this slug (and optional tracker ref).
+# {slug}/{ref} are substituted; an empty {ref} collapses the doubled/edge separator it would leave
+# (so '{ref}/{slug}' with no ref → '<slug>', a valid branch) — the default 'feat/{slug}' path never
+# hits that and stays byte-identical to feat/<slug>.
+herd_branch_render() {
+  local _br_slug="${1:-}" _br_ref="${2:-}" _br_out
+  _br_out="$(_herd_branch_template)"
+  _br_out="${_br_out//\{slug\}/$_br_slug}"
+  _br_out="${_br_out//\{ref\}/$_br_ref}"
+  # Collapse runs of '/' (an empty {ref} can leave '//' or a leading '/') and trim edge slashes.
+  while case "$_br_out" in *//*) true ;; *) false ;; esac; do _br_out="${_br_out//\/\//\/}"; done
+  _br_out="${_br_out#/}"; _br_out="${_br_out%/}"
+  printf '%s' "$_br_out"
+}
+
+# herd_branch_parse <branch> — echo the slug encoded in <branch> under the active BRANCH_TEMPLATE
+# (the inverse of herd_branch_render). Strips the template's literal prefix (everything up to {slug},
+# with any {ref} treated as a wildcard) and its literal suffix (everything after {slug}). Empty when
+# the branch does not fit the template. Mirrored inline by the watcher's orphan-tab sweep (python).
+herd_branch_parse() {
+  local _bp_tmpl _bp_pre _bp_post _bp_out="${1:-}"
+  _bp_tmpl="$(_herd_branch_template)"
+  _bp_pre="${_bp_tmpl%%\{slug\}*}"   # literal (+ maybe {ref}) BEFORE {slug}
+  _bp_post="${_bp_tmpl#*\{slug\}}"    # literal (+ maybe {ref}) AFTER  {slug}
+  # Strip the prefix. With a {ref} in it, drop up to the last occurrence of the separator that
+  # trails the ref (e.g. '/'); otherwise drop the fixed literal prefix from the front.
+  case "$_bp_pre" in
+    *'{ref}'*) local _bp_sep="${_bp_pre##*\{ref\}}"; [ -n "$_bp_sep" ] && _bp_out="${_bp_out##*$_bp_sep}" ;;
+    '')        : ;;
+    *)         _bp_out="${_bp_out#"$_bp_pre"}" ;;
+  esac
+  # Strip the suffix. With a {ref} in it, cut from the first occurrence of the separator that
+  # leads the ref; otherwise drop the fixed literal suffix from the end.
+  case "$_bp_post" in
+    *'{ref}'*) local _bp_sep2="${_bp_post%%\{ref\}*}"; [ -n "$_bp_sep2" ] && _bp_out="${_bp_out%%$_bp_sep2*}" ;;
+    '')        : ;;
+    *)         _bp_out="${_bp_out%"$_bp_post"}" ;;
+  esac
+  printf '%s' "$_bp_out"
 }

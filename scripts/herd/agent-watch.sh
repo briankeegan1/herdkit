@@ -2060,14 +2060,37 @@ for line in os.environ.get("WT","").splitlines():
       print(os.path.basename(p))
 ' 2>/dev/null || true)"
 
-  # Collect live slugs from open PRs (headRefName last component).
+  # Collect live slugs from open PRs by parsing each headRefName under the active BRANCH_TEMPLATE
+  # (HERD-120) — mirrors herd_branch_parse so a custom / non-feat branch scheme still resolves the
+  # slug that keys the tab, instead of assuming the slug is the last '/'-segment.
   local _sw_pr_slugs
-  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | python3 -c '
-import sys, json
+  local _sw_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_sw_tmpl" ] || _sw_tmpl='feat/{slug}'
+  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
+import sys, json, os
+tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
+if "{slug}" not in tmpl: tmpl = "feat/{slug}"
+pre, _, post = tmpl.partition("{slug}")
+def parse(b):
+  s = b
+  if "{ref}" in pre:
+    sep = pre.rsplit("{ref}", 1)[1]
+    if sep:
+      i = s.rfind(sep)
+      if i >= 0: s = s[i + len(sep):]
+  elif pre and s.startswith(pre):
+    s = s[len(pre):]
+  if "{ref}" in post:
+    sep2 = post.split("{ref}", 1)[0]
+    if sep2:
+      i = s.find(sep2)
+      if i >= 0: s = s[:i]
+  elif post and s.endswith(post):
+    s = s[:len(s) - len(post)]
+  return s
 try:
   for p in json.load(sys.stdin):
     b = p.get("headRefName","")
-    if b: print(b.split("/")[-1])
+    if b: print(parse(b))
 except Exception:
   pass
 ' 2>/dev/null || true)"
@@ -2227,14 +2250,36 @@ except Exception:
 
   # (2) One gh call: map each OPEN PR's slug → its mergeable state. A slug ABSENT from this map has no
   #     open PR (merged/closed/never-existed) → its conflict is definitively gone.
-  local _srt_prs
-  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | python3 -c '
-import sys, json
+  local _srt_prs _srt_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_srt_tmpl" ] || _srt_tmpl='feat/{slug}'
+  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | BRANCH_TEMPLATE="$_srt_tmpl" python3 -c '
+import sys, json, os
+# Parse each headRefName to its slug under the active BRANCH_TEMPLATE (HERD-120), mirroring
+# herd_branch_parse — so a custom / non-feat branch scheme resolves the slug that keys the resolve tab.
+tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
+if "{slug}" not in tmpl: tmpl = "feat/{slug}"
+pre, _, post = tmpl.partition("{slug}")
+def parse(b):
+    s = b
+    if "{ref}" in pre:
+        sep = pre.rsplit("{ref}", 1)[1]
+        if sep:
+            i = s.rfind(sep)
+            if i >= 0: s = s[i + len(sep):]
+    elif pre and s.startswith(pre):
+        s = s[len(pre):]
+    if "{ref}" in post:
+        sep2 = post.split("{ref}", 1)[0]
+        if sep2:
+            i = s.find(sep2)
+            if i >= 0: s = s[:i]
+    elif post and s.endswith(post):
+        s = s[:len(s) - len(post)]
+    return s
 try:
     for p in json.load(sys.stdin):
         b = p.get("headRefName","")
         if b:
-            print(b.split("/")[-1] + "\t" + (p.get("mergeable","") or ""))
+            print(parse(b) + "\t" + (p.get("mergeable","") or ""))
 except Exception:
     pass
 ' 2>/dev/null || true)"
@@ -4079,7 +4124,11 @@ _spawn_dep_merged() {
   # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
   [ -z "${DRYRUN:-}" ] || return 1
   local _sdm_target
-  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="feat/$_sdm_after"; fi
+  # A slug dependency resolves to its branch via the shared BRANCH_TEMPLATE helper (HERD-120), not a
+  # hardcoded feat/ prefix, so a project with custom branch naming still resolves the gh fallback. The
+  # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
+  # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi
   [ "$(gh pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
   return 1
 }

@@ -16,6 +16,11 @@ PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
 WORKTREES_DIR="$HOME/source/myproject-trees"   # the worktree pool (sibling, never committed)
 DEFAULT_BRANCH="origin/main"                   # branch off / push to this
 WORKSPACE_NAME="myproject"                     # herdr workspace label
+# BRANCH_TEMPLATE — how the lanes name their feature branches (HERD-120). Default 'feat/{slug}' is
+# byte-identical to the historically-hardcoded feat/<slug>. Tokens: {slug} (required) and optional
+# {ref} (the tracker id, filled when the coordinator spawns from a tracked item). A malformed
+# template (no {slug}) warns and falls back to the default. Uncomment to use a project convention:
+# BRANCH_TEMPLATE="feat/{slug}"                # e.g. "{ref}/{slug}" → HERD-120/my-slug · "wip/{slug}"
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
