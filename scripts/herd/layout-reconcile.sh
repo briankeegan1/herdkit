@@ -156,6 +156,63 @@ layout_write_registry() {
   } > "$file"
 }
 
+# ── stale single-pane drainer/reviewer tab flagging (HERD-114 crash sweep) ────
+# A herdr crash can strand a SINGLE-PANE drainer/reviewer tab whose agent PROCESS was killed while the
+# tab + pane persist: the pane falls back to a BARE shell (its `claude` gone). These leftovers slip
+# past the reviewer-pane registry sweep (their dispatch row may be gone too) and the orphan-tab sweep
+# (their PR/worktree may still exist). This eyes-on-layout flag NAMES them from the live scan so a
+# caller can surface/retire them; it is READ-ONLY and never closes anything itself.
+
+# _reload_tabs <workspace_id> → one "tab_id<TAB>label" line per tab (empty when herdr is absent).
+_reload_tabs() {
+  herdr tab list --workspace "$1" 2>/dev/null | python3 -c '
+import sys,json
+try: tabs=json.load(sys.stdin)["result"]["tabs"]
+except Exception: tabs=[]
+for t in tabs:
+    tid=t.get("tab_id","") or ""
+    if tid: print("%s\t%s"%(tid,(t.get("label","") or "").replace("\t"," ")))
+' 2>/dev/null || true
+}
+
+# _is_drainer_or_reviewer_label <label> — success iff <label> names an engine DRAINER or REVIEWER
+# single-pane agent tab: a reviewer (review·<slug>), conflict resolver (resolve·<slug>), scribe drainer
+# (scribe-<ws>), or research drainer (researcher-<ws>). A control-room / coordinator / plain feature-
+# builder tab is deliberately NOT matched — a builder tab is recovered by its own dead-agent path, and
+# the control room is multi-pane and load-bearing — so those are never flagged as stale leftovers.
+_is_drainer_or_reviewer_label() {
+  case "$1" in
+    review·*|resolve·*|scribe-*|researcher-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# layout_stale_agent_tabs <workspace_id> — emit one "tab_id<TAB>label<TAB>role" line per STALE
+# single-pane drainer/reviewer tab: EXACTLY one pane, that pane a DEAD agent (role bare|gone — its
+# claude process is gone), AND an engine drainer/reviewer label. Read-only; empty when herdr is absent
+# or nothing is stale. The caller decides whether to surface or retire — this only supplies the eyes.
+layout_stale_agent_tabs() {
+  local ws="$1" tid label panes n p role tab
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r tid label; do
+    [ -n "$tid" ] || continue
+    _is_drainer_or_reviewer_label "$label" || continue
+    # Count panes; a crash-stranded drainer/reviewer is single-pane by construction.
+    panes="$(_reload_tab_panes "$ws" "$tid")"
+    n=0
+    while IFS= read -r p; do [ -n "$p" ] && n=$((n+1)); done <<EOF
+$panes
+EOF
+    [ "$n" -eq 1 ] || continue
+    role="$(_reload_pane_role "${panes%%$'\n'*}")"
+    case "$role" in
+      bare|gone) printf '%s\t%s\t%s\n' "$tid" "$label" "$role" ;;
+    esac
+  done <<EOF
+$(_reload_tabs "$ws")
+EOF
+}
+
 # layout_fold_stray_tabs <workspace_id> <workspace_name> — close stray STANDALONE control-room tabs
 # ("watch-<name>" / "backlog-<name>") that earlier bad reloads left behind; those roles belong
 # INSIDE the coordinator tab, re-established there by the caller. The coordinator tab is never

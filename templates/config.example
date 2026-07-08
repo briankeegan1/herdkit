@@ -16,6 +16,11 @@ PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
 WORKTREES_DIR="$HOME/source/myproject-trees"   # the worktree pool (sibling, never committed)
 DEFAULT_BRANCH="origin/main"                   # branch off / push to this
 WORKSPACE_NAME="myproject"                     # herdr workspace label
+# BRANCH_TEMPLATE — how the lanes name their feature branches (HERD-120). Default 'feat/{slug}' is
+# byte-identical to the historically-hardcoded feat/<slug>. Tokens: {slug} (required) and optional
+# {ref} (the tracker id, filled when the coordinator spawns from a tracked item). A malformed
+# template (no {slug}) warns and falls back to the default. Uncomment to use a project convention:
+# BRANCH_TEMPLATE="feat/{slug}"                # e.g. "{ref}/{slug}" → HERD-120/my-slug · "wip/{slug}"
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
@@ -103,6 +108,13 @@ SMOKE_CMD=""                        # optional; an extra smoke gate used by the 
 # default — reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
 # (review gate). An explicit MODEL_* key here ALWAYS beats the starter default (TOKEN_MODE and the
 # escalate globs compose on top of whatever you set).
+#
+# Every MODEL_* value accepts an optionally runtime-qualified ref '<driver>:<model>' (HERD-151): a BARE
+# model id (as below) runs on the default driver — byte-identical to before — while a '<driver>:' prefix
+# pins that role to a shipped runtime driver (templates/drivers/<name>.driver), e.g.
+# MODEL_QUICK="headless:claude-haiku-4-5". An unknown driver prefix FAILS LOUDLY at spawn time (never a
+# silent fallback). 'herd config set MODEL_*' suggests from templates/models.tsv (see 'herd config
+# models'); an uncatalogued model is allowed with a soft note — your model is never refused.
 MODEL_COORDINATOR="claude-opus-4-8"
 MODEL_FEATURE="claude-sonnet-4-6"   # eco default; escalate to Opus via MODEL_ESCALATE_GLOB
 MODEL_QUICK="claude-haiku-4-5"      # trivial lane → cheapest tier
@@ -181,6 +193,26 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Combination is fail-safe: ANY member's BLOCK blocks the merge; a merge needs >=1 PASS and zero BLOCKs.
 # REVIEW_PANEL="1"         # concurrent reviewer passes when NATIVE_BURST=on (default 1)
 
+# post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
+# health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
+# broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited
+# it). ON → after every merge the watcher runs the healthcheck against the freshly ff'd default-branch
+# HEAD (sha-keyed so each main sha runs once; runs the FULL heavy suite — a light check against the
+# default-branch checkout is a zero-file vacuous green; honors HEALTH_CONCURRENCY) and, on a
+# reproduced red, raises a LOUD persistent 'MAIN RED — <failing
+# test> (since #N)' console row + a notification, cleared when a later sha goes green. An ALARM only —
+# never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
+# MAIN_HEALTH_TICK="off"   # off (default) | on
+
+# Watcher-console FLAIR pack (HERD-147) — an ADDITIVE cosmetic layer on the live 'herd watch' console.
+# ON → (a) a merge CELEBRATION: the status tick after a merge prints one theme-colored line
+# '🐑 #<pr> joins the flock · <n> grazing'; (b) a PASTURE HEADER: one line rendering the in-flight herd
+# by state — 🐑 grazing (building), 💤 idle, ✅ in the pen (done). Colors come only from the active
+# theme (theme.sh C_* vars); NO_COLOR / non-tty renders plain. HARD RULE: flair NEVER softens a
+# red/dead/needs-you state — a 💀 dead or ⚠️ needs-you builder is exactly as loud as today, and it never
+# touches a gate or a merge decision. Ships OFF (byte-inert: every console byte identical to before).
+# WATCHER_FLAIR="off"      # off (default) | on
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After
@@ -201,6 +233,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 #                  coordinator | human. Only consulted when PR_FLOW=draft.
 PR_FLOW="direct"          # direct | draft
 PR_READY_WHEN="builder"   # builder | coordinator | human   (only used when PR_FLOW=draft)
+
+# PUSH_GATE (HERD-123) — gate-then-upload: hold a FINISHED builder for human review BEFORE anything
+# reaches GitHub. The missing seam: PR_FLOW=draft gates AFTER the push (PR already public);
+# MERGE_POLICY=approve gates AFTER review (PR exists); PUSH_GATE=human gates BEFORE the push, while the
+# diff is still only local. With =human the builder completes work + healthcheck but STOPS before
+# `git push` / `gh pr create`, recording a sha-keyed hold the watcher shows as 'ready · awaiting push
+# approval' with the worktree path; a human reviews the LOCAL diff and runs `herd-approve.sh approve
+# <slug>`, which resumes the push + PR creation. A new commit after the hold invalidates a prior
+# approval. SAFE DEFAULT: '' (off) → lanes byte-identical, this gate never fires.
+PUSH_GATE=""              # "" (default, off) | human
 
 # delete the head branch after a merge. false (default) preserves today's behavior (branches kept).
 DELETE_BRANCH_ON_MERGE="false"   # true | false

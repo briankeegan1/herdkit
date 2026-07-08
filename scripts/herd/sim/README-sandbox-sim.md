@@ -354,6 +354,51 @@ cat /tmp/sharedcfg-run/scorecard.json
 The scorecard mirrors the sandbox-sim JSON and **adds**: `key`, `branch`, `pr`, `merges`,
 `healthcheck_runs`, `merged`. Hermetic proof: `../../../tests/test-sandbox-shared-config.sh`.
 
+## HERD-127 — end-to-end GOVERNANCE scenario — `sandbox-governance-scenario.sh`
+
+Proves the WHOLE governance **import→enforcement chain** at zero quota, in one hermetic run. A fixture
+consumer's `CLAUDE.md` carries the canonical operator ruleset — *"I review every change before it is
+uploaded"*, *"never co-author Claude"*, a branch convention, a commit-subject convention — and the
+scenario drives every consumed feature as REAL code against a throwaway fixture. The only thing stubbed
+is the LLM (never called — the deterministic `templates/governance-map.tsv` alone classifies, proven by
+a `claude` PATH shim whose invocation log must stay empty) and `gh pr create` on the push-gate resume
+(a local seam, exactly as `sandbox-scenario.sh`'s push-gate phase). **Zero model calls, deterministic,
+no network, no herdr panes.**
+
+It asserts, in order, as scorecard checkpoints:
+
+- **(1) adoption** (HERD-119) — the deterministic table maps each `CLAUDE.md` sentence to its key:
+  `PUSH_GATE=human` · `ATTRIBUTION_POLICY=no-ai-coauthor` · `BRANCH_TEMPLATE=feat/{slug}` ·
+  `COMMIT_CONVENTION=^(feat|fix|…)` (real `_gov_statements` / `_gov_match` from `governance.sh`).
+- **(2) PUSH_GATE=human** (HERD-123) — a finished stub builder is HELD pre-push; **NOTHING** reaches the
+  bare `origin` until a human `approve`s, and approve resumes the push + PR.
+- **(3) ATTRIBUTION_POLICY** (HERD-121) — a commit carrying a `Co-Authored-By: Claude` trailer REDS the
+  real `healthcheck.sh` gate, **naming the offending sha**; a trailer-free commit stays green (no false red).
+- **(4) BRANCH_TEMPLATE / COMMIT_CONVENTION** (HERD-120 / HERD-124) — a non-conforming branch name (via
+  the real `herd_branch_parse`→`herd_branch_render` round-trip) and a non-conforming commit subject (via
+  the real commit-convention lint) are both REFUSED; the conforming forms are accepted.
+- **(5) reset contract** — the governance-augmented fixture rebuilds **byte-identical** (same HEAD sha)
+  across three independent builds; teardown leaves no residue.
+
+```sh
+# Drive the whole import→enforcement chain; inspect the scorecard:
+bash scripts/herd/sim/sandbox-governance-scenario.sh --artifacts /tmp/gov-run
+cat /tmp/gov-run/scorecard.json
+
+# Negative leg — flip ONE assertion (the attribution commit drops its trailer) so the gate stays
+# green when it must red; the scorecard must FAIL LOUDLY (result=fail, exit 1):
+SANDBOX_FORCE_GOVERNANCE_FAIL=1 bash scripts/herd/sim/sandbox-governance-scenario.sh --artifacts /tmp/gov-fail
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds** the governance fields: `governance_source`,
+`statements`, `mapped_keys` (**must be 4**), `push_held`, `push_resumed`, `attribution_red`,
+`offending_sha`, `branch_refused`, `commit_refused`, `reset_identical`, `model_calls` (**must be 0**).
+
+Flags: `--artifacts DIR` (repo(s) + scorecard; `--keep` implied), `--keep`. Env:
+`SANDBOX_FORCE_GOVERNANCE_FAIL=1` (the negative leg). Hermetic proof:
+`../../../tests/test-sandbox-governance.sh` (end-to-end all-pass, field accounting, the negative leg's
+single-flip loud failure, determinism across two runs, and no leak into the real repo).
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -365,6 +410,7 @@ The scorecard mirrors the sandbox-sim JSON and **adds**: `key`, `branch`, `pr`, 
 | **P2b** | `sandbox-real-panes-scenario.sh` | a **real** disposable herdr control room | pane/tab existence + labels, agent `idle→working→done`, **clean teardown (0 leaks)** |
 | **P2c** | `sandbox-real-remote-scenario.sh` | a **real** disposable GitHub repo (opt-in) | real `gh pr create` / watcher poll / `gh pr merge`, **guaranteed repo cleanup** |
 | **HERD-74** | `sandbox-shared-config-scenario.sh` | real `config set --shared` **+** the real watcher gate | a `config/<key>` branch with **no worktree** is **adopted → gated → merged → reaped** |
+| **HERD-127** | `sandbox-governance-scenario.sh` | the real HERD-119 adoption table **+** the shipped PUSH_GATE / ATTRIBUTION / BRANCH_TEMPLATE / COMMIT_CONVENTION gates | the whole governance **import→enforcement chain**: `CLAUDE.md` → mapped keys → held/refused/reddened at the gate (zero model calls) |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique

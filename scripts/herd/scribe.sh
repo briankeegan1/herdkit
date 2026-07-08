@@ -15,10 +15,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # HERD_DRIVER=headless spawns a detached scribe; herdr-claude emits the identical argv below.
 # shellcheck source=/dev/null
 . "$HERE/driver.sh"
-# Drainer singleton liveness (HERD-109): herd_drainer_hung lets the singleton check below tell a
-# HUNG-but-listed drainer from a live one, so a wedged drainer can't block the queue forever.
+# Drainer singleton liveness (HERD-109 / HERD-122): herd_drainer_* let the singleton check below tell a
+# HUNG-but-listed drainer from a live one, and CORROBORATE liveness before reclaiming so a fresh/live
+# drainer is never falsely declared hung.
 # shellcheck source=/dev/null
 . "$HERE/drainer-liveness.sh"
+# journal.sh gives the liveness path its forensic record (HERD-122): a refused reclaim, a genuine
+# reclaim, and a failed respawn each journal instead of dumping a raw driver error. Best-effort.
+# shellcheck source=/dev/null
+. "$HERE/journal.sh"
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
@@ -62,23 +67,38 @@ fi
 
 # 3. Is THIS project's scribe drainer already running? Match by name AND workspace_id (when known)
 #    so a scribe in a different workspace is not reused. herdr agent list has no --workspace flag;
-#    filter client-side via the workspace_id field each agent record already carries.
-if herdr agent list 2>/dev/null | NAME="$HERD_AGENT_SCRIBE" WS="$_WS_ID" python3 -c '
+#    filter client-side via the workspace_id field each agent record already carries. Capture the
+#    roster ONCE so the liveness corroboration below reads the SAME snapshot (no second call / TOCTOU).
+HEARTBEAT="$TREES/.scribe.heartbeat"
+AGENTS_JSON="$(herdr agent list 2>/dev/null || echo '{}')"
+if printf '%s' "$AGENTS_JSON" | NAME="$HERD_AGENT_SCRIBE" WS="$_WS_ID" python3 -c '
 import sys,json,os
 ws=os.environ.get("WS","")
+try:
+  agents=json.load(sys.stdin)["result"]["agents"]
+except Exception:
+  agents=[]
 sys.exit(0 if any(
   x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
-  for x in json.load(sys.stdin)["result"]["agents"]
+  for x in agents
 ) else 1)'; then
   # A drainer of this name is LISTED. Normally we short-circuit (it will drain this). But a listed
-  # drainer can be HUNG (wedged claude session / stuck step): its heartbeat ($HEARTBEAT, written by
-  # scribe-step.sh on every drain step) goes stale. If it is stale beyond DRAINER_HEARTBEAT_TIMEOUT,
-  # RECLAIM the singleton and fall through to spawn a fresh drainer (HERD-109) — the queue's atomic
-  # per-request claim keeps this from double-draining. Heartbeat fresh (or feature off / absent
-  # heartbeat) → the exact legacy path, byte-identical.
-  HEARTBEAT="$TREES/.scribe.heartbeat"
-  if herd_drainer_hung "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT"; then
-    echo "⚠️  scribe drainer appears HUNG (no heartbeat for >${DRAINER_HEARTBEAT_TIMEOUT}s) — reclaiming the singleton and spawning a fresh drainer (per-request atomic claim prevents double-draining)."
+  # drainer can be HUNG: its heartbeat ($HEARTBEAT, written by scribe-step.sh on every drain step)
+  # goes stale. HERD-109 reclaimed on stale-heartbeat alone — but that FALSE-POSITIVED a fresh,
+  # seconds-old drainer whose leftover heartbeat (from a prior drainer's lifetime) was ancient, and
+  # then failed the respawn with agent_name_taken (HERD-122). So a stale heartbeat now only reclaims
+  # once CORROBORATED: a working/idle live agent is never hung regardless of heartbeat age. Reclaim
+  # ONLY on positive death (dead pid / bare pane + stale heartbeat); otherwise keep the legacy path.
+  LIVE="$(herd_drainer_live_status "$HERD_AGENT_SCRIBE" "$AGENTS_JSON")"
+  if herd_drainer_should_reclaim "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT" "$LIVE"; then
+    echo "⚠️  scribe drainer is DEAD (no heartbeat for >${DRAINER_HEARTBEAT_TIMEOUT}s and its process is gone) — reclaiming the singleton and spawning a fresh drainer (per-request atomic claim prevents double-draining)."
+    journal_append drainer_reclaimed component scribe agent "$HERD_AGENT_SCRIBE" live_status "$LIVE" timeout "$DRAINER_HEARTBEAT_TIMEOUT"
+  elif herd_drainer_hung "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT"; then
+    # Heartbeat is stale but the agent is LIVE (working/idle) or its death can't be confirmed — refuse
+    # the reclaim and journal it (no-false-red). The live drainer will drain this request.
+    echo "✍️  scribe already running (heartbeat stale but the agent is live/${LIVE} — not hung); it will drain this."
+    journal_append drainer_reclaim_refused component scribe agent "$HERD_AGENT_SCRIBE" live_status "$LIVE" timeout "$DRAINER_HEARTBEAT_TIMEOUT"
+    exit 0
   else
     echo "✍️  scribe already running — it will drain this."; exit 0
   fi
@@ -103,6 +123,14 @@ Repeat this loop:
      MORE -> go back to step 1.
 2. Apply the request via the ACTIVE backend from the "BACKEND <name>" line just printed. The backend
    can change mid-session, so ALWAYS use the one printed for THIS request — never an earlier value:
+   • AMEND (any backend): if the request only APPENDS a clarification/comment/note to an EXISTING item
+     — not a new item, not a state change, not a title/description rewrite — do NOT hand-edit the file.
+     Run:  bash $HERE/scribe-step.sh amend "<claimed_path>" "<ref>" "<note>"
+     It attaches the note first-class (file backend: a dated "↳ note" line under the item entry;
+     github/linear: an issue comment) and NEVER changes state or title. <ref> = the item identifier
+     when the request names one (HERD-22, or a bare issue number for github), otherwise a distinctive
+     title phrase to match. If you cannot pin the request to exactly ONE existing item, SKIP (next
+     verb) — never guess which item to amend.
    • BACKEND is "file": edit ONLY $REPO/$BACKLOG_FILE. This covers BOTH new items AND state changes —
      marking an item done/in-progress/canceled is just editing its 🔜/🚧/✅ emoji (and, when done,
      moving it under "## Recently shipped"). Need to look into the repo first? dispatch an Explore
@@ -141,7 +169,11 @@ Repeat this loop:
          done | in-progress | canceled. For a reconcile request that gives only a PR number, work out
          the matching item identifier/title from the request text; if you cannot confidently pin it to
          ONE item, SKIP (next bullet) — never guess, never file a new issue.
-       – ANYTHING you cannot map to an add or a state change →
+       – APPEND a clarification/comment/note to an EXISTING item (NOT a new item, NOT a state change) →
+           bash $HERE/scribe-step.sh amend "<claimed_path>" "<ref>" "<note>"
+         Posts an issue comment; never changes state or title. If you cannot pin it to ONE existing
+         item, SKIP (next bullet) — never guess, never file a new issue.
+       – ANYTHING you cannot map to an add, a state change, or an amend →
            bash $HERE/scribe-step.sh skip "<claimed_path>" "<one-line reason>"
          skip records a loud line in the scribe report and files NOTHING. When in doubt between
          update-state and skip, prefer skip over add-item — a wrongly-filed issue is the exact bug.
@@ -151,9 +183,31 @@ Use scribe-step.sh for all git/queue/report mechanics. Never merge, switch branc
 file other than $BACKLOG_FILE (and only when the active backend is "file").
 EOF
 )
-created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus)
-TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')
-herd_driver_launch_agent \
-  name="$HERD_AGENT_SCRIBE" workspace="$_WS_ID" cwd="$REPO" tab="$TAB" env="SCRIBE_TAB=$TAB" \
-  model="$SCRIBE_MODEL" flags="$CLAUDE_FLAGS" pointer="$PROMPT"
-echo "✍️  scribe drainer dispatched (tab $TAB). Coordinator is free; watch for the JUST SCRIBED banner."
+# Stamp the heartbeat NOW, at spawn, so the grace period is measured from SPAWN rather than from a
+# leftover heartbeat left by a prior drainer's lifetime (HERD-122 fix 1). Without this, a fresh
+# drainer that has not yet run its first scribe-step could be seen as "hung since epoch" by a
+# concurrent enqueue seconds later. Best-effort; the step scripts keep it fresh from here on.
+herd_drainer_heartbeat "$HEARTBEAT"
+created=$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$REPO" --label "$HERD_AGENT_SCRIBE" --no-focus 2>/dev/null || true)
+TAB=$(printf '%s' "$created" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])' 2>/dev/null || true)
+if [ -z "$TAB" ]; then
+  # The control surface refused a tab (busy / herdr down). Journal an infra_event and exit cleanly —
+  # the request stays safely queued; the next enqueue retries. Never dump a raw driver error.
+  journal_append infra_event component scribe agent "$HERD_AGENT_SCRIBE" reason spawn_tab_failed
+  echo "✍️  scribe: could not create a drainer tab (control surface busy?) — your request is queued and the next enqueue will retry."
+  exit 0
+fi
+# Guard the launch: even after the corroboration above, a residual race (an existing drainer still
+# holds the name in herdr) makes `agent start` fail with agent_name_taken. Journal that as an
+# infra_event and exit cleanly instead of dumping the raw driver error (HERD-122 fix 3).
+if _launch_out="$(herd_driver_launch_agent \
+      name="$HERD_AGENT_SCRIBE" workspace="$_WS_ID" cwd="$REPO" tab="$TAB" env="SCRIBE_TAB=$TAB" \
+      model="$SCRIBE_MODEL" flags="$CLAUDE_FLAGS" pointer="$PROMPT" 2>&1)"; then
+  echo "✍️  scribe drainer dispatched (tab $TAB). Coordinator is free; watch for the JUST SCRIBED banner."
+else
+  herdr tab close "$TAB" >/dev/null 2>&1 || true
+  journal_append infra_event component scribe agent "$HERD_AGENT_SCRIBE" reason respawn_failed \
+    detail "$(printf '%s' "$_launch_out" | head -n1)"
+  echo "✍️  scribe: a drainer already holds the name — leaving the existing one in place; your request is queued and will be drained."
+  exit 0
+fi

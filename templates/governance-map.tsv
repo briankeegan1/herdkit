@@ -1,0 +1,48 @@
+# templates/governance-map.tsv — the DETERMINISTIC governance-adoption pattern table (HERD-119).
+#
+# `herd init`'s opt-in adoption pass reads an OPTIONAL CLAUDE.md / AGENTS.md (one source among many —
+# never required), splits it into statements, and matches each against the PATTERNS below to propose a
+# herd governance surface. Deterministic-first: this table is tried before any LLM fallback, so a
+# known statement maps identically every run. Fail-soft: an unmatched statement is NOT an error (it
+# flows to the style-convention heuristic or the gap report).
+#
+# Columns (TAB-separated):
+#   pattern  — an egrep ERE, matched case-insensitively against a source statement. First row that
+#              matches wins. Keep patterns specific enough to avoid false positives on prose.
+#   surface  — the ENFORCEMENT SURFACE the rule renders to. Exactly one of:
+#                config-key   → a MERGE-TIME .herd/config key (applied via `herd config set` on accept)
+#                provisioning → session grounding: the REVIEW_CHECKLIST file / CONTEXT_PROVISION notes
+#                hook         → a SESSION-TIME Claude Code settings.json hook, rendered by
+#                               `herd governance hooks render` (HERD-131), which consumes EVERY
+#                               surface==hook row (independent of pattern matching) and proposes each
+#                               as a per-hook, propose-then-write settings merge. `herd init`'s
+#                               adoption pass RECOGNIZES these rows but leaves them to that command.
+#                               DUAL-SURFACE: a hook row may mirror a config-key rule (e.g. the
+#                               no-ai-coauthor commit block below complements ATTRIBUTION_POLICY, and
+#                               the human-gate push warning complements PUSH_GATE=human) so the rule
+#                               binds at BOTH the keyboard (session) and the merge gate. A hook row
+#                               that shares a pattern with an earlier config-key row is shadowed for
+#                               adoption (first match wins) but still rendered by the hook command.
+#   target   — surface-specific:
+#                config-key   → SPACE-separated KEY=VALUE pair(s); each VALUE is shell-safe and
+#                               space-free (applied one `herd config set KEY VALUE` per pair).
+#                provisioning → a provisioning lane token (review-checklist).
+#                hook         → an opaque hook spec consumed by the follow-up (e.g. pre-action:run-checks).
+#   label    — a short human description of the rule, shown in the interview proposal alongside the
+#              QUOTED source sentence as evidence.
+pattern	surface	target	label
+(human|manual|someone|a person|reviewer).{0,40}(review|sign.?off|approv).{0,40}(before|prior|ahead of).{0,20}(push|upload|merg)	config-key	PUSH_GATE=human	Human review required before changes are pushed/uploaded
+(review|sign.?off|approv).{0,30}(before|prior).{0,20}(push|upload)	config-key	PUSH_GATE=human	Changes reviewed before they are pushed
+(never|no|not|don.?t|do not).{0,25}auto.?.?merg	config-key	MERGE_POLICY=approve	Never auto-merge without explicit approval
+require.{0,30}(approval|sign.?off|review).{0,20}(before|to|prior).{0,15}merg	config-key	MERGE_POLICY=approve	Merges require explicit approval
+squash.?.?merg	config-key	MERGE_METHOD=squash	Squash-merge pull requests
+rebase.?.?merg	config-key	MERGE_METHOD=rebase	Rebase-merge pull requests
+delete.{0,20}(the )?(head |feature )?branch(es)?.{0,20}(after|on|once|when).{0,15}merg	config-key	DELETE_BRANCH_ON_MERGE=true	Delete the head branch after merge
+(open|create|submit).{0,25}(pr|prs|pull request).{0,15}(as|in).{0,10}draft|draft.{0,10}(pr|prs|pull request)	config-key	PR_FLOW=draft	Open pull requests as drafts
+(never|no|not|don.?t|do not).{0,30}(co.?author|coauthor).{0,20}(claude|ai|assistant|bot|model)|no.?ai.?co.?author	config-key	ATTRIBUTION_POLICY=no-ai-coauthor	Never add an AI co-author trailer to commits
+(use|follow|adopt).{0,20}conventional.?.?commit	config-key	COMMIT_CONVENTION=^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)	Use Conventional Commits for commit messages
+(branch|branches).{0,25}(feat/|feature/|convention|naming|prefix|named|start with)	config-key	BRANCH_TEMPLATE=feat/{slug}	Feature branches follow the feat/<slug> naming convention (HERD-120)
+(run|execute).{0,25}(the )?(lint|linter|format|prettier|test|tests|suite).{0,25}(before|prior|ahead).{0,15}(commit|committing|push|pushing|merge)	hook	pre-action:run-checks	Run checks (lint/test/format) before committing or pushing
+(format|reformat|run .*formatter|prettier).{0,25}(before|on).{0,15}(commit|committing|save|saving)	hook	pre-action:format	Format code before committing
+(never|no|not|don.?t|do not).{0,30}(co.?author|coauthor).{0,20}(claude|ai|assistant|bot|model)|no.?ai.?co.?author	hook	pre-commit:no-ai-coauthor	Block a commit carrying an AI attribution trailer (session-time; complements ATTRIBUTION_POLICY)
+(human|manual|someone|a person|reviewer).{0,40}(review|sign.?off|approv).{0,40}(before|prior|ahead of).{0,20}(push|upload)	hook	pre-push:human-gate	Warn before a direct git push — human review expected first (session-time; complements PUSH_GATE=human)

@@ -10,9 +10,11 @@
 #   - NO live app-preview pane (no free-port app server, no [app│agent] split).
 #   - just ONE pane: the Claude sub-agent, in the worktree, yolo by default.
 #
-# The pre-PR healthcheck is SHARED with herd-feature.sh and auto-adapts: if the diff matches
-# HEALTHCHECK_HEAVY_GLOB it runs the full heavy profile; otherwise the LIGHT profile (per-changed
-# -file syntax + the project test command). See healthcheck.sh.
+# The pre-PR verification instruction is SHARED with herd-feature.sh and SCOPED (HERD-99): the builder
+# is told to verify its OWN surface — the LIGHT profile (per-changed-file syntax) plus its own new/
+# changed tests — NOT the whole heavy suite. The watcher's gate-time full run stays the authoritative
+# pass, so a blanket local heavy run just duplicates it; the scoped text says so and leaves --heavy
+# available for a builder that wants extra confidence. See healthcheck.sh for the profiles.
 #
 # Pick the lane:
 #   herd-feature.sh  — app-facing features; you want the live preview.
@@ -40,6 +42,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Runtime driver shim: under HERD_DRIVER=headless this lane spawns a DETACHED agent (no herdr tab)
 # via herd_driver_start_agent; the default herdr-claude driver keeps the herdr path below unchanged.
 . "$HERE/driver.sh"
+# Pipeline steps (HERD-132) — the shared step-runner. Sourced for steps_has_seam so the BUILDER-seam
+# rule (post-build / post-healthcheck) is threaded into the prompt below only when the project defines
+# such steps; the watcher owns the pre/post-merge seams. Sourcing DEFINES functions only (CLI dispatch
+# is $0-guarded), so this is byte-inert when .herd/steps.tsv is absent/empty.
+. "$HERE/steps.sh"
 _HERD_DRIVER_NAME="$(herd_driver_name)"
 # Force-spawn override: a leading --force/-f (or HERD_FORCE_SPAWN=1) bypasses the advisory
 # review-gate saturation check below, for urgent items. Only recognized as the FIRST arg so it can
@@ -82,6 +89,10 @@ if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
   fi
 fi
+# Resolve an optionally runtime-qualified model ref (HERD-151) → bare model. Loud-fails at spawn time
+# on an unknown driver prefix; byte-identical for a bare model id. (Idempotent when this lane later
+# routes through herd_driver_start_agent under headless — a bare model resolves to itself.)
+MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if
@@ -154,6 +165,26 @@ else
   LOCAL_REVIEW_RULE=""
 fi
 
+# PUSH_GATE=human (HERD-123) — hold this FINISHED builder for human review BEFORE anything reaches
+# GitHub (gate-then-upload). SAFE DEFAULT: PUSH_GATE unset/'' → PUSH_GATE_RULE empty, rules text
+# byte-for-byte unchanged and the builder pushes + opens its PR normally. When =human the builder does
+# ALL its work + healthcheck but must NOT run '$PR_CREATE_CMD' / 'git push' — instead it records a
+# sha-keyed push-hold via push-gate.sh; a human reviews the LOCAL diff and approves, which resumes the
+# push + PR creation. Unknown value → off (fail safe). Normalized inline, same pattern as PR_FLOW.
+_push_gate="${PUSH_GATE:-}"; case "$_push_gate" in human) ;; *) _push_gate="" ;; esac
+if [ "$_push_gate" = "human" ]; then
+  PUSH_GATE_RULE=" PUSH GATE (human review BEFORE upload): this project holds finished builders for human review before ANYTHING reaches GitHub. Do NOT run '$PR_CREATE_CMD' and do NOT 'git push' yourself. Instead, once your work is committed and the healthcheck passes, write your intended PR body (including any 'Refs:' line) to a file and run:  bash $HERE/push-gate.sh hold $SLUG --title \"<your PR title>\" --body-file <that-file>  — this records a sha-keyed hold and STOPS. A human then reviews your LOCAL diff and runs 'herd-approve.sh approve $SLUG', which resumes the push + PR creation for you. Nothing you build reaches GitHub until a human approves; a new commit after the hold invalidates a prior approval, so re-run the hold if you change anything."
+else
+  PUSH_GATE_RULE=""
+fi
+
+# Pipeline steps (HERD-132) — the BUILDER-seam rule (post-build / post-healthcheck), threaded ONLY
+# when the project defines such steps in .herd/steps.tsv (else EMPTY → prompt byte-identical). The
+# watcher runs the pre/post-merge seams itself, so they are never mentioned to the builder. Built by
+# the shared steps_builder_rule helper so both lanes inject identical text — same opt-in pattern as
+# PUSH_GATE_RULE above.
+STEPS_RULE="$(steps_builder_rule "$SLUG" "$DIR" "$HERE" "$PR_CREATE_CMD")"
+
 # Tracker linkage (HERD-39): when the coordinator spawns from a TRACKED item it prefixes the lane
 # command with HERD_ITEM_REF=<id>. When set, the LANE RULES below REQUIRE the builder to carry an
 # explicit 'Refs: <id>' line in its PR body, so merge-time reconcile (agent-watch.sh) resolves the
@@ -182,9 +213,14 @@ GROUNDING_RULE="$(herd_context_provision_preamble)"
 #    (no --split right). Yolo by default is fine: the worktree is isolated. Seeded task + the
 #    standing workflow rules become its opening prompt.
 RULES="[workflow rules] Build ONLY this change in this worktree. Before running '$PR_CREATE_CMD',
-run:  bash $HERE/healthcheck.sh \"$DIR\"  and get a clean pass (fix any CODE errors; data/env
-warnings are fine).$LOCAL_REVIEW_RULE$PR_READY_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
-If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped.$GROUNDING_RULE$REFS_RULE"
+verify YOUR change's OWN surface — you do NOT run the full heavy suite yourself. Run
+ bash $HERE/healthcheck.sh \"$DIR\" --light  (per-changed-file syntax) PLUS any test you added or
+changed, and get a clean pass (fix any CODE errors; data/env warnings are fine). DESCOPED, on purpose:
+the whole-project heavy profile (healthcheck.sh --heavy / the full test suite) is NOT required of you
+here — the auto-merge watcher re-runs that FULL profile as the AUTHORITATIVE merge gate, so a blanket
+local heavy run only duplicates it and burns turns. If your change is broad or risky you MAY still run
+it yourself with  bash $HERE/healthcheck.sh \"$DIR\" --heavy  (descoped = optional, not forbidden).$LOCAL_REVIEW_RULE$PR_READY_RULE$PUSH_GATE_RULE$STEPS_RULE Do NOT merge the PR and do NOT edit $BACKLOG_FILE — the auto-merge watcher merges ready PRs (healthcheck + review gate); the coordinator owns the backlog. Never read .herd/secrets and never write the work tracker (a Linear/GitHub issue's state, labels, or assignee) — the coordinator owns ALL item states; a builder that mutates tracker state corrupts the queue.
+If your change needs a manual step you cannot perform yourself (a live smoke test, a UI/pane check, anything needing a running app or human eyes), declare each such step in a 'HUMAN-VERIFY:' block in the PR body — one step per line. That switches this PR to a human-verify hold: all gates still run, but the watcher waits for a human to run 'herd-approve.sh approve <pr#>' instead of auto-merging, so the step is never silently skipped. If your change ADDS a capability to templates/capabilities.tsv (a command, config key, lever, or lane), add its row to templates/conformance.tsv in the SAME PR — a real proof (proof_kind unit|sim|render) when a test asserts its behavior, else a 'none-yet' note row — so 'herd conformance report' stays honest and the no-new-unmapped ratchet never flags your addition.$GROUNDING_RULE$REFS_RULE"
 # Externalize the full task spec (caller task + workflow-rules footer) to a file OUTSIDE the
 # worktree's tracked tree, and hand the builder a SHORT pointer prompt instead of a multi-KB argv.
 # herd_write_task_spec is FAIL-LOUD: a failed/partial spec write returns non-zero and — under
@@ -203,7 +239,23 @@ if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
     exit 1
   fi
 else
-  herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER"
+  # HERD-136: guard the launch so a failed 'agent start' (e.g. a residual agent_name_taken race) never
+  # aborts the lane leaving the tab we just created above as an empty corpse tab that nothing reaps.
+  # Close the just-created tab on the failure path and journal the reap before bailing (fail-soft; the
+  # success path is byte-identical — the same argv is captured whether or not it is wrapped in `if`).
+  if ! _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"; then
+    herdr tab close "$TAB" >/dev/null 2>&1 || true
+    journal_append infra_event component builder agent "$SLUG" reason spawn_agent_failed tab "$TAB"
+    echo "❌ herdr: could not start the builder agent for '$SLUG' — closed the empty tab; worktree is ready at $DIR." >&2
+    exit 1
+  fi
+  # HERD-135: LABEL the freshly-created agent pane with the slug so the dead-agent-eyes probe reads its
+  # role by label (and can still find it if the agent is later delisted) instead of positional/cmdline
+  # guessing. Best-effort: parse the pane id from the start result, else resolve via the roster; a
+  # rename the driver can't do just leaves the probe on its fallback heuristic (fail-soft, no red row).
+  _AGENT_PANE="$(herd_driver_pane_id_from_agent_start "$_agent_start_out")"
+  [ -z "$_AGENT_PANE" ] && _AGENT_PANE="$(herd_driver_agent_pane_id "$SLUG")"
+  [ -n "$_AGENT_PANE" ] && herd_driver_pane_rename "$_AGENT_PANE" "$SLUG"
 fi
 
 # 3b. Task-spec viewer in the tab's OTHERWISE-IDLE root pane (TASK_PANE_VIEW, default on). The quick
@@ -212,8 +264,17 @@ fi
 # bare shell exactly. Sent through the driver's send-text surface (the `herdr pane run` equivalent),
 # which fails SOFT if the pane is gone. HEADLESS has no panes → skip cleanly (panes are a view, not a
 # dependency), so the whole block is gated on the non-headless driver.
-if [ "$_HERD_DRIVER_NAME" != "headless" ] && [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
-  herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+# HERD-135: name the root pane's ROLE via the driver so the coordinator (human AND agent) never
+# mistakes the viewer pane for the agent pane again (the #249 incident): the viewer is 'task-spec·$SLUG'
+# and a bare shell (TASK_PANE_VIEW=off) is 'shell·$SLUG'. Fail-soft — a rename the driver can't do is a
+# clean no-op and the probe simply falls back to its heuristic.
+if [ "$_HERD_DRIVER_NAME" != "headless" ]; then
+  if [ "${TASK_PANE_VIEW:-on}" != "off" ]; then
+    herd_driver_pane_rename "$ROOT" "task-spec·$SLUG"
+    herd_driver_send_text "$ROOT" "bash $HERE/task-spec-view.sh \"$TASK_SPEC_FILE\""
+  else
+    herd_driver_pane_rename "$ROOT" "shell·$SLUG"
+  fi
 fi
 
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then

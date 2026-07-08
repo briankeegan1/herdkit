@@ -153,6 +153,11 @@ disposable herdr workspace and **degrades to a clean skip** where herdr is unava
 `python3`, and a modern `bash`. No specific OS or package manager is assumed — these tools work
 on macOS and Linux alike.
 
+> **Running unattended on macOS?** macOS **TCC** permission prompts (Full Disk Access, Automation)
+> can silently pause a builder that touches a protected resource with no one there to click Allow.
+> Pre-grant the right permissions and run headless so a hidden consent dialog never stalls the herd —
+> see [`docs/macos-unattended-permissions.md`](docs/macos-unattended-permissions.md).
+
 ### One command (recommended)
 
 ```sh
@@ -253,6 +258,12 @@ herd config get <KEY>        # print one validated key's value
 herd config set <KEY> <VAL>  # edit in place, then restart the watcher / re-render the skill
 herd config set --shared <KEY> <VAL>   # project-scoped change via a tiny config/<key> PR (multi-operator)
 herd config lint             # flag DUPLICATE keys (shell last-wins can silently disable a gate)
+
+# Export / apply a project's GOVERNANCE (merge/gate/PR/attribution/commit policy) as a portable profile:
+herd governance export --file gov.profile   # write the governance-scoped keys (secrets/machine keys never travel)
+herd governance apply gov.profile           # propose each key via the validated 'herd config set' (--yes for automation)
+herd init --governance gov.profile          # seed a fresh install from a profile
+herd fleet set --profile gov.profile        # roll a profile out across every registered project
 
 # Forensics — read the append-only engine journal (.herd/journal.jsonl):
 herd log [--pr N] [--tail]   # page the journal: one line per gate event; --tail follows live

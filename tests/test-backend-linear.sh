@@ -229,6 +229,30 @@ grep -q '"key": "ENG"' "$GQLLOG"  || fail "_backend_item_state did not scope res
 grep -q 'team_xyz' "$GQLLOG"      && fail "_backend_item_state must NOT scope resolution by the configured LINEAR_TEAM_ID"
 pass
 
+# 4a. HERD-117 claim-guard PRECONDITION — the adapter's state read is exactly what the pre-spawn claim
+#     guard (herd-claim.sh) consults to refuse a stale (Done/Canceled) pick before it can reopen a
+#     shipped issue. With the state read MOCKED, assert a completed AND a canceled issue both map to
+#     closed, that the query requests updatedAt, and that the last-updated day is surfaced as
+#     ITEM_UPDATED evidence (a refusal that cannot name the state/last-updated is a worse abort message).
+: > "$GQLLOG"
+guard_state() {   # env G_TYPE/G_UPD drive the mocked state.type + updatedAt; prints ITEM_STATE/ITEM_UPDATED.
+  ( cd "$T" && . "$BACKEND"
+    _linear_gql() {
+      printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+      printf '{"data":{"issues":{"nodes":[{"state":{"type":"%s"},"updatedAt":"%s"}]}}}' "$G_TYPE" "$G_UPD"
+    }
+    ITEM_STATE=""; ITEM_UPDATED=""
+    _backend_item_state "provider-lib#ENG-7"
+    printf 'ITEM_STATE=%s\nITEM_UPDATED=%s\n' "${ITEM_STATE:-}" "${ITEM_UPDATED:-}" )
+}
+out="$(G_TYPE=completed G_UPD="2026-07-08T21:51:00.000Z" guard_state)"
+echo "$out" | grep -q "ITEM_STATE=closed"       || fail "guard precondition: completed issue must read closed ($out)"
+echo "$out" | grep -q "ITEM_UPDATED=2026-07-08" || fail "guard precondition: last-updated (day) evidence not surfaced ($out)"
+grep -q "updatedAt" "$GQLLOG"                   || fail "guard precondition: state read did not request updatedAt evidence"
+out="$(G_TYPE=canceled G_UPD="2026-07-01T00:00:00.000Z" guard_state)"
+echo "$out" | grep -q "ITEM_STATE=closed"       || fail "guard precondition: canceled issue must also read closed ($out)"
+pass
+
 # 4b. CROSS-TEAM (the dep-watcher case): with LINEAR_TEAM_ID set, an identifier from a DIFFERENT team
 #     must resolve against ITS OWN team key — never the configured team, whose same-numbered issue
 #     would otherwise be silently mislabeled (premature unblock). This is the exact divergence the

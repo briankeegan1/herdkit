@@ -72,6 +72,10 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCS" || fail "(A) s
 [ "$(cp_count_status "$SCS" skip)" -ge 5 ]   || fail "(A) skip path should loudly skip the pane checkpoints"
 # The fixture still builds locally even with no herdr.
 [ "$(cp_status "$SCS" fixture_built)" = "pass" ] || fail "(A) fixture_built should still pass with no herdr"
+# HERD-139: the notify-hermeticity invariant holds even on the skip path (nothing ran → nothing leaked),
+# and the notify-stub checkpoint is loudly skipped (never a false fail) when there is no herdr.
+[ "$(cp_status "$SCS" notify_hermetic)" = "pass" ] || fail "(A) notify_hermetic should pass on the skip path"
+[ "$(cp_status "$SCS" notify_stubbed)" = "skip" ]  || fail "(A) notify_stubbed should be skip with no herdr"
 echo "PASS (A) SANDBOX_NO_HERDR=1 → clean loud skip (result=skip, exit 0, 0 fails)"
 
 # ── build a FILE-BACKED stub `herdr` (a JSON state machine — no real panes, no server) ────────────
@@ -167,6 +171,34 @@ if cmd == "pane list":
                       "label": p["label"], "agent_status": p["agent_status"]})
     emit({"panes": panes})
 
+if cmd == "pane process-info":
+    # Report the pane's FOREGROUND from the pid `pane run` recorded (below): a still-running pid ⇒ that
+    # command is the live foreground (the deadeyes 'claude' sleeper); a gone pid ⇒ a bare shell. shell_pid
+    # is kept DISTINCT from the fg pid so the driver's "drop the shell" filter never discards the fg. A
+    # gone pane ⇒ no process_info at all — the HERD-135 'missing' signal.
+    pane = opt("--pane")
+    for _, _, p_id, p in all_panes(s):
+        if p_id == pane:
+            fg_pid = p.get("fg_pid"); fg_cmd = p.get("fg_cmd", "")
+            alive = False
+            if isinstance(fg_pid, int):
+                try: os.kill(fg_pid, 0); alive = True
+                except OSError: alive = False
+            # claude-as-ROOT panes (agent start -- claude): the foreground process IS the pane shell, so
+            # shell_pid == fg_pid — the exact shape that fooled the pre-fix classifier. Otherwise shell_pid
+            # is a DISTINCT wrapper (fg is a child of the pane shell), the deadeyes shell+child model.
+            if p.get("fg_root") and isinstance(fg_pid, int):
+                shell = fg_pid
+            else:
+                shell = (fg_pid + 1000000) if isinstance(fg_pid, int) else 4242
+            if alive:
+                emit({"process_info": {"shell_pid": shell, "foreground_process_group_id": fg_pid,
+                                       "foreground_processes": [{"pid": fg_pid, "cmdline": fg_cmd}]}})
+            else:
+                emit({"process_info": {"shell_pid": shell, "foreground_process_group_id": shell,
+                                       "foreground_processes": []}})
+    emit({})
+
 if cmd == "pane rename":
     for _, _, p_id, p in all_panes(s):
         if p_id == args[2]: p["label"] = args[3]
@@ -180,7 +212,53 @@ if cmd == "pane report-agent":
     save(s); emit({"type": "ok"})
 
 if cmd == "pane run":
-    sys.exit(0)   # no-op: nothing to execute in the stub
+    # Model a foreground process so `pane process-info` (above) can report live/gone foreground exactly
+    # as a real pane would (the dead-vs-missing eyes flow). Launch the command DETACHED in its OWN
+    # session (pgid == pid) and record the pid in pane state: a resident command (the deadeyes 'claude'
+    # sleeper) stays alive until the scenario kills its process GROUP; a printf exits at once ⇒ gone.
+    pane = args[2] if len(args) > 2 else ""
+    runcmd = args[3] if len(args) > 3 else ""
+    if pane and runcmd:
+        import subprocess
+        for _, _, p_id, p in all_panes(s):
+            if p_id == pane:
+                try:
+                    proc = subprocess.Popen(["/bin/sh", "-c", runcmd], start_new_session=True,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    p["fg_pid"] = proc.pid; p["fg_cmd"] = runcmd
+                    save(s)
+                except Exception:
+                    pass
+    sys.exit(0)
+
+if cmd == "agent start":
+    # Model the lane's `herdr agent start … --tab <t> --split <d> -- <cmd>`: create a NEW pane in the
+    # tab whose ROOT process is <cmd> (claude launched directly, no wrapping shell — so process-info
+    # reports shell_pid == that pid via the fg_root flag). Background it detached so it stays 'alive'
+    # until the scenario kills its process GROUP.
+    name = args[2] if len(args) > 2 else ""
+    tab = opt("--tab")
+    runcmd = ""
+    if "--" in args:
+        i = args.index("--"); runcmd = " ".join(args[i+1:])
+    for wid, w in s["workspaces"].items():
+        if tab and tab in w["tabs"]:
+            pid = nid(s, wid + ":p")
+            p = {"label": None, "agent": name, "agent_status": "idle", "fg_root": True}
+            if runcmd:
+                import subprocess
+                try:
+                    proc = subprocess.Popen(["/bin/sh", "-c", runcmd], start_new_session=True,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    p["fg_pid"] = proc.pid; p["fg_cmd"] = runcmd
+                except Exception:
+                    pass
+            w["tabs"][tab]["panes"][pid] = p
+            save(s)
+            emit({"agent": {"pane_id": pid, "tab_id": tab, "workspace_id": wid, "name": name}})
+    emit({})
 
 if cmd == "pane read":
     print("rp stub builder: done"); sys.exit(0)
@@ -211,17 +289,23 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 [ "$(sc "$SCR" result)" = "pass" ]                  || fail "(B) result should be pass (got $(sc "$SCR" result))"
 [ "$(sc "$SCR" failed)" -eq 0 ]                     || fail "(B) failed should be 0"
 [ "$(sc "$SCR" herdr_available)" = "True" ]         || fail "(B) herdr_available should be True with stub herdr"
-# The pane/tab/agent checkpoints all pass.
-for cpn in workspace_created control_room builder_tab agent_idle agent_working agent_done teardown_clean; do
+# The pane/tab/agent checkpoints all pass — including the HERD-135 role-label + alive/dead/missing eyes.
+# The stub models `pane process-info` off a detached process (recorded by `pane run` for the deadeyes
+# kill flow, and by `agent start` for the claude-as-ROOT pane where shell_pid == the claude pid — the
+# PR #260 false-death shape). alive→dead on kill, →missing on pane removal, and claude-as-root ⇒ alive.
+for cpn in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working \
+           agent_done builder_agent_alive_claude_root builder_agent_dead builder_refix_escalates_on_dead \
+           builder_agent_missing teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Two tabs (control room + builder) and four panes (watcher, backlog, builder, + the reviewer split
-# stood up for the reviewer-pane-lifecycle checkpoint, which is then retired on verdict consumption).
+# Two tabs (control room + builder) and five panes (watcher, backlog, builder, the reviewer split for
+# the reviewer-pane-lifecycle checkpoint, and the claude-as-root pane for the alive checkpoint — the
+# last two are both closed again within their steps, so nothing leaks at teardown).
 [ "$(sc "$SCR" tabs_created)" -eq 2 ]  || fail "(B) tabs_created should be 2 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 4 ] || fail "(B) panes_created should be 4 (got $(sc "$SCR" panes_created))"
+[ "$(sc "$SCR" panes_created)" -eq 5 ] || fail "(B) panes_created should be 5 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.

@@ -24,6 +24,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
 . "$HERE/human-verify.sh"
+# PUSH_GATE=human (HERD-123) — push-hold helpers so list/approve gain PRE-push hold coverage: a
+# finished builder that stopped before push/PR create is listed here, and `approve <slug>` resumes
+# its push + PR creation. Sourcing only defines functions (CLI dispatch is $0-guarded).
+. "$HERE/push-gate.sh"
+# Pipeline steps (HERD-132) — the step-hold helper. Sourced so `list` surfaces a step waiting at an
+# approve-HOLD and `approve <slug>` releases it (resuming the pipeline past the held step). Sourcing
+# only DEFINES functions (its CLI dispatch is $0-guarded); inert until a step recorded a hold.
+. "$HERE/steps.sh"
+# Journal (best-effort) so the push-hold approve/resume path can emit events like the watcher does.
+# shellcheck source=scripts/herd/journal.sh
+[ -f "$HERE/journal.sh" ] && . "$HERE/journal.sh"
 # CLI palette for the `list` verdict column — themed via HERD_THEME (default tokyonight). Pre-set to
 # "" so the surface degrades to plain (byte-identical to before this coloring) under NO_COLOR, a
 # non-TTY stdout, or a missing theme.sh.
@@ -77,8 +88,39 @@ EOF
 case "$cmd" in
 
   list)
+    # PUSH_GATE=human (HERD-123): finished builders holding for human review BEFORE push — no PR yet,
+    # so they live in the push-hold ledger, not $APPROVALS. Surface them FIRST (a human reviews the
+    # LOCAL diff at the printed worktree path, then approves to resume push + PR creation). Presence-
+    # driven: nothing is printed when the feature is unused. Rendered before the PR-approval list.
+    push_found=0
+    while read -r ph_slug ph_sha ph_dir; do
+      [ -n "$ph_slug" ] || continue
+      if [ "$push_found" -eq 0 ]; then echo "Builders awaiting PUSH approval (pre-PR, review the LOCAL diff):"; fi
+      printf '  %s  sha:%.8s  %s\n' "$ph_slug" "$ph_sha" "${ph_dir:-(worktree path unknown)}"
+      [ -n "$ph_dir" ] && printf '      review:  git -C %s diff origin/HEAD...HEAD    approve:  bash %s/herd-approve.sh approve %s\n' "$ph_dir" "$HERE" "$ph_slug"
+      push_found=$((push_found + 1))
+    done <<EOF
+$(push_gate_list 2>/dev/null || true)
+EOF
+    [ "$push_found" -gt 0 ] && echo
+
+    # PIPELINE STEPS (HERD-132): steps stopped at an approve-HOLD — no PR gate involved, so they live in
+    # the step-hold ledger. Surface them next (a human reviews at the printed worktree, then approves to
+    # resume the pipeline past the held step). Presence-driven: nothing prints when unused.
+    step_found=0
+    while read -r sh_slug sh_sha sh_step sh_dir; do
+      [ -n "$sh_slug" ] || continue
+      if [ "$step_found" -eq 0 ]; then echo "Builders awaiting STEP approval (a hold=approve pipeline step):"; fi
+      printf '  %s  step:%s  sha:%.8s  %s\n' "$sh_slug" "$sh_step" "$sh_sha" "${sh_dir:-(worktree path unknown)}"
+      printf '      approve:  bash %s/herd-approve.sh approve %s\n' "$HERE" "$sh_slug"
+      step_found=$((step_found + 1))
+    done <<EOF
+$(steps_hold_list 2>/dev/null || true)
+EOF
+    [ "$step_found" -gt 0 ] && echo
+
     if [ ! -s "$APPROVALS" ]; then
-      echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && [ "$step_found" -eq 0 ] && echo "No PRs awaiting approval."
       exit 0
     fi
     found=0
@@ -103,15 +145,64 @@ case "$cmd" in
       found=$((found + 1))
     done < "$APPROVALS"
     if [ "$found" -eq 0 ]; then
-      echo "No PRs awaiting approval."
+      [ "$push_found" -eq 0 ] && [ "$step_found" -eq 0 ] && echo "No PRs awaiting approval."
     else
       printf '\nRun:  bash %s/herd-approve.sh approve <pr#>  to approve a PR for merge.\n' "$HERE"
     fi
     ;;
 
   approve)
-    prnum="${1:-}"
-    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#>" >&2; exit 1; }
+    # Optional --sha <sha> PINS the approval to a specific commit: a human who saw a commit in `list`
+    # can assert "approve THIS sha" so a hold that was superseded by a new push (the sha moved) is
+    # refused instead of silently approving a different commit than the operator reviewed (HERD-157).
+    prnum=""; pin_sha=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --sha) pin_sha="${2:-}"; shift 2 ;;
+        --sha=*) pin_sha="${1#--sha=}"; shift ;;
+        -*) echo "herd-approve.sh approve: unknown flag: $1 (usage: approve <pr#|slug> [--sha <sha>])" >&2; exit 1 ;;
+        *) [ -z "$prnum" ] && prnum="$1"; shift ;;
+      esac
+    done
+    [ -n "$prnum" ] || { echo "Usage: herd-approve.sh approve <pr#|slug> [--sha <sha>]" >&2; exit 1; }
+    # pin_matches <live-sha> — 0 unless --sha was given and disagrees with the live hold's sha. A
+    # PREFIX match counts (list shows the short 8-char sha a human copies; git-style prefixes against
+    # the single known live sha are unambiguous). On a real mismatch it prints a LOUD refusal (the
+    # operator asked to approve a commit that is no longer what is held) and returns 1 so the caller
+    # bails before recording anything.
+    pin_matches() {
+      local live="$1"
+      [ -z "$pin_sha" ] && return 0
+      [ "$pin_sha" = "$live" ] && return 0
+      case "$live" in "$pin_sha"*) return 0 ;; esac
+      printf '🛑 Refusing: you asked to approve sha %s, but %s is currently holding %s.\n' "$pin_sha" "$prnum" "$live" >&2
+      printf '   A newer commit may have superseded the one you reviewed. Re-check `herd-approve.sh list` and retry.\n' >&2
+      return 1
+    }
+    # PUSH_GATE=human (HERD-123): if the argument names a builder with a LIVE push-hold (pre-PR), this
+    # is a PUSH approval, not a merge approval — record it and RESUME (push + PR creation). A PR number
+    # is numeric and a builder slug is kebab-case, so a live push-hold for "$prnum" unambiguously
+    # selects this path; otherwise fall through to the existing PR-merge approval below. push_gate_resume
+    # is fail-soft: a stale (new-commit) or corrupt hold refuses LOUDLY and pushes nothing.
+    if [ -n "$(push_gate_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      pin_matches "$(push_gate_awaiting_sha "$prnum")" || exit 1
+      _pg_approved_sha="$(push_gate_approve "$prnum")" || { echo "❌ Could not record push approval for '$prnum'." >&2; exit 1; }
+      printf '✅ Push approval recorded for %s — approved commit %s.\n' "$prnum" "$_pg_approved_sha"
+      printf '   Resuming push + PR creation…\n'
+      push_gate_resume "$prnum"; exit $?
+    fi
+    # PIPELINE STEPS (HERD-132): if the argument names a builder/slug with a LIVE step-hold (a
+    # hold=approve step stopped the pipeline), this is a STEP approval — record it and RELEASE, which
+    # resumes the pipeline past the held step. Keyed by slug (kebab) like the push-hold, so a numeric PR
+    # number never selects this path; checked after the push-hold (a builder hits a push-hold only once,
+    # after its step holds). steps_hold_release is fail-soft: a stale/corrupt hold refuses LOUDLY.
+    if [ -n "$(steps_hold_awaiting_sha "$prnum" 2>/dev/null || true)" ]; then
+      pin_matches "$(steps_hold_awaiting_sha "$prnum")" || exit 1
+      _st_approved_sha="$(steps_hold_approve "$prnum")" || { echo "❌ Could not record step approval for '$prnum'." >&2; exit 1; }
+      printf '✅ Step approval recorded for %s — approved commit %s.\n' "$prnum" "$_st_approved_sha"
+      printf '   Resuming the pipeline past the held step…\n'
+      steps_hold_release "$prnum"; exit $?
+    fi
     if [ ! -s "$APPROVALS" ]; then
       echo "No awaiting approval record found for PR #${prnum}." >&2; exit 1
     fi
@@ -123,12 +214,13 @@ case "$cmd" in
     if [ -z "$sha" ]; then
       printf 'No awaiting approval record found for PR #%s.\n' "$prnum" >&2; exit 1
     fi
+    pin_matches "$sha" || exit 1
     # Idempotent: don't double-write if already approved for this sha.
     if grep -q "^[0-9]* approved $prnum $sha$" "$APPROVALS" 2>/dev/null; then
-      printf 'PR #%s commit %.8s is already approved.\n' "$prnum" "$sha"; exit 0
+      printf 'PR #%s commit %s is already approved.\n' "$prnum" "$sha"; exit 0
     fi
     printf '%s approved %s %s\n' "$(date +%s)" "$prnum" "$sha" >> "$APPROVALS"
-    printf '✅ Approved PR #%s (%.8s) — the watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
+    printf '✅ Approved PR #%s — approved commit %s. The watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
     ;;
 
   why)

@@ -205,4 +205,48 @@ printf '%s\n' "$OUT" | grep -qE 'SCRIBE_BACKEND[[:space:]]+file[[:space:]]+\[bas
   || fail "(d3) no-overlay list missing [baseline] provenance ($OUT)"
 okp
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI contract (e) — `herd config get` resolves through baseline+overlay (HERD-142).
+# The BUG: cmd_config_get read only the committed baseline, so an overlaid key printed the baseline
+# value (or empty when the key lived only in the overlay). Fix: baseline first, overlay OVERRIDES.
+# ══════════════════════════════════════════════════════════════════════════════
+# (e1) An OVERLAID key returns the overlay value; a NON-overlaid key returns the baseline value.
+PG="$T/pg"; mkdir "$PG"; _make_project "$PG"
+cat > "$PG/.herd/config.local" <<'CFG'
+MODEL_QUICK="claude-local-get"
+CFG
+run "$PG" config get MODEL_QUICK
+[ "$RC" -eq 0 ] || fail "(e1) get failed ($OUT)"
+[ "$OUT" = "claude-local-get" ] || fail "(e1) overlaid key did not return the overlay value (got: $OUT)"
+run "$PG" config get SCRIBE_BACKEND
+{ [ "$RC" -eq 0 ] && [ "$OUT" = "file" ]; } || fail "(e1) non-overlaid key did not return the baseline value (got: $OUT)"
+okp
+
+# (e2) A key present ONLY in the overlay (absent from the baseline) returns the overlay value — the
+# exact live repro (HUMAN_VERIFY_POLICY set local-only printed empty before the fix). Modeled here
+# with MODEL_QUICK removed from the baseline so it is genuinely local-only.
+PG2="$T/pg2"; mkdir "$PG2"; _make_project "$PG2"
+grep -v '^MODEL_QUICK=' "$PG2/.herd/config" > "$PG2/.herd/config.tmp" && mv "$PG2/.herd/config.tmp" "$PG2/.herd/config"
+cat > "$PG2/.herd/config.local" <<'CFG'
+MODEL_QUICK="claude-only-in-overlay"
+CFG
+run "$PG2" config get MODEL_QUICK
+{ [ "$RC" -eq 0 ] && [ "$OUT" = "claude-only-in-overlay" ]; } || fail "(e2) local-only key did not return the overlay value (got: $OUT)"
+okp
+
+# (e3) With NO config.local, get is byte-identical to before (pure baseline read).
+PG3="$T/pg3"; mkdir "$PG3"; _make_project "$PG3"
+[ ! -f "$PG3/.herd/config.local" ] || fail "(e3) fixture unexpectedly has a config.local"
+run "$PG3" config get MODEL_QUICK
+{ [ "$RC" -eq 0 ] && [ "$OUT" = "claude-baseline" ]; } || fail "(e3) no-overlay get did not return the baseline value (got: $OUT)"
+okp
+
+# (e4) An overlay that assigns the key the EMPTY string OVERRIDES a non-empty baseline (shell-source
+# last-wins) — presence, not non-emptiness, decides the override.
+PG4="$T/pg4"; mkdir "$PG4"; _make_project "$PG4"
+printf 'MODEL_QUICK=""\n' > "$PG4/.herd/config.local"
+run "$PG4" config get MODEL_QUICK
+{ [ "$RC" -eq 0 ] && [ -z "$OUT" ]; } || fail "(e4) empty-string overlay did not override the baseline (got: $OUT)"
+okp
+
 echo "ALL PASS ($pass tests)"

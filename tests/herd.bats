@@ -43,6 +43,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic jira-backend test passes" {
+  run bash "$REPO/tests/test-backend-jira.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic cli backend-switch test passes" {
+  run bash "$REPO/tests/test-cli-backend-switch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic file-backend test passes" {
   run bash "$REPO/tests/test-backend-file.sh"
   [ "$status" -eq 0 ]
@@ -51,6 +63,12 @@ setup() {
 
 @test "hermetic planned-work-visibility test passes" {
   run bash "$REPO/tests/test-planned-work-visibility.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic scribe AMEND verb (HERD-128) test passes" {
+  run bash "$REPO/tests/test-scribe-amend.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
@@ -69,6 +87,24 @@ setup() {
 
 @test "hermetic generalized start-agent seam (driver launch-agent) test passes" {
   run bash "$REPO/tests/test-driver-launch-agent.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic agent-runtime exec-surface bindings (HERD-150 P1) test passes" {
+  run bash "$REPO/tests/test-driver-agent-exec.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic model-matrix (HERD-151) test passes" {
+  run bash "$REPO/tests/test-model-matrix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic HERD-42 A/B scorer test passes" {
+  run bash "$REPO/tests/test-herd42-score.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
@@ -163,6 +199,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
+  run bash "$REPO/tests/test-agent-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic coordinator startup-restore probe (HERD-112) test passes" {
   run bash "$REPO/tests/test-startup-restore.sh"
   [ "$status" -eq 0 ]
@@ -186,6 +228,61 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
+
+@test "hermetic project-defined branch naming (HERD-120) test passes" {
+  run bash "$REPO/tests/test-branch-template.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance adoption from CLAUDE.md (HERD-119) test passes" {
+  run bash "$REPO/tests/test-init-governance-adoption.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic init merge-policy consequence-loud ask (HERD-140) test passes" {
+  run bash "$REPO/tests/test-init-merge-policy-ask.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance profiles export/apply (HERD-126) test passes" {
+  run bash "$REPO/tests/test-governance-profiles.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance hook-rendering (HERD-131) test passes" {
+  run bash "$REPO/tests/test-governance-hooks-render.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic governance-drift sweep (HERD-125) test passes" {
+  run bash "$REPO/tests/test-governance-drift.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic end-to-end governance sim (HERD-127) test passes" {
+  run bash "$REPO/tests/test-sandbox-governance.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic capability conformance matrix (HERD-144) test passes" {
+  run bash "$REPO/tests/test-conformance.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic watcher-flair pack (HERD-147) unit test passes" {
+  run bash "$REPO/tests/test-watcher-flair.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render

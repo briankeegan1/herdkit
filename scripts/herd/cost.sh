@@ -67,6 +67,12 @@ _COST_RESEARCHER_FINGERPRINT='You are the RESEARCH DRAINER'
 # costs 1.25x input at the 5-minute TTL and 2.0x at the 1-hour TTL. Unknown models price at $0 and
 # are flagged (model=<id>? in the report) rather than guessed.
 #
+# FOREIGN / runtime-qualified model refs (HERD-151: a MODEL_* key '<driver>:<model>' pointing a role at
+# a non-Claude runtime) land here as an UNKNOWN model id — so they surface as an explicit `unpriced=N`
+# report field + a model=<id>? flag, NEVER a silent $0. To price a foreign model, add its id here (or
+# supply a full HERD_COST_PRICE_FILE override table); the mechanism, not the table, is what guarantees
+# a foreign ref is visible rather than silently zeroed.
+#
 # A test seam / operator override: set HERD_COST_PRICE_FILE to a JSON file of the same shape
 #   { "claude-opus-4-8": {"in": 5.0, "out": 25.0}, ... }
 # to replace this built-in table wholesale (the hermetic tests use this to assert exact figures).
@@ -217,8 +223,14 @@ def emit(comps, components, want):
         acc = comps[comp]
         if not acc["msgs"] and acc["in"] == 0 and acc["out"] == 0:
             continue   # nothing for this component
-        print("component=%s model=%s in=%d out=%d cache_read=%d cache_write=%d usd=%.6f msgs=%d" % (
-            comp, primary_model(acc), acc["in"], acc["out"], acc["cr"], acc["cw"], acc["usd"], len(acc["msgs"])))
+        # unpriced = how many DISTINCT models this component ran that are NOT in the price table
+        # (a foreign/runtime-qualified ref, or a model shipped since this perishable table was dated).
+        # A VISIBLE, greppable marker so a foreign ref that priced at $0 is never SILENTLY zeroed;
+        # it complements the model-id ? flag from primary_model. unpriced=0 for a fully priced
+        # component (the all-Claude case today), so existing operators just see unpriced=0.
+        unpriced = sum(1 for m in acc["model_out"] if price_of(m) is None)
+        print("component=%s model=%s in=%d out=%d cache_read=%d cache_write=%d usd=%.6f msgs=%d unpriced=%d" % (
+            comp, primary_model(acc), acc["in"], acc["out"], acc["cr"], acc["cw"], acc["usd"], len(acc["msgs"]), unpriced))
 '
 
 # _COST_PY — the builder/review scanner (default `herd cost`, journaled at merge). A session is
@@ -317,10 +329,10 @@ _cost_emit_merge_impl() {
   type journal_append >/dev/null 2>&1 || return 0
   local dir; dir="$(_cost_transcript_dir "$wt")"
   [ -d "$dir" ] || return 0
-  local line component model tin tout cread cwrite usd msgs kv
+  local line component model tin tout cread cwrite usd msgs unpriced kv
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    component=""; model=""; tin=""; tout=""; cread=""; cwrite=""; usd=""; msgs=""
+    component=""; model=""; tin=""; tout=""; cread=""; cwrite=""; usd=""; msgs=""; unpriced=""
     for kv in $line; do
       case "$kv" in
         component=*)   component="${kv#component=}" ;;
@@ -331,11 +343,13 @@ _cost_emit_merge_impl() {
         cache_write=*) cwrite="${kv#cache_write=}" ;;
         usd=*)         usd="${kv#usd=}" ;;
         msgs=*)        msgs="${kv#msgs=}" ;;
+        unpriced=*)    unpriced="${kv#unpriced=}" ;;
       esac
     done
     [ -n "$component" ] || continue
     journal_append cost component "$component" pr "$pr" slug "$slug" model "$model" \
-      in "$tin" out "$tout" cache_read "$cread" cache_write "$cwrite" usd "$usd" msgs "$msgs"
+      in "$tin" out "$tout" cache_read "$cread" cache_write "$cwrite" usd "$usd" msgs "$msgs" \
+      unpriced "${unpriced:-0}"
   done <<EOF
 $(cost_report_dir "$dir" all)
 EOF

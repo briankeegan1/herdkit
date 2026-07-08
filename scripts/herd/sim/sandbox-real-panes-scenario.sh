@@ -8,7 +8,14 @@
 # asserts the pane surface itself via herdr's JSON output:
 #   • a control-room TAB with a watcher pane + a backlog pane (labels asserted);
 #   • a builder TAB with a stub builder (a file/CLI-driven agent — no model call);
+#   • PANE ROLE LABELS at spawn (HERD-135): the agent pane is named by its slug via the driver, and the
+#     label is asserted queryable — the role the dead-agent-eyes probe consumes instead of guessing;
 #   • agent-status transitions idle → working → done, each observed via `herdr agent list`;
+#   • ALIVE/DEAD/MISSING dead-agent eyes, all three verdicts against REAL panes: claude launched AS the
+#     pane root (shell_pid == claude pid) ⇒ 'alive' — never a fabricated death (PR #260 review); kill
+#     the pane process ⇒ 'dead' (pane present, unresponsive); REMOVE the agent pane entirely ⇒ 'missing'
+#     (HERD-135) — the SHIPPED status classifier reads 'agentmissing' (NOT done) for an open-PR builder
+#     with no agent (the #249 false-'done' incident);
 #   • CLEAN TEARDOWN — the disposable workspace is closed and NO tab or pane is leaked afterward
 #     (so the result satisfies the tab-leak-guard).
 #
@@ -46,6 +53,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=scripts/herd/sim/sandbox-fixture.sh
 . "$HERE/sandbox-fixture.sh"
+# shellcheck source=scripts/herd/sim/sim-notify-stub.sh
+. "$HERE/sim-notify-stub.sh"   # notify hermeticity (HERD-139) — installed after the herdr probe
 
 # ── output helpers (mirror the sandbox-sim family's style) ──────────────────────────────────────
 c_bold=$'\033[1m'; c_dim=$'\033[2m'
@@ -183,14 +192,21 @@ else
   command -v herdr >/dev/null 2>&1 || reason="herdr not installed"
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
-  for cp in workspace_created control_room builder_tab agent_idle agent_working agent_done \
-            pane_captured reviewer_pane_retired_on_verdict teardown_clean; do
+  for cp in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
+            pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
+            builder_agent_alive_claude_root builder_agent_dead builder_refix_escalates_on_dead \
+            builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
 
 # ── the real-pane path (only when herdr is up) ───────────────────────────────────────────────────
 if [ "$HERDR_OK" = true ]; then
+
+  # driver seam (functions only; no side effects) — herd_driver_pane_rename / herd_driver_agent_liveness
+  # power the HERD-135 role-label + agent-missing checkpoints below.
+  # shellcheck source=scripts/herd/driver.sh
+  . "$HERE/../driver.sh"
 
   # ── workspace: a fresh, disposable, ISOLATED workspace (unique label) ──────────────────────────
   step workspace "create a disposable isolated herdr workspace ($WS_LABEL)"
@@ -264,6 +280,30 @@ except Exception:
     fi
   fi
 
+  # ── PANE ROLE LABELS AT SPAWN (HERD-135): the lane names each pane by role via the driver so the
+  # coordinator (and the dead-agent-eyes probe) read a pane's role by LABEL instead of guessing from
+  # position/cmdline — the fix for the #249 incident where a `claude --continue` was typed into the
+  # task-spec viewer pane. Exercise the SHIPPED driver call the lanes use (herd_driver_pane_rename) to
+  # label the builder's agent pane with its slug, then assert the label is queryable via herdr JSON.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step labels "name the agent pane by role via the driver (herd_driver_pane_rename)"
+    herd_driver_pane_rename "$BUILD_PANE" "rp-builder"
+    LBL_OK="$(pane_json "$WSID" | BP="$BUILD_PANE" python3 -c '
+import sys,json,os
+bp=os.environ["BP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print(next((str(p.get("label","")) for p in panes if str(p.get("pane_id",""))==bp), ""))
+except Exception:
+    print("err")
+' 2>/dev/null)"
+    if [ "$LBL_OK" = "rp-builder" ]; then
+      checkpoint pane_labels_on_spawn pass "agent pane $BUILD_PANE labelled 'rp-builder' via the driver (role readable by the probe)"
+    else
+      checkpoint pane_labels_on_spawn fail "agent pane label not set as expected (got '$LBL_OK')"
+    fi
+  fi
+
   # ── agent-status transitions idle → working → done (observed via herdr agent list) ─────────────
   if [ -n "$BUILD_PANE" ]; then
     step agent "drive + observe the stub builder's status transitions"
@@ -308,6 +348,29 @@ except Exception:
     fi
     # Optional screenshot at the 'done' checkpoint; degrades gracefully (no-false-red).
     take_screenshot "control-room"
+  fi
+
+  # ── notify hermeticity (HERD-139): stub ONLY notify, keep REAL panes ───────────────────────────
+  # The lib-mode phases that follow (reviewer-retire, dead-eyes refix) run the DEFAULT herdr-claude
+  # driver and call herd_driver_notify → a REAL `herdr notification show` on the operator's desktop
+  # (the dead-eyes refix genuinely fires a '💀 agent dead' alarm). Install the shared notify stub HERE
+  # — AFTER the timing-sensitive agent-status transition phase above, so the real herdr answers those
+  # polls with no added latency (verdicts byte-identical) — a PATH-stubbed `herdr` that intercepts ONLY
+  # the `notification` subcommand and FORWARDS every other subcommand to the real herdr. Prove it: a
+  # probe notification is CAPTURED (never delivered) while real herdr still answers non-notify calls.
+  step notify "real-panes tier stubs ONLY notify (real panes kept; notification captured, not delivered)"
+  sim_notify_install "$ART"
+  # shellcheck source=scripts/herd/driver.sh
+  . "$HERE/../driver.sh"   # herd_driver_notify (functions only; no side effects)
+  _rp_before="$(sim_notify_captured_count 'RP NOTIFY PROBE')"
+  ( unset HERD_DRIVER; herd_driver_notify "🔔 RP NOTIFY PROBE" "real-panes notify must be stubbed, not delivered" default )
+  _rp_after="$(sim_notify_captured_count 'RP NOTIFY PROBE')"
+  _rp_herdr_live=no; herdr workspace list >/dev/null 2>&1 && _rp_herdr_live=yes   # forwarded to REAL herdr
+  _rp_native="$(sim_notify_native_attempts)"
+  if [ "$_rp_after" -gt "$_rp_before" ] && [ "$_rp_herdr_live" = yes ] && [ "$_rp_native" = 0 ]; then
+    checkpoint notify_stubbed pass "herdr notification INTERCEPTED to the sink (captured=$_rp_after); real herdr still answers non-notify commands; zero native desktop notifications"
+  else
+    checkpoint notify_stubbed fail "real-panes notify stub failed (captured before=$_rp_before after=$_rp_after; herdr_live=$_rp_herdr_live; native=$_rp_native)"
   fi
 
   # ── REVIEWER-PANE LIFECYCLE (HERD-113): the reviewer pane is GONE after its verdict is consumed ──
@@ -371,6 +434,238 @@ except Exception:
     fi
   fi
 
+  # ── GUARDED PANE CLOSE (HERD-134): a stale/recycled registry pane id must NEVER kill a neighbour ──
+  # Model the 2026-07-08 incident directly: plant a reviewer dispatch-registry row that points at the
+  # BUILDER's OWN pane (exactly as a stale/recycled id would), then drive the SHIPPED verdict-consumption
+  # path (_retire_reviewer_pane via _review_gate_step). The guarded close reads the pane's LIVE identity
+  # (agent:rp-builder — NOT a reviewer) and must REFUSE: assert the builder pane SURVIVES, a
+  # pane_close_refused is journaled with both identities, and NO reviewer_pane_retired is emitted (the
+  # decoy was never retired). The reviewpane checkpoint above already proves a genuine reviewer still
+  # closes — together they show the guard is byte-identical on a match and loud-refusing on a mismatch.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step guardedclose "a stale registry id pointing at the builder is REFUSED, not closed (HERD-134)"
+    _bp_present() {
+      pane_json "$WSID" | BPP="$1" python3 -c '
+import sys,json,os
+bpp=os.environ["BPP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==bpp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    if [ "$(_bp_present "$BUILD_PANE")" = yes ]; then
+      GDT="$ART/guardtrees"; mkdir -p "$GDT/.herd"
+      GD_PR=556; GD_SHA="gdsha556"; GD_SLUG="rp-builder"
+      GD_JOURNAL="$ART/gd-journal.jsonl"; : > "$GD_JOURNAL"
+      # Registry row points at the BUILDER pane (the stale/recycled-id hazard); a PASS verdict waits.
+      printf '%s %s\n' "$$" "$BUILD_PANE" > "$GDT/.review-registry-$GD_PR-$GD_SHA"
+      printf 'REVIEW: PASS\n'            > "$GDT/.review-result-$GD_PR-$GD_SHA"
+      # Drive the SHIPPED path in a subshell (same isolation the reviewpane step uses). HERD_DRIVER
+      # defaults to herdr-claude → a REAL identity probe + `herdr pane close` behind the guard.
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$GDT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-guardedclose-sim" JOURNAL_FILE="$GD_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        _review_gate_step "$GD_PR" "$GD_SLUG" "$GD_SHA" >/dev/null 2>&1 || true
+      )
+      # Assert the builder pane SURVIVES across a short window (a wrong close would remove it).
+      _bp_survived=yes; _i=0
+      while [ "$_i" -lt 12 ]; do
+        [ "$(_bp_present "$BUILD_PANE")" = yes ] || { _bp_survived=no; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _gd_refused=no; grep -q '"event":"pane_close_refused"' "$GD_JOURNAL" 2>/dev/null && _gd_refused=yes
+      _gd_retired=no; grep -q '"event":"reviewer_pane_retired"' "$GD_JOURNAL" 2>/dev/null && _gd_retired=yes
+      if [ "$_bp_survived" = yes ] && [ "$_gd_refused" = yes ] && [ "$_gd_retired" = no ]; then
+        checkpoint reviewer_pane_close_refused_on_mismatch pass \
+          "stale registry id → builder pane $BUILD_PANE SURVIVED; pane_close_refused journaled; no false retire"
+      else
+        checkpoint reviewer_pane_close_refused_on_mismatch fail \
+          "guard did not refuse as expected (builder_survived=$_bp_survived refused=$_gd_refused false_retire=$_gd_retired)"
+      fi
+    else
+      checkpoint reviewer_pane_close_refused_on_mismatch fail "builder pane not present to serve as decoy (BUILD_PANE='$BUILD_PANE')"
+    fi
+  fi
+
+  # ── CLAUDE-AS-ROOT LIVENESS (PR #260 review): the lane launches claude DIRECTLY as the pane ROOT
+  # (`herdr agent start … -- claude`, no wrapping shell), so the pane's shell_pid IS the claude pid. The
+  # probe excludes the pane's shell so a BARE shell reads 'dead' — but it must NOT drop the shell_pid
+  # entry when that entry is ITSELF claude, or it fabricates a death for a live idle builder ('💀 AGENT
+  # DEAD'). Stand up a REAL claude-as-root pane via the lane's exact incantation and assert the SHIPPED
+  # probe reads 'alive'. The killed-pane 'dead' + removed-pane 'missing' checkpoints below cover the
+  # other two liveness verdicts; together the three prove the classifier end to end.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
+    step clauderoot "claude launched AS the pane root (shell_pid == claude pid) reads 'alive', not a fabricated death"
+    CR_BIN="$ART/clauderootbin"; mkdir -p "$CR_BIN"
+    # A resident fake claude whose cmdline retains 'claude' (a bash script — NOT exec'd, so the process
+    # name stays '…/claude', exactly the argv the real binary carries). It sleeps until we kill it.
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CR_BIN/claude"; chmod +x "$CR_BIN/claude"
+    CR_START="$(herdr agent start cair-root-builder --workspace "$WSID" --cwd "$REPO" --tab "$BUILD_TAB" --split down --no-focus -- "$CR_BIN/claude" 2>/dev/null || true)"
+    CR_PANE="$(printf '%s' "$CR_START" | hj 'd["result"]["agent"]["pane_id"]')"
+    [ -z "$CR_PANE" ] && CR_PANE="$(herd_driver_agent_pane_id cair-root-builder 2>/dev/null || true)"
+    [ -n "$CR_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))
+    # Poll until the probe sees the live claude root.
+    _cr_live="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(herd_driver_agent_liveness cair-root-builder "$CR_PANE" 2>/dev/null)" = "alive" ] && { _cr_live=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    # NON-VACUOUS: prove the pane really IS claude-as-root — the shell_pid appears AMONG the foreground
+    # processes with 'claude' in its cmdline (the exact shape that fooled the pre-fix classifier).
+    _cr_isroot="$(herdr pane process-info --pane "$CR_PANE" 2>/dev/null | python3 -c '
+import sys,json
+pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+sh=pi.get("shell_pid"); fps=pi.get("foreground_processes") or []
+print("yes" if any(p.get("pid")==sh and "claude" in (p.get("cmdline") or "") for p in fps) else "no")
+' 2>/dev/null || true)"
+    _cr_pgid="$(herdr pane process-info --pane "$CR_PANE" 2>/dev/null | python3 -c '
+import sys,json
+pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+print(pi.get("foreground_process_group_id") or "")
+' 2>/dev/null || true)"
+    if [ "$_cr_live" = yes ] && [ "$_cr_isroot" = yes ]; then
+      checkpoint builder_agent_alive_claude_root pass \
+        "claude-as-root pane $CR_PANE (shell_pid == claude pid) reads 'alive' — the pane-shell exclusion did not fabricate a death"
+    else
+      checkpoint builder_agent_alive_claude_root fail \
+        "claude-as-root liveness wrong (live=$_cr_live is_root=$_cr_isroot pane=$CR_PANE)"
+    fi
+    # Cleanup: kill the detached claude process GROUP + close its pane (never leak a sleep or a pane).
+    [ -n "$_cr_pgid" ] && kill -TERM -"$_cr_pgid" >/dev/null 2>&1 || true
+    [ -n "$CR_PANE" ] && herdr pane close "$CR_PANE" >/dev/null 2>&1 || true
+  fi
+
+  # ── DEAD-AGENT EYES (HERD-114): kill the builder's pane process, assert the liveness probe flips to
+  # 'dead' and a refix bounce ESCALATES (needs you · agent dead) instead of waking a dead pane. Models
+  # the 2026-07-08 incident where a herdr server stop killed a builder's claude while its pane/PR
+  # persisted and a REVIEW_AUTOFIX bounce would have typed a re-task into the dead pane. Drives the
+  # SHIPPED probe (herd_driver_agent_liveness) + the SHIPPED refix path (_handle_block_verdict, sourced
+  # in lib mode) against REAL panes. The stub builder has no real claude, so we stand up a long-lived
+  # foreground process WITH a 'claude' argv0 as the live session, then kill it to strand a bare pane.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step deadeyes "kill the builder pane process → agent-dead; a refix bounce escalates, never wakes"
+    # shellcheck source=scripts/herd/driver.sh
+    . "$HERE/../driver.sh"   # herd_driver_agent_liveness (functions only; no side effects)
+
+    # the pane's foreground PROCESS GROUP id (the running job; == shell_pid when the shell is idle)
+    _fg_pgid() {
+      herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
+import sys,json
+try: pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+except Exception: pi={}
+print(pi.get("foreground_process_group_id") or "")
+' 2>/dev/null
+    }
+    _live_of() { herd_driver_agent_liveness rp-builder "$BUILD_PANE" 2>/dev/null; }
+
+    # 1) Stand up the "live session": the stub builder has no real claude, so run a long-lived
+    #    foreground process whose cmdline contains 'claude' (an executable literally named `claude`
+    #    that sleeps) — the same signal herd_driver_agent_liveness reads for a real builder. NOT
+    #    exec'd, so the pane's shell stays the parent and returns to a bare prompt once we kill the job.
+    CLAUDE_BIN="$ART/claudebin"; mkdir -p "$CLAUDE_BIN"
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CLAUDE_BIN/claude"; chmod +x "$CLAUDE_BIN/claude"
+    _pgid_before=""
+    herdr pane run "$BUILD_PANE" "$CLAUDE_BIN/claude" >/dev/null 2>&1 || true
+    _alive="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(_live_of)" = "alive" ] && { _alive=yes; _pgid_before="$(_fg_pgid "$BUILD_PANE")"; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+
+    if [ "$_alive" = yes ]; then
+      # 2) Kill the pane's foreground JOB (whole process group) → the pane falls back to a bare shell.
+      [ -n "$_pgid_before" ] && kill -TERM -"$_pgid_before" >/dev/null 2>&1 || true
+      _dead="no"; _i=0
+      while [ "$_i" -lt 25 ]; do [ "$(_live_of)" = "dead" ] && { _dead=yes; break; }; _i=$((_i+1)); sleep 0.2; done
+      if [ "$_dead" = yes ]; then
+        checkpoint builder_agent_dead pass "killed pane process; herd_driver_agent_liveness flipped alive→dead"
+      else
+        checkpoint builder_agent_dead fail "liveness did not flip to dead after the pane process was killed (got '$(_live_of)')"
+      fi
+    else
+      checkpoint builder_agent_dead fail "could not stand up a live 'claude' foreground to kill (liveness='$(_live_of)')"
+    fi
+
+    # 3) Drive the SHIPPED refix bounce against the now-dead builder and assert it ESCALATES (needs you
+    #    · agent dead) and never wakes. Isolated trees/journal + REVIEW_AUTOFIX on. A subshell so
+    #    agent-watch.sh's globals never clobber the scenario's.
+    if [ "${_dead:-no}" = yes ]; then
+      BVT="$ART/deadtrees"; mkdir -p "$BVT"
+      BV_JOURNAL="$ART/bv-journal.jsonl"; : > "$BV_JOURNAL"
+      BV_DISPLAY="$ART/bv-display.txt"; : > "$BV_DISPLAY"
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$BVT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-deadeyes-sim" JOURNAL_FILE="$BV_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        render() { :; }
+        REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+        DISPLAY=()
+        _handle_block_verdict "600" "rp-builder" "deadsha600" "0" || true
+        printf '%s' "${DISPLAY[0]:-}" > "$BV_DISPLAY"
+      ) ; BV_RC=$?
+      _bv_disp="$(cat "$BV_DISPLAY" 2>/dev/null || true)"
+      _bv_escalated=no; printf '%s' "$_bv_disp" | grep -q "agent dead" && _bv_escalated=yes
+      _bv_journaled=no; grep -q '"event":"refix_escalated_dead"' "$BV_JOURNAL" 2>/dev/null && _bv_journaled=yes
+      # "escalates instead of waking": the escalation event is present AND the wake-result event is NOT.
+      _bv_no_wake=no; grep -q '"event":"refix_wake_result"' "$BV_JOURNAL" 2>/dev/null || _bv_no_wake=yes
+      if [ "$BV_RC" = 0 ] && [ "$_bv_escalated" = yes ] && [ "$_bv_journaled" = yes ] && [ "$_bv_no_wake" = yes ]; then
+        checkpoint builder_refix_escalates_on_dead pass \
+          "refix bounce escalated to 'agent dead' (refix_escalated_dead journaled; no wake attempted)"
+      else
+        checkpoint builder_refix_escalates_on_dead fail \
+          "refix bounce did not escalate cleanly (rc=$BV_RC escalated=$_bv_escalated journaled=$_bv_journaled no_wake=$_bv_no_wake disp='$_bv_disp')"
+      fi
+    else
+      checkpoint builder_refix_escalates_on_dead fail "skipped refix assertion — the pane process was not confirmed dead"
+    fi
+  fi
+
+  # ── AGENT MISSING (HERD-135): the tab has NO agent pane AT ALL. The deadeyes step above left the
+  # builder pane a BARE shell (process killed, pane present ⇒ 'dead'); now CLOSE that pane entirely so
+  # the agent is neither in the roster NOR does any pane carry its label. Assert the SHIPPED probe reads
+  # 'missing' (NOT dead, NOT alive) and the SHIPPED status classifier buckets it 'agentmissing' (NOT
+  # done) for an open-PR builder — the #249 incident where 'done · PR #249' hid a tab with zero agents.
+  # A refix would then have nobody to wake; the operator sees the truth. Complements the dead-vs-missing
+  # split: 'dead' = pane present but unresponsive; 'missing' = no agent pane at all.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step missingeyes "remove the agent pane entirely → agent-missing; status reads 'agent missing', never done"
+    # shellcheck source=scripts/herd/status.sh
+    . "$HERE/../status.sh"   # _status_classify_builder (functions only; no side effects)
+    _mp_present() {
+      pane_json "$WSID" | MP="$1" python3 -c '
+import sys,json,os
+mp=os.environ["MP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==mp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    herdr pane close "$BUILD_PANE" >/dev/null 2>&1 || true
+    _mp_gone="no"; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(_mp_present "$BUILD_PANE")" = no ] && { _mp_gone=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    # The SHIPPED probe: no agent in the roster AND no pane carries its label ⇒ 'missing'.
+    _mp_live="$(herd_driver_agent_liveness rp-builder 2>/dev/null || printf 'unknown')"
+    # The SHIPPED classifier: has_agent=0, an open PR (has_pr=1) + commits ⇒ 'agentmissing', NEVER done.
+    _mp_bucket="$(_status_classify_builder 0 "" 1 1 "" 2>/dev/null || true)"
+    if [ "$_mp_gone" = yes ] && [ "$_mp_live" = "missing" ] && [ "$_mp_bucket" = "agentmissing" ]; then
+      checkpoint builder_agent_missing pass \
+        "agent pane removed → liveness 'missing' (not dead/alive); status classifier reads 'agentmissing' (not done) for an open-PR builder with no agent"
+    else
+      checkpoint builder_agent_missing fail \
+        "agent-missing not surfaced as expected (pane_gone=$_mp_gone liveness='$_mp_live' bucket='$_mp_bucket')"
+    fi
+  fi
+
   # ── CLEAN TEARDOWN: close the disposable workspace; assert nothing leaks ────────────────────────
   if [ -n "$WSID" ]; then
     step teardown "close the disposable workspace; assert no leaked tabs/panes"
@@ -402,6 +697,18 @@ except Exception:
       checkpoint teardown_clean fail "teardown left residue (workspace=$WS_GONE, leaked_tabs=$LEAKED_TABS)"
     fi
   fi
+fi
+
+# ── notify hermeticity invariant (HERD-139) ─────────────────────────────────────────────────────
+# Across the whole run (every lib-mode escalation the phases drove) not one notification may have
+# reached a real desktop channel. The notify stub captures any native osascript/notify-send attempt;
+# with the fix this is 0 — a non-zero count means a real-pane phase leaked an alarm to the desktop.
+step notify-invariant "harness invariant — zero notifications delivered outside the sink"
+_notify_native="$(sim_notify_native_attempts)"
+if [ "$_notify_native" = 0 ]; then
+  checkpoint notify_hermetic pass "no native desktop notification fired during the run (all notifications captured to the sink)"
+else
+  checkpoint notify_hermetic fail "$_notify_native native desktop notification(s) LEAKED outside the sink (see ${SIM_NOTIFY_CAPTURED:-unset})"
 fi
 
 # ── SCORECARD emitter (machine-readable JSON; mirrors the sandbox-sim family + real-pane fields) ──

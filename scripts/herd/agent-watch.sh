@@ -88,6 +88,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
+# PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
+# the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
+# dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
+. "$HERE/push-gate.sh"
+# Pipeline steps (HERD-132) — the step-runner. Sourced for steps_run_at, which the merge sequence
+# (do_merge) calls at the pre-merge and post-merge seams. Sourcing DEFINES functions only (CLI dispatch
+# is $0-guarded); byte-inert until a project ships a non-empty .herd/steps.tsv, so a project with no
+# step list runs a byte-identical merge sequence.
+. "$HERE/steps.sh"
 # Runtime driver shim — binds each runtime-specific control-surface capability (list-agents,
 # read-pane, send-keys, notifications, start-agent) to the active HERD_DRIVER. Makes the watcher's
 # load-bearing core run with NO herdr panes under HERD_DRIVER=headless (panes-as-a-view); the default
@@ -278,7 +287,10 @@ LANDED=""
 BLOCKED=""
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
+CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
+PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
+FLAIR_STATE=()         # HERD-147 flair: one state-token per DISPLAY row (parallel index), read by build_pasture
 
 # build_header — the title row + a full-width rule.
 build_header() {
@@ -450,6 +462,23 @@ build_spawn_holds() {
   [ -n "$rows" ] && SPAWN_HOLDS="$rows"
 }
 
+# build_main_health — the post-merge main-health ALARM row (HERD-129). One LOUD persistent red line
+# while the default branch is red, read from $MAIN_HEALTH_STATE ("<sha> <since_pr> <failing test…>",
+# written by _main_health_set_red and cleared by _main_health_clear). Empty (MAIN_HEALTH="") when the
+# file is absent — so a green main renders NOTHING. Also GATED on the lever: if an operator flips
+# MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no tick is left to
+# clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature whenever the
+# feature is off, red state file or not.
+build_main_health() {
+  MAIN_HEALTH=""
+  _main_health_enabled || return 0
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0
+  local _bm_sha _bm_since _bm_fail
+  read -r _bm_sha _bm_since _bm_fail < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  [ -n "${_bm_fail:-}" ] || _bm_fail="unknown"
+  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(since #${_bm_since})${C_RESET}"$'\n'
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -461,9 +490,103 @@ _fmt_age() {
   fi
 }
 
+# ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
+# An ADDITIVE cosmetic layer, gated by WATCHER_FLAIR (default off). Two surfaces, both assembled from
+# state the watcher already computes, both colored ONLY via theme.sh's C_* vars (so NO_COLOR / non-tty
+# renders plain):
+#   • merge CELEBRATION — the status tick after a merge prints one line '🐑 #<pr> joins the flock ·
+#     <n> grazing' (n = builders still building this tick). do_merge drops a self-clearing marker;
+#     build_celebrate turns it into the line and consumes it, so it shows exactly once.
+#   • PASTURE HEADER — one line rendering the in-flight herd by state, one glyph per builder in the
+#     same order as the "in flight" rows below it (🐑 grazing = building, 💤 idle, ✅ in the pen = done).
+# HARD RULE (proven by the sim + units): flair NEVER softens a red/dead/needs-you state. A dead builder
+# is 💀 red and a needs-you builder is ⚠️ red in the header — exactly as loud as their rows — and OFF is
+# byte-inert: build_celebrate/build_pasture leave CELEBRATE/PASTURE empty so render() emits nothing new.
+FLAIR_CELEBRATE_STATE="$TREES/.agent-watch-flair-celebrate"   # pending merged-PR numbers, one per line
+
+# _flair_enabled — true iff WATCHER_FLAIR opts in. Default OFF (mirrors _main_health_enabled); any
+# unrecognized value reads as off (fail toward the byte-identical console).
+_flair_enabled() {
+  case "$(printf '%s' "${WATCHER_FLAIR:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _flair_glyph <state-token> — echo the theme-colored glyph for one builder state. The calm states get
+# the cozy flair glyphs; every attention/dead state keeps its LOUD color+glyph (never softened). An
+# unknown token falls back to a dim 🐑 (a benign herd member), never a colored alarm.
+_flair_glyph() {
+  case "$1" in
+    grazing)   printf '%s🐑%s' "$C_GREEN"  "$C_RESET" ;;   # building
+    idle)      printf '%s💤%s' "$C_DIM"    "$C_RESET" ;;   # idle · no PR
+    pen)       printf '%s✅%s' "$C_GREEN"  "$C_RESET" ;;   # done / ready
+    dead)      printf '%s💀%s' "$C_RED"    "$C_RESET" ;;   # dead builder — LOUD, byte-as-today
+    attention) printf '%s⚠️%s'  "$C_RED"    "$C_RESET" ;;   # needs-you / not-mergeable / failed — LOUD
+    warn)      printf '%s⚠️%s'  "$C_YELLOW" "$C_RESET" ;;   # stalled "no activity · check pane"
+    busy)      printf '%s🩺%s' "$C_YELLOW" "$C_RESET" ;;   # in-progress gate (health-check / resolving / limit-resume / waiting)
+    verify)    printf '%s🔍%s' "$C_DIM"    "$C_RESET" ;;   # verifying mergeability
+    other)     printf '%s👥%s' "$C_DIM"    "$C_RESET" ;;   # not mine — manual (team mode)
+    self)      printf '%s🐑%s' "$C_DIM"    "$C_RESET" ;;   # the watcher's own worktree
+    *)         printf '%s🐑%s' "$C_DIM"    "$C_RESET" ;;
+  esac
+}
+
+# _flair_celebration_line <pr#> <n-grazing> — the pure formatter for ONE merge-celebration line
+# (no trailing newline). Themed: a green 🐑 headline + a dim tail. NO_COLOR/non-tty → the C_* are blank
+# so it degrades to plain text. Kept pure (no I/O, no globals) so the unit test can pin its exact bytes.
+_flair_celebration_line() {
+  printf '  %s🐑 #%s joins the flock%s %s· %s grazing%s' \
+    "$C_GREEN" "$1" "$C_RESET" "$C_DIM" "$2" "$C_RESET"
+}
+
+# build_celebrate <n-grazing> — set CELEBRATE from the pending-merge marker (one celebration line per
+# just-merged PR), then CONSUME the marker so each merge is celebrated exactly once. Empty (byte-inert)
+# when flair is off or nothing merged since the last tick — so render() adds nothing.
+build_celebrate() {
+  CELEBRATE=""
+  _flair_enabled || return 0
+  [ -s "$FLAIR_CELEBRATE_STATE" ] || return 0
+  local _bc_n="${1:-0}" pr rows=""
+  case "$_bc_n" in ''|*[!0-9]*) _bc_n=0 ;; esac
+  while read -r pr _; do
+    case "$pr" in ''|*[!0-9]*) continue ;; esac
+    rows="${rows}$(_flair_celebration_line "$pr" "$_bc_n")"$'\n'
+  done < "$FLAIR_CELEBRATE_STATE"
+  rm -f "$FLAIR_CELEBRATE_STATE" 2>/dev/null || true
+  CELEBRATE="$rows"
+}
+
+# build_pasture — set PASTURE to a single header line rendering each in-flight builder by state, one
+# glyph per FLAIR_STATE[] entry (parallel-indexed to DISPLAY[], populated in the classification loop),
+# in row order. Empty (byte-inert) when flair is off OR there are no builders — so a byte-identical
+# console when the feature is unused and no "empty pasture" line when the herd is idle.
+build_pasture() {
+  PASTURE=""
+  _flair_enabled || return 0
+  [ "${#FLAIR_STATE[@]}" -gt 0 ] || return 0
+  local st glyphs=""
+  for st in "${FLAIR_STATE[@]}"; do
+    [ -n "$st" ] || st=grazing
+    glyphs="${glyphs}$(_flair_glyph "$st") "
+  done
+  [ -n "$glyphs" ] || return 0
+  PASTURE="  ${C_DIM}pasture${C_RESET}  ${glyphs% }"$'\n'
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # Post-merge main-health ALARM (HERD-129) — pinned at the TOP so a red default branch is the first
+  # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
+  if [ -n "${MAIN_HEALTH:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH}"$'\n'
+  fi
+  # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
+  # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
+  if [ -n "${CELEBRATE:-}" ]; then
+    frame="${frame}${CELEBRATE}"$'\n'
+  fi
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
   if [ -n "${BLOCKED:-}" ]; then
     frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
@@ -473,6 +596,11 @@ render() {
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
+  # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
+  # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
+  if [ -n "${PASTURE:-}" ]; then
+    frame="${frame}${PASTURE}"
   fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
@@ -824,8 +952,14 @@ _retire_reviewer_pane() {
   [ -f "$reg" ] || return 0
   read -r pid pane < "$reg" 2>/dev/null || true
   if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
-    herd_driver_close_pane "$pane"
-    journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+    # GUARDED CLOSE (HERD-134): the registry pane id can be stale/recycled and now name the BUILDER (or
+    # another neighbour) sharing this tab. Verify the pane is still a reviewer BEFORE closing; on a
+    # mismatch the guard REFUSES and journals pane_close_refused, so we journal reviewer_pane_retired
+    # ONLY on a real close. The registry row is dropped unconditionally below either way — a row that
+    # pointed at the wrong pane must not linger to be retried.
+    if herd_close_pane_verified "$pane" "review·"; then
+      journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
+    fi
   fi
   rm -f "$reg" 2>/dev/null || true
 }
@@ -1079,12 +1213,15 @@ _review_gate_step() {
   # Collect a finished verdict: record to the ledger exactly as the synchronous gate did.
   if [ -f "$result" ]; then
     verdict_line="$(grep -E '^REVIEW: (PASS|BLOCK|INFRA-FAIL)' "$result" 2>/dev/null | tail -1)"
-    rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
-    # VERDICT CONSUMED → retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane
-    # OPEN with an idle session showing the verdict banner; now that the watcher has read the verdict
-    # that pane has done its job, so close it (and drop the registry row). No-op when there is no live
-    # pane (headless, or an INFRA-FAIL reviewer that already tore down its own pane).
-    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    # HERD-156 (record-before-rm): DURABLY record the verdict to the ledger FIRST, and only THEN remove
+    # the reviewer's scratch files. The old order (rm → record) had a fatal seam: a crash BETWEEN the rm
+    # and the record deleted the result file with NO ledger row to show for it, permanently losing a
+    # collected PASS/BLOCK — the next tick, finding neither result nor verdict, would dispatch a
+    # brand-new review from scratch. Recording first makes the collect at-least-once: a crash after the
+    # record simply re-reads the still-present result file next tick and re-records it (duplicate ledger
+    # rows are last-wins = safe). The rm + pane-retire below are pure cleanup that a re-run repeats
+    # harmlessly.
+    local _rgs_echo=""
     case "$verdict_line" in
       # A parseable PASS/BLOCK is reviewer-backed (herd-review.sh only emits these from a real
       # verdict line + PR comment; a no-verdict run now reports INFRA-FAIL, not a default BLOCK).
@@ -1096,22 +1233,30 @@ _review_gate_step() {
         _breaker_record_ok
         record_review "$pr" "$sha" "PASS" "reviewer"
         _record_advisory_notes "$pr" "$sha" "$verdict_line"
-        echo PASS; return 0 ;;
+        _rgs_echo=PASS ;;
       "REVIEW: BLOCK"*)
         _breaker_record_ok
         record_review "$pr" "$sha" "BLOCK" "reviewer"
         # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
         _persist_block_fields "$pr" "$sha" "$verdict_line"
-        echo BLOCK; return 0 ;;
+        _rgs_echo=BLOCK ;;
       *)
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
         # verdict — never cached to the ledger, retried next poll with a cap. Counts against the
         # global INFRA circuit breaker (HERD-110): a run of these across PRs means the env is dead.
         record_review_retry "$pr" "$sha"
         _breaker_record_infra
-        if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; else echo RETRY; fi
-        return 0 ;;
+        if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then _rgs_echo=FAILED; else _rgs_echo=RETRY; fi
+        ;;
     esac
+    # Verdict is now durably in the ledger → drop the reviewer's scratch files. VERDICT CONSUMED →
+    # retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane OPEN with an idle
+    # session showing the verdict banner; now that the watcher has read the verdict that pane has done
+    # its job, so close it (and drop the registry row). No-op when there is no live pane (headless, or
+    # an INFRA-FAIL reviewer that already tore down its own pane).
+    rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+    _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    echo "$_rgs_echo"; return 0
   fi
 
   # In flight and alive → wait. Dead with no result = severed reviewer → reap, count, re-dispatch.
@@ -1440,6 +1585,9 @@ _classify_conflict() {
   sl="$(_slug_cell "$cslug")"; pn=" ${C_DIM}#${cpr}${C_RESET} ·"
   cap="${REFIX_MAX_ROUNDS:-3}"
   count="$(resolver_dispatch_count "$cpr")"
+  # HERD-147 flair default: a conflict is a needs-you/red state → 'attention' in the pasture header
+  # (never softened). The in-progress "resolving conflict…" outcomes below downgrade it to 'busy'.
+  FLAIR_STATE[ci]="attention"
 
   # ESCALATE already recorded for THIS sha → terminal; hold for a human, never re-dispatch.
   if resolver_escalated_sha "$cpr" "$csha"; then
@@ -1465,6 +1613,7 @@ _classify_conflict() {
     # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
     if _resolver_in_flight "$cslug" "$cpr"; then
       DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+      FLAIR_STATE[ci]="busy"
       return
     fi
     # DEAD resolver — re-spawn for the same sha if budget remains, else surface needs-you.
@@ -1491,6 +1640,7 @@ _classify_conflict() {
   # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
   if _resolver_in_flight "$cslug" "$cpr"; then
     DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
+    FLAIR_STATE[ci]="busy"
     return
   fi
   if [ "$count" -ge "$cap" ]; then
@@ -1723,8 +1873,126 @@ _reap_slug() {
   local _rp_slug="$1" _rp_dir="$2" _rp_pr="${3:-}" _rp_sha="${4:-}" _rp_reason="${5:-merged}"
   git -C "$MAIN" worktree remove --force "$_rp_dir" >/dev/null 2>&1 || true
   rm -f "$(_slug_ref_file "$_rp_slug")" 2>/dev/null || true
+  # HERD-157 F9 backstop: purge any step-hold rows + detail files for this reaped slug. A reaped
+  # worktree is terminal, so a lingering 'awaiting' step-hold row would haunt `herd-approve.sh list`
+  # forever (the step-hold analogue of purge_pr_approvals). Fail-soft + idempotent; no-op when steps
+  # are unused. Done before teardown so a teardown hiccup can't strand the phantom hold.
+  command -v steps_hold_purge >/dev/null 2>&1 && steps_hold_purge "$_rp_slug" || true
   journal_append reap pr "$_rp_pr" slug "$_rp_slug" sha "$_rp_sha" reason "$_rp_reason"
   herd_teardown_slug "$_rp_slug"
+  return 0
+}
+
+# ── Post-merge main-health tick (HERD-129) ─────────────────────────────────────────────────────────
+# Catch a RED default branch AT MERGE TIME. The pre-merge health gate proves each PR green in
+# ISOLATION, but two independently-green PRs can merge into a broken COMBINATION — the #226 advise
+# exit-code collision (2026-07-08) left main red ~2h, found only when later unrelated PRs #238/#239
+# inherited the failure. So after every merge we run the healthcheck suite against the freshly ff'd
+# default-branch HEAD and, on a reproduced red, raise a LOUD persistent 'MAIN RED' console row +
+# notification — cleared the moment a later sha goes green.
+#
+# This is an ALARM, never a gate: it runs AFTER the merge has landed and never blocks, reverts, or
+# re-merges anything (mirrors the 2b/2c codemap/symbol-index hooks' best-effort posture). Gated by
+# MAIN_HEALTH_TICK (default off) → byte-inert when unset: no suite, no journal, no state file, so
+# build_main_health finds nothing and the console renders byte-identically. Fully fail-soft: a suite
+# that cannot even run (no HEAD, no slot, no bin) journals an infra_event and never paints a red row,
+# and a tab-leak-guard trip is treated as the same transient the pre-merge gate already tolerates.
+MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"   # one line while RED: "<sha> <since_pr> <failing test…>"
+
+# _main_health_enabled — true iff MAIN_HEALTH_TICK opts in. Default OFF (the inverse of the
+# CODEMAP_AUTOREFRESH default-on lever); any unrecognized value reads as off (fail toward dormant).
+_main_health_enabled() {
+  case "$(printf '%s' "${MAIN_HEALTH_TICK:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _main_health_marker <sha> — the per-sha run-once marker (mirrors the sha-keyed .health-result cache):
+# a main sha whose marker exists has ALREADY been ticked, so a re-entrant merge tick / watcher restart
+# never re-runs the suite for the same commit.
+_main_health_marker() { printf '%s' "$TREES/.main-health-$1"; }
+
+# WHY the tick is ALWAYS heavy (never light) — a review-caught correctness trap. The 'light' profile
+# derives its file set from healthcheck.sh's `git diff --name-only $DEFAULT_BRANCH` run INSIDE the dir
+# it checks; against $MAIN — which IS the default-branch checkout — that diff is EMPTY, so light checks
+# ZERO files and returns a vacuous rc-0 ("✅ light clean — 0 sh, 0 py ok") no matter what state main is
+# actually in. Routing that vacuous rc-0 to _main_health_clear would WIPE a real MAIN RED and fire a
+# false 'recovered' the next time a docs/BACKLOG/config merge (any diff not matching
+# HEALTHCHECK_HEAVY_GLOB) landed. A light subset is categorically meaningless on a zero-diff tree, so a
+# main-health tick must run the FULL suite every time: we pass --heavy unconditionally. (For a project
+# with no HEALTHCHECK_CMD, healthcheck.sh's --heavy falls back to light anyway — but such a project
+# also never paints red, so there is nothing to falsely clear.)
+
+# _main_health_clear <pr#> <sha> — a main sha went GREEN. Drop any standing red state (which removes
+# the console row), journal the green result, and on a RED→green TRANSITION notify recovery once.
+_main_health_clear() {
+  local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0
+  [ -s "$MAIN_HEALTH_STATE" ] && _mc_wasred=1
+  rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
+  if [ "$_mc_wasred" -eq 1 ]; then
+    herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
+  fi
+}
+
+# _main_health_set_red <pr#> <sha> <healthcheck-oneline> — a main sha REPRODUCED a red. Persist the
+# red state (which drives the console row), journal the failing test via the HERD-76 identity
+# extraction, and notify ONCE on the green→red transition. The 'since #N' PR is STICKY: if main was
+# already red, keep the FIRST offending PR so a run of red merges all point back to where main broke.
+_main_health_set_red() {
+  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_fail _sr_since _sr_wasred=0 _sr_pv_sha _sr_pv_since _sr_rest
+  _sr_fail="$(_health_fail_identity "$_sr_out")"
+  [ -n "$_sr_fail" ] || _sr_fail="$_sr_out"
+  _sr_since="$_sr_pr"
+  if [ -s "$MAIN_HEALTH_STATE" ]; then
+    _sr_wasred=1
+    read -r _sr_pv_sha _sr_pv_since _sr_rest < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+    [ -n "${_sr_pv_since:-}" ] && _sr_since="$_sr_pv_since"
+  fi
+  printf '%s %s %s\n' "$_sr_sha" "$_sr_since" "$_sr_fail" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_fail" since "$_sr_since"
+  if [ "$_sr_wasred" -eq 0 ]; then
+    herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_fail} (since #${_sr_since})" default
+  fi
+}
+
+# main_health_tick <pr#> — the post-merge hook (called from do_merge). Runs the healthcheck suite
+# against the current default-branch HEAD ONCE per sha and routes the outcome to _main_health_clear /
+# _main_health_set_red. Byte-inert when disabled; ALWAYS returns 0 (an alarm can never fail a merge).
+main_health_tick() {
+  _main_health_enabled || return 0
+  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_out _mh_rc
+  _mh_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_mh_sha" ] || { journal_append main_health pr "$_mh_pr" result infra_event reason no-head; return 0; }
+  _mh_marker="$(_main_health_marker "$_mh_sha")"
+  [ -e "$_mh_marker" ] && return 0                        # this main sha already ticked — run ONCE
+  # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared mutex (all
+  # worktrees + $MAIN share one git object store, so overlapping suites race on .git locks and paint
+  # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so a later
+  # merge tick re-attempts it; never run an overlapping suite.
+  _health_slot_free || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-slot; return 0; }
+  [ -f "$HERD_HEALTHCHECK_BIN" ] || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-bin; return 0; }
+  _health_acquire "main-$_mh_sha"
+  # ALWAYS --heavy: a 'light' check against $MAIN is a zero-file vacuous green (see the note above), so
+  # it could silently CLEAR a real MAIN RED. The full suite is the only meaningful main-health check.
+  _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
+  # RETRY-BEFORE-RED: a lone rc-1 may be transient cross-worktree git-lock contention — the exact
+  # false-red the pre-merge gate's solo retry defends against. Re-run once, still holding the mutex.
+  if [ "$_mh_rc" -eq 1 ]; then
+    _mh_out="$(bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --oneline --heavy 2>/dev/null)"; _mh_rc=$?
+  fi
+  _health_release "main-$_mh_sha"
+  : > "$_mh_marker" 2>/dev/null || true                   # the suite ran against this sha — mark run-once
+  case "$_mh_rc" in
+    0) _main_health_clear "$_mh_pr" "$_mh_sha" ;;          # clean (or tolerated data/env) → green
+    1) case "$_mh_out" in
+         *tab-leak-guard*)                                 # transient control-room churn, NOT a code bug (issue #78)
+           journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason tab-leak-guard ;;
+         *) _main_health_set_red "$_mh_pr" "$_mh_sha" "$_mh_out" ;;
+       esac ;;
+    *) journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason "rc-$_mh_rc" ;;
+  esac
   return 0
 }
 
@@ -1734,7 +2002,40 @@ do_merge() {
   if [ -n "$DRYRUN" ]; then
     return 0
   fi
-  gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
+  # Pipeline steps (HERD-132) — PRE-MERGE seam. Operator-defined pre-merge steps run HERE, AFTER the
+  # built-in review + health gates have already passed (this PR only reaches do_merge on green gates),
+  # so they ADD a gate, never bypass the floor. A block-step failure (rc 1) or an approve-HOLD (rc 20)
+  # leaves the PR UNMERGED — we return WITHOUT writing the $STATE merge row, so the watcher retries next
+  # tick (a block re-runs; an approve-hold re-surfaces until 'herd-approve.sh approve <slug>' releases
+  # it). Byte-inert when .herd/steps.tsv is absent (steps_run_at returns 0 immediately).
+  if command -v steps_run_at >/dev/null 2>&1; then
+    local _st_rc=0
+    steps_run_at pre-merge --slug "$ds" --dir "$dd" --sha "$dsha" || _st_rc=$?
+    if [ "$_st_rc" -ne 0 ]; then
+      case "$_st_rc" in
+        20) journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam pre-merge action held ;;
+        *)  journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam pre-merge action blocked ;;
+      esac
+      return 1
+    fi
+  fi
+  # HERD-156: PIN the merge to the gate-verified sha. Everything upstream — the re-verify tick, the
+  # PR-body fetch, the pre-merge steps seam above — opens a window in which a NEW commit could be
+  # pushed to the head branch AFTER the review + health gates passed on $dsha. --match-head-commit makes
+  # gh REFUSE the merge unless the remote head is still exactly $dsha, so a commit that landed during
+  # that window can NEVER merge unreviewed. On a moved head gh exits non-zero; we journal it and return
+  # WITHOUT writing the $STATE merge row, so the next tick re-gates (re-review + re-health) the NEW sha
+  # through the existing machinery — no new state, and the merge stays at-most-once. $dsha is empty only
+  # for a legacy caller that threaded no sha; there we fall back to the unpinned merge (byte-identical to
+  # before this change) rather than refuse a merge we cannot pin.
+  if [ -n "$dsha" ]; then
+    if ! gh pr merge "$dp" "$(_merge_method_flag)" --match-head-commit "$dsha" >/dev/null 2>&1; then
+      journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+      return 1
+    fi
+  else
+    gh pr merge "$dp" "$(_merge_method_flag)" >/dev/null 2>&1 || return 1
+  fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
   # body line. Empty for an untracked PR → the row renders the plain slug, exactly as before.
@@ -1748,6 +2049,10 @@ do_merge() {
     printf '%s %s %s\n' "$(date +%s)" "$dp" "$ds" >> "$STATE"
   fi
   journal_append merge pr "$dp" slug "$ds" sha "$dsha" method "$(_merge_method_flag)" reason gates_passed
+  # HERD-147 flair: queue a merge CELEBRATION for the NEXT status tick (build_celebrate renders + clears
+  # it). Gated on WATCHER_FLAIR so the marker is never written when flair is off → do_merge stays
+  # byte-identical to before this feature. Additive + fail-soft: a marker write that fails is ignored.
+  _flair_enabled && printf '%s\n' "$dp" >> "$FLAIR_CELEBRATE_STATE" 2>/dev/null || true
   # HERD-90: purge every approval-ledger row for this PR (all shas) now that it is merged. Without
   # this, an OLD-sha 'awaiting' row from a re-applied HUMAN-VERIFY hold lingers as a phantom pending
   # approval in `herd-approve.sh list`. Done right after the merge record so a later cleanup crash
@@ -1771,6 +2076,19 @@ do_merge() {
   # 2c) POST-MERGE symbol-index refresh: same posture as 2b but for the function-level def→caller
   #     index (docs/symbol-index.md). Shares the CODEMAP_AUTOREFRESH lever; fully fail-soft.
   refresh_symbol_index "$dp"
+  # 2d) POST-MERGE main-health tick (HERD-129): run the healthcheck suite against the freshly ff'd
+  #     default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into
+  #     a broken combination). Gated by MAIN_HEALTH_TICK (default off → byte-inert). An ALARM only:
+  #     fully fail-soft, never blocks/reverts/re-merges — like 2b/2c it can never fail the merge.
+  main_health_tick "$dp"
+  # 2e) POST-MERGE pipeline steps (HERD-132): operator-defined post-merge steps run here, BEFORE the
+  #     worktree is reaped (so a step can still inspect it). ALARM-class like 2b–2d: the merge has
+  #     already landed, so this can NEVER revert or re-merge — a failing block-step / an approve-hold
+  #     journals loudly but the merge stands. Byte-inert when no steps.tsv. Never fails the merge.
+  if command -v steps_run_at >/dev/null 2>&1; then
+    steps_run_at post-merge --slug "$ds" --dir "$dd" --sha "$dsha" \
+      || journal_append step_gate pr "$dp" slug "$ds" sha "$dsha" seam post-merge action nonzero
+  fi
   # 3+4) IDEMPOTENT teardown (the WATCHER's job — sub-agents NEVER self-close): force-remove the
   #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
   #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup
@@ -1920,14 +2238,37 @@ for line in os.environ.get("WT","").splitlines():
       print(os.path.basename(p))
 ' 2>/dev/null || true)"
 
-  # Collect live slugs from open PRs (headRefName last component).
+  # Collect live slugs from open PRs by parsing each headRefName under the active BRANCH_TEMPLATE
+  # (HERD-120) — mirrors herd_branch_parse so a custom / non-feat branch scheme still resolves the
+  # slug that keys the tab, instead of assuming the slug is the last '/'-segment.
   local _sw_pr_slugs
-  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | python3 -c '
-import sys, json
+  local _sw_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_sw_tmpl" ] || _sw_tmpl='feat/{slug}'
+  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
+import sys, json, os
+tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
+if "{slug}" not in tmpl: tmpl = "feat/{slug}"
+pre, _, post = tmpl.partition("{slug}")
+def parse(b):
+  s = b
+  if "{ref}" in pre:
+    sep = pre.rsplit("{ref}", 1)[1]
+    if sep:
+      i = s.rfind(sep)
+      if i >= 0: s = s[i + len(sep):]
+  elif pre and s.startswith(pre):
+    s = s[len(pre):]
+  if "{ref}" in post:
+    sep2 = post.split("{ref}", 1)[0]
+    if sep2:
+      i = s.find(sep2)
+      if i >= 0: s = s[:i]
+  elif post and s.endswith(post):
+    s = s[:len(s) - len(post)]
+  return s
 try:
   for p in json.load(sys.stdin):
     b = p.get("headRefName","")
-    if b: print(b.split("/")[-1])
+    if b: print(parse(b))
 except Exception:
   pass
 ' 2>/dev/null || true)"
@@ -2087,14 +2428,36 @@ except Exception:
 
   # (2) One gh call: map each OPEN PR's slug → its mergeable state. A slug ABSENT from this map has no
   #     open PR (merged/closed/never-existed) → its conflict is definitively gone.
-  local _srt_prs
-  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | python3 -c '
-import sys, json
+  local _srt_prs _srt_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_srt_tmpl" ] || _srt_tmpl='feat/{slug}'
+  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | BRANCH_TEMPLATE="$_srt_tmpl" python3 -c '
+import sys, json, os
+# Parse each headRefName to its slug under the active BRANCH_TEMPLATE (HERD-120), mirroring
+# herd_branch_parse — so a custom / non-feat branch scheme resolves the slug that keys the resolve tab.
+tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
+if "{slug}" not in tmpl: tmpl = "feat/{slug}"
+pre, _, post = tmpl.partition("{slug}")
+def parse(b):
+    s = b
+    if "{ref}" in pre:
+        sep = pre.rsplit("{ref}", 1)[1]
+        if sep:
+            i = s.rfind(sep)
+            if i >= 0: s = s[i + len(sep):]
+    elif pre and s.startswith(pre):
+        s = s[len(pre):]
+    if "{ref}" in post:
+        sep2 = post.split("{ref}", 1)[0]
+        if sep2:
+            i = s.find(sep2)
+            if i >= 0: s = s[:i]
+    elif post and s.endswith(post):
+        s = s[:len(s) - len(post)]
+    return s
 try:
     for p in json.load(sys.stdin):
         b = p.get("headRefName","")
         if b:
-            print(b.split("/")[-1] + "\t" + (p.get("mergeable","") or ""))
+            print(parse(b) + "\t" + (p.get("mergeable","") or ""))
 except Exception:
     pass
 ' 2>/dev/null || true)"
@@ -2176,6 +2539,15 @@ record_refix() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$REFIX_STATE"
 }
 
+# Dead-agent refix escalation dedup (HERD-114): the review-block path re-enters every tick while a PR
+# stays blocked, so a builder whose agent SESSION died would re-journal + re-notify each tick. This
+# tiny per-(pr,sha) marker fires the journal event + notification EXACTLY ONCE per dead escalation
+# (mirroring the dead-builder ledger's notify-once), while the red console row is (idempotently) re-set
+# every tick. A new commit changes the sha → a fresh escalation is eligible if the new agent is dead too.
+_refix_dead_marker()  { printf '%s' "$TREES/.agent-watch-refix-dead-$1-$2"; }
+_refix_dead_seen()    { [ -f "$(_refix_dead_marker "$1" "$2")" ]; }
+_record_refix_dead()  { : > "$(_refix_dead_marker "$1" "$2")" 2>/dev/null || true; }
+
 # _maybe_arm_review_escalation <pr#> — called right AFTER record_refix. If this PR has now accumulated
 # at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed refix rounds, the cheap reviewer's PASS
 # has been proven wrong across two rounds — arm a one-shot Opus escalation for the PR's NEXT review
@@ -2223,6 +2595,15 @@ except Exception:
 ' 2>/dev/null || true
 }
 
+# _agent_liveness <slug> — three-valued liveness (alive|dead|unknown) of this builder's agent SESSION
+# via the driver seam (herd_driver_agent_liveness): is its underlying PROCESS actually running, as
+# opposed to a stale agent_status word herdr keeps reporting after a crash killed it (HERD-114)? Only a
+# POSITIVE 'dead' ever changes a caller's behavior; 'unknown' (probe blind) preserves prior behavior so
+# the console stays byte-identical whenever every agent is live OR the probe cannot see the truth.
+_agent_liveness() {
+  herd_driver_agent_liveness "$1" 2>/dev/null || printf 'unknown'
+}
+
 # _wait_agent_working <slug> <window-s> — poll `herdr agent list` until the agent's status is
 # "working" or the window expires, on a BACKED-OFF cadence: an immediate check, then 1s, 2s, 3s…
 # capped at 5s between checks. Several spread-out checks across the window catch a builder that
@@ -2246,12 +2627,27 @@ _wait_agent_working() {
 # Always updates DISPLAY[<idx>]; calls render internally before the blocking wait so the user sees
 # "refixing" while the bounce is in progress.
 _handle_block_verdict() {
-  local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4"
-  local _hbv_sl _hbv_pn
+  local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4" _hbv_wt="${5:-}"
+  local _hbv_sl _hbv_pn _hbv_live
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
+    # HARDENING (HERD-155 F5): NEVER pane-run a re-task prompt into a LIMIT-PARKED builder. A builder
+    # that hit the account usage limit AFTER opening its PR is parked at the limit arrow-menu (or a
+    # frozen session); the bounce below types the fix prompt via `herdr pane run`, which would land in
+    # the menu — exactly the keystroke-into-a-menu hazard this change closes. Consult the SAME limit
+    # detector the idle path uses and, on a hit, route to the park/resume handler (surface the hold +
+    # schedule the resume) instead of typing. refix-once is NOT burned, so the bounce fires normally
+    # once the builder is back. Inert when the worktree is unknown or there is no limit signal.
+    if [ -n "$_hbv_wt" ]; then
+      local _hbv_lreset
+      if _hbv_lreset="$(_detect_limit_hit "$_hbv_slug" "$_hbv_wt")"; then
+        journal_append refix_deferred_limit pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" reset_at "${_hbv_lreset:-0}"
+        _handle_limit_blocked "$_hbv_slug" "$_hbv_wt" "$_hbv_idx" "${_hbv_lreset:-0}"
+        return 0
+      fi
+    fi
     # SAFETY GATE: only a REVIEWER-BACKED block may bounce a builder. A gate-generated default
     # verdict (or any non-reviewer provenance) carries no actionable finding — bouncing on it
     # sends the builder a "fix" prompt with nothing to fix (2026-07-02 incident: a no-verdict
@@ -2270,6 +2666,35 @@ _handle_block_verdict() {
       DISPLAY[_hbv_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_YELLOW}review blocked · fix requested · awaiting push${C_RESET}"
     elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
+    elif _hbv_live="$(_agent_liveness "$_hbv_slug")"; [ "$_hbv_live" = "dead" ] || [ "$_hbv_live" = "missing" ]; then
+      # HERD-114/HERD-135 PREFLIGHT — the auto-refix bounce wakes the builder by typing the re-task
+      # prompt into its agent pane. If that agent SESSION is DEAD (process killed — e.g. a herdr server
+      # stop — while the pane/worktree persist and herdr still reports a stale 'done') OR the agent pane
+      # is MISSING entirely (the pane vanished and cleanup closed the leftover shell — the 2026-07-08
+      # PR #249 incident), typing a wake can only hit nobody. Detect it up front and escalate LOUDLY
+      # WITHOUT burning a refix round on a guaranteed-failed wake. Only a POSITIVE 'dead'/'missing'
+      # escalates here; 'unknown'/'alive' fell through to the normal bounce below, so the path is
+      # byte-identical whenever the agent is live OR the probe cannot see the truth (no false-red).
+      if [ "$_hbv_live" = "missing" ]; then
+        DISPLAY[_hbv_idx]="    ${C_RED}🫥${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent missing (no agent pane) — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      else
+        DISPLAY[_hbv_idx]="    ${C_RED}💀${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · agent dead · session unwakeable — re-task by hand · see PR #${_hbv_pr}${C_RESET}"
+      fi
+      # Journal + notify ONCE per (pr,sha) — this path re-enters every tick while the PR stays blocked.
+      if ! _refix_dead_seen "$_hbv_pr" "$_hbv_sha"; then
+        _record_refix_dead "$_hbv_pr" "$_hbv_sha"
+        if [ "$_hbv_live" = "missing" ]; then
+          journal_append refix_escalated_missing pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+            reason "agent pane missing — no agent to wake; escalated for human"
+          herd_driver_notify "🫥 agent missing: ${_hbv_slug}" \
+            "PR #${_hbv_pr} review-blocked but the builder has no agent pane (vanished) — re-task by hand" default
+        else
+          journal_append refix_escalated_dead pr "$_hbv_pr" sha "$_hbv_sha" slug "$_hbv_slug" \
+            reason "agent session dead — wake would fail; escalated for human"
+          herd_driver_notify "💀 agent dead: ${_hbv_slug}" \
+            "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
+        fi
+      fi
     else
       local _hbv_round_num
       _hbv_round_num="$((_hbv_rounds + 1))"
@@ -2392,6 +2817,17 @@ except Exception:
 _resume_builder() {
   local _rb_slug="$1" _rb_wt="$2" _rb_pane="$3" _rb_prompt="${4:-continue}"
   [ -n "$_rb_pane" ] || return 1
+  # HARDENING (HERD-155 F1): NEVER type `cd … && claude --continue` into a pane still parked at the
+  # limit ARROW-MENU — the command line would be captured as MENU input (worst case: it lands on
+  # "Upgrade your plan" and strands the session at a login screen). The `--continue` backstop is only
+  # valid for a session that has actually ENDED (a normal REPL). Fire ONLY when a menu is NOT CONFIRMED
+  # present; a confirmed menu means the clean-select degraded, so REFUSE and let the CALLER escalate
+  # (record 'failed' + loud row / notification) rather than type blind. Empty/blind read → not a menu
+  # → proceed (headless & pane-less environments keep working, backstop unchanged).
+  if _pane_menu_confirmed "$_rb_pane"; then
+    journal_append limit_resume_refused slug "$_rb_slug" pane "$_rb_pane" reason menu_parked
+    return 1
+  fi
   local _rb_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
   # cd into the worktree so `claude --continue` resumes THAT worktree's session even if the pane's
   # shell drifted; the explicit path also makes the invocation shape assertable in the hermetic tests.
@@ -2465,11 +2901,22 @@ _parse_reset_epoch() {
 import os, re, sys, datetime
 text = os.environ.get("HERD_RESET_TEXT", "")
 now = int(os.environ.get("HERD_RESET_NOW", "0") or 0)
-m = re.fullmatch(r"\s*(\d{9,})\s*", text)      # an already-numeric epoch (hook may write one)
+m = re.fullmatch(r"\s*(\d{9,})\s*", text)      # a WHOLE-string numeric epoch (hook may write one)
 if m:
     sys.stdout.write(m.group(1)); sys.exit(0)
-m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", text, re.I)   # 7:30pm / 7pm / 19:30
+# HERD-155 F3: require an ANCHORED "reset at/in" context before trusting any clock time. A stray 1-2
+# digit number floating anywhere in the text — a JSON stdin blob, a token count, a session-id fragment,
+# a "2 files changed" from a builder discussing limits — must NEVER be misread as a reset clock, which
+# would schedule a bogus resume. Only parse a time that FOLLOWS the anchor.
+am = re.search(r"reset[s]?\s+(?:at|in)\b(.*)", text, re.I | re.S)
+if not am:
+    sys.exit(0)
+m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", am.group(1), re.I)   # reset at 7:30pm / 7pm / 19:30
 if not m:
+    sys.exit(0)
+# Demand a REAL clock token: an am/pm marker OR an explicit :MM. A bare integer after the anchor
+# ("reset in 5 hours") is a DURATION, not a wall-clock time — don't guess it; fall to unknown-wait.
+if not (m.group(3) or m.group(2)):
     sys.exit(0)
 hh = int(m.group(1)); mm = int(m.group(2) or 0); ap = (m.group(3) or "").lower()
 if ap == "pm" and hh != 12: hh += 12
@@ -2482,6 +2929,23 @@ if cand.timestamp() <= now:            # already passed today → the next day's
     cand += datetime.timedelta(days=1)
 sys.stdout.write(str(int(cand.timestamp())))
 PY
+}
+
+# _text_is_limit_banner <text> — 0 iff <text> looks like Claude's actual usage-limit BANNER, not a
+# builder merely DISCUSSING usage limits. HERD-155 F4: this repo's builders BUILD limit features, so
+# the bare phrase "usage limit" shows up in perfectly normal assistant output (task specs, PR bodies,
+# code comments — this very sentence). Detection now requires BOTH:
+#   1. the canonical usage-limit PHRASE — kept VERBATIM as the driver's DRIVER_AGENT_LIMIT_PATTERN
+#      mirror (the cross-driver conformance audit in test-driver-agent-exec.sh asserts this exact
+#      string is still present here), AND
+#   2. the banner SHAPE — a "limit reached" / "limit will reset" / "reset at|in <time>" STATUS line.
+# Discussion carries the phrase but not the shape, so the transcript-scrape fallback no longer
+# self-triggers a phantom park on a limit-feature builder's own words. The hook sentinel (primary
+# signal) is unaffected — this only tightens the fallback.
+_text_is_limit_banner() {
+  local _tb="$1"
+  printf '%s' "$_tb" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit' || return 1
+  printf '%s' "$_tb" | grep -qiE 'limit reached|will reset|reset[s]? (at|in) |reached your (usage|session) limit'
 }
 
 # _detect_limit_hit <slug> <worktree> — is this builder blocked on the account usage limit?
@@ -2500,7 +2964,7 @@ _detect_limit_hit() {
     printf '%s' "${_dl_reset:-0}"; return 0
   fi
   _dl_text="$(_transcript_last_assistant_text "$_dl_wt")"
-  if [ -n "$_dl_text" ] && printf '%s' "$_dl_text" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit'; then
+  if [ -n "$_dl_text" ] && _text_is_limit_banner "$_dl_text"; then
     _dl_reset="$(_parse_reset_epoch "$_dl_text")"
     printf '%s' "${_dl_reset:-0}"; return 0
   fi
@@ -2610,6 +3074,46 @@ _pane_shows_limit_menu() {
   printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
 }
 
+# ── Shared actuator surface-guards (HERD-155): never a keystroke without VERIFIED pane content ──────
+# The two guards below read the pane and confirm the EXPECTED surface before/after acting. They fail
+# in OPPOSITE directions on purpose, because the two actuators they protect need opposite safe defaults.
+#
+# _pane_menu_confirmed <pane_id> — 0 ONLY on POSITIVE evidence: a NON-EMPTY pane read whose content
+# matches the usage-limit arrow-menu. Unlike _pane_shows_limit_menu (which fails SAFE toward "still
+# parked" so a blind read never declares the clean-select a false SUCCESS), this REQUIRES evidence and
+# returns 1 on an empty/blind read. Used by the two guards that must only act on a CONFIRMED menu:
+#   • BEFORE a menu-select keystroke — send "Down Enter" ONLY when the menu is confirmed present, so a
+#     stray keystroke is never typed into a normal REPL / unknown surface.
+#   • BEFORE a `claude --continue` prompt — REFUSE only when a menu is confirmed present, so the
+#     backstop still fires where the pane can't be read (empty read → not-a-menu → proceed).
+_pane_menu_confirmed() {
+  local _pmc_pane="$1" _pmc_txt
+  [ -n "$_pmc_pane" ] || return 1
+  _pmc_txt="$(herd_driver_read_pane "$_pmc_pane" visible)"
+  [ -n "$_pmc_txt" ] || return 1   # no evidence → NOT confirmed a menu
+  printf '%s' "$_pmc_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
+}
+
+# _pane_confirms_limit_wait <pane_id> [slug] — the DISTINCT post-select outcome check. "Menu gone" is
+# NOT success: selecting option 1 ("Upgrade your plan") ALSO clears the menu but strands the session at
+# a login/upgrade screen — a disaster we must never misreport as a clean resume. Success requires
+# POSITIVE evidence the WAIT/RESUME path was taken:
+#   • the agent flipped to "working" (native auto-resume kicked straight in), OR
+#   • the pane shows Claude's native limit-wait / working surface (a parked "waiting for reset" banner
+#     or the working spinner) AND shows neither the menu options nor an upgrade/login surface.
+# Fails SAFE: an empty/blind read, a residual menu, or an upgrade/login surface → 1 (outcome
+# UNVERIFIED → caller journals limit_menu_outcome_unverified and keeps the scheduled backstop).
+_pane_confirms_limit_wait() {
+  local _pw_pane="$1" _pw_slug="${2:-}" _pw_txt
+  [ -n "$_pw_slug" ] && [ "$(_agent_status "$_pw_slug")" = "working" ] && return 0
+  _pw_txt="$(herd_driver_read_pane "$_pw_pane" visible)"
+  [ -n "$_pw_txt" ] || return 1                                            # no evidence → unverified
+  # Wrong selection (option 1) or a still-present menu OPTION line → never a success.
+  printf '%s' "$_pw_txt" | grep -qiE 'Upgrade your plan|Stop and wait|/login|Sign ?in|Choose .*plan' && return 1
+  # Positive wait/working evidence that the "stop and wait" path took.
+  printf '%s' "$_pw_txt" | grep -qiE 'waiting.*(reset|limit)|limit.*will reset|resuming|auto-resume|esc to interrupt|Claude is working|working[.…]'
+}
+
 # _try_clean_limit_menu_select <slug> <worktree> [pane_id] — the CLEAN limit-resume path. Sends the
 # menu-select keystrokes (Down, Enter) via `herdr pane send-keys` to pick "Stop and wait for limit to
 # reset" — handing the wait to Claude's NATIVE auto-resume — then VERIFIES the menu is gone by
@@ -2631,13 +3135,25 @@ _try_clean_limit_menu_select() {
   [ "${#_cs_keys[@]}" -gt 0 ] || return 1
   _cs_max="${HERD_LIMIT_MENU_ATTEMPTS:-2}"; case "$_cs_max" in ''|*[!0-9]*) _cs_max=2 ;; esac
   for (( _cs_i=1; _cs_i<=_cs_max; _cs_i++ )); do
+    # HARDENING (HERD-155 F2, before): confirm the EXPECTED surface — the limit menu — is actually
+    # present BEFORE sending any keystroke, so a stray "Down Enter" is never typed into a normal REPL
+    # or an unknown/blind surface. On unexpected content, journal + bail (never type on no evidence).
+    if ! _pane_menu_confirmed "$_cs_pane"; then
+      journal_append limit_menu_absent slug "$_cs_slug" pane "$_cs_pane" attempt "$_cs_i"
+      return 1
+    fi
     herd_driver_send_keys "$_cs_pane" "${_cs_keys[@]}"
-    if ! _pane_shows_limit_menu "$_cs_pane"; then
+    # HARDENING (HERD-155 F2, after): verify the SPECIFIC expected OUTCOME — positive evidence the
+    # wait/resume path was selected (agent working, or a native limit-wait banner) — NOT merely
+    # "the menu text is gone" (option 1 clears the menu too, straight into an upgrade/login screen).
+    if _pane_confirms_limit_wait "$_cs_pane" "$_cs_slug"; then
       journal_append limit_menu_selected slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempt "$_cs_i"
       return 0
     fi
   done
-  journal_append limit_menu_select_failed slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempts "$_cs_max"
+  # Keys were sent but the wait/resume outcome could not be confirmed — do NOT claim a clean select.
+  # The caller keeps the scheduled `claude --continue` backstop (which itself refuses a still-menu pane).
+  journal_append limit_menu_outcome_unverified slug "$_cs_slug" pane "$_cs_pane" keys "$(_limit_menu_keys)" attempts "$_cs_max"
   return 1
 }
 
@@ -2652,6 +3168,10 @@ _handle_limit_blocked() {
   _lb_sl="$(_slug_cell "$_lb_slug")"
   _lb_now="$(_now)"
   _lb_state="$(limit_state "$_lb_slug")"
+  # HERD-147 flair default: a limit-hit auto-resume is an in-progress ('busy') state in the pasture
+  # header. The failed outcomes below escalate it to 'attention' (red, never softened); a confirmed
+  # resume flips it to 'grazing' (building again).
+  FLAIR_STATE[_lb_idx]="busy"
 
   # First sighting → record + journal the hold and compute the resume target once.
   if [ -z "$_lb_state" ]; then
@@ -2680,6 +3200,7 @@ _handle_limit_blocked() {
   # A prior failed attempt stays escalated — never re-attempt every tick.
   if [ "$_lb_state" = "failed" ]; then
     DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+    FLAIR_STATE[_lb_idx]="attention"
     return 0
   fi
 
@@ -2702,6 +3223,7 @@ _handle_limit_blocked() {
     journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false reason native_or_manual
     clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
     DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed (native auto-resume)${C_RESET}"
+    FLAIR_STATE[_lb_idx]="grazing"
     return 0
   fi
 
@@ -2715,10 +3237,12 @@ _handle_limit_blocked() {
     journal_append limit_resume_result slug "$_lb_slug" woke 1 escalated false
     clear_limit "$_lb_slug" "$_lb_wt"; clear_sendkeys "$_lb_slug"
     DISPLAY[_lb_idx]="    ${C_GREEN}↻${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_GREEN}resumed via --continue${C_RESET}"
+    FLAIR_STATE[_lb_idx]="grazing"
   else
     record_limit "$_lb_slug" "$_lb_now" "$_lb_target" "failed"
     journal_append limit_resume_result slug "$_lb_slug" woke 0 escalated true
     DISPLAY[_lb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_lb_sl}${C_RESET} ${C_RED}needs you · limit-resume failed · check pane${C_RESET}"
+    FLAIR_STATE[_lb_idx]="attention"
   fi
   return 0
 }
@@ -3139,12 +3663,20 @@ _classify_dead_builder() {
 # first-seen anchor on the first sighting, clears it the instant any liveness signal returns, and
 # fires exactly one 💀 notification (+ journal event) when a slug crosses into DEAD.
 _reconcile_dead_builder() {
-  local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3"
+  local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3" _rd_liveness="${4:-}"
   local _rd_now _rd_grace _rd_has_agent _rd_tgrow _rd_first _rd_verdict
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
-  # A present agent record (any status) means the agent is still listed ⇒ alive.
-  [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
+  # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
+  # crash can leave the agent LISTED with a stale status while its PROCESS is dead (HERD-114); a
+  # POSITIVE liveness='dead' probe (pane exists but runs no claude) overrides the listing and counts as
+  # NO live agent, so a listed-but-unwakeable builder crosses into DEAD just like a vanished one. Only
+  # a positive 'dead' overrides; 'unknown'/'alive'/empty preserve the prior listing-based signal.
+  if [ "$_rd_liveness" = "dead" ]; then
+    _rd_has_agent=0
+  else
+    [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
+  fi
   # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
   # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
   _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
@@ -3158,9 +3690,16 @@ _reconcile_dead_builder() {
     DEAD)
       if ! dead_notified "$_rd_slug"; then
         record_dead_notified "$_rd_slug"
-        journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}"
-        herd_driver_notify "💀 builder died: ${_rd_slug}" \
-          "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
+        journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}" \
+          cause "$([ "$_rd_liveness" = "dead" ] && printf 'session-dead' || printf 'vanished')"
+        # Wording reflects the actual cause: a listed-but-unwakeable session vs a fully vanished agent.
+        if [ "$_rd_liveness" = "dead" ]; then
+          herd_driver_notify "💀 builder died: ${_rd_slug}" \
+            "${_rd_slug}: agent session dead (unwakeable, no PR) — re-spawn" default
+        else
+          herd_driver_notify "💀 builder died: ${_rd_slug}" \
+            "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
+        fi
         # Bounded, opt-in AUTO-RESPAWN fires exactly here — once per DEAD crossing (guarded by the
         # dead_notified dedup), AFTER the unconditional 💀 surface. Byte-inert when the flag is off.
         _maybe_autorespawn_dead_builder "$_rd_slug" "$_rd_wt" >/dev/null
@@ -3264,7 +3803,17 @@ _respawn_builder_in_worktree() {
   # Register in the sweep allowlist so only engine-created tabs are ever swept (mirrors the lane).
   printf '%s %s builder\n' "$_rw_slug" "$_rw_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
   # shellcheck disable=SC2086  # $_rw_flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS).
-  herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1
+  if herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1; then
+    return 0
+  fi
+  # agent start FAILED after the tab was already created — the exact HERD-136 corpse-tab shape: a
+  # residual 'agent_name_taken' race (the dead builder's agent name still held in herdr) leaves the
+  # just-created tab as empty shrapnel that nothing reaps (the observed wE:tMP/tMQ corpses). Close it
+  # on the failure path and journal the reap; the caller escalates via its 💀 notification and does NOT
+  # spend the at-most-once budget (mirrors the drainers' agent_name_taken cleanup in research/scribe.sh).
+  herdr tab close "$_rw_tab" >/dev/null 2>&1 || true
+  journal_append builder_respawn_tab_reaped slug "$_rw_slug" tab "$_rw_tab"
+  return 1
 }
 
 # _maybe_autorespawn_dead_builder <slug> <worktree> — drive the bounded auto-respawn for ONE slug that
@@ -3889,7 +4438,11 @@ _spawn_dep_merged() {
   # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
   [ -z "${DRYRUN:-}" ] || return 1
   local _sdm_target
-  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="feat/$_sdm_after"; fi
+  # A slug dependency resolves to its branch via the shared BRANCH_TEMPLATE helper (HERD-120), not a
+  # hardcoded feat/ prefix, so a project with custom branch naming still resolves the gh fallback. The
+  # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
+  # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi
   [ "$(gh pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
   return 1
 }
@@ -4087,6 +4640,7 @@ while true; do
   build_blocked
   build_tracker_drift
   build_spawn_holds
+  build_main_health
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
@@ -4134,6 +4688,7 @@ for wt, branch in feats:
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()
+  FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
@@ -4143,7 +4698,16 @@ $rec
 EOF
     sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
-    if [ -z "$prnum" ]; then
+    if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
+      # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
+      # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
+      # worktree PATH so a human reviews the LOCAL diff, and short-circuit the idle/dead/building
+      # classification below — a push-held builder's agent has exited CLEANLY, which the dead-builder
+      # path would otherwise mis-flag as died. Presence-driven: no hold record → this branch is skipped
+      # and the console is byte-identical to before the feature.
+      DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
+      FLAIR_STATE[i]="pen"
+    elif [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
         # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
@@ -4156,21 +4720,32 @@ EOF
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
         else
           # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
-          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list while
-          # its worktree lives on with no PR. astatus is EMPTY only when the slug has NO agent record
-          # at all — the dead signature; a present-but-idle agent keeps a non-empty status. Surface a
-          # persistently-dead builder LOUDLY (💀 + notification) so it is never silently lost.
-          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus")" in
+          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list — OR is
+          # still LISTED but whose PROCESS is dead (HERD-114: a herdr crash leaves a stale 'idle'/'done'
+          # over a killed session) — while its worktree lives on with no PR. astatus is EMPTY only when
+          # the slug has NO agent record; the liveness probe additionally catches a listed-but-dead
+          # session. Surface a persistently-dead builder LOUDLY (💀 + notification) so it is never lost.
+          _live="$(_agent_liveness "$slug")"
+          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
             DEAD)
-              DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}" ;;
+              if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
+              else
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
+              fi
+              FLAIR_STATE[i]="dead" ;;
             *)
-              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}" ;;
+              DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}idle · no PR${C_RESET}"
+              FLAIR_STATE[i]="idle" ;;
           esac
         fi
       else
         # A working agent means any earlier limit hold has cleared (a human intervened, or the
-        # scheduled resume flipped it working) — drop a stale limit record + sentinel, then classify.
-        [ -n "$(limit_state "$slug")" ] && clear_limit "$slug" "$dir"
+        # scheduled resume flipped it working). HERD-155 F4: a working agent is DEFINITIVELY not
+        # limit-parked, so clear the ledger record AND any stale hook sentinel UNCONDITIONALLY (both
+        # clears no-op when absent) — a leftover sentinel must never survive to re-trigger a false park
+        # on a later idle tick. Also drop any stale clean-select record (the same singleton could re-park).
+        clear_limit "$slug" "$dir"; clear_sendkeys "$slug"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
@@ -4189,29 +4764,36 @@ EOF
         if [ "$_changes" -eq 1 ]; then _qelapsed="$_edit_age"; else _qelapsed=$(( _now - _born )); fi
         case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet" "$_qelapsed")" in
           BUILD_UNCOMMITTED)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}" ;;
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
           STALL)
             # Reached only when _qelapsed ≥ _quiet, so this age is a real, ≥-window duration.
             _qmins=$(( _qelapsed / 60 ))
-            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}" ;;
+            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}"
+            FLAIR_STATE[i]="warn" ;;
           *)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}" ;;
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
         esac
       fi
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
+      FLAIR_STATE[i]="self"
     elif [ "$mergeable" = "MERGEABLE" ] && _should_automerge "$mstate"; then
       if _scope_permits_automerge "$prauthor"; then
         DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        FLAIR_STATE[i]="busy"
         CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
       else
         # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,
         # but it is NOT owned by the configured operator. DISPLAY it so a teammate's progress is
         # visible, but NEVER add it to the merge-candidate set — a human merges a teammate's PR.
         DISPLAY[i]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${prauthor:-unknown})${C_RESET}"
+        FLAIR_STATE[i]="other"
       fi
     elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
       DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
+      FLAIR_STATE[i]="verify"
     elif [ "$mergeable" = "CONFLICTING" ]; then
       # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
       # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
@@ -4222,12 +4804,25 @@ EOF
       # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
       # is transient, NOT a human-action error, so no ⚠️ "needs you".
       DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
+      FLAIR_STATE[i]="busy"
     else
       reason="not mergeable (${mstate})"
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
+      FLAIR_STATE[i]="attention"
     fi
     i=$((i + 1))
   done
+
+  # HERD-147 flair — assemble the pasture header + any queued merge celebration from THIS tick's herd
+  # snapshot, BEFORE render. Both no-op (leave PASTURE/CELEBRATE empty) when WATCHER_FLAIR is off, so
+  # the frame is byte-identical to before the feature. The celebration's "<n> grazing" count is the
+  # number of builders classified as building this tick.
+  _flair_grazing=0
+  for _fs in ${FLAIR_STATE[@]+"${FLAIR_STATE[@]}"}; do
+    [ "$_fs" = "grazing" ] && _flair_grazing=$((_flair_grazing + 1))
+  done
+  build_celebrate "$_flair_grazing"
+  build_pasture
 
   render
 
@@ -4329,7 +4924,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         # Human override recorded for this sha — treat as PASS and proceed to merge path.
         prior="PASS"
       else
-        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
+        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
         render
         continue
       fi
@@ -4342,7 +4937,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       case "$step" in
         PASS) : ;;  # verdict just collected + recorded — fall through to the merge path
         BLOCK)
-          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx"
+          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
           render
           continue ;;
         QUEUED)

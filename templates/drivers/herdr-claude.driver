@@ -25,3 +25,20 @@ DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
 DRIVER_CREATE_TAB='herdr tab create --workspace <ws>'
 DRIVER_READ_PANE='herdr pane read <pane>'
 DRIVER_SEND_KEYS='herdr pane send-keys <pane> <keys>'
+
+# ── Agent-runtime EXEC bindings (HERD-150 phase 1) ────────────────────────────────────────────────
+# The keys above bind the MULTIPLEXER (herdr) surface. The keys below factor out the AGENT RUNTIME
+# (Claude Code) exec surface: the `claude`-specific incantations the lanes, drainers, watcher and CLI
+# invoke directly. Phase 1 (HERD-150) only CATALOGUES them here as data + docs — NOTHING renders or
+# consumes these tokens yet, so the tree stays byte-identical; phases 2-4 route the call sites in the
+# audit table (docs/driver-abstraction.md § agent-runtime portability) through these bindings. Each
+# value is TODAY'S EXACT string for its capability class; a non-Claude runtime rebinds this block
+# (keeping herdr as the mux). Same contract as above: COMMITTED, ZERO-SECRET, command SHAPES only.
+DRIVER_AGENT_INTERACTIVE_SPAWN='claude --model <model> --dangerously-skip-permissions "<prompt>"'
+DRIVER_AGENT_ONESHOT_EXEC='claude -p "<prompt>" --model <model> --dangerously-skip-permissions'
+DRIVER_AGENT_RESUME='claude --dangerously-skip-permissions --continue "<prompt>"'
+DRIVER_AGENT_MODEL_SWITCH='/model <model>'
+DRIVER_AGENT_PERMISSION_FLAG='--dangerously-skip-permissions'
+DRIVER_AGENT_LIMIT_PATTERN='usage limit|session limit|hit your (usage|session) limit'
+DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/<cwd:tr-/.-to-dash>/*.jsonl'
+DRIVER_AGENT_COST_USAGE_KEYS='input_tokens output_tokens cache_creation_input_tokens cache_read_input_tokens'

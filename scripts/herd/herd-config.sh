@@ -164,6 +164,12 @@ fi
 : "${WORKTREES_DIR:="${PROJECT_ROOT}-trees"}"
 : "${DEFAULT_BRANCH:="origin/main"}"
 : "${WORKSPACE_NAME:="$(basename "$PROJECT_ROOT")"}"
+# Project-defined branch naming for the builder lanes (HERD-120). The DEFAULT 'feat/{slug}' renders
+# byte-identical to the historically-hardcoded feat/<slug>, so an unset key is zero behavior change.
+# Tokens: {slug} (required — the coordinator-chosen kebab name) and optional {ref} (the tracker id).
+# ONE shared render+parse helper (herd_branch_render / herd_branch_parse, below) routes every branch
+# construction AND parse site through this so naming stays consistent end-to-end.
+: "${BRANCH_TEMPLATE:="feat/{slug}"}"
 
 # ── Console-strict config binding (issue #60 launch-binding guard) ───────────
 # A long-running CONSOLE (agent-watch / herd-watch / backlog-view / coordinator) sets
@@ -357,6 +363,22 @@ fi
 : "${INTERACTION_TEST_CMD:=""}"   # command that drives widgets and asserts dependent output changes; exit 0 clean, 1 code error, 2 data/env
 : "${SMOKE_CMD:=""}"              # optional resolver smoke gate
 
+# ATTRIBUTION_POLICY — commit-attribution lint gate (HERD-121). Ships dormant: default ''
+# (empty) → lint absent, byte-identical to before. Set to no-ai-coauthor to scan the PR's
+# commits (git log <DEFAULT_BRANCH>..HEAD) for AI co-author markers (Co-Authored-By: Claude*,
+# 'Generated with Claude' lines) and fail as a healthcheck code-error naming the offending
+# sha+line. The 'Never co-author Claude' rule in AGENTS.md is advisory prose without this;
+# with it set the healthcheck enforces it deterministically and cannot be silently violated.
+: "${ATTRIBUTION_POLICY:=""}"     # '' (default, off) | no-ai-coauthor
+
+# COMMIT_CONVENTION — commit-message convention lint gate (HERD-124). Ships dormant: default ''
+# (empty) → lint absent, byte-identical to before. Set to an egrep pattern that every commit
+# subject on <DEFAULT_BRANCH>..HEAD must match; a non-conforming subject fails the healthcheck as a
+# code-error naming the offending sha + subject + pattern. Fail-soft: an invalid regex warns and
+# skips the lint (never a false red). E.g. Conventional Commits:
+#   '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
+: "${COMMIT_CONVENTION:=""}"      # '' (default, off) | egrep pattern every commit subject must match
+
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
 : "${REVIEW_CHECKLIST:=""}"     # project risk list injected into the review gate
 
@@ -366,6 +388,16 @@ fi
 : "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh
+# PUSH_GATE (HERD-123) — hold a FINISHED builder for human review BEFORE anything reaches GitHub. The
+# missing gate-then-upload seam: PR_FLOW=draft gates AFTER the push (PR already public), MERGE_POLICY=
+# approve gates AFTER review (PR exists); PUSH_GATE=human gates BEFORE the push, while the diff is only
+# local. With =human, the builder lane completes work + healthcheck but STOPS before git push / gh pr
+# create, recording a sha-keyed awaiting-push hold (push-gate.sh) the watcher surfaces as 'ready ·
+# awaiting push approval'; herd-approve.sh approve resumes push + PR creation. A new commit invalidates
+# a prior approval (sha-keyed, same semantics as merge approval). Default '' (off) → lanes byte-
+# identical, byte-inert. Unknown value → off (fail safe). Consumed by herd-quick.sh / herd-feature.sh
+# (lane rules), herd-approve.sh (list/approve/resume), agent-watch.sh (console row), via push-gate.sh.
+: "${PUSH_GATE:=""}"              # '' (default, off) | human
 : "${MERGE_METHOD:="merge"}"      # merge | squash | rebase — the gh pr merge strategy
 : "${REVIEW_CONCURRENCY:="2"}"    # max pre-merge reviews the watcher runs in parallel
 # NATIVE_BURST (HERD-107) — off (default) | on. The master switch for the bounded read-only FAN-OUT
@@ -400,6 +432,8 @@ fi
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
+: "${MAIN_HEALTH_TICK:="off"}"   # HERD-129: after a PR merges, run the healthcheck against the freshly ff'd default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into a broken combination). on → a loud persistent 'MAIN RED' alarm row + notification, cleared when a later sha goes green. ALARM only — never gates/reverts/re-merges. off (default) → byte-inert: no suite, no journal, no row
+: "${WATCHER_FLAIR:="off"}"      # HERD-147: watcher-console flair pack — on → a post-merge celebration line + a pasture header rendering the in-flight herd by state (🐑 grazing / 💤 idle / ✅ in the pen); off (default) → byte-inert: every console byte identical to before. ADDITIVE cosmetic only — NEVER softens a red/dead/needs-you row, never touches a gate/merge
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health
@@ -763,17 +797,29 @@ herd_write_ratelimit_hook() {
   local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
   mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
   if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
-import json, os, sys, tempfile
+import json, os, shlex, sys, tempfile
 
 path = os.environ["HERD_RH_SETTINGS"]
 sentinel = os.environ["HERD_RH_SENTINEL"]
 
-# The hook command: write the stop reason (reset banner text, if the harness passes it on stdin) to
-# the sentinel; an empty write still marks "limit hit". Kept dependency-free (sh + cat).
-cmd = "cat > %s 2>/dev/null || : > %s" % (
-    "'" + sentinel.replace("'", "'\\''") + "'",
-    "'" + sentinel.replace("'", "'\\''") + "'",
-)
+# The hook command. HERD-155 F3: a StopFailure/rate_limit hook's stdin is the harness EVENT — a JSON
+# blob (session_id, transcript_path, a reason/message, …), NOT the bare reset banner. The old `cat >`
+# wrote that whole blob, so a stray numeric field (a token count, an id fragment) could be misparsed
+# downstream as a reset clock time. Instead EXTRACT just the usage-limit banner text — the anchored
+# "reset at/in <time>" phrase, else any "usage/session limit" line — from whatever arrives (JSON or
+# raw) and write only that. An empty write still marks "limit hit" (→ HERD_LIMIT_UNKNOWN_WAIT). If
+# python3 is unavailable at hook time, the `|| : >` fallback writes an empty sentinel — never lost.
+_extract = r'''import sys, re
+raw = sys.stdin.read()
+m = re.search(r'[^\n"]*reset[s]? (?:at|in)[^\n"]*', raw, re.I)
+out = (m.group(0) if m else "").strip()
+if not out:
+    m = re.search(r'[^\n"]*(?:usage|session) limit[^\n"]*', raw, re.I)
+    out = (m.group(0) if m else "").strip()
+sys.stdout.write(out)
+'''
+q_sentinel = "'" + sentinel.replace("'", "'\\''") + "'"
+cmd = "python3 -c %s > %s 2>/dev/null || : > %s" % (shlex.quote(_extract), q_sentinel, q_sentinel)
 entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
 
 data = {}
@@ -1089,4 +1135,73 @@ herd_write_task_spec() {
   fi
   # Spec is safely on disk — only now emit the SHORT pointer the agent receives in place of the spec.
   printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_ts_file"
+}
+
+# ── Project-defined branch naming (BRANCH_TEMPLATE, HERD-120) ─────────────────────────────────────
+# feat/<slug> was hardcoded across the lanes (new-feature.sh), the resolver, and the watcher's
+# dep-check fallback. These two helpers are the SINGLE seam every branch construction AND parse site
+# routes through, so a project can rename its lanes' branches without the pieces drifting out of sync.
+#
+# The template lives in BRANCH_TEMPLATE (default 'feat/{slug}', byte-identical to the old hardcoded
+# name when unset). Tokens: {slug} (required) and optional {ref} (the tracker id, e.g. HERD-120).
+# FAIL-SOFT: a malformed template (missing {slug}) warns once and falls back to the default rather
+# than producing an unusable branch — the no-false-red / never-strand-work discipline.
+#
+# render and parse are exact inverses for any template whose {slug} is delimited from its {ref}/prefix
+# by a literal separator (e.g. 'feat/{slug}', '{ref}/{slug}', 'wip/{slug}', 'feat/{slug}-exp'), which
+# covers every realistic naming scheme. The round-trip is locked by tests/test-branch-template.sh.
+
+# _herd_branch_template — the effective template, with the malformed-template fallback applied ONCE.
+# Warns to stderr (not stdout, so a render's captured output is never polluted) when it falls back.
+_herd_branch_template() {
+  # NB: never use ${BRANCH_TEMPLATE:-feat/{slug}} — the '}' inside the default word closes the
+  # expansion early and appends a stray '}'. Resolve the default on its own line instead.
+  local _bt="${BRANCH_TEMPLATE:-}"
+  [ -n "$_bt" ] || _bt='feat/{slug}'
+  case "$_bt" in
+    *'{slug}'*) printf '%s' "$_bt" ;;
+    *) echo "⚠️  BRANCH_TEMPLATE='$_bt' has no {slug} token — falling back to 'feat/{slug}'." >&2
+       printf '%s' 'feat/{slug}' ;;
+  esac
+}
+
+# herd_branch_render <slug> [ref] — echo the branch name for this slug (and optional tracker ref).
+# {slug}/{ref} are substituted; an empty {ref} collapses the doubled/edge separator it would leave
+# (so '{ref}/{slug}' with no ref → '<slug>', a valid branch) — the default 'feat/{slug}' path never
+# hits that and stays byte-identical to feat/<slug>.
+herd_branch_render() {
+  local _br_slug="${1:-}" _br_ref="${2:-}" _br_out
+  _br_out="$(_herd_branch_template)"
+  _br_out="${_br_out//\{slug\}/$_br_slug}"
+  _br_out="${_br_out//\{ref\}/$_br_ref}"
+  # Collapse runs of '/' (an empty {ref} can leave '//' or a leading '/') and trim edge slashes.
+  while case "$_br_out" in *//*) true ;; *) false ;; esac; do _br_out="${_br_out//\/\//\/}"; done
+  _br_out="${_br_out#/}"; _br_out="${_br_out%/}"
+  printf '%s' "$_br_out"
+}
+
+# herd_branch_parse <branch> — echo the slug encoded in <branch> under the active BRANCH_TEMPLATE
+# (the inverse of herd_branch_render). Strips the template's literal prefix (everything up to {slug},
+# with any {ref} treated as a wildcard) and its literal suffix (everything after {slug}). Empty when
+# the branch does not fit the template. Mirrored inline by the watcher's orphan-tab sweep (python).
+herd_branch_parse() {
+  local _bp_tmpl _bp_pre _bp_post _bp_out="${1:-}"
+  _bp_tmpl="$(_herd_branch_template)"
+  _bp_pre="${_bp_tmpl%%\{slug\}*}"   # literal (+ maybe {ref}) BEFORE {slug}
+  _bp_post="${_bp_tmpl#*\{slug\}}"    # literal (+ maybe {ref}) AFTER  {slug}
+  # Strip the prefix. With a {ref} in it, drop up to the last occurrence of the separator that
+  # trails the ref (e.g. '/'); otherwise drop the fixed literal prefix from the front.
+  case "$_bp_pre" in
+    *'{ref}'*) local _bp_sep="${_bp_pre##*\{ref\}}"; [ -n "$_bp_sep" ] && _bp_out="${_bp_out##*$_bp_sep}" ;;
+    '')        : ;;
+    *)         _bp_out="${_bp_out#"$_bp_pre"}" ;;
+  esac
+  # Strip the suffix. With a {ref} in it, cut from the first occurrence of the separator that
+  # leads the ref; otherwise drop the fixed literal suffix from the end.
+  case "$_bp_post" in
+    *'{ref}'*) local _bp_sep2="${_bp_post%%\{ref\}*}"; [ -n "$_bp_sep2" ] && _bp_out="${_bp_out%%$_bp_sep2*}" ;;
+    '')        : ;;
+    *)         _bp_out="${_bp_out%"$_bp_post"}" ;;
+  esac
+  printf '%s' "$_bp_out"
 }

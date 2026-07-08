@@ -62,6 +62,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/fleet.sh" ] && . "$SCRIPTS_DIR/fleet.sh"
 
+# Shared governance EXTRACTION + MAPPING helpers (_gov_map_file / _gov_statements / _gov_match). The
+# read-only half of the HERD-119 adoption pass, factored out so the HERD-125 drift sweep re-extracts a
+# CLAUDE.md/AGENTS.md change EXACTLY as init imported it. Defines functions only (TEMPLATES_DIR is set
+# above, so _gov_map_file resolves the same table it always has). The init-only mutators + LLM
+# fallback stay in this file, below.
+# shellcheck source=/dev/null
+. "$SCRIPTS_DIR/governance.sh"
+
 # Runtime driver shim: the ONE seam binding the runtime-specific control surface (multiplexer + agent
 # runtime) to a concrete backend, dispatched on HERD_DRIVER. Defines functions only (side-effect-free),
 # and — like fleet.sh — late-binds herd_resolve_workspace_id / WORKTREES_DIR at call time, so sourcing
@@ -524,9 +532,209 @@ _init_grounding_interview() {
   say "  ${c_dim}• DOCTOR_STARTUP_HINT=on — reminds you at control-room startup which optional tools are missing and what each degrades.${c_rst}"
 }
 
+# ── governance adoption (HERD-119) ────────────────────────────────────────────────────────────────
+# `herd init`'s OPT-IN adoption pass imports gates/conventions from an OPTIONAL CLAUDE.md / AGENTS.md.
+# BINDING CONSTRAINT: CLAUDE.md is ONE source among many (defaults, interview, profile, manual
+# `herd config set`) — never required, never load-bearing. No file present ⇒ the pass returns before
+# any prompt or write, so init is BYTE-IDENTICAL. Every accepted proposal applies ONLY through the
+# validated `herd config set` (or an append to the REVIEW_CHECKLIST file); declining all leaves the
+# config exactly as the interview wrote it. Deterministic-first (templates/governance-map.tsv), with a
+# cleanly-stubbable LLM fallback for fuzzy phrasing. Fail-soft: unparseable prose is silently skipped.
+#
+# The read-only extraction + mapping half (_gov_map_file / _gov_statements / _gov_match) lives in
+# scripts/herd/governance.sh, sourced near the top of this file and SHARED with the HERD-125 drift
+# sweep. The init-only mutators + the default-off LLM fallback below are NOT shared.
+
+# _gov_llm_classify <statement> — LLM FALLBACK for fuzzy phrasing the deterministic table missed.
+# CLEANLY STUBBABLE and DEFAULT-OFF: unless HERD_GOV_LLM=1 AND `claude` is on PATH it prints nothing,
+# so extraction is fully deterministic (and hermetic tests get a stable, model-free mapping). When
+# enabled it asks the model to map the sentence to at most one surface, echoing the SAME
+# "surface<TAB>target<TAB>label" contract the table uses; any non-conforming reply is dropped.
+_gov_llm_classify() {
+  [ "${HERD_GOV_LLM:-}" = "1" ] || return 0
+  command -v claude >/dev/null 2>&1 || return 0
+  local stmt="$1" reply surface rest
+  reply="$(claude -p "Map this project-governance sentence to AT MOST ONE herd enforcement surface, or reply NONE. Reply with a single line: '<surface>\t<target>\t<label>' where surface is one of config-key|provisioning|hook. config-key target is SPACE-separated KEY=VALUE using only these keys: PUSH_GATE MERGE_POLICY MERGE_METHOD PR_FLOW PR_READY_WHEN DELETE_BRANCH_ON_MERGE ATTRIBUTION_POLICY COMMIT_CONVENTION. provisioning target is 'review-checklist'. Reply NONE if unsure. Sentence: $stmt" 2>/dev/null || true)"
+  reply="$(printf '%s' "$reply" | head -1)"
+  case "$reply" in ''|NONE|none) return 0 ;; esac
+  surface="${reply%%$'\t'*}"; rest="${reply#*$'\t'}"
+  case "$surface" in
+    config-key|provisioning|hook) [ "$rest" != "$reply" ] && printf '%s' "$reply" ;;
+  esac
+  return 0
+}
+
+# _gov_is_convention <statement> — deterministic heuristic distinguishing an unmatched coding/STYLE
+# convention (→ provisioning) from noise (→ gap report). Only reached AFTER the table and the LLM
+# fallback both miss.
+_gov_is_convention() {
+  printf '%s' "$1" | grep -qiE '\b(prefer|preferred|use|using|avoid|style|format|formatting|naming|indent|indentation|tabs?|spaces|convention|conventions|docstring|comment|comments|type[- ]?hint|typed|snake_case|camelcase|line[- ]length|import|imports)\b' 2>/dev/null
+}
+
+# _gov_review_checklist_path <project_root> — the repo-relative REVIEW_CHECKLIST path from .herd/config
+# (default .herd/review-checklist.md when unset).
+_gov_review_checklist_path() {
+  local root="$1" p=""
+  # shellcheck source=/dev/null
+  [ -f "$root/.herd/config" ] && p="$( . "$root/.herd/config" 2>/dev/null; printf '%s' "${REVIEW_CHECKLIST:-}" )"
+  printf '%s' "${p:-.herd/review-checklist.md}"
+}
+
+# _gov_apply_config <project_root> <KEY=VALUE...> — apply each accepted config-key pair through the
+# VALIDATED setter. HERD_INIT_DEFER_APPLY suppresses the watcher-restart / re-render side-effect: init
+# runs BEFORE the control room exists, so the value is simply written and takes effect on first launch.
+_gov_apply_config() {
+  local root="$1" pairs="$2" kv key val
+  for kv in $pairs; do
+    key="${kv%%=*}"; val="${kv#*=}"
+    { [ -n "$key" ] && [ "$key" != "$kv" ]; } || continue
+    ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set "$key" "$val" ) || true
+  done
+}
+
+# _gov_apply_provision <project_root> <statement> — route an unmappable coding/style convention into
+# the REVIEW_CHECKLIST file (created with a header on first use), so the pre-merge review gate verifies
+# it. The provisioning surface's session-grounding sibling (CONTEXT_PROVISION notes) plugs in here later.
+_gov_apply_provision() {
+  local root="$1" line="$2" rel dest
+  rel="$(_gov_review_checklist_path "$root")"
+  dest="$root/$rel"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  if [ ! -f "$dest" ]; then
+    {
+      printf '# Review checklist\n\n'
+      printf '> Project risk checklist injected into the pre-merge review gate (REVIEW_CHECKLIST).\n'
+      printf '> Seeded by governance adoption from an adopted CLAUDE.md/AGENTS.md convention.\n\n'
+    } > "$dest"
+  fi
+  printf -- '- [ ] %s\n' "$line" >> "$dest"
+  ok "appended convention to $rel"
+}
+
+# _init_governance_adoption <project_root> — the opt-in adoption pass. Runs AFTER the config exists
+# (config set requires it) and only under _ground_interactive (a scripted/non-tty init skips cleanly).
+# No CLAUDE.md/AGENTS.md ⇒ returns before any prompt or write (byte-identical init).
+_init_governance_adoption() {
+  local root="$1"
+  _ground_interactive || return 0
+
+  # Collect the OPTIONAL governance sources actually present. None ⇒ nothing to do, zero output.
+  # (No bash arrays anywhere in this function — an empty-array expansion under `set -u` aborts on
+  # bash 3.2 / macOS; the file's established idiom is newline-delimited strings.)
+  local names=""
+  [ -f "$root/CLAUDE.md" ] && names="CLAUDE.md"
+  [ -f "$root/AGENTS.md" ] && names="${names:+$names, }AGENTS.md"
+  [ -n "$names" ] || return 0
+
+  say ""
+  say "${c_bold}Governance adoption${c_rst} ${c_dim}(optional — CLAUDE.md/AGENTS.md is ONE source; nothing is written unless you accept a proposal)${c_rst}"
+  if ! _ground_yes "$(_ground_ask "Found $names — scan for governance rules to propose as herd config? (y/N)" "n")"; then
+    say "  ${c_dim}skipped — later: re-run 'herd init' or set gates manually with 'herd config set'${c_rst}"
+    return 0
+  fi
+
+  # Deterministic-first extraction. Each statement → a (surface,target,label,evidence) proposal, a
+  # style-convention (→ provisioning), or a gap. Proposals accumulate as newline-delimited TAB records
+  # (no arrays), deduped by surface+target (first evidence kept) so the same gate is proposed once.
+  local proposals="" gaps="" seen="" stmt m surface target label
+  while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    m="$(_gov_match "$stmt")"
+    [ -n "$m" ] || m="$(_gov_llm_classify "$stmt")"
+    if [ -z "$m" ]; then
+      if _gov_is_convention "$stmt"; then
+        m="$(printf 'provisioning\treview-checklist\tCoding/style convention')"
+      else
+        gaps="${gaps}${stmt}"$'\n'
+        continue
+      fi
+    fi
+    surface="${m%%$'\t'*}"; m="${m#*$'\t'}"
+    target="${m%%$'\t'*}"; label="${m#*$'\t'}"
+    case "$seen" in *"|${surface}::${target}|"*) continue ;; esac
+    seen="${seen}|${surface}::${target}|"
+    proposals="${proposals}$(printf '%s\t%s\t%s\t%s' "$surface" "$target" "$label" "$stmt")"$'\n'
+  done <<< "$(_gov_statements "$root/CLAUDE.md" "$root/AGENTS.md")"
+
+  # Present each proposal: QUOTE the source sentence as evidence; per-proposal accept / edit / decline.
+  # config-key applies via the validated setter; provisioning appends to REVIEW_CHECKLIST; hook rows
+  # are RECOGNIZED but not applied (the 'Governance hook-rendering' follow-up consumes them). Iterate by
+  # line INDEX (not a pipe/here-string around the loop) so _ground_ask keeps reading the real stdin.
+  local applied=0 deferred="" rec evidence ans i np
+  np="$(printf '%s' "$proposals" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$proposals" | sed -n "${i}p")"
+    IFS=$'\t' read -r surface target label evidence <<< "$rec"
+    [ -n "$surface" ] || continue
+    say ""
+    say "  ${c_bold}${label}${c_rst}"
+    say "  ${c_dim}evidence: \"${evidence}\"${c_rst}"
+    case "$surface" in
+      config-key)
+        say "  ${c_dim}→ proposes (config-key surface): herd config set ${target}${c_rst}"
+        ans="$(_ground_ask "  accept / edit / decline? (a/e/N)" "n")"
+        case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+          a|accept) _gov_apply_config "$root" "$target"; applied=$((applied+1)) ;;
+          e|edit)
+            local edited; edited="$(_ground_ask "  enter KEY=VALUE pair(s)" "$target")"
+            if [ -n "$edited" ]; then _gov_apply_config "$root" "$edited"; applied=$((applied+1)); else say "  ${c_dim}declined (empty)${c_rst}"; fi ;;
+          *) say "  ${c_dim}declined${c_rst}" ;;
+        esac ;;
+      provisioning)
+        say "  ${c_dim}→ proposes (provisioning surface): append to the REVIEW_CHECKLIST risk checklist${c_rst}"
+        ans="$(_ground_ask "  accept / decline? (a/N)" "n")"
+        case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+          a|accept) _gov_apply_provision "$root" "$evidence"; applied=$((applied+1)) ;;
+          *) say "  ${c_dim}declined${c_rst}" ;;
+        esac ;;
+      hook)
+        say "  ${c_dim}→ hook surface (session-time Claude Code hook) — recognized; rendering ships in the 'Governance hook-rendering' follow-up, not applied here${c_rst}"
+        deferred="${deferred}  • ${label} (hook: ${target})"$'\n' ;;
+    esac
+  done
+
+  if [ -n "$deferred" ]; then
+    say ""
+    say "  ${c_bold}Recognized hook rules${c_rst} ${c_dim}(deferred to 'Governance hook-rendering'):${c_rst}"
+    printf '%s' "$deferred" | while IFS= read -r d; do [ -n "$d" ] && say "  ${c_dim}${d}${c_rst}"; done
+  fi
+
+  # Gap report — statements that mapped to NO governance surface, left as prose.
+  if [ -n "$gaps" ]; then
+    say ""
+    local gapn; gapn="$(printf '%s' "$gaps" | grep -c . || true)"
+    say "  ${c_bold}Gap report${c_rst} ${c_dim}— ${gapn} statement(s) mapped to no governance surface (left as prose):${c_rst}"
+    printf '%s' "$gaps" | while IFS= read -r g; do [ -n "$g" ] && say "  ${c_dim}• ${g}${c_rst}"; done
+  fi
+
+  say ""
+  if [ "$applied" -gt 0 ]; then ok "governance adoption: applied $applied proposal(s)"; else say "  ${c_dim}governance adoption: nothing applied${c_rst}"; fi
+}
+
 cmd_init() {
+  # Optional flags. --governance <file> SEEDS this fresh install from a portable governance profile
+  # (HERD-126): validated up front (a malformed profile aborts BEFORE any config is written), then
+  # applied non-interactively after the interview writes .herd/config. One optional source among many
+  # — it composes with the interview and the CLAUDE.md adoption pass; it never overrides them blindly.
+  local gov_profile=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --governance) gov_profile="${2:-}"; [ -n "$gov_profile" ] || die "usage: herd init [--governance <file>]"; shift 2 ;;
+      --)           shift; break ;;
+      -?*)          die "unknown flag '$1' — usage: herd init [--governance <file>]" ;;
+      *)            break ;;
+    esac
+  done
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
+
+  # Validate a --governance profile NOW, before doing any init work, so a bad file fails fast with
+  # zero side-effects rather than after the interview has already written config.
+  if [ -n "$gov_profile" ]; then
+    { [ -f "$gov_profile" ] && [ -r "$gov_profile" ]; } || die "no readable governance profile at $gov_profile"
+    _gov_parse_and_validate "$gov_profile" "$(_config_caps_file)" >/dev/null \
+      || die "herd init --governance: the profile is malformed; aborting before any changes (see the reason above)"
+  fi
 
   # Dependency doctor FIRST — catch a broken environment (the issue #31 class: a missing/mis-encoded
   # load-bearing dep that silently truncates the control room) BEFORE we write any config. HARD-gates
@@ -675,10 +883,30 @@ cmd_init() {
 
   # 4b. Merge policy + method — seeded from GitHub detection (protected + required review ⇒ approve).
   #     The human can still override either here; detection only chooses the SAFE default.
+  #
+  #     CONSEQUENCE-LOUD (HERD-140): MERGE_POLICY decides whether the watcher merges PRs with NO
+  #     human in the loop, so it must NEVER be seeded silently. We always print, in the flow, what
+  #     each value DOES before asking — an operator can't unknowingly end up on 'auto'. On a
+  #     non-interactive / no-tty init (where we can't prompt) we seed the default but print a LOUD
+  #     notice of exactly what was chosen instead of a single dim line — and never hang the script.
   say ""
-  say "${c_bold}Merge policy${c_rst}"
+  say "${c_bold}Merge policy${c_rst} ${c_dim}— does the watcher merge PRs for you, or hold them?${c_rst}"
+  say "  ${c_bold}auto${c_rst}     the watcher MERGES every gate-passed PR with ${c_bold}no human in the loop${c_rst}"
+  say "  ${c_bold}approve${c_rst}  the watcher HOLDS each PR for an explicit human sign-off before merging"
+  say "  ${c_bold}observe${c_rst}  the watcher NEVER merges — it only reports; you merge by hand"
   local merge_policy merge_method
-  merge_policy="$(ask "MERGE_POLICY (auto merges on green / approve holds for sign-off / observe never merges)" "$det_policy")"
+  if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+    merge_policy="$(ask "MERGE_POLICY (auto | approve | observe)" "$det_policy")"
+  else
+    # Non-interactive: seed the (suggested) default, but say loudly what it means — auto especially,
+    # since a silent auto is the exact footgun HERD-140 fixes.
+    merge_policy="$det_policy"
+    if [ "$merge_policy" = "auto" ]; then
+      warn "MERGE_POLICY defaulted to 'auto' (non-interactive init): the watcher will MERGE every gate-passed PR with NO human sign-off. To hold PRs for review instead, run 'herd config set MERGE_POLICY approve'."
+    else
+      say "  ${c_bold}→ MERGE_POLICY=${merge_policy}${c_rst} ${c_dim}(non-interactive init — seeded default; change with 'herd config set MERGE_POLICY ...')${c_rst}"
+    fi
+  fi
   merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
 
   # 4c. PR flow — how builders open PRs. SAFE DEFAULTS preserve today's EXACT behavior: direct PRs
@@ -805,6 +1033,24 @@ EOF
   # 6. Render the coordinator skill.
   local skill; skill="$(render_skill "$project_root" "$cfg")"
   ok "rendered coordinator skill → $skill"
+
+  # 6a. Governance profile seeding (HERD-126): when `herd init --governance <file>` was given, apply the
+  #     (already-validated) profile through the same validated setter the standalone `governance apply`
+  #     uses. HERD_INIT_DEFER_APPLY=1 defers the watcher-restart / re-render (the control room does not
+  #     exist yet — the values take effect on first launch) and suppresses the reload hint. A profile is
+  #     ONE governance source: the CLAUDE.md adoption pass below still runs and composes on top.
+  if [ -n "$gov_profile" ]; then
+    say ""
+    say "${c_bold}Seeding governance from profile${c_rst} ${c_dim}($(basename "$gov_profile"))${c_rst}"
+    local _gp_pairs; _gp_pairs="$(_gov_parse_and_validate "$gov_profile" "$(_config_caps_file)")" || _gp_pairs=""
+    HERD_INIT_DEFER_APPLY=1 _gov_apply_pairs "$project_root" "$cfg" "$(_config_caps_file)" "$_gp_pairs" 1 "$gov_profile"
+  fi
+
+  # 6b. Governance adoption (HERD-119): OPT-IN import of gates/conventions from an OPTIONAL CLAUDE.md /
+  #     AGENTS.md. One source among many — suggest-never-auto-write, applied only through the validated
+  #     `herd config set` on accept. No such file ⇒ returns silently (byte-identical init). Skipped on a
+  #     scripted / non-tty init. Fail-soft: any internal error never aborts init.
+  _init_governance_adoption "$project_root" || true
 
   # 7. Grounding interview (HERD-80): OFFER codemap/CONTEXT_PROVISION, graphify/GRAPHIFY_BIN, MCP wiring
   #    and surface the efficiency levers. Suggest-never-auto-write — applies only on an explicit yes via
@@ -943,6 +1189,163 @@ cmd_render() {
   ok "rendered coordinator skill → $skill"
 }
 
+# ── herd governance hooks render: emit SESSION-TIME Claude Code hooks from the governance map (HERD-131)
+# Dual-surface enforcement: the governance rules the merge-time watcher gate enforces ALSO bind
+# session-time as Claude Code PreToolUse hooks — blocking a violation at the keyboard, early and cheap.
+# Consumes EVERY surface==hook row of templates/governance-map.tsv (HERD-119); each rendered hook runs
+# scripts/herd/governance-hook.sh <target> against the tool payload. PROPOSE-then-write like every
+# governance write: each hook is shown, the operator accepts per-hook, and accepted entries MERGE into
+# .claude/settings.local.json (or --shared → .claude/settings.json) preserving ALL existing entries.
+# Every generated matcher-group carries a "herd-governance" marker key, so a re-render strips ONLY its
+# own prior entries and re-adds the current selection — idempotent, never clobbering user hooks.
+# Fail-soft: no map / no hook rows / non-interactive → clean no-op, no file written.
+_GOV_HOOK_MARKER="herd-governance"
+
+
+_gov_hooks() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    render) _gov_hooks_render "$@" ;;
+    ''|help|-h|--help) say "usage: herd governance hooks render [--shared]" ;;
+    *) die "unknown: herd governance hooks $action (try: herd governance hooks render)" ;;
+  esac
+}
+
+_gov_hooks_render() {
+  local shared="" a
+  for a in "$@"; do
+    case "$a" in
+      --shared) shared=1 ;;
+      -*) die "unknown flag: $a (usage: herd governance hooks render [--shared])" ;;
+      *)  die "unexpected argument: $a (usage: herd governance hooks render [--shared])" ;;
+    esac
+  done
+
+  local root map
+  root="$(pwd)"
+  map="$(_gov_map_file)"
+  # Fail-soft: no map → clean no-op (byte-identical for projects that never provisioned one).
+  [ -f "$map" ] || { say "  ${c_dim}governance hooks: no map at $map — nothing to render${c_rst}"; return 0; }
+
+  # Collect surface==hook rows as target<TAB>label, in file order. The renderer consumes EVERY hook
+  # row (unlike adoption's first-match _gov_match); the pattern column is irrelevant here.
+  local rows="" pattern surface target label
+  while IFS=$'\t' read -r pattern surface target label; do
+    case "$pattern" in ''|'#'*|'pattern') continue ;; esac
+    [ "$surface" = "hook" ] || continue
+    [ -n "$target" ] || continue
+    rows="${rows}${target}"$'\t'"${label}"$'\n'
+  done < "$map"
+
+  if [ -z "$rows" ]; then
+    say "  ${c_dim}governance hooks: no hook rows in the map — nothing to render${c_rst}"
+    return 0
+  fi
+
+  # Target settings file: the per-machine local overlay by default; --shared → the committed baseline.
+  local relfile settings
+  if [ -n "$shared" ]; then relfile=".claude/settings.json"; else relfile=".claude/settings.local.json"; fi
+  settings="$root/$relfile"
+
+  # PROPOSE-then-write: writes REQUIRE an interactive operator (never auto-write). Non-interactive →
+  # clean no-op so a scripted/CI invocation changes nothing.
+  if ! _ground_interactive; then
+    say "  ${c_dim}governance hooks: non-interactive — nothing written (run from a terminal to accept per-hook)${c_rst}"
+    return 0
+  fi
+
+  say ""
+  say "${c_bold}Governance hooks${c_rst} ${c_dim}(session-time Claude Code hooks — propose-then-write; merged into ${relfile}, existing entries preserved)${c_rst}"
+
+  local accepted="" np i rec cmd ans
+  np="$(printf '%s' "$rows" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$rows" | sed -n "${i}p")"
+    IFS=$'\t' read -r target label <<< "$rec"
+    [ -n "$target" ] || continue
+    cmd="bash $SCRIPTS_DIR/governance-hook.sh $target"
+    say ""
+    say "  ${c_bold}${label}${c_rst}"
+    say "  ${c_dim}→ PreToolUse[Bash] hook: ${cmd}${c_rst}"
+    ans="$(_ground_ask "  accept? (a/N)" "n")"
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      a|accept|y|yes) accepted="${accepted}${target}"$'\n'; say "  ${c_dim}accepted${c_rst}" ;;
+      *) say "  ${c_dim}declined${c_rst}" ;;
+    esac
+  done
+
+  say ""
+  # Write when there is something to add, OR when the file already carries our marker (so declining a
+  # previously-accepted hook cleanly removes it). A fresh decline-all never creates a file.
+  if [ -n "$accepted" ] || { [ -f "$settings" ] && grep -q "$_GOV_HOOK_MARKER" "$settings" 2>/dev/null; }; then
+    _gov_hooks_merge "$settings" "$accepted"
+  else
+    say "  ${c_dim}governance hooks: nothing accepted — no file written${c_rst}"
+  fi
+}
+
+# _gov_hooks_merge <settings-file> <accepted-targets-newline> — merge the accepted hook targets into
+# the settings JSON, preserving every existing entry. Strips our previously-rendered marker groups
+# from every hook event first (idempotent re-render), then re-adds the current selection in a stable
+# (sorted) order. A malformed settings file is refused, never clobbered.
+_gov_hooks_merge() {
+  local settings="$1" accepted="$2"
+  command -v python3 >/dev/null 2>&1 || die "governance hooks render requires python3"
+  mkdir -p "$(dirname "$settings")" 2>/dev/null || true
+  SETTINGS="$settings" MARKER="$_GOV_HOOK_MARKER" HOOKSCRIPT="$SCRIPTS_DIR/governance-hook.sh" \
+  ACCEPTED="$accepted" python3 -c '
+import json, os, shlex, sys
+settings = os.environ["SETTINGS"]
+marker   = os.environ["MARKER"]
+hookscript = os.environ["HOOKSCRIPT"]
+accepted = [t for t in os.environ.get("ACCEPTED", "").splitlines() if t.strip()]
+try:
+    with open(settings) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except FileNotFoundError:
+    data = {}
+except Exception:
+    sys.stderr.write("governance hooks: %s is not valid JSON — refusing to overwrite\n" % settings)
+    sys.exit(1)
+hooks = data.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+# Strip our previously-rendered marker groups from every event (idempotent re-render); drop an event
+# that we emptied so re-render stays byte-stable.
+for ev in list(hooks.keys()):
+    arr = hooks.get(ev)
+    if not isinstance(arr, list):
+        continue
+    kept = [g for g in arr if not (isinstance(g, dict) and marker in g)]
+    if kept:
+        hooks[ev] = kept
+    else:
+        del hooks[ev]
+for target in sorted(set(accepted)):
+    cmd = "bash %s %s" % (shlex.quote(hookscript), shlex.quote(target))
+    hooks.setdefault("PreToolUse", []).append({
+        "matcher": "Bash",
+        marker: target,
+        "hooks": [{"type": "command", "command": cmd}],
+    })
+if hooks:
+    data["hooks"] = hooks
+elif "hooks" in data:
+    del data["hooks"]
+with open(settings, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' || die "governance hooks: merge into $settings failed"
+  local nacc; nacc="$(printf '%s' "$accepted" | grep -c . || true)"
+  if [ "$nacc" -gt 0 ]; then
+    ok "governance hooks: merged $nacc hook(s) → $settings"
+  else
+    say "  ${c_dim}governance hooks: removed prior generated entries → $settings${c_rst}"
+  fi
+}
+
 # ── herd codemap: regenerate docs/codemap.md, a native map of the repo's tree ────────────────────
 # Delegates to scripts/herd/codemap.sh, which regenerates the committed, deterministic docs/codemap.md
 # — module roles, who-imports/sources-whom, and config-key → consumer wiring — for coordinator/builder
@@ -992,6 +1395,58 @@ cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
 
 # Capabilities manifest path (key set + metadata); HERD_CAPABILITIES_FILE overrides it for tests.
 _config_caps_file() { printf '%s' "${HERD_CAPABILITIES_FILE:-$TEMPLATES_DIR/capabilities.tsv}"; }
+
+# ── Model suggestions catalog (HERD-151) ──────────────────────────────────────────────────────────
+# templates/models.tsv is an ADVISORY, perishable list of model refs with a tier + role-fit hint.
+# `herd config set MODEL_*` reads it to SUGGEST a fit and to soft-note an uncatalogued ref — never to
+# refuse one (catalog / CLAUDE.md / manual set are coequal, none required). HERD_MODELS_CATALOG_FILE
+# overrides the path for tests, mirroring HERD_CAPABILITIES_FILE.
+_models_catalog_file() { printf '%s' "${HERD_MODELS_CATALOG_FILE:-$TEMPLATES_DIR/models.tsv}"; }
+
+# _config_is_model_key <KEY> — success iff KEY holds a MODEL REF value (so `config set` should consult
+# the catalog). Covers the MODEL_* role tiers and the REVIEW_MODEL_* reviewer tiers, but EXCLUDES
+# MODEL_ESCALATE_GLOB (an egrep pattern, not a model id).
+_config_is_model_key() {
+  case "$1" in
+    MODEL_ESCALATE_GLOB) return 1 ;;
+    MODEL_*|REVIEW_MODEL_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _models_catalog_row <catalog> <model-id> — print the catalog row (tier<TAB>role_fit<TAB>as_of) for
+# an EXACT bare model id, or nothing (exit 1) when it is not catalogued. Skips the header + comments.
+_models_catalog_row() {
+  awk -F'\t' -v m="$2" '
+    NR==1 { next }                                  # header
+    { s=$0; sub(/^[[:space:]]+/,"",s) }
+    s ~ /^#/ || s=="" { next }                      # comments / blanks
+    $1==m { printf "%s\t%s\t%s", $2, $3, $4; found=1; exit }
+    END { exit(found?0:1) }' "$1"
+}
+
+# _models_catalog_lint <catalog> — validate every data row: exactly 4 tab columns, a tier in the
+# controlled vocabulary {judgment,balanced,cheap,docs}, and an as_of date shaped YYYY-MM-DD. Prints one
+# problem per line (empty when clean) and exits non-zero when any row is malformed. Pure/read-only.
+_models_catalog_lint() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || { echo "no models catalog at ${f:-<unset>}"; return 1; }
+  awk -F'\t' '
+    NR==1 { next }                                  # header
+    { s=$0; sub(/^[[:space:]]+/,"",s) }
+    s ~ /^#/ || s=="" { next }                      # comments / blanks
+    {
+      rows++
+      if (NF != 4) { print "row " NR ": expected 4 tab-separated columns, got " NF; bad++; next }
+      tier=$2
+      if (tier != "judgment" && tier != "balanced" && tier != "cheap" && tier != "docs")
+        { print "row " NR " (" $1 "): invalid tier \"" tier "\" — want judgment|balanced|cheap|docs"; bad++ }
+      if ($4 !~ /^[0-9][0-9][0-9][0-9]-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/)
+        { print "row " NR " (" $1 "): invalid as_of \"" $4 "\" — want YYYY-MM-DD"; bad++ }
+      if ($1 == "") { print "row " NR ": empty model_ref"; bad++ }
+    }
+    END { if (rows==0) { print "catalog has no data rows"; bad++ } exit(bad?1:0) }' "$f"
+}
 
 # _config_key_requires <caps> <KEY> → prints the requires token (watcher | render | '') for the
 # matching kind==config row; prints nothing and exits 1 when KEY is NOT a known config key. Exact
@@ -1075,6 +1530,17 @@ _config_file_value() {
       if (v ~ /^".*"$/) v=substr(v,2,length(v)-2)
       print v; exit
     }' "$1"
+}
+
+# _config_file_has_key <cfg> <KEY> → exit 0 when KEY is ASSIGNED in the config file (first assignment;
+# comments ignored, same parse as _config_file_value), 1 otherwise. Presence, not value — it lets
+# cmd_config_get honor an overlay key that overrides the baseline even when the overlay assigns it the
+# EMPTY string (shell-source last-wins), which a bare value read cannot distinguish from "unset".
+_config_file_has_key() {
+  awk -v k="$2" '
+    { line=$0; sub(/^[[:space:]]+/,"",line) }
+    index(line, k "=")==1 { found=1; exit }
+    END { exit(found?0:1) }' "$1"
 }
 
 # _config_put_value <cfg> <KEY> <VALUE> — idempotent, targeted in-place write of KEY="VALUE" into the
@@ -1189,8 +1655,9 @@ cmd_config() {
     set)          cmd_config_set "$@" ;;
     sync)         cmd_config_sync "$@" ;;
     lint)         _config_lint "$@" ;;
-    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
-    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint" ;;
+    models)       cmd_config_models "$@" ;;
+    ""|-h|--help) say "usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint | models [lint]" ;;
+    *)            die "unknown 'herd config' subcommand '$sub' — usage: herd config list | get <KEY> | set [--local|--shared] [--reason <why>] <KEY> <VALUE> | sync | lint | models [lint]" ;;
   esac
 }
 
@@ -1221,6 +1688,64 @@ _config_lint() {
   say ""
   warn "shell last-wins can SILENTLY disable a gate (issue #115) — delete the stale duplicate line(s) in $cfg (value resolution is unchanged; herd does not auto-dedup)."
   exit 1
+}
+
+# cmd_config_models [lint] — the model SUGGESTIONS CATALOG surface (HERD-151). With no argument it
+# prints the catalog (tier · role-fit · as-of) an operator can pick a MODEL_* value from; `lint`
+# validates the catalog (tier + date per row) and exits non-zero on any malformed row. Read-only.
+cmd_config_models() {
+  local sub="${1:-}" cat; cat="$(_models_catalog_file)"
+  [ -f "$cat" ] || die "no model catalog at $cat"
+  case "$sub" in
+    lint)
+      local out; out="$(_models_catalog_lint "$cat")" || {
+        say "${c_bold}model catalog problems${c_rst}  ($cat)"
+        printf '%s\n' "$out" | while IFS= read -r l; do [ -n "$l" ] && say "  $l"; done
+        exit 1
+      }
+      ok "model catalog is well-formed ($cat)"
+      ;;
+    ""|list)
+      say "${c_bold}model suggestions catalog${c_rst}  ($cat)  ${c_dim}advisory — never a gate; unknown refs are always allowed${c_rst}"
+      awk -F'\t' '
+        NR==1 { next }
+        { s=$0; sub(/^[[:space:]]+/,"",s) }
+        s ~ /^#/ || s=="" { next }
+        { printf "  %-20s %-9s %s  (as of %s)\n", $1, $2, $3, $4 }' "$cat"
+      ;;
+    *) die "usage: herd config models [lint]" ;;
+  esac
+}
+
+# _config_model_suggest <ref> — print an ADVISORY note (never an error) for a MODEL_* ref just set:
+# whether its (bare) model is in the suggestions catalog, and — for a runtime-qualified '<driver>:<model>'
+# ref — whether the driver is a shipped one. NEVER refuses: an uncatalogued model is allowed with a soft
+# note; an unknown driver is soft-noted here (it hard-fails only at SPAWN time, by design).
+_config_model_suggest() {
+  local ref="${1:-}" cat mdl drv=""
+  [ -n "$ref" ] || return 0
+  cat="$(_models_catalog_file)"; [ -f "$cat" ] || return 0
+  case "$ref" in
+    *:*) drv="${ref%%:*}"; mdl="${ref#*:}"
+         if command -v herd_driver_known >/dev/null 2>&1 && herd_driver_known "$drv"; then
+           say "  ${c_dim}(runtime-qualified ref → driver '$drv', model '$mdl')${c_rst}"
+         else
+           say "  ${c_dim}note: '$drv' is not a shipped driver (templates/drivers/) — this ref will FAIL at spawn time; use a bare model or a known <driver>:<model>${c_rst}"
+         fi ;;
+    *)   mdl="$ref" ;;
+  esac
+  # `_models_catalog_row` exits 1 when the model is not catalogued — guard the command sub so that
+  # (expected, non-error) miss never trips `set -e` and swallows the soft note below.
+  local row; row="$(_models_catalog_row "$cat" "$mdl" || true)"
+  if [ -n "$row" ]; then
+    local tier hint
+    tier="$(printf '%s' "$row" | cut -f1)"
+    hint="$(printf '%s' "$row" | cut -f2)"
+    say "  ${c_dim}(catalog: tier=$tier — $hint)${c_rst}"
+  else
+    say "  ${c_dim}('$mdl' is not in the suggestions catalog templates/models.tsv — allowed; add a row to catalog it. See 'herd config models')${c_rst}"
+  fi
+  return 0
 }
 
 cmd_config_list() {
@@ -1294,12 +1819,20 @@ cmd_config_list() {
 cmd_config_get() {
   local key="${1:-}"
   [ -n "$key" ] || die "usage: herd config get <KEY>"
-  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   local caps; caps="$(_config_caps_file)"
   _config_key_requires "$caps" "$key" >/dev/null \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
+  # HERD-142: resolve through the SAME baseline+overlay precedence herd-config.sh sources at runtime
+  # (HERD-47 contract) — baseline first, then the per-user overlay .herd/config.local OVERRIDES it. A
+  # key the overlay assigns wins even when set to the empty string (shell-source last-wins), hence the
+  # presence check rather than a non-empty test. When config.local is absent, or is present but does
+  # not assign this key, the baseline value stands and output is byte-identical to before.
   local val; val="$(_config_file_value "$cfg" "$key")"
+  if [ -f "$local_cfg" ] && _config_file_has_key "$local_cfg" "$key"; then
+    val="$(_config_file_value "$local_cfg" "$key")"
+  fi
   { _config_secret_key "$key" && [ -n "$val" ]; } && val='********'
   printf '%s\n' "$val"
 }
@@ -1401,10 +1934,20 @@ cmd_config_set() {
   else
     ok "$key already = \"$val\" in $target_label (local change already applied)"
   fi
+  # HERD-151: for a MODEL_* / REVIEW_MODEL_* key, consult the suggestions catalog — an ADVISORY note on
+  # the model's tier/role-fit (or a soft note for an uncatalogued model / unshipped driver prefix).
+  # Never refuses: the operator's chosen model always stands.
+  _config_is_model_key "$key" && _config_model_suggest "$val"
 
   # 4. Change-awareness: do exactly what the change requires, reusing the shared mechanisms. Skipped
   #    on a no-local-change --shared run (nothing changed locally to re-apply — only the PR is opened).
-  if [ "$changed" -eq 1 ]; then
+  #    HERD_INIT_DEFER_APPLY (set by `herd init`'s governance adoption/seeding, HERD-119/HERD-126, and
+  #    by `herd governance apply`'s multi-key loop) suppresses the watcher-restart / re-render: the
+  #    caller applies possibly-many keys at once and drives ONE reload afterward (or, during init, the
+  #    value simply takes effect on first launch) — no per-key restart, no premature headless spawn.
+  if [ "$changed" -eq 1 ] && [ "${HERD_INIT_DEFER_APPLY:-}" = "1" ]; then
+    say "  ${c_dim}(watcher restart / skill re-render deferred — takes effect on the next control-room launch or 'herd reload')${c_rst}"
+  elif [ "$changed" -eq 1 ]; then
   case "$requires" in
     watcher)
       say ""
@@ -1649,11 +2192,546 @@ _config_sync_report() {
   return 1
 }
 
+# ── herd governance: export / apply a project's governance as a portable profile (HERD-126) ───────
+# A governance profile makes a project's GOVERNANCE STANCE — its merge / gate / PR / attribution /
+# commit policy — a portable, versioned artifact. `herd governance export` writes the governance-scoped
+# .herd/config key subset; `herd governance apply` PROPOSES each key back through the validated `herd
+# config set` (never a blind overwrite); `herd init --governance` seeds a fresh install; and `herd
+# fleet set --profile` rides the existing fleet fan-out to roll a profile across the registry.
+#
+# SINGLE SOURCE OF TRUTH for WHICH keys travel: the `governance` tag in templates/capabilities.tsv's
+# 7th column. STRUCTURAL EXCLUSIONS are enforced on BOTH export and apply (never merely trusted from
+# the tag): a SECRET-shaped key (_config_secret_key) and a MACHINE-scoped key (_config_key_scope ==
+# machine — e.g. GRAPHIFY_BIN, model tiers) NEVER travel, even if a row were mis-tagged.
+#
+# BINDING CONSTRAINT: a profile is ONE optional governance source among several (defaults, interview,
+# CLAUDE.md adoption, manual `herd config set`). apply COMPOSES — it proposes, it never overwrites;
+# declining every key leaves .herd/config byte-identical. A malformed profile is refused LOUDLY with
+# ZERO partial writes: the WHOLE file is validated before a single key is applied.
+
+# _gov_profile_version — the profile format version this herd writes and understands. A profile that
+# declares an unsupported version is refused rather than guessed at (forward-compatible).
+_gov_profile_version() { printf '1'; }
+
+# _gov_profile_marker — the version-marker key a profile header carries. It is NOT a .herd/config key,
+# so it is recognized specially by the parser and never proposed as a config set.
+_gov_profile_marker() { printf 'HERD_GOVERNANCE_PROFILE'; }
+
+# _gov_travels <caps> <KEY> — success when KEY may travel in a profile: a kind==config row tagged
+# `governance` in the 7th column of capabilities.tsv, AND not machine-scoped, AND not secret-shaped.
+# This is the ONE predicate both export (which keys to emit) and apply (which keys to accept) consult,
+# so the traveling set can never diverge between the two directions.
+_gov_travels() {
+  local caps="$1" key="$2" tag
+  tag="$(awk -F'\t' -v k="$key" '$2=="config" && $1==k { t=$7; gsub(/[[:space:]]+$/,"",t); print t; exit }' "$caps")"
+  [ "$tag" = "governance" ] || return 1
+  _config_secret_key "$key" && return 1                       # secret-shaped → belongs in .herd/secrets
+  [ "$(_config_key_scope "$caps" "$key")" = "machine" ] && return 1   # per-user/per-machine → never travels
+  return 0
+}
+
+# _gov_profile_keys <caps> — every traveling governance key, in manifest order (one per line).
+_gov_profile_keys() {
+  local caps="$1" key
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    _gov_travels "$caps" "$key" && printf '%s\n' "$key"
+  done < <(_config_manifest_config_keys "$caps")
+}
+
+# _gov_collect_pairs <cfg> <local_cfg> <caps> — print each SET traveling governance key as
+# KEY<TAB>VALUE in manifest order. Effective value: the per-user overlay (.herd/config.local) wins
+# over the baseline, mirroring how herd-config.sh sources config. A key UNSET in both files is skipped
+# — a profile carries the project's DELIBERATE governance stance, not the defaults every install rides.
+_gov_collect_pairs() {
+  local cfg="$1" local_cfg="$2" caps="$3" key val
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg"; then
+      val="$(_config_file_value "$local_cfg" "$key")"
+    elif grep -qE "^[[:space:]]*$key=" "$cfg"; then
+      val="$(_config_file_value "$cfg" "$key")"
+    else
+      continue
+    fi
+    printf '%s\t%s\n' "$key" "$val"
+  done < <(_gov_profile_keys "$caps")
+}
+
+cmd_governance() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    export)       cmd_governance_export "$@" ;;
+    apply)        cmd_governance_apply "$@" ;;
+    hooks)        _gov_hooks "$@" ;;
+    ""|-h|--help) say "usage: herd governance export [--file <path>] | apply [--yes] <file> | hooks render [--shared]" ;;
+    *)            die "unknown 'herd governance' subcommand '$sub' — usage: herd governance export [--file <path>] | apply [--yes] <file> | hooks render [--shared]" ;;
+  esac
+}
+
+cmd_governance_export() {
+  local out_file=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --file) out_file="${2:-}"; [ -n "$out_file" ] || die "usage: herd governance export [--file <path>]"; shift 2 ;;
+      --)     shift; break ;;
+      -?*)    die "unknown flag '$1' — usage: herd governance export [--file <path>]" ;;
+      *)      die "unexpected argument '$1' — usage: herd governance export [--file <path>]" ;;
+    esac
+  done
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local caps; caps="$(_config_caps_file)"
+
+  local pairs; pairs="$(_gov_collect_pairs "$cfg" "$local_cfg" "$caps")"
+  local n; n="$(printf '%s' "$pairs" | grep -c . || true)"
+  local ws; ws="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKSPACE_NAME:-}" ) )"
+
+  # Emit the commented, versioned profile. Header first (what it is + how to apply), then the version
+  # marker, then one KEY="VALUE" per SET governance key. Values are double-quoted so a profile is a
+  # drop-in shell-sourceable snippet AND identical in shape to a .herd/config assignment.
+  _gov_emit() {
+    printf '# herd governance profile (v%s)%s\n' "$(_gov_profile_version)" "${ws:+ — exported from $ws}"
+    printf '#\n'
+    printf '# A PORTABLE, VERSIONED snapshot of this project'\''s governance stance (merge / gate / PR /\n'
+    printf '# attribution / commit policy). Generated by '\''herd governance export'\'' (HERD-126). Each\n'
+    printf '# KEY="VALUE" line is a governance-scoped .herd/config key; secrets and machine-scoped keys\n'
+    printf '# NEVER travel in a profile. Apply with '\''herd governance apply <file>'\'' (proposes each key;\n'
+    printf '# --yes for automation), seed a fresh install with '\''herd init --governance <file>'\'', or roll\n'
+    printf '# out across a fleet with '\''herd fleet set --profile <file>'\''.\n'
+    printf '%s=%s\n' "$(_gov_profile_marker)" "$(_gov_profile_version)"
+    # `|| [ -n "$k" ]`: command substitution strips the trailing newline, so the LAST pair would be
+    # dropped by a bare `read` (which returns non-zero on an unterminated final line).
+    printf '%s' "$pairs" | while IFS=$'\t' read -r k v || [ -n "$k" ]; do
+      [ -n "$k" ] || continue
+      printf '%s="%s"\n' "$k" "$v"
+    done
+  }
+
+  if [ -n "$out_file" ]; then
+    _gov_emit > "$out_file" || die "could not write governance profile to $out_file"
+    ok "wrote governance profile → $out_file ${c_dim}($n governance key$([ "$n" = "1" ] || printf 's'))${c_rst}"
+  else
+    _gov_emit
+  fi
+}
+
+# _gov_parse_and_validate <file> <caps> — the SINGLE validation gate for a profile. Proves <file> is a
+# well-formed vN profile and prints one KEY<TAB>VALUE line per governance assignment to STDOUT on
+# success. On ANY defect it prints a reason to STDERR, returns non-zero, and has written NOTHING to
+# stdout — so a caller that applies stdout applies ZERO keys on a malformed profile. Refuses: a
+# missing/unsupported version marker; a non-KEY=VALUE line; a key that is not a TRAVELING governance
+# key (unknown / non-governance / machine / secret); a value with a shell-active char (the same rule
+# `herd config set` enforces, since .herd/config is shell-sourced).
+_gov_parse_and_validate() {
+  local file="$1" caps="$2"
+  local marker; marker="$(_gov_profile_marker)"
+  local line t key val ver="" seenmarker=0 pairs="" lineno=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno+1))
+    t="${line#"${line%%[![:space:]]*}"}"          # strip leading whitespace
+    case "$t" in ''|'#'*) continue ;; esac         # blank / comment
+    case "$t" in
+      [A-Za-z_]*=*) : ;;
+      *) printf 'malformed profile at line %d: not a KEY=VALUE assignment: %s\n' "$lineno" "$line" >&2; return 1 ;;
+    esac
+    key="${t%%=*}"; val="${t#*=}"
+    case "$val" in \"*\") val="${val#\"}"; val="${val%\"}" ;; esac   # strip one layer of surrounding quotes
+    if [ "$key" = "$marker" ]; then ver="$val"; seenmarker=1; continue; fi
+    case "$key" in
+      *[!A-Za-z0-9_]*) printf 'malformed profile at line %d: bad key name "%s"\n' "$lineno" "$key" >&2; return 1 ;;
+    esac
+    if ! _gov_travels "$caps" "$key"; then
+      printf 'refusing profile: line %d key "%s" is not a traveling governance key (unknown, non-governance, machine-scoped, or secret) — nothing applied\n' "$lineno" "$key" >&2
+      return 1
+    fi
+    case "$val" in
+      *'$'*|*'`'*|*'\'*|*'"'*) printf 'refusing profile: line %d value for "%s" contains a shell-active character ($ ` \\ or ") — nothing applied\n' "$lineno" "$key" >&2; return 1 ;;
+    esac
+    pairs="${pairs}$(printf '%s\t%s' "$key" "$val")"$'\n'
+  done < "$file"
+  if [ "$seenmarker" -ne 1 ]; then
+    printf 'refusing profile: missing the %s version marker — is %s a governance profile? nothing applied\n' "$marker" "$file" >&2
+    return 1
+  fi
+  if [ "$ver" != "$(_gov_profile_version)" ]; then
+    printf 'refusing profile: unsupported %s version "%s" — this herd understands v%s; nothing applied\n' "$marker" "$ver" "$(_gov_profile_version)" >&2
+    return 1
+  fi
+  printf '%s' "$pairs"
+  return 0
+}
+
+# _gov_apply_pairs <root> <cfg> <caps> <pairs> <assume_yes> <file> — apply already-validated KEY<TAB>VALUE
+# pairs. With assume_yes=1 every key is applied non-interactively (journaled); otherwise each key is
+# PROPOSED with the profile line as evidence and a current→proposed diff, accept / edit / decline.
+# Every write goes through cmd_config_set under HERD_INIT_DEFER_APPLY=1, so a multi-key profile never
+# triggers N watcher restarts mid-apply; a single 'herd reload' hint is printed at the end when any
+# applied key is watcher/render-affecting (suppressed under init, which launches fresh). Declining
+# every key leaves .herd/config byte-identical. Iterates by line INDEX (not a here-string wrapping the
+# loop) so _ground_ask keeps reading the REAL stdin for the interactive prompts.
+_gov_apply_pairs() {
+  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6"
+  local applied=0 needs_reload=0 np i rec key val cur requires ans
+  np="$(printf '%s' "$pairs" | grep -c . || true)"
+  for (( i=1; i<=np; i++ )); do
+    rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+    IFS=$'\t' read -r key val <<< "$rec"
+    [ -n "$key" ] || continue
+    cur="$(_config_file_value "$cfg" "$key")"
+    if [ "$assume_yes" -ne 1 ]; then
+      say ""
+      say "  ${c_bold}${key}${c_rst}"
+      say "  ${c_dim}evidence: ${key}=\"${val}\"  (from $(basename "$file"))${c_rst}"
+      if [ "$cur" = "$val" ]; then
+        say "  ${c_dim}→ already ${key}=\"${val}\" — no change${c_rst}"
+        continue
+      fi
+      say "  ${c_dim}→ proposes: ${key} \"${cur}\" → \"${val}\"  (via the validated herd config set)${c_rst}"
+      ans="$(_ground_ask "  accept / edit / decline? (a/e/N)" "n")"
+      case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+        a|accept) : ;;
+        e|edit)
+          local edited; edited="$(_ground_ask "  enter value for $key" "$val")"
+          if [ -n "$edited" ]; then val="$edited"; else say "  ${c_dim}declined (empty)${c_rst}"; continue; fi ;;
+        *) say "  ${c_dim}declined${c_rst}"; continue ;;
+      esac
+    fi
+    requires="$(_config_key_requires "$caps" "$key" 2>/dev/null || true)"
+    if ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set "$key" "$val" >/dev/null 2>&1 ); then
+      applied=$((applied+1))
+      case "$requires" in watcher|render) needs_reload=1 ;; esac
+      ok "applied ${key}=\"${val}\""
+      if [ "$assume_yes" -eq 1 ]; then
+        local wt; wt="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
+        { type journal_append >/dev/null 2>&1 && WORKTREES_DIR="$wt" journal_append governance_applied key "$key" value "$val" profile "$(basename "$file")"; } || true
+      fi
+    else
+      warn "could not apply ${key}=\"${val}\" — 'herd config set' rejected it; skipped (other keys unaffected)"
+    fi
+  done
+
+  say ""
+  if [ "$applied" -gt 0 ]; then
+    ok "governance apply: applied $applied key(s)"
+    [ "$needs_reload" -eq 1 ] && [ "${HERD_INIT_DEFER_APPLY:-}" != "1" ] \
+      && say "  ${c_dim}→ run 'herd reload' to apply the watcher/skill changes to a running control room${c_rst}"
+  else
+    say "  ${c_dim}governance apply: nothing applied (config untouched)${c_rst}"
+  fi
+  return 0
+}
+
+cmd_governance_apply() {
+  local assume_yes=0 file=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --yes|-y) assume_yes=1; shift ;;
+      --)       shift; break ;;
+      -?*)      die "unknown flag '$1' — usage: herd governance apply [--yes] <file>" ;;
+      *)        file="$1"; shift; break ;;
+    esac
+  done
+  [ -n "$file" ] || die "usage: herd governance apply [--yes] <file>"
+  { [ -f "$file" ] && [ -r "$file" ]; } || die "no readable governance profile at $file"
+  local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local caps; caps="$(_config_caps_file)"
+
+  # Validate the ENTIRE profile before ANY write — a malformed profile is refused here, zero writes.
+  local pairs
+  pairs="$(_gov_parse_and_validate "$file" "$caps")" \
+    || die "herd governance apply refused — the profile is malformed; nothing was written (see the reason above)"
+
+  local n; n="$(printf '%s' "$pairs" | grep -c . || true)"
+  if [ "$n" -eq 0 ]; then
+    ok "governance profile carries no traveling keys — nothing to apply (config untouched)"
+    return 0
+  fi
+
+  say "${c_bold}herd governance apply${c_rst} ${c_dim}— $n governance key(s) from $(basename "$file")${c_rst}"
+  say "  ${c_dim}(each proposal applies ONLY through the validated 'herd config set'; nothing is overwritten unless you accept it)${c_rst}"
+  _gov_apply_pairs "$root" "$cfg" "$caps" "$pairs" "$assume_yes" "$file"
+}
+
 cmd_config_sync() {
   local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
   # Return status IS the process exit status (missing → non-zero gate), by tail position under set -e.
   _config_sync_report "$cfg" "$(_config_caps_file)" "$(_config_example_file)"
+}
+
+# ── herd conformance: the capability CONFORMANCE MATRIX (HERD-144) ─────────────────────────────────
+# `herd conformance report [--json]` joins the capabilities manifest (templates/capabilities.tsv, the
+# same file `herd config` reads) against the committed proof map (templates/conformance.tsv) and
+# reports, DETERMINISTICALLY and WITHOUT an LLM: every capability with NO proof mapping (a GAP) and
+# every mapping whose proof_ref no longer exists (ROT). `herd conformance run [--kind unit]` executes
+# the mapped proofs and writes conformance.json (capability → verdict → sha → timestamp) — the
+# whole-surface analog of the sim scorecard. FAIL-SOFT: an absent proof map is a soft note (every
+# capability reads as a gap), never a hard error; REPORT-ONLY — nothing here is a merge gate. The proof
+# map is a SIBLING of capabilities.tsv (keyed by capability NAME) so the manifest stays byte-identical
+# for its other consumers (herd config/upgrade/codemap and the queued HERD-140/141/143).
+#
+# All paths are overridable for hermetic tests: the manifest is _config_caps_file (shared with `herd
+# config`); the proof map is _conformance_map_file; proof_refs resolve relative to _conformance_root
+# (the repo root); `run` output goes to _conformance_out.
+_conformance_map_file() { printf '%s' "${HERD_CONFORMANCE_FILE:-$TEMPLATES_DIR/conformance.tsv}"; }
+_conformance_root()     { printf '%s' "${HERD_CONFORMANCE_ROOT:-$HERDKIT_HOME}"; }
+_conformance_out()      { printf '%s' "${HERD_CONFORMANCE_OUT:-$(_conformance_root)/.herd/conformance.json}"; }
+
+# _conformance_analyze <caps> <map> <root> — emit ONE analysis row per capability (in manifest order),
+# TAB-separated: "<capability>\t<status>\t<proofs>\t<note>", where status ∈ mapped|rot|none-yet|unmapped,
+# <proofs> is a ';'-joined list of REAL proofs "kind|ref|exists" (exists = 1|0, empty when none), and
+# <note> is the ';'-note carried by any none-yet row(s) ('' otherwise). Status:
+#   mapped   — has ≥1 REAL proof row (kind unit|sim|render) whose ref EXISTS.
+#   rot      — has REAL proof rows but NONE of their refs exist (an actionable dangling-ref breakage).
+#   none-yet — carries only none-yet NOTE row(s): an EXPLICIT, expected gap with a missing-proof note.
+#   unmapped — carries NO row at all: a capability added since mapping began (the no-new-unmapped RATCHET
+#              target). After the backfill every existing capability has a row, so unmapped ≈ 0.
+# (An individual dangling ref on an otherwise-mapped capability still shows exists=0 in <proofs>, so the
+# caller can enumerate every dangling mapping.) A none-yet row is NEVER existence-checked (its third
+# column is prose) and never rots. Deterministic: manifest order for capabilities, map-file order for
+# proofs/notes, no timestamps. Absent map → every capability reads as unmapped.
+_conformance_analyze() {
+  local caps="$1" map="$2" root="$3"
+  local tmp exf mapf; tmp="$(mktemp -d)"
+  exf="$tmp/exists.tsv"; mapf="$map"
+  # An absent/empty proof map is fail-soft: substitute an empty file so every capability reads as a gap.
+  [ -f "$mapf" ] || { mapf="$tmp/empty.tsv"; : > "$mapf"; }
+  # Precompute proof_ref existence in the shell ([ -e ] is not awk-portable), one row per unique ref.
+  # A none-yet row's third column is a free-text NOTE, not a path — skip it so a note that happens to
+  # look like a path is never existence-checked (and a none-yet capability never reads as rot).
+  awk -F'\t' 'NF>=3 && $1!~/^#/ && $1!="capability" && $1!="" && $2!="none-yet" {print $3}' "$mapf" | sort -u \
+    | while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        if [ -e "$root/$ref" ]; then printf '%s\t1\n' "$ref"; else printf '%s\t0\n' "$ref"; fi
+      done > "$exf"
+  awk -F'\t' -v exf="$exf" -v mapf="$mapf" -v capf="$caps" '
+    FILENAME==exf  { ex[$1]=$2; next }
+    FILENAME==mapf {
+      if ($0 ~ /^#/ || $1=="capability" || NF<3 || $1=="") next
+      cap=$1; n=++pc[cap]; pk[cap,n]=$2; pr[cap,n]=$3; next
+    }
+    FILENAME==capf {
+      if ($1=="name" || $1=="" ) next          # header / blank
+      cap=$1; if (seen[cap]++) next             # first occurrence wins; dedupe defensively
+      order[++cn]=cap
+    }
+    END {
+      for (i=1;i<=cn;i++){
+        cap=order[i]; cnt=pc[cap]+0
+        if (cnt==0){ print cap "\t" "unmapped" "\t" "\t"; continue }
+        anyexist=0; real=0; enc=""; note=""
+        for (j=1;j<=cnt;j++){
+          k=pk[cap,j]; r=pr[cap,j]
+          if (k=="none-yet"){ note = note (note!=""?"; ":"") r; continue }  # prose note, not a proof
+          real++; e=(r in ex)?ex[r]:0
+          if (e==1) anyexist=1
+          enc=enc (enc!=""?";":"") k "|" r "|" e
+        }
+        if (real>0)      status=(anyexist?"mapped":"rot")
+        else if (note!="") status="none-yet"
+        else               status="unmapped"
+        print cap "\t" status "\t" enc "\t" note
+      }
+    }' "$exf" "$mapf" "$caps"
+  rm -rf "$tmp"
+}
+
+# cmd_conformance_report [--json] — the deterministic coverage report. Human text by default; --json
+# emits a machine-ingestable object. Four statuses: mapped, rot, none-yet (an explicit missing-proof
+# note), and unmapped (NO row at all). The no-new-unmapped RATCHET: after the backfill every existing
+# capability carries a row, so any UNMAPPED capability is one added since mapping began that never got a
+# proof row or a none-yet note — surfaced as a LOUD ADVISORY (never a gate). Exits NON-ZERO only when ROT
+# is present (a proof_ref no longer exists — a real, actionable breakage); none-yet AND unmapped alone
+# never fail (advisory only). An absent proof map is a soft note (all unmapped), exit 0.
+cmd_conformance_report() {
+  local as_json=0 a
+  for a in "$@"; do case "$a" in --json) as_json=1 ;; -h|--help) say "usage: herd conformance report [--json]"; return 0 ;; *) die "unknown 'herd conformance report' flag: $a" ;; esac; done
+  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  [ -f "$caps" ] || die "no capabilities manifest at $caps"
+  local analysis; analysis="$(_conformance_analyze "$caps" "$map" "$root")"
+  local map_present=1; [ -f "$map" ] || map_present=0
+
+  if [ "$as_json" -eq 1 ]; then
+    ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    python3 -c '
+import os, json, sys
+caps = []
+none_yet = []       # explicit missing-proof notes: [{capability, note}]
+unmapped = []       # the no-new-unmapped ratchet list: [capability]
+rot = []
+counts = {"mapped": 0, "none_yet": 0, "unmapped": 0, "rot": 0, "dangling_refs": 0}
+for line in os.environ.get("ANALYSIS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    cap = parts[0]
+    status = parts[1] if len(parts) > 1 else "unmapped"
+    enc = parts[2] if len(parts) > 2 else ""
+    note = parts[3] if len(parts) > 3 else ""
+    proofs = []
+    for tok in (enc.split(";") if enc else []):
+        k, r, e = (tok.split("|", 2) + ["", "", "0"])[:3]
+        exists = (e == "1")
+        proofs.append({"kind": k, "ref": r, "exists": exists})
+        if not exists:
+            counts["dangling_refs"] += 1
+            rot.append({"capability": cap, "kind": k, "ref": r})
+    if status == "none-yet":
+        none_yet.append({"capability": cap, "note": note})
+    elif status == "unmapped":
+        unmapped.append(cap)
+    key = "none_yet" if status == "none-yet" else status
+    counts[key] = counts.get(key, 0) + 1
+    caps.append({"capability": cap, "status": status, "note": note, "proofs": proofs})
+out = {
+    "source": os.environ.get("CAPS_BASE", ""),
+    "map": os.environ.get("MAP_BASE", ""),
+    "map_present": os.environ.get("MAP_PRESENT", "1") == "1",
+    "total": len(caps),
+    "counts": counts,
+    "capabilities": caps,
+    "none_yet": none_yet,
+    "unmapped": unmapped,
+    "rot": rot,
+}
+json.dump(out, sys.stdout, indent=2)
+print()
+'
+  else
+    ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    python3 -c '
+import os
+mapped = noneyetl = unmappedl = rotl = dangling = 0
+none_yets = []
+unmaps = []
+rots = []
+for line in os.environ.get("ANALYSIS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    cap = parts[0]; status = parts[1] if len(parts) > 1 else "unmapped"
+    enc = parts[2] if len(parts) > 2 else ""; note = parts[3] if len(parts) > 3 else ""
+    if status == "mapped": mapped += 1
+    elif status == "rot": rotl += 1
+    elif status == "none-yet": noneyetl += 1; none_yets.append((cap, note))
+    else: unmappedl += 1; unmaps.append(cap)
+    for tok in (enc.split(";") if enc else []):
+        k, r, e = (tok.split("|", 2) + ["", "", "0"])[:3]
+        if e != "1":
+            dangling += 1
+            rots.append((cap, k, r))
+total = mapped + noneyetl + unmappedl + rotl
+print("Conformance report — %s vs %s" % (os.environ.get("CAPS_BASE",""), os.environ.get("MAP_BASE","")))
+if os.environ.get("MAP_PRESENT","1") != "1":
+    print("  ⚠️  no proof map found — every capability reads as unmapped (fail-soft)")
+print("  %d capabilities · %d mapped · %d none-yet · %d unmapped · %d rot   (%d dangling refs)"
+      % (total, mapped, noneyetl, unmappedl, rotl, dangling))
+if rots:
+    print("")
+    print("  ROT (mapping whose proof_ref no longer exists):")
+    for cap, k, r in rots:
+        print("    - %s  →  %s:%s  (missing)" % (cap, k, r))
+if unmaps:
+    print("")
+    print("  ⚠️  UNMAPPED — no proof row AND no none-yet note (added since mapping began; ADVISORY, never a gate):")
+    for cap in unmaps:
+        print("    - %s   → add a proof row to the conformance map, or a none-yet note" % cap)
+if none_yets:
+    print("")
+    print("  NONE-YET (no proof mapped — explicit missing-proof note):")
+    for cap, note in none_yets:
+        print("    - %s%s" % (cap, ("  —  " + note) if note else ""))
+'
+  fi
+
+  # Exit status: rot present → non-zero (actionable dangling ref); gaps alone → 0 (report-only).
+  printf '%s\n' "$analysis" | awk -F'\t' '$2=="rot"{r=1} $3 ~ /\|0(;|$)/ {r=1} END{exit(r?1:0)}'
+}
+
+# cmd_conformance_run [--kind KIND] [--out FILE] — execute the mapped proofs and write conformance.json
+# (capability → verdict → sha → timestamp). Each mapping is run in the repo root: proof_kind=unit →
+# `bash <ref>` (0=pass, else fail); a missing ref → verdict "missing"; a none-yet note or any non-unit
+# kind (or a unit mapping filtered out by --kind) → "skipped" (no runner, never "missing"). Deterministic
+# file except the recorded sha +
+# timestamp. Exits non-zero when any proof FAILS. REPORT-ONLY — not wired into any merge gate.
+cmd_conformance_run() {
+  local kind="" out="" a
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --kind) kind="${2:-}"; shift 2 ;;
+      --kind=*) kind="${1#--kind=}"; shift ;;
+      --out) out="${2:-}"; shift 2 ;;
+      --out=*) out="${1#--out=}"; shift ;;
+      -h|--help) say "usage: herd conformance run [--kind unit] [--out FILE]"; return 0 ;;
+      *) die "unknown 'herd conformance run' arg: $1" ;;
+    esac
+  done
+  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  [ -f "$caps" ] || die "no capabilities manifest at $caps"
+  [ -n "$out" ] || out="$(_conformance_out)"
+  if [ ! -f "$map" ]; then warn "no proof map at $map — nothing to run (fail-soft)"; fi
+
+  local sha ts; sha="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+
+  # Execute each mapping and stream "<cap>\t<kind>\t<ref>\t<verdict>" for the JSON writer.
+  local results; results="$(
+    awk -F'\t' 'NF>=3 && $1!~/^#/ && $1!="capability" && $1!="" {print $1 "\t" $2 "\t" $3}' "$map" 2>/dev/null \
+    | while IFS=$'\t' read -r cap pkind pref; do
+        [ -n "$cap" ] || continue
+        verdict=""
+        if [ "$pkind" = "none-yet" ]; then
+          verdict="skipped"                                   # a prose note, never a runnable/existent ref
+        elif [ -n "$kind" ] && [ "$pkind" != "$kind" ]; then
+          verdict="skipped"
+        elif [ ! -e "$root/$pref" ]; then
+          verdict="missing"
+        elif [ "$pkind" = "unit" ]; then
+          if ( cd "$root" && bash "$pref" ) >/dev/null 2>&1; then verdict="pass"; else verdict="fail"; fi
+        else
+          verdict="skipped"
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$cap" "$pkind" "$pref" "$verdict"
+      done
+  )"
+
+  mkdir -p "$(dirname "$out")"
+  RESULTS="$results" SHA="$sha" TS="$ts" KIND="${kind:-}" OUT="$out" python3 -c '
+import os, json, sys
+results = []
+summary = {"pass": 0, "fail": 0, "skipped": 0, "missing": 0}
+for line in os.environ.get("RESULTS", "").splitlines():
+    if not line:
+        continue
+    cap, k, r, v = (line.split("\t", 3) + ["", "", "", ""])[:4]
+    results.append({"capability": cap, "kind": k, "ref": r, "verdict": v})
+    summary[v] = summary.get(v, 0) + 1
+out = {
+    "sha": os.environ.get("SHA", "unknown"),
+    "timestamp": os.environ.get("TS", "unknown"),
+    "kind_filter": os.environ.get("KIND", "") or None,
+    "summary": summary,
+    "results": results,
+}
+with open(os.environ["OUT"], "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+print("wrote %s — %d pass · %d fail · %d skipped · %d missing"
+      % (os.environ["OUT"], summary["pass"], summary["fail"], summary["skipped"], summary["missing"]))
+sys.exit(1 if summary["fail"] else 0)
+'
+}
+
+cmd_conformance() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    report)       cmd_conformance_report "$@" ;;
+    run)          cmd_conformance_run "$@" ;;
+    ""|-h|--help) say "usage: herd conformance report [--json] | run [--kind unit] [--out FILE]" ;;
+    *)            die "unknown 'herd conformance' subcommand '$sub' — usage: herd conformance report [--json] | run [--kind unit]" ;;
+  esac
 }
 
 # cmd_doctor — run the one-pass dependency doctor (scripts/herd/herd-preflight.sh). Exposed so a
@@ -1868,7 +2946,7 @@ cmd_backend() {
   local sub="${1:-}"; [ "$#" -gt 0 ] && shift
   case "$sub" in
     switch) cmd_backend_switch "$@" ;;
-    *) die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate] [--yes]" ;;
+    *) die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate] [--yes]" ;;
   esac
 }
 
@@ -1883,7 +2961,7 @@ cmd_backend_switch() {
     esac
     shift
   done
-  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]"
+  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate]"
 
   # Load the project (mirrors cmd_backlog's loader).
   local root; root="$(pwd)"
@@ -1935,6 +3013,46 @@ cmd_backend_switch() {
       command -v gh >/dev/null 2>&1 || die "github backend needs the gh CLI — install it first; nothing was changed"
       gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run 'gh auth login') — nothing was changed"
       say "✓ gh authenticated"
+      ;;
+    jira)
+      # Basic-auth creds live in .herd/secrets ONLY (gitignored, never .herd/config). Prompt for any
+      # missing one on a tty (stored chmod 600 + gitignored, token hidden); fail loud off a tty.
+      if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+        if [ -t 0 ]; then
+          touch "$secrets" && chmod 600 "$secrets"
+          local gi="$PROJECT_ROOT/.gitignore"
+          if ! { [ -f "$gi" ] && grep -qxF '.herd/secrets' "$gi"; }; then
+            printf '.herd/secrets\n' >> "$gi"
+          fi
+          if [ -z "${JIRA_BASE_URL:-}" ]; then
+            printf 'Jira base URL (e.g. https://acme.atlassian.net): ' >&2
+            local _url=""; IFS= read -r _url </dev/tty || true
+            [ -n "$_url" ] || die "no base URL entered — nothing was changed"
+            printf 'JIRA_BASE_URL="%s"\n' "$_url" >> "$secrets"; JIRA_BASE_URL="$_url"; export JIRA_BASE_URL
+          fi
+          if [ -z "${JIRA_EMAIL:-}" ]; then
+            printf 'Jira account email: ' >&2
+            local _email=""; IFS= read -r _email </dev/tty || true
+            [ -n "$_email" ] || die "no email entered — nothing was changed"
+            printf 'JIRA_EMAIL="%s"\n' "$_email" >> "$secrets"; JIRA_EMAIL="$_email"; export JIRA_EMAIL
+          fi
+          if [ -z "${JIRA_API_TOKEN:-}" ]; then
+            printf 'Jira API token (stored in %s, gitignored; input hidden): ' "$secrets" >&2
+            local _tok=""; IFS= read -rs _tok </dev/tty || true; printf '\n' >&2
+            [ -n "$_tok" ] || die "no token entered — nothing was changed"
+            printf 'JIRA_API_TOKEN="%s"\n' "$_tok" >> "$secrets"; JIRA_API_TOKEN="$_tok"; export JIRA_API_TOKEN
+          fi
+        else
+          die "JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN missing — add them to $secrets (gitignored) and re-run; nothing was changed"
+        fi
+      fi
+      # Live round-trip: prove the creds work before touching config. /myself is the cheapest
+      # authenticated call; any error/HTML/empty response fails the grep.
+      # shellcheck source=/dev/null
+      . "$target_file"
+      _jira_api GET /rest/api/3/myself 2>/dev/null | grep -q '"accountId"' \
+        || die "Jira API round-trip FAILED (bad creds or network) — nothing was changed"
+      say "✓ Jira API reachable (myself check passed)"
       ;;
   esac
 
@@ -2987,6 +4105,15 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
         # was already stopped in step 1).
         layout_fold_stray_tabs "$ws" "$WORKSPACE_NAME"
 
+        # HERD-114 eyes sweep: flag single-pane drainer/reviewer tabs a crash stranded as a bare shell
+        # (agent process gone, tab+pane persist). INFORMATIONAL ONLY — surfaced for a human, never
+        # auto-closed here (a false close could kill a legitimately-quiet agent tab). Best-effort.
+        local _st_tab _st_label _st_role
+        while IFS="$(printf '\t')" read -r _st_tab _st_label _st_role; do
+          [ -n "$_st_tab" ] || continue
+          warn "stale ${_st_label} tab (${_st_role} — agent session dead) left by a crash: tab ${_st_tab} · retire with 'herdr tab close ${_st_tab}'"
+        done <<< "$(layout_stale_agent_tabs "$ws" 2>/dev/null || true)"
+
         # SNAPSHOT: classify every pane in the coordinator tab by its foreground process (the shared
         # eyes-on-layout scan). The live roster — not the registry — is ground truth. Duplicate
         # backlog viewers (a stale registry once split a SECOND one beside a still-live viewer) are
@@ -4007,6 +5134,12 @@ for comp in sorted(by_component, key=lambda c: -by_component[c]):
 print("By model:")
 for model in sorted(by_model, key=lambda m: -by_model[m]):
     print("  %-18s $%9.4f" % (model, by_model[model]))
+# HERD-151: surface any UNPRICED model explicitly so a foreign/runtime-qualified ref that priced at $0
+# is never read as free. A ?-flagged model id (or a journaled unpriced>0) is the signal.
+_unpriced_models = sorted({m for m in by_model if m.endswith("?")})
+if _unpriced_models or any(fnum(o.get("unpriced", 0)) > 0 for o in rows):
+    print("  [!] unpriced (no price in the cost table, counted at $0): %s"
+          % (", ".join(_unpriced_models) or "see model? flags above"))
 print("")
 print("Total spend recorded:   $%.4f" % grand)
 print("Merged PRs (billed):     %d" % len(merged))
@@ -4060,6 +5193,8 @@ usage: herd fleet <subcommand>
                              when the registry is empty. (herd fleet room --help for details)
   set <KEY> <VALUE>          propagate a policy across the fleet by delegating to each project's own
                              VALIDATED 'herd config set' (e.g. MERGE_POLICY / model tier / TOKEN_MODE)
+  set --profile <file>       apply a GOVERNANCE PROFILE across the fleet (delegates 'herd governance
+                             apply --yes <file>' per project; malformed profile refused per project)
   upgrade                    run 'herd update' in every registered project (per-project outcomes)
   reload                     run 'herd reload' in every registered project (per-project outcomes)
 
@@ -4118,6 +5253,29 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd conformance <report|run>       the capability CONFORMANCE MATRIX — join capabilities.tsv against
+                                        the committed proof map templates/conformance.tsv:
+                                        report [--json]  DETERMINISTIC, no-LLM: every capability with NO
+                                                      proof mapping (gap) + every mapping whose proof_ref
+                                                      no longer exists (rot); non-zero only on rot
+                                        run [--kind unit]  execute the mapped proofs, write
+                                                      conformance.json (capability→verdict→sha→timestamp)
+                                      Fail-soft (absent map = soft note) + report-only (no merge gate)
+  herd governance <export|apply>      export/apply a project's governance as a portable, versioned
+                                        export [--file <path>]  write the governance-scoped config key
+                                                      subset (secrets/machine keys never travel) to a
+                                                      file or stdout
+                                        apply [--yes] <file>    propose each key via the validated
+                                                      'herd config set' (never a blind overwrite; --yes
+                                                      applies all, journaled); malformed → refused,
+                                                      zero writes. Also: herd init --governance <file>,
+                                                      herd fleet set --profile <file>
+  herd governance hooks render        render SESSION-TIME Claude Code hooks from the governance map's
+              [--shared]              hook rows (dual-surface: the same rules the merge gate enforces,
+                                      now blocking at the keyboard). Propose-then-write, per-hook
+                                      accept; merges into .claude/settings.local.json (or
+                                      .claude/settings.json with --shared) preserving existing entries;
+                                      marker-keyed so re-render is idempotent. No hook rows → no-op
   herd reload                         rebuild the control room around the coordinator: stop +
                                       relaunch the watcher (pane visibility verified), ensure
                                       the pinned backlog pane, re-render the coordinator skill;
@@ -4155,10 +5313,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
               [show <#id>]            one item's full detail (state, description, URL)
               [browse]                interactive fzf picker with a live detail preview
                                       (soft-degrades to the plain list without fzf)
-  herd backend switch <name>          guided work-tracker switch (file|github|linear|changelog):
+  herd backend switch <name>          guided work-tracker switch (file|github|linear|jira|changelog):
               [--migrate|--no-migrate]  preflight creds FIRST (linear: prompts for the API key on
-                                      a tty → .herd/secrets + live viewer{} check; github: gh
-                                      auth) — a failed preflight changes nothing; then flips
+                                      a tty → .herd/secrets + live viewer{} check; jira: prompts
+                                      for base URL/email/token → .herd/secrets + live /myself
+                                      check; github: gh auth) — a failed preflight changes
+                                      nothing; then flips
                                       SCRIBE_BACKEND via config set, optionally replays the old
                                       backend's open items into the new one (idempotent), stamps
                                       a frozen-archive banner on BACKLOG.md when leaving the file
@@ -4217,6 +5377,8 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  conformance) shift; cmd_conformance "$@" ;;
+  governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;

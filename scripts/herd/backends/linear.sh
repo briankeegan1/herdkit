@@ -409,6 +409,45 @@ EOF
     _backend_tw_journal "$ref" "$want" "$_BACKEND_RESULT"
 }
 
+_backend_amend() {
+    # $1 = item ref (Linear identifier e.g. HERD-22, a leading '#' tolerated — or a title phrase when
+    # no identifier is present); $2 = the note to post.
+    # HERD-128 AMEND: attach a clarification/comment to an EXISTING issue via commentCreate — first-
+    # class, WITHOUT touching its workflow state or title. Reuses the same issues(filter:) resolution
+    # as _backend_update_state (issueSearch was deprecated/removed by Linear 2026-07). Conservative:
+    # resolve to EXACTLY ONE issue (identifier, or a UNIQUE title match) — zero/ambiguous → NOCHANGE +
+    # a LOUD reason (skip-over-guess), nothing posted. Sets _BACKEND_RESULT=DONE|NOCHANGE.
+    local ref="$1" note="$2" resp issue_id ok
+    _BACKEND_RESULT="NOCHANGE"
+    _linear_require_key
+    if _linear_issue_query "$ref" "id identifier"; then
+        resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"          # identifier path (HERD-22 → number+team)
+    else
+        resp="$(_linear_resolve_by_title "$ref" started)"       # conservative title match (first:2 → unique-only)
+    fi
+    # Require EXACTLY ONE matching node — uniqueness IS the conservatism, mirroring _backend_update_state.
+    issue_id="$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+print(nodes[0].get("id", "") if len(nodes) == 1 else "")' 2>/dev/null)"
+    if [ -z "$issue_id" ]; then
+        echo "linear backend: no unique issue matching '$ref' — nothing to amend (skipping, not posting)" >&2
+        _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution (records the attempt)
+        return 0
+    fi
+    ok="$(_linear_gql 'mutation Amend($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) { success }
+}' "$(ID="$issue_id" BODY="$note" python3 -c 'import os, json
+print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" 2>/dev/null \
+      | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print("1" if (((d.get("data") or {}).get("commentCreate") or {}).get("success")) else "0")' 2>/dev/null)"
+    [ "$ok" = "1" ] && _BACKEND_RESULT="DONE"
+    _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution
+}
+
 _backend_list_open() {
     # Print open issues (any state whose type is not completed/canceled) as one
     # "#<identifier> <title>" line each — the same shape the file/github backends emit.
@@ -542,23 +581,30 @@ if meta:
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
     # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)
-    # and reads state.type, setting ITEM_STATE=open|closed|in-progress.
+    # and reads state.type, setting ITEM_STATE=open|closed|in-progress. Also sets ITEM_UPDATED to the
+    # issue's last-updated day (YYYY-MM-DD, best-effort — empty if absent), used by the HERD-117 claim
+    # guard as evidence when it refuses a stale (Done/Canceled) pick.
     # Linear state types: completed/canceled → closed; started → in-progress; all others → open.
-    local ref="$1" slug resp stype
+    local ref="$1" slug resp parsed stype
     _linear_require_key
     slug="${ref#*#}"
-    if ! _linear_issue_query "$slug" 'state { type }'; then
+    ITEM_UPDATED=""
+    if ! _linear_issue_query "$slug" 'state { type } updatedAt'; then
         ITEM_STATE="open"
         return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
-    stype="$(printf '%s' "$resp" | python3 -c '
+    # Emit "<type>\t<updated-day>" so a single parse yields both the state class and the evidence stamp.
+    parsed="$(printf '%s' "$resp" | python3 -c '
 import sys, json
 try:    d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
-print(nodes[0].get("state", {}).get("type", "") if nodes else "")
-' 2>/dev/null || printf '')"
+n = nodes[0] if nodes else {}
+print("%s\t%s" % ((n.get("state") or {}).get("type", ""), (n.get("updatedAt") or "")[:10]))
+' 2>/dev/null || printf '\t')"
+    stype="${parsed%%$'\t'*}"
+    ITEM_UPDATED="${parsed#*$'\t'}"
     case "$stype" in
         completed|canceled|cancelled) ITEM_STATE="closed"      ;;
         started)                      ITEM_STATE="in-progress" ;;

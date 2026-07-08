@@ -70,9 +70,16 @@ SMOKE_STEP=""
 RESULT_STEP=""
 [ -n "${HERD_RESOLVE_RESULT_FILE:-}" ] && RESULT_STEP=" (6) RESULT FILE — as your VERY LAST act, record your outcome for the watcher: on a clean green push write the single line 'RESOLVE: DONE' to $HERD_RESOLVE_RESULT_FILE; on an escalation write 'RESOLVE: ESCALATE' to $HERD_RESOLVE_RESULT_FILE instead. Write it exactly once, at the end."
 TASK="You are a CONFLICT RESOLVER for one feature worktree. Goal: make this branch cleanly mergeable into the default branch WITHOUT changing either side's intent. Steps: (1) git fetch $HERD_REMOTE; merge $DEFAULT_BRANCH into this branch (git merge $DEFAULT_BRANCH). (2) If there are conflicts, resolve them PRESERVING BOTH sides' intent — mechanical conflicts (imports, adjacent edits, a helper that moved/was extracted, formatting) you resolve directly. (3) After resolving, run ${SMOKE_STEP}bash $HERE/healthcheck.sh on this worktree ($DIR); both must pass. (4) If everything resolves cleanly AND the checks are green AND you are confident the merge preserved both intents: commit the merge and git push (normal push to the feature branch, NEVER force, NEVER push to $HERD_BRANCH_NAME). The PR will then flip to CLEAN and the auto-merge watcher will merge it. (5) ESCALATION — if any conflict is SEMANTICALLY AMBIGUOUS (the same function/logic was changed two different ways and the correct combined result is unclear), DO NOT GUESS: abort the merge (git merge --abort), post a PR comment via gh pr comment summarizing both sides and what needs a human decision, print a clear line starting with 'ESCALATE:' explaining the ambiguity, and STOP.${RESULT_STEP} Never edit $BACKLOG_FILE. Never touch $HERD_BRANCH_NAME directly."
-herd_driver_launch_agent \
+# HERD-136: guard the launch so a failed agent start never aborts the lane leaving the tab created at
+# step 2 as an empty corpse tab that nothing reaps. Close it on the failure path before bailing.
+if ! herd_driver_launch_agent \
   name="resolve·$SLUG" workspace="$_WS_ID" cwd="$DIR" tab="$TAB" split=right \
-  model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK"
+  model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK"; then
+  herdr tab close "$TAB" >/dev/null 2>&1 || true
+  command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason spawn_agent_failed tab "$TAB"
+  echo "❌ herdr: could not start the resolver agent for '$SLUG' — closed the empty tab; worktree is at $DIR." >&2
+  exit 1
+fi
 
 # 4. LEFT pane (the tab's root): live app preview on a free port — only when configured.
 PORT=""

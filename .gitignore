@@ -19,6 +19,11 @@
 # WORKTREES_DIR/.herd/ (covered by *-trees/, but named explicitly for a .herd-inside-the-tree layout).
 .herd/ledger.jsonl
 
+# Conformance run artifact (HERD-144) — `herd conformance run` writes this machine-local, regenerable
+# scorecard (capability→verdict→sha→timestamp). Never committed; the committed proof map is
+# templates/conformance.tsv, this is only the per-run verdict output.
+.herd/conformance.json
+
 # machine-local Claude Code state — never committed.
 .claude/settings.local.json
 .claude/settings.json

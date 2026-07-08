@@ -12,11 +12,21 @@
 #   • Runs the claim ONLY when CLAIM_REQUIRED is on AND a tracker id is present (HERD_CLAIM_ID, else
 #     the HERD_ITEM_REF the coordinator already threads). Otherwise returns 0 immediately — a no-id
 #     or disabled spawn is byte-for-byte today's behavior (the async scribe still marks it in-progress).
+#   • CLAIM GUARD (HERD-117): BEFORE claiming, it reads the item's CURRENT tracker state. A Done/Canceled
+#     item is a STALE pick — claiming it would silently REOPEN a shipped item (the 2026-07-08 double-build:
+#     a second operator's stale pick reclaimed HERD-55 minutes after it merged, flipping Done → In Progress
+#     and spawning a duplicate PR that arrived already conflicting). So a closed item is REFUSED loudly
+#     (evidence + a re-ground pointer), journaled as claim_refused reason=already-done, and the lane aborts
+#     — the claim path NEVER transitions Done → In Progress (a reopen is a coordinator/scribe act only).
+#     HERD_FORCE_SPAWN=1 is the deliberate, journaled override: build against the closed item anyway WITHOUT
+#     reclaiming it (the tracker item stays closed). Fail-soft: a state that cannot be read falls through to
+#     today's claim behavior with a journal note, so tracker flakiness never blocks a legitimate spawn.
 #   • On a definitive "already claimed by another identity" it prints a LOUD abort and returns NON-ZERO,
 #     so the lane exits before creating a worktree or agent.
 #   • On our own successful claim, a self-claim (re-spawn of our own item), or a FAIL-SOFT backend error
 #     (backend unreachable / no claim op / no such item) it returns 0 and the lane proceeds. Never
 #     hard-block a solo operator on a backend hiccup.
+#   • Byte-identical behavior for a claim on a genuinely OPEN item (the added state read is read-only).
 #
 # The claim itself is delegated to the active SCRIBE_BACKEND's _backend_claim_item op (backends/*.sh),
 # sourced in a SUBSHELL so the _backend_* helpers never leak into the lane's namespace — the same
@@ -73,6 +83,43 @@ _herd_claim_dispatch() {
   )
 }
 
+# _herd_state_dispatch <id> — read the item's CURRENT tracker state via the active backend's read-only
+# _backend_item_state op, sourced in a SUBSHELL with the same namespace/secrets discipline as
+# _herd_claim_dispatch (the _backend_* helpers never leak into the lane). Prints "<STATE>\t<UPDATED>" on
+# stdout where STATE ∈ open|closed|in-progress and UPDATED is a best-effort last-updated stamp (may be
+# empty — not every backend exposes one). A backend that cannot be sourced, defines no state op, or errors
+# maps to a bare "UNREADABLE" (no tab) so the caller fails soft and falls through to today's claim path.
+_herd_state_dispatch() {
+  local id="$1" bdir bfile
+  bdir="${SCRIBE_BACKEND_DIR:-$_HERD_CLAIM_DIR/backends}"
+  bfile="$bdir/${SCRIBE_BACKEND:-file}.sh"
+  if [ ! -f "$bfile" ]; then printf 'UNREADABLE'; return 0; fi
+  (
+    # API-backend credentials live in .herd/secrets (gitignored); file/changelog need none.
+    if [ -n "${PROJECT_ROOT:-}" ] && [ -f "$PROJECT_ROOT/.herd/secrets" ]; then
+      # shellcheck source=/dev/null
+      . "$PROJECT_ROOT/.herd/secrets"
+    fi
+    # shellcheck source=/dev/null
+    . "$bfile" 2>/dev/null || { printf 'UNREADABLE'; exit 0; }
+    command -v _backend_item_state >/dev/null 2>&1 || { printf 'UNREADABLE'; exit 0; }
+    [ -n "${PROJECT_ROOT:-}" ] && cd "$PROJECT_ROOT" 2>/dev/null
+    ITEM_STATE=""; ITEM_UPDATED=""
+    _backend_item_state "$id" 2>/dev/null || { printf 'UNREADABLE'; exit 0; }
+    [ -n "${ITEM_STATE:-}" ] || { printf 'UNREADABLE'; exit 0; }
+    printf '%s\t%s' "$ITEM_STATE" "${ITEM_UPDATED:-}"
+  )
+}
+
+# _herd_force_spawn — is the deliberate HERD_FORCE_SPAWN override in effect? Same truthy set the other
+# lanes/gates honor (herd-config.sh, herd-spawn-gate.sh). Returns 0 (forced) / 1 (not).
+_herd_force_spawn() {
+  case "${HERD_FORCE_SPAWN:-}" in
+    1|true|yes|on|ON|On) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # herd_claim_or_abort <slug> — the lane-facing entry point. See the header contract. Returns 0 to
 # PROCEED, non-zero to ABORT the spawn.
 herd_claim_or_abort() {
@@ -87,6 +134,35 @@ herd_claim_or_abort() {
   id="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
   [ -n "$id" ] || return 0
   who="$(_herd_claim_identity)"; [ -n "$who" ] || who="unknown-operator"
+
+  # ── CLAIM GUARD (HERD-117): never claim (and so never reopen) a Done/Canceled item ──────────────────
+  # Read the item's CURRENT state up front. A closed item is a stale pick — refuse LOUDLY with evidence
+  # + a re-ground pointer, journal it, and abort the spawn, so the claim below never flips Done → In
+  # Progress. HERD_FORCE_SPAWN=1 builds against it anyway WITHOUT reclaiming (the item stays closed).
+  # Fail-soft: an unreadable state journals a note and falls through to today's claim path — an OPEN item
+  # is byte-for-byte unchanged (this read is read-only).
+  local sparsed sstate supdated
+  sparsed="$(_herd_state_dispatch "$id")"
+  sstate="${sparsed%%$'\t'*}"
+  case "$sparsed" in *$'\t'*) supdated="${sparsed#*$'\t'}" ;; *) supdated="" ;; esac
+  case "$sstate" in
+    closed)
+      if _herd_force_spawn; then
+        echo "⚠️  $id is Done/Canceled, but HERD_FORCE_SPAWN=1 — building '$slug' anyway WITHOUT reclaiming it (the tracker item stays closed; reopening is a coordinator/scribe act)." >&2
+        journal_append claim_forced ref "$id" reason already-done state "$sstate" who "$who" slug "$slug"
+        return 0
+      fi
+      echo "🛑 refusing to claim $id — it is already Done/Canceled${supdated:+ (last updated $supdated)}; a shipped item must NOT be silently reopened, NOT spawning '$slug' (no worktree, no agent)." >&2
+      echo "    Your pick is stale — re-ground it against \`herd backlog\` (the item was almost certainly shipped since you read the queue)." >&2
+      echo "    To build against it deliberately anyway — without reopening it — re-run with HERD_FORCE_SPAWN=1 (a journaled override)." >&2
+      journal_append claim_refused ref "$id" reason already-done state "$sstate" who "$who" slug "$slug"
+      return 1 ;;
+    open|in-progress)
+      : ;;   # genuinely open (or already started) → proceed to the claim exactly as before
+    *)
+      # UNREADABLE / anything unexpected → fail soft: note it and let the claim below run today's path.
+      journal_append claim_state_unreadable ref "$id" backend "${SCRIBE_BACKEND:-file}" slug "$slug" ;;
+  esac
 
   parsed="$(_herd_claim_dispatch "$id" "$who")"
   result="${parsed%%$'\t'*}"; owner="${parsed#*$'\t'}"
