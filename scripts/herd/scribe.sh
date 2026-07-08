@@ -15,6 +15,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # HERD_DRIVER=headless spawns a detached scribe; herdr-claude emits the identical argv below.
 # shellcheck source=/dev/null
 . "$HERE/driver.sh"
+# Drainer singleton liveness (HERD-109): herd_drainer_hung lets the singleton check below tell a
+# HUNG-but-listed drainer from a live one, so a wedged drainer can't block the queue forever.
+# shellcheck source=/dev/null
+. "$HERE/drainer-liveness.sh"
 REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
@@ -66,7 +70,18 @@ sys.exit(0 if any(
   x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
   for x in json.load(sys.stdin)["result"]["agents"]
 ) else 1)'; then
-  echo "✍️  scribe already running — it will drain this."; exit 0
+  # A drainer of this name is LISTED. Normally we short-circuit (it will drain this). But a listed
+  # drainer can be HUNG (wedged claude session / stuck step): its heartbeat ($HEARTBEAT, written by
+  # scribe-step.sh on every drain step) goes stale. If it is stale beyond DRAINER_HEARTBEAT_TIMEOUT,
+  # RECLAIM the singleton and fall through to spawn a fresh drainer (HERD-109) — the queue's atomic
+  # per-request claim keeps this from double-draining. Heartbeat fresh (or feature off / absent
+  # heartbeat) → the exact legacy path, byte-identical.
+  HEARTBEAT="$TREES/.scribe.heartbeat"
+  if herd_drainer_hung "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT"; then
+    echo "⚠️  scribe drainer appears HUNG (no heartbeat for >${DRAINER_HEARTBEAT_TIMEOUT}s) — reclaiming the singleton and spawning a fresh drainer (per-request atomic claim prevents double-draining)."
+  else
+    echo "✍️  scribe already running — it will drain this."; exit 0
+  fi
 fi
 
 # 4. Otherwise spawn the single drainer. The prompt is BACKEND-AGNOSTIC (issue #139): it is emitted

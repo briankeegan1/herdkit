@@ -16,13 +16,21 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed researcher drainer can
+# be detected and reclaimed by research.sh. Best-effort; never affects this script's stdout.
+. "$HERE/drainer-liveness.sh"
 TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
 REPORTS="${RESEARCH_REPORTS:-$TREES/research-reports}"
 INBOX="${RESEARCH_INBOX:-$TREES/.research-reports}"
 POLL="${RESEARCH_POLL:-25}"
+# Liveness heartbeat file for THIS project's researcher drainer (HERD-109). research.sh reads the SAME
+# path to tell a hung drainer from a live one. Beat once here so EVERY subcommand is a progress signal,
+# and again each poll-loop iteration below so a long poll stays fresh.
+HEARTBEAT="${RESEARCH_HEARTBEAT:-$TREES/.research.heartbeat}"
 mkdir -p "$Q"
 cmd="${1:-}"
+herd_drainer_heartbeat "$HEARTBEAT"
 
 case "$cmd" in
   next)
@@ -48,6 +56,7 @@ case "$cmd" in
       fi
       [ "$waited" -ge "$POLL" ] && { echo "EMPTY"; exit 0; }
       sleep 2; waited=$((waited+2))
+      herd_drainer_heartbeat "$HEARTBEAT"   # keep the beat fresh across a long poll wait
     done
     ;;
   report)
