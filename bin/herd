@@ -5037,6 +5037,22 @@ for o in rows:
 '
 }
 
+# ── herd approve: first-class front door for scripts/herd/herd-approve.sh (HERD-200) ────────────
+# Approval was the one operator verb with no `herd` alias: `herd approve 294` printed the top-level
+# help, so an operator had to type the full `bash scripts/herd/herd-approve.sh approve 294` path.
+# This is a pure DISPATCH alias — no approval logic lives here, the script stays the single source
+# of truth for the ledgers. The args are handed over verbatim, except that a first arg which is not
+# one of the script's own verbs is taken to be the argument of `approve` (that bare `herd approve
+# <pr#|slug>` form is the papercut being fixed). No args → the script's own default, `list`.
+cmd_approve() {
+  case "${1:-}" in
+    ''|list|approve|why|override) : ;;
+    -h|--help) say "usage: herd approve [<pr#|slug> [--sha <sha>] | list | why <pr#> | override <pr#>]"; return 0 ;;
+    *) set -- approve "$@" ;;
+  esac
+  bash "$SCRIPTS_DIR/herd-approve.sh" "$@"
+}
+
 # cmd_cost — the token/cost READER: aggregate the journal's `cost` events (written by the watcher
 # at merge time via scripts/herd/cost.sh) into per-PR cost, cost-per-merged-PR, and running totals
 # by component + model. READ-ONLY. `herd cost` shows the full rollup; `herd cost --pr N` drills into
@@ -5657,6 +5673,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
+  herd approve [<pr#|slug>] [--sha <sha>]
+                                      the approval front door under MERGE_POLICY=approve (an alias
+                                      for scripts/herd/herd-approve.sh — same records, same watcher):
+                                        <pr#|slug>          approve the sha currently held for a PR,
+                                                            or resume a pre-push / pipeline-step hold;
+                                                            --sha pins it to the commit you reviewed
+                                        list (default)      what is awaiting approval, with verdicts
+                                        why <pr#>           the review verdict + block reason for a PR
+                                        override <pr#>      record a human override of a cached BLOCK
   herd cost [--pr N] [--full]         aggregate the journal's token/cost events (measured per builder
                                       + review at merge time): per-PR cost, cost-per-merged-PR, and
                                       running totals by component + model; --pr N drills into one PR.
@@ -5750,6 +5775,7 @@ case "${1:-help}" in
   log)     shift; cmd_log "$@" ;;
   status)  shift; cmd_status "$@" ;;
   why)     shift; cmd_why "$@" ;;
+  approve) shift; cmd_approve "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   update)  shift; cmd_update "$@" ;;

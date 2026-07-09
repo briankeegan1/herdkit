@@ -67,6 +67,7 @@ herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
 herd update [--force]	unit	tests/test-cli-update.sh
 herd log [--pr N] [--tail]	unit	tests/test-journal.sh
 herd why <pr#>	unit	tests/test-journal.sh
+herd approve [<pr#|slug>] [--sha <sha>]	unit	tests/test-cli-approve.sh
 herd status	unit	tests/test-status.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
 herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
