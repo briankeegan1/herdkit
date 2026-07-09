@@ -428,6 +428,102 @@ BROKEN
   fi
 fi
 
+# ── cross-seat BLOCK precedence (HERD-247): one seat's BLOCK outranks another seat's PASS ────────
+# The gate phases above prove a BROKEN change never merges. This phase proves the OTHER failure class,
+# the one PR #343 hit on 2026-07-09: a change that THIS seat's gates call green, while ANOTHER seat's
+# reviewer has a standing correctness BLOCK on the very same sha. Each seat's review ledger is local, so
+# only the SHARED artifacts (the herd/gates commit status + the PR's comments) can see the conflict.
+# We drive the REAL guard from scripts/herd/agent-watch.sh (AGENT_WATCH_LIB=1) with `gh` stubbed to
+# serve a seeded foreign-BLOCK comment fixture, and assert the scenario ends HELD: no blessing posted,
+# the merge held behind the loud reconcile row — and that the blocking seat's own later PASS releases it.
+step cross-seat-block "herd/gates BLOCK precedence — a foreign BLOCK outranks our PASS until resolved"
+WATCH_SH="$HERE/../agent-watch.sh"
+if [ ! -f "$WATCH_SH" ]; then
+  checkpoint cross_seat_block_lib skip "agent-watch.sh not found at $WATCH_SH — cross-seat phase skipped"
+else
+  XS="$ART/xseat"; mkdir -p "$XS/bin" "$XS/trees"
+  # gh stub: the two shared artifacts the guard reads, plus the statuses WRITE it must not perform.
+  # Every invocation is logged, so "was a blessing posted?" is an observable fact, not an inference.
+  cat > "$XS/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then cat "$GH_COMMENTS_FILE"; exit 0; fi
+url=""; prev=""
+for a in "$@"; do [ "$prev" = "api" ] && { url="$a"; break; }; prev="$a"; done
+case "$url" in
+  */commits/*/statuses) printf '' ;;                       # no herd/gates status on the sha yet
+  */commits/*)          printf '2026-07-09T16:10:00Z' ;;   # when the head sha landed
+  */statuses/*)         exit 0 ;;                          # the blessing WRITE (must never happen held)
+  *)                    exit 0 ;;
+esac
+GHSTUB
+  chmod +x "$XS/bin/gh"
+  # Driver: source the watcher in lib mode, run the REAL guard, then the REAL setter, and report
+  # STANDING/SEAT/BLESSED as three plain lines. $1=comments fixture $2=gh log $3=trees $4=journal.
+  cat > "$XS/driver.sh" <<'XSDRV'
+#!/usr/bin/env bash
+set -u
+export PATH="$5/bin:$PATH" GH_COMMENTS_FILE="$1" GH_LOG="$2"
+export AGENT_WATCH_LIB=1 HERD_DRIVER=headless NO_COLOR=1
+export WORKTREES_DIR="$3" JOURNAL_FILE="$4" HERD_CONFIG_FILE="$3/.no-such-config"
+export WATCHER_OWNER="seat-b"     # THIS seat: the one whose gates are green
+export _XSEAT_MEMO_TTL=0          # no stale memo across the two legs of this driver
+# shellcheck source=/dev/null
+. "$6" >/dev/null 2>&1 || { echo "SRC_FAIL"; exit 3; }
+if _cross_seat_block_standing 343 simsha; then
+  printf 'STANDING=yes\nSEAT=%s\nROW=%s\n' "$_XSEAT_SEAT" "$(_cross_seat_block_row "sim" " #343 ·" "$_XSEAT_SEAT")"
+else
+  printf 'STANDING=no\nSEAT=\nROW=\n'
+fi
+post_gate_status 343 simsha success
+if grep -q 'statuses/simsha' "$GH_LOG" 2>/dev/null; then printf 'BLESSED=yes\n'; else printf 'BLESSED=no\n'; fi
+XSDRV
+  # xs_drive <comments-json> — run one leg against a fresh gh log + journal; echo the driver's report.
+  xs_drive() {
+    : > "$XS/gh.log"; : > "$XS/journal.jsonl"; rm -f "$XS/trees/.agent-watch-gate-status"
+    bash "$XS/driver.sh" "$1" "$XS/gh.log" "$XS/trees" "$XS/journal.jsonl" "$XS" "$WATCH_SH" 2>/dev/null
+  }
+  # Leg 1 — seat-a BLOCKs simsha at 16:19Z; seat-b (us) PASSes it at 16:23Z. Exactly the #343 shape.
+  cat > "$XS/held.json" <<'XSJSON'
+{"comments": [
+  {"author": {"login": "seat-a"}, "createdAt": "2026-07-09T16:19:00Z",
+   "body": "REVIEW: **BLOCK** — rule: safety-rail bypass | why: a limit-parked resolver reads idle | location: agent-watch.sh"},
+  {"author": {"login": "seat-b"}, "createdAt": "2026-07-09T16:23:00Z",
+   "body": "**Pre-merge correctness review — PASS (no blocking findings).**"}
+]}
+XSJSON
+  XS_HELD="$(xs_drive "$XS/held.json")"
+  _xs_get() { printf '%s\n' "$1" | grep "^$2=" | head -1 | cut -d= -f2- ; }
+  if [ "$(_xs_get "$XS_HELD" STANDING)" = "yes" ] && [ "$(_xs_get "$XS_HELD" SEAT)" = "seat-a" ] \
+     && printf '%s' "$XS_HELD" | grep -q 'cross-seat BLOCK · needs reconcile'; then
+    checkpoint cross_seat_block_held pass "our PASS did NOT overwrite seat-a's standing BLOCK: scenario ends HELD with the reconcile row"
+  else
+    checkpoint cross_seat_block_held fail "a standing foreign BLOCK was not honored (report: $(printf '%s' "$XS_HELD" | tr '\n' ' '))"
+  fi
+  if [ "$(_xs_get "$XS_HELD" BLESSED)" = "no" ] && grep -q cross_seat_block_honored "$XS/journal.jsonl" 2>/dev/null; then
+    checkpoint cross_seat_block_no_bless pass "no herd/gates=success posted over the standing BLOCK; cross_seat_block_honored journaled"
+  else
+    checkpoint cross_seat_block_no_bless fail "a blessing leaked, or the honored event was not journaled (blessed=$(_xs_get "$XS_HELD" BLESSED))"
+  fi
+  # Leg 2 — RESOLUTION on an existing surface: the BLOCKING seat re-reviews the same sha to PASS.
+  cat > "$XS/resolved.json" <<'XSJSON'
+{"comments": [
+  {"author": {"login": "seat-a"}, "createdAt": "2026-07-09T16:19:00Z",
+   "body": "REVIEW: **BLOCK** — rule: safety-rail bypass | why: a limit-parked resolver reads idle | location: agent-watch.sh"},
+  {"author": {"login": "seat-b"}, "createdAt": "2026-07-09T16:23:00Z",
+   "body": "**Pre-merge correctness review — PASS (no blocking findings).**"},
+  {"author": {"login": "seat-a"}, "createdAt": "2026-07-09T17:05:00Z",
+   "body": "REVIEW: PASS — the addressed sha now honors the limit-park check."}
+]}
+XSJSON
+  XS_OK="$(xs_drive "$XS/resolved.json")"
+  if [ "$(_xs_get "$XS_OK" STANDING)" = "no" ] && [ "$(_xs_get "$XS_OK" BLESSED)" = "yes" ]; then
+    checkpoint cross_seat_block_resolved pass "the blocking seat's later PASS on the same sha released the hold — the blessing posts and the merge proceeds"
+  else
+    checkpoint cross_seat_block_resolved fail "resolution did not release the hold (report: $(printf '%s' "$XS_OK" | tr '\n' ' '))"
+  fi
+fi
+
 # ── push-gate (HERD-123): PUSH_GATE=human — hold BEFORE push, approve to resume push + PR ────────
 # Proves the seam the item exists for, driving the REAL push-gate.sh + herd-approve.sh entry points
 # against a throwaway fixture with a LOCAL bare 'origin' remote (so a real `git push` works with no

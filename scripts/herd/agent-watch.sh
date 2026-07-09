@@ -2336,6 +2336,14 @@ post_gate_status() {
   case "$state" in success) ;; *) return 0 ;; esac
   _gate_status_posted "$pr" "$sha" "$state" && return 0
   [ -n "$DRYRUN" ] && return 0
+  # SETTER GUARD (HERD-247): never bless a sha another seat is still blocking, and never overwrite a
+  # foreign herd/gates=failure with our success. Runs AFTER the ledger/dry-run short-circuits, so it
+  # costs its (memoized) reads only on the one tick that would actually write the blessing. Called
+  # directly — a subshell would discard the memo. See _cross_seat_block_standing.
+  if _cross_seat_block_standing "$pr" "$sha"; then
+    _xseat_journal_honored "$pr" "$sha" "$_XSEAT_SEAT" setter
+    return 0
+  fi
   [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
   if gh api "repos/{owner}/{repo}/statuses/$sha" -f state="$state" -f context="$GATE_STATUS_CONTEXT" -f description="$desc" >/dev/null 2>&1; then
     _record_gate_status "$pr" "$sha" "$state"
@@ -2354,6 +2362,178 @@ _gate_status_blessed() {
   state="$(gh api "repos/{owner}/{repo}/commits/$sha/statuses" \
              --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0].state" 2>/dev/null || true)"
   [ "$state" = "success" ]
+}
+
+# ── cross-seat BLOCK precedence (HERD-247) ───────────────────────────────────────────────────────
+# INCIDENT (PR #343, 2026-07-09 16:19-16:25Z): two seats gated the same PR concurrently. One seat's
+# reviewer posted a correctness BLOCK; minutes later the OTHER seat's reviewer posted a PASS, that
+# seat's watcher blessed the sha and merged over the standing BLOCK. A BLOCK from ANY seat must be
+# TERMINAL for that sha until it is RESOLVED — a second seat's PASS is a second opinion, not a
+# resolution. The review ledger cannot see this: it is per-seat local state, so each watcher only ever
+# knows its OWN verdict. Both guards below therefore read only artifacts EVERY seat already writes —
+# the herd/gates commit status and the PR's comments. No new substrate, no new config key.
+#
+#   SETTER GUARD  post_gate_status refuses to bless a sha carrying a standing foreign BLOCK.
+#   MERGE GUARD   the merge-eligibility path holds the PR before `gh pr merge`, with a loud row.
+#
+# WHY NO `failure` STATUS IS POSTED. Posting herd/gates=failure on the standing-BLOCK sha would break
+# the SUCCESS-ONLY invariant documented above, and it would strand the PR PERMANENTLY: a non-passing
+# status flips a CLEAN sha to mergeStateStatus=UNSTABLE in the default unprotected config, and UNSTABLE
+# is neither CLEAN (drops out of the candidate loop) nor BLOCKED (not gate-eligible via
+# _gate_bless_eligible) — so after the blocking seat reconciles, NO seat can re-enter the loop to
+# overwrite the status back to success. The fail-safe never needed it: WITHHOLDING success already
+# leaves the PR unmergeable under `require herd/gates` protection, and the MERGE GUARD holds it in the
+# unprotected config. The other half IS honored — an existing herd/gates=failure written by another
+# seat is KEPT, never overwritten with our success.
+#
+# RESOLUTION flows through existing surfaces only: the blocking seat posts a NEWER verdict comment for
+# the same sha reading PASS, or a human records the sha-keyed override (`herd-approve.sh override`). A
+# new commit is a new sha and carries no verdict at all, so it starts clean.
+#
+# FAIL-SOFT: an unreadable commit/status/comment list, or an unresolvable seat identity, journals
+# `cross_seat_block_scan state=degraded` and reports NO standing block — today's behavior, never a
+# false hold. With no foreign status and no foreign verdict comment the surface is byte-identical.
+
+# The verdict classifier. Reads `gh pr view --json comments` JSON on stdin; argv = <since-iso> <me>.
+# A comment is a VERDICT comment when its first non-empty line — stripped of markdown emphasis, because
+# real reviewers post `REVIEW: **BLOCK** — …` and `**PASS — no correctness bug found.**` — contains the
+# whole word BLOCK or PASS (BLOCK wins; a BLOCK's prose may mention passing). Everything else (the
+# watcher's own 🐑/🔁 rows, a human's prose) is not a verdict and is ignored. Only comments created at or
+# after the head sha landed count, which is what keys a verdict to a sha: GitHub comments carry no sha.
+# Per foreign seat we keep only its LATEST verdict, so a blocking seat's newer PASS resolves its BLOCK.
+# Exit 0 + prints the (lexically first) blocking seat's login · 1 = no standing block · 2 = degraded.
+_XSEAT_PY='import json,sys,re
+since, me = sys.argv[1], sys.argv[2]
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(2)
+if not isinstance(d, dict): sys.exit(2)
+latest = {}
+for c in (d.get("comments") or []):
+    login = ((c.get("author") or {}).get("login") or "")
+    when = c.get("createdAt") or ""
+    if not login or not when or login == me or when < since: continue
+    first = ""
+    for ln in (c.get("body") or "").splitlines():
+        s = re.sub("[*`_#>]", "", ln).strip()
+        if s:
+            first = s
+            break
+    if re.search(r"\bBLOCK\b", first): v = "BLOCK"
+    elif re.search(r"\bPASS\b", first): v = "PASS"
+    else: continue
+    prev = latest.get(login)
+    if prev is None or when >= prev[0]: latest[login] = (when, v)
+blockers = sorted(l for l, (w, v) in latest.items() if v == "BLOCK")
+if blockers:
+    sys.stdout.write(blockers[0])
+    sys.exit(0)
+sys.exit(1)'
+
+# _gate_status_current <sha> — the CURRENT herd/gates status for the sha as "<state> <creator-login>"
+# (either field may be empty). Same newest-first read as _gate_status_blessed, one extra field: WHO
+# wrote it, so a failure posted by another seat is distinguishable from one of ours. Fail-soft: empty.
+_gate_status_current() {
+  [ -n "${1:-}" ] || return 0
+  gh api "repos/{owner}/{repo}/commits/$1/statuses" \
+    --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0] | \"\(.state // \"\") \(.creator.login // \"\")\"" 2>/dev/null || true
+}
+
+# _xseat_foreign_block <pr#> <sha> <me> — scan the PR's comments for a standing BLOCK from another seat
+# on THIS sha. Prints the blocking seat's login. rc: 0 standing · 1 none · 2 degraded (unreadable).
+_xseat_foreign_block() {
+  local pr="$1" sha="$2" me="$3" since json out rc
+  since="$(gh api "repos/{owner}/{repo}/commits/$sha" --jq '.commit.committer.date' 2>/dev/null || true)"
+  case "$since" in ''|null) return 2 ;; esac
+  json="$(gh pr view "$pr" --json comments 2>/dev/null || true)"
+  [ -n "$json" ] || return 2
+  out="$(printf '%s' "$json" | python3 -c "$_XSEAT_PY" "$since" "$me" 2>/dev/null)"; rc=$?
+  case "$rc" in 0) printf '%s' "$out" ;; 1|2) ;; *) rc=2 ;; esac
+  return "$rc"
+}
+
+# _xseat_note_once <key> — true the FIRST time this process sees <key>. Keeps the per-tick guard from
+# re-journaling the same (pr,sha) event every 4s while a PR sits held; the console row still renders.
+_XSEAT_NOTED=""
+_xseat_note_once() {
+  case " $_XSEAT_NOTED " in *" $1 "*) return 1 ;; esac
+  _XSEAT_NOTED="$_XSEAT_NOTED $1"
+  return 0
+}
+
+# _cross_seat_block_standing <pr#> <sha> — THE shared check both guards run. Returns 0 when a standing
+# foreign BLOCK exists for (pr,sha) and sets $_XSEAT_SEAT to the blocking seat's login; non-zero (and
+# an empty $_XSEAT_SEAT) otherwise. MUST be called DIRECTLY, never in a `$()` subshell — the memo and
+# $_XSEAT_SEAT would be discarded. Checks, cheapest first:
+#   1. sha-keyed human override recorded → resolved, no hold (the documented human out).
+#   2. herd/gates=failure written by ANOTHER seat → standing (we never post failure, so it is foreign).
+#   3. a foreign seat whose LATEST verdict comment for this sha is BLOCK → standing.
+# The network reads are memoized per (pr,sha) for $_XSEAT_MEMO_TTL seconds so a held PR costs at most
+# one scan per minute, not one per 4s tick — a resolution is honored within that window.
+: "${_XSEAT_MEMO_TTL:=60}"
+_XSEAT_MEMO_KEY=""; _XSEAT_MEMO_TS=0; _XSEAT_MEMO_SEAT=""; _XSEAT_MEMO_RC=1
+_XSEAT_SEAT=""
+_cross_seat_block_standing() {
+  local pr="$1" sha="$2" me now rc cur st creator seat frc
+  _XSEAT_SEAT=""
+  [ -n "$pr" ] && [ -n "$sha" ] || return 1
+  now="$(date +%s)"
+  if [ "$_XSEAT_MEMO_KEY" = "$pr $sha" ] && [ "$(( now - _XSEAT_MEMO_TS ))" -lt "$_XSEAT_MEMO_TTL" ]; then
+    _XSEAT_SEAT="$_XSEAT_MEMO_SEAT"
+    return "$_XSEAT_MEMO_RC"
+  fi
+  rc=1
+  if override_exists "$pr" "$sha"; then
+    rc=1
+  else
+    # Identify "another seat" by comment author != this seat's gh auth login. Unresolvable identity →
+    # degraded: EVERY author would read as foreign, which would hold on our OWN seat's block.
+    _resolve_watcher_owner
+    me="$_WATCHER_OWNER_CACHE"
+    if [ -z "$me" ]; then
+      _xseat_journal_degraded "$pr" "$sha" "seat identity unresolved"
+      rc=1
+    else
+      cur="$(_gate_status_current "$sha")"
+      st="${cur%% *}"; creator="${cur#* }"
+      [ "$creator" = "$cur" ] && creator=""
+      if [ "$st" = "failure" ] && [ "$creator" != "$me" ]; then
+        _XSEAT_SEAT="${creator:-unknown}"
+        rc=0
+      else
+        seat="$(_xseat_foreign_block "$pr" "$sha" "$me")"; frc=$?
+        case "$frc" in
+          0) _XSEAT_SEAT="$seat"; rc=0 ;;
+          2) _xseat_journal_degraded "$pr" "$sha" "commit status / comment scan unreadable"; rc=1 ;;
+          *) rc=1 ;;
+        esac
+      fi
+    fi
+  fi
+  _XSEAT_MEMO_KEY="$pr $sha"; _XSEAT_MEMO_TS="$now"; _XSEAT_MEMO_SEAT="$_XSEAT_SEAT"; _XSEAT_MEMO_RC="$rc"
+  return "$rc"
+}
+
+# _xseat_journal_degraded <pr#> <sha> <reason> — one durable line per (pr,sha) when the scan could not
+# read the shared artifacts. The gate then behaves exactly as it did before this feature.
+_xseat_journal_degraded() {
+  _xseat_note_once "degraded:$1:$2" || return 0
+  journal_append cross_seat_block_scan pr "$1" sha "$2" state degraded reason "$3"
+}
+
+# _xseat_journal_honored <pr#> <sha> <seat> <stage> — one durable line per (pr,sha,stage) recording that
+# a foreign BLOCK took precedence over this seat's PASS: `setter` = a blessing withheld, `merge` = a
+# merge held. This is the audit trail the #343 incident had no way to leave.
+_xseat_journal_honored() {
+  _xseat_note_once "honored:$4:$1:$2" || return 0
+  journal_append cross_seat_block_honored pr "$1" sha "$2" seat "$3" stage "$4" \
+    reason "cross-seat BLOCK standing (seat $3)"
+}
+
+# _cross_seat_block_row <slug-cell> <pr-cell> <seat> — the loud console row for a held PR. Factored out
+# so the wording is asserted by a test rather than by a human reading the render loop.
+_cross_seat_block_row() {
+  printf '    %s🛑%s %s%s%s%s %scross-seat BLOCK · needs reconcile (seat %s)%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$2" "$C_RED" "$3" "$C_RESET"
 }
 
 # _gate_bless_eligible <pr#> <sha> <mergeStateStatus> — true when a MERGEABLE-but-not-CLEAN PR must
@@ -8498,6 +8678,20 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           continue ;;
       esac
     fi
+    # MERGE GUARD — cross-seat BLOCK precedence (HERD-247). THIS seat's gates are green for (pr,rsha),
+    # but green here means "no seat I can see refused it" only in a single-seat world. Before the
+    # blessing and before `gh pr merge`, re-establish the invariant from SHARED state: if another seat's
+    # BLOCK on this exact sha is still standing (its own later PASS, or a sha-keyed human override, would
+    # have resolved it), our PASS does NOT get to overwrite it. Hold, journal, and paint the row that
+    # tells the operator which seat to reconcile with. Fail-soft: an unreadable scan reports no block and
+    # this tick behaves exactly as it did before the guard existed. See _cross_seat_block_standing.
+    if _cross_seat_block_standing "$prnum" "$rsha"; then
+      _xseat_journal_honored "$prnum" "$rsha" "$_XSEAT_SEAT" merge
+      DISPLAY[idx]="$(_cross_seat_block_row "$sl" "$pn" "$_XSEAT_SEAT")"
+      render
+      continue
+    fi
+
     # herd/gates → success (HERD-194). Both gates are now green for this (pr,sha): the healthcheck
     # passed above (CLEAN/FLAKY) and the review verdict is PASS. Post the success status BEFORE the
     # merge-policy decision below — the blessing reflects the GATE outcome, independent of any
