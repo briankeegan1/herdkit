@@ -887,6 +887,11 @@ render() {
   if [ -n "${HERD_ENGINE_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}engine${C_RESET}"$'\n'"${HERD_ENGINE_NOTE}"$'\n'
   fi
+  # CONTROL-ROOM SWEEP advisory (HERD-191) — one quiet line when debris has accumulated. Empty when
+  # the control room is clean or SWEEP_AUTO=off, so the console is byte-identical when unused.
+  if [ -n "${SWEEP_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}housekeeping${C_RESET}"$'\n'"${SWEEP_NOTE}"$'\n'
+  fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
   # byte-identical when the feature is unused.
@@ -3017,8 +3022,12 @@ emit(wt, branch)
 #
 # Self-exclusion: HERD_WATCHER_TAB_ID (set by coordinator.sh via --env) is always excluded even
 # if it somehow appeared in the registry, so the watcher can never sweep its own host tab.
-_sweep_orphan_tabs() {
-  [ -n "$DRYRUN" ] && return 0
+#
+# DETECTION vs ACTION: the candidate computation lives in _orphan_tab_ids (below), which PRINTS the
+# orphaned tab ids and touches nothing. _sweep_orphan_tabs is the action wrapper. `herd sweep`
+# (HERD-191) reuses the detector for its dry-run plan, so the plan and the live sweep can never
+# disagree about which tabs are stale.
+_orphan_tab_ids() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _sw_wsid; _sw_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
   local _sw_tabs; _sw_tabs="$(herdr tab list 2>/dev/null || true)"
@@ -3142,7 +3151,16 @@ except Exception:
 ' 2>/dev/null || true)"
 
   [ -n "$_sw_orphans" ] || return 0
-  local _sw_id
+  printf '%s\n' "$_sw_orphans"
+}
+
+# _sweep_orphan_tabs — the ACTION wrapper around _orphan_tab_ids: close each orphaned tab, journal
+# it, and prune its registry row. Dry-run-inert; byte-quiet when there are no orphans.
+_sweep_orphan_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  local _sw_registry="$TREES/.herd-tabs" _sw_orphans _sw_id
+  _sw_orphans="$(_orphan_tab_ids)"
+  [ -n "$_sw_orphans" ] || return 0
   while IFS= read -r _sw_id; do
     [ -n "$_sw_id" ] || continue
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
@@ -5775,6 +5793,64 @@ for wt, branch in feats:
 '
 }
 
+# ── Control-room sweep (HERD-191) ────────────────────────────────────────────────────────────────
+# sweep.sh composes the reapers defined ABOVE (_marker_live, _sweep_gate_corpses, _orphan_tab_ids,
+# _sweep_orphan_tabs, _sweep_stale_resolve_tabs, _reap_slug), so it must be sourced AFTER them. It in
+# turn skips re-sourcing this file because those helpers are already in scope — no recursion.
+# SWEEP_LIB=1 loads functions only; the CLI entry point (sweep_main) never runs from inside a watcher.
+SWEEP_LIB=1
+# shellcheck source=/dev/null
+. "$HERE/sweep.sh"
+unset SWEEP_LIB
+
+# The trigger pass's cached counts. Recomputed on the ORPHAN-sweep cadence (not every 4 s tick): the
+# scan costs one `ps -e` plus a filesystem walk, which has no business riding the repaint. Rendering
+# reads the CACHE every tick, so the frame stays stable between scans instead of flickering.
+_SWEEP_SCAN_INTERVAL=15                  # ~60 s (15 × 4 s sleep) — matches _ORPHAN_SWEEP_INTERVAL,
+                                         # which is declared further down, next to the live loop
+_SWEEP_SCAN_TICK=$_SWEEP_SCAN_INTERVAL   # primed so the FIRST tick scans, then every interval
+_SWEEP_C_TABS=0; _SWEEP_C_MARKERS=0; _SWEEP_C_PROCS=0
+
+# _sweep_trigger_tick — the per-tick trigger. On the scan cadence it refreshes the cached counts,
+# journals `sweep_advice` once per distinct condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs.
+# Byte-inert under SWEEP_AUTO=off: no scan, no journal, no row, no action.
+_sweep_trigger_tick() {
+  [ -n "$DRYRUN" ] && return 0
+  local _st_mode; _st_mode="$(sweep_auto_mode)"
+  [ "$_st_mode" = off ] && return 0
+  _SWEEP_SCAN_TICK=$(( _SWEEP_SCAN_TICK + 1 ))
+  [ "$_SWEEP_SCAN_TICK" -ge "$_SWEEP_SCAN_INTERVAL" ] || return 0
+  _SWEEP_SCAN_TICK=0
+  read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
+  sweep_journal_advice_once "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"
+  if [ "$_st_mode" = auto ] \
+     && { [ "$_SWEEP_C_TABS" -gt 0 ] || [ "$_SWEEP_C_MARKERS" -gt 0 ] || [ "$_SWEEP_C_PROCS" -gt 0 ]; }; then
+    # SAFE legs only. Judgment findings (dirty / unique-commit worktrees) are flagged + journaled by
+    # sweep_leg_worktrees and never acted on, so `auto` can never destroy unrecovered work. Narration
+    # is swallowed: the console is the watcher's, not the sweep's — the journal carries the record.
+    sweep_run_safe_legs >/dev/null 2>&1 || true
+    # The mess is gone; re-scan so the console row clears this same tick instead of lingering a cycle.
+    read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
+  fi
+  return 0
+}
+
+# build_sweep_note — the '🧹 sweep recommended: N stale tabs · M dead markers' console row, rendered
+# from the CACHED counts. Empty when the control room is clean or SWEEP_AUTO=off, so the console is
+# byte-identical to before this feature whenever there is nothing to sweep.
+build_sweep_note() {
+  SWEEP_NOTE=""
+  local _bs_mode _bs_line
+  _bs_mode="$(sweep_auto_mode)"
+  [ "$_bs_mode" = off ] && return 0
+  _bs_line="$(sweep_advice_line "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS")"
+  [ -n "$_bs_line" ] || return 0
+  local _bs_hint="run 'herd sweep'"
+  [ "$_bs_mode" = auto ] && _bs_hint="auto-sweeping safe legs; 'herd sweep' for the rest"
+  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
+  return 0
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
 # the live watch loop. Direct execution runs the loop normally.
@@ -6120,6 +6196,9 @@ while true; do
   # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
   _sweep_gate_corpses
   _collect_main_health
+  # CONTROL-ROOM SWEEP trigger (HERD-191): refresh the cheap debris counts on the orphan-sweep
+  # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
+  _sweep_trigger_tick
 
   build_header
   build_landed
@@ -6128,6 +6207,7 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  build_sweep_note
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never

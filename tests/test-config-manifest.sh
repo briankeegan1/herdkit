@@ -116,7 +116,7 @@ EXEMPT_PREFIX = (
     "JIRA_", "LINEAR_", # tracker-backend secrets — sourced from .herd/secrets, never .herd/config
     "C_",               # theme palette color vars (theme.sh)
     "HANDOFF_",         # handoff.sh capture fields
-    "SWEEP_",           # backlog-reconcile-sweep.sh scoring seams
+    "SWEEP_",           # backlog-reconcile-sweep.sh scoring seams + sweep.sh internals (SWEEP_AUTO is declared)
     "EMIT_",            # backlog-reconcile-sweep.sh output-format seams
     "BACKLOG_VIEW_",    # backlog viewer pane internals
     "TASK_PANE_VIEW_",  # task-spec viewer pane internals
