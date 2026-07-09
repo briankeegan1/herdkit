@@ -64,21 +64,23 @@ run() {
         *commentCreate*)    echo '{"data":{"commentCreate":{"success":true}}}' ;;
         *issueUpdate*)      echo "{\"data\":{\"issueUpdate\":{\"success\":${ISSUEUPDATE_SUCCESS:-true}}}}" ;;
         *"states(filter"*)  echo "{\"data\":{\"issues\":{\"nodes\":[{\"id\":\"iss_7\",\"identifier\":\"ENG-7\",\"title\":\"first open issue\",\"team\":{\"states\":{\"nodes\":${STATES_NODES:-$DEFAULT_STATE_NODES}}}}]}}}" ;;
+        # HERD-52/HERD-244 planned markers MUST precede the bare `"state { type }"` item_state shape:
+        # unqueue now also selects `state { type }` (to protect a claim's assignee), so the more
+        # specific comments-shape has to win first.
+        *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"},{"id":"cmt_other","body":"an unrelated comment"}]},"assignee":{"id":"me_viewer"},"state":{"type":"unstarted"}}]}}}' ;;
+        *"comments { nodes { body } }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]}},{"identifier":"ENG-9","comments":{"nodes":[{"body":"just a regular note"}]}}]}}}' ;;
+        *commentDelete*)    echo '{"data":{"commentDelete":{"success":true}}}' ;;
         *"state { type }"*) echo '{"data":{"issues":{"nodes":[{"state":{"type":"completed"}}]}}}' ;;
         *updatedAt*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nFull spec body here.","url":"https://linear.app/acme/issue/ENG-7","updatedAt":"2026-07-06T01:02:03.000Z","state":{"name":"In Progress","type":"started"}}]}}}' ;;
         *"state { name type }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue","description":"first open issue\nDetails for seven.","url":"https://linear.app/acme/issue/ENG-7","state":{"name":"Todo","type":"unstarted"},"assignee":null},{"identifier":"ENG-9","title":"second open issue","description":null,"url":"https://linear.app/acme/issue/ENG-9","state":{"name":"In Progress","type":"started"},"assignee":{"displayName":"Chase"}}]}}}' ;;
-        # HERD-52 planned markers: unqueue resolves id + comment ids/bodies; list_queued reads
-        # per-issue comment bodies; commentDelete removes a marker; queue resolves just id+identifier.
-        # These specific comment/id shapes MUST precede the generic issues( fallthrough below.
-        *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"},{"id":"cmt_other","body":"an unrelated comment"}]}}]}}}' ;;
-        *"comments { nodes { body } }"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]}},{"identifier":"ENG-9","comments":{"nodes":[{"body":"just a regular note"}]}}]}}}' ;;
-        *commentDelete*)    echo '{"data":{"commentDelete":{"success":true}}}' ;;
         # HERD-184 operator-inbox reader: viewer id + per-issue comments with author + id. Must precede
         # the generic issues( fallthrough. The comment set mixes a cross-operator comment, the viewer's
         # OWN comment (must be excluded), and a 📌 planned marker (must be skipped).
+        # Also used by HERD-244 plan-time assignee set/clear (viewer = API identity).
         *"viewer { id }"*)  echo '{"data":{"viewer":{"id":"me_viewer"}}}' ;;
         *"comments(first: 50)"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"id":"cin_1","body":"please rebase before we merge","user":{"id":"other_op","name":"Dana"}},{"id":"cin_self","body":"my own note","user":{"id":"me_viewer","name":"Me"}},{"id":"cin_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]","user":{"id":"other_op","name":"Dana"}}]}}]}}}' ;;
-        *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7"}]}}}' ;;
+        # queue resolves id+identifier+assignee (unassigned so set-assignee runs).
+        *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","assignee":null}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -427,6 +429,8 @@ pass
 
 # 8. HERD-52 queue_item → resolves the issue id, then commentCreate's a 📌 planned marker carrying
 #    who + "sequenced after <blocker>" + a [<epoch>] timestamp. Reports DONE.
+#    HERD-244: ALSO issueUpdate's assigneeId to the viewer (API identity) so the plan is visible as
+#    a first-class Linear assignee in every client, not only via `herd backlog queued`.
 : > "$GQLLOG"
 q="$(run _backend_queue_item ENG-7 alice ENG-9)"
 echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
@@ -434,6 +438,10 @@ grep -q "commentCreate" "$GQLLOG" || fail "queue_item did not post the marker vi
 grep -q "queued by alice" "$GQLLOG" || fail "queue_item marker did not name the operator (who)"
 grep -q "sequenced after ENG-9" "$GQLLOG" || fail "queue_item marker did not record the blocker"
 grep -qE '\[[0-9]+\]' "$GQLLOG" || fail "queue_item marker did not embed a [<epoch>] timestamp"
+grep -q "viewer { id }" "$GQLLOG" || fail "queue_item (HERD-244) did not resolve the viewer for assignee"
+grep -q "issueUpdate" "$GQLLOG" || fail "queue_item (HERD-244) did not issueUpdate the assignee"
+grep -q "assigneeId" "$GQLLOG" || fail "queue_item (HERD-244) issueUpdate did not set assigneeId"
+grep -q "me_viewer" "$GQLLOG" || fail "queue_item (HERD-244) did not assign the viewer id (me_viewer)"
 pass
 
 # 8a. queue_item with NO blocker → marker says "sequenced next", still DONE.
@@ -462,12 +470,55 @@ pass
 
 # 8d. unqueue_item → resolves the issue's comments and commentDelete's ONLY the 📌 marker (cmt_mark),
 #     never the unrelated comment (cmt_other). Reports DONE.
+#     HERD-244: ALSO clears the plan-time assignee (issueUpdate assigneeId: null) when the issue is
+#     still assigned to the viewer on a non-started state (plan dropped before claim).
 : > "$GQLLOG"
 uq="$(run _backend_unqueue_item ENG-7 alice)"
 echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
 grep -q "commentDelete" "$GQLLOG" || fail "unqueue_item did not delete the marker via commentDelete"
 grep -q '"id": "cmt_mark"' "$GQLLOG" || fail "unqueue_item did not target the 📌 marker comment (cmt_mark)"
 grep -q '"id": "cmt_other"' "$GQLLOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
+grep -q "viewer { id }" "$GQLLOG" || fail "unqueue_item (HERD-244) did not resolve the viewer to clear assignee"
+# The clear mutation must pass a null assignee (Python json.dumps None → null).
+python3 - "$GQLLOG" <<'PY' || fail "unqueue_item (HERD-244) did not issueUpdate assigneeId to null"
+import sys, re, json
+log = open(sys.argv[1]).read()
+assert "issueUpdate" in log, "no issueUpdate in log"
+# Find PlanUnassign / any issueUpdate VARS carrying assignee: null
+found = False
+for m in re.finditer(r"VARS<<(.*?)>>", log, re.S):
+    try: v = json.loads(m.group(1))
+    except Exception: continue
+    if "assignee" in v and v["assignee"] is None and v.get("id") == "iss_7":
+        found = True
+        break
+assert found, "no issueUpdate VARS with assignee=null for iss_7"
+PY
+pass
+
+# 8d-started. HERD-244: unqueue on a STARTED issue (claim has taken over) must NOT clear assignee —
+#     the claim owns assignee+started; unqueue only removes the 📌 noise.
+: > "$GQLLOG"
+uq_started="$(
+  cd "$T" && . "$BACKEND"
+  journal_append() { :; }
+  _linear_gql() {
+    printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+    case "$1" in
+      *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]},"assignee":{"id":"me_viewer"},"state":{"type":"started"}}]}}}' ;;
+      *commentDelete*) echo '{"data":{"commentDelete":{"success":true}}}' ;;
+      *"viewer { id }"*) echo '{"data":{"viewer":{"id":"me_viewer"}}}' ;;
+      *issueUpdate*) echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      *) echo '{"data":{}}' ;;
+    esac
+  }
+  _BACKEND_RESULT=""
+  _backend_unqueue_item ENG-7 alice
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+echo "$uq_started" | grep -q "RESULT=DONE" || fail "unqueue on started issue should still clear the 📌 ($uq_started)"
+grep -q "commentDelete" "$GQLLOG" || fail "unqueue on started issue should still commentDelete"
+grep -q "issueUpdate" "$GQLLOG" && fail "unqueue on started issue must NOT clear the claim assignee via issueUpdate"
 pass
 
 # 8d-inbox. HERD-184 list_inbox_comments → reads comments on issues assigned to the viewer (isMe) and
