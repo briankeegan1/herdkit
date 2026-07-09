@@ -43,6 +43,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required (journal.sh)"
 # appends its full argv, so a case can prove exactly what gh was handed.
 #   ok     → prints a JSON payload on stdout, exit 0
 #   hung   → never returns (exec sleep — the pid the timeout kills is the sleep)
+#   stubborn → never returns AND ignores SIGTERM (only SIGKILL ends it)
 #   broken → prints to stderr, exit 1 (gh's own failure: a 404, a rate limit, an expired token)
 stub_gh() {
   local d="$1" kind="$2" argvlog="${3:-}"
@@ -52,6 +53,7 @@ stub_gh() {
     case "$kind" in
       ok)     printf 'printf %%s "[{\\"number\\":7}]"\nexit 0\n' ;;
       hung)   printf 'exec sleep 30\n' ;;
+      stubborn) printf 'trap "" TERM INT\nsleep 30\n' ;;
       broken) printf 'echo "gh: HTTP 404" >&2\nexit 1\n' ;;
     esac
   } > "$d/gh"
@@ -119,6 +121,22 @@ ok "(2) gh's own non-zero exit passes through verbatim and is never journaled as
   exit 0
 ) || fail "(3) a hung gh was not bounded, journaled, or was allowed to fabricate output"
 ok "(3) hung gh → SIGTERM at the deadline, rc 124, ONE gh_timeout event (site + budget), no stdout"
+
+# ── (3b) a gh that IGNORES SIGTERM is still killed at the deadline ────────────────────────────────
+# The perl and pure-shell runners escalate TERM→KILL. coreutils `timeout` sends TERM only unless given
+# -k, and that is the branch Linux always takes — a `gh` that traps TERM would re-open the very hang.
+(
+  WT="$T/stubborn"; STUB="$WT/bin"; stub_gh "$STUB" stubborn; export PATH="$STUB:$PATH"
+  source_watcher "$WT" 2
+  start=$(date +%s)
+  _gh_timeout tick_pr_list pr list >/dev/null 2>&1; rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  [ "$rc" -ne 0 ]        || { echo "a TERM-ignoring gh returned success"; exit 1; }
+  [ "$elapsed" -lt 20 ]  || { echo "a TERM-ignoring gh held the tick ${elapsed}s (budget 2s)"; exit 1; }
+  grep -q '"event":"gh_timeout"' "$JOURNAL_FILE" || { echo "no gh_timeout event"; exit 1; }
+  exit 0
+) || fail "(3b) a gh that ignores SIGTERM was not killed at the deadline"
+ok "(3b) a TERM-ignoring gh is escalated to SIGKILL — the coreutils path carries -k when supported"
 
 # ── (4) FAIL-SOFT at the real call sites: a hang lands in the EXISTING gh-failure branch ───────────
 (

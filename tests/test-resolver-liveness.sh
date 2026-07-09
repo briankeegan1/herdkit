@@ -121,8 +121,16 @@ dispatched_at() {
   : > "$RESOLVE_STATE"
   printf '%s %s %s %s %s dispatched\n' "$(( $(date +%s) - $1 ))" "$PR" "$SLUG" "$BRANCH" "$SHA" >> "$RESOLVE_STATE"
 }
+# lane_marker_live / lane_marker_dead / lane_marker_clear — plant (or clear) the inflight marker a
+# backgrounded resolver lane holds for $SLUG, with a live or a provably-dead worker pid.
+lane_marker_file() { printf '%s%s-%s-x-1' "$SPAWN_INFLIGHT_PREFIX" resolve "$(_spawn_slug_key "$SLUG")"; }
+lane_marker_live() { _marker_write "$(lane_marker_file)" "$$"; }
+lane_marker_dead() { _marker_write "$(lane_marker_file)" "$(_dead_pid)"; }
+lane_marker_clear(){ rm -f "$SPAWN_INFLIGHT_PREFIX"resolve-* 2>/dev/null || true; }
+
 reset() {
   : > "$JOURNAL_FILE"; : > "$CLOSED"; : > "$REG"; : > "$RESOLVE_STATE"
+  lane_marker_clear
   printf '[]\n' > "$GH_PRLIST"; printf '0\n' > "$GH_RC"
   probe_blind
   _RESOLVER_DEAD_GRACE="$GRACE_DEFAULT"
@@ -144,7 +152,7 @@ was_closed() { grep -qxF "$1" "$CLOSED" 2>/dev/null; }
 # ── (1) helpers exist ─────────────────────────────────────────────────────────
 for fn in _resolver_liveness_verdict _resolver_in_flight _resolver_agent_alive _resolver_roster_listed \
           _resolver_probe _roster_readable _resolver_grace_active resolver_last_dispatch_epoch_slug \
-          _sweep_stale_resolve_tabs spawn_resolver; do
+          _sweep_stale_resolve_tabs spawn_resolver _resolver_lane_starting _spawn_slug_key; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing (HERD-206 liveness seam)"
 done
 ok
@@ -320,6 +328,54 @@ done
 [ "$spawned" -eq 0 ] || fail "(16) resolver-loop: a blind watcher queued $spawned respawns over a live resolver"
 [ "$(resolver_dispatch_count "$PR")" -eq 1 ] || fail "(16) resolver-loop: the respawn budget was burned"
 case "${DISPLAY[0]}" in *"gave up"*) fail "(16) resolver-loop: the PR was stranded at the round cap" ;; esac
+ok
+
+# ── (19) HERD-237: a DISPATCHED-BUT-QUEUED resolver lane is STARTING, not DEAD ────────────────────
+# The lane is backgrounded and serialized behind the lane lock, so the k-th lane of a merge burst can
+# start minutes after its dispatch. `record_resolve_attempt` (which starts the 90s grace) fires on the
+# tick, so the grace lapses long before the lane runs. A queued lane has no roster row and no pane —
+# exactly a corpse's signature. Calling it DEAD re-dispatches a resolver that never started, burns the
+# respawn budget, and ends in a false "resolver gave up (3 rounds)". The live lane marker is the truth.
+reset
+dispatched_at $(( GRACE_DEFAULT + 600 ))   # grace long lapsed
+probe_blind                                 # no pane yet — the lane has not started the agent
+AGENTS_JSON="$(roster_empty)"               # readable roster, resolver absent ⇒ would be DEAD
+[ "$(verdict)" = "DEAD" ] || fail "(19) precondition: a grace-lapsed, unregistered resolver must read DEAD without a lane marker"
+lane_marker_live
+[ "$(verdict)" = "STARTING" ] || fail "(19) a live resolver LANE must read STARTING, got '$(verdict)' — a queued dispatch would be re-dispatched"
+_resolver_in_flight "$SLUG" "$PR" || fail "(19) a live resolver lane must count as in-flight (the double-dispatch guard)"
+ok
+
+# ── (20) the classifier does not re-dispatch (nor burn a round) behind a live lane ────────────────
+reset
+dispatched_at $(( GRACE_DEFAULT + 600 ))
+probe_blind; AGENTS_JSON="$(roster_empty)"
+lane_marker_live
+classify "$SHA"
+[ "$CLASSIFY_N" = "0" ] || fail "(20) the classifier queued $CLASSIFY_N respawn(s) for a resolver whose lane is still running"
+grep -q 'dead-resolver' "$JOURNAL_FILE" 2>/dev/null && fail "(20) a queued lane was journaled as a dead resolver"
+ok
+
+# ── (21) a DEAD lane worker restores the death verdict (liveness, not immortality) ────────────────
+# The marker must not become a permanent "hands off": a watcher killed mid-dispatch leaves a marker
+# whose pid is gone, and the resolver must then be re-dispatchable exactly as before.
+reset
+dispatched_at $(( GRACE_DEFAULT + 600 ))
+probe_blind; AGENTS_JSON="$(roster_empty)"
+lane_marker_dead
+[ "$(verdict)" = "DEAD" ] || fail "(21) a marker for a DEAD lane worker must not mask a real death, got '$(verdict)'"
+_resolver_in_flight "$SLUG" "$PR" && fail "(21) a dead lane worker's marker still read as in-flight (the resolver would never respawn)"
+ok
+
+# ── (22) an ALIVE-but-idle resolver is held while its lane worker still runs ──────────────────────
+# HERD-225 frees an idle resolver for re-dispatch. But if THIS slug's lane is still running it is about
+# to (re)start that very agent — re-dispatching races it into `herd-resolve.sh: agent name already used`.
+reset
+dispatched_at $(( GRACE_DEFAULT + 600 ))
+AGENTS_JSON="$(printf '{"result":{"agents":[{"name":"resolve·%s","agent_status":"idle"}]}}' "$SLUG")"
+_resolver_in_flight "$SLUG" "$PR" && fail "(22) precondition: an idle resolver past grace is free for re-dispatch"
+lane_marker_live
+_resolver_in_flight "$SLUG" "$PR" || fail "(22) an idle resolver whose lane worker is still running must be held"
 ok
 
 echo "ALL PASS ($pass checks) — resolver liveness: positive-evidence-only death (HERD-206)"

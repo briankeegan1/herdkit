@@ -177,11 +177,36 @@ _gh_timeout_secs() {
 #      of the tick's ~30 gh calls a full second — a fix for a hang that manufactures a stall.
 #   3. a pure-shell watchdog — last resort (no timeout binary AND no perl).
 # Every kill/wait/sleep is guarded so this can never abort a caller running under `set -e`.
+# _gh_timeout_kill_flag <bin> — echo `-k <grace>` when <bin> supports coreutils' kill-after flag, else
+# nothing. Without it `timeout` sends only SIGTERM, and a `gh` that ignores TERM keeps the tick wedged —
+# re-introducing the exact hang, on the coreutils path Linux always takes. Probed once, cached.
+_GH_TIMEOUT_KFLAG=""
+_GH_TIMEOUT_KFLAG_PROBED=""
+_gh_timeout_kill_flag() {
+  if [ -z "$_GH_TIMEOUT_KFLAG_PROBED" ]; then
+    _GH_TIMEOUT_KFLAG_PROBED=1
+    "$1" -k 1 1 true >/dev/null 2>&1 && _GH_TIMEOUT_KFLAG="-k 5"
+  fi
+  printf '%s' "$_GH_TIMEOUT_KFLAG"
+}
+
 _gh_timeout_run() {
   local secs="$1"; shift
   local rc=0
-  if command -v timeout  >/dev/null 2>&1; then timeout  "$secs" "$@" || rc=$?; return "$rc"; fi
-  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" || rc=$?; return "$rc"; fi
+  # $(…) unquoted ON PURPOSE: it is either empty or the two words `-k 5`.
+  # NORMALIZE THE ESCALATED EXIT: coreutils `timeout` returns 124 when its TERM ended the command, but
+  # 137 (128+KILL) / 143 (128+TERM) when the -k grace had to finish the job. All three mean the same
+  # thing here — the deadline killed it — and only 124 is the convention the wrapper's callers read.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout $(_gh_timeout_kill_flag timeout) "$secs" "$@" || rc=$?
+    case "$rc" in 137|143) rc=124 ;; esac
+    return "$rc"
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout $(_gh_timeout_kill_flag gtimeout) "$secs" "$@" || rc=$?
+    case "$rc" in 137|143) rc=124 ;; esac
+    return "$rc"
+  fi
   if command -v perl >/dev/null 2>&1; then
     perl -e '
       my $secs = shift;
@@ -1921,9 +1946,12 @@ SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
 # Uniqueness matters: a same-slug re-dispatch (a resolver respawned for a new sha) would otherwise alias
 # the previous worker's marker, and the FIRST worker's cleanup would then delete the SECOND's — silently
 # un-exempting a live lane. The slug stays in the name so the marker is legible in `ls $TREES`.
+# _spawn_slug_key <slug> — the filename-safe form of a slug. ONE definition, so the writer
+# (_spawn_inflight_file) and every reader (the per-slug marker globs) can never drift apart.
+_spawn_slug_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
 _spawn_inflight_file() {
-  printf '%s%s-%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" \
-    "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_')" "$$" "${RANDOM:-0}"
+  printf '%s%s-%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(_spawn_slug_key "$2")" "$$" "${RANDOM:-0}"
 }
 
 # _spawn_inflight_bg <marker> <fn> [args…] — run <fn> in a background subshell, recording its pid in
@@ -1948,12 +1976,15 @@ _spawn_inflight_sweep() {
   done
 }
 
-# _lane_spawn_inflight — true iff a builder lane spawned by a previous tick is STILL running. Callers
-# run _spawn_inflight_sweep first, so a corpse can never hold the queue shut.
+# _lane_spawn_inflight — true iff a builder lane spawned by a previous tick is STILL running. Tests the
+# marker's LIVENESS, not its existence: a corpse marker (worker dead, or its pid recycled) can never
+# hold the queue shut, whether or not the caller swept first. _spawn_inflight_sweep still GCs the files
+# — this predicate merely refuses to depend on it having run.
 _lane_spawn_inflight() {
   local _lsi_f
   for _lsi_f in "$SPAWN_INFLIGHT_PREFIX"lane-*; do
-    [ -e "$_lsi_f" ] && return 0
+    [ -e "$_lsi_f" ] || continue
+    _marker_live "$_lsi_f" 2>/dev/null && return 0
   done
   return 1
 }
@@ -1966,7 +1997,30 @@ _resolver_lane_inflight() {
   _spawn_inflight_sweep
   local _rli_f
   for _rli_f in "$SPAWN_INFLIGHT_PREFIX"resolve-*; do
-    [ -e "$_rli_f" ] && return 0
+    [ -e "$_rli_f" ] || continue
+    _marker_live "$_rli_f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# _resolver_lane_starting <slug> — true while THIS slug's resolver lane has been dispatched but has not
+# yet produced an agent: the lane worker is alive (queued behind the lane lock, cloning the worktree,
+# rendering the spec, starting the agent). It is the missing third source of "not dead" evidence.
+#
+# WHY (HERD-237): `record_resolve_attempt` runs on the tick and starts the 90 s _RESOLVER_DEAD_GRACE
+# clock. That was a sound proxy for "the lane is starting" while the lane ran inline. It is not once
+# lanes serialize: with K conflicting PRs the k-th lane starts at roughly (k-1) x lane-duration, and
+# this whole change exists to tolerate lanes that take minutes. A queued lane has no roster row and no
+# pane, so the instant its grace lapsed `_resolver_liveness_verdict` called it DEAD — and
+# `_resolver_in_flight`, the SINGLE guard against double-dispatch, read false for a resolver that was
+# dispatched and merely waiting its turn. Each tick then re-dispatched it, burned a respawn round, and
+# after REFIX_MAX_ROUNDS painted the terminal false red "resolver gave up (3 rounds)" over a conflict
+# nothing had yet attempted. The marker is the honest signal: it lives exactly as long as the lane.
+_resolver_lane_starting() {
+  local _rls_f
+  for _rls_f in "$SPAWN_INFLIGHT_PREFIX"resolve-"$(_spawn_slug_key "$1")"-*; do
+    [ -e "$_rls_f" ] || continue
+    _marker_live "$_rls_f" 2>/dev/null && return 0
   done
   return 1
 }
@@ -3592,6 +3646,10 @@ _resolver_liveness_verdict() {
   _resolver_roster_listed "$_rlv_slug" && { printf 'ALIVE'; return 0; }
   _rlv_probe="$(_resolver_probe "$_rlv_slug")"
   [ "$_rlv_probe" = "alive" ] && { printf 'ALIVE'; return 0; }
+  # A live lane worker for this slug is STARTING evidence that does not expire (HERD-237). It must be
+  # checked with the grace, above every death branch: a lane queued behind the lane lock outlives the
+  # 90 s dispatch grace by design, and calling that DEAD re-dispatches a resolver that never started.
+  _resolver_lane_starting "$_rlv_slug" && { printf 'STARTING'; return 0; }
   _resolver_grace_active "$_rlv_slug" "$_rlv_pr" && { printf 'STARTING'; return 0; }
   case "$_rlv_probe" in
     dead|missing) printf 'DEAD'; return 0 ;;
@@ -3712,7 +3770,10 @@ _resolver_in_flight() {
     case "$_rif_st" in
       idle|done)
         # Finished its round — free for re-dispatch. Still hold inside the startup grace so a
-        # just-spawned agent that blips idle cannot be double-dispatched over.
+        # just-spawned agent that blips idle cannot be double-dispatched over — and while THIS slug's
+        # lane worker is still running (HERD-237: a re-dispatch would race the lane that is about to
+        # (re)start this very agent, and `herd-resolve.sh` would fail with 'agent name already used').
+        _resolver_lane_starting "$_rif_slug" && return 0
         _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
         # …unless this "idle" is a usage-limit park awaiting auto-resume (HERD-246).
         if ! _resolver_round_finished "$_rif_pr" "$_rif_sha" && _resolver_limit_parked "$_rif_slug"; then
@@ -3795,7 +3856,7 @@ spawn_resolver() {
   _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs")"
-  _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha"
+  _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha" "$_sr_marker"
   return 0
 }
 
@@ -3837,40 +3898,93 @@ _spawn_resolver_wait() {
 # (journaled). Losing serialization degrades to the concurrency we would have had with no lock at all;
 # dropping the dispatch would lose the heal.
 RESOLVE_LANE_LOCK="$TREES/.spawn-resolve-lane.lock"   # a lock DIRECTORY (mkdir is atomic everywhere)
-_RESOLVE_LANE_LOCK_STALE=600     # seconds before a held lock is presumed abandoned and broken
+_RESOLVE_LANE_LOCK_STALE=600     # seconds before an UNATTRIBUTABLE held lock is presumed abandoned
 
-# _resolve_lane_lock_acquire — take the lane lock, or return 1 after the wait budget. Breaks a lock
-# whose holder has been gone longer than _RESOLVE_LANE_LOCK_STALE (a watcher killed mid-dispatch), so a
-# corpse can never wedge resolver dispatch. HERD_RESOLVE_LANE_LOCK_WAIT is a test seam, not a config key.
+# The lock records its HOLDER: the path of that lane's own inflight marker, which carries the worker's
+# pid + start-time. That makes both dangerous operations decidable rather than guessed:
+#   • BREAKING a held lock asks "is the holder still alive?" (_marker_live), not "is it old?". An age
+#     rule alone breaks the lock out from under a lane that is legitimately slow.
+#   • RELEASING asks "is the lock still MINE?". An unconditional `rm -rf` lets a lane whose lock was
+#     broken delete its SUCCESSOR's lock on the way out, so one overlap cascades into many.
+# Both mutate the lock by ATOMIC RENAME (only one racer can win a rename), never by a bare rm -rf.
+# The age rule survives only as the last-resort escape for a lock whose holder we cannot attribute at
+# all (a torn write, an older engine's lock dir): a wedge is worse than an overlap.
+
+# _resolve_lane_lock_scrap <reason> — atomically take the lock dir out of the way and delete it.
+# Returns 0 only for the racer that actually won the rename, so no two lanes can both "break" it.
+_resolve_lane_lock_scrap() {
+  local _rls_tmp="$RESOLVE_LANE_LOCK.scrap.$$.${RANDOM:-0}"
+  mv "$RESOLVE_LANE_LOCK" "$_rls_tmp" 2>/dev/null || return 1
+  rm -rf "$_rls_tmp" 2>/dev/null || true
+  return 0
+}
+
+# _resolve_lane_lock_acquire <holder-marker> — take the lane lock, or return 1 after the wait budget.
+# HERD_RESOLVE_LANE_LOCK_WAIT is a test seam, not a config key.
 _resolve_lane_lock_acquire() {
-  local _rll_waited=0 _rll_max="${HERD_RESOLVE_LANE_LOCK_WAIT:-900}" _rll_ts _rll_now
+  local _rll_holder="$1" _rll_waited=0 _rll_max="${HERD_RESOLVE_LANE_LOCK_WAIT:-900}"
+  local _rll_cur _rll_ts _rll_now
   case "$_rll_max" in ''|*[!0-9]*) _rll_max=900 ;; esac
   while :; do
     if mkdir "$RESOLVE_LANE_LOCK" 2>/dev/null; then
-      printf '%s\n' "$(_now_epoch)" > "$RESOLVE_LANE_LOCK/ts" 2>/dev/null || true
+      printf '%s\n' "$_rll_holder"    > "$RESOLVE_LANE_LOCK/holder" 2>/dev/null || true
+      printf '%s\n' "$(_now_epoch)"   > "$RESOLVE_LANE_LOCK/ts"     2>/dev/null || true
       return 0
     fi
-    _rll_ts="$(cat "$RESOLVE_LANE_LOCK/ts" 2>/dev/null || true)"
-    _rll_now="$(_now_epoch)"
-    case "$_rll_ts" in ''|*[!0-9]*) _rll_ts=0 ;; esac
-    if [ "$_rll_ts" -gt 0 ] && [ "$(( _rll_now - _rll_ts ))" -gt "$_RESOLVE_LANE_LOCK_STALE" ]; then
-      journal_append resolver_lane_lock_broken age "$(( _rll_now - _rll_ts ))"
-      rm -rf "$RESOLVE_LANE_LOCK" 2>/dev/null || true
-      continue
+    _rll_cur="$(cat "$RESOLVE_LANE_LOCK/holder" 2>/dev/null || true)"
+    if [ -n "$_rll_cur" ]; then
+      # Attributable holder: break iff it is provably gone (dead pid, or a recycled one).
+      if ! _marker_live "$_rll_cur" 2>/dev/null; then
+        if _resolve_lane_lock_scrap; then
+          journal_append resolver_lane_lock_broken reason holder-dead holder "$_rll_cur"
+        fi
+        continue
+      fi
+    else
+      # Unattributable holder — fall back to the age rule so a torn lock cannot wedge dispatch forever.
+      _rll_ts="$(cat "$RESOLVE_LANE_LOCK/ts" 2>/dev/null || true)"
+      _rll_now="$(_now_epoch)"
+      case "$_rll_ts" in ''|*[!0-9]*) _rll_ts=0 ;; esac
+      if [ "$_rll_ts" -gt 0 ] && [ "$(( _rll_now - _rll_ts ))" -gt "$_RESOLVE_LANE_LOCK_STALE" ]; then
+        if _resolve_lane_lock_scrap; then
+          journal_append resolver_lane_lock_broken reason stale-unattributed age "$(( _rll_now - _rll_ts ))"
+        fi
+        continue
+      fi
     fi
     [ "$_rll_waited" -ge "$_rll_max" ] && return 1
     sleep 1 2>/dev/null || return 1
     _rll_waited=$(( _rll_waited + 1 ))
   done
 }
-_resolve_lane_lock_release() { rm -rf "$RESOLVE_LANE_LOCK" 2>/dev/null || true; }
 
-# _spawn_resolver_lane <slug> <pr#> <sha> — the backgrounded body of spawn_resolver: launch the lane,
-# observe the ACK, journal. The pre-HERD-237 foreground tail verbatim, wrapped in the lane lock.
+# _resolve_lane_lock_release <holder-marker> — drop the lock ONLY if this lane still holds it. A lane
+# whose lock was broken (it overran the stale window) must not delete its SUCCESSOR's lock. Reading the
+# holder and then deleting would race, so we take the dir out of the way by atomic rename FIRST, read
+# the holder from the now-private copy, and put it back untouched if it was never ours.
+_resolve_lane_lock_release() {
+  local _rlr_want="$1" _rlr_tmp="$RESOLVE_LANE_LOCK.rel.$$.${RANDOM:-0}" _rlr_got
+  [ -d "$RESOLVE_LANE_LOCK" ] || return 0
+  mv "$RESOLVE_LANE_LOCK" "$_rlr_tmp" 2>/dev/null || return 0   # lost the rename ⇒ not ours to drop
+  _rlr_got="$(cat "$_rlr_tmp/holder" 2>/dev/null || true)"
+  if [ "$_rlr_got" = "$_rlr_want" ]; then
+    rm -rf "$_rlr_tmp" 2>/dev/null || true
+    return 0
+  fi
+  # Our lock was broken and re-taken while we ran. Restore the current holder's lock verbatim; if a
+  # third lane has already mkdir'd one in the gap, drop our copy rather than clobber theirs.
+  mv "$_rlr_tmp" "$RESOLVE_LANE_LOCK" 2>/dev/null || rm -rf "$_rlr_tmp" 2>/dev/null || true
+  return 0
+}
+
+# _spawn_resolver_lane <slug> <pr#> <sha> <marker> — the backgrounded body of spawn_resolver: launch
+# the lane, observe the ACK, journal. The pre-HERD-237 foreground tail verbatim, wrapped in the lane
+# lock. <marker> is this worker's own inflight marker: it identifies the lock's holder, and while it is
+# live `_resolver_lane_starting` keeps this slug out of every death verdict.
 _spawn_resolver_lane() {
-  local rs="$1" rp="$2" rsha="$3"
+  local rs="$1" rp="$2" rsha="$3" _sr_marker="$4"
   local _sr_rc=0 _sr_ack _sr_roster _sr_locked=""
-  if _resolve_lane_lock_acquire; then
+  if _resolve_lane_lock_acquire "$_sr_marker"; then
     _sr_locked=1
   else
     journal_append resolver_lane_lock_timeout pr "$rp" slug "$rs" \
@@ -3879,7 +3993,7 @@ _spawn_resolver_lane() {
   _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
-  [ -n "$_sr_locked" ] && _resolve_lane_lock_release
+  [ -n "$_sr_locked" ] && _resolve_lane_lock_release "$_sr_marker"
   # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
   # spawn and can never show it) and fall back to the pane probe, so 'acked' is observed, not assumed.
   _sr_roster="$(herd_driver_agent_list_json 2>/dev/null || printf '{}')"

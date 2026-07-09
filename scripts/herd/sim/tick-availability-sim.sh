@@ -270,6 +270,19 @@ grep -q 'other-slug' "$RESOLVE_STATE" 2>/dev/null \
 [ -d "$RESOLVE_LANE_LOCK" ] \
   && ok "the running lane holds the resolver lane lock (the second lane is queued, not concurrent)" \
   || bad "no lane lock is held while a resolver lane runs"
+# The lock names its HOLDER (that lane's inflight marker), so a break is liveness-aware and a release
+# can verify ownership instead of rm -rf'ing whatever lock happens to be there.
+_sim_holder="$(cat "$RESOLVE_LANE_LOCK/holder" 2>/dev/null || true)"
+[ -n "$_sim_holder" ] && _marker_live "$_sim_holder" 2>/dev/null \
+  && ok "the lock names a LIVE holder marker (breaks are liveness-aware, releases ownership-checked)" \
+  || bad "the lane lock has no live holder attribution"
+# A queued lane is DISPATCHED, not dead: its slug must read STARTING however long it waits.
+[ "$(_resolver_liveness_verdict other-slug 42)" = "STARTING" ] \
+  && ok "a queued resolver lane reads STARTING (never DEAD → no re-dispatch, no burned round)" \
+  || bad "a queued resolver lane reads $(_resolver_liveness_verdict other-slug 42) — it would be re-dispatched"
+_resolver_in_flight other-slug 42 def5678 \
+  && ok "the double-dispatch guard holds for a resolver whose lane is merely waiting its turn" \
+  || bad "_resolver_in_flight reads false for a dispatched-but-queued resolver"
 
 # THE CALLER'S LEDGER ORDER (the review's failure scenario, exactly). _handle_stale_dup burns a
 # record-first once-guard (record_refix) and journals the heal BEFORE calling spawn_resolver. Replay
@@ -303,6 +316,13 @@ _spawn_resolver_wait
 
 # The lock and the markers are released once the lanes land — nothing wedges the next conflict.
 _spawn_inflight_sweep
+# The MARKER's hold ends with the lane (the 90s dispatch grace legitimately still holds the verdict at
+# STARTING here — that is _resolver_grace_active's job, and it expires on its own).
+if _resolver_lane_starting other-slug; then
+  bad "a landed lane still reads as lane-STARTING — its marker would hold off every future respawn"
+else
+  ok "once its lane lands the marker's hold ends (it is liveness, not immortality)"
+fi
 [ -d "$RESOLVE_LANE_LOCK" ] && bad "the landed lanes left the lane lock held — resolver dispatch wedges" \
                            || ok "the landed lanes released the lane lock"
 if _resolver_lane_inflight; then
