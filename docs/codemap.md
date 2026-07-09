@@ -21,6 +21,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
+- `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
 - `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
 - `console-section.sh` — THE shared bounded-console-section helper (HERD-243).
@@ -109,6 +110,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
 - `backlog-view.sh` → `herd-config.sh`, `theme.sh`
+- `changelog.sh` → `herd-config.sh`
 - `codemap.sh` → `herd-config.sh`
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
 - `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
@@ -226,7 +228,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
 - `NATIVE_BURST` → `burst.sh`
 - `OPERATOR_INBOX` → `agent-watch.sh`
-- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
+- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
@@ -270,4 +272,4 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `changelog.sh`, `coordinator.sh`, `driver.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`
