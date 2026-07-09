@@ -1598,6 +1598,14 @@ _record_advisory_notes() {
 # a newer head) is discarded unread. INFRA-FAIL results are retried, never cached.
 # HERD_REVIEW_BIN is a test seam: the hermetic suite points it at a stub reviewer.
 #
+# PROCESS-GROUP ISOLATION (HERD-245): reviewers are launched in a NEW session (setsid) so a
+# process-group kill of the watcher — herdr pane recycle on `herd reload`, sweep leg 5, or any
+# `kill -- -<watcher_pgid>` — never SIGTERMs an actively-running review mid-flight. Observed live:
+# reviews shared the watcher's pgid (plain `cmd &`), so pane restarts severed Opus reviews before a
+# verdict (INFRA-FAIL + silent re-dispatch burn). The every-tick corpse sweep still TERMs a worker by
+# its recorded marker pid once past REVIEW_INFLIGHT_TIMEOUT — only ACTIVE non-timeout reviews are
+# protected. Mirrors HERD-217's "never kill live gate work" spirit for the stop/reload path.
+#
 # LOCAL_REVIEW=pre-pr AND THIS POST-PR GATE (belt-and-suspenders — DELIBERATELY NOT SKIPPED):
 # When LOCAL_REVIEW=pre-pr, the builder lanes (herd-quick.sh / herd-feature.sh) already ran
 # `herd-review.sh --local <slug>` in the worktree and required a 'REVIEW: PASS' BEFORE opening the
@@ -1870,6 +1878,24 @@ _discard_stale_reviews() {
   done
 }
 
+# _bg_new_session <cmd> [args...] — launch <cmd> in a NEW session; set _BG_NEW_SESSION_PID to its pid.
+# HERD-245: isolates gate workers from the caller's process group so a `kill -- -<pgid>` aimed at the
+# watcher (herdr pane recycle on reload, sweep leg 5) never severs mid-flight review/health work.
+# Preferred: util-linux `setsid` (no -f: $! IS the worker). Fallback: python os.setsid + exec (macOS
+# has no setsid(1)). Last resort: plain background (no isolation). MUST NOT run inside $() — a command
+# substitution subshell would reap/SIGHUP the child when it exits. stdin/stdout/stderr → /dev/null
+# (gate workers communicate via result files, never the watcher's tty).
+_bg_new_session() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" </dev/null >/dev/null 2>&1 &
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >/dev/null 2>&1 &
+  else
+    "$@" </dev/null >/dev/null 2>&1 &
+  fi
+  _BG_NEW_SESSION_PID=$!
+}
+
 # _dispatch_review <pr#> <slug> <headSha> — launch herd-review.sh in the background, result file
 # wired via $HERD_REVIEW_RESULT_FILE, and write the inflight marker (pid) for this exact pr+sha.
 # Idempotent: an existing result file or live marker means this pr+sha is already handled — never
@@ -1894,12 +1920,18 @@ _dispatch_review() {
   # HERD_REVIEW_MODEL override still wins) exactly as before tiering existed. A non-empty model
   # (the cheap tier) is passed through so the reviewer runs on that tier. HERD_REVIEW_REGISTRY_FILE is
   # the seam herd-review.sh writes its pane id back through (see the registry helpers above).
+  # HERD-245: launch in a new session so a watcher process-group kill never severs this review.
+  local _dr_pid
   if [ -n "$model" ]; then
-    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" HERD_REVIEW_MODEL="$model" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    _bg_new_session env \
+      HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" HERD_REVIEW_MODEL="$model" \
+      bash "$HERD_REVIEW_BIN" "$pr" "$slug"
   else
-    HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" bash "$HERD_REVIEW_BIN" "$pr" "$slug" >/dev/null 2>&1 &
+    _bg_new_session env \
+      HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" \
+      bash "$HERD_REVIEW_BIN" "$pr" "$slug"
   fi
-  local _dr_pid="$!"
+  _dr_pid="$_BG_NEW_SESSION_PID"
   # Lay down the registry row FIRST (pane id unknown yet → "-"), before the slower restart-safe marker
   # write below, so this placeholder lands in the narrowest possible window after launch — herd-review.sh
   # (or the stub) overwrites it with the real pane id once its agent pane is up, and must not race the
@@ -7247,6 +7279,10 @@ _healthcheck_gate() {
   # restart-safe inflight marker with the WORKER'S pid (so a corpse sweep can detect it dying) + start-time
   # + dispatch ts SYNCHRONOUSLY here, so a same-tick sibling sees the slot taken and QUEUEs (never a second
   # overlapping suite). Mirrors _dispatch_review.
+  # Note (HERD-245): review workers use _bg_new_session (setsid) because they are an external argv;
+  # health workers are an in-process bash function so they stay a plain background subshell. Live
+  # health pids are still exempted from _list_project_watchers (HERD-217/245) so reload never
+  # SIGTERMs them as "stray watchers".
   ( _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log" ) &
   local _hg_wpid="$!"
   _marker_write "$_hg_inflight" "$_hg_wpid"
