@@ -170,7 +170,7 @@ render_skill() {
     local out="$out_dir/$name.md"
 
     # ── Driver: the runtime-specific control surface (multiplexer + agent runtime). HERD_DRIVER
-    # (default herdr-claude, the only driver shipped) selects templates/drivers/<driver>.driver,
+    # (default herdr-claude; headless + a stub proof driver also ship) selects templates/drivers/<driver>.driver,
     # whose DRIVER_* bindings are substituted into the {{DRIVER_*}} tokens below — the SAME token
     # machinery as the other keys. Default renders the skill functionally identical to before the
     # abstraction (see docs/driver-abstraction.md). Unknown value ⇒ loud error listing what ships.
