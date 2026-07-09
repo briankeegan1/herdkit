@@ -18,7 +18,6 @@ scripts/herd/fleet.sh	running: claude --model \$MODEL_COORDINATOR /fleet-coordin
 scripts/herd/herd-config.sh	: "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}" # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 scripts/herd/herd-feature.sh	echo "🐑 Sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB dir: $DIR"
 scripts/herd/herd-feature.sh	echo "🐑 Sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS) dir: $DIR"
-scripts/herd/herd-feature.sh	if ! _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --split right --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"; then
 scripts/herd/herd-preflight.sh	if _herd_doctor_recommend claude "$os" 'spawn a Claude Code agent in a lane'; then
 scripts/herd/herd-preflight.sh	if _herd_doctor_run_timeout "$claude_secs" claude --version; then
 scripts/herd/herd-preflight.sh	printf ' \xe2\x9a\xa0 claude HUNG \xe2\x80\x94 `claude --version` did not return within %ss; the binary never finishes starting (hangs in _dyld_start), so spawned agents sit idle with blank panes\n' "$claude_secs"
@@ -28,5 +27,4 @@ scripts/herd/herd-preflight.sh	printf ' fix: %s\n' "$(_herd_doctor_hint claude "
 scripts/herd/herd-preflight.sh	printf ' fix: reinstall/repair the claude binary \xe2\x80\x94 %s\n' "$(_herd_doctor_hint claude "$os")"
 scripts/herd/herd-quick.sh	echo "🐑 Quick sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB dir: $DIR"
 scripts/herd/herd-quick.sh	echo "🐑 Quick sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS) dir: $DIR"
-scripts/herd/herd-quick.sh	if ! _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"; then
 scripts/herd/herd-resolve.sh	echo "🔀 Resolver agent 'resolve·$SLUG' running (claude $CLAUDE_FLAGS) in herdr tab $TAB dir: $DIR"
