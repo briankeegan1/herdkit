@@ -3231,11 +3231,8 @@ _main_health_worker() {
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   if [ "$_mw_rc" -eq 1 ]; then
-    if grep -q 'tab-leak-guard' "$_mw_log" 2>/dev/null; then
-      _mw_detail="$(grep -m1 'tab-leak-guard' "$_mw_log" 2>/dev/null)"
-    else
-      _mw_detail="$(_health_fail_detail "$_mw_log")"
-    fi
+    _mw_detail="$(_health_leak_guard_line "$_mw_log")"
+    [ -n "$_mw_detail" ] || _mw_detail="$(_health_fail_detail "$_mw_log")"
   else
     _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
   fi
@@ -3342,11 +3339,11 @@ _collect_main_health() {
     : > "$(_main_health_marker "$_cm_sha")" 2>/dev/null || true   # run-once BEFORE routing (crash-safe)
     case "$_cm_rc" in
       0) _main_health_clear "$_cm_pr" "$_cm_sha" ;;               # clean (or tolerated data/env) → green
-      1) case "$_cm_out" in
-           *tab-leak-guard*)                                      # transient control-room churn (issue #78)
-             journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard ;;
-           *) _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out" ;;
-         esac ;;
+      1) if _health_is_leak_guard_detail "$_cm_out"; then        # transient control-room churn (issue #78)
+           journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard
+         else
+           _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out"
+         fi ;;
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true
@@ -4594,13 +4591,20 @@ _handle_health_codeerror() {
   _hhc_sl="$(_slug_cell "$_hhc_slug")"
   _hhc_pn=" ${C_DIM}#${_hhc_pr}${C_RESET} ·"
 
-  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
-  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  # An infra red that outlived its re-dispatch budget (HERD-228) stopped being transient: it is a human's
+  # problem, not a builder's. Loud needs-you row, still no bounce — a builder cannot fix the control room.
   case "$_hhc_detail" in
-    *tab-leak-guard*)
-      DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    "$_HEALTH_INFRA_CAP_TAG"*)
+      DISPLAY[_hhc_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · infra red did not self-heal · ${_hhc_detail}${C_RESET}"
       return 0 ;;
   esac
+
+  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
+  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  if _health_is_leak_guard_detail "$_hhc_detail"; then
+    DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    return 0
+  fi
 
   if ! _health_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
     # OFF / dry-run: no bounce, no ledger write. Row truth still applies — a builder a HUMAN re-tasked
@@ -5865,6 +5869,76 @@ _health_first_notok() {
   grep -m1 -E '^[[:space:]]*not ok( |$)' "$1" 2>/dev/null | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
+# ── tab-leak-guard exemption (HERD-228) ─────────────────────────────────────────────────────────────
+# The healthcheck's tab-leak-guard trips when the suite leaks an orphan herdr tab into the LIVE
+# workspace: transient control-room churn (issue #78), never a code bug. Three seams therefore EXEMPT
+# it — the candidate gate never sha-caches it (so the next tick re-runs and it self-heals), never
+# bounces a builder, and the main-health collector routes it to an infra_event instead of MAIN RED.
+#
+# That exemption used to be a bare `grep -q tab-leak-guard <log>` over the WHOLE suite log, which is
+# wrong in the one case that matters: tests/herd.bats contains tests NAMED "hermetic tab-leak-guard …",
+# so their PASSING TAP lines ("ok 29 hermetic tab-leak-guard engine-whitelist test passes") carry the
+# literal. EVERY reproduced bats red therefore read as the leak-guard transient: the red row quoted a
+# passing test, the verdict was never cached, and the PR re-dispatched a ~9-minute suite every tick with
+# no cap and no bounce (PR #333 looped 40+ minutes while "not ok 41 …" sat in the log). On main the same
+# bug meant a genuine bats red could not paint MAIN RED at all.
+#
+# The exemption now matches only the guard's OWN failure line, which it prints ANCHORED at column 0:
+#     TAB-LEAK-GUARD: the test suite left an orphan tab/pane in the live workspace   (full mode)
+#     tab-leak-guard: suite leaked an orphan tab into the live workspace — 3 -> 4    (--oneline)
+# optionally behind healthcheck.sh's own "❌ code error — " oneline prefix. A TAP result line ("ok …",
+# "not ok …") can never satisfy that anchor, and the guard's non-failing notes ("tab-leak-guard: clean",
+# "… skipped") are excluded explicitly. On top of that, a TAP "not ok" ANYWHERE in the log OUTRANKS the
+# exemption outright: a suite that reports a failing test has a code error to answer for, whatever else
+# the log happens to say. One helper decides this for all three seams (HERD-222 builds on it too).
+_HLG_PREFIX_RE='^[[:space:]]*(❌[[:space:]]*)?(code error[[:space:]]*—[[:space:]]*)?'
+_HLG_LINE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:"
+_HLG_NOTE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:[[:space:]]*(clean|skipped)"
+
+# _health_is_leak_guard_detail <line> — true iff ONE line is the guard's failure line. The gate seams
+# carry only the collected <detail> string (never the log), so they classify with this.
+_health_is_leak_guard_detail() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_LINE_RE" 2>/dev/null || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_NOTE_RE" 2>/dev/null && return 1
+  return 0
+}
+
+# _health_leak_guard_line <log> — the guard's failure line from a suite log, or EMPTY when this log is
+# not a genuine trip (no such line, or the suite reported a TAP failure that outranks it). Fail-soft:
+# a missing log is not a trip.
+_health_leak_guard_line() {
+  [ -f "$1" ] || return 0
+  [ -n "$(_health_first_notok "$1")" ] && return 0
+  grep -iE "$_HLG_LINE_RE" "$1" 2>/dev/null | grep -viE "$_HLG_NOTE_RE" 2>/dev/null \
+    | sed -n '1p' | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
+# _health_leak_guard_red <log> — true iff <log> is a genuine tab-leak-guard trip.
+_health_leak_guard_red() { [ -n "$(_health_leak_guard_line "$1")" ]; }
+
+# BOUNDED INFRA RE-DISPATCH (HERD-228). An exempted red is never cached, so the gate re-runs the suite
+# for that same (pr,sha) every tick — that re-run IS the self-heal. Bound it: after this many
+# consecutive infra re-dispatches the "transient" plainly is not transient, so cache the red under an
+# ESCALATION tag, which both stops the loop and surfaces a needs-you row instead of bouncing a builder
+# for infra. Inline constant on purpose — no new config key.
+_HEALTH_INFRA_REDISPATCH_MAX=3
+_HEALTH_INFRA_CAP_TAG='infra re-dispatch cap reached'
+
+# _health_infra_file <pr#> <sha> — the per-(pr,sha) infra re-dispatch counter (swept with the sha-cache).
+_health_infra_file() { printf '%s' "$TREES/.health-infra-$1-$2"; }
+
+# _health_infra_bump <pr#> <sha> — count one infra re-dispatch for this (pr,sha); prints the new total.
+_health_infra_bump() {
+  local _hib_f _hib_n
+  _hib_f="$(_health_infra_file "$1" "$2")"
+  _hib_n="$(cat "$_hib_f" 2>/dev/null || printf 0)"
+  case "$_hib_n" in ''|*[!0-9]*) _hib_n=0 ;; esac
+  _hib_n=$((_hib_n + 1))
+  printf '%s\n' "$_hib_n" > "$_hib_f" 2>/dev/null || true
+  printf '%s' "$_hib_n"
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -5889,7 +5963,12 @@ _health_first_notok() {
 #
 # The pre-diff behaviour (`sed -n 1p` → the "❌ CODE ERROR" banner) was uninformative but never WRONG.
 # That is the floor: this function may return something uninformative, never something misleading.
-_HFD_PASS_RE='^[[:space:]]*(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
+# A pass marker may sit behind a short RUNNER PREFIX — `bats: ok 29 …`, `tests: ✓ widget` — because the
+# project healthcheck relabels the streams it wraps. The anchor therefore tolerates ONE such prefix
+# (a bare word + colon) so those lines are dropped from the candidate set too (HERD-228); it stays
+# anchored, so prose like "look at the ok path" or "PASS is spelled out here" can never be mistaken for
+# a pass marker and silently swallow a real failure line.
+_HFD_PASS_RE='^[[:space:]]*([[:alnum:]_.-]+:[[:space:]]+)?(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
 _HFD_ZERO_RE='(^|[^0-9])0 (errors?|failures?|failed)'
 # Anchored failure MARKERS — a line that BEGINS with FAIL/✗/● is a failure whatever words follow. This
 # is how a bare 'FAIL  src/widget.test.js' is caught without putting bare 'fail' in the token list
@@ -5966,6 +6045,9 @@ _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 #                                written when _healthcheck_gate reaches a terminal outcome for this
 #                                exact commit sha. A cached CLEAN/FLAKY proceeds as passing; a cached
 #                                CODEERROR keeps surfacing the red row — both WITHOUT re-running.
+#   .health-infra-<pr>-<sha>   — how many times an EXEMPTED infra red (tab-leak-guard) has re-dispatched
+#                                the suite for this sha; at _HEALTH_INFRA_REDISPATCH_MAX the red is
+#                                cached under the escalation tag instead of looping (HERD-228).
 # A new commit (new sha) invalidates the cache and forces a fresh full run (see _discard_stale_health,
 # mirroring _discard_stale_reviews). A non-terminal/in-flight state is NEVER cached.
 _health_result_file() { printf '%s' "$TREES/.health-result-$1-$2"; }
@@ -5983,7 +6065,7 @@ record_health_result() {
 # marker is keyed by pr alone and released synchronously within the gate, so it is never stale).
 _discard_stale_health() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.health-result-$pr-"*; do
+  for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -6114,9 +6196,8 @@ _health_worker() {
       _hw_line="FLAKY"$'\t'"$_hw_id"
     else
       mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
-      if grep -q 'tab-leak-guard' "$_hw_log" 2>/dev/null; then
-        _hw_detail="$(grep -m1 'tab-leak-guard' "$_hw_log" 2>/dev/null | tr '\t\n' '  ')"
-      else
+      _hw_detail="$(_health_leak_guard_line "$_hw_log")"
+      if [ -z "$_hw_detail" ]; then
         _hw_notok2="$(_health_fail_detail "$_hw_log")"
         _hw_detail="$_hw_notok2"
       fi
@@ -6219,10 +6300,20 @@ _healthcheck_gate() {
         # A tab-leak-guard CODE ERROR is INFRA/TRANSIENT (issue #78 part 2), never a code bug: it must
         # NEVER be sha-cached, else the cache replays the transient every tick and FREEZES red. Skip the
         # cache so the next tick re-dispatches fresh + self-heals; a genuine code error caches + stays red.
-        case "$_hg_d" in
-          *tab-leak-guard*) : ;;
-          *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d" ;;
-        esac
+        # The skip is BOUNDED (HERD-228): count the re-dispatches for this (pr,sha) and, once the cap is
+        # reached, cache the red under the escalation tag so the loop ends in a needs-you row rather than
+        # re-running a ~9-minute suite forever. An empty sha means the cache (and so the cap) is disabled.
+        if _health_is_leak_guard_detail "$_hg_d"; then
+          local _hg_n=0
+          [ -n "$_hg_sha" ] && _hg_n="$(_health_infra_bump "$_hg_pr" "$_hg_sha")"
+          if [ "${_hg_n:-0}" -ge "$_HEALTH_INFRA_REDISPATCH_MAX" ]; then
+            _hg_d="${_HEALTH_INFRA_CAP_TAG} (${_hg_n}× infra) · ${_hg_d}"
+            record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+            journal_append infra_event component agent-watch reason health_infra_cap pr "$_hg_pr" sha "$_hg_sha" count "$_hg_n"
+          fi
+        else
+          record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+        fi
         _handle_health_codeerror "$_hg_pr" "$_hg_slug" "$_hg_sha" "$_hg_idx" "$_hg_dir" "$_hg_d"
         _HC_RESULT="CODEERROR"
         journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_d" ;;

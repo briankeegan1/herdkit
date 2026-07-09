@@ -205,6 +205,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic leak-guard exemption + infra cap (HERD-228) test passes" {
+  run bash "$REPO/tests/test-watcher-leakguard-exemption.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic builder-secrets-isolation test passes" {
   run bash "$REPO/tests/test-builder-secrets-isolation.sh"
   [ "$status" -eq 0 ]
