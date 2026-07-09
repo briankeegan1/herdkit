@@ -193,6 +193,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver idle re-dispatch (HERD-225) test passes" {
+  run bash "$REPO/tests/test-resolver-idle-redispatch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]

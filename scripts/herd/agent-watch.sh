@@ -2615,14 +2615,90 @@ _resolver_liveness_verdict() {
   printf 'UNKNOWN'
 }
 
-# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING, so
-# a (re)dispatch must HOLD: a second resolver on the same worktree would race the first on
-# `git merge`/`git push`. This is the SINGLE guard that prevents a double-dispatch, and it is now the
-# exact complement of a POSITIVELY-dead verdict: ALIVE, STARTING and UNKNOWN all hold; only DEAD frees
-# the slot. Both the same-sha (dead-resolver) and new-commit respawn paths consult it, so a respawn
-# only ever fires once the prior resolver is PROVABLY gone — never merely unseen.
+# _resolver_agent_status <slug> — agent_status word for resolve·<slug> from the tick's $AGENTS_JSON
+# roster (empty when absent/unreadable). Identity match tolerates either `name` or `agent` (same
+# breadth as _resolver_roster_listed). Reads the tick snapshot, never a live herdr call — hermetic
+# under test and consistent with every other resolver oracle on this path.
+_resolver_agent_status() {
+  [ -n "${AGENTS_JSON:-}" ] || { printf ''; return 0; }
+  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+import sys, json, os
+name = os.environ["NAME"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+except Exception:
+  agents = []
+for a in agents:
+  if a.get("name") == name or a.get("agent") == name:
+    print(a.get("agent_status", "") or "", end="")
+    raise SystemExit(0)
+' 2>/dev/null || true
+}
+
+# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is ACTIVELY RESOLVING (or may
+# still be starting / invisible), so a (re)dispatch must HOLD: a second resolver on the same worktree
+# would race the first on `git merge`/`git push`. This is the SINGLE guard that prevents a
+# double-dispatch.
+#
+# HERD-206: ALIVE / STARTING / UNKNOWN all hold; only DEAD frees the slot — never spawn over something
+# we cannot positively prove is free (a blipped roster is not death).
+#
+# HERD-225: an IDLE/DONE-but-ALIVE resolver has FINISHED its round (pushed or escalated) yet the
+# agent pane stays up. Holding forever on mere ALIVE left NEW conflicts stranded — the watcher could
+# neither re-dispatch (guard held) nor rely on the idle agent (it is not working). So ALIVE +
+# agent_status idle|done frees the slot (past the startup grace — a fresh agent can blip idle before
+# picking up its task). The spawn path reaps the idle agent so the name can be reclaimed. WORKING
+# still holds; STARTING / UNKNOWN still hold.
 _resolver_in_flight() {
-  [ "$(_resolver_liveness_verdict "$1" "${2:-}")" != "DEAD" ]
+  local _rif_slug="$1" _rif_pr="${2:-}" _rif_v _rif_st
+  _rif_v="$(_resolver_liveness_verdict "$_rif_slug" "$_rif_pr")"
+  [ "$_rif_v" = "DEAD" ] && return 1
+  if [ "$_rif_v" = "ALIVE" ]; then
+    _rif_st="$(_resolver_agent_status "$_rif_slug")"
+    case "$_rif_st" in
+      idle|done)
+        # Finished its round — free for re-dispatch. Still hold inside the startup grace so a
+        # just-spawned agent that blips idle cannot be double-dispatched over.
+        _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
+        return 1
+        ;;
+    esac
+  fi
+  return 0
+}
+
+# _reap_idle_resolver_for_redispatch <slug> — HERD-225: before a (re)spawn, close any IDLE/DONE-but-
+# alive resolve·<slug> tab so herd-resolve.sh can claim the agent name. Without this, re-dispatch
+# fails with "agent name already used" (confirmed live on PR #328). WORKING resolvers are never
+# touched (the in-flight guard holds them). Fail-soft: missing tab / missing herdr / dry-run → no-op.
+_reap_idle_resolver_for_redispatch() {
+  local _rir_slug="$1" _rir_status _rir_reg _rir_tab _rir_adir _rir_pid
+  _rir_status="$(_resolver_agent_status "$_rir_slug")"
+  case "$_rir_status" in
+    idle|done) ;;
+    *) return 0 ;;
+  esac
+  [ -z "${DRYRUN:-}" ] || return 0
+  _rir_reg="${TREES:-${WORKTREES_DIR:-.}}/.herd-tabs"
+  if [ -f "$_rir_reg" ]; then
+    _rir_tab="$(awk -v s="resolve·${_rir_slug}" '$1==s {print $2; exit}' "$_rir_reg" 2>/dev/null || true)"
+    if [ -n "$_rir_tab" ]; then
+      herdr tab close "$_rir_tab" >/dev/null 2>&1 || true
+      journal_append reap_resolve_tab tab_id "$_rir_tab" slug "$_rir_slug" reason idle-redispatch
+      _herd_tabs_drop_row "$_rir_reg" "$_rir_tab"
+    fi
+  fi
+  # Headless registry: free the slot so the next launch owns a clean pid/status file (herdr tab
+  # close is a no-op under HERD_DRIVER=headless). Best-effort kill of a still-live detached pid.
+  _rir_adir="${WORKTREES_DIR:-${TREES:-.}}/.herd/agents/resolve·${_rir_slug}"
+  if [ -d "$_rir_adir" ]; then
+    _rir_pid="$(cat "$_rir_adir/pid" 2>/dev/null || true)"
+    if [ -n "$_rir_pid" ] && kill -0 "$_rir_pid" 2>/dev/null; then
+      kill "$_rir_pid" 2>/dev/null || true
+    fi
+    rm -rf "$_rir_adir" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
@@ -2637,10 +2713,15 @@ _resolver_in_flight() {
 # actually observed alive afterwards, so a spawn that never ACKed is auditable rather than inferred from
 # a silence. Behavior is unchanged (still best-effort, still never fails a tick): the record already
 # landed, the grace still runs, and the next tick's POSITIVE-death verdict re-dispatches within budget.
+#
+# IDLE-REDISPATCH (HERD-225): when the prior resolve·<slug> agent is still ALIVE but idle/done, reap
+# it first so the lane can reclaim the agent name (otherwise herdr refuses with "agent name already
+# used" and the new conflict sits forever).
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   local _sr_rc=0 _sr_ack _sr_roster
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
+  _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
   # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
