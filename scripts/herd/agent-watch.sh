@@ -2891,18 +2891,20 @@ for a in agents:
 ' 2>/dev/null || true
 }
 
-# _resolve_verdict_recorded <pr#> — true iff the resolver wrote a terminal verdict (DONE | ESCALATE)
-# for ANY sha of this PR. _resolve_result needs the sha the caller happens to hold; the idle-guard
-# only needs "did this resolver finish a round", so it globs the sha-scoped files instead. A written
-# verdict is the resolver's own last act: its round is OVER and the session is idle for real, never
-# parked mid-work.
-_resolve_verdict_recorded() {
-  local _rvr_pr="${1:-}" _rvr_f
-  [ -n "$_rvr_pr" ] || return 1
-  for _rvr_f in "${TREES:-.}"/.resolve-result-"$_rvr_pr"-*; do
-    [ -f "$_rvr_f" ] && return 0
-  done
-  return 1
+# _resolver_round_finished <pr#> [sha] — true iff the resolver wrote its terminal verdict (DONE |
+# ESCALATE) for the sha ACTUALLY IN FLIGHT. A resolver round is identified by pr+sha, never by pr
+# alone: verdict files are sha-scoped (_resolve_result_file) and are cleaned only at PR RETIREMENT,
+# so a PR-wide glob would match round 1's leftover verdict forever and report every later round as
+# "finished" — silently disabling the caller's park guard from the second conflict round onward.
+#
+# When the caller has no sha, fall back to the most-recently DISPATCHED sha for this PR; with no sha
+# at all the answer is "not finished" (the conservative side — the caller then consults park state).
+_resolver_round_finished() {
+  local _rrf_pr="${1:-}" _rrf_sha="${2:-}"
+  [ -n "$_rrf_pr" ] || return 1
+  [ -n "$_rrf_sha" ] || _rrf_sha="$(resolver_last_sha "$_rrf_pr" 2>/dev/null || true)"
+  [ -n "$_rrf_sha" ] || return 1
+  _resolve_result "$_rrf_pr" "$_rrf_sha" >/dev/null 2>&1
 }
 
 # _resolver_limit_parked <slug> — true iff the resolve·<slug> session is parked on the ACCOUNT USAGE
@@ -2912,19 +2914,41 @@ _resolve_verdict_recorded() {
 # The resolver runs IN the feature worktree (herd-resolve.sh resolves in place), so its sentinel and
 # ledger row live exactly where the builder's do. No new state, no new config key.
 #
-# Fail-soft to PARKED: an unreadable/garbled sentinel still means a limit hit was recorded, and
-# holding the dispatch slot is the conservative side — a held slot re-dispatches on a later tick,
-# a reaped session is gone for good.
+# THE SENTINEL IS SHARED with the builder that owns this worktree, so a sentinel that PREDATES this
+# resolver's dispatch is someone else's park — most often a builder park whose clear_limit ran without
+# the worktree arg and left the file behind. Treating that as a resolver park would hold the dispatch
+# slot forever, stranding re-dispatch rather than deferring it. So sentinel evidence must POSTDATE the
+# last dispatch for this slug. A sentinel written after we dispatched can only be this resolver's.
+#
+# Fail-soft to PARKED whenever the read itself is doubtful: an unreadable mtime, or an empty/garbled
+# sentinel, still means a limit hit was recorded. A held slot re-dispatches on a later tick; a reaped
+# session is gone for good. HERD_LIMIT_DETECT=off disables the guard with the rest of limit detection.
 _resolver_limit_parked() {
-  local _rlp_slug="$1" _rlp_wt
+  local _rlp_slug="$1" _rlp_wt _rlp_sent _rlp_since=0 _rlp_mt
+  [ "${HERD_LIMIT_DETECT:-on}" != "off" ] || return 1
+  # The park handler's ledger: slug-scoped, and clear_limit always drops the row on resume.
   if [ -n "${LIMIT_STATE:-}" ] && [ "$(limit_state "$_rlp_slug" 2>/dev/null || printf '')" = "scheduled" ]; then
     return 0
   fi
   _rlp_wt="${WORKTREES_DIR:-${TREES:-.}}/$_rlp_slug"
+  _rlp_sent="$(_limit_sentinel_file "$_rlp_wt")"
+  if [ -f "$_rlp_sent" ]; then
+    [ -n "${RESOLVE_STATE:-}" ] && _rlp_since="$(resolver_last_dispatch_epoch_slug "$_rlp_slug" 2>/dev/null || printf 0)"
+    [ -n "$_rlp_since" ] || _rlp_since=0
+    _rlp_mt="$(file_mtime "$_rlp_sent" 2>/dev/null || printf '')"
+    case "$_rlp_mt" in
+      ''|*[!0-9]*) return 0 ;;                       # unreadable mtime → fail soft to PARKED
+    esac
+    [ "$_rlp_mt" -ge "$_rlp_since" ] && return 0     # written since we dispatched → OUR park
+    return 1                                         # predates the dispatch → a stale foreign sentinel
+  fi
+  # No sentinel: the hookless banner-scrape fallback (already banner-shape guarded). It reads the
+  # NEWEST transcript under the worktree, and this guard only runs while the resolver is ALIVE — so
+  # the newest session is the resolver's own, not the builder's.
   _detect_limit_hit "$_rlp_slug" "$_rlp_wt" >/dev/null 2>&1
 }
 
-# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is ACTIVELY RESOLVING (or may
+# _resolver_in_flight <slug> <pr#> [sha] — true if a resolver for this slug is ACTIVELY RESOLVING (or may
 # still be starting / invisible), so a (re)dispatch must HOLD: a second resolver on the same worktree
 # would race the first on `git merge`/`git push`. This is the SINGLE guard that prevents a
 # double-dispatch.
@@ -2943,11 +2967,15 @@ _resolver_limit_parked() {
 # from a finished round, and a park legitimately outlasts any startup grace. Freeing the slot there
 # hands the pane to _reap_idle_resolver_for_redispatch, which kills the session and defeats
 # limit-park auto-resume (the engine's core capability). So idle|done past the grace ALSO consults
-# the park state: PARKED with no terminal verdict written ⇒ HOLD, exactly as pre-HERD-225 (the resume
-# scheduler owns that session). No park state, or a verdict already written ⇒ free + reap, as
-# HERD-225 intends. When nothing is parked this is byte-identical to HERD-225.
+# the park state: PARKED with no terminal verdict for the sha IN FLIGHT ⇒ HOLD, exactly as pre-HERD-225
+# (the resume scheduler owns that session). No park state, or a verdict already written for THIS sha
+# ⇒ free + reap, as HERD-225 intends. When nothing is parked this is byte-identical to HERD-225.
+#
+# <sha> is the sha whose resolver round is in question. Pass it: a resolver round is pr+sha, and the
+# PR-wide question ("has ANY round of this PR ever finished?") is true forever after round 1, which
+# would short-circuit the park guard away on every later conflict round. Callers all hold it.
 _resolver_in_flight() {
-  local _rif_slug="$1" _rif_pr="${2:-}" _rif_v _rif_st
+  local _rif_slug="$1" _rif_pr="${2:-}" _rif_sha="${3:-}" _rif_v _rif_st
   _rif_v="$(_resolver_liveness_verdict "$_rif_slug" "$_rif_pr")"
   [ "$_rif_v" = "DEAD" ] && return 1
   if [ "$_rif_v" = "ALIVE" ]; then
@@ -2958,7 +2986,7 @@ _resolver_in_flight() {
         # just-spawned agent that blips idle cannot be double-dispatched over.
         _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
         # …unless this "idle" is a usage-limit park awaiting auto-resume (HERD-246).
-        if ! _resolve_verdict_recorded "$_rif_pr" && _resolver_limit_parked "$_rif_slug"; then
+        if ! _resolver_round_finished "$_rif_pr" "$_rif_sha" && _resolver_limit_parked "$_rif_slug"; then
           return 0
         fi
         return 1
@@ -3082,7 +3110,7 @@ _classify_conflict() {
     esac
     # Dispatched for this sha, no verdict yet. If the resolver is still in flight (agent alive, or a
     # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
-    if _resolver_in_flight "$cslug" "$cpr"; then
+    if _resolver_in_flight "$cslug" "$cpr" "$csha"; then
       DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
       FLAIR_STATE[ci]="busy"
       return
@@ -3109,7 +3137,7 @@ _classify_conflict() {
   # for minutes while ticks are seconds. Re-dispatching now would put a second resolver on the SAME
   # worktree, racing the first on `git merge`/`git push`. So HOLD while it is in flight; the respawn
   # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
-  if _resolver_in_flight "$cslug" "$cpr"; then
+  if _resolver_in_flight "$cslug" "$cpr" "$csha"; then
     DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
     FLAIR_STATE[ci]="busy"
     return
@@ -5112,7 +5140,7 @@ _handle_stale_dup() {
     render
     journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
       round "$_hsd_round_num" reason "no live builder — dispatching conflict resolver to merge ${_hsd_base}"
-    _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+    _resolver_in_flight "$_hsd_slug" "$_hsd_pr" "$_hsd_sha" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
     DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     return 0
   fi
@@ -5162,7 +5190,7 @@ Why: ${_hsd_reason}"
       fi
       journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
         round "$_hsd_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
-      _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+      _resolver_in_flight "$_hsd_slug" "$_hsd_pr" "$_hsd_sha" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     else
       _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "agent pane not found"
