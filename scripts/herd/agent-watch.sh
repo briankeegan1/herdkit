@@ -4552,8 +4552,14 @@ record_healthcheck() {
 # every ledger write in the tick process, ordered. Runs in a subshell fork so all helpers are in scope.
 _health_worker() {
   local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line
+  # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
+  # tree) + a sha-keyed cache dir so a candidate whose failures ALL already fail on the base is
+  # surfaced as an inherited ⚠️ (rc 0 → CLEAN) instead of a merge-blocking code error — no fix-PR
+  # deadlocks on an inherited base failure. Scoped to THIS candidate gate only; the main-health worker
+  # deliberately does NOT set it (comparing main against itself would mask a genuine MAIN RED).
   # FULL run streamed to the live log (redirect = tailable as it runs); rc drives the verdict class.
-  bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
+  HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
   _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
   if [ "$_hw_rc" -eq 0 ]; then
     case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
@@ -4561,7 +4567,9 @@ _health_worker() {
     _hw_notok="$(_health_first_notok "$_hw_log")"; [ -n "$_hw_notok" ] || _hw_notok="$_hw_first"
     _hw_id="$(_health_fail_identity "$_hw_notok")"
     # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
-    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    # Baseline-aware on the retry too (HERD-190), so an inherited-only failure still collapses to rc 0.
+    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+      bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
       _hw_line="FLAKY"$'\t'"$_hw_id"

@@ -417,6 +417,15 @@ fi
 : "${INTERACTION_TEST_CMD:=""}"   # command that drives widgets and asserts dependent output changes; exit 0 clean, 1 code error, 2 data/env
 : "${SMOKE_CMD:=""}"              # optional resolver smoke gate
 
+# BASELINE_AWARE_GATE — baseline-aware healthcheck gate (HERD-190). on (default) → a heavy code error
+# whose failing tests ALL already fail on the base (origin/main) is treated as INHERITED (a tolerated
+# ⚠️), not a merge-blocking code error, so a fix-PR never deadlocks on a base failure it did not
+# introduce. Only ever DOWNGRADES a red to a tolerated ⚠️; byte-identical when the base is green (an
+# empty base known-failure set = every PR failure is introduced) and fully fail-soft (an unresolvable
+# or unparseable base blocks exactly as before). off → the classic absolute pass/fail gate, byte-
+# identical to pre-HERD-190. Consumed by healthcheck.sh (the watcher passes HERD_BASELINE_DIR=$MAIN).
+: "${BASELINE_AWARE_GATE:="on"}"
+
 # ATTRIBUTION_POLICY — commit-attribution lint gate (HERD-121). Ships dormant: default ''
 # (empty) → lint absent, byte-identical to before. Set to no-ai-coauthor to scan the PR's
 # commits (git log <DEFAULT_BRANCH>..HEAD) for AI co-author markers (Co-Authored-By: Claude*,
