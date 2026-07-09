@@ -876,6 +876,31 @@ herd_driver_launch_agent() {
   "${argv[@]}"
 }
 
+# ── one-shot exec (HERD-175 — HERD-150 P3 drainers) ───────────────────────────────────────────────
+# herd_driver_oneshot_exec <prompt> <model> [runtime-arg …] — run a HEADLESS ONE-SHOT agent query with
+# NO pane: the DRIVER_AGENT_ONESHOT_EXEC capability (docs/driver-abstraction.md § agent-runtime
+# portability, class 2). This is the ONE seam the drainer-family one-shot `claude -p` call sites route
+# through — the mid-flight advisor (herd-advise.sh) and the pre-merge reviewer's headless `-p` passes
+# (herd-review.sh: the local panel, local single, and headless-PR paths) — so a non-Claude runtime
+# rebinds the incantation in ONE place instead of at every drainer site.
+#
+# Every arg AFTER <model> is forwarded VERBATIM (the caller's word-split $CLAUDE_FLAGS, plus the
+# reviewer's --output-format stream-json --verbose), so the composed argv is BYTE-IDENTICAL to the
+# inlined `claude -p "$prompt" --model "$model" $flags …` each site had before — the drift guard in
+# tests/test-driver-agent-exec.sh + the compose proof in tests/test-oneshot-exec-seam.sh are the rail.
+#
+# NO driver branch: a one-shot query is pane-INDEPENDENT, so herdr-claude and headless run the
+# IDENTICAL command (both .driver files bind DRIVER_AGENT_ONESHOT_EXEC to the same string — the exec
+# surface is a property of the RUNTIME, not the mux). NOT fail-soft (a deliberate exception, like the
+# model resolver): it returns the runtime's exit status UNCHANGED so each caller keeps its OWN
+# degrade/verdict handling — advise degrades to 'unavailable' on non-zero/empty, review treats a
+# non-zero-without-verdict as INFRA-FAIL; wrapping the status here would corrupt both.
+herd_driver_oneshot_exec() {
+  local prompt="${1:-}" model="${2:-}"
+  shift 2 2>/dev/null || set --
+  claude -p "$prompt" --model "$model" "$@"
+}
+
 # ── CLI entrypoint ───────────────────────────────────────────────────────────────────────────────
 # Only runs when EXECUTED (not sourced): `bash driver.sh <cap> …`. Sources herd-config.sh for
 # WORKTREES_DIR, then dispatches to the capability. This is what the rendered headless coordinator
@@ -896,12 +921,13 @@ _herd_driver_cli() {
     pane-alive)  herd_driver_pane_alive "$@" ;;
     agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
     create-tab)  herd_driver_create_tab "$@" ;;
+    oneshot-exec) herd_driver_oneshot_exec "$@" ;;   # <prompt> <model> [runtime-arg …] → claude -p …
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 

@@ -269,7 +269,7 @@ _panel_member() {
   local i="$1"
   local mfile="$_PANEL_DIR/m.$i"
   ( cd "$CWD" 2>/dev/null && \
-    claude -p "$_PANEL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+    herd_driver_oneshot_exec "$_PANEL_TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
       --output-format stream-json --verbose 2>/dev/null \
     | python3 -uc "$REVIEW_STREAM_FORMATTER" ) > "$mfile" 2>/dev/null || true
 }
@@ -358,7 +358,7 @@ if [ "$REVIEW_MODE" = "local" ]; then
     # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
     # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
     (set -o pipefail; cd "$CWD" 2>/dev/null && \
-      claude -p "$LOCAL_TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+      herd_driver_oneshot_exec "$LOCAL_TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
         --output-format stream-json --verbose 2>&1 | \
       python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
     rc=${PIPESTATUS[0]}
@@ -696,7 +696,7 @@ else
   # The formatter emits: tool name + one-line input summary (bash command, file path, etc.)
   # and the reviewer's reasoning text — never the old bare '[tool] Bash'.
   (set -o pipefail; cd "$CWD" 2>/dev/null && \
-    claude -p "$TASK" --model "$REVIEW_MODEL" $CLAUDE_FLAGS \
+    herd_driver_oneshot_exec "$TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
       --output-format stream-json --verbose 2>&1 | \
     python3 -uc "$REVIEW_STREAM_FORMATTER") >>"$LOG" 2>&1
   rc=$?
