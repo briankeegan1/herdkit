@@ -127,9 +127,9 @@ CLAIM_REQUIRED="on"
 CONTEXT_PROVISION="codemap"
 
 # — Review concurrency / tiering —
-REVIEW_CONCURRENCY="2"
+REVIEW_CONCURRENCY="3"
 # keep 1: worktrees share one git object store
-HEALTH_CONCURRENCY="1"
+HEALTH_CONCURRENCY="2"
 # HERD-129: run the healthcheck against fresh default-branch HEAD after each merge and raise a loud
 # 'MAIN RED' alarm row + notification on a red main (alarm only — never gates/reverts). Enabled here
 # because herdkit dogfoods its own merge-time tripwire; ships OFF for other consumers.
@@ -175,3 +175,11 @@ ENGINE_MIN=1
 # (HERD-179), so this project's watcher pulls the engine forward on its own once a merge raises
 # the floor. `herd update`'s builders-mid-flight refusal is the quiescent-window guard.
 ENGINE_AUTOUPDATE="auto"
+DOCS_ONLY_GLOB="[.](md|txt)"
+GATE_DISPATCH="parallel"
+SCRIBE_LINGER_SECS="90"
+WATCHER_FLAIR="on"
+BASELINE_AWARE_GATE="on"
+HEALTHCHECK_AUTOFIX="true"
+TRACKED_SPAWNS="required"
+SWEEP_AUTO="auto"
