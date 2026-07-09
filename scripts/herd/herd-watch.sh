@@ -14,9 +14,15 @@
 # Dry-run (renders + gates but performs NO merge/remove/scribe/ff):
 #
 #     AGENT_WATCH_DRYRUN=1 bash scripts/herd/herd-watch.sh
+#
+# Singleton (HERD-209 / HERD-252): agent-watch.sh acquires HERD_WATCHER_LOCK at startup. If a LIVE
+# watcher already holds it, this process prints the holder pid on stderr
+# (`herd-watch: already running (pid <N>) — refusing duplicate`) and EXITS NON-ZERO immediately —
+# never blocks/hangs. A free or stale (dead-pid) lock is adopted and the console starts normally.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # The launch-binding banner + foreign-cwd guard (issue #60) runs inside agent-watch.sh, which this
 # execs into (same process): it sets HERD_REQUIRE_PROJECT_CONFIG, prints the resolved
 # WORKSPACE_NAME/PROJECT_ROOT banner, and refuses a foreign $PWD unless HERD_ALLOW_FOREIGN_CWD=1.
+# LIVE-lock refusal (HERD-252) also lives there: loud stderr + non-zero exit, never a silent hang.
 exec bash "$HERE/agent-watch.sh"
