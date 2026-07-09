@@ -187,6 +187,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver liveness / false-dead (HERD-206) test passes" {
+  run bash "$REPO/tests/test-resolver-liveness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]
@@ -283,6 +289,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic healthcheck-autofix + row-truth test passes" {
+  run bash "$REPO/tests/test-health-autofix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
   run bash "$REPO/tests/test-agent-liveness.sh"
   [ "$status" -eq 0 ]
@@ -373,6 +385,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic stale-base autofix (HERD-199) unit test passes" {
+  run bash "$REPO/tests/test-stale-base-autofix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
   run bash "$REPO/tests/test-watcher-discovery-scope.sh"
   [ "$status" -eq 0 ]
@@ -400,6 +418,18 @@ setup() {
 
 @test "hermetic connector seams edges (HERD-170) test passes" {
   run bash "$REPO/tests/test-connector-seams.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic engine version handshake + ENGINE_AUTOUPDATE (HERD-179) test passes" {
+  run bash "$REPO/tests/test-engine-handshake.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic control-room sweep (HERD-191) test passes" {
+  run bash "$REPO/tests/test-sweep.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

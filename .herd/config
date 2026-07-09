@@ -68,6 +68,8 @@ SPAWN_AHEAD=1
 HERD_REPO="briankeegan1/herdkit"
 # Dogfood: bounce BLOCK reviews straight to the builder agent (3-round cap, sha-keyed).
 REVIEW_AUTOFIX="true"
+# Dogfood HERD-199: auto-heal mechanical stale-base holds (shared refix budget).
+STALE_BASE_AUTOFIX="on"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Explicitly materialized config (2026-07-06). Every key below is written at its
@@ -162,3 +164,14 @@ COORDINATOR_WATCHDOG="on"
 # restart a silently-dead EMPTY builder once (never blows away work)
 DEAD_BUILDER_AUTORESPAWN="on"
 DOCTOR_STARTUP_HINT="on"
+
+# ── Engine version handshake (HERD-179) ──────────────────────────────────────
+# ENGINE_MIN — the minimum engine LEVEL this project requires. `herd upgrade` stamps it
+# monotonically to the level of the engine that ran it (scripts/herd/engine-version.sh's
+# _HERD_ENGINE_LEVEL). A checkout below this floor refuses every write path (lane spawn,
+# herd-claim, scribe apply, backend switch) with the remedy: run herd update.
+ENGINE_MIN=1
+# ENGINE_AUTOUPDATE — NON-default (ships off): operator pre-approved "auto" for herdkit itself
+# (HERD-179), so this project's watcher pulls the engine forward on its own once a merge raises
+# the floor. `herd update`'s builders-mid-flight refusal is the quiescent-window guard.
+ENGINE_AUTOUPDATE="auto"

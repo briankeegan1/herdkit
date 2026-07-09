@@ -80,6 +80,7 @@ grep -qF 'driver.sh send-text'            "$SK" || fail "headless send-text inca
 grep -qF 'driver.sh focus'                "$SK" || fail "headless focus-agent incantation not rendered"
 # the herdr binding is genuinely GONE from the tokenized send-text site (proves the swap is real).
 grep -qF 'herdr pane run <agent-pane> "<text>"' "$SK" && fail "old herdr send-text binding survived headless" || true
+grep -qF 'herdr pane send-keys <agent-pane> Enter' "$SK" && fail "old herdr send-text Enter binding survived headless" || true
 ok; echo "PASS (1) HERD_DRIVER=headless renders cleanly, headless incantations swapped in"
 
 # ── 2. Unknown driver error lists BOTH shipped drivers. ──────────────────────────────────────────

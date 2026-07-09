@@ -57,7 +57,8 @@ Capabilities this skill uses directly:
 - **`DRIVER:focus-agent`** — `{{DRIVER_FOCUS_AGENT}}` — jump to (and hand off to) a builder's
   agent by its slug.
 - **`DRIVER:send-text`** — `{{DRIVER_SEND_TEXT}}` — send a prompt or command to a
-  builder's **agent** pane; Claude Code auto-submits it (no separate keystroke). Always target the
+  builder's **agent** pane and **submit** it (type the text, then an explicit Enter keystroke —
+  HERD-186: `pane run` alone can leave text sitting in the agent prompt buffer). Always target the
   agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
   where text vanishes and the agent never wakes.
 - **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code
@@ -397,13 +398,47 @@ or escalate — then act on what the record actually shows.
 When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict
 directly to the builder: it finds the builder's idle agent pane, sends a re-task prompt with
 `gh pr view <n>` instructions to fix and push, and verifies the agent wakes within ~15 s (retrying
-once). Console shows **refixing (round k/3)** while in flight; **fix requested · awaiting push**
-on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent won't wake.
-Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**. Sha-keyed
-semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
+once). Console shows **refixing (round k/3)** while in flight; **fix in progress · awaiting push
+(round k/3)** on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent
+won't wake. Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**.
+Sha-keyed semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for
+that sha.
 
 When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
 you re-task builders by hand via `{{DRIVER_FOCUS_AGENT}}` or by messaging the agent pane. <!-- DRIVER:focus-agent -->
+
+### Auto-heal stale-base holds (STALE_BASE_AUTOFIX)
+
+When `.herd/config` sets `STALE_BASE_AUTOFIX=on`, a **stale-base** hold from the pre-merge
+stale-duplicate gate (touched files moved on `$DEFAULT_BRANCH`) self-heals: the watcher re-tasks
+the live builder with `git merge $DEFAULT_BRANCH` (or dispatches the conflict resolver when no live
+builder remains). Console shows **rebasing · awaiting push**. Shares the `REFIX_MAX_ROUNDS` budget
+with review autofix; only bounce-exhaustion escalates to **needs you**. The **duplicate** flavor
+(re-implements shipped work) always stays a human judgment call. Default is `off` (ship-dormant).
+
+### Auto-refix a red healthcheck (HEALTHCHECK_AUTOFIX)
+
+A reproduced pre-merge healthcheck **CODE ERROR** is the same shape of finding as a BLOCK review —
+a machine-checkable defect in the builder's own diff — so `HEALTHCHECK_AUTOFIX=true` bounces it on
+the same rails: the builder's agent pane receives the failing test line plus the path of the tailable
+suite log, once per `(pr, sha)`. The round budget is **shared with the review refix** — `REFIX_MAX_ROUNDS`
+counts review and healthcheck bounces *together*, one budget per PR — so a builder can never be bounced
+three times by review and three more by the healthcheck. A limit-parked builder is never typed at (it
+routes to the park/resume handler, keeping its bounce for when it returns), a dead or missing agent
+escalates without burning a round, and a `tab-leak-guard` trip is treated as the infra transient it is
+(never bounced). Exhausting the budget escalates to **needs you · refix limit …**.
+
+`HEALTHCHECK_AUTOFIX=false` (the default) bounces nothing: the red row holds the PR and you re-task
+by hand.
+
+### Row truth: "needs you" means nobody is on it
+
+A red row says **needs you** only when *no agent is working that red* — and then it always carries
+both the **blocker** (which test failed) and the **remedy** (what to do, and where the full suite
+output lives). Whenever a builder is actively fixing it — because the watcher bounced it, or because
+you re-tasked the agent by hand and its status reads `working` against that same red sha — the row
+instead reads **fix in progress · awaiting push (round k/3)**. So a `needs you` on the console is
+always real work for you, never work already in flight.
 
 ### Approve pending merges (MERGE_POLICY=approve)
 

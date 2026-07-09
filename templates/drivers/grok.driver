@@ -29,7 +29,7 @@
 #    multiplexer, so every herdr incantation below is byte-for-byte the default's. ──────────────────
 DRIVER_LIST_AGENTS='herdr agent list'
 DRIVER_FOCUS_AGENT='herdr agent focus <slug>'
-DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"'
+DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"; herdr pane send-keys <agent-pane> Enter'
 DRIVER_SWITCH_MODEL='herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"'
 
 # ── MUX capabilities the LANE SCRIPTS + watcher exercise (bound so the driver covers the FULL
