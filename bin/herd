@@ -2778,6 +2778,13 @@ cmd_conformance() {
 # user with a broken/weird setup can self-diagnose anytime; also the gate cmd_init runs before it
 # writes any config, and install.sh runs (advisory) at install time. Exits non-zero when a HARD dep
 # is missing/broken so `herd doctor` is scriptable in CI.
+#
+#   herd doctor              the dependency doctor (git/gh/claude/python3/herdr + config dup lint).
+#   herd doctor --posture    the CONFIG-POSTURE doctor (HERD-154): a deterministic, no-LLM, report-only
+#                            lint of THIS project's live .herd/config — flags incoherent knob combos
+#                            (a lever superseded/ignored by another key) and reports whether the
+#                            operator's effective posture is exercised by the posture-matrix sim. It is
+#                            advisory: always exits 0, never a gate (scripts/herd/posture-lint.sh).
 cmd_doctor() {
   # Source the config loader too: herd_doctor's config-dup check (issue #115) uses its scanner
   # (_herd_config_dup_keys). Pre-set the once-per-process marker so the loader's PASSIVE dup warning
@@ -2787,7 +2794,15 @@ cmd_doctor() {
   . "$SCRIPTS_DIR/herd-config.sh"
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-preflight.sh"
-  herd_doctor || exit 1
+  case "${1:-}" in
+    --posture)
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/posture-lint.sh"
+      herd_doctor_posture   # report-only, always 0 — advisory, never a gate
+      return 0 ;;
+    "") herd_doctor || exit 1 ;;
+    *)  die "usage: herd doctor [--posture]" ;;
+  esac
 }
 
 cmd_status() {
@@ -5536,6 +5551,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       report every problem at once with per-platform install hints;
                                       soft deps (glow, shellcheck, bats) warn only. Exits non-zero
                                       when a required dep is missing/broken. (bypass: HERD_SKIP_DOCTOR=1)
+  herd doctor --posture               config-posture lint (no-LLM, report-only): flag incoherent knob
+                                      combos (a lever superseded/ignored by another key, each with a
+                                      fix hint) and report whether your effective posture is exercised
+                                      by the posture-matrix sim. Advisory — always exits 0.
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
