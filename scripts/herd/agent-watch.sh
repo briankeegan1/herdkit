@@ -3438,10 +3438,11 @@ _sweep_tracker_state() {
 # Enabled by REVIEW_AUTOFIX=true in .herd/config (default false). When the watcher records a
 # BLOCK verdict for PR <n> (slug S), it finds S's AGENT pane (NOT the tab's root shell pane —
 # text sent there vanishes and the agent never wakes) REGARDLESS of whether the agent reads idle
-# or 'done', and submits the re-task prompt via `herdr pane run` — command text + Enter, the one
-# mechanism that actually SUBMITS the prompt (cf. the 'herdr agent send doesn't press Enter' gotcha).
-# A 'done' builder's Claude TUI is still up and waiting, so this raw submit wakes it instantly, the
-# same way a manual `herdr pane run <pane> <text>` does (issue #86). It then verifies agent_status
+# or 'done', and submits the re-task prompt via the DRIVER send-text surface: type the text
+# (`herdr pane run`) then an explicit submit keystroke (`herdr pane send-keys Enter`) — HERD-186.
+# Live 2026-07-08: `pane run` alone typed REVIEW_AUTOFIX / coordinator re-tasks into the agent
+# prompt buffer and did NOT auto-submit (text sat until a manual Enter); bounces silently no-op'd
+# (PR #284 journal: BLOCK with no refix_wake follow-through). After submit it verifies agent_status
 # flips to "working" over a BACKED-OFF poll window (several checks across ~HERD_REFIX_WAIT_TIMEOUT
 # seconds, default 15, per attempt), re-sending once before giving up. On persistent failure it
 # surfaces "needs you · auto-refix failed" on the row.
@@ -3450,9 +3451,9 @@ _sweep_tracker_state() {
 # (_resume_builder), on the theory their session had ENDED. But a 'done' agent's TUI is still in the
 # pane foreground, so the `cd … && claude --continue …` command line was typed into that TUI as
 # literal prompt text and never re-tasked the agent — the bounce escalated woke=0 (journal:
-# 'auto-refix wake woke=0 escalated=true (done → done)') even though a raw `herdr pane run` nudge
-# wakes the exact same agent. The raw-prompt submit below is now the single wake path for idle AND
-# done builders; _resume_builder remains for the limit-auto-resume scheduler (a truly-frozen session).
+# 'auto-refix wake woke=0 escalated=true (done → done)') even though a raw submit nudge wakes the
+# exact same agent. The raw-prompt submit below is now the single wake path for idle AND done
+# builders; _resume_builder remains for the limit-auto-resume scheduler (a truly-frozen session).
 #
 # Sha-keyed refix-once semantics mirror review-once: one bounce per BLOCK per sha. A new commit
 # changes the sha → a fresh bounce is eligible for the new sha's BLOCK (if any). Total bounces
@@ -3623,8 +3624,9 @@ _maybe_arm_review_escalation() {
   : > "$(_review_escalate_file "$_mare_pr")" 2>/dev/null || true
 }
 
-# _find_builder_pane_id <slug> — find the herdr agent pane_id for the builder whose name==slug
+# _find_builder_pane_id <slug> — find the herdr agent pane_id for the builder whose identity==slug
 # and whose agent_status is "idle" (idle means it's waiting for a task, not already working).
+# Identity is `name` when set (lane-started builders), else `agent` (report-agent-only registrations).
 # Prints the pane_id to stdout; prints nothing if the agent is absent or already working.
 _find_builder_pane_id() {
   local _fpid_slug="$1"
@@ -3634,7 +3636,8 @@ slug = os.environ["SLUG"]
 try:
   agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
   for a in agents:
-    if a.get("name") == slug and a.get("agent_status") == "idle":
+    ident = a.get("name") or a.get("agent") or ""
+    if ident == slug and a.get("agent_status") == "idle":
       print(a.get("pane_id", ""), end="")
       break
 except Exception:
@@ -3643,6 +3646,7 @@ except Exception:
 }
 
 # _agent_status <slug> — current agent_status string for this agent (empty if not found).
+# Identity match: `name` when set, else `agent` (same rule as _find_builder_pane_id).
 _agent_status() {
   local _as_slug="$1"
   herdr agent list 2>/dev/null | SLUG="$_as_slug" python3 -c '
@@ -3651,7 +3655,8 @@ slug = os.environ["SLUG"]
 try:
   agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
   for a in agents:
-    if a.get("name") == slug:
+    ident = a.get("name") or a.get("agent") or ""
+    if ident == slug:
       print(a.get("agent_status", ""), end="")
       break
 except Exception:
@@ -3807,20 +3812,20 @@ _handle_block_verdict() {
 ${_hbv_finding}Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
       # Target the builder's AGENT pane whether it reads idle OR 'done' (never a 'working' one) —
-      # a 'done' builder's Claude TUI is still up and waiting, so submitting the raw re-task prompt
-      # via `herdr pane run` (command text + Enter) wakes it exactly as a manual nudge does (issue
-      # #86). This is the SINGLE wake path for both states; the old idle-only lookup + `--continue`
-      # resume for 'done' builders never actually re-tasked them (woke=0 → escalated on every BLOCK).
+      # a 'done' builder's agent TUI is still up and waiting, so submitting the raw re-task prompt
+      # (type + explicit Enter — HERD-186 / issue #86) wakes it. This is the SINGLE wake path for
+      # both states; the old idle-only lookup + `--continue` resume for 'done' builders never
+      # actually re-tasked them (woke=0 → escalated on every BLOCK).
       _hbv_pane_id="$(_find_builder_pane_id_any "$_hbv_slug")"
       if [ -n "$_hbv_pane_id" ]; then
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
-        # Submit the prompt via the run/Enter path, then verify wake over a backed-off window; if the
-        # first window expires, re-send once (in case pane run dropped the line) and verify again.
-        herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
+        # Submit via the driver send-text seam (pane run + send-keys Enter), then verify wake over a
+        # backed-off window; if the first window expires, re-send once and verify again.
+        herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
         if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
           _hbv_woke=1
         else
-          herdr pane run "$_hbv_pane_id" "$_hbv_prompt" >/dev/null 2>&1 || true
+          herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
           if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
             _hbv_woke=1
           else
@@ -4257,9 +4262,10 @@ _shq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-# _find_builder_pane_id_any <slug> — pane_id for the agent named <slug> REGARDLESS of idle/done/ended
-# status, but NEVER a "working" one (resuming a live session would double-drive it). The resume path
-# targets a builder whose session has ENDED, which the idle-only _find_builder_pane_id deliberately
+# _find_builder_pane_id_any <slug> — pane_id for the agent identified by <slug> REGARDLESS of
+# idle/done/ended status, but NEVER a "working" one (resuming a live session would double-drive it).
+# Identity is `name` when set, else `agent` (report-agent-only registrations have no name). The resume
+# path targets a builder whose session has ENDED, which the idle-only _find_builder_pane_id deliberately
 # misses — and that idle-only miss is exactly why the 2026-07-02 refix bounce to a 'done' builder
 # escalated woke=0. Prints the pane_id; prints nothing if absent or already working.
 _find_builder_pane_id_any() {
@@ -4270,7 +4276,8 @@ slug = os.environ["SLUG"]
 try:
   agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
   for a in agents:
-    if a.get("name") == slug and a.get("agent_status") != "working":
+    ident = a.get("name") or a.get("agent") or ""
+    if ident == slug and a.get("agent_status") != "working":
       print(a.get("pane_id", ""), end="")
       break
 except Exception:

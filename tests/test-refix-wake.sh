@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# test-refix-wake.sh — hermetic tests for the issue-#86 auto-refix WAKE fix.
+# test-refix-wake.sh — hermetic tests for the issue-#86 / HERD-186 auto-refix WAKE fix.
 #
 # Regression target: when a review returned BLOCK, the auto-refix bounce could not wake a builder
 # whose agent read 'done' — the old path reserved 'done' builders for a `claude --continue` relaunch,
 # but that command line was typed into the still-present Claude TUI as literal prompt text and never
-# re-tasked the agent (journal: 'auto-refix wake woke=0 escalated=true (done → done)'). A manual
-# `herdr pane run <pane> <text>` (command text + Enter) wakes the same agent instantly.
+# re-tasked the agent (journal: 'auto-refix wake woke=0 escalated=true (done → done)'). HERD-186:
+# even a raw `herdr pane run` can leave text sitting in the agent prompt buffer until a human
+# `herdr pane send-keys Enter` — so the shipped wake path is type + explicit Enter + verify.
 #
 # These tests drive the REAL _handle_block_verdict + the REAL backed-off _wait_agent_working (only
-# `date +%s`/`sleep` are mocked so no wall-clock time passes) against a herdr stub whose `pane run`
-# actually flips the stubbed agent from 'done' → 'working' — modelling the real wake — and assert:
-#   (A) a 'done' builder is woken by a RAW-prompt `herdr pane run` submit (not `claude --continue`);
+# `date +%s`/`sleep` are mocked so no wall-clock time passes) against a herdr stub that models the
+# live bug: `pane run` alone does NOT wake; only `pane run` + `send-keys Enter` flips done→working.
+# Asserts:
+#   (A) a 'done' builder is woken by type+Enter submit (not `claude --continue`); Enter is required;
 #       the agent transitions done→working and the bounce records woke=1 / escalated=false.
 #   (B) the backed-off poll catches a wake that arrives a few checks after the submit (single submit).
 #   (C) a submit that never wakes exhausts both backed-off windows → re-sent once, then escalates.
@@ -35,12 +37,14 @@ for cmd in gh git; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/$cmd"; chmod +x "$BIN/$cmd"
 done
 
-# herdr stub:
+# herdr stub (HERD-186 model of the live bug):
 #   agent list — reports the agent named STUB_AGENT_NAME with a status read from $STUB_STATUS_FILE
 #                (default "done"). If STUB_WAKE_COUNTDOWN_FILE holds N>0, force "done" and decrement
 #                (a wake that arrives only after N status checks — exercises the backed-off poll).
-#   pane run   — logs the submitted COMMAND TEXT ($4) to $STUB_PANE_RUN_LOG; when STUB_WAKE_ON_RUN=1
-#                it flips $STUB_STATUS_FILE to "working" (the submit woke the agent).
+#   pane run   — logs the submitted COMMAND TEXT ($4) to $STUB_PANE_RUN_LOG; marks the pane as having
+#                pending typed text. Does NOT wake by itself (models the live stuck-in-buffer bug).
+#   pane send-keys — when keys include Enter on a pane with pending text AND STUB_WAKE_ON_SUBMIT=1,
+#                flips $STUB_STATUS_FILE to "working" (the Enter submit woke the agent).
 cat > "$BIN/herdr" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
@@ -59,7 +63,25 @@ case "$1 $2" in
     # logged separately (for content greps) and must never be line-counted.
     [ -n "${STUB_PANE_RUN_CALLS:-}" ] && printf '%s\n' "$3" >> "$STUB_PANE_RUN_CALLS"
     [ -n "${STUB_PANE_RUN_LOG:-}" ]   && printf '%s\n' "$4" >> "$STUB_PANE_RUN_LOG"
-    [ "${STUB_WAKE_ON_RUN:-0}" = "1" ] && [ -n "${STUB_STATUS_FILE:-}" ] && echo working > "$STUB_STATUS_FILE"
+    # Mark pending typed text — wake only happens on send-keys Enter (HERD-186).
+    [ -n "${STUB_PENDING_FILE:-}" ] && printf '%s\n' "$3" > "$STUB_PENDING_FILE"
+    ;;
+  "pane send-keys")
+    # args: pane(1) send-keys(2) <pane_id>(3) <key…>(4..). Log pane + keys; wake on Enter after run.
+    _sk_pane="${3:-}"; shift 3 || true
+    _sk_keys="$*"
+    [ -n "${STUB_SENDKEYS_LOG:-}" ] && printf '%s %s\n' "$_sk_pane" "$_sk_keys" >> "$STUB_SENDKEYS_LOG"
+    case " ${_sk_keys} " in
+      *" Enter "*)
+        if [ "${STUB_WAKE_ON_SUBMIT:-0}" = "1" ] && [ -n "${STUB_STATUS_FILE:-}" ]; then
+          if [ -z "${STUB_PENDING_FILE:-}" ] || [ ! -f "${STUB_PENDING_FILE:-}" ] \
+             || grep -qxF "$_sk_pane" "${STUB_PENDING_FILE:-}" 2>/dev/null; then
+            echo working > "$STUB_STATUS_FILE"
+            [ -n "${STUB_PENDING_FILE:-}" ] && rm -f "$STUB_PENDING_FILE"
+          fi
+        fi
+        ;;
+    esac
     ;;
   *) exit 0 ;;
 esac
@@ -94,15 +116,18 @@ export HERD_REFIX_WAIT_TIMEOUT=6
 
 PANE_LOG="$T/pane-run.log"          # command text ($4) — multi-line; for content greps only
 PANE_CALLS="$T/pane-run.calls"      # pane_id ($3) — one line per invocation; for exact counts
+SENDKEYS_LOG="$T/send-keys.log"     # pane + keys — proves the HERD-186 Enter submit fired
+PENDING="$T/pending-pane"           # pane_id with typed-but-unsubmitted text
 STAT="$T/agent-status"
-export STUB_PANE_RUN_LOG="$PANE_LOG" STUB_PANE_RUN_CALLS="$PANE_CALLS" STUB_STATUS_FILE="$STAT"
+export STUB_PANE_RUN_LOG="$PANE_LOG" STUB_PANE_RUN_CALLS="$PANE_CALLS" \
+       STUB_SENDKEYS_LOG="$SENDKEYS_LOG" STUB_PENDING_FILE="$PENDING" STUB_STATUS_FILE="$STAT"
 
 REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 
-# ── (A) a 'done' builder is woken by a raw-prompt herdr pane run submit ───────
-rm -f "$REFIX_STATE"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$JOURNAL_FILE"
+# ── (A) a 'done' builder is woken by type+Enter (HERD-186), not pane-run alone ─
+rm -f "$REFIX_STATE" "$PENDING"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
 unset STUB_WAKE_COUNTDOWN_FILE
-export STUB_AGENT_NAME="wake-a" STUB_AGENT_PANE_ID="pane-A" STUB_WAKE_ON_RUN=1
+export STUB_AGENT_NAME="wake-a" STUB_AGENT_PANE_ID="pane-A" STUB_WAKE_ON_SUBMIT=1
 echo done > "$STAT"                       # builder session reads 'done'
 DISPLAY=()
 _handle_block_verdict "80" "wake-a" "sha-80" "0"
@@ -114,7 +139,11 @@ grep -q "review-blocked" "$PANE_LOG" \
   || fail "A: the submit must carry the raw 'review-blocked' re-task prompt (log: $(cat "$PANE_LOG"))"
 ok
 grep -q -- "--continue" "$PANE_LOG" \
-  && fail "A: a done builder must be woken by a raw pane run submit, NOT a claude --continue command"
+  && fail "A: a done builder must be woken by a raw re-task prompt, NOT a claude --continue command"
+ok
+# HERD-186: the Enter submit keystroke MUST fire after the text (pane run alone does not wake).
+grep -qE 'pane-A.*Enter|Enter' "$SENDKEYS_LOG" \
+  || fail "A: must send-keys Enter after typing the re-task (send-keys log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
 printf '%s\n' "$d" | grep -q "refixing" \
@@ -139,8 +168,10 @@ printf '%s\n' "$wl" | grep -q '"agent_status_before":"done"' \
 ok
 
 # ── (B) the backed-off poll catches a wake that arrives a few checks later ────
-rm -f "$REFIX_STATE"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$JOURNAL_FILE"
-export STUB_AGENT_NAME="wake-b" STUB_AGENT_PANE_ID="pane-B" STUB_WAKE_ON_RUN=0
+rm -f "$REFIX_STATE" "$PENDING"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+# STUB_WAKE_ON_SUBMIT=0 so Enter does not flip status; the countdown file drives a delayed wake
+# (status reads force 'done' for N checks, then 'working') — models a slow pick-up after submit.
+export STUB_AGENT_NAME="wake-b" STUB_AGENT_PANE_ID="pane-B" STUB_WAKE_ON_SUBMIT=0
 echo done > "$STAT"
 CD="$T/countdown-b"; echo 4 > "$CD"       # 'done' for the first 4 status reads, then 'working'
 export STUB_WAKE_COUNTDOWN_FILE="$CD"
@@ -148,6 +179,9 @@ DISPLAY=()
 _handle_block_verdict "81" "wake-b" "sha-81" "0"
 [ "$(wc -l < "$PANE_CALLS")" -eq 1 ] \
   || fail "B: a wake caught within the first backed-off window → a single submit, no re-send (got $(wc -l < "$PANE_CALLS"))"
+ok
+grep -qE 'Enter' "$SENDKEYS_LOG" \
+  || fail "B: delayed-wake path must still send-keys Enter (log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
 printf '%s\n' "$d" | grep -q "refixing" \
@@ -159,13 +193,17 @@ ok
 unset STUB_WAKE_COUNTDOWN_FILE
 
 # ── (C) a submit that never wakes → re-sent once, then escalates ──────────────
-rm -f "$REFIX_STATE"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$JOURNAL_FILE"
-export STUB_AGENT_NAME="wake-c" STUB_AGENT_PANE_ID="pane-C" STUB_WAKE_ON_RUN=0
+rm -f "$REFIX_STATE" "$PENDING"; : > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+export STUB_AGENT_NAME="wake-c" STUB_AGENT_PANE_ID="pane-C" STUB_WAKE_ON_SUBMIT=0
 echo done > "$STAT"                        # never flips to working
 DISPLAY=()
 _handle_block_verdict "82" "wake-c" "sha-82" "0"
 [ "$(wc -l < "$PANE_CALLS")" -eq 2 ] \
   || fail "C: a never-waking submit must be re-sent exactly once (got $(wc -l < "$PANE_CALLS"))"
+ok
+# Two submits → two Enter keystrokes (initial + retry).
+[ "$(grep -cE 'Enter' "$SENDKEYS_LOG" || true)" -eq 2 ] \
+  || fail "C: never-waking path must send-keys Enter twice (log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
 printf '%s\n' "$d" | grep -q "needs you · auto-refix failed" \
