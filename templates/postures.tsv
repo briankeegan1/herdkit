@@ -3,8 +3,8 @@
 # of .herd/config KEY=VALUE settings that together select one coherent governance stance (who merges,
 # whether a human approves, whether a push is gated, what pipeline steps run). This file is the SINGLE
 # SOURCE OF TRUTH for those bundles: the posture-matrix sim (scripts/herd/sim/sandbox-posture-matrix.sh)
-# proves the gate loop under each posture here, and HERD-141 (init v2 posture profiles, queued) will
-# CONSUME this file to offer these postures at `herd init` time and render the chosen bundle into a
+# proves the gate loop under each posture here, and HERD-141 (init v2 posture profiles, shipped) CONSUMES
+# this file to offer these postures at `herd init` time and render the chosen bundle into a
 # project's .herd/config. Keep it authoritative: add a posture here (not in the sim or the installer)
 # and every consumer picks it up.
 #
