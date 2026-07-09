@@ -285,9 +285,11 @@ for crash in none before-hooks after-purges after-reconcile; do
   if [ "$jbefore" = "$jafter" ] && [ "$(state_rows "$scn")" -eq 1 ] && [ "$(scribe_calls "$scn")" -eq 1 ]; then
     ok "crash=$crash → re-running the sweep over a converged world is byte-inert"
   else
-    # BRACE the names: macOS bash 3.2 under a UTF-8 locale folds the bytes of a following multibyte
-    # char into the identifier, so a bare `$jbefore→` reads as the unset name `jbefore→` and `set -u`
-    # kills the script with "unbound variable" — replacing the diagnostic exactly when it is needed.
+    # BRACE the names (HERD-260): macOS bash 3.2 under a UTF-8 locale folds the bytes of a following
+    # multibyte char into the identifier, so an UNBRACED name butted straight against the arrow below
+    # would read as an unset variable and `set -u` would kill the script with "unbound variable" —
+    # replacing this diagnostic exactly when it is needed. tests/test-bash32-brace-multibyte.sh lints
+    # for it repo-wide (and greps source text, so do not spell the hazard out literally here).
     bad "crash=$crash → the sweep is not a fixed point (journal ${jbefore}→${jafter}, rows $(state_rows "$scn"), enqueues $(scribe_calls "$scn"))"
   fi
 done
