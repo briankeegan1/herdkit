@@ -28,6 +28,16 @@ herd_driver_name() { printf '%s' "${HERD_DRIVER:-herdr-claude}"; }
 # _herd_driver_is_headless — success iff the active driver is the headless driver.
 _herd_driver_is_headless() { [ "$(herd_driver_name)" = "headless" ]; }
 
+# herd_driver_endpoint_env_lines — emit K=V lines for the claude custom endpoint (HERD-171).
+# When ANTHROPIC_BASE_URL is set (machine-scoped config key / config.local), every spawn path injects
+# it so Claude Code hits the enterprise/BAA or local gateway. Empty when unset → byte-identical argv
+# (no --env). Pure: reads the env, prints zero or more lines, never fails.
+herd_driver_endpoint_env_lines() {
+  if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+    printf 'ANTHROPIC_BASE_URL=%s\n' "$ANTHROPIC_BASE_URL"
+  fi
+}
+
 # ── MODEL matrix: runtime-qualified model refs (HERD-151) ─────────────────────────────────────────
 # Every MODEL_* config key accepts an OPTIONALLY runtime-qualified ref '<driver>:<model>', so an
 # operator can pin a role's agent to a specific RUNTIME (a shipped templates/drivers/<name>.driver)
@@ -781,7 +791,11 @@ _herd_headless_start_agent() {
   # runtime argv is COMPOSED from the resolved driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
-  ( cd "$wt" || exit 1; nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
+  # HERD-171: export the custom endpoint into the detached child when set (byte-identical when unset).
+  ( cd "$wt" || exit 1
+    # shellcheck disable=SC2163  # $_ep is a literal "K=V" pair — `export "K=V"` sets+exports it.
+    while IFS= read -r _ep; do [ -n "$_ep" ] && export "$_ep"; done < <(herd_driver_endpoint_env_lines)
+    nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
   printf 'working\n' > "$adir/status" 2>/dev/null || true
   [ -s "$adir/pid" ]
 }
@@ -799,8 +813,11 @@ _herd_herdr_start_agent() {
   # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  # HERD-171: inject ANTHROPIC_BASE_URL as --env when set (no-op / byte-identical when unset).
+  local -a envargs=(); local _ep
+  while IFS= read -r _ep; do [ -n "$_ep" ] && envargs+=(--env "$_ep"); done < <(herd_driver_endpoint_env_lines)
   # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
-  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- "${rt[@]}" >/dev/null 2>&1; then
+  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus "${envargs[@]}" -- "${rt[@]}" >/dev/null 2>&1; then
     return 0
   fi
   # HERD-136: agent start failed after we created the tab — close it so no empty corpse tab lingers,
@@ -859,6 +876,11 @@ herd_driver_launch_agent() {
       *)         : ;;  # ignore unknown keys (forward-compat)
     esac
   done
+  # HERD-171: auto-append the custom claude endpoint when set. Empty → sa_env unchanged (byte-identical).
+  local _ep
+  while IFS= read -r _ep; do
+    [ -n "$_ep" ] && sa_env="${sa_env}${sa_env:+$'\n'}$_ep"
+  done < <(herd_driver_endpoint_env_lines)
   [ -n "$sa_name" ] || { printf '⚠️  driver: launch-agent called with no name\n' >&2; return 1; }
   # Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER *and* bare model,
   # once, before either backend builds its argv (HERD-150 P2). Making the resolved driver REAL — not

@@ -570,6 +570,19 @@ fi
 # holds the queue). A small value like 5 is a conservative arm for unattended runs.
 : "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
+# ── Claude Code custom endpoint (HERD-171) ───────────────────────────────────
+# ANTHROPIC_BASE_URL relocates the endpoint the claude runtime talks to (enterprise/BAA gateway or
+# a local model server). Empty/unset => Claude Code default Anthropic endpoint (byte-identical). The
+# key is MACHINE-scoped + secrets-adjacent: herd config set routes it to the gitignored
+# .herd/config.local, never the committed baseline, because a tenant/gateway URL is not project
+# policy. Companion credentials (ANTHROPIC_API_KEY) live in .herd/secrets or the control-room process
+# env, never here (this file stays ZERO-SECRET). When non-empty we EXPORT so oneshot/headless children
+# inherit it; scripts/herd/driver.sh also injects it as --env on herdr agent start so interactive
+# spawns hit the same endpoint. Composes with the model matrix (HERD-151): MODEL_* still pick the
+# model id; this only moves the wire. See docs/sensitive-data.md.
+: "${ANTHROPIC_BASE_URL:=}"
+[ -n "${ANTHROPIC_BASE_URL}" ] && export ANTHROPIC_BASE_URL
+
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /
 # herd-feature.sh) run BEFORE creating a worktree, via scripts/herd/herd-claim.sh. It exists to

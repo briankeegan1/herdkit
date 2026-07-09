@@ -261,6 +261,7 @@ herd-claim.sh	unit	tests/test-claim.sh
 MCP_PROVISION	unit	tests/test-mcp-provision.sh
 GRAPHIFY_BIN	unit	tests/test-init-grounding-interview.sh
 GRAPHIFY_BIN	unit	tests/test-codemap-project.sh
+ANTHROPIC_BASE_URL	unit	tests/test-driver-launch-agent.sh
 .herd/steps.tsv	sim	tests/test-sandbox-sim.sh
 triggers.sh	unit	tests/test-triggers.sh
 .herd/triggers.tsv	unit	tests/test-triggers.sh
