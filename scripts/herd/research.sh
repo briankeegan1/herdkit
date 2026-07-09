@@ -33,6 +33,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # reclaim, and a failed respawn each journal instead of dumping a raw driver error. Best-effort.
 # shellcheck source=/dev/null
 . "$HERE/journal.sh"
+# Supervised-process contract (HERD-193): record this drainer singleton's OWNER / DEADLINE / LIVENESS
+# / RETIRE at spawn so the watcher's per-tick sweep can surface a drainer that has gone silent past
+# DRAINER_HEARTBEAT_TIMEOUT — the SAME window the reclaim gate above already uses, integrated rather
+# than duplicated. Pure library; inert while LIFECYCLE_CONTRACTS=off (default).
+# shellcheck source=/dev/null
+. "$HERE/lifecycle.sh"
 REPO="$PROJECT_ROOT"
 TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
@@ -110,6 +116,7 @@ sys.exit(0 if any(
   if herd_drainer_should_reclaim "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT" "$LIVE"; then
     echo "⚠️  researcher drainer is DEAD (no heartbeat for >${DRAINER_HEARTBEAT_TIMEOUT}s and its process is gone) — reclaiming the singleton and spawning a fresh drainer (per-request atomic claim prevents double-draining)."
     journal_append drainer_reclaimed component researcher agent "$HERD_AGENT_RESEARCHER" live_status "$LIVE" timeout "$DRAINER_HEARTBEAT_TIMEOUT"
+    lifecycle_retire research-drainer "$HERD_AGENT_RESEARCHER" reclaimed
   elif herd_drainer_hung "$HEARTBEAT" "$DRAINER_HEARTBEAT_TIMEOUT"; then
     # Heartbeat is stale but the agent is LIVE (working/idle) or its death can't be confirmed — refuse
     # the reclaim and journal it (no-false-red). The live drainer will drain this request.
@@ -181,6 +188,11 @@ fi
 if _launch_out="$(herd_driver_launch_agent \
       name="$HERD_AGENT_RESEARCHER" workspace="$_WS_ID" cwd="$REPO" tab="$TAB" env="RESEARCH_TAB=$TAB" \
       model="$RESEARCH_MODEL" flags="$CLAUDE_FLAGS" pointer="$PROMPT" 2>&1)"; then
+  # HERD-193 SPAWN: owner=research.sh, liveness=the heartbeat the step script keeps fresh, deadline=the
+  # reclaim gate's DRAINER_HEARTBEAT_TIMEOUT, retire=drainer-reclaim. A drainer legitimately runs for
+  # hours, so SILENCE past the heartbeat window — not absolute lifetime — is what "past deadline" means
+  # for this population. Lever-gated; byte-inert with LIFECYCLE_CONTRACTS=off.
+  lifecycle_spawn research-drainer "$HERD_AGENT_RESEARCHER" "heartbeat:$HEARTBEAT" research.sh
   echo "🔎 researcher drainer dispatched (tab $TAB). Coordinator is free; fetch the report with research-get.sh $REQ_ID."
 else
   herdr tab close "$TAB" >/dev/null 2>&1 || true

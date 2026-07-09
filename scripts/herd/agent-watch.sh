@@ -91,6 +91,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
+# Supervised-process contract (HERD-193) — owner/deadline/liveness/retire bookkeeping for every
+# population this watcher spawns. Pure library; wholly inert while LIFECYCLE_CONTRACTS=off (default).
+. "$HERE/lifecycle.sh"
 # Engine version handshake (HERD-179) — the staleness predicate behind the quiet 'engine outdated'
 # console note (ENGINE_AUTOUPDATE=check|auto) and the quiescent-window auto-update (auto). Sourced
 # after journal.sh so its events are journaled; defines functions only, and is wholly inert while
@@ -2124,6 +2127,10 @@ _reviewer_registry_live() {
 # journal line — a workspace with no orphaned reviewer panes sees zero change.
 _retire_reviewer_pane() {
   local pr="$1" sha="$2" reason="${3:-verdict-consumed}" reg pid pane
+  # HERD-193 RETIRE: this is the reviewer population's real teardown point, so account for the
+  # supervised process here — ABOVE the registry-row guard, since a reviewer whose row is already
+  # gone (adopted, swept) is still a process this seat spawned. Byte-inert with the lever off.
+  lifecycle_retire reviewer "${pr}-${sha}" "$reason"
   reg="$(_review_registry_file "$pr" "$sha")"
   [ -f "$reg" ] || return 0
   read -r pid pane < "$reg" 2>/dev/null || true
@@ -2329,6 +2336,11 @@ _dispatch_review() {
   _marker_write "$inflight" "$_dr_pid"
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result" pin "$_pin_mode"
+  # Supervised-process contract (HERD-193): owner=agent-watch, liveness=the worker pid, deadline=the
+  # corpse sweep's own REVIEW_INFLIGHT_TIMEOUT, retire=verdict-consumed (below) or the corpse sweep.
+  # The pid is this POLLER, not the reviewer's agent pane — the pane outlives it and remains HERD-113's
+  # `_retire_reviewer_pane` / startup-sweep problem. Byte-inert while LIFECYCLE_CONTRACTS=off.
+  lifecycle_spawn reviewer "${pr}-${sha}" "pid:$_dr_pid" agent-watch
 }
 
 # ── INFRA-timeout circuit breaker (HERD-110) ─────────────────────────────────────────────────────
@@ -5118,6 +5130,9 @@ _main_health_dispatch() {
   printf '%s\n' "$_mh_pr" > "$(_main_health_pr_file "$_mh_sha")" 2>/dev/null || true
   journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" \
     log_path "$_mh_log" provenance "$_mh_prov"
+  # HERD-193 SPAWN: the main-health suite is a health worker like any other — same key space
+  # (main-<sha>), same slot cap, same corpse-sweep deadline. Lever-gated; retired by _collect_main_health.
+  lifecycle_spawn health-worker "$_mh_key" "pid:$_mh_wpid" agent-watch
   return 0
 }
 
@@ -5257,6 +5272,7 @@ _collect_main_health() {
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
           "$(_main_health_retry_file "$_cm_sha")" 2>/dev/null || true
+    lifecycle_retire health-worker "main-$_cm_sha" collected   # HERD-193 RETIRE: verdict routed
   done
 }
 
@@ -6326,6 +6342,25 @@ _sweep_journal_audit() {
   HERD_JOURNAL_AUDIT_INBOX="$INBOX_LEDGER" \
   HERD_JOURNAL_AUDIT_SEEN="$TREES/.agent-watch-journal-audit-seen" \
     bash "$HERE/journal-audit.sh" >/dev/null 2>&1 || true
+}
+
+# _sweep_lifecycle — HERD-193 supervised-process sweep, run on EVERY tick (it is a handful of stats
+# over a handful of records — cheaper than the corpse sweep that already runs beside it).
+#
+# For each supervised process this seat spawned: a pid that has exited is RETIRED (the reconcile
+# layer — a worker that died before its teardown is still accounted for), and anything past its
+# deadline is journaled `lifecycle_expired` ONCE with the ROUTE naming the owner that tears that
+# population down. It NEVER kills: the corpse sweep still TERMs a timed-out gate worker, the drainer
+# reclaim gate still respawns a dead drainer, the stall detector still rows a quiet builder. This leg
+# only makes the expiry visible and attributable, which is the whole of HERD-193's first increment.
+#
+# Byte-inert when LIFECYCLE_CONTRACTS=off (default) or in dry-run; can never fail or slow a tick.
+_sweep_lifecycle() {
+  [ -n "$DRYRUN" ] && return 0
+  # Subshell so the inbox pin cannot leak into the rest of the tick (a prefix assignment on a shell
+  # FUNCTION is not scoped the way it is on an external command).
+  ( HERD_LIFECYCLE_INBOX="$INBOX_LEDGER"; lifecycle_sweep ) >/dev/null 2>&1 || true
+  return 0
 }
 
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
@@ -9216,6 +9251,7 @@ _healthcheck_gate() {
         journal_append infra_event component agent-watch reason health_bad_result key "$_hg_key" ;;
     esac
     rm -f "$_hg_disp" "$_hg_inflight" 2>/dev/null || true
+    lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
   fi
 
@@ -9236,6 +9272,7 @@ _healthcheck_gate() {
       return 0
     fi
     rm -f "$_hg_inflight" 2>/dev/null || true
+    lifecycle_retire health-worker "$_hg_key" severed        # HERD-193 RETIRE: worker died verdictless
     journal_append infra_event component agent-watch reason health_died key "$_hg_key"
   fi
 
@@ -9278,6 +9315,9 @@ _healthcheck_gate() {
   # healthcheck_started (not just a later 'outcome'): the record shows runs IN FLIGHT — so a suite that
   # never finishes (killed, restart) is visible in the journal, and log_path points at the tailable log.
   journal_append healthcheck_started pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" pid "$_hg_wpid" log_path "$_hg_log"
+  # HERD-193 SPAWN: owner=agent-watch, liveness=worker pid, deadline=HEALTH_INFLIGHT_TIMEOUT (the very
+  # timeout the corpse sweep already enforces), retire=the collect/severed paths above. Lever-gated.
+  lifecycle_spawn health-worker "$_hg_key" "pid:$_hg_wpid" agent-watch
   return 0
 }
 
@@ -10450,6 +10490,10 @@ while true; do
   # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
   _sweep_gate_corpses
   _collect_main_health
+  # SUPERVISED-PROCESS sweep (HERD-193): immediately after the corpse sweep has had its say, account
+  # for every population's spawns — retire the ones that exited, journal + inbox the ones past their
+  # deadline (routed to the owner that tears that population down). Observability only; never kills.
+  _sweep_lifecycle
   # CONTROL-ROOM SWEEP trigger (HERD-191): refresh the cheap debris counts on the orphan-sweep
   # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
   _sweep_trigger_tick
