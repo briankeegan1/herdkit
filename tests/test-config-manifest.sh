@@ -6,11 +6,13 @@
 # key can be documented but never read (a DEAD key), read but never documented (a GHOST key), or
 # mis-scoped so `herd config set` routes it to the wrong file / a governance doc adopts a per-machine
 # knob. This test turns those invariants into a hard gate so the manifest can never silently drift
-# from the code that reads it. Six checks:
+# from the code that reads it. Seven checks:
 #
 #   (a) DEAD keys      — every manifest config key is READ at least once under bin/ + scripts/.
 #   (b) GHOST keys     — every ${UPPER_CASE:-…} config read in the engine is a DECLARED manifest key
 #                        (or an explicitly-exempt internal/env/secret/test-seam var, see EXEMPT below).
+#   (b') scan bites    — the ghost scan, with its comment/script-local waivers, still FLAGS synthetic
+#                        real ghosts. Guards (b) against decaying into a vacuous pass (HERD-203).
 #   (c) machine list   — the machine-scoped keys enumerated in the .herd/config.local manifest row
 #                        equal EXACTLY the set of scope=machine config keys (the list `herd config set`
 #                        auto-routes to the per-user overlay). Keeps the doc from lying about routing.
@@ -93,8 +95,42 @@ def engine_files():
     return [f for f in fs if os.path.isfile(f)]
 
 ENGINE = engine_files()
-SRC = {f: open(f, encoding="utf-8", errors="replace").read() for f in ENGINE}
+
+# A `#`-comment is PROSE, never a read. herd-config.sh's own comments quote the `: "${KEY:=…}"` idiom
+# verbatim to explain the caps-sync gate's heuristic, which made the raw-text scan hallucinate a config
+# key literally named KEY. Drop whole-line comments only: a trailing `#` cannot be stripped safely (it
+# is legal inside strings and `${var#pattern}`), and every real read lives on a non-comment line anyway.
+def strip_comments(text):
+    return "\n".join("" if re.match(r'^\s*#', ln) else ln for ln in text.split("\n"))
+
+SRC = {f: strip_comments(open(f, encoding="utf-8", errors="replace").read()) for f in ENGINE}
 ALL_SRC = "\n".join(SRC.values())
+
+# ── Loader-defaulted keys: the `: "${KEY:="v"}"` idiom in herd-config.sh IS the definition of a config
+# knob (the same signal the caps-sync gate greps for). A key defaulted there is a knob no matter what
+# else the engine does with it, so it can NEVER be waived by the script-local rule below — it must be
+# declared in the manifest. This is what keeps the tightening from decaying into a blanket exemption.
+LOADER_SRC = strip_comments(open(LOADER, encoding="utf-8").read())
+LOADER_DEFAULTED = set(re.findall(r'^\s*:\s*"\$\{([A-Z][A-Z0-9_]+):=', LOADER_SRC, re.M))
+
+# ── Script-local vars: a var the file DEFINES itself before reading is a computed local, not a knob a
+# user could ever set in .herd/config. Detect the definition rather than enumerating names by hand —
+# EXEMPT_NAMES had already accreted MAIN_HEALTH, PASTURE, CELEBRATE, AGENTS_JSON, TREES … one incident
+# at a time, while their line-mates MAIN, WT, PRS_JSON and OPERATOR_INBOX_ROWS stayed ghosts.
+# Scoped per-file on purpose: assigned in A but read in B is a cross-file contract, and stays a ghost.
+def local_defs(text):
+    names = set()
+    for m in re.finditer(r'^[ \t]*(?:local |declare |export |readonly )?([A-Z][A-Z0-9_]+)=(.*)$', text, re.M):
+        name, rhs = m.group(1), m.group(2)
+        # `VAR="${VAR:-}" cmd …` (the env-prefix passthrough) READS VAR; it does not define it. Without
+        # this guard every ghost would launder itself into an exemption on its own read site.
+        if re.match(r'^"?\$\{' + re.escape(name) + r':[-=]', rhs):
+            continue
+        names.add(name)
+    names.update(re.findall(r'^[ \t]*for +([A-Z][A-Z0-9_]+) +in\b', text, re.M))
+    return names
+
+LOCALS = {f: local_defs(t) for f, t in SRC.items()}
 
 def is_read(key, text):
     # A genuine variable READ: ${KEY...} or $KEY at a word boundary (not a bare comment mention).
@@ -136,23 +172,61 @@ EXEMPT_NAMES = {
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
     "TAB", "TEMPLATES_DIR", "TMPDIR", "TRACKER_DRIFT", "TREES", "TSWEEP_LIMIT", "WPANE",
 }
-def exempt(k):
-    if k in KEYS:            # already declared → not a ghost
+def exempt(k, declared, file_locals):
+    if k in declared:        # already declared → not a ghost
         return True
     if k in EXEMPT_PREFIX_EXCEPTIONS:
         return False
     if k.startswith(EXEMPT_PREFIX):
         return True
-    return k in EXEMPT_NAMES
+    if k in EXEMPT_NAMES:
+        return True
+    if k in LOADER_DEFAULTED:  # a loader default IS a config knob — declare it, never waive it
+        return False
+    return k in file_locals    # defined by this very file → a computed local, not a knob
 
-ghosts = {}
-for f, text in SRC.items():
-    for m in re.finditer(r'\$\{([A-Z][A-Z0-9_]+):[-=]', text):
-        k = m.group(1)
-        if not exempt(k):
-            ghosts.setdefault(k, os.path.basename(f))
+def scan_ghosts(src, declared=KEYS, locals_by_file=None):
+    locals_by_file = LOCALS if locals_by_file is None else locals_by_file
+    found = {}
+    for f, text in src.items():
+        for m in re.finditer(r'\$\{([A-Z][A-Z0-9_]+):[-=]', text):
+            k = m.group(1)
+            if not exempt(k, declared, locals_by_file.get(f, ())):
+                found.setdefault(k, os.path.basename(f))
+    return found
+
+ghosts = scan_ghosts(SRC)
 check("b: no GHOST (read-but-undeclared) keys", not ghosts,
       "undeclared reads: " + ", ".join(f"{k} ({v})" for k, v in sorted(ghosts.items())))
+
+# ── (b') the ghost scan still BITES: feed it synthetic sources that must trip it ───────────────────
+# (b) passing is only meaningful if it can still fail. The comment/local waivers above narrow the scan,
+# and a future "just exempt it" patch would quietly widen them until (b) passes vacuously. These probes
+# pin the three ways a genuine ghost must survive: never defined at all; defined only by its own
+# passthrough read; and loader-defaulted (a real knob) even when the file also assigns it.
+FAKE = "__probe.sh"
+# A real knob, borrowed as a stand-in for an undeclared one — must not be prefix-exempt (that rule
+# fires before LOADER_DEFAULTED and would make the probe pass for the wrong reason).
+_knob = sorted(k for k in LOADER_DEFAULTED & KEYS
+               if not k.startswith(EXEMPT_PREFIX) and k not in EXEMPT_NAMES)[0]
+probes = [
+    ("never defined",            '[ -n "${TOTALLY_UNDECLARED:-}" ]',                "TOTALLY_UNDECLARED"),
+    ("defined only by its read", 'X_GHOST="${X_GHOST:-}" python3 -c ""',            "X_GHOST"),
+    ("loader-defaulted knob",    f'{_knob}="a"\necho "${{{_knob}:-}}"',             _knob),
+    ("comment is not a read",    f'# echo "${{TOTALLY_UNDECLARED:-}}"',             None),
+]
+missed = []
+for label, body, want in probes:
+    src = {FAKE: strip_comments(body)}
+    # `declared` omits the borrowed knob so it must be judged on the LOADER_DEFAULTED rule alone.
+    hits = scan_ghosts(src, declared=KEYS - {_knob}, locals_by_file={FAKE: local_defs(body)})
+    if want is None:
+        if hits:
+            missed.append(f"{label} (flagged {sorted(hits)})")
+    elif want not in hits:
+        missed.append(f"{label} ({want})")
+check("b': the GHOST scan still catches real ghosts", not missed,
+      "ghost scan misjudged: " + ", ".join(missed))
 
 # ── (c) config.local machine list == the scope=machine key set ─────────────────────────────────────
 machine = {k for k, v in COLS.items() if v["scope"] == "machine"}
@@ -182,7 +256,7 @@ watch_src = ""
 for name in ("agent-watch.sh", "dep-watcher.sh"):
     p = os.path.join(ROOT, "scripts/herd", name)
     if os.path.isfile(p):
-        watch_src += "\n" + open(p, encoding="utf-8", errors="replace").read()
+        watch_src += "\n" + strip_comments(open(p, encoding="utf-8", errors="replace").read())
 bad_requires = sorted(k for k in KEYS if is_read(k, watch_src) and COLS[k]["requires"] != "watcher")
 check("e: watcher-read keys carry requires=watcher", not bad_requires,
       "read by agent-watch/dep-watcher but requires!=watcher: "
@@ -195,7 +269,7 @@ check("e: watcher-read keys carry requires=watcher", not bad_requires,
 # STRICT default-parity contract are the model tiers: the value config.example seeds a fresh project is
 # exactly what herd-config.sh must fall back to when the key is unset. This guards the "Opus is an
 # escalation tier, not a default" migration (HERD-161) from drifting the loader fallback out of the docs.
-loader = open(LOADER, encoding="utf-8").read()
+loader = LOADER_SRC
 # herd-config.sh declares each fallback via `: "${KEY:="v"}"`. The eco block (TOKEN_MODE=eco) assigns
 # some MODEL_* FIRST; the unconditional STANDARD defaults come LATER and are what an unset config
 # resolves to — iterate in source order and keep the LAST literal def per key.
@@ -232,5 +306,5 @@ print()
 if failures:
     print(f"{len(failures)} CHECK(S) FAILED: {', '.join(failures)}", file=sys.stderr)
     sys.exit(1)
-print("ALL PASS (6 manifest self-enforcement checks)")
+print("ALL PASS (7 manifest self-enforcement checks)")
 PY

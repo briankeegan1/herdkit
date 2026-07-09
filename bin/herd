@@ -2885,7 +2885,7 @@ cmd_sweep() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run)    dry=1; restart=0; args+=("$1") ;;
-      --no-restart) restart=0 ;;
+      --no-restart) restart=0; args+=("$1") ;;
       -h|--help)    say "usage: herd sweep [--dry-run] [--no-restart]"; return 0 ;;
       *)            die "herd sweep: unknown option '$1' (try --dry-run or --no-restart)" ;;
     esac

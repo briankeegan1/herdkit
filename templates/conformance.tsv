@@ -208,6 +208,7 @@ INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh

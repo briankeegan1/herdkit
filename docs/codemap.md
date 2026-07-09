@@ -236,6 +236,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SHIPPED_KEEP` → —
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
+- `STALE_BASE_AUTOFIX` → `agent-watch.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`
 - `SWEEP_AUTO` → `sweep.sh`

@@ -13,7 +13,8 @@
 # functions only, no tick loop, the same seam the hermetic tests use):
 #
 #   leg 1  worktrees   sha-anchored reap of merged/closed-PR worktrees (mirrors _startup_reap_sweep's
-#                      proof obligation), plus unowned tmp/detached scratch trees → _reap_slug
+#                      proof obligation), plus unowned tmp/detached scratch trees that carry no unique
+#                      commits → _reap_slug
 #   leg 2  tabs        stale engine tabs, registry-allowlisted + workspace-scoped → _sweep_orphan_tabs
 #                      / _sweep_stale_resolve_tabs (via the extracted _orphan_tab_ids detector)
 #   leg 3  markers     dead-pid inflight markers → _sweep_gate_corpses (HERD-185's restart-safe sweep,
@@ -25,9 +26,10 @@
 # SAFE vs JUDGMENT legs. A leg is SAFE when its precondition is a PROOF (a merged PR whose headRefOid
 # equals the worktree's HEAD; a pid that is provably dead; a tab in the engine's own registry whose
 # slug has no worktree and no open PR). A leg is JUDGMENT when acting could destroy work a human
-# still wants: a worktree carrying REAL dirt, or a closed-PR branch carrying commits that exist
-# nowhere else. Judgment findings are FLAGGED WITH EVIDENCE and NEVER deleted — not by `herd sweep`,
-# not in --dry-run, not under SWEEP_AUTO=auto. The only cure for a flag is a human.
+# still wants: a worktree carrying REAL dirt, or ANY tree — a closed-PR branch or a DETACHED scratch
+# HEAD — carrying commits that exist nowhere else. Judgment findings are FLAGGED WITH EVIDENCE and
+# NEVER deleted — not by `herd sweep`, not in --dry-run, not under SWEEP_AUTO=auto. The only cure for
+# a flag is a human.
 #
 # TRIGGERS (SWEEP_AUTO=off|advise|auto, default advise). The watcher runs a CHEAP detection pass on
 # its orphan-sweep cadence and renders one '🧹 sweep recommended: …' console row, journaling
@@ -45,7 +47,7 @@
 # Sourced as a library (SWEEP_LIB=1) by agent-watch.sh for the trigger pass; executed directly by
 # bin/herd's cmd_sweep for legs 1–4.
 #
-# Run:  bash scripts/herd/sweep.sh [--dry-run] [--auto]
+# Run:  bash scripts/herd/sweep.sh [--dry-run] [--no-restart] [--auto]
 
 _SWEEP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -76,7 +78,8 @@ SWEEP_REGENERABLE_GLOBS='.DS_Store:*.log:*.pyc:*.pyo:*.tmp:__pycache__:.pytest_c
 
 # Basenames that mark a DETACHED worktree as engine/agent scratch, wherever it lives. A detached
 # worktree UNDER $TREES also qualifies. Anything else detached is left alone: `git worktree add
-# --detach` is the documented way to A/B a change against base, and that tree is precious.
+# --detach` is the documented way to A/B a change against base, and that tree is precious. Even a
+# MATCHING scratch tree is only reaped when it carries zero unique commits (see sweep_leg_worktrees).
 SWEEP_SCRATCH_GLOBS='tmp-*:*-tmp:tmp:scratch-*:herd-tmp-*:.tmp*'
 
 # Command patterns for leg 4's orphan hunt: a bats runner or a healthcheck/test script.
@@ -88,6 +91,12 @@ SWEEP_KILL_GRACE="${HERD_SWEEP_KILL_GRACE:-3}"   # seconds between SIGTERM and S
 # (empty) so the watcher's auto path — which never calls sweep_main — reads it safely under `set -u`
 # without a ${:-} default (which the config-manifest ghost-key lint would read as an undeclared knob).
 SWEEP_SELF=""
+
+# Whether LEG 5 (the watcher pane restart, owned by bin/herd's cmd_sweep) will actually run after
+# legs 1-4. Leg 5 is what STOPS the duplicate watchers leg 4 merely lists — so the narration for a
+# stray must not claim it was handled when --dry-run / --no-restart, or the watcher's own SWEEP_AUTO
+# path, means no restart follows. 0 = no leg 5 (the safe default for every non-CLI caller).
+SWEEP_LEG5=0
 
 # ── plan accumulation ───────────────────────────────────────────────────────────────────────────
 # Legs append one PLAN LINE per finding: "<verb>\t<what>\t<detail>". _sweep_emit prints it (the
@@ -226,11 +235,23 @@ sweep_leg_worktrees() {
     dirt="${dirt%%$'\t'*}"
 
     # ── detached scratch trees ──
+    # A detached tree carries the SAME proof obligation as the CLOSED branch-backed path, and then
+    # some: its commits are reachable from NO branch ref, so `git worktree remove --force` (which also
+    # deletes .git/worktrees/<name>/ and with it that HEAD's reflog) destroys them UNRECOVERABLY. A
+    # committed-but-unpushed detached HEAD reads `clean` to `git status --porcelain`, so a dirt check
+    # alone would sail straight into the reap — and this is exactly the shape of this project's own
+    # documented A/B practice (`git worktree add --detach HEAD` under $WORKTREES_DIR). So: reap only
+    # when the tree is clean-or-regenerable AND carries ZERO unique commits; flag everything else.
     if [ "$det" = "1" ]; then
       _sweep_is_scratch "$dir" "$slug" || continue
       _sweep_registry_has_slug "$slug" && continue          # owned by a live tab → not ours to reap
+      uniq="$(_sweep_unique_commits "$dir")"
       if [ "$dirt" = "dirty" ]; then
         _sweep_emit_flag "$slug" scratch-dirty "$evidence"
+      elif [ "$uniq" = "?" ]; then
+        _sweep_emit_flag "$slug" scratch-unverifiable "cannot resolve ${DEFAULT_BRANCH:-origin/main} to prove no unique work in this detached tree"
+      elif [ "$uniq" != "0" ]; then
+        _sweep_emit_flag "$slug" scratch-unique-commits "$uniq commit(s) exist only here, on a DETACHED HEAD reachable from no branch — removing the worktree would destroy them"
       else
         _sweep_emit_reap "$slug" "$dir" "" "" scratch-detached "$dry"
       fi
@@ -307,8 +328,9 @@ sweep_leg_tabs() {
     _sweep_say "🗂 " "close stale tab ${id}"
   done <<< "$ids"
   [ -n "$dry" ] && return 0
-  # Act through the shipped sweeps (they journal `sweep_closed` and prune the registry row).
-  [ "$n" -gt 0 ] && _sweep_orphan_tabs
+  # Act through the shipped sweeps (they journal `sweep_closed` and prune the registry row). Hand the
+  # ids we already computed back to the action wrapper so the herdr/gh round-trips happen ONCE.
+  [ "$n" -gt 0 ] && _sweep_orphan_tabs "$ids"
   # _sweep_stale_resolve_tabs reads AGENTS_JSON (the agent roster) to spare a LIVE resolver; the
   # watcher's tick primes it, so a CLI sweep must prime it too or every resolve tab reads "no live
   # resolver". shellcheck cannot see the read across the sourced file.
@@ -493,14 +515,14 @@ _sweep_spare_pgids() {
   printf '%s' "$out"
 }
 
-# _sweep_kill_tree <pid> <pgid> <starttime> — kill an orphan, PID-RECYCLING-GUARDED. The start-time
-# token was captured when the process was LISTED; if it no longer matches, that pid number now
-# belongs to an unrelated process and we must not signal it. Signals the whole PROCESS GROUP (a bats
-# run is a tree; TERMing only the leader strands its children) — except for a group we must spare
-# (see _sweep_spare_pgids), and never group 0/1. SIGTERM, grace, then SIGKILL. Idempotent: a pid a
-# previous group kill already reaped simply fails the liveness check and returns.
-_sweep_kill_tree() {
-  local pid="$1" pgid="$2" st="$3" cur target waited=0 spare
+# _sweep_term_one <pid> <pgid> <starttime> — PID-RECYCLING-GUARDED SIGTERM. The start-time token was
+# captured when the process was LISTED; if it no longer matches, that pid number now belongs to an
+# unrelated process and we must not signal it. Signals the whole PROCESS GROUP (a bats run is a tree;
+# TERMing only the leader strands its children) — except for a group we must spare (see
+# _sweep_spare_pgids), and never group 0/1. Prints the signalled target (for the later SIGKILL), or
+# nothing when the kill was refused or the pid is already gone.
+_sweep_term_one() {
+  local pid="$1" pgid="$2" st="$3" cur target spare
   cur="$(_pid_starttime "$pid")"
   if [ -n "$st" ] && [ -n "$cur" ] && [ "$cur" != "$st" ]; then
     journal_append sweep_proc_skip pid "$pid" reason pid-recycled
@@ -517,10 +539,32 @@ _sweep_kill_tree() {
        esac ;;
   esac
   kill -TERM "$target" 2>/dev/null || true
-  while [ "$waited" -lt "$SWEEP_KILL_GRACE" ]; do
-    kill -0 "$pid" 2>/dev/null || return 0
+  printf '%s' "$target"
+}
+
+# _sweep_await_dead <deadline-secs> <pid…> — poll until every pid is gone or the deadline expires.
+# ONE deadline for the WHOLE batch, not one per pid: under SWEEP_AUTO=auto this runs inside the
+# watcher tick, and a per-pid grace would stall the tick by (orphans × grace) seconds. Most orphans
+# die together anyway (they share a process group), so the batch usually clears on the first poll.
+_sweep_await_dead() {
+  local deadline="$1"; shift
+  local waited=0 pid alive
+  while [ "$waited" -lt "$deadline" ]; do
+    alive=0
+    for pid in "$@"; do kill -0 "$pid" 2>/dev/null && { alive=1; break; }; done
+    [ "$alive" -eq 0 ] && return 0
     sleep 1; waited=$(( waited + 1 ))
   done
+  return 1
+}
+
+# _sweep_kill_tree <pid> <pgid> <starttime> — the SINGLE-process kill: TERM, grace, KILL. Built on the
+# same two primitives the batch path uses, so the guards can never diverge between them.
+_sweep_kill_tree() {
+  local pid="$1" pgid="$2" st="$3" target
+  target="$(_sweep_term_one "$pid" "$pgid" "$st")"
+  [ -n "$target" ] || return 0
+  _sweep_await_dead "$SWEEP_KILL_GRACE" "$pid" && return 0
   kill -KILL "$target" 2>/dev/null || true
   return 0
 }
@@ -529,7 +573,7 @@ _sweep_kill_tree() {
 # acting is deliberate: an operator reading the console must see what is about to die BEFORE it does,
 # and a dry-run must print exactly the same list.
 sweep_leg_procs() {
-  local dry="$1" pid pgid cmd st rows strays
+  local dry="$1" pid pgid cmd st tgt rows strays
   rows="$(sweep_orphan_procs)"
   strays="$(sweep_stray_watchers)"
 
@@ -540,16 +584,29 @@ sweep_leg_procs() {
   done <<< "$rows"
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    _sweep_say "👻" "duplicate watcher pid ${pid} — stopped by the leg-5 watcher restart"
+    if [ "$SWEEP_LEG5" = "1" ]; then
+      _sweep_say "👻" "duplicate watcher pid ${pid} — stopped by the leg-5 watcher restart"
+    else
+      _sweep_say "👻" "duplicate watcher pid ${pid} — NOT stopped (leg 5 skipped); run 'herd sweep' to stop it"
+    fi
   done <<< "$strays"
 
   [ -n "$dry" ] && return 0
+  # TERM the whole batch, then wait ONE shared grace period, then SIGKILL whatever survived. Under
+  # SWEEP_AUTO=auto this runs inside the watcher tick, so the wall-clock cost must be O(grace), not
+  # O(orphans × grace).
+  local pids=() targets=()
   while IFS=$'\t' read -r pid pgid cmd; do
     [ -n "${pid:-}" ] || continue
     st="$(_pid_starttime "$pid")"
-    _sweep_kill_tree "$pid" "$pgid" "$st"
+    tgt="$(_sweep_term_one "$pid" "$pgid" "$st")"
+    [ -n "$tgt" ] || continue                     # refused (recycled) or already gone
+    pids+=("$pid"); targets+=("$tgt")
     journal_append sweep_proc pid "$pid" pgid "$pgid" cmd "${cmd:0:120}"
   done <<< "$rows"
+  [ "${#pids[@]}" -gt 0 ] || return 0
+  _sweep_await_dead "$SWEEP_KILL_GRACE" "${pids[@]}" && return 0
+  for tgt in "${targets[@]}"; do kill -KILL "$tgt" 2>/dev/null || true; done
   return 0
 }
 
@@ -646,15 +703,18 @@ sweep_run_safe_legs() {
 
 # ── CLI entry point (legs 1–4; leg 5 lives in bin/herd's cmd_sweep) ──────────────────────────────
 sweep_main() {
-  local dry="" mode="run"
+  local dry="" mode="run" norestart=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dry-run) dry=1; mode="dry-run" ;;
-      --auto)    mode="auto" ;;
-      *) printf 'usage: sweep.sh [--dry-run] [--auto]\n' >&2; return 2 ;;
+      --dry-run)    dry=1; mode="dry-run" ;;
+      --no-restart) norestart=1 ;;
+      --auto)       mode="auto" ;;
+      *) printf 'usage: sweep.sh [--dry-run] [--no-restart] [--auto]\n' >&2; return 2 ;;
     esac
     shift
   done
+  # cmd_sweep runs leg 5 iff neither flag is set — mirror that so the stray-watcher narration is honest.
+  if [ -z "$dry" ] && [ -z "$norestart" ]; then SWEEP_LEG5=1; else SWEEP_LEG5=0; fi
 
   # The checkout `herd sweep` was invoked from is never a sweep target.
   SWEEP_SELF="$(git rev-parse --show-toplevel 2>/dev/null || true)"

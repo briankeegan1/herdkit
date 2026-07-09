@@ -244,6 +244,14 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # never false-holds a legit PR. off → byte-inert. Watcher-affecting (next watcher restart).
 # STALE_DUP_DETECT="on"    # on (default) | off
 
+# stale-base auto-heal (HERD-199) — on | off (default off, ship-dormant). on → a STALE-BASE hold from
+# the stale-duplicate gate is mechanical and self-heals: the watcher auto-bounces the live builder with
+# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, shared REFIX_MAX_ROUNDS budget, honest
+# `rebasing · awaiting push` row), or dispatches the conflict resolver when no live builder remains
+# (foreign/reaped/dead). Only bounce-exhaustion escalates to needs-you. DUPLICATE flavor stays human.
+# off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.
+# STALE_BASE_AUTOFIX="off"  # off (default) | on
+
 # herd/gates commit status (HERD-194) — on (default) | off. on → as the watcher clears each (pr,sha) it
 # posts a `herd/gates` COMMIT STATUS: state=success on both-gates-green (healthcheck + adversarial
 # review), exactly once per (pr,sha). It posts ONLY success — never a non-passing pending/failure status,

@@ -10,6 +10,8 @@
 #   • an open-PR worktree                              → untouched
 #   • a stale tab registry entry                       → closed + registry row pruned
 #   • a dead-pid inflight marker                       → dropped
+#   • a detached scratch tree, clean, no unique commits → reaped
+#   • a detached scratch tree with a unique commit      → FLAGGED, never deleted  [judgment]
 #   • an orphaned (ppid=1) healthcheck process stub    → killed
 #
 # Asserts:
@@ -32,6 +34,8 @@
 #  (10) NO SHA ANCHOR ⇒ NO REAP — a worktree whose HEAD != the merged PR's headRefOid is untouched.
 #  (11) SHARED-PGID GUARD — a process group that also holds a spared process (the watcher, a live gate
 #       worker, ourselves) is never GROUP-killed; the sweep degrades to a single-pid kill.
+#  (13) DETACHED SCRATCH — a detached tree whose commits are reachable from no branch ref is FLAGGED,
+#       never reaped (removing the worktree destroys them irrecoverably); a clean one still reaps.
 #  (12) COUNTERS RESET PER RUN — the watcher's auto path reuses one process, so SWEEP_N_* must not
 #       accumulate across cadence ticks (a `sweep_auto` line would otherwise report a lifetime total).
 #
@@ -71,6 +75,19 @@ echo changed > "$TREESDIR/merged-dirty/f.txt"
 echo uniq > "$TREESDIR/closed-unique/u.txt"
 git -C "$TREESDIR/closed-unique" add -A
 git -C "$TREESDIR/closed-unique" -c user.email=t@t.local -c user.name=t commit -qm "unique work"
+# tmp-clean: a DETACHED scratch tree at origin/main, no unique work → safe to reap.
+git -C "$MAINDIR" worktree add -q --detach "$TREESDIR/tmp-clean" main >/dev/null 2>&1
+# tmp-precious: a DETACHED scratch tree carrying a commit reachable from NO branch ref. `git status`
+# reads CLEAN, so only a unique-commit check can save it. Removing the worktree would destroy the
+# commit AND its reflog (.git/worktrees/<name>/ goes with it). Must be FLAGGED, never reaped.
+git -C "$MAINDIR" worktree add -q --detach "$TREESDIR/tmp-precious" main >/dev/null 2>&1
+echo precious > "$TREESDIR/tmp-precious/only-here.txt"
+git -C "$TREESDIR/tmp-precious" add -A
+git -C "$TREESDIR/tmp-precious" -c user.email=t@t.local -c user.name=t commit -qm "unique A/B work"
+PRECIOUS_SHA="$(git -C "$TREESDIR/tmp-precious" rev-parse HEAD)"
+[ -z "$(git -C "$TREESDIR/tmp-precious" status --porcelain)" ] \
+  || fail "fixture: tmp-precious must read CLEAN to git status (that is the trap)"
+
 # stale-sha: HEAD moves past the sha the (merged) PR recorded → no anchor → must be untouched
 echo drift > "$TREESDIR/stale-sha/d.txt"
 git -C "$TREESDIR/stale-sha" add -A
@@ -221,7 +238,18 @@ sweep_run_safe_legs >/dev/null 2>&1 || fail "(5a) sweep_run_safe_legs exited non
 grep -q '"reason":"merged-dirty"' "$JOURNAL_FILE"          || fail "(5a) no sweep_flag for the dirty worktree"
 grep -q '"reason":"closed-unique-commits"' "$JOURNAL_FILE" || fail "(5a) no sweep_flag for the unique-commit worktree"
 grep '"event":"sweep_flag"' "$JOURNAL_FILE" | grep -q 'f.txt' || fail "(5a) the dirty flag carries no file evidence"
+grep -q '"reason":"scratch-unique-commits"' "$JOURNAL_FILE" \
+  || fail "(5a) no sweep_flag for the DETACHED tree carrying unique commits"
 ok; echo "PASS (5) judgment legs FLAGGED with evidence, never auto-deleted (auto mode)"
+
+# ── (13) detached scratch: unique commits are unrecoverable → FLAG, never reap ───────────────────
+[ -d "$TREESDIR/tmp-precious" ] \
+  || fail "(13) AUTO DELETED a detached scratch tree whose commit exists on NO branch (unrecoverable)"
+git -C "$MAINDIR" cat-file -e "$PRECIOUS_SHA^{commit}" 2>/dev/null \
+  || fail "(13) the detached tree's unique commit is gone from the object store"
+[ ! -d "$TREESDIR/tmp-clean" ] \
+  || fail "(13) a CLEAN detached scratch tree with zero unique commits should still be reaped"
+ok; echo "PASS (13) detached scratch: unique commits FLAGGED (unrecoverable); clean scratch still reaped"
 ok; echo "PASS (10) a worktree whose HEAD != the merged PR's headRefOid is never reaped"
 
 # ── (4) safe legs acted + journaled ──────────────────────────────────────────
@@ -305,14 +333,14 @@ ok; echo "PASS (9) SWEEP_AUTO off|advise|auto normalize; off is byte-inert; unkn
 # process. Without a per-run reset the SWEEP_N_* globals accumulate and each `sweep_auto` journal line
 # reports a lifetime total rather than what that tick actually swept. Everything is already clean here,
 # so a second pass must journal all-zero counts.
-# The two judgment worktrees (merged-dirty, closed-unique) survive every pass and are re-flagged each
-# time, so `flagged` is the field that exposes accumulation: it must read 2 on EVERY pass, not 2,4,6…
+# The three judgment worktrees (merged-dirty, closed-unique, tmp-precious) survive every pass and are
+# re-flagged each time, so `flagged` exposes accumulation: it must read 3 on EVERY pass, not 3,6,9…
 : > "$JOURNAL_FILE"
 sweep_run_safe_legs >/dev/null 2>&1 || true
 sweep_run_safe_legs >/dev/null 2>&1 || true
 LAST="$(grep '"event":"sweep_auto"' "$JOURNAL_FILE" | tail -1)"
-printf '%s' "$LAST" | grep -q '"flagged":2' \
-  || fail "(12) counters accumulated across runs (expected flagged=2 on every pass): $LAST"
+printf '%s' "$LAST" | grep -q '"flagged":3' \
+  || fail "(12) counters accumulated across runs (expected flagged=3 on every pass): $LAST"
 printf '%s' "$LAST" | grep -q '"reaped":0' || fail "(12) reaped counter accumulated across runs: $LAST"
 ok; echo "PASS (12) SWEEP_N_* counters reset per run (auto ticks never report a lifetime total)"
 
