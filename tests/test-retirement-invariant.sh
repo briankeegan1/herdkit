@@ -416,4 +416,95 @@ cold; [ "$(retire_classify whoknows "$T/nope" "" 0 registry | cut -d"$RS" -f1)" 
   || fail "(20) …but a registry-provenanced orphan retires normally"
 ok
 
+# ── (21) THE ORPHAN-PATH SHA ANCHOR: a merged PR does NOT license deleting a moved branch ────────
+# The worktree path anchors on HEAD == headRefOid (check 3). The worktree-GONE path must anchor on the
+# local branch TIP == headRefOid. Without it, a builder that kept committing after its PR merged has
+# those commits destroyed by `branch -D` — recoverable only via `git fsck` inside the gc window.
+# _retire_branch_unique is NOT a substitute: a SQUASH merge makes every commit read as unique.
+sha_q="$(mkwt anchor-moved)"                       # this commit is what the PR merged
+gh_says "feat/anchor-moved" MERGED "$sha_q" 25
+echo extra1 > "$WTREES/anchor-moved/e1"
+git -C "$WTREES/anchor-moved" add -A
+git -C "$WTREES/anchor-moved" -c user.email=t@t.t -c user.name=t commit -qm "kept working after the merge"
+tip_q="$(git -C "$WTREES/anchor-moved" rev-parse HEAD)"
+[ "$tip_q" != "$sha_q" ] || fail "(21) fixture: branch tip must differ from the merged head"
+git -C "$REPO" worktree remove --force "$WTREES/anchor-moved"
+
+cold; d="$(retire_classify anchor-moved "$WTREES/anchor-moved" "" 0 residual)"
+[ "$(printf '%s' "$d" | cut -d"$RS" -f1)" = held ] \
+  || fail "(21) a MERGED PR whose headRefOid != the local branch TIP must be HELD, got: $d"
+case "$(printf '%s' "$d" | cut -d"$RS" -f4)" in *"moved past the merged head"*) : ;;
+  *) fail "(21) the hold must name the drift and count the commits: $d" ;; esac
+
+# …and a real teardown pass must NOT delete it.
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step anchor-moved "$WTREES/anchor-moved" "" 0 residual
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/anchor-moved \
+  || fail "(21) a branch carrying commits past the merged head was DELETED — work lost"
+[ "$(_retire_state_of anchor-moved)" = held ] || fail "(21) …and the row must be a red hold"
+
+# Leg D carries the identical anchor: it must refuse this slug, and accept it once the ref is reset to
+# exactly the merged head.
+printf '%s 25 anchor-moved\n' "$(date +%s)" > "$STATE"
+cold; _retire_merged_branch_slug anchor-moved \
+  && fail "(21) leg D must refuse a branch whose tip is past the merged head"
+git -C "$REPO" branch -f feat/anchor-moved "$sha_q"
+cold; _retire_merged_branch_slug anchor-moved \
+  || fail "(21) leg D must accept a branch whose tip IS the merged head"
+# Anchored → the teardown proceeds and the branch goes.
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step anchor-moved "$WTREES/anchor-moved" "" 0 ledger
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/anchor-moved \
+  && fail "(21) an anchored merged branch must still be reaped"
+: > "$STATE"
+
+# An OPEN PR on an orphaned ref is not terminal at all — retire_classify must say so on its own, without
+# leaning on retirement_tick's (view-filtered) open-PR fast path.
+sha_r="$(mkwt anchor-open)"
+gh_says "feat/anchor-open" OPEN "$sha_r" 26
+git -C "$REPO" worktree remove --force "$WTREES/anchor-open"
+cold; [ "$(state_of anchor-open "$WTREES/anchor-open" "" 0)" = active ] \
+  || fail "(21) an orphaned ref with an OPEN PR must classify active"
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/anchor-open \
+  || fail "(21) …and its branch must survive"
+ok
+
+# ── (22) the noted-marker clear must not cross slug boundaries ───────────────────────────────────
+# _retire_state_clear runs on EVERY active classification (every tick for a healthy slug). A
+# `.retire-noted-foo-*` glob would delete sibling `foo-bar`'s hold marker each tick, so `foo-bar` would
+# re-journal retire_hold forever — defeating the once-per-(slug,kind) dedupe the marker exists for.
+: > "$TREES/.retire-noted-sib-hold"
+: > "$TREES/.retire-noted-sib-bling-hold"
+_retire_state_clear sib
+[ -e "$TREES/.retire-noted-sib-hold" ] && fail "(22) a slug must clear its OWN notice marker"
+[ -e "$TREES/.retire-noted-sib-bling-hold" ] \
+  || fail "(22) clearing 'sib' must not delete sibling 'sib-bling' notice markers"
+rm -f "$TREES/.retire-noted-sib-bling-hold"
+ok
+
+# ── (23) held → retiring resets the escalation grace (no false-red first tick) ───────────────────
+# A held slug bumps the counter every tick (that is what keeps it discoverable). Curing the hold by
+# DISCARDING dirt leaves HEAD at the merged sha, so the slug flips to retiring — and must NOT inherit a
+# counter already past _RETIRE_STUCK_TICKS, or the first converging tick renders a red 'retirement
+# stuck' row for a teardown that is proceeding normally.
+sha_s="$(mkwt cure-hold)"
+gh_says "feat/cure-hold" MERGED "$sha_s" 27
+echo "uncommitted" >> "$WTREES/cure-hold/file.txt"          # real dirt → held
+export HERD_RETIRE_STUCK_TICKS=3; _RETIRE_STUCK_TICKS=3
+for _ in 1 2 3 4; do
+  cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+  AGENTS_JSON='{"result":{"agents":[{"name":"cure-hold","agent_status":"idle"}]}}' \
+    _retire_step cure-hold "$WTREES/cure-hold" feat/cure-hold 0 worktree
+done
+[ "$(_retire_state_of cure-hold)" = held ] || fail "(23) fixture: the slug should be held"
+[ "$(_retire_attempts cure-hold)" -ge 3 ] || fail "(23) fixture: the held counter should have climbed"
+
+git -C "$WTREES/cure-hold" checkout -- file.txt                # the human discards the dirt
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+AGENTS_JSON='{"result":{"agents":[{"name":"cure-hold","agent_status":"idle"}]}}' \
+  _retire_step cure-hold "$WTREES/cure-hold" feat/cure-hold 0 worktree
+[ "$(_retire_state_of cure-hold)" = retiring ] \
+  || fail "(23) the first tick after a cured hold must be calm 'retiring', got: $(_retire_state_of cure-hold)"
+ok
+
 echo "ALL PASS ($pass checks)"

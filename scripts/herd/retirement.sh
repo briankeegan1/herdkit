@@ -116,9 +116,26 @@ _retire_state_bump() {
 # _retire_state_clear <slug> — forget everything this file remembers about <slug>: the escalation
 # counter AND the once-per-kind journal markers. Called when a slug converges or turns out to be active
 # (a re-spawn on the same kebab name), so a later hold/stuck for the same slug speaks again.
+# _retire_last_left <slug> — the leftovers string recorded on the previous non-converged tick (line 2 of
+# the state file), or empty. 'held' marks a slug that was carrying real work last tick.
+_retire_last_left() {
+  local f; f="$(_retire_state_file "$1")"
+  [ -s "$f" ] || return 0
+  sed -n 2p "$f" 2>/dev/null || true
+}
+
 _retire_state_clear() {
+  local k
   rm -f "$(_retire_state_file "$1")" 2>/dev/null || true
-  rm -f "$TREES/.retire-noted-$1-"* 2>/dev/null || true
+  # EXACT names, never a `.retire-noted-$1-*` glob: that glob also matches a SIBLING slug's markers
+  # (clearing `foo` would delete `foo-bar`'s `.retire-noted-foo-bar-hold`), and since this runs on every
+  # `active` classification — i.e. every tick for a healthy `foo` — a held `foo-bar` would re-emit its
+  # `retire_hold` journal line forever, defeating the very once-per-(slug,kind) dedupe the marker exists
+  # for. The kind is a closed set, so enumerate it; _retire_tail_ok cannot help here (its tails are shas,
+  # and `hold`/`stuck` are not hex).
+  for k in hold stuck; do
+    rm -f "$TREES/.retire-noted-$1-$k" 2>/dev/null || true
+  done
 }
 
 # ── leftovers: what still exists that has no right to ────────────────────────────────────────────
@@ -186,6 +203,16 @@ _retire_suffixed() {
     [ -e "$f" ] || continue
     _retire_tail_ok "${f#"$prefix"}" && printf '%s\n' "$f"
   done
+  return 0
+}
+
+# _retire_drop_probes <slug> — remove THIS slug's probe memos, tail-guarded. A bare
+# `.retire-probe-$slug-*` glob also matches a sibling (`foo` eats `foo-bar`'s probes), which would cost
+# the sibling one extra `gh pr view`. Bounded, but the guard is one line.
+_retire_drop_probes() {
+  local f
+  while IFS= read -r f; do [ -n "$f" ] && rm -f "$f" 2>/dev/null; done \
+    < <(_retire_suffixed "$TREES/.retire-probe-$1-")
   return 0
 }
 
@@ -288,13 +315,13 @@ EOF
     MERGED|CLOSED)
       if [ "${oid:-}" = "$head" ]; then
         printf '%s' "$line" > "$memo" 2>/dev/null || true
-        rm -f "$TREES/.retire-probe-$slug-"* 2>/dev/null || true
+        _retire_drop_probes "$slug"
       fi
       ;;
     *)
       # Non-terminal (open / no PR / gh unreachable): remember only that we asked, and drop this slug's
       # probes for any OTHER head — a builder that commits moves its head and would otherwise litter.
-      rm -f "$TREES/.retire-probe-$slug-"* 2>/dev/null || true
+      _retire_drop_probes "$slug"
       printf '%s\n' "$(_now_epoch)" > "$probe" 2>/dev/null || true
       ;;
   esac
@@ -336,15 +363,27 @@ _retire_branch_unique() {
 # _retire_classify_orphan <slug> <provenance> — the classifier for a slug whose WORKTREE IS GONE. Its
 # tab, agent, and ledger rows are pure debris either way; the only thing that can carry work is the
 # local BRANCH, so that is what must be proven disposable before it is deleted:
-#   no branch                         → retiring (nothing to lose)
-#   branch's PR is MERGED             → retiring (GitHub has every commit)
-#   …or the ledger's PR is MERGED     → retiring (the branch-name lookup fails after a delete-at-merge)
-#   CLOSED / no PR, 0 unique commits  → retiring (the branch adds nothing to the default branch)
-#   CLOSED / no PR, unique commits    → held     (this is the only copy — a human decides)
-#   base ref unresolvable             → held     (unprovable is never deleted)
+#   no branch                              → retiring (nothing to lose)
+#   branch's PR MERGED, tip == headRefOid   → retiring (every commit on this ref is in the merged PR)
+#   branch's PR MERGED, tip != headRefOid   → held     (commits past the merged head live ONLY here)
+#   branch has an OPEN PR                   → active   (not terminal at all)
+#   …or the ledger's PR is MERGED           → retiring (only with the SAME tip anchor; the branch-name
+#                                                       lookup fails after a delete-at-merge)
+#   CLOSED / no PR, 0 unique commits        → retiring (the branch adds nothing to the default branch)
+#   CLOSED / no PR, unique commits          → held     (this is the only copy — a human decides)
+#   base ref unresolvable                   → held     (unprovable is never deleted)
 #
-# PROVENANCE is a REQUIRED second gate, and it exists because this path has no sha anchor to lean on —
-# there is no worktree HEAD to compare a PR's headRefOid against. A slug reaches teardown here only if
+# THE SHA ANCHOR, restated for the branch. The worktree path anchors on the tree's HEAD == a terminal
+# PR's headRefOid. There is no worktree here, so the anchor becomes the LOCAL BRANCH TIP: `git rev-parse
+# refs/heads/<br>` must EQUAL the merged PR's headRefOid. "The PR named by this branch merged" is NOT
+# the same claim as "this ref holds nothing but that PR" — a builder that kept committing after the
+# merge has commits past the merged head that exist nowhere else, and `branch -D` destroys them
+# irrecoverably (recoverable only via `git fsck` inside the gc window). _retire_branch_unique cannot
+# substitute: a SQUASH merge rewrites history, so every commit on the branch reads as "unique" against
+# the default branch and the check would hold every squash-merged branch forever. Only the tip anchor
+# distinguishes "this ref is exactly the thing GitHub merged" from "this ref is that thing plus work".
+#
+# PROVENANCE is a REQUIRED second gate, on top of the anchor. A slug reaches teardown here only if
 # herdkit itself can show it created the thing: an engine tab in its own registry, a residual slug-keyed
 # marker it wrote, or a row in the reap ledger. Without that, the answer is `active` — do nothing. So a
 # discovery-key bug on any future leg (the class of bug that let PR-keyed ledgers manufacture the
@@ -368,7 +407,14 @@ _retire_classify_orphan() {
   IFS=$'\t' read -r st oid num <<EOF
 $(_srs_gh_view "$br")
 EOF
-  if [ "${st:-}" != "MERGED" ]; then
+  # An OPEN PR on this ref is not terminal at all. retirement_tick's open_slugs filter usually catches
+  # this first, but that filter reads a VIEW-FILTERED $PRS_JSON — it is a fast path, never the proof.
+  # retire_classify is a documented, unit-tested entry point and must be safe called directly.
+  [ "${st:-}" = "OPEN" ] && { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
+
+  # Ledger fallback ONLY when the branch name resolves NO PR at all (GitHub deleted the head branch at
+  # merge). Never let an old ledger PR's MERGED overwrite a live CLOSED verdict for THIS ref.
+  if [ -z "${st:-}" ]; then
     lpr="$(_retire_ledger_pr "$slug")"
     if [ -n "$lpr" ]; then
       # NB: _srs_gh_view's other callers pass a BRANCH NAME; here we pass a PR NUMBER. `gh pr view`
@@ -383,7 +429,17 @@ EOF
   fi
 
   if [ "${st:-}" = "MERGED" ]; then
-    printf 'retiring\x1f%s\x1f%s\x1fPR #%s merged · worktree gone\x1f%s' "${num:-}" "${oid:-}" "${num:-}" "$br"
+    # THE ANCHOR. Without it, "the PR merged" would license deleting a ref that has moved on since.
+    local tip ahead
+    tip="$(git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$br" 2>/dev/null || true)"
+    if [ -n "${oid:-}" ] && [ -n "$tip" ] && [ "$tip" = "$oid" ]; then
+      printf 'retiring\x1f%s\x1f%s\x1fPR #%s merged · worktree gone\x1f%s' "${num:-}" "${oid:-}" "${num:-}" "$br"
+    else
+      ahead="$(git -C "$MAIN" rev-list --count "${oid:-HEAD}..refs/heads/$br" 2>/dev/null || true)"
+      case "$ahead" in ''|*[!0-9]*) ahead="?" ;; esac
+      printf 'held\x1f\x1f\x1fbranch %s has moved past the merged head of PR #%s (%s commit(s) exist only here) · commit or discard\x1f%s' \
+        "$br" "${num:-}" "$ahead" "$br"
+    fi
     return 0
   fi
 
@@ -663,21 +719,34 @@ _retire_ledger_slugs() {
 # holds no uncommitted work and no tab, so an UNPROVABLE one is simply left where it is — silently, and
 # without a red row. `gh` being down must never turn a squash-merged branch into an alarm.
 _retire_merged_branch_slug() {
-  local slug="$1" br st oid num lpr lst
+  local slug="$1" br tip st oid num lpr lst loid
   _retire_branch_reapable || return 1
   br="$(_retire_branch_for_slug "$slug")"
   [ -n "$br" ] || return 1
   _retire_branch_live "$br" || return 1
+  tip="$(git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$br" 2>/dev/null || true)"
+  [ -n "$tip" ] || return 1
+
+  # THE SAME ANCHOR the orphan classifier enforces, and for the same reason: "the PR merged" does not
+  # mean "this ref is exactly what merged". Anchored on the branch TIP, so a branch that gained commits
+  # after its PR merged is never handed to teardown. _retire_anchor memoizes a terminal verdict for this
+  # exact (slug, tip) forever and TTL-caches a non-terminal one — which is also the BACKOFF: leg D walks
+  # the append-only reap ledger every tick, so an unreachable `gh` or a branch whose delete keeps failing
+  # would otherwise re-probe the network once per slug per 4 s tick, unbounded.
   IFS=$'\t' read -r st oid num <<EOF
-$(_srs_gh_view "$br")
+$(_retire_anchor "$slug" "$br" "$tip")
 EOF
-  [ "${st:-}" = "MERGED" ] && return 0
+  [ "${st:-}" = "MERGED" ] && [ -n "${oid:-}" ] && [ "$oid" = "$tip" ] && return 0
+
+  # Head branch deleted at merge ⇒ the branch name resolves no PR. Fall back to the ledger's PR NUMBER,
+  # but keep the anchor: its headRefOid must still equal this ref's tip.
+  [ -z "${st:-}" ] || return 1
   lpr="$(_retire_ledger_pr "$slug")"
   [ -n "$lpr" ] || return 1
-  IFS=$'\t' read -r lst _ _ <<EOF
+  IFS=$'\t' read -r lst loid _ <<EOF
 $(_srs_gh_view "$lpr")
 EOF
-  [ "${lst:-}" = "MERGED" ]
+  [ "${lst:-}" = "MERGED" ] && [ -n "${loid:-}" ] && [ "$loid" = "$tip" ]
 }
 
 # ── the invariant tick ───────────────────────────────────────────────────────────────────────────
@@ -847,6 +916,15 @@ EOF
       _retire_record "$slug" held "$detail" "$dir"
       return 0 ;;
   esac
+
+  # HELD → RETIRING is a FRESH teardown, not a continuation of a stuck one. A held slug bumps the
+  # escalation counter every tick it is held (that is what keeps it discoverable), so a human who cures
+  # the hold by DISCARDING dirt — HEAD stays at the merged sha, the tree goes clean — would otherwise
+  # land on a counter already past _RETIRE_STUCK_TICKS and see a red 'retirement stuck' row on the very
+  # first converging tick. That contradicts this file's own contract ("a single failed tick is never
+  # red") and the no-false-red-consoles rule. Reset the counter on the transition and restore the grace.
+  # (Curing by COMMIT needs no such care: HEAD moves, the anchor fails, the slug goes active.)
+  [ "$(_retire_last_left "$slug")" = held ] && _retire_state_clear "$slug"
 
   # retiring: drive teardown, then re-observe the world. Both halves are idempotent.
   local had_wt=0; [ -n "$dir" ] && [ -d "$dir" ] && had_wt=1
