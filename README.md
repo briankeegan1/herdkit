@@ -280,8 +280,10 @@ herd fleet digest [--since D]  # cross-project standup from each project's journ
 herd fleet set <KEY> <VAL>   # propagate one policy across the fleet (validated per project)
 
 # Sign off held PRs (MERGE_POLICY=approve or a HUMAN-VERIFY hold):
-bash scripts/herd/herd-approve.sh list           # gate-passed PRs awaiting approval
-bash scripts/herd/herd-approve.sh approve <pr#>  # sha-keyed approval → watcher merges
+herd approve list            # gate-passed PRs awaiting approval
+herd approve <pr#>           # sha-keyed approval → watcher merges
+herd approve why <pr#>       # the review verdict + block reason for one PR
+# (`herd approve` is an alias for `bash scripts/herd/herd-approve.sh`, which also still works)
 ```
 
 ---

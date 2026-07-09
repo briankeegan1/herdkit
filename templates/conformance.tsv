@@ -67,6 +67,7 @@ herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
 herd update [--force]	unit	tests/test-cli-update.sh
 herd log [--pr N] [--tail]	unit	tests/test-journal.sh
 herd why <pr#>	unit	tests/test-journal.sh
+herd approve [<pr#|slug>] [--sha <sha>]	unit	tests/test-cli-approve.sh
 herd status	unit	tests/test-status.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
 herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
@@ -89,11 +90,14 @@ fleet.sh	unit	tests/test-fleet-digest.sh
 herd-feature.sh	unit	tests/test-scoped-builder-verification.sh
 herd-feature.sh	unit	tests/test-flow-preference.sh
 herd-feature.sh	unit	tests/test-app-preview-config.sh
+herd-feature.sh	unit	tests/test-driver-lane-spawn.sh
 herd-quick.sh	unit	tests/test-scoped-builder-verification.sh
 herd-quick.sh	unit	tests/test-flow-preference.sh
 herd-quick.sh	unit	tests/test-context-provision.sh
+herd-quick.sh	unit	tests/test-driver-lane-spawn.sh
 herd-resolve.sh	sim	tests/test-sandbox-resolver-respawn.sh
 herd-resolve.sh	unit	tests/test-model-flags.sh
+herd-resolve.sh	unit	tests/test-driver-lane-spawn.sh
 herd-approve.sh	unit	tests/test-human-verify-hold.sh
 herd-approve.sh	unit	tests/test-approval-purge.sh
 herd-approve.sh	unit	tests/test-human-verify-policy.sh
@@ -238,6 +242,7 @@ HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
 HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
 HERD_LIMIT_UNKNOWN_WAIT	none-yet	unit: no test references HERD_LIMIT_UNKNOWN_WAIT or asserts the unparseable-reset blind-resume wait
 COORDINATOR_WATCHDOG	unit	tests/test-coordinator-watchdog.sh
+COORDINATOR_AUTONOMY	none-yet	render: coordinator template respects COORDINATOR_AUTONOMY posture (human|gated|full) — no test yet asserts the rendered conditional text
 DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh
 scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
 TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh

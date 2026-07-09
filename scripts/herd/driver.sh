@@ -82,16 +82,19 @@ _herd_known_drivers() {
   printf '%s' "${out:-<none>}"
 }
 
-# herd_driver_agent_value <KEY> [default] — read a DRIVER_AGENT_* binding from the ACTIVE driver's
-# .driver file (the runtime-exec / update catalog block). PURE: it READS the file (a single grep +
-# quote-strip), it does NOT source it, so it has no side effects and cannot inherit an unrelated env
-# var of the same name. FAIL-SOFT: echoes <default> when the drivers dir / file / key is unreadable,
-# so a caller under `set -euo pipefail` never aborts. The AGENT_UPDATE mechanism reads the runtime
-# binary + installer package names through this, making the knob driver-aware (claude/codex/grok).
+# herd_driver_agent_value <KEY> [default] [driver] — read a DRIVER_AGENT_* binding from a driver's
+# .driver file (the runtime-exec / update catalog block). Defaults to the ACTIVE driver; pass a third
+# arg to read a SPECIFIC driver's binding (the spawn composer below reads the RESOLVED runtime driver,
+# which a runtime-qualified MODEL ref may make differ from the active one). PURE: it READS the file (a
+# single grep + quote-strip), it does NOT source it, so it has no side effects and cannot inherit an
+# unrelated env var of the same name. FAIL-SOFT: echoes <default> when the drivers dir / file / key is
+# unreadable, so a caller under `set -euo pipefail` never aborts. The AGENT_UPDATE mechanism reads the
+# runtime binary + installer package names through this, making the knob driver-aware (claude/codex/grok).
 herd_driver_agent_value() {
-  local key="${1:-}" dflt="${2:-}" f line v
+  local key="${1:-}" dflt="${2:-}" drv="${3:-}" f line v
   [ -n "$key" ] || { printf '%s' "$dflt"; return 0; }
-  f="$(_herd_drivers_dir)/$(herd_driver_name).driver"
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  f="$(_herd_drivers_dir)/$drv.driver"
   [ -f "$f" ] || { printf '%s' "$dflt"; return 0; }
   line="$(grep -E "^${key}=" "$f" 2>/dev/null | tail -n1 || true)"
   [ -n "$line" ] || { printf '%s' "$dflt"; return 0; }
@@ -167,6 +170,102 @@ herd_model_driver_for() {
   local ref="${1:-}" out
   out="$(herd_model_resolve "$ref" 2>/dev/null)" || return 1
   printf '%s' "${out%%$'\t'*}"
+}
+
+# ── Agent-runtime EXEC composition (HERD-150 P2 — route the lanes through the P1 bindings) ─────────
+# P1 (PR #264) CATALOGUED every claude-specific incantation into DRIVER_AGENT_* bindings carried as
+# DATA in templates/drivers/<name>.driver; nothing consumed them, so the tree stayed byte-identical.
+# P2 makes the INTERACTIVE-SPAWN binding REAL at spawn: the lane/shim no longer HARDCODES
+# `claude --model … <flags> <prompt>` but COMPOSES the agent-runtime argv from the RESOLVED driver's
+# DRIVER_AGENT_INTERACTIVE_SPAWN template. Two consequences:
+#   • a runtime-qualified MODEL ref (HERD-151, `<driver>:<model>`) now actually launches THAT driver's
+#     runtime — the driver half is no longer resolved-then-DISCARDED, it selects the spawn binding;
+#   • a future non-Claude runtime (P5) rebinds this ONE block instead of forking every spawn lane.
+# BYTE-IDENTICAL for the shipped drivers: both herdr-claude and headless carry the `claude …` shape,
+# so composing against them reproduces today's exact argv (the lane spawn test is the rail).
+
+# The per-driver DRIVER_AGENT_* reader these helpers use is herd_driver_agent_value (above), passing the
+# resolved <driver> as its third arg so a runtime-qualified MODEL ref reads the RIGHT driver's binding.
+
+# herd_driver_agent_spawn_argv <driver> <model> <flags> <prompt> — compose the AGENT-RUNTIME argv for
+# an INTERACTIVE SPAWN from <driver>'s DRIVER_AGENT_INTERACTIVE_SPAWN template, emitting each token
+# NUL-TERMINATED so a caller reads it into an array (the prompt may hold spaces / newlines). The
+# template is shell-tokenized (quotes respected — `"<prompt>"` is ONE token); each token maps as:
+#   <model>                    → the <model> value; if EMPTY, DROP it AND the preceding --model flag
+#   <prompt>                   → the <prompt> value (one token, verbatim)
+#   the permission-flag token  → replaced by <flags>, whitespace-split (empty <flags> → dropped)
+#   anything else              → kept literally (the runtime executable + its fixed flags)
+# The permission-flag token is <driver>'s DRIVER_AGENT_PERMISSION_FLAG value, so a runtime that renames
+# or drops the yolo flag still composes correctly — the permission flag is honored as its OWN P1 class.
+# FAIL-SOFT: a driver with no spawn/permission binding falls back to today's exact claude shape, so a
+# misconfigured/foreign driver still spawns a real command (never an empty argv). BYTE-IDENTICAL to the
+# pre-P2 hardcoded `claude --model <model> <flags> <prompt>` for herdr-claude and headless.
+herd_driver_agent_spawn_argv() {
+  local drv="${1:-}" model="${2:-}" flags="${3:-}" prompt="${4:-}" binding perm
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN "" "$drv")"
+  perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "" "$drv")"
+  [ -n "$binding" ] || binding='claude --model <model> --dangerously-skip-permissions "<prompt>"'
+  [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
+  HERD_SPAWN_BINDING="$binding" HERD_SPAWN_PERM="$perm" HERD_SPAWN_MODEL="$model" \
+  HERD_SPAWN_FLAGS="$flags" HERD_SPAWN_PROMPT="$prompt" python3 -c '
+import os, shlex, sys
+model  = os.environ["HERD_SPAWN_MODEL"]
+flags  = os.environ["HERD_SPAWN_FLAGS"].split()   # whitespace split — mirrors bash $flags expansion
+prompt = os.environ["HERD_SPAWN_PROMPT"]
+try:
+    toks = shlex.split(os.environ["HERD_SPAWN_BINDING"])
+    perm = os.environ["HERD_SPAWN_PERM"]
+    out = []
+    for t in toks:
+        if t == "<model>":
+            if model:
+                out.append(model)
+            elif out and out[-1] == "--model":
+                out.pop()                          # empty model → drop the --model flag+value pair
+        elif t == "<prompt>":
+            out.append(prompt)
+        elif t == perm:
+            out.extend(flags)                      # permission flag → the (word-split) flags override
+        else:
+            out.append(t)
+except Exception:
+    # Unparseable binding falls back to the native claude shape, so a spawn is never silently dropped.
+    out = ["claude"] + (["--model", model] if model else []) + flags + [prompt]
+sys.stdout.write("".join(tok + "\0" for tok in out))
+'
+}
+
+# herd_driver_agent_runtime_native <driver> — success iff <driver>'s agent runtime is the NATIVE Claude
+# Code runtime (its DRIVER_AGENT_INTERACTIVE_SPAWN launches `claude`). The mux (herdr) tracks a native
+# `claude` agent by fingerprinting the pane's foreground process (herd_driver_agent_liveness's
+# has_claude probe); a NON-native runtime is INVISIBLE to that heuristic and must register its own
+# session identity + liveness via report-agent (below) — the HERD-178 session-identity seam. FAIL-SOFT:
+# an unreadable binding is treated as native so a misconfig never forces the report-agent path.
+herd_driver_agent_runtime_native() {
+  local drv="${1:-}" binding
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN "" "$drv")"
+  [ -n "$binding" ] || return 0
+  [ "${binding%% *}" = "claude" ]
+}
+
+# herd_driver_report_agent <slug> <pane> [state] — SESSION-IDENTITY registration for a NON-native agent
+# runtime (HERD-178). Tells the herdr mux "this pane IS agent <slug>, state <state>" so the roster /
+# liveness surface tracks a foreign runtime by NAME + reported state instead of the claude-cmdline
+# heuristic that only recognizes the native runtime — the same `agent`-keyed identity herd_driver_
+# agent_liveness already tolerates alongside `name`. herdr mux: `herdr pane report-agent`. headless /
+# native runtime / missing pane: a clean no-op. FAIL-SOFT: never aborts a caller, never blocks a spawn —
+# an un-registerable foreign agent simply falls back to the mux's own tracking (no red row). This is the
+# seam a non-native runtime driver (HERD-150 P5) — or the lanes below, when the resolved runtime is
+# non-native — wire their spawn through so a foreign session is visible to the watcher.
+herd_driver_report_agent() {
+  local slug="${1:-}" pane="${2:-}" state="${3:-working}"
+  [ -n "$slug" ] && [ -n "$pane" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr pane report-agent "$pane" --agent "$slug" --state "$state" >/dev/null 2>&1 || true
+  return 0
 }
 
 # ── Headless detached-agent registry ─────────────────────────────────────────────────────────────
@@ -651,30 +750,36 @@ herd_driver_focus_agent() {
 # list-agents can report its liveness. Returns 0 iff an agent was started.
 herd_driver_start_agent() {
   local slug="${1:-}" wt="${2:-}" model="${3:-}" flags="${4:-}" pointer="${5:-}" split="${6:-}"
-  # Resolve an optionally runtime-qualified model ref (HERD-151) → bare model. Loud-fails (never a
-  # silent claude fallback) on an unknown driver prefix; byte-identical for a bare value.
-  model="$(herd_model_for_spawn "$model")" || return 1
+  # Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER *and* bare model,
+  # TOGETHER, so the driver half is REAL (HERD-150 P2) instead of resolved-then-discarded: it selects
+  # which runtime's DRIVER_AGENT_INTERACTIVE_SPAWN binding composes the spawn argv below. Loud-fails
+  # (never a silent claude fallback) on an unknown driver prefix; byte-identical for a bare value.
+  local _res rt_driver
+  _res="$(herd_model_resolve "$model")" || return 1
+  rt_driver="${_res%%$'\t'*}"; model="${_res#*$'\t'}"
   if _herd_driver_is_headless; then
-    _herd_headless_start_agent "$slug" "$wt" "$model" "$flags" "$pointer"
+    _herd_headless_start_agent "$slug" "$wt" "$model" "$flags" "$pointer" "$rt_driver"
   else
-    _herd_herdr_start_agent "$slug" "$wt" "$model" "$flags" "$pointer" "$split"
+    _herd_herdr_start_agent "$slug" "$wt" "$model" "$flags" "$pointer" "$split" "$rt_driver"
   fi
 }
 _herd_headless_start_agent() {
-  local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5"
+  local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5" rt_driver="${6:-}"
   [ -n "$slug" ] && [ -d "$wt" ] || { printf '⚠️  headless: bad slug/worktree for start-agent (%s / %s)\n' "$slug" "$wt" >&2; return 1; }
   command -v claude >/dev/null 2>&1 || { printf '⚠️  headless: claude not on PATH — cannot start detached agent %s\n' "$slug" >&2; return 1; }
   local adir; adir="$(_herd_agent_dir "$slug")"
   mkdir -p "$adir" 2>/dev/null || { printf '⚠️  headless: cannot create agent registry dir %s\n' "$adir" >&2; return 1; }
   : "${flags:=--dangerously-skip-permissions}"
-  # Detached, no controlling terminal, no pane: stdout+stderr → the registry log (the "pane").
-  # shellcheck disable=SC2086  # $flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS).
-  ( cd "$wt" || exit 1; nohup claude --model "$model" $flags "$pointer" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
+  # Detached, no controlling terminal, no pane: stdout+stderr → the registry log (the "pane"). The
+  # runtime argv is COMPOSED from the resolved driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2).
+  local -a rt=(); local t
+  while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  ( cd "$wt" || exit 1; nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
   printf 'working\n' > "$adir/status" 2>/dev/null || true
   [ -s "$adir/pid" ]
 }
 _herd_herdr_start_agent() {
-  local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5" split="$6"
+  local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5" split="$6" rt_driver="${7:-}"
   local wsid; wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
   local created tab root
   # shellcheck disable=SC2086  # ${wsid:+…} deliberately word-splits into two argv when set
@@ -684,8 +789,11 @@ _herd_herdr_start_agent() {
   [ -n "${tab:-}" ] || return 1
   printf '%s %s builder\n' "$slug" "$tab" >> "${WORKTREES_DIR:-.}/.herd-tabs" 2>/dev/null || true
   : "${flags:=--dangerously-skip-permissions}"
-  # shellcheck disable=SC2086  # $wsid/$flags intentionally word-split (mirror the lane's args)
-  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- claude --model "$model" $flags "$pointer" >/dev/null 2>&1; then
+  # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
+  local -a rt=(); local t
+  while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
+  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- "${rt[@]}" >/dev/null 2>&1; then
     return 0
   fi
   # HERD-136: agent start failed after we created the tab — close it so no empty corpse tab lingers,
@@ -726,7 +834,7 @@ _herd_herdr_start_agent() {
 # (nohup) into the registry, exactly like the builder headless path. Returns the launch exit status.
 herd_driver_launch_agent() {
   local sa_name="" sa_cwd="" sa_pointer="" sa_model="" sa_flags="" sa_split="" sa_tab="" sa_focus="" sa_env=""
-  local sa_ws="" sa_ws_set=0 kv key val
+  local sa_ws="" sa_ws_set=0 sa_driver="" kv key val
   for kv in "$@"; do
     key="${kv%%=*}"; val="${kv#*=}"
     case "$key" in
@@ -739,15 +847,31 @@ herd_driver_launch_agent() {
       tab)       sa_tab="$val" ;;
       focus)     sa_focus="$val" ;;
       workspace) sa_ws="$val"; sa_ws_set=1 ;;
+      driver)    sa_driver="$val" ;;   # HERD-150 P2: caller-resolved runtime driver (lanes pre-resolve to fail-fast)
       env)       sa_env="${sa_env}${sa_env:+$'\n'}$val" ;;
       *)         : ;;  # ignore unknown keys (forward-compat)
     esac
   done
   [ -n "$sa_name" ] || { printf '⚠️  driver: launch-agent called with no name\n' >&2; return 1; }
-  # Resolve an optionally runtime-qualified model ref (HERD-151) → bare model, once, before either
-  # backend builds its argv. Loud-fails on an unknown driver prefix; byte-identical for a bare value
-  # (incl. the empty model the human seats / coordinator relaunch pass → no --model).
-  sa_model="$(herd_model_for_spawn "$sa_model")" || return 1
+  # Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER *and* bare model,
+  # once, before either backend builds its argv (HERD-150 P2). Making the resolved driver REAL — not
+  # discarded — is the point: it selects which runtime's DRIVER_AGENT_INTERACTIVE_SPAWN binding composes
+  # the `-- <runtime …>` argv below.
+  #
+  # TWO CONTRACTS, resolve EXACTLY ONCE:
+  #   • driver=<name> supplied → the caller ALREADY resolved (the builder lanes, which resolve BEFORE
+  #     creating a tab so a bad ref fails fast). sa_model is BARE BY CONTRACT — do NOT re-resolve it.
+  #     A bare model may LEGITIMATELY carry colons (an ollama-style 'llama3:8b' tag; a role model literally
+  #     named 'headless:opus'); re-feeding it to herd_model_for_spawn would mis-split on the first colon —
+  #     ABORTING on an unknown driver ('llama3'), or SILENTLY rewriting the model (headless:opus → opus).
+  #     herd_model_for_spawn / herd_model_resolve are for an UNRESOLVED ref ONLY.
+  #   • no driver= → sa_model is a raw (possibly qualified) ref; resolve it here (the human-seat / drainer
+  #     lanes). Loud-fails on an unknown driver prefix; byte-identical for a bare value (incl. the empty
+  #     model the human seats / coordinator relaunch pass → no --model).
+  if [ -z "$sa_driver" ]; then
+    local _res; _res="$(herd_model_resolve "$sa_model")" || return 1
+    sa_driver="${_res%%$'\t'*}"; sa_model="${_res#*$'\t'}"
+  fi
 
   if _herd_driver_is_headless; then
     [ -d "$sa_cwd" ] || { printf '⚠️  headless: bad cwd for launch-agent %s (%s)\n' "$sa_name" "$sa_cwd" >&2; return 1; }
@@ -755,22 +879,23 @@ herd_driver_launch_agent() {
     local adir; adir="$(_herd_agent_dir "$sa_name")"
     mkdir -p "$adir" 2>/dev/null || { printf '⚠️  headless: cannot create agent registry dir %s\n' "$adir" >&2; return 1; }
     : "${sa_flags:=--dangerously-skip-permissions}"
+    # The detached runtime argv is COMPOSED from the resolved driver's P1 binding (P2), same as the
+    # herdr path below — so a runtime-qualified ref launches the right runtime detached too.
+    local -a rt=(); local t
+    while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
     # Detached, no tty, no pane: stdout+stderr → the registry log; env vars exported into the child.
     ( cd "$sa_cwd" || exit 1
       # shellcheck disable=SC2163  # $_l is a literal "K=V" pair — `export "K=V"` sets+exports it.
       if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && export "$_l"; done <<< "$sa_env"; fi
-      # shellcheck disable=SC2086  # $sa_flags intentionally word-splits (mirrors the lane's flags)
-      if [ -n "$sa_model" ]; then
-        nohup claude --model "$sa_model" $sa_flags "$sa_pointer" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid"
-      else
-        nohup claude $sa_flags "$sa_pointer" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid"
-      fi )
+      nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
     printf 'working\n' > "$adir/status" 2>/dev/null || true
     [ -s "$adir/pid" ]
     return
   fi
 
-  # herdr-claude: build the exact argv the lane hardcoded (indexed array — bash-3.2 safe).
+  # herdr-claude: build the exact argv the lane hardcoded (indexed array — bash-3.2 safe). The MUX
+  # prefix (herdr agent start …) is the active driver's; the RUNTIME tail (after `--`) is composed from
+  # the RESOLVED runtime driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2) instead of hardcoded.
   local ws
   if [ "$sa_ws_set" = 1 ]; then ws="$sa_ws"; else ws="$(herd_resolve_workspace_id 2>/dev/null || true)"; fi
   local -a argv
@@ -781,11 +906,9 @@ herd_driver_launch_agent() {
   [ -n "$sa_split" ] && argv+=(--split "$sa_split")
   [ "$sa_focus" != "yes" ] && argv+=(--no-focus)
   if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && argv+=(--env "$_l"); done <<< "$sa_env"; fi
-  argv+=(-- claude)
-  [ -n "$sa_model" ] && argv+=(--model "$sa_model")
-  # shellcheck disable=SC2206  # $sa_flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS)
-  [ -n "$sa_flags" ] && argv+=($sa_flags)
-  argv+=("$sa_pointer")
+  argv+=(--)
+  local _t
+  while IFS= read -r -d '' _t; do argv+=("$_t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
   "${argv[@]}"
 }
 
@@ -840,6 +963,7 @@ _herd_driver_cli() {
     close-verified) herd_close_pane_verified "$@" ;;
     pane-identity)  herd_driver_pane_identity "$@"; echo ;;
     pane-rename)    herd_driver_pane_rename "$@" ;;
+    report-agent)   herd_driver_report_agent "$@" ;;   # HERD-178: session-identity register for a non-native runtime
     agent-pane)     herd_driver_agent_pane_id "$@"; echo ;;
     pane-alive)  herd_driver_pane_alive "$@" ;;
     agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
@@ -852,7 +976,7 @@ _herd_driver_cli() {
     agent-value) herd_driver_agent_value "$@"; echo ;;   # <KEY> [default] → the active driver's DRIVER_AGENT_* value
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 

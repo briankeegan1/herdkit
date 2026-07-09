@@ -109,6 +109,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
      ```
      bash {{SCRIPTS_DIR}}/herd-quick.sh <slug> "<task>"
      ```
+   **{{COORDINATOR_AUTONOMY_NOTE}}**
    **Link a tracked item back to its tracker.** When the item you picked carries a tracker id (the
    `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
    `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
