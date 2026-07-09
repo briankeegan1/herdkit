@@ -883,6 +883,58 @@ fi
 unset WATCHER_FLAIR
 DISPLAY=(); FLAIR_STATE=()
 
+# ── WATCHER SINGLETON spawn-lock (HERD-209) — reproduce the duplicate-watcher race ──────────────
+# The incident: control-room recovery spawned a SECOND agent-watch main while the first was still
+# alive; both polled the same PRs and raced the shared .git object store, so healthchecks restarted
+# endlessly. Drive the SHIPPED acquisition function _acquire_watcher_singleton (already sourced in lib
+# mode above) against the two states that decide REFUSE-vs-ADOPT:
+#   • LIVE lock  → a second launch REFUSES (spawns no duplicate), recorded pid untouched.
+#   • STALE lock → a launch under a dead recorded pid PROCEEDS and adopts the lock.
+# Each acquisition runs in a SUBSHELL so any flock fd / EXIT trap it installs never leaks into the
+# scenario shell (a subshell models a separate launch process).
+step singleton "watcher singleton spawn-lock (HERD-209): a second launch under a live lock refuses; a stale lock is adopted"
+
+_SNGL_OK=1
+if type _acquire_watcher_singleton >/dev/null 2>&1; then
+  _sngl_lock="$ART/.singleton-watcher.pid"
+  _sngl_saved="${HERD_WATCHER_LOCK:-}"
+  export HERD_WATCHER_LOCK="$_sngl_lock"
+  # A guaranteed-live pid we own; a guaranteed-dead pid (spawned then reaped).
+  sleep 300 & _sngl_live=$!
+  sleep 0   & _sngl_dead=$!; wait "$_sngl_dead" 2>/dev/null || true
+
+  # (a) LIVE lock → REFUSE, recorded pid untouched.
+  printf '%s\n' "$_sngl_live" > "$_sngl_lock"
+  if ( _acquire_watcher_singleton >/dev/null 2>&1 ); then _sngl_a=ACQUIRE; else _sngl_a=REFUSE; fi
+  _sngl_after_live="$(cat "$_sngl_lock" 2>/dev/null || true)"
+  if [ "$_sngl_a" = "REFUSE" ] && [ "$_sngl_after_live" = "$_sngl_live" ]; then
+    checkpoint watcher_singleton_refuses_live pass "a second launch under a LIVE lock (pid $_sngl_live) refused; no duplicate, recorded pid untouched"
+  else
+    checkpoint watcher_singleton_refuses_live fail "live-lock launch should REFUSE + preserve pid (got $_sngl_a, lock now '$_sngl_after_live')"
+    _SNGL_OK=0
+  fi
+
+  # (b) STALE lock (dead pid) → PROCEED and adopt (dead pid overwritten).
+  printf '%s\n' "$_sngl_dead" > "$_sngl_lock"
+  if ( _acquire_watcher_singleton >/dev/null 2>&1 ); then _sngl_b=ACQUIRE; else _sngl_b=REFUSE; fi
+  _sngl_after_stale="$(cat "$_sngl_lock" 2>/dev/null || true)"
+  if [ "$_sngl_b" = "ACQUIRE" ] && [ "$_sngl_after_stale" != "$_sngl_dead" ]; then
+    checkpoint watcher_singleton_adopts_stale pass "a launch under a STALE lock (dead pid $_sngl_dead) proceeded and adopted the lock"
+  else
+    checkpoint watcher_singleton_adopts_stale fail "stale-lock launch should PROCEED + adopt (got $_sngl_b, lock now '$_sngl_after_stale')"
+    _SNGL_OK=0
+  fi
+
+  kill "$_sngl_live" 2>/dev/null || true
+  rm -f "$_sngl_lock" 2>/dev/null || true
+  # Restore the scenario's HERD_WATCHER_LOCK so nothing downstream sees our probe path.
+  if [ -n "$_sngl_saved" ]; then export HERD_WATCHER_LOCK="$_sngl_saved"; else unset HERD_WATCHER_LOCK; fi
+else
+  checkpoint watcher_singleton_refuses_live fail "_acquire_watcher_singleton not defined (lib-mode source did not expose the singleton gate)"
+  checkpoint watcher_singleton_adopts_stale fail "_acquire_watcher_singleton not defined"
+  _SNGL_OK=0
+fi
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"
@@ -914,6 +966,8 @@ write_scorecard() {
     printf '  "queue_drained": %s,\n' "$([ "$_merged_ct" -eq "$NPRS" ] && echo true || echo false)"
     printf '  "ticks": %d,\n' "$TICKS"
     printf '  "flair_tested": true,\n'
+    printf '  "watcher_singleton_tested": true,\n'
+    printf '  "watcher_singleton_ok": %s,\n' "$([ "${_SNGL_OK:-0}" -eq 1 ] && echo true || echo false)"
     printf '  "infra_breaker_tested": true,\n'
     printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
     printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"

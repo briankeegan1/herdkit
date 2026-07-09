@@ -4127,6 +4127,21 @@ _list_project_watchers() {
   done < <(pgrep -f "$HERD_WATCH_ARGV0" 2>/dev/null || true)
 }
 
+# _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
+# else echo nothing (HERD-209). The atomic REFUSE-or-ADOPT read the launch paths (cmd_pane_watch /
+# cmd_reload) consult right before spawning: a non-empty result means a watcher already owns this
+# workspace, so ADOPT it instead of launching a duplicate; empty means the lock is stale/absent and
+# the caller may (re)launch. Mirrors agent-watch.sh's own startup guard (_acquire_watcher_singleton).
+# READ-ONLY and race-safe: agent-watch.sh writes the pid atomically (flock / temp+mv), so a torn read
+# is impossible; a `kill -0` on the recorded pid is the same liveness signal `herd status` uses.
+_watcher_lock_pid_if_live() {
+  local p=""
+  [ -f "$HERD_WATCHER_LOCK" ] || return 0
+  p="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && printf '%s\n' "$p"
+  return 0
+}
+
 # _stop_project_watcher — stop THIS project's watcher(s) with the SIGTERM-poll-SIGKILL-abort
 # sequence + duplicate-watcher guard. Requires HERD_WATCHER_LOCK, HERD_WATCH_ARGV0 and PROJECT_ROOT
 # in scope (loaded from .herd/config). DIES (aborts the caller) when a watcher cannot be stopped,
@@ -4586,13 +4601,21 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
       launch_desc="NOT relaunched (fallback suppressed)"
       warn "watcher NOT relaunched — herdr pane launch failed and the background fallback is suppressed (HERD_RELOAD_SKIP_LAUNCH=fallback)"
     else
-      [ "$herdr_attempted" -eq 1 ] && warn "herdr pane launch failed verification — relaunching the watcher in the BACKGROUND (no visible console)"
-      ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="$cfg" nohup bash "$watch_script" >/dev/null 2>&1 & )
-      say "  watcher relaunched in background"
-      # agent-watch.sh writes its PID to the lockfile on start — bounded poll for the summary.
-      local k=0
-      while [ "$k" -lt 10 ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; k=$((k+1)); done
-      [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      # HERD-209 singleton: never spawn over a LIVE watcher. If one already holds the lock (a
+      # concurrent recovery won the stop→spawn race), ADOPT it rather than launch a duplicate.
+      local _live_bg; _live_bg="$(_watcher_lock_pid_if_live)"
+      if [ -n "$_live_bg" ]; then
+        launch_desc="adopted (live watcher already holds the lock)"; watch_pid="$_live_bg"
+        say "  watcher already running (pid $_live_bg) — adopted, no duplicate spawned"
+      else
+        [ "$herdr_attempted" -eq 1 ] && warn "herdr pane launch failed verification — relaunching the watcher in the BACKGROUND (no visible console)"
+        ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="$cfg" nohup bash "$watch_script" >/dev/null 2>&1 & )
+        say "  watcher relaunched in background"
+        # agent-watch.sh writes its PID to the lockfile on start — bounded poll for the summary.
+        local k=0
+        while [ "$k" -lt 10 ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; k=$((k+1)); done
+        [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      fi
     fi
   fi
 
@@ -4771,7 +4794,13 @@ cmd_pane_watch() {
   # 3. Run the watcher in the pane, verified. On a detached run the watcher still grabs the
   #    lockfile — surface that loudly rather than double-spawning (the singleton refuses anyway).
   local wsum="FAILED ✗" watch_pid=""
-  if [ -n "$wPane" ]; then
+  # HERD-209 singleton: if a live watcher already holds the lock (a concurrent recovery won the race
+  # after our stop), ADOPT it — never drive a duplicate into the pane.
+  watch_pid="$(_watcher_lock_pid_if_live)"
+  if [ -n "$watch_pid" ]; then
+    wsum="adopted live watcher · no duplicate spawned"
+    warn "watcher pid $watch_pid already running for $WORKSPACE_NAME — adopted, not re-spawned"
+  elif [ -n "$wPane" ]; then
     if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
       wsum="pane $wPane · visible ✓"
       [ "$recreated" -eq 1 ] && wsum="pane $wPane · recreated ✓"
