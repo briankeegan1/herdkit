@@ -363,14 +363,19 @@ _retire_branch_unique() {
 # _retire_classify_orphan <slug> <provenance> — the classifier for a slug whose WORKTREE IS GONE. Its
 # tab, agent, and ledger rows are pure debris either way; the only thing that can carry work is the
 # local BRANCH, so that is what must be proven disposable before it is deleted:
-#   no branch                              → retiring (nothing to lose)
-#   branch's PR MERGED, tip == headRefOid   → retiring (every commit on this ref is in the merged PR)
-#   branch's PR MERGED, tip != headRefOid   → held     (commits past the merged head live ONLY here)
+# The order below is load-bearing: PROVE terminality from `gh` first, apply the branch-retention POLICY
+# only afterwards. A policy is not evidence.
 #   branch has an OPEN PR                   → active   (not terminal at all)
+#   no PR verdict at all (gh down / no PR)  → active   (unproven is not terminal; never a teardown)
+#   no branch                               → retiring (no ref ⇒ no commits ⇒ nothing to lose)
+#   terminal, DELETE_BRANCH_ON_MERGE=false  → retiring, with an EMPTY <branch>: the debris retires, the
+#                                                       retained ref is never touched and never judged
+#   MERGED, tip == headRefOid               → retiring (every commit on this ref is in the merged PR)
+#   MERGED, tip != headRefOid               → held     (commits past the merged head live ONLY here)
 #   …or the ledger's PR is MERGED           → retiring (only with the SAME tip anchor; the branch-name
 #                                                       lookup fails after a delete-at-merge)
-#   CLOSED / no PR, 0 unique commits        → retiring (the branch adds nothing to the default branch)
-#   CLOSED / no PR, unique commits          → held     (this is the only copy — a human decides)
+#   CLOSED, 0 unique commits                → retiring (the branch adds nothing to the default branch)
+#   CLOSED, unique commits                  → held     (this is the only copy — a human decides)
 #   base ref unresolvable                   → held     (unprovable is never deleted)
 #
 # THE SHA ANCHOR, restated for the branch. The worktree path anchors on the tree's HEAD == a terminal
@@ -397,19 +402,32 @@ _retire_classify_orphan() {
     worktree|registry|residual|ledger) : ;;
     *) printf 'active\x1f\x1f\x1f\x1f'; return 0 ;;
   esac
-  # Branches the operator asked to KEEP (DELETE_BRANCH_ON_MERGE=false, the default) are not debris and
-  # not our business: retire the tab/agent/ledger debris and leave the ref alone. Reporting a retained
-  # branch as unprovable work would be a red row about a deliberate policy.
-  _retire_branch_reapable || { printf 'retiring\x1f\x1f\x1fworktree gone\x1f'; return 0; }
+  # ORDER IS THE WHOLE FIX. The branch-retention POLICY must never gate the TERMINALITY PROOF.
+  #
+  # This check used to run first: under DELETE_BRANCH_ON_MERGE=false — the shipped default, and this
+  # repo's own committed value — every provenanced worktree-gone slug short-circuited straight to
+  # `retiring`, whether its PR was merged, closed, OPEN, or `gh` was simply unreachable. The OPEN guard
+  # below was dead code. The only thing left standing between a live open PR and a full silent teardown
+  # (tabs killed, registry row dropped, .herd-ref deleted, no console row) was retirement_tick's
+  # open_slugs FAST PATH — which fails OPEN on a `gh` blip ($PRS_JSON='[]') or a narrowed WATCHER_VIEW.
+  #
+  # So: prove terminality FIRST, from `gh`, for THIS ref. Only once a slug is proven disposable does the
+  # policy decide what happens to the BRANCH — and when the operator asked to retain it, the record is
+  # emitted with an EMPTY <branch> so retire_converge's _retire_delete_branch is a no-op on it, while the
+  # tab/agent/ledger debris still retires.
   br="$(_retire_branch_for_slug "$slug")"
+
+  # No local ref at all. Nothing here can carry commits: the only assets are tabs and slug markers, which
+  # the shipped orphan-tab sweep (_orphan_tab_ids) already reaps on strictly weaker evidence than the
+  # provenance gate above. Nothing to prove against, so nothing to prove.
   [ -n "$br" ] || { printf 'retiring\x1f\x1f\x1fworktree gone\x1f'; return 0; }
 
   IFS=$'\t' read -r st oid num <<EOF
 $(_srs_gh_view "$br")
 EOF
-  # An OPEN PR on this ref is not terminal at all. retirement_tick's open_slugs filter usually catches
-  # this first, but that filter reads a VIEW-FILTERED $PRS_JSON — it is a fast path, never the proof.
-  # retire_classify is a documented, unit-tested entry point and must be safe called directly.
+  # An OPEN PR on this ref is not terminal. retirement_tick's open_slugs filter usually catches this
+  # first, but that filter reads a VIEW-FILTERED $PRS_JSON — a fast path, never the proof. retire_classify
+  # is a documented, unit-tested entry point and must be safe when called directly.
   [ "${st:-}" = "OPEN" ] && { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
 
   # Ledger fallback ONLY when the branch name resolves NO PR at all (GitHub deleted the head branch at
@@ -427,6 +445,19 @@ EOF
       [ "${lst:-}" = "MERGED" ] && { st="MERGED"; num="$lnum"; oid="$loid"; }
     fi
   fi
+
+  # STILL no verdict: `gh` is unreachable, rate-limited, or this ref simply has no PR record. Those are
+  # indistinguishable from here, and an unreachable `gh` must never license a teardown — the worktree path
+  # makes exactly the same call (no anchor ⇒ active). Unproven is not terminal.
+  [ -n "${st:-}" ] || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
+
+  # POLICY, now that terminality is PROVEN (the PR is MERGED or CLOSED; OPEN and unproven already
+  # returned active). The operator asked to retain landed branches, so this ref is not debris and no
+  # proof about its commits is owed: retire the tab/agent/ledger debris and emit an EMPTY <branch> so
+  # _retire_delete_branch never touches it. Holding a retained branch would be a red row about a
+  # deliberate policy; deleting it would defy that policy. Neither.
+  _retire_branch_reapable \
+    || { printf 'retiring\x1f%s\x1f\x1fworktree gone · branch %s retained by policy\x1f' "${num:-}" "$br"; return 0; }
 
   if [ "${st:-}" = "MERGED" ]; then
     # THE ANCHOR. Without it, "the PR merged" would license deleting a ref that has moved on since.
@@ -663,6 +694,15 @@ _retire_real() {
   ( cd "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
 }
 
+# _retire_worktrees_enumerable — success iff `git worktree list` actually enumerated something. A git
+# repo always reports at least its own main checkout, so zero `worktree ` lines means the listing FAILED
+# (bad cwd, unreadable .git, a git that errored), not that there are no worktrees. Legs B–D key "orphan"
+# off the absence of a worktree, so a failed enumeration would make every registered slug an orphan at
+# once. This is the guard that turns that amplifier into a no-op tick.
+_retire_worktrees_enumerable() {
+  git -C "$MAIN" worktree list --porcelain 2>/dev/null | grep -q '^worktree '
+}
+
 # _retire_residual_slugs — slugs whose only remaining trace is a SLUG-KEYED file. This is the leg that
 # makes the invariant hold across a crash INSIDE teardown: by the time the worktree and the registry row
 # are gone, nothing else names the slug.
@@ -840,6 +880,17 @@ retirement_tick() {
     [ -n "$branch" ] && printf '%s\n' "$open_branches" | grep -qxF "$branch" && open=1
     _retire_step "$slug" "$dir" "$branch" "$open" worktree
   done < <(_sweep_worktree_rows)
+
+  # FAIL-CLOSED on enumeration failure. Legs B–D define an orphan as "a slug with no worktree", derived
+  # from $wt_slugs. If `git worktree list` fails, times out, or the repo is momentarily unreadable, that
+  # set is EMPTY and every registered slug — including live builders — looks orphaned, so one tick could
+  # tear down the entire control room. A healthy repo ALWAYS enumerates at least the main checkout, so an
+  # empty porcelain listing is never a legitimate "no worktrees"; it is a failure to observe. And an
+  # invariant that cannot observe the world must not act on it.
+  if ! _retire_worktrees_enumerable; then
+    journal_append retire_skip reason worktree-enumeration-failed
+    return 0
+  fi
 
   # ── legs B + C: slugs with NO worktree that nonetheless left something behind ──
   # B: an engine tab in the registry (the "merged builder lingers" corpse the operator kept seeing).

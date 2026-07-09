@@ -181,29 +181,36 @@ cold; [ "$(state_of vanished "$T/definitely-not-here" "" 0)" = retiring ] \
 cold; [ "$(state_of vanished "" "" 1)" = active ] \
   || fail "(10) …unless it still has an open PR"
 
-# 10a: worktree gone, branch's PR MERGED → retiring (GitHub has every commit).
+# 10a: worktree gone, branch's PR MERGED at this ref's tip → retiring (the ref IS what merged).
 sha_k="$(mkwt gone-merged)"
 gh_says "feat/gone-merged" MERGED "$sha_k" 21
 git -C "$REPO" worktree remove --force "$WTREES/gone-merged"
 cold; [ "$(state_of gone-merged "$WTREES/gone-merged" "" 0)" = retiring ] \
-  || fail "(10a) worktree gone + MERGED PR must classify retiring"
+  || fail "(10a) worktree gone + MERGED PR anchored at the branch tip must classify retiring"
 
-# 10b: worktree gone, NO PR anywhere, branch carries commits that exist only here → HELD. Deleting
+# 10b: worktree gone, PR CLOSED unmerged, branch carries commits that exist only here → HELD. Deleting
 # that branch is the one irreversible thing on this path, so it must never happen on a guess.
 sha_l="$(mkwt gone-orphan)"
+gh_says "feat/gone-orphan" CLOSED "$sha_l" 28
+cold; d="$(retire_classify gone-orphan "$WTREES/gone-orphan" "" 0 residual)"
 git -C "$REPO" worktree remove --force "$WTREES/gone-orphan"
 cold; d="$(retire_classify gone-orphan "$WTREES/gone-orphan" "" 0 residual)"
 [ "$(printf '%s' "$d" | cut -d"$RS" -f1)" = held ] \
-  || fail "(10b) an unmerged branch with unique commits must be HELD, not deleted: $d"
+  || fail "(10b) a CLOSED branch with unique commits must be HELD, not deleted: $d"
 case "$(printf '%s' "$d" | cut -d"$RS" -f4)" in *"exist only on branch"*) : ;;
   *) fail "(10b) the hold must name the branch and count its commits: $d" ;; esac
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-orphan \
   || fail "(10b) classification must not have side effects"
 
-# 10c: worktree gone, no PR, branch adds nothing to the default branch → retiring (nothing to lose).
+# 10c: worktree gone, PR CLOSED, branch adds nothing to the default branch → retiring (nothing to lose).
 git -C "$REPO" branch -q feat/gone-empty main
+gh_says "feat/gone-empty" CLOSED "$(git -C "$REPO" rev-parse main)" 29
 cold; [ "$(state_of gone-empty "$WTREES/gone-empty" "" 0)" = retiring ] \
-  || fail "(10c) a branch with zero unique commits must classify retiring"
+  || fail "(10c) a CLOSED branch with zero unique commits must classify retiring"
+# …but with NO verdict at all (gh down / no PR record) it is UNPROVEN, and unproven is never terminal.
+git -C "$REPO" branch -q feat/gone-empty2 main
+cold; [ "$(state_of gone-empty2 "$WTREES/gone-empty2" "" 0)" = active ] \
+  || fail "(10c) an orphan with no gh verdict must classify active, whatever its commits"
 
 # 10d: the ledger fallback — GitHub deleted the head branch at merge, so the branch name resolves no
 # PR, but the reap ledger's PR number does, and it says MERGED.
@@ -213,10 +220,13 @@ printf '%s 22 gone-ledger\n' "$(date +%s)" > "$STATE"
 gh_says "22" MERGED "$sha_m" 22
 cold; [ "$(state_of gone-ledger "$WTREES/gone-ledger" "" 0)" = retiring ] \
   || fail "(10d) the ledger's MERGED PR must anchor a branch whose name resolves no PR"
-# …but a ledger row whose PR is NOT merged proves nothing: the branch's unique commits still hold.
+# …but a ledger row whose PR is NOT merged proves nothing. With no terminal verdict from either the
+# branch name or the ledger PR, the slug is UNPROVEN → active. Never a delete on a stale ledger row.
 gh_says "22" OPEN "$sha_m" 22
-cold; [ "$(state_of gone-ledger "$WTREES/gone-ledger" "" 0)" = held ] \
+cold; [ "$(state_of gone-ledger "$WTREES/gone-ledger" "" 0)" = active ] \
   || fail "(10d) a stale ledger row must never anchor a delete on its own"
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-ledger \
+  || fail "(10d) …and the branch must survive"
 : > "$STATE"
 ok
 
@@ -322,11 +332,34 @@ left="$(DELETE_BRANCH_ON_MERGE="false" AGENTS_JSON='{"result":{"agents":[]}}' \
         retire_leftovers keepbranch "$WTREES/keepbranch" feat/keepbranch)"
 [ -z "$left" ] || fail "(17) a retained branch must not count as a leftover, got: $left"
 [ "$(_retire_state_of keepbranch)" = active ] || fail "(17) …so the slug converges and renders no row"
-# …and an ORPHANED slug under the same policy retires its debris without judging the branch.
-cold; [ "$(DELETE_BRANCH_ON_MERGE=false state_of gone-orphan "$WTREES/gone-orphan" "" 0)" = retiring ] \
-  || fail "(17) a retained branch must not turn an orphan slug into a hold"
-git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-orphan \
+# …and an ORPHANED slug under the same policy retires its DEBRIS without judging or touching the branch —
+# but ONLY once terminality is proven. The policy is not evidence: it must never stand in for the proof.
+#
+#   gone-orphan   has a branch with unique commits and NO PR verdict at all (gh silent) → unproven →
+#                 active. A `gh` blip must never license a teardown, whatever the branch policy says.
+sha_u="$(mkwt gone-nogh)"          # no gh_says → no PR verdict at all
+git -C "$REPO" worktree remove --force "$WTREES/gone-nogh"
+cold; [ "$(DELETE_BRANCH_ON_MERGE=false state_of gone-nogh "$WTREES/gone-nogh" "" 0)" = active ] \
+  || fail "(17) an UNPROVEN orphan must be active under any branch policy — the policy is not the proof"
+cold; [ "$(DELETE_BRANCH_ON_MERGE=true state_of gone-nogh "$WTREES/gone-nogh" "" 0)" = active ] \
+  || fail "(17) …and under the reaping policy too"
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-nogh \
   || fail "(17) …and its commits are still there"
+
+#   gone-merged   is provably MERGED at its tip → the debris retires, the branch is retained, and the
+#                 record carries an EMPTY <branch> so _retire_delete_branch cannot fire on it.
+cold; d="$(DELETE_BRANCH_ON_MERGE=false retire_classify gone-merged "$WTREES/gone-merged" "" 0 registry)"
+[ "$(printf '%s' "$d" | cut -d"$RS" -f1)" = retiring ] \
+  || fail "(17) a proven-terminal orphan must still retire its debris under a retain policy: $d"
+[ -z "$(printf '%s' "$d" | cut -d"$RS" -f5)" ] \
+  || fail "(17) a retained branch must be emitted as an EMPTY <branch> field, got: $d"
+case "$(printf '%s' "$d" | cut -d"$RS" -f4)" in *"retained by policy"*) : ;;
+  *) fail "(17) …and say so: $d" ;; esac
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+DELETE_BRANCH_ON_MERGE=false AGENTS_JSON='{"result":{"agents":[]}}' \
+  _retire_step gone-merged "$WTREES/gone-merged" "" 0 registry
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-merged \
+  || fail "(17) a real teardown pass must not delete a retained branch"
 ok
 
 # ── (18) REGRESSION: the orphan path through _retire_step (the \x1f field-parse bug) ─────────────
@@ -334,6 +367,7 @@ ok
 # <pr>/<sha> fields collapsed under `IFS=$'\t' read`, so `pr` got prose, `detail` (the evidence) went
 # empty, and `branch` went empty so it was never reaped though the slug reported "converged".
 sha_o="$(mkwt orphan-held)"
+gh_says "feat/orphan-held" CLOSED "$sha_o" 30   # terminal, unmerged: the branch is the only copy
 git -C "$REPO" worktree remove --force "$WTREES/orphan-held"
 cold
 RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
@@ -352,6 +386,7 @@ printf '%s\n' "$(_retire_residual_slugs)" | grep -qxF orphan-held \
 # AND an empty <sha> — three consecutive separators — so it is the exact shape that collapsed, leaving
 # <branch> empty: the branch survived while the slug reported "converged".
 git -C "$REPO" branch -q feat/orphan-empty main
+gh_says "feat/orphan-empty" CLOSED "$(git -C "$REPO" rev-parse main)" 31
 cold
 RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
 AGENTS_JSON='{"result":{"agents":[]}}' _retire_step orphan-empty "$WTREES/orphan-empty" "" 0 registry
@@ -367,7 +402,7 @@ cold
 JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
 RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
 DELETE_BRANCH_ON_MERGE=false AGENTS_JSON='{"result":{"agents":[]}}' \
-  _retire_step journal-orphan "$T/nope" "" 0 registry
+  _retire_step journal-orphan "$T/nope" "" 0 registry   # no local branch ⇒ no ref, no commits, no proof owed
 grep -q '"event":"retire_converged"' "$JOURNAL_FILE" \
   || fail "(18) a first-tick teardown must journal retire_converged (post-mortem observability)"
 grep -q 'worktree gone' "$JOURNAL_FILE" && grep -q '"pr":"worktree gone"' "$JOURNAL_FILE" \
@@ -467,6 +502,26 @@ cold; [ "$(state_of anchor-open "$WTREES/anchor-open" "" 0)" = active ] \
   || fail "(21) an orphaned ref with an OPEN PR must classify active"
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/anchor-open \
   || fail "(21) …and its branch must survive"
+
+# THE SAME, under the SHIPPED DEFAULT policy. This is the case the branch-retention short-circuit used
+# to swallow: with DELETE_BRANCH_ON_MERGE=false every provenanced orphan returned `retiring` before the
+# OPEN check could run, so a live PR's tabs, registry row, and .herd-ref were silently torn down. The
+# open_slugs fast path cannot save it — it reads a view-filtered $PRS_JSON and fails open on a gh blip.
+cold; [ "$(DELETE_BRANCH_ON_MERGE=false state_of anchor-open "$WTREES/anchor-open" "" 0)" = active ] \
+  || fail "(21) an OPEN PR must classify active under the DEFAULT branch policy too"
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+: > "$TREES/.herd-ref-anchor-open"
+DELETE_BRANCH_ON_MERGE=false AGENTS_JSON='{"result":{"agents":[]}}' \
+  _retire_step anchor-open "$WTREES/anchor-open" "" 0 registry
+[ -e "$TREES/.herd-ref-anchor-open" ] \
+  || fail "(21) an OPEN PR's slug markers must survive a tick under the default policy"
+[ "$(_retire_state_of anchor-open)" = active ] || fail "(21) …and it must render no row"
+rm -f "$TREES/.herd-ref-anchor-open"
+
+# An unreachable gh is likewise unproven → active, under either policy.
+sha_v="$(mkwt anchor-nogh)"; git -C "$REPO" worktree remove --force "$WTREES/anchor-nogh"
+cold; [ "$(DELETE_BRANCH_ON_MERGE=false state_of anchor-nogh "$WTREES/anchor-nogh" "" 0)" = active ] \
+  || fail "(21) an orphan with no gh verdict must be active (unproven is never terminal)"
 ok
 
 # ── (22) the noted-marker clear must not cross slug boundaries ───────────────────────────────────
