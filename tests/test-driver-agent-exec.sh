@@ -66,8 +66,15 @@ check DRIVER_AGENT_PERMISSION_FLAG   "'--dangerously-skip-permissions'"
 check DRIVER_AGENT_LIMIT_PATTERN     "'usage limit|session limit|hit your (usage|session) limit'"
 check DRIVER_AGENT_COST_USAGE_KEYS   "'input_tokens output_tokens cache_creation_input_tokens cache_read_input_tokens'"
 # The real code these mirror must still contain the exact string — a drift guard on the audit map.
-grep -qF 'claude -p "$PROMPT" --model "$ADVISE_MODEL"' "$ROOT/scripts/herd/herd-advise.sh" \
-  || fail "one-shot-exec audit site drifted (herd-advise.sh)"
+# one-shot-exec has been ROUTED (HERD-150 P3): the `claude -p …` incantation now lives ONCE in the
+# driver seam (herd_driver_oneshot_exec), and the drainer sites call THAT — so the guard follows the
+# incantation to driver.sh and asserts the advisor site routes through the seam (no raw `claude -p`).
+grep -qF 'claude -p "$prompt" --model "$model"' "$ROOT/scripts/herd/driver.sh" \
+  || fail "one-shot-exec incantation drifted out of the driver seam (driver.sh: herd_driver_oneshot_exec)"
+grep -qF 'herd_driver_oneshot_exec "$PROMPT" "$ADVISE_MODEL"' "$ROOT/scripts/herd/herd-advise.sh" \
+  || fail "herd-advise.sh no longer routes its one-shot query through the driver seam"
+grep -qF 'claude -p "$' "$ROOT/scripts/herd/herd-advise.sh" \
+  && fail "herd-advise.sh still calls a RAW claude -p (must route through herd_driver_oneshot_exec)"
 grep -qF 'usage limit|session limit|hit your (usage|session) limit' "$ROOT/scripts/herd/agent-watch.sh" \
   || fail "limit-detection audit site drifted (agent-watch.sh)"
 ok; echo "PASS (3) herdr-claude binds today's exact strings; audit sites still present"

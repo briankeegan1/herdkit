@@ -29,6 +29,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/herd-config.sh"
+# Runtime driver shim: route the one-shot advisor query through herd_driver_oneshot_exec so a
+# non-Claude runtime rebinds the exec incantation in one place (HERD-150 P3). Byte-identical default.
+# shellcheck source=/dev/null
+. "$HERE/driver.sh"
 
 _advise_usage() {
   printf 'usage: herd advise "<question>" [context…]   (extra context may also be piped on stdin)\n' >&2
@@ -106,11 +110,12 @@ CONTEXT PROVIDED BY THE BUILDER:
 $CONTEXT"
 fi
 
-# Single-shot, non-interactive. Capture stdout; a non-zero exit OR empty output is a fail-soft
-# degrade, never a hard error. stderr from claude is dropped so a transient warning cannot corrupt
-# the advice the builder reads.
+# Single-shot, non-interactive — routed through the driver's one-shot exec seam (DRIVER_AGENT_ONESHOT_EXEC,
+# HERD-150 P3) so a non-Claude runtime rebinds the incantation in one place; byte-identical for the
+# default driver. Capture stdout; a non-zero exit OR empty output is a fail-soft degrade, never a hard
+# error. stderr from claude is dropped so a transient warning cannot corrupt the advice the builder reads.
 # shellcheck disable=SC2086  # $CLAUDE_FLAGS intentionally word-splits (mirrors the lanes' usage)
-advice="$(claude -p "$PROMPT" --model "$ADVISE_MODEL" $CLAUDE_FLAGS 2>/dev/null)" || advice=""
+advice="$(herd_driver_oneshot_exec "$PROMPT" "$ADVISE_MODEL" $CLAUDE_FLAGS 2>/dev/null)" || advice=""
 
 if [ -z "${advice//[[:space:]]/}" ]; then
   _advise_degrade "the advisor model call returned no advice (model=$ADVISE_MODEL)"
