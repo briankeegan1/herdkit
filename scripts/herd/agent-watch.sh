@@ -631,9 +631,18 @@ _fmt_age() {
 # only gives them a consistent, honest vocabulary):
 #   • working                            — the HERD's move; a builder/gate is making progress
 #                                          (building… · health-check · running 3m · review · running …).
-#   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, no PR.
-#                                          Carries the idle age so a just-freed spare (0s) reads apart
-#                                          from a forgotten one (2h, reap it). Calm — benign, not an alarm.
+#   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, and a
+#                                          SUCCESSFUL open-PR list positively has no PR for its branch
+#                                          (HERD-224). Carries the idle age so a just-freed spare (0s)
+#                                          reads apart from a forgotten one (2h, reap it). Calm — benign.
+#                                          RESERVED (HERD-164) for a genuinely UNASSIGNED, pre-PR builder:
+#                                          a merged/closed slug is 'retiring…', never a spare.
+#   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
+#                                          (HERD-224). Neutral/degraded — never the definitive
+#                                          "awaiting task" claim from a lookup FAILURE.
+#   • retiring… · <leftovers> · <age>    — the HERD's move; a merged/closed slug whose teardown is
+#                                          converging this tick (see retirement.sh). Calm — it clears
+#                                          itself, usually within one tick.
 #   • parked · <cause> · retry <eta>     — the HERD's move; auto-recovering on its own (a limit-hit
 #                                          auto-resume names its reset ETA; see _handle_limit_blocked).
 #   • needs-you · <blocker> · <remedy>   — YOUR move; a red hold that will NOT clear itself (dead
@@ -647,12 +656,71 @@ _fmt_age() {
 # owner (yours: assign work or retire the worktree) and the age since the worktree was born, so the row
 # answers whose-move-is-it AND how long it has waited. Replaces the banned, ownerless, ageless
 # "idle · no PR". Age uses _now_epoch (HERD_FAKE_NOW-overridable) so it is deterministic under test.
+# ONLY call this when a SUCCESSFUL open-PR list positively contains no PR for the branch (HERD-224);
+# a failed/empty-from-error `gh pr list` must use _row_pr_match_pending instead.
 _row_awaiting_task() {
   local _sl="$1" _wt="$2" _age _born
   _born="$(_worktree_born "$_wt")"
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_retirement <slug-cell> <slug> <state> <detail> — the console row for a slug the retirement
+# invariant (HERD-164, retirement.sh) is reconciling. Three states, three owners:
+#
+#   retiring  the HERD's move — teardown is converging; <detail> is the comma-joined leftover kinds
+#             (worktree,tab,agent,branch,ledger). CALM (dim ♻️): it clears itself, and a single
+#             non-converged tick is normal (a herdr tab close is a round-trip). Carries the age it has
+#             been converging so a wedged one is legible before it even turns red.
+#   stuck     YOUR move — teardown has failed _RETIRE_STUCK_TICKS ticks running. RED, and it NAMES the
+#             blocker (the first leftover kind that would not die) plus the remedy.
+#   held      YOUR move — the slug is terminal but carries REAL WORK (uncommitted tracked files, or
+#             commits that exist nowhere else). RED, with the evidence verbatim. Retirement will not
+#             touch it, this tick or ever, until a human commits or discards.
+#
+# Never renders the banned 'idle' word, and never renders 'awaiting task' — a merged builder is not a
+# spare. Pure formatter (age is read from the escalation state), so the unit test can pin its bytes.
+_row_retirement() {
+  local _sl="$1" _slug="$2" _state="$3" _detail="$4" _age
+  _age="$(_retire_age "$_slug")"
+  case "$_state" in
+    stuck)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · retirement stuck: %s · run `herd sweep` or close it by hand · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$_age" "$C_RESET" ;;
+    held)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$C_RESET" ;;
+    *)
+      printf '    %s♻️%s  %s%s%s %sretiring… · %s · %s%s' \
+        "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_detail" "$_age" "$C_RESET" ;;
+  esac
+}
+
+# build_retiring — the "retiring" console block: one row per retirement candidate whose WORKTREE IS
+# ALREADY GONE, so it can never appear among the in-flight (worktree-derived) rows — the merged builder
+# whose tab, agent, or ledger row outlived its tree. Slugs that still HAVE a worktree are rendered
+# inline by the tick loop's classifier instead, so nothing is listed twice. Empty (byte-identical
+# console) whenever every slug has converged — the healthy steady state.
+build_retiring() {
+  RETIRING=""
+  local i
+  for i in "${!RETIRE_SLUG[@]}"; do
+    local _slug="${RETIRE_SLUG[i]}" _dir="${RETIRE_DIR[i]}"
+    [ -n "$_dir" ] && [ -d "$_dir" ] && continue
+    RETIRING="${RETIRING}$(_row_retirement "$(_slug_cell "$_slug")" "$_slug" "${RETIRE_STATE[i]}" "${RETIRE_DETAIL[i]}")"$'\n'
+  done
+}
+
+# _row_pr_match_pending <slug-cell> — NEUTRAL/degraded console row when the open-PR roster could not
+# be fetched this tick (HERD-224). GROUNDED: a `gh pr list` blip (or the old `|| echo '[]'` collapse)
+# used to paint "awaiting task · assign or retire" for builders that HAD an open PR — a definitive
+# "this builder has no work" claim from a lookup FAILURE. This row is calm (not needs-you/💀), names
+# the transient, and never says "awaiting task". Next tick retries the fetch.
+_row_pr_match_pending() {
+  local _sl="$1"
+  printf '    %s⏳%s %s%s%s %sPR match pending · retrying%s' \
+    "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$C_RESET"
 }
 
 # ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
@@ -1150,6 +1218,12 @@ render() {
   # unless a builder has filed a note since the cursor advanced, so byte-identical when unused.
   if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
+  fi
+  # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
+  # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
+  # every terminal slug has converged, which is the steady state, so the console is byte-identical.
+  if [ -n "${RETIRING:-}" ]; then
+    frame="${frame}  ${C_DIM}retiring${C_RESET}"$'\n'"${RETIRING}"$'\n'
   fi
   # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
   # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
@@ -3001,13 +3075,17 @@ reconcile_backlog() {
   return 0
 }
 
-# refresh_codemap <pr#> — POST-MERGE codemap freshness hook (best-effort, NEVER blocks/fails the
-# merge). After a PR lands on the default branch and $MAIN is fast-forwarded, regenerate the
-# committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan actually changed its
-# content, commit the refresh STRAIGHT to the default branch — no PR, mirroring the BACKLOG.md
-# generated-artifact convention — and push ff-safe. Every failure mode fails SOFT and journals a
-# `codemap_refresh` event so a drift audit can see what happened; nothing here can ever return
-# non-zero into do_merge.
+# refresh_codemap <pr#> [provenance] — POST-MERGE codemap freshness hook (best-effort, NEVER
+# blocks/fails the merge). After a PR lands on the default branch and $MAIN is fast-forwarded,
+# regenerate the committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan
+# actually changed its content, commit the refresh STRAIGHT to the default branch — no PR,
+# mirroring the BACKLOG.md generated-artifact convention — and push ff-safe. Every failure mode
+# fails SOFT and journals a `codemap_refresh` event so a drift audit can see what happened; nothing
+# here can ever return non-zero into do_merge.
+#
+# Optional <provenance> tags the journal (and shapes the commit message when <pr#> is empty): the
+# do_merge fast path leaves it empty (byte-identical journal lines for existing tests); the
+# tick-level reconcile (HERD-218) passes `reconcile` so out-of-band merges are auditable.
 #
 # Gated by CODEMAP_AUTOREFRESH: off → byte-inert (we never run the scan, never touch the tree).
 # Race-guarded three ways: (1) only when the project has already ADOPTED the codemap (the committed
@@ -3017,47 +3095,64 @@ reconcile_backlog() {
 # nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
 # HERD-159: unrecognized values fail soft toward ACTIVE via _codemap_auto (cosmetic key).
 refresh_codemap() {
-  local rc_pr="${1:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh"
+  local rc_pr="${1:-}" rc_prov="${2:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh" rc_msg
+  # _rc_j <k v ...> — journal codemap_refresh with optional provenance tag (empty → omit, keeps the
+  # pre-HERD-218 journal lines byte-identical for the do_merge path / existing hermetic tests).
+  _rc_j() {
+    if [ -n "$rc_prov" ]; then
+      journal_append codemap_refresh pr "$rc_pr" "$@" provenance "$rc_prov"
+    else
+      journal_append codemap_refresh pr "$rc_pr" "$@"
+    fi
+  }
   case "$(_codemap_auto)" in
     false)
-      journal_append codemap_refresh pr "$rc_pr" result skipped reason disabled; return 0 ;;
+      _rc_j result skipped reason disabled; return 0 ;;
   esac
-  [ -f "$rc_script" ]      || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-script;  return 0; }
-  [ -f "$MAIN/$rc_out" ]   || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-codemap; return 0; }
+  [ -f "$rc_script" ]      || { _rc_j result skipped reason no-script;  return 0; }
+  [ -f "$MAIN/$rc_out" ]   || { _rc_j result skipped reason no-codemap; return 0; }
   # A pending change already on docs/codemap.md means someone else is mid-edit — leave it alone.
   if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    journal_append codemap_refresh pr "$rc_pr" result skipped reason dirty-path; return 0
+    _rc_j result skipped reason dirty-path; return 0
   fi
   # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
   if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result error reason regen-failed; return 0
+    _rc_j result error reason regen-failed; return 0
   fi
   # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
   if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    journal_append codemap_refresh pr "$rc_pr" result fresh; return 0
+    _rc_j result fresh; return 0
   fi
   # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
   # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if ! git -C "$MAIN" commit -q -m "chore: refresh codemap after PR #${rc_pr}" -- "$rc_out" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result error reason commit-failed; return 0
+  if [ -n "$rc_pr" ]; then
+    rc_msg="chore: refresh codemap after PR #${rc_pr}"
+  elif [ "$rc_prov" = "reconcile" ]; then
+    rc_msg="chore: refresh codemap (reconcile)"
+  else
+    rc_msg="chore: refresh codemap"
+  fi
+  if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
+    _rc_j result error reason commit-failed; return 0
   fi
   if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes; return 0
+    _rc_j result committed pushed yes; return 0
   fi
   if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
      && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes-after-rebase; return 0
+    _rc_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  journal_append codemap_refresh pr "$rc_pr" result committed pushed no
+  _rc_j result committed pushed no
   return 0
 }
 
-# refresh_symbol_index <pr#> — POST-MERGE symbol-index freshness hook, the function-level twin of
-# refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd $MAIN and,
-# ONLY when the deterministic scan actually changed its content, commits the refresh STRAIGHT to the
-# default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and byte-inert on every
-# failure mode; journals a `symbol_index_refresh` event; can never return non-zero into do_merge.
+# refresh_symbol_index <pr#> [provenance] — POST-MERGE symbol-index freshness hook, the function-level
+# twin of refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd
+# $MAIN and, ONLY when the deterministic scan actually changed its content, commits the refresh
+# STRAIGHT to the default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and
+# byte-inert on every failure mode; journals a `symbol_index_refresh` event; can never return
+# non-zero into do_merge. Optional <provenance> mirrors refresh_codemap (HERD-218 reconcile path).
 #
 # Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
 # and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
@@ -3065,39 +3160,153 @@ refresh_codemap() {
 # already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
 # changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
 refresh_symbol_index() {
-  local rs_pr="${1:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh"
+  local rs_pr="${1:-}" rs_prov="${2:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh" rs_msg
+  _rs_j() {
+    if [ -n "$rs_prov" ]; then
+      journal_append symbol_index_refresh pr "$rs_pr" "$@" provenance "$rs_prov"
+    else
+      journal_append symbol_index_refresh pr "$rs_pr" "$@"
+    fi
+  }
   case "$(_codemap_auto)" in
     false)
-      journal_append symbol_index_refresh pr "$rs_pr" result skipped reason disabled; return 0 ;;
+      _rs_j result skipped reason disabled; return 0 ;;
   esac
-  [ -f "$rs_script" ]    || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-script; return 0; }
-  [ -f "$MAIN/$rs_out" ] || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-index;  return 0; }
+  [ -f "$rs_script" ]    || { _rs_j result skipped reason no-script; return 0; }
+  [ -f "$MAIN/$rs_out" ] || { _rs_j result skipped reason no-index;  return 0; }
   # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
   if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    journal_append symbol_index_refresh pr "$rs_pr" result skipped reason dirty-path; return 0
+    _rs_j result skipped reason dirty-path; return 0
   fi
   # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
   if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result error reason regen-failed; return 0
+    _rs_j result error reason regen-failed; return 0
   fi
   # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
   if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    journal_append symbol_index_refresh pr "$rs_pr" result fresh; return 0
+    _rs_j result fresh; return 0
   fi
   # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
   # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if ! git -C "$MAIN" commit -q -m "chore: refresh symbol-index after PR #${rs_pr}" -- "$rs_out" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result error reason commit-failed; return 0
+  if [ -n "$rs_pr" ]; then
+    rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
+  elif [ "$rs_prov" = "reconcile" ]; then
+    rs_msg="chore: refresh symbol-index (reconcile)"
+  else
+    rs_msg="chore: refresh symbol-index"
+  fi
+  if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
+    _rs_j result error reason commit-failed; return 0
   fi
   if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes; return 0
+    _rs_j result committed pushed yes; return 0
   fi
   if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
      && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes-after-rebase; return 0
+    _rs_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  journal_append symbol_index_refresh pr "$rs_pr" result committed pushed no
+  _rs_j result committed pushed no
+  return 0
+}
+
+# ── Tick-level map-freshness reconcile (HERD-218) ─────────────────────────────────────────────────
+# Multi-seat doctrine Rule 1: map freshness is a RECONCILED INVARIANT, not a do_merge side-effect.
+# refresh_codemap / refresh_symbol_index still fire on THIS seat's merges (fast path). When another
+# seat (or the gh UI) merges without this watcher's do_merge, the committed maps can drift until a
+# human runs `herd codemap`. This tick-level reconcile heals that: probe with the read-only
+# --check seams, and only when STALE regenerate+commit ONCE with provenance=reconcile.
+#
+# HARD INVARIANTS:
+#   • CODEMAP_AUTOREFRESH=off → byte-inert (no pull, no probe, no commit, no journal).
+#   • Maps already fresh at this $MAIN HEAD → zero commits (and, after the first probe of a sha,
+#     zero re-scans — memoized on $TREES/.codemap-reconcile-sha).
+#   • Race-guarded: skip quietly when a review/health gate is mid-op (live inflight marker) OR $MAIN
+#     is dirty (a concurrent writer owns the tree). Never double-commits with do_merge: after a local
+#     merge the maps are fresh, so the probe no-ops; the sha memo prevents re-probe until HEAD moves.
+# Fully fail-soft; never blocks a tick.
+
+# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted change,
+# so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+_map_reconcile_mid_op() {
+  local f
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _marker_live "$f" 2>/dev/null && return 0
+  done
+  # Any dirty path on $MAIN → a concurrent writer (or a partial write) owns the tree this tick.
+  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ] && return 0
+  return 1
+}
+
+# _map_reconcile_memo_file — per-watcher memo of the last $MAIN HEAD we probed for map freshness.
+_map_reconcile_memo_file() { printf '%s' "$TREES/.codemap-reconcile-sha"; }
+
+# _map_reconcile_memo_write <sha> — record that this main sha has been reconciled (fresh or repaired).
+_map_reconcile_memo_write() {
+  local _mw="$1"
+  [ -n "$_mw" ] || return 0
+  mkdir -p "$TREES" 2>/dev/null || true
+  printf '%s\n' "$_mw" > "$(_map_reconcile_memo_file)" 2>/dev/null || true
+}
+
+# reconcile_map_freshness — the HERD-218 tick-level invariant. Call once per watcher tick (or on a
+# cadence); safe to call repeatedly. Picks up out-of-band merges via ff-only pull, probes both
+# adopted maps with their --check seams, and repairs only when stale.
+reconcile_map_freshness() {
+  local _rm_head _rm_memo _rm_prev _rm_stale=0
+  [ -n "${DRYRUN:-}" ] && return 0
+  case "$(_codemap_auto)" in
+    false) return 0 ;;   # HARD: off → byte-inert (no journal spam either)
+  esac
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+
+  # Race: a live gate or a dirty $MAIN means someone else owns the tree this tick — defer.
+  _map_reconcile_mid_op && return 0
+
+  # Pick up out-of-band merges into $MAIN (another seat's do_merge / gh UI). Never force.
+  git -C "$MAIN" pull --ff-only >/dev/null 2>&1 \
+    || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
+
+  # Re-check mid-op after the pull (a concurrent writer may have dirtied $MAIN mid-fetch).
+  _map_reconcile_mid_op && return 0
+
+  _rm_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_rm_head" ] || return 0
+  _rm_memo="$(_map_reconcile_memo_file)"
+  _rm_prev="$(cat "$_rm_memo" 2>/dev/null || true)"
+  # Already probed/repaired this exact main sha → zero work (no scan, no commit).
+  [ "$_rm_prev" = "$_rm_head" ] && return 0
+
+  # ── codemap probe (read-only --check) ──────────────────────────────────────────────────────────
+  if [ -f "$HERE/codemap.sh" ] && [ -f "$MAIN/docs/codemap.md" ]; then
+    if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/docs/codemap.md" \
+         bash "$HERE/codemap.sh" --check >/dev/null 2>&1; then
+      _rm_stale=1
+      # Stale → regenerate+commit ONCE via the shared refresh primitive, tagged provenance=reconcile.
+      # Empty pr# (no single PR caused this; an out-of-band merge did).
+      refresh_codemap "" "reconcile"
+    fi
+  fi
+
+  # ── symbol-index probe (read-only --check) ─────────────────────────────────────────────────────
+  if [ -f "$HERE/symbol-index.sh" ] && [ -f "$MAIN/docs/symbol-index.md" ]; then
+    if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/docs/symbol-index.md" \
+         bash "$HERE/symbol-index.sh" --check >/dev/null 2>&1; then
+      _rm_stale=1
+      refresh_symbol_index "" "reconcile"
+    fi
+  fi
+
+  # Memoize the post-repair HEAD (a successful commit advances it). Only memoize when $MAIN is clean
+  # — a failed/deferred refresh that left the tree dirty must NOT suppress the next tick's retry.
+  if [ -z "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ]; then
+    _rm_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+    _map_reconcile_memo_write "$_rm_head"
+  fi
+  # _rm_stale is load-bearing for tests that inspect the function's side effects only; silence SC2034.
+  : "$_rm_stale"
   return 0
 }
 
@@ -3173,11 +3382,8 @@ _main_health_worker() {
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   if [ "$_mw_rc" -eq 1 ]; then
-    if grep -q 'tab-leak-guard' "$_mw_log" 2>/dev/null; then
-      _mw_detail="$(grep -m1 'tab-leak-guard' "$_mw_log" 2>/dev/null)"
-    else
-      _mw_detail="$(_health_fail_detail "$_mw_log")"
-    fi
+    _mw_detail="$(_health_leak_guard_line "$_mw_log")"
+    [ -n "$_mw_detail" ] || _mw_detail="$(_health_fail_detail "$_mw_log")"
   else
     _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
   fi
@@ -3284,11 +3490,11 @@ _collect_main_health() {
     : > "$(_main_health_marker "$_cm_sha")" 2>/dev/null || true   # run-once BEFORE routing (crash-safe)
     case "$_cm_rc" in
       0) _main_health_clear "$_cm_pr" "$_cm_sha" ;;               # clean (or tolerated data/env) → green
-      1) case "$_cm_out" in
-           *tab-leak-guard*)                                      # transient control-room churn (issue #78)
-             journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard ;;
-           *) _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out" ;;
-         esac ;;
+      1) if _health_is_leak_guard_detail "$_cm_out"; then        # transient control-room churn (issue #78)
+           journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard
+         else
+           _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out"
+         fi ;;
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true
@@ -4536,13 +4742,20 @@ _handle_health_codeerror() {
   _hhc_sl="$(_slug_cell "$_hhc_slug")"
   _hhc_pn=" ${C_DIM}#${_hhc_pr}${C_RESET} ·"
 
-  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
-  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  # An infra red that outlived its re-dispatch budget (HERD-228) stopped being transient: it is a human's
+  # problem, not a builder's. Loud needs-you row, still no bounce — a builder cannot fix the control room.
   case "$_hhc_detail" in
-    *tab-leak-guard*)
-      DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    "$_HEALTH_INFRA_CAP_TAG"*)
+      DISPLAY[_hhc_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · infra red did not self-heal · ${_hhc_detail}${C_RESET}"
       return 0 ;;
   esac
+
+  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
+  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  if _health_is_leak_guard_detail "$_hhc_detail"; then
+    DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    return 0
+  fi
 
   if ! _health_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
     # OFF / dry-run: no bounce, no ledger write. Row truth still applies — a builder a HUMAN re-tasked
@@ -5807,6 +6020,76 @@ _health_first_notok() {
   grep -m1 -E '^[[:space:]]*not ok( |$)' "$1" 2>/dev/null | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
+# ── tab-leak-guard exemption (HERD-228) ─────────────────────────────────────────────────────────────
+# The healthcheck's tab-leak-guard trips when the suite leaks an orphan herdr tab into the LIVE
+# workspace: transient control-room churn (issue #78), never a code bug. Three seams therefore EXEMPT
+# it — the candidate gate never sha-caches it (so the next tick re-runs and it self-heals), never
+# bounces a builder, and the main-health collector routes it to an infra_event instead of MAIN RED.
+#
+# That exemption used to be a bare `grep -q tab-leak-guard <log>` over the WHOLE suite log, which is
+# wrong in the one case that matters: tests/herd.bats contains tests NAMED "hermetic tab-leak-guard …",
+# so their PASSING TAP lines ("ok 29 hermetic tab-leak-guard engine-whitelist test passes") carry the
+# literal. EVERY reproduced bats red therefore read as the leak-guard transient: the red row quoted a
+# passing test, the verdict was never cached, and the PR re-dispatched a ~9-minute suite every tick with
+# no cap and no bounce (PR #333 looped 40+ minutes while "not ok 41 …" sat in the log). On main the same
+# bug meant a genuine bats red could not paint MAIN RED at all.
+#
+# The exemption now matches only the guard's OWN failure line, which it prints ANCHORED at column 0:
+#     TAB-LEAK-GUARD: the test suite left an orphan tab/pane in the live workspace   (full mode)
+#     tab-leak-guard: suite leaked an orphan tab into the live workspace — 3 -> 4    (--oneline)
+# optionally behind healthcheck.sh's own "❌ code error — " oneline prefix. A TAP result line ("ok …",
+# "not ok …") can never satisfy that anchor, and the guard's non-failing notes ("tab-leak-guard: clean",
+# "… skipped") are excluded explicitly. On top of that, a TAP "not ok" ANYWHERE in the log OUTRANKS the
+# exemption outright: a suite that reports a failing test has a code error to answer for, whatever else
+# the log happens to say. One helper decides this for all three seams (HERD-222 builds on it too).
+_HLG_PREFIX_RE='^[[:space:]]*(❌[[:space:]]*)?(code error[[:space:]]*—[[:space:]]*)?'
+_HLG_LINE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:"
+_HLG_NOTE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:[[:space:]]*(clean|skipped)"
+
+# _health_is_leak_guard_detail <line> — true iff ONE line is the guard's failure line. The gate seams
+# carry only the collected <detail> string (never the log), so they classify with this.
+_health_is_leak_guard_detail() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_LINE_RE" 2>/dev/null || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_NOTE_RE" 2>/dev/null && return 1
+  return 0
+}
+
+# _health_leak_guard_line <log> — the guard's failure line from a suite log, or EMPTY when this log is
+# not a genuine trip (no such line, or the suite reported a TAP failure that outranks it). Fail-soft:
+# a missing log is not a trip.
+_health_leak_guard_line() {
+  [ -f "$1" ] || return 0
+  [ -n "$(_health_first_notok "$1")" ] && return 0
+  grep -iE "$_HLG_LINE_RE" "$1" 2>/dev/null | grep -viE "$_HLG_NOTE_RE" 2>/dev/null \
+    | sed -n '1p' | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
+# _health_leak_guard_red <log> — true iff <log> is a genuine tab-leak-guard trip.
+_health_leak_guard_red() { [ -n "$(_health_leak_guard_line "$1")" ]; }
+
+# BOUNDED INFRA RE-DISPATCH (HERD-228). An exempted red is never cached, so the gate re-runs the suite
+# for that same (pr,sha) every tick — that re-run IS the self-heal. Bound it: after this many
+# consecutive infra re-dispatches the "transient" plainly is not transient, so cache the red under an
+# ESCALATION tag, which both stops the loop and surfaces a needs-you row instead of bouncing a builder
+# for infra. Inline constant on purpose — no new config key.
+_HEALTH_INFRA_REDISPATCH_MAX=3
+_HEALTH_INFRA_CAP_TAG='infra re-dispatch cap reached'
+
+# _health_infra_file <pr#> <sha> — the per-(pr,sha) infra re-dispatch counter (swept with the sha-cache).
+_health_infra_file() { printf '%s' "$TREES/.health-infra-$1-$2"; }
+
+# _health_infra_bump <pr#> <sha> — count one infra re-dispatch for this (pr,sha); prints the new total.
+_health_infra_bump() {
+  local _hib_f _hib_n
+  _hib_f="$(_health_infra_file "$1" "$2")"
+  _hib_n="$(cat "$_hib_f" 2>/dev/null || printf 0)"
+  case "$_hib_n" in ''|*[!0-9]*) _hib_n=0 ;; esac
+  _hib_n=$((_hib_n + 1))
+  printf '%s\n' "$_hib_n" > "$_hib_f" 2>/dev/null || true
+  printf '%s' "$_hib_n"
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -5831,7 +6114,12 @@ _health_first_notok() {
 #
 # The pre-diff behaviour (`sed -n 1p` → the "❌ CODE ERROR" banner) was uninformative but never WRONG.
 # That is the floor: this function may return something uninformative, never something misleading.
-_HFD_PASS_RE='^[[:space:]]*(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
+# A pass marker may sit behind a short RUNNER PREFIX — `bats: ok 29 …`, `tests: ✓ widget` — because the
+# project healthcheck relabels the streams it wraps. The anchor therefore tolerates ONE such prefix
+# (a bare word + colon) so those lines are dropped from the candidate set too (HERD-228); it stays
+# anchored, so prose like "look at the ok path" or "PASS is spelled out here" can never be mistaken for
+# a pass marker and silently swallow a real failure line.
+_HFD_PASS_RE='^[[:space:]]*([[:alnum:]_.-]+:[[:space:]]+)?(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
 _HFD_ZERO_RE='(^|[^0-9])0 (errors?|failures?|failed)'
 # Anchored failure MARKERS — a line that BEGINS with FAIL/✗/● is a failure whatever words follow. This
 # is how a bare 'FAIL  src/widget.test.js' is caught without putting bare 'fail' in the token list
@@ -5908,6 +6196,9 @@ _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 #                                written when _healthcheck_gate reaches a terminal outcome for this
 #                                exact commit sha. A cached CLEAN/FLAKY proceeds as passing; a cached
 #                                CODEERROR keeps surfacing the red row — both WITHOUT re-running.
+#   .health-infra-<pr>-<sha>   — how many times an EXEMPTED infra red (tab-leak-guard) has re-dispatched
+#                                the suite for this sha; at _HEALTH_INFRA_REDISPATCH_MAX the red is
+#                                cached under the escalation tag instead of looping (HERD-228).
 # A new commit (new sha) invalidates the cache and forces a fresh full run (see _discard_stale_health,
 # mirroring _discard_stale_reviews). A non-terminal/in-flight state is NEVER cached.
 _health_result_file() { printf '%s' "$TREES/.health-result-$1-$2"; }
@@ -5925,7 +6216,7 @@ record_health_result() {
 # marker is keyed by pr alone and released synchronously within the gate, so it is never stale).
 _discard_stale_health() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.health-result-$pr-"*; do
+  for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -6056,9 +6347,8 @@ _health_worker() {
       _hw_line="FLAKY"$'\t'"$_hw_id"
     else
       mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
-      if grep -q 'tab-leak-guard' "$_hw_log" 2>/dev/null; then
-        _hw_detail="$(grep -m1 'tab-leak-guard' "$_hw_log" 2>/dev/null | tr '\t\n' '  ')"
-      else
+      _hw_detail="$(_health_leak_guard_line "$_hw_log")"
+      if [ -z "$_hw_detail" ]; then
         _hw_notok2="$(_health_fail_detail "$_hw_log")"
         _hw_detail="$_hw_notok2"
       fi
@@ -6161,10 +6451,20 @@ _healthcheck_gate() {
         # A tab-leak-guard CODE ERROR is INFRA/TRANSIENT (issue #78 part 2), never a code bug: it must
         # NEVER be sha-cached, else the cache replays the transient every tick and FREEZES red. Skip the
         # cache so the next tick re-dispatches fresh + self-heals; a genuine code error caches + stays red.
-        case "$_hg_d" in
-          *tab-leak-guard*) : ;;
-          *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d" ;;
-        esac
+        # The skip is BOUNDED (HERD-228): count the re-dispatches for this (pr,sha) and, once the cap is
+        # reached, cache the red under the escalation tag so the loop ends in a needs-you row rather than
+        # re-running a ~9-minute suite forever. An empty sha means the cache (and so the cap) is disabled.
+        if _health_is_leak_guard_detail "$_hg_d"; then
+          local _hg_n=0
+          [ -n "$_hg_sha" ] && _hg_n="$(_health_infra_bump "$_hg_pr" "$_hg_sha")"
+          if [ "${_hg_n:-0}" -ge "$_HEALTH_INFRA_REDISPATCH_MAX" ]; then
+            _hg_d="${_HEALTH_INFRA_CAP_TAG} (${_hg_n}× infra) · ${_hg_d}"
+            record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+            journal_append infra_event component agent-watch reason health_infra_cap pr "$_hg_pr" sha "$_hg_sha" count "$_hg_n"
+          fi
+        else
+          record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+        fi
         _handle_health_codeerror "$_hg_pr" "$_hg_slug" "$_hg_sha" "$_hg_idx" "$_hg_dir" "$_hg_d"
         _HC_RESULT="CODEERROR"
         journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_d" ;;
@@ -6529,6 +6829,29 @@ _watcher_tick_fields() {
   printf '%s' "$_wtf"
 }
 
+# _prs_fetch_tick — set PRS_JSON + PRS_LOOKUP_OK for this watch tick (HERD-224).
+# Captures the EXIT STATUS of `gh pr list` so a transient fetch failure is NEVER collapsed into an
+# empty roster. The pre-fix form (`|| echo '[]'`) made a failed fetch look identical to "zero open
+# PRs", which then rendered builders that HAD an open PR as "awaiting task · assign or retire".
+#   • PRS_LOOKUP_OK=1 — the list call succeeded; an empty `[]` means positively no open PRs.
+#   • PRS_LOOKUP_OK=0 — the list call failed/errored; PRS_JSON is `[]` only as a safe placeholder
+#     for discovery, and the console must paint the degraded "PR match pending" row, never the
+#     definitive awaiting-task / died-(no PR) claims. The view filter still applies on success.
+_prs_fetch_tick() {
+  local _raw _rc=0
+  _raw="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null)" || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    PRS_LOOKUP_OK=0
+    PRS_JSON='[]'
+    return 0
+  fi
+  PRS_LOOKUP_OK=1
+  PRS_JSON="${_raw}"
+  [ -n "$PRS_JSON" ] || PRS_JSON='[]'
+  PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
+  return 0
+}
+
 # ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
 # _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
 # record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
@@ -6605,6 +6928,13 @@ SWEEP_LIB=1
 # shellcheck source=/dev/null
 . "$HERE/sweep.sh"
 unset SWEEP_LIB
+
+# ── Retirement invariant (HERD-164) ──────────────────────────────────────────────────────────────
+# retirement.sh reconciles "a merged/closed slug owns nothing" on EVERY tick, composing _reap_slug
+# (above) with sweep.sh's dirt/unique-commit proof helpers — so it must be sourced after BOTH. It
+# detects they are already in scope and does not re-source this file.
+# shellcheck source=/dev/null
+. "$HERE/retirement.sh"
 
 # The trigger pass's cached counts. Recomputed on the ORPHAN-sweep cadence (not every 4 s tick): the
 # scan costs one `ps -e` plus a filesystem walk, which has no business riding the repaint. Rendering
@@ -7076,17 +7406,29 @@ while true; do
   build_main_health
   build_sweep_note
 
-  # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
-  # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
-  # relaxes any merge gate. Default (all lens, no filters) requests the base fields and passes the
-  # JSON through unchanged, preserving today's exact behavior.
-  PRS_JSON="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null || echo '[]')"
-  PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
+  # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
+  # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
+  # is a read-time SELECTION filter only — it narrows which PRs this tick displays/considers and
+  # never relaxes any merge gate. Default (all lens, no filters) requests the base fields and
+  # passes the JSON through unchanged, preserving today's exact behavior on a successful fetch.
+  _prs_fetch_tick
   # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
   # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
   # reconciliation keys off, so it must reflect real liveness with OR without panes.
   AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+
+  # RETIREMENT INVARIANT (HERD-164), reconciled EVERY tick against the world we just observed: a slug
+  # whose PR is MERGED or CLOSED (or whose worktree is gone) owns no agent, tab, worktree, branch, or
+  # ledger row. Drives the idempotent teardown one step further and records what it could not finish;
+  # a slug carrying real work is HELD (loud, never deleted). Runs BEFORE row classification so a
+  # retiring slug can never be mistaken for an 'awaiting task' spare — and after $PRS_JSON/$AGENTS_JSON
+  # are fetched, because those ARE the observation. Restart-proof: nothing here is event-driven.
+  retirement_tick
+  # A reap this tick invalidated the worktree snapshot — re-read it so the reaped tree does not render
+  # one last phantom in-flight row. Zero reaps (the steady state) costs zero git calls.
+  [ "$RETIRE_REAPED" -gt 0 ] && WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  build_retiring
 
   # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
   # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
@@ -7118,14 +7460,32 @@ EOF
       # and the console is byte-identical to before the feature.
       DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
       FLAIR_STATE[i]="pen"
+    elif [ -z "$prnum" ] && _rt_state="$(_retire_state_of "$slug")" && [ "$_rt_state" != "active" ]; then
+      # RETIREMENT (HERD-164): this tick's invariant pass proved the slug terminal — its PR is merged
+      # or closed. It is NOT an 'awaiting task' spare, whatever its agent status says, and it is not a
+      # dead builder either: its work landed. Render whose move it is (the herd's while teardown
+      # converges; yours once it is stuck or holding real work) and skip the limit/dead/idle
+      # classification entirely — those all key off "PR-less", which a merged builder trivially is.
+      DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
+      case "$_rt_state" in
+        retiring) FLAIR_STATE[i]="busy" ;;
+        *)        FLAIR_STATE[i]="attention" ;;
+      esac
     elif [ -z "$prnum" ]; then
-      if [ "$astatus" != "working" ]; then
+      if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+        # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
+        # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
+        # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
+        DISPLAY[i]="$(_row_pr_match_pending "$sl")"
+        FLAIR_STATE[i]="busy"
+      elif [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
         # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
         # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
         # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
         # otherwise it is the benign "awaiting task" spare row. An existing record keeps the row (and the
         # scheduled resume) alive across ticks even after the transient signal clears.
+        # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
         if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
@@ -7705,6 +8065,13 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
   fi
+
+  # Codemap / symbol-index freshness reconcile (HERD-218): multi-seat invariant — when another seat
+  # (or the gh UI) merges without THIS watcher's do_merge, the committed maps can go stale. Probe the
+  # read-only --check seams and repair ONCE with provenance=reconcile. Byte-inert when
+  # CODEMAP_AUTOREFRESH=off; zero commits when maps already fresh; skips mid-op (live gate / dirty
+  # MAIN). The do_merge refresh_* path remains the local-merge fast path.
+  reconcile_map_freshness
 
   # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
   # with a genuinely stale engine, dispatch `herd update` DETACHED — it ends in a reload that restarts

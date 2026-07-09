@@ -205,6 +205,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic leak-guard exemption + infra cap (HERD-228) test passes" {
+  run bash "$REPO/tests/test-watcher-leakguard-exemption.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic builder-secrets-isolation test passes" {
   run bash "$REPO/tests/test-builder-secrets-isolation.sh"
   [ "$status" -eq 0 ]
@@ -379,6 +385,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic doc-drift check (HERD-168 / HERD-96) test passes" {
+  run bash "$REPO/tests/test-doc-drift.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher-flair pack (HERD-147) unit test passes" {
   run bash "$REPO/tests/test-watcher-flair.sh"
   [ "$status" -eq 0 ]
@@ -436,6 +448,18 @@ setup() {
 
 @test "hermetic control-room sweep (HERD-191) test passes" {
   run bash "$REPO/tests/test-sweep.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic retirement-invariant (HERD-164) test passes" {
+  run bash "$REPO/tests/test-retirement-invariant.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {
+  run bash "$REPO/scripts/herd/sim/retirement-invariant-sim.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
