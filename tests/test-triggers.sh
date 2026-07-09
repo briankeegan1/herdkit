@@ -18,6 +18,12 @@ PASS=0
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS+1)); }
 
+# HERD-223: pin the engine journal to this fixture's temp dir so trigger_tick / trigger_spawn events
+# never append to the live project journal (the CLI re-sources herd-config, which would otherwise
+# resolve WORKTREES_DIR from the committed .herd/config). Shared layer: scripts/herd/journal-test-env.sh.
+# shellcheck source=scripts/herd/journal-test-env.sh
+. "$ROOT/scripts/herd/journal-test-env.sh" "$T"
+
 TAB=$'\t'
 
 # A spawn STUB: records "slug|lane|task" per enqueue so the sim can assert exactly what was spawned.
