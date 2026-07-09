@@ -23,6 +23,7 @@ Role summarized from each file's top-of-file comment.
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
 - `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
+- `console-section.sh` — THE shared bounded-console-section helper (HERD-243).
 - `coordinator.sh` — (re)launch the coordinator herdr tab as a 2-pane control room:
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
@@ -101,9 +102,9 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
+- `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
+- `agent-watch.sh` → `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -141,7 +142,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `sweep.sh` → `agent-watch.sh`, `derived-files.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
-- `tracker-state-sweep.sh` → `herd-config.sh`, `journal.sh`
+- `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
 
 ## Config key → consumers
