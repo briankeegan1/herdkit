@@ -75,8 +75,9 @@ reset() { rm -f "$GL"; : > "$GH_LOG"; GH_BLESSED_STATE=""; GH_FAIL_WRITE=""; DRY
 gh_calls() { [ -s "$GH_LOG" ] && grep -c . "$GH_LOG" || echo 0; }
 ledger_rows() { [ -s "$GL" ] && grep -c . "$GL" || echo 0; }
 
-# ── (1) each conclusion posts once, with the right state + context ─────────────
-for st in pending success failure; do
+# ── (1) each TERMINAL conclusion posts once, with the right state + context ────
+# `pending` is intentionally NOT a valid conclusion (a pending status mutates mergeStateStatus).
+for st in success failure; do
   reset
   post_gate_status 7 "sha-$st" "$st"
   grep -q "statuses/sha-$st" "$GH_LOG"      || fail "(1) $st: no statuses POST logged"
@@ -91,12 +92,18 @@ for st in pending success failure; do
   ok
 done
 
-# Distinct conclusions for the SAME (pr,sha) each post once (pending → failure is two rows).
+# pending is rejected outright — no network write, no ledger row (it would flip CLEAN→UNSTABLE).
 reset
-post_gate_status 8 shaX pending
+post_gate_status 7 shaPend pending
+[ "$(gh_calls)" = "0" ] && [ "$(ledger_rows)" = "0" ] || fail "(1p) pending must never be posted"
+ok
+
+# Distinct conclusions for the SAME (pr,sha) — here failure then (a re-review) success = two rows.
+reset
 post_gate_status 8 shaX failure
+post_gate_status 8 shaX success
 [ "$(ledger_rows)" = "2" ] || fail "(1b) distinct conclusions should be 2 ledger rows"
-grep -q "state=pending" "$GH_LOG" && grep -q "state=failure" "$GH_LOG" || fail "(1b) both states not posted"
+grep -q "state=failure" "$GH_LOG" && grep -q "state=success" "$GH_LOG" || fail "(1b) both states not posted"
 ok
 
 # ── (2) a FAILED API write is not recorded → retries next tick ─────────────────
@@ -166,6 +173,10 @@ post_gate_status 5 shaBlk success
 _gate_bless_eligible 5 shaBlk BLOCKED && fail "(7) an already-blessed sha must NOT re-gate"
 # GATE_STATUS=off → no deadlock machinery → never force-gates
 GATE_STATUS=off _gate_bless_eligible 5 shaOther BLOCKED && fail "(7) GATE_STATUS=off must not force-gate"
+# dry-run inert — a bless-only candidate never merges, so --dry-run must not force it into the gate set
+reset
+DRYRUN=1
+_gate_bless_eligible 6 shaDryBlk BLOCKED && fail "(7) dry-run must not force-gate a BLOCKED PR"
 ok
 
 echo "PASS test-gate-status.sh ($pass checks)"

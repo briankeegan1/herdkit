@@ -206,17 +206,24 @@ RECONCILE_STATE="$TREES/.agent-watch-reconciled"
 # re-check). Keyed by pr+sha like the review/health ledgers, so a new commit re-evaluates fresh.
 STALE_DUP_STATE="$TREES/.agent-watch-stale-dup"
 # herd/gates commit-status ledger (HERD-194): one line "<epoch> <pr#> <sha> <conclusion>" per commit
-# STATUS this watcher successfully POSTED, conclusion ∈ pending | success | failure. Keyed by
-# pr+sha+conclusion (mirroring the review/health once-per-sha ledgers) so each (pr,sha,conclusion)
-# posts EXACTLY ONCE — the GitHub Statuses API is itself idempotent per (sha,context), but this ledger
-# stops us re-POSTing (a network write) on every 4 s tick. A row is written ONLY after the API write
-# succeeds, so a transient failure re-tries next tick (fail-safe: the status MUST land, since its
-# ABSENCE is exactly what keeps a PR unmergeable under `require herd/gates` branch protection).
+# STATUS this watcher successfully POSTED, conclusion ∈ success | failure (terminal only — see the
+# gate-status helpers for why `pending` is never posted). Keyed by pr+sha+conclusion (mirroring the
+# review/health once-per-sha ledgers) so each (pr,sha,conclusion) posts EXACTLY ONCE — the GitHub
+# Statuses API is itself idempotent per (sha,context), but this ledger stops us re-POSTing (a network
+# write) on every 4 s tick. A row is written ONLY after the API write succeeds, so a transient failure
+# re-tries next tick (fail-safe: the status MUST land, since its ABSENCE is exactly what keeps a PR
+# unmergeable under `require herd/gates` branch protection).
 GATE_STATUS_STATE="$TREES/.agent-watch-gate-status"
 # The commit-status context the watcher posts + the operator requires in branch protection. Kept as a
 # constant (not a config key) so the protection recipe in docs/governance-gates.md and the watcher can
 # never drift apart — the whole fail-safe rests on both naming the SAME context.
 GATE_STATUS_CONTEXT="herd/gates"
+# GH CI check-run gate-event ledger (HERD-197): one line "<pr> <sha> <conclusion> <check-name>" per
+# TERMINAL check-run result the watcher has already journaled (and, for a failure, notified). Keyed by
+# pr+sha+conclusion+name so each landed result fires its once-only side effects EXACTLY ONCE while the
+# console row is re-derived live every tick; a new commit (new sha) re-evaluates the CI leg from scratch.
+# See the "GH CI check-run gate events" helpers below. Purged per-PR on merge/reap (purge_pr_ci_checks).
+CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # Tracker-state self-heal surfaces (HERD-86). The periodic tracker-state sweep (tracker-state-sweep.sh)
 # re-asserts Done for a recently-merged PR whose tracker item drifted (stuck open after merge — the
 # HERD-67/HERD-69 incidents). TRACKER_SWEEP_LEDGER records refs already confirmed Done so the sweep
@@ -1744,10 +1751,13 @@ _review_gate_step() {
 # watcher that actually ran the gates, so its ABSENCE (no watcher blessed this commit) leaves the PR
 # unmergeable under protection. --match-head-commit in do_merge stays as the belt-and-suspenders guard.
 #
-# State machine per (pr,sha): pending (gates dispatched) → success (both gates green) | failure
-# (reproduced healthcheck CODEERROR, or a review BLOCK). Each conclusion posts EXACTLY ONCE (sha-keyed
-# $GATE_STATUS_STATE ledger), and the whole surface is best-effort + fail-soft — every helper returns 0
-# and never breaks the gate loop.
+# Terminal-only per (pr,sha): success (both gates green) | failure (reproduced healthcheck CODEERROR,
+# or a review BLOCK). We deliberately do NOT post a `pending` status — a pending NON-passing commit
+# status flips a CLEAN sha to mergeStateStatus=UNSTABLE (neither CLEAN nor BLOCKED), which would strand
+# the PR out of both the merge path and the bless path in the DEFAULT unprotected config. The fail-safe
+# needs only the ABSENCE of success; GitHub itself renders a missing REQUIRED check as "Expected".
+# Each conclusion posts EXACTLY ONCE (sha-keyed $GATE_STATUS_STATE ledger), and the whole surface is
+# best-effort + fail-soft — every helper returns 0 and never breaks the gate loop.
 
 # _gate_status_enabled — master lever. GATE_STATUS=off disables posting entirely (byte-inert: no read,
 # no post, no ledger); any other value (default) → on. Mirrors STALE_DUP_DETECT's on|off shape.
@@ -1768,7 +1778,6 @@ _record_gate_status() {
 # _gate_status_desc <conclusion> — the default human-facing description shown on the GitHub check row.
 _gate_status_desc() {
   case "$1" in
-    pending) printf 'herd watch is running the gates (healthcheck + review)' ;;
     success) printf 'healthcheck + adversarial review passed' ;;
     failure) printf 'a gate failed — see the PR for the healthcheck/review finding' ;;
     *)       printf 'herd/gates' ;;
@@ -1776,16 +1785,18 @@ _gate_status_desc() {
 }
 
 # post_gate_status <pr#> <sha> <conclusion> [description] — post the herd/gates commit status for this
-# (pr,sha) via the GitHub Statuses API, at most ONCE per (pr,sha,conclusion). conclusion maps 1:1 to
-# the API `state`: pending | success | failure. No-op when GATE_STATUS=off, the sha is empty, the
-# conclusion is unrecognized, or this conclusion was already posted. Under --dry-run it is a pure
-# no-op (no network, no ledger). The ledger row is written ONLY on a successful API write, so a failed
-# post re-tries next tick — the status MUST land for the fail-safe to hold. Always returns 0.
+# (pr,sha) via the GitHub Statuses API, at most ONCE per (pr,sha,conclusion). Only the TERMINAL
+# conclusions success|failure are accepted (each maps 1:1 to the API `state`); `pending` is
+# intentionally rejected (see the state-machine note above — a pending status mutates mergeStateStatus).
+# No-op when GATE_STATUS=off, the sha is empty, the conclusion is unrecognized, or this conclusion was
+# already posted. Under --dry-run it is a pure no-op (no network, no ledger). The ledger row is written
+# ONLY on a successful API write, so a failed post re-tries next tick — the status MUST land for the
+# fail-safe to hold. Always returns 0.
 post_gate_status() {
   local pr="$1" sha="$2" state="$3" desc="${4:-}"
   _gate_status_enabled || return 0
   [ -n "$sha" ] || return 0
-  case "$state" in pending|success|failure) ;; *) return 0 ;; esac
+  case "$state" in success|failure) ;; *) return 0 ;; esac
   _gate_status_posted "$pr" "$sha" "$state" && return 0
   [ -n "$DRYRUN" ] && return 0
   [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
@@ -1822,8 +1833,11 @@ _gate_status_blessed() {
 #   • Once we have posted success for this sha the local ledger stops re-gating it, so a PR that stays
 #     BLOCKED for SOME OTHER reason (a required human review) is gated AT MOST ONCE per sha, then
 #     soft-holds like before — no per-tick re-gate, no wasted review loop.
+#   • DRY-RUN inert: a bless-only candidate never merges, so under --dry-run it is not force-added to the
+#     candidate set (no real, expensive healthcheck for a row that could never merge anyway).
 _gate_bless_eligible() {
   _gate_status_enabled || return 1
+  [ -z "${DRYRUN:-}" ] || return 1
   [ "${3:-}" = "BLOCKED" ] || return 1
   [ -n "${2:-}" ] || return 1
   ! _gate_status_posted "$1" "$2" success
@@ -1951,6 +1965,156 @@ purge_pr_approvals() {
     mv -f "$_tmp" "$APPROVALS" 2>/dev/null || rm -f "$_tmp"
   else
     rm -f "$_tmp"
+  fi
+}
+
+# ── GH CI check-run gate events (HERD-197) ──────────────────────────────────────────────────────
+# GROUNDED: PR #293's macOS CI leg failed and NOBODY was notified — the watcher rendered only
+# 'blocked · awaiting required checks/reviews (UNSTABLE)' with no which/why, so the operator found the
+# failing leg by reading GitHub by hand. mergeStateStatus==UNSTABLE means a REQUIRED status check is
+# pending or failing, but it is opaque: it never names the check. These helpers fetch the PR's GH
+# check-run results, journal each TERMINAL result as a first-class gate event (`ci_check`) the moment
+# it lands, NOTIFY once on a newly-landed failure, and hand the classifier a one-line summary so the
+# console row names WHICH check failed instead of the bare UNSTABLE.
+#
+# CONVENTIONS (match the surrounding gate helpers):
+#   • FAIL-SOFT: an offline/old gh, a malformed payload, or a PR with NO checks configured yields NO
+#     output and NO side effects, so the row is BYTE-IDENTICAL to before this feature (the grounded
+#     no-CI project sees exactly today's behavior).
+#   • NEVER A FALSE RED: a check is called `fail` ONLY on a genuine failing conclusion
+#     (FAILURE/ERROR/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE). Anything not-yet-terminal — QUEUED,
+#     IN_PROGRESS, PENDING, EXPECTED — is `pending` (yellow hold, never red); an UNKNOWN/ambiguous
+#     conclusion (incl. CANCELLED/STALE, which block merge but are not a code failure) is treated as
+#     `pending` too, so it never paints red.
+#   • ONCE-ONLY side effects: journal (pass AND fail) + notify (fail only) fire at most ONCE per
+#     pr+sha+conclusion+check via $CI_CHECKS_STATE; the console row is re-derived live every tick.
+
+# _ci_checks_noted <pr> <sha> <conclusion> <check> — true iff this exact terminal check event has
+# already fired its once-only journal/notify. The check NAME may contain spaces, so the ledger stores
+# one whole line per event and we match it whole (grep -x -F), never a prefix/regex.
+_ci_checks_noted() {
+  [ -s "$CI_CHECKS_STATE" ] || return 1
+  grep -qxF "$1 $2 $3 $4" "$CI_CHECKS_STATE" 2>/dev/null
+}
+
+# _ci_record_checked <pr> <sha> <conclusion> <check> — record that this terminal check event's
+# once-only side effects have fired. Fail-soft: an unwritable ledger just re-notifies next tick.
+_ci_record_checked() {
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$CI_CHECKS_STATE" 2>/dev/null || true
+}
+
+# purge_pr_ci_checks <pr#> — on merge/reap, drop every CI-check ledger row for this PR (all shas), so
+# the ledger cannot grow unbounded as PRs come and go (mirrors purge_pr_approvals). The PR number is
+# field 1; an exact whole-field awk compare avoids clobbering a different PR whose number is a
+# substring (9 vs 90). Fail-soft — a ledger hiccup must never touch the merge.
+purge_pr_ci_checks() {
+  local _pr="$1" _tmp
+  [ -s "$CI_CHECKS_STATE" ] || return 0
+  _tmp="$(mktemp "$CI_CHECKS_STATE.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v p="$_pr" '$1 != p' "$CI_CHECKS_STATE" > "$_tmp" 2>/dev/null; then
+    mv -f "$_tmp" "$CI_CHECKS_STATE" 2>/dev/null || rm -f "$_tmp"
+  else
+    rm -f "$_tmp"
+  fi
+}
+
+# _ci_checks_normalize — read a `gh pr view --json statusCheckRollup` payload on stdin, emit one
+# TAB-separated "<bucket>\t<conclusion>\t<check-name>" line per check (bucket ∈ pass|fail|pending).
+# Handles BOTH rollup node kinds: CheckRun (GitHub Actions / apps — status+conclusion) and
+# StatusContext (classic commit statuses — state). Fail-soft: bad JSON or a non-list rollup emits
+# nothing. Uses only python3 stdlib. This is the ONE place the "what counts as a failure" policy lives.
+_ci_checks_normalize() {
+  python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rollup = d.get("statusCheckRollup") if isinstance(d, dict) else None
+if not isinstance(rollup, list):
+    sys.exit(0)
+PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+def clean(s):
+    return str(s or "").replace("\t", " ").replace("\n", " ").strip()
+for c in rollup:
+    if not isinstance(c, dict):
+        continue
+    typ = c.get("__typename", "")
+    if typ == "StatusContext" or (not c.get("name") and c.get("context")):
+        name = clean(c.get("context"))
+        state = str(c.get("state") or "").upper()
+        if state in PASS:   bucket, concl = "pass", state
+        elif state in FAIL: bucket, concl = "fail", state
+        else:               bucket, concl = "pending", (state or "PENDING")
+    else:
+        name = clean(c.get("name") or c.get("workflowName"))
+        status = str(c.get("status") or "").upper()
+        concl  = str(c.get("conclusion") or "").upper()
+        if status and status != "COMPLETED":
+            bucket, concl = "pending", status          # QUEUED / IN_PROGRESS / WAITING / REQUESTED / PENDING
+        elif concl in PASS: bucket = "pass"
+        elif concl in FAIL: bucket = "fail"
+        else:               bucket, concl = "pending", (concl or "PENDING")  # unknown/CANCELLED/STALE → never red
+    if not name:
+        continue
+    sys.stdout.write("%s\t%s\t%s\n" % (bucket, concl, name))
+'
+}
+
+# _ci_names_summary <label> <name>... — render a compact, length-bounded row fragment naming the
+# offending checks: "<label>: a, b" (first 3), appending " +N more" past three. Keeps the console row
+# a single tidy line no matter how many legs a big matrix has.
+_ci_names_summary() {
+  local _label="$1"; shift
+  local _n=$# _i=0 _shown="" _nm
+  for _nm in "$@"; do
+    _i=$((_i + 1)); [ "$_i" -le 3 ] || break
+    _shown="${_shown:+$_shown, }$_nm"
+  done
+  [ "$_n" -gt 3 ] && _shown="$_shown, +$((_n - 3)) more"
+  printf '%s: %s' "$_label" "$_shown"
+}
+
+# _ci_gate_eval <pr> <sha> <slug> — the entry point the classifier calls for a PR whose
+# mergeStateStatus is UNSTABLE (a required check pending or failing). Fetches the PR's check-run
+# rollup, JOURNALS every terminal result once (event=ci_check), NOTIFIES once on each newly-landed
+# failure, and echoes a single "<bucket>\t<summary>" line for the row (bucket ∈ fail|pending) — or
+# NOTHING when there are no checks / gh is unavailable (fail-soft: the caller then keeps the exact
+# pre-feature row). Failures dominate the summary (red-worthy); otherwise pending checks are named.
+_ci_gate_eval() {
+  local _cg_pr="$1" _cg_sha="$2" _cg_slug="$3" _cg_json _cg_norm
+  [ -n "$_cg_pr" ] || return 0
+  _cg_json="$(gh pr view "$_cg_pr" --json statusCheckRollup 2>/dev/null)" || return 0
+  [ -n "$_cg_json" ] || return 0
+  _cg_norm="$(printf '%s' "$_cg_json" | _ci_checks_normalize)"
+  [ -n "$_cg_norm" ] || return 0   # no checks configured → byte-identical, no side effects
+  local _cg_bucket _cg_concl _cg_name
+  local -a _cg_fails=() _cg_pends=()
+  while IFS=$'\t' read -r _cg_bucket _cg_concl _cg_name; do
+    [ -n "$_cg_bucket" ] || continue
+    case "$_cg_bucket" in
+      fail)
+        _cg_fails+=("$_cg_name")
+        if ! _ci_checks_noted "$_cg_pr" "$_cg_sha" "$_cg_concl" "$_cg_name"; then
+          _ci_record_checked "$_cg_pr" "$_cg_sha" "$_cg_concl" "$_cg_name"
+          journal_append ci_check pr "$_cg_pr" sha "$_cg_sha" slug "$_cg_slug" check "$_cg_name" conclusion "$_cg_concl" result fail
+          herd_driver_notify "🚨 CI failed · #${_cg_pr}" "${_cg_name}: ${_cg_concl} — required check failed (${_cg_slug})" default
+        fi ;;
+      pass)
+        if ! _ci_checks_noted "$_cg_pr" "$_cg_sha" "$_cg_concl" "$_cg_name"; then
+          _ci_record_checked "$_cg_pr" "$_cg_sha" "$_cg_concl" "$_cg_name"
+          journal_append ci_check pr "$_cg_pr" sha "$_cg_sha" slug "$_cg_slug" check "$_cg_name" conclusion "$_cg_concl" result pass
+        fi ;;
+      pending) _cg_pends+=("$_cg_name") ;;
+    esac
+  done <<EOF
+$_cg_norm
+EOF
+  if [ "${#_cg_fails[@]}" -gt 0 ]; then
+    printf 'fail\t%s' "$(_ci_names_summary "CI failed" "${_cg_fails[@]}")"
+  elif [ "${#_cg_pends[@]}" -gt 0 ]; then
+    printf 'pending\t%s' "$(_ci_names_summary "awaiting checks" "${_cg_pends[@]}")"
   fi
 }
 
@@ -2648,6 +2812,9 @@ do_merge() {
   # approval in `herd-approve.sh list`. Done right after the merge record so a later cleanup crash
   # can never leave the phantom behind.
   purge_pr_approvals "$dp"
+  # HERD-197: drop this PR's CI-check gate-event ledger rows too — the PR is merged, so its check
+  # results are terminal and never re-evaluated; keeps $CI_CHECKS_STATE from growing unbounded.
+  purge_pr_ci_checks "$dp"
   # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and journal
   #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
   #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.
@@ -5659,8 +5826,29 @@ EOF
       # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
       # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
       # is transient, NOT a human-action error, so no ⚠️ "needs you".
-      DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
-      FLAIR_STATE[i]="busy"
+      #
+      # HERD-197: UNSTABLE is opaque — it never names the check. When the hold is UNSTABLE, fetch the
+      # GH check-run rollup, journal each landed result as a `ci_check` gate event + notify once on a
+      # newly-landed failure, and surface WHICH check is failing/pending in the row instead of the bare
+      # (UNSTABLE). A genuine FAILING required check is a human-action stop — it will NEVER merge until
+      # fixed — so it graduates to a LOUD red 'needs you · <check>' row (the grounded #293 macOS leg);
+      # pending-only checks stay a yellow hold, just named. Fail-soft: a PR with no checks / an offline
+      # gh yields no summary and the row is BYTE-IDENTICAL to before.
+      _ci_sum=""
+      if [ "$mstate" = "UNSTABLE" ]; then _ci_sum="$(_ci_gate_eval "$prnum" "$headsha" "$slug")"; fi
+      if [ -n "$_ci_sum" ]; then
+        _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
+        if [ "$_ci_bucket" = "fail" ]; then
+          DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
+          FLAIR_STATE[i]="attention"
+        else
+          DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · ${_ci_text}${C_RESET}"
+          FLAIR_STATE[i]="busy"
+        fi
+      else
+        DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
+        FLAIR_STATE[i]="busy"
+      fi
     else
       reason="not mergeable (${mstate})"
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
@@ -5732,7 +5920,9 @@ EOF
     # multi-op audit's "don't both run the gates on a shared PR". Team mode only (WATCHER_SCOPE=all): in
     # the solo default no other seat sees this PR, so no per-tick status read runs (byte-inert). Our OWN
     # blessing (already in $GATE_STATUS_STATE) never triggers this — we posted it, so we fall through to
-    # our merge path. A sha another seat has blessed is theirs to gate + merge; we skip it this tick.
+    # our merge path. Defensive: because a non-owned PR never enters CAND_IDX (the ownership gate), the
+    # only seat that reaches here for a given sha is its owner, so in practice this skips a sha WE would
+    # otherwise re-gate after a ledger loss — cheap insurance against duplicate gate spend either way.
     if _gate_status_enabled && _watcher_team_mode \
        && ! _gate_status_posted "$prnum" "$candsha" success \
        && _gate_status_blessed "$candsha"; then
@@ -5741,10 +5931,13 @@ EOF
       continue
     fi
 
-    # herd/gates → pending (HERD-194): we are about to run the gates for this (pr,sha). Post the pending
-    # status once per sha so a watcher-in-progress is visible on the PR (and so branch protection shows
-    # the required check as pending, not missing). Fail-soft + at-most-once via $GATE_STATUS_STATE.
-    post_gate_status "$prnum" "$candsha" pending
+    # NOTE (HERD-194): we deliberately do NOT post a `pending` herd/gates status here. A pending
+    # NON-passing commit status flips a CLEAN sha to mergeStateStatus=UNSTABLE — which is neither CLEAN
+    # (so it drops out of the merge path) nor BLOCKED (so it is not gate-eligible), a self-inflicted
+    # deadlock in the DEFAULT unprotected config. The fail-safe rests only on the ABSENCE of `success`
+    # (which keeps the PR unmergeable under `require herd/gates` protection), and GitHub already
+    # represents a missing REQUIRED check as "Expected / waiting", so a pending write buys nothing.
+    # Only the terminal success/failure are ever posted (below).
 
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
     # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap

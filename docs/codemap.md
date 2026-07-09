@@ -104,7 +104,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
 - `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
-- `herd-advise.sh` → `herd-config.sh`
+- `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
 - `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`

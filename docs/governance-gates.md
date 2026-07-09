@@ -18,9 +18,13 @@ against each `(pr, head-sha)` as it clears it:
 
 | When | State |
 | --- | --- |
-| Gates dispatched (watcher started gating this commit) | `pending` |
 | Healthcheck reproduced a code error, **or** the review returned BLOCK | `failure` |
 | Both gates green (healthcheck + review PASS) | `success` |
+
+Only these **terminal** states are posted — there is deliberately **no `pending`** status. A pending
+*non-passing* commit status flips a `CLEAN` sha to `mergeStateStatus=UNSTABLE`, which would strand the
+PR out of the merge path; the fail-safe below needs only the **absence of `success`**, and GitHub
+already shows a missing *required* check as "Expected / waiting" on its own.
 
 Each conclusion is posted **exactly once per `(pr, sha, conclusion)`** (sha-keyed ledger), and the
 status is posted **only by a watcher that actually ran the gates**. So a commit that no watcher has

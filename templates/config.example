@@ -210,13 +210,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # STALE_DUP_DETECT="on"    # on (default) | off
 
 # herd/gates commit status (HERD-194) — on (default) | off. on → as the watcher clears each (pr,sha) it
-# posts a `herd/gates` COMMIT STATUS: pending at gate dispatch → success on both-gates-green, or failure
-# on a reproduced healthcheck CODEERROR / review BLOCK (exactly once per (pr,sha,conclusion)). Wire
-# `require herd/gates` into GitHub branch protection (recipe: docs/governance-gates.md) so the gate is
-# FAIL-SAFE across seats + collaborators who keep merge rights: anyone may merge, but nothing UNGATED
-# can — a commit no watcher blessed has no success status and cannot merge under protection. In team
-# mode (WATCHER_SCOPE=all) a sha another seat already blessed is skipped (cross-seat dedup). off →
-# byte-inert: no status posted, no read. Watcher-affecting (next watcher restart).
+# posts a `herd/gates` COMMIT STATUS: success on both-gates-green, or failure on a reproduced healthcheck
+# CODEERROR / review BLOCK (exactly once per (pr,sha,conclusion)). It never posts `pending` — a pending
+# non-passing check flips a CLEAN sha to UNSTABLE and would strand it; the fail-safe rests only on the
+# ABSENCE of success. Wire `require herd/gates` into GitHub branch protection (recipe:
+# docs/governance-gates.md) so the gate is FAIL-SAFE across seats + collaborators who keep merge rights:
+# anyone may merge, but nothing UNGATED can — a commit no watcher blessed has no success status and cannot
+# merge under protection (a fresh PR reports BLOCKED until the watcher gates + blesses it, so it never
+# deadlocks). In team mode (WATCHER_SCOPE=all) a sha another seat already blessed is skipped (cross-seat
+# dedup). off → byte-inert: no status posted, no read. Watcher-affecting (next watcher restart).
 # GATE_STATUS="on"         # on (default) | off
 
 # post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
