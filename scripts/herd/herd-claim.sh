@@ -44,6 +44,11 @@ _HERD_CLAIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # so a standalone claim without WORKTREES_DIR simply drops the entry and never blocks the claim.
 command -v journal_append >/dev/null 2>&1 || . "$_HERD_CLAIM_DIR/journal.sh" 2>/dev/null || true
 
+# engine-version.sh provides herd_engine_guard, the ENGINE VERSION HANDSHAKE (HERD-179) the claim
+# crosses before it writes tracker state. Sourced only if the lane has not already; functions only.
+# shellcheck source=/dev/null
+command -v herd_engine_guard >/dev/null 2>&1 || . "$_HERD_CLAIM_DIR/engine-version.sh" 2>/dev/null || true
+
 # _herd_claim_identity — the operator identity a claim is stamped with. WATCHER_OWNER wins (an
 # explicit, gh-free identity), then WATCHER_VIEW_AUTHOR (reuse the watcher-lens identity, same order
 # agent-watch.sh resolves), else the authenticated `gh api user` login. Empty when none resolves —
@@ -124,6 +129,14 @@ _herd_force_spawn() {
 # PROCEED, non-zero to ABORT the spawn.
 herd_claim_or_abort() {
   local slug="${1:-?}" id who parsed result owner
+  # ENGINE VERSION HANDSHAKE (HERD-179), FIRST — this is the earliest write gate a lane crosses (it
+  # runs before new-feature.sh, hence before herd_preflight's copy of the guard). A claim is a tracker
+  # WRITE, and everything downstream of it (worktree, branch, tab, agent) is a write too, so an engine
+  # below the project's committed ENGINE_MIN aborts the spawn here with the remedy `run herd update`.
+  # Inert when the project pins no floor; HERD_ENGINE_SKIP_HANDSHAKE=1 downgrades it to a journaled warn.
+  if command -v herd_engine_guard >/dev/null 2>&1; then
+    herd_engine_guard "herd-claim ($slug)" || return 1
+  fi
   # OFF by default → zero behavior change (the async scribe mark-in-progress path is untouched).
   case "${CLAIM_REQUIRED:-off}" in
     1|true|yes|on|ON|On) ;;

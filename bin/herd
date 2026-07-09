@@ -42,6 +42,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh"
 
+# Engine version handshake (HERD-179): the local engine's level constant + herd_engine_guard (the
+# write-path refusal), herd_engine_warn_if_stale (the read-path advisory), herd_engine_doctor_row, and
+# herd_engine_min_stamp (the monotonic ENGINE_MIN stamp `herd upgrade` writes). Defines functions only;
+# ENGINE_MIN/ENGINE_AUTOUPDATE resolve lazily at call time, so sourcing before herd-config.sh is safe.
+# Sourced AFTER journal.sh so its refusal/bypass events are journaled. See scripts/herd/engine-version.sh.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/engine-version.sh" ] && . "$SCRIPTS_DIR/engine-version.sh"
+
 # Cost summer/reader helpers (transcript-token pricing). Defines functions + constants only, sourced
 # AFTER journal.sh (its documented order); gives cmd_cost the `herd cost --full` live-scan readers
 # (_cost_transcript_dir + cost_report_full). No side effects at source time.
@@ -1171,6 +1179,18 @@ cmd_upgrade() {
     printf 'HERD_VERSION=%s\n' "$target" >> "$cfg"
   fi
   ok "HERD_VERSION → $target"
+  # ENGINE VERSION HANDSHAKE (HERD-179): stamp the project's ENGINE_MIN floor to the level of the
+  # engine that just upgraded it. MONOTONIC — herd_engine_min_stamp never lowers a floor a newer engine
+  # already set elsewhere, so an operator running an old checkout cannot silently un-pin the project.
+  # From here on, any engine below that level refuses the write paths with `run herd update`.
+  if command -v herd_engine_min_stamp >/dev/null 2>&1; then
+    local engine_min_before engine_min_after
+    engine_min_before="$(_herd_engine_min_in_file "$cfg")"
+    engine_min_after="$(herd_engine_min_stamp "$cfg")"
+    if [ "$engine_min_after" != "$engine_min_before" ]; then
+      ok "ENGINE_MIN → $engine_min_after (engine level $(herd_engine_level))"
+    fi
+  fi
   local skill; skill="$(render_skill "$root" "$cfg")"
   ok "re-rendered coordinator skill → $skill"
   # After the re-render, surface engine config keys this project still hasn't assigned so a new knob
@@ -2821,6 +2841,10 @@ cmd_status() {
   # Re-theme the CLI palette from THIS project's HERD_THEME (startup default was tokyonight).
   if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   command -v _status_run >/dev/null 2>&1 || die "status helpers not loaded (scripts/herd/status.sh missing)"
+  # ENGINE VERSION HANDSHAKE (HERD-179), READ path: a snapshot against a stale engine is safe (it
+  # observes, it never acts) — so this WARNS and proceeds where a write path would refuse. Silent when
+  # the engine is current or the project pins no ENGINE_MIN floor; never changes the exit contract.
+  if command -v herd_engine_warn_if_stale >/dev/null 2>&1; then herd_engine_warn_if_stale "herd status"; fi
   local rc=0
   _status_run || rc=$?
   return "$rc"
@@ -3035,6 +3059,15 @@ cmd_backend_switch() {
   if [ "$target" = "$current" ]; then
     say "already on SCRIBE_BACKEND=$current — nothing to do"
     return 0
+  fi
+
+  # ENGINE VERSION HANDSHAKE (HERD-179). A backend switch REWRITES .herd/config and (with --migrate)
+  # moves every open item between trackers — the single most destructive write the CLI makes. An engine
+  # below the project's committed ENGINE_MIN refuses it here, before any preflight or migration. Placed
+  # after the same-backend early return so a genuine no-op stays a silent no-op: only a switch that
+  # would actually WRITE crosses the guard.
+  if command -v herd_engine_guard >/dev/null 2>&1; then
+    herd_engine_guard "herd backend switch" || die "backend switch aborted — stale engine (see above)"
   fi
 
   # ── 1. preflight — fail loud BEFORE any change ─────────────────────────────────────────────────

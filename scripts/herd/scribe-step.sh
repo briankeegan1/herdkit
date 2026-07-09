@@ -41,6 +41,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # backend dispatch from this drainer to the 'scribe' component (the explicit-ref reconcile path in
 # agent-watch attributes its own writes 'reconcile' before this ever runs).
 . "$HERE/journal.sh"
+# Engine version handshake (HERD-179): herd_engine_guard, crossed below before any APPLY verb writes.
+# shellcheck source=/dev/null
+. "$HERE/engine-version.sh"
 # Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed drainer can be
 # detected and reclaimed by scribe.sh. Best-effort; never affects this script's stdout.
 . "$HERE/drainer-liveness.sh"
@@ -73,6 +76,18 @@ HEARTBEAT="$TREES/.scribe.heartbeat"
 mkdir -p "$Q"
 cmd="${1:-}"
 herd_drainer_heartbeat "$HEARTBEAT"
+
+# ENGINE VERSION HANDSHAKE (HERD-179). The APPLY verbs are this script's write edge: they commit
+# $BACKLOG_FILE or dispatch a create/transition/comment through the active tracker backend. An engine
+# below the project's committed ENGINE_MIN must not apply them — a stale drainer's idea of the backend
+# contract is exactly how a half-migrated tracker happens. The read/queue verbs (next, skip, finish)
+# are untouched, so a stale drainer still polls, still reports, and still stops cleanly.
+# A refused apply leaves the request CLAIMED (*.mine); the `next` reclaim (find -mmin +5) returns it to
+# the queue, so nothing is lost — a fresh drainer on a current engine drains it after `herd update`.
+case "$cmd" in
+  commit|add-item|update-state|amend)
+    herd_engine_guard "scribe-step apply ($cmd)" || exit 1 ;;
+esac
 
 # _report_and_cleanup <claimed-path> <summary> <result> — shared post-write tail for both
 # commit (file) and add-item (api/changelog): live-view receipt, inbox line, notify, unclaim.
