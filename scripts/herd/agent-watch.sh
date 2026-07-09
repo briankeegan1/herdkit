@@ -4972,14 +4972,20 @@ _handle_coordinator_watchdog() {
 #   4. otherwise (clean/quiet tree, zero commits, flat transcript) ⇒ the "no activity" warning
 # The genuinely-dead case (agent_status != "working") is handled by the caller as "awaiting task".
 
-# file_mtime / _file_size — portable stat helpers (GNU stat -c vs BSD/macOS stat -f), detected once
-# at load, mirroring backlog-view.sh's pattern.
+# file_mtime / _file_size / _stat_birth — portable stat helpers (GNU stat -c vs BSD/macOS stat -f),
+# detected ONCE at load, mirroring backlog-view.sh's pattern. Selecting the flavor here (not per-call)
+# guarantees GNU/uutils never sees a BSD '-f <fmt>' arg — on uutils '-f' means --file-system, so an
+# inline 'stat -f %B || stat -c %W' chain queries the WRONG thing instead of cleanly falling through
+# (HERD-207, regression of HERD-198). _stat_birth echoes the inode birth epoch, or 0 when the stat
+# flavor / filesystem does not expose one (GNU '%W' yields 0 when unknown).
 if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then
-  file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
-  _file_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+  file_mtime()  { stat -c %Y "$1" 2>/dev/null || echo 0; }
+  _file_size()  { stat -c %s "$1" 2>/dev/null || echo 0; }
+  _stat_birth() { stat -c %W "$1" 2>/dev/null || echo 0; }
 else
-  file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
-  _file_size() { stat -f %z "$1" 2>/dev/null || echo 0; }
+  file_mtime()  { stat -f %m "$1" 2>/dev/null || echo 0; }
+  _file_size()  { stat -f %z "$1" 2>/dev/null || echo 0; }
+  _stat_birth() { stat -f %B "$1" 2>/dev/null || echo 0; }
 fi
 
 # _stall_quiet_secs — how long (seconds) a working builder's tree may go quiet before the warning.
@@ -5018,7 +5024,7 @@ _worktree_newest_edit() {
 # "stalled" before its own tree even existed, so a young worktree reads as building, not stalled.
 _worktree_born() {
   local wt="$1" b
-  b="$(stat -f '%B' "$wt" 2>/dev/null || stat -c '%W' "$wt" 2>/dev/null || echo 0)"
+  b="$(_stat_birth "$wt")"
   [ "${b:-0}" -gt 0 ] || b="$(file_mtime "$wt")"
   printf '%s' "${b:-0}"
 }
