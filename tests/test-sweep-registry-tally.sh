@@ -100,16 +100,31 @@ grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" && fail "(2) a row whose tab no longe
 grep -q 'tabKEEP'   "$TREESDIR/.herd-tabs" || fail "(2) a live tab's row was wrongly pruned"
 grep -q '"event":"sweep_tab_prune"' "$JOURNAL_FILE" || fail "(2) the prune was not journaled"
 grep -q 'tabZOMBIE' "$JOURNAL_FILE" || fail "(2) the pruned tab_id was not journaled"
-# OFFLINE SAFETY: a failed `herdr tab list` (rc!=0) must NEVER be read as "every tab gone → wipe rows".
-cat > "$TREESDIR/.herd-tabs" <<'EOF'
+# SAFETY: NO degenerate read may be taken as "every tab gone → wipe the registry". Each of the four
+# failure shapes below must leave BOTH rows intact.
+seed_two(){ cat > "$TREESDIR/.herd-tabs" <<'EOF'
 live-slug tabKEEP builder
 zombie tabZOMBIE builder
 EOF
-printf '3' > "$HERDR_RC"
+}
+# (a) rc != 0 — herdr offline / rate-limited.
+seed_two; printf '3' > "$HERDR_RC"
 _herd_tabs_prune_orphans "$TREESDIR/.herd-tabs"
-grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" || fail "(2) an offline herdr wrongly wiped the registry"
+grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" && grep -q 'tabKEEP' "$TREESDIR/.herd-tabs" || fail "(2) rc!=0 wrongly wiped the registry"
 printf '0' > "$HERDR_RC"
-ok; echo "PASS (2) prune drops dead-tab rows, spares live rows, journals, and is offline-safe"
+# (b) rc 0 but BLANK stdout.
+seed_two; : > "$HERDR_TABS_JSON"
+_herd_tabs_prune_orphans "$TREESDIR/.herd-tabs"
+grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" && grep -q 'tabKEEP' "$TREESDIR/.herd-tabs" || fail "(2) a blank rc-0 read wiped the registry"
+# (c) rc 0, valid JSON, but ZERO tabs — the ambiguous case (empty room vs blip) → refuse.
+seed_two; set_tabs '{"result":{"tabs":[]}}'
+_herd_tabs_prune_orphans "$TREESDIR/.herd-tabs"
+grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" && grep -q 'tabKEEP' "$TREESDIR/.herd-tabs" || fail "(2) a zero-tabs read wiped the registry"
+# (d) rc 0 but UNPARSEABLE garbage.
+seed_two; set_tabs 'not json at all'
+_herd_tabs_prune_orphans "$TREESDIR/.herd-tabs"
+grep -q 'tabZOMBIE' "$TREESDIR/.herd-tabs" && grep -q 'tabKEEP' "$TREESDIR/.herd-tabs" || fail "(2) an unparseable rc-0 read wiped the registry"
+ok; echo "PASS (2) prune drops dead-tab rows, spares live rows, journals; every degenerate read is a safe no-op"
 
 # ── (3) closing a tab drops its row in the SAME action ───────────────────────
 # 'ghost' has a LIVE (open) tab but no worktree and no PR → a genuine orphan → closed + row dropped.

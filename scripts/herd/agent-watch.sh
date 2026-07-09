@@ -3554,10 +3554,18 @@ except Exception: pass
 # and so never reaps a row whose tab is already gone. The prune makes the registry SELF-CONSISTENT: a
 # row exists only while its tab does.
 #
-# SAFETY: prune ONLY against a POSITIVELY-read live list. No herdr, or a `herdr tab list` that FAILS
-# (offline / rate-limited / rc != 0) yields NO prune — an empty/failed result is never read as "every
-# tab is gone, wipe the registry" (the HERD-206 discipline). A row we cannot parse (< 2 fields) is
-# preserved byte-for-byte. Fail-soft + idempotent: a second run over a clean registry is a no-op.
+# SAFETY (the whole point — a wrong read WIPES the allowlist, de-registering LIVE tabs): prune ONLY
+# against a live list that was BOTH positively fetched AND positively parsed AND non-empty. Three
+# distinct failure shapes must every one degrade to NO-OP, never to "every tab is gone → wipe":
+#   • `herdr tab list` FAILS           (rc != 0 — offline / rate-limited)        → no prune
+#   • rc 0 but BLANK / UNPARSEABLE     (empty stdout, truncated or garbage JSON) → no prune
+#   • rc 0, valid JSON, but ZERO tabs  (ambiguous: empty room vs a herdr blip)   → no prune
+# Only the last case is a JUDGMENT call, and we resolve it conservatively: a lingering stale row is a
+# benign over-count the cadence will catch once real tabs reappear, whereas a false wipe destroys the
+# registry. This mirrors HERD-206 (a failed `gh pr list` is never "every PR merged"). The live-id
+# parser therefore EXITS NON-ZERO on empty/garbage/wrong-shape input (rather than swallowing to an
+# empty set), and the bash side refuses to prune unless it read at least one live tab_id. A registry
+# row we cannot parse (< 2 fields) is preserved byte-for-byte. Fail-soft + idempotent throughout.
 _herd_tabs_prune_orphans() {
   local _pr_reg="$1"
   [ -n "$_pr_reg" ] || return 0
@@ -3566,24 +3574,31 @@ _herd_tabs_prune_orphans() {
   local _pr_raw _pr_rc=0
   _pr_raw="$(herdr tab list 2>/dev/null)" || _pr_rc=$?
   [ "$_pr_rc" -eq 0 ] || return 0
-  local _pr_live
+  # Extract the live tab_ids. The parser raises (→ non-zero exit) on empty/garbage input or a response
+  # whose result.tabs is not a list, so a degenerate rc-0 read is a hard STOP, not an empty live set.
+  local _pr_live _pr_prc=0
   _pr_live="$(printf '%s' "$_pr_raw" | python3 -c '
 import sys, json
-try:
-    for t in json.load(sys.stdin).get("result",{}).get("tabs",[]):
-        tid = t.get("tab_id","") or ""
-        if tid: print(tid)
-except Exception:
-    pass
-' 2>/dev/null || true)"
+data = json.loads(sys.stdin.read())          # raises on empty / truncated / non-JSON → SystemExit != 0
+tabs = data["result"]["tabs"]                # raises (KeyError/TypeError) on the wrong shape
+if not isinstance(tabs, list):
+    raise SystemExit(1)
+sys.stdout.write("\n".join(t.get("tab_id","") for t in tabs if isinstance(t, dict) and t.get("tab_id")))
+' 2>/dev/null)" || _pr_prc=$?
+  [ "$_pr_prc" -eq 0 ] || return 0
+  # A positively-parsed but EMPTY live set is the ambiguous case above → refuse to prune against it.
+  [ -n "$_pr_live" ] || return 0
   # Rewrite the registry keeping only rows whose tab_id is live (or unparseable). Print each pruned
   # tab_id so the caller can journal it. The file is only rewritten when something is actually dropped,
-  # so a clean registry keeps its exact bytes (and mtime).
+  # so a clean registry keeps its exact bytes (and mtime). Belt-and-braces: the rewrite ALSO refuses an
+  # empty live set, so it can never wipe the registry even if a future caller forgets the guard above.
   local _pr_dropped
   _pr_dropped="$(REG="$_pr_reg" LIVE="$_pr_live" python3 -c '
 import os
 reg  = os.environ["REG"]
 live = set(l for l in os.environ.get("LIVE","").split("\n") if l)
+if not live:
+    raise SystemExit(0)                       # never prune against an empty live set (would wipe rows)
 try:
     with open(reg, encoding="utf-8") as f: lines = f.readlines()
 except Exception:
