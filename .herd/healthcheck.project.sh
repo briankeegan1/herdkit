@@ -348,6 +348,21 @@ if [ -n "$_hk_dh_dir" ]; then
 fi
 dh_note="daemon-hermeticity: clean"
 
+# ── HERD-223 JOURNAL HERMETICITY (shared TEST layer) ─────────────────────────────────────────────
+# A hermetic test that journals (via journal_append) and forgets to export JOURNAL_FILE used to
+# append FIXTURE events into the LIVE $WORKTREES_DIR/.herd/journal.jsonl — the committed .herd/config
+# pins WORKTREES_DIR to the main checkout's pool, so a worktree-run suite polluted herd why/log/
+# stats. Pin JOURNAL_FILE to a throwaway path for the WHOLE suite (and set HERD_JOURNAL_HERMETIC so
+# the journal.sh fail-safe still redirects if a child unsets it). Complements the engine guard in
+# scripts/herd/journal.sh; kept in lockstep with tests/test-journal-hermeticity.sh. INERT if a tmp
+# dir can't be made (the journal.sh guard still fires on HERMETIC_TEST / HERD_HERMETIC_GUARD alone).
+_hk_jh_dir="$(mktemp -d 2>/dev/null || echo '')"
+_hk_jh_file=""
+if [ -n "$_hk_jh_dir" ]; then
+  _hk_jh_file="$_hk_jh_dir/journal.jsonl"
+  : > "$_hk_jh_file"
+fi
+
 _hk_dh_verdict() {
   # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
   # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
@@ -361,18 +376,21 @@ _hk_dh_verdict() {
       echo "   and never deliver a desktop notification — install scripts/herd/sim/sim-notify-stub.sh)"
       sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
     fi
-    rm -rf "$_hk_dh_dir"
+    rm -rf "$_hk_dh_dir" "$_hk_jh_dir"
     exit 1
   fi
   [ -n "$_hk_dh_dir" ] && rm -rf "$_hk_dh_dir"
+  [ -n "$_hk_jh_dir" ] && rm -rf "$_hk_jh_dir"
 }
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189): run bats under BOTH guards.
+  # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189) + JOURNAL HERMETICITY (HERD-223):
   # HERD-189: the live agent-spawn surface (herdr/claude/codex) is shadowed by the tripwire stubs
   # prepended to PATH ($_hk_dh_pp) and HERD_HERMETIC_GUARD arms agent-watch.sh's choke point, so any test
   # that reaches the live control room / spawns a real daemon RECORDS a leak (a HARD fail via _hk_dh_verdict).
+  # HERD-223: JOURNAL_FILE + HERD_JOURNAL_HERMETIC pin every fixture journal_append away from the live
+  # project journal (see scripts/herd/journal.sh + scripts/herd/journal-test-env.sh).
   # HERD-185: a test that prompts for input or reads /dev/tty used to hang the WHOLE suite forever headless
   # (the watcher's async health worker has no controlling terminal — exactly how a prompt stalls a slot),
   # so `</dev/null` fails a stdin prompt fast, BATS_TEST_TIMEOUT names a per-test wedge, and an OUTER
@@ -381,10 +399,14 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
   BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
   if command -v timeout >/dev/null 2>&1; then
-    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   else
-    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   fi
   _hk_bats_rc=$?
@@ -419,7 +441,11 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then
   fails=0
-  for t in tests/test-*.sh; do PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" bash "$t" >/dev/null 2>&1 || fails=$((fails+1)); done
+  for t in tests/test-*.sh; do
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      bash "$t" >/dev/null 2>&1 || fails=$((fails+1))
+  done
   _hk_dh_verdict
   if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"
@@ -484,52 +510,37 @@ fi
 # 5. caps-sync guard — a PR adding a cmd_* subcommand to bin/herd, a new config key to
 # herd-config.sh, or a new lane script under scripts/herd/ without also touching
 # templates/capabilities.tsv is a CODE error (the manifest must stay in sync).
+# The rule itself lives in scripts/herd/caps-sync-lint.sh — ONE implementation, shared with the
+# builder's LIGHT pre-PR gate in scripts/herd/healthcheck.sh (HERD-220), so the two can never
+# disagree about what a manifest miss is.
 caps_note="caps-sync: clean"
 _hc_branch="origin/main"
 if [ -f .herd/config ]; then
   _hc_branch="$(. .herd/config 2>/dev/null && printf '%s' "${DEFAULT_BRANCH:-origin/main}")" \
     || _hc_branch="origin/main"
 fi
-if _hc_changed="$(git diff --name-only "$_hc_branch" 2>/dev/null)"; then
-  _hc_manifest_touched=0
-  case "$_hc_changed" in *"templates/capabilities.tsv"*) _hc_manifest_touched=1 ;; esac
-  _hc_sync_errs=""
-
-  if printf '%s\n' "$_hc_changed" | grep -qxE 'bin/herd'; then
-    _hc_new_cmds="$(git diff "$_hc_branch" -- bin/herd 2>/dev/null \
-      | grep -E '^\+[[:space:]]*cmd_[a-z_]+\(\)' || true)"
-    if [ -n "$_hc_new_cmds" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-      _hc_sync_errs="${_hc_sync_errs}bin/herd adds cmd_*: also update templates/capabilities.tsv"$'\n'
-    fi
-  fi
-
-  if printf '%s\n' "$_hc_changed" | grep -qxE 'scripts/herd/herd-config\.sh'; then
-    _hc_new_keys="$(git diff "$_hc_branch" -- scripts/herd/herd-config.sh 2>/dev/null \
-      | grep -E '^\+[[:space:]]*:[[:space:]]+"?\$\{[A-Z_]+:=' || true)"
-    if [ -n "$_hc_new_keys" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-      _hc_sync_errs="${_hc_sync_errs}herd-config.sh adds config keys: also update templates/capabilities.tsv"$'\n'
-    fi
-  fi
-
-  _hc_added_lanes="$(git diff --diff-filter=A --name-only "$_hc_branch" 2>/dev/null \
-    | grep -Ex 'scripts/herd/[^/]+\.sh' | grep -vxE 'scripts/herd/herd-config\.sh' || true)"
-  if [ -n "$_hc_added_lanes" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-    _hc_sync_errs="${_hc_sync_errs}new lane script added: also update templates/capabilities.tsv"$'\n'
-  fi
-
-  if [ -n "$_hc_sync_errs" ]; then
-    caps_note="caps-sync: VIOLATION"
-    if [ -n "$ONELINE" ]; then
-      echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"
-    else
-      echo "CAPS-SYNC: capabilities manifest not updated alongside engine change"
-      printf '%s' "$_hc_sync_errs"
-    fi
-    exit 1
-  fi
+HERD_CAPS_SYNC_SKIP_REASON=""
+if [ -f scripts/herd/caps-sync-lint.sh ]; then
+  . scripts/herd/caps-sync-lint.sh
+  _hc_sync_errs="$(herd_caps_sync_lint "$_hc_branch")"; _hc_sync_rc=$?
 else
-  caps_note="caps-sync: skipped (no diff against $_hc_branch)"
+  # Fail-soft on our own infra (a fixture tree, or a checkout without the engine scripts): SKIP,
+  # never a red — same convention as the claude-hardcode lint's missing-lint path below.
+  _hc_sync_errs=""; _hc_sync_rc=2
+  HERD_CAPS_SYNC_SKIP_REASON="scripts/herd/caps-sync-lint.sh not present"
 fi
+case "$_hc_sync_rc" in
+  0) caps_note="caps-sync: clean" ;;
+  2) caps_note="caps-sync: skipped ($HERD_CAPS_SYNC_SKIP_REASON)" ;;
+  *) caps_note="caps-sync: VIOLATION"
+     if [ -n "$ONELINE" ]; then
+       echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"
+     else
+       echo "CAPS-SYNC: capabilities manifest not updated alongside engine change"
+       printf '%s\n' "$_hc_sync_errs"
+     fi
+     exit 1 ;;
+esac
 
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver

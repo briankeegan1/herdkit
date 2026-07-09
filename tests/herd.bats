@@ -217,6 +217,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic journal hermeticity guard (HERD-223) test passes" {
+  run bash "$REPO/tests/test-journal-hermeticity.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic approval-purge (HERD-90) test passes" {
   run bash "$REPO/tests/test-approval-purge.sh"
   [ "$status" -eq 0 ]

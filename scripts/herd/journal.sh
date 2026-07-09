@@ -35,11 +35,41 @@ _journal_ts() {
   date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
 }
 
+# _journal_in_test_context — HERD-223: is this process a hermetic test (or a child of one)?
+# True when any of the suite/test signals is set. Those vars are NEVER set in production lanes
+# (watcher, builders, CLI on a real project) — the dogfood healthcheck / CI suite / individual
+# hermetic tests set them. Used only as a fail-safe redirect so a forgotten JOURNAL_FILE export
+# cannot pollute the live project journal. INERT in production.
+_journal_in_test_context() {
+  # Use ${VAR-} (no colon) so the caps-sync ghost scan does not treat these as config knobs;
+  # HERD_* is already exempt, but HERMETIC_TEST / BATS_* are plain test harness signals.
+  [ -n "${HERMETIC_TEST-}" ] && return 0
+  [ -n "${HERD_HERMETIC_GUARD-}" ] && return 0
+  [ -n "${HERD_JOURNAL_HERMETIC-}" ] && return 0
+  [ -n "${BATS_TEST_FILENAME-}" ] && return 0
+  [ -n "${BATS_TEST_NAME-}" ] && return 0
+  return 1
+}
+
 # _journal_file — resolve the journal path LAZILY on every call, so a component that sets
 # WORKTREES_DIR after sourcing (the hermetic tests do) still lands in the right place. A test seam,
 # JOURNAL_FILE, overrides the derived path outright. Empty output ⇒ no destination ⇒ caller drops.
+#
+# HERD-223 GUARD: when a test context has NOT exported JOURNAL_FILE, do NOT fall through to
+# $WORKTREES_DIR/.herd/journal.jsonl — that path is almost always the REAL project journal
+# (a test inside a worktree sources the committed .herd/config, which pins WORKTREES_DIR to the
+# main checkout's pool). Fail-safe redirect to a throwaway per-process file under TMPDIR instead.
+# Production is byte-identical: the test signals are unset, so the historical path is used.
 _journal_file() {
   if [ -n "${JOURNAL_FILE:-}" ]; then printf '%s' "$JOURNAL_FILE"; return 0; fi
+  if _journal_in_test_context; then
+    # Stable per-process redirect so concurrent appends inside one test land in one file.
+    if [ -z "${_HERD_TEST_JOURNAL_REDIRECT:-}" ]; then
+      _HERD_TEST_JOURNAL_REDIRECT="${TMPDIR:-/tmp}/herd-test-journal-$$.jsonl"
+    fi
+    printf '%s' "$_HERD_TEST_JOURNAL_REDIRECT"
+    return 0
+  fi
   [ -n "${WORKTREES_DIR:-}" ] || return 1
   printf '%s' "$WORKTREES_DIR/.herd/journal.jsonl"
 }

@@ -3233,13 +3233,23 @@ do_merge() {
   # through the existing machinery — no new state, and the merge stays at-most-once. $dsha is empty only
   # for a legacy caller that threaded no sha; there we fall back to the unpinned merge (byte-identical to
   # before this change) rather than refuse a merge we cannot pin.
+  #
+  # HERD-221: gh pr merge can exit non-zero AFTER a successful merge — most commonly when
+  # DELETE_BRANCH_ON_MERGE=true and the local branch delete fails (branch still checked out in its
+  # worktree). Treating ANY non-zero as "sha moved" skipped every post-merge hook while the PR was
+  # already MERGED. On non-zero, re-check the PR's actual state: MERGED → treat as success and run
+  # ALL post-merge hooks; only a NOT-merged PR is a real refusal that returns 1 and skips hooks.
   if [ -n "$dsha" ]; then
     if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
-      journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
-      return 1
+      if [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" != "MERGED" ]; then
+        journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+        return 1
+      fi
     fi
   else
-    gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1 || return 1
+    if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1; then
+      [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" = "MERGED" ] || return 1
+    fi
   fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
@@ -6581,6 +6591,73 @@ build_sweep_note() {
   return 0
 }
 
+# ── Singleton acquisition (HERD-209) — the ONE race-safe watcher spawn-lock ──────────────────────
+# _acquire_watcher_singleton — REFUSE-or-ADOPT gate enforcing "exactly one agent-watch main per
+# workspace". Returns 0 when this process may run (it acquired the lock — a stale/absent lock is
+# adopted); returns 1 when a LIVE watcher is already recorded and this one must NOT run (a duplicate).
+#
+# The HERD-209 incident: control-room recovery (herd pane watch / herd reload / manual herd-watch.sh)
+# spawned a SECOND watcher WITHOUT killing the first, so two mains polled the same PRs and raced the
+# shared .git object store — healthchecks restarted endlessly. The defense is a REAL singleton at every
+# launch: atomically check HERD_WATCHER_LOCK (kill -0 on the recorded pid) and refuse the duplicate.
+#
+# Two acquisition primitives, one per environment — both ATOMIC (create/flock, never check-then-write):
+#   • flock(1) available  — a non-blocking exclusive lock on fd 9 held for our lifetime; a second
+#                           watcher's `flock -n` fails instantly (auto-released on any exit via fd close).
+#   • no flock (macOS)    — an atomic-mkdir mutex serializes the check+write window, then a PID file is
+#                           held for our lifetime and removed on EXIT/INT/TERM.
+# In BOTH primitives we FIRST read the RECORDED pid (before any truncating open — `exec 9>` empties the
+# file) and refuse a live, non-self one. That kill -0 check is what catches the exact race the flock
+# alone cannot: a lockfile inode swapped out from under an alive holder (rm+recreate) — the recorded pid
+# still proves a watcher is up. Lib-visible (defined above the AGENT_WATCH_LIB return) so the unit test
+# can drive it directly; called once at main startup below.
+_acquire_watcher_singleton() {
+  mkdir -p "$(dirname "$HERD_WATCHER_LOCK")" 2>/dev/null || true
+  # Recorded-pid refuse — read the pid BEFORE any open that would truncate the lockfile. A LIVE,
+  # non-self recorded pid means a watcher already owns this workspace: refuse rather than duplicate.
+  local _wl_rec
+  _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
+    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_rec" >&2
+    return 1
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$HERD_WATCHER_LOCK"
+    if ! flock -n 9; then
+      printf '🐑 watcher already running for %s — exiting.\n' "$WORKSPACE_NAME" >&2
+      return 1
+    fi
+    printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
+    return 0
+  fi
+  # Atomic-mkdir mutex (serializes the check+write window; held only for that instant).
+  local _wl_mtx="${HERD_WATCHER_LOCK}.d" _wl_tries=0 _wl_pid _wl_tmp
+  while ! mkdir "$_wl_mtx" 2>/dev/null; do
+    [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
+    _wl_tries=$((_wl_tries + 1)); [ "$_wl_tries" -ge 30 ] && break; sleep 0.1
+  done
+  _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
+    rmdir "$_wl_mtx" 2>/dev/null || true
+    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_pid" >&2
+    return 1
+  fi
+  # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
+  _wl_tmp="${HERD_WATCHER_LOCK}.$$"
+  printf '%s\n' "$$" >"$_wl_tmp"; mv "$_wl_tmp" "$HERD_WATCHER_LOCK"
+  rmdir "$_wl_mtx" 2>/dev/null || true
+  # Clean up the PID file on exit — but ONLY if it still contains our own PID. If cmd_reload confirms
+  # us dead, removes our lock, and relaunches a new watcher, the new watcher writes its PID before we
+  # exit; our EXIT trap must not clobber it.
+  _watcher_lock_cleanup() {
+    [ "$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)" = "$$" ] \
+      && rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+  }
+  trap '_watcher_lock_cleanup' EXIT
+  trap '_watcher_lock_cleanup; exit 1' INT TERM
+  return 0
+}
+
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
 # merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
 # the live watch loop. Direct execution runs the loop normally.
@@ -6625,51 +6702,14 @@ fi
 # that is not inside the project it resolves to.
 herd_console_guard "herd watch" || exit 1
 
-# ── Singleton spawn-lock: exactly one watcher per project ──────────────────────────────────────
-# Keyed by WORKSPACE_NAME (matching the coordinator/scribe/researcher pattern). Prevents duplicate
-# launchers from racing on 'gh pr merge' when the coordinator is relaunched. Stale locks (PID dead
-# from a crashed/ended session) are reaped automatically so the next launch can take over.
-#
-# Two mechanisms, one per environment:
-#   • flock(1) available  — non-blocking exclusive lock (fd 9) held for our lifetime; auto-released
-#                           on any exit (fd close). A second watcher's flock -n fails immediately.
-#   • no flock (macOS)    — atomic-mkdir mutex guards the check+write, then a PID file is held for
-#                           our lifetime and removed on EXIT/INT/TERM.
-mkdir -p "$(dirname "$HERD_WATCHER_LOCK")" 2>/dev/null || true
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$HERD_WATCHER_LOCK"
-  if ! flock -n 9; then
-    printf '🐑 watcher already running for %s — exiting.\n' "$WORKSPACE_NAME" >&2; exit 0
-  fi
-  printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
-else
-  # Atomic-mkdir mutex (serializes the check+write window; held only for that instant).
-  _wl_mtx="${HERD_WATCHER_LOCK}.d"
-  _wl_tries=0
-  while ! mkdir "$_wl_mtx" 2>/dev/null; do
-    [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
-    _wl_tries=$((_wl_tries + 1)); [ "$_wl_tries" -ge 30 ] && break; sleep 0.1
-  done
-  _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
-  if [ -n "$_wl_pid" ] && kill -0 "$_wl_pid" 2>/dev/null; then
-    rmdir "$_wl_mtx" 2>/dev/null || true
-    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_pid" >&2; exit 0
-  fi
-  # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
-  _wl_tmp="${HERD_WATCHER_LOCK}.$$"
-  printf '%s\n' "$$" >"$_wl_tmp"; mv "$_wl_tmp" "$HERD_WATCHER_LOCK"
-  rmdir "$_wl_mtx" 2>/dev/null || true
-  unset _wl_mtx _wl_tries _wl_pid _wl_tmp
-  # Clean up the PID file on exit — but ONLY if it still contains our own PID.
-  # If cmd_reload confirms us dead, removes our lock, and relaunches a new watcher,
-  # the new watcher writes its PID before we exit; our EXIT trap must not clobber it.
-  _watcher_lock_cleanup() {
-    [ "$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)" = "$$" ] \
-      && rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
-  }
-  trap '_watcher_lock_cleanup' EXIT
-  trap '_watcher_lock_cleanup; exit 1' INT TERM
-fi
+# ── Singleton spawn-lock: exactly one watcher per project (HERD-209) ────────────────────────────
+# The race-safe acquisition lives in _acquire_watcher_singleton (defined above the AGENT_WATCH_LIB
+# return so the unit test can drive it): it REFUSES when a LIVE watcher is already recorded in
+# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then flock/mkdir), and ADOPTS a stale/absent lock.
+# A refusal exits 0 — a duplicate launch is a no-op, never an error. Keyed by WORKSPACE_NAME (matching
+# the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths (cmd_pane_watch /
+# cmd_reload) mirror this check before spawning so a duplicate is caught at the launcher too.
+_acquire_watcher_singleton || exit 0
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
 # ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
