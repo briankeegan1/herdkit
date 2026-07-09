@@ -234,6 +234,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
+- `STALE_BASE_AUTOFIX` → `agent-watch.sh` (stale-base hold path; shares refix ledger with `REVIEW_AUTOFIX`)
 - `STALL_QUIET_MIN` → `agent-watch.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
 - `TOKEN_MODE` → `bin/herd`

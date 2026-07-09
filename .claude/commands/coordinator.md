@@ -38,7 +38,7 @@ After completing any action, return to this menu until the user chooses to stop.
 This skill drives two **runtime-specific** surfaces: the **multiplexer** (`herdr`, which owns
 tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into
 a pane). Everything else the coordinator runs — `herd …`, `gh …`, the lane scripts under
-`/Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd` — is runtime-independent and stays the same regardless of driver.
+`/Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd` — is runtime-independent and stays the same regardless of driver.
 
 The incantations below are the **only** places this skill is bound to the herdr + Claude Code
 driver. They are the single source for that surface: every driver use elsewhere in this skill
@@ -74,12 +74,12 @@ Keep your own context lean AND keep this window responsive. When you need to **l
 repo**, **enqueue the question on the async research lane** rather than reading a pile of files
 yourself:
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/research.sh "the question"
+    bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/research.sh "the question"
 
 It returns **instantly** with a `REQ_ID` and ensures ONE read-only **researcher** drainer is
 running in its own herdr pane. Fetch each result when you need it:
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/research-get.sh THE_REQ_ID
+    bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/research-get.sh THE_REQ_ID
 
 It prints the report, or `PENDING` if the drainer hasn't filed it yet. The coordinator window
 stays free. **One exception:** for a tiny instant lookup you need *right now*, do it inline.
@@ -103,12 +103,13 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    flight so you can sequence instead of spawning into a conflict. Then pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
+     bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
      ```
    - **Quick lane** (trivial / non-app change — scripts, docs, config):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-quick.sh <slug> "<task>"
+     bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-quick.sh <slug> "<task>"
      ```
+   **(Interactive mode: each spawn requires your approval)**
    **Link a tracked item back to its tracker.** When the item you picked carries a tracker id (the
    `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
    `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
@@ -116,7 +117,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    matching. Under *Tracker-routed spawns* (below) you thread it on **every** spawn — file a tracker
    item first so there is always a ref; a raw file-backend item with no id falls back to fuzzy matching:
    ```
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-feature.sh <slug> "<task>"
    ```
    **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
    (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
@@ -128,7 +129,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
    catches the costly misjudgments.
 4. Enqueue the status change (don't edit `BACKLOG.md` yourself — see *Backlog writes*):
-   `bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
+   `bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any. <!-- DRIVER:focus-agent -->
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `BACKLOG.md`. The
@@ -144,14 +145,14 @@ The rule is **file-then-spawn**:
 
 1. **Ensure a tracker item exists BEFORE you spawn.** Reuse the item you picked, or — for anything not
    already tracked — enqueue it on the scribe FIRST and use that item:
-   `bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
+   `bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
    refactor, a config tweak, a docs pass, a flake fix all get an item too. If it is worth a worktree
    and a PR, it is worth a one-line tracker entry.
 2. **Thread `HERD_ITEM_REF=<id>` on EVERY lane invocation** — feature, quick, and `spawn.sh` alike:
    ```
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-quick.sh <slug> "<task>"
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-feature.sh <slug> "<task>"
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/spawn.sh <slug> quick "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-quick.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/spawn.sh <slug> quick "<task>"
    ```
    The builder then carries a `Refs: <id>` line in its PR body (the exact-ref reconcile), and with
    `CLAIM_REQUIRED` on the same id atomically **claims** the item so two operators can't double-build it.
@@ -246,7 +247,7 @@ When a PR **moves or renames the things backlog items point at** — file paths,
 section headers — entries that still reference the OLD name dangle silently once it merges. After
 such a PR lands, run the reconcile pass (it is safe on any PR — a no-op when nothing moved):
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/backlog-reconcile.sh run <pr#>
+    bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/backlog-reconcile.sh run <pr#>
 
 It diffs the PR's rename/move surface (git rename detection for files + defs/headers that existed
 before the PR and are gone after), finds `BACKLOG.md` entries that reference the old
@@ -282,9 +283,9 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
 - **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
   writes the grounded entry:
-  `bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
+  `bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
-  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
 
 ### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
 
@@ -367,7 +368,7 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
 3. For a CONFLICTING PR, **do NOT hand-resolve it here** — spawn the isolated, test-gated resolver:
-   `bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-resolve.sh <slug>`
+   `bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
@@ -396,13 +397,47 @@ or escalate — then act on what the record actually shows.
 When `.herd/config` sets `REVIEW_AUTOFIX=true`, the watcher bounces each new BLOCK verdict
 directly to the builder: it finds the builder's idle agent pane, sends a re-task prompt with
 `gh pr view <n>` instructions to fix and push, and verifies the agent wakes within ~15 s (retrying
-once). Console shows **refixing (round k/3)** while in flight; **fix requested · awaiting push**
-on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent won't wake.
-Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**. Sha-keyed
-semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
+once). Console shows **refixing (round k/3)** while in flight; **fix in progress · awaiting push
+(round k/3)** on subsequent ticks for the same sha; **needs you · auto-refix failed** if the agent
+won't wake. Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you**.
+Sha-keyed semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for
+that sha.
 
 When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
 you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane. <!-- DRIVER:focus-agent -->
+
+### Auto-heal stale-base holds (STALE_BASE_AUTOFIX)
+
+When `.herd/config` sets `STALE_BASE_AUTOFIX=on`, a **stale-base** hold from the pre-merge
+stale-duplicate gate (touched files moved on `$DEFAULT_BRANCH`) self-heals: the watcher re-tasks
+the live builder with `git merge $DEFAULT_BRANCH` (or dispatches the conflict resolver when no live
+builder remains). Console shows **rebasing · awaiting push**. Shares the `REFIX_MAX_ROUNDS` budget
+with review autofix; only bounce-exhaustion escalates to **needs you**. The **duplicate** flavor
+(re-implements shipped work) always stays a human judgment call. Default is `off` (ship-dormant).
+
+### Auto-refix a red healthcheck (HEALTHCHECK_AUTOFIX)
+
+A reproduced pre-merge healthcheck **CODE ERROR** is the same shape of finding as a BLOCK review —
+a machine-checkable defect in the builder's own diff — so `HEALTHCHECK_AUTOFIX=true` bounces it on
+the same rails: the builder's agent pane receives the failing test line plus the path of the tailable
+suite log, once per `(pr, sha)`. The round budget is **shared with the review refix** — `REFIX_MAX_ROUNDS`
+counts review and healthcheck bounces *together*, one budget per PR — so a builder can never be bounced
+three times by review and three more by the healthcheck. A limit-parked builder is never typed at (it
+routes to the park/resume handler, keeping its bounce for when it returns), a dead or missing agent
+escalates without burning a round, and a `tab-leak-guard` trip is treated as the infra transient it is
+(never bounced). Exhausting the budget escalates to **needs you · refix limit …**.
+
+`HEALTHCHECK_AUTOFIX=false` (the default) bounces nothing: the red row holds the PR and you re-task
+by hand.
+
+### Row truth: "needs you" means nobody is on it
+
+A red row says **needs you** only when *no agent is working that red* — and then it always carries
+both the **blocker** (which test failed) and the **remedy** (what to do, and where the full suite
+output lives). Whenever a builder is actively fixing it — because the watcher bounced it, or because
+you re-tasked the agent by hand and its status reads `working` against that same red sha — the row
+instead reads **fix in progress · awaiting push (round k/3)**. So a `needs you` on the console is
+always real work for you, never work already in flight.
 
 ### Approve pending merges (MERGE_POLICY=approve)
 
@@ -411,8 +446,8 @@ pipeline but holds before merging — posting a PR comment and a notification on
 To approve and trigger merge:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
 ```
 
 Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
@@ -430,15 +465,15 @@ concurrency / limit / pane scenarios drive the **shipped** watcher code in lib m
 scorecard is real signal — they break if that code regresses:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
-bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
-SANDBOX_FORCE_GATE_FAIL=1 bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
+bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
+SANDBOX_FORCE_GATE_FAIL=1 bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
 ```
 
 Each writes a machine-readable `scorecard.json` (`result: pass` iff `failed == 0`) — read it, don't
-eyeball the console. `/Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/sim/README-sandbox-sim.md` catalogs the full tier table and each
+eyeball the console. `/Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/sim/README-sandbox-sim.md` catalogs the full tier table and each
 scenario's invariants. **Thread this into the builder task spec whenever you spawn a watcher-touching
 item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
 tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
@@ -505,8 +540,8 @@ default, untouched.
 ## Herdkit capabilities — compact index
 
 _A one-line index of every command, lane, config key, lever, convention, env var, and reference. For
-the full description **and** when-to-use guidance of any item, read `/Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/docs/capabilities-overview.md`
-(curated narrative) or its machine-readable source of truth `/Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/templates/capabilities.tsv`
+the full description **and** when-to-use guidance of any item, read `/Users/macbookpro/source/herdkit-trees/stale-base-autofix/docs/capabilities-overview.md`
+(curated narrative) or its machine-readable source of truth `/Users/macbookpro/source/herdkit-trees/stale-base-autofix/templates/capabilities.tsv`
 (one row per item, with a `when_to_surface` column). Load those only when you need the detail — this
 index is enough to know what exists._
 
@@ -551,7 +586,7 @@ _On every invocation, read live state to surface what is configured:_
 - `herd conformance <report|run>` — The capability CONFORMANCE MATRIX (HERD-144): joins the capabilities manifest (templates/capabilities.tsv) against the…
 - `herd config models` — Print the model suggestions catalog (templates/models.tsv) — each ref with its tier, role-fit hint and as-of date
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/<lane>.sh`)
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/<lane>.sh`)
 - `fleet.sh` — Helper library behind 'herd fleet' (sourced by bin/herd): the project-registry reader/writer, per-project config…
 - `herd-feature.sh` — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR
 - `herd-quick.sh` — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR
@@ -653,6 +688,7 @@ _On every invocation, read live state to surface what is configured:_
 - `WATCH_CLAUDE_PROBE_TIMEOUT` — Claude exec-hang probe timeout in seconds (HERD-108): on some environments `claude` WEDGES on invocation — every exec…
 - `REVIEW_AUTOFIX` — Auto-bounce BLOCK reviews to the builder agent: true | false (default false); when true, the watcher delivers a re-task…
 - `REFIX_MAX_ROUNDS` — Maximum auto-refix rounds per PR before escalating to "needs you" (default: 3); counts across all shas for a PR
+- `HEALTHCHECK_AUTOFIX` — Auto-bounce a reproduced pre-merge healthcheck CODE ERROR to the builder agent, exactly as REVIEW_AUTOFIX bounces a…
 - `CODEMAP_AUTOREFRESH` — After a PR merges to the default branch, the watcher regenerates the committed code maps — docs/codemap.md (file-level;…
 - `MAIN_HEALTH_TICK` — After a PR merges to the default branch, the watcher runs the healthcheck suite against the freshly ff'd default-branch…
 - `WATCHER_FLAIR` — Watcher status-console FLAIR pack (HERD-147): on | off (default)
@@ -673,10 +709,12 @@ _On every invocation, read live state to surface what is configured:_
 - `HERD_LIMIT_RESUME_BUFFER` — Seconds to wait AFTER the parsed reset time before relaunching a limit-blocked builder via `claude --continue` (default…
 - `HERD_LIMIT_UNKNOWN_WAIT` — Seconds to hold a limit-blocked builder before resuming when the reset time could NOT be parsed (default 18000 ≈ one 5h…
 - `COORDINATOR_WATCHDOG` — on | off (default off): opt-in coordinator auto-resume
+- `COORDINATOR_AUTONOMY` — Coordinator spawn autonomy posture: human (default) | gated | full
 - `DEAD_BUILDER_AUTORESPAWN` — on | off (default off): opt-in AUTO-RESPAWN for a silently-dead pre-PR builder (agent-watch.sh)
 - `DEAD_GRACE_MIN` — Minutes a builder's DEAD signature must persist before the watcher surfaces it as dead (agent-watch.sh) — long enough…
 - `STALL_QUIET_MIN` — Minutes a working builder's worktree may stay quiet before the watcher warns of a stall (agent-watch.sh)
 - `STALE_DUP_DETECT` — Pre-merge STALE-DUPLICATE gate (HERD-188): on (default) | off
+- `STALE_BASE_AUTOFIX` — Auto-heal STALE-BASE holds from the pre-merge stale-duplicate gate (HERD-199): on | off (default off, ship-dormant)
 - `TASK_PANE_VIEW` — Builder-tab task-spec viewer: on (default) | off
 - `DOCTOR_STARTUP_HINT` — Proactive soft-dependency surfacing on control-room startup (herd reload / coordinator launch): off (default) | on
 - `AGENT_UPDATE` — Opt-in safe self-update of the AGENT RUNTIME (HERD-149): off (default) | on
@@ -725,7 +763,7 @@ The backlog is a planning doc, so backlog changes **commit straight to the defau
 PR. But **you never edit `BACKLOG.md` yourself.** You *enqueue* the change and a single async
 **scribe** applies it (one writer ⇒ no clobber, your window stays free):
 
-    bash /Users/macbookpro/source/herdkit-trees/engine-handshake-autoupdate/scripts/herd/scribe.sh "<the change, described in full>"
+    bash /Users/macbookpro/source/herdkit-trees/stale-base-autofix/scripts/herd/scribe.sh "<the change, described in full>"
 
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git
