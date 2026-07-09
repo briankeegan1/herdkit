@@ -312,6 +312,80 @@ cost_report_full() {
     python3 -c "$_COST_FULL_PY" "$dir" 2>/dev/null || true
 }
 
+# ── DAILY BUDGET GOVERNANCE (HERD-95) ───────────────────────────────────────────────────────────
+# ENFORCE a spend ceiling, not just measure it. herd cost already PRICES every session and journals a
+# `cost` event (carrying the already-computed usd) at merge time; the two helpers below turn that
+# ledger into a rail without reimplementing any token/cost math — they only AGGREGATE the recorded usd
+# for one UTC day and compare it to BUDGET_DAILY. Consumed by the watcher's spawn-queue drain and by
+# the builder lanes' pre-spawn gate.
+
+# cost_day_total [YYYY-MM-DD] — sum the `usd` of every journal `cost` event whose ts falls on the given
+# UTC day (default: today, from `date -u`). READS the live journal PLUS its same-day rotated archives
+# (a runaway day can cross the JOURNAL_MAX_MB rotation boundary), resolved via journal.sh's _journal_file
+# so it honors the JOURNAL_FILE test seam and WORKTREES_DIR exactly like every other journal reader.
+# Pure reader, FAIL-SOFT: missing journal / no python3 / no events → prints "0". Never reprices tokens —
+# it reuses the usd the cost summer already wrote. The public seam the hermetic tests drive directly.
+cost_day_total() {
+  local day="${1:-}"
+  [ -n "$day" ] || day="$(date -u +%Y-%m-%d 2>/dev/null || true)"
+  [ -n "$day" ] || { printf '0'; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf '0'; return 0; }
+  type _journal_file >/dev/null 2>&1 || { printf '0'; return 0; }
+  local jf; jf="$(_journal_file 2>/dev/null || true)"
+  [ -n "$jf" ] || { printf '0'; return 0; }
+  HERD_BUDGET_DAY="$day" python3 -c '
+import sys, os, json, glob
+day = os.environ.get("HERD_BUDGET_DAY", "")
+jf = sys.argv[1]
+base = os.path.basename(jf)
+stem = base[:-6] if base.endswith(".jsonl") else base
+d = os.path.dirname(jf) or "."
+# Rotated archives are "<stem>-<stamp>.jsonl" (journal.sh); the live journal is jf itself.
+paths = sorted(glob.glob(os.path.join(d, stem + "-*.jsonl"))) + [jf]
+total = 0.0
+for path in paths:
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if o.get("event") != "cost":
+                continue
+            ts = o.get("ts", "")
+            if not (isinstance(ts, str) and ts[:10] == day):
+                continue
+            try:
+                total += float(o.get("usd") or 0)
+            except (TypeError, ValueError):
+                pass
+print("%.6f" % total)
+' "$jf" 2>/dev/null || printf '0'
+}
+
+# budget_daily_exceeded — return 0 (TRUE) iff BUDGET_DAILY is a positive number AND today's recorded
+# spend (cost_day_total) is strictly greater than it; on that path it ECHOES "<spent> <budget>" for the
+# caller's loud message. DORMANT by default: an EMPTY or non-numeric BUDGET_DAILY returns 1 (not
+# exceeded) with zero work — byte-identical to no budget. FAIL-SOFT throughout. This is the ONE
+# predicate the watcher drain and both lanes consult, so the ceiling can never diverge between them.
+budget_daily_exceeded() {
+  local cap="${BUDGET_DAILY:-}"
+  [ -n "$cap" ] || return 1
+  case "$cap" in ''|*[!0-9.]*) return 1 ;; esac   # non-numeric (a typo) → dormant, never enforce
+  local total; total="$(cost_day_total)"
+  # Float compare via awk (bash arithmetic is integer-only); strictly-greater = "exceeds" the ceiling.
+  awk -v t="$total" -v c="$cap" 'BEGIN { exit !((t + 0) > (c + 0)) }' || return 1
+  printf '%s %s' "$total" "$cap"
+  return 0
+}
+
 # cost_emit_merge <pr> <slug> <worktree> — BEST-EFFORT, SILENT, ALWAYS returns 0. Reads the
 # builder worktree's transcript dir, and for each component present appends a `cost` journal event
 # (via journal_append) carrying the token breakdown + priced usd. Called from do_merge before the

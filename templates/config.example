@@ -253,6 +253,18 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
 
+# Daily SPEND CEILING (HERD-95) — ENFORCE a budget, don't just measure it. `herd cost` already prices
+# every builder/review/agent session and journals a `cost` event at merge; this key turns that ledger
+# into a rail. Set it to a USD number and, when TODAY's (UTC) recorded spend EXCEEDS it, the watcher
+# PAUSES draining the spawn queue and each lane REFUSES a new builder spawn with one loud line — so a
+# runaway day stops spending instead of only surfacing when a human reads the ledger. The daily total
+# REUSES herd cost's summer (no cost math reimplemented). OVERRIDABLE: HERD_FORCE_SPAWN=1 (or a lane's
+# --force) spawns anyway (journaled), and a merge that finishes still records its cost. FAIL-SOFT: a
+# missing journal / no python3 never blocks a spawn. EMPTY (default) = DORMANT: byte-identical to no
+# budget. A non-numeric value is treated as dormant (never enforce on a typo). Watcher-affecting for the
+# drain pause (next watcher restart); the lanes read it live per spawn.
+# BUDGET_DAILY=""          # '' (default, dormant) | a USD number, e.g. 25
+
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,
 # an env failure, a reviewer that dies WITHOUT writing a verdict), GLOBALLY across all PRs. After

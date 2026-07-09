@@ -29,6 +29,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Journal (HERD-64): sourced so herd_tracked_spawn_or_abort can record a TRACKED_SPAWNS bypass.
 # Best-effort + always-0; a no-op when TRACKED_SPAWNS is off (the default).
 . "$HERE/journal.sh"
+# Daily-budget governance (HERD-95): sourced AFTER journal.sh for budget_daily_exceeded / cost_day_total,
+# the pre-spawn ceiling gate below. Defines functions only (no side effects at source time); a no-op
+# when BUDGET_DAILY is empty (the default). Guarded so an engine tree without cost.sh degrades to no gate.
+[ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # Runtime driver shim: this lane IS the start-agent capability. Under HERD_DRIVER=headless it spawns
 # a DETACHED background agent (no herdr tab/pane) via herd_driver_start_agent; the default herdr-claude
 # driver keeps the herdr tab + agent-start path below byte-identical.
@@ -52,6 +56,23 @@ TASK="${*:-}"
 # HERD_FORCE_SPAWN=1 bypasses and journals it. Off (default) → returns 0, byte-identical to today.
 if ! herd_tracked_spawn_or_abort "$SLUG" "$FORCE_SPAWN"; then
   exit 1
+fi
+
+# Daily-budget governance gate (HERD-95) — BEFORE any worktree/tab is created. When BUDGET_DAILY is set
+# and today's recorded spend (herd cost's summer, journaled at merge) has EXCEEDED it, REFUSE this spawn
+# with one loud line rather than burning more budget on a runaway day. --force / HERD_FORCE_SPAWN=1
+# overrides (and journals the override). DORMANT when BUDGET_DAILY is empty (the default): the predicate
+# returns non-zero with no work, so this block is a byte-identical no-op. Fail-soft by construction.
+if type budget_daily_exceeded >/dev/null 2>&1 && _budget_over="$(budget_daily_exceeded)"; then
+  _budget_spent="${_budget_over%% *}"; _budget_cap="${_budget_over##* }"
+  if [ "$FORCE_SPAWN" = "1" ]; then
+    echo "⚠️  daily budget exceeded (spent \$$_budget_spent > BUDGET_DAILY \$$_budget_cap) but --force set — spawning '$SLUG' anyway."
+    journal_append budget_spawn_forced slug "$SLUG" lane feature spent "$_budget_spent" budget "$_budget_cap"
+  else
+    echo "🛑 BUDGET_DAILY reached: today's spend \$$_budget_spent exceeds the \$$_budget_cap ceiling — refusing to spawn '$SLUG'. Override with HERD_FORCE_SPAWN=1 (or pass --force before the slug)." >&2
+    journal_append budget_spawn_refused slug "$SLUG" lane feature spent "$_budget_spent" budget "$_budget_cap"
+    exit 1
+  fi
 fi
 
 # Advisory pre-spawn review-gate check (BEFORE any worktree/tab is created). If the review pipeline
