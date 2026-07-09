@@ -25,6 +25,7 @@ Role summarized from each file's top-of-file comment.
 - `coordinator.sh` — (re)launch the coordinator herdr tab as a 2-pane control room:
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
+- `derived-files.sh` — the ONE list of REGENERABLE DERIVED FILES the engine writes into a project
 - `drainer-liveness.sh` — shared LIVENESS helpers for the async drainer singletons (HERD-109).
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
@@ -98,7 +99,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `cost.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
+- `agent-watch.sh` → `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -130,8 +131,9 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
+- `stale-dup-gate.sh` → `derived-files.sh`
 - `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
-- `sweep.sh` → `agent-watch.sh`
+- `sweep.sh` → `agent-watch.sh`, `derived-files.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `herd-config.sh`, `journal.sh`
@@ -161,12 +163,13 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_AUTONOMY` → `bin/herd`
-- `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`
+- `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`, `derived-files.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
 - `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`, `sweep.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `agent-watch.sh`
+- `DELTA_REVIEW` → `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`

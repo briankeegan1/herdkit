@@ -28,6 +28,13 @@
 .claude/settings.local.json
 .claude/settings.json
 
+# Rendered coordinator skill (HERD-214) — `render_skill` regenerates it from
+# templates/coordinator.md.tmpl + .herd/config on every init/update/reload/render, so a tracked copy
+# meant EVERY one of those commands dirtied the checkout it ran in (six worktree-interference
+# incidents in two days: unreapable worktrees, bogus stale-base holds, a blocked ff-only pull). Same
+# doctrine as .herd/config.local: consumers share the TEMPLATE, each machine renders its own artifact.
+.claude/commands/coordinator.md
+
 # Per-user / per-machine .herd/config overlay (HERD-47) — sourced AFTER .herd/config so its keys
 # override the committed baseline; gitignored so a collaborator's local tuning never diverges main
 # or dirties the ff-only `herd update` pull. The baseline .herd/config stays tracked.

@@ -70,12 +70,21 @@ if ! command -v _marker_live >/dev/null 2>&1; then
   unset AGENT_WATCH_LIB
 fi
 
+# The shared regenerable-derived-files list (HERD-214). Idempotent guard inside, so sourcing it here
+# is free when agent-watch.sh (above) already pulled it in.
+# shellcheck source=/dev/null
+. "$_SWEEP_HERE/derived-files.sh"
+
 # ── tunables (deliberate constants, not config keys) ─────────────────────────────────────────────
 # REGENERABLE DIRT: untracked paths a merged worktree may carry without blocking its reap. These are
 # build/test/editor droppings that any checkout regenerates for free — refusing to reap over a stray
 # .DS_Store or __pycache__ would make the sweep useless in practice (the #289 corpse incidents all
 # had them). Matched per PATH SEGMENT, so `x/__pycache__/y.pyc` is regenerable. A MODIFIED, DELETED,
-# STAGED, or RENAMED TRACKED file is NEVER regenerable, whatever its name: that is real work.
+# STAGED, or RENAMED TRACKED file is NEVER regenerable, whatever its name: that is real work — with
+# ONE exception, the shared regenerable-derived-files list from derived-files.sh (HERD-214). Those
+# paths (the rendered coordinator skill, .herd/config.local) are rewritten from committed inputs by
+# every init/update/reload/render, so they are regenerable in ANY status — including tracked-and-
+# modified, which is exactly how they appear in a worktree cut before the untracking migration.
 SWEEP_REGENERABLE_GLOBS='.DS_Store:*.log:*.pyc:*.pyo:*.tmp:__pycache__:.pytest_cache:.mypy_cache:.ruff_cache:.coverage:coverage:node_modules:.venv:venv:dist:build:target'
 
 # Basenames that mark a DETACHED worktree as engine/agent scratch, wherever it lives. A detached
@@ -150,9 +159,10 @@ _sweep_classify_dirt() {
   local dir="$1" porcelain
   porcelain="$(git -C "$dir" status --porcelain 2>/dev/null || true)"
   [ -n "$porcelain" ] || { printf 'clean'; return 0; }
-  printf '%s\n' "$porcelain" | GLOBS="$SWEEP_REGENERABLE_GLOBS" python3 -c '
+  printf '%s\n' "$porcelain" | GLOBS="$SWEEP_REGENERABLE_GLOBS" DERIVED="$(herd_derived_paths | tr '\n' ':')" python3 -c '
 import os, sys, fnmatch
 globs = [g for g in os.environ["GLOBS"].split(":") if g]
+derived = {p for p in os.environ.get("DERIVED", "").split(":") if p}
 def regenerable(path):
     # Match per path SEGMENT so nested droppings (a/__pycache__/b.pyc) classify correctly.
     for seg in path.rstrip("/").split("/"):
@@ -164,8 +174,12 @@ for line in sys.stdin.read().splitlines():
     if len(line) < 4:
         continue
     xy, path = line[:2], line[3:]
-    # A tracked file that is modified/staged/deleted/renamed is ALWAYS real work. Only an untracked
-    # ("??") path can be excused as a regenerable dropping.
+    # A DERIVED file (the rendered coordinator skill, .herd/config.local) is regenerable whatever its
+    # status: the engine rewrites it from the template + config, so no state of it is real work.
+    if path in derived:
+        continue
+    # Otherwise a tracked file that is modified/staged/deleted/renamed is ALWAYS real work. Only an
+    # untracked ("??") path can be excused as a regenerable dropping.
     if xy != "??" or not regenerable(path):
         real.append(path)
 if not real:
