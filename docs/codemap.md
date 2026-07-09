@@ -210,6 +210,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
+- `MERGE_FAIRNESS` → `agent-watch.sh`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `merge-policy.sh`, `posture-lint.sh`
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`

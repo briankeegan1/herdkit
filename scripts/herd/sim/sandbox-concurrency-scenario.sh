@@ -1003,6 +1003,221 @@ else
   _MF_OK=0
 fi
 
+# ── MERGE FAIRNESS: ready-PR priority + starvation surfacing (HERD-231) ─────────────────────────
+# The happy-path drain above ran with MERGE_FAIRNESS unset (off), proving the knob is byte-inert: the
+# candidate order was discovery order and every PR merged. Now drive the SHIPPED reorder
+# (_merge_fairness_reorder) and the SHIPPED re-stale counter (_restale_note / restale_count) through
+# the concurrency scenario's own shape — N>=3 PRs racing one base under merge pressure.
+#
+# The pressure is the incident, replayed: an expensive dispatch for one candidate takes minutes, and a
+# merge lands during it. Every PR that had gate work invested in its sha loses that sha — a lap. A PR
+# whose gates are ALREADY green has nothing left to spend and should simply MERGE, which is what the
+# reorder buys: it is visited before the pass dispatches anything for anyone else.
+#
+#   ON  → the green PR merges first, so it is NEVER re-staled; the queue drains; no PR reaches the
+#         starvation threshold; merge_fairness_priority is journaled.
+#   OFF → (fault leg) the identical rounds starve the green PR: each round a sibling's dispatch invites
+#         the merge that re-stales it before the pass ever reaches it. Past the threshold the watcher
+#         journals pr_starvation and paints `starving · N re-stale laps`. This proves the ON leg above
+#         is not vacuous — the invariant it asserts is one the engine can actually violate.
+step fairness "drive $NPRS PRs under merge pressure through the SHIPPED reorder + re-stale counter (HERD-231)"
+
+_FAIR_JOURNAL="$(_journal_file)"
+_FAIR_ROUNDS=$(( _RESTALE_STARVE_THRESHOLD + 2 ))
+_fair_prs=""; _fair_i=0
+while [ "$_fair_i" -lt "$NPRS" ]; do _fair_prs="$_fair_prs $((9001 + _fair_i))"; _fair_i=$((_fair_i+1)); done
+
+# Ledger fixtures — the reorder and the counter read NOTHING else: no gh, no git, no worktree.
+_fair_green()   { printf 'CLEAN\t\n' > "$(_health_result_file "$1" "$2")"
+                  printf '%s %s %s PASS reviewer\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_STATE"; }
+_fair_invest()  { printf '%s\n' "$$" > "$(_health_inflight_file "$1-$2")"; }   # a suite in flight
+_fair_ungreen() { rm -f "$(_health_result_file "$1" "$2")" 2>/dev/null || true; }
+# Every PR this leg invents is 9xxx, so one pattern clears all of them — including the 95xx
+# replacements the sustained-pressure run mints. A row left behind would hand the next run a
+# pre-greened PR and quietly vacate its assertions.
+_fair_reset()   {
+  rm -f "$TREES"/.health-result-9* "$TREES"/.health-inflight-9* 2>/dev/null || true
+  : > "$RESTALE_STATE"
+  grep -v " 9[0-9][0-9][0-9] " "$REVIEW_STATE" > "$REVIEW_STATE.tmp" 2>/dev/null || : > "$REVIEW_STATE.tmp"
+  mv "$REVIEW_STATE.tmp" "$REVIEW_STATE"
+  _FAIR_MARK="$(wc -l < "$_FAIR_JOURNAL" 2>/dev/null | tr -d ' ')"; _FAIR_MARK="${_FAIR_MARK:-0}"
+}
+
+# The three helpers below read the caller's `live` / `sha` / `green` arrays through bash's dynamic
+# scoping — they are round-loop internals, not general utilities.
+# Events journaled since the last _fair_reset — this leg's own signal, never the drain's.
+_fair_events() { tail -n +$(( ${_FAIR_MARK:-0} + 1 )) "$_FAIR_JOURNAL" 2>/dev/null | grep -c "\"event\":\"$1\"" || true; }
+
+# _fair_assemble — build this round's candidate arrays in DISCOVERY order (ascending PR), exactly as
+# the watcher's classify pass does, from the live set. Empty slots are reaped PRs.
+_fair_assemble() {
+  local j
+  CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
+  for ((j=0; j<${#live[@]}; j++)); do
+    [ -n "${live[j]}" ] || continue
+    CAND_IDX+=("$j"); CAND_DIR+=("$REPO"); CAND_SLUG+=("fair-${live[j]}")
+    CAND_PR+=("${live[j]}"); CAND_BRANCH+=("feat/fair-${live[j]}"); CAND_SHA+=("${sha[j]}")
+  done
+}
+
+# _fair_slot_of <pr#> — the live-array index holding this PR.
+_fair_slot_of() { local j=0; while [ "${live[j]:-}" != "$1" ]; do j=$((j+1)); done; printf '%s' "$j"; }
+
+# _fair_merge_pressure <dispatching-slot> <round> — the incident, in one call. Our expensive dispatch
+# for the head candidate takes minutes; during it ANOTHER merge lands on the base. Every sibling
+# holding an invested sha loses it: one lap, one bounce, a fresh sha, gates re-run from scratch.
+_fair_merge_pressure() {
+  local dj="$1" rnd="$2" k
+  for ((k=0; k<${#live[@]}; k++)); do
+    [ -n "${live[k]:-}" ] || continue
+    [ "$k" = "$dj" ] && continue
+    _gate_work_invested "${live[k]}" "${sha[k]}" || continue
+    [ "${green[k]}" = "1" ] && _FAIR_GREEN_RESTALED=$(( _FAIR_GREEN_RESTALED + 1 ))
+    _restale_note "${live[k]}" "${sha[k]}" "fair-${live[k]}" stale-base   # ← the SHIPPED counter
+    _fair_ungreen "${live[k]}" "${sha[k]}"
+    green[k]=0; sha[k]="sha-${live[k]}-${rnd}"
+    _fair_invest "${live[k]}" "${sha[k]}"
+  done
+}
+
+# ── LEG 1 (ON): the queue drains under pressure, and no gates-green PR is ever re-staled ────────
+# The LAST PR in discovery order arrives gates-green — PR #328's exact position: green, at the back,
+# behind siblings whose dispatches invite the merge that re-stales it.
+fair_drain_run() {
+  local mode="$1" round=0 merged=0 j alive
+  local -a live=() sha=() green=()
+  _FAIR_GREEN_RESTALED=0
+  _fair_reset
+  j=0; for p in $_fair_prs; do live[j]="$p"; sha[j]="sha-${p}-0"; green[j]=0; j=$((j+1)); done
+  local last=$((j-1))
+  green[last]=1; _fair_green "${live[last]}" "${sha[last]}"
+  for ((j=0; j<last; j++)); do _fair_invest "${live[j]}" "${sha[j]}"; done
+
+  while [ "$round" -lt "$(( NPRS * 2 + _RESTALE_STARVE_THRESHOLD ))" ]; do
+    round=$((round+1))
+    _fair_assemble
+    [ "${#CAND_PR[@]}" -gt 0 ] || break
+    MERGE_FAIRNESS="$mode" _merge_fairness_reorder            # ← the SHIPPED reorder
+    j="$(_fair_slot_of "${CAND_PR[0]}")"
+    if _cand_gates_ready "${CAND_PR[0]}" "${sha[j]}"; then
+      merged=$((merged+1)); live[j]=""; green[j]=0            # merge + reap
+    else
+      _fair_invest "${CAND_PR[0]}" "${sha[j]}"
+      _fair_merge_pressure "$j" "$round"
+      green[j]=1; _fair_green "${CAND_PR[0]}" "${sha[j]}"     # our suite finished on the fresh base
+    fi
+    alive=0; for ((j=0; j<${#live[@]}; j++)); do [ -n "${live[j]:-}" ] && alive=$((alive+1)); done
+    [ "$alive" -eq 0 ] && break
+  done
+  printf '%s' "$merged"
+}
+
+_F_MERGED="$(fair_drain_run on)"
+_F_GREENRESTALED="${_FAIR_GREEN_RESTALED:-0}"
+_F_PRIO="$(_fair_events merge_fairness_priority)"
+_F_STARVE="$(_fair_events pr_starvation)"
+_F_MAXLAPS=0
+for p in $_fair_prs; do _n="$(restale_count "$p")"; [ "$_n" -gt "$_F_MAXLAPS" ] && _F_MAXLAPS="$_n"; done
+
+if [ "${_F_GREENRESTALED:-1}" -eq 0 ]; then
+  checkpoint fairness_green_pr_never_restaled pass "MERGE_FAIRNESS=on: a gates-green PR was never re-staled — it merged before any sibling dispatch"
+else
+  checkpoint fairness_green_pr_never_restaled fail "a gates-green PR lost $_F_GREENRESTALED lap(s) despite the reorder"
+fi
+if [ "${_F_MERGED:-0}" -eq "$NPRS" ]; then
+  checkpoint fairness_queue_drained pass "all $NPRS PRs merged under sustained merge pressure"
+else
+  checkpoint fairness_queue_drained fail "only ${_F_MERGED:-0}/$NPRS PRs merged before the round budget ran out"
+fi
+if [ "${_F_MAXLAPS:-99}" -le "$_RESTALE_STARVE_THRESHOLD" ] && [ "${_F_STARVE:-1}" -eq 0 ]; then
+  checkpoint fairness_no_starvation pass "max re-stale laps=${_F_MAXLAPS} <= threshold=$_RESTALE_STARVE_THRESHOLD; no pr_starvation journaled"
+else
+  checkpoint fairness_no_starvation fail "starvation under the knob (max laps=${_F_MAXLAPS}, threshold=$_RESTALE_STARVE_THRESHOLD, pr_starvation=${_F_STARVE})"
+fi
+if [ "${_F_PRIO:-0}" -ge 1 ]; then
+  checkpoint fairness_priority_journaled pass "$_F_PRIO merge_fairness_priority event(s) — the reorder actually fired (non-vacuous)"
+else
+  checkpoint fairness_priority_journaled fail "the reorder never changed an order — the ON leg proved nothing"
+fi
+
+# ── LEG 2 (fault): SUSTAINED pressure — a control room that keeps merging ───────────────────────
+# Real merge pressure does not stop when three PRs drain: the coordinator keeps landing work. Here a
+# merged PR is immediately replaced by a fresh sibling, so the base never stops moving. TARGET is the
+# gates-green PR sitting at the back of discovery order.
+#
+#   OFF → the pass reaches a sibling first, dispatches, and the merge that lands during that dispatch
+#         re-stales TARGET. Every round. It starves, and the engine must SAY so.
+#   ON  → TARGET is promoted, merges on round 1, and never loses a lap.
+fair_pressure_run() {
+  local mode="$1" round=0 j fresh=9500
+  local -a live=() sha=() green=()
+  _FAIR_GREEN_RESTALED=0; _FAIR_TARGET_MERGED=0
+  _fair_reset
+  j=0; for p in $_fair_prs; do live[j]="$p"; sha[j]="sha-${p}-0"; green[j]=0; j=$((j+1)); done
+  local last=$((j-1)); _FAIR_TARGET="${live[last]}"
+  green[last]=1; _fair_green "${live[last]}" "${sha[last]}"
+  for ((j=0; j<last; j++)); do _fair_invest "${live[j]}" "${sha[j]}"; done
+
+  while [ "$round" -lt "$_FAIR_ROUNDS" ]; do
+    round=$((round+1))
+    _fair_assemble
+    MERGE_FAIRNESS="$mode" _merge_fairness_reorder            # ← the SHIPPED reorder
+    j="$(_fair_slot_of "${CAND_PR[0]}")"
+    if _cand_gates_ready "${CAND_PR[0]}" "${sha[j]}"; then
+      [ "${CAND_PR[0]}" = "$_FAIR_TARGET" ] && _FAIR_TARGET_MERGED=1
+      # A merged PR is replaced by a fresh sibling: the pressure never lets up.
+      fresh=$((fresh+1)); live[j]="$fresh"; sha[j]="sha-${fresh}-0"; green[j]=0
+      _fair_invest "${live[j]}" "${sha[j]}"
+      [ "$_FAIR_TARGET_MERGED" = "1" ] && break
+    else
+      _fair_invest "${CAND_PR[0]}" "${sha[j]}"
+      _fair_merge_pressure "$j" "$round"
+      # TARGET's builder rebases fast and its gates go green again — only to be passed over again.
+      local tj; tj="$(_fair_slot_of "$_FAIR_TARGET")"
+      green[tj]=1; _fair_green "$_FAIR_TARGET" "${sha[tj]}"
+    fi
+  done
+}
+
+fair_pressure_run off
+_FO_TARGET="$_FAIR_TARGET"
+_FO_GREENRESTALED="${_FAIR_GREEN_RESTALED:-0}"
+_FO_MAXLAPS="$(restale_count "$_FO_TARGET")"
+_FO_STARVE="$(_fair_events pr_starvation)"
+_FO_PRIO="$(_fair_events merge_fairness_priority)"
+_FO_ROW="$(_starvation_row "$_FO_TARGET")"
+
+if [ "${_FO_PRIO:-1}" -eq 0 ]; then
+  checkpoint fairness_off_byte_quiet pass "MERGE_FAIRNESS=off: the reorder never fired, never journaled — candidate order byte-identical"
+else
+  checkpoint fairness_off_byte_quiet fail "the knob is off but merge_fairness_priority fired ${_FO_PRIO}×"
+fi
+if [ "${_FAIR_TARGET_MERGED:-1}" -eq 0 ] && [ "${_FO_GREENRESTALED:-0}" -ge 1 ] && [ "${_FO_MAXLAPS:-0}" -gt "$_RESTALE_STARVE_THRESHOLD" ]; then
+  checkpoint fairness_off_reproduces_starvation pass "knob off: gates-green PR #$_FO_TARGET never merged, re-staled ${_FO_GREENRESTALED}× (laps=${_FO_MAXLAPS} > $_RESTALE_STARVE_THRESHOLD) — the ON leg is non-vacuous"
+else
+  checkpoint fairness_off_reproduces_starvation fail "the fault leg did not reproduce starvation (target merged=${_FAIR_TARGET_MERGED}, green re-staled=${_FO_GREENRESTALED}, laps=${_FO_MAXLAPS})"
+fi
+if [ "${_FO_STARVE:-0}" -ge 1 ] && printf '%s' "$_FO_ROW" | grep -q "starving · .* re-stale laps"; then
+  checkpoint starvation_surfaced pass "pr_starvation journaled + the loud row rendered: $(printf '%s' "$_FO_ROW" | sed 's/\x1b\[[0-9;]*m//g' | tr -s ' ')"
+else
+  checkpoint starvation_surfaced fail "starvation was not surfaced (pr_starvation=${_FO_STARVE}, row='${_FO_ROW:-<none>}')"
+fi
+
+# Same sustained pressure, knob ON: TARGET is promoted and merges instead of starving.
+fair_pressure_run on
+_FP_TARGET_MERGED="${_FAIR_TARGET_MERGED:-0}"
+_FP_LAPS="$(restale_count "$_FAIR_TARGET")"
+if [ "$_FP_TARGET_MERGED" -eq 1 ] && [ "$_FP_LAPS" -eq 0 ]; then
+  checkpoint fairness_on_rescues_starved_pr pass "same pressure, MERGE_FAIRNESS=on: the gates-green PR merged with 0 re-stale laps"
+else
+  checkpoint fairness_on_rescues_starved_pr fail "the reorder did not rescue the starved PR (merged=$_FP_TARGET_MERGED, laps=$_FP_LAPS)"
+fi
+
+# Leave no fairness fixtures behind for the scorecard/tail steps.
+rm -f "$TREES"/.health-result-9* "$TREES"/.health-inflight-9* 2>/dev/null || true
+
+
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"
@@ -1041,6 +1256,12 @@ write_scorecard() {
     printf '  "infra_breaker_tested": true,\n'
     printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
     printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"
+    printf '  "merge_fairness_tested": true,\n'
+    printf '  "restale_threshold": %d,\n' "$_RESTALE_STARVE_THRESHOLD"
+    printf '  "fairness_on_max_restale_laps": %d,\n' "${_F_MAXLAPS:-0}"
+    printf '  "fairness_on_green_restaled": %d,\n' "${_F_GREENRESTALED:-0}"
+    printf '  "fairness_off_max_restale_laps": %d,\n' "${_FO_MAXLAPS:-0}"
+    printf '  "fairness_off_starved": %s,\n' "$([ "${_FO_STARVE:-0}" -ge 1 ] && echo true || echo false)"
     printf '  "pane_captures": %d,\n' "$PANE_CAPTURES"
     printf '  "screenshots": %d,\n' "$SHOTS_TAKEN"
     printf '  "checkpoints": [\n'
