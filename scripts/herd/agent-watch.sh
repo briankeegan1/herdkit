@@ -4576,6 +4576,63 @@ Why: ${_hsd_reason}"
     agent_status_after "${_hsd_after:-unknown}" woke "$_hsd_woke" escalated "$_hsd_escalated"
 }
 
+# _stale_dup_gate_step <pr#> <slug> <worktree-dir> <headSha> <branch> <display-idx>
+# The whole PRE-MERGE STALE / DUPLICATE gate (HERD-188 + HERD-199) as ONE callable step: evaluate,
+# and on a proven hold fire the once-per-sha comment/notify/journal, run the autofix/needs-you row,
+# and re-render. Returns 0 → PROCEED, 1 → HOLD (caller `continue`s; it must dispatch NOTHING).
+#
+# WHY IT IS A FUNCTION (HERD-227 — gate ORDER). This gate used to sit inline at the very END of the
+# action pass: after the parallel review pre-dispatch and after the heavy healthcheck had to run to
+# completion. Both are expensive (an Opus review; a ~9-min suite) and both are DOOMED the instant the
+# gate holds, because a stale-base hold bounces the builder and supersedes the sha. Journal proof, PR
+# #328 on 2026-07-09: healthcheck_started 14:23:57 → CLEAN 14:26:22 → stale_dup_hold 14:26:24 →
+# bounce → the in-flight review BLOCKed at 14:29:57 on a sha nothing would ever merge. The decision
+# is deterministic (a duplicate ref, or a pure-git merge-base file overlap), so it belongs FIRST.
+# Extracting it here lets the action pass call it before any dispatch, and again (only) if the
+# pre-merge re-verify turns up a newer head sha.
+#
+# This is an ORDERING change only: the gate, its holds, its autofix and its sha-keying are unchanged.
+# It does NOT cancel work already in flight for a superseded sha (that is HERD-235's structural scope).
+#
+# FAIL-SOFT, twice over: stale_dup_check itself never holds without proof, and a nonzero return that
+# somehow carries no _STALE_DUP_KIND is treated as an evaluation error → PROCEED (today's order).
+# DRY-RUN is a strict no-op here — the pre-HERD-227 pass `continue`d before ever reaching the gate,
+# so evaluating it under dry-run would newly post PR comments.
+_stale_dup_gate_step() {
+  local _sdg_pr="$1" _sdg_slug="$2" _sdg_dir="$3" _sdg_sha="$4" _sdg_branch="$5" _sdg_idx="$6"
+  [ -n "$_sdg_sha" ] || return 0
+  [ -z "${DRYRUN:-}" ] || return 0
+  stale_dup_check "$_sdg_pr" "$_sdg_slug" "$_sdg_dir" "$_sdg_sha" "$DEFAULT_BRANCH" && return 0
+  [ -n "${_STALE_DUP_KIND:-}" ] || return 0
+
+  # The console row re-renders every tick from this live re-check; the PR comment / notify / journal
+  # of the HOLD fire once per sha (stale_dup_held_noted). NEVER auto-merges.
+  if ! stale_dup_held_noted "$_sdg_pr" "$_sdg_sha"; then
+    record_stale_dup_held "$_sdg_pr" "$_sdg_sha" "$_STALE_DUP_KIND"
+    journal_append stale_dup_hold pr "$_sdg_pr" sha "$_sdg_sha" slug "$_sdg_slug" \
+      kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
+    if [ "$_STALE_DUP_KIND" = "stale-base" ] && _stale_base_autofix_enabled; then
+      gh pr comment "$_sdg_pr" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
+
+**Why:** ${_STALE_DUP_REASON}
+
+This is a mechanical base-stale hold (touched files moved on \`${DEFAULT_BRANCH}\`). The watcher is auto-bouncing the builder to \`git merge ${DEFAULT_BRANCH}\` (or dispatching the conflict resolver if no live builder remains). Only bounce-budget exhaustion escalates to a human. (Disable the heal with \`STALE_BASE_AUTOFIX=off\`; disable the gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
+      herd_driver_notify "🔁 PR #${_sdg_pr} stale-base — auto-healing" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
+    else
+      gh pr comment "$_sdg_pr" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
+
+**Why:** ${_STALE_DUP_REASON}
+
+This PR appears to re-implement already-shipped work, or sits on a base stale enough that merging it would silently clobber newer \`${DEFAULT_BRANCH}\`. A human must resolve it: rebase onto \`${DEFAULT_BRANCH}\` and confirm the change is still needed, or close it as a duplicate. (Disable this gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
+      herd_driver_notify "🛑 PR #${_sdg_pr} held — stale/duplicate" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
+    fi
+  fi
+  _handle_stale_dup "$_sdg_pr" "$_sdg_slug" "$_sdg_sha" "$_sdg_idx" "$_sdg_dir" "$_sdg_branch" \
+    "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
+  render
+  return 1
+}
+
 # _health_needs_you_row <slug-cell> <pr-cell> <pr#> <sha> <detail> — the honest red row for a health
 # CODE ERROR that NOBODY is working: the BLOCKER (which test failed) plus the REMEDY (what to do, and
 # where to read the whole suite). Two lines, mirroring the review-blocked row's continuation line.
@@ -7454,6 +7511,19 @@ EOF
     # represents a missing REQUIRED check as "Expected / waiting", so a pending write buys nothing.
     # Only the terminal success/failure are ever posted (below).
 
+    # GATE ORDER (HERD-227): the stale/duplicate gate decides FIRST — before the parallel review
+    # pre-dispatch and before the healthcheck. It is deterministic (a duplicate tracker ref, or a
+    # pure-git merge-base file overlap) and its hold is TERMINAL for this sha: the stale-base autofix
+    # bounces the builder, superseding the very sha a review/suite would be grading. Running it last
+    # burned one ~9-min heavy suite plus one Opus review per stale cycle (PR #328, 2026-07-09). On a
+    # hold we dispatch NOTHING expensive for this sha; the hold row, comment and STALE_BASE_AUTOFIX
+    # bounce proceed exactly as before. Proceeding is byte-quiet — no events, no side effects — so a
+    # fresh-base PR's dispatch order is unchanged. Keyed on $candsha (this tick's head, free); the
+    # pre-merge re-verify below re-runs the gate only if it observes a NEWER sha.
+    if ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx"; then
+      continue
+    fi
+
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
     # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap
     # instead of running serially (review only after health lands). Byte-inert under the default serial
@@ -7532,38 +7602,14 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       fi
     fi
 
-    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188 + HERD-199). BEFORE the (expensive) review + the merge:
-    # refuse to auto-merge a PR that re-implements already-shipped work (DUPLICATE) or sits on a base so
-    # stale that a clean merge would silently clobber newer main (STALE-BASE — the #236 → revert-#280
-    # incident). Provable-only + fail-soft: off (STALE_DUP_DETECT=off), no item ref, an offline gh, or a
-    # bad worktree → proceed exactly as before. Placed ahead of the review gate so a provable duplicate
-    # never wastes an Opus review. The console row re-renders every tick from this live re-check; the PR
-    # comment/notify/journal of the HOLD fire once per sha (stale_dup_held_noted). NEVER auto-merges.
-    # HERD-199: STALE-BASE is mechanical — when STALE_BASE_AUTOFIX=on the hold path auto-bounces the
-    # builder (or dispatches the conflict resolver when there is no live builder) via the shared refix
-    # rails; only bounce-exhaustion escalates to needs-you. DUPLICATE stays a human judgment call.
-    if [ -n "$rsha" ] && ! stale_dup_check "$prnum" "$slug" "$dir" "$rsha" "$DEFAULT_BRANCH"; then
-      if ! stale_dup_held_noted "$prnum" "$rsha"; then
-        record_stale_dup_held "$prnum" "$rsha" "$_STALE_DUP_KIND"
-        journal_append stale_dup_hold pr "$prnum" sha "$rsha" slug "$slug" kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
-        if [ "$_STALE_DUP_KIND" = "stale-base" ] && _stale_base_autofix_enabled && [ -z "${DRYRUN:-}" ]; then
-          gh pr comment "$prnum" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
-
-**Why:** ${_STALE_DUP_REASON}
-
-This is a mechanical base-stale hold (touched files moved on \`${DEFAULT_BRANCH}\`). The watcher is auto-bouncing the builder to \`git merge ${DEFAULT_BRANCH}\` (or dispatching the conflict resolver if no live builder remains). Only bounce-budget exhaustion escalates to a human. (Disable the heal with \`STALE_BASE_AUTOFIX=off\`; disable the gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
-          herd_driver_notify "🔁 PR #${prnum} stale-base — auto-healing" "${slug}: ${_STALE_DUP_REASON}" default
-        else
-          gh pr comment "$prnum" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
-
-**Why:** ${_STALE_DUP_REASON}
-
-This PR appears to re-implement already-shipped work, or sits on a base stale enough that merging it would silently clobber newer \`${DEFAULT_BRANCH}\`. A human must resolve it: rebase onto \`${DEFAULT_BRANCH}\` and confirm the change is still needed, or close it as a duplicate. (Disable this gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
-          herd_driver_notify "🛑 PR #${prnum} held — stale/duplicate" "${slug}: ${_STALE_DUP_REASON}" default
-        fi
-      fi
-      _handle_stale_dup "$prnum" "$slug" "$rsha" "$idx" "$dir" "$branch" "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
-      render
+    # PRE-MERGE STALE / DUPLICATE GATE, sha-skew leg (HERD-188 + HERD-199 + HERD-227). The gate already
+    # decided against $candsha at the TOP of this candidate's pass, before any dispatch. Re-run it here
+    # ONLY when the pre-merge re-verify observed a DIFFERENT head sha (a push landed mid-tick): the merge
+    # decision is made against $rsha, and no sha may ever merge without the gate having cleared it. When
+    # the sha is unchanged (the overwhelmingly common case) this leg is a no-op — the gate is not
+    # re-evaluated and no gh calls are spent.
+    if [ -n "$rsha" ] && [ "$rsha" != "$candsha" ] \
+       && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then
       continue
     fi
 
