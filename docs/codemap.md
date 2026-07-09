@@ -13,6 +13,7 @@ Role summarized from each file's top-of-file comment.
 
 ### Engine scripts (`scripts/herd/`)
 
+- `agent-update.sh` — the AGENT_UPDATE mechanism (HERD-149): keep the AGENT RUNTIME up to date SAFELY,
 - `agent-watch.sh` — live "herd watch" status console for the coordinator.
 - `app-monitor.sh` — app-monitor.sh <port> — the left-pane app preview for a feature worktree.
 - `backlog-reconcile-sweep.sh` — periodic, ADVISORY reconcile SWEEP for backlog drift.
@@ -49,6 +50,7 @@ Role summarized from each file's top-of-file comment.
 - `layout-reconcile.sh` — the shared EYES-ON-LAYOUT helper for the herd control room.
 - `ledger.sh` — the COORDINATOR PROGRESS LEDGER (HERD-103): durable, cross-session coordinator state so
 - `new-feature.sh` — new-feature.sh <name> — spin up an isolated worktree off the latest default branch.
+- `posture-lint.sh` — the CONFIG-POSTURE DOCTOR (HERD-154): a deterministic, no-LLM, report-only lint
 - `push-gate.sh` — the shared helper for the PUSH_GATE=human hold convention (HERD-123).
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
@@ -57,18 +59,22 @@ Role summarized from each file's top-of-file comment.
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
 - `spawn.sh` — spawn.sh <slug> <lane> <task> — ENQUEUE a builder spawn intent to the durable spawn queue and
+- `stale-dup-gate.sh` — the PRE-MERGE STALE-DUPLICATE gate (HERD-188).
 - `status.sh` — pure helpers + the orchestrator behind `herd status`, a ONE-SHOT, READ-ONLY,
 - `steps.sh` — the shared PIPELINE STEPS runner (HERD-132): operator-defined lane stages with
 - `symbol-index.sh` — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
+- `triggers.sh` — SCHEDULED / TRIGGERED RUNS (HERD-169): a cron-style trigger spawns a defined workflow
 
 ### Templates (`templates/`)
 
 - `capabilities.tsv` — (tab-separated manifest — no header comment)
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
 - `conformance.tsv` — (tab-separated manifest — no header comment)
+- `connector-fetch.sh` — connector-fetch.sh (TEMPLATE) — the FETCH edge of the herdkit connector seams (HERD-170).
+- `connector-post.sh` — connector-post.sh (TEMPLATE) — the POST edge of the herdkit connector seams (HERD-170).
 - `coordinator.md.tmpl` — (render template — no header comment)
 - `fleet-coordinator.md.tmpl` — (render template — no header comment)
 - `governance-map.tsv` — templates/governance-map.tsv — the DETERMINISTIC governance-adoption pattern table (HERD-119).
@@ -81,13 +87,15 @@ Role summarized from each file's top-of-file comment.
 - `models.tsv` — (tab-separated manifest — no header comment)
 - `postures.tsv` — templates/postures.tsv — the CANONICAL CONFIG POSTURES (HERD-153): the committed, authoritative
 - `steps.example` — .herd/steps.tsv — declarative PIPELINE STEP LIST (HERD-132). Commit this (code-shaped config,
+- `triggers.example` — .herd/triggers.tsv — declarative SCHEDULED / TRIGGERED RUNS (HERD-169). Commit this (code-shaped
 
 ## Who sources whom
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `cost.sh`, `driver.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `status.sh`, `theme.sh`
-- `agent-watch.sh` → `cost.sh`, `driver.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
+- `bin/herd` → `agent-update.sh`, `cost.sh`, `driver.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
+- `agent-update.sh` → `driver.sh`, `herd-config.sh`
+- `agent-watch.sh` → `cost.sh`, `driver.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `stale-dup-gate.sh`, `steps.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -96,22 +104,23 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
 - `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`
+- `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
 - `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
-- `herd-advise.sh` → `herd-config.sh`
+- `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `journal.sh`
-- `herd-feature.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
-- `herd-quick.sh` → `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-feature.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
 - `push-gate.sh` → `herd-config.sh`, `journal.sh`
 - `research-get.sh` → `herd-config.sh`
-- `research-step.sh` → `drainer-liveness.sh`, `herd-config.sh`
+- `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
-- `scribe-step.sh` → `drainer-liveness.sh`, `herd-config.sh`, `journal.sh`
+- `scribe-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
@@ -119,12 +128,14 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `herd-config.sh`, `journal.sh`
+- `triggers.sh` → `herd-config.sh`, `journal.sh`
 
 ## Config key → consumers
 
 Which script(s) reference each `kind=config` key from `templates/capabilities.tsv`. The
 loader `herd-config.sh` (which only sets defaults) is omitted, so this shows real consumers.
 
+- `AGENT_UPDATE` → `bin/herd`, `agent-update.sh`
 - `APP_PREVIEW_CMD` → `bin/herd`, `app-monitor.sh`, `herd-feature.sh`, `herd-resolve.sh`
 - `APP_PREVIEW_HEALTH_CMD` → `app-monitor.sh`
 - `APP_PREVIEW_HEALTH_PATH` → `app-monitor.sh`
@@ -134,7 +145,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ATTRIBUTION_POLICY` → `bin/herd`, `governance-hook.sh`, `healthcheck.sh`
 - `BACKLOG_FILE` → `bin/herd`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
+- `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
+- `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
 - `CLAIM_REQUIRED` → `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
@@ -143,39 +156,41 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
-- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`
+- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`
 - `DEP_STALE_TTL` → `agent-watch.sh`, `dep-watcher.sh`
-- `DOCS_ONLY_GLOB` → `agent-watch.sh`
+- `DOCS_ONLY_GLOB` → `agent-watch.sh`, `posture-lint.sh`
 - `DOCTOR_STARTUP_HINT` → `bin/herd`, `herd-preflight.sh`
 - `DRAINER_HEARTBEAT_TIMEOUT` → `research.sh`, `scribe.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
+- `GATE_STATUS` → `agent-watch.sh`
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
+- `HEALTH_INFLIGHT_TIMEOUT` → `agent-watch.sh`
 - `HERD_BRAND` → `herd-preflight.sh`
 - `HERD_DRIVER` → `bin/herd`, `driver.sh`, `herd-preflight.sh`
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
 - `HERD_LIMIT_UNKNOWN_WAIT` → `agent-watch.sh`
-- `HERD_REPO` → `bin/herd`, `fleet.sh`, `herd-links.sh`
-- `HERD_THEME` → `theme.sh`
+- `HERD_REPO` → `bin/herd`, `herd-links.sh`
+- `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
-- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`
+- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `posture-lint.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `JOURNAL_KEEP_DAYS` → `journal.sh`
 - `JOURNAL_MAX_MB` → `journal.sh`
-- `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
-- `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`
+- `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
+- `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_METHOD` → `bin/herd`, `agent-watch.sh`
-- `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`
+- `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `posture-lint.sh`
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
 - `MODEL_ESCALATE_GLOB` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
@@ -186,38 +201,41 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MODEL_REVIEW` → `bin/herd`, `agent-watch.sh`, `herd-review.sh`
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
 - `NATIVE_BURST` → `burst.sh`
-- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`
-- `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
+- `OPERATOR_INBOX` → `agent-watch.sh`
+- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `codemap.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
+- `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
-- `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `push-gate.sh`
+- `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
 - `REVIEW_AUTOFIX` → `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`
-- `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`
-- `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`
+- `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
+- `REVIEW_INFLIGHT_TIMEOUT` → `agent-watch.sh`
 - `REVIEW_LOG_KEEP` → `herd-review.sh`
-- `REVIEW_MODEL_CHEAP` → `agent-watch.sh`
-- `REVIEW_MODEL_DOCS` → `agent-watch.sh`
+- `REVIEW_MODEL_CHEAP` → `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_MODEL_ESCALATED` → `agent-watch.sh`
 - `REVIEW_PANEL` → `herd-review.sh`
-- `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `tracker-state-sweep.sh`
+- `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SCRIBE_POLL` → `scribe-step.sh`
 - `SHARE_LINKS` → `bin/herd`, `new-feature.sh`
 - `SHIPPED_KEEP` → —
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
+- `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → —
-- `WATCHER_AUTOMERGE` → `bin/herd`, `agent-watch.sh`
+- `WATCHER_AUTOMERGE` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
-- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
-- `WATCHER_SCOPE` → `agent-watch.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`, `posture-lint.sh`
+- `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
 - `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
@@ -225,5 +243,5 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
-- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `fleet.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `fleet.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`
+- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `coordinator.sh`, `driver.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `ledger.sh`, `new-feature.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`

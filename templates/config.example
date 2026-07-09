@@ -225,6 +225,19 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # never false-holds a legit PR. off → byte-inert. Watcher-affecting (next watcher restart).
 # STALE_DUP_DETECT="on"    # on (default) | off
 
+# herd/gates commit status (HERD-194) — on (default) | off. on → as the watcher clears each (pr,sha) it
+# posts a `herd/gates` COMMIT STATUS: state=success on both-gates-green (healthcheck + adversarial
+# review), exactly once per (pr,sha). It posts ONLY success — never a non-passing pending/failure status,
+# which would flip a CLEAN sha to mergeStateStatus=UNSTABLE and strand it out of the merge loop in the
+# default unprotected config. A gate FAIL posts nothing; the fail-safe rests entirely on the ABSENCE of
+# success. Wire `require herd/gates` into GitHub branch protection (recipe: docs/governance-gates.md) so
+# the gate is FAIL-SAFE across seats + collaborators who keep merge rights: anyone may merge, but nothing
+# UNGATED can — a commit no watcher blessed has no success status and cannot merge under protection (a
+# fresh PR reports BLOCKED until the watcher gates + blesses it, so it never deadlocks). In team mode
+# (WATCHER_SCOPE=all) a sha another seat already blessed is not re-gated (cross-seat dedup). off →
+# byte-inert: no status posted, no read. Watcher-affecting (next watcher restart).
+# GATE_STATUS="on"         # on (default) | off
+
 # post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
 # health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
 # broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited

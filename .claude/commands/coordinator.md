@@ -22,15 +22,51 @@ in parallel.
    planned/shipped (✅) prose history.
 2. Get current state of in-flight work (run both, they're fast):
    - `git worktree list` — existing feature worktrees
-   - `herdr agent list` — which sub-agents are running / idle / blocked
+   - `herdr agent list` — which sub-agents are running / idle / blocked <!-- DRIVER:list-agents -->
 3. Present the menu with **AskUserQuestion**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo
    - **Add an item** — research the idea in the repo, then capture a grounded entry
    - **Curate & reprioritize** — prune to what the user needs and reorder by importance
    - **Check running agents** — show status of in-flight sub-agents and the watcher's verdicts
+   - **Workflow settings** — view or change any workflow preference (`.herd/config`) anytime
 
 After completing any action, return to this menu until the user chooses to stop.
+
+## Driver commands (herdr + Claude Code)
+
+This skill drives two **runtime-specific** surfaces: the **multiplexer** (`herdr`, which owns
+tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into
+a pane). Everything else the coordinator runs — `herd …`, `gh …`, the lane scripts under
+`/Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd` — is runtime-independent and stays the same regardless of driver.
+
+The incantations below are the **only** places this skill is bound to the herdr + Claude Code
+driver. They are the single source for that surface: every driver use elsewhere in this skill
+carries a matching `DRIVER:<capability>` marker, so the whole surface is greppable in one pass
+(`grep DRIVER:`). Each incantation is **rendered from the active driver definition** — the
+`HERD_DRIVER` config key (default `herdr-claude`) selects `templates/drivers/<driver>.driver`, whose
+`DRIVER_*` bindings are substituted into this skill at render time by the same machinery that fills
+the other tokens in this file. Behavior is **unchanged** for the default driver; a runtime swap
+replaces each capability's incantation in that one data file rather than forking this skill. The
+capability model + design is written up in `docs/driver-abstraction.md`.
+
+Capabilities this skill uses directly:
+
+- **`DRIVER:list-agents`** — `herdr agent list` — enumerate sub-agents with running / idle / blocked
+  status; also used to match agents to open PRs.
+- **`DRIVER:focus-agent`** — `herdr agent focus <slug>` — jump to (and hand off to) a builder's
+  agent by its slug.
+- **`DRIVER:send-text`** — `herdr pane run <agent-pane> "<text>"` — send a prompt or command to a
+  builder's **agent** pane; Claude Code auto-submits it (no separate keystroke). Always target the
+  agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
+  where text vanishes and the agent never wakes.
+- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code
+  runtime's model mid-session (the escalate / step-up flow).
+
+Adjacent driver capabilities the *workflow* uses but this skill does not invoke inline — the lane
+scripts spawn builders (**start-agent** / **create-tab**) and the watcher reads panes
+(**read-pane**, **send-keys**) — are catalogued in `docs/driver-abstraction.md` so phase 2 covers
+the full surface.
 
 ## How you research (important)
 
@@ -38,29 +74,50 @@ Keep your own context lean AND keep this window responsive. When you need to **l
 repo**, **enqueue the question on the async research lane** rather than reading a pile of files
 yourself:
 
-    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/research.sh "the question"
+    bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/research.sh "the question"
 
 It returns **instantly** with a `REQ_ID` and ensures ONE read-only **researcher** drainer is
 running in its own herdr pane. Fetch each result when you need it:
 
-    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/research-get.sh THE_REQ_ID
+    bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/research-get.sh THE_REQ_ID
 
 It prints the report, or `PENDING` if the drainer hasn't filed it yet. The coordinator window
 stays free. **One exception:** for a tiny instant lookup you need *right now*, do it inline.
 
 ## Implement an item
 
-1. List the 🔜 items and let the user pick one (AskUserQuestion).
+1. List the 🔜 items and let the user pick one (AskUserQuestion). **Before you offer an item, screen
+   out what another operator has already taken or planned** (two operators now share this tracker):
+   - **In flight** — skip anything already assigned / 🚧 in progress (the tracker's own state, and
+     `git worktree list`). A pre-spawn **claim** (`CLAIM_REQUIRED`, below) is the hard guard here.
+   - **Planned but not yet spawned** — run `herd backlog queued` and skip any item another operator
+     has published a 📌 marker for. This is the *plan-time* complement to claiming: it surfaces work a
+     coordinator has **sequenced to spawn next** but hasn't spawned yet, which otherwise lives only in
+     that coordinator's conversation. A marker flagged `ADVISORY: >24h stale` is **advisory only** —
+     an abandoned plan never becomes a soft lock, so you MAY pick it (say so out loud). You may also
+     override a fresh marker with an explicit reason (e.g. the other operator asked you to take it).
+     A marker is auto-superseded once the item is spawned (the claim takes over).
 2. Derive a short **kebab-case slug** (e.g. "Card CSV importer" → `card-csv-importer`). Confirm.
-3. Spawn the sub-agent — pick the lane:
+3. **Before you spawn**, run the *pre-spawn impact/conflict analysis* below if graphify is available
+   on this machine — it reads whether the candidate's file surface collides with work already in
+   flight so you can sequence instead of spawning into a conflict. Then pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
+     bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
      ```
    - **Quick lane** (trivial / non-app change — scripts, docs, config):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-quick.sh <slug> "<task>"
+     bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-quick.sh <slug> "<task>"
      ```
+   **Link a tracked item back to its tracker.** When the item you picked carries a tracker id (the
+   `#<id>` `herd backlog` prints under an API backend — e.g. `HERD-39`), prefix the lane command with
+   `HERD_ITEM_REF=<id>`. That makes the builder carry a `Refs: <id>` line in its PR body, so the
+   merge-time reconcile resolves the exact backlog item by that ref instead of fuzzy slug/title
+   matching. Under *Tracker-routed spawns* (below) you thread it on **every** spawn — file a tracker
+   item first so there is always a ref; a raw file-backend item with no id falls back to fuzzy matching:
+   ```
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-feature.sh <slug> "<task>"
+   ```
    **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
    (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
    the quick lane; anything touching judgment-heavy engine surface (`bin/herd`, the watcher,
@@ -71,16 +128,138 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
    catches the costly misjudgments.
 4. Enqueue the status change (don't edit `BACKLOG.md` yourself — see *Backlog writes*):
-   `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
-5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any.
+   `bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
+5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any. <!-- DRIVER:focus-agent -->
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `BACKLOG.md`. The
 auto-merge watcher reviews + merges ready PRs; you reconcile the backlog after.
+
+### Tracker-routed spawns — file first, then spawn (always)
+
+**Every builder you spawn must trace back to a tracked work item — no off-book spawns.** This is
+project policy, not a nicety: it keeps the tracker the single truthful picture of what is being built
+and lets merge-time reconcile link each PR to its item by an exact ref.
+
+The rule is **file-then-spawn**:
+
+1. **Ensure a tracker item exists BEFORE you spawn.** Reuse the item you picked, or — for anything not
+   already tracked — enqueue it on the scribe FIRST and use that item:
+   `bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
+   refactor, a config tweak, a docs pass, a flake fix all get an item too. If it is worth a worktree
+   and a PR, it is worth a one-line tracker entry.
+2. **Thread `HERD_ITEM_REF=<id>` on EVERY lane invocation** — feature, quick, and `spawn.sh` alike:
+   ```
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-quick.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/spawn.sh <slug> quick "<task>"
+   ```
+   The builder then carries a `Refs: <id>` line in its PR body (the exact-ref reconcile), and with
+   `CLAIM_REQUIRED` on the same id atomically **claims** the item so two operators can't double-build it.
+3. **Engine bugs get a tracker mirror.** When you escalate a HERD-ENGINE bug OUT to `briankeegan1/herdkit`
+   via `herd report` (see *Routing* below), also **mirror it as a local tracker item** (scribe-add)
+   if you intend to build the fix here, so the fix-spawn is tracked like any other — the escalation
+   filing alone is not a spawnable tracked item.
+
+**Enforcement (`TRACKED_SPAWNS`).** By default this is a discipline the coordinator follows. Set
+`TRACKED_SPAWNS=required` in `.herd/config` and the lanes + `spawn.sh` **refuse** a spawn that carries
+no tracker ref, with a loud reason — the escape hatch is `HERD_FORCE_SPAWN=1` (it journals the bypass).
+Turn it on for shared / multi-operator repos where an off-book spawn must be impossible, not merely
+discouraged; pair it with `CLAIM_REQUIRED` so every spawn is both **visible** in the tracker and
+**claimed** against a double-build.
+
+### Planned-work visibility — publish what you've sequenced next (HERD-52)
+
+Claiming (`CLAIM_REQUIRED`) closes the *spawn-time* race, but there is an earlier one: once you
+**sequence** an item to spawn next — decided, but waiting on a blocker to merge or on review
+bandwidth — that plan lives only in *your* conversation. A second operator reading the same tracker
+sees the item still open and can grab it. Close that plan-time window by publishing a lightweight
+**📌 planned marker**:
+
+    herd backlog queue <#id> --after <blocker>     # "I'm building this next, after <blocker>"
+    herd backlog queued                            # list every operator's live planned markers
+    herd backlog unqueue <#id>                     # clear it (plan dropped)
+
+**When to publish.** Whenever you decide to build an item but don't spawn it *right now* — you're
+holding it behind an in-flight worktree (the graphify *Sequence or warn* step above), waiting on
+review capacity, or lining up a batch. Publish before you move on, so the other operator's next
+`herd backlog queued` shows it.
+
+**Lifecycle (so a marker never rots into a lock).**
+- **Superseded on spawn.** When you actually spawn the item, the pre-spawn **claim** takes over as
+  the authoritative signal (assignee + 🚧). You don't have to unqueue by hand — but do it if the
+  backend keeps the marker around and it's noise.
+- **Cleared on drop.** Change your mind? `herd backlog unqueue <#id>` removes it.
+- **Advisory after 24h.** `herd backlog queued` flags any marker older than 24h `ADVISORY: >24h
+  stale`. A stale plan is informational only — never treat it as a lock; pick the item if the plan
+  was clearly abandoned.
+
+**Backend-optional + fail-soft.** On the file backend the marker is a 📌 annotation committed onto
+the item's `BACKLOG.md` line (so it also shows inline in `herd backlog`); on Linear it's a 📌
+comment on the issue. A backend that doesn't support markers prints a soft note and no-ops — the
+feature is advisory, so a missing op is never an error and never blocks a spawn. Each marker write is
+journaled (`herd log | grep tracker_write`, component `plan`) for attribution.
+
+### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
+
+Before spawning a builder — and periodically while several are in flight — check whether the
+candidate item's file surface **overlaps** work already underway, so you can *sequence* colliding
+items instead of spawning them into a merge conflict. This is the **coordinator-side third leg** of
+the graphify integration: `CONTEXT_PROVISION=codemap` grounds each *builder* in the committed
+`docs/codemap.md`, `MCP_PROVISION=graphify-mcp` gives a *builder* the graphify MCP tools, and this
+move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no Claude quota).
+
+1. **Resolve the binary, fail soft.** graphify is machine-local (PyPI `graphifyy`, usually at
+   `~/.local/bin/graphify`). Resolve it from `GRAPHIFY_BIN` in `.herd/config` — a **machine-scoped**
+   key, so set it per-machine with `herd config set GRAPHIFY_BIN <path>` (it routes to the gitignored
+   `.herd/config.local`, never the committed baseline) — falling back to `graphify` on `PATH`. If it
+   does not resolve (`command -v` fails), **skip this analysis silently**: no note, no warning, no red
+   row. It is an optional accelerator, and a missing tool is never an error — spawn as you normally
+   would.
+
+2. **Rebuild the graph LLM-free.** From `/Users/macbookpro/source/herdkit` run `"$GRAPHIFY_BIN" update --no-cluster`
+   — it writes `graphify-out/graph.json` (gitignored) with **zero** model calls, so it is cheap to
+   re-run on every spawn or periodic tick.
+
+3. **Cross the file surfaces.** For each in-flight worktree (`git worktree list`), take its changed
+   files (`git -C <worktree> diff --name-only origin/main`) and intersect: (a) each worktree's
+   set against every other worktree's, and (b) all of them against the candidate item's *likely* file
+   surface (the files the item names, plus what `docs/codemap.md` maps its subsystem to). `graph.json`
+   adds *within-file* structure — which symbols in a shared file each side touches — to sharpen a
+   same-file hit.
+
+4. **Sequence or warn.** On a real overlap, prefer to **hold the colliding candidate** until the
+   in-flight worktree merges, or spawn it with an explicit note in the task so the builder expects a
+   rebase. Non-overlapping items spawn freely in parallel. When you **hold** a candidate to sequence
+   it after the blocker, **publish that plan** so a second operator sees it (next section) —
+   `herd backlog queue <#id> --after <blocker>`.
+
+**Honest scope — file-level only.** graphify's bash **cross-file call** resolution is weak (measured
+2026-07-06: **0** cross-file call links among the big engine scripts; the ~136 repo-wide cross-file
+links are mostly imports/`contains`, not calls). Trust this for **file-level overlap detection and
+within-file structure only** — do NOT treat it as a cross-script call graph. When two items touch
+disjoint files it will not surface a call-level coupling between them; fall back to `docs/codemap.md`
+(who-sources-whom) and your own read for that.
+
+### Reconcile the backlog after a cutover / extraction / rename PR lands
+
+When a PR **moves or renames the things backlog items point at** — file paths, function names,
+section headers — entries that still reference the OLD name dangle silently once it merges. After
+such a PR lands, run the reconcile pass (it is safe on any PR — a no-op when nothing moved):
+
+    bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/backlog-reconcile.sh run <pr#>
+
+It diffs the PR's rename/move surface (git rename detection for files + defs/headers that existed
+before the PR and are gone after), finds `BACKLOG.md` entries that reference the old
+path/name, and — scribe-driven, like the reap — **enqueues ONE scribe request** to update each
+stale reference to its new location or, when old→new can't be confirmed, append a visible
+`⚠️ (dangling ref …)` flag for a human. It never edits `BACKLOG.md` itself. Preview what it
+would touch first with `backlog-reconcile.sh scan <pr#>` (prints the dangling report, or `NONE`).
 
 Never run more than the user wants in parallel — call out if 4+ agents are already in flight
 (review bandwidth, not spawn capacity, is the real limit).
 
 ### Step up a builder mid-flight
+<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands (herdr + Claude Code)" -->
 
 `MODEL_ESCALATE_GLOB` only sees the task text at spawn time — it can't know about scope you add
 later. So whenever you **expand a running builder's scope** — sending it addenda that pull in more
@@ -101,24 +280,94 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 - **Browse:** summarize the open work (`herd backlog` for the live, backend-agnostic set;
   `BACKLOG.md` for the file backend's full grouped history). For *real* status (is a 🔜
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
-- **Add:** enqueue it — the scribe does the research + writes the grounded entry:
-  `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
+- **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
+  writes the grounded entry:
+  `bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
-  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+
+### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
+
+A backlog item is a task spec in waiting: whatever you leave out here, a builder has to guess at spawn
+time. Before you hand an Add to the scribe, walk these six — the first that fails sends you back to the
+repo/journal, not to the scribe:
+
+1. **GROUNDED.** The gap is real — verified against **live code / the journal**, not memory. Cite the
+   dated evidence (a file+line, a `herd why <pr>` line, a journal event) so a stale or already-shipped
+   idea never gets filed. If you can't point at the gap, research it first (research lane) — don't file.
+2. **SHAPE.** A short **title line** (< 80 chars) FIRST, then the body — the tracker takes line 1 as the
+   title. Never open with a run-on paragraph (that files a giant duplicated title).
+3. **FIX + SURFACE.** The body names a **fix sketch AND its file surface** — the exact scripts/functions
+   the change lands in. "Fix the watcher race" is not a spec; "guard the sha-cache write in
+   `agent-watch.sh` gate loop" is.
+4. **SEQUENCING.** Call out **explicit conflicts with in-flight / queued items** — same file surface,
+   dependent order, or a rename that would dangle it. Cross it against `git worktree list` + the open
+   queue (and the pre-spawn graphify read) so it isn't filed into a collision.
+5. **VERIFICATION PLAN.** Decide up front **how the change will be proven**, and write it into the item
+   so it flows into the builder task spec at spawn. If it touches a **gate / merge / concurrency /
+   limit-park / pane** seam, name the exact **sandbox sim scenario + the seam** it exercises (see
+   *Verify GATE / MERGE …* above) — a green scorecard is the proof. Otherwise name the **test surface**
+   (which `tests/*.sh` or unit covers it). An item with no verification plan ships the builder blind.
+6. **CONVENTIONS.** Bake in the engine defaults: **fail-soft** (a missing optional tool skips silently,
+   never a red row), **ship-dormant / default-off** (new behavior rides behind a config key, off by
+   default), and **byte-identical-when-off** (with the flag off the rendered/observed output is
+   unchanged). Say which apply so the builder doesn't have to infer them.
 
 Keep every backlog edit **privacy-safe** — nothing under `.herd/secrets` and no secrets ever
 reach `BACKLOG.md` (it's committed).
+
+## Switching work-tracker backends
+
+When the operator asks to move work tracking (markdown file ↔ GitHub Issues ↔ Linear), do NOT
+hand-edit `.herd/config` or `.herd/secrets` — run the one guided command and relay its prompts:
+
+    herd backend switch <file|github|linear|changelog> [--migrate|--no-migrate]
+
+It preflights credentials BEFORE changing anything (linear: asks for the API key on a tty, stores
+it in `.herd/secrets` — gitignored, never in config — and proves it with a live API round-trip;
+github: checks `gh auth`), flips `SCRIBE_BACKEND` through the validated config-set path, offers to
+replay the old backend's open items into the new one (idempotent; titles get a
+"(migrated from …)" provenance suffix), stamps `BACKLOG.md` as a FROZEN ARCHIVE when leaving
+the file backend, restarts the backlog pane, and journals `backend_switched`. Everything downstream
+— the scribe drainer, `herd backlog`, the watcher's mark-shipped, this skill — follows
+`SCRIBE_BACKEND` automatically. Two operator-facing footnotes to pass along: retire any idle scribe
+drainer spawned under the OLD backend (the flip warns about this), and secrets NEVER go in
+`.herd/config` or the backlog file.
+
+## Workflow settings
+
+Every workflow preference lives in `.herd/config`, and the user can view or change **any** of them
+at **any** time — nothing is init-only. Drive it entirely through the validated CLI; never hand-edit
+`.herd/config` yourself:
+
+    herd config list              # print every effective key + value (secrets masked)
+    herd config get <KEY>         # read one key
+    herd config set <KEY> <VALUE> # change one key
+
+When the user picks **Workflow settings**, start with `herd config list` so they see the current
+state, then interview them (AskUserQuestion) for what to change and apply it with `herd config set`.
+Surface what the CLI guarantees so the user knows the change is safe and live:
+
+- **Validated keys** — `set` refuses any key not in the capabilities manifest, so a typo can't
+  silently write dead config.
+- **Secrets stay out** — secret-shaped keys are masked in `list`/`get` and refused by `set`;
+  credentials belong in `.herd/secrets`, never the committed config.
+- **Auto-applied, nothing init-only** — after a successful `set` the CLI *does what the change
+  requires*: a **watcher-affecting key** restarts the watcher (via `herd reload`) and a
+  **coordinator-facing key** re-renders this coordinator skill. A key needing neither is just
+  written. **Watcher-affecting changes take effect on the watcher's restart** — the CLI prints
+  which happened, so relay that back.
 
 ## Check running agents / review & merge
 
 You own **all** backlog updates — sub-agents build + open PRs, the auto-merge watcher merges them.
 
-1. `herdr agent list` + `gh pr list` to match agents to open PRs.
+1. `herdr agent list` + `gh pr list` to match agents to open PRs. <!-- DRIVER:list-agents -->
 2. **The watcher merges ready PRs automatically** — MERGEABLE+CLEAN → healthcheck + review gate →
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
 3. For a CONFLICTING PR, **do NOT hand-resolve it here** — spawn the isolated, test-gated resolver:
-   `bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-resolve.sh <slug>`
+   `bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
@@ -153,7 +402,7 @@ Round cap: `REFIX_MAX_ROUNDS` (default 3) total bounces per PR, then **needs you
 semantics mirror review-once: one bounce per BLOCK sha; a new commit resets the budget for that sha.
 
 When `REVIEW_AUTOFIX=false` (default), the watcher shows the standard **review blocked** row and
-you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane.
+you re-task builders by hand via `herdr agent focus <slug>` or by messaging the agent pane. <!-- DRIVER:focus-agent -->
 
 ### Approve pending merges (MERGE_POLICY=approve)
 
@@ -162,14 +411,60 @@ pipeline but holds before merging — posting a PR comment and a notification on
 To approve and trigger merge:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
-bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
 ```
 
 Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
 the prior approval — the gate cycle re-runs and a fresh approval is required. The watcher shows
 `ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
 yet approved.
+
+## Verify GATE / MERGE / CONCURRENCY / LIMIT-PARK / PANE behavior → reproduce in the sim FIRST
+
+When you are investigating or verifying **gate / merge / concurrency / limit-park / pane** behavior —
+or before you **trust an engine change** that touches any of those seams — reproduce it in the matching
+**sandbox sim scenario FIRST**, never against the live watcher. The sims run at **zero quota** (stub
+builders, no model call) and reset to a **byte-identical** fixture, so every run is deterministic; the
+concurrency / limit / pane scenarios drive the **shipped** watcher code in lib mode, so a green
+scorecard is real signal — they break if that code regresses:
+
+```
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
+bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
+SANDBOX_FORCE_GATE_FAIL=1 bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
+```
+
+Each writes a machine-readable `scorecard.json` (`result: pass` iff `failed == 0`) — read it, don't
+eyeball the console. `/Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/sim/README-sandbox-sim.md` catalogs the full tier table and each
+scenario's invariants. **Thread this into the builder task spec whenever you spawn a watcher-touching
+item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
+tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
+before opening the PR, so the engine change is proven against the real gate loop, not just unit tests.
+
+## Troubleshooting: setup problems or a wrong-rendering pane → `herd doctor` FIRST
+
+When something in the control room looks wrong at the environment level — a command misbehaves on a
+fresh or Windows machine, or a pane renders wrong (e.g. the backlog pane shows raw markdown / literal
+`**` and backticks instead of the pretty view) — **run `herd doctor` before anything else.** It is a
+one-pass dependency check that reports every problem at once with per-platform install hints:
+
+    herd doctor
+
+Read its output by tier:
+
+- **Hard deps block.** A missing/broken REQUIRED dep (git, gh + auth, claude, python3, herdr) is a
+  ✗ — `herd init` and the lanes cannot proceed until you install/fix it. Follow the printed `fix:` hint.
+- **Soft deps each degrade ONE named feature** (a ⚠, never a block) — install the tool to restore it:
+  - `glow` missing → the backlog pane renders **raw markdown** instead of the pretty view.
+  - `shellcheck` missing → the healthcheck **skips shell lint** (`bash -n` still runs).
+  - `bats` missing → the healthcheck runs the `*.sh` **test suite directly** instead of via bats.
+
+A degraded pane is almost always a missing soft dep, not a code bug — `herd doctor` names which one and
+how to install it. (Opt-in: set `DOCTOR_STARTUP_HINT=on` to have startup surface missing soft deps for
+you on every `herd reload` / coordinator launch.)
 
 ## Routing: APP bug vs HERD-ENGINE bug (read every time)
 
@@ -179,14 +474,14 @@ Every reported problem routes to ONE of two places:
   connector failing). → spin a **worktree in this project** (the normal feature/quick lane above).
 - **HERD-ENGINE bug** — the symptom is in the workflow itself (a lane mislabels state, the watcher
   races, the resolver guesses, a script leaks another project's assumptions). → **escalate OUT to
-  the herdkit repo**; do NOT patch it in this clone (the fix would be lost on the next
+  the engine repo (`briankeegan1/herdkit`)**; do NOT patch it in this clone (the fix would be lost on the next
   `herd upgrade` and never reach other consumers). File it:
       herd report "<symptom + which lane>"
   (opens a `gh issue` on `briankeegan1/herdkit`, stamped with this project + the lane + version pin).
 
 ## Update the engine
 
-When a fix has landed upstream in herdkit, or the user asks "how do I get the latest engine
+When a fix has landed upstream in the engine, or the user asks "how do I get the latest engine
 fix", run:
 
     herd update
@@ -195,7 +490,25 @@ It pulls HERDKIT_HOME (fast-forward only), shows the incoming delta, re-renders 
 skill preserving `.herd/config` answers, and reloads the workspace — all in one step. It refuses
 if the engine checkout is dirty or builders are mid-flight; pass `--force` to proceed anyway.
 
-## Herdkit capabilities
+**After an engine update**, an update can add new config keys the engine now understands but this
+project has not set — it silently rides their built-in defaults. `herd update`/`herd upgrade` print
+the summary automatically, or run it anytime:
+
+    herd config sync   # READ-ONLY: lists each engine key missing from .herd/config, its default + when to set it
+
+For **each missing key the operator cares about**, interview them with **AskUserQuestion** (show the
+default and its when-to-surface guidance), then apply the chosen value with `herd config set <KEY>
+<VALUE>`. **Never auto-write** — `herd config sync` only reports; the operator decides, and only the
+validated `herd config set` ever changes `.herd/config`. A key they don't care about stays on its
+default, untouched.
+
+## Herdkit capabilities — compact index
+
+_A one-line index of every command, lane, config key, lever, convention, env var, and reference. For
+the full description **and** when-to-use guidance of any item, read `/Users/macbookpro/source/herdkit-trees/herd-gates-status/docs/capabilities-overview.md`
+(curated narrative) or its machine-readable source of truth `/Users/macbookpro/source/herdkit-trees/herd-gates-status/templates/capabilities.tsv`
+(one row per item, with a `when_to_surface` column). Load those only when you need the detail — this
+index is enough to know what exists._
 
 _On every invocation, read live state to surface what is configured:_
 - Run `herd link list` — shows peers in `.herd/links` (enables `herd report --to <name>`)
@@ -203,81 +516,198 @@ _On every invocation, read live state to surface what is configured:_
 - Check `MERGE_POLICY` in `.herd/config`: empty/auto → watcher auto-merges; approve → use `herd-approve.sh`; observe → watcher never merges
 
 ### Commands (`herd <subcommand>`)
-- **herd init** — Stand up herdkit in a project: scout, interview, write .herd/config, render coordinator skill. _When: Onboarding a new project to the herd workflow for the first time._
-- **herd doctor** — One-pass dependency doctor: verify git, gh (+auth), claude, python3, herdr (+JSON contract) are present and working and that python3 can emit UTF-8 (Windows cp1252 guard, issue #31); reports every problem at once with per-platform install hints; soft deps (glow, shellcheck, bats) warn only; exits non-zero on any missing/broken hard dep. _When: When a herd command misbehaves, a fresh or Windows environment needs verifying, or the control room came up partially broken — run herd doctor to self-diagnose missing/broken dependencies in one pass._
-- **herd upgrade** — Bump HERD_VERSION and re-render the coordinator skill preserving all .herd/config answers. _When: After a herdkit engine update or when the coordinator template changes._
-- **herd render** — Re-render only the coordinator skill from the current .herd/config without bumping version. _When: When only the template changed and no version bump is needed._
-- **herd reload** — Rebuild the control room minus the coordinator: stop + relaunch the watcher with pane visibility verified, ensure the pinned backlog pane, re-render the coordinator skill; prints a per-component summary and effective MERGE_POLICY; never closes the coordinator tab/agent. _When: When .herd/config changes need to take effect, the watcher or backlog pane died or went invisible, or duplicate watchers must be cleared — safe to run from inside the coordinator._
-- **herd pane <watch|backlog|coordinator>** — Restart ONE control-room pane in place without a full reload: watch stops + reruns the watcher in its registered pane (recreated below the coordinator if gone); backlog reruns the backlog viewer in its pane, interrupting a live viewer safely first; coordinator relaunches the coordinator agent pane (KILLS the live claude session, so it requires a typed 'yes' or --yes). Each rewrites .herd-panes from observed state and prints a per-component outcome; refuses when no project .herd/config resolves. _When: When just one pane died or went stale (watcher stopped, backlog viewer stuck, coordinator session needs a fresh start) and a full 'herd reload' is more than needed — surgically restart that single pane; use 'herd reload' instead when the whole control room needs rebuilding._
-- **herd update [--force]** — Pull the herdkit engine (git pull --ff-only in HERDKIT_HOME), show the incoming delta, re-render the coordinator skill preserving .herd/config answers, and reload the workspace in one step; refuses if the engine checkout is dirty or builders are mid-flight (--force overrides both guards). _When: When a fix has landed upstream in herdkit and you need to bring it in, or when the user asks 'how do I get the latest engine fix' — answer: run herd update._
-- **herd log [--pr N] [--tail]** — Page the append-only engine journal (.herd/journal.jsonl): one readable line per gate event (review dispatch, verdict + provenance, healthcheck attempt/outcome, refix bounce, merge, reap, reload, infra death). --pr N filters to a single PR; --tail follows live. _When: When you want the raw chronological event stream, to watch gate activity live, or to see every recorded event for one PR before drilling in with herd why._
-- **herd why <pr#>** — Summarize ONE PR's full gate history from the journal, chronologically: every dispatch, verdict (with reviewer/gate_default/infra provenance), healthcheck attempt + outcome, auto-refix bounce + wake result, and the merge/reap — the first post-mortem tool for 'what happened to this PR'. _When: FIRST tool to run when the user asks what happened to a PR, why a PR is stuck, or why a gate/review/merge failed — grounds the answer in recorded events instead of process archaeology._
-- **herd backlog** — List open work items via the active SCRIBE_BACKEND (file/github/linear) in a uniform line shape. _When: Any time the coordinator needs the current open work set regardless of backend._
-- **herd report [--to <link>] "<symptom>"** — File a cross-repo issue on HERD_REPO or a peer from .herd/links via --to; deduplicates first. _When: When a HERD-ENGINE bug needs to escalate to the herdkit repo or a registered peer._
-- **herd link list** — List peer repos registered in .herd/links with their backend and routing target. _When: When reviewing cross-repo filing targets or confirming link names for herd report --to._
+- `herd init` — Stand up herdkit in a project: scout (detects lang node/python/go/rust/java), interview, write .herd/config, seed…
+- `herd doctor` — One-pass dependency doctor: verify git, gh (+auth), claude, python3, herdr (+JSON contract) are present and working and…
+- `herd upgrade` — Bump HERD_VERSION and re-render the coordinator skill preserving all .herd/config answers
+- `herd render` — Re-render only the coordinator skill from the current .herd/config without bumping version
+- `herd codemap` — Regenerate docs/codemap.md — a bash-native, DETERMINISTIC map of the herdkit engine tree scanned by…
+- `herd symbol-index` — Regenerate docs/symbol-index.md — a bash-native, DETERMINISTIC function-level def→caller index of the herdkit engine…
+- `herd ledger <set|get|list|rm|compact|path>` — The COORDINATOR PROGRESS LEDGER (HERD-103): durable, cross-session coordinator-side state keyed by tracker id so a…
+- `herd advise "<question>" [context…]` — MID-FLIGHT strong-model ADVISOR (HERD-101): a builder pulls a ONE-SHOT second opinion on a hard decision from a strong…
+- `herd reload` — Rebuild the control room minus the coordinator: stop + relaunch the watcher with pane visibility verified, ensure the…
+- `herd pane <watch|backlog|coordinator>` — Restart ONE control-room pane in place without a full reload: watch stops + reruns the watcher in its registered pane…
+- `herd update [--force]` — Pull the herdkit engine (git pull --ff-only in HERDKIT_HOME), show the incoming delta, re-render the coordinator skill…
+- `herd log [--pr N] [--tail]` — Page the append-only engine journal (.herd/journal.jsonl): one readable line per gate event (review dispatch, verdict +…
+- `herd why <pr#>` — Summarize ONE PR's full gate history from the journal, chronologically: every dispatch, verdict (with…
+- `herd status` — One-shot READ-ONLY control-room health snapshot for THIS project (deterministic, no LLM, no mutation): (a) is the…
+- `herd cost [--pr N]` — Aggregate the engine journal's token/cost events (measured per builder and per in-worktree review at merge time,…
+- `herd backlog` — List open work items via the active SCRIBE_BACKEND (file/github/linear) in a uniform line shape; subcommands: --rich…
+- `herd backend switch` — Guided work-tracker backend switch (file|github|linear|jira|changelog): preflights credentials BEFORE any change…
+- `herd report [--to <link>] [--dep] "<symptom>"` — File a cross-repo issue on HERD_REPO or a peer from .herd/links via --to; deduplicates first
+- `herd link list` — List peer repos registered in .herd/links with their backend and routing target
+- `herd depend <link>#<id>` — Record a WATCHED blocked-on dependency on a peer-repo item (link resolved via .herd/links) as a blocked-on row in…
+- `herd deps <list|rm|demote>` — Inspect and edit recorded dependencies — a dep is editable data, never stuck: list prints each dep with its current…
+- `herd config <list|get|set>` — View/validate/set .herd/config keys with the known-key set + per-key metadata sourced from templates/capabilities.tsv…
+- `herd governance <export|apply>` — Export/apply a project's GOVERNANCE as a portable, versioned profile (HERD-126)
+- `herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>` — DETERMINISTIC (no-LLM) multi-project fan-out over a flat project registry (default ~/.herd/fleet, one line per project:…
+- `herd governance hooks render [--shared]` — Render SESSION-TIME Claude Code hooks from the governance map's surface==hook rows (HERD-131)
+- `herd-approve.sh why <pr#>` — Print the latest review verdict and block reason from the review ledger and PR comment
+- `herd-approve.sh override <pr#>` — Record a sha-keyed human override so the watcher treats a cached BLOCK as passed for the PR's current commit
+- `herd conformance <report|run>` — The capability CONFORMANCE MATRIX (HERD-144): joins the capabilities manifest (templates/capabilities.tsv) against the…
+- `herd config models` — Print the model suggestions catalog (templates/models.tsv) — each ref with its tier, role-fit hint and as-of date
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/<lane>.sh`)
-- **herd-feature.sh** — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR. _When: App-facing changes where a running preview aids development; APP_PREVIEW_CMD must be set._
-- **herd-quick.sh** — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR. _When: Trivial or non-app changes: scripts, docs, config, engine fixes; no APP_PREVIEW_CMD required._
-- **herd-resolve.sh** — Isolated conflict resolver: merges default branch into worktree, fixes conflicts, verifies, pushes or escalates. _When: When the watcher surfaces a CONFLICTING PR that cannot auto-resolve._
-- **herd-approve.sh** — Approval entry-point for MERGE_POLICY=approve AND per-PR human-verify holds: list gate-passed PRs (printing any declared HUMAN-VERIFY steps) and write sha-keyed approval records. _When: When MERGE_POLICY=approve, or a PR declared a HUMAN-VERIFY block, and it has passed all gates but needs coordinator sign-off before the watcher merges._
-
-### Commands (`herd <subcommand>`)
-- **herd-approve.sh why <pr#>** — Print the latest review verdict and block reason from the review ledger and PR comment. _When: When a PR shows 'review blocked' in the watch console and the coordinator needs to understand why before deciding to fix or override._
-- **herd-approve.sh override <pr#>** — Record a sha-keyed human override so the watcher treats a cached BLOCK as passed for the PR's current commit. _When: When the coordinator decides to override a review block; a new commit invalidates the override and triggers re-review._
-
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/<lane>.sh`)
-- **dep-watcher.sh** — Polls .herd/deps for blocked-on upstream PRs; transitions items to ready when the upstream PR merges. _When: When .herd/deps exists and features are waiting on a peer-repo PR to merge first._
-- **coordinator.sh** — Launches the two-pane herd control room: backlog viewer pane and agent-watch status pane. _When: To start or restart the herd control room for a project._
-- **research.sh** — Enqueue a research question on the async research lane; returns REQ_ID instantly without blocking. _When: When the coordinator needs to look into the repo without occupying its own context window._
-- **research-get.sh** — Fetch a completed research report by REQ_ID; prints PENDING if the drainer has not filed it yet. _When: After enqueueing research with research.sh, to retrieve the result when needed._
-- **scribe.sh** — Enqueue a backlog change; a single async drainer applies it with git pull plus targeted edit so no clobber occurs. _When: Any time the coordinator updates the backlog — never edit BACKLOG_FILE directly._
-- **agent-watch.sh** — Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs; a PR whose body declares a HUMAN-VERIFY block is held for sha-keyed approval instead of auto-merging. _When: Runs continuously in the watcher pane; coordinator checks its verdicts for blocked, held, or failed PRs._
-- **herd-review.sh** — Adversarial pre-merge correctness gate invoked by the watcher before any merge. _When: Automatically invoked by agent-watch.sh; coordinator surfaces CODE failures back to the sub-agent._
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/<lane>.sh`)
+- `fleet.sh` — Helper library behind 'herd fleet' (sourced by bin/herd): the project-registry reader/writer, per-project config…
+- `herd-feature.sh` — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR
+- `herd-quick.sh` — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR
+- `herd-resolve.sh` — Isolated conflict resolver: merges default branch into worktree, fixes conflicts, verifies, pushes or escalates
+- `herd-approve.sh` — Approval entry-point for MERGE_POLICY=approve AND per-PR human-verify holds: list gate-passed PRs (printing any…
+- `push-gate.sh` — PUSH_GATE=human hold helper (HERD-123): a finished builder records a sha-keyed pre-push hold instead of pushing;…
+- `governance-hook.sh` — Session-time governance enforcer (HERD-131): the command rendered into a project's .claude/settings by `herd governance…
+- `steps.sh` — Pipeline steps runner (HERD-132): runs operator-defined stages from .herd/steps.tsv at the post-build |…
+- `triggers.sh` — Scheduled/triggered runs (HERD-169): a cron-style trigger in .herd/triggers.tsv spawns a defined workflow (a named…
+- `dep-watcher.sh` — Polls .herd/deps for blocked-on upstream PRs; transitions items to ready when the upstream PR merges
+- `coordinator.sh` — Launches the two-pane herd control room: backlog viewer pane and agent-watch status pane
+- `research.sh` — Enqueue a research question on the async research lane; returns REQ_ID instantly without blocking
+- `research-get.sh` — Fetch a completed research report by REQ_ID; prints PENDING if the drainer has not filed it yet
+- `scribe.sh` — Enqueue a backlog change; a single async drainer applies it with git pull plus targeted edit so no clobber occurs
+- `spawn.sh` — Enqueue a builder spawn intent (slug + lane=quick|feature + task text) to the durable spawn queue…
+- `backlog-reconcile.sh` — Reconcile BACKLOG.md against a merged PR's rename/move surface: diff the PR (surface = renamed/moved/deleted files via…
+- `backlog-reconcile-sweep.sh` — Periodic ADVISORY drift sweep: cross-reference open 🔜 backlog items against recently-merged PRs (gh pr list --state…
+- `governance-drift-sweep.sh` — Periodic ADVISORY governance-DRIFT sweep (HERD-125): re-extract an OPTIONAL CLAUDE.md/AGENTS.md with the SAME…
+- `agent-watch.sh` — Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs; a PR…
+- `herd-review.sh` — Adversarial pre-merge correctness gate invoked by the watcher before any merge
+- `herd-claim.sh` — Atomic pre-spawn work-item claim (HERD-50): sourced by herd-quick.sh / herd-feature.sh and called ONCE before worktree…
 
 ### Config keys (`.herd/config`)
-- **PROJECT_ROOT** — Absolute path to the project git root; all scripts derive paths from this value. _When: Always required; set by herd init; must point to the repo root._
-- **WORKTREES_DIR** — Directory where feature worktrees are created; must be a sibling of PROJECT_ROOT and never committed. _When: Always required; must exist outside the project repo before lanes are used._
-- **DEFAULT_BRANCH** — Remote/branch to fork from and merge PRs into (e.g. origin/main). _When: Always required; controls PR targets and the scribe git pull/push destination._
-- **WORKSPACE_NAME** — Human-readable project label used in coordinator title, herdr agent names, and singleton identifiers. _When: Always required; two projects sharing one herdr instance must have distinct names._
-- **BACKLOG_FILE** — Repo-relative path to the backlog file (default: BACKLOG.md). _When: Used by the file and changelog backends; can be omitted when SCRIBE_BACKEND=github or linear._
-- **SCRIBE_BACKEND** — Work-tracker backend adapter: file | github | linear | changelog. _When: Set when items are tracked in GitHub Issues or Linear instead of a markdown file._
-- **SHARE_LINKS** — Space-separated dirs to symlink into each new worktree (e.g. data .venv). _When: When worktrees need large shared dirs that should not be duplicated on disk._
-- **MODEL_COORDINATOR** — Claude model for the coordinator agent (default: claude-opus-4-8). _When: Override to trade cost for quality on coordination tasks._
-- **MODEL_FEATURE** — Claude model for full feature lane agents (default: claude-opus-4-8). _When: Override when a different model tier is preferred for feature implementation._
-- **MODEL_QUICK** — Claude model for quick lane agents (default: claude-sonnet-4-6). _When: Override for lightweight task agents._
-- **MODEL_SCRIBE** — Claude model for the async backlog scribe drainer (default: claude-sonnet-4-6). _When: Override for backlog editing tasks._
-- **MODEL_RESEARCH** — Claude model for the async researcher drainer (default: claude-sonnet-4-6). _When: Override for repo research tasks._
-- **MODEL_REVIEW** — Claude model for the adversarial pre-merge review gate (default: claude-opus-4-8). _When: Override when a different model tier is preferred for correctness review._
-- **MODEL_RESOLVER** — Claude model for the isolated conflict-resolver agent (default: claude-sonnet-4-6). _When: Override for conflict resolution; resolvers do mechanical merge work, so a cheaper tier is usually fine._
-- **TOKEN_MODE** — Token-budget mode: standard (default) | eco. eco flips the BUILT-IN model defaults to cheaper tiers (coordinator/feature→claude-sonnet-4-6; quick/scribe/research/resolver→claude-haiku-4-5; review→claude-sonnet-4-6). An explicit MODEL_* key in .herd/config ALWAYS beats eco — eco replaces built-in defaults only, never a user override. _When: Opt in to cut engine token cost. Tradeoffs: the review gate on sonnet may miss subtle logic bugs; the feature builder on sonnet is weaker on complex multi-file work; haiku is fine for mechanical scribe/resolver work. Composes with the model step-up item, which escalates FROM whatever tier eco sets._
-- **APP_PREVIEW_CMD** — Shell command to launch the live app preview pane (blank = no preview pane). _When: For projects with a runnable app; blank restricts lanes to herd-quick.sh only._
-- **HEALTHCHECK_CMD** — Project health command: exit 0 clean, exit 1 code error, exit 2 data/env tolerated. _When: Required for the heavy healthcheck profile; blank falls back to bash -n syntax check only._
-- **HEALTHCHECK_HEAVY_GLOB** — Egrep pattern of diff paths that force the heavy profile; blank means every change is heavy. _When: When only certain changed files need the full test suite (e.g. ^app/ for backend-only heavy runs)._
-- **APP_SURFACE_GLOB** — Egrep pattern of diff paths that constitute the app surface; blank (default) disables the interaction gate with zero behavior change. _When: Set for projects with an interactive app (e.g. ^app/) so the healthcheck can gate or flag widget→output interaction tests on app-facing PRs._
-- **INTERACTION_TEST_CMD** — Command that drives widgets/inputs and asserts the dependent output changed (exit 0 clean, 1 code error, 2 data/env); e.g. an st.testing.v1.AppTest harness that sets a value, re-runs, and asserts the output moved. _When: Set alongside APP_SURFACE_GLOB so an app-surface PR is gated on real interactivity; when APP_SURFACE_GLOB matches but this is blank the healthcheck emits a loud warning that a render smoke cannot see widget→output causality._
-- **SMOKE_CMD** — Optional smoke test run by herd-resolve.sh after a conflict fix before pushing. _When: When a quick integration check is faster than the full healthcheck during conflict resolution._
-- **DENY_PATHS** — Space-separated paths never committed; scribe and lanes are scoped away from these. _When: For secrets, credentials, or generated dirs that must never reach git (e.g. .herd/secrets)._
-- **REVIEW_CHECKLIST** — Repo-relative path to a project risk checklist injected into the pre-merge review gate. _When: When the review gate should verify project-specific invariants beyond generic correctness._
-- **COORDINATOR_CMD** — Slash command name for the rendered coordinator skill (default: /coordinator). _When: When the project uses a non-default coordinator command name._
-- **HERD_VERSION** — Engine contract version pinned in .herd/config; herd upgrade reads and bumps this value. _When: Internal version pin; a mismatch triggers a warning on upgrade._
-- **HERD_REPO** — GitHub repo where engine bugs escalate via herd report (e.g. owner/herdkit). _When: Required for herd report to file issues against the herdkit engine repo._
-- **WATCHER_AUTOMERGE** — Legacy boolean lever (true/false); superseded by MERGE_POLICY when set. _When: Prefer MERGE_POLICY; kept for backwards compatibility with pre-v1 configs._
-- **MERGE_POLICY** — Merge gate policy: auto (watcher merges on pass) | approve (coordinator approval required) | observe (watcher never merges). _When: Primary merge control lever; when approve, coordinator uses herd-approve.sh to sign off PRs._
-- **MERGE_METHOD** — git merge strategy used by the watcher: merge | squash | rebase. _When: Controls how PRs land; merge preserves history, squash condenses, rebase linearizes._
-- **REVIEW_CONCURRENCY** — Maximum pre-merge reviews the watcher dispatches in parallel (default: 2). _When: Raise for review throughput at higher model cost; lower to 1 to serialize reviews._
-- **HEALTH_CONCURRENCY** — Maximum healthcheck suites the watcher runs at once (default: 1 = serialize); all feature worktrees share one git object store, so overlapping suites race on shared .git locks and can paint a false-red for a clean PR — the watcher queues a PR ("health-check · queued") until a slot frees. _When: Keep at 1 unless the project's healthcheck is fully worktree-isolated (no shared object store); raise only if suites provably do not contend._
-- **REVIEW_AUTOFIX** — Auto-bounce BLOCK reviews to the builder agent: true | false (default false); when true, the watcher delivers a re-task prompt and re-tasks the idle builder on each new BLOCK sha, up to REFIX_MAX_ROUNDS. _When: Enable to remove the human re-task step after a BLOCK review; disable (default) for projects that prefer explicit coordinator approval before re-work._
-- **REFIX_MAX_ROUNDS** — Maximum auto-refix rounds per PR before escalating to "needs you" (default: 3); counts across all shas for a PR. _When: Raise for longer fix cycles; lower to 1 for a single bounce with immediate escalation; requires REVIEW_AUTOFIX=true._
-- **MODEL_ESCALATE_GLOB** — Egrep -i pattern of task text that forces the MODEL_FEATURE tier in either lane, overriding MODEL_QUICK and any per-spawn HERD_QUICK_MODEL/HERD_FEATURE_MODEL override (deterministic model step-up, analogous to HEALTHCHECK_HEAVY_GLOB); blank (default) → off. _When: Set when judgment-heavy engine surfaces keep getting routed through the cheap quick lane and misbuilding, so those tasks deterministically get the feature-tier model without a per-spawn override._
+- `PROJECT_ROOT` — Absolute path to the project git root; all scripts derive paths from this value
+- `WORKTREES_DIR` — Directory where feature worktrees are created; must be a sibling of PROJECT_ROOT and never committed
+- `DEFAULT_BRANCH` — Remote/branch to fork from and merge PRs into (e.g. origin/main)
+- `BRANCH_TEMPLATE` — Project-defined branch naming for the builder lanes (HERD-120): the template the lanes' feature branches are rendered…
+- `WORKSPACE_NAME` — Human-readable project label used in coordinator title, herdr agent names, and singleton identifiers
+- `BACKLOG_FILE` — Repo-relative path to the backlog file (default: BACKLOG.md)
+- `SHIPPED_KEEP` — How many most-recent entries the file backend keeps in BACKLOG.md's '## Recently shipped' section before older ones are…
+- `JOURNAL_MAX_MB` — Journal self-rotation threshold in MB (journal.sh): before each append, a journal grown past this is rotated to…
+- `JOURNAL_KEEP_DAYS` — How many days of rotated journal archives to retain (journal.sh); older journal-<stamp>.jsonl files are pruned
+- `SCRIBE_BACKEND` — Work-tracker backend adapter: file | github | linear | jira | changelog
+- `SCRIBE_LINGER_SECS` — Backlog-drainer linger window in seconds (HERD-88): after the scribe empties the queue, `scribe-step.sh next` keeps…
+- `SCRIBE_POLL` — Backlog-drainer base poll window in seconds (scribe-step.sh): how long `scribe-step.sh next` waits for a queued request…
+- `RESEARCH_POLL` — Research-drainer base poll window in seconds (research-step.sh): how long `research-step.sh next` waits for a queued…
+- `DRAINER_HEARTBEAT_TIMEOUT` — Drainer singleton liveness window in seconds (HERD-109)
+- `BACKLOG_VIEW_EXTRAS` — View-only backlog-pane extra section: "" (default, off → pane byte-identical to today) | github-issues
+- `SHARE_LINKS` — Space-separated dirs to symlink into each new worktree (e.g. node_modules target)
+- `MODEL_COORDINATOR` — Claude model for the coordinator agent (default: claude-opus-4-8)
+- `MODEL_FEATURE` — Claude model for full feature lane agents (eco-leaning starter default: claude-sonnet-4-6; Opus is now an ESCALATION…
+- `MODEL_QUICK` — Claude model for quick lane agents (eco-leaning starter default: claude-haiku-4-5, the cheapest tier)
+- `MODEL_SCRIBE` — Claude model for the async backlog scribe drainer (default: claude-sonnet-4-6)
+- `MODEL_RESEARCH` — Claude model for the async researcher drainer (default: claude-sonnet-4-6)
+- `MODEL_REVIEW` — Claude model for the adversarial pre-merge review gate (eco-leaning starter default: claude-sonnet-4-6; Opus is now an…
+- `MODEL_RESOLVER` — Claude model for the isolated conflict-resolver agent (default: claude-sonnet-4-6)
+- `MODEL_ADVISE` — Claude model for the `herd advise` one-shot mid-flight advisor (HERD-101): the strong tier a builder pulls a second…
+- `TOKEN_MODE` — Token-budget mode: standard (default) | eco
+- `APP_PREVIEW_CMD` — Shell command to launch the live app preview pane (blank = no preview pane)
+- `APP_PREVIEW_SERVER_ARGS` — Extra launch args appended to $APP_PREVIEW_CMD for the preview server, with a literal {port} token substituted by the…
+- `APP_PREVIEW_HEALTH_CMD` — Preview health-probe command, run with PORT exported; exit 0 = 🟢 serving
+- `APP_PREVIEW_HEALTH_PATH` — HTTP path curled at http://localhost:$PORT<path> for the preview health probe; HTTP 200 = 🟢 serving (default: /,…
+- `APP_PREVIEW_PORT_BASE` — Base of the free-port search range the feature/resolver lanes scan for the app-preview server (they try base..base+98;…
+- `HEALTHCHECK_CMD` — Project health command: exit 0 clean, exit 1 code error, exit 2 data/env tolerated
+- `HEALTHCHECK_HEAVY_GLOB` — Egrep pattern of diff paths that force the heavy profile; blank (default) means every change is heavy
+- `APP_SURFACE_GLOB` — Egrep pattern of diff paths that constitute the app surface; blank (default) disables the interaction gate with zero…
+- `INTERACTION_TEST_CMD` — Command that drives an input and asserts the dependent output changed (exit 0 clean, 1 code error, 2 data/env);…
+- `ATTRIBUTION_POLICY` — Commit-attribution lint policy (HERD-121): '' (default off — lint absent, output byte-identical) | no-ai-coauthor
+- `COMMIT_CONVENTION` — Commit-message convention lint (HERD-124): '' (default off — lint absent, output byte-identical) | an egrep pattern
+- `SMOKE_CMD` — Optional smoke test run by herd-resolve.sh after a conflict fix before pushing
+- `DENY_PATHS` — Space-separated paths never committed; scribe and lanes are scoped away from these
+- `REVIEW_CHECKLIST` — Repo-relative path to a project risk checklist injected into the pre-merge review gate
+- `COORDINATOR_CMD` — Slash command name for the rendered coordinator skill (default: /coordinator)
+- `HERD_DRIVER` — Driver binding for the coordinator skill's runtime-specific control surface (multiplexer + agent runtime): selects…
+- `HERD_VERSION` — Engine contract version pinned in .herd/config; herd upgrade reads and bumps this value
+- `HERD_REPO` — GitHub repo where engine bugs escalate via herd report (e.g. owner/herdkit)
+- `HERD_BRAND` — Display brand shown in user-facing doctor/preflight diagnostics (herd-preflight.sh); a consumer who has branded their…
+- `WATCHER_AUTOMERGE` — Legacy boolean lever (true/false); superseded by MERGE_POLICY when set
+- `MERGE_POLICY` — Merge gate policy: auto (watcher merges on pass) | approve (coordinator approval required) | observe (watcher never…
+- `HUMAN_VERIFY_POLICY` — How the watcher treats a PR that declares a HUMAN-VERIFY: block under MERGE_POLICY=auto: hold (default — today's EXACT…
+- `MERGE_METHOD` — git merge strategy used by the watcher: merge | squash | rebase
+- `PR_FLOW` — How builders open PRs: direct (open ready to merge — default, today's behavior) | draft (builder runs 'gh pr create…
+- `PR_READY_WHEN` — Who promotes a DRAFT PR to ready-for-review: builder (self, once the healthcheck passes — default) | coordinator | human
+- `PUSH_GATE` — Gate-then-upload: hold a FINISHED builder for human review BEFORE anything reaches GitHub
+- `DELETE_BRANCH_ON_MERGE` — Whether the merged head branch is auto-deleted: true | false (default false — branches are retained, today's behavior)
+- `LOCAL_REVIEW` — Pre-PR local review mode: none (default) | pre-pr | risk-scoped
+- `LOCAL_REVIEW_GLOB` — Egrep pattern of changed-file paths (git diff DEFAULT_BRANCH...HEAD --name-only) that make a LOCAL_REVIEW=risk-scoped…
+- `CONTEXT_PROVISION` — Builder context-provisioning surface: a SPACE-SEPARATED list of grounding sources injected into the STABLE region of…
+- `WATCHER_VIEW` — Watcher lens — narrows WHICH open PRs the console displays/considers each tick: all (default; unset behaves identically…
+- `WATCHER_VIEW_AUTHOR` — Filter/identity: only show PRs authored by this GitHub login; also supplies the identity for WATCHER_VIEW=mine (when…
+- `WATCHER_VIEW_ASSIGNEE` — Filter: only show PRs assigned to this GitHub login (ANDs with the lens and other filters)
+- `WATCHER_VIEW_LABEL` — Filter: only show PRs carrying this label (ANDs with the lens and other filters)
+- `WATCHER_VIEW_STATUS` — Filter: only show PRs whose mergeStateStatus equals this value, e.g. CLEAN | BLOCKED | BEHIND | UNSTABLE (ANDs with the…
+- `WATCHER_VIEW_DEPS_LABEL` — The label the `deps` lens matches on (default: dependencies)
+- `WATCHER_SCOPE` — Team-mode auto-merge ownership gate: mine (default) | all
+- `WATCHER_OWNER` — Operator identity (GitHub login) that OWNS auto-merge in team mode (WATCHER_SCOPE=all)
+- `REVIEW_CONCURRENCY` — Maximum pre-merge reviews the watcher dispatches in parallel (default: 2)
+- `SPAWN_AHEAD` — Advisory spawn-rate lead over the review gate (default: 1)
+- `HEALTH_CONCURRENCY` — Maximum healthcheck suites the watcher runs at once (default: 1 = serialize); all feature worktrees share one git…
+- `REVIEW_INFLIGHT_TIMEOUT` — Restart-safe review-dispatch timeout in seconds (HERD-185)
+- `HEALTH_INFLIGHT_TIMEOUT` — Restart-safe health-dispatch timeout in seconds (HERD-185)
+- `GATE_DISPATCH` — When the watcher's action pass fires the pre-merge review relative to the healthcheck for a (pr,sha): serial (default)…
+- `GATE_STATUS` — Whether the watcher posts a `herd/gates` COMMIT STATUS as it clears each (pr,sha): on (default) | off
+- `NATIVE_BURST` — Master switch for the native-burst bounded read-only FAN-OUT seam (scripts/herd/burst.sh): off (default) | on
+- `REVIEW_PANEL` — How many CONCURRENT read-only reviewer passes the pre-merge review runs over the SAME diff when NATIVE_BURST=on — a…
+- `INFRA_BREAKER_MAX` — INFRA-timeout circuit breaker threshold (HERD-110): after this many CONSECUTIVE INFRA failures — non-verdict reviewer…
+- `INFRA_BREAKER_COOLDOWN` — Seconds the INFRA circuit breaker (HERD-110, INFRA_BREAKER_MAX) stays OPEN before it admits a SINGLE half-open probe…
+- `WATCH_CLAUDE_PROBE_TIMEOUT` — Claude exec-hang probe timeout in seconds (HERD-108): on some environments `claude` WEDGES on invocation — every exec…
+- `REVIEW_AUTOFIX` — Auto-bounce BLOCK reviews to the builder agent: true | false (default false); when true, the watcher delivers a re-task…
+- `REFIX_MAX_ROUNDS` — Maximum auto-refix rounds per PR before escalating to "needs you" (default: 3); counts across all shas for a PR
+- `CODEMAP_AUTOREFRESH` — After a PR merges to the default branch, the watcher regenerates the committed code maps — docs/codemap.md (file-level;…
+- `MAIN_HEALTH_TICK` — After a PR merges to the default branch, the watcher runs the healthcheck suite against the freshly ff'd default-branch…
+- `WATCHER_FLAIR` — Watcher status-console FLAIR pack (HERD-147): on | off (default)
+- `OPERATOR_INBOX` — Cross-seat OPERATOR INBOX (HERD-184): so coordination messages left as comments reach an autonomous coordinator…
+- `MODEL_ESCALATE_GLOB` — Egrep -i pattern of task text that forces the MODEL_FEATURE tier in either lane, overriding MODEL_QUICK and any…
+- `REVIEW_ESCALATE_GLOB` — Egrep pattern of changed-file paths that opts into RISK-TIERED pre-merge review (analogous to HEALTHCHECK_HEAVY_GLOB /…
+- `REVIEW_MODEL_CHEAP` — Cheaper reviewer model tier used for small, low-risk diffs when REVIEW_ESCALATE_GLOB tiering is active (default:…
+- `REVIEW_ESCALATE_MAXFILES` — Under REVIEW_ESCALATE_GLOB tiering, a diff touching MORE than this many files escalates to the STRONG tier even without…
+- `DOCS_ONLY_GLOB` — Egrep pattern (HERD-89) that opts a PR's review into the cheapest DOCS tier when EVERY changed path matches it; blank…
+- `REVIEW_MODEL_DOCS` — Cheapest reviewer model tier used for pure-docs diffs when DOCS_ONLY_GLOB matches every changed path (default:…
+- `REVIEW_MODEL_ESCALATED` — Reviewer model tier the pre-merge gate ESCALATES to once a PR has burned enough failed refix rounds (agent-watch.sh):…
+- `REVIEW_EVIDENCE_ESCALATE_ROUNDS` — How many failed refix rounds a PR must accumulate before a cheap-tier reviewer PASS is distrusted and the next review…
+- `REVIEW_LOG_KEEP` — How many pre-merge review logs to retain per PR in the rolling review-log tracker (herd-review.sh); older logs fall off
+- `DEP_POLL_MIN` — Initial dep-watcher poll interval in seconds; also the value a state change resets the capped-exponential backoff to…
+- `DEP_POLL_MAX` — Maximum dep-watcher poll interval in seconds after backoff widens it while open deps sit unchanged tick-over-tick…
+- `DEP_STALE_TTL` — Seconds a still-open dep may go without movement before it surfaces as `stalled` (loudly, but never a freeze);…
+- `HERD_LIMIT_RESUME_BUFFER` — Seconds to wait AFTER the parsed reset time before relaunching a limit-blocked builder via `claude --continue` (default…
+- `HERD_LIMIT_UNKNOWN_WAIT` — Seconds to hold a limit-blocked builder before resuming when the reset time could NOT be parsed (default 18000 ≈ one 5h…
+- `COORDINATOR_WATCHDOG` — on | off (default off): opt-in coordinator auto-resume
+- `DEAD_BUILDER_AUTORESPAWN` — on | off (default off): opt-in AUTO-RESPAWN for a silently-dead pre-PR builder (agent-watch.sh)
+- `DEAD_GRACE_MIN` — Minutes a builder's DEAD signature must persist before the watcher surfaces it as dead (agent-watch.sh) — long enough…
+- `STALL_QUIET_MIN` — Minutes a working builder's worktree may stay quiet before the watcher warns of a stall (agent-watch.sh)
+- `STALE_DUP_DETECT` — Pre-merge STALE-DUPLICATE gate (HERD-188): on (default) | off
+- `TASK_PANE_VIEW` — Builder-tab task-spec viewer: on (default) | off
+- `DOCTOR_STARTUP_HINT` — Proactive soft-dependency surfacing on control-room startup (herd reload / coordinator launch): off (default) | on
+- `HERD_THEME` — Pluggable theming across all herd color surfaces: name of the active theme (default: tokyonight, the shipped built-in)
+- `CLAIM_REQUIRED` — Atomic work-item claiming gate (HERD-50): when on, the builder lanes (herd-quick.sh / herd-feature.sh) run a…
+- `TRACKED_SPAWNS` — Tracker-routed spawn enforcement (HERD-64): make "every builder is traceable to a tracked work item" a PROJECT POLICY…
+- `MCP_PROVISION` — Builder MCP tool-provisioning surface (the tools SIBLING of CONTEXT_PROVISION): a SPACE-SEPARATED list of MCP server…
+- `GRAPHIFY_BIN` — Machine-local path to the graphify call-graph binary (PyPI 'graphifyy'; usually ~/.local/bin/graphify) that the…
 
 ### State files and levers
-- **.herd/links** — Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list. _When: When filing issues against peer repos or routing engine bugs to specific trackers across services._
-- **.herd/deps** — Cross-repo dependency list polled by dep-watcher.sh; each row marks a feature as blocked-on an upstream PR. _When: When a feature waits on a peer-repo PR to merge first; dep-watcher transitions state when upstream merges._
-- **.herd/secrets** — API-backend credentials (e.g. LINEAR_API_KEY); gitignored and sourced by scribe-step and cmd_backlog. _When: Required for linear or other API backends; never put credentials in the committed .herd/config._
+- `.herd/links` — Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list
+- `.herd/deps` — Cross-repo dependency list polled by dep-watcher.sh; each row marks a feature as blocked-on an upstream PR
+- `.herd/secrets` — API-backend credentials (e.g. LINEAR_API_KEY; jira: JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN [+optional…
+- `.herd/themes` — User-defined, project-local theme directories: .herd/themes/<name>/ holding palette.sh + glow.json
+- `.herd/config.local` — Per-user / per-machine overlay for .herd/config (gitignored, HERD-47): sourced AFTER .herd/config by herd-config.sh so…
+- `.herd/steps.tsv` — Declarative PIPELINE STEP LIST (HERD-132), committed like .herd/links: one TAB-separated row per custom stage — name |…
+- `.herd/triggers.tsv` — Declarative SCHEDULED/TRIGGERED RUN LIST (HERD-169), committed like .herd/steps.tsv: one TAB-separated row per trigger…
+- `templates/postures.tsv` — The CANONICAL CONFIG POSTURES (HERD-153): the committed, authoritative set of named operating postures — solo-auto…
+- `templates/models.tsv` — Model SUGGESTIONS CATALOG (HERD-151): an advisory, perishable TSV of model refs with a coarse tier…
 
+### Conventions
+- `HUMAN-VERIFY:` — PR-body marker a builder emits to declare manual steps it could not run itself (one step per line); the watcher parses…
+- `herd-watch-<workspace>` — Per-workspace argv0 the watcher (agent-watch.sh) re-execs itself under at startup, so a running watcher is attributable…
+- `.herd-limit-sentinel` — Per-worktree sentinel file written by the rate_limit StopFailure Claude Code hook (generated into…
+- `MODEL_* ref <driver>:<model>` — Runtime-qualified MODEL_* value (HERD-151): every MODEL_* key accepts an optionally driver-qualified ref…
 
-- **HUMAN-VERIFY:** — PR-body marker a builder emits to declare manual steps it could not run itself (one step per line); the watcher parses it and holds that PR for sha-keyed approval instead of auto-merging, a new commit re-holds. _When: When a change has a manual/live verification step (smoke test, UI or pane check, running-app dependency) that the automated gates cannot exercise before merge._
+### Environment variables
+- `HERD_REQUIRE_PROJECT_CONFIG` — Console-strict config binding: set to 1 by the long-running consoles (agent-watch/herd-watch/backlog-view/coordinator)…
+- `HERD_ALLOW_FOREIGN_CWD` — Escape hatch for the launch-binding guard (issue #60): set to 1 to let a console start from a $PWD outside its resolved…
+- `HERD_LIMIT_HOOK` — Set to off to skip generating the rate_limit StopFailure hook into new worktrees (herd_write_ratelimit_hook); the…
+- `HERD_LIMIT_DETECT` — Set to off to disable usage-limit detection + auto-resume entirely (kill-switch for agent-watch.sh _detect_limit_hit);…
+- `HERD_FORCE_SPAWN` — Set to 1 to bypass the advisory pre-spawn review-gate saturation check (herd-spawn-gate.sh) and the no-tracker-ref…
+
+### Reference
+- `spawn-step.sh` — Atomic queue mechanics for the durable spawn queue, called from agent-watch.sh's _drain_spawn_queue (NOT a Claude…
+- `scripts/herd/cost.sh` — The token/cost SUMMER + PERISHABLE model→$ price table (single source of truth, dated "as of 2026-06-24")
+- `scripts/herd/layout-reconcile.sh` — The shared EYES-ON-LAYOUT helper
+- `scripts/herd/task-spec-view.sh` — The builder-tab task-spec viewer
+- `scripts/herd/theme.sh` — The HERD_THEME resolver library, sourced by every color surface
 
 ## Backlog writes — enqueue, never edit inline
 
@@ -285,7 +715,7 @@ The backlog is a planning doc, so backlog changes **commit straight to the defau
 PR. But **you never edit `BACKLOG.md` yourself.** You *enqueue* the change and a single async
 **scribe** applies it (one writer ⇒ no clobber, your window stays free):
 
-    bash /Users/macbookpro/source/herdkit-trees/model-escalate-glob/scripts/herd/scribe.sh "<the change, described in full>"
+    bash /Users/macbookpro/source/herdkit-trees/herd-gates-status/scripts/herd/scribe.sh "<the change, described in full>"
 
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git
