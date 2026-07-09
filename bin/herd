@@ -4335,8 +4335,25 @@ _reload_reparent() {
 # UNTAGGED legacy watchers (started before the argv0 marker existed) carry no marker and are NOT
 # returned here — _stop_project_watcher still reaps those via its lsof cwd/lockfile fallback.
 # Requires HERD_WATCHER_LOCK + HERD_WATCH_ARGV0 in scope (from .herd/config).
+#
+# CRITICAL EXEMPTION (HERD-217 + HERD-245): the canonical watcher FORKS its async gate workers
+# (healthcheck/review). Health worker subshells re-exec under the SAME argv0, so a live gate worker
+# is argv0-indistinguishable from a duplicate watcher. Listing it here hands it to
+# _stop_project_watcher, which SIGTERMs it — destroying in-flight gate work (the HERD-245 review-sever
+# class). Skip any pid owned by a LIVE .review-inflight-* / .health-inflight-* marker under
+# $WORKTREES_DIR (or $HERD_WORKTREES_DIR), mirroring sweep_stray_watchers' gate-worker exemption.
 _list_project_watchers() {
-  local pid argv0 seen=" "
+  local pid argv0 seen=" " live=" " f mp trees="${WORKTREES_DIR:-${HERD_WORKTREES_DIR:-}}"
+  # Live gate-worker pids (review + health inflight markers) — never list these as "watchers".
+  if [ -n "$trees" ]; then
+    for f in "$trees"/.review-inflight-* "$trees"/.health-inflight-*; do
+      [ -e "$f" ] || continue
+      mp="$(head -1 "$f" 2>/dev/null || true)"
+      case "$mp" in ''|*[!0-9]*) continue ;; esac
+      kill -0 "$mp" 2>/dev/null || continue
+      live=" $live$mp "
+    done
+  fi
   # (a) lockfile PID — the watcher this project recorded.
   if [ -f "$HERD_WATCHER_LOCK" ]; then
     pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
@@ -4349,6 +4366,8 @@ _list_project_watchers() {
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     case "$seen" in *" $pid "*) continue ;; esac
+    # Gate-worker exemption: a live inflight-marker pid is mid-flight gate work, not a stray watcher.
+    case "$live" in *" $pid "*) continue ;; esac
     # `|| true`: ps on a since-dead pid exits non-zero and, under `set -euo pipefail`, would abort
     # this function before it reaches later (still-alive) pids — dropping real strays. Neutralize it.
     argv0="$(ps -o command= -p "$pid" 2>/dev/null | awk 'NR==1{print $1}' || true)"
