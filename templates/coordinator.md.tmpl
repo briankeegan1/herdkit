@@ -197,10 +197,13 @@ review capacity, or lining up a batch. Publish before you move on, so the other 
   was clearly abandoned.
 
 **Backend-optional + fail-soft.** On the file backend the marker is a 📌 annotation committed onto
-the item's `{{BACKLOG_FILE}}` line (so it also shows inline in `herd backlog`); on Linear it's a 📌
-comment on the issue. A backend that doesn't support markers prints a soft note and no-ops — the
-feature is advisory, so a missing op is never an error and never blocks a spawn. Each marker write is
-journaled (`herd log | grep tracker_write`, component `plan`) for attribution.
+the item's `{{BACKLOG_FILE}}` line (so it also shows inline in `herd backlog`); on Linear/GitHub it's
+a 📌 comment on the issue **and** (HERD-244) the issue ASSIGNEE is set to the queuing operator so a
+second seat sees the plan in every client list/view — not only via `herd backlog queued`. `unqueue`
+clears that assignee when the queue set it (and a claim has not already taken over). A backend that
+doesn't support markers prints a soft note and no-ops — the feature is advisory, so a missing op is
+never an error and never blocks a spawn. Assignee writes are fail-soft too (comment still posts).
+Each marker write is journaled (`herd log | grep tracker_write`, component `plan`) for attribution.
 
 ### Pre-spawn impact/conflict analysis (graphify) — optional, machine-local
 

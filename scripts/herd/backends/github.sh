@@ -11,6 +11,10 @@
 #   _backend_add_item REQ_ID TEXT     — gh issue create; sets _BACKEND_RESULT=DONE|NOCHANGE
 #   _backend_mark_shipped SLUG PR_URL — gh issue close + linking comment
 #   _backend_list_open                — gh issue list --state open, one "#<n> <title>" line each
+# plus OPTIONAL planned-work markers (HERD-52 / HERD-244): _backend_queue_item /
+# _backend_unqueue_item / _backend_list_queued — a 📌 comment naming who sequenced the item after
+# what, and (HERD-244) setting/clearing the issue ASSIGNEE so the plan is visible in every GitHub
+# client, not only via `herd backlog queued`.
 #
 # Repo selection: $HERD_REPO (<owner>/<repo>) when configured, else gh falls back to the current
 # repo's default. Requires the GitHub CLI (`gh`); degrades with a clear error if it is absent.
@@ -269,4 +273,150 @@ print(next((a for a in asg if a and a != who), ""))' 2>/dev/null)"
         _CLAIM_RESULT="CLAIMED"; _CLAIM_OWNER="$who"
         _backend_tw_journal "$ref" in-progress CLAIMED   # HERD-85: a claim writes in-progress
     fi
+}
+
+# ── Planned-work markers (HERD-52 / HERD-244) — cross-operator plan-time visibility ──────────────
+# A 📌 comment of the shared shape "📌 queued by <who>: sequenced after <blocker> [<epoch>]" plus
+# (HERD-244) setting the issue ASSIGNEE so a second operator sees the plan in every GitHub client
+# view, not only via `herd backlog queued`. Fail-soft + backend-optional: transport hiccups and
+# assignee permission errors no-op that half; the comment remains the backward-compat signal.
+_GITHUB_QUEUE_MARK_RE='📌 queued by (.*?): (.*?) \[(\d+)\]'
+
+# _github_plan_set_assignee NUM WHO — fail-soft: add WHO as assignee when the issue is unassigned (or
+# already includes WHO). Never steals another operator's assignee.
+_github_plan_set_assignee() {
+    local num="$1" who="$2" info other mine
+    [ -n "$num" ] && [ -n "$who" ] || return 0
+    info="$(_gh issue view "$num" --json assignees 2>/dev/null)" || return 0
+    other="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+print(next((a for a in asg if a and a != who), ""))' 2>/dev/null)"
+    [ -z "$other" ] || return 0
+    mine="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+print("1" if who in asg else "0")' 2>/dev/null)"
+    [ "$mine" = "1" ] && return 0   # already ours — no-op
+    _gh issue edit "$num" --add-assignee "$who" >/dev/null 2>&1 || true
+}
+
+# _github_plan_clear_assignee NUM WHO — fail-soft: remove WHO when still assigned and no competing
+# assignee. Only called after a 📌 marker was actually deleted (the queue set the plan).
+_github_plan_clear_assignee() {
+    local num="$1" who="$2" info mine
+    [ -n "$num" ] && [ -n "$who" ] || return 0
+    info="$(_gh issue view "$num" --json assignees 2>/dev/null)" || return 0
+    mine="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+print("1" if who in asg else "0")' 2>/dev/null)"
+    [ "$mine" = "1" ] || return 0
+    _gh issue edit "$num" --remove-assignee "$who" >/dev/null 2>&1 || true
+}
+
+# _backend_queue_item REF WHO BLOCKER — publish a 📌 planned marker comment and set assignee to WHO
+# (API identity / WATCHER_OWNER). BLOCKER may be empty → "sequenced next". Sets
+# _BACKEND_RESULT=DONE|NOCHANGE off the comment write; assignee is fail-soft.
+_backend_queue_item() {
+    local ref="$1" who="$2" blocker="$3" num ts detail body
+    _BACKEND_RESULT="NOCHANGE"
+    _github_require_gh
+    [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+    [ -n "$who" ] || who="unknown-operator"
+    ts="$(date +%s 2>/dev/null || echo 0)"
+    if [ -n "$blocker" ]; then detail="sequenced after $blocker"; else detail="sequenced next"; fi
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then
+        echo "github backend: no open issue matching '$ref' — cannot publish a queued marker" >&2
+        return 0
+    fi
+    body="$(printf '📌 queued by %s: %s [%s]' "$who" "$detail" "$ts")"
+    if _gh issue comment "$num" --body "$body" >/dev/null 2>&1; then
+        _BACKEND_RESULT="DONE"
+    fi
+    # HERD-244: first-class assignee so the plan shows in every GitHub list/view (fail-soft).
+    _github_plan_set_assignee "$num" "$who"
+    _backend_tw_journal "$ref" queued "$_BACKEND_RESULT"
+}
+
+# _backend_unqueue_item REF WHO — delete every 📌-marker comment on the issue; when ≥1 was removed
+# and WHO is still assigned, also clear that assignee (HERD-244: clear only what the queue set).
+# Sets _BACKEND_RESULT=DONE|NOCHANGE.
+_backend_unqueue_item() {
+    local ref="$1" who="$2" num resp ids id deleted=0
+    _BACKEND_RESULT="NOCHANGE"
+    _github_require_gh
+    [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+    [ -n "$who" ] || who="unknown-operator"
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then return 0; fi
+    # Comments via REST so we get stable numeric ids for DELETE. Fail-soft on any transport miss.
+    if [ -n "${HERD_REPO:-}" ]; then
+        resp="$(gh api "repos/$HERD_REPO/issues/$num/comments" 2>/dev/null)" || resp="[]"
+    else
+        resp="$(gh api "repos/{owner}/{repo}/issues/$num/comments" 2>/dev/null)" || resp="[]"
+    fi
+    ids="$(printf '%s' "$resp" | RE="$_GITHUB_QUEUE_MARK_RE" python3 -c 'import sys, json, os, re
+rx = re.compile(os.environ["RE"])
+try: d = json.load(sys.stdin)
+except Exception: d = []
+if not isinstance(d, list): d = []
+for c in d:
+    if rx.search(c.get("body") or ""):
+        print(c.get("id", ""))' 2>/dev/null)"
+    for id in $ids; do
+        [ -n "$id" ] || continue
+        if [ -n "${HERD_REPO:-}" ]; then
+            if gh api -X DELETE "repos/$HERD_REPO/issues/comments/$id" >/dev/null 2>&1; then
+                deleted=$((deleted + 1))
+            fi
+        else
+            if gh api -X DELETE "repos/{owner}/{repo}/issues/comments/$id" >/dev/null 2>&1; then
+                deleted=$((deleted + 1))
+            fi
+        fi
+    done
+    if [ "$deleted" -gt 0 ]; then
+        _BACKEND_RESULT="DONE"
+        _github_plan_clear_assignee "$num" "$who"
+    fi
+    _backend_tw_journal "$ref" unqueued "$_BACKEND_RESULT"
+}
+
+# _backend_list_queued — print every live planned marker across open issues, one TSV line each:
+# "#<number>\t<who>\t<detail>\t<epoch>". Fail-soft: any miss prints nothing.
+_backend_list_queued() {
+    _github_require_gh
+    local nums n resp
+    nums="$(_gh issue list --state open --json number 2>/dev/null \
+      | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = []
+for it in d:
+    n = it.get("number")
+    if n is not None: print(n)' 2>/dev/null)" || return 0
+    for n in $nums; do
+        [ -n "$n" ] || continue
+        if [ -n "${HERD_REPO:-}" ]; then
+            resp="$(gh api "repos/$HERD_REPO/issues/$n/comments" 2>/dev/null)" || resp="[]"
+        else
+            resp="$(gh api "repos/{owner}/{repo}/issues/$n/comments" 2>/dev/null)" || resp="[]"
+        fi
+        printf '%s' "$resp" | RE="$_GITHUB_QUEUE_MARK_RE" NUM="$n" python3 -c 'import sys, json, os, re
+rx = re.compile(os.environ["RE"]); num = os.environ.get("NUM", "")
+try: d = json.load(sys.stdin)
+except Exception: d = []
+if not isinstance(d, list): d = []
+for c in d:
+    m = rx.search(c.get("body") or "")
+    if m:
+        print("#%s\t%s\t%s\t%s" % (num, m.group(1).strip(), m.group(2).strip(), m.group(3)))' 2>/dev/null || true
+    done
 }

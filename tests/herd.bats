@@ -199,6 +199,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver limit-park guard (HERD-246) test passes" {
+  run bash "$REPO/tests/test-resolver-limit-park.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]

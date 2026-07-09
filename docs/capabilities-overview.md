@@ -121,7 +121,7 @@ metadata is in `templates/capabilities.tsv` and viewable live with `herd config 
 
 | key | purpose |
 |---|---|
-| `MERGE_POLICY` | The primary merge lever: `auto` (watcher merges on pass) \| `approve` (coordinator sign-off via `herd-approve.sh`) \| `observe` (never merges). Supersedes the legacy `WATCHER_AUTOMERGE` boolean. |
+| `MERGE_POLICY` | The primary merge lever (**default `auto`**): `auto` (watcher merges on pass) \| `approve` (coordinator sign-off via `herd-approve.sh`) \| `observe` (never merges). Supersedes the legacy `WATCHER_AUTOMERGE` boolean; empty/unset derives from that boolean (also default true→auto). |
 | `MERGE_METHOD` | `merge` \| `squash` \| `rebase`. |
 | `DELETE_BRANCH_ON_MERGE` | `true` to clean up merged feature branches (default `false` preserves today's behavior). |
 | `PR_FLOW` / `PR_READY_WHEN` | Open PRs `direct` (default) or `draft`; and who promotes a draft to ready (`builder` / `coordinator` / `human`). Threaded into the lane rules only. |
@@ -154,6 +154,7 @@ non-HTTP preview can't be curled.
 | `DEP_POLL_MIN` / `DEP_POLL_MAX` / `DEP_STALE_TTL` | `dep-watcher.sh` cadence: initial poll, capped-exponential backoff ceiling, and the TTL after which a still-open dep with no movement surfaces as `stalled` (loudly, but still polled — never a freeze; `0` disables). |
 | `HERD_LIMIT_DETECT` / `HERD_LIMIT_HOOK` (env) | Kill-switches for usage-limit detection + auto-resume, and for generating the per-worktree `rate_limit` hook. |
 | `HERD_LIMIT_RESUME_BUFFER` / `HERD_LIMIT_UNKNOWN_WAIT` | Seconds to wait after the parsed reset before resuming a limit-blocked builder, and how long to hold when the reset time couldn't be parsed (≈ one 5h window). |
+| `COORDINATOR_WATCHDOG` | `on` \| `off` (**default off**): opt-in coordinator auto-resume, **wired** in `agent-watch.sh` (`_handle_coordinator_watchdog`, per-tick). When `on` (and the watcher has been restarted so config is re-read), the watcher revives a **confirmed** limit-parked coordinator the same way it revives builders — at reset+buffer via `claude --continue`. Only acts when a limit sentinel/banner is present **and** the agent is not `working`; never touches a healthy coordinator; a `WORKSPACE_NAME`-keyed launch lock prevents double-launch; a failed resume escalates via notification without looping. Ships **dormant**: leave off to keep the coordinator human-managed; turn on for unattended/overnight runs so a limit-hit coordinator does not strand orchestration. |
 
 ---
 
@@ -169,16 +170,3 @@ non-HTTP preview can't be curled.
   agent process vanished with no PR filed (a silent death that falls through the stall, orphan-tab,
   and limit-hit paths): a loud console row + one-shot notification so the operator knows. Detect +
   alert only; auto-respawn is deliberately deferred.
-
----
-
-## Experimental / in progress
-
-- **Coordinator auto-resume + watchdog** — builders already get a `rate_limit` hook and the watcher
-  auto-resumes them at reset, but the **coordinator** has no such watchdog: if it hits the
-  account-wide usage limit unattended it parks at Claude's interactive menu and nothing revives it,
-  halting new spawn waves and approvals until a human resumes it. A watchdog to close this
-  session-scoped seam is **in progress**, intended to land **dormant** behind a **default-off,
-  opt-in `COORDINATOR_WATCHDOG` flag** (a deliberate operator flip + watcher restart to activate).
-  **It is not yet wired in the current engine** — treat this as roadmap, not a lever you can set
-  today. See the tracking item in `BACKLOG.md`.
