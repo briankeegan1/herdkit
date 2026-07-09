@@ -163,4 +163,58 @@ chmod +x "$CBIN/claude"
 ) || fail "headless detached-launch checks failed (see FAIL above)"
 ok; echo "PASS (2) headless: routed shapes detach into the registry (cwd/env/model/forced-yolo)"
 
+# ── 3. HERD-171: ANTHROPIC_BASE_URL endpoint env injection (byte-identical when unset). ───────────
+# When the machine-scoped key is set, launch-agent injects --env ANTHROPIC_BASE_URL=… so Claude Code
+# hits the enterprise/local gateway. When unset, argv stays byte-identical to section (1).
+( set +e
+  export HERD_DRIVER="herdr-claude" PATH="$BIN:$PATH"
+  herd_resolve_workspace_id(){ printf 'ws-RESOLVED'; }
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+
+  # Unset → no --env from the endpoint helper (existing caller env still works).
+  unset ANTHROPIC_BASE_URL
+  got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
+  printf '%s\n' "$got" | grep -qF -- '--env' \
+    && { echo "FAIL: --env leaked when ANTHROPIC_BASE_URL unset"; printf '%s\n' "$got"; exit 1; }
+  # helper itself emits nothing
+  [ -z "$(herd_driver_endpoint_env_lines)" ] || { echo "FAIL: endpoint_env_lines non-empty when unset"; exit 1; }
+
+  # Set → --env ANTHROPIC_BASE_URL=<url> appears before the runtime tail.
+  export ANTHROPIC_BASE_URL="https://corp.example/v1"
+  got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
+  printf '%s\n' "$got" | grep -qF -- '[--env]' || { echo "FAIL: missing --env when URL set"; printf '%s\n' "$got"; exit 1; }
+  printf '%s\n' "$got" | grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' \
+    || { echo "FAIL: missing ANTHROPIC_BASE_URL value in argv"; printf '%s\n' "$got"; exit 1; }
+  # composes with an explicit caller env (both present)
+  got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 env=RESEARCH_TAB=x model=opus flags=--dangerously-skip-permissions pointer=P)"
+  printf '%s\n' "$got" | grep -qF -- '[RESEARCH_TAB=x]' || { echo "FAIL: caller env dropped"; printf '%s\n' "$got"; exit 1; }
+  printf '%s\n' "$got" | grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' \
+    || { echo "FAIL: endpoint env dropped when composing with caller env"; printf '%s\n' "$got"; exit 1; }
+  exit 0
+) || fail "HERD-171 endpoint env injection checks failed (see FAIL above)"
+ok; echo "PASS (3) HERD-171: ANTHROPIC_BASE_URL injects --env when set, silent when unset"
+
+# Headless inherits the endpoint export into the detached child.
+( set +e
+  export HERD_DRIVER="headless" PATH="$CBIN:$PATH" WORKTREES_DIR="$T/proj-ep" ANTHROPIC_BASE_URL="http://127.0.0.1:9"
+  mkdir -p "$WORKTREES_DIR/.herd" "$T/repo"
+  # Rebuild a claude stub that prints the endpoint env.
+  cat > "$CBIN/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<unset>}"
+sleep 0.2
+STUB
+  chmod +x "$CBIN/claude"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  herd_driver_launch_agent name=ep-local cwd="$T/repo" model=haiku flags=--dangerously-skip-permissions pointer=P \
+    || { echo "FAIL: headless endpoint launch rc"; exit 1; }
+  sleep 0.4
+  grep -qF "ANTHROPIC_BASE_URL=http://127.0.0.1:9" "$WORKTREES_DIR/.herd/agents/ep-local/log" \
+    || { echo "FAIL: headless child missing ANTHROPIC_BASE_URL"; cat "$WORKTREES_DIR/.herd/agents/ep-local/log"; exit 1; }
+  exit 0
+) || fail "HERD-171 headless endpoint export checks failed (see FAIL above)"
+ok; echo "PASS (4) HERD-171: headless detached child inherits ANTHROPIC_BASE_URL"
+
 echo "ALL PASS ($pass checks)"
