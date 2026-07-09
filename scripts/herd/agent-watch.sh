@@ -4154,6 +4154,66 @@ _self_restart_tick() {
 # _main_fresh_clear — back to fresh: drop the held row (the journal already recorded the transition).
 _main_fresh_clear() { rm -f "$MAIN_FRESH_STATE" 2>/dev/null || true; }
 
+# _main_fresh_recovered — the held row's condition is GONE. Drop the state file and journal the
+# transition ONCE (mirrors _main_health_clear: the file's presence IS the "was held" flag, so reading
+# it before the rm is what makes the event fire exactly once). Never called on a happy-path tick —
+# _main_fresh_recheck's first guard is the state file's existence.
+_main_fresh_recovered() {
+  local _mv_reason _mv_b _mv_a
+  read -r _mv_reason _mv_b _mv_a < "$MAIN_FRESH_STATE" 2>/dev/null || true
+  _main_fresh_clear
+  journal_append main_fresh_recovered reason "${_mv_reason:-unknown}" \
+    was_behind "${_mv_b:-0}" was_ahead "${_mv_a:-0}"
+  return 0
+}
+
+# _main_fresh_recheck — the OBSERVED-state recovery probe (HERD-259). The held row is a STATE FILE, and
+# before this every path that could delete it sat BELOW a defer in reconcile_main_freshness: a live gate
+# marker, a failed fetch, or a $MAIN parked off-branch all returned early, so a row whose condition had
+# already healed kept painting. It also outlived a watcher restart — startup drops $MAIN_FRESH_RESTART
+# (see the one-shot sweep below the tick loop) but never re-validated $MAIN_FRESH_STATE, and the render
+# pass runs ABOVE the reconcile in the tick, so the first paint of the new process trusted the stale
+# file. Live incident 2026-07-09: 'dirty-tree 4 0' held for 20+ minutes across a restart on a checkout
+# that was clean and current, until a human deleted the file.
+#
+# So the row is re-derived from OBSERVED git state every tick, ABOVE every defer, on both the render and
+# reconcile paths. It is READ-ONLY on the repo (status + rev-list, no fetch, no network, no tree
+# mutation), which is exactly why it is safe to run while a gate owns the tree — the reason the reconcile
+# proper cannot.
+#
+# CLEARS ONLY ON PROVABLE FRESHNESS — clean tree AND zero behind AND zero ahead. "Not behind" alone would
+# wipe a real `local-commits` hold (clean tree, 0 behind, N ahead is precisely that red), the same way a
+# vacuous rc-0 would wipe a real MAIN RED (see _main_health_clear's warning). Anything else — dirty,
+# behind, ahead, unreadable — leaves the file exactly as it was for the reconcile to re-decide.
+#
+# The behind/ahead counts come from the LOCAL remote-tracking ref (no fetch of our own). A row cleared
+# against a ref that has since moved is not a lie: the hold's condition (a dirty tree, a divergence this
+# checkout no longer has) is observably gone, and the reconcile below fetches and re-holds on the same
+# tick if $MAIN is genuinely stale again.
+#
+# Byte-inert on the happy path: with no state file the first test returns, so a fresh $MAIN costs one
+# `[ -s ]` and touches no git.
+_main_fresh_recheck() {
+  [ -s "${MAIN_FRESH_STATE:-}" ] || return 0
+  [ -n "${DRYRUN:-}" ] && return 0            # an observation run mutates no state (as the reconcile does not)
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
+    || return 0
+  local _mk_up _mk_dirty _mk_counts _mk_ahead _mk_behind
+  _mk_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  git -C "$MAIN" rev-parse --verify --quiet "$_mk_up" >/dev/null 2>&1 || return 0
+  _mk_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  [ -n "$_mk_dirty" ] && return 0
+  _mk_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mk_up" 2>/dev/null || true)"
+  _mk_ahead="$(printf '%s' "$_mk_counts" | awk '{print $1}')"
+  _mk_behind="$(printf '%s' "$_mk_counts" | awk '{print $2}')"
+  case "${_mk_ahead:-x}${_mk_behind:-x}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_mk_ahead" -eq 0 ] && [ "$_mk_behind" -eq 0 ] || return 0
+  _main_fresh_recovered
+  return 0
+}
+
 # _main_fresh_hold <reason> <behind> <ahead> — surface an unhealable divergence: persist the row and
 # journal it ONCE (a reason that has not changed since the last tick paints, but does not re-journal).
 _main_fresh_hold() {
@@ -4201,6 +4261,10 @@ reconcile_main_freshness() {
   # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
   [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
     || return 0
+  # HERD-259: a standing held row is re-derived from observed git state BEFORE any defer below it —
+  # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
+  # fetch is failing. Read-only, and a no-op when no row is held.
+  _main_fresh_recheck
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
 
@@ -6527,9 +6591,26 @@ _handle_stale_dup() {
     return 0
   fi
 
-  # OFF / dry-run: byte-identical to the pre-HERD-199 hold — no bounce, no ledger, no resolver.
+  # OFF / dry-run: no bounce, no ledger, no resolver — the rebase is somebody's to do by hand.
+  #
+  # ROW TRUTH (HERD-259): "somebody" is often the builder itself, and this row lied about it. Every
+  # sibling stale-base row consults agent activity before shouting for a human (_active_fix_note's
+  # clause (b), the working-agent guards on the heal paths) — but the OFF path, which is the SHIP
+  # DEFAULT and therefore the row most operators actually see, escalated unconditionally. An operator
+  # who context-switches into a rebase a live builder is already running is exactly the expensive lie
+  # HERD-173 set out to remove. Mirror the same POSITIVE-signal-only check: an agent reading `working`
+  # renders fix-in-progress; a blind/absent `herdr agent list` yields no positive signal and falls
+  # through to the honest needs-you. Same one-way strength as clause (b) — a needs-you row is
+  # trustworthy, a fix-in-progress row can be a busy agent doing something else, and the next idle tick
+  # corrects it. DUPLICATE never reaches here (it returned above): it is a judgment call, always human.
+  # Nothing but the rendered string changes — no dispatch, no ledger write, no refix round, on either
+  # branch — so an idle builder's row stays byte-identical to before.
   if ! _stale_base_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
-    DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}fix in progress · builder working · stale base held${C_RESET}"
+    else
+      DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    fi
     return 0
   fi
 
@@ -9684,6 +9765,13 @@ _startup_reap_sweep
 # restart that got us here. Drop it, or the row would outlive the condition it warns about.
 rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
 
+# …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
+# to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved
+# came back with the new process. Both freshness rows are now derived from observed state at startup.
+# (The tick loop re-derives it before every render too; this one-shot is what makes the FIRST paint of a
+# new process honest, since nothing else has run yet.)
+_main_fresh_recheck
+
 # One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
 # or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
 # panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
@@ -9714,6 +9802,11 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
+  # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
+  # row whose condition healed while this watcher was down paints for a whole tick after every restart —
+  # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
+  _main_fresh_recheck
   build_main_freshness
   build_sweep_note
 
