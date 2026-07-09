@@ -517,6 +517,17 @@ fi
 : "${STALE_DUP_DETECT:="on"}"    # HERD-188: pre-merge STALE-DUPLICATE gate — on (default) | off. on → the watcher HOLDS (never auto-merges) a PR whose tracked item ref is already Done via another merged PR, or whose touched files were materially changed on the base branch by a merge the branch predates (a stale base). Provable-only + fail-soft (no ref / offline / bad worktree → no hold), so default-on never false-holds a legit PR. off → byte-inert. Consumed by agent-watch.sh via stale-dup-gate.sh
 : "${WATCHER_FLAIR:="off"}"      # HERD-147: watcher-console flair pack — on → a post-merge celebration line + a pasture header rendering the in-flight herd by state (🐑 grazing / 💤 idle / ✅ in the pen); off (default) → byte-inert: every console byte identical to before. ADDITIVE cosmetic only — NEVER softens a red/dead/needs-you row, never touches a gate/merge
 : "${OPERATOR_INBOX:="off"}"     # HERD-184: cross-seat OPERATOR INBOX — on → the watcher surfaces NEW comments by OTHER authors (PR comments on open PRs this seat authors/gates + tracker comments on items this seat claimed, via the active SCRIBE_BACKEND's optional comment reader) as a 'operator inbox' console section + one notify-once per comment. off (default) → byte-inert: no reader runs, no fetch, no section, every console byte identical to before. ADDITIVE + FAIL-SOFT (missing/api error = empty inbox, never a red row); never touches a gate/merge
+# BUDGET_DAILY (HERD-95) — daily SPEND CEILING in USD that ENFORCES, not just measures. herd cost
+# already prices every builder/review/agent session and journals a `cost` event at merge; this key
+# turns that ledger into a rail. When today's (UTC) recorded cost total exceeds BUDGET_DAILY the
+# watcher PAUSES spawn-queue draining (agent-watch.sh _drain_spawn_queue) and each lane (herd-quick.sh
+# / herd-feature.sh) REFUSES a new spawn with one loud line — so a runaway day stops spending instead
+# of only surfacing when a human reads the ledger. The daily total REUSES herd cost's summer
+# (cost.sh cost_day_total) — no cost math is reimplemented. FAIL-SOFT + overridable: HERD_FORCE_SPAWN=1
+# (or a lane's --force) spawns anyway (journaled); a missing journal / no python3 never blocks. EMPTY
+# (default) = DORMANT: the gate returns immediately and behavior is byte-identical to no budget. A
+# non-numeric value is treated as dormant (never enforce on a typo). Consumed by agent-watch.sh + the lanes.
+: "${BUDGET_DAILY:=""}"          # '' (default, dormant) | a USD number, e.g. 25 — daily spend ceiling; see capabilities.tsv / cost.sh
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health
