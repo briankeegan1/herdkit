@@ -56,8 +56,9 @@ Capabilities this skill uses directly:
   status; also used to match agents to open PRs.
 - **`DRIVER:focus-agent`** — `herdr agent focus <slug>` — jump to (and hand off to) a builder's
   agent by its slug.
-- **`DRIVER:send-text`** — `herdr pane run <agent-pane> "<text>"` — send a prompt or command to a
-  builder's **agent** pane; Claude Code auto-submits it (no separate keystroke). Always target the
+- **`DRIVER:send-text`** — `herdr pane run <agent-pane> "<text>"; herdr pane send-keys <agent-pane> Enter` — send a prompt or command to a
+  builder's **agent** pane and **submit** it (type the text, then an explicit Enter keystroke —
+  HERD-186: `pane run` alone can leave text sitting in the agent prompt buffer). Always target the
   agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
   where text vanishes and the agent never wakes.
 - **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code

@@ -57,7 +57,8 @@ Capabilities this skill uses directly:
 - **`DRIVER:focus-agent`** — `{{DRIVER_FOCUS_AGENT}}` — jump to (and hand off to) a builder's
   agent by its slug.
 - **`DRIVER:send-text`** — `{{DRIVER_SEND_TEXT}}` — send a prompt or command to a
-  builder's **agent** pane; Claude Code auto-submits it (no separate keystroke). Always target the
+  builder's **agent** pane and **submit** it (type the text, then an explicit Enter keystroke —
+  HERD-186: `pane run` alone can leave text sitting in the agent prompt buffer). Always target the
   agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
   where text vanishes and the agent never wakes.
 - **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code

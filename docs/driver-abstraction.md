@@ -45,8 +45,8 @@ surfaces that *are* runtime-specific:
    a pane, send raw keys.
 2. **The agent runtime** — today Claude Code. Controlled by text (and `/`-commands) delivered *through*
    the multiplexer into an agent pane. Provides: start an agent on a task, switch model mid-session,
-   and the auto-submit convention (text sent to a Claude Code pane is submitted without a separate
-   Enter keystroke — a driver-specific behavior a different runtime would not share).
+   and the auto-submit convention (text is typed then an explicit Enter is sent — HERD-186; a
+   driver-specific submit shape a different runtime would rebind).
 
 A "driver" is the concrete binding of the capabilities below to one multiplexer + one runtime.
 
@@ -61,7 +61,7 @@ the current binding; the **token** column is the phase-2 substitution point (see
 | --------------------- | ------------------------------------------------------------------- | ---------------------------------------------------- | ------------------------ |
 | `list-agents`         | Enumerate sub-agents with running / idle / blocked status           | `herdr agent list`                                   | `{{DRIVER_LIST_AGENTS}}` |
 | `focus-agent`         | Jump to / hand off to a builder's agent by slug                     | `herdr agent focus <slug>`                           | `{{DRIVER_FOCUS_AGENT}}` |
-| `send-text`           | Send a prompt/command to a builder's agent pane (auto-submitted)    | `herdr pane run <agent-pane> "<text>"`               | `{{DRIVER_SEND_TEXT}}`   |
+| `send-text`           | Send a prompt/command to a builder's agent pane (auto-submitted)    | `herdr pane run …; herdr pane send-keys … Enter` (HERD-186) | `{{DRIVER_SEND_TEXT}}`   |
 | `switch-model`        | Switch the agent runtime's model mid-session                        | send `/model <value>` via `send-text`                | `{{DRIVER_SWITCH_MODEL}}`|
 | `start-agent`         | Spawn an agent on a task in a fresh tab/pane                         | the lane scripts (`herd-feature.sh` / `herd-quick.sh`)| `{{DRIVER_START_AGENT}}` |
 | `create-tab`         | Create a tab/pane in the target workspace                            | `herdr tab create --workspace <ws>`                  | `{{DRIVER_CREATE_TAB}}`  |
@@ -69,10 +69,11 @@ the current binding; the **token** column is the phase-2 substitution point (see
 | `send-keys`           | Send raw keystrokes (control keys, menu navigation) to a pane       | `herdr pane send-keys <pane> <keys>`                 | `{{DRIVER_SEND_KEYS}}`   |
 
 `send-text` vs `send-keys` is the same distinction the operator memory captures: **`send-text`
-auto-submits on Claude Code**, so a prompt goes in with one call; **`send-keys`** is for raw control
-input (e.g. menu navigation) and never auto-submits. A driver for a runtime that does *not* auto-submit
-would bind `send-text` to a send-then-Enter pair — which is exactly why the capability, not the raw
-command, is the unit of abstraction.
+types then submits** (HERD-186: `pane run` + explicit `send-keys Enter` — live 2026-07-08 showed
+`pane run` alone can leave text sitting in an agent prompt buffer), so a prompt goes in with one
+capability call; **`send-keys` alone** is for raw control input (e.g. menu navigation) without a
+surrounding prompt. Binding `send-text` to a send-then-Enter pair is exactly why the capability, not
+the raw command, is the unit of abstraction.
 
 ---
 
@@ -125,7 +126,7 @@ binds every capability to a concrete incantation:
 # templates/drivers/herdr-claude.driver — the default binding (byte-identical to today's output)
 DRIVER_LIST_AGENTS='herdr agent list'
 DRIVER_FOCUS_AGENT='herdr agent focus <slug>'
-DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"'
+DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"; herdr pane send-keys <agent-pane> Enter'
 DRIVER_SWITCH_MODEL='send `/model <value>` via herdr pane run'
 DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
 DRIVER_CREATE_TAB='herdr tab create --workspace <ws>'

@@ -263,11 +263,18 @@ if cmd == "agent start":
 if cmd == "pane read":
     print("rp stub builder: done"); sys.exit(0)
 
+if cmd == "pane send-keys":
+    # HERD-186: accept send-keys (Enter submit after pane run). No state change here — the scenario's
+    # wake-shim flips agent status via report-agent after Enter, modelling a real agent reacting.
+    sys.exit(0)
+
 if cmd == "agent list":
     agents = []
     for w_id, t_id, p_id, p in all_panes(s):
         if p.get("agent"):
-            agents.append({"agent": p["agent"], "agent_status": p["agent_status"],
+            # Emit both `name` (lane-started identity) and `agent` (report-agent label) so the
+            # shipped _find_builder_pane_id_any / _agent_status matchers resolve the builder.
+            agents.append({"name": p["agent"], "agent": p["agent"], "agent_status": p["agent_status"],
                            "pane_id": p_id, "tab_id": t_id, "workspace_id": w_id})
     emit({"agents": agents})
 
@@ -294,8 +301,8 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 # kill flow, and by `agent start` for the claude-as-ROOT pane where shell_pid == the claude pid — the
 # PR #260 false-death shape). alive→dead on kill, →missing on pane removal, and claude-as-root ⇒ alive.
 for cpn in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working \
-           agent_done builder_agent_alive_claude_root builder_agent_dead builder_refix_escalates_on_dead \
-           builder_agent_missing teardown_clean; do
+           agent_done builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
+           builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
 # The observed transitions are exactly idle → working → done.
