@@ -97,7 +97,6 @@ if herd_spawn_gate_saturated; then
   fi
 fi
 DIR="$WORKTREES_DIR/$SLUG"
-CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 MODEL="${HERD_QUICK_MODEL:-$MODEL_QUICK}"
 # Deterministic model step-up: if the coordinator-passed task text matches MODEL_ESCALATE_GLOB
 # (egrep -i, e.g. judgment-heavy engine surface), force the MODEL_FEATURE tier — REGARDLESS of
@@ -118,6 +117,11 @@ fi
 _MODEL_REF="$MODEL"
 MODEL="$(herd_model_for_spawn "$_MODEL_REF")" || exit 1
 _DRIVER_RUNTIME="$(herd_model_driver_for "$_MODEL_REF" 2>/dev/null || true)"; [ -n "$_DRIVER_RUNTIME" ] || _DRIVER_RUNTIME="$_HERD_DRIVER_NAME"
+# Permission flags for the spawn's <flags> — derived from the RESOLVED runtime driver (HERD-201) so a
+# runtime-qualified MODEL ref spawns THAT runtime's approve flag, not claude's --dangerously-skip-
+# permissions. An explicit HERD_CLAUDE_FLAGS override still wins. Byte-identical for herdr-claude/headless
+# (their permission flag IS --dangerously-skip-permissions). Resolved AFTER _DRIVER_RUNTIME, before spawn.
+CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$_DRIVER_RUNTIME")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if

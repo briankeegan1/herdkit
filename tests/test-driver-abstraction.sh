@@ -145,4 +145,47 @@ grep -qE '^HERD_DRIVER="herdr-claude"' "$CFG_EXAMPLE" \
   || fail "config.example does not document HERD_DRIVER default herdr-claude"
 ok; echo "PASS (6) HERD_DRIVER documented (capabilities.tsv requires=render + config.example default)"
 
+# ── 7. HERD-201: the builder lanes derive the spawn's permission flag from the RESOLVED runtime ─────
+# driver, so a runtime-qualified MODEL ref spawns THAT runtime's approve flag — never claude's
+# --dangerously-skip-permissions forced into a foreign runtime (the launch-death bug). Byte-identical
+# for the native claude runtimes (herdr-claude/headless). Exercises the REAL fix path: resolve the ref
+# → derive herd_driver_lane_permission_flags → compose herd_driver_agent_spawn_argv, exactly as the
+# lanes do. driver.sh sourcing is side-effect-free (functions only), so this stays hermetic — no herdr,
+# no claude, no model (each case sources driver.sh in a clean subshell to pin the env precisely).
+# lane_argv <model-ref> — mirror the builder lane: resolve the (driver,model), derive the permission
+# flags from the RESOLVED driver (HERD_CLAUDE_FLAGS honored exactly as the lane does), compose the spawn
+# argv, and echo it space-joined for a stable string compare.
+lane_argv() {
+  local ref="$1" mdl drv flags
+  mdl="$(herd_model_for_spawn "$ref")" || return 1
+  drv="$(herd_model_driver_for "$ref" 2>/dev/null || true)"; [ -n "$drv" ] || drv="$(herd_driver_name)"
+  flags="$(herd_driver_lane_permission_flags "$drv")"
+  local -a a=(); local t
+  while IFS= read -r -d '' t; do a+=("$t"); done < <(herd_driver_agent_spawn_argv "$drv" "$mdl" "$flags" PTR)
+  printf '%s' "${a[*]}"
+}
+
+# 7a. a grok: ref composes grok's OWN --always-approve flag — never the claude flag.
+got="$(env -u HERD_CLAUDE_FLAGS -u HERD_DRIVER bash -c '. "$1"; '"$(declare -f lane_argv)"'; lane_argv grok:grok-4.5' _ "$ROOT/scripts/herd/driver.sh")"
+[ "$got" = "grok --model grok-4.5 --always-approve PTR" ] \
+  || fail "grok ref did not compose grok's permission flag: got [$got]"
+case "$got" in *--dangerously-skip-permissions*) fail "grok spawn leaked the claude permission flag: $got" ;; esac
+# 7b. a codex: ref composes codex's OWN bypass flag — never the claude flag.
+got="$(env -u HERD_CLAUDE_FLAGS -u HERD_DRIVER bash -c '. "$1"; '"$(declare -f lane_argv)"'; lane_argv codex:gpt-5-codex' _ "$ROOT/scripts/herd/driver.sh")"
+[ "$got" = "codex --model gpt-5-codex --dangerously-bypass-approvals-and-sandbox PTR" ] \
+  || fail "codex ref did not compose codex's permission flag: got [$got]"
+case "$got" in *--dangerously-skip-permissions*) fail "codex spawn leaked the claude permission flag: $got" ;; esac
+# 7c. the native claude runtimes stay BYTE-IDENTICAL (bare ref → default driver; explicit headless ref).
+got="$(env -u HERD_CLAUDE_FLAGS -u HERD_DRIVER bash -c '. "$1"; '"$(declare -f lane_argv)"'; lane_argv opus' _ "$ROOT/scripts/herd/driver.sh")"
+[ "$got" = "claude --model opus --dangerously-skip-permissions PTR" ] \
+  || fail "bare model ref not byte-identical (native claude): got [$got]"
+got="$(env -u HERD_CLAUDE_FLAGS -u HERD_DRIVER bash -c '. "$1"; '"$(declare -f lane_argv)"'; lane_argv headless:sonnet' _ "$ROOT/scripts/herd/driver.sh")"
+[ "$got" = "claude --model sonnet --dangerously-skip-permissions PTR" ] \
+  || fail "headless ref not byte-identical (native claude): got [$got]"
+# 7d. an EXPLICIT HERD_CLAUDE_FLAGS override still WINS — verbatim, even for a foreign runtime.
+got="$(env -u HERD_DRIVER HERD_CLAUDE_FLAGS='--custom-yolo' bash -c '. "$1"; '"$(declare -f lane_argv)"'; lane_argv grok:grok-4.5' _ "$ROOT/scripts/herd/driver.sh")"
+[ "$got" = "grok --model grok-4.5 --custom-yolo PTR" ] \
+  || fail "explicit HERD_CLAUDE_FLAGS override did not win for a grok ref: got [$got]"
+ok; echo "PASS (7) HERD-201: lanes derive the permission flag from the resolved runtime (grok/codex own flag; claude byte-identical; explicit override wins)"
+
 echo "ALL PASS ($pass checks)"

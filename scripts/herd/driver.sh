@@ -236,6 +236,31 @@ sys.stdout.write("".join(tok + "\0" for tok in out))
 '
 }
 
+# herd_driver_lane_permission_flags <driver> — the permission FLAGS a builder LANE passes as the spawn's
+# <flags> (which herd_driver_agent_spawn_argv substitutes for <driver>'s DRIVER_AGENT_PERMISSION_FLAG
+# token). HERD-201: the lanes previously hardcoded CLAUDE_FLAGS to claude's --dangerously-skip-permissions
+# and passed it UNCONDITIONALLY — so a runtime-qualified MODEL ref ('grok:…','codex:…') composed the
+# claude flag into a non-claude runtime ('grok … --dangerously-skip-permissions') and the agent died on
+# launch. This helper derives the flags correctly:
+#   • an EXPLICIT non-empty HERD_CLAUDE_FLAGS override WINS, verbatim, for ANY runtime (the operator's
+#     word beats the derived default — same precedence the old `${HERD_CLAUDE_FLAGS:-…}` gave it);
+#   • otherwise the flags come from the RESOLVED runtime driver's OWN DRIVER_AGENT_PERMISSION_FLAG, so
+#     each runtime spawns with its own approve flag (grok --always-approve, codex's bypass flag, …).
+# BYTE-IDENTICAL for herdr-claude / headless: their permission flag already IS
+# --dangerously-skip-permissions, so an unset/empty override yields the EXACT token the lanes hardcoded.
+# Empty-or-unset are treated alike (mirrors the old `:-` default) so an explicit empty never drops the
+# flag. FAIL-SOFT: an unreadable/absent binding falls back to the claude flag (today's behavior), never
+# empty. PURE — no side effects on source.
+herd_driver_lane_permission_flags() {
+  local drv="${1:-}"
+  if [ -n "${HERD_CLAUDE_FLAGS:+set}" ]; then
+    printf '%s' "$HERD_CLAUDE_FLAGS"
+    return 0
+  fi
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG '--dangerously-skip-permissions' "$drv"
+}
+
 # herd_driver_agent_runtime_native <driver> — success iff <driver>'s agent runtime is the NATIVE Claude
 # Code runtime (its DRIVER_AGENT_INTERACTIVE_SPAWN launches `claude`). The mux (herdr) tracks a native
 # `claude` agent by fingerprinting the pane's foreground process (herd_driver_agent_liveness's
