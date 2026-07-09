@@ -2,6 +2,10 @@
 
 This document describes the operational playbook for running and monitoring the herdkit coordinator in both attended and unattended modes.
 
+> Several coordinator seats work the same repo in parallel. The two rules that keep them from
+> interrupting each other — reconciled invariants over event side-effects, and one shared check at
+> every enforcement surface — are in [`multi-seat-doctrine.md`](multi-seat-doctrine.md).
+
 ## Roles and Responsibilities
 
 ### The Coordinator Agent

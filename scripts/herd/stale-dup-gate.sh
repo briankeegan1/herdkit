@@ -47,6 +47,13 @@
 # Sourced AFTER herd-config.sh, exactly like human-verify.sh / journal.sh:
 #   . "$HERE/stale-dup-gate.sh"
 
+# The shared regenerable-derived-files list (HERD-214) — the stale-base overlap must never count a
+# file the engine regenerates (the rendered coordinator skill, .herd/config.local) as work a merge
+# could clobber. Sourced by absolute path off THIS file so the gate stays self-sufficient for the
+# tests that source it directly.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/derived-files.sh"
+
 # stale_dup_enabled — the master lever. STALE_DUP_DETECT=off disables the gate entirely; any other
 # value (default "on") leaves it active. Kept as a function so callers read one obvious predicate.
 stale_dup_enabled() {
@@ -141,7 +148,11 @@ _stale_dup_shipped_by() {
 # base branch ALSO changed since their common merge-base (one per line), and return 0 iff that overlap
 # is non-empty. Returns 1 (no overlap → not stale) when: the dir is not a worktree, a ref is missing,
 # the branch already CONTAINS the base tip (merge-base == base tip → not behind → nothing to be stale
-# against), or either diff is empty. Pure git; no network. Unit-tested against a sandbox repo.
+# against), either diff is empty, or the whole overlap is REGENERABLE DERIVED FILES (HERD-214: a branch
+# cut before the untracking migration carries the rendered coordinator skill as a tracked file, so both
+# sides "change" it on every render — re-applying an old render clobbers nothing, since the next
+# init/update/reload/render rewrites it from the template). Pure git; no network. Unit-tested against a
+# sandbox repo.
 stale_dup_base_overlap() {
   local dir="$1" base="$2" head="$3" mb basetip touched moved overlap
   [ -d "$dir" ] || return 1
@@ -156,6 +167,9 @@ stale_dup_base_overlap() {
   [ -n "$moved" ] || return 1
   # Exact path intersection (-Fx: fixed-string, whole-line) — the files BOTH sides changed.
   overlap="$(printf '%s\n' "$touched" | grep -Fxf <(printf '%s\n' "$moved") 2>/dev/null || true)"
+  [ -n "$overlap" ] || return 1
+  # Drop the regenerable derived files: an overlap made only of those proves nothing.
+  overlap="$(printf '%s\n' "$overlap" | herd_strip_derived)"
   [ -n "$overlap" ] || return 1
   printf '%s\n' "$overlap"
 }
