@@ -172,7 +172,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
 - `HERD_LIMIT_UNKNOWN_WAIT` → `agent-watch.sh`
 - `HERD_REPO` → `bin/herd`, `herd-links.sh`
-- `HERD_THEME` → `theme.sh`
+- `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
 - `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
