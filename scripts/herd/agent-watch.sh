@@ -4597,7 +4597,14 @@ Why: ${_hsd_reason}"
 # FAIL-SOFT, twice over: stale_dup_check itself never holds without proof, and a nonzero return that
 # somehow carries no _STALE_DUP_KIND is treated as an evaluation error → PROCEED (today's order).
 # DRY-RUN is a strict no-op here — the pre-HERD-227 pass `continue`d before ever reaching the gate,
-# so evaluating it under dry-run would newly post PR comments.
+# so evaluating it under dry-run would newly post PR comments. An EMPTY sha also PROCEEDs (nothing to
+# prove against), mirroring the old inline `[ -n "$rsha" ]` predicate; the pre-merge caller keeps that
+# same guard, so an empty head sha still lands on the `awaiting head sha for review…` row below.
+#
+# CALLED TWICE per candidate, on purpose. The top-of-pass call is a CHEAPENING pass: it skips the
+# review + suite for an already-doomed sha. The pre-merge call is the SAFETY RAIL: a stale-base
+# clearance is keyed on (head sha, base tip), and another seat's merge can advance the base tip while
+# our suite runs — so the merge decision must be re-established from current state, unconditionally.
 _stale_dup_gate_step() {
   local _sdg_pr="$1" _sdg_slug="$2" _sdg_dir="$3" _sdg_sha="$4" _sdg_branch="$5" _sdg_idx="$6"
   [ -n "$_sdg_sha" ] || return 0
@@ -7518,8 +7525,9 @@ EOF
     # burned one ~9-min heavy suite plus one Opus review per stale cycle (PR #328, 2026-07-09). On a
     # hold we dispatch NOTHING expensive for this sha; the hold row, comment and STALE_BASE_AUTOFIX
     # bounce proceed exactly as before. Proceeding is byte-quiet — no events, no side effects — so a
-    # fresh-base PR's dispatch order is unchanged. Keyed on $candsha (this tick's head, free); the
-    # pre-merge re-verify below re-runs the gate only if it observes a NEWER sha.
+    # fresh-base PR's dispatch order is unchanged. Keyed on $candsha (this tick's head, free). This is a
+    # CHEAPENING pass, not the safety rail: the base tip can advance under us while the suite runs, so
+    # the merge decision still rests on the unconditional re-evaluation just before do_merge below.
     if ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx"; then
       continue
     fi
@@ -7602,14 +7610,26 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       fi
     fi
 
-    # PRE-MERGE STALE / DUPLICATE GATE, sha-skew leg (HERD-188 + HERD-199 + HERD-227). The gate already
-    # decided against $candsha at the TOP of this candidate's pass, before any dispatch. Re-run it here
-    # ONLY when the pre-merge re-verify observed a DIFFERENT head sha (a push landed mid-tick): the merge
-    # decision is made against $rsha, and no sha may ever merge without the gate having cleared it. When
-    # the sha is unchanged (the overwhelmingly common case) this leg is a no-op — the gate is not
-    # re-evaluated and no gh calls are spent.
-    if [ -n "$rsha" ] && [ "$rsha" != "$candsha" ] \
-       && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then
+    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188 + HERD-199), re-evaluated in the instant before the
+    # merge — exactly where it ran before HERD-227, and for exactly the same reason.
+    #
+    # WHY THIS IS NOT REDUNDANT with the top-of-pass call. A stale-base clearance is a function of TWO
+    # inputs: the head sha AND the base tip (stale_dup_base_overlap compares `merge-base $base $head`
+    # against `rev-parse $base`). Only the head sha belongs to this PR. Between the top-of-pass gate and
+    # do_merge below, this pass waits out the review pre-dispatch, a full healthcheck suite, and the
+    # review verdict — minutes during which ANOTHER SEAT's watcher can merge and ff-pull $DEFAULT_BRANCH
+    # (a LOCAL ref, shared across every worktree via one common .git). Our head sha never moves, so a
+    # sha-keyed skip would merge on a clearance computed against a base tip that no longer exists — the
+    # clean-but-behind merge that silently clobbers newer main (#236 → revert #280). Nothing downstream
+    # re-catches it: a behind branch is still MERGEABLE/CLEAN in the default unprotected config.
+    #
+    # The invariant is therefore "no merge without a clearance against the CURRENT base", not "…against
+    # this sha" — and it must be re-established from observed state, never inferred from what THIS seat
+    # did (multi-seat doctrine R1). So: always re-run, unconditionally. Cost is one stale_dup_check per
+    # merge-ready candidate per tick, identical to the pre-HERD-227 code, which paid it at this very
+    # spot. HERD-227's win is the EARLY evaluation above, which skips the doomed review + suite — not a
+    # skipped re-check here.
+    if [ -n "$rsha" ] && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then
       continue
     fi
 

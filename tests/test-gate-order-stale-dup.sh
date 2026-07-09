@@ -41,8 +41,11 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required"
 command -v git >/dev/null 2>&1 || fail "git required"
 
 # ── (1) STRUCTURAL: the action pass decides stale-dup before it dispatches anything ───────────
-line_of() { grep -F -n -- "$1" "$WATCH" | head -n1 | cut -d: -f1; }
-count_of() { grep -F -c -- "$1" "$WATCH" 2>/dev/null | head -n1 | tr -d ' '; }
+# Match CODE only: a comment line carrying the same literal must never satisfy (or shadow) the
+# assertion — otherwise a prose mention of `_healthcheck_gate "$prnum"` would pass it vacuously.
+code_lines() { grep -F -n -- "$1" "$WATCH" | awk '{ rest = substr($0, index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }'; }
+line_of()  { code_lines "$1" | head -n1 | cut -d: -f1; }
+count_of() { code_lines "$1" | awk 'END{print NR+0}'; }
 
 L_GATE="$(line_of '_stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha"')"
 L_REVIEW="$(line_of '_predispatch_review_if_parallel "$prnum"')"
@@ -55,6 +58,16 @@ L_HEALTH="$(line_of '_healthcheck_gate "$prnum"')"
 [ "$L_GATE" -lt "$L_REVIEW" ] || fail "(1) stale-dup gate (line $L_GATE) must precede the review pre-dispatch (line $L_REVIEW)"
 [ "$L_GATE" -lt "$L_HEALTH" ] || fail "(1) stale-dup gate (line $L_GATE) must precede the healthcheck gate (line $L_HEALTH)"
 ok "(1) action pass evaluates stale-dup before review pre-dispatch and healthcheck"
+
+# The pre-merge leg, lifted VERBATIM from the source so check (8) exercises the real condition rather
+# than a paraphrase of it. It must be one self-contained `if …; then` line ending in `continue`.
+PREMERGE_SRC="$(code_lines '_stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha"' | head -n1 | cut -d: -f2-)"
+[ -n "$PREMERGE_SRC" ] || fail "(1c) no pre-merge _stale_dup_gate_step callsite on \$rsha found"
+case "$PREMERGE_SRC" in
+  *'; then') : ;;
+  *) fail "(1c) pre-merge callsite is not a single-line 'if …; then' — check (8) can no longer eval it: $PREMERGE_SRC" ;;
+esac
+ok "(1c) pre-merge gate callsite is liftable for the behavioral safety-rail check"
 
 # ── Stubs ─────────────────────────────────────────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"
@@ -126,18 +139,29 @@ DISPLAY=()
 
 # _healthcheck_gate is a ~9-min real suite; stand in for it with the one thing we assert on — the
 # healthcheck_started event it journals at dispatch (agent-watch.sh: journal_append healthcheck_started).
+# HC_HOOK stands in for what can happen DURING those minutes: another seat's merge advancing the base.
 _healthcheck_gate() {
   journal_append healthcheck_started pr "$1" slug "$2" sha "${5:-}" pid 0 log_path stub
+  [ -n "${HC_HOOK:-}" ] && "$HC_HOOK"
   _HC_RESULT=CLEAN
 }
 
 # action_pass <pr#> <slug> <dir> <sha> <branch> — a faithful replay of agent-watch.sh's per-candidate
-# call order, which check (1) pins to the real source. Everything expensive sits behind the gate.
+# call order, which check (1) pins to the real source. Everything expensive sits behind the top-of-pass
+# gate; the merge is behind the UNCONDITIONAL pre-merge re-evaluation. Returns 1 on either hold.
 action_pass() {
   local prnum="$1" slug="$2" dir="$3" candsha="$4" branch="$5" idx=0
   _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx" || return 1
   _predispatch_review_if_parallel "$prnum" "$slug" "$candsha"
   _HC_RESULT=""; _healthcheck_gate "$prnum" "$slug" "$dir" "$idx" "$candsha"
+  # The pre-merge re-verify hands us $rsha; here the head never moves (a mid-tick push is not the
+  # subject — the BASE tip moving is). The pre-merge leg is not retyped: PREMERGE_SRC is the literal
+  # `if …; then` line lifted out of agent-watch.sh, eval'd with `continue` rewritten as `return 1`.
+  # A guard added to that line (e.g. the sha-equality skip HERD-227 shipped and #348's review caught)
+  # is therefore exercised for real, not paraphrased — check (8) fails the moment one reappears.
+  local rsha="$candsha"
+  eval "$PREMERGE_SRC return 1; fi"
+  journal_append merge_reached pr "$prnum" sha "$rsha"
   return 0
 }
 
@@ -172,9 +196,10 @@ comments() { awk '/pr comment/{n++} END{print n+0}' "$GH_LOG" 2>/dev/null || pri
 reset_state() {
   : > "$JOURNAL_FILE"; : > "$GH_LOG"; : > "$STALE_DUP_STATE"; : > "$REFIX_STATE"
   rm -f "$TREES"/.review-* 2>/dev/null || true
-  DISPLAY=(); DRYRUN=""
+  DISPLAY=(); DRYRUN=""; HC_HOOK=""
   unset STALE_DUP_DETECT STALE_BASE_AUTOFIX 2>/dev/null || true
 }
+HC_HOOK=""
 TREES="$WORKTREES_DIR"
 
 # ── (2) STALE BASE → HOLD, and nothing expensive is dispatched for that sha ────────────────────
@@ -204,6 +229,7 @@ action_pass 42 fresh-slug "$REPO" "$FRESH_SHA" feat/fresh || fail "(3) fresh-bas
 [ "$(events stale_dup_hold)" = "0" ]      || fail "(3) fresh base must not hold"
 [ "$(events review_dispatched)" = "1" ]   || fail "(3) fresh base must dispatch exactly one review"
 [ "$(events healthcheck_started)" = "1" ] || fail "(3) fresh base must start exactly one healthcheck"
+[ "$(events merge_reached)" = "1" ]       || fail "(3) fresh base must reach the merge"
 [ "$(event_order)" = "review_dispatched healthcheck_started" ] \
   || fail "(3) dispatch order changed — expected 'review_dispatched healthcheck_started', got '$(event_order)'"
 [ "$(comments)" = "0" ] || fail "(3) a proceeding gate must be byte-quiet (no PR comment)"
@@ -239,5 +265,29 @@ action_pass 45 fresh-slug "$REPO" "$FRESH_SHA" feat/fresh || fail "(6) an evalua
   || fail "(6) fail-soft must fall back to today's dispatch order: got '$(event_order)'"
 eval "$_real_check"
 ok "(6) evaluation errors fail soft to the pre-HERD-227 order"
+
+# ── (8) SAFETY RAIL: another seat advances the base tip while OUR suite runs ──────────────────
+# The stale-base clearance is keyed on (head sha, base tip) — only the head sha is ours. $DEFAULT_BRANCH
+# is a LOCAL ref shared by every worktree, so another seat's do_merge ff-pull moves it under us during
+# the ~9-min suite. Our head sha never moves. A pre-merge re-check keyed on the sha alone would skip,
+# and the PR would merge on a clearance computed against a base tip that no longer exists — exactly the
+# clean-but-behind merge the gate exists to stop (#236 → revert #280). The pre-merge leg is therefore
+# UNCONDITIONAL: it must hold here even though the top-of-pass gate cleared this very sha.
+reset_state
+git -C "$REPO" checkout -q feat/fresh
+advance_base() {   # stand-in for another seat's merge landing mid-suite; fires once
+  [ -n "${_BASE_ADVANCED:-}" ] && return 0
+  _BASE_ADVANCED=1
+  git -C "$REPO" checkout -q main
+  printf 'other-seat\n' > "$REPO/B.txt"; git -C "$REPO" add B.txt; git -C "$REPO" commit -qm other-seat-merge
+  git -C "$REPO" checkout -q feat/fresh
+}
+HC_HOOK=advance_base
+action_pass 46 fresh-slug "$REPO" "$FRESH_SHA" feat/fresh && fail "(8) merge must NOT proceed after the base tip advanced under us"
+[ "$(events review_dispatched)" = "1" ]   || fail "(8) the top-of-pass gate should have CLEARED (review dispatched)"
+[ "$(events healthcheck_started)" = "1" ] || fail "(8) the top-of-pass gate should have CLEARED (suite started)"
+[ "$(events stale_dup_hold)" = "1" ]      || fail "(8) the pre-merge gate must HOLD on the advanced base tip"
+[ "$(events merge_reached)" = "0" ]       || fail "(8) SAFETY-RAIL BYPASS: merged on a clearance against a dead base tip"
+ok "(8) pre-merge gate re-checks against the CURRENT base tip, not just our sha"
 
 echo "ALL PASS ($pass checks) — gate order: stale-dup decides first (HERD-227)"
