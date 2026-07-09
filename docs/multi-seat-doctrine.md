@@ -1,0 +1,66 @@
+# The multi-seat doctrine
+
+herdkit is worked by **many coordinator seats at once** — several operators, each with their own
+watcher, builders, and merges, against the same repo. A behavior that is correct with one seat and
+wrong with three is the single most common source of mid-run interruptions. Two rules keep the fleet
+uninterrupted; both are enforced surfaces, not aspirations (the coordinator SOP's check 7, and the
+pre-merge review checklist at `.herd/review-checklist.md`).
+
+## Rule 1 — Prefer reconciled invariants over event side-effects
+
+State a behavior as an **invariant reconciled every tick against observed state**, not as a side
+effect that only fires when *this* seat/watcher happens to perform the triggering action. If the only
+thing that repairs a condition is the seat that caused it, then every other seat's action leaves the
+condition unrepaired.
+
+The test: *does this hold regardless of which seat performed the triggering event?*
+
+**Incident evidence**
+
+- **HERD-218 — codemap goes stale after another seat's merge.** `refresh_codemap` is called from
+  `do_merge` (`scripts/herd/agent-watch.sh:3222`). A seat only refreshes `docs/codemap.md` for merges
+  *it* performs; when another seat's watcher merges, this seat's next builder is spawned against a
+  stale map. The invariant form is: *the committed map matches the tree at `$MAIN`* — checked on the
+  tick against observed `$MAIN`, repaired whenever it drifts, no matter who merged.
+- **HERD-164 — retirement as an event handler.** Retiring a pane/worktree ran as a handler on the
+  merge the seat performed, so panes belonging to work merged elsewhere were never retired. The
+  invariant form: *no pane/worktree exists for a branch already merged into `$MAIN`* — evaluated
+  against observed state each tick.
+
+## Rule 2 — One shared deterministic check, enforced identically at every surface
+
+When a rule gates work, implement it **once** and reuse that one implementation at **every**
+enforcement surface — the builder's pre-PR light profile *and* the merge gate. Do not write a second
+copy per surface, and do not leave the rule as prose the builder is expected to judge for itself.
+A rule enforced only downstream converts into a bounced PR and a wasted builder run.
+
+The test: *is any new check a single shared implementation, reused at every enforcement surface?*
+
+**Incident evidence**
+
+- **HERD-220 / PR #328 — caps-sync gate-only.** The caps-sync guard (a diff that adds a `cmd_*`
+  subcommand, a config key, or a lane script must also touch `templates/capabilities.tsv`) lives in
+  `.herd/healthcheck.project.sh:484`, which only the heavy merge-gate profile runs. The builder's
+  light pre-PR profile cannot see it, so PR #328 was authored clean, passed locally, and bounced at
+  the gate. Either the check runs at both surfaces from one implementation, or it is not a check the
+  builder can satisfy.
+
+## Why this is doctrine and not style
+
+The goal is **many coordinator seats working this repo in parallel, uninterrupted, with minimal
+issues**. A seat-local side effect and a per-surface duplicate both look correct in a single-seat
+test and both fail the moment a second seat exists. Under Rule 1 a stale condition self-heals on the
+next tick regardless of who caused it; under Rule 2 a violation is impossible to author rather than
+expensive to discover. Treat merge-performer-dependent behavior and per-surface duplicate checks as
+**correctness defects**, not as cleanups.
+
+## Where this is enforced
+
+- **Authoring** — coordinator skill, *Authoring a backlog item* SOP, check 7 (MULTI-SEAT /
+  INVARIANCE). Source: `templates/coordinator.md.tmpl` (`herd render` renders it).
+- **Review** — `.herd/review-checklist.md` (the `REVIEW_CHECKLIST` key in `.herd/config`), injected
+  into the adversarial pre-merge review gate `herd-review.sh`.
+- **Operations** — see [`COORDINATOR-SOP.md`](COORDINATOR-SOP.md) for the seat/watcher roles this
+  doctrine constrains, and [`codemap.md`](codemap.md) for the module map.
+
+Tracked as HERD-219.

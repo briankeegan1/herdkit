@@ -38,6 +38,7 @@ herd config <list|get|set>	unit	tests/test-cli-config-sync.sh
 herd config <list|get|set>	unit	tests/test-config-dedup-lint.sh
 herd config <list|get|set>	unit	tests/test-config-shared-pr.sh
 .herd/config.local	unit	tests/test-config-local-overlay.sh
+.claude/commands/coordinator.md	unit	tests/test-derived-skill.sh
 BRANCH_TEMPLATE	unit	tests/test-branch-template.sh
 ATTRIBUTION_POLICY	unit	tests/test-attribution-lint.sh
 COMMIT_CONVENTION	unit	tests/test-commit-convention-lint.sh

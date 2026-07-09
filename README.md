@@ -231,6 +231,9 @@ Python-shaped defaults. It runs the **work-tracker discovery dialogue** (detects
 - **`.claude/commands/coordinator.md`** — the coordinator skill, *rendered* from
   `templates/coordinator.md.tmpl` with your config baked in (no conditionals — it reads as if
   hand-written for your project). Regenerate it any time with `herd upgrade`.
+  **Gitignored, per-machine** (like `.herd/config.local`): the render is a derived artifact, never
+  committed — teams share the *template*, and `herd init` / `update` / `reload` / `render` each
+  rebuild it locally. A tracked copy would dirty every checkout the moment any of those ran.
 
 Then launch the control room:
 
