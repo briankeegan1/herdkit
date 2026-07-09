@@ -73,20 +73,82 @@ default branch (e.g. `main`):
    half of the property and is unnecessary once `herd/gates` is required.
 6. Apply an equivalent rule to any other protected branch a watcher gates.
 
-Equivalent one-shot via the API (adjust `OWNER/REPO` and the branch):
+### API alternative (read-merge-write — **preserves existing rules**)
+
+The UI steps above are the simple path. If you must script it, do **not** naively
+`PUT …/protection` with a hand-built body: that endpoint is a **full replace**, so a body that omits
+your existing required reviews / other required checks / push restrictions **silently strips them**.
+Instead **read** the current protection, **merge** `herd/gates` into its existing required checks, and
+**write** the reconstructed object back — preserving everything else verbatim. (GET and PUT use
+different shapes for reviews/restrictions/toggles, so the `jq` below transforms each field to its PUT
+form; it is a no-op-safe upsert — re-running never double-adds `herd/gates`, and it also works on a
+branch whose protection has no status checks yet.)
 
 ```sh
-gh api -X PUT repos/OWNER/REPO/branches/main/protection \
-  -H 'Accept: application/vnd.github+json' \
-  -f 'required_status_checks[strict]=true' \
-  -f 'required_status_checks[checks][][context]=herd/gates' \
-  -F 'enforce_admins=false' \
-  -F 'required_pull_request_reviews=null' \
-  -F 'restrictions=null'
+OWNER=your-org REPO=your-repo BRANCH=main   # adjust
+
+# 1. READ current protection (empty file if the branch has no protection yet — see note below).
+gh api "repos/$OWNER/$REPO/branches/$BRANCH/protection" > /tmp/prot.json
+
+# 2. MERGE herd/gates into the existing required status checks, preserving every other rule.
+jq '{
+  required_status_checks: (
+    if .required_status_checks == null
+    then { strict: false, checks: [ { context: "herd/gates" } ] }
+    else { strict: .required_status_checks.strict,
+           checks: ( ( .required_status_checks.checks
+                       // ( .required_status_checks.contexts // [] | map({context: .})) )
+                     + [ { context: "herd/gates" } ] | unique_by(.context) ) }
+    end
+  ),
+  enforce_admins: (.enforce_admins.enabled // false),
+  required_pull_request_reviews: (
+    if .required_pull_request_reviews == null then null
+    else .required_pull_request_reviews as $r
+      | { dismiss_stale_reviews: $r.dismiss_stale_reviews,
+          require_code_owner_reviews: $r.require_code_owner_reviews,
+          required_approving_review_count: $r.required_approving_review_count,
+          require_last_push_approval: ($r.require_last_push_approval // false) }
+        + ( if $r.dismissal_restrictions then { dismissal_restrictions: {
+              users: [ $r.dismissal_restrictions.users[]?.login ],
+              teams: [ $r.dismissal_restrictions.teams[]?.slug ],
+              apps:  [ $r.dismissal_restrictions.apps[]?.slug ] } } else {} end )
+        + ( if $r.bypass_pull_request_allowances then { bypass_pull_request_allowances: {
+              users: [ $r.bypass_pull_request_allowances.users[]?.login ],
+              teams: [ $r.bypass_pull_request_allowances.teams[]?.slug ],
+              apps:  [ $r.bypass_pull_request_allowances.apps[]?.slug ] } } else {} end )
+    end
+  ),
+  restrictions: (
+    if .restrictions == null then null
+    else { users: [ .restrictions.users[]?.login ],
+           teams: [ .restrictions.teams[]?.slug ],
+           apps:  [ .restrictions.apps[]?.slug ] }
+    end
+  ),
+  required_linear_history: (.required_linear_history.enabled // false),
+  allow_force_pushes: (.allow_force_pushes.enabled // false),
+  allow_deletions: (.allow_deletions.enabled // false),
+  block_creations: (.block_creations.enabled // false),
+  required_conversation_resolution: (.required_conversation_resolution.enabled // false),
+  lock_branch: (.lock_branch.enabled // false),
+  allow_fork_syncing: (.allow_fork_syncing.enabled // false)
+}' /tmp/prot.json > /tmp/prot.new.json
+
+# 3. Review the diff, THEN write it back.
+diff <(jq -S . /tmp/prot.json) <(jq -S . /tmp/prot.new.json)   # sanity-check what changes
+gh api -X PUT "repos/$OWNER/$REPO/branches/$BRANCH/protection" --input /tmp/prot.new.json
 ```
 
-(`restrictions=null` = **no** user/team push restrictions — collaborators keep merge rights;
-`strict=true` = require up-to-date branches.)
+Notes:
+- **Branch not protected yet?** Step 1 returns `404` and writes an error object, not a protection
+  object. In that case set up protection in the **UI** first (it's the simpler from-scratch path), then
+  the script above is only needed if you later automate additions.
+- This keeps **`restrictions` exactly as they were** — it does *not* impose push restrictions (the
+  design keeps collaborators' merge rights; the gate is the required check, not a person). If your repo
+  has none, `restrictions` stays `null`.
+- It does **not** flip `strict` (require-up-to-date). Enable *Require branches to be up to date* in the
+  UI (recommended) or add `.required_status_checks.strict = true` in the `jq`.
 
 ## Turning it off
 

@@ -6,17 +6,22 @@
 # protection (docs/governance-gates.md) that makes the gate FAIL-SAFE across seats/collaborators —
 # anyone may merge, but a commit no watcher blessed has no success status and is unmergeable.
 #
-# These tests source agent-watch.sh in lib mode (the same seam test-gate-dispatch.sh uses) with `gh`
-# stubbed on PATH, and assert the mechanics the item requires:
-#   (1) post_gate_status posts each conclusion (pending|success|failure) via the Statuses API with the
-#       right state + context=herd/gates, and EXACTLY ONCE per (pr,sha,conclusion) — a repeat call is a
-#       no-op (no second network write, one ledger row).
-#   (2) A FAILED API write is NOT recorded, so the next tick re-tries (the status MUST land).
+# The surface is SUCCESS-ONLY: the watcher posts `herd/gates=success` when both gates are green and
+# NOTHING otherwise — a non-passing (pending/failure) status would flip a CLEAN sha to UNSTABLE and
+# strand it. The fail-safe rests entirely on the ABSENCE of success. These tests source agent-watch.sh
+# in lib mode (the same seam test-gate-dispatch.sh uses) with `gh` stubbed on PATH, and assert:
+#   (1) post_gate_status posts `success` via the Statuses API with the right state + context=herd/gates,
+#       EXACTLY ONCE per (pr,sha) — a repeat call is a no-op (no second write, one ledger row) — and
+#       every non-passing conclusion (pending/failure/anything) is REJECTED as a no-op.
+#   (2) A FAILED API write is NOT recorded, so the next tick re-tries (the blessing MUST land).
 #   (3) GATE_STATUS=off and --dry-run are pure no-ops (no post, no ledger).
 #   (4) An empty sha or an unrecognized conclusion never posts.
-#   (5) failure-on-BLOCK: _handle_block_verdict (the single BLOCK choke point) posts state=failure.
+#   (5) A review BLOCK posts NOTHING: _handle_block_verdict (the single BLOCK choke point) must not
+#       write a status — posting `failure` there would flip CLEAN→UNSTABLE and break the override loop.
 #   (6) skip-on-existing-blessing: _gate_status_blessed is true ONLY for an existing herd/gates=success
 #       status (another seat's blessing) and fail-soft false otherwise.
+#   (7) deadlock fix: a BLOCKED-but-unblessed PR is gate-eligible (BLOCKED only; never re-gated once
+#       blessed; off/dry-run inert) so `require herd/gates` never bricks a fresh PR.
 #
 # Fully hermetic: local temp only; stubs gh (PATH). No network, no model, no real PRs.
 # Run:  bash tests/test-gate-status.sh

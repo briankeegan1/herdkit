@@ -6136,7 +6136,14 @@ This PR appears to re-implement already-shipped work, or sits on a base stale en
     # actual merge stays gated on CLEAN, so STOP here. GitHub recomputes mergeStateStatus once the status
     # lands; a later tick sees CLEAN and takes the normal merge path. Never merge a non-CLEAN PR.
     if [ -n "${bless_only:-}" ]; then
-      DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}gates green · herd/gates blessed · awaiting branch-protection recheck${C_RESET}"
+      # Console honesty: only claim "blessed" if the success status ACTUALLY landed (the ledger row is
+      # written only on a successful POST). If the POST failed (best-effort, retries next tick), say
+      # "blessing…" — never assert a blessing that is not on the commit.
+      if _gate_status_posted "$prnum" "$rsha" success; then
+        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}gates green · herd/gates blessed · awaiting branch-protection recheck${C_RESET}"
+      else
+        DISPLAY[idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gates green · posting herd/gates blessing…${C_RESET}"
+      fi
       render
       continue
     fi
