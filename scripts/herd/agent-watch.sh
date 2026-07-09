@@ -102,6 +102,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$HERE/cost.sh" ] && . "$HERE/cost.sh"
 # HUMAN-VERIFY parser — the shared convention for the per-PR human-verify hold (sourced, not run).
 . "$HERE/human-verify.sh"
+# REGENERABLE DERIVED FILES (HERD-214) — the shared list of engine-rendered artifacts (the rendered
+# coordinator skill, .herd/config.local) that the reaps and the stale-base gate must never mistake for
+# real work. Defines functions + one constant; idempotent when a later source pulls it in again.
+. "$HERE/derived-files.sh"
 # STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
@@ -3382,8 +3386,10 @@ EOF
     fi
     # (4) No MERGED PR whose head is this worktree's HEAD → not stranded (in-flight / reused / gh down).
     [ -n "$_srs_pr" ] || continue
-    # (5) Defense-in-depth: never force-remove a worktree carrying uncommitted work.
-    if [ -n "$(git -C "$_srs_dir" status --porcelain 2>/dev/null)" ]; then
+    # (5) Defense-in-depth: never force-remove a worktree carrying uncommitted work. A regenerable
+    #     derived file (HERD-214) is not work: a `herd reload` run in a merged worktree used to leave
+    #     the rendered skill modified there, which stranded the tree forever as "dirty".
+    if [ -n "$(git -C "$_srs_dir" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)" ]; then
       journal_append startup_reap_skip slug "$_srs_slug" pr "$_srs_pr" reason dirty-worktree
       continue
     fi
