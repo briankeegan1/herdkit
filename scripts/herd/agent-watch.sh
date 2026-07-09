@@ -290,6 +290,18 @@ INBOX_SEEN_STATE="$TREES/.agent-watch-inbox-seen"
 INBOX_SEEN_LIVE="$TREES/.agent-watch-inbox-seen-live"
 INBOX_LEDGER_MAX=50    # most-recent entries kept in the ledger
 INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounded)
+# Builder-notes surface (HERD-202). Builders file mid-build findings via `herd note "<finding>"`,
+# which journals a builder_note event. The watcher scans the journal each tick for NEW builder_note
+# rows past a byte cursor, notifies once per event, and renders a needs-you-adjacent console section.
+# Ship-dormant: with zero new builder_note events the ledger stays empty and render() adds nothing
+# (byte-identical console). Always-on (no config gate) — dormancy is "nobody called herd note".
+#   • BUILDER_NOTES_LEDGER — one TAB-separated entry per surfaced note
+#     ("<epoch>\t<slug>\t<text>\t<ts>"), newest appended; rendered newest-first by build_builder_notes.
+#   • BUILDER_NOTES_CURSOR — byte offset into the live journal already consumed (first scan pins to
+#     EOF so a restart never re-floods historical notes).
+BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
+BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
+BUILDER_NOTES_LEDGER_MAX=20
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -1029,6 +1041,140 @@ build_operator_inbox() {
   [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
 }
 
+# ── Builder notes (HERD-202) ──────────────────────────────────────────────────────────────────────
+# `_builder_notes_scan` drains NEW builder_note journal events past the cursor into the ledger + one
+# notify each; `build_builder_notes` is the pure console renderer. Both are fail-soft (missing
+# journal / unreadable path / python fail = no-op). First scan with no cursor pins the cursor at EOF
+# so a watcher restart never re-notifies historical notes.
+
+# _builder_notes_journal — resolve the live journal path (JOURNAL_FILE test seam wins; else the
+# standard $TREES/.herd/journal.jsonl the engine writers use). Empty → no destination.
+_builder_notes_journal() {
+  if [ -n "${JOURNAL_FILE:-}" ]; then printf '%s' "$JOURNAL_FILE"; return 0; fi
+  [ -n "${TREES:-}" ] || return 1
+  printf '%s' "$TREES/.herd/journal.jsonl"
+}
+
+# _builder_notes_scan — consume builder_note events past BUILDER_NOTES_CURSOR. For each new event:
+# append a ledger row + fire herd_driver_notify once. Advances the cursor to the end of the journal
+# (or to the last complete line consumed). Fail-soft: never breaks the watch loop.
+_builder_notes_scan() {
+  local jf; jf="$(_builder_notes_journal 2>/dev/null)" || return 0
+  [ -n "$jf" ] && [ -f "$jf" ] || return 0
+
+  local sz; sz="$(wc -c < "$jf" 2>/dev/null | tr -cd '0-9')"; sz="${sz:-0}"
+  [ "$sz" -gt 0 ] 2>/dev/null || return 0
+
+  # First scan: pin cursor at EOF so historical noise never floods the console/notify stream.
+  if [ ! -f "$BUILDER_NOTES_CURSOR" ]; then
+    printf '%s' "$sz" > "$BUILDER_NOTES_CURSOR" 2>/dev/null || true
+    return 0
+  fi
+
+  local off; off="$(tr -cd '0-9' < "$BUILDER_NOTES_CURSOR" 2>/dev/null)"; off="${off:-0}"
+  # Journal rotated/truncated (new file smaller than cursor) → reset to 0 and re-scan the live file.
+  [ "$off" -gt "$sz" ] 2>/dev/null && off=0
+  [ "$sz" -le "$off" ] 2>/dev/null && return 0
+
+  # Extract builder_note rows after the cursor; print new cursor offset on the last line as
+  # "__CURSOR__ <n>". One python pass keeps UTF-8 + partial-line handling correct.
+  local out
+  out="$(JF="$jf" OFF="$off" python3 -c '
+import os, json, sys
+path = os.environ["JF"]
+off = int(os.environ.get("OFF") or "0")
+try:
+    f = open(path, "rb")
+except OSError:
+    sys.exit(0)
+with f:
+    size = f.seek(0, 2)
+    if off > size:
+        off = 0
+    f.seek(off)
+    if off > 0:
+        # Ensure we start at a line boundary (skip a partial first line after a mid-line seek).
+        f.seek(off - 1)
+        if f.read(1) != b"\n":
+            f.readline()
+    pos = f.tell()
+    rows = []
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        pos = f.tell()
+        try:
+            raw = line.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            o = json.loads(raw)
+        except Exception:
+            continue
+        if o.get("event") != "builder_note":
+            continue
+        ts = str(o.get("ts") or "")
+        slug = str(o.get("slug") or "?")
+        text = str(o.get("text") or o.get("note") or "")
+        text = " ".join(text.split())
+        if len(text) > 300:
+            text = text[:299].rstrip() + "…"
+        # TAB-safe (ledger is TSV).
+        text = text.replace("\t", " ")
+        rows.append("%s\t%s\t%s" % (ts, slug, text))
+    for r in rows:
+        print(r)
+    print("__CURSOR__ %d" % pos)
+' 2>/dev/null)" || true
+
+  local new_off="$off" line ts slug text epoch
+  while IFS= read -r line; do
+    case "$line" in
+      "__CURSOR__ "*) new_off="${line#__CURSOR__ }"; new_off="$(printf '%s' "$new_off" | tr -cd '0-9')" ;;
+      *)
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r ts slug text <<EOF
+$line
+EOF
+        [ -n "${slug:-}" ] || continue
+        epoch="$(_now_epoch)"
+        printf '%s\t%s\t%s\t%s\n' "$epoch" "$slug" "$text" "$ts" >> "$BUILDER_NOTES_LEDGER" 2>/dev/null || true
+        herd_driver_notify "📝 builder note · ${slug}" "${text}" default
+        ;;
+    esac
+  done <<< "$out"
+
+  [ -n "$new_off" ] && printf '%s' "$new_off" > "$BUILDER_NOTES_CURSOR" 2>/dev/null || true
+
+  # Bound the ledger to the most recent BUILDER_NOTES_LEDGER_MAX rows (tail-keep).
+  if [ -f "$BUILDER_NOTES_LEDGER" ]; then
+    local n; n="$(wc -l < "$BUILDER_NOTES_LEDGER" 2>/dev/null | tr -cd '0-9')"
+    if [ "${n:-0}" -gt "$BUILDER_NOTES_LEDGER_MAX" ] 2>/dev/null; then
+      tail -n "$BUILDER_NOTES_LEDGER_MAX" "$BUILDER_NOTES_LEDGER" > "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null \
+        && mv "$BUILDER_NOTES_LEDGER.tmp" "$BUILDER_NOTES_LEDGER" 2>/dev/null \
+        || rm -f "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null || true
+    fi
+  fi
+}
+
+# build_builder_notes — the "builder notes" console section: most recent ledger entries, newest
+# first. Empty (BUILDER_NOTES_ROWS="") when the ledger is absent/empty so render() omits the section
+# and the console is byte-identical when unused. Pure renderer — no journal I/O.
+build_builder_notes() {
+  BUILDER_NOTES_ROWS=""
+  [ -s "$BUILDER_NOTES_LEDGER" ] || return 0
+  local epoch slug text ts hhmm rows=""
+  while IFS=$'\t' read -r epoch slug text ts; do
+    [ -n "${slug:-}" ] || continue
+    hhmm="$(epoch_to_hhmm "$epoch")"
+    rows="${rows}    ${C_CYAN}📝${C_RESET} ${C_BOLD}${slug}${C_RESET} ${text} ${C_DIM}${hhmm}${C_RESET}"$'\n'
+  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | head -5)
+  [ -n "$rows" ] && BUILDER_NOTES_ROWS="$rows"
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -1067,6 +1213,11 @@ render() {
   # byte-identical when the feature is unused.
   if [ -n "${OPERATOR_INBOX_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}operator inbox${C_RESET}"$'\n'"${OPERATOR_INBOX_ROWS}"$'\n'
+  fi
+  # BUILDER NOTES (HERD-202) — mid-build findings filed via `herd note`, needs-you-adjacent. Empty
+  # unless a builder has filed a note since the cursor advanced, so byte-identical when unused.
+  if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -7626,6 +7777,12 @@ EOF
     fi
   fi
   build_operator_inbox
+
+  # HERD-202 builder notes — drain NEW builder_note journal events into the ledger + notify stream,
+  # then render the section. Cheap (local journal tail via byte cursor); every tick is fine. Empty
+  # ledger ⇒ build_builder_notes leaves BUILDER_NOTES_ROWS empty ⇒ byte-identical console when unused.
+  _builder_notes_scan
+  build_builder_notes
 
   render
 
