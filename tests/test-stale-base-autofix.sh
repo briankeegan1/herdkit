@@ -318,4 +318,44 @@ row | grep -q 'builder busy' || fail "(15) row must read deferred (got: $(row))"
 eval "$_agent_status_real_15"
 ok "(15) TOCTOU flip defers — no resolver into a live worktree"
 
+# ── (16-18) SUITE WRITE INTERLOCK (HERD-227) ─────────────────────────────────────────────────
+# _health_worker runs the ~9-min suite INSIDE the worktree. The stale-base heal mutates that same tree
+# (pane bounce → `git merge`, or a resolver that merges directly). Before HERD-227 the gate sat behind
+# _healthcheck_gate, whose RUNNING short-circuit made a collision impossible by accident; the hoist
+# removed that, so the interlock is now explicit. A live suite must DEFER the heal without burning the
+# once-guard or a refix round — and the head sha does not move until the builder pushes, so a mutation
+# here would poison the sha-cached verdict.
+suite_marker() { printf '%s' "$TREES/.health-inflight-$1"; }
+
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_LIVENESS=alive STUB_RESOLVER_ALIVE=0 STUB_AGENT_STATUS=idle
+printf '%s\n' "$$" > "$(suite_marker "70-shaS")"        # a LIVE suite (this shell's pid) holds the tree
+_handle_stale_dup 70 slug-a shaS 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "0" ]  || fail "(16) live suite: must NOT pane-bounce into a worktree under a running suite"
+[ "$(rslv)" = "0" ]  || fail "(16) live suite: must NOT spawn a resolver into a worktree under a running suite"
+row | grep -q 'waiting for suite' || fail "(16) row must read deferred (got: $(row))"
+grep -q 'refix_deferred_suite' "$JOURNAL_FILE" || fail "(16) the defer must be journaled"
+[ "$(refix_round_count 70)" = "0" ] || fail "(16) a deferred heal must not spend a refix round"
+refix_attempted 70 shaS stale && fail "(16) a deferred heal must not burn the once-guard"
+ok "(16) live suite defers the stale-base heal — no bounce, no resolver, no budget spent"
+
+# The suite collects (marker gone) → the very next tick heals normally. Same pr+sha: proves the defer
+# left the once-guard intact rather than silently consuming this sha's only heal.
+rm -f "$(suite_marker "70-shaS")"
+_handle_stale_dup 70 slug-a shaS 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "1" ] || fail "(17) after the suite collects, the bounce must fire (got $(runs) pane-runs)"
+row | grep -q 'rebasing' || fail "(17) row must read rebasing (got: $(row))"
+[ "$(refix_round_count 70)" = "1" ] || fail "(17) the healed round must now be recorded"
+ok "(17) suite collects → next tick bounces normally (once-guard survived the defer)"
+
+# A DEAD marker is not a running suite (the worker was severed; the corpse sweep reaps it). Blindness
+# must never freeze the heal forever — fail-soft means "no provable suite ⇒ proceed".
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle
+printf '%s\n' "999999" > "$(suite_marker "71-shaD")"     # pid that cannot be alive
+_handle_stale_dup 71 slug-a shaD 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "1" ] || fail "(18) a DEAD suite marker must not defer the heal (got $(runs) pane-runs)"
+rm -f "$(suite_marker "71-shaD")"
+ok "(18) a dead suite marker is not a running suite — heal proceeds (fail-soft)"
+
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"

@@ -217,6 +217,17 @@ _handle_health_codeerror 40 slug-a shaLEAK 0 "$T/wt" "❌ tab-leak-guard: 1 unex
 row | grep -q 'tab-leak-guard' || fail "(8) the leak-guard row must be preserved verbatim"
 ok
 
+# ── (8b) a bats red NAMING the guard is a code error, and DOES bounce (HERD-228) ────────────────
+# tests/herd.bats names three tests "hermetic tab-leak-guard …", so a failing one carries the literal
+# the exemption used to substring-match. The exemption is anchored now: only the guard's own failure
+# line is infra; a TAP 'not ok' is a builder's problem, whatever the test is called.
+reset_state
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 41 slug-a shaBATS 0 "$T/wt" "not ok 41 hermetic tab-leak-guard deflake (HERD-93) test passes"
+[ "$(runs)" = "1" ] || fail "(8b) a bats red naming the guard MUST bounce the builder (got $(runs))"
+[ "$(refix_round_count 41)" = "1" ] || fail "(8b) a bats red naming the guard MUST consume a round"
+ok
+
 # ── (9) dry-run never bounces ───────────────────────────────────────────────────────────────────
 reset_state
 DRYRUN=1 _handle_health_codeerror 50 slug-a shaD 0 "$T/wt" "$NOTOK"
