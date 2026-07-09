@@ -5752,6 +5752,13 @@ if FULL:
 # refix bounces, limit park/resume, reaps, and recorded cost. Fail-soft: an empty or missing journal
 # prints an all-zeros card, never an error. No filter = all time; --today / --since <date> restrict by
 # the ISO ts; --pr N restricts to one PR. Filters compose (AND).
+# cmd_changelog — journal-driven CHANGELOG + release-tag helper (HERD-256). Pure dispatch to
+# scripts/herd/changelog.sh; the script is the single source of truth (also standalone-runnable).
+# Ship-dormant / read-mostly: never auto-run by the watcher. Deterministic — no LLM.
+cmd_changelog() {
+  bash "$SCRIPTS_DIR/changelog.sh" "$@"
+}
+
 cmd_stats() {
   local pr="" since="" today=0
   while [ $# -gt 0 ]; do
@@ -6217,6 +6224,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       reaps, and recorded cost. No filter = all time; --today /
                                       --since <date> bound by the ISO ts; --pr N scopes to one PR.
                                       Fail-soft: an empty/missing journal prints an all-zeros card
+  herd changelog [generate|tag <ver>] journal-driven CHANGELOG + release-tag helper (HERD-256):
+                                      generate reads merge events from .herd/journal.jsonl and
+                                      conventional-commit subjects, then writes/updates the
+                                      ## [Unreleased] section of CHANGELOG.md (deterministic, no
+                                      LLM). tag <ver> promotes [Unreleased] → [ver] - date and cuts
+                                      a local annotated git tag. Ship-dormant — never auto-run;
+                                      does not push or publish (see docs/releasing.md)
   herd backlog                        list open work items via the active backend
               [--rich]                TSV with workflow state + description (backends that
                                       support it; others fall back to the plain list)
@@ -6302,6 +6316,7 @@ case "${1:-help}" in
   approve) shift; cmd_approve "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
+  changelog) shift; cmd_changelog "$@" ;;
   update)  shift; cmd_update "$@" ;;
   agent-update) shift; cmd_agent_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;

@@ -439,6 +439,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic watcher sha-resilient PR join + branch auto-repair (HERD-226) test passes" {
+  run bash "$REPO/tests/test-watcher-sha-join.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher GH CI check-run gate events (HERD-197) test passes" {
   run bash "$REPO/tests/test-watcher-ci-gate-events.sh"
   [ "$status" -eq 0 ]

@@ -441,6 +441,49 @@ Flags: `--artifacts DIR` (repo(s) + scorecard; `--keep` implied), `--keep`. Env:
 `../../../tests/test-sandbox-governance.sh` (end-to-end all-pass, field accounting, the negative leg's
 single-flip loud failure, determinism across two runs, and no leak into the real repo).
 
+## HERD-236 — MULTI-SEAT + STARVATION scenario — `sandbox-multiseat-scenario.sh`
+
+No prior tier runs **two watchers** against one repo. Every multi-seat invariant (blessing dedup via
+`herd/gates`, hold-comment once-per-sha, resolver single-flight, merge fairness under re-stale
+pressure) was proven only in prod. This tier closes that gap.
+
+It stands up **two REAL watcher gate loops** (`agent-watch.sh` sourced in lib mode,
+`AGENT_WATCH_LIB=1`), each with its **own `$TREES`** (seat-local ledgers) and a **shared stub
+remote** (`gh` on `PATH` recording merges / statuses / comments). Both seats clone one bare origin
+carrying N≥2 stub-builder PRs (deterministic tiny changes, **no model call**), with
+`WATCHER_SCOPE=all` and alternating PR authors so each seat owns half the queue. Tick-by-tick each
+seat drives the **shipped** gate functions (`_healthcheck_gate`, `_review_gate_step`,
+`post_gate_status`, `do_merge`, `_classify_conflict` / `spawn_resolver`, `_restale_note` /
+`_merge_fairness_reorder`) until the shared remote shows every owned PR `MERGED`.
+
+Scorecard asserts (`result: pass` iff `failed == 0`):
+
+| Field | Invariant |
+| --- | --- |
+| `duplicate_gate_runs` | **0** — each `(pr,sha)` gets at most one `herd/gates=success` POST / no cross-seat health re-run for the same owned sha |
+| `duplicate_hold_comments` | **0** — each `(pr, kind)` hold comment lands at most once across seats |
+| `resolver_double_dispatch` | **0** — the owning seat dispatches a resolver **exactly once** for a CONFLICTING sha (2nd tick holds) |
+| `max_restale_cycles` | **bounded** — under `MERGE_FAIRNESS=on`, max re-stale laps ≤ `_RESTALE_STARVE_THRESHOLD` while the queue drains |
+| `queue_drained` | **true** — every owned PR merges exactly once on the shared remote |
+
+```sh
+# Drain 4 PRs across two seats; inspect the scorecard:
+bash scripts/herd/sim/sandbox-multiseat-scenario.sh --artifacts /tmp/multiseat-run
+cat /tmp/multiseat-run/scorecard.json
+
+# Wider fan-out:
+bash scripts/herd/sim/sandbox-multiseat-scenario.sh --artifacts /tmp/ms6 -n 6
+```
+
+Flags: `--artifacts DIR` (`--keep` implied), `--keep`, `-n/--prs N` (default 4, min 2). Env:
+`MERGE_FAIRNESS` (default `on`), `SANDBOX_REVIEW_DELAY` (default 0). Hermetic proof:
+`../../../tests/test-sandbox-multiseat.sh`.
+
+> Two seats, one stub remote, zero model calls, no herdr panes. The scorecard also records
+> `cross_seat_resolver_probe` (whether a second seat's empty local ledger would also dispatch a
+> resolver for the same CONFLICTING sha — the G5 observation from the multi-seat doctrine audit);
+> the shippable fail-gate is per-seat single-flight (`resolver_double_dispatch=0`).
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -453,6 +496,7 @@ single-flip loud failure, determinism across two runs, and no leak into the real
 | **P2c** | `sandbox-real-remote-scenario.sh` | a **real** disposable GitHub repo (opt-in) | real `gh pr create` / watcher poll / `gh pr merge`, **guaranteed repo cleanup** |
 | **HERD-74** | `sandbox-shared-config-scenario.sh` | real `config set --shared` **+** the real watcher gate | a `config/<key>` branch with **no worktree** is **adopted → gated → merged → reaped** |
 | **HERD-127** | `sandbox-governance-scenario.sh` | the real HERD-119 adoption table **+** the shipped PUSH_GATE / ATTRIBUTION / BRANCH_TEMPLATE / COMMIT_CONVENTION gates | the whole governance **import→enforcement chain**: `CLAUDE.md` → mapped keys → held/refused/reddened at the gate (zero model calls) |
+| **HERD-236** | `sandbox-multiseat-scenario.sh` | **two real** watcher gate loops, two `$TREES`, one stub remote | multi-seat: `duplicate_gate_runs=0` / `duplicate_hold_comments=0` / `resolver_double_dispatch=0` / `max_restale_cycles` bounded / all-PRs-drained |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique
