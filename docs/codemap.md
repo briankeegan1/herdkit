@@ -214,6 +214,12 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `JOURNAL_AUDIT` → `agent-watch.sh`, `journal-audit.sh`
+- `JOURNAL_AUDIT_DISPATCH_TTL` → `journal-audit.sh`
+- `JOURNAL_AUDIT_MERGE_GRACE` → `journal-audit.sh`
+- `JOURNAL_AUDIT_PUSHED_GRACE` → `journal-audit.sh`
+- `JOURNAL_AUDIT_RED_TTL` → `journal-audit.sh`
+- `JOURNAL_AUDIT_REFIX_TTL` → `journal-audit.sh`
+- `JOURNAL_AUDIT_WINDOW_SECS` → `journal-audit.sh`
 - `JOURNAL_KEEP_DAYS` → `journal.sh`
 - `JOURNAL_MAX_MB` → `journal.sh`
 - `LIFECYCLE_CONTRACTS` → `lifecycle.sh`
