@@ -170,7 +170,7 @@ render_skill() {
     local out="$out_dir/$name.md"
 
     # ── Driver: the runtime-specific control surface (multiplexer + agent runtime). HERD_DRIVER
-    # (default herdr-claude, the only driver shipped) selects templates/drivers/<driver>.driver,
+    # (default herdr-claude; headless + a stub proof driver also ship) selects templates/drivers/<driver>.driver,
     # whose DRIVER_* bindings are substituted into the {{DRIVER_*}} tokens below — the SAME token
     # machinery as the other keys. Default renders the skill functionally identical to before the
     # abstraction (see docs/driver-abstraction.md). Unknown value ⇒ loud error listing what ships.
@@ -1365,6 +1365,32 @@ cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
 # sharpen its overlap read to symbol level. Idempotent; maps the engine, needs no .herd/config.
 # `herd symbol-index --check` is a read-only staleness probe (0 fresh / non-zero stale), like codemap.
 cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
+
+# ── herd map: render the operator-facing control-room map (docs/control-room-map.md) ─────────────
+# The one-page DECISION GRAPH of how a change ships end-to-end: coordinator → lanes (feature/quick)
+# → builder worktree → watcher gates (healthcheck + review) → verdict branches (PASS/BLOCK/refix) →
+# merge policy → post-merge reconcile, PLUS bug routing (APP vs HERD-ENGINE), the async lanes
+# (scribe/research), and the safety rails. The FLOW complement to `herd codemap` (the FILE map,
+# docs/codemap.md) and docs/driver-abstraction.md (the ONE runtime seam). Distinct from codemap —
+# codemap regenerates a scanned artifact; this just RENDERS the committed, hand-authored doc.
+# Read-only + fail-soft: renders with glow (themed) when available, else cat; a broken/absent glow
+# or theme degrades to plain text, never a crash.
+cmd_map() {
+  local doc="$HERDKIT_HOME/docs/control-room-map.md"
+  [ -f "$doc" ] || die "control-room map not found at $doc — is this the herdkit engine repo?"
+  if command -v glow >/dev/null 2>&1; then
+    local style; style="$(herd_theme_glow_style 2>/dev/null || true)"
+    if [ -n "$style" ] && [ -f "$style" ]; then
+      glow -s "$style" "$doc" && return 0
+    else
+      glow "$doc" && return 0
+    fi
+    # glow is present but the render failed (e.g. a terminal-capability probe) — fall through to a
+    # plain cat rather than showing nothing. Warn once so the degradation is visible, never fatal.
+    warn "glow could not render the control-room map — showing plain text"
+  fi
+  cat "$doc"
+}
 
 # ── herd ledger: the coordinator progress ledger read/write surface (HERD-103) ───────────────────
 # Durable, cross-session coordinator state (per work-item: slug/worktree/PR, sequencing, planned
@@ -2752,6 +2778,13 @@ cmd_conformance() {
 # user with a broken/weird setup can self-diagnose anytime; also the gate cmd_init runs before it
 # writes any config, and install.sh runs (advisory) at install time. Exits non-zero when a HARD dep
 # is missing/broken so `herd doctor` is scriptable in CI.
+#
+#   herd doctor              the dependency doctor (git/gh/claude/python3/herdr + config dup lint).
+#   herd doctor --posture    the CONFIG-POSTURE doctor (HERD-154): a deterministic, no-LLM, report-only
+#                            lint of THIS project's live .herd/config — flags incoherent knob combos
+#                            (a lever superseded/ignored by another key) and reports whether the
+#                            operator's effective posture is exercised by the posture-matrix sim. It is
+#                            advisory: always exits 0, never a gate (scripts/herd/posture-lint.sh).
 cmd_doctor() {
   # Source the config loader too: herd_doctor's config-dup check (issue #115) uses its scanner
   # (_herd_config_dup_keys). Pre-set the once-per-process marker so the loader's PASSIVE dup warning
@@ -2761,7 +2794,15 @@ cmd_doctor() {
   . "$SCRIPTS_DIR/herd-config.sh"
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-preflight.sh"
-  herd_doctor || exit 1
+  case "${1:-}" in
+    --posture)
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/posture-lint.sh"
+      herd_doctor_posture   # report-only, always 0 — advisory, never a gate
+      return 0 ;;
+    "") herd_doctor || exit 1 ;;
+    *)  die "usage: herd doctor [--posture]" ;;
+  esac
 }
 
 cmd_status() {
@@ -4810,6 +4851,26 @@ print("\n".join(working))
   cmd_reload
 }
 
+# ── herd agent-update: safe self-update of the AGENT RUNTIME (HERD-149) ──────────────────────────
+# Distinct from `herd update` (which pulls the herdkit ENGINE): this updates the agent RUNTIME the
+# active driver points at (claude — or, via the driver seam, codex/grok). Opt-in via AGENT_UPDATE;
+# off (default) is a no-op. Detects the installer (brew/npm/native), runs the update, and de-quarantines
+# the binary on macOS (the issue #137 footgun). The mechanism lives in scripts/herd/agent-update.sh;
+# this just loads config + the driver seam and delegates. --dry-run previews commands without running.
+cmd_agent_update() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # driver.sh (for herd_driver_agent_value) is sourced at the top of this file; agent-update.sh adds
+  # the mechanism. Both define functions only, so sourcing here is side-effect-free.
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/agent-update.sh"
+  agent_update_run "$@"
+}
+
 # ── herd log / herd why: read the engine journal ────────────────────────────────────────────────
 # The journal is the append-only forensic record written by the engine components (agent-watch.sh,
 # herd-review.sh, cmd_reload) via scripts/herd/journal.sh. `herd log` pages it; `herd why <pr>`
@@ -5164,6 +5225,148 @@ if FULL:
 '
 }
 
+# cmd_stats — the SHEPHERD'S DIGEST CARD (HERD-146): a compact, DETERMINISTIC (zero-LLM) rollup of a
+# window of the engine journal. Same reader pattern as cmd_cost: resolve the journal via the shared
+# config loader, scan the live journal + rotated archives, aggregate in python. Counts the herd's
+# throughput and friction over a window: PRs merged (a 🐑 each), review verdicts (with provenance),
+# refix bounces, limit park/resume, reaps, and recorded cost. Fail-soft: an empty or missing journal
+# prints an all-zeros card, never an error. No filter = all time; --today / --since <date> restrict by
+# the ISO ts; --pr N restricts to one PR. Filters compose (AND).
+cmd_stats() {
+  local pr="" since="" today=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --today)   today=1; shift ;;
+      --since)   since="${2:-}"; [ -n "$since" ] || die "--since requires a date (YYYY-MM-DD)"; shift 2 ;;
+      --since=*) since="${1#--since=}"; [ -n "$since" ] || die "--since requires a date (YYYY-MM-DD)"; shift ;;
+      --pr)      pr="${2:-}"; [ -n "$pr" ] || die "--pr requires a PR number"; shift 2 ;;
+      --pr=*)    pr="${1#--pr=}"; shift ;;
+      *) die "usage: herd stats [--today|--since <date>|--pr N]" ;;
+    esac
+  done
+  case "$pr" in \#*) pr="${pr#\#}" ;; esac
+  [ -z "$pr" ] || [ -z "${pr//[0-9]/}" ] || die "herd stats: --pr must be a number (got '$pr')"
+  # --today is sugar for --since <today, UTC>; compute the day here so python only sees one ISO bound.
+  local day=""
+  if [ "$today" -eq 1 ]; then
+    day="$(date -u +%Y-%m-%d 2>/dev/null || true)"
+  fi
+  _journal_load_config
+  if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
+  local files; files="$(_journal_all_files)"
+  # NOTE: never early-return on a missing journal — an empty scan must still render a zeros card.
+  printf '%s\n' "$files" | HERD_STATS_PR="$pr" HERD_STATS_SINCE="$since" HERD_STATS_DAY="$day" \
+    PYTHONIOENCODING=utf-8 python3 -c '
+import sys, os, json
+want_pr    = os.environ.get("HERD_STATS_PR", "")
+want_since = os.environ.get("HERD_STATS_SINCE", "")
+want_day   = os.environ.get("HERD_STATS_DAY", "")
+
+rows = []
+for path in sys.stdin.read().split("\n"):
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            rows.append(o)
+
+def keep(o):
+    if want_pr and str(o.get("pr", "")) != want_pr:
+        return False
+    ts = str(o.get("ts", ""))
+    # ISO-8601 UTC sorts lexically, so a plain string compare is a correct date bound.
+    if want_day and not ts.startswith(want_day):
+        return False
+    if want_since and ts < want_since:
+        return False
+    return True
+
+rows = [o for o in rows if keep(o)]
+
+def fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+merges = 0
+verdicts_by_value = {}      # APPROVE / BLOCK / ...
+verdicts_by_source = {}     # reviewer / gate_default / infra / ...
+refix_bounces = 0
+limit_parks = 0
+limit_resumes = 0
+reaps = 0
+cost_usd = 0.0
+cost_events = 0
+for o in rows:
+    ev = o.get("event")
+    if ev == "merge":
+        merges += 1
+    elif ev == "verdict_recorded":
+        val = str(o.get("value", "?")) or "?"
+        src = str(o.get("source", "reviewer")) or "reviewer"
+        verdicts_by_value[val]  = verdicts_by_value.get(val, 0) + 1
+        verdicts_by_source[src] = verdicts_by_source.get(src, 0) + 1
+    elif ev == "refix_bounce":
+        refix_bounces += 1
+    elif ev == "limit_detected":
+        limit_parks += 1
+    elif ev == "limit_resume_result":
+        limit_resumes += 1
+    elif ev == "reap":
+        reaps += 1
+    elif ev == "cost":
+        cost_usd += fnum(o.get("usd"))
+        cost_events += 1
+
+# Scope line — describe the window the card covers.
+if want_pr:
+    scope = "PR #%s" % want_pr
+elif want_day:
+    scope = "today (%s UTC)" % want_day
+elif want_since:
+    scope = "since %s" % want_since
+else:
+    scope = "all time"
+# --pr may also carry a time bound; note it so the header is never misleading.
+if want_pr and (want_day or want_since):
+    scope += " · since %s" % (want_day or want_since)
+
+def kv(d):
+    # stable order: highest count first, then name — deterministic for tests.
+    if not d:
+        return "none"
+    return " · ".join("%s %d" % (k, d[k]) for k in sorted(d, key=lambda k: (-d[k], k)))
+
+sheep = "\U0001F411" * min(merges, 20)
+
+print("\U0001F411 Shepherd’s digest — %s" % scope)
+print("")
+print("  Merged PRs         %-4d %s" % (merges, sheep))
+print("  Review verdicts    %-4d %s" % (sum(verdicts_by_value.values()), kv(verdicts_by_value)))
+print("    by provenance         %s" % kv(verdicts_by_source))
+print("  Refix bounces      %d" % refix_bounces)
+print("  Limit park/resume  %d / %d" % (limit_parks, limit_resumes))
+print("  Reaps              %d" % reaps)
+print("  Cost recorded      $%.4f (%d event%s)" % (cost_usd, cost_events, "" if cost_events == 1 else "s"))
+if not rows:
+    print("")
+    print("  (no journal events in scope — all zeros)")
+'
+}
+
 # ── cmd_fleet — the DETERMINISTIC (no-LLM) multi-project fan-out (P0 of the fleet-coordinator EPIC) ──
 # A parent orchestration layer above the per-project coordinators: a flat project REGISTRY plus a
 # read-mostly rollup (`status`) and bulk delegation of the existing per-project `herd update`/`herd
@@ -5219,6 +5422,125 @@ EOF
   esac
 }
 
+# ── herd theme (HERD-145): the operator PICKER over the pluggable-theming seam (scripts/herd/theme.sh)
+# A thin, deterministic surface — it never re-implements resolution, it drives the same dirs theme.sh
+# reads and the same validated `herd config set` path an operator would use by hand:
+#   list                 the catalog — every engine BUILT-IN (templates/themes/) + every USER theme
+#                        (.herd/themes/), the ACTIVE one (current HERD_THEME) marked.
+#   preview [<name>]     render <name>'s palette as color swatches (default: the active theme).
+#   set <name>           validate <name> resolves to a COMPLETE theme dir, then write HERD_THEME via
+#                        `herd config set` (manifest validation + the watcher restart that repaints
+#                        every live surface). Refuses an unknown/incomplete theme rather than
+#                        persisting a value that would silently fall back to tokyonight at render time.
+# Fail-soft + NO_COLOR-aware throughout: swatches come from the theme's own C_* via
+# herd_theme_load_console, which blanks every color under NO_COLOR / a non-TTY stdout (plain output).
+
+# _theme_builtins_dir / _theme_user_dir — the two catalog roots, mirroring theme.sh's search order.
+_theme_builtins_dir() { printf '%s' "$TEMPLATES_DIR/themes"; }
+_theme_user_dir()     { printf '%s' "$(pwd)/.herd/themes"; }
+
+# _theme_dir_ok <dir> — true when <dir> is a COMPLETE theme (both files present). Mirrors theme.sh's
+# _herd_theme_dir_ok, so `list`/`preview`/`set` agree with the resolver on what counts as a theme.
+_theme_dir_ok() { [ -n "${1:-}" ] && [ -f "$1/palette.sh" ] && [ -f "$1/glow.json" ]; }
+
+# _theme_active — the persistent active theme name: the per-user overlay (.herd/config.local) value
+# wins over the committed baseline (.herd/config), matching load-time precedence; empty/unset →
+# tokyonight (the shipped default). Read-only; no sourcing, so it never triggers config side effects.
+_theme_active() {
+  local root cfg local_cfg v=""; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$local_cfg" ] && v="$(_config_file_value "$local_cfg" HERD_THEME)"
+  [ -z "$v" ] && [ -f "$cfg" ] && v="$(_config_file_value "$cfg" HERD_THEME)"
+  printf '%s' "${v:-tokyonight}"
+}
+
+# _theme_list — the catalog. Built-ins first, then user themes; the active theme is marked. A user
+# theme that shadows a built-in of the same name (theme.sh resolves user first) is noted as such.
+_theme_list() {
+  local bdir udir active; bdir="$(_theme_builtins_dir)"; udir="$(_theme_user_dir)"; active="$(_theme_active)"
+  local d name mark tag
+  say "${c_bold}Themes${c_rst} ${c_dim}(active: ${active} — set with 'herd theme set <name>')${c_rst}"
+  say ""
+  say "${c_bold}built-in${c_rst} ${c_dim}${bdir}${c_rst}"
+  if [ -d "$bdir" ]; then
+    for d in "$bdir"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      mark="  "; [ "$name" = "$active" ] && mark="${c_grn}●${c_rst} "
+      tag=""; _theme_dir_ok "$d" || tag=" ${c_yel}(incomplete — missing palette.sh or glow.json)${c_rst}"
+      _theme_dir_ok "$udir/$name" && tag="$tag ${c_dim}(overridden by a user theme)${c_rst}"
+      printf '  %s%s%s\n' "$mark" "$name" "$tag"
+    done
+  fi
+  say ""
+  say "${c_bold}user${c_rst} ${c_dim}${udir}${c_rst}"
+  if [ -d "$udir" ] && [ -n "$(ls -A "$udir" 2>/dev/null)" ]; then
+    for d in "$udir"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      mark="  "; [ "$name" = "$active" ] && mark="${c_grn}●${c_rst} "
+      tag=""; _theme_dir_ok "$d" || tag=" ${c_yel}(incomplete — missing palette.sh or glow.json)${c_rst}"
+      printf '  %s%s%s\n' "$mark" "$name" "$tag"
+    done
+  else
+    printf '  %s(none — drop palette.sh + glow.json into .herd/themes/<name>/ to add one)%s\n' "$c_dim" "$c_rst"
+  fi
+}
+
+# _theme_swatch <color-escape> <label> — one swatch row (a colored block + its label). Under
+# NO_COLOR / non-TTY the escape and reset are blank, so it degrades to a plain "     label" row.
+_theme_swatch() { printf '  %s██████%s  %s\n' "${1:-}" "${C_RESET:-}" "$2"; }
+
+# _theme_preview [<name>] — render a theme's palette swatches (default: the active theme). Fail-soft:
+# refuses a name that resolves to no complete dir. Loads the palette by pointing the resolver at the
+# theme (HERD_THEME=<name>) in a subshell, so it never disturbs the caller's palette; the swatches go
+# plain automatically under NO_COLOR / a non-TTY stdout.
+_theme_preview() {
+  local name="${1:-}"; [ -n "$name" ] || name="$(_theme_active)"
+  local udir bdir dir="" src=""
+  udir="$(_theme_user_dir)/$name"; bdir="$(_theme_builtins_dir)/$name"
+  if   _theme_dir_ok "$udir"; then dir="$udir"; src="user"
+  elif _theme_dir_ok "$bdir"; then dir="$bdir"; src="built-in"
+  else die "no theme '$name' — run 'herd theme list' to see available themes"
+  fi
+  (
+    export HERD_THEME="$name" PROJECT_ROOT="$(pwd)"
+    herd_theme_load_console
+    say "${c_bold}${name}${c_rst} ${c_dim}(${src} · ${dir})${c_rst}"
+    _theme_swatch "$C_BLUE"   "blue    (headings, links)"
+    _theme_swatch "$C_CYAN"   "cyan    (accents)"
+    _theme_swatch "$C_GREEN"  "green   (ok / building)"
+    _theme_swatch "$C_YELLOW" "yellow  (warnings)"
+    _theme_swatch "$C_RED"    "red     (errors / dead)"
+    _theme_swatch "$C_DIM"    "dim     (secondary text)"
+  )
+}
+
+# _theme_set <name> — the VALIDATED switch. Refuse an unknown/incomplete theme up front (the whole
+# point of `set` is not to persist a value that silently falls back), then route the write through
+# `herd config set` so it inherits manifest validation + the watcher restart (HERD_THEME is
+# watcher-affecting). config set is idempotent, so re-setting the active theme is a clean no-op.
+_theme_set() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: herd theme set <name>"
+  local udir bdir; udir="$(_theme_user_dir)/$name"; bdir="$(_theme_builtins_dir)/$name"
+  if ! _theme_dir_ok "$udir" && ! _theme_dir_ok "$bdir"; then
+    die "no theme '$name' (needs palette.sh + glow.json under .herd/themes/$name/ or a built-in) — run 'herd theme list'"
+  fi
+  cmd_config_set HERD_THEME "$name"
+}
+
+# cmd_theme — dispatch for `herd theme <list|preview|set>`.
+cmd_theme() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    list)         _theme_list "$@" ;;
+    preview)      _theme_preview "$@" ;;
+    set)          _theme_set "$@" ;;
+    ""|-h|--help) say "usage: herd theme list | preview [<name>] | set <name>" ;;
+    *)            die "unknown 'herd theme' subcommand '$sub' — usage: herd theme list | preview [<name>] | set <name>" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
@@ -5229,6 +5551,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       report every problem at once with per-platform install hints;
                                       soft deps (glow, shellcheck, bats) warn only. Exits non-zero
                                       when a required dep is missing/broken. (bypass: HERD_SKIP_DOCTOR=1)
+  herd doctor --posture               config-posture lint (no-LLM, report-only): flag incoherent knob
+                                      combos (a lever superseded/ignored by another key, each with a
+                                      fix hint) and report whether your effective posture is exercised
+                                      by the posture-matrix sim. Advisory — always exits 0.
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
@@ -5238,6 +5564,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
                                         def→caller index of the engine tree (who-defines / who-calls);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
+  herd map                            render docs/control-room-map.md: the one-page operator DECISION
+                                        GRAPH of how a change ships (coordinator → lanes → builder →
+                                        watcher gates → verdicts → merge policy → reconcile; bug
+                                        routing; async lanes; safety rails). glow if available, else cat
   herd ledger <set|get|list|rm|compact|path>  coordinator PROGRESS LEDGER — durable, cross-session
                                       per-work-item state (slug/worktree/PR, sequencing, planned
                                       markers) keyed by tracker id, so you resume with an accurate
@@ -5267,6 +5597,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd theme <list|preview|set>       pick the active color THEME (HERD_THEME) across every herd
+                                        list             the catalog: built-in themes (templates/
+                                                      themes/) + user themes (.herd/themes/), active marked
+                                        preview [<name>] render a theme's palette as color swatches
+                                                      (default: the active theme)
+                                        set <name>    switch the active theme via the validated
+                                                      'herd config set HERD_THEME' (restarts the watcher
+                                                      so every live surface repaints); refuses an unknown
+                                                      theme. NO_COLOR / non-TTY renders plain
   herd conformance <report|run>       the capability CONFORMANCE MATRIX — join capabilities.tsv against
                                         the committed proof map templates/conformance.tsv:
                                         report [--json]  DETERMINISTIC, no-LLM: every capability with NO
@@ -5305,6 +5644,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       coordinator skill, and reload the workspace in one step;
                                       refuses if the engine checkout is dirty or builders are
                                       mid-flight (--force overrides both guards)
+  herd agent-update [--dry-run]       safely update the AGENT RUNTIME (claude/codex/grok per driver):
+                                      opt-in via AGENT_UPDATE (off = no-op); detects the installer
+                                      (brew/npm/native), runs it, and de-quarantines the binary on
+                                      macOS (issue #137). --dry-run previews without running
   herd log [--pr N] [--tail]          page the engine journal (.herd/journal.jsonl): one line per
                                       gate event; --pr filters to one PR, --tail follows live
   herd status                         one-shot READ-ONLY control-room snapshot for THIS project:
@@ -5321,6 +5664,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       transcripts and appends their token/USD + a complete session
                                       total (the default view stays merge-gated + unchanged).
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
+  herd stats [--today|--since <date>|--pr N]
+                                      a shepherd's digest CARD: a compact, deterministic (no-LLM)
+                                      rollup of a journal window — PRs merged (a 🐑 each), review
+                                      verdicts (with provenance), refix bounces, limit park/resume,
+                                      reaps, and recorded cost. No filter = all time; --today /
+                                      --since <date> bound by the ISO ts; --pr N scopes to one PR.
+                                      Fail-soft: an empty/missing journal prints an all-zeros card
   herd backlog                        list open work items via the active backend
               [--rich]                TSV with workflow state + description (backends that
                                       support it; others fall back to the plain list)
@@ -5388,9 +5738,11 @@ case "${1:-help}" in
   render)  shift; cmd_render "$@" ;;
   codemap) shift; cmd_codemap "$@" ;;
   symbol-index) shift; cmd_symbol_index "$@" ;;
+  map)     shift; cmd_map "$@" ;;
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
   governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
@@ -5399,7 +5751,9 @@ case "${1:-help}" in
   status)  shift; cmd_status "$@" ;;
   why)     shift; cmd_why "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
+  stats)   shift; cmd_stats "$@" ;;
   update)  shift; cmd_update "$@" ;;
+  agent-update) shift; cmd_agent_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   backend) shift; cmd_backend "$@" ;;
   report)  shift; cmd_report "$@" ;;

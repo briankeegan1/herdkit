@@ -234,6 +234,12 @@ DEP_STATES_FILE="${DEP_STATES_FILE:-${HERD_DEPWATCHER_LOCK%.pid}.states}"
 # silent forever-hold. Rows for vanished intents (spawned / skipped / operator-cleared) are pruned by
 # build_spawn_holds so the ledger cannot grow unbounded.
 SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
+# Daily-budget drain-pause state (HERD-95): 1 while the spawn-queue drain is PAUSED because today's
+# recorded spend has exceeded BUDGET_DAILY, else empty. In-process only (the watch loop is one long
+# process), so the pause is journaled ONCE per continuous over-budget stretch — not every 4s tick —
+# and cleared when spend falls back under the ceiling. Untouched (stays empty) when BUDGET_DAILY is
+# dormant, so a no-budget watcher is byte-identical to before.
+_BUDGET_DRAIN_PAUSED=""
 # Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
 # DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
@@ -4711,8 +4717,14 @@ record_healthcheck() {
 # every ledger write in the tick process, ordered. Runs in a subshell fork so all helpers are in scope.
 _health_worker() {
   local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line
+  # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
+  # tree) + a sha-keyed cache dir so a candidate whose failures ALL already fail on the base is
+  # surfaced as an inherited ⚠️ (rc 0 → CLEAN) instead of a merge-blocking code error — no fix-PR
+  # deadlocks on an inherited base failure. Scoped to THIS candidate gate only; the main-health worker
+  # deliberately does NOT set it (comparing main against itself would mask a genuine MAIN RED).
   # FULL run streamed to the live log (redirect = tailable as it runs); rc drives the verdict class.
-  bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
+  HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
   _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
   if [ "$_hw_rc" -eq 0 ]; then
     case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
@@ -4720,7 +4732,9 @@ _health_worker() {
     _hw_notok="$(_health_first_notok "$_hw_log")"; [ -n "$_hw_notok" ] || _hw_notok="$_hw_first"
     _hw_id="$(_health_fail_identity "$_hw_notok")"
     # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
-    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    # Baseline-aware on the retry too (HERD-190), so an inherited-only failure still collapses to rc 0.
+    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+      bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
       _hw_line="FLAKY"$'\t'"$_hw_id"
@@ -5420,6 +5434,27 @@ _drain_spawn_queue() {
   local _dsq_q="$TREES/spawn-queue"
   [ -d "$_dsq_q" ] || return 0
   ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+
+  # Daily-budget governance (HERD-95): PAUSE draining when today's recorded spend has EXCEEDED
+  # BUDGET_DAILY. The lanes refuse a spawn individually too, but pausing the drain here stops the
+  # watcher from feeding the queue into those refusals every tick and burning claim churn. The pause is
+  # journaled ONCE per continuous over-budget stretch ($_BUDGET_DRAIN_PAUSED) and cleared when spend
+  # falls back under the ceiling. DORMANT when BUDGET_DAILY is empty (budget_daily_exceeded returns 1
+  # with no work) → byte-identical to before. HERD_FORCE_SPAWN=1 on the watcher overrides the pause.
+  if [ "${HERD_FORCE_SPAWN:-}" != "1" ]; then
+    local _dsq_over
+    if _dsq_over="$(budget_daily_exceeded)"; then
+      if [ "$_BUDGET_DRAIN_PAUSED" != "1" ]; then
+        journal_append budget_drain_paused spent "${_dsq_over%% *}" budget "${_dsq_over##* }"
+        _BUDGET_DRAIN_PAUSED=1
+      fi
+      return 0
+    fi
+  fi
+  if [ "$_BUDGET_DRAIN_PAUSED" = "1" ]; then
+    journal_append budget_drain_resumed
+    _BUDGET_DRAIN_PAUSED=""
+  fi
 
   # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
   local _dsq_cap _dsq_budget

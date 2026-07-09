@@ -281,6 +281,18 @@ esac
 # paths see it under `set -u`.
 : "${DOCTOR_STARTUP_HINT:="off"}"
 
+# AGENT_UPDATE — opt-in safe self-update of the AGENT RUNTIME (HERD-149). Default "off": nothing runs,
+# byte-identical to today — operators keep updating claude (or, via the driver seam, codex/grok) by
+# hand or a personal OS job, outside the engine. Set "on" and `herd agent-update` (scripts/herd/
+# agent-update.sh) DETECTS the installer (brew/npm/native) of the runtime HERD_DRIVER points at, runs
+# the update, and — the whole point — HANDLES the macOS footgun where a `brew upgrade --cask` leaves
+# the new binary com.apple.quarantine'd so every new exec hangs in _dyld_start (issue #137): it
+# xattr-de-quarantines the resolved binary after the update. DRIVER-AWARE (updates whichever runtime
+# the active driver binds via DRIVER_AGENT_BINARY/_NPM_PKG/_BREW_PKG/_NATIVE_UPDATE) and FAIL-SOFT (a
+# missing runtime / failed installer command warns, never hard-aborts). Any value other than "on" is
+# off. Defaulted here so the mechanism + CLI see it under `set -u`.
+: "${AGENT_UPDATE:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)
@@ -417,6 +429,15 @@ fi
 : "${INTERACTION_TEST_CMD:=""}"   # command that drives widgets and asserts dependent output changes; exit 0 clean, 1 code error, 2 data/env
 : "${SMOKE_CMD:=""}"              # optional resolver smoke gate
 
+# BASELINE_AWARE_GATE — baseline-aware healthcheck gate (HERD-190). on (default) → a heavy code error
+# whose failing tests ALL already fail on the base (origin/main) is treated as INHERITED (a tolerated
+# ⚠️), not a merge-blocking code error, so a fix-PR never deadlocks on a base failure it did not
+# introduce. Only ever DOWNGRADES a red to a tolerated ⚠️; byte-identical when the base is green (an
+# empty base known-failure set = every PR failure is introduced) and fully fail-soft (an unresolvable
+# or unparseable base blocks exactly as before). off → the classic absolute pass/fail gate, byte-
+# identical to pre-HERD-190. Consumed by healthcheck.sh (the watcher passes HERD_BASELINE_DIR=$MAIN).
+: "${BASELINE_AWARE_GATE:="on"}"
+
 # ATTRIBUTION_POLICY — commit-attribution lint gate (HERD-121). Ships dormant: default ''
 # (empty) → lint absent, byte-identical to before. Set to no-ai-coauthor to scan the PR's
 # commits (git log <DEFAULT_BRANCH>..HEAD) for AI co-author markers (Co-Authored-By: Claude*,
@@ -496,6 +517,17 @@ fi
 : "${STALE_DUP_DETECT:="on"}"    # HERD-188: pre-merge STALE-DUPLICATE gate — on (default) | off. on → the watcher HOLDS (never auto-merges) a PR whose tracked item ref is already Done via another merged PR, or whose touched files were materially changed on the base branch by a merge the branch predates (a stale base). Provable-only + fail-soft (no ref / offline / bad worktree → no hold), so default-on never false-holds a legit PR. off → byte-inert. Consumed by agent-watch.sh via stale-dup-gate.sh
 : "${WATCHER_FLAIR:="off"}"      # HERD-147: watcher-console flair pack — on → a post-merge celebration line + a pasture header rendering the in-flight herd by state (🐑 grazing / 💤 idle / ✅ in the pen); off (default) → byte-inert: every console byte identical to before. ADDITIVE cosmetic only — NEVER softens a red/dead/needs-you row, never touches a gate/merge
 : "${OPERATOR_INBOX:="off"}"     # HERD-184: cross-seat OPERATOR INBOX — on → the watcher surfaces NEW comments by OTHER authors (PR comments on open PRs this seat authors/gates + tracker comments on items this seat claimed, via the active SCRIBE_BACKEND's optional comment reader) as a 'operator inbox' console section + one notify-once per comment. off (default) → byte-inert: no reader runs, no fetch, no section, every console byte identical to before. ADDITIVE + FAIL-SOFT (missing/api error = empty inbox, never a red row); never touches a gate/merge
+# BUDGET_DAILY (HERD-95) — daily SPEND CEILING in USD that ENFORCES, not just measures. herd cost
+# already prices every builder/review/agent session and journals a `cost` event at merge; this key
+# turns that ledger into a rail. When today's (UTC) recorded cost total exceeds BUDGET_DAILY the
+# watcher PAUSES spawn-queue draining (agent-watch.sh _drain_spawn_queue) and each lane (herd-quick.sh
+# / herd-feature.sh) REFUSES a new spawn with one loud line — so a runaway day stops spending instead
+# of only surfacing when a human reads the ledger. The daily total REUSES herd cost's summer
+# (cost.sh cost_day_total) — no cost math is reimplemented. FAIL-SOFT + overridable: HERD_FORCE_SPAWN=1
+# (or a lane's --force) spawns anyway (journaled); a missing journal / no python3 never blocks. EMPTY
+# (default) = DORMANT: the gate returns immediately and behavior is byte-identical to no budget. A
+# non-numeric value is treated as dormant (never enforce on a typo). Consumed by agent-watch.sh + the lanes.
+: "${BUDGET_DAILY:=""}"          # '' (default, dormant) | a USD number, e.g. 25 — daily spend ceiling; see capabilities.tsv / cost.sh
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health

@@ -66,6 +66,17 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # herd reload / coordinator launch.
 # DOCTOR_STARTUP_HINT="off"           # off (default) | on
 
+# AGENT_UPDATE — opt-in safe self-update of the AGENT RUNTIME (HERD-149). Default "off": nothing runs,
+# byte-identical to today — you keep updating claude (or, via the driver seam, codex/grok) by hand or
+# a personal OS job. Set "on" and `herd agent-update` detects the installer (brew/npm/native) of the
+# runtime HERD_DRIVER points at, runs the update, and — the whole point — HANDLES the macOS footgun
+# where a `brew upgrade --cask` leaves the new binary com.apple.quarantine'd so every new exec hangs
+# in _dyld_start (issue #137): it xattr-de-quarantines the resolved binary after the update. It is
+# DRIVER-AWARE (updates whichever runtime the active driver binds) and FAIL-SOFT (a missing runtime or
+# a failed installer command warns, never hard-aborts). Preview the exact commands without running
+# them: `herd agent-update --dry-run`. Any value other than "on" is treated as off.
+# AGENT_UPDATE="off"                  # off (default) | on
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color
@@ -87,6 +98,7 @@ APP_SURFACE_GLOB=""                 # optional; egrep of diff paths that are the
 INTERACTION_TEST_CMD=""             # optional; drives an input + asserts the dependent output changed (0 clean/1 code/2 data-env); e.g. a UI test harness that sets a value, re-runs, and asserts the output moved
 APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
 SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
+BASELINE_AWARE_GATE="on"            # on (default) → a heavy code error whose failing tests ALL already fail on the base (origin/main) is INHERITED (a tolerated ⚠️), not merge-blocking, so a fix-PR never deadlocks on a base failure it did not introduce; byte-identical when the base is green, fully fail-soft. off → classic absolute pass/fail gate
 
 # app-preview knobs — all optional; the defaults below reproduce today's web-app behavior EXACTLY,
 # so leave them unset unless your preview is a non-web-framework command. Consumed by app-monitor.sh
@@ -138,11 +150,15 @@ COORDINATOR_CMD="/coordinator"
 
 # driver — the runtime-specific control surface (multiplexer + agent runtime) the coordinator skill
 # is bound to. Selects templates/drivers/<name>.driver, whose DRIVER_* incantations are substituted
-# into the rendered coordinator skill. Two drivers ship:
+# into the rendered coordinator skill. Four production drivers ship, plus a stub proof driver:
 #   herdr-claude (default) — herdr multiplexer + Claude Code; renders the skill functionally
 #     identical to before the driver abstraction (the byte-identical default).
 #   headless — NO herdr panes: agents run detached, panes become a VIEW not a dependency, and the
 #     watcher / journal / notifications / limit detection run headless (Windows / CI / headless Linux).
+#   codex — herdr mux + OpenAI Codex CLI runtime (the DRIVER_AGENT_* exec surface rebound to `codex`).
+#   grok  — herdr mux + xAI Grok Build CLI runtime (the DRIVER_AGENT_* exec surface rebound to `grok`).
+#   stub — a NON-Claude PROOF/REFERENCE driver (HERD-177): the minimal existence proof that the
+#     portability seam runs a non-Claude runtime end-to-end. Not for production (use codex/grok).
 # An unknown value fails `herd render` loudly, listing the available drivers.
 HERD_DRIVER="herdr-claude"
 
@@ -238,6 +254,18 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # ADDITIVE + FAIL-SOFT: a missing reader / api error / no credentials = empty inbox, NEVER a red row;
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
+
+# Daily SPEND CEILING (HERD-95) — ENFORCE a budget, don't just measure it. `herd cost` already prices
+# every builder/review/agent session and journals a `cost` event at merge; this key turns that ledger
+# into a rail. Set it to a USD number and, when TODAY's (UTC) recorded spend EXCEEDS it, the watcher
+# PAUSES draining the spawn queue and each lane REFUSES a new builder spawn with one loud line — so a
+# runaway day stops spending instead of only surfacing when a human reads the ledger. The daily total
+# REUSES herd cost's summer (no cost math reimplemented). OVERRIDABLE: HERD_FORCE_SPAWN=1 (or a lane's
+# --force) spawns anyway (journaled), and a merge that finishes still records its cost. FAIL-SOFT: a
+# missing journal / no python3 never blocks a spawn. EMPTY (default) = DORMANT: byte-identical to no
+# budget. A non-numeric value is treated as dormant (never enforce on a typo). Watcher-affecting for the
+# drain pause (next watcher restart); the lanes read it live per spawn.
+# BUDGET_DAILY=""          # '' (default, dormant) | a USD number, e.g. 25
 
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. It tracks CONSECUTIVE INFRA failures (non-verdict reviewer deaths — a claude exec-hang,

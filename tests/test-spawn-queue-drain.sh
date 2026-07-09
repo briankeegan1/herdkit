@@ -75,6 +75,12 @@ run_drain() {
   ( export LANELOG LANE_MODE="$T/lane.mode" JLOG
     HERE="$ENG"; TREES="$T/trees"; FEATS=()
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
+    # HERD-95: the drain now consults budget_daily_exceeded + the _BUDGET_DRAIN_PAUSED tick state.
+    # Stub the predicate DORMANT (return 1) and init the state so these cases test the drain path
+    # under a no-budget watcher — byte-identical to pre-HERD-95 behavior. The budget PAUSE path is
+    # covered by tests/test-budget-governance.sh.
+    _BUDGET_DRAIN_PAUSED=""
+    budget_daily_exceeded(){ return 1; }
     journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }
     # shellcheck source=/dev/null
     . "$DRAIN_SRC"
