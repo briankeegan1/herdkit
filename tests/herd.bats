@@ -115,6 +115,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic no-new-hardcoded-claude lint (HERD-177 P5) test passes" {
+  run bash "$REPO/tests/test-claude-hardcode-lint.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic stub proof driver + runtime seam (HERD-177 P6) test passes" {
+  run bash "$REPO/tests/test-stub-driver.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic HERD-42 A/B scorer test passes" {
   run bash "$REPO/tests/test-herd42-score.sh"
   [ "$status" -eq 0 ]

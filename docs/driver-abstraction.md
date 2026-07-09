@@ -406,3 +406,62 @@ An advisory **suggestions catalog** (`templates/models.tsv`, browsable via `herd
 `herd config set MODEL_*` with a tier/role-fit hint; it never refuses a model. `cost.sh` surfaces an
 unknown/foreign model as an explicit `unpriced` marker rather than a silent `$0`. Proof:
 `tests/test-model-matrix.sh`.
+
+---
+
+## HERD-177: portability guardrails — the no-new-hardcoded-claude lint + the stub proof driver
+
+The epic above factors the claude-specific exec surface into the `.driver` files and routes it through
+`scripts/herd/driver.sh` **incrementally** (P1 audited, P3 routed the one-shot drainers, P2/P4+ pending).
+Two things were missing to make that portability real rather than aspirational, and to *keep* it real as
+the tree evolves: a **ratchet** that stops the engine from re-growing hardcoded `claude`, and a concrete
+**non-Claude driver** that exercises the seam end-to-end. HERD-177 ships both. They **unblock HERD-178**
+(the real `codex` / `grok` drivers), which is now purely a matter of dropping in `.driver` files.
+
+### P5 — the `no-new-hardcoded-claude` lint (`.herd/claude-hardcode-lint.sh`)
+
+A dogfood gate (a sibling of the leak-guard / caps-sync / daemon-hermeticity gates in
+`.herd/healthcheck.project.sh`, which the healthcheck runs as section 6). It scans the **engine tree** —
+`scripts/herd/*.sh` (top level only, so the driver seam `driver.sh`, the `sim/` sandbox scripts and
+`backends/` are out) plus `bin/herd` — for any non-comment line that **invokes** `claude` (or carries a
+claude-specific incantation). Each such line is fingerprinted `<relpath>\t<whitespace-collapsed line>`
+and diffed against the committed baseline `.herd/claude-hardcode-baseline.tsv`. A fingerprint **absent**
+from the baseline is a NEW hardcoded `claude` outside the seam → the lint fails, naming `file:line`.
+
+- **Where hardcoded `claude` is legitimate (never scanned):** the driver seam — `templates/drivers/*.driver`
+  (where `claude` is *data*, the command shape a driver binds), `scripts/herd/driver.sh` (the ONE runtime
+  shim that names the default runtime so everything else routes through it), and the P1 audit table above
+  (the grandfathered un-routed sites, carried in the baseline until the routing phases retire them).
+- **Why a baseline, not zero:** routing is incremental; many audited sites are still un-routed by design.
+  The ratchet lets the count only ever go **down** as sites are routed (drop the baseline row), while
+  blocking any **new** one — the actual invariant. Line *numbers* are not part of the fingerprint, so
+  moving an existing invocation is not a false new-site; a routed-and-removed site is advisory (regen to
+  tighten), never a red. **Fail-soft** on its own infra (missing baseline / no engine tree → tolerated
+  ⚠️, exit 2), never a false red. Proof: `tests/test-claude-hardcode-lint.sh` (incl. a planted-invocation
+  catch and the seam-exemption negative control).
+
+### P6 — the stub proof driver (`templates/drivers/stub.driver`) + the runtime exec seam
+
+The render-time seam already swaps a non-herdr **multiplexer** (phase 2, `test-driver-abstraction.sh`
+§5). What was unproven is a non-Claude **runtime** flowing through the *runtime* shim. HERD-177 closes it:
+
+1. **`stub.driver`** — a COMPLETE, non-herdr, **non-Claude** proof driver (mux = a fictional `stubmux`,
+   runtime = a fictional `stub-agent`). Every tokenized mux `DRIVER_*` key is bound (so `herd render`
+   with `HERD_DRIVER=stub` produces a valid coordinator skill and the completeness lint passes), and
+   every `DRIVER_AGENT_*` exec class names `stub-agent`, **never `claude`**. It is a PROOF/REFERENCE
+   driver, not a production runtime.
+2. **The runtime exec seam consumes the driver's exec binding.** `driver.sh` gains
+   `herd_driver_agent_binding <KEY>` (read the active driver's `DRIVER_AGENT_*` value, sourcing the
+   driver file in a subshell — fail-soft empty on a missing file/key) and `herd_driver_agent_runtime`
+   (the runtime executable = the first token of `DRIVER_AGENT_ONESHOT_EXEC`, else `INTERACTIVE_SPAWN`,
+   else empty). `herd_driver_oneshot_exec` now runs **that** runtime: `stub-agent -p …` under
+   `HERD_DRIVER=stub`, the drift-guarded byte-identical `claude -p …` literal for the default/claude case.
+3. **Absent-binding degradation.** A driver that omits an exec binding (or a missing driver file) yields
+   an empty runtime → the seam degrades to the default `claude` and **never crashes** under
+   `set -euo pipefail`. This is the graceful-degradation guarantee a partial third-party driver relies on.
+
+Proof: `tests/test-stub-driver.sh` — parse/zero-secret/non-claude, `HERD_DRIVER=stub` render + mux swap,
+the one-shot seam running `stub-agent` end-to-end, the byte-identical claude default, and absent-binding
+degradation. `main` stays GREEN: every existing driver/exec test (`test-driver-agent-exec.sh`,
+`test-oneshot-exec-seam.sh`, `test-driver-abstraction.sh`, `test-model-matrix.sh`, `test-headless-driver.sh`)
+is unchanged because the default path is byte-identical.

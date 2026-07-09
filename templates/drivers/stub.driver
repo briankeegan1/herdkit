@@ -1,0 +1,44 @@
+# templates/drivers/stub.driver — the STUB PROOF driver (HERD-177, driver portability P6):
+#   multiplexer = a fictional `stubmux` · agent runtime = a fictional NON-Claude `stub-agent`.
+#
+# THIS IS A PROOF / REFERENCE DRIVER, NOT A PRODUCTION RUNTIME. It ships so the portability seam has a
+# COMPLETE, non-herdr, NON-CLAUDE driver to prove itself against end-to-end: `herd render` produces a
+# valid coordinator skill whose incantations are all `stubmux`/`stub-agent` (never herdr/claude), and
+# the runtime shim (scripts/herd/driver.sh) runs the `stub-agent` runtime through the one-shot exec
+# seam instead of `claude`. It is the existence proof that a driver is a DATA FILE, not a fork — the
+# thing HERD-178 (real codex / grok drivers) builds on. Selecting HERD_DRIVER=stub in a real project
+# renders a coordinator bound to commands that do not exist; don't. The hermetic proof is
+# tests/test-stub-driver.sh.
+#
+# CONTRACT (identical to every driver): shell-sourceable KEY=value, COMMITTED, ZERO-SECRET — command
+# SHAPES only, never credentials or absolute paths ({{SCRIPTS_DIR}} resolves at render time). Every
+# mux DRIVER_* key the coordinator template tokenizes is bound (so the completeness lint passes), and
+# every DRIVER_AGENT_* exec class is bound to the NON-CLAUDE `stub-agent` runtime (so the runtime seam
+# resolves a non-claude executable). See docs/driver-abstraction.md for the capability model.
+
+# ── Capabilities the coordinator skill binds INLINE (greppable as DRIVER:<cap> in the skill) ──────
+DRIVER_LIST_AGENTS='stubmux agents'
+DRIVER_FOCUS_AGENT='stubmux focus <slug>'
+DRIVER_SEND_TEXT='stubmux send <slug> "<text>"'
+DRIVER_SWITCH_MODEL='stubmux send <builder-slug> "/model <MODEL_FEATURE value>"'
+
+# ── Capabilities the LANE SCRIPTS + watcher exercise (bound so the driver covers the FULL surface) ──
+DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
+DRIVER_CREATE_TAB='stubmux tab <slug>'
+DRIVER_READ_PANE='stubmux read <slug>'
+DRIVER_SEND_KEYS='stubmux keys <slug> <keys>'
+
+# ── Agent-runtime EXEC bindings (the P1 exec surface, rebound to a NON-CLAUDE runtime) ─────────────
+# Unlike herdr-claude/headless (which keep Claude as the runtime and only swap the mux), the stub
+# driver swaps the RUNTIME itself: every exec class names `stub-agent`, NOT `claude`. This is what the
+# runtime seam (herd_driver_agent_runtime → herd_driver_oneshot_exec in scripts/herd/driver.sh) reads
+# so a one-shot query runs `stub-agent -p …` — the proof that the seam is runtime-portable, not
+# claude-wired. Same contract as above: COMMITTED, ZERO-SECRET, command SHAPES only.
+DRIVER_AGENT_INTERACTIVE_SPAWN='stub-agent --model <model> --auto-approve "<prompt>"'
+DRIVER_AGENT_ONESHOT_EXEC='stub-agent -p "<prompt>" --model <model> --auto-approve'
+DRIVER_AGENT_RESUME='stub-agent --auto-approve --resume "<prompt>"'
+DRIVER_AGENT_MODEL_SWITCH='/model <model>'
+DRIVER_AGENT_PERMISSION_FLAG='--auto-approve'
+DRIVER_AGENT_LIMIT_PATTERN='rate limit|quota exceeded|please wait'
+DRIVER_AGENT_SESSION_ID='${STUB_TRANSCRIPT_ROOT:-$HOME/.stub-agent/sessions}/<cwd:tr-/.-to-dash>/*.jsonl'
+DRIVER_AGENT_COST_USAGE_KEYS='prompt_tokens completion_tokens'

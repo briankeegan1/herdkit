@@ -166,6 +166,7 @@ REVIEW_CHECKLIST	none-yet	unit: no test asserts the checklist injection into the
 COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh
+HERD_DRIVER	unit	tests/test-stub-driver.sh
 HERD_VERSION	unit	tests/test-upgrade-migrations.sh
 HERD_REPO	unit	tests/test-report-repo-guard.sh
 WATCHER_AUTOMERGE	unit	tests/test-merge-policy.sh

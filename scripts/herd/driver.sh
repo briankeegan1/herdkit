@@ -82,6 +82,41 @@ _herd_known_drivers() {
   printf '%s' "${out:-<none>}"
 }
 
+# ── Agent-exec binding accessors (HERD-177, driver portability P6) ─────────────────────────────────
+# The runtime counterpart to render_skill()'s driver sourcing: read the ACTIVE driver's agent-exec
+# bindings (the DRIVER_AGENT_* keys the P1 audit factored into each .driver file) at RUNTIME, so the
+# routed exec seam runs whatever runtime the selected driver names — Claude by default, a non-Claude
+# runtime (codex/grok/an SDK loop — HERD-178) when a driver rebinds them. This is the seam that makes a
+# STUB proof driver (templates/drivers/stub.driver) actually drive a non-Claude runtime end-to-end.
+
+# herd_driver_agent_binding <KEY> — echo the value the ACTIVE driver binds for a DRIVER_AGENT_* key
+# (e.g. DRIVER_AGENT_ONESHOT_EXEC). Sources the driver file in a SUBSHELL so no DRIVER_* leaks into the
+# caller's env. FAIL-SOFT: a missing driver file, an unset/absent key, or an unreadable dir all yield
+# EMPTY output and return 0 — a driver missing a binding degrades gracefully, never aborts a caller
+# under `set -euo pipefail`. This is the "absent-binding degrades cleanly" guarantee (HERD-177 P6).
+herd_driver_agent_binding() {
+  local key="${1:-}" file
+  [ -n "$key" ] || return 0
+  file="$(_herd_drivers_dir)/$(herd_driver_name).driver"
+  [ -f "$file" ] || return 0
+  # shellcheck disable=SC1090
+  ( . "$file" 2>/dev/null || exit 0; printf '%s' "${!key:-}" ) 2>/dev/null || true
+}
+
+# herd_driver_agent_runtime — the RUNTIME EXECUTABLE the active driver spawns: the first whitespace
+# token of its DRIVER_AGENT_ONESHOT_EXEC binding (the capability the one-shot seam implements), falling
+# back to DRIVER_AGENT_INTERACTIVE_SPAWN. Empty when neither is bound (a driver with no agent-exec
+# surface) — the caller then defaults to `claude`, so an absent binding degrades to today's behavior.
+# For herdr-claude / headless this is `claude` (byte-identical default); for stub.driver it is the
+# stub runtime, proving the seam is not wired to `claude` by construction.
+herd_driver_agent_runtime() {
+  local b
+  b="$(herd_driver_agent_binding DRIVER_AGENT_ONESHOT_EXEC)"
+  [ -n "$b" ] || b="$(herd_driver_agent_binding DRIVER_AGENT_INTERACTIVE_SPAWN)"
+  [ -n "$b" ] || return 0
+  printf '%s' "${b%%[[:space:]]*}"
+}
+
 # herd_model_resolve <ref> — resolve an optionally runtime-qualified MODEL_* value into its concrete
 # driver + model. On success echoes two TAB-separated tokens "<driver>\t<model>" and returns 0:
 #   • BARE (no colon)                → "<default-driver>\t<ref>"  (herd_driver_name; byte-identical)
@@ -774,7 +809,18 @@ herd_driver_launch_agent() {
 herd_driver_oneshot_exec() {
   local prompt="${1:-}" model="${2:-}"
   shift 2 2>/dev/null || set --
-  claude -p "$prompt" --model "$model" "$@"
+  # HERD-177 P6: run the ACTIVE driver's runtime, not a hardwired `claude`. herd_driver_agent_runtime
+  # resolves the runtime executable from the driver's DRIVER_AGENT_ONESHOT_EXEC binding; a non-Claude
+  # driver (stub/codex/grok) runs its own binary through the SAME arg composition. The default path is
+  # the drift-guarded, BYTE-IDENTICAL `claude -p …` literal — taken whenever the runtime is claude OR
+  # unresolvable (an absent binding degrades to today's behavior, never a crash). The compose proof +
+  # the audit drift guard (tests/test-oneshot-exec-seam.sh, tests/test-driver-agent-exec.sh) are the rail.
+  local _rt; _rt="$(herd_driver_agent_runtime 2>/dev/null || true)"
+  if [ -n "$_rt" ] && [ "$_rt" != "claude" ]; then
+    "$_rt" -p "$prompt" --model "$model" "$@"
+  else
+    claude -p "$prompt" --model "$model" "$@"
+  fi
 }
 
 # ── CLI entrypoint ───────────────────────────────────────────────────────────────────────────────
@@ -796,13 +842,15 @@ _herd_driver_cli() {
     pane-alive)  herd_driver_pane_alive "$@" ;;
     agent-liveness) herd_driver_agent_liveness "$@"; echo ;;
     create-tab)  herd_driver_create_tab "$@" ;;
-    oneshot-exec) herd_driver_oneshot_exec "$@" ;;   # <prompt> <model> [runtime-arg …] → claude -p …
+    oneshot-exec) herd_driver_oneshot_exec "$@" ;;   # <prompt> <model> [runtime-arg …] → <runtime> -p …
+    agent-binding) herd_driver_agent_binding "$@"; echo ;;  # <DRIVER_AGENT_* key> → the active driver's value
+    agent-runtime) herd_driver_agent_runtime; echo ;;       # the active driver's runtime executable
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|agent-binding <KEY>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 
