@@ -197,6 +197,43 @@ A builder that hits a load-bearing mid-build finding (a red row that is a stale 
 
 The loop is **read → route → ack**, run on invocation and every time you check running agents — *before* re-tasking a builder or overriding a gate, since a note often explains the very row you are about to act on. Read the open notes with `herd log | grep builder_note`, or with the ack-aware `notes` subcommand (`notes` lists them numbered, newest first) once HERD-243 has landed it. Route each one: **act now** if it changes your next move, **file it** via the scribe with the note quoted verbatim if it is real work that outlives this build, or **dismiss** it as informational. Then ack the handled note (`notes ack <n>`, or `notes ack all`) so the console clears and the next coordinator seat does not re-route it. The ack is display-only — the journal keeps every note. Where that subcommand is not yet present in the engine build, read and route exactly the same way; handled notes age out of the display on their own instead of clearing on command. The coordinator skill carries the full command surface.
 
+## Programs
+
+Most work larger than one PR is a **program**: an epic item on the tracker plus the children that build
+it. The coordinator owns the shape.
+
+An **epic** carries three things and nothing else: the **goal** (what is true when the program is done),
+the **phases** (ordered groups of work, each with a reason it must come after the one before it), and the
+**child list** (one line per child item, ticked as it lands). It is a map, not an essay — the essay lives
+elsewhere.
+
+**Long-form evidence lives as a committed doc, never only as a session artifact.** A post-mortem or audit
+goes in `docs/audits/` (dated: `docs/audits/2026-07-09-gating-hardening.md`); a design goes in `docs/`.
+An agent transcript, a pane's scrollback, and a coordinator's summary all evaporate; the next seat, and
+every builder spawned six weeks from now, can only read what is in the repo. Every item in a program
+cites the committed path, so a builder that needs the *why* can `cat` it instead of asking a human.
+
+**The maintenance rule** — three obligations, in order:
+
+1. **Read the epic before picking a child.** The phase ordering is the sequencing decision; a child
+   pulled out of order collides with work that has not landed yet.
+2. **Tick children on land.** When a child's PR merges, enqueue the epic update through the scribe
+   (`bash scripts/herd/scribe.sh "..."`) like any other tracker write — the coordinator never hand-edits
+   the tracker. An epic whose child list lies is worse than no epic.
+3. **A new gap gets filed AND slotted.** Discovering work mid-program means two writes, not one: file the
+   item (against the *Authoring a backlog item* SOP), and add it to the epic's phase list. A filed-but-
+   unslotted item is invisible to the next seat, which reads the epic, not the queue.
+
+The trigger to create one, from the authoring SOP's check 8: the **third** item sharing a single root
+cause with no epic covering them. Create the epic first, then file the child against it — file-then-spawn,
+so no builder is ever spawned against a program that does not exist on the tracker yet.
+
+The live exemplar is the **HERD-240** gating-hardening epic: its evidence base is committed at
+[`docs/audits/2026-07-09-gating-hardening.md`](audits/2026-07-09-gating-hardening.md), its children each
+carry a `Part of HERD-240 — Phase N; full context: docs/audits/2026-07-09-gating-hardening.md` backlink,
+and its phases sequence the reconcile-layer completions ahead of the structural redesigns that depend on
+them.
+
 ## Escalation Paths
 
 ### Review BLOCKS

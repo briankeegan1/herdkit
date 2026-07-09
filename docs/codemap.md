@@ -28,7 +28,7 @@ Role summarized from each file's top-of-file comment.
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
 - `derived-files.sh` — the ONE list of REGENERABLE DERIVED FILES the engine writes into a project
-- `doc-drift-lint.sh` — THE shared doc-drift guard (HERD-168 / extends HERD-96): every
+- `doc-drift-lint.sh` — THE shared doc-drift guard (HERD-168 / extends HERD-96; HERD-254
 - `drainer-liveness.sh` — shared LIVENESS helpers for the async drainer singletons (HERD-109).
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
