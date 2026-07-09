@@ -409,6 +409,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic gate order: stale-dup decides before review/health dispatch (HERD-227) test passes" {
+  run bash "$REPO/tests/test-gate-order-stale-dup.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
   run bash "$REPO/tests/test-watcher-discovery-scope.sh"
   [ "$status" -eq 0 ]
