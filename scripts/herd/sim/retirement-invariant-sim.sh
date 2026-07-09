@@ -182,13 +182,29 @@ fixture() {
 EOF
   printf '%s t-build 0\nreview·%s t-review 0\n' "$slug" "$slug" > "$trees/.herd-tabs"
 
-  # Per-slug ledger rows the retired slug must not leave behind.
+  # SLUG-keyed state the retired slug must not leave behind (the tracker-ref marker + our memo scratch).
   printf 'HERD-164\n' > "$trees/.herd-ref-$slug"
-  : > "$trees/.health-cachehit-$slug"
-  : > "$trees/.health-result-$slug-$sha"
+  : > "$trees/.retire-anchor-$slug-$sha"
 
-  # A SIBLING slug's ledger file — retiring <slug> must never eat it.
-  : > "$trees/.health-result-$slug-sibling-$sha"
+  # A LIVE SIBLING builder whose slug shares <slug>'s prefix (`retiree` vs `retiree-sibling`), with its
+  # own state file. Retiring <slug> must touch neither: the sha/PR-tail guard is what stops
+  # `.retire-anchor-retiree-*` from globbing the sibling's `.retire-anchor-retiree-sibling-<sha>`.
+  git -C "$main" worktree add -q -b "feat/$slug-sibling" "$trees/$slug-sibling" main
+  : > "$trees/.retire-anchor-$slug-sibling-$sha"
+
+  # PR-KEYED gate ledgers for a DIFFERENT, live PR (#312). Nothing here belongs to any slug: these are
+  # keyed by PR number and owned by the health/review gates and the corpse sweep. Retirement must leave
+  # every one of them exactly where it found it — deleting `.review-escalate-<pr>` silently downgrades a
+  # PR that earned a deep review, and deleting `.health-inflight-<pr>-<sha>` frees the health mutex out
+  # from under a running worker. The sim fixtures the shape the ENGINE actually writes, not a shape that
+  # happens to make retirement look right.
+  : > "$trees/.health-cachehit-312"
+  : > "$trees/.review-escalate-312"
+  : > "$trees/.health-result-312-$sha"
+  : > "$trees/.health-inflight-312-$sha"
+  : > "$trees/.health-inflight-main-$sha"
+  : > "$trees/.resolve-result-312-$sha"
+  : > "$trees/.agent-watch-refix-dead-312-$sha"
 
   if [ "$mode" = dirty ]; then
     echo "work a human has not committed" >> "$trees/$slug/file.txt"
@@ -204,7 +220,7 @@ residue() {
   grep -q "review·$slug" "$scn/tabs.json" 2>/dev/null && out="${out}review-tab "
   grep -q "$slug" "$scn/trees/.herd-tabs" 2>/dev/null && out="${out}registry "
   [ -e "$scn/trees/.herd-ref-$slug" ] && out="${out}ref-ledger "
-  [ -e "$scn/trees/.health-cachehit-$slug" ] && out="${out}health-ledger "
+  ls "$scn/trees/.retire-anchor-$slug-"[0-9a-f]* >/dev/null 2>&1 && out="${out}anchor-memo "
   ls "$scn/trees/.retire-$slug" >/dev/null 2>&1 && out="${out}retire-state "
   printf '%s' "$out"
 }
@@ -235,10 +251,22 @@ for crash in none before-teardown after-reap after-registry-prune after-branch-d
   fi
 
   # The sibling's ledger must be untouched in every scenario — a slug retires only its own state.
-  if ls "$scn/trees/.health-result-$SLUG-sibling-"* >/dev/null 2>&1; then
-    ok "crash=$crash → sibling slug's ledger untouched"
+  if ls "$scn/trees/.retire-anchor-$SLUG-sibling-"* >/dev/null 2>&1 && [ -d "$scn/trees/$SLUG-sibling" ]; then
+    ok "crash=$crash → the live sibling builder ('$SLUG-sibling') and its state are untouched"
   else
-    bad "crash=$crash → retiring '$SLUG' ate sibling slug '$SLUG-sibling' ledger files"
+    bad "crash=$crash → retiring '$SLUG' ate live sibling '$SLUG-sibling' (worktree and/or state)"
+  fi
+
+  # And the LIVE PR's gate ledgers — the mutex, the cached verdict, the review-escalation rail — are all
+  # still there. This is the assertion that would have caught the PR-keyed-vs-slug-keyed bug.
+  _pr_missing=""
+  for _f in .health-cachehit-312 .review-escalate-312 .health-inflight-main-* .health-inflight-312-* .health-result-312-* .resolve-result-312-* .agent-watch-refix-dead-312-*; do
+    ls "$scn/trees/"$_f >/dev/null 2>&1 || _pr_missing="$_pr_missing $_f"
+  done
+  if [ -z "$_pr_missing" ]; then
+    ok "crash=$crash → a live open PR's gate ledgers survive untouched"
+  else
+    bad "crash=$crash → retirement deleted live PR-keyed gate state:$_pr_missing"
   fi
 done
 

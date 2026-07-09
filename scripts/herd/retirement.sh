@@ -189,30 +189,39 @@ _retire_suffixed() {
   return 0
 }
 
-# _retire_ledger_files <slug> — the per-slug engine ledger files that a retired slug must not leave
-# behind: its tracker-ref marker, its health markers/logs/results, its review-escalation arm, its
-# resolver results, its refix bookkeeping, and its own anchor memo. PR-keyed files (.review-inflight-<pr>-…)
-# are NOT here — they belong to the gate's corpse sweep, which owns their liveness semantics.
+# _retire_ledger_files <slug> — the SLUG-KEYED engine state a retired slug must not leave behind.
+#
+# THE KEYING RULE, and it is the whole safety story of this function: almost nothing in $TREES is keyed
+# by slug. Every gate ledger is keyed by PR NUMBER (or <pr>-<sha>), even where its name reads like a
+# slug would fit. Verified against the writers:
+#
+#   .health-cachehit-<pr>            _health_cachehit_file "$_jc_pr"
+#   .health-inflight-<pr>-<sha>      _health_acquire  (also .health-inflight-main-<sha>)
+#   .health-dispatch-<pr>-<sha>      _health_dispatch_file
+#   .health-log-<pr>-<sha>           _health_log_file
+#   .health-result-<pr>-<sha>        record_health_result "$_hg_pr" "$_hg_sha"
+#   .review-escalate-<pr>            _review_escalate_file "$_mare_pr"
+#   .resolve-result-<pr>-<sha>       _resolve_result_file "$rp" "$rsha"
+#   .agent-watch-refix-dead-<pr>-<sha>          _refix_dead_marker  <pr> <sha>
+#   .agent-watch-refix-stuck-<kind>-<pr>-<sha>  _refix_stuck_file   <pr> <sha> <kind>
+#
+# Globbing any of those by slug matches a LIVE, OPEN PR's state whenever a PR number happens to share
+# the prefix — and deleting it is not cosmetic: `.review-escalate-<pr>` is a safety rail (a PR that
+# earned a deep review silently gets the cheap one), and `.health-inflight-<pr>-<sha>` is the health
+# mutex (removing it frees the slot for a duplicate dispatch while the worker still runs). None of them
+# are ours. They belong to _discard_stale_health / _discard_stale_reviews / the gate corpse sweep,
+# which own their liveness semantics. Retirement must not touch a single one.
+#
+# What IS slug-keyed, and therefore ours:
+#   .herd-ref-<slug>          the per-worktree tracker-ref marker (_slug_ref_file)
+#   .retire-anchor-<slug>-<sha> / .retire-probe-<slug>-<sha>   this file's own memo scratch
+# (`.retire-<slug>` and `.retire-noted-<slug>-<kind>` are also ours but are escalation memory, cleared
+#  by _retire_state_clear — counting them here would make a slug its own leftover and never converge.)
 _retire_ledger_files() {
-  local slug="$1" f p
-  for f in "$TREES/.herd-ref-$slug" \
-           "$TREES/.health-inflight-$slug" "$TREES/.health-dispatch-$slug" \
-           "$TREES/.health-cachehit-$slug" "$TREES/.review-escalate-$slug"; do
-    [ -e "$f" ] && printf '%s\n' "$f"
-  done
-  for f in "$TREES/.health-log-$slug" "$TREES/.health-log-$slug".*; do
-    [ -e "$f" ] && printf '%s\n' "$f"
-  done
-  for p in "$TREES/.health-result-$slug-" "$TREES/.resolve-result-$slug-" \
-           "$TREES/.retire-anchor-$slug-" "$TREES/.retire-probe-$slug-" \
-           "$TREES/.agent-watch-refix-dead-$slug-"; do
+  local slug="$1" p
+  [ -e "$TREES/.herd-ref-$slug" ] && printf '%s\n' "$TREES/.herd-ref-$slug"
+  for p in "$TREES/.retire-anchor-$slug-" "$TREES/.retire-probe-$slug-"; do
     _retire_suffixed "$p"
-  done
-  # The refix-stuck marker is .agent-watch-refix-stuck-<kind>-<slug>-<pr>: the KIND sits before the
-  # slug, so each kind is its own prefix.
-  for f in "$TREES/.agent-watch-refix-stuck-"*"-$slug-"*; do
-    [ -e "$f" ] || continue
-    p="${f%"-$slug-"*}"; _retire_tail_ok "${f#"$p-$slug-"}" && printf '%s\n' "$f"
   done
   return 0
 }
@@ -324,24 +333,37 @@ _retire_branch_unique() {
   case "$n" in ''|*[!0-9]*) printf '?' ;; *) printf '%s' "$n" ;; esac
 }
 
-# _retire_classify_orphan <slug> — the classifier for a slug whose WORKTREE IS GONE. Its tab, agent,
-# and ledger rows are pure debris either way; the only thing that can carry work is the local BRANCH,
-# so that is what must be proven disposable before it is deleted:
+# _retire_classify_orphan <slug> <provenance> — the classifier for a slug whose WORKTREE IS GONE. Its
+# tab, agent, and ledger rows are pure debris either way; the only thing that can carry work is the
+# local BRANCH, so that is what must be proven disposable before it is deleted:
 #   no branch                         → retiring (nothing to lose)
 #   branch's PR is MERGED             → retiring (GitHub has every commit)
 #   …or the ledger's PR is MERGED     → retiring (the branch-name lookup fails after a delete-at-merge)
 #   CLOSED / no PR, 0 unique commits  → retiring (the branch adds nothing to the default branch)
 #   CLOSED / no PR, unique commits    → held     (this is the only copy — a human decides)
 #   base ref unresolvable             → held     (unprovable is never deleted)
-# Echoes the same "<state>\t<pr>\t<sha>\t<detail>\t<branch>" tuple as retire_classify.
+#
+# PROVENANCE is a REQUIRED second gate, and it exists because this path has no sha anchor to lean on —
+# there is no worktree HEAD to compare a PR's headRefOid against. A slug reaches teardown here only if
+# herdkit itself can show it created the thing: an engine tab in its own registry, a residual slug-keyed
+# marker it wrote, or a row in the reap ledger. Without that, the answer is `active` — do nothing. So a
+# discovery-key bug on any future leg (the class of bug that let PR-keyed ledgers manufacture the
+# phantom slug `312`) degrades to a no-op instead of a silent teardown. Fail safe, not fail destructive.
+# Echoes the same \x1f-separated "<state> <pr> <sha> <detail> <branch>" tuple as retire_classify.
 _retire_classify_orphan() {
-  local slug="$1" br st oid num lpr uniq
+  local slug="$1" prov="${2:-}" br st oid num lpr uniq
+  case "$prov" in
+    # worktree: the tree was under $WORKTREES_DIR when the tick began and vanished under us (a reap
+    # earlier in this same tick, or `herd sweep` racing). The strongest provenance there is.
+    worktree|registry|residual|ledger) : ;;
+    *) printf 'active\x1f\x1f\x1f\x1f'; return 0 ;;
+  esac
   # Branches the operator asked to KEEP (DELETE_BRANCH_ON_MERGE=false, the default) are not debris and
   # not our business: retire the tab/agent/ledger debris and leave the ref alone. Reporting a retained
   # branch as unprovable work would be a red row about a deliberate policy.
-  _retire_branch_reapable || { printf 'retiring\t\t\tworktree gone\t'; return 0; }
+  _retire_branch_reapable || { printf 'retiring\x1f\x1f\x1fworktree gone\x1f'; return 0; }
   br="$(_retire_branch_for_slug "$slug")"
-  [ -n "$br" ] || { printf 'retiring\t\t\tworktree gone\t'; return 0; }
+  [ -n "$br" ] || { printf 'retiring\x1f\x1f\x1fworktree gone\x1f'; return 0; }
 
   IFS=$'\t' read -r st oid num <<EOF
 $(_srs_gh_view "$br")
@@ -349,6 +371,9 @@ EOF
   if [ "${st:-}" != "MERGED" ]; then
     lpr="$(_retire_ledger_pr "$slug")"
     if [ -n "$lpr" ]; then
+      # NB: _srs_gh_view's other callers pass a BRANCH NAME; here we pass a PR NUMBER. `gh pr view`
+      # accepts either, and the number is the only handle left once GitHub deleted the head branch at
+      # merge. Same helper, deliberately both shapes.
       local lst loid lnum
       IFS=$'\t' read -r lst loid lnum <<EOF
 $(_srs_gh_view "$lpr")
@@ -358,25 +383,26 @@ EOF
   fi
 
   if [ "${st:-}" = "MERGED" ]; then
-    printf 'retiring\t%s\t%s\tPR #%s merged · worktree gone\t%s' "${num:-}" "${oid:-}" "${num:-}" "$br"
+    printf 'retiring\x1f%s\x1f%s\x1fPR #%s merged · worktree gone\x1f%s' "${num:-}" "${oid:-}" "${num:-}" "$br"
     return 0
   fi
 
   uniq="$(_retire_branch_unique "$br")"
   if [ "$uniq" = "?" ]; then
-    printf 'held\t\t\tcannot resolve %s to prove branch %s carries no unique work\t%s' \
+    printf 'held\x1f\x1f\x1fcannot resolve %s to prove branch %s carries no unique work\x1f%s' \
       "${DEFAULT_BRANCH:-origin/main}" "$br" "$br"
   elif [ "$uniq" != "0" ]; then
-    printf 'held\t\t\t%s commit(s) exist only on branch %s (worktree gone, no merged PR)\t%s' \
+    printf 'held\x1f\x1f\x1f%s commit(s) exist only on branch %s (worktree gone, no merged PR)\x1f%s' \
       "$uniq" "$br" "$br"
   else
-    printf 'retiring\t%s\t\tworktree gone · branch %s carries nothing\t%s' "${num:-}" "$br" "$br"
+    printf 'retiring\x1f%s\x1f\x1fworktree gone · branch %s carries nothing\x1f%s' "${num:-}" "$br" "$br"
   fi
   return 0
 }
 
 # retire_classify <slug> <dir> <branch> <has-open-pr> — the CLASSIFIER, the unit-testable heart of this
-# file. Echoes "<state>\t<pr>\t<sha>\t<detail>\t<branch>" with state in a closed set of three:
+# file. Echoes "<state> <pr> <sha> <detail> <branch>", \x1f-separated (NEVER tab: tab is IFS whitespace and
+# `read` would collapse the empty <pr>/<sha> the orphan path emits), with state in a closed set of three:
 #
 #   active   — nothing to retire: an open PR, an in-flight builder with no PR yet, no sha anchor, or a
 #              `gh` we could not reach. The default for everything unproven; no action, ever.
@@ -387,28 +413,28 @@ EOF
 #              exist nowhere else, or a base ref we cannot resolve to prove otherwise. NEVER touched;
 #              <detail> is the evidence a human needs, verbatim.
 retire_classify() {
-  local slug="$1" dir="${2:-}" branch="${3:-}" open_pr="${4:-0}"
+  local slug="$1" dir="${2:-}" branch="${3:-}" open_pr="${4:-0}" prov="${5:-}"
   local head st oid num dirt evidence uniq
 
-  [ "$open_pr" = "1" ] && { printf 'active\t\t\t\t'; return 0; }
+  [ "$open_pr" = "1" ] && { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
 
   # Worktree already gone (removed by hand, by `herd sweep`, or by a half-finished reap): the tab,
   # agent, and ledger rows are pure debris; only the branch can still carry work.
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then
-    _retire_classify_orphan "$slug"
+    _retire_classify_orphan "$slug" "$prov"
     return 0
   fi
 
-  [ -n "$branch" ] || { printf 'active\t\t\t\t'; return 0; }
+  [ -n "$branch" ] || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
   head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-  [ -n "$head" ] || { printf 'active\t\t\t\t'; return 0; }
+  [ -n "$head" ] || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
 
   IFS=$'\t' read -r st oid num <<EOF
 $(_retire_anchor "$slug" "$branch" "$head")
 EOF
   # No sha anchor → not provably terminal → untouchable. This single line is what makes a reused slug,
   # a fresh commit, and a gh outage all safe.
-  [ -n "${oid:-}" ] && [ "$oid" = "$head" ] || { printf 'active\t\t\t\t'; return 0; }
+  [ -n "${oid:-}" ] && [ "$oid" = "$head" ] || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
 
   dirt="$(_sweep_classify_dirt "$dir")"
   evidence="${dirt#*$'\t'}"; [ "$evidence" = "$dirt" ] && evidence=""
@@ -417,27 +443,27 @@ EOF
   case "${st:-}" in
     MERGED)
       if [ "$dirt" = "dirty" ]; then
-        printf 'held\t%s\t%s\tuncommitted work: %s (PR #%s merged; commit or discard)\t%s' \
+        printf 'held\x1f%s\x1f%s\x1funcommitted work: %s (PR #%s merged; commit or discard)\x1f%s' \
           "$num" "$head" "$evidence" "$num" "$branch"
       else
-        printf 'retiring\t%s\t%s\tPR #%s merged\t%s' "$num" "$head" "$num" "$branch"
+        printf 'retiring\x1f%s\x1f%s\x1fPR #%s merged\x1f%s' "$num" "$head" "$num" "$branch"
       fi
       ;;
     CLOSED)
       uniq="$(_sweep_unique_commits "$dir")"
       if [ "$uniq" = "?" ]; then
-        printf 'held\t%s\t%s\tcannot resolve %s to prove no unique work (PR #%s closed)\t%s' \
+        printf 'held\x1f%s\x1f%s\x1fcannot resolve %s to prove no unique work (PR #%s closed)\x1f%s' \
           "$num" "$head" "${DEFAULT_BRANCH:-origin/main}" "$num" "$branch"
       elif [ "$uniq" != "0" ]; then
-        printf 'held\t%s\t%s\t%s commit(s) exist only here (PR #%s closed unmerged)\t%s' \
+        printf 'held\x1f%s\x1f%s\x1f%s commit(s) exist only here (PR #%s closed unmerged)\x1f%s' \
           "$num" "$head" "$uniq" "$num" "$branch"
       elif [ "$dirt" = "dirty" ]; then
-        printf 'held\t%s\t%s\tuncommitted work: %s (PR #%s closed)\t%s' "$num" "$head" "$evidence" "$num" "$branch"
+        printf 'held\x1f%s\x1f%s\x1funcommitted work: %s (PR #%s closed)\x1f%s' "$num" "$head" "$evidence" "$num" "$branch"
       else
-        printf 'retiring\t%s\t%s\tPR #%s closed\t%s' "$num" "$head" "$num" "$branch"
+        printf 'retiring\x1f%s\x1f%s\x1fPR #%s closed\x1f%s' "$num" "$head" "$num" "$branch"
       fi
       ;;
-    *) printf 'active\t\t\t\t' ;;
+    *) printf 'active\x1f\x1f\x1f\x1f' ;;
   esac
   return 0
 }
@@ -581,22 +607,42 @@ _retire_real() {
   ( cd "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
 }
 
-# _retire_residual_slugs — slugs whose only remaining trace is a per-slug LEDGER file. Derived from the
-# ledger names whose slug segment is UNAMBIGUOUS (no sha/PR suffix to confuse a dashed slug with a
-# sibling): the tracker-ref marker, the health markers, the review-escalation arm, and this file's own
-# escalation state. The sha-suffixed ledgers are not discovery keys — they are simply purged once the
-# slug is discovered through one of these.
+# _retire_residual_slugs — slugs whose only remaining trace is a SLUG-KEYED file. This is the leg that
+# makes the invariant hold across a crash INSIDE teardown: by the time the worktree and the registry row
+# are gone, nothing else names the slug.
 #
-# This is the leg that makes the invariant hold across a crash INSIDE teardown: by the time the
-# worktree and the registry row are gone, nothing else names the slug.
+# ONLY genuinely slug-keyed names may be discovery keys, and this is load-bearing, not tidiness. The
+# gate ledgers (.health-*, .review-escalate-*, .resolve-result-*, .agent-watch-refix-*) are keyed by PR
+# NUMBER — see _retire_ledger_files. Reading them here manufactures phantom "slugs" like `312`,
+# `312-<sha>`, or `main-<sha>` from a LIVE open PR's state. None of those match a worktree or an
+# open-PR slug, so nothing guards them: they classify as orphans and get torn down on the spot.
+#
+# Three keys, all ours:
+#   .herd-ref-<slug>                     the tracker-ref marker (survives until _reap_slug runs)
+#   .retire-<slug>                       our escalation state (written for retiring AND held slugs, so a
+#                                        held orphan whose tab and ref are gone stays discoverable)
+#   .retire-anchor-<slug>-<sha> / .retire-probe-<slug>-<sha>
+#                                        our memo scratch; the trailing -<sha> is stripped, and a tail
+#                                        that is not a lone sha (i.e. a sibling slug's name) is skipped
 _retire_residual_slugs() {
-  local f base p
-  for p in .herd-ref- .health-cachehit- .health-inflight- .health-dispatch- .review-escalate- .retire-; do
+  local f base p tail
+  for p in .herd-ref- .retire-; do
     for f in "$TREES/$p"*; do
       [ -e "$f" ] || continue
       base="${f##*/}"; base="${base#"$p"}"
-      # `.retire-anchor-…` / `.retire-probe-…` / `.retire-noted-…` are this file's own scratch, not slugs.
+      # `.retire-anchor-…` / `.retire-probe-…` / `.retire-noted-…` are scratch, handled below/not at all.
       case "$p$base" in .retire-anchor-*|.retire-probe-*|.retire-noted-*) continue ;; esac
+      [ -n "$base" ] && printf '%s\n' "$base"
+    done
+  done
+  # The memo scratch: `<slug>-<sha>`. Strip the sha tail; reject anything whose tail is not one, so a
+  # dashed slug can never be mistaken for a sibling.
+  for p in .retire-anchor- .retire-probe-; do
+    for f in "$TREES/$p"*; do
+      [ -e "$f" ] || continue
+      base="${f##*/}"; base="${base#"$p"}"
+      tail="${base##*-}"; _retire_tail_ok "$tail" || continue
+      base="${base%-*}"
       [ -n "$base" ] && printf '%s\n' "$base"
     done
   done
@@ -723,7 +769,7 @@ retirement_tick() {
     [ -n "$trees_real" ] && case "$real/" in "$trees_real"/*) ;; *) continue ;; esac
     open=0
     [ -n "$branch" ] && printf '%s\n' "$open_branches" | grep -qxF "$branch" && open=1
-    _retire_step "$slug" "$dir" "$branch" "$open"
+    _retire_step "$slug" "$dir" "$branch" "$open" worktree
   done < <(_sweep_worktree_rows)
 
   # ── legs B + C: slugs with NO worktree that nonetheless left something behind ──
@@ -732,15 +778,16 @@ retirement_tick() {
   #    removes the worktree and the registry row, so a watcher killed after those two steps leaves a
   #    slug that leg A and leg B are both blind to. Its ledger files are the last handle on it.
   # Both legs feed the same reconciler; a slug discovered twice is stepped once.
-  local open_slugs seen=""; open_slugs="$(_retire_open_pr_slugs)"
-  while IFS= read -r slug; do
+  local open_slugs seen="" prov; open_slugs="$(_retire_open_pr_slugs)"
+  while read -r prov slug; do
     [ -n "${slug:-}" ] || continue
     printf '%s' "$wt_slugs" | grep -qxF "$slug" && continue    # a live tree → leg A owns it
     printf '%s' "$open_slugs" | grep -qxF "$slug" && continue  # open PR, no local tree → not debris
     printf '%s' "$seen" | grep -qxF "$slug" && continue        # already stepped via the other leg
     seen="${seen}${slug}"$'\n'
-    _retire_step "$slug" "" "" 0
-  done < <(_retire_registry_slugs; _retire_residual_slugs)
+    # Provenance: this slug came from the engine's OWN tab registry or its OWN slug-keyed marker.
+    _retire_step "$slug" "" "" 0 "$prov"
+  done < <(_retire_registry_slugs | sed 's/^/registry /'; _retire_residual_slugs | sed 's/^/residual /')
 
   # ── leg D: a landed slug whose only residue is its local BRANCH ──
   # A teardown that got as far as removing the worktree, the tabs, AND the ledgers (HERD-91's one-shot
@@ -757,28 +804,45 @@ retirement_tick() {
     printf '%s' "$seen" | grep -qxF "$slug" && continue
     _retire_merged_branch_slug "$slug" || continue
     seen="${seen}${slug}"$'\n'
-    _retire_step "$slug" "" "" 0
+    _retire_step "$slug" "" "" 0 ledger
   done < <(_retire_ledger_slugs)
   return 0
 }
 
-# _retire_step <slug> <dir> <branch> <open-pr> — reconcile ONE slug. Split out of retirement_tick so
-# both legs share it verbatim and the unit tests can drive a single slug.
+# _retire_step <slug> <dir> <branch> <open-pr> [provenance] — reconcile ONE slug. Split out of
+# retirement_tick so every leg shares it verbatim and the unit tests can drive a single slug.
+# <provenance> names WHICH leg found it (worktree|registry|residual|ledger); the worktree-gone classifier
+# refuses to act without one, so an orphan can never be torn down on a slug nobody can show we created.
 _retire_step() {
-  local slug="$1" dir="${2:-}" branch="${3:-}" open="${4:-0}"
+  local slug="$1" dir="${2:-}" branch="${3:-}" open="${4:-0}" prov="${5:-}"
   local state pr sha detail left blocker
 
   # The classifier may DISCOVER the branch (the orphan path, where the caller has none), so read it
   # back: it is what the teardown deletes and what `retire_leftovers` then re-checks.
-  IFS=$'\t' read -r state pr sha detail branch <<EOF
-$(retire_classify "$slug" "$dir" "$branch" "$open")
+  #
+  # The record separator is \x1f, NOT a tab. Tab is an IFS WHITESPACE character, so `IFS=$'\t' read`
+  # collapses a RUN of consecutive tabs into one delimiter and strips leading/trailing ones — which
+  # shifts every field left on exactly the records the orphan path emits (empty <pr>/<sha>). That put
+  # prose into $pr, emptied $detail (a red needs-you row carrying no evidence), and left $branch empty
+  # so the branch was never reaped even as the slug reported "converged". \x1f is not IFS whitespace,
+  # so empty fields survive. Same separator _sweep_worktree_rows already uses for the same reason.
+  IFS=$'\x1f' read -r state pr sha detail branch <<EOF
+$(retire_classify "$slug" "$dir" "$branch" "$open" "$prov")
 EOF
+  # Defense in depth: only a NUMERIC pr ever reaches the PR-keyed ledgers or the journal. If a record
+  # shape ever shifts again, this refuses to purge another PR's state on a parse artifact.
+  case "${pr:-}" in ''|*[!0-9]*) pr="" ;; esac
 
   case "$state" in
     active)
       _retire_state_clear "$slug"
       return 0 ;;
     held)
+      # Persist the escalation state even though nothing is torn down. It is what keeps a HELD ORPHAN
+      # discoverable: its worktree, tab, and .herd-ref are already gone, so `.retire-<slug>` is the last
+      # key leg C has. Without it the red row renders once and then goes silent forever while the branch
+      # it is protecting sits there unnoticed.
+      _retire_state_bump "$slug" held
       _retire_note_once "$slug" hold "$detail"
       _retire_record "$slug" held "$detail" "$dir"
       return 0 ;;
@@ -791,8 +855,10 @@ EOF
 
   left="$(retire_leftovers "$slug" "$dir" "$branch" | tr '\n' ',' | sed 's/,$//')"
   if [ -z "$left" ]; then
-    # Converged. The slug's row vanishes; nothing is remembered.
-    [ "$(_retire_attempts "$slug")" != "0" ] && journal_append retire_converged slug "$slug" pr "$pr" reason "$detail"
+    # Converged. The slug's row vanishes; nothing is remembered. Journal it ALWAYS, not only when the
+    # slug had previously failed to converge — a teardown that runs and completes on its first tick is
+    # exactly the event a post-mortem of an unexpected reap needs to find.
+    journal_append retire_converged slug "$slug" pr "$pr" reason "$detail"
     _retire_state_clear "$slug"
     return 0
   fi

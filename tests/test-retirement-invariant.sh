@@ -94,8 +94,11 @@ mkwt() {
 # gh_says <branch> <STATE> <oid> <num>
 gh_says() { mkdir -p "$GH_DIR/$(dirname "$1")"; printf '%s\t%s\t%s\n' "$2" "$3" "$4" > "$GH_DIR/$1"; }
 # state_of <slug> <dir> <branch> <open> — the classifier's first field.
-state_of() { retire_classify "$1" "$2" "$3" "$4" | cut -f1; }
-detail_of() { retire_classify "$1" "$2" "$3" "$4" | cut -f4; }
+# The classifier's record separator is \x1f (never a tab — see _retire_step). Extract with the SAME
+# separator the engine reads with, or these helpers would paper over the very bug they must catch.
+RS=$'\x1f'
+state_of()  { retire_classify "$1" "$2" "$3" "$4" "${5:-residual}" | cut -d"$RS" -f1; }
+detail_of() { retire_classify "$1" "$2" "$3" "$4" "${5:-residual}" | cut -d"$RS" -f4; }
 # Every classification below must start from a cold cache, or a memo from a previous case leaks in.
 cold() { rm -f "$TREES"/.retire-anchor-* "$TREES"/.retire-probe-* 2>/dev/null; }
 
@@ -166,7 +169,7 @@ ok
 
 # ── (9) CLOSED + an unresolvable base ref → held (unprovable is never deleted) ───────────────────
 cold; d="$(DEFAULT_BRANCH="origin/nope" retire_classify closed-empty "$WTREES/closed-empty" feat/closed-empty 0)"
-[ "$(printf '%s' "$d" | cut -f1)" = held ] \
+[ "$(printf '%s' "$d" | cut -d"$RS" -f1)" = held ] \
   || fail "(9) an unresolvable base ref must HOLD, not reap: $d"
 ok
 
@@ -189,10 +192,10 @@ cold; [ "$(state_of gone-merged "$WTREES/gone-merged" "" 0)" = retiring ] \
 # that branch is the one irreversible thing on this path, so it must never happen on a guess.
 sha_l="$(mkwt gone-orphan)"
 git -C "$REPO" worktree remove --force "$WTREES/gone-orphan"
-cold; d="$(retire_classify gone-orphan "$WTREES/gone-orphan" "" 0)"
-[ "$(printf '%s' "$d" | cut -f1)" = held ] \
+cold; d="$(retire_classify gone-orphan "$WTREES/gone-orphan" "" 0 residual)"
+[ "$(printf '%s' "$d" | cut -d"$RS" -f1)" = held ] \
   || fail "(10b) an unmerged branch with unique commits must be HELD, not deleted: $d"
-case "$(printf '%s' "$d" | cut -f4)" in *"exist only on branch"*) : ;;
+case "$(printf '%s' "$d" | cut -d"$RS" -f4)" in *"exist only on branch"*) : ;;
   *) fail "(10b) the hold must name the branch and count its commits: $d" ;; esac
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-orphan \
   || fail "(10b) classification must not have side effects"
@@ -218,37 +221,37 @@ cold; [ "$(state_of gone-ledger "$WTREES/gone-ledger" "" 0)" = held ] \
 ok
 
 # ── (16) the ledger globs cannot eat a SIBLING slug's files ──────────────────────────────────────
-# `.health-result-foo-*` also matches slug `foo-bar`'s files. The tail guard rejects any tail that is
+# `.retire-anchor-foo-*` also matches slug `foo-bar`'s files. The tail guard rejects any tail that is
 # not a lone hex sha / PR number, which is what a sibling slug's name always is.
 _retire_tail_ok "0123456789abcdef0123456789abcdef01234567" || fail "(16) a full sha must be a valid tail"
 _retire_tail_ok "42"        || fail "(16) a PR number must be a valid tail"
 _retire_tail_ok "bar"       && fail "(16) a sibling slug segment must NOT be a valid tail"
 _retire_tail_ok "bar-abc"   && fail "(16) a multi-segment sibling tail must NOT be valid"
 _retire_tail_ok "beef"      && fail "(16) a short hex-looking sibling segment must NOT be valid"
-: > "$TREES/.health-result-sib-0123456789abcdef0123456789abcdef01234567"
-: > "$TREES/.health-result-sib-bling-0123456789abcdef0123456789abcdef01234567"
+: > "$TREES/.retire-anchor-sib-0123456789abcdef0123456789abcdef01234567"
+: > "$TREES/.retire-anchor-sib-bling-0123456789abcdef0123456789abcdef01234567"
 files="$(_retire_ledger_files sib)"
 case "$files" in *sib-bling*) fail "(16) slug 'sib' must not own slug 'sib-bling' ledger files" ;; esac
-printf '%s' "$files" | grep -q 'health-result-sib-0123' || fail "(16) slug 'sib' must own its own ledger file"
-rm -f "$TREES/.health-result-sib-"*
+printf '%s' "$files" | grep -q 'retire-anchor-sib-0123' || fail "(16) slug 'sib' must own its own ledger file"
+rm -f "$TREES/.retire-anchor-sib-"*
 ok
 
 # ── (11) a retiring slug CONVERGES: worktree, branch, ledgers all gone; state cleared ────────────
 sha_h="$(mkwt conv)"
 gh_says "feat/conv" MERGED "$sha_h" 18
 : > "$(_slug_ref_file conv)"                       # a tracker-ref ledger row to be reaped
-: > "$TREES/.health-cachehit-conv"                 # a health ledger row to be reaped
+: > "$TREES/.retire-anchor-conv-$sha_h"           # our own memo scratch, to be reaped
 cold
-AGENTS_JSON='{"result":{"agents":[]}}' _retire_step conv "$WTREES/conv" feat/conv 0
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step conv "$WTREES/conv" feat/conv 0 worktree
 [ -d "$WTREES/conv" ] && fail "(11) a converged slug must not keep its worktree"
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/conv && fail "(11) …nor its local branch"
 [ -e "$(_slug_ref_file conv)" ] && fail "(11) …nor its tracker-ref marker"
-[ -e "$TREES/.health-cachehit-conv" ] && fail "(11) …nor its health ledger row"
+[ -e "$TREES/.retire-anchor-conv-$sha_h" ] && fail "(11) …nor its anchor memo"
 [ -e "$(_retire_state_file conv)" ] && fail "(11) …nor any escalation state"
 [ "$(_retire_state_of conv)" = active ] && ok || fail "(11) a converged slug must render no row"
 
 # ── (12) a HELD slug is NEVER touched, and says so exactly once ──────────────────────────────────
-AGENTS_JSON='{"result":{"agents":[]}}' _retire_step merged-dirty "$WTREES/merged-dirty" feat/merged-dirty 0
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step merged-dirty "$WTREES/merged-dirty" feat/merged-dirty 0 worktree
 [ -d "$WTREES/merged-dirty" ] || fail "(12) a held worktree must survive"
 grep -q 'uncommitted work' "$WTREES/merged-dirty/file.txt" || fail "(12) held dirt must survive verbatim"
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/merged-dirty \
@@ -265,7 +268,7 @@ cold
 export HERD_RETIRE_STUCK_TICKS=3; _RETIRE_STUCK_TICKS=3
 tick_stuck() { AGENTS_JSON='{"result":{"agents":[{"name":"stuck","agent_status":"idle"}]}}' \
                  retirement_tick_one stuck "$WTREES/stuck" feat/stuck; }
-retirement_tick_one() { RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=(); _retire_step "$1" "$2" "$3" 0; }
+retirement_tick_one() { RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=(); _retire_step "$1" "$2" "$3" 0 worktree; }
 tick_stuck; [ "$(_retire_state_of stuck)" = retiring ] || fail "(13) tick 1 must be calm 'retiring'"
 tick_stuck; [ "$(_retire_state_of stuck)" = retiring ] || fail "(13) tick 2 must still be calm"
 tick_stuck; [ "$(_retire_state_of stuck)" = stuck ]    || fail "(13) tick 3 must escalate to red 'stuck'"
@@ -279,7 +282,7 @@ rm -f "$TREES"/.retire-* 2>/dev/null
 sha_j="$(mkwt restart)"
 gh_says "feat/restart" MERGED "$sha_j" 20
 cold
-AGENTS_JSON='{"result":{"agents":[]}}' _retire_step restart "$WTREES/restart" feat/restart 0
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step restart "$WTREES/restart" feat/restart 0 worktree
 [ -d "$WTREES/restart" ] && fail "(14) a fresh reconciler with zero memory must still converge"
 [ -z "$(AGENTS_JSON='{"result":{"agents":[]}}' retire_leftovers restart "$WTREES/restart" feat/restart)" ] \
   || fail "(14) …to ZERO leftovers"
@@ -311,7 +314,7 @@ sha_n="$(mkwt keepbranch)"
 gh_says "feat/keepbranch" MERGED "$sha_n" 23
 cold
 DELETE_BRANCH_ON_MERGE="false" AGENTS_JSON='{"result":{"agents":[]}}' \
-  _retire_step keepbranch "$WTREES/keepbranch" feat/keepbranch 0
+  _retire_step keepbranch "$WTREES/keepbranch" feat/keepbranch 0 worktree
 [ -d "$WTREES/keepbranch" ] && fail "(17) the worktree must still be reaped"
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/keepbranch \
   || fail "(17) DELETE_BRANCH_ON_MERGE=false must RETAIN the local branch"
@@ -324,6 +327,93 @@ cold; [ "$(DELETE_BRANCH_ON_MERGE=false state_of gone-orphan "$WTREES/gone-orpha
   || fail "(17) a retained branch must not turn an orphan slug into a hold"
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/gone-orphan \
   || fail "(17) …and its commits are still there"
+ok
+
+# ── (18) REGRESSION: the orphan path through _retire_step (the \x1f field-parse bug) ─────────────
+# Nothing used to drive an orphan (worktree-gone) record through _retire_step — the classifier's empty
+# <pr>/<sha> fields collapsed under `IFS=$'\t' read`, so `pr` got prose, `detail` (the evidence) went
+# empty, and `branch` went empty so it was never reaped though the slug reported "converged".
+sha_o="$(mkwt orphan-held)"
+git -C "$REPO" worktree remove --force "$WTREES/orphan-held"
+cold
+RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step orphan-held "$WTREES/orphan-held" "" 0 residual
+[ "$(_retire_state_of orphan-held)" = held ] || fail "(18) an orphan branch with unique commits must be HELD"
+d="$(_retire_detail_of orphan-held)"
+[ -n "$d" ] || fail "(18) the held row must carry its EVIDENCE, not an empty needs-you"
+case "$d" in *"exist only on branch"*) : ;; *) fail "(18) evidence must name the branch + commit count, got: $d" ;; esac
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/orphan-held \
+  || fail "(18) a held orphan's branch must survive"
+# …and the hold stays DISCOVERABLE: `.retire-<slug>` is the last key leg C has once the ref is gone.
+printf '%s\n' "$(_retire_residual_slugs)" | grep -qxF orphan-held \
+  || fail "(18) a held orphan must remain discoverable by leg C, or its red row goes silent forever"
+
+# A retiring orphan whose branch adds nothing must REAP that branch. This record carries an empty <pr>
+# AND an empty <sha> — three consecutive separators — so it is the exact shape that collapsed, leaving
+# <branch> empty: the branch survived while the slug reported "converged".
+git -C "$REPO" branch -q feat/orphan-empty main
+cold
+RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+AGENTS_JSON='{"result":{"agents":[]}}' _retire_step orphan-empty "$WTREES/orphan-empty" "" 0 registry
+git -C "$REPO" show-ref --verify --quiet refs/heads/feat/orphan-empty \
+  && fail "(18) a retiring orphan must reap a branch that carries nothing (branch lost to field-parse)"
+[ "$(_retire_state_of orphan-empty)" = active ] || fail "(18) …and then converge, rendering no row"
+
+# And under the DEFAULT policy the record is `retiring | "" | "" | worktree gone | ""`. The collapse put
+# the prose "worktree gone" into <pr>, which then reached the JOURNAL and the PR-keyed purge helpers as
+# if it were a PR number. Assert on the journal, because that is where the garbage actually landed —
+# `cut` never collapses, so only a real _retire_step parse can prove this.
+cold
+JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
+RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+DELETE_BRANCH_ON_MERGE=false AGENTS_JSON='{"result":{"agents":[]}}' \
+  _retire_step journal-orphan "$T/nope" "" 0 registry
+grep -q '"event":"retire_converged"' "$JOURNAL_FILE" \
+  || fail "(18) a first-tick teardown must journal retire_converged (post-mortem observability)"
+grep -q 'worktree gone' "$JOURNAL_FILE" && grep -q '"pr":"worktree gone"' "$JOURNAL_FILE" \
+  && fail "(18) prose leaked into the journal's pr field"
+grep -q '"pr":"[^"]*[a-z ][^"]*"' "$JOURNAL_FILE" \
+  && fail "(18) the journal's pr field must be a number or empty, never prose"
+ok
+
+# ── (19) REGRESSION: a live OPEN PR's PR-keyed gate ledgers survive a tick, untouched ────────────
+# Almost nothing in $TREES is slug-keyed: the health/review/resolve/refix ledgers are keyed by PR
+# NUMBER. Globbing them by slug deleted a live PR's health mutex, its cached verdict, and its
+# review-ESCALATION arm (a safety rail: the PR silently drops back to the cheap review tier).
+pr_files=(
+  "$TREES/.health-cachehit-312"                                             # _health_cachehit_file <pr>
+  "$TREES/.review-escalate-312"                                             # _review_escalate_file <pr>
+  "$TREES/.health-result-312-abc1234def5678"                                # record_health_result <pr> <sha>
+  "$TREES/.health-inflight-312-abc1234def5678"                              # _health_acquire (the mutex)
+  "$TREES/.health-inflight-main-abc1234def5678"                             # the main-health run
+  "$TREES/.resolve-result-312-abc1234def5678"                               # _resolve_result_file <pr> <sha>
+  "$TREES/.agent-watch-refix-dead-312-abc1234def5678"                       # _refix_dead_marker <pr> <sha>
+  "$TREES/.agent-watch-refix-stuck-health-312-abc1234def5678"               # _refix_stuck_file <pr> <sha> <kind>
+)
+for f in "${pr_files[@]}"; do : > "$f"; done
+# None of them may be claimed as slug '312' state…
+[ -z "$(_retire_ledger_files 312)" ] || fail "(19) PR-keyed gate ledgers must never be claimed as slug state"
+# …nor may they manufacture a phantom slug for leg C to tear down.
+res="$(_retire_residual_slugs)"
+for phantom in 312 312-abc1234def5678 main-abc1234def5678; do
+  printf '%s\n' "$res" | grep -qxF "$phantom" \
+    && fail "(19) leg C manufactured the phantom slug '$phantom' from a live PR's ledger"
+done
+# …and a full tick leaves every one of them on disk.
+PRS_JSON='[]' AGENTS_JSON='{"result":{"agents":[]}}' retirement_tick
+for f in "${pr_files[@]}"; do
+  [ -e "$f" ] || fail "(19) retirement_tick DELETED a live open PR's gate ledger: ${f##*/}"
+done
+for f in "${pr_files[@]}"; do rm -f "$f"; done
+ok
+
+# ── (20) an orphan with NO provenance is never torn down ─────────────────────────────────────────
+# The orphan path has no sha anchor to lean on, so provenance is the gate: a slug nobody can show the
+# engine created is `active`. A future discovery-key bug then degrades to a no-op, not a silent reap.
+cold; [ "$(retire_classify whoknows "$T/nope" "" 0 "" | cut -d"$RS" -f1)" = active ] \
+  || fail "(20) an orphan with no provenance must classify active, never retiring"
+cold; [ "$(retire_classify whoknows "$T/nope" "" 0 registry | cut -d"$RS" -f1)" = retiring ] \
+  || fail "(20) …but a registry-provenanced orphan retires normally"
 ok
 
 echo "ALL PASS ($pass checks)"
