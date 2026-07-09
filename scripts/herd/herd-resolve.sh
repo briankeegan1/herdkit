@@ -84,6 +84,16 @@ if ! herd_driver_launch_agent \
   exit 1
 fi
 
+# HERD-206: LABEL the freshly-created agent pane 'resolve·<slug>' — exactly what herd-feature.sh does
+# for a builder (HERD-135). The watcher's resolver liveness probe (herd_driver_agent_liveness) resolves
+# an agent's pane through the roster FIRST and falls back to a pane carrying its label; the TAB was
+# already labelled, but the PANE was not, so a resolver DELISTED from the roster (a herdr blip, a
+# report-agent registration) had no pane the probe could find and read as positively gone — the
+# false-dead that drove the respawn loop. Best-effort + fail-soft: a rename the driver can't do just
+# leaves the probe on its roster/heuristic path (no red row, no death verdict).
+_RESOLVE_PANE="$(herd_driver_agent_pane_id "resolve·$SLUG" 2>/dev/null || true)"
+[ -n "$_RESOLVE_PANE" ] && herd_driver_pane_rename "$_RESOLVE_PANE" "resolve·$SLUG" || true
+
 # 4. LEFT pane (the tab's root): live app preview on a free port — only when configured.
 PORT=""
 if [ -n "$APP_PREVIEW_CMD" ] && [ "${HERD_NO_APP:-}" != "1" ]; then

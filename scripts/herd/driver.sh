@@ -380,9 +380,13 @@ herd_driver_read_pane() {
 
 # ── send-text ────────────────────────────────────────────────────────────────────────────────────
 # herd_driver_send_text <pane-or-slug> <text> — send an auto-submitted prompt/command to a builder.
-# herdr-claude: `herdr pane run`. headless: append to the agent's input queue (best-effort; a bare
-# `claude` process does not drain it, so for the default runtime this is a documented no-op seam an
-# SDK/headless runtime can consume). NEVER fails.
+# herdr-claude (HERD-186): `herdr pane run` types the text, then an explicit `herdr pane send-keys
+# Enter` SUBMITS it. Live observation 2026-07-08: `pane run` alone can leave the prompt sitting in a
+# Claude/agent TUI buffer (REVIEW_AUTOFIX + coordinator re-tasks silently no-op until a human presses
+# Enter). The extra Enter is fail-soft and a no-op on an empty shell prompt when the wake already
+# works. headless: append to the agent's input queue (best-effort; a bare `claude` process does not
+# drain it, so for the default runtime this is a documented no-op seam an SDK/headless runtime can
+# consume). NEVER fails.
 herd_driver_send_text() {
   local target="${1:-}" text="${2:-}"
   if _herd_driver_is_headless; then
@@ -391,6 +395,9 @@ herd_driver_send_text() {
     printf '%s\n' "$text" >> "$q" 2>/dev/null || true
   else
     herdr pane run "$target" "$text" >/dev/null 2>&1 || true
+    # Explicit submit (HERD-186) — pane run's documented "text + Enter" is not reliable against a
+    # live agent TUI; send-keys Enter is the same keystroke operators use to finish a stuck nudge.
+    herdr pane send-keys "$target" Enter >/dev/null 2>&1 || true
   fi
   return 0
 }

@@ -11,6 +11,9 @@
 #   • PANE ROLE LABELS at spawn (HERD-135): the agent pane is named by its slug via the driver, and the
 #     label is asserted queryable — the role the dead-agent-eyes probe consumes instead of guessing;
 #   • agent-status transitions idle → working → done, each observed via `herdr agent list`;
+#   • RE-TASK WAKE (HERD-186): a live 'done' builder is re-tasked via the SHIPPED type+Enter path
+#     (herd_driver_send_text → pane run + send-keys Enter) and the agent wakes (refix_wake_result
+#     woke=1) — the 2026-07-08 stuck-in-prompt-buffer bug class;
 #   • ALIVE/DEAD/MISSING dead-agent eyes, all three verdicts against REAL panes: claude launched AS the
 #     pane root (shell_pid == claude pid) ⇒ 'alive' — never a fabricated death (PR #260 review); kill
 #     the pane process ⇒ 'dead' (pane present, unresponsive); REMOVE the agent pane entirely ⇒ 'missing'
@@ -194,8 +197,8 @@ else
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
-            builder_agent_alive_claude_root builder_agent_dead builder_refix_escalates_on_dead \
-            builder_agent_missing teardown_clean; do
+            builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
+            builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -537,6 +540,104 @@ print(pi.get("foreground_process_group_id") or "")
     # Cleanup: kill the detached claude process GROUP + close its pane (never leak a sleep or a pane).
     [ -n "$_cr_pgid" ] && kill -TERM -"$_cr_pgid" >/dev/null 2>&1 || true
     [ -n "$CR_PANE" ] && herdr pane close "$CR_PANE" >/dev/null 2>&1 || true
+  fi
+
+  # ── RE-TASK WAKE (HERD-186): a live 'done' builder must WAKE when the auto-refix bounce types the
+  # re-task prompt AND submits Enter. Live 2026-07-08: `herdr pane run` alone left text in the agent
+  # prompt buffer (REVIEW_AUTOFIX + coordinator nudges silently no-op'd until a human Enter). Drives
+  # the SHIPPED path (_handle_block_verdict → herd_driver_send_text: pane run + send-keys Enter) against
+  # REAL panes with a live session, then asserts refix_wake_result woke=1 and agent_status=working.
+  # The sandbox has no model to flip status on its own, so a thin PATH wrapper simulates the agent's
+  # reaction: after a review-blocked pane run + Enter on the builder pane, report-agent → working.
+  # That proves the SHIPPED submit sequence ran end-to-end (without the Enter, the wrapper never flips
+  # and the bounce escalates woke=0). Runs BEFORE deadeyes so the builder pane is still wakeable.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step retask "re-task a done builder via type+Enter; assert the agent wakes (HERD-186)"
+    # shellcheck source=scripts/herd/driver.sh
+    . "$HERE/../driver.sh"
+
+    # Live session on the builder pane so the liveness probe is 'alive' (not dead → escalate).
+    WAKE_CLAUDE_BIN="$ART/wakeclaudebin"; mkdir -p "$WAKE_CLAUDE_BIN"
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$WAKE_CLAUDE_BIN/claude"; chmod +x "$WAKE_CLAUDE_BIN/claude"
+    herdr pane run "$BUILD_PANE" "$WAKE_CLAUDE_BIN/claude" >/dev/null 2>&1 || true
+    _wake_alive=no; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(herd_driver_agent_liveness rp-builder "$BUILD_PANE" 2>/dev/null)" = "alive" ] && { _wake_alive=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    # Builder reads 'done' (session still up, awaiting re-task) — the HERD-186 stuck-prompt shape.
+    herdr pane report-agent "$BUILD_PANE" --source rp-sim --agent "rp-builder" --state idle --custom-status "done" >/dev/null 2>&1 || true
+
+    if [ "$_wake_alive" = yes ]; then
+      WT="$ART/waketrees"; mkdir -p "$WT"
+      W_JOURNAL="$ART/wake-journal.jsonl"; : > "$W_JOURNAL"
+      W_DISPLAY="$ART/wake-display.txt"; : > "$W_DISPLAY"
+      W_MARK="$ART/wake-pending"; rm -f "$W_MARK"
+      # PATH wrapper: forward everything; on send-keys Enter after a review-blocked run to BUILD_PANE,
+      # flip the agent to working (the sandbox agent has no model to react itself).
+      W_SHIM="$ART/wake-shim"; mkdir -p "$W_SHIM"
+      _w_real="$(command -v herdr 2>/dev/null || true)"
+      cat > "$W_SHIM/herdr" <<WAKEHERDR
+#!/usr/bin/env bash
+_real="$_w_real"
+_pane="${BUILD_PANE}"
+_mark="${W_MARK}"
+if [ "\${1:-}" = "pane" ] && [ "\${2:-}" = "run" ] && [ "\${3:-}" = "\$_pane" ]; then
+  case "\${4:-}" in *review-blocked*) printf '%s\n' "\$_pane" > "\$_mark" 2>/dev/null || true ;; esac
+fi
+if [ "\${1:-}" = "pane" ] && [ "\${2:-}" = "send-keys" ] && [ "\${3:-}" = "\$_pane" ]; then
+  _keys="\$*"
+  if [ -f "\$_mark" ] && case " \$_keys " in *" Enter "*) true ;; *) false ;; esac; then
+    if [ -n "\$_real" ] && [ -x "\$_real" ]; then "\$_real" "\$@" || true; else true; fi
+    "\$_real" pane report-agent "\$_pane" --source rp-sim --agent "rp-builder" --state working >/dev/null 2>&1 || true
+    rm -f "\$_mark"
+    exit 0
+  fi
+fi
+if [ -n "\$_real" ] && [ -x "\$_real" ]; then exec "\$_real" "\$@"; fi
+exit 0
+WAKEHERDR
+      chmod +x "$W_SHIM/herdr"
+      (
+        export PATH="$W_SHIM:$PATH"
+        export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$WT" DEFAULT_BRANCH=main \
+               WORKSPACE_NAME="rp-retask-sim" JOURNAL_FILE="$W_JOURNAL" \
+               HERD_REFIX_WAIT_TIMEOUT=8
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        render() { :; }
+        # Speedy poll: no real multi-second sleeps; the wrapper flips status on Enter immediately.
+        sleep() { :; }
+        date() {
+          if [ "${1:-}" = "+%s" ]; then
+            # Advance a file-backed clock so the backed-off wait window terminates quickly.
+            local _c="$WT/.mock-clock"; local n
+            n=$(( $(cat "$_c" 2>/dev/null || echo 1000) + 1 )); echo "$n" > "$_c"; printf '%s\n' "$n"
+          else command date "$@"; fi
+        }
+        REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+        DISPLAY=()
+        _handle_block_verdict "186" "rp-builder" "wakesha186" "0" || true
+        printf '%s' "${DISPLAY[0]:-}" > "$W_DISPLAY"
+      ) ; W_RC=$?
+      _w_st="$(agent_status_of rp-builder)"
+      _w_woke=no; grep -q '"event":"refix_wake_result"' "$W_JOURNAL" 2>/dev/null \
+        && grep 'refix_wake_result' "$W_JOURNAL" | tail -1 | grep -q '"woke":1' && _w_woke=yes
+      _w_enter=no; [ ! -f "$W_MARK" ] && _w_enter=yes   # mark consumed ⇒ Enter path ran
+      if [ "$W_RC" = 0 ] && [ "$_w_woke" = yes ] && [ "$_w_st" = working ]; then
+        checkpoint builder_retask_wakes_on_enter pass \
+          "type+Enter re-task woke the done builder (refix_wake_result woke=1; agent_status=working)"
+      else
+        checkpoint builder_retask_wakes_on_enter fail \
+          "re-task did not wake (rc=$W_RC woke=$_w_woke status='$_w_st' enter_consumed=$_w_enter disp='$(cat "$W_DISPLAY" 2>/dev/null | tr -d '\n')')"
+      fi
+      # Reset agent to done for the deadeyes step that follows (it expects a non-working target).
+      herdr pane report-agent "$BUILD_PANE" --source rp-sim --agent "rp-builder" --state idle --custom-status "done" >/dev/null 2>&1 || true
+    else
+      checkpoint builder_retask_wakes_on_enter fail \
+        "could not stand up a live session to re-task (liveness='$(herd_driver_agent_liveness rp-builder "$BUILD_PANE" 2>/dev/null)')"
+    fi
   fi
 
   # ── DEAD-AGENT EYES (HERD-114): kill the builder's pane process, assert the liveness probe flips to

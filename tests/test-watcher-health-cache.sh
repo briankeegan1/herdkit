@@ -23,6 +23,15 @@ ok(){ pass=$((pass+1)); }
 
 [ -f "$WATCH" ] || fail "agent-watch.sh not found at $WATCH"
 
+# HERMETIC STUB (HERD-173 / HERD-189): a red row now consults the builder's agent_status, so that a red
+# somebody is ALREADY fixing never lies "needs you" (_active_fix_note). That is a `herdr agent list`
+# call, and a hermetic test must never reach the LIVE control room — stub herdr on PATH. It reports no
+# agents, which is the "nobody is on it" case this test's CODEERROR row asserts.
+BIN="$T/bin"; mkdir -p "$BIN"
+printf '#!/usr/bin/env bash\necho '"'"'{"result":{"agents":[]}}'"'"'\nexit 0\n' > "$BIN/herdr"
+chmod +x "$BIN/herdr"
+export PATH="$BIN:$PATH"
+
 # Source the watcher's helpers WITHOUT its live loop. Point config discovery at a nonexistent file so
 # herd-config.sh falls back to its generic defaults — fully hermetic, no repo/.herd walk-up.
 export AGENT_WATCH_LIB=1

@@ -42,6 +42,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh"
 
+# Engine version handshake (HERD-179): the local engine's level constant + herd_engine_guard (the
+# write-path refusal), herd_engine_warn_if_stale (the read-path advisory), herd_engine_doctor_row, and
+# herd_engine_min_stamp (the monotonic ENGINE_MIN stamp `herd upgrade` writes). Defines functions only;
+# ENGINE_MIN/ENGINE_AUTOUPDATE resolve lazily at call time, so sourcing before herd-config.sh is safe.
+# Sourced AFTER journal.sh so its refusal/bypass events are journaled. See scripts/herd/engine-version.sh.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/engine-version.sh" ] && . "$SCRIPTS_DIR/engine-version.sh"
+
 # Cost summer/reader helpers (transcript-token pricing). Defines functions + constants only, sourced
 # AFTER journal.sh (its documented order); gives cmd_cost the `herd cost --full` live-scan readers
 # (_cost_transcript_dir + cost_report_full). No side effects at source time.
@@ -1185,6 +1193,18 @@ cmd_upgrade() {
     printf 'HERD_VERSION=%s\n' "$target" >> "$cfg"
   fi
   ok "HERD_VERSION → $target"
+  # ENGINE VERSION HANDSHAKE (HERD-179): stamp the project's ENGINE_MIN floor to the level of the
+  # engine that just upgraded it. MONOTONIC — herd_engine_min_stamp never lowers a floor a newer engine
+  # already set elsewhere, so an operator running an old checkout cannot silently un-pin the project.
+  # From here on, any engine below that level refuses the write paths with `run herd update`.
+  if command -v herd_engine_min_stamp >/dev/null 2>&1; then
+    local engine_min_before engine_min_after
+    engine_min_before="$(_herd_engine_min_in_file "$cfg")"
+    engine_min_after="$(herd_engine_min_stamp "$cfg")"
+    if [ "$engine_min_after" != "$engine_min_before" ]; then
+      ok "ENGINE_MIN → $engine_min_after (engine level $(herd_engine_level))"
+    fi
+  fi
   local skill; skill="$(render_skill "$root" "$cfg")"
   ok "re-rendered coordinator skill → $skill"
   # After the re-render, surface engine config keys this project still hasn't assigned so a new knob
@@ -2900,9 +2920,79 @@ cmd_status() {
   # Re-theme the CLI palette from THIS project's HERD_THEME (startup default was tokyonight).
   if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   command -v _status_run >/dev/null 2>&1 || die "status helpers not loaded (scripts/herd/status.sh missing)"
+  # ENGINE VERSION HANDSHAKE (HERD-179), READ path: a snapshot against a stale engine is safe (it
+  # observes, it never acts) — so this WARNS and proceeds where a write path would refuse. Silent when
+  # the engine is current or the project pins no ENGINE_MIN floor; never changes the exit contract.
+  if command -v herd_engine_warn_if_stale >/dev/null 2>&1; then herd_engine_warn_if_stale "herd status"; fi
   local rc=0
   _status_run || rc=$?
   return "$rc"
+}
+
+cmd_sweep() {
+  # ONE-COMMAND CONTROL-ROOM CLEANUP (HERD-191). Runs every reaper the engine owns, on demand:
+  #   1. worktrees — sha-anchored reap of merged/closed-PR trees + unowned detached scratch trees
+  #   2. tabs      — stale engine tabs (registry-allowlisted, workspace-scoped)
+  #   3. markers   — dead-pid inflight markers (HERD-185's restart-safe corpse sweep)
+  #   4. processes — orphaned (ppid=1) bats/healthcheck trees; duplicate argv0-tagged watchers
+  #   5. watcher   — restart the watcher pane, then verify it survives one tick
+  # Legs 1–4 live in scripts/herd/sweep.sh, which COMPOSES the shipped helpers (it reuses
+  # agent-watch.sh's _reap_slug / _orphan_tab_ids / _sweep_gate_corpses via AGENT_WATCH_LIB=1 rather
+  # than reimplementing them). Leg 5 lives HERE because it needs the pane helpers + the single
+  # watcher-killing code path (_stop_project_watcher's SIGTERM-poll-SIGKILL-abort discipline), which
+  # cmd_pane_watch already owns — so the sweep never grows a second way to kill a watcher.
+  #
+  # SAFETY: anything the sweep cannot PROVE disposable (a worktree with real dirt, or a closed-PR
+  # branch carrying commits that exist nowhere else) is FLAGGED WITH EVIDENCE and never deleted.
+  #   --dry-run     print the full plan, touch nothing (also skips leg 5)
+  #   --no-restart  run legs 1–4 only
+  local dry="" restart=1 args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)    dry=1; restart=0; args+=("$1") ;;
+      --no-restart) restart=0; args+=("$1") ;;
+      -h|--help)    say "usage: herd sweep [--dry-run] [--no-restart]"; return 0 ;;
+      *)            die "herd sweep: unknown option '$1' (try --dry-run or --no-restart)" ;;
+    esac
+    shift
+  done
+
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+
+  # Legs 1–4. sweep.sh loads its own helper substrate and journals every action it takes.
+  bash "$SCRIPTS_DIR/sweep.sh" ${args[@]+"${args[@]}"} || return $?
+
+  [ "$restart" -eq 1 ] || return 0
+
+  # ── leg 5: watcher pane restart + one-tick verify ──
+  # cmd_pane_watch stops THIS project's watcher(s) — including the duplicate/zombie strays leg 4
+  # merely listed — and brings exactly one back up in its pane. Then prove the new watcher is not a
+  # crash-loop: a watcher that dies during its first ~4 s tick would otherwise look like a success.
+  say ""
+  say "${c_bold}sweep leg 5${c_rst} — restarting the watcher"
+  cmd_pane_watch || { warn "watcher restart failed — control room swept, but no watcher is running"; return 1; }
+
+  local wait_s="${HERD_SWEEP_TICK_WAIT:-5}" wpid=""
+  [ -f "$HERD_WATCHER_LOCK" ] && wpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  if [ -z "$wpid" ]; then
+    warn "watcher restarted but wrote no pid lock — cannot verify it survived a tick"
+    journal_append sweep_watcher_verify result no-lock
+    return 1
+  fi
+  sleep "$wait_s"
+  if kill -0 "$wpid" 2>/dev/null; then
+    ok "watcher pid $wpid alive after one tick (${wait_s}s)"
+    journal_append sweep_watcher_verify result alive pid "$wpid"
+    return 0
+  fi
+  warn "watcher pid $wpid DIED within ${wait_s}s of restart — inspect its pane"
+  journal_append sweep_watcher_verify result died pid "$wpid"
+  return 1
 }
 
 cmd_backlog() {
@@ -3114,6 +3204,15 @@ cmd_backend_switch() {
   if [ "$target" = "$current" ]; then
     say "already on SCRIBE_BACKEND=$current — nothing to do"
     return 0
+  fi
+
+  # ENGINE VERSION HANDSHAKE (HERD-179). A backend switch REWRITES .herd/config and (with --migrate)
+  # moves every open item between trackers — the single most destructive write the CLI makes. An engine
+  # below the project's committed ENGINE_MIN refuses it here, before any preflight or migration. Placed
+  # after the same-backend early return so a genuine no-op stays a silent no-op: only a switch that
+  # would actually WRITE crosses the guard.
+  if command -v herd_engine_guard >/dev/null 2>&1; then
+    herd_engine_guard "herd backend switch" || die "backend switch aborted — stale engine (see above)"
   fi
 
   # ── 1. preflight — fail loud BEFORE any change ─────────────────────────────────────────────────
@@ -5749,6 +5848,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       watcher alive?, in-flight builders (+ DEAD detection), open
                                       PRs + gate state, backlog counts. Deterministic, no LLM, no
                                       mutation; exits non-zero when something needs attention
+  herd sweep [--dry-run] [--no-restart]
+                                      one-command control-room cleanup: reap merged/closed-PR
+                                      worktrees (sha-anchored), close stale engine tabs, drop
+                                      dead inflight markers, kill orphaned bats/healthcheck
+                                      process trees, then restart + verify the watcher. Anything
+                                      it cannot prove disposable (real dirt, unpushed unique
+                                      commits) is FLAGGED with evidence, never deleted.
+                                      --dry-run prints the full plan and touches nothing
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
@@ -5853,6 +5960,7 @@ case "${1:-help}" in
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;
   status)  shift; cmd_status "$@" ;;
+  sweep)   shift; cmd_sweep "$@" ;;
   why)     shift; cmd_why "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   cost)    shift; cmd_cost "$@" ;;

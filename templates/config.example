@@ -77,6 +77,25 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # them: `herd agent-update --dry-run`. Any value other than "on" is treated as off.
 # AGENT_UPDATE="off"                  # off (default) | on
 
+# ENGINE_MIN — the ENGINE VERSION HANDSHAKE floor (HERD-179): the minimum herdkit ENGINE LEVEL this
+# project requires. You do not hand-edit this — `herd upgrade` STAMPS it to the level of the engine
+# that ran the upgrade, and only ever RAISES it (monotonic), so an operator on an older checkout can
+# never silently un-pin the project. An engine BELOW the floor is STALE, and every WRITE path refuses
+# it with one remedy — `run herd update`: lane spawn preflight, herd-claim, scribe-step apply, and
+# `herd backend switch`. READS only warn (`herd status`, the advisory `herd doctor` row). The escape
+# hatch HERD_ENGINE_SKIP_HANDSHAKE=1 downgrades any refusal to a warning and JOURNALS the bypass.
+# Default 0 (or absent) = no floor = the handshake is inert.
+# ENGINE_MIN=0                        # 0/absent (default, inert) | a positive engine level
+
+# ENGINE_AUTOUPDATE — what the engine DOES about a stale local checkout (HERD-179). "off" (default)
+# runs nothing beyond the always-advisory `herd doctor` row. "check" paints one quiet "engine outdated"
+# note on the watcher console and calls it out in the doctor — `herd update` stays yours to run. "auto"
+# additionally has the watcher dispatch `herd update` in a QUIESCENT window: it reuses that command's
+# own refusal (it aborts rather than swap the engine while builders are mid-flight, or over a dirty
+# engine checkout) and is rate-limited by a cooldown, so a persistent refusal never hammers the remote.
+# Any other value is treated as off.
+# ENGINE_AUTOUPDATE="off"             # off (default) | check | auto
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color
@@ -225,6 +244,14 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # never false-holds a legit PR. off → byte-inert. Watcher-affecting (next watcher restart).
 # STALE_DUP_DETECT="on"    # on (default) | off
 
+# stale-base auto-heal (HERD-199) — on | off (default off, ship-dormant). on → a STALE-BASE hold from
+# the stale-duplicate gate is mechanical and self-heals: the watcher auto-bounces the live builder with
+# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, shared REFIX_MAX_ROUNDS budget, honest
+# `rebasing · awaiting push` row), or dispatches the conflict resolver when no live builder remains
+# (foreign/reaped/dead). Only bounce-exhaustion escalates to needs-you. DUPLICATE flavor stays human.
+# off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.
+# STALE_BASE_AUTOFIX="off"  # off (default) | on
+
 # herd/gates commit status (HERD-194) — on (default) | off. on → as the watcher clears each (pr,sha) it
 # posts a `herd/gates` COMMIT STATUS: state=success on both-gates-green (healthcheck + adversarial
 # review), exactly once per (pr,sha). It posts ONLY success — never a non-passing pending/failure status,
@@ -248,6 +275,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # test> (since #N)' console row + a notification, cleared when a later sha goes green. An ALARM only —
 # never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
 # MAIN_HEALTH_TICK="off"   # off (default) | on
+
+# Control-room SWEEP triggers (HERD-191) — off | advise (default) | auto. `herd sweep` is the
+# one-command cleanup: it reaps merged/closed-PR worktrees (sha-anchored), closes stale engine tabs,
+# drops dead inflight markers, and kills orphaned bats/healthcheck process trees. This key controls
+# what the WATCHER does about the same debris on its own. advise → a cheap per-cadence scan renders
+# one '🧹 sweep recommended: N stale tabs · M dead markers' console row and journals `sweep_advice`
+# once per distinct condition-set. auto → the watcher additionally runs the SAFE legs itself (dead
+# markers, orphan processes, registry-matched tabs, PROVABLY-disposable worktrees). JUDGMENT legs — a
+# worktree carrying real dirt or unpushed unique commits — are FLAGGED WITH EVIDENCE and never
+# auto-deleted, in any mode. off → byte-inert: no scan, no row, no journal. Watcher-affecting.
+# SWEEP_AUTO="advise"      # off | advise (default) | auto
 
 # Watcher-console FLAIR pack (HERD-147) — an ADDITIVE cosmetic layer on the live 'herd watch' console.
 # ON → (a) a merge CELEBRATION: the status tick after a merge prints one theme-colored line

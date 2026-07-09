@@ -95,7 +95,32 @@ ok 2 $ENV_TEST"
 F="$(build_fixture genuine "$TAP_GENUINE" 1 none)"
 run_proj "$F" --oneline
 [ "$RC" -eq 1 ] || fail "(b) genuine code failure should exit 1, got $RC — out: $OUT"
-echo "PASS (b) genuine non-env test failure → exit 1"
+# HERD-173 (live incident, PR #273): the genuine-code-error --oneline detail used to be
+# `bats: $(tail -1)`, which grabbed the LAST line bats printed — here the PASSING 'ok 2 …' — and sent
+# both the coordinator and the builder to the WRONG test. The detail is load-bearing: the auto-refix
+# re-task prompt quotes it verbatim. It must name the FAILING test.
+case "$OUT" in
+  *"bats: ok "*) fail "(b) the code-error detail must never quote a PASSING 'ok' line — got: $OUT" ;;
+esac
+printf '%s' "$OUT" | grep -q "not ok 1 hermetic backlog-view rich-render test passes" \
+  || fail "(b) the code-error detail must quote the FIRST 'not ok' line — got: $OUT"
+echo "PASS (b) genuine non-env test failure → exit 1, detail quotes the failing test"
+
+# ── (b3) MULTIPLE genuine failures → the detail names the FIRST + how many failed ────────────────────
+TAP_MULTI="1..4
+ok 1 setup
+not ok 2 cross-driver conformance audit
+#   (in test file tests/test-driver-agent-exec.sh, line 88)
+not ok 3 another failing test
+ok 4 $ENV_TEST"
+F="$(build_fixture multi "$TAP_MULTI" 1 none)"
+run_proj "$F" --oneline
+[ "$RC" -eq 1 ] || fail "(b3) multiple genuine failures should exit 1, got $RC — out: $OUT"
+printf '%s' "$OUT" | grep -q "not ok 2 cross-driver conformance audit" \
+  || fail "(b3) the detail must quote the FIRST failing test — got: $OUT"
+printf '%s' "$OUT" | grep -q "(2 failing)" \
+  || fail "(b3) the detail must report how many tests failed — got: $OUT"
+echo "PASS (b3) multiple failures → detail names the first + the failing count"
 
 # ── (b2) env test AND a genuine test both fail → exit 1 (never downgrade; the real worktree state) ──
 TAP_BOTH="1..2
