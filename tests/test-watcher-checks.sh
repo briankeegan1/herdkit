@@ -97,11 +97,16 @@ type do_merge >/dev/null 2>&1 || fail "do_merge not defined after sourcing (lib 
 # simulate either a moved head OR a post-merge local failure (branch-delete). $GH_PR_STATE is what
 # `pr view --json state,mergedAt -q .state` returns so HERD-221 can tell MERGED from OPEN after a
 # non-zero merge (the stub honours -q so production's jq selector sees a bare state token).
-GH_MERGE_ARGS="$T/merge-args.log"; export GH_MERGE_ARGS GH_MERGE_RC GH_PR_STATE
+GH_MERGE_ARGS="$T/merge-args.log"; GH_VIEW_RC=0
+export GH_MERGE_ARGS GH_MERGE_RC GH_PR_STATE GH_VIEW_RC
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "pr view")
+    # GH_VIEW_RC simulates gh itself being unreadable (network blip, rate limit, expired auth): a
+    # non-zero exit and NO output, exactly as real gh behaves. HERD-232 / audit G6 needs this to tell a
+    # genuine sha-moved refusal apart from "we could not find out".
+    [ "${GH_VIEW_RC:-0}" -ne 0 ] && exit "${GH_VIEW_RC}"
     # Honour -q / --jq so callers like `gh pr view N --json state,mergedAt -q '.state'` get a bare
     # token (matches real gh). Without this, HERD-221's MERGED check would compare full JSON ≠ MERGED.
     _q=""
@@ -201,6 +206,36 @@ grep -q '"event":"merge"' "$JOURNAL_FILE" || grep -qE '(^|[[:space:]])merge([[:s
 grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" \
   && fail "HERD-221: must NEVER journal merge_refused_sha_moved when PR is MERGED (got: $(cat "$JOURNAL_FILE"))"
 post_merge_ran || fail "HERD-221: MERGED-despite-rc must fire post-merge hooks (got: $(cat "$POST_MERGE_LOG"))"
+ok
+
+# ── HERD-232 (audit G6, honest labels): gh refuses the merge AND the state re-check is ITSELF
+#    unreadable (network blip / rate limit / expired auth). Nothing proves the head moved, so the
+#    refusal must NOT be labelled merge_refused_sha_moved — that sends a post-mortem hunting a phantom
+#    force-push. It is an infra event: merge_gh_unreadable. Still returns 1 and still skips the hooks.
+: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$JOURNAL_FILE"; : > "$POST_MERGE_LOG"
+GH_MERGE_RC=1 GH_PR_STATE=OPEN GH_VIEW_RC=1
+if do_merge "my-slug" 4242 "$T/wt" "$GATED_SHA"; then
+  fail "do_merge must return non-zero when it cannot establish the PR's state"
+fi
+grep -q 'merge_gh_unreadable' "$JOURNAL_FILE" \
+  || fail "an unreadable gh must journal merge_gh_unreadable (got: $(cat "$JOURNAL_FILE"))"
+grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" \
+  && fail "G6: an unreadable gh must NEVER be labelled a sha-moved refusal (got: $(cat "$JOURNAL_FILE"))"
+[ -s "$STATE" ] && fail "an unreadable gh must NOT write the \$STATE merge row"
+[ -s "$POST_MERGE_LOG" ] && fail "an unreadable gh must leave post-merge hooks silent"
+GH_VIEW_RC=0
+ok
+
+# …and the converse still holds: a READABLE non-MERGED state is a genuine refusal, and it now names the
+# state it actually saw, so the label and the evidence agree.
+: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$JOURNAL_FILE"; : > "$POST_MERGE_LOG"
+GH_MERGE_RC=1 GH_PR_STATE=OPEN
+if do_merge "my-slug" 4242 "$T/wt" "$GATED_SHA"; then
+  fail "do_merge must return non-zero on a genuine refusal"
+fi
+grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" || fail "a readable OPEN state is a genuine sha-moved refusal"
+grep -q '"state":"OPEN"' "$JOURNAL_FILE" || fail "the refusal must carry the state it observed (got: $(cat "$JOURNAL_FILE"))"
+grep -q 'merge_gh_unreadable' "$JOURNAL_FILE" && fail "a readable state must not be labelled a gh outage"
 ok
 
 # ════════════════════════════════════════════════════════════════════════════

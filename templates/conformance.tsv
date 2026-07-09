@@ -134,7 +134,9 @@ agent-watch.sh	unit	tests/test-human-verify-hold.sh
 agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
 agent-watch.sh	unit	tests/test-watcher-singleton.sh
+agent-watch.sh	unit	tests/test-postmerge-sweep.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
+agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh
