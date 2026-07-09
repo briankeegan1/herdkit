@@ -13,25 +13,42 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS+1)); }
 
 # Fake gh: logs its args to $T/gh.log and emits canned output keyed on "<noun> <verb>".
+# HERD-244: issue view returns assignees (empty by default so plan-set-assignee runs); `api` covers
+# issue comments list/delete for unqueue/list_queued.
 GHLOG="$T/gh.log"
 mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<EOF
 #!/usr/bin/env bash
 echo "gh \$*" >> "$GHLOG"
+# \`api\` is a single-token verb (path is \$2 or later) — handle it before "\$1 \$2" noun/verb pairs.
+if [ "\$1" = "api" ]; then
+  if [ "\$2" = "user" ]; then echo "alice"; exit 0; fi
+  args="\$*"
+  case "\$args" in
+    *"issues/comments/"*) exit 0 ;;   # DELETE — succeed silently
+    *"/issues/7/comments"*)
+      printf '%s' '[{"id":701,"body":"📌 queued by alice: sequenced after 9 [1700000000]"},{"id":702,"body":"unrelated note"}]'
+      ;;
+    *"issues/"*"/comments"*) printf '[]' ;;
+    *) : ;;
+  esac
+  exit 0
+fi
 case "\$1 \$2" in
   "issue create")  echo "https://github.com/acme/widgets/issues/42" ;;
   "issue list")    printf '%s' '[{"number":7,"title":"first open issue"},{"number":9,"title":"second open issue"}]' ;;
   "issue comment") : ;;
   "issue close")   : ;;
+  "issue edit")    : ;;
   "issue view")
     _vnum=""
     for _va in "\$@"; do
       [ -z "\${_va##*[!0-9]*}" ] || { _vnum="\$_va"; break; }
     done
     case "\$_vnum" in
-      7)  printf '{"state":"OPEN","number":7}\n'   ;;
-      42) printf '{"state":"CLOSED","number":42}\n' ;;
-      *)  printf '{"state":"OPEN","number":0}\n'    ;;
+      7)  printf '{"state":"OPEN","number":7,"assignees":[]}\n'   ;;
+      42) printf '{"state":"CLOSED","number":42,"assignees":[]}\n' ;;
+      *)  printf '{"state":"OPEN","number":0,"assignees":[]}\n'    ;;
     esac
     ;;
   *) : ;;
@@ -125,6 +142,77 @@ pass
 if ( cd "$T"; export PATH="/nonexistent"; . "$BACKEND"; _backend_list_open ) >/dev/null 2>&1; then
   fail "list_open should fail when gh is absent"
 fi
+pass
+
+# 7. HERD-52/HERD-244 queue_item → posts a 📌 comment AND --add-assignee the operator (first-class
+#    GitHub field). Reports DONE off the comment write.
+: > "$GHLOG"
+q="$(run _backend_queue_item 7 alice 9)"
+echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
+grep -q -- "issue comment -R acme/widgets 7" "$GHLOG" || fail "queue_item did not post a comment on issue 7"
+grep -q "queued by alice" "$GHLOG" || fail "queue_item marker did not name the operator"
+grep -q "sequenced after 9" "$GHLOG" || fail "queue_item marker did not record the blocker"
+grep -q -- "issue edit -R acme/widgets 7 --add-assignee alice" "$GHLOG" \
+  || fail "queue_item (HERD-244) did not --add-assignee the operator ($(cat "$GHLOG"))"
+pass
+
+# 7a. unqueue_item → DELETE's only the 📌 comment (id 701), never the unrelated one (702), and
+#     --remove-assignee when the plan-time assignee is still us.
+: > "$GHLOG"
+# Seed assignees so clear-assignee sees us as currently assigned.
+cat > "$T/bin/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG"
+if [ "\$1" = "api" ]; then
+  args="\$*"
+  case "\$args" in
+    *"issues/comments/"*) exit 0 ;;
+    *"/issues/7/comments"*)
+      printf '%s' '[{"id":701,"body":"📌 queued by alice: sequenced after 9 [1700000000]"},{"id":702,"body":"unrelated note"}]' ;;
+    *) : ;;
+  esac
+  exit 0
+fi
+case "\$1 \$2" in
+  "issue view") printf '{"state":"OPEN","number":7,"assignees":[{"login":"alice"}]}\n' ;;
+  "issue edit") : ;;
+  *) : ;;
+esac
+EOF
+chmod +x "$T/bin/gh"
+uq="$(run _backend_unqueue_item 7 alice)"
+echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
+grep -q -- "issues/comments/701" "$GHLOG" || fail "unqueue_item did not DELETE the 📌 comment (701)"
+grep -q -- "issues/comments/702" "$GHLOG" && fail "unqueue_item deleted a non-marker comment (702)"
+grep -q -- "--remove-assignee alice" "$GHLOG" \
+  || fail "unqueue_item (HERD-244) did not --remove-assignee the operator ($(cat "$GHLOG"))"
+pass
+
+# 7b. list_queued → one TSV line per 📌 marker across open issues.
+: > "$GHLOG"
+cat > "$T/bin/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG"
+if [ "\$1" = "api" ]; then
+  args="\$*"
+  case "\$args" in
+    *"/issues/7/comments"*)
+      printf '%s' '[{"id":701,"body":"📌 queued by alice: sequenced after 9 [1700000000]"}]' ;;
+    *) printf '[]' ;;
+  esac
+  exit 0
+fi
+case "\$1 \$2" in
+  "issue list") printf '%s' '[{"number":7,"title":"first open issue"},{"number":9,"title":"second open issue"}]' ;;
+  *) : ;;
+esac
+EOF
+chmod +x "$T/bin/gh"
+TAB="$(printf '\t')"
+lq="$(run _backend_list_queued)"
+echo "$lq" | grep -q "^#7${TAB}alice${TAB}sequenced after 9${TAB}1700000000$" \
+  || fail "list_queued did not emit the parsed marker TSV for #7 ($lq)"
+echo "$lq" | grep -q "^#9" && fail "list_queued surfaced #9 which carries no 📌 marker ($lq)"
 pass
 
 echo "ALL PASS ($PASS checks)"

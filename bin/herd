@@ -3190,10 +3190,15 @@ cmd_backlog() {
   #                             sequenced-to-spawn-next but not yet spawned, so a second operator
   #                             sees plan-time intent. Markers older than 24h are flagged ADVISORY.
   #   herd backlog queue <#id> [--after <blocker>]
-  #                             publish such a marker (I'm building this next, after <blocker>)
-  #   herd backlog unqueue <#id>  clear my marker (plan dropped; a spawn's claim supersedes it too)
+  #                             publish such a marker (I'm building this next, after <blocker>).
+  #                             HERD-244: on API backends (linear/github) ALSO sets the tracker
+  #                             ASSIGNEE to the queuing operator (API identity / WATCHER_OWNER) so
+  #                             the plan is visible in every client view, not only via `queued`.
+  #   herd backlog unqueue <#id>  clear my marker (plan dropped; a spawn's claim supersedes it too);
+  #                             HERD-244: clear the plan-time assignee when the queue set it.
   # queue/unqueue/queued are BACKEND-OPTIONAL: a backend without the op prints a soft note (or an
-  # empty list) and exits 0 — a plan marker is advisory, never a gate.
+  # empty list) and exits 0 — a plan marker is advisory, never a gate. Assignee writes are fail-soft
+  # (a backend that cannot set assignee still posts the 📌 comment).
   local mode="plain" ref="" blocker=""
   case "${1:-}" in
     --rich)  mode="rich" ;;

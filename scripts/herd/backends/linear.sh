@@ -13,8 +13,10 @@
 #   _backend_mark_shipped SLUG PR_URL — comment PR link + issueUpdate into the Done state
 #   _backend_list_open                — open issues, one "#<identifier> <title>" line each
 # plus _backend_item_state REF for the link-state watcher, and the OPTIONAL planned-work markers
-# (HERD-52): _backend_queue_item / _backend_unqueue_item / _backend_list_queued for cross-operator
-# plan-time visibility (a 📌 comment naming who sequenced the item after what, and when).
+# (HERD-52 / HERD-244): _backend_queue_item / _backend_unqueue_item / _backend_list_queued for
+# cross-operator plan-time visibility (a 📌 comment naming who sequenced the item after what and
+# when, plus HERD-244 setting/clearing the issue ASSIGNEE to the API identity so the plan is visible
+# in every Linear client view).
 #
 # Credentials: LINEAR_API_KEY is read from .herd/secrets (gitignored) — NEVER from .herd/config.
 # Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID (also from .herd/secrets) names
@@ -711,29 +713,85 @@ EOF
 # complements the pre-spawn CLAIM (_backend_claim_item, HERD-50, which covers spawn-time): the marker
 # covers PLAN-time, the window between "I've decided to build this next" and the claim. On Linear the
 # marker is a COMMENT of the shared shape "📌 queued by <who>: sequenced after <blocker> [<epoch>]"
-# (an ISO-ish unix timestamp so a reader can age it out). All three ops are BACKEND-OPTIONAL and
-# FAIL-SOFT: an unresolvable ref, a missing key, or a transport hiccup is NOCHANGE/empty, never a hard
-# error — a plan marker is advisory, never a gate.
+# (an ISO-ish unix timestamp so a reader can age it out). HERD-244: queue ALSO sets the issue
+# ASSIGNEE to the API key's viewer (a first-class field every Linear client surfaces) and unqueue
+# clears that assignee when the plan is dropped — only if we still own it and a claim has not moved
+# the issue into a started state. The 📌 comment is kept for backward-compat. All ops are
+# BACKEND-OPTIONAL and FAIL-SOFT: an unresolvable ref, a missing key, a transport hiccup, or an
+# assignee write the backend rejects is NOCHANGE/empty for that part, never a hard error — a plan
+# marker is advisory, never a gate.
 _LINEAR_QUEUE_MARK_RE='📌 queued by (.*?): (.*?) \[(\d+)\]'
 
+# _linear_viewer_id — API-key identity used as the plan-time assignee (same as claim). Empty on fail.
+_linear_viewer_id() {
+    _linear_gql 'query { viewer { id } }' | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print(((d.get("data") or {}).get("viewer") or {}).get("id") or "")' 2>/dev/null
+}
+
+# _linear_plan_set_assignee ISSUE_ID CUR_ASSIGNEE_ID — HERD-244 fail-soft: assign the viewer when the
+# issue is unassigned (or already ours). Never steals another operator's assignee. Returns 0 always.
+_linear_plan_set_assignee() {
+    local issue_id="$1" cur_assignee="${2:-}" me_id
+    [ -n "$issue_id" ] || return 0
+    me_id="$(_linear_viewer_id)"
+    [ -n "$me_id" ] || return 0
+    if [ -n "$cur_assignee" ] && [ "$cur_assignee" != "$me_id" ]; then
+        return 0   # another operator already owns it — do not overwrite
+    fi
+    _linear_gql 'mutation PlanAssign($id: String!, $assignee: String!) {
+  issueUpdate(id: $id, input: { assigneeId: $assignee }) { success }
+}' "$(ID="$issue_id" A="$me_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "assignee": os.environ["A"]}))')" >/dev/null 2>&1 || true
+}
+
+# _linear_plan_clear_assignee ISSUE_ID CUR_ASSIGNEE_ID STATE_TYPE — HERD-244 fail-soft: unassign when
+# (a) the issue is still assigned to the viewer AND (b) state is not started (a claim owns started +
+# assignee — unqueue after claim must not undo the claim). assigneeId: null is Linear's unassign.
+_linear_plan_clear_assignee() {
+    local issue_id="$1" cur_assignee="${2:-}" stype="${3:-}" me_id
+    [ -n "$issue_id" ] || return 0
+    [ -n "$cur_assignee" ] || return 0
+    case "$stype" in started) return 0 ;; esac   # claim supersedes the plan-time assignee
+    me_id="$(_linear_viewer_id)"
+    [ -n "$me_id" ] || return 0
+    [ "$cur_assignee" = "$me_id" ] || return 0
+    _linear_gql 'mutation PlanUnassign($id: String!, $assignee: String) {
+  issueUpdate(id: $id, input: { assigneeId: $assignee }) { success }
+}' "$(ID="$issue_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "assignee": None}))')" >/dev/null 2>&1 || true
+}
+
 # _backend_queue_item REF WHO BLOCKER — publish a planned marker comment on the issue. BLOCKER is the
-# item this one is sequenced after (may be empty → "sequenced next"). Sets _BACKEND_RESULT=DONE|NOCHANGE.
+# item this one is sequenced after (may be empty → "sequenced next"). Also sets assignee to the API
+# identity (viewer) when free (HERD-244). Sets _BACKEND_RESULT=DONE|NOCHANGE off the comment write;
+# assignee is fail-soft and never flips DONE→NOCHANGE.
 _backend_queue_item() {
-    local ref="$1" who="$2" blocker="$3" resp issue_id ok ts detail body
+    local ref="$1" who="$2" blocker="$3" resp issue_id cur_assignee ok ts detail body
     _linear_require_key
     [ -n "$who" ] || who="unknown-operator"
     ts="$(date +%s 2>/dev/null || echo 0)"
     if [ -n "$blocker" ]; then detail="sequenced after $blocker"; else detail="sequenced next"; fi
-    if ! _linear_issue_query "$ref" "id identifier"; then
+    if ! _linear_issue_query "$ref" "id identifier assignee { id }"; then
         echo "linear backend: '$ref' is not a resolvable identifier — cannot publish a queued marker" >&2
         _BACKEND_RESULT="NOCHANGE"; return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
-    issue_id="$(printf '%s' "$resp" | python3 -c 'import sys, json
+    # issue_id \x1f assignee_id — unit separator so an unassigned issue's empty field is preserved.
+    IFS=$'\x1f' read -r issue_id cur_assignee <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+SEP = "\x1f"
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
-print(nodes[0].get("id", "") if nodes else "")' 2>/dev/null)"
+if not nodes:
+    print(SEP)
+else:
+    n = nodes[0]
+    a = n.get("assignee") or {}
+    print(SEP.join([n.get("id", ""), a.get("id", "") or ""]))' 2>/dev/null)
+EOF
     if [ -z "$issue_id" ]; then
         echo "linear backend: no issue matching '$ref' — nothing to queue" >&2
         _BACKEND_RESULT="NOCHANGE"; return 0
@@ -748,20 +806,38 @@ try: d = json.load(sys.stdin)
 except Exception: d = {}
 print("1" if (((d.get("data") or {}).get("commentCreate") or {}).get("success")) else "0")' 2>/dev/null)"
     if [ "$ok" = "1" ]; then _BACKEND_RESULT="DONE"; else _BACKEND_RESULT="NOCHANGE"; fi
+    # HERD-244: surface plan-time intent on the first-class assignee field too (fail-soft).
+    _linear_plan_set_assignee "$issue_id" "$cur_assignee"
     # HERD-85: journal the plan-time write (component=plan set by the caller). Fail-soft.
     _backend_tw_journal "$ref" queued "$_BACKEND_RESULT"
 }
 
 # _backend_unqueue_item REF WHO — clear the planned marker(s) on the issue (plan dropped, or the item
 # was spawned and the claim now supersedes it). WHO is informational. Deletes every 📌-marker comment
-# on the issue via commentDelete. Sets _BACKEND_RESULT=DONE (≥1 deleted) | NOCHANGE (none present).
+# on the issue via commentDelete. When markers were cleared and the plan-time assignee is still the
+# viewer on a non-started issue, also unassigns (HERD-244). Sets _BACKEND_RESULT=DONE (≥1 deleted) |
+# NOCHANGE (none present).
 _backend_unqueue_item() {
-    local ref="$1" who="$2" resp ids id deleted=0
+    local ref="$1" who="$2" resp ids id deleted=0 issue_id cur_assignee stype
     _linear_require_key
-    if ! _linear_issue_query "$ref" "id comments { nodes { id body } }"; then
+    if ! _linear_issue_query "$ref" "id comments { nodes { id body } } assignee { id } state { type }"; then
         _BACKEND_RESULT="NOCHANGE"; return 0
     fi
     resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    IFS=$'\x1f' read -r issue_id cur_assignee stype <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+SEP = "\x1f"
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if not nodes:
+    print(SEP * 2)
+else:
+    n = nodes[0]
+    a = n.get("assignee") or {}
+    st = n.get("state") or {}
+    print(SEP.join([n.get("id", ""), a.get("id", "") or "", st.get("type", "") or ""]))' 2>/dev/null)
+EOF
     ids="$(printf '%s' "$resp" | RE="$_LINEAR_QUEUE_MARK_RE" python3 -c 'import sys, json, os, re
 rx = re.compile(os.environ["RE"])
 try: d = json.load(sys.stdin)
@@ -783,7 +859,14 @@ sys.exit(0 if (((d.get("data") or {}).get("commentDelete") or {}).get("success")
             deleted=$((deleted+1))
         fi
     done
-    if [ "$deleted" -gt 0 ]; then _BACKEND_RESULT="DONE"; else _BACKEND_RESULT="NOCHANGE"; fi
+    if [ "$deleted" -gt 0 ]; then
+        _BACKEND_RESULT="DONE"
+        # HERD-244: clear the plan-time assignee only when the queue set it and a claim has not
+        # already taken over (started state + assignee is the claim signal).
+        _linear_plan_clear_assignee "$issue_id" "$cur_assignee" "$stype"
+    else
+        _BACKEND_RESULT="NOCHANGE"
+    fi
     _backend_tw_journal "$ref" unqueued "$_BACKEND_RESULT"
 }
 
