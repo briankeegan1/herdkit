@@ -529,6 +529,19 @@ fi
 # only the wall-clock overlaps. Tradeoff: a health-failed sha wastes one review run (cheap under
 # REVIEW_ESCALATE_GLOB tiering). Unknown value → serial (fail safe). Consumed by agent-watch.sh.
 : "${GATE_DISPATCH:="serial"}"   # serial (default) | parallel — see capabilities.tsv / agent-watch.sh
+# DELTA_REVIEW (HERD-204) — off (default) | on. Skip a full pre-merge re-review when a PR's NEW head
+# sha differs from its last review-PASSED sha ONLY by a merge of DEFAULT_BRANCH (a pure INTEGRATION
+# push: the newly-merged main commits are already-reviewed main, and the merge itself carries no
+# authored conflict-resolution content). on → before dispatching a full review for a new sha, the
+# watcher tries to PROVE the delta is integration-only (new sha is a 2-parent merge whose branch-side
+# parent IS the last-passed sha, whose other parent is already contained in DEFAULT_BRANCH, and whose
+# tree equals a clean 3-way auto-merge of those parents with zero manual edits); if proven, it CARRIES
+# FORWARD the prior PASS onto the new sha (records a sha-keyed PASS with source=carried-forward and
+# journals review_carried_forward) instead of re-reviewing. CONSERVATIVE + FAIL-CLOSED: any authored
+# change beyond the merge, a non-trivial/conflicted merge, a missing sha/worktree, or any inability to
+# prove integration-only → a normal full review. off (default) → byte-inert: no probe, no carry, the
+# review-once gate is unchanged. Unknown value → off (fail safe). Consumed by agent-watch.sh.
+: "${DELTA_REVIEW:="off"}"       # off (default) | on — see capabilities.tsv / agent-watch.sh
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
 : "${HEALTHCHECK_AUTOFIX:="false"}"  # HERD-173: auto-bounce a reproduced healthcheck CODE ERROR to the builder agent, on the same rails as REVIEW_AUTOFIX — true | false (default false). true → the watcher delivers the failing test + the tailable suite log to the builder's agent pane, once per (pr,sha), sharing ONE per-PR round budget with the review refix (REFIX_MAX_ROUNDS counts both kinds together); the same limit-parked / dead-agent preflights apply, and the cap escalates to a needs-you row. A tab-leak-guard trip is infra, never bounced. false (default) → no bounce, no ledger write, no re-task prompt: the gate decision is unchanged and the red row still holds the PR. Consumed by agent-watch.sh
