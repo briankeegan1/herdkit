@@ -630,7 +630,7 @@ _health_release 99999
 if [ "$_HC_RESULT" = "QUEUED" ] && [ "$_probe_before" = "$_probe_after" ]; then
   checkpoint health_mutex_queues pass "a healthcheck QUEUED (stub not invoked) while the single slot was busy"
 else
-  checkpoint health_mutex_queues fail "expected QUEUED with stub not invoked (got '$_HC_RESULT', runs $_probe_before→$_probe_after)"
+  checkpoint health_mutex_queues fail "expected QUEUED with stub not invoked (got '$_HC_RESULT', runs ${_probe_before}→${_probe_after})"
 fi
 
 # (c) no double-merge, no skipped PR — each PR merged exactly once.
@@ -975,7 +975,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   if [ -n "$_mf_head" ] && [ "$_mf_head" = "$_mf_want" ] && [ "$_mf_ff_after" -gt "$_mf_ff_before" ]; then
     checkpoint main_freshness_ff pass "out-of-band merge fast-forwarded \$MAIN on the tick and journaled main_ff"
   else
-    checkpoint main_freshness_ff fail "expected ff to origin/main + a main_ff event (head=$_mf_head want=$_mf_want main_ff $_mf_ff_before→$_mf_ff_after)"
+    checkpoint main_freshness_ff fail "expected ff to origin/main + a main_ff event (head=$_mf_head want=$_mf_want main_ff ${_mf_ff_before}→${_mf_ff_after})"
     _MF_OK=0
   fi
 
@@ -991,7 +991,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   if [ "$_mf_head_after" = "$_mf_head_before" ] && [ -n "$_mf_held" ]; then
     checkpoint main_freshness_no_guess pass "a diverged \$MAIN with a hand-written commit was HELD (row: $_mf_held), never rebased"
   else
-    checkpoint main_freshness_no_guess fail "expected a HELD row and an untouched HEAD (head $_mf_head_before→$_mf_head_after, row '${_mf_held:-<none>}')"
+    checkpoint main_freshness_no_guess fail "expected a HELD row and an untouched HEAD (head ${_mf_head_before}→${_mf_head_after}, row '${_mf_held:-<none>}')"
     _MF_OK=0
   fi
 
