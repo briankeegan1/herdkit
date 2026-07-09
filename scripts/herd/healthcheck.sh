@@ -10,6 +10,10 @@
 #         0 = clean (or only a tolerated data/env issue)
 #         1 = a real CODE error
 #         2 = a data/env issue (tolerated — treated as clean, surfaced as a ⚠️)
+#       BASELINE-AWARE (HERD-190): a heavy code error whose failing tests ALL already fail on the base
+#       (origin/main) is INHERITED — surfaced as a tolerated ⚠️, not blocked — so a fix-PR never
+#       deadlocks on a base failure it did not introduce. See the baseline-aware gate section below;
+#       byte-identical when the base is green, fully fail-soft, and only ever downgrades (never reds).
 #   • light — no project command: per-changed-file syntax only (bash -n / py_compile / gofmt -e).
 #       Fast. Source types it has NO dependency-free probe for (.rs/.java/.ts/…) are never silently
 #       green-lit — they are flagged-the-absence with a loud ⚠️ (like the interaction gate), so a
@@ -79,6 +83,104 @@ _changed_files() {
   } | sort -u
 }
 
+# ── baseline-aware gate (HERD-190) ────────────────────────────────────────────
+# The heavy gate evaluates the worktree's ABSOLUTE pass/fail. When the base (origin/main) itself
+# carries known-failing tests — landed by an ungated merge — a PR that merely INHERITS one of them
+# fails the full-suite gate on a bug it did not introduce, and two such fix-PRs can DEADLOCK on each
+# other's inherited failure (proven live 2026-07-08). Fix: when a heavy run is a CODE error, compute
+# the base's known-failure set and let only INTRODUCED failures (present in the PR, absent in the
+# base) block. A failure set entirely contained in the base is inherited → surfaced, not blocking.
+#
+# Conventions honored: FAIL-SOFT (any inability to resolve/parse the base → today's behavior, block)
+# and BYTE-IDENTICAL when the base is green (an empty base known-failure set means every PR failure
+# is introduced → the verdict + output are exactly the pre-HERD-190 code error). Only ever DOWNGRADES
+# a red to a tolerated ⚠️; it can never turn a green into a red, and never masks an introduced failure.
+#
+# Scope: the GATING (full, non --oneline) path only — the --oneline status pane emits one summary line
+# with no TAP to diff, and it does not gate merges. The base suite runs at most once per red PR and is
+# cached by base sha (HERD_BASELINE_CACHE), so the two-fix-PR deadlock reuses one base run.
+#   HERD_BASELINE_DIR   — optional existing base (origin/main) checkout to run the base suite in; the
+#                         watcher passes $MAIN so no throwaway worktree is created. Absent → a detached
+#                         worktree of $DEFAULT_BRANCH is added + removed (fail-soft if that is refused).
+#   HERD_BASELINE_CACHE — optional dir for the sha-keyed base known-failure cache (watcher passes $TREES).
+
+# _baseline_aware_enabled — the feature is on (BASELINE_AWARE_GATE, default "on") AND this is the
+# gating full-mode run. Any unrecognized value reads as off (fail toward the classic absolute gate).
+_baseline_aware_enabled() {
+  [ -z "$ONELINE" ] || return 1
+  case "$(printf '%s' "${BASELINE_AWARE_GATE:-on}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _baseline_notok_set <suite-output> — the set of FAILING test identities in a bats/TAP suite output:
+# the description after 'not ok N ', sorted-unique. The leading 'not ok <N>' NUMBER is stripped on
+# purpose — a fix-PR that adds/removes a test renumbers the plan, so comparing by number would read an
+# unchanged inherited failure as introduced. Empty when the output carries no TAP 'not ok' (a non-bats
+# suite, or a suite that passed) → the caller then treats the base as green and blocks (byte-identical).
+_baseline_notok_set() {
+  printf '%s\n' "$1" | sed -n -E 's/^not ok[[:space:]]*[0-9]*[[:space:]]*//p' \
+    | sed -e 's/[[:space:]]*$//' | sort -u
+}
+
+# _baseline_all_inherited <pr-set> <base-set> — return 0 IFF the PR has ≥1 failing test AND every one
+# of them is also in the base's known-failure set (introduced set empty). Both args are newline sets
+# from _baseline_notok_set (already sorted-unique, so comm's sort precondition holds). An empty PR set
+# (nothing to subtract) or an empty base set (base green → all introduced) returns 1 (block).
+_baseline_all_inherited() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ -z "$(comm -23 <(printf '%s\n' "$1") <(printf '%s\n' "$2"))" ]
+}
+
+# _baseline_base_set — the base (origin/main) known-failure set, printed as a sorted-unique newline
+# set (empty = base green / unresolvable → caller blocks). Resolves a base checkout (an explicit
+# HERD_BASELINE_DIR, else a throwaway detached worktree of $DEFAULT_BRANCH), runs the SAME heavy suite
+# there in FULL mode, and caches the extracted set by base sha. Fail-soft throughout: any git/worktree
+# failure yields the empty set, which routes the caller to the classic absolute (blocking) verdict.
+_baseline_base_set() {
+  local _bl_dir="" _bl_created="" _bl_base_sha _bl_pr_sha _bl_cache_dir _bl_cache _bl_out _bl_set _bl_tmp
+  if [ -n "${HERD_BASELINE_DIR:-}" ] && [ -d "$HERD_BASELINE_DIR" ] \
+     && _bl_base_sha="$(git -C "$HERD_BASELINE_DIR" rev-parse HEAD 2>/dev/null)" && [ -n "$_bl_base_sha" ]; then
+    _bl_dir="$HERD_BASELINE_DIR"
+  else
+    _bl_base_sha="$(git -C "$DIR" rev-parse "$DEFAULT_BRANCH" 2>/dev/null || true)"
+    [ -n "$_bl_base_sha" ] || return 0                       # base ref unresolvable → empty set (block)
+    _bl_tmp="$(mktemp -d 2>/dev/null || true)"
+    [ -n "$_bl_tmp" ] || return 0
+    _bl_dir="$_bl_tmp/base"
+    if ! git -C "$DIR" worktree add --detach "$_bl_dir" "$_bl_base_sha" >/dev/null 2>&1; then
+      rm -rf "$_bl_tmp" 2>/dev/null || true
+      return 0                                                # base checkout refused → empty set (block)
+    fi
+    _bl_created="$_bl_tmp"
+  fi
+
+  # Self-comparison guard: if the worktree IS the base commit, nothing could have been introduced —
+  # but an empty/degenerate PR is not the deadlock this fixes, so fall back to the classic verdict.
+  _bl_pr_sha="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [ -n "$_bl_pr_sha" ] && [ "$_bl_pr_sha" = "$_bl_base_sha" ]; then
+    [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
+    return 0
+  fi
+
+  _bl_cache_dir="${HERD_BASELINE_CACHE:-${TMPDIR:-/tmp}}"
+  _bl_cache="$_bl_cache_dir/.herd-baseline-notok-$_bl_base_sha"
+  if [ -f "$_bl_cache" ]; then
+    cat "$_bl_cache" 2>/dev/null || true
+    [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
+    return 0
+  fi
+
+  # Run the base suite in FULL mode (TAP), extract + cache its known-failure set. A tolerated data/env
+  # (⚠️, rc 2) or clean (rc 0) base simply yields no 'not ok' lines → an empty set (base green).
+  _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir'" 2>&1)"
+  _bl_set="$(_baseline_notok_set "$_bl_out")"
+  printf '%s\n' "$_bl_set" > "$_bl_cache" 2>/dev/null || true
+  [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
+  printf '%s\n' "$_bl_set"
+}
+
 # ── resolve the profile ──────────────────────────────────────────────────────
 if [ "$MODE" = "auto" ]; then
   if [ -z "$HEALTHCHECK_CMD" ]; then
@@ -118,6 +220,24 @@ run_heavy() {
     out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1)"; rc=$?
   else
     out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1)"; rc=$?
+  fi
+  # BASELINE-AWARE GATE (HERD-190): a CODE error whose failing tests ALL already fail on the base
+  # (origin/main) is INHERITED, not introduced by this change — surface it as a tolerated ⚠️ (exit 0)
+  # instead of blocking. Byte-identical when the base is green (empty base set → all failures counted
+  # as introduced → the classic code error below runs unchanged). Fail-soft: an unresolvable/unparseable
+  # base yields an empty set and blocks exactly as before.
+  if [ "$rc" -eq 1 ] && _baseline_aware_enabled; then
+    local _pr_set _base_set _pr_n
+    _pr_set="$(_baseline_notok_set "$out")"
+    if [ -n "$_pr_set" ]; then
+      _base_set="$(_baseline_base_set)"
+      if _baseline_all_inherited "$_pr_set" "$_base_set"; then
+        _pr_n="$(printf '%s\n' "$_pr_set" | grep -c .)"
+        echo "⚠️  INHERITED BASE FAILURE(S) — ${_pr_n} failing test(s) already fail on ${DEFAULT_BRANCH}; NOT introduced by this change (tolerated, not a code bug)"
+        printf '%s\n' "$out"
+        exit 0
+      fi
+    fi
   fi
   local last; last="$(printf '%s' "$out" | tail -1)"
   case "$rc" in

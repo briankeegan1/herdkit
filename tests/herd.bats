@@ -235,6 +235,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic baseline-aware gate (HERD-190) test passes" {
+  run bash "$REPO/tests/test-baseline-gate.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic reviewer-pane lifecycle (HERD-113) test passes" {
   run bash "$REPO/tests/test-reviewer-pane-lifecycle.sh"
   [ "$status" -eq 0 ]
