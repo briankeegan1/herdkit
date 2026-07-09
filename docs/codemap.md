@@ -49,6 +49,7 @@ Role summarized from each file's top-of-file comment.
 - `herd-spawn-gate.sh` — ADVISORY pre-spawn review-gate saturation check, SOURCED by the lane
 - `herd-watch.sh` — launcher for the live "herd watch" status console (agent-watch.sh).
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
+- `journal-test-env.sh` — HERD-223 shared TEST layer: pin JOURNAL_FILE to a throwaway path so a
 - `journal.sh` — the herdkit engine journal: an append-only JSONL record of every key gate event
 - `layout-reconcile.sh` — the shared EYES-ON-LAYOUT helper for the herd control room.
 - `ledger.sh` — the COORDINATOR PROGRESS LEDGER (HERD-103): durable, cross-session coordinator state so
