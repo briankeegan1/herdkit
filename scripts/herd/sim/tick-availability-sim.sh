@@ -31,8 +31,8 @@
 #      same journal event stream as before this feature: no gh_timeout events, spawn_launched exactly
 #      once. This is the guard against "made it available by making it lie".
 #
-# Hermetic: stub `gh` + stub lanes on PATH/in a stub engine dir, a real spawn queue, real markers. NO
-# network, NO model, NO herdr, NO tab.
+# Hermetic: stub `gh`, stub `herdr` and stub lanes on PATH/in a stub engine dir, a real spawn queue,
+# real markers. NO network, NO model, NO live control room, NO tab.
 # Run:  bash scripts/herd/sim/tick-availability-sim.sh [--artifacts DIR] [--keep]
 # Exit: 0 = every checkpoint passed · 1 = at least one failed.
 set -uo pipefail
@@ -95,6 +95,18 @@ case "\$(cat "$GH_MODE" 2>/dev/null)" in
 esac
 GHSTUB
 chmod +x "$BIN/gh"
+
+# Stub herdr (HERD-189 daemon-hermeticity): spawn_resolver's ACK probe re-reads the driver's roster
+# (`herdr agent list`) and falls back to a pane probe (`herdr pane list`). Unstubbed, this sim would
+# reach the operator's LIVE control room. An empty roster is the honest answer here — the stub lane
+# starts no agent — so the ACK lands on `acked=no`, which is exactly what the sim asserts on: that the
+# event is journaled AFTER the lane returns, not that a real agent came up.
+cat > "$BIN/herdr" <<'HSTUB'
+#!/usr/bin/env bash
+printf '%s\n' '{}'
+exit 0
+HSTUB
+chmod +x "$BIN/herdr"
 export PATH="$BIN:$PATH"
 
 # Stub lanes: log the invocation, sleep $LANE_SLEEP seconds, exit 0 (a clean spawn).
