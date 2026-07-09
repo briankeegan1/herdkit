@@ -290,6 +290,18 @@ INBOX_SEEN_STATE="$TREES/.agent-watch-inbox-seen"
 INBOX_SEEN_LIVE="$TREES/.agent-watch-inbox-seen-live"
 INBOX_LEDGER_MAX=50    # most-recent entries kept in the ledger
 INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounded)
+# Builder-notes surface (HERD-202). Builders file mid-build findings via `herd note "<finding>"`,
+# which journals a builder_note event. The watcher scans the journal each tick for NEW builder_note
+# rows past a byte cursor, notifies once per event, and renders a needs-you-adjacent console section.
+# Ship-dormant: with zero new builder_note events the ledger stays empty and render() adds nothing
+# (byte-identical console). Always-on (no config gate) — dormancy is "nobody called herd note".
+#   • BUILDER_NOTES_LEDGER — one TAB-separated entry per surfaced note
+#     ("<epoch>\t<slug>\t<text>\t<ts>"), newest appended; rendered newest-first by build_builder_notes.
+#   • BUILDER_NOTES_CURSOR — byte offset into the live journal already consumed (first scan pins to
+#     EOF so a restart never re-floods historical notes).
+BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
+BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
+BUILDER_NOTES_LEDGER_MAX=20
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -623,9 +635,14 @@ _fmt_age() {
 #                                          SUCCESSFUL open-PR list positively has no PR for its branch
 #                                          (HERD-224). Carries the idle age so a just-freed spare (0s)
 #                                          reads apart from a forgotten one (2h, reap it). Calm — benign.
+#                                          RESERVED (HERD-164) for a genuinely UNASSIGNED, pre-PR builder:
+#                                          a merged/closed slug is 'retiring…', never a spare.
 #   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
 #                                          (HERD-224). Neutral/degraded — never the definitive
 #                                          "awaiting task" claim from a lookup FAILURE.
+#   • retiring… · <leftovers> · <age>    — the HERD's move; a merged/closed slug whose teardown is
+#                                          converging this tick (see retirement.sh). Calm — it clears
+#                                          itself, usually within one tick.
 #   • parked · <cause> · retry <eta>     — the HERD's move; auto-recovering on its own (a limit-hit
 #                                          auto-resume names its reset ETA; see _handle_limit_blocked).
 #   • needs-you · <blocker> · <remedy>   — YOUR move; a red hold that will NOT clear itself (dead
@@ -647,6 +664,52 @@ _row_awaiting_task() {
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_retirement <slug-cell> <slug> <state> <detail> — the console row for a slug the retirement
+# invariant (HERD-164, retirement.sh) is reconciling. Three states, three owners:
+#
+#   retiring  the HERD's move — teardown is converging; <detail> is the comma-joined leftover kinds
+#             (worktree,tab,agent,branch,ledger). CALM (dim ♻️): it clears itself, and a single
+#             non-converged tick is normal (a herdr tab close is a round-trip). Carries the age it has
+#             been converging so a wedged one is legible before it even turns red.
+#   stuck     YOUR move — teardown has failed _RETIRE_STUCK_TICKS ticks running. RED, and it NAMES the
+#             blocker (the first leftover kind that would not die) plus the remedy.
+#   held      YOUR move — the slug is terminal but carries REAL WORK (uncommitted tracked files, or
+#             commits that exist nowhere else). RED, with the evidence verbatim. Retirement will not
+#             touch it, this tick or ever, until a human commits or discards.
+#
+# Never renders the banned 'idle' word, and never renders 'awaiting task' — a merged builder is not a
+# spare. Pure formatter (age is read from the escalation state), so the unit test can pin its bytes.
+_row_retirement() {
+  local _sl="$1" _slug="$2" _state="$3" _detail="$4" _age
+  _age="$(_retire_age "$_slug")"
+  case "$_state" in
+    stuck)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · retirement stuck: %s · run `herd sweep` or close it by hand · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$_age" "$C_RESET" ;;
+    held)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$C_RESET" ;;
+    *)
+      printf '    %s♻️%s  %s%s%s %sretiring… · %s · %s%s' \
+        "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_detail" "$_age" "$C_RESET" ;;
+  esac
+}
+
+# build_retiring — the "retiring" console block: one row per retirement candidate whose WORKTREE IS
+# ALREADY GONE, so it can never appear among the in-flight (worktree-derived) rows — the merged builder
+# whose tab, agent, or ledger row outlived its tree. Slugs that still HAVE a worktree are rendered
+# inline by the tick loop's classifier instead, so nothing is listed twice. Empty (byte-identical
+# console) whenever every slug has converged — the healthy steady state.
+build_retiring() {
+  RETIRING=""
+  local i
+  for i in "${!RETIRE_SLUG[@]}"; do
+    local _slug="${RETIRE_SLUG[i]}" _dir="${RETIRE_DIR[i]}"
+    [ -n "$_dir" ] && [ -d "$_dir" ] && continue
+    RETIRING="${RETIRING}$(_row_retirement "$(_slug_cell "$_slug")" "$_slug" "${RETIRE_STATE[i]}" "${RETIRE_DETAIL[i]}")"$'\n'
+  done
 }
 
 # _row_pr_match_pending <slug-cell> — NEUTRAL/degraded console row when the open-PR roster could not
@@ -978,6 +1041,140 @@ build_operator_inbox() {
   [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
 }
 
+# ── Builder notes (HERD-202) ──────────────────────────────────────────────────────────────────────
+# `_builder_notes_scan` drains NEW builder_note journal events past the cursor into the ledger + one
+# notify each; `build_builder_notes` is the pure console renderer. Both are fail-soft (missing
+# journal / unreadable path / python fail = no-op). First scan with no cursor pins the cursor at EOF
+# so a watcher restart never re-notifies historical notes.
+
+# _builder_notes_journal — resolve the live journal path (JOURNAL_FILE test seam wins; else the
+# standard $TREES/.herd/journal.jsonl the engine writers use). Empty → no destination.
+_builder_notes_journal() {
+  if [ -n "${JOURNAL_FILE:-}" ]; then printf '%s' "$JOURNAL_FILE"; return 0; fi
+  [ -n "${TREES:-}" ] || return 1
+  printf '%s' "$TREES/.herd/journal.jsonl"
+}
+
+# _builder_notes_scan — consume builder_note events past BUILDER_NOTES_CURSOR. For each new event:
+# append a ledger row + fire herd_driver_notify once. Advances the cursor to the end of the journal
+# (or to the last complete line consumed). Fail-soft: never breaks the watch loop.
+_builder_notes_scan() {
+  local jf; jf="$(_builder_notes_journal 2>/dev/null)" || return 0
+  [ -n "$jf" ] && [ -f "$jf" ] || return 0
+
+  local sz; sz="$(wc -c < "$jf" 2>/dev/null | tr -cd '0-9')"; sz="${sz:-0}"
+  [ "$sz" -gt 0 ] 2>/dev/null || return 0
+
+  # First scan: pin cursor at EOF so historical noise never floods the console/notify stream.
+  if [ ! -f "$BUILDER_NOTES_CURSOR" ]; then
+    printf '%s' "$sz" > "$BUILDER_NOTES_CURSOR" 2>/dev/null || true
+    return 0
+  fi
+
+  local off; off="$(tr -cd '0-9' < "$BUILDER_NOTES_CURSOR" 2>/dev/null)"; off="${off:-0}"
+  # Journal rotated/truncated (new file smaller than cursor) → reset to 0 and re-scan the live file.
+  [ "$off" -gt "$sz" ] 2>/dev/null && off=0
+  [ "$sz" -le "$off" ] 2>/dev/null && return 0
+
+  # Extract builder_note rows after the cursor; print new cursor offset on the last line as
+  # "__CURSOR__ <n>". One python pass keeps UTF-8 + partial-line handling correct.
+  local out
+  out="$(JF="$jf" OFF="$off" python3 -c '
+import os, json, sys
+path = os.environ["JF"]
+off = int(os.environ.get("OFF") or "0")
+try:
+    f = open(path, "rb")
+except OSError:
+    sys.exit(0)
+with f:
+    size = f.seek(0, 2)
+    if off > size:
+        off = 0
+    f.seek(off)
+    if off > 0:
+        # Ensure we start at a line boundary (skip a partial first line after a mid-line seek).
+        f.seek(off - 1)
+        if f.read(1) != b"\n":
+            f.readline()
+    pos = f.tell()
+    rows = []
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        pos = f.tell()
+        try:
+            raw = line.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            o = json.loads(raw)
+        except Exception:
+            continue
+        if o.get("event") != "builder_note":
+            continue
+        ts = str(o.get("ts") or "")
+        slug = str(o.get("slug") or "?")
+        text = str(o.get("text") or o.get("note") or "")
+        text = " ".join(text.split())
+        if len(text) > 300:
+            text = text[:299].rstrip() + "…"
+        # TAB-safe (ledger is TSV).
+        text = text.replace("\t", " ")
+        rows.append("%s\t%s\t%s" % (ts, slug, text))
+    for r in rows:
+        print(r)
+    print("__CURSOR__ %d" % pos)
+' 2>/dev/null)" || true
+
+  local new_off="$off" line ts slug text epoch
+  while IFS= read -r line; do
+    case "$line" in
+      "__CURSOR__ "*) new_off="${line#__CURSOR__ }"; new_off="$(printf '%s' "$new_off" | tr -cd '0-9')" ;;
+      *)
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r ts slug text <<EOF
+$line
+EOF
+        [ -n "${slug:-}" ] || continue
+        epoch="$(_now_epoch)"
+        printf '%s\t%s\t%s\t%s\n' "$epoch" "$slug" "$text" "$ts" >> "$BUILDER_NOTES_LEDGER" 2>/dev/null || true
+        herd_driver_notify "📝 builder note · ${slug}" "${text}" default
+        ;;
+    esac
+  done <<< "$out"
+
+  [ -n "$new_off" ] && printf '%s' "$new_off" > "$BUILDER_NOTES_CURSOR" 2>/dev/null || true
+
+  # Bound the ledger to the most recent BUILDER_NOTES_LEDGER_MAX rows (tail-keep).
+  if [ -f "$BUILDER_NOTES_LEDGER" ]; then
+    local n; n="$(wc -l < "$BUILDER_NOTES_LEDGER" 2>/dev/null | tr -cd '0-9')"
+    if [ "${n:-0}" -gt "$BUILDER_NOTES_LEDGER_MAX" ] 2>/dev/null; then
+      tail -n "$BUILDER_NOTES_LEDGER_MAX" "$BUILDER_NOTES_LEDGER" > "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null \
+        && mv "$BUILDER_NOTES_LEDGER.tmp" "$BUILDER_NOTES_LEDGER" 2>/dev/null \
+        || rm -f "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null || true
+    fi
+  fi
+}
+
+# build_builder_notes — the "builder notes" console section: most recent ledger entries, newest
+# first. Empty (BUILDER_NOTES_ROWS="") when the ledger is absent/empty so render() omits the section
+# and the console is byte-identical when unused. Pure renderer — no journal I/O.
+build_builder_notes() {
+  BUILDER_NOTES_ROWS=""
+  [ -s "$BUILDER_NOTES_LEDGER" ] || return 0
+  local epoch slug text ts hhmm rows=""
+  while IFS=$'\t' read -r epoch slug text ts; do
+    [ -n "${slug:-}" ] || continue
+    hhmm="$(epoch_to_hhmm "$epoch")"
+    rows="${rows}    ${C_CYAN}📝${C_RESET} ${C_BOLD}${slug}${C_RESET} ${text} ${C_DIM}${hhmm}${C_RESET}"$'\n'
+  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | head -5)
+  [ -n "$rows" ] && BUILDER_NOTES_ROWS="$rows"
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -1016,6 +1213,17 @@ render() {
   # byte-identical when the feature is unused.
   if [ -n "${OPERATOR_INBOX_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}operator inbox${C_RESET}"$'\n'"${OPERATOR_INBOX_ROWS}"$'\n'
+  fi
+  # BUILDER NOTES (HERD-202) — mid-build findings filed via `herd note`, needs-you-adjacent. Empty
+  # unless a builder has filed a note since the cursor advanced, so byte-identical when unused.
+  if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
+  fi
+  # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
+  # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
+  # every terminal slug has converged, which is the steady state, so the console is byte-identical.
+  if [ -n "${RETIRING:-}" ]; then
+    frame="${frame}  ${C_DIM}retiring${C_RESET}"$'\n'"${RETIRING}"$'\n'
   fi
   # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
   # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
@@ -3255,11 +3463,8 @@ _main_health_worker() {
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   if [ "$_mw_rc" -eq 1 ]; then
-    if grep -q 'tab-leak-guard' "$_mw_log" 2>/dev/null; then
-      _mw_detail="$(grep -m1 'tab-leak-guard' "$_mw_log" 2>/dev/null)"
-    else
-      _mw_detail="$(_health_fail_detail "$_mw_log")"
-    fi
+    _mw_detail="$(_health_leak_guard_line "$_mw_log")"
+    [ -n "$_mw_detail" ] || _mw_detail="$(_health_fail_detail "$_mw_log")"
   else
     _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
   fi
@@ -3366,11 +3571,11 @@ _collect_main_health() {
     : > "$(_main_health_marker "$_cm_sha")" 2>/dev/null || true   # run-once BEFORE routing (crash-safe)
     case "$_cm_rc" in
       0) _main_health_clear "$_cm_pr" "$_cm_sha" ;;               # clean (or tolerated data/env) → green
-      1) case "$_cm_out" in
-           *tab-leak-guard*)                                      # transient control-room churn (issue #78)
-             journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard ;;
-           *) _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out" ;;
-         esac ;;
+      1) if _health_is_leak_guard_detail "$_cm_out"; then        # transient control-room churn (issue #78)
+           journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason tab-leak-guard
+         else
+           _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out"
+         fi ;;
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true
@@ -3754,6 +3959,10 @@ except Exception:
 _sweep_orphan_tabs() {
   [ -n "$DRYRUN" ] && return 0
   local _sw_registry="$TREES/.herd-tabs" _sw_orphans="${1:-}" _sw_id
+  # HERD-215: make the registry SELF-CONSISTENT before counting or closing anything — drop rows for
+  # tabs that no longer exist at all (closed by a crash / reload / foreign path), so they stop
+  # inflating the stale-tab tally. Runs regardless of whether there are orphan-tab candidates below.
+  _herd_tabs_prune_orphans "$_sw_registry"
   [ -n "$_sw_orphans" ] || _sw_orphans="$(_orphan_tab_ids)"
   [ -n "$_sw_orphans" ] || return 0
   while IFS= read -r _sw_id; do
@@ -3787,6 +3996,87 @@ try:
                 f.write(line)
 except Exception: pass
 ' 2>/dev/null || true
+}
+
+# _herd_tabs_prune_orphans <registry-file> — drop every registry row whose tab_id (field 2) names a
+# tab that no longer EXISTS in the live `herdr tab list`, regardless of who closed it (a crash, a
+# herdr reload, a manual `herdr tab close`, or a lane that closed the tab without owning the row).
+# HERD-215: without this, a tab closed OUTSIDE the sweep's own close+drop path leaves its row behind
+# forever, and the cheap stale-tab tally (sweep_cheap_tab_count — worktree-absence only, no herdr RPC)
+# counts that dead row as a live mess across restarts (observed: 13 rows, 6 live tabs) — cry-wolf the
+# operator can never clear, because _orphan_tab_ids only ever considers tabs that ARE in the live list
+# and so never reaps a row whose tab is already gone. The prune makes the registry SELF-CONSISTENT: a
+# row exists only while its tab does.
+#
+# SAFETY (the whole point — a wrong read WIPES the allowlist, de-registering LIVE tabs): prune ONLY
+# against a live list that was BOTH positively fetched AND positively parsed AND non-empty. Three
+# distinct failure shapes must every one degrade to NO-OP, never to "every tab is gone → wipe":
+#   • `herdr tab list` FAILS           (rc != 0 — offline / rate-limited)        → no prune
+#   • rc 0 but BLANK / UNPARSEABLE     (empty stdout, truncated or garbage JSON) → no prune
+#   • rc 0, valid JSON, but ZERO tabs  (ambiguous: empty room vs a herdr blip)   → no prune
+# Only the last case is a JUDGMENT call, and we resolve it conservatively: a lingering stale row is a
+# benign over-count the cadence will catch once real tabs reappear, whereas a false wipe destroys the
+# registry. This mirrors HERD-206 (a failed `gh pr list` is never "every PR merged"). The live-id
+# parser therefore EXITS NON-ZERO on empty/garbage/wrong-shape input (rather than swallowing to an
+# empty set), and the bash side refuses to prune unless it read at least one live tab_id. A registry
+# row we cannot parse (< 2 fields) is preserved byte-for-byte. Fail-soft + idempotent throughout.
+_herd_tabs_prune_orphans() {
+  local _pr_reg="$1"
+  [ -n "$_pr_reg" ] || return 0
+  [ -f "$_pr_reg" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _pr_raw _pr_rc=0
+  _pr_raw="$(herdr tab list 2>/dev/null)" || _pr_rc=$?
+  [ "$_pr_rc" -eq 0 ] || return 0
+  # Extract the live tab_ids. The parser raises (→ non-zero exit) on empty/garbage input or a response
+  # whose result.tabs is not a list, so a degenerate rc-0 read is a hard STOP, not an empty live set.
+  local _pr_live _pr_prc=0
+  _pr_live="$(printf '%s' "$_pr_raw" | python3 -c '
+import sys, json
+data = json.loads(sys.stdin.read())          # raises on empty / truncated / non-JSON → SystemExit != 0
+tabs = data["result"]["tabs"]                # raises (KeyError/TypeError) on the wrong shape
+if not isinstance(tabs, list):
+    raise SystemExit(1)
+sys.stdout.write("\n".join(t.get("tab_id","") for t in tabs if isinstance(t, dict) and t.get("tab_id")))
+' 2>/dev/null)" || _pr_prc=$?
+  [ "$_pr_prc" -eq 0 ] || return 0
+  # A positively-parsed but EMPTY live set is the ambiguous case above → refuse to prune against it.
+  [ -n "$_pr_live" ] || return 0
+  # Rewrite the registry keeping only rows whose tab_id is live (or unparseable). Print each pruned
+  # tab_id so the caller can journal it. The file is only rewritten when something is actually dropped,
+  # so a clean registry keeps its exact bytes (and mtime). Belt-and-braces: the rewrite ALSO refuses an
+  # empty live set, so it can never wipe the registry even if a future caller forgets the guard above.
+  local _pr_dropped
+  _pr_dropped="$(REG="$_pr_reg" LIVE="$_pr_live" python3 -c '
+import os
+reg  = os.environ["REG"]
+live = set(l for l in os.environ.get("LIVE","").split("\n") if l)
+if not live:
+    raise SystemExit(0)                       # never prune against an empty live set (would wipe rows)
+try:
+    with open(reg, encoding="utf-8") as f: lines = f.readlines()
+except Exception:
+    raise SystemExit(0)
+kept, dropped = [], []
+for line in lines:
+    parts = line.strip().split(" ", 2)
+    if len(parts) >= 2 and parts[1] and parts[1] not in live:
+        dropped.append(parts[1]); continue
+    kept.append(line)
+if dropped:
+    try:
+        with open(reg, "w", encoding="utf-8") as f: f.writelines(kept)
+    except Exception:
+        raise SystemExit(0)
+    for d in dropped: print(d)
+' 2>/dev/null || true)"
+  local _pr_id
+  while IFS= read -r _pr_id; do
+    [ -n "$_pr_id" ] || continue
+    command -v journal_append >/dev/null 2>&1 && \
+      journal_append sweep_tab_prune tab_id "$_pr_id" reason orphan-row
+  done <<< "$_pr_dropped"
+  return 0
 }
 
 # _sweep_stale_resolve_tabs — proactively close STALE resolve·<slug> conflict-resolver tabs (HERD-54).
@@ -4618,13 +4908,20 @@ _handle_health_codeerror() {
   _hhc_sl="$(_slug_cell "$_hhc_slug")"
   _hhc_pn=" ${C_DIM}#${_hhc_pr}${C_RESET} ·"
 
-  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
-  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  # An infra red that outlived its re-dispatch budget (HERD-228) stopped being transient: it is a human's
+  # problem, not a builder's. Loud needs-you row, still no bounce — a builder cannot fix the control room.
   case "$_hhc_detail" in
-    *tab-leak-guard*)
-      DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    "$_HEALTH_INFRA_CAP_TAG"*)
+      DISPLAY[_hhc_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · infra red did not self-heal · ${_hhc_detail}${C_RESET}"
       return 0 ;;
   esac
+
+  # A tab-leak-guard trip is a transient infra red (never sha-cached, never a builder's fault): keep the
+  # legacy row verbatim and never bounce. Checked before ANY agent probe so the off-path stays cheap.
+  if _health_is_leak_guard_detail "$_hhc_detail"; then
+    DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
+    return 0
+  fi
 
   if ! _health_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
     # OFF / dry-run: no bounce, no ledger write. Row truth still applies — a builder a HUMAN re-tasked
@@ -5889,6 +6186,76 @@ _health_first_notok() {
   grep -m1 -E '^[[:space:]]*not ok( |$)' "$1" 2>/dev/null | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
+# ── tab-leak-guard exemption (HERD-228) ─────────────────────────────────────────────────────────────
+# The healthcheck's tab-leak-guard trips when the suite leaks an orphan herdr tab into the LIVE
+# workspace: transient control-room churn (issue #78), never a code bug. Three seams therefore EXEMPT
+# it — the candidate gate never sha-caches it (so the next tick re-runs and it self-heals), never
+# bounces a builder, and the main-health collector routes it to an infra_event instead of MAIN RED.
+#
+# That exemption used to be a bare `grep -q tab-leak-guard <log>` over the WHOLE suite log, which is
+# wrong in the one case that matters: tests/herd.bats contains tests NAMED "hermetic tab-leak-guard …",
+# so their PASSING TAP lines ("ok 29 hermetic tab-leak-guard engine-whitelist test passes") carry the
+# literal. EVERY reproduced bats red therefore read as the leak-guard transient: the red row quoted a
+# passing test, the verdict was never cached, and the PR re-dispatched a ~9-minute suite every tick with
+# no cap and no bounce (PR #333 looped 40+ minutes while "not ok 41 …" sat in the log). On main the same
+# bug meant a genuine bats red could not paint MAIN RED at all.
+#
+# The exemption now matches only the guard's OWN failure line, which it prints ANCHORED at column 0:
+#     TAB-LEAK-GUARD: the test suite left an orphan tab/pane in the live workspace   (full mode)
+#     tab-leak-guard: suite leaked an orphan tab into the live workspace — 3 -> 4    (--oneline)
+# optionally behind healthcheck.sh's own "❌ code error — " oneline prefix. A TAP result line ("ok …",
+# "not ok …") can never satisfy that anchor, and the guard's non-failing notes ("tab-leak-guard: clean",
+# "… skipped") are excluded explicitly. On top of that, a TAP "not ok" ANYWHERE in the log OUTRANKS the
+# exemption outright: a suite that reports a failing test has a code error to answer for, whatever else
+# the log happens to say. One helper decides this for all three seams (HERD-222 builds on it too).
+_HLG_PREFIX_RE='^[[:space:]]*(❌[[:space:]]*)?(code error[[:space:]]*—[[:space:]]*)?'
+_HLG_LINE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:"
+_HLG_NOTE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:[[:space:]]*(clean|skipped)"
+
+# _health_is_leak_guard_detail <line> — true iff ONE line is the guard's failure line. The gate seams
+# carry only the collected <detail> string (never the log), so they classify with this.
+_health_is_leak_guard_detail() {
+  [ -n "${1:-}" ] || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_LINE_RE" 2>/dev/null || return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_NOTE_RE" 2>/dev/null && return 1
+  return 0
+}
+
+# _health_leak_guard_line <log> — the guard's failure line from a suite log, or EMPTY when this log is
+# not a genuine trip (no such line, or the suite reported a TAP failure that outranks it). Fail-soft:
+# a missing log is not a trip.
+_health_leak_guard_line() {
+  [ -f "$1" ] || return 0
+  [ -n "$(_health_first_notok "$1")" ] && return 0
+  grep -iE "$_HLG_LINE_RE" "$1" 2>/dev/null | grep -viE "$_HLG_NOTE_RE" 2>/dev/null \
+    | sed -n '1p' | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
+# _health_leak_guard_red <log> — true iff <log> is a genuine tab-leak-guard trip.
+_health_leak_guard_red() { [ -n "$(_health_leak_guard_line "$1")" ]; }
+
+# BOUNDED INFRA RE-DISPATCH (HERD-228). An exempted red is never cached, so the gate re-runs the suite
+# for that same (pr,sha) every tick — that re-run IS the self-heal. Bound it: after this many
+# consecutive infra re-dispatches the "transient" plainly is not transient, so cache the red under an
+# ESCALATION tag, which both stops the loop and surfaces a needs-you row instead of bouncing a builder
+# for infra. Inline constant on purpose — no new config key.
+_HEALTH_INFRA_REDISPATCH_MAX=3
+_HEALTH_INFRA_CAP_TAG='infra re-dispatch cap reached'
+
+# _health_infra_file <pr#> <sha> — the per-(pr,sha) infra re-dispatch counter (swept with the sha-cache).
+_health_infra_file() { printf '%s' "$TREES/.health-infra-$1-$2"; }
+
+# _health_infra_bump <pr#> <sha> — count one infra re-dispatch for this (pr,sha); prints the new total.
+_health_infra_bump() {
+  local _hib_f _hib_n
+  _hib_f="$(_health_infra_file "$1" "$2")"
+  _hib_n="$(cat "$_hib_f" 2>/dev/null || printf 0)"
+  case "$_hib_n" in ''|*[!0-9]*) _hib_n=0 ;; esac
+  _hib_n=$((_hib_n + 1))
+  printf '%s\n' "$_hib_n" > "$_hib_f" 2>/dev/null || true
+  printf '%s' "$_hib_n"
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -5913,7 +6280,12 @@ _health_first_notok() {
 #
 # The pre-diff behaviour (`sed -n 1p` → the "❌ CODE ERROR" banner) was uninformative but never WRONG.
 # That is the floor: this function may return something uninformative, never something misleading.
-_HFD_PASS_RE='^[[:space:]]*(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
+# A pass marker may sit behind a short RUNNER PREFIX — `bats: ok 29 …`, `tests: ✓ widget` — because the
+# project healthcheck relabels the streams it wraps. The anchor therefore tolerates ONE such prefix
+# (a bare word + colon) so those lines are dropped from the candidate set too (HERD-228); it stays
+# anchored, so prose like "look at the ok path" or "PASS is spelled out here" can never be mistaken for
+# a pass marker and silently swallow a real failure line.
+_HFD_PASS_RE='^[[:space:]]*([[:alnum:]_.-]+:[[:space:]]+)?(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
 _HFD_ZERO_RE='(^|[^0-9])0 (errors?|failures?|failed)'
 # Anchored failure MARKERS — a line that BEGINS with FAIL/✗/● is a failure whatever words follow. This
 # is how a bare 'FAIL  src/widget.test.js' is caught without putting bare 'fail' in the token list
@@ -5990,6 +6362,9 @@ _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 #                                written when _healthcheck_gate reaches a terminal outcome for this
 #                                exact commit sha. A cached CLEAN/FLAKY proceeds as passing; a cached
 #                                CODEERROR keeps surfacing the red row — both WITHOUT re-running.
+#   .health-infra-<pr>-<sha>   — how many times an EXEMPTED infra red (tab-leak-guard) has re-dispatched
+#                                the suite for this sha; at _HEALTH_INFRA_REDISPATCH_MAX the red is
+#                                cached under the escalation tag instead of looping (HERD-228).
 # A new commit (new sha) invalidates the cache and forces a fresh full run (see _discard_stale_health,
 # mirroring _discard_stale_reviews). A non-terminal/in-flight state is NEVER cached.
 _health_result_file() { printf '%s' "$TREES/.health-result-$1-$2"; }
@@ -6007,7 +6382,7 @@ record_health_result() {
 # marker is keyed by pr alone and released synchronously within the gate, so it is never stale).
 _discard_stale_health() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.health-result-$pr-"*; do
+  for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -6138,9 +6513,8 @@ _health_worker() {
       _hw_line="FLAKY"$'\t'"$_hw_id"
     else
       mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
-      if grep -q 'tab-leak-guard' "$_hw_log" 2>/dev/null; then
-        _hw_detail="$(grep -m1 'tab-leak-guard' "$_hw_log" 2>/dev/null | tr '\t\n' '  ')"
-      else
+      _hw_detail="$(_health_leak_guard_line "$_hw_log")"
+      if [ -z "$_hw_detail" ]; then
         _hw_notok2="$(_health_fail_detail "$_hw_log")"
         _hw_detail="$_hw_notok2"
       fi
@@ -6243,10 +6617,20 @@ _healthcheck_gate() {
         # A tab-leak-guard CODE ERROR is INFRA/TRANSIENT (issue #78 part 2), never a code bug: it must
         # NEVER be sha-cached, else the cache replays the transient every tick and FREEZES red. Skip the
         # cache so the next tick re-dispatches fresh + self-heals; a genuine code error caches + stays red.
-        case "$_hg_d" in
-          *tab-leak-guard*) : ;;
-          *)                record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d" ;;
-        esac
+        # The skip is BOUNDED (HERD-228): count the re-dispatches for this (pr,sha) and, once the cap is
+        # reached, cache the red under the escalation tag so the loop ends in a needs-you row rather than
+        # re-running a ~9-minute suite forever. An empty sha means the cache (and so the cap) is disabled.
+        if _health_is_leak_guard_detail "$_hg_d"; then
+          local _hg_n=0
+          [ -n "$_hg_sha" ] && _hg_n="$(_health_infra_bump "$_hg_pr" "$_hg_sha")"
+          if [ "${_hg_n:-0}" -ge "$_HEALTH_INFRA_REDISPATCH_MAX" ]; then
+            _hg_d="${_HEALTH_INFRA_CAP_TAG} (${_hg_n}× infra) · ${_hg_d}"
+            record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+            journal_append infra_event component agent-watch reason health_infra_cap pr "$_hg_pr" sha "$_hg_sha" count "$_hg_n"
+          fi
+        else
+          record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_d"
+        fi
         _handle_health_codeerror "$_hg_pr" "$_hg_slug" "$_hg_sha" "$_hg_idx" "$_hg_dir" "$_hg_d"
         _HC_RESULT="CODEERROR"
         journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_d" ;;
@@ -6711,6 +7095,13 @@ SWEEP_LIB=1
 . "$HERE/sweep.sh"
 unset SWEEP_LIB
 
+# ── Retirement invariant (HERD-164) ──────────────────────────────────────────────────────────────
+# retirement.sh reconciles "a merged/closed slug owns nothing" on EVERY tick, composing _reap_slug
+# (above) with sweep.sh's dirt/unique-commit proof helpers — so it must be sourced after BOTH. It
+# detects they are already in scope and does not re-source this file.
+# shellcheck source=/dev/null
+. "$HERE/retirement.sh"
+
 # The trigger pass's cached counts. Recomputed on the ORPHAN-sweep cadence (not every 4 s tick): the
 # scan costs one `ps -e` plus a filesystem walk, which has no business riding the repaint. Rendering
 # reads the CACHE every tick, so the frame stays stable between scans instead of flickering.
@@ -6718,17 +7109,42 @@ _SWEEP_SCAN_INTERVAL=15                  # ~60 s (15 × 4 s sleep) — matches _
                                          # which is declared further down, next to the live loop
 _SWEEP_SCAN_TICK=$_SWEEP_SCAN_INTERVAL   # primed so the FIRST tick scans, then every interval
 _SWEEP_C_TABS=0; _SWEEP_C_MARKERS=0; _SWEEP_C_PROCS=0
+# Epoch of the last cache refresh (0 = never scanned yet). Drives BOTH halves of the HERD-215 tally-
+# honesty fix: the '(as of …)' staleness note build_sweep_note renders between scans, and the
+# after-sweep immediate recompute (_sweep_tally_invalidated compares this against the sweep's stamp).
+_SWEEP_LAST_SCAN=0
+_SWEEP_TALLY_STAMP="$TREES/.sweep-tally-stamp"   # written by sweep_main / sweep_run_safe_legs on finish
 
-# _sweep_trigger_tick — the per-tick trigger. On the scan cadence it refreshes the cached counts,
-# journals `sweep_advice` once per distinct condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs.
-# Byte-inert under SWEEP_AUTO=off: no scan, no journal, no row, no action.
+# _sweep_tally_invalidated — success iff a sweep finished (stamped $_SWEEP_TALLY_STAMP) more recently
+# than our last cache refresh. A MANUAL `herd sweep` runs in a SEPARATE process from this watcher, so
+# it cannot poke our in-memory cache directly — it drops a timestamp file, and we poll it here. When it
+# fires we recompute the tally THIS tick instead of waiting out the ~60 s scan cadence, so the
+# housekeeping line clears the instant a manual sweep cleaned the room rather than crying wolf for up to
+# a minute (HERD-215). Fail-soft: no stamp, or an unreadable/garbage stamp, reads as "not invalidated".
+_sweep_tally_invalidated() {
+  local _ti_ts
+  [ -f "$_SWEEP_TALLY_STAMP" ] || return 1
+  _ti_ts="$(cat "$_SWEEP_TALLY_STAMP" 2>/dev/null || true)"
+  case "$_ti_ts" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_ti_ts" -gt "${_SWEEP_LAST_SCAN:-0}" ] 2>/dev/null
+}
+
+# _sweep_trigger_tick — the per-tick trigger. On the scan cadence (or immediately when a finished sweep
+# invalidated the cache) it refreshes the cached counts, journals `sweep_advice` once per distinct
+# condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs. Byte-inert under SWEEP_AUTO=off.
 _sweep_trigger_tick() {
   [ -n "$DRYRUN" ] && return 0
   local _st_mode; _st_mode="$(sweep_auto_mode)"
   [ "$_st_mode" = off ] && return 0
+  # A finished sweep (manual, in another process) forces an immediate recompute; otherwise scan on the
+  # throttled cadence. Either path refreshes the cache and stamps _SWEEP_LAST_SCAN (drives the age note).
+  local _st_force=1; _sweep_tally_invalidated || _st_force=0
   _SWEEP_SCAN_TICK=$(( _SWEEP_SCAN_TICK + 1 ))
-  [ "$_SWEEP_SCAN_TICK" -ge "$_SWEEP_SCAN_INTERVAL" ] || return 0
+  if [ "$_st_force" = 0 ] && [ "$_SWEEP_SCAN_TICK" -lt "$_SWEEP_SCAN_INTERVAL" ]; then
+    return 0
+  fi
   _SWEEP_SCAN_TICK=0
+  _SWEEP_LAST_SCAN="$(_now_epoch)"
   read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   sweep_journal_advice_once "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"
   if [ "$_st_mode" = auto ] \
@@ -6745,6 +7161,9 @@ _sweep_trigger_tick() {
     # sweep_advice memo suppressed the journal spam but not the work.
     _sweep_auto_record "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS" "$(sweep_swept_total)"
     # The mess is gone; re-scan so the console row clears this same tick instead of lingering a cycle.
+    # Re-stamp _SWEEP_LAST_SCAN AFTER sweep_run_safe_legs (which wrote its own tally stamp) so the fresh
+    # stamp does not read as "invalidated" and force a redundant re-scan on the very next tick.
+    _SWEEP_LAST_SCAN="$(_now_epoch)"
     read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   fi
   return 0
@@ -6767,9 +7186,26 @@ _sweep_auto_record() {
   printf '%s|%s\n' "t=$1 m=$2 p=$3" "$4" > "$_SWEEP_AUTO_MEMO" 2>/dev/null || true
 }
 
+# _sweep_fmt_age <secs> — compact human age: "Ns" under a minute, "Nm" under an hour, else "Nh". Used
+# by the housekeeping staleness note; empty for a non-numeric / negative input.
+_sweep_fmt_age() {
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) return 0 ;; esac
+  if   [ "$s" -ge 3600 ]; then printf '%dh' "$(( s / 3600 ))"
+  elif [ "$s" -ge 60 ];   then printf '%dm' "$(( s / 60 ))"
+  else                         printf '%ds' "$s"
+  fi
+}
+
 # build_sweep_note — the '🧹 sweep recommended: N stale tabs · M dead markers' console row, rendered
 # from the CACHED counts. Empty when the control room is clean or SWEEP_AUTO=off, so the console is
 # byte-identical to before this feature whenever there is nothing to sweep.
+#
+# HERD-215 (tally honesty): the counts refresh only on the ~60 s scan cadence, so between scans this
+# row shows a CACHED reading. Rather than silently pass off a stale count as current, annotate it with
+# its age ('as of 4m ago') whenever the reading is not this-tick-fresh — the operator sees at a glance
+# that the figure may already be out of date (the recompute-after-sweep path clears it entirely once a
+# sweep actually runs).
 build_sweep_note() {
   SWEEP_NOTE=""
   local _bs_mode _bs_line
@@ -6779,7 +7215,14 @@ build_sweep_note() {
   [ -n "$_bs_line" ] || return 0
   local _bs_hint="run 'herd sweep'"
   [ "$_bs_mode" = auto ] && _bs_hint="auto-sweeping safe legs; 'herd sweep' for the rest"
-  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
+  # Staleness caveat: only when we have a real prior scan AND the reading is at least a second old (a
+  # this-tick scan reads age 0 and needs no caveat).
+  local _bs_age _bs_note=""
+  if [ "${_SWEEP_LAST_SCAN:-0}" -gt 0 ] 2>/dev/null; then
+    _bs_age=$(( $(_now_epoch) - _SWEEP_LAST_SCAN ))
+    [ "$_bs_age" -ge 1 ] 2>/dev/null && _bs_note=" ${C_DIM}(as of $(_sweep_fmt_age "$_bs_age") ago)${C_RESET}"
+  fi
+  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET}${_bs_note} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
   return 0
 }
 
@@ -7193,6 +7636,18 @@ while true; do
   AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
+  # RETIREMENT INVARIANT (HERD-164), reconciled EVERY tick against the world we just observed: a slug
+  # whose PR is MERGED or CLOSED (or whose worktree is gone) owns no agent, tab, worktree, branch, or
+  # ledger row. Drives the idempotent teardown one step further and records what it could not finish;
+  # a slug carrying real work is HELD (loud, never deleted). Runs BEFORE row classification so a
+  # retiring slug can never be mistaken for an 'awaiting task' spare — and after $PRS_JSON/$AGENTS_JSON
+  # are fetched, because those ARE the observation. Restart-proof: nothing here is event-driven.
+  retirement_tick
+  # A reap this tick invalidated the worktree snapshot — re-read it so the reaped tree does not render
+  # one last phantom in-flight row. Zero reaps (the steady state) costs zero git calls.
+  [ "$RETIRE_REAPED" -gt 0 ] && WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  build_retiring
+
   # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
   # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
   # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
@@ -7223,6 +7678,17 @@ EOF
       # and the console is byte-identical to before the feature.
       DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
       FLAIR_STATE[i]="pen"
+    elif [ -z "$prnum" ] && _rt_state="$(_retire_state_of "$slug")" && [ "$_rt_state" != "active" ]; then
+      # RETIREMENT (HERD-164): this tick's invariant pass proved the slug terminal — its PR is merged
+      # or closed. It is NOT an 'awaiting task' spare, whatever its agent status says, and it is not a
+      # dead builder either: its work landed. Render whose move it is (the herd's while teardown
+      # converges; yours once it is stuck or holding real work) and skip the limit/dead/idle
+      # classification entirely — those all key off "PR-less", which a merged builder trivially is.
+      DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
+      case "$_rt_state" in
+        retiring) FLAIR_STATE[i]="busy" ;;
+        *)        FLAIR_STATE[i]="attention" ;;
+      esac
     elif [ -z "$prnum" ]; then
       if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
         # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
@@ -7392,6 +7858,12 @@ EOF
     fi
   fi
   build_operator_inbox
+
+  # HERD-202 builder notes — drain NEW builder_note journal events into the ledger + notify stream,
+  # then render the section. Cheap (local journal tail via byte cursor); every tick is fine. Empty
+  # ledger ⇒ build_builder_notes leaves BUILDER_NOTES_ROWS empty ⇒ byte-identical console when unused.
+  _builder_notes_scan
+  build_builder_notes
 
   render
 
