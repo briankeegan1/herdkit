@@ -414,6 +414,7 @@ the live builder with `git merge $DEFAULT_BRANCH` (or dispatches the conflict re
 builder remains). Console shows **rebasing · awaiting push**. Shares the `REFIX_MAX_ROUNDS` budget
 with review autofix; only bounce-exhaustion escalates to **needs you**. The **duplicate** flavor
 (re-implements shipped work) always stays a human judgment call. Default is `off` (ship-dormant).
+
 ### Auto-refix a red healthcheck (HEALTHCHECK_AUTOFIX)
 
 A reproduced pre-merge healthcheck **CODE ERROR** is the same shape of finding as a BLOCK review —

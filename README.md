@@ -339,6 +339,7 @@ budget, honest console row `rebasing · awaiting push`. A live builder is re-tas
 `git merge $DEFAULT_BRANCH`; if there is no live builder (foreign/reaped PR) the conflict resolver
 is dispatched instead. Only bounce-exhaustion escalates to `needs you`. Default is **`off`**
 (ship-dormant) so the hold path stays byte-identical until a project opts in.
+
 ### Auto-refix a red healthcheck — `HEALTHCHECK_AUTOFIX`
 
 A reproduced pre-merge healthcheck **code error** is the same shape of finding as a BLOCK review — a

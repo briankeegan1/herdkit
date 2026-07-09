@@ -3461,7 +3461,7 @@ _refix_stalled_row() {
     esac
     _escalate_refix_stuck "$_rsr_pr" "$_rsr_sha" "$_rsr_slug" "$_rsr_kind" "$_rsr_reason"
   fi
-  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; *) _rsr_what="review blocked" ;; esac
+  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; stale) _rsr_what="stale base" ;; *) _rsr_what="review blocked" ;; esac
   printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_rsr_sl}${C_RESET}${_rsr_pn} ${C_RED}needs you · ${_rsr_what} · ${_rsr_kind} autofix stalled: ${_rsr_reason} · re-task by hand${C_RESET}"
 }
 
@@ -3822,7 +3822,11 @@ _handle_stale_dup() {
   _hsd_rounds="$(refix_round_count "$_hsd_pr")"
   # Once-guard: already healed this sha → wait for the push / resolver finish. Honest in-progress row.
   if refix_attempted "$_hsd_pr" "$_hsd_sha" stale; then
-    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_rounds}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    if _refix_stuck_seen "$_hsd_pr" "$_hsd_sha" stale; then
+      DISPLAY[_hsd_idx]="$(_refix_stalled_row "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "$_hsd_sl" "$_hsd_pn")"
+    else
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_rounds}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    fi
     return 0
   fi
   # Shared budget exhausted → needs-you. Only exhaustion escalates (not a missing builder — that
@@ -3893,7 +3897,8 @@ Why: ${_hsd_reason}"
       if _wait_agent_working "$_hsd_slug" "$_hsd_wait"; then
         _hsd_woke=1
       else
-        DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · stale-base autofix failed · check pane${C_RESET}"
+        _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "the builder never woke (prompt delivered twice)"
+      DISPLAY[_hsd_idx]="$(_refix_stalled_row "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "$_hsd_sl" "$_hsd_pn")"
         _hsd_escalated=true
       fi
     fi
@@ -3906,7 +3911,8 @@ Why: ${_hsd_reason}"
       spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     else
-      DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · stale-base autofix failed · agent pane not found${C_RESET}"
+      _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "agent pane not found"
+      DISPLAY[_hsd_idx]="$(_refix_stalled_row "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "$_hsd_sl" "$_hsd_pn")"
       _hsd_escalated=true
     fi
   fi

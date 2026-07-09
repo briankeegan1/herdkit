@@ -245,4 +245,15 @@ ok "(8) kind isolation (stale vs review)"
 ok "(9) _stale_base_autofix_enabled lever"
 
 echo
+# ── (10) failed wake → durable needs-you, never a 'rebasing' lie (review round-5 fix) ─────────
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle
+printf '1\n1\n' > "$STUB_WAIT_FILE"   # both wake checks fail: the builder never wakes
+_handle_stale_dup 80 slug-a shaK 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(10) tick1: failed wake must read needs-you (got: $(row))"
+_handle_stale_dup 80 slug-a shaK 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(10) tick2: once-guard must NOT flip to rebasing (got: $(row))"
+row | grep -q 'stalled' || fail "(10) tick2 must carry the stalled reason (got: $(row))"
+ok "(10) failed wake escalates durably (no rebasing lie)"
+
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"
