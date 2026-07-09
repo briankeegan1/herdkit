@@ -256,7 +256,7 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 
 # stale-base auto-heal (HERD-199) — on | off (default off, ship-dormant). on → a STALE-BASE hold from
 # the stale-duplicate gate is mechanical and self-heals: the watcher auto-bounces the live builder with
-# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, shared REFIX_MAX_ROUNDS budget, honest
+# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, the stale rail's own REFIX_MAX_ROUNDS budget, honest
 # `rebasing · awaiting push` row), or dispatches the conflict resolver when no live builder remains
 # (foreign/reaped/dead). Only bounce-exhaustion escalates to needs-you. DUPLICATE flavor stays human.
 # off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.

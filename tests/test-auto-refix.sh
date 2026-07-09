@@ -8,6 +8,7 @@
 #   (6) refix-once per sha: second call with same sha → no pane run, display="awaiting push"
 #   (7) round cap: after REFIX_MAX_ROUNDS bounces (different shas), next → "refix limit reached"
 #   (8) AGENT_WATCH_DRYRUN=1 → no bounce even when REVIEW_AUTOFIX=true
+#   (9) HERD-229 budget rails: per-rail counters, reset-on-progress, derived total safety cap
 #
 # Sources agent-watch.sh in lib mode. Stubs herdr/gh/git (NETWORK-FREE).
 # Run:  bash tests/test-auto-refix.sh
@@ -282,6 +283,126 @@ printf '%s\n' "$d" | grep -q "review blocked" \
 ok
 ! refix_attempted "60" "sha-f1" \
   || fail "DRYRUN: no refix should be recorded in dry-run mode"
+ok
+
+# ── (9) HERD-229 — per-rail budgets, reset-on-progress, total safety cap ────
+# The bookkeeping that stranded PR #328: three DIFFERENT rails each failed once, the shared counter
+# hit 3, and a genuinely new review BLOCK had no bounce left. A rail's budget is now its own, a rail
+# that RESOLVES its red gets it back, and a derived total ceiling still bounds a PR that thrashes.
+export JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
+case "$(_journal_file)" in "$T"/*) : ;; *) fail "(9) journal escapes the sandbox: '$(_journal_file)'" ;; esac
+ok
+REFIX_MAX_ROUNDS=3
+[ "$(refix_rail_cap)" = "3" ]  || fail "(9) rail cap must be REFIX_MAX_ROUNDS (got $(refix_rail_cap))"
+[ "$(refix_total_cap)" = "9" ] || fail "(9) total cap must be 3x the rail cap (got $(refix_total_cap))"
+ok
+
+# (9a) THE #328 REGRESSION: one bounce on each of the three rails leaves every rail under its cap.
+rm -f "$REFIX_STATE"
+record_refix "70" "sha-1" "slug-g" review
+record_refix "70" "sha-2" "slug-g" health
+record_refix "70" "sha-3" "slug-g" stale
+for kind in review health stale; do
+  [ "$(refix_rail_count "70" "$kind")" -eq 1 ] \
+    || fail "(9a) rail $kind should hold exactly its own bounce (got $(refix_rail_count 70 "$kind"))"
+  ! _refix_budget_reason "70" "$kind" >/dev/null \
+    || fail "(9a) rail $kind must still have budget — three different first-time failures are not a loop"
+done
+ok
+[ "$(refix_total_count "70")" -eq 3 ] || fail "(9a) the total ceiling counts every rail"
+ok
+
+# (9b) SAME-RAIL REPEAT still exhausts at REFIX_MAX_ROUNDS, exactly as today (single-rail parity).
+rm -f "$REFIX_STATE"
+record_refix "71" "sha-1" "slug-g" review
+record_refix "71" "sha-2" "slug-g" review
+! _refix_budget_reason "71" review >/dev/null || fail "(9b) two review rounds must not exhaust the rail"
+ok
+record_refix "71" "sha-3" "slug-g" review
+[ "$(_refix_budget_reason "71" review)" = "refix limit (3 rounds) reached" ] \
+  || fail "(9b) the 3rd same-rail round must exhaust with today's phrase (got: $(_refix_budget_reason 71 review))"
+ok
+# … and it exhausts ONLY that rail: the other rails are untouched.
+! _refix_budget_reason "71" health >/dev/null || fail "(9b) an exhausted review rail must not close the health rail"
+ok
+
+# (9c) RESET-ON-PROGRESS: a rail that resolves its red gets its budget back; a rail that never
+# failed has nothing to zero, so the reset is a no-op that leaves the append-only ledger untouched.
+rm -f "$REFIX_STATE"
+refix_rail_reset "72" health "sha-0" "slug-g"
+[ ! -s "$REFIX_STATE" ] || fail "(9c) resetting a rail with 0 rounds must not append a row"
+ok
+record_refix "72" "sha-1" "slug-g" health
+record_refix "72" "sha-2" "slug-g" health
+record_refix "72" "sha-3" "slug-g" health
+_refix_budget_reason "72" health >/dev/null || fail "(9c) three health rounds must exhaust the health rail"
+refix_rail_reset "72" health "sha-4" "slug-g"          # the suite went CLEAN
+[ "$(refix_rail_count "72" health)" -eq 0 ] || fail "(9c) a resolved rail's counter must be zeroed"
+ok
+! _refix_budget_reason "72" health >/dev/null || fail "(9c) a resolved rail must be able to bounce again"
+ok
+grep -q '"event":"refix_rail_reset"' "$JOURNAL_FILE" || fail "(9c) a reset must be journalled"
+ok
+# Resolve-then-fail-again: the rail restarts its budget from zero and exhausts on its own 3 reds.
+record_refix "72" "sha-5" "slug-g" health
+[ "$(refix_rail_count "72" health)" -eq 1 ] || fail "(9c) the rail restarts at round 1 after a reset"
+! _refix_budget_reason "72" health >/dev/null || fail "(9c) a restarted rail has budget again"
+ok
+# The reset REFUNDS the rail, never the total ceiling — every bounce ever made still counts.
+[ "$(refix_total_count "72")" -eq 4 ] || fail "(9c) resets must not refund the total (got $(refix_total_count 72))"
+ok
+# … and a reset row is bookkeeping, not a bounce: it must never satisfy the sha-keyed once-guard.
+! refix_attempted "72" "sha-4" health || fail "(9c) a reset row must not satisfy the once-guard"
+! refix_attempted "72" "sha-4"        || fail "(9c) a reset row must not satisfy the kindless once-guard"
+ok
+# Lifetime EVIDENCE (the reviewer-escalation input) is deliberately NOT refunded by a reset.
+[ "$(refix_round_count_kind "72" health)" -eq 4 ] \
+  || fail "(9c) refix_round_count_kind is lifetime evidence, not a budget (got $(refix_round_count_kind 72 health))"
+ok
+
+# (9d) TOTAL SAFETY CAP: a PR that thrashes across rails escalates even though reset-on-progress
+# keeps every individual rail under its own cap. Health passes and re-reds twice; review + stale
+# each spend some; the 9th bounce closes the PR out.
+rm -f "$REFIX_STATE"
+for s in 1 2; do record_refix "73" "sha-h$s" "slug-g" health; done
+refix_rail_reset "73" health "sha-hp1" "slug-g"
+for s in 3 4; do record_refix "73" "sha-h$s" "slug-g" health; done
+refix_rail_reset "73" health "sha-hp2" "slug-g"
+for s in 5 6; do record_refix "73" "sha-h$s" "slug-g" health; done
+record_refix "73" "sha-r1" "slug-g" review
+record_refix "73" "sha-r2" "slug-g" review
+record_refix "73" "sha-s1" "slug-g" stale
+[ "$(refix_total_count "73")" -eq 9 ] || fail "(9d) expected 9 lifetime bounces (got $(refix_total_count 73))"
+for kind in review health stale; do
+  [ "$(refix_rail_count "73" "$kind")" -lt 3 ] \
+    || fail "(9d) rail $kind should still be under its own cap (got $(refix_rail_count 73 "$kind"))"
+done
+ok
+[ "$(_refix_budget_reason "73" stale)" = "refix limit (9 total rounds across rails) reached" ] \
+  || fail "(9d) the total ceiling must escalate, naming itself apart from a rail cap (got: $(_refix_budget_reason 73 stale))"
+ok
+[ -n "$(_refix_budget_reason "73" health)" ] || fail "(9d) the total ceiling closes every rail at once"
+ok
+
+# (9e) LEGACY LEDGER: a pre-kind 4-field line reads as the review rail, unchanged.
+rm -f "$REFIX_STATE"
+printf '%s 74 sha-old slug-g\n' "$(date +%s)" > "$REFIX_STATE"
+[ "$(refix_rail_count "74" review)" -eq 1 ] || fail "(9e) a legacy line must count on the review rail"
+[ "$(refix_rail_count "74" health)" -eq 0 ] || fail "(9e) a legacy line must not count on another rail"
+[ "$(refix_total_count "74")" -eq 1 ]       || fail "(9e) a legacy line is a bounce"
+ok
+
+# (9f) A garbage REFIX_MAX_ROUNDS must fail soft to the documented default, never to a zero cap that
+# would escalate every PR on its first red.
+REFIX_MAX_ROUNDS="abc"
+[ "$(refix_rail_cap)" = "3" ] && [ "$(refix_total_cap)" = "9" ] \
+  || fail "(9f) a non-numeric REFIX_MAX_ROUNDS must fail soft to 3"
+REFIX_MAX_ROUNDS=0
+[ "$(refix_rail_cap)" = "3" ] || fail "(9f) a zero REFIX_MAX_ROUNDS must fail soft to 3"
+REFIX_MAX_ROUNDS=2
+[ "$(refix_rail_cap)" = "2" ] && [ "$(refix_total_cap)" = "6" ] \
+  || fail "(9f) the caps must track REFIX_MAX_ROUNDS"
+REFIX_MAX_ROUNDS=3
 ok
 
 echo "ALL PASS ($pass checks)"
