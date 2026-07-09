@@ -279,3 +279,5 @@ PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh
 .herd/steps.tsv	sim	tests/test-sandbox-posture-matrix.sh
 herd agent-update [--dry-run]	unit	tests/test-agent-update.sh
 AGENT_UPDATE	unit	tests/test-agent-update.sh
+ENGINE_MIN	unit	tests/test-engine-handshake.sh
+ENGINE_AUTOUPDATE	unit	tests/test-engine-handshake.sh
