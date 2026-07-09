@@ -11,6 +11,12 @@
 #       a sibling-in-group sleeper (simulates watcher death without killing the review).
 #
 # Fully hermetic: temp dir only, stubbed reviewer, no network/model/panes.
+#
+# HERD-253: every assertion needs an env that can put a command in its own process group. Where
+# neither setsid(1) nor python3 exists, this prints "SKIP (env: ...)" and exits 0 (the tolerated-env
+# convention, cf. test-backlog-view-render.sh). The probe measures the ENV only — a regression that
+# removes isolation from _bg_new_session still reds check (1) rather than skipping.
+#
 # Run:  bash tests/test-review-sever-protect.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -45,17 +51,72 @@ ok
 
 TREES="$WORKTREES_DIR"
 
+# ── pgid helpers + env capability probe (HERD-253) ────────────────────────────
+# Every assertion here rests on new-session isolation, and the split does not always land at fork:
+# without setsid(1) (macOS) _bg_new_session reaches a new session via a python3 fork+exec that calls
+# setsid() a few ms LATER, and a shell with no job control (any non-interactive builder sandbox or
+# coordinator shell, as opposed to the watcher's interactive tty pane) starts the background child
+# inside the caller's group. So poll for the split instead of sampling it once. If a trivial command
+# can never be split off at all, this env cannot host the behaviour under test — SKIP rather than
+# red, since the protection logic itself is env-independent and is exercised wherever it can run.
+_pgid_of(){ ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# _await_pgid_split <pid> <pgid-to-differ-from> — 0 once <pid> lives elsewhere, 1 after ~3s.
+_await_pgid_split(){
+  local pid="$1" other="$2" cur _i
+  for _i in $(seq 1 30); do
+    cur="$(_pgid_of "$pid")"
+    [ -n "$cur" ] || return 1   # child already gone — nothing left to observe
+    [ "$cur" != "$other" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Launch <cmd...> in a session of its own, mirroring _bg_new_session's fallback chain, so the test
+# harness can group-kill a stand-in watcher without taking itself down. Never the plain-background
+# last resort: an unsplit child would put that kill on OUR group. The probe below proves one of
+# these two paths works here before any caller relies on it.
+_test_new_session(){
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" &
+  else
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" &
+  fi
+  _TEST_NEW_SESSION_PID=$!
+  # Disowned: these children are group-killed on purpose below, and an un-disowned job makes the
+  # shell report the kill ("Terminated: 15") onto the suite's stderr.
+  disown "$_TEST_NEW_SESSION_PID" 2>/dev/null || true
+}
+
+# _env_can_split — can THIS env put a trivial command in a process group of its own?
+# Deliberately probes with the test's own launcher, never with _bg_new_session: probing through the
+# function under test would turn a real HERD-245 regression (isolation removed) into a SKIP, and the
+# suite would go green on exactly the bug it exists to catch. The env is the only variable here.
+_env_can_split(){
+  command -v setsid >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || return 1
+  local pid rc=0
+  _test_new_session sleep 5
+  pid="$_TEST_NEW_SESSION_PID"
+  [ -n "$pid" ] || return 1
+  _await_pgid_split "$pid" "$MYPGID" || rc=1
+  kill "$pid" 2>/dev/null || true
+  return "$rc"
+}
+
+MYPGID="$(_pgid_of $$)"
+if [ -z "$MYPGID" ] || ! _env_can_split; then
+  echo "SKIP (env: no pgid isolation available)"
+  exit 0
+fi
+
 # ── (1) _bg_new_session isolates process group ────────────────────────────────
 _bg_new_session sleep 60
 CHILD="$_BG_NEW_SESSION_PID"
 [ -n "$CHILD" ] || fail "(1) _bg_new_session returned empty pid"
 kill -0 "$CHILD" 2>/dev/null || fail "(1) child not alive right after launch"
-MYPGID="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
-CPGID="$(ps -o pgid= -p "$CHILD" 2>/dev/null | tr -d ' ')"
-[ -n "$CPGID" ] || fail "(1) could not read child pgid"
-if command -v setsid >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
-  [ "$CPGID" != "$MYPGID" ] || fail "(1) child pgid ($CPGID) must differ from caller pgid ($MYPGID) — no isolation"
-fi
+_await_pgid_split "$CHILD" "$MYPGID" \
+  || fail "(1) child pgid ($(_pgid_of "$CHILD")) must differ from caller pgid ($MYPGID) — no isolation"
 kill "$CHILD" 2>/dev/null || true; wait "$CHILD" 2>/dev/null || true
 ok
 
@@ -95,7 +156,7 @@ EOF
 chmod +x "$WATCHER_SH"
 
 # Launch fake watcher in its own session so we can group-kill it without killing this test.
-setsid bash "$WATCHER_SH" > "$T/watcher-out" 2>"$T/watcher-err" &
+_test_new_session bash "$WATCHER_SH" > "$T/watcher-out" 2>"$T/watcher-err"
 # Wait for the dispatch to land.
 for _i in 1 2 3 4 5 6 7 8 9 10; do
   [ -s "$T/watcher-out" ] && break
@@ -106,10 +167,10 @@ read -r WPID RPID < "$T/watcher-out"
 [ -n "$WPID" ] && [ -n "$RPID" ] || fail "(2) bad watcher-out: '$(cat "$T/watcher-out")'"
 kill -0 "$RPID" 2>/dev/null || fail "(2) precondition: reviewer pid $RPID must be alive before group-kill"
 # Process-group kill of the WATCHER (not the reviewer — they must be in different groups).
-WPGID="$(ps -o pgid= -p "$WPID" 2>/dev/null | tr -d ' ')"
-RPGID="$(ps -o pgid= -p "$RPID" 2>/dev/null | tr -d ' ')"
+WPGID="$(_pgid_of "$WPID")"
 [ -n "$WPGID" ] || fail "(2) watcher pgid unreadable"
-[ "$WPGID" != "$RPGID" ] || fail "(2) reviewer still shares watcher pgid ($WPGID) — isolation broken"
+_await_pgid_split "$RPID" "$WPGID" \
+  || fail "(2) reviewer still shares watcher pgid ($WPGID) — isolation broken"
 kill -TERM -"$WPGID" 2>/dev/null || true
 sleep 0.4
 # Watcher should be dead; reviewer must still be alive.
