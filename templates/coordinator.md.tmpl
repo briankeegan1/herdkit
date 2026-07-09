@@ -291,7 +291,7 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 ### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
 
 A backlog item is a task spec in waiting: whatever you leave out here, a builder has to guess at spawn
-time. Before you hand an Add to the scribe, walk these six — the first that fails sends you back to the
+time. Before you hand an Add to the scribe, walk these seven — the first that fails sends you back to the
 repo/journal, not to the scribe:
 
 1. **GROUNDED.** The gap is real — verified against **live code / the journal**, not memory. Cite the
@@ -314,6 +314,14 @@ repo/journal, not to the scribe:
    never a red row), **ship-dormant / default-off** (new behavior rides behind a config key, off by
    default), and **byte-identical-when-off** (with the flag off the rendered/observed output is
    unchanged). Say which apply so the builder doesn't have to infer them.
+7. **MULTI-SEAT / INVARIANCE.** Many coordinator seats work this repo in parallel, so ask both halves:
+   does the behavior hold **regardless of which seat performs the triggering event** (prefer an
+   invariant reconciled every tick against observed state over an event side-effect that only fires
+   for the seat that acted — a codemap refreshed only inside `do_merge` goes stale after another
+   seat's merge), and is any new check **a single shared implementation reused at every enforcement
+   surface** (the builder's pre-PR light profile AND the merge gate — a gate-only check the builder
+   can't run just bounces the PR; prose the builder must judge is not a check). Seat-local state and
+   merge-performer-dependent behavior are correctness defects. See `docs/multi-seat-doctrine.md`.
 
 Keep every backlog edit **privacy-safe** — nothing under `{{DENY_PATHS}}` and no secrets ever
 reach `{{BACKLOG_FILE}}` (it's committed).
