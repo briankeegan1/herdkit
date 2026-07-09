@@ -20,6 +20,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-reconcile.sh` — keep BACKLOG.md coherent when a PR MOVES or RENAMES the things backlog
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
+- `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
 - `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
 - `coordinator.sh` — (re)launch the coordinator herdr tab as a 2-pane control room:
@@ -110,7 +111,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `engine-version.sh` → `journal.sh`
 - `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
-- `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
+- `healthcheck.sh` → `caps-sync-lint.sh`, `commit-lint.sh`, `herd-config.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`

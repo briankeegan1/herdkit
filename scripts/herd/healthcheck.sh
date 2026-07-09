@@ -18,6 +18,10 @@
 #       Fast. Source types it has NO dependency-free probe for (.rs/.java/.ts/…) are never silently
 #       green-lit — they are flagged-the-absence with a loud ⚠️ (like the interaction gate), so a
 #       diff that only touches an unprobed language reads as ⚠️, never a confident ✅.
+#       After the syntax pass it also runs the SHARED caps-sync guard (scripts/herd/caps-sync-lint.sh,
+#       HERD-220) — the same lint the heavy project gate runs — so a builder whose change grows the
+#       capability surface without touching templates/capabilities.tsv sees the red here, pre-PR,
+#       instead of bouncing off the merge gate. Skipped in trees with no manifest (every consumer).
 #
 # Profile selection (auto):
 #   * no $HEALTHCHECK_CMD configured        → always light (pure syntax gate)
@@ -69,6 +73,7 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 . "$HERE/commit-lint.sh"
+. "$HERE/caps-sync-lint.sh"
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -304,6 +309,19 @@ EOF
   if [ -n "$syntax_errs" ]; then
     if [ -n "$ONELINE" ]; then echo "❌ light syntax — $(printf '%s' "$syntax_errs" | head -1)";
     else echo "❌ LIGHT CHECK: SYNTAX ERROR"; printf '%s' "$syntax_errs"; fi
+    exit 1
+  fi
+
+  # caps-sync guard (HERD-220) — the SAME lint the heavy project gate runs (scripts/herd/caps-sync-lint.sh),
+  # so a manifest miss is caught here, pre-PR, instead of bouncing at the authoritative merge gate.
+  # Same red semantics as the syntax pass (exit 1). Skipped (silently, never red) in any tree with no
+  # capabilities manifest — i.e. every consuming project — so the light verdict stays byte-identical
+  # for a diff that touches no engine surface.
+  local caps_errs caps_rc
+  caps_errs="$(herd_caps_sync_lint "$DEFAULT_BRANCH")"; caps_rc=$?
+  if [ "$caps_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ caps-sync — $(printf '%s' "$caps_errs" | head -1)";
+    else echo "❌ CAPS-SYNC: capabilities manifest not updated alongside engine change"; printf '%s\n' "$caps_errs"; fi
     exit 1
   fi
 
