@@ -17,11 +17,13 @@ The test: *does this hold regardless of which seat performed the triggering even
 
 **Incident evidence**
 
-- **HERD-218 — codemap goes stale after another seat's merge.** `refresh_codemap` is called from
-  `do_merge` (`scripts/herd/agent-watch.sh:3222`). A seat only refreshes `docs/codemap.md` for merges
-  *it* performs; when another seat's watcher merges, this seat's next builder is spawned against a
-  stale map. The invariant form is: *the committed map matches the tree at `$MAIN`* — checked on the
-  tick against observed `$MAIN`, repaired whenever it drifts, no matter who merged.
+- **HERD-218 — codemap goes stale after another seat's merge.** `refresh_codemap` used to fire only
+  from `do_merge`, so a seat only refreshed `docs/codemap.md` for merges *it* performed; when another
+  seat's watcher (or the gh UI) merged, this seat's next builder was spawned against a stale map.
+  The invariant form — now implemented as `reconcile_map_freshness` on every watcher tick — is:
+  *the committed map matches the tree at `$MAIN`* — probed via `codemap.sh --check` /
+  `symbol-index.sh --check` against observed `$MAIN`, repaired whenever it drifts with
+  `provenance=reconcile`, no matter who merged. The do_merge refresh remains the local-merge fast path.
 - **HERD-164 — retirement as an event handler.** Retiring a pane/worktree ran as a handler on the
   merge the seat performed, so panes belonging to work merged elsewhere were never retired. The
   invariant form: *no pane/worktree exists for a branch already merged into `$MAIN`* — evaluated

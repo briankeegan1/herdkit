@@ -22,11 +22,47 @@
 # It depends only on `herdr` + `python3`; every call degrades gracefully when herdr is absent or its
 # JSON does not parse (a pane resolves to `gone`, a scan to empty), so callers fail loud, not crash.
 
+# ── the hard-timeout guard (HERD-208) ────────────────────────────────────────
+# _reload_timeout <secs> <cmd> [args...] — run <cmd> under a HARD wall-clock timeout, PRESERVING its
+# stdout (unlike herd-preflight.sh's doctor runner, which discards it — every eyes/verify helper here
+# pipes herdr's JSON to python3, so stdout MUST survive). Prefers coreutils `timeout`/`gtimeout`; else
+# a pure-shell watchdog (background, poll to <secs>, SIGTERM→SIGKILL). Returns 124 on timeout
+# (coreutils' convention), else the command's own exit code. This is THE guard that stops a WEDGED
+# `herdr pane …` subcall — observed live on WSL2, where a pane verify never returned and `herd reload`
+# hung INDEFINITELY (had to be killed) instead of degrading — from blocking a caller forever: a
+# timeout becomes an empty result the caller already handles (a pane resolves 'gone'/GONE, a scan to
+# empty). Every kill/wait/sleep is guarded so this can never abort a caller running under `set -e`.
+# The per-call budget is HERD_RELOAD_HERDR_TIMEOUT (seconds; default 8) at every call site.
+_reload_timeout() {
+  local secs="$1"; shift
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@" || rc=$?; return "$rc"; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" || rc=$?; return "$rc"; fi
+  # No timeout binary (stock macOS): a pure-shell watchdog. It needs a working `sleep` to enforce the
+  # bound; without one, degrade to an un-timed run rather than busy-spin into a FALSE timeout.
+  if ! sleep 0 2>/dev/null; then "$@" || rc=$?; return "$rc"; fi
+  "$@" &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited+1))
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
 # ── classification primitives (the eyes) ─────────────────────────────────────
 
 # _reload_tab_by_label <workspace_id> <label> → tab_id, or empty.
 _reload_tab_by_label() {
-  herdr tab list --workspace "$1" 2>/dev/null | LABEL="$2" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr tab list --workspace "$1" 2>/dev/null | LABEL="$2" python3 -c '
 import sys,json,os
 try: tabs=json.load(sys.stdin)["result"]["tabs"]
 except Exception: tabs=[]
@@ -38,7 +74,7 @@ print(next((t.get("tab_id","") for t in tabs if t.get("label")==os.environ["LABE
 # roster is ground truth; the registry and neighbor queries are only hints that callers validate
 # against this list before trusting them.
 _reload_tab_panes() {
-  herdr pane list --workspace "$1" 2>/dev/null | TAB="$2" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane list --workspace "$1" 2>/dev/null | TAB="$2" python3 -c '
 import sys,json,os
 try: panes=json.load(sys.stdin)["result"]["panes"]
 except Exception: panes=[]
@@ -53,7 +89,7 @@ for p in panes:
 # backlog viewer, the watcher (herd-watch execs agent-watch), a claude agent, an idle shell
 # (BARE, safe to reuse), or something else the human is running (BUSY — never hijacked).
 _reload_pane_role() {
-  herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
 import sys,json
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: print("gone"); sys.exit(0)
@@ -165,7 +201,7 @@ layout_write_registry() {
 
 # _reload_tabs <workspace_id> → one "tab_id<TAB>label" line per tab (empty when herdr is absent).
 _reload_tabs() {
-  herdr tab list --workspace "$1" 2>/dev/null | python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr tab list --workspace "$1" 2>/dev/null | python3 -c '
 import sys,json
 try: tabs=json.load(sys.stdin)["result"]["tabs"]
 except Exception: tabs=[]

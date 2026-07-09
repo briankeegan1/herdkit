@@ -195,7 +195,7 @@ else
   command -v herdr >/dev/null 2>&1 || reason="herdr not installed"
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
-  for cp in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
+  for cp in workspace_created control_room reload_pane_verify_timeout builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
             builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
             builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
@@ -248,6 +248,49 @@ except Exception as e:
       checkpoint control_room pass "control-room tab $CTRL_TAB has labelled watcher + backlog panes"
     else
       checkpoint control_room fail "watcher/backlog panes not both present+labelled ($CTRL_OK)"
+    fi
+  fi
+
+  # ── RELOAD PANE-VERIFY IS BOUNDED (HERD-208): a WEDGED `herdr pane process-info` must ABORT the
+  # eyes/verify within the hard timeout — NEVER block. Live 2026-07-09 WSL2: process-info never
+  # returned for an existing-but-idle pane, so `herd reload`'s pane-verify hung INDEFINITELY (had to be
+  # killed) instead of degrading to the headless watcher. Prove the shipped guard (_reload_timeout in
+  # layout-reconcile.sh, the shared "eyes" every mutating path routes through) against a REAL pane:
+  # first classify it FAST (non-vacuous baseline), then WEDGE `herdr pane process-info` for that pane
+  # via a PATH shim (exec sleep — the wedge shape) and assert the shipped _reload_pane_role returns
+  # 'gone' within the per-call timeout. The OUTER `timeout` is the real assertion: the probe RETURNS
+  # rather than hanging. This is the PANE-seam reproduction the residual (HERD-208) calls for.
+  if [ -n "$WSID" ] && [ -n "$BACKLOG_PANE" ]; then
+    step reloadverify "reload pane-verify aborts on a wedged herdr subcall, never blocks (HERD-208)"
+    # shellcheck source=scripts/herd/layout-reconcile.sh
+    . "$HERE/../layout-reconcile.sh"   # _reload_timeout / _reload_pane_role (functions only, no side effects)
+    _rv_role_fast="$(_reload_pane_role "$BACKLOG_PANE" 2>/dev/null || true)"
+    # A herdr shim that WEDGES process-info for THIS pane (exec sleep) and forwards everything else to
+    # the real/stub herdr — models the WSL2 subcall that never returns.
+    RVSHIM="$ART/rvshim"; mkdir -p "$RVSHIM"
+    _rv_real="$(command -v herdr 2>/dev/null || true)"
+    cat > "$RVSHIM/herdr" <<RVH
+#!/usr/bin/env bash
+if [ "\${1:-}" = "pane" ] && [ "\${2:-}" = "process-info" ]; then
+  case " \$* " in *" $BACKLOG_PANE "*) exec sleep 120 ;; esac
+fi
+exec "$_rv_real" "\$@"
+RVH
+    chmod +x "$RVSHIM/herdr"
+    # A probe that re-sources the shipped guard with the wedging shim on PATH and classifies the pane.
+    cat > "$ART/rv-probe.sh" <<RVP
+. "$HERE/../layout-reconcile.sh"
+_reload_pane_role "$BACKLOG_PANE"
+RVP
+    _rv_out="$(timeout 12 env PATH="$RVSHIM:$PATH" HERD_RELOAD_HERDR_TIMEOUT=1 bash "$ART/rv-probe.sh" 2>/dev/null)"; _rv_rc=$?
+    if [ -z "$_rv_real" ]; then
+      checkpoint reload_pane_verify_timeout skip "herdr not resolvable on PATH to build the wedge shim"
+    elif [ "$_rv_role_fast" != gone ] && [ "$_rv_rc" != 124 ] && [ "$_rv_out" = gone ]; then
+      checkpoint reload_pane_verify_timeout pass \
+        "wedged herdr process-info aborted to 'gone' within the 1s per-call timeout (baseline role '$_rv_role_fast'); reload eyes never block"
+    else
+      checkpoint reload_pane_verify_timeout fail \
+        "verify did not abort cleanly (baseline='$_rv_role_fast' outer_rc=$_rv_rc wedged_out='$_rv_out')"
     fi
   fi
 
