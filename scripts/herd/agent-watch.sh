@@ -3354,8 +3354,14 @@ refix_round_count_kind() {
 }
 
 # record_refix <pr#> <headSha> <slug> [kind=review] — append one bounce record.
+# The ledger is POSITIONAL and space-separated, so an EMPTY <slug> would collapse the line to four
+# fields: awk then reads the KIND out of $4 and sees $5="" — i.e. a legacy "review" line — so
+# `refix_attempted <pr> <sha> health` returns false and the once-guard OPENS (re-bounce every tick).
+# Not reachable today (the slug comes from a worktree name), but the failure is silent and unbounded,
+# so substitute a '-' placeholder rather than rely on a caller invariant (review note #2).
 record_refix() {
-  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-review}" >> "$REFIX_STATE"
+  local _rr_slug="${3:-}"; [ -n "$_rr_slug" ] || _rr_slug='-'
+  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$_rr_slug" "${4:-review}" >> "$REFIX_STATE"
 }
 
 # ── ROW TRUTH: "needs you" means NOBODY is on it (HERD-173) ────────────────────────────────────────
@@ -3364,7 +3370,9 @@ record_refix() {
 # be on a slug's red:
 #   (a) the watcher BOUNCED it — a refix record exists for this exact (pr,sha,kind); the agent has the
 #       re-task prompt and we are waiting for its push. We know the round, so we show k/cap.
-#   (b) an agent is BUSY — agent_status reads "working". NOTE (review, non-blocking #1): `herdr agent
+#   (b) an agent is BUSY — agent_status reads "working". This path is live in the DEFAULT config
+#       (HEALTHCHECK_AUTOFIX=false), so its blast radius is EVERY project, not just autofix adopters.
+#       NOTE (review, non-blocking #1): `herdr agent
 #       list` reports one GLOBAL status per agent; it carries no sha and no evidence of WHAT the agent
 #       is working on. So (b) is a heuristic: a builder busy with anything at all reads "fix in
 #       progress" and is not bounced until it goes idle. That is deliberately the SAFE direction — we
@@ -5017,25 +5025,47 @@ _health_first_notok() {
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
 # (HERD-173: the last path #289 left quoting a non-'not ok' line). Resolution order:
 #   1. the first TAP 'not ok' line — a bats/TAP suite names the failing test exactly;
-#   2. else the first FAILURE-MARKED line BELOW the banner — the `syntax error near…`, the `FAIL:`, the
-#      traceback a non-TAP checker (shellcheck, py_compile, a project healthcheck) actually printed;
-#   3. else the first non-empty line below the banner — the checker said SOMETHING; quote it;
+#   2. else the first FAILURE-MARKED line among the surviving CANDIDATES below the banner;
+#   3. else the first surviving candidate — the checker said something that is not a pass; quote it;
 #   4. else the banner itself — better a bare classifier than an empty red row.
-# Whitespace-collapsed; the caller still bounds the length.
+#
+# "SURVIVING CANDIDATES" is the load-bearing part (review BLOCK, round 2). A non-TAP log — i.e. EVERY
+# non-bats consumer project, which is the generic-engine case — interleaves passes and failures, and a
+# GREEN line routinely contains a failure WORD:
+#     PASS  src/error.test.js                     ← jest: a passing FILE named "error"
+#       ✓ throws an error on bad input (3 ms)     ← jest: a passing TEST named "throws an error"
+#     --- PASS: TestParse/returns an error        ← go:   a passing test named "returns an error"
+# Token-matching without first excluding pass lines selects one of those. This string is quoted VERBATIM
+# into the auto-refix re-task prompt ("Failing test: PASS src/error.test.js") and into the needs-you row,
+# so it would send the builder to fix a GREEN test and burn a round of the shared, capped
+# REFIX_MAX_ROUNDS budget — the exact class of lie this PR exists to remove, re-introduced one layer
+# down. Pass-marked lines are therefore dropped from the candidate set FIRST: before the token match AND
+# before the step-3 fallback, which would otherwise re-select that very same green line.
+#
+# The pre-diff behaviour (`sed -n 1p` → the "❌ CODE ERROR" banner) was uninformative but never WRONG.
+# That is the floor: this function may return something uninformative, never something misleading.
+_HFD_PASS_RE='^[[:space:]]*(ok([[:space:]]|$)|✓|✔|--- PASS:|PASS([[:space:]]|:)|\[[[:space:]]*OK[[:space:]]*\]|SKIP)'
+_HFD_ZERO_RE='(^|[^0-9])0 (errors?|failures?|failed)'
+# Anchored failure MARKERS — a line that BEGINS with FAIL/✗/● is a failure whatever words follow. This
+# is how a bare 'FAIL  src/widget.test.js' is caught without putting bare 'fail' in the token list
+# (where it would also match 'failsafe').
+_HFD_MARK_RE='^[[:space:]]*(--- FAIL:|FAIL(ED)?([[:space:]]|:)|✗|✘|●|❌|E[[:space:]])'
+# … plus whole-word failure TOKENS anywhere in the line, for checkers that print prose.
+_HFD_TOKEN_RE='(^|[^[:alnum:]_])(error|errors|failed|failure|failures|fatal|exception|traceback|panic|assert|assertion)([^[:alnum:]_]|$)'
 _health_fail_detail() {
   [ -f "$1" ] || return 0
-  local _hfd_d _hfd_body
+  local _hfd_d _hfd_cand
   _hfd_d="$(_health_first_notok "$1")"
   if [ -z "$_hfd_d" ]; then
-    _hfd_body="$(sed -n '2,$p' "$1" 2>/dev/null | grep -v '^[[:space:]]*$' 2>/dev/null)"
-    # Whole-word failure tokens only, and never a line that REPORTS ZERO failures. A bare substring
-    # match (review note #3) happily selected 'failsafe', 'error_handler', or the summary '0 failures'
-    # — and this line is quoted VERBATIM into the builder's re-task prompt, so a benign pick sends it
-    # chasing a phantom. 'fail' alone is dropped; the inflected forms below are what real tools print.
-    _hfd_d="$(printf '%s\n' "$_hfd_body" \
-      | grep -viE '(^|[^0-9])0 (errors?|failures?|failed)' 2>/dev/null \
-      | grep -m1 -iE '(^|[^[:alnum:]_])(error|errors|failed|failure|failures|fatal|exception|traceback|panic|❌|✗)([^[:alnum:]_]|$)' 2>/dev/null)"
-    [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_body" | sed -n '1p')"
+    _hfd_cand="$(sed -n '2,$p' "$1" 2>/dev/null \
+      | grep -v '^[[:space:]]*$' 2>/dev/null \
+      | grep -viE "$_HFD_PASS_RE" 2>/dev/null \
+      | grep -viE "$_HFD_ZERO_RE" 2>/dev/null)"
+    if [ -n "$_hfd_cand" ]; then
+      _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_MARK_RE" 2>/dev/null)"
+      [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_TOKEN_RE" 2>/dev/null)"
+      [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_cand" | sed -n '1p')"
+    fi
     _hfd_d="$(printf '%s' "$_hfd_d" | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
   fi
   [ -n "$_hfd_d" ] || _hfd_d="$(sed -n '1p' "$1" 2>/dev/null)"
@@ -5107,6 +5137,15 @@ record_health_result() {
 _discard_stale_health() {
   local pr="$1" sha="$2" f base
   for f in "$TREES/.health-result-$pr-"*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    [ "${base##*-}" = "$sha" ] && continue
+    rm -f "$f" 2>/dev/null || true
+  done
+  # Sweep this PR's stuck-bounce markers for any OTHER sha (review note #5): they are keyed by
+  # (kind,pr,sha) and were otherwise never reaped, growing one file per bounce forever. A marker for the
+  # CURRENT sha must survive — it is the durable proof that nobody is on this red.
+  for f in "$TREES/.agent-watch-refix-stuck-"*"-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue

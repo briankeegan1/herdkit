@@ -308,6 +308,14 @@ record_refix 59 shaZ slug-a                    # a legacy 4-field line reads as 
 [ "$(refix_round_count_kind 59 review)" = "1" ] || fail "(9h) a legacy ledger line must read as review"
 ok
 
+# ── (9i) the ledger is POSITIONAL: an empty slug must not silently open the once-guard ──────────────
+reset_state
+record_refix 61 shaEMPTY "" health
+refix_attempted 61 shaEMPTY health || fail "(9i) an empty-slug record must still read back as kind=health"
+refix_attempted 61 shaEMPTY review && fail "(9i) an empty-slug health record must not read as review"
+[ "$(refix_round_count 61)" = "1" ] || fail "(9i) an empty-slug record must still count against the budget"
+ok
+
 # ── (9d) an ENV-TOLERATED outcome (a data/env warning, exit 0) NEVER bounces — only CODEERROR does ──
 reset_state
 DATAENV="$T/body-dataenv.txt"; printf '⚠️  DATA/ENV ISSUE (tolerated, not a code bug)\nshellcheck not installed\n' > "$DATAENV"
@@ -339,6 +347,34 @@ case "$d" in
   *"0 failures"*)  fail "(10) a line reporting ZERO failures is not a failure (got: $d)" ;;
 esac
 printf '%s' "$d" | grep -q 'assertion failed' || fail "(10) the real failure line must win (got: $d)"
+
+# A PASSING line must never be selected, even when it CONTAINS a failure word. This is the generic-
+# engine case: every non-bats consumer project emits a non-TAP log that interleaves passes and failures,
+# and the pass lines are full of the word "error". Check (10)'s benign fixture above covers 'failsafe'
+# and '0 failures' but has NO pass line, so it passed this vacuously (review BLOCK, round 2).
+JEST="$T/jest.log"
+printf '❌ CODE ERROR\nPASS  src/error.test.js\n  ✓ throws an error on bad input (3 ms)\nFAIL  src/widget.test.js\n  ● Widget › renders: expected 3 got 4\n' > "$JEST"
+d="$(_health_fail_detail "$JEST")"
+case "$d" in
+  PASS*|*"✓"*) fail "(10) a PASSING jest line must never be the failure detail (got: $d)" ;;
+esac
+printf '%s' "$d" | grep -q 'widget' || fail "(10) the jest detail must name the FAILING file (got: $d)"
+
+GO="$T/go.log"
+printf '❌ CODE ERROR\n--- PASS: TestParse/returns an error (0.00s)\n--- FAIL: TestWidget (0.01s)\n' > "$GO"
+d="$(_health_fail_detail "$GO")"
+case "$d" in
+  *"PASS"*) fail "(10) a PASSING go line must never be the failure detail (got: $d)" ;;
+esac
+printf '%s' "$d" | grep -q 'FAIL: TestWidget' || fail "(10) the go detail must name the FAILING test (got: $d)"
+
+# A log with NOTHING but passes (pathological: rc=1 with no failure line) must fall back to the banner —
+# uninformative, but never a lie. That is the floor the pre-diff `sed -n 1p` set.
+ALLPASS="$T/allpass.log"; printf '❌ CODE ERROR\nok 1 alpha\nPASS: everything\n' > "$ALLPASS"
+d="$(_health_fail_detail "$ALLPASS")"
+case "$d" in
+  *PASS*|*"ok 1"*) fail "(10) an all-pass body must fall back to the banner, never quote a pass (got: $d)" ;;
+esac
 
 # Nothing quotable at all → the banner is better than an empty row.
 ONLY="$T/only.log"; printf '❌ CODE ERROR\n' > "$ONLY"

@@ -279,7 +279,11 @@ _hk_bats_first_notok() {
   local _bfn_line _bfn_n
   _bfn_line="$(printf '%s\n' "$1" | grep -m1 -E '^[[:space:]]*not ok( |$)')"
   if [ -z "$_bfn_line" ]; then printf '%s' "$(printf '%s' "$1" | tail -1)"; return 0; fi
-  _bfn_n="$(printf '%s\n' "$1" | grep -cE '^[[:space:]]*not ok( |$)' 2>/dev/null || printf 1)"
+  # grep -c PRINTS "0" and exits 1 on no match, so `… || printf 1` would APPEND a 1 to that 0 ("01")
+  # rather than replace it. Unreachable (a match is already proven above) but the idiom reads as a bug:
+  # capture, then default (review note #3).
+  _bfn_n="$(printf '%s\n' "$1" | grep -cE '^[[:space:]]*not ok( |$)' 2>/dev/null)" || true
+  [ -n "$_bfn_n" ] || _bfn_n=1
   if [ "${_bfn_n:-1}" -gt 1 ] 2>/dev/null; then printf '%s (%s failing)' "$_bfn_line" "$_bfn_n"
   else printf '%s' "$_bfn_line"; fi
 }
