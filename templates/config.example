@@ -332,6 +332,20 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # touches a gate or a merge decision. Ships OFF (byte-inert: every console byte identical to before).
 # WATCHER_FLAIR="off"      # off (default) | on
 
+# Watcher SELF-RESTART on stale engine code (HERD-251) — on | off (default off, ship-dormant). The
+# watcher runs the engine code it loaded at startup, so a merge that rewrites scripts/herd/agent-watch.sh
+# leaves it grading PRs with an image the repo has already replaced. Today that raises the advisory
+# 'main pulled new engine code … restart recommended (`herd reload`)' row and an operator restarts by
+# hand. ON → the same trigger QUIESCES the watcher instead: no NEW gate work is dispatched (reviews,
+# healthchecks, resolver spawns and the stale-base heal all hold) while in-flight workers finish and their verdicts are
+# collected — nothing is killed, nothing is lost, already-green PRs still merge — and once zero workers
+# remain for 2 consecutive ticks, or a 15-minute cap expires, the watcher re-execs itself IN PLACE: same
+# pane, same herd-watch-<workspace> argv0 tag, same singleton lock (exec keeps the pid). Journals
+# watcher_quiesce then watcher_self_restart; the console row becomes 'restarting on new engine code ·
+# draining N workers'. Fail-soft — any error falls back to the recommendation row. OFF (default) → the
+# recommendation row and every gate dispatch are byte-identical to before. Watcher-affecting.
+# WATCHER_SELF_RESTART="off"   # off (default) | on
+
 # Cross-seat OPERATOR INBOX (HERD-184) — so coordination messages left as comments reach an autonomous
 # coordinator automatically. ON → each watcher tick surfaces NEW comments by OTHER authors as a
 # 'operator inbox' console section (needs-you-adjacent) plus one notify-once per comment: (a) a
