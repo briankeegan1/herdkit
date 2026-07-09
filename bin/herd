@@ -150,6 +150,113 @@ _ground_ask() {
 # _ground_yes <answer> — success for an affirmative interview answer (y / yes, case-insensitive).
 _ground_yes() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; *) return 1 ;; esac; }
 
+# ── init posture profiles (HERD-141) ─────────────────────────────────────────────────────────────
+# Intent-first interview helpers for `herd init`: offer the named postures from templates/postures.tsv
+# (via posture-lib.sh) and render the chosen KEY=VALUE bundle into .herd/config. The advanced path
+# keeps today's per-key prompts for power users. Non-interactive / no-tty init never enters this
+# interview (byte-identical seeded defaults). HERD_POSTURE_ASSUME_TTY is the hermetic test seam —
+# separate from HERD_GROUND_ASSUME_TTY so grounding tests' scripted stdin is not consumed here.
+
+# Source the shared postures reader once (idempotent; defines posture_* helpers).
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/sim/posture-lib.sh" ] && . "$SCRIPTS_DIR/sim/posture-lib.sh"
+
+# _posture_interactive — true when the posture interview should prompt.
+_posture_interactive() {
+  { [ -t 0 ] || [ -n "${HERD_POSTURE_ASSUME_TTY:-}" ]; } && [ -z "${HERD_NONINTERACTIVE:-}" ]
+}
+
+# _posture_ask <prompt> <default> — like ask(), but interactive under _posture_interactive.
+_posture_ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if _posture_interactive; then
+    printf '%s%s%s' "$c_bold" "$prompt" "$c_rst" >&2
+    [ -n "$def" ] && printf ' %s[%s]%s' "$c_dim" "$def" "$c_rst" >&2
+    printf ': ' >&2
+    read -r ans || true
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+# _posture_default_for_policy <merge-policy> — map a GitHub-derived MERGE_POLICY to a suggested
+# canonical posture name (templates/postures.tsv). approve → team-approve; observe → observe-only;
+# anything else (incl. auto) → solo-auto (today's fixture default).
+_posture_default_for_policy() {
+  case "${1:-auto}" in
+    approve) printf 'team-approve' ;;
+    observe) printf 'observe-only' ;;
+    *)       printf 'solo-auto' ;;
+  esac
+}
+
+# _posture_apply_bundle <name> — parse posture_keys into shell variables used by cmd_init's config
+# write. Sets: merge_policy, pr_flow, pr_ready, delete_branch, local_review, merge_method (only when
+# the bundle names them), posture_extra (SPACE-separated KEY=VALUE for keys not in the standard
+# init template), steps_profile (STEPS_PROFILE id, or empty). Caller's locals must already exist.
+_posture_apply_bundle() {
+  local name="$1" kv k v
+  steps_profile=""
+  posture_extra=""
+  for kv in $(posture_keys "$name" 2>/dev/null); do
+    case "$kv" in *=*) ;; *) continue ;; esac
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in
+      STEPS_PROFILE)          steps_profile="$v" ;;
+      MERGE_POLICY)           merge_policy="$v" ;;
+      MERGE_METHOD)           merge_method="$v" ;;
+      PR_FLOW)                pr_flow="$v" ;;
+      PR_READY_WHEN)          pr_ready="$v" ;;
+      DELETE_BRANCH_ON_MERGE) delete_branch="$v" ;;
+      LOCAL_REVIEW)           local_review="$v" ;;
+      *)
+        # Real config key not in the standard init template — append after the base write.
+        posture_extra="${posture_extra:+$posture_extra }$k=$v"
+        ;;
+    esac
+  done
+}
+
+# _posture_seed_steps <project_root> <profile-id> — materialise a STEPS_PROFILE into .herd/steps.tsv.
+# Only 'approve-stage' is defined today (custom-steps posture); unknown ids warn and skip. Never
+# clobbers an existing steps.tsv.
+_posture_seed_steps() {
+  local root="$1" profile="$2" dest="$1/.herd/steps.tsv"
+  [ -n "$profile" ] || return 0
+  if [ -e "$dest" ]; then
+    say "  ${c_dim}(steps.tsv already present — left untouched; STEPS_PROFILE=$profile not re-seeded)${c_rst}"
+    return 0
+  fi
+  case "$profile" in
+    approve-stage)
+      mkdir -p "$root/.herd"
+      {
+        printf '# .herd/steps.tsv — seeded by herd init posture custom-steps (STEPS_PROFILE=approve-stage).\n'
+        printf '# An approve-stage hold: the lane stops pre-merge until a human runs herd-approve.sh.\n'
+        printf 'approve-stage\tpre-merge\techo approve-stage ready\tblock\tapprove\n'
+      } > "$dest"
+      ok "seeded .herd/steps.tsv (approve-stage) from posture STEPS_PROFILE"
+      ;;
+    *)
+      warn "unknown STEPS_PROFILE='$profile' — no steps.tsv seeded; add .herd/steps.tsv by hand"
+      ;;
+  esac
+}
+
+# _posture_write_extra <cfg> <KEY=VALUE...> — append posture-only keys (quoted) after the base
+# template so a named posture's full bundle lands without rewriting the whole file shape.
+_posture_write_extra() {
+  local cfg="$1" pairs="${2:-}" kv k v
+  [ -n "$pairs" ] || return 0
+  {
+    printf '\n# Operating posture extras (HERD-141) — rendered from the chosen templates/postures.tsv bundle.\n'
+    for kv in $pairs; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      { [ -n "$k" ] && [ "$k" != "$kv" ]; } || continue
+      printf '%s="%s"\n' "$k" "$v"
+    done
+  } >> "$cfg"
+}
+
 # _ensure_gitignored <project_root> <pattern> — append <pattern> to the project's .gitignore unless
 # already present (idempotent). Used for per-machine / secret files that must never be committed.
 _ensure_gitignored() {
@@ -1012,45 +1119,133 @@ cmd_init() {
 
   local herd_repo; herd_repo="$(ask "HERD_REPO (where engine bugs escalate)" "briankeegan1/herdkit")"
 
-  # 4b. Merge policy + method — seeded from GitHub detection (protected + required review ⇒ approve).
-  #     The human can still override either here; detection only chooses the SAFE default.
+  # 4b. Operating posture (HERD-141) — INTENT-FIRST interview.
+  #     Ask about the operator's working style via the named postures in templates/postures.tsv
+  #     (canonical bundles: solo-auto / team-approve / gated-push / observe-only / custom-steps /
+  #     full-auto), then RENDER the chosen posture's KEY=VALUE bundle into .herd/config. An
+  #     ADVANCED per-key path keeps today's power-user prompts (MERGE_POLICY, PR_FLOW, …).
   #
-  #     CONSEQUENCE-LOUD (HERD-140): MERGE_POLICY decides whether the watcher merges PRs with NO
-  #     human in the loop, so it must NEVER be seeded silently. We always print, in the flow, what
-  #     each value DOES before asking — an operator can't unknowingly end up on 'auto'. On a
-  #     non-interactive / no-tty init (where we can't prompt) we seed the default but print a LOUD
-  #     notice of exactly what was chosen instead of a single dim line — and never hang the script.
+  #     HARD INVARIANTS:
+  #       • Non-interactive / no-tty init is BYTE-IDENTICAL to pre-HERD-141 seeded defaults
+  #         (det_policy / det_method + direct/builder/false/none) — no posture interview, no
+  #         extra keys. HERD-140 consequence-loud notice still prints for the seeded MERGE_POLICY.
+  #       • A named posture that only sets keys already in the base template (e.g. solo-auto →
+  #         MERGE_POLICY=auto) produces the SAME key set as today's init (no behavior regression).
+  #       • Posture-only keys (HUMAN_VERIFY_POLICY, PUSH_GATE, …) are appended only when the
+  #         chosen bundle names them. STEPS_PROFILE seeds .herd/steps.tsv (not a config key).
+  #       • Model map stays HARDCODED into the config write (never asked).
+  #
+  #     SAFE DEFAULTS for keys a posture does not set preserve today's EXACT behavior: direct PRs
+  #     opened ready, builder-owned readiness, branches retained on merge, no pre-PR local review.
+  local merge_policy="$det_policy" merge_method="$det_method"
+  local pr_flow="direct" pr_ready="builder" delete_branch="false" local_review="none"
+  local posture_name="" posture_extra="" steps_profile="" posture_mode=""
+
+  # Always print the MERGE_POLICY consequence block (HERD-140) so an operator never lands on a
+  # merge stance without seeing what auto / approve / observe DO — whether they pick a posture
+  # or take the advanced path. Non-interactive sees it too (with the loud default notice below).
   say ""
   say "${c_bold}Merge policy${c_rst} ${c_dim}— does the watcher merge PRs for you, or hold them?${c_rst}"
   say "  ${c_bold}auto${c_rst}     the watcher MERGES every gate-passed PR with ${c_bold}no human in the loop${c_rst}"
   say "  ${c_bold}approve${c_rst}  the watcher HOLDS each PR for an explicit human sign-off before merging"
   say "  ${c_bold}observe${c_rst}  the watcher NEVER merges — it only reports; you merge by hand"
-  local merge_policy merge_method
-  if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
-    merge_policy="$(ask "MERGE_POLICY (auto | approve | observe)" "$det_policy")"
-  else
-    # Non-interactive: seed the (suggested) default, but say loudly what it means — auto especially,
-    # since a silent auto is the exact footgun HERD-140 fixes.
-    merge_policy="$det_policy"
-    if [ "$merge_policy" = "auto" ]; then
-      warn "MERGE_POLICY defaulted to 'auto' (non-interactive init): the watcher will MERGE every gate-passed PR with NO human sign-off. To hold PRs for review instead, run 'herd config set MERGE_POLICY approve'."
+
+  if _posture_interactive && type posture_names >/dev/null 2>&1 && [ -f "$(posture_file 2>/dev/null || true)" ]; then
+    local def_posture; def_posture="$(_posture_default_for_policy "$det_policy")"
+    local i=0 choice name_list="" n adv_n
+    # Bash 3.2-clean: collect names into a space-separated list for number→name resolution.
+    say ""
+    say "${c_bold}Operating posture${c_rst} ${c_dim}— pick a working style; we render the knobs for you${c_rst}"
+    say "  ${c_dim}(canonical postures from templates/postures.tsv — same bundles the posture-matrix sim proves)${c_rst}"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      i=$((i + 1))
+      name_list="${name_list:+$name_list }$n"
+      say "  ${c_bold}$i)${c_rst} ${c_bold}$n${c_rst}  ${c_dim}— $(posture_intent "$n")${c_rst}"
+      say "       ${c_dim}keys: $(posture_keys "$n")${c_rst}"
+    done <<EOF
+$(posture_names)
+EOF
+    adv_n=$((i + 1))
+    say "  ${c_bold}$adv_n)${c_rst} ${c_bold}advanced${c_rst}  ${c_dim}— set each key by name (MERGE_POLICY, PR_FLOW, …)${c_rst}"
+    choice="$(_posture_ask "Posture (name, number, or 'advanced')" "$def_posture")"
+    # Resolve number → name, or accept a known name / 'advanced'.
+    case "$choice" in
+      advanced|Advanced|ADVANCED)
+        posture_mode="advanced"
+        ;;
+      *)
+        if [ "$choice" = "$adv_n" ]; then
+          posture_mode="advanced"
+        elif posture_exists "$choice" 2>/dev/null; then
+          posture_mode="named"; posture_name="$choice"
+        elif printf '%s' "$choice" | grep -qE '^[0-9]+$'; then
+          i=0; posture_name=""
+          for n in $name_list; do
+            i=$((i + 1))
+            if [ "$i" = "$choice" ]; then posture_name="$n"; break; fi
+          done
+          if [ -n "$posture_name" ]; then
+            posture_mode="named"
+          else
+            warn "unknown posture choice '$choice' — falling back to advanced per-key path"
+            posture_mode="advanced"
+          fi
+        else
+          warn "unknown posture '$choice' — falling back to advanced per-key path"
+          posture_mode="advanced"
+        fi
+        ;;
+    esac
+
+    if [ "$posture_mode" = "named" ]; then
+      _posture_apply_bundle "$posture_name"
+      say "  ${c_bold}→ posture=${posture_name}${c_rst}  ${c_dim}$(posture_intent "$posture_name")${c_rst}"
+      say "  ${c_dim}rendered: $(posture_keys "$posture_name")${c_rst}"
+      # MERGE_METHOD is never in a posture bundle today; seed from GitHub detection without a prompt
+      # so the named-posture path stays intent-first (no per-key interrogations).
+      say "  ${c_dim}MERGE_METHOD=${merge_method} (from GitHub detection / default; override later with 'herd config set')${c_rst}"
     else
-      say "  ${c_bold}→ MERGE_POLICY=${merge_policy}${c_rst} ${c_dim}(non-interactive init — seeded default; change with 'herd config set MERGE_POLICY ...')${c_rst}"
+      # Advanced: today's per-key interview (consequence-loud MERGE_POLICY already printed above).
+      say ""
+      say "${c_bold}Advanced${c_rst} ${c_dim}— set each governance key by name${c_rst}"
+      merge_policy="$(_posture_ask "MERGE_POLICY (auto | approve | observe)" "$det_policy")"
+      merge_method="$(_posture_ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
+      say ""
+      say "${c_bold}PR flow${c_rst}"
+      pr_flow="$(_posture_ask "PR_FLOW (direct = open PRs ready to merge | draft = open as draft, held by the watcher until marked ready)" "direct")"
+      pr_ready="$(_posture_ask "PR_READY_WHEN (who marks a DRAFT PR ready: builder = self after healthcheck | coordinator | human; only used when PR_FLOW=draft)" "builder")"
+      delete_branch="$(_posture_ask "DELETE_BRANCH_ON_MERGE (delete the head branch after merge: true | false)" "false")"
+      # LOCAL_REVIEW is written + documented here, but its pre-pr behavior is DEFERRED to a follow-up
+      # lane (that wiring touches the review gate / agent-watch.sh / herd-review.sh, owned elsewhere).
+      local_review="$(_posture_ask "LOCAL_REVIEW (none | pre-pr — pre-pr wiring is deferred; leave 'none')" "none")"
+    fi
+  else
+    # Non-interactive / no posture table: seed defaults, print HERD-140 loud notice, and (when a
+    # real TTY is somehow missing the table) fall through ask() so defaults still land. Keeps the
+    # non-interactive config BYTE-IDENTICAL to pre-HERD-141.
+    if [ -t 0 ] && [ -z "${HERD_NONINTERACTIVE:-}" ]; then
+      # Interactive but posture table unavailable — degrade to the old per-key path via ask().
+      merge_policy="$(ask "MERGE_POLICY (auto | approve | observe)" "$det_policy")"
+      merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
+      say ""
+      say "${c_bold}PR flow${c_rst}"
+      pr_flow="$(ask "PR_FLOW (direct = open PRs ready to merge | draft = open as draft, held by the watcher until marked ready)" "direct")"
+      pr_ready="$(ask "PR_READY_WHEN (who marks a DRAFT PR ready: builder = self after healthcheck | coordinator | human; only used when PR_FLOW=draft)" "builder")"
+      delete_branch="$(ask "DELETE_BRANCH_ON_MERGE (delete the head branch after merge: true | false)" "false")"
+      local_review="$(ask "LOCAL_REVIEW (none | pre-pr — pre-pr wiring is deferred; leave 'none')" "none")"
+    else
+      merge_policy="$det_policy"
+      merge_method="$det_method"
+      if [ "$merge_policy" = "auto" ]; then
+        warn "MERGE_POLICY defaulted to 'auto' (non-interactive init): the watcher will MERGE every gate-passed PR with NO human sign-off. To hold PRs for review instead, run 'herd config set MERGE_POLICY approve'."
+      else
+        say "  ${c_bold}→ MERGE_POLICY=${merge_policy}${c_rst} ${c_dim}(non-interactive init — seeded default; change with 'herd config set MERGE_POLICY ...')${c_rst}"
+      fi
+      # Non-interactive: remaining PR-flow keys keep their SAFE DEFAULTS above (direct/builder/…).
+      # ask() would also return those defaults; we skip the prompts so the flow stays quiet.
     fi
   fi
-  merge_method="$(ask "MERGE_METHOD (merge | squash | rebase)" "$det_method")"
-
-  # 4c. PR flow — how builders open PRs. SAFE DEFAULTS preserve today's EXACT behavior: direct PRs
-  #     opened ready, builder-owned readiness, branches retained on merge, and no pre-PR local review.
-  say ""
-  say "${c_bold}PR flow${c_rst}"
-  local pr_flow pr_ready delete_branch local_review
-  pr_flow="$(ask "PR_FLOW (direct = open PRs ready to merge | draft = open as draft, held by the watcher until marked ready)" "direct")"
-  pr_ready="$(ask "PR_READY_WHEN (who marks a DRAFT PR ready: builder = self after healthcheck | coordinator | human; only used when PR_FLOW=draft)" "builder")"
-  delete_branch="$(ask "DELETE_BRANCH_ON_MERGE (delete the head branch after merge: true | false)" "false")"
-  # LOCAL_REVIEW is written + documented here, but its pre-pr behavior is DEFERRED to a follow-up lane
-  # (that wiring touches the review gate / agent-watch.sh / herd-review.sh, owned elsewhere).
-  local_review="$(ask "LOCAL_REVIEW (none | pre-pr — pre-pr wiring is deferred; leave 'none')" "none")"
 
   # 5. Write .herd/config.
   mkdir -p "$project_root/.herd"
@@ -1115,7 +1310,13 @@ DELETE_BRANCH_ON_MERGE="$delete_branch"
 # documented and written but not yet consumed. Deferred follow-up: wire pre-pr local review.
 LOCAL_REVIEW="$local_review"
 EOF
+  # Named-posture extras (HUMAN_VERIFY_POLICY, PUSH_GATE, REVIEW_AUTOFIX, …) — only when a posture
+  # bundle set them. solo-auto / observe-only / non-interactive leave the key set byte-identical
+  # to pre-HERD-141. Append AFTER the base template so the standard key order is stable.
+  _posture_write_extra "$cfg" "${posture_extra:-}"
   ok "wrote $cfg"
+  # STEPS_PROFILE (custom-steps) is not a config key — seed .herd/steps.tsv when the posture asks.
+  _posture_seed_steps "$project_root" "${steps_profile:-}"
 
   # API-backend credentials live in .herd/secrets (gitignored), never in the committed config.
   if [ "$backend" = "linear" ] && [ -n "$linear_key" ]; then
@@ -5517,6 +5718,12 @@ def describe(o):
         return "hold released", "%s hold · sha %s · %s" % (g(o,"kind") or "approve", g(o,"sha")[:12] or "?", g(o,"reason") or "")
     if ev == "merge":
         return "MERGED", "sha %s · %s · %s" % (g(o,"sha")[:12] or "?", g(o,"method") or "?", g(o,"reason") or "")
+    if ev == "merge_observed":
+        # HERD-232: a merge this seat did NOT perform (foreign seat / gh UI), or one whose do_merge died
+        # before it could record the merge. The post-merge sweep reconciled it. Distinct from `merge`
+        # because only `merge` asserts that this seat owes the post-merge teardown.
+        return "MERGED (observed)", "sha %s · reconciled · reap_owed %s" % (
+            g(o,"sha")[:12] or "?", g(o,"reap_owed") or "?")
     if ev == "reap":
         return "reaped worktree", "reason %s" % (g(o,"reason") or "?")
     if ev == "review_log_retained":

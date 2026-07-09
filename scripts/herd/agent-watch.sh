@@ -110,6 +110,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
 . "$HERE/stale-dup-gate.sh"
+# CI auto-repair (HERD-250) — pure predicate for the inherited-red healer: a MERGEABLE+UNSTABLE PR whose
+# required CI is FAILING, herd/gates already PASSED, and the branch is BEHIND main is base-refreshed
+# (not silently merged). Sourcing DEFINES functions only; ship-dormant under CI_AUTOREPAIR=off.
+. "$HERE/ci-repair.sh"
 # PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
 # the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
 # dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
@@ -268,6 +272,16 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # the console, never a silent correction.
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
+# Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
+# the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
+# from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
+# killed mid-do_merge all converge. One "<epoch> <pr> <sha>" row per merged PR whose obligations this
+# seat has FULLY discharged — the pr+sha run-once key that keeps a reconciled PR from being re-probed.
+POSTMERGE_SWEPT_LEDGER="$TREES/.agent-watch-postmerge-swept"
+# Note-once ledger for a merged PR whose reap is DEFERRED (dirty tree / re-spawned slug). Such a PR
+# never earns a run-once row — the reap must keep retrying — so without this its `postmerge_reap_skip`
+# / `postmerge_deferred` lines would re-appear every cadence pass, forever. Rows: "<pr> <sha> <kind>".
+POSTMERGE_NOTED_LEDGER="$TREES/.agent-watch-postmerge-noted"
 # Dep-state console surface: dep-watcher.sh rewrites this file each tick with one
 # "<ref> <state> <age-seconds>" line per live blocked-on dep (state ∈ open|in-progress|in-review|
 # stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
@@ -638,14 +652,23 @@ build_engine_note() {
 # MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no tick is left to
 # clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature whenever the
 # feature is off, red state file or not.
+#
+# HONEST 'since' (HERD-222): an OBSERVED-SHA tick — a main sha this seat never merged — often has no PR
+# number to attribute the break to (the sha is recorded as "?"). Printing "(since #?)" would name a PR
+# that does not exist, so a non-numeric since renders "(observed)" instead: the row says WHAT is red and
+# admits it does not know WHO broke it, rather than pointing at a fictional PR.
 build_main_health() {
   MAIN_HEALTH=""
   _main_health_enabled || return 0
   [ -s "$MAIN_HEALTH_STATE" ] || return 0
-  local _bm_sha _bm_since _bm_fail
+  local _bm_sha _bm_since _bm_fail _bm_attr
   read -r _bm_sha _bm_since _bm_fail < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
   [ -n "${_bm_fail:-}" ] || _bm_fail="unknown"
-  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(since #${_bm_since})${C_RESET}"$'\n'
+  case "${_bm_since:-}" in
+    ''|*[!0-9]*) _bm_attr="observed" ;;
+    *)           _bm_attr="since #${_bm_since}" ;;
+  esac
+  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(${_bm_attr})${C_RESET}"$'\n'
 }
 
 # build_main_freshness — the MAIN-checkout freshness rows (HERD-233), both read from state files the
@@ -673,7 +696,14 @@ build_main_freshness() {
     MAIN_FRESHNESS="    ${C_RED}⚠️${C_RESET}  ${C_BOLD}MAIN STALE${C_RESET}${C_RED} — ${_bf_delta} · ${_bf_why}${C_RESET}"$'\n'
   fi
   if [ -s "${MAIN_FRESH_RESTART:-}" ]; then
-    MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}main pulled new engine code — this watcher still runs the old one · restart recommended (\`herd reload\`)${C_RESET}"$'\n'
+    # HERD-251: with WATCHER_SELF_RESTART=on the note is no longer a request for the operator — the
+    # watcher is already draining toward its own in-place re-exec, so say so (and name the workers it
+    # is still waiting on). With the lever off (or before the quiesce arms) the row is unchanged.
+    if _self_restart_quiescing; then
+      MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⟳${C_RESET}  ${C_DIM}restarting on new engine code · draining $(_count_gate_workers) gate workers${C_RESET}"$'\n'
+    else
+      MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}main pulled new engine code — this watcher still runs the old one · restart recommended (\`herd reload\`)${C_RESET}"$'\n'
+    fi
   fi
 }
 
@@ -2008,6 +2038,11 @@ _pin_review_sha() {
 # push must not desync reviewed content from the verdict-sha).
 _dispatch_review() {
   local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight registry
+  # SELF-RESTART QUIESCE (HERD-251): defence in depth. Every caller reaches here through
+  # _review_gate_step, which holds earlier and cheaper (before the escalation arm is consumed), so this
+  # is unreachable today. It returns NON-ZERO — never 0 — so a future caller cannot read the refusal as
+  # a launched reviewer and report RUNNING/ESCALATED over nothing. Byte-inert with the lever off.
+  _self_restart_hold_dispatch && return 1
   result="$(_review_result_file "$pr" "$sha")"
   inflight="$(_review_inflight_file "$pr" "$sha")"
   registry="$(_review_registry_file "$pr" "$sha")"
@@ -2369,6 +2404,14 @@ _review_gate_step() {
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
+
+  # SELF-RESTART QUIESCE (HERD-251): the watcher is draining toward an in-place re-exec on new engine
+  # code — start no new reviewer. Placed BELOW the collect/in-flight branches (a running review still
+  # finishes and its verdict is still recorded) and ABOVE every step with a side effect: no tier
+  # classification, no carry-forward, no escalation-arm consumption. QUEUED is the existing
+  # "will dispatch on a later tick" token, so the candidate holds without merging — and the restarted
+  # watcher dispatches it on new code. Byte-inert with the lever off.
+  if _self_restart_hold_dispatch; then echo QUEUED; return 0; fi
 
   # DELTA-SCOPED REVIEW carry-forward (HERD-204): before spending a reviewer on this new sha, try to
   # PROVE it differs from this PR's last-passed sha ONLY by a merge of DEFAULT_BRANCH (a pure
@@ -3553,6 +3596,13 @@ _reap_idle_resolver_for_redispatch() {
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   local _sr_rc=0 _sr_ack _sr_roster
+  # SELF-RESTART QUIESCE (HERD-251): defence in depth. Both callers hold ABOVE their own ledger writes
+  # (the resolve pass at its row, _handle_stale_dup above record_refix), so this is unreachable
+  # today. It returns NON-ZERO — never 0 — because `_resolver_in_flight … || spawn_resolver …` reads a
+  # zero rc as "a resolver is now running": a refusal that returned 0 would paint `rebasing · awaiting
+  # push` over nothing. Refused before record_resolve_attempt, so no respawn round is burned either.
+  # Byte-inert with the lever off.
+  _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
@@ -3942,8 +3992,231 @@ _watch_gate_inflight() {
   return 1
 }
 
+# _count_gate_workers — how many review/health workers are LIVE right now. The counted form of
+# _watch_gate_inflight (same two marker families, same liveness probe), used by the self-restart
+# quiesce to decide when the drain is complete and to render 'draining N gate workers'.
+#
+# SCOPE, precisely: the two INFLIGHT-MARKER families this watcher owns in-process — reviewers and
+# healthcheck suites. Conflict resolvers and builders are NOT counted: they are agents in their own
+# panes with no inflight marker, they are never killed by the exec (they outlive it, like the review
+# and health workers do), and blocking a restart on a resolver — which can run for many minutes —
+# would strand the watcher on stale code for exactly as long. The quiesce still refuses to DISPATCH a
+# new resolver, so no fresh one starts mid-drain.
+_count_gate_workers() {
+  local f n=0
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _marker_live "$f" 2>/dev/null && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+# ── Watcher SELF-RESTART on stale engine code (HERD-251) ─────────────────────────────────────────
+# The watcher executes the engine code it loaded at startup. HERD-233 detects the case where a pulled
+# delta rewrote agent-watch.sh and leaves a "restart recommended" note ($MAIN_FRESH_RESTART) for the
+# operator — who then restarts by hand (six times on 2026-07-09 alone). This closes that loop.
+#
+# WATCHER_SELF_RESTART=on → the note ARMS a QUIESCE-THEN-EXEC:
+#   (a) QUIESCE — stop dispatching NEW gate work (reviews, healthchecks, resolver spawns, and the
+#       stale-base heal that dispatches them). Every hold sits ABOVE its call site's ledger write, so a
+#       refused dispatch never leaves a spent once-guard behind it (see _handle_stale_dup). In-flight
+#       workers are never killed: they run to completion and their verdicts are COLLECTED normally,
+#       because the collect paths sit upstream of every dispatch hold. Merges of already-green PRs
+#       still land; nothing expensive is started.
+#   (b) EXEC — once zero live REVIEW/HEALTH workers remain for 2 CONSECUTIVE ticks (a single quiet tick
+#       can be the instant between one worker's exit and its sibling's dispatch), or the inline
+#       15-minute max-wait cap expires, re-exec this script IN PLACE. See _count_gate_workers for why
+#       resolvers and builders are deliberately outside that count.
+#   (c) journal watcher_self_restart reason=engine-update shas=<old>..<new>.
+#
+# WHY exec IS SAFE HERE — all three identities survive because exec keeps the PID and the pane:
+#   • pane    — exec replaces the process image inside the same pane/tty; nothing is respawned.
+#   • argv0   — we pass `exec -a "$HERD_WATCH_ARGV0"` ourselves. HERD_WATCH_REEXEC is already exported
+#               in this process, so the new image skips the one-shot argv0 re-exec and keeps the tag.
+#   • lock    — the singleton is re-acquired by the new image at the SAME pid. _acquire_watcher_singleton
+#               refuses only a LIVE recorded pid that is NOT $$; ours IS $$, so it adopts. Under flock
+#               the `exec 9>>` reopen drops the old open-file description (releasing the lock) and
+#               flock -n immediately re-takes it; under the mkdir fallback the EXIT trap never fires on
+#               exec, so the pid file is simply rewritten with the same pid. Neither path can hand the
+#               workspace to a duplicate: no window exists in which the lock is free AND we are gone.
+# In-flight workers are NOT killed even at cap expiry: reviews are setsid'd and health workers are
+# ordinary children, so both outlive the exec. The new image's startup sweeps + the every-tick corpse
+# sweep reap their markers and time them out from the marker's own dispatch ts.
+#
+# HARD INVARIANTS:
+#   • WATCHER_SELF_RESTART=off (default) → byte-identical to HERD-233: no arm, no dispatch hold, no
+#     exec, no journal. The recommendation row renders exactly as before.
+#   • DRYRUN → never arms (an observation run must not restart anything).
+#   • FAIL-SOFT: an unreadable script path, or a hermetic-test guard, disarms and leaves the note in
+#     place, so the console falls back to the plain 'restart recommended' row. The refusal LATCHES for
+#     the life of the process: the note that armed us is still there, so without the latch the next
+#     tick would re-arm, hold dispatch, refuse again, and spin — an every-other-tick gate stall.
+SELF_RESTART_CAP_SECS=900          # inline 15-minute max-wait cap on the drain (HERD-251)
+_SELF_RESTART_ARMED=""             # epoch the quiesce began; empty ⇒ not quiescing
+_SELF_RESTART_FROM=""              # $MAIN HEAD sha before the pull that carried new engine code
+_SELF_RESTART_TO=""                # …and after it (the sha recorded in $MAIN_FRESH_RESTART)
+_SELF_RESTART_IDLE_TICKS=0         # consecutive ticks observed with zero live review/health workers
+_SELF_RESTART_GAVE_UP=""           # 1 once an exec was refused: never arm again in this process
+
+# _self_restart_enabled — the master lever. Anything but `on` is off (ship-dormant default).
+_self_restart_enabled() { [ "${WATCHER_SELF_RESTART:-off}" = "on" ]; }
+
+# _self_restart_quiescing — true once armed: the watcher is draining toward an in-place re-exec.
+_self_restart_quiescing() { [ -n "${_SELF_RESTART_ARMED:-}" ]; }
+
+# _self_restart_hold_dispatch — the ONE predicate every gate-dispatch site consults. True ⇒ this tick
+# must NOT start new gate work. Byte-inert with the lever off (the first test short-circuits).
+_self_restart_hold_dispatch() { _self_restart_enabled && _self_restart_quiescing; }
+
+# _self_restart_arm — enter the quiesce. Records the sha delta (from the reconcile's own note file,
+# whose single line is the NEW sha) and journals ONCE. Idempotent: a second call while armed no-ops.
+_self_restart_arm() {
+  _self_restart_quiescing && return 0
+  _SELF_RESTART_ARMED="$(date +%s)"
+  _SELF_RESTART_IDLE_TICKS=0
+  _SELF_RESTART_TO="$(cat "$MAIN_FRESH_RESTART" 2>/dev/null || true)"
+  _SELF_RESTART_TO="${_SELF_RESTART_TO%%[$'\t\r\n ']*}"
+  journal_append watcher_quiesce reason engine-update \
+    shas "${_SELF_RESTART_FROM:-unknown}..${_SELF_RESTART_TO:-unknown}" cap "$SELF_RESTART_CAP_SECS"
+  return 0
+}
+
+# _self_restart_should_exec <live-workers> <waited-secs> — the pure decision. Echoes the trigger
+# reason ('drained' | 'cap-expiry') when it is time to re-exec, else nothing. Two consecutive
+# zero-worker ticks (not one) so we never exec in the gap between a collect and its sibling dispatch.
+_self_restart_should_exec() {
+  local _sr_n="${1:-0}" _sr_waited="${2:-0}"
+  case "$_sr_n" in ''|*[!0-9]*) _sr_n=0 ;; esac
+  case "$_sr_waited" in ''|*[!0-9]*) _sr_waited=0 ;; esac
+  [ "$_sr_n" -eq 0 ] && [ "$_SELF_RESTART_IDLE_TICKS" -ge 2 ] && { printf 'drained'; return 0; }
+  [ "$_sr_waited" -ge "$SELF_RESTART_CAP_SECS" ] && { printf 'cap-expiry'; return 0; }
+  return 0
+}
+
+# _self_restart_journal <trigger> <live-workers> <waited-secs> — the ONE watcher_self_restart event.
+# Emitted only once the exec is certain to be attempted (see below), so a consumer counting these
+# events counts restarts that actually happened, not ones the guards refused.
+_self_restart_journal() {
+  journal_append watcher_self_restart reason engine-update \
+    shas "${_SELF_RESTART_FROM:-unknown}..${_SELF_RESTART_TO:-unknown}" \
+    trigger "$1" workers "$2" waited "$3"
+}
+
+# _self_restart_exec <trigger> <live-workers> <waited-secs> — replace this process image with a fresh
+# load of the engine code now on disk. Returns 1 (fail-soft, still armed → the caller disarms and the
+# recommendation row returns) when the exec must not happen.
+#
+# The refusal guards run BEFORE the journal, and nothing but the exec follows it: a `watcher_self_restart`
+# event therefore means a restart that happened. (Journaling AFTER the exec is impossible — exec never
+# returns — so "immediately before, past every guard" is the closest honest point.)
+_self_restart_exec() {
+  local _se_trigger="$1" _se_workers="$2" _se_waited="$3"
+  # A hermetic test never replaces its own image (the guard above already refuses the live loop).
+  [ -n "${HERD_HERMETIC_GUARD:-}" ] && return 1
+  [ -r "$HERE/agent-watch.sh" ] || return 1
+  _self_restart_journal "$_se_trigger" "$_se_workers" "$_se_waited"
+  # HERD_WATCH_REEXEC is already exported in this process, so the new image keeps the argv0 we pass
+  # here rather than re-execing a second time. Same pid ⇒ same pane, same singleton lock. $_WATCH_ARGV
+  # replays this watcher's own positional args, exactly as the startup argv0 re-exec passes "$@" — the
+  # launch path this is imitating (empty today; agent-watch.sh takes none).
+  exec -a "${HERD_WATCH_ARGV0:-herd-watch}" bash "$HERE/agent-watch.sh" \
+    ${_WATCH_ARGV[@]+"${_WATCH_ARGV[@]}"}
+}
+
+# _self_restart_tick — call once per tick, AFTER reconcile_main_freshness (which writes the note this
+# arms on). Never returns non-zero; the caller still guards with `|| true` so a self-restart bug can
+# never take the watch loop down with it.
+_self_restart_tick() {
+  _self_restart_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "${_SELF_RESTART_GAVE_UP:-}" ] && return 0    # a refused exec is terminal for this process
+  if ! _self_restart_quiescing; then
+    [ -s "${MAIN_FRESH_RESTART:-}" ] || return 0
+    _self_restart_arm
+  fi
+  local _st_n _st_waited _st_trigger
+  _st_n="$(_count_gate_workers)"
+  _st_waited=$(( $(date +%s) - _SELF_RESTART_ARMED ))
+  [ "$_st_waited" -ge 0 ] || _st_waited=0    # a clock step backwards must not skip the cap
+  if [ "$_st_n" -eq 0 ]; then
+    _SELF_RESTART_IDLE_TICKS=$((_SELF_RESTART_IDLE_TICKS + 1))
+  else
+    _SELF_RESTART_IDLE_TICKS=0
+  fi
+  _st_trigger="$(_self_restart_should_exec "$_st_n" "$_st_waited")"
+  [ -n "$_st_trigger" ] || return 0
+  _self_restart_exec "$_st_trigger" "$_st_n" "$_st_waited" && return 0
+  # Fail-soft: the exec did not happen. Disarm so gate dispatch resumes on the OLD (running) code, and
+  # GIVE UP for the life of this process — the note that armed us is still on disk, so re-arming next
+  # tick would only refuse again. The note reverts to its HERD-233 meaning: a restart recommendation
+  # the operator acts on. Journaled ONCE, for the same reason.
+  _SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0; _SELF_RESTART_GAVE_UP=1
+  journal_append watcher_self_restart result skipped reason exec-unavailable trigger "$_st_trigger"
+  return 0
+}
+
 # _main_fresh_clear — back to fresh: drop the held row (the journal already recorded the transition).
 _main_fresh_clear() { rm -f "$MAIN_FRESH_STATE" 2>/dev/null || true; }
+
+# _main_fresh_recovered — the held row's condition is GONE. Drop the state file and journal the
+# transition ONCE (mirrors _main_health_clear: the file's presence IS the "was held" flag, so reading
+# it before the rm is what makes the event fire exactly once). Never called on a happy-path tick —
+# _main_fresh_recheck's first guard is the state file's existence.
+_main_fresh_recovered() {
+  local _mv_reason _mv_b _mv_a
+  read -r _mv_reason _mv_b _mv_a < "$MAIN_FRESH_STATE" 2>/dev/null || true
+  _main_fresh_clear
+  journal_append main_fresh_recovered reason "${_mv_reason:-unknown}" \
+    was_behind "${_mv_b:-0}" was_ahead "${_mv_a:-0}"
+  return 0
+}
+
+# _main_fresh_recheck — the OBSERVED-state recovery probe (HERD-259). The held row is a STATE FILE, and
+# before this every path that could delete it sat BELOW a defer in reconcile_main_freshness: a live gate
+# marker, a failed fetch, or a $MAIN parked off-branch all returned early, so a row whose condition had
+# already healed kept painting. It also outlived a watcher restart — startup drops $MAIN_FRESH_RESTART
+# (see the one-shot sweep below the tick loop) but never re-validated $MAIN_FRESH_STATE, and the render
+# pass runs ABOVE the reconcile in the tick, so the first paint of the new process trusted the stale
+# file. Live incident 2026-07-09: 'dirty-tree 4 0' held for 20+ minutes across a restart on a checkout
+# that was clean and current, until a human deleted the file.
+#
+# So the row is re-derived from OBSERVED git state every tick, ABOVE every defer, on both the render and
+# reconcile paths. It is READ-ONLY on the repo (status + rev-list, no fetch, no network, no tree
+# mutation), which is exactly why it is safe to run while a gate owns the tree — the reason the reconcile
+# proper cannot.
+#
+# CLEARS ONLY ON PROVABLE FRESHNESS — clean tree AND zero behind AND zero ahead. "Not behind" alone would
+# wipe a real `local-commits` hold (clean tree, 0 behind, N ahead is precisely that red), the same way a
+# vacuous rc-0 would wipe a real MAIN RED (see _main_health_clear's warning). Anything else — dirty,
+# behind, ahead, unreadable — leaves the file exactly as it was for the reconcile to re-decide.
+#
+# The behind/ahead counts come from the LOCAL remote-tracking ref (no fetch of our own). A row cleared
+# against a ref that has since moved is not a lie: the hold's condition (a dirty tree, a divergence this
+# checkout no longer has) is observably gone, and the reconcile below fetches and re-holds on the same
+# tick if $MAIN is genuinely stale again.
+#
+# Byte-inert on the happy path: with no state file the first test returns, so a fresh $MAIN costs one
+# `[ -s ]` and touches no git.
+_main_fresh_recheck() {
+  [ -s "${MAIN_FRESH_STATE:-}" ] || return 0
+  [ -n "${DRYRUN:-}" ] && return 0            # an observation run mutates no state (as the reconcile does not)
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
+    || return 0
+  local _mk_up _mk_dirty _mk_counts _mk_ahead _mk_behind
+  _mk_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  git -C "$MAIN" rev-parse --verify --quiet "$_mk_up" >/dev/null 2>&1 || return 0
+  _mk_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  [ -n "$_mk_dirty" ] && return 0
+  _mk_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mk_up" 2>/dev/null || true)"
+  _mk_ahead="$(printf '%s' "$_mk_counts" | awk '{print $1}')"
+  _mk_behind="$(printf '%s' "$_mk_counts" | awk '{print $2}')"
+  case "${_mk_ahead:-x}${_mk_behind:-x}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_mk_ahead" -eq 0 ] && [ "$_mk_behind" -eq 0 ] || return 0
+  _main_fresh_recovered
+  return 0
+}
 
 # _main_fresh_hold <reason> <behind> <ahead> — surface an unhealable divergence: persist the row and
 # journal it ONCE (a reason that has not changed since the last tick paints, but does not re-journal).
@@ -3970,12 +4243,15 @@ _main_fresh_generated_only() {
 }
 
 # _main_fresh_note_restart <old-sha> <new-sha> — success (and leave a note) iff the pulled delta
-# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds.
+# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds. The note is
+# also the ARM signal for the HERD-251 self-restart quiesce (see _self_restart_tick); $_SELF_RESTART_FROM
+# carries the pre-pull sha the note file itself cannot hold, for the journal's shas=<old>..<new> field.
 _main_fresh_note_restart() {
   git -C "$MAIN" diff --name-only "$1" "$2" 2>/dev/null \
     | grep -qx 'scripts/herd/agent-watch.sh' || return 1
   mkdir -p "$TREES" 2>/dev/null || true
   printf '%s\n' "$2" > "$MAIN_FRESH_RESTART" 2>/dev/null || true
+  _SELF_RESTART_FROM="$1"
   return 0
 }
 
@@ -3989,6 +4265,10 @@ reconcile_main_freshness() {
   # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
   [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
     || return 0
+  # HERD-259: a standing held row is re-derived from observed git state BEFORE any defer below it —
+  # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
+  # fetch is failing. Read-only, and a no-op when no row is held.
+  _main_fresh_recheck
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
 
@@ -4189,12 +4469,56 @@ _reap_slug() {
 # build_main_health finds nothing and the console renders byte-identically. Fully fail-soft: a suite
 # that cannot even run (no HEAD, no slot, no bin) journals an infra_event and never paints a red row,
 # and a tab-leak-guard trip is treated as the same transient the pre-merge gate already tolerates.
-MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"   # one line while RED: "<sha> <since_pr> <failing test…>"
+# ── MAIN-HEALTH AS A RECONCILED INVARIANT (HERD-222) ──────────────────────────────────────────────
+# Multi-seat doctrine Rule 1, applied to main-health exactly as HERD-233 applied it to $MAIN freshness:
+# "every observed main sha has a collected health verdict" is an INVARIANT reconciled once per tick, not
+# a do_merge side-effect. The event-only tick had three holes, all observed on main:
+#   • a merge by ANOTHER seat (or the gh UI) never ran main_health_tick at all — main could sit red, or
+#     stay falsely red after a fix landed, until THIS watcher happened to merge something;
+#   • a no-slot deferral was retried only on the NEXT MERGE, so the day's last merge went un-ticked;
+#   • a worker KILLED mid-suite (restart, corpse sweep) left its sha with no verdict and no re-dispatch —
+#     it never wrote the run-once marker, but nothing ever looked at the sha again.
+# reconcile_main_health closes all three by dispatching whenever the CURRENT $MAIN HEAD has no marker,
+# whoever merged it. do_merge's main_health_tick call survives as the fast path: it is now
+# redundant-but-harmless, since the per-sha marker + the inflight/dispatch idempotency guards make the
+# reconciler a no-op for a sha the merge tick already dispatched.
+#
+# Two new levers, both SHIP-DORMANT (default off → byte-identical to the pre-HERD-222 engine):
+#   • MAIN_HEALTH_RECHECK_MINS — while the red state file stands, RE-VERIFY the CURRENT sha on this
+#     rate-limited cadence, so a red that was already fixed (or was never real) self-heals through the
+#     existing green→clear path instead of shouting for 19 hours.
+#   • MAIN_HEALTH_AUTOFIX — on a REPRODUCED red with an HONEST failing-test identity, enqueue ONE scribe
+#     item naming that test. It files work; it does NOT spawn a builder in this increment.
+MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"        # one line while RED: "<sha> <since_pr> <failing test…>"
+MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" — the last journaled defer
+MAIN_HEALTH_FIX_STATE="$TREES/.agent-watch-main-health-fix" # the failing identity autofix already filed
+
+# A worker that keeps DYING before it can collect must not be re-dispatched forever: after this many
+# consecutive deaths the sha is marked (run-once) and the deaths surface as an infra_event instead of a
+# per-tick suite. Inline constant on purpose — no new config key (mirrors _HEALTH_INFRA_REDISPATCH_MAX).
+_MAIN_HEALTH_DIED_MAX=2
 
 # _main_health_enabled — true iff MAIN_HEALTH_TICK opts in. Default OFF (the inverse of the
 # CODEMAP_AUTOREFRESH default-on lever); any unrecognized value reads as off (fail toward dormant).
 _main_health_enabled() {
   case "$(printf '%s' "${MAIN_HEALTH_TICK:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _main_health_recheck_mins — the RED re-verify cadence in whole minutes, or 0 (the default) for OFF.
+# A non-numeric value reads as 0: a typo can never turn a dormant lever on.
+_main_health_recheck_mins() {
+  case "${MAIN_HEALTH_RECHECK_MINS:-0}" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$MAIN_HEALTH_RECHECK_MINS" ;;
+  esac
+}
+
+# _main_health_autofix_enabled — true iff MAIN_HEALTH_AUTOFIX opts in. Default OFF (ship-dormant).
+_main_health_autofix_enabled() {
+  case "$(printf '%s' "${MAIN_HEALTH_AUTOFIX:-off}" | tr '[:upper:]' '[:lower:]')" in
     1|true|on|yes|enable|enabled) return 0 ;;
     *) return 1 ;;
   esac
@@ -4208,6 +4532,24 @@ _main_health_marker() { printf '%s' "$TREES/.main-health-$1"; }
 # the collector (a later, possibly RESTARTED tick) can attribute the 'since #N' / recovery correctly
 # even though the pr# is not in the sha-keyed marker/dispatch filenames.
 _main_health_pr_file() { printf '%s' "$TREES/.main-health-pr-$1"; }
+# _main_health_retry_file <sha> — how many times a worker for this sha DIED before collecting.
+_main_health_retry_file() { printf '%s' "$TREES/.main-health-died-$1"; }
+
+# _main_health_observed_pr <sha> — the PR number this sha landed as, read from its own commit subject.
+# This is the ONLY attribution available for a merge THIS seat never performed. Empty when the commit
+# names no PR — the caller then records "?" and the console row says "(observed)", never a made-up number.
+#
+# A TRAILING "(#N)" wins over any earlier "#N". GitHub's squash subject is "<title> (#456)", and a title
+# may itself cite an issue — "Fix #123 widget handling (#456)" — where the first match names the ISSUE,
+# not the PR. Merge-commit subjects ("Merge pull request #456 from …") carry no trailing form, so they
+# fall through to the first-match rule unchanged.
+_main_health_observed_pr() {
+  local _op_subj _op_n
+  _op_subj="$(git -C "$MAIN" log -1 --format='%s' "$1" 2>/dev/null)"
+  _op_n="$(printf '%s\n' "$_op_subj" | grep -oE '\(#[0-9]+\)[[:space:]]*$' | grep -oE '[0-9]+')"
+  [ -n "$_op_n" ] || _op_n="$(printf '%s\n' "$_op_subj" | grep -oE '#[0-9]+' | sed -n '1p' | tr -d '#')"
+  printf '%s' "$_op_n"
+}
 
 # _main_health_worker <sha> <dispatch-file> <log-file> — the ASYNC main-health suite, run in the
 # BACKGROUND by main_health_tick so a post-merge heavy suite (the LONGEST the watcher runs) never blocks
@@ -4249,11 +4591,64 @@ _main_health_worker() {
 _main_health_clear() {
   local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0
   [ -s "$MAIN_HEALTH_STATE" ] && _mc_wasred=1
-  rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  rm -f "$MAIN_HEALTH_STATE" "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
   if [ "$_mc_wasred" -eq 1 ]; then
     herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
   fi
+}
+
+# _main_health_honest_identity <detail> <identity> — true iff this red names something a human (or a
+# scribe item) can act on. The floor the AUTOFIX path must clear before it files work:
+#   • a TAP 'not ok' line, or an identity that resolved to concrete test/source FILE tokens → honest;
+#   • healthcheck.sh's content-free classifier banner ("❌ CODE ERROR"), a PASS-marked line that slipped
+#     through, or an empty identity → NOT honest: filing "fix ❌ CODE ERROR" is the exact cry-wolf this
+#     item exists to remove, so we stay silent and leave the loud console row to a human.
+#
+# The leak-guard test below is REDUNDANT with _collect_main_health, which already routes a genuine trip to
+# an infra_event and so never reaches _main_health_set_red. It stays on purpose: this predicate is what
+# stands between an infra transient and a tracker write, and _main_health_set_red is a seam any future
+# caller may reach from a path that has not classified the detail. The check is a string match on one
+# line — the cost of keeping the guarantee local is nil, and the cost of it being someone else's job is a
+# spurious item filed against a control-room hiccup.
+_main_health_honest_identity() {
+  local _hi_detail="${1:-}" _hi_id="${2:-}"
+  [ -n "$_hi_id" ] || return 1
+  printf '%s\n' "$_hi_id" | grep -qiE "$_HFD_PASS_RE" 2>/dev/null && return 1
+  _health_is_leak_guard_detail "$_hi_detail" && return 1
+  printf '%s\n' "$_hi_detail" | grep -qE '^[[:space:]]*not ok( |$)' 2>/dev/null && return 0
+  printf '%s\n' "$_hi_id" | grep -qE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null
+}
+
+# _main_health_scribe <text> — the ENQUEUE edge of the autofix path, isolated in one function so a test
+# can spy on it without spawning a real drainer. Best-effort by construction: an alarm never fails a tick.
+_main_health_scribe() { bash "$HERE/scribe.sh" "$1" >/dev/null 2>&1 || true; }
+
+# _main_health_autofix <pr#> <sha> <identity> <detail> — MAIN_HEALTH_AUTOFIX (default off, ship-dormant).
+# On a REPRODUCED red whose identity is honest, enqueue ONE scribe item citing the failing test and
+# journal that we did. Scoped DELIBERATELY narrow for this increment: it FILES work, it never spawns a
+# builder — an agent that fixes main unattended is a separate, riskier decision.
+#
+# Enqueued at most once per distinct failing identity while main is red ($MAIN_HEALTH_FIX_STATE, dropped
+# by _main_health_clear). So a RECHECK that reproduces the SAME failure re-files nothing, while a red
+# that MUTATES into a different failing test files the new one. Fully fail-soft; always returns 0.
+_main_health_autofix() {
+  local _af_pr="$1" _af_sha="$2" _af_id="$3" _af_detail="$4" _af_prev
+  _main_health_autofix_enabled || return 0
+  if ! _main_health_honest_identity "$_af_detail" "$_af_id"; then
+    journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" result skipped reason dishonest-identity
+    return 0
+  fi
+  _af_prev="$(cat "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true)"
+  [ "$_af_prev" = "$_af_id" ] && return 0                  # already filed for this failure — never re-file
+  printf '%s\n' "$_af_id" > "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true
+  # First line is the tracker TITLE (the backend takes it verbatim) — keep it short; body carries context.
+  _main_health_scribe "MAIN RED: fix ${_af_id}
+The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
+Failing test: ${_af_detail}
+Add a 🔜 item to fix it. Do not close it until main-health goes green."
+  journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result enqueued
+  return 0
 }
 
 # _main_health_set_red <pr#> <sha> <healthcheck-oneline> — a main sha REPRODUCED a red. Persist the
@@ -4275,44 +4670,178 @@ _main_health_set_red() {
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_fail} (since #${_sr_since})" default
   fi
+  _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_fail" "$_sr_out"
 }
 
-# main_health_tick <pr#> — the post-merge hook (called from do_merge). DISPATCHES the main-health suite
-# ASYNCHRONOUSLY: it backgrounds the heavy suite (_main_health_worker) holding a HEALTH_CONCURRENCY slot,
-# and returns immediately so the merge tick NEVER blocks on a ~9-min suite (the .health-inflight-main-<sha>
-# = watcher pid freeze). The outcome is COLLECTED on a later tick by _collect_main_health, which routes
-# it to _main_health_clear / _main_health_set_red. Sha-keyed run-once; byte-inert when disabled; ALWAYS
-# returns 0 (an alarm can never fail a merge).
-main_health_tick() {
-  _main_health_enabled || return 0
-  local _mh_pr="${1:-}" _mh_sha _mh_marker _mh_key _mh_inflight _mh_disp _mh_wpid
-  _mh_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
-  [ -n "$_mh_sha" ] || { journal_append main_health pr "$_mh_pr" result infra_event reason no-head; return 0; }
-  _mh_marker="$(_main_health_marker "$_mh_sha")"
-  [ -e "$_mh_marker" ] && return 0                        # this main sha already ticked — run ONCE
+# _main_health_defer <pr#> <sha> <reason> — journal a DEFERRAL (no slot, no bin) at most once per
+# (sha, reason). The reconciler re-attempts a deferred sha EVERY tick, so an unguarded journal_append
+# here would write the same "no-slot" line every ~90s for as long as a long gate holds the slot. The memo
+# collapses that run into one honest line, and re-arms the moment the sha or the reason changes.
+_main_health_defer() {
+  local _md_pr="$1" _md_sha="$2" _md_reason="$3" _md_line _md_prev
+  _md_line="$_md_sha $_md_reason"
+  _md_prev="$(cat "$MAIN_HEALTH_DEFER" 2>/dev/null || true)"
+  printf '%s\n' "$_md_line" > "$MAIN_HEALTH_DEFER" 2>/dev/null || true
+  [ "$_md_prev" = "$_md_line" ] && return 0
+  journal_append main_health pr "$_md_pr" sha "$_md_sha" result infra_event reason "$_md_reason"
+  return 0
+}
+
+# _main_health_dispatch <pr#> <sha> <provenance> — the SHARED dispatch seam behind both the do_merge fast
+# path (provenance=merge) and the tick-level reconciler (observed-sha | recheck | died). Backgrounds the
+# heavy suite (_main_health_worker) holding a HEALTH_CONCURRENCY slot and returns immediately, so a tick
+# NEVER blocks on a ~9-min suite (the .health-inflight-main-<sha> marker carries the WORKER's pid, so a
+# corpse sweep can free the slot if it dies). The outcome is COLLECTED on a later tick by
+# _collect_main_health, which routes it to _main_health_clear / _main_health_set_red.
+#
+# Assumes the caller already decided this sha WANTS a run; the idempotency guards below make a redundant
+# call a silent no-op.
+#
+# RETURN CODE IS LOAD-BEARING (review BLOCK, round 1): 0 iff a worker was ACTUALLY BACKGROUNDED for this
+# sha; 1 for every no-op — already in flight, result pending collection, no free HEALTH_CONCURRENCY slot,
+# no healthcheck bin. A caller that spends a BUDGET (the died-worker retry counter) or DROPS STATE (the
+# recheck path's run-once marker) must key that on a real dispatch, never on having called this. Charging
+# a tick that merely DEFERRED would let slot contention — HEALTH_CONCURRENCY defaults to 1 and is shared
+# with every per-PR gate suite, so "no slot" is the ROUTINE case — burn the death budget and mark a sha
+# whose suite never ran even once, silently abandoning the very invariant this file asserts. Never fails
+# a caller: no caller propagates this rc (an alarm can never fail a merge, nor a tick).
+_main_health_dispatch() {
+  local _mh_pr="${1:-}" _mh_sha="$2" _mh_prov="${3:-merge}" _mh_key _mh_inflight _mh_disp _mh_wpid _mh_log
   _mh_key="main-$_mh_sha"
   _mh_inflight="$(_health_inflight_file "$_mh_key")"
   _mh_disp="$(_health_dispatch_file "$_mh_key")"
   # Idempotent dispatch: a live worker for this sha, or a result already pending collection, means this
-  # sha is handled — never double-dispatch (a re-entrant merge tick / restart re-enters here).
-  { [ -f "$_mh_inflight" ] && _health_pid_live "$_mh_inflight"; } && return 0
-  [ -f "$_mh_disp" ] && return 0
+  # sha is handled — never double-dispatch (a re-entrant merge tick / restart / the reconciler landing on
+  # the very sha do_merge just dispatched all re-enter here).
+  { [ -f "$_mh_inflight" ] && _health_pid_live "$_mh_inflight"; } && return 1
+  [ -f "$_mh_disp" ] && return 1
   # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared slot cap (all
   # worktrees + $MAIN share one git object store, so overlapping suites race on .git locks and paint
-  # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so a later
-  # merge tick re-attempts it; never run an overlapping suite.
-  _health_slot_free || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-slot; return 0; }
-  [ -f "$HERD_HEALTHCHECK_BIN" ] || { journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result infra_event reason no-bin; return 0; }
-  # Background the heavy suite STREAMING to the tailable log; write the restart-safe inflight marker with
-  # the WORKER'S pid so a corpse sweep can free the slot if it dies, and record the merging pr# for the
-  # collector.
-  local _mh_log; _mh_log="$(_health_log_file "$_mh_key")"
+  # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so the NEXT TICK
+  # re-attempts it (pre-HERD-222 this waited for the next MERGE); never run an overlapping suite.
+  _health_slot_free || { _main_health_defer "$_mh_pr" "$_mh_sha" no-slot; return 1; }
+  [ -f "$HERD_HEALTHCHECK_BIN" ] || { _main_health_defer "$_mh_pr" "$_mh_sha" no-bin; return 1; }
+  rm -f "$MAIN_HEALTH_DEFER" 2>/dev/null || true            # dispatched — re-arm the deferral journal
+  # Background the heavy suite STREAMING to the tailable log; record the pr# for the collector.
+  _mh_log="$(_health_log_file "$_mh_key")"
   ( _main_health_worker "$_mh_sha" "$_mh_disp" "$_mh_log" ) &
   _mh_wpid="$!"
   _marker_write "$_mh_inflight" "$_mh_wpid"
   _rotate_health_logs
   printf '%s\n' "$_mh_pr" > "$(_main_health_pr_file "$_mh_sha")" 2>/dev/null || true
-  journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" log_path "$_mh_log"
+  journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" \
+    log_path "$_mh_log" provenance "$_mh_prov"
+  return 0
+}
+
+# main_health_tick <pr#> — the post-merge FAST PATH (called from do_merge): dispatch the suite for the
+# sha this seat just fast-forwarded to, so the verdict lands a tick earlier than the reconciler would
+# find it. Sha-keyed run-once; byte-inert when disabled; ALWAYS returns 0.
+#
+# Since HERD-222 this call is redundant-but-harmless: reconcile_main_health would dispatch the very same
+# sha on the next tick, and the marker + inflight guards make whichever runs second a no-op. It stays
+# because latency on the seat that DID merge is free, and it is the one path with a real pr# in hand.
+main_health_tick() {
+  _main_health_enabled || return 0
+  local _mt_pr="${1:-}" _mt_sha
+  _mt_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_mt_sha" ] || { journal_append main_health pr "$_mt_pr" result infra_event reason no-head; return 0; }
+  [ -e "$(_main_health_marker "$_mt_sha")" ] && return 0    # this main sha already ticked — run ONCE
+  _main_health_dispatch "$_mt_pr" "$_mt_sha" merge
+  return 0
+}
+
+# _main_health_died <sha> — true iff a worker was dispatched for this sha and is GONE without a verdict:
+# the pr# sidecar (written only at dispatch) survives, but there is no live worker, no pending result,
+# and no run-once marker. That is precisely the state _sweep_gate_corpses leaves behind when it reaps a
+# killed worker (`health_died`) — pre-HERD-222 the sha was then stranded forever.
+_main_health_died() {
+  [ -f "$(_main_health_pr_file "$1")" ] || return 1
+  [ -e "$(_main_health_marker "$1")" ] && return 1
+  [ -f "$(_health_dispatch_file "main-$1")" ] && return 1
+  local _mdd_inflight; _mdd_inflight="$(_health_inflight_file "main-$1")"
+  { [ -f "$_mdd_inflight" ] && _health_pid_live "$_mdd_inflight"; } && return 1
+  return 0
+}
+
+# _main_health_file_age_mins <file> — whole minutes since <file> was last written; -1 when its mtime is
+# unreadable (file_mtime echoes 0), so an unstattable marker can never read as "infinitely old" and
+# re-dispatch every tick. file_mtime is defined further down the file; this only ever runs from the tick.
+_main_health_file_age_mins() {
+  local _fa_mt _fa_now
+  _fa_mt="$(file_mtime "$1" 2>/dev/null || printf 0)"
+  case "${_fa_mt:-0}" in ''|0|*[!0-9]*) printf -- '-1'; return 0 ;; esac
+  _fa_now="$(_now_epoch)"
+  [ "$_fa_now" -ge "$_fa_mt" ] 2>/dev/null || { printf -- '-1'; return 0; }
+  printf '%s' "$(( (_fa_now - _fa_mt) / 60 ))"
+}
+
+# reconcile_main_health — the HERD-222 tick-level invariant: EVERY observed main sha ends with a
+# collected health verdict, no matter who merged it. Call once per tick, AFTER reconcile_main_freshness
+# (so $MAIN's HEAD is the real default-branch HEAD, not a stale checkout). Safe to call repeatedly.
+#
+#   • no marker for HEAD  → dispatch (provenance observed-sha). This is the cross-seat merge, the
+#     no-slot deferral, and the watcher restart, all healed by the same rule.
+#   • no marker, and the sha's worker DIED before collect → dispatch (provenance died), bounded by
+#     _MAIN_HEALTH_DIED_MAX so a worker that dies every time surfaces as an infra_event, not a suite loop.
+#   • marker present + main RED + MAIN_HEALTH_RECHECK_MINS elapsed → drop the marker and RE-VERIFY the
+#     current sha. A red that is stale (already fixed, or never real) then clears itself through the
+#     ordinary green path; a red that is real is simply re-confirmed.
+#
+# HARD INVARIANTS: byte-inert when MAIN_HEALTH_TICK is off; byte-identical to the pre-HERD-222 engine
+# when MAIN_HEALTH_RECHECK_MINS is 0 (a marked, non-red-rechecking sha does nothing); fail-soft
+# throughout — a tick is never failed by an alarm.
+reconcile_main_health() {
+  _main_health_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  local _rm_sha _rm_marker _rm_pr _rm_mins _rm_age _rm_n
+  _rm_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_rm_sha" ] || return 0                             # no HEAD to observe — silent, retried next tick
+  _rm_marker="$(_main_health_marker "$_rm_sha")"
+
+  if [ ! -e "$_rm_marker" ]; then
+    if _main_health_died "$_rm_sha"; then
+      _rm_pr="$(cat "$(_main_health_pr_file "$_rm_sha")" 2>/dev/null || true)"; [ -n "$_rm_pr" ] || _rm_pr="?"
+      _rm_n="$(cat "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || printf 0)"
+      case "$_rm_n" in ''|*[!0-9]*) _rm_n=0 ;; esac
+      if [ "$_rm_n" -ge "$_MAIN_HEALTH_DIED_MAX" ]; then
+        : > "$_rm_marker" 2>/dev/null || true               # stop the loop: this sha gets no verdict
+        journal_append main_health pr "$_rm_pr" sha "$_rm_sha" result infra_event reason died-cap deaths "$_rm_n"
+        rm -f "$(_main_health_pr_file "$_rm_sha")" "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || true
+        return 0
+      fi
+      # CHARGE THE BUDGET ONLY ON A REAL DISPATCH. The counter counts DEATHS, not ticks: a tick that
+      # merely deferred (the shared health slot was busy — the routine case at HEALTH_CONCURRENCY=1) ran
+      # no suite, so it must not spend a death. Charging it would let three slot-contended ticks reach
+      # the cap, mark the sha run-once, and permanently strand a sha whose suite never ran once.
+      if _main_health_dispatch "$_rm_pr" "$_rm_sha" died; then
+        printf '%s\n' "$(( _rm_n + 1 ))" > "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || true
+      fi
+      return 0
+    fi
+    _rm_pr="$(_main_health_observed_pr "$_rm_sha")"; [ -n "$_rm_pr" ] || _rm_pr="?"
+    _main_health_dispatch "$_rm_pr" "$_rm_sha" observed-sha    # a deferral simply retries next tick
+    return 0
+  fi
+
+  # This sha already has a verdict. The ONLY reason to run it again is a standing RED we are asked to
+  # re-verify on a cadence — everything else is a no-op (and, with the lever off, byte-identical).
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0
+  _rm_mins="$(_main_health_recheck_mins)"
+  [ "$_rm_mins" -gt 0 ] 2>/dev/null || return 0
+  _rm_age="$(_main_health_file_age_mins "$_rm_marker")"     # marker mtime = when this sha was last collected
+  case "$_rm_age" in ''|-*|*[!0-9]*) return 0 ;; esac
+  [ "$_rm_age" -ge "$_rm_mins" ] || return 0
+  _rm_pr="$(_main_health_observed_pr "$_rm_sha")"; [ -n "$_rm_pr" ] || _rm_pr="?"
+  # DISPATCH FIRST, THEN drop the run-once marker — never the reverse. The marker is this sha's ONLY
+  # record that it has a verdict; dropping it ahead of a dispatch that then defers (busy slot) would
+  # leave the sha unmarked while $MAIN_HEALTH_STATE still renders its old verdict. It self-heals next
+  # tick via the observed-sha branch, but the honest ordering is to spend nothing until the suite is
+  # actually running. The collector rewrites the marker (and its mtime, which IS the cadence clock).
+  if _main_health_dispatch "$_rm_pr" "$_rm_sha" recheck; then
+    rm -f "$_rm_marker" 2>/dev/null || true
+    journal_append main_health pr "$_rm_pr" sha "$_rm_sha" result recheck age_mins "$_rm_age"
+  fi
   return 0
 }
 
@@ -4339,7 +4868,8 @@ _collect_main_health() {
          fi ;;
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
-    rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" 2>/dev/null || true
+    rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
+          "$(_main_health_retry_file "$_cm_sha")" 2>/dev/null || true
   done
 }
 
@@ -4381,10 +4911,22 @@ do_merge() {
   # worktree). Treating ANY non-zero as "sha moved" skipped every post-merge hook while the PR was
   # already MERGED. On non-zero, re-check the PR's actual state: MERGED → treat as success and run
   # ALL post-merge hooks; only a NOT-merged PR is a real refusal that returns 1 and skips hooks.
+  #
+  # HERD-232 (audit G6, honest labels): the re-check itself can fail. `gh pr view` returning nothing —
+  # a network blip, rate limit, auth expiry — is NOT evidence the head moved, and journaling
+  # `merge_refused_sha_moved` for it sends a post-mortem hunting a phantom force-push. Distinguish the
+  # two: an EMPTY state is a gh outage (`merge_gh_unreadable`), a readable non-MERGED state is a real
+  # refusal. Both still return 1 and skip the hooks — the PR is re-gated next tick either way, and the
+  # post-merge reconcile sweep is the backstop if it turns out the merge did land.
   if [ -n "$dsha" ]; then
     if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
-      if [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" != "MERGED" ]; then
-        journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+      _dm_state="$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null || true)"
+      if [ "$_dm_state" != "MERGED" ]; then
+        if [ -n "$_dm_state" ]; then
+          journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha" state "$_dm_state"
+        else
+          journal_append merge_gh_unreadable pr "$dp" slug "$ds" sha "$dsha"
+        fi
         return 1
       fi
     fi
@@ -4985,6 +5527,392 @@ _sweep_tracker_state() {
     bash "$HERE/tracker-state-sweep.sh" >/dev/null 2>&1 || true
 }
 
+# ── Post-merge hooks as a RECONCILED SWEEP (HERD-232) ─────────────────────────────────────────────
+# GROUNDED (docs/audits/2026-07-09-gating-hardening.md, incidents 1 + 12 → N6): every post-merge hook
+# was merge-EVENT-driven — it ran only inside the do_merge of the seat that landed the PR. Two ways
+# that loses:
+#   • CRASH: 17 MERGED PRs skipped every hook when do_merge misread gh's exit (HERD-221 fixed the
+#     trigger, not the residue), and a watcher killed between the merge and the reap never retries —
+#     the merge row is already written, so the next tick sees "handled".
+#   • FOREIGN MERGE: another seat's watcher, or a human clicking Merge in the gh UI, runs ITS hooks
+#     (or none). OUR seat's $STATE row, approval/CI ledger purges, cost capture and worktree teardown
+#     simply never happen. Only worktree teardown had any resume path at all (_startup_reap_sweep),
+#     and only at startup.
+#
+# THE FIX IS THE DOCTRINE (docs/multi-seat-doctrine.md R1, the seam HERD-218/HERD-233 established for
+# codemap + $MAIN freshness): stop treating a hook as a side-effect of OUR merge event and start
+# treating "this merged PR's obligations are discharged" as an INVARIANT re-derived from the world.
+# Each cadence pass enumerates recently-MERGED PRs, asks of each which obligations are OUTSTANDING,
+# and runs exactly those, idempotently.
+#
+# OBLIGATIONS PROBED (each is a cheap local-ledger read; each runner is the SAME idempotent primitive
+# do_merge calls, so a reconciled PR is indistinguishable from a locally-merged one):
+#   state_row  — the $STATE merge row (drives already_merged + the "recently landed" console row)
+#   reconcile  — the backlog/tracker link (reconcile_backlog; itself pr+sha-ledgered)
+#   approvals  — phantom "awaiting approval" rows for a terminal PR (purge_pr_approvals)
+#   ci_checks  — the PR's terminal CI gate-event rows (purge_pr_ci_checks)
+#   cost       — builder token/cost accounting, ONLY where a transcript ledger still exists
+#   reap       — worktree + tabs teardown (_reap_slug), under the same sha anchor _startup_reap_sweep
+#                uses: reap ONLY when the worktree's HEAD is exactly the merged PR's headRefOid
+#
+# DELIBERATELY NOT REPLAYED — four of do_merge's hooks are someone else's invariant, or unsafe to
+# replay for a merge we did not perform:
+#   tracker mark-done      — _sweep_tracker_state already re-asserts Done for every recently-merged PR
+#                            carrying a `Refs:` line, on this same cadence, seat-agnostically. Running
+#                            it here would double-write the tracker; instead we DEFER to its ledger as
+#                            evidence (see _pms_reconcile_handled).
+#   codemap / symbol-index — reconcile_map_freshness (HERD-218) already re-derives both per tick,
+#                            independent of any merge event. That is the same fix, one layer up.
+#   main-health tick       — its own tick-level invariant (audit A1 → HERD-222), keyed on $MAIN's HEAD,
+#                            not on a PR.
+#   post-merge steps.tsv   — operator-defined side effects (deploy, notify, publish). A foreign seat
+#                            that merged the PR has ALREADY run its own copy of them; re-running them
+#                            here would fire an external, possibly irreversible action twice. Replaying
+#                            an operator's side effects needs the cross-seat evidence substrate (audit
+#                            N8) before it can be safe, so this sweep never touches them.
+#
+# MULTI-SEAT SAFETY — a foreign-seat merge gets OUR seat's obligations ONLY. Every obligation above
+# except `reconcile` writes a $TREES-local ledger or tears down a worktree this seat owns, so it is
+# unobservable to another seat and safe to run unconditionally. `reconcile` is the one hook with a
+# SHARED side effect (a tracker state write, or a scribe enqueue that edits BACKLOG.md), so it is
+# gated on evidence that it is already handled.
+#
+# BE PRECISE ABOUT WHAT THAT BUYS (review note): every evidence source _pms_reconcile_handled consults
+# — $RECONCILE_STATE, this seat's journal, $TRACKER_SWEEP_LEDGER — lives under THIS seat's $TREES. So
+# the defer reliably suppresses OUR OWN re-work (a restart, a rotated ledger, a second pass), and it
+# suppresses cross-seat re-work only insofar as our tracker sweep has already observed the item Done.
+# Against a genuinely separate seat with its own $TREES the defer may simply not fire, and
+# reconcile_backlog runs a second time. That is SAFE, not correct-by-construction: _reconcile_via_ref
+# reports NOCHANGE on an already-Done item, and the fuzzy scribe request only ever matches a 🔜/🚧
+# item, so it no-ops on one already marked ✅. Both paths converge; neither corrupts. A real
+# cross-seat guarantee needs the shared per-PR comment/status substrate (audit item N8's spike);
+# when it lands, _pms_reconcile_handled is the ONE place to teach it a new evidence source.
+#
+# CONVENTIONS: fail-soft (a gh error skips the pass entirely and quietly — never a false red, never a
+# partial reconcile off a truncated PR list); idempotent (record-first, run-once keyed by pr+sha);
+# bounded lookback; NO new config key — the cadence and window are engine constants.
+_PMS_LOOKBACK=30            # recently-MERGED PRs probed per pass (bounded window, one gh call)
+_PMS_LEDGER_KEEP=400        # run-once rows retained (review: the ledger only ever grew). Far above the
+                            # lookback, so trimming can never drop a row for a PR still in the window —
+                            # and a dropped row costs at most one idempotent re-probe, never an action.
+
+# _pms_swept <pr#> <sha> — true iff this exact merged (pr,sha) had every obligation discharged by a
+# previous pass. The run-once key. Sha-keyed as well as pr-keyed so a (pathological) force-push onto a
+# merged PR's head re-opens the probe rather than being silently skipped forever.
+_pms_swept() {
+  [ -s "$POSTMERGE_SWEPT_LEDGER" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{f=1} END{exit !f}' "$POSTMERGE_SWEPT_LEDGER" 2>/dev/null
+}
+
+# _pms_record <pr#> <sha> — mark this merged PR fully reconciled. Called ONLY when nothing was left
+# outstanding; a pass that deliberately deferred a reap (live/dirty worktree) does NOT record, so the
+# next pass retries. Fail-soft: an unwritable ledger just re-probes next pass (all runners are no-ops).
+# Trimmed on write to the last _PMS_LEDGER_KEEP rows — the sibling PR-keyed ledgers are purged at merge,
+# but this one is keyed by a PR that is already gone, so nothing else would ever bound it.
+_pms_record() {
+  printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$POSTMERGE_SWEPT_LEDGER" 2>/dev/null || true
+  _pms_trim_ledger "$POSTMERGE_SWEPT_LEDGER"
+}
+
+# _pms_trim_ledger <file> — keep only the last _PMS_LEDGER_KEEP lines. Atomic rewrite, fully fail-soft:
+# a failed trim leaves the ledger correct (just longer), never truncated.
+_pms_trim_ledger() {
+  local _pmt_f="$1" _pmt_n _pmt_tmp
+  [ -s "$_pmt_f" ] || return 0
+  _pmt_n="$(wc -l < "$_pmt_f" 2>/dev/null | tr -cd '0-9')"; _pmt_n="${_pmt_n:-0}"
+  [ "$_pmt_n" -gt "$_PMS_LEDGER_KEEP" ] 2>/dev/null || return 0
+  _pmt_tmp="$(mktemp "$_pmt_f.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n "$_PMS_LEDGER_KEEP" "$_pmt_f" > "$_pmt_tmp" 2>/dev/null; then
+    mv -f "$_pmt_tmp" "$_pmt_f" 2>/dev/null || rm -f "$_pmt_tmp"
+  else
+    rm -f "$_pmt_tmp"
+  fi
+}
+
+# _pms_noted / _pms_note <pr#> <sha> <kind> — a NOTE-ONCE ledger for the journal lines a DEFERRED PR
+# would otherwise re-emit forever. A permanently dirty worktree (or a stray non-repo $TREES/<slug>
+# directory) never earns its run-once row by design — the reap must keep retrying — but the operator
+# does not need `postmerge_reap_skip` every ~3 min until someone cleans it up. _startup_reap_sweep
+# journals its skip once per run; this gives the cadence sweep the same manners: the CONDITION is
+# re-evaluated every pass, only the NOTIFICATION is once per (pr,sha,kind).
+_pms_noted() {
+  [ -s "$POSTMERGE_NOTED_LEDGER" ] || return 1
+  grep -qxF "$1 $2 $3" "$POSTMERGE_NOTED_LEDGER" 2>/dev/null
+}
+_pms_note() {
+  printf '%s %s %s\n' "$1" "$2" "$3" >> "$POSTMERGE_NOTED_LEDGER" 2>/dev/null || true
+  _pms_trim_ledger "$POSTMERGE_NOTED_LEDGER"
+}
+
+# _pms_state_row <pr#> — true iff the merge ledger already carries a row for this PR. Deliberately
+# PR-keyed only (unlike already_merged, which also matches the slug): a foreign PR's branch may not
+# fit BRANCH_TEMPLATE at all, and the question here is "did this seat record the merge", not "for
+# which slug". Row format: "<epoch> <pr#> <slug> [ref]".
+_pms_state_row() {
+  [ -s "$STATE" ] || return 1
+  awk -v p="$1" 'NF>=3 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null
+}
+
+# _pms_approvals_rows <pr#> / _pms_ci_rows <pr#> — true iff the PR still has ledger residue to purge.
+# Field positions mirror purge_pr_approvals ("<epoch> <state> <pr#> <sha>") and purge_pr_ci_checks
+# ("<pr#> <sha> <conclusion> <check…>"), so the probe and the purge can never disagree about the key.
+_pms_approvals_rows() {
+  [ -s "$APPROVALS" ] || return 1
+  awk -v p="$1" '$3==p{f=1} END{exit !f}' "$APPROVALS" 2>/dev/null
+}
+_pms_ci_rows() {
+  [ -s "$CI_CHECKS_STATE" ] || return 1
+  awk -v p="$1" '$1==p{f=1} END{exit !f}' "$CI_CHECKS_STATE" 2>/dev/null
+}
+
+# _pms_journal_has <event> <pr#> — true iff the engine journal already carries <event> for this PR.
+# journal.sh emits compact JSON with the keys in CALL order, so `pr` is NOT always the first key: the
+# reconcile hook journals `reconcile pr <n> …` but cost.sh journals `cost component <c> pr <n> …`. So
+# match the event and the pr INDEPENDENTLY on the same line rather than as an adjacent pair — an
+# anchored `"event":"X","pr":N` silently never matches `cost`, which is exactly the guard that must
+# not fail open (a false negative re-emits a cost event and inflates the day's spend).
+# Fail-soft: no journal destination (the HERD-223 test guard) or an unreadable file reads as "no
+# evidence" — the caller then does the work, which is always idempotent except for `cost`, whose own
+# transcript-dir probe bounds it.
+_pms_journal_has() {
+  type _journal_file >/dev/null 2>&1 || return 1
+  local _pmj_f; _pmj_f="$(_journal_file 2>/dev/null || true)"
+  [ -n "$_pmj_f" ] && [ -s "$_pmj_f" ] || return 1
+  grep -F "\"event\":\"$1\"" "$_pmj_f" 2>/dev/null | grep -qE "\"pr\":$2[,}]"
+}
+
+# _pms_tracker_ledgered <ref> — true iff the tracker-state sweep has already CONFIRMED this ref Done
+# (ledger row "<epoch> <ref> <pr#>"). That sweep scans every recently-merged PR regardless of which
+# seat merged it, so a hit here means the tracker obligation is discharged no matter who discharged it.
+_pms_tracker_ledgered() {
+  [ -n "${1:-}" ] || return 1
+  [ -s "$TRACKER_SWEEP_LEDGER" ] || return 1
+  awk -v r="$1" '$2==r{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
+}
+
+# _pms_reconcile_handled <pr#> <sha> — the DEFER predicate for the one hook with a shared side effect.
+# Prints the evidence kind on stdout and returns 0 when the backlog/tracker link is already handled:
+#   ledger        — this seat enqueued/resolved it (reconcile_backlog's own pr+sha guard)
+#   journal       — this seat journaled a `reconcile` for the PR (a ledger lost to rotation/repair)
+#   tracker-swept — the tracker sweep confirmed the PR's `Refs:` item Done (whoever marked it)
+# Returns 1 (with no output) when nothing has handled it, i.e. WE must. The `Refs:` read is the only
+# per-PR network call this sweep makes, and it happens at most once per merged PR: the moment we run
+# reconcile_backlog it ledgers pr+sha and this predicate short-circuits on the cheap local read.
+_pms_reconcile_handled() {
+  local _pmr_pr="$1" _pmr_sha="$2" _pmr_ref
+  reconcile_enqueued "$_pmr_pr" "$_pmr_sha" && { printf 'ledger'; return 0; }
+  _pms_journal_has reconcile "$_pmr_pr"     && { printf 'journal'; return 0; }
+  _pmr_ref="$(_reconcile_pr_ref "$_pmr_pr" 2>/dev/null || true)"
+  _pms_tracker_ledgered "$_pmr_ref"         && { printf 'tracker-swept'; return 0; }
+  return 1
+}
+
+# _pms_merged_prs — "<pr#>\t<headRefOid>\t<headRefName>\t<mergedAt-epoch>" per recently-merged PR,
+# OLDEST FIRST. ONE gh call per pass. A non-zero gh (offline, rate-limited, auth blip) prints NOTHING
+# and returns non-zero so the caller aborts the whole pass: an empty PR list is indistinguishable from
+# "gh is down", and reconciling off a truncated list is how a sweep silently skips obligations (the
+# HERD-206 lesson from _sweep_stale_resolve_tabs). Hermetic seam: HERD_PMS_PRS_JSON_FILE supplies raw
+# `gh pr list --json` output, bypassing the network exactly like tracker-state-sweep.sh's seam.
+#
+# ORDER + TIMESTAMP MATTER (review note). gh returns merged PRs newest-first, and `build_landed` renders
+# the LAST THREE $STATE rows in file order. A first catch-up pass on a seat whose $STATE predates this
+# feature appends up to _PMS_LOOKBACK rows at once — newest-first would therefore leave the OLDEST PRs
+# of the batch at the tail and render them as the three most recent landings. Sorting ascending by
+# mergedAt makes the appended run read in true merge order. And each row is stamped with the PR's REAL
+# mergedAt, not `date +%s`: a reconciled row must not claim a PR landed the moment we noticed it.
+_pms_merged_prs() {
+  local _pmp_json
+  if [ -n "${HERD_PMS_PRS_JSON_FILE:-}" ]; then
+    _pmp_json="$(cat "$HERD_PMS_PRS_JSON_FILE" 2>/dev/null)" || return 1
+  else
+    command -v gh >/dev/null 2>&1 || return 1
+    _pmp_json="$(gh pr list --state merged --limit "$_PMS_LOOKBACK" \
+      --json number,headRefOid,headRefName,mergedAt 2>/dev/null)" || return 1
+  fi
+  [ -n "$_pmp_json" ] || return 0
+  printf '%s' "$_pmp_json" | python3 -c '
+import sys, json, calendar, time
+try:
+    prs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+def epoch(s):
+    # gh emits RFC3339 UTC ("2026-07-09T18:46:53Z"). An unparseable/absent mergedAt falls back to
+    # "now" — the row is still honest about the merge having happened, just not about when.
+    try:
+        return calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return int(time.time())
+rows = []
+for pr in prs if isinstance(prs, list) else []:
+    num = pr.get("number"); oid = pr.get("headRefOid") or ""
+    if num is None or not oid:
+        continue
+    rows.append((epoch(pr.get("mergedAt")), num, oid, pr.get("headRefName") or ""))
+rows.sort(key=lambda r: r[0])          # OLDEST first — see the ORDER note above
+for ts, num, oid, branch in rows:
+    print("%s\t%s\t%s\t%s" % (num, oid, branch, ts))
+' 2>/dev/null || return 0
+}
+
+# _pms_reconcile_one <pr#> <sha> <branch> [merged-epoch] — probe ONE merged PR and discharge whatever
+# is outstanding. Returns 0 when the PR is fully reconciled (caller records the run-once row), 1 when an
+# obligation was deliberately left for a later pass (a worktree that is not provably disposable yet).
+_pms_reconcile_one() {
+  local _pm_pr="$1" _pm_sha="$2" _pm_branch="${3:-}" _pm_mts="${4:-}"
+  local _pm_slug="" _pm_dir="" _pm_missing="" _pm_defer="" _pm_retry=0
+  case "$_pm_mts" in ''|*[!0-9]*) _pm_mts="$(date +%s)" ;; esac
+
+  # SLUG, and whether the branch fits BRANCH_TEMPLATE at all. herd_branch_parse strips the template's
+  # literal prefix with `${var#prefix}`, which is a NO-OP when the prefix does not match — so a foreign
+  # branch like `chore/bump-deps` under `feat/{slug}` comes back verbatim, not empty (review note). A
+  # real slug is a single kebab path segment (it names a directory directly under $TREES), so a parse
+  # result that still carries a '/' provably did not fit the template: treat it as "no slug of ours",
+  # which keeps $TREES/<slug> from ever being probed for a branch we do not own.
+  [ -n "$_pm_branch" ] && _pm_slug="$(herd_branch_parse "$_pm_branch" 2>/dev/null || true)"
+  case "$_pm_slug" in ''|*/*) _pm_slug='-' ;; esac
+  [ "$_pm_slug" = '-' ] || _pm_dir="$TREES/$_pm_slug"
+
+  _pms_state_row "$_pm_pr" || _pm_missing="$_pm_missing state_row"
+
+  local _pm_ev=""
+  if _pm_ev="$(_pms_reconcile_handled "$_pm_pr" "$_pm_sha")"; then
+    # `ledger` is this seat's own guard doing its job — not a cross-seat deferral, and not worth a line.
+    [ "$_pm_ev" = ledger ] || _pm_defer="$_pm_ev"
+  else
+    _pm_missing="$_pm_missing reconcile"
+  fi
+
+  _pms_approvals_rows "$_pm_pr" && _pm_missing="$_pm_missing approvals"
+  _pms_ci_rows "$_pm_pr"        && _pm_missing="$_pm_missing ci_checks"
+
+  # Worktree obligations. The reap anchor is _startup_reap_sweep's: a worktree is disposable ONLY when
+  # its HEAD sha is exactly the merged PR's headRefOid, so every committed thing in it is already
+  # merged. A re-spawned slug (fresh commits, or none yet) and a dirty tree both fail that test and are
+  # left alone — and because we then skip the run-once row, the next pass re-probes rather than
+  # stranding the worktree forever.
+  #
+  # COST is probed by RESIDUE, like every other obligation — a transcript ledger that exists AND no
+  # `cost` event already journaled for this PR (review note). The transcript dir is NOT inside the
+  # worktree (_cost_transcript_dir munges the worktree PATH into $HOME/.claude/projects/<munged>), so
+  # it survives the reap: without the journal guard, a do_merge that emitted `cost` and then died
+  # before teardown would have its cost re-emitted here, and cost_day_total sums `cost` events
+  # unconditionally into budget_daily_exceeded. Cost still RUNS before the reap, matching do_merge.
+  if [ -n "$_pm_dir" ] && [ -d "$_pm_dir" ] && [ "$_pm_dir" != "${SELF_WT:-}" ] && [ "$_pm_dir" != "$MAIN" ]; then
+    local _pm_head; _pm_head="$(git -C "$_pm_dir" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$_pm_head" ] || [ "$_pm_head" != "$_pm_sha" ]; then
+      _pm_retry=1                                   # live / re-spawned slug — not this PR's worktree
+    elif [ -n "$(git -C "$_pm_dir" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)" ]; then
+      # Journal the hold ONCE per (pr,sha): the condition is re-checked every pass, but a permanently
+      # dirty tree must not re-notify every ~3 min (it never earns a run-once row, by design).
+      if ! _pms_noted "$_pm_pr" "$_pm_sha" reap_skip; then
+        journal_append postmerge_reap_skip pr "$_pm_pr" slug "$_pm_slug" reason dirty-worktree
+        _pms_note "$_pm_pr" "$_pm_sha" reap_skip
+      fi
+      _pm_retry=1                                   # never force-remove uncommitted work
+    else
+      local _pm_costdir=""
+      type _cost_transcript_dir >/dev/null 2>&1 && _pm_costdir="$(_cost_transcript_dir "$_pm_dir" 2>/dev/null || true)"
+      if [ -n "$_pm_costdir" ] && [ -d "$_pm_costdir" ] && ! _pms_journal_has cost "$_pm_pr"; then
+        _pm_missing="$_pm_missing cost"
+      fi
+      _pm_missing="$_pm_missing reap"
+    fi
+  fi
+
+  if [ -z "$_pm_missing" ]; then
+    _pms_defer_note "$_pm_pr" "$_pm_sha" "$_pm_slug" "$_pm_defer"
+    [ "$_pm_retry" -eq 0 ] && return 0 || return 1
+  fi
+
+  # ── RUN the outstanding hooks, in do_merge's order. Record-first: the $STATE row goes down before
+  #    anything that can die, so a crash here can never re-merge or double-reconcile this PR.
+  case " $_pm_missing " in
+    *' state_row '*)
+      # TRACKER REF: prefer the PR's OWN `Refs:` line over the per-worktree marker (review note). This
+      # inverts do_merge's order deliberately. do_merge runs inside the lane that owns the marker, so
+      # the two always agree; the sweep can be looking at an OLD merged PR whose slug has since been
+      # re-spawned, and `.herd-ref-<slug>` then holds the NEW lane's ref — attaching it to the old PR's
+      # landed row would credit the wrong tracker item. The PR body is the only source keyed to the PR.
+      local _pm_ref; _pm_ref="$(_reconcile_pr_ref "$_pm_pr" 2>/dev/null || true)"
+      [ -n "$_pm_ref" ] || _pm_ref="$(_slug_ref "$_pm_slug" 2>/dev/null || true)"
+      # Stamp the row with the PR's REAL mergedAt, not "now" — see _pms_merged_prs.
+      if [ -n "$_pm_ref" ]; then
+        printf '%s %s %s %s\n' "$_pm_mts" "$_pm_pr" "$_pm_slug" "$_pm_ref" >> "$STATE"
+      else
+        printf '%s %s %s\n' "$_pm_mts" "$_pm_pr" "$_pm_slug" >> "$STATE"
+      fi
+      # NOT a `merge` event (review BLOCK). In this engine `merge` is a CLAIM: journal-audit.sh rule (a)
+      # reads every `merge` as "this seat merged a PR and therefore owes a later `reap`". A reconciled
+      # merge frequently owes no reap at all — a gh-UI or collaborator merge has no worktree here, which
+      # is the very case this sweep exists to serve — so emitting `merge` would manufacture a permanent,
+      # unfixable `merge_without_reap` finding for exactly those PRs. `merge_observed` says the true
+      # thing: we OBSERVED a merge we did not perform, and `reap_owed` records whether a teardown is
+      # actually outstanding, so a future audit rule can assert the honest invariant
+      # (merge_observed[reap_owed=yes] ⇒ reap) without inventing an obligation we cannot discharge.
+      local _pm_owed=no
+      case " $_pm_missing " in *' reap '*) _pm_owed=yes ;; esac
+      journal_append merge_observed pr "$_pm_pr" slug "$_pm_slug" sha "$_pm_sha" \
+        reason reconcile reap_owed "$_pm_owed" ;;
+  esac
+  # Same order do_merge runs them in, so a reconciled tail is indistinguishable from a merged one.
+  case " $_pm_missing " in *' approvals '*) purge_pr_approvals "$_pm_pr" ;; esac
+  case " $_pm_missing " in *' ci_checks '*) purge_pr_ci_checks "$_pm_pr" ;; esac
+  case " $_pm_missing " in
+    *' cost '*) type cost_emit_merge >/dev/null 2>&1 && cost_emit_merge "$_pm_pr" "$_pm_slug" "$_pm_dir" ;;
+  esac
+  case " $_pm_missing " in *' reconcile '*) reconcile_backlog "$_pm_pr" "$_pm_slug" "$_pm_sha" ;; esac
+  case " $_pm_missing " in
+    *' reap '*) _reap_slug "$_pm_slug" "$_pm_dir" "$_pm_pr" "$_pm_sha" postmerge-sweep ;;   # last: it deletes $_pm_dir
+  esac
+
+  journal_append postmerge_reconciled pr "$_pm_pr" slug "$_pm_slug" sha "$_pm_sha" \
+    missing "$(printf '%s' "${_pm_missing# }" | tr ' ' ',')"
+  _pms_defer_note "$_pm_pr" "$_pm_sha" "$_pm_slug" "$_pm_defer"
+  [ "$_pm_retry" -eq 0 ] && return 0 || return 1
+}
+
+# _pms_defer_note <pr#> <sha> <slug> <evidence> — journal a cross-seat deferral of the shared reconcile
+# hook, ONCE per (pr,sha). A PR whose reap is deferred forever (dirty tree) is re-probed every pass, so
+# without the note-once ledger this line would repeat every ~3 min alongside postmerge_reap_skip.
+# No-op when there was nothing to defer.
+_pms_defer_note() {
+  local _pd_pr="$1" _pd_sha="$2" _pd_slug="$3" _pd_ev="${4:-}"
+  [ -n "$_pd_ev" ] || return 0
+  _pms_noted "$_pd_pr" "$_pd_sha" deferred && return 0
+  journal_append postmerge_deferred pr "$_pd_pr" slug "$_pd_slug" \
+    sha "$_pd_sha" obligations reconcile evidence "$_pd_ev"
+  _pms_note "$_pd_pr" "$_pd_sha" deferred
+}
+
+# _sweep_merged_prs — the HERD-232 cadence entry point. Called every _PMS_SWEEP_INTERVAL ticks from the
+# main loop. Steady state on a healthy seat: ONE `gh pr list`, then a run-once ledger hit per PR — zero
+# journal lines, zero writes, byte-inert. Inert in dry-run. Never merges, never touches another seat's
+# ledgers, never fails a tick.
+_sweep_merged_prs() {
+  [ -n "$DRYRUN" ] && return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local _pms_rows _pms_rc=0
+  _pms_rows="$(_pms_merged_prs)" || _pms_rc=$?
+  [ "$_pms_rc" -eq 0 ] || return 0          # gh unreadable → skip the pass quietly (never a partial sweep)
+  [ -n "$_pms_rows" ] || return 0
+  # Read on FD 3, not stdin (review note): the loop body invokes gh, git, scribe.sh and
+  # herd_teardown_slug, and any child that reads stdin would swallow the rest of the PR list and
+  # silently truncate the sweep. The heredoc stays bound to 3, so the body's children inherit the
+  # watcher's own stdin and can never consume it. The loop runs in the CURRENT shell (no pipe), so
+  # ledger appends and reaps performed in the body persist.
+  local _pms_pr _pms_sha _pms_branch _pms_mts
+  while IFS=$'\t' read -r _pms_pr _pms_sha _pms_branch _pms_mts <&3; do
+    [ -n "$_pms_pr" ] && [ -n "$_pms_sha" ] || continue
+    _pms_swept "$_pms_pr" "$_pms_sha" && continue
+    _pms_reconcile_one "$_pms_pr" "$_pms_sha" "$_pms_branch" "$_pms_mts" \
+      && _pms_record "$_pms_pr" "$_pms_sha"
+  done 3<<EOF
+$_pms_rows
+EOF
+  return 0
+}
+
 # _sweep_journal_audit — HERD-238 journal-driven self-audit (the gap-finder). Runs on the same
 # low-frequency housekeeping cadence as the tracker-state sweep. Shells out to the standalone
 # journal-audit.sh which replays a BOUNDED journal window for invariant violations (merge without
@@ -5264,7 +6192,7 @@ _refix_stalled_row() {
     esac
     _escalate_refix_stuck "$_rsr_pr" "$_rsr_sha" "$_rsr_slug" "$_rsr_kind" "$_rsr_reason"
   fi
-  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; stale) _rsr_what="stale base" ;; *) _rsr_what="review blocked" ;; esac
+  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; stale) _rsr_what="stale base" ;; ci) _rsr_what="CI red" ;; *) _rsr_what="review blocked" ;; esac
   printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_rsr_sl}${C_RESET}${_rsr_pn} ${C_RED}needs you · ${_rsr_what} · ${_rsr_kind} autofix stalled: ${_rsr_reason} · re-task by hand${C_RESET}"
 }
 
@@ -5598,6 +6526,187 @@ _stale_base_autofix_enabled() {
   esac
 }
 
+# ── CI auto-repair for INHERITED reds (HERD-250) ──────────────────────────────────────────────────
+# CI_AUTOREPAIR=on|off (default off, ship-dormant). When a PR is MERGEABLE but UNSTABLE with a FAILING
+# required CI check, herd/gates already PASSED for the head sha, AND the branch is BEHIND main, the
+# failure is almost certainly main's already-fixed bugs riding the branch (PR #353). A base-refresh
+# (merge $DEFAULT_BRANCH) picks them up — the SAME mechanical heal as STALE_BASE_AUTOFIX, but keyed
+# on CI-red+behind-base rather than touched-file overlap (which #353's diff never hit).
+#
+# NEVER silently merges a red PR. A REAL new-code CI failure (failing CI on an up-to-date branch, or
+# without a gates blessing) falls through to the existing needs-you row. OFF is byte-identical to the
+# pre-HERD-250 UNSTABLE-fail path. Journals `ci_repair` events. Kind=ci on the shared refix rails so
+# the CI rail budgets independently of review/health/stale.
+#
+# Decision predicates live in scripts/herd/ci-repair.sh (ci_autorepair_enabled / ci_repair_eligible);
+# this handler owns the bounce / resolver / row truth, mirroring _handle_stale_dup.
+
+# _handle_ci_repair <pr#> <slug> <headSha> <display-idx> <worktree-dir> <branch> <ci-summary>
+# Called when the classifier has a FAILING required CI check. Returns 0 if THIS handler set DISPLAY
+# (heal in progress, deferred, or needs-you after a spent budget); returns 1 if the caller should
+# paint the classic needs-you · CI-failed row (off / ineligible / dry-run).
+_handle_ci_repair() {
+  local _hcr_pr="$1" _hcr_slug="$2" _hcr_sha="$3" _hcr_idx="$4" _hcr_wt="${5:-}" \
+        _hcr_branch="${6:-}" _hcr_ci="${7:-}"
+  local _hcr_sl _hcr_pn _hcr_rounds _hcr_round_num _hcr_base _hcr_capmsg
+
+  # OFF / dry-run: byte-identical to pre-HERD-250 — caller paints needs-you, no ledger, no bounce.
+  if ! ci_autorepair_enabled || [ -n "${DRYRUN:-}" ]; then
+    return 1
+  fi
+
+  _hcr_base="${DEFAULT_BRANCH:-origin/main}"
+  # Not the inherited-red case (up-to-date / gates not green / probe fail) → real failure, needs-you.
+  if ! ci_repair_eligible "${_hcr_wt:-/}" "$_hcr_base" "$_hcr_sha"; then
+    return 1
+  fi
+
+  _hcr_sl="$(_slug_cell "$_hcr_slug")"
+  _hcr_pn=" ${C_DIM}#${_hcr_pr}${C_RESET} ·"
+
+  # LIMIT PREFLIGHT: never type into a usage-limit arrow-menu. Once-guard not burned.
+  if [ -n "$_hcr_wt" ]; then
+    local _hcr_lreset
+    if _hcr_lreset="$(_detect_limit_hit "$_hcr_slug" "$_hcr_wt")"; then
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result deferred reason limit reset_at "${_hcr_lreset:-0}"
+      _handle_limit_blocked "$_hcr_slug" "$_hcr_wt" "$_hcr_idx" "${_hcr_lreset:-0}"
+      return 0
+    fi
+  fi
+
+  _hcr_rounds="$(refix_rail_count "$_hcr_pr" ci)"
+  # Once-guard: already healed this sha → wait for the push / resolver finish.
+  if refix_attempted "$_hcr_pr" "$_hcr_sha" ci; then
+    local _hcr_note
+    if _hcr_note="$(_active_fix_note "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci)"; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}${_hcr_note/fix in progress/ci-repair rebasing}${C_RESET}"
+    elif _resolver_agent_alive "$_hcr_slug" 2>/dev/null; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · resolver working${C_RESET}"
+    else
+      DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+    fi
+    return 0
+  fi
+
+  # SELF-RESTART QUIESCE (HERD-251): drain toward re-exec — do not burn the once-guard.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · held (watcher restarting on new engine code)${C_RESET}"
+    return 0
+  fi
+
+  # SUITE WRITE INTERLOCK: a live health suite owns this worktree — defer without burning the guard.
+  _defer_for_suite "$_hcr_pr" "$_hcr_slug" "$_hcr_sha" "$_hcr_idx" ci "ci-repair" && return 0
+
+  # WORKING-AGENT GUARD: never spawn a resolver into a live builder's worktree.
+  if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+    return 0
+  fi
+
+  # Budget exhausted → needs-you (still handled here so the row names the CI rail).
+  if _hcr_capmsg="$(_refix_budget_reason "$_hcr_pr" ci)"; then
+    DISPLAY[_hcr_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · ${_hcr_capmsg} · CI still red · ${_hcr_ci}${C_RESET}"
+    if ! _refix_dead_seen "$_hcr_pr" "ci-cap-$_hcr_sha"; then
+      _record_refix_dead "$_hcr_pr" "ci-cap-$_hcr_sha"
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result escalated rounds "$_hcr_rounds" reason "${_hcr_capmsg} — CI still red after base-refresh attempts"
+      herd_driver_notify "⚠️ CI repair budget spent: ${_hcr_slug}" \
+        "PR #${_hcr_pr} CI still red after ${_hcr_rounds} base-refresh rounds — needs you" default
+    fi
+    return 0
+  fi
+
+  _hcr_round_num="$((_hcr_rounds + 1))"
+
+  # NO LIVE BUILDER → conflict resolver (same mechanical merge-base tool as stale-base heal).
+  if ! _stale_has_live_builder "$_hcr_slug"; then
+    if [ -z "$_hcr_wt" ] || [ ! -d "$_hcr_wt" ]; then
+      DISPLAY[_hcr_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · CI red (inherited?) + no builder/worktree — merge \`${_hcr_base}\` by hand · ${_hcr_ci}${C_RESET}"
+      if ! _refix_dead_seen "$_hcr_pr" "ci-nowt-$_hcr_sha"; then
+        _record_refix_dead "$_hcr_pr" "ci-nowt-$_hcr_sha"
+        journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+          result escalated reason "no live builder and no worktree — cannot auto-heal"
+        herd_driver_notify "🛑 CI red, no healer: ${_hcr_slug}" \
+          "PR #${_hcr_pr} has inherited-looking CI red but no builder/worktree — merge base by hand" default
+      fi
+      return 0
+    fi
+    if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+      return 0
+    fi
+    record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
+    DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair · resolver (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    render
+    journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+      result resolver round "$_hcr_round_num" reason "no live builder — dispatching conflict resolver to merge ${_hcr_base}" \
+      ci "${_hcr_ci}" detail "${_CI_REPAIR_REASON:-}"
+    _resolver_in_flight "$_hcr_slug" "$_hcr_pr" "$_hcr_sha" || spawn_resolver "$_hcr_slug" "$_hcr_pr" "${_hcr_branch:-$_hcr_slug}" "$_hcr_sha"
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    return 0
+  fi
+
+  # LIVE BUILDER → bounce with a mechanical merge-base re-task (inherited-red framing).
+  DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+  render
+  record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
+  local _hcr_before; _hcr_before="$(_agent_status "$_hcr_slug")"
+  journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+    result bounce round "$_hcr_round_num" agent_status_before "${_hcr_before:-unknown}" \
+    ci "${_hcr_ci}" detail "${_CI_REPAIR_REASON:-}"
+
+  local _hcr_pane_id _hcr_woke=0 _hcr_escalated=false _hcr_prompt
+  _hcr_prompt="PR #${_hcr_pr} is red on GitHub CI (${_hcr_ci:-required check failed}) but herd/gates PASSED and this branch is BEHIND ${_hcr_base}.
+This is almost certainly an INHERITED red — main already carries fixes for hermetic/suite failures that this branch still has because it predates those merges. Do NOT silently treat it as a defect in YOUR code first; refresh the base.
+MECHANICAL fix (not a judgment call). From your worktree:
+  git fetch ${HERD_REMOTE:-origin}
+  git merge ${_hcr_base}
+Resolve any conflicts PRESERVING both sides' intent, run the healthcheck, then push (normal push, NEVER force, NEVER push to the default branch).
+If CI is still red AFTER the base-refresh lands, that is a REAL new-code failure — fix the failing check, do not keep re-merging main.
+Why: ${_CI_REPAIR_REASON:-CI red + gates green + behind base}"
+  _hcr_pane_id="$(_find_builder_pane_id_any "$_hcr_slug")"
+  if [ -n "$_hcr_pane_id" ]; then
+    local _hcr_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+    herdr pane run "$_hcr_pane_id" "$_hcr_prompt" >/dev/null 2>&1 || true
+    if _wait_agent_working "$_hcr_slug" "$_hcr_wait"; then
+      _hcr_woke=1
+    else
+      herdr pane run "$_hcr_pane_id" "$_hcr_prompt" >/dev/null 2>&1 || true
+      if _wait_agent_working "$_hcr_slug" "$_hcr_wait"; then
+        _hcr_woke=1
+      else
+        _escalate_refix_stuck "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "the builder never woke (prompt delivered twice)"
+        DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+        _hcr_escalated=true
+      fi
+    fi
+  else
+    if [ -n "$_hcr_wt" ] && [ -d "$_hcr_wt" ]; then
+      if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+        DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+        return 0
+      fi
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result resolver round "$_hcr_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
+      _resolver_in_flight "$_hcr_slug" "$_hcr_pr" "$_hcr_sha" || spawn_resolver "$_hcr_slug" "$_hcr_pr" "${_hcr_branch:-$_hcr_slug}" "$_hcr_sha"
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    else
+      _escalate_refix_stuck "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "agent pane not found"
+      DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+      _hcr_escalated=true
+    fi
+  fi
+  if [ "$_hcr_woke" = "1" ] && [ "$_hcr_escalated" = "false" ]; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+  fi
+  local _hcr_after; _hcr_after="$(_agent_status "$_hcr_slug")"
+  journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+    result wake_result round "$_hcr_round_num" agent_status_before "${_hcr_before:-unknown}" \
+    agent_status_after "${_hcr_after:-unknown}" woke "$_hcr_woke" escalated "$_hcr_escalated"
+  return 0
+}
+
 # ── Auto-refix (healthcheck): bounce a reproduced CODE ERROR straight to the builder ───────────────
 # HEALTHCHECK_AUTOFIX=true|false (default false). The review gate already bounces a BLOCK verdict to the
 # builder (_handle_block_verdict); a reproduced healthcheck CODE ERROR is the same shape of finding —
@@ -5667,9 +6776,26 @@ _handle_stale_dup() {
     return 0
   fi
 
-  # OFF / dry-run: byte-identical to the pre-HERD-199 hold — no bounce, no ledger, no resolver.
+  # OFF / dry-run: no bounce, no ledger, no resolver — the rebase is somebody's to do by hand.
+  #
+  # ROW TRUTH (HERD-259): "somebody" is often the builder itself, and this row lied about it. Every
+  # sibling stale-base row consults agent activity before shouting for a human (_active_fix_note's
+  # clause (b), the working-agent guards on the heal paths) — but the OFF path, which is the SHIP
+  # DEFAULT and therefore the row most operators actually see, escalated unconditionally. An operator
+  # who context-switches into a rebase a live builder is already running is exactly the expensive lie
+  # HERD-173 set out to remove. Mirror the same POSITIVE-signal-only check: an agent reading `working`
+  # renders fix-in-progress; a blind/absent `herdr agent list` yields no positive signal and falls
+  # through to the honest needs-you. Same one-way strength as clause (b) — a needs-you row is
+  # trustworthy, a fix-in-progress row can be a busy agent doing something else, and the next idle tick
+  # corrects it. DUPLICATE never reaches here (it returned above): it is a judgment call, always human.
+  # Nothing but the rendered string changes — no dispatch, no ledger write, no refix round, on either
+  # branch — so an idle builder's row stays byte-identical to before.
   if ! _stale_base_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
-    DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}fix in progress · builder working · stale base held${C_RESET}"
+    else
+      DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    fi
     return 0
   fi
 
@@ -5704,6 +6830,21 @@ _handle_stale_dup() {
     fi
     return 0
   fi
+
+  # SELF-RESTART QUIESCE (HERD-251): the watcher is draining toward an in-place re-exec on new engine
+  # code — dispatch no heal. Placed HERE, among its sibling deferrals and ABOVE every `record_refix`,
+  # for the reason they all state: the once-guard is NOT burned and no refix round is spent, so the
+  # restarted watcher heals this sha on new code. Refusing further down (inside spawn_resolver) would
+  # refuse AFTER the caller had burned refix_attempted(pr,sha,stale) and journaled stale_refix_resolver
+  # — a dropped dispatch behind a spent guard, which no later tick could ever retry, leaving a durable
+  # needs-you row for a heal the watcher itself declined. This covers BOTH heals below (the resolver
+  # dispatch and the live-builder bounce), which is why it sits above the fork. The read-only once-guard
+  # branch above still runs first, so a heal already in flight keeps its honest in-progress row.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · held (watcher restarting on new engine code)${C_RESET}"
+    return 0
+  fi
+
   # SUITE WRITE INTERLOCK (HERD-227): a live healthcheck suite is running INSIDE this worktree. Both
   # heals below mutate it — the bounce types `git merge` into the builder's pane, the resolver fallback
   # merges in the tree directly. Either one under a running suite gives two writers one worktree, and
@@ -5728,10 +6869,17 @@ _handle_stale_dup() {
     DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · ${_hsd_capmsg} · stale base still held · ${_hsd_reason}${C_RESET}"
     if ! _refix_dead_seen "$_hsd_pr" "stale-cap-$_hsd_sha"; then
       _record_refix_dead "$_hsd_pr" "stale-cap-$_hsd_sha"
+      # HERD-261: report TOTAL rounds when the total ceiling closed the PR. The rail counter can
+      # honestly read 0 after reset-on-progress while the PR burned N across rails — a needs-you
+      # must never mislead with "after 0 refix rounds".
+      local _hsd_report_rounds="$_hsd_rounds"
+      case "$_hsd_capmsg" in
+        *'total rounds across rails'*) _hsd_report_rounds="$(refix_total_count "$_hsd_pr")" ;;
+      esac
       journal_append stale_refix_escalated pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
-        rounds "$_hsd_rounds" reason "${_hsd_capmsg} — stale base still held"
+        rounds "$_hsd_report_rounds" reason "${_hsd_capmsg} — stale base still held"
       herd_driver_notify "⚠️ refix budget spent: ${_hsd_slug}" \
-        "PR #${_hsd_pr} stale base still held after ${_hsd_rounds} refix rounds — needs you" default
+        "PR #${_hsd_pr} stale base still held after ${_hsd_report_rounds} refix rounds — needs you" default
     fi
     return 0
   fi
@@ -5981,10 +7129,17 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_capmsg} · health-check still red: ${_hhc_detail}${C_RESET}"
     if ! _refix_dead_seen "$_hhc_pr" "health-cap-$_hhc_sha"; then
       _record_refix_dead "$_hhc_pr" "health-cap-$_hhc_sha"
+      # HERD-261: report TOTAL rounds when the total ceiling closed the PR. The rail counter can
+      # honestly read 0 after reset-on-progress while the PR burned N across rails — a needs-you
+      # must never mislead with "after 0 refix rounds".
+      local _hhc_report_rounds="$_hhc_rounds"
+      case "$_hhc_capmsg" in
+        *'total rounds across rails'*) _hhc_report_rounds="$(refix_total_count "$_hhc_pr")" ;;
+      esac
       journal_append health_refix_escalated pr "$_hhc_pr" sha "$_hhc_sha" slug "$_hhc_slug" \
-        rounds "$_hhc_rounds" reason "${_hhc_capmsg} — health-check still red"
+        rounds "$_hhc_report_rounds" reason "${_hhc_capmsg} — health-check still red"
       herd_driver_notify "⚠️ refix budget spent: ${_hhc_slug}" \
-        "PR #${_hhc_pr} health-check still red after ${_hhc_rounds} refix rounds — needs you" default
+        "PR #${_hhc_pr} health-check still red after ${_hhc_report_rounds} refix rounds — needs you" default
     fi
     return 0
   fi
@@ -7690,6 +8845,16 @@ _healthcheck_gate() {
     journal_append infra_event component agent-watch reason health_died key "$_hg_key"
   fi
 
+  # SELF-RESTART QUIESCE (HERD-251): draining toward an in-place re-exec — start no new suite. Reached
+  # only after the collect + in-flight branches above, so a running suite still finishes and its verdict
+  # is still cached. QUEUED holds the candidate (no merge) exactly as a busy slot does; the restarted
+  # watcher dispatches it on new code. Byte-inert with the lever off.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · held (watcher restarting on new engine code)${C_RESET}"
+    _HC_RESULT="QUEUED"
+    return 0
+  fi
+
   # DISPATCH: needs a free slot (HEALTH_CONCURRENCY). No slot → queue this PR, honestly naming how many
   # suites are ahead of it. Never runs a suite that would overlap another (shared git object store).
   if ! _health_slot_free; then
@@ -8500,6 +9665,10 @@ if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
   export HERD_WATCH_REEXEC=1
   exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
 fi
+# This watcher's own positional args, so the HERD-251 self-restart's exec replays exactly what the
+# re-exec above passes through ("$@" is not visible inside a function). Empty today — agent-watch.sh
+# parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
+_WATCH_ARGV=("$@")
 
 # ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
 # Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
@@ -8754,6 +9923,15 @@ _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0
 _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+_PMS_SWEEP_INTERVAL=45      # post-merge hook reconcile (HERD-232) every ~3 min — one `gh pr list`, then
+                            # a run-once ledger hit per PR. Shares the tracker sweep's cadence class:
+                            # the drift it catches (a foreign/crashed merge's unrun hooks) is a rare
+                            # merge-tail condition, not a per-tick one
+_PMS_SWEEP_TICK=$_PMS_SWEEP_INTERVAL  # PRIMED so the FIRST tick sweeps, then every interval. The
+                            # grounding incident is a watcher that died mid-do_merge: the restart that
+                            # follows is exactly when the stranded hooks must be replayed, so a fresh
+                            # process must not idle 3 min before noticing. (This is the cadence sibling
+                            # of the one-shot _startup_reap_sweep above, which covers worktrees only.)
 _ENGINE_TICK=0
 _ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
                             # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
@@ -8771,6 +9949,13 @@ _startup_reap_sweep
 # "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
 # restart that got us here. Drop it, or the row would outlive the condition it warns about.
 rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
+
+# …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
+# to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved
+# came back with the new process. Both freshness rows are now derived from observed state at startup.
+# (The tick loop re-derives it before every render too; this one-shot is what makes the FIRST paint of a
+# new process honest, since nothing else has run yet.)
+_main_fresh_recheck
 
 # One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
 # or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
@@ -8802,6 +9987,11 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
+  # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
+  # row whose condition healed while this watcher was down paints for a whole tick after every restart —
+  # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
+  _main_fresh_recheck
   build_main_freshness
   build_sweep_note
 
@@ -9017,13 +10207,21 @@ EOF
       # fixed — so it graduates to a LOUD red 'needs you · <check>' row (the grounded #293 macOS leg);
       # pending-only checks stay a yellow hold, just named. Fail-soft: a PR with no checks / an offline
       # gh yields no summary and the row is BYTE-IDENTICAL to before.
+      #
+      # HERD-250: when the fail is the INHERITED-red case (CI red + herd/gates green + branch behind
+      # main) and CI_AUTOREPAIR=on, _handle_ci_repair dispatches a base-refresh instead of needs-you.
+      # NEVER silent-merges a red PR; a real new-code failure (not behind / no gates) still needs-you.
       _ci_sum=""
       if [ "$mstate" = "UNSTABLE" ]; then _ci_sum="$(_ci_gate_eval "$prnum" "$headsha" "$slug")"; fi
       if [ -n "$_ci_sum" ]; then
         _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
         if [ "$_ci_bucket" = "fail" ]; then
-          DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
-          FLAIR_STATE[i]="attention"
+          if _handle_ci_repair "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
+            FLAIR_STATE[i]="busy"
+          else
+            DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
+            FLAIR_STATE[i]="attention"
+          fi
         else
           DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · ${_ci_text}${C_RESET}"
           FLAIR_STATE[i]="busy"
@@ -9295,7 +10493,13 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         QUEUED)
           # Console honesty (HERD-185): name the STAGE (review) + WHY it waits (how many are ahead of
           # it holding the cap) — never a bare gate label a health-stage wait could be confused with.
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
+          # A quiesce hold (HERD-251) is not a full cap: say which it is, so "queued (0 ahead)" can
+          # never read as a stuck console.
+          if _self_restart_hold_dispatch; then
+            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · held (watcher restarting on new engine code)${C_RESET}"
+          else
+            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
+          fi
           render
           continue ;;
         RETRY)
@@ -9471,6 +10675,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
     sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # SELF-RESTART QUIESCE (HERD-251): a resolver is new gate work — hold it while the watcher drains
+    # toward its in-place re-exec. Nothing is recorded, so the restarted watcher dispatches it cleanly
+    # on the first tick after startup. Byte-inert with the lever off.
+    if _self_restart_hold_dispatch; then
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}conflict · held (watcher restarting on new engine code)${C_RESET}"
+      render
+      continue
+    fi
     # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
     # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
     # spawn_resolver, so this read still sees only prior ticks' attempts.
@@ -9532,6 +10744,16 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     _sweep_journal_audit
   fi
 
+  # Post-merge hook reconcile (HERD-232): every _PMS_SWEEP_INTERVAL ticks, re-derive the post-merge
+  # obligations of recently-MERGED PRs from the world and run whatever is outstanding. This is what
+  # makes the hooks hold for a merge THIS seat did not perform (another watcher, the gh UI) or did not
+  # finish (killed mid-do_merge). Idempotent + run-once-keyed; byte-inert once a PR is reconciled.
+  _PMS_SWEEP_TICK=$((_PMS_SWEEP_TICK + 1))
+  if [ "$_PMS_SWEEP_TICK" -ge "$_PMS_SWEEP_INTERVAL" ]; then
+    _PMS_SWEEP_TICK=0
+    _sweep_merged_prs
+  fi
+
   # Codemap / symbol-index freshness reconcile (HERD-218): multi-seat invariant — when another seat
   # (or the gh UI) merges without THIS watcher's do_merge, the committed maps can go stale. Probe the
   # read-only --check seams and repair ONCE with provenance=reconcile. Byte-inert when
@@ -9543,6 +10765,20 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   # config key), independent of CODEMAP_AUTOREFRESH, byte-inert when $MAIN is already current.
   reconcile_main_freshness
   reconcile_map_freshness
+
+  # Watcher SELF-RESTART (HERD-251): the reconcile above may have left a "new engine code" note. With
+  # WATCHER_SELF_RESTART=on that note arms a QUIESCE (no new gate dispatch) and, once the in-flight
+  # workers have drained for 2 consecutive ticks — or the 15-minute cap expires — this call re-execs
+  # the watcher in place and never returns. Byte-inert with the lever off (and in dry-run); guarded so
+  # no failure inside it can end the watch loop.
+  _self_restart_tick || true
+
+  # Main-health (HERD-222): the SAME multi-seat rule for the default branch's health. Every observed
+  # main sha must end with a collected verdict, whoever merged it — so this runs AFTER the freshness
+  # reconcile above, against the HEAD it just fast-forwarded to. Dispatches an un-ticked sha (a cross-seat
+  # merge, a no-slot deferral, a killed worker), and re-verifies a standing red on the
+  # MAIN_HEALTH_RECHECK_MINS cadence. Byte-inert when MAIN_HEALTH_TICK=off.
+  reconcile_main_health
 
   # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
   # with a genuinely stale engine, dispatch `herd update` DETACHED — it ends in a reload that restarts

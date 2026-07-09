@@ -52,6 +52,7 @@ APP_PREVIEW_PORT_BASE	none-yet	unit: no test asserts the free-port base-scan (he
 herd init	unit	tests/test-cli.sh
 herd init	unit	tests/test-stack-aware-init.sh
 herd init	unit	tests/test-init-grounding-interview.sh
+herd init	unit	tests/test-init-posture-profiles.sh
 herd doctor	unit	tests/test-doctor.sh
 herd doctor	unit	tests/test-doctor-posture.sh
 herd upgrade	unit	tests/test-cli.sh
@@ -140,7 +141,9 @@ agent-watch.sh	unit	tests/test-human-verify-hold.sh
 agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
 agent-watch.sh	unit	tests/test-watcher-singleton.sh
+agent-watch.sh	unit	tests/test-postmerge-sweep.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
+agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
@@ -233,6 +236,7 @@ REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
+CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
@@ -242,8 +246,14 @@ HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-reconcile.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
+MAIN_HEALTH_TICK	unit	tests/test-main-health-invariant.sh
+MAIN_HEALTH_TICK	sim	tests/test-sandbox-concurrency.sh
+MAIN_HEALTH_RECHECK_MINS	unit	tests/test-main-health-invariant.sh
+MAIN_HEALTH_AUTOFIX	unit	tests/test-main-health-invariant.sh
 SWEEP_AUTO	unit	tests/test-sweep.sh
 WATCHER_FLAIR	unit	tests/test-watcher-flair.sh
+WATCHER_SELF_RESTART	unit	tests/test-watcher-self-restart.sh
+WATCHER_SELF_RESTART	sim	tests/test-sandbox-self-restart.sh
 OPERATOR_INBOX	unit	tests/test-operator-inbox.sh
 BUDGET_DAILY	unit	tests/test-budget-governance.sh
 MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh

@@ -630,7 +630,7 @@ _health_release 99999
 if [ "$_HC_RESULT" = "QUEUED" ] && [ "$_probe_before" = "$_probe_after" ]; then
   checkpoint health_mutex_queues pass "a healthcheck QUEUED (stub not invoked) while the single slot was busy"
 else
-  checkpoint health_mutex_queues fail "expected QUEUED with stub not invoked (got '$_HC_RESULT', runs $_probe_before→$_probe_after)"
+  checkpoint health_mutex_queues fail "expected QUEUED with stub not invoked (got '$_HC_RESULT', runs ${_probe_before}→${_probe_after})"
 fi
 
 # (c) no double-merge, no skipped PR — each PR merged exactly once.
@@ -975,7 +975,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   if [ -n "$_mf_head" ] && [ "$_mf_head" = "$_mf_want" ] && [ "$_mf_ff_after" -gt "$_mf_ff_before" ]; then
     checkpoint main_freshness_ff pass "out-of-band merge fast-forwarded \$MAIN on the tick and journaled main_ff"
   else
-    checkpoint main_freshness_ff fail "expected ff to origin/main + a main_ff event (head=$_mf_head want=$_mf_want main_ff $_mf_ff_before→$_mf_ff_after)"
+    checkpoint main_freshness_ff fail "expected ff to origin/main + a main_ff event (head=$_mf_head want=$_mf_want main_ff ${_mf_ff_before}→${_mf_ff_after})"
     _MF_OK=0
   fi
 
@@ -991,7 +991,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   if [ "$_mf_head_after" = "$_mf_head_before" ] && [ -n "$_mf_held" ]; then
     checkpoint main_freshness_no_guess pass "a diverged \$MAIN with a hand-written commit was HELD (row: $_mf_held), never rebased"
   else
-    checkpoint main_freshness_no_guess fail "expected a HELD row and an untouched HEAD (head $_mf_head_before→$_mf_head_after, row '${_mf_held:-<none>}')"
+    checkpoint main_freshness_no_guess fail "expected a HELD row and an untouched HEAD (head ${_mf_head_before}→${_mf_head_after}, row '${_mf_held:-<none>}')"
     _MF_OK=0
   fi
 
@@ -1002,6 +1002,114 @@ else
   checkpoint main_freshness_no_guess fail "reconcile_main_freshness not defined"
   _MF_OK=0
 fi
+
+# ── MAIN-HEALTH as a reconciled invariant (HERD-222) — the two holes the drain above cannot show ─────
+# The drain proves the merge-time tick: this seat merges, do_merge fires main_health_tick. Neither of the
+# states below ever reaches do_merge, and both stranded before HERD-222:
+#   (a) ANOTHER seat merges — $MAIN's HEAD moves with no do_merge on this seat. main-health must still
+#       dispatch for that observed sha, within ONE tick, on the strength of the sha alone.
+#   (b) a worker is KILLED mid-suite (watcher restart, corpse sweep). Its sha never wrote the run-once
+#       marker, and nothing looked at it again: main sat unchecked forever. It must be RE-DISPATCHABLE.
+# Driven against the SHIPPED reconcile_main_health (sourced in lib mode above), on a throwaway $MAIN with
+# a stub healthcheck bin. $MAIN / $TREES / the state paths are swapped onto the fixture and restored after,
+# so the drain's markers, ledgers and journal are untouched.
+step mainhealth "main-health invariant (HERD-222): an other-seat merge dispatches within one tick; a killed suite leaves a re-dispatchable sha"
+
+_MH_OK=1
+if type reconcile_main_health >/dev/null 2>&1; then
+  _mh_root="$ART/mainhealth"; rm -rf "$_mh_root"; mkdir -p "$_mh_root"
+  _mh_repo="$_mh_root/main"; _mh_trees="$_mh_root/trees"; mkdir -p "$_mh_repo" "$_mh_trees"
+  git init -q -b main "$_mh_repo"
+  git -C "$_mh_repo" config user.email sim@herdkit.test; git -C "$_mh_repo" config user.name sim
+  printf 'base\n' > "$_mh_repo/README.md"
+  git -C "$_mh_repo" add -A; git -C "$_mh_repo" commit -q -m "init"
+
+  # Stub healthcheck: verdict switched by a control file, so one bin drives both a fast green and a
+  # suite slow enough to be killed mid-flight.
+  _mh_hc="$_mh_root/hc.sh"; _mh_mode="$_mh_root/mode"; printf 'green\n' > "$_mh_mode"
+  cat > "$_mh_hc" <<MHSTUB
+#!/usr/bin/env bash
+case "\$(cat "$_mh_mode" 2>/dev/null)" in
+  slow) sleep 60; echo "✅ clean"; exit 0 ;;
+  *)    echo "✅ clean — all tests pass"; exit 0 ;;
+esac
+MHSTUB
+  chmod +x "$_mh_hc"
+
+  # Swap the watcher's coordinates onto the fixture. The main-health state paths were bound to $TREES at
+  # source time, so they must be re-bound explicitly (the drain's $TREES must stay pristine).
+  _mh_sv_main="$MAIN"; _mh_sv_trees="$TREES"; _mh_sv_wt="$WORKTREES_DIR"; _mh_sv_hc="$HERD_HEALTHCHECK_BIN"
+  _mh_sv_state="$MAIN_HEALTH_STATE"; _mh_sv_defer="$MAIN_HEALTH_DEFER"; _mh_sv_fix="$MAIN_HEALTH_FIX_STATE"
+  _mh_sv_tick="${MAIN_HEALTH_TICK:-off}"
+  MAIN="$_mh_repo"; TREES="$_mh_trees"; export WORKTREES_DIR="$_mh_trees"
+  export HERD_HEALTHCHECK_BIN="$_mh_hc"; MAIN_HEALTH_TICK=on
+  MAIN_HEALTH_STATE="$_mh_trees/.agent-watch-main-health"
+  MAIN_HEALTH_DEFER="$_mh_trees/.agent-watch-main-health-defer"
+  MAIN_HEALTH_FIX_STATE="$_mh_trees/.agent-watch-main-health-fix"
+  _mh_journal="$_mh_trees/.herd/journal.jsonl"
+  # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
+  _mh_count() { local c; c="$(grep -c "$1" "$_mh_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
+  # _mh_settle — await the backgrounded suite's result (bounded), then collect it, as the tick top does.
+  _mh_settle() {
+    local n=0
+    while [ "$n" -lt 400 ]; do
+      ls "$_mh_trees"/.health-dispatch-main-* >/dev/null 2>&1 && break
+      ls "$_mh_trees"/.health-inflight-main-* >/dev/null 2>&1 || break
+      sleep 0.05; n=$((n + 1))
+    done
+    _collect_main_health
+  }
+
+  # (a) OTHER-SEAT MERGE: HEAD advances with no do_merge. ONE tick must dispatch for the new sha.
+  printf 'another seat merged this\n' > "$_mh_repo/README.md"
+  git -C "$_mh_repo" commit -q -am "Merge pull request #4242 from other/seat"
+  _mh_sha="$(git -C "$_mh_repo" rev-parse HEAD)"
+  reconcile_main_health
+  _mh_disp="$(_mh_count '"provenance":"observed-sha"')"
+  _mh_settle
+  _mh_green="$(_mh_count '"result":"green"')"
+  if [ "$_mh_disp" -eq 1 ] && [ "$_mh_green" -ge 1 ] && [ -e "$(_main_health_marker "$_mh_sha")" ]; then
+    checkpoint main_health_observed_dispatch pass "an other-seat merge (${_mh_sha:0:12}, no do_merge) dispatched main_health within ONE tick and collected a verdict"
+  else
+    checkpoint main_health_observed_dispatch fail "expected exactly 1 observed-sha dispatch + a collected verdict (dispatched=$_mh_disp green=$_mh_green)"
+    _MH_OK=0
+  fi
+
+  # (b) KILL MID-SUITE: dispatch a slow suite for a fresh sha, kill the worker, let the corpse sweep reap
+  #     it (health_died), then assert the very next tick RE-DISPATCHES that same sha (never stranded).
+  printf 'slow\n' > "$_mh_mode"
+  printf 'and again\n' >> "$_mh_repo/README.md"
+  git -C "$_mh_repo" commit -q -am "Merge pull request #4243 from other/seat"
+  _mh_sha2="$(git -C "$_mh_repo" rev-parse HEAD)"
+  reconcile_main_health                                  # dispatches the slow suite
+  _mh_pid="$(_marker_pid "$(_health_inflight_file "main-$_mh_sha2")" 2>/dev/null || true)"
+  if [ -n "$_mh_pid" ]; then
+    kill -9 "$_mh_pid" 2>/dev/null || true
+    wait "$_mh_pid" 2>/dev/null || true
+  fi
+  _sweep_gate_corpses                                    # the restart/corpse path: journals health_died
+  printf 'green\n' > "$_mh_mode"
+  _mh_died_ok=0; _main_health_died "$_mh_sha2" && _mh_died_ok=1
+  reconcile_main_health                                  # the invariant: a sha with no verdict re-runs
+  _mh_redisp="$(_mh_count '"provenance":"died"')"
+  _mh_settle
+  _mh_green2="$(_mh_count '"result":"green"')"
+  if [ -n "$_mh_pid" ] && [ "$_mh_died_ok" -eq 1 ] && [ "$_mh_redisp" -eq 1 ] && [ "$_mh_green2" -ge 2 ]; then
+    checkpoint main_health_kill_redispatch pass "a suite killed mid-flight (pid $_mh_pid) left sha ${_mh_sha2:0:12} re-dispatchable; the next tick re-ran it to a verdict"
+  else
+    checkpoint main_health_kill_redispatch fail "expected a died-sha re-dispatch to a verdict (pid='${_mh_pid:-<none>}' died=$_mh_died_ok redispatched=$_mh_redisp green=$_mh_green2)"
+    _MH_OK=0
+  fi
+
+  MAIN="$_mh_sv_main"; TREES="$_mh_sv_trees"; export WORKTREES_DIR="$_mh_sv_wt"
+  export HERD_HEALTHCHECK_BIN="$_mh_sv_hc"; MAIN_HEALTH_TICK="$_mh_sv_tick"
+  MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"; MAIN_HEALTH_FIX_STATE="$_mh_sv_fix"
+else
+  checkpoint main_health_observed_dispatch fail "reconcile_main_health not defined (lib-mode source did not expose the tick reconcile)"
+  checkpoint main_health_kill_redispatch   fail "reconcile_main_health not defined"
+  _MH_OK=0
+fi
+
 
 # ── MERGE FAIRNESS: ready-PR priority + starvation surfacing (HERD-231) ─────────────────────────
 # The happy-path drain above ran with MERGE_FAIRNESS unset (off), proving the knob is byte-inert: the
@@ -1253,6 +1361,8 @@ write_scorecard() {
     printf '  "watcher_singleton_ok": %s,\n' "$([ "${_SNGL_OK:-0}" -eq 1 ] && echo true || echo false)"
     printf '  "main_freshness_tested": true,\n'
     printf '  "main_freshness_ok": %s,\n' "$([ "${_MF_OK:-0}" -eq 1 ] && echo true || echo false)"
+    printf '  "main_health_tested": true,\n'
+    printf '  "main_health_ok": %s,\n' "$([ "${_MH_OK:-0}" -eq 1 ] && echo true || echo false)"
     printf '  "infra_breaker_tested": true,\n'
     printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
     printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"

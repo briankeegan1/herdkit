@@ -47,7 +47,8 @@ ok; echo "PASS (2) grok.driver bindings are zero-secret"
 # ── 3. Grok Build's REAL flags are bound (researched, not guessed) — an authenticity/drift guard. ─
 exact(){ awk -F= -v k="$1" '$1==k{sub(/^[^=]+=/,"");print}' "$DRIVER"; }
 grepd(){ grep -qF -e "$1" "$DRIVER" || fail "grok.driver missing real flag/incantation: $1"; }
-grepd 'grok --model <model> --always-approve "<prompt>"'   # interactive spawn
+grepd 'grok --model <model> --always-approve'              # interactive spawn (grok's real flags)
+grepd '--append-rules-to-system-prompt <agents-rules> "<prompt>"'  # grok-context-injection: additive conventions grounding
 grepd 'grok -p "<prompt>" --model <model> --always-approve' # one-shot / headless (-p,--single)
 grepd 'grok --continue --always-approve'                    # resume (-c,--continue)
 grepd '--always-approve'                                    # permission / auto-approve flag
@@ -106,5 +107,66 @@ for k in $AGENT_KEYS; do
   grep -qF -e "$v" "$SK" && fail "agent-exec value for $k leaked into the rendered skill: $v" || true
 done
 ok; echo "PASS (5) HERD_DRIVER=grok renders cleanly — binding table resolves, no leftover token"
+
+# ── 6. CONTEXT-INJECTION: a grok interactive spawn's COMPOSED argv carries the repo-root AGENTS.md
+#      conventions (grok has no CLAUDE.md auto-load), while a claude spawn's argv is byte-IDENTICAL to
+#      before (no conventions leak, no new flag) — the grok-context-injection invariant. ────────────
+command -v python3 >/dev/null 2>&1 || fail "python3 required for the compose test"
+CROOT="$T/convroot"; mkdir -p "$CROOT"
+AGENTS_MARK="SENTINEL_AGENTS_CONVENTION_XYZZY"
+printf '# AGENTS.md\n\n%s — builders never edit BACKLOG.md.\n' "$AGENTS_MARK" > "$CROOT/AGENTS.md"
+
+# NUL token-separator, rendered as a real unit-separator byte (0x1f) so `[ = ]` can byte-compare the
+# token stream and `case` can scan it. Built via printf so it is an actual control char, not literal text.
+SEP="$(printf '\037')"
+
+# Compose a grok spawn argv (NUL-separated) with PROJECT_ROOT pointed at the conventions repo. Source
+# driver.sh + herd-config.sh hermetically (HERD_SKIP_PREFLIGHT, sandboxed HOME/config) so the REAL
+# herd_agents_conventions resolves the file.
+compose_argv() {  # compose_argv <driver> <project_root>
+  HOME="$T" HERD_SKIP_PREFLIGHT=1 HERD_CONFIG_FILE="$T/noconfig" PROJECT_ROOT="$2" \
+  WORKTREES_DIR="$T/trees" WORKSPACE_NAME="herdkit" DEFAULT_BRANCH="origin/main" \
+  ROOT="$ROOT" DRV="$1" PR="$2" bash -c '
+    set -uo pipefail
+    . "$ROOT/scripts/herd/herd-config.sh" >/dev/null 2>&1 || true
+    . "$ROOT/scripts/herd/driver.sh"
+    PROJECT_ROOT="$PR" herd_driver_agent_spawn_argv "$DRV" "grok-model" "--always-approve" "POINTER_TEXT" \
+      | tr "\0" "\037"
+  '
+}
+
+grok_argv="$(compose_argv grok "$CROOT")"          || fail "composing a grok spawn argv failed"
+claude_argv="$(compose_argv herdr-claude "$CROOT")" || fail "composing a claude spawn argv failed"
+
+# (a) grok's composed argv carries the conventions AND the additive append-rules flag.
+case "$grok_argv" in
+  *"--append-rules-to-system-prompt"*) : ;;
+  *) fail "grok spawn argv missing --append-rules-to-system-prompt: $grok_argv" ;;
+esac
+case "$grok_argv" in
+  *"$AGENTS_MARK"*) : ;;
+  *) fail "grok spawn argv does NOT inline the repo-root AGENTS.md conventions: $grok_argv" ;;
+esac
+# (b) a claude spawn is byte-identical to today: no conventions, no append-rules flag.
+case "$claude_argv" in
+  *"$AGENTS_MARK"*) fail "claude spawn argv LEAKED AGENTS.md conventions (must stay byte-identical): $claude_argv" ;;
+esac
+case "$claude_argv" in
+  *"--append-rules-to-system-prompt"*) fail "claude spawn argv grew an append-rules flag (must stay byte-identical): $claude_argv" ;;
+esac
+# The claude argv is exactly the pre-injection native shape (proves byte-identity, not just absence).
+[ "$claude_argv" = "claude${SEP}--model${SEP}grok-model${SEP}--always-approve${SEP}POINTER_TEXT${SEP}" ] \
+  || fail "claude spawn argv drifted from the native shape: $claude_argv"
+
+# (c) FAIL-SOFT: with NO AGENTS.md/CLAUDE.md at the root, grok's argv drops the flag+value pair and is
+#     byte-identical to the plain grok spawn shape (no dangling --append-rules flag).
+EMPTY="$T/emptyroot"; mkdir -p "$EMPTY"
+grok_bare="$(compose_argv grok "$EMPTY")" || fail "composing a bare grok spawn argv failed"
+case "$grok_bare" in
+  *"--append-rules-to-system-prompt"*) fail "grok argv kept a dangling append-rules flag with no AGENTS.md: $grok_bare" ;;
+esac
+[ "$grok_bare" = "grok${SEP}--model${SEP}grok-model${SEP}--always-approve${SEP}POINTER_TEXT${SEP}" ] \
+  || fail "bare grok spawn argv (no conventions) drifted from the plain grok shape: $grok_bare"
+ok; echo "PASS (6) grok spawn argv inlines AGENTS.md conventions; claude byte-identical; fail-soft when absent"
 
 echo "ALL PASS ($pass checks)"

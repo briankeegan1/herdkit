@@ -433,6 +433,27 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic CI auto-repair inherited red (HERD-250) unit test passes" {
+  run bash "$REPO/tests/test-ci-autorepair.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic main-health reconciled invariant (HERD-222) unit test passes" {
+  run bash "$REPO/tests/test-main-health-invariant.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+# HERD-259: this suite shipped with HERD-233 but no bats block ever ran it, so the MAIN-freshness
+# reconcile was ungated for four months — including the recovery leg whose absence let a healed
+# 'dirty-tree' row paint for 20+ minutes. Wired in with the recovery legs it now carries.
+@test "hermetic MAIN-checkout freshness reconcile (HERD-233/259) unit test passes" {
+  run bash "$REPO/tests/test-main-freshness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 @test "hermetic gate order: stale-dup decides before review/health dispatch (HERD-227) test passes" {
   run bash "$REPO/tests/test-gate-order-stale-dup.sh"
   [ "$status" -eq 0 ]
@@ -502,6 +523,18 @@ setup() {
 
 @test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {
   run bash "$REPO/scripts/herd/sim/retirement-invariant-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic post-merge reconcile sweep (HERD-232) test passes" {
+  run bash "$REPO/tests/test-postmerge-sweep.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS: test-postmerge-sweep.sh"* ]]
+}
+
+@test "post-merge reconcile sim: a foreign or crashed merge still gets its hooks (HERD-232)" {
+  run bash "$REPO/scripts/herd/sim/postmerge-reconcile-sim.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
