@@ -6,7 +6,7 @@
 # key can be documented but never read (a DEAD key), read but never documented (a GHOST key), or
 # mis-scoped so `herd config set` routes it to the wrong file / a governance doc adopts a per-machine
 # knob. This test turns those invariants into a hard gate so the manifest can never silently drift
-# from the code that reads it. Seven checks:
+# from the code that reads it. Eight checks:
 #
 #   (a) DEAD keys      — every manifest config key is READ at least once under bin/ + scripts/.
 #   (b) GHOST keys     — every ${UPPER_CASE:-…} config read in the engine is a DECLARED manifest key
@@ -23,6 +23,8 @@
 #                        requires=watcher, so `herd config set` restarts the watcher for it to take.
 #   (f) default drift  — every config key documented in templates/config.example with a literal value
 #                        matches that key's fallback in herd-config.sh (docs never drift from code).
+#   (g) shape literals — a value_shape enum lists the LITERAL values `herd config set` accepts; no member
+#                        may be a unit/placeholder word (that is what the `numeric` token is for).
 #
 # Fully hermetic: reads the repo's own committed files; NO herdr, gh, network, or model.
 # Run:  bash tests/test-config-manifest.sh
@@ -73,6 +75,7 @@ with open(CAPS, encoding="utf-8") as f:
             "scope":       col("scope"),
             "governance":  col("governance"),
             "description": col("description"),
+            "value_shape": col("value_shape").strip(),
         }
 KEYS = set(COLS)
 
@@ -305,9 +308,31 @@ for k in sorted(MODEL_TIERS):
 check("f: config.example model-tier defaults match herd-config.sh fallbacks", not drift,
       "; ".join(drift))
 
+# ── (g) a value_shape enum lists LITERAL values, never a unit or placeholder word ──────────────────
+# bin/herd's _config_validate_value treats any shape that is not `numeric`/`free`/empty as a closed enum:
+# `herd config set KEY V` succeeds only when V equals a member EXACTLY. So a shape written as prose —
+# MAIN_HEALTH_RECHECK_MINS shipped as `0|minutes` (HERD-264) — rejects every real value the key accepts
+# (30, 45, …) while looking documented. A numeric key's shape is the `numeric` token; the "0=off, N
+# minutes" reading belongs in the description column. Catch the class, not just that one row.
+PLACEHOLDER = {
+    "n", "num", "number", "numeric", "int", "integer", "digits", "count", "value",
+    "ms", "sec", "secs", "second", "seconds", "min", "mins", "minute", "minutes",
+    "hr", "hrs", "hour", "hours", "day", "days", "bytes", "pct", "percent",
+}
+prose = []
+for k in sorted(KEYS):
+    shape = COLS[k]["value_shape"]
+    if shape in ("", "free", "numeric"):
+        continue
+    for member in shape.split("|"):
+        if member.strip().lower() in PLACEHOLDER:
+            prose.append(f"{k}: enum member '{member}' is a unit/placeholder word (want value_shape=numeric)")
+check("g: value_shape enums list literal values, not placeholders", not prose,
+      "; ".join(prose))
+
 print()
 if failures:
     print(f"{len(failures)} CHECK(S) FAILED: {', '.join(failures)}", file=sys.stderr)
     sys.exit(1)
-print("ALL PASS (7 manifest self-enforcement checks)")
+print("ALL PASS (8 manifest self-enforcement checks)")
 PY
