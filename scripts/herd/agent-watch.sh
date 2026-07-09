@@ -3448,6 +3448,10 @@ except Exception:
 _sweep_orphan_tabs() {
   [ -n "$DRYRUN" ] && return 0
   local _sw_registry="$TREES/.herd-tabs" _sw_orphans="${1:-}" _sw_id
+  # HERD-215: make the registry SELF-CONSISTENT before counting or closing anything — drop rows for
+  # tabs that no longer exist at all (closed by a crash / reload / foreign path), so they stop
+  # inflating the stale-tab tally. Runs regardless of whether there are orphan-tab candidates below.
+  _herd_tabs_prune_orphans "$_sw_registry"
   [ -n "$_sw_orphans" ] || _sw_orphans="$(_orphan_tab_ids)"
   [ -n "$_sw_orphans" ] || return 0
   while IFS= read -r _sw_id; do
@@ -3481,6 +3485,72 @@ try:
                 f.write(line)
 except Exception: pass
 ' 2>/dev/null || true
+}
+
+# _herd_tabs_prune_orphans <registry-file> — drop every registry row whose tab_id (field 2) names a
+# tab that no longer EXISTS in the live `herdr tab list`, regardless of who closed it (a crash, a
+# herdr reload, a manual `herdr tab close`, or a lane that closed the tab without owning the row).
+# HERD-215: without this, a tab closed OUTSIDE the sweep's own close+drop path leaves its row behind
+# forever, and the cheap stale-tab tally (sweep_cheap_tab_count — worktree-absence only, no herdr RPC)
+# counts that dead row as a live mess across restarts (observed: 13 rows, 6 live tabs) — cry-wolf the
+# operator can never clear, because _orphan_tab_ids only ever considers tabs that ARE in the live list
+# and so never reaps a row whose tab is already gone. The prune makes the registry SELF-CONSISTENT: a
+# row exists only while its tab does.
+#
+# SAFETY: prune ONLY against a POSITIVELY-read live list. No herdr, or a `herdr tab list` that FAILS
+# (offline / rate-limited / rc != 0) yields NO prune — an empty/failed result is never read as "every
+# tab is gone, wipe the registry" (the HERD-206 discipline). A row we cannot parse (< 2 fields) is
+# preserved byte-for-byte. Fail-soft + idempotent: a second run over a clean registry is a no-op.
+_herd_tabs_prune_orphans() {
+  local _pr_reg="$1"
+  [ -n "$_pr_reg" ] || return 0
+  [ -f "$_pr_reg" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _pr_raw _pr_rc=0
+  _pr_raw="$(herdr tab list 2>/dev/null)" || _pr_rc=$?
+  [ "$_pr_rc" -eq 0 ] || return 0
+  local _pr_live
+  _pr_live="$(printf '%s' "$_pr_raw" | python3 -c '
+import sys, json
+try:
+    for t in json.load(sys.stdin).get("result",{}).get("tabs",[]):
+        tid = t.get("tab_id","") or ""
+        if tid: print(tid)
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  # Rewrite the registry keeping only rows whose tab_id is live (or unparseable). Print each pruned
+  # tab_id so the caller can journal it. The file is only rewritten when something is actually dropped,
+  # so a clean registry keeps its exact bytes (and mtime).
+  local _pr_dropped
+  _pr_dropped="$(REG="$_pr_reg" LIVE="$_pr_live" python3 -c '
+import os
+reg  = os.environ["REG"]
+live = set(l for l in os.environ.get("LIVE","").split("\n") if l)
+try:
+    with open(reg, encoding="utf-8") as f: lines = f.readlines()
+except Exception:
+    raise SystemExit(0)
+kept, dropped = [], []
+for line in lines:
+    parts = line.strip().split(" ", 2)
+    if len(parts) >= 2 and parts[1] and parts[1] not in live:
+        dropped.append(parts[1]); continue
+    kept.append(line)
+if dropped:
+    try:
+        with open(reg, "w", encoding="utf-8") as f: f.writelines(kept)
+    except Exception:
+        raise SystemExit(0)
+    for d in dropped: print(d)
+' 2>/dev/null || true)"
+  local _pr_id
+  while IFS= read -r _pr_id; do
+    [ -n "$_pr_id" ] || continue
+    command -v journal_append >/dev/null 2>&1 && \
+      journal_append sweep_tab_prune tab_id "$_pr_id" reason orphan-row
+  done <<< "$_pr_dropped"
+  return 0
 }
 
 # _sweep_stale_resolve_tabs — proactively close STALE resolve·<slug> conflict-resolver tabs (HERD-54).
@@ -6389,17 +6459,42 @@ _SWEEP_SCAN_INTERVAL=15                  # ~60 s (15 × 4 s sleep) — matches _
                                          # which is declared further down, next to the live loop
 _SWEEP_SCAN_TICK=$_SWEEP_SCAN_INTERVAL   # primed so the FIRST tick scans, then every interval
 _SWEEP_C_TABS=0; _SWEEP_C_MARKERS=0; _SWEEP_C_PROCS=0
+# Epoch of the last cache refresh (0 = never scanned yet). Drives BOTH halves of the HERD-215 tally-
+# honesty fix: the '(as of …)' staleness note build_sweep_note renders between scans, and the
+# after-sweep immediate recompute (_sweep_tally_invalidated compares this against the sweep's stamp).
+_SWEEP_LAST_SCAN=0
+_SWEEP_TALLY_STAMP="$TREES/.sweep-tally-stamp"   # written by sweep_main / sweep_run_safe_legs on finish
 
-# _sweep_trigger_tick — the per-tick trigger. On the scan cadence it refreshes the cached counts,
-# journals `sweep_advice` once per distinct condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs.
-# Byte-inert under SWEEP_AUTO=off: no scan, no journal, no row, no action.
+# _sweep_tally_invalidated — success iff a sweep finished (stamped $_SWEEP_TALLY_STAMP) more recently
+# than our last cache refresh. A MANUAL `herd sweep` runs in a SEPARATE process from this watcher, so
+# it cannot poke our in-memory cache directly — it drops a timestamp file, and we poll it here. When it
+# fires we recompute the tally THIS tick instead of waiting out the ~60 s scan cadence, so the
+# housekeeping line clears the instant a manual sweep cleaned the room rather than crying wolf for up to
+# a minute (HERD-215). Fail-soft: no stamp, or an unreadable/garbage stamp, reads as "not invalidated".
+_sweep_tally_invalidated() {
+  local _ti_ts
+  [ -f "$_SWEEP_TALLY_STAMP" ] || return 1
+  _ti_ts="$(cat "$_SWEEP_TALLY_STAMP" 2>/dev/null || true)"
+  case "$_ti_ts" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_ti_ts" -gt "${_SWEEP_LAST_SCAN:-0}" ] 2>/dev/null
+}
+
+# _sweep_trigger_tick — the per-tick trigger. On the scan cadence (or immediately when a finished sweep
+# invalidated the cache) it refreshes the cached counts, journals `sweep_advice` once per distinct
+# condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs. Byte-inert under SWEEP_AUTO=off.
 _sweep_trigger_tick() {
   [ -n "$DRYRUN" ] && return 0
   local _st_mode; _st_mode="$(sweep_auto_mode)"
   [ "$_st_mode" = off ] && return 0
+  # A finished sweep (manual, in another process) forces an immediate recompute; otherwise scan on the
+  # throttled cadence. Either path refreshes the cache and stamps _SWEEP_LAST_SCAN (drives the age note).
+  local _st_force=1; _sweep_tally_invalidated || _st_force=0
   _SWEEP_SCAN_TICK=$(( _SWEEP_SCAN_TICK + 1 ))
-  [ "$_SWEEP_SCAN_TICK" -ge "$_SWEEP_SCAN_INTERVAL" ] || return 0
+  if [ "$_st_force" = 0 ] && [ "$_SWEEP_SCAN_TICK" -lt "$_SWEEP_SCAN_INTERVAL" ]; then
+    return 0
+  fi
   _SWEEP_SCAN_TICK=0
+  _SWEEP_LAST_SCAN="$(_now_epoch)"
   read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   sweep_journal_advice_once "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"
   if [ "$_st_mode" = auto ] \
@@ -6416,6 +6511,9 @@ _sweep_trigger_tick() {
     # sweep_advice memo suppressed the journal spam but not the work.
     _sweep_auto_record "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS" "$(sweep_swept_total)"
     # The mess is gone; re-scan so the console row clears this same tick instead of lingering a cycle.
+    # Re-stamp _SWEEP_LAST_SCAN AFTER sweep_run_safe_legs (which wrote its own tally stamp) so the fresh
+    # stamp does not read as "invalidated" and force a redundant re-scan on the very next tick.
+    _SWEEP_LAST_SCAN="$(_now_epoch)"
     read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   fi
   return 0
@@ -6438,9 +6536,26 @@ _sweep_auto_record() {
   printf '%s|%s\n' "t=$1 m=$2 p=$3" "$4" > "$_SWEEP_AUTO_MEMO" 2>/dev/null || true
 }
 
+# _sweep_fmt_age <secs> — compact human age: "Ns" under a minute, "Nm" under an hour, else "Nh". Used
+# by the housekeeping staleness note; empty for a non-numeric / negative input.
+_sweep_fmt_age() {
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) return 0 ;; esac
+  if   [ "$s" -ge 3600 ]; then printf '%dh' "$(( s / 3600 ))"
+  elif [ "$s" -ge 60 ];   then printf '%dm' "$(( s / 60 ))"
+  else                         printf '%ds' "$s"
+  fi
+}
+
 # build_sweep_note — the '🧹 sweep recommended: N stale tabs · M dead markers' console row, rendered
 # from the CACHED counts. Empty when the control room is clean or SWEEP_AUTO=off, so the console is
 # byte-identical to before this feature whenever there is nothing to sweep.
+#
+# HERD-215 (tally honesty): the counts refresh only on the ~60 s scan cadence, so between scans this
+# row shows a CACHED reading. Rather than silently pass off a stale count as current, annotate it with
+# its age ('as of 4m ago') whenever the reading is not this-tick-fresh — the operator sees at a glance
+# that the figure may already be out of date (the recompute-after-sweep path clears it entirely once a
+# sweep actually runs).
 build_sweep_note() {
   SWEEP_NOTE=""
   local _bs_mode _bs_line
@@ -6450,7 +6565,14 @@ build_sweep_note() {
   [ -n "$_bs_line" ] || return 0
   local _bs_hint="run 'herd sweep'"
   [ "$_bs_mode" = auto ] && _bs_hint="auto-sweeping safe legs; 'herd sweep' for the rest"
-  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
+  # Staleness caveat: only when we have a real prior scan AND the reading is at least a second old (a
+  # this-tick scan reads age 0 and needs no caveat).
+  local _bs_age _bs_note=""
+  if [ "${_SWEEP_LAST_SCAN:-0}" -gt 0 ] 2>/dev/null; then
+    _bs_age=$(( $(_now_epoch) - _SWEEP_LAST_SCAN ))
+    [ "$_bs_age" -ge 1 ] 2>/dev/null && _bs_note=" ${C_DIM}(as of $(_sweep_fmt_age "$_bs_age") ago)${C_RESET}"
+  fi
+  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET}${_bs_note} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
   return 0
 }
 
