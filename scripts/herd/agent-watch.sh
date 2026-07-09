@@ -278,8 +278,12 @@ DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
 #     never grow unbounded.
 #   • INBOX_SEEN_STATE — the DEDUP ledger of comment ids already surfaced ("pr:<id>" / "tr:<id>", one
 #     per line) so each comment lands in the inbox AND notifies exactly ONCE, not every scan tick.
+#   • INBOX_SEEN_LIVE — the per-tick set of comment ids OBSERVED this scan (whether newly surfaced or
+#     already seen). Reset each _inbox_scan; consumed by the retention-aware seen-ledger trim so a
+#     still-live id is never evicted at the cap and re-notified (HERD-213). Off → never created.
 INBOX_LEDGER="$TREES/.agent-watch-inbox"
 INBOX_SEEN_STATE="$TREES/.agent-watch-inbox-seen"
+INBOX_SEEN_LIVE="$TREES/.agent-watch-inbox-seen-live"
 INBOX_LEDGER_MAX=50    # most-recent entries kept in the ledger
 INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounded)
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
@@ -758,15 +762,58 @@ _inbox_seen() {
   grep -qxF -- "$1" "$INBOX_SEEN_STATE" 2>/dev/null
 }
 
-# _inbox_mark_seen <key> — record a comment key as surfaced, then trim the dedup ledger to its most
-# recent INBOX_SEEN_MAX ids so it can never grow without bound.
+# _inbox_mark_seen <key> — record a comment key as surfaced (append-only). The dedup ledger is bounded
+# by _inbox_trim_seen, called ONCE at the end of a scan so the trim can see the full live set for the
+# tick (a per-append tail-trim can't — it would evict a still-live id and re-notify it, HERD-213).
 _inbox_mark_seen() {
   printf '%s\n' "$1" >> "$INBOX_SEEN_STATE" 2>/dev/null || return 0
+}
+
+# _inbox_note_live <key> — record a comment key as OBSERVED this tick (its PR/tracker item is still
+# open and the comment still present), so the retention-aware trim keeps it. Appended for EVERY comment
+# the scan sees, whether or not it was already surfaced.
+_inbox_note_live() {
+  printf '%s\n' "$1" >> "$INBOX_SEEN_LIVE" 2>/dev/null || return 0
+}
+
+# _inbox_trim_seen — retention-aware trim of the dedup ledger ($INBOX_SEEN_STATE) to INBOX_SEEN_MAX.
+# A naive `tail -n MAX` evicts the OLDEST ids, but an old id can still be LIVE — its comment is still
+# on an open PR / open tracker item this tick — and dropping it makes the NEXT scan see it as unseen and
+# re-notify it (HERD-213). So this keeps EVERY live id (the ids observed this tick in $INBOX_SEEN_LIVE)
+# and evicts only SETTLED ids (no longer observed — their PR/item closed), dropping the oldest settled
+# first to fill the cap budget. No-op when under the cap; with an empty/absent live set it degrades to
+# the old oldest-first eviction (nothing is live → everything is settled). Called once per _inbox_scan.
+_inbox_trim_seen() {
+  [ -s "$INBOX_SEEN_STATE" ] || return 0
   local n; n="$(wc -l < "$INBOX_SEEN_STATE" 2>/dev/null || echo 0)"
-  if [ "${n:-0}" -gt "$INBOX_SEEN_MAX" ]; then
-    local keep; keep="$(mktemp "${INBOX_SEEN_STATE}.XXXXXX" 2>/dev/null || true)"
-    [ -n "$keep" ] || return 0
-    tail -n "$INBOX_SEEN_MAX" "$INBOX_SEEN_STATE" > "$keep" 2>/dev/null && mv -f "$keep" "$INBOX_SEEN_STATE" 2>/dev/null || rm -f "$keep" 2>/dev/null
+  [ "${n:-0}" -gt "$INBOX_SEEN_MAX" ] || return 0
+  local keep; keep="$(mktemp "${INBOX_SEEN_STATE}.XXXXXX" 2>/dev/null || true)"
+  [ -n "$keep" ] || return 0
+  if SEEN_MAX="$INBOX_SEEN_MAX" LIVE_FILE="$INBOX_SEEN_LIVE" \
+     python3 -c 'import os, sys
+cap = int(os.environ.get("SEEN_MAX") or 0)
+live_path = os.environ.get("LIVE_FILE") or ""
+live = set()
+if live_path:
+    try:
+        with open(live_path) as f:
+            live = {ln.strip() for ln in f if ln.strip()}
+    except OSError:
+        live = set()
+seen = [ln.rstrip("\n") for ln in sys.stdin]
+# Drop the OLDEST settled ids first (iterate oldest→newest, appended order) until size <= cap; never
+# drop a live id. If live ids alone exceed the cap they are ALL kept (bounded by real open activity).
+drop = max(0, len(seen) - cap)
+out = []
+for s in seen:
+    if drop > 0 and s not in live:
+        drop -= 1
+        continue
+    out.append(s)
+sys.stdout.write("".join(s + "\n" for s in out))' < "$INBOX_SEEN_STATE" > "$keep" 2>/dev/null; then
+    mv -f "$keep" "$INBOX_SEEN_STATE" 2>/dev/null || rm -f "$keep" 2>/dev/null
+  else
+    rm -f "$keep" 2>/dev/null
   fi
 }
 
@@ -836,6 +883,10 @@ _inbox_scan() {
   _resolve_watcher_owner
   owner="$(_watcher_owner_login)"
 
+  # Reset the per-tick live set: every comment observed below is noted live so the end-of-scan
+  # retention-aware trim (HERD-213) keeps still-live ids and evicts only settled ones.
+  : > "$INBOX_SEEN_LIVE" 2>/dev/null || true
+
   # (1) PR-COMMENT feed — comments by OTHERS on the tick's open PRs. Self-exclusion is by owner login
   # (_inbox_extract_pr_comments drops comments whose author == $owner). When the seat's identity is
   # UNRESOLVED ($owner empty), that match is a no-op, so the feed would surface the seat's OWN comments
@@ -847,6 +898,7 @@ _inbox_scan() {
       [ -n "$prnum" ] || continue
       while IFS=$'\t' read -r cid author snip; do
         [ -n "$cid" ] || continue
+        _inbox_note_live "pr:$cid"
         _inbox_seen "pr:$cid" && continue
         _inbox_mark_seen "pr:$cid"
         _inbox_record pr "#$prnum" "$author" "$snip"
@@ -865,6 +917,7 @@ _inbox_scan() {
   if [ -f "$_bfile" ]; then
     while IFS=$'\t' read -r ref author cid snip; do
       [ -n "$cid" ] || continue
+      _inbox_note_live "tr:$cid"
       _inbox_seen "tr:$cid" && continue
       _inbox_mark_seen "tr:$cid"
       _inbox_record tracker "$ref" "$author" "$(_inbox_flatten "$snip")"
@@ -880,6 +933,10 @@ _inbox_scan() {
       _backend_list_inbox_comments 2>/dev/null || true
     )
   fi
+
+  # Bound the dedup ledger ONCE, now that the full live set for this tick is known — retention-aware, so
+  # a still-live id is never evicted at the cap and re-notified (HERD-213).
+  _inbox_trim_seen
 }
 
 # build_operator_inbox — the "operator inbox" section: the most recent INBOX ledger entries, newest

@@ -52,7 +52,7 @@ export NO_COLOR=1                    # deterministic plain output for byte asser
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in _operator_inbox_enabled _inbox_extract_pr_comments _inbox_pr_numbers _inbox_seen \
-          _inbox_mark_seen _inbox_record _inbox_scan build_operator_inbox; do
+          _inbox_mark_seen _inbox_note_live _inbox_trim_seen _inbox_record _inbox_scan build_operator_inbox; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 pass
@@ -158,5 +158,32 @@ grep -q "me-operator" "$INBOX_LEDGER" 2>/dev/null && fail "unresolved-owner scan
 [ ! -s "$NOTIFY_LOG" ] || fail "unresolved-owner scan must not notify for self-authored comments"; pass
 # Restore the pinned identity so any later assertions see a resolved owner.
 export WATCHER_OWNER="$SAVED_OWNER"; _WATCHER_OWNER_CACHE="$SAVED_OWNER"; _WATCHER_OWNER_RESOLVED=1
+
+# ── 9. Retention-aware seen-ledger trim (HERD-213): trimming at the cap keeps a still-LIVE id (so it is
+# never re-notified) and evicts only SETTLED ids — the oldest settled first. A naive `tail -n MAX` would
+# drop the oldest id regardless of whether its comment is still on an open PR/item, re-notifying it.
+SAVED_MAX="$INBOX_SEEN_MAX"; INBOX_SEEN_MAX=3
+# Seed the dedup ledger with 5 ids, oldest→newest (append order): pr:1 .. pr:5 (over the cap of 3).
+printf 'pr:1\npr:2\npr:3\npr:4\npr:5\n' > "$INBOX_SEEN_STATE"
+# pr:1 — the OLDEST id — is still live this tick (its comment is on an open PR); the rest are settled.
+printf 'pr:1\n' > "$INBOX_SEEN_LIVE"
+_inbox_trim_seen
+grep -qxF 'pr:1' "$INBOX_SEEN_STATE" || fail "trim must KEEP a still-live id (pr:1): [$(tr '\n' ',' < "$INBOX_SEEN_STATE")]"; pass
+grep -qxF 'pr:2' "$INBOX_SEEN_STATE" && fail "trim must evict the oldest SETTLED id (pr:2)"; pass
+grep -qxF 'pr:3' "$INBOX_SEEN_STATE" && fail "trim must evict the next oldest SETTLED id (pr:3)"; pass
+grep -qxF 'pr:4' "$INBOX_SEEN_STATE" || fail "trim must keep recent settled id pr:4"
+grep -qxF 'pr:5' "$INBOX_SEEN_STATE" || fail "trim must keep recent settled id pr:5"; pass
+[ "$(wc -l < "$INBOX_SEEN_STATE")" -eq 3 ] || fail "trim must bound the ledger to the cap (3): got $(wc -l < "$INBOX_SEEN_STATE")"; pass
+# With NO live ids (empty live set), the trim degrades to plain oldest-first eviction (nothing is live).
+printf 'pr:1\npr:2\npr:3\npr:4\npr:5\n' > "$INBOX_SEEN_STATE"; : > "$INBOX_SEEN_LIVE"
+_inbox_trim_seen
+{ grep -qxF 'pr:1' "$INBOX_SEEN_STATE" || grep -qxF 'pr:2' "$INBOX_SEEN_STATE"; } && fail "empty live set: oldest ids (pr:1,pr:2) must be evicted"; pass
+[ "$(wc -l < "$INBOX_SEEN_STATE")" -eq 3 ] || fail "empty live set: ledger must be bounded to the cap (3)"; pass
+# Under the cap → no-op (byte-identical): a 2-line ledger with cap 3 is untouched.
+printf 'pr:8\npr:9\n' > "$INBOX_SEEN_STATE"; : > "$INBOX_SEEN_LIVE"
+_inbox_trim_seen
+[ "$(wc -l < "$INBOX_SEEN_STATE")" -eq 2 ] && grep -qxF 'pr:8' "$INBOX_SEEN_STATE" \
+  || fail "under-cap trim must be a no-op"; pass
+INBOX_SEEN_MAX="$SAVED_MAX"; rm -f "$INBOX_SEEN_STATE" "$INBOX_SEEN_LIVE"
 
 echo "PASS ($PASS assertions) — tests/test-operator-inbox.sh"
