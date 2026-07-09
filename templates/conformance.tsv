@@ -268,3 +268,5 @@ MERGE_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh
 .herd/steps.tsv	sim	tests/test-sandbox-posture-matrix.sh
+herd agent-update [--dry-run]	unit	tests/test-agent-update.sh
+AGENT_UPDATE	unit	tests/test-agent-update.sh

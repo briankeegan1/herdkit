@@ -281,6 +281,18 @@ esac
 # paths see it under `set -u`.
 : "${DOCTOR_STARTUP_HINT:="off"}"
 
+# AGENT_UPDATE — opt-in safe self-update of the AGENT RUNTIME (HERD-149). Default "off": nothing runs,
+# byte-identical to today — operators keep updating claude (or, via the driver seam, codex/grok) by
+# hand or a personal OS job, outside the engine. Set "on" and `herd agent-update` (scripts/herd/
+# agent-update.sh) DETECTS the installer (brew/npm/native) of the runtime HERD_DRIVER points at, runs
+# the update, and — the whole point — HANDLES the macOS footgun where a `brew upgrade --cask` leaves
+# the new binary com.apple.quarantine'd so every new exec hangs in _dyld_start (issue #137): it
+# xattr-de-quarantines the resolved binary after the update. DRIVER-AWARE (updates whichever runtime
+# the active driver binds via DRIVER_AGENT_BINARY/_NPM_PKG/_BREW_PKG/_NATIVE_UPDATE) and FAIL-SOFT (a
+# missing runtime / failed installer command warns, never hard-aborts). Any value other than "on" is
+# off. Defaulted here so the mechanism + CLI see it under `set -u`.
+: "${AGENT_UPDATE:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)

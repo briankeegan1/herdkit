@@ -4836,6 +4836,26 @@ print("\n".join(working))
   cmd_reload
 }
 
+# ── herd agent-update: safe self-update of the AGENT RUNTIME (HERD-149) ──────────────────────────
+# Distinct from `herd update` (which pulls the herdkit ENGINE): this updates the agent RUNTIME the
+# active driver points at (claude — or, via the driver seam, codex/grok). Opt-in via AGENT_UPDATE;
+# off (default) is a no-op. Detects the installer (brew/npm/native), runs the update, and de-quarantines
+# the binary on macOS (the issue #137 footgun). The mechanism lives in scripts/herd/agent-update.sh;
+# this just loads config + the driver seam and delegates. --dry-run previews commands without running.
+cmd_agent_update() {
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # driver.sh (for herd_driver_agent_value) is sourced at the top of this file; agent-update.sh adds
+  # the mechanism. Both define functions only, so sourcing here is side-effect-free.
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/agent-update.sh"
+  agent_update_run "$@"
+}
+
 # ── herd log / herd why: read the engine journal ────────────────────────────────────────────────
 # The journal is the append-only forensic record written by the engine components (agent-watch.sh,
 # herd-review.sh, cmd_reload) via scripts/herd/journal.sh. `herd log` pages it; `herd why <pr>`
@@ -5605,6 +5625,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       coordinator skill, and reload the workspace in one step;
                                       refuses if the engine checkout is dirty or builders are
                                       mid-flight (--force overrides both guards)
+  herd agent-update [--dry-run]       safely update the AGENT RUNTIME (claude/codex/grok per driver):
+                                      opt-in via AGENT_UPDATE (off = no-op); detects the installer
+                                      (brew/npm/native), runs it, and de-quarantines the binary on
+                                      macOS (issue #137). --dry-run previews without running
   herd log [--pr N] [--tail]          page the engine journal (.herd/journal.jsonl): one line per
                                       gate event; --pr filters to one PR, --tail follows live
   herd status                         one-shot READ-ONLY control-room snapshot for THIS project:
@@ -5710,6 +5734,7 @@ case "${1:-help}" in
   cost)    shift; cmd_cost "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   update)  shift; cmd_update "$@" ;;
+  agent-update) shift; cmd_agent_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   backend) shift; cmd_backend "$@" ;;
   report)  shift; cmd_report "$@" ;;
