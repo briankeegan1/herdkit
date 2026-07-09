@@ -124,6 +124,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # load-bearing core run with NO herdr panes under HERD_DRIVER=headless (panes-as-a-view); the default
 # herdr-claude driver delegates to the exact same herdr commands. Defines functions only; lib-safe.
 . "$HERE/driver.sh"
+# Bounded console sections (HERD-243) — the shared age-out / ack / ledger-trim helpers behind the
+# tracker-heal and builder-note surfaces, so both age out by one rule. Defines functions + two
+# constants (CONSOLE_ROW_RETENTION, CONSOLE_LEDGER_MAX); display-only, lib-safe.
+. "$HERE/console-section.sh"
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
@@ -310,9 +314,13 @@ INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounde
 #     ("<epoch>\t<slug>\t<text>\t<ts>"), newest appended; rendered newest-first by build_builder_notes.
 #   • BUILDER_NOTES_CURSOR — byte offset into the live journal already consumed (first scan pins to
 #     EOF so a restart never re-floods historical notes).
+#   • BUILDER_NOTES_ACK — the ACK ledger (HERD-243): one verbatim ledger line per note the operator
+#     has handled via `herd notes ack <all|n>`. An acked note leaves the console IMMEDIATELY; the
+#     journal (the history) is never touched. Notes also age out of display after CONSOLE_ROW_RETENTION.
 BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
 BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
-BUILDER_NOTES_LEDGER_MAX=20
+BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
+BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -523,25 +531,39 @@ build_blocked() {
   [ -n "$rows" ] && BLOCKED="$rows"
 }
 
-# build_tracker_drift — the "tracker healed" section: the last 3 heal actions from $TRACKER_HEAL_FILE
-# ("<epoch> <status> <ref> <pr> <found-state>", written by tracker-state-sweep.sh), newest first.
-# Empty (TRACKER_DRIFT="") when the file is absent/empty so render omits the section. A `healed` row
-# is calm green (drift was auto-corrected); a `failed` row is loud red (still stuck, retries next
-# sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86).
+# _tracker_heal_row — render ONE heal ledger line ("<epoch> <status> <ref> <pr> <found-state>").
+# A `healed` row is calm green (drift was auto-corrected); a `failed` row is loud red (still stuck,
+# retries next sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86).
+_tracker_heal_row() {
+  local epoch status ref pr state hhmm glyph color
+  local IFS=$' \t\n'
+  read -r epoch status ref pr state <<EOF
+$1
+EOF
+  [ -n "${ref:-}" ] || return 1
+  hhmm="$(epoch_to_hhmm "$epoch")"
+  case "$status" in
+    healed) glyph='🩹'; color="$C_GREEN" ;;
+    *)      glyph='⚠️'; color="$C_RED"   ;;
+  esac
+  printf '    %s%s%s %s%s%s %s%s%s %s#%s was %s · %s%s' \
+    "$color" "$glyph" "$C_RESET" "$C_BOLD" "$ref" "$C_RESET" \
+    "$color" "$status" "$C_RESET" "$C_DIM" "$pr" "$state" "$hhmm" "$C_RESET"
+}
+
+# build_tracker_drift — the "tracker healed" section: the newest 3 STILL-RELEVANT heal actions from
+# $TRACKER_HEAL_FILE (written by tracker-state-sweep.sh), newest first. Empty (TRACKER_DRIFT="") when
+# the file is absent/empty — or when every row has aged out — so render omits the section.
+# Age-out (HERD-243, via the shared bounded-section helper): a calm `healed` row leaves the DISPLAY
+# after CONSOLE_ROW_RETENTION (the correction landed; it is history now, and the journal keeps it),
+# while a LOUD `failed` row never ages out — a stuck drift stays on screen until the sweep heals it.
 build_tracker_drift() {
   TRACKER_DRIFT=""
-  [ -s "$TRACKER_HEAL_FILE" ] || return 0
-  local epoch status ref pr state hhmm glyph color rows=""
-  while read -r epoch status ref pr state; do
-    [ -n "${ref:-}" ] || continue
-    hhmm="$(epoch_to_hhmm "$epoch")"
-    case "$status" in
-      healed) glyph='🩹'; color="$C_GREEN" ;;
-      *)      glyph='⚠️'; color="$C_RED"   ;;
-    esac
-    rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${status}${C_RESET} ${C_DIM}#${pr} was ${state} · ${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$TRACKER_HEAL_FILE" | head -3)
-  [ -n "$rows" ] && TRACKER_DRIFT="$rows"
+  local rows
+  rows="$(herd_console_section "$TRACKER_HEAL_FILE" 3 \
+    herd_console_classify_tracker_heal _tracker_heal_row)"
+  [ -n "$rows" ] && TRACKER_DRIFT="${rows}"$'\n'
+  return 0
 }
 
 # build_spawn_holds — the "spawn holds" section (HERD-94): one row per intent the durable-queue
@@ -1189,30 +1211,38 @@ EOF
 
   [ -n "$new_off" ] && printf '%s' "$new_off" > "$BUILDER_NOTES_CURSOR" 2>/dev/null || true
 
-  # Bound the ledger to the most recent BUILDER_NOTES_LEDGER_MAX rows (tail-keep).
-  if [ -f "$BUILDER_NOTES_LEDGER" ]; then
-    local n; n="$(wc -l < "$BUILDER_NOTES_LEDGER" 2>/dev/null | tr -cd '0-9')"
-    if [ "${n:-0}" -gt "$BUILDER_NOTES_LEDGER_MAX" ] 2>/dev/null; then
-      tail -n "$BUILDER_NOTES_LEDGER_MAX" "$BUILDER_NOTES_LEDGER" > "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null \
-        && mv "$BUILDER_NOTES_LEDGER.tmp" "$BUILDER_NOTES_LEDGER" 2>/dev/null \
-        || rm -f "$BUILDER_NOTES_LEDGER.tmp" 2>/dev/null || true
-    fi
-  fi
+  # Bound BOTH ledger files on write (tail-keep, shared helper): the notes ledger and its ack
+  # sidecar, so neither surface can grow unbounded.
+  herd_console_trim "$BUILDER_NOTES_LEDGER" "$BUILDER_NOTES_LEDGER_MAX"
+  herd_console_trim "$BUILDER_NOTES_ACK" "$BUILDER_NOTES_LEDGER_MAX"
 }
 
-# build_builder_notes — the "builder notes" console section: most recent ledger entries, newest
-# first. Empty (BUILDER_NOTES_ROWS="") when the ledger is absent/empty so render() omits the section
-# and the console is byte-identical when unused. Pure renderer — no journal I/O.
+# _builder_note_row — render ONE note ledger line ("<epoch>\t<slug>\t<text>\t<ts>").
+_builder_note_row() {
+  local epoch slug text ts hhmm
+  IFS=$'\t' read -r epoch slug text ts <<EOF
+$1
+EOF
+  [ -n "${slug:-}" ] || return 1
+  hhmm="$(epoch_to_hhmm "$epoch")"
+  printf '    %s📝%s %s%s%s %s %s%s%s' \
+    "$C_CYAN" "$C_RESET" "$C_BOLD" "$slug" "$C_RESET" "${text:-}" "$C_DIM" "$hhmm" "$C_RESET"
+}
+
+# build_builder_notes — the "builder notes" console section: the newest 5 STILL-RELEVANT ledger
+# entries, newest first. Empty (BUILDER_NOTES_ROWS="") when the ledger is absent/empty — or when every
+# note has been acked or aged out — so render() omits the section and the console is byte-identical
+# when unused. Pure renderer — no journal I/O.
+# Notes are CALM by definition, so (HERD-243, shared bounded-section helper) each one leaves the
+# DISPLAY after CONSOLE_ROW_RETENTION, and `herd notes ack <all|n>` clears one immediately. Neither
+# touches the journal: the history of every note survives both.
 build_builder_notes() {
   BUILDER_NOTES_ROWS=""
-  [ -s "$BUILDER_NOTES_LEDGER" ] || return 0
-  local epoch slug text ts hhmm rows=""
-  while IFS=$'\t' read -r epoch slug text ts; do
-    [ -n "${slug:-}" ] || continue
-    hhmm="$(epoch_to_hhmm "$epoch")"
-    rows="${rows}    ${C_CYAN}📝${C_RESET} ${C_BOLD}${slug}${C_RESET} ${text} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | head -5)
-  [ -n "$rows" ] && BUILDER_NOTES_ROWS="$rows"
+  local rows
+  rows="$(herd_console_section "$BUILDER_NOTES_LEDGER" 5 \
+    herd_console_classify_builder_note _builder_note_row "$BUILDER_NOTES_ACK")"
+  [ -n "$rows" ] && BUILDER_NOTES_ROWS="${rows}"$'\n'
+  return 0
 }
 
 # render — paint the whole rollup card, but ONLY when the computed frame changed.

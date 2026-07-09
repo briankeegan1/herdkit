@@ -1615,6 +1615,92 @@ sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
   say "noted · ${c_bold}${slug}${c_rst}: $text"
 }
 
+# ── herd notes: list / acknowledge the builder notes on the console (HERD-243) ───────────────────
+# `herd note` files a finding; the watcher renders it in the "builder notes" console section. Without
+# an ACK that row sits there until five newer notes displace it — an append-only surface the operator
+# learns to ignore. `herd notes` lists the notes currently taking console space (newest first,
+# numbered); `herd notes ack <n>` / `herd notes ack all` clears them from the DISPLAY immediately by
+# recording the exact ledger line in an ack sidecar. The journal is never touched: `herd log` still
+# has every note. Notes also age out of the display on their own after CONSOLE_ROW_RETENTION (2h).
+# Both the ledger and the ack sidecar are bounded on write (shared herd_console_trim).
+cmd_notes() {
+  local sub="list"
+  case "${1:-}" in
+    -h|--help) say "usage: herd notes [list] | herd notes ack <n|all>"; return 0 ;;
+    "") ;;
+    list|ack) sub="$1"; shift ;;
+    *) die "herd notes: unknown subcommand $1 (usage: herd notes [list] | herd notes ack <n|all>)" ;;
+  esac
+
+  _journal_load_config
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/console-section.sh"
+  local ledger="$WORKTREES_DIR/.agent-watch-builder-notes"
+  local ack="$WORKTREES_DIR/.agent-watch-builder-notes-acked"
+
+  # The notes still on the console: newest first, aged-out and already-acked rows dropped. ONE shared
+  # decision (herd_console_visible_lines) with the watcher, so `herd notes` can never disagree with
+  # what the operator is looking at.
+  local visible
+  visible="$(herd_console_visible_lines "$ledger" "$CONSOLE_LEDGER_MAX" \
+    herd_console_classify_builder_note "$ack")"
+
+  if [ -z "$visible" ]; then
+    say "no builder notes on the console"
+    return 0
+  fi
+
+  local n=0 line slug text ts
+  if [ "$sub" = "list" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      n=$((n+1))
+      IFS=$'\t' read -r _ slug text ts <<EOF
+$line
+EOF
+      say "  ${c_bold}${n}${c_rst}  📝 ${c_bold}${slug}${c_rst}  ${text}  (${ts})"
+    done <<< "$visible"
+    say ""
+    say "ack a handled note with: herd notes ack <n>   (or: herd notes ack all)"
+    return 0
+  fi
+
+  # ── ack ──────────────────────────────────────────────────────────────────────────────────────
+  local which="${1:-}"
+  [ -n "$which" ] || die "usage: herd notes ack <n|all>"
+  local total; total="$(printf '%s\n' "$visible" | grep -c .)"
+  local picked=""
+  case "$which" in
+    all) picked="$visible" ;;
+    ''|*[!0-9]*) die "herd notes ack: <n> must be a number or 'all' (got: $which)" ;;
+    *)
+      [ "$which" -ge 1 ] && [ "$which" -le "$total" ] \
+        || die "herd notes ack: no note #$which (${total} on the console — run: herd notes)"
+      picked="$(printf '%s\n' "$visible" | sed -n "${which}p")"
+      ;;
+  esac
+  [ -n "$picked" ] || die "herd notes ack: nothing to acknowledge"
+
+  local dir="${ack%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || die "herd notes ack: cannot create $dir"
+  printf '%s\n' "$picked" >> "$ack" 2>/dev/null || die "herd notes ack: cannot write $ack"
+
+  # An ack for a line the ledger has already evicted is dead weight — keep only acks that still
+  # correspond to a live ledger row, then bound the sidecar. Fail-soft: a failed prune is not an error.
+  if [ -s "$ledger" ] && [ -s "$ack" ]; then
+    local tmp="$ack.tmp.$$"
+    if grep -Fxf "$ledger" "$ack" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$ack" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+  herd_console_trim "$ack"
+
+  local count; count="$(printf '%s\n' "$picked" | grep -c .)"
+  say "acked ${c_bold}${count}${c_rst} builder note$([ "$count" = 1 ] || printf 's') · console cleared (journal keeps the history)"
+}
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -6024,6 +6110,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       within a tick (no human clipboard). Journals a builder_note
                                       event (component=builder, slug, text ≤~300 chars). Ship-dormant:
                                       no behavior change unless a builder calls it
+  herd notes [list|ack <n|all>]       list the builder notes currently on the console (newest first,
+                                      numbered) and ACK the handled ones (HERD-243): an acked note
+                                      leaves the DISPLAY immediately; the journal keeps every note.
+                                      Unacked notes age out of the display on their own after 2h
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -6198,6 +6288,7 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   note)    shift; cmd_note "$@" ;;
+  notes)   shift; cmd_notes "$@" ;;
   config)  shift; cmd_config "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;

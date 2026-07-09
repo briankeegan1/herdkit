@@ -41,6 +41,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 # shellcheck source=/dev/null
 . "$HERE/journal.sh"
+# Bounded console ledgers (HERD-243) — sourced for herd_console_trim, the ONE tail-keep bound shared
+# with the watcher's builder-notes ledger. Defines functions + constants only.
+# shellcheck source=/dev/null
+. "$HERE/console-section.sh"
 REPO="$PROJECT_ROOT"
 
 _tsweep_die() { echo "tracker-state-sweep: $1" >&2; exit "${2:-1}"; }
@@ -158,19 +162,18 @@ _tsweep_probe_and_heal() {
 
 # ── console-note surface (the watcher renders the last lines) ──────────────────
 # One append-only line per heal ACTION: "<epoch> <status> <ref> <pr> <found-state>".
-# status ∈ healed | failed. Trimmed to the last 50 lines so a persistently-failing heal (which
-# re-appends every sweep, by design — it stays visible until it succeeds) can never grow unbounded.
+# status ∈ healed | failed. Trimmed ON WRITE to the last CONSOLE_LEDGER_MAX lines by the shared
+# bounded-section helper (HERD-243) — the same bound the builder-notes ledger uses — so a
+# persistently-failing heal (which re-appends every sweep, by design: it stays visible until it
+# succeeds) can never grow unbounded. Display age-out lives in the watcher's build_tracker_drift.
 _tsweep_note() {
-  local status="$1" ref="$2" pr="$3" state="$4" epoch tmp
+  local status="$1" ref="$2" pr="$3" state="$4" epoch
   [ -n "$NOTE_FILE" ] || return 0
   epoch="$(date +%s 2>/dev/null || echo 0)"
   local dir="${NOTE_FILE%/*}"
   [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
   printf '%s %s %s %s %s\n' "$epoch" "$status" "$ref" "$pr" "$state" >> "$NOTE_FILE" 2>/dev/null || return 0
-  if [ "$(wc -l < "$NOTE_FILE" 2>/dev/null | tr -cd '0-9')" -gt 50 ] 2>/dev/null; then
-    tmp="$(mktemp "${TMPDIR:-/tmp}/tsweep-note.XXXXXX")" && \
-      tail -n 50 "$NOTE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$NOTE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
-  fi
+  herd_console_trim "$NOTE_FILE"
 }
 
 # ── ledger: refs already confirmed Done (skip → no backend read) ──────────────
