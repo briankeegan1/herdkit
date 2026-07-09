@@ -1958,11 +1958,10 @@ _lane_spawn_inflight() {
   return 1
 }
 
-# _resolver_lane_inflight — true iff a resolver lane dispatch is STILL running. The foreground
-# spawn_resolver serialized dispatches implicitly; backgrounding them would let the resolve pass fire
-# one `herd-resolve.sh` per CONFLICTING PR in the SAME tick, and each of those runs `git worktree add`
-# against the same $MAIN — N concurrent writers contending on one index lock. Sweeps corpses first, so
-# a watcher killed mid-dispatch cannot block resolver dispatch forever.
+# _resolver_lane_inflight — true iff any resolver lane dispatch is STILL running. A pure liveness
+# predicate: it drives `_spawn_resolver_wait` (the test/sim synchronization seam) and NOTHING gates a
+# dispatch on it. See _resolve_lane_lock_acquire for why serialization lives in the lane, not here.
+# Sweeps corpses first, so a watcher killed mid-dispatch cannot make this read "busy" forever.
 _resolver_lane_inflight() {
   _spawn_inflight_sweep
   local _rli_f
@@ -3794,11 +3793,6 @@ spawn_resolver() {
   # push` over nothing. Refused before record_resolve_attempt, so no respawn round is burned either.
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
-  # DISPATCH SERIALIZATION (HERD-237): one resolver lane at a time. Refused BEFORE
-  # record_resolve_attempt — exactly like the quiesce hold above — so no respawn round is burned, and
-  # NON-ZERO so `_resolver_in_flight … || spawn_resolver …` does not read this as "a resolver is now
-  # running". The conflict simply keeps its row and is re-dispatched on a later tick.
-  _resolver_lane_inflight && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs")"
   _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha"
@@ -3823,14 +3817,69 @@ _spawn_resolver_wait() {
   return 0
 }
 
+# ── Resolver lane serialization (HERD-237) ───────────────────────────────────────────────────────
+# Every resolver lane runs `git worktree add` against the SAME $MAIN. The foreground spawn_resolver
+# serialized them implicitly: the resolve pass dispatched all of a tick's conflicts, one after another.
+# Backgrounding the lane keeps every dispatch — the ledger rows, the ACK events, the respawn budget are
+# all unchanged — but the lanes would now overlap. So the serialization moves INTO the lane: a dispatch
+# is never refused, it just queues behind whichever lane is already running. The tick waits for none of
+# it.
+#
+# It must be a LOCK, not a dispatch-time guard. A guard that refuses `spawn_resolver` is a safety-rail
+# bypass: `_handle_stale_dup` and `_handle_ci_repair` call it AFTER burning `record_refix` (a
+# record-first once-guard) and journaling the heal — so a refusal there strands the sha behind a spent
+# guard that no later tick can retry, leaving a durable "needs you" row for a heal the watcher itself
+# declined. Two of their call sites (pane vanished mid-bounce) burn that guard several branches
+# upstream and CANNOT hoist a check above it. Refusing a dispatch is therefore never safe here, at any
+# depth. Queuing one always is.
+#
+# Fail-soft in the strongest sense: if the lock cannot be taken within the budget, the lane runs ANYWAY
+# (journaled). Losing serialization degrades to the concurrency we would have had with no lock at all;
+# dropping the dispatch would lose the heal.
+RESOLVE_LANE_LOCK="$TREES/.spawn-resolve-lane.lock"   # a lock DIRECTORY (mkdir is atomic everywhere)
+_RESOLVE_LANE_LOCK_STALE=600     # seconds before a held lock is presumed abandoned and broken
+
+# _resolve_lane_lock_acquire — take the lane lock, or return 1 after the wait budget. Breaks a lock
+# whose holder has been gone longer than _RESOLVE_LANE_LOCK_STALE (a watcher killed mid-dispatch), so a
+# corpse can never wedge resolver dispatch. HERD_RESOLVE_LANE_LOCK_WAIT is a test seam, not a config key.
+_resolve_lane_lock_acquire() {
+  local _rll_waited=0 _rll_max="${HERD_RESOLVE_LANE_LOCK_WAIT:-900}" _rll_ts _rll_now
+  case "$_rll_max" in ''|*[!0-9]*) _rll_max=900 ;; esac
+  while :; do
+    if mkdir "$RESOLVE_LANE_LOCK" 2>/dev/null; then
+      printf '%s\n' "$(_now_epoch)" > "$RESOLVE_LANE_LOCK/ts" 2>/dev/null || true
+      return 0
+    fi
+    _rll_ts="$(cat "$RESOLVE_LANE_LOCK/ts" 2>/dev/null || true)"
+    _rll_now="$(_now_epoch)"
+    case "$_rll_ts" in ''|*[!0-9]*) _rll_ts=0 ;; esac
+    if [ "$_rll_ts" -gt 0 ] && [ "$(( _rll_now - _rll_ts ))" -gt "$_RESOLVE_LANE_LOCK_STALE" ]; then
+      journal_append resolver_lane_lock_broken age "$(( _rll_now - _rll_ts ))"
+      rm -rf "$RESOLVE_LANE_LOCK" 2>/dev/null || true
+      continue
+    fi
+    [ "$_rll_waited" -ge "$_rll_max" ] && return 1
+    sleep 1 2>/dev/null || return 1
+    _rll_waited=$(( _rll_waited + 1 ))
+  done
+}
+_resolve_lane_lock_release() { rm -rf "$RESOLVE_LANE_LOCK" 2>/dev/null || true; }
+
 # _spawn_resolver_lane <slug> <pr#> <sha> — the backgrounded body of spawn_resolver: launch the lane,
-# observe the ACK, journal. Identical to the pre-HERD-237 foreground tail, verbatim.
+# observe the ACK, journal. The pre-HERD-237 foreground tail verbatim, wrapped in the lane lock.
 _spawn_resolver_lane() {
   local rs="$1" rp="$2" rsha="$3"
-  local _sr_rc=0 _sr_ack _sr_roster
+  local _sr_rc=0 _sr_ack _sr_roster _sr_locked=""
+  if _resolve_lane_lock_acquire; then
+    _sr_locked=1
+  else
+    journal_append resolver_lane_lock_timeout pr "$rp" slug "$rs" \
+      detail "proceeding unserialized — a dropped dispatch would strand the conflict"
+  fi
   _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
+  [ -n "$_sr_locked" ] && _resolve_lane_lock_release
   # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
   # spawn and can never show it) and fall back to the pane probe, so 'acked' is observed, not assumed.
   _sr_roster="$(herd_driver_agent_list_json 2>/dev/null || printf '{}')"

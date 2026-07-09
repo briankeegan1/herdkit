@@ -269,4 +269,38 @@ grep -q "spawn_claim_lost slug slug-lost lane quick action done" "$JLOG" \
 grep -q "spawn_launched" "$JLOG" && fail "(8) a worker with no claim journaled a phantom spawn_launched"
 pass
 
+# ── Case 9: `release` is a single atomic rename — it can never create a phantom empty .req ─────────
+# `release` used to `mv` then `touch "$released"`. Backgrounded, it runs concurrently with the parent
+# tick's `next`: if `next` re-claims the just-released intent in that gap, the trailing `touch` CREATES
+# an empty <id>.req beside the live <id>.req.mine. Assert the touch happens BEFORE the rename, so the
+# window does not exist — and that the released intent still gets a fresh stale-clock (HERD-116).
+rm -f "$T/trees/spawn-queue"/* 2>/dev/null
+enqueue slug-rel quick "release round-trip"
+step next >/dev/null
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+id="$(basename "${mine%.req.mine}")"
+age "$mine"                                      # a stale-looking claim …
+before_mtime="$(python3 -c 'import os,sys;print(int(os.stat(sys.argv[1]).st_mtime))' "$mine")"
+step release "$mine" >/dev/null
+released="$T/trees/spawn-queue/$id.req"
+[ -f "$released" ] || fail "(9) release did not restore the .req"
+[ "$(ls "$T/trees/spawn-queue"/*.req 2>/dev/null | wc -l | tr -d ' ')" = "1" ] \
+  || fail "(9) release produced more than one .req (a phantom empty intent)"
+[ -s "$released" ] || fail "(9) the released intent is EMPTY — the phantom-.req race"
+after_mtime="$(python3 -c 'import os,sys;print(int(os.stat(sys.argv[1]).st_mtime))' "$released")"
+[ "$after_mtime" -gt "$before_mtime" ] || fail "(9) release did not restart the stale clock (HERD-116 spin)"
+# And the release survives a `next` racing it: the claim it hands back is immediately re-servable.
+out="$(step next)"
+case "${out%%$'\n'*}" in CLAIMED*) : ;; *) fail "(9) a released intent was not re-servable" ;; esac
+# The properties above hold for BOTH orderings; only the ORDER closes the interleaving window, and no
+# black-box test can schedule that interleaving reliably. Assert the order itself, in the source.
+python3 - "$STEP" <<'ORDER' || fail "(9) release must touch the CLAIM before renaming it — the mv-then-touch order recreates a phantom .req when next() wins the gap"
+import re, sys
+body = re.search(r'^  release\)(.*?)^    ;;', open(sys.argv[1]).read(), re.S | re.M).group(1)
+t = body.index('touch "$mine"')
+m = body.index('mv -f "$mine"')
+sys.exit(0 if t < m else 1)
+ORDER
+pass
+
 echo "ALL PASS ($PASS checks)"

@@ -25,9 +25,10 @@
 #
 #   C. SLOW RESOLVER — spawn_resolver must return before its lane does, with the respawn-budget ledger
 #      row already down (record-first), and the resolver_spawn ACK event must still be journaled once
-#      the lane lands. A SECOND dispatch while one is in flight must be REFUSED (non-zero, no round
-#      burned): backgrounding must not turn the resolve pass into N concurrent `git worktree add`s
-#      against one $MAIN. The landed lane must release the dispatch slot.
+#      the lane lands. A SECOND dispatch while one is in flight must still be ACCEPTED — refusing it
+#      would strand a caller that has already burned its record-first once-guard — and must SERIALIZE
+#      behind the lane lock, so backgrounding never turns the resolve pass into N concurrent
+#      `git worktree add`s against one $MAIN.
 #
 #   D. HEALTHY = BYTE-IDENTICAL — the same drain against a fast lane and a healthy gh must produce the
 #      same journal event stream as before this feature: no gh_timeout events, spawn_launched exactly
@@ -251,29 +252,63 @@ c_elapsed=$(( $(now) - c_start ))
   && ok "resolver_spawn ACK not asserted before the lane returned" \
   || bad "resolver_spawn journaled before the lane could ACK"
 
-# A SECOND conflict in the same tick must NOT fire a concurrent `git worktree add` against $MAIN.
-# Refused before record_resolve_attempt, so no respawn round is burned; the conflict retries next tick.
-_sim_rows_before="$(grep -c 'other-slug' "$RESOLVE_STATE" 2>/dev/null || true)"
+# A SECOND conflict dispatched while the first lane is still running must NEVER be REFUSED. Callers
+# (_handle_stale_dup, _handle_ci_repair) reach spawn_resolver with a record-first once-guard already
+# burned — two of their sites burn it several branches upstream and cannot pre-check anything — so a
+# refusal here strands the sha behind a spent guard that no later tick can retry. It must DISPATCH,
+# record its ledger row, and let its LANE queue behind the lock.
 if spawn_resolver other-slug 42 feat/other-slug def5678; then
-  bad "a second resolver dispatch ran CONCURRENTLY with a live one (N× git worktree add on \$MAIN)"
+  ok "a second dispatch during a live lane is ACCEPTED (never refused behind a caller's spent guard)"
 else
-  ok "a second resolver dispatch is refused while one is in flight (returns non-zero → not 'running')"
+  bad "spawn_resolver REFUSED a dispatch — a caller that already burned record_refix strands its sha"
 fi
-[ "${_sim_rows_before:-0}" = "$(grep -c 'other-slug' "$RESOLVE_STATE" 2>/dev/null || true)" ] \
-  && ok "the refused dispatch burned no respawn round (refused above record_resolve_attempt)" \
-  || bad "the refused dispatch still recorded a resolve attempt"
+grep -q 'other-slug' "$RESOLVE_STATE" 2>/dev/null \
+  && ok "the second dispatch recorded its resolve-attempt row (respawn budget stays sound)" \
+  || bad "the second dispatch recorded no ledger row — _resolver_in_flight would read it as dead"
+
+# …and its LANE serializes: the lock means one `git worktree add` against $MAIN at a time.
+[ -d "$RESOLVE_LANE_LOCK" ] \
+  && ok "the running lane holds the resolver lane lock (the second lane is queued, not concurrent)" \
+  || bad "no lane lock is held while a resolver lane runs"
+
+# THE CALLER'S LEDGER ORDER (the review's failure scenario, exactly). _handle_stale_dup burns a
+# record-first once-guard (record_refix) and journals the heal BEFORE calling spawn_resolver. Replay
+# that order while a lane is in flight: the dispatch must land, so a later tick reads the resolver as
+# in-flight rather than painting the durable "needs you · the bounce was delivered to nobody" row.
+record_refix 43 sha43 stale-slug stale
+if _resolver_in_flight stale-slug 43 sha43; then
+  bad "a resolver read as in-flight for stale-slug before it was dispatched"
+else
+  spawn_resolver stale-slug 43 feat/stale-slug sha43
+  if _resolver_in_flight stale-slug 43 sha43; then
+    ok "a caller that already burned record_refix still gets a dispatch (no stranded once-guard)"
+  else
+    bad "record_refix burned but NO resolver dispatched — this sha's heal is permanently lost"
+  fi
+fi
+refix_attempted 43 sha43 stale \
+  && ok "the once-guard is spent AND a dispatch exists to justify it (ledger and reality agree)" \
+  || bad "record_refix did not register the once-guard"
 
 _spawn_resolver_wait
-[ "$(jgrep '"event":"resolver_spawn"')" -ge 1 ] \
-  && ok "the resolver lane landed: its ACK event (rc + acked) is journaled" \
-  || bad "the resolver lane landed but never journaled its ACK"
+[ "$(jgrep '"event":"resolver_spawn"')" -ge 3 ] \
+  && ok "ALL THREE resolver lanes landed and journaled their ACK — no dispatch was lost" \
+  || bad "only $(jgrep '"event":"resolver_spawn"') of 3 resolver lanes journaled an ACK"
+[ "$(grep -c '^herd-resolve.sh' "$LANELOG")" = "3" ] \
+  && ok "all three lanes actually ran herd-resolve.sh (serialized, never dropped)" \
+  || bad "$(grep -c '^herd-resolve.sh' "$LANELOG") lane invocations (want 3)"
+[ "$(jgrep '"event":"resolver_lane_lock_timeout"')" = "0" ] \
+  && ok "neither lane had to fall back to unserialized execution" \
+  || bad "a lane timed out on the lane lock"
 
-# Once the lane lands and its marker is swept, the next conflict dispatches normally.
+# The lock and the markers are released once the lanes land — nothing wedges the next conflict.
 _spawn_inflight_sweep
+[ -d "$RESOLVE_LANE_LOCK" ] && bad "the landed lanes left the lane lock held — resolver dispatch wedges" \
+                           || ok "the landed lanes released the lane lock"
 if _resolver_lane_inflight; then
-  bad "a landed resolver lane left its marker behind — resolver dispatch would be blocked forever"
+  bad "a landed resolver lane left its marker behind"
 else
-  ok "the landed lane released the resolver dispatch slot"
+  ok "the landed lanes released their inflight markers"
 fi
 
 # ── D. the healthy path is byte-identical ────────────────────────────────────────────────────────

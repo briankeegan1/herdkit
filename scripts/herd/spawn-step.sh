@@ -42,9 +42,14 @@ mkdir -p "$Q"
 cmd="${1:-}"
 
 # _spawn_pid_starttime <pid> — the pid's process start-time, or empty. The recycling guard: a pid
-# reused by an unrelated process reports a different start-time. Mirrors agent-watch.sh's helper.
+# reused by an unrelated process reports a different start-time. Mirrors agent-watch.sh's _pid_starttime
+# EXACTLY, including its HERD_PID_STARTTIME_CMD test seam — the two helpers read and write the same
+# .owner sidecar, so a hermetic test that stubs the seam on one side must not see the other shell out
+# to a real `ps`.
 _spawn_pid_starttime() {
-  ps -o lstart= -p "${1:-}" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
+  local p="${1:-}"; [ -n "$p" ] || return 0
+  if [ -n "${HERD_PID_STARTTIME_CMD:-}" ]; then "$HERD_PID_STARTTIME_CMD" "$p" 2>/dev/null; return 0; fi
+  ps -o lstart= -p "$p" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
 }
 
 # _spawn_owner_alive <owner-sidecar> — true iff the sidecar names a process that is STILL RUNNING and
@@ -162,11 +167,16 @@ case "$cmd" in
     # sidecar does NOT survive: the intent is back in the queue, owned by nobody.
     released="${mine%.mine}"
     rm -f "${mine%.req.mine}.owner" 2>/dev/null || true
+    # Restart the stale clock BEFORE the rename, not after (HERD-237). `release` used to `mv` and then
+    # `touch "$released"`. Pre-HERD-237 that pair only ever ran in the drain's foreground, serialized
+    # against `next`; it now runs in the background lane worker while the parent tick's `next` walks the
+    # queue. If `next` re-claims the just-released intent in the gap, the trailing `touch` CREATES an
+    # empty `<id>.req` beside the live `<id>.req.mine` — a phantom intent. Touching the claim first and
+    # letting `mv` carry the fresh mtime across makes the release a single atomic rename with no window.
+    # (The clock still restarts: a just-released intent must not be instantly reclaimable as "stale", or
+    # the enqueue age leaks back in and revives the HERD-116 spin.)
+    touch "$mine" 2>/dev/null || true
     mv -f "$mine" "$released" 2>/dev/null || true
-    # Restart the stale clock on release too (mv preserves mtime): a just-released intent must not be
-    # instantly reclaimable as "stale" on the next claim, or the enqueue age would leak back in and
-    # revive the HERD-116 spin. A truly dead watcher's claim still ages 5 min from its last touch.
-    touch "$released" 2>/dev/null || true
     ;;
   skip)
     mine="${2:?usage: spawn-step.sh skip <claimed-path> <reason>}"
