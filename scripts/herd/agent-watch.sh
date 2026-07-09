@@ -1746,7 +1746,7 @@ _review_gate_step() {
     rm -f "$_esc_file" 2>/dev/null || true
     # (d) durable record of the review-lane step-up; the caller paints the '⬆️  escalated to …' row.
     journal_append review_escalated pr "$pr" sha "$sha" model "$_rt_model" \
-      rounds "$(refix_round_count "$pr")" reason "cheap reviewer missed the issue across refix rounds"
+      rounds "$(refix_round_count_kind "$pr" review)" reason "cheap reviewer missed the issue across refix rounds"
     _dispatch_review "$pr" "$slug" "$sha" "$_rt_model"
     echo ESCALATED; return 0   # distinct from RUNNING so the console shows the Opus upgrade
   fi
@@ -3309,10 +3309,20 @@ refix_attempted() {
 }
 
 # refix_round_count <pr#> — total bounces recorded for this PR (across all shas AND all kinds: the
-# review refix and the healthcheck refix SHARE one per-PR budget).
+# review refix and the healthcheck refix SHARE one per-PR BUDGET).
 refix_round_count() {
   [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
   awk -v p="$1" '$2==p{n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+}
+
+# refix_round_count_kind <pr#> <kind> — bounces of ONE kind for this PR. The shared budget above is
+# right for the CAP (a builder must not be bounced 3× by review and 3× again by health), but WRONG as
+# EVIDENCE about a particular gate: a health bounce proves nothing about whether the cheap REVIEWER
+# missed an issue (review note #2). Callers reasoning about a gate's own history use this.
+refix_round_count_kind() {
+  [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
+  awk -v p="$1" -v k="$2" \
+    '$2==p && (($5==k) || (k=="review" && $5=="")){n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
 }
 
 # record_refix <pr#> <headSha> <slug> [kind=review] — append one bounce record.
@@ -3326,25 +3336,96 @@ record_refix() {
 # be on a slug's red:
 #   (a) the watcher BOUNCED it — a refix record exists for this exact (pr,sha,kind); the agent has the
 #       re-task prompt and we are waiting for its push. We know the round, so we show k/cap.
-#   (b) a HUMAN (or the agent itself) is on it — no bounce for this sha, but the agent_status reads
-#       "working" against the SAME red sha. No round to show; still emphatically not "needs you".
+#   (b) an agent is BUSY — agent_status reads "working". NOTE (review, non-blocking #1): `herdr agent
+#       list` reports one GLOBAL status per agent; it carries no sha and no evidence of WHAT the agent
+#       is working on. So (b) is a heuristic: a builder busy with anything at all reads "fix in
+#       progress" and is not bounced until it goes idle. That is deliberately the SAFE direction — we
+#       never type a re-task prompt into a working agent, and the next idle tick corrects the row — but
+#       it is weaker than "is on THIS red", and the invariant it upholds is one-way: a `needs you` row
+#       is trustworthy; a `fix in progress` row can be a busy agent doing something else.
+#
+# THE CONVERSE MATTERS TOO (HERD-173 review BLOCK): a refix RECORD is not proof anyone is fixing. The
+# bounce writes its record BEFORE delivery, so the once-guard survives a failed send — which means a
+# record also exists when the wake PROVABLY failed, and when the agent died right after being woken. If
+# (a) trusted the record alone, that one-tick "auto-refix failed" escalation would be overwritten by
+# "fix in progress · awaiting push" on the very next tick and never recover: the once-guard blocks a
+# re-bounce, the sha never changes (nobody is fixing it), and the cap is never reached. So (a) is
+# gated on two DURABLE disproofs — a stuck marker (the wake failed) and a positive dead/missing
+# liveness probe (the agent is gone) — either of which drops the row back to the honest "needs you".
+#
 # Only a POSITIVE signal suppresses "needs you" — an absent/blind `herdr agent list` yields no note and
 # the row falls through to the honest needs-you (fail toward asking the human, never toward silence).
-#
+
+# Stuck-bounce marker: a DURABLE record that a bounce for this exact (pr,sha,kind) was delivered to
+# nobody — both `herdr pane run` + wake-verify attempts failed, or the agent pane was gone. Mirrors
+# _record_refix_dead's notify-once shape. Keyed by sha, so a new commit clears the way for a fresh
+# bounce. Its presence is what stops _active_fix_note claiming a fix is in flight.
+_refix_stuck_file()   { printf '%s' "$TREES/.agent-watch-refix-stuck-$3-$1-$2"; }
+_refix_stuck_seen()   { [ -f "$(_refix_stuck_file "$1" "$2" "$3")" ]; }
+_record_refix_stuck() { printf '%s\n' "${4:-unknown}" > "$(_refix_stuck_file "$1" "$2" "$3")" 2>/dev/null || true; }
+_refix_stuck_reason() { sed -n 1p "$(_refix_stuck_file "$1" "$2" "$3")" 2>/dev/null; }
+
+# _escalate_refix_stuck <pr#> <sha> <slug> <kind> <reason> — the SINGLE escalation point for "we bounced
+# this red and nobody is fixing it". Records the durable marker, journals, and notifies EXACTLY ONCE per
+# (pr,sha,kind) — the dead/missing and cap paths both notify, and the failed-wake path used to do
+# neither (it painted a row that the next tick overwrote). Idempotent: later ticks re-paint the row from
+# the marker without re-journaling or re-notifying.
+_escalate_refix_stuck() {
+  local _ers_pr="$1" _ers_sha="$2" _ers_slug="$3" _ers_kind="$4" _ers_reason="$5"
+  _refix_stuck_seen "$_ers_pr" "$_ers_sha" "$_ers_kind" && return 0
+  _record_refix_stuck "$_ers_pr" "$_ers_sha" "$_ers_kind" "$_ers_reason"
+  journal_append refix_stalled pr "$_ers_pr" sha "$_ers_sha" slug "$_ers_slug" kind "$_ers_kind" \
+    reason "$_ers_reason"
+  herd_driver_notify "⚠️ refix stalled: ${_ers_slug}" \
+    "PR #${_ers_pr} was bounced but nobody is fixing it — ${_ers_reason}" default
+}
+
 # _active_fix_note <pr#> <headSha> <slug> <kind> — print the in-progress phrase and return 0 when an
 # agent is on this red; print nothing and return 1 when nobody is.
 _active_fix_note() {
-  local _afn_pr="$1" _afn_sha="$2" _afn_slug="$3" _afn_kind="$4" _afn_rounds
-  if refix_attempted "$_afn_pr" "$_afn_sha" "$_afn_kind"; then
-    _afn_rounds="$(refix_round_count "$_afn_pr")"
-    printf 'fix in progress · awaiting push (round %s/%s)' "${_afn_rounds:-1}" "${REFIX_MAX_ROUNDS:-3}"
-    return 0
+  local _afn_pr="$1" _afn_sha="$2" _afn_slug="$3" _afn_kind="$4" _afn_rounds _afn_live
+  if refix_attempted "$_afn_pr" "$_afn_sha" "$_afn_kind" \
+     && ! _refix_stuck_seen "$_afn_pr" "$_afn_sha" "$_afn_kind"; then
+    # A bounce was delivered and not disproved by a stuck marker. One more disproof: the agent may have
+    # DIED after the wake. Only a POSITIVE dead/missing overturns the record ('unknown' keeps the row).
+    _afn_live="$(_agent_liveness "$_afn_slug")"
+    case "$_afn_live" in
+      dead|missing) : ;;
+      *)
+        _afn_rounds="$(refix_round_count "$_afn_pr")"
+        printf 'fix in progress · awaiting push (round %s/%s)' "${_afn_rounds:-1}" "${REFIX_MAX_ROUNDS:-3}"
+        return 0 ;;
+    esac
   fi
+  # (b) — also the RESCUE path: a human who re-tasks a builder whose bounce got stuck flips it back to
+  # "working", and the row must stop shouting "needs you" again.
   if [ "$(_agent_status "$_afn_slug")" = "working" ]; then
     printf 'fix in progress · awaiting push (agent working)'
     return 0
   fi
   return 1
+}
+
+# _refix_stalled_row <pr#> <headSha> <slug> <kind> <slug-cell> <pr-cell> — the row for a red that WAS
+# bounced but that nobody is on: the wake failed, or the agent died right after. Records the durable
+# stuck marker + journals + notifies EXACTLY ONCE per (pr,sha,kind), then prints the needs-you row every
+# tick thereafter (idempotent). This is the escalation that used to live for a single tick.
+_refix_stalled_row() {
+  local _rsr_pr="$1" _rsr_sha="$2" _rsr_slug="$3" _rsr_kind="$4" _rsr_sl="$5" _rsr_pn="$6"
+  local _rsr_reason _rsr_live _rsr_what
+  if _refix_stuck_seen "$_rsr_pr" "$_rsr_sha" "$_rsr_kind"; then
+    _rsr_reason="$(_refix_stuck_reason "$_rsr_pr" "$_rsr_sha" "$_rsr_kind")"
+  else
+    _rsr_live="$(_agent_liveness "$_rsr_slug")"
+    case "$_rsr_live" in
+      dead)    _rsr_reason="agent died after the bounce (session unwakeable)" ;;
+      missing) _rsr_reason="agent pane vanished after the bounce" ;;
+      *)       _rsr_reason="the bounce was delivered to nobody" ;;
+    esac
+    _escalate_refix_stuck "$_rsr_pr" "$_rsr_sha" "$_rsr_slug" "$_rsr_kind" "$_rsr_reason"
+  fi
+  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; *) _rsr_what="review blocked" ;; esac
+  printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_rsr_sl}${C_RESET}${_rsr_pn} ${C_RED}needs you · ${_rsr_what} · ${_rsr_kind} autofix stalled: ${_rsr_reason} · re-task by hand${C_RESET}"
 }
 
 # Dead-agent refix escalation dedup (HERD-114): the review-block path re-enters every tick while a PR
@@ -3357,12 +3438,13 @@ _refix_dead_seen()    { [ -f "$(_refix_dead_marker "$1" "$2")" ]; }
 _record_refix_dead()  { : > "$(_refix_dead_marker "$1" "$2")" 2>/dev/null || true; }
 
 # _maybe_arm_review_escalation <pr#> — called right AFTER record_refix. If this PR has now accumulated
-# at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed refix rounds, the cheap reviewer's PASS
-# has been proven wrong across two rounds — arm a one-shot Opus escalation for the PR's NEXT review
-# dispatch. Reuses the shared refix-round accounting (refix_round_count) — no parallel counter.
+# at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed REVIEW refix rounds, the cheap reviewer's
+# PASS has been proven wrong across two rounds — arm a one-shot Opus escalation for the PR's NEXT review
+# dispatch. Counts REVIEW rounds ONLY (refix_round_count_kind): a healthcheck bounce is evidence about
+# the SUITE, not about the reviewer, and must never arm an Opus re-review it says nothing about.
 _maybe_arm_review_escalation() {
   local _mare_pr="$1" _mare_rounds
-  _mare_rounds="$(refix_round_count "$_mare_pr")"
+  _mare_rounds="$(refix_round_count_kind "$_mare_pr" review)"
   [ "${_mare_rounds:-0}" -ge "${REVIEW_EVIDENCE_ESCALATE_ROUNDS:-2}" ] 2>/dev/null || return 0
   : > "$(_review_escalate_file "$_mare_pr")" 2>/dev/null || true
 }
@@ -3477,10 +3559,14 @@ _handle_block_verdict() {
     local _hbv_rounds _hbv_note
     _hbv_rounds="$(refix_round_count "$_hbv_pr")"
     if _hbv_note="$(_active_fix_note "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review)"; then
-      # An agent is ON this red — either we already bounced it for this sha, or it reads "working"
-      # against this same red sha (a human re-tasked it). Never "needs you", and never a second bounce
+      # An agent is ON this red — either we bounced it for this sha (and neither a stuck marker nor a
+      # dead probe disproves that), or it reads "working". Never "needs you", and never a second bounce
       # into a builder that is already fixing: wait for its push (HERD-173 row truth).
       DISPLAY[_hbv_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_YELLOW}review blocked · ${_hbv_note}${C_RESET}"
+    elif refix_attempted "$_hbv_pr" "$_hbv_sha" review; then
+      # Bounced, but NOBODY is on it: the wake failed, or the agent died right after. Escalate durably —
+      # this row used to be overwritten by a false "awaiting push" on the very next tick.
+      DISPLAY[_hbv_idx]="$(_refix_stalled_row "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review "$_hbv_sl" "$_hbv_pn")"
     elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
     elif _hbv_live="$(_agent_liveness "$_hbv_slug")"; [ "$_hbv_live" = "dead" ] || [ "$_hbv_live" = "missing" ]; then
@@ -3566,11 +3652,13 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
           else
             DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · check pane${C_RESET}"
             _hbv_escalated=true
+            _escalate_refix_stuck "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review "the builder never woke (prompt delivered twice)"
           fi
         fi
       else
         DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · agent pane not found${C_RESET}"
         _hbv_escalated=true
+        _escalate_refix_stuck "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review "no agent pane to deliver the bounce to"
       fi
       local _hbv_status_after
       _hbv_status_after="$(_agent_status "$_hbv_slug")"
@@ -3672,6 +3760,12 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_YELLOW}health-check failed · ${_hhc_note}${C_RESET}"
     return 0
   fi
+  if refix_attempted "$_hhc_pr" "$_hhc_sha" health; then
+    # Bounced, but NOBODY is on it (the wake failed, or the agent died right after). The once-guard
+    # blocks a re-bounce and the sha will never change on its own — so this escalation must PERSIST.
+    DISPLAY[_hhc_idx]="$(_refix_stalled_row "$_hhc_pr" "$_hhc_sha" "$_hhc_slug" health "$_hhc_sl" "$_hhc_pn")"
+    return 0
+  fi
   if [ "$_hhc_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ] 2>/dev/null; then
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · health-check still red: ${_hhc_detail}${C_RESET}"
     if ! _refix_dead_seen "$_hhc_pr" "health-cap-$_hhc_sha"; then
@@ -3711,16 +3805,19 @@ _handle_health_codeerror() {
     round "$_hhc_round_num" agent_status_before "${_hhc_before:-unknown}" detail "$_hhc_detail"
 
   local _hhc_pane_id _hhc_woke=0 _hhc_escalated=false _hhc_prompt
-  # REPRODUCE-FIRST guidance: the watcher runs the suite in a pane with a LOGIN PATH and a tty, which a
-  # bare sandbox shell does not have — so a handful of env-sensitive tests fail locally that pass in the
-  # gate, and vice versa. A gate fail on YOUR sha is YOUR diff: reproduce it the way the gate ran it
-  # before concluding the red is environmental.
+  # REPRODUCE-FIRST guidance. The command below is EXACTLY what _health_worker ran: the auto profile
+  # (never --heavy, which the worker does not pass) with the BASELINE-AWARE env (HERD-190). Getting this
+  # wrong is worse than omitting it (review note #5): under a bare `--heavy` an INHERITED base failure
+  # that the gate TOLERATES (rc 0) reproduces red, which flatly contradicts the "your sha, your diff"
+  # line that follows. The watcher also runs in a pane with a LOGIN PATH and a tty that a bare sandbox
+  # shell lacks, so some env-sensitive tests differ either way — reproduce as the gate ran it.
   _hhc_prompt="PR #${_hhc_pr} FAILED the pre-merge healthcheck (this is the gate that merges your PR).
 Failing test: ${_hhc_detail}
 Full suite output (the gate's own log, already on disk): $(_health_log_file "${_hhc_pr}-${_hhc_sha}")
-REPRODUCE FIRST, from your worktree, the way the gate ran it:
-  bash ${HERD_HEALTHCHECK_BIN:-scripts/herd/healthcheck.sh} ${_hhc_wt:-.} --heavy
-The gate runs with a login PATH and a tty; a red on YOUR sha is YOUR diff, not the environment.
+REPRODUCE FIRST, from your worktree, exactly as the gate ran it (same profile, same baseline env):
+  HERD_BASELINE_DIR='${MAIN}' HERD_BASELINE_CACHE='${TREES}' bash ${HERD_HEALTHCHECK_BIN:-scripts/herd/healthcheck.sh} ${_hhc_wt:-.}
+A red on YOUR sha is YOUR diff — the baseline env above already forgives failures inherited from the
+base branch, so what remains is yours.
 Fix the failure, re-run until the healthcheck is green, then push."
   _hhc_pane_id="$(_find_builder_pane_id_any "$_hhc_slug")"
   if [ -n "$_hhc_pane_id" ]; then
@@ -3735,11 +3832,13 @@ Fix the failure, re-run until the healthcheck is green, then push."
       else
         DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · health autofix failed · check pane${C_RESET}"
         _hhc_escalated=true
+        _escalate_refix_stuck "$_hhc_pr" "$_hhc_sha" "$_hhc_slug" health "the builder never woke (prompt delivered twice)"
       fi
     fi
   else
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · health autofix failed · agent pane not found${C_RESET}"
     _hhc_escalated=true
+    _escalate_refix_stuck "$_hhc_pr" "$_hhc_sha" "$_hhc_slug" health "no agent pane to deliver the bounce to"
   fi
   local _hhc_after; _hhc_after="$(_agent_status "$_hhc_slug")"
   journal_append health_refix_wake_result pr "$_hhc_pr" sha "$_hhc_sha" slug "$_hhc_slug" \
@@ -4901,7 +5000,13 @@ _health_fail_detail() {
   _hfd_d="$(_health_first_notok "$1")"
   if [ -z "$_hfd_d" ]; then
     _hfd_body="$(sed -n '2,$p' "$1" 2>/dev/null | grep -v '^[[:space:]]*$' 2>/dev/null)"
-    _hfd_d="$(printf '%s\n' "$_hfd_body" | grep -m1 -iE 'error|fail|exception|traceback|panic|❌|✗' 2>/dev/null)"
+    # Whole-word failure tokens only, and never a line that REPORTS ZERO failures. A bare substring
+    # match (review note #3) happily selected 'failsafe', 'error_handler', or the summary '0 failures'
+    # — and this line is quoted VERBATIM into the builder's re-task prompt, so a benign pick sends it
+    # chasing a phantom. 'fail' alone is dropped; the inflected forms below are what real tools print.
+    _hfd_d="$(printf '%s\n' "$_hfd_body" \
+      | grep -viE '(^|[^0-9])0 (errors?|failures?|failed)' 2>/dev/null \
+      | grep -m1 -iE '(^|[^[:alnum:]_])(error|errors|failed|failure|failures|fatal|exception|traceback|panic|❌|✗)([^[:alnum:]_]|$)' 2>/dev/null)"
     [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_body" | sed -n '1p')"
     _hfd_d="$(printf '%s' "$_hfd_d" | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
   fi

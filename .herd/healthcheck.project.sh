@@ -256,13 +256,16 @@ _HK_ENV_TEST="hermetic project-mode codemap test passes"
 
 _hk_bats_notok() {
   # Emit the description of every failing test in bats TAP output ($1) — the text after 'not ok N '.
-  printf '%s\n' "$1" | sed -n 's/^not ok [0-9][0-9]* //p'
+  # Leading whitespace tolerated, in LOCKSTEP with _hk_bats_notok_line + _hk_bats_first_notok: a nested
+  # bats stream indents its TAP lines, and if the extractor saw a failure the env-only classifier could
+  # not (or vice versa) a genuine code error could be mislabelled data/env, or tolerated silently.
+  printf '%s\n' "$1" | sed -n 's/^[[:space:]]*not ok[[:space:]][0-9][0-9]*[[:space:]]//p'
 }
 
 _hk_bats_notok_line() {
   # Emit the FULL 'not ok N <desc>' line whose description contains $2 — the REAL failing line to quote
   # in the detail, NOT the adjacent diagnostic comment / next 'ok' that a bare `tail -1` used to grab.
-  printf '%s\n' "$1" | grep -E "^not ok [0-9]+ .*$2" | head -1
+  printf '%s\n' "$1" | grep -E "^[[:space:]]*not ok [0-9]+ .*$2" | head -1
 }
 
 _hk_bats_first_notok() {
@@ -324,7 +327,13 @@ _hk_dh_dir="$(mktemp -d 2>/dev/null || echo '')"
 _hk_dh_log=""; _hk_dh_pp=""
 if [ -n "$_hk_dh_dir" ]; then
   _hk_dh_log="$_hk_dh_dir/leaks.log"; mkdir -p "$_hk_dh_dir/bin"; : > "$_hk_dh_log"
-  for _dhc in herdr claude codex; do
+  # NOTIFY HERMETICITY (HERD-173): a hermetic test must not reach the operator's DESKTOP either. The
+  # headless driver's notify seam fires a best-effort native osascript/notify-send, so a test that
+  # exercises an escalation path (dead agent, refix stalled, MAIN RED) pops a REAL notification from
+  # FIXTURE data — cry-wolf, the same class of production-surface leak as touching the live control
+  # room. Shim them to RECORD, never deliver; a recorded attempt fails the suite below, exactly as a
+  # herdr/claude call does. Tests opt out properly by installing scripts/herd/sim/sim-notify-stub.sh.
+  for _dhc in herdr claude codex osascript notify-send; do
     { printf '#!/usr/bin/env bash\n'
       printf 'printf '\''%%s\\t%%s\\t%%s\\n'\'' "${HERMETIC_TEST:-suite}" "%s" "$*" >> "%s"\n' "$_dhc" "$_hk_dh_log"
       case "$_dhc" in herdr) printf 'echo '\''{}'\''\n' ;; claude) printf 'echo '\''claude 0.0.0'\''\n' ;; esac
@@ -341,10 +350,11 @@ _hk_dh_verdict() {
   # BEFORE the env classification. Cleans up the sandbox dir on the way out (leak or clean).
   if [ -n "$_hk_dh_log" ] && [ -s "$_hk_dh_log" ]; then
     if [ -n "$ONELINE" ]; then
-      echo "daemon-hermeticity: a test touched the live control room / spawned a real daemon — $(sort -u "$_hk_dh_log" | head -1)"
+      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — $(sort -u "$_hk_dh_log" | head -1)"
     else
-      echo "DAEMON-HERMETICITY: a test reached the LIVE control room or spawned a real watcher/daemon"
-      echo "  (a hermetic test must stub herdr/claude and never launch agent-watch.sh against real state)"
+      echo "DAEMON-HERMETICITY: a test reached a LIVE production surface"
+      echo "  (a hermetic test must stub herdr/claude, never launch agent-watch.sh against real state,"
+      echo "   and never deliver a desktop notification — install scripts/herd/sim/sim-notify-stub.sh)"
       sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
     fi
     rm -rf "$_hk_dh_dir"

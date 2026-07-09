@@ -66,6 +66,18 @@ exit "${HC_RC:-0}"
 STUB
 chmod +x "$HC_STUB"
 
+# ── NOTIFY STUB (HERD-139) — MUST precede any code that can reach herd_driver_notify ─────────────
+# This test drives the REAL escalation paths (cap reached, dead agent, refix stalled), every one of
+# which calls herd_driver_notify. Under HERD_DRIVER=headless that seam writes its durable sink AND
+# fires a best-effort NATIVE osascript/notify-send — so the fixture's "PR #58 … session unwakeable"
+# popped on the operator's real desktop, training them to ignore the real alarm (the exact cry-wolf
+# incident HERD-139's sim stub was built for). Reuse that stub, do not reinvent it: it suppresses the
+# native seam, keeps the durable sink OBSERVABLE, and captures any native attempt so "zero delivered"
+# is PROVABLE. Installed AFTER $BIN is on PATH so its herdr shim forwards `agent list` to our stub.
+# shellcheck source=/dev/null
+. "$HERE/../scripts/herd/sim/sim-notify-stub.sh" || fail "cannot source the HERD-139 notify stub"
+sim_notify_install "$T" || fail "sim_notify_install failed"
+
 # ── Source agent-watch.sh in lib mode ────────────────────────────────────────
 export AGENT_WATCH_LIB=1 HERD_DRIVER=headless
 export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
@@ -234,6 +246,68 @@ assert w and str(w[-1].get("woke"))=="0" and str(w[-1].get("escalated"))=="true"
 PY2
 ok
 
+# ── (9e) LOST ESCALATION (review BLOCK, HERD-173): a failed wake must escalate DURABLY, not for one
+# tick. The bounce records the refix ledger BEFORE delivery (so the once-guard survives a failed send),
+# which means the record alone is NOT proof anyone is fixing. Before the fix, tick 2 replayed the same
+# red from the sha-cache, _active_fix_note found that record, and the row flipped — permanently — to
+# "fix in progress · awaiting push", with the once-guard blocking a re-bounce, the sha never changing,
+# and the cap never reached. A builder the watcher PROVED it could not wake sat behind a row asserting
+# a fix was in flight, forever. Assert the row across THREE ticks, not one.
+reset_state
+printf '1\n1\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
+row | grep -q 'needs you' || fail "(9e) tick 1 must escalate (got: $(row))"
+for _tick in 2 3; do
+  DISPLAY=()
+  _handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
+  row | grep -q 'fix in progress' && fail "(9e) tick $_tick must NOT claim a fix is in flight (got: $(row))"
+  row | grep -q 'needs you' || fail "(9e) tick $_tick must keep saying 'needs you' (got: $(row))"
+  row | grep -q 'stalled'   || fail "(9e) tick $_tick must name the stall (got: $(row))"
+done
+[ "$(runs)" = "2" ] || fail "(9e) the once-guard must still block a re-bounce (got $(runs) pane runs)"
+python3 - "$JOURNAL_FILE" <<'PY2' || fail "(9e) the stall must journal refix_stalled EXACTLY once"
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+st=[r for r in rows if r.get("event")=="refix_stalled" and str(r.get("pr"))=="57"]
+assert len(st)==1, st
+PY2
+ok
+
+# ── (9f) RESCUE: a human re-tasks the stalled builder → the row must stop shouting "needs you" ───────
+export STUB_AGENT_STATUS="working"
+DISPLAY=()
+_handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
+row | grep -q 'needs you' && fail "(9f) a rescued builder must not read 'needs you' (got: $(row))"
+row | grep -q 'fix in progress' || fail "(9f) a rescued builder reads fix-in-progress (got: $(row))"
+export STUB_AGENT_STATUS="idle"
+ok
+
+# ── (9g) DEATH AFTER A SUCCESSFUL BOUNCE: the record says "bounced", the agent says nothing ──────────
+# _active_fix_note is consulted before the liveness preflight, so a builder that dies after being woken
+# would read "fix in progress" forever unless case (a) is disproved by a positive dead/missing probe.
+reset_state
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"      # bounce lands, agent wakes
+DISPLAY=(); _handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"
+row | grep -q 'fix in progress' || fail "(9g) a live bounced agent reads fix-in-progress (got: $(row))"
+STUB_LIVENESS=dead
+DISPLAY=(); _handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"
+row | grep -q 'fix in progress' && fail "(9g) a DEAD agent must not read 'fix in progress' (got: $(row))"
+row | grep -q 'needs you' || fail "(9g) a dead bounced agent must escalate (got: $(row))"
+unset STUB_LIVENESS
+ok
+
+# ── (9h) the SHARED budget caps, but a health bounce is not EVIDENCE about the reviewer ─────────────
+reset_state
+record_refix 59 shaX slug-a health
+record_refix 59 shaY slug-a health
+[ "$(refix_round_count 59)" = "2" ]            || fail "(9h) the cap budget counts every kind"
+[ "$(refix_round_count_kind 59 review)" = "0" ] || fail "(9h) health bounces are not review evidence"
+[ "$(refix_round_count_kind 59 health)" = "2" ] || fail "(9h) health rounds are counted as health"
+record_refix 59 shaZ slug-a                    # a legacy 4-field line reads as kind=review
+[ "$(refix_round_count_kind 59 review)" = "1" ] || fail "(9h) a legacy ledger line must read as review"
+ok
+
 # ── (9d) an ENV-TOLERATED outcome (a data/env warning, exit 0) NEVER bounces — only CODEERROR does ──
 reset_state
 DATAENV="$T/body-dataenv.txt"; printf '⚠️  DATA/ENV ISSUE (tolerated, not a code bug)\nshellcheck not installed\n' > "$DATAENV"
@@ -257,6 +331,15 @@ NT="$T/nontap.log"; printf '❌ CODE ERROR\nscripts/herd/foo.sh: line 12: syntax
 d="$(_health_fail_detail "$NT")"
 case "$d" in "❌ CODE ERROR"*) fail "(10) the detail must not be the content-free banner (got: $d)" ;; esac
 printf '%s' "$d" | grep -q 'syntax error' || fail "(10) the non-TAP detail must name the error (got: $d)"
+# A benign body line must never be selected: this string is quoted VERBATIM into the re-task prompt.
+BENIGN="$T/benign.log"; printf '❌ CODE ERROR\nfailsafe handler installed\n0 failures, 0 errors\nassertion failed: widget\n' > "$BENIGN"
+d="$(_health_fail_detail "$BENIGN")"
+case "$d" in
+  *failsafe*)      fail "(10) 'failsafe' is not a failure (got: $d)" ;;
+  *"0 failures"*)  fail "(10) a line reporting ZERO failures is not a failure (got: $d)" ;;
+esac
+printf '%s' "$d" | grep -q 'assertion failed' || fail "(10) the real failure line must win (got: $d)"
+
 # Nothing quotable at all → the banner is better than an empty row.
 ONLY="$T/only.log"; printf '❌ CODE ERROR\n' > "$ONLY"
 [ -n "$(_health_fail_detail "$ONLY")" ] || fail "(10) a bannerless fallback must never be empty"
@@ -292,6 +375,19 @@ _healthcheck_gate 71 slug-a "$T/wt" 0 shae2eon              # next tick: shaCach
 row | grep -q 'needs you' && fail "(11) the cached row must not lie with 'needs you' (got: $(row))"
 row | grep -q 'fix in progress · awaiting push (round 1/3)' \
   || fail "(11) the cached row must read fix-in-progress (got: $(row))"
+ok
+
+# ── HARNESS INVARIANT: zero REAL desktop notifications escaped this test ────────────────────────────
+# Mirrors the daemon-hermeticity assert (a hermetic test must not touch a live production surface).
+# The escalation legs above deliberately fire notifications; every one must have landed in the durable
+# sink, and NONE on the operator's screen. A non-zero count here is a hermeticity regression.
+_native="$(sim_notify_native_attempts)"
+[ "${_native:-0}" -eq 0 ] \
+  || fail "HERMETICITY: ${_native} REAL desktop notification(s) escaped this test — see $SIM_NOTIFY_CAPTURED"
+# …and prove the stub is not vacuous: the escalations really did notify, into the durable sink.
+_sink="$(sim_notify_sink "$WORKTREES_DIR")"
+[ "$(sim_notify_count "$_sink" 'refix stalled')" -ge 1 ] \
+  || fail "the refix-stall escalation must still NOTIFY (into the sink, not the desktop)"
 ok
 
 echo "ALL PASS ($pass checks)"
