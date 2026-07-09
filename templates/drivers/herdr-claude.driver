@@ -42,3 +42,16 @@ DRIVER_AGENT_PERMISSION_FLAG='--dangerously-skip-permissions'
 DRIVER_AGENT_LIMIT_PATTERN='usage limit|session limit|hit your (usage|session) limit'
 DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/<cwd:tr-/.-to-dash>/*.jsonl'
 DRIVER_AGENT_COST_USAGE_KEYS='input_tokens output_tokens cache_creation_input_tokens cache_read_input_tokens'
+
+# ── Agent-runtime UPDATE bindings (HERD-149 — the AGENT_UPDATE knob) ───────────────────────────────
+# The runtime-specific data the AGENT_UPDATE mechanism (scripts/herd/agent-update.sh) needs to keep
+# THIS driver's agent runtime current: the CLI binary (command-resolved for installer detection AND
+# the macOS de-quarantine target), the npm global package + Homebrew formula/cask names, and the
+# native self-update command. A non-Claude runtime (codex/grok) rebinds this block so `herd
+# agent-update` updates ITS binary, not claude's — that is what makes the knob DRIVER-AWARE. Same
+# contract as the exec block: COMMITTED, ZERO-SECRET, command SHAPES only. Read ONLY when
+# AGENT_UPDATE=on (opt-in); nothing consumes them otherwise, so the tree stays byte-identical off.
+DRIVER_AGENT_BINARY='claude'
+DRIVER_AGENT_NPM_PKG='@anthropic-ai/claude-code'
+DRIVER_AGENT_BREW_PKG='claude-code'
+DRIVER_AGENT_NATIVE_UPDATE='claude update'

@@ -82,6 +82,28 @@ _herd_known_drivers() {
   printf '%s' "${out:-<none>}"
 }
 
+# herd_driver_agent_value <KEY> [default] — read a DRIVER_AGENT_* binding from the ACTIVE driver's
+# .driver file (the runtime-exec / update catalog block). PURE: it READS the file (a single grep +
+# quote-strip), it does NOT source it, so it has no side effects and cannot inherit an unrelated env
+# var of the same name. FAIL-SOFT: echoes <default> when the drivers dir / file / key is unreadable,
+# so a caller under `set -euo pipefail` never aborts. The AGENT_UPDATE mechanism reads the runtime
+# binary + installer package names through this, making the knob driver-aware (claude/codex/grok).
+herd_driver_agent_value() {
+  local key="${1:-}" dflt="${2:-}" f line v
+  [ -n "$key" ] || { printf '%s' "$dflt"; return 0; }
+  f="$(_herd_drivers_dir)/$(herd_driver_name).driver"
+  [ -f "$f" ] || { printf '%s' "$dflt"; return 0; }
+  line="$(grep -E "^${key}=" "$f" 2>/dev/null | tail -n1 || true)"
+  [ -n "$line" ] || { printf '%s' "$dflt"; return 0; }
+  v="${line#*=}"
+  # Strip a single pair of surrounding single- or double-quotes (the .driver value convention).
+  case "$v" in
+    \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    \"*\") v="${v#\"}"; v="${v%\"}" ;;
+  esac
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$dflt"
+}
+
 # herd_model_resolve <ref> — resolve an optionally runtime-qualified MODEL_* value into its concrete
 # driver + model. On success echoes two TAB-separated tokens "<driver>\t<model>" and returns 0:
 #   • BARE (no colon)                → "<default-driver>\t<ref>"  (herd_driver_name; byte-identical)
@@ -800,9 +822,10 @@ _herd_driver_cli() {
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
+    agent-value) herd_driver_agent_value "$@"; echo ;;   # <KEY> [default] → the active driver's DRIVER_AGENT_* value
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|focus <slug>|notify <title> <body> [sound]|name|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 
