@@ -8124,55 +8124,91 @@ build_sweep_note() {
   return 0
 }
 
-# ── Singleton acquisition (HERD-209) — the ONE race-safe watcher spawn-lock ──────────────────────
+# ── Singleton acquisition (HERD-209 / HERD-252) — the ONE race-safe watcher spawn-lock ──────────
 # _acquire_watcher_singleton — REFUSE-or-ADOPT gate enforcing "exactly one agent-watch main per
 # workspace". Returns 0 when this process may run (it acquired the lock — a stale/absent lock is
-# adopted); returns 1 when a LIVE watcher is already recorded and this one must NOT run (a duplicate).
+# adopted); returns 1 when a LIVE watcher already holds the lock and this one must NOT run.
 #
 # The HERD-209 incident: control-room recovery (herd pane watch / herd reload / manual herd-watch.sh)
 # spawned a SECOND watcher WITHOUT killing the first, so two mains polled the same PRs and raced the
 # shared .git object store — healthchecks restarted endlessly. The defense is a REAL singleton at every
 # launch: atomically check HERD_WATCHER_LOCK (kill -0 on the recorded pid) and refuse the duplicate.
 #
-# Two acquisition primitives, one per environment — both ATOMIC (create/flock, never check-then-write):
-#   • flock(1) available  — a non-blocking exclusive lock on fd 9 held for our lifetime; a second
-#                           watcher's `flock -n` fails instantly (auto-released on any exit via fd close).
-#   • no flock (macOS)    — an atomic-mkdir mutex serializes the check+write window, then a PID file is
-#                           held for our lifetime and removed on EXIT/INT/TERM.
-# In BOTH primitives we FIRST read the RECORDED pid (before any truncating open — `exec 9>` empties the
-# file) and refuse a live, non-self one. That kill -0 check is what catches the exact race the flock
-# alone cannot: a lockfile inode swapped out from under an alive holder (rm+recreate) — the recorded pid
-# still proves a watcher is up. Lib-visible (defined above the AGENT_WATCH_LIB return) so the unit test
-# can drive it directly; called once at main startup below.
+# HERD-252: a LIVE-lock collision must REFUSE LOUDLY and IMMEDIATELY — print the holder pid on stderr
+# and return non-zero so the caller exits non-zero. Never BLOCK/hang waiting for the lock (operator
+# must be able to tell a working launch from a blocked one). A free/stale (dead-pid) lock still
+# acquires and starts normally (unchanged).
+#
+# Two acquisition primitives, one per environment — both ATOMIC and NON-BLOCKING:
+#   • flock(1) available  — `flock -n` on fd 9 held for our lifetime; a second watcher's flock -n
+#                           fails instantly (auto-released on any exit via fd close). Open with >> so
+#                           a failed acquire does not truncate the holder pid out of the lockfile.
+#   • no flock (macOS)    — an atomic-mkdir mutex serializes the check+write window, then a PID file
+#                           is held for our lifetime and removed on EXIT/INT/TERM. While contending
+#                           for the mutex, a LIVE recorded pid refuses immediately (no sleep loop).
+# In BOTH primitives we FIRST read the RECORDED pid and refuse a live, non-self one. That kill -0
+# check is what catches the exact race the flock alone cannot: a lockfile inode swapped out from
+# under an alive holder (rm+recreate) — the recorded pid still proves a watcher is up. Lib-visible
+# (defined above the AGENT_WATCH_LIB return) so the unit test can drive it directly; called once at
+# main startup below.
+_watcher_singleton_refuse_msg() {
+  # _watcher_singleton_refuse_msg <pid-or-empty> — one-line LOUD refuse on stderr (HERD-252).
+  local _wl_holder="${1:-}"
+  if [ -n "$_wl_holder" ]; then
+    printf 'herd-watch: already running (pid %s) — refusing duplicate\n' "$_wl_holder" >&2
+  else
+    printf 'herd-watch: already running — refusing duplicate\n' >&2
+  fi
+}
+
 _acquire_watcher_singleton() {
   mkdir -p "$(dirname "$HERD_WATCHER_LOCK")" 2>/dev/null || true
-  # Recorded-pid refuse — read the pid BEFORE any open that would truncate the lockfile. A LIVE,
-  # non-self recorded pid means a watcher already owns this workspace: refuse rather than duplicate.
+  # Recorded-pid refuse — read the pid BEFORE any open. A LIVE, non-self recorded pid means a
+  # watcher already owns this workspace: refuse LOUDLY rather than duplicate or wait.
   local _wl_rec
   _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  # Trim trailing whitespace/newlines so a pid line is a clean integer for kill -0 + messaging.
+  _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
   if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_rec" >&2
+    _watcher_singleton_refuse_msg "$_wl_rec"
     return 1
   fi
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"$HERD_WATCHER_LOCK"
+    # Append-open: do NOT truncate. A contested flock -n must still be able to name the holder pid
+    # from the lockfile (truncating open was the silent-manners footgun for the flock-fail path).
+    exec 9>>"$HERD_WATCHER_LOCK"
     if ! flock -n 9; then
-      printf '🐑 watcher already running for %s — exiting.\n' "$WORKSPACE_NAME" >&2
+      _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
+      if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
+        _watcher_singleton_refuse_msg "$_wl_rec"
+      else
+        _watcher_singleton_refuse_msg ""
+      fi
       return 1
     fi
     printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
     return 0
   fi
   # Atomic-mkdir mutex (serializes the check+write window; held only for that instant).
+  # LIVE-lock invariant (HERD-252): never sleep/wait on a live holder — re-check the pid every
+  # contention tick and refuse immediately. Only a free mutex / stale (dead) lock may wait briefly.
   local _wl_mtx="${HERD_WATCHER_LOCK}.d" _wl_tries=0 _wl_pid _wl_tmp
   while ! mkdir "$_wl_mtx" 2>/dev/null; do
+    _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
+    if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
+      _watcher_singleton_refuse_msg "$_wl_pid"
+      return 1
+    fi
     [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
     _wl_tries=$((_wl_tries + 1)); [ "$_wl_tries" -ge 30 ] && break; sleep 0.1
   done
   _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
   if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
     rmdir "$_wl_mtx" 2>/dev/null || true
-    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_pid" >&2
+    _watcher_singleton_refuse_msg "$_wl_pid"
     return 1
   fi
   # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
@@ -8235,14 +8271,17 @@ fi
 # that is not inside the project it resolves to.
 herd_console_guard "herd watch" || exit 1
 
-# ── Singleton spawn-lock: exactly one watcher per project (HERD-209) ────────────────────────────
+# ── Singleton spawn-lock: exactly one watcher per project (HERD-209 / HERD-252) ─────────────────
 # The race-safe acquisition lives in _acquire_watcher_singleton (defined above the AGENT_WATCH_LIB
 # return so the unit test can drive it): it REFUSES when a LIVE watcher is already recorded in
-# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then flock/mkdir), and ADOPTS a stale/absent lock.
-# A refusal exits 0 — a duplicate launch is a no-op, never an error. Keyed by WORKSPACE_NAME (matching
-# the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths (cmd_pane_watch /
-# cmd_reload) mirror this check before spawning so a duplicate is caught at the launcher too.
-_acquire_watcher_singleton || exit 0
+# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then non-blocking flock/mkdir), and ADOPTS a
+# stale/absent lock. A LIVE-lock refusal is LOUD and NON-ZERO (HERD-252): stderr names the holder
+# pid (`herd-watch: already running (pid <N>) — refusing duplicate`) and we exit 1 immediately —
+# never hang, never soft-exit 0 that looks like a successful launch. Keyed by WORKSPACE_NAME
+# (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
+# (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
+# launcher too.
+_acquire_watcher_singleton || exit 1
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
 # ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
