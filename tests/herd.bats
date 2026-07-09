@@ -355,6 +355,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic watcher GH CI check-run gate events (HERD-197) test passes" {
+  run bash "$REPO/tests/test-watcher-ci-gate-events.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic scheduled/triggered runs (HERD-169) test + sim passes" {
   run bash "$REPO/tests/test-triggers.sh"
   [ "$status" -eq 0 ]
