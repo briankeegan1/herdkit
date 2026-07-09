@@ -134,6 +134,8 @@ spawn-step.sh	unit	tests/test-spawn-queue-deps.sh
 backlog-reconcile.sh	unit	tests/test-backlog-reconcile.sh
 backlog-reconcile-sweep.sh	unit	tests/test-backlog-reconcile-sweep.sh
 governance-drift-sweep.sh	unit	tests/test-governance-drift.sh
+journal-audit.sh	unit	tests/test-journal-audit.sh
+JOURNAL_AUDIT	unit	tests/test-journal-audit.sh
 agent-watch.sh	unit	tests/test-human-verify-hold.sh
 agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
