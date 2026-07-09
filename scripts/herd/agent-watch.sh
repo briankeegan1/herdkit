@@ -5272,7 +5272,7 @@ _handle_stale_dup() {
   # resolver gets spawned INTO the live worktree (two agents, one directory, merge over WIP). If the
   # agent is working, defer: honest row, once-guard NOT burned, heal retries when it goes idle.
   if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
     return 0
   fi
 
@@ -5311,7 +5311,7 @@ _handle_stale_dup() {
     # top guard is EXCLUDED from the pane lookup by design and so reads as "no live builder" here.
     # A working builder must never reach spawn_resolver — defer without burning the once-guard.
     if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
       return 0
     fi
     # Record-first once-guard so a later tick never double-dispatches.
@@ -5365,7 +5365,7 @@ Why: ${_hsd_reason}"
       # builder must never reach spawn_resolver: defer instead, once-guard already burned is acceptable
       # (the next sha or idle tick heals).
       if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-        DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+        DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
         return 0
       fi
       journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \

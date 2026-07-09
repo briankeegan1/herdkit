@@ -504,12 +504,15 @@ uq_started="$(
   journal_append() { :; }
   _linear_gql() {
     printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+    # Every pattern below carries a leading open-paren. bash 3.2, the macOS system bash, mis-parses a
+    # bare case pattern inside a command substitution: it reads the pattern-closing paren as the end
+    # of the substitution itself. The balanced form parses on bash 3.2 and 5 alike.
     case "$1" in
-      *"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]},"assignee":{"id":"me_viewer"},"state":{"type":"started"}}]}}}' ;;
-      *commentDelete*) echo '{"data":{"commentDelete":{"success":true}}}' ;;
-      *"viewer { id }"*) echo '{"data":{"viewer":{"id":"me_viewer"}}}' ;;
-      *issueUpdate*) echo '{"data":{"issueUpdate":{"success":true}}}' ;;
-      *) echo '{"data":{}}' ;;
+      (*"id comments { nodes { id body } }"*) echo '{"data":{"issues":{"nodes":[{"id":"iss_7","comments":{"nodes":[{"id":"cmt_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]"}]},"assignee":{"id":"me_viewer"},"state":{"type":"started"}}]}}}' ;;
+      (*commentDelete*) echo '{"data":{"commentDelete":{"success":true}}}' ;;
+      (*"viewer { id }"*) echo '{"data":{"viewer":{"id":"me_viewer"}}}' ;;
+      (*issueUpdate*) echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      (*) echo '{"data":{}}' ;;
     esac
   }
   _BACKEND_RESULT=""
