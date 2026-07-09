@@ -57,6 +57,9 @@ STUB
 chmod +x "$BIN/herdr"
 export PATH="$BIN:$PATH"
 
+# HERD-139 notify stub: escalation paths fire real desktop notifications without it (hermeticity belt catch)
+. "$(dirname "$0")/../scripts/herd/sim/sim-notify-stub.sh" || { echo "cannot source notify stub"; exit 1; }
+
 # ── Source agent-watch.sh in lib mode ────────────────────────────────────────
 export AGENT_WATCH_LIB=1 HERD_DRIVER=headless
 export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
