@@ -4187,7 +4187,7 @@ _handle_coordinator_watchdog() {
 
 # file_mtime / _file_size — portable stat helpers (GNU stat -c vs BSD/macOS stat -f), detected once
 # at load, mirroring backlog-view.sh's pattern.
-if stat --version 2>/dev/null | grep -q GNU; then
+if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then
   file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
   _file_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
 else
