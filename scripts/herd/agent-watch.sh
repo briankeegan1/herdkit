@@ -3878,6 +3878,13 @@ _handle_stale_dup() {
       fi
       return 0
     fi
+    # TOCTOU RE-ASSERT (round-9, both dispatch sites): a builder that flipped idle→working since the
+    # top guard is EXCLUDED from the pane lookup by design and so reads as "no live builder" here.
+    # A working builder must never reach spawn_resolver — defer without burning the once-guard.
+    if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+      return 0
+    fi
     # Record-first once-guard so a later tick never double-dispatches.
     record_refix "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale
     DISPLAY[_hsd_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_CYAN}rebasing · resolver (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
@@ -3924,6 +3931,14 @@ Why: ${_hsd_reason}"
     # Race: liveness said live but pane vanished between the preflight and the send. Fall through to
     # the resolver if the worktree is still there; otherwise escalate.
     if [ -n "$_hsd_wt" ] && [ -d "$_hsd_wt" ]; then
+      # TOCTOU RE-ASSERT (round-9): an empty pane id has TWO causes — vanished, or the builder flipped
+      # idle→working since the guard (a working agent is excluded from the lookup BY DESIGN). A working
+      # builder must never reach spawn_resolver: defer instead, once-guard already burned is acceptable
+      # (the next sha or idle tick heals).
+      if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
+        DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+        return 0
+      fi
       journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
         round "$_hsd_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
       _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"

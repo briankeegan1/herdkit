@@ -302,4 +302,20 @@ _handle_stale_dup 110 slug-a shaP 0 "$WT" feat/a stale-base "$REASON"
 unset STUB_AGENT_EMPTY
 ok "(14) resolver single-flight respected"
 
+# ── (15) TOCTOU: builder flips idle→working mid-tick → defer, never a resolver (round-9) ──────
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_LIVENESS=alive STUB_RESOLVER_ALIVE=0
+STATUS_SEQ="$T/status-seq.txt"; printf 'idle\nworking\nworking\n' > "$STATUS_SEQ"   # guard sees idle; dispatch re-assert sees working
+_agent_status_real_15=$(declare -f _agent_status)
+_agent_status() {  # pop one status per call: guard sees idle, dispatch-site re-assert sees working
+  local _c; _c="$(head -1 "$STATUS_SEQ" 2>/dev/null)"; { tail -n +2 "$STATUS_SEQ" 2>/dev/null; } > "$STATUS_SEQ.t"; mv "$STATUS_SEQ.t" "$STATUS_SEQ"
+  printf '%s' "${_c:-working}"
+}
+export STUB_AGENT_STATUS=working   # herdr-level: pane lookup excludes working → empty pane id
+_handle_stale_dup 120 slug-a shaQ 0 "$WT" feat/a stale-base "$REASON"
+[ "$(rslv)" = "0" ] || fail "(15) mid-tick flip must NEVER dispatch a resolver into the live worktree"
+row | grep -q 'builder busy' || fail "(15) row must read deferred (got: $(row))"
+eval "$_agent_status_real_15"
+ok "(15) TOCTOU flip defers — no resolver into a live worktree"
+
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"
