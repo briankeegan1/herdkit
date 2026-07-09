@@ -619,9 +619,13 @@ _fmt_age() {
 # only gives them a consistent, honest vocabulary):
 #   • working                            — the HERD's move; a builder/gate is making progress
 #                                          (building… · health-check · running 3m · review · running …).
-#   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, no PR.
-#                                          Carries the idle age so a just-freed spare (0s) reads apart
-#                                          from a forgotten one (2h, reap it). Calm — benign, not an alarm.
+#   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, and a
+#                                          SUCCESSFUL open-PR list positively has no PR for its branch
+#                                          (HERD-224). Carries the idle age so a just-freed spare (0s)
+#                                          reads apart from a forgotten one (2h, reap it). Calm — benign.
+#   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
+#                                          (HERD-224). Neutral/degraded — never the definitive
+#                                          "awaiting task" claim from a lookup FAILURE.
 #   • parked · <cause> · retry <eta>     — the HERD's move; auto-recovering on its own (a limit-hit
 #                                          auto-resume names its reset ETA; see _handle_limit_blocked).
 #   • needs-you · <blocker> · <remedy>   — YOUR move; a red hold that will NOT clear itself (dead
@@ -635,12 +639,25 @@ _fmt_age() {
 # owner (yours: assign work or retire the worktree) and the age since the worktree was born, so the row
 # answers whose-move-is-it AND how long it has waited. Replaces the banned, ownerless, ageless
 # "idle · no PR". Age uses _now_epoch (HERD_FAKE_NOW-overridable) so it is deterministic under test.
+# ONLY call this when a SUCCESSFUL open-PR list positively contains no PR for the branch (HERD-224);
+# a failed/empty-from-error `gh pr list` must use _row_pr_match_pending instead.
 _row_awaiting_task() {
   local _sl="$1" _wt="$2" _age _born
   _born="$(_worktree_born "$_wt")"
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_pr_match_pending <slug-cell> — NEUTRAL/degraded console row when the open-PR roster could not
+# be fetched this tick (HERD-224). GROUNDED: a `gh pr list` blip (or the old `|| echo '[]'` collapse)
+# used to paint "awaiting task · assign or retire" for builders that HAD an open PR — a definitive
+# "this builder has no work" claim from a lookup FAILURE. This row is calm (not needs-you/💀), names
+# the transient, and never says "awaiting task". Next tick retries the fetch.
+_row_pr_match_pending() {
+  local _sl="$1"
+  printf '    %s⏳%s %s%s%s %sPR match pending · retrying%s' \
+    "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$C_RESET"
 }
 
 # ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
@@ -6513,6 +6530,29 @@ _watcher_tick_fields() {
   printf '%s' "$_wtf"
 }
 
+# _prs_fetch_tick — set PRS_JSON + PRS_LOOKUP_OK for this watch tick (HERD-224).
+# Captures the EXIT STATUS of `gh pr list` so a transient fetch failure is NEVER collapsed into an
+# empty roster. The pre-fix form (`|| echo '[]'`) made a failed fetch look identical to "zero open
+# PRs", which then rendered builders that HAD an open PR as "awaiting task · assign or retire".
+#   • PRS_LOOKUP_OK=1 — the list call succeeded; an empty `[]` means positively no open PRs.
+#   • PRS_LOOKUP_OK=0 — the list call failed/errored; PRS_JSON is `[]` only as a safe placeholder
+#     for discovery, and the console must paint the degraded "PR match pending" row, never the
+#     definitive awaiting-task / died-(no PR) claims. The view filter still applies on success.
+_prs_fetch_tick() {
+  local _raw _rc=0
+  _raw="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null)" || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    PRS_LOOKUP_OK=0
+    PRS_JSON='[]'
+    return 0
+  fi
+  PRS_LOOKUP_OK=1
+  PRS_JSON="${_raw}"
+  [ -n "$PRS_JSON" ] || PRS_JSON='[]'
+  PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
+  return 0
+}
+
 # ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
 # _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
 # record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
@@ -7060,12 +7100,12 @@ while true; do
   build_main_health
   build_sweep_note
 
-  # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
-  # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
-  # relaxes any merge gate. Default (all lens, no filters) requests the base fields and passes the
-  # JSON through unchanged, preserving today's exact behavior.
-  PRS_JSON="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null || echo '[]')"
-  PRS_JSON="$(printf '%s' "$PRS_JSON" | _watcher_view_filter)"
+  # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
+  # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
+  # is a read-time SELECTION filter only — it narrows which PRs this tick displays/considers and
+  # never relaxes any merge gate. Default (all lens, no filters) requests the base fields and
+  # passes the JSON through unchanged, preserving today's exact behavior on a successful fetch.
+  _prs_fetch_tick
   # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
   # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
   # reconciliation keys off, so it must reflect real liveness with OR without panes.
@@ -7103,13 +7143,20 @@ EOF
       DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
       FLAIR_STATE[i]="pen"
     elif [ -z "$prnum" ]; then
-      if [ "$astatus" != "working" ]; then
+      if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+        # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
+        # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
+        # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
+        DISPLAY[i]="$(_row_pr_match_pending "$sl")"
+        FLAIR_STATE[i]="busy"
+      elif [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
         # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
         # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
         # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
         # otherwise it is the benign "awaiting task" spare row. An existing record keeps the row (and the
         # scheduled resume) alive across ticks even after the transient signal clears.
+        # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
         if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
