@@ -21,9 +21,13 @@ in parallel.
    (🔜 planned · 🚧 in progress); a **github**/**linear** backend drains its issue tracker as the
    work source instead. When the file backend is in use, also read `{{BACKLOG_FILE}}` for the
    planned/shipped (✅) prose history.
-2. Get current state of in-flight work (run both, they're fast):
+2. Get current state of in-flight work (run all three, they're fast):
    - `git worktree list` — existing feature worktrees
    - `{{DRIVER_LIST_AGENTS}}` — which sub-agents are running / idle / blocked <!-- DRIVER:list-agents -->
+   - `herd log | grep builder_note` — **builder notes**: mid-build findings your builders filed for
+     you (`herd note "<finding>"`). Drain and route them per *Builder notes* below **before** you act
+     on any red row — a note is often the reason a row is red, and it is state no pane transcript
+     will hand you.
 3. Present the menu with **AskUserQuestion**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo
@@ -384,6 +388,42 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    `bash {{SCRIPTS_DIR}}/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
+
+### Builder notes — read, route, ack (HERD-202)
+
+A builder that discovers a load-bearing mid-build finding — a red row that is a **stale cached
+result**, a test file **not wired into the gate**, a hold that is **env, not code** — files it with
+`herd note "<finding>"`. That journals a `builder_note` event and the watcher renders it in a
+**builder notes** console section within a tick. You are that section's consumer: notes only reach
+you if you drain them, and nothing else in the engine acts on one. **Do this every time you check
+running agents, and once on invocation** — before you re-task a builder or override a gate, because a
+note frequently explains the row you are about to act on.
+
+1. **READ** the notes you have not handled yet:
+   ```
+   herd notes                     # numbered, newest first — the notes on the console right now
+   herd log | grep builder_note   # fallback / full history, including already-handled notes
+   ```
+   `herd notes` is the ack-aware listing; if this engine build predates it, read the ledger the
+   watcher renders from (`.agent-watch-builder-notes` in the worktree pool) or grep the journal.
+2. **ROUTE** each note — exactly one of three, and say which you chose:
+   - **Act now** — the note changes what you were about to do (don't bounce that builder; the red is
+     a stale cache; the hold clears itself). Do the thing, then ack.
+   - **File it** — the note names real work that outlives this build. Enqueue a tracker item through
+     the scribe, quoting the note **verbatim** so the finding survives the summary:
+     `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <short title> — builder <slug> reported: \"<note text, verbatim>\". <why it matters + fix sketch>"`
+     Author it against the *Authoring a backlog item* SOP first. Then ack.
+   - **Dismiss** — informational, no action (a builder narrating a decision). Ack it anyway.
+3. **ACK** the handled note so the console clears and the next seat does not re-route it:
+   ```
+   herd notes ack <n>     # the number from `herd notes`
+   herd notes ack all     # everything currently on the console
+   ```
+   The ack is display-only: `herd log` keeps every note forever, so acking never destroys evidence.
+   **If `herd notes ack` is not available in this engine build** (it ships with HERD-243), the loop
+   still works — read and route exactly as above, and handled notes simply **age out of the display**
+   on their own rather than clearing on command. Never skip the routing step just because you cannot
+   ack: an unacked note is a note nobody has acted on.
 
 ### Diagnose a gate: "what happened / is it stuck / why did X fail" → `herd why` FIRST
 
