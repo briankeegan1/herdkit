@@ -47,6 +47,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed drainer can be
 # detected and reclaimed by scribe.sh. Best-effort; never affects this script's stdout.
 . "$HERE/drainer-liveness.sh"
+# Supervised-process contract (HERD-193): the drainer RETIRES ITS OWN lifecycle record on the normal
+# completion path below (`finish` → STOP). Without that, a cleanly-drained scribe would leave a record
+# behind whose heartbeat is frozen at its last beat, and the watcher's sweep would eventually report a
+# finished process as hung. Inert while LIFECYCLE_CONTRACTS=off (default).
+# shellcheck source=/dev/null
+. "$HERE/lifecycle.sh"
 export HERD_COMPONENT="${HERD_COMPONENT:-scribe}"
 # API backends read credentials from .herd/secrets (gitignored). The file/changelog backends
 # never touch it — sourcing is best-effort and absent-file-safe so the zero-secret case is clean.
@@ -347,6 +353,9 @@ case "$cmd" in
     ;;
   finish)
     if ls "$Q"/*.req >/dev/null 2>&1; then echo "MORE"; exit 0; fi
+    # HERD-193 RETIRE: the queue is drained and this drainer is about to exit — account for it NOW,
+    # with its true reason, rather than leaving a record whose frozen heartbeat later reads as a hang.
+    lifecycle_retire scribe-drainer "$HERD_AGENT_SCRIBE" drained
     [ -n "${SCRIBE_TAB:-}" ] && herdr tab close "$SCRIBE_TAB" >/dev/null 2>&1 || true
     echo "STOP"
     ;;
