@@ -135,6 +135,7 @@ agent-watch.sh	unit	tests/test-watcher-singleton.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
+caps-sync-lint.sh	unit	tests/test-caps-sync-light.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
 herd-review.sh	unit	tests/test-review-verdict-integrity.sh
 herd-review.sh	unit	tests/test-structured-block-verdict.sh
