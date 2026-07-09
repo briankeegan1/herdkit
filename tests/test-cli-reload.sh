@@ -121,6 +121,21 @@ out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
 printf '%s' "$out" | grep -q "auto" || fail "default WATCHER_AUTOMERGE=true should derive auto"
 ok
 
+# ── 2f. TYPO'd MERGE_POLICY fails STRICT to observe (HERD-210) ───────────────
+# A non-empty unrecognized MERGE_POLICY is a typo, not a legacy-derivation trigger: the watcher
+# resolves it to observe, so reload's summary must say observe too. Reporting the legacy
+# WATCHER_AUTOMERGE derivation ("auto") here would tell the operator the watcher auto-merges
+# while it is actually observing — the inconsistency that let #317 merge past a live BLOCK.
+P="$T/p2f"; mkdir "$P"
+_make_project "$P" "reloadtest" 'MERGE_POLICY="aprove"'
+out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
+pol_line="$(printf '%s\n' "$out" | grep "MERGE_POLICY:" || true)"
+printf '%s' "$pol_line" | grep -q "observe" \
+  || fail "typo MERGE_POLICY=aprove must report observe, got: $pol_line"
+printf '%s' "$pol_line" | grep -q "auto" \
+  && fail "typo MERGE_POLICY=aprove reported 'auto' from the legacy WATCHER_AUTOMERGE derivation" || true
+ok
+
 # ── 3. reload removes lockfile with a non-existent PID ───────────────────────
 P="$T/p3"; mkdir "$P"
 _make_project "$P" "reloadtest"
