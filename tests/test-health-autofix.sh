@@ -15,6 +15,7 @@
 #   (6) PER-RAIL round budget (HERD-229) — review bounces never spend the health rail's rounds
 #   (7) the health rail's own cap reached → "needs you · refix limit … " (blocker + remedy), no bounce
 #  (7b) reset-on-progress — a CLEAN suite refunds the health rail; the next red bounces at round 1
+#  (7c) HERD-261: total-ceiling escalate journals + notifies TOTAL rounds (never per-rail 0 after reset)
 #   (8) a tab-leak-guard CODE ERROR is infra: never bounced, legacy row preserved
 #   (9) dry-run → never bounces even with autofix ON
 #
@@ -229,6 +230,40 @@ printf '0\n' > "$STUB_WAIT_FILE"
 _handle_health_codeerror 31 slug-a shaH5 0 "$T/wt" "$NOTOK"   # a NEW red on a later sha
 [ "$(runs)" = "1" ] || fail "(7b) a rail that resolved its red must be able to bounce again (got $(runs))"
 row | grep -q 'refixing health-check (round 1/3)' || fail "(7b) the row must restart the rail at round 1 (got: $(row))"
+ok
+
+# ── (7c) HERD-261: total-ceiling escalate reports TOTAL rounds in journal + notify, not per-rail 0 ─
+# Reproduce the honest-label lie: a PR burns N rounds across rails, the health rail is then reset
+# (counter 0), total ceiling still closes the PR. The escalate must say "after N refix rounds", never
+# "after 0" from the single-rail counter.
+reset_state
+export HEALTHCHECK_AUTOFIX=true REFIX_MAX_ROUNDS=3
+for s in 1 2 3; do record_refix 32 "sha-r$s" slug-a review; done
+for s in 1 2 3; do record_refix 32 "sha-h$s" slug-a health; done
+for s in 1 2 3; do record_refix 32 "sha-s$s" slug-a stale; done
+refix_rail_reset 32 health "sha-hp" slug-a     # health rail refunded → rail count 0
+[ "$(refix_total_count 32)" -eq 9 ] || fail "(7c) expected 9 lifetime bounces (got $(refix_total_count 32))"
+[ "$(refix_rail_count 32 health)" -eq 0 ] \
+  || fail "(7c) health rail must be 0 after reset (got $(refix_rail_count 32 health))"
+[ -n "$(_refix_budget_reason 32 health)" ] || fail "(7c) total ceiling must close the health rail"
+_handle_health_codeerror 32 slug-a shaHtot 0 "$T/wt" "$NOTOK"
+[ "$(runs)" = "0" ] || fail "(7c) total-ceiling escalate must not bounce (got $(runs))"
+row | grep -q 'refix limit (9 total rounds across rails) reached' \
+  || fail "(7c) the row must name the total ceiling (got: $(row))"
+# Journal `rounds` field must be the TOTAL (9), never the per-rail 0.
+python3 - "$JOURNAL_FILE" <<'PY' || fail "(7c) journal rounds must be total 9, not per-rail 0"
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+ev = [r for r in rows if r.get("event") == "health_refix_escalated" and str(r.get("pr")) == "32"]
+assert ev, "missing health_refix_escalated for pr 32"
+assert str(ev[-1].get("rounds")) == "9", f"rounds field lied: {ev[-1]!r}"
+PY
+# Operator notify body must also say "after 9 refix rounds", never "after 0".
+_sink="$(sim_notify_sink "$WORKTREES_DIR")"
+[ "$(sim_notify_count "$_sink" 'PR #32 health-check still red after 9 refix rounds')" -ge 1 ] \
+  || fail "(7c) notify must report 9 total rounds (sink: $(cat "$_sink" 2>/dev/null | grep 'PR #32' || true))"
+[ "$(sim_notify_count "$_sink" 'PR #32 health-check still red after 0 refix rounds')" -eq 0 ] \
+  || fail "(7c) notify must NEVER report per-rail 0 when total is 9"
 ok
 
 # ── (8) a tab-leak-guard CODE ERROR is INFRA: never bounced ─────────────────────────────────────

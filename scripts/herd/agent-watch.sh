@@ -6603,10 +6603,17 @@ _handle_stale_dup() {
     DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · ${_hsd_capmsg} · stale base still held · ${_hsd_reason}${C_RESET}"
     if ! _refix_dead_seen "$_hsd_pr" "stale-cap-$_hsd_sha"; then
       _record_refix_dead "$_hsd_pr" "stale-cap-$_hsd_sha"
+      # HERD-261: report TOTAL rounds when the total ceiling closed the PR. The rail counter can
+      # honestly read 0 after reset-on-progress while the PR burned N across rails — a needs-you
+      # must never mislead with "after 0 refix rounds".
+      local _hsd_report_rounds="$_hsd_rounds"
+      case "$_hsd_capmsg" in
+        *'total rounds across rails'*) _hsd_report_rounds="$(refix_total_count "$_hsd_pr")" ;;
+      esac
       journal_append stale_refix_escalated pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
-        rounds "$_hsd_rounds" reason "${_hsd_capmsg} — stale base still held"
+        rounds "$_hsd_report_rounds" reason "${_hsd_capmsg} — stale base still held"
       herd_driver_notify "⚠️ refix budget spent: ${_hsd_slug}" \
-        "PR #${_hsd_pr} stale base still held after ${_hsd_rounds} refix rounds — needs you" default
+        "PR #${_hsd_pr} stale base still held after ${_hsd_report_rounds} refix rounds — needs you" default
     fi
     return 0
   fi
@@ -6856,10 +6863,17 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_capmsg} · health-check still red: ${_hhc_detail}${C_RESET}"
     if ! _refix_dead_seen "$_hhc_pr" "health-cap-$_hhc_sha"; then
       _record_refix_dead "$_hhc_pr" "health-cap-$_hhc_sha"
+      # HERD-261: report TOTAL rounds when the total ceiling closed the PR. The rail counter can
+      # honestly read 0 after reset-on-progress while the PR burned N across rails — a needs-you
+      # must never mislead with "after 0 refix rounds".
+      local _hhc_report_rounds="$_hhc_rounds"
+      case "$_hhc_capmsg" in
+        *'total rounds across rails'*) _hhc_report_rounds="$(refix_total_count "$_hhc_pr")" ;;
+      esac
       journal_append health_refix_escalated pr "$_hhc_pr" sha "$_hhc_sha" slug "$_hhc_slug" \
-        rounds "$_hhc_rounds" reason "${_hhc_capmsg} — health-check still red"
+        rounds "$_hhc_report_rounds" reason "${_hhc_capmsg} — health-check still red"
       herd_driver_notify "⚠️ refix budget spent: ${_hhc_slug}" \
-        "PR #${_hhc_pr} health-check still red after ${_hhc_rounds} refix rounds — needs you" default
+        "PR #${_hhc_pr} health-check still red after ${_hhc_report_rounds} refix rounds — needs you" default
     fi
     return 0
   fi
