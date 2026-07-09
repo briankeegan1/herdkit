@@ -256,7 +256,7 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 
 # stale-base auto-heal (HERD-199) — on | off (default off, ship-dormant). on → a STALE-BASE hold from
 # the stale-duplicate gate is mechanical and self-heals: the watcher auto-bounces the live builder with
-# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, shared REFIX_MAX_ROUNDS budget, honest
+# `git merge $DEFAULT_BRANCH` (sha-keyed once-guard kind=stale, the stale rail's own REFIX_MAX_ROUNDS budget, honest
 # `rebasing · awaiting push` row), or dispatches the conflict resolver when no live builder remains
 # (foreign/reaped/dead). Only bounce-exhaustion escalates to needs-you. DUPLICATE flavor stays human.
 # off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.
@@ -341,6 +341,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # ADDITIVE + FAIL-SOFT: a missing reader / api error / no credentials = empty inbox, NEVER a red row;
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
+
+# Journal-driven self-audit / gap-finder (HERD-238). When on, the watcher runs journal-audit.sh on
+# the housekeeping sweep cadence (~3 min), replaying a BOUNDED journal window for invariant
+# violations that were visible in the journal but nothing was reading: merge without reap;
+# *_dispatched with no terminal past family TTL; refix_bounce without wake_result; MAIN RED older
+# than TTL; pushed=no never followed by yes; known-fixture slugs. Findings → journal_audit events
+# (component=audit) + operator-inbox rows (source=audit). ADVISORY ONLY — never gates, never mutates.
+# Ships OFF (byte-inert). Pair with OPERATOR_INBOX=on to render audit rows in the console.
+# JOURNAL_AUDIT="off"      # off (default) | on
 
 # Daily SPEND CEILING (HERD-95) — ENFORCE a budget, don't just measure it. `herd cost` already prices
 # every builder/review/agent session and journals a `cost` event at merge; this key turns that ledger

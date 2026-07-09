@@ -155,9 +155,11 @@ REVIEW_STATE="$TREES/.agent-watch-reviewed"
 REVIEW_RETRIES="$TREES/.agent-watch-review-retries"
 # Max transient failures per pr+sha before the watcher stops re-dispatching and asks for a human.
 _REVIEW_RETRY_MAX=3
-# Refix ledger: one line per auto-refix bounce ("<epoch> <pr#> <headSha> <slug>"). Sha-keyed
-# (one bounce per BLOCK per sha; new commit → fresh budget). Total per PR capped at REFIX_MAX_ROUNDS;
-# further BLOCKs after the cap escalate to "needs you".
+# Refix ledger: one line per auto-refix bounce ("<epoch> <pr#> <headSha> <slug> <kind>"), plus a
+# "… <kind> reset" row whenever a rail's red resolves. Sha-keyed (one bounce per BLOCK per sha; new
+# commit → fresh budget). Each RAIL (review | health | stale) carries its own round budget, capped at
+# REFIX_MAX_ROUNDS and zeroed when that rail passes; a per-PR total ceiling (3× REFIX_MAX_ROUNDS)
+# bounds the whole thing. Exhausting either escalates to "needs you". See the HERD-229 block below.
 REFIX_STATE="$TREES/.agent-watch-refixed"
 # Override ledger: one line per human override of a cached BLOCK.
 # Format: "<epoch> override <pr#> <headSha>"
@@ -1108,7 +1110,7 @@ build_operator_inbox() {
   while IFS=$'\t' read -r epoch source ref author snip; do
     [ -n "${ref:-}" ] || continue
     hhmm="$(epoch_to_hhmm "$epoch")"
-    case "$source" in tracker) glyph='🗂' ;; *) glyph='📬' ;; esac
+    case "$source" in tracker) glyph='🗂' ;; audit) glyph='🔎' ;; *) glyph='📬' ;; esac
     rows="${rows}    ${C_CYAN}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${C_DIM}@${author}${C_RESET} ${snip} ${C_DIM}${hhmm}${C_RESET}"$'\n'
   done < <(reverse_file "$INBOX_LEDGER" | head -5)
   [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
@@ -1555,6 +1557,10 @@ _maybe_carry_forward_review() {
 record_review() {
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
   journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
+  # RESET-ON-PROGRESS (HERD-229): a PASS is the review rail's red resolving — whatever its provenance
+  # (reviewer, carried-forward, skipped-low-risk), the review loop converged. Refund that rail's refix
+  # budget here, at the one seam every PASS passes through. No-op unless the rail has rounds to zero.
+  if [ "$3" = "PASS" ]; then refix_rail_reset "$1" review "$2"; fi
 }
 
 # ── Structured BLOCK verdicts (HERD-104) ────────────────────────────────────────────────────────
@@ -5238,6 +5244,27 @@ _sweep_tracker_state() {
     bash "$HERE/tracker-state-sweep.sh" >/dev/null 2>&1 || true
 }
 
+# _sweep_journal_audit — HERD-238 journal-driven self-audit (the gap-finder). Runs on the same
+# low-frequency housekeeping cadence as the tracker-state sweep. Shells out to the standalone
+# journal-audit.sh which replays a BOUNDED journal window for invariant violations (merge without
+# reap; *_dispatched with no terminal past family TTL; refix_bounce without wake_result; stale MAIN
+# RED; pushed=no never followed by yes; known-fixture slugs), journals `journal_audit` events
+# (component=audit), and appends operator-inbox rows. ADVISORY ONLY — never gates, never mutates.
+# BEST-EFFORT + ship-dormant: byte-inert when JOURNAL_AUDIT=off (default); fail-soft on empty/short
+# journal; can never fail or slow a tick. Points the inbox ledger at THIS watcher's $INBOX_LEDGER so
+# build_operator_inbox surfaces findings when OPERATOR_INBOX is on.
+_sweep_journal_audit() {
+  [ -n "$DRYRUN" ] && return 0
+  case "$(printf '%s' "${JOURNAL_AUDIT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) ;;
+    *) return 0 ;;
+  esac
+  [ -f "$HERE/journal-audit.sh" ] || return 0
+  HERD_JOURNAL_AUDIT_INBOX="$INBOX_LEDGER" \
+  HERD_JOURNAL_AUDIT_SEEN="$TREES/.agent-watch-journal-audit-seen" \
+    bash "$HERE/journal-audit.sh" >/dev/null 2>&1 || true
+}
+
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
 # Enabled by REVIEW_AUTOFIX=true in .herd/config (default false). When the watcher records a
 # BLOCK verdict for PR <n> (slug S), it finds S's AGENT pane (NOT the tab's root shell pane —
@@ -5260,40 +5287,114 @@ _sweep_tracker_state() {
 # builders; _resume_builder remains for the limit-auto-resume scheduler (a truly-frozen session).
 #
 # Sha-keyed refix-once semantics mirror review-once: one bounce per BLOCK per sha. A new commit
-# changes the sha → a fresh bounce is eligible for the new sha's BLOCK (if any). Total bounces
-# per PR are capped at REFIX_MAX_ROUNDS (default 3); further BLOCKs escalate to "needs you".
+# changes the sha → a fresh bounce is eligible for the new sha's BLOCK (if any).
 #
 # KINDS (HERD-199 / HERD-173 pair): the same ledger records every autofix bounce as a 5th `kind`
-# field (review | health | stale). The once-guard is per (pr,sha,kind) — different findings each
-# bounce once — while the round BUDGET (refix_round_count) counts EVERY kind for the PR: ONE budget
-# per PR, so a builder can never be bounced 3× by review and 3× again by a stale-base heal. Legacy
-# 4-field lines read as kind=review.
+# field (review | health | stale) — the RAIL it belongs to. The once-guard is per (pr,sha,kind), so
+# different findings each bounce once. Legacy 4-field lines read as kind=review.
+#
+# BUDGET (HERD-229). The budget used to be ONE shared per-PR counter across every rail, and that
+# conflated two very different stories. PR #328 spent round 1 on a healthcheck red, round 2 on a
+# review BLOCK, round 3 on a stale base — three DIFFERENT first-time failures, each fixed on the
+# first bounce — and then a genuinely new review BLOCK arrived with no bounce left and sat needs-you
+# until a human relayed it by hand. A loop is the SAME check failing again; three checks each failing
+# once is a pipeline converging. So the budget is per rail, and progress refunds it:
+#
+#   • PER-RAIL ROUNDS  — each rail carries its own counter, capped at `refix_rail_cap`
+#     (= REFIX_MAX_ROUNDS, today's number). One rail's bounces never eat another's budget.
+#   • RESET-ON-PROGRESS — when a rail's red RESOLVES (review PASS after a BLOCK, health CLEAN after a
+#     red, base freshened), that rail's counter is zeroed: the loop demonstrably converges, so only
+#     repeated failure of the SAME kind should exhaust. `refix_rail_reset` appends a `reset` row —
+#     the ledger stays append-only, and a reset row is bookkeeping, never a bounce.
+#   • TOTAL SAFETY CAP — a per-PR absolute ceiling (`refix_total_cap`, derived: 3× REFIX_MAX_ROUNDS,
+#     no new config key) counts every bounce ever recorded for the PR, ignoring resets. A PR that
+#     fails across all rails, over and over, still escalates rather than bouncing forever.
+#
+# A single-rail PR is byte-identical to the old behavior: with no resets and no other rail spending,
+# rail count == total count, and the rail cap (REFIX_MAX_ROUNDS) is reached long before 3×.
+
+# Ledger row shapes (positional, space-separated):
+#   bounce: "<epoch> <pr#> <sha> <slug> <kind>"
+#   reset:  "<epoch> <pr#> <sha> <slug> <kind> reset"
+# Every reader below discriminates on the 6th field, so a reset row is never mistaken for a bounce
+# (it must not satisfy the once-guard, and it must not spend the total ceiling).
+
+# _refix_cap_num — REFIX_MAX_ROUNDS as a sane integer. A garbage value must not turn arithmetic into a
+# crash inside the tick loop, and must not silently read as 0 (which would cap every rail at zero and
+# escalate every PR on its first red). Fail-soft to the documented default.
+_refix_cap_num() {
+  local _rcn="${REFIX_MAX_ROUNDS:-3}"
+  case "$_rcn" in ''|*[!0-9]*|0) _rcn=3 ;; esac
+  printf '%s' "$_rcn"
+}
+
+# refix_rail_cap — the per-rail round cap. Each rail gets a budget of this size.
+refix_rail_cap() { _refix_cap_num; }
+
+# refix_total_cap — the per-PR ceiling across all rails, DERIVED from the rail cap (no new config key).
+refix_total_cap() { printf '%s' "$(( $(_refix_cap_num) * 3 ))"; }
 
 # refix_attempted <pr#> <headSha> [kind] — true if a bounce was already recorded for this exact
 # pr+sha. With [kind], only a bounce of THAT kind counts (a legacy line with no kind is "review").
 # Without [kind], any kind for that pr+sha matches (backward-compatible with pre-kind callers).
+# A `reset` row carries the sha it progressed past, so it must be excluded here or it would satisfy
+# the once-guard for that (pr,sha,kind) and silently suppress a later real bounce.
 refix_attempted() {
   [ -s "$REFIX_STATE" ] || return 1
   awk -v p="$1" -v s="$2" -v k="${3:-}" \
-    '$2==p && $3==s && (k=="" || ($5==k) || (k=="review" && $5=="")){f=1} END{exit !f}' \
+    '$2==p && $3==s && $6!="reset" && (k=="" || ($5==k) || (k=="review" && $5=="")){f=1} END{exit !f}' \
     "$REFIX_STATE" 2>/dev/null
 }
 
-# refix_round_count <pr#> — total bounces recorded for this PR (across all shas AND all kinds: the
-# review / health / stale-base autofixes SHARE one per-PR budget).
-refix_round_count() {
+# refix_total_count <pr#> — every bounce ever recorded for this PR, across all shas and all rails.
+# This is what the TOTAL safety cap reads; resets never refund it.
+refix_total_count() {
   [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
-  awk -v p="$1" '$2==p{n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+  awk -v p="$1" '$2==p && $6!="reset"{n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
 }
 
-# refix_round_count_kind <pr#> <kind> — bounces of ONE kind for this PR. The shared budget above is
-# right for the CAP (a builder must not be bounced 3× by review and 3× again by health), but WRONG as
-# EVIDENCE about a particular gate: a health bounce proves nothing about whether the cheap REVIEWER
-# missed an issue (review note #2). Callers reasoning about a gate's own history use this.
+# refix_round_count <pr#> — the PR's lifetime bounce total. Retained under its original name for the
+# callers that want the whole story (the escalated-reviewer row's "N failed refix rounds").
+refix_round_count() { refix_total_count "$1"; }
+
+# refix_rail_count <pr#> <kind> — bounces on ONE rail SINCE THAT RAIL LAST MADE PROGRESS. This is the
+# rail's live budget: the ledger is chronological and append-only, so a `reset` row simply zeroes the
+# running count as the scan passes it. This is what the per-rail cap reads.
+refix_rail_count() {
+  [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
+  awk -v p="$1" -v k="$2" '
+    $2==p && (($5==k) || (k=="review" && $5=="")) {
+      if ($6=="reset") n=0; else n++
+    }
+    END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+}
+
+# refix_round_count_kind <pr#> <kind> — LIFETIME bounces of one kind (resets do not refund it). Not a
+# budget: it is EVIDENCE about a particular gate's history — a health bounce proves nothing about
+# whether the cheap REVIEWER missed an issue (review note #2). `_maybe_arm_review_escalation` reads it
+# to decide the reviewer needs a smarter model, a question a rail reset must not erase.
 refix_round_count_kind() {
   [ -s "$REFIX_STATE" ] || { printf '0'; return 0; }
   awk -v p="$1" -v k="$2" \
-    '$2==p && (($5==k) || (k=="review" && $5=="")){n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+    '$2==p && $6!="reset" && (($5==k) || (k=="review" && $5=="")){n++} END{print n+0}' "$REFIX_STATE" 2>/dev/null || printf '0'
+}
+
+# _refix_budget_reason <pr#> <kind> — when this rail may NOT bounce again, print the honest cap phrase
+# and return 0; print nothing and return 1 while budget remains. The two ceilings are named apart on
+# the row because the remedy differs: a spent RAIL means one check keeps failing (read the finding); a
+# spent TOTAL means the PR is thrashing across rails (read the PR).
+_refix_budget_reason() {
+  local _rbr_pr="$1" _rbr_kind="$2" _rbr_rail _rbr_total _rbr_rcap _rbr_tcap
+  _rbr_rcap="$(refix_rail_cap)"; _rbr_tcap="$(refix_total_cap)"
+  _rbr_rail="$(refix_rail_count "$_rbr_pr" "$_rbr_kind")"
+  _rbr_total="$(refix_total_count "$_rbr_pr")"
+  if [ "${_rbr_rail:-0}" -ge "$_rbr_rcap" ] 2>/dev/null; then
+    printf 'refix limit (%s rounds) reached' "$_rbr_rcap"; return 0
+  fi
+  if [ "${_rbr_total:-0}" -ge "$_rbr_tcap" ] 2>/dev/null; then
+    printf 'refix limit (%s total rounds across rails) reached' "$_rbr_tcap"; return 0
+  fi
+  return 1
 }
 
 # record_refix <pr#> <headSha> <slug> [kind=review] — append one bounce record.
@@ -5305,6 +5406,23 @@ refix_round_count_kind() {
 record_refix() {
   local _rr_slug="${3:-}"; [ -n "$_rr_slug" ] || _rr_slug='-'
   printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$_rr_slug" "${4:-review}" >> "$REFIX_STATE"
+}
+
+# refix_rail_reset <pr#> <kind> [sha] [slug] — this rail's red RESOLVED; zero its budget by appending a
+# `reset` row. NO-OP when the rail has nothing to zero, which is what makes it safe on a hot path (the
+# health gate calls it on every CLEAN verdict) and keeps the ledger from growing without bound.
+# Fail-soft: an unwritable ledger loses a refund, never a tick.
+refix_rail_reset() {
+  local _rrr_pr="$1" _rrr_kind="$2" _rrr_sha="${3:-}" _rrr_slug="${4:-}" _rrr_n
+  [ -n "$_rrr_pr" ] && [ -n "$_rrr_kind" ] || return 0
+  _rrr_n="$(refix_rail_count "$_rrr_pr" "$_rrr_kind")"
+  [ "${_rrr_n:-0}" -gt 0 ] 2>/dev/null || return 0
+  [ -n "$_rrr_sha" ] || _rrr_sha='-'
+  [ -n "$_rrr_slug" ] || _rrr_slug='-'
+  printf '%s %s %s %s %s reset\n' "$(date +%s)" "$_rrr_pr" "$_rrr_sha" "$_rrr_slug" "$_rrr_kind" \
+    >> "$REFIX_STATE" || return 0
+  journal_append refix_rail_reset pr "$_rrr_pr" sha "$_rrr_sha" slug "$_rrr_slug" kind "$_rrr_kind" \
+    rounds "$_rrr_n" reason "rail resolved its red — per-rail refix budget restored"
 }
 
 # ── ROW TRUTH: "needs you" means NOBODY is on it (HERD-173) ────────────────────────────────────────
@@ -5371,8 +5489,10 @@ _active_fix_note() {
     case "$_afn_live" in
       dead|missing) : ;;
       *)
-        _afn_rounds="$(refix_round_count "$_afn_pr")"
-        printf 'fix in progress · awaiting push (round %s/%s)' "${_afn_rounds:-1}" "${REFIX_MAX_ROUNDS:-3}"
+        # k/cap is THIS RAIL's budget (HERD-229) — the row names the rail's red, so the number beside
+        # it must be that rail's rounds, not the PR's lifetime total across every rail.
+        _afn_rounds="$(refix_rail_count "$_afn_pr" "$_afn_kind")"
+        printf 'fix in progress · awaiting push (round %s/%s)' "${_afn_rounds:-1}" "$(refix_rail_cap)"
         return 0 ;;
     esac
   fi
@@ -5590,8 +5710,8 @@ _handle_block_verdict() {
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · review blocked without a reviewer finding (${_hbv_src}) · not auto-refixed · see PR #${_hbv_pr}${C_RESET}"
       return 0
     fi
-    local _hbv_rounds _hbv_note
-    _hbv_rounds="$(refix_round_count "$_hbv_pr")"
+    local _hbv_rounds _hbv_note _hbv_capmsg
+    _hbv_rounds="$(refix_rail_count "$_hbv_pr" review)"
     if _hbv_note="$(_active_fix_note "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review)"; then
       # An agent is ON this red — either we bounced it for this sha (and neither a stuck marker nor a
       # dead probe disproves that), or it reads "working". Never "needs you", and never a second bounce
@@ -5601,8 +5721,8 @@ _handle_block_verdict() {
       # Bounced, but NOBODY is on it: the wake failed, or the agent died right after. Escalate durably —
       # this row used to be overwritten by a false "awaiting push" on the very next tick.
       DISPLAY[_hbv_idx]="$(_refix_stalled_row "$_hbv_pr" "$_hbv_sha" "$_hbv_slug" review "$_hbv_sl" "$_hbv_pn")"
-    elif [ "$_hbv_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ]; then
-      DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · see PR #${_hbv_pr}${C_RESET}"
+    elif _hbv_capmsg="$(_refix_budget_reason "$_hbv_pr" review)"; then
+      DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · ${_hbv_capmsg} · see PR #${_hbv_pr}${C_RESET}"
     elif _hbv_live="$(_agent_liveness "$_hbv_slug")"; [ "$_hbv_live" = "dead" ] || [ "$_hbv_live" = "missing" ]; then
       # HERD-114/HERD-135 PREFLIGHT — the auto-refix bounce wakes the builder by typing the re-task
       # prompt into its agent pane. If that agent SESSION is DEAD (process killed — e.g. a herdr server
@@ -5719,7 +5839,8 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
 # (touched files moved on origin/main — purely MECHANICAL). When enabled, a STALE-BASE hold self-heals
 # on the same rails as the review/health autofixes:
 #   • sha-keyed once-guard, kind=stale — one heal attempt per commit;
-#   • SHARED per-PR round budget with every other autofix kind (REFIX_MAX_ROUNDS);
+#   • the STALE rail's OWN round budget (REFIX_MAX_ROUNDS), zeroed whenever the base comes back fresh
+#     and bounded by the per-PR total ceiling (HERD-229);
 #   • LIVE builder → re-task with `git merge $DEFAULT_BRANCH` + push; row reads
 #     `rebasing · awaiting push`;
 #   • NO live builder (foreign / reaped / dead / missing pane) → dispatch the EXISTING conflict
@@ -5744,8 +5865,9 @@ _stale_base_autofix_enabled() {
 # tailable log path to the builder's agent pane on exactly the same rails as the review bounce:
 #   • sha-keyed once-guard, kind=health, so one CODE ERROR bounces once per commit (a new push re-runs
 #     the suite and is eligible for a fresh bounce);
-#   • the SHARED per-PR round budget (refix_round_count counts review + health together, capped at
-#     REFIX_MAX_ROUNDS) — a builder can never be bounced 3× by review and 3× again by health;
+#   • the HEALTH rail's OWN round budget (REFIX_MAX_ROUNDS), zeroed whenever the suite next goes CLEAN
+#     and bounded by the per-PR total ceiling — a red suite never eats the rounds a later review BLOCK
+#     will need (HERD-229);
 #   • the SAME preflights: a LIMIT-PARKED builder routes to the park/resume handler instead of having
 #     the prompt typed into its limit menu, and a DEAD/MISSING agent escalates loudly WITHOUT burning a
 #     round on a wake that can only hit nobody;
@@ -5793,7 +5915,7 @@ _stale_needs_you_row() {
 _handle_stale_dup() {
   local _hsd_pr="$1" _hsd_slug="$2" _hsd_sha="$3" _hsd_idx="$4" _hsd_wt="${5:-}" \
         _hsd_branch="${6:-}" _hsd_kind="${7:-}" _hsd_reason="${8:-}"
-  local _hsd_sl _hsd_pn _hsd_rounds _hsd_round_num _hsd_base
+  local _hsd_sl _hsd_pn _hsd_rounds _hsd_round_num _hsd_base _hsd_capmsg
   _hsd_sl="$(_slug_cell "$_hsd_slug")"
   _hsd_pn=" ${C_DIM}#${_hsd_pr}${C_RESET} ·"
   _hsd_base="${DEFAULT_BRANCH:-origin/main}"
@@ -5822,7 +5944,7 @@ _handle_stale_dup() {
     fi
   fi
 
-  _hsd_rounds="$(refix_round_count "$_hsd_pr")"
+  _hsd_rounds="$(refix_rail_count "$_hsd_pr" stale)"
   # Once-guard: already healed this sha → wait for the push / resolver finish. Honest in-progress row.
   if refix_attempted "$_hsd_pr" "$_hsd_sha" stale; then
     local _hsd_note
@@ -5859,14 +5981,14 @@ _handle_stale_dup() {
     return 0
   fi
 
-  # Shared budget exhausted → needs-you. Only exhaustion escalates (not a missing builder — that
-  # routes to the resolver below).
-  if [ "${_hsd_rounds:-0}" -ge "${REFIX_MAX_ROUNDS:-3}" ] 2>/dev/null; then
-    DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · stale base still held · ${_hsd_reason}${C_RESET}"
+  # Budget exhausted → needs-you: this rail's own rounds, or the PR's total ceiling across rails. Only
+  # exhaustion escalates (not a missing builder — that routes to the resolver below).
+  if _hsd_capmsg="$(_refix_budget_reason "$_hsd_pr" stale)"; then
+    DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · ${_hsd_capmsg} · stale base still held · ${_hsd_reason}${C_RESET}"
     if ! _refix_dead_seen "$_hsd_pr" "stale-cap-$_hsd_sha"; then
       _record_refix_dead "$_hsd_pr" "stale-cap-$_hsd_sha"
       journal_append stale_refix_escalated pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
-        rounds "$_hsd_rounds" reason "shared refix budget exhausted — stale base still held"
+        rounds "$_hsd_rounds" reason "${_hsd_capmsg} — stale base still held"
       herd_driver_notify "⚠️ refix budget spent: ${_hsd_slug}" \
         "PR #${_hsd_pr} stale base still held after ${_hsd_rounds} refix rounds — needs you" default
     fi
@@ -6003,7 +6125,12 @@ _stale_dup_gate_step() {
   local _sdg_pr="$1" _sdg_slug="$2" _sdg_dir="$3" _sdg_sha="$4" _sdg_branch="$5" _sdg_idx="$6"
   [ -n "$_sdg_sha" ] || return 0
   [ -z "${DRYRUN:-}" ] || return 0
-  stale_dup_check "$_sdg_pr" "$_sdg_slug" "$_sdg_dir" "$_sdg_sha" "$DEFAULT_BRANCH" && return 0
+  if stale_dup_check "$_sdg_pr" "$_sdg_slug" "$_sdg_dir" "$_sdg_sha" "$DEFAULT_BRANCH"; then
+    # RESET-ON-PROGRESS (HERD-229): the base is fresh again — the stale rail's red resolved (the heal
+    # landed, or another seat's merge stopped conflicting). Refund the stale rail's refix budget.
+    refix_rail_reset "$_sdg_pr" stale "$_sdg_sha" "$_sdg_slug"
+    return 0
+  fi
   [ -n "${_STALE_DUP_KIND:-}" ] || return 0
 
   # The console row re-renders every tick from this live re-check; the PR comment / notify / journal
@@ -6053,7 +6180,7 @@ _health_needs_you_row() {
 # sha-cache — so the row stays truthful on every tick. Always sets DISPLAY[<idx>]; returns 0.
 _handle_health_codeerror() {
   local _hhc_pr="$1" _hhc_slug="$2" _hhc_sha="$3" _hhc_idx="$4" _hhc_wt="${5:-}" _hhc_detail="${6:-}"
-  local _hhc_sl _hhc_pn _hhc_note _hhc_rounds _hhc_live
+  local _hhc_sl _hhc_pn _hhc_note _hhc_rounds _hhc_live _hhc_capmsg
   _hhc_sl="$(_slug_cell "$_hhc_slug")"
   _hhc_pn=" ${C_DIM}#${_hhc_pr}${C_RESET} ·"
 
@@ -6096,7 +6223,7 @@ _handle_health_codeerror() {
     fi
   fi
 
-  _hhc_rounds="$(refix_round_count "$_hhc_pr")"
+  _hhc_rounds="$(refix_rail_count "$_hhc_pr" health)"
   if _hhc_note="$(_active_fix_note "$_hhc_pr" "$_hhc_sha" "$_hhc_slug" health)"; then
     # Already bounced for this sha, or an agent is working this red — wait for the push. (Checked BEFORE
     # the cap: a row is never "needs you" while somebody is on it, even at the budget's end.)
@@ -6109,12 +6236,12 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="$(_refix_stalled_row "$_hhc_pr" "$_hhc_sha" "$_hhc_slug" health "$_hhc_sl" "$_hhc_pn")"
     return 0
   fi
-  if [ "$_hhc_rounds" -ge "${REFIX_MAX_ROUNDS:-3}" ] 2>/dev/null; then
-    DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · refix limit (${REFIX_MAX_ROUNDS:-3} rounds) reached · health-check still red: ${_hhc_detail}${C_RESET}"
+  if _hhc_capmsg="$(_refix_budget_reason "$_hhc_pr" health)"; then
+    DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_capmsg} · health-check still red: ${_hhc_detail}${C_RESET}"
     if ! _refix_dead_seen "$_hhc_pr" "health-cap-$_hhc_sha"; then
       _record_refix_dead "$_hhc_pr" "health-cap-$_hhc_sha"
       journal_append health_refix_escalated pr "$_hhc_pr" sha "$_hhc_sha" slug "$_hhc_slug" \
-        rounds "$_hhc_rounds" reason "shared refix budget exhausted — health-check still red"
+        rounds "$_hhc_rounds" reason "${_hhc_capmsg} — health-check still red"
       herd_driver_notify "⚠️ refix budget spent: ${_hhc_slug}" \
         "PR #${_hhc_pr} health-check still red after ${_hhc_rounds} refix rounds — needs you" default
     fi
@@ -7529,6 +7656,9 @@ _health_result_file() { printf '%s' "$TREES/.health-result-$1-$2"; }
 record_health_result() {
   [ -n "$2" ] || return 0
   printf '%s\t%s\n' "$3" "${4:-}" > "$(_health_result_file "$1" "$2")"
+  # RESET-ON-PROGRESS (HERD-229): the suite went green (CLEAN, or FLAKY = passed on retry) — the health
+  # rail's red resolved, so refund its refix budget. CODEERROR is the failure that must keep spending.
+  case "$3" in CLEAN|FLAKY) refix_rail_reset "$1" health "$2" ;; esac
 }
 
 # _discard_stale_health <pr#> <currentSha> — a cached result for this PR keyed to ANY OTHER sha is
@@ -9650,10 +9780,15 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
 
   # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
   # recently-merged PR whose tracker item drifted (stuck open after merge). Cheap + advisory.
+  # Journal self-audit (HERD-238) rides the same cadence: a bounded journal replay for invariant
+  # violations (merge-without-reap, stranded dispatches, bounce-without-wake, stale MAIN RED,
+  # pushed=no, fixture slugs) → operator-inbox rows + journal_audit events. Ship-dormant unless
+  # JOURNAL_AUDIT=on; advisory only.
   _TRACKER_SWEEP_TICK=$((_TRACKER_SWEEP_TICK + 1))
   if [ "$_TRACKER_SWEEP_TICK" -ge "$_TRACKER_SWEEP_INTERVAL" ]; then
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
+    _sweep_journal_audit
   fi
 
   # Codemap / symbol-index freshness reconcile (HERD-218): multi-seat invariant — when another seat

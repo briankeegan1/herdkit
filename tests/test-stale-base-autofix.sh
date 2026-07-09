@@ -7,7 +7,7 @@
 #   (1) OFF (default) + stale-base → needs-you row, no bounce, no ledger write
 #   (2) ON + live builder + stale-base → one pane-run bounce, kind=stale, row "rebasing · awaiting push"
 #   (3) once-guard: same sha re-enters → no second bounce; still "rebasing · awaiting push"
-#   (4) shared budget with review refix; cap → needs-you · refix limit
+#   (4) per-rail budget (HERD-229): review bounces spare the stale rail; its own cap → needs-you
 #   (5) no live builder (foreign/reaped) → conflict resolver dispatched (not needs-you)
 #   (6) DUPLICATE flavor always human, even with autofix ON
 #   (7) dry-run never bounces
@@ -153,22 +153,25 @@ _handle_stale_dup 20 slug-a shaD 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "2" ] || fail "(3b) a new sha must be eligible for a fresh bounce (got $(runs))"
 ok "(3b) new sha is eligible"
 
-# ── (4) shared budget with review refix; cap escalates ────────────────────────────────────────
+# ── (4) PER-RAIL budget (HERD-229): review bounces never spend the stale rail; its own cap escalates
 reset_state
 export STALE_BASE_AUTOFIX=on REFIX_MAX_ROUNDS=3
 record_refix 30 shaR1 slug-a review
 record_refix 30 shaR2 slug-a review
-[ "$(refix_round_count 30)" = "2" ] || fail "(4) budget must count review bounces"
+[ "$(refix_rail_count 30 stale)" = "0" ] || fail "(4) review bounces must not spend the stale rail"
+[ "$(refix_total_count 30)" = "2" ]      || fail "(4) the total ceiling still counts every rail"
 printf '0\n' > "$STUB_WAIT_FILE"
 _handle_stale_dup 30 slug-a shaS1 0 "$WT" feat/a stale-base "$REASON"
-[ "$(runs)" = "1" ] || fail "(4) third shared round should still bounce (got $(runs))"
-[ "$(refix_round_count 30)" = "3" ] || fail "(4) review + stale must share ONE per-PR budget"
+[ "$(runs)" = "1" ] || fail "(4) the stale rail's first round should bounce (got $(runs))"
 _handle_stale_dup 30 slug-a shaS2 0 "$WT" feat/a stale-base "$REASON"
-[ "$(runs)" = "1" ] || fail "(4b) bounce past the cap must not be delivered (got $(runs))"
+_handle_stale_dup 30 slug-a shaS3 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "3" ] || fail "(4) three stale rounds should all bounce (got $(runs))"
+_handle_stale_dup 30 slug-a shaS4 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "3" ] || fail "(4b) bounce past the cap must not be delivered (got $(runs))"
 row | grep -q 'needs you · refix limit (3 rounds) reached' \
   || fail "(4b) cap row must read 'needs you · refix limit' (got: $(row))"
 grep -q '"event":"stale_refix_escalated"' "$JOURNAL_FILE" || fail "(4b) cap must journal an escalation"
-ok "(4) shared budget + cap escalation"
+ok "(4) per-rail budget + cap escalation"
 
 # ── (5) no live builder (foreign/reaped) → conflict resolver, not needs-you ───────────────────
 reset_state
