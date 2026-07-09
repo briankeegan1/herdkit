@@ -86,6 +86,7 @@ _wait_agent_working() {
   return "${_c:-0}"
 }
 _agent_liveness() { printf '%s' "${STUB_LIVENESS:-alive}"; }
+_resolver_agent_alive() { [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }
 _detect_limit_hit() { return 1; }
 
 # Capture spawn_resolver calls instead of launching real resolvers.
@@ -255,5 +256,30 @@ _handle_stale_dup 80 slug-a shaK 0 "$WT" feat/a stale-base "$REASON"
 row | grep -q 'needs you' || fail "(10) tick2: once-guard must NOT flip to rebasing (got: $(row))"
 row | grep -q 'stalled' || fail "(10) tick2 must carry the stalled reason (got: $(row))"
 ok "(10) failed wake escalates durably (no rebasing lie)"
+
+# ── (11) agent dies AFTER a good wake → stalled row, never a permanent 'rebasing' lie (round-6) ──
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle STUB_LIVENESS=alive
+printf '0\n' > "$STUB_WAIT_FILE"                       # wake SUCCEEDS: record written, no stuck marker
+_handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'rebasing' || fail "(11) tick1: good wake reads rebasing (got: $(row))"
+export STUB_LIVENESS=dead                              # builder session dies before pushing
+_handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(11) tick2: dead-after-wake must escalate, not claim rebasing (got: $(row))"
+_handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(11) tick3: escalation is durable (got: $(row))"
+ok "(11) died-after-wake escalates durably (round-6 triple disproof)"
+
+# ── (12) live RESOLVER keeps an honest in-progress row ────────────────────────────────────────
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_LIVENESS=missing STUB_RESOLVER_ALIVE=1
+printf '0\n' > "$STUB_WAIT_FILE"
+record_refix 95 shaM slug-a stale                       # heal already dispatched (resolver path)
+_handle_stale_dup 95 slug-a shaM 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'resolver working' || fail "(12) live resolver must read as working (got: $(row))"
+export STUB_RESOLVER_ALIVE=0
+_handle_stale_dup 95 slug-a shaM 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(12) dead resolver must escalate (got: $(row))"
+ok "(12) resolver liveness consulted before claiming progress"
 
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"

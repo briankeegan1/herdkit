@@ -3822,10 +3822,19 @@ _handle_stale_dup() {
   _hsd_rounds="$(refix_round_count "$_hsd_pr")"
   # Once-guard: already healed this sha → wait for the push / resolver finish. Honest in-progress row.
   if refix_attempted "$_hsd_pr" "$_hsd_sha" stale; then
-    if _refix_stuck_seen "$_hsd_pr" "$_hsd_sha" stale; then
-      DISPLAY[_hsd_idx]="$(_refix_stalled_row "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "$_hsd_sl" "$_hsd_pn")"
+    local _hsd_note
+    if _hsd_note="$(_active_fix_note "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale)"; then
+      # Someone is genuinely ON this rebase (record + no stuck marker + liveness not positively
+      # dead/missing — the sibling paths' triple disproof, review round-6). Honest in-progress row.
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}${_hsd_note/fix in progress/rebasing}${C_RESET}"
+    elif _resolver_agent_alive "$_hsd_slug" 2>/dev/null; then
+      # No live BUILDER on it, but the dispatched conflict RESOLVER is alive and working (review
+      # round-6: the resolver path needs its own liveness consult, not the builder probe).
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · resolver working${C_RESET}"
     else
-      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_rounds}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+      # Bounced but NOBODY is on it (wake failed, agent died after a good wake, or the resolver
+      # died/escalated). Durable needs-you via the shared stalled row.
+      DISPLAY[_hsd_idx]="$(_refix_stalled_row "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "$_hsd_sl" "$_hsd_pn")"
     fi
     return 0
   fi
