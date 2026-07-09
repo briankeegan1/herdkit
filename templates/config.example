@@ -66,6 +66,17 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # herd reload / coordinator launch.
 # DOCTOR_STARTUP_HINT="off"           # off (default) | on
 
+# AGENT_UPDATE — opt-in safe self-update of the AGENT RUNTIME (HERD-149). Default "off": nothing runs,
+# byte-identical to today — you keep updating claude (or, via the driver seam, codex/grok) by hand or
+# a personal OS job. Set "on" and `herd agent-update` detects the installer (brew/npm/native) of the
+# runtime HERD_DRIVER points at, runs the update, and — the whole point — HANDLES the macOS footgun
+# where a `brew upgrade --cask` leaves the new binary com.apple.quarantine'd so every new exec hangs
+# in _dyld_start (issue #137): it xattr-de-quarantines the resolved binary after the update. It is
+# DRIVER-AWARE (updates whichever runtime the active driver binds) and FAIL-SOFT (a missing runtime or
+# a failed installer command warns, never hard-aborts). Preview the exact commands without running
+# them: `herd agent-update --dry-run`. Any value other than "on" is treated as off.
+# AGENT_UPDATE="off"                  # off (default) | on
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color
@@ -139,13 +150,15 @@ COORDINATOR_CMD="/coordinator"
 
 # driver — the runtime-specific control surface (multiplexer + agent runtime) the coordinator skill
 # is bound to. Selects templates/drivers/<name>.driver, whose DRIVER_* incantations are substituted
-# into the rendered coordinator skill. Two production drivers ship, plus a stub proof driver:
+# into the rendered coordinator skill. Four production drivers ship, plus a stub proof driver:
 #   herdr-claude (default) — herdr multiplexer + Claude Code; renders the skill functionally
 #     identical to before the driver abstraction (the byte-identical default).
 #   headless — NO herdr panes: agents run detached, panes become a VIEW not a dependency, and the
 #     watcher / journal / notifications / limit detection run headless (Windows / CI / headless Linux).
-#   stub — a NON-Claude PROOF/REFERENCE driver (HERD-177): the existence proof that the portability
-#     seam runs a non-Claude runtime end-to-end. Not for production; HERD-178 adds real codex/grok.
+#   codex — herdr mux + OpenAI Codex CLI runtime (the DRIVER_AGENT_* exec surface rebound to `codex`).
+#   grok  — herdr mux + xAI Grok Build CLI runtime (the DRIVER_AGENT_* exec surface rebound to `grok`).
+#   stub — a NON-Claude PROOF/REFERENCE driver (HERD-177): the minimal existence proof that the
+#     portability seam runs a non-Claude runtime end-to-end. Not for production (use codex/grok).
 # An unknown value fails `herd render` loudly, listing the available drivers.
 HERD_DRIVER="herdr-claude"
 

@@ -450,12 +450,13 @@ The render-time seam already swaps a non-herdr **multiplexer** (phase 2, `test-d
    with `HERD_DRIVER=stub` produces a valid coordinator skill and the completeness lint passes), and
    every `DRIVER_AGENT_*` exec class names `stub-agent`, **never `claude`**. It is a PROOF/REFERENCE
    driver, not a production runtime.
-2. **The runtime exec seam consumes the driver's exec binding.** `driver.sh` gains
-   `herd_driver_agent_binding <KEY>` (read the active driver's `DRIVER_AGENT_*` value, sourcing the
-   driver file in a subshell — fail-soft empty on a missing file/key) and `herd_driver_agent_runtime`
-   (the runtime executable = the first token of `DRIVER_AGENT_ONESHOT_EXEC`, else `INTERACTIVE_SPAWN`,
-   else empty). `herd_driver_oneshot_exec` now runs **that** runtime: `stub-agent -p …` under
-   `HERD_DRIVER=stub`, the drift-guarded byte-identical `claude -p …` literal for the default/claude case.
+2. **The runtime exec seam consumes the driver's exec binding.** It reuses HERD-149's
+   `herd_driver_agent_value <KEY> [default]` (a PURE grep-read of the active driver's `DRIVER_AGENT_*`
+   value — no sourcing, fail-soft `<default>` on a missing file/key) and adds `herd_driver_agent_runtime`
+   on top (the runtime executable = the first token of `DRIVER_AGENT_ONESHOT_EXEC`, else
+   `INTERACTIVE_SPAWN`, else empty). `herd_driver_oneshot_exec` now runs **that** runtime: `stub-agent -p …`
+   under `HERD_DRIVER=stub` (and `codex`/`grok` for those drivers), the drift-guarded byte-identical
+   `claude -p …` literal for the default/claude case.
 3. **Absent-binding degradation.** A driver that omits an exec binding (or a missing driver file) yields
    an empty runtime → the seam degrades to the default `claude` and **never crashes** under
    `set -euo pipefail`. This is the graceful-degradation guarantee a partial third-party driver relies on.

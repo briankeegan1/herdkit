@@ -14,7 +14,7 @@
 #       herd_driver_oneshot_exec runs `stub-agent -p …` end-to-end — the seam is runtime-portable.
 #   (4) BYTE-IDENTICAL DEFAULT: with HERD_DRIVER unset/herdr-claude the same seam runs `claude -p …`.
 #   (5) ABSENT-BINDING DEGRADATION: a driver that omits DRIVER_AGENT_ONESHOT_EXEC → the seam degrades
-#       to the default `claude` runtime and never crashes; herd_driver_agent_binding on a missing key
+#       to the default `claude` runtime and never crashes; herd_driver_agent_value on a missing key
 #       or a missing driver file returns empty + rc 0 under `set -euo pipefail`.
 #
 # Fully hermetic: temp git repos + fake `stub-agent`/`claude` on PATH. NO real claude/herdr/gh/network.
@@ -136,15 +136,20 @@ DRIVER_CREATE_TAB='x tab'
 DRIVER_READ_PANE='x read'
 DRIVER_SEND_KEYS='x keys'
 EOF
-# 5a. agent-binding on a missing key → empty + rc 0 (fail-soft under set -euo pipefail).
+# 5a. herd_driver_agent_value (HERD-149) on a missing key → the [default] (empty here) + rc 0
+#     (fail-soft under set -euo pipefail); herd_driver_agent_runtime built on it returns empty too.
 b="$(HERD_DRIVER=degraded HERD_DRIVERS_DIR="$DD" \
-     bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_agent_binding DRIVER_AGENT_ONESHOT_EXEC')" \
-  || fail "(5a) herd_driver_agent_binding aborted on an absent binding (must fail-soft)"
+     bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC')" \
+  || fail "(5a) herd_driver_agent_value aborted on an absent binding (must fail-soft)"
 [ -z "$b" ] || fail "(5a) absent binding should be empty, got: $b"
-# 5b. agent-binding against a MISSING driver file → empty + rc 0.
+r="$(HERD_DRIVER=degraded HERD_DRIVERS_DIR="$DD" \
+     bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_agent_runtime')" \
+  || fail "(5a) herd_driver_agent_runtime aborted on a driver with no exec surface (must fail-soft)"
+[ -z "$r" ] || fail "(5a) runtime for a driver with no exec surface should be empty, got: $r"
+# 5b. herd_driver_agent_value against a MISSING driver file → the [default] (empty) + rc 0.
 b="$(HERD_DRIVER=doesnotexist HERD_DRIVERS_DIR="$DD" \
-     bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_agent_binding DRIVER_AGENT_ONESHOT_EXEC')" \
-  || fail "(5b) herd_driver_agent_binding aborted on a missing driver file (must fail-soft)"
+     bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC')" \
+  || fail "(5b) herd_driver_agent_value aborted on a missing driver file (must fail-soft)"
 [ -z "$b" ] || fail "(5b) missing driver file should yield empty binding, got: $b"
 # 5c. the one-shot seam under the degraded driver degrades to claude and returns cleanly (no crash).
 out="$(HERD_DRIVER=degraded HERD_DRIVERS_DIR="$DD" PATH="$FB:$PATH" \
