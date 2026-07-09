@@ -477,5 +477,44 @@ printf '%s' "$LAST" | grep -q '"flagged":4' \
 printf '%s' "$LAST" | grep -q '"reaped":0' || fail "(12) reaped counter accumulated across runs: $LAST"
 ok; echo "PASS (12) SWEEP_N_* counters reset per run (auto ticks never report a lifetime total)"
 
+# ── (19) stray-watcher detection EXEMPTS live gate-worker forks (HERD-217) ───────────────────────
+# Leg 5 delegates the kill of every pid sweep_stray_watchers lists to _stop_project_watcher, which
+# SIGKILLs it. But the canonical watcher FORKS its healthcheck/review gate workers, and each re-execs
+# under the SAME argv0 ($HERD_WATCH_ARGV0) — so a live gate worker is argv0-indistinguishable from a
+# duplicate watcher. Listing one strands the PR behind a corpse (the live 2026-07-09 failure). This
+# asserts sweep_stray_watchers exempts a gate-worker fork two ways — a CHILD of the canonical watcher,
+# and a reparented fork that still PARENTS a live healthcheck/review worker — while STILL listing a
+# genuine orphan duplicate whose parent is dead and which owns no gate child.
+WPID=700001        # the canonical (lockfile) watcher
+FORK_A=700002      # a gate-worker fork: ppid == canonical  → exempt (ppid guard)
+FORK_B=700003      # a gate-worker fork reparented to init, still parenting a healthcheck  → exempt (child guard)
+HC_CHILD=700004    # FORK_B's live healthcheck worker (not argv0-tagged; it is the gate child)
+ORPHAN=700005      # a GENUINE orphan duplicate: parent dead, no gate child  → must be LISTED
+printf '%s\n' "$WPID" > "$T/watch.lock"
+cat > "$T/ps-stray" <<EOF
+#!/usr/bin/env bash
+# pid ppid pgid command  — argv0 (first token) == the marker tags a watcher.
+printf '%s 1 %s herd-watch-sweepws bash %s/scripts/herd/agent-watch.sh --watch\n'         "$WPID"     "$WPID"   "$MAINDIR"
+printf '%s %s %s herd-watch-sweepws bash %s/scripts/herd/agent-watch.sh\n'                 "$FORK_A"   "$WPID"   "$FORK_A"  "$MAINDIR"
+printf '%s 1 %s herd-watch-sweepws bash %s/scripts/herd/agent-watch.sh\n'                  "$FORK_B"   "$FORK_B" "$MAINDIR"
+printf '%s %s %s bash %s/scripts/herd/healthcheck.sh %s/merged-clean\n'                    "$HC_CHILD" "$FORK_B" "$FORK_B"  "$MAINDIR" "$TREESDIR"
+printf '%s 1 %s herd-watch-sweepws bash %s/scripts/herd/agent-watch.sh\n'                  "$ORPHAN"   "$ORPHAN" "$MAINDIR"
+EOF
+chmod +x "$T/ps-stray"
+STRAY="$(HERD_SWEEP_PS_CMD="$T/ps-stray" HERD_WATCH_ARGV0=herd-watch-sweepws HERD_WATCHER_LOCK="$T/watch.lock" sweep_stray_watchers)"
+printf '%s\n' "$STRAY" | grep -qx "$ORPHAN" \
+  || fail "(19) a GENUINE orphan duplicate watcher (parent dead, no gate child) was not listed: '$STRAY'"
+printf '%s\n' "$STRAY" | grep -qx "$WPID" \
+  && fail "(19) the canonical lockfile watcher was listed as a stray"
+printf '%s\n' "$STRAY" | grep -qx "$FORK_A" \
+  && fail "(19) a live gate-worker fork (child of the canonical watcher) was listed — leg 5 would SIGKILL it and strand the PR"
+printf '%s\n' "$STRAY" | grep -qx "$FORK_B" \
+  && fail "(19) a reparented gate-worker fork still parenting a live healthcheck was listed — leg 5 would SIGKILL in-flight gate work"
+printf '%s\n' "$STRAY" | grep -qx "$HC_CHILD" \
+  && fail "(19) a non-argv0-tagged healthcheck worker was mistaken for a watcher"
+# MUTATION CHECK: exactly these two exemptions are load-bearing. Deleting the ppid guard lists FORK_A;
+# deleting the gate-child guard lists FORK_B — either regression flips one assertion above to FAIL.
+ok; echo "PASS (19) stray-watcher detection exempts live gate-worker forks, still lists a genuine orphan"
+
 echo
 echo "ALL PASS ($PASS checks)"
