@@ -214,6 +214,78 @@ render_skill() {
       *)      COORDINATOR_AUTONOMY_NOTE="(Unknown COORDINATOR_AUTONOMY posture: '$COORDINATOR_AUTONOMY' — defaulting to human interaction required)" ;;
     esac
 
+    # HERD-216: knob-aware autonomous-operating doctrine. RENDER-TIME-CONDITIONAL (HERD-143 mechanism):
+    # assemble an "Operating posture" section from the effective autofix / autonomy knobs, re-rendered
+    # on every config-set that touches a render key. HARD INVARIANT: empty under COORDINATOR_AUTONOMY=
+    # human (default) so the rendered skill stays byte-identical to the pre-doctrine interactive brief.
+    # Full doctrine when COORDINATOR_AUTONOMY=full AND the autofix suite is on; partial configs get
+    # per-knob lines naming which duties stay MANUAL.
+    : "${STALE_BASE_AUTOFIX:=off}"
+    : "${HEALTHCHECK_AUTOFIX:=false}"
+    : "${SWEEP_AUTO:=advise}"
+    : "${REVIEW_AUTOFIX:=false}"
+    local OPERATING_POSTURE=''
+    local _op_auto _op_stale _op_health _op_sweep _op_review _op_full_suite _op_manual=''
+    _op_auto="$(printf '%s' "$COORDINATOR_AUTONOMY" | tr '[:upper:]' '[:lower:]')"
+    _op_stale="$(printf '%s' "$STALE_BASE_AUTOFIX" | tr '[:upper:]' '[:lower:]')"
+    _op_health="$(printf '%s' "$HEALTHCHECK_AUTOFIX" | tr '[:upper:]' '[:lower:]')"
+    _op_sweep="$(printf '%s' "$SWEEP_AUTO" | tr '[:upper:]' '[:lower:]')"
+    _op_review="$(printf '%s' "$REVIEW_AUTOFIX" | tr '[:upper:]' '[:lower:]')"
+    case "$_op_stale" in on|true|1|yes) _op_stale=on ;; *) _op_stale=off ;; esac
+    case "$_op_health" in true|on|1|yes) _op_health=true ;; *) _op_health=false ;; esac
+    case "$_op_sweep" in auto) _op_sweep=auto ;; off) _op_sweep=off ;; *) _op_sweep=advise ;; esac
+    case "$_op_review" in true|on|1|yes) _op_review=true ;; *) _op_review=false ;; esac
+    _op_full_suite=0
+    { [ "$_op_stale" = on ] && [ "$_op_health" = true ] && [ "$_op_sweep" = auto ] && [ "$_op_review" = true ]; } && _op_full_suite=1
+    case "$_op_auto" in
+      full|gated)
+        # Core doctrine (always under autonomy knobs) — distilled from the proven 2026-07-08/09 model.
+        OPERATING_POSTURE='## Operating posture
+
+**Autonomous operating doctrine** (`COORDINATOR_AUTONOMY='"$COORDINATOR_AUTONOMY"'`). Execute accordingly:
+
+1. **End-to-end pipelines** — pick, spawn, watch gates, and close the loop without mid-step asks. Escalate only genuine judgment calls (semantic conflicts, product ambiguity, budget/safety the engine cannot decide).
+2. **File-then-spawn** — every unit of work is a tracker item first (`TRACKED_SPAWNS` + `CLAIM_REQUIRED`); thread `HERD_ITEM_REF` on every lane spawn.
+3. **Respect review bandwidth** — honor `REVIEW_CONCURRENCY`; hold further spawns when the review gate is saturated.
+4. **Let the GATE merge** — never self-merge; the watcher merges when green.
+5. **Reconcile the tracker on every merge** — close/mark the item so the tracker stays truthful.
+6. **Sweep debris** — keep the control room clean on the `SWEEP_AUTO` cadence (or when the console advises).'
+        if [ "$_op_auto" = full ] && [ "$_op_full_suite" -eq 1 ]; then
+          # Full-auto posture: engine owns the autofix suite; no manual-duty appendix.
+          # (Backticks escaped — this is a double-quoted expansion; unescaped ` would command-sub.)
+          OPERATING_POSTURE="${OPERATING_POSTURE}
+
+### Autofix suite (engine-owned)
+
+- \`REVIEW_AUTOFIX=true\` — BLOCK reviews bounce to the builder.
+- \`HEALTHCHECK_AUTOFIX=true\` — red healthchecks bounce to the builder.
+- \`STALE_BASE_AUTOFIX=on\` — stale-base holds self-heal via merge-up (or resolver).
+- \`SWEEP_AUTO=auto\` — safe debris legs run on the watcher's sweep cadence."
+        else
+          # Partial knobs: name each duty that stays MANUAL under this effective config.
+          [ "$_op_review" = true ] || _op_manual="${_op_manual}
+- \`REVIEW_AUTOFIX=false\`: BLOCK reviews are yours to re-task."
+          [ "$_op_health" = true ] || _op_manual="${_op_manual}
+- \`HEALTHCHECK_AUTOFIX=false\`: red healthchecks are yours — re-task the builder with the failing test + suite log."
+          [ "$_op_stale" = on ] || _op_manual="${_op_manual}
+- \`STALE_BASE_AUTOFIX=off\`: stale-base holds are yours to bounce (re-task the builder with \`git merge \$DEFAULT_BRANCH\`, or dispatch the resolver)."
+          case "$_op_sweep" in
+            auto) ;;
+            off)  _op_manual="${_op_manual}
+- \`SWEEP_AUTO=off\`: run \`herd sweep\` when housekeeping advises." ;;
+            *)    _op_manual="${_op_manual}
+- \`SWEEP_AUTO=${SWEEP_AUTO}\`: run \`herd sweep\` when the console recommends (engine will not auto-clean)." ;;
+          esac
+          if [ -n "$_op_manual" ]; then
+            OPERATING_POSTURE="${OPERATING_POSTURE}
+
+### Duties that stay MANUAL under this config
+${_op_manual}"
+          fi
+        fi
+        ;;
+    esac
+
     # ── Driver: the runtime-specific control surface (multiplexer + agent runtime). HERD_DRIVER
     # (default herdr-claude; headless + a stub proof driver also ship) selects templates/drivers/<driver>.driver,
     # whose DRIVER_* bindings are substituted into the {{DRIVER_*}} tokens below — the SAME token
@@ -306,6 +378,13 @@ _On every invocation, read live state to surface what is configured:_
     shopt -u patsub_replacement 2>/dev/null || true
     local line _dk
     while IFS= read -r line || [ -n "$line" ]; do
+      # HERD-216: {{OPERATING_POSTURE}} is either a multi-line section or empty. When empty (human
+      # autonomy default) drop the token line entirely so the rendered skill stays byte-identical —
+      # a bare `printf` of an empty substitution would inject a spurious blank line.
+      if [ "$line" = '{{OPERATING_POSTURE}}' ]; then
+        [ -n "$OPERATING_POSTURE" ] && printf '%s\n' "$OPERATING_POSTURE"
+        continue
+      fi
       # Driver tokens FIRST, so a driver value that itself contains a {{TOKEN}} (e.g. {{SCRIPTS_DIR}})
       # is resolved by the passes below. Only keys the driver defined are substituted; a token whose
       # capability the driver omits survives to the completeness lint.
