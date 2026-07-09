@@ -265,6 +265,22 @@ _hk_bats_notok_line() {
   printf '%s\n' "$1" | grep -E "^not ok [0-9]+ .*$2" | head -1
 }
 
+_hk_bats_first_notok() {
+  # Emit the FIRST failing 'not ok N <desc>' line in bats TAP output ($1), plus how many tests failed
+  # in total: "not ok 15 <desc> (3 failing)". HERD-173, live incident 2026-07-08 (PR #273): the
+  # --oneline code-error detail was `bats: $(tail -1)`, which grabbed whatever line bats printed LAST —
+  # routinely a PASSING 'ok 45 …' summary line — and sent both the coordinator and the builder to the
+  # WRONG test. The detail is load-bearing (the auto-refix re-task prompt quotes it verbatim), so it
+  # must name a FAILING test or nothing at all. Falls back to the last line only when the output carries
+  # no TAP 'not ok' at all (a non-bats failure), where there is nothing better to quote.
+  local _bfn_line _bfn_n
+  _bfn_line="$(printf '%s\n' "$1" | grep -m1 -E '^[[:space:]]*not ok( |$)')"
+  if [ -z "$_bfn_line" ]; then printf '%s' "$(printf '%s' "$1" | tail -1)"; return 0; fi
+  _bfn_n="$(printf '%s\n' "$1" | grep -cE '^[[:space:]]*not ok( |$)' 2>/dev/null || printf 1)"
+  if [ "${_bfn_n:-1}" -gt 1 ] 2>/dev/null; then printf '%s (%s failing)' "$_bfn_line" "$_bfn_n"
+  else printf '%s' "$_bfn_line"; fi
+}
+
 _hk_codemap_failure_is_env() {
   # Confirm the codemap test's failure is the ENV-dependent real-repo/ENGINE assertion (tolerable),
   # NOT a hermetic-fixture regression (a genuine codemap.sh code bug). Re-run the test directly:
@@ -384,7 +400,7 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
     exit 2
   else
     # Genuine code error — original behaviour (byte-identical when there is no env-only failure).
-    [ -n "$ONELINE" ] && echo "bats: $(printf '%s' "$to" | tail -1)" || { echo "BATS FAILED"; printf '%s\n' "$to"; }
+    [ -n "$ONELINE" ] && echo "bats: $(_hk_bats_first_notok "$to")" || { echo "BATS FAILED"; printf '%s\n' "$to"; }
     exit 1
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then

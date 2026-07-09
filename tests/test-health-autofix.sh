@@ -107,6 +107,19 @@ reset_state() { : > "$STUB_PANE_RUN_LOG"; : > "$REFIX_STATE"; DISPLAY=(); }
 
 NOTOK='not ok 7 tests/test-widget.sh: expected 3 got 4'
 
+export MAIN="$T/main"; mkdir -p "$T/main" "$T/wt"
+# drive <pr> <slug> <sha> — dispatch the async gate, await the worker, collect.
+drive() {
+  local _p="$1" _s="$2" _sha="$3" _disp _n=0
+  _HC_RESULT=""; DISPLAY=()
+  _healthcheck_gate "$_p" "$_s" "$T/wt" 0 "$_sha"
+  case "$_HC_RESULT" in CLEAN|FLAKY|CODEERROR|QUEUED) return 0 ;; esac
+  _disp="$(_health_dispatch_file "${_p}-${_sha}")"
+  while [ "$_n" -lt 500 ]; do [ -f "$_disp" ] && break; sleep 0.02; _n=$((_n + 1)); done
+  _HC_RESULT=""; DISPLAY=()
+  _healthcheck_gate "$_p" "$_s" "$T/wt" 0 "$_sha"
+}
+
 # ── (1) ROW TRUTH: nobody working → "needs you" with blocker AND remedy ─────────────────────────
 reset_state
 export STUB_AGENT_NAME="slug-a" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-a"
@@ -207,6 +220,31 @@ STUB_LIVENESS=dead _handle_health_codeerror 55 slug-a shaDEAD 0 "$T/wt" "$NOTOK"
 row | grep -q 'agent dead' || fail "(9b) the dead row must say so (got: $(row))"
 ok
 
+# ── (9c) the agent never wakes → the bounce ESCALATES (loudly, once) instead of silently claiming a fix
+reset_state
+printf '1\n1\n' > "$STUB_WAIT_FILE"          # neither the initial submit nor the re-send wakes it
+_handle_health_codeerror 56 slug-a shaNOWAKE 0 "$T/wt" "$NOTOK"
+[ "$(runs)" = "2" ] || fail "(9c) a non-waking agent must be re-sent exactly once (got $(runs))"
+row | grep -q 'needs you · health autofix failed' || fail "(9c) a failed wake must escalate (got: $(row))"
+python3 - "$JOURNAL_FILE" <<'PY2' || fail "(9c) the failed wake must be journaled escalated=true"
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+w=[r for r in rows if r.get("event")=="health_refix_wake_result" and str(r.get("pr"))=="56"]
+assert w and str(w[-1].get("woke"))=="0" and str(w[-1].get("escalated"))=="true", w
+PY2
+ok
+
+# ── (9d) an ENV-TOLERATED outcome (a data/env warning, exit 0) NEVER bounces — only CODEERROR does ──
+reset_state
+DATAENV="$T/body-dataenv.txt"; printf '⚠️  DATA/ENV ISSUE (tolerated, not a code bug)\nshellcheck not installed\n' > "$DATAENV"
+HC_BODY_FILE="$DATAENV" HC_RC=0
+export HC_BODY_FILE HC_RC
+drive 60 slug-a shaDATAENV
+[ "$_HC_RESULT" = "CLEAN" ] || fail "(9d) a tolerated data/env outcome must collect CLEAN (got '$_HC_RESULT')"
+[ "$(runs)" = "0" ] || fail "(9d) a data/env outcome must NEVER bounce a builder"
+[ "$(refix_round_count 60)" = "0" ] || fail "(9d) a data/env outcome must not consume a refix round"
+ok
+
 # ── (10) _health_fail_detail: TAP → first not-ok; non-TAP → the error UNDER the banner ──────────
 TAP="$T/tap.log"; printf '1..3\nok 1 setup\n%s\nok 3 teardown\n' "$NOTOK" > "$TAP"
 [ "$(_health_fail_detail "$TAP")" = "$NOTOK" ] || fail "(10) TAP log must yield the first not-ok line (got: $(_health_fail_detail "$TAP"))"
@@ -225,20 +263,8 @@ ONLY="$T/only.log"; printf '❌ CODE ERROR\n' > "$ONLY"
 ok
 
 # ── (11) END-TO-END through the real gate: forced CODEERROR + autofix on ────────────────────────
-# drive <pr> <slug> <sha> — dispatch the async gate, await the worker, collect.
-drive() {
-  local _p="$1" _s="$2" _sha="$3" _disp _n=0
-  _HC_RESULT=""; DISPLAY=()
-  _healthcheck_gate "$_p" "$_s" "$T/wt" 0 "$_sha"
-  case "$_HC_RESULT" in CLEAN|FLAKY|CODEERROR|QUEUED) return 0 ;; esac
-  _disp="$(_health_dispatch_file "${_p}-${_sha}")"
-  while [ "$_n" -lt 500 ]; do [ -f "$_disp" ] && break; sleep 0.02; _n=$((_n + 1)); done
-  _HC_RESULT=""; DISPLAY=()
-  _healthcheck_gate "$_p" "$_s" "$T/wt" 0 "$_sha"
-}
 BODY="$T/body-fail.txt"; printf '1..3\nok 1 setup\n%s\nok 3 teardown\n' "$NOTOK" > "$BODY"
 export HC_BODY_FILE="$BODY" HC_RC=1
-export MAIN="$T/main"; mkdir -p "$MAIN"
 
 # OFF-MODE: the gate still holds the PR red, nothing is bounced, no round is consumed.
 reset_state

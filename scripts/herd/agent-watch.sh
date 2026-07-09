@@ -3711,11 +3711,17 @@ _handle_health_codeerror() {
     round "$_hhc_round_num" agent_status_before "${_hhc_before:-unknown}" detail "$_hhc_detail"
 
   local _hhc_pane_id _hhc_woke=0 _hhc_escalated=false _hhc_prompt
-  _hhc_prompt="PR #${_hhc_pr} FAILED the pre-merge healthcheck.
+  # REPRODUCE-FIRST guidance: the watcher runs the suite in a pane with a LOGIN PATH and a tty, which a
+  # bare sandbox shell does not have — so a handful of env-sensitive tests fail locally that pass in the
+  # gate, and vice versa. A gate fail on YOUR sha is YOUR diff: reproduce it the way the gate ran it
+  # before concluding the red is environmental.
+  _hhc_prompt="PR #${_hhc_pr} FAILED the pre-merge healthcheck (this is the gate that merges your PR).
 Failing test: ${_hhc_detail}
-Full suite output: $(_health_log_file "${_hhc_pr}-${_hhc_sha}")
-Reproduce with: bash ${HERD_HEALTHCHECK_BIN:-scripts/herd/healthcheck.sh} ${_hhc_wt:-.}
-Fix the failure, re-run the healthcheck until it is green, and push."
+Full suite output (the gate's own log, already on disk): $(_health_log_file "${_hhc_pr}-${_hhc_sha}")
+REPRODUCE FIRST, from your worktree, the way the gate ran it:
+  bash ${HERD_HEALTHCHECK_BIN:-scripts/herd/healthcheck.sh} ${_hhc_wt:-.} --heavy
+The gate runs with a login PATH and a tty; a red on YOUR sha is YOUR diff, not the environment.
+Fix the failure, re-run until the healthcheck is green, then push."
   _hhc_pane_id="$(_find_builder_pane_id_any "$_hhc_slug")"
   if [ -n "$_hhc_pane_id" ]; then
     local _hhc_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
