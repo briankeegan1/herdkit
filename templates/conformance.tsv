@@ -86,11 +86,14 @@ fleet.sh	unit	tests/test-fleet-digest.sh
 herd-feature.sh	unit	tests/test-scoped-builder-verification.sh
 herd-feature.sh	unit	tests/test-flow-preference.sh
 herd-feature.sh	unit	tests/test-app-preview-config.sh
+herd-feature.sh	unit	tests/test-driver-lane-spawn.sh
 herd-quick.sh	unit	tests/test-scoped-builder-verification.sh
 herd-quick.sh	unit	tests/test-flow-preference.sh
 herd-quick.sh	unit	tests/test-context-provision.sh
+herd-quick.sh	unit	tests/test-driver-lane-spawn.sh
 herd-resolve.sh	sim	tests/test-sandbox-resolver-respawn.sh
 herd-resolve.sh	unit	tests/test-model-flags.sh
+herd-resolve.sh	unit	tests/test-driver-lane-spawn.sh
 herd-approve.sh	unit	tests/test-human-verify-hold.sh
 herd-approve.sh	unit	tests/test-approval-purge.sh
 herd-approve.sh	unit	tests/test-human-verify-policy.sh

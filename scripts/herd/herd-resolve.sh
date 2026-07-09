@@ -25,6 +25,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 # Runtime driver shim: route the resolver agent launch through herd_driver_launch_agent so
 # HERD_DRIVER=headless spawns a detached resolver; herdr-claude emits the identical argv below.
+# HERD-150 P2: the shim resolves RESOLVER_MODEL's runtime driver from the (possibly qualified) ref and
+# composes the `-- <runtime>` tail from that driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding — so a
+# runtime-qualified RESOLVER_MODEL launches the right runtime, byte-identical for a bare model id.
 # shellcheck source=/dev/null
 . "$HERE/driver.sh"
 SLUG="${1:?usage: herd-resolve.sh <slug>   (slug = the existing worktree under the worktrees dir)}"

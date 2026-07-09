@@ -89,10 +89,14 @@ if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
   fi
 fi
-# Resolve an optionally runtime-qualified model ref (HERD-151) → bare model. Loud-fails at spawn time
-# on an unknown driver prefix; byte-identical for a bare model id. (Idempotent when this lane later
-# routes through herd_driver_start_agent under headless — a bare model resolves to itself.)
-MODEL="$(herd_model_for_spawn "$MODEL")" || exit 1
+# Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER + bare model.
+# Resolved HERE (before the tab is created below) so a bad ref fails FAST with the loud error. HERD-150
+# P2: the resolved driver is kept (not discarded) and passed to herd_driver_launch_agent, which composes
+# the agent-runtime argv from THAT driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding. Byte-identical for a
+# bare model id: _DRIVER_RUNTIME resolves to the default driver → the `claude …` binding → today's argv.
+_MODEL_REF="$MODEL"
+MODEL="$(herd_model_for_spawn "$_MODEL_REF")" || exit 1
+_DRIVER_RUNTIME="$(herd_model_driver_for "$_MODEL_REF" 2>/dev/null || true)"; [ -n "$_DRIVER_RUNTIME" ] || _DRIVER_RUNTIME="$_HERD_DRIVER_NAME"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if
@@ -269,7 +273,14 @@ else
   # aborts the lane leaving the tab we just created above as an empty corpse tab that nothing reaps.
   # Close the just-created tab on the failure path and journal the reap before bailing (fail-soft; the
   # success path is byte-identical — the same argv is captured whether or not it is wrapped in `if`).
-  if ! _agent_start_out="$(herdr agent start "$SLUG" ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$DIR" --tab "$TAB" --no-focus -- claude --model "$MODEL" $CLAUDE_FLAGS "$POINTER")"; then
+  #
+  # HERD-150 P2: route the interactive spawn through herd_driver_launch_agent (the ONE seam), passing
+  # the RESOLVED runtime driver so the `-- <runtime>` tail is composed from that driver's
+  # DRIVER_AGENT_INTERACTIVE_SPAWN binding. Byte-identical mux argv for herdr-claude (no --split — the
+  # quick lane's agent runs in the tab root); stdout (the herdr JSON) is still captured for labeling.
+  if ! _agent_start_out="$(herd_driver_launch_agent \
+        name="$SLUG" workspace="$_WS_ID" cwd="$DIR" tab="$TAB" \
+        driver="$_DRIVER_RUNTIME" model="$MODEL" flags="$CLAUDE_FLAGS" pointer="$POINTER")"; then
     herdr tab close "$TAB" >/dev/null 2>&1 || true
     journal_append infra_event component builder agent "$SLUG" reason spawn_agent_failed tab "$TAB"
     echo "❌ herdr: could not start the builder agent for '$SLUG' — closed the empty tab; worktree is ready at $DIR." >&2
@@ -282,6 +293,13 @@ else
   _AGENT_PANE="$(herd_driver_pane_id_from_agent_start "$_agent_start_out")"
   [ -z "$_AGENT_PANE" ] && _AGENT_PANE="$(herd_driver_agent_pane_id "$SLUG")"
   [ -n "$_AGENT_PANE" ] && herd_driver_pane_rename "$_AGENT_PANE" "$SLUG"
+  # HERD-178 session identity: a NON-native agent runtime (a foreign DRIVER_AGENT_INTERACTIVE_SPAWN,
+  # reached via a runtime-qualified MODEL ref) is invisible to the mux's claude-cmdline liveness probe,
+  # so register its identity + state explicitly. A clean no-op — byte-identical — for the native claude
+  # runtime, which the mux already tracks by its `claude` foreground process.
+  if [ -n "$_AGENT_PANE" ] && ! herd_driver_agent_runtime_native "$_DRIVER_RUNTIME"; then
+    herd_driver_report_agent "$SLUG" "$_AGENT_PANE" working
+  fi
 fi
 
 # 3b. Task-spec viewer in the tab's OTHERWISE-IDLE root pane (TASK_PANE_VIEW, default on). The quick

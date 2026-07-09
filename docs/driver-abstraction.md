@@ -8,9 +8,11 @@ The sections below (originally written for phase 1) describe the design that pha
 
 A follow-on **agent-runtime portability epic (HERD-150)** extends the same `.driver` format to the
 `claude`-specific *exec* surface (spawn / one-shot / resume / model-switch / limit-detection /
-cost-parse). Its **phase 1 — the exec-surface audit + capability bindings — has shipped**; see
-[Agent-runtime portability epic](#agent-runtime-portability-epic-herd-150) at the end. Phases 2–4
-(routing the call sites through the new bindings) are not built yet.
+cost-parse). Its **phase 1 — the exec-surface audit + capability bindings — has shipped**, and
+**phase 2 — routing the interactive-spawn LANES (`herd-feature.sh` / `herd-quick.sh` /
+`herd-resolve.sh`) through the spawn binding (HERD-174) — has now shipped too**; see
+[Agent-runtime portability epic](#agent-runtime-portability-epic-herd-150) at the end. Phases 3–4
+(resume / model-switch, then limit-detection / session-identity / cost) are not built yet.
 
 **Origin:** Leak F in [`external-consumer-audit.md`](external-consumer-audit.md) and the backlog item
 *"[P3] Renderable coordinator skill for non-herdr/non-Claude drivers."* The rendered coordinator
@@ -260,7 +262,7 @@ before/after render diff plus the parse/completeness unit test (`tests/test-driv
 | Phase | Scope                                                                                  | Status      |
 | ----- | -------------------------------------------------------------------------------------- | ----------- |
 | P1    | Audit the exec surface into capability classes; add `DRIVER_AGENT_*` bindings (data + docs, byte-identical) | **shipped** |
-| P2    | Route the **spawn** classes (interactive-spawn, one-shot-exec, permission flag) through the bindings | not built   |
+| P2    | Route the interactive-spawn **lanes** (feature/quick/resolve) through the spawn binding (spawn template + model flag + permission flag + session identity), resolved driver made REAL at spawn (HERD-174) | **shipped** |
 | P3    | Route **resume + model-switch** through the bindings                                    | not built   |
 | P4    | Route **limit-detection + session-identity + cost/telemetry** through the bindings      | not built   |
 | P5    | Ship a second, non-Claude agent-runtime driver binding the exec surface                 | not built   |
@@ -376,6 +378,39 @@ never touches them — the rendered skill is unchanged. No runtime script reads 
 is a before/after `herd render` diff (empty) plus `tests/test-driver-agent-exec.sh`, which asserts
 both `.driver` files parse with the extended format, every class is bound in **both** drivers, the
 bindings are zero-secret, and none of their values leak into a rendered skill.
+
+### Phase 2 — routing the interactive-spawn lanes (HERD-174, shipped)
+
+P2 makes the **interactive-spawn** binding *real at spawn*. The three lanes that open an agent on a
+prompt — `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh` — no longer hardcode
+`claude --model <model> <flags> <prompt>` after the `herdr agent start … --`; they **compose** that
+agent-runtime argv from the resolved driver's `DRIVER_AGENT_INTERACTIVE_SPAWN` + `DRIVER_AGENT_PERMISSION_FLAG`
+bindings, through one seam.
+
+- **The seam** — `herd_driver_agent_spawn_argv <driver> <model> <flags> <prompt>` (in `driver.sh`)
+  tokenizes the driver's spawn template and substitutes the P1 classes: `<model>` (empty ⇒ the
+  `--model` pair is dropped), the permission-flag token (⇒ the lane's `<flags>`, word-split; empty ⇒
+  dropped), and `<prompt>`. It emits a NUL-delimited argv the callers read into a bash array. The
+  builder lanes route through `herd_driver_launch_agent` (which now also composes its `--` tail via the
+  seam); `herd-resolve.sh` already used that seam, so it inherited the routing.
+- **Resolved driver made REAL, not discarded** — the model half of a runtime-qualified ref
+  (`<driver>:<model>`, below) was resolved and then *thrown away*, so every spawn was always `claude`.
+  Now the lanes resolve the **driver** too (`herd_model_driver_for`) and thread it to the seam, so a
+  `MODEL_*` ref like `foo:opus` composes **`foo`'s** `DRIVER_AGENT_INTERACTIVE_SPAWN` — the qualified
+  driver selects the spawn binding. For a bare model the driver resolves to the default, so the spawn is
+  **byte-identical** to before.
+- **Session identity for a non-native runtime (HERD-178 seam)** — the mux tracks a *native* `claude`
+  agent by fingerprinting the pane's foreground process; a runtime whose spawn binding is not `claude`
+  is invisible to that probe. `herd_driver_agent_runtime_native` classifies the resolved runtime and,
+  when it is non-native, the lanes register the agent's identity + state with the mux via
+  `herd_driver_report_agent` (`herdr pane report-agent`, also a `driver.sh report-agent` CLI verb) — a
+  clean **no-op for the native runtime**, so the default path stays byte-identical.
+
+**Proof:** the before/after `herd render` diff stays empty (no template/token consumes the routing —
+`test-driver-agent-exec.sh` / `test-driver-abstraction.sh`), and `tests/test-driver-lane-spawn.sh`
+asserts the composed spawn command byte-for-byte (default + every class edge), the foreign-runtime
+composition (driver is real), and that all three lanes route through the one seam. P3–P4 (resume /
+model-switch, then limit-detection / cost) still route their own classes later.
 
 ### Model matrix — runtime-qualified `MODEL_*` refs (HERD-151)
 
