@@ -2368,6 +2368,14 @@ post_gate_status() {
   case "$state" in success) ;; *) return 0 ;; esac
   _gate_status_posted "$pr" "$sha" "$state" && return 0
   [ -n "$DRYRUN" ] && return 0
+  # SETTER GUARD (HERD-247): never bless a sha another seat is still blocking, and never overwrite a
+  # foreign herd/gates=failure with our success. Runs AFTER the ledger/dry-run short-circuits, so it
+  # costs its (memoized) reads only on the one tick that would actually write the blessing. Called
+  # directly — a subshell would discard the memo. See _cross_seat_block_standing.
+  if _cross_seat_block_standing "$pr" "$sha"; then
+    _xseat_journal_honored "$pr" "$sha" "$_XSEAT_SEAT" setter
+    return 0
+  fi
   [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
   if gh api "repos/{owner}/{repo}/statuses/$sha" -f state="$state" -f context="$GATE_STATUS_CONTEXT" -f description="$desc" >/dev/null 2>&1; then
     _record_gate_status "$pr" "$sha" "$state"
@@ -2386,6 +2394,178 @@ _gate_status_blessed() {
   state="$(gh api "repos/{owner}/{repo}/commits/$sha/statuses" \
              --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0].state" 2>/dev/null || true)"
   [ "$state" = "success" ]
+}
+
+# ── cross-seat BLOCK precedence (HERD-247) ───────────────────────────────────────────────────────
+# INCIDENT (PR #343, 2026-07-09 16:19-16:25Z): two seats gated the same PR concurrently. One seat's
+# reviewer posted a correctness BLOCK; minutes later the OTHER seat's reviewer posted a PASS, that
+# seat's watcher blessed the sha and merged over the standing BLOCK. A BLOCK from ANY seat must be
+# TERMINAL for that sha until it is RESOLVED — a second seat's PASS is a second opinion, not a
+# resolution. The review ledger cannot see this: it is per-seat local state, so each watcher only ever
+# knows its OWN verdict. Both guards below therefore read only artifacts EVERY seat already writes —
+# the herd/gates commit status and the PR's comments. No new substrate, no new config key.
+#
+#   SETTER GUARD  post_gate_status refuses to bless a sha carrying a standing foreign BLOCK.
+#   MERGE GUARD   the merge-eligibility path holds the PR before `gh pr merge`, with a loud row.
+#
+# WHY NO `failure` STATUS IS POSTED. Posting herd/gates=failure on the standing-BLOCK sha would break
+# the SUCCESS-ONLY invariant documented above, and it would strand the PR PERMANENTLY: a non-passing
+# status flips a CLEAN sha to mergeStateStatus=UNSTABLE in the default unprotected config, and UNSTABLE
+# is neither CLEAN (drops out of the candidate loop) nor BLOCKED (not gate-eligible via
+# _gate_bless_eligible) — so after the blocking seat reconciles, NO seat can re-enter the loop to
+# overwrite the status back to success. The fail-safe never needed it: WITHHOLDING success already
+# leaves the PR unmergeable under `require herd/gates` protection, and the MERGE GUARD holds it in the
+# unprotected config. The other half IS honored — an existing herd/gates=failure written by another
+# seat is KEPT, never overwritten with our success.
+#
+# RESOLUTION flows through existing surfaces only: the blocking seat posts a NEWER verdict comment for
+# the same sha reading PASS, or a human records the sha-keyed override (`herd-approve.sh override`). A
+# new commit is a new sha and carries no verdict at all, so it starts clean.
+#
+# FAIL-SOFT: an unreadable commit/status/comment list, or an unresolvable seat identity, journals
+# `cross_seat_block_scan state=degraded` and reports NO standing block — today's behavior, never a
+# false hold. With no foreign status and no foreign verdict comment the surface is byte-identical.
+
+# The verdict classifier. Reads `gh pr view --json comments` JSON on stdin; argv = <since-iso> <me>.
+# A comment is a VERDICT comment when its first non-empty line — stripped of markdown emphasis, because
+# real reviewers post `REVIEW: **BLOCK** — …` and `**PASS — no correctness bug found.**` — contains the
+# whole word BLOCK or PASS (BLOCK wins; a BLOCK's prose may mention passing). Everything else (the
+# watcher's own 🐑/🔁 rows, a human's prose) is not a verdict and is ignored. Only comments created at or
+# after the head sha landed count, which is what keys a verdict to a sha: GitHub comments carry no sha.
+# Per foreign seat we keep only its LATEST verdict, so a blocking seat's newer PASS resolves its BLOCK.
+# Exit 0 + prints the (lexically first) blocking seat's login · 1 = no standing block · 2 = degraded.
+_XSEAT_PY='import json,sys,re
+since, me = sys.argv[1], sys.argv[2]
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(2)
+if not isinstance(d, dict): sys.exit(2)
+latest = {}
+for c in (d.get("comments") or []):
+    login = ((c.get("author") or {}).get("login") or "")
+    when = c.get("createdAt") or ""
+    if not login or not when or login == me or when < since: continue
+    first = ""
+    for ln in (c.get("body") or "").splitlines():
+        s = re.sub("[*`_#>]", "", ln).strip()
+        if s:
+            first = s
+            break
+    if re.search(r"\bBLOCK\b", first): v = "BLOCK"
+    elif re.search(r"\bPASS\b", first): v = "PASS"
+    else: continue
+    prev = latest.get(login)
+    if prev is None or when >= prev[0]: latest[login] = (when, v)
+blockers = sorted(l for l, (w, v) in latest.items() if v == "BLOCK")
+if blockers:
+    sys.stdout.write(blockers[0])
+    sys.exit(0)
+sys.exit(1)'
+
+# _gate_status_current <sha> — the CURRENT herd/gates status for the sha as "<state> <creator-login>"
+# (either field may be empty). Same newest-first read as _gate_status_blessed, one extra field: WHO
+# wrote it, so a failure posted by another seat is distinguishable from one of ours. Fail-soft: empty.
+_gate_status_current() {
+  [ -n "${1:-}" ] || return 0
+  gh api "repos/{owner}/{repo}/commits/$1/statuses" \
+    --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0] | \"\(.state // \"\") \(.creator.login // \"\")\"" 2>/dev/null || true
+}
+
+# _xseat_foreign_block <pr#> <sha> <me> — scan the PR's comments for a standing BLOCK from another seat
+# on THIS sha. Prints the blocking seat's login. rc: 0 standing · 1 none · 2 degraded (unreadable).
+_xseat_foreign_block() {
+  local pr="$1" sha="$2" me="$3" since json out rc
+  since="$(gh api "repos/{owner}/{repo}/commits/$sha" --jq '.commit.committer.date' 2>/dev/null || true)"
+  case "$since" in ''|null) return 2 ;; esac
+  json="$(gh pr view "$pr" --json comments 2>/dev/null || true)"
+  [ -n "$json" ] || return 2
+  out="$(printf '%s' "$json" | python3 -c "$_XSEAT_PY" "$since" "$me" 2>/dev/null)"; rc=$?
+  case "$rc" in 0) printf '%s' "$out" ;; 1|2) ;; *) rc=2 ;; esac
+  return "$rc"
+}
+
+# _xseat_note_once <key> — true the FIRST time this process sees <key>. Keeps the per-tick guard from
+# re-journaling the same (pr,sha) event every 4s while a PR sits held; the console row still renders.
+_XSEAT_NOTED=""
+_xseat_note_once() {
+  case " $_XSEAT_NOTED " in *" $1 "*) return 1 ;; esac
+  _XSEAT_NOTED="$_XSEAT_NOTED $1"
+  return 0
+}
+
+# _cross_seat_block_standing <pr#> <sha> — THE shared check both guards run. Returns 0 when a standing
+# foreign BLOCK exists for (pr,sha) and sets $_XSEAT_SEAT to the blocking seat's login; non-zero (and
+# an empty $_XSEAT_SEAT) otherwise. MUST be called DIRECTLY, never in a `$()` subshell — the memo and
+# $_XSEAT_SEAT would be discarded. Checks, cheapest first:
+#   1. sha-keyed human override recorded → resolved, no hold (the documented human out).
+#   2. herd/gates=failure written by ANOTHER seat → standing (we never post failure, so it is foreign).
+#   3. a foreign seat whose LATEST verdict comment for this sha is BLOCK → standing.
+# The network reads are memoized per (pr,sha) for $_XSEAT_MEMO_TTL seconds so a held PR costs at most
+# one scan per minute, not one per 4s tick — a resolution is honored within that window.
+: "${_XSEAT_MEMO_TTL:=60}"
+_XSEAT_MEMO_KEY=""; _XSEAT_MEMO_TS=0; _XSEAT_MEMO_SEAT=""; _XSEAT_MEMO_RC=1
+_XSEAT_SEAT=""
+_cross_seat_block_standing() {
+  local pr="$1" sha="$2" me now rc cur st creator seat frc
+  _XSEAT_SEAT=""
+  [ -n "$pr" ] && [ -n "$sha" ] || return 1
+  now="$(date +%s)"
+  if [ "$_XSEAT_MEMO_KEY" = "$pr $sha" ] && [ "$(( now - _XSEAT_MEMO_TS ))" -lt "$_XSEAT_MEMO_TTL" ]; then
+    _XSEAT_SEAT="$_XSEAT_MEMO_SEAT"
+    return "$_XSEAT_MEMO_RC"
+  fi
+  rc=1
+  if override_exists "$pr" "$sha"; then
+    rc=1
+  else
+    # Identify "another seat" by comment author != this seat's gh auth login. Unresolvable identity →
+    # degraded: EVERY author would read as foreign, which would hold on our OWN seat's block.
+    _resolve_watcher_owner
+    me="$_WATCHER_OWNER_CACHE"
+    if [ -z "$me" ]; then
+      _xseat_journal_degraded "$pr" "$sha" "seat identity unresolved"
+      rc=1
+    else
+      cur="$(_gate_status_current "$sha")"
+      st="${cur%% *}"; creator="${cur#* }"
+      [ "$creator" = "$cur" ] && creator=""
+      if [ "$st" = "failure" ] && [ "$creator" != "$me" ]; then
+        _XSEAT_SEAT="${creator:-unknown}"
+        rc=0
+      else
+        seat="$(_xseat_foreign_block "$pr" "$sha" "$me")"; frc=$?
+        case "$frc" in
+          0) _XSEAT_SEAT="$seat"; rc=0 ;;
+          2) _xseat_journal_degraded "$pr" "$sha" "commit status / comment scan unreadable"; rc=1 ;;
+          *) rc=1 ;;
+        esac
+      fi
+    fi
+  fi
+  _XSEAT_MEMO_KEY="$pr $sha"; _XSEAT_MEMO_TS="$now"; _XSEAT_MEMO_SEAT="$_XSEAT_SEAT"; _XSEAT_MEMO_RC="$rc"
+  return "$rc"
+}
+
+# _xseat_journal_degraded <pr#> <sha> <reason> — one durable line per (pr,sha) when the scan could not
+# read the shared artifacts. The gate then behaves exactly as it did before this feature.
+_xseat_journal_degraded() {
+  _xseat_note_once "degraded:$1:$2" || return 0
+  journal_append cross_seat_block_scan pr "$1" sha "$2" state degraded reason "$3"
+}
+
+# _xseat_journal_honored <pr#> <sha> <seat> <stage> — one durable line per (pr,sha,stage) recording that
+# a foreign BLOCK took precedence over this seat's PASS: `setter` = a blessing withheld, `merge` = a
+# merge held. This is the audit trail the #343 incident had no way to leave.
+_xseat_journal_honored() {
+  _xseat_note_once "honored:$4:$1:$2" || return 0
+  journal_append cross_seat_block_honored pr "$1" sha "$2" seat "$3" stage "$4" \
+    reason "cross-seat BLOCK standing (seat $3)"
+}
+
+# _cross_seat_block_row <slug-cell> <pr-cell> <seat> — the loud console row for a held PR. Factored out
+# so the wording is asserted by a test rather than by a human reading the render loop.
+_cross_seat_block_row() {
+  printf '    %s🛑%s %s%s%s%s %scross-seat BLOCK · needs reconcile (seat %s)%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$2" "$C_RED" "$3" "$C_RESET"
 }
 
 # _gate_bless_eligible <pr#> <sha> <mergeStateStatus> — true when a MERGEABLE-but-not-CLEAN PR must
@@ -2923,7 +3103,64 @@ for a in agents:
 ' 2>/dev/null || true
 }
 
-# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is ACTIVELY RESOLVING (or may
+# _resolver_round_finished <pr#> [sha] — true iff the resolver wrote its terminal verdict (DONE |
+# ESCALATE) for the sha ACTUALLY IN FLIGHT. A resolver round is identified by pr+sha, never by pr
+# alone: verdict files are sha-scoped (_resolve_result_file) and are cleaned only at PR RETIREMENT,
+# so a PR-wide glob would match round 1's leftover verdict forever and report every later round as
+# "finished" — silently disabling the caller's park guard from the second conflict round onward.
+#
+# When the caller has no sha, fall back to the most-recently DISPATCHED sha for this PR; with no sha
+# at all the answer is "not finished" (the conservative side — the caller then consults park state).
+_resolver_round_finished() {
+  local _rrf_pr="${1:-}" _rrf_sha="${2:-}"
+  [ -n "$_rrf_pr" ] || return 1
+  [ -n "$_rrf_sha" ] || _rrf_sha="$(resolver_last_sha "$_rrf_pr" 2>/dev/null || true)"
+  [ -n "$_rrf_sha" ] || return 1
+  _resolve_result "$_rrf_pr" "$_rrf_sha" >/dev/null 2>&1
+}
+
+# _resolver_limit_parked <slug> — true iff the resolve·<slug> session is parked on the ACCOUNT USAGE
+# LIMIT, awaiting auto-resume. Reads the SAME park state the builder refix paths read — the
+# .herd-limit-sentinel the rate_limit hook writes into the worktree (via _detect_limit_hit, which also
+# carries the banner-scrape fallback), plus the park handler's own ledger (limit_state = scheduled).
+# The resolver runs IN the feature worktree (herd-resolve.sh resolves in place), so its sentinel and
+# ledger row live exactly where the builder's do. No new state, no new config key.
+#
+# THE SENTINEL IS SHARED with the builder that owns this worktree, so a sentinel that PREDATES this
+# resolver's dispatch is someone else's park — most often a builder park whose clear_limit ran without
+# the worktree arg and left the file behind. Treating that as a resolver park would hold the dispatch
+# slot forever, stranding re-dispatch rather than deferring it. So sentinel evidence must POSTDATE the
+# last dispatch for this slug. A sentinel written after we dispatched can only be this resolver's.
+#
+# Fail-soft to PARKED whenever the read itself is doubtful: an unreadable mtime, or an empty/garbled
+# sentinel, still means a limit hit was recorded. A held slot re-dispatches on a later tick; a reaped
+# session is gone for good. HERD_LIMIT_DETECT=off disables the guard with the rest of limit detection.
+_resolver_limit_parked() {
+  local _rlp_slug="$1" _rlp_wt _rlp_sent _rlp_since=0 _rlp_mt
+  [ "${HERD_LIMIT_DETECT:-on}" != "off" ] || return 1
+  # The park handler's ledger: slug-scoped, and clear_limit always drops the row on resume.
+  if [ -n "${LIMIT_STATE:-}" ] && [ "$(limit_state "$_rlp_slug" 2>/dev/null || printf '')" = "scheduled" ]; then
+    return 0
+  fi
+  _rlp_wt="${WORKTREES_DIR:-${TREES:-.}}/$_rlp_slug"
+  _rlp_sent="$(_limit_sentinel_file "$_rlp_wt")"
+  if [ -f "$_rlp_sent" ]; then
+    [ -n "${RESOLVE_STATE:-}" ] && _rlp_since="$(resolver_last_dispatch_epoch_slug "$_rlp_slug" 2>/dev/null || printf 0)"
+    [ -n "$_rlp_since" ] || _rlp_since=0
+    _rlp_mt="$(file_mtime "$_rlp_sent" 2>/dev/null || printf '')"
+    case "$_rlp_mt" in
+      ''|*[!0-9]*) return 0 ;;                       # unreadable mtime → fail soft to PARKED
+    esac
+    [ "$_rlp_mt" -ge "$_rlp_since" ] && return 0     # written since we dispatched → OUR park
+    return 1                                         # predates the dispatch → a stale foreign sentinel
+  fi
+  # No sentinel: the hookless banner-scrape fallback (already banner-shape guarded). It reads the
+  # NEWEST transcript under the worktree, and this guard only runs while the resolver is ALIVE — so
+  # the newest session is the resolver's own, not the builder's.
+  _detect_limit_hit "$_rlp_slug" "$_rlp_wt" >/dev/null 2>&1
+}
+
+# _resolver_in_flight <slug> <pr#> [sha] — true if a resolver for this slug is ACTIVELY RESOLVING (or may
 # still be starting / invisible), so a (re)dispatch must HOLD: a second resolver on the same worktree
 # would race the first on `git merge`/`git push`. This is the SINGLE guard that prevents a
 # double-dispatch.
@@ -2937,8 +3174,20 @@ for a in agents:
 # agent_status idle|done frees the slot (past the startup grace — a fresh agent can blip idle before
 # picking up its task). The spawn path reaps the idle agent so the name can be reclaimed. WORKING
 # still holds; STARTING / UNKNOWN still hold.
+#
+# HERD-246: a USAGE-LIMIT-PARKED Claude session reports agent_status idle|done — indistinguishable
+# from a finished round, and a park legitimately outlasts any startup grace. Freeing the slot there
+# hands the pane to _reap_idle_resolver_for_redispatch, which kills the session and defeats
+# limit-park auto-resume (the engine's core capability). So idle|done past the grace ALSO consults
+# the park state: PARKED with no terminal verdict for the sha IN FLIGHT ⇒ HOLD, exactly as pre-HERD-225
+# (the resume scheduler owns that session). No park state, or a verdict already written for THIS sha
+# ⇒ free + reap, as HERD-225 intends. When nothing is parked this is byte-identical to HERD-225.
+#
+# <sha> is the sha whose resolver round is in question. Pass it: a resolver round is pr+sha, and the
+# PR-wide question ("has ANY round of this PR ever finished?") is true forever after round 1, which
+# would short-circuit the park guard away on every later conflict round. Callers all hold it.
 _resolver_in_flight() {
-  local _rif_slug="$1" _rif_pr="${2:-}" _rif_v _rif_st
+  local _rif_slug="$1" _rif_pr="${2:-}" _rif_sha="${3:-}" _rif_v _rif_st
   _rif_v="$(_resolver_liveness_verdict "$_rif_slug" "$_rif_pr")"
   [ "$_rif_v" = "DEAD" ] && return 1
   if [ "$_rif_v" = "ALIVE" ]; then
@@ -2948,6 +3197,10 @@ _resolver_in_flight() {
         # Finished its round — free for re-dispatch. Still hold inside the startup grace so a
         # just-spawned agent that blips idle cannot be double-dispatched over.
         _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
+        # …unless this "idle" is a usage-limit park awaiting auto-resume (HERD-246).
+        if ! _resolver_round_finished "$_rif_pr" "$_rif_sha" && _resolver_limit_parked "$_rif_slug"; then
+          return 0
+        fi
         return 1
         ;;
     esac
@@ -3069,7 +3322,7 @@ _classify_conflict() {
     esac
     # Dispatched for this sha, no verdict yet. If the resolver is still in flight (agent alive, or a
     # just-spawned resolver still inside the startup grace) HOLD — never double-dispatch onto its tree.
-    if _resolver_in_flight "$cslug" "$cpr"; then
+    if _resolver_in_flight "$cslug" "$cpr" "$csha"; then
       DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
       FLAIR_STATE[ci]="busy"
       return
@@ -3096,7 +3349,7 @@ _classify_conflict() {
   # for minutes while ticks are seconds. Re-dispatching now would put a second resolver on the SAME
   # worktree, racing the first on `git merge`/`git push`. So HOLD while it is in flight; the respawn
   # fires on a later tick once it has exited (agent gone + past grace) — same guard as the dead path.
-  if _resolver_in_flight "$cslug" "$cpr"; then
+  if _resolver_in_flight "$cslug" "$cpr" "$csha"; then
     DISPLAY[ci]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
     FLAIR_STATE[ci]="busy"
     return
@@ -5051,7 +5304,7 @@ _handle_stale_dup() {
   # resolver gets spawned INTO the live worktree (two agents, one directory, merge over WIP). If the
   # agent is working, defer: honest row, once-guard NOT burned, heal retries when it goes idle.
   if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
     return 0
   fi
 
@@ -5090,7 +5343,7 @@ _handle_stale_dup() {
     # top guard is EXCLUDED from the pane lookup by design and so reads as "no live builder" here.
     # A working builder must never reach spawn_resolver — defer without burning the once-guard.
     if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
       return 0
     fi
     # Record-first once-guard so a later tick never double-dispatches.
@@ -5099,7 +5352,7 @@ _handle_stale_dup() {
     render
     journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
       round "$_hsd_round_num" reason "no live builder — dispatching conflict resolver to merge ${_hsd_base}"
-    _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+    _resolver_in_flight "$_hsd_slug" "$_hsd_pr" "$_hsd_sha" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
     DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     return 0
   fi
@@ -5144,12 +5397,12 @@ Why: ${_hsd_reason}"
       # builder must never reach spawn_resolver: defer instead, once-guard already burned is acceptable
       # (the next sha or idle tick heals).
       if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
-        DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until idle${C_RESET}"
+        DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
         return 0
       fi
       journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
         round "$_hsd_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
-      _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+      _resolver_in_flight "$_hsd_slug" "$_hsd_pr" "$_hsd_sha" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     else
       _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "agent pane not found"
@@ -8461,6 +8714,20 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
           continue ;;
       esac
     fi
+    # MERGE GUARD — cross-seat BLOCK precedence (HERD-247). THIS seat's gates are green for (pr,rsha),
+    # but green here means "no seat I can see refused it" only in a single-seat world. Before the
+    # blessing and before `gh pr merge`, re-establish the invariant from SHARED state: if another seat's
+    # BLOCK on this exact sha is still standing (its own later PASS, or a sha-keyed human override, would
+    # have resolved it), our PASS does NOT get to overwrite it. Hold, journal, and paint the row that
+    # tells the operator which seat to reconcile with. Fail-soft: an unreadable scan reports no block and
+    # this tick behaves exactly as it did before the guard existed. See _cross_seat_block_standing.
+    if _cross_seat_block_standing "$prnum" "$rsha"; then
+      _xseat_journal_honored "$prnum" "$rsha" "$_XSEAT_SEAT" merge
+      DISPLAY[idx]="$(_cross_seat_block_row "$sl" "$pn" "$_XSEAT_SEAT")"
+      render
+      continue
+    fi
+
     # herd/gates → success (HERD-194). Both gates are now green for this (pr,sha): the healthcheck
     # passed above (CLEAN/FLAKY) and the review verdict is PASS. Post the success status BEFORE the
     # merge-policy decision below — the blessing reflects the GATE outcome, independent of any

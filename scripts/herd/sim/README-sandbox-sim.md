@@ -218,8 +218,9 @@ proof of the auto-resume moat that HERD-42's A/B run invokes.
 
 Only the two things that would be a live account + a live Claude session are stubbed, both through
 documented seams: the rate-limit **sentinel is written by the ACTUAL `StopFailure`/`rate_limit` hook
-command** (`herd_write_ratelimit_hook` installs it; a near-future reset epoch is fed on stdin exactly
-as the harness would — so the injected sentinel matches the hook's format byte for byte), and
+command** (`herd_write_ratelimit_hook` installs it; the harness *event* — a JSON blob carrying the
+usage-limit banner — is fed on stdin exactly as Claude Code does, so the injected sentinel is
+whatever the hook's own extractor produces rather than a hand-written value), and
 **`claude` is a stub shim on `PATH`** that records its invocation (argv + cwd), completes the parked
 task deterministically (implements + commits the pending feature, no model call), and flips the agent
 to `working` so the watcher's wake-verify observes the resume. The `herdr` agent surface is a

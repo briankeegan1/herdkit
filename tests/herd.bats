@@ -199,6 +199,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver limit-park guard (HERD-246) test passes" {
+  run bash "$REPO/tests/test-resolver-limit-park.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]
@@ -474,6 +480,12 @@ setup() {
   run bash "$REPO/tests/test-retirement-invariant.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "cross-seat BLOCK precedence: a foreign BLOCK outranks this seat's PASS (HERD-247)" {
+  run bash "$REPO/tests/test-cross-seat-block.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS test-cross-seat-block.sh"* ]]
 }
 
 @test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {

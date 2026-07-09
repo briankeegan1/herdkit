@@ -14,8 +14,9 @@
 # The two moving parts that would be a live account + a live Claude session are the ONLY things
 # stubbed, and both through documented seams:
 #   • The rate-limit sentinel is written by the ACTUAL StopFailure/rate_limit hook command
-#     (herd_write_ratelimit_hook installs it; we feed a near-future reset epoch on stdin exactly as
-#     the harness would) — so the injected sentinel matches the format the hook writes, byte for byte.
+#     (herd_write_ratelimit_hook installs it; we feed the harness EVENT on stdin — a JSON blob
+#     carrying the usage-limit banner, exactly as Claude Code does) — so the injected sentinel is
+#     whatever the hook's own extractor produces, never a hand-written value.
 #   • `claude` is a stub shim on PATH: when the resume fires `claude --continue` in the builder's
 #     worktree, the shim RECORDS its invocation (argv + cwd) and COMPLETES the parked task
 #     deterministically (implements the pending feature + commits it, no model call), then flips the
@@ -99,10 +100,22 @@ mkdir -p "$TREES" "$SHOTS"
 export HERD_LIMIT_RESUME_BUFFER
 
 # ── deterministic clock (HERD_NOW_EPOCH seam) ───────────────────────────────────────────────────
-# A fixed base so every run is byte-stable. The reset is a NEAR-FUTURE epoch (base + 300s).
+# A fixed base so every run is byte-stable. The reset is a NEAR-FUTURE epoch (~base + 300s).
+#
+# MINUTE-ALIGNED (HERD-246): the reset reaches the engine the way it reaches it in production — as a
+# wall-clock time inside the banner text ("…will reset at 03:38"), which _parse_reset_epoch resolves
+# to the next occurrence of that HH:MM with seconds ZEROED. A reset epoch carrying a seconds
+# component could therefore never round-trip. Anchor RESET on a minute boundary so
+# `banner → sentinel → _parse_reset_epoch` returns it exactly.
+# TZ is pinned so the HH:MM the banner renders and the HH:MM the parser resolves cannot disagree.
+export TZ="${TZ:-UTC}"
 NOW0=2000000000
-RESET=$(( NOW0 + 300 ))
+RESET=$(( (NOW0 / 60) * 60 + 300 ))
 TARGET=$(( RESET + HERD_LIMIT_RESUME_BUFFER ))
+RESET_HHMM="$(date -r "$RESET" +%H:%M 2>/dev/null || date -d "@$RESET" +%H:%M 2>/dev/null)"
+# The usage-limit BANNER Claude prints when a turn ends rate-limited. This — not a bare epoch — is
+# what the real rate_limit hook sees, and the only shape its extractor writes to the sentinel.
+RESET_BANNER="Claude usage limit reached. Your limit will reset at ${RESET_HHMM}."
 
 # ── checkpoint recording (bash 3.2: parallel indexed arrays, no assoc arrays) ───────────────────
 CP_NAMES=(); CP_STATUS=(); CP_DETAIL=()
@@ -312,9 +325,16 @@ take_screenshot() {
 }
 
 # ── INJECT the limit sentinel via the ACTUAL StopFailure/rate_limit hook command ─────────────────
-# Install the real hook, then run its command with the near-future reset epoch on stdin exactly as
-# the harness would on a rate-limited turn end — so the sentinel matches the hook's format byte for
-# byte (rather than being hand-written). The builder's session has now ended: mark it idle.
+# Install the real hook, then run its command with the harness EVENT on stdin exactly as Claude Code
+# would on a rate-limited turn end — so the sentinel matches the hook's format byte for byte (rather
+# than being hand-written). The builder's session has now ended: mark it idle.
+#
+# HERD-246: stdin is a JSON EVENT carrying the banner, not a bare epoch. HERD-155 F3 tightened the
+# hook's extractor to write ONLY banner-shaped text ("reset at/in <time>", else a "usage/session
+# limit" line) precisely so a stray number in this blob could never be misread as a reset clock. The
+# pre-HERD-246 sim piped the raw epoch, which matches neither pattern — the hook wrote an EMPTY
+# sentinel, `detect` returned reset=0, and the schedule silently fell through to
+# HERD_LIMIT_UNKNOWN_WAIT. Feeding the real event shape is what makes this an end-to-end proof.
 step inject "inject the rate-limit sentinel via the real StopFailure hook, session ends"
 herd_write_ratelimit_hook "$WT"
 HOOK_CMD="$(python3 - "$WT/.claude/settings.json" <<'PY'
@@ -329,15 +349,26 @@ except Exception:
 PY
 )"
 if [ -n "$HOOK_CMD" ]; then
-  printf '%s' "$RESET" | bash -c "$HOOK_CMD"     # the hook writes the reset banner text → sentinel
+  # The StopFailure/rate_limit event blob, banner included — the hook extracts the banner → sentinel.
+  HOOK_EVENT="$(HERD_SIM_BANNER="$RESET_BANNER" python3 -c 'import json, os; print(json.dumps({
+    "session_id": "sim-0000-1111-2222",
+    "transcript_path": "/dev/null",
+    "reason": "rate_limit",
+    "message": os.environ["HERD_SIM_BANNER"],
+  }))')"
+  printf '%s' "$HOOK_EVENT" | bash -c "$HOOK_CMD"
   info "hook command: $HOOK_CMD"
 fi
 set_agent "$SLUG" idle "$PANE"    # the parked session has ENDED (not working)
 SENT="$(_limit_sentinel_file "$WT")"
-if [ -f "$SENT" ] && [ "$(cat "$SENT" 2>/dev/null)" = "$RESET" ]; then
-  checkpoint sentinel_injected pass "hook wrote .herd-limit-sentinel = reset epoch $RESET"
+# The sentinel must hold the extracted BANNER, and that banner must parse back to exactly $RESET —
+# the round-trip (banner → hook → sentinel → _parse_reset_epoch) is the checkpoint, not a byte match.
+_sent_txt="$(cat "$SENT" 2>/dev/null || true)"
+if [ -f "$SENT" ] && [ -n "$_sent_txt" ] && \
+   [ "$(HERD_NOW_EPOCH="$NOW0" _parse_reset_epoch "$_sent_txt")" = "$RESET" ]; then
+  checkpoint sentinel_injected pass "hook extracted the banner → .herd-limit-sentinel ('$_sent_txt'), parses to reset epoch $RESET"
 else
-  checkpoint sentinel_injected fail "sentinel not written as expected (got '$(cat "$SENT" 2>/dev/null)')"
+  checkpoint sentinel_injected fail "sentinel did not round-trip to $RESET (got '$_sent_txt')"
 fi
 
 # ── TICK 1 — DETECT + PARK (clock = base; reset is in the future) ────────────────────────────────

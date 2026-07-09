@@ -101,7 +101,7 @@ HERD_DRIVER="herdr-claude"
 # merge | squash | rebase
 MERGE_METHOD="merge"
 # direct (open ready) | draft
-PR_FLOW="direct"
+PR_FLOW="draft"
 # only consulted when PR_FLOW=draft
 PR_READY_WHEN="builder"
 # retain merged feature branches (today's behavior)
