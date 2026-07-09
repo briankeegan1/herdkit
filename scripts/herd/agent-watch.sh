@@ -7916,11 +7916,81 @@ _prs_fetch_tick() {
   return 0
 }
 
-# ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
+# ── Branch-ref repair (HERD-226) ─────────────────────────────────────────────────────────────────
+# A worktree that the sha-fallback join matched (its HEAD is exactly one open PR's head commit) is on
+# the WRONG branch name — a resolver or builder left it on a scratch ref. Point the PR's own branch at
+# that commit and check it out, so the next tick's cheap branch-name join matches on its own.
+#
+# The repair is deliberately timid. It runs ONLY when the repair is provably lossless:
+#   • the worktree is CLEAN (no dirty or untracked files — nothing to strand);
+#   • HEAD is exactly the PR's head commit (never move a diverged branch onto a stranger's work);
+#   • the PR's local branch is absent, or its tip is an ANCESTOR of HEAD (a fast-forward, never a
+#     clobber of a diverged ref) — and `checkout -B` itself refuses a branch checked out elsewhere.
+# Any other shape (dirty tree, diverged ref, ambiguous match, DRYRUN) is a SKIP: the sha-join match is
+# already recorded, so gating proceeds untouched and the console renders the truthful mismatch row.
+# FAIL-SOFT by construction: every git call's failure is a SKIP, never a gate block.
+# Echoes REPAIRED (branch now matches the PR) or SKIP. Journals `branch_repaired` on success only —
+# the row carries the un-repaired case, so a stuck worktree never spams the journal every 4 s tick.
+_repair_branch_ref() {
+  local _d="$1" _b="$2" _pb="$3" _sha="$4" _pr="$5" _slug="$6"
+  _repair_branch_ref_try "$@" || { printf 'SKIP'; return 0; }
+  journal_append branch_repaired pr "$_pr" slug "$_slug" sha "$_sha" \
+    from_branch "$_b" to_branch "$_pb" 2>/dev/null || true
+  printf 'REPAIRED'
+}
+
+# _repair_branch_ref_try — the guarded repair itself. Success (rc 0) iff the ref was moved and checked
+# out; every refusal and every git failure is a plain nonzero rc, so the caller's SKIP is the default.
+_repair_branch_ref_try() {
+  local _d="$1" _b="$2" _pb="$3" _sha="$4" _head _tip
+  [ -z "${DRYRUN:-}" ] || return 1
+  [ -n "$_d" ] && [ -n "$_pb" ] && [ -n "$_sha" ] || return 1
+  [ "$_b" != "$_pb" ] || return 1                                      # already on the PR's branch
+  _head="$(git -C "$_d" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_head" ] && [ "$_head" = "$_sha" ] || return 1                # diverged from the PR head
+  [ -z "$(git -C "$_d" status --porcelain 2>/dev/null)" ] || return 1  # dirty tree — never touch it
+  _tip="$(git -C "$_d" rev-parse --verify --quiet "refs/heads/$_pb" 2>/dev/null || true)"
+  if [ -n "$_tip" ] && ! git -C "$_d" merge-base --is-ancestor "$_tip" "$_head" 2>/dev/null; then
+    return 1                                                           # local PR branch diverged
+  fi
+  git -C "$_d" checkout -q -B "$_pb" "$_head" 2>/dev/null || return 1
+}
+
+# _branch_mismatch_text <worktree-branch> <pr-head-description> — the one sentence both the standalone
+# mismatch row and the appended gate-row note render. Naming the two refs is the whole point: an
+# operator seeing it knows the PR was found (gates ARE running) and knows exactly which ref to fix.
+_branch_mismatch_text() {
+  printf 'branch mismatch — worktree on %s, PR head is %s' "$1" "$2"
+}
+
+# _row_branch_mismatch <slug-cell> <text> — the console row for a worktree whose PR could not be
+# joined unambiguously (two open PRs share its HEAD commit). It is NOT an 'awaiting task' spare: a
+# spare has no PR, this one has too many. Yours to disambiguate.
+_row_branch_mismatch() {
+  printf '    %s⚠️%s  %s%s%s %s%s%s' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$C_YELLOW" "$2" "$C_RESET"
+}
+
+# ── Feature-worktree discovery (HERD-182, HERD-226) ──────────────────────────────────────────────
 # _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
-# record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
-# slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits records on stdout,
-# one per line, in the exact field order the tick loop consumes.
+# record per LEGITIMATE builder worktree, matching each to its open PR (by branch, then by HEAD commit)
+# and its agent (by slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits
+# records on stdout, one per line, in the exact field order the tick loop consumes:
+#   dir slug branch pr mergeable mergeStateStatus agent_status headRefOid author matchkind matchdetail
+# The last two are HERD-226's join provenance — matchkind ∈ {branch, sha, ambig, ""} and, for the two
+# non-trivial kinds, the detail the console names (the PR's own branch, or which PRs collide).
+#
+# SHA-RESILIENT JOIN (HERD-226). GROUNDED INCIDENT: a resolver exited leaving its worktree on the
+# scratch branch `pr328`; the branch-name-only join found no PR, so PR #328 was INVISIBLE to the
+# watcher for ~20 min — no gates ran and the console claimed 'awaiting task'. So after the branch-name
+# join, still-unmatched worktrees get a FALLBACK pass: when a worktree's HEAD commit equals exactly
+# ONE still-unmatched open PR's headRefOid (already fetched this tick), that is the PR. The identity is
+# a cryptographic one, and every downstream gate/verdict/ledger is (pr,sha)-keyed — not branch-keyed —
+# so a sha-joined row gates exactly like a branch-joined one.
+#
+# AMBIGUITY IS NEVER RESOLVED, only reported: two open PRs on one commit (or two worktrees on one PR's
+# commit) yields matchkind=ambig with NO pr fields — the tick paints the truthful mismatch row instead
+# of guessing, and never the 'awaiting task' claim that hid #328.
 #
 # DISCOVERY SCOPE (HERD-182): a worktree is a builder candidate ONLY when BOTH hold —
 #   1. it lives UNDER $WORKTREES_DIR ($TREES) — every builder worktree is $WORKTREES_DIR/<slug>,
@@ -7957,29 +8027,65 @@ try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") o
 except Exception: agents = []
 pr_by_branch = {p.get("headRefName"): p for p in prs}
 ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
-feats = []; wt = None; branch = None; detached = False
-def _emit(wt, branch, detached):
+feats = []; wt = None; branch = None; head = None; detached = False
+def _emit(wt, branch, head, detached):
     # A builder candidate is UNDER $WORKTREES_DIR, on a BRANCH (not detached), and not $MAIN.
     if not wt: return
     if MAIN and _real(wt) == main_real: return
     if detached or not branch: return
     if not _under_trees(wt): return
-    feats.append((wt, branch))
+    feats.append((wt, branch, head or ""))
 for line in (os.environ.get("WT") or "").splitlines():
-    if line.startswith("worktree "): wt = line[9:]; branch = None; detached = False
+    if line.startswith("worktree "): wt = line[9:]; branch = None; head = None; detached = False
+    elif line.startswith("HEAD "): head = line[5:]
     elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
     elif line == "detached": detached = True
     elif line == "":
-        _emit(wt, branch, detached); wt = None; branch = None; detached = False
-_emit(wt, branch, detached)
-for wt, branch in feats:
+        _emit(wt, branch, head, detached); wt = None; branch = None; head = None; detached = False
+_emit(wt, branch, head, detached)
+
+# SHA-FALLBACK JOIN (HERD-226). A PR is claimable only when NO discovered worktree already sits on its
+# head branch, and a worktree is a claimant only when the branch join left it PR-less: the cheap name
+# join always wins, so a repo whose names all match takes this pass with nothing to do.
+wt_branches = set(b for _, b, _ in feats)
+free_by_oid = {}   # oid -> [pr, ...]   open PRs no worktree claimed by name
+for p in prs:
+    if p.get("headRefName") in wt_branches: continue
+    oid = p.get("headRefOid")
+    if oid: free_by_oid.setdefault(oid, []).append(p)
+claim_by_oid = {}  # oid -> [wt, ...]   worktrees the name join left unmatched
+for w, b, h in feats:
+    if b in pr_by_branch or not h: continue
+    claim_by_oid.setdefault(h, []).append(w)
+
+fallback = {}      # wt -> (pr_or_None, matchkind, detail)
+for w, b, h in feats:
+    if b in pr_by_branch or not h: continue
+    cands = free_by_oid.get(h) or []
+    peers = claim_by_oid.get(h) or []
+    if not cands: continue                                     # no PR at this commit — a real spare
+    if len(cands) == 1 and len(peers) == 1:
+        # Exactly one PR head at exactly one worktree HEAD: a cryptographic identity, not a guess.
+        fallback[w] = (cands[0], "sha", cands[0].get("headRefName") or "")
+    else:
+        # Two PRs on one commit, or two worktrees on one PR head. Never guess which; say so.
+        nums = ",".join("#%s" % p.get("number") for p in sorted(cands, key=lambda p: p.get("number") or 0))
+        fallback[w] = (None, "ambig", "ambiguous (%s share this commit)" % nums)
+
+for wt, branch, head in feats:
     slug = os.path.basename(wt)
     pr = pr_by_branch.get(branch or "", {})
+    kind = "branch" if pr else ""
+    detail = ""
+    if not pr and wt in fallback:
+        fb, kind, detail = fallback[wt]
+        pr = fb or {}
     print("\x1f".join(str(x) for x in [
         wt, slug, branch or "", pr.get("number", ""),
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
         ag_status.get(slug, ""), pr.get("headRefOid", ""),
-        (pr.get("author") or {}).get("login", "")]))
+        (pr.get("author") or {}).get("login", ""),
+        kind, detail]))
 '
 }
 
@@ -8124,55 +8230,91 @@ build_sweep_note() {
   return 0
 }
 
-# ── Singleton acquisition (HERD-209) — the ONE race-safe watcher spawn-lock ──────────────────────
+# ── Singleton acquisition (HERD-209 / HERD-252) — the ONE race-safe watcher spawn-lock ──────────
 # _acquire_watcher_singleton — REFUSE-or-ADOPT gate enforcing "exactly one agent-watch main per
 # workspace". Returns 0 when this process may run (it acquired the lock — a stale/absent lock is
-# adopted); returns 1 when a LIVE watcher is already recorded and this one must NOT run (a duplicate).
+# adopted); returns 1 when a LIVE watcher already holds the lock and this one must NOT run.
 #
 # The HERD-209 incident: control-room recovery (herd pane watch / herd reload / manual herd-watch.sh)
 # spawned a SECOND watcher WITHOUT killing the first, so two mains polled the same PRs and raced the
 # shared .git object store — healthchecks restarted endlessly. The defense is a REAL singleton at every
 # launch: atomically check HERD_WATCHER_LOCK (kill -0 on the recorded pid) and refuse the duplicate.
 #
-# Two acquisition primitives, one per environment — both ATOMIC (create/flock, never check-then-write):
-#   • flock(1) available  — a non-blocking exclusive lock on fd 9 held for our lifetime; a second
-#                           watcher's `flock -n` fails instantly (auto-released on any exit via fd close).
-#   • no flock (macOS)    — an atomic-mkdir mutex serializes the check+write window, then a PID file is
-#                           held for our lifetime and removed on EXIT/INT/TERM.
-# In BOTH primitives we FIRST read the RECORDED pid (before any truncating open — `exec 9>` empties the
-# file) and refuse a live, non-self one. That kill -0 check is what catches the exact race the flock
-# alone cannot: a lockfile inode swapped out from under an alive holder (rm+recreate) — the recorded pid
-# still proves a watcher is up. Lib-visible (defined above the AGENT_WATCH_LIB return) so the unit test
-# can drive it directly; called once at main startup below.
+# HERD-252: a LIVE-lock collision must REFUSE LOUDLY and IMMEDIATELY — print the holder pid on stderr
+# and return non-zero so the caller exits non-zero. Never BLOCK/hang waiting for the lock (operator
+# must be able to tell a working launch from a blocked one). A free/stale (dead-pid) lock still
+# acquires and starts normally (unchanged).
+#
+# Two acquisition primitives, one per environment — both ATOMIC and NON-BLOCKING:
+#   • flock(1) available  — `flock -n` on fd 9 held for our lifetime; a second watcher's flock -n
+#                           fails instantly (auto-released on any exit via fd close). Open with >> so
+#                           a failed acquire does not truncate the holder pid out of the lockfile.
+#   • no flock (macOS)    — an atomic-mkdir mutex serializes the check+write window, then a PID file
+#                           is held for our lifetime and removed on EXIT/INT/TERM. While contending
+#                           for the mutex, a LIVE recorded pid refuses immediately (no sleep loop).
+# In BOTH primitives we FIRST read the RECORDED pid and refuse a live, non-self one. That kill -0
+# check is what catches the exact race the flock alone cannot: a lockfile inode swapped out from
+# under an alive holder (rm+recreate) — the recorded pid still proves a watcher is up. Lib-visible
+# (defined above the AGENT_WATCH_LIB return) so the unit test can drive it directly; called once at
+# main startup below.
+_watcher_singleton_refuse_msg() {
+  # _watcher_singleton_refuse_msg <pid-or-empty> — one-line LOUD refuse on stderr (HERD-252).
+  local _wl_holder="${1:-}"
+  if [ -n "$_wl_holder" ]; then
+    printf 'herd-watch: already running (pid %s) — refusing duplicate\n' "$_wl_holder" >&2
+  else
+    printf 'herd-watch: already running — refusing duplicate\n' >&2
+  fi
+}
+
 _acquire_watcher_singleton() {
   mkdir -p "$(dirname "$HERD_WATCHER_LOCK")" 2>/dev/null || true
-  # Recorded-pid refuse — read the pid BEFORE any open that would truncate the lockfile. A LIVE,
-  # non-self recorded pid means a watcher already owns this workspace: refuse rather than duplicate.
+  # Recorded-pid refuse — read the pid BEFORE any open. A LIVE, non-self recorded pid means a
+  # watcher already owns this workspace: refuse LOUDLY rather than duplicate or wait.
   local _wl_rec
   _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  # Trim trailing whitespace/newlines so a pid line is a clean integer for kill -0 + messaging.
+  _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
   if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_rec" >&2
+    _watcher_singleton_refuse_msg "$_wl_rec"
     return 1
   fi
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"$HERD_WATCHER_LOCK"
+    # Append-open: do NOT truncate. A contested flock -n must still be able to name the holder pid
+    # from the lockfile (truncating open was the silent-manners footgun for the flock-fail path).
+    exec 9>>"$HERD_WATCHER_LOCK"
     if ! flock -n 9; then
-      printf '🐑 watcher already running for %s — exiting.\n' "$WORKSPACE_NAME" >&2
+      _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
+      if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
+        _watcher_singleton_refuse_msg "$_wl_rec"
+      else
+        _watcher_singleton_refuse_msg ""
+      fi
       return 1
     fi
     printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
     return 0
   fi
   # Atomic-mkdir mutex (serializes the check+write window; held only for that instant).
+  # LIVE-lock invariant (HERD-252): never sleep/wait on a live holder — re-check the pid every
+  # contention tick and refuse immediately. Only a free mutex / stale (dead) lock may wait briefly.
   local _wl_mtx="${HERD_WATCHER_LOCK}.d" _wl_tries=0 _wl_pid _wl_tmp
   while ! mkdir "$_wl_mtx" 2>/dev/null; do
+    _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
+    if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
+      _watcher_singleton_refuse_msg "$_wl_pid"
+      return 1
+    fi
     [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
     _wl_tries=$((_wl_tries + 1)); [ "$_wl_tries" -ge 30 ] && break; sleep 0.1
   done
   _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
   if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
     rmdir "$_wl_mtx" 2>/dev/null || true
-    printf '🐑 watcher already running for %s (PID %s) — exiting.\n' "$WORKSPACE_NAME" "$_wl_pid" >&2
+    _watcher_singleton_refuse_msg "$_wl_pid"
     return 1
   fi
   # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
@@ -8235,14 +8377,17 @@ fi
 # that is not inside the project it resolves to.
 herd_console_guard "herd watch" || exit 1
 
-# ── Singleton spawn-lock: exactly one watcher per project (HERD-209) ────────────────────────────
+# ── Singleton spawn-lock: exactly one watcher per project (HERD-209 / HERD-252) ─────────────────
 # The race-safe acquisition lives in _acquire_watcher_singleton (defined above the AGENT_WATCH_LIB
 # return so the unit test can drive it): it REFUSES when a LIVE watcher is already recorded in
-# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then flock/mkdir), and ADOPTS a stale/absent lock.
-# A refusal exits 0 — a duplicate launch is a no-op, never an error. Keyed by WORKSPACE_NAME (matching
-# the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths (cmd_pane_watch /
-# cmd_reload) mirror this check before spawning so a duplicate is caught at the launcher too.
-_acquire_watcher_singleton || exit 0
+# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then non-blocking flock/mkdir), and ADOPTS a
+# stale/absent lock. A LIVE-lock refusal is LOUD and NON-ZERO (HERD-252): stderr names the holder
+# pid (`herd-watch: already running (pid <N>) — refusing duplicate`) and we exit 1 immediately —
+# never hang, never soft-exit 0 that looks like a successful launch. Keyed by WORKSPACE_NAME
+# (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
+# (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
+# launcher too.
+_acquire_watcher_singleton || exit 1
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
 # ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
@@ -8556,6 +8701,8 @@ while true; do
   # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
   # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
   # the main checkout is excluded as before. See _discover_feature_worktrees.
+  # Each record also carries HERD-226's join provenance: matchkind (branch | sha | ambig | "") and a
+  # matchdetail (the PR's own branch name for a sha join; which PRs collide for an ambiguous one).
   FEATS=()
   while IFS= read -r rec; do
     [ -n "$rec" ] && FEATS+=("$rec")
@@ -8568,11 +8715,26 @@ while true; do
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
 $rec
 EOF
     sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # HERD-226: this row's PR was found by HEAD commit, not by branch name — the worktree sits on some
+    # other ref (a resolver's scratch branch). Try the lossless repair; if it takes, the row is an
+    # ordinary branch-matched one from here down (and stays so next tick, via the cheap name join).
+    # If it cannot (dirty tree, diverged ref), the sha-join match STILL stands — gates are (pr,sha)-
+    # keyed — and we hang the truthful mismatch note on whatever row the classification produces.
+    # $SELF_WT is exempt: never swap the branch out from under the checkout this watcher is running.
+    _bmismatch=""
+    if [ "$matchkind" = "sha" ]; then
+      if [ "$dir" != "$SELF_WT" ] \
+         && [ "$(_repair_branch_ref "$dir" "$branch" "$matchdetail" "$headsha" "$prnum" "$slug")" = "REPAIRED" ]; then
+        branch="$matchdetail"
+      else
+        _bmismatch="$(_branch_mismatch_text "$branch" "$matchdetail")"
+      fi
+    fi
     if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
       # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
       # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
@@ -8594,7 +8756,13 @@ EOF
         *)        FLAIR_STATE[i]="attention" ;;
       esac
     elif [ -z "$prnum" ]; then
-      if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+      if [ "$matchkind" = "ambig" ]; then
+        # HERD-226: this worktree's HEAD is the head commit of MORE THAN ONE open PR (or it shares that
+        # commit with a sibling worktree). A PR-less row would read 'awaiting task · assign or retire'
+        # — the exact lie that hid PR #328. The commit is claimed; which PR is yours to say.
+        DISPLAY[i]="$(_row_branch_mismatch "$sl" "$(_branch_mismatch_text "$branch" "$matchdetail")")"
+        FLAIR_STATE[i]="attention"
+      elif [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
         # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
         # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
         # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
@@ -8737,6 +8905,10 @@ EOF
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
       FLAIR_STATE[i]="attention"
     fi
+    # A sha-joined worktree we could not repair keeps its real row — health-check, blocked, conflict,
+    # whatever the PR's state is — with the mismatch named after it. The gate outcome is the headline;
+    # the stale ref is the footnote. Empty (the overwhelmingly common case) leaves the row untouched.
+    [ -n "$_bmismatch" ] && DISPLAY[i]="${DISPLAY[i]} ${C_YELLOW}· ${_bmismatch}${C_RESET}"
     i=$((i + 1))
   done
 
