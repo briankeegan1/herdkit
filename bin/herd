@@ -164,10 +164,23 @@ render_skill() {
     : "${DENY_PATHS:=}"
     : "${HERD_REPO:=}"
     : "${COORDINATOR_CMD:=/coordinator}"
+    : "${COORDINATOR_AUTONOMY:=human}"
     local name="${COORDINATOR_CMD#/}"; name="${name:-coordinator}"
     local out_dir="$root/.claude/commands"
     mkdir -p "$out_dir"
     local out="$out_dir/$name.md"
+
+    # Coordinator autonomy note for the template. The default "human" is byte-identical to today's
+    # behavior (interactive control required). "gated" or "full" enable autonomous spawning subject to
+    # constraints (impact analysis, budget, concurrency). For the template, compose a note based on the
+    # posture so the rendered skill surfaces what autonomy mode is active.
+    local COORDINATOR_AUTONOMY_NOTE=''
+    case "$COORDINATOR_AUTONOMY" in
+      human)  COORDINATOR_AUTONOMY_NOTE='(Interactive mode: each spawn requires your approval)' ;;
+      gated)  COORDINATOR_AUTONOMY_NOTE='(Autonomous mode: spawns when constraints permit — no impact conflicts, budget available, review capacity allows)' ;;
+      full)   COORDINATOR_AUTONOMY_NOTE='(Fully autonomous mode: spawns without approval constraints, subject only to the gates themselves)' ;;
+      *)      COORDINATOR_AUTONOMY_NOTE="(Unknown COORDINATOR_AUTONOMY posture: '$COORDINATOR_AUTONOMY' — defaulting to human interaction required)" ;;
+    esac
 
     # ── Driver: the runtime-specific control surface (multiplexer + agent runtime). HERD_DRIVER
     # (default herdr-claude; headless + a stub proof driver also ship) selects templates/drivers/<driver>.driver,
@@ -275,6 +288,7 @@ _On every invocation, read live state to surface what is configured:_
       line="${line//\{\{DENY_PATHS\}\}/$DENY_PATHS}"
       line="${line//\{\{HERD_REPO\}\}/$HERD_REPO}"
       line="${line//\{\{COORDINATOR_CMD\}\}/$COORDINATOR_CMD}"
+      line="${line//\{\{COORDINATOR_AUTONOMY_NOTE\}\}/$COORDINATOR_AUTONOMY_NOTE}"
       line="${line//\{\{CAPABILITIES\}\}/$CAPABILITIES}"
       printf '%s\n' "$line"
     done < "$TEMPLATES_DIR/coordinator.md.tmpl" > "$out"
