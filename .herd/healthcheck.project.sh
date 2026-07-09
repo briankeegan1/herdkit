@@ -562,5 +562,29 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $chl_note"; }
+# 7. test-wiring ratchet (HERD-257) — every tests/test-*.sh is either referenced by tests/herd.bats
+# (the curated suite) or listed in tests/test-wiring-exempt.tsv with a reason. Shared implementation
+# with the light profile (scripts/herd/test-wiring-lint.sh). Fail-soft skip when the lint is absent.
+tw_note="test-wiring: clean"
+if [ -f scripts/herd/test-wiring-lint.sh ]; then
+  # shellcheck source=/dev/null
+  . scripts/herd/test-wiring-lint.sh
+  _tw_errs="$(herd_test_wiring_lint ".")"; _tw_rc=$?
+  case "$_tw_rc" in
+    0) tw_note="test-wiring: clean" ;;
+    2) tw_note="test-wiring: skipped (${HERD_TEST_WIRING_SKIP_REASON:-infra})" ;;
+    *) tw_note="test-wiring: VIOLATION"
+       if [ -n "$ONELINE" ]; then
+         echo "test-wiring: $(printf '%s' "$_tw_errs" | head -1)"
+       else
+         echo "TEST-WIRING: a tests/test-*.sh is neither wired into tests/herd.bats nor exempted"
+         printf '%s\n' "$_tw_errs"
+       fi
+       exit 1 ;;
+  esac
+else
+  tw_note="test-wiring: skipped (scripts/herd/test-wiring-lint.sh not present)"
+fi
+
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $chl_note; $tw_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $chl_note"; echo "  $tw_note"; }
 exit 0

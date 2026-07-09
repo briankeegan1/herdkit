@@ -1,0 +1,31 @@
+# tests/test-wiring-exempt.tsv — EXPLICIT allowlist of tests/test-*.sh files that are
+# intentionally NOT wired into the merge-gate suite (tests/herd.bats / scripts/ci/run-suite.sh
+# curated mode). Read by scripts/herd/test-wiring-lint.sh (HERD-257).
+#
+# Every tests/test-*.sh file must be either:
+#   (a) referenced by tests/herd.bats (the gate runs it), or
+#   (b) listed here with a non-empty reason (genuinely not a gate test OR a known pre-existing
+#       red that must not block the suite until a dedicated fix-PR lands).
+# A new unexempted + unwired test file is a CODE error (the test-wiring ratchet).
+#
+# Prefer WIRING over exempting. Env-fragile tests that still SHOULD run belong in the suite +
+# tests/known-env-sensitive.tsv (XFAIL), not here: an exempt test is never executed by the gate.
+#
+# Columns (TAB-separated):
+#   name    the test file basename, e.g. test-foo.sh
+#   reason  one-line why it is not in the gate (required, non-empty)
+name	reason
+test-cli-update.sh	pre-existing red (rc 128, empty output) when run outside the maintainer-blessed env; landed ungated — fix-PR, do not gate-block until green
+test-codemap.sh	pre-existing red: modules section missing agent-watch.sh (codemap/doc drift); landed ungated — wire once the codemap assertion is green
+test-config-manifest.sh	pre-existing red: GHOST keys JOURNAL_AUDIT_* in journal-audit.sh not declared in capabilities; landed ungated — wire with the caps fix
+test-config-shared-pr.sh	pre-existing red: --shared degrade path expects a missing-gh warn the current stub path no longer emits; landed ungated
+test-doctor-point-of-need.sh	pre-existing red: no-glow render missing self-diagnosing doctor hint (render output shape drift); landed ungated
+test-doctor.sh	pre-existing red: herd init interview/flow assertions drift from current non-interactive init path; landed ungated
+test-main-freshness.sh	pre-existing red: fixture origin has no main ref (src refspec main does not match any); landed ungated
+test-map.sh	pre-existing red: map output missing the doc title (format drift); landed ungated
+test-review-pane-v2.sh	pre-existing red: herdr pane close not called on orphaned-reviewer timeout path; landed ungated
+test-seam-conformance.sh	pre-existing red: retirement.sh journal_append without source/guard (B4); landed ungated — wire with the seam fix
+test-sync-guard.sh	pre-existing red: caps-sync guard does not trip on new cmd_* without manifest in this fixture; landed ungated (superseded in part by test-caps-sync-light.sh which IS wired)
+test-sandbox-concurrency.sh	pre-existing red: sandbox concurrency scorecard 33/1 (one checkpoint still fails under current engine); landed ungated
+test-sandbox-posture-matrix.sh	depends on sandbox-concurrency posture legs; pre-existing red (solo-auto/full-auto fail) while concurrency sim is red; landed ungated
+test-tracked-spawns.sh	pre-existing red: case 11 task remainder keeps a leading newline/space (' build the thing'); landed ungated

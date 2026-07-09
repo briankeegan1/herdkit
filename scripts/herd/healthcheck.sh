@@ -27,6 +27,9 @@
 #       CONFIG_KEY) absent from the capabilities manifest. Docs/tmpl-only diffs run light under
 #       HEALTHCHECK_HEAVY_GLOB, so this is the pre-PR gate that catches doc drift (the heavy suite
 #       also wraps tests/test-doc-drift.sh).
+#       Then the SHARED test-wiring ratchet (scripts/herd/test-wiring-lint.sh, HERD-257) — every
+#       tests/test-*.sh must be referenced by tests/herd.bats or listed in tests/test-wiring-exempt.tsv
+#       with a reason, so a new ungated hermetic test cannot land silently (incident: PR #353).
 #
 # Profile selection (auto):
 #   * no $HEALTHCHECK_CMD configured        → always light (pure syntax gate)
@@ -93,6 +96,14 @@ if [ -f "$HERE/doc-drift-lint.sh" ]; then
 else
   HERD_DOC_DRIFT_SKIP_REASON="doc-drift-lint.sh not present"
   herd_doc_drift_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# test-wiring ratchet (rc 2), never break the healthcheck it is a part of.
+if [ -f "$HERE/test-wiring-lint.sh" ]; then
+  . "$HERE/test-wiring-lint.sh"
+else
+  HERD_TEST_WIRING_SKIP_REASON="test-wiring-lint.sh not present"
+  herd_test_wiring_lint() { return 2; }
 fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
@@ -356,6 +367,18 @@ EOF
   if [ "$drift_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ doc-drift — $(printf '%s' "$drift_errs" | grep '^DRIFT' | head -1)";
     else echo "❌ DOC-DRIFT: README/docs/templates reference a command (or README key) absent from capabilities.tsv"; printf '%s\n' "$drift_errs" | grep '^DRIFT' || printf '%s\n' "$drift_errs"; fi
+    exit 1
+  fi
+
+  # test-wiring ratchet (HERD-257) — every tests/test-*.sh is either referenced by tests/herd.bats
+  # (the curated merge-gate suite / run-suite curated mode) or listed in tests/test-wiring-exempt.tsv
+  # with a reason. Same red semantics as caps-sync. Skipped (never red) in trees with no herd.bats
+  # (every consuming project) or when the shared lint is absent.
+  local tw_errs tw_rc
+  tw_errs="$(herd_test_wiring_lint ".")"; tw_rc=$?
+  if [ "$tw_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ test-wiring — $(printf '%s' "$tw_errs" | head -1)";
+    else echo "❌ TEST-WIRING: a tests/test-*.sh is neither wired into tests/herd.bats nor exempted in tests/test-wiring-exempt.tsv"; printf '%s\n' "$tw_errs"; fi
     exit 1
   fi
 

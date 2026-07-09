@@ -149,6 +149,7 @@ retirement.sh	sim	scripts/herd/sim/retirement-invariant-sim.sh
 caps-sync-lint.sh	unit	tests/test-caps-sync-light.sh
 console-section.sh	unit	tests/test-console-rows-ageout.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
+test-wiring-lint.sh	unit	tests/test-test-wiring.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
 herd-review.sh	unit	tests/test-review-verdict-integrity.sh

@@ -512,3 +512,833 @@ setup() {
   run grep -q '{{' "$REPO/.claude/commands/coordinator.md"
   [ "$status" -ne 0 ]
 }
+
+# ── HERD-257 test-wiring ratchet: previously-ungated hermetic tests ─────────────────
+# Auto-generated bulk wiring so the merge gate (and scripts/ci/run-suite.sh curated
+# mode) actually RUNS every tests/test-*.sh that is not in test-wiring-exempt.tsv.
+# Prefer a hand-written descriptive @test name when revisiting a file; status-eq-0
+# is the load-bearing pass criterion (output markers vary across the suite).
+
+@test "hermetic test-agent-naming.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-agent-naming.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-agent-update.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-agent-update.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-app-preview-config.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-app-preview-config.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-attribution-lint.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-attribution-lint.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-auto-refix.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-auto-refix.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-autoreconcile.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-autoreconcile.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backend-claim.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backend-claim.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backend-github.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backend-github.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-reconcile-sweep.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-reconcile-sweep.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-reconcile.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-reconcile.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-view-bold.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-view-bold.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-view-extras.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-view-extras.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-view-render.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-view-render.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-view-rich.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-view-rich.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-backlog-view-untracked.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-backlog-view-untracked.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-benchmark-drain.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-benchmark-drain.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-budget-governance.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-budget-governance.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-builder-notes-journal.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-builder-notes-journal.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-caps-sync-light.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-caps-sync-light.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-changelog.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-changelog.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-ci-run-suite.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-ci-run-suite.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-claim.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-claim.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-approve.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-approve.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-backlog.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-backlog.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-config-sync.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-config-sync.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-config.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-config.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-links.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-links.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-pane.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-pane.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-reload.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-reload.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-report.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-report.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cli-symlink.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cli-symlink.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-codemap-autorefresh.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-codemap-autorefresh.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-codemap-reconcile.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-codemap-reconcile.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-codex-driver.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-codex-driver.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-commit-convention-lint.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-commit-convention-lint.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-config-dedup-lint.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-config-dedup-lint.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-config-key-docs.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-config-key-docs.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-config-list-hang.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-config-list-hang.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-config-local-dup-lint.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-config-local-dup-lint.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-config-local-overlay.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-config-local-overlay.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+
+@test "hermetic test-console-rows-ageout.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-console-rows-ageout.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-console-tracker-ids.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-console-tracker-ids.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-console-vocabulary.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-console-vocabulary.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-context-provision.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-context-provision.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-coordinator-watchdog.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-coordinator-watchdog.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-correctness-only-block.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-correctness-only-block.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-cost.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-cost.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-de-brand-output.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-de-brand-output.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-de-streamlit-docs.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-de-streamlit-docs.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-dead-builder-respawn.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-dead-builder-respawn.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-dead-builder.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-dead-builder.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-delta-review.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-delta-review.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-dep-states.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-dep-states.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-dep-watcher.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-dep-watcher.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-derived-skill.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-derived-skill.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-dispatch-deps.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-dispatch-deps.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-doctor-claude-quarantine.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-doctor-claude-quarantine.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-doctor-dep-tiering.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-doctor-dep-tiering.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-doctor-exechang-probe.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-doctor-exechang-probe.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-doctor-posture.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-doctor-posture.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-drainer-driver-seam.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-drainer-driver-seam.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-drainer-liveness-corroborate.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-drainer-liveness-corroborate.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-driver-abstraction.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-driver-abstraction.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-driver-lane-spawn.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-driver-lane-spawn.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-eco-starter-defaults.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-eco-starter-defaults.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-external-consumer-audit.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-external-consumer-audit.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-externalize-task-specs.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-externalize-task-specs.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet-digest.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet-digest.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet-discover.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet-discover.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet-governance.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet-governance.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet-inbox.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet-inbox.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet-room.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet-room.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-fleet.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-fleet.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-flow-preference.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-flow-preference.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-gate-dispatch.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-gate-dispatch.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-gate-keys-strict.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-gate-keys-strict.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-gate-status.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-gate-status.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-grok-driver.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-grok-driver.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-headless-driver.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-headless-driver.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-healthcheck-interaction.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-healthcheck-interaction.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-healthcheck-light-probes.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-healthcheck-light-probes.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-healthcheck-routing.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-healthcheck-routing.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-human-verify-hold.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-human-verify-hold.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-human-verify-policy.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-human-verify-policy.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-infra-breaker.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-infra-breaker.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-init-github-detection.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-init-github-detection.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-init-grounding-interview.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-init-grounding-interview.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-install.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-install.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-journal.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-journal.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-launch-binding-guard.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-launch-binding-guard.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-layout-reconcile.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-layout-reconcile.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-leakguard.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-leakguard.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-limit-menu-select.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-limit-menu-select.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-limit-resume.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-limit-resume.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-local-review-prepr.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-local-review-prepr.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+
+@test "hermetic test-mcp-provision.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-mcp-provision.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-merge-fairness.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-merge-fairness.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-merge-policy.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-merge-policy.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-model-escalate.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-model-escalate.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-oss-triage.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-oss-triage.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-parallel-review.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-parallel-review.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-pr-match-truth.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-pr-match-truth.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-pr-tracker-linking.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-pr-tracker-linking.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-preflight.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-preflight.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-pretrust.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-pretrust.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-prompt-order.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-prompt-order.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-quick-tab-register.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-quick-tab-register.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-read-project-config.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-read-project-config.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-reconcile-backend-gate.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-reconcile-backend-gate.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-refix-wake.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-refix-wake.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-report-repo-guard.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-report-repo-guard.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-review-escalation.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-escalation.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-review-pin-dispatch-sha.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-pin-dispatch-sha.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-review-sever-protect.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-sever-protect.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-review-verdict-integrity.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-verdict-integrity.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-review-verdict-path-quote.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-verdict-path-quote.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-review-visibility.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-review-visibility.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-risk-scoped-prpr-review.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-risk-scoped-prpr-review.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-risk-tiered-review.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-risk-tiered-review.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-sandbox-limit-resume.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-limit-resume.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sandbox-multiseat.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-multiseat.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-sandbox-real-panes.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-real-panes.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sandbox-real-remote.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-real-remote.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sandbox-resolver-respawn.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-resolver-respawn.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sandbox-shared-config.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-shared-config.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sandbox-sim.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sandbox-sim.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-scoped-builder-verification.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-scoped-builder-verification.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-scribe-backend-flip.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-scribe-backend-flip.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-scribe-intent-dispatch.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-scribe-intent-dispatch.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-scribe-linger.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-scribe-linger.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-spawn-queue-drain.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-spawn-queue-drain.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-spawn-rate-match.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-spawn-rate-match.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-stack-aware-init.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-stack-aware-init.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-stale-resolve-tab-sweep.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-stale-resolve-tab-sweep.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-stall-detector.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-stall-detector.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-startup-reap-sweep.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-startup-reap-sweep.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-stat-uutils-detection.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-stat-uutils-detection.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-stats.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-stats.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-status-driver-seam.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-status-driver-seam.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-status.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-status.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-steps-hold-supersession.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-steps-hold-supersession.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-structured-block-verdict.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-structured-block-verdict.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-sweep-registry-tally.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-sweep-registry-tally.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-symbol-index-autorefresh.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-symbol-index-autorefresh.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-symbol-index.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-symbol-index.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-tab-leak-scope.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-tab-leak-scope.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-tab-teardown.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-tab-teardown.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-task-spec-pane.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-task-spec-pane.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-team-mode.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-team-mode.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-test-wiring.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-test-wiring.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-theme-cmd.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-theme-cmd.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-theme.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-theme.sh"
+  [ "$status" -eq 0 ]
+}
+
+
+@test "hermetic test-tracker-state-sweep.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-tracker-state-sweep.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-upgrade-config-adoption.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-upgrade-config-adoption.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-upgrade-migrations.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-upgrade-migrations.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-utf8-control-room.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-utf8-control-room.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-watcher-checks.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-watcher-checks.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-watcher-claude-hang.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-watcher-claude-hang.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-watcher-singleton.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-watcher-singleton.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-watcher-views.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-watcher-views.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-workspace-pin.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-workspace-pin.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-worktree-born-stat.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-worktree-born-stat.sh"
+  [ "$status" -eq 0 ]
+}
