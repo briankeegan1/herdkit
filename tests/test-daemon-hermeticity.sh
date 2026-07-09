@@ -37,7 +37,7 @@ ok(){ pass=$((pass+1)); }
 hermetic_sandbox() {
   local dir="$1" log="$2" c
   mkdir -p "$dir/bin"; : > "$log"
-  for c in herdr claude codex; do
+  for c in herdr claude codex osascript notify-send; do
     { printf '#!/usr/bin/env bash\n'
       printf 'printf '\''%%s\\t%%s\\t%%s\\n'\'' "${HERMETIC_TEST:-suite}" "%s" "$*" >> "%s"\n' "$c" "$log"
       case "$c" in herdr) printf 'echo '\''{}'\''\n' ;; claude) printf 'echo '\''claude 0.0.0'\''\n' ;; esac
@@ -124,5 +124,42 @@ ok; echo "PASS (B2) a test that spawns a real watcher daemon is caught"
 : > "$LOG"; run_under_sandbox "$T/good.sh" || fail "(B3) the hermetic fake test should exit 0"
 [ -s "$LOG" ] && fail "(B3) a properly-stubbed hermetic test tripped the guard: $(cat "$LOG")"
 ok; echo "PASS (B3) a properly-stubbed test shadows the tripwire and stays clean (no false positive)"
+
+# ── (B4) DESKTOP SURFACE: a test that delivers a REAL notification is caught (HERD-173) ───────────
+# The headless driver's notify seam fires a best-effort native osascript/notify-send. A test that
+# exercises an escalation path (dead agent, refix stalled, MAIN RED) therefore pops a REAL macOS
+# notification built from FIXTURE data — cry-wolf, and the same class of production-surface leak as
+# touching the live control room. The guard must catch it; sim-notify-stub.sh is how a test opts out.
+: > "$LOG"
+LEAKY_NOTIFY="$T/leaky-notify.sh"
+cat > "$LEAKY_NOTIFY" <<'LEAK'
+#!/usr/bin/env bash
+osascript -e 'display notification "PR #58 ... session unwakeable" with title "refix stalled"' >/dev/null 2>&1 || true
+exit 0
+LEAK
+chmod +x "$LEAKY_NOTIFY"
+PATH="$SB/bin:$PATH" HERD_HERMETIC_GUARD="$LOG" HERMETIC_TEST="leaky-notify.sh" bash "$LEAKY_NOTIFY" >/dev/null 2>&1 || true
+grep -q 'osascript' "$LOG" || fail "(B4) a test delivering a desktop notification must be caught by the guard"
+ok; echo "PASS (B4) a test that fires a REAL desktop notification is caught"
+
+# ── (B5) …and a test that installs the HERD-139 notify stub stays clean (no false positive) ────────
+: > "$LOG"
+STUBBED_NOTIFY="$T/stubbed-notify.sh"
+cat > "$STUBBED_NOTIFY" <<LEAK
+#!/usr/bin/env bash
+set -e
+. "$HERE/../scripts/herd/sim/sim-notify-stub.sh"
+sim_notify_install "\$(mktemp -d)"
+osascript -e 'display notification "captured, never delivered"' >/dev/null 2>&1 || true
+printf 'ran\n' > "$T/b5-ran"
+exit 0
+LEAK
+chmod +x "$STUBBED_NOTIFY"
+rm -f "$T/b5-ran"
+PATH="$SB/bin:$PATH" HERD_HERMETIC_GUARD="$LOG" HERMETIC_TEST="stubbed-notify.sh" bash "$STUBBED_NOTIFY" >/dev/null 2>&1 || true
+# The fixture must actually RUN and reach osascript — otherwise a clean log proves nothing (vacuous).
+[ -f "$T/b5-ran" ] || fail "(B5) the notify-stubbed fixture never ran — the assertion would be vacuous"
+[ -s "$LOG" ] && fail "(B5) a properly notify-stubbed test must not trip the guard (log: $(cat "$LOG"))"
+ok; echo "PASS (B5) a notify-stubbed test shadows the tripwire and stays clean"
 
 echo "ALL PASS ($pass checks)"

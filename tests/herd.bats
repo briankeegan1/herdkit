@@ -283,6 +283,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic healthcheck-autofix + row-truth test passes" {
+  run bash "$REPO/tests/test-health-autofix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
   run bash "$REPO/tests/test-agent-liveness.sh"
   [ "$status" -eq 0 ]
@@ -406,6 +412,12 @@ setup() {
 
 @test "hermetic connector seams edges (HERD-170) test passes" {
   run bash "$REPO/tests/test-connector-seams.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic engine version handshake + ENGINE_AUTOUPDATE (HERD-179) test passes" {
+  run bash "$REPO/tests/test-engine-handshake.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

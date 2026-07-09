@@ -293,6 +293,24 @@ esac
 # off. Defaulted here so the mechanism + CLI see it under `set -u`.
 : "${AGENT_UPDATE:="off"}"
 
+# ENGINE_MIN — the ENGINE VERSION HANDSHAKE floor (HERD-179): the minimum herdkit ENGINE LEVEL this
+# project requires. Committed in .herd/config and stamped MONOTONICALLY by `herd upgrade` to the level
+# of the engine that ran it. An engine BELOW this floor is STALE: every write path (lane spawn
+# preflight, herd-claim, scribe-step apply, `herd backend switch`) refuses with the remedy `run herd
+# update`, reads warn only, and HERD_ENGINE_SKIP_HANDSHAKE=1 is a journaled escape hatch. Default 0 ⇒
+# no floor ⇒ the handshake is inert and behavior is byte-identical to before it existed. The mechanism
+# lives in scripts/herd/engine-version.sh (which also carries the engine's own level constant).
+: "${ENGINE_MIN:="0"}"
+
+# ENGINE_AUTOUPDATE — what the engine DOES about a stale local checkout (HERD-179): off (default) |
+# check | auto. off runs nothing beyond the always-advisory `herd doctor` row. check paints one quiet
+# "engine outdated" note on the watcher console and calls it out in the doctor. auto additionally has
+# the watcher dispatch `herd update` in a QUIESCENT window — reusing that command's own refusal when
+# builders are mid-flight or the engine checkout is dirty, rate-limited by a cooldown so a persistent
+# refusal never hammers the remote. Any other value is off. Defaulted here so every path sees it
+# under `set -u`.
+: "${ENGINE_AUTOUPDATE:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)
@@ -512,6 +530,7 @@ fi
 : "${GATE_DISPATCH:="serial"}"   # serial (default) | parallel — see capabilities.tsv / agent-watch.sh
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per PR; further BLOCKs escalate to needs-you
+: "${HEALTHCHECK_AUTOFIX:="false"}"  # HERD-173: auto-bounce a reproduced healthcheck CODE ERROR to the builder agent, on the same rails as REVIEW_AUTOFIX — true | false (default false). true → the watcher delivers the failing test + the tailable suite log to the builder's agent pane, once per (pr,sha), sharing ONE per-PR round budget with the review refix (REFIX_MAX_ROUNDS counts both kinds together); the same limit-parked / dead-agent preflights apply, and the cap escalates to a needs-you row. A tab-leak-guard trip is infra, never bounced. false (default) → no bounce, no ledger write, no re-task prompt: the gate decision is unchanged and the red row still holds the PR. Consumed by agent-watch.sh
 : "${CODEMAP_AUTOREFRESH:="true"}"  # after a PR merges, the watcher regenerates docs/codemap.md and commits it direct to the default branch (deterministic, LLM-free); off → the watcher never touches the codemap
 : "${MAIN_HEALTH_TICK:="off"}"   # HERD-129: after a PR merges, run the healthcheck against the freshly ff'd default-branch HEAD to catch a RED main AT MERGE TIME (two independently-green PRs merging into a broken combination). on → a loud persistent 'MAIN RED' alarm row + notification, cleared when a later sha goes green. ALARM only — never gates/reverts/re-merges. off (default) → byte-inert: no suite, no journal, no row
 : "${STALE_DUP_DETECT:="on"}"    # HERD-188: pre-merge STALE-DUPLICATE gate — on (default) | off. on → the watcher HOLDS (never auto-merges) a PR whose tracked item ref is already Done via another merged PR, or whose touched files were materially changed on the base branch by a merge the branch predates (a stale base). Provable-only + fail-soft (no ref / offline / bad worktree → no hold), so default-on never false-holds a legit PR. off → byte-inert. Consumed by agent-watch.sh via stale-dup-gate.sh
