@@ -262,6 +262,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.
 # STALE_BASE_AUTOFIX="off"  # off (default) | on
 
+# CI auto-repair for inherited reds (HERD-250) — on | off (default off, ship-dormant). on → when a PR
+# is MERGEABLE but UNSTABLE with a FAILING required CI check, herd/gates already PASSED for the head
+# sha, AND the branch is BEHIND DEFAULT_BRANCH, the watcher dispatches a base-refresh (merge
+# $DEFAULT_BRANCH — same mechanical heal as STALE_BASE_AUTOFIX, but keyed on CI-red+behind-base, not
+# touched-file overlap). Sha-keyed once-guard kind=ci, the CI rail's own REFIX_MAX_ROUNDS budget,
+# honest `ci-repair · awaiting push` row. NEVER silently merges a red PR: a REAL new-code CI failure
+# (failing CI on an up-to-date branch, or without a gates blessing) stays needs-you. off (default) →
+# byte-identical to the pre-HERD-250 UNSTABLE-fail path. Watcher-affecting.
+# CI_AUTOREPAIR="off"       # off (default) | on
+
 # merge fairness / ready-PR priority (HERD-231) — on | off (default off, ship-dormant). on → in the
 # watcher's action pass, a candidate whose gates are ALREADY green for its head sha (cached CLEAN/FLAKY
 # healthcheck + review PASS, or a human-overridden BLOCK) is visited BEFORE any candidate that still
