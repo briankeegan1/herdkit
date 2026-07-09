@@ -256,8 +256,10 @@ TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
   # Headless: launch a DETACHED background agent (no herdr pane) into the registry. Fail-loud so a
-  # spawn that cannot start does not masquerade as success (mirrors the herdr bail above).
-  if ! herd_driver_start_agent "$SLUG" "$DIR" "$MODEL" "$CLAUDE_FLAGS" "$POINTER"; then
+  # spawn that cannot start does not masquerade as success (mirrors the herdr bail above). Pass the RAW
+  # ref ($_MODEL_REF, not the pre-resolved bare $MODEL): the positional shim resolves the (driver,model)
+  # ONCE — re-resolving an already-bare model would mis-split a colon-bearing tag (e.g. 'llama3:8b').
+  if ! herd_driver_start_agent "$SLUG" "$DIR" "$_MODEL_REF" "$CLAUDE_FLAGS" "$POINTER"; then
     echo "❌ headless: could not start a detached agent for '$SLUG'; worktree is ready at $DIR." >&2
     exit 1
   fi

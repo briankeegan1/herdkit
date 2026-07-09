@@ -127,4 +127,31 @@ emit(){ for a in "$@"; do printf '[%s]\n' "$a"; done; }
 ) || fail "end-to-end lane-seam spawn checks failed (see FAIL above)"
 ok; echo "PASS (3) lane seam emits the P2-composed spawn command (bare=byte-identical, qualified=foreign runtime)"
 
+# ── 4. driver= branch does NOT re-resolve a bare model — the colon-bearing regression the review caught. ─
+# When the caller supplies driver=<name> the model is BARE BY CONTRACT; re-feeding it to the resolver
+# mis-splits any colon-bearing model. Two failure modes the fix must prevent:
+#   • ABORT — a bare 'llama3:8b' (from a resolved 'headless:llama3:8b') re-parsed as driver 'llama3'
+#     (unknown) → the whole spawn aborts. It must instead spawn with model 'llama3:8b' INTACT.
+#   • SILENT CORRUPTION — a bare 'headless:opus' re-parsed as driver 'headless' → model silently
+#     rewritten to 'opus'. The model must reach the runtime UNCHANGED.
+( set +e
+  export HERD_DRIVER="herdr-claude" HERD_DRIVERS_DIR="$DD" PATH="$BIN:$PATH"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  # (a) colon-bearing bare model through driver= — must NOT abort and must carry 'llama3:8b' intact.
+  out="$(herd_driver_launch_agent name=b workspace=ws cwd=/d tab=t driver=headless \
+           model=llama3:8b flags=--dangerously-skip-permissions pointer=PTR)"; rc=$?
+  [ "$rc" -eq 0 ] || { echo "FAIL: driver= branch ABORTED on a colon-bearing bare model (re-resolution bug)"; exit 1; }
+  case "$out" in *'[--model]'*'[llama3:8b]'*) : ;; *) echo "FAIL: colon-bearing model not carried intact:"; printf '%s\n' "$out"; exit 1 ;; esac
+  # (b) a bare model that LOOKS like '<known-driver>:<x>' must NOT be silently rewritten by re-resolution.
+  out="$(herd_driver_launch_agent name=b workspace=ws cwd=/d tab=t driver=herdr-claude \
+           model=headless:opus flags=--dangerously-skip-permissions pointer=PTR)"; rc=$?
+  [ "$rc" -eq 0 ] || { echo "FAIL: driver= branch aborted on a colon-bearing bare model"; exit 1; }
+  case "$out" in *'[--model]'*'[headless:opus]'*) : ;; *) echo "FAIL: bare model SILENTLY rewritten (expected headless:opus intact):"; printf '%s\n' "$out"; exit 1 ;; esac
+  # The corruption case would emit '[opus]' as the model token instead — assert that did NOT happen.
+  case "$out" in *'[--model]'$'\n''[opus]'*) echo "FAIL: model corrupted headless:opus → opus"; printf '%s\n' "$out"; exit 1 ;; esac
+  exit 0
+) || fail "driver= no-re-resolve checks failed (see FAIL above)"
+ok; echo "PASS (4) driver= branch does NOT re-resolve a bare model (no abort / no silent rewrite on colons)"
+
 echo "ALL PASS ($pass checks)"

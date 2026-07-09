@@ -826,13 +826,19 @@ herd_driver_launch_agent() {
   # Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER *and* bare model,
   # once, before either backend builds its argv (HERD-150 P2). Making the resolved driver REAL — not
   # discarded — is the point: it selects which runtime's DRIVER_AGENT_INTERACTIVE_SPAWN binding composes
-  # the `-- <runtime …>` argv below. A caller that already resolved (the builder lanes, which resolve
-  # BEFORE creating a tab so a bad ref fails fast) passes driver=<name>; then only the (idempotent) model
-  # bare-ification runs. Loud-fails on an unknown driver prefix; byte-identical for a bare value (incl.
-  # the empty model the human seats / coordinator relaunch pass → no --model).
-  if [ -n "$sa_driver" ]; then
-    sa_model="$(herd_model_for_spawn "$sa_model")" || return 1
-  else
+  # the `-- <runtime …>` argv below.
+  #
+  # TWO CONTRACTS, resolve EXACTLY ONCE:
+  #   • driver=<name> supplied → the caller ALREADY resolved (the builder lanes, which resolve BEFORE
+  #     creating a tab so a bad ref fails fast). sa_model is BARE BY CONTRACT — do NOT re-resolve it.
+  #     A bare model may LEGITIMATELY carry colons (an ollama-style 'llama3:8b' tag; a role model literally
+  #     named 'headless:opus'); re-feeding it to herd_model_for_spawn would mis-split on the first colon —
+  #     ABORTING on an unknown driver ('llama3'), or SILENTLY rewriting the model (headless:opus → opus).
+  #     herd_model_for_spawn / herd_model_resolve are for an UNRESOLVED ref ONLY.
+  #   • no driver= → sa_model is a raw (possibly qualified) ref; resolve it here (the human-seat / drainer
+  #     lanes). Loud-fails on an unknown driver prefix; byte-identical for a bare value (incl. the empty
+  #     model the human seats / coordinator relaunch pass → no --model).
+  if [ -z "$sa_driver" ]; then
     local _res; _res="$(herd_model_resolve "$sa_model")" || return 1
     sa_driver="${_res%%$'\t'*}"; sa_model="${_res#*$'\t'}"
   fi
