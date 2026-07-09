@@ -599,6 +599,35 @@ build_main_health() {
   MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(since #${_bm_since})${C_RESET}"$'\n'
 }
 
+# build_main_freshness — the MAIN-checkout freshness rows (HERD-233), both read from state files the
+# tick reconcile writes: (1) a LOUD row while $MAIN diverged in a way only a human can resolve, and
+# (2) a "restart recommended" note when a fast-forward pulled engine code this watcher process is no
+# longer running. Both files are absent on the happy path, so a fresh $MAIN renders NOTHING and the
+# console stays byte-identical to before this feature.
+build_main_freshness() {
+  MAIN_FRESHNESS=""
+  local _bf_reason _bf_b _bf_a _bf_up _bf_why _bf_delta
+  [ -s "${MAIN_FRESH_STATE:-}" ] || [ -s "${MAIN_FRESH_RESTART:-}" ] || return 0
+  _bf_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  if [ -s "${MAIN_FRESH_STATE:-}" ]; then
+    read -r _bf_reason _bf_b _bf_a < "$MAIN_FRESH_STATE" 2>/dev/null || return 0
+    case "${_bf_reason:-}" in
+      dirty-tree)    _bf_why="uncommitted changes in the checkout · commit or stash them" ;;
+      local-commits) _bf_why="local commits nobody generated · rebase or push them by hand" ;;
+      ff-failed)     _bf_why="fast-forward refused · resolve in ${MAIN}" ;;
+      rebase-failed) _bf_why="rebase of the generated-map commits refused · resolve in ${MAIN}" ;;
+      push-failed)   _bf_why="push of the generated-map commits refused · retrying each tick" ;;
+      *)             _bf_why="${_bf_reason:-unknown}" ;;
+    esac
+    _bf_delta="behind ${_bf_up} by ${_bf_b:-?}"
+    [ "${_bf_a:-0}" = 0 ] || _bf_delta="${_bf_delta}, ahead by ${_bf_a}"
+    MAIN_FRESHNESS="    ${C_RED}⚠️${C_RESET}  ${C_BOLD}MAIN STALE${C_RESET}${C_RED} — ${_bf_delta} · ${_bf_why}${C_RESET}"$'\n'
+  fi
+  if [ -s "${MAIN_FRESH_RESTART:-}" ]; then
+    MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}main pulled new engine code — this watcher still runs the old one · restart recommended (\`herd reload\`)${C_RESET}"$'\n'
+  fi
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -1034,8 +1063,10 @@ render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
   # Post-merge main-health ALARM (HERD-129) — pinned at the TOP so a red default branch is the first
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
-  if [ -n "${MAIN_HEALTH:-}" ]; then
-    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH}"$'\n'
+  # MAIN-freshness (HERD-233) shares that section: a diverged/held checkout, and the restart note
+  # after a pull carried new engine code. Both empty on the happy path.
+  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}"$'\n'
   fi
   # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
   # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
@@ -3059,6 +3090,157 @@ refresh_symbol_index() {
   return 0
 }
 
+# ── Tick-level MAIN-checkout freshness reconcile (HERD-233) ───────────────────────────────────────
+# Multi-seat doctrine Rule 1: the freshness of the $MAIN checkout is a RECONCILED INVARIANT, not a
+# do_merge side-effect. do_merge fast-forwards $MAIN after THIS seat's merge; nothing did so when
+# another seat (or the gh UI) merged — $MAIN drifted 22 commits behind while this watcher went on
+# running the stale engine code it loads from there. Worse, a generated-map refresh whose push was
+# rejected (`pushed no`) left $MAIN DIVERGED with no retry path, and a human had to rebase by hand.
+#
+# This reconcile owns both, once per tick, INDEPENDENT of the CODEMAP_AUTOREFRESH lever (the HERD-218
+# map reconcile's ff-pull rode that lever, so maps-off meant no freshness reconcile at all):
+#   • strictly BEHIND + clean tree            → fast-forward, journal `main_ff`
+#   • DIVERGED/AHEAD, and every local-only commit touches ONLY the generated maps (docs/codemap.md,
+#     docs/symbol-index.md — the `pushed=no` corpse) → rebase onto origin + push, journal `main_heal`
+#   • anything else (dirty tree, a local commit a human wrote, a failed ff/rebase/push) → a LOUD
+#     console row + one `main_freshness result held` journal line. NEVER guess, never force, never
+#     reset a commit we did not generate.
+#
+# HARD INVARIANTS:
+#   • Already fresh (0 ahead, 0 behind) → byte-inert: no journal, no state file, no console row.
+#   • A fetch failure never blocks the tick (offline / gh outage → silent, retried next tick).
+#   • Held reasons journal ONCE per transition (the row persists; the journal does not spam).
+#   • The watcher executes the engine code it loaded at startup, so a pull that carries a new
+#     agent-watch.sh leaves a "restart recommended" note — cleared at the next watcher startup.
+
+MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALABLE: "<reason> <behind> <ahead>"
+MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
+
+# _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
+# MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
+_watch_gate_inflight() {
+  local f
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _marker_live "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# _main_fresh_clear — back to fresh: drop the held row (the journal already recorded the transition).
+_main_fresh_clear() { rm -f "$MAIN_FRESH_STATE" 2>/dev/null || true; }
+
+# _main_fresh_hold <reason> <behind> <ahead> — surface an unhealable divergence: persist the row and
+# journal it ONCE (a reason that has not changed since the last tick paints, but does not re-journal).
+_main_fresh_hold() {
+  local _mh_reason="$1" _mh_b="$2" _mh_a="$3" _mh_line _mh_prev
+  _mh_line="$_mh_reason $_mh_b $_mh_a"
+  _mh_prev="$(cat "$MAIN_FRESH_STATE" 2>/dev/null || true)"
+  mkdir -p "$TREES" 2>/dev/null || true
+  printf '%s\n' "$_mh_line" > "$MAIN_FRESH_STATE" 2>/dev/null || true
+  [ "$_mh_prev" = "$_mh_line" ] && return 0
+  journal_append main_freshness result held reason "$_mh_reason" behind "$_mh_b" ahead "$_mh_a"
+  return 0
+}
+
+# _main_fresh_generated_only <upstream-ref> — success iff the local-only commits (merge-base..HEAD)
+# touch NOTHING but the engine's own regenerable maps. A git failure returns 1 (never guess); an
+# empty delta returns 0 (a rebase can lose nothing). This is the ONLY gate on the auto-heal path.
+_main_fresh_generated_only() {
+  local _mg_out
+  _mg_out="$(git -C "$MAIN" diff --name-only "${1}...HEAD" 2>/dev/null)" || return 1
+  [ -n "$_mg_out" ] || return 0
+  printf '%s\n' "$_mg_out" | grep -qvxE 'docs/(codemap|symbol-index)\.md' && return 1
+  return 0
+}
+
+# _main_fresh_note_restart <old-sha> <new-sha> — success (and leave a note) iff the pulled delta
+# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds.
+_main_fresh_note_restart() {
+  git -C "$MAIN" diff --name-only "$1" "$2" 2>/dev/null \
+    | grep -qx 'scripts/herd/agent-watch.sh' || return 1
+  mkdir -p "$TREES" 2>/dev/null || true
+  printf '%s\n' "$2" > "$MAIN_FRESH_RESTART" 2>/dev/null || true
+  return 0
+}
+
+# reconcile_main_freshness — the HERD-233 tick-level invariant. Call once per watcher tick, before
+# the map reconcile (so the maps are probed against a fresh HEAD). Safe to call repeatedly.
+reconcile_main_freshness() {
+  local _mf_up _mf_head _mf_new _mf_counts _mf_ahead _mf_behind _mf_dirty _mf_restart=no
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
+    || return 0
+  # A live gate owns the tree this tick — defer silently; the next tick reconciles.
+  _watch_gate_inflight && return 0
+
+  _mf_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  # Fail-soft: a fetch failure NEVER blocks the tick and never alarms (offline, or a gh/network blip
+  # the gates already surface). The comparison below is only honest against a fetched ref, so bail.
+  git -C "$MAIN" fetch --quiet "${HERD_REMOTE:-origin}" "${HERD_BRANCH_NAME:-main}" >/dev/null 2>&1 \
+    || return 0
+  git -C "$MAIN" rev-parse --verify --quiet "$_mf_up" >/dev/null 2>&1 || return 0
+  _mf_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_mf_head" ] || return 0
+
+  # "<ahead>\t<behind>" — commits only on HEAD, commits only on the remote branch.
+  _mf_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mf_up" 2>/dev/null || true)"
+  _mf_ahead="$(printf '%s' "$_mf_counts" | awk '{print $1}')"
+  _mf_behind="$(printf '%s' "$_mf_counts" | awk '{print $2}')"
+  case "${_mf_ahead:-x}${_mf_behind:-x}" in ''|*[!0-9]*) return 0 ;; esac
+
+  # FRESH → byte-inert.
+  if [ "$_mf_ahead" -eq 0 ] && [ "$_mf_behind" -eq 0 ]; then
+    _main_fresh_clear; return 0
+  fi
+
+  # A dirty tree means a human (or a concurrent writer) owns $MAIN: never pull over their work.
+  # Regenerable derived files are excused from the same ONE list every reaper/gate uses.
+  _mf_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  if [ -n "$_mf_dirty" ]; then
+    _main_fresh_hold dirty-tree "$_mf_behind" "$_mf_ahead"; return 0
+  fi
+
+  # Strictly BEHIND + clean → fast-forward. The one healing path the watcher takes unprompted.
+  if [ "$_mf_ahead" -eq 0 ]; then
+    if git -C "$MAIN" merge --ff-only --quiet "$_mf_up" >/dev/null 2>&1; then
+      _mf_new="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+      _main_fresh_note_restart "$_mf_head" "$_mf_new" && _mf_restart=yes
+      journal_append main_ff behind "$_mf_behind" from "$_mf_head" to "$_mf_new" restart "$_mf_restart"
+      _main_fresh_clear
+    else
+      _main_fresh_hold ff-failed "$_mf_behind" 0
+    fi
+    return 0
+  fi
+
+  # AHEAD (diverged, or the unpushed `pushed=no` corpse): heal ONLY when every local commit is one
+  # of our own regenerable map refreshes. Anything a human wrote is held, never rebased behind their back.
+  if ! _main_fresh_generated_only "$_mf_up"; then
+    _main_fresh_hold local-commits "$_mf_behind" "$_mf_ahead"; return 0
+  fi
+  if [ "$_mf_behind" -gt 0 ]; then
+    if ! git -C "$MAIN" rebase --quiet "$_mf_up" >/dev/null 2>&1; then
+      git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+      _main_fresh_hold rebase-failed "$_mf_behind" "$_mf_ahead"; return 0
+    fi
+  fi
+  if git -C "$MAIN" push --quiet "${HERD_REMOTE:-origin}" "${HERD_BRANCH_NAME:-main}" >/dev/null 2>&1; then
+    _mf_new="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+    _main_fresh_note_restart "$_mf_head" "$_mf_new" && _mf_restart=yes
+    journal_append main_heal ahead "$_mf_ahead" behind "$_mf_behind" result pushed restart "$_mf_restart"
+    _main_fresh_clear
+  else
+    # The push lost a race (or the remote refused): hold, and retry from scratch next tick — the
+    # divergence is still generated-only, so the next reconcile re-rebases and re-pushes.
+    _main_fresh_hold push-failed "$_mf_behind" "$_mf_ahead"
+  fi
+  return 0
+}
+
 # ── Tick-level map-freshness reconcile (HERD-218) ─────────────────────────────────────────────────
 # Multi-seat doctrine Rule 1: map freshness is a RECONCILED INVARIANT, not a do_merge side-effect.
 # refresh_codemap / refresh_symbol_index still fire on THIS seat's merges (fast path). When another
@@ -3078,11 +3260,7 @@ refresh_symbol_index() {
 # _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted change,
 # so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
 _map_reconcile_mid_op() {
-  local f
-  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
-    [ -e "$f" ] || continue
-    _marker_live "$f" 2>/dev/null && return 0
-  done
+  _watch_gate_inflight && return 0
   # Any dirty path on $MAIN → a concurrent writer (or a partial write) owns the tree this tick.
   [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ] && return 0
   return 1
@@ -7132,6 +7310,11 @@ _INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans
 # stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
 _startup_reap_sweep
 
+# One-shot at STARTUP: this process just loaded the engine code that is on disk NOW, so any pending
+# "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
+# restart that got us here. Drop it, or the row would outlive the condition it warns about.
+rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
+
 # One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
 # or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
 # panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
@@ -7162,6 +7345,7 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  build_main_freshness
   build_sweep_note
 
   # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
@@ -7823,6 +8007,11 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   # read-only --check seams and repair ONCE with provenance=reconcile. Byte-inert when
   # CODEMAP_AUTOREFRESH=off; zero commits when maps already fresh; skips mid-op (live gate / dirty
   # MAIN). The do_merge refresh_* path remains the local-merge fast path.
+  #
+  # MAIN-checkout freshness (HERD-233) runs FIRST so the map probe sees a fresh HEAD: ff when behind,
+  # heal an unpushed/diverged generated-map commit, hold loudly on anything else. Rides the tick (no
+  # config key), independent of CODEMAP_AUTOREFRESH, byte-inert when $MAIN is already current.
+  reconcile_main_freshness
   reconcile_map_freshness
 
   # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
