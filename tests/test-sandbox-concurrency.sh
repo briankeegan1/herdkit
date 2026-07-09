@@ -142,6 +142,16 @@ echo "PASS (h) flair pack: off byte-identical, on adds pasture header, dead rows
 [ "$(cp_status "$SCARD" watcher_singleton_adopts_stale)" = "pass" ]       || fail "(i) watcher_singleton_adopts_stale not pass (a stale lock must be adopted)"
 echo "PASS (i) watcher singleton: live lock → refuse (no duplicate), stale lock → adopt"
 
+# ── (j) MAIN-HEALTH INVARIANT (HERD-222) — cross-seat dispatch + a killed suite re-dispatches ────
+# The scenario drives the SHIPPED reconcile_main_health against a throwaway $MAIN. Lock in that an
+# other-seat merge (HEAD moved, no do_merge on this seat) dispatched the suite within ONE tick, and that
+# a worker killed mid-suite left its sha RE-DISPATCHABLE rather than stranded without a verdict.
+[ "$(sc "$SCARD" main_health_tested)" = "True" ]                        || fail "(j) main_health_tested flag not set"
+[ "$(sc "$SCARD" main_health_ok)" = "True" ]                            || fail "(j) main_health_ok should be true"
+[ "$(cp_status "$SCARD" main_health_observed_dispatch)" = "pass" ]      || fail "(j) main_health_observed_dispatch not pass (a cross-seat merge must dispatch within one tick)"
+[ "$(cp_status "$SCARD" main_health_kill_redispatch)" = "pass" ]        || fail "(j) main_health_kill_redispatch not pass (a killed suite must leave a re-dispatchable sha)"
+echo "PASS (j) main-health invariant: other-seat merge dispatches within one tick; killed suite re-dispatches"
+
 # ── (f) HERMETIC — nothing leaked into the real repo tree ────────────────────────
 # The scenario writes only under its --artifacts dir. Compare against the baseline captured before
 # any run: no NEW working-tree entry may appear because of the scenario.

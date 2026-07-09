@@ -76,6 +76,7 @@ herd sweep	unit	tests/test-sweep.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
 herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
 herd changelog [generate|tag <ver>]	unit	tests/test-changelog.sh
+herd triage [run|report]	unit	tests/test-oss-triage.sh
 herd backlog	unit	tests/test-cli-backlog.sh
 herd backend switch	unit	tests/test-cli-backend-switch.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
@@ -119,6 +120,8 @@ coordinator.sh	unit	tests/test-model-flags.sh
 coordinator.sh	unit	tests/test-utf8-control-room.sh
 research.sh	none-yet	unit: no test invokes research.sh; test-research-step.sh drives research-step.sh, never research.sh's enqueue/REQ_ID
 research-get.sh	unit	tests/test-research-step.sh
+oss-triage.sh	unit	tests/test-oss-triage.sh
+OSS_TRIAGE	unit	tests/test-oss-triage.sh
 scribe.sh	unit	tests/test-scribe-linger.sh
 scribe.sh	unit	tests/test-scribe-intent-dispatch.sh
 scribe.sh	unit	tests/test-scribe-backend-flip.sh
@@ -240,6 +243,10 @@ HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-reconcile.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
+MAIN_HEALTH_TICK	unit	tests/test-main-health-invariant.sh
+MAIN_HEALTH_TICK	sim	tests/test-sandbox-concurrency.sh
+MAIN_HEALTH_RECHECK_MINS	unit	tests/test-main-health-invariant.sh
+MAIN_HEALTH_AUTOFIX	unit	tests/test-main-health-invariant.sh
 SWEEP_AUTO	unit	tests/test-sweep.sh
 WATCHER_FLAIR	unit	tests/test-watcher-flair.sh
 OPERATOR_INBOX	unit	tests/test-operator-inbox.sh
