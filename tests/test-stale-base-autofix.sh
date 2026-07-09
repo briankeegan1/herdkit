@@ -87,6 +87,7 @@ _wait_agent_working() {
 }
 _agent_liveness() { printf '%s' "${STUB_LIVENESS:-alive}"; }
 _resolver_agent_alive() { [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }
+_resolver_in_flight() { [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }
 _detect_limit_hit() { return 1; }
 
 # Capture spawn_resolver calls instead of launching real resolvers.
@@ -281,5 +282,24 @@ export STUB_RESOLVER_ALIVE=0
 _handle_stale_dup 95 slug-a shaM 0 "$WT" feat/a stale-base "$REASON"
 row | grep -q 'needs you' || fail "(12) dead resolver must escalate (got: $(row))"
 ok "(12) resolver liveness consulted before claiming progress"
+
+# ── (13) WORKING builder → heal deferred, never a resolver into the live worktree (round-7) ────
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=working STUB_LIVENESS=alive STUB_RESOLVER_ALIVE=0
+_handle_stale_dup 100 slug-a shaN 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "0" ] || fail "(13) working builder must not be bounced"
+[ "$(rslv)" = "0" ] || fail "(13) working builder must NEVER get a resolver in its worktree"
+refix_attempted 100 shaN stale && fail "(13) once-guard must NOT be burned on defer"
+row | grep -q 'builder busy' || fail "(13) row must read deferred (got: $(row))"
+ok "(13) working builder defers the heal (no two-agents-one-worktree)"
+
+# ── (14) resolver already in flight → no second dispatch ──────────────────────────────────────
+reset_state
+export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle STUB_LIVENESS=missing STUB_RESOLVER_ALIVE=1
+export STUB_AGENT_EMPTY=1
+_handle_stale_dup 110 slug-a shaP 0 "$WT" feat/a stale-base "$REASON"
+[ "$(rslv)" = "0" ] || fail "(14) in-flight resolver must not be doubled (got $(rslv) spawns)"
+unset STUB_AGENT_EMPTY
+ok "(14) resolver single-flight respected"
 
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"
