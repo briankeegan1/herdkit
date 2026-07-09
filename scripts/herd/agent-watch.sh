@@ -614,6 +614,11 @@ _fmt_age() {
 #   • awaiting task · assign or retire   — YOUR move; a live spare builder finished/never-tasked, no PR.
 #                                          Carries the idle age so a just-freed spare (0s) reads apart
 #                                          from a forgotten one (2h, reap it). Calm — benign, not an alarm.
+#                                          RESERVED (HERD-164) for a genuinely UNASSIGNED, pre-PR builder:
+#                                          a merged/closed slug is 'retiring…', never a spare.
+#   • retiring… · <leftovers> · <age>    — the HERD's move; a merged/closed slug whose teardown is
+#                                          converging this tick (see retirement.sh). Calm — it clears
+#                                          itself, usually within one tick.
 #   • parked · <cause> · retry <eta>     — the HERD's move; auto-recovering on its own (a limit-hit
 #                                          auto-resume names its reset ETA; see _handle_limit_blocked).
 #   • needs-you · <blocker> · <remedy>   — YOUR move; a red hold that will NOT clear itself (dead
@@ -633,6 +638,52 @@ _row_awaiting_task() {
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_retirement <slug-cell> <slug> <state> <detail> — the console row for a slug the retirement
+# invariant (HERD-164, retirement.sh) is reconciling. Three states, three owners:
+#
+#   retiring  the HERD's move — teardown is converging; <detail> is the comma-joined leftover kinds
+#             (worktree,tab,agent,branch,ledger). CALM (dim ♻️): it clears itself, and a single
+#             non-converged tick is normal (a herdr tab close is a round-trip). Carries the age it has
+#             been converging so a wedged one is legible before it even turns red.
+#   stuck     YOUR move — teardown has failed _RETIRE_STUCK_TICKS ticks running. RED, and it NAMES the
+#             blocker (the first leftover kind that would not die) plus the remedy.
+#   held      YOUR move — the slug is terminal but carries REAL WORK (uncommitted tracked files, or
+#             commits that exist nowhere else). RED, with the evidence verbatim. Retirement will not
+#             touch it, this tick or ever, until a human commits or discards.
+#
+# Never renders the banned 'idle' word, and never renders 'awaiting task' — a merged builder is not a
+# spare. Pure formatter (age is read from the escalation state), so the unit test can pin its bytes.
+_row_retirement() {
+  local _sl="$1" _slug="$2" _state="$3" _detail="$4" _age
+  _age="$(_retire_age "$_slug")"
+  case "$_state" in
+    stuck)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · retirement stuck: %s · run `herd sweep` or close it by hand · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$_age" "$C_RESET" ;;
+    held)
+      printf '    %s⚠️%s  %s%s%s %sneeds-you · %s%s' \
+        "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$C_RESET" ;;
+    *)
+      printf '    %s♻️%s  %s%s%s %sretiring… · %s · %s%s' \
+        "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_detail" "$_age" "$C_RESET" ;;
+  esac
+}
+
+# build_retiring — the "retiring" console block: one row per retirement candidate whose WORKTREE IS
+# ALREADY GONE, so it can never appear among the in-flight (worktree-derived) rows — the merged builder
+# whose tab, agent, or ledger row outlived its tree. Slugs that still HAVE a worktree are rendered
+# inline by the tick loop's classifier instead, so nothing is listed twice. Empty (byte-identical
+# console) whenever every slug has converged — the healthy steady state.
+build_retiring() {
+  RETIRING=""
+  local i
+  for i in "${!RETIRE_SLUG[@]}"; do
+    local _slug="${RETIRE_SLUG[i]}" _dir="${RETIRE_DIR[i]}"
+    [ -n "$_dir" ] && [ -d "$_dir" ] && continue
+    RETIRING="${RETIRING}$(_row_retirement "$(_slug_cell "$_slug")" "$_slug" "${RETIRE_STATE[i]}" "${RETIRE_DETAIL[i]}")"$'\n'
+  done
 }
 
 # ── Watcher-console FLAIR pack (HERD-147) ─────────────────────────────────────────────────────────
@@ -931,6 +982,12 @@ render() {
   # byte-identical when the feature is unused.
   if [ -n "${OPERATOR_INBOX_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}operator inbox${C_RESET}"$'\n'"${OPERATOR_INBOX_ROWS}"$'\n'
+  fi
+  # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
+  # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
+  # every terminal slug has converged, which is the steady state, so the console is byte-identical.
+  if [ -n "${RETIRING:-}" ]; then
+    frame="${frame}  ${C_DIM}retiring${C_RESET}"$'\n'"${RETIRING}"$'\n'
   fi
   # PASTURE HEADER (HERD-147 flair) — one glyph-per-builder line just above the in-flight rows it
   # summarizes. Empty when flair is off or the herd is idle, so byte-identical when the feature is unused.
@@ -6375,6 +6432,13 @@ SWEEP_LIB=1
 . "$HERE/sweep.sh"
 unset SWEEP_LIB
 
+# ── Retirement invariant (HERD-164) ──────────────────────────────────────────────────────────────
+# retirement.sh reconciles "a merged/closed slug owns nothing" on EVERY tick, composing _reap_slug
+# (above) with sweep.sh's dirt/unique-commit proof helpers — so it must be sourced after BOTH. It
+# detects they are already in scope and does not re-source this file.
+# shellcheck source=/dev/null
+. "$HERE/retirement.sh"
+
 # The trigger pass's cached counts. Recomputed on the ORPHAN-sweep cadence (not every 4 s tick): the
 # scan costs one `ps -e` plus a filesystem walk, which has no business riding the repaint. Rendering
 # reads the CACHE every tick, so the frame stays stable between scans instead of flickering.
@@ -6827,6 +6891,18 @@ while true; do
   AGENTS_JSON="$(herd_driver_agent_list_json)"
   WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
 
+  # RETIREMENT INVARIANT (HERD-164), reconciled EVERY tick against the world we just observed: a slug
+  # whose PR is MERGED or CLOSED (or whose worktree is gone) owns no agent, tab, worktree, branch, or
+  # ledger row. Drives the idempotent teardown one step further and records what it could not finish;
+  # a slug carrying real work is HELD (loud, never deleted). Runs BEFORE row classification so a
+  # retiring slug can never be mistaken for an 'awaiting task' spare — and after $PRS_JSON/$AGENTS_JSON
+  # are fetched, because those ARE the observation. Restart-proof: nothing here is event-driven.
+  retirement_tick
+  # A reap this tick invalidated the worktree snapshot — re-read it so the reaped tree does not render
+  # one last phantom in-flight row. Zero reaps (the steady state) costs zero git calls.
+  [ "$RETIRE_REAPED" -gt 0 ] && WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  build_retiring
+
   # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
   # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
   # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
@@ -6857,6 +6933,17 @@ EOF
       # and the console is byte-identical to before the feature.
       DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
       FLAIR_STATE[i]="pen"
+    elif [ -z "$prnum" ] && _rt_state="$(_retire_state_of "$slug")" && [ "$_rt_state" != "active" ]; then
+      # RETIREMENT (HERD-164): this tick's invariant pass proved the slug terminal — its PR is merged
+      # or closed. It is NOT an 'awaiting task' spare, whatever its agent status says, and it is not a
+      # dead builder either: its work landed. Render whose move it is (the herd's while teardown
+      # converges; yours once it is stuck or holding real work) and skip the limit/dead/idle
+      # classification entirely — those all key off "PR-less", which a merged builder trivially is.
+      DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
+      case "$_rt_state" in
+        retiring) FLAIR_STATE[i]="busy" ;;
+        *)        FLAIR_STATE[i]="attention" ;;
+      esac
     elif [ -z "$prnum" ]; then
       if [ "$astatus" != "working" ]; then
         # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead

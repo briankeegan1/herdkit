@@ -434,6 +434,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic retirement-invariant (HERD-164) test passes" {
+  run bash "$REPO/tests/test-retirement-invariant.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {
+  run bash "$REPO/scripts/herd/sim/retirement-invariant-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]

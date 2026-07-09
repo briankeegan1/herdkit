@@ -57,6 +57,7 @@ Role summarized from each file's top-of-file comment.
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
 - `research.sh` — research.sh "<question>" — ENQUEUE a READ-ONLY repo research question and make sure exactly
+- `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
@@ -98,7 +99,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `cost.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
+- `agent-watch.sh` → `cost.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -126,6 +127,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `research-get.sh` → `herd-config.sh`
 - `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
+- `retirement.sh` → `agent-watch.sh`
 - `scribe-step.sh` → `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
 - `spawn-step.sh` → `herd-config.sh`
@@ -165,8 +167,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
-- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`, `sweep.sh`
-- `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `agent-watch.sh`
+- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `retirement.sh`, `status.sh`, `sweep.sh`
+- `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `agent-watch.sh`, `retirement.sh`
+- `DELTA_REVIEW` → `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`
