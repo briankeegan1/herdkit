@@ -247,6 +247,12 @@ DEP_STATES_FILE="${DEP_STATES_FILE:-${HERD_DEPWATCHER_LOCK%.pid}.states}"
 # silent forever-hold. Rows for vanished intents (spawned / skipped / operator-cleared) are pruned by
 # build_spawn_holds so the ledger cannot grow unbounded.
 SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
+# Daily-budget drain-pause state (HERD-95): 1 while the spawn-queue drain is PAUSED because today's
+# recorded spend has exceeded BUDGET_DAILY, else empty. In-process only (the watch loop is one long
+# process), so the pause is journaled ONCE per continuous over-budget stretch — not every 4s tick —
+# and cleared when spend falls back under the ceiling. Untouched (stays empty) when BUDGET_DAILY is
+# dormant, so a no-budget watcher is byte-identical to before.
+_BUDGET_DRAIN_PAUSED=""
 # Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
 # DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
@@ -5551,6 +5557,27 @@ _drain_spawn_queue() {
   local _dsq_q="$TREES/spawn-queue"
   [ -d "$_dsq_q" ] || return 0
   ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+
+  # Daily-budget governance (HERD-95): PAUSE draining when today's recorded spend has EXCEEDED
+  # BUDGET_DAILY. The lanes refuse a spawn individually too, but pausing the drain here stops the
+  # watcher from feeding the queue into those refusals every tick and burning claim churn. The pause is
+  # journaled ONCE per continuous over-budget stretch ($_BUDGET_DRAIN_PAUSED) and cleared when spend
+  # falls back under the ceiling. DORMANT when BUDGET_DAILY is empty (budget_daily_exceeded returns 1
+  # with no work) → byte-identical to before. HERD_FORCE_SPAWN=1 on the watcher overrides the pause.
+  if [ "${HERD_FORCE_SPAWN:-}" != "1" ]; then
+    local _dsq_over
+    if _dsq_over="$(budget_daily_exceeded)"; then
+      if [ "$_BUDGET_DRAIN_PAUSED" != "1" ]; then
+        journal_append budget_drain_paused spent "${_dsq_over%% *}" budget "${_dsq_over##* }"
+        _BUDGET_DRAIN_PAUSED=1
+      fi
+      return 0
+    fi
+  fi
+  if [ "$_BUDGET_DRAIN_PAUSED" = "1" ]; then
+    journal_append budget_drain_resumed
+    _BUDGET_DRAIN_PAUSED=""
+  fi
 
   # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
   local _dsq_cap _dsq_budget

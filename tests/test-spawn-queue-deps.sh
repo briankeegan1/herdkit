@@ -85,6 +85,11 @@ run_drain() {
     HERE="$ENG"; TREES="$T/trees"; FEATS=()
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     STATE="$STATE"; SPAWN_HELD_STATE="$SPAWN_HELD_STATE"; DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
+    # HERD-95: the drain now consults budget_daily_exceeded + the _BUDGET_DRAIN_PAUSED tick state.
+    # Stub the predicate DORMANT (return 1) + init the state so these dependency cases run under a
+    # no-budget watcher; the budget PAUSE path is covered by tests/test-budget-governance.sh.
+    _BUDGET_DRAIN_PAUSED=""
+    budget_daily_exceeded(){ return 1; }
     journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }
     # shellcheck source=/dev/null
     . "$DRAIN_SRC"
