@@ -238,6 +238,7 @@ REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
+CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh

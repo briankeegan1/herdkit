@@ -17,6 +17,13 @@
 #   (8) MID-OP (live gate marker) → defer silently
 #   (9) FETCH FAILURE (unreachable remote) → fail-soft: no journal, no state, tree untouched
 #
+# HERD-259 — the held row is re-derived from OBSERVED state every tick, so it CLEARS on recovery:
+#  (11) a held row whose tree went clean+current clears the file + the row in ONE tick, journaling
+#       main_fresh_recovered exactly once (the live incident: 'dirty-tree 4 0' held for 20+ min)
+#  (12) it clears ABOVE the defers that used to strand it — a live gate marker, an unfetchable remote
+#  (13) a GENUINELY stale MAIN is untouched: state file + rendered row byte-identical, no journal
+#  (14) a still-dirty tree keeps its own hold; DRYRUN clears nothing; no state file ⇒ byte-inert
+#
 # Sources agent-watch.sh in lib mode and drives reconcile_main_freshness against a REAL local git
 # repo wired to a bare "origin", with a second clone standing in for the other seat that pushes.
 # journal_append is overridden to a log.
@@ -45,7 +52,8 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in reconcile_main_freshness build_main_freshness _main_fresh_generated_only \
-          _main_fresh_note_restart _main_fresh_hold _watch_gate_inflight; do
+          _main_fresh_note_restart _main_fresh_hold _main_fresh_recheck _main_fresh_recovered \
+          _watch_gate_inflight; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -223,6 +231,84 @@ h0="$(head_sha)"
 DRYRUN=1 reconcile_main_freshness
 [ "$(head_sha)" = "$h0" ]                  || fail "(10) DRYRUN moved HEAD"
 [ ! -s "$JLOG" ]                           || fail "(10) DRYRUN journaled: $(cat "$JLOG")"
+ok
+
+# ── (11) RECOVERED: a held row whose condition healed clears within ONE tick (HERD-259) ───────────
+# The 2026-07-09 incident, reproduced: the file says 'dirty-tree 4 0'; the checkout is clean + current.
+reset_state
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main
+_main_fresh_hold dirty-tree 4 0
+: > "$JLOG"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) ;; *) fail "(11) fixture did not paint a held row" ;; esac
+_main_fresh_recheck
+[ ! -e "$MAIN_FRESH_STATE" ] || fail "(11) clean+current MAIN kept its held state file: $(cat "$MAIN_FRESH_STATE")"
+jhas 'main_fresh_recovered reason dirty-tree was_behind 4 was_ahead 0' \
+                               || fail "(11) missing main_fresh_recovered journal: $(cat "$JLOG")"
+build_main_freshness
+[ -z "${MAIN_FRESHNESS:-}" ]   || fail "(11) the row outlived its state file: $MAIN_FRESHNESS"
+_main_fresh_recheck            # the transition journals ONCE; a recovered tick is byte-inert thereafter
+[ "$(jcount 'main_fresh_recovered')" = "1" ] || fail "(11) recovery re-journaled: $(jcount 'main_fresh_recovered') lines"
+ok
+
+# ── (12) it clears ABOVE the defers that used to strand it ────────────────────────────────────────
+# A live gate marker: the reconcile proper must keep its hands off the tree, but the read-only recheck
+# above it still clears the row (this is what made the incident survive 20+ minutes of busy ticks).
+reset_state
+_main_fresh_hold dirty-tree 4 0
+INF="$TREES/.review-inflight-98-shaGATE"
+_marker_write "$INF" "$$"
+: > "$JLOG"
+reconcile_main_freshness
+[ ! -e "$MAIN_FRESH_STATE" ] || fail "(12) a mid-gate tick left a recovered row standing"
+jhas 'main_fresh_recovered'  || fail "(12) mid-gate recovery not journaled: $(cat "$JLOG")"
+rm -f "$INF"
+ok
+
+# An unfetchable remote: the reconcile bails before it can compare, the recheck reads the local ref.
+reset_state
+_main_fresh_hold dirty-tree 4 0
+git -C "$MAIN" remote set-url origin "$T/no-such-origin.git"
+reconcile_main_freshness     || fail "(12b) a fetch failure returned non-zero — must be fail-soft"
+[ ! -e "$MAIN_FRESH_STATE" ] || fail "(12b) an unfetchable remote left a recovered row standing"
+git -C "$MAIN" remote set-url origin "$ORIGIN"
+ok
+
+# ── (13) a GENUINELY stale MAIN is untouched — byte-identical file + row, no recovery journal ─────
+reset_state
+printf 'a human wrote this too\n' > "$MAIN/NOTES2.md"
+git -C "$MAIN" add NOTES2.md; git -C "$MAIN" commit -q -m "wip: another hand edit on main"
+seat_push README.md "seat2 once more" "feat: yet another seat merge"
+reconcile_main_freshness
+held_before="$(cat "$MAIN_FRESH_STATE" 2>/dev/null || true)"
+[ -n "$held_before" ] || fail "(13) fixture did not hold a genuinely diverged MAIN"
+build_main_freshness; row_before="${MAIN_FRESHNESS:-}"
+: > "$JLOG"
+_main_fresh_recheck
+[ -s "$MAIN_FRESH_STATE" ] || fail "(13) a genuinely diverged MAIN had its row cleared"
+[ "$(cat "$MAIN_FRESH_STATE")" = "$held_before" ] || fail "(13) the held state file was rewritten"
+build_main_freshness
+[ "${MAIN_FRESHNESS:-}" = "$row_before" ] || fail "(13) the held row is not byte-identical"
+[ ! -s "$JLOG" ]                          || fail "(13) a still-held row journaled: $(cat "$JLOG")"
+ok
+git -C "$MAIN" reset -q --hard origin/main
+
+# ── (14) still-dirty keeps its hold; DRYRUN clears nothing; no state file ⇒ byte-inert ────────────
+reset_state
+_main_fresh_hold dirty-tree 1 0
+printf 'uncommitted work\n' > "$MAIN/WIP2.md"; git -C "$MAIN" add WIP2.md
+_main_fresh_recheck
+[ -s "$MAIN_FRESH_STATE" ] || fail "(14) a still-dirty tree cleared its own dirty-tree hold"
+git -C "$MAIN" reset -q --hard HEAD; rm -f "$MAIN/WIP2.md"
+
+DRYRUN=1 _main_fresh_recheck
+[ -s "$MAIN_FRESH_STATE" ] || fail "(14) DRYRUN mutated state — an observation run clears nothing"
+
+reset_state
+: > "$JLOG"
+_main_fresh_recheck
+[ ! -s "$JLOG" ]           || fail "(14) with no row held the recheck is not byte-inert: $(cat "$JLOG")"
 ok
 
 echo "PASS: test-main-freshness.sh ($pass checks)"

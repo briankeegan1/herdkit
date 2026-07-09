@@ -110,6 +110,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
 . "$HERE/stale-dup-gate.sh"
+# CI auto-repair (HERD-250) — pure predicate for the inherited-red healer: a MERGEABLE+UNSTABLE PR whose
+# required CI is FAILING, herd/gates already PASSED, and the branch is BEHIND main is base-refreshed
+# (not silently merged). Sourcing DEFINES functions only; ship-dormant under CI_AUTOREPAIR=off.
+. "$HERE/ci-repair.sh"
 # PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
 # the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
 # dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
@@ -4154,6 +4158,66 @@ _self_restart_tick() {
 # _main_fresh_clear — back to fresh: drop the held row (the journal already recorded the transition).
 _main_fresh_clear() { rm -f "$MAIN_FRESH_STATE" 2>/dev/null || true; }
 
+# _main_fresh_recovered — the held row's condition is GONE. Drop the state file and journal the
+# transition ONCE (mirrors _main_health_clear: the file's presence IS the "was held" flag, so reading
+# it before the rm is what makes the event fire exactly once). Never called on a happy-path tick —
+# _main_fresh_recheck's first guard is the state file's existence.
+_main_fresh_recovered() {
+  local _mv_reason _mv_b _mv_a
+  read -r _mv_reason _mv_b _mv_a < "$MAIN_FRESH_STATE" 2>/dev/null || true
+  _main_fresh_clear
+  journal_append main_fresh_recovered reason "${_mv_reason:-unknown}" \
+    was_behind "${_mv_b:-0}" was_ahead "${_mv_a:-0}"
+  return 0
+}
+
+# _main_fresh_recheck — the OBSERVED-state recovery probe (HERD-259). The held row is a STATE FILE, and
+# before this every path that could delete it sat BELOW a defer in reconcile_main_freshness: a live gate
+# marker, a failed fetch, or a $MAIN parked off-branch all returned early, so a row whose condition had
+# already healed kept painting. It also outlived a watcher restart — startup drops $MAIN_FRESH_RESTART
+# (see the one-shot sweep below the tick loop) but never re-validated $MAIN_FRESH_STATE, and the render
+# pass runs ABOVE the reconcile in the tick, so the first paint of the new process trusted the stale
+# file. Live incident 2026-07-09: 'dirty-tree 4 0' held for 20+ minutes across a restart on a checkout
+# that was clean and current, until a human deleted the file.
+#
+# So the row is re-derived from OBSERVED git state every tick, ABOVE every defer, on both the render and
+# reconcile paths. It is READ-ONLY on the repo (status + rev-list, no fetch, no network, no tree
+# mutation), which is exactly why it is safe to run while a gate owns the tree — the reason the reconcile
+# proper cannot.
+#
+# CLEARS ONLY ON PROVABLE FRESHNESS — clean tree AND zero behind AND zero ahead. "Not behind" alone would
+# wipe a real `local-commits` hold (clean tree, 0 behind, N ahead is precisely that red), the same way a
+# vacuous rc-0 would wipe a real MAIN RED (see _main_health_clear's warning). Anything else — dirty,
+# behind, ahead, unreadable — leaves the file exactly as it was for the reconcile to re-decide.
+#
+# The behind/ahead counts come from the LOCAL remote-tracking ref (no fetch of our own). A row cleared
+# against a ref that has since moved is not a lie: the hold's condition (a dirty tree, a divergence this
+# checkout no longer has) is observably gone, and the reconcile below fetches and re-holds on the same
+# tick if $MAIN is genuinely stale again.
+#
+# Byte-inert on the happy path: with no state file the first test returns, so a fresh $MAIN costs one
+# `[ -s ]` and touches no git.
+_main_fresh_recheck() {
+  [ -s "${MAIN_FRESH_STATE:-}" ] || return 0
+  [ -n "${DRYRUN:-}" ] && return 0            # an observation run mutates no state (as the reconcile does not)
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
+    || return 0
+  local _mk_up _mk_dirty _mk_counts _mk_ahead _mk_behind
+  _mk_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  git -C "$MAIN" rev-parse --verify --quiet "$_mk_up" >/dev/null 2>&1 || return 0
+  _mk_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  [ -n "$_mk_dirty" ] && return 0
+  _mk_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mk_up" 2>/dev/null || true)"
+  _mk_ahead="$(printf '%s' "$_mk_counts" | awk '{print $1}')"
+  _mk_behind="$(printf '%s' "$_mk_counts" | awk '{print $2}')"
+  case "${_mk_ahead:-x}${_mk_behind:-x}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_mk_ahead" -eq 0 ] && [ "$_mk_behind" -eq 0 ] || return 0
+  _main_fresh_recovered
+  return 0
+}
+
 # _main_fresh_hold <reason> <behind> <ahead> — surface an unhealable divergence: persist the row and
 # journal it ONCE (a reason that has not changed since the last tick paints, but does not re-journal).
 _main_fresh_hold() {
@@ -4201,6 +4265,10 @@ reconcile_main_freshness() {
   # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
   [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
     || return 0
+  # HERD-259: a standing held row is re-derived from observed git state BEFORE any defer below it —
+  # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
+  # fetch is failing. Read-only, and a no-op when no row is held.
+  _main_fresh_recheck
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
 
@@ -6124,7 +6192,7 @@ _refix_stalled_row() {
     esac
     _escalate_refix_stuck "$_rsr_pr" "$_rsr_sha" "$_rsr_slug" "$_rsr_kind" "$_rsr_reason"
   fi
-  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; stale) _rsr_what="stale base" ;; *) _rsr_what="review blocked" ;; esac
+  case "$_rsr_kind" in health) _rsr_what="health-check red" ;; stale) _rsr_what="stale base" ;; ci) _rsr_what="CI red" ;; *) _rsr_what="review blocked" ;; esac
   printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_rsr_sl}${C_RESET}${_rsr_pn} ${C_RED}needs you · ${_rsr_what} · ${_rsr_kind} autofix stalled: ${_rsr_reason} · re-task by hand${C_RESET}"
 }
 
@@ -6458,6 +6526,187 @@ _stale_base_autofix_enabled() {
   esac
 }
 
+# ── CI auto-repair for INHERITED reds (HERD-250) ──────────────────────────────────────────────────
+# CI_AUTOREPAIR=on|off (default off, ship-dormant). When a PR is MERGEABLE but UNSTABLE with a FAILING
+# required CI check, herd/gates already PASSED for the head sha, AND the branch is BEHIND main, the
+# failure is almost certainly main's already-fixed bugs riding the branch (PR #353). A base-refresh
+# (merge $DEFAULT_BRANCH) picks them up — the SAME mechanical heal as STALE_BASE_AUTOFIX, but keyed
+# on CI-red+behind-base rather than touched-file overlap (which #353's diff never hit).
+#
+# NEVER silently merges a red PR. A REAL new-code CI failure (failing CI on an up-to-date branch, or
+# without a gates blessing) falls through to the existing needs-you row. OFF is byte-identical to the
+# pre-HERD-250 UNSTABLE-fail path. Journals `ci_repair` events. Kind=ci on the shared refix rails so
+# the CI rail budgets independently of review/health/stale.
+#
+# Decision predicates live in scripts/herd/ci-repair.sh (ci_autorepair_enabled / ci_repair_eligible);
+# this handler owns the bounce / resolver / row truth, mirroring _handle_stale_dup.
+
+# _handle_ci_repair <pr#> <slug> <headSha> <display-idx> <worktree-dir> <branch> <ci-summary>
+# Called when the classifier has a FAILING required CI check. Returns 0 if THIS handler set DISPLAY
+# (heal in progress, deferred, or needs-you after a spent budget); returns 1 if the caller should
+# paint the classic needs-you · CI-failed row (off / ineligible / dry-run).
+_handle_ci_repair() {
+  local _hcr_pr="$1" _hcr_slug="$2" _hcr_sha="$3" _hcr_idx="$4" _hcr_wt="${5:-}" \
+        _hcr_branch="${6:-}" _hcr_ci="${7:-}"
+  local _hcr_sl _hcr_pn _hcr_rounds _hcr_round_num _hcr_base _hcr_capmsg
+
+  # OFF / dry-run: byte-identical to pre-HERD-250 — caller paints needs-you, no ledger, no bounce.
+  if ! ci_autorepair_enabled || [ -n "${DRYRUN:-}" ]; then
+    return 1
+  fi
+
+  _hcr_base="${DEFAULT_BRANCH:-origin/main}"
+  # Not the inherited-red case (up-to-date / gates not green / probe fail) → real failure, needs-you.
+  if ! ci_repair_eligible "${_hcr_wt:-/}" "$_hcr_base" "$_hcr_sha"; then
+    return 1
+  fi
+
+  _hcr_sl="$(_slug_cell "$_hcr_slug")"
+  _hcr_pn=" ${C_DIM}#${_hcr_pr}${C_RESET} ·"
+
+  # LIMIT PREFLIGHT: never type into a usage-limit arrow-menu. Once-guard not burned.
+  if [ -n "$_hcr_wt" ]; then
+    local _hcr_lreset
+    if _hcr_lreset="$(_detect_limit_hit "$_hcr_slug" "$_hcr_wt")"; then
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result deferred reason limit reset_at "${_hcr_lreset:-0}"
+      _handle_limit_blocked "$_hcr_slug" "$_hcr_wt" "$_hcr_idx" "${_hcr_lreset:-0}"
+      return 0
+    fi
+  fi
+
+  _hcr_rounds="$(refix_rail_count "$_hcr_pr" ci)"
+  # Once-guard: already healed this sha → wait for the push / resolver finish.
+  if refix_attempted "$_hcr_pr" "$_hcr_sha" ci; then
+    local _hcr_note
+    if _hcr_note="$(_active_fix_note "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci)"; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}${_hcr_note/fix in progress/ci-repair rebasing}${C_RESET}"
+    elif _resolver_agent_alive "$_hcr_slug" 2>/dev/null; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · resolver working${C_RESET}"
+    else
+      DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+    fi
+    return 0
+  fi
+
+  # SELF-RESTART QUIESCE (HERD-251): drain toward re-exec — do not burn the once-guard.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · held (watcher restarting on new engine code)${C_RESET}"
+    return 0
+  fi
+
+  # SUITE WRITE INTERLOCK: a live health suite owns this worktree — defer without burning the guard.
+  _defer_for_suite "$_hcr_pr" "$_hcr_slug" "$_hcr_sha" "$_hcr_idx" ci "ci-repair" && return 0
+
+  # WORKING-AGENT GUARD: never spawn a resolver into a live builder's worktree.
+  if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+    return 0
+  fi
+
+  # Budget exhausted → needs-you (still handled here so the row names the CI rail).
+  if _hcr_capmsg="$(_refix_budget_reason "$_hcr_pr" ci)"; then
+    DISPLAY[_hcr_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · ${_hcr_capmsg} · CI still red · ${_hcr_ci}${C_RESET}"
+    if ! _refix_dead_seen "$_hcr_pr" "ci-cap-$_hcr_sha"; then
+      _record_refix_dead "$_hcr_pr" "ci-cap-$_hcr_sha"
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result escalated rounds "$_hcr_rounds" reason "${_hcr_capmsg} — CI still red after base-refresh attempts"
+      herd_driver_notify "⚠️ CI repair budget spent: ${_hcr_slug}" \
+        "PR #${_hcr_pr} CI still red after ${_hcr_rounds} base-refresh rounds — needs you" default
+    fi
+    return 0
+  fi
+
+  _hcr_round_num="$((_hcr_rounds + 1))"
+
+  # NO LIVE BUILDER → conflict resolver (same mechanical merge-base tool as stale-base heal).
+  if ! _stale_has_live_builder "$_hcr_slug"; then
+    if [ -z "$_hcr_wt" ] || [ ! -d "$_hcr_wt" ]; then
+      DISPLAY[_hcr_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · CI red (inherited?) + no builder/worktree — merge \`${_hcr_base}\` by hand · ${_hcr_ci}${C_RESET}"
+      if ! _refix_dead_seen "$_hcr_pr" "ci-nowt-$_hcr_sha"; then
+        _record_refix_dead "$_hcr_pr" "ci-nowt-$_hcr_sha"
+        journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+          result escalated reason "no live builder and no worktree — cannot auto-heal"
+        herd_driver_notify "🛑 CI red, no healer: ${_hcr_slug}" \
+          "PR #${_hcr_pr} has inherited-looking CI red but no builder/worktree — merge base by hand" default
+      fi
+      return 0
+    fi
+    if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+      return 0
+    fi
+    record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
+    DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair · resolver (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    render
+    journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+      result resolver round "$_hcr_round_num" reason "no live builder — dispatching conflict resolver to merge ${_hcr_base}" \
+      ci "${_hcr_ci}" detail "${_CI_REPAIR_REASON:-}"
+    _resolver_in_flight "$_hcr_slug" "$_hcr_pr" "$_hcr_sha" || spawn_resolver "$_hcr_slug" "$_hcr_pr" "${_hcr_branch:-$_hcr_slug}" "$_hcr_sha"
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    return 0
+  fi
+
+  # LIVE BUILDER → bounce with a mechanical merge-base re-task (inherited-red framing).
+  DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+  render
+  record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
+  local _hcr_before; _hcr_before="$(_agent_status "$_hcr_slug")"
+  journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+    result bounce round "$_hcr_round_num" agent_status_before "${_hcr_before:-unknown}" \
+    ci "${_hcr_ci}" detail "${_CI_REPAIR_REASON:-}"
+
+  local _hcr_pane_id _hcr_woke=0 _hcr_escalated=false _hcr_prompt
+  _hcr_prompt="PR #${_hcr_pr} is red on GitHub CI (${_hcr_ci:-required check failed}) but herd/gates PASSED and this branch is BEHIND ${_hcr_base}.
+This is almost certainly an INHERITED red — main already carries fixes for hermetic/suite failures that this branch still has because it predates those merges. Do NOT silently treat it as a defect in YOUR code first; refresh the base.
+MECHANICAL fix (not a judgment call). From your worktree:
+  git fetch ${HERD_REMOTE:-origin}
+  git merge ${_hcr_base}
+Resolve any conflicts PRESERVING both sides' intent, run the healthcheck, then push (normal push, NEVER force, NEVER push to the default branch).
+If CI is still red AFTER the base-refresh lands, that is a REAL new-code failure — fix the failing check, do not keep re-merging main.
+Why: ${_CI_REPAIR_REASON:-CI red + gates green + behind base}"
+  _hcr_pane_id="$(_find_builder_pane_id_any "$_hcr_slug")"
+  if [ -n "$_hcr_pane_id" ]; then
+    local _hcr_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+    herdr pane run "$_hcr_pane_id" "$_hcr_prompt" >/dev/null 2>&1 || true
+    if _wait_agent_working "$_hcr_slug" "$_hcr_wait"; then
+      _hcr_woke=1
+    else
+      herdr pane run "$_hcr_pane_id" "$_hcr_prompt" >/dev/null 2>&1 || true
+      if _wait_agent_working "$_hcr_slug" "$_hcr_wait"; then
+        _hcr_woke=1
+      else
+        _escalate_refix_stuck "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "the builder never woke (prompt delivered twice)"
+        DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+        _hcr_escalated=true
+      fi
+    fi
+  else
+    if [ -n "$_hcr_wt" ] && [ -d "$_hcr_wt" ]; then
+      if [ "$(_agent_status "$_hcr_slug")" = "working" ]; then
+        DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
+        return 0
+      fi
+      journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+        result resolver round "$_hcr_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
+      _resolver_in_flight "$_hcr_slug" "$_hcr_pr" "$_hcr_sha" || spawn_resolver "$_hcr_slug" "$_hcr_pr" "${_hcr_branch:-$_hcr_slug}" "$_hcr_sha"
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+    else
+      _escalate_refix_stuck "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "agent pane not found"
+      DISPLAY[_hcr_idx]="$(_refix_stalled_row "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci "$_hcr_sl" "$_hcr_pn")"
+      _hcr_escalated=true
+    fi
+  fi
+  if [ "$_hcr_woke" = "1" ] && [ "$_hcr_escalated" = "false" ]; then
+    DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · awaiting push (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+  fi
+  local _hcr_after; _hcr_after="$(_agent_status "$_hcr_slug")"
+  journal_append ci_repair pr "$_hcr_pr" sha "$_hcr_sha" slug "$_hcr_slug" \
+    result wake_result round "$_hcr_round_num" agent_status_before "${_hcr_before:-unknown}" \
+    agent_status_after "${_hcr_after:-unknown}" woke "$_hcr_woke" escalated "$_hcr_escalated"
+  return 0
+}
+
 # ── Auto-refix (healthcheck): bounce a reproduced CODE ERROR straight to the builder ───────────────
 # HEALTHCHECK_AUTOFIX=true|false (default false). The review gate already bounces a BLOCK verdict to the
 # builder (_handle_block_verdict); a reproduced healthcheck CODE ERROR is the same shape of finding —
@@ -6527,9 +6776,26 @@ _handle_stale_dup() {
     return 0
   fi
 
-  # OFF / dry-run: byte-identical to the pre-HERD-199 hold — no bounce, no ledger, no resolver.
+  # OFF / dry-run: no bounce, no ledger, no resolver — the rebase is somebody's to do by hand.
+  #
+  # ROW TRUTH (HERD-259): "somebody" is often the builder itself, and this row lied about it. Every
+  # sibling stale-base row consults agent activity before shouting for a human (_active_fix_note's
+  # clause (b), the working-agent guards on the heal paths) — but the OFF path, which is the SHIP
+  # DEFAULT and therefore the row most operators actually see, escalated unconditionally. An operator
+  # who context-switches into a rebase a live builder is already running is exactly the expensive lie
+  # HERD-173 set out to remove. Mirror the same POSITIVE-signal-only check: an agent reading `working`
+  # renders fix-in-progress; a blind/absent `herdr agent list` yields no positive signal and falls
+  # through to the honest needs-you. Same one-way strength as clause (b) — a needs-you row is
+  # trustworthy, a fix-in-progress row can be a busy agent doing something else, and the next idle tick
+  # corrects it. DUPLICATE never reaches here (it returned above): it is a judgment call, always human.
+  # Nothing but the rendered string changes — no dispatch, no ledger write, no refix round, on either
+  # branch — so an idle builder's row stays byte-identical to before.
   if ! _stale_base_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
-    DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}fix in progress · builder working · stale base held${C_RESET}"
+    else
+      DISPLAY[_hsd_idx]="$(_stale_needs_you_row "$_hsd_sl" "$_hsd_pn" "$_hsd_kind" "$_hsd_reason")"
+    fi
     return 0
   fi
 
@@ -9697,6 +9963,13 @@ _startup_reap_sweep
 # restart that got us here. Drop it, or the row would outlive the condition it warns about.
 rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
 
+# …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
+# to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved
+# came back with the new process. Both freshness rows are now derived from observed state at startup.
+# (The tick loop re-derives it before every render too; this one-shot is what makes the FIRST paint of a
+# new process honest, since nothing else has run yet.)
+_main_fresh_recheck
+
 # One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
 # or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
 # panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
@@ -9727,6 +10000,11 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
+  # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
+  # row whose condition healed while this watcher was down paints for a whole tick after every restart —
+  # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
+  _main_fresh_recheck
   build_main_freshness
   build_sweep_note
 
@@ -9942,13 +10220,21 @@ EOF
       # fixed — so it graduates to a LOUD red 'needs you · <check>' row (the grounded #293 macOS leg);
       # pending-only checks stay a yellow hold, just named. Fail-soft: a PR with no checks / an offline
       # gh yields no summary and the row is BYTE-IDENTICAL to before.
+      #
+      # HERD-250: when the fail is the INHERITED-red case (CI red + herd/gates green + branch behind
+      # main) and CI_AUTOREPAIR=on, _handle_ci_repair dispatches a base-refresh instead of needs-you.
+      # NEVER silent-merges a red PR; a real new-code failure (not behind / no gates) still needs-you.
       _ci_sum=""
       if [ "$mstate" = "UNSTABLE" ]; then _ci_sum="$(_ci_gate_eval "$prnum" "$headsha" "$slug")"; fi
       if [ -n "$_ci_sum" ]; then
         _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
         if [ "$_ci_bucket" = "fail" ]; then
-          DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
-          FLAIR_STATE[i]="attention"
+          if _handle_ci_repair "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
+            FLAIR_STATE[i]="busy"
+          else
+            DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
+            FLAIR_STATE[i]="attention"
+          fi
         else
           DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · ${_ci_text}${C_RESET}"
           FLAIR_STATE[i]="busy"
