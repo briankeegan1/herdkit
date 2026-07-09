@@ -316,6 +316,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
 
+# Journal-driven self-audit / gap-finder (HERD-238). When on, the watcher runs journal-audit.sh on
+# the housekeeping sweep cadence (~3 min), replaying a BOUNDED journal window for invariant
+# violations that were visible in the journal but nothing was reading: merge without reap;
+# *_dispatched with no terminal past family TTL; refix_bounce without wake_result; MAIN RED older
+# than TTL; pushed=no never followed by yes; known-fixture slugs. Findings → journal_audit events
+# (component=audit) + operator-inbox rows (source=audit). ADVISORY ONLY — never gates, never mutates.
+# Ships OFF (byte-inert). Pair with OPERATOR_INBOX=on to render audit rows in the console.
+# JOURNAL_AUDIT="off"      # off (default) | on
+
 # Daily SPEND CEILING (HERD-95) — ENFORCE a budget, don't just measure it. `herd cost` already prices
 # every builder/review/agent session and journals a `cost` event at merge; this key turns that ledger
 # into a rail. Set it to a USD number and, when TODAY's (UTC) recorded spend EXCEEDS it, the watcher
