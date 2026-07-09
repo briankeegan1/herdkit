@@ -95,13 +95,20 @@ cat > "$P1/BACKLOG.md" <<'EOF'
 EOF
 git -C "$P1" add -A; git -C "$P1" commit -q -m init
 : > "$LOG"
-# The file loop has no MAX_POLLS hook — run it briefly, then stop. BACKLOG_VIEW_TTY=/dev/null keeps it
-# hermetic: the backgrounded viewer must NEVER read the pane's real /dev/tty (the suite runs inside a
-# live pane, where a backgrounded read wedges the gate) — it falls back to the plain sleep instead.
+# The file loop has no MAX_POLLS hook — run it, WAIT for the first frame to land, then stop.
+# BACKLOG_VIEW_TTY=/dev/null keeps it hermetic: the backgrounded viewer must NEVER read the pane's real
+# /dev/tty (the suite runs inside a live pane, where a backgrounded read wedges the gate) — it falls
+# back to the plain sleep instead.
 env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
   HERD_CONFIG_FILE="$P1/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 HERD_FAKE_LOG="$LOG" \
   BACKLOG_VIEW_TTY=/dev/null bash "$SCRIPT" </dev/null >"$T/out1" 2>/dev/null & vpid=$!
-sleep 1; kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
+# Poll (bounded ~10s) for the first render instead of a fixed 1s sleep. The header is a glow-INDEPENDENT
+# printf that renders even with no glow on PATH (verified), so the historical CI red here was NOT a
+# glow/render gap — it was this fixed-time race: a loaded CI runner can take >1s to reach the file
+# loop's first iteration, so `sleep 1; kill` killed the viewer before it ever painted a frame. Waiting
+# for the frame makes the case deterministic; the TERM trap flushes the captured output on kill.
+_i=0; while [ "$_i" -lt 50 ]; do grep -q "📋 BACKLOG.md" "$T/out1" 2>/dev/null && break; sleep 0.2; _i=$((_i + 1)); done
+kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
 grep -q "📋 BACKLOG.md" "$T/out1"          || fail "file-mode header '📋 BACKLOG.md' missing"
 grep -q "file-mode-sentinel-item" "$T/out1" || fail "file-mode did not render the backlog file content"
 if [ -s "$LOG" ]; then fail "file-mode must NOT invoke 'herd backlog' (log: $(cat "$LOG"))"; fi
