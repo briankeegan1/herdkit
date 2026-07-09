@@ -73,7 +73,7 @@ The watcher **always**:
 
 **Prerequisites**:
 - All gates must be deterministic and pass-safe (e.g., healthcheck must not be flaky, review verdicts must not time out).
-- `MERGE_POLICY` must be set (auto-merge is OFF by default; set to `auto` or `held` to enable).
+- `MERGE_POLICY` should be set explicitly for unattended intent (default is `auto` — the watcher merges on pass; use `approve` for coordinator sign-off via `herd-approve.sh`, or `observe` to never merge).
 - `CLAIM_REQUIRED` should be `on` if a shared project (prevents concurrent operator claims).
 - `COORDINATOR_WATCHDOG` should be enabled (so the coordinator auto-resumes on limit-hit or crash).
 - Backlog must be well-prioritized (the coordinator respects top-to-bottom order).
@@ -313,7 +313,7 @@ Output: Token and USD spend per PR, per session, or total (with coordinator + sc
 
 2. **Test the review gate on a dummy PR**: If you've changed `REVIEW_CHECKLIST`, run one manual review to ensure it's not too strict or crashing.
 
-3. **Set `MERGE_POLICY` explicitly**: Leaving it unset defaults to `held` (manual approval); in unattended mode, you probably want `auto`. Make the policy explicit.
+3. **Set `MERGE_POLICY` explicitly**: Leaving it unset defaults to `auto` (watcher merges on pass; empty derives from legacy `WATCHER_AUTOMERGE`, which also defaults true→auto). Recognized values: `auto` | `approve` | `observe`. Make the policy explicit so operators never guess.
 
 4. **Monitor the first hour of an unattended run**: Watch `herd status` or the journal; if something breaks early (e.g., a builder crashes, review verdicts are nonsensical), you can catch it before the run diverges.
 
