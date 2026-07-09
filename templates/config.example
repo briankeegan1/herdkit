@@ -327,6 +327,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
 
+# OSS auto-triage (HERD-255 / HERD-168 part 1/3) — classify + draft replies for incoming GitHub issues
+# on HERD_REPO via the READ-ONLY research lane. ON → `herd triage` (scripts/herd/oss-triage.sh) lists
+# open issues (gh issue list), enqueues one research request per NEW issue to classify
+# (bug/feature/question/duplicate) and draft a suggested reply/labels, then writes a ranked shortlist
+# under $WORKTREES_DIR/.herd/oss-triage/ for the coordinator. NEVER auto-posts (no issue comment,
+# close, or label — drafts for human approval only). OFF (default) → byte-inert: no gh, no research,
+# no report files. FAIL-SOFT: missing HERD_REPO / gh error yields an empty shortlist, never a hard red.
+# OSS_TRIAGE="off"         # off (default) | on
+
 # Daily SPEND CEILING (HERD-95) — ENFORCE a budget, don't just measure it. `herd cost` already prices
 # every builder/review/agent session and journals a `cost` event at merge; this key turns that ledger
 # into a rail. Set it to a USD number and, when TODAY's (UTC) recorded spend EXCEEDS it, the watcher
