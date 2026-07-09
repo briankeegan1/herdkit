@@ -191,6 +191,12 @@ approve <pr#>
 
 This records an `APPROVE` event in the journal (audit trail) and releases the hold so the watcher can merge.
 
+## Builder Notes
+
+A builder that hits a load-bearing mid-build finding (a red row that is a stale cached result, a test not wired into the gate, a hold that is env rather than code) files it with `herd note "<finding>"`. That journals a `builder_note` event, and the watcher surfaces it in the console's **builder notes** section within a tick — no human clipboard paste. The coordinator is the only consumer: nothing else in the engine acts on a note.
+
+The loop is **read → route → ack**, run on invocation and every time you check running agents — *before* re-tasking a builder or overriding a gate, since a note often explains the very row you are about to act on. Read the open notes with `herd log | grep builder_note`, or with the ack-aware `notes` subcommand (`notes` lists them numbered, newest first) once HERD-243 has landed it. Route each one: **act now** if it changes your next move, **file it** via the scribe with the note quoted verbatim if it is real work that outlives this build, or **dismiss** it as informational. Then ack the handled note (`notes ack <n>`, or `notes ack all`) so the console clears and the next coordinator seat does not re-route it. The ack is display-only — the journal keeps every note. Where that subcommand is not yet present in the engine build, read and route exactly the same way; handled notes age out of the display on their own instead of clearing on command. The coordinator skill carries the full command surface.
+
 ## Escalation Paths
 
 ### Review BLOCKS
