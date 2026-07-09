@@ -327,6 +327,22 @@ gate cycle re-runs on the new commit. This is bounded by **`REFIX_MAX_ROUNDS`** 
 per PR — after which it escalates to `needs you`. When `REVIEW_AUTOFIX=false` (default), a BLOCK just
 shows the standard `review blocked` row for the coordinator to re-task by hand.
 
+### Auto-refix a red healthcheck — `HEALTHCHECK_AUTOFIX`
+
+A reproduced pre-merge healthcheck **code error** is the same shape of finding as a BLOCK review — a
+machine-checkable defect in the builder's own diff — so **`HEALTHCHECK_AUTOFIX=true`** bounces it back
+the same way, handing the builder the failing test line and the path to the tailable suite log. The
+round budget is **shared with the review refix**: `REFIX_MAX_ROUNDS` counts both kinds together, one
+budget per PR. The same guards apply — a limit-parked builder is never typed at, a dead agent escalates
+without burning a round, and an infra `tab-leak-guard` trip is never bounced. Default `false`.
+
+### "Needs you" means nobody is on it
+
+A red row is only ever labelled `needs you` when **no agent is working that red**, and it then carries
+both the blocker (which test failed) and the remedy. While a builder is fixing it — bounced by the
+watcher, or re-tasked by you — the row reads `fix in progress · awaiting push (round k/3)` instead. A
+`needs you` on the console is always real work for you, never work already in flight.
+
 ### Catch a BLOCK before the PR opens — `LOCAL_REVIEW=pre-pr`
 
 By default (`LOCAL_REVIEW=none`) correctness review happens once, post-PR, in the watcher's gate.
