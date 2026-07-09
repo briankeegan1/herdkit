@@ -4399,6 +4399,57 @@ _wait_agent_working() {
   return 1
 }
 
+# ── SUITE/WORKTREE WRITE INTERLOCK (HERD-227) ─────────────────────────────────────────────────────
+# `_health_worker` runs the ~9-min healthcheck suite INSIDE the PR's worktree. Every refix rail MUTATES
+# that same worktree: the stale-base bounce types `git merge <base>` into the builder's pane, its
+# resolver fallback spawns an agent that merges in the tree, and the review/health bounces re-task the
+# builder to edit files and re-run. Two writers, one worktree.
+#
+# Until HERD-227 nothing collided, but only by ACCIDENT: the stale-dup gate sat AFTER `_healthcheck_gate`,
+# and a RUNNING suite short-circuits the whole action pass (`_HC_RESULT=RUNNING` → `continue`), so no rail
+# was reachable while a suite was live. Hoisting the gate ahead of the healthcheck removed that interlock
+# for the stale-base rail: a hold arriving mid-suite would re-task the builder to merge the base UNDER the
+# running suite. The head sha does not move until the builder pushes, so `record_health_result` then
+# sha-caches a POISONED verdict — a false CODEERROR red from a half-merged tree, or (worse) a false CLEAN
+# blessing a tree that sha never had.
+#
+# So the interlock is now EXPLICIT, and shared by every rail rather than re-derived per rail (R2: one
+# deterministic check at every enforcement surface). Note what does NOT defer: the gate's DECISION still
+# runs first, so a held sha still dispatches no review and no suite. Only the MUTATION waits.
+#
+# _suite_inflight_key <pr#> — print the key of a LIVE health suite for this PR, else nothing (rc 1).
+# ANY sha counts: a suite dispatched for an earlier sha is still writing in the same worktree, and the
+# live marker is what proves a worker holds it. Fail-soft — an absent/dead marker reads as "no suite".
+_suite_inflight_key() {
+  local _sik_pr="$1" _sik_f
+  [ -n "$_sik_pr" ] || return 1
+  # The glob is anchored on "<pr>-" so PR 9 never matches PR 90's marker; a no-match glob stays literal
+  # and fails the -f test.
+  for _sik_f in "$TREES"/.health-inflight-"$_sik_pr"-*; do
+    { [ -f "$_sik_f" ] && _health_pid_live "$_sik_f"; } || continue
+    printf '%s' "${_sik_f##*/.health-inflight-}"
+    return 0
+  done
+  return 1
+}
+
+# _defer_for_suite <pr#> <slug> <sha> <display-idx> <kind> <row-label>
+# Returns 0 → a live suite holds this PR's worktree: the honest deferred row is set and the defer is
+# journaled; THE CALLER MUST NOT MUTATE (and must not burn its once-guard or a refix round — the heal
+# fires normally on the first tick after the suite collects). Returns 1 → no suite in flight, proceed.
+_defer_for_suite() {
+  local _dfs_pr="$1" _dfs_slug="$2" _dfs_sha="$3" _dfs_idx="$4" _dfs_kind="$5" _dfs_label="$6"
+  local _dfs_key _dfs_sl _dfs_pn _dfs_age
+  _dfs_key="$(_suite_inflight_key "$_dfs_pr")" || return 1
+  _dfs_sl="$(_slug_cell "$_dfs_slug")"
+  _dfs_pn=" ${C_DIM}#${_dfs_pr}${C_RESET} ·"
+  _dfs_age="$(_fmt_age "$(_marker_age "$(_health_inflight_file "$_dfs_key")")" 2>/dev/null || printf '?')"
+  DISPLAY[_dfs_idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${_dfs_sl}${C_RESET}${_dfs_pn} ${C_YELLOW}${_dfs_label} · waiting for suite (health-check running ${_dfs_age})${C_RESET}"
+  journal_append refix_deferred_suite pr "$_dfs_pr" sha "$_dfs_sha" slug "$_dfs_slug" \
+    kind "$_dfs_kind" suite_key "$_dfs_key"
+  return 0
+}
+
 # _handle_block_verdict <pr#> <slug> <headSha> <display-idx>
 # Called when the review verdict for a PR is BLOCK (from the ledger or a fresh gate step). If
 # REVIEW_AUTOFIX=true, attempts to bounce the builder agent; otherwise shows the standard message.
@@ -4486,6 +4537,12 @@ _handle_block_verdict() {
             "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
         fi
       fi
+    elif _defer_for_suite "$_hbv_pr" "$_hbv_slug" "$_hbv_sha" "$_hbv_idx" review "review blocked"; then
+      # SUITE WRITE INTERLOCK (HERD-227). Reachable under GATE_DISPATCH=parallel, where a review verdict
+      # can land while this PR's suite is still running in the worktree; the serial default cannot get
+      # here (a RUNNING suite short-circuits the pass first). Row + journal handled by _defer_for_suite;
+      # once-guard NOT burned, no refix round spent.
+      :
     else
       local _hbv_round_num
       _hbv_round_num="$((_hbv_rounds + 1))"
@@ -4689,6 +4746,15 @@ _handle_stale_dup() {
     fi
     return 0
   fi
+  # SUITE WRITE INTERLOCK (HERD-227): a live healthcheck suite is running INSIDE this worktree. Both
+  # heals below mutate it — the bounce types `git merge` into the builder's pane, the resolver fallback
+  # merges in the tree directly. Either one under a running suite gives two writers one worktree, and
+  # since the head sha cannot move until the builder pushes, the suite's verdict gets sha-cached against
+  # a tree that sha never had. Defer: honest row, once-guard NOT burned, no refix round spent; the heal
+  # fires on the first tick after the suite collects. Guards BOTH mutation paths at once (they are the
+  # only code below this point) — see _defer_for_suite.
+  _defer_for_suite "$_hsd_pr" "$_hsd_slug" "$_hsd_sha" "$_hsd_idx" stale "stale base" && return 0
+
   # WORKING-AGENT GUARD (review round-7): an actively-working builder is invisible to the pane lookup
   # BY DESIGN (never double-drive a live session) — without this check it reads as "no builder" and a
   # resolver gets spawned INTO the live worktree (two agents, one directory, merge over WIP). If the
@@ -4971,6 +5037,12 @@ _handle_health_codeerror() {
     fi
     return 0
   fi
+
+  # SUITE WRITE INTERLOCK (HERD-227). This PR's OWN suite has necessarily collected (that is what produced
+  # the CODEERROR), but a suite dispatched for an EARLIER sha can still be running in the same worktree,
+  # and the corpse sweep only reaps it on timeout. Consult the same shared check every rail uses rather
+  # than reason locally about which shas can overlap. Once-guard NOT burned; the bounce fires next tick.
+  _defer_for_suite "$_hhc_pr" "$_hhc_slug" "$_hhc_sha" "$_hhc_idx" health "health-check failed" && return 0
 
   # BOUNCE. Record BEFORE sending so the once-guard holds even if pane lookup or delivery fails.
   local _hhc_round_num; _hhc_round_num="$((_hhc_rounds + 1))"
@@ -8226,6 +8298,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     # spawn_resolver, so this read still sees only prior ticks' attempts.
     _retry_reason="resolving conflict…"
     resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
+    # SUITE WRITE INTERLOCK (HERD-227): the resolver merges the base INSIDE this worktree. A PR that was
+    # CLEAN last tick (suite dispatched) and CONFLICTING this one still has that suite running here — the
+    # marker outlives the mergeability flip. Defer the spawn; nothing is recorded, so the resolver
+    # dispatches normally on the first tick after the suite collects.
+    if [ -z "$DRYRUN" ] && _defer_for_suite "$prnum" "$slug" "$csha" "$idx" resolver "conflict"; then
+      render
+      continue
+    fi
     if [ -n "$DRYRUN" ]; then
       if [ "$creason" = "first" ]; then
         DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
