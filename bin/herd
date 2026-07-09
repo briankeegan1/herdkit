@@ -4541,13 +4541,16 @@ _reload_reparent() {
 # (healthcheck/review). Health worker subshells re-exec under the SAME argv0, so a live gate worker
 # is argv0-indistinguishable from a duplicate watcher. Listing it here hands it to
 # _stop_project_watcher, which SIGTERMs it — destroying in-flight gate work (the HERD-245 review-sever
-# class). Skip any pid owned by a LIVE .review-inflight-* / .health-inflight-* marker under
-# $WORKTREES_DIR (or $HERD_WORKTREES_DIR), mirroring sweep_stray_watchers' gate-worker exemption.
+# class). Skip any pid owned by a LIVE .review-inflight-* / .health-inflight-* / .spawn-inflight-*
+# marker under $WORKTREES_DIR (or $HERD_WORKTREES_DIR), mirroring sweep_stray_watchers' exemption.
+# HERD-237 adds .spawn-inflight-*: the tick now forks its builder-lane and resolver dispatches too, so
+# a background lane is argv0-indistinguishable from a duplicate watcher in exactly the same way — and
+# SIGTERMing one mid-spawn strands a claimed intent with no worktree behind it.
 _list_project_watchers() {
   local pid argv0 seen=" " live=" " f mp trees="${WORKTREES_DIR:-${HERD_WORKTREES_DIR:-}}"
-  # Live gate-worker pids (review + health inflight markers) — never list these as "watchers".
+  # Live gate-worker + lane-dispatch pids — never list these as "watchers".
   if [ -n "$trees" ]; then
-    for f in "$trees"/.review-inflight-* "$trees"/.health-inflight-*; do
+    for f in "$trees"/.review-inflight-* "$trees"/.health-inflight-* "$trees"/.spawn-inflight-*; do
       [ -e "$f" ] || continue
       mp="$(head -1 "$f" 2>/dev/null || true)"
       case "$mp" in ''|*[!0-9]*) continue ;; esac

@@ -225,6 +225,7 @@ probe_alive
 STUB="$T/stub-resolve.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 HERD_RESOLVE_BIN="$STUB" spawn_resolver "$SLUG" "$PR" "$BRANCH" "$SHA2"
+_spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
 # The idle tab must have been closed (name reclaim) and the registry row pruned.
 grep -qxF "tab-idle" "$CLOSED" || fail "(9) spawn_resolver must close the idle resolve tab (got: $(cat "$CLOSED"))"
 grep -q 'tab-idle' "$REG" && fail "(9) the reaped tab's registry row must be pruned"

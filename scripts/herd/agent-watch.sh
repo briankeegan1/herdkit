@@ -128,6 +128,101 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # tracker-heal and builder-note surfaces, so both age out by one rule. Defines functions + two
 # constants (CONSOLE_ROW_RETENTION, CONSOLE_LEDGER_MAX); display-only, lib-safe.
 . "$HERE/console-section.sh"
+
+# ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
+# EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
+# whole control room rides ONE loop. A single `gh` that never returns — a wedged TLS handshake, a
+# black-holed proxy, a captive-portal DNS answer that hangs the connect — froze merges, gate-status
+# posts, collections and limit-parks INDEFINITELY. Nothing guarded it: WATCH_CLAUDE_PROBE_TIMEOUT
+# covers `claude` execs only. A per-call wall-clock bound converts "the console is dead" into "this
+# one call failed", which every call site already knows how to handle.
+#
+# CONTRACT
+#   • Signature: _gh_timeout <site> <gh-args…>  — <site> is a stable label for the JOURNAL, never
+#     passed to gh. stdout/stderr/exit status of gh are passed through UNTOUCHED, so a healthy call
+#     is byte-identical to the bare `gh …` it replaced (that is what the unit test asserts).
+#   • On expiry: journal ONE `gh_timeout` event carrying the site + budget, then return 124 (the
+#     coreutils convention). NOTHING is printed to stdout. A timed-out call therefore lands in the
+#     EXISTING gh-failure branch of its site — an empty inbox, a `return 0`, a `|| true`, an aborted
+#     sweep, PRS_LOOKUP_OK=0 — and never in a fabricated success. `journal_append` writes only to the
+#     journal file (its impl runs in an output-suppressed subshell), so a wrapper inside `$(…)` can
+#     never pollute the captured stdout.
+#   • gh's own non-zero exits (rate-limit, 404, auth) pass straight through and are NOT journaled —
+#     they are not availability faults and the sites already report them.
+#
+# The budget is INLINE, deliberately not a config key: a hung network call is never a policy choice.
+# HERD_GH_TIMEOUT_SECS is a TEST SEAM (so a unit need not wait 15 s), mirroring layout-reconcile.sh's
+# HERD_RELOAD_HERDR_TIMEOUT. A non-numeric/empty value falls back to the default rather than aborting.
+_GH_TIMEOUT_DEFAULT_SECS=15
+
+# _gh_timeout_secs — the effective per-call budget in seconds (fail-safe parse: garbage → default).
+_gh_timeout_secs() {
+  case "${HERD_GH_TIMEOUT_SECS:-}" in
+    ''|*[!0-9]*|0) printf '%s' "$_GH_TIMEOUT_DEFAULT_SECS" ;;
+    *)             printf '%s' "$HERD_GH_TIMEOUT_SECS" ;;
+  esac
+}
+
+# _gh_timeout_run <secs> <cmd> [args…] — run <cmd> under a HARD wall-clock bound, PRESERVING its
+# stdout (unlike _claude_probe_run_timeout, which discards it — most gh call sites capture JSON).
+# Returns 124 on expiry, else the command's own exit code. Portable, in preference order:
+#   1. coreutils `timeout` / `gtimeout` — exact, no added latency.
+#   2. perl — on every stock macOS and Linux. fork + SIGALRM in the parent: exact, and (unlike a
+#      poll loop) it adds ZERO latency to a fast call. This is the path that matters: the pure-shell
+#      watchdog below cannot sleep for less than a second, so on a stock macOS it would tax EVERY one
+#      of the tick's ~30 gh calls a full second — a fix for a hang that manufactures a stall.
+#   3. a pure-shell watchdog — last resort (no timeout binary AND no perl).
+# Every kill/wait/sleep is guarded so this can never abort a caller running under `set -e`.
+_gh_timeout_run() {
+  local secs="$1"; shift
+  local rc=0
+  if command -v timeout  >/dev/null 2>&1; then timeout  "$secs" "$@" || rc=$?; return "$rc"; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@" || rc=$?; return "$rc"; fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '
+      my $secs = shift;
+      my $pid = fork();
+      die "fork failed\n" unless defined $pid;
+      if ($pid == 0) { exec @ARGV or exit 127; }
+      $SIG{ALRM} = sub {
+        kill "TERM", $pid; sleep 1; kill "KILL", $pid; waitpid($pid, 0); exit 124;
+      };
+      alarm $secs;
+      waitpid($pid, 0);
+      alarm 0;
+      my $st = $?;
+      exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+    ' "$secs" "$@" || rc=$?
+    return "$rc"
+  fi
+  # No timeout binary and no perl. The watchdog needs a working `sleep` to enforce the bound; without
+  # one, degrade to an un-timed run rather than busy-spin into a FALSE timeout.
+  if ! sleep 0 2>/dev/null; then "$@" || rc=$?; return "$rc"; fi
+  "$@" &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null || true; sleep 1; kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true; return 124
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# _gh_timeout <site> <gh-args…> — THE seam. See the contract above.
+_gh_timeout() {
+  local _ght_site="$1"; shift
+  local _ght_secs _ght_rc=0
+  _ght_secs="$(_gh_timeout_secs)"
+  _gh_timeout_run "$_ght_secs" gh "$@" || _ght_rc=$?
+  if [ "$_ght_rc" -eq 124 ]; then
+    journal_append gh_timeout component agent-watch site "$_ght_site" timeout_secs "$_ght_secs"
+  fi
+  return "$_ght_rc"
+}
+
 MAIN="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 STATE="$TREES/.agent-watch-merged"
@@ -1011,7 +1106,7 @@ _inbox_record() {
 # (or the `gh` it calls). Prints the PR's comments as JSON ({"comments":[…]}); empty JSON on any error
 # (fail-soft — a gh hiccup yields an empty inbox, never a red row).
 _inbox_fetch_pr_comments() {
-  gh pr view "$1" --json comments 2>/dev/null || printf '{"comments":[]}'
+  _gh_timeout inbox_comments pr view "$1" --json comments 2>/dev/null || printf '{"comments":[]}'
 }
 
 # _inbox_extract_pr_comments — pure filter: read a `gh pr view --json comments` JSON on stdin and,
@@ -1785,6 +1880,69 @@ _marker_age() {
   now="$(_now_epoch)"; printf '%s' "$(( now - ts ))"
 }
 
+# ── Backgrounded lane dispatch (HERD-237) ─────────────────────────────────────────────────────────
+# Grounding (audit 2026-07-09, G4): the two lane invocations on the tick path ran in the FOREGROUND —
+# `_drain_spawn_queue` waited on herd-feature.sh/herd-quick.sh, `spawn_resolver` waited on
+# herd-resolve.sh. A lane creates a worktree, renders a task spec and starts an agent; a slow git
+# fetch or a wedged driver call inside one froze merges, collections and limit-parks for every OTHER
+# PR. The lane now runs in a background subshell and the tick moves on.
+#
+# WHAT IS PRESERVED, AND HOW: each lane's OUTCOME HANDLING moves into the background subshell with
+# it, unsplit — the queue's durability contract (PR #151: an intent is consumed only after its lane
+# observably spawned) and the resolver's spawn-ACK (HERD-206) still read the lane's real exit status
+# and output, just off the tick. Every journal event is the same event with the same fields; only the
+# tick it lands on can differ.
+#
+# WHY A MARKER, NOT JUST `&`: a `( … ) &` subshell of the watcher INHERITS the watcher's argv0
+# ($HERD_WATCH_ARGV0). `_list_project_watchers` (bin/herd) attributes watchers by exact argv0 match,
+# so an unmarked background lane would be counted as a second watcher by `herd status` and SIGTERM'd
+# mid-spawn by `herd reload`'s stray reaper. The gate workers solved this with inflight markers; these
+# reuse the mechanism, under a `.spawn-inflight-*` prefix that bin/herd exempts alongside the review
+# and health ones. The marker is written SYNCHRONOUSLY by the parent (before the tick continues) so
+# the exemption can never lose the race with a reload.
+#
+# The lane marker doubles as the drain's CROSS-TICK MUTEX: the foreground drain implicitly ran one
+# lane at a time and observed it finish before starting the next. `_lane_spawn_inflight` restores
+# exactly that serialization without blocking — a tick that finds a live lane marker simply drains
+# nothing and returns. Dead markers are garbage-collected on the way past (pid-gone / pid-recycled),
+# so a watcher killed mid-spawn cannot wedge the queue: the next tick sweeps the corpse and drains.
+SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
+
+# _spawn_inflight_file <kind> <slug> — the marker path for one in-flight lane. <kind> ∈ lane | resolve.
+_spawn_inflight_file() { printf '%s%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_')"; }
+
+# _spawn_inflight_bg <marker> <fn> [args…] — run <fn> in a background subshell, recording its pid in
+# <marker> BEFORE returning, and clearing the marker when it finishes. Never blocks; always returns 0.
+# The worker's own `rm` is the fast path; _spawn_inflight_sweep is the correctness one (it collects
+# markers left by a watcher killed mid-spawn, and the marker a worker that exited BEFORE the parent
+# got to write it — a race whose only cost is one skipped drain tick).
+_spawn_inflight_bg() {
+  local _sib_marker="$1"; shift
+  ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true ) &
+  _marker_write "$_sib_marker" "$!"
+  return 0
+}
+
+# _spawn_inflight_sweep — drop every spawn marker whose pid is dead (or recycled into another process).
+_spawn_inflight_sweep() {
+  local _sis_f
+  for _sis_f in "$SPAWN_INFLIGHT_PREFIX"*; do
+    [ -e "$_sis_f" ] || continue
+    _marker_live "$_sis_f" 2>/dev/null || rm -f "$_sis_f" 2>/dev/null || true
+  done
+}
+
+# _lane_spawn_inflight — true iff a builder lane spawned by a previous tick is STILL running. Corpses
+# are swept first, so a watcher killed mid-spawn can never hold the queue shut.
+_lane_spawn_inflight() {
+  _spawn_inflight_sweep
+  local _lsi_f
+  for _lsi_f in "$SPAWN_INFLIGHT_PREFIX"lane-*; do
+    [ -e "$_lsi_f" ] && return 0
+  done
+  return 1
+}
+
 # ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
 # _classify_review_tier <pr#> — echo the review tier for a PR's diff: STRONG | CHEAP | DOCS | SKIP.
 # Only ever called when REVIEW_ESCALATE_GLOB or DOCS_ONLY_GLOB is set (the opt-in); with BOTH empty the
@@ -1800,7 +1958,7 @@ _marker_age() {
 _classify_review_tier() {
   local pr="$1" paths n max
   # Changed-file paths for THIS PR's diff. Any failure/empty list → STRONG (never downgrade blind).
-  paths="$(gh pr diff "$pr" --name-only 2>/dev/null | awk 'NF')"
+  paths="$(_gh_timeout review_scope_diff pr diff "$pr" --name-only 2>/dev/null | awk 'NF')"
   [ -n "$paths" ] || { printf STRONG; return 0; }
   # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ — i.e. NO line fails to match
   # the docs/test pattern → skip the adversarial review entirely.
@@ -2533,7 +2691,7 @@ post_gate_status() {
     return 0
   fi
   [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
-  if gh api "repos/{owner}/{repo}/statuses/$sha" -f state="$state" -f context="$GATE_STATUS_CONTEXT" -f description="$desc" >/dev/null 2>&1; then
+  if _gh_timeout gate_status_post api "repos/{owner}/{repo}/statuses/$sha" -f state="$state" -f context="$GATE_STATUS_CONTEXT" -f description="$desc" >/dev/null 2>&1; then
     _record_gate_status "$pr" "$sha" "$state"
     journal_append gate_status pr "$pr" sha "$sha" state "$state" context "$GATE_STATUS_CONTEXT"
   fi
@@ -2547,7 +2705,7 @@ post_gate_status() {
 _gate_status_blessed() {
   local sha="$1" state
   [ -n "$sha" ] || return 1
-  state="$(gh api "repos/{owner}/{repo}/commits/$sha/statuses" \
+  state="$(_gh_timeout gate_status_blessed api "repos/{owner}/{repo}/commits/$sha/statuses" \
              --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0].state" 2>/dev/null || true)"
   [ "$state" = "success" ]
 }
@@ -2622,7 +2780,7 @@ sys.exit(1)'
 # wrote it, so a failure posted by another seat is distinguishable from one of ours. Fail-soft: empty.
 _gate_status_current() {
   [ -n "${1:-}" ] || return 0
-  gh api "repos/{owner}/{repo}/commits/$1/statuses" \
+  _gh_timeout gate_status_current api "repos/{owner}/{repo}/commits/$1/statuses" \
     --jq "[.[] | select(.context==\"$GATE_STATUS_CONTEXT\")][0] | \"\(.state // \"\") \(.creator.login // \"\")\"" 2>/dev/null || true
 }
 
@@ -2630,9 +2788,9 @@ _gate_status_current() {
 # on THIS sha. Prints the blocking seat's login. rc: 0 standing · 1 none · 2 degraded (unreadable).
 _xseat_foreign_block() {
   local pr="$1" sha="$2" me="$3" since json out rc
-  since="$(gh api "repos/{owner}/{repo}/commits/$sha" --jq '.commit.committer.date' 2>/dev/null || true)"
+  since="$(_gh_timeout xseat_commit_date api "repos/{owner}/{repo}/commits/$sha" --jq '.commit.committer.date' 2>/dev/null || true)"
   case "$since" in ''|null) return 2 ;; esac
-  json="$(gh pr view "$pr" --json comments 2>/dev/null || true)"
+  json="$(_gh_timeout xseat_comments pr view "$pr" --json comments 2>/dev/null || true)"
   [ -n "$json" ] || return 2
   out="$(printf '%s' "$json" | python3 -c "$_XSEAT_PY" "$since" "$me" 2>/dev/null)"; rc=$?
   case "$rc" in 0) printf '%s' "$out" ;; 1|2) ;; *) rc=2 ;; esac
@@ -3165,7 +3323,7 @@ _ci_names_summary() {
 _ci_gate_eval() {
   local _cg_pr="$1" _cg_sha="$2" _cg_slug="$3" _cg_json _cg_norm
   [ -n "$_cg_pr" ] || return 0
-  _cg_json="$(gh pr view "$_cg_pr" --json statusCheckRollup 2>/dev/null)" || return 0
+  _cg_json="$(_gh_timeout ci_checks pr view "$_cg_pr" --json statusCheckRollup 2>/dev/null)" || return 0
   [ -n "$_cg_json" ] || return 0
   _cg_norm="$(printf '%s' "$_cg_json" | _ci_checks_normalize)"
   [ -n "$_cg_norm" ] || return 0   # no checks configured → byte-identical, no side effects
@@ -3209,7 +3367,7 @@ EOF
 # _pr_body <pr#> — the PR's body text, or empty on any failure. Isolated so the hermetic tests can
 # stub `gh pr view` and so the (potentially large) body is only fetched when the hold is relevant.
 _pr_body() {
-  gh pr view "$1" --json body -q '.body' 2>/dev/null || true
+  _gh_timeout pr_body pr view "$1" --json body -q '.body' 2>/dev/null || true
 }
 
 # pr_human_verify_held <pr#> — true iff the PR body declares a NON-EMPTY HUMAN-VERIFY block.
@@ -3589,9 +3747,17 @@ _reap_idle_resolver_for_redispatch() {
 # IDLE-REDISPATCH (HERD-225): when the prior resolve·<slug> agent is still ALIVE but idle/done, reap
 # it first so the lane can reclaim the agent name (otherwise herdr refuses with "agent name already
 # used" and the new conflict sits forever).
+#
+# BACKGROUNDED (HERD-237): the lane + its ACK probe + its journal run in a background subshell — the
+# whole tail, unsplit, so the ACK is still OBSERVED from the lane's real exit status and the driver's
+# post-spawn roster. Only the tick that carries those events can differ. The two things that MUST be
+# on the tick are: the self-restart refusal (its non-zero rc is the caller's "no resolver is running"
+# signal) and record_resolve_attempt (record-first keeps the respawn budget sound even if the watcher
+# dies mid-spawn) — both stay foreground, in order, above the fork. A same-slug re-dispatch on the
+# NEXT tick is prevented exactly as before: the ledger row is already written, so _resolver_in_flight
+# reads STARTING for the whole _RESOLVER_DEAD_GRACE window that this very race motivated.
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
-  local _sr_rc=0 _sr_ack _sr_roster
   # SELF-RESTART QUIESCE (HERD-251): defence in depth. Both callers hold ABOVE their own ledger writes
   # (the resolve pass at its row, _handle_stale_dup above record_refix), so this is unreachable
   # today. It returns NON-ZERO — never 0 — because `_resolver_in_flight … || spawn_resolver …` reads a
@@ -3600,6 +3766,29 @@ spawn_resolver() {
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
+  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs")"
+  _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha"
+  # The bg pid, so a test (and the sim) can synchronize on the dispatch it just made instead of
+  # sleeping. Production never reads it — the resolver reports through its ledger + result file.
+  _SPAWN_RESOLVER_BG_PID="$!"
+  return 0
+}
+
+# _spawn_resolver_wait — block until the most recent spawn_resolver's lane has finished, or return
+# immediately when none was dispatched from this shell. The TICK never calls this (not waiting is the
+# entire point); it is the synchronization seam the hermetic tests and sims use to assert on the
+# dispatch they just made, instead of sleeping and hoping.
+_spawn_resolver_wait() {
+  [ -n "${_SPAWN_RESOLVER_BG_PID:-}" ] || return 0
+  wait "$_SPAWN_RESOLVER_BG_PID" 2>/dev/null || true
+  return 0
+}
+
+# _spawn_resolver_lane <slug> <pr#> <sha> — the backgrounded body of spawn_resolver: launch the lane,
+# observe the ACK, journal. Identical to the pre-HERD-237 foreground tail, verbatim.
+_spawn_resolver_lane() {
+  local rs="$1" rp="$2" rsha="$3"
+  local _sr_rc=0 _sr_ack _sr_roster
   _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
@@ -3732,7 +3921,7 @@ record_reconcile() {
 # silently mark an unrelated tracker item shipped on every merge of an untracked PR.
 _reconcile_pr_ref() {
   local body ref
-  body="$(gh pr view "$1" --json body -q .body 2>/dev/null || true)"
+  body="$(_gh_timeout reconcile_pr_ref pr view "$1" --json body -q .body 2>/dev/null || true)"
   [ -n "$body" ] || return 0
   # Strip HTML comment blocks (possibly multi-line) so template instructions/examples can't be read as
   # a real ref. python3 is already a hard dependency here; if it is somehow unavailable, fall back to
@@ -4850,9 +5039,16 @@ do_merge() {
   # two: an EMPTY state is a gh outage (`merge_gh_unreadable`), a readable non-MERGED state is a real
   # refusal. Both still return 1 and skip the hooks — the PR is re-gated next tick either way, and the
   # post-merge reconcile sweep is the backstop if it turns out the merge did land.
+  #
+  # HERD-237: the merge call is timeout-wrapped like every other gh call. A merge killed at the
+  # deadline is INDISTINGUISHABLE from any other non-zero merge exit — including one where GitHub
+  # already applied the merge — which is precisely the case the HERD-221 state re-check below was
+  # written for: it re-reads the PR's actual state instead of inferring it from the exit code. A
+  # timed-out merge whose PR reads MERGED runs its hooks; one that reads unmerged/unreadable returns 1
+  # and is re-gated next tick. No new failure mode, and the tick no longer wedges on a hung merge.
   if [ -n "$dsha" ]; then
-    if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
-      _dm_state="$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null || true)"
+    if ! _gh_timeout merge_pinned pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
+      _dm_state="$(_gh_timeout merge_state_recheck pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null || true)"
       if [ "$_dm_state" != "MERGED" ]; then
         if [ -n "$_dm_state" ]; then
           journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha" state "$_dm_state"
@@ -4863,8 +5059,8 @@ do_merge() {
       fi
     fi
   else
-    if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1; then
-      [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" = "MERGED" ] || return 1
+    if ! _gh_timeout merge_unpinned pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1; then
+      [ "$(_gh_timeout merge_state_recheck pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" = "MERGED" ] || return 1
     fi
   fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
@@ -4935,7 +5131,7 @@ do_merge() {
 # name OR number, or nothing on any error (no PR, deleted branch, gh down). One network call. The head
 # OID is what makes the sweep SAFE (see _startup_reap_sweep) — never reap without it.
 _srs_gh_view() {
-  gh pr view "$1" --json state,number,headRefOid \
+  _gh_timeout startup_reap_view pr view "$1" --json state,number,headRefOid \
     -q '.state+"\t"+((.headRefOid)//"")+"\t"+(((.number)//0)|tostring)' 2>/dev/null || true
 }
 
@@ -5083,7 +5279,7 @@ for line in os.environ.get("WT","").splitlines():
   # slug that keys the tab, instead of assuming the slug is the last '/'-segment.
   local _sw_pr_slugs
   local _sw_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_sw_tmpl" ] || _sw_tmpl='feat/{slug}'
-  _sw_pr_slugs="$(gh pr list --json headRefName 2>/dev/null | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
+  _sw_pr_slugs="$(_gh_timeout worktree_sweep_prs pr list --json headRefName 2>/dev/null | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
 import sys, json, os
 tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
 if "{slug}" not in tmpl: tmpl = "feat/{slug}"
@@ -5373,7 +5569,7 @@ except Exception:
   #     "zero open PRs", and the pre-fix sweep read that as "no slug has a PR → close every resolve tab".
   #     Capture the raw output + its EXIT STATUS first; a non-zero rc aborts the sweep untouched.
   local _srt_raw _srt_rc=0
-  _srt_raw="$(gh pr list --json headRefName,mergeable 2>/dev/null)" || _srt_rc=$?
+  _srt_raw="$(_gh_timeout resolver_tab_sweep_prs pr list --json headRefName,mergeable 2>/dev/null)" || _srt_rc=$?
   [ "$_srt_rc" -eq 0 ] || return 0
   local _srt_prs _srt_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_srt_tmpl" ] || _srt_tmpl='feat/{slug}'
   _srt_prs="$(printf '%s' "$_srt_raw" | BRANCH_TEMPLATE="$_srt_tmpl" python3 -c '
@@ -5658,7 +5854,7 @@ _pms_merged_prs() {
     _pmp_json="$(cat "$HERD_PMS_PRS_JSON_FILE" 2>/dev/null)" || return 1
   else
     command -v gh >/dev/null 2>&1 || return 1
-    _pmp_json="$(gh pr list --state merged --limit "$_PMS_LOOKBACK" \
+    _pmp_json="$(_gh_timeout postmerge_sweep_prs pr list --state merged --limit "$_PMS_LOOKBACK" \
       --json number,headRefOid,headRefName,mergedAt 2>/dev/null)" || return 1
   fi
   [ -n "$_pmp_json" ] || return 0
@@ -6763,14 +6959,14 @@ _stale_dup_gate_step() {
     journal_append stale_dup_hold pr "$_sdg_pr" sha "$_sdg_sha" slug "$_sdg_slug" \
       kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
     if [ "$_STALE_DUP_KIND" = "stale-base" ] && _stale_base_autofix_enabled; then
-      gh pr comment "$_sdg_pr" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
+      _gh_timeout stale_base_comment pr comment "$_sdg_pr" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
 
 **Why:** ${_STALE_DUP_REASON}
 
 This is a mechanical base-stale hold (touched files moved on \`${DEFAULT_BRANCH}\`). The watcher is auto-bouncing the builder to \`git merge ${DEFAULT_BRANCH}\` (or dispatching the conflict resolver if no live builder remains). Only bounce-budget exhaustion escalates to a human. (Disable the heal with \`STALE_BASE_AUTOFIX=off\`; disable the gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
       herd_driver_notify "🔁 PR #${_sdg_pr} stale-base — auto-healing" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
     else
-      gh pr comment "$_sdg_pr" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
+      _gh_timeout stale_dup_comment pr comment "$_sdg_pr" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
 
 **Why:** ${_STALE_DUP_REASON}
 
@@ -8798,7 +8994,7 @@ _watcher_view_filter() {
   # `mine` needs an identity: prefer the configured author, else resolve the gh user; if neither is
   # available, fall back to `all` (loud) rather than silently hiding every PR.
   if [ "$_wvf_lens" = "mine" ] && [ -z "$_wvf_author" ]; then
-    _wvf_author="$(gh api user -q .login 2>/dev/null || true)"
+    _wvf_author="$(_gh_timeout view_filter_user api user -q .login 2>/dev/null || true)"
     if [ -z "$_wvf_author" ]; then
       _watcher_view_warn_once "WATCHER_VIEW=mine but no WATCHER_VIEW_AUTHOR set and gh user unresolved — falling back to 'all'" "mine:noauthor"
       _wvf_lens="all"
@@ -8889,7 +9085,7 @@ _resolve_watcher_owner() {
   [ -n "$_WATCHER_OWNER_RESOLVED" ] && return 0
   if   [ -n "${WATCHER_OWNER:-}" ];       then _WATCHER_OWNER_CACHE="$WATCHER_OWNER"
   elif [ -n "${WATCHER_VIEW_AUTHOR:-}" ]; then _WATCHER_OWNER_CACHE="$WATCHER_VIEW_AUTHOR"
-  else _WATCHER_OWNER_CACHE="$(gh api user -q .login 2>/dev/null || true)"; fi
+  else _WATCHER_OWNER_CACHE="$(_gh_timeout watcher_owner_user api user -q .login 2>/dev/null || true)"; fi
   _WATCHER_OWNER_RESOLVED=1
 }
 _watcher_owner_login() { _resolve_watcher_owner; printf '%s' "$_WATCHER_OWNER_CACHE"; }
@@ -8934,7 +9130,7 @@ _watcher_tick_fields() {
 #     definitive awaiting-task / died-(no PR) claims. The view filter still applies on success.
 _prs_fetch_tick() {
   local _raw _rc=0
-  _raw="$(gh pr list --json "$(_watcher_tick_fields)" 2>/dev/null)" || _rc=$?
+  _raw="$(_gh_timeout tick_pr_list pr list --json "$(_watcher_tick_fields)" 2>/dev/null)" || _rc=$?
   if [ "$_rc" -ne 0 ]; then
     PRS_LOOKUP_OK=0
     PRS_JSON='[]'
@@ -9453,7 +9649,7 @@ _spawn_dep_merged() {
   # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
   # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
   if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi
-  [ "$(gh pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
+  [ "$(_gh_timeout spawn_dep_state pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
   return 1
 }
 
@@ -9493,8 +9689,8 @@ _spawn_clear_held() {
 # worktree roster) is computed earlier this tick, so active count is its length.
 #
 # DURABILITY CONTRACT (review gate, PR #151): an intent is consumed (`done`, rm) ONLY after its
-# lane observably spawned. The lane runs in the FOREGROUND with output captured, because the lanes
-# have TWO no-builder exits the old backgrounded launch could never see:
+# lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
+# never see:
 #   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
 #     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
 #     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
@@ -9503,6 +9699,28 @@ _spawn_clear_held() {
 #     is dropped LOUDLY (skip + journal), never silently.
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
 # post-mortem can answer "why did nothing spawn?" from `herd log` alone.
+#
+# HERD-237 — the lane no longer runs in the tick's foreground. The contract above is UNCHANGED: the
+# lane's output and exit status are still captured and still decide the intent's fate, but that whole
+# observe-and-consume tail moved WITH the lane into `_drain_lane_worker`, which runs in a background
+# subshell (`_spawn_inflight_bg`). The tick fires it and moves on; a lane that takes 30 s to clone a
+# worktree no longer stalls merges, collections and limit-parks for every other PR. Until its worker
+# finishes, the intent stays CLAIMED (.req.mine) — so the drain is durable across a watcher death at
+# any instant, exactly as before.
+#
+# ONE LANE AT A TIME, still. The foreground drain implicitly serialized lanes, and stopped the tick
+# outright on a saturation defer (`break`) so siblings would not defer against the same gate. Both
+# properties survive without blocking: at most ONE lane is launched per tick, and none at all while a
+# previous tick's lane is still in flight (`_lane_spawn_inflight`). A saturated gate therefore still
+# costs exactly one lane invocation per tick, never one per queued intent.
+#
+# What does NOT change is the SCAN. The loop still walks the queue to its budget every tick, so a
+# dependency hold is still recorded and journaled (spawn_held) on the tick it becomes visible — the
+# HERD-94 invariant that one stalled dependency never freezes the queue. A runnable intent that cannot
+# launch this tick (its slot is taken by a live lane) is simply RELEASED with the held ones and
+# re-claimed next tick, in the same FIFO order. Net effect: the queue drains one intent per tick
+# instead of N-in-one-blocking-tick — faster in wall-clock whenever a lane outlives the 4 s tick,
+# which is every real lane.
 #
 # DEPENDENCY ORDERING (HERD-94): an intent may carry an after=<slug|pr#> (the .after sidecar, surfaced
 # as the 4th claim line). While that dependency is NOT yet MERGED the intent is HELD: it stays claimed
@@ -9518,11 +9736,43 @@ _spawn_clear_held() {
 #
 # Fail-soft: a malformed intent is skipped with a logged warning — never crashes the watcher loop.
 # Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
+_drain_lane_worker() {
+  local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
+  local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
+  [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
+  # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
+  # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
+  # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
+  # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
+  _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then
+    # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
+    # a later tick. The drain already stopped for this tick when it launched this worker.
+    bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1 || true
+    journal_append spawn_deferred slug "$_dlw_slug" lane "$_dlw_lane"
+  elif [ "$_dlw_rc" -ne 0 ]; then
+    # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the journal
+    # records why, so a lost spawn is always visible in `herd log`.
+    bash "$HERE/spawn-step.sh" skip "$_dlw_claimed" "lane exited $_dlw_rc" >/dev/null 2>&1 || true
+    journal_append spawn_skipped slug "$_dlw_slug" lane "$_dlw_lane" reason "lane exited $_dlw_rc"
+  else
+    # Spawned: only now is the intent consumed.
+    bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1 || true
+    journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
+  fi
+  return 0
+}
+
 _drain_spawn_queue() {
   [ -z "${DRYRUN:-}" ] || return 0
   local _dsq_q="$TREES/spawn-queue"
   [ -d "$_dsq_q" ] || return 0
   ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+  # This tick's ONE launch slot. Taken already when a lane launched by an earlier tick is still
+  # running (its intent is claimed, its outcome not yet observed) — the pre-HERD-237 foreground drain
+  # could not have started a second lane there either. Corpse markers are swept by the predicate.
+  local _dsq_can_launch=1
+  _lane_spawn_inflight && _dsq_can_launch=0
 
   # Daily-budget governance (HERD-95): PAUSE draining when today's recorded spend has EXCEEDED
   # BUDGET_DAILY. The lanes refuse a spawn individually too, but pausing the drain here stops the
@@ -9604,39 +9854,28 @@ _drain_spawn_queue() {
           _dsq_held+=("$_dsq_claimed")
           continue
         fi
+        # The launch slot is already spent this tick (a lane is running). Release this intent with the
+        # dependency-held ones and re-claim it next tick — FIFO order is preserved by the INTENT_ID
+        # filenames. It still SPENDS budget, so a long queue is walked at most _dsq_budget deep per
+        # tick, exactly as the foreground drain walked it. Checked ABOVE the spawn_released announce
+        # so a release is only ever announced on the tick that acts on it.
+        if [ "$_dsq_can_launch" != "1" ]; then
+          _dsq_held+=("$_dsq_claimed")
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
         # Dependency met (or none). If this intent had been held on a prior tick, announce the release
         # (spawn_released, dependency named) and clear its hold row before it spawns below.
         if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
           journal_append spawn_released slug "$_dsq_slug" lane "$_dsq_lane" after "$_dsq_after"
           _spawn_clear_held "$_dsq_id"
         fi
-        # Launch the lane in the FOREGROUND and observe the outcome before consuming the intent.
-        # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
-        # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
-        # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
-        # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
-        local _dsq_out="" _dsq_rc=0
-        if [ "$_dsq_lane" = "feature" ]; then
-          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-feature.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
-        else
-          _dsq_out="$(HERD_ITEM_REF="$_dsq_ref" bash "$HERE/herd-quick.sh" "$_dsq_slug" "$_dsq_task" 2>&1)" || _dsq_rc=$?
-        fi
-        if [ "$_dsq_rc" -eq 0 ] && printf '%s' "$_dsq_out" | grep -q 'review-gate saturated'; then
-          # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent
-          # back for a later tick and stop draining — siblings would defer against the same gate.
-          bash "$HERE/spawn-step.sh" release "$_dsq_claimed" >/dev/null 2>&1 || true
-          journal_append spawn_deferred slug "$_dsq_slug" lane "$_dsq_lane"
-          break
-        elif [ "$_dsq_rc" -ne 0 ]; then
-          # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the
-          # journal records why, so a lost spawn is always visible in `herd log`.
-          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "lane exited $_dsq_rc" >/dev/null 2>&1 || true
-          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "lane exited $_dsq_rc"
-        else
-          # Spawned: only now is the intent consumed.
-          bash "$HERE/spawn-step.sh" done "$_dsq_claimed" >/dev/null 2>&1 || true
-          journal_append spawn_launched slug "$_dsq_slug" lane "$_dsq_lane"
-        fi
+        # Launch the lane in the BACKGROUND (HERD-237). The worker observes the lane's output + exit
+        # status and only then consumes/releases the intent, so the PR #151 durability contract is
+        # unchanged; the tick just no longer waits for it. The marker keeps the worker out of
+        # `_list_project_watchers` and holds the launch slot shut until the lane lands.
+        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug")" \
+          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
+        _dsq_can_launch=0
         _dsq_n=$(( _dsq_n + 1 ))
         ;;
     esac
@@ -10098,12 +10337,23 @@ EOF
 
     # Re-verify in the instant before merging — guard the window between classification and merge.
     IFS=$'\t' read -r rmergeable rmstate rbranch rsha rauthor < <(
-      gh pr view "$prnum" --json mergeable,mergeStateStatus,headRefName,headRefOid,author 2>/dev/null | python3 -c '
+      _gh_timeout merge_reverify pr view "$prnum" --json mergeable,mergeStateStatus,headRefName,headRefOid,author 2>/dev/null | python3 -c '
 import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), str(d.get("headRefName","")), str(d.get("headRefOid","")), str((d.get("author") or {}).get("login",""))]))
 ')
+    # HONEST LABELS (HERD-237, the HERD-232/G6 convention): an ALL-EMPTY read is gh being unreadable —
+    # timed out at the guard above, rate-limited, auth expired — NOT a PR that moved. Calling it "no
+    # longer maps to <branch>" paints a ⚠️ needs-you row for a network blip, and the timeout guard would
+    # have made that the routine outcome of every outage. Both branches refuse the merge and re-gate
+    # next tick; only the label differs. Unreachable on a healthy gh (a live PR always has a branch).
+    if [ -z "$rbranch" ] && [ -z "$rsha" ] && [ -z "$rmstate" ]; then
+      journal_append merge_reverify_unreadable pr "$prnum" slug "$slug" sha "$candsha"
+      DISPLAY[idx]="    ${C_DIM}⋯${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}gh unreadable · re-checking next tick${C_RESET}"
+      render
+      continue
+    fi
     if [ "$rbranch" != "$branch" ]; then
       DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · PR #${prnum} no longer maps to ${branch}${C_RESET}"
       render
@@ -10322,7 +10572,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
             # loudly as coordinator-actionable so a coordinator/agent runs the steps then approves.
             journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" human_verify_policy coordinator
             hv_steps="$(pr_human_verify_steps "$prnum")"
-            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual steps and \`HUMAN_VERIFY_POLICY=coordinator\`, so it is held as **coordinator-actionable**: a coordinator/agent should execute these steps, then approve:
+            _gh_timeout hv_coordinator_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual steps and \`HUMAN_VERIFY_POLICY=coordinator\`, so it is held as **coordinator-actionable**: a coordinator/agent should execute these steps, then approve:
 
 ${hv_steps}
 
@@ -10332,7 +10582,7 @@ Once executed, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approv
             # HUMAN_VERIFY_POLICY=hold (default): byte-identical to today's per-PR human-verify hold.
             journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
             hv_steps="$(pr_human_verify_steps "$prnum")"
-            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
+            _gh_timeout hv_hold_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
 
 ${hv_steps}
 
@@ -10340,7 +10590,7 @@ Once verified, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approv
             herd_driver_notify "🐑 PR #${prnum} human-verify pending" "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" default
           else
             journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
-            gh pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
+            _gh_timeout approve_hold_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
 
 Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
             herd_driver_notify "🐑 PR #${prnum} awaiting approval" "${slug}: gates passed — herd approve ${prnum}" default
@@ -10358,7 +10608,7 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
           record_hv_informed "$prnum" "$rsha"
           hv_steps="$(pr_human_verify_steps "$prnum")"
           journal_append human_verify_policy pr "$prnum" sha "$rsha" slug "$slug" policy auto action merged-with-declared-steps
-          gh pr comment "$prnum" --body "🐑 **herd watch** · \`HUMAN_VERIFY_POLICY=auto\` — this PR declared manual verify steps, treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These steps were NOT executed before merge:
+          _gh_timeout hv_auto_comment pr comment "$prnum" --body "🐑 **herd watch** · \`HUMAN_VERIFY_POLICY=auto\` — this PR declared manual verify steps, treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These steps were NOT executed before merge:
 
 ${hv_steps}
 

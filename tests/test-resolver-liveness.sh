@@ -285,6 +285,7 @@ reset
 STUB="$T/stub-resolve.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 HERD_RESOLVE_BIN="$STUB" spawn_resolver "$SLUG" "$PR" "$BRANCH" "$SHA"
+_spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
 grep -q '"event":"resolver_spawn"' "$JOURNAL_FILE" || fail "(15) spawn_resolver must journal a resolver_spawn ACK event"
 grep -q '"acked":"no"' "$JOURNAL_FILE" || fail "(15) a resolver that never registered must journal acked=no"
 grep -q '"rc":0' "$JOURNAL_FILE" || fail "(15) the ACK event must carry the lane's exit status"
@@ -293,6 +294,7 @@ grep -q '"rc":0' "$JOURNAL_FILE" || fail "(15) the ACK event must carry the lane
 reset
 printf '#!/usr/bin/env bash\nexit 3\n' > "$STUB"
 HERD_RESOLVE_BIN="$STUB" spawn_resolver "$SLUG" "$PR" "$BRANCH" "$SHA"
+_spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
 grep -q '"event":"resolver_spawn_failed"' "$JOURNAL_FILE" || fail "(15) a non-zero lane rc must journal resolver_spawn_failed"
 grep -q '"event":"resolver_spawn_failed".*"rc":3' "$JOURNAL_FILE" || fail "(15) resolver_spawn_failed must carry the real rc"
 ok

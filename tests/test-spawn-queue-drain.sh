@@ -68,12 +68,24 @@ done
 # journal_append (logs events) and the tick globals it reads (TREES, FEATS, caps, HERE).
 JLOG="$T/journal.log"
 DRAIN_SRC="$T/drain.sh"
-sed -n '/^_drain_spawn_queue()/,/^}/p' "$WATCH" > "$DRAIN_SRC"
-grep -q '_drain_spawn_queue()' "$DRAIN_SRC" || fail "could not extract _drain_spawn_queue from agent-watch.sh"
+: > "$DRAIN_SRC"
+# HERD-237: the drain now fires its lane through a background worker guarded by an inflight marker,
+# so the harness needs the worker + the marker helpers alongside _drain_spawn_queue itself.
+for fn in _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+          _drain_lane_worker _drain_spawn_queue; do
+  sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$DRAIN_SRC"
+  grep -q "^$fn()" "$DRAIN_SRC" || fail "could not extract $fn from agent-watch.sh"
+done
 
+# run_drain — one tick's drain. HERD-237: the lane runs in a BACKGROUND worker, so the tick returns
+# before the intent is consumed; `wait` synchronizes on that worker exactly as the next tick's
+# _lane_spawn_inflight marker check would, and every assertion below still reads a settled queue.
 run_drain() {
   ( export LANELOG LANE_MODE="$T/lane.mode" JLOG
     HERE="$ENG"; TREES="$T/trees"; FEATS=()
+    SPAWN_INFLIGHT_PREFIX="$T/trees/.spawn-inflight-"
+    _marker_write(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
+    _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     # HERD-95: the drain now consults budget_daily_exceeded + the _BUDGET_DRAIN_PAUSED tick state.
     # Stub the predicate DORMANT (return 1) and init the state so these cases test the drain path
@@ -84,7 +96,8 @@ run_drain() {
     journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }
     # shellcheck source=/dev/null
     . "$DRAIN_SRC"
-    _drain_spawn_queue )
+    _drain_spawn_queue
+    wait )
 }
 
 enqueue(){ ( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$SPAWN" "$@" >/dev/null ); }
