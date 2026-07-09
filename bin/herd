@@ -3876,7 +3876,7 @@ cmd_report() {
 #   RUN      a foreground process matches <match> (|-separated substrings); pid printed
 #   BUSY     something else is running — never hijack this pane
 _reload_pane_state() {
-  herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
 import sys,json,os
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: print("GONE"); sys.exit(0)
@@ -3900,7 +3900,7 @@ print("BUSY" if fg else "BARE")
 # incident where a dead viewer's leftover keystrokes concatenated onto our run — is rejected, so a
 # false ✓ can't survive. <match> is a '|'-separated set of accepted script names.
 _reload_pane_alive() {
-  herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
 import sys,json,os,re
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: sys.exit(1)
@@ -3917,10 +3917,14 @@ sys.exit(1)
 ' 2>/dev/null
 }
 
-# _reload_pane_ready <pane_id> — bounded wait for the pane's shell to initialize.
+# _reload_pane_ready <pane_id> [start_secs] [deadline_secs] — bounded wait for the pane's shell to
+# initialize. When a wall-clock deadline is supplied (start_secs = the caller's $SECONDS baseline,
+# deadline_secs = the hard bound), abort early the moment it is exceeded so a wedged herdr can never
+# stretch the readiness poll past the caller's overall timeout (HERD-208).
 _reload_pane_ready() {
-  local pane="$1" tries="${HERD_RELOAD_PANE_POLLS:-25}" i=0 st
+  local pane="$1" start="${2:-}" deadline="${3:-}" tries="${HERD_RELOAD_PANE_POLLS:-25}" i=0 st
   while [ "$i" -lt "$tries" ]; do
+    [ -n "$deadline" ] && [ "$(( SECONDS - start ))" -ge "$deadline" ] && return 1
     st="$(_reload_pane_state "$pane" "")"
     case "$st" in BARE|BUSY|RUN*) return 0 ;; esac
     sleep 0.2; i=$((i+1))
@@ -3937,22 +3941,37 @@ _reload_pane_ready() {
 # merely echoes the script token never earns a false ✓.
 _reload_pane_run_verified() {
   local pane="$1" cmd="$2" match="$3" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i pid
+  # HARD wall-clock bound across the WHOLE verify — readiness wait AND both retry attempts. Each herdr
+  # subcall below is ALSO individually time-bounded (_reload_pane_ready→_reload_pane_state,
+  # _reload_pane_alive, and the send-keys/run here all route through _reload_timeout), so a single
+  # wedge can't sit past one loop tick; this deadline additionally caps how many bounded-but-slow ticks
+  # can stack, GUARANTEEING the helper returns to its caller (→ headless fallback) instead of ever
+  # blocking indefinitely — the HERD-208 WSL2 hang. Normal fast-herdr runs finish the poll budget well
+  # inside the deadline, so a genuine never-visible pane still returns an ordinary miss (not a timeout).
+  local deadline="${HERD_RELOAD_VERIFY_DEADLINE:-30}" start="$SECONDS"
   for attempt in 1 2; do
-    _reload_pane_ready "$pane" || true   # bounded wait; the verify below is the real gate
+    [ "$(( SECONDS - start ))" -ge "$deadline" ] && break
+    _reload_pane_ready "$pane" "$start" "$deadline" || true   # bounded wait; the verify below is the real gate
     # Flush any pending/typed-ahead input BEFORE injecting the command: ctrl+c aborts a partial
     # line, ctrl+u kills the line buffer back to a clean prompt. Otherwise a dead viewer's buffered
     # keystrokes prepend onto our run and the shell rejects the malformed line — the viewer never
     # starts, yet the old loose poll reported success off the stale shell.
-    herdr pane send-keys "$pane" ctrl+c ctrl+u >/dev/null 2>&1 || true
-    herdr pane run "$pane" "$cmd" >/dev/null 2>&1 || true
+    _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane send-keys "$pane" ctrl+c ctrl+u >/dev/null 2>&1 || true
+    _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane run "$pane" "$cmd" >/dev/null 2>&1 || true
     i=0
     while [ "$i" -lt "$vp" ]; do
+      [ "$(( SECONDS - start ))" -ge "$deadline" ] && break 2
       if pid="$(_reload_pane_alive "$pane" "$match")" && [ -n "$pid" ]; then
         printf '%s' "$pid"; return 0
       fi
       sleep 0.2; i=$((i+1))
     done
   done
+  # Distinguish a HARD-timeout abort (wedged herdr → the indefinite-hang class) from an ordinary
+  # never-visible miss, and say so loudly so the operator sees WHY reload degraded to headless.
+  if [ "$(( SECONDS - start ))" -ge "$deadline" ]; then
+    warn "pane $pane verify hit the ${deadline}s hard timeout — herdr pane verification wedged (WSL2 HERD-208); aborting to the headless watcher instead of blocking"
+  fi
   return 1
 }
 
