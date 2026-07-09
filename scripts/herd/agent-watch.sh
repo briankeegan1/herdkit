@@ -324,6 +324,16 @@ BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
+# Console palette — themed via HERD_THEME (default tokyonight, byte-identical to the old hardcoded
+# truecolor block). theme.sh resolves .herd/themes/<name>/palette.sh → templates/themes/<name>/ →
+# tokyonight, warns-once-and-falls-back on an unknown/broken theme, and renders plain under NO_COLOR
+# or a non-TTY stdout. This is a status console (a pane), not markdown, so it uses the truecolor C_*.
+# Loaded HERE, ahead of the policy resolvers below, because their launch-time warnings colour through
+# the same C_* palette.
+# shellcheck source=/dev/null
+. "$HERE/theme.sh"
+herd_theme_load_console
+
 # _effective_merge_policy — resolve "auto" | "approve" | "observe" (HERD-159). THE shared resolver,
 # sourced by the watcher, `herd reload` and `herd doctor --posture` alike so all three agree on what
 # the watcher will actually do (HERD-210). MERGE_POLICY wins when recognized; empty/unset derives
@@ -344,8 +354,8 @@ esac
 # journal line (mirrors HUMAN_VERIFY_POLICY below).
 if [ "${AGENT_WATCH_LIB:-}" != "1" ] && _merge_policy_is_typo; then
   journal_append merge_policy_invalid value "$MERGE_POLICY" fell_back_to observe 2>/dev/null || true
-  printf '\033[31m⚠️  herdkit: invalid MERGE_POLICY=%s — falling back to observe (never merge)\033[0m\n' \
-    "$MERGE_POLICY" >&2
+  printf '%s⚠️  herdkit: invalid MERGE_POLICY=%s — falling back to observe (never merge)%s\n' \
+    "$C_RED" "$MERGE_POLICY" "$C_RESET" >&2
 fi
 unset _pol
 
@@ -401,14 +411,6 @@ _codemap_auto() {
 
 # This watcher's own worktree root — never auto-merge/remove the dir we run from.
 SELF_WT="$(cd "$HERE/../.." && pwd)"
-
-# Console palette — themed via HERD_THEME (default tokyonight, byte-identical to the old hardcoded
-# truecolor block). theme.sh resolves .herd/themes/<name>/palette.sh → templates/themes/<name>/ →
-# tokyonight, warns-once-and-falls-back on an unknown/broken theme, and renders plain under NO_COLOR
-# or a non-TTY stdout. This is a status console (a pane), not markdown, so it uses the truecolor C_*.
-# shellcheck source=/dev/null
-. "$HERE/theme.sh"
-herd_theme_load_console
 
 SLUGW=28               # slug column width — pads slugs so the state words align.
 
