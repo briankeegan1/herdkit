@@ -836,17 +836,24 @@ _inbox_scan() {
   _resolve_watcher_owner
   owner="$(_watcher_owner_login)"
 
-  # (1) PR-COMMENT feed — comments by OTHERS on the tick's open PRs.
-  while IFS= read -r prnum; do
-    [ -n "$prnum" ] || continue
-    while IFS=$'\t' read -r cid author snip; do
-      [ -n "$cid" ] || continue
-      _inbox_seen "pr:$cid" && continue
-      _inbox_mark_seen "pr:$cid"
-      _inbox_record pr "#$prnum" "$author" "$snip"
-      herd_driver_notify "📬 inbox · PR #${prnum}" "${author}: ${snip}" default
-    done < <(_inbox_fetch_pr_comments "$prnum" | _inbox_extract_pr_comments "$owner")
-  done < <(printf '%s' "$prs_json" | _inbox_pr_numbers)
+  # (1) PR-COMMENT feed — comments by OTHERS on the tick's open PRs. Self-exclusion is by owner login
+  # (_inbox_extract_pr_comments drops comments whose author == $owner). When the seat's identity is
+  # UNRESOLVED ($owner empty), that match is a no-op, so the feed would surface the seat's OWN comments
+  # as inbox noise (HERD-212). Rather than flood with self-authored comments, skip the PR feed entirely
+  # until an identity resolves — an unresolved owner yields ZERO self-authored comments, not all of them.
+  # (The tracker feed self-excludes at the backend, so it is unaffected by an empty owner login.)
+  if [ -n "$owner" ]; then
+    while IFS= read -r prnum; do
+      [ -n "$prnum" ] || continue
+      while IFS=$'\t' read -r cid author snip; do
+        [ -n "$cid" ] || continue
+        _inbox_seen "pr:$cid" && continue
+        _inbox_mark_seen "pr:$cid"
+        _inbox_record pr "#$prnum" "$author" "$snip"
+        herd_driver_notify "📬 inbox · PR #${prnum}" "${author}: ${snip}" default
+      done < <(_inbox_fetch_pr_comments "$prnum" | _inbox_extract_pr_comments "$owner")
+    done < <(printf '%s' "$prs_json" | _inbox_pr_numbers)
+  fi
 
   # (2) TRACKER feed — comments by OTHER operators on items this seat claimed, via the backend's
   # OPTIONAL comment reader (linear only). Sourced in a SUBSHELL (secrets + backend, exactly the
