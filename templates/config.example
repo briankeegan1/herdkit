@@ -154,6 +154,16 @@ MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIEW_ESCALATE_GLOB
 # MODEL_ADVISE="claude-opus-4-8"    # `herd advise` one-shot advisor; defaults to the MODEL_FEATURE tier
 
+# Claude Code custom endpoint (HERD-171) — MACHINE-scoped, secrets-adjacent. Points the claude
+# runtime at an enterprise/BAA-covered gateway or a local model server via the standard
+# ANTHROPIC_BASE_URL env Claude Code already honors. Empty/unset (default) → Anthropic's public
+# endpoint (byte-identical). Set with `herd config set ANTHROPIC_BASE_URL <url>`, which routes to
+# the gitignored .herd/config.local — NEVER put a tenant/gateway URL in this committed baseline.
+# Companion credentials (ANTHROPIC_API_KEY) live in .herd/secrets or the control-room process env,
+# never here. Composes with MODEL_* above (model id) — this key only relocates the endpoint.
+# See docs/sensitive-data.md for the enterprise/BAA and local-model patterns.
+# ANTHROPIC_BASE_URL=""   # e.g. "https://my-corp.example/v1" | "http://127.0.0.1:11434"
+
 # docs-only review tier (HERD-89) — route pure-docs diffs to the cheapest reviewer. Leave both blank
 # (default) for byte-identical behavior; set DOCS_ONLY_GLOB to opt in. ESCALATION WINS: a docs diff
 # also matching REVIEW_ESCALATE_GLOB or over REVIEW_ESCALATE_MAXFILES files stays on the STRONG tier.

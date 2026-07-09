@@ -28,6 +28,16 @@ herd_driver_name() { printf '%s' "${HERD_DRIVER:-herdr-claude}"; }
 # _herd_driver_is_headless — success iff the active driver is the headless driver.
 _herd_driver_is_headless() { [ "$(herd_driver_name)" = "headless" ]; }
 
+# herd_driver_endpoint_env_lines — emit K=V lines for the claude custom endpoint (HERD-171).
+# When ANTHROPIC_BASE_URL is set (machine-scoped config key / config.local), every spawn path injects
+# it so Claude Code hits the enterprise/BAA or local gateway. Empty when unset → byte-identical argv
+# (no --env). Pure: reads the env, prints zero or more lines, never fails.
+herd_driver_endpoint_env_lines() {
+  if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+    printf 'ANTHROPIC_BASE_URL=%s\n' "$ANTHROPIC_BASE_URL"
+  fi
+}
+
 # ── MODEL matrix: runtime-qualified model refs (HERD-151) ─────────────────────────────────────────
 # Every MODEL_* config key accepts an OPTIONALLY runtime-qualified ref '<driver>:<model>', so an
 # operator can pin a role's agent to a specific RUNTIME (a shipped templates/drivers/<name>.driver)
@@ -234,6 +244,31 @@ except Exception:
     out = ["claude"] + (["--model", model] if model else []) + flags + [prompt]
 sys.stdout.write("".join(tok + "\0" for tok in out))
 '
+}
+
+# herd_driver_lane_permission_flags <driver> — the permission FLAGS a builder LANE passes as the spawn's
+# <flags> (which herd_driver_agent_spawn_argv substitutes for <driver>'s DRIVER_AGENT_PERMISSION_FLAG
+# token). HERD-201: the lanes previously hardcoded CLAUDE_FLAGS to claude's --dangerously-skip-permissions
+# and passed it UNCONDITIONALLY — so a runtime-qualified MODEL ref ('grok:…','codex:…') composed the
+# claude flag into a non-claude runtime ('grok … --dangerously-skip-permissions') and the agent died on
+# launch. This helper derives the flags correctly:
+#   • an EXPLICIT non-empty HERD_CLAUDE_FLAGS override WINS, verbatim, for ANY runtime (the operator's
+#     word beats the derived default — same precedence the old `${HERD_CLAUDE_FLAGS:-…}` gave it);
+#   • otherwise the flags come from the RESOLVED runtime driver's OWN DRIVER_AGENT_PERMISSION_FLAG, so
+#     each runtime spawns with its own approve flag (grok --always-approve, codex's bypass flag, …).
+# BYTE-IDENTICAL for herdr-claude / headless: their permission flag already IS
+# --dangerously-skip-permissions, so an unset/empty override yields the EXACT token the lanes hardcoded.
+# Empty-or-unset are treated alike (mirrors the old `:-` default) so an explicit empty never drops the
+# flag. FAIL-SOFT: an unreadable/absent binding falls back to the claude flag (today's behavior), never
+# empty. PURE — no side effects on source.
+herd_driver_lane_permission_flags() {
+  local drv="${1:-}"
+  if [ -n "${HERD_CLAUDE_FLAGS:+set}" ]; then
+    printf '%s' "$HERD_CLAUDE_FLAGS"
+    return 0
+  fi
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG '--dangerously-skip-permissions' "$drv"
 }
 
 # herd_driver_agent_runtime_native <driver> — success iff <driver>'s agent runtime is the NATIVE Claude
@@ -781,7 +816,11 @@ _herd_headless_start_agent() {
   # runtime argv is COMPOSED from the resolved driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
-  ( cd "$wt" || exit 1; nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
+  # HERD-171: export the custom endpoint into the detached child when set (byte-identical when unset).
+  ( cd "$wt" || exit 1
+    # shellcheck disable=SC2163  # $_ep is a literal "K=V" pair — `export "K=V"` sets+exports it.
+    while IFS= read -r _ep; do [ -n "$_ep" ] && export "$_ep"; done < <(herd_driver_endpoint_env_lines)
+    nohup "${rt[@]}" >"$adir/log" 2>&1 </dev/null & echo $! > "$adir/pid" )
   printf 'working\n' > "$adir/status" 2>/dev/null || true
   [ -s "$adir/pid" ]
 }
@@ -799,8 +838,11 @@ _herd_herdr_start_agent() {
   # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  # HERD-171: inject ANTHROPIC_BASE_URL as --env when set (no-op / byte-identical when unset).
+  local -a envargs=(); local _ep
+  while IFS= read -r _ep; do [ -n "$_ep" ] && envargs+=(--env "$_ep"); done < <(herd_driver_endpoint_env_lines)
   # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
-  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus -- "${rt[@]}" >/dev/null 2>&1; then
+  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus "${envargs[@]}" -- "${rt[@]}" >/dev/null 2>&1; then
     return 0
   fi
   # HERD-136: agent start failed after we created the tab — close it so no empty corpse tab lingers,
@@ -859,6 +901,11 @@ herd_driver_launch_agent() {
       *)         : ;;  # ignore unknown keys (forward-compat)
     esac
   done
+  # HERD-171: auto-append the custom claude endpoint when set. Empty → sa_env unchanged (byte-identical).
+  local _ep
+  while IFS= read -r _ep; do
+    [ -n "$_ep" ] && sa_env="${sa_env}${sa_env:+$'\n'}$_ep"
+  done < <(herd_driver_endpoint_env_lines)
   [ -n "$sa_name" ] || { printf '⚠️  driver: launch-agent called with no name\n' >&2; return 1; }
   # Resolve an optionally runtime-qualified model ref (HERD-151) → the runtime DRIVER *and* bare model,
   # once, before either backend builds its argv (HERD-150 P2). Making the resolved driver REAL — not
