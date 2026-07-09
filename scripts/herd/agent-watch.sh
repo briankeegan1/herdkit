@@ -3884,7 +3884,7 @@ _handle_stale_dup() {
     render
     journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
       round "$_hsd_round_num" reason "no live builder — dispatching conflict resolver to merge ${_hsd_base}"
-    _resolver_in_flight "$_hsd_slug" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+    _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
     DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     return 0
   fi
@@ -3926,7 +3926,7 @@ Why: ${_hsd_reason}"
     if [ -n "$_hsd_wt" ] && [ -d "$_hsd_wt" ]; then
       journal_append stale_refix_resolver pr "$_hsd_pr" sha "$_hsd_sha" slug "$_hsd_slug" \
         round "$_hsd_round_num" reason "pane vanished mid-bounce — dispatching conflict resolver"
-      _resolver_in_flight "$_hsd_slug" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
+      _resolver_in_flight "$_hsd_slug" "$_hsd_pr" || spawn_resolver "$_hsd_slug" "$_hsd_pr" "${_hsd_branch:-$_hsd_slug}" "$_hsd_sha"
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}rebasing · awaiting push (round ${_hsd_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     else
       _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "agent pane not found"

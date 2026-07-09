@@ -87,7 +87,7 @@ _wait_agent_working() {
 }
 _agent_liveness() { printf '%s' "${STUB_LIVENESS:-alive}"; }
 _resolver_agent_alive() { [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }
-_resolver_in_flight() { [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }
+_resolver_in_flight() { local _s="$1" _p="$2"; [ "${STUB_RESOLVER_ALIVE:-0}" = "1" ]; }  # arity-2, matches the real helper under set -u
 _detect_limit_hit() { return 1; }
 
 # Capture spawn_resolver calls instead of launching real resolvers.
