@@ -682,7 +682,14 @@ build_main_freshness() {
     MAIN_FRESHNESS="    ${C_RED}⚠️${C_RESET}  ${C_BOLD}MAIN STALE${C_RESET}${C_RED} — ${_bf_delta} · ${_bf_why}${C_RESET}"$'\n'
   fi
   if [ -s "${MAIN_FRESH_RESTART:-}" ]; then
-    MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}main pulled new engine code — this watcher still runs the old one · restart recommended (\`herd reload\`)${C_RESET}"$'\n'
+    # HERD-251: with WATCHER_SELF_RESTART=on the note is no longer a request for the operator — the
+    # watcher is already draining toward its own in-place re-exec, so say so (and name the workers it
+    # is still waiting on). With the lever off (or before the quiesce arms) the row is unchanged.
+    if _self_restart_quiescing; then
+      MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⟳${C_RESET}  ${C_DIM}restarting on new engine code · draining $(_count_gate_workers) gate workers${C_RESET}"$'\n'
+    else
+      MAIN_FRESHNESS="${MAIN_FRESHNESS}    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}main pulled new engine code — this watcher still runs the old one · restart recommended (\`herd reload\`)${C_RESET}"$'\n'
+    fi
   fi
 }
 
@@ -2017,6 +2024,11 @@ _pin_review_sha() {
 # push must not desync reviewed content from the verdict-sha).
 _dispatch_review() {
   local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight registry
+  # SELF-RESTART QUIESCE (HERD-251): defence in depth. Every caller reaches here through
+  # _review_gate_step, which holds earlier and cheaper (before the escalation arm is consumed), so this
+  # is unreachable today. It returns NON-ZERO — never 0 — so a future caller cannot read the refusal as
+  # a launched reviewer and report RUNNING/ESCALATED over nothing. Byte-inert with the lever off.
+  _self_restart_hold_dispatch && return 1
   result="$(_review_result_file "$pr" "$sha")"
   inflight="$(_review_inflight_file "$pr" "$sha")"
   registry="$(_review_registry_file "$pr" "$sha")"
@@ -2378,6 +2390,14 @@ _review_gate_step() {
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
+
+  # SELF-RESTART QUIESCE (HERD-251): the watcher is draining toward an in-place re-exec on new engine
+  # code — start no new reviewer. Placed BELOW the collect/in-flight branches (a running review still
+  # finishes and its verdict is still recorded) and ABOVE every step with a side effect: no tier
+  # classification, no carry-forward, no escalation-arm consumption. QUEUED is the existing
+  # "will dispatch on a later tick" token, so the candidate holds without merging — and the restarted
+  # watcher dispatches it on new code. Byte-inert with the lever off.
+  if _self_restart_hold_dispatch; then echo QUEUED; return 0; fi
 
   # DELTA-SCOPED REVIEW carry-forward (HERD-204): before spending a reviewer on this new sha, try to
   # PROVE it differs from this PR's last-passed sha ONLY by a merge of DEFAULT_BRANCH (a pure
@@ -3562,6 +3582,13 @@ _reap_idle_resolver_for_redispatch() {
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   local _sr_rc=0 _sr_ack _sr_roster
+  # SELF-RESTART QUIESCE (HERD-251): defence in depth. Both callers hold ABOVE their own ledger writes
+  # (the resolve pass at its row, _handle_stale_dup above record_refix), so this is unreachable
+  # today. It returns NON-ZERO — never 0 — because `_resolver_in_flight … || spawn_resolver …` reads a
+  # zero rc as "a resolver is now running": a refusal that returned 0 would paint `rebasing · awaiting
+  # push` over nothing. Refused before record_resolve_attempt, so no respawn round is burned either.
+  # Byte-inert with the lever off.
+  _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
@@ -3951,6 +3978,169 @@ _watch_gate_inflight() {
   return 1
 }
 
+# _count_gate_workers — how many review/health workers are LIVE right now. The counted form of
+# _watch_gate_inflight (same two marker families, same liveness probe), used by the self-restart
+# quiesce to decide when the drain is complete and to render 'draining N gate workers'.
+#
+# SCOPE, precisely: the two INFLIGHT-MARKER families this watcher owns in-process — reviewers and
+# healthcheck suites. Conflict resolvers and builders are NOT counted: they are agents in their own
+# panes with no inflight marker, they are never killed by the exec (they outlive it, like the review
+# and health workers do), and blocking a restart on a resolver — which can run for many minutes —
+# would strand the watcher on stale code for exactly as long. The quiesce still refuses to DISPATCH a
+# new resolver, so no fresh one starts mid-drain.
+_count_gate_workers() {
+  local f n=0
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _marker_live "$f" 2>/dev/null && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+# ── Watcher SELF-RESTART on stale engine code (HERD-251) ─────────────────────────────────────────
+# The watcher executes the engine code it loaded at startup. HERD-233 detects the case where a pulled
+# delta rewrote agent-watch.sh and leaves a "restart recommended" note ($MAIN_FRESH_RESTART) for the
+# operator — who then restarts by hand (six times on 2026-07-09 alone). This closes that loop.
+#
+# WATCHER_SELF_RESTART=on → the note ARMS a QUIESCE-THEN-EXEC:
+#   (a) QUIESCE — stop dispatching NEW gate work (reviews, healthchecks, resolver spawns, and the
+#       stale-base heal that dispatches them). Every hold sits ABOVE its call site's ledger write, so a
+#       refused dispatch never leaves a spent once-guard behind it (see _handle_stale_dup). In-flight
+#       workers are never killed: they run to completion and their verdicts are COLLECTED normally,
+#       because the collect paths sit upstream of every dispatch hold. Merges of already-green PRs
+#       still land; nothing expensive is started.
+#   (b) EXEC — once zero live REVIEW/HEALTH workers remain for 2 CONSECUTIVE ticks (a single quiet tick
+#       can be the instant between one worker's exit and its sibling's dispatch), or the inline
+#       15-minute max-wait cap expires, re-exec this script IN PLACE. See _count_gate_workers for why
+#       resolvers and builders are deliberately outside that count.
+#   (c) journal watcher_self_restart reason=engine-update shas=<old>..<new>.
+#
+# WHY exec IS SAFE HERE — all three identities survive because exec keeps the PID and the pane:
+#   • pane    — exec replaces the process image inside the same pane/tty; nothing is respawned.
+#   • argv0   — we pass `exec -a "$HERD_WATCH_ARGV0"` ourselves. HERD_WATCH_REEXEC is already exported
+#               in this process, so the new image skips the one-shot argv0 re-exec and keeps the tag.
+#   • lock    — the singleton is re-acquired by the new image at the SAME pid. _acquire_watcher_singleton
+#               refuses only a LIVE recorded pid that is NOT $$; ours IS $$, so it adopts. Under flock
+#               the `exec 9>>` reopen drops the old open-file description (releasing the lock) and
+#               flock -n immediately re-takes it; under the mkdir fallback the EXIT trap never fires on
+#               exec, so the pid file is simply rewritten with the same pid. Neither path can hand the
+#               workspace to a duplicate: no window exists in which the lock is free AND we are gone.
+# In-flight workers are NOT killed even at cap expiry: reviews are setsid'd and health workers are
+# ordinary children, so both outlive the exec. The new image's startup sweeps + the every-tick corpse
+# sweep reap their markers and time them out from the marker's own dispatch ts.
+#
+# HARD INVARIANTS:
+#   • WATCHER_SELF_RESTART=off (default) → byte-identical to HERD-233: no arm, no dispatch hold, no
+#     exec, no journal. The recommendation row renders exactly as before.
+#   • DRYRUN → never arms (an observation run must not restart anything).
+#   • FAIL-SOFT: an unreadable script path, or a hermetic-test guard, disarms and leaves the note in
+#     place, so the console falls back to the plain 'restart recommended' row. The refusal LATCHES for
+#     the life of the process: the note that armed us is still there, so without the latch the next
+#     tick would re-arm, hold dispatch, refuse again, and spin — an every-other-tick gate stall.
+SELF_RESTART_CAP_SECS=900          # inline 15-minute max-wait cap on the drain (HERD-251)
+_SELF_RESTART_ARMED=""             # epoch the quiesce began; empty ⇒ not quiescing
+_SELF_RESTART_FROM=""              # $MAIN HEAD sha before the pull that carried new engine code
+_SELF_RESTART_TO=""                # …and after it (the sha recorded in $MAIN_FRESH_RESTART)
+_SELF_RESTART_IDLE_TICKS=0         # consecutive ticks observed with zero live review/health workers
+_SELF_RESTART_GAVE_UP=""           # 1 once an exec was refused: never arm again in this process
+
+# _self_restart_enabled — the master lever. Anything but `on` is off (ship-dormant default).
+_self_restart_enabled() { [ "${WATCHER_SELF_RESTART:-off}" = "on" ]; }
+
+# _self_restart_quiescing — true once armed: the watcher is draining toward an in-place re-exec.
+_self_restart_quiescing() { [ -n "${_SELF_RESTART_ARMED:-}" ]; }
+
+# _self_restart_hold_dispatch — the ONE predicate every gate-dispatch site consults. True ⇒ this tick
+# must NOT start new gate work. Byte-inert with the lever off (the first test short-circuits).
+_self_restart_hold_dispatch() { _self_restart_enabled && _self_restart_quiescing; }
+
+# _self_restart_arm — enter the quiesce. Records the sha delta (from the reconcile's own note file,
+# whose single line is the NEW sha) and journals ONCE. Idempotent: a second call while armed no-ops.
+_self_restart_arm() {
+  _self_restart_quiescing && return 0
+  _SELF_RESTART_ARMED="$(date +%s)"
+  _SELF_RESTART_IDLE_TICKS=0
+  _SELF_RESTART_TO="$(cat "$MAIN_FRESH_RESTART" 2>/dev/null || true)"
+  _SELF_RESTART_TO="${_SELF_RESTART_TO%%[$'\t\r\n ']*}"
+  journal_append watcher_quiesce reason engine-update \
+    shas "${_SELF_RESTART_FROM:-unknown}..${_SELF_RESTART_TO:-unknown}" cap "$SELF_RESTART_CAP_SECS"
+  return 0
+}
+
+# _self_restart_should_exec <live-workers> <waited-secs> — the pure decision. Echoes the trigger
+# reason ('drained' | 'cap-expiry') when it is time to re-exec, else nothing. Two consecutive
+# zero-worker ticks (not one) so we never exec in the gap between a collect and its sibling dispatch.
+_self_restart_should_exec() {
+  local _sr_n="${1:-0}" _sr_waited="${2:-0}"
+  case "$_sr_n" in ''|*[!0-9]*) _sr_n=0 ;; esac
+  case "$_sr_waited" in ''|*[!0-9]*) _sr_waited=0 ;; esac
+  [ "$_sr_n" -eq 0 ] && [ "$_SELF_RESTART_IDLE_TICKS" -ge 2 ] && { printf 'drained'; return 0; }
+  [ "$_sr_waited" -ge "$SELF_RESTART_CAP_SECS" ] && { printf 'cap-expiry'; return 0; }
+  return 0
+}
+
+# _self_restart_journal <trigger> <live-workers> <waited-secs> — the ONE watcher_self_restart event.
+# Emitted only once the exec is certain to be attempted (see below), so a consumer counting these
+# events counts restarts that actually happened, not ones the guards refused.
+_self_restart_journal() {
+  journal_append watcher_self_restart reason engine-update \
+    shas "${_SELF_RESTART_FROM:-unknown}..${_SELF_RESTART_TO:-unknown}" \
+    trigger "$1" workers "$2" waited "$3"
+}
+
+# _self_restart_exec <trigger> <live-workers> <waited-secs> — replace this process image with a fresh
+# load of the engine code now on disk. Returns 1 (fail-soft, still armed → the caller disarms and the
+# recommendation row returns) when the exec must not happen.
+#
+# The refusal guards run BEFORE the journal, and nothing but the exec follows it: a `watcher_self_restart`
+# event therefore means a restart that happened. (Journaling AFTER the exec is impossible — exec never
+# returns — so "immediately before, past every guard" is the closest honest point.)
+_self_restart_exec() {
+  local _se_trigger="$1" _se_workers="$2" _se_waited="$3"
+  # A hermetic test never replaces its own image (the guard above already refuses the live loop).
+  [ -n "${HERD_HERMETIC_GUARD:-}" ] && return 1
+  [ -r "$HERE/agent-watch.sh" ] || return 1
+  _self_restart_journal "$_se_trigger" "$_se_workers" "$_se_waited"
+  # HERD_WATCH_REEXEC is already exported in this process, so the new image keeps the argv0 we pass
+  # here rather than re-execing a second time. Same pid ⇒ same pane, same singleton lock. $_WATCH_ARGV
+  # replays this watcher's own positional args, exactly as the startup argv0 re-exec passes "$@" — the
+  # launch path this is imitating (empty today; agent-watch.sh takes none).
+  exec -a "${HERD_WATCH_ARGV0:-herd-watch}" bash "$HERE/agent-watch.sh" \
+    ${_WATCH_ARGV[@]+"${_WATCH_ARGV[@]}"}
+}
+
+# _self_restart_tick — call once per tick, AFTER reconcile_main_freshness (which writes the note this
+# arms on). Never returns non-zero; the caller still guards with `|| true` so a self-restart bug can
+# never take the watch loop down with it.
+_self_restart_tick() {
+  _self_restart_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "${_SELF_RESTART_GAVE_UP:-}" ] && return 0    # a refused exec is terminal for this process
+  if ! _self_restart_quiescing; then
+    [ -s "${MAIN_FRESH_RESTART:-}" ] || return 0
+    _self_restart_arm
+  fi
+  local _st_n _st_waited _st_trigger
+  _st_n="$(_count_gate_workers)"
+  _st_waited=$(( $(date +%s) - _SELF_RESTART_ARMED ))
+  [ "$_st_waited" -ge 0 ] || _st_waited=0    # a clock step backwards must not skip the cap
+  if [ "$_st_n" -eq 0 ]; then
+    _SELF_RESTART_IDLE_TICKS=$((_SELF_RESTART_IDLE_TICKS + 1))
+  else
+    _SELF_RESTART_IDLE_TICKS=0
+  fi
+  _st_trigger="$(_self_restart_should_exec "$_st_n" "$_st_waited")"
+  [ -n "$_st_trigger" ] || return 0
+  _self_restart_exec "$_st_trigger" "$_st_n" "$_st_waited" && return 0
+  # Fail-soft: the exec did not happen. Disarm so gate dispatch resumes on the OLD (running) code, and
+  # GIVE UP for the life of this process — the note that armed us is still on disk, so re-arming next
+  # tick would only refuse again. The note reverts to its HERD-233 meaning: a restart recommendation
+  # the operator acts on. Journaled ONCE, for the same reason.
+  _SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0; _SELF_RESTART_GAVE_UP=1
+  journal_append watcher_self_restart result skipped reason exec-unavailable trigger "$_st_trigger"
+  return 0
+}
+
 # _main_fresh_clear — back to fresh: drop the held row (the journal already recorded the transition).
 _main_fresh_clear() { rm -f "$MAIN_FRESH_STATE" 2>/dev/null || true; }
 
@@ -3979,12 +4169,15 @@ _main_fresh_generated_only() {
 }
 
 # _main_fresh_note_restart <old-sha> <new-sha> — success (and leave a note) iff the pulled delta
-# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds.
+# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds. The note is
+# also the ARM signal for the HERD-251 self-restart quiesce (see _self_restart_tick); $_SELF_RESTART_FROM
+# carries the pre-pull sha the note file itself cannot hold, for the journal's shas=<old>..<new> field.
 _main_fresh_note_restart() {
   git -C "$MAIN" diff --name-only "$1" "$2" 2>/dev/null \
     | grep -qx 'scripts/herd/agent-watch.sh' || return 1
   mkdir -p "$TREES" 2>/dev/null || true
   printf '%s\n' "$2" > "$MAIN_FRESH_RESTART" 2>/dev/null || true
+  _SELF_RESTART_FROM="$1"
   return 0
 }
 
@@ -5963,6 +6156,21 @@ _handle_stale_dup() {
     fi
     return 0
   fi
+
+  # SELF-RESTART QUIESCE (HERD-251): the watcher is draining toward an in-place re-exec on new engine
+  # code — dispatch no heal. Placed HERE, among its sibling deferrals and ABOVE every `record_refix`,
+  # for the reason they all state: the once-guard is NOT burned and no refix round is spent, so the
+  # restarted watcher heals this sha on new code. Refusing further down (inside spawn_resolver) would
+  # refuse AFTER the caller had burned refix_attempted(pr,sha,stale) and journaled stale_refix_resolver
+  # — a dropped dispatch behind a spent guard, which no later tick could ever retry, leaving a durable
+  # needs-you row for a heal the watcher itself declined. This covers BOTH heals below (the resolver
+  # dispatch and the live-builder bounce), which is why it sits above the fork. The read-only once-guard
+  # branch above still runs first, so a heal already in flight keeps its honest in-progress row.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · held (watcher restarting on new engine code)${C_RESET}"
+    return 0
+  fi
+
   # SUITE WRITE INTERLOCK (HERD-227): a live healthcheck suite is running INSIDE this worktree. Both
   # heals below mutate it — the bounce types `git merge` into the builder's pane, the resolver fallback
   # merges in the tree directly. Either one under a running suite gives two writers one worktree, and
@@ -7949,6 +8157,16 @@ _healthcheck_gate() {
     journal_append infra_event component agent-watch reason health_died key "$_hg_key"
   fi
 
+  # SELF-RESTART QUIESCE (HERD-251): draining toward an in-place re-exec — start no new suite. Reached
+  # only after the collect + in-flight branches above, so a running suite still finishes and its verdict
+  # is still cached. QUEUED holds the candidate (no merge) exactly as a busy slot does; the restarted
+  # watcher dispatches it on new code. Byte-inert with the lever off.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · held (watcher restarting on new engine code)${C_RESET}"
+    _HC_RESULT="QUEUED"
+    return 0
+  fi
+
   # DISPATCH: needs a free slot (HEALTH_CONCURRENCY). No slot → queue this PR, honestly naming how many
   # suites are ahead of it. Never runs a suite that would overlap another (shared git object store).
   if ! _health_slot_free; then
@@ -8759,6 +8977,10 @@ if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
   export HERD_WATCH_REEXEC=1
   exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
 fi
+# This watcher's own positional args, so the HERD-251 self-restart's exec replays exactly what the
+# re-exec above passes through ("$@" is not visible inside a function). Empty today — agent-watch.sh
+# parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
+_WATCH_ARGV=("$@")
 
 # ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
 # Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
@@ -9554,7 +9776,13 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
         QUEUED)
           # Console honesty (HERD-185): name the STAGE (review) + WHY it waits (how many are ahead of
           # it holding the cap) — never a bare gate label a health-stage wait could be confused with.
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
+          # A quiesce hold (HERD-251) is not a full cap: say which it is, so "queued (0 ahead)" can
+          # never read as a stuck console.
+          if _self_restart_hold_dispatch; then
+            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · held (watcher restarting on new engine code)${C_RESET}"
+          else
+            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
+          fi
           render
           continue ;;
         RETRY)
@@ -9730,6 +9958,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
     sl="$(_slug_cell "$slug")"
     pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # SELF-RESTART QUIESCE (HERD-251): a resolver is new gate work — hold it while the watcher drains
+    # toward its in-place re-exec. Nothing is recorded, so the restarted watcher dispatches it cleanly
+    # on the first tick after startup. Byte-inert with the lever off.
+    if _self_restart_hold_dispatch; then
+      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}conflict · held (watcher restarting on new engine code)${C_RESET}"
+      render
+      continue
+    fi
     # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
     # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
     # spawn_resolver, so this read still sees only prior ticks' attempts.
@@ -9802,6 +10038,13 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   # config key), independent of CODEMAP_AUTOREFRESH, byte-inert when $MAIN is already current.
   reconcile_main_freshness
   reconcile_map_freshness
+
+  # Watcher SELF-RESTART (HERD-251): the reconcile above may have left a "new engine code" note. With
+  # WATCHER_SELF_RESTART=on that note arms a QUIESCE (no new gate dispatch) and, once the in-flight
+  # workers have drained for 2 consecutive ticks — or the 15-minute cap expires — this call re-execs
+  # the watcher in place and never returns. Byte-inert with the lever off (and in dry-run); guarded so
+  # no failure inside it can end the watch loop.
+  _self_restart_tick || true
 
   # Main-health (HERD-222): the SAME multi-seat rule for the default branch's health. Every observed
   # main sha must end with a collected verdict, whoever merged it — so this runs AFTER the freshness
