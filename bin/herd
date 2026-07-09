@@ -50,6 +50,12 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/engine-version.sh" ] && . "$SCRIPTS_DIR/engine-version.sh"
 
+# The shared merge-policy resolver (_effective_merge_policy). Pure helpers, no side effects, and it
+# reads MERGE_POLICY / WATCHER_AUTOMERGE lazily at call time, so sourcing before herd-config.sh is
+# safe. cmd_reload's summary MUST resolve through this — never a local copy (HERD-210).
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/merge-policy.sh" ] && . "$SCRIPTS_DIR/merge-policy.sh"
+
 # Cost summer/reader helpers (transcript-token pricing). Defines functions + constants only, sourced
 # AFTER journal.sh (its documented order); gives cmd_cost the `herd cost --full` live-scan readers
 # (_cost_transcript_dir + cost_report_full). No side effects at source time.
@@ -4543,16 +4549,11 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
     fi
   fi
 
-  # 4. Resolve and display the effective merge policy so the human can confirm.
+  # 4. Display the effective merge policy so the human can confirm. Resolved by the SAME helper the
+  #    watcher runs (scripts/herd/merge-policy.sh) — a typo'd MERGE_POLICY must read `observe` here
+  #    exactly as the watcher fails strict, never `auto` via the legacy derivation (HERD-210).
   local effective_policy
-  case "${MERGE_POLICY:-}" in
-    auto|approve|observe) effective_policy="$MERGE_POLICY" ;;
-    *)
-      case "${WATCHER_AUTOMERGE:-true}" in
-        false|no|off|0) effective_policy="approve" ;;
-        *)              effective_policy="auto" ;;
-      esac ;;
-  esac
+  effective_policy="$(_effective_merge_policy)"
 
   # 5. Per-component summary — one line per rebuilt piece so the human can confirm state.
   local wsum="$launch_desc"

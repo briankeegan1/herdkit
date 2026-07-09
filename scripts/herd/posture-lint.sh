@@ -48,23 +48,15 @@ _posture_is_set() {
   return 1
 }
 
-# _posture_effective_merge_policy — resolve the EFFECTIVE merge policy exactly as agent-watch.sh /
-# cmd_reload do (HERD-159): MERGE_POLICY (auto|approve|observe) wins when recognized; empty/unset
-# falls back to the legacy WATCHER_AUTOMERGE boolean (false/no/off/0 → approve, anything else → auto);
-# a NON-EMPTY unrecognized value fails STRICT to observe (never merge) so a typo can never silently
-# auto-merge. This is the single seam the doctor and the watcher must agree on, so the honesty line
-# reflects what the watcher will ACTUALLY do.
-_posture_effective_merge_policy() {
-  case "${MERGE_POLICY:-}" in
-    auto|approve|observe) printf '%s' "$MERGE_POLICY" ;;
-    '')
-      case "${WATCHER_AUTOMERGE:-true}" in
-        false|no|off|0) printf 'approve' ;;
-        *)              printf 'auto' ;;
-      esac ;;
-    *) printf 'observe' ;;
-  esac
-}
+# The EFFECTIVE merge policy must be resolved by the SAME code the watcher runs, or the honesty line
+# describes a posture the engine is not in. Source the shared resolver (HERD-210) rather than keeping
+# a lookalike copy: _effective_merge_policy + _legacy_automerge_policy.
+# shellcheck source=/dev/null
+. "$_posture_lint_here/merge-policy.sh"
+
+# _posture_effective_merge_policy — back-compat alias kept for callers that reach for the namespaced
+# name (tests/test-gate-keys-strict.sh). Delegates; it must never grow its own logic.
+_posture_effective_merge_policy() { _effective_merge_policy; }
 
 # _posture_steps_active <steps-file> — return 0 iff the project has a NON-EMPTY .herd/steps.tsv (at
 # least one non-blank, non-comment row): the operator has wired custom pipeline steps. Mirrors the
@@ -81,7 +73,7 @@ _posture_steps_active() {
 # reads the effective value (env, with the same inline defaults the consumers use).
 _posture_op_tuple() {
   local merge hv push flow steps sf
-  merge="$(_posture_effective_merge_policy)"
+  merge="$(_effective_merge_policy)"
   hv="${HUMAN_VERIFY_POLICY:-hold}"
   push="${PUSH_GATE:-}"; [ -n "$push" ] || push="none"
   flow="${PR_FLOW:-direct}"
@@ -143,8 +135,8 @@ _posture_coherence_rules() {
   #      an outright silent CONTRADICTION (the operator likely believes the legacy lever still applies).
   if _posture_is_set MERGE_POLICY "$cfg" "$local" && _posture_is_set WATCHER_AUTOMERGE "$cfg" "$local"; then
     local eff wa_implies
-    eff="$(_posture_effective_merge_policy)"
-    case "${WATCHER_AUTOMERGE:-true}" in false|no|off|0) wa_implies="approve" ;; *) wa_implies="auto" ;; esac
+    eff="$(_effective_merge_policy)"
+    wa_implies="$(_legacy_automerge_policy)"
     if [ "$eff" != "$wa_implies" ]; then
       _posture_add_finding \
         "WATCHER_AUTOMERGE=${WATCHER_AUTOMERGE} CONTRADICTS MERGE_POLICY=${MERGE_POLICY}: the legacy lever implies '${wa_implies}', but MERGE_POLICY takes precedence, so the effective policy is '${eff}'." \
