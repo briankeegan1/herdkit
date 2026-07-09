@@ -295,7 +295,22 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # reproduced red, raises a LOUD persistent 'MAIN RED — <failing
 # test> (since #N)' console row + a notification, cleared when a later sha goes green. An ALARM only —
 # never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
+# Since HERD-222 this is a RECONCILED INVARIANT, not a merge side-effect: the tick dispatches whenever
+# the current default-branch HEAD has no verdict yet — so a merge by ANOTHER seat (or the gh UI), a run
+# deferred for a busy health slot, and a worker killed mid-suite all still get checked.
 # MAIN_HEALTH_TICK="off"   # off (default) | on
+
+# RE-VERIFY a standing MAIN RED every N minutes (HERD-222), so a red that has since been fixed — or was
+# never real — clears itself through the ordinary green path instead of shouting until the next merge.
+# 0 (default) → off, byte-identical: a sha that already has a verdict is never re-run.
+# MAIN_HEALTH_RECHECK_MINS="0"   # 0 (default, off) | minutes, e.g. 30
+
+# AUTO-REMEDIATE a reproduced MAIN RED (HERD-222). ON → the watcher enqueues ONE scribe item citing the
+# failing test, at most once per distinct failure while main is red, and only when the failure identity
+# is HONEST (a TAP 'not ok' line or a concrete test file — never a content-free classifier banner). It
+# FILES work; it never spawns a builder or touches the branch. Ships OFF (byte-identical: no item, no
+# journal line).
+# MAIN_HEALTH_AUTOFIX="off"   # off (default) | on
 
 # Control-room SWEEP triggers (HERD-191) — off | advise (default) | auto. `herd sweep` is the
 # one-command cleanup: it reaps merged/closed-PR worktrees (sha-anchored), closes stale engine tabs,

@@ -213,6 +213,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `JOURNAL_MAX_MB` → `journal.sh`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
+- `MAIN_HEALTH_AUTOFIX` → `agent-watch.sh`
+- `MAIN_HEALTH_RECHECK_MINS` → `agent-watch.sh`
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_FAIRNESS` → `agent-watch.sh`
