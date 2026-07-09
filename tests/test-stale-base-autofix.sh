@@ -361,4 +361,53 @@ _handle_stale_dup 71 slug-a shaD 0 "$WT" feat/a stale-base "$REASON"
 rm -f "$(suite_marker "71-shaD")"
 ok "(18) a dead suite marker is not a running suite — heal proceeds (fail-soft)"
 
+# ── (19) ROW TRUTH (HERD-259): an escalated OFF-mode hold never says "needs you" over a live fix ────
+# The ship default is STALE_BASE_AUTOFIX=off, so this is the stale-base row operators actually see. A
+# builder that is WORKING the rebase makes "needs you" a lie — the expensive kind (the operator
+# context-switches into work already in flight). Mirrors _active_fix_note's clause (b).
+reset_state
+unset STALE_BASE_AUTOFIX
+export STUB_AGENT_STATUS=working
+_handle_stale_dup 90 slug-a shaW 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'fix in progress · builder working' \
+  || fail "(19) a working builder must render fix-in-progress (got: $(row))"
+row | grep -q 'needs you' && fail "(19) a working builder must never render needs-you (got: $(row))"
+[ "$(runs)" = "0" ] || fail "(19) off-mode must still never pane-run"
+[ "$(rslv)" = "0" ] || fail "(19) off-mode must still never spawn a resolver"
+[ "$(refix_round_count 90)" = "0" ] || fail "(19) a row-truth render must not consume a refix round"
+ok "(19) off-mode + working builder → fix in progress · builder working"
+
+# The converse, byte-identical: an IDLE builder is nobody fixing anything, so the row is the unchanged
+# needs-you it has always been. Only a POSITIVE 'working' suppresses the escalation.
+reset_state
+unset STALE_BASE_AUTOFIX
+export STUB_AGENT_STATUS=idle
+_handle_stale_dup 92 slug-a shaI 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you · stale/duplicate (stale-base)' \
+  || fail "(19b) an idle builder's off-mode row must be byte-identical needs-you (got: $(row))"
+# …and a BLIND agent roster (no positive signal at all) fails toward asking the human, never silence.
+reset_state
+unset STALE_BASE_AUTOFIX
+export STUB_AGENT_EMPTY=1
+_handle_stale_dup 93 slug-a shaB 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'needs you' || fail "(19c) a blind agent roster must fall through to needs-you (got: $(row))"
+ok "(19b/c) idle + blind rosters keep the unchanged needs-you row"
+
+# ── (20) DUPLICATE stays human even while the builder works — it is a judgment call, not a rebase ───
+reset_state
+unset STALE_BASE_AUTOFIX
+export STUB_AGENT_STATUS=working
+_handle_stale_dup 94 slug-a shaD2 0 "$WT" feat/a duplicate "$REASON"
+row | grep -q 'needs you · stale/duplicate (duplicate)' \
+  || fail "(20) DUPLICATE must stay needs-you regardless of agent activity (got: $(row))"
+ok "(20) DUPLICATE is unaffected by the activity check"
+
+# ── (21) dry-run gets the same honest row (rendering is the only thing this path does) ─────────────
+reset_state
+export STALE_BASE_AUTOFIX=on DRYRUN=1 STUB_AGENT_STATUS=working
+_handle_stale_dup 95 slug-a shaDR 0 "$WT" feat/a stale-base "$REASON"
+row | grep -q 'fix in progress · builder working' || fail "(21) dry-run must render the honest row (got: $(row))"
+[ "$(runs)" = "0" ] || fail "(21) dry-run must never bounce"
+ok "(21) dry-run + working builder → fix in progress, still no bounce"
+
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"
