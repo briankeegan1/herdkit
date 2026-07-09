@@ -1060,6 +1060,13 @@ PY
 # FIRST supported source — 'codemap': the deterministic engine-tree map produced by `herd codemap`
 # (scripts/herd/codemap.sh) and committed at docs/codemap.md. The pointer tells the builder to read it
 # FIRST to orient (module roles, source edges, config-key → consumer wiring) instead of re-scanning.
+#
+# 'agents-md' (HERD grok-context-injection): unlike the pointer sources above, this INLINES the actual
+# content of the repo-root AGENTS.md (and CLAUDE.md if present) into the STABLE preamble — so a runtime
+# that does NOT auto-load CLAUDE.md (grok, codex) still carries the project conventions in its task
+# spec, not just a pointer it might skip. Fail-soft: no AGENTS.md/CLAUDE.md at the root → this source
+# emits NOTHING (byte-identical to leaving it off). Driver-agnostic: the same inlined block lands in
+# every driver's task spec, so a claude spec and a grok spec stay byte-identical.
 herd_context_provision_preamble() {
   local _cp="${CONTEXT_PROVISION:-}"
   [ -n "$_cp" ] || return 0     # off (default) → emit nothing; task specs are byte-identical to today
@@ -1070,8 +1077,29 @@ herd_context_provision_preamble() {
         _out="$_out A deterministic map of this repo's engine tree is committed at docs/codemap.md (module roles, who-sources-whom, and config-key→consumer wiring; regenerate with 'herd codemap'). READ IT FIRST to orient — it lets you skip re-exploring the tree." ;;
       symbol-index)
         _out="$_out A function-level symbol index (definition sites + cross-file callers for functions under bin/ and scripts/herd/) is committed at docs/symbol-index.md; use it to jump to a function's def or its likely callers instead of grepping, and regenerate with 'herd symbol-index'. HONEST SCOPE: a heuristic token scan, not ground truth — same-name defs and dynamic dispatch are ambiguous." ;;
+      agents-md)
+        local _conv; _conv="$(herd_agents_conventions)"
+        [ -n "$_conv" ] && _out="$_out"$'\n\n--- PROJECT CONVENTIONS (repo-root AGENTS.md / CLAUDE.md — read + follow these) ---\n'"$_conv" ;;
       *) : ;;   # unknown grounding source — ignore (forward-compatible)
     esac
+  done
+  printf '%s' "$_out"
+}
+
+# herd_agents_conventions [root] — print the repo-root project conventions (AGENTS.md, then CLAUDE.md
+# if present) as ONE block, or NOTHING when neither exists. The single source of truth for two
+# consumers: the 'agents-md' grounding source above (inlines it into every builder's task spec) and
+# the grok driver spawn (grounds grok's system prompt from it, since grok — unlike Claude Code — does
+# not auto-load CLAUDE.md). <root> defaults to $PROJECT_ROOT (the main worktree the engine resolved),
+# so the canonical committed conventions are read regardless of the caller's cwd. PURE + FAIL-SOFT: an
+# absent/unreadable file contributes nothing; neither file → empty output, never an error.
+herd_agents_conventions() {
+  local _root="${1:-${PROJECT_ROOT:-.}}" _out="" _f
+  for _f in AGENTS.md CLAUDE.md; do
+    if [ -f "$_root/$_f" ] && [ -r "$_root/$_f" ]; then
+      [ -n "$_out" ] && _out="$_out"$'\n\n'
+      _out="$_out$(cat "$_root/$_f" 2>/dev/null)"
+    fi
   done
   printf '%s' "$_out"
 }

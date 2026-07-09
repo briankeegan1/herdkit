@@ -217,12 +217,22 @@ herd_driver_agent_spawn_argv() {
   perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "" "$drv")"
   [ -n "$binding" ] || binding='claude --model <model> --dangerously-skip-permissions "<prompt>"'
   [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
+  # HERD grok-context-injection: a binding may carry a <agents-rules> value token (only grok.driver
+  # does today) — the repo-root project conventions (AGENTS.md/CLAUDE.md) grounding a runtime that
+  # does NOT auto-load CLAUDE.md. Resolve it ONLY when the token is present, so a claude/headless spawn
+  # (whose binding has no such token) never even reads the file — its argv is byte-identical to before.
+  # Fail-soft: no conventions → empty, and the composer drops the flag+value pair (see <agents-rules>).
+  local agents=""
+  case "$binding" in *'<agents-rules>'*)
+    command -v herd_agents_conventions >/dev/null 2>&1 && agents="$(herd_agents_conventions)" ;;
+  esac
   HERD_SPAWN_BINDING="$binding" HERD_SPAWN_PERM="$perm" HERD_SPAWN_MODEL="$model" \
-  HERD_SPAWN_FLAGS="$flags" HERD_SPAWN_PROMPT="$prompt" python3 -c '
+  HERD_SPAWN_FLAGS="$flags" HERD_SPAWN_PROMPT="$prompt" HERD_SPAWN_AGENTS="$agents" python3 -c '
 import os, shlex, sys
 model  = os.environ["HERD_SPAWN_MODEL"]
 flags  = os.environ["HERD_SPAWN_FLAGS"].split()   # whitespace split — mirrors bash $flags expansion
 prompt = os.environ["HERD_SPAWN_PROMPT"]
+agents = os.environ["HERD_SPAWN_AGENTS"]
 try:
     toks = shlex.split(os.environ["HERD_SPAWN_BINDING"])
     perm = os.environ["HERD_SPAWN_PERM"]
@@ -233,6 +243,11 @@ try:
                 out.append(model)
             elif out and out[-1] == "--model":
                 out.pop()                          # empty model → drop the --model flag+value pair
+        elif t == "<agents-rules>":
+            if agents:
+                out.append(agents)
+            elif out and out[-1] == "--append-rules-to-system-prompt":
+                out.pop()                          # no conventions → drop the append-rules flag+value pair
         elif t == "<prompt>":
             out.append(prompt)
         elif t == perm:
