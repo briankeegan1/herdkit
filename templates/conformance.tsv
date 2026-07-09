@@ -52,6 +52,7 @@ APP_PREVIEW_PORT_BASE	none-yet	unit: no test asserts the free-port base-scan (he
 herd init	unit	tests/test-cli.sh
 herd init	unit	tests/test-stack-aware-init.sh
 herd init	unit	tests/test-init-grounding-interview.sh
+herd init	unit	tests/test-init-posture-profiles.sh
 herd doctor	unit	tests/test-doctor.sh
 herd doctor	unit	tests/test-doctor-posture.sh
 herd upgrade	unit	tests/test-cli.sh
