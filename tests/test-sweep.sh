@@ -9,6 +9,7 @@
 #   • a closed-PR worktree carrying unique commits     → FLAGGED, never deleted   [judgment]
 #   • an open-PR worktree                              → untouched
 #   • a stale tab registry entry                       → closed + registry row pruned
+#   • a stale resolve·<slug> tab on a LIVE slug whose conflict is gone → closed, counted, in the plan
 #   • a dead-pid inflight marker                       → dropped
 #   • a detached scratch tree, clean, no unique commits → reaped
 #   • a detached scratch tree with a unique commit      → FLAGGED, never deleted  [judgment]
@@ -34,6 +35,13 @@
 #  (10) NO SHA ANCHOR ⇒ NO REAP — a worktree whose HEAD != the merged PR's headRefOid is untouched.
 #  (11) SHARED-PGID GUARD — a process group that also holds a spared process (the watcher, a live gate
 #       worker, ourselves) is never GROUP-killed; the sweep degrades to a single-pid kill.
+#  (14) INERT-GUARD REGRESSION — the start-time is captured at LISTING and threaded to the kill; if the
+#       kill path re-samples it, the recycling guard is dead code and a recycled pid gets signalled.
+#  (15) A stale pgid is re-verified before any process-GROUP kill.
+#  (16) The corpse sweep holds an atomic claim, so `herd sweep` + a live watcher cannot double-charge
+#       a PR's review-retry budget or the global infra breaker.
+#  (17) Leg 3 narrates the past-deadline LIVE workers it will SIGTERM (plan == action).
+#  (18) SWEEP_AUTO=auto stands down on a repeated no-progress condition-set.
 #  (13) DETACHED SCRATCH — a detached tree whose commits are reachable from no branch ref is FLAGGED,
 #       never reaped (removing the worktree destroys them irrecoverably); a clean one still reaps.
 #  (12) COUNTERS RESET PER RUN — the watcher's auto path reuses one process, so SWEEP_N_* must not
@@ -88,6 +96,10 @@ PRECIOUS_SHA="$(git -C "$TREESDIR/tmp-precious" rev-parse HEAD)"
 [ -z "$(git -C "$TREESDIR/tmp-precious" status --porcelain)" ] \
   || fail "fixture: tmp-precious must read CLEAN to git status (that is the trap)"
 
+# tmp-inuse: a DETACHED scratch tree, clean, zero unique commits — but a live process holds it open.
+# Reaping it loses no data, yet pulls the checkout out from under its user. Must be FLAGGED.
+git -C "$MAINDIR" worktree add -q --detach "$TREESDIR/tmp-inuse" main >/dev/null 2>&1
+
 # stale-sha: HEAD moves past the sha the (merged) PR recorded → no anchor → must be untouched
 echo drift > "$TREESDIR/stale-sha/d.txt"
 git -C "$TREESDIR/stale-sha" add -A
@@ -125,7 +137,7 @@ cat > "$BIN/herdr" <<EOF
 #!/usr/bin/env bash
 case "\${1:-}/\${2:-}" in
   workspace/list) printf '{"result":{"workspaces":[{"workspace_id":"ws1","label":"sweepws"}]}}\n' ;;
-  tab/list) printf '%s\n' '{"result":{"tabs":[{"tab_id":"tabSTALE","label":"ghost","workspace_id":"ws1"},{"tab_id":"tabLIVE","label":"open-live","workspace_id":"ws1"}]}}' ;;
+  tab/list) printf '%s\n' '{"result":{"tabs":[{"tab_id":"tabSTALE","label":"ghost","workspace_id":"ws1"},{"tab_id":"tabRESOLVE","label":"resolve·open-live","workspace_id":"ws1"},{"tab_id":"tabLIVE","label":"open-live","workspace_id":"ws1"}]}}' ;;
   tab/close) printf '%s\n' "\${3:-}" >> "$TAB_CLOSED" ;;
   agent/list) printf '{"result":{"agents":[]}}\n' ;;
   *) : ;;
@@ -162,6 +174,7 @@ jcount(){ local n; n="$(grep -c "$1" "$JOURNAL_FILE" 2>/dev/null || true)"; prin
 # ── plant the rest of the mess: registry, markers, orphan process ────────────
 cat > "$TREESDIR/.herd-tabs" <<'EOF'
 ghost tabSTALE builder
+resolve·open-live tabRESOLVE resolver
 open-live tabLIVE builder
 EOF
 
@@ -190,6 +203,12 @@ chmod +x "$T/ps-stub"
 export HERD_SWEEP_PS_CMD="$T/ps-stub"
 printf '#!/usr/bin/env bash\nprintf ""\n' > "$T/cwd-stub"; chmod +x "$T/cwd-stub"
 export HERD_SWEEP_PROC_CWD_CMD="$T/cwd-stub"
+# Occupancy stub: only tmp-inuse is held open by a live process.
+cat > "$T/inuse-stub" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in *tmp-inuse) exit 0 ;; *) exit 1 ;; esac
+EOF
+chmod +x "$T/inuse-stub"; export HERD_SWEEP_DIR_INUSE_CMD="$T/inuse-stub"
 
 # ── (6) attribution + live-marker exemption ──────────────────────────────────
 MAIN=/x/proj TREES=/x/proj-trees _sweep_owns_path /x/proj-other/t.sh \
@@ -207,7 +226,7 @@ ok; echo "PASS (6) attribution rejects sibling/foreign paths; a live gate worker
 read -r C_TABS C_MARKERS C_PROCS <<< "$(sweep_scan_counts)"
 [ "$C_MARKERS" = "1" ] || fail "(2) expected 1 dead marker, got '$C_MARKERS'"
 [ "$C_PROCS" = "1" ]   || fail "(2) expected 1 orphan proc, got '$C_PROCS'"
-# 'ghost' has no worktree → counted; 'open-live' does → not counted.
+# 'ghost' has no worktree → counted. 'open-live' (and its resolve· tab) does → not counted.
 [ "$C_TABS" = "1" ]    || fail "(2) expected 1 stale tab, got '$C_TABS'"
 LINE="$(sweep_advice_line 2 1 0)"
 [ "$LINE" = "🧹 sweep recommended: 2 stale tabs · 1 dead marker" ] || fail "(2) advice line wrong: '$LINE'"
@@ -221,6 +240,8 @@ printf '%s' "$PLAN" | grep -q "reap worktree merged-clean" || fail "(3) plan omi
 printf '%s' "$PLAN" | grep -q "drop dead inflight marker"  || fail "(3) plan omits the dead marker"
 printf '%s' "$PLAN" | grep -q "kill orphan pid $VICTIM"    || fail "(3) plan omits the orphan process"
 printf '%s' "$PLAN" | grep -q "FLAG merged-dirty"          || fail "(3) plan omits the dirty-worktree flag"
+printf '%s' "$PLAN" | grep -q "close stale resolve tab tabRESOLVE" \
+  || fail "(3) plan omits the stale resolve tab it would close (invisible destructive action)"
 [ -d "$TREESDIR/merged-clean" ] || fail "(3) DRY-RUN DELETED a worktree"
 [ -f "$DEADMARK" ]              || fail "(3) DRY-RUN removed the dead marker"
 kill -0 "$VICTIM" 2>/dev/null   || fail "(3) DRY-RUN killed the orphan process"
@@ -240,6 +261,9 @@ grep -q '"reason":"closed-unique-commits"' "$JOURNAL_FILE" || fail "(5a) no swee
 grep '"event":"sweep_flag"' "$JOURNAL_FILE" | grep -q 'f.txt' || fail "(5a) the dirty flag carries no file evidence"
 grep -q '"reason":"scratch-unique-commits"' "$JOURNAL_FILE" \
   || fail "(5a) no sweep_flag for the DETACHED tree carrying unique commits"
+grep -q '"reason":"scratch-in-use"' "$JOURNAL_FILE" \
+  || fail "(5a) no sweep_flag for the DETACHED tree a live process holds open"
+[ -d "$TREESDIR/tmp-inuse" ] || fail "(5a) reaped a detached tree a live process holds open"
 ok; echo "PASS (5) judgment legs FLAGGED with evidence, never auto-deleted (auto mode)"
 
 # ── (13) detached scratch: unique commits are unrecoverable → FLAG, never reap ───────────────────
@@ -263,30 +287,88 @@ grep -q 'tabSTALE' "$TAB_CLOSED"                     || fail "(4) the stale tab 
 grep -q 'tabLIVE'  "$TAB_CLOSED"                     && fail "(4) a LIVE builder's tab was closed"
 grep -q 'tabSTALE' "$TREESDIR/.herd-tabs"            && fail "(4) the swept tab's registry row was not pruned"
 grep -q '"event":"sweep_proc"' "$JOURNAL_FILE"  || fail "(4) no orphan-process kill journaled"
+grep -q 'tabRESOLVE' "$TAB_CLOSED"                   || fail "(4) the stale resolve tab was not closed"
+grep -q '"event":"reap_resolve_tab"' "$JOURNAL_FILE"  || fail "(4) the resolve-tab close was not journaled"
+grep -q 'tabRESOLVE' "$TREESDIR/.herd-tabs"          && fail "(4) the resolve tab's registry row was not pruned"
 sleep 1
 kill -0 "$VICTIM" 2>/dev/null && fail "(4) the orphan process survived the sweep"
 kill -0 "$LIVEWORKER" 2>/dev/null || fail "(4) the LIVE gate worker was killed"
 ok; echo "PASS (4) safe legs reaped worktrees, closed the stale tab, dropped the dead marker, killed the orphan"
 
-# ── (7) pid-recycling guard ──────────────────────────────────────────────────
+# ── (7) pid-recycling guard — exercised through the REAL kill primitive ─────────────────────────
+# _sweep_term_one is what sweep_leg_procs actually calls. (An earlier revision tested the guard only
+# through a _sweep_kill_tree wrapper with ZERO production callers, so the suite stayed green while the
+# shipped path was unguarded. That wrapper is gone; these drive the real thing.)
 : > "$JOURNAL_FILE"
 bash -c 'sleep 30' & SURVIVOR=$!
 disown 2>/dev/null || true
-_sweep_kill_tree "$SURVIVOR" 0 "a start-time that will never match"
+OUT="$(_sweep_term_one "$SURVIVOR" 0 "a start-time that will never match")"
+[ -z "$OUT" ] || fail "(7) a start-time MISMATCH must signal NOTHING (got target '$OUT')"
 kill -0 "$SURVIVOR" 2>/dev/null || fail "(7) a start-time MISMATCH must REFUSE the kill (pid recycled)"
 grep -q '"reason":"pid-recycled"' "$JOURNAL_FILE" || fail "(7) the refused kill was not journaled"
 kill "$SURVIVOR" 2>/dev/null || true
-ok; echo "PASS (7) a start-time mismatch refuses the kill (pid-recycling guard)"
+ok; echo "PASS (7) a start-time mismatch refuses the kill (pid-recycling guard, real path)"
+
+# ── (14) the guard is NOT inert: the token comes from LISTING, not from kill time ────────────────
+# THE REGRESSION TEST. sweep_orphan_procs must emit the start-time as a 4th field, and sweep_leg_procs
+# must compare that LISTED token against the pid's CURRENT one. If the kill path re-samples the token
+# itself (as it once did), st and cur are two ps calls microseconds apart, can never differ, and the
+# recycling guard is dead code. Here _pid_starttime returns "ST-A" on its first call (listing) and
+# "ST-B" thereafter — simulating a pid recycled between listing and TERM. The victim MUST survive.
+: > "$JOURNAL_FILE"
+bash -c 'sleep 30' & RECYCLED=$!
+disown 2>/dev/null || true
+cat > "$T/ps-recycle" <<EOF
+#!/usr/bin/env bash
+printf '%s 1 0 bash %s/scripts/herd/healthcheck.sh %s/x\n' "$RECYCLED" "$MAINDIR" "$TREESDIR"
+EOF
+chmod +x "$T/ps-recycle"
+# Per-pid call counter: the FIRST read of a pid's start-time (the listing) reports ST-A; every later
+# read (the kill-time re-verify) reports ST-B — i.e. the pid number was recycled inside the window
+# between the listing that authorized the kill and the TERM. Other pids (the live gate worker's
+# marker) are untouched. sweep_leg_procs relists internally, so the flip must key on the pid, not on
+# wall-clock ordering.
+ST_DIR="$T/st"; mkdir -p "$ST_DIR"
+_pid_starttime() {
+  local p="${1:-}" f="$ST_DIR/${1:-none}"
+  case "$p" in
+    "$RECYCLED")
+      if [ -f "$f" ]; then printf 'ST-B'; else : > "$f"; printf 'ST-A'; fi ;;
+    *) printf 'ST-OTHER-%s' "$p" ;;
+  esac
+}
+ROWS="$(HERD_SWEEP_PS_CMD="$T/ps-recycle" sweep_orphan_procs)"
+[ "$(printf '%s' "$ROWS" | awk -F'\t' '{print NF; exit}')" = "4" ] \
+  || fail "(14) sweep_orphan_procs must emit pid/pgid/STARTTIME/cmd — got: $ROWS"
+printf '%s' "$ROWS" | cut -f3 | grep -qx 'ST-A' || fail "(14) the row must carry the LISTING-time token"
+rm -f "$ST_DIR/$RECYCLED"                # re-arm: the coming sweep_leg_procs does its own listing
+HERD_SWEEP_PS_CMD="$T/ps-recycle" sweep_leg_procs "" >/dev/null 2>&1
+kill -0 "$RECYCLED" 2>/dev/null \
+  || fail "(14) INERT GUARD: a pid recycled between listing and TERM was killed"
+grep -q '"reason":"pid-recycled"' "$JOURNAL_FILE" || fail "(14) the recycled pid was not journaled as skipped"
+unset -f _pid_starttime
+. "$WATCH" >/dev/null 2>&1 || true       # restore the real _pid_starttime
+kill "$RECYCLED" 2>/dev/null || true
+ok; echo "PASS (14) start-time is captured at LISTING and re-verified at kill (guard is live, not inert)"
+
+# ── (15) a stale pgid is never used as a GROUP-kill target ───────────────────────────────────────
+: > "$JOURNAL_FILE"
+bash -c 'sleep 30' & MOVED=$!
+disown 2>/dev/null || true
+_sweep_pgid_of() { printf '999002'; }    # current pgid ≠ the listed one
+OUT="$(_sweep_term_one "$MOVED" 999001 "")"
+[ "$OUT" = "$MOVED" ] || fail "(15) a pid whose pgid changed since listing must be pid-killed, not group-killed (target '$OUT')"
+grep -q '"reason":"pgid-changed"' "$JOURNAL_FILE" || fail "(15) the pgid mismatch was not journaled"
+unset -f _sweep_pgid_of
+. "$WATCH" >/dev/null 2>&1 || true
+kill "$MOVED" 2>/dev/null || true
+ok; echo "PASS (15) a stale pgid is re-verified and never aimed at as a process group"
 
 # ── (11) shared-pgid guard: never GROUP-kill a group holding a process we must spare ─────────────
-# Observed live: several orphans share one pgid. If a live gate worker (or the watcher) sits in that
-# group, `kill -TERM -<pgid>` would reap it too. The sweep must degrade to a single-pid kill instead.
 : > "$JOURNAL_FILE"
 SHARED_PGID=777001
 bash -c 'sleep 30' & SPARE_VICTIM=$!
 disown 2>/dev/null || true
-# Present BOTH the still-live gate worker (LIVEWORKER, whose marker LIVEMARK reads live) and a fresh
-# orphan as members of ONE process group. A group kill here would reap the healthy worker.
 cat > "$T/ps-shared" <<EOF
 #!/usr/bin/env bash
 printf '%s 1 %s bash %s/scripts/herd/healthcheck.sh %s/x\n' "$SPARE_VICTIM" "$SHARED_PGID" "$MAINDIR" "$TREESDIR"
@@ -295,13 +377,64 @@ EOF
 chmod +x "$T/ps-shared"
 kill -0 "$LIVEWORKER" 2>/dev/null || fail "(11) precondition: the live gate worker must still be running"
 PS_SAVED="$HERD_SWEEP_PS_CMD"; export HERD_SWEEP_PS_CMD="$T/ps-shared"
-_sweep_kill_tree "$SPARE_VICTIM" "$SHARED_PGID" "$(_pid_starttime "$SPARE_VICTIM")"
+OUT="$(_sweep_term_one "$SPARE_VICTIM" "$SHARED_PGID" "$(_pid_starttime "$SPARE_VICTIM")")"
 export HERD_SWEEP_PS_CMD="$PS_SAVED"
+[ "$OUT" = "$SPARE_VICTIM" ] || fail "(11) a spared group must degrade to a single-pid kill (target '$OUT')"
 grep -q '"reason":"spared-group"' "$JOURNAL_FILE" \
   || fail "(11) a group holding a live gate worker was GROUP-killed (would reap the healthy worker)"
 kill -0 "$LIVEWORKER" 2>/dev/null || fail "(11) the live gate worker sharing the pgid was killed"
-kill -0 "$SPARE_VICTIM" 2>/dev/null && fail "(11) the orphan itself must still be killed (single-pid)"
+kill "$SPARE_VICTIM" 2>/dev/null || true
 ok; echo "PASS (11) a shared pgid holding a spared process degrades to a single-pid kill"
+
+# ── (16) corpse-sweep is serialized: no double-charged retry budget / infra breaker ──────────────
+# `herd sweep`'s leg 3 makes _sweep_gate_corpses a SECOND concurrent caller alongside the live watcher
+# tick (cmd_sweep runs legs 1-4 before leg 5 restarts the watcher). Without a claim, both can win the
+# same corpse and both run record_review_retry (bare `>>` append) and _breaker_record_infra (a
+# read-modify-write) — silently double-charging the PR's review-retry budget.
+: > "$JOURNAL_FILE"
+DEADPID2="$(bash -c 'exit 0' & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p")"
+CORPSE="$TREESDIR/.review-inflight-901-shaX"
+printf '%s\n%s\n%s\n' "$DEADPID2" "stale" "$(date +%s)" > "$CORPSE"
+_gate_corpse_claim || fail "(16) precondition: the mutex must be free"
+_sweep_gate_corpses                       # a CONCURRENT caller: must stand down, touch nothing
+[ -f "$CORPSE" ] || fail "(16) a concurrent corpse sweep acted while another holder had the claim"
+[ "$(jcount '"reason":"review_died"')" = "0" ] || fail "(16) the locked-out sweep still journaled/charged a retry"
+_gate_corpse_release
+_sweep_gate_corpses                       # now the claim is free: it reaps exactly once
+[ ! -f "$CORPSE" ] || fail "(16) the corpse was not reaped once the claim was free"
+[ "$(jcount '"reason":"review_died"')" = "1" ] || fail "(16) expected exactly ONE review_died charge"
+_sweep_gate_corpses                       # idempotent re-run must not double-charge
+[ "$(jcount '"reason":"review_died"')" = "1" ] || fail "(16) a re-run double-charged the review retry budget"
+ok; echo "PASS (16) corpse sweep holds an atomic claim — no double-charged retry budget / breaker"
+
+# ── (17) past-deadline LIVE workers appear in the plan (leg 3 narrates what it will kill) ────────
+# _sweep_gate_corpses SIGTERMs them, so --dry-run must show them or the sweep performs a destructive
+# action it never announced.
+: > "$JOURNAL_FILE"
+bash -c 'sleep 30' & SLOWPID=$!
+disown 2>/dev/null || true
+SLOWMARK="$TREESDIR/.review-inflight-902-shaY"
+printf '%s\n%s\n%s\n' "$SLOWPID" "$(_pid_starttime "$SLOWPID")" "$(( $(date +%s) - 9999 ))" > "$SLOWMARK"
+REVIEW_INFLIGHT_TIMEOUT=1 sweep_timedout_marker_keys | grep -q '.review-inflight-902-shaY' \
+  || fail "(17) a past-deadline LIVE marker was not detected"
+PLAN2="$(REVIEW_INFLIGHT_TIMEOUT=1 sweep_leg_markers 1 2>&1)"
+printf '%s' "$PLAN2" | grep -q 'SIGTERM past-deadline worker for .review-inflight-902-shaY' \
+  || fail "(17) the plan omits the past-deadline worker it would SIGTERM: $PLAN2"
+kill -0 "$SLOWPID" 2>/dev/null || fail "(17) the dry-run plan killed the worker"
+kill "$SLOWPID" 2>/dev/null || true; rm -f "$SLOWMARK"
+ok; echo "PASS (17) leg 3 narrates the past-deadline workers it will SIGTERM (plan == action)"
+
+# ── (18) auto stands down on a no-progress condition-set (false-positive tab count) ──────────────
+# sweep_cheap_tab_count knowingly over-counts. Without a memo, one false positive re-runs every safe
+# leg — a `gh pr view` per worktree plus a `gh pr list` — on every cadence tick, forever.
+rm -f "$TREESDIR/.sweep-auto-acted"
+_sweep_auto_should_act 1 0 0 || fail "(18) a fresh condition-set must be acted on"
+_sweep_auto_record 1 0 0 0                    # …and it swept NOTHING
+_sweep_auto_should_act 1 0 0 && fail "(18) a repeat no-progress condition-set must stand down"
+_sweep_auto_should_act 2 0 0 || fail "(18) a CHANGED condition-set must re-arm"
+_sweep_auto_record 2 0 0 3                    # this one swept 3 things
+_sweep_auto_should_act 2 0 0 || fail "(18) a condition-set whose last run made progress must retry"
+ok; echo "PASS (18) auto stands down on a no-progress repeat, re-arms on change or progress"
 
 # ── (8) advice journaled once per condition-set ──────────────────────────────
 : > "$JOURNAL_FILE"; rm -f "$TREESDIR/.sweep-advice"
@@ -333,14 +466,14 @@ ok; echo "PASS (9) SWEEP_AUTO off|advise|auto normalize; off is byte-inert; unkn
 # process. Without a per-run reset the SWEEP_N_* globals accumulate and each `sweep_auto` journal line
 # reports a lifetime total rather than what that tick actually swept. Everything is already clean here,
 # so a second pass must journal all-zero counts.
-# The three judgment worktrees (merged-dirty, closed-unique, tmp-precious) survive every pass and are
-# re-flagged each time, so `flagged` exposes accumulation: it must read 3 on EVERY pass, not 3,6,9…
+# The four judgment worktrees (merged-dirty, closed-unique, tmp-precious, tmp-inuse) survive every pass
+# and are re-flagged each time, so `flagged` exposes accumulation: it must read 4 EVERY pass, not 4,8…
 : > "$JOURNAL_FILE"
 sweep_run_safe_legs >/dev/null 2>&1 || true
 sweep_run_safe_legs >/dev/null 2>&1 || true
 LAST="$(grep '"event":"sweep_auto"' "$JOURNAL_FILE" | tail -1)"
-printf '%s' "$LAST" | grep -q '"flagged":3' \
-  || fail "(12) counters accumulated across runs (expected flagged=3 on every pass): $LAST"
+printf '%s' "$LAST" | grep -q '"flagged":4' \
+  || fail "(12) counters accumulated across runs (expected flagged=4 on every pass): $LAST"
 printf '%s' "$LAST" | grep -q '"reaped":0' || fail "(12) reaped counter accumulated across runs: $LAST"
 ok; echo "PASS (12) SWEEP_N_* counters reset per run (auto ticks never report a lifetime total)"
 

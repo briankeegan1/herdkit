@@ -180,7 +180,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
-- `HEALTH_INFLIGHT_TIMEOUT` → `agent-watch.sh`
+- `HEALTH_INFLIGHT_TIMEOUT` → `agent-watch.sh`, `sweep.sh`
 - `HERD_BRAND` → `herd-preflight.sh`
 - `HERD_DRIVER` → `bin/herd`, `driver.sh`, `herd-preflight.sh`
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
@@ -223,7 +223,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
-- `REVIEW_INFLIGHT_TIMEOUT` → `agent-watch.sh`
+- `REVIEW_INFLIGHT_TIMEOUT` → `agent-watch.sh`, `sweep.sh`
 - `REVIEW_LOG_KEEP` → `herd-review.sh`
 - `REVIEW_MODEL_CHEAP` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`

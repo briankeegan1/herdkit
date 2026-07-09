@@ -3219,8 +3219,9 @@ except Exception: pass
 # populated (the tick sets it; the startup call primes it). Idempotent + fully fail-soft: no registry,
 # no herdr, or dry-run ⇒ zero action. One `gh pr list` per invocation; cheap when there are no resolve
 # rows (the common case) — it returns before any network call.
-_sweep_stale_resolve_tabs() {
-  [ -n "$DRYRUN" ] && return 0
+# DETECTION vs ACTION: _stale_resolve_tab_ids PRINTS "slug<TAB>tab_id" for each stale resolve tab and
+# touches nothing; _sweep_stale_resolve_tabs (below) is the action wrapper.
+_stale_resolve_tab_ids() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _srt_reg="$TREES/.herd-tabs"
   [ -f "$_srt_reg" ] || return 0
@@ -3282,7 +3283,7 @@ except Exception:
     pass
 ' 2>/dev/null || true)"
 
-  local _srt_slug _srt_tab _srt_merge _srt_n=0
+  local _srt_slug _srt_tab _srt_merge
   while IFS=$'\t' read -r _srt_slug _srt_tab; do
     [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
     # SAFETY: a live resolver agent for this slug is NEVER closed (shared liveness with HERD-55).
@@ -3292,12 +3293,24 @@ except Exception:
     case "$_srt_merge" in
       CONFLICTING|UNKNOWN) continue ;;
     esac
-    # STALE: dead resolver + PR merged/closed/clean → close the tab, prune its registry row, journal.
+    printf '%s\t%s\n' "$_srt_slug" "$_srt_tab"
+  done <<< "$_srt_rows"
+  return 0
+}
+
+# _sweep_stale_resolve_tabs — the ACTION wrapper around _stale_resolve_tab_ids: close each stale
+# resolve tab, journal it, prune its registry row. Dry-run-inert. Split for the same reason as
+# _orphan_tab_ids: `herd sweep` (HERD-191) narrates + counts from the detector, so a resolve tab it
+# closes can never be invisible in the plan or in SWEEP_N_TAB.
+_sweep_stale_resolve_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  local _srt_reg="$TREES/.herd-tabs" _srt_slug _srt_tab
+  while IFS=$'\t' read -r _srt_slug _srt_tab; do
+    [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
     herdr tab close "$_srt_tab" >/dev/null 2>&1 || true
     journal_append reap_resolve_tab tab_id "$_srt_tab" slug "$_srt_slug" reason stale-sweep
     _herd_tabs_drop_row "$_srt_reg" "$_srt_tab"
-    _srt_n=$(( _srt_n + 1 ))
-  done <<< "$_srt_rows"
+  done <<< "$(_stale_resolve_tab_ids)"
   return 0
 }
 
@@ -5692,8 +5705,40 @@ _healthcheck_gate() {
 # Crucially independent of the candidate list: a marker whose PR merged/closed/changed-sha — the exact
 # corpse that held a slot for ~1h on 2026-07-08 — is swept too, because nothing else would ever revisit
 # it. Idempotent, dry-run-inert, and byte-quiet when there are no corpses.
+# ── Corpse-sweep MUTUAL EXCLUSION (HERD-191) ─────────────────────────────────────────────────────
+# _sweep_gate_corpses used to have exactly ONE caller (the watcher tick). `herd sweep`'s leg 3 makes it
+# a SECOND, CONCURRENT caller: cmd_sweep runs legs 1-4 while the old watcher is still alive (leg 5
+# restarts it only afterwards). The function has no claim on a marker — it reads it, does a driver RPC
+# (_retire_reviewer_pane), and only THEN rm -f's — so two processes can both win the same corpse and
+# both run record_review_retry (a bare `>>` append) and _breaker_record_infra (a read-modify-write
+# counter). That silently double-charges a PR's review-retry budget (it exhausts its retries and stops
+# being reviewed) and can trip the global INFRA breaker early, while the RMW loses an increment.
+#
+# So the whole sweep runs under an atomic-mkdir mutex — the same primitive the watcher singleton lock
+# uses. `mkdir` is atomic on every POSIX filesystem: exactly one process creates the directory. The
+# loser SKIPS (returns 0) rather than blocking: the sweep is periodic and idempotent, so whoever holds
+# the lock is already freeing those slots, and the loser's next tick will find them gone. A lock dir
+# older than the staleness window is a crashed holder's leftover and is reclaimed.
+_GATE_CORPSE_MTX="${TREES}/.gate-corpse-sweep.lock.d"
+
+# _gate_corpse_claim — success iff we now hold the sweep mutex (caller MUST _gate_corpse_release).
+_gate_corpse_claim() {
+  if mkdir "$_GATE_CORPSE_MTX" 2>/dev/null; then return 0; fi
+  # Held. Reclaim only a STALE lock (no mtime inside the last minute ⇒ the holder died mid-sweep).
+  if [ -z "$(find "$_GATE_CORPSE_MTX" -prune -mmin -1 2>/dev/null)" ]; then
+    rmdir "$_GATE_CORPSE_MTX" 2>/dev/null || true
+    mkdir "$_GATE_CORPSE_MTX" 2>/dev/null && return 0
+  fi
+  return 1
+}
+_gate_corpse_release() { rmdir "$_GATE_CORPSE_MTX" 2>/dev/null || true; }
+
 _sweep_gate_corpses() {
   [ -z "${DRYRUN:-}" ] || return 0
+  # Serialize against a concurrent `herd sweep` / watcher tick. A skipped sweep is harmless (periodic
+  # + idempotent); a CONCURRENT one corrupts the retry ledger and the infra breaker.
+  _gate_corpse_claim || return 0
+  trap '_gate_corpse_release' RETURN
   local f base rest pr sha age pid
   # ── review family: .review-inflight-<pr>-<sha> ──
   for f in "$TREES"/.review-inflight-*; do
@@ -6046,15 +6091,39 @@ _sweep_trigger_tick() {
   read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   sweep_journal_advice_once "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"
   if [ "$_st_mode" = auto ] \
-     && { [ "$_SWEEP_C_TABS" -gt 0 ] || [ "$_SWEEP_C_MARKERS" -gt 0 ] || [ "$_SWEEP_C_PROCS" -gt 0 ]; }; then
+     && { [ "$_SWEEP_C_TABS" -gt 0 ] || [ "$_SWEEP_C_MARKERS" -gt 0 ] || [ "$_SWEEP_C_PROCS" -gt 0 ]; } \
+     && _sweep_auto_should_act "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"; then
     # SAFE legs only. Judgment findings (dirty / unique-commit worktrees) are flagged + journaled by
     # sweep_leg_worktrees and never acted on, so `auto` can never destroy unrecovered work. Narration
     # is swallowed: the console is the watcher's, not the sweep's — the journal carries the record.
     sweep_run_safe_legs >/dev/null 2>&1 || true
+    # Remember whether this condition-set was actually ACTIONABLE. sweep_cheap_tab_count knowingly
+    # over-counts (a slug whose worktree was reaped but whose PR is still open reads as a stale tab
+    # forever). Without this memo that single false positive would re-run every safe leg — a
+    # `gh pr view` per worktree plus a `gh pr list` — on every cadence tick, indefinitely. The
+    # sweep_advice memo suppressed the journal spam but not the work.
+    _sweep_auto_record "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS" "$(sweep_swept_total)"
     # The mess is gone; re-scan so the console row clears this same tick instead of lingering a cycle.
     read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
   fi
   return 0
+}
+
+# _sweep_auto_should_act <tabs> <markers> <procs> — skip a repeat auto-sweep of a condition-set we
+# already swept and which yielded NOTHING. Any change in the signature (new debris, or debris cleared)
+# re-arms it, and a signature whose last run DID sweep something is retried (it was making progress).
+_SWEEP_AUTO_MEMO="$TREES/.sweep-auto-acted"
+_sweep_auto_should_act() {
+  local sig="t=$1 m=$2 p=$3" prev="" psig pswept
+  [ -f "$_SWEEP_AUTO_MEMO" ] || return 0
+  prev="$(cat "$_SWEEP_AUTO_MEMO" 2>/dev/null || true)"
+  psig="${prev%%|*}"; pswept="${prev##*|}"
+  [ "$psig" = "$sig" ] || return 0            # different condition-set → act
+  [ "${pswept:-0}" -gt 0 ] 2>/dev/null && return 0   # same set, but last run made progress → retry
+  return 1                                    # same set, swept nothing → a false positive; stand down
+}
+_sweep_auto_record() {
+  printf '%s|%s\n' "t=$1 m=$2 p=$3" "$4" > "$_SWEEP_AUTO_MEMO" 2>/dev/null || true
 }
 
 # build_sweep_note — the '🧹 sweep recommended: N stale tabs · M dead markers' console row, rendered

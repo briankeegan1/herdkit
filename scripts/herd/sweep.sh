@@ -17,9 +17,11 @@
 #                      commits → _reap_slug
 #   leg 2  tabs        stale engine tabs, registry-allowlisted + workspace-scoped → _sweep_orphan_tabs
 #                      / _sweep_stale_resolve_tabs (via the extracted _orphan_tab_ids detector)
-#   leg 3  markers     dead-pid inflight markers → _sweep_gate_corpses (HERD-185's restart-safe sweep,
-#                      including its pid-RECYCLING guard via _marker_live)
-#   leg 4  processes   orphaned (ppid=1) bats/healthcheck trees + duplicate argv0-tagged watchers
+#   leg 3  markers     dead-pid inflight markers AND past-deadline live workers (both narrated) →
+#                      _sweep_gate_corpses (HERD-185's restart-safe sweep, under an atomic claim so a
+#                      CLI sweep and the watcher tick never double-charge the retry ledger / breaker)
+#   leg 4  processes   orphaned (ppid=1) bats/healthcheck trees (pgid + start-time captured at LISTING,
+#                      re-verified immediately before the signal) + duplicate argv0-tagged watchers
 #   leg 5  watcher     restart the watcher pane + verify it survives one tick (driven by bin/herd's
 #                      cmd_sweep, which owns the pane helpers; never run from inside the watcher)
 #
@@ -188,6 +190,20 @@ _sweep_is_scratch() {
   return 1
 }
 
+# _sweep_dir_in_use <dir> — success iff some live process has <dir> (or anything under it) open,
+# most importantly as its CWD. A detached scratch tree at origin/main is clean and carries no unique
+# commits, so nothing is LOST by reaping it — but a human or agent may be sitting in it (the A/B
+# checkout this project's own builder guidance recommends), and pulling the directory out from under
+# them is hostile. The .herd-tabs registry only spares trees that own a TAB, which such a tree does not.
+# Seam: HERD_SWEEP_DIR_INUSE_CMD (test stub). Without lsof we cannot check, and we PROCEED — the
+# data-safety guarantee rests on the unique-commit proof, not on this occupancy courtesy check.
+_sweep_dir_in_use() {
+  local dir="${1:-}"; [ -n "$dir" ] || return 1
+  if [ -n "${HERD_SWEEP_DIR_INUSE_CMD:-}" ]; then "$HERD_SWEEP_DIR_INUSE_CMD" "$dir"; return $?; fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  [ -n "$(lsof -t +D "$dir" 2>/dev/null | head -1)" ]
+}
+
 # _sweep_unique_commits <dir> — count commits on this worktree's HEAD that exist nowhere on the
 # default branch (i.e. work a delete would destroy). Prints a count, or "?" when the base ref cannot
 # be resolved — an unverifiable tree is FLAGGED, never reaped.
@@ -248,6 +264,8 @@ sweep_leg_worktrees() {
       uniq="$(_sweep_unique_commits "$dir")"
       if [ "$dirt" = "dirty" ]; then
         _sweep_emit_flag "$slug" scratch-dirty "$evidence"
+      elif _sweep_dir_in_use "$dir"; then
+        _sweep_emit_flag "$slug" scratch-in-use "a live process holds this directory open (cwd or file) — reaping it would pull the checkout out from under its user"
       elif [ "$uniq" = "?" ]; then
         _sweep_emit_flag "$slug" scratch-unverifiable "cannot resolve ${DEFAULT_BRANCH:-origin/main} to prove no unique work in this detached tree"
       elif [ "$uniq" != "0" ]; then
@@ -319,23 +337,35 @@ _sweep_emit_flag() {
 # the live sweep therefore agree by construction. _sweep_stale_resolve_tabs adds the resolve·<slug>
 # case, which needs a live-resolver-agent check the generic detector does not do.
 sweep_leg_tabs() {
-  local dry="$1" ids id n=0
+  local dry="$1" ids id n=0 rslug rtab
   command -v herdr >/dev/null 2>&1 || return 0
+  # _sweep_stale_resolve_tabs / _stale_resolve_tab_ids read AGENTS_JSON (the agent roster) to spare a
+  # LIVE resolver; the watcher's tick primes it, so a CLI sweep must prime it too or every resolve tab
+  # reads "no live resolver". Primed BEFORE detection so the plan and the action agree.
+  # shellcheck disable=SC2034
+  AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
+
   ids="$(_orphan_tab_ids 2>/dev/null || true)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     n=$(( n + 1 )); SWEEP_N_TAB=$(( SWEEP_N_TAB + 1 ))
     _sweep_say "🗂 " "close stale tab ${id}"
   done <<< "$ids"
+  # Stale resolve·<slug> tabs are closed by the same leg — narrate + count them, or they would be
+  # invisible in both the plan and SWEEP_N_TAB while still being closed. DEDUPE against the orphan
+  # list: a resolve tab whose slug is entirely dead is ALSO an orphan-tab candidate, and
+  # _sweep_orphan_tabs closes it first; counting it in both detectors would double-report one tab.
+  while IFS=$'\t' read -r rslug rtab; do
+    [ -n "${rtab:-}" ] || continue
+    case "$(printf '%s\n' "$ids")" in *"$rtab"*) continue ;; esac
+    SWEEP_N_TAB=$(( SWEEP_N_TAB + 1 ))
+    _sweep_say "🗂 " "close stale resolve tab ${rtab} (resolve·${rslug})"
+  done <<< "$(_stale_resolve_tab_ids 2>/dev/null || true)"
+
   [ -n "$dry" ] && return 0
-  # Act through the shipped sweeps (they journal `sweep_closed` and prune the registry row). Hand the
-  # ids we already computed back to the action wrapper so the herdr/gh round-trips happen ONCE.
+  # Act through the shipped sweeps (they journal `sweep_closed` / `reap_resolve_tab` and prune the
+  # registry row). Hand the orphan ids we already computed back so those round-trips happen ONCE.
   [ "$n" -gt 0 ] && _sweep_orphan_tabs "$ids"
-  # _sweep_stale_resolve_tabs reads AGENTS_JSON (the agent roster) to spare a LIVE resolver; the
-  # watcher's tick primes it, so a CLI sweep must prime it too or every resolve tab reads "no live
-  # resolver". shellcheck cannot see the read across the sourced file.
-  # shellcheck disable=SC2034
-  AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
   _sweep_stale_resolve_tabs
   return 0
 }
@@ -343,9 +373,10 @@ sweep_leg_tabs() {
 # ── leg 3: dead inflight markers ─────────────────────────────────────────────────────────────────
 # sweep_dead_marker_keys — the CHEAP detector (filesystem + kill -0 + start-time), shared by the
 # watcher's trigger pass and the CLI. A marker is DEAD when its worker's pid is gone or recycled
-# (_marker_live, HERD-185) AND no finished result/dispatch file is waiting to be collected. A LIVE
-# but past-deadline marker is NOT reported here: timing a running worker out is the watcher's job,
-# not a cleanup command's.
+# (_marker_live, HERD-185) AND no finished result/dispatch file is waiting to be collected.
+# LIVE-but-past-deadline markers are reported separately by sweep_timedout_marker_keys — the action
+# (_sweep_gate_corpses) reaps BOTH, so the plan must show both or `herd sweep` would perform a
+# destructive SIGTERM that never appeared in its narration or in --dry-run.
 sweep_dead_marker_keys() {
   local f base rest pr sha
   for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
@@ -367,17 +398,55 @@ sweep_dead_marker_keys() {
   done
 }
 
+# sweep_timedout_marker_keys — markers whose worker is still LIVE but whose age exceeds its family's
+# timeout. _sweep_gate_corpses SIGTERMs these, so they belong in the plan: a `herd sweep` that prints
+# only dead markers while silently killing a running (merely slow) reviewer or healthcheck would be
+# lying about what it does. Mirrors the family timeouts + the never-TERM-the-watcher-itself guard.
+sweep_timedout_marker_keys() {
+  local f base rest pr sha age pid timeout
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"
+    case "$base" in
+      .review-inflight-*)
+        rest="${base#.review-inflight-}"; pr="${rest%-*}"; sha="${rest##*-}"
+        [ -n "$pr" ] && [ -n "$sha" ] || continue
+        [ -f "$(_review_result_file "$pr" "$sha")" ] && continue
+        timeout="${REVIEW_INFLIGHT_TIMEOUT:-1800}" ;;
+      .health-inflight-*)
+        rest="${base#.health-inflight-}"
+        [ -n "$rest" ] || continue
+        [ -f "$(_health_dispatch_file "$rest")" ] && continue
+        timeout="${HEALTH_INFLIGHT_TIMEOUT:-1800}" ;;
+      *) continue ;;
+    esac
+    _marker_live "$f" || continue                     # dead → the other detector owns it
+    age="$(_marker_age "$f")"
+    case "$age" in ''|-1|*[!0-9]*) continue ;; esac   # no deadline recorded → runs forever
+    [ "$age" -lt "$timeout" ] 2>/dev/null && continue
+    pid="$(_marker_pid "$f")"
+    [ "$pid" = "$$" ] && continue                     # never TERM ourselves
+    printf '%s\t%s\n' "$base" "$age"
+  done
+}
+
 # sweep_leg_markers <dry> — narrate every dead marker, then hand the actual reap to HERD-185's
 # _sweep_gate_corpses, which additionally frees the concurrency slot, retires an orphaned reviewer
 # pane, counts the review retry budget, and feeds the INFRA breaker. Reusing it (rather than `rm`-ing
 # the markers here) is what keeps a CLI sweep and a watcher tick accounting-identical.
 sweep_leg_markers() {
-  local dry="$1" k n=0
+  local dry="$1" k age n=0
   while IFS= read -r k; do
     [ -n "$k" ] || continue
     n=$(( n + 1 )); SWEEP_N_MARKER=$(( SWEEP_N_MARKER + 1 ))
     _sweep_say "🩻" "drop dead inflight marker ${k}"
   done < <(sweep_dead_marker_keys)
+  # Past-deadline LIVE workers are SIGTERMed by the same action — narrate them (and count them) too.
+  while IFS=$'\t' read -r k age; do
+    [ -n "$k" ] || continue
+    n=$(( n + 1 )); SWEEP_N_MARKER=$(( SWEEP_N_MARKER + 1 ))
+    _sweep_say "⏱ " "SIGTERM past-deadline worker for ${k} (running ${age}s) + drop its marker"
+  done < <(sweep_timedout_marker_keys)
   [ -n "$dry" ] && return 0
   [ "$n" -gt 0 ] && _sweep_gate_corpses
   return 0
@@ -427,7 +496,7 @@ _sweep_owns_path() {
   return 1
 }
 
-# sweep_orphan_procs — emit "pid\tpgid\tcommand" for every ORPHANED (ppid==1) bats/healthcheck
+# sweep_orphan_procs — emit "pid\tpgid\tSTARTTIME\tcommand" for every ORPHANED (ppid==1) bats/healthcheck
 # process tree ATTRIBUTED TO THIS PROJECT. Attribution is the whole safety story (issue #60: a
 # careless pattern kill once reaped a sibling project's watcher), so a candidate must satisfy ALL of:
 #   • ppid == 1                     — genuinely reparented to init; a child of a live runner is busy
@@ -436,8 +505,16 @@ _sweep_owns_path() {
 #   • it is NOT the worker of a live inflight marker (see _sweep_live_marker_pids)
 #   • its command line names a path UNDER $MAIN/$TREES, or its cwd resolves under one of them
 # A candidate we cannot attribute is DROPPED, never killed.
+#
+# The START-TIME is captured HERE, at listing time, and travels with the row — it is the identity
+# token the kill path re-verifies against. Sampling it again at kill time (as an earlier revision did)
+# compares two `ps` calls microseconds apart and can never disagree, which makes the recycling guard
+# dead code. Real time elapses between listing and TERM: the cwd fallback below runs an `lsof` per
+# unattributed candidate, so hundreds of ms can pass, and a listed orphan may exit and have its
+# pid/pgid recycled inside that window. Same discipline as _marker_write, which persists the
+# start-time at dispatch rather than re-reading it at collect.
 sweep_orphan_procs() {
-  local pid ppid pgid cmd cwd tok mypgid wpid="" live owned
+  local pid ppid pgid cmd cwd tok mypgid wpid="" live owned st
   mypgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
   [ -f "${HERD_WATCHER_LOCK:-/nonexistent}" ] && wpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
   live=" $(_sweep_live_marker_pids | tr '\n' ' ')"
@@ -462,7 +539,9 @@ sweep_orphan_procs() {
       cwd="$(_sweep_proc_cwd "$pid")"
       _sweep_owns_path "$cwd" || continue
     fi
-    printf '%s\t%s\t%s\n' "$pid" "$pgid" "$cmd"
+    # Capture the identity token NOW, while the listing decision is being made.
+    st="$(_pid_starttime "$pid")"
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$pgid" "$st" "$cmd"
   done < <(_sweep_ps)
 }
 
@@ -515,58 +594,70 @@ _sweep_spare_pgids() {
   printf '%s' "$out"
 }
 
-# _sweep_term_one <pid> <pgid> <starttime> — PID-RECYCLING-GUARDED SIGTERM. The start-time token was
-# captured when the process was LISTED; if it no longer matches, that pid number now belongs to an
-# unrelated process and we must not signal it. Signals the whole PROCESS GROUP (a bats run is a tree;
-# TERMing only the leader strands its children) — except for a group we must spare (see
-# _sweep_spare_pgids), and never group 0/1. Prints the signalled target (for the later SIGKILL), or
-# nothing when the kill was refused or the pid is already gone.
+# _sweep_term_one <pid> <pgid> <listed-starttime> — IDENTITY-VERIFIED SIGTERM.
+#
+# The start-time token was captured by sweep_orphan_procs at LISTING time; here we re-read the pid's
+# CURRENT start-time and refuse to signal unless they match. That is the whole recycling guard: if the
+# listed orphan exited and an unrelated process inherited its pid number, the tokens differ and we
+# signal nothing. (Re-sampling the token here instead of threading the listed one through would
+# compare a value against itself — the guard would be inert.)
+#
+# The PGID gets the SAME treatment. It is a snapshot value used as a GROUP-kill target, so it is the
+# more dangerous of the two: a stale pgid aims SIGTERM/SIGKILL at an entire unrelated process group.
+# We re-read the pid's current pgid and group-kill only when it still equals the listed one; on any
+# mismatch (or an unreadable pgid) we fall back to signalling the single pid.
+#
+# Group kills also skip a group we must spare (see _sweep_spare_pgids) and never group 0/1.
+# Prints the signalled TARGET ("<pid>" or "-<pgid>") for the later SIGKILL; prints nothing when the
+# kill was refused or the pid is already gone.
 _sweep_term_one() {
-  local pid="$1" pgid="$2" st="$3" cur target spare
+  local pid="$1" pgid="$2" st="$3" cur curpgid target spare
   cur="$(_pid_starttime "$pid")"
   if [ -n "$st" ] && [ -n "$cur" ] && [ "$cur" != "$st" ]; then
     journal_append sweep_proc_skip pid "$pid" reason pid-recycled
     return 0
   fi
   kill -0 "$pid" 2>/dev/null || return 0
-  spare="$(_sweep_spare_pgids)"
   target="$pid"
   case "$pgid" in
     ''|0|1|*[!0-9]*) : ;;
-    *) case "$spare" in
-         *" $pgid "*) journal_append sweep_proc_pidonly pid "$pid" pgid "$pgid" reason spared-group ;;
-         *) target="-$pgid" ;;
-       esac ;;
+    *)
+      curpgid="$(_sweep_pgid_of "$pid")"
+      if [ -z "$curpgid" ] || [ "$curpgid" != "$pgid" ]; then
+        # The pid moved groups (or we cannot read its group) since listing — the recorded pgid no
+        # longer provably names THIS process's group, so it is not a safe group-kill target.
+        journal_append sweep_proc_pidonly pid "$pid" pgid "$pgid" reason pgid-changed
+      else
+        spare="$(_sweep_spare_pgids)"
+        case "$spare" in
+          *" $pgid "*) journal_append sweep_proc_pidonly pid "$pid" pgid "$pgid" reason spared-group ;;
+          *) target="-$pgid" ;;
+        esac
+      fi ;;
   esac
   kill -TERM "$target" 2>/dev/null || true
   printf '%s' "$target"
 }
 
-# _sweep_await_dead <deadline-secs> <pid…> — poll until every pid is gone or the deadline expires.
-# ONE deadline for the WHOLE batch, not one per pid: under SWEEP_AUTO=auto this runs inside the
-# watcher tick, and a per-pid grace would stall the tick by (orphans × grace) seconds. Most orphans
+# _sweep_await_dead <deadline-secs> <target…> — poll until every TARGET is gone or the deadline
+# expires. Targets, not pids: a group target ("-<pgid>") is only dead when the WHOLE group is empty
+# (`kill -0 -<pgid>` succeeds while any member lives). Waiting on the leader pid alone would return
+# success the moment the leader exits, skip the follow-up SIGKILL, and strand the surviving children —
+# exactly the "TERMing only the leader strands its children" case the group kill exists to prevent.
+#
+# ONE deadline for the WHOLE batch, not one per target: under SWEEP_AUTO=auto this runs inside the
+# watcher tick, and a per-target grace would stall the tick by (orphans × grace) seconds. Most orphans
 # die together anyway (they share a process group), so the batch usually clears on the first poll.
 _sweep_await_dead() {
   local deadline="$1"; shift
-  local waited=0 pid alive
+  local waited=0 t alive
   while [ "$waited" -lt "$deadline" ]; do
     alive=0
-    for pid in "$@"; do kill -0 "$pid" 2>/dev/null && { alive=1; break; }; done
+    for t in "$@"; do kill -0 "$t" 2>/dev/null && { alive=1; break; }; done
     [ "$alive" -eq 0 ] && return 0
     sleep 1; waited=$(( waited + 1 ))
   done
   return 1
-}
-
-# _sweep_kill_tree <pid> <pgid> <starttime> — the SINGLE-process kill: TERM, grace, KILL. Built on the
-# same two primitives the batch path uses, so the guards can never diverge between them.
-_sweep_kill_tree() {
-  local pid="$1" pgid="$2" st="$3" target
-  target="$(_sweep_term_one "$pid" "$pgid" "$st")"
-  [ -n "$target" ] || return 0
-  _sweep_await_dead "$SWEEP_KILL_GRACE" "$pid" && return 0
-  kill -KILL "$target" 2>/dev/null || true
-  return 0
 }
 
 # sweep_leg_procs <dry> — leg 4. LISTS every orphan first (the plan), then kills. Listing before
@@ -577,7 +668,7 @@ sweep_leg_procs() {
   rows="$(sweep_orphan_procs)"
   strays="$(sweep_stray_watchers)"
 
-  while IFS=$'\t' read -r pid pgid cmd; do
+  while IFS=$'\t' read -r pid pgid st cmd; do
     [ -n "${pid:-}" ] || continue
     SWEEP_N_PROC=$(( SWEEP_N_PROC + 1 ))
     _sweep_say "🧟" "kill orphan pid ${pid} (pgid ${pgid}) — ${cmd:0:70}"
@@ -595,17 +686,17 @@ sweep_leg_procs() {
   # TERM the whole batch, then wait ONE shared grace period, then SIGKILL whatever survived. Under
   # SWEEP_AUTO=auto this runs inside the watcher tick, so the wall-clock cost must be O(grace), not
   # O(orphans × grace).
-  local pids=() targets=()
-  while IFS=$'\t' read -r pid pgid cmd; do
+  local targets=()
+  while IFS=$'\t' read -r pid pgid st cmd; do
     [ -n "${pid:-}" ] || continue
-    st="$(_pid_starttime "$pid")"
+    # $st is the token captured at LISTING — never re-sampled here, or the guard would be inert.
     tgt="$(_sweep_term_one "$pid" "$pgid" "$st")"
-    [ -n "$tgt" ] || continue                     # refused (recycled) or already gone
-    pids+=("$pid"); targets+=("$tgt")
-    journal_append sweep_proc pid "$pid" pgid "$pgid" cmd "${cmd:0:120}"
+    [ -n "$tgt" ] || continue                     # refused (recycled / already gone)
+    targets+=("$tgt")
+    journal_append sweep_proc pid "$pid" pgid "$pgid" target "$tgt" cmd "${cmd:0:120}"
   done <<< "$rows"
-  [ "${#pids[@]}" -gt 0 ] || return 0
-  _sweep_await_dead "$SWEEP_KILL_GRACE" "${pids[@]}" && return 0
+  [ "${#targets[@]}" -gt 0 ] || return 0
+  _sweep_await_dead "$SWEEP_KILL_GRACE" "${targets[@]}" && return 0
   for tgt in "${targets[@]}"; do kill -KILL "$tgt" 2>/dev/null || true; done
   return 0
 }
@@ -690,6 +781,10 @@ sweep_journal_advice_once() {
 # has no worktree and no open PR, so sweeping tabs first would see every about-to-be-reaped slug as
 # still LIVE and leave its tab behind for a whole cadence. Reaping first frees the slug, and the tab
 # leg then recognizes (and prunes the registry row for) any tab the reap's teardown missed.
+# sweep_swept_total — how many things the last sweep_run_safe_legs actually acted on (flags excluded:
+# a flag is a report, not an action). Lets the watcher's auto path detect a no-progress run.
+sweep_swept_total() { printf '%s' "$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC ))"; }
+
 sweep_run_safe_legs() {
   _sweep_reset_counters
   sweep_leg_markers ""
