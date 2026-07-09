@@ -270,6 +270,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`, `posture-lint.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`
+- `WATCHER_SELF_RESTART` → `agent-watch.sh`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
 - `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
