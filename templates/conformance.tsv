@@ -63,6 +63,7 @@ herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
 herd advise "<question>" [context…]	unit	tests/test-advise.sh
+herd note "<finding>"	unit	tests/test-builder-notes-journal.sh
 herd reload	unit	tests/test-cli-reload.sh
 herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
 herd update [--force]	unit	tests/test-cli-update.sh
