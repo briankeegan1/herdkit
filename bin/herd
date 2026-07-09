@@ -1476,6 +1476,66 @@ cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
 # advisor model or a failed model call degrades to a clear one-line message, never a hard error.
 cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
 
+# ── herd note: builder findings → journal for the coordinator (HERD-202) ─────────────────────────
+# Builders produce load-bearing mid-build findings ("this red is a stale cached row", "my test is not
+# wired into the gate", "this hold is env not code") that used to live ONLY in their pane transcript;
+# the coordinator learned them only when a human pasted the clipboard. `herd note "<finding>"`
+# journals a builder_note event (component=builder, slug, free text truncated ~300 chars). The
+# watcher's monitor/notification stream surfaces each new note within a tick. Ship-dormant: no
+# behavior change unless a builder calls it.
+cmd_note() {
+  local text="" slug cwd base
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) say "usage: herd note \"<finding>\""; return 0 ;;
+      --) shift; break ;;
+      -?*) die "herd note: unknown flag $1 (usage: herd note \"<finding>\")" ;;
+      *)  if [ -z "$text" ]; then text="$1"; else text="$text $1"; fi ;;
+    esac
+    shift
+  done
+  while [ $# -gt 0 ]; do text="${text:+$text }$1"; shift; done
+  [ -n "${text//[[:space:]]/}" ] || die "usage: herd note \"<finding>\""
+
+  # Flatten whitespace + cap at ~300 chars so a journal line stays sub-PIPE_BUF and console rows stay
+  # readable. Fail-soft: if python is missing, bash-prefix the first 300 bytes.
+  text="$(printf '%s' "$text" | python3 -c '
+import sys
+s = " ".join(sys.stdin.read().split())
+sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
+' 2>/dev/null || {
+    # shell-only fallback: collapse runs of space, then cut.
+    text="$(printf '%s' "$text" | tr -s '[:space:]' ' ')"
+    text="${text# }"; text="${text% }"
+    printf '%.300s' "$text"
+  })"
+
+  # Resolve WORKTREES_DIR (and thus the journal path) the same way `herd log` does.
+  _journal_load_config
+
+  # Slug: explicit HERD_SLUG wins; else the worktree directory basename (builders run from
+  # $WORKTREES_DIR/<slug>); else "unknown". Never invents a tracker ref.
+  slug="${HERD_SLUG:-}"
+  if [ -z "$slug" ]; then
+    cwd="$(pwd -P 2>/dev/null || pwd)"
+    base="${cwd##*/}"
+    if [ -n "${WORKTREES_DIR:-}" ]; then
+      case "$cwd" in
+        "${WORKTREES_DIR}"|"${WORKTREES_DIR}/") base="" ;;
+        "${WORKTREES_DIR}"/*) base="${cwd#"${WORKTREES_DIR}"/}"; base="${base%%/*}" ;;
+      esac
+    fi
+    slug="$base"
+  fi
+  [ -n "$slug" ] || slug="unknown"
+
+  type journal_append >/dev/null 2>&1 || . "$SCRIPTS_DIR/journal.sh" 2>/dev/null || true
+  if type journal_append >/dev/null 2>&1; then
+    WORKTREES_DIR="${WORKTREES_DIR:-}" journal_append builder_note component builder slug "$slug" text "$text"
+  fi
+  say "noted · ${c_bold}${slug}${c_rst}: $text"
+}
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -5837,6 +5897,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       its whole lane; prints the advice to stdout. Extra args (and
                                       piped stdin) are appended as context. Additive + fail-soft: an
                                       absent model or a failed call degrades to a clear message
+  herd note "<finding>"               builder findings JOURNAL (HERD-202): file a load-bearing mid-
+                                      build finding so the coordinator sees it in the watch stream
+                                      within a tick (no human clipboard). Journals a builder_note
+                                      event (component=builder, slug, text ≤~300 chars). Ship-dormant:
+                                      no behavior change unless a builder calls it
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -6010,6 +6075,7 @@ case "${1:-help}" in
   map)     shift; cmd_map "$@" ;;
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
+  note)    shift; cmd_note "$@" ;;
   config)  shift; cmd_config "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
