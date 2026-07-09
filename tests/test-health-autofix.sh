@@ -114,10 +114,25 @@ _agent_liveness() { printf '%s' "${STUB_LIVENESS:-alive}"; }
 # The limit preflight is exercised by test-sandbox-limit-resume.sh; here it never fires.
 _detect_limit_hit() { return 1; }
 
+# HERD-176: health refix wake routes through herd_driver_send_text (not raw herdr pane run). Under
+# HERD_DRIVER=headless that is a queue-append. Wrap the seam so each delivery is still logged as
+# one greppable "pane\ttext" line (same shape the old herdr pane-run stub produced) — proving the
+# call site hit the driver seam without losing the bounce-count assertions.
 export STUB_PANE_RUN_LOG="$T/pane-runs.txt"; : > "$STUB_PANE_RUN_LOG"
+# Re-bind after source: log each delivery, then run the real headless queue-append. Shadows the
+# shipped function for the rest of this test process so bounce counts stay greppable.
+herd_driver_send_text() {
+  local target="${1:-}" text="${2:-}"
+  [ -n "${STUB_PANE_RUN_LOG:-}" ] \
+    && printf '%s\t%s\n' "$target" "$(printf '%s' "$text" | tr '\n' ' ')" >> "$STUB_PANE_RUN_LOG"
+  local q; q="$WORKTREES_DIR/.herd/agents/${target}/input"
+  mkdir -p "${q%/*}" 2>/dev/null || true
+  printf '%s\n' "$text" >> "$q" 2>/dev/null || true
+  return 0
+}
 runs() { awk 'END{print NR+0}' "$STUB_PANE_RUN_LOG" 2>/dev/null || printf '0'; }
 row()  { printf '%s\n' "${DISPLAY[0]:-}"; }
-reset_state() { : > "$STUB_PANE_RUN_LOG"; : > "$REFIX_STATE"; DISPLAY=(); }
+reset_state() { : > "$STUB_PANE_RUN_LOG"; : > "$REFIX_STATE"; DISPLAY=(); rm -rf "$WORKTREES_DIR/.herd/agents"; }
 
 NOTOK='not ok 7 tests/test-widget.sh: expected 3 got 4'
 
