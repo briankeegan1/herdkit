@@ -177,6 +177,7 @@ v2 will consume the same file). Each posture is a small named bundle of `.herd/c
 | `gated-push` | `PUSH_GATE=human` `PR_FLOW=draft` | **nothing reaches the remote** before the push is approved |
 | `custom-steps` | `STEPS_PROFILE=approve-stage` | an approve-stage hold **releases exactly once per (sha,step)** |
 | `observe-only` | `MERGE_POLICY=observe` | **nothing merges, ever** |
+| `full-auto` | `MERGE_POLICY=auto` `REVIEW_AUTOFIX=true` `HEALTHCHECK_AUTOFIX=true` `COORDINATOR_AUTONOMY=full` `DEAD_BUILDER_AUTORESPAWN=on` `HUMAN_VERIFY_POLICY=coordinator` `STALE_BASE_AUTOFIX=on` `SWEEP_AUTO=auto` | drains fully — the engine-autonomous **hands-off** bundle (auto-merges on green like `solo-auto`, with the autofix/respawn/self-heal levers on) |
 
 Each posture routes to the scenario that structurally exercises its invariant and runs it with the new
 `--posture` flag (the merge-policy postures through `sandbox-concurrency-scenario.sh`, which drives the
@@ -201,7 +202,7 @@ The default (no `--posture`) invocation of either scenario is **byte-identical**
 logic is inert when unset, so the per-merge sims stay cheap. The matrix is an **explicit** invocation
 (a nightly candidate, not a per-merge gate). Hermetic proof:
 [`../../../tests/test-sandbox-posture-matrix.sh`](../../../tests/test-sandbox-posture-matrix.sh) — the
-five posture invariants, the caught fault, and the byte-identical solo-auto check.
+six posture invariants, the caught fault, and the byte-identical solo-auto check.
 
 ## P2a — end-to-end LIMIT-PARK / AUTO-RESUME scenario — `sandbox-limit-resume-scenario.sh`
 
