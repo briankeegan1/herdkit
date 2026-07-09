@@ -24,6 +24,8 @@
 #   console_drain_row    — the console note flips to 'restarting on new engine code · draining N workers'
 #   no_new_dispatch      — while quiescing, a SECOND PR's healthcheck is HELD (no suite, no marker), a
 #                          review dispatch spawns no reviewer, and a resolver spawn burns no round
+#   stale_heal_burns_no_guard — the stale-base heal holds ABOVE record_refix: the refix once-guard and
+#                          the rail budget are untouched, so the restarted watcher can still heal the sha
 #   drain_waits          — a live gate worker keeps the watcher waiting (it never execs over live work)
 #   self_restart_fires   — once drained, watcher_self_restart reason=engine-update shas=<old>..<new>
 #   gates_resume_on_new  — after the restart, $MAIN carries the NEW engine code and the held PR's
@@ -260,6 +262,30 @@ _held_resolver=$([ -z "$_RESOLVE_RECORDED" ] && echo 0 || echo 1)
 assert no_new_dispatch \
   $([ "$_held_health" -eq 0 ] && [ "$_held_review" -eq 0 ] && [ "$_held_resolver" -eq 0 ] && echo 0 || echo 1) \
   "healthcheck held (no suite), review dispatched no reviewer, resolver burned no respawn round"
+
+# ═══ the stale-base heal holds ABOVE its own ledger write ═════════════════════════════════════════
+# _handle_stale_dup burns the refix once-guard and journals stale_refix_resolver BEFORE it calls
+# spawn_resolver. A hold placed further down would drop the dispatch behind a spent guard: the sha
+# could never be re-healed (no builder exists to advance it) and every later tick — including after the
+# re-exec, since $REFIX_STATE is on disk — would paint a durable needs-you for a heal the watcher itself
+# declined. So the hold sits with its sibling deferrals, above record_refix. (PR #376 review.)
+step stale "a base-stale PR with no live builder arrives mid-quiesce: the heal must burn no once-guard"
+PR3=104; SLUG3="feat-stale"; SHA3="sha4444"
+STALE_WT="$ART/stale-wt"; mkdir -p "$STALE_WT"     # a worktree that EXISTS: the reviewed dispatch path
+export STALE_BASE_AUTOFIX=on
+render() { :; }                                    # the heal repaints mid-dispatch; not under test here
+DISPLAY=()
+_handle_stale_dup "$PR3" "$SLUG3" "$SHA3" 0 "$STALE_WT" "feat/$SLUG3" stale-base "base moved under it"
+_guard_clean=$(refix_attempted "$PR3" "$SHA3" stale && echo 1 || echo 0)
+_rail_clean=$([ "$(refix_rail_count "$PR3" stale)" = "0" ] && echo 0 || echo 1)
+_row_honest=1
+case "${DISPLAY[0]:-}" in
+  *"restarting on new engine code"*) case "${DISPLAY[0]}" in *"awaiting push"*) ;; *) _row_honest=0 ;; esac ;;
+esac
+assert stale_heal_burns_no_guard \
+  $([ "$_guard_clean" -eq 0 ] && [ "$_rail_clean" -eq 0 ] && [ "$_row_honest" -eq 0 ] && echo 0 || echo 1) \
+  "refix once-guard unburned, 0 rail rounds spent, row reads 'held' not 'awaiting push' — the sha stays healable"
+unset STALE_BASE_AUTOFIX
 
 # ═══ the drain never execs over live work ═════════════════════════════════════════════════════════
 step drain "a gate worker is still live: the watcher waits, then restarts once it clears"

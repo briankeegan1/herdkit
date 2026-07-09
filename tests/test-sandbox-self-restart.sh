@@ -60,13 +60,13 @@ SCARD="$ART/scorecard.json"
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCARD" || fail "scorecard.json is not valid JSON"
 [ "$(sc "$SCARD" result)" = "pass" ] || fail "scorecard result != pass: $(cat "$SCARD")"
 [ "$(sc "$SCARD" failed)" = "0" ]    || fail "scorecard reports failed checkpoints: $(cat "$SCARD")"
-[ "$(sc "$SCARD" passed)" -ge 12 ]   || fail "expected >=12 passing checkpoints, got $(sc "$SCARD" passed)"
+[ "$(sc "$SCARD" passed)" -ge 13 ]   || fail "expected >=13 passing checkpoints, got $(sc "$SCARD" passed)"
 [ "$(sc "$SCARD" scenario)" = "watcher-self-restart-e2e" ] || fail "unexpected scenario name"
 [ -n "$(sc "$SCARD" engine_sha)" ]   || fail "scorecard omits the engine_sha delta"
 ok
 
 # ── (b) every quiesce invariant is its own PASSING checkpoint (not merely an absent failure) ──────
-for c in no_arm_midsuite suite_collects quiesce_armed console_drain_row no_new_dispatch \
+for c in no_arm_midsuite suite_collects quiesce_armed console_drain_row no_new_dispatch stale_heal_burns_no_guard \
          drain_waits self_restart_fires; do
   [ "$(cp_status "$SCARD" "$c")" = "pass" ] || fail "checkpoint '$c' did not pass: $(cp_status "$SCARD" "$c")"
 done

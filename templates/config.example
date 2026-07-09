@@ -337,7 +337,7 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # leaves it grading PRs with an image the repo has already replaced. Today that raises the advisory
 # 'main pulled new engine code … restart recommended (`herd reload`)' row and an operator restarts by
 # hand. ON → the same trigger QUIESCES the watcher instead: no NEW gate work is dispatched (reviews,
-# healthchecks, resolver spawns all hold) while the in-flight workers finish and their verdicts are
+# healthchecks, resolver spawns and the stale-base heal all hold) while in-flight workers finish and their verdicts are
 # collected — nothing is killed, nothing is lost, already-green PRs still merge — and once zero workers
 # remain for 2 consecutive ticks, or a 15-minute cap expires, the watcher re-execs itself IN PLACE: same
 # pane, same herd-watch-<workspace> argv0 tag, same singleton lock (exec keeps the pid). Journals

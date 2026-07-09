@@ -508,6 +508,7 @@ Scorecard checkpoints (`result: pass` iff `failed == 0`):
 | `quiesce_armed` | the next tick fast-forwards `$MAIN`; the delta rewrote the watcher → armed + `watcher_quiesce` |
 | `console_drain_row` | the console note reads `restarting on new engine code · draining N workers` |
 | `no_new_dispatch` | mid-quiesce a second PR's healthcheck is **held** (no suite), the review spawns no reviewer, the resolver burns no respawn round |
+| `stale_heal_burns_no_guard` | the stale-base heal holds **above** `record_refix` — the refix once-guard and rail budget are untouched, so the sha stays healable |
 | `drain_waits` | a live gate worker **blocks** the exec and resets the idle streak |
 | `self_restart_fires` | once drained for 2 consecutive ticks → `watcher_self_restart reason=engine-update shas=<old>..<new>` |
 | `gates_resume_on_new_code` | after the restart `$MAIN` holds the new engine image and the held PR's suite dispatches again |

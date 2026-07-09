@@ -7,9 +7,14 @@
 #
 #   (1)  lever OFF (default) → byte-identical: the note never arms, no dispatch is held, no journal
 #   (2)  lever ON + note     → arms the quiesce ONCE and journals watcher_quiesce
-#   (3)  quiesce refuses NEW gate dispatch: _dispatch_review, _healthcheck_gate, spawn_resolver
+#   (3)  quiesce refuses NEW gate dispatch: _dispatch_review, _healthcheck_gate, spawn_resolver — and
+#        the two defence-in-depth refusals return NON-ZERO, so no caller reads them as a live spawn
+#   (3b) the stale-base heal (_handle_stale_dup) holds ABOVE record_refix: the refix once-guard is NOT
+#        burned, no rail round is spent, nothing is journaled — a dropped dispatch behind a spent guard
+#        would strand the PR on a needs-you row forever (PR #376 review)
 #   (4)  a collected verdict is NOT held — an in-flight review still lands its PASS in the ledger
-#   (5)  the real _self_restart_exec journals watcher_self_restart reason=engine-update shas=<a>..<b>
+#   (5)  _self_restart_journal emits watcher_self_restart reason=engine-update shas=<a>..<b>, and the
+#        real _self_restart_exec runs its refusal guards BEFORE that journal (a refused exec is silent)
 #   (6)  fail-soft: an exec that cannot happen DISARMS, so gate dispatch resumes on the old code
 #   (7)  the drain needs TWO consecutive zero-worker ticks (one quiet tick is not enough)
 #   (8)  a live gate worker keeps the watcher waiting, and resets the idle streak
@@ -47,7 +52,8 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 
 for fn in _self_restart_enabled _self_restart_quiescing _self_restart_hold_dispatch \
           _self_restart_arm _self_restart_should_exec _self_restart_exec _self_restart_tick \
-          _count_gate_workers _dispatch_review _healthcheck_gate spawn_resolver build_main_freshness; do
+          _self_restart_journal _count_gate_workers _dispatch_review _healthcheck_gate \
+          spawn_resolver _handle_stale_dup build_main_freshness; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -103,13 +109,15 @@ ok
 # Still armed from (2): every dispatch site must return without spawning or recording anything.
 _self_restart_hold_dispatch        || fail "(3) armed watcher does not hold dispatch"
 
-_dispatch_review 77 quiesce-slug shaZ
+# Both defence-in-depth refusals must return NON-ZERO. `_resolver_in_flight … || spawn_resolver …`
+# reads a zero rc as "a resolver is now running" and paints 'rebasing · awaiting push' over nothing.
+_dispatch_review 77 quiesce-slug shaZ && fail "(3) _dispatch_review returned 0 while refusing to spawn"
 [ -z "$(ls "$TREES"/.review-inflight-77-* 2>/dev/null)" ] || fail "(3) _dispatch_review spawned a reviewer while quiescing"
 jhas 'review_dispatched'           && fail "(3) _dispatch_review journaled a dispatch while quiescing"
 
 _RESOLVE_RECORDED=""
 record_resolve_attempt() { _RESOLVE_RECORDED=1; }
-spawn_resolver quiesce-slug 77 feat/quiesce-slug shaZ
+spawn_resolver quiesce-slug 77 feat/quiesce-slug shaZ && fail "(3) spawn_resolver returned 0 while refusing to spawn"
 [ -z "$_RESOLVE_RECORDED" ]        || fail "(3) spawn_resolver burned a respawn round while quiescing"
 
 # _healthcheck_gate reaches its dispatch branch past the sha-cache + in-flight checks; both are empty
@@ -119,6 +127,36 @@ _healthcheck_gate 77 quiesce-slug "$T" 0 shaZ
 [ "$_HC_RESULT" = "QUEUED" ]       || fail "(3) _healthcheck_gate did not hold (got '${_HC_RESULT:-<empty>}')"
 [ -z "$(ls "$TREES"/.health-inflight-* 2>/dev/null)" ] || fail "(3) _healthcheck_gate ran a suite while quiescing"
 case "${DISPLAY[0]:-}" in *"restarting on new engine code"*) ;; *) fail "(3) health hold row not honest: ${DISPLAY[0]:-<empty>}" ;; esac
+ok
+
+# ── (3b) the stale-base heal holds ABOVE record_refix — the once-guard is never burned ───────────
+# The PR #376 review's blocking finding. _handle_stale_dup writes the refix once-guard and journals
+# stale_refix_resolver BEFORE it calls spawn_resolver, so a refusal further down would drop the
+# dispatch behind a spent guard: refix_attempted(pr,sha,stale) is permanently true, one rail round is
+# gone, no builder exists to advance the head sha, and every later tick renders a durable needs-you row
+# for a heal the watcher itself declined. The hold therefore sits with its sibling deferrals, above the
+# ledger write. Still armed from (2).
+reset_state; note; _self_restart_tick
+export STALE_BASE_AUTOFIX=on
+_STALE_PR=80; _STALE_SHA=shaSTALE; _STALE_SLUG=stale-slug
+_STALE_WT="$T/stale-wt"; mkdir -p "$_STALE_WT"
+render() { :; }                    # the heal renders mid-dispatch; the console is not under test here
+DISPLAY=()
+# A worktree that EXISTS with no live builder is exactly the reviewed path: without the hold this
+# reaches `record_refix` → journal stale_refix_resolver → spawn_resolver. (An absent worktree would
+# escalate harmlessly before the ledger write, and would prove nothing.)
+_handle_stale_dup "$_STALE_PR" "$_STALE_SLUG" "$_STALE_SHA" 0 "$_STALE_WT" "feat/$_STALE_SLUG" stale-base "base moved"
+refix_attempted "$_STALE_PR" "$_STALE_SHA" stale && fail "(3b) the quiesce burned the refix once-guard"
+[ "$(refix_rail_count "$_STALE_PR" stale)" = "0" ] || fail "(3b) the quiesce spent a refix rail round: $(refix_rail_count "$_STALE_PR" stale)"
+jhas 'stale_refix'                 && fail "(3b) the quiesce journaled a stale heal it never dispatched: $(cat "$JLOG")"
+case "${DISPLAY[0]:-}" in *"stale base"*"restarting on new engine code"*) ;;
+  *) fail "(3b) stale hold row not honest: ${DISPLAY[0]:-<empty>}" ;; esac
+case "${DISPLAY[0]:-}" in *"awaiting push"*) fail "(3b) painted work in flight with nothing running" ;; esac
+# …and once the quiesce clears, the SAME sha is still healable: nothing was consumed.
+_SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0
+_self_restart_hold_dispatch        && fail "(3b) still holding after the quiesce cleared"
+refix_attempted "$_STALE_PR" "$_STALE_SHA" stale && fail "(3b) the sha is no longer healable after the hold"
+unset STALE_BASE_AUTOFIX
 ok
 
 # ── (4) an in-flight review still COLLECTS its verdict while quiescing ───────────────────────────
@@ -133,13 +171,18 @@ step="$(_review_gate_step 78 collect-slug shaC)"
 [ "$(_review_gate_step 79 hold-slug shaD)" = "QUEUED" ] || fail "(4) a fresh candidate was not held"
 ok
 
-# ── (5) the REAL _self_restart_exec journals the required line, and refuses under the guard ──────
+# ── (5) the restart event's shape, and that a REFUSED exec never emits it ────────────────────────
 reset_state
 _SELF_RESTART_FROM=oldsha; _SELF_RESTART_TO=newsha
-_self_restart_exec drained 0 8     && fail "(5) exec returned 0 under the hermetic guard — it must refuse"
+_self_restart_journal drained 0 8
 jhas 'watcher_self_restart reason engine-update shas oldsha..newsha' \
                                    || fail "(5) missing watcher_self_restart journal: $(cat "$JLOG")"
 jhas 'trigger drained'             || fail "(5) the restart line does not name its trigger"
+# The real exec runs its refusal guards ABOVE the journal, so an exec that cannot happen emits NO
+# watcher_self_restart event — a consumer counting them counts restarts that actually occurred.
+: > "$JLOG"
+_self_restart_exec drained 0 8     && fail "(5) exec returned 0 under the hermetic guard — it must refuse"
+[ ! -s "$JLOG" ]                   || fail "(5) a refused exec journaled a restart: $(cat "$JLOG")"
 ok
 
 # ── (6) fail-soft: an exec that cannot happen DISARMS (dispatch resumes on the old code) ─────────
@@ -214,7 +257,7 @@ reset_state; note
 _self_restart_tick                                       # arm (0 workers, idle=1 — no exec)
 worker health; worker review
 build_main_freshness
-case "${MAIN_FRESHNESS:-}" in *"restarting on new engine code"*"draining 2 workers"*) ;;
+case "${MAIN_FRESHNESS:-}" in *"restarting on new engine code"*"draining 2 gate workers"*) ;;
   *) fail "(11) quiesce row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
 case "${MAIN_FRESHNESS:-}" in *"restart recommended"*) fail "(11) still asking the operator to restart" ;; esac
 case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) fail "(11) a quiesce must not paint a STALE row" ;; esac
