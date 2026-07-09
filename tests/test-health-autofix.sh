@@ -12,8 +12,9 @@
 # HEALTHCHECK_AUTOFIX:
 #   (4) OFF (default) → no bounce, no ledger write, gate still returns CODEERROR (PR held red)
 #   (5) ON  → the failing test + suite log are delivered to the builder's AGENT pane, once per (pr,sha)
-#   (6) SHARED round budget with the review refix — one budget per PR, capped at REFIX_MAX_ROUNDS
-#   (7) cap reached → "needs you · refix limit … " (blocker + remedy), no further bounce
+#   (6) PER-RAIL round budget (HERD-229) — review bounces never spend the health rail's rounds
+#   (7) the health rail's own cap reached → "needs you · refix limit … " (blocker + remedy), no bounce
+#  (7b) reset-on-progress — a CLEAN suite refunds the health rail; the next red bounces at round 1
 #   (8) a tab-leak-guard CODE ERROR is infra: never bounced, legacy row preserved
 #   (9) dry-run → never bounces even with autofix ON
 #
@@ -191,21 +192,43 @@ _handle_health_codeerror 20 slug-a shaC 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "2" ] || fail "(3) a new sha must be eligible for a fresh bounce (got $(runs))"
 ok
 
-# ── (6)+(7) SHARED budget with the review refix, then the cap escalates ─────────────────────────
+# ── (6) PER-RAIL budget (HERD-229): the review rail's bounces never spend the health rail ───────
+# This is the PR #328 regression: rounds burned by OTHER first-time failures used to leave a fresh
+# red with no bounce left. The health rail now carries its own REFIX_MAX_ROUNDS.
 reset_state
 export REFIX_MAX_ROUNDS=3
 record_refix 30 shaR1 slug-a review      # two REVIEW bounces already spent on this PR …
 record_refix 30 shaR2 slug-a review
-[ "$(refix_round_count 30)" = "2" ] || fail "(6) the budget must count review bounces"
+[ "$(refix_rail_count 30 health)" = "0" ] || fail "(6) review bounces must not spend the health rail"
+[ "$(refix_total_count 30)" = "2" ]       || fail "(6) the total ceiling still counts every rail"
 printf '0\n' > "$STUB_WAIT_FILE"
-_handle_health_codeerror 30 slug-a shaH1 0 "$T/wt" "$NOTOK"   # … the health bounce spends the 3rd
-[ "$(runs)" = "1" ] || fail "(6) the third round should still bounce (got $(runs))"
-[ "$(refix_round_count 30)" = "3" ] || fail "(6) review + health bounces must share ONE per-PR budget"
-_handle_health_codeerror 30 slug-a shaH2 0 "$T/wt" "$NOTOK"   # 4th → over cap
-[ "$(runs)" = "1" ] || fail "(7) a bounce past the cap must not be delivered (got $(runs))"
+_handle_health_codeerror 30 slug-a shaH1 0 "$T/wt" "$NOTOK"   # … a first health red still bounces
+[ "$(runs)" = "1" ] || fail "(6) the health rail's first round must bounce (got $(runs))"
+[ "$(refix_rail_count 30 health)" = "1" ] || fail "(6) the health bounce lands on the health rail"
+ok
+
+# ── (7) … and the health rail exhausts at REFIX_MAX_ROUNDS of ITS OWN reds, exactly as before ───
+_handle_health_codeerror 30 slug-a shaH2 0 "$T/wt" "$NOTOK"
+_handle_health_codeerror 30 slug-a shaH3 0 "$T/wt" "$NOTOK"
+[ "$(runs)" = "3" ] || fail "(7) three health rounds must all bounce (got $(runs))"
+_handle_health_codeerror 30 slug-a shaH4 0 "$T/wt" "$NOTOK"   # 4th health red → over the rail cap
+[ "$(runs)" = "3" ] || fail "(7) a bounce past the cap must not be delivered (got $(runs))"
 row | grep -q 'needs you · refix limit (3 rounds) reached' || fail "(7) the cap row must read 'needs you · refix limit' (got: $(row))"
 row | grep -q "$NOTOK" || fail "(7) the cap row must still carry the blocker"
 grep -q '"event":"health_refix_escalated"' "$JOURNAL_FILE" || fail "(7) the cap must journal an escalation"
+ok
+
+# ── (7b) RESET-ON-PROGRESS: a CLEAN suite refunds the health rail, and the next red bounces again ─
+reset_state
+record_refix 31 shaH1 slug-a health
+record_refix 31 shaH2 slug-a health
+record_refix 31 shaH3 slug-a health
+record_health_result 31 shaH4 CLEAN      # the builder's fix landed — the health rail's red resolved
+[ "$(refix_rail_count 31 health)" = "0" ] || fail "(7b) a CLEAN suite must zero the health rail"
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 31 slug-a shaH5 0 "$T/wt" "$NOTOK"   # a NEW red on a later sha
+[ "$(runs)" = "1" ] || fail "(7b) a rail that resolved its red must be able to bounce again (got $(runs))"
+row | grep -q 'refixing health-check (round 1/3)' || fail "(7b) the row must restart the rail at round 1 (got: $(row))"
 ok
 
 # ── (8) a tab-leak-guard CODE ERROR is INFRA: never bounced ─────────────────────────────────────
