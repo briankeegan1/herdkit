@@ -152,11 +152,22 @@ _status_run() {
 
   # (a) WATCHER — alive via the argv0 marker / pid lock. A down watcher is INFORMATIONAL only (its
   #     counts may be stale); it is NOT an attention condition on its own — we never false-red it.
-  local wpids wpid1
+  local wpids wpid1 wcount
   wpids="$(_status_watcher_pids)"
   if [ -n "$wpids" ]; then
     wpid1="${wpids%%$'\n'*}"   # first pid line (no pipe → no pipefail/SIGPIPE surprise under set -e)
-    printf '  %sWATCHER%s   %salive%s (pid %s)\n' "$b" "$x" "$g" "$x" "$wpid1"
+    # Count DISTINCT live watcher mains for this workspace. Exactly one is the invariant (HERD-209):
+    # a duplicate races the shared .git object store (healthchecks restart endlessly) and is a REAL
+    # attention condition, NOT the calm "down" state — so we warn LOUD and flag it for the operator.
+    wcount="$(printf '%s\n' "$wpids" | grep -c . 2>/dev/null || printf 0)"
+    if [ "${wcount:-1}" -gt 1 ]; then
+      local wall; wall="$(printf '%s' "$wpids" | tr '\n' ' ')"
+      printf '  %sWATCHER%s   %s⚠ %s watcher mains alive%s (pids %s) %s— duplicates race the gate; stop the extras: '"'"'herd pane watch'"'"' (or kill all but one)%s\n' \
+        "$b" "$x" "$r" "$wcount" "$x" "${wall% }" "$d" "$x"
+      attention=1; reasons="${reasons} duplicate-watchers:${wcount}"
+    else
+      printf '  %sWATCHER%s   %salive%s (pid %s)\n' "$b" "$x" "$g" "$x" "$wpid1"
+    fi
   else
     printf '  %sWATCHER%s   %sdown%s %s(no herd-watch-<workspace> process / pid lock)%s\n' \
       "$b" "$x" "$y" "$x" "$d" "$x"

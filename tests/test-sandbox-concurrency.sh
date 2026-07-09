@@ -133,6 +133,15 @@ echo "PASS (e) pane text captured via driver read-pane; screenshots degraded gra
 [ "$(cp_status "$SCARD" flair_merge_celebration)" = "pass" ]           || fail "(h) flair_merge_celebration not pass"
 echo "PASS (h) flair pack: off byte-identical, on adds pasture header, dead rows unchanged, merge celebrated"
 
+# ── (i) WATCHER SINGLETON spawn-lock (HERD-209) — reproduce the duplicate-watcher race ──────────
+# The scenario drives the SHIPPED _acquire_watcher_singleton against a live and a stale lock. Lock in
+# that a second launch under a LIVE lock REFUSED (no duplicate) and a STALE lock was ADOPTED.
+[ "$(sc "$SCARD" watcher_singleton_tested)" = "True" ]                    || fail "(i) watcher_singleton_tested flag not set"
+[ "$(sc "$SCARD" watcher_singleton_ok)" = "True" ]                        || fail "(i) watcher_singleton_ok should be true"
+[ "$(cp_status "$SCARD" watcher_singleton_refuses_live)" = "pass" ]       || fail "(i) watcher_singleton_refuses_live not pass (a second live-lock launch must refuse)"
+[ "$(cp_status "$SCARD" watcher_singleton_adopts_stale)" = "pass" ]       || fail "(i) watcher_singleton_adopts_stale not pass (a stale lock must be adopted)"
+echo "PASS (i) watcher singleton: live lock → refuse (no duplicate), stale lock → adopt"
+
 # ── (f) HERMETIC — nothing leaked into the real repo tree ────────────────────────
 # The scenario writes only under its --artifacts dir. Compare against the baseline captured before
 # any run: no NEW working-tree entry may appear because of the scenario.
