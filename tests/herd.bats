@@ -512,6 +512,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic post-merge reconcile sweep (HERD-232) test passes" {
+  run bash "$REPO/tests/test-postmerge-sweep.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS: test-postmerge-sweep.sh"* ]]
+}
+
+@test "post-merge reconcile sim: a foreign or crashed merge still gets its hooks (HERD-232)" {
+  run bash "$REPO/scripts/herd/sim/postmerge-reconcile-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]

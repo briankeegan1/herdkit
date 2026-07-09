@@ -268,6 +268,16 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # the console, never a silent correction.
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
+# Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
+# the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
+# from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
+# killed mid-do_merge all converge. One "<epoch> <pr> <sha>" row per merged PR whose obligations this
+# seat has FULLY discharged — the pr+sha run-once key that keeps a reconciled PR from being re-probed.
+POSTMERGE_SWEPT_LEDGER="$TREES/.agent-watch-postmerge-swept"
+# Note-once ledger for a merged PR whose reap is DEFERRED (dirty tree / re-spawned slug). Such a PR
+# never earns a run-once row — the reap must keep retrying — so without this its `postmerge_reap_skip`
+# / `postmerge_deferred` lines would re-appear every cadence pass, forever. Rows: "<pr> <sha> <kind>".
+POSTMERGE_NOTED_LEDGER="$TREES/.agent-watch-postmerge-noted"
 # Dep-state console surface: dep-watcher.sh rewrites this file each tick with one
 # "<ref> <state> <age-seconds>" line per live blocked-on dep (state ∈ open|in-progress|in-review|
 # stalled). Read-only here and purely informational — a blocked-on is a STATUS LINE, never a freeze,
@@ -4833,10 +4843,22 @@ do_merge() {
   # worktree). Treating ANY non-zero as "sha moved" skipped every post-merge hook while the PR was
   # already MERGED. On non-zero, re-check the PR's actual state: MERGED → treat as success and run
   # ALL post-merge hooks; only a NOT-merged PR is a real refusal that returns 1 and skips hooks.
+  #
+  # HERD-232 (audit G6, honest labels): the re-check itself can fail. `gh pr view` returning nothing —
+  # a network blip, rate limit, auth expiry — is NOT evidence the head moved, and journaling
+  # `merge_refused_sha_moved` for it sends a post-mortem hunting a phantom force-push. Distinguish the
+  # two: an EMPTY state is a gh outage (`merge_gh_unreadable`), a readable non-MERGED state is a real
+  # refusal. Both still return 1 and skip the hooks — the PR is re-gated next tick either way, and the
+  # post-merge reconcile sweep is the backstop if it turns out the merge did land.
   if [ -n "$dsha" ]; then
     if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
-      if [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" != "MERGED" ]; then
-        journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+      _dm_state="$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null || true)"
+      if [ "$_dm_state" != "MERGED" ]; then
+        if [ -n "$_dm_state" ]; then
+          journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha" state "$_dm_state"
+        else
+          journal_append merge_gh_unreadable pr "$dp" slug "$ds" sha "$dsha"
+        fi
         return 1
       fi
     fi
@@ -5435,6 +5457,392 @@ _sweep_tracker_state() {
   HERD_TSWEEP_LEDGER="$TRACKER_SWEEP_LEDGER" \
   HERD_TSWEEP_NOTE_FILE="$TRACKER_HEAL_FILE" \
     bash "$HERE/tracker-state-sweep.sh" >/dev/null 2>&1 || true
+}
+
+# ── Post-merge hooks as a RECONCILED SWEEP (HERD-232) ─────────────────────────────────────────────
+# GROUNDED (docs/audits/2026-07-09-gating-hardening.md, incidents 1 + 12 → N6): every post-merge hook
+# was merge-EVENT-driven — it ran only inside the do_merge of the seat that landed the PR. Two ways
+# that loses:
+#   • CRASH: 17 MERGED PRs skipped every hook when do_merge misread gh's exit (HERD-221 fixed the
+#     trigger, not the residue), and a watcher killed between the merge and the reap never retries —
+#     the merge row is already written, so the next tick sees "handled".
+#   • FOREIGN MERGE: another seat's watcher, or a human clicking Merge in the gh UI, runs ITS hooks
+#     (or none). OUR seat's $STATE row, approval/CI ledger purges, cost capture and worktree teardown
+#     simply never happen. Only worktree teardown had any resume path at all (_startup_reap_sweep),
+#     and only at startup.
+#
+# THE FIX IS THE DOCTRINE (docs/multi-seat-doctrine.md R1, the seam HERD-218/HERD-233 established for
+# codemap + $MAIN freshness): stop treating a hook as a side-effect of OUR merge event and start
+# treating "this merged PR's obligations are discharged" as an INVARIANT re-derived from the world.
+# Each cadence pass enumerates recently-MERGED PRs, asks of each which obligations are OUTSTANDING,
+# and runs exactly those, idempotently.
+#
+# OBLIGATIONS PROBED (each is a cheap local-ledger read; each runner is the SAME idempotent primitive
+# do_merge calls, so a reconciled PR is indistinguishable from a locally-merged one):
+#   state_row  — the $STATE merge row (drives already_merged + the "recently landed" console row)
+#   reconcile  — the backlog/tracker link (reconcile_backlog; itself pr+sha-ledgered)
+#   approvals  — phantom "awaiting approval" rows for a terminal PR (purge_pr_approvals)
+#   ci_checks  — the PR's terminal CI gate-event rows (purge_pr_ci_checks)
+#   cost       — builder token/cost accounting, ONLY where a transcript ledger still exists
+#   reap       — worktree + tabs teardown (_reap_slug), under the same sha anchor _startup_reap_sweep
+#                uses: reap ONLY when the worktree's HEAD is exactly the merged PR's headRefOid
+#
+# DELIBERATELY NOT REPLAYED — four of do_merge's hooks are someone else's invariant, or unsafe to
+# replay for a merge we did not perform:
+#   tracker mark-done      — _sweep_tracker_state already re-asserts Done for every recently-merged PR
+#                            carrying a `Refs:` line, on this same cadence, seat-agnostically. Running
+#                            it here would double-write the tracker; instead we DEFER to its ledger as
+#                            evidence (see _pms_reconcile_handled).
+#   codemap / symbol-index — reconcile_map_freshness (HERD-218) already re-derives both per tick,
+#                            independent of any merge event. That is the same fix, one layer up.
+#   main-health tick       — its own tick-level invariant (audit A1 → HERD-222), keyed on $MAIN's HEAD,
+#                            not on a PR.
+#   post-merge steps.tsv   — operator-defined side effects (deploy, notify, publish). A foreign seat
+#                            that merged the PR has ALREADY run its own copy of them; re-running them
+#                            here would fire an external, possibly irreversible action twice. Replaying
+#                            an operator's side effects needs the cross-seat evidence substrate (audit
+#                            N8) before it can be safe, so this sweep never touches them.
+#
+# MULTI-SEAT SAFETY — a foreign-seat merge gets OUR seat's obligations ONLY. Every obligation above
+# except `reconcile` writes a $TREES-local ledger or tears down a worktree this seat owns, so it is
+# unobservable to another seat and safe to run unconditionally. `reconcile` is the one hook with a
+# SHARED side effect (a tracker state write, or a scribe enqueue that edits BACKLOG.md), so it is
+# gated on evidence that it is already handled.
+#
+# BE PRECISE ABOUT WHAT THAT BUYS (review note): every evidence source _pms_reconcile_handled consults
+# — $RECONCILE_STATE, this seat's journal, $TRACKER_SWEEP_LEDGER — lives under THIS seat's $TREES. So
+# the defer reliably suppresses OUR OWN re-work (a restart, a rotated ledger, a second pass), and it
+# suppresses cross-seat re-work only insofar as our tracker sweep has already observed the item Done.
+# Against a genuinely separate seat with its own $TREES the defer may simply not fire, and
+# reconcile_backlog runs a second time. That is SAFE, not correct-by-construction: _reconcile_via_ref
+# reports NOCHANGE on an already-Done item, and the fuzzy scribe request only ever matches a 🔜/🚧
+# item, so it no-ops on one already marked ✅. Both paths converge; neither corrupts. A real
+# cross-seat guarantee needs the shared per-PR comment/status substrate (audit item N8's spike);
+# when it lands, _pms_reconcile_handled is the ONE place to teach it a new evidence source.
+#
+# CONVENTIONS: fail-soft (a gh error skips the pass entirely and quietly — never a false red, never a
+# partial reconcile off a truncated PR list); idempotent (record-first, run-once keyed by pr+sha);
+# bounded lookback; NO new config key — the cadence and window are engine constants.
+_PMS_LOOKBACK=30            # recently-MERGED PRs probed per pass (bounded window, one gh call)
+_PMS_LEDGER_KEEP=400        # run-once rows retained (review: the ledger only ever grew). Far above the
+                            # lookback, so trimming can never drop a row for a PR still in the window —
+                            # and a dropped row costs at most one idempotent re-probe, never an action.
+
+# _pms_swept <pr#> <sha> — true iff this exact merged (pr,sha) had every obligation discharged by a
+# previous pass. The run-once key. Sha-keyed as well as pr-keyed so a (pathological) force-push onto a
+# merged PR's head re-opens the probe rather than being silently skipped forever.
+_pms_swept() {
+  [ -s "$POSTMERGE_SWEPT_LEDGER" ] || return 1
+  awk -v p="$1" -v s="$2" '$2==p && $3==s{f=1} END{exit !f}' "$POSTMERGE_SWEPT_LEDGER" 2>/dev/null
+}
+
+# _pms_record <pr#> <sha> — mark this merged PR fully reconciled. Called ONLY when nothing was left
+# outstanding; a pass that deliberately deferred a reap (live/dirty worktree) does NOT record, so the
+# next pass retries. Fail-soft: an unwritable ledger just re-probes next pass (all runners are no-ops).
+# Trimmed on write to the last _PMS_LEDGER_KEEP rows — the sibling PR-keyed ledgers are purged at merge,
+# but this one is keyed by a PR that is already gone, so nothing else would ever bound it.
+_pms_record() {
+  printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$POSTMERGE_SWEPT_LEDGER" 2>/dev/null || true
+  _pms_trim_ledger "$POSTMERGE_SWEPT_LEDGER"
+}
+
+# _pms_trim_ledger <file> — keep only the last _PMS_LEDGER_KEEP lines. Atomic rewrite, fully fail-soft:
+# a failed trim leaves the ledger correct (just longer), never truncated.
+_pms_trim_ledger() {
+  local _pmt_f="$1" _pmt_n _pmt_tmp
+  [ -s "$_pmt_f" ] || return 0
+  _pmt_n="$(wc -l < "$_pmt_f" 2>/dev/null | tr -cd '0-9')"; _pmt_n="${_pmt_n:-0}"
+  [ "$_pmt_n" -gt "$_PMS_LEDGER_KEEP" ] 2>/dev/null || return 0
+  _pmt_tmp="$(mktemp "$_pmt_f.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n "$_PMS_LEDGER_KEEP" "$_pmt_f" > "$_pmt_tmp" 2>/dev/null; then
+    mv -f "$_pmt_tmp" "$_pmt_f" 2>/dev/null || rm -f "$_pmt_tmp"
+  else
+    rm -f "$_pmt_tmp"
+  fi
+}
+
+# _pms_noted / _pms_note <pr#> <sha> <kind> — a NOTE-ONCE ledger for the journal lines a DEFERRED PR
+# would otherwise re-emit forever. A permanently dirty worktree (or a stray non-repo $TREES/<slug>
+# directory) never earns its run-once row by design — the reap must keep retrying — but the operator
+# does not need `postmerge_reap_skip` every ~3 min until someone cleans it up. _startup_reap_sweep
+# journals its skip once per run; this gives the cadence sweep the same manners: the CONDITION is
+# re-evaluated every pass, only the NOTIFICATION is once per (pr,sha,kind).
+_pms_noted() {
+  [ -s "$POSTMERGE_NOTED_LEDGER" ] || return 1
+  grep -qxF "$1 $2 $3" "$POSTMERGE_NOTED_LEDGER" 2>/dev/null
+}
+_pms_note() {
+  printf '%s %s %s\n' "$1" "$2" "$3" >> "$POSTMERGE_NOTED_LEDGER" 2>/dev/null || true
+  _pms_trim_ledger "$POSTMERGE_NOTED_LEDGER"
+}
+
+# _pms_state_row <pr#> — true iff the merge ledger already carries a row for this PR. Deliberately
+# PR-keyed only (unlike already_merged, which also matches the slug): a foreign PR's branch may not
+# fit BRANCH_TEMPLATE at all, and the question here is "did this seat record the merge", not "for
+# which slug". Row format: "<epoch> <pr#> <slug> [ref]".
+_pms_state_row() {
+  [ -s "$STATE" ] || return 1
+  awk -v p="$1" 'NF>=3 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null
+}
+
+# _pms_approvals_rows <pr#> / _pms_ci_rows <pr#> — true iff the PR still has ledger residue to purge.
+# Field positions mirror purge_pr_approvals ("<epoch> <state> <pr#> <sha>") and purge_pr_ci_checks
+# ("<pr#> <sha> <conclusion> <check…>"), so the probe and the purge can never disagree about the key.
+_pms_approvals_rows() {
+  [ -s "$APPROVALS" ] || return 1
+  awk -v p="$1" '$3==p{f=1} END{exit !f}' "$APPROVALS" 2>/dev/null
+}
+_pms_ci_rows() {
+  [ -s "$CI_CHECKS_STATE" ] || return 1
+  awk -v p="$1" '$1==p{f=1} END{exit !f}' "$CI_CHECKS_STATE" 2>/dev/null
+}
+
+# _pms_journal_has <event> <pr#> — true iff the engine journal already carries <event> for this PR.
+# journal.sh emits compact JSON with the keys in CALL order, so `pr` is NOT always the first key: the
+# reconcile hook journals `reconcile pr <n> …` but cost.sh journals `cost component <c> pr <n> …`. So
+# match the event and the pr INDEPENDENTLY on the same line rather than as an adjacent pair — an
+# anchored `"event":"X","pr":N` silently never matches `cost`, which is exactly the guard that must
+# not fail open (a false negative re-emits a cost event and inflates the day's spend).
+# Fail-soft: no journal destination (the HERD-223 test guard) or an unreadable file reads as "no
+# evidence" — the caller then does the work, which is always idempotent except for `cost`, whose own
+# transcript-dir probe bounds it.
+_pms_journal_has() {
+  type _journal_file >/dev/null 2>&1 || return 1
+  local _pmj_f; _pmj_f="$(_journal_file 2>/dev/null || true)"
+  [ -n "$_pmj_f" ] && [ -s "$_pmj_f" ] || return 1
+  grep -F "\"event\":\"$1\"" "$_pmj_f" 2>/dev/null | grep -qE "\"pr\":$2[,}]"
+}
+
+# _pms_tracker_ledgered <ref> — true iff the tracker-state sweep has already CONFIRMED this ref Done
+# (ledger row "<epoch> <ref> <pr#>"). That sweep scans every recently-merged PR regardless of which
+# seat merged it, so a hit here means the tracker obligation is discharged no matter who discharged it.
+_pms_tracker_ledgered() {
+  [ -n "${1:-}" ] || return 1
+  [ -s "$TRACKER_SWEEP_LEDGER" ] || return 1
+  awk -v r="$1" '$2==r{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
+}
+
+# _pms_reconcile_handled <pr#> <sha> — the DEFER predicate for the one hook with a shared side effect.
+# Prints the evidence kind on stdout and returns 0 when the backlog/tracker link is already handled:
+#   ledger        — this seat enqueued/resolved it (reconcile_backlog's own pr+sha guard)
+#   journal       — this seat journaled a `reconcile` for the PR (a ledger lost to rotation/repair)
+#   tracker-swept — the tracker sweep confirmed the PR's `Refs:` item Done (whoever marked it)
+# Returns 1 (with no output) when nothing has handled it, i.e. WE must. The `Refs:` read is the only
+# per-PR network call this sweep makes, and it happens at most once per merged PR: the moment we run
+# reconcile_backlog it ledgers pr+sha and this predicate short-circuits on the cheap local read.
+_pms_reconcile_handled() {
+  local _pmr_pr="$1" _pmr_sha="$2" _pmr_ref
+  reconcile_enqueued "$_pmr_pr" "$_pmr_sha" && { printf 'ledger'; return 0; }
+  _pms_journal_has reconcile "$_pmr_pr"     && { printf 'journal'; return 0; }
+  _pmr_ref="$(_reconcile_pr_ref "$_pmr_pr" 2>/dev/null || true)"
+  _pms_tracker_ledgered "$_pmr_ref"         && { printf 'tracker-swept'; return 0; }
+  return 1
+}
+
+# _pms_merged_prs — "<pr#>\t<headRefOid>\t<headRefName>\t<mergedAt-epoch>" per recently-merged PR,
+# OLDEST FIRST. ONE gh call per pass. A non-zero gh (offline, rate-limited, auth blip) prints NOTHING
+# and returns non-zero so the caller aborts the whole pass: an empty PR list is indistinguishable from
+# "gh is down", and reconciling off a truncated list is how a sweep silently skips obligations (the
+# HERD-206 lesson from _sweep_stale_resolve_tabs). Hermetic seam: HERD_PMS_PRS_JSON_FILE supplies raw
+# `gh pr list --json` output, bypassing the network exactly like tracker-state-sweep.sh's seam.
+#
+# ORDER + TIMESTAMP MATTER (review note). gh returns merged PRs newest-first, and `build_landed` renders
+# the LAST THREE $STATE rows in file order. A first catch-up pass on a seat whose $STATE predates this
+# feature appends up to _PMS_LOOKBACK rows at once — newest-first would therefore leave the OLDEST PRs
+# of the batch at the tail and render them as the three most recent landings. Sorting ascending by
+# mergedAt makes the appended run read in true merge order. And each row is stamped with the PR's REAL
+# mergedAt, not `date +%s`: a reconciled row must not claim a PR landed the moment we noticed it.
+_pms_merged_prs() {
+  local _pmp_json
+  if [ -n "${HERD_PMS_PRS_JSON_FILE:-}" ]; then
+    _pmp_json="$(cat "$HERD_PMS_PRS_JSON_FILE" 2>/dev/null)" || return 1
+  else
+    command -v gh >/dev/null 2>&1 || return 1
+    _pmp_json="$(gh pr list --state merged --limit "$_PMS_LOOKBACK" \
+      --json number,headRefOid,headRefName,mergedAt 2>/dev/null)" || return 1
+  fi
+  [ -n "$_pmp_json" ] || return 0
+  printf '%s' "$_pmp_json" | python3 -c '
+import sys, json, calendar, time
+try:
+    prs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+def epoch(s):
+    # gh emits RFC3339 UTC ("2026-07-09T18:46:53Z"). An unparseable/absent mergedAt falls back to
+    # "now" — the row is still honest about the merge having happened, just not about when.
+    try:
+        return calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return int(time.time())
+rows = []
+for pr in prs if isinstance(prs, list) else []:
+    num = pr.get("number"); oid = pr.get("headRefOid") or ""
+    if num is None or not oid:
+        continue
+    rows.append((epoch(pr.get("mergedAt")), num, oid, pr.get("headRefName") or ""))
+rows.sort(key=lambda r: r[0])          # OLDEST first — see the ORDER note above
+for ts, num, oid, branch in rows:
+    print("%s\t%s\t%s\t%s" % (num, oid, branch, ts))
+' 2>/dev/null || return 0
+}
+
+# _pms_reconcile_one <pr#> <sha> <branch> [merged-epoch] — probe ONE merged PR and discharge whatever
+# is outstanding. Returns 0 when the PR is fully reconciled (caller records the run-once row), 1 when an
+# obligation was deliberately left for a later pass (a worktree that is not provably disposable yet).
+_pms_reconcile_one() {
+  local _pm_pr="$1" _pm_sha="$2" _pm_branch="${3:-}" _pm_mts="${4:-}"
+  local _pm_slug="" _pm_dir="" _pm_missing="" _pm_defer="" _pm_retry=0
+  case "$_pm_mts" in ''|*[!0-9]*) _pm_mts="$(date +%s)" ;; esac
+
+  # SLUG, and whether the branch fits BRANCH_TEMPLATE at all. herd_branch_parse strips the template's
+  # literal prefix with `${var#prefix}`, which is a NO-OP when the prefix does not match — so a foreign
+  # branch like `chore/bump-deps` under `feat/{slug}` comes back verbatim, not empty (review note). A
+  # real slug is a single kebab path segment (it names a directory directly under $TREES), so a parse
+  # result that still carries a '/' provably did not fit the template: treat it as "no slug of ours",
+  # which keeps $TREES/<slug> from ever being probed for a branch we do not own.
+  [ -n "$_pm_branch" ] && _pm_slug="$(herd_branch_parse "$_pm_branch" 2>/dev/null || true)"
+  case "$_pm_slug" in ''|*/*) _pm_slug='-' ;; esac
+  [ "$_pm_slug" = '-' ] || _pm_dir="$TREES/$_pm_slug"
+
+  _pms_state_row "$_pm_pr" || _pm_missing="$_pm_missing state_row"
+
+  local _pm_ev=""
+  if _pm_ev="$(_pms_reconcile_handled "$_pm_pr" "$_pm_sha")"; then
+    # `ledger` is this seat's own guard doing its job — not a cross-seat deferral, and not worth a line.
+    [ "$_pm_ev" = ledger ] || _pm_defer="$_pm_ev"
+  else
+    _pm_missing="$_pm_missing reconcile"
+  fi
+
+  _pms_approvals_rows "$_pm_pr" && _pm_missing="$_pm_missing approvals"
+  _pms_ci_rows "$_pm_pr"        && _pm_missing="$_pm_missing ci_checks"
+
+  # Worktree obligations. The reap anchor is _startup_reap_sweep's: a worktree is disposable ONLY when
+  # its HEAD sha is exactly the merged PR's headRefOid, so every committed thing in it is already
+  # merged. A re-spawned slug (fresh commits, or none yet) and a dirty tree both fail that test and are
+  # left alone — and because we then skip the run-once row, the next pass re-probes rather than
+  # stranding the worktree forever.
+  #
+  # COST is probed by RESIDUE, like every other obligation — a transcript ledger that exists AND no
+  # `cost` event already journaled for this PR (review note). The transcript dir is NOT inside the
+  # worktree (_cost_transcript_dir munges the worktree PATH into $HOME/.claude/projects/<munged>), so
+  # it survives the reap: without the journal guard, a do_merge that emitted `cost` and then died
+  # before teardown would have its cost re-emitted here, and cost_day_total sums `cost` events
+  # unconditionally into budget_daily_exceeded. Cost still RUNS before the reap, matching do_merge.
+  if [ -n "$_pm_dir" ] && [ -d "$_pm_dir" ] && [ "$_pm_dir" != "${SELF_WT:-}" ] && [ "$_pm_dir" != "$MAIN" ]; then
+    local _pm_head; _pm_head="$(git -C "$_pm_dir" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$_pm_head" ] || [ "$_pm_head" != "$_pm_sha" ]; then
+      _pm_retry=1                                   # live / re-spawned slug — not this PR's worktree
+    elif [ -n "$(git -C "$_pm_dir" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)" ]; then
+      # Journal the hold ONCE per (pr,sha): the condition is re-checked every pass, but a permanently
+      # dirty tree must not re-notify every ~3 min (it never earns a run-once row, by design).
+      if ! _pms_noted "$_pm_pr" "$_pm_sha" reap_skip; then
+        journal_append postmerge_reap_skip pr "$_pm_pr" slug "$_pm_slug" reason dirty-worktree
+        _pms_note "$_pm_pr" "$_pm_sha" reap_skip
+      fi
+      _pm_retry=1                                   # never force-remove uncommitted work
+    else
+      local _pm_costdir=""
+      type _cost_transcript_dir >/dev/null 2>&1 && _pm_costdir="$(_cost_transcript_dir "$_pm_dir" 2>/dev/null || true)"
+      if [ -n "$_pm_costdir" ] && [ -d "$_pm_costdir" ] && ! _pms_journal_has cost "$_pm_pr"; then
+        _pm_missing="$_pm_missing cost"
+      fi
+      _pm_missing="$_pm_missing reap"
+    fi
+  fi
+
+  if [ -z "$_pm_missing" ]; then
+    _pms_defer_note "$_pm_pr" "$_pm_sha" "$_pm_slug" "$_pm_defer"
+    [ "$_pm_retry" -eq 0 ] && return 0 || return 1
+  fi
+
+  # ── RUN the outstanding hooks, in do_merge's order. Record-first: the $STATE row goes down before
+  #    anything that can die, so a crash here can never re-merge or double-reconcile this PR.
+  case " $_pm_missing " in
+    *' state_row '*)
+      # TRACKER REF: prefer the PR's OWN `Refs:` line over the per-worktree marker (review note). This
+      # inverts do_merge's order deliberately. do_merge runs inside the lane that owns the marker, so
+      # the two always agree; the sweep can be looking at an OLD merged PR whose slug has since been
+      # re-spawned, and `.herd-ref-<slug>` then holds the NEW lane's ref — attaching it to the old PR's
+      # landed row would credit the wrong tracker item. The PR body is the only source keyed to the PR.
+      local _pm_ref; _pm_ref="$(_reconcile_pr_ref "$_pm_pr" 2>/dev/null || true)"
+      [ -n "$_pm_ref" ] || _pm_ref="$(_slug_ref "$_pm_slug" 2>/dev/null || true)"
+      # Stamp the row with the PR's REAL mergedAt, not "now" — see _pms_merged_prs.
+      if [ -n "$_pm_ref" ]; then
+        printf '%s %s %s %s\n' "$_pm_mts" "$_pm_pr" "$_pm_slug" "$_pm_ref" >> "$STATE"
+      else
+        printf '%s %s %s\n' "$_pm_mts" "$_pm_pr" "$_pm_slug" >> "$STATE"
+      fi
+      # NOT a `merge` event (review BLOCK). In this engine `merge` is a CLAIM: journal-audit.sh rule (a)
+      # reads every `merge` as "this seat merged a PR and therefore owes a later `reap`". A reconciled
+      # merge frequently owes no reap at all — a gh-UI or collaborator merge has no worktree here, which
+      # is the very case this sweep exists to serve — so emitting `merge` would manufacture a permanent,
+      # unfixable `merge_without_reap` finding for exactly those PRs. `merge_observed` says the true
+      # thing: we OBSERVED a merge we did not perform, and `reap_owed` records whether a teardown is
+      # actually outstanding, so a future audit rule can assert the honest invariant
+      # (merge_observed[reap_owed=yes] ⇒ reap) without inventing an obligation we cannot discharge.
+      local _pm_owed=no
+      case " $_pm_missing " in *' reap '*) _pm_owed=yes ;; esac
+      journal_append merge_observed pr "$_pm_pr" slug "$_pm_slug" sha "$_pm_sha" \
+        reason reconcile reap_owed "$_pm_owed" ;;
+  esac
+  # Same order do_merge runs them in, so a reconciled tail is indistinguishable from a merged one.
+  case " $_pm_missing " in *' approvals '*) purge_pr_approvals "$_pm_pr" ;; esac
+  case " $_pm_missing " in *' ci_checks '*) purge_pr_ci_checks "$_pm_pr" ;; esac
+  case " $_pm_missing " in
+    *' cost '*) type cost_emit_merge >/dev/null 2>&1 && cost_emit_merge "$_pm_pr" "$_pm_slug" "$_pm_dir" ;;
+  esac
+  case " $_pm_missing " in *' reconcile '*) reconcile_backlog "$_pm_pr" "$_pm_slug" "$_pm_sha" ;; esac
+  case " $_pm_missing " in
+    *' reap '*) _reap_slug "$_pm_slug" "$_pm_dir" "$_pm_pr" "$_pm_sha" postmerge-sweep ;;   # last: it deletes $_pm_dir
+  esac
+
+  journal_append postmerge_reconciled pr "$_pm_pr" slug "$_pm_slug" sha "$_pm_sha" \
+    missing "$(printf '%s' "${_pm_missing# }" | tr ' ' ',')"
+  _pms_defer_note "$_pm_pr" "$_pm_sha" "$_pm_slug" "$_pm_defer"
+  [ "$_pm_retry" -eq 0 ] && return 0 || return 1
+}
+
+# _pms_defer_note <pr#> <sha> <slug> <evidence> — journal a cross-seat deferral of the shared reconcile
+# hook, ONCE per (pr,sha). A PR whose reap is deferred forever (dirty tree) is re-probed every pass, so
+# without the note-once ledger this line would repeat every ~3 min alongside postmerge_reap_skip.
+# No-op when there was nothing to defer.
+_pms_defer_note() {
+  local _pd_pr="$1" _pd_sha="$2" _pd_slug="$3" _pd_ev="${4:-}"
+  [ -n "$_pd_ev" ] || return 0
+  _pms_noted "$_pd_pr" "$_pd_sha" deferred && return 0
+  journal_append postmerge_deferred pr "$_pd_pr" slug "$_pd_slug" \
+    sha "$_pd_sha" obligations reconcile evidence "$_pd_ev"
+  _pms_note "$_pd_pr" "$_pd_sha" deferred
+}
+
+# _sweep_merged_prs — the HERD-232 cadence entry point. Called every _PMS_SWEEP_INTERVAL ticks from the
+# main loop. Steady state on a healthy seat: ONE `gh pr list`, then a run-once ledger hit per PR — zero
+# journal lines, zero writes, byte-inert. Inert in dry-run. Never merges, never touches another seat's
+# ledgers, never fails a tick.
+_sweep_merged_prs() {
+  [ -n "$DRYRUN" ] && return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local _pms_rows _pms_rc=0
+  _pms_rows="$(_pms_merged_prs)" || _pms_rc=$?
+  [ "$_pms_rc" -eq 0 ] || return 0          # gh unreadable → skip the pass quietly (never a partial sweep)
+  [ -n "$_pms_rows" ] || return 0
+  # Read on FD 3, not stdin (review note): the loop body invokes gh, git, scribe.sh and
+  # herd_teardown_slug, and any child that reads stdin would swallow the rest of the PR list and
+  # silently truncate the sweep. The heredoc stays bound to 3, so the body's children inherit the
+  # watcher's own stdin and can never consume it. The loop runs in the CURRENT shell (no pipe), so
+  # ledger appends and reaps performed in the body persist.
+  local _pms_pr _pms_sha _pms_branch _pms_mts
+  while IFS=$'\t' read -r _pms_pr _pms_sha _pms_branch _pms_mts <&3; do
+    [ -n "$_pms_pr" ] && [ -n "$_pms_sha" ] || continue
+    _pms_swept "$_pms_pr" "$_pms_sha" && continue
+    _pms_reconcile_one "$_pms_pr" "$_pms_sha" "$_pms_branch" "$_pms_mts" \
+      && _pms_record "$_pms_pr" "$_pms_sha"
+  done 3<<EOF
+$_pms_rows
+EOF
+  return 0
 }
 
 # _sweep_journal_audit — HERD-238 journal-driven self-audit (the gap-finder). Runs on the same
@@ -9235,6 +9643,15 @@ _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0
 _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+_PMS_SWEEP_INTERVAL=45      # post-merge hook reconcile (HERD-232) every ~3 min — one `gh pr list`, then
+                            # a run-once ledger hit per PR. Shares the tracker sweep's cadence class:
+                            # the drift it catches (a foreign/crashed merge's unrun hooks) is a rare
+                            # merge-tail condition, not a per-tick one
+_PMS_SWEEP_TICK=$_PMS_SWEEP_INTERVAL  # PRIMED so the FIRST tick sweeps, then every interval. The
+                            # grounding incident is a watcher that died mid-do_merge: the restart that
+                            # follows is exactly when the stranded hooks must be replayed, so a fresh
+                            # process must not idle 3 min before noticing. (This is the cadence sibling
+                            # of the one-shot _startup_reap_sweep above, which covers worktrees only.)
 _ENGINE_TICK=0
 _ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
                             # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
@@ -10025,6 +10442,16 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
     _sweep_journal_audit
+  fi
+
+  # Post-merge hook reconcile (HERD-232): every _PMS_SWEEP_INTERVAL ticks, re-derive the post-merge
+  # obligations of recently-MERGED PRs from the world and run whatever is outstanding. This is what
+  # makes the hooks hold for a merge THIS seat did not perform (another watcher, the gh UI) or did not
+  # finish (killed mid-do_merge). Idempotent + run-once-keyed; byte-inert once a PR is reconciled.
+  _PMS_SWEEP_TICK=$((_PMS_SWEEP_TICK + 1))
+  if [ "$_PMS_SWEEP_TICK" -ge "$_PMS_SWEEP_INTERVAL" ]; then
+    _PMS_SWEEP_TICK=0
+    _sweep_merged_prs
   fi
 
   # Codemap / symbol-index freshness reconcile (HERD-218): multi-seat invariant — when another seat
