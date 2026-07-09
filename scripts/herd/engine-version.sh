@@ -153,7 +153,10 @@ herd_engine_doctor_row() {
 # `herd upgrade` must stamp what is committed, not what a stray export says.
 _herd_engine_min_in_file() {
   local cfg="${1:-}" v
-  [ -f "$cfg" ] || { printf '0'; return 0; }
+  # CANNOT-TELL ⇒ 0 ⇒ no floor ⇒ the guard passes. Absence of evidence is never evidence of staleness
+  # (the same no-fabrication rule the liveness probe follows: unknown never fabricates death). The
+  # -r test also keeps an unreadable config from leaking a raw "Permission denied" out of sed.
+  [ -f "$cfg" ] && [ -r "$cfg" ] || { printf '0'; return 0; }
   v="$(sed -n -E 's/^[[:space:]]*ENGINE_MIN=["'"'"']?([0-9]+).*/\1/p' "$cfg" 2>/dev/null | tail -1)"
   _herd_engine_int "$v"
 }
@@ -164,7 +167,11 @@ _herd_engine_min_in_file() {
 # caller can report a change; returns 0 always.
 herd_engine_min_stamp() {
   local cfg="${1:-}" lvl cur tmp
-  [ -f "$cfg" ] || { printf '0'; return 0; }
+  # A config we cannot read or write is not one we can stamp: echo the floor we know (0) and leave it
+  # alone, SILENTLY. Testing -w up front matters because a failing `>>` redirect prints its own
+  # "Permission denied" diagnostic while the redirection is being SET UP — before any 2>/dev/null on
+  # that same command can suppress it — so the check, not the redirect, is what keeps this quiet.
+  [ -f "$cfg" ] && [ -r "$cfg" ] && [ -w "$cfg" ] || { printf '%s' "$(_herd_engine_min_in_file "$cfg")"; return 0; }
   lvl="$(herd_engine_level)"
   cur="$(_herd_engine_min_in_file "$cfg")"
   if [ "$lvl" -le "$cur" ]; then printf '%s' "$cur"; return 0; fi

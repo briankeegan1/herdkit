@@ -230,4 +230,48 @@ min="$(ev -- "_herd_engine_min_in_file '$REPO/.herd/config'")"
 [ "$min" -gt 0 ] || fail "(10) herdkit's own .herd/config pins no ENGINE_MIN floor — the dogfood project must exercise the handshake"
 ok
 
+# ── (11) FAIL-OPEN ON UNKNOWN: a floor we cannot COMPUTE is never a floor we REFUSE on ─────────────
+# The engine's no-fabrication rule (cf. the liveness probe: "unknown never fabricates death"). A stale
+# guard that refuses on absence-of-evidence fails less gracefully than staleness itself — it would kill
+# any consumer whose .herd/config is absent, unreadable, or typo'd, including a CI checkout that never
+# had one. Refusal requires a POSITIVE level < min determination and nothing less.
+[ "$(ev -- "_herd_engine_min_in_file '$T/does-not-exist'")" = 0 ] || fail "(11) a MISSING config did not read as floor 0"
+cfg="$T/cfg-unreadable"; printf 'ENGINE_MIN=5\n' > "$cfg"; chmod 000 "$cfg"
+if [ -r "$cfg" ]; then
+  echo "SKIP (11) unreadable-file case — running as root, chmod 000 is not enforced" >&2
+else
+  # Unreadable ⇒ floor 0 ⇒ the guard PASSES, and does so SILENTLY (no leaked "Permission denied").
+  out="$(ev -- "_herd_engine_min_in_file '$cfg'" 2>&1)"
+  [ "$out" = 0 ] || fail "(11) an UNREADABLE config did not fail open silently: [$out]"
+  # ...and the stamp leaves it alone rather than erroring on the write.
+  out="$(ev HERD_ENGINE_LEVEL_FORCE=9 -- "herd_engine_min_stamp '$cfg'" 2>&1)"
+  [ "$out" = 0 ] || fail "(11) stamping an UNREADABLE config was not a silent no-op: [$out]"
+fi
+chmod 644 "$cfg"
+# A config with NO ENGINE_MIN at all (every project before this feature) ⇒ floor 0 ⇒ guard passes.
+cfg="$T/cfg-nofloor"; printf 'HERD_VERSION=1\n' > "$cfg"
+[ "$(ev -- "_herd_engine_min_in_file '$cfg'")" = 0 ] || fail "(11) a config with no ENGINE_MIN did not read as 0"
+# Real assignments still parse: quoted, and with a trailing comment.
+cfg="$T/cfg-quoted"; printf 'ENGINE_MIN="4" # stamped by herd upgrade\n' > "$cfg"
+[ "$(ev -- "_herd_engine_min_in_file '$cfg'")" = 4 ] || fail "(11) a quoted/comment-trailed ENGINE_MIN did not parse as 4"
+# The module reaches for NO git metadata: clone depth (shallow vs full) cannot influence the verdict,
+# so a depth=1 CI checkout resolves exactly as a full one does. Asserted structurally — there is no
+# git call to stub.
+# (Comments are stripped first — the header prose legitimately mentions `git pull` when explaining what
+# ENGINE_AUTOUPDATE=auto delegates to; only real CODE lines are searched for a git invocation.)
+sed -E 's/(^|[[:space:]])#.*$//' "$EV_SH" | grep -qE '(^|[^A-Za-z0-9_.-])git([[:space:]]|$)' \
+  && fail "(11) engine-version.sh shells out to git — the verdict must not depend on clone depth"
+ok
+
+# ── (12) SCOPE: the guard hangs off WRITE entry points ONLY ────────────────────────────────────────
+# herd-config.sh is sourced by EVERY herd command and by read-only paths (herd status, the CI suite's
+# config load). A guard hooked there would refuse reads and tests, not just writes. Pin that shut.
+grep -q 'herd_engine_guard' "$REPO/scripts/herd/herd-config.sh" \
+  && fail "(12) herd-config.sh calls the guard — a config LOAD must never refuse (it is on every read path)"
+# The four declared write surfaces, and nothing else, invoke the guard.
+sites="$(grep -rlE 'herd_engine_guard "' "$REPO/scripts/herd" "$REPO/bin" 2>/dev/null | grep -v 'engine-version.sh' | sed "s|$REPO/||" | sort | tr '\n' ' ')"
+want="bin/herd scripts/herd/herd-claim.sh scripts/herd/herd-preflight.sh scripts/herd/scribe-step.sh "
+[ "$sites" = "$want" ] || fail "(12) guard call sites drifted: got [$sites], want [$want]"
+ok
+
 echo "ALL PASS ($pass checks)"
