@@ -77,6 +77,25 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # them: `herd agent-update --dry-run`. Any value other than "on" is treated as off.
 # AGENT_UPDATE="off"                  # off (default) | on
 
+# ENGINE_MIN — the ENGINE VERSION HANDSHAKE floor (HERD-179): the minimum herdkit ENGINE LEVEL this
+# project requires. You do not hand-edit this — `herd upgrade` STAMPS it to the level of the engine
+# that ran the upgrade, and only ever RAISES it (monotonic), so an operator on an older checkout can
+# never silently un-pin the project. An engine BELOW the floor is STALE, and every WRITE path refuses
+# it with one remedy — `run herd update`: lane spawn preflight, herd-claim, scribe-step apply, and
+# `herd backend switch`. READS only warn (`herd status`, the advisory `herd doctor` row). The escape
+# hatch HERD_ENGINE_SKIP_HANDSHAKE=1 downgrades any refusal to a warning and JOURNALS the bypass.
+# Default 0 (or absent) = no floor = the handshake is inert.
+# ENGINE_MIN=0                        # 0/absent (default, inert) | a positive engine level
+
+# ENGINE_AUTOUPDATE — what the engine DOES about a stale local checkout (HERD-179). "off" (default)
+# runs nothing beyond the always-advisory `herd doctor` row. "check" paints one quiet "engine outdated"
+# note on the watcher console and calls it out in the doctor — `herd update` stays yours to run. "auto"
+# additionally has the watcher dispatch `herd update` in a QUIESCENT window: it reuses that command's
+# own refusal (it aborts rather than swap the engine while builders are mid-flight, or over a dirty
+# engine checkout) and is rate-limited by a cooldown, so a persistent refusal never hammers the remote.
+# Any other value is treated as off.
+# ENGINE_AUTOUPDATE="off"             # off (default) | check | auto
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color

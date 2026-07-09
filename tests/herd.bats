@@ -410,6 +410,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic engine version handshake + ENGINE_AUTOUPDATE (HERD-179) test passes" {
+  run bash "$REPO/tests/test-engine-handshake.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]

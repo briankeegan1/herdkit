@@ -293,6 +293,24 @@ esac
 # off. Defaulted here so the mechanism + CLI see it under `set -u`.
 : "${AGENT_UPDATE:="off"}"
 
+# ENGINE_MIN — the ENGINE VERSION HANDSHAKE floor (HERD-179): the minimum herdkit ENGINE LEVEL this
+# project requires. Committed in .herd/config and stamped MONOTONICALLY by `herd upgrade` to the level
+# of the engine that ran it. An engine BELOW this floor is STALE: every write path (lane spawn
+# preflight, herd-claim, scribe-step apply, `herd backend switch`) refuses with the remedy `run herd
+# update`, reads warn only, and HERD_ENGINE_SKIP_HANDSHAKE=1 is a journaled escape hatch. Default 0 ⇒
+# no floor ⇒ the handshake is inert and behavior is byte-identical to before it existed. The mechanism
+# lives in scripts/herd/engine-version.sh (which also carries the engine's own level constant).
+: "${ENGINE_MIN:="0"}"
+
+# ENGINE_AUTOUPDATE — what the engine DOES about a stale local checkout (HERD-179): off (default) |
+# check | auto. off runs nothing beyond the always-advisory `herd doctor` row. check paints one quiet
+# "engine outdated" note on the watcher console and calls it out in the doctor. auto additionally has
+# the watcher dispatch `herd update` in a QUIESCENT window — reusing that command's own refusal when
+# builders are mid-flight or the engine checkout is dirty, rate-limited by a cooldown so a persistent
+# refusal never hammers the remote. Any other value is off. Defaulted here so every path sees it
+# under `set -u`.
+: "${ENGINE_AUTOUPDATE:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)

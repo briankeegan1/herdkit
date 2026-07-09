@@ -30,8 +30,24 @@
 # (templates/capabilities.tsv); this inline default keeps herdkit's own output byte-unchanged.
 _herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
 
+# Engine version handshake (HERD-179). Sourced here — not assumed present — because herd_preflight is
+# the lane-spawn write gate and coordinator.sh/new-feature.sh source THIS file directly, without going
+# through bin/herd. Defines functions only; a missing module leaves the guard call below undefined, so
+# the `command -v` check keeps a partial install fail-open rather than fatal.
+_HERD_PREFLIGHT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=/dev/null
+command -v herd_engine_guard >/dev/null 2>&1 || . "$_HERD_PREFLIGHT_DIR/engine-version.sh" 2>/dev/null || true
+
 herd_preflight() {
   [ "${HERD_SKIP_PREFLIGHT:-}" = "1" ] && return 0
+  # ENGINE VERSION HANDSHAKE (HERD-179), before every other probe: a lane spawn is a WRITE (worktree,
+  # branch, tab, agent, claim), and an engine below the project's committed ENGINE_MIN must not make
+  # it. Refuses with `run herd update`; inert when the project pins no floor. Placed AFTER the
+  # HERD_SKIP_PREFLIGHT bypass (that knob is documented as "skip this whole guard") and BEFORE the
+  # headless early-return, since a headless lane writes exactly as much as a herdr one.
+  if command -v herd_engine_guard >/dev/null 2>&1; then
+    herd_engine_guard "lane spawn preflight" || return 1
+  fi
   # The headless driver has NO herdr dependency (agents run detached; panes are a view). Every check
   # below probes the herdr CLI/JSON contract, so under HERD_DRIVER=headless the whole preflight is
   # inapplicable — return clean rather than falsely failing the lane for a missing multiplexer.
@@ -588,6 +604,14 @@ herd_doctor() {
         fi
       fi
     fi
+  fi
+
+  # ── Engine version handshake (HERD-179): report the local engine level against the project's
+  #    committed ENGINE_MIN floor, plus the ENGINE_AUTOUPDATE posture. ADVISORY — a stale engine is
+  #    an operator action (`herd update`), not a missing dependency, so it never touches hard_fail or
+  #    the warn counter and never changes the doctor's exit contract. ────────────────────────────
+  if command -v herd_engine_doctor_row >/dev/null 2>&1; then
+    herd_engine_doctor_row
   fi
 
   printf '\n'

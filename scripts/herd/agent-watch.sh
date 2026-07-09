@@ -87,6 +87,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
+# Engine version handshake (HERD-179) — the staleness predicate behind the quiet 'engine outdated'
+# console note (ENGINE_AUTOUPDATE=check|auto) and the quiescent-window auto-update (auto). Sourced
+# after journal.sh so its events are journaled; defines functions only, and is wholly inert while
+# ENGINE_AUTOUPDATE=off (the ship default) or the project pins no ENGINE_MIN floor.
+. "$HERE/engine-version.sh"
 # Token/cost accounting (additive + read-only): sums a merged builder's transcript and journals a
 # `cost` event so `herd cost` can surface cost-per-merged-PR. Sourced after journal.sh (it calls
 # journal_append). Defines functions only; safe to source in lib mode.
@@ -517,6 +522,24 @@ build_spawn_holds() {
   [ -n "$rows" ] && SPAWN_HOLDS="$rows"
 }
 
+# build_engine_note — the QUIET 'engine outdated' console note (HERD-179). One dim line, and only when
+# ENGINE_AUTOUPDATE is check|auto AND the local engine is genuinely below the project's committed
+# ENGINE_MIN. Deliberately not an alarm row: a stale engine is a routine "pull the engine" nudge, not a
+# red gate (the write paths themselves already refuse, loudly, at the point of use). Empty — hence a
+# byte-identical console — while ENGINE_AUTOUPDATE=off (the ship default), when no floor is pinned, or
+# when the engine is current. Pure: reads two integers, no I/O, no network.
+build_engine_note() {
+  HERD_ENGINE_NOTE=""
+  local mode; mode="$(herd_engine_autoupdate_mode)"
+  [ "$mode" = off ] && return 0
+  herd_engine_stale || return 0
+  local lvl min remedy
+  lvl="$(herd_engine_level)"; min="$(herd_engine_min)"
+  if [ "$mode" = auto ]; then remedy="auto-updating in the next quiescent window"; else remedy="run herd update"; fi
+  HERD_ENGINE_NOTE="    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}engine outdated${C_RESET} (level ${lvl} < ENGINE_MIN ${min}) ${C_DIM}— ${remedy}${C_RESET}"$'\n'
+  return 0
+}
+
 # build_main_health — the post-merge main-health ALARM row (HERD-129). One LOUD persistent red line
 # while the default branch is red, read from $MAIN_HEALTH_STATE ("<sha> <since_pr> <failing test…>",
 # written by _main_health_set_red and cleared by _main_health_clear). Empty (MAIN_HEALTH="") when the
@@ -858,6 +881,11 @@ render() {
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
+  # ENGINE OUTDATED note (HERD-179) — one quiet line under ENGINE_AUTOUPDATE=check|auto when the local
+  # engine is below the project's ENGINE_MIN. Empty (byte-identical console) otherwise.
+  if [ -n "${HERD_ENGINE_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}engine${C_RESET}"$'\n'"${HERD_ENGINE_NOTE}"$'\n'
   fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
@@ -6021,6 +6049,10 @@ _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0
 _TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+_ENGINE_TICK=0
+_ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
+                            # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
+                            # further rate-limited by engine-version.sh's cooldown (HERD-179)
 _INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
                             # reads (gh pr comments + tracker) never ride the 4 s repaint
 _INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
@@ -6055,6 +6087,7 @@ while true; do
   build_blocked
   build_tracker_drift
   build_spawn_holds
+  build_engine_note
   build_main_health
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
@@ -6669,6 +6702,17 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   if [ "$_TRACKER_SWEEP_TICK" -ge "$_TRACKER_SWEEP_INTERVAL" ]; then
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
+  fi
+
+  # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
+  # with a genuinely stale engine, dispatch `herd update` DETACHED — it ends in a reload that restarts
+  # this watcher, so it must not run inside the tick. `herd update`'s own preflight is the quiescent
+  # window: under HERD_NONINTERACTIVE it refuses outright while builders are mid-flight (their lanes
+  # reference engine scripts live) or the engine checkout is dirty. Never runs in dry-run.
+  _ENGINE_TICK=$((_ENGINE_TICK + 1))
+  if [ "$_ENGINE_TICK" -ge "$_ENGINE_INTERVAL" ]; then
+    _ENGINE_TICK=0
+    [ -n "$DRYRUN" ] || herd_engine_autoupdate_tick
   fi
 
   sleep 4
