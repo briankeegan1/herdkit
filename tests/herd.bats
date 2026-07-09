@@ -445,6 +445,15 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+# HERD-259: this suite shipped with HERD-233 but no bats block ever ran it, so the MAIN-freshness
+# reconcile was ungated for four months — including the recovery leg whose absence let a healed
+# 'dirty-tree' row paint for 20+ minutes. Wired in with the recovery legs it now carries.
+@test "hermetic MAIN-checkout freshness reconcile (HERD-233/259) unit test passes" {
+  run bash "$REPO/tests/test-main-freshness.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS"* ]]
+}
+
 @test "hermetic gate order: stale-dup decides before review/health dispatch (HERD-227) test passes" {
   run bash "$REPO/tests/test-gate-order-stale-dup.sh"
   [ "$status" -eq 0 ]
