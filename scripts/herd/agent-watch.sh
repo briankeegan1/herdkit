@@ -1937,10 +1937,67 @@ _bg_new_session() {
   _BG_NEW_SESSION_PID=$!
 }
 
+# _pin_review_sha <pr#> <headSha> — HERD-230 pin helper for review dispatch.
+# Fetches the live PR head into a private tmp ref under $MAIN and verifies it still equals the
+# dispatch sha (the sha the verdict will be keyed to). Echoes one token + exit status:
+#   pinned     (0) — fetch succeeded and rev-parse matches $sha; objects are in $MAIN
+#   unpinned   (0) — pin could not be verified (offline / hermetic / no MAIN); FAIL-SOFT: caller
+#                    still dispatches with HERD_REVIEW_SHA set; herd-review.sh falls back to live
+#                    `gh pr diff` when the pin objects are missing (journaled there too)
+#   superseded (1) — fetch succeeded but the live head is a DIFFERENT commit; the dispatch sha is
+#                    already obsolete, so the caller aborts cheaply (no reviewer spawn)
+# The force-update refspec keeps the pin ref current; sha is embedded in the ref name so concurrent
+# pins for different shas never clobber each other.
+_pin_review_sha() {
+  local pr="$1" sha="$2"
+  local main="${MAIN:-${PROJECT_ROOT:-}}"
+  local remote="${HERD_REMOTE:-origin}"
+  local ref got want
+  if [ -z "$main" ] || [ -z "$pr" ] || [ -z "$sha" ]; then
+    printf 'unpinned'
+    return 0
+  fi
+  # Need a real git dir (worktree or checkout). Hermetic tests often stub `git` or point MAIN at a
+  # non-repo — soft-fail rather than block every dispatch.
+  if [ ! -d "$main/.git" ] && [ ! -e "$main/.git" ]; then
+    printf 'unpinned'
+    return 0
+  fi
+  ref="refs/herd-review/pin-${pr}-${sha}"
+  if ! git -C "$main" fetch -q "$remote" "+pull/${pr}/head:${ref}" 2>/dev/null; then
+    journal_append review_pin_soft pr "$pr" sha "$sha" reason "fetch failed; live-diff fallback"
+    printf 'unpinned'
+    return 0
+  fi
+  got="$(git -C "$main" rev-parse --verify "${ref}^{commit}" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$got" ]; then
+    journal_append review_pin_soft pr "$pr" sha "$sha" reason "rev-parse empty after fetch; live-diff fallback"
+    printf 'unpinned'
+    return 0
+  fi
+  # Match full or abbreviated dispatch sha against the fetched tip.
+  case "$got" in
+    "$sha"|"$sha"*) printf 'pinned'; return 0 ;;
+  esac
+  want="$(git -C "$main" rev-parse --verify "${sha}^{commit}" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$want" ] && [ "$got" = "$want" ]; then
+    printf 'pinned'
+    return 0
+  fi
+  journal_append review_pin_aborted pr "$pr" sha "$sha" head "$got" \
+    reason "pr head moved; dispatch sha superseded"
+  printf 'superseded'
+  return 1
+}
+
 # _dispatch_review <pr#> <slug> <headSha> — launch herd-review.sh in the background, result file
 # wired via $HERD_REVIEW_RESULT_FILE, and write the inflight marker (pid) for this exact pr+sha.
 # Idempotent: an existing result file or live marker means this pr+sha is already handled — never
 # double-dispatch. Callers gate on concurrency/retries; this only guards identity.
+# HERD-230: pins the review INPUT to $sha before launch (fetch PR head into a tmp ref; abort if the
+# head already moved). Passes HERD_REVIEW_SHA + HERD_REVIEW_PIN_MODE so herd-review.sh instructs the
+# reviewer to read `git diff <merge-base>..<sha>` from $MAIN instead of live `gh pr diff` (a mid-review
+# push must not desync reviewed content from the verdict-sha).
 _dispatch_review() {
   local pr="$1" slug="$2" sha="$3" model="${4:-}" result inflight registry
   result="$(_review_result_file "$pr" "$sha")"
@@ -1956,20 +2013,31 @@ _dispatch_review() {
     journal_append reviewer_adopted pr "$pr" sha "$sha" reason "live reviewer already dispatched for pr+sha"
     return 0
   fi
+  # HERD-230: pin the review input to this exact dispatch sha. Superseded (head moved) → abort cheaply
+  # (no spawn); a later tick will dispatch for the new head. Soft pin failure → still dispatch with
+  # HERD_REVIEW_SHA set (herd-review falls back to live diff when objects are missing).
+  local _pin_mode
+  _pin_mode="$(_pin_review_sha "$pr" "$sha")" || {
+    # superseded — head already moved past $sha; do not burn a reviewer on obsolete content
+    return 0
+  }
   # <model> is the risk-tier's chosen reviewer model. EMPTY means "use the default path" — do NOT
   # set HERD_REVIEW_MODEL, so herd-review.sh resolves $MODEL_REVIEW (and any operator-exported
   # HERD_REVIEW_MODEL override still wins) exactly as before tiering existed. A non-empty model
   # (the cheap tier) is passed through so the reviewer runs on that tier. HERD_REVIEW_REGISTRY_FILE is
   # the seam herd-review.sh writes its pane id back through (see the registry helpers above).
+  # HERD_REVIEW_SHA + HERD_REVIEW_PIN_MODE (HERD-230): pin the reviewer's DIFF INPUT to this sha.
   # HERD-245: launch in a new session so a watcher process-group kill never severs this review.
   local _dr_pid
   if [ -n "$model" ]; then
     _bg_new_session env \
-      HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" HERD_REVIEW_MODEL="$model" \
+      HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" \
+      HERD_REVIEW_SHA="$sha" HERD_REVIEW_PIN_MODE="$_pin_mode" HERD_REVIEW_MODEL="$model" \
       bash "$HERD_REVIEW_BIN" "$pr" "$slug"
   else
     _bg_new_session env \
       HERD_REVIEW_RESULT_FILE="$result" HERD_REVIEW_REGISTRY_FILE="$registry" \
+      HERD_REVIEW_SHA="$sha" HERD_REVIEW_PIN_MODE="$_pin_mode" \
       bash "$HERD_REVIEW_BIN" "$pr" "$slug"
   fi
   _dr_pid="$_BG_NEW_SESSION_PID"
@@ -1981,7 +2049,7 @@ _dispatch_review() {
   # Restart-safe marker: pid + start-time (recycling guard) + dispatch ts (deadline any watcher can time).
   _marker_write "$inflight" "$_dr_pid"
   journal_append review_dispatched pr "$pr" sha "$sha" pid "$_dr_pid" \
-    model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result"
+    model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result" pin "$_pin_mode"
 }
 
 # ── INFRA-timeout circuit breaker (HERD-110) ─────────────────────────────────────────────────────
