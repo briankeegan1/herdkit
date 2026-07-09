@@ -22,6 +22,10 @@
 #       HERD-220) — the same lint the heavy project gate runs — so a builder whose change grows the
 #       capability surface without touching templates/capabilities.tsv sees the red here, pre-PR,
 #       instead of bouncing off the merge gate. Skipped in trees with no manifest (every consumer).
+#       Then the SHARED doc-drift guard (scripts/herd/doc-drift-lint.sh, HERD-168) — README.md +
+#       docs/*.md must not reference a herd command (or a README CONFIG_KEY) absent from the
+#       capabilities manifest. Docs-only diffs run light under HEALTHCHECK_HEAVY_GLOB, so this is
+#       the pre-PR gate that catches doc drift (the heavy suite also wraps tests/test-doc-drift.sh).
 #
 # Profile selection (auto):
 #   * no $HEALTHCHECK_CMD configured        → always light (pure syntax gate)
@@ -80,6 +84,14 @@ if [ -f "$HERE/caps-sync-lint.sh" ]; then
 else
   HERD_CAPS_SYNC_SKIP_REASON="caps-sync-lint.sh not present"
   herd_caps_sync_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# doc-drift guard (rc 2), never break the healthcheck it is a part of.
+if [ -f "$HERE/doc-drift-lint.sh" ]; then
+  . "$HERE/doc-drift-lint.sh"
+else
+  HERD_DOC_DRIFT_SKIP_REASON="doc-drift-lint.sh not present"
+  herd_doc_drift_lint() { return 2; }
 fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
@@ -329,6 +341,19 @@ EOF
   if [ "$caps_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ caps-sync — $(printf '%s' "$caps_errs" | head -1)";
     else echo "❌ CAPS-SYNC: capabilities manifest not updated alongside engine change"; printf '%s\n' "$caps_errs"; fi
+    exit 1
+  fi
+
+  # doc-drift guard (HERD-168 / HERD-96) — README.md + docs/*.md must not reference a `herd <subcommand>`
+  # (or a README CONFIG_KEY) absent from templates/capabilities.tsv. Docs-only diffs run this LIGHT
+  # profile under HEALTHCHECK_HEAVY_GLOB, so this is the gate that actually catches doc drift pre-PR
+  # (the heavy suite also wraps tests/test-doc-drift.sh via herd.bats). Same red semantics as
+  # caps-sync. Skipped (never red) when the shared lint is absent or the tree has no manifest/docs.
+  local drift_errs drift_rc
+  drift_errs="$(herd_doc_drift_lint ".")"; drift_rc=$?
+  if [ "$drift_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ doc-drift — $(printf '%s' "$drift_errs" | grep '^DRIFT' | head -1)";
+    else echo "❌ DOC-DRIFT: README/docs reference a command (or README key) absent from capabilities.tsv"; printf '%s\n' "$drift_errs" | grep '^DRIFT' || printf '%s\n' "$drift_errs"; fi
     exit 1
   fi
 

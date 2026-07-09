@@ -83,21 +83,43 @@ _should_automerge CLEAN   || fail "_should_automerge CLEAN should return 0"
 ok
 
 # ════════════════════════════════════════════════════════════════════════════
-# HERD-156 (1): do_merge PINS the merge to the gate-verified sha.
+# HERD-156 (1) + HERD-221: do_merge PINS the merge to the gate-verified sha, and on a non-zero
+# `gh pr merge` exit DISTINGUISHES a genuine sha-moved refusal from "merged-but-a-later-step-failed"
+# (e.g. --delete-branch failing because the branch is still checked out in its worktree).
 # The re-verify → body-fetch → pre-merge-steps window lets a commit land AFTER the gates passed on the
 # reviewed sha; --match-head-commit <gated-sha> makes gh REFUSE such a merge so nothing unreviewed can
 # slip in. We swap in an arg-capturing `gh` stub, isolate do_merge's post-merge side effects behind
-# no-op stubs, and drive both the pinned-success and the sha-moved-refusal paths.
+# instrumented stubs, and drive pinned-success, genuine-refusal, and merge-landed-but-rc≠0 paths.
 # ════════════════════════════════════════════════════════════════════════════
 type do_merge >/dev/null 2>&1 || fail "do_merge not defined after sourcing (lib mode)"
 
 # arg-capturing gh: log every `pr merge` invocation's full argv, and fail with $GH_MERGE_RC to
-# simulate a moved head (gh exits non-zero when --match-head-commit no longer matches the remote head).
-GH_MERGE_ARGS="$T/merge-args.log"; export GH_MERGE_ARGS GH_MERGE_RC
+# simulate either a moved head OR a post-merge local failure (branch-delete). $GH_PR_STATE is what
+# `pr view --json state,mergedAt -q .state` returns so HERD-221 can tell MERGED from OPEN after a
+# non-zero merge (the stub honours -q so production's jq selector sees a bare state token).
+GH_MERGE_ARGS="$T/merge-args.log"; export GH_MERGE_ARGS GH_MERGE_RC GH_PR_STATE
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "pr view") printf '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}\n' ;;
+  "pr view")
+    # Honour -q / --jq so callers like `gh pr view N --json state,mergedAt -q '.state'` get a bare
+    # token (matches real gh). Without this, HERD-221's MERGED check would compare full JSON ≠ MERGED.
+    _q=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -q|--jq) _q="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$_q" in
+      .state|state) printf '%s\n' "${GH_PR_STATE:-OPEN}" ;;
+      *)
+        printf '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"%s","mergedAt":%s}\n' \
+          "${GH_PR_STATE:-OPEN}" \
+          "$([ "${GH_PR_STATE:-OPEN}" = MERGED ] && printf '"2026-01-01T00:00:00Z"' || printf 'null')"
+        ;;
+    esac
+    ;;
   "pr merge") printf '%s\n' "$*" >> "${GH_MERGE_ARGS:?GH_MERGE_ARGS unset}"; exit "${GH_MERGE_RC:-0}" ;;
   *) : ;;
 esac
@@ -105,37 +127,52 @@ exit 0
 STUB
 chmod +x "$BIN/gh"
 
-# Isolate do_merge: point every state file at the sandbox and neutralize the post-merge sequence so the
-# test exercises ONLY the gh-invocation + merge-row logic (the reap/refresh/reconcile steps have their
-# own coverage and need a live worktree/tab/main checkout we deliberately don't build here).
+# Isolate do_merge: point every state file at the sandbox and instrument the post-merge sequence so we
+# can prove which hooks ran (HERD-221) without needing a live worktree/tab/main checkout.
 export WORKTREES_DIR="$T" TREES="$T" MAIN="$T"
 STATE="$T/.agent-watch-merged"; export STATE
 REVIEW_STATE="$T/.agent-watch-reviewed"; export REVIEW_STATE
 JOURNAL_FILE="$T/journal.jsonl"; export JOURNAL_FILE
 DRYRUN=""; export DRYRUN
+POST_MERGE_LOG="$T/post-merge-hooks.log"; export POST_MERGE_LOG
 _slug_ref(){ printf 'HERD-156'; }              # skip the network _reconcile_pr_ref fallback
 _flair_enabled(){ return 1; }                  # flair off → no celebrate marker
 steps_run_at(){ return 0; }                    # no operator steps
-purge_pr_approvals(){ :; }
-cost_emit_merge(){ :; }
-reconcile_backlog(){ :; }
-refresh_codemap(){ :; }
-refresh_symbol_index(){ :; }
-main_health_tick(){ :; }
-_reap_slug(){ :; }
+purge_pr_approvals(){ printf 'purge_pr_approvals\n' >> "$POST_MERGE_LOG"; }
+purge_pr_ci_checks(){ printf 'purge_pr_ci_checks\n' >> "$POST_MERGE_LOG"; }
+cost_emit_merge(){ printf 'cost_emit_merge\n' >> "$POST_MERGE_LOG"; }
+reconcile_backlog(){ printf 'reconcile_backlog\n' >> "$POST_MERGE_LOG"; }
+refresh_codemap(){ printf 'refresh_codemap\n' >> "$POST_MERGE_LOG"; }
+refresh_symbol_index(){ printf 'refresh_symbol_index\n' >> "$POST_MERGE_LOG"; }
+main_health_tick(){ printf 'main_health_tick\n' >> "$POST_MERGE_LOG"; }
+_reap_slug(){ printf 'reap_slug\n' >> "$POST_MERGE_LOG"; }
 
 GATED_SHA="abcdef1234567890abcdef1234567890abcdef12"
 
+# post_merge_ran — true when the critical post-merge hooks all fired (never on a real refusal).
+post_merge_ran() {
+  grep -q 'reconcile_backlog'    "$POST_MERGE_LOG" && \
+  grep -q 'refresh_codemap'      "$POST_MERGE_LOG" && \
+  grep -q 'refresh_symbol_index' "$POST_MERGE_LOG" && \
+  grep -q 'main_health_tick'     "$POST_MERGE_LOG" && \
+  grep -q 'reap_slug'            "$POST_MERGE_LOG" && \
+  grep -q 'cost_emit_merge'      "$POST_MERGE_LOG"
+}
+
 # ── success: head still at the gated sha → gh gets --match-head-commit <gated sha>, PR is recorded ──
-: > "$GH_MERGE_ARGS"; : > "$STATE"; GH_MERGE_RC=0
+: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$POST_MERGE_LOG"; : > "$JOURNAL_FILE"
+GH_MERGE_RC=0 GH_PR_STATE=OPEN
 do_merge "my-slug" 4242 "$T/wt" "$GATED_SHA" || fail "do_merge should return 0 when the head matches"
 grep -q -- "--match-head-commit $GATED_SHA" "$GH_MERGE_ARGS" \
   || fail "gh pr merge must receive --match-head-commit with the gated sha (got: $(cat "$GH_MERGE_ARGS"))"
 grep -q ' 4242 my-slug' "$STATE" || fail "a matched-head merge must write the \$STATE merge row"
+post_merge_ran || fail "successful merge must fire post-merge hooks (got: $(cat "$POST_MERGE_LOG"))"
+grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" && fail "success path must never journal merge_refused_sha_moved"
 ok
 
-# ── sha moved: gh refuses (rc≠0) → journal merge_refused_sha_moved, and NO merge row is written ──────
-: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$JOURNAL_FILE"; GH_MERGE_RC=1
+# ── genuine sha moved: gh refuses (rc≠0) AND PR is still OPEN → journal refusal, skip hooks ──────
+: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$JOURNAL_FILE"; : > "$POST_MERGE_LOG"
+GH_MERGE_RC=1 GH_PR_STATE=OPEN
 if do_merge "my-slug" 4242 "$T/wt" "$GATED_SHA"; then
   fail "do_merge must return non-zero when the gated sha no longer matches the head"
 fi
@@ -145,6 +182,25 @@ grep -q -- "--match-head-commit $GATED_SHA" "$GH_MERGE_ARGS" \
 grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" \
   || fail "a sha-moved refusal must journal merge_refused_sha_moved (got: $(cat "$JOURNAL_FILE"))"
 [ -s "$STATE" ] && fail "a refused merge must NOT write the \$STATE merge row (leaves the PR for re-gate)"
+post_merge_ran && fail "a genuine sha-moved refusal must NOT fire post-merge hooks (got: $(cat "$POST_MERGE_LOG"))"
+[ -s "$POST_MERGE_LOG" ] && fail "a genuine sha-moved refusal must leave post-merge hooks silent (got: $(cat "$POST_MERGE_LOG"))"
+ok
+
+# ── HERD-221: merge LANDED but gh exited non-zero (e.g. --delete-branch failed on a checked-out
+#    worktree branch). PR state is MERGED → treat as SUCCESS: journal merge, write $STATE, run ALL
+#    post-merge hooks, never journal merge_refused_sha_moved.
+: > "$GH_MERGE_ARGS"; : > "$STATE"; : > "$JOURNAL_FILE"; : > "$POST_MERGE_LOG"
+GH_MERGE_RC=1 GH_PR_STATE=MERGED
+do_merge "my-slug" 4242 "$T/wt" "$GATED_SHA" \
+  || fail "do_merge must return 0 when gh exits non-zero but the PR is already MERGED"
+grep -q -- "--match-head-commit $GATED_SHA" "$GH_MERGE_ARGS" \
+  || fail "HERD-221 path must still have ATTEMPTED the pinned merge"
+grep -q ' 4242 my-slug' "$STATE" || fail "HERD-221: MERGED-despite-rc must write the \$STATE merge row"
+grep -q '"event":"merge"' "$JOURNAL_FILE" || grep -qE '(^|[[:space:]])merge([[:space:]]|$)' "$JOURNAL_FILE" \
+  || fail "HERD-221: must journal the merge event (got: $(cat "$JOURNAL_FILE"))"
+grep -q 'merge_refused_sha_moved' "$JOURNAL_FILE" \
+  && fail "HERD-221: must NEVER journal merge_refused_sha_moved when PR is MERGED (got: $(cat "$JOURNAL_FILE"))"
+post_merge_ran || fail "HERD-221: MERGED-despite-rc must fire post-merge hooks (got: $(cat "$POST_MERGE_LOG"))"
 ok
 
 # ════════════════════════════════════════════════════════════════════════════

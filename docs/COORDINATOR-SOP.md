@@ -50,9 +50,10 @@ The watcher **always**:
 
 1. **Launch the coordinator**:
    ```bash
-   herd coordinator
-   # or
-   herd new  # spawns coordinator + a feature lane side-by-side
+   bash scripts/herd/coordinator.sh   # 2-pane control room (backlog + coordinator)
+   # or restart one pane later:
+   herd pane coordinator              # relaunches the coordinator agent pane
+   herd reload                        # rebuild watcher + backlog around a live coordinator
    ```
 
 2. **Monitor the control room**: The coordinator pane shows the backlog and agent output; the watcher row (pinned below) streams live PR gate transitions.
@@ -80,11 +81,11 @@ The watcher **always**:
 **Launch**:
 ```bash
 # One-time launch (if not already running)
-herd new --unattended
+bash scripts/herd/coordinator.sh
 
 # Or, in a shell script or cron job:
-herd reload  # restart the watcher + coordinator if they've stalled
-herd drain --await-merge  # blocks until all in-flight builders have merged, then exits 0 or 1
+herd reload   # restart the watcher + re-render around a live coordinator if they've stalled
+herd status   # poll until open PRs clear / DEAD builders go to zero (no await-merge CLI)
 ```
 
 **Monitoring** (if you step away but stay reachable):
@@ -99,7 +100,7 @@ herd status --json | jq '.watcher.alive | select(. == false)' && notify_ops "Wat
 **Troubleshooting**:
 - **Watcher is dead**: Run `herd reload` to restart it. If it dies again immediately, check the watcher log: `herd log --component watcher --tail 20`.
 - **Coordinator is paused on limit**: The `COORDINATOR_WATCHDOG` should have auto-resumed it. Check the journal: `herd log --component coordinator --tail 20`. If no auto-resume event, the watchdog may not be enabled; enable it with `herd config set COORDINATOR_WATCHDOG on`.
-- **A builder is stuck**: Check `herd status` for in-flight worktrees. Run `herd why <pr#>` to see the full gate history. If it's wedged (no state change for >30 min), escalate: `herd escalate --worktree <name> --reason "builder-stuck-30min"`.
+- **A builder is stuck**: Check `herd status` for in-flight worktrees. Run `herd why <pr#>` to see the full gate history. If it's wedged (no state change for >30 min), surface it to the human (a HUMAN-VERIFY / ESCALATE note via the coordinator) — there is no dedicated escalate subcommand; the journal + status console carry the trail.
 - **A review keeps BLOCKING**: Run `herd log --pr <pr#>` to see the review comments. Either the code needs fixing, or the review gate is too strict. If misconfigured, adjust `REVIEW_CHECKLIST` or set `REVIEW_MODEL_CHEAP` for non-blocking passes.
 
 ## State Machine: The Merge Dance
@@ -224,17 +225,17 @@ This records an `APPROVE` event in the journal (audit trail) and releases the ho
 **Trigger**: A worktree exists, but the agent process crashed and no PR was opened.
 
 **Action**:
-1. Check the builder's transcript: `herd log --component builder-<name> --tail 50`.
+1. Check the builder's transcript: `herd log --tail 50` (filter by worktree/PR as needed).
 2. Decide:
-   - **Relaunch**: `herd relaunch --builder <name>` to restart the agent in the same worktree.
+   - **Relaunch**: re-spawn the builder lane against the same worktree (coordinator / `spawn.sh`) — there is no dedicated relaunch subcommand.
    - **Salvage**: Manually inspect the worktree, commit any partial work, and open a PR by hand.
-   - **Scrap**: `herd reap --builder <name>` to delete the worktree and move on.
+   - **Scrap**: `herd sweep --dry-run` then `herd sweep` to reap disposable worktrees/tabs (or remove the worktree by hand when it still has unique commits).
 
 ### Coordinator CRASHES
 
 **If attended**:
 1. The watcher will detect the coordinator pane is gone and print a warning to the watch console.
-2. Re-launch: `herd coordinator` (or `herd new` to start both).
+2. Re-launch: `herd pane coordinator` (or `bash scripts/herd/coordinator.sh` / `herd reload` to rebuild the control room).
 3. The coordinator will re-read the journal and backlog, and resume from the last known state.
 
 **If unattended**:
@@ -246,27 +247,30 @@ This records an `APPROVE` event in the journal (audit trail) and releases the ho
 ### Stop All Builders Gracefully
 
 ```bash
-herd shutdown --graceful
-# Allows all in-flight builders to finish; no new spawns.
-# The coordinator will still run, but it won't spawn new worktrees.
+# There is no dedicated shutdown subcommand. To stop new spawns while in-flight work finishes:
+#   1) leave the coordinator idle (do not enqueue more spawn.sh intents), and/or
+#   2) set SPAWN_AHEAD=0 + herd config set / herd reload so the drain stays capped.
+# In-flight builders finish; the watcher keeps merging ready PRs.
+herd status   # confirm builders drain and open PRs clear
 ```
 
 ### Kill the Watcher (Emergency)
 
 ```bash
-herd watcher stop
-# Stops the merge gate immediately.
-# In-flight PRs stay open; no new merges happen.
-# Useful if the merge gate is broken and blocking the pipeline.
+herd pane watch
+# Restarts the watcher pane in place (stops the prior watcher process first).
+# In-flight PRs stay open; merges resume once the new watcher is healthy.
+# Useful if the merge gate is wedged and needs a fresh process.
 ```
 
 ### Restart Everything (Hard Reset)
 
 ```bash
-herd reload --kill
-# Kills both the coordinator and watcher, then re-launches them.
+herd reload
+# Rebuilds the control room around a live coordinator: stop + relaunch watcher,
+# ensure the backlog pane, re-render the skill. Never closes the coordinator tab.
 # All in-flight builders stay alive in their worktrees.
-# Use only if the system is in a broken state and you want a clean restart.
+# Use when the system is in a broken state and you want a clean control-room restart.
 ```
 
 ## Forensic Commands

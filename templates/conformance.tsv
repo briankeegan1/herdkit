@@ -63,6 +63,7 @@ herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
 herd advise "<question>" [context…]	unit	tests/test-advise.sh
+herd note "<finding>"	unit	tests/test-builder-notes-journal.sh
 herd reload	unit	tests/test-cli-reload.sh
 herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
 herd update [--force]	unit	tests/test-cli-update.sh
@@ -135,7 +136,11 @@ agent-watch.sh	unit	tests/test-watcher-singleton.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
+retirement.sh	unit	tests/test-retirement-invariant.sh
+retirement.sh	sim	scripts/herd/sim/retirement-invariant-sim.sh
 caps-sync-lint.sh	unit	tests/test-caps-sync-light.sh
+doc-drift-lint.sh	unit	tests/test-doc-drift.sh
+HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
 herd-review.sh	unit	tests/test-review-verdict-integrity.sh
 herd-review.sh	unit	tests/test-structured-block-verdict.sh
@@ -188,7 +193,7 @@ MERGE_METHOD	unit	tests/test-merge-policy.sh
 PR_FLOW	unit	tests/test-flow-preference.sh
 PR_READY_WHEN	unit	tests/test-flow-preference.sh
 PUSH_GATE	sim	tests/test-sandbox-governance.sh
-DELETE_BRANCH_ON_MERGE	none-yet	unit: no test asserts branch deletion after merge; only the init default write is tested
+DELETE_BRANCH_ON_MERGE	unit	tests/test-retirement-invariant.sh
 LOCAL_REVIEW	unit	tests/test-local-review-prepr.sh
 LOCAL_REVIEW_GLOB	unit	tests/test-risk-scoped-prpr-review.sh
 CONTEXT_PROVISION	unit	tests/test-context-provision.sh
@@ -215,9 +220,12 @@ INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
+STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
+CODEMAP_AUTOREFRESH	unit	tests/test-codemap-reconcile.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
 SWEEP_AUTO	unit	tests/test-sweep.sh
 WATCHER_FLAIR	unit	tests/test-watcher-flair.sh

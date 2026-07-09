@@ -11,7 +11,7 @@ Two roles run the whole show, and they never touch each other's turf:
 
 - **The coordinator** — one agent in the control-room tab. Owns the **backlog** and **spawning**.
   It NEVER edits code in the main checkout and NEVER merges a PR.
-- **The watcher** (`herd watch` → `agent-watch.sh`) — a headless status console. Owns the
+- **The watcher** (`herd pane watch` → `agent-watch.sh` / `herd-watch.sh`) — a headless status console. Owns the
   **gates** and the **merge**. It NEVER writes the backlog and NEVER edits code.
 
 Everything below is the handoff between them.
@@ -186,5 +186,5 @@ instantly, and exactly one drainer batches the queue:
 | which module/script does what | [`docs/codemap.md`](codemap.md) — `herd codemap` |
 | a def→caller function index | [`docs/symbol-index.md`](symbol-index.md) — `herd symbol-index` |
 | how the runtime/multiplexer is swapped | [`docs/driver-abstraction.md`](driver-abstraction.md) |
-| live pipeline state right now | `herd watch` (the watcher console) |
+| live pipeline state right now | `herd pane watch` / `herd status` (the watcher console) |
 | this map, rendered | `herd map` |

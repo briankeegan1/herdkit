@@ -381,6 +381,14 @@ PY
     fi ;;
   "pane process-info")
     p="${4:-}"
+    # WEDGE sim (HERD-208): when FAKE_HANG names this pane ("all" or its id), NEVER return — model the
+    # WSL2 hang where `herdr pane process-info` blocks forever. exec sleep so the process IS the sleep
+    # and the caller's `timeout` kills it directly (no orphaned child left behind).
+    case "${FAKE_HANG:-}" in
+      "") : ;;
+      all) exec sleep 120 ;;
+      *) case " ${FAKE_HANG} " in *" $p "*) exec sleep 120 ;; esac ;;
+    esac
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
     cmd=""
     [ -f "$S/panes/$p/cmd" ] && [ ! -f "$S/panes/$p/noshow" ] && cmd="$(cat "$S/panes/$p/cmd")"
@@ -970,6 +978,30 @@ REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (wrong-role test)"
 grep -q "herd-watch.sh" "$S/panes/pX/cmd" 2>/dev/null && fail "watcher run into a pane serving the WRONG role (backlog)" || true
 grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watcher not recreated below the coordinator after dropping the wrong-role hint"
+ok
+
+# ── 37. WEDGED herdr pane-verify → HARD timeout + headless fallback, never blocks (HERD-208) ──────
+# The residual live 2026-07-09 WSL2 hang: `herdr pane process-info` never returns for an idle pane, so
+# reload's pane-verify blocked FOREVER (had to be killed) instead of degrading. Model it with the
+# rich stub's FAKE_HANG=all wedge (every process-info exec-sleeps). The verify must abort on its hard
+# wall-clock deadline and fall back to the headless watcher — and the OUTER `timeout 45` is the real
+# assertion: reload RETURNS (exit != 124) rather than hanging. Poll/deadline knobs are shrunk so the
+# bounded degrade is fast; without the fix the inner run would sit past the outer bound and trip 124.
+P="$T/p37"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state37"; _rich_coord_state "$S"
+set +e
+out="$( cd "$P" && timeout 45 env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="reloadtest" \
+    FAKE_HANG=all HERD_RELOAD_SKIP_LAUNCH=fallback \
+    HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 HERD_RELOAD_LOCKPID_POLLS=1 \
+    HERD_RELOAD_HERDR_TIMEOUT=1 HERD_RELOAD_VERIFY_DEADLINE=2 \
+    bash "$HERD" reload 2>&1 )"
+rc=$?
+set -e
+[ "$rc" -ne 124 ] || fail "reload BLOCKED on a wedged herdr pane-verify (outer timeout fired) — HERD-208 regression"
+printf '%s' "$out" | grep -qi "hard timeout" || fail "wedged verify did not emit the hard-timeout degraded note"
+printf '%s' "$out" | grep -qi "headless"     || fail "wedged verify did not name the headless-watcher fallback"
+printf '%s' "$out" | grep -q  "NOT relaunched" || fail "wedged verify did not reach the (suppressed) watcher fallback"
 ok
 
 echo "ALL PASS ($pass checks)"
