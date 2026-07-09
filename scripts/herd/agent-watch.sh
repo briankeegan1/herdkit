@@ -180,33 +180,41 @@ _gh_timeout_secs() {
 #      of the tick's ~30 gh calls a full second — a fix for a hang that manufactures a stall.
 #   3. a pure-shell watchdog — last resort (no timeout binary AND no perl).
 # Every kill/wait/sleep is guarded so this can never abort a caller running under `set -e`.
-# _gh_timeout_kill_flag <bin> — echo `-k <grace>` when <bin> supports coreutils' kill-after flag, else
-# nothing. Without it `timeout` sends only SIGTERM, and a `gh` that ignores TERM keeps the tick wedged —
-# re-introducing the exact hang, on the coreutils path Linux always takes. Probed once, cached.
+# _gh_timeout_kill_flag <bin> — SET $_GH_TIMEOUT_KFLAG to `-k <grace>` when <bin> supports coreutils'
+# kill-after flag, else to nothing. Without it `timeout` sends only SIGTERM, and a `gh` that ignores
+# TERM keeps the tick wedged — re-introducing the exact hang, on the coreutils path Linux always takes.
+#
+# It ASSIGNS rather than echoes, and the caller invokes it as a plain command rather than inside `$(…)`:
+# a command substitution runs in a subshell, so an echoing version's cache would be discarded and the
+# `timeout -k 1 1 true` probe would re-fork on EVERY gh call of every tick. Probed once per process.
 _GH_TIMEOUT_KFLAG=""
 _GH_TIMEOUT_KFLAG_PROBED=""
+# ${VAR-} (no colon) throughout: the ghost scan reads `${UPPER:-…}` as a config knob, and a hermetic
+# test that extracts this function alone must not trip `set -u` on the un-sourced globals.
 _gh_timeout_kill_flag() {
-  if [ -z "$_GH_TIMEOUT_KFLAG_PROBED" ]; then
-    _GH_TIMEOUT_KFLAG_PROBED=1
-    "$1" -k 1 1 true >/dev/null 2>&1 && _GH_TIMEOUT_KFLAG="-k 5"
-  fi
-  printf '%s' "$_GH_TIMEOUT_KFLAG"
+  [ -n "${_GH_TIMEOUT_KFLAG_PROBED-}" ] && return 0
+  _GH_TIMEOUT_KFLAG_PROBED=1
+  _GH_TIMEOUT_KFLAG=""
+  "$1" -k 1 1 true >/dev/null 2>&1 && _GH_TIMEOUT_KFLAG="-k 5"
+  return 0
 }
 
 _gh_timeout_run() {
   local secs="$1"; shift
   local rc=0
-  # $(…) unquoted ON PURPOSE: it is either empty or the two words `-k 5`.
+  # $_GH_TIMEOUT_KFLAG unquoted ON PURPOSE: it is either empty or the two words `-k 5`.
   # NORMALIZE THE ESCALATED EXIT: coreutils `timeout` returns 124 when its TERM ended the command, but
   # 137 (128+KILL) / 143 (128+TERM) when the -k grace had to finish the job. All three mean the same
   # thing here — the deadline killed it — and only 124 is the convention the wrapper's callers read.
   if command -v timeout >/dev/null 2>&1; then
-    timeout $(_gh_timeout_kill_flag timeout) "$secs" "$@" || rc=$?
+    _gh_timeout_kill_flag timeout
+    timeout ${_GH_TIMEOUT_KFLAG-} "$secs" "$@" || rc=$?
     case "$rc" in 137|143) rc=124 ;; esac
     return "$rc"
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout $(_gh_timeout_kill_flag gtimeout) "$secs" "$@" || rc=$?
+    _gh_timeout_kill_flag gtimeout
+    gtimeout ${_GH_TIMEOUT_KFLAG-} "$secs" "$@" || rc=$?
     case "$rc" in 137|143) rc=124 ;; esac
     return "$rc"
   fi
@@ -1944,6 +1952,11 @@ _marker_age() {
 # corpses), meaning a watcher killed mid-spawn cannot wedge the queue or leave a stale pid exempted
 # in `_list_project_watchers`.
 SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
+# Monotonic per-watcher dispatch counter — the uniquifier for a marker whose natural identity could
+# repeat. Bumped in the TICK (never inside a `$(…)`, which would discard it), so two dispatches can
+# never share a marker name however fast they follow one another. A restarted watcher restarts the
+# count, which is harmless: its predecessor's markers are corpses and get swept.
+_SPAWN_DISPATCH_SEQ=0
 
 # _spawn_inflight_file <kind> <slug> <uniq> — a UNIQUE marker path for one in-flight lane.
 # <kind> ∈ lane|resolve. <uniq> is supplied by the caller from something already unique to the
@@ -3467,18 +3480,35 @@ EOF
 # keep auto-merging. Under approve/observe the hold is redundant (those policies already gate every
 # PR), so it is never applied there — avoiding any double-hold.
 
-# _pr_body <pr#> — the PR's body text, or empty on any failure. Isolated so the hermetic tests can
-# stub `gh pr view` and so the (potentially large) body is only fetched when the hold is relevant.
+# _pr_body <pr#> — the PR's body text on stdout, and gh's EXIT STATUS. Isolated so the hermetic tests
+# can stub `gh pr view` and so the (potentially large) body is only fetched when the hold is relevant.
+#
+# THE STATUS IS THE POINT (HERD-237). This used to swallow every failure with `|| true`, so an
+# unreadable body was indistinguishable from a PR that simply declares no HUMAN-VERIFY block — and an
+# absent block means MERGE. That was survivable while `gh` was unbounded (a slow fetch eventually
+# returned the body); the 15 s deadline turns a slow network into a silent auto-merge of a PR whose
+# declared manual steps were never run. `human-verify.sh` names this exact bypass. Callers MUST branch
+# on the rc: an EMPTY body with rc 0 is "no hold declared"; ANY non-zero rc is "we cannot see", and the
+# only safe reading of "we cannot see" in front of a merge is HOLD.
 _pr_body() {
-  _gh_timeout pr_body pr view "$1" --json body -q '.body' 2>/dev/null || true
+  _gh_timeout pr_body pr view "$1" --json body -q '.body' 2>/dev/null
 }
 
-# pr_human_verify_held <pr#> — true iff the PR body declares a NON-EMPTY HUMAN-VERIFY block.
+# pr_human_verify_held <pr#> — THREE-VALUED, because the honest answer has three cases:
+#   0  a NON-EMPTY HUMAN-VERIFY block is declared        → hold
+#   1  the body was read and declares no block           → no hold
+#   2  the body could NOT be read (gh timeout/failure)   → UNKNOWN; callers must fail CLOSED
+# A caller that treats this as a plain boolean gets "no hold" for case 2 — the bypass. The merge gate
+# branches on 2 explicitly; the hermetic tests assert both the boolean cases and the tri-state.
 pr_human_verify_held() {
-  _pr_body "$1" | human_verify_has
+  local _phv_body _phv_rc=0
+  _phv_body="$(_pr_body "$1")" || _phv_rc=$?
+  [ "$_phv_rc" -eq 0 ] || return 2
+  printf '%s' "$_phv_body" | human_verify_has
 }
 
-# pr_human_verify_steps <pr#> — print the PR's declared HUMAN-VERIFY steps, one per line.
+# pr_human_verify_steps <pr#> — print the PR's declared HUMAN-VERIFY steps, one per line. Only ever
+# reached once pr_human_verify_held has already proven the body readable.
 pr_human_verify_steps() {
   _pr_body "$1" | human_verify_steps
 }
@@ -3876,8 +3906,11 @@ spawn_resolver() {
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
-  # The dispatch's own identity (pr + sha + dispatch epoch) uniquifies the marker.
-  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs" "${rp}-${rsha:--}-$(_now_epoch)")"
+  # pr + sha keep the marker legible; the monotonic sequence makes it UNIQUE. An epoch alone would
+  # alias two dispatches of the same pr+sha inside one second — unreachable today (the
+  # _resolver_in_flight guard closes it) but exactly the aliasing hazard this name exists to avoid.
+  _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
+  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs" "${rp}-${rsha:--}-${_SPAWN_DISPATCH_SEQ}")"
   _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha" "$_sr_marker"
   return 0
 }
@@ -5576,7 +5609,15 @@ for line in os.environ.get("WT","").splitlines():
   # slug that keys the tab, instead of assuming the slug is the last '/'-segment.
   local _sw_pr_slugs
   local _sw_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_sw_tmpl" ] || _sw_tmpl='feat/{slug}'
-  _sw_pr_slugs="$(_gh_timeout worktree_sweep_prs pr list --json headRefName 2>/dev/null | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
+  # HERD-206 shape (HERD-237): a pipeline hides the fetch's exit status, so a `gh pr list` that fails
+  # or times out looks exactly like "zero open PRs". Capture the RAW output + its rc first, and abort
+  # the sweep on a bad read rather than reasoning from a fabricated empty PR set. (_sw_live also unions
+  # live worktree slugs, so the blast radius was bounded — but this is the same bug _srt_rc fixed in
+  # _sweep_resolver_tabs, and it should not survive twice.)
+  local _sw_raw _sw_rc=0
+  _sw_raw="$(_gh_timeout worktree_sweep_prs pr list --json headRefName 2>/dev/null)" || _sw_rc=$?
+  [ "$_sw_rc" -eq 0 ] || return 0
+  _sw_pr_slugs="$(printf '%s' "$_sw_raw" | BRANCH_TEMPLATE="$_sw_tmpl" python3 -c '
 import sys, json, os
 tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
 if "{slug}" not in tmpl: tmpl = "feat/{slug}"
@@ -10419,7 +10460,8 @@ _drain_spawn_queue() {
         # status and only then consumes/releases the intent, so the PR #151 durability contract is
         # unchanged; the tick just no longer waits for it. The marker keeps the worker out of
         # `_list_project_watchers` and holds the launch slot shut until the lane lands.
-        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "$_dsq_id")" \
+        _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
+        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "${_dsq_id}-${_SPAWN_DISPATCH_SEQ}")" \
           _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
         # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
         # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
@@ -11116,8 +11158,23 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
     # approve-style hold on top of auto). The parse only runs in auto mode (a body fetch per PASS
     # candidate) — approve/observe already hold every PR, so the marker is moot there.
     mode="auto"; [ -z "$AUTOMERGE" ] && mode="approve"; [ -n "$MERGE_OBSERVE" ] && mode="observe"
-    hv_hold=""
-    if [ "$mode" = "auto" ] && pr_human_verify_held "$prnum"; then hv_hold=1; fi
+    hv_hold=""; hv_body=""
+    if [ "$mode" = "auto" ]; then
+      # Read the body ONCE and branch on the READ, not on its emptiness (HERD-237). In auto mode this
+      # parse is the ONLY thing that converts a green-gated PR into a human-verify hold, so an
+      # unreadable body must never be spent as "nothing to verify". FAIL CLOSED: skip the merge for
+      # this tick, journal it, and re-gate next tick — no ledger row is written, so a transient gh
+      # timeout costs one tick, and a persistent one holds the PR loudly instead of merging it blind.
+      hv_rc=0; hv_body="$(_pr_body "$prnum")" || hv_rc=$?
+      if [ "$hv_rc" -ne 0 ]; then
+        journal_append hv_body_unreadable pr "$prnum" sha "$rsha" slug "$slug" rc "$hv_rc" \
+          detail "cannot read the PR body — holding rather than merging a possibly human-verify PR"
+        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gh unreadable · holding (cannot read HUMAN-VERIFY block)${C_RESET}"
+        render
+        continue
+      fi
+      printf '%s' "$hv_body" | human_verify_has && hv_hold=1
+    fi
     hold_kind="approve"; [ -n "$hv_hold" ] && hold_kind="human-verify"
     # A hold is in effect when the policy holds (approve) OR this PR is human-verify-held AND
     # HUMAN_VERIFY_POLICY still HOLDS (hold|coordinator). Under HUMAN_VERIFY_POLICY=auto (HERD-59) a
@@ -11151,7 +11208,7 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
             # HUMAN_VERIFY_POLICY=coordinator: still a hold, but journaled with the policy + surfaced
             # loudly as coordinator-actionable so a coordinator/agent runs the steps then approves.
             journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" human_verify_policy coordinator
-            hv_steps="$(pr_human_verify_steps "$prnum")"
+            hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
             _gh_timeout hv_coordinator_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual steps and \`HUMAN_VERIFY_POLICY=coordinator\`, so it is held as **coordinator-actionable**: a coordinator/agent should execute these steps, then approve:
 
 ${hv_steps}
@@ -11161,7 +11218,7 @@ Once executed, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approv
           elif [ -n "$hv_hold" ]; then
             # HUMAN_VERIFY_POLICY=hold (default): byte-identical to today's per-PR human-verify hold.
             journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
-            hv_steps="$(pr_human_verify_steps "$prnum")"
+            hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
             _gh_timeout hv_hold_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
 
 ${hv_steps}
@@ -11186,7 +11243,7 @@ Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${
         # sha. The journal line makes it explicit + auditable that the steps were NOT human-executed.
         if [ -n "$hv_hold" ] && [ "$HV_POLICY" = "auto" ] && ! hv_informed_noted "$prnum" "$rsha"; then
           record_hv_informed "$prnum" "$rsha"
-          hv_steps="$(pr_human_verify_steps "$prnum")"
+          hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
           journal_append human_verify_policy pr "$prnum" sha "$rsha" slug "$slug" policy auto action merged-with-declared-steps
           _gh_timeout hv_auto_comment pr comment "$prnum" --body "🐑 **herd watch** · \`HUMAN_VERIFY_POLICY=auto\` — this PR declared manual verify steps, treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These steps were NOT executed before merge:
 

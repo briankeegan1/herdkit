@@ -14,8 +14,9 @@
 #       timeouts — they are not availability faults.
 #   (3) A HUNG gh is killed at the deadline: rc 124, one `gh_timeout` journal event carrying the site
 #       + budget, and NO stdout (never a fabricated success).
-#   (4) FAIL-SOFT AT THE REAL CALL SITES — a hung gh lands in each site's existing gh-failure branch:
-#       `_prs_fetch_tick` → PRS_LOOKUP_OK=0 (never "zero open PRs"), `_pr_body` → empty,
+#   (4) FAIL-CLOSED AT THE REAL CALL SITES — a hung gh lands in each site's existing gh-failure branch:
+#       `_prs_fetch_tick` → PRS_LOOKUP_OK=0 (never "zero open PRs"), `_pr_body` → non-zero rc (never a
+#       fabricated "no HUMAN-VERIFY block", which would auto-merge an unverified PR),
 #       `_gate_status_blessed` → false (never a fabricated blessing).
 #   (5) The tick PROCEEDS: a hung gh costs the budget, not the loop.
 #   (6) BUDGET PARSE is fail-safe (empty / 0 / garbage → the 15 s default) and HERD_GH_TIMEOUT_SECS
@@ -150,8 +151,11 @@ ok "(3b) a TERM-ignoring gh is escalated to SIGKILL — the coreutils path carri
   [ "$PRS_LOOKUP_OK" = "0" ] || { echo "hung gh left PRS_LOOKUP_OK=$PRS_LOOKUP_OK (want 0)"; exit 1; }
   [ "$PRS_JSON" = "[]" ]     || { echo "hung gh left PRS_JSON='$PRS_JSON' (want [])"; exit 1; }
 
-  # (4b) the human-verify body read: empty, and the caller's `|| true` never aborts.
-  body="$(_pr_body 12)"; [ -z "$body" ] || { echo "_pr_body fabricated a body on a hang"; exit 1; }
+  # (4b) the human-verify body read: no body AND a non-zero rc. The rc is the load-bearing half — an
+  # empty body with rc 0 would mean "this PR declares no HUMAN-VERIFY steps" and auto-merge it.
+  body="$(_pr_body 12)" && { echo "_pr_body reported SUCCESS on a hang (auto-merge bypass)"; exit 1; }
+  [ -z "$body" ] || { echo "_pr_body fabricated a body on a hang"; exit 1; }
+  pr_human_verify_held 12; [ "$?" -eq 2 ] || { echo "pr_human_verify_held must report UNKNOWN(2) on a hang"; exit 1; }
 
   # (4c) the cross-seat blessing: a hang must NOT read as "blessed" (that would skip both gates).
   _gate_status_blessed abc123 && { echo "a hung gh blessed a sha"; exit 1; }
@@ -166,7 +170,7 @@ ok "(3b) a TERM-ignoring gh is escalated to SIGKILL — the coreutils path carri
   done
   exit 0
 ) || fail "(4) a hung gh did not land in the existing fail-soft path at some call site"
-ok "(4) hung gh → each site takes its EXISTING gh-failure branch (no fabricated PR list / body / blessing / reap)"
+ok "(4) hung gh → each site FAILS CLOSED (no fabricated PR list / body / blessing / reap)"
 
 # ── (4e) HONEST LABELS: an unreadable merge re-verify is never a 'PR no longer maps' needs-you row ──
 # The guard turns an outage from a wedge into a routine outcome, so the outage's LABEL now matters:
