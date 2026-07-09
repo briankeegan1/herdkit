@@ -33,19 +33,21 @@ chmod +x "$BIN/pgrep"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
 export PATH="$BIN:$PATH"
 
-# ── Stub capabilities manifest (5-column: name kind description when requires) ─
+# ── Stub capabilities manifest (HERD-159: + value_shape column) ─
 # WORKSPACE_NAME/BACKLOG_FILE are tagged `watcher`: the live watcher consumes them (lockfile slug,
 # reap greps, PR target), so a set must restart it — re-rendering alone would silently partial-apply.
 # HERD_REPO is genuinely render-only (skill token, no watcher consumer).
+# REVIEW_CONCURRENCY is numeric; MERGE_POLICY is an enum — exercise write-time value validation.
 CAPS="$T/capabilities.tsv"
 {
-  printf 'name\tkind\tdescription\twhen_to_surface\trequires\n'
-  printf 'WORKSPACE_NAME\tconfig\tProject label (lockfile slug + skill)\tAlways required\twatcher\n'
-  printf 'BACKLOG_FILE\tconfig\tBacklog path consumed by the watcher reap step\tUsed by file backend\twatcher\n'
-  printf 'REVIEW_CONCURRENCY\tconfig\tMax parallel pre-merge reviews\tRaise for throughput\twatcher\n'
-  printf 'HERD_REPO\tconfig\tGitHub repo engine bugs escalate to (skill token only)\tFor herd report\trender\n'
-  printf 'SCRIBE_BACKEND\tconfig\tWork-tracker backend adapter\tSet for a tracker\t\n'
-  printf 'DENY_PATHS\tconfig\tNever-committed paths\tFor secrets\trender\n'
+  printf 'name\tkind\tdescription\twhen_to_surface\trequires\tscope\tgovernance\tvalue_shape\n'
+  printf 'WORKSPACE_NAME\tconfig\tProject label (lockfile slug + skill)\tAlways required\twatcher\t\t\tfree\n'
+  printf 'BACKLOG_FILE\tconfig\tBacklog path consumed by the watcher reap step\tUsed by file backend\twatcher\t\t\tfree\n'
+  printf 'REVIEW_CONCURRENCY\tconfig\tMax parallel pre-merge reviews\tRaise for throughput\twatcher\t\t\tnumeric\n'
+  printf 'MERGE_POLICY\tconfig\tMerge gate policy\tPrimary merge lever\twatcher\t\tgovernance\tauto|approve|observe\n'
+  printf 'HERD_REPO\tconfig\tGitHub repo engine bugs escalate to (skill token only)\tFor herd report\trender\t\t\tfree\n'
+  printf 'SCRIBE_BACKEND\tconfig\tWork-tracker backend adapter\tSet for a tracker\t\t\t\tfree\n'
+  printf 'DENY_PATHS\tconfig\tNever-committed paths\tFor secrets\trender\t\t\tfree\n'
 } > "$CAPS"
 export HERD_CAPABILITIES_FILE="$CAPS"
 
@@ -201,6 +203,27 @@ run "$P5" config get WORKSPACE_NAME; got="$OUT"
 sourced="$( cd "$P5" && ( set +u +e; . ./.herd/config >/dev/null 2>&1; printf '%s' "${WORKSPACE_NAME:-}" ) )"
 [ "$got" = "plain-value_123" ]                    || fail "benign roundtrip wrong ($got)"
 [ "$got" = "$sourced" ]                           || fail "get ($got) != shell-sourced value ($sourced)"
+ok
+
+# ══ 13. HERD-159: write-time value_shape validation (enum + numeric) ══════════
+# A typo'd MERGE_POLICY or non-numeric REVIEW_CONCURRENCY must be REFUSED before it lands in
+# .herd/config — runtime fail-strict is the backstop, write-time is the front door.
+P6="$T/p6"; mkdir "$P6"; _make_project "$P6"
+run "$P6" config set MERGE_POLICY aprove
+[ "$RC" -ne 0 ]                                   || fail "set accepted typo MERGE_POLICY=aprove"
+printf '%s\n' "$OUT" | grep -qi 'invalid value'   || fail "typo MERGE_POLICY missing invalid-value message ($OUT)"
+grep -qE '^MERGE_POLICY=' "$P6/.herd/config"     && fail "typo MERGE_POLICY was written despite refusal"
+run "$P6" config set MERGE_POLICY observe
+[ "$RC" -eq 0 ]                                   || fail "set valid MERGE_POLICY=observe failed ($OUT)"
+run "$P6" config get MERGE_POLICY
+[ "$OUT" = "observe" ]                            || fail "valid MERGE_POLICY not persisted ($OUT)"
+run "$P6" config set REVIEW_CONCURRENCY two
+[ "$RC" -ne 0 ]                                   || fail "set accepted non-numeric REVIEW_CONCURRENCY=two"
+printf '%s\n' "$OUT" | grep -qi 'invalid value\|non-negative integer' \
+                                                  || fail "non-numeric concurrency missing message ($OUT)"
+grep -qE '^REVIEW_CONCURRENCY="two"' "$P6/.herd/config" && fail "non-numeric concurrency was written"
+run "$P6" config set REVIEW_CONCURRENCY 3
+[ "$RC" -eq 0 ]                                   || fail "set valid REVIEW_CONCURRENCY=3 failed ($OUT)"
 ok
 
 echo "ALL PASS ($pass tests)"

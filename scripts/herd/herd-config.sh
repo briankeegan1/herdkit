@@ -112,9 +112,10 @@ _herd_read_project_config() {
     # shellcheck source=/dev/null
     . "$cfg" 2>/dev/null || exit 1
     # Apply the SAME fallbacks the main loader does. Written as explicit `-n` guards (the vars are
-    # pre-initialised to "" just above), NOT the `: "${KEY:=…}"` idiom: the caps-sync gate greps THIS
-    # file for `: "${KEY:=…}"` as its "new config key" heuristic, so the `:=` form here would false-trip
-    # it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids `:=`.
+    # pre-initialised to "" just above), NOT the colon-equals defaulting idiom: the caps-sync gate
+    # greps THIS file for that form as its "new config key" heuristic, so using it here would
+    # false-trip it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids
+    # colon-equals.
     [ -n "$PROJECT_ROOT" ]   || PROJECT_ROOT="$path"
     [ -n "$WORKTREES_DIR" ]  || WORKTREES_DIR="${PROJECT_ROOT}-trees"
     [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="origin/main"
@@ -1301,6 +1302,91 @@ _herd_branch_template() {
     *'{slug}'*) printf '%s' "$_bt" ;;
     *) echo "⚠️  BRANCH_TEMPLATE='$_bt' has no {slug} token — falling back to 'feat/{slug}'." >&2
        printf '%s' 'feat/{slug}' ;;
+  esac
+}
+
+# ── Shared config-value validators (HERD-159) ─────────────────────────────────
+# RULE: **gate keys fail strict; cosmetic keys fail soft.**
+#   • Gate keys (MERGE_POLICY, HUMAN_VERIFY_POLICY, HEALTH_CONCURRENCY, REVIEW_CONCURRENCY,
+#     SPAWN_AHEAD, …) control merge/hold/dispatch. An invalid value must NEVER silently take a
+#     permissive path — fall back to the STRICTEST / safest default and warn loudly.
+#   • Cosmetic keys (CODEMAP_AUTOREFRESH, WATCHER_FLAIR, …) are non-gating. An invalid value falls
+#     back to the documented default and soft-warns (no silent no-op, no crash).
+# The helpers themselves are posture-neutral: the CALLER chooses which default to pass (strictest for
+# gates, documented default for cosmetic). Empty/unset always yields the default WITHOUT a warning
+# (an unset key is intentional "use default", not a typo); a NON-EMPTY invalid value warns on stderr
+# and returns exit 1 so the caller can journal / escalate.
+
+# _herd_val_warn_once <KEY> <message> — print <message> to stderr at most once per KEY per process
+# so a tick loop that re-resolves a bad value never spams the console. Side-channel is a per-pid
+# marker file (not a shell var) because callers typically resolve via `$(herd_numeric …)` command
+# substitution — a subshell cannot mutate the parent's `_HERD_VAL_WARNED`. The file lives under
+# ${TMPDIR:-/tmp} and is keyed by pid so concurrent herd processes never share marks.
+_herd_val_warn_once() {
+  local _hw_key="${1:-}" _hw_msg="${2:-}"
+  local _hw_f="${HERD_VAL_WARN_FILE:-${TMPDIR:-/tmp}/.herd-val-warned.$$}"
+  if [ -n "$_hw_key" ] && [ -f "$_hw_f" ] && grep -qxF "$_hw_key" "$_hw_f" 2>/dev/null; then
+    return 0
+  fi
+  [ -n "$_hw_key" ] && printf '%s\n' "$_hw_key" >> "$_hw_f" 2>/dev/null || true
+  printf '%s\n' "$_hw_msg" >&2
+}
+
+# herd_enum <KEY> <default> <v1> [v2…] — resolve the env var named KEY against an allowed set.
+# Prints the resolved value (the live value when it matches one of v1…, else <default>). Exit 0 when
+# the live value is empty/unset OR one of the allowed values; exit 1 when a NON-EMPTY value was
+# rejected (and a single stderr warning was printed, once per KEY). Safe under `set -e` when the
+# caller captures the exit:  val="$(herd_enum KEY def a b || true)".
+# Reads the LIVE env var on every call so a hermetic test (or a mid-process export) is honored.
+herd_enum() {
+  local _he_key="${1:-}" _he_def="${2:-}"
+  [ -n "$_he_key" ] || { printf '%s' "$_he_def"; return 0; }
+  shift 2 || true
+  local _he_val
+  # bash indirect expansion — KEY is the config key name, not a shell variable to pass by value.
+  eval "_he_val=\"\${${_he_key}-}\""
+  if [ -z "$_he_val" ]; then
+    printf '%s' "$_he_def"
+    return 0
+  fi
+  local _he_v
+  for _he_v in "$@"; do
+    if [ "$_he_val" = "$_he_v" ]; then
+      printf '%s' "$_he_val"
+      return 0
+    fi
+  done
+  _herd_val_warn_once "$_he_key" \
+    "⚠️  herdkit: invalid ${_he_key}=${_he_val} — falling back to ${_he_def}"
+  printf '%s' "$_he_def"
+  return 1
+}
+
+# herd_numeric <KEY> <default> — resolve the env var named KEY as a non-negative integer.
+# Prints the live value when it is all digits (0-9, no sign/decimal); else prints <default>. Exit 0
+# when empty/unset OR valid; exit 1 when a NON-EMPTY non-numeric value was rejected (warned once).
+# An empty value is "use default" (no warn) so a config that never sets the key is silent.
+# Reads the LIVE env var on every call so mid-process overrides (tests, `export KEY=N`) are honored.
+herd_numeric() {
+  local _hn_key="${1:-}" _hn_def="${2:-0}"
+  [ -n "$_hn_key" ] || { printf '%s' "$_hn_def"; return 0; }
+  local _hn_val
+  eval "_hn_val=\"\${${_hn_key}-}\""
+  if [ -z "$_hn_val" ]; then
+    printf '%s' "$_hn_def"
+    return 0
+  fi
+  case "$_hn_val" in
+    ''|*[!0-9]*)
+      _herd_val_warn_once "$_hn_key" \
+        "⚠️  herdkit: invalid ${_hn_key}=${_hn_val} (not a non-negative integer) — falling back to ${_hn_def}"
+      printf '%s' "$_hn_def"
+      return 1
+      ;;
+    *)
+      printf '%s' "$_hn_val"
+      return 0
+      ;;
   esac
 }
 

@@ -65,12 +65,20 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 # Reclassified in HERD-161: it is a MERGE-GATE policy (how a HUMAN-VERIFY hold resolves under auto-
 # merge), a project-wide decision like MERGE_POLICY — NOT a per-machine operator posture — so scope is
 # project (empty) and governance=governance, not machine.
-row="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print NF"|"$5"|"$6"|"$7; exit}' "$CAPS")"
-[ -n "$row" ] || fail "(1) HUMAN_VERIFY_POLICY missing from capabilities.tsv (kind=config)"
-[ "${row%%|*}" = "7" ] || fail "(1) HUMAN_VERIFY_POLICY row should have 7 columns, got: $row"
-[ "$(echo "$row" | cut -d'|' -f2)" = "watcher" ]    || fail "(1) HUMAN_VERIFY_POLICY requires must be 'watcher', got: $row"
-[ "$(echo "$row" | cut -d'|' -f3)" = "" ]           || fail "(1) HUMAN_VERIFY_POLICY scope must be project (empty), got: $row"
-[ "$(echo "$row" | cut -d'|' -f4)" = "governance" ] || fail "(1) HUMAN_VERIFY_POLICY governance must be 'governance', got: $row"
+# HERD-159 widened the row to 8 columns (value_shape); cols 5/6/7 stay requires/scope/governance.
+# value_shape itself contains '|' so do NOT join fields with '|' and cut — read each col separately.
+hv_nf="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print NF; exit}' "$CAPS")"
+hv_req="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print $5; exit}' "$CAPS")"
+hv_scope="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print $6; exit}' "$CAPS")"
+hv_gov="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print $7; exit}' "$CAPS")"
+hv_shape="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY" && $2=="config"{print $8; exit}' "$CAPS")"
+[ -n "$hv_nf" ] || fail "(1) HUMAN_VERIFY_POLICY missing from capabilities.tsv (kind=config)"
+[ "$hv_nf" = "8" ] || fail "(1) HUMAN_VERIFY_POLICY row should have 8 columns, got: $hv_nf"
+[ "$hv_req" = "watcher" ]    || fail "(1) HUMAN_VERIFY_POLICY requires must be 'watcher', got: $hv_req"
+[ "$hv_scope" = "" ]         || fail "(1) HUMAN_VERIFY_POLICY scope must be project (empty), got: $hv_scope"
+[ "$hv_gov" = "governance" ] || fail "(1) HUMAN_VERIFY_POLICY governance must be 'governance', got: $hv_gov"
+[ "$hv_shape" = "hold|coordinator|auto" ] \
+  || fail "(1) HUMAN_VERIFY_POLICY value_shape must be hold|coordinator|auto, got: $hv_shape"
 ok
 # when_to_surface (col 4) present and mentions all three values so the manifest is self-documenting.
 wts="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY"{print $4; exit}' "$CAPS")"

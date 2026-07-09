@@ -164,13 +164,16 @@ EXEMPT_PREFIX_EXCEPTIONS = {"HERD_BRAND"}
 EXEMPT_NAMES = {
     "ADVISE_MODEL", "AGENTS_JSON", "BLOCKED", "CELEBRATE", "DEPS_FILE", "DEP_STATES_FILE",
     "DEP_WATCHER_LIB", "DRYRUN", "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
-    "JOURNAL_FILE", "JOURNAL_MAX_BYTES", "LEDGER_FILE", "LOG", "MAIN_HEALTH", "NO_COLOR",
+    "JOURNAL_FILE", "JOURNAL_MAX_BYTES", "LEDGER_FILE", "LOG", "MAIN", "MAIN_HEALTH", "NO_COLOR",
+    "OPERATOR_INBOX_ROWS",  # agent-watch.sh: rendered inbox body for this tick (not a config knob)
     "OSC8_LINK_BASE",  # backlog-view.sh: computed from the Linear slug for OSC-8 hyperlinks (not a config knob)
     "PASTURE",
-    "PR", "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
+    "PR", "PRS_JSON",  # agent-watch.sh: live gh pr list JSON for this tick
+    "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
     "RESEARCH_REPORTS", "RESEARCH_TAB", "RESEARCH_TREES", "RESOLVER_MODEL", "ROOT",
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
     "TAB", "TEMPLATES_DIR", "TMPDIR", "TRACKER_DRIFT", "TREES", "TSWEEP_LIMIT", "WPANE",
+    "WT",  # agent-watch.sh: git worktree list --porcelain for this tick
 }
 def exempt(k, declared, file_locals):
     if k in declared:        # already declared → not a ghost

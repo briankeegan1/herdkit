@@ -73,6 +73,19 @@ ok
 [ "$(MERGE_POLICY=observe WATCHER_AUTOMERGE=true _effective_merge_policy)" = "observe" ] || fail "MERGE_POLICY overrides WATCHER_AUTOMERGE (observe wins)"
 ok
 
+# HERD-159: a TYPO'd non-empty MERGE_POLICY fails STRICT to observe (never merge) — it must NOT
+# fall through to the legacy WATCHER_AUTOMERGE derivation (which defaults true → auto and would
+# silently turn an approval-gated repo into an auto-merging one). Empty alone is the legacy trigger.
+[ "$(MERGE_POLICY=aprove  WATCHER_AUTOMERGE=true  _effective_merge_policy)" = "observe" ] \
+  || fail "typo MERGE_POLICY=aprove must fail strict → observe (not auto via WATCHER_AUTOMERGE)"
+ok
+[ "$(MERGE_POLICY=held    WATCHER_AUTOMERGE=false _effective_merge_policy)" = "observe" ] \
+  || fail "typo MERGE_POLICY=held must fail strict → observe (not approve via WATCHER_AUTOMERGE)"
+ok
+[ "$(MERGE_POLICY=AUTO    _effective_merge_policy)" = "observe" ] \
+  || fail "case-sensitive: MERGE_POLICY=AUTO is unrecognized → observe"
+ok
+
 # ── _merge_method_flag ───────────────────────────────────────────────────────
 
 type _merge_method_flag >/dev/null 2>&1 || fail "_merge_method_flag not defined"

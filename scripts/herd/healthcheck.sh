@@ -354,14 +354,23 @@ EOF
 
 # ── attribution lint: scan PR commits for AI co-author markers (HERD-121) ──────────────────────
 # Keyed on ATTRIBUTION_POLICY (independent of the heavy/light profile and the interaction gate). Sets:
-#   AL_STATE  = DISABLED | CLEAN | CODEERROR
-#   AL_REASON = first offending "sha:line" (empty when not CODEERROR)
+#   AL_STATE  = DISABLED | CLEAN | WARN | CODEERROR
+#   AL_REASON = first offending "sha:line" (CODEERROR); the fixed warning text (WARN)
 #   AL_FULL   = all offending "sha:line" pairs, newline-separated (empty unless CODEERROR)
+# HERD-159: unknown NON-EMPTY values WARN (like COMMIT_CONVENTION's invalid-regex path) instead of
+# silently disabling the lint — a typo (ATTRIBUTION_POLICY=no-ai-co-author) must never ride the off
+# path unnoticed. Empty/unset remains the intentional off switch (byte-identical, no warn).
 AL_STATE="DISABLED"; AL_REASON=""; AL_FULL=""
 run_attribution_lint() {
   case "${ATTRIBUTION_POLICY:-}" in
     no-ai-coauthor) ;;
-    *) return 0 ;;   # off (default "") or unknown value → zero behavior change
+    '') return 0 ;;   # off (default "") → zero behavior change
+    *)
+      # Non-empty unrecognized value → WARN and skip (mirrors COMMIT_CONVENTION invalid regex).
+      AL_STATE="WARN"
+      AL_REASON="invalid ATTRIBUTION_POLICY (lint skipped): $ATTRIBUTION_POLICY"
+      return 0
+      ;;
   esac
   local _al_violations
   _al_violations="$(_herd_attr_scan "$DEFAULT_BRANCH")"
@@ -472,7 +481,8 @@ if [ -n "$ONELINE" ]; then
     case "$IG_STATE" in
       WARN)    printf '⚠️  %s\n' "$IG_REASON" ;;
       DATAENV) printf '⚠️  interaction data/env (not a code bug) — %s\n' "$IG_REASON" ;;
-      *)       if [ "$CC_STATE" = "WARN" ]; then printf '⚠️  commit-convention — %s\n' "$CC_REASON"
+      *)       if [ "$AL_STATE" = "WARN" ]; then printf '⚠️  attribution — %s\n' "$AL_REASON"
+               elif [ "$CC_STATE" = "WARN" ]; then printf '⚠️  commit-convention — %s\n' "$CC_REASON"
                else printf '%s\n' "$MAIN_OUT"; fi ;;
     esac
   fi
@@ -493,6 +503,7 @@ esac
 case "$AL_STATE" in
   DISABLED) : ;;
   CLEAN)    printf '✅ ATTRIBUTION LINT CLEAN\n' ;;
+  WARN)     printf '⚠️  ATTRIBUTION LINT: %s\n' "$AL_REASON" ;;
   CODEERROR) printf '❌ ATTRIBUTION LINT: AI co-author marker found\n'
              [ -n "$AL_FULL" ] && printf '%s\n' "$AL_FULL" ;;
 esac
