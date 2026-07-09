@@ -1,0 +1,80 @@
+# templates/drivers/grok.driver — the xAI Grok Build CLI driver:
+#   multiplexer = herdr · agent runtime = xAI Grok Build CLI (`grok`).
+#
+# A non-Claude agent-runtime driver (HERD-178, agent-runtime portability epic HERD-150). It swaps
+# ONLY the RUNTIME — the `claude`-specific exec surface (spawn / one-shot / resume / model-switch /
+# permission-mode / limit / session / cost) is rebound to Grok Build's real control surface — while
+# KEEPING herdr as the multiplexer, exactly as herdr-claude.driver's header notes ("a non-Claude
+# runtime rebinds this block, keeping herdr as the mux"). Model this file on
+# templates/drivers/herdr-claude.driver (default) + headless.driver. See docs/driver-abstraction.md.
+#
+# CONTRACT (mirrors .herd/config, same as every driver): shell-sourceable KEY=value, COMMITTED,
+# ZERO-SECRET — command SHAPES only, never credentials or absolute host paths ({{SCRIPTS_DIR}} is
+# resolved at render time). Selected per project by `.herd/config` key HERD_DRIVER=grok.
+#
+# RENDER SCOPE: templates/coordinator.md.tmpl tokenizes only the four MUX capabilities
+# ({{DRIVER_LIST_AGENTS}} {{DRIVER_FOCUS_AGENT}} {{DRIVER_SEND_TEXT}} {{DRIVER_SWITCH_MODEL}}), which
+# this driver binds to the SAME herdr surface as the default — so `HERD_DRIVER=grok herd render`
+# resolves the binding table with NO missing-binding crash and NO leftover {{token}}. The
+# DRIVER_AGENT_* exec block below is data the P2–P4 routing (Brian's queue) consumes; nothing renders
+# it yet. Proof: tests/test-grok-driver.sh.
+#
+# FLAGS ARE RESEARCHED, NOT GUESSED. Every grok flag below is from the Grok Build CLI headless
+# reference (docs.x.ai/build/cli/headless-scripting): interactive `grok`; `-p,--single <PROMPT>`
+# ("send one prompt"); `-m,--model <MODEL>`; `--output-format {plain|json|streaming-json}`;
+# `--always-approve` ("auto-approve tool executions"); session flags `-s,--session-id <ID>`,
+# `-r,--resume <ID>`, `-c,--continue`; and the `/model` TUI command.
+
+# ── MUX capabilities (herdr) — IDENTICAL to herdr-claude: this driver swaps the RUNTIME, not the
+#    multiplexer, so every herdr incantation below is byte-for-byte the default's. ──────────────────
+DRIVER_LIST_AGENTS='herdr agent list'
+DRIVER_FOCUS_AGENT='herdr agent focus <slug>'
+DRIVER_SEND_TEXT='herdr pane run <agent-pane> "<text>"'
+DRIVER_SWITCH_MODEL='herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"'
+
+# ── MUX capabilities the LANE SCRIPTS + watcher exercise (bound so the driver covers the FULL
+#    mux surface, not just the four the skill names inline). Same herdr surface as the default. ─────
+DRIVER_START_AGENT='bash {{SCRIPTS_DIR}}/herd-feature.sh <slug> "<task>"'
+DRIVER_CREATE_TAB='herdr tab create --workspace <ws>'
+DRIVER_READ_PANE='herdr pane read <pane>'
+DRIVER_SEND_KEYS='herdr pane send-keys <pane> <keys>'
+
+# ── Agent-runtime EXEC bindings (HERD-150 P1 capability table, rebound for Grok Build) ────────────
+# Each key is Grok Build's real incantation for its capability class — the grok counterpart of the
+# exact `claude …` strings herdr-claude.driver carries. Same contract: command SHAPES, zero-secret.
+#
+# ABSENT-BINDING DEGRADATION CONTRACT. A capability the runtime does NOT expose as a stable,
+# verifiable contract (Grok's usage-limit banner text; the exact session token-usage JSON schema + a
+# grok-model→USD price table) is bound to an explicit `@degrade:<reason>` sentinel rather than a
+# GUESSED value. The sentinel is deliberately fail-safe on every consumer: as a regex it can never
+# match real runtime output (so limit-detection simply never false-fires and falls through to the
+# runtime-independent hook-sentinel + resume backstop — see docs/driver-abstraction.md § limit-
+# detection); as a space-separated key list it names no real JSON field (so a usage sum finds nothing
+# and cost.sh surfaces it as `unpriced`/zero, its documented graceful degrade). It is always non-empty
+# so no consumer crashes under `set -u`, and self-documents WHY the capability degraded. This is the
+# honest alternative to inventing a rate-limit regex or a token schema the runtime never promised.
+
+# interactive-spawn — open a Grok TUI seeded with the task prompt; --always-approve = hands-off tools.
+DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve "<prompt>"'
+# one-shot-exec — headless, prints and exits. `-p,--single` is Grok Build's `claude -p` analog.
+DRIVER_AGENT_ONESHOT_EXEC='grok -p "<prompt>" --model <model> --always-approve'
+# resume — continue the most recent session in the cwd with full context. Grok analog of
+# `claude --continue` (`-r,--resume <ID>` / `-s,--session-id <ID>` target a specific session).
+DRIVER_AGENT_RESUME='grok --continue --always-approve "<prompt>"'
+# model-switch — the `/model <model>` TUI slash command, delivered via the mux DRIVER_SEND_TEXT
+# (same shape as Claude Code — both TUIs expose `/model`).
+DRIVER_AGENT_MODEL_SWITCH='/model <model>'
+# permission-mode flag — Grok's auto-approve-tool-executions flag, the analog of Claude's
+# `--dangerously-skip-permissions`: a hands-off builder in an isolated worktree. Overridable via
+# HERD_CLAUDE_FLAGS.
+DRIVER_AGENT_PERMISSION_FLAG='--always-approve'
+# limit-detection — DEGRADED: no verified Grok usage-limit banner (`/usage` shows credit balance in
+# the TUI, not a scrapeable banner). Fail-safe: never matches → falls through to the hook sentinel.
+DRIVER_AGENT_LIMIT_PATTERN='@degrade:no-verified-grok-usage-limit-banner'
+# session-identity — Grok Build stores headless sessions under ~/.grok/sessions (keyed by
+# --session-id), rebindable via $HERD_TRANSCRIPT_ROOT. Real Grok equivalent of ~/.claude/projects.
+DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.grok/sessions}/<session-id>'
+# cost/telemetry parse — DEGRADED: Grok's session token-usage JSON keys + a grok-model→USD price
+# table are not a verifiable stable contract here. Fail-safe: names no real field → cost.sh sums
+# nothing and marks the model `unpriced` rather than reporting a fabricated $0.
+DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-grok-usage-token-schema'

@@ -139,11 +139,13 @@ COORDINATOR_CMD="/coordinator"
 
 # driver — the runtime-specific control surface (multiplexer + agent runtime) the coordinator skill
 # is bound to. Selects templates/drivers/<name>.driver, whose DRIVER_* incantations are substituted
-# into the rendered coordinator skill. Two drivers ship:
+# into the rendered coordinator skill. Four drivers ship:
 #   herdr-claude (default) — herdr multiplexer + Claude Code; renders the skill functionally
 #     identical to before the driver abstraction (the byte-identical default).
 #   headless — NO herdr panes: agents run detached, panes become a VIEW not a dependency, and the
 #     watcher / journal / notifications / limit detection run headless (Windows / CI / headless Linux).
+#   codex — herdr mux + OpenAI Codex CLI runtime (the DRIVER_AGENT_* exec surface rebound to `codex`).
+#   grok  — herdr mux + xAI Grok Build CLI runtime (the DRIVER_AGENT_* exec surface rebound to `grok`).
 # An unknown value fails `herd render` loudly, listing the available drivers.
 HERD_DRIVER="herdr-claude"
 
