@@ -84,6 +84,7 @@ EXPECTED = (
   "torn_down", "final_clean",
   "main_health_dormant", "main_health_green", "main_health_red", "main_health_recovery",
   "main_health_notify_sink", "main_health_nonheavy_red",
+  "cross_seat_block_held", "cross_seat_block_no_bless", "cross_seat_block_resolved",
   "push_gate_held_no_push", "push_gate_listed", "push_gate_resumed", "push_gate_stale_refused",
   "pipeline_steps_held", "pipeline_steps_listed", "pipeline_steps_released", "pipeline_steps_order",
   "pipeline_steps_block", "pipeline_steps_off", "pipeline_steps_merge_resume", "pipeline_steps_two_approve",

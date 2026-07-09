@@ -476,6 +476,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "cross-seat BLOCK precedence: a foreign BLOCK outranks this seat's PASS (HERD-247)" {
+  run bash "$REPO/tests/test-cross-seat-block.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS test-cross-seat-block.sh"* ]]
+}
+
 @test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {
   run bash "$REPO/scripts/herd/sim/retirement-invariant-sim.sh"
   [ "$status" -eq 0 ]
