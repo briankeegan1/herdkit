@@ -141,4 +141,22 @@ rm -f "$INBOX_LEDGER" "$INBOX_SEEN_STATE"
 SCRIBE_BACKEND=file SCRIBE_BACKEND_DIR="$HERE/../scripts/herd/backends" _inbox_scan '[]'
 [ ! -s "$INBOX_LEDGER" ] || fail "a backend without the op must yield an empty tracker feed"; pass
 
+# ── 8. Unresolved owner: the PR self-feed is SKIPPED so the seat's OWN comments never surface (HERD-212)
+# When the seat identity cannot be resolved ($owner empty), self-exclusion by login is a no-op — so a
+# naive scan would flood the inbox with the seat's own comments. An unresolved owner must yield ZERO
+# self-authored comments (in fact zero PR-feed rows), not all of them.
+OPERATOR_INBOX=on
+rm -f "$INBOX_LEDGER" "$INBOX_SEEN_STATE"; : > "$NOTIFY_LOG"
+_inbox_fetch_pr_comments() { printf '%s' "$FIX"; }   # FIX still contains a self-authored comment (c2)
+# Force an UNRESOLVED identity: mark the owner memo resolved-to-empty so _resolve_watcher_owner is a
+# no-op and $owner is "" (no gh probe, no WATCHER_OWNER fallback).
+_WATCHER_OWNER_CACHE=""; _WATCHER_OWNER_RESOLVED=1
+SAVED_OWNER="${WATCHER_OWNER:-}"; unset WATCHER_OWNER
+_inbox_scan '[{"number":11}]'
+[ ! -s "$INBOX_LEDGER" ] || fail "unresolved-owner scan must record NO PR comments: [$(cat "$INBOX_LEDGER" 2>/dev/null)]"; pass
+grep -q "me-operator" "$INBOX_LEDGER" 2>/dev/null && fail "unresolved-owner scan must never surface the seat's OWN comments"; pass
+[ ! -s "$NOTIFY_LOG" ] || fail "unresolved-owner scan must not notify for self-authored comments"; pass
+# Restore the pinned identity so any later assertions see a resolved owner.
+export WATCHER_OWNER="$SAVED_OWNER"; _WATCHER_OWNER_CACHE="$SAVED_OWNER"; _WATCHER_OWNER_RESOLVED=1
+
 echo "PASS ($PASS assertions) — tests/test-operator-inbox.sh"
