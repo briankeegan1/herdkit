@@ -274,6 +274,8 @@ herd log [--pr N] [--tail]   # page the journal: one line per gate event; --tail
 herd why <pr#>               # summarize one PR's full gate history — the first post-mortem tool
 herd status                  # one-shot read-only health snapshot for THIS project (no LLM)
 herd cost [--pr N]           # per-builder + review token/$ accounting; cost-per-merged-PR
+herd changelog generate      # journal-driven CHANGELOG.md [Unreleased] (deterministic, no LLM)
+herd changelog tag <ver>     # promote [Unreleased] + local git tag (see docs/releasing.md)
 herd link list               # list peer repos registered in .herd/links
 
 # Manage several herd projects at once — deterministic, no-LLM fan-out (see below):

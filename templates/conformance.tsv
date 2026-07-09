@@ -75,6 +75,7 @@ herd status	unit	tests/test-status.sh
 herd sweep	unit	tests/test-sweep.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
 herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
+herd changelog [generate|tag <ver>]	unit	tests/test-changelog.sh
 herd backlog	unit	tests/test-cli-backlog.sh
 herd backend switch	unit	tests/test-cli-backend-switch.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
@@ -137,6 +138,7 @@ agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
 agent-watch.sh	unit	tests/test-watcher-singleton.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
+agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh
@@ -229,6 +231,9 @@ STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
+MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
+GATE_STATUS	sim	tests/test-sandbox-multiseat.sh
+WATCHER_SCOPE	sim	tests/test-sandbox-multiseat.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-reconcile.sh

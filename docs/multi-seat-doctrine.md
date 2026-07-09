@@ -65,10 +65,23 @@ next tick regardless of who caused it; under Rule 2 a violation is impossible to
 expensive to discover. Treat merge-performer-dependent behavior and per-surface duplicate checks as
 **correctness defects**, not as cleanups.
 
+## The program pattern — the doctrine's work-organization arm
+
+The two rules above keep *the engine* seat-independent; the **program pattern** keeps *the work* seat-
+independent, and it is the same argument one layer up. A multi-item effort is filed as an **epic** (goal,
+phases, child list) whose long-form evidence is a **committed doc**, and every child carries a one-line
+backlink to both. The alternative — the effort's shape living in the coordinator seat that conceived it,
+and its evidence living in that seat's transcript — is a side effect of one seat, exactly what Rule 1
+forbids: a second seat picking up a child cannot see the goal, cannot read the audit that grounded it,
+and re-derives (or contradicts) the sequencing. Committing the evidence and slotting every child into the
+epic is the reconciled-invariant form of project context: any seat, at any tick, reads the repo and the
+tracker and knows the whole program. See the *Programs* section of
+[`COORDINATOR-SOP.md`](COORDINATOR-SOP.md) and check 8 of the authoring SOP.
+
 ## Where this is enforced
 
 - **Authoring** — coordinator skill, *Authoring a backlog item* SOP, check 7 (MULTI-SEAT /
-  INVARIANCE). Source: `templates/coordinator.md.tmpl` (`herd render` renders it).
+  INVARIANCE) and check 8 (PROGRAM). Source: `templates/coordinator.md.tmpl` (`herd render` renders it).
 - **Review** — `.herd/review-checklist.md` (the `REVIEW_CHECKLIST` key in `.herd/config`), injected
   into the adversarial pre-merge review gate `herd-review.sh`.
 - **Operations** — see [`COORDINATOR-SOP.md`](COORDINATOR-SOP.md) for the seat/watcher roles this
