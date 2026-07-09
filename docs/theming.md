@@ -1,8 +1,8 @@
 # Theming herd surfaces (`HERD_THEME`)
 
-Every color-emitting herd surface — the `herd watch` console, the backlog and task-spec viewers, and
-the `herd` CLI (`status` / `fleet` / `cost` / `why`, plus `herd-approve.sh list`) — is themed by a
-single config key:
+Every color-emitting herd surface — the herd-watch status console (`herd pane watch`), the backlog and
+task-spec viewers, and the `herd` CLI (`status` / `fleet` / `cost` / `why`, plus `herd-approve.sh list`)
+— is themed by a single config key:
 
 ```sh
 HERD_THEME="tokyonight"   # .herd/config — default; the shipped built-in
@@ -23,7 +23,7 @@ A theme is a **directory** holding two files:
 `palette.sh` defines two groups:
 
 - **`C_*`** — the truecolor console palette (`C_RESET C_BOLD C_BLUE C_CYAN C_GREEN C_YELLOW C_RED
-  C_DIM`), used by the `herd watch` status console (a live pane, so 24-bit truecolor).
+  C_DIM`), used by the herd-watch status console (a live pane, so 24-bit truecolor).
 - **`C_CLI_*`** *(optional)* — a 16-color palette (`C_CLI_BOLD C_CLI_DIM C_CLI_GREEN C_CLI_YELLOW
   C_CLI_RED C_CLI_RESET`) for the plain CLI surfaces, which stay readable on basic terminals. If a
   theme omits these, the CLI falls back to the theme's `C_*` truecolor values — so a theme that sets
