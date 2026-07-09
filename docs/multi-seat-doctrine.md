@@ -73,5 +73,6 @@ expensive to discover. Treat merge-performer-dependent behavior and per-surface 
   into the adversarial pre-merge review gate `herd-review.sh`.
 - **Operations** — see [`COORDINATOR-SOP.md`](COORDINATOR-SOP.md) for the seat/watcher roles this
   doctrine constrains, and [`codemap.md`](codemap.md) for the module map.
+- **Evidence** — incident evidence + hardening program: [`docs/audits/2026-07-09-gating-hardening.md`](audits/2026-07-09-gating-hardening.md).
 
 Tracked as HERD-219.
