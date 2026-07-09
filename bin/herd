@@ -5164,6 +5164,148 @@ if FULL:
 '
 }
 
+# cmd_stats — the SHEPHERD'S DIGEST CARD (HERD-146): a compact, DETERMINISTIC (zero-LLM) rollup of a
+# window of the engine journal. Same reader pattern as cmd_cost: resolve the journal via the shared
+# config loader, scan the live journal + rotated archives, aggregate in python. Counts the herd's
+# throughput and friction over a window: PRs merged (a 🐑 each), review verdicts (with provenance),
+# refix bounces, limit park/resume, reaps, and recorded cost. Fail-soft: an empty or missing journal
+# prints an all-zeros card, never an error. No filter = all time; --today / --since <date> restrict by
+# the ISO ts; --pr N restricts to one PR. Filters compose (AND).
+cmd_stats() {
+  local pr="" since="" today=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --today)   today=1; shift ;;
+      --since)   since="${2:-}"; [ -n "$since" ] || die "--since requires a date (YYYY-MM-DD)"; shift 2 ;;
+      --since=*) since="${1#--since=}"; [ -n "$since" ] || die "--since requires a date (YYYY-MM-DD)"; shift ;;
+      --pr)      pr="${2:-}"; [ -n "$pr" ] || die "--pr requires a PR number"; shift 2 ;;
+      --pr=*)    pr="${1#--pr=}"; shift ;;
+      *) die "usage: herd stats [--today|--since <date>|--pr N]" ;;
+    esac
+  done
+  case "$pr" in \#*) pr="${pr#\#}" ;; esac
+  [ -z "$pr" ] || [ -z "${pr//[0-9]/}" ] || die "herd stats: --pr must be a number (got '$pr')"
+  # --today is sugar for --since <today, UTC>; compute the day here so python only sees one ISO bound.
+  local day=""
+  if [ "$today" -eq 1 ]; then
+    day="$(date -u +%Y-%m-%d 2>/dev/null || true)"
+  fi
+  _journal_load_config
+  if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
+  local files; files="$(_journal_all_files)"
+  # NOTE: never early-return on a missing journal — an empty scan must still render a zeros card.
+  printf '%s\n' "$files" | HERD_STATS_PR="$pr" HERD_STATS_SINCE="$since" HERD_STATS_DAY="$day" \
+    PYTHONIOENCODING=utf-8 python3 -c '
+import sys, os, json
+want_pr    = os.environ.get("HERD_STATS_PR", "")
+want_since = os.environ.get("HERD_STATS_SINCE", "")
+want_day   = os.environ.get("HERD_STATS_DAY", "")
+
+rows = []
+for path in sys.stdin.read().split("\n"):
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            rows.append(o)
+
+def keep(o):
+    if want_pr and str(o.get("pr", "")) != want_pr:
+        return False
+    ts = str(o.get("ts", ""))
+    # ISO-8601 UTC sorts lexically, so a plain string compare is a correct date bound.
+    if want_day and not ts.startswith(want_day):
+        return False
+    if want_since and ts < want_since:
+        return False
+    return True
+
+rows = [o for o in rows if keep(o)]
+
+def fnum(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+merges = 0
+verdicts_by_value = {}      # APPROVE / BLOCK / ...
+verdicts_by_source = {}     # reviewer / gate_default / infra / ...
+refix_bounces = 0
+limit_parks = 0
+limit_resumes = 0
+reaps = 0
+cost_usd = 0.0
+cost_events = 0
+for o in rows:
+    ev = o.get("event")
+    if ev == "merge":
+        merges += 1
+    elif ev == "verdict_recorded":
+        val = str(o.get("value", "?")) or "?"
+        src = str(o.get("source", "reviewer")) or "reviewer"
+        verdicts_by_value[val]  = verdicts_by_value.get(val, 0) + 1
+        verdicts_by_source[src] = verdicts_by_source.get(src, 0) + 1
+    elif ev == "refix_bounce":
+        refix_bounces += 1
+    elif ev == "limit_detected":
+        limit_parks += 1
+    elif ev == "limit_resume_result":
+        limit_resumes += 1
+    elif ev == "reap":
+        reaps += 1
+    elif ev == "cost":
+        cost_usd += fnum(o.get("usd"))
+        cost_events += 1
+
+# Scope line — describe the window the card covers.
+if want_pr:
+    scope = "PR #%s" % want_pr
+elif want_day:
+    scope = "today (%s UTC)" % want_day
+elif want_since:
+    scope = "since %s" % want_since
+else:
+    scope = "all time"
+# --pr may also carry a time bound; note it so the header is never misleading.
+if want_pr and (want_day or want_since):
+    scope += " · since %s" % (want_day or want_since)
+
+def kv(d):
+    # stable order: highest count first, then name — deterministic for tests.
+    if not d:
+        return "none"
+    return " · ".join("%s %d" % (k, d[k]) for k in sorted(d, key=lambda k: (-d[k], k)))
+
+sheep = "\U0001F411" * min(merges, 20)
+
+print("\U0001F411 Shepherd’s digest — %s" % scope)
+print("")
+print("  Merged PRs         %-4d %s" % (merges, sheep))
+print("  Review verdicts    %-4d %s" % (sum(verdicts_by_value.values()), kv(verdicts_by_value)))
+print("    by provenance         %s" % kv(verdicts_by_source))
+print("  Refix bounces      %d" % refix_bounces)
+print("  Limit park/resume  %d / %d" % (limit_parks, limit_resumes))
+print("  Reaps              %d" % reaps)
+print("  Cost recorded      $%.4f (%d event%s)" % (cost_usd, cost_events, "" if cost_events == 1 else "s"))
+if not rows:
+    print("")
+    print("  (no journal events in scope — all zeros)")
+'
+}
+
 # ── cmd_fleet — the DETERMINISTIC (no-LLM) multi-project fan-out (P0 of the fleet-coordinator EPIC) ──
 # A parent orchestration layer above the per-project coordinators: a flat project REGISTRY plus a
 # read-mostly rollup (`status`) and bulk delegation of the existing per-project `herd update`/`herd
@@ -5321,6 +5463,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       transcripts and appends their token/USD + a complete session
                                       total (the default view stays merge-gated + unchanged).
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
+  herd stats [--today|--since <date>|--pr N]
+                                      a shepherd's digest CARD: a compact, deterministic (no-LLM)
+                                      rollup of a journal window — PRs merged (a 🐑 each), review
+                                      verdicts (with provenance), refix bounces, limit park/resume,
+                                      reaps, and recorded cost. No filter = all time; --today /
+                                      --since <date> bound by the ISO ts; --pr N scopes to one PR.
+                                      Fail-soft: an empty/missing journal prints an all-zeros card
   herd backlog                        list open work items via the active backend
               [--rich]                TSV with workflow state + description (backends that
                                       support it; others fall back to the plain list)
@@ -5399,6 +5548,7 @@ case "${1:-help}" in
   status)  shift; cmd_status "$@" ;;
   why)     shift; cmd_why "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
+  stats)   shift; cmd_stats "$@" ;;
   update)  shift; cmd_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
   backend) shift; cmd_backend "$@" ;;
