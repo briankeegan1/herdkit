@@ -22,6 +22,7 @@ Role summarized from each file's top-of-file comment.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
+- `ci-repair.sh` — CI auto-repair for INHERITED reds (HERD-250).
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
 - `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
 - `console-section.sh` — THE shared bounded-console-section helper (HERD-243).
@@ -107,7 +108,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
+- `agent-watch.sh` → `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -170,6 +171,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
+- `CI_AUTOREPAIR` → `ci-repair.sh`
 - `CLAIM_REQUIRED` → `bin/herd`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
