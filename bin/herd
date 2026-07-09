@@ -1366,6 +1366,32 @@ cmd_codemap() { bash "$SCRIPTS_DIR/codemap.sh" "$@"; }
 # `herd symbol-index --check` is a read-only staleness probe (0 fresh / non-zero stale), like codemap.
 cmd_symbol_index() { bash "$SCRIPTS_DIR/symbol-index.sh" "$@"; }
 
+# ── herd map: render the operator-facing control-room map (docs/control-room-map.md) ─────────────
+# The one-page DECISION GRAPH of how a change ships end-to-end: coordinator → lanes (feature/quick)
+# → builder worktree → watcher gates (healthcheck + review) → verdict branches (PASS/BLOCK/refix) →
+# merge policy → post-merge reconcile, PLUS bug routing (APP vs HERD-ENGINE), the async lanes
+# (scribe/research), and the safety rails. The FLOW complement to `herd codemap` (the FILE map,
+# docs/codemap.md) and docs/driver-abstraction.md (the ONE runtime seam). Distinct from codemap —
+# codemap regenerates a scanned artifact; this just RENDERS the committed, hand-authored doc.
+# Read-only + fail-soft: renders with glow (themed) when available, else cat; a broken/absent glow
+# or theme degrades to plain text, never a crash.
+cmd_map() {
+  local doc="$HERDKIT_HOME/docs/control-room-map.md"
+  [ -f "$doc" ] || die "control-room map not found at $doc — is this the herdkit engine repo?"
+  if command -v glow >/dev/null 2>&1; then
+    local style; style="$(herd_theme_glow_style 2>/dev/null || true)"
+    if [ -n "$style" ] && [ -f "$style" ]; then
+      glow -s "$style" "$doc" && return 0
+    else
+      glow "$doc" && return 0
+    fi
+    # glow is present but the render failed (e.g. a terminal-capability probe) — fall through to a
+    # plain cat rather than showing nothing. Warn once so the degradation is visible, never fatal.
+    warn "glow could not render the control-room map — showing plain text"
+  fi
+  cat "$doc"
+}
+
 # ── herd ledger: the coordinator progress ledger read/write surface (HERD-103) ───────────────────
 # Durable, cross-session coordinator state (per work-item: slug/worktree/PR, sequencing, planned
 # markers) keyed by tracker id, so a coordinator or a second operator RESUMES with an accurate
@@ -5238,6 +5264,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd symbol-index [--check]         regenerate docs/symbol-index.md: a deterministic function-level
                                         def→caller index of the engine tree (who-defines / who-calls);
                                         --check probes staleness read-only (0 fresh / non-zero stale)
+  herd map                            render docs/control-room-map.md: the one-page operator DECISION
+                                        GRAPH of how a change ships (coordinator → lanes → builder →
+                                        watcher gates → verdicts → merge policy → reconcile; bug
+                                        routing; async lanes; safety rails). glow if available, else cat
   herd ledger <set|get|list|rm|compact|path>  coordinator PROGRESS LEDGER — durable, cross-session
                                       per-work-item state (slug/worktree/PR, sequencing, planned
                                       markers) keyed by tracker id, so you resume with an accurate
@@ -5388,6 +5418,7 @@ case "${1:-help}" in
   render)  shift; cmd_render "$@" ;;
   codemap) shift; cmd_codemap "$@" ;;
   symbol-index) shift; cmd_symbol_index "$@" ;;
+  map)     shift; cmd_map "$@" ;;
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;

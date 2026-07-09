@@ -56,6 +56,7 @@ herd upgrade	unit	tests/test-cli.sh
 herd upgrade	unit	tests/test-upgrade-migrations.sh
 herd upgrade	unit	tests/test-upgrade-config-adoption.sh
 herd render	unit	tests/test-cli.sh
+herd map	unit	tests/test-map.sh
 herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
