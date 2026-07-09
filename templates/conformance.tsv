@@ -67,6 +67,7 @@ herd log [--pr N] [--tail]	unit	tests/test-journal.sh
 herd why <pr#>	unit	tests/test-journal.sh
 herd status	unit	tests/test-status.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
+herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
 herd backlog	unit	tests/test-cli-backlog.sh
 herd backend switch	unit	tests/test-cli-backend-switch.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
