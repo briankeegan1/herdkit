@@ -2860,6 +2860,39 @@ for a in agents:
 ' 2>/dev/null || true
 }
 
+# _resolve_verdict_recorded <pr#> — true iff the resolver wrote a terminal verdict (DONE | ESCALATE)
+# for ANY sha of this PR. _resolve_result needs the sha the caller happens to hold; the idle-guard
+# only needs "did this resolver finish a round", so it globs the sha-scoped files instead. A written
+# verdict is the resolver's own last act: its round is OVER and the session is idle for real, never
+# parked mid-work.
+_resolve_verdict_recorded() {
+  local _rvr_pr="${1:-}" _rvr_f
+  [ -n "$_rvr_pr" ] || return 1
+  for _rvr_f in "${TREES:-.}"/.resolve-result-"$_rvr_pr"-*; do
+    [ -f "$_rvr_f" ] && return 0
+  done
+  return 1
+}
+
+# _resolver_limit_parked <slug> — true iff the resolve·<slug> session is parked on the ACCOUNT USAGE
+# LIMIT, awaiting auto-resume. Reads the SAME park state the builder refix paths read — the
+# .herd-limit-sentinel the rate_limit hook writes into the worktree (via _detect_limit_hit, which also
+# carries the banner-scrape fallback), plus the park handler's own ledger (limit_state = scheduled).
+# The resolver runs IN the feature worktree (herd-resolve.sh resolves in place), so its sentinel and
+# ledger row live exactly where the builder's do. No new state, no new config key.
+#
+# Fail-soft to PARKED: an unreadable/garbled sentinel still means a limit hit was recorded, and
+# holding the dispatch slot is the conservative side — a held slot re-dispatches on a later tick,
+# a reaped session is gone for good.
+_resolver_limit_parked() {
+  local _rlp_slug="$1" _rlp_wt
+  if [ -n "${LIMIT_STATE:-}" ] && [ "$(limit_state "$_rlp_slug" 2>/dev/null || printf '')" = "scheduled" ]; then
+    return 0
+  fi
+  _rlp_wt="${WORKTREES_DIR:-${TREES:-.}}/$_rlp_slug"
+  _detect_limit_hit "$_rlp_slug" "$_rlp_wt" >/dev/null 2>&1
+}
+
 # _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is ACTIVELY RESOLVING (or may
 # still be starting / invisible), so a (re)dispatch must HOLD: a second resolver on the same worktree
 # would race the first on `git merge`/`git push`. This is the SINGLE guard that prevents a
@@ -2874,6 +2907,14 @@ for a in agents:
 # agent_status idle|done frees the slot (past the startup grace — a fresh agent can blip idle before
 # picking up its task). The spawn path reaps the idle agent so the name can be reclaimed. WORKING
 # still holds; STARTING / UNKNOWN still hold.
+#
+# HERD-246: a USAGE-LIMIT-PARKED Claude session reports agent_status idle|done — indistinguishable
+# from a finished round, and a park legitimately outlasts any startup grace. Freeing the slot there
+# hands the pane to _reap_idle_resolver_for_redispatch, which kills the session and defeats
+# limit-park auto-resume (the engine's core capability). So idle|done past the grace ALSO consults
+# the park state: PARKED with no terminal verdict written ⇒ HOLD, exactly as pre-HERD-225 (the resume
+# scheduler owns that session). No park state, or a verdict already written ⇒ free + reap, as
+# HERD-225 intends. When nothing is parked this is byte-identical to HERD-225.
 _resolver_in_flight() {
   local _rif_slug="$1" _rif_pr="${2:-}" _rif_v _rif_st
   _rif_v="$(_resolver_liveness_verdict "$_rif_slug" "$_rif_pr")"
@@ -2885,6 +2926,10 @@ _resolver_in_flight() {
         # Finished its round — free for re-dispatch. Still hold inside the startup grace so a
         # just-spawned agent that blips idle cannot be double-dispatched over.
         _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
+        # …unless this "idle" is a usage-limit park awaiting auto-resume (HERD-246).
+        if ! _resolve_verdict_recorded "$_rif_pr" && _resolver_limit_parked "$_rif_slug"; then
+          return 0
+        fi
         return 1
         ;;
     esac
