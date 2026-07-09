@@ -87,6 +87,7 @@ APP_SURFACE_GLOB=""                 # optional; egrep of diff paths that are the
 INTERACTION_TEST_CMD=""             # optional; drives an input + asserts the dependent output changed (0 clean/1 code/2 data-env); e.g. a UI test harness that sets a value, re-runs, and asserts the output moved
 APP_PREVIEW_CMD=""                  # optional; omit → no preview pane (quick-only project)
 SMOKE_CMD=""                        # optional; an extra smoke gate used by the resolver
+BASELINE_AWARE_GATE="on"            # on (default) → a heavy code error whose failing tests ALL already fail on the base (origin/main) is INHERITED (a tolerated ⚠️), not merge-blocking, so a fix-PR never deadlocks on a base failure it did not introduce; byte-identical when the base is green, fully fail-soft. off → classic absolute pass/fail gate
 
 # app-preview knobs — all optional; the defaults below reproduce today's web-app behavior EXACTLY,
 # so leave them unset unless your preview is a non-web-framework command. Consumed by app-monitor.sh
