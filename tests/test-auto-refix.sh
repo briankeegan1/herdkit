@@ -225,6 +225,26 @@ _handle_block_verdict "40" "slug-d" "sha-d2" "0"    # new sha → should bounce
   || fail "refix-once: new sha for same PR should trigger a fresh bounce"
 ok
 
+# ── (6b) LOST ESCALATION on the REVIEW row (HERD-173): a bounce that never woke the builder must keep
+# escalating. The refix record is written BEFORE delivery, so the record alone is not proof anyone is
+# fixing: tick 1 said "auto-refix failed", and tick 2 used to overwrite it with "awaiting push" forever.
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"
+export STUB_AGENT_NAME="slug-stuck" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-S-1"
+printf '1\n1\n' > "$STUB_WAIT_FILE"      # neither wake attempt succeeds
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+_handle_block_verdict "60" "slug-stuck" "sha-s1" "0"
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q "auto-refix failed" \
+  || fail "(6b) tick 1 must escalate a failed wake (got: ${DISPLAY[0]:-})"
+runs_before="$(wc -l < "$PANE_LOG")"
+DISPLAY=(); _handle_block_verdict "60" "slug-stuck" "sha-s1" "0"     # tick 2 — the sha has not changed
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q "fix in progress" \
+  && fail "(6b) tick 2 must NOT claim a fix is in flight (got: ${DISPLAY[0]:-})"
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" \
+  || fail "(6b) tick 2 must keep saying 'needs you' (got: ${DISPLAY[0]:-})"
+[ "$(wc -l < "$PANE_LOG")" -eq "$runs_before" ] \
+  || fail "(6b) the once-guard must still block a re-bounce on tick 2"
+ok
+
 # ── (7) round cap: after REFIX_MAX_ROUNDS bounces, next → "refix limit reached" ─
 rm -f "$REFIX_STATE"; : > "$PANE_LOG"
 export STUB_AGENT_NAME="slug-e" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-E-111"

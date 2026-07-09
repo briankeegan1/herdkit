@@ -173,6 +173,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
+- `HEALTHCHECK_AUTOFIX` → `agent-watch.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
