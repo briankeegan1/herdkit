@@ -379,6 +379,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic doc-drift check (HERD-168 / HERD-96) test passes" {
+  run bash "$REPO/tests/test-doc-drift.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher-flair pack (HERD-147) unit test passes" {
   run bash "$REPO/tests/test-watcher-flair.sh"
   [ "$status" -eq 0 ]

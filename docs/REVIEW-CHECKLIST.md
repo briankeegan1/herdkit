@@ -204,7 +204,7 @@ except requests.RequestException as e:
     return None
 ```
 
-Then requeue the PR: `herd requeue <pr#>`.
+Then requeue the PR via the coordinator (spawn a refix builder / push a fix commit) — there is no dedicated requeue subcommand; a new push re-triggers the watcher gates.
 
 ### "REVIEW: BLOCK — Diff is too large, difficult to assess"
 
