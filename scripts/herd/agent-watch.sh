@@ -3176,13 +3176,23 @@ do_merge() {
   # through the existing machinery — no new state, and the merge stays at-most-once. $dsha is empty only
   # for a legacy caller that threaded no sha; there we fall back to the unpinned merge (byte-identical to
   # before this change) rather than refuse a merge we cannot pin.
+  #
+  # HERD-221: gh pr merge can exit non-zero AFTER a successful merge — most commonly when
+  # DELETE_BRANCH_ON_MERGE=true and the local branch delete fails (branch still checked out in its
+  # worktree). Treating ANY non-zero as "sha moved" skipped every post-merge hook while the PR was
+  # already MERGED. On non-zero, re-check the PR's actual state: MERGED → treat as success and run
+  # ALL post-merge hooks; only a NOT-merged PR is a real refusal that returns 1 and skips hooks.
   if [ -n "$dsha" ]; then
     if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) --match-head-commit "$dsha" >/dev/null 2>&1; then
-      journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
-      return 1
+      if [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" != "MERGED" ]; then
+        journal_append merge_refused_sha_moved pr "$dp" slug "$ds" sha "$dsha"
+        return 1
+      fi
     fi
   else
-    gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1 || return 1
+    if ! gh pr merge "$dp" "$(_merge_method_flag)" $(_delete_branch_flag) >/dev/null 2>&1; then
+      [ "$(gh pr view "$dp" --json state,mergedAt -q '.state' 2>/dev/null)" = "MERGED" ] || return 1
+    fi
   fi
   # HERD-92: capture the tracker ref so "recently landed" can render "<ref> <slug>" like the healed
   # section. Prefer the cheap per-worktree marker (no network); fall back to the merged PR's 'Refs:'
