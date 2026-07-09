@@ -131,6 +131,8 @@ governance-drift-sweep.sh	unit	tests/test-governance-drift.sh
 agent-watch.sh	unit	tests/test-human-verify-hold.sh
 agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
+agent-watch.sh	unit	tests/test-watcher-singleton.sh
+agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
