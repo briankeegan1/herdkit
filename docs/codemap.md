@@ -167,6 +167,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
 - `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `status.sh`, `sweep.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `agent-watch.sh`
+- `DELTA_REVIEW` → `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
 - `DEP_POLL_MAX` → `dep-watcher.sh`
 - `DEP_POLL_MIN` → `dep-watcher.sh`
