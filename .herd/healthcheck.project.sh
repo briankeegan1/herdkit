@@ -348,6 +348,21 @@ if [ -n "$_hk_dh_dir" ]; then
 fi
 dh_note="daemon-hermeticity: clean"
 
+# ── HERD-223 JOURNAL HERMETICITY (shared TEST layer) ─────────────────────────────────────────────
+# A hermetic test that journals (via journal_append) and forgets to export JOURNAL_FILE used to
+# append FIXTURE events into the LIVE $WORKTREES_DIR/.herd/journal.jsonl — the committed .herd/config
+# pins WORKTREES_DIR to the main checkout's pool, so a worktree-run suite polluted herd why/log/
+# stats. Pin JOURNAL_FILE to a throwaway path for the WHOLE suite (and set HERD_JOURNAL_HERMETIC so
+# the journal.sh fail-safe still redirects if a child unsets it). Complements the engine guard in
+# scripts/herd/journal.sh; kept in lockstep with tests/test-journal-hermeticity.sh. INERT if a tmp
+# dir can't be made (the journal.sh guard still fires on HERMETIC_TEST / HERD_HERMETIC_GUARD alone).
+_hk_jh_dir="$(mktemp -d 2>/dev/null || echo '')"
+_hk_jh_file=""
+if [ -n "$_hk_jh_dir" ]; then
+  _hk_jh_file="$_hk_jh_dir/journal.jsonl"
+  : > "$_hk_jh_file"
+fi
+
 _hk_dh_verdict() {
   # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
   # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
@@ -361,18 +376,21 @@ _hk_dh_verdict() {
       echo "   and never deliver a desktop notification — install scripts/herd/sim/sim-notify-stub.sh)"
       sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
     fi
-    rm -rf "$_hk_dh_dir"
+    rm -rf "$_hk_dh_dir" "$_hk_jh_dir"
     exit 1
   fi
   [ -n "$_hk_dh_dir" ] && rm -rf "$_hk_dh_dir"
+  [ -n "$_hk_jh_dir" ] && rm -rf "$_hk_jh_dir"
 }
 
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
-  # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189): run bats under BOTH guards.
+  # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189) + JOURNAL HERMETICITY (HERD-223):
   # HERD-189: the live agent-spawn surface (herdr/claude/codex) is shadowed by the tripwire stubs
   # prepended to PATH ($_hk_dh_pp) and HERD_HERMETIC_GUARD arms agent-watch.sh's choke point, so any test
   # that reaches the live control room / spawns a real daemon RECORDS a leak (a HARD fail via _hk_dh_verdict).
+  # HERD-223: JOURNAL_FILE + HERD_JOURNAL_HERMETIC pin every fixture journal_append away from the live
+  # project journal (see scripts/herd/journal.sh + scripts/herd/journal-test-env.sh).
   # HERD-185: a test that prompts for input or reads /dev/tty used to hang the WHOLE suite forever headless
   # (the watcher's async health worker has no controlling terminal — exactly how a prompt stalls a slot),
   # so `</dev/null` fails a stdin prompt fast, BATS_TEST_TIMEOUT names a per-test wedge, and an OUTER
@@ -381,10 +399,14 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
   BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
   if command -v timeout >/dev/null 2>&1; then
-    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   else
-    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   fi
   _hk_bats_rc=$?
@@ -419,7 +441,11 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then
   fails=0
-  for t in tests/test-*.sh; do PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" bash "$t" >/dev/null 2>&1 || fails=$((fails+1)); done
+  for t in tests/test-*.sh; do
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" \
+      JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
+      bash "$t" >/dev/null 2>&1 || fails=$((fails+1))
+  done
   _hk_dh_verdict
   if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"

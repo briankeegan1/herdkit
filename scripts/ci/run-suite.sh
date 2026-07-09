@@ -48,6 +48,17 @@ PER_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-120}"
 # clean in ~70s with no leaked daemons. Harmless where herdr IS present (nothing to leak).
 export HERD_RELOAD_SKIP_LAUNCH="${HERD_RELOAD_SKIP_LAUNCH:-1}"
 
+# HERD-223 JOURNAL HERMETICITY (shared TEST layer): pin JOURNAL_FILE to a throwaway path so a
+# fixture that journals cannot append to a live project journal (mirrors the dogfood healthcheck
+# sandbox + scripts/herd/journal-test-env.sh). HERD_JOURNAL_HERMETIC keeps the journal.sh fail-safe
+# armed even if a child unsets JOURNAL_FILE. A test that needs its own journal re-exports JOURNAL_FILE.
+_hk_ci_jh_dir="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/herd-ci-jherm-$$")"
+mkdir -p "$_hk_ci_jh_dir" 2>/dev/null || true
+export JOURNAL_FILE="${JOURNAL_FILE:-$_hk_ci_jh_dir/journal.jsonl}"
+: >> "$JOURNAL_FILE" 2>/dev/null || true
+export HERD_JOURNAL_HERMETIC=1
+trap 'rm -rf "$_hk_ci_jh_dir"' EXIT
+
 # ── platform detection (overridable so tests are deterministic) ──────────────────
 detect_platform() {
   if [ -n "${HERD_CI_PLATFORM:-}" ]; then printf '%s\n' "$HERD_CI_PLATFORM"; return; fi
@@ -124,7 +135,8 @@ for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
   # shellcheck disable=SC2086
-  $TO bash "$t" </dev/null >"$log" 2>&1
+  # HERMETIC_TEST names the fixture for journal.sh's fail-safe (and any other test-context guards).
+  HERMETIC_TEST="$name" $TO bash "$t" </dev/null >"$log" 2>&1
   rc=$?
   if [ "$rc" -eq 0 ]; then
     pass=$((pass+1)); continue
