@@ -193,6 +193,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver idle re-dispatch (HERD-225) test passes" {
+  run bash "$REPO/tests/test-resolver-idle-redispatch.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic tab-leak-guard deflake (HERD-93) test passes" {
   run bash "$REPO/tests/test-tab-leak-deflake.sh"
   [ "$status" -eq 0 ]
@@ -307,6 +313,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic knob-aware operating doctrine (HERD-216) test passes" {
+  run bash "$REPO/tests/test-knob-aware-doctrine.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
   run bash "$REPO/tests/test-agent-liveness.sh"
   [ "$status" -eq 0 ]
@@ -405,6 +417,12 @@ setup() {
 
 @test "hermetic stale-base autofix (HERD-199) unit test passes" {
   run bash "$REPO/tests/test-stale-base-autofix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic gate order: stale-dup decides before review/health dispatch (HERD-227) test passes" {
+  run bash "$REPO/tests/test-gate-order-stale-dup.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

@@ -2871,14 +2871,90 @@ _resolver_liveness_verdict() {
   printf 'UNKNOWN'
 }
 
-# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING, so
-# a (re)dispatch must HOLD: a second resolver on the same worktree would race the first on
-# `git merge`/`git push`. This is the SINGLE guard that prevents a double-dispatch, and it is now the
-# exact complement of a POSITIVELY-dead verdict: ALIVE, STARTING and UNKNOWN all hold; only DEAD frees
-# the slot. Both the same-sha (dead-resolver) and new-commit respawn paths consult it, so a respawn
-# only ever fires once the prior resolver is PROVABLY gone — never merely unseen.
+# _resolver_agent_status <slug> — agent_status word for resolve·<slug> from the tick's $AGENTS_JSON
+# roster (empty when absent/unreadable). Identity match tolerates either `name` or `agent` (same
+# breadth as _resolver_roster_listed). Reads the tick snapshot, never a live herdr call — hermetic
+# under test and consistent with every other resolver oracle on this path.
+_resolver_agent_status() {
+  [ -n "${AGENTS_JSON:-}" ] || { printf ''; return 0; }
+  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+import sys, json, os
+name = os.environ["NAME"]
+try:
+  agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+except Exception:
+  agents = []
+for a in agents:
+  if a.get("name") == name or a.get("agent") == name:
+    print(a.get("agent_status", "") or "", end="")
+    raise SystemExit(0)
+' 2>/dev/null || true
+}
+
+# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is ACTIVELY RESOLVING (or may
+# still be starting / invisible), so a (re)dispatch must HOLD: a second resolver on the same worktree
+# would race the first on `git merge`/`git push`. This is the SINGLE guard that prevents a
+# double-dispatch.
+#
+# HERD-206: ALIVE / STARTING / UNKNOWN all hold; only DEAD frees the slot — never spawn over something
+# we cannot positively prove is free (a blipped roster is not death).
+#
+# HERD-225: an IDLE/DONE-but-ALIVE resolver has FINISHED its round (pushed or escalated) yet the
+# agent pane stays up. Holding forever on mere ALIVE left NEW conflicts stranded — the watcher could
+# neither re-dispatch (guard held) nor rely on the idle agent (it is not working). So ALIVE +
+# agent_status idle|done frees the slot (past the startup grace — a fresh agent can blip idle before
+# picking up its task). The spawn path reaps the idle agent so the name can be reclaimed. WORKING
+# still holds; STARTING / UNKNOWN still hold.
 _resolver_in_flight() {
-  [ "$(_resolver_liveness_verdict "$1" "${2:-}")" != "DEAD" ]
+  local _rif_slug="$1" _rif_pr="${2:-}" _rif_v _rif_st
+  _rif_v="$(_resolver_liveness_verdict "$_rif_slug" "$_rif_pr")"
+  [ "$_rif_v" = "DEAD" ] && return 1
+  if [ "$_rif_v" = "ALIVE" ]; then
+    _rif_st="$(_resolver_agent_status "$_rif_slug")"
+    case "$_rif_st" in
+      idle|done)
+        # Finished its round — free for re-dispatch. Still hold inside the startup grace so a
+        # just-spawned agent that blips idle cannot be double-dispatched over.
+        _resolver_grace_active "$_rif_slug" "$_rif_pr" && return 0
+        return 1
+        ;;
+    esac
+  fi
+  return 0
+}
+
+# _reap_idle_resolver_for_redispatch <slug> — HERD-225: before a (re)spawn, close any IDLE/DONE-but-
+# alive resolve·<slug> tab so herd-resolve.sh can claim the agent name. Without this, re-dispatch
+# fails with "agent name already used" (confirmed live on PR #328). WORKING resolvers are never
+# touched (the in-flight guard holds them). Fail-soft: missing tab / missing herdr / dry-run → no-op.
+_reap_idle_resolver_for_redispatch() {
+  local _rir_slug="$1" _rir_status _rir_reg _rir_tab _rir_adir _rir_pid
+  _rir_status="$(_resolver_agent_status "$_rir_slug")"
+  case "$_rir_status" in
+    idle|done) ;;
+    *) return 0 ;;
+  esac
+  [ -z "${DRYRUN:-}" ] || return 0
+  _rir_reg="${TREES:-${WORKTREES_DIR:-.}}/.herd-tabs"
+  if [ -f "$_rir_reg" ]; then
+    _rir_tab="$(awk -v s="resolve·${_rir_slug}" '$1==s {print $2; exit}' "$_rir_reg" 2>/dev/null || true)"
+    if [ -n "$_rir_tab" ]; then
+      herdr tab close "$_rir_tab" >/dev/null 2>&1 || true
+      journal_append reap_resolve_tab tab_id "$_rir_tab" slug "$_rir_slug" reason idle-redispatch
+      _herd_tabs_drop_row "$_rir_reg" "$_rir_tab"
+    fi
+  fi
+  # Headless registry: free the slot so the next launch owns a clean pid/status file (herdr tab
+  # close is a no-op under HERD_DRIVER=headless). Best-effort kill of a still-live detached pid.
+  _rir_adir="${WORKTREES_DIR:-${TREES:-.}}/.herd/agents/resolve·${_rir_slug}"
+  if [ -d "$_rir_adir" ]; then
+    _rir_pid="$(cat "$_rir_adir/pid" 2>/dev/null || true)"
+    if [ -n "$_rir_pid" ] && kill -0 "$_rir_pid" 2>/dev/null; then
+      kill "$_rir_pid" 2>/dev/null || true
+    fi
+    rm -rf "$_rir_adir" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
@@ -2893,10 +2969,15 @@ _resolver_in_flight() {
 # actually observed alive afterwards, so a spawn that never ACKed is auditable rather than inferred from
 # a silence. Behavior is unchanged (still best-effort, still never fails a tick): the record already
 # landed, the grace still runs, and the next tick's POSITIVE-death verdict re-dispatches within budget.
+#
+# IDLE-REDISPATCH (HERD-225): when the prior resolve·<slug> agent is still ALIVE but idle/done, reap
+# it first so the lane can reclaim the agent name (otherwise herdr refuses with "agent name already
+# used" and the new conflict sits forever).
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   local _sr_rc=0 _sr_ack _sr_roster
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
+  _reap_idle_resolver_for_redispatch "$rs"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
   # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
@@ -4577,6 +4658,57 @@ _wait_agent_working() {
   return 1
 }
 
+# ── SUITE/WORKTREE WRITE INTERLOCK (HERD-227) ─────────────────────────────────────────────────────
+# `_health_worker` runs the ~9-min healthcheck suite INSIDE the PR's worktree. Every refix rail MUTATES
+# that same worktree: the stale-base bounce types `git merge <base>` into the builder's pane, its
+# resolver fallback spawns an agent that merges in the tree, and the review/health bounces re-task the
+# builder to edit files and re-run. Two writers, one worktree.
+#
+# Until HERD-227 nothing collided, but only by ACCIDENT: the stale-dup gate sat AFTER `_healthcheck_gate`,
+# and a RUNNING suite short-circuits the whole action pass (`_HC_RESULT=RUNNING` → `continue`), so no rail
+# was reachable while a suite was live. Hoisting the gate ahead of the healthcheck removed that interlock
+# for the stale-base rail: a hold arriving mid-suite would re-task the builder to merge the base UNDER the
+# running suite. The head sha does not move until the builder pushes, so `record_health_result` then
+# sha-caches a POISONED verdict — a false CODEERROR red from a half-merged tree, or (worse) a false CLEAN
+# blessing a tree that sha never had.
+#
+# So the interlock is now EXPLICIT, and shared by every rail rather than re-derived per rail (R2: one
+# deterministic check at every enforcement surface). Note what does NOT defer: the gate's DECISION still
+# runs first, so a held sha still dispatches no review and no suite. Only the MUTATION waits.
+#
+# _suite_inflight_key <pr#> — print the key of a LIVE health suite for this PR, else nothing (rc 1).
+# ANY sha counts: a suite dispatched for an earlier sha is still writing in the same worktree, and the
+# live marker is what proves a worker holds it. Fail-soft — an absent/dead marker reads as "no suite".
+_suite_inflight_key() {
+  local _sik_pr="$1" _sik_f
+  [ -n "$_sik_pr" ] || return 1
+  # The glob is anchored on "<pr>-" so PR 9 never matches PR 90's marker; a no-match glob stays literal
+  # and fails the -f test.
+  for _sik_f in "$TREES"/.health-inflight-"$_sik_pr"-*; do
+    { [ -f "$_sik_f" ] && _health_pid_live "$_sik_f"; } || continue
+    printf '%s' "${_sik_f##*/.health-inflight-}"
+    return 0
+  done
+  return 1
+}
+
+# _defer_for_suite <pr#> <slug> <sha> <display-idx> <kind> <row-label>
+# Returns 0 → a live suite holds this PR's worktree: the honest deferred row is set and the defer is
+# journaled; THE CALLER MUST NOT MUTATE (and must not burn its once-guard or a refix round — the heal
+# fires normally on the first tick after the suite collects). Returns 1 → no suite in flight, proceed.
+_defer_for_suite() {
+  local _dfs_pr="$1" _dfs_slug="$2" _dfs_sha="$3" _dfs_idx="$4" _dfs_kind="$5" _dfs_label="$6"
+  local _dfs_key _dfs_sl _dfs_pn _dfs_age
+  _dfs_key="$(_suite_inflight_key "$_dfs_pr")" || return 1
+  _dfs_sl="$(_slug_cell "$_dfs_slug")"
+  _dfs_pn=" ${C_DIM}#${_dfs_pr}${C_RESET} ·"
+  _dfs_age="$(_fmt_age "$(_marker_age "$(_health_inflight_file "$_dfs_key")")" 2>/dev/null || printf '?')"
+  DISPLAY[_dfs_idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${_dfs_sl}${C_RESET}${_dfs_pn} ${C_YELLOW}${_dfs_label} · waiting for suite (health-check running ${_dfs_age})${C_RESET}"
+  journal_append refix_deferred_suite pr "$_dfs_pr" sha "$_dfs_sha" slug "$_dfs_slug" \
+    kind "$_dfs_kind" suite_key "$_dfs_key"
+  return 0
+}
+
 # _handle_block_verdict <pr#> <slug> <headSha> <display-idx>
 # Called when the review verdict for a PR is BLOCK (from the ledger or a fresh gate step). If
 # REVIEW_AUTOFIX=true, attempts to bounce the builder agent; otherwise shows the standard message.
@@ -4664,6 +4796,12 @@ _handle_block_verdict() {
             "PR #${_hbv_pr} review-blocked but the builder's session is dead (unwakeable) — re-task by hand" default
         fi
       fi
+    elif _defer_for_suite "$_hbv_pr" "$_hbv_slug" "$_hbv_sha" "$_hbv_idx" review "review blocked"; then
+      # SUITE WRITE INTERLOCK (HERD-227). Reachable under GATE_DISPATCH=parallel, where a review verdict
+      # can land while this PR's suite is still running in the worktree; the serial default cannot get
+      # here (a RUNNING suite short-circuits the pass first). Row + journal handled by _defer_for_suite;
+      # once-guard NOT burned, no refix round spent.
+      :
     else
       local _hbv_round_num
       _hbv_round_num="$((_hbv_rounds + 1))"
@@ -4867,6 +5005,15 @@ _handle_stale_dup() {
     fi
     return 0
   fi
+  # SUITE WRITE INTERLOCK (HERD-227): a live healthcheck suite is running INSIDE this worktree. Both
+  # heals below mutate it — the bounce types `git merge` into the builder's pane, the resolver fallback
+  # merges in the tree directly. Either one under a running suite gives two writers one worktree, and
+  # since the head sha cannot move until the builder pushes, the suite's verdict gets sha-cached against
+  # a tree that sha never had. Defer: honest row, once-guard NOT burned, no refix round spent; the heal
+  # fires on the first tick after the suite collects. Guards BOTH mutation paths at once (they are the
+  # only code below this point) — see _defer_for_suite.
+  _defer_for_suite "$_hsd_pr" "$_hsd_slug" "$_hsd_sha" "$_hsd_idx" stale "stale base" && return 0
+
   # WORKING-AGENT GUARD (review round-7): an actively-working builder is invisible to the pane lookup
   # BY DESIGN (never double-drive a live session) — without this check it reads as "no builder" and a
   # resolver gets spawned INTO the live worktree (two agents, one directory, merge over WIP). If the
@@ -4987,6 +5134,70 @@ Why: ${_hsd_reason}"
     agent_status_after "${_hsd_after:-unknown}" woke "$_hsd_woke" escalated "$_hsd_escalated"
 }
 
+# _stale_dup_gate_step <pr#> <slug> <worktree-dir> <headSha> <branch> <display-idx>
+# The whole PRE-MERGE STALE / DUPLICATE gate (HERD-188 + HERD-199) as ONE callable step: evaluate,
+# and on a proven hold fire the once-per-sha comment/notify/journal, run the autofix/needs-you row,
+# and re-render. Returns 0 → PROCEED, 1 → HOLD (caller `continue`s; it must dispatch NOTHING).
+#
+# WHY IT IS A FUNCTION (HERD-227 — gate ORDER). This gate used to sit inline at the very END of the
+# action pass: after the parallel review pre-dispatch and after the heavy healthcheck had to run to
+# completion. Both are expensive (an Opus review; a ~9-min suite) and both are DOOMED the instant the
+# gate holds, because a stale-base hold bounces the builder and supersedes the sha. Journal proof, PR
+# #328 on 2026-07-09: healthcheck_started 14:23:57 → CLEAN 14:26:22 → stale_dup_hold 14:26:24 →
+# bounce → the in-flight review BLOCKed at 14:29:57 on a sha nothing would ever merge. The decision
+# is deterministic (a duplicate ref, or a pure-git merge-base file overlap), so it belongs FIRST.
+# Extracting it here lets the action pass call it before any dispatch, and again (only) if the
+# pre-merge re-verify turns up a newer head sha.
+#
+# This is an ORDERING change only: the gate, its holds, its autofix and its sha-keying are unchanged.
+# It does NOT cancel work already in flight for a superseded sha (that is HERD-235's structural scope).
+#
+# FAIL-SOFT, twice over: stale_dup_check itself never holds without proof, and a nonzero return that
+# somehow carries no _STALE_DUP_KIND is treated as an evaluation error → PROCEED (today's order).
+# DRY-RUN is a strict no-op here — the pre-HERD-227 pass `continue`d before ever reaching the gate,
+# so evaluating it under dry-run would newly post PR comments. An EMPTY sha also PROCEEDs (nothing to
+# prove against), mirroring the old inline `[ -n "$rsha" ]` predicate; the pre-merge caller keeps that
+# same guard, so an empty head sha still lands on the `awaiting head sha for review…` row below.
+#
+# CALLED TWICE per candidate, on purpose. The top-of-pass call is a CHEAPENING pass: it skips the
+# review + suite for an already-doomed sha. The pre-merge call is the SAFETY RAIL: a stale-base
+# clearance is keyed on (head sha, base tip), and another seat's merge can advance the base tip while
+# our suite runs — so the merge decision must be re-established from current state, unconditionally.
+_stale_dup_gate_step() {
+  local _sdg_pr="$1" _sdg_slug="$2" _sdg_dir="$3" _sdg_sha="$4" _sdg_branch="$5" _sdg_idx="$6"
+  [ -n "$_sdg_sha" ] || return 0
+  [ -z "${DRYRUN:-}" ] || return 0
+  stale_dup_check "$_sdg_pr" "$_sdg_slug" "$_sdg_dir" "$_sdg_sha" "$DEFAULT_BRANCH" && return 0
+  [ -n "${_STALE_DUP_KIND:-}" ] || return 0
+
+  # The console row re-renders every tick from this live re-check; the PR comment / notify / journal
+  # of the HOLD fire once per sha (stale_dup_held_noted). NEVER auto-merges.
+  if ! stale_dup_held_noted "$_sdg_pr" "$_sdg_sha"; then
+    record_stale_dup_held "$_sdg_pr" "$_sdg_sha" "$_STALE_DUP_KIND"
+    journal_append stale_dup_hold pr "$_sdg_pr" sha "$_sdg_sha" slug "$_sdg_slug" \
+      kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
+    if [ "$_STALE_DUP_KIND" = "stale-base" ] && _stale_base_autofix_enabled; then
+      gh pr comment "$_sdg_pr" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
+
+**Why:** ${_STALE_DUP_REASON}
+
+This is a mechanical base-stale hold (touched files moved on \`${DEFAULT_BRANCH}\`). The watcher is auto-bouncing the builder to \`git merge ${DEFAULT_BRANCH}\` (or dispatching the conflict resolver if no live builder remains). Only bounce-budget exhaustion escalates to a human. (Disable the heal with \`STALE_BASE_AUTOFIX=off\`; disable the gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
+      herd_driver_notify "🔁 PR #${_sdg_pr} stale-base — auto-healing" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
+    else
+      gh pr comment "$_sdg_pr" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
+
+**Why:** ${_STALE_DUP_REASON}
+
+This PR appears to re-implement already-shipped work, or sits on a base stale enough that merging it would silently clobber newer \`${DEFAULT_BRANCH}\`. A human must resolve it: rebase onto \`${DEFAULT_BRANCH}\` and confirm the change is still needed, or close it as a duplicate. (Disable this gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
+      herd_driver_notify "🛑 PR #${_sdg_pr} held — stale/duplicate" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
+    fi
+  fi
+  _handle_stale_dup "$_sdg_pr" "$_sdg_slug" "$_sdg_sha" "$_sdg_idx" "$_sdg_dir" "$_sdg_branch" \
+    "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
+  render
+  return 1
+}
+
 # _health_needs_you_row <slug-cell> <pr-cell> <pr#> <sha> <detail> — the honest red row for a health
 # CODE ERROR that NOBODY is working: the BLOCKER (which test failed) plus the REMEDY (what to do, and
 # where to read the whole suite). Two lines, mirroring the review-blocked row's continuation line.
@@ -5085,6 +5296,12 @@ _handle_health_codeerror() {
     fi
     return 0
   fi
+
+  # SUITE WRITE INTERLOCK (HERD-227). This PR's OWN suite has necessarily collected (that is what produced
+  # the CODEERROR), but a suite dispatched for an EARLIER sha can still be running in the same worktree,
+  # and the corpse sweep only reaps it on timeout. Consult the same shared check every rail uses rather
+  # than reason locally about which shas can overlap. Once-guard NOT burned; the bounce fires next tick.
+  _defer_for_suite "$_hhc_pr" "$_hhc_slug" "$_hhc_sha" "$_hhc_idx" health "health-check failed" && return 0
 
   # BOUNCE. Record BEFORE sending so the once-guard holds even if pane lookup or delivery fails.
   local _hhc_round_num; _hhc_round_num="$((_hhc_rounds + 1))"
@@ -8023,6 +8240,20 @@ EOF
     # represents a missing REQUIRED check as "Expected / waiting", so a pending write buys nothing.
     # Only the terminal success/failure are ever posted (below).
 
+    # GATE ORDER (HERD-227): the stale/duplicate gate decides FIRST — before the parallel review
+    # pre-dispatch and before the healthcheck. It is deterministic (a duplicate tracker ref, or a
+    # pure-git merge-base file overlap) and its hold is TERMINAL for this sha: the stale-base autofix
+    # bounces the builder, superseding the very sha a review/suite would be grading. Running it last
+    # burned one ~9-min heavy suite plus one Opus review per stale cycle (PR #328, 2026-07-09). On a
+    # hold we dispatch NOTHING expensive for this sha; the hold row, comment and STALE_BASE_AUTOFIX
+    # bounce proceed exactly as before. Proceeding is byte-quiet — no events, no side effects — so a
+    # fresh-base PR's dispatch order is unchanged. Keyed on $candsha (this tick's head, free). This is a
+    # CHEAPENING pass, not the safety rail: the base tip can advance under us while the suite runs, so
+    # the merge decision still rests on the unconditional re-evaluation just before do_merge below.
+    if ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx"; then
+      continue
+    fi
+
     # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
     # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap
     # instead of running serially (review only after health lands). Byte-inert under the default serial
@@ -8101,38 +8332,26 @@ print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), 
       fi
     fi
 
-    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188 + HERD-199). BEFORE the (expensive) review + the merge:
-    # refuse to auto-merge a PR that re-implements already-shipped work (DUPLICATE) or sits on a base so
-    # stale that a clean merge would silently clobber newer main (STALE-BASE — the #236 → revert-#280
-    # incident). Provable-only + fail-soft: off (STALE_DUP_DETECT=off), no item ref, an offline gh, or a
-    # bad worktree → proceed exactly as before. Placed ahead of the review gate so a provable duplicate
-    # never wastes an Opus review. The console row re-renders every tick from this live re-check; the PR
-    # comment/notify/journal of the HOLD fire once per sha (stale_dup_held_noted). NEVER auto-merges.
-    # HERD-199: STALE-BASE is mechanical — when STALE_BASE_AUTOFIX=on the hold path auto-bounces the
-    # builder (or dispatches the conflict resolver when there is no live builder) via the shared refix
-    # rails; only bounce-exhaustion escalates to needs-you. DUPLICATE stays a human judgment call.
-    if [ -n "$rsha" ] && ! stale_dup_check "$prnum" "$slug" "$dir" "$rsha" "$DEFAULT_BRANCH"; then
-      if ! stale_dup_held_noted "$prnum" "$rsha"; then
-        record_stale_dup_held "$prnum" "$rsha" "$_STALE_DUP_KIND"
-        journal_append stale_dup_hold pr "$prnum" sha "$rsha" slug "$slug" kind "$_STALE_DUP_KIND" reason "$_STALE_DUP_REASON"
-        if [ "$_STALE_DUP_KIND" = "stale-base" ] && _stale_base_autofix_enabled && [ -z "${DRYRUN:-}" ]; then
-          gh pr comment "$prnum" --body "🔁 **herd watch** · **stale-base auto-heal** — this PR will **NOT** auto-merge until it absorbs \`${DEFAULT_BRANCH}\`.
-
-**Why:** ${_STALE_DUP_REASON}
-
-This is a mechanical base-stale hold (touched files moved on \`${DEFAULT_BRANCH}\`). The watcher is auto-bouncing the builder to \`git merge ${DEFAULT_BRANCH}\` (or dispatching the conflict resolver if no live builder remains). Only bounce-budget exhaustion escalates to a human. (Disable the heal with \`STALE_BASE_AUTOFIX=off\`; disable the gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
-          herd_driver_notify "🔁 PR #${prnum} stale-base — auto-healing" "${slug}: ${_STALE_DUP_REASON}" default
-        else
-          gh pr comment "$prnum" --body "🛑 **herd watch** · **stale-duplicate hold** (\`${_STALE_DUP_KIND}\`) — this PR will **NOT** auto-merge.
-
-**Why:** ${_STALE_DUP_REASON}
-
-This PR appears to re-implement already-shipped work, or sits on a base stale enough that merging it would silently clobber newer \`${DEFAULT_BRANCH}\`. A human must resolve it: rebase onto \`${DEFAULT_BRANCH}\` and confirm the change is still needed, or close it as a duplicate. (Disable this gate with \`STALE_DUP_DETECT=off\`.)" >/dev/null 2>&1 || true
-          herd_driver_notify "🛑 PR #${prnum} held — stale/duplicate" "${slug}: ${_STALE_DUP_REASON}" default
-        fi
-      fi
-      _handle_stale_dup "$prnum" "$slug" "$rsha" "$idx" "$dir" "$branch" "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
-      render
+    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188 + HERD-199), re-evaluated in the instant before the
+    # merge — exactly where it ran before HERD-227, and for exactly the same reason.
+    #
+    # WHY THIS IS NOT REDUNDANT with the top-of-pass call. A stale-base clearance is a function of TWO
+    # inputs: the head sha AND the base tip (stale_dup_base_overlap compares `merge-base $base $head`
+    # against `rev-parse $base`). Only the head sha belongs to this PR. Between the top-of-pass gate and
+    # do_merge below, this pass waits out the review pre-dispatch, a full healthcheck suite, and the
+    # review verdict — minutes during which ANOTHER SEAT's watcher can merge and ff-pull $DEFAULT_BRANCH
+    # (a LOCAL ref, shared across every worktree via one common .git). Our head sha never moves, so a
+    # sha-keyed skip would merge on a clearance computed against a base tip that no longer exists — the
+    # clean-but-behind merge that silently clobbers newer main (#236 → revert #280). Nothing downstream
+    # re-catches it: a behind branch is still MERGEABLE/CLEAN in the default unprotected config.
+    #
+    # The invariant is therefore "no merge without a clearance against the CURRENT base", not "…against
+    # this sha" — and it must be re-established from observed state, never inferred from what THIS seat
+    # did (multi-seat doctrine R1). So: always re-run, unconditionally. Cost is one stale_dup_check per
+    # merge-ready candidate per tick, identical to the pre-HERD-227 code, which paid it at this very
+    # spot. HERD-227's win is the EARLY evaluation above, which skips the doomed review + suite — not a
+    # skipped re-check here.
+    if [ -n "$rsha" ] && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then
       continue
     fi
 
@@ -8344,6 +8563,14 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     # spawn_resolver, so this read still sees only prior ticks' attempts.
     _retry_reason="resolving conflict…"
     resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
+    # SUITE WRITE INTERLOCK (HERD-227): the resolver merges the base INSIDE this worktree. A PR that was
+    # CLEAN last tick (suite dispatched) and CONFLICTING this one still has that suite running here — the
+    # marker outlives the mergeability flip. Defer the spawn; nothing is recorded, so the resolver
+    # dispatches normally on the first tick after the suite collects.
+    if [ -z "$DRYRUN" ] && _defer_for_suite "$prnum" "$slug" "$csha" "$idx" resolver "conflict"; then
+      render
+      continue
+    fi
     if [ -n "$DRYRUN" ]; then
       if [ "$creason" = "first" ]; then
         DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"

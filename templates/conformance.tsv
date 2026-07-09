@@ -220,6 +220,8 @@ INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
+STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh
 CODEMAP_AUTOREFRESH	unit	tests/test-codemap-autorefresh.sh
@@ -258,7 +260,7 @@ HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
 HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
 HERD_LIMIT_UNKNOWN_WAIT	none-yet	unit: no test references HERD_LIMIT_UNKNOWN_WAIT or asserts the unparseable-reset blind-resume wait
 COORDINATOR_WATCHDOG	unit	tests/test-coordinator-watchdog.sh
-COORDINATOR_AUTONOMY	none-yet	render: coordinator template respects COORDINATOR_AUTONOMY posture (human|gated|full) — no test yet asserts the rendered conditional text
+COORDINATOR_AUTONOMY	unit	tests/test-knob-aware-doctrine.sh
 DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh
 scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
 TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh
