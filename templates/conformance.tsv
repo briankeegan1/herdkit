@@ -241,6 +241,7 @@ scripts/herd/task-spec-view.sh	unit	tests/test-task-spec-pane.sh
 HERD_THEME	unit	tests/test-theme.sh
 scripts/herd/theme.sh	unit	tests/test-theme.sh
 .herd/themes	unit	tests/test-theme.sh
+herd theme <list|preview|set>	unit	tests/test-theme-cmd.sh
 CLAIM_REQUIRED	unit	tests/test-claim.sh
 TRACKED_SPAWNS	unit	tests/test-tracked-spawns.sh
 herd-claim.sh	unit	tests/test-claim.sh

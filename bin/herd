@@ -5387,6 +5387,125 @@ EOF
   esac
 }
 
+# ── herd theme (HERD-145): the operator PICKER over the pluggable-theming seam (scripts/herd/theme.sh)
+# A thin, deterministic surface — it never re-implements resolution, it drives the same dirs theme.sh
+# reads and the same validated `herd config set` path an operator would use by hand:
+#   list                 the catalog — every engine BUILT-IN (templates/themes/) + every USER theme
+#                        (.herd/themes/), the ACTIVE one (current HERD_THEME) marked.
+#   preview [<name>]     render <name>'s palette as color swatches (default: the active theme).
+#   set <name>           validate <name> resolves to a COMPLETE theme dir, then write HERD_THEME via
+#                        `herd config set` (manifest validation + the watcher restart that repaints
+#                        every live surface). Refuses an unknown/incomplete theme rather than
+#                        persisting a value that would silently fall back to tokyonight at render time.
+# Fail-soft + NO_COLOR-aware throughout: swatches come from the theme's own C_* via
+# herd_theme_load_console, which blanks every color under NO_COLOR / a non-TTY stdout (plain output).
+
+# _theme_builtins_dir / _theme_user_dir — the two catalog roots, mirroring theme.sh's search order.
+_theme_builtins_dir() { printf '%s' "$TEMPLATES_DIR/themes"; }
+_theme_user_dir()     { printf '%s' "$(pwd)/.herd/themes"; }
+
+# _theme_dir_ok <dir> — true when <dir> is a COMPLETE theme (both files present). Mirrors theme.sh's
+# _herd_theme_dir_ok, so `list`/`preview`/`set` agree with the resolver on what counts as a theme.
+_theme_dir_ok() { [ -n "${1:-}" ] && [ -f "$1/palette.sh" ] && [ -f "$1/glow.json" ]; }
+
+# _theme_active — the persistent active theme name: the per-user overlay (.herd/config.local) value
+# wins over the committed baseline (.herd/config), matching load-time precedence; empty/unset →
+# tokyonight (the shipped default). Read-only; no sourcing, so it never triggers config side effects.
+_theme_active() {
+  local root cfg local_cfg v=""; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$local_cfg" ] && v="$(_config_file_value "$local_cfg" HERD_THEME)"
+  [ -z "$v" ] && [ -f "$cfg" ] && v="$(_config_file_value "$cfg" HERD_THEME)"
+  printf '%s' "${v:-tokyonight}"
+}
+
+# _theme_list — the catalog. Built-ins first, then user themes; the active theme is marked. A user
+# theme that shadows a built-in of the same name (theme.sh resolves user first) is noted as such.
+_theme_list() {
+  local bdir udir active; bdir="$(_theme_builtins_dir)"; udir="$(_theme_user_dir)"; active="$(_theme_active)"
+  local d name mark tag
+  say "${c_bold}Themes${c_rst} ${c_dim}(active: ${active} — set with 'herd theme set <name>')${c_rst}"
+  say ""
+  say "${c_bold}built-in${c_rst} ${c_dim}${bdir}${c_rst}"
+  if [ -d "$bdir" ]; then
+    for d in "$bdir"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      mark="  "; [ "$name" = "$active" ] && mark="${c_grn}●${c_rst} "
+      tag=""; _theme_dir_ok "$d" || tag=" ${c_yel}(incomplete — missing palette.sh or glow.json)${c_rst}"
+      _theme_dir_ok "$udir/$name" && tag="$tag ${c_dim}(overridden by a user theme)${c_rst}"
+      printf '  %s%s%s\n' "$mark" "$name" "$tag"
+    done
+  fi
+  say ""
+  say "${c_bold}user${c_rst} ${c_dim}${udir}${c_rst}"
+  if [ -d "$udir" ] && [ -n "$(ls -A "$udir" 2>/dev/null)" ]; then
+    for d in "$udir"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      mark="  "; [ "$name" = "$active" ] && mark="${c_grn}●${c_rst} "
+      tag=""; _theme_dir_ok "$d" || tag=" ${c_yel}(incomplete — missing palette.sh or glow.json)${c_rst}"
+      printf '  %s%s%s\n' "$mark" "$name" "$tag"
+    done
+  else
+    printf '  %s(none — drop palette.sh + glow.json into .herd/themes/<name>/ to add one)%s\n' "$c_dim" "$c_rst"
+  fi
+}
+
+# _theme_swatch <color-escape> <label> — one swatch row (a colored block + its label). Under
+# NO_COLOR / non-TTY the escape and reset are blank, so it degrades to a plain "     label" row.
+_theme_swatch() { printf '  %s██████%s  %s\n' "${1:-}" "${C_RESET:-}" "$2"; }
+
+# _theme_preview [<name>] — render a theme's palette swatches (default: the active theme). Fail-soft:
+# refuses a name that resolves to no complete dir. Loads the palette by pointing the resolver at the
+# theme (HERD_THEME=<name>) in a subshell, so it never disturbs the caller's palette; the swatches go
+# plain automatically under NO_COLOR / a non-TTY stdout.
+_theme_preview() {
+  local name="${1:-}"; [ -n "$name" ] || name="$(_theme_active)"
+  local udir bdir dir="" src=""
+  udir="$(_theme_user_dir)/$name"; bdir="$(_theme_builtins_dir)/$name"
+  if   _theme_dir_ok "$udir"; then dir="$udir"; src="user"
+  elif _theme_dir_ok "$bdir"; then dir="$bdir"; src="built-in"
+  else die "no theme '$name' — run 'herd theme list' to see available themes"
+  fi
+  (
+    export HERD_THEME="$name" PROJECT_ROOT="$(pwd)"
+    herd_theme_load_console
+    say "${c_bold}${name}${c_rst} ${c_dim}(${src} · ${dir})${c_rst}"
+    _theme_swatch "$C_BLUE"   "blue    (headings, links)"
+    _theme_swatch "$C_CYAN"   "cyan    (accents)"
+    _theme_swatch "$C_GREEN"  "green   (ok / building)"
+    _theme_swatch "$C_YELLOW" "yellow  (warnings)"
+    _theme_swatch "$C_RED"    "red     (errors / dead)"
+    _theme_swatch "$C_DIM"    "dim     (secondary text)"
+  )
+}
+
+# _theme_set <name> — the VALIDATED switch. Refuse an unknown/incomplete theme up front (the whole
+# point of `set` is not to persist a value that silently falls back), then route the write through
+# `herd config set` so it inherits manifest validation + the watcher restart (HERD_THEME is
+# watcher-affecting). config set is idempotent, so re-setting the active theme is a clean no-op.
+_theme_set() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: herd theme set <name>"
+  local udir bdir; udir="$(_theme_user_dir)/$name"; bdir="$(_theme_builtins_dir)/$name"
+  if ! _theme_dir_ok "$udir" && ! _theme_dir_ok "$bdir"; then
+    die "no theme '$name' (needs palette.sh + glow.json under .herd/themes/$name/ or a built-in) — run 'herd theme list'"
+  fi
+  cmd_config_set HERD_THEME "$name"
+}
+
+# cmd_theme — dispatch for `herd theme <list|preview|set>`.
+cmd_theme() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    list)         _theme_list "$@" ;;
+    preview)      _theme_preview "$@" ;;
+    set)          _theme_set "$@" ;;
+    ""|-h|--help) say "usage: herd theme list | preview [<name>] | set <name>" ;;
+    *)            die "unknown 'herd theme' subcommand '$sub' — usage: herd theme list | preview [<name>] | set <name>" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
@@ -5439,6 +5558,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd theme <list|preview|set>       pick the active color THEME (HERD_THEME) across every herd
+                                        list             the catalog: built-in themes (templates/
+                                                      themes/) + user themes (.herd/themes/), active marked
+                                        preview [<name>] render a theme's palette as color swatches
+                                                      (default: the active theme)
+                                        set <name>    switch the active theme via the validated
+                                                      'herd config set HERD_THEME' (restarts the watcher
+                                                      so every live surface repaints); refuses an unknown
+                                                      theme. NO_COLOR / non-TTY renders plain
   herd conformance <report|run>       the capability CONFORMANCE MATRIX — join capabilities.tsv against
                                         the committed proof map templates/conformance.tsv:
                                         report [--json]  DETERMINISTIC, no-LLM: every capability with NO
@@ -5571,6 +5699,7 @@ case "${1:-help}" in
   ledger)  shift; cmd_ledger "$@" ;;
   advise)  shift; cmd_advise "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
   governance) shift; cmd_governance "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
