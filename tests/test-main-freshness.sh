@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# test-main-freshness.sh — hermetic tests for the TICK-LEVEL MAIN-checkout freshness reconcile
+# (reconcile_main_freshness in agent-watch.sh, HERD-233).
+#
+# Multi-seat doctrine: the freshness of $MAIN is a RECONCILED INVARIANT, not a do_merge side-effect.
+# When another seat merges, $MAIN goes stale and this watcher keeps running the engine code it loads
+# from there; when a generated-map push is rejected, $MAIN is left DIVERGED with no retry path.
+#
+#   (1) FRESH ($MAIN == origin) → byte-inert: no commit, no journal, no state file
+#   (2) BEHIND (origin advanced out-of-band, do_merge never ran) → ff-pull + journal main_ff.
+#       Runs with CODEMAP_AUTOREFRESH=false: freshness is DECOUPLED from the codemap lever.
+#   (3) the ff delta rewrote agent-watch.sh → 'restart recommended' note + restart=yes journaled
+#   (4) AHEAD-only generated-map commit (the `pushed=no` corpse) → pushed, journal main_heal
+#   (5) DIVERGED with only generated-map local commits → rebase onto origin + push, journal main_heal
+#   (6) DIVERGED with a local commit nobody generated → HELD: no rebase, LOUD row, journaled ONCE
+#   (7) DIRTY tree while behind → HELD (dirty-tree): never pull over a human's work
+#   (8) MID-OP (live gate marker) → defer silently
+#   (9) FETCH FAILURE (unreachable remote) → fail-soft: no journal, no state, tree untouched
+#
+# Sources agent-watch.sh in lib mode and drives reconcile_main_freshness against a REAL local git
+# repo wired to a bare "origin", with a second clone standing in for the other seat that pushes.
+# journal_append is overridden to a log.
+# Run:  bash tests/test-main-freshness.sh
+set -uo pipefail
+HERE_T="$(cd "$(dirname "$0")" && pwd)"
+WATCH="$HERE_T/../scripts/herd/agent-watch.sh"
+
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+pass=0
+fail() { echo "FAIL: $1" >&2; exit 1; }
+ok()   { pass=$((pass+1)); }
+
+[ -f "$WATCH" ] || fail "agent-watch.sh not found at $WATCH"
+command -v git >/dev/null 2>&1 || fail "git required to run this test"
+
+# ── Stub gh / herdr on PATH (network-free); git stays REAL ────────────────────────────────────────
+BIN="$T/bin"; mkdir -p "$BIN"
+for cmd in gh herdr; do printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/$cmd"; chmod +x "$BIN/$cmd"; done
+export PATH="$BIN:$PATH"
+
+# ── Source agent-watch.sh in lib mode ─────────────────────────────────────────────────────────────
+export AGENT_WATCH_LIB=1
+export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
+export HERD_CONFIG_FILE="$T/no-such-config"
+# shellcheck source=/dev/null
+. "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
+for fn in reconcile_main_freshness build_main_freshness _main_fresh_generated_only \
+          _main_fresh_note_restart _main_fresh_hold _watch_gate_inflight; do
+  type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
+done
+
+JLOG="$T/journal.log"; : > "$JLOG"
+journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
+
+# ── Real git repo wired to a bare origin, plus a SECOND clone = "the other seat" ──────────────────
+ORIGIN="$T/origin.git"; git init -q --bare "$ORIGIN"
+gitcfg() { git -C "$1" config user.email t@t.test; git -C "$1" config user.name tester; }
+
+MAIN="$T/main"; git clone -q "$ORIGIN" "$MAIN" 2>/dev/null
+git -C "$MAIN" checkout -q -B main; gitcfg "$MAIN"
+mkdir -p "$MAIN/docs" "$MAIN/scripts/herd"
+printf 'MAP v1\n'    > "$MAIN/docs/codemap.md"
+printf 'INDEX v1\n'  > "$MAIN/docs/symbol-index.md"
+printf 'engine v1\n' > "$MAIN/scripts/herd/agent-watch.sh"
+printf 'hello\n'     > "$MAIN/README.md"
+git -C "$MAIN" add -A; git -C "$MAIN" commit -q -m init; git -C "$MAIN" push -q origin main
+
+SEAT="$T/seat2"; git clone -q "$ORIGIN" "$SEAT" 2>/dev/null; gitcfg "$SEAT"
+
+HERD_REMOTE=origin; HERD_BRANCH_NAME=main; DEFAULT_BRANCH=origin/main
+mkdir -p "$TREES"
+MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"
+MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"
+
+commits()  { git -C "$MAIN" rev-list --count HEAD; }
+head_sha() { git -C "$MAIN" rev-parse HEAD; }
+origin_sha() { git -C "$MAIN" rev-parse origin/main; }
+jhas()     { grep -q "$1" "$JLOG"; }
+jcount()   { grep -c "$1" "$JLOG" 2>/dev/null || printf '0'; }
+reset_state() { : > "$JLOG"; rm -f "$MAIN_FRESH_STATE" "$MAIN_FRESH_RESTART"; }
+
+# seat_push <file> <content> <msg> — the OTHER seat lands a commit on origin/main (no do_merge here).
+seat_push() {
+  git -C "$SEAT" pull -q --ff-only origin main >/dev/null 2>&1
+  mkdir -p "$SEAT/$(dirname "$1")"
+  printf '%s\n' "$2" > "$SEAT/$1"
+  git -C "$SEAT" add -A; git -C "$SEAT" commit -q -m "$3"; git -C "$SEAT" push -q origin main
+}
+
+# ── (1) FRESH → byte-inert ────────────────────────────────────────────────────────────────────────
+reset_state
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]      || fail "(1) FRESH moved HEAD"
+[ ! -s "$JLOG" ]               || fail "(1) FRESH journaled: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_STATE" ]   || fail "(1) FRESH wrote a held state file"
+build_main_freshness
+[ -z "${MAIN_FRESHNESS:-}" ]   || fail "(1) FRESH rendered a row: $MAIN_FRESHNESS"
+ok
+
+# ── (2) BEHIND → ff-pull + main_ff, WITH the codemap lever OFF (decoupled) ────────────────────────
+reset_state
+seat_push README.md "other seat was here" "feat: other seat merge"
+h0="$(head_sha)"
+CODEMAP_AUTOREFRESH=false reconcile_main_freshness
+[ "$(head_sha)" = "$(origin_sha)" ] || fail "(2) BEHIND did not fast-forward"
+[ "$(head_sha)" != "$h0" ]          || fail "(2) BEHIND left HEAD stale"
+jhas 'main_ff behind 1 from'        || fail "(2) missing main_ff journal line: $(cat "$JLOG")"
+jhas 'restart no'                   || fail "(2) a README-only pull must not recommend a restart: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_RESTART" ]      || fail "(2) README-only pull left a restart note"
+[ ! -e "$MAIN_FRESH_STATE" ]        || fail "(2) a healed ff left a held state file"
+ok
+
+# ── (3) the pulled delta rewrote agent-watch.sh → restart recommended ─────────────────────────────
+reset_state
+seat_push scripts/herd/agent-watch.sh "engine v2" "feat: engine change"
+CODEMAP_AUTOREFRESH=false reconcile_main_freshness
+[ "$(head_sha)" = "$(origin_sha)" ] || fail "(3) engine pull did not fast-forward"
+jhas 'restart yes'                  || fail "(3) engine pull did not journal restart=yes: $(cat "$JLOG")"
+[ -s "$MAIN_FRESH_RESTART" ]        || fail "(3) engine pull left no restart note"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"restart recommended"*) ;; *) fail "(3) restart row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) fail "(3) restart note must not paint a STALE row" ;; esac
+rm -f "$MAIN_FRESH_RESTART"
+ok
+
+# ── (4) AHEAD-only generated-map commit (the `pushed=no` corpse) → pushed ─────────────────────────
+reset_state
+printf 'MAP v2\n' > "$MAIN/docs/codemap.md"
+git -C "$MAIN" commit -q -m "chore: refresh codemap (reconcile)" -- docs/codemap.md
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]                       || fail "(4) a pure push moved HEAD"
+[ "$(origin_sha)" = "$h0" ]                     || fail "(4) the stranded generated commit was not pushed"
+jhas 'main_heal ahead 1 behind 0 result pushed' || fail "(4) missing main_heal journal: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_STATE" ]                    || fail "(4) a healed push left a held state file"
+ok
+
+# ── (5) DIVERGED, local commits are generated maps only → rebase + push ───────────────────────────
+reset_state
+printf 'INDEX v2\n' > "$MAIN/docs/symbol-index.md"
+git -C "$MAIN" commit -q -m "chore: refresh symbol-index (reconcile)" -- docs/symbol-index.md
+seat_push README.md "seat2 raced us" "feat: concurrent seat merge"
+reconcile_main_freshness
+[ "$(head_sha)" = "$(origin_sha)" ]        || fail "(5) DIVERGED generated-only did not converge with origin"
+[ "$(cat "$MAIN/docs/symbol-index.md")" = "INDEX v2" ] \
+                                           || fail "(5) the rebase lost the generated commit"
+grep -q 'seat2 raced us' "$MAIN/README.md" || fail "(5) the rebase lost the other seat's commit"
+jhas 'main_heal ahead 1 behind 1 result pushed' || fail "(5) missing main_heal journal: $(cat "$JLOG")"
+ok
+
+# ── (6) DIVERGED with a local commit nobody generated → HELD, never rebased ───────────────────────
+reset_state
+printf 'a human wrote this\n' > "$MAIN/NOTES.md"
+git -C "$MAIN" add NOTES.md; git -C "$MAIN" commit -q -m "wip: hand edit on main"
+seat_push README.md "seat2 again" "feat: another seat merge"
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]                  || fail "(6) HELD rebased a human's commit — must never"
+[ "$(head_sha)" != "$(origin_sha)" ]       || fail "(6) HELD pushed a human's commit — must never"
+jhas 'main_freshness result held reason local-commits behind 1 ahead 1' \
+                                           || fail "(6) missing held journal: $(cat "$JLOG")"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*"local commits"*) ;; *) fail "(6) held row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+# The same unchanged hold journals ONCE (the row persists; the journal does not spam).
+reconcile_main_freshness
+[ "$(jcount 'main_freshness')" = "1" ]     || fail "(6) held reason re-journaled: $(jcount 'main_freshness') lines"
+ok
+
+# Recover: drop the human commit so the remaining legs start from a clean, ff-able MAIN.
+git -C "$MAIN" reset -q --hard origin/main
+
+# ── (7) DIRTY tree while behind → HELD (dirty-tree), never pull over the work ─────────────────────
+reset_state
+seat_push README.md "seat2 while we were dirty" "feat: seat merge during local edit"
+printf 'uncommitted work\n' > "$MAIN/WIP.md"
+git -C "$MAIN" add WIP.md
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]                  || fail "(7) DIRTY tree was pulled over"
+[ -f "$MAIN/WIP.md" ]                      || fail "(7) DIRTY tree lost the uncommitted file"
+jhas 'main_freshness result held reason dirty-tree behind 1 ahead 0' \
+                                           || fail "(7) missing dirty-tree held journal: $(cat "$JLOG")"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"uncommitted changes"*) ;; *) fail "(7) dirty row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+git -C "$MAIN" reset -q --hard HEAD; rm -f "$MAIN/WIP.md"
+ok
+
+# ── (8) MID-OP (live gate marker) → defer silently ────────────────────────────────────────────────
+reset_state
+INF="$TREES/.review-inflight-99-shaMID"
+_marker_write "$INF" "$$"          # live: this pid, this starttime
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]                  || fail "(8) MID-OP pulled while a gate was live"
+[ ! -s "$JLOG" ]                           || fail "(8) MID-OP journaled: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_STATE" ]               || fail "(8) MID-OP wrote a held state file"
+rm -f "$INF"
+ok
+
+# Bonus: once the gate clears, the deferred ff DOES happen on the next tick.
+reset_state
+reconcile_main_freshness
+[ "$(head_sha)" = "$(origin_sha)" ]        || fail "(8b) post-mid-op ff did not happen"
+jhas 'main_ff'                             || fail "(8b) post-mid-op missing main_ff: $(cat "$JLOG")"
+ok
+
+# ── (9) FETCH FAILURE → fail-soft (never blocks the tick, never alarms) ───────────────────────────
+reset_state
+seat_push README.md "unreachable-remote leg" "feat: seat merge we cannot fetch"
+git -C "$MAIN" remote set-url origin "$T/no-such-origin.git"
+h0="$(head_sha)"
+reconcile_main_freshness || fail "(9) a fetch failure returned non-zero — must be fail-soft"
+[ "$(head_sha)" = "$h0" ]                  || fail "(9) fetch failure moved HEAD"
+[ ! -s "$JLOG" ]                           || fail "(9) fetch failure journaled: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_STATE" ]               || fail "(9) fetch failure raised a false MAIN STALE row"
+git -C "$MAIN" remote set-url origin "$ORIGIN"
+ok
+
+# ── (10) DRYRUN → byte-inert ──────────────────────────────────────────────────────────────────────
+reset_state
+h0="$(head_sha)"
+DRYRUN=1 reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]                  || fail "(10) DRYRUN moved HEAD"
+[ ! -s "$JLOG" ]                           || fail "(10) DRYRUN journaled: $(cat "$JLOG")"
+ok
+
+echo "PASS: test-main-freshness.sh ($pass checks)"

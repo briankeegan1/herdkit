@@ -24,6 +24,15 @@ The test: *does this hold regardless of which seat performed the triggering even
   *the committed map matches the tree at `$MAIN`* — probed via `codemap.sh --check` /
   `symbol-index.sh --check` against observed `$MAIN`, repaired whenever it drifts with
   `provenance=reconcile`, no matter who merged. The do_merge refresh remains the local-merge fast path.
+- **HERD-233 — the `$MAIN` checkout itself goes stale after another seat's merge.** The only
+  fast-forward of `$MAIN` lived inside `do_merge` (plus one riding the `CODEMAP_AUTOREFRESH` lever),
+  so another seat's merges left this watcher 22 commits behind — running the *engine code it loads
+  from there* — and a rejected generated-map push stranded `$MAIN` diverged until a human rebased.
+  The invariant form — `reconcile_main_freshness` on every watcher tick, independent of any lever —
+  is: *`$MAIN` equals `origin/<default>`* — fast-forwarded when behind (`main_ff`), healed when the
+  only local commits are the engine's own regenerable maps (`main_heal`), and otherwise HELD with a
+  loud console row rather than guessed at. A pull that carries new `agent-watch.sh` also notes that
+  the running watcher is now stale code until restarted.
 - **HERD-164 — retirement as an event handler.** Retiring a pane/worktree ran as a handler on the
   merge the seat performed, so panes belonging to work merged elsewhere were never retired. The
   invariant form: *no pane/worktree exists for a branch already merged into `$MAIN`* — evaluated

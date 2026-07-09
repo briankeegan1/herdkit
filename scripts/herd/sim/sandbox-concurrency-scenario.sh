@@ -935,6 +935,74 @@ else
   _SNGL_OK=0
 fi
 
+# ── MAIN-checkout freshness reconcile (HERD-233) — the cross-seat drift the drain above cannot show ──
+# The incident: another seat merged, so THIS watcher's do_merge never ran, and its $MAIN checkout — the
+# very tree it loads engine code from — silently fell 22 commits behind; a rejected generated-map push
+# then left it DIVERGED until a human rebased by hand. Reproduce BOTH against the SHIPPED tick function
+# reconcile_main_freshness (sourced in lib mode above), on a fixture where origin advances with no local
+# do_merge, and assert (a) the ff + the real `main_ff` journal event, (b) that a local commit nobody
+# generated is HELD, never rebased. $MAIN / remote vars are swapped onto the fixture and restored after.
+step mainfresh "MAIN-checkout freshness (HERD-233): origin advances without a local do_merge → ff + main_ff; a hand commit is held"
+
+_MF_OK=1
+if type reconcile_main_freshness >/dev/null 2>&1; then
+  _mf_root="$ART/mainfresh"; rm -rf "$_mf_root"; mkdir -p "$_mf_root"
+  _mf_origin="$_mf_root/origin.git"; git init -q --bare "$_mf_origin"
+  _mf_main="$_mf_root/main";  git clone -q "$_mf_origin" "$_mf_main" 2>/dev/null
+  _mf_seat="$_mf_root/seat2"
+  git -C "$_mf_main" checkout -q -B main
+  git -C "$_mf_main" config user.email sim@herdkit.test; git -C "$_mf_main" config user.name sim
+  printf 'base\n' > "$_mf_main/README.md"
+  git -C "$_mf_main" add -A; git -C "$_mf_main" commit -q -m init; git -C "$_mf_main" push -q origin main
+  git clone -q "$_mf_origin" "$_mf_seat" 2>/dev/null
+  git -C "$_mf_seat" config user.email sim2@herdkit.test; git -C "$_mf_seat" config user.name sim2
+
+  # Swap the watcher's $MAIN + remote coordinates onto the fixture (restored below).
+  _mf_saved_main="$MAIN"; _mf_saved_remote="$HERD_REMOTE"; _mf_saved_branch="$HERD_BRANCH_NAME"
+  MAIN="$_mf_main"; HERD_REMOTE=origin; HERD_BRANCH_NAME=main
+  _mf_journal="$TREES/.herd/journal.jsonl"
+  # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
+  _mf_ff_count() { local c; c="$(grep -c '"event":"main_ff"' "$_mf_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
+  _mf_ff_before="$(_mf_ff_count)"
+
+  # (a) The OTHER seat merges straight to origin — this watcher's do_merge never runs.
+  printf 'another seat merged this\n' > "$_mf_seat/README.md"
+  git -C "$_mf_seat" commit -q -am "feat: out-of-band merge (other seat)"; git -C "$_mf_seat" push -q origin main
+  reconcile_main_freshness
+  _mf_head="$(git -C "$_mf_main" rev-parse HEAD 2>/dev/null || true)"
+  _mf_want="$(git -C "$_mf_main" rev-parse origin/main 2>/dev/null || true)"
+  _mf_ff_after="$(_mf_ff_count)"
+  if [ -n "$_mf_head" ] && [ "$_mf_head" = "$_mf_want" ] && [ "$_mf_ff_after" -gt "$_mf_ff_before" ]; then
+    checkpoint main_freshness_ff pass "out-of-band merge fast-forwarded \$MAIN on the tick and journaled main_ff"
+  else
+    checkpoint main_freshness_ff fail "expected ff to origin/main + a main_ff event (head=$_mf_head want=$_mf_want main_ff $_mf_ff_before→$_mf_ff_after)"
+    _MF_OK=0
+  fi
+
+  # (b) NEVER GUESS: a local commit that is not one of our regenerable maps is held, not rebased.
+  printf 'a human wrote this\n' > "$_mf_main/NOTES.md"
+  git -C "$_mf_main" add NOTES.md; git -C "$_mf_main" commit -q -m "wip: hand edit on main"
+  printf 'seat2 again\n' > "$_mf_seat/README.md"
+  git -C "$_mf_seat" commit -q -am "feat: another out-of-band merge"; git -C "$_mf_seat" push -q origin main
+  _mf_head_before="$(git -C "$_mf_main" rev-parse HEAD)"
+  reconcile_main_freshness
+  _mf_head_after="$(git -C "$_mf_main" rev-parse HEAD)"
+  _mf_held="$(cat "$TREES/.agent-watch-main-freshness" 2>/dev/null || true)"
+  if [ "$_mf_head_after" = "$_mf_head_before" ] && [ -n "$_mf_held" ]; then
+    checkpoint main_freshness_no_guess pass "a diverged \$MAIN with a hand-written commit was HELD (row: $_mf_held), never rebased"
+  else
+    checkpoint main_freshness_no_guess fail "expected a HELD row and an untouched HEAD (head $_mf_head_before→$_mf_head_after, row '${_mf_held:-<none>}')"
+    _MF_OK=0
+  fi
+
+  rm -f "$TREES/.agent-watch-main-freshness" "$TREES/.agent-watch-main-restart" 2>/dev/null || true
+  MAIN="$_mf_saved_main"; HERD_REMOTE="$_mf_saved_remote"; HERD_BRANCH_NAME="$_mf_saved_branch"
+else
+  checkpoint main_freshness_ff       fail "reconcile_main_freshness not defined (lib-mode source did not expose the tick reconcile)"
+  checkpoint main_freshness_no_guess fail "reconcile_main_freshness not defined"
+  _MF_OK=0
+fi
+
 # ── SCORECARD emitter (machine-readable JSON; mirrors sandbox-scenario.sh + concurrency fields) ──
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1"
@@ -968,6 +1036,8 @@ write_scorecard() {
     printf '  "flair_tested": true,\n'
     printf '  "watcher_singleton_tested": true,\n'
     printf '  "watcher_singleton_ok": %s,\n' "$([ "${_SNGL_OK:-0}" -eq 1 ] && echo true || echo false)"
+    printf '  "main_freshness_tested": true,\n'
+    printf '  "main_freshness_ok": %s,\n' "$([ "${_MF_OK:-0}" -eq 1 ] && echo true || echo false)"
     printf '  "infra_breaker_tested": true,\n'
     printf '  "infra_breaker_max": %d,\n' "$BRK_MAX"
     printf '  "infra_breaker_opened": %s,\n' "$([ -n "${_brk_opened:-}" ] && echo true || echo false)"
