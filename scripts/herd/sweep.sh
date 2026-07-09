@@ -378,8 +378,11 @@ sweep_leg_tabs() {
 
   [ -n "$dry" ] && return 0
   # Act through the shipped sweeps (they journal `sweep_closed` / `reap_resolve_tab` and prune the
-  # registry row). Hand the orphan ids we already computed back so those round-trips happen ONCE.
-  [ "$n" -gt 0 ] && _sweep_orphan_tabs "$ids"
+  # closed tab's registry row). Hand the orphan ids we already computed back so those round-trips
+  # happen ONCE. _sweep_orphan_tabs is invoked UNCONDITIONALLY — even with zero orphan candidates it
+  # runs _herd_tabs_prune_orphans first (HERD-215), self-healing registry rows whose tab was closed
+  # outside the sweep so the stale-tab tally stops counting them forever.
+  _sweep_orphan_tabs "$ids"
   _sweep_stale_resolve_tabs
   return 0
 }
@@ -835,6 +838,17 @@ sweep_journal_advice_once() {
 # a flag is a report, not an action). Lets the watcher's auto path detect a no-progress run.
 sweep_swept_total() { printf '%s' "$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC ))"; }
 
+# _sweep_stamp_tally — record this sweep's completion wall-clock in $TREES/.sweep-tally-stamp so a LIVE
+# watcher recomputes its cached housekeeping tally the very next tick instead of advertising the
+# now-cleaned mess until its throttled ~60 s scan (HERD-215 cry-wolf fix). A MANUAL `herd sweep` runs
+# in a SEPARATE process from the watcher, so a shared file is the only channel — the watcher polls it in
+# _sweep_trigger_tick. Best-effort; the watcher falls back to its cadence when the stamp cannot be read.
+_sweep_stamp_tally() {
+  [ -n "${TREES:-}" ] || return 0
+  local _st_now; _st_now="$(_now_epoch 2>/dev/null || date +%s)"
+  printf '%s\n' "$_st_now" > "$TREES/.sweep-tally-stamp" 2>/dev/null || true
+}
+
 sweep_run_safe_legs() {
   _sweep_reset_counters
   sweep_leg_markers ""
@@ -843,6 +857,9 @@ sweep_run_safe_legs() {
   sweep_leg_tabs ""
   journal_append sweep_auto reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" \
     tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
+  # Tell a live watcher the tally is stale so it recomputes now (HERD-215). Harmless in the auto path,
+  # which recomputes in-process anyway; load-bearing for a manual `herd sweep` from another process.
+  _sweep_stamp_tally
   return 0
 }
 
@@ -890,6 +907,9 @@ sweep_main() {
 
   journal_append sweep_done mode "$mode" reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" \
     tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
+  # Invalidate a live watcher's cached tally so its housekeeping line recomputes next tick (HERD-215).
+  # Skip on --dry-run: it touched nothing, so the mess is still there and the cached count is still true.
+  [ -z "$dry" ] && _sweep_stamp_tally
   return 0
 }
 
