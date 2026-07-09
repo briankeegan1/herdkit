@@ -111,7 +111,7 @@ enqueue(){ ( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$SPAWN" "
 DRAIN_SRC="$T/drain.sh"
 : > "$DRAIN_SRC"
 # HERD-237: the drain fires its lane through a background worker behind an inflight marker.
-for fn in _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+for fn in _spawn_slug_key _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
           _drain_lane_worker _drain_spawn_queue; do
   sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$DRAIN_SRC"
   grep -q "^$fn()" "$DRAIN_SRC" || fail "could not extract $fn from agent-watch.sh"

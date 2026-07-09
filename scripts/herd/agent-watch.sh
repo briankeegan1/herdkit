@@ -1945,16 +1945,25 @@ _marker_age() {
 # in `_list_project_watchers`.
 SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
 
-# _spawn_inflight_file <kind> <slug> — a UNIQUE marker path for one in-flight lane. <kind> ∈ lane|resolve.
-# Uniqueness matters: a same-slug re-dispatch (a resolver respawned for a new sha) would otherwise alias
+# _spawn_inflight_file <kind> <slug> <uniq> — a UNIQUE marker path for one in-flight lane.
+# <kind> ∈ lane|resolve. <uniq> is supplied by the caller from something already unique to the
+# dispatch (the intent id; the pr+sha+epoch), NOT from $RANDOM: the manifest ghost-key scan reads
+# `${RANDOM:-…}` as an undeclared config key, and a dispatch already carries a better identity than a
+# coin flip. Uniqueness matters: a same-slug re-dispatch (a resolver respawned for a new sha) would otherwise alias
 # the previous worker's marker, and the FIRST worker's cleanup would then delete the SECOND's — silently
 # un-exempting a live lane. The slug stays in the name so the marker is legible in `ls $TREES`.
 # _spawn_slug_key <slug> — the filename-safe form of a slug. ONE definition, so the writer
 # (_spawn_inflight_file) and every reader (the per-slug marker globs) can never drift apart.
-_spawn_slug_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+#
+# '-' is deliberately NOT in the safe set: it is the marker name's FIELD SEPARATOR. Leave it in the key
+# and the per-slug glob `…resolve-<key>-*` also matches every slug that merely has <key> as a
+# dash-prefix — a live lane for `fix-more` would make `fix` read STARTING and suppress its legitimate
+# respawn. Mapping '-' to '_' makes the field boundary unambiguous. Two slugs differing only by '-' vs
+# '_' still collide, as they already did for every other punctuation character.
+_spawn_slug_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._' '_'; }
 
 _spawn_inflight_file() {
-  printf '%s%s-%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(_spawn_slug_key "$2")" "$$" "${RANDOM:-0}"
+  printf '%s%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(_spawn_slug_key "$2")" "$(_spawn_slug_key "$3")"
 }
 
 # _spawn_inflight_bg <marker> <fn> [args…] — run <fn> in a background subshell, recording its pid in
@@ -3867,7 +3876,8 @@ spawn_resolver() {
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
-  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs")"
+  # The dispatch's own identity (pr + sha + dispatch epoch) uniquifies the marker.
+  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs" "${rp}-${rsha:--}-$(_now_epoch)")"
   _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha" "$_sr_marker"
   return 0
 }
@@ -3922,10 +3932,13 @@ _RESOLVE_LANE_LOCK_STALE=600     # seconds before an UNATTRIBUTABLE held lock is
 # The age rule survives only as the last-resort escape for a lock whose holder we cannot attribute at
 # all (a torn write, an older engine's lock dir): a wedge is worse than an overlap.
 
-# _resolve_lane_lock_scrap <reason> — atomically take the lock dir out of the way and delete it.
+# _resolve_lane_lock_scrap <token> — atomically take the lock dir out of the way and delete it.
 # Returns 0 only for the racer that actually won the rename, so no two lanes can both "break" it.
+# <token> only has to make the temp path private to this racer; each lane passes its own marker path,
+# which is unique per dispatch ($$ is not: a `( … ) &` subshell inherits the watcher's pid).
 _resolve_lane_lock_scrap() {
-  local _rls_tmp="$RESOLVE_LANE_LOCK.scrap.$$.${RANDOM:-0}"
+  local _rls_tmp="$RESOLVE_LANE_LOCK.scrap.$(_spawn_slug_key "$(basename -- "${1:-x}")")"
+  rm -rf "$_rls_tmp" 2>/dev/null || true
   mv "$RESOLVE_LANE_LOCK" "$_rls_tmp" 2>/dev/null || return 1
   rm -rf "$_rls_tmp" 2>/dev/null || true
   return 0
@@ -3947,7 +3960,7 @@ _resolve_lane_lock_acquire() {
     if [ -n "$_rll_cur" ]; then
       # Attributable holder: break iff it is provably gone (dead pid, or a recycled one).
       if ! _marker_live "$_rll_cur" 2>/dev/null; then
-        if _resolve_lane_lock_scrap; then
+        if _resolve_lane_lock_scrap "$_rll_holder"; then
           journal_append resolver_lane_lock_broken reason holder-dead holder "$_rll_cur"
         fi
         continue
@@ -3958,7 +3971,7 @@ _resolve_lane_lock_acquire() {
       _rll_now="$(_now_epoch)"
       case "$_rll_ts" in ''|*[!0-9]*) _rll_ts=0 ;; esac
       if [ "$_rll_ts" -gt 0 ] && [ "$(( _rll_now - _rll_ts ))" -gt "$_RESOLVE_LANE_LOCK_STALE" ]; then
-        if _resolve_lane_lock_scrap; then
+        if _resolve_lane_lock_scrap "$_rll_holder"; then
           journal_append resolver_lane_lock_broken reason stale-unattributed age "$(( _rll_now - _rll_ts ))"
         fi
         continue
@@ -3975,8 +3988,10 @@ _resolve_lane_lock_acquire() {
 # holder and then deleting would race, so we take the dir out of the way by atomic rename FIRST, read
 # the holder from the now-private copy, and put it back untouched if it was never ours.
 _resolve_lane_lock_release() {
-  local _rlr_want="$1" _rlr_tmp="$RESOLVE_LANE_LOCK.rel.$$.${RANDOM:-0}" _rlr_got
+  local _rlr_want="$1" _rlr_got
+  local _rlr_tmp="$RESOLVE_LANE_LOCK.rel.$(_spawn_slug_key "$(basename -- "$1")")"
   [ -d "$RESOLVE_LANE_LOCK" ] || return 0
+  rm -rf "$_rlr_tmp" 2>/dev/null || true
   mv "$RESOLVE_LANE_LOCK" "$_rlr_tmp" 2>/dev/null || return 0   # lost the rename ⇒ not ours to drop
   _rlr_got="$(cat "$_rlr_tmp/holder" 2>/dev/null || true)"
   if [ "$_rlr_got" = "$_rlr_want" ]; then
@@ -10404,7 +10419,7 @@ _drain_spawn_queue() {
         # status and only then consumes/releases the intent, so the PR #151 durability contract is
         # unchanged; the tick just no longer waits for it. The marker keeps the worker out of
         # `_list_project_watchers` and holds the launch slot shut until the lane lands.
-        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug")" \
+        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "$_dsq_id")" \
           _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
         # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
         # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a

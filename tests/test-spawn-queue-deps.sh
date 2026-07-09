@@ -73,7 +73,7 @@ JLOG="$T/journal.log"
 DRAIN_SRC="$T/drain.sh"
 : > "$DRAIN_SRC"
 for fn in _gh_timeout_secs _gh_timeout_run _gh_timeout \
-          _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+          _spawn_slug_key _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
           _spawn_dep_merged _spawn_held_epoch _spawn_mark_held _spawn_clear_held \
           _drain_lane_worker _drain_spawn_queue; do
   sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$DRAIN_SRC"

@@ -378,4 +378,16 @@ lane_marker_live
 _resolver_in_flight "$SLUG" "$PR" || fail "(22) an idle resolver whose lane worker is still running must be held"
 ok
 
+# ── (23) a sibling slug's lane marker never masks THIS slug's death ──────────────────────────────
+# The per-slug marker glob is `…resolve-<key>-*`. If '-' survived into the key, a live lane for
+# `fixit-more` would match `fixit`'s glob and hold off its legitimate respawn forever.
+reset
+dispatched_at $(( GRACE_DEFAULT + 600 ))
+probe_blind; AGENTS_JSON="$(roster_empty)"
+_marker_write "$(printf '%sresolve-%s-x-1' "$SPAWN_INFLIGHT_PREFIX" "$(_spawn_slug_key "${SLUG}-more")")" "$$"
+_resolver_lane_starting "$SLUG" && fail "(23) a sibling slug's live lane marker masked ${SLUG}'s death verdict"
+[ "$(verdict)" = "DEAD" ] || fail "(23) ${SLUG} must still read DEAD while only ${SLUG}-more has a live lane, got '$(verdict)'"
+_resolver_lane_starting "${SLUG}-more" || fail "(23) the sibling's own lane marker must still be found by its own slug"
+ok
+
 echo "ALL PASS ($pass checks) — resolver liveness: positive-evidence-only death (HERD-206)"
