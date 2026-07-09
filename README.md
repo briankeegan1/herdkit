@@ -329,6 +329,17 @@ gate cycle re-runs on the new commit. This is bounded by **`REFIX_MAX_ROUNDS`** 
 per PR — after which it escalates to `needs you`. When `REVIEW_AUTOFIX=false` (default), a BLOCK just
 shows the standard `review blocked` row for the coordinator to re-task by hand.
 
+### Auto-heal a stale base — `STALE_BASE_AUTOFIX`
+
+The pre-merge stale-duplicate gate (HERD-188) holds two flavors: **duplicate** (re-implements shipped
+work — always a human judgment call) and **stale-base** (touched files moved on `DEFAULT_BRANCH` —
+purely mechanical). When `.herd/config` sets **`STALE_BASE_AUTOFIX=on`**, a stale-base hold
+self-heals on the same rails as review autofix: sha-keyed once-guard, shared **`REFIX_MAX_ROUNDS`**
+budget, honest console row `rebasing · awaiting push`. A live builder is re-tasked with
+`git merge $DEFAULT_BRANCH`; if there is no live builder (foreign/reaped PR) the conflict resolver
+is dispatched instead. Only bounce-exhaustion escalates to `needs you`. Default is **`off`**
+(ship-dormant) so the hold path stays byte-identical until a project opts in.
+
 ### Catch a BLOCK before the PR opens — `LOCAL_REVIEW=pre-pr`
 
 By default (`LOCAL_REVIEW=none`) correctness review happens once, post-PR, in the watcher's gate.

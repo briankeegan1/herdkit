@@ -373,6 +373,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic stale-base autofix (HERD-199) unit test passes" {
+  run bash "$REPO/tests/test-stale-base-autofix.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic watcher discovery-scope / phantom detached-HEAD filter (HERD-182) test passes" {
   run bash "$REPO/tests/test-watcher-discovery-scope.sh"
   [ "$status" -eq 0 ]

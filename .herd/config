@@ -68,6 +68,8 @@ SPAWN_AHEAD=1
 HERD_REPO="briankeegan1/herdkit"
 # Dogfood: bounce BLOCK reviews straight to the builder agent (3-round cap, sha-keyed).
 REVIEW_AUTOFIX="true"
+# Dogfood HERD-199: auto-heal mechanical stale-base holds (shared refix budget).
+STALE_BASE_AUTOFIX="on"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Explicitly materialized config (2026-07-06). Every key below is written at its
