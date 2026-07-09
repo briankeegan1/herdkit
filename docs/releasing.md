@@ -25,14 +25,53 @@ contract number — bump it only on an engine-contract change, not on every rele
 
 ---
 
+## 0. CHANGELOG from the engine journal (deterministic)
+
+`herd changelog` (HERD-256) turns the watcher's merge events in `.herd/journal.jsonl` into
+Keep-a-Changelog entries — **no LLM**. Each merge is paired with a conventional-commit subject
+(from the PR head sha / a subject that cites `(#N)`, or an optional subject map for tests).
+
+Ship-dormant: nothing in the watcher auto-runs this. You invoke it when cutting a release.
+
+```bash
+# Refresh ## [Unreleased] from merges since the last v* tag (or all merges if none):
+herd changelog generate
+
+# Preview the section body only:
+herd changelog preview
+# (same as: herd changelog generate --stdout)
+
+# Promote [Unreleased] → [0.1.0] - <today UTC> and create a LOCAL annotated tag v0.1.0
+# (does not commit, push, or publish):
+herd changelog tag 0.1.0
+```
+
+The generator is deterministic: same journal + same subjects → same CHANGELOG body. Prefer good
+conventional-commit subjects on merged PRs (`feat:`, `fix:`, `docs:`, …) so the section groups
+cleanly under Features / Fixes / Documentation / …
+
+---
+
 ## 1. Cut the release (Git tag + GitHub release)
 
 ```bash
 VER=0.1.0
-# bump the version fields listed above in a normal PR, merge it, then from main:
-git tag "v$VER"
+# 1. bump the version fields listed above in a normal PR and merge it
+# 2. on main, refresh notes + cut the local tag (or use the plain git tag if you already wrote notes):
+herd changelog generate
+herd changelog tag "$VER"          # rewrites CHANGELOG.md + git tag -a "v$VER"
+git add CHANGELOG.md && git commit -m "chore: release v$VER"
+# 3. push the tag + create the GitHub release:
 git push origin "v$VER"
 gh release create "v$VER" --generate-notes    # ⚠️ HUMAN-VERIFY: needs push + gh auth to this repo
+```
+
+Equivalent bare-git form (if you skip `herd changelog tag`):
+
+```bash
+git tag "v$VER"
+git push origin "v$VER"
+gh release create "v$VER" --generate-notes    # ⚠️ HUMAN-VERIFY
 ```
 
 The GitHub release auto-creates the source tarball at
@@ -91,6 +130,9 @@ the git tag exists** (step 1).
 ## Release checklist
 
 - [ ] Version fields bumped in npm / homebrew / plugin / marketplace and merged
+- [ ] `herd changelog generate` refreshed `## [Unreleased]` from the journal
+- [ ] `herd changelog tag $VER` (or bare `git tag v$VER`) — CHANGELOG promoted + local tag
+- [ ] CHANGELOG.md committed if the tag helper rewrote it
 - [ ] `git tag v$VER` pushed
 - [ ] ⚠️ GitHub release created (`gh release create`)
 - [ ] ⚠️ Homebrew tap formula updated with real `url` + `sha256`, `brew install` verified
