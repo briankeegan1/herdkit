@@ -227,6 +227,17 @@ RECONCILE_STATE="$TREES/.agent-watch-reconciled"
 # ONCE per sha instead of every tick (the console row itself is re-rendered every tick from the live
 # re-check). Keyed by pr+sha like the review/health ledgers, so a new commit re-evaluates fresh.
 STALE_DUP_STATE="$TREES/.agent-watch-stale-dup"
+# Re-stale ledger (HERD-231): one line "<epoch> <pr#> <sha> <kind>" per LAP a PR lost — a sha this
+# watcher had already INVESTED gate work in (a review or healthcheck in flight, or a verdict already
+# recorded) that another merge then re-staled (kind=stale-base|duplicate) or re-conflicted
+# (kind=conflict). Keyed by pr+sha+kind so a hold that lingers across ticks counts ONCE, and a bounce
+# to a fresh sha that loses the race AGAIN counts a second lap. Purely OBSERVABILITY: the per-PR lap
+# count drives the loud `starving · N re-stale laps` row and the pr_starvation journal event at
+# _RESTALE_STARVE_THRESHOLD. Nothing gates on it — no merge, hold, or bounce reads this file.
+RESTALE_STATE="$TREES/.agent-watch-restale"
+# Laps a PR may lose before the console calls it STARVING. Inline (not a config key): it names a
+# reporting threshold, not a policy — no behavior branches on it.
+_RESTALE_STARVE_THRESHOLD=3
 # herd/gates commit-status ledger (HERD-194): one line "<epoch> <pr#> <sha> success" per SUCCESS commit
 # STATUS this watcher successfully POSTED. The watcher posts ONLY `success` (a green blessing) — never a
 # non-passing pending/failure status, which would flip a CLEAN sha to UNSTABLE and strand it (see the
@@ -2727,6 +2738,181 @@ record_stale_dup_held() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "${3:-}" >> "$STALE_DUP_STATE"
 }
 
+# ── RE-STALE COUNTER + STARVATION SURFACING (HERD-231) ──────────────────────────────────────────
+# A PR starves when merges keep landing faster than its own gates can finish: each landing re-stales
+# (or re-conflicts) the very sha a review/suite was grading, the autofix bounces the builder, and the
+# next sha races the next merge. PR #328 lost four such laps on 2026-07-09 and PR #347 three; nothing
+# in the console or the journal ever said so — each lap looked like a fresh, unrelated hold.
+#
+# This is DISPLAY + JOURNAL only, and it is ALWAYS ON. It counts laps, it never decides anything: no
+# merge, hold, bounce or dispatch reads $RESTALE_STATE. The reorder that actually *fixes* starvation
+# ships separately, dormant, behind MERGE_FAIRNESS (see _merge_fairness_reorder).
+#
+# A lap is counted only when the lost sha carried REAL investment — the whole point is to measure work
+# thrown away, not holds. A PR held on its first tick (stale before any gate ran) has lost nothing.
+
+# _gate_work_invested <pr#> <sha> — true iff this watcher has already spent (or is spending) gate work
+# on this exact commit: a health verdict cached, a health worker in flight or waiting to be collected,
+# a reviewer in flight, or a review verdict on the ledger. All local reads; no network, no git.
+_gate_work_invested() {
+  local _gwi_pr="$1" _gwi_sha="$2"
+  [ -n "$_gwi_pr" ] && [ -n "$_gwi_sha" ] && [ "$_gwi_sha" != "-" ] || return 1
+  [ -f "$(_health_result_file "$_gwi_pr" "$_gwi_sha")" ]      && return 0
+  [ -f "$(_health_inflight_file "${_gwi_pr}-${_gwi_sha}")" ]  && return 0
+  [ -f "$(_health_dispatch_file "${_gwi_pr}-${_gwi_sha}")" ]  && return 0
+  [ -f "$(_review_inflight_file "$_gwi_pr" "$_gwi_sha")" ]    && return 0
+  review_verdict "$_gwi_pr" "$_gwi_sha" >/dev/null 2>&1       && return 0
+  return 1
+}
+
+# restale_counted <pr#> <sha> <kind> — true if this exact lap is already on the ledger. The dedup that
+# keeps a hold lingering across 20 ticks from inflating the count to 20.
+restale_counted() {
+  [ -s "$RESTALE_STATE" ] || return 1
+  awk -v p="$1" -v s="$2" -v k="$3" '$2==p && $3==s && $4==k{f=1; exit} END{exit !f}' "$RESTALE_STATE" 2>/dev/null
+}
+
+# restale_count <pr#> — how many laps this PR has lost, across every sha and kind. Echoes an integer
+# (0 when the ledger is absent), so callers can compare it without guarding.
+restale_count() {
+  [ -s "$RESTALE_STATE" ] || { printf '0'; return 0; }
+  awk -v p="$1" '$2==p{n++} END{print n+0}' "$RESTALE_STATE" 2>/dev/null || printf '0'
+}
+
+# _restale_note <pr#> <sha> <slug> <kind> — record ONE lost lap, if this sha really lost one. Returns 0
+# always (observability must never fail a gate). Journals pr_restale per lap, and pr_starvation on
+# every lap at or past the threshold — so the operator, and the future journal-driven self-auditor,
+# both see the starvation while it is happening rather than in a post-mortem.
+_restale_note() {
+  local _rsn_pr="$1" _rsn_sha="$2" _rsn_slug="$3" _rsn_kind="$4" _rsn_n
+  [ -n "$_rsn_pr" ] && [ -n "$_rsn_sha" ] || return 0
+  # DRY-RUN writes nothing. The conflict classifier runs under --dry-run (the stale-dup gate does not),
+  # and a lap recorded there would persist into the next real tick's count.
+  [ -z "${DRYRUN:-}" ] || return 0
+  _gate_work_invested "$_rsn_pr" "$_rsn_sha" || return 0
+  restale_counted "$_rsn_pr" "$_rsn_sha" "$_rsn_kind" && return 0
+  printf '%s %s %s %s\n' "$(date +%s)" "$_rsn_pr" "$_rsn_sha" "$_rsn_kind" >> "$RESTALE_STATE"
+  _rsn_n="$(restale_count "$_rsn_pr")"
+  journal_append pr_restale pr "$_rsn_pr" sha "$_rsn_sha" slug "$_rsn_slug" kind "$_rsn_kind" laps "$_rsn_n"
+  if [ "$_rsn_n" -ge "$_RESTALE_STARVE_THRESHOLD" ]; then
+    journal_append pr_starvation pr "$_rsn_pr" sha "$_rsn_sha" slug "$_rsn_slug" \
+      laps "$_rsn_n" threshold "$_RESTALE_STARVE_THRESHOLD"
+  fi
+  return 0
+}
+
+# _starvation_row <pr#> — the loud continuation line for a starving PR, or NOTHING (empty, rc 0) for a
+# PR under the threshold. Rendered under the hold/conflict row the way _health_needs_you_row renders
+# its remedy line. Read live from the ledger, so it survives a watcher restart and re-paints each tick.
+_starvation_row() {
+  local _srw_n; _srw_n="$(restale_count "$1")"
+  [ "$_srw_n" -ge "$_RESTALE_STARVE_THRESHOLD" ] || return 0
+  printf '%s' "       ${C_RED}└─ starving · ${_srw_n} re-stale laps — merges keep landing before this PR's gates finish${C_RESET}"
+}
+
+# _restale_decorate_row <display-idx> <pr#> — append the starvation line to an already-painted row.
+# ONE helper at BOTH surfaces that can lose a lap (the stale/duplicate hold and the conflict
+# classifier), so the two can never drift into differently-wrong copies (multi-seat doctrine R2).
+_restale_decorate_row() {
+  local _rdr_line; _rdr_line="$(_starvation_row "$2")"
+  [ -n "$_rdr_line" ] || return 0
+  DISPLAY[$1]="${DISPLAY[$1]:-}"$'\n'"$_rdr_line"
+}
+
+# ── MERGE FAIRNESS: ready-PR priority (HERD-231) ────────────────────────────────────────────────
+# The action pass walks candidates in worktree-DISCOVERY order. A PR whose gates are already green for
+# its head sha therefore waits behind whatever dispatching the loop does for the PRs ahead of it — and
+# the merge that lands from one of those is exactly what re-stales it. Merging the ready one FIRST
+# costs nothing and removes it from the race.
+#
+# SHIP-DORMANT. MERGE_FAIRNESS=off (default) returns before touching the arrays, so the candidate order
+# — and every event, dispatch and merge that follows from it — is byte-identical to today.
+#
+# It NEVER merges anything that has not fully passed: the reorder only permutes the visit order. Every
+# gate, the pre-merge re-verify, the unconditional stale-base re-check and the merge-policy decision run
+# on a promoted candidate exactly as they do on a demoted one. A wrongly-promoted PR simply gates and
+# holds where it stands.
+
+# _merge_fairness_enabled — true iff MERGE_FAIRNESS opts in. Any unrecognized value → off.
+_merge_fairness_enabled() {
+  case "$(printf '%s' "${MERGE_FAIRNESS:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _health_cached_verdict <pr#> <sha> — echo the TERMINAL health verdict cached for this exact commit
+# (CLEAN | FLAKY | CODEERROR), or return 1 when nothing is cached. The read-only companion to
+# record_health_result: it must never dispatch, collect, or journal a cache hit.
+_health_cached_verdict() {
+  local _hcv_f _hcv_v; _hcv_f="$(_health_result_file "$1" "$2")"
+  [ -f "$_hcv_f" ] || return 1
+  IFS=$'\t' read -r _hcv_v _ < "$_hcv_f" || return 1
+  [ -n "$_hcv_v" ] || return 1
+  printf '%s' "$_hcv_v"
+}
+
+# _cand_gates_ready <pr#> <sha> — true iff BOTH gates are already green for this exact commit, read
+# from the ledgers alone (no dispatch, no gh, no git). This is the same pair of facts the action pass
+# itself requires before it will merge: a cached CLEAN/FLAKY healthcheck, and a review PASS — or a
+# BLOCK a human has overridden for this very sha, which the pass also treats as PASS.
+_cand_gates_ready() {
+  local _cgr_pr="$1" _cgr_sha="$2" _cgr_v
+  [ -n "$_cgr_pr" ] && [ -n "$_cgr_sha" ] || return 1
+  case "$(_health_cached_verdict "$_cgr_pr" "$_cgr_sha" 2>/dev/null || true)" in
+    CLEAN|FLAKY) : ;;
+    *) return 1 ;;
+  esac
+  _cgr_v="$(review_verdict "$_cgr_pr" "$_cgr_sha" 2>/dev/null || true)"
+  [ "$_cgr_v" = "PASS" ] && return 0
+  [ "$_cgr_v" = "BLOCK" ] && override_exists "$_cgr_pr" "$_cgr_sha" && return 0
+  return 1
+}
+
+# _merge_fairness_reorder — stable-partition this tick's candidate arrays so every gates-ready PR is
+# visited before every PR that still needs gate work. Mutates CAND_IDX/CAND_DIR/CAND_SLUG/CAND_PR/
+# CAND_BRANCH/CAND_SHA in place (they stay index-parallel), and returns 0 always.
+#
+# STABLE within each partition: ready PRs keep their relative discovery order, and so do the rest. So
+# the reorder is a deterministic function of (candidate set, ledger state) — two watchers reading the
+# same ledgers produce the same order, and a tick with nothing to promote is a no-op.
+#
+# Journals merge_fairness_priority ONLY when the order actually changes: a tick where the ready PRs
+# already sit first is byte-quiet, exactly as if the knob were off.
+_merge_fairness_reorder() {
+  _merge_fairness_enabled || return 0
+  local _mfr_n=${#CAND_IDX[@]} _mfr_k
+  [ "$_mfr_n" -gt 1 ] || return 0
+
+  local _mfr_ready=() _mfr_rest=()
+  for ((_mfr_k = 0; _mfr_k < _mfr_n; _mfr_k++)); do
+    if _cand_gates_ready "${CAND_PR[_mfr_k]}" "${CAND_SHA[_mfr_k]}"; then
+      _mfr_ready+=("$_mfr_k")
+    else
+      _mfr_rest+=("$_mfr_k")
+    fi
+  done
+  # Nothing to promote, or nothing to promote PAST — the identity permutation either way.
+  [ "${#_mfr_ready[@]}" -gt 0 ] && [ "${#_mfr_rest[@]}" -gt 0 ] || return 0
+  # Already ready-first (every ready index precedes every other): no reorder, no journal, no noise.
+  [ "${_mfr_ready[${#_mfr_ready[@]}-1]}" -gt "${_mfr_rest[0]}" ] || return 0
+
+  local _mfr_i=() _mfr_d=() _mfr_s=() _mfr_p=() _mfr_b=() _mfr_h=() _mfr_prs=""
+  for _mfr_k in "${_mfr_ready[@]}" "${_mfr_rest[@]}"; do
+    _mfr_i+=("${CAND_IDX[_mfr_k]}"); _mfr_d+=("${CAND_DIR[_mfr_k]}"); _mfr_s+=("${CAND_SLUG[_mfr_k]}")
+    _mfr_p+=("${CAND_PR[_mfr_k]}");  _mfr_b+=("${CAND_BRANCH[_mfr_k]}"); _mfr_h+=("${CAND_SHA[_mfr_k]}")
+  done
+  CAND_IDX=("${_mfr_i[@]}"); CAND_DIR=("${_mfr_d[@]}"); CAND_SLUG=("${_mfr_s[@]}")
+  CAND_PR=("${_mfr_p[@]}");  CAND_BRANCH=("${_mfr_b[@]}"); CAND_SHA=("${_mfr_h[@]}")
+
+  # The promoted PRs are, by construction, the first ${#_mfr_ready[@]} entries of the new order.
+  for ((_mfr_k = 0; _mfr_k < ${#_mfr_ready[@]}; _mfr_k++)); do
+    _mfr_prs="${_mfr_prs:+$_mfr_prs,}${CAND_PR[_mfr_k]}"
+  done
+  journal_append merge_fairness_priority promoted "${#_mfr_ready[@]}" deferred "${#_mfr_rest[@]}" prs "$_mfr_prs"
+  return 0
+}
+
 # purge_pr_approvals <pr#> — on merge/reap, drop EVERY approval-ledger row for this PR number
 # (awaiting/approved/observed/hv-informed) regardless of sha. HERD-90: when a HUMAN-VERIFY hold
 # re-applies at a NEW sha and the PR is merged at that sha, the OLD sha's 'awaiting' row was never
@@ -3329,6 +3515,12 @@ _classify_conflict() {
   # HERD-147 flair default: a conflict is a needs-you/red state → 'attention' in the pasture header
   # (never softened). The in-progress "resolving conflict…" outcomes below downgrade it to 'busy'.
   FLAIR_STATE[ci]="attention"
+
+  # RE-STALE LAP (HERD-231): a PR that was a gate CANDIDATE and is now CONFLICTING lost this sha to a
+  # merge that landed under it, exactly as a stale-base hold does. Counted once per sha (and only when
+  # gate work was actually invested), before the early returns below — every branch here is a lost lap.
+  # The decoration of the row it paints happens at the caller, which knows the branch it took.
+  _restale_note "$cpr" "$csha" "$cslug" conflict
 
   # ESCALATE already recorded for THIS sha → terminal; hold for a human, never re-dispatch.
   if resolver_escalated_sha "$cpr" "$csha"; then
@@ -5528,8 +5720,13 @@ This PR appears to re-implement already-shipped work, or sits on a base stale en
       herd_driver_notify "🛑 PR #${_sdg_pr} held — stale/duplicate" "${_sdg_slug}: ${_STALE_DUP_REASON}" default
     fi
   fi
+  # RE-STALE LAP (HERD-231). Count this hold as a lost lap IF the sha it holds already carried gate
+  # work — a suite that ran, a reviewer in flight, a verdict recorded. Held-before-any-gate is not a
+  # lap: nothing was thrown away. Observability only; nothing below reads the count.
+  _restale_note "$_sdg_pr" "$_sdg_sha" "$_sdg_slug" "$_STALE_DUP_KIND"
   _handle_stale_dup "$_sdg_pr" "$_sdg_slug" "$_sdg_sha" "$_sdg_idx" "$_sdg_dir" "$_sdg_branch" \
     "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
+  _restale_decorate_row "$_sdg_idx" "$_sdg_pr"
   render
   return 1
 }
@@ -8458,6 +8655,8 @@ EOF
       # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
       # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
       _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
+      # HERD-231: whichever row that painted, a starving PR says so underneath it.
+      _restale_decorate_row "$i" "$prnum"
     elif [ "$mergeable" = "MERGEABLE" ]; then
       # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
       # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
@@ -8533,6 +8732,15 @@ EOF
   # WATCH_CLAUDE_PROBE_TIMEOUT is armed; the probe only runs when there is at least one candidate to protect.
   _claude_hung=""
   if [ -n "${CAND_IDX[*]:-}" ] && [ "$(_claude_exec_hung)" = "HUNG" ]; then _claude_hung=1; fi
+
+  # MERGE FAIRNESS (HERD-231, MERGE_FAIRNESS=on — dormant by default). Visit every candidate whose gates
+  # are ALREADY green for its head sha before any candidate that still needs gate work, so a ready PR
+  # merges this tick instead of waiting behind dispatches for its siblings — dispatches whose eventual
+  # merge is precisely what re-stales it (PR #328 lost four laps that way, PR #347 three). Ordering only:
+  # a promoted candidate still runs the pre-merge re-verify, the unconditional stale-base re-check and
+  # the merge-policy decision below. With the knob off the arrays are untouched and this pass is
+  # byte-identical to before the feature. See _merge_fairness_reorder.
+  _merge_fairness_reorder
 
   # Action pass: gate + auto-merge each CLEAN/MERGEABLE candidate.
   j=0

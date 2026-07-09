@@ -262,6 +262,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # off (default) → byte-identical to the pre-HERD-199 hold (🛑 needs-you). Watcher-affecting.
 # STALE_BASE_AUTOFIX="off"  # off (default) | on
 
+# merge fairness / ready-PR priority (HERD-231) — on | off (default off, ship-dormant). on → in the
+# watcher's action pass, a candidate whose gates are ALREADY green for its head sha (cached CLEAN/FLAKY
+# healthcheck + review PASS, or a human-overridden BLOCK) is visited BEFORE any candidate that still
+# needs gate work — so it merges this tick rather than waiting behind sibling dispatches whose merge is
+# exactly what re-stales it. Ordering only: a promoted PR still runs the pre-merge re-verify, the
+# unconditional stale-base re-check and the merge-policy decision, so nothing merges that has not fully
+# passed. off (default) → candidate order byte-identical to before. The `starving · N re-stale laps` row
+# and the pr_restale/pr_starvation journal events are ALWAYS ON and unaffected by this knob (they only
+# report). Enable in high-churn repos where PRs lose repeated laps to sibling merges. Watcher-affecting.
+# MERGE_FAIRNESS="off"      # off (default) | on
+
 # herd/gates commit status (HERD-194) — on (default) | off. on → as the watcher clears each (pr,sha) it
 # posts a `herd/gates` COMMIT STATUS: state=success on both-gates-green (healthcheck + adversarial
 # review), exactly once per (pr,sha). It posts ONLY success — never a non-passing pending/failure status,
