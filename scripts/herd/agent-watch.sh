@@ -1076,6 +1076,119 @@ review_verdict_source() {
   awk -v p="$1" -v s="$2" '$2==p && $3==s{src=$5} END{ if(src==""){src="reviewer"} print src }' "$REVIEW_STATE" 2>/dev/null || printf 'reviewer'
 }
 
+# ── DELTA-SCOPED REVIEW carry-forward (HERD-204) ─────────────────────────────────────────────────
+# When a builder pushes a PURE INTEGRATION commit — it merged DEFAULT_BRANCH into the branch with NO
+# authored change beyond the merge — re-running the full adversarial review for that new sha burns
+# tokens/time for zero correctness gain: the newly-merged main commits are already-reviewed main, and
+# the merge itself introduced no new authored content. With DELTA_REVIEW=on, the review gate PROVES
+# the delta between the new head sha and this PR's LAST review-PASSED sha is integration-only and, if
+# so, CARRIES FORWARD the prior PASS onto the new sha instead of dispatching a reviewer.
+#
+# The proof is CONSERVATIVE + FAIL-CLOSED — every one of these must hold, else a normal full review:
+#   1. DELTA_REVIEW=on (opt-in; default/unknown → off → byte-inert).
+#   2. the PR has a recorded PASS for an OLDER sha (the carry source).
+#   3. the new sha is a 2-parent MERGE commit.
+#   4. one parent IS the last-passed sha (the branch side — already reviewed & PASSED).
+#   5. the OTHER parent is already contained in DEFAULT_BRANCH (already-reviewed main).
+#   6. the new commit's tree EQUALS a clean 3-way auto-merge of those two parents — i.e. the merge
+#      carries ZERO manual edits (no authored conflict resolution). A conflicted or hand-edited merge
+#      fails this and gets a full review.
+# Any authored change beyond the merge diverges the tree (6) or breaks the parent identity (4), and a
+# missing sha / worktree / main ref simply returns "not provable" → full review. So a real code change
+# NEVER carries forward.
+
+# _delta_review_enabled — true iff DELTA_REVIEW opts in (on). Default/unknown → off (fail safe).
+_delta_review_enabled() {
+  case "${DELTA_REVIEW:-off}" in
+    on|On|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _review_last_passed_sha <pr#> — echo the most-recently recorded PASS sha for this PR (any PASS
+# provenance: a real reviewer PASS, a low-risk skip, or an earlier carry-forward — each traces back to
+# a real cleared commit). Empty + rc1 when the PR has no recorded PASS yet.
+_review_last_passed_sha() {
+  [ -s "$REVIEW_STATE" ] || return 1
+  awk -v p="$1" '$2==p && $4=="PASS"{s=$3} END{if(s){print s} else exit 1}' "$REVIEW_STATE" 2>/dev/null
+}
+
+# _delta_main_ref <dir> — echo the first resolvable ref naming DEFAULT_BRANCH in <dir> (the bare name,
+# then origin/<name>, then refs/remotes/origin/<name>), used for the "parent already in main" ancestry
+# check. rc1 (no output) when none resolves → the caller treats that as "not provable" → full review.
+_delta_main_ref() {
+  local dir="$1" b="${DEFAULT_BRANCH:-main}" c
+  b="${b#origin/}"
+  for c in "$DEFAULT_BRANCH" "$b" "origin/$b" "refs/remotes/origin/$b"; do
+    [ -n "$c" ] || continue
+    if git -C "$dir" rev-parse --verify --quiet "${c}^{commit}" >/dev/null 2>&1; then
+      printf '%s' "$c"; return 0
+    fi
+  done
+  return 1
+}
+
+# _delta_is_integration_only <dir> <old-sha> <new-sha> — return 0 iff the delta from <old-sha> (the
+# last-passed commit) to <new-sha> (the new head) is PROVABLY a pure merge of DEFAULT_BRANCH with no
+# authored content. Fail-closed: any missing precondition, unresolved ref, or content divergence → 1.
+_delta_is_integration_only() {
+  local dir="$1" old="$2" new="$3"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ] || return 1
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  # Both commits must be present in this worktree's object store.
+  local oldfull newfull
+  oldfull="$(git -C "$dir" rev-parse --verify --quiet "${old}^{commit}" 2>/dev/null)" || return 1
+  newfull="$(git -C "$dir" rev-parse --verify --quiet "${new}^{commit}" 2>/dev/null)" || return 1
+  # The new head must be a MERGE with EXACTLY two parents (a simple integration merge).
+  local pline p1 p2
+  pline="$(git -C "$dir" rev-list --parents -n1 "$newfull" 2>/dev/null)" || return 1
+  # shellcheck disable=SC2086
+  set -- $pline
+  shift                       # drop the commit's own oid; the rest are its parents
+  [ "$#" -eq 2 ] || return 1
+  p1="$1"; p2="$2"
+  # One parent must BE the last-passed sha (the already-reviewed branch side); the other is the
+  # main-side parent. Neither → an authored commit sits between old and the merge → full review.
+  local branchp mainp
+  if   [ "$p1" = "$oldfull" ]; then branchp="$p1"; mainp="$p2"
+  elif [ "$p2" = "$oldfull" ]; then branchp="$p2"; mainp="$p1"
+  else return 1
+  fi
+  # The main-side parent must already be contained in DEFAULT_BRANCH (already-reviewed main).
+  local mainref
+  mainref="$(_delta_main_ref "$dir")" || return 1
+  git -C "$dir" merge-base --is-ancestor "$mainp" "$mainref" 2>/dev/null || return 1
+  # CONTENT-TRIVIAL merge: the new commit's tree must equal a clean 3-way auto-merge of the two
+  # parents. A non-zero merge-tree (conflict) or any manual edit diverges the tree → full review.
+  local auto rc newtree
+  auto="$(git -C "$dir" merge-tree --write-tree "$branchp" "$mainp" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  auto="$(printf '%s\n' "$auto" | head -1)"
+  [ -n "$auto" ] || return 1
+  newtree="$(git -C "$dir" rev-parse --verify --quiet "${newfull}^{tree}" 2>/dev/null)" || return 1
+  [ "$auto" = "$newtree" ] || return 1
+  return 0
+}
+
+# _maybe_carry_forward_review <pr#> <slug> <sha> — if DELTA_REVIEW=on and the delta from this PR's
+# last-passed sha to <sha> is provably integration-only, RECORD a carried-forward PASS for <sha> (with
+# a distinct source=carried-forward provenance) + journal review_carried_forward, and return 0 so the
+# caller skips the reviewer dispatch. Return 1 (carry nothing) in every other case → normal review.
+_maybe_carry_forward_review() {
+  _delta_review_enabled || return 1
+  local pr="$1" slug="$2" sha="$3" old dir
+  [ -n "$sha" ] || return 1
+  old="$(_review_last_passed_sha "$pr")" || return 1
+  [ -n "$old" ] && [ "$old" != "$sha" ] || return 1
+  dir="$TREES/$slug"
+  _delta_is_integration_only "$dir" "$old" "$sha" || return 1
+  record_review "$pr" "$sha" "PASS" "carried-forward"
+  journal_append review_carried_forward pr "$pr" sha "$sha" from_sha "$old" slug "$slug" \
+    reason "integration-only delta (merge of ${DEFAULT_BRANCH:-main}) — prior review PASS carried forward"
+  return 0
+}
+
 # record_review <pr#> <headSha> <verdict> [source] — append one review record (the instant a verdict
 # is known). <source> is the verdict PROVENANCE (reviewer | gate_default | infra); defaults to
 # "reviewer" when omitted. Only "reviewer" verdicts are ever cached as a sticky BLOCK AND are the
@@ -1800,6 +1913,15 @@ _review_gate_step() {
   fi
 
   if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then echo FAILED; return 0; fi
+
+  # DELTA-SCOPED REVIEW carry-forward (HERD-204): before spending a reviewer on this new sha, try to
+  # PROVE it differs from this PR's last-passed sha ONLY by a merge of DEFAULT_BRANCH (a pure
+  # integration push). If proven, the prior PASS is carried forward onto this sha (recorded +
+  # journalled) and no reviewer is dispatched. Fail-closed (see _delta_is_integration_only): any
+  # authored change or unprovable case falls straight through to the normal review below. Byte-inert
+  # when DELTA_REVIEW is off. Decided BEFORE the risk-tier classification + escalation-arm consumption
+  # so a carry consumes neither a reviewer slot nor a pending Opus escalation.
+  if _maybe_carry_forward_review "$pr" "$slug" "$sha"; then echo PASS; return 0; fi
 
   # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB and/or DOCS_ONLY_GLOB). Default (BOTH
   # empty) → the STRONG tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no
