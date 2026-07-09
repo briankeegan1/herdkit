@@ -484,6 +484,58 @@ Flags: `--artifacts DIR` (`--keep` implied), `--keep`, `-n/--prs N` (default 4, 
 > resolver for the same CONFLICTING sha — the G5 observation from the multi-seat doctrine audit);
 > the shippable fail-gate is per-seat single-flight (`resolver_double_dispatch=0`).
 
+## HERD-251 — WATCHER SELF-RESTART scenario — `sandbox-self-restart-scenario.sh`
+
+The watcher executes the engine code it loaded at startup. When another seat merges a commit that
+rewrites `scripts/herd/agent-watch.sh`, HERD-233 notices and leaves a *"restart recommended"* note —
+and an operator restarts by hand (six times on 2026-07-09). `WATCHER_SELF_RESTART=on` turns that note
+into a **quiesce-then-exec**, and this tier proves the whole loop against the shipped code.
+
+It drives the **real watcher tick** in the shipped order — `_healthcheck_gate` /
+`_dispatch_review` / `spawn_resolver` (the action pass) → `reconcile_main_freshness` →
+`_self_restart_tick` (`agent-watch.sh` sourced in lib mode, `AGENT_WATCH_LIB=1`) — against a **real**
+local git repo wired to a bare origin, with a second clone standing in for the seat that merges. The
+healthcheck worker is a **real background process** writing a **real restart-safe inflight marker**, so
+the drain accounting under test is production's.
+
+Scorecard checkpoints (`result: pass` iff `failed == 0`):
+
+| Checkpoint | Invariant |
+| --- | --- |
+| `suite_inflight` | tick 1 dispatches a real suite; its inflight marker is live |
+| `no_arm_midsuite` | the engine merge lands **mid-suite** → the reconcile defers: no ff, no note, no quiesce |
+| `suite_collects` | the in-flight suite finishes and its verdict is **collected** — a drain never discards paid work |
+| `quiesce_armed` | the next tick fast-forwards `$MAIN`; the delta rewrote the watcher → armed + `watcher_quiesce` |
+| `console_drain_row` | the console note reads `restarting on new engine code · draining N workers` |
+| `no_new_dispatch` | mid-quiesce a second PR's healthcheck is **held** (no suite), the review spawns no reviewer, the resolver burns no respawn round |
+| `drain_waits` | a live gate worker **blocks** the exec and resets the idle streak |
+| `self_restart_fires` | once drained for 2 consecutive ticks → `watcher_self_restart reason=engine-update shas=<old>..<new>` |
+| `gates_resume_on_new_code` | after the restart `$MAIN` holds the new engine image and the held PR's suite dispatches again |
+| `cap_expiry` | a worker that never drains still restarts at the inline **15-minute** cap |
+| `lever_off_identical` | `WATCHER_SELF_RESTART=off` → no arm, no hold, no journal; the row still reads `restart recommended` |
+
+```sh
+# Drive the full quiesce → drain → restart loop; inspect the scorecard:
+bash scripts/herd/sim/sandbox-self-restart-scenario.sh --artifacts /tmp/sr-run
+cat /tmp/sr-run/scorecard.json
+
+# Give the stub suite a longer dwell so the mid-suite merge window is wider:
+SIM_SUITE_SECS=5 bash scripts/herd/sim/sandbox-self-restart-scenario.sh --artifacts /tmp/sr-slow
+```
+
+The scorecard mirrors the sandbox-sim JSON and **adds** `engine_sha` (the sha whose pull carried the
+new watcher code), `restart_cap_secs` (**must be 900**) and `suite_dwell_secs`.
+
+Flags: `--artifacts DIR` (`--keep` implied), `--keep`. Env: `SIM_SUITE_SECS` (default 2). Hermetic
+proof: [`../../../tests/test-sandbox-self-restart.sh`](../../../tests/test-sandbox-self-restart.sh).
+
+> **The one thing not performed is the `exec` itself.** A lib-mode scenario cannot replace its own
+> process image with a live watcher — `HERD_HERMETIC_GUARD` exists precisely to forbid that — so
+> `_self_restart_exec` is **recorded**, and the restarted watcher is modeled by re-applying
+> `agent-watch.sh`'s own startup steps (a fresh process carries no quiesce state, and startup drops the
+> restart note). The real function's journal line and its fail-soft refusal are proven in
+> [`../../../tests/test-watcher-self-restart.sh`](../../../tests/test-watcher-self-restart.sh).
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -497,6 +549,7 @@ Flags: `--artifacts DIR` (`--keep` implied), `--keep`, `-n/--prs N` (default 4, 
 | **HERD-74** | `sandbox-shared-config-scenario.sh` | real `config set --shared` **+** the real watcher gate | a `config/<key>` branch with **no worktree** is **adopted → gated → merged → reaped** |
 | **HERD-127** | `sandbox-governance-scenario.sh` | the real HERD-119 adoption table **+** the shipped PUSH_GATE / ATTRIBUTION / BRANCH_TEMPLATE / COMMIT_CONVENTION gates | the whole governance **import→enforcement chain**: `CLAUDE.md` → mapped keys → held/refused/reddened at the gate (zero model calls) |
 | **HERD-236** | `sandbox-multiseat-scenario.sh` | **two real** watcher gate loops, two `$TREES`, one stub remote | multi-seat: `duplicate_gate_runs=0` / `duplicate_hold_comments=0` / `resolver_double_dispatch=0` / `max_restale_cycles` bounded / all-PRs-drained |
+| **HERD-251** | `sandbox-self-restart-scenario.sh` | the **real** watcher tick + a **real** background suite worker | stale-engine **quiesce → drain → in-place re-exec**: nothing dispatched mid-drain, nothing in flight discarded, cap expiry, kill-switch |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique
