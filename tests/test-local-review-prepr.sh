@@ -208,8 +208,21 @@ grep -q 'belt-and-suspenders' "$WATCH" \
 grep -q 'LOCAL_REVIEW=pre-pr' "$WATCH" \
   || fail "C: agent-watch.sh should mention LOCAL_REVIEW=pre-pr in the review-dispatch note"
 # The dispatch call itself is unconditional (no LOCAL_REVIEW guard around _dispatch_review).
-grep -q 'HERD_REVIEW_RESULT_FILE="\$result".*bash "\$HERD_REVIEW_BIN"' "$WATCH" \
-  || fail "C: the post-PR review dispatch must remain unconditional"
+# HERD-230 threads HERD_REVIEW_SHA / PIN_MODE on adjacent env lines, so RESULT_FILE and the
+# reviewer bin may no longer share a single physical line — match them across a short window.
+if ! python3 - "$WATCH" <<'PY'
+import sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+for i, line in enumerate(lines):
+    if 'HERD_REVIEW_RESULT_FILE="$result"' in line:
+        window = "\n".join(lines[i:i+6])
+        if 'bash "$HERD_REVIEW_BIN"' in window:
+            sys.exit(0)
+sys.exit(1)
+PY
+then
+  fail "C: the post-PR review dispatch must remain unconditional"
+fi
 ok
 
 echo "ALL PASS ($pass checks)"

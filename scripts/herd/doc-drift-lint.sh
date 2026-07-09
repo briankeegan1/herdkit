@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# doc-drift-lint.sh — THE shared doc-drift guard (HERD-168 / extends HERD-96): every
-# `herd <subcommand>` REFERENCED in README.md + docs/*.md (and every CONFIG_KEY-shaped token
-# REFERENCED in README.md) must resolve to a row in templates/capabilities.tsv. A doc that
-# references a command absent from the manifest is a CODE error — the docs-drift analog of the
-# conformance / caps-sync ratchet.
+# doc-drift-lint.sh — THE shared doc-drift guard (HERD-168 / extends HERD-96; HERD-254
+# templates/*.tmpl extension): every `herd <subcommand>` REFERENCED in README.md + docs/*.md
+# + templates/*.tmpl (and every CONFIG_KEY-shaped token REFERENCED in README.md) must resolve
+# to a row in templates/capabilities.tsv. A doc or render-template that references a command
+# absent from the manifest is a CODE error — the docs-drift analog of the conformance /
+# caps-sync ratchet. Phantom commands in templates/*.tmpl are MORE damaging than in a doc:
+# coordinator.md.tmpl (and fleet-coordinator.md.tmpl) render into every seat's operating
+# instructions, so a typo'd subcommand would instruct coordinators to run something that
+# does not exist.
 #
 # ONE implementation, sourced (never executed) by BOTH gate surfaces so they can never disagree:
 #     • scripts/herd/healthcheck.sh  — the builder's LIGHT pre-PR gate (docs-only diffs run light
@@ -16,7 +20,9 @@
 # stripped) so English prose like "manage several herd projects at once" never reads as a
 # command. Config keys are checked on README.md only — design docs (audits, spikes, SOPs) name
 # many internal/env tokens that are not capability knobs; flagging them would false-red a clean
-# tree. Commands are checked on README.md + every top-level docs/*.md.
+# tree. Commands are checked on README.md + every top-level docs/*.md + every templates/*.tmpl.
+# Template placeholder syntax ({{...}}) is stripped before matching so render tokens never
+# false-positive as subcommands or keys.
 #
 # herd_doc_drift_lint [<root>]
 #   Run against <root> (default: cwd). Prints DRIFT lines on stdout (one per unknown token) then
@@ -24,9 +30,10 @@
 #   Exit: 0 = clean · 1 = drift (DRIFT lines on stdout) · 2 = skipped (infra; NEVER a red).
 #   On a skip, $HERD_DOC_DRIFT_SKIP_REASON carries the one-line why.
 #
-# herd_doc_drift_report <caps> <readme> [doc.md ...]
+# herd_doc_drift_report <caps> <readme> [doc-or-tmpl ...]
 #   Pure-function form used by the hermetic test fixtures. Same stdout/exit contract as above
 #   (no skip path — missing files are the caller's problem). Exit 0 clean / 2 if any DRIFT line.
+#   Extra args after <readme> are command-only surfaces (docs/*.md and/or templates/*.tmpl).
 #
 # Fail-soft by construction: no capabilities.tsv / no python3 → skip, never a false red in a
 # consuming project that has neither a manifest nor our docs surface. SHIP-DORMANT: a clean
@@ -34,12 +41,13 @@
 
 HERD_DOC_DRIFT_SKIP_REASON=""
 
-# herd_doc_drift_report <caps> <readme> [doc.md ...] — pure function of the listed files.
+# herd_doc_drift_report <caps> <readme> [doc-or-tmpl ...] — pure function of the listed files.
 # stdout: DRIFT lines then ADVISORY summary. exit 2 if any DRIFT, else 0.
 herd_doc_drift_report() {
   local _dd_caps="${1:-}" _dd_readme="${2:-}"
   shift 2 2>/dev/null || true
-  # Remaining args are extra doc files (docs/*.md). Empty is fine (README-only).
+  # Remaining args are extra command-only surfaces (docs/*.md and/or templates/*.tmpl).
+  # Empty is fine (README-only).
   HERD_DD_CAPS="$_dd_caps" HERD_DD_README="$_dd_readme" HERD_DD_DOCS="$(printf '%s\n' "$@")" \
     python3 - <<'PY'
 import os, re, sys
@@ -49,11 +57,18 @@ readme_path = os.environ.get("HERD_DD_README") or ""
 docs = [p for p in os.environ.get("HERD_DD_DOCS", "").split("\n") if p]
 
 KEY = re.compile(r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b")  # CONFIG_KEY-shaped: UPPER_SNAKE, ≥1 '_'
+# Render-template placeholders ({{TOKEN}} / {{ TOKEN }}) must never read as commands or keys.
+TMPL_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
 
 def strip_comment(s):
     # Drop a shell '#' comment so prose inside a fenced block never reads as a command/key.
     m = re.search(r"(^|\s)#", s)
     return s[: m.start()] if m else s
+
+def strip_placeholders(s):
+    # HERD-254: drop {{...}} before command-position matching so template tokens never
+    # false-positive (e.g. `herd {{SUB}}` must not invent a subcommand named from the braces).
+    return TMPL_PLACEHOLDER.sub(" ", s)
 
 def extract(path, want_keys):
     """Command-position scoped extraction. want_keys=False skips CONFIG_KEY harvesting."""
@@ -69,7 +84,7 @@ def extract(path, want_keys):
             in_fence = not in_fence
             continue
         if in_fence:
-            code = strip_comment(ln)
+            code = strip_placeholders(strip_comment(ln))
             m = re.match(r"\s*(?:\$\s+)?herd ([a-z][a-z-]+)", code)
             if m:
                 ref_subs.add(m.group(1))
@@ -77,6 +92,7 @@ def extract(path, want_keys):
                 ref_keys |= set(KEY.findall(code))
         else:
             for span in re.findall(r"`([^`\n]+)`", ln):
+                span = strip_placeholders(span)
                 m = re.match(r"herd ([a-z][a-z-]+)", span)
                 if m:
                     ref_subs.add(m.group(1))
@@ -106,7 +122,9 @@ for row in caps_lines[1:]:
         valid_keys.add(name)
 
 # ── Extract references ────────────────────────────────────────────────────────────────────────
-# README: commands + config keys (HERD-96). docs/*.md: commands only (HERD-168).
+# README: commands + config keys (HERD-96). docs/*.md + templates/*.tmpl: commands only
+# (HERD-168 / HERD-254). Templates render into seat operating instructions — same red
+# direction as docs, no config-key harvesting (placeholders dominate that surface).
 ref_subs, ref_keys = set(), set()
 sub_where = {}  # sub -> sorted set of short labels
 if readme_path:
@@ -143,7 +161,7 @@ adv_subs = sorted(valid_subs - ref_subs)
 adv_keys = sorted(valid_keys - ref_keys)
 print(
     f"ADVISORY: {len(adv_subs)} command(s) + {len(adv_keys)} config key(s) documented in "
-    f"capabilities.tsv but not mentioned in README/docs (curated, not exhaustive — never a failure)"
+    f"capabilities.tsv but not mentioned in README/docs/templates (curated, not exhaustive — never a failure)"
 )
 if adv_subs:
     print("ADVISORY   commands: " + ", ".join("herd " + s for s in adv_subs))
@@ -187,9 +205,19 @@ herd_doc_drift_lint() {
     done
   fi
 
-  # Nothing to scan (no README, no docs) → clean no-op (a consuming project with only a manifest).
+  # templates/*.tmpl — render sources that become seat operating instructions (HERD-254).
+  # Same command-only extraction as docs; {{...}} placeholders are stripped in the report.
+  if [ -d "$_dd_root/templates" ]; then
+    for _f in "$_dd_root"/templates/*.tmpl; do
+      [ -f "$_f" ] || continue
+      _dd_docs+=("$_f")
+    done
+  fi
+
+  # Nothing to scan (no README, no docs, no templates) → skip (a consuming project with only a
+  # manifest and no operator-facing prose/render surface).
   if [ -z "$_dd_readme" ] && [ "${#_dd_docs[@]}" -eq 0 ]; then
-    HERD_DOC_DRIFT_SKIP_REASON="no README.md or docs/*.md to scan"
+    HERD_DOC_DRIFT_SKIP_REASON="no README.md, docs/*.md, or templates/*.tmpl to scan"
     return 2
   fi
 
