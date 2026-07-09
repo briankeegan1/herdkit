@@ -7585,11 +7585,81 @@ _prs_fetch_tick() {
   return 0
 }
 
-# ── Feature-worktree discovery (HERD-182) ─────────────────────────────────────────────────────────
+# ── Branch-ref repair (HERD-226) ─────────────────────────────────────────────────────────────────
+# A worktree that the sha-fallback join matched (its HEAD is exactly one open PR's head commit) is on
+# the WRONG branch name — a resolver or builder left it on a scratch ref. Point the PR's own branch at
+# that commit and check it out, so the next tick's cheap branch-name join matches on its own.
+#
+# The repair is deliberately timid. It runs ONLY when the repair is provably lossless:
+#   • the worktree is CLEAN (no dirty or untracked files — nothing to strand);
+#   • HEAD is exactly the PR's head commit (never move a diverged branch onto a stranger's work);
+#   • the PR's local branch is absent, or its tip is an ANCESTOR of HEAD (a fast-forward, never a
+#     clobber of a diverged ref) — and `checkout -B` itself refuses a branch checked out elsewhere.
+# Any other shape (dirty tree, diverged ref, ambiguous match, DRYRUN) is a SKIP: the sha-join match is
+# already recorded, so gating proceeds untouched and the console renders the truthful mismatch row.
+# FAIL-SOFT by construction: every git call's failure is a SKIP, never a gate block.
+# Echoes REPAIRED (branch now matches the PR) or SKIP. Journals `branch_repaired` on success only —
+# the row carries the un-repaired case, so a stuck worktree never spams the journal every 4 s tick.
+_repair_branch_ref() {
+  local _d="$1" _b="$2" _pb="$3" _sha="$4" _pr="$5" _slug="$6"
+  _repair_branch_ref_try "$@" || { printf 'SKIP'; return 0; }
+  journal_append branch_repaired pr "$_pr" slug "$_slug" sha "$_sha" \
+    from_branch "$_b" to_branch "$_pb" 2>/dev/null || true
+  printf 'REPAIRED'
+}
+
+# _repair_branch_ref_try — the guarded repair itself. Success (rc 0) iff the ref was moved and checked
+# out; every refusal and every git failure is a plain nonzero rc, so the caller's SKIP is the default.
+_repair_branch_ref_try() {
+  local _d="$1" _b="$2" _pb="$3" _sha="$4" _head _tip
+  [ -z "${DRYRUN:-}" ] || return 1
+  [ -n "$_d" ] && [ -n "$_pb" ] && [ -n "$_sha" ] || return 1
+  [ "$_b" != "$_pb" ] || return 1                                      # already on the PR's branch
+  _head="$(git -C "$_d" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_head" ] && [ "$_head" = "$_sha" ] || return 1                # diverged from the PR head
+  [ -z "$(git -C "$_d" status --porcelain 2>/dev/null)" ] || return 1  # dirty tree — never touch it
+  _tip="$(git -C "$_d" rev-parse --verify --quiet "refs/heads/$_pb" 2>/dev/null || true)"
+  if [ -n "$_tip" ] && ! git -C "$_d" merge-base --is-ancestor "$_tip" "$_head" 2>/dev/null; then
+    return 1                                                           # local PR branch diverged
+  fi
+  git -C "$_d" checkout -q -B "$_pb" "$_head" 2>/dev/null || return 1
+}
+
+# _branch_mismatch_text <worktree-branch> <pr-head-description> — the one sentence both the standalone
+# mismatch row and the appended gate-row note render. Naming the two refs is the whole point: an
+# operator seeing it knows the PR was found (gates ARE running) and knows exactly which ref to fix.
+_branch_mismatch_text() {
+  printf 'branch mismatch — worktree on %s, PR head is %s' "$1" "$2"
+}
+
+# _row_branch_mismatch <slug-cell> <text> — the console row for a worktree whose PR could not be
+# joined unambiguously (two open PRs share its HEAD commit). It is NOT an 'awaiting task' spare: a
+# spare has no PR, this one has too many. Yours to disambiguate.
+_row_branch_mismatch() {
+  printf '    %s⚠️%s  %s%s%s %s%s%s' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$C_YELLOW" "$2" "$C_RESET"
+}
+
+# ── Feature-worktree discovery (HERD-182, HERD-226) ──────────────────────────────────────────────
 # _discover_feature_worktrees — parse `git worktree list --porcelain` (in $WT) into one \x1f-joined
-# record per LEGITIMATE builder worktree, matching each to its open PR (by branch) and its agent (by
-# slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits records on stdout,
-# one per line, in the exact field order the tick loop consumes.
+# record per LEGITIMATE builder worktree, matching each to its open PR (by branch, then by HEAD commit)
+# and its agent (by slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits
+# records on stdout, one per line, in the exact field order the tick loop consumes:
+#   dir slug branch pr mergeable mergeStateStatus agent_status headRefOid author matchkind matchdetail
+# The last two are HERD-226's join provenance — matchkind ∈ {branch, sha, ambig, ""} and, for the two
+# non-trivial kinds, the detail the console names (the PR's own branch, or which PRs collide).
+#
+# SHA-RESILIENT JOIN (HERD-226). GROUNDED INCIDENT: a resolver exited leaving its worktree on the
+# scratch branch `pr328`; the branch-name-only join found no PR, so PR #328 was INVISIBLE to the
+# watcher for ~20 min — no gates ran and the console claimed 'awaiting task'. So after the branch-name
+# join, still-unmatched worktrees get a FALLBACK pass: when a worktree's HEAD commit equals exactly
+# ONE still-unmatched open PR's headRefOid (already fetched this tick), that is the PR. The identity is
+# a cryptographic one, and every downstream gate/verdict/ledger is (pr,sha)-keyed — not branch-keyed —
+# so a sha-joined row gates exactly like a branch-joined one.
+#
+# AMBIGUITY IS NEVER RESOLVED, only reported: two open PRs on one commit (or two worktrees on one PR's
+# commit) yields matchkind=ambig with NO pr fields — the tick paints the truthful mismatch row instead
+# of guessing, and never the 'awaiting task' claim that hid #328.
 #
 # DISCOVERY SCOPE (HERD-182): a worktree is a builder candidate ONLY when BOTH hold —
 #   1. it lives UNDER $WORKTREES_DIR ($TREES) — every builder worktree is $WORKTREES_DIR/<slug>,
@@ -7626,29 +7696,65 @@ try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") o
 except Exception: agents = []
 pr_by_branch = {p.get("headRefName"): p for p in prs}
 ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
-feats = []; wt = None; branch = None; detached = False
-def _emit(wt, branch, detached):
+feats = []; wt = None; branch = None; head = None; detached = False
+def _emit(wt, branch, head, detached):
     # A builder candidate is UNDER $WORKTREES_DIR, on a BRANCH (not detached), and not $MAIN.
     if not wt: return
     if MAIN and _real(wt) == main_real: return
     if detached or not branch: return
     if not _under_trees(wt): return
-    feats.append((wt, branch))
+    feats.append((wt, branch, head or ""))
 for line in (os.environ.get("WT") or "").splitlines():
-    if line.startswith("worktree "): wt = line[9:]; branch = None; detached = False
+    if line.startswith("worktree "): wt = line[9:]; branch = None; head = None; detached = False
+    elif line.startswith("HEAD "): head = line[5:]
     elif line.startswith("branch "): branch = line[7:].replace("refs/heads/", "")
     elif line == "detached": detached = True
     elif line == "":
-        _emit(wt, branch, detached); wt = None; branch = None; detached = False
-_emit(wt, branch, detached)
-for wt, branch in feats:
+        _emit(wt, branch, head, detached); wt = None; branch = None; head = None; detached = False
+_emit(wt, branch, head, detached)
+
+# SHA-FALLBACK JOIN (HERD-226). A PR is claimable only when NO discovered worktree already sits on its
+# head branch, and a worktree is a claimant only when the branch join left it PR-less: the cheap name
+# join always wins, so a repo whose names all match takes this pass with nothing to do.
+wt_branches = set(b for _, b, _ in feats)
+free_by_oid = {}   # oid -> [pr, ...]   open PRs no worktree claimed by name
+for p in prs:
+    if p.get("headRefName") in wt_branches: continue
+    oid = p.get("headRefOid")
+    if oid: free_by_oid.setdefault(oid, []).append(p)
+claim_by_oid = {}  # oid -> [wt, ...]   worktrees the name join left unmatched
+for w, b, h in feats:
+    if b in pr_by_branch or not h: continue
+    claim_by_oid.setdefault(h, []).append(w)
+
+fallback = {}      # wt -> (pr_or_None, matchkind, detail)
+for w, b, h in feats:
+    if b in pr_by_branch or not h: continue
+    cands = free_by_oid.get(h) or []
+    peers = claim_by_oid.get(h) or []
+    if not cands: continue                                     # no PR at this commit — a real spare
+    if len(cands) == 1 and len(peers) == 1:
+        # Exactly one PR head at exactly one worktree HEAD: a cryptographic identity, not a guess.
+        fallback[w] = (cands[0], "sha", cands[0].get("headRefName") or "")
+    else:
+        # Two PRs on one commit, or two worktrees on one PR head. Never guess which; say so.
+        nums = ",".join("#%s" % p.get("number") for p in sorted(cands, key=lambda p: p.get("number") or 0))
+        fallback[w] = (None, "ambig", "ambiguous (%s share this commit)" % nums)
+
+for wt, branch, head in feats:
     slug = os.path.basename(wt)
     pr = pr_by_branch.get(branch or "", {})
+    kind = "branch" if pr else ""
+    detail = ""
+    if not pr and wt in fallback:
+        fb, kind, detail = fallback[wt]
+        pr = fb or {}
     print("\x1f".join(str(x) for x in [
         wt, slug, branch or "", pr.get("number", ""),
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
         ag_status.get(slug, ""), pr.get("headRefOid", ""),
-        (pr.get("author") or {}).get("login", "")]))
+        (pr.get("author") or {}).get("login", ""),
+        kind, detail]))
 '
 }
 
@@ -8225,6 +8331,8 @@ while true; do
   # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
   # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
   # the main checkout is excluded as before. See _discover_feature_worktrees.
+  # Each record also carries HERD-226's join provenance: matchkind (branch | sha | ambig | "") and a
+  # matchdetail (the PR's own branch name for a sha join; which PRs collide for an ambiguous one).
   FEATS=()
   while IFS= read -r rec; do
     [ -n "$rec" ] && FEATS+=("$rec")
@@ -8237,11 +8345,26 @@ while true; do
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
 $rec
 EOF
     sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # HERD-226: this row's PR was found by HEAD commit, not by branch name — the worktree sits on some
+    # other ref (a resolver's scratch branch). Try the lossless repair; if it takes, the row is an
+    # ordinary branch-matched one from here down (and stays so next tick, via the cheap name join).
+    # If it cannot (dirty tree, diverged ref), the sha-join match STILL stands — gates are (pr,sha)-
+    # keyed — and we hang the truthful mismatch note on whatever row the classification produces.
+    # $SELF_WT is exempt: never swap the branch out from under the checkout this watcher is running.
+    _bmismatch=""
+    if [ "$matchkind" = "sha" ]; then
+      if [ "$dir" != "$SELF_WT" ] \
+         && [ "$(_repair_branch_ref "$dir" "$branch" "$matchdetail" "$headsha" "$prnum" "$slug")" = "REPAIRED" ]; then
+        branch="$matchdetail"
+      else
+        _bmismatch="$(_branch_mismatch_text "$branch" "$matchdetail")"
+      fi
+    fi
     if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
       # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
       # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
@@ -8263,7 +8386,13 @@ EOF
         *)        FLAIR_STATE[i]="attention" ;;
       esac
     elif [ -z "$prnum" ]; then
-      if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+      if [ "$matchkind" = "ambig" ]; then
+        # HERD-226: this worktree's HEAD is the head commit of MORE THAN ONE open PR (or it shares that
+        # commit with a sibling worktree). A PR-less row would read 'awaiting task · assign or retire'
+        # — the exact lie that hid PR #328. The commit is claimed; which PR is yours to say.
+        DISPLAY[i]="$(_row_branch_mismatch "$sl" "$(_branch_mismatch_text "$branch" "$matchdetail")")"
+        FLAIR_STATE[i]="attention"
+      elif [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
         # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
         # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
         # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
@@ -8404,6 +8533,10 @@ EOF
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
       FLAIR_STATE[i]="attention"
     fi
+    # A sha-joined worktree we could not repair keeps its real row — health-check, blocked, conflict,
+    # whatever the PR's state is — with the mismatch named after it. The gate outcome is the headline;
+    # the stale ref is the footnote. Empty (the overwhelmingly common case) leaves the row untouched.
+    [ -n "$_bmismatch" ] && DISPLAY[i]="${DISPLAY[i]} ${C_YELLOW}· ${_bmismatch}${C_RESET}"
     i=$((i + 1))
   done
 
