@@ -205,14 +205,14 @@ RECONCILE_STATE="$TREES/.agent-watch-reconciled"
 # ONCE per sha instead of every tick (the console row itself is re-rendered every tick from the live
 # re-check). Keyed by pr+sha like the review/health ledgers, so a new commit re-evaluates fresh.
 STALE_DUP_STATE="$TREES/.agent-watch-stale-dup"
-# herd/gates commit-status ledger (HERD-194): one line "<epoch> <pr#> <sha> <conclusion>" per commit
-# STATUS this watcher successfully POSTED, conclusion ∈ success | failure (terminal only — see the
-# gate-status helpers for why `pending` is never posted). Keyed by pr+sha+conclusion (mirroring the
-# review/health once-per-sha ledgers) so each (pr,sha,conclusion) posts EXACTLY ONCE — the GitHub
-# Statuses API is itself idempotent per (sha,context), but this ledger stops us re-POSTing (a network
-# write) on every 4 s tick. A row is written ONLY after the API write succeeds, so a transient failure
-# re-tries next tick (fail-safe: the status MUST land, since its ABSENCE is exactly what keeps a PR
-# unmergeable under `require herd/gates` branch protection).
+# herd/gates commit-status ledger (HERD-194): one line "<epoch> <pr#> <sha> success" per SUCCESS commit
+# STATUS this watcher successfully POSTED. The watcher posts ONLY `success` (a green blessing) — never a
+# non-passing pending/failure status, which would flip a CLEAN sha to UNSTABLE and strand it (see the
+# gate-status helpers). Keyed by pr+sha so the blessing posts EXACTLY ONCE — the GitHub Statuses API is
+# itself idempotent per (sha,context), but this ledger stops us re-POSTing (a network write) on every
+# 4 s tick. A row is written ONLY after the API write succeeds, so a transient failure re-tries next
+# tick (fail-safe: the blessing MUST land, since its ABSENCE is exactly what keeps a PR unmergeable
+# under `require herd/gates` branch protection).
 GATE_STATUS_STATE="$TREES/.agent-watch-gate-status"
 # The commit-status context the watcher posts + the operator requires in branch protection. Kept as a
 # constant (not a config key) so the protection recipe in docs/governance-gates.md and the watcher can
@@ -1751,13 +1751,17 @@ _review_gate_step() {
 # watcher that actually ran the gates, so its ABSENCE (no watcher blessed this commit) leaves the PR
 # unmergeable under protection. --match-head-commit in do_merge stays as the belt-and-suspenders guard.
 #
-# Terminal-only per (pr,sha): success (both gates green) | failure (reproduced healthcheck CODEERROR,
-# or a review BLOCK). We deliberately do NOT post a `pending` status — a pending NON-passing commit
-# status flips a CLEAN sha to mergeStateStatus=UNSTABLE (neither CLEAN nor BLOCKED), which would strand
-# the PR out of both the merge path and the bless path in the DEFAULT unprotected config. The fail-safe
-# needs only the ABSENCE of success; GitHub itself renders a missing REQUIRED check as "Expected".
-# Each conclusion posts EXACTLY ONCE (sha-keyed $GATE_STATUS_STATE ledger), and the whole surface is
-# best-effort + fail-soft — every helper returns 0 and never breaks the gate loop.
+# SUCCESS-ONLY: the watcher posts EXACTLY ONE terminal state — `success`, when both gates are green.
+# It NEVER posts a non-passing status (`pending` or `failure`). This is deliberate and load-bearing: a
+# non-passing commit status flips a CLEAN sha to mergeStateStatus=UNSTABLE in the DEFAULT unprotected
+# config (where herd/gates is not a required check), and UNSTABLE is neither CLEAN (drops out of the
+# merge path) nor BLOCKED (not gate-eligible) — a self-inflicted deadlock that would silently strand
+# every PR and break the block/override/auto-refix paths. The fail-safe does not need a failing status:
+# it rests entirely on the ABSENCE of `success` (a PR the watcher did not bless has no success status,
+# so it is unmergeable under `require herd/gates` protection — GitHub renders the missing REQUIRED check
+# as "Expected" on its own). A gate FAIL therefore posts NOTHING; only a green (pr,sha) is blessed.
+# The success post is idempotent + at-most-once (sha-keyed $GATE_STATUS_STATE ledger), and the whole
+# surface is best-effort + fail-soft — every helper returns 0 and never breaks the gate loop.
 
 # _gate_status_enabled — master lever. GATE_STATUS=off disables posting entirely (byte-inert: no read,
 # no post, no ledger); any other value (default) → on. Mirrors STALE_DUP_DETECT's on|off shape.
@@ -1779,24 +1783,23 @@ _record_gate_status() {
 _gate_status_desc() {
   case "$1" in
     success) printf 'healthcheck + adversarial review passed' ;;
-    failure) printf 'a gate failed — see the PR for the healthcheck/review finding' ;;
     *)       printf 'herd/gates' ;;
   esac
 }
 
 # post_gate_status <pr#> <sha> <conclusion> [description] — post the herd/gates commit status for this
-# (pr,sha) via the GitHub Statuses API, at most ONCE per (pr,sha,conclusion). Only the TERMINAL
-# conclusions success|failure are accepted (each maps 1:1 to the API `state`); `pending` is
-# intentionally rejected (see the state-machine note above — a pending status mutates mergeStateStatus).
-# No-op when GATE_STATUS=off, the sha is empty, the conclusion is unrecognized, or this conclusion was
-# already posted. Under --dry-run it is a pure no-op (no network, no ledger). The ledger row is written
-# ONLY on a successful API write, so a failed post re-tries next tick — the status MUST land for the
-# fail-safe to hold. Always returns 0.
+# (pr,sha) via the GitHub Statuses API, at most ONCE per (pr,sha). ONLY `success` is accepted (it maps
+# to the API `state`); every non-passing conclusion (`pending`/`failure`/anything) is intentionally
+# rejected as a no-op — a non-passing status mutates mergeStateStatus and would strand the PR (see the
+# state-machine note above). No-op when GATE_STATUS=off, the sha is empty, or success was already
+# posted. Under --dry-run it is a pure no-op (no network, no ledger). The ledger row is written ONLY on
+# a successful API write, so a failed post re-tries next tick — the blessing MUST land for the fail-safe
+# to hold. Always returns 0.
 post_gate_status() {
   local pr="$1" sha="$2" state="$3" desc="${4:-}"
   _gate_status_enabled || return 0
   [ -n "$sha" ] || return 0
-  case "$state" in success|failure) ;; *) return 0 ;; esac
+  case "$state" in success) ;; *) return 0 ;; esac
   _gate_status_posted "$pr" "$sha" "$state" && return 0
   [ -n "$DRYRUN" ] && return 0
   [ -n "$desc" ] || desc="$(_gate_status_desc "$state")"
@@ -3389,10 +3392,12 @@ _handle_block_verdict() {
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
 
-  # herd/gates → failure (HERD-194). A BLOCK verdict is a hard review-gate fail; post it once per sha
-  # (ledger-deduped) at this single BLOCK choke point, so the PR is unmergeable under branch protection
-  # even while an auto-refix bounce is in flight. A later PASS on a NEW sha posts a fresh success.
-  post_gate_status "$_hbv_pr" "$_hbv_sha" failure "review: BLOCK"
+  # herd/gates (HERD-194): a BLOCK is a gate FAIL, but we deliberately post NOTHING here. The fail-safe
+  # rests only on the ABSENCE of a herd/gates=success — a BLOCK simply means success is never posted, so
+  # the PR stays unmergeable under `require herd/gates` protection. We must NOT post a `failure` status:
+  # a non-passing status flips a CLEAN sha to mergeStateStatus=UNSTABLE (in the DEFAULT unprotected
+  # config, where herd/gates is not required), which would strand the PR out of the candidate loop and
+  # silently break the block/override/auto-refix paths this very function drives. See post_gate_status.
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
     # HARDENING (HERD-155 F5): NEVER pane-run a re-task prompt into a LIMIT-PARKED builder. A builder
@@ -5916,19 +5921,17 @@ EOF
     esac
 
     # CROSS-SEAT GATE DEDUP (HERD-194). BEFORE dispatching our own (expensive) gates, check whether the
-    # head sha already carries a herd/gates=success status posted by ANOTHER operator's watcher — the
-    # multi-op audit's "don't both run the gates on a shared PR". Team mode only (WATCHER_SCOPE=all): in
-    # the solo default no other seat sees this PR, so no per-tick status read runs (byte-inert). Our OWN
-    # blessing (already in $GATE_STATUS_STATE) never triggers this — we posted it, so we fall through to
-    # our merge path. Defensive: because a non-owned PR never enters CAND_IDX (the ownership gate), the
-    # only seat that reaches here for a given sha is its owner, so in practice this skips a sha WE would
-    # otherwise re-gate after a ledger loss — cheap insurance against duplicate gate spend either way.
+    # head sha already carries a herd/gates=success status (posted by ANOTHER operator's watcher, or by
+    # US before a $GATE_STATUS_STATE ledger loss). Team mode only (WATCHER_SCOPE=all): in the solo
+    # default no other seat sees this PR, so no per-tick status read runs (byte-inert). We do NOT `skip`
+    # the candidate — a skip would strand an OWNED, CLEAN, already-blessed PR forever on a ledger loss.
+    # Instead we HEAL the ledger from the observed blessing (so the redundant status re-POST is deduped)
+    # and fall through to the normal action pass, which merges an owned CLEAN PR as usual. Our own
+    # already-recorded blessing never reaches this (the ledger check short-circuits).
     if _gate_status_enabled && _watcher_team_mode \
        && ! _gate_status_posted "$prnum" "$candsha" success \
        && _gate_status_blessed "$candsha"; then
-      DISPLAY[idx]="    ${C_DIM}🤝${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}gates blessed by another seat — skipping${C_RESET}"
-      render
-      continue
+      _record_gate_status "$prnum" "$candsha" success
     fi
 
     # NOTE (HERD-194): we deliberately do NOT post a `pending` herd/gates status here. A pending
@@ -5957,10 +5960,10 @@ EOF
     case "$_HC_RESULT" in
       CLEAN|FLAKY) : ;;            # passed (clean, tolerated data/env, or flaky-then-passed) → gate on
       QUEUED)      continue ;;     # slot busy — re-evaluate next tick, do NOT merge
-      CODEERROR)                   # reproduced code error (red) — held for a human, do NOT merge
-        # herd/gates → failure (HERD-194): a REPRODUCED healthcheck code error is a hard gate fail.
-        post_gate_status "$prnum" "$candsha" failure "healthcheck: reproduced code error"
-        continue ;;
+      CODEERROR)   continue ;;    # reproduced code error (red) — held for a human, do NOT merge. No
+                                  # herd/gates status: success is simply never posted (its ABSENCE keeps
+                                  # the PR unmergeable under protection). Posting a `failure` here would
+                                  # flip a CLEAN sha to UNSTABLE and strand it — see post_gate_status.
       *) continue ;;              # unknown/empty result — hold, do NOT merge (no status either way)
     esac
 

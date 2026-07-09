@@ -75,35 +75,29 @@ reset() { rm -f "$GL"; : > "$GH_LOG"; GH_BLESSED_STATE=""; GH_FAIL_WRITE=""; DRY
 gh_calls() { [ -s "$GH_LOG" ] && grep -c . "$GH_LOG" || echo 0; }
 ledger_rows() { [ -s "$GL" ] && grep -c . "$GL" || echo 0; }
 
-# ── (1) each TERMINAL conclusion posts once, with the right state + context ────
-# `pending` is intentionally NOT a valid conclusion (a pending status mutates mergeStateStatus).
-for st in success failure; do
-  reset
-  post_gate_status 7 "sha-$st" "$st"
-  grep -q "statuses/sha-$st" "$GH_LOG"      || fail "(1) $st: no statuses POST logged"
-  grep -q "state=$st" "$GH_LOG"             || fail "(1) $st: state=$st not in POST"
-  grep -q "context=herd/gates" "$GH_LOG"    || fail "(1) $st: context=herd/gates not in POST"
-  [ "$(ledger_rows)" = "1" ]                || fail "(1) $st: expected exactly 1 ledger row"
-  # repeat → no second network write, still one ledger row (exactly-once per (pr,sha,conclusion))
-  : > "$GH_LOG"
-  post_gate_status 7 "sha-$st" "$st"
-  [ "$(gh_calls)" = "0" ]                   || fail "(1) $st: repeat call posted again (not once)"
-  [ "$(ledger_rows)" = "1" ]                || fail "(1) $st: repeat call grew the ledger"
-  ok
-done
-
-# pending is rejected outright — no network write, no ledger row (it would flip CLEAN→UNSTABLE).
+# ── (1) success posts once, with the right state + context ─────────────────────
+# SUCCESS-ONLY: the watcher blesses a green (pr,sha) and posts NOTHING else. A non-passing status
+# (pending/failure) would flip a CLEAN sha to UNSTABLE and strand it, so both are rejected below.
 reset
-post_gate_status 7 shaPend pending
-[ "$(gh_calls)" = "0" ] && [ "$(ledger_rows)" = "0" ] || fail "(1p) pending must never be posted"
+post_gate_status 7 shaOk success
+grep -q "statuses/shaOk" "$GH_LOG"        || fail "(1) success: no statuses POST logged"
+grep -q "state=success" "$GH_LOG"         || fail "(1) success: state=success not in POST"
+grep -q "context=herd/gates" "$GH_LOG"    || fail "(1) success: context=herd/gates not in POST"
+[ "$(ledger_rows)" = "1" ]                || fail "(1) success: expected exactly 1 ledger row"
+# repeat → no second network write, still one ledger row (exactly-once per (pr,sha))
+: > "$GH_LOG"
+post_gate_status 7 shaOk success
+[ "$(gh_calls)" = "0" ]                   || fail "(1) success: repeat call posted again (not once)"
+[ "$(ledger_rows)" = "1" ]                || fail "(1) success: repeat call grew the ledger"
 ok
 
-# Distinct conclusions for the SAME (pr,sha) — here failure then (a re-review) success = two rows.
-reset
-post_gate_status 8 shaX failure
-post_gate_status 8 shaX success
-[ "$(ledger_rows)" = "2" ] || fail "(1b) distinct conclusions should be 2 ledger rows"
-grep -q "state=failure" "$GH_LOG" && grep -q "state=success" "$GH_LOG" || fail "(1b) both states not posted"
+# pending AND failure are rejected outright — no network write, no ledger row (both are NON-passing and
+# would flip a CLEAN sha to UNSTABLE). Only `success` is ever posted.
+for bad in pending failure bogus; do
+  reset
+  post_gate_status 7 "sha-$bad" "$bad"
+  [ "$(gh_calls)" = "0" ] && [ "$(ledger_rows)" = "0" ] || fail "(1x) non-success '$bad' must never be posted"
+done
 ok
 
 # ── (2) a FAILED API write is not recorded → retries next tick ─────────────────
@@ -136,14 +130,15 @@ post_gate_status 11 shaBad bogus-state
 [ "$(gh_calls)" = "0" ] && [ "$(ledger_rows)" = "0" ] || fail "(4) empty sha or bad state posted"
 ok
 
-# ── (5) failure-on-BLOCK: _handle_block_verdict posts state=failure ────────────
+# ── (5) BLOCK posts NOTHING — a failing status would flip CLEAN→UNSTABLE and strand the PR ─────
+# _handle_block_verdict must never post a herd/gates status: the fail-safe is the ABSENCE of success,
+# and posting `failure` here would break the very block/override/refix loop this function drives.
 reset
 export REVIEW_AUTOFIX=false
 DISPLAY=()
 _handle_block_verdict 42 someslug blockSha 0 || true
-grep -q "statuses/blockSha" "$GH_LOG" || fail "(5) BLOCK did not POST a status"
-grep -q "state=failure" "$GH_LOG"     || fail "(5) BLOCK did not post state=failure"
-[ "$(ledger_rows)" = "1" ]            || fail "(5) BLOCK failure not recorded once"
+grep -q "statuses/blockSha" "$GH_LOG" && fail "(5) BLOCK must NOT post a herd/gates status"
+[ "$(ledger_rows)" = "0" ]            || fail "(5) BLOCK must not write the gate-status ledger"
 ok
 
 # ── (6) skip-on-existing-blessing: _gate_status_blessed ────────────────────────

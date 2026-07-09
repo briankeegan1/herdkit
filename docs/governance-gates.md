@@ -18,17 +18,20 @@ against each `(pr, head-sha)` as it clears it:
 
 | When | State |
 | --- | --- |
-| Healthcheck reproduced a code error, **or** the review returned BLOCK | `failure` |
 | Both gates green (healthcheck + review PASS) | `success` |
+| A gate fails (healthcheck code error, or review BLOCK) | *(nothing posted)* |
 
-Only these **terminal** states are posted — there is deliberately **no `pending`** status. A pending
-*non-passing* commit status flips a `CLEAN` sha to `mergeStateStatus=UNSTABLE`, which would strand the
-PR out of the merge path; the fail-safe below needs only the **absence of `success`**, and GitHub
-already shows a missing *required* check as "Expected / waiting" on its own.
+The watcher posts **only `success`** — it never posts a non-passing (`pending`/`failure`) status. A
+non-passing commit status flips a `CLEAN` sha to `mergeStateStatus=UNSTABLE`, which would strand the PR
+out of the merge loop (and silently break the block/override/auto-refix paths) in the default
+*unprotected* config. The fail-safe below needs only the **absence of `success`**: a PR the watcher did
+not bless simply has no `herd/gates=success`, and GitHub renders the missing *required* check as
+"Expected / waiting" on its own. A failed gate therefore posts nothing — the PR's red row and review
+comment come from the watcher console and the review gate, not from a commit status.
 
-Each conclusion is posted **exactly once per `(pr, sha, conclusion)`** (sha-keyed ledger), and the
-status is posted **only by a watcher that actually ran the gates**. So a commit that no watcher has
-blessed simply has *no* `herd/gates=success` status.
+The blessing is posted **exactly once per `(pr, sha)`** (sha-keyed ledger), and **only by a watcher that
+actually ran the gates**. So a commit that no watcher has blessed simply has *no* `herd/gates=success`
+status.
 
 Pair that with a branch-protection rule that **requires** the `herd/gates` check, and the property
 becomes fail-safe:
@@ -95,10 +98,20 @@ unmergeable with no watcher able to bless it. If you disable the protection rule
 ## Multiple operators (team mode)
 
 Under `WATCHER_SCOPE=all`, several operators' watchers may see the same shared PR. Before dispatching
-its own (expensive) gates, each watcher checks the head sha's existing `herd/gates` status and
-**skips** a commit another seat has already blessed — so two seats never both run the gates on the
-same commit. The blessing is cross-seat by construction: it lives on the commit in GitHub, not in any
-one seat's local ledger.
+its own (expensive) gates, each watcher checks the head sha's existing `herd/gates` status and does not
+re-gate a commit another seat has already blessed — so two seats don't both run the gates on the same
+commit. The blessing is cross-seat by construction: it lives on the commit in GitHub, not in any one
+seat's local ledger. (A seat that observes a blessing it hasn't recorded heals its own ledger and
+proceeds to merge as normal — a local ledger loss never strands an owned, already-blessed PR.)
+
+## Trust model
+
+The gate assumes **write-scoped tokens are trusted**. Any actor with `repo:status` (or `statuses:write`)
+on the repo can post a `herd/gates=success` status directly and thereby bless a commit without a
+watcher having run the gates. Branch protection's required-status-check enforcement is only as strong as
+who can post that context. Keep status-write scope limited to the operators' watcher tokens; do not hand
+`repo:status` to untrusted collaborators or third-party apps. (This is the same trust boundary as any
+required-status-check gate on GitHub — the check is a claim by whoever can write it.)
 
 ## Follow-up (out of scope here)
 
