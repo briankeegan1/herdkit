@@ -420,7 +420,7 @@ _claude_after_wait="$(wc -l < "$CLAUDE_INVOCATION_LOG" | tr -d ' ')"
 if [ "$_claude_before_wait" = "$_claude_after_wait" ] && printf '%s' "$WAIT_ROW" | grep -q 'auto-resume at'; then
   checkpoint waiting_no_early_resume pass "before reset: holding ('$WAIT_ROW'), claude NOT relaunched"
 else
-  checkpoint waiting_no_early_resume fail "early resume or wrong hold row (claude runs $_claude_before_wait→$_claude_after_wait, row '$WAIT_ROW')"
+  checkpoint waiting_no_early_resume fail "early resume or wrong hold row (claude runs ${_claude_before_wait}→${_claude_after_wait}, row '$WAIT_ROW')"
 fi
 
 # ── TICK 3 — RESUME (clock >= target): relaunch via `claude --continue` ──────────────────────────
@@ -491,7 +491,7 @@ if [ "$_neg_detected" = no ] && [ "$_neg_handled" = no ] \
    && [ -f "$(_limit_sentinel_file "$NEG_WT")" ]; then
   checkpoint negative_no_park pass "HERD_LIMIT_DETECT=off: sentinel present but NO detect, NO hold, NO relaunch"
 else
-  checkpoint negative_no_park fail "kill-switch leaked (detected=$_neg_detected handled=$_neg_handled state='$(limit_state "$NEG_SLUG")' claude $_claude_before_neg→$_claude_after_neg)"
+  checkpoint negative_no_park fail "kill-switch leaked (detected=$_neg_detected handled=$_neg_handled state='$(limit_state "$NEG_SLUG")' claude ${_claude_before_neg}→${_claude_after_neg})"
 fi
 
 # Artifact-presence checkpoint.
