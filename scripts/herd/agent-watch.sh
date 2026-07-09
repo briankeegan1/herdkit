@@ -285,26 +285,14 @@ INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounde
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
-# _effective_merge_policy — resolve "auto" | "approve" | "observe" (HERD-159).
-# MERGE_POLICY takes precedence when set to a RECOGNIZED value. Empty/unset falls back to the legacy
-# WATCHER_AUTOMERGE derivation (false/no/off/0 → approve, else → auto). An UNRECOGNIZED non-empty
-# value (e.g. MERGE_POLICY=aprove) is a TYPO, NOT a legacy-derivation trigger: fail STRICT to
-# `observe` (never merge) so a typo can never silently turn an approval-gated repo into auto-merge.
-# The launch-time journal below surfaces the bad value once; this pure helper only resolves.
-_effective_merge_policy() {
-  case "${MERGE_POLICY:-}" in
-    auto|approve|observe) printf '%s' "${MERGE_POLICY}" ;;
-    '')
-      # Truly empty/unset → legacy WATCHER_AUTOMERGE derivation (back-compat).
-      case "${WATCHER_AUTOMERGE:-true}" in
-        false|no|off|0) printf 'approve' ;;
-        *)              printf 'auto' ;;
-      esac ;;
-    *)
-      # Garbage value → STRICTEST live behavior (observe = never merge). Gate keys fail strict.
-      printf 'observe' ;;
-  esac
-}
+# _effective_merge_policy — resolve "auto" | "approve" | "observe" (HERD-159). THE shared resolver,
+# sourced by the watcher, `herd reload` and `herd doctor --posture` alike so all three agree on what
+# the watcher will actually do (HERD-210). MERGE_POLICY wins when recognized; empty/unset derives
+# from the legacy WATCHER_AUTOMERGE boolean; an unrecognized non-empty value is a TYPO that fails
+# STRICT to `observe`. The launch-time journal below surfaces the bad value once; the resolver is a
+# pure helper and only resolves.
+# shellcheck source=/dev/null
+. "$HERE/merge-policy.sh"
 _pol="$(_effective_merge_policy)"
 AUTOMERGE=""; MERGE_OBSERVE=""
 case "$_pol" in
@@ -315,15 +303,10 @@ esac
 # launch and print a red console line so a typo (MERGE_POLICY=aprove) never silently rides the
 # legacy auto-merge default. Skipped in lib mode so sourcing for pure helpers never writes a
 # journal line (mirrors HUMAN_VERIFY_POLICY below).
-if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
-  case "${MERGE_POLICY:-}" in
-    ''|auto|approve|observe) ;;
-    *)
-      journal_append merge_policy_invalid value "$MERGE_POLICY" fell_back_to observe 2>/dev/null || true
-      printf '\033[31m⚠️  herdkit: invalid MERGE_POLICY=%s — falling back to observe (never merge)\033[0m\n' \
-        "$MERGE_POLICY" >&2
-      ;;
-  esac
+if [ "${AGENT_WATCH_LIB:-}" != "1" ] && _merge_policy_is_typo; then
+  journal_append merge_policy_invalid value "$MERGE_POLICY" fell_back_to observe 2>/dev/null || true
+  printf '\033[31m⚠️  herdkit: invalid MERGE_POLICY=%s — falling back to observe (never merge)\033[0m\n' \
+    "$MERGE_POLICY" >&2
 fi
 unset _pol
 

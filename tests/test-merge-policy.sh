@@ -86,6 +86,25 @@ ok
   || fail "case-sensitive: MERGE_POLICY=AUTO is unrecognized → observe"
 ok
 
+# ── single-resolver drift guard (HERD-210) ───────────────────────────────────
+# The strict-fallback contract is only worth as much as its LEAST strict copy: cmd_reload once
+# carried its own `case "${MERGE_POLICY:-}"` whose catch-all derived from WATCHER_AUTOMERGE, so
+# `herd reload` reported "auto" for a typo the watcher observed. Every consumer now sources
+# scripts/herd/merge-policy.sh — this guard fails if a new inline copy appears anywhere else.
+# Derived from $WATCH, not $HERE: sourcing agent-watch.sh above reassigns HERE to its own directory.
+ROOT="$(cd "$(dirname "$WATCH")/../.." && pwd)"
+[ -f "$ROOT/scripts/herd/merge-policy.sh" ] || fail "shared resolver scripts/herd/merge-policy.sh missing"
+copies="$(grep -rlE 'case[[:space:]]+"\$\{(MERGE_POLICY:-|WATCHER_AUTOMERGE:-true)\}"' "$ROOT/bin" "$ROOT/scripts" 2>/dev/null \
+  | grep -v '/merge-policy\.sh$' || true)"
+[ -z "$copies" ] \
+  || fail "inline MERGE_POLICY resolution outside the shared resolver: $copies"
+ok
+for consumer in scripts/herd/agent-watch.sh scripts/herd/posture-lint.sh bin/herd; do
+  grep -q 'merge-policy\.sh' "$ROOT/$consumer" \
+    || fail "$consumer does not source the shared merge-policy resolver"
+  ok
+done
+
 # ── _merge_method_flag ───────────────────────────────────────────────────────
 
 type _merge_method_flag >/dev/null 2>&1 || fail "_merge_method_flag not defined"
