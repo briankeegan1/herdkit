@@ -315,11 +315,54 @@ res="$(residue "$scn" "$SLUG")"
 grep -q '"event":"postmerge_reconciled"' "$scn/journal.jsonl" 2>/dev/null \
   && ok "the reconcile is journaled (postmerge_reconciled) — never a silent correction" \
   || bad "the sweep did not journal postmerge_reconciled"
-grep -q '"event":"merge".*"reason":"reconcile"' "$scn/journal.jsonl" 2>/dev/null \
-  && ok "the merge event carries an honest provenance (reason=reconcile, not gates_passed)" \
-  || bad "the reconciled merge event does not carry reason=reconcile"
+grep -q '"event":"merge_observed".*"reason":"reconcile"' "$scn/journal.jsonl" 2>/dev/null \
+  && ok "the observed merge carries an honest provenance (merge_observed, reason=reconcile)" \
+  || bad "the reconciled merge is not journaled as merge_observed/reason=reconcile"
+# THE MERGE⇒REAP INVARIANT (review BLOCK). journal-audit.sh rule (a) treats every `merge` event as a
+# claim that this seat owes a later `reap`. Here the sweep DID reap, so a bare `merge` would happen to
+# be satisfiable — but the event must still not be emitted, because the identical code path serves the
+# worktree-less foreign merge where no reap can ever exist. Assert the absence directly.
+grep -q '"event":"merge"[,}]' "$scn/journal.jsonl" 2>/dev/null \
+  && bad "the sweep journaled a bare 'merge' event — it would assert a reap obligation it may not own" \
+  || ok "the sweep never emits a bare 'merge' event (the merge⇒reap invariant stays honest)"
 live_pr_intact "$scn" && ok "the live open PR's gate ledgers survive untouched" \
                       || bad "the sweep ate a live PR's approval/CI rows"
+
+# ── PART 2b: the REAL journal auditor must not flag the reconciled foreign merge ─────────────────
+# HERD-238's journal-audit.sh check (a) is literally "a `merge` event with no LATER `reap` for the same
+# pr/slug, past the grace window". A foreign merge has no worktree here, so the sweep can never emit a
+# reap for it. If the sweep journaled `merge`, this seat's own auditor would raise a permanent,
+# self-healing-proof `merge_without_reap` finding for exactly the PRs the sweep exists to serve — the
+# two halves of the engine contradicting each other. Drive the SHIPPED auditor, not a re-implementation.
+step audit "the shipped journal auditor agrees with the sweep (no phantom merge_without_reap)"
+# _audit <scenario-dir> → how many merge_without_reap findings the SHIPPED auditor raises.
+# The auditor reports through the operator inbox + journal (its stdout is only a one-line tally), so
+# read the inbox. Fresh inbox + seen-ledger each call: the dedup ledger would suppress a repeat finding.
+_audit() {
+  local s="$1" now
+  now="$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()+3600)))')"
+  rm -f "$s/inbox" "$s/audit-seen"
+  JOURNAL_AUDIT=on JOURNAL_FILE="$s/journal.jsonl" \
+  HERD_JOURNAL_AUDIT_NOW="$now" \
+  HERD_JOURNAL_AUDIT_INBOX="$s/inbox" HERD_JOURNAL_AUDIT_SEEN="$s/audit-seen" \
+  WORKTREES_DIR="$s/trees" \
+    bash "$HERE/../journal-audit.sh" >/dev/null 2>&1 || true
+  grep -c 'audit:merge_without_reap' "$s/inbox" 2>/dev/null || printf '0'
+}
+[ "$(_audit "$scn")" -eq 0 ] \
+  && ok "the auditor raises NO merge_without_reap for the reconciled foreign merge" \
+  || bad "the auditor flagged the foreign merge as a stranded merge — the sweep mislabels engine state"
+
+# CONTROL: the check is not vacuous. Inject a bare `merge` with no reap and the auditor must catch it —
+# proving the clean result above comes from an honest event, not from a dead audit rule.
+cp "$scn/journal.jsonl" "$scn/journal.jsonl.bak"
+printf '{"ts":"%s","event":"merge","pr":9999,"slug":"phantom","sha":"deadbeef","reason":"gates_passed"}\n' \
+  "$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()-1800)))')" \
+  >> "$scn/journal.jsonl"
+[ "$(_audit "$scn")" -ge 1 ] \
+  && ok "control: a genuine merge-without-reap IS still caught (the rule is live, not vacuous)" \
+  || bad "control failed: the auditor no longer catches a real stranded merge"
+mv -f "$scn/journal.jsonl.bak" "$scn/journal.jsonl"; rm -f "$scn/audit-seen" "$scn/inbox"
 
 # ── PART 3: the shared hook DEFERS when another seat already handled the tracker item ────────────
 step defer "a foreign merge whose tracker ref is already Done — the shared hook must not double-write"

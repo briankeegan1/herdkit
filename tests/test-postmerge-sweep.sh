@@ -93,18 +93,30 @@ ok
 # ── helpers ───────────────────────────────────────────────────────────────────
 PRS_JSON="$T/prs.json"; export HERD_PMS_PRS_JSON_FILE="$PRS_JSON"
 
-# prs <pr> <sha> <branch> [...] — write the raw `gh pr list --json` payload the seam reads.
+# prs <pr> <sha> <branch> [...] — write the raw `gh pr list --json` payload the seam reads. Emits the
+# PRs NEWEST-first with descending mergedAt, exactly as real `gh pr list --state merged` does, so the
+# sweep's own oldest-first re-sort is what the ordering checks exercise.
 prs() {
   python3 -c '
 import sys, json
 a = sys.argv[1:]
-print(json.dumps([{"number": int(a[i]), "headRefOid": a[i+1], "headRefName": a[i+2]}
-                  for i in range(0, len(a), 3)]))' "$@" > "$PRS_JSON"
+n = len(a) // 3
+out = []
+for i in range(n):
+    # newest first: PR at index 0 gets the LATEST mergedAt
+    out.append({"number": int(a[3*i]), "headRefOid": a[3*i+1], "headRefName": a[3*i+2],
+                "mergedAt": "2026-07-0%dT12:00:00Z" % (9 - i)})
+print(json.dumps(out))' "$@" > "$PRS_JSON"
 }
+
+# mergedAt epoch for the k-th PR passed to prs() (k is 0-based), for asserting $STATE stamps.
+prs_epoch() { python3 -c '
+import sys, calendar, time
+print(calendar.timegm(time.strptime("2026-07-0%dT12:00:00Z" % (9 - int(sys.argv[1])), "%Y-%m-%dT%H:%M:%SZ")))' "$1"; }
 
 reset_world() {
   : > "$STATE"; : > "$RECONCILE_STATE"; : > "$APPROVALS"; : > "$CI_CHECKS_STATE"
-  : > "$TRACKER_SWEEP_LEDGER"; : > "$POSTMERGE_SWEPT_LEDGER"
+  : > "$TRACKER_SWEEP_LEDGER"; : > "$POSTMERGE_SWEPT_LEDGER"; : > "$POSTMERGE_NOTED_LEDGER"
   : > "$JOURNAL_FILE"; : > "$SCRIBE_LOG"; : > "$REAP_LOG"; : > "$COST_LOG"
   PR_REF=""
 }
@@ -154,18 +166,53 @@ prs 91 abc123 feat/lost-merge
 _sweep_merged_prs || fail "_sweep_merged_prs returned non-zero on a clean pass"
 [ "$(state_rows 91)" -eq 1 ] || fail "the sweep must write the \$STATE merge row (got $(state_rows 91))"
 grep -q ' 91 lost-merge' "$STATE" || fail "the \$STATE row must carry the branch's slug (got: $(cat "$STATE"))"
-jhas merge                 || fail "the sweep must journal the merge event"
-grep -q '"event":"merge".*"reason":"reconcile"' "$JOURNAL_FILE" \
-  || fail "a reconciled merge must be journaled reason=reconcile (got: $(cat "$JOURNAL_FILE"))"
+# THE MERGE⇒REAP INVARIANT (review BLOCK). journal-audit.sh rule (a) reads every `merge` event as
+# "this seat merged a PR and owes a later `reap`". This PR has no worktree here, so no reap is owed and
+# none will ever be emitted. Journaling `merge` would therefore mint a permanent, unfixable
+# merge_without_reap finding for precisely the foreign merges this sweep exists to serve.
+jhas merge && fail "the sweep must NEVER journal a bare 'merge' event — it asserts a reap obligation it cannot discharge"
+jhas merge_observed || fail "the sweep must journal merge_observed for a merge it did not perform"
+grep -q '"event":"merge_observed".*"reason":"reconcile".*"reap_owed":"no"' "$JOURNAL_FILE" \
+  || fail "a worktree-less reconciled merge must record reap_owed=no (got: $(cat "$JOURNAL_FILE"))"
 jhas postmerge_reconciled  || fail "the sweep must journal postmerge_reconciled"
 [ "$(jmissing)" = "state_row,reconcile" ] \
   || fail "missing list should be 'state_row,reconcile', got '$(jmissing)'"
 [ "$(scribe_calls)" -eq 1 ] || fail "the sweep must enqueue exactly one reconcile (got $(scribe_calls))"
 reconcile_enqueued 91 abc123 || fail "reconcile_backlog must have ledgered pr+sha"
 _pms_swept 91 abc123 || fail "a fully-reconciled PR must be recorded run-once"
+# The $STATE row is stamped with the PR's REAL mergedAt, not the moment we noticed it.
+[ "$(awk '$2==91{print $1}' "$STATE")" = "$(prs_epoch 0)" ] \
+  || fail "the \$STATE row must carry the PR's mergedAt epoch (got: $(cat "$STATE"))"
+ok
+
+# ── (2b) merge⇒reap: when a reap IS owed, say so ─────────────────────────────
+reset_world
+owed_sha="$(real_wt owed)"
+prs 90 "$owed_sha" feat/owed
+_sweep_merged_prs
+grep -q '"event":"merge_observed".*"reap_owed":"yes"' "$JOURNAL_FILE" \
+  || fail "a reconciled merge WITH a reapable worktree must record reap_owed=yes (got: $(cat "$JOURNAL_FILE"))"
+grep -q "^owed 90 postmerge-sweep$" "$REAP_LOG" || fail "…and it must actually reap"
+jhas merge && fail "still no bare 'merge' event, even when a reap is owed"
+ok
+
+# ── (2c) catch-up batch lands in TRUE merge order, newest last ────────────────
+# gh returns newest-first; build_landed renders the LAST THREE $STATE rows. Appending in gh's order
+# would show the OLDEST three PRs of a catch-up batch as the most recent landings.
+reset_world
+prs 71 s71 feat/p71  72 s72 feat/p72  73 s73 feat/p73
+_sweep_merged_prs
+[ "$(awk '{print $2}' "$STATE" | tr '\n' ' ')" = "73 72 71 " ] \
+  || fail "catch-up rows must be appended oldest-first (got: $(awk '{print $2}' "$STATE" | tr '\n' ' '))"
 ok
 
 # ── (3) a second pass over the reconciled world is BYTE-INERT ─────────────────
+# Re-establish (2)'s world: the checks above each reset it, and this section is about what a SECOND
+# pass does to an ALREADY-reconciled PR.
+reset_world
+prs 91 abc123 feat/lost-merge
+_sweep_merged_prs || fail "establishing pass returned non-zero"
+[ "$(state_rows 91)" -eq 1 ] || fail "establishing pass did not write the \$STATE row"
 before="$(jlines)"
 _sweep_merged_prs || fail "second pass returned non-zero"
 [ "$(jlines)" -eq "$before" ]  || fail "a reconciled PR must journal nothing on re-run (was $before, now $(jlines))"
@@ -300,6 +347,101 @@ _sweep_merged_prs
 grep -q '^99 costly$' "$COST_LOG" || fail "cost_emit_merge must run before the reap (got: $(cat "$COST_LOG"))"
 ok
 # …and with no transcript dir, cost is silently skipped (proven by (6a): missing was 'reap' alone).
+
+# (7b) COST IS NEVER DOUBLE-COUNTED. The transcript dir lives OUTSIDE the worktree
+# ($HOME/.claude/projects/<munged-path>), so it survives a reap: a do_merge that emitted `cost` and then
+# died before teardown would otherwise have its cost re-emitted here. cost_day_total sums `cost` events
+# unconditionally into budget_daily_exceeded, so a duplicate inflates the day's spend.
+reset_world
+cost_sha="$(real_wt already-costed)"
+prs 89 "$cost_sha" feat/already-costed
+printf '%s 89 already-costed\n' "$(date +%s)" >> "$STATE"; record_reconcile 89 "$cost_sha" already-costed
+mkdir -p "$(_cost_transcript_dir "$TREES/already-costed")"
+# cost.sh journals `cost component <c> pr <n> …` — `pr` is NOT the first key, so the guard must not
+# assume adjacency to "event".
+journal_append cost component builder pr 89 slug already-costed model m usd 1.23
+_pms_journal_has cost 89 || fail "_pms_journal_has must find a cost event whose pr is not the first key"
+_pms_journal_has cost 8  && fail "_pms_journal_has must match the whole pr field (8 vs 89)"
+_sweep_merged_prs
+[ "$(jmissing)" = "reap" ] || fail "an already-costed PR must not re-claim cost, got '$(jmissing)'"
+[ ! -s "$COST_LOG" ] || fail "cost_emit_merge must NOT re-run for an already-costed PR (got: $(cat "$COST_LOG"))"
+ok
+
+# ── (7c) a permanently-deferred PR notifies ONCE, not every pass ──────────────
+reset_world
+noisy_sha="$(real_wt noisy dirty)"
+prs 88 "$noisy_sha" feat/noisy
+printf '%s HERD-88 88\n' "$(date +%s)" >> "$TRACKER_SWEEP_LEDGER"; PR_REF="HERD-88"
+_sweep_merged_prs; _sweep_merged_prs; _sweep_merged_prs
+[ "$(grep -c '"event":"postmerge_reap_skip"' "$JOURNAL_FILE")" -eq 1 ] \
+  || fail "a permanently dirty worktree must journal postmerge_reap_skip ONCE, got $(grep -c '"event":"postmerge_reap_skip"' "$JOURNAL_FILE")"
+[ "$(grep -c '"event":"postmerge_deferred"' "$JOURNAL_FILE")" -eq 1 ] \
+  || fail "a repeated deferral must journal ONCE, got $(grep -c '"event":"postmerge_deferred"' "$JOURNAL_FILE")"
+_pms_swept 88 "$noisy_sha" && fail "the held PR must still be retried (never marked swept)"
+[ -d "$TREES/noisy" ] || fail "the dirty worktree must survive all three passes"
+ok
+
+# ── (7d) a branch that does not fit BRANCH_TEMPLATE is never treated as our slug ─
+# herd_branch_parse's prefix strip is a no-op on a miss, so `chore/bump-deps` under `feat/{slug}` comes
+# back verbatim. A real slug is one path segment (it names a dir under $TREES), so a '/' means "not ours".
+reset_world
+mkdir -p "$TREES/chore"                       # a decoy: $TREES/chore/bump-deps must never be probed
+prs 87 fff777 chore/bump-deps
+_sweep_merged_prs
+grep -q ' 87 -' "$STATE" || fail "a non-template branch must record the '-' slug, got: $(cat "$STATE")"
+[ ! -s "$REAP_LOG" ]     || fail "a non-template branch must never drive a reap"
+rmdir "$TREES/chore" 2>/dev/null
+ok
+
+# ── (7e) the run-once ledger is bounded ──────────────────────────────────────
+reset_world
+[ "${_PMS_LEDGER_KEEP:-0}" -gt "$_PMS_LOOKBACK" ] \
+  || fail "the ledger bound must exceed the lookback, else a live PR's row could be trimmed"
+i=0; while [ "$i" -lt $((_PMS_LEDGER_KEEP + 25)) ]; do _pms_record "$i" "sha$i"; i=$((i+1)); done
+[ "$(grep -c . "$POSTMERGE_SWEPT_LEDGER")" -eq "$_PMS_LEDGER_KEEP" ] \
+  || fail "the swept ledger must be trimmed to $_PMS_LEDGER_KEEP rows, got $(grep -c . "$POSTMERGE_SWEPT_LEDGER")"
+_pms_swept $((_PMS_LEDGER_KEEP + 24)) "sha$((_PMS_LEDGER_KEEP + 24))" \
+  || fail "trimming must keep the NEWEST rows (the tail), not the oldest"
+ok
+
+# ── (7f) the landed row credits the PR's OWN tracker ref, not a reused slug's marker ─
+# do_merge runs inside the lane that owns `.herd-ref-<slug>`, so the two always agree. The sweep can be
+# looking at an OLD merged PR whose slug has since been re-spawned, and the live marker then holds the
+# NEW lane's ref. Preferring the marker would credit the wrong tracker item on the landed row.
+reset_world
+PR_REF="HERD-OLD-PR"                          # what the merged PR's own body says
+_slug_ref() { printf 'HERD-NEW-LANE'; }       # what the re-spawned slug's live marker says
+prs 86 aaa888 feat/reused-slug
+_sweep_merged_prs
+grep -q ' 86 reused-slug HERD-OLD-PR' "$STATE" \
+  || fail "the landed row must carry the PR's own Refs:, not the reused slug's marker (got: $(cat "$STATE"))"
+_slug_ref() { printf ''; }                    # restore
+ok
+# …and with no Refs: line on the PR, the slug marker is still the fallback (never worse than do_merge).
+reset_world
+PR_REF=""
+_slug_ref() { printf 'HERD-FALLBACK'; }
+prs 85 aaa999 feat/no-refs
+_sweep_merged_prs
+grep -q ' 85 no-refs HERD-FALLBACK' "$STATE" \
+  || fail "with no PR Refs: line the slug marker must still supply the ref (got: $(cat "$STATE"))"
+_slug_ref() { printf ''; }
+ok
+
+# ── (7g) a child that reads stdin cannot truncate the sweep ──────────────────
+# The loop body invokes gh, git, scribe.sh and herd_teardown_slug. If the PR list were fed on stdin, the
+# first child to read it would swallow the remaining PRs and the sweep would silently stop early.
+reset_world
+_reap_slug() { cat >/dev/null 2>&1 || true; printf '%s %s %s\n' "$1" "$3" "${5:-}" >> "$REAP_LOG"; }
+s84="$(real_wt g84)"; s83="$(real_wt g83)"; s82="$(real_wt g82)"
+prs 84 "$s84" feat/g84  83 "$s83" feat/g83  82 "$s82" feat/g82
+_sweep_merged_prs
+for p in 84 83 82; do
+  [ "$(state_rows $p)" -eq 1 ] || fail "PR #$p was skipped — a stdin-reading child truncated the sweep"
+done
+[ "$(grep -c . "$REAP_LOG")" -eq 3 ] || fail "all three worktrees must be reaped (got $(grep -c . "$REAP_LOG"))"
+_reap_slug() { printf '%s %s %s\n' "$1" "$3" "${5:-}" >> "$REAP_LOG"; }   # restore
+ok
 
 # ── (8) an unreadable gh skips the whole pass — never a partial reconcile ─────
 # The stub gh prints a WELL-FORMED one-PR list and exits 7. PR #100 has no $STATE row and no reconcile,

@@ -5517,6 +5517,12 @@ def describe(o):
         return "hold released", "%s hold · sha %s · %s" % (g(o,"kind") or "approve", g(o,"sha")[:12] or "?", g(o,"reason") or "")
     if ev == "merge":
         return "MERGED", "sha %s · %s · %s" % (g(o,"sha")[:12] or "?", g(o,"method") or "?", g(o,"reason") or "")
+    if ev == "merge_observed":
+        # HERD-232: a merge this seat did NOT perform (foreign seat / gh UI), or one whose do_merge died
+        # before it could record the merge. The post-merge sweep reconciled it. Distinct from `merge`
+        # because only `merge` asserts that this seat owes the post-merge teardown.
+        return "MERGED (observed)", "sha %s · reconciled · reap_owed %s" % (
+            g(o,"sha")[:12] or "?", g(o,"reap_owed") or "?")
     if ev == "reap":
         return "reaped worktree", "reason %s" % (g(o,"reason") or "?")
     if ev == "review_log_retained":
