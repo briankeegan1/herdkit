@@ -55,7 +55,15 @@ DRIVER_SEND_KEYS='herdr pane send-keys <pane> <keys>'
 # honest alternative to inventing a rate-limit regex or a token schema the runtime never promised.
 
 # interactive-spawn — open a Grok TUI seeded with the task prompt; --always-approve = hands-off tools.
-DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve "<prompt>"'
+# CONTEXT-INJECTION (grok-context-injection): Grok does NOT auto-load CLAUDE.md/AGENTS.md the way Claude
+# Code does, so a grok builder would otherwise start with NO project conventions. The <agents-rules>
+# token is resolved at spawn time (herd_driver_agent_spawn_argv) to the repo-root AGENTS.md/CLAUDE.md
+# conventions and passed via --append-rules-to-system-prompt (ADDITIVE — it augments Grok's own system
+# prompt rather than replacing it, unlike --system-prompt-override). FAIL-SOFT: when there is no
+# AGENTS.md/CLAUDE.md the composer DROPS the flag+value pair, so the spawn is byte-identical to the
+# plain `grok --model <model> --always-approve "<prompt>"` shape. Claude/headless bindings carry no
+# such token, so their argv is unaffected.
+DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve --append-rules-to-system-prompt <agents-rules> "<prompt>"'
 # one-shot-exec — headless, prints and exits. `-p,--single` is Grok Build's `claude -p` analog.
 DRIVER_AGENT_ONESHOT_EXEC='grok -p "<prompt>" --model <model> --always-approve'
 # resume — continue the most recent session in the cwd with full context. Grok analog of

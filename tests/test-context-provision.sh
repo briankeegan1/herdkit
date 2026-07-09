@@ -181,4 +181,35 @@ body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
 [ "$cm_ln" -lt "$body_ln" ] && [ "$si_ln" -lt "$body_ln" ] || fail "si-both: a grounding pointer landed after the per-task body — not in the stable preamble"
 pass; echo "PASS (f) both grounding sources inject together, each in the STABLE preamble"
 
+# ── (g) agents-md → the repo-root AGENTS.md CONTENT is INLINED into the STABLE preamble (not a pointer),
+#        so a runtime with no CLAUDE.md auto-load still carries the conventions; argv stays externalized ─
+AGENTS_MARK="SENTINEL_AGENTS_CONVENTION_QWOP"
+printf '# AGENTS.md\n\n%s — builders never edit BACKLOG.md.\n' "$AGENTS_MARK" > "$REPO/AGENTS.md"
+git -C "$REPO" -c user.email=t@t -c user.name=t add AGENTS.md
+git -C "$REPO" -c user.email=t@t -c user.name=t commit -q -m agents
+write_cfg "agents-md"
+for pair in "quick $QUICK" "feat $FEATURE"; do
+  set -- $pair; slug="am-on-$1"; script="$2"
+  run_lane "$script" "$slug"
+  spec="$TREES/$slug.task.md"
+  grep -qF "$AGENTS_MARK" "$spec" || fail "$slug: agents-md ON but the AGENTS.md content was not inlined into the spec"
+  # It is CONTENT inlining, not a pointer: the literal convention sentence lands in the STABLE preamble.
+  mark_ln=$(grep -nF "$AGENTS_MARK"      "$spec" | head -1 | cut -d: -f1)
+  body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  [ -n "$mark_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate conventions/body lines"
+  [ "$mark_ln" -lt "$body_ln" ] || fail "$slug: inlined conventions ($mark_ln) not before the per-task body ($body_ln)"
+  # Externalization still holds: the agent-start argv carries ONLY the short pointer, not the conventions.
+  line="$(agent_start_line "$slug")"
+  case "$line" in *"$AGENTS_MARK"*) fail "$slug: AGENTS.md content leaked into the agent-start argv"$'\n'"$line" ;; esac
+done
+pass; echo "PASS (g) CONTEXT_PROVISION=agents-md inlines repo-root AGENTS.md content into the STABLE preamble"
+
+# ── (h) OFF still byte-identical EVEN THOUGH AGENTS.md now exists at the repo root (ship-dormant): the
+#        default (unset) spec must NOT inline conventions — proves the inlining is opt-in, not automatic. ─
+write_cfg __UNSET__
+run_lane "$QUICK" "am-off"
+spec="$TREES/am-off.task.md"
+grep -qF "$AGENTS_MARK" "$spec" && fail "am-off: AGENTS.md content inlined with CONTEXT_PROVISION unset (not ship-dormant)"
+pass; echo "PASS (h) agents-md is opt-in — an existing repo-root AGENTS.md is NOT inlined when unset"
+
 echo "ALL PASS ($PASS groups)"

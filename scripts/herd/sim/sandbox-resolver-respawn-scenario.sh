@@ -323,7 +323,7 @@ if [ "$_fd_base" -eq 1 ] && [ "$_fd_after" -eq 1 ] \
    && ! printf '%s' "$_fd_row" | grep -q 'gave up'; then
   checkpoint false_dead_no_loop pass "10 blind ticks over a live resolver: 0 respawns, budget intact (1 dispatch), PR never stranded"
 else
-  checkpoint false_dead_no_loop fail "false-dead loop: dispatches $_fd_base→$_fd_after, respawn events $_fd_respawn_before→$_fd_respawn_after, row='$_fd_row'"
+  checkpoint false_dead_no_loop fail "false-dead loop: dispatches ${_fd_base}→${_fd_after}, respawn events ${_fd_respawn_before}→${_fd_respawn_after}, row='$_fd_row'"
 fi
 
 # (8b) …and blindness must not become a PERMANENT hold either: once the roster is READABLE and the

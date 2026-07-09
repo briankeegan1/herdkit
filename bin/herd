@@ -5960,6 +5960,13 @@ cmd_changelog() {
   bash "$SCRIPTS_DIR/changelog.sh" "$@"
 }
 
+# cmd_triage — OSS auto-triage (HERD-255 / HERD-168 part 1/3). Pure dispatch to
+# scripts/herd/oss-triage.sh. Opt-in via OSS_TRIAGE=on; default off → byte-inert. NEVER auto-posts
+# to GitHub — drafts a ranked shortlist for human approval only, via the research lane.
+cmd_triage() {
+  bash "$SCRIPTS_DIR/oss-triage.sh" "$@"
+}
+
 cmd_stats() {
   local pr="" since="" today=0
   while [ $# -gt 0 ]; do
@@ -6432,6 +6439,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       LLM). tag <ver> promotes [Unreleased] → [ver] - date and cuts
                                       a local annotated git tag. Ship-dormant — never auto-run;
                                       does not push or publish (see docs/releasing.md)
+  herd triage [run|report]            OSS auto-triage (HERD-255): list open issues on HERD_REPO,
+                                      enqueue research-lane classify+draft per NEW issue, write a
+                                      ranked shortlist for human approval. Opt-in OSS_TRIAGE=on
+                                      (default off → byte-inert). NEVER auto-posts to GitHub
   herd backlog                        list open work items via the active backend
               [--rich]                TSV with workflow state + description (backends that
                                       support it; others fall back to the plain list)
@@ -6518,6 +6529,7 @@ case "${1:-help}" in
   cost)    shift; cmd_cost "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   changelog) shift; cmd_changelog "$@" ;;
+  triage)  shift; cmd_triage "$@" ;;
   update)  shift; cmd_update "$@" ;;
   agent-update) shift; cmd_agent_update "$@" ;;
   backlog) shift; cmd_backlog "$@" ;;
