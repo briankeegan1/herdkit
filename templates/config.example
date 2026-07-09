@@ -327,6 +327,15 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # it never touches a gate or a merge decision. Ships OFF (byte-inert: no reader runs, console identical).
 # OPERATOR_INBOX="off"     # off (default) | on
 
+# OSS auto-triage (HERD-255 / HERD-168 part 1/3) — classify + draft replies for incoming GitHub issues
+# on HERD_REPO via the READ-ONLY research lane. ON → `herd triage` (scripts/herd/oss-triage.sh) lists
+# open issues (gh issue list), enqueues one research request per NEW issue to classify
+# (bug/feature/question/duplicate) and draft a suggested reply/labels, then writes a ranked shortlist
+# under $WORKTREES_DIR/.herd/oss-triage/ for the coordinator. NEVER auto-posts (no issue comment,
+# close, or label — drafts for human approval only). OFF (default) → byte-inert: no gh, no research,
+# no report files. FAIL-SOFT: missing HERD_REPO / gh error yields an empty shortlist, never a hard red.
+# OSS_TRIAGE="off"         # off (default) | on
+
 # Journal-driven self-audit / gap-finder (HERD-238). When on, the watcher runs journal-audit.sh on
 # the housekeeping sweep cadence (~3 min), replaying a BOUNDED journal window for invariant
 # violations that were visible in the journal but nothing was reading: merge without reap;
