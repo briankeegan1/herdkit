@@ -2850,13 +2850,17 @@ reconcile_backlog() {
   return 0
 }
 
-# refresh_codemap <pr#> — POST-MERGE codemap freshness hook (best-effort, NEVER blocks/fails the
-# merge). After a PR lands on the default branch and $MAIN is fast-forwarded, regenerate the
-# committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan actually changed its
-# content, commit the refresh STRAIGHT to the default branch — no PR, mirroring the BACKLOG.md
-# generated-artifact convention — and push ff-safe. Every failure mode fails SOFT and journals a
-# `codemap_refresh` event so a drift audit can see what happened; nothing here can ever return
-# non-zero into do_merge.
+# refresh_codemap <pr#> [provenance] — POST-MERGE codemap freshness hook (best-effort, NEVER
+# blocks/fails the merge). After a PR lands on the default branch and $MAIN is fast-forwarded,
+# regenerate the committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan
+# actually changed its content, commit the refresh STRAIGHT to the default branch — no PR,
+# mirroring the BACKLOG.md generated-artifact convention — and push ff-safe. Every failure mode
+# fails SOFT and journals a `codemap_refresh` event so a drift audit can see what happened; nothing
+# here can ever return non-zero into do_merge.
+#
+# Optional <provenance> tags the journal (and shapes the commit message when <pr#> is empty): the
+# do_merge fast path leaves it empty (byte-identical journal lines for existing tests); the
+# tick-level reconcile (HERD-218) passes `reconcile` so out-of-band merges are auditable.
 #
 # Gated by CODEMAP_AUTOREFRESH: off → byte-inert (we never run the scan, never touch the tree).
 # Race-guarded three ways: (1) only when the project has already ADOPTED the codemap (the committed
@@ -2866,47 +2870,64 @@ reconcile_backlog() {
 # nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
 # HERD-159: unrecognized values fail soft toward ACTIVE via _codemap_auto (cosmetic key).
 refresh_codemap() {
-  local rc_pr="${1:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh"
+  local rc_pr="${1:-}" rc_prov="${2:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh" rc_msg
+  # _rc_j <k v ...> — journal codemap_refresh with optional provenance tag (empty → omit, keeps the
+  # pre-HERD-218 journal lines byte-identical for the do_merge path / existing hermetic tests).
+  _rc_j() {
+    if [ -n "$rc_prov" ]; then
+      journal_append codemap_refresh pr "$rc_pr" "$@" provenance "$rc_prov"
+    else
+      journal_append codemap_refresh pr "$rc_pr" "$@"
+    fi
+  }
   case "$(_codemap_auto)" in
     false)
-      journal_append codemap_refresh pr "$rc_pr" result skipped reason disabled; return 0 ;;
+      _rc_j result skipped reason disabled; return 0 ;;
   esac
-  [ -f "$rc_script" ]      || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-script;  return 0; }
-  [ -f "$MAIN/$rc_out" ]   || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-codemap; return 0; }
+  [ -f "$rc_script" ]      || { _rc_j result skipped reason no-script;  return 0; }
+  [ -f "$MAIN/$rc_out" ]   || { _rc_j result skipped reason no-codemap; return 0; }
   # A pending change already on docs/codemap.md means someone else is mid-edit — leave it alone.
   if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    journal_append codemap_refresh pr "$rc_pr" result skipped reason dirty-path; return 0
+    _rc_j result skipped reason dirty-path; return 0
   fi
   # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
   if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result error reason regen-failed; return 0
+    _rc_j result error reason regen-failed; return 0
   fi
   # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
   if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    journal_append codemap_refresh pr "$rc_pr" result fresh; return 0
+    _rc_j result fresh; return 0
   fi
   # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
   # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if ! git -C "$MAIN" commit -q -m "chore: refresh codemap after PR #${rc_pr}" -- "$rc_out" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result error reason commit-failed; return 0
+  if [ -n "$rc_pr" ]; then
+    rc_msg="chore: refresh codemap after PR #${rc_pr}"
+  elif [ "$rc_prov" = "reconcile" ]; then
+    rc_msg="chore: refresh codemap (reconcile)"
+  else
+    rc_msg="chore: refresh codemap"
+  fi
+  if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
+    _rc_j result error reason commit-failed; return 0
   fi
   if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes; return 0
+    _rc_j result committed pushed yes; return 0
   fi
   if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
      && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append codemap_refresh pr "$rc_pr" result committed pushed yes-after-rebase; return 0
+    _rc_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  journal_append codemap_refresh pr "$rc_pr" result committed pushed no
+  _rc_j result committed pushed no
   return 0
 }
 
-# refresh_symbol_index <pr#> — POST-MERGE symbol-index freshness hook, the function-level twin of
-# refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd $MAIN and,
-# ONLY when the deterministic scan actually changed its content, commits the refresh STRAIGHT to the
-# default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and byte-inert on every
-# failure mode; journals a `symbol_index_refresh` event; can never return non-zero into do_merge.
+# refresh_symbol_index <pr#> [provenance] — POST-MERGE symbol-index freshness hook, the function-level
+# twin of refresh_codemap. Regenerates the committed docs/symbol-index.md against the freshly ff'd
+# $MAIN and, ONLY when the deterministic scan actually changed its content, commits the refresh
+# STRAIGHT to the default branch (no PR, BACKLOG.md-style) and pushes ff-safe. Best-effort and
+# byte-inert on every failure mode; journals a `symbol_index_refresh` event; can never return
+# non-zero into do_merge. Optional <provenance> mirrors refresh_codemap (HERD-218 reconcile path).
 #
 # Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
 # and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
@@ -2914,39 +2935,153 @@ refresh_codemap() {
 # already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
 # changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
 refresh_symbol_index() {
-  local rs_pr="${1:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh"
+  local rs_pr="${1:-}" rs_prov="${2:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh" rs_msg
+  _rs_j() {
+    if [ -n "$rs_prov" ]; then
+      journal_append symbol_index_refresh pr "$rs_pr" "$@" provenance "$rs_prov"
+    else
+      journal_append symbol_index_refresh pr "$rs_pr" "$@"
+    fi
+  }
   case "$(_codemap_auto)" in
     false)
-      journal_append symbol_index_refresh pr "$rs_pr" result skipped reason disabled; return 0 ;;
+      _rs_j result skipped reason disabled; return 0 ;;
   esac
-  [ -f "$rs_script" ]    || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-script; return 0; }
-  [ -f "$MAIN/$rs_out" ] || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-index;  return 0; }
+  [ -f "$rs_script" ]    || { _rs_j result skipped reason no-script; return 0; }
+  [ -f "$MAIN/$rs_out" ] || { _rs_j result skipped reason no-index;  return 0; }
   # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
   if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    journal_append symbol_index_refresh pr "$rs_pr" result skipped reason dirty-path; return 0
+    _rs_j result skipped reason dirty-path; return 0
   fi
   # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
   if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result error reason regen-failed; return 0
+    _rs_j result error reason regen-failed; return 0
   fi
   # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
   if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    journal_append symbol_index_refresh pr "$rs_pr" result fresh; return 0
+    _rs_j result fresh; return 0
   fi
   # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
   # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if ! git -C "$MAIN" commit -q -m "chore: refresh symbol-index after PR #${rs_pr}" -- "$rs_out" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result error reason commit-failed; return 0
+  if [ -n "$rs_pr" ]; then
+    rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
+  elif [ "$rs_prov" = "reconcile" ]; then
+    rs_msg="chore: refresh symbol-index (reconcile)"
+  else
+    rs_msg="chore: refresh symbol-index"
+  fi
+  if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
+    _rs_j result error reason commit-failed; return 0
   fi
   if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes; return 0
+    _rs_j result committed pushed yes; return 0
   fi
   if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
      && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    journal_append symbol_index_refresh pr "$rs_pr" result committed pushed yes-after-rebase; return 0
+    _rs_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  journal_append symbol_index_refresh pr "$rs_pr" result committed pushed no
+  _rs_j result committed pushed no
+  return 0
+}
+
+# ── Tick-level map-freshness reconcile (HERD-218) ─────────────────────────────────────────────────
+# Multi-seat doctrine Rule 1: map freshness is a RECONCILED INVARIANT, not a do_merge side-effect.
+# refresh_codemap / refresh_symbol_index still fire on THIS seat's merges (fast path). When another
+# seat (or the gh UI) merges without this watcher's do_merge, the committed maps can drift until a
+# human runs `herd codemap`. This tick-level reconcile heals that: probe with the read-only
+# --check seams, and only when STALE regenerate+commit ONCE with provenance=reconcile.
+#
+# HARD INVARIANTS:
+#   • CODEMAP_AUTOREFRESH=off → byte-inert (no pull, no probe, no commit, no journal).
+#   • Maps already fresh at this $MAIN HEAD → zero commits (and, after the first probe of a sha,
+#     zero re-scans — memoized on $TREES/.codemap-reconcile-sha).
+#   • Race-guarded: skip quietly when a review/health gate is mid-op (live inflight marker) OR $MAIN
+#     is dirty (a concurrent writer owns the tree). Never double-commits with do_merge: after a local
+#     merge the maps are fresh, so the probe no-ops; the sha memo prevents re-probe until HEAD moves.
+# Fully fail-soft; never blocks a tick.
+
+# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted change,
+# so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+_map_reconcile_mid_op() {
+  local f
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    _marker_live "$f" 2>/dev/null && return 0
+  done
+  # Any dirty path on $MAIN → a concurrent writer (or a partial write) owns the tree this tick.
+  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ] && return 0
+  return 1
+}
+
+# _map_reconcile_memo_file — per-watcher memo of the last $MAIN HEAD we probed for map freshness.
+_map_reconcile_memo_file() { printf '%s' "$TREES/.codemap-reconcile-sha"; }
+
+# _map_reconcile_memo_write <sha> — record that this main sha has been reconciled (fresh or repaired).
+_map_reconcile_memo_write() {
+  local _mw="$1"
+  [ -n "$_mw" ] || return 0
+  mkdir -p "$TREES" 2>/dev/null || true
+  printf '%s\n' "$_mw" > "$(_map_reconcile_memo_file)" 2>/dev/null || true
+}
+
+# reconcile_map_freshness — the HERD-218 tick-level invariant. Call once per watcher tick (or on a
+# cadence); safe to call repeatedly. Picks up out-of-band merges via ff-only pull, probes both
+# adopted maps with their --check seams, and repairs only when stale.
+reconcile_map_freshness() {
+  local _rm_head _rm_memo _rm_prev _rm_stale=0
+  [ -n "${DRYRUN:-}" ] && return 0
+  case "$(_codemap_auto)" in
+    false) return 0 ;;   # HARD: off → byte-inert (no journal spam either)
+  esac
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+
+  # Race: a live gate or a dirty $MAIN means someone else owns the tree this tick — defer.
+  _map_reconcile_mid_op && return 0
+
+  # Pick up out-of-band merges into $MAIN (another seat's do_merge / gh UI). Never force.
+  git -C "$MAIN" pull --ff-only >/dev/null 2>&1 \
+    || git -C "$MAIN" fetch --all >/dev/null 2>&1 || true
+
+  # Re-check mid-op after the pull (a concurrent writer may have dirtied $MAIN mid-fetch).
+  _map_reconcile_mid_op && return 0
+
+  _rm_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_rm_head" ] || return 0
+  _rm_memo="$(_map_reconcile_memo_file)"
+  _rm_prev="$(cat "$_rm_memo" 2>/dev/null || true)"
+  # Already probed/repaired this exact main sha → zero work (no scan, no commit).
+  [ "$_rm_prev" = "$_rm_head" ] && return 0
+
+  # ── codemap probe (read-only --check) ──────────────────────────────────────────────────────────
+  if [ -f "$HERE/codemap.sh" ] && [ -f "$MAIN/docs/codemap.md" ]; then
+    if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/docs/codemap.md" \
+         bash "$HERE/codemap.sh" --check >/dev/null 2>&1; then
+      _rm_stale=1
+      # Stale → regenerate+commit ONCE via the shared refresh primitive, tagged provenance=reconcile.
+      # Empty pr# (no single PR caused this; an out-of-band merge did).
+      refresh_codemap "" "reconcile"
+    fi
+  fi
+
+  # ── symbol-index probe (read-only --check) ─────────────────────────────────────────────────────
+  if [ -f "$HERE/symbol-index.sh" ] && [ -f "$MAIN/docs/symbol-index.md" ]; then
+    if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/docs/symbol-index.md" \
+         bash "$HERE/symbol-index.sh" --check >/dev/null 2>&1; then
+      _rm_stale=1
+      refresh_symbol_index "" "reconcile"
+    fi
+  fi
+
+  # Memoize the post-repair HEAD (a successful commit advances it). Only memoize when $MAIN is clean
+  # — a failed/deferred refresh that left the tree dirty must NOT suppress the next tick's retry.
+  if [ -z "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ]; then
+    _rm_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+    _map_reconcile_memo_write "$_rm_head"
+  fi
+  # _rm_stale is load-bearing for tests that inspect the function's side effects only; silence SC2034.
+  : "$_rm_stale"
   return 0
 }
 
@@ -7548,6 +7683,13 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
   fi
+
+  # Codemap / symbol-index freshness reconcile (HERD-218): multi-seat invariant — when another seat
+  # (or the gh UI) merges without THIS watcher's do_merge, the committed maps can go stale. Probe the
+  # read-only --check seams and repair ONCE with provenance=reconcile. Byte-inert when
+  # CODEMAP_AUTOREFRESH=off; zero commits when maps already fresh; skips mid-op (live gate / dirty
+  # MAIN). The do_merge refresh_* path remains the local-merge fast path.
+  reconcile_map_freshness
 
   # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
   # with a genuinely stale engine, dispatch `herd update` DETACHED — it ends in a reload that restarts
