@@ -1902,18 +1902,29 @@ _marker_age() {
 # so an unmarked background lane would be counted as a second watcher by `herd status` and SIGTERM'd
 # mid-spawn by `herd reload`'s stray reaper. The gate workers solved this with inflight markers; these
 # reuse the mechanism, under a `.spawn-inflight-*` prefix that bin/herd exempts alongside the review
-# and health ones. The marker is written SYNCHRONOUSLY by the parent (before the tick continues) so
-# the exemption can never lose the race with a reload.
+# and health ones. The parent writes the marker the instant `&` returns — but `&` forks FIRST, so a
+# `herd reload` landing in that micro-window still sees an unexempted argv0 match and can SIGTERM the
+# lane. That is survivable, not silent: the lane's claim (`.owner`, spawn-step.sh) names a now-dead pid,
+# so the next `next` reclaims the intent and a later tick re-launches it. The marker narrows the
+# window; the claim's liveness is what makes losing the race harmless.
 #
 # The lane marker doubles as the drain's CROSS-TICK MUTEX: the foreground drain implicitly ran one
 # lane at a time and observed it finish before starting the next. `_lane_spawn_inflight` restores
 # exactly that serialization without blocking — a tick that finds a live lane marker simply drains
-# nothing and returns. Dead markers are garbage-collected on the way past (pid-gone / pid-recycled),
-# so a watcher killed mid-spawn cannot wedge the queue: the next tick sweeps the corpse and drains.
+# nothing and returns. Dead markers are garbage-collected by `_spawn_inflight_sweep` on EVERY tick
+# (before the drain's queue-empty fast exits, so a project with no spawn queue still reaps resolver
+# corpses), meaning a watcher killed mid-spawn cannot wedge the queue or leave a stale pid exempted
+# in `_list_project_watchers`.
 SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
 
-# _spawn_inflight_file <kind> <slug> — the marker path for one in-flight lane. <kind> ∈ lane | resolve.
-_spawn_inflight_file() { printf '%s%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_')"; }
+# _spawn_inflight_file <kind> <slug> — a UNIQUE marker path for one in-flight lane. <kind> ∈ lane|resolve.
+# Uniqueness matters: a same-slug re-dispatch (a resolver respawned for a new sha) would otherwise alias
+# the previous worker's marker, and the FIRST worker's cleanup would then delete the SECOND's — silently
+# un-exempting a live lane. The slug stays in the name so the marker is legible in `ls $TREES`.
+_spawn_inflight_file() {
+  printf '%s%s-%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" \
+    "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_')" "$$" "${RANDOM:-0}"
+}
 
 # _spawn_inflight_bg <marker> <fn> [args…] — run <fn> in a background subshell, recording its pid in
 # <marker> BEFORE returning, and clearing the marker when it finishes. Never blocks; always returns 0.
@@ -1923,7 +1934,8 @@ _spawn_inflight_file() { printf '%s%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(print
 _spawn_inflight_bg() {
   local _sib_marker="$1"; shift
   ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true ) &
-  _marker_write "$_sib_marker" "$!"
+  _SPAWN_INFLIGHT_BG_PID="$!"
+  _marker_write "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
   return 0
 }
 
@@ -1936,13 +1948,26 @@ _spawn_inflight_sweep() {
   done
 }
 
-# _lane_spawn_inflight — true iff a builder lane spawned by a previous tick is STILL running. Corpses
-# are swept first, so a watcher killed mid-spawn can never hold the queue shut.
+# _lane_spawn_inflight — true iff a builder lane spawned by a previous tick is STILL running. Callers
+# run _spawn_inflight_sweep first, so a corpse can never hold the queue shut.
 _lane_spawn_inflight() {
-  _spawn_inflight_sweep
   local _lsi_f
   for _lsi_f in "$SPAWN_INFLIGHT_PREFIX"lane-*; do
     [ -e "$_lsi_f" ] && return 0
+  done
+  return 1
+}
+
+# _resolver_lane_inflight — true iff a resolver lane dispatch is STILL running. The foreground
+# spawn_resolver serialized dispatches implicitly; backgrounding them would let the resolve pass fire
+# one `herd-resolve.sh` per CONFLICTING PR in the SAME tick, and each of those runs `git worktree add`
+# against the same $MAIN — N concurrent writers contending on one index lock. Sweeps corpses first, so
+# a watcher killed mid-dispatch cannot block resolver dispatch forever.
+_resolver_lane_inflight() {
+  _spawn_inflight_sweep
+  local _rli_f
+  for _rli_f in "$SPAWN_INFLIGHT_PREFIX"resolve-*; do
+    [ -e "$_rli_f" ] && return 0
   done
   return 1
 }
@@ -3769,22 +3794,32 @@ spawn_resolver() {
   # push` over nothing. Refused before record_resolve_attempt, so no respawn round is burned either.
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
+  # DISPATCH SERIALIZATION (HERD-237): one resolver lane at a time. Refused BEFORE
+  # record_resolve_attempt — exactly like the quiesce hold above — so no respawn round is burned, and
+  # NON-ZERO so `_resolver_in_flight … || spawn_resolver …` does not read this as "a resolver is now
+  # running". The conflict simply keeps its row and is re-dispatched on a later tick.
+  _resolver_lane_inflight && return 1
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs")"
   _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha"
-  # The bg pid, so a test (and the sim) can synchronize on the dispatch it just made instead of
-  # sleeping. Production never reads it — the resolver reports through its ledger + result file.
-  _SPAWN_RESOLVER_BG_PID="$!"
   return 0
 }
 
-# _spawn_resolver_wait — block until the most recent spawn_resolver's lane has finished, or return
-# immediately when none was dispatched from this shell. The TICK never calls this (not waiting is the
-# entire point); it is the synchronization seam the hermetic tests and sims use to assert on the
-# dispatch they just made, instead of sleeping and hoping.
+# _spawn_resolver_wait — block until no resolver lane is in flight, then return. The TICK never calls
+# this (not waiting is the entire point); it is the synchronization seam the hermetic tests and sims
+# use to assert on a dispatch they just made, instead of sleeping and hoping.
+#
+# Keyed on the MARKER, not on a remembered pid. A pid handle is wrong in two directions: a REFUSED
+# dispatch (quiesce hold, serialization hold) would either strand the handle of a still-running lane or
+# leave a caller waiting on a lane this call never started. The marker is the truth — and because
+# _spawn_inflight_bg removes it only AFTER the worker's body returns, a cleared marker also means the
+# lane's journal lines are already on disk. Bounded (60 s) so a wedged lane can never hang a suite.
 _spawn_resolver_wait() {
-  [ -n "${_SPAWN_RESOLVER_BG_PID:-}" ] || return 0
-  wait "$_SPAWN_RESOLVER_BG_PID" 2>/dev/null || true
+  local _srw_n=0
+  while _resolver_lane_inflight && [ "$_srw_n" -lt 600 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    _srw_n=$(( _srw_n + 1 ))
+  done
   return 0
 }
 
@@ -9974,6 +10009,14 @@ _spawn_clear_held() {
 # finishes, the intent stays CLAIMED (.req.mine) — so the drain is durable across a watcher death at
 # any instant, exactly as before.
 #
+# THE CLAIM MUST NOW OUTLIVE A TICK, so `spawn-step.sh next`'s five-minute stale reclaim can no longer
+# treat a surviving claim as proof of a dead watcher. The worker's first act is `spawn-step.sh own
+# <claim> $BASHPID`, and the reclaim skips any claim whose owner is alive. Without that, a lane slower
+# than five minutes has its intent re-served while it is still launching, its `done` becomes a no-op on
+# a moved path, and the next free tick spawns the same slug again. Every `done`/`release`/`skip` now
+# fails LOUD (exit 3 → a `spawn_claim_lost` journal line) when the claim it was handed has vanished,
+# so a lost claim can never be mistaken for a consumed one.
+#
 # ONE LANE AT A TIME, still. The foreground drain implicitly serialized lanes, and stopped the tick
 # outright on a saturation defer (`break`) so siblings would not defer against the same gate. Both
 # properties survive without blocking: at most ONE lane is launched per tick, and none at all while a
@@ -10006,37 +10049,56 @@ _drain_lane_worker() {
   local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
   local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
   [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
+  # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
+  # see `spawn-step.sh own` at the launch site. $BASHPID would let the worker do it itself, but bash
+  # 3.2 — still macOS's /bin/bash — has no BASHPID, and the parent already holds the pid as `$!`.)
   # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
   # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
   # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
   # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
   _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
+  # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
+  # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
   if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then
     # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
     # a later tick. The drain already stopped for this tick when it launched this worker.
-    bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1 || true
-    journal_append spawn_deferred slug "$_dlw_slug" lane "$_dlw_lane"
+    if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
+      journal_append spawn_deferred slug "$_dlw_slug" lane "$_dlw_lane"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action release
+    fi
   elif [ "$_dlw_rc" -ne 0 ]; then
     # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the journal
     # records why, so a lost spawn is always visible in `herd log`.
-    bash "$HERE/spawn-step.sh" skip "$_dlw_claimed" "lane exited $_dlw_rc" >/dev/null 2>&1 || true
-    journal_append spawn_skipped slug "$_dlw_slug" lane "$_dlw_lane" reason "lane exited $_dlw_rc"
+    if bash "$HERE/spawn-step.sh" skip "$_dlw_claimed" "lane exited $_dlw_rc" >/dev/null 2>&1; then
+      journal_append spawn_skipped slug "$_dlw_slug" lane "$_dlw_lane" reason "lane exited $_dlw_rc"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action skip
+    fi
   else
     # Spawned: only now is the intent consumed.
-    bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1 || true
-    journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
+    if bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1; then
+      journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action done
+    fi
   fi
   return 0
 }
 
 _drain_spawn_queue() {
   [ -z "${DRYRUN:-}" ] || return 0
+  # Sweep dead spawn markers on EVERY tick — ABOVE the queue-empty fast exits below. A project with an
+  # idle spawn queue still dispatches resolvers, and a `.spawn-inflight-resolve-*` corpse left here
+  # keeps exempting its (possibly recycled) pid from bin/herd's duplicate-watcher reap.
+  _spawn_inflight_sweep
   local _dsq_q="$TREES/spawn-queue"
   [ -d "$_dsq_q" ] || return 0
   ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
   # This tick's ONE launch slot. Taken already when a lane launched by an earlier tick is still
   # running (its intent is claimed, its outcome not yet observed) — the pre-HERD-237 foreground drain
-  # could not have started a second lane there either. Corpse markers are swept by the predicate.
+  # could not have started a second lane there either.
   local _dsq_can_launch=1
   _lane_spawn_inflight && _dsq_can_launch=0
 
@@ -10141,6 +10203,16 @@ _drain_spawn_queue() {
         # `_list_project_watchers` and holds the launch slot shut until the lane lands.
         _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug")" \
           _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
+        # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
+        # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
+        # dead watcher leaves one behind — true while the lane ran in this loop's foreground, false now
+        # that the worker holds the claim for the lane's whole duration. Recording the worker's pid
+        # makes that reclaim liveness-aware, so a lane slower than five minutes (a slow clone, a wedged
+        # driver call — the exact fault this design exists to tolerate) is never re-served and launched
+        # a second time underneath us. If the worker already finished, `own` refuses (exit 3) rather
+        # than leave a sidecar for a consumed intent; the 5-minute clock makes that window unreachable
+        # by any reclaim anyway.
+        bash "$HERE/spawn-step.sh" own "$_dsq_claimed" "$_SPAWN_INFLIGHT_BG_PID" >/dev/null 2>&1 || true
         _dsq_can_launch=0
         _dsq_n=$(( _dsq_n + 1 ))
         ;;

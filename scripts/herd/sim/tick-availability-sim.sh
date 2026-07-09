@@ -25,7 +25,9 @@
 #
 #   C. SLOW RESOLVER — spawn_resolver must return before its lane does, with the respawn-budget ledger
 #      row already down (record-first), and the resolver_spawn ACK event must still be journaled once
-#      the lane lands.
+#      the lane lands. A SECOND dispatch while one is in flight must be REFUSED (non-zero, no round
+#      burned): backgrounding must not turn the resolve pass into N concurrent `git worktree add`s
+#      against one $MAIN. The landed lane must release the dispatch slot.
 #
 #   D. HEALTHY = BYTE-IDENTICAL — the same drain against a fast lane and a healthy gh must produce the
 #      same journal event stream as before this feature: no gh_timeout events, spawn_launched exactly
@@ -249,10 +251,30 @@ c_elapsed=$(( $(now) - c_start ))
   && ok "resolver_spawn ACK not asserted before the lane returned" \
   || bad "resolver_spawn journaled before the lane could ACK"
 
+# A SECOND conflict in the same tick must NOT fire a concurrent `git worktree add` against $MAIN.
+# Refused before record_resolve_attempt, so no respawn round is burned; the conflict retries next tick.
+_sim_rows_before="$(grep -c 'other-slug' "$RESOLVE_STATE" 2>/dev/null || true)"
+if spawn_resolver other-slug 42 feat/other-slug def5678; then
+  bad "a second resolver dispatch ran CONCURRENTLY with a live one (N× git worktree add on \$MAIN)"
+else
+  ok "a second resolver dispatch is refused while one is in flight (returns non-zero → not 'running')"
+fi
+[ "${_sim_rows_before:-0}" = "$(grep -c 'other-slug' "$RESOLVE_STATE" 2>/dev/null || true)" ] \
+  && ok "the refused dispatch burned no respawn round (refused above record_resolve_attempt)" \
+  || bad "the refused dispatch still recorded a resolve attempt"
+
 _spawn_resolver_wait
 [ "$(jgrep '"event":"resolver_spawn"')" -ge 1 ] \
   && ok "the resolver lane landed: its ACK event (rc + acked) is journaled" \
   || bad "the resolver lane landed but never journaled its ACK"
+
+# Once the lane lands and its marker is swept, the next conflict dispatches normally.
+_spawn_inflight_sweep
+if _resolver_lane_inflight; then
+  bad "a landed resolver lane left its marker behind — resolver dispatch would be blocked forever"
+else
+  ok "the landed lane released the resolver dispatch slot"
+fi
 
 # ── D. the healthy path is byte-identical ────────────────────────────────────────────────────────
 step D "healthy gh + fast lane — the event stream is unchanged"
