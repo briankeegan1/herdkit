@@ -4256,13 +4256,20 @@ _main_health_pr_file() { printf '%s' "$TREES/.main-health-pr-$1"; }
 # _main_health_retry_file <sha> — how many times a worker for this sha DIED before collecting.
 _main_health_retry_file() { printf '%s' "$TREES/.main-health-died-$1"; }
 
-# _main_health_observed_pr <sha> — the PR number this sha landed as, read from its own commit subject
-# ("Merge pull request #12 …" or a squash's "title (#12)"). This is the ONLY attribution available for a
-# merge THIS seat never performed. Empty when the commit names no PR — the caller then records "?" and
-# the console row says "(observed)" rather than inventing a number.
+# _main_health_observed_pr <sha> — the PR number this sha landed as, read from its own commit subject.
+# This is the ONLY attribution available for a merge THIS seat never performed. Empty when the commit
+# names no PR — the caller then records "?" and the console row says "(observed)", never a made-up number.
+#
+# A TRAILING "(#N)" wins over any earlier "#N". GitHub's squash subject is "<title> (#456)", and a title
+# may itself cite an issue — "Fix #123 widget handling (#456)" — where the first match names the ISSUE,
+# not the PR. Merge-commit subjects ("Merge pull request #456 from …") carry no trailing form, so they
+# fall through to the first-match rule unchanged.
 _main_health_observed_pr() {
-  git -C "$MAIN" log -1 --format='%s' "$1" 2>/dev/null \
-    | grep -oE '#[0-9]+' | sed -n '1p' | tr -d '#'
+  local _op_subj _op_n
+  _op_subj="$(git -C "$MAIN" log -1 --format='%s' "$1" 2>/dev/null)"
+  _op_n="$(printf '%s\n' "$_op_subj" | grep -oE '\(#[0-9]+\)[[:space:]]*$' | grep -oE '[0-9]+')"
+  [ -n "$_op_n" ] || _op_n="$(printf '%s\n' "$_op_subj" | grep -oE '#[0-9]+' | sed -n '1p' | tr -d '#')"
+  printf '%s' "$_op_n"
 }
 
 # _main_health_worker <sha> <dispatch-file> <log-file> — the ASYNC main-health suite, run in the
@@ -4318,6 +4325,13 @@ _main_health_clear() {
 #   • healthcheck.sh's content-free classifier banner ("❌ CODE ERROR"), a PASS-marked line that slipped
 #     through, or an empty identity → NOT honest: filing "fix ❌ CODE ERROR" is the exact cry-wolf this
 #     item exists to remove, so we stay silent and leave the loud console row to a human.
+#
+# The leak-guard test below is REDUNDANT with _collect_main_health, which already routes a genuine trip to
+# an infra_event and so never reaches _main_health_set_red. It stays on purpose: this predicate is what
+# stands between an infra transient and a tracker write, and _main_health_set_red is a seam any future
+# caller may reach from a path that has not classified the detail. The check is a string match on one
+# line — the cost of keeping the guarantee local is nil, and the cost of it being someone else's job is a
+# spurious item filed against a control-room hiccup.
 _main_health_honest_identity() {
   local _hi_detail="${1:-}" _hi_id="${2:-}"
   [ -n "$_hi_id" ] || return 1
@@ -4402,7 +4416,16 @@ _main_health_defer() {
 # _collect_main_health, which routes it to _main_health_clear / _main_health_set_red.
 #
 # Assumes the caller already decided this sha WANTS a run; the idempotency guards below make a redundant
-# call a silent no-op. ALWAYS returns 0 (an alarm can never fail a merge, nor a tick).
+# call a silent no-op.
+#
+# RETURN CODE IS LOAD-BEARING (review BLOCK, round 1): 0 iff a worker was ACTUALLY BACKGROUNDED for this
+# sha; 1 for every no-op — already in flight, result pending collection, no free HEALTH_CONCURRENCY slot,
+# no healthcheck bin. A caller that spends a BUDGET (the died-worker retry counter) or DROPS STATE (the
+# recheck path's run-once marker) must key that on a real dispatch, never on having called this. Charging
+# a tick that merely DEFERRED would let slot contention — HEALTH_CONCURRENCY defaults to 1 and is shared
+# with every per-PR gate suite, so "no slot" is the ROUTINE case — burn the death budget and mark a sha
+# whose suite never ran even once, silently abandoning the very invariant this file asserts. Never fails
+# a caller: no caller propagates this rc (an alarm can never fail a merge, nor a tick).
 _main_health_dispatch() {
   local _mh_pr="${1:-}" _mh_sha="$2" _mh_prov="${3:-merge}" _mh_key _mh_inflight _mh_disp _mh_wpid _mh_log
   _mh_key="main-$_mh_sha"
@@ -4411,14 +4434,14 @@ _main_health_dispatch() {
   # Idempotent dispatch: a live worker for this sha, or a result already pending collection, means this
   # sha is handled — never double-dispatch (a re-entrant merge tick / restart / the reconciler landing on
   # the very sha do_merge just dispatched all re-enter here).
-  { [ -f "$_mh_inflight" ] && _health_pid_live "$_mh_inflight"; } && return 0
-  [ -f "$_mh_disp" ] && return 0
+  { [ -f "$_mh_inflight" ] && _health_pid_live "$_mh_inflight"; } && return 1
+  [ -f "$_mh_disp" ] && return 1
   # Respect HEALTH_CONCURRENCY: serialize against any candidate suite via the shared slot cap (all
   # worktrees + $MAIN share one git object store, so overlapping suites race on .git locks and paint
   # false-red). No slot free → journal an infra_event and defer WITHOUT marking the sha, so the NEXT TICK
   # re-attempts it (pre-HERD-222 this waited for the next MERGE); never run an overlapping suite.
-  _health_slot_free || { _main_health_defer "$_mh_pr" "$_mh_sha" no-slot; return 0; }
-  [ -f "$HERD_HEALTHCHECK_BIN" ] || { _main_health_defer "$_mh_pr" "$_mh_sha" no-bin; return 0; }
+  _health_slot_free || { _main_health_defer "$_mh_pr" "$_mh_sha" no-slot; return 1; }
+  [ -f "$HERD_HEALTHCHECK_BIN" ] || { _main_health_defer "$_mh_pr" "$_mh_sha" no-bin; return 1; }
   rm -f "$MAIN_HEALTH_DEFER" 2>/dev/null || true            # dispatched — re-arm the deferral journal
   # Background the heavy suite STREAMING to the tailable log; record the pr# for the collector.
   _mh_log="$(_health_log_file "$_mh_key")"
@@ -4508,12 +4531,17 @@ reconcile_main_health() {
         rm -f "$(_main_health_pr_file "$_rm_sha")" "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || true
         return 0
       fi
-      printf '%s\n' "$(( _rm_n + 1 ))" > "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || true
-      _main_health_dispatch "$_rm_pr" "$_rm_sha" died
+      # CHARGE THE BUDGET ONLY ON A REAL DISPATCH. The counter counts DEATHS, not ticks: a tick that
+      # merely deferred (the shared health slot was busy — the routine case at HEALTH_CONCURRENCY=1) ran
+      # no suite, so it must not spend a death. Charging it would let three slot-contended ticks reach
+      # the cap, mark the sha run-once, and permanently strand a sha whose suite never ran once.
+      if _main_health_dispatch "$_rm_pr" "$_rm_sha" died; then
+        printf '%s\n' "$(( _rm_n + 1 ))" > "$(_main_health_retry_file "$_rm_sha")" 2>/dev/null || true
+      fi
       return 0
     fi
     _rm_pr="$(_main_health_observed_pr "$_rm_sha")"; [ -n "$_rm_pr" ] || _rm_pr="?"
-    _main_health_dispatch "$_rm_pr" "$_rm_sha" observed-sha
+    _main_health_dispatch "$_rm_pr" "$_rm_sha" observed-sha    # a deferral simply retries next tick
     return 0
   fi
 
@@ -4525,10 +4553,16 @@ reconcile_main_health() {
   _rm_age="$(_main_health_file_age_mins "$_rm_marker")"     # marker mtime = when this sha was last collected
   case "$_rm_age" in ''|-*|*[!0-9]*) return 0 ;; esac
   [ "$_rm_age" -ge "$_rm_mins" ] || return 0
-  rm -f "$_rm_marker" 2>/dev/null || true                   # re-arm this sha; the guards below still hold
   _rm_pr="$(_main_health_observed_pr "$_rm_sha")"; [ -n "$_rm_pr" ] || _rm_pr="?"
-  journal_append main_health pr "$_rm_pr" sha "$_rm_sha" result recheck age_mins "$_rm_age"
-  _main_health_dispatch "$_rm_pr" "$_rm_sha" recheck
+  # DISPATCH FIRST, THEN drop the run-once marker — never the reverse. The marker is this sha's ONLY
+  # record that it has a verdict; dropping it ahead of a dispatch that then defers (busy slot) would
+  # leave the sha unmarked while $MAIN_HEALTH_STATE still renders its old verdict. It self-heals next
+  # tick via the observed-sha branch, but the honest ordering is to spend nothing until the suite is
+  # actually running. The collector rewrites the marker (and its mtime, which IS the cadence clock).
+  if _main_health_dispatch "$_rm_pr" "$_rm_sha" recheck; then
+    rm -f "$_rm_marker" 2>/dev/null || true
+    journal_append main_health pr "$_rm_pr" sha "$_rm_sha" result recheck age_mins "$_rm_age"
+  fi
   return 0
 }
 

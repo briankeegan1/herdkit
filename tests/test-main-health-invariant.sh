@@ -231,6 +231,62 @@ reconcile_main_health
 [ -s "$MAIN_HEALTH_STATE" ] && fail "(c) an infra death painted MAIN RED (it must never)"
 ok "(c) serial worker deaths are bounded: an infra_event, never an endless suite loop"
 
+# (c') THE DEATH BUDGET COUNTS DEATHS, NOT TICKS (review BLOCK, round 1). HEALTH_CONCURRENCY defaults to
+# 1 and that slot is shared with every per-PR gate suite, so a died sha routinely meets ticks on which no
+# dispatch is possible. If a deferred tick charged a death, three slot-contended ticks would reach the cap
+# and mark a sha whose suite NEVER RAN — silently abandoning the invariant, suppressing a real MAIN RED,
+# and (at the default RECHECK_MINS=0) stranding that sha permanently.
+reset_state
+printf 'slow\n' > "$HC_MODE"
+new_sha "chore: a sha whose worker dies into a busy slot"
+SHA="$(head_sha)"
+reconcile_main_health                                    # dispatch #1 (a free slot)
+kill_worker                                              # → died, no verdict, budget still 0
+
+# Occupy the ONLY health slot with a live foreign holder, exactly as a per-PR gate suite does.
+sleep 60 & HOLDER=$!
+_marker_write "$(_health_inflight_file "probe-busy")" "$HOLDER"
+_health_slot_free && fail "(c') the planted holder did not occupy the health slot"
+
+for _t in 1 2 3 4; do reconcile_main_health; done        # four ticks, all of them deferrals
+[ "$(jcount '"provenance":"died"')" -eq 0 ] || fail "(c') a deferred tick dispatched a suite"
+[ "$(jcount '"reason":"died-cap"')" -eq 0 ] || fail "(c') slot contention burned the death budget to the cap"
+[ -e "$(_main_health_marker "$SHA")" ] && fail "(c') a sha whose suite never ran was marked as verified"
+[ "$(cat "$(_main_health_retry_file "$SHA")" 2>/dev/null || printf 0)" -eq 0 ] \
+  || fail "(c') a deferred tick was charged as a death"
+# The deferral is journaled ONCE, not once per tick (the defer memo), and it is honest about the reason.
+[ "$(jcount '"reason":"no-slot"')" -eq 1 ] || fail "(c') the no-slot deferral was not journaled exactly once"
+ok "(c') a busy health slot never charges a death, never caps, never marks an unverified sha"
+
+# Free the slot: the very next tick must re-dispatch the still-died sha — it was deferred, not abandoned.
+kill -9 "$HOLDER" 2>/dev/null || true; wait "$HOLDER" 2>/dev/null || true
+rm -f "$(_health_inflight_file "probe-busy")"
+printf 'green\n' > "$HC_MODE"
+_main_health_died "$SHA" || fail "(c') the sha stopped being died while merely deferred"
+reconcile_main_health
+[ "$(jcount '"provenance":"died"')" -eq 1 ] || fail "(c') the deferred died sha did not re-dispatch once the slot freed"
+settle
+[ "$(jcount '"result":"green"')" -ge 1 ] || fail "(c') the re-dispatched sha never reached a verdict"
+ok "(c') once the slot frees, the deferred sha re-dispatches and reaches a verdict"
+
+# (c'') The RECHECK path must not drop the run-once marker on a tick that only defers.
+reset_state
+printf 'red-file\n' > "$HC_MODE"
+new_sha "feat: a red we will try to recheck into a busy slot"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(c'') setup: the red did not paint"
+MAIN_HEALTH_RECHECK_MINS=30
+touch -t 200001010000 "$(_main_health_marker "$(head_sha)")"
+sleep 60 & HOLDER=$!
+_marker_write "$(_health_inflight_file "probe-busy")" "$HOLDER"
+reconcile_main_health
+[ -e "$(_main_health_marker "$(head_sha)")" ] || fail "(c'') a deferred recheck dropped the run-once marker"
+[ "$(jcount '"result":"recheck"')" -eq 0 ]   || fail "(c'') a deferred recheck journaled as if it ran"
+kill -9 "$HOLDER" 2>/dev/null || true; wait "$HOLDER" 2>/dev/null || true
+rm -f "$(_health_inflight_file "probe-busy")"
+MAIN_HEALTH_RECHECK_MINS=0
+ok "(c'') a recheck that defers on a busy slot leaves the marker and the verdict intact"
+
 # ── (d) AUTOFIX: one item per distinct HONEST identity; a banner files nothing ───────────────────────
 reset_state
 MAIN_HEALTH_AUTOFIX=on
@@ -304,5 +360,14 @@ printf '%s %s %s\n' "deadbeef" "226" "app/greet.test.sh" > "$MAIN_HEALTH_STATE"
 ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
 printf '%s' "$ROW" | grep -q 'since #226' || fail "(a) an attributed red lost its 'since #N': $ROW"
 ok "(a) the row names the PR when it knows one, and says (observed) when it does not"
+
+# ── PR attribution: a trailing "(#N)" (the squash form) outranks an issue ref earlier in the subject ──
+new_sha "Merge pull request #456 from other/seat"
+[ "$(_main_health_observed_pr "$(head_sha)")" = "456" ] || fail "(a) merge-commit subject: wrong pr#"
+new_sha "Fix #123 widget handling (#456)"
+[ "$(_main_health_observed_pr "$(head_sha)")" = "456" ] || fail "(a) squash subject: the ISSUE ref was attributed, not the PR"
+new_sha "chore: a commit that names no PR at all"
+[ -z "$(_main_health_observed_pr "$(head_sha)")" ] || fail "(a) a PR number was invented for a subject that names none"
+ok "(a) attribution: trailing (#N) wins over an earlier issue ref; no PR named → no PR invented"
 
 echo "ALL PASS ($pass checks)"
