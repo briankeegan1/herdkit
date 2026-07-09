@@ -35,11 +35,34 @@
 #                      legitimately runs for hours, so absolute lifetime is the wrong deadline for it.
 #   none               no liveness signal; deadline from spawn only.
 #
+# A STALE BEAT IS NOT, BY ITSELF, A HANG. HERD-122 learned this the hard way: a frozen heartbeat is
+# equally the signature of a drainer that FINISHED (its last beat is simply its last), and reclaiming
+# on the beat alone false-positived a live drainer. So a stale beat is CORROBORATED against the agent's
+# real liveness before it is called a hang — exactly as herd_drainer_should_reclaim does:
+#     agent dead    → `exited`  (it finished or crashed; retire the record, never a fabricated hang)
+#     agent alive   → `expired` (silent but running: the genuine hang this contract exists to surface)
+#     unprobeable   → `live`    (blindness is never evidence of anything)
+# The drainers additionally retire their own record on their normal completion path (`*-step.sh finish`
+# → STOP), so a clean drain is accounted for the moment it ends, without waiting for corroboration.
+#
 # ── The deadline ─────────────────────────────────────────────────────────────────────────────────
 # REUSES the timeout each population already has, so this file introduces no new tunables:
 #   reviewer / health-worker   → REVIEW_INFLIGHT_TIMEOUT / HEALTH_INFLIGHT_TIMEOUT (the corpse sweep's)
 #   scribe-drainer / research-drainer → DRAINER_HEARTBEAT_TIMEOUT (the reclaim gate's)
 #   anything else              → _LC_FALLBACK_DEADLINE
+#
+# ── What each population actually gets from this leg ─────────────────────────────────────────────
+# The GATE WORKERS (reviewer, health-worker) share their deadline with the corpse sweep, which runs
+# EARLIER in the same tick, TERMs the timed-out worker and drops the record. So in practice a gate
+# worker is surfaced by the corpse sweep, and what this leg adds for them is the exited/reconcile path:
+# a worker that died before its teardown ran is still accounted for. `lifecycle_expired` is their
+# BACKSTOP — it fires only when the corpse sweep is lagging or disabled. The DRAINERS have no corpse
+# sweep at all, so the expiry path is their primary surface, and the resolver/builder populations
+# (unwired here, on the HERD-225 / stall-detector rails) are what the routes are reserved for.
+#
+# One honest limit on reviewer LIVENESS: the recorded pid is the herd-review.sh POLLER, not the
+# reviewer's agent pane, which outlives it. Pane orphans stay HERD-113's `_retire_reviewer_pane` /
+# startup-sweep problem; this record supervises the process the watcher itself forked.
 #
 # ── SHIP-DORMANT, BYTE-IDENTICAL WHEN OFF ────────────────────────────────────────────────────────
 # LIFECYCLE_CONTRACTS=off (the default) makes every public function an immediate no-op: no record is
@@ -60,6 +83,14 @@
 # literal, not a config key: the whole point is to reuse each population's real timeout, and a
 # catch-all knob would invite operators to tune the wrong dial. 30 min matches the gate families.
 _LC_FALLBACK_DEADLINE=1800
+
+# _LC_EXIT_GRACE — how long the sweep waits, after first observing that a pid-probed process has
+# EXITED, before retiring the record itself with the generic reason `exited`. The population's own
+# teardown runs later in the tick (a health worker's result is collected, a reviewer's verdict is
+# consumed) and retires the record with its TRUE reason; without this grace the sweep would always win
+# the race and the journal would read `exited` for every cleanly-finished gate worker. The grace only
+# delays bookkeeping — nothing waits on it.
+_LC_EXIT_GRACE=60
 
 # lifecycle_enabled — the ship-dormant gate. Returns 0 only when LIFECYCLE_CONTRACTS is truthy.
 # EVERY public function consults this first.
@@ -141,6 +172,23 @@ _lc_beat_age() {
   printf '%s' "$(( _now - _mt ))"
 }
 
+# _lc_agent_liveness <agent-name> — corroborate a heartbeat population's real liveness. Prints
+# alive | dead | unknown. Delegates to whichever probe the caller has already sourced:
+# herd_drainer_live_status (drainer-liveness.sh — status-first, then the process probe) if present,
+# else herd_driver_agent_liveness (driver.sh) directly. A caller that sourced NEITHER (or a runtime
+# with no control surface) gets `unknown`, which every consumer below treats as "no evidence".
+_lc_agent_liveness() {
+  local _n="${1:-}"
+  [ -n "$_n" ] || { printf 'unknown'; return 0; }
+  if command -v herd_drainer_live_status >/dev/null 2>&1; then
+    herd_drainer_live_status "$_n" 2>/dev/null || printf 'unknown'
+  elif command -v herd_driver_agent_liveness >/dev/null 2>&1; then
+    herd_driver_agent_liveness "$_n" 2>/dev/null || printf 'unknown'
+  else
+    printf 'unknown'
+  fi
+}
+
 # ── The four properties, written once ────────────────────────────────────────────────────────────
 # lifecycle_spawn <population> <id> <probe> [owner] [deadline_secs]
 #   Record a supervised process and journal `lifecycle_spawn` with all four properties. <probe> is
@@ -160,13 +208,15 @@ lifecycle_spawn() {
   _spawn_epoch="$(_lc_now)"
   _dir="${_rf%/*}"
   [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
-  # temp+rename so a reader never sees a half-written record.
-  local _tmp; _tmp="$(mktemp "${_rf}.XXXXXX" 2>/dev/null)" || return 0
+  # temp+rename so a reader never sees a half-written record. The temp name is DOT-PREFIXED and carries
+  # no `__`, so a concurrent lifecycle_sweep's `*__*` glob can never pick it up mid-write.
+  local _tmp; _tmp="$(mktemp "${_dir}/.lctmp.XXXXXX" 2>/dev/null)" || return 0
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$_pop" "$_id" "$_owner" "$_probe" "$_dl" "$_spawn_epoch" "$_route" > "$_tmp" 2>/dev/null \
     && mv -f "$_tmp" "$_rf" 2>/dev/null || rm -f "$_tmp" 2>/dev/null
-  # A fresh spawn re-arms the once-only expiry notice (a superseding dispatch is not still-expired).
-  rm -f "${_rf}.expired" 2>/dev/null || true
+  # A fresh spawn re-arms the once-only expiry notice and clears any exit observation (a superseding
+  # dispatch is neither still-expired nor still-gone).
+  rm -f "${_rf}.expired" "${_rf}.gone" 2>/dev/null || true
   journal_append lifecycle_spawn population "$_pop" id "$_id" owner "$_owner" \
     probe "$_probe" deadline "$_dl" route "$_route" component lifecycle
   return 0
@@ -189,7 +239,7 @@ lifecycle_retire() {
   _spawn_epoch="$(_lc_num "$_spawn_epoch" 0)"
   _lived=0
   [ "$_spawn_epoch" -gt 0 ] 2>/dev/null && _lived=$(( $(_lc_now) - _spawn_epoch ))
-  rm -f "$_rf" "${_rf}.expired" 2>/dev/null || true
+  rm -f "$_rf" "${_rf}.expired" "${_rf}.gone" 2>/dev/null || true
   journal_append lifecycle_retire population "$_pop" id "$_id" owner "${_owner:-unknown}" \
     reason "$_reason" lived_secs "$_lived" component lifecycle
   return 0
@@ -204,21 +254,21 @@ lifecycle_records() {
   local _f
   for _f in "$_d"/*__*; do
     [ -f "$_f" ] || continue
-    case "${_f##*/}" in *.expired) continue ;; esac
+    case "${_f##*/}" in *.expired|*.gone) continue ;; esac
     cat -- "$_f" 2>/dev/null || true
   done
   return 0
 }
 
-# _lc_state <probe> <deadline> <spawn_epoch> — classify ONE record against ground truth. Prints
-# exactly one token:
+# _lc_state <probe> <deadline> <spawn_epoch> [agent-id] — classify ONE record against ground truth.
+# Prints exactly one token:
 #   live     — within deadline, and (pid probe) the process is alive
-#   exited   — POSITIVE evidence the pid is gone. The process is accounted for; retire it.
-#   expired  — past its deadline while still alive (pid) / silent past the heartbeat window.
-# A probe we cannot read (missing heartbeat, non-numeric pid) yields `live`: fail-soft, never
-# fabricate a death or a hang. This is the same rule drainer-liveness.sh applies to an absent beat.
+#   exited   — POSITIVE evidence the process is gone. It is accounted for; retire it.
+#   expired  — past its deadline while STILL RUNNING: the hang this contract exists to surface.
+# A probe we cannot read (missing heartbeat, non-numeric pid, no control surface) yields `live`:
+# fail-soft, never fabricate a death OR a hang. Same rule drainer-liveness.sh applies to an absent beat.
 _lc_state() {
-  local _probe="${1:-none}" _dl="${2:-0}" _spawn="${3:-0}" _now _age
+  local _probe="${1:-none}" _dl="${2:-0}" _spawn="${3:-0}" _id="${4:-}" _now _age
   _dl="$(_lc_num "$_dl" "$_LC_FALLBACK_DEADLINE")"
   _spawn="$(_lc_num "$_spawn" 0)"
   _now="$(_lc_now)"
@@ -228,9 +278,19 @@ _lc_state() {
       _age=$(( _now - _spawn ))
       ;;
     heartbeat:*)
-      # Silence past the window IS the deadline for a heartbeat population (a drainer may legitimately
+      # Silence past the window is the deadline for a heartbeat population (a drainer may legitimately
       # live for hours). An absent/unreadable beat is treated as fresh — fail-soft.
       _age="$(_lc_beat_age "${_probe#heartbeat:}")" || { printf 'live'; return 0; }
+      [ "$_age" -gt "$_dl" ] 2>/dev/null || { printf 'live'; return 0; }
+      # STALE BEAT — but a frozen heartbeat is equally the signature of a drainer that FINISHED. Never
+      # call it a hang without corroboration (HERD-122): only an agent that is POSITIVELY ALIVE while
+      # silent is hung. A dead agent has simply ended; anything unprobeable is no evidence at all.
+      case "$(_lc_agent_liveness "$_id")" in
+        dead)  printf 'exited' ;;
+        alive) printf 'expired' ;;
+        *)     printf 'live' ;;
+      esac
+      return 0
       ;;
     *)
       _age=$(( _now - _spawn ))
@@ -241,19 +301,23 @@ _lc_state() {
 }
 
 # _lc_inbox_append <ref> <snippet> — one operator-inbox row, the same TSV shape agent-watch.sh's
-# _inbox_record writes: <epoch>\t<source>\t<ref>\t<author>\t<snippet>. Best-effort; tail-bounded.
+# _inbox_record writes: <epoch>\t<source>\t<ref>\t<author>\t<snippet>, tail-bounded to the SAME
+# INBOX_LEDGER_MAX (defined by agent-watch.sh, our only production caller) so the two can never drift.
+# Best-effort. No inbox destination ⇒ silent no-op.
 _lc_inbox_append() {
+  [ -n "${HERD_LIFECYCLE_INBOX:-}" ] || [ -n "${WORKTREES_DIR:-}" ] || return 0
   local _inbox="${HERD_LIFECYCLE_INBOX:-${WORKTREES_DIR:-}/.agent-watch-inbox}"
-  case "$_inbox" in /.agent-watch-inbox) return 0 ;; esac   # no WORKTREES_DIR ⇒ no destination
-  local _ref="$1" _snip="$2" _now _n
-  _now="$(date +%s 2>/dev/null || printf '0')"
+  local _ref="$1" _snip="$2" _n _max
+  # ${VAR-} (no colon) so the caps-sync ghost scan does not read agent-watch.sh's script-local
+  # INBOX_LEDGER_MAX as a config knob — the same idiom journal.sh uses for its test signals.
+  _max="$(_lc_num "${INBOX_LEDGER_MAX-}" 50)"
   _snip="$(printf '%s' "$_snip" | tr '\t\n' '  ')"; _snip="${_snip:0:120}"
   mkdir -p "$(dirname -- "$_inbox")" 2>/dev/null || true
-  printf '%s\t%s\t%s\t%s\t%s\n' "$_now" "lifecycle" "$_ref" "lifecycle" "$_snip" >> "$_inbox" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(_lc_now)" "lifecycle" "$_ref" "lifecycle" "$_snip" >> "$_inbox" 2>/dev/null || return 0
   _n="$(wc -l < "$_inbox" 2>/dev/null | tr -cd '0-9')"
-  if [ "${_n:-0}" -gt 50 ]; then
+  if [ "${_n:-0}" -gt "$_max" ]; then
     local _keep; _keep="$(mktemp "${_inbox}.XXXXXX" 2>/dev/null)" || return 0
-    tail -n 50 "$_inbox" > "$_keep" 2>/dev/null && mv -f "$_keep" "$_inbox" 2>/dev/null || rm -f "$_keep" 2>/dev/null
+    tail -n "$_max" "$_inbox" > "$_keep" 2>/dev/null && mv -f "$_keep" "$_inbox" 2>/dev/null || rm -f "$_keep" 2>/dev/null
   fi
   return 0
 }
@@ -276,15 +340,25 @@ lifecycle_sweep() {
   lifecycle_enabled || return 0
   local _d; _d="$(lifecycle_dir)" || return 0
   [ -d "$_d" ] || return 0
-  local _f _pop _id _owner _probe _dl _spawn _route _state
+  local _f _pop _id _owner _probe _dl _spawn _route _state _gone_at
   for _f in "$_d"/*__*; do
     [ -f "$_f" ] || continue
-    case "${_f##*/}" in *.expired) continue ;; esac
+    case "${_f##*/}" in *.expired|*.gone) continue ;; esac
     IFS=$'\t' read -r _pop _id _owner _probe _dl _spawn _route < "$_f" 2>/dev/null || continue
     [ -n "$_pop" ] && [ -n "$_id" ] || continue
-    _state="$(_lc_state "$_probe" "$_dl" "$_spawn")"
+    _state="$(_lc_state "$_probe" "$_dl" "$_spawn" "$_id")"
     case "$_state" in
       exited)
+        # The process is GONE. Give its own population's teardown _LC_EXIT_GRACE to retire the record
+        # with the TRUE reason (verdict-consumed / collected / drained) — it runs later in this tick.
+        # Only once that grace lapses does the sweep claim the record with the generic `exited`, so the
+        # journal reports what actually happened rather than always racing to the vaguest answer.
+        if [ ! -f "${_f}.gone" ]; then
+          printf '%s\n' "$(_lc_now)" > "${_f}.gone" 2>/dev/null || true
+          continue
+        fi
+        _gone_at="$(_lc_num "$(cat "${_f}.gone" 2>/dev/null | tr -cd '0-9')" 0)"
+        [ "$(( $(_lc_now) - _gone_at ))" -ge "$_LC_EXIT_GRACE" ] 2>/dev/null || continue
         lifecycle_retire "$_pop" "$_id" exited
         ;;
       expired)
@@ -298,8 +372,9 @@ lifecycle_sweep() {
         printf '%s\t%s\t%s\n' "$_pop" "$_id" "${_route:-operator}"
         ;;
       *)
-        # Healthy again → re-arm the once-only notice so a future expiry is not swallowed.
-        rm -f "${_f}.expired" 2>/dev/null || true
+        # Healthy again → re-arm the once-only notice so a future expiry is not swallowed, and drop any
+        # stale exit observation (a heartbeat that resumed was never gone).
+        rm -f "${_f}.expired" "${_f}.gone" 2>/dev/null || true
         ;;
     esac
   done

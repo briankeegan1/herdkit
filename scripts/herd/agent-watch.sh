@@ -2102,7 +2102,8 @@ _dispatch_review() {
     model "${model:-${HERD_REVIEW_MODEL:-${MODEL_REVIEW:-}}}" log_path "$result" pin "$_pin_mode"
   # Supervised-process contract (HERD-193): owner=agent-watch, liveness=the worker pid, deadline=the
   # corpse sweep's own REVIEW_INFLIGHT_TIMEOUT, retire=verdict-consumed (below) or the corpse sweep.
-  # Byte-inert while LIFECYCLE_CONTRACTS=off.
+  # The pid is this POLLER, not the reviewer's agent pane — the pane outlives it and remains HERD-113's
+  # `_retire_reviewer_pane` / startup-sweep problem. Byte-inert while LIFECYCLE_CONTRACTS=off.
   lifecycle_spawn reviewer "${pr}-${sha}" "pid:$_dr_pid" agent-watch
 }
 
