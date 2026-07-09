@@ -163,7 +163,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
-- `CLAIM_REQUIRED` → `herd-claim.sh`
+- `CLAIM_REQUIRED` → `bin/herd`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
@@ -187,7 +187,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
-- `HEALTHCHECK_AUTOFIX` → `agent-watch.sh`
+- `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
@@ -228,9 +228,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
-- `REVIEW_AUTOFIX` → `agent-watch.sh`
+- `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
-- `REVIEW_CONCURRENCY` → `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`
+- `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`
 - `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
@@ -247,13 +247,13 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SHIPPED_KEEP` → —
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
-- `STALE_BASE_AUTOFIX` → `agent-watch.sh`
+- `STALE_BASE_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`
-- `SWEEP_AUTO` → `sweep.sh`
+- `SWEEP_AUTO` → `bin/herd`, `sweep.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
 - `TOKEN_MODE` → `bin/herd`
-- `TRACKED_SPAWNS` → —
+- `TRACKED_SPAWNS` → `bin/herd`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`, `posture-lint.sh`
