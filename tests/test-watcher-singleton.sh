@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-watcher-singleton.sh — hermetic proof of the watcher SINGLETON spawn-lock (HERD-209).
+# test-watcher-singleton.sh — hermetic proof of the watcher SINGLETON spawn-lock (HERD-209 / HERD-252).
 #
 # The incident: control-room recovery (herd pane watch / herd reload / manual herd-watch.sh) spawned a
 # SECOND agent-watch main WITHOUT killing the first, so two watchers polled the same PRs and raced the
@@ -7,11 +7,15 @@
 # every launch: an ATOMIC check of HERD_WATCHER_LOCK (kill -0 on the recorded pid) that REFUSES a
 # duplicate and ADOPTS a stale/absent lock.
 #
+# HERD-252: a LIVE-lock collision must refuse LOUDLY (stderr names the holder pid) and EXIT NON-ZERO
+# immediately — never block/hang. Operator report: a second `bash scripts/herd/herd-watch.sh` under a
+# live pane watcher printed the banner then hung silently. Correct refusal, wrong manners.
+#
 # This test drives the SHIPPED acquisition function _acquire_watcher_singleton (agent-watch.sh, sourced
 # in lib mode via the AGENT_WATCH_LIB guard) and bin/herd's mirror helper _watcher_lock_pid_if_live,
 # asserting:
-#   (a) a SECOND launch under a LIVE HERD_WATCHER_LOCK REFUSES (returns non-zero) and spawns no
-#       duplicate — the recorded pid is left untouched.
+#   (a) a SECOND launch under a LIVE HERD_WATCHER_LOCK REFUSES (returns non-zero) within ~1s, prints
+#       the holder pid on stderr, and spawns no duplicate — the recorded pid is left untouched.
 #   (b) a launch under a STALE lock (dead pid) PROCEEDS (returns 0) and adopts the lock (writes its
 #       own pid).
 #   (c) a launch under an ABSENT lock PROCEEDS.
@@ -58,12 +62,25 @@ type _acquire_watcher_singleton >/dev/null 2>&1 || fail "_acquire_watcher_single
 # REFUSE (non-zero return) or ACQUIRE (zero return).
 acquire() { if ( _acquire_watcher_singleton >/dev/null 2>&1 ); then echo ACQUIRE; else echo REFUSE; fi; }
 
-# ── (a) LIVE lock → REFUSE, no duplicate, recorded pid untouched ────────────────
+# ── (a) LIVE lock → REFUSE LOUDLY + non-zero + fast, no duplicate, recorded pid untouched ─────
 printf '%s\n' "$LIVE" > "$LOCK"
-[ "$(acquire)" = "REFUSE" ] || fail "(a) a second launch under a LIVE lock must REFUSE (spawn no duplicate)"
+# Capture stderr + wall time: must name the holder pid and finish within ~1s (never hang).
+_a_err="$T/a.err"
+_a_start=$(date +%s)
+_a_rc=0
+( _acquire_watcher_singleton >"$T/a.out" 2>"$_a_err" ) || _a_rc=$?
+_a_end=$(date +%s)
+_a_elapsed=$((_a_end - _a_start))
+[ "$_a_rc" -ne 0 ] || fail "(a) a second launch under a LIVE lock must exit NON-ZERO (got rc=$_a_rc)"
+[ "$_a_elapsed" -le 1 ] || fail "(a) live-lock refuse must complete within ~1s (took ${_a_elapsed}s — hung/blocked?)"
+grep -q "already running" "$_a_err" || fail "(a) stderr must say already running (got: $(cat "$_a_err"))"
+grep -qE "pid[[:space:]]*$LIVE|PID[[:space:]]*$LIVE|\\(pid $LIVE\\)" "$_a_err" \
+  || fail "(a) stderr must name the holder pid $LIVE (got: $(cat "$_a_err"))"
 [ "$(cat "$LOCK")" = "$LIVE" ] || fail "(a) the live recorded pid must be left untouched by the refused launch"
+# Sanity: the quiet acquire() helper still reports REFUSE for the same state.
+[ "$(acquire)" = "REFUSE" ] || fail "(a) acquire() helper must also REFUSE under a LIVE lock"
 ok
-echo "PASS (a) live lock → refuse, no duplicate"
+echo "PASS (a) live lock → refuse loudly (pid $LIVE), non-zero, ≤1s, no duplicate"
 
 # ── (b) STALE lock (dead pid) → PROCEED and adopt ───────────────────────────────
 printf '%s\n' "$DEAD" > "$LOCK"
