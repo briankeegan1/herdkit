@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# test-doc-drift.sh — deterministic, ZERO-LLM guard that README.md + docs/*.md never drift from
-# the machine source of truth, templates/capabilities.tsv (HERD-96 README; HERD-168 docs extension).
+# test-doc-drift.sh — deterministic, ZERO-LLM guard that README.md + docs/*.md +
+# templates/*.tmpl never drift from the machine source of truth,
+# templates/capabilities.tsv (HERD-96 README; HERD-168 docs extension; HERD-254 tmpl scan).
 #
 # README/docs claims are hand-written; capabilities.tsv is the manifest every other surface
 # (herd codemap, the coordinator skill, `herd config`) is keyed off. Nothing catches a doc that
 # references a `herd <subcommand>` (or a README CONFIG_KEY) that no longer exists — exactly the
 # staleness class HERD-82 hand-fixed after the fact. This locks that fix in as a repeatable check
-# and the docs-drift analog of the conformance ratchet.
+# and the docs-drift analog of the conformance ratchet. HERD-254 extends the same red direction
+# to templates/*.tmpl: coordinator.md.tmpl renders into every seat's operating instructions, so
+# a phantom command there is MORE damaging than in a design doc.
 #
 # The check has ONE red direction and ONE advisory direction:
-#   • RED  (code-error): every `herd <subcommand>` REFERENCED in README.md + docs/*.md, and every
-#     CONFIG_KEY-shaped token REFERENCED in README.md, must resolve to a row in capabilities.tsv.
-#   • WARN (advisory only): capabilities present in the tsv but NOT mentioned in README/docs are
-#     listed as an advisory — the docs are curated, not exhaustive, so this NEVER reds.
+#   • RED  (code-error): every `herd <subcommand>` REFERENCED in README.md + docs/*.md +
+#     templates/*.tmpl, and every CONFIG_KEY-shaped token REFERENCED in README.md, must resolve
+#     to a row in capabilities.tsv.
+#   • WARN (advisory only): capabilities present in the tsv but NOT mentioned in README/docs/
+#     templates are listed as an advisory — the docs are curated, not exhaustive, so this NEVER reds.
 #
 # Extraction is COMMAND-POSITION scoped (see scripts/herd/doc-drift-lint.sh). Fully hermetic:
 # local file reads + a temp fixture only. NO herdr, NO gh, NO network, NO model.
@@ -36,15 +40,15 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required"
 # shellcheck source=/dev/null
 . "$LINT"
 
-# ── 1. The REAL tree is clean: no README/docs token drifts from capabilities.tsv ────────────────
+# ── 1. The REAL tree is clean: no README/docs/tmpl token drifts from capabilities.tsv ──────────
 real_out="$(herd_doc_drift_lint "$ROOT")"; real_rc=$?
 if [ "$real_rc" -ne 0 ]; then
   echo "$real_out" | grep '^DRIFT' >&2
-  fail "(1) README.md / docs/*.md drifted from templates/capabilities.tsv (see DRIFT lines above) — fix the doc reference or add the row to the manifest"
+  fail "(1) README.md / docs/*.md / templates/*.tmpl drifted from templates/capabilities.tsv (see DRIFT lines above) — fix the reference or add the row to the manifest"
 fi
 printf '%s\n' "$real_out" | grep -q '^DRIFT' && fail "(1) drift lines present despite clean exit"
 pass
-echo "PASS (1) README.md + docs/*.md ↔ capabilities.tsv: every referenced herd command (+ README CONFIG_KEY) resolves (no drift)"
+echo "PASS (1) README.md + docs/*.md + templates/*.tmpl ↔ capabilities.tsv: every referenced herd command (+ README CONFIG_KEY) resolves (no drift)"
 
 # ── 2. ADVISORY is emitted AND is warn-only ────────────────────────────────────────────────────
 printf '%s\n' "$real_out" | grep -q '^ADVISORY:' || fail "(2) advisory summary line missing"
@@ -127,5 +131,66 @@ skip_rc=$?
 pass
 echo "PASS (5) herd_doc_drift_lint skips (rc 2) when capabilities.tsv is absent — never a false red"
 
+# ── 6. DELIBERATE-DRIFT FIXTURE (templates/*.tmpl): phantom command reds; clean + {{}} pass ────
+# HERD-254 VERIFY: a *.tmpl referencing a nonexistent `herd <bogus>` reds; every registered
+# command (and template placeholder syntax) passes.
+FIX_TMPL="$T/tmpl"; mkdir -p "$FIX_TMPL"
+cat > "$FIX_TMPL/clean.md.tmpl" <<'EOF'
+# Clean coordinator-style template
+
+You run in `{{PROJECT_ROOT}}` on `{{DEFAULT_BRANCH}}`.
+Use `herd status` and `herd backlog` — both real. No drift.
+Driver binding stays a placeholder: `{{DRIVER_LIST_AGENTS}}`.
+A fenced line with a real command and a placeholder arg must stay clean:
+
+```bash
+$ herd config set {{SOME_KEY}} value   # placeholder must not invent a subcommand
+```
+
+Inline with a placeholder where a subcommand might have been: `herd {{SUBCOMMAND}}` — must NOT
+drift (placeholder stripped; no residual command-position subcommand to check).
+EOF
+cat > "$FIX_TMPL/stale.md.tmpl" <<'EOF'
+# Stale template (would render into seat operating instructions)
+
+Operators sometimes invent commands. Run `herd boguscmd` — MUST drift.
+A real one stays clean: `herd notes`.
+Also a placeholder that must NOT false-positive: re-render with `herd {{RENDER_CMD}}`.
+EOF
+
+clean_tmpl_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_TMPL/clean.md.tmpl")"; clean_tmpl_rc=$?
+[ "$clean_tmpl_rc" -eq 0 ] || fail "(6a) clean tmpl fixture must exit 0, got $clean_tmpl_rc — $clean_tmpl_out"
+printf '%s\n' "$clean_tmpl_out" | grep -q '^DRIFT' && fail "(6a) clean tmpl fixture emitted DRIFT lines: $clean_tmpl_out"
+pass
+echo "PASS (6a) templates/*.tmpl fixture with only real commands + {{...}} placeholders passes"
+
+stale_tmpl_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_TMPL/stale.md.tmpl")"; stale_tmpl_rc=$?
+[ "$stale_tmpl_rc" -eq 2 ] || fail "(6b) tmpl fixture with `herd boguscmd` must exit 2, got $stale_tmpl_rc"
+printf '%s\n' "$stale_tmpl_out" | grep -q 'DRIFT command:.*`herd boguscmd`' \
+  || fail "(6b) stale command 'herd boguscmd' not flagged in tmpl fixture: $stale_tmpl_out"
+printf '%s\n' "$stale_tmpl_out" | grep -qE 'DRIFT.*`herd notes`' \
+  && fail "(6b) false positive: real `herd notes` flagged as drift"
+# Placeholder residue must not invent a DRIFT (e.g. empty/partial after strip).
+printf '%s\n' "$stale_tmpl_out" | grep -q 'RENDER_CMD' \
+  && fail "(6b) false positive from {{...}} placeholder: $stale_tmpl_out"
+pass
+echo "PASS (6b) templates/*.tmpl deliberate-drift fixture: phantom 'herd boguscmd' flagged; real commands + {{...}} untouched"
+
+# ── 6c. herd_doc_drift_lint discovers templates/*.tmpl under a synthetic tree ──────────────────
+# Prove the lint entrypoint (not just the pure report) scans templates/ the same way it scans docs.
+LINT_TREE="$T/lint-tree"
+mkdir -p "$LINT_TREE/templates" "$LINT_TREE/docs"
+cp "$CAPS" "$LINT_TREE/templates/capabilities.tsv"
+cat > "$LINT_TREE/templates/coordinator.md.tmpl" <<'EOF'
+# synthetic coordinator skill template
+Run `herd phantomtmpl` — MUST drift when scanned by herd_doc_drift_lint.
+EOF
+lint_tmpl_out="$(herd_doc_drift_lint "$LINT_TREE")"; lint_tmpl_rc=$?
+[ "$lint_tmpl_rc" -eq 1 ] || fail "(6c) lint entrypoint on tree with phantom tmpl cmd must exit 1 (drift), got $lint_tmpl_rc — $lint_tmpl_out"
+printf '%s\n' "$lint_tmpl_out" | grep -q 'DRIFT command:.*`herd phantomtmpl`' \
+  || fail "(6c) lint entrypoint did not flag phantom tmpl command: $lint_tmpl_out"
+pass
+echo "PASS (6c) herd_doc_drift_lint scans templates/*.tmpl under <root> (entrypoint, not just report)"
+
 echo
-echo "ALL PASS ($PASS checks) — README + docs/*.md ↔ capabilities.tsv drift check is live, advisory-safe, and fails on real drift."
+echo "ALL PASS ($PASS checks) — README + docs/*.md + templates/*.tmpl ↔ capabilities.tsv drift check is live, advisory-safe, and fails on real drift."
