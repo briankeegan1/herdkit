@@ -276,6 +276,17 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # never a merge gate, revert, or re-merge; fully fail-soft. Ships OFF (byte-inert: no suite, no row).
 # MAIN_HEALTH_TICK="off"   # off (default) | on
 
+# Control-room SWEEP triggers (HERD-191) — off | advise (default) | auto. `herd sweep` is the
+# one-command cleanup: it reaps merged/closed-PR worktrees (sha-anchored), closes stale engine tabs,
+# drops dead inflight markers, and kills orphaned bats/healthcheck process trees. This key controls
+# what the WATCHER does about the same debris on its own. advise → a cheap per-cadence scan renders
+# one '🧹 sweep recommended: N stale tabs · M dead markers' console row and journals `sweep_advice`
+# once per distinct condition-set. auto → the watcher additionally runs the SAFE legs itself (dead
+# markers, orphan processes, registry-matched tabs, PROVABLY-disposable worktrees). JUDGMENT legs — a
+# worktree carrying real dirt or unpushed unique commits — are FLAGGED WITH EVIDENCE and never
+# auto-deleted, in any mode. off → byte-inert: no scan, no row, no journal. Watcher-affecting.
+# SWEEP_AUTO="advise"      # off | advise (default) | auto
+
 # Watcher-console FLAIR pack (HERD-147) — an ADDITIVE cosmetic layer on the live 'herd watch' console.
 # ON → (a) a merge CELEBRATION: the status tick after a merge prints one theme-colored line
 # '🐑 #<pr> joins the flock · <n> grazing'; (b) a PASTURE HEADER: one line rendering the in-flight herd

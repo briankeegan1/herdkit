@@ -2864,6 +2864,72 @@ cmd_status() {
   return "$rc"
 }
 
+cmd_sweep() {
+  # ONE-COMMAND CONTROL-ROOM CLEANUP (HERD-191). Runs every reaper the engine owns, on demand:
+  #   1. worktrees — sha-anchored reap of merged/closed-PR trees + unowned detached scratch trees
+  #   2. tabs      — stale engine tabs (registry-allowlisted, workspace-scoped)
+  #   3. markers   — dead-pid inflight markers (HERD-185's restart-safe corpse sweep)
+  #   4. processes — orphaned (ppid=1) bats/healthcheck trees; duplicate argv0-tagged watchers
+  #   5. watcher   — restart the watcher pane, then verify it survives one tick
+  # Legs 1–4 live in scripts/herd/sweep.sh, which COMPOSES the shipped helpers (it reuses
+  # agent-watch.sh's _reap_slug / _orphan_tab_ids / _sweep_gate_corpses via AGENT_WATCH_LIB=1 rather
+  # than reimplementing them). Leg 5 lives HERE because it needs the pane helpers + the single
+  # watcher-killing code path (_stop_project_watcher's SIGTERM-poll-SIGKILL-abort discipline), which
+  # cmd_pane_watch already owns — so the sweep never grows a second way to kill a watcher.
+  #
+  # SAFETY: anything the sweep cannot PROVE disposable (a worktree with real dirt, or a closed-PR
+  # branch carrying commits that exist nowhere else) is FLAGGED WITH EVIDENCE and never deleted.
+  #   --dry-run     print the full plan, touch nothing (also skips leg 5)
+  #   --no-restart  run legs 1–4 only
+  local dry="" restart=1 args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)    dry=1; restart=0; args+=("$1") ;;
+      --no-restart) restart=0; args+=("$1") ;;
+      -h|--help)    say "usage: herd sweep [--dry-run] [--no-restart]"; return 0 ;;
+      *)            die "herd sweep: unknown option '$1' (try --dry-run or --no-restart)" ;;
+    esac
+    shift
+  done
+
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+
+  # Legs 1–4. sweep.sh loads its own helper substrate and journals every action it takes.
+  bash "$SCRIPTS_DIR/sweep.sh" ${args[@]+"${args[@]}"} || return $?
+
+  [ "$restart" -eq 1 ] || return 0
+
+  # ── leg 5: watcher pane restart + one-tick verify ──
+  # cmd_pane_watch stops THIS project's watcher(s) — including the duplicate/zombie strays leg 4
+  # merely listed — and brings exactly one back up in its pane. Then prove the new watcher is not a
+  # crash-loop: a watcher that dies during its first ~4 s tick would otherwise look like a success.
+  say ""
+  say "${c_bold}sweep leg 5${c_rst} — restarting the watcher"
+  cmd_pane_watch || { warn "watcher restart failed — control room swept, but no watcher is running"; return 1; }
+
+  local wait_s="${HERD_SWEEP_TICK_WAIT:-5}" wpid=""
+  [ -f "$HERD_WATCHER_LOCK" ] && wpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  if [ -z "$wpid" ]; then
+    warn "watcher restarted but wrote no pid lock — cannot verify it survived a tick"
+    journal_append sweep_watcher_verify result no-lock
+    return 1
+  fi
+  sleep "$wait_s"
+  if kill -0 "$wpid" 2>/dev/null; then
+    ok "watcher pid $wpid alive after one tick (${wait_s}s)"
+    journal_append sweep_watcher_verify result alive pid "$wpid"
+    return 0
+  fi
+  warn "watcher pid $wpid DIED within ${wait_s}s of restart — inspect its pane"
+  journal_append sweep_watcher_verify result died pid "$wpid"
+  return 1
+}
+
 cmd_backlog() {
   # Print the project's OPEN work items via the active SCRIBE_BACKEND — the generic,
   # backend-agnostic "what's my open work?" command. The file backend greps $BACKLOG_FILE,
@@ -5717,6 +5783,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       watcher alive?, in-flight builders (+ DEAD detection), open
                                       PRs + gate state, backlog counts. Deterministic, no LLM, no
                                       mutation; exits non-zero when something needs attention
+  herd sweep [--dry-run] [--no-restart]
+                                      one-command control-room cleanup: reap merged/closed-PR
+                                      worktrees (sha-anchored), close stale engine tabs, drop
+                                      dead inflight markers, kill orphaned bats/healthcheck
+                                      process trees, then restart + verify the watcher. Anything
+                                      it cannot prove disposable (real dirt, unpushed unique
+                                      commits) is FLAGGED with evidence, never deleted.
+                                      --dry-run prints the full plan and touches nothing
   herd why <pr#>                      summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
                                       merge/reap — chronologically; the first post-mortem tool
@@ -5821,6 +5895,7 @@ case "${1:-help}" in
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;
   status)  shift; cmd_status "$@" ;;
+  sweep)   shift; cmd_sweep "$@" ;;
   why)     shift; cmd_why "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   cost)    shift; cmd_cost "$@" ;;

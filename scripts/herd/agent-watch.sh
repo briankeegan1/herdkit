@@ -891,6 +891,11 @@ render() {
   if [ -n "${HERD_ENGINE_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}engine${C_RESET}"$'\n'"${HERD_ENGINE_NOTE}"$'\n'
   fi
+  # CONTROL-ROOM SWEEP advisory (HERD-191) — one quiet line when debris has accumulated. Empty when
+  # the control room is clean or SWEEP_AUTO=off, so the console is byte-identical when unused.
+  if [ -n "${SWEEP_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}housekeeping${C_RESET}"$'\n'"${SWEEP_NOTE}"$'\n'
+  fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
   # byte-identical when the feature is unused.
@@ -3143,8 +3148,12 @@ emit(wt, branch)
 #
 # Self-exclusion: HERD_WATCHER_TAB_ID (set by coordinator.sh via --env) is always excluded even
 # if it somehow appeared in the registry, so the watcher can never sweep its own host tab.
-_sweep_orphan_tabs() {
-  [ -n "$DRYRUN" ] && return 0
+#
+# DETECTION vs ACTION: the candidate computation lives in _orphan_tab_ids (below), which PRINTS the
+# orphaned tab ids and touches nothing. _sweep_orphan_tabs is the action wrapper. `herd sweep`
+# (HERD-191) reuses the detector for its dry-run plan, so the plan and the live sweep can never
+# disagree about which tabs are stale.
+_orphan_tab_ids() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _sw_wsid; _sw_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
   local _sw_tabs; _sw_tabs="$(herdr tab list 2>/dev/null || true)"
@@ -3268,7 +3277,19 @@ except Exception:
 ' 2>/dev/null || true)"
 
   [ -n "$_sw_orphans" ] || return 0
-  local _sw_id
+  printf '%s\n' "$_sw_orphans"
+}
+
+# _sweep_orphan_tabs — the ACTION wrapper around _orphan_tab_ids: close each orphaned tab, journal
+# it, and prune its registry row. Dry-run-inert; byte-quiet when there are no orphans.
+# Optional arg: a PRE-COMPUTED newline-separated id list from an earlier _orphan_tab_ids call. `herd
+# sweep` narrates the plan from that list, so passing it back avoids a second `herdr tab list` +
+# `gh pr list` round-trip per sweep. Absent ⇒ compute it here (the watcher's own every-15-tick path).
+_sweep_orphan_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  local _sw_registry="$TREES/.herd-tabs" _sw_orphans="${1:-}" _sw_id
+  [ -n "$_sw_orphans" ] || _sw_orphans="$(_orphan_tab_ids)"
+  [ -n "$_sw_orphans" ] || return 0
   while IFS= read -r _sw_id; do
     [ -n "$_sw_id" ] || continue
     herdr tab close "$_sw_id" >/dev/null 2>&1 || true
@@ -3327,8 +3348,9 @@ except Exception: pass
 # populated (the tick sets it; the startup call primes it). Idempotent + fully fail-soft: no registry,
 # no herdr, or dry-run ⇒ zero action. One `gh pr list` per invocation; cheap when there are no resolve
 # rows (the common case) — it returns before any network call.
-_sweep_stale_resolve_tabs() {
-  [ -n "$DRYRUN" ] && return 0
+# DETECTION vs ACTION: _stale_resolve_tab_ids PRINTS "slug<TAB>tab_id" for each stale resolve tab and
+# touches nothing; _sweep_stale_resolve_tabs (below) is the action wrapper.
+_stale_resolve_tab_ids() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _srt_reg="$TREES/.herd-tabs"
   [ -f "$_srt_reg" ] || return 0
@@ -3396,7 +3418,7 @@ except Exception:
     pass
 ' 2>/dev/null || true)"
 
-  local _srt_slug _srt_tab _srt_merge _srt_n=0
+  local _srt_slug _srt_tab _srt_merge
   while IFS=$'\t' read -r _srt_slug _srt_tab; do
     [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
     # SAFETY (HERD-206): only a POSITIVELY-dead resolver is ever closed. ALIVE (roster row OR a pane
@@ -3408,12 +3430,24 @@ except Exception:
     case "$_srt_merge" in
       CONFLICTING|UNKNOWN) continue ;;
     esac
-    # STALE: dead resolver + PR merged/closed/clean → close the tab, prune its registry row, journal.
+    printf '%s\t%s\n' "$_srt_slug" "$_srt_tab"
+  done <<< "$_srt_rows"
+  return 0
+}
+
+# _sweep_stale_resolve_tabs — the ACTION wrapper around _stale_resolve_tab_ids: close each stale
+# resolve tab, journal it, prune its registry row. Dry-run-inert. Split for the same reason as
+# _orphan_tab_ids: `herd sweep` (HERD-191) narrates + counts from the detector, so a resolve tab it
+# closes can never be invisible in the plan or in SWEEP_N_TAB.
+_sweep_stale_resolve_tabs() {
+  [ -n "$DRYRUN" ] && return 0
+  local _srt_reg="$TREES/.herd-tabs" _srt_slug _srt_tab
+  while IFS=$'\t' read -r _srt_slug _srt_tab; do
+    [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
     herdr tab close "$_srt_tab" >/dev/null 2>&1 || true
     journal_append reap_resolve_tab tab_id "$_srt_tab" slug "$_srt_slug" reason stale-sweep
     _herd_tabs_drop_row "$_srt_reg" "$_srt_tab"
-    _srt_n=$(( _srt_n + 1 ))
-  done <<< "$_srt_rows"
+  done <<< "$(_stale_resolve_tab_ids)"
   return 0
 }
 
@@ -5815,8 +5849,40 @@ _healthcheck_gate() {
 # Crucially independent of the candidate list: a marker whose PR merged/closed/changed-sha — the exact
 # corpse that held a slot for ~1h on 2026-07-08 — is swept too, because nothing else would ever revisit
 # it. Idempotent, dry-run-inert, and byte-quiet when there are no corpses.
+# ── Corpse-sweep MUTUAL EXCLUSION (HERD-191) ─────────────────────────────────────────────────────
+# _sweep_gate_corpses used to have exactly ONE caller (the watcher tick). `herd sweep`'s leg 3 makes it
+# a SECOND, CONCURRENT caller: cmd_sweep runs legs 1-4 while the old watcher is still alive (leg 5
+# restarts it only afterwards). The function has no claim on a marker — it reads it, does a driver RPC
+# (_retire_reviewer_pane), and only THEN rm -f's — so two processes can both win the same corpse and
+# both run record_review_retry (a bare `>>` append) and _breaker_record_infra (a read-modify-write
+# counter). That silently double-charges a PR's review-retry budget (it exhausts its retries and stops
+# being reviewed) and can trip the global INFRA breaker early, while the RMW loses an increment.
+#
+# So the whole sweep runs under an atomic-mkdir mutex — the same primitive the watcher singleton lock
+# uses. `mkdir` is atomic on every POSIX filesystem: exactly one process creates the directory. The
+# loser SKIPS (returns 0) rather than blocking: the sweep is periodic and idempotent, so whoever holds
+# the lock is already freeing those slots, and the loser's next tick will find them gone. A lock dir
+# older than the staleness window is a crashed holder's leftover and is reclaimed.
+_GATE_CORPSE_MTX="${TREES}/.gate-corpse-sweep.lock.d"
+
+# _gate_corpse_claim — success iff we now hold the sweep mutex (caller MUST _gate_corpse_release).
+_gate_corpse_claim() {
+  if mkdir "$_GATE_CORPSE_MTX" 2>/dev/null; then return 0; fi
+  # Held. Reclaim only a STALE lock (no mtime inside the last minute ⇒ the holder died mid-sweep).
+  if [ -z "$(find "$_GATE_CORPSE_MTX" -prune -mmin -1 2>/dev/null)" ]; then
+    rmdir "$_GATE_CORPSE_MTX" 2>/dev/null || true
+    mkdir "$_GATE_CORPSE_MTX" 2>/dev/null && return 0
+  fi
+  return 1
+}
+_gate_corpse_release() { rmdir "$_GATE_CORPSE_MTX" 2>/dev/null || true; }
+
 _sweep_gate_corpses() {
   [ -z "${DRYRUN:-}" ] || return 0
+  # Serialize against a concurrent `herd sweep` / watcher tick. A skipped sweep is harmless (periodic
+  # + idempotent); a CONCURRENT one corrupts the retry ledger and the infra breaker.
+  _gate_corpse_claim || return 0
+  trap '_gate_corpse_release' RETURN
   local f base rest pr sha age pid
   # ── review family: .review-inflight-<pr>-<sha> ──
   for f in "$TREES"/.review-inflight-*; do
@@ -6136,6 +6202,88 @@ for wt, branch in feats:
         ag_status.get(slug, ""), pr.get("headRefOid", ""),
         (pr.get("author") or {}).get("login", "")]))
 '
+}
+
+# ── Control-room sweep (HERD-191) ────────────────────────────────────────────────────────────────
+# sweep.sh composes the reapers defined ABOVE (_marker_live, _sweep_gate_corpses, _orphan_tab_ids,
+# _sweep_orphan_tabs, _sweep_stale_resolve_tabs, _reap_slug), so it must be sourced AFTER them. It in
+# turn skips re-sourcing this file because those helpers are already in scope — no recursion.
+# SWEEP_LIB=1 loads functions only; the CLI entry point (sweep_main) never runs from inside a watcher.
+SWEEP_LIB=1
+# shellcheck source=/dev/null
+. "$HERE/sweep.sh"
+unset SWEEP_LIB
+
+# The trigger pass's cached counts. Recomputed on the ORPHAN-sweep cadence (not every 4 s tick): the
+# scan costs one `ps -e` plus a filesystem walk, which has no business riding the repaint. Rendering
+# reads the CACHE every tick, so the frame stays stable between scans instead of flickering.
+_SWEEP_SCAN_INTERVAL=15                  # ~60 s (15 × 4 s sleep) — matches _ORPHAN_SWEEP_INTERVAL,
+                                         # which is declared further down, next to the live loop
+_SWEEP_SCAN_TICK=$_SWEEP_SCAN_INTERVAL   # primed so the FIRST tick scans, then every interval
+_SWEEP_C_TABS=0; _SWEEP_C_MARKERS=0; _SWEEP_C_PROCS=0
+
+# _sweep_trigger_tick — the per-tick trigger. On the scan cadence it refreshes the cached counts,
+# journals `sweep_advice` once per distinct condition-set, and (SWEEP_AUTO=auto) runs the SAFE legs.
+# Byte-inert under SWEEP_AUTO=off: no scan, no journal, no row, no action.
+_sweep_trigger_tick() {
+  [ -n "$DRYRUN" ] && return 0
+  local _st_mode; _st_mode="$(sweep_auto_mode)"
+  [ "$_st_mode" = off ] && return 0
+  _SWEEP_SCAN_TICK=$(( _SWEEP_SCAN_TICK + 1 ))
+  [ "$_SWEEP_SCAN_TICK" -ge "$_SWEEP_SCAN_INTERVAL" ] || return 0
+  _SWEEP_SCAN_TICK=0
+  read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
+  sweep_journal_advice_once "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"
+  if [ "$_st_mode" = auto ] \
+     && { [ "$_SWEEP_C_TABS" -gt 0 ] || [ "$_SWEEP_C_MARKERS" -gt 0 ] || [ "$_SWEEP_C_PROCS" -gt 0 ]; } \
+     && _sweep_auto_should_act "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS"; then
+    # SAFE legs only. Judgment findings (dirty / unique-commit worktrees) are flagged + journaled by
+    # sweep_leg_worktrees and never acted on, so `auto` can never destroy unrecovered work. Narration
+    # is swallowed: the console is the watcher's, not the sweep's — the journal carries the record.
+    sweep_run_safe_legs >/dev/null 2>&1 || true
+    # Remember whether this condition-set was actually ACTIONABLE. sweep_cheap_tab_count knowingly
+    # over-counts (a slug whose worktree was reaped but whose PR is still open reads as a stale tab
+    # forever). Without this memo that single false positive would re-run every safe leg — a
+    # `gh pr view` per worktree plus a `gh pr list` — on every cadence tick, indefinitely. The
+    # sweep_advice memo suppressed the journal spam but not the work.
+    _sweep_auto_record "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS" "$(sweep_swept_total)"
+    # The mess is gone; re-scan so the console row clears this same tick instead of lingering a cycle.
+    read -r _SWEEP_C_TABS _SWEEP_C_MARKERS _SWEEP_C_PROCS <<< "$(sweep_scan_counts)"
+  fi
+  return 0
+}
+
+# _sweep_auto_should_act <tabs> <markers> <procs> — skip a repeat auto-sweep of a condition-set we
+# already swept and which yielded NOTHING. Any change in the signature (new debris, or debris cleared)
+# re-arms it, and a signature whose last run DID sweep something is retried (it was making progress).
+_SWEEP_AUTO_MEMO="$TREES/.sweep-auto-acted"
+_sweep_auto_should_act() {
+  local sig="t=$1 m=$2 p=$3" prev="" psig pswept
+  [ -f "$_SWEEP_AUTO_MEMO" ] || return 0
+  prev="$(cat "$_SWEEP_AUTO_MEMO" 2>/dev/null || true)"
+  psig="${prev%%|*}"; pswept="${prev##*|}"
+  [ "$psig" = "$sig" ] || return 0            # different condition-set → act
+  [ "${pswept:-0}" -gt 0 ] 2>/dev/null && return 0   # same set, but last run made progress → retry
+  return 1                                    # same set, swept nothing → a false positive; stand down
+}
+_sweep_auto_record() {
+  printf '%s|%s\n' "t=$1 m=$2 p=$3" "$4" > "$_SWEEP_AUTO_MEMO" 2>/dev/null || true
+}
+
+# build_sweep_note — the '🧹 sweep recommended: N stale tabs · M dead markers' console row, rendered
+# from the CACHED counts. Empty when the control room is clean or SWEEP_AUTO=off, so the console is
+# byte-identical to before this feature whenever there is nothing to sweep.
+build_sweep_note() {
+  SWEEP_NOTE=""
+  local _bs_mode _bs_line
+  _bs_mode="$(sweep_auto_mode)"
+  [ "$_bs_mode" = off ] && return 0
+  _bs_line="$(sweep_advice_line "$_SWEEP_C_TABS" "$_SWEEP_C_MARKERS" "$_SWEEP_C_PROCS")"
+  [ -n "$_bs_line" ] || return 0
+  local _bs_hint="run 'herd sweep'"
+  [ "$_bs_mode" = auto ] && _bs_hint="auto-sweeping safe legs; 'herd sweep' for the rest"
+  SWEEP_NOTE="    ${C_YELLOW}${_bs_line}${C_RESET} ${C_DIM}— ${_bs_hint}${C_RESET}"$'\n'
+  return 0
 }
 
 # Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
@@ -6483,6 +6631,9 @@ while true; do
   # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
   _sweep_gate_corpses
   _collect_main_health
+  # CONTROL-ROOM SWEEP trigger (HERD-191): refresh the cheap debris counts on the orphan-sweep
+  # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
+  _sweep_trigger_tick
 
   build_header
   build_landed
@@ -6491,6 +6642,7 @@ while true; do
   build_spawn_holds
   build_engine_note
   build_main_health
+  build_sweep_note
 
   # Fetch open PRs, then apply the configured watcher view (lens + filters). The view is a
   # read-time SELECTION filter only — it narrows which PRs this tick displays/considers and never
