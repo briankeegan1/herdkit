@@ -52,6 +52,7 @@ herd init	unit	tests/test-cli.sh
 herd init	unit	tests/test-stack-aware-init.sh
 herd init	unit	tests/test-init-grounding-interview.sh
 herd doctor	unit	tests/test-doctor.sh
+herd doctor	unit	tests/test-doctor-posture.sh
 herd upgrade	unit	tests/test-cli.sh
 herd upgrade	unit	tests/test-upgrade-migrations.sh
 herd upgrade	unit	tests/test-upgrade-config-adoption.sh
@@ -166,6 +167,7 @@ REVIEW_CHECKLIST	none-yet	unit: no test asserts the checklist injection into the
 COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh
+HERD_DRIVER	unit	tests/test-stub-driver.sh
 HERD_VERSION	unit	tests/test-upgrade-migrations.sh
 HERD_REPO	unit	tests/test-report-repo-guard.sh
 WATCHER_AUTOMERGE	unit	tests/test-merge-policy.sh
@@ -269,3 +271,5 @@ MERGE_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh
 .herd/steps.tsv	sim	tests/test-sandbox-posture-matrix.sh
+herd agent-update [--dry-run]	unit	tests/test-agent-update.sh
+AGENT_UPDATE	unit	tests/test-agent-update.sh

@@ -30,7 +30,9 @@ while IFS= read -r f; do
   e="$(bash -n "$f" 2>&1)" || errs="${errs}bash -n $f → $(printf '%s' "$e" | tail -1)"$'\n'
 done < <(
   { find scripts bin templates tests -type f -name '*.sh' 2>/dev/null
-    [ -f bin/herd ] && echo bin/herd; } | sort -u
+    [ -f bin/herd ] && echo bin/herd
+    # The dogfood lints live in .herd/ (outside the shipped engine surface); syntax-check them too.
+    [ -f .herd/claude-hardcode-lint.sh ] && echo .herd/claude-hardcode-lint.sh; } | sort -u
 )
 
 if [ -n "$errs" ]; then
@@ -41,7 +43,7 @@ fi
 # 2. shellcheck (best-effort lint — only fail on errors, not style).
 sc_note="shellcheck: skipped (not installed)"
 if command -v shellcheck >/dev/null 2>&1; then
-  if sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh bin/herd 2>&1)"; then
+  if sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; then
     sc_note="shellcheck: clean"
   else
     [ -n "$ONELINE" ] && echo "shellcheck: $(printf '%s' "$sc" | head -1)" || { echo "SHELLCHECK ERRORS"; printf '%s\n' "$sc"; }
@@ -499,5 +501,25 @@ else
   caps_note="caps-sync: skipped (no diff against $_hc_branch)"
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; }
+# 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
+# NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
+# + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
+# audit sites): a claude invocation not in the baseline is a CODE error. The lint is fail-soft on its
+# own infra (missing baseline/tree → exit 2), which we tolerate as a ⚠️ note rather than a red.
+chl_note="claude-hardcode: clean"
+if [ -f .herd/claude-hardcode-lint.sh ]; then
+  if [ -n "$ONELINE" ]; then
+    chl_out="$(bash .herd/claude-hardcode-lint.sh . --oneline 2>&1)"; chl_rc=$?
+  else
+    chl_out="$(bash .herd/claude-hardcode-lint.sh . 2>&1)"; chl_rc=$?
+  fi
+  case "$chl_rc" in
+    0) chl_note="$(printf '%s' "$chl_out" | tail -1)" ;;
+    2) chl_note="claude-hardcode: skipped (infra) — $(printf '%s' "$chl_out" | tail -1)" ;;   # tolerated ⚠️
+    *) [ -n "$ONELINE" ] && echo "$chl_out" || { echo "$chl_out"; }
+       exit 1 ;;
+  esac
+fi
+
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $chl_note"; }
 exit 0
