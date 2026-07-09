@@ -49,17 +49,20 @@ _posture_is_set() {
 }
 
 # _posture_effective_merge_policy — resolve the EFFECTIVE merge policy exactly as agent-watch.sh /
-# cmd_reload do: MERGE_POLICY (auto|approve|observe) wins; else the legacy WATCHER_AUTOMERGE boolean
-# derives it (false/no/off/0 → approve, anything else → auto). This is the single seam the doctor and
-# the watcher must agree on, so the honesty line reflects what the watcher will ACTUALLY do.
+# cmd_reload do (HERD-159): MERGE_POLICY (auto|approve|observe) wins when recognized; empty/unset
+# falls back to the legacy WATCHER_AUTOMERGE boolean (false/no/off/0 → approve, anything else → auto);
+# a NON-EMPTY unrecognized value fails STRICT to observe (never merge) so a typo can never silently
+# auto-merge. This is the single seam the doctor and the watcher must agree on, so the honesty line
+# reflects what the watcher will ACTUALLY do.
 _posture_effective_merge_policy() {
   case "${MERGE_POLICY:-}" in
     auto|approve|observe) printf '%s' "$MERGE_POLICY" ;;
-    *)
+    '')
       case "${WATCHER_AUTOMERGE:-true}" in
         false|no|off|0) printf 'approve' ;;
         *)              printf 'auto' ;;
       esac ;;
+    *) printf 'observe' ;;
   esac
 }
 

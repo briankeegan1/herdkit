@@ -271,16 +271,24 @@ INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounde
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
-# _effective_merge_policy — resolve "auto" | "approve" | "observe".
-# MERGE_POLICY takes precedence; falls back to legacy WATCHER_AUTOMERGE when unset/empty.
+# _effective_merge_policy — resolve "auto" | "approve" | "observe" (HERD-159).
+# MERGE_POLICY takes precedence when set to a RECOGNIZED value. Empty/unset falls back to the legacy
+# WATCHER_AUTOMERGE derivation (false/no/off/0 → approve, else → auto). An UNRECOGNIZED non-empty
+# value (e.g. MERGE_POLICY=aprove) is a TYPO, NOT a legacy-derivation trigger: fail STRICT to
+# `observe` (never merge) so a typo can never silently turn an approval-gated repo into auto-merge.
+# The launch-time journal below surfaces the bad value once; this pure helper only resolves.
 _effective_merge_policy() {
   case "${MERGE_POLICY:-}" in
     auto|approve|observe) printf '%s' "${MERGE_POLICY}" ;;
-    *)
+    '')
+      # Truly empty/unset → legacy WATCHER_AUTOMERGE derivation (back-compat).
       case "${WATCHER_AUTOMERGE:-true}" in
         false|no|off|0) printf 'approve' ;;
         *)              printf 'auto' ;;
       esac ;;
+    *)
+      # Garbage value → STRICTEST live behavior (observe = never merge). Gate keys fail strict.
+      printf 'observe' ;;
   esac
 }
 _pol="$(_effective_merge_policy)"
@@ -289,6 +297,20 @@ case "$_pol" in
   auto)    AUTOMERGE=1 ;;
   observe) MERGE_OBSERVE=1 ;;
 esac
+# An explicitly-set but UNRECOGNIZED MERGE_POLICY fails strict to observe — journal it once at
+# launch and print a red console line so a typo (MERGE_POLICY=aprove) never silently rides the
+# legacy auto-merge default. Skipped in lib mode so sourcing for pure helpers never writes a
+# journal line (mirrors HUMAN_VERIFY_POLICY below).
+if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
+  case "${MERGE_POLICY:-}" in
+    ''|auto|approve|observe) ;;
+    *)
+      journal_append merge_policy_invalid value "$MERGE_POLICY" fell_back_to observe 2>/dev/null || true
+      printf '\033[31m⚠️  herdkit: invalid MERGE_POLICY=%s — falling back to observe (never merge)\033[0m\n' \
+        "$MERGE_POLICY" >&2
+      ;;
+  esac
+fi
 unset _pol
 
 # _effective_human_verify_policy — resolve HUMAN_VERIFY_POLICY (HERD-59) to hold | coordinator | auto.
@@ -316,6 +338,31 @@ if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
     *) journal_append human_verify_policy_invalid value "$HUMAN_VERIFY_POLICY" fell_back_to hold 2>/dev/null || true ;;
   esac
 fi
+
+# ── HERD-159: live numeric / cosmetic resolvers (gate keys fail strict; cosmetic fail soft) ─────
+# herd_numeric / herd_enum live in herd-config.sh. These thin wrappers keep every call site on a
+# SAFE integer (or a known on/off token) while still honoring a mid-process export — hermetic tests
+# set HEALTH_CONCURRENCY / CODEMAP_AUTOREFRESH AFTER sourcing this file. Warnings fire once per key
+# via _herd_val_warn_once so a tick loop never spams stderr.
+_review_conc()  { herd_numeric REVIEW_CONCURRENCY 2 || true; }
+_spawn_ahead()  { herd_numeric SPAWN_AHEAD 1 || true; }
+_health_conc()  { herd_numeric HEALTH_CONCURRENCY 1 || true; }
+# CODEMAP_AUTOREFRESH is cosmetic (post-merge map refresh, never a gate). Unrecognized values fail
+# soft toward ACTIVE (default true) so a typo never freezes the maps.
+_codemap_auto() {
+  local _ca
+  _ca="$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')"
+  case "$_ca" in
+    ''|1|true|on|yes|enable|enabled) printf 'true' ;;
+    0|false|off|no|disable|disabled) printf 'false' ;;
+    *)
+      _herd_val_warn_once CODEMAP_AUTOREFRESH \
+        "⚠️  herdkit: invalid CODEMAP_AUTOREFRESH=${CODEMAP_AUTOREFRESH} — falling back to true (active)"
+      printf 'true'
+      ;;
+  esac
+}
+
 # This watcher's own worktree root — never auto-merge/remove the dir we run from.
 SELF_WT="$(cd "$HERE/../.." && pwd)"
 
@@ -1736,7 +1783,7 @@ _review_gate_step() {
 
   # Consume the arm ONLY when actually dispatching (below) — a QUEUED tick must leave it armed so the
   # escalation still lands when a concurrency slot frees on a later tick.
-  if [ "$(_count_live_reviews)" -ge "${REVIEW_CONCURRENCY:-2}" ]; then echo QUEUED; return 0; fi
+  if [ "$(_count_live_reviews)" -ge "$(_review_conc)" ]; then echo QUEUED; return 0; fi
   if [ -n "$_esc_armed" ]; then
     rm -f "$_esc_file" 2>/dev/null || true
     # (d) durable record of the review-lane step-up; the caller paints the '⬆️  escalated to …' row.
@@ -2480,10 +2527,11 @@ reconcile_backlog() {
 # uncommitted change (a concurrent writer owns it this tick — never clobber or bundle their edit);
 # (3) codemap.sh rewrites the file ONLY when content changed, so a clean tree after regen = fresh,
 # nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
+# HERD-159: unrecognized values fail soft toward ACTIVE via _codemap_auto (cosmetic key).
 refresh_codemap() {
   local rc_pr="${1:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh"
-  case "$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')" in
-    0|false|off|no|disable|disabled)
+  case "$(_codemap_auto)" in
+    false)
       journal_append codemap_refresh pr "$rc_pr" result skipped reason disabled; return 0 ;;
   esac
   [ -f "$rc_script" ]      || { journal_append codemap_refresh pr "$rc_pr" result skipped reason no-script;  return 0; }
@@ -2530,8 +2578,8 @@ refresh_codemap() {
 # changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
 refresh_symbol_index() {
   local rs_pr="${1:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh"
-  case "$(printf '%s' "${CODEMAP_AUTOREFRESH:-true}" | tr '[:upper:]' '[:lower:]')" in
-    0|false|off|no|disable|disabled)
+  case "$(_codemap_auto)" in
+    false)
       journal_append symbol_index_refresh pr "$rs_pr" result skipped reason disabled; return 0 ;;
   esac
   [ -f "$rs_script" ]    || { journal_append symbol_index_refresh pr "$rs_pr" result skipped reason no-script; return 0; }
@@ -4705,8 +4753,10 @@ _count_live_healthchecks() {
 }
 
 # _health_slot_free — true if a healthcheck slot is available under HEALTH_CONCURRENCY (default 1).
+# HERD-159: non-numeric HEALTH_CONCURRENCY falls back to 1 via _health_conc so a typo never breaks
+# the comparison into a silent "never dispatch" stall.
 _health_slot_free() {
-  [ "$(_count_live_healthchecks)" -lt "${HEALTH_CONCURRENCY:-1}" ]
+  [ "$(_count_live_healthchecks)" -lt "$(_health_conc)" ]
 }
 
 # _health_acquire <pr#> — claim a slot by writing this process's live pid to the pr's marker.
@@ -5580,8 +5630,18 @@ _drain_spawn_queue() {
   fi
 
   # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
-  local _dsq_cap _dsq_budget
-  _dsq_cap=$(( ${REVIEW_CONCURRENCY:-2} + ${SPAWN_AHEAD:-1} ))
+  # HERD-159: sanitize via herd_numeric (or a pure case fallback when the helper is unavailable —
+  # hermetic tests extract this function alone). Raw ${REVIEW_CONCURRENCY}+${SPAWN_AHEAD}
+  # arithmetic aborts on a non-numeric typo and freezes the spawn queue.
+  local _dsq_cap _dsq_budget _dsq_rc _dsq_sa
+  if type herd_numeric >/dev/null 2>&1; then
+    _dsq_rc="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+    _dsq_sa="$(herd_numeric SPAWN_AHEAD 1)" || true
+  else
+    _dsq_rc="${REVIEW_CONCURRENCY:-2}"; case "$_dsq_rc" in ''|*[!0-9]*) _dsq_rc=2 ;; esac
+    _dsq_sa="${SPAWN_AHEAD:-1}";       case "$_dsq_sa" in ''|*[!0-9]*) _dsq_sa=1 ;; esac
+  fi
+  _dsq_cap=$(( _dsq_rc + _dsq_sa ))
   _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
   [ "$_dsq_budget" -le 0 ] && return 0
 

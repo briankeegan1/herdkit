@@ -297,10 +297,14 @@ grep -qF -- '- `FIX_KEY` → `alpha.sh`'          "$EO"    || fail "engine: miss
 guardrails "$EO"; determinism "$E" "$EO"; ok
 echo "PASS engine-mode byte-identical (frozen fixture)"
 
-# The REAL herdkit repo must still map as ENGINE (HERD-79 did not flip it to project mode). No
-# HERD_CODEMAP_ROOT override → the default resolution picks the engine repo this script ships in.
+# The REAL herdkit repo must still map as ENGINE (HERD-79 did not flip it to project mode).
+# Pin HERD_CODEMAP_ROOT to the engine tree that ships this codemap.sh: in a linked worktree the
+# dogfood .herd/config may set PROJECT_ROOT to a different checkout that lacks the engine signature
+# files, which would otherwise force project/unknown mode and false-fail this assertion.
 RO_REAL="$T/real.md"
-HERD_CODEMAP_OUT="$RO_REAL" bash "$CODEMAP" </dev/null >/dev/null 2>&1 || fail "real-repo codemap failed"
+_real_engine="$(cd "$(dirname "$CODEMAP")/../.." && pwd -P)"
+HERD_CODEMAP_ROOT="$_real_engine" HERD_CODEMAP_OUT="$RO_REAL" bash "$CODEMAP" </dev/null >/dev/null 2>&1 \
+  || fail "real-repo codemap failed"
 head -1 "$RO_REAL" | grep -qF -- '# herdkit codemap' || fail "real repo no longer maps as ENGINE"
 grep -qF -- '## Who sources whom' "$RO_REAL"          || fail "real repo lost its engine 'sources whom' section"
 ok

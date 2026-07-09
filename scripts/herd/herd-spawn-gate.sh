@@ -134,8 +134,9 @@ print(n)
 # (SATURATED → the caller should defer unless forced) or 1 (headroom → proceed). Advisory only.
 herd_spawn_gate_saturated() {
   local conc ahead cap
-  conc="${REVIEW_CONCURRENCY:-2}"; case "$conc" in ''|*[!0-9]*) conc=2 ;; esac
-  ahead="${SPAWN_AHEAD:-1}";       case "$ahead" in ''|*[!0-9]*) ahead=1 ;; esac
+  # HERD-159: shared numeric sanitizer (warns once on a non-empty non-numeric typo).
+  conc="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  ahead="$(herd_numeric SPAWN_AHEAD 1)" || true
   _SG_LIVE="$(_sg_count_live_reviews)"
   _SG_QUEUED="$(_sg_count_queued_reviews)"
   _SG_BUILDERS="$(_sg_count_inflight_builders)"

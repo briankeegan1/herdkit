@@ -1497,6 +1497,56 @@ _config_key_requires() {
     END { exit(found?0:1) }' "$1"
 }
 
+# _config_key_value_shape <caps> <KEY> → print the value_shape token for KEY's kind==config row
+# (HERD-159). The optional 8th column of capabilities.tsv: "numeric" | "free" | a pipe-separated
+# enum list (e.g. auto|approve|observe). Empty / missing → free (backward-compatible). Presence of
+# an empty enum member (leading/trailing/double pipe, e.g. "|no-ai-coauthor") means the empty string
+# is an allowed value.
+_config_key_value_shape() {
+  awk -F'\t' -v k="$2" '
+    $2=="config" && $1==k { s=$8; gsub(/[[:space:]]+$/,"",s); print s; exit }
+  ' "$1"
+}
+
+# _config_validate_value <shape> <VALUE> — exit 0 when VALUE matches the shape, 1 when it does not.
+# Shapes (HERD-159):
+#   free / empty  — any value (including empty)
+#   numeric       — non-negative integer (digits only); empty is NOT numeric (caller may allow empty
+#                   separately by treating free). Used for concurrency / timeout keys.
+#   a|b|c         — VALUE must equal one of the pipe-separated members exactly. A leading/trailing/
+#                   double pipe admits the empty string as a member.
+# Pure predicate: no I/O beyond the exit status.
+_config_validate_value() {
+  local shape="${1:-}" val="${2-}"
+  case "$shape" in
+    ''|free) return 0 ;;
+    numeric)
+      case "$val" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *)
+      # Enum: walk pipe-separated members. Preserve empty members.
+      local _cv_rest="$shape" _cv_mem
+      while :; do
+        case "$_cv_rest" in
+          *'|'*)
+            _cv_mem="${_cv_rest%%|*}"
+            _cv_rest="${_cv_rest#*|}"
+            [ "$val" = "$_cv_mem" ] && return 0
+            ;;
+          *)
+            [ "$val" = "$_cv_rest" ] && return 0
+            break
+            ;;
+        esac
+      done
+      return 1
+      ;;
+  esac
+}
+
 # _config_key_scope <caps> <KEY> → print the key's WRITE SCOPE (HERD-47): "machine" for keys that
 # hold per-user/per-machine state and therefore DEFAULT to the gitignored .herd/config.local overlay
 # (driver binding, model tiers / token budget, operator-posture opt-ins), or "project" for keys that
@@ -1944,6 +1994,21 @@ cmd_config_set() {
   local requires
   requires="$(_config_key_requires "$caps" "$key")" \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
+
+  # 2a. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
+  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
+  #     the capabilities.tsv value_shape column (enum list | numeric | free). free/empty → no check.
+  local shape; shape="$(_config_key_value_shape "$caps" "$key")"
+  if ! _config_validate_value "$shape" "$val"; then
+    case "$shape" in
+      numeric)
+        die "invalid value for $key: \"$val\" — want a non-negative integer (see capabilities.tsv value_shape)"
+        ;;
+      *)
+        die "invalid value for $key: \"$val\" — allowed: ${shape} (see capabilities.tsv value_shape)"
+        ;;
+    esac
+  fi
 
   # 2b. Decide the TARGET file (HERD-47). A write lands in the per-user overlay .herd/config.local
   #     when EITHER --local was passed OR the key is machine-scoped in the manifest (scope=machine:
