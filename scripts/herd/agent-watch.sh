@@ -1107,7 +1107,7 @@ build_operator_inbox() {
   while IFS=$'\t' read -r epoch source ref author snip; do
     [ -n "${ref:-}" ] || continue
     hhmm="$(epoch_to_hhmm "$epoch")"
-    case "$source" in tracker) glyph='🗂' ;; *) glyph='📬' ;; esac
+    case "$source" in tracker) glyph='🗂' ;; audit) glyph='🔎' ;; *) glyph='📬' ;; esac
     rows="${rows}    ${C_CYAN}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${C_DIM}@${author}${C_RESET} ${snip} ${C_DIM}${hhmm}${C_RESET}"$'\n'
   done < <(reverse_file "$INBOX_LEDGER" | head -5)
   [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
@@ -5267,6 +5267,27 @@ _sweep_merged_prs() {
 $_pms_rows
 EOF
   return 0
+}
+
+# _sweep_journal_audit — HERD-238 journal-driven self-audit (the gap-finder). Runs on the same
+# low-frequency housekeeping cadence as the tracker-state sweep. Shells out to the standalone
+# journal-audit.sh which replays a BOUNDED journal window for invariant violations (merge without
+# reap; *_dispatched with no terminal past family TTL; refix_bounce without wake_result; stale MAIN
+# RED; pushed=no never followed by yes; known-fixture slugs), journals `journal_audit` events
+# (component=audit), and appends operator-inbox rows. ADVISORY ONLY — never gates, never mutates.
+# BEST-EFFORT + ship-dormant: byte-inert when JOURNAL_AUDIT=off (default); fail-soft on empty/short
+# journal; can never fail or slow a tick. Points the inbox ledger at THIS watcher's $INBOX_LEDGER so
+# build_operator_inbox surfaces findings when OPERATOR_INBOX is on.
+_sweep_journal_audit() {
+  [ -n "$DRYRUN" ] && return 0
+  case "$(printf '%s' "${JOURNAL_AUDIT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) ;;
+    *) return 0 ;;
+  esac
+  [ -f "$HERE/journal-audit.sh" ] || return 0
+  HERD_JOURNAL_AUDIT_INBOX="$INBOX_LEDGER" \
+  HERD_JOURNAL_AUDIT_SEEN="$TREES/.agent-watch-journal-audit-seen" \
+    bash "$HERE/journal-audit.sh" >/dev/null 2>&1 || true
 }
 
 # ── Auto-refix: bounce BLOCK-reviewed PRs straight to the builder agent ────────────────────────
@@ -9793,10 +9814,15 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
 
   # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
   # recently-merged PR whose tracker item drifted (stuck open after merge). Cheap + advisory.
+  # Journal self-audit (HERD-238) rides the same cadence: a bounded journal replay for invariant
+  # violations (merge-without-reap, stranded dispatches, bounce-without-wake, stale MAIN RED,
+  # pushed=no, fixture slugs) → operator-inbox rows + journal_audit events. Ship-dormant unless
+  # JOURNAL_AUDIT=on; advisory only.
   _TRACKER_SWEEP_TICK=$((_TRACKER_SWEEP_TICK + 1))
   if [ "$_TRACKER_SWEEP_TICK" -ge "$_TRACKER_SWEEP_INTERVAL" ]; then
     _TRACKER_SWEEP_TICK=0
     _sweep_tracker_state
+    _sweep_journal_audit
   fi
 
   # Post-merge hook reconcile (HERD-232): every _PMS_SWEEP_INTERVAL ticks, re-derive the post-merge
