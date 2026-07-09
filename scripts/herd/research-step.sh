@@ -23,6 +23,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed researcher drainer can
 # be detected and reclaimed by research.sh. Best-effort; never affects this script's stdout.
 . "$HERE/drainer-liveness.sh"
+# Engine journal — the forensic substrate lifecycle.sh writes its spawn/retire events to. Best-effort;
+# journal_append can never break a caller.
+# shellcheck source=/dev/null
+. "$HERE/journal.sh"
+# Supervised-process contract (HERD-193): the drainer RETIRES ITS OWN lifecycle record on the normal
+# completion path below (`finish` → STOP). Without that, a cleanly-drained researcher would leave a
+# record behind whose heartbeat is frozen at its last beat, and the watcher's sweep would eventually
+# report a finished process as hung. Inert while LIFECYCLE_CONTRACTS=off (default).
+# shellcheck source=/dev/null
+. "$HERE/lifecycle.sh"
 TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
 REPORTS="${RESEARCH_REPORTS:-$TREES/research-reports}"
@@ -77,6 +87,9 @@ case "$cmd" in
     ;;
   finish)
     if ls "$Q"/*.req >/dev/null 2>&1; then echo "MORE"; exit 0; fi
+    # HERD-193 RETIRE: the queue is drained and this drainer is about to exit — account for it NOW,
+    # with its true reason, rather than leaving a record whose frozen heartbeat later reads as a hang.
+    lifecycle_retire research-drainer "$HERD_AGENT_RESEARCHER" drained
     [ -n "${RESEARCH_TAB:-}" ] && herdr tab close "$RESEARCH_TAB" >/dev/null 2>&1 || true
     echo "STOP"
     ;;
