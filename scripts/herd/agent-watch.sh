@@ -53,12 +53,16 @@
 # AUTO-RESOLVE rule (full auto, safety-railed): when a PR FIRST goes CONFLICTING, the watcher
 # auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>), keyed to the head sha. HERD-55
 # adds sha-keyed RESPAWN: if a CONFLICTING PR gets a NEW commit (its sha changes → the conflict
-# surface changed) OR the dispatched resolver DIES without clearing it, and no resolver agent for the
-# slug is alive, the watcher re-dispatches a fresh resolver for the new sha (journaling
-# resolver_respawn). Hard rails: (1) respawn budget — dispatches per PR are capped at REFIX_MAX_ROUNDS,
-# then the PR surfaces "resolver gave up · needs you" (never an infinite resolver loop); (2) escalation
-# preserved + terminal — the resolver aborts + escalates semantically-ambiguous conflicts, and an
-# ESCALATE is TERMINAL for that sha (no respawn until a new commit); the watcher NEVER blind-merges.
+# surface changed) OR the dispatched resolver is POSITIVELY DEAD without clearing it, the watcher
+# re-dispatches a fresh resolver for the new sha (journaling resolver_respawn). Hard rails:
+# (1) respawn budget — dispatches per PR are capped at REFIX_MAX_ROUNDS, then the PR surfaces
+# "resolver gave up · needs you" (never an infinite resolver loop); (2) escalation preserved +
+# terminal — the resolver aborts + escalates semantically-ambiguous conflicts, and an ESCALATE is
+# TERMINAL for that sha (no respawn until a new commit); the watcher NEVER blind-merges;
+# (3) HERD-206 POSITIVE-EVIDENCE-ONLY DEATH — "no resolver agent in the roster" is NOT a death
+# verdict. A resolver is dead only when the pane process probe says so, or when a roster we could
+# actually READ omits it; a fresh resolver is STARTING for its whole grace window, and a blind
+# watcher holds. Nothing respawns over, or reaps, a resolver that has not been proven gone.
 #
 # MERGE_POLICY (.herd/config): three-way human-in-the-loop lever.
 #   auto    — current behavior: merge automatically after all gates pass.
@@ -972,6 +976,16 @@ resolver_escalated_sha() {
 resolver_last_dispatch_epoch() {
   [ -s "$RESOLVE_STATE" ] || return 0
   awk -v p="$1" '$2==p && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
+}
+
+# resolver_last_dispatch_epoch_slug <slug> — epoch of the most-recent DISPATCH for this SLUG across
+# every PR + sha (empty if none). The SLUG-keyed twin of the helper above, for the callers that hold a
+# resolve·<slug> tab but no PR number (the stale-resolve-tab reaper): a just-spawned resolver whose
+# agent has not registered yet must be inside the startup grace THERE too, or the reaper closes the
+# tab out from under it (HERD-206).
+resolver_last_dispatch_epoch_slug() {
+  [ -s "$RESOLVE_STATE" ] || return 0
+  awk -v s="$1" '$3==s && $6!="escalated"{e=$1} END{if(e)print e}' "$RESOLVE_STATE" 2>/dev/null
 }
 
 # resolver_last_sha <pr#> — the most-recently DISPATCHED sha for this PR (empty if none / legacy row).
@@ -2261,9 +2275,48 @@ _resolve_result() {
   if grep -qi 'ESCALATE' "$f" 2>/dev/null; then printf 'ESCALATE'; else printf 'DONE'; fi
 }
 
-# _resolver_agent_alive <slug> — true if a live resolve·<slug> resolver agent is present in the tick's
-# driver roster ($AGENTS_JSON). A vanished resolver = it died/finished → eligible for a respawn.
-_resolver_agent_alive() {
+# ── Resolver liveness: POSITIVE-EVIDENCE-ONLY death (HERD-206) ────────────────────────────────────
+# Resolver rows now carry the SAME liveness discipline builders got in PR #260. The pre-HERD-206 rule
+# was "absent from $AGENTS_JSON ⇒ dead", which is NEGATIVE evidence and produced a false-dead respawn
+# loop: the tick's roster comes from `herd_driver_agent_list_json`, which falls back to `{}` whenever
+# `herdr agent list` blips — so one unreadable roster read every resolver as dead, the watcher reaped
+# the (live) resolve tab, re-dispatched onto the same worktree, and looped to REFIX_MAX_ROUNDS while
+# the real resolver was still merging. A manually-spawned resolver survived because nothing was
+# watching it. Three defects, three fixes:
+#   • roster identity was matched on `name` ONLY — herdr carries it in EITHER `name` or `agent`
+#     (see herd_driver_agent_liveness), so a resolver registered via `pane report-agent` read dead;
+#   • an UNREADABLE roster (absent / '{}' / garbage) was indistinguishable from an EMPTY one;
+#   • there was no pane-process probe, so a DELISTED-but-running resolver had no way to prove itself.
+# Death is now a POSITIVE verdict only: the pane process probe says the session is gone, or a roster
+# we could actually READ does not list it. Blindness never kills.
+
+# _roster_readable — true iff $AGENTS_JSON is a PARSEABLE driver roster: a JSON object carrying
+# result.agents as a LIST. An EMPTY list is readable (there genuinely are no agents). An absent /
+# '{}' / unparseable roster is NOT readable — the watcher is BLIND, and blindness is never evidence
+# of death (no-false-red). This is the single guard that turns a `herdr agent list` blip from a
+# fleet-wide "every resolver died" into a no-op hold.
+_roster_readable() {
+  [ -n "${AGENTS_JSON:-}" ] || return 1
+  printf '%s' "$AGENTS_JSON" | python3 -c '
+import sys, json
+try:
+  d = json.load(sys.stdin)
+except Exception:
+  sys.exit(1)
+if not isinstance(d, dict): sys.exit(1)
+r = d.get("result")
+if not isinstance(r, dict): sys.exit(1)
+sys.exit(0 if isinstance(r.get("agents"), list) else 1)
+' 2>/dev/null
+}
+
+# _resolver_roster_listed <slug> — true iff the tick's roster lists a resolve·<slug> agent under
+# EITHER identity key. herdr registers an agent's identity as `name` (started via `herdr agent start`)
+# or `agent` (reported via `herdr pane report-agent --agent`); the pre-HERD-206 check read only `name`,
+# so a resolver registered the second way was invisible and read dead. Matches the exact breadth
+# herd_driver_agent_liveness already uses to find a pane. Roster presence at ANY status is a liveness
+# signal (mirrors the builder rule): a resolver that finished and went 'done' is listed, not dead.
+_resolver_roster_listed() {
   [ -n "${AGENTS_JSON:-}" ] || return 1
   printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
 import sys, json, os
@@ -2273,40 +2326,113 @@ try:
 except Exception:
   agents = []
 for a in agents:
-  if a.get("name") == name:
+  if a.get("name") == name or a.get("agent") == name:
     sys.exit(0)
 sys.exit(1)
 ' 2>/dev/null
 }
 
-# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING:
-# a live resolve·<slug> agent in the roster, OR the PR's most-recent dispatch is younger than the
-# startup grace (a freshly-spawned resolver whose pid has not yet registered). This is the SINGLE
-# guard that prevents a double-dispatch — a second resolver on the same worktree would race the first
-# on `git merge`/`git push`. Both the same-sha (dead-resolver) and new-commit respawn paths consult it,
-# so a respawn only ever fires once the prior resolver is provably gone.
+# _resolver_probe <slug> — three-valued pane-process liveness of the resolve·<slug> agent SESSION,
+# via the SAME probe the dead-builder reconciliation uses (herd_driver_agent_liveness): alive | dead |
+# missing | unknown. It is claude-as-pane-root aware (the lane launches claude AS the pane root, so
+# shell_pid == the claude pid; naively excluding the pane shell fabricates a death — PR #260), and it
+# fails soft to 'unknown' whenever it cannot see the truth. Never errors under `set -euo pipefail`.
+_resolver_probe() {
+  command -v herd_driver_agent_liveness >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  herd_driver_agent_liveness "resolve·$1" 2>/dev/null || printf 'unknown'
+}
+
+# _resolver_agent_alive <slug> — POSITIVE alive evidence for a resolve·<slug> agent: it is listed in a
+# roster we could read, OR its pane is running a live claude process. Returning false NEVER means
+# "dead" (it may just mean "we cannot see") — callers that need a death verdict must use
+# _resolver_liveness_verdict. Shared by the respawn path (HERD-55) and the stale-tab reaper (HERD-54):
+# a resolver that is alive by EITHER signal is never re-dispatched over and never reaped.
+_resolver_agent_alive() {
+  _resolver_roster_listed "$1" && return 0
+  [ "$(_resolver_probe "$1")" = "alive" ]
+}
+
+# _resolver_grace_active <slug> <pr#> — true while the most-recent dispatch for this resolver is
+# younger than the startup grace. A fresh resolver spends its first seconds unregistered (no roster
+# row, no pane process yet), which reads exactly like a corpse; inside this window NO death verdict is
+# ever returned. Keyed by PR when the caller has one, else by SLUG (the reaper holds a tab, not a PR).
+_resolver_grace_active() {
+  local _rga_slug="$1" _rga_pr="${2:-}" _rga_last _rga_age
+  if [ -n "$_rga_pr" ]; then _rga_last="$(resolver_last_dispatch_epoch "$_rga_pr")"
+  else                       _rga_last="$(resolver_last_dispatch_epoch_slug "$_rga_slug")"
+  fi
+  [ -n "$_rga_last" ] || return 1
+  _rga_age=$(( $(date +%s) - _rga_last ))
+  [ "$_rga_age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]
+}
+
+# _resolver_liveness_verdict <slug> [pr#] — the ONE death oracle for a resolve·<slug> agent. Echoes
+# exactly one token, in strict evidence order:
+#   ALIVE    — POSITIVE liveness: roster-listed (any status), or the pane runs a live claude
+#   STARTING — inside the startup grace since the last dispatch; a resolver that has not registered
+#              yet is NEVER dead. Checked BEFORE any death evidence, so a not-yet-spawned pane can
+#              not be read as 'missing' and reaped inside the grace.
+#   DEAD     — POSITIVE death: the probe says the pane exists but runs no claude ('dead'), or the
+#              agent pane is positively GONE ('missing'); OR the probe is blind but a READABLE roster
+#              does not list the resolver (the headless / no-pane driver's positive absence).
+#   UNKNOWN  — probe blind AND roster unreadable ⇒ we cannot see. HOLD. Never a respawn, never a reap.
+# Only DEAD authorizes a respawn or a tab close. Callers must treat every other token as "hands off".
+_resolver_liveness_verdict() {
+  local _rlv_slug="$1" _rlv_pr="${2:-}" _rlv_probe
+  _resolver_roster_listed "$_rlv_slug" && { printf 'ALIVE'; return 0; }
+  _rlv_probe="$(_resolver_probe "$_rlv_slug")"
+  [ "$_rlv_probe" = "alive" ] && { printf 'ALIVE'; return 0; }
+  _resolver_grace_active "$_rlv_slug" "$_rlv_pr" && { printf 'STARTING'; return 0; }
+  case "$_rlv_probe" in
+    dead|missing) printf 'DEAD'; return 0 ;;
+  esac
+  _roster_readable && { printf 'DEAD'; return 0; }
+  printf 'UNKNOWN'
+}
+
+# _resolver_in_flight <slug> <pr#> — true if a resolver for this slug is (or may still be) RUNNING, so
+# a (re)dispatch must HOLD: a second resolver on the same worktree would race the first on
+# `git merge`/`git push`. This is the SINGLE guard that prevents a double-dispatch, and it is now the
+# exact complement of a POSITIVELY-dead verdict: ALIVE, STARTING and UNKNOWN all hold; only DEAD frees
+# the slot. Both the same-sha (dead-resolver) and new-commit respawn paths consult it, so a respawn
+# only ever fires once the prior resolver is PROVABLY gone — never merely unseen.
 _resolver_in_flight() {
-  local _rif_slug="$1" _rif_pr="$2" _rif_last _rif_now _rif_age
-  _resolver_agent_alive "$_rif_slug" && return 0
-  _rif_last="$(resolver_last_dispatch_epoch "$_rif_pr")"
-  [ -n "$_rif_last" ] || return 1
-  _rif_now="$(date +%s)"; _rif_age=$(( _rif_now - _rif_last ))
-  [ "$_rif_age" -lt "${_RESOLVER_DEAD_GRACE:-90}" ]
+  [ "$(_resolver_liveness_verdict "$1" "${2:-}")" != "DEAD" ]
 }
 
 # spawn_resolver <slug> <pr#> <branch> <sha> — hand a CONFLICTING PR to the isolated resolver, keyed
 # to <sha>. Record-first keeps the respawn budget sound; the spawn is best-effort. The resolver is
 # told (via $HERD_RESOLVE_RESULT_FILE) to write its terminal verdict to the sha-scoped result file.
+#
+# SPAWN-ACK (HERD-206): the lane's exit status is the resolver's spawn acknowledgement — herd-resolve.sh
+# exits non-zero when the worktree is gone, when herdr cannot create the tab, or when the agent fails to
+# start (it closes the empty tab itself). Before HERD-206 that rc was discarded, so a dispatch that never
+# produced an agent still burned a respawn round and looked identical to a live resolver for the whole
+# grace window. Now every dispatch journals a `resolver_spawn` event carrying rc + whether the agent was
+# actually observed alive afterwards, so a spawn that never ACKed is auditable rather than inferred from
+# a silence. Behavior is unchanged (still best-effort, still never fails a tick): the record already
+# landed, the grace still runs, and the next tick's POSITIVE-death verdict re-dispatches within budget.
 spawn_resolver() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
+  local _sr_rc=0 _sr_ack _sr_roster
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
-    bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || true
+    bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
+  # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
+  # spawn and can never show it) and fall back to the pane probe, so 'acked' is observed, not assumed.
+  _sr_roster="$(herd_driver_agent_list_json 2>/dev/null || printf '{}')"
+  _sr_ack="no"
+  if ( AGENTS_JSON="$_sr_roster"; _resolver_roster_listed "$rs" ) || [ "$(_resolver_probe "$rs")" = "alive" ]; then
+    _sr_ack="yes"
+  fi
+  journal_append resolver_spawn pr "$rp" slug "$rs" sha "${rsha:--}" rc "$_sr_rc" acked "$_sr_ack"
+  [ "$_sr_rc" -eq 0 ] || journal_append resolver_spawn_failed pr "$rp" slug "$rs" sha "${rsha:--}" rc "$_sr_rc"
+  return 0
 }
 
-# Grace window (seconds) before a resolver dispatched-for-this-sha whose agent is not yet visible in
-# the roster is treated as DEAD (rather than "just starting up"). Prevents a double-dispatch race when
-# a freshly-spawned resolver has not yet registered its pid. Overridable so the sim can zero it out.
+# Grace window (seconds) before a resolver whose agent is not yet visible is even ELIGIBLE for a death
+# verdict (it reads STARTING instead). Prevents a double-dispatch race — and a reap — when a freshly
+# spawned resolver has not yet registered its pid. Overridable so the sim can zero it out.
 : "${_RESOLVER_DEAD_GRACE:=90}"
 
 # _classify_conflict <idx> <pr#> <slug> <branch> <headsha> — decide what to do with a CONFLICTING PR
@@ -3183,16 +3309,19 @@ except Exception: pass
 # before/after snapshot mid-flap and false-red an innocent PR. This sweep closes such tabs.
 #
 # A resolve tab is STALE only when BOTH hold:
-#   (1) no LIVE resolver agent for its slug — checked via _resolver_agent_alive, the SAME liveness
-#       helper the resolver-respawn path (HERD-55) uses, so the two features never disagree on
-#       "is a resolver alive for this slug"; AND
+#   (1) its resolver is POSITIVELY DEAD — _resolver_liveness_verdict, the SAME death oracle the
+#       resolver-respawn path (HERD-55) uses, returns DEAD. ALIVE (roster-listed or a pane running
+#       claude), STARTING (inside the spawn grace) and UNKNOWN (we cannot see) all spare the tab; AND
 #   (2) the slug's PR is no longer CONFLICTING — it is merged/closed (absent from the open-PR list) or
 #       its mergeable state is clean (MERGEABLE). A CONFLICTING PR still needs the resolver, and an
 #       UNKNOWN state (GitHub still computing) is treated conservatively as "still relevant" — neither
 #       is swept.
-# SAFETY MIRRORS HERD-91's OID-guard philosophy: never tear down a live worker. A tab whose resolver
-# agent is still in the roster (working OR just-registered) is ALWAYS spared, so an in-flight resolve —
-# including a fresh respawn — is never closed out from under itself.
+# SAFETY MIRRORS HERD-91's OID-guard philosophy: never tear down a live worker. HERD-206: the pre-fix
+# guard read only the roster, so a `herdr agent list` blip (or a resolver registered under the `agent`
+# identity key) let this sweep CLOSE the tab of a live, mid-merge resolver — which the respawn path
+# then re-dispatched, round after round, to the cap. Both defects are gone: the reaper now demands
+# POSITIVE death evidence, and a failed `gh pr list` (rc != 0) aborts the sweep rather than reading an
+# empty result as "every PR merged, close everything".
 #
 # Runs at startup and before each leak-guard-relevant healthcheck snapshot. Requires AGENTS_JSON to be
 # populated (the tick sets it; the startup call primes it). Idempotent + fully fail-soft: no registry,
@@ -3227,8 +3356,14 @@ except Exception:
 
   # (2) One gh call: map each OPEN PR's slug → its mergeable state. A slug ABSENT from this map has no
   #     open PR (merged/closed/never-existed) → its conflict is definitively gone.
+  #     HERD-206: `gh pr list` failing (offline, rate-limited, auth blip) yields the SAME empty output as
+  #     "zero open PRs", and the pre-fix sweep read that as "no slug has a PR → close every resolve tab".
+  #     Capture the raw output + its EXIT STATUS first; a non-zero rc aborts the sweep untouched.
+  local _srt_raw _srt_rc=0
+  _srt_raw="$(gh pr list --json headRefName,mergeable 2>/dev/null)" || _srt_rc=$?
+  [ "$_srt_rc" -eq 0 ] || return 0
   local _srt_prs _srt_tmpl="${BRANCH_TEMPLATE:-}"; [ -n "$_srt_tmpl" ] || _srt_tmpl='feat/{slug}'
-  _srt_prs="$(gh pr list --json headRefName,mergeable 2>/dev/null | BRANCH_TEMPLATE="$_srt_tmpl" python3 -c '
+  _srt_prs="$(printf '%s' "$_srt_raw" | BRANCH_TEMPLATE="$_srt_tmpl" python3 -c '
 import sys, json, os
 # Parse each headRefName to its slug under the active BRANCH_TEMPLATE (HERD-120), mirroring
 # herd_branch_parse — so a custom / non-feat branch scheme resolves the slug that keys the resolve tab.
@@ -3264,8 +3399,10 @@ except Exception:
   local _srt_slug _srt_tab _srt_merge _srt_n=0
   while IFS=$'\t' read -r _srt_slug _srt_tab; do
     [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue
-    # SAFETY: a live resolver agent for this slug is NEVER closed (shared liveness with HERD-55).
-    _resolver_agent_alive "$_srt_slug" && continue
+    # SAFETY (HERD-206): only a POSITIVELY-dead resolver is ever closed. ALIVE (roster row OR a pane
+    # running claude — the reaper must never kill a resolver whose pane process is alive), STARTING
+    # (inside the spawn grace, slug-keyed since we hold no PR number) and UNKNOWN (blind) all spare it.
+    [ "$(_resolver_liveness_verdict "$_srt_slug")" = "DEAD" ] || continue
     # PR still CONFLICTING (or UNKNOWN — GitHub still computing) → the resolve tab is still relevant.
     _srt_merge="$(printf '%s\n' "$_srt_prs" | awk -F'\t' -v s="$_srt_slug" '$1==s{print $2; exit}')"
     case "$_srt_merge" in

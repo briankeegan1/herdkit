@@ -148,14 +148,23 @@ fi
 # classification decision (shipped _classify_conflict) + the resolve pass (shipped spawn_resolver).
 DISPLAY=()
 CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
+# ROSTER_ALIVE=1 → a live resolve·<slug> row; 0 → a READABLE but EMPTY roster (positive absence);
+# blind → the '{}' herd_driver_agent_list_json falls back to when `herdr agent list` fails. HERD-206:
+# 'blind' must NEVER read as death — that fallback drove the false-dead respawn loop.
 set_roster() {
-  if [ "$1" = "1" ]; then
-    AGENTS_JSON='{"result":{"agents":[{"name":"resolve·'"$SLUG"'","agent_status":"working"}]}}'
-  else
-    AGENTS_JSON='{"result":{"agents":[]}}'
-  fi
+  case "$1" in
+    1)     AGENTS_JSON='{"result":{"agents":[{"name":"resolve·'"$SLUG"'","agent_status":"working"}]}}' ;;
+    blind) AGENTS_JSON='{}' ;;
+    *)     AGENTS_JSON='{"result":{"agents":[]}}' ;;
+  esac
   export AGENTS_JSON
 }
+# The headless liveness probe reads $WORKTREES_DIR/.herd/agents/<agent>/pid. Writing a LIVE pid there
+# is POSITIVE process evidence for resolve·<slug> even when the roster does not list it — the
+# delisted-but-still-merging resolver from the HERD-206 incident.
+probe_pid_dir() { printf '%s/.herd/agents/resolve·%s' "$TREES" "$SLUG"; }
+set_probe_alive() { mkdir -p "$(probe_pid_dir)"; printf '%s\n' "$$" > "$(probe_pid_dir)/pid"; }
+set_probe_blind() { rm -rf "$TREES/.herd/agents"; }
 run_conflict_tick() {
   local sha="$1"
   DISPLAY=()
@@ -279,6 +288,60 @@ if [ "$_rr_events" -ge 2 ] && grep -q '"reason":"dead-resolver"' "$JOURNAL_FILE"
   checkpoint journal_trail pass "$_rr_events resolver_respawn + $_esc_events resolver_escalated journal events (old/new sha, reasons)"
 else
   checkpoint journal_trail fail "expected >=2 resolver_respawn (dead+new-commit) + escalate; got respawn=$_rr_events esc=$_esc_events"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# (8) CHAOS — RESOLVER FALSE-DEAD / RESPAWN LOOP (HERD-206)
+# The stranding signature from #299/#309/#315/#319: the watcher could not SEE the resolver, called it
+# dead from that silence, re-dispatched onto its worktree, and looped to the cap while the real
+# resolver was still merging. Two blindness flavors are injected over a resolver that is provably
+# ALIVE the whole time; NEITHER may produce a dispatch, a respawn event, or a "gave up" row.
+step chaos "inject resolver-liveness blindness over a LIVE resolver (false-dead loop)"
+PR=104; SLUG="feat-falsedead"; BRANCH="sim/$SLUG"
+export STUB_RESOLVE_VERDICT=""           # the resolver is working; it has written no verdict yet
+FD1="1111111a"
+set_roster 0; set_probe_blind
+run_conflict_tick "$FD1"                 # first dispatch (count 1) — the resolver is now "running"
+_fd_base="$(dispatch_count)"
+_fd_respawn_before="$(grep -c '"event":"resolver_respawn"' "$JOURNAL_FILE" 2>/dev/null || echo 0)"
+
+_fd_row=""
+for _fd_tick in 1 2 3 4 5 6 7 8 9 10; do
+  if [ $(( _fd_tick % 2 )) -eq 0 ]; then
+    set_roster blind; set_probe_blind      # `herdr agent list` blipped → roster '{}' → we are BLIND
+  else
+    set_roster 0;     set_probe_alive      # roster readable but DELISTED; the pane process still runs
+  fi
+  run_conflict_tick "$FD1"
+  _fd_row="$(last_row)"
+done
+set_probe_blind
+_fd_after="$(dispatch_count)"
+_fd_respawn_after="$(grep -c '"event":"resolver_respawn"' "$JOURNAL_FILE" 2>/dev/null || echo 0)"
+if [ "$_fd_base" -eq 1 ] && [ "$_fd_after" -eq 1 ] \
+   && [ "$_fd_respawn_after" -eq "$_fd_respawn_before" ] \
+   && ! printf '%s' "$_fd_row" | grep -q 'gave up'; then
+  checkpoint false_dead_no_loop pass "10 blind ticks over a live resolver: 0 respawns, budget intact (1 dispatch), PR never stranded"
+else
+  checkpoint false_dead_no_loop fail "false-dead loop: dispatches $_fd_base→$_fd_after, respawn events $_fd_respawn_before→$_fd_respawn_after, row='$_fd_row'"
+fi
+
+# (8b) …and blindness must not become a PERMANENT hold either: once the roster is READABLE and the
+# resolver is genuinely gone, the positive-death verdict re-dispatches it exactly as before.
+set_roster 0; set_probe_blind
+run_conflict_tick "$FD1"
+_fd_recover="$(dispatch_count)"
+if [ "$_fd_recover" -eq 2 ]; then
+  checkpoint false_dead_recovers pass "a POSITIVELY-dead resolver (readable roster, no process) still re-dispatches (round 2)"
+else
+  checkpoint false_dead_recovers fail "expected the recovered tick to re-dispatch to 2, got count=$_fd_recover"
+fi
+
+# (8c) SPAWN-ACK — every dispatch journals its lane exit status + whether the agent was observed alive.
+if grep -q '"event":"resolver_spawn"' "$JOURNAL_FILE" && grep -q '"acked":' "$JOURNAL_FILE"; then
+  checkpoint spawn_ack pass "each dispatch journals a resolver_spawn ACK event (rc + acked)"
+else
+  checkpoint spawn_ack fail "no resolver_spawn ACK event journaled"
 fi
 
 # ── scorecard ───────────────────────────────────────────────────────────────────
