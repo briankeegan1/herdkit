@@ -14,7 +14,8 @@
 #       are each red without a manifest touch (the other two arms of the shared lint).
 #   (5) FAIL-SOFT — a tree with no templates/capabilities.tsv (i.e. every consuming project) SKIPS:
 #       clean, never red, and the verdict is unchanged.
-#   (6) ONE IMPLEMENTATION — the light profile owns no grep of its own; both gates source the lib.
+#   (6) FAIL-SOFT (infra) — an engine tree missing the lint SKIPS the guard, never breaks the run.
+#   (7) ONE IMPLEMENTATION — the light profile owns no grep of its own; both gates source the lib.
 #
 # Network-free: a temp git repo + temp config via HERD_CONFIG_FILE. No $HEALTHCHECK_CMD is set, so
 # the profile resolves to light on its own; --light is passed to be explicit.
@@ -158,13 +159,29 @@ commit_all
 [ "$?" -eq 2 ] || fail "(5) an unresolvable base ref must return 2 (skip), never 1"
 ok
 
-# ── (6) ONE IMPLEMENTATION — both gates source the lib; neither re-greps the rule ──────────────
+# ── (6) FAIL-SOFT ON OUR OWN INFRA — an engine tree missing the lint SKIPS, never breaks ──────
+# A partially-upgraded engine (healthcheck.sh present, caps-sync-lint.sh not) must still run: the
+# guard skips. Caught live — the first cut of this change sourced the lib by a path that does not
+# exist in the fixture worktrees the project-gate tests drive, reddening tests/herd.bats.
+reset_repo with-manifest
+printf '#!/usr/bin/env bash\necho lane\n' > "$WT/scripts/herd/x.sh"
+commit_all
+NOLIB="$T/nolib"; mkdir -p "$NOLIB"
+cp "$ROOT/scripts/herd/healthcheck.sh" "$ROOT/scripts/herd/herd-config.sh" \
+   "$ROOT/scripts/herd/commit-lint.sh" "$NOLIB/"      # caps-sync-lint.sh deliberately not copied
+out="$(bash "$NOLIB/healthcheck.sh" "$WT" --light 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] || fail "(6) healthcheck.sh without caps-sync-lint.sh must skip the guard, not break (exit 0, got $rc): $out"
+printf '%s' "$out" | grep -qi 'not found\|No such file' && fail "(6) missing lint must not leak a shell error (got: $out)"
+printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' || fail "(6) verdict should be the plain light clean (got: $out)"
+ok
+
+# ── (7) ONE IMPLEMENTATION — both gates source the lib; neither re-greps the rule ──────────────
 grep -q 'caps-sync-lint.sh' "$ROOT/scripts/herd/healthcheck.sh" \
-  || fail "(6) healthcheck.sh must source scripts/herd/caps-sync-lint.sh"
+  || fail "(7) healthcheck.sh must source scripts/herd/caps-sync-lint.sh"
 grep -q 'caps-sync-lint.sh' "$ROOT/.herd/healthcheck.project.sh" \
-  || fail "(6) .herd/healthcheck.project.sh must source scripts/herd/caps-sync-lint.sh"
+  || fail "(7) .herd/healthcheck.project.sh must source scripts/herd/caps-sync-lint.sh"
 for f in "$ROOT/scripts/herd/healthcheck.sh" "$ROOT/.herd/healthcheck.project.sh"; do
-  grep -q 'diff-filter=A' "$f" && fail "(6) $f still carries its own caps-sync grep (duplicated logic)"
+  grep -q 'diff-filter=A' "$f" && fail "(7) $f still carries its own caps-sync grep (duplicated logic)"
 done
 ok
 

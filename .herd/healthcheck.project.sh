@@ -493,8 +493,16 @@ if [ -f .herd/config ]; then
   _hc_branch="$(. .herd/config 2>/dev/null && printf '%s' "${DEFAULT_BRANCH:-origin/main}")" \
     || _hc_branch="origin/main"
 fi
-. scripts/herd/caps-sync-lint.sh
-_hc_sync_errs="$(herd_caps_sync_lint "$_hc_branch")"; _hc_sync_rc=$?
+HERD_CAPS_SYNC_SKIP_REASON=""
+if [ -f scripts/herd/caps-sync-lint.sh ]; then
+  . scripts/herd/caps-sync-lint.sh
+  _hc_sync_errs="$(herd_caps_sync_lint "$_hc_branch")"; _hc_sync_rc=$?
+else
+  # Fail-soft on our own infra (a fixture tree, or a checkout without the engine scripts): SKIP,
+  # never a red — same convention as the claude-hardcode lint's missing-lint path below.
+  _hc_sync_errs=""; _hc_sync_rc=2
+  HERD_CAPS_SYNC_SKIP_REASON="scripts/herd/caps-sync-lint.sh not present"
+fi
 case "$_hc_sync_rc" in
   0) caps_note="caps-sync: clean" ;;
   2) caps_note="caps-sync: skipped ($HERD_CAPS_SYNC_SKIP_REASON)" ;;

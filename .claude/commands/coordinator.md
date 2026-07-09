@@ -38,7 +38,7 @@ After completing any action, return to this menu until the user chooses to stop.
 This skill drives two **runtime-specific** surfaces: the **multiplexer** (`herdr`, which owns
 tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into
 a pane). Everything else the coordinator runs — `herd …`, `gh …`, the lane scripts under
-`/Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd` — is runtime-independent and stays the same regardless of driver.
+`/Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd` — is runtime-independent and stays the same regardless of driver.
 
 The incantations below are the **only** places this skill is bound to the herdr + Claude Code
 driver. They are the single source for that surface: every driver use elsewhere in this skill
@@ -75,12 +75,12 @@ Keep your own context lean AND keep this window responsive. When you need to **l
 repo**, **enqueue the question on the async research lane** rather than reading a pile of files
 yourself:
 
-    bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/research.sh "the question"
+    bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/research.sh "the question"
 
 It returns **instantly** with a `REQ_ID` and ensures ONE read-only **researcher** drainer is
 running in its own herdr pane. Fetch each result when you need it:
 
-    bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/research-get.sh THE_REQ_ID
+    bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/research-get.sh THE_REQ_ID
 
 It prints the report, or `PENDING` if the drainer hasn't filed it yet. The coordinator window
 stays free. **One exception:** for a tiny instant lookup you need *right now*, do it inline.
@@ -104,11 +104,11 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    flight so you can sequence instead of spawning into a conflict. Then pick the lane:
    - **Feature lane** (app-facing change, you want the live preview):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
+     bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-feature.sh <slug> "<task: what to build, plus 'follow AGENTS.md, run the healthcheck, then gh pr create'>"
      ```
    - **Quick lane** (trivial / non-app change — scripts, docs, config):
      ```
-     bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-quick.sh <slug> "<task>"
+     bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-quick.sh <slug> "<task>"
      ```
    **(Interactive mode: each spawn requires your approval)**
    **Link a tracked item back to its tracker.** When the item you picked carries a tracker id (the
@@ -118,7 +118,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    matching. Under *Tracker-routed spawns* (below) you thread it on **every** spawn — file a tracker
    item first so there is always a ref; a raw file-backend item with no id falls back to fuzzy matching:
    ```
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-feature.sh <slug> "<task>"
    ```
    **Match the model tier to the task's judgment load.** The quick lane runs on `MODEL_QUICK`
    (cheap) and the feature lane on `MODEL_FEATURE` (the judgment tier). A trivial edit belongs on
@@ -130,7 +130,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
    catches the costly misjudgments.
 4. Enqueue the status change (don't edit `BACKLOG.md` yourself — see *Backlog writes*):
-   `bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
+   `bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`herdr agent focus <slug>`), and the preview URL if any. <!-- DRIVER:focus-agent -->
 
 The sub-agent only **builds and opens a PR** — it won't merge or edit `BACKLOG.md`. The
@@ -146,14 +146,14 @@ The rule is **file-then-spawn**:
 
 1. **Ensure a tracker item exists BEFORE you spawn.** Reuse the item you picked, or — for anything not
    already tracked — enqueue it on the scribe FIRST and use that item:
-   `bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
+   `bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>."` **This includes chores** — a
    refactor, a config tweak, a docs pass, a flake fix all get an item too. If it is worth a worktree
    and a PR, it is worth a one-line tracker entry.
 2. **Thread `HERD_ITEM_REF=<id>` on EVERY lane invocation** — feature, quick, and `spawn.sh` alike:
    ```
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-quick.sh <slug> "<task>"
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-feature.sh <slug> "<task>"
-   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/spawn.sh <slug> quick "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-quick.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-feature.sh <slug> "<task>"
+   HERD_ITEM_REF=<id> bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/spawn.sh <slug> quick "<task>"
    ```
    The builder then carries a `Refs: <id>` line in its PR body (the exact-ref reconcile), and with
    `CLAIM_REQUIRED` on the same id atomically **claims** the item so two operators can't double-build it.
@@ -248,7 +248,7 @@ When a PR **moves or renames the things backlog items point at** — file paths,
 section headers — entries that still reference the OLD name dangle silently once it merges. After
 such a PR lands, run the reconcile pass (it is safe on any PR — a no-op when nothing moved):
 
-    bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/backlog-reconcile.sh run <pr#>
+    bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/backlog-reconcile.sh run <pr#>
 
 It diffs the PR's rename/move surface (git rename detection for files + defs/headers that existed
 before the PR and are gone after), finds `BACKLOG.md` entries that reference the old
@@ -284,9 +284,9 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
   already shipped?), enqueue the reconciliation on the research lane and reconcile against reality.
 - **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
   writes the grounded entry:
-  `bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
+  `bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
 - **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
-  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
+  Keep/Cut/Defer plan, get approval, THEN enqueue: `bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/scribe.sh "Apply this approved curation: <the full plan>"`.
 
 ### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
 
@@ -369,7 +369,7 @@ You own **all** backlog updates — sub-agents build + open PRs, the auto-merge 
    `gh pr merge`. Step in ONLY when the watcher surfaces **needs-you / review blocked / health
    failed**: a ❌ code error → send the agent back to fix it (⚠️ data/env is fine).
 3. For a CONFLICTING PR, **do NOT hand-resolve it here** — spawn the isolated, test-gated resolver:
-   `bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-resolve.sh <slug>`
+   `bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-resolve.sh <slug>`
    It merges the default branch in, fixes mechanical conflicts, verifies, and pushes — or aborts
    and prints `ESCALATE:` for a human. The watcher NEVER blind-merges a conflict.
 
@@ -447,8 +447,8 @@ pipeline but holds before merging — posting a PR comment and a notification on
 To approve and trigger merge:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-approve.sh list              # show gate-passed PRs awaiting approval
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/herd-approve.sh approve <pr#>     # write sha-keyed approval → watcher merges on next poll (~4 s)
 ```
 
 Approval is **sha-keyed**: a new commit pushed after the awaiting record was written invalidates
@@ -466,15 +466,15 @@ concurrency / limit / pane scenarios drive the **shipped** watcher code in lib m
 scorecard is real signal — they break if that code regresses:
 
 ```
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
-bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
-SANDBOX_FORCE_GATE_FAIL=1 bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/gate-run          # one-PR GATE / MERGE happy path + fault isolation
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/sandbox-concurrency-scenario.sh --artifacts /tmp/conc  # the REAL watcher CONCURRENCY gate loop (N≥3 PRs)
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/sandbox-limit-resume-scenario.sh --artifacts /tmp/lr   # LIMIT-PARK → auto-resume (+ HERD_LIMIT_DETECT=off negative seam)
+bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/sandbox-real-panes-scenario.sh --artifacts /tmp/rp     # real disposable PANE control room + clean teardown
+SANDBOX_FORCE_GATE_FAIL=1 bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/sandbox-scenario.sh --artifacts /tmp/fail   # fault-inject: gate fails LOUDLY, merge skipped
 ```
 
 Each writes a machine-readable `scorecard.json` (`result: pass` iff `failed == 0`) — read it, don't
-eyeball the console. `/Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/sim/README-sandbox-sim.md` catalogs the full tier table and each
+eyeball the console. `/Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/sim/README-sandbox-sim.md` catalogs the full tier table and each
 scenario's invariants. **Thread this into the builder task spec whenever you spawn a watcher-touching
 item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
 tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
@@ -541,8 +541,8 @@ default, untouched.
 ## Herdkit capabilities — compact index
 
 _A one-line index of every command, lane, config key, lever, convention, env var, and reference. For
-the full description **and** when-to-use guidance of any item, read `/Users/macbookpro/source/herdkit-trees/herd-sweep/docs/capabilities-overview.md`
-(curated narrative) or its machine-readable source of truth `/Users/macbookpro/source/herdkit-trees/herd-sweep/templates/capabilities.tsv`
+the full description **and** when-to-use guidance of any item, read `/Users/macbookpro/source/herdkit-trees/caps-sync-light/docs/capabilities-overview.md`
+(curated narrative) or its machine-readable source of truth `/Users/macbookpro/source/herdkit-trees/caps-sync-light/templates/capabilities.tsv`
 (one row per item, with a `when_to_surface` column). Load those only when you need the detail — this
 index is enough to know what exists._
 
@@ -588,7 +588,7 @@ _On every invocation, read live state to surface what is configured:_
 - `herd conformance <report|run>` — The capability CONFORMANCE MATRIX (HERD-144): joins the capabilities manifest (templates/capabilities.tsv) against the…
 - `herd config models` — Print the model suggestions catalog (templates/models.tsv) — each ref with its tier, role-fit hint and as-of date
 
-### Lanes (`bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/<lane>.sh`)
+### Lanes (`bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/<lane>.sh`)
 - `fleet.sh` — Helper library behind 'herd fleet' (sourced by bin/herd): the project-registry reader/writer, per-project config…
 - `herd-feature.sh` — Full feature lane: creates worktree, opens live app preview pane, spawns Claude agent, runs healthcheck before PR
 - `herd-quick.sh` — Lightweight lane: creates worktree, single agent pane, no preview, runs healthcheck before PR
@@ -608,6 +608,8 @@ _On every invocation, read live state to surface what is configured:_
 - `backlog-reconcile-sweep.sh` — Periodic ADVISORY drift sweep: cross-reference open 🔜 backlog items against recently-merged PRs (gh pr list --state…
 - `governance-drift-sweep.sh` — Periodic ADVISORY governance-DRIFT sweep (HERD-125): re-extract an OPTIONAL CLAUDE.md/AGENTS.md with the SAME…
 - `agent-watch.sh` — Live status console and auto-merge state machine: polls PRs, runs healthcheck and review gate, merges ready PRs; a PR…
+- `merge-policy.sh` — THE shared resolver for the effective merge policy (HERD-159, unified in HERD-210): _effective_merge_policy resolves…
+- `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): herd_caps_sync_lint <base-ref> reds a change that adds a cmd_* subcommand to…
 - `herd-review.sh` — Adversarial pre-merge correctness gate invoked by the watcher before any merge
 - `herd-claim.sh` — Atomic pre-spawn work-item claim (HERD-50): sourced by herd-quick.sh / herd-feature.sh and called ONCE before worktree…
 
@@ -682,6 +684,7 @@ _On every invocation, read live state to surface what is configured:_
 - `REVIEW_INFLIGHT_TIMEOUT` — Restart-safe review-dispatch timeout in seconds (HERD-185)
 - `HEALTH_INFLIGHT_TIMEOUT` — Restart-safe health-dispatch timeout in seconds (HERD-185)
 - `GATE_DISPATCH` — When the watcher's action pass fires the pre-merge review relative to the healthcheck for a (pr,sha): serial (default)…
+- `DELTA_REVIEW` — Delta-scoped review carry-forward (HERD-204): off (default) | on
 - `GATE_STATUS` — Whether the watcher posts a `herd/gates` COMMIT STATUS as it clears each (pr,sha): on (default) | off
 - `NATIVE_BURST` — Master switch for the native-burst bounded read-only FAN-OUT seam (scripts/herd/burst.sh): off (default) | on
 - `REVIEW_PANEL` — How many CONCURRENT read-only reviewer passes the pre-merge review runs over the SAME diff when NATIVE_BURST=on — a…
@@ -728,6 +731,7 @@ _On every invocation, read live state to surface what is configured:_
 - `TRACKED_SPAWNS` — Tracker-routed spawn enforcement (HERD-64): make "every builder is traceable to a tracked work item" a PROJECT POLICY…
 - `MCP_PROVISION` — Builder MCP tool-provisioning surface (the tools SIBLING of CONTEXT_PROVISION): a SPACE-SEPARATED list of MCP server…
 - `GRAPHIFY_BIN` — Machine-local path to the graphify call-graph binary (PyPI 'graphifyy'; usually ~/.local/bin/graphify) that the…
+- `ANTHROPIC_BASE_URL` — Claude Code custom model endpoint (HERD-171): the standard ANTHROPIC_BASE_URL env Claude Code already honors, exposed…
 
 ### State files and levers
 - `.herd/links` — Cross-repo link registry: name|owner/repo|backend|target rows; enables herd report --to and herd link list
@@ -766,7 +770,7 @@ The backlog is a planning doc, so backlog changes **commit straight to the defau
 PR. But **you never edit `BACKLOG.md` yourself.** You *enqueue* the change and a single async
 **scribe** applies it (one writer ⇒ no clobber, your window stays free):
 
-    bash /Users/macbookpro/source/herdkit-trees/herd-sweep/scripts/herd/scribe.sh "<the change, described in full>"
+    bash /Users/macbookpro/source/herdkit-trees/caps-sync-light/scripts/herd/scribe.sh "<the change, described in full>"
 
 It returns immediately and reports back peripherally — the live pane flashes **✍️ JUST SCRIBED**,
 a notification pings, and a line is appended to the `.scribe-reports` inbox. The scribe `git

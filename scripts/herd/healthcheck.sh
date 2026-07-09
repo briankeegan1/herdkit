@@ -73,7 +73,14 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 . "$HERE/commit-lint.sh"
-. "$HERE/caps-sync-lint.sh"
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# caps-sync guard (rc 2), never break the healthcheck it is a part of.
+if [ -f "$HERE/caps-sync-lint.sh" ]; then
+  . "$HERE/caps-sync-lint.sh"
+else
+  HERD_CAPS_SYNC_SKIP_REASON="caps-sync-lint.sh not present"
+  herd_caps_sync_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
