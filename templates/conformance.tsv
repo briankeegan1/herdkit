@@ -52,6 +52,7 @@ herd init	unit	tests/test-cli.sh
 herd init	unit	tests/test-stack-aware-init.sh
 herd init	unit	tests/test-init-grounding-interview.sh
 herd doctor	unit	tests/test-doctor.sh
+herd doctor	unit	tests/test-doctor-posture.sh
 herd upgrade	unit	tests/test-cli.sh
 herd upgrade	unit	tests/test-upgrade-migrations.sh
 herd upgrade	unit	tests/test-upgrade-config-adoption.sh
