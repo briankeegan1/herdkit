@@ -484,52 +484,37 @@ fi
 # 5. caps-sync guard — a PR adding a cmd_* subcommand to bin/herd, a new config key to
 # herd-config.sh, or a new lane script under scripts/herd/ without also touching
 # templates/capabilities.tsv is a CODE error (the manifest must stay in sync).
+# The rule itself lives in scripts/herd/caps-sync-lint.sh — ONE implementation, shared with the
+# builder's LIGHT pre-PR gate in scripts/herd/healthcheck.sh (HERD-220), so the two can never
+# disagree about what a manifest miss is.
 caps_note="caps-sync: clean"
 _hc_branch="origin/main"
 if [ -f .herd/config ]; then
   _hc_branch="$(. .herd/config 2>/dev/null && printf '%s' "${DEFAULT_BRANCH:-origin/main}")" \
     || _hc_branch="origin/main"
 fi
-if _hc_changed="$(git diff --name-only "$_hc_branch" 2>/dev/null)"; then
-  _hc_manifest_touched=0
-  case "$_hc_changed" in *"templates/capabilities.tsv"*) _hc_manifest_touched=1 ;; esac
-  _hc_sync_errs=""
-
-  if printf '%s\n' "$_hc_changed" | grep -qxE 'bin/herd'; then
-    _hc_new_cmds="$(git diff "$_hc_branch" -- bin/herd 2>/dev/null \
-      | grep -E '^\+[[:space:]]*cmd_[a-z_]+\(\)' || true)"
-    if [ -n "$_hc_new_cmds" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-      _hc_sync_errs="${_hc_sync_errs}bin/herd adds cmd_*: also update templates/capabilities.tsv"$'\n'
-    fi
-  fi
-
-  if printf '%s\n' "$_hc_changed" | grep -qxE 'scripts/herd/herd-config\.sh'; then
-    _hc_new_keys="$(git diff "$_hc_branch" -- scripts/herd/herd-config.sh 2>/dev/null \
-      | grep -E '^\+[[:space:]]*:[[:space:]]+"?\$\{[A-Z_]+:=' || true)"
-    if [ -n "$_hc_new_keys" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-      _hc_sync_errs="${_hc_sync_errs}herd-config.sh adds config keys: also update templates/capabilities.tsv"$'\n'
-    fi
-  fi
-
-  _hc_added_lanes="$(git diff --diff-filter=A --name-only "$_hc_branch" 2>/dev/null \
-    | grep -Ex 'scripts/herd/[^/]+\.sh' | grep -vxE 'scripts/herd/herd-config\.sh' || true)"
-  if [ -n "$_hc_added_lanes" ] && [ "$_hc_manifest_touched" -eq 0 ]; then
-    _hc_sync_errs="${_hc_sync_errs}new lane script added: also update templates/capabilities.tsv"$'\n'
-  fi
-
-  if [ -n "$_hc_sync_errs" ]; then
-    caps_note="caps-sync: VIOLATION"
-    if [ -n "$ONELINE" ]; then
-      echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"
-    else
-      echo "CAPS-SYNC: capabilities manifest not updated alongside engine change"
-      printf '%s' "$_hc_sync_errs"
-    fi
-    exit 1
-  fi
+HERD_CAPS_SYNC_SKIP_REASON=""
+if [ -f scripts/herd/caps-sync-lint.sh ]; then
+  . scripts/herd/caps-sync-lint.sh
+  _hc_sync_errs="$(herd_caps_sync_lint "$_hc_branch")"; _hc_sync_rc=$?
 else
-  caps_note="caps-sync: skipped (no diff against $_hc_branch)"
+  # Fail-soft on our own infra (a fixture tree, or a checkout without the engine scripts): SKIP,
+  # never a red — same convention as the claude-hardcode lint's missing-lint path below.
+  _hc_sync_errs=""; _hc_sync_rc=2
+  HERD_CAPS_SYNC_SKIP_REASON="scripts/herd/caps-sync-lint.sh not present"
 fi
+case "$_hc_sync_rc" in
+  0) caps_note="caps-sync: clean" ;;
+  2) caps_note="caps-sync: skipped ($HERD_CAPS_SYNC_SKIP_REASON)" ;;
+  *) caps_note="caps-sync: VIOLATION"
+     if [ -n "$ONELINE" ]; then
+       echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"
+     else
+       echo "CAPS-SYNC: capabilities manifest not updated alongside engine change"
+       printf '%s\n' "$_hc_sync_errs"
+     fi
+     exit 1 ;;
+esac
 
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
