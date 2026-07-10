@@ -82,6 +82,7 @@ Role summarized from each file's top-of-file comment.
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
 - `triggers.sh` — SCHEDULED / TRIGGERED RUNS (HERD-169): a cron-style trigger spawns a defined workflow
+- `watcher-exempt.sh` — THE ONE shared WATCHER-IDENTITY check (HERD-266).
 
 ### Templates (`templates/`)
 
@@ -108,9 +109,9 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`
+- `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`
+- `agent-watch.sh` → `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -148,7 +149,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
 - `stale-dup-gate.sh` → `derived-files.sh`
 - `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
-- `sweep.sh` → `agent-watch.sh`, `derived-files.sh`
+- `sweep.sh` → `agent-watch.sh`, `derived-files.sh`, `watcher-exempt.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
@@ -290,4 +291,4 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `coordinator.sh`, `driver.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `coordinator.sh`, `driver.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`

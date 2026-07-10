@@ -92,6 +92,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/driver.sh" ] && . "$SCRIPTS_DIR/driver.sh"
 
+# The ONE shared watcher-identity check (HERD-266): watcher_list_mains + the exemption clauses that
+# tell a real duplicate watcher apart from the canonical watcher's own argv0-inherited forks. Sourced
+# by bin/herd, sweep.sh, status.sh and agent-watch.sh so no surface can disagree. Defines functions
+# only (its readers late-bind HERD_WATCH_ARGV0 / HERD_WATCHER_LOCK / WORKTREES_DIR at call time, so
+# sourcing here before .herd/config is loaded is safe).
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/watcher-exempt.sh" ] && . "$SCRIPTS_DIR/watcher-exempt.sh"
+
 # `herd status` helpers: the DETERMINISTIC, READ-ONLY one-shot health snapshot for THIS project
 # (watcher liveness, in-flight builders + DEAD detection, open PRs + gate state, backlog counts).
 # Defines functions only — its _status_watcher_pids late-binds _list_project_watchers (defined far
@@ -4526,61 +4534,27 @@ _reload_reparent() {
   [ "$v" = "yes" ]
 }
 
-# _list_project_watchers — enumerate ONLY this project's watcher PIDs, one per line, de-duplicated:
-# the union of (a) the lockfile PID (if alive) and (b) every process whose argv0 is EXACTLY
-# $HERD_WATCH_ARGV0 (herd-watch-<slug>). argv0 is the attribution mechanism — see agent-watch.sh's
-# startup re-exec: it is visible in ps/pgrep on every platform, unlike an env-var marker which modern
-# macOS will not read back via ps. We match argv0 EXACTLY (the ps command's first token), NOT as a
-# pgrep substring, so workspace "north" never captures "northern"'s watcher and "app" never captures
-# "apple"'s. This finds lock-ABSENT strays too (the "no running watcher found while 2 alive" case).
-# UNTAGGED legacy watchers (started before the argv0 marker existed) carry no marker and are NOT
-# returned here — _stop_project_watcher still reaps those via its lsof cwd/lockfile fallback.
+# _list_project_watchers — enumerate ONLY this project's watcher MAINS, one PID per line. A THIN
+# CALLER of watcher_list_mains (scripts/herd/watcher-exempt.sh), which is the ONE place the engine
+# decides what a watcher main is: the union of (a) the lockfile PID when alive and (b) every process
+# whose argv0 is EXACTLY $HERD_WATCH_ARGV0 and which is not PROVABLY one of the canonical watcher's
+# own forks (marker-owned gate worker, or a child of the canonical watcher).
 # Requires HERD_WATCHER_LOCK + HERD_WATCH_ARGV0 in scope (from .herd/config).
 #
-# CRITICAL EXEMPTION (HERD-217 + HERD-245): the canonical watcher FORKS its async gate workers
-# (healthcheck/review). Health worker subshells re-exec under the SAME argv0, so a live gate worker
-# is argv0-indistinguishable from a duplicate watcher. Listing it here hands it to
-# _stop_project_watcher, which SIGTERMs it — destroying in-flight gate work (the HERD-245 review-sever
-# class). Skip any pid owned by a LIVE .review-inflight-* / .health-inflight-* / .spawn-inflight-*
-# marker under $WORKTREES_DIR (or $HERD_WORKTREES_DIR). scripts/herd/sweep.sh carries the matching
-# exemption (_sweep_live_marker_pids globs the same three families; _sweep_watcher_has_gate_child also
-# spares a tagged fork parenting a lane script).
-# HERD-237 adds .spawn-inflight-*: the tick now forks its builder-lane and resolver dispatches too, so
-# a background lane is argv0-indistinguishable from a duplicate watcher in exactly the same way — and
-# SIGTERMing one mid-spawn strands a claimed intent with no worktree behind it.
-_list_project_watchers() {
-  local pid argv0 seen=" " live=" " f mp trees="${WORKTREES_DIR:-${HERD_WORKTREES_DIR:-}}"
-  # Live gate-worker + lane-dispatch pids — never list these as "watchers".
-  if [ -n "$trees" ]; then
-    for f in "$trees"/.review-inflight-* "$trees"/.health-inflight-* "$trees"/.spawn-inflight-*; do
-      [ -e "$f" ] || continue
-      mp="$(head -1 "$f" 2>/dev/null || true)"
-      case "$mp" in ''|*[!0-9]*) continue ;; esac
-      kill -0 "$mp" 2>/dev/null || continue
-      live=" $live$mp "
-    done
-  fi
-  # (a) lockfile PID — the watcher this project recorded.
-  if [ -f "$HERD_WATCHER_LOCK" ]; then
-    pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      printf '%s\n' "$pid"; seen="$seen$pid "
-    fi
-  fi
-  # (b) argv0-tagged processes — exact first-token match on the ps command string. pgrep narrows the
-  # candidate set (substring); the ps first-token check makes attribution exact and cross-platform.
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    case "$seen" in *" $pid "*) continue ;; esac
-    # Gate-worker exemption: a live inflight-marker pid is mid-flight gate work, not a stray watcher.
-    case "$live" in *" $pid "*) continue ;; esac
-    # `|| true`: ps on a since-dead pid exits non-zero and, under `set -euo pipefail`, would abort
-    # this function before it reaches later (still-alive) pids — dropping real strays. Neutralize it.
-    argv0="$(ps -o command= -p "$pid" 2>/dev/null | awk 'NR==1{print $1}' || true)"
-    [ "$argv0" = "$HERD_WATCH_ARGV0" ] || continue
-    printf '%s\n' "$pid"; seen="$seen$pid "
-  done < <(pgrep -f "$HERD_WATCH_ARGV0" 2>/dev/null || true)
-}
+# WHY A SHARED HELPER (HERD-266). This function used to exempt ONLY marker-owned pids, while
+# sweep.sh's sweep_stray_watchers ALSO exempted a fork whose ppid is the canonical watcher. The tick
+# loop forks constantly and every fork inherits the argv0, so a sub-second marker-less fork alive at
+# sample time was counted here as a second watcher main — `herd status` alarmed '⚠ 2 watcher mains
+# alive' on a healthy control room (~20 such forks observed, all children of the canonical watcher).
+# Both seats now ask the same question of the same code.
+#
+# THIS LIST IS THE KILL LIST. _stop_project_watcher (below) SIGTERMs every pid it returns, so it still
+# reaps lock-ABSENT strays — including a stray that has dispatched a gate worker. sweep.sh's
+# DETECTION-only surface layers an extra gate-child guard on top of this listing; that guard is
+# deliberately NOT part of the listing, because exempting a gate-running stray here would make
+# _stop_project_watcher report "no running watcher found", drop the lockfile, and let the caller spawn
+# a second main on top of the survivor. A GENUINE orphan duplicate is listed, and killed.
+_list_project_watchers() { watcher_list_mains; }
 
 # _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
 # else echo nothing (HERD-209). The atomic REFUSE-or-ADOPT read the launch paths (cmd_pane_watch /
@@ -4693,6 +4667,12 @@ _stop_project_watcher() {
       journal_append watcher_reaped pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd
     fi
   done < <(pgrep -f "agent-watch.sh" 2>/dev/null || true)
+
+  # No watcher of ours is running now, so no self-restart generation handoff can be in flight: drop a
+  # marker a crashed exec left behind (HERD-266) rather than leave it on disk until its TTL expires.
+  # The launch paths that call us go on to spawn a fresh watcher, whose startup clears it anyway; this
+  # covers the `herd reload` / sweep-leg-5 stop that never relaunches.
+  declare -f watcher_handoff_clear >/dev/null 2>&1 && watcher_handoff_clear
 
   [ "$killed" -eq 0 ] && say "  no running watcher found"
   return 0

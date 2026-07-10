@@ -109,6 +109,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # coordinator skill, .herd/config.local) that the reaps and the stale-base gate must never mistake for
 # real work. Defines functions + one constant; idempotent when a later source pulls it in again.
 . "$HERE/derived-files.sh"
+# SHARED WATCHER-IDENTITY CHECK (HERD-266) — watcher_list_mains + the exemption clauses that tell a
+# duplicate watcher apart from this watcher's own argv0-inherited forks, plus the self-restart handoff
+# marker this file writes (watcher_handoff_begin/_clear). Defines functions + one constant; idempotent.
+# shellcheck source=/dev/null
+. "$HERE/watcher-exempt.sh"
 # STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
@@ -4566,6 +4571,13 @@ _self_restart_exec() {
   [ -n "${HERD_HERMETIC_GUARD:-}" ] && return 1
   [ -r "$HERE/agent-watch.sh" ] || return 1
   _self_restart_journal "$_se_trigger" "$_se_workers" "$_se_waited"
+  # GENERATION HANDOFF (HERD-266). exec keeps our pid, but the outgoing image's still-running forks
+  # are momentarily neither marker-owned nor children of a settled lock, so a `herd status` sampling
+  # inside this window can see more than one tagged main. Record the window (TTL-bounded, cleared by
+  # the incoming image once it owns the singleton) so the duplicate ALARM stays silent through it —
+  # the pids are still LISTED, so `herd reload` can still stop us. Written last: nothing but the exec
+  # follows, so a marker on disk means a handoff that actually started.
+  watcher_handoff_begin "$$"
   # HERD_WATCH_REEXEC is already exported in this process, so the new image keeps the argv0 we pass
   # here rather than re-execing a second time. Same pid ⇒ same pane, same singleton lock. $_WATCH_ARGV
   # replays this watcher's own positional args, exactly as the startup argv0 re-exec passes "$@" — the
@@ -4602,6 +4614,7 @@ _self_restart_tick() {
   # tick would only refuse again. The note reverts to its HERD-233 meaning: a restart recommendation
   # the operator acts on. Journaled ONCE, for the same reason.
   _SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0; _SELF_RESTART_GAVE_UP=1
+  watcher_handoff_clear    # no handoff happened — never let a marker mask a real duplicate
   journal_append watcher_self_restart result skipped reason exec-unavailable trigger "$_st_trigger"
   return 0
 }
@@ -10196,6 +10209,11 @@ herd_console_guard "herd watch" || exit 1
 # (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
 # launcher too.
 _acquire_watcher_singleton || exit 1
+# The incoming generation owns the lock: any self-restart handoff window is over (HERD-266). Clearing
+# it HERE — after the acquire, in both the exec'd image and a cold launch — means the duplicate alarm
+# is suppressed for exactly the exec, never a tick longer. A crashed exec that never reached this line
+# leaves a marker that ages out on its own (WATCHER_HANDOFF_TTL).
+watcher_handoff_clear
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
 # ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────

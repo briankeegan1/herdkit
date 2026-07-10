@@ -5,8 +5,9 @@
 # (tests/test-status.sh), which drives ONLY the pure classifiers/ledger-readers below.
 #
 # It NEVER mutates anything — no tree, ledger, tab, PR, or dead-builder record. It only READS:
-#   • the watcher liveness (bin/herd's _list_project_watchers — lockfile ∪ herd-watch-<slug> argv0
-#     marker — with a self-contained argv0 pgrep fallback when sourced standalone);
+#   • the watcher liveness (the shared check in scripts/herd/watcher-exempt.sh — lockfile ∪
+#     herd-watch-<slug> argv0 marker, minus the canonical watcher's own forks — reached via bin/herd's
+#     _list_project_watchers, with a self-contained argv0 pgrep fallback when sourced standalone);
 #   • `git worktree list` + `herdr agent list` + `gh pr list` to enumerate in-flight builders;
 #   • the watcher's OWN append-only ledgers ($WORKTREES_DIR/.agent-watch-reviewed and
 #     .agent-watch-healthchecks) for the last review/health verdict — never writing them;
@@ -114,13 +115,18 @@ _status_backlog_counts() {
 
 # ── Watcher liveness ─────────────────────────────────────────────────────────────────────────────
 
-# _status_watcher_pids — one PID per line for THIS project's live watcher(s). Prefers bin/herd's
-# _list_project_watchers (lockfile ∪ exact herd-watch-<slug> argv0 marker) when it is in scope;
-# falls back to a self-contained argv0-EXACT pgrep so status.sh still works sourced standalone.
-# READ-ONLY: it only reads the lockfile + ps/pgrep, never signals anything.
+# _status_watcher_pids — one PID per line for THIS project's live watcher MAIN(s). Prefers bin/herd's
+# _list_project_watchers, then watcher-exempt.sh's watcher_list_mains directly (both are the SAME
+# shared check: lockfile ∪ exact herd-watch-<slug> argv0, minus the canonical watcher's own forks);
+# falls back to a self-contained argv0-EXACT pgrep so status.sh still works sourced standalone with
+# neither in scope. READ-ONLY: it only reads the lockfile + ps/pgrep, never signals anything.
 _status_watcher_pids() {
   if declare -f _list_project_watchers >/dev/null 2>&1; then
     _list_project_watchers 2>/dev/null || true
+    return 0
+  fi
+  if declare -f watcher_list_mains >/dev/null 2>&1; then
+    watcher_list_mains 2>/dev/null || true
     return 0
   fi
   command -v pgrep >/dev/null 2>&1 || return 0
@@ -130,6 +136,69 @@ _status_watcher_pids() {
     a0="$(ps -o command= -p "$pid" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     [ "$a0" = "$marker" ] && printf '%s\n' "$pid"
   done < <(pgrep -f "$marker" 2>/dev/null || true)
+}
+
+# _status_watcher_count — how many watcher mains the CURRENT sample sees. `grep -c .` exits 1 on an
+# empty input, so `|| printf 0` keeps that zero under the caller's set -e.
+_status_watcher_count() {
+  local pids="${1:-}"
+  [ -n "$pids" ] || { printf 0; return 0; }
+  printf '%s\n' "$pids" | grep -c . 2>/dev/null || printf 0
+}
+
+# _status_dup_sleep — pause one inter-sample gap. $HERD_STATUS_DUP_SLEEP is a test seam; a value that
+# is not a plain (possibly fractional) number is ignored. A `sleep` without fractional-second support
+# would reject "0.3" and, with a bare `|| true`, silently run the samples back-to-back — degrading the
+# PERSISTENCE check to a single sample. So a rejected fractional gap falls back to a whole second: a
+# slower `herd status` on that platform, never a weaker check. A gap of exactly 0 means "no pause"
+# (the unit tests' seam) and must not fall back.
+_status_dup_sleep() {
+  local gap="${HERD_STATUS_DUP_SLEEP:-0.3}"
+  case "$gap" in
+    ''|*[!0-9.]*|*.*.*) gap="0.3" ;;
+  esac
+  case "$gap" in 0|0.0|0.00) return 0 ;; esac
+  sleep "$gap" 2>/dev/null && return 0
+  sleep 1 2>/dev/null || true
+}
+
+# _status_dup_verified <first-sample-pids> — is the duplicate-watcher condition REAL? (HERD-266)
+#
+# A duplicate watcher is a genuine emergency (two mains race the shared .git object store), so the row
+# is red and loud. That makes a FALSE red expensive: the operator hunts a ghost, and a console that
+# cries wolf stops being read. One `ps` sample cannot tell a duplicate from a sub-second fork of the
+# canonical watcher that happened to be alive when we looked — the tick loop forks constantly.
+# watcher_list_mains's exemptions remove the forks we can PROVE are ours (marker-owned, child of the
+# canonical watcher, parent of a live gate worker); this adds the two checks that need TIME, not a
+# process table:
+#   • HANDOFF — a WATCHER_SELF_RESTART exec is in flight. Both generations are legitimate; the window
+#     is TTL-bounded and closes itself. Never alarm inside it.
+#   • PERSISTENCE — re-sample. A real duplicate is a long-lived process and survives every sample; a
+#     fork the exemptions could not attribute (its parent already reaped, its gate child not yet
+#     exec'd) is gone within a sample or two. We alarm only when EVERY sample still sees >1 main.
+# On success it PRINTS the pids of the LAST sample — the mains that actually survived every check, and
+# so the only ones the operator should be told to stop. The caller must render those, never the first
+# sample's: re-reading the list after verification (as an earlier revision did) can catch a shrunk
+# sample and print a nonsensical '⚠ 1 watcher mains alive (pids 12345)'.
+# Returns 0 (alarm — verified real, surviving pids on stdout), 1 (do not alarm). Read-only.
+# HERD_STATUS_DUP_SAMPLES / HERD_STATUS_DUP_SLEEP are test seams; the defaults cost ~0.6s and only on
+# the already-suspect path.
+_status_dup_verified() {
+  local pids="${1:-}" samples="${HERD_STATUS_DUP_SAMPLES:-3}" i=1
+  if declare -f watcher_handoff_active >/dev/null 2>&1 && watcher_handoff_active; then
+    return 1
+  fi
+  case "$samples" in ''|*[!0-9]*|0) samples=3 ;; esac
+  # The caller's sample is sample 1; it already showed > 1 main. Re-sample until we have `samples` of
+  # them, and let the LAST one carry the pids we print.
+  while [ "$i" -lt "$samples" ]; do
+    _status_dup_sleep
+    pids="$(_status_watcher_pids)"
+    # The extra main is already gone ⇒ it was a transient fork, not a duplicate.
+    [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
+    i=$(( i + 1 ))
+  done
+  printf '%s\n' "$pids"
 }
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────────────────────────
@@ -159,12 +228,22 @@ _status_run() {
     # Count DISTINCT live watcher mains for this workspace. Exactly one is the invariant (HERD-209):
     # a duplicate races the shared .git object store (healthchecks restart endlessly) and is a REAL
     # attention condition, NOT the calm "down" state — so we warn LOUD and flag it for the operator.
-    wcount="$(printf '%s\n' "$wpids" | grep -c . 2>/dev/null || printf 0)"
-    if [ "${wcount:-1}" -gt 1 ]; then
-      local wall; wall="$(printf '%s' "$wpids" | tr '\n' ' ')"
+    # But only once it is VERIFIED REAL (HERD-266): a single sample cannot tell a duplicate from a
+    # transient fork or a self-restart handoff, and a false red is worse than a late one.
+    wcount="$(_status_watcher_count "$wpids")"
+    local wsurv=""
+    if [ "${wcount:-1}" -gt 1 ] && wsurv="$(_status_dup_verified "$wpids")"; then
+      # The SURVIVING mains — the ones every sample saw — are what the operator must act on, and the
+      # only ones we count. _status_dup_verified has already proven there is more than one of them.
+      wcount="$(_status_watcher_count "$wsurv")"
+      local wall; wall="$(printf '%s' "$wsurv" | tr '\n' ' ')"
       printf '  %sWATCHER%s   %s⚠ %s watcher mains alive%s (pids %s) %s— duplicates race the gate; stop the extras: '"'"'herd pane watch'"'"' (or kill all but one)%s\n' \
         "$b" "$x" "$r" "$wcount" "$x" "${wall% }" "$d" "$x"
       attention=1; reasons="${reasons} duplicate-watchers:${wcount}"
+    elif [ "${wcount:-1}" -gt 1 ] && declare -f watcher_handoff_active >/dev/null 2>&1 \
+         && watcher_handoff_active; then
+      printf '  %sWATCHER%s   %salive%s (pid %s) %s· engine-update restart handoff in progress%s\n' \
+        "$b" "$x" "$g" "$x" "$wpid1" "$d" "$x"
     else
       printf '  %sWATCHER%s   %salive%s (pid %s)\n' "$b" "$x" "$g" "$x" "$wpid1"
     fi
