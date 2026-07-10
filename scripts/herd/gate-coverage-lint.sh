@@ -31,17 +31,19 @@ HERD_GATE_COVERAGE_SKIP_REASON=""
 # Pure function: prints UNGATED lines then an ADVISORY summary. Exit 0 clean / 1 ungated.
 herd_gate_coverage_check() {
   local _gc_bats="${1:-}" _gc_dir="${2:-}" _gc_exempt="${3:-}"
-  local _gc_bats_text _gc_ungated="" _gc_total=0 _gc_exempted=0 _gc_wired=0 _gc_f _gc_base
-
-  _gc_bats_text="$(cat "$_gc_bats" 2>/dev/null || true)"
+  local _gc_ungated="" _gc_total=0 _gc_exempted=0 _gc_wired=0 _gc_f _gc_base
 
   while IFS= read -r _gc_f; do
     [ -n "$_gc_f" ] || continue
     _gc_base="$(basename "$_gc_f")"
     _gc_total=$((_gc_total + 1))
 
-    # Is it referenced in herd.bats?
-    if printf '%s\n' "$_gc_bats_text" | grep -qF "$_gc_base"; then
+    # Is it referenced in herd.bats? Grep the bats FILE directly — NOT `printf … | grep -q`
+    # (HERD-297): grep -q exits at the first match and closes the pipe, the producer takes EPIPE,
+    # and under a caller's `set -o pipefail` the pipeline goes nonzero — misclassifying a wired
+    # test as UNGATED once herd.bats grows past a 16KB (macOS) pipe buffer. No pipe, no EPIPE, and
+    # grep's early exit is now a pure win.
+    if grep -qF -- "$_gc_base" "$_gc_bats" 2>/dev/null; then
       _gc_wired=$((_gc_wired + 1))
       continue
     fi

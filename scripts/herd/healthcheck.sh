@@ -235,7 +235,7 @@ if [ "$MODE" = "auto" ]; then
       if [ "$?" -ge 2 ]; then
         echo "⚠️  invalid HEALTHCHECK_HEAVY_GLOB regex (routing to HEAVY): $HEALTHCHECK_HEAVY_GLOB" >&2
         MODE="heavy"
-      elif printf '%s\n' "$changed" | grep -qE "$HEALTHCHECK_HEAVY_GLOB"; then
+      elif grep -qE "$HEALTHCHECK_HEAVY_GLOB" <<< "$changed"; then   # here-string, not a pipe (HERD-297: no EPIPE if grep -q exits early on a >16KB diff)
         MODE="heavy"
       else
         MODE="light"
@@ -498,7 +498,7 @@ run_interaction_gate() {
   [ -n "$APP_SURFACE_GLOB" ] || return 0            # feature off → zero behavior change
   local changed; changed="$(_changed_files)"
   [ -n "$changed" ] || return 0                     # nothing changed to compare → nothing to gate
-  printf '%s\n' "$changed" | grep -qE "$APP_SURFACE_GLOB" || return 0   # diff misses the app surface
+  grep -qE "$APP_SURFACE_GLOB" <<< "$changed" || return 0   # diff misses the app surface (here-string, not a pipe — HERD-297)
 
   if [ -z "$INTERACTION_TEST_CMD" ]; then           # app-surface PR, but no interaction tests declared
     IG_STATE="WARN"
