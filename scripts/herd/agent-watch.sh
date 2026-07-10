@@ -4975,13 +4975,27 @@ _main_fresh_recovered() {
 #
 # CLEARS ONLY ON PROVABLE FRESHNESS — clean tree AND zero behind AND zero ahead. "Not behind" alone would
 # wipe a real `local-commits` hold (clean tree, 0 behind, N ahead is precisely that red), the same way a
-# vacuous rc-0 would wipe a real MAIN RED (see _main_health_clear's warning). Anything else — dirty,
-# behind, ahead, unreadable — leaves the file exactly as it was for the reconcile to re-decide.
+# vacuous rc-0 would wipe a real MAIN RED (see _main_health_clear's warning).
 #
-# The behind/ahead counts come from the LOCAL remote-tracking ref (no fetch of our own). A row cleared
-# against a ref that has since moved is not a lie: the hold's condition (a dirty tree, a divergence this
-# checkout no longer has) is observably gone, and the reconcile below fetches and re-holds on the same
-# tick if $MAIN is genuinely stale again.
+# When it CANNOT clear it does NOT just leave the file frozen: it RE-DERIVES the row from observed state
+# (HERD-293). The live incident 2026-07-10: a `dirty-tree 3 0` hold kept painting "behind by 3" after the
+# operator pulled ($MAIN went 0-behind) — the old recheck returned early on the still-dirty tree, so the
+# stored counts froze, and reconcile_main_freshness (which would re-hold with fresh counts) starves below
+# the _watch_gate_inflight defer while gates run. So the row is a reconciled invariant over observed git
+# state every tick (docs/multi-seat-doctrine.md rule 1), never an event-time snapshot: the reason and the
+# behind/ahead counts are recomputed and re-held whenever they differ from the stored line.
+#
+# Only the two reasons a read-only, no-fetch probe can classify UNAMBIGUOUSLY are re-held here: `dirty-tree`
+# (a dirty checkout) and `local-commits` (clean, ahead, and NOT generated-only). Every other hold —
+# a clean ff-able behind, a generated-only divergence still auto-healing, a prior ff/rebase/push failure —
+# depends on a fetch or a heal attempt the recheck deliberately does not make, so its file is left exactly
+# as it was for the reconcile below the defer to re-decide once it can fetch and heal. _main_fresh_hold
+# dedups the journal on an identical line, so a re-derive that matches the stored row is byte-inert.
+#
+# The behind/ahead counts come from the LOCAL remote-tracking ref (no fetch of our own). A row cleared or
+# re-derived against a ref that has since moved is not a lie: the hold's condition (a dirty tree, a
+# divergence this checkout no longer has) is observed as it stands now, and the reconcile below fetches
+# and re-decides on the same tick if $MAIN is genuinely stale again.
 #
 # Byte-inert on the happy path: with no state file the first test returns, so a fresh $MAIN costs one
 # `[ -s ]` and touches no git.
@@ -4996,13 +5010,29 @@ _main_fresh_recheck() {
   _mk_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
   git -C "$MAIN" rev-parse --verify --quiet "$_mk_up" >/dev/null 2>&1 || return 0
   _mk_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
-  [ -n "$_mk_dirty" ] && return 0
   _mk_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mk_up" 2>/dev/null || true)"
   _mk_ahead="$(printf '%s' "$_mk_counts" | awk '{print $1}')"
   _mk_behind="$(printf '%s' "$_mk_counts" | awk '{print $2}')"
   case "${_mk_ahead:-x}${_mk_behind:-x}" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$_mk_ahead" -eq 0 ] && [ "$_mk_behind" -eq 0 ] || return 0
-  _main_fresh_recovered
+
+  # PROVABLE FRESHNESS — clean AND 0-behind AND 0-ahead: the hold's condition is observably gone.
+  if [ -z "$_mk_dirty" ] && [ "$_mk_ahead" -eq 0 ] && [ "$_mk_behind" -eq 0 ]; then
+    _main_fresh_recovered
+    return 0
+  fi
+
+  # Cannot clear → re-derive the line so its counts never freeze. Dirty tree wins (it is why the reconcile
+  # would refuse to pull), else a clean, ahead, non-generated-only divergence is the `local-commits` hold.
+  if [ -n "$_mk_dirty" ]; then
+    _main_fresh_hold dirty-tree "$_mk_behind" "$_mk_ahead"
+    return 0
+  fi
+  if [ "$_mk_ahead" -gt 0 ] && ! _main_fresh_generated_only "$_mk_up"; then
+    _main_fresh_hold local-commits "$_mk_behind" "$_mk_ahead"
+    return 0
+  fi
+  # Anything else (clean ff-able behind, generated-only divergence, a prior heal failure) is left for the
+  # reconcile below the defer to re-decide once it can fetch and heal.
   return 0
 }
 
