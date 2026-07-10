@@ -364,6 +364,225 @@ Output: Token and USD spend per PR, per session, or total (with coordinator + sc
 
 6. **Archive failed items promptly**: If a builder keeps failing the same item (e.g., a test always fails), archive it and move on rather than letting it loop. Looping wastes budget.
 
+## Full-autonomy doctrine
+
+The full-autonomy doctrine is the complete set of binding rules and practices for running
+this coordinator seat without human supervision. It was codified from the 2026-07-09
+gating-hardening session (evidence at
+[`docs/audits/2026-07-09-gating-hardening.md`](audits/2026-07-09-gating-hardening.md))
+and tracked as HERD-270. The coordinator skill source (`templates/coordinator.md.tmpl`)
+carries the per-session reference; this section is the full operational playbook.
+
+### Configuration prerequisites
+
+Full autonomy requires these knobs to be set:
+
+```
+COORDINATOR_AUTONOMY=full          # no mid-item approval pauses
+REVIEW_AUTOFIX=true                # BLOCK reviews bounce to the builder automatically
+HEALTHCHECK_AUTOFIX=true           # red healthchecks bounce to the builder automatically
+STALE_BASE_AUTOFIX=on              # stale-base holds self-heal via merge-up or resolver
+SWEEP_AUTO=auto                    # safe debris runs on the watcher's sweep cadence
+CLAIM_REQUIRED=on                  # prevents double-claiming under multiple seats
+TRACKED_SPAWNS=required            # prevents off-book spawns
+```
+
+Set each with `herd config set <KEY> <VALUE>`. `posture-lint.sh` (via `herd doctor`)
+reports which knobs are not at their full-autonomy values.
+
+### Why a doctrine, not just configuration
+
+The knobs set WHAT the coordinator may do autonomously. The doctrine says HOW to
+exercise that autonomy — diagnostic order, multi-seat coordination, when to wait vs.
+act, and how to persist context. Both are required. A coordinator with the full knob
+set but no doctrine will still burn needless rounds: it acts before reading the gate
+record, re-tasks a builder the engine was already bouncing, or loses context across
+sessions and re-derives it from scratch.
+
+### The six binding rules (full rationale)
+
+The `## Operating posture` block in the rendered coordinator skill provides a compact
+summary. The full rationale for each rule:
+
+1. **End-to-end pipelines.** Run each item from pick → spawn → gate monitoring → close
+   without pausing for confirmation on mechanical steps. Pause only for genuine judgment
+   calls: semantic merge conflicts (a human must choose between two valid meanings),
+   product ambiguity (the backlog item is underspecified and a human must clarify), or
+   budget/safety decisions the engine cannot make. Every other step is mechanical — the
+   audit trail and gate output make the right action unambiguous without human input.
+
+2. **File-then-spawn.** Every builder spawn must trace to a tracked work item. The
+   tracker is the single source of what is being built; two coordinator seats reading
+   the same tracker see the same queue. Off-book spawns corrupt that picture: the second
+   seat reads the tracker, sees the item open, and double-builds. Set
+   `TRACKED_SPAWNS=required` so the lanes enforce this; `CLAIM_REQUIRED=on` so a claim
+   atomically locks the item against a second seat's spawn.
+
+3. **Respect review bandwidth.** `REVIEW_CONCURRENCY` (default 2) is the real throughput
+   ceiling. Spawning ahead of it queues PRs waiting for a reviewer slot, not code
+   readiness. Count open PRs (`gh pr list --state open | wc -l`) and hold new spawns
+   when that count approaches `REVIEW_CONCURRENCY + SPAWN_AHEAD`.
+
+4. **Let the GATE merge.** The watcher's gate → merge sequence is the authoritative ship
+   path. The coordinator never calls `gh pr merge`, never bypasses the gate with
+   `herd-approve.sh` for mechanical reasons, and never hand-resolves a conflict except
+   through `herd-resolve.sh`. Its role at the merge stage is to surface `needs you` rows
+   and route them to the right sub-agent or human.
+
+5. **Reconcile the tracker on every merge.** Whether the merge was by this seat's
+   watcher, a foreign seat's watcher, or a human via the GitHub UI, the tracker item
+   must be closed. The watcher's merged-PR sweep catches the hook chain (retirement,
+   cost accounting, backlog reconcile) for foreign merges, but the TRACKER ITEM is the
+   coordinator's responsibility — scribe-driven, not automatic.
+
+6. **Sweep debris.** `herd sweep --dry-run` shows what is safe to remove; `herd sweep`
+   removes it. Run on the `SWEEP_AUTO` cadence (when `SWEEP_AUTO=auto` the watcher
+   runs safe legs automatically; when `advise`, the coordinator gets a console
+   recommendation to run manually). Never let dead worktrees and stale panes accumulate:
+   each occupies a concurrency slot, biases `herd status`, and confuses multi-seat
+   visibility.
+
+### Diagnostic-first rule (no exceptions)
+
+The rule: **read the record before acting.** The 2026-07-09 session recorded nudges
+where the coordinator acted on a red row before reading the gate history, and the row
+was a no-op situation — an infra transient, an autofix round already in progress, or a
+hold that would clear on the next tick. The correct diagnostic sequence:
+
+```bash
+herd notes                     # drain and route builder notes (ack-aware listing)
+herd log | grep builder_note   # fallback / full history including already-handled notes
+herd why <pr#>                 # chronological gate history for the PR you are about to act on
+```
+
+Only AFTER draining notes and reading `herd why`: re-task, override, or escalate.
+
+**What `herd why` surfaces:**
+
+- `infra_event` — a Claude death or API timeout; NOT a code error; do not re-task.
+- `verdict_recorded source=gate_default` — gate defaulted to PASS (no reviewer ran);
+  NOT a human-approved review.
+- `refix_wake_result escalated=true` — the autofix bounce failed to wake the builder;
+  the PR needs a manual re-task despite showing a `refixing` state.
+- `healthcheck_started` count — how many suite runs this PR has consumed; a count > 3
+  may indicate a flaky test or misconfigured suite.
+- `stale_dup_hold` — the PR's base is stale; when `STALE_BASE_AUTOFIX=on` this
+  self-heals on the next tick without coordinator action.
+
+**What to do with each finding:**
+
+- Infra transient → wait one watcher tick; it clears on its own.
+- `gate_default` PASS → the review gate did not actually run; do not treat as approval.
+- `refix_wake_result escalated=true` → re-task the builder manually.
+- `stale_dup_hold` + `STALE_BASE_AUTOFIX=on` → wait for self-heal.
+- BLOCK verdict with review comments → decide: builder refix, manual override (with
+  explicit reason), or archive.
+
+### Autofix-aware behavior (full doctrine)
+
+When the full autofix suite is on (`REVIEW_AUTOFIX + HEALTHCHECK_AUTOFIX + STALE_BASE_AUTOFIX`),
+the engine runs an automated bounce/refix cycle for every code error. The coordinator's
+role is monitor-and-escalate only:
+
+| Console row | What it means | Coordinator action |
+|---|---|---|
+| `refixing (round k/3)` | Engine bounced the builder; it is working the fix | **Wait** |
+| `fix in progress · awaiting push (round k/3)` | Builder received the bounce and pushed | **Wait** |
+| `needs you · auto-refix failed` | Engine exhausted bounce budget | **Re-task with context** |
+| `needs you · refix limit …` | Same: budget exhausted | **Re-task with context** |
+| `needs you` (no round suffix) | Autofix not applicable or off | **Re-task** |
+
+**Re-tasking with context** means reading `herd why <pr#>` first, then sending the
+builder the failing test line + suite log path — not a blind re-task. A blind bounce
+on a budget-exhausted PR will also exhaust the bounce budget for the next rail.
+
+**Round budget semantics:** rounds are per-rail (`review`, `health`, `stale-base` each
+have their own count) and reset when that rail subsequently passes. A PR that fails
+review (round 1), gets review to pass (reset), then fails health (round 1 of health)
+has NOT exhausted any budget — each rail's count reset when its gate passed. The total
+per-PR ceiling (`3 × REFIX_MAX_ROUNDS`) stops a PR that keeps failing across ALL rails.
+
+**When partial autofix is on:** check which knobs are on and which duties remain manual
+(the `## Duties that stay MANUAL` sub-section in the rendered coordinator skill lists
+them explicitly for the current config). The diagnostic-first rule still applies for
+every manual duty before acting.
+
+### Multi-seat discipline (complete doctrine)
+
+Several coordinator seats may work this repo in parallel. Seat-local plans and
+event side-effects are the root causes of most inter-seat interruptions (see
+`docs/multi-seat-doctrine.md` Rule 1: reconciled invariants > event side-effects).
+
+**Before picking an item to spawn:**
+
+1. `herd backlog queued` — list all live 📌 markers.
+2. For each fresh (< 24h) marker: skip unless the plan was clearly abandoned or you
+   have an explicit reason to override (state the reason out loud before proceeding).
+3. For each `ADVISORY: >24h stale` marker: treat as advisory only — pick the item.
+
+**After deciding to spawn (before the lane command):**
+
+1. Run the pre-spawn impact analysis: `graphify update --no-cluster` + cross the
+   candidate's file surface against in-flight worktrees (see *Pre-spawn impact/conflict
+   analysis* in the coordinator skill). Sequence colliding items.
+2. Publish a 📌 marker: `herd backlog queue <#id> --after <blocker>`. This covers the
+   plan-time window between "decided to spawn" and "spawned" — a second seat reading
+   the tracker in that window will see the marker and hold off.
+
+**Why a marker AND a claim?**
+The **claim** (`CLAIM_REQUIRED=on`) fires AT spawn time — atomic guard against two
+simultaneous spawns. The **marker** is published BEFORE spawn, covering the "decided
+to build this next" state that may last minutes or hours. Together they close the full
+race window: plan-time → spawn-time → build-time.
+
+**Cross-seat conflict cost:** two seats spawning against the same file surface produce
+a merge conflict. The conflict resolver (`herd-resolve.sh`) handles it, but resolver
+spawns use concurrency slots: one avoidable conflict = one wasted review + one health
+run + one resolver slot. Pre-spawn impact analysis is the prevention layer; the claim
+is the last-resort guard.
+
+### Session continuity (full doctrine)
+
+Full autonomy means the coordinator must resume work between sessions without a human
+briefing. Three requirements:
+
+1. **Project memory is updated every session.** The local memory store holds what was
+   learned this session — decisions made, vocabulary, domain quirks (see *Persist
+   project & domain context* in the skill). Failing to update it means the next session
+   re-derives context from scratch, which is attended operation in disguise. Update at
+   the END of every session, not only when asked.
+
+2. **Long-form evidence is committed.** A post-mortem, an audit, a design, or a test
+   protocol that any builder or the next coordinator session must read goes in a
+   committed doc (`docs/audits/`, `docs/spikes/`, `docs/`). A session artifact (pane
+   scrollback, coordinator summary) evaporates on session boundary. The committed doc
+   path is cited in every tracker item that needs the background.
+
+3. **Epics are filed before their children.** A multi-item effort whose shape lives only
+   in the coordinator's current session is a session artifact. File the epic on the
+   tracker first, commit the evidence doc, then file the children — each with a backlink
+   to the epic and the committed doc. The next seat reads the repo; if the shape is not
+   there, the seat re-derives it (or contradicts it).
+
+### The eight 2026-07-09 hand-nudges and their doctrine mappings
+
+Each nudge traces to a missing or unexercised doctrine practice. Understanding these
+mappings lets the coordinator recognize and self-route each class without human help:
+
+| # | Incident summary | Missing practice | Doctrine section |
+|---|---|---|---|
+| 1 | Opus review burned on stale-base bounce (gate ordering) | Wait for cheap gate before dispatching expensive one | *Autofix-aware* — wait for stale-base self-heal before acting |
+| 2 | 19h MAIN RED: main-health tick event-only, not reconciled | Reconciled invariant > event side-effect (R1) | *Multi-seat discipline* — hold spawns when MAIN is red |
+| 3 | PR #333 endless infra re-dispatch loop | Read gate history before concluding a PR is stuck | *Diagnostic-first* — `herd why` reveals the infra loop |
+| 4 | Test fixtures polluted the live journal | `herd why` context before concluding gate results are real | *Diagnostic-first* — verify journal context, check provenance |
+| 5 | Idle resolver held re-dispatch forever (no deadline) | Builder notes surface mid-flight resolver state | *Builder notes* — drain and route before acting on resolver row |
+| 6 | Resolver exited on scratch branch; PR became invisible | Read builder notes + `herd why` before declaring PR lost | *Diagnostic-first* — full history before drastic action |
+| 7 | Failed `gh pr list` rendered live builders as dead | Confirm status before acting; blindness ≠ evidence of death | *Diagnostic-first* — never act on a potentially-blind read |
+| 8 | Seat-local ledgers: double-comment, double-resolver race | Multi-seat marker + claim closes the race window | *Multi-seat discipline* — marker before spawn, claim at spawn |
+
+Evidence base: [`docs/audits/2026-07-09-gating-hardening.md`](audits/2026-07-09-gating-hardening.md),
+incidents 1–12 and gaps G1–G9. Epic: HERD-240. Item: HERD-270.
+
 ---
 
 This SOP is the reference for operating herdkit in both attended and unattended modes. Deviations (e.g., a custom escalation policy) should be documented in your project's `.herd/config` comments or a local runbook.
