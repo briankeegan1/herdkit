@@ -161,6 +161,12 @@ _backend_amend() {
         _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"
         return 0
     fi
+    # HERD-312: the file backend has no concept of assignees or other tracker fields — when the note
+    # body is empty (pure field amend with no comment body), there is nothing to write; skip gracefully.
+    if [ -z "$note" ]; then
+        _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"
+        return 0
+    fi
     day="$(date +%Y-%m-%d 2>/dev/null || echo '')"
     # Sync to the remote tip first so the amend lands beneath the item's CURRENT line (another scribe
     # may have edited it). Fail-soft: an offline/failed pull just amends against local state.

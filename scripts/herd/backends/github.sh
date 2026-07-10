@@ -171,6 +171,7 @@ _backend_amend() {
     # first-class, WITHOUT touching the issue's state (open/closed) or its title. Conservative: no
     # matching issue → NOCHANGE + a LOUD reason (skip-over-guess), nothing posted. Sets
     # _BACKEND_RESULT=DONE|NOCHANGE.
+    # HERD-312: if _AMEND_FIELDS is set, only touch those fields — never mutate unrequested ones.
     local ref="$1" note="$2" num
     _BACKEND_RESULT="NOCHANGE"
     _github_require_gh
@@ -180,8 +181,21 @@ _backend_amend() {
         _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution (records the attempt)
         return 0
     fi
-    if _gh issue comment "$num" --body "$note" >/dev/null 2>&1; then
-        _BACKEND_RESULT="DONE"
+    # HERD-312: field-scoped mutations — only touch explicitly requested fields.
+    local fields="${_AMEND_FIELDS:-}"
+    if [ -n "$fields" ]; then
+        case "$fields" in
+            *assignee*)
+                if _gh issue edit "$num" --add-assignee "@me" >/dev/null 2>&1; then
+                    _BACKEND_RESULT="DONE"
+                fi
+                ;;
+        esac
+    fi
+    if [ -n "$note" ]; then
+        if _gh issue comment "$num" --body "$note" >/dev/null 2>&1; then
+            _BACKEND_RESULT="DONE"
+        fi
     fi
     _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution
 }
