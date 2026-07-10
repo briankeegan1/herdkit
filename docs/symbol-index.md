@@ -1142,8 +1142,8 @@ this scan cannot see).
 - `herd_engine_stale` — def `scripts/herd/engine-version.sh:73` — callers: `scripts/herd/agent-watch.sh:795`
 - `herd_engine_warn_if_stale` — def `scripts/herd/engine-version.sh:118` — callers: `bin/herd:3528`
 - `herd_enum` — def `scripts/herd/herd-config.sh:1439` — callers: —
-- `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:32` — callers: —
-- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:73`, `scripts/herd/healthcheck.sh:103` — callers: —
+- `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:39` — callers: —
+- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:94`, `scripts/herd/healthcheck.sh:103` — callers: —
 - `herd_is_derived_path` — def `scripts/herd/derived-files.sh:54` — callers: —
 - `herd_model_driver_for` — def `scripts/herd/driver.sh:182` — callers: `scripts/herd/herd-feature.sh:111`, `scripts/herd/herd-quick.sh:119`, `scripts/herd/herd-review.sh:364`
 - `herd_model_for_spawn` — def `scripts/herd/driver.sh:171` — callers: `scripts/herd/herd-feature.sh:110`, `scripts/herd/herd-quick.sh:118`, `scripts/herd/herd-review.sh:358`
