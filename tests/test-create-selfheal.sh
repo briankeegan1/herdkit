@@ -111,7 +111,7 @@ REQ_TEXT='Add a dark-mode toggle
 with a second line and  spacing preserved'
 
 # ══ (1)+(2) a failed create is DIVERTED, never consumed; the text survives verbatim ══════════════
-printf 'API is having a moment (503)\n' > "$T/fail-with"
+printf 'HTTP 503 Service Unavailable\n' > "$T/fail-with"
 p="$(mkreq 100 "$REQ_TEXT")"
 step add-item "$p" "$REQ_TEXT"
 [ "$RC" -eq 0 ]                       || fail "(1) add-item exited $RC ($OUT)"
@@ -208,20 +208,59 @@ ROWS="$( HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_
 printf '%s' "$ROWS" | grep -q 'Coalesce me'       || fail "(4) the coalesced row lost its title"
 ok; echo "PASS (4) repeated failures of one request coalesce into one row with a retry count"
 
-# ══ (5) CLASSIFICATION — and cap outranks rate-limit, or a wall reads as a flake ═════════════════
+# ══ (5) CLASSIFICATION — the trap runs BOTH ways ═════════════════════════════════════════════════
+# A cap read as a flake wastes every retry (the incident). A THROTTLE read as a wall is the mirror
+# image: the self-heal never fires on the commonest recoverable failure, and the operator is sent to
+# raise a cap they never hit. Both are false reds. The strings below are the ones the backends really
+# emit — `_linear_error_text` feeds "<extensions.code> <message>", so RATELIMITED arrives glued to
+# "Rate limit exceeded", which is exactly what a generic *limit exceeded* cap pattern would swallow.
 # shellcheck source=/dev/null
 WORKTREES_DIR="$TREES" . "$LIB"
 [ "$(create_retry_class 'USAGE_LIMIT_EXCEEDED rate limit reached')" = cap ] \
   || fail "(5) 'usage limit' lost to 'rate limit' — the exact mislabel behind the incident"
+[ "$(create_retry_class 'USAGE_LIMIT_EXCEEDED You have reached the issue limit for your plan')" = cap ] \
+  || fail "(5) a real Linear cap refusal is not a cap"
+# …and the mirror: every real Linear throttling shape must stay RETRYABLE.
+for s in 'RATELIMITED Rate limit exceeded' \
+         'Rate limit exceeded, please try again later' \
+         'RATELIMITED You have exceeded the rate limit' \
+         'RATE_LIMIT_EXCEEDED too many requests' \
+         'rate-limit exceeded'; do
+  [ "$(create_retry_class "$s")" = transient ] \
+    || fail "(5) '$s' classified $(create_retry_class "$s"), not transient — a self-clearing throttle would be marked a PERMANENT wall"
+  create_retry_permanent_class "$(create_retry_class "$s")" \
+    && fail "(5) '$s' is permanent — the retry queue would never fire on it"
+done
 [ "$(create_retry_class 'AUTHENTICATION_ERROR bad key')" = auth ]    || fail "(5) auth misclassified"
 [ "$(create_retry_class 'HTTP 503 upstream')" = transient ]          || fail "(5) 5xx misclassified"
+[ "$(create_retry_class '503')" = transient ]                        || fail "(5) a bare 5xx status misclassified"
 [ "$(create_retry_class 'rate limit, try again')" = transient ]      || fail "(5) rate limit misclassified"
 [ "$(create_retry_class '')" = unknown ]                             || fail "(5) empty error misclassified"
+# A generic limit-exceeded with no rate/usage qualifier is a cap by elimination…
+[ "$(create_retry_class 'LIMIT_EXCEEDED you have exceeded the limit')" = cap ] \
+  || fail "(5) a generic limit-exceeded no longer reads as a cap"
+# …but a 3-digit run that merely starts with 5 is NOT an http 5xx.
+[ "$(create_retry_class 'Issue 501 not found')" = unknown ] \
+  || fail "(5) 'Issue 501 not found' was read as a 5xx — the loose numeric match is back"
 create_retry_permanent_class cap  || fail "(5) cap is not permanent"
 create_retry_permanent_class auth || fail "(5) auth is not permanent"
 create_retry_permanent_class transient && fail "(5) transient must stay retryable"
 create_retry_permanent_class unknown   && fail "(5) unknown must stay retryable (never discard a recoverable request)"
-ok; echo "PASS (5) cap / auth / transient / unknown are told apart; cap outranks rate-limit"
+ok; echo "PASS (5) cap vs throttle vs auth vs unknown — neither a wall nor a hiccup reads as the other"
+
+# ══ (5b) a REAL Linear rate limit survives the whole pipeline as a RETRYABLE entry ════════════════
+# End-to-end, not just the classifier: the throttle must leave a pending entry that `next` re-injects.
+rm -rf "$RETRY"
+printf 'RATELIMITED Rate limit exceeded\n' > "$T/fail-with"
+p="$(mkreq 250 "Throttled filing")"
+NOW=9000 step add-item "$p" "Throttled filing"
+RL="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
+grep -q '^last_class=transient' "$RETRY/$RL.meta" || fail "(5b) a Linear rate limit was not classified transient"
+grep -q '^state=pending'        "$RETRY/$RL.meta" || fail "(5b) a Linear rate limit was marked PERMANENT — the self-heal never fires on it"
+printf '%s\n' "$OUT" | grep -q 'ISSUE CAP' && fail "(5b) a throttle was labeled as an issue cap ($OUT)"
+NOW=99000 step next
+printf '%s\n' "$OUT" | grep -q '^CLAIMED ' || fail "(5b) the throttled request was never re-injected ($OUT)"
+ok; echo "PASS (5b) a real Linear rate limit stays pending and is retried, never walled"
 
 # ══ (6) the linear backend reports WHY — the fact that was missing during the incident ═══════════
 # shellcheck source=/dev/null
@@ -266,6 +305,75 @@ NOW=7000 step add-item "$p" "A perfectly ordinary item"
 printf '%s\n' "$OUT" | grep -q 'DONE' || fail "(9b) the success report tail changed ($OUT)"
 printf '%s\n' "$OUT" | grep -q 'HERD-900' || fail "(9b) the backend's add stdout was swallowed ($OUT)"
 ok; echo "PASS (9b) the happy path is untouched — no entry, unchanged report tail"
+
+# ══ (11) A FAILED DURABLE WRITE NEVER REPORTS "SAVED" — the claim is kept, the request survives ══
+# The one invariant this file names non-negotiable ("never lose the original text") had no confirmation
+# on the single path that deletes the other copy. Simulate an unwritable retry directory: the claimed
+# .req must SURVIVE, the step must exit non-zero, and it must not print the reassuring SAVED line.
+rm -rf "$RETRY"
+printf 'upstream timeout\n' > "$T/fail-with"
+p="$(mkreq 700 "Must not vanish")"
+: > "$RETRY"                       # a FILE where the directory must go → mkdir -p fails
+NOW=9500 step add-item "$p" "Must not vanish"
+[ "$RC" -ne 0 ]  || fail "(11) a failed durable write exited 0 — the caller believes the text is safe"
+[ -e "$p" ]      || fail "(11) the ONLY surviving copy of the request was deleted after a failed durable write"
+printf '%s\n' "$OUT" | grep -q 'SAVED' && fail "(11) claimed the request was SAVED when the write failed ($OUT)"
+printf '%s\n' "$OUT" | grep -q 'DURABLE WRITE FAILED' || fail "(11) the failed write was not surfaced ($OUT)"
+rm -f "$RETRY" "$p"
+ok; echo "PASS (11) a failed durable write keeps the claim and refuses to claim the text is safe"
+
+# ══ (12) A RE-INJECTED REQUEST THE DRAINER SKIPS IS TERMINAL — it must not re-inject forever ══════
+# attempts is only bumped by create_retry_enqueue, so an entry whose retries all route to skip/amend/
+# update-state could never converge on CREATE_RETRY_MAX either.
+for verb in skip amend update-state; do
+  rm -rf "$RETRY"; printf 'upstream timeout\n' > "$T/fail-with"
+  p="$(mkreq "80${#verb}" "Terminal via $verb")"
+  NOW=9600 step add-item "$p" "Terminal via $verb"
+  TH="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
+  RQ="$Q/9700-retry-${TH}.req.mine"; printf 'Terminal via %s' "$verb" > "$RQ"
+  case "$verb" in
+    skip)         NOW=9700 step skip "$RQ" "not a backlog add" ;;
+    amend)        NOW=9700 step amend "$RQ" "HERD-22" "a note" ;;
+    update-state) NOW=9700 step update-state "$RQ" "HERD-22" "done" ;;
+  esac
+  [ "$(entries)" = "0" ] || fail "(12) '$verb' left the durable entry behind — it will re-inject forever"
+done
+ok; echo "PASS (12) skip / amend / update-state release a re-injected entry (no infinite re-inject)"
+
+# ══ (13) REINJECT IS DEDUPED — an entry already sitting in the queue is not queued twice ═════════
+rm -rf "$RETRY"; rm -f "$Q"/*.req "$Q"/*.mine 2>/dev/null
+printf 'upstream timeout\n' > "$T/fail-with"
+p="$(mkreq 900 "Dedupe me")"
+NOW=10000 step add-item "$p" "Dedupe me"
+DH="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
+reinject() { HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on \
+  HERD_CREATE_RETRY_NOW="$1" bash "$LIB" reinject "$Q" 2>/dev/null; }
+[ "$(reinject 20000)" = "1" ] || fail "(13) the due entry was not re-injected"
+# Same hash still queued (an unread .req) → a second, later reinject must not duplicate it.
+[ "$(reinject 40000)" = "0" ] || fail "(13) an entry already in the queue was re-injected twice"
+[ "$(ls "$Q"/*-retry-"$DH".req 2>/dev/null | grep -c .)" = "1" ] || fail "(13) a duplicate .req was written"
+rm -f "$Q"/*.req
+ok; echo "PASS (13) reinject skips an entry that is already sitting in the queue"
+
+# ══ (14) THE changelog BACKEND IS EXEMPT — its NOCHANGE means 'no staged edit', not 'refused' ════
+# Same reasoning as the `file` exemption: feeding it the retry queue would eventually render a
+# '🚫 tracker create BLOCKED' row for a condition no create can fix.
+rm -rf "$RETRY"
+sed 's/SCRIBE_BACKEND="stub"/SCRIBE_BACKEND="changelog"/' "$CFG" > "$CFG.changelog"
+cat > "$FAKEDIR/changelog.sh" <<'CLEOF'
+_backend_add_item() { _BACKEND_RESULT="NOCHANGE"; }
+_backend_list_open() { :; }
+CLEOF
+p="$(mkreq 950 "Changelog item")"
+set +e
+OUT="$( cd "$REPO" && HERD_CONFIG_FILE="$CFG.changelog" SCRIBE_BACKEND_DIR="$FAKEDIR" SCRIBE_POLL=0 \
+          JOURNAL_FILE="$JOURNAL" HERMETIC_TEST=1 CREATE_SELFHEAL=on \
+          bash "$STEP" add-item "$p" "Changelog item" 2>&1 )"
+RC=$?
+set -e
+[ "$RC" -eq 0 ]   || fail "(14) the changelog add exited $RC ($OUT)"
+[ ! -d "$RETRY" ] || fail "(14) a local (changelog) backend's NOCHANGE fed the tracker retry queue"
+ok; echo "PASS (14) local backends (file, changelog) never feed the tracker-create retry queue"
 
 # ══ (10) SWEEP RETROACTIVE LINKAGE ═══════════════════════════════════════════════════════════════
 # Source sweep.sh through agent-watch.sh's lib seam, exactly as `herd sweep` does.

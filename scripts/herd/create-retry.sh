@@ -83,20 +83,43 @@ print(hashlib.sha1(os.environ["TEXT"].encode()).hexdigest()[:16])' 2>/dev/null
 #   cap        the tracker refused because a plan/quota limit is reached (Linear's free-tier issue
 #              cap). PERMANENT — a human must raise the cap or archive issues.
 #   auth       the credential is missing, expired, or unauthorized. PERMANENT — a human must fix it.
-#   transient  a 5xx, a timeout, a rate limit, a dropped connection. RETRYABLE.
+#   transient  a 5xx, a timeout, a RATE LIMIT, a dropped connection. RETRYABLE.
 #   unknown    anything else, including an empty error (a backend that reports no reason). RETRYABLE,
 #              because refusing to retry an unclassified failure is how a recoverable request dies.
 #
-# Order is load-bearing: the cap patterns are tested BEFORE the rate-limit patterns, or Linear's
-# "usage limit exceeded" would read as a retryable rate limit.
+# ORDER IS LOAD-BEARING, and both directions are traps:
+#
+#   • A cap read as a flake wastes every retry and buries the one fact that predicted the rest of the
+#     incident. So the UNAMBIGUOUS cap keys and phrases are tested first.
+#   • A THROTTLE read as a wall is the same mistake in a mirror, and it is the easier one to make.
+#     Linear reports throttling as extensions.code=RATELIMITED, message="Rate limit exceeded", and
+#     _linear_error_text feeds this classifier exactly "<code> <message>". A generic `*limit exceeded*`
+#     alternative sitting in the cap arm therefore swallows every rate limit, marks it permanent on
+#     attempt 1, and tells the operator to go raise a cap they never hit. So the rate-limit patterns
+#     are tested BEFORE the generic limit-exceeded ones, which only catch what is left over.
+#
+# The unambiguous cap keys (`usage_limit_exceeded`, `usage limit`, `issue cap`, a quota/plan phrase)
+# already win against any rate-limit wording, so nothing is lost by demoting the generic alternatives.
 create_retry_class() {
     local e; e="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
     case "$e" in
-        *usage_limit_exceeded*|*usage\ limit*|*issue\ cap*|*limit_exceeded*|*limit\ exceeded*|*quota*|*plan\ limit*|*upgrade\ your*)
+        # 1. UNAMBIGUOUS cap — a named quota/plan/issue limit. Nothing here can read as throttling.
+        *usage_limit_exceeded*|*usage\ limit*|*issue\ cap*|*quota*|*plan\ limit*|*upgrade\ your*)
             printf 'cap' ;;
+        # 2. THROTTLING — before any generic "limit exceeded". Linear's key is RATELIMITED; other
+        #    trackers spell it rate_limit / rate-limit / "rate limit". A rate limit CLEARS ON ITS OWN,
+        #    which is precisely what the retry queue is for.
+        *ratelimit*|*rate_limit*|*rate-limit*|*rate\ limit*)
+            printf 'transient' ;;
+        # 3. AUTH — a credential a human must fix.
         *authentication*|*unauthenticated*|*unauthorized*|*forbidden*|*invalid\ api\ key*|*api\ key*|*401*|*403*)
             printf 'auth' ;;
-        *rate\ limit*|*ratelimit*|*timeout*|*timed\ out*|*temporarily*|*try\ again*|*connection*|*network*|*5[0-9][0-9]*|*internal\ server*)
+        # 4. A generic "limit exceeded" that survived arms 1–3 is a cap by elimination.
+        *limit_exceeded*|*limit\ exceeded*|*exceeded\ the\ limit*)
+            printf 'cap' ;;
+        # 5. The remaining transients. The 5xx test is ANCHORED to an http-status context (or a bare
+        #    status code) rather than a loose 3-digit run, so "Issue 501 not found" is not a 5xx.
+        *timeout*|*timed\ out*|*temporarily*|*try\ again*|*connection*|*network*|*internal\ server*|*bad\ gateway*|*service\ unavailable*|*http\ 5[0-9][0-9]*|*status\ 5[0-9][0-9]*|5[0-9][0-9])
             printf 'transient' ;;
         *)  printf 'unknown' ;;
     esac
@@ -145,6 +168,16 @@ _create_retry_backoff() {
 # re-wrapped line. Hashing THAT text would (a) fail to resolve the original entry on success, leaving
 # it to re-inject and file a duplicate forever, and (b) fork a SECOND entry on failure, defeating the
 # coalescing. Keying off the filename the engine itself minted removes the LLM from the identity path.
+# _create_retry_write_failed <why> — the durable write could not be made. Shout, journal, and let the
+# caller's non-zero return keep the ONLY surviving copy of the request. Never swallowed: this is the
+# failure that, silent, reproduces the incident exactly.
+_create_retry_write_failed() {
+    printf 'create-retry: DURABLE WRITE FAILED (%s) — the request text is NOT saved. The caller must keep its claim; do not drop the request. [HERD-267]\n' "$1" >&2
+    if command -v journal_append >/dev/null 2>&1; then
+        journal_append create_retry_write_failed reason "$1"
+    fi
+}
+
 create_retry_key() {
     local text="$1" override="${2:-}" dir
     if [ -n "$override" ]; then
@@ -177,15 +210,20 @@ create_retry_path_key() {
 # `herd scribe` once the human raises the cap re-files it.
 #
 # Journals scribe_add_failed (every attempt) and create_retry_permanent (on the transition), so the
-# console is not the only place a cap can be learned. Returns 0 always.
+# console is not the only place a cap can be learned.
+#
+# RETURN VALUE IS A PROMISE, and the caller must honor it. 0 = the request text is durably on disk (or
+# the feature is off / there was no text to save). NON-ZERO = the durable write FAILED, and the caller
+# still holds the ONLY copy — it must NOT delete the claimed request file. This is the one function in
+# the engine whose failure mode is the incident itself, so it does not get to fail silently.
 create_retry_enqueue() {
     local text="$1" class="${2:-unknown}" err="${3:-}" key="${4:-}" dir hash meta attempts first now next state max
     create_retry_enabled || return 0
     [ -n "$text" ] || return 0
-    dir="$(create_retry_dir)" || return 0
-    mkdir -p "$dir" 2>/dev/null || return 0
+    dir="$(create_retry_dir)" || { _create_retry_write_failed "no WORKTREES_DIR — cannot locate the retry queue"; return 1; }
+    mkdir -p "$dir" 2>/dev/null || { _create_retry_write_failed "cannot create $dir"; return 1; }
     hash="$(create_retry_key "$text" "$key")"
-    [ -n "$hash" ] || return 0
+    [ -n "$hash" ] || { _create_retry_write_failed "no digest tool (shasum/sha1sum/python3) — cannot key the entry"; return 1; }
     meta="$dir/$hash.meta"
     now="$(_create_retry_now)"
 
@@ -207,8 +245,11 @@ create_retry_enqueue() {
     # that ALREADY holds text is never overwritten — on a retry the caller's $text has passed through
     # the drainer's LLM, and the copy on disk is the ORIGINAL. Keeping the original is the point.
     if [ ! -f "$dir/$hash.text" ]; then
-        printf '%s' "$text" > "$dir/$hash.text" 2>/dev/null || return 0
+        printf '%s' "$text" > "$dir/$hash.text" 2>/dev/null \
+          || { _create_retry_write_failed "cannot write $dir/$hash.text"; return 1; }
     fi
+    # A missing meta means the entry is never due and never renders — the text would sit on disk
+    # unseen. That is a failed durable write too, so say so and keep the caller's copy alive.
     {
         printf 'attempts=%s\n' "$attempts"
         printf 'first_seen=%s\n' "$first"
@@ -216,7 +257,7 @@ create_retry_enqueue() {
         printf 'state=%s\n' "$state"
         printf 'last_class=%s\n' "$class"
         printf 'last_error=%s\n' "$(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-300)"
-    } > "$meta" 2>/dev/null || return 0
+    } > "$meta" 2>/dev/null || { _create_retry_write_failed "cannot write $meta"; return 1; }
 
     if command -v journal_append >/dev/null 2>&1; then
         journal_append scribe_add_failed reason "$class" attempts "$attempts" \
@@ -237,16 +278,22 @@ create_retry_enqueue() {
     printf '%s' "$hash"
 }
 
-# create_retry_resolve <text> [entry-hash] — the create for this request finally landed: drop its
-# durable entry. A first-time success calls this too and removes nothing (no entry exists), which is
-# what keeps the happy path byte-identical. Returns 0 always.
+# create_retry_resolve <text> [entry-hash] — this request reached a TERMINAL outcome (the create
+# landed, or the drainer routed it to a verb that files nothing): drop its durable entry so it stops
+# being re-injected. A first-time success calls this too and removes nothing (no entry exists), which
+# is what keeps the happy path byte-identical.
+#
+# Either argument alone is enough: `<text>` for an ordinary request, or `"" <entry-hash>` for a
+# terminal verb (skip / amend / update-state) that never sees the item text but was handed a
+# re-injected `*-retry-<hash>.req`. Without the latter form such an entry would re-inject on every
+# backoff expiry forever, never advancing its attempt count toward CREATE_RETRY_MAX. Returns 0 always.
 create_retry_resolve() {
     local dir hash
     create_retry_enabled || return 0
-    [ -n "${1:-}" ] || return 0
+    [ -n "${1:-}" ] || [ -n "${2:-}" ] || return 0
     dir="$(create_retry_dir)" || return 0
     [ -d "$dir" ] || return 0
-    hash="$(create_retry_key "$1" "${2:-}")"
+    hash="$(create_retry_key "${1:-}" "${2:-}")"
     [ -n "$hash" ] || return 0
     [ -f "$dir/$hash.meta" ] || [ -f "$dir/$hash.text" ] || return 0
     rm -f "$dir/$hash.meta" "$dir/$hash.text" 2>/dev/null || true
@@ -295,6 +342,11 @@ create_retry_reinject() {
     while IFS= read -r hash; do
         [ -n "$hash" ] || continue
         meta="$dir/$hash.meta"
+        # Already sitting in the queue (claimed or not) from an earlier re-injection whose drainer has
+        # not reached it yet — re-injecting again would file the same item twice.
+        if compgen -G "$q/*-retry-$hash.req" >/dev/null 2>&1 || compgen -G "$q/*-retry-$hash.req.mine" >/dev/null 2>&1; then
+            continue
+        fi
         cp "$dir/$hash.text" "$q/.tmp.retry.$hash" 2>/dev/null || continue
         mv "$q/.tmp.retry.$hash" "$q/${now}-retry-${hash}.req" 2>/dev/null || { rm -f "$q/.tmp.retry.$hash"; continue; }
         attempts="$(_create_retry_meta_get "$meta" attempts)"
