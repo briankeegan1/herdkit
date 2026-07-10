@@ -614,3 +614,20 @@ HERD_REPO="briankeegan1/herdkit"
 # slug-keyed ledger; a builder that dies AGAIN after its one respawn escalates and is never respawned
 # a second time, so it can never loop). Recommended for unattended/overnight runs.
 # DEAD_BUILDER_AUTORESPAWN="off"   # off (default) | on
+
+# ── Wedged builders: "finished" without a PR (HERD-278) ────────────────────────────────────────
+# A builder whose agent reads 'done' while its branch has NO open PR — and whose tree holds nothing
+# that could become one (no commits ahead of base, or uncommitted changes) — did not succeed. It was
+# tasked and abandoned the task mid-delivery. The watcher surfaces it as its own red attention row
+# ('⚠️ finished without PR · wake or inspect'), never as a ✅ and never as an 'awaiting task' spare.
+#
+# WEDGE_GRACE_MIN — minutes the signature must persist before the row appears. A builder inside
+# `gh pr create` shows the exact same signature for a few seconds, so this window is what keeps the
+# red verified-real. Default 10.
+# WEDGE_GRACE_MIN="10"
+#
+# WEDGE_AUTOWAKE — ships DORMANT. On, the watcher also sends ONE nudge to the wedged builder's agent
+# pane (the same driver send-text seam REVIEW_AUTOFIX bounces through) and verifies the agent flips
+# back to 'working'; at most once per wedge, and only after the grace window. This is the remedy a
+# coordinator applied by hand 3/3 times. Off (default) is detect-and-surface only, byte-identical.
+# WEDGE_AUTOWAKE="off"   # off (default) | on

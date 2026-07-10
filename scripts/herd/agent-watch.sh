@@ -341,6 +341,14 @@ DEAD_STATE="$TREES/.agent-watch-dead"
 # instead of looping. Only written when DEAD_BUILDER_AUTORESPAWN is opted in (byte-inert when off).
 # See the "Dead-builder AUTO-RESPAWN" helpers below.
 DEAD_RESPAWN_STATE="$TREES/.agent-watch-respawn"
+# Wedged-builder ledger (HERD-278), PARALLEL to $DEAD_STATE: one line per active worktree slug whose
+# agent is ALIVE and reads 'done' while its branch has NO open PR and its tree carries nothing that
+# could become one (no commits ahead of base, or uncommitted changes). Format
+# "<slug> <first-seen-epoch> <state>", state ∈ pending | notified | woken. A builder mid-`gh pr create`
+# transiently looks exactly like this, so the slug is surfaced only once the signature has PERSISTED
+# past a grace window (WEDGE_GRACE_MIN). Any escape (a PR appears, the agent goes back to working)
+# clears the record. See the "Wedged-builder detection" helpers below.
+WEDGE_STATE="$TREES/.agent-watch-wedged"
 # Healthcheck ledger, PARALLEL to the review ledgers: one line per healthcheck ATTEMPT
 # ("<epoch> <pr#> <slug> <attempt> <outcome>"), outcome ∈ clean | dataenv | code-error | flaky-pass.
 # This is the healthcheck analogue of $REVIEW_STATE — an append-only provenance record so a red row
@@ -879,6 +887,9 @@ _fmt_age() {
 #                                          reads apart from a forgotten one (2h, reap it). Calm — benign.
 #                                          RESERVED (HERD-164) for a genuinely UNASSIGNED, pre-PR builder:
 #                                          a merged/closed slug is 'retiring…', never a spare.
+#   • finished without PR · wake or …    — YOUR move; the agent reads 'done' but its branch has no PR
+#                                          and nothing that could become one (HERD-278). A WEDGE, never
+#                                          a ✅ and never an 'awaiting task' spare. Red, with the age.
 #   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
 #                                          (HERD-224). Neutral/degraded — never the definitive
 #                                          "awaiting task" claim from a lookup FAILURE.
@@ -906,6 +917,25 @@ _row_awaiting_task() {
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_wedged <slug-cell> <age> [woken] — the console row for a WEDGED builder (HERD-278): an agent
+# that reads 'done' over a branch with no PR and nothing that could become one. It is NOT a spare
+# ("awaiting task" would invite you to retire a builder that never delivered its work) and it is NOT
+# a success — three live incidents on 2026-07-09 were coordinator-woken by hand. RED (⚠️): the herd
+# will not clear this on its own, so it is YOUR move, and the remedy is named. Carries the age it has
+# been wedged so a 10m-old one reads apart from an all-night one.
+# With [woken] non-empty the auto-wake nudge (WEDGE_AUTOWAKE, default off) has just been delivered —
+# the herd's move again, so the row is calm 🔁 and says so rather than asking you to do it twice.
+_row_wedged() {
+  local _sl="$1" _age="$2" _woken="${3:-}"
+  if [ -n "$_woken" ]; then
+    printf '    %s🔁%s %s%s%s %sfinished without PR · auto-wake sent · %s%s' \
+      "$C_CYAN" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_CYAN" "$_age" "$C_RESET"
+  else
+    printf '    %s⚠️%s  %s%s%s %sfinished without PR · wake or inspect · %s%s' \
+      "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_age" "$C_RESET"
+  fi
 }
 
 # _row_retirement <slug-cell> <slug> <state> <detail> — the console row for a slug the retirement
@@ -1994,25 +2024,121 @@ _spawn_inflight_file() {
   printf '%s%s-%s-%s' "$SPAWN_INFLIGHT_PREFIX" "$1" "$(_spawn_slug_key "$2")" "$(_spawn_slug_key "$3")"
 }
 
+# ── Lane workers are supervised processes too (HERD-268) ─────────────────────────────────────────
+# The two populations below are exactly the shape lifecycle.sh (HERD-193) supervises: agent-watch is
+# their OWNER, their marker already carries a pid + start-time (LIVENESS), and they have a natural
+# DEADLINE. What they lacked was the bookkeeping — so a lane worker orphaned by a watcher killed
+# mid-dispatch left a marker and a process nobody could attribute. They are now registered at dispatch
+# and RETIRED at every teardown point they already had:
+#
+#   completed  the worker's body returned (the fast path, inside its own subshell)
+#   swept      `_spawn_inflight_sweep` reaped its marker: the pid is dead, or recycled into another
+#              process. This is the population's existing corpse sweep — no new actuator, no new kill.
+#
+# `lifecycle_sweep` (the per-tick supervision leg) is only the BACKSTOP: a record whose marker sweep
+# never ran is reconciled there as `exited`, and one still ALIVE past its deadline is journaled +
+# inboxed as `lifecycle_expired`. Nothing here kills anything.
+#
+# THE THREE REASONS ARE A JOURNAL PREFERENCE, NOT A STATE MACHINE. Every one of them converges on the
+# same end state (record gone, worker accounted for), and the races between them are benign by
+# construction: a worker whose own `rm` lands between the sweep's `[ -e ]` and its `_marker_live` is
+# retired `swept` rather than `completed`; a worker that finishes before the parent registers it is
+# retired `exited` by the backstop. `lifecycle_retire`'s file guard and its `rm` are not atomic, so a
+# double-retire is VANISHINGLY narrow rather than impossible — and its only cost is a second journal
+# line for a worker that is, either way, correctly accounted for.
+#
+# PID RECYCLING is handled where the marker is: `_marker_live` compares the recorded start-time before
+# trusting `kill -0`, so a recycled lane pid is reaped + retired by `_spawn_inflight_sweep` on the next
+# tick, well inside `_LC_LANE_DEADLINE`. (lifecycle.sh's own `_lc_pid_live` has no such guard, so a
+# record that lost its marker AND had its pid recycled could reach `lifecycle_expired` — one
+# observability row, never a gate, and the same exposure `reviewer`/`health-worker` already carry.)
+#
+# The MARKER NAME is the record key: `<prefix><kind>-<slug>-<uniq>` is already unique per dispatch
+# (_SPAWN_DISPATCH_SEQ), so the lifecycle id needs no second identity to invent — and a corpse marker
+# found by a sweep that never saw its dispatch still resolves to the record that dispatch wrote.
+
+# _lane_lifecycle_key <marker> — print '<population>\t<id>' for a lane/resolve marker; return 1 for any
+# other path (a marker kind this leg does not supervise). Pure; no side effects.
+_lane_lifecycle_key() {
+  local _llk_rest="${1##*/}"
+  _llk_rest="${_llk_rest#"${SPAWN_INFLIGHT_PREFIX##*/}"}"
+  case "$_llk_rest" in
+    lane-*)    printf 'lane-worker\t%s'   "${_llk_rest#lane-}" ;;
+    resolve-*) printf 'resolver-lane\t%s' "${_llk_rest#resolve-}" ;;
+    *)         return 1 ;;
+  esac
+}
+
+# _lane_lifecycle_spawn <marker> <pid> — register the contract for a just-forked lane worker.
+# _lane_lifecycle_retire <marker> <reason> — close it at one of the teardown points above.
+#
+# Both return IMMEDIATELY unless lifecycle.sh is sourced AND LIFECYCLE_CONTRACTS is on — the dispatch
+# path stays byte-inert by default, and the hermetic drain tests may extract these functions ALONE, with
+# no library behind them. lifecycle_retire refuses to journal a retirement it cannot evidence, so the
+# ordinary worker-vs-sweep race resolves to ONE journal line. Always 0.
+_lane_lifecycle_spawn() {
+  command -v lifecycle_enabled >/dev/null 2>&1 && lifecycle_enabled || return 0
+  local _lls_k; _lls_k="$(_lane_lifecycle_key "$1")" || return 0
+  [ -n "$_lls_k" ] || return 0
+  lifecycle_spawn "${_lls_k%%$'\t'*}" "${_lls_k#*$'\t'}" "pid:$2" agent-watch
+  return 0
+}
+
+_lane_lifecycle_retire() {
+  command -v lifecycle_enabled >/dev/null 2>&1 && lifecycle_enabled || return 0
+  local _llr_k; _llr_k="$(_lane_lifecycle_key "$1")" || return 0
+  [ -n "$_llr_k" ] || return 0
+  lifecycle_retire "${_llr_k%%$'\t'*}" "${_llr_k#*$'\t'}" "${2:-done}"
+  return 0
+}
+
 # _spawn_inflight_bg <marker> <fn> [args…] — run <fn> in a background subshell, recording its pid in
 # <marker> BEFORE returning, and clearing the marker when it finishes. Never blocks; always returns 0.
 # The worker's own `rm` is the fast path; _spawn_inflight_sweep is the correctness one (it collects
 # markers left by a watcher killed mid-spawn, and the marker a worker that exited BEFORE the parent
 # got to write it — a race whose only cost is one skipped drain tick).
+#
+# The worker closes its own lifecycle contract (HERD-268) right where it clears its marker, so a clean
+# lane is accounted for the moment it lands rather than waiting on the sweep's exit grace.
+#
+# `_marker_write` STAYS THE PARENT'S FIRST ACT AFTER THE FORK, ahead of the lifecycle bookkeeping. The
+# marker is not only a corpse-sweep token: it is the RESOLVER LANE LOCK'S HOLDER IDENTITY, and
+# `_resolve_lane_lock_acquire` breaks a held lock iff `! _marker_live <holder>` — for which a marker
+# that does not exist YET reads exactly like a dead one. `_lane_lifecycle_spawn` costs a dozen forks
+# (mktemp, mv, date, journal_append), each of which hands the CPU to the freshly-forked lane, whose very
+# first act is to take that lock. Registering before writing the marker therefore let a queued sibling
+# lane observe a live holder as dead, journal `resolver_lane_lock_broken reason=holder-dead` about it,
+# and run a second `git worktree add` against the shared $MAIN — the exact overlap HERD-237's
+# serialization exists to prevent. Marker first, always: bookkeeping never precedes a safety rail.
+#
+# What that costs is only a JOURNAL REASON, never state. A `true`-fast worker can remove the marker and
+# run its own retire before the parent has written the record; that retire is then a silent no-op
+# (lifecycle_retire never journals a retirement it cannot evidence) and the record it could not find is
+# left behind with no marker to collect it. `lifecycle_sweep`'s exited-after-grace reconcile is built
+# for precisely that: the worker is still accounted for, as `exited` rather than `completed`. Trading a
+# lock-safety window for a nicer retire reason would be the wrong way round.
+#
+# With LIFECYCLE_CONTRACTS off both helpers return before touching anything, so the dispatch path is the
+# pre-HERD-268 sequence, fork-for-fork.
 _spawn_inflight_bg() {
   local _sib_marker="$1"; shift
-  ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true ) &
+  ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true; _lane_lifecycle_retire "$_sib_marker" completed ) &
   _SPAWN_INFLIGHT_BG_PID="$!"
   _marker_write "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
+  _lane_lifecycle_spawn "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
   return 0
 }
 
-# _spawn_inflight_sweep — drop every spawn marker whose pid is dead (or recycled into another process).
+# _spawn_inflight_sweep — drop every spawn marker whose pid is dead (or recycled into another process),
+# and retire that worker's lifecycle contract with it: this sweep IS the lane populations' corpse sweep
+# (HERD-268), so a worker orphaned by a watcher killed mid-dispatch is accounted for on the next tick.
 _spawn_inflight_sweep() {
   local _sis_f
   for _sis_f in "$SPAWN_INFLIGHT_PREFIX"*; do
     [ -e "$_sis_f" ] || continue
-    _marker_live "$_sis_f" 2>/dev/null || rm -f "$_sis_f" 2>/dev/null || true
+    if _marker_live "$_sis_f" 2>/dev/null; then continue; fi
+    rm -f "$_sis_f" 2>/dev/null || true
+    _lane_lifecycle_retire "$_sis_f" swept
   done
 }
 
@@ -9195,6 +9321,243 @@ _maybe_autorespawn_dead_builder() {
   printf '%s' "$_ar_verdict"
 }
 
+# ── Wedged-builder detection (HERD-278) ───────────────────────────────────────────────────────────
+# GROUNDED in three live incidents on 2026-07-09: a builder's agent read 'done', its worktree still
+# existed, and it had opened NO PR. The console called each one a benign spare — "awaiting task ·
+# assign or retire" — which reads as "this builder has no work", exactly backwards: it HAD work, it
+# just never delivered it. The coordinator woke all three by hand and each finished the job. Nothing
+# in the console said to.
+#
+# A wedge is neither of the two states the watcher already knows. It is not DEAD (the agent is alive
+# and listed — the dead reconciliation correctly rules death out), and it is not a SPARE (a spare was
+# never tasked; a wedge was, and abandoned the task mid-delivery). So it gets its own row and its own
+# ledger, sitting between them in the PR-less/non-working branch of the tick.
+#
+# THE SIGNATURE — all four, simultaneously:
+#   • agent_status reads exactly 'done'      (an 'idle' agent is a genuine spare; 'working' is building)
+#   • the open-PR roster positively has NO PR (never inferred from a `gh pr list` FAILURE — the caller
+#                                              only reaches here when PRS_LOOKUP_OK=1)
+#   • no commits ahead of base OR a dirty tree (i.e. the tree holds nothing that is already a pushable,
+#                                              finished commit series)
+#   • it has PERSISTED past WEDGE_GRACE_MIN   (a builder mid-`gh pr create` shows this exact signature
+#                                              for a few seconds — no-false-red, so it must age in)
+#
+# WHY the third clause looks inverted: a done builder with commits ahead AND a clean tree has already
+# produced the thing a PR is made of. Its PR is a push and an API call away — the honest reading is
+# "in flight", not "wedged" — and PUSH_GATE=human parks precisely there on purpose (that branch is
+# handled earlier in the tick). A done builder with NOTHING committed never started delivering; a done
+# builder with uncommitted changes stopped halfway. Those two are the wedge, and they are exactly the
+# three incidents. (See _classify_wedged_builder for the token-by-token contract.)
+#
+# DISPLAY + JOURNAL ONLY by default. The remedy the coordinator applied by hand — one nudge to the
+# agent pane — ships DORMANT behind WEDGE_AUTOWAKE (below), because a wake types into a live agent.
+
+# _wedge_grace_secs — how long the WEDGE signature must persist before the row surfaces. Configurable
+# via WEDGE_GRACE_MIN (minutes); non-numeric/unset falls back to 10 minutes — comfortably longer than
+# a `gh pr create` round-trip (the false-red this grace exists to prevent), short enough that a wedged
+# overnight builder is found on the next glance at the console. A literal 0 is honored (tests).
+_wedge_grace_secs() {
+  case "${WEDGE_GRACE_MIN:-}" in
+    ''|*[!0-9]*) printf '%s' 600 ;;
+    *)           printf '%s' $(( WEDGE_GRACE_MIN * 60 )) ;;
+  esac
+}
+
+# wedge_first_seen <slug> — the recorded first-seen epoch for this slug's WEDGE signature, or nothing.
+wedge_first_seen() {
+  [ -s "$WEDGE_STATE" ] || return 0
+  awk -v s="$1" '$1==s{f=$2} END{if(f!="")print f}' "$WEDGE_STATE" 2>/dev/null || true
+}
+# wedge_state_of <slug> — the recorded state word (pending | notified | woken), or nothing.
+wedge_state_of() {
+  [ -s "$WEDGE_STATE" ] || return 0
+  awk -v s="$1" '$1==s{st=$3} END{print st}' "$WEDGE_STATE" 2>/dev/null || true
+}
+# wedge_notified <slug> — true iff the ⚠️ notification already fired for this slug's current record
+# (dedup guard, so a wedged builder notifies exactly once, not every tick). 'woken' implies notified.
+wedge_notified() {
+  case "$(wedge_state_of "$1")" in notified|woken) return 0 ;; *) return 1 ;; esac
+}
+# wedge_woken <slug> — true iff the auto-wake nudge was already delivered for this record (at-most-once
+# per wedge; a slug that wedges AGAIN after escaping gets a fresh record and so a fresh nudge).
+wedge_woken() { [ "$(wedge_state_of "$1")" = "woken" ]; }
+
+# _wedge_upsert <slug> <first-seen> <state> — drop any prior line for this slug, append the fresh one
+# (temp+mv), mirroring _dead_upsert.
+_wedge_upsert() {
+  local _wu_tmp="${WEDGE_STATE}.$$"
+  { [ -f "$WEDGE_STATE" ] && grep -v "^$1 " "$WEDGE_STATE" 2>/dev/null
+    printf '%s %s %s\n' "$1" "$2" "$3"
+  } > "$_wu_tmp" 2>/dev/null && mv "$_wu_tmp" "$WEDGE_STATE" 2>/dev/null || rm -f "$_wu_tmp" 2>/dev/null
+}
+# record_wedge_seen <slug> <epoch> — first sighting of the signature: record the anchor epoch, pending.
+record_wedge_seen() { _wedge_upsert "$1" "$2" pending; }
+# record_wedge_state <slug> <state> — flip the record's state word, PRESERVING its first-seen anchor.
+record_wedge_state() { local _rws_f; _rws_f="$(wedge_first_seen "$1")"; _wedge_upsert "$1" "${_rws_f:-$(_now)}" "$2"; }
+# clear_wedge <slug> — drop the slug's record (it escaped: a PR opened, or it went back to working).
+clear_wedge() {
+  [ -s "$WEDGE_STATE" ] || return 0
+  local _cw_tmp="${WEDGE_STATE}.$$"
+  grep -v "^$1 " "$WEDGE_STATE" 2>/dev/null > "$_cw_tmp"
+  mv "$_cw_tmp" "$WEDGE_STATE" 2>/dev/null || rm -f "$_cw_tmp" 2>/dev/null
+}
+
+# _classify_wedged_builder <agent-status> <has-pr> <commits-ahead> <dirty> <first-seen> <now> <grace>
+# — the PURE verdict for a live, non-working builder. Echoes exactly one token:
+#   NOT_WEDGED — an escape hatch holds (an open PR; an agent that is not 'done'; or a finished,
+#                committed, clean tree whose PR is merely in flight) ⇒ the caller clears any record
+#   PENDING    — the full WEDGE signature holds but has NOT yet persisted past <grace> (no prior
+#                first-seen, or now - first-seen < grace) ⇒ hold; the row stays whatever it was
+#   WEDGED     — the signature has held continuously past the grace window ⇒ surface ⚠️ + notify
+# <has-pr>/<dirty> are "1"/"0"; <commits-ahead> is an integer (a non-numeric probe reads as 0);
+# <first-seen> is the recorded anchor epoch (empty on the first sighting of the signature).
+_classify_wedged_builder() {
+  local astatus="$1" has_pr="${2:-0}" commits="${3:-0}" dirty="${4:-0}" first_seen="$5" now="${6:-0}" grace="${7:-0}"
+  case "$commits" in ''|*[!0-9]*) commits=0 ;; esac
+  # An open PR is the whole point of a builder: it delivered. Never a wedge.
+  [ "$has_pr" = "1" ] && { printf 'NOT_WEDGED'; return 0; }
+  # Only a 'done' agent can be wedged. 'working' is building; 'idle' is a genuine unassigned spare;
+  # an EMPTY status means no agent record at all — that is the dead reconciliation's business.
+  [ "$astatus" = "done" ] || { printf 'NOT_WEDGED'; return 0; }
+  # Committed AND clean: the work exists as a pushable commit series, so its PR is in flight (or held
+  # by PUSH_GATE). Nothing to wake. Only an empty tree or a half-finished dirty one is a wedge.
+  [ "$commits" -gt 0 ] && [ "$dirty" != "1" ] && { printf 'NOT_WEDGED'; return 0; }
+  # Full wedge signature. Age it in past the grace window so a builder inside `gh pr create` — which
+  # shows this exact signature for a few seconds — is never flagged (no-false-red).
+  if [ -z "$first_seen" ] || [ "$(( now - first_seen ))" -lt "$grace" ]; then
+    printf 'PENDING'; return 0
+  fi
+  printf 'WEDGED'
+}
+
+# _wedge_commits_ahead <worktree> — commits this branch carries that the base does not. A git failure
+# reads as 0 (an uninspectable tree has produced nothing we can prove), which only ever makes the
+# signature MORE wedge-like; the grace window, not this probe, is what prevents a false red.
+_wedge_commits_ahead() {
+  local _wc; _wc="$(git -C "$1" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || printf 0)"
+  case "$_wc" in ''|*[!0-9]*) _wc=0 ;; esac
+  printf '%s' "$_wc"
+}
+# _wedge_dirty <worktree> — 1 iff the tree has staged/unstaged/untracked changes, else 0.
+_wedge_dirty() {
+  [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ] && printf 1 || printf 0
+}
+
+# ── Wedge AUTO-WAKE (bounded, opt-in, DEFAULT OFF) ────────────────────────────────────────────────
+# The remedy is not clever: the coordinator sent the wedged agent one nudge and it finished the job,
+# three times out of three. WEDGE_AUTOWAKE=on lets the watcher send that same nudge itself, through
+# the SAME driver seam the auto-refix bounce uses (`herd_driver_send_text` = pane run + explicit Enter
+# — HERD-186; typing without the Enter leaves the prompt sitting in the buffer and the agent never
+# wakes), then verifies agent_status flips to "working". Journaled exactly like a refix wake.
+# Bounded by two rails: it fires AT MOST ONCE per wedge record (a nudge that did not take escalates to
+# the red row rather than typing into the same pane every tick), and only ever at the WEDGED crossing
+# — never at PENDING, so the grace window still governs. SHIPS DORMANT: with the key off the function
+# is a hard no-op that touches no pane, writes no journal event, and leaves the row byte-identical.
+
+# _wedge_autowake_on — true iff WEDGE_AUTOWAKE opts in. DEFAULT OFF: only on|true|yes|1 enable it.
+_wedge_autowake_on() {
+  case "${WEDGE_AUTOWAKE:-off}" in
+    on|true|yes|1) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# _wedge_wake_prompt <slug> — the nudge text. Names the observation, not a diagnosis: the agent may
+# have finished and forgotten the PR, or stopped halfway. Both remedies are one line apart.
+_wedge_wake_prompt() {
+  printf 'Your worktree for %s has no open PR and your agent has stopped.\nIf the work is finished: run the healthcheck, commit, push, and open the PR with `gh pr create`.\nIf it is not finished: resume where you left off, then do the same.\nDo not merge the PR and do not edit BACKLOG.md.' "$1"
+}
+
+# _maybe_autowake_wedged_builder <slug> — drive the bounded auto-wake for ONE slug that has just
+# crossed into WEDGED. Echoes the verdict (OFF | DRYRUN | ALREADY | NO_PANE | WOKE | NO_WAKE) for tests
+# and for the caller's row choice; spends the at-most-once budget only on a delivered nudge. Never runs
+# under DRYRUN (logs intent instead), mirroring _maybe_autorespawn_dead_builder.
+_maybe_autowake_wedged_builder() {
+  local _aw_slug="$1" _aw_pane _aw_before _aw_after _aw_woke=0
+  # OFF ⇒ hard no-op: no pane lookup, no journal, no ledger write. The ⚠️ row already fired.
+  _wedge_autowake_on || { printf 'OFF'; return 0; }
+  wedge_woken "$_aw_slug" && { printf 'ALREADY'; return 0; }
+  if [ -n "${DRYRUN:-}" ]; then
+    printf '🐑 (dry-run) would auto-wake wedged builder %s\n' "$_aw_slug" >&2
+    printf 'DRYRUN'; return 0
+  fi
+  # The agent reads 'done', not 'working' — its TUI is still up, so the raw prompt submit is the wake
+  # path (the same one REVIEW_AUTOFIX uses for done builders; `claude --continue` would be typed into
+  # that TUI as literal text). _find_builder_pane_id_any matches idle AND done panes.
+  _aw_pane="$(_find_builder_pane_id_any "$_aw_slug")"
+  if [ -z "$_aw_pane" ]; then
+    journal_append wedge_wake_result slug "$_aw_slug" woke 0 reason "no agent pane to deliver the nudge to"
+    printf 'NO_PANE'; return 0
+  fi
+  _aw_before="$(_agent_status "$_aw_slug")"
+  journal_append wedge_wake slug "$_aw_slug" agent_status_before "${_aw_before:-unknown}"
+  herd_driver_send_text "$_aw_pane" "$(_wedge_wake_prompt "$_aw_slug")"
+  _wait_agent_working "$_aw_slug" "${HERD_REFIX_WAIT_TIMEOUT:-15}" && _aw_woke=1
+  _aw_after="$(_agent_status "$_aw_slug")"
+  journal_append wedge_wake_result slug "$_aw_slug" agent_status_before "${_aw_before:-unknown}" \
+    agent_status_after "${_aw_after:-unknown}" woke "$_aw_woke"
+  # Spend the budget on DELIVERY, not on success: the prompt is in that pane either way, and re-typing
+  # it every tick is exactly the runaway this rail exists to avoid. A nudge that did not wake the agent
+  # leaves the record 'notified', so the next tick paints the honest red row again.
+  if [ "$_aw_woke" = "1" ]; then
+    record_wedge_state "$_aw_slug" woken
+    herd_driver_notify "🔁 wedged builder woken: ${_aw_slug}" \
+      "${_aw_slug}: finished without a PR — auto-wake nudge delivered, agent is working again" default
+    printf 'WOKE'
+  else
+    printf 'NO_WAKE'
+  fi
+}
+
+# _reconcile_wedged_builder <slug> <worktree> <agent-status> — drive the ledger + notification + the
+# (dormant) auto-wake for ONE PR-less, non-working builder, and echo the verdict
+# (NOT_WEDGED | PENDING | WEDGED). Called from the tick's no-PR/non-working branch, AFTER the dead
+# reconciliation has ruled death out — so the agent here is alive and listed. has_pr is 0 by
+# construction (the caller only reaches this on a PR-less slug, and only when PRS_LOOKUP_OK=1).
+# Records the first-seen anchor on the first sighting, clears it the instant the slug escapes, and
+# journals + notifies exactly once when a slug crosses into WEDGED. The ⚠️ notification is suppressed
+# only when the (dormant) auto-wake actually WOKE the agent — that path fires its own 🔁 notification,
+# and shouting "wake or inspect it" at an operator whose builder is already working again is the same
+# false-red this item exists to delete.
+_reconcile_wedged_builder() {
+  local _rw_slug="$1" _rw_wt="$2" _rw_astatus="$3"
+  local _rw_now _rw_grace _rw_first _rw_verdict
+  _rw_now="$(_now)"
+  _rw_grace="$(_wedge_grace_secs)"
+  _rw_first="$(wedge_first_seen "$_rw_slug")"
+  # The git probes only run for a 'done' agent — the one status that can be wedged. Every other status
+  # short-circuits to NOT_WEDGED without touching git, so the common idle/spare tick is unchanged.
+  local _rw_commits=0 _rw_dirty=0
+  if [ "$_rw_astatus" = "done" ]; then
+    _rw_commits="$(_wedge_commits_ahead "$_rw_wt")"
+    _rw_dirty="$(_wedge_dirty "$_rw_wt")"
+  fi
+  _rw_verdict="$(_classify_wedged_builder "$_rw_astatus" 0 "$_rw_commits" "$_rw_dirty" \
+    "${_rw_first:-}" "$_rw_now" "$_rw_grace")"
+  case "$_rw_verdict" in
+    NOT_WEDGED)
+      [ -n "$_rw_first" ] && clear_wedge "$_rw_slug" ;;
+    PENDING)
+      [ -n "$_rw_first" ] || record_wedge_seen "$_rw_slug" "$_rw_now" ;;
+    WEDGED)
+      if ! wedge_notified "$_rw_slug"; then
+        record_wedge_state "$_rw_slug" notified
+        journal_append builder_wedged slug "$_rw_slug" first_seen "${_rw_first:-$_rw_now}" \
+          commits "$_rw_commits" dirty "$_rw_dirty"
+        # Ship-dormant remedy: a hard no-op (verdict OFF) unless WEDGE_AUTOWAKE opted in. Fires ONCE
+        # per crossing, guarded by the wedge_notified dedup above, exactly like the dead-builder
+        # auto-respawn. The JOURNAL event above is unconditional — a wedge is always recorded, whether
+        # or not anything was done about it.
+        if [ "$(_maybe_autowake_wedged_builder "$_rw_slug")" != "WOKE" ]; then
+          # Nobody is on it: the default detect-and-surface path, or a nudge that failed to land.
+          herd_driver_notify "⚠️ builder finished without a PR: ${_rw_slug}" \
+            "${_rw_slug}: agent done, no PR, nothing pushable — wake or inspect it" default
+        fi
+      fi ;;
+  esac
+  printf '%s' "$_rw_verdict"
+}
+
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
 # WHY: every feature worktree shares ONE git object store and one .git/worktrees lock namespace, so
 # two full healthcheck suites running at once race on shared git locks (empirically: concurrent
@@ -11087,6 +11450,9 @@ EOF
           _live="$(_agent_liveness "$slug")"
           case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
             DEAD)
+              # A dead builder is not a wedge — 💀 is the louder, truer row, and a corpse cannot be
+              # woken. Drop any wedge record so the two ledgers never both claim the same slug.
+              clear_wedge "$slug"
               if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
               else
@@ -11094,11 +11460,25 @@ EOF
               fi
               FLAIR_STATE[i]="dead" ;;
             *)
-              # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
-              # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
-              # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
-              DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
-              FLAIR_STATE[i]="idle" ;;
+              # ALIVE (or still PENDING death): the agent is listed. Two very different builders land
+              # here. HERD-278: one whose agent reads 'done' over a branch with no PR and nothing
+              # pushable is a WEDGE — it was tasked and abandoned the task mid-delivery — and calling
+              # it a spare ("assign or retire") is the lie that hid three of them on 2026-07-09.
+              # Everything else is a genuine spare. A wedge must age past the grace window first, so a
+              # builder inside `gh pr create` keeps the row it had.
+              _wedge="$(_reconcile_wedged_builder "$slug" "$dir" "$astatus")"
+              if [ "$_wedge" = "WEDGED" ]; then
+                _wfirst="$(wedge_first_seen "$slug")"; _wwoke=""
+                if wedge_woken "$slug"; then _wwoke="woken"; fi
+                DISPLAY[i]="$(_row_wedged "$sl" "$(_fmt_age "$(( $(_now) - ${_wfirst:-$(_now)} ))")" "$_wwoke")"
+                FLAIR_STATE[i]="attention"
+              else
+                # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
+                # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
+                # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
+                DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
+                FLAIR_STATE[i]="idle"
+              fi ;;
           esac
         fi
       else
@@ -11108,6 +11488,10 @@ EOF
         # clears no-op when absent) — a leftover sentinel must never survive to re-trigger a false park
         # on a later idle tick. Also drop any stale clean-select record (the same singleton could re-park).
         clear_limit "$slug" "$dir"; clear_sendkeys "$slug"
+        # A working agent is DEFINITIVELY not wedged (HERD-278) — it is delivering. Drop any wedge
+        # record so a builder that was woken (by the auto-wake, or by a human) and later stops again
+        # must serve the FULL grace window before it re-surfaces. No-ops when absent.
+        clear_wedge "$slug"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or

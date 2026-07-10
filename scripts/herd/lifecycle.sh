@@ -49,6 +49,7 @@
 # REUSES the timeout each population already has, so this file introduces no new tunables:
 #   reviewer / health-worker   → REVIEW_INFLIGHT_TIMEOUT / HEALTH_INFLIGHT_TIMEOUT (the corpse sweep's)
 #   scribe-drainer / research-drainer → DRAINER_HEARTBEAT_TIMEOUT (the reclaim gate's)
+#   lane-worker / resolver-lane → _LC_LANE_DEADLINE (see below — they have no timeout of their own)
 #   anything else              → _LC_FALLBACK_DEADLINE
 #
 # ── What each population actually gets from this leg ─────────────────────────────────────────────
@@ -57,8 +58,16 @@
 # worker is surfaced by the corpse sweep, and what this leg adds for them is the exited/reconcile path:
 # a worker that died before its teardown ran is still accounted for. `lifecycle_expired` is their
 # BACKSTOP — it fires only when the corpse sweep is lagging or disabled. The DRAINERS have no corpse
-# sweep at all, so the expiry path is their primary surface, and the resolver/builder populations
+# sweep at all, so the expiry path is their primary surface, and the resolver/builder AGENT populations
 # (unwired here, on the HERD-225 / stall-detector rails) are what the routes are reserved for.
+#
+# The LANE WORKERS (HERD-268) are the two background subshells HERD-237 forks off the tick — the
+# builder lane (`.spawn-inflight-lane-*`) and the resolver lane (`.spawn-inflight-resolve-*`). They
+# are shaped like the gate workers: agent-watch forks them, their marker records a pid + start-time,
+# and `_spawn_inflight_sweep` is their corpse sweep (it reaps the marker of a dead worker on EVERY
+# tick, and retires the record with it). What this leg adds is the same thing it adds for a gate
+# worker: a leaked lane worker — one whose watcher died mid-dispatch, or that outlived any plausible
+# spawn — is ATTRIBUTABLE instead of orphaning silently.
 #
 # One honest limit on reviewer LIVENESS: the recorded pid is the herd-review.sh POLLER, not the
 # reviewer's agent pane, which outlives it. Pane orphans stay HERD-113's `_retire_reviewer_pane` /
@@ -83,6 +92,17 @@
 # literal, not a config key: the whole point is to reuse each population's real timeout, and a
 # catch-all knob would invite operators to tune the wrong dial. 30 min matches the gate families.
 _LC_FALLBACK_DEADLINE=1800
+
+# _LC_LANE_DEADLINE — the deadline for the two backgrounded lane-worker populations (HERD-268). Also a
+# literal: a lane worker has no timeout of its own to reuse, and its own corpse sweep
+# (`_spawn_inflight_sweep`) keys on the marker pid, not on age. It is deliberately GENEROUS — the same
+# 30 min the gate families get — because a lane's SPAWN EPOCH is stamped at dispatch, before it queues:
+# resolver lanes serialize behind `_resolve_lane_lock_acquire`, so with K conflicting PRs the k-th lane
+# legitimately idles for (k-1) x lane-duration before it does any work. A tight "a spawn takes ~2 min"
+# deadline would surface that queued lane as hung — a false red on the operator inbox, which is exactly
+# what this observability leg must never manufacture. Past 30 min, a lane worker is unaccounted for on
+# any reading.
+_LC_LANE_DEADLINE=1800
 
 # _LC_EXIT_GRACE — how long the sweep waits, after first observing that a pid-probed process has
 # EXITED, before retiring the record itself with the generic reason `exited`. The population's own
@@ -136,6 +156,7 @@ lifecycle_deadline() {
     reviewer)                        _lc_num "${REVIEW_INFLIGHT_TIMEOUT:-}" 1800 ;;
     health-worker)                   _lc_num "${HEALTH_INFLIGHT_TIMEOUT:-}" 1800 ;;
     scribe-drainer|research-drainer) _lc_num "${DRAINER_HEARTBEAT_TIMEOUT:-}" 900 ;;
+    lane-worker|resolver-lane)       printf '%s' "$_LC_LANE_DEADLINE" ;;
     *)                               printf '%s' "$_LC_FALLBACK_DEADLINE" ;;
   esac
 }
@@ -148,6 +169,12 @@ lifecycle_route() {
     scribe-drainer|research-drainer) printf 'drainer-reclaim' ;;
     builder)                         printf 'stall-detector' ;;
     resolver)                        printf 'resolver-escalation' ;;
+    # A lane worker's own sweep (`_spawn_inflight_sweep`) reaps it the moment its pid is gone, and
+    # retires the record there — so a lane worker never reaches the EXPIRED branch by dying. It reaches
+    # it only by being ALIVE past its deadline, and no existing machinery tears down a live lane. Naming
+    # the marker sweep here would route that expiry to something that provably cannot act on it, so the
+    # route is the operator: honest, and the only actor that can decide what a wedged spawn means.
+    lane-worker|resolver-lane)       printf 'operator' ;;
     *)                               printf 'operator' ;;
   esac
 }
