@@ -343,6 +343,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic health inflight-timeout fork-bomb guard (HERD-283) test passes" {
+  run bash "$REPO/tests/test-health-redispatch-kill.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic healthcheck-autofix + row-truth test passes" {
   run bash "$REPO/tests/test-health-autofix.sh"
   [ "$status" -eq 0 ]
