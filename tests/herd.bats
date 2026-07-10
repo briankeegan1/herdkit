@@ -337,6 +337,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic wedged-builder classifier (HERD-278) test passes" {
+  run bash "$REPO/tests/test-wedged-builder.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic dead-agent-eyes liveness probe (HERD-114) test passes" {
   run bash "$REPO/tests/test-agent-liveness.sh"
   [ "$status" -eq 0 ]
