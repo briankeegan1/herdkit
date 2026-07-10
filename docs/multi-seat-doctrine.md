@@ -78,6 +78,56 @@ epic is the reconciled-invariant form of project context: any seat, at any tick,
 tracker and knows the whole program. See the *Programs* section of
 [`COORDINATOR-SOP.md`](COORDINATOR-SOP.md) and check 8 of the authoring SOP.
 
+## The dual-engine window — operational prescription (engine port, P3.5)
+
+Rules 1 and 2 assume every seat runs the **same engine**. The engine port (HERD-300) breaks that
+assumption for one bounded window: between P3 (a Python watcher runs beside the bash one) and P5
+(cutover), two *different* engine implementations — or the same operator on two checkouts at different
+levels — can write the **same worktree pool** at once. Two engines at different behavior levels
+silently coexisting is the hazard: the newer one writes a format or semantics the older one then
+clobbers, and the corruption (a half-migrated state store, a mis-shaped journal row, a claim written
+two different ways) surfaces later, in the queue. The invariant form (HERD-308) is:
+
+> **Every mutable-state write under the pool carries its writer's engine level, reconciled every
+> watcher tick. Two distinct levels writing one pool is never silent — the stale seat halts loudly,
+> so there are zero cross-mismatch writes.**
+
+This is Rule 1 applied to the engine itself: the check is a per-tick reconcile against observed pool
+state (`herd_engine_seat_reconcile` in [`scripts/herd/engine-seat.sh`](../scripts/herd/engine-seat.sh)),
+not a side effect of whichever seat happens to write. It is enforced through one shared stamp
+(`herd_engine_seat_stamp`) that the bash watcher calls today and the pysrc store accessors adopt
+verbatim in P4, so the two implementations reconcile against a **single format**.
+
+**The prescription — set these on every seat before opening the dual-engine window:**
+
+1. **`ENGINE_AUTOUPDATE=check`** — every seat's console + `herd doctor` surface when the local engine
+   has fallen behind the project's `ENGINE_MIN`, so no seat runs stale without saying so. (`auto` is
+   also fine — it pulls the engine forward in a quiescent window — but `check` is the floor: never
+   leave a fleet seat on `off` during the window.)
+2. **`WATCHER_SELF_RESTART=on`** — when a seat pulls new engine code, its watcher quiesces and
+   re-execs in place onto the new code, instead of running the old image against a config that now
+   expects the new behavior. Without it, a seat that updated its checkout keeps running the *loaded*
+   old code until a human restarts it — exactly the stale-writer the reconcile then has to halt.
+3. **Bump `ENGINE_MIN` at every phase flip.** When a phase lands behavior a project's config or lanes
+   come to depend on, raise `_HERD_ENGINE_LEVEL` in the same PR and stamp the project floor
+   (`herd upgrade` does this monotonically). This makes an older checkout **refuse to write** rather
+   than merely coexist — the handshake (HERD-179) and the pool reconcile (HERD-308) are complementary:
+   the handshake stops a stale engine writing against a *pinned* project; the reconcile stops two
+   engines writing one *pool* even before a floor is pinned.
+
+**Enabling the pool reconcile:** set `ENGINE_SEAT_RECONCILE=on` on every seat sharing the pool. It is
+ship-dormant (default `off`, a hard no-op) and inert for a single seat, so it costs nothing until a
+second engine actually appears; turn it on for the whole window.
+
+**Running a P4 store migration:** the migration runner must cross `herd_engine_migration_guard` first
+— it refuses unless every other registered seat has **quiesced** (`herd_engine_seat_quiesce`) or an
+operator has declared a deliberate **dual-write window** (`HERD_ENGINE_DUALWRITE=1`, journaled). A
+migration never races a live engine writing the store.
+
+Keep the window **short** (the epic's own risk note): the reconcile keeps it *safe*, but two engines
+to keep honest is still two engines. See the P3.5 leg of
+[`docs/spikes/engine-port-python.md`](spikes/engine-port-python.md).
+
 ## Where this is enforced
 
 - **Authoring** — coordinator skill, *Authoring a backlog item* SOP, check 7 (MULTI-SEAT /

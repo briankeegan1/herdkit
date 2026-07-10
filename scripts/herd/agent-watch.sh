@@ -99,6 +99,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # after journal.sh so its events are journaled; defines functions only, and is wholly inert while
 # ENGINE_AUTOUPDATE=off (the ship default) or the project pins no ENGINE_MIN floor.
 . "$HERE/engine-version.sh"
+# Cross-seat dual-engine safety (HERD-308) — the per-tick pool-level invariant that halts a STALE seat
+# writing the same worktree pool as a newer engine (the dual-engine window), plus the P4 migration
+# quiesce gate. Sourced after engine-version.sh (it stamps that file's level) and journal.sh (it
+# journals mismatches); defines functions only, wholly inert while ENGINE_SEAT_RECONCILE=off (default).
+. "$HERE/engine-seat.sh"
 # Token/cost accounting (additive + read-only): sums a merged builder's transcript and journals a
 # `cost` event so `herd cost` can surface cost-per-merged-PR. Sourced after journal.sh (it calls
 # journal_append). Defines functions only; safe to source in lib mode.
@@ -382,6 +387,11 @@ SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 # autofix bounce that finally lands, a re-detected hand-off merge) reads this ledger and no-ops instead
 # of re-enqueuing. Closes the drift where AUTOFIX / direct hand-off merges never reconciled the backlog.
 RECONCILE_STATE="$TREES/.agent-watch-reconciled"
+# Cross-seat dual-engine state (HERD-308): one line "<verdict> <self_level> <max_level> <peer>" written
+# by the per-tick reconcile whenever this pool has two DISTINCT engine levels writing it, read by
+# build_engine_seat_note to paint the loud halt/coexistence row. Absent on the coherent single-seat
+# path, so the console is byte-identical while ENGINE_SEAT_RECONCILE is off or only one engine writes.
+ENGINE_SEAT_STATE="$TREES/.agent-watch-engine-seat"
 # Stale-duplicate hold ledger (HERD-188): one line "<epoch> <pr#> <sha> <kind>" per PR+sha the
 # pre-merge stale-dup gate HELD, so the loud PR comment + notification + journal event fire EXACTLY
 # ONCE per sha instead of every tick (the console row itself is re-rendered every tick from the live
@@ -797,6 +807,48 @@ build_engine_note() {
   lvl="$(herd_engine_level)"; min="$(herd_engine_min)"
   if [ "$mode" = auto ]; then remedy="auto-updating in the next quiescent window"; else remedy="run herd update"; fi
   HERD_ENGINE_NOTE="    ${C_YELLOW}⬆${C_RESET}  ${C_DIM}engine outdated${C_RESET} (level ${lvl} < ENGINE_MIN ${min}) ${C_DIM}— ${remedy}${C_RESET}"$'\n'
+  return 0
+}
+
+# build_engine_seat_note — the CROSS-SEAT DUAL-ENGINE row (HERD-308), read from $ENGINE_SEAT_STATE which
+# _engine_seat_reconcile_tick writes only when two DISTINCT engine levels are writing this pool. A STALE
+# verdict is a LOUD red HALT row (this seat's writes are held); a LEAD verdict is a loud coexistence
+# warning (a stale seat shares the pool and is itself halted). Empty — hence a byte-identical console —
+# while ENGINE_SEAT_RECONCILE is off, when only one engine writes, or when the mismatch has cleared.
+build_engine_seat_note() {
+  HERD_ENGINE_SEAT_NOTE=""
+  [ "${ENGINE_SEAT_RECONCILE:-off}" = on ] || return 0
+  [ -s "${ENGINE_SEAT_STATE:-}" ] || return 0
+  local _es_verdict _es_self _es_max _es_peer
+  read -r _es_verdict _es_self _es_max _es_peer < "$ENGINE_SEAT_STATE" 2>/dev/null || return 0
+  case "${_es_verdict:-}" in
+    stale)
+      HERD_ENGINE_SEAT_NOTE="    ${C_RED}🛑 ${C_BOLD}DUAL-ENGINE HALT${C_RESET}${C_RED} — this seat's engine level ${_es_self} < level ${_es_max} on seat ${_es_peer:-?} sharing this pool · writes HELD ${C_DIM}— run herd update${C_RESET}"$'\n' ;;
+    lead)
+      HERD_ENGINE_SEAT_NOTE="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}dual-engine coexistence${C_RESET}${C_YELLOW} — a stale seat (${_es_peer:-?}, below level ${_es_self}) shares this pool ${C_DIM}— it is halted until updated${C_RESET}"$'\n' ;;
+    *) return 0 ;;
+  esac
+  return 0
+}
+
+# _engine_seat_reconcile_tick — the per-tick call (HERD-308). Under ENGINE_SEAT_RECONCILE=on it stamps
+# this seat's engine level into the pool registry and reconciles it against the other active seats. On a
+# STALE verdict it arms $_ENGINE_SEAT_HALT so do_merge / post_gate_status refuse the cross-mismatch
+# write; on any mismatch it records the verdict to $ENGINE_SEAT_STATE for build_engine_seat_note; a
+# coherent pool clears the note. A HARD no-op (no stamp, no read, no file) when the lever is off or in
+# dry-run, so the console + merge path stay byte-identical. Guarded so no failure can end the tick.
+_engine_seat_reconcile_tick() {
+  _ENGINE_SEAT_HALT=""
+  [ "${ENGINE_SEAT_RECONCILE:-off}" = on ] || return 0
+  [ -n "$DRYRUN" ] && return 0
+  command -v herd_engine_seat_reconcile >/dev/null 2>&1 || return 0
+  if herd_engine_seat_reconcile; then
+    rm -f "$ENGINE_SEAT_STATE" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s %s %s %s\n' "${_HERD_SEAT_VERDICT:-}" "${_HERD_SEAT_SELF_LEVEL:-}" \
+    "${_HERD_SEAT_MAX_LEVEL:-}" "${_HERD_SEAT_PEER:-}" > "$ENGINE_SEAT_STATE" 2>/dev/null || true
+  [ "${_HERD_SEAT_VERDICT:-}" = stale ] && _ENGINE_SEAT_HALT=1
   return 0
 }
 
@@ -1485,6 +1537,12 @@ render() {
   # engine is below the project's ENGINE_MIN. Empty (byte-identical console) otherwise.
   if [ -n "${HERD_ENGINE_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}engine${C_RESET}"$'\n'"${HERD_ENGINE_NOTE}"$'\n'
+  fi
+  # DUAL-ENGINE row (HERD-308) — a loud HALT (stale seat) or coexistence warning (leading seat) when two
+  # engine levels write this pool. Empty (byte-identical console) while ENGINE_SEAT_RECONCILE is off or
+  # only one engine writes.
+  if [ -n "${HERD_ENGINE_SEAT_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}engine seats${C_RESET}"$'\n'"${HERD_ENGINE_SEAT_NOTE}"$'\n'
   fi
   # CONTROL-ROOM SWEEP advisory (HERD-191) — one quiet line when debris has accumulated. Empty when
   # the control room is clean or SWEEP_AUTO=off, so the console is byte-identical when unused.
@@ -2986,6 +3044,13 @@ post_gate_status() {
   case "$state" in success) ;; *) return 0 ;; esac
   _gate_status_posted "$pr" "$sha" "$state" && return 0
   [ -n "$DRYRUN" ] && return 0
+  # CROSS-SEAT DUAL-ENGINE HALT (HERD-308): posting the herd/gates blessing is a cross-seat write. If
+  # this seat is STALE under a live dual-engine mismatch, HOLD it — a newer engine owns the pool's write
+  # format; our blessing must not land. Gated on the lever ⇒ byte-identical when ENGINE_SEAT_RECONCILE=off.
+  if [ "${ENGINE_SEAT_RECONCILE:-off}" = on ] && [ -n "${_ENGINE_SEAT_HALT:-}" ]; then
+    journal_append engine_seat_write_held surface post_gate_status pr "$pr" sha "$sha"
+    return 0
+  fi
   # SETTER GUARD (HERD-247): never bless a sha another seat is still blocking, and never overwrite a
   # foreign herd/gates=failure with our success. Runs AFTER the ledger/dry-run short-circuits, so it
   # costs its (memoized) reads only on the one tick that would actually write the blessing. Called
@@ -5725,6 +5790,14 @@ do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
   if [ -n "$DRYRUN" ]; then
     return 0
+  fi
+  # CROSS-SEAT DUAL-ENGINE HALT (HERD-308): a merge is the pool's most consequential mutable write. If
+  # this tick's reconcile found this seat STALE (a newer engine is writing the same pool), HOLD the
+  # merge — return WITHOUT writing the $STATE merge row, so the PR re-gates next tick once the engine is
+  # updated. Gated on the lever, so byte-identical when ENGINE_SEAT_RECONCILE=off (the global is unset).
+  if [ "${ENGINE_SEAT_RECONCILE:-off}" = on ] && [ -n "${_ENGINE_SEAT_HALT:-}" ]; then
+    journal_append engine_seat_write_held surface do_merge pr "$dp" slug "$ds" sha "$dsha"
+    return 1
   fi
   # Pipeline steps (HERD-132) — PRE-MERGE seam. Operator-defined pre-merge steps run HERE, AFTER the
   # built-in review + health gates have already passed (this PR only reaches do_merge on green gates),
@@ -11629,12 +11702,20 @@ while true; do
   # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
   _sweep_trigger_tick
 
+  # Cross-seat dual-engine reconcile (HERD-308), BEFORE the build + action passes so a detected halt
+  # both paints this tick and holds this tick's writes. Under ENGINE_SEAT_RECONCILE=on it stamps this
+  # seat's engine level into the pool registry and, if a second engine at a different level is writing
+  # the same pool, arms $_ENGINE_SEAT_HALT (the stale seat) so do_merge/post_gate_status refuse. A hard
+  # no-op when the lever is off or in dry-run; guarded so nothing inside it can end the loop.
+  _engine_seat_reconcile_tick || true
+
   build_header
   build_landed
   build_blocked
   build_tracker_drift
   build_spawn_holds
   build_engine_note
+  build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
   build_main_health
   # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
   # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
