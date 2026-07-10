@@ -106,6 +106,7 @@ herd-resolve.sh	sim	tests/test-sandbox-resolver-respawn.sh
 herd-resolve.sh	unit	tests/test-model-flags.sh
 herd-resolve.sh	unit	tests/test-driver-lane-spawn.sh
 herd-approve.sh	unit	tests/test-human-verify-hold.sh
+herd-approve.sh	unit	tests/test-journal-audit.sh
 herd-approve.sh	unit	tests/test-approval-purge.sh
 herd-approve.sh	unit	tests/test-human-verify-policy.sh
 push-gate.sh	sim	tests/test-sandbox-governance.sh
@@ -158,12 +159,14 @@ agent-watch.sh	sim	tests/test-sandbox-limit-resume.sh
 agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 agent-watch.sh	sim	scripts/herd/sim/tick-availability-sim.sh
 agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
+approvals.sh	unit	tests/test-journal-audit.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh
 retirement.sh	sim	scripts/herd/sim/retirement-invariant-sim.sh
 caps-sync-lint.sh	unit	tests/test-caps-sync-light.sh
 console-section.sh	unit	tests/test-console-rows-ageout.sh
+watcher-exempt.sh	unit	tests/test-watcher-exempt.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh

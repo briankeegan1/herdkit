@@ -241,7 +241,7 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
-@test "hermetic journal self-audit gap-finder (HERD-238) test passes" {
+@test "hermetic journal self-audit gap-finder (HERD-238 + HERD-272 human-verify rule) test passes" {
   run bash "$REPO/tests/test-journal-audit.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
@@ -511,6 +511,12 @@ setup() {
 
 @test "hermetic tracker-create self-heal: durable retry + sweep relink (HERD-267) test passes" {
   run bash "$REPO/tests/test-create-selfheal.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic shared watcher-identity check (HERD-266) test passes" {
+  run bash "$REPO/tests/test-watcher-exempt.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

@@ -24,6 +24,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
 . "$HERE/human-verify.sh"
+# Approval-ledger seam (HERD-272): the ledger's path and row grammar live in ONE place, so the
+# auditor that later checks a merged PR against this ledger reads exactly the file this script wrote.
+. "$HERE/approvals.sh"
 # PUSH_GATE=human (HERD-123) — push-hold helpers so list/approve gain PRE-push hold coverage: a
 # finished builder that stopped before push/PR create is listed here, and `approve <slug>` resumes
 # its push + PR creation. Sourcing only defines functions (CLI dispatch is $0-guarded).
@@ -42,7 +45,7 @@ c_grn=""; c_red=""; c_dim=""; c_rst=""
 # shellcheck source=/dev/null
 [ -f "$HERE/theme.sh" ] && { . "$HERE/theme.sh"; herd_theme_load_cli; }
 
-APPROVALS="$WORKTREES_DIR/.agent-watch-approvals"
+APPROVALS="$(_approvals_file || true)"
 REVIEW_STATE="$WORKTREES_DIR/.agent-watch-reviewed"
 OVERRIDES="$WORKTREES_DIR/.agent-watch-overrides"
 # Merge/reap ledger the watcher appends to in do_merge ("<epoch> <pr#> <slug>"). Used as the
@@ -220,6 +223,13 @@ EOF
       printf 'PR #%s commit %s is already approved.\n' "$prnum" "$sha"; exit 0
     fi
     printf '%s approved %s %s\n' "$(date +%s)" "$prnum" "$sha" >> "$APPROVALS"
+    # The ledger row above is EPHEMERAL: do_merge calls purge_pr_approvals as soon as this PR merges,
+    # dropping every row for it. So the fact that a human signed this sha off is ALSO written to the
+    # append-only journal, which nothing purges. That journal event is the only evidence a post-merge
+    # auditor (journal-audit.sh check (g), HERD-272) can still see; without it, an approved
+    # HUMAN-VERIFY merge is indistinguishable from one that fail-open merged with its steps unrun.
+    command -v journal_append >/dev/null 2>&1 \
+      && journal_append approval_recorded pr "$prnum" sha "$sha" state approved source herd-approve || true
     printf '✅ Approved PR #%s — approved commit %s. The watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
     ;;
 
