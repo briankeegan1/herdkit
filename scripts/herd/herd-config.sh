@@ -334,6 +334,18 @@ esac
 # watcher sees it under `set -u`.
 : "${ENGINE_SEAT_RECONCILE:="off"}"
 
+# ENGINE_IMPL — which ENGINE-CORE IMPLEMENTATION the watcher runs (HERD-316, EPIC HERD-300, the
+# Python port): bash (default) | shadow. bash is today's byte-identical behavior — the shell watcher
+# is authoritative and nothing else runs. shadow ADDITIONALLY runs the Python watcher
+# (pysrc/herd/shadow_runtime.py) beside it in DRY-RUN mode: it re-walks the same candidate → gate →
+# decision pipeline but MUTATES NOTHING (no gh, no merge, no pane ops) — its sole output is
+# .herd/journal-shadow.jsonl in journal.sh-identical event shapes, so the P3 acceptance gate can diff
+# the two event streams for parity. shadow NEVER changes what the bash engine does; it only observes.
+# Any value other than shadow reads as bash (a typo can never divert the authoritative engine). Ship
+# default bash ⇒ inert and byte-identical to before this key existed. Resolved in
+# scripts/herd/engine-version.sh (herd_engine_impl); the dormant shadow tick lives there too.
+: "${ENGINE_IMPL:="bash"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)

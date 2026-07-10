@@ -12573,6 +12573,9 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
   if [ "$_ENGINE_TICK" -ge "$_ENGINE_INTERVAL" ]; then
     _ENGINE_TICK=0
     [ -n "$DRYRUN" ] || herd_engine_autoupdate_tick
+    # ENGINE_IMPL=shadow (HERD-316): run the Python shadow watcher beside this one, DRY-RUN. A HARD
+    # no-op under the ship default ENGINE_IMPL=bash, so the live tick is byte-identical when off.
+    herd_engine_shadow_tick
   fi
 
   sleep 4
