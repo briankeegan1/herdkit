@@ -179,4 +179,14 @@ set -e
 printf '%s\n' "$COUT2" | grep -qi 'retire' && fail "7: a no-op backend set still warned to retire the drainer"
 ok
 
+# ══ 7. the SHIPPED retire-drainer remedy names an ACTIONABLE herdr surface (HERD-287) ═══════════
+# Guards against a regression to the old bogus line, which told operators to run
+# 'herdr agent stop scribe-<workspace>' — but 'herdr agent' has NO stop subcommand (its surface is
+# list/get/read/send/rename/focus/wait/attach/start/explain). The actionable remedy is closing the
+# drainer's tab ('herdr tab close <tab-id>'). Grep the shipped bin/herd text directly so a future
+# bogus remedy reds the gate even if the runtime warn path is refactored.
+grep -q 'herdr agent stop' "$HERD" && fail "7: bin/herd still ships the bogus 'herdr agent stop' remedy ('herdr agent' has no stop subcommand)"
+grep -q 'herdr tab close' "$HERD" || fail "7: bin/herd's retire-drainer remedy no longer names the actionable 'herdr tab close' surface"
+ok
+
 echo "ALL PASS ($pass checks)"
