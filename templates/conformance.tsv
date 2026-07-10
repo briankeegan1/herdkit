@@ -260,6 +260,8 @@ CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
+RESOLVER_PANE	unit	tests/test-resolver-pane-lifecycle.sh
+RESOLVER_PANE	sim	tests/test-sandbox-real-panes.sh
 GATE_STATUS	sim	tests/test-sandbox-multiseat.sh
 WATCHER_SCOPE	sim	tests/test-sandbox-multiseat.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh

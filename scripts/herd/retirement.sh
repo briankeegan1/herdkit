@@ -229,6 +229,7 @@ _retire_drop_probes() {
 #   .health-result-<pr>-<sha>        record_health_result "$_hg_pr" "$_hg_sha"
 #   .review-escalate-<pr>            _review_escalate_file "$_mare_pr"
 #   .resolve-result-<pr>-<sha>       _resolve_result_file "$rp" "$rsha"
+#   .resolve-registry-<pr>-<sha>     _resolve_registry_file "$rp" "$rsha"   (HERD-280 resolver pane)
 #   .agent-watch-refix-dead-<pr>-<sha>          _refix_dead_marker  <pr> <sha>
 #   .agent-watch-refix-stuck-<kind>-<pr>-<sha>  _refix_stuck_file   <pr> <sha> <kind>
 #
