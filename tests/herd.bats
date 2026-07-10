@@ -630,3 +630,9 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
+
+@test "hermetic fleet digest test passes including merged_external leg (HERD-291)" {
+  run bash "$REPO/tests/test-fleet-digest.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
