@@ -258,6 +258,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
+- `RESOLVER_PANE` → `agent-watch.sh`, `herd-resolve.sh`
 - `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`

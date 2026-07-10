@@ -197,6 +197,7 @@ else
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room reload_pane_verify_timeout builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
+            resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
             builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
             builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
@@ -534,6 +535,109 @@ except Exception:
       fi
     else
       checkpoint reviewer_pane_close_refused_on_mismatch fail "builder pane not present to serve as decoy (BUILD_PANE='$BUILD_PANE')"
+    fi
+  fi
+
+  # ── RESOLVER-PANE LIFECYCLE (HERD-280): retired on DONE, KEPT on ESCALATE ─────────────────────────
+  # The resolver is a pane that retires on result-consumed, exactly like a reviewer pane — but its two
+  # verdicts part ways. Stand up a REAL resolve split pane inside the builder's tab (the placement
+  # herd-resolve.sh uses under RESOLVER_PANE=on), plant its dispatch-registry row plus a waiting verdict,
+  # and drive the SHIPPED watcher reconcile (_reconcile_resolver_panes, sourced from agent-watch.sh in
+  # lib mode) against a REAL herdr pane close:
+  #   DONE     → the pane is CLOSED, the row dropped, resolver_pane_retired journaled … and the WORKTREE
+  #              is untouched (the retirement invariant, not this path, reaps the tree at merge).
+  #   ESCALATE → the pane STAYS. It is the evidence the needs-you row sends a human to read.
+  # Each leg gets its own $TREES + journal so "no retire happened" is an honest assertion.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step resolverpane "resolver pane retires on DONE and survives ESCALATE (shipped path, real panes)"
+    _rs_present() {
+      pane_json "$WSID" | RSP="$1" python3 -c '
+import sys,json,os
+rsp=os.environ["RSP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==rsp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    # Split a real resolver pane into the builder's tab and label it with the resolver identity the
+    # HERD-134 guarded close proves against before closing. Runs in a command substitution, so the
+    # PANES_CREATED bookkeeping stays with the caller (a subshell's increment would be lost).
+    _rs_split_pane() {
+      local _out _pane
+      _out="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+      _pane="$(printf '%s' "$_out" | hj 'd["result"]["pane"]["pane_id"]')"
+      [ -n "$_pane" ] && herdr pane rename "$_pane" "resolve·rp-builder" >/dev/null 2>&1 || true
+      printf '%s' "$_pane"
+    }
+    # Run the shipped reconcile against <trees> in a subshell so agent-watch.sh's globals never clobber
+    # this scenario's. HERD_DRIVER defaults to herdr-claude → a REAL `herdr pane close` behind the guard.
+    _rs_reconcile() {
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$1" DEFAULT_BRANCH=main RESOLVER_PANE=on \
+               WORKSPACE_NAME="rp-resolverpane-sim" JOURNAL_FILE="$2"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        _reconcile_resolver_panes
+      )
+    }
+
+    # ── leg 1: RESOLVE: DONE → the pane is retired, the worktree is not ──────────────────────────────
+    RS_PANE="$(_rs_split_pane)"; [ -n "$RS_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))
+    if [ -n "$RS_PANE" ] && [ "$(_rs_present "$RS_PANE")" = yes ]; then
+      RST="$ART/resolvetrees"; mkdir -p "$RST/.herd"
+      RS_WT="$RST/rp-builder"; mkdir -p "$RS_WT"          # the worktree that must SURVIVE the retire
+      RS_JOURNAL="$ART/rs-journal.jsonl"; : > "$RS_JOURNAL"
+      printf '%s - split 601 rssha601\n' "$RS_PANE" > "$RST/.resolve-registry-601-rssha601"
+      printf 'RESOLVE: DONE\n'                      > "$RST/.resolve-result-601-rssha601"
+      _rs_reconcile "$RST" "$RS_JOURNAL"; RS_RC=$?
+      _rs_gone="no"; _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_rs_present "$RS_PANE")" = no ] && { _rs_gone=yes; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _rs_reg_dropped=no; [ ! -f "$RST/.resolve-registry-601-rssha601" ] && _rs_reg_dropped=yes
+      _rs_journaled=no; grep -q '"event":"resolver_pane_retired"' "$RS_JOURNAL" 2>/dev/null && _rs_journaled=yes
+      _rs_consumed=no; grep -q '"reason":"result-consumed"' "$RS_JOURNAL" 2>/dev/null && _rs_consumed=yes
+      _rs_wt=no; [ -d "$RS_WT" ] && _rs_wt=yes
+      if [ "$RS_RC" = 0 ] && [ "$_rs_gone" = yes ] && [ "$_rs_reg_dropped" = yes ] \
+         && [ "$_rs_journaled" = yes ] && [ "$_rs_consumed" = yes ] && [ "$_rs_wt" = yes ]; then
+        checkpoint resolver_pane_retired_on_done pass \
+          "resolve pane $RS_PANE closed on DONE; row dropped; resolver_pane_retired reason=result-consumed journaled; worktree still present"
+      else
+        checkpoint resolver_pane_retired_on_done fail \
+          "pane not retired as expected (rc=$RS_RC gone=$_rs_gone reg_dropped=$_rs_reg_dropped journaled=$_rs_journaled consumed=$_rs_consumed worktree=$_rs_wt)"
+      fi
+    else
+      checkpoint resolver_pane_retired_on_done fail "could not stand up the resolve split pane (RS_PANE='$RS_PANE')"
+    fi
+
+    # ── leg 2: RESOLVE: ESCALATE → the pane stays open for the human ─────────────────────────────────
+    ES_PANE="$(_rs_split_pane)"; [ -n "$ES_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))
+    if [ -n "$ES_PANE" ] && [ "$(_rs_present "$ES_PANE")" = yes ]; then
+      EST="$ART/escalatetrees"; mkdir -p "$EST/.herd"
+      ES_JOURNAL="$ART/es-journal.jsonl"; : > "$ES_JOURNAL"
+      printf '%s - split 602 essha602\n' "$ES_PANE" > "$EST/.resolve-registry-602-essha602"
+      printf 'RESOLVE: ESCALATE\n'                  > "$EST/.resolve-result-602-essha602"
+      _rs_reconcile "$EST" "$ES_JOURNAL"           # two ticks: a later one must not change its mind
+      _rs_reconcile "$EST" "$ES_JOURNAL"; ES_RC=$?
+      _es_alive=yes; _i=0
+      while [ "$_i" -lt 12 ]; do
+        [ "$(_rs_present "$ES_PANE")" = yes ] || { _es_alive=no; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _es_reg_kept=no; [ -f "$EST/.resolve-registry-602-essha602" ] && _es_reg_kept=yes
+      _es_retired=no; grep -q '"event":"resolver_pane_retired"' "$ES_JOURNAL" 2>/dev/null && _es_retired=yes
+      if [ "$ES_RC" = 0 ] && [ "$_es_alive" = yes ] && [ "$_es_reg_kept" = yes ] && [ "$_es_retired" = no ]; then
+        checkpoint resolver_pane_kept_on_escalate pass \
+          "escalated resolve pane $ES_PANE still open across two reconcile ticks; row kept; no retire journaled"
+      else
+        checkpoint resolver_pane_kept_on_escalate fail \
+          "escalated pane not preserved (rc=$ES_RC alive=$_es_alive reg_kept=$_es_reg_kept false_retire=$_es_retired)"
+      fi
+    else
+      checkpoint resolver_pane_kept_on_escalate fail "could not stand up the escalate split pane (ES_PANE='$ES_PANE')"
     fi
   fi
 

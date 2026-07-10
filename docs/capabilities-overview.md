@@ -141,6 +141,23 @@ metadata is in `templates/capabilities.tsv` and viewable live with `herd config 
 | `WATCHER_VIEW` (+ `WATCHER_VIEW_AUTHOR` / `_ASSIGNEE` / `_LABEL` / `_STATUS` / `_DEPS_LABEL`) | Narrow **which** open PRs the console displays each tick: `all` (default) \| `mine` \| `review-queue` \| `deps`, ANDed with the filters. **Selection only** — it never relaxes a merge gate. |
 | `WATCHER_SCOPE` / `WATCHER_OWNER` | **Team mode (opt-in).** `mine` (default) = today's exact solo behavior. `all` = teammates' PRs are **displayed** but auto-merge is strictly scoped to PRs owned by `WATCHER_OWNER`; a teammate's PR shows "not mine — manual" and is never auto-merged. A **narrowing** gate — it can only withhold a merge, never authorize one the gates would deny. Fail-closed: an unresolvable owner withholds auto-merge. |
 
+### Conflict-resolver pane (`RESOLVER_PANE`)
+
+`RESOLVER_PANE=on` makes the conflict resolver a **pane that retires on result-consumed**, the same
+contract reviewer panes have carried since HERD-113. The resolver is split into the builder's own tab
+(falling back to a standalone `resolve·<slug>` tab when there is no builder tab, no herdr, or the split
+fails), and the watcher reconciles its dispatch registry against the **observed verdict file** — not
+against any dispatch-seat event, so any seat retires the pane once the verdict lands:
+
+| verdict | what happens to the pane |
+|---|---|
+| `RESOLVE: DONE` | closed immediately through the guarded close; `resolver_pane_retired reason=result-consumed` journaled; registry row (and, for a standalone tab, the empty tab) dropped |
+| `RESOLVE: ESCALATE` | **kept open.** The escalation is addressed to a human, and the resolver's transcript is the evidence its `needs you · resolver escalated` row points at. No later tick may retire it. |
+
+The **worktree** lifecycle is untouched either way: retiring a pane is not reaping a tree, and the
+retirement invariant still reaps at merge. `off` (default) leaves the pre-HERD-280 standalone tab,
+which only the stale-tab reaper ever closes.
+
 ### App preview (feature lane)
 
 `APP_PREVIEW_CMD` and its companions (`APP_PREVIEW_SERVER_ARGS`, `APP_PREVIEW_HEALTH_CMD`,
