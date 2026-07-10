@@ -536,6 +536,15 @@ fi
 # above any legitimate run so a healthy worker is never killed. Non-numeric → the built-in 1800 default.
 : "${REVIEW_INFLIGHT_TIMEOUT:="1800"}"   # HERD-185: seconds before an in-flight reviewer is timed out + reaped (default 1800 = 30m)
 : "${HEALTH_INFLIGHT_TIMEOUT:="1800"}"   # HERD-185: seconds before an in-flight healthcheck suite is timed out + reaped (default 1800 = 30m)
+# HEALTH_TIMEOUT_HEADROOM (HERD-281) — headroom margin in seconds between the observed max suite
+# duration and HEALTH_INFLIGHT_TIMEOUT. When > 0 and a live suite enters the window
+# [HEALTH_INFLIGHT_TIMEOUT - HEALTH_TIMEOUT_HEADROOM, HEALTH_INFLIGHT_TIMEOUT + HEALTH_TIMEOUT_HEADROOM),
+# the corpse sweep (a) surfaces a loud console + journal advisory to raise HEALTH_INFLIGHT_TIMEOUT, and
+# (b) does NOT tear down the dispatch within that window — giving the suite the full margin to complete.
+# SHIP-DORMANT: 0 (default) → corpse sweep is byte-identical (kills at HEALTH_INFLIGHT_TIMEOUT exactly);
+# the advisory and deferred-kill paths are unreachable. Non-numeric → 0 (never activate on a typo).
+# Set to ~20% of HEALTH_INFLIGHT_TIMEOUT as a starting point (e.g. 360 for the default 1800s timeout).
+: "${HEALTH_TIMEOUT_HEADROOM:="0"}"   # HERD-281: advisory + deferred-kill margin (seconds); 0 = off
 # GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
 # the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
 # byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is

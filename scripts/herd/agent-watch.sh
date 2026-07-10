@@ -1490,6 +1490,12 @@ render() {
   if [ -n "${SWEEP_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}housekeeping${C_RESET}"$'\n'"${SWEEP_NOTE}"$'\n'
   fi
+  # HEALTH HEADROOM advisory (HERD-281) — fires when the observed suite duration is within
+  # HEALTH_TIMEOUT_HEADROOM of HEALTH_INFLIGHT_TIMEOUT. Empty when HEALTH_TIMEOUT_HEADROOM=0 (default),
+  # so the console is byte-identical to before when the margin is not crossed or the lever is dormant.
+  if [ -n "${HEALTH_HEADROOM_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}health headroom${C_RESET}"$'\n'"${HEALTH_HEADROOM_NOTE}"$'\n'
+  fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
   # byte-identical when the feature is unused.
@@ -9689,6 +9695,80 @@ _health_infra_bump() {
   printf '%s' "$_hib_n"
 }
 
+# ── HERD-281: suite-duration vs inflight-timeout headroom tracking ──────────────────────────────────
+# Track the max observed completed-suite wall-clock duration so the headroom check can compare it
+# against HEALTH_INFLIGHT_TIMEOUT and surface an advisory before the timeout fires prematurely.
+
+# _health_duration_file — path to the rolling max-observed suite duration record.
+_health_duration_file() { printf '%s' "$TREES/.health-observed-duration"; }
+
+# _health_duration_record <seconds> — update the max observed suite duration (best-effort, fail-soft).
+# Called at collection time so the recorded value is the actual suite wall-clock time.
+_health_duration_record() {
+  local _hdr_secs="${1:-}" _hdr_prev _hdr_f
+  case "$_hdr_secs" in ''|*[!0-9]*) return 0 ;; esac
+  _hdr_f="$(_health_duration_file)"
+  _hdr_prev="$(cat "$_hdr_f" 2>/dev/null || printf 0)"
+  case "$_hdr_prev" in ''|*[!0-9]*) _hdr_prev=0 ;; esac
+  [ "$_hdr_secs" -gt "$_hdr_prev" ] && printf '%s\n' "$_hdr_secs" > "$_hdr_f" 2>/dev/null || true
+}
+
+# _health_duration_observed — the max observed completed suite duration in seconds, or 0 if none.
+_health_duration_observed() {
+  local _hdo_v; _hdo_v="$(cat "$(_health_duration_file)" 2>/dev/null || printf 0)"
+  case "$_hdo_v" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_hdo_v" ;; esac
+}
+
+# _health_timeout_headroom — the configured HEALTH_TIMEOUT_HEADROOM margin in seconds, or 0 (off).
+# Non-numeric or unset → 0 so a typo can never activate the check (fail safe = off).
+_health_timeout_headroom() {
+  local _hth_v="${HEALTH_TIMEOUT_HEADROOM:-0}"
+  case "$_hth_v" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_hth_v" ;; esac
+}
+
+# _health_headroom_advisory_file — throttle-marker path for the headroom journal advisory.
+_health_headroom_advisory_file() { printf '%s' "$TREES/.health-headroom-advisory"; }
+
+# _health_headroom_journal_once <key> <age> <timeout> <margin> — journal a headroom advisory at most
+# once per 600 s (throttled). Fail-soft; never blocks the corpse sweep.
+_health_headroom_journal_once() {
+  local _hhj_f _hhj_now _hhj_last
+  _hhj_f="$(_health_headroom_advisory_file)"
+  _hhj_now="$(_now_epoch)"
+  _hhj_last="$(cat "$_hhj_f" 2>/dev/null || printf 0)"
+  case "$_hhj_last" in ''|*[!0-9]*) _hhj_last=0 ;; esac
+  [ "$(( _hhj_now - _hhj_last ))" -lt 600 ] 2>/dev/null && return 0
+  printf '%s\n' "$_hhj_now" > "$_hhj_f" 2>/dev/null || true
+  journal_append health_timeout_headroom_advisory key "${1:-}" age "${2:-}" timeout "${3:-}" margin "${4:-}"
+}
+
+# build_health_headroom_note — the 'suite headroom' advisory console row (HERD-281). Fires when:
+# (a) the max observed suite duration is within HEALTH_TIMEOUT_HEADROOM of HEALTH_INFLIGHT_TIMEOUT, or
+# (b) a live suite is currently in the approach window (set by _sweep_gate_corpses this tick via
+#     _HEALTH_HEADROOM_APPROACHING). Empty when HEALTH_TIMEOUT_HEADROOM=0 (default off) or the
+# margin is not crossed — so the console is byte-identical to before when dormant.
+build_health_headroom_note() {
+  HEALTH_HEADROOM_NOTE=""
+  local _bhn_margin; _bhn_margin="$(_health_timeout_headroom)"
+  [ "$_bhn_margin" -gt 0 ] 2>/dev/null || return 0
+  local _bhn_timeout="${HEALTH_INFLIGHT_TIMEOUT:-1800}"
+  case "$_bhn_timeout" in ''|*[!0-9]*) _bhn_timeout=1800 ;; esac
+  local _bhn_obs _bhn_headroom
+  # Case A: observed max duration is close to the timeout (recorded from completed suites).
+  _bhn_obs="$(_health_duration_observed)"
+  if [ "$_bhn_obs" -gt 0 ] 2>/dev/null; then
+    _bhn_headroom=$(( _bhn_timeout - _bhn_obs ))
+    if [ "$_bhn_headroom" -lt "$_bhn_margin" ] 2>/dev/null; then
+      HEALTH_HEADROOM_NOTE="    ${C_YELLOW}⚠️  suite headroom${C_RESET}: observed ${_bhn_obs}s · timeout ${_bhn_timeout}s · headroom ${_bhn_headroom}s < margin ${_bhn_margin}s — raise HEALTH_INFLIGHT_TIMEOUT${C_RESET}"$'\n'
+      return 0
+    fi
+  fi
+  # Case B: a live suite is approaching/past timeout this tick (set by corpse sweep).
+  if [ -n "${_HEALTH_HEADROOM_APPROACHING:-}" ]; then
+    HEALTH_HEADROOM_NOTE="    ${C_YELLOW}⚠️  suite headroom${C_RESET}: running ${_HEALTH_HEADROOM_APPROACHING}s · timeout ${_bhn_timeout}s · margin ${_bhn_margin}s — raise HEALTH_INFLIGHT_TIMEOUT${C_RESET}"$'\n'
+  fi
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -10076,6 +10156,9 @@ _healthcheck_gate() {
         _HC_RESULT="RUNNING"
         journal_append infra_event component agent-watch reason health_bad_result key "$_hg_key" ;;
     esac
+    # HERD-281: record observed suite wall-clock duration for headroom tracking.
+    local _hg_elapsed; _hg_elapsed="$(_marker_age "$_hg_inflight")"
+    case "$_hg_elapsed" in ''|-1|*[!0-9]*) : ;; *) _health_duration_record "$_hg_elapsed" ;; esac
     rm -f "$_hg_disp" "$_hg_inflight" 2>/dev/null || true
     lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
@@ -10196,7 +10279,7 @@ _sweep_gate_corpses() {
   # + idempotent); a CONCURRENT one corrupts the retry ledger and the infra breaker.
   _gate_corpse_claim || return 0
   trap '_gate_corpse_release' RETURN
-  local f base rest pr sha age pid
+  local f base rest pr sha age pid _sw_margin _sw_timeout
   # ── review family: .review-inflight-<pr>-<sha> ──
   for f in "$TREES"/.review-inflight-*; do
     [ -e "$f" ] || continue
@@ -10233,7 +10316,23 @@ _sweep_gate_corpses() {
     if _marker_live "$f"; then
       age="$(_marker_age "$f")"
       case "$age" in ''|-1|*[!0-9]*) continue ;; esac
-      [ "$age" -lt "${HEALTH_INFLIGHT_TIMEOUT:-1800}" ] 2>/dev/null && continue
+      # HERD-281: headroom check — before the kill, honour HEALTH_TIMEOUT_HEADROOM.
+      _sw_margin="$(_health_timeout_headroom)"
+      _sw_timeout="${HEALTH_INFLIGHT_TIMEOUT:-1800}"
+      case "$_sw_timeout" in ''|*[!0-9]*) _sw_timeout=1800 ;; esac
+      if [ "$_sw_margin" -gt 0 ] 2>/dev/null; then
+        # Approaching or within the grace window: surface advisory.
+        if [ "$age" -ge "$(( _sw_timeout - _sw_margin ))" ] 2>/dev/null; then
+          _HEALTH_HEADROOM_APPROACHING="$age"
+          _health_headroom_journal_once "$rest" "$age" "$_sw_timeout" "$_sw_margin"
+        fi
+        # Within [0, timeout + margin): defer the kill — do NOT tear down within the margin.
+        [ "$age" -lt "$(( _sw_timeout + _sw_margin ))" ] 2>/dev/null && continue
+        # age >= timeout + margin: fall through to kill.
+      else
+        # HEALTH_TIMEOUT_HEADROOM=0 (default): byte-identical — kill at HEALTH_INFLIGHT_TIMEOUT.
+        [ "$age" -lt "$_sw_timeout" ] 2>/dev/null && continue
+      fi
       pid="$(_marker_pid "$f")"
       [ "$pid" = "$$" ] && continue
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
@@ -11316,6 +11415,8 @@ AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
 
 while true; do
+  # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
+  _HEALTH_HEADROOM_APPROACHING=""
   # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
   # review or health worker (corpse sweep), then collect any finished ASYNC main-health suite. Both run
   # BEFORE the candidate pass so a freed slot is available to dispatch this same tick and a landed
@@ -11344,6 +11445,7 @@ while true; do
   _main_fresh_recheck
   build_main_freshness
   build_sweep_note
+  build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
 
   # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
   # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
