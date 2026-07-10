@@ -365,3 +365,4 @@ ENGINE_AUTOUPDATE	unit	tests/test-engine-handshake.sh
 create-retry.sh	unit	tests/test-create-selfheal.sh
 CREATE_SELFHEAL	unit	tests/test-create-selfheal.sh
 CREATE_RETRY_MAX	unit	tests/test-create-selfheal.sh
+ENGINE_IMPL	unit	tests/test-py-shadow-runtime.sh

@@ -260,3 +260,46 @@ herd_engine_autoupdate_tick() {
   ( cd "$root" 2>/dev/null && HERD_NONINTERACTIVE=1 nohup $cmd >>"$log" 2>&1 & ) >/dev/null 2>&1 || true
   return 0
 }
+
+# ── ENGINE_IMPL: the engine-core implementation selector (HERD-316, EPIC HERD-300) ────────────────
+# The strangler port runs the Python engine core in SHADOW mode beside the authoritative bash watcher.
+# ENGINE_IMPL selects the posture; this seam resolves + dispatches it, ship-dormant and default-off.
+
+# herd_engine_impl — the normalized implementation knob: bash | shadow. Anything but the exact token
+# `shadow` reads as `bash`, so a typo can never divert the authoritative engine to the (dry-run) port.
+herd_engine_impl() {
+  case "${ENGINE_IMPL:-bash}" in
+    shadow) printf 'shadow' ;;
+    *)      printf 'bash' ;;
+  esac
+}
+
+# herd_engine_shadow_tick — dispatch the Python SHADOW watcher for one tick. A HARD no-op unless
+# ENGINE_IMPL=shadow (the ship default `bash` returns before doing ANYTHING, so the watcher's console,
+# argv, task-specs and journal are byte-identical to before this key existed). When armed it runs
+# `python3 -m herd.shadow_runtime` over a caller-provided sim fixture — DRY-RUN by construction: the
+# module writes ONLY .herd/journal-shadow.jsonl and mutates nothing the live engine reads (no gh, no
+# merge, no pane ops). Detached so a slow shadow pass never wedges the real tick. Fail-soft: a missing
+# python3, a missing package, or a missing fixture skips SILENTLY (a shadow miss is a parity gap, never
+# a red row). Always returns 0. The parity DIFF against the live journal is the P3 acceptance gate, run
+# out-of-band; this tick only PRODUCES the shadow stream. Test seam: HERD_ENGINE_SHADOW_SYNC=1 runs it
+# inline (not detached) so a unit can await the journal; HERD_ENGINE_SHADOW_FIXTURE points at the
+# scenario JSON (the sim rig feeds it — never the live control room, per the VERIFY discipline).
+herd_engine_shadow_tick() {
+  [ "$(herd_engine_impl)" = shadow ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local home fixture pyp
+  home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
+  pyp="$home/pysrc"
+  [ -f "$pyp/herd/shadow_runtime.py" ] || return 0
+  fixture="${HERD_ENGINE_SHADOW_FIXTURE:-}"
+  [ -n "$fixture" ] && [ -f "$fixture" ] || return 0
+  _herd_engine_journal engine_shadow_dispatched shadow
+  if [ -n "${HERD_ENGINE_SHADOW_SYNC:-}" ]; then
+    PYTHONPATH="$pyp" python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 || true
+    return 0
+  fi
+  ( PYTHONPATH="$pyp" nohup python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 & ) \
+    >/dev/null 2>&1 || true
+  return 0
+}

@@ -96,6 +96,15 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # Any other value is treated as off.
 # ENGINE_AUTOUPDATE="off"             # off (default) | check | auto
 
+# ENGINE_IMPL — which engine-core implementation the watcher runs (HERD-316, the Python port). "bash"
+# (default) is today's byte-identical behavior — the shell watcher is authoritative and nothing else
+# runs. "shadow" ADDITIONALLY runs the Python watcher (pysrc/herd/shadow_runtime.py) beside it in
+# DRY-RUN mode: same candidate → gate → decision walk, but it MUTATES NOTHING (no gh, no merge, no pane
+# ops) — its only output is .herd/journal-shadow.jsonl in journal.sh-identical shapes, so the two event
+# streams can be diffed for parity. "shadow" never changes what the bash engine does; it only observes.
+# Any value other than "shadow" reads as "bash". Ship default "bash" = inert.
+# ENGINE_IMPL="bash"                  # bash (default, authoritative) | shadow (also run the dry-run port)
+
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A
 # theme is a DIRECTORY with two files: palette.sh (console C_* truecolor + optional C_CLI_* 16-color
