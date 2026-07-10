@@ -230,7 +230,7 @@ _sweep_dir_in_use() {
   local dir="${1:-}"; [ -n "$dir" ] || return 1
   if [ -n "${HERD_SWEEP_DIR_INUSE_CMD:-}" ]; then "$HERD_SWEEP_DIR_INUSE_CMD" "$dir"; return $?; fi
   command -v lsof >/dev/null 2>&1 || return 1
-  [ -n "$(lsof -t +D "$dir" 2>/dev/null | head -1)" ]
+  [ -n "$(lsof -t +D "$dir" 2>/dev/null | head -1)" ]  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # _sweep_unique_commits <dir> — count commits on this worktree's HEAD that exist nowhere on the
@@ -494,7 +494,7 @@ _sweep_ps() { watcher_ps_table; }
 _sweep_proc_cwd() {
   if [ -n "${HERD_SWEEP_PROC_CWD_CMD:-}" ]; then "$HERD_SWEEP_PROC_CWD_CMD" "$1"; return 0; fi
   command -v lsof >/dev/null 2>&1 || return 0
-  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # _sweep_live_marker_pids — the pids owned by a LIVE inflight marker (review or health), one per line.
@@ -553,7 +553,7 @@ sweep_orphan_procs() {
     [ -n "$wpid" ] && [ "$pid" = "$wpid" ] && continue
     [ -n "$mypgid" ] && [ "$pgid" = "$mypgid" ] && continue
     case "$live" in *" $pid "*) continue ;; esac
-    printf '%s' "$cmd" | grep -Eq "$SWEEP_ORPHAN_CMD_RE" || continue
+    printf '%s' "$cmd" | grep -Eq "$SWEEP_ORPHAN_CMD_RE" || continue  # pipe-ok: single short scalar (one line), far under a pipe buffer
     # Project attribution: some whitespace-separated token of the command line is a path we own …
     # (noglob: a command line legitimately contains `*`, which must never pathname-expand here)
     owned=""

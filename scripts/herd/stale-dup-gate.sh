@@ -76,7 +76,7 @@ sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 
   ref="$(printf '%s\n' "$body" \
     | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
     | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//' 2>/dev/null || true)"
+    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//' 2>/dev/null || true)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   case "$ref" in
     ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
   esac
@@ -199,7 +199,7 @@ stale_dup_check() {
   overlap="$(stale_dup_base_overlap "$dir" "$base" "$head" 2>/dev/null || true)"
   if [ -n "$overlap" ]; then
     count="$(printf '%s\n' "$overlap" | grep -c . 2>/dev/null || printf '0')"
-    first="$(printf '%s\n' "$overlap" | head -n1)"
+    first="$(printf '%s\n' "$overlap" | head -n1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
     _STALE_DUP_KIND="stale-base"
     _STALE_DUP_REASON="stale base: ${count} touched file(s) were changed on ${base} after this branch's merge-base (e.g. ${first}) — merging would silently clobber newer work"
     return 1

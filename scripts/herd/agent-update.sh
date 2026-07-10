@@ -95,7 +95,7 @@ agent_update_dequarantine() {
   [ -n "$path" ] || return 0
   _agent_update_is_darwin || return 0                     # quarantine is a macOS-only concern
   command -v xattr >/dev/null 2>&1 || return 0
-  if xattr "$path" 2>/dev/null | grep -q '^com\.apple\.quarantine$'; then
+  if xattr "$path" 2>/dev/null | grep -q '^com\.apple\.quarantine$'; then  # pipe-ok: bounded command output, under a pipe buffer
     if [ -n "$dry" ]; then
       printf 'agent-update: [dry-run] xattr -d com.apple.quarantine %s\n' "$path"
     else

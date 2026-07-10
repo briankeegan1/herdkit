@@ -51,7 +51,7 @@ _herd_commit_convention_scan() {
   while IFS= read -r _cc_sha; do
     [ -n "$_cc_sha" ] || continue
     _cc_subj="$(git log -1 --format="%s" "$_cc_sha" 2>/dev/null)"
-    if ! printf '%s' "$_cc_subj" | grep -qE "$_cc_pat" 2>/dev/null; then
+    if ! printf '%s' "$_cc_subj" | grep -qE "$_cc_pat" 2>/dev/null; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
       _cc_out="${_cc_out}$(printf '%.12s' "$_cc_sha"):${_cc_subj}"$'\n'
     fi
   done < <(_herd_commit_shas "$_cc_base")

@@ -66,6 +66,7 @@ Role summarized from each file's top-of-file comment.
 - `merge-policy.sh` — THE resolver for the effective merge policy (HERD-159, unified in HERD-210).
 - `new-feature.sh` — new-feature.sh <name> — spin up an isolated worktree off the latest default branch.
 - `oss-triage.sh` — OSS auto-triage (HERD-255 / HERD-168 part 1/3).
+- `pipe-safety-lint.sh` — THE shared pipe-safety guard (HERD-299): a NEW '<producer> | grep -q'
 - `posture-lint.sh` — the CONFIG-POSTURE DOCTOR (HERD-154): a deterministic, no-LLM, report-only lint
 - `push-gate.sh` — the shared helper for the PUSH_GATE=human hold convention (HERD-123).
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
@@ -130,7 +131,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `engine-version.sh` → `journal.sh`
 - `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
-- `healthcheck.sh` → `caps-sync-lint.sh`, `commit-lint.sh`, `doc-drift-lint.sh`, `gate-coverage-lint.sh`, `herd-config.sh`
+- `healthcheck.sh` → `caps-sync-lint.sh`, `commit-lint.sh`, `doc-drift-lint.sh`, `gate-coverage-lint.sh`, `herd-config.sh`, `pipe-safety-lint.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`

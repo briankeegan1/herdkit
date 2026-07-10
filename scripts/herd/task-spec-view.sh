@@ -65,7 +65,7 @@ fi
 glow_pane() { CLICOLOR_FORCE=1 COLORTERM=truecolor glow "$@" </dev/null; }
 
 # file_mtime — portable helper; detect BSD vs GNU once at startup (mirrors backlog-view.sh).
-if stat --version 2>/dev/null | grep -q GNU; then
+if stat --version 2>/dev/null | grep -q GNU; then  # pipe-ok: fixed short version banner, far under a pipe buffer
   file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
 else
   file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }

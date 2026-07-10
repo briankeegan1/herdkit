@@ -707,7 +707,7 @@ _retire_real() {
 # off the absence of a worktree, so a failed enumeration would make every registered slug an orphan at
 # once. This is the guard that turns that amplifier into a no-op tick.
 _retire_worktrees_enumerable() {
-  git -C "$MAIN" worktree list --porcelain 2>/dev/null | grep -q '^worktree '
+  git -C "$MAIN" worktree list --porcelain 2>/dev/null | grep -q '^worktree '  # pipe-ok: bounded command output, under a pipe buffer
 }
 
 # _retire_residual_slugs — slugs whose only remaining trace is a SLUG-KEYED file. This is the leg that
@@ -884,7 +884,7 @@ retirement_tick() {
     [ "$real" = "$self_real" ] && continue          # never retire the checkout we are running from
     [ -n "$trees_real" ] && case "$real/" in "$trees_real"/*) ;; *) continue ;; esac
     open=0
-    [ -n "$branch" ] && printf '%s\n' "$open_branches" | grep -qxF "$branch" && open=1
+    [ -n "$branch" ] && printf '%s\n' "$open_branches" | grep -qxF "$branch" && open=1  # pipe-ok: bounded membership list, under a pipe buffer
     _retire_step "$slug" "$dir" "$branch" "$open" worktree
   done < <(_sweep_worktree_rows)
 
@@ -908,9 +908,9 @@ retirement_tick() {
   local open_slugs seen="" prov; open_slugs="$(_retire_open_pr_slugs)"
   while read -r prov slug; do
     [ -n "${slug:-}" ] || continue
-    printf '%s' "$wt_slugs" | grep -qxF "$slug" && continue    # a live tree → leg A owns it
-    printf '%s' "$open_slugs" | grep -qxF "$slug" && continue  # open PR, no local tree → not debris
-    printf '%s' "$seen" | grep -qxF "$slug" && continue        # already stepped via the other leg
+    printf '%s' "$wt_slugs" | grep -qxF "$slug" && continue    # a live tree → leg A owns it  # pipe-ok: bounded membership list, under a pipe buffer
+    printf '%s' "$open_slugs" | grep -qxF "$slug" && continue  # open PR, no local tree → not debris  # pipe-ok: bounded membership list, under a pipe buffer
+    printf '%s' "$seen" | grep -qxF "$slug" && continue        # already stepped via the other leg  # pipe-ok: bounded membership list, under a pipe buffer
     seen="${seen}${slug}"$'\n'
     # Provenance: this slug came from the engine's OWN tab registry or its OWN slug-keyed marker.
     _retire_step "$slug" "" "" 0 "$prov"
@@ -926,9 +926,9 @@ retirement_tick() {
   _retire_branch_reapable || return 0
   while IFS= read -r slug; do
     [ -n "${slug:-}" ] || continue
-    printf '%s' "$wt_slugs" | grep -qxF "$slug" && continue
-    printf '%s' "$open_slugs" | grep -qxF "$slug" && continue
-    printf '%s' "$seen" | grep -qxF "$slug" && continue
+    printf '%s' "$wt_slugs" | grep -qxF "$slug" && continue  # pipe-ok: bounded membership list, under a pipe buffer
+    printf '%s' "$open_slugs" | grep -qxF "$slug" && continue  # pipe-ok: bounded membership list, under a pipe buffer
+    printf '%s' "$seen" | grep -qxF "$slug" && continue  # pipe-ok: bounded membership list, under a pipe buffer
     _retire_merged_branch_slug "$slug" || continue
     seen="${seen}${slug}"$'\n'
     _retire_step "$slug" "" "" 0 ledger

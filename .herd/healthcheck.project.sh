@@ -567,6 +567,35 @@ case "$_hc_gcov_rc" in
      exit 1 ;;
 esac
 
+# 5c. pipe-safety guard (HERD-299) — a NEW '<producer> | grep -q/-m' (or '| head') is a latent
+# false-red under `set -o pipefail`: the early-exit consumer closes the pipe, the producer takes
+# EPIPE, and pipefail turns the pipeline nonzero once the producer output crosses a pipe buffer
+# (macOS 16KB / Linux 64KB) — exactly the bug that turned macOS CI chronically red (HERD-297, swept
+# in #412). ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/pipe-safety-lint.sh), so the two gates can never disagree. A verified-small producer
+# opts out with an inline '# pipe-ok: <why>'.
+pipe_note="pipe-safety: clean"
+HERD_PIPE_SAFETY_SKIP_REASON=""
+if [ -f scripts/herd/pipe-safety-lint.sh ]; then
+  . scripts/herd/pipe-safety-lint.sh
+  _hc_pipe_errs="$(herd_pipe_safety_lint ".")"; _hc_pipe_rc=$?
+else
+  _hc_pipe_errs=""; _hc_pipe_rc=2
+  HERD_PIPE_SAFETY_SKIP_REASON="scripts/herd/pipe-safety-lint.sh not present"
+fi
+case "$_hc_pipe_rc" in
+  0) pipe_note="pipe-safety: clean" ;;
+  2) pipe_note="pipe-safety: skipped ($HERD_PIPE_SAFETY_SKIP_REASON)" ;;
+  *) pipe_note="pipe-safety: EPIPE-UNSAFE PIPES"
+     if [ -n "$ONELINE" ]; then
+       echo "pipe-safety: $(printf '%s' "$_hc_pipe_errs" | grep '^PIPE-UNSAFE' | head -1)"
+     else
+       echo "PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>')"
+       printf '%s\n' "$_hc_pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$_hc_pipe_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -587,5 +616,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $chl_note"; }
 exit 0
