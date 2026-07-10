@@ -1,5 +1,7 @@
 # herdkit
 
+<img width="3478" height="2228" alt="image" src="https://github.com/user-attachments/assets/bcaa4bfe-ecf0-4fab-a5b6-0c7a6332962f" />
+
 **A reusable, config-driven multi-agent "herd" workflow for [Claude Code](https://claude.com/claude-code), built on the [herdr](https://github.com/) terminal multiplexer.**
 
 herdkit is the orchestration layer — a long-lived **coordinator** that owns a backlog and
