@@ -94,11 +94,11 @@ allow_reason() {
   return 1
 }
 
-# ── select the test files: curated (herd.bats subset) by default, else the glob ──
+# ── select the test files: curated (the exact set the bats gate runs) by default, else the glob ──
 tests=()
 if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
   MODE="curated"
-  # PARSE GUARD (HERD-172): curated mode only greps test-*.sh NAMES out of herd.bats and runs them
+  # PARSE GUARD (HERD-172): curated mode runs the SAME test-*.sh files the bats gate exercises,
   # DIRECTLY — it never parses herd.bats AS bats. So a bats PARSE error (an unclosed / merged @test
   # block) is invisible here and only dies later in the full-suite health gate; that is exactly how a
   # corrupted herd.bats once rode a green CI. Reject it cheaply. A raw .bats file is NOT valid bash
@@ -111,9 +111,22 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
     echo "   Reproduce:  sed -E 's/^[[:space:]]*@test .*\\{\$/f() {/' \"$CURATED_SRC\" | bash -n" >&2
     exit 2
   fi
-  while IFS= read -r f; do
-    [ -n "$f" ] && [ -f "$TESTS_DIR/$f" ] && tests+=("$TESTS_DIR/$f")
-  done < <(grep -oE 'test-[a-z0-9-]+\.sh' "$CURATED_SRC" | sort -u)
+  # SELECTION (HERD-295): tests/herd.bats now GLOBS tests/test-*.sh (dynamic discovery) rather than
+  # naming each test, so we can no longer grep names out of it. Mirror the gate exactly by globbing
+  # test-*.sh and subtracting the SAME exempt list the bats discovery loop and gate-coverage-lint use
+  # (tests/gate-coverage-exempt.tsv — flaky/live-env files kept out of the hermetic gate). The bespoke
+  # hand-written @test blocks (e.g. test-codemap-project.sh) are NOT on the exempt list, so they are
+  # selected here too — this runner runs every file, whether the gate reaches it via discovery or a block.
+  EXEMPT_FILE="$TESTS_DIR/gate-coverage-exempt.tsv"
+  shopt -s nullglob
+  for f in "$TESTS_DIR"/test-*.sh; do
+    base="$(basename "$f")"
+    if [ -f "$EXEMPT_FILE" ] && grep -qxF -- "$base" "$EXEMPT_FILE" 2>/dev/null; then
+      continue
+    fi
+    tests+=("$f")
+  done
+  shopt -u nullglob
 else
   MODE="all"
   shopt -s nullglob
