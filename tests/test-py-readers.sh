@@ -9,6 +9,15 @@
 # mode — herd why <pr>, herd log / --pr N, herd cost / --pr N — and that a broken/absent package
 # silently falls back to the builtin (never a red).
 #
+# HERD-307 (P1b) extends this to `herd status`, which is a LIVE-ENVIRONMENT snapshot (ps / gh /
+# driver-seam / colours / timing dup-detect), not a journal reader — so it is ported via a
+# bash-gathers/python-formats split (scripts/herd/status.sh's _status_gather emits ONE <US>-delimited
+# snapshot; pysrc/herd/status.py and the bash _status_format_bash render it). Only the pure FORMAT
+# stage can be golden-tested; the live-probe GATHER stage deliberately gets no golden. Section (6)
+# drives the FORMAT stage BOTH ways on committed snapshot fixtures (tests/fixtures/status/*.snapshot)
+# via the HERD_STATUS_SNAPSHOT_FILE seam — which skips gather — and cmp's byte-identical incl. exit
+# codes, plus the same fail-soft contract.
+#
 # Fully hermetic: a mktemp project with a fixture .herd/config + a fixture journal (live journal +
 # one rotated archive). Drives the REAL bin/herd both ways and diffs. No real journal, watcher,
 # panes, gh or HOME is touched. --tail is a live `tail -f` follow and is out of scope for a golden
@@ -128,6 +137,77 @@ for mode in "why 42" "log --pr 42" "cost" "cost --pr 42"; do
   # shellcheck disable=SC2086
   run_herd 0 $mode > "$T/bash.out"
   cmp -s "$T/py.out" "$T/bash.out" || fail "raw bytes differ for '$mode' (trailing-newline drift?)"
+  ok
+done
+
+# ── (6) herd status — bash-gathers/python-formats split (HERD-307, P1b) ──────────────────────────────
+# Drive the FORMAT stage both ways on committed snapshot fixtures via the HERD_STATUS_SNAPSHOT_FILE
+# seam (which skips every live probe / gather), and assert byte-identical output + exit code. The
+# fixtures cover the representative states (healthy, watcher-down, dup-detected) plus handoff and a
+# branch-name-overflow case, and one carries a real ANSI palette so the HERD_THEME colour seam is
+# proven identical across both formatters. Live-probe (gather) paths get NO golden — that is the split.
+STATUS_FIX="$REPO/tests/fixtures/status"
+[ -d "$STATUS_FIX" ] || fail "status fixtures dir missing at $STATUS_FIX"
+
+# run_status <engine 0|1> <fixture>  → real CLI, gather skipped by the seam, stdout+exit only. NO_COLOR
+# is deliberately NOT set: colours ride the fixture's COLORS record, so both paths read the same bytes.
+run_status() {
+  local eng="$1" fix="$2"
+  ( cd "$PROJ" && HERD_ENGINE_PY="$eng" HERD_NONINTERACTIVE=1 \
+      HERD_STATUS_SNAPSHOT_FILE="$STATUS_FIX/$fix.snapshot" \
+      HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$HERD_BIN" status 2>/dev/null )
+}
+assert_status_parity() {
+  local fix="$1" out_py out_bash rc_py rc_bash
+  out_py="$(run_status 1 "$fix")";   rc_py=$?
+  out_bash="$(run_status 0 "$fix")"; rc_bash=$?
+  [ "$rc_py" = "$rc_bash" ] || fail "status $fix: exit differs (py=$rc_py bash=$rc_bash)"
+  [ "$out_py" = "$out_bash" ] || {
+    echo "---- python (status $fix) ----" >&2; printf '%s\n' "$out_py" >&2
+    echo "---- builtin (status $fix) ----" >&2; printf '%s\n' "$out_bash" >&2
+    fail "status $fix: output differs between python and bash formatters"
+  }
+  ok
+}
+for fix in healthy watcher-down dup-detected handoff long-branch; do
+  assert_status_parity "$fix"
+done
+
+# Exit-code contract: an attention fixture must exit 1 (both paths), a healthy fixture 0.
+run_status 1 dup-detected >/dev/null; [ "$?" = 1 ] || fail "status dup-detected: python path must exit 1 (attention)"
+run_status 0 dup-detected >/dev/null; [ "$?" = 1 ] || fail "status dup-detected: bash path must exit 1 (attention)"
+run_status 1 healthy      >/dev/null; [ "$?" = 0 ] || fail "status healthy: python path must exit 0"
+ok
+
+# FAIL-SOFT (absent package): an empty HERD_PYSRC tree → `import herd` fails → silent bash formatter,
+# byte-identical to HERD_ENGINE_PY=0, and the attention exit code is preserved.
+brokestat_out="$( cd "$PROJ" && HERD_ENGINE_PY=1 HERD_PYSRC="$BROKEN" \
+    HERD_STATUS_SNAPSHOT_FILE="$STATUS_FIX/dup-detected.snapshot" \
+    HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$HERD_BIN" status 2>/dev/null )"
+brokestat_rc=$?
+[ "$brokestat_rc" = 1 ] || fail "status fail-soft: attention exit must survive the fallback (got $brokestat_rc)"
+[ "$brokestat_out" = "$(run_status 0 dup-detected)" ] || fail "status fail-soft: absent-package output must equal the bash formatter"
+ok
+
+# FAIL-SOFT (broken module): the `herd` package imports but herd.status is missing (BROKEN2 has no
+# status.py) → the python formatter emits nothing → fall back to bash AND print the one-line stderr
+# notice, while stdout stays byte-identical to the bash formatter.
+bs_out="$( cd "$PROJ" && HERD_ENGINE_PY=1 HERD_PYSRC="$BROKEN2" \
+    HERD_STATUS_SNAPSHOT_FILE="$STATUS_FIX/healthy.snapshot" \
+    HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$HERD_BIN" status 2>/dev/null )"
+bs_err="$( cd "$PROJ" && HERD_ENGINE_PY=1 HERD_PYSRC="$BROKEN2" \
+    HERD_STATUS_SNAPSHOT_FILE="$STATUS_FIX/healthy.snapshot" \
+    HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$HERD_BIN" status 2>&1 1>/dev/null )"
+[ "$bs_out" = "$(run_status 0 healthy)" ] || fail "status fail-soft: broken-module output must equal the bash formatter"
+[[ "$bs_err" == *"builtin fallback"* ]] || fail "status fail-soft: expected a one-line stderr fallback notice"
+ok
+
+# RAW BYTES: cmp the unstripped byte streams for one attention + one healthy fixture (catches any
+# trailing-newline drift the $(...) parity checks strip symmetrically).
+for fix in dup-detected healthy; do
+  run_status 1 "$fix" > "$T/py.out"
+  run_status 0 "$fix" > "$T/bash.out"
+  cmp -s "$T/py.out" "$T/bash.out" || fail "status raw bytes differ for '$fix' (trailing-newline drift?)"
   ok
 done
 

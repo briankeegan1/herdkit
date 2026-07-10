@@ -201,65 +201,96 @@ _status_dup_verified() {
   printf '%s\n' "$pids"
 }
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────────────────────────
+# ── GATHER → FORMAT split (HERD-307, P1b, EPIC HERD-300) ───────────────────────────────────────────
+# `herd status` is a LIVE-ENVIRONMENT snapshot (ps / gh / driver-seam / colours / timing dup-detect),
+# not a journal reader — so it cannot be ported wholesale like P1's readers. Instead it is split at a
+# stable serialization seam:
+#   • _status_gather      — runs EVERY live probe (watcher liveness, git worktrees, driver roster, gh
+#                           PRs, ledgers, backlog, codemap), does all classification, and emits ONE
+#                           colour-resolved, <US>-delimited snapshot. This is the ONLY stage that
+#                           touches the live environment, so it deliberately gets NO golden.
+#   • _status_format_bash — the historical bash formatter, now reading that snapshot instead of local
+#                           vars. Stays in place as the FAIL-SOFT fallback.
+#   • pysrc/herd/status.py — the python formatter, byte-identical to _status_format_bash over the same
+#                           snapshot. Preferred when the `herd` package imports (HERD_ENGINE_PY!=0).
+# _status_run wires them: gather once, then format via python (fail-soft to bash on HERD_ENGINE_PY=0 or
+# any import/exec failure). Because BOTH formatters consume the SAME snapshot, output cannot fork; the
+# golden parity test (tests/test-py-readers.sh) drives the format both ways on committed snapshot
+# fixtures and cmp's byte-identical incl. exit codes. Colours flow through the snapshot's COLORS record
+# (resolved from HERD_THEME by cmd_status, exactly as today) so the seam carries the palette too.
+#
+# Snapshot record grammar — one record per line, fields joined by US (\037); section order is fixed by
+# the formatter (it parses all records first, then renders), so record order is not load-bearing:
+#   COLORS    <b> <d> <g> <y> <r> <x>          resolved palette (empty under NO_COLOR / standalone)
+#   WORKSPACE <name>
+#   ROOT      <root>
+#   WATCHER   <state> <pid1> <count> <pids>    state ∈ down|alive|handoff|dup ; <pids> space-joined
+#   BCOUNTS   <building> <done> <idle> <dead>
+#   BUILDER   <verdict> <slug> <prnum>         repeated, in display order
+#   PRCOUNT   <n>
+#   PR        <num> <branch> <mergeable> <mstate> <review> <health> <decision> <attn>   repeated
+#   BACKLOG   file <open> <inprog>   |   BACKLOG other <backend>
+#   CODEMAP   <present 0|1> <fresh 0|1>        no CODEMAP section rendered when present=0
+#   ATTENTION <0|1>
+#   REASONS   <reasons string>                 leading-space-joined tokens, printed verbatim
 
-# _status_run — gather + print the four-section snapshot for THIS project (config already loaded).
-# Returns 1 when something needs attention (a DEAD builder, a CONFLICTING PR, or a review-blocked
-# PR), 0 when healthy. Every external command is best-effort (missing git/gh/herdr degrades to a
-# graceful "unknown"/empty, never a crash).
-_status_run() {
+# _status_gather — LIVE-PROBE stage: gather + classify, emit the snapshot on stdout. Always returns 0
+# (the attention verdict rides in the snapshot's ATTENTION field, not the exit code). Every external
+# command is best-effort (missing git/gh/herdr degrades to a graceful "unknown"/empty, never a crash).
+_status_gather() {
+  local US=$'\037'
   local root="${PROJECT_ROOT:-$(pwd)}"
   local trees="${WORKTREES_DIR:-${root}-trees}"
   local base="${DEFAULT_BRANCH:-origin/main}"
   local review_ledger="$trees/.agent-watch-reviewed"
   local health_ledger="$trees/.agent-watch-healthchecks"
-  local b="${c_bold:-}" d="${c_dim:-}" g="${c_grn:-}" y="${c_yel:-}" r="${c_red:-}" x="${c_rst:-}"
   local attention=0 reasons=""
 
-  printf '%s🐑 herd status%s · %s%s%s · %s%s%s\n\n' \
-    "$b" "$x" "$b" "${WORKSPACE_NAME:-?}" "$x" "$d" "$root" "$x"
+  # Resolved palette, baked into the snapshot so BOTH formatters apply byte-identical colours from the
+  # same seam (HERD_THEME via bin/herd's herd_theme_load_cli, already loaded by cmd_status). Empty under
+  # NO_COLOR / a standalone source, exactly as the historical inline `${x:-}` defaults.
+  printf 'COLORS%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+    "$US" "${c_bold:-}" "$US" "${c_dim:-}" "$US" "${c_grn:-}" \
+    "$US" "${c_yel:-}" "$US" "${c_red:-}" "$US" "${c_rst:-}"
+  printf 'WORKSPACE%s%s\n' "$US" "${WORKSPACE_NAME:-?}"
+  printf 'ROOT%s%s\n' "$US" "$root"
 
   # (a) WATCHER — alive via the argv0 marker / pid lock. A down watcher is INFORMATIONAL only (its
   #     counts may be stale); it is NOT an attention condition on its own — we never false-red it.
-  local wpids wpid1 wcount
+  local wpids wpid1="" wcount="0" wstate="down" wpids_out=""
   wpids="$(_status_watcher_pids)"
   if [ -n "$wpids" ]; then
     wpid1="${wpids%%$'\n'*}"   # first pid line (no pipe → no pipefail/SIGPIPE surprise under set -e)
-    # Count DISTINCT live watcher mains for this workspace. Exactly one is the invariant (HERD-209):
-    # a duplicate races the shared .git object store (healthchecks restart endlessly) and is a REAL
-    # attention condition, NOT the calm "down" state — so we warn LOUD and flag it for the operator.
-    # But only once it is VERIFIED REAL (HERD-266): a single sample cannot tell a duplicate from a
-    # transient fork or a self-restart handoff, and a false red is worse than a late one.
+    # Exactly one watcher main is the invariant (HERD-209): a duplicate races the shared .git object
+    # store and is a REAL attention condition — but only once VERIFIED REAL (HERD-266): a single sample
+    # cannot tell a duplicate from a transient fork or a self-restart handoff, and a false red is worse
+    # than a late one. _status_dup_verified adds the checks that need TIME (handoff window + resample)
+    # and prints the SURVIVING pids — the only ones the operator should act on.
     wcount="$(_status_watcher_count "$wpids")"
     local wsurv=""
     if [ "${wcount:-1}" -gt 1 ] && wsurv="$(_status_dup_verified "$wpids")"; then
-      # The SURVIVING mains — the ones every sample saw — are what the operator must act on, and the
-      # only ones we count. _status_dup_verified has already proven there is more than one of them.
       wcount="$(_status_watcher_count "$wsurv")"
-      local wall; wall="$(printf '%s' "$wsurv" | tr '\n' ' ')"
-      printf '  %sWATCHER%s   %s⚠ %s watcher mains alive%s (pids %s) %s— duplicates race the gate; stop the extras: '"'"'herd pane watch'"'"' (or kill all but one)%s\n' \
-        "$b" "$x" "$r" "$wcount" "$x" "${wall% }" "$d" "$x"
+      wpids_out="$(printf '%s' "$wsurv" | tr '\n' ' ')"; wpids_out="${wpids_out% }"
+      wstate="dup"
       attention=1; reasons="${reasons} duplicate-watchers:${wcount}"
     elif [ "${wcount:-1}" -gt 1 ] && declare -f watcher_handoff_active >/dev/null 2>&1 \
          && watcher_handoff_active; then
-      printf '  %sWATCHER%s   %salive%s (pid %s) %s· engine-update restart handoff in progress%s\n' \
-        "$b" "$x" "$g" "$x" "$wpid1" "$d" "$x"
+      wstate="handoff"
     else
-      printf '  %sWATCHER%s   %salive%s (pid %s)\n' "$b" "$x" "$g" "$x" "$wpid1"
+      wstate="alive"
     fi
+    printf 'WATCHER%s%s%s%s%s%s%s%s\n' "$US" "$wstate" "$US" "$wpid1" "$US" "$wcount" "$US" "$wpids_out"
   else
-    printf '  %sWATCHER%s   %sdown%s %s(no herd-watch-<workspace> process / pid lock)%s\n' \
-      "$b" "$x" "$y" "$x" "$d" "$x"
+    printf 'WATCHER%s%s%s%s%s%s%s%s\n' "$US" "down" "$US" "" "$US" "0" "$US" ""
   fi
 
-  # (b) BUILDERS — one row per active feature worktree, joined to its agent + PR. DEAD is the
+  # (b) BUILDERS — one record per active feature worktree, joined to its agent + PR. DEAD is the
   #     read-only replica of the watcher's signature. gh/herdr absence degrades gracefully.
   local wt_porcelain agents_json prs_json
   wt_porcelain="$(git -C "$root" worktree list --porcelain 2>/dev/null || true)"
   # Builder roster via the driver seam (herdr-claude → `herdr agent list`; headless → the detached-agent
-  # registry), the same seam agent-watch.sh reads. Guarded like the liveness probe below so a standalone
-  # source (the hermetic test) — where driver.sh is not loaded — degrades to an empty roster instead of a
-  # raw herdr call.
+  # registry), the same seam agent-watch.sh reads. Guarded so a standalone source (the hermetic tests) —
+  # where driver.sh is not loaded — degrades to an empty roster instead of a raw herdr call.
   if declare -f herd_driver_agent_list_json >/dev/null 2>&1; then
     agents_json="$(herd_driver_agent_list_json 2>/dev/null || printf '{}')"
   else
@@ -306,7 +337,7 @@ for wt, branch in feats:
         ag_status.get(slug, "")]))
 ' 2>/dev/null || true)"
 
-  local n_build=0 n_done=0 n_idle=0 n_dead=0 rows=""
+  local n_build=0 n_done=0 n_idle=0 n_dead=0 builder_recs=""
   local rec wt slug branch prnum mergeable mstate decision headsha astatus has_agent has_pr commits verdict liveness
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
@@ -319,34 +350,28 @@ EOF
     case "$commits" in ''|*[!0-9]*) commits=0 ;; esac
     # HERD-114: read-only, fail-soft liveness of the agent SESSION (its process), distinct from the
     # stale agent_status word herdr keeps reporting after a crash. Probe only a listed agent that would
-    # otherwise read done/idle (a live process for a working agent is self-evident; a vanished one is
-    # already 'dead'); only a POSITIVE 'dead' changes the bucket, so this is byte-identical when live or
-    # when the probe can't tell / the driver seam is unavailable (standalone test).
+    # otherwise read done/idle; only a POSITIVE 'dead' changes the bucket, so this is byte-identical when
+    # live or when the probe can't tell / the driver seam is unavailable (standalone tests).
     liveness=""
     if [ "$has_agent" = "1" ] && [ "$astatus" != "working" ] && declare -f herd_driver_agent_liveness >/dev/null 2>&1; then
       liveness="$(herd_driver_agent_liveness "$slug" 2>/dev/null || printf 'unknown')"
     fi
     verdict="$(_status_classify_builder "$has_agent" "$astatus" "$has_pr" "$commits" "$liveness")"
-    local sl; sl="$(printf '%-24s' "$slug")"
     case "$verdict" in
-      building)  n_build=$((n_build+1)); rows="${rows}    ${g}🔨${x} ${b}${sl}${x} building"$'\n' ;;
-      done)      n_done=$((n_done+1));   rows="${rows}    ${g}✅${x} ${b}${sl}${x} done${prnum:+ · PR #$prnum}"$'\n' ;;
-      idle)      n_idle=$((n_idle+1));   rows="${rows}    ${d}💤 ${sl} idle · no PR${x}"$'\n' ;;
-      agentdead) n_dead=$((n_dead+1));   attention=1; reasons="${reasons} agent-dead:${slug}"
-                 rows="${rows}    ${r}💀 ${b}${sl}${x} ${r}AGENT DEAD (session unwakeable${prnum:+ · PR #$prnum}) — re-task by hand${x}"$'\n' ;;
-      agentmissing) n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-missing:${slug}"
-                 rows="${rows}    ${r}🫥 ${b}${sl}${x} ${r}AGENT MISSING (no agent pane${prnum:+ · PR #$prnum}) — re-task by hand${x}"$'\n' ;;
-      dead)      n_dead=$((n_dead+1));   attention=1; reasons="${reasons} dead-builder:${slug}"
-                 rows="${rows}    ${r}💀 ${b}${sl}${x} ${r}DEAD (no agent, no PR, no commits)${x}"$'\n' ;;
+      building)     n_build=$((n_build+1)) ;;
+      done)         n_done=$((n_done+1)) ;;
+      idle)         n_idle=$((n_idle+1)) ;;
+      agentdead)    n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-dead:${slug}" ;;
+      agentmissing) n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-missing:${slug}" ;;
+      dead)         n_dead=$((n_dead+1)); attention=1; reasons="${reasons} dead-builder:${slug}" ;;
     esac
+    builder_recs="${builder_recs}BUILDER${US}${verdict}${US}${slug}${US}${prnum}"$'\n'
   done <<EOF
 $feats
 EOF
 
-  local dcol=""; [ "$n_dead" -gt 0 ] && dcol="$r"
-  printf '  %sBUILDERS%s  %d building · %d done · %d idle · %s%d dead%s\n' \
-    "$b" "$x" "$n_build" "$n_done" "$n_idle" "$dcol" "$n_dead" "$x"
-  [ -n "$rows" ] && printf '%s' "$rows"
+  printf 'BCOUNTS%s%s%s%s%s%s%s%s\n' "$US" "$n_build" "$US" "$n_done" "$US" "$n_idle" "$US" "$n_dead"
+  [ -n "$builder_recs" ] && printf '%s' "$builder_recs"
 
   # (c) PRS — open PRs + gate state (mergeable/mstate + last review/health verdict + reviewDecision).
   local pr_summary
@@ -363,8 +388,8 @@ for p in prs:
 ' 2>/dev/null || printf '0')"
   local n_prs; n_prs="${pr_summary%%$'\n'*}"   # first line = the count (no pipe under set -e)
   case "$n_prs" in ''|*[!0-9]*) n_prs=0 ;; esac
-  printf '  %sPRS%s       %d open\n' "$b" "$x" "$n_prs"
-  local first=1 num title brnch review health attn mcol
+  printf 'PRCOUNT%s%s\n' "$US" "$n_prs"
+  local first=1 num title brnch review health attn
   while IFS= read -r rec; do
     if [ "$first" = 1 ]; then first=0; continue; fi   # skip the count line
     [ -n "$rec" ] || continue
@@ -375,20 +400,14 @@ EOF
     health="$(_status_latest_health "$health_ledger" "$num")"
     attn="$(_status_pr_attention "$mergeable" "$review" "$decision")"
     if [ "$attn" = "1" ]; then
-      attention=1; mcol="$r"
+      attention=1
       case "$mergeable" in CONFLICTING) reasons="${reasons} conflicting-pr:#${num}" ;; esac
       [ "$review" = "BLOCK" ] && reasons="${reasons} review-blocked:#${num}"
       [ "$decision" = "CHANGES_REQUESTED" ] && reasons="${reasons} changes-requested:#${num}"
-    else
-      mcol="$g"
     fi
-    printf '    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s\n' \
-      "$d" "$num" "$x" "$b" "${brnch:0:24}" "$x" \
-      "$mcol" "${mergeable:-UNKNOWN}" "$x" \
-      "${mstate:+ · $mstate}" \
-      "${review:+ · review $review}" \
-      "${health:+ · health $health}" \
-      "${decision:+ · $decision}"
+    printf 'PR%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+      "$US" "$num" "$US" "$brnch" "$US" "$mergeable" "$US" "$mstate" \
+      "$US" "$review" "$US" "$health" "$US" "$decision" "$US" "$attn"
   done <<EOF
 $pr_summary
 EOF
@@ -401,34 +420,184 @@ EOF
     case "$blf" in /*) : ;; *) blf="$root/$blf" ;; esac
     counts="$(_status_backlog_counts "$blf")"
     bopen="${counts%% *}"; binprog="${counts##* }"
-    printf '  %sBACKLOG%s   %s open · %s in-progress\n' "$b" "$x" "$bopen" "$binprog"
+    printf 'BACKLOG%sfile%s%s%s%s\n' "$US" "$US" "$bopen" "$US" "$binprog"
   else
-    printf '  %sBACKLOG%s   %s(backend: %s — no local counts)%s\n' \
-      "$b" "$x" "$d" "${SCRIBE_BACKEND}" "$x"
+    printf 'BACKLOG%sother%s%s\n' "$US" "$US" "${SCRIBE_BACKEND}"
   fi
 
-  # (e) CODEMAP — freshness of the committed docs/codemap.md. INFORMATIONAL ONLY: always dim, never
-  #     red, and NEVER an attention condition (per the no-false-red rule — a stale doc is not a broken
-  #     build). Shown only when the project has adopted the codemap (the committed file exists). Uses
-  #     the read-only `codemap.sh --check` probe (exit 0 fresh / non-zero stale) which never writes
-  #     the committed file. Independent of CODEMAP_AUTOREFRESH.
-  local cm_dir cm_script cm_out
+  # (e) CODEMAP — freshness of the committed docs/codemap.md. INFORMATIONAL ONLY (always dim, never an
+  #     attention condition — a stale doc is not a broken build). Shown only when the project has adopted
+  #     the codemap. Uses the read-only `codemap.sh --check` probe (exit 0 fresh / non-zero stale), which
+  #     never writes the committed file. Independent of CODEMAP_AUTOREFRESH.
+  local cm_dir cm_script cm_out cm_present=0 cm_fresh=0
   cm_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   cm_script="$cm_dir/codemap.sh"; cm_out="$root/docs/codemap.md"
   if [ -f "$cm_out" ] && [ -f "$cm_script" ]; then
+    cm_present=1
     if HERD_CODEMAP_ROOT="$root" HERD_CODEMAP_OUT="$cm_out" bash "$cm_script" --check >/dev/null 2>&1; then
+      cm_fresh=1
+    fi
+  fi
+  printf 'CODEMAP%s%s%s%s\n' "$US" "$cm_present" "$US" "$cm_fresh"
+
+  printf 'ATTENTION%s%s\n' "$US" "$attention"
+  printf 'REASONS%s%s\n' "$US" "$reasons"
+  return 0
+}
+
+# _status_format_bash — FORMAT stage (fallback): render the snapshot on stdin to the four-section
+# report, byte-identical to the historical inline formatter. Returns 1 on attention, 0 when healthy —
+# the exit contract rides the snapshot's ATTENTION field, so both formatters agree.
+_status_format_bash() {
+  local US=$'\037'
+  local b="" d="" g="" y="" r="" x=""
+  local workspace="" root=""
+  local w_state="down" w_pid1="" w_count="0" w_pids=""
+  local n_build=0 n_done=0 n_idle=0 n_dead=0 builder_rows=""
+  local n_prs=0 pr_rows=""
+  local bl_kind="" bl_open="" bl_inprog="" bl_backend=""
+  local cm_present=0 cm_fresh=0 attention=0 reasons=""
+  local line key rest
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    key="${line%%"$US"*}"; rest="${line#*"$US"}"
+    case "$key" in
+      COLORS)    IFS=$US read -r b d g y r x <<EOF
+$rest
+EOF
+        ;;
+      WORKSPACE) workspace="$rest" ;;
+      ROOT)      root="$rest" ;;
+      WATCHER)   IFS=$US read -r w_state w_pid1 w_count w_pids <<EOF
+$rest
+EOF
+        ;;
+      BCOUNTS)   IFS=$US read -r n_build n_done n_idle n_dead <<EOF
+$rest
+EOF
+        ;;
+      BUILDER)
+        local bv bslug bpr sl
+        IFS=$US read -r bv bslug bpr <<EOF
+$rest
+EOF
+        sl="$(printf '%-24s' "$bslug")"
+        case "$bv" in
+          building)     builder_rows="${builder_rows}    ${g}🔨${x} ${b}${sl}${x} building"$'\n' ;;
+          done)         builder_rows="${builder_rows}    ${g}✅${x} ${b}${sl}${x} done${bpr:+ · PR #$bpr}"$'\n' ;;
+          idle)         builder_rows="${builder_rows}    ${d}💤 ${sl} idle · no PR${x}"$'\n' ;;
+          agentdead)    builder_rows="${builder_rows}    ${r}💀 ${b}${sl}${x} ${r}AGENT DEAD (session unwakeable${bpr:+ · PR #$bpr}) — re-task by hand${x}"$'\n' ;;
+          agentmissing) builder_rows="${builder_rows}    ${r}🫥 ${b}${sl}${x} ${r}AGENT MISSING (no agent pane${bpr:+ · PR #$bpr}) — re-task by hand${x}"$'\n' ;;
+          dead)         builder_rows="${builder_rows}    ${r}💀 ${b}${sl}${x} ${r}DEAD (no agent, no PR, no commits)${x}"$'\n' ;;
+        esac
+        ;;
+      PRCOUNT)   n_prs="$rest" ;;
+      PR)
+        local pnum pbr pmerge pmstate preview phealth pdec pattn mcol
+        IFS=$US read -r pnum pbr pmerge pmstate preview phealth pdec pattn <<EOF
+$rest
+EOF
+        [ "$pattn" = "1" ] && mcol="$r" || mcol="$g"
+        pr_rows="${pr_rows}$(printf '    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s' \
+          "$d" "$pnum" "$x" "$b" "${pbr:0:24}" "$x" \
+          "$mcol" "${pmerge:-UNKNOWN}" "$x" \
+          "${pmstate:+ · $pmstate}" \
+          "${preview:+ · review $preview}" \
+          "${phealth:+ · health $phealth}" \
+          "${pdec:+ · $pdec}")"$'\n'
+        ;;
+      BACKLOG)   IFS=$US read -r bl_kind bl_open bl_inprog <<EOF
+$rest
+EOF
+        [ "$bl_kind" = "other" ] && bl_backend="$bl_open"
+        ;;
+      CODEMAP)   IFS=$US read -r cm_present cm_fresh <<EOF
+$rest
+EOF
+        ;;
+      ATTENTION) attention="$rest" ;;
+      REASONS)   reasons="$rest" ;;
+    esac
+  done
+
+  printf '%s🐑 herd status%s · %s%s%s · %s%s%s\n\n' \
+    "$b" "$x" "$b" "$workspace" "$x" "$d" "$root" "$x"
+
+  case "$w_state" in
+    dup)     printf '  %sWATCHER%s   %s⚠ %s watcher mains alive%s (pids %s) %s— duplicates race the gate; stop the extras: '"'"'herd pane watch'"'"' (or kill all but one)%s\n' \
+               "$b" "$x" "$r" "$w_count" "$x" "$w_pids" "$d" "$x" ;;
+    handoff) printf '  %sWATCHER%s   %salive%s (pid %s) %s· engine-update restart handoff in progress%s\n' \
+               "$b" "$x" "$g" "$x" "$w_pid1" "$d" "$x" ;;
+    alive)   printf '  %sWATCHER%s   %salive%s (pid %s)\n' "$b" "$x" "$g" "$x" "$w_pid1" ;;
+    *)       printf '  %sWATCHER%s   %sdown%s %s(no herd-watch-<workspace> process / pid lock)%s\n' \
+               "$b" "$x" "$y" "$x" "$d" "$x" ;;
+  esac
+
+  local dcol=""; [ "$n_dead" -gt 0 ] && dcol="$r"
+  printf '  %sBUILDERS%s  %d building · %d done · %d idle · %s%d dead%s\n' \
+    "$b" "$x" "$n_build" "$n_done" "$n_idle" "$dcol" "$n_dead" "$x"
+  [ -n "$builder_rows" ] && printf '%s' "$builder_rows"
+
+  printf '  %sPRS%s       %d open\n' "$b" "$x" "$n_prs"
+  [ -n "$pr_rows" ] && printf '%s' "$pr_rows"
+
+  if [ "$bl_kind" = "file" ]; then
+    printf '  %sBACKLOG%s   %s open · %s in-progress\n' "$b" "$x" "$bl_open" "$bl_inprog"
+  else
+    printf '  %sBACKLOG%s   %s(backend: %s — no local counts)%s\n' \
+      "$b" "$x" "$d" "$bl_backend" "$x"
+  fi
+
+  if [ "$cm_present" = "1" ]; then
+    if [ "$cm_fresh" = "1" ]; then
       printf '  %sCODEMAP%s   %sfresh%s\n' "$b" "$x" "$d" "$x"
     else
       printf '  %sCODEMAP%s   %sstale · run `herd codemap` to refresh%s\n' "$b" "$x" "$d" "$x"
     fi
   fi
 
-  # Verdict line + exit code.
   printf '\n'
-  if [ "$attention" = 1 ]; then
+  if [ "$attention" = "1" ]; then
     printf '%s⚠️  attention:%s%s\n' "$y" "$reasons" "$x"
     return 1
   fi
   printf '%s✅ healthy%s\n' "$g" "$x"
   return 0
+}
+
+# _status_run — gather ONCE, then FORMAT via python (fail-soft to the bash formatter). The snapshot is
+# buffered to a rewindable temp file so both paths read the same bytes and a mid-render python failure
+# (empty output) falls back cleanly. HERD_STATUS_SNAPSHOT_FILE is a TEST SEAM: when it names a readable
+# file, gather is skipped and that committed snapshot fixture is formatted directly — the hook the
+# golden parity test uses to drive the FORMAT stage both ways without any live probe. Returns 1 on
+# attention, 0 when healthy (the snapshot's verdict, preserved across both format paths).
+_status_run() {
+  local snap="" snap_is_temp=0 rc
+  if [ -n "${HERD_STATUS_SNAPSHOT_FILE:-}" ] && [ -f "$HERD_STATUS_SNAPSHOT_FILE" ]; then
+    snap="$HERD_STATUS_SNAPSHOT_FILE"
+  else
+    snap="$(mktemp 2>/dev/null)" || { _status_gather | _status_format_bash; return $?; }
+    snap_is_temp=1
+    _status_gather > "$snap" || true
+  fi
+  # Python FORMAT path — mirrors the P1 reader dispatch: preflight the package once (memoised), buffer
+  # its output, and use it ONLY if it rendered something. Empty output = HERD_ENGINE_PY=0 or an
+  # import/exec failure → silently fall back to the bash formatter (never a red row).
+  if declare -f _herd_py_ok >/dev/null 2>&1 && _herd_py_ok; then
+    local out; out="$(mktemp 2>/dev/null)"
+    if [ -n "$out" ]; then
+      PYTHONPATH="${HERD_PYSRC:-}${PYTHONPATH:+:$PYTHONPATH}" python3 -m herd.status <"$snap" >"$out" 2>/dev/null
+      rc=$?
+      if [ -s "$out" ]; then
+        cat "$out"; rm -f "$out"
+        [ "$snap_is_temp" = 1 ] && rm -f "$snap"
+        return "$rc"
+      fi
+      rm -f "$out"
+      declare -f warn >/dev/null 2>&1 && warn "herd status: python formatter unavailable — using builtin fallback"
+    fi
+  fi
+  _status_format_bash <"$snap"; rc=$?
+  [ "$snap_is_temp" = 1 ] && rm -f "$snap"
+  return "$rc"
 }
