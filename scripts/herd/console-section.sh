@@ -117,6 +117,60 @@ herd_console_section() {
   printf '%s' "$_cs_rows"
 }
 
+# herd_console_visible_lines_tracker <ledger> <limit> [ack-file]
+#   Like herd_console_visible_lines but with HEALED-SUPERSEDES-FAILED (HERD-284): when a `healed`
+#   row for a tracker ref has been seen (reading newest-first), any earlier `failed` rows for that
+#   same ref are dropped. Display-only and fail-soft — a missing or malformed ref never hides a row.
+herd_console_visible_lines_tracker() {
+  local _cs_file="$1" _cs_limit="$2" _cs_ack="${3:-}"
+  [ -s "$_cs_file" ] || return 0
+  local _cs_line _cs_meta _cs_epoch _cs_loud _cs_now _cs_n=0
+  local _cs_e2 _cs_status _cs_ref _cs_rest _cs_healed=" "
+  _cs_now="$(_console_now_epoch)"
+  while IFS= read -r _cs_line; do
+    [ -n "$_cs_line" ] || continue
+    _cs_meta="$(herd_console_classify_tracker_heal "$_cs_line")" || continue
+    IFS=$'\t' read -r _cs_epoch _cs_loud <<EOF
+$_cs_meta
+EOF
+    herd_console_row_visible "$_cs_now" "${_cs_epoch:-}" "${_cs_loud:-calm}" || continue
+    herd_console_acked "$_cs_ack" "$_cs_line" && continue
+    _cs_e2="" _cs_status="" _cs_ref="" _cs_rest=""
+    read -r _cs_e2 _cs_status _cs_ref _cs_rest <<EOF
+$_cs_line
+EOF
+    case "${_cs_status:-}" in
+      healed)
+        [ -n "${_cs_ref:-}" ] && _cs_healed="${_cs_healed}${_cs_ref} "
+        ;;
+      *)
+        if [ -n "${_cs_ref:-}" ]; then
+          case "${_cs_healed}" in *" ${_cs_ref} "*) continue ;; esac
+        fi
+        ;;
+    esac
+    printf '%s\n' "$_cs_line"
+    _cs_n=$(( _cs_n + 1 ))
+    [ "$_cs_n" -ge "$_cs_limit" ] && break
+  done < <(_console_reverse_file "$_cs_file")
+  return 0
+}
+
+# herd_console_section_tracker <ledger> <limit> <render-fn> [ack-file]
+#   Like herd_console_section but uses herd_console_visible_lines_tracker so healed rows supersede
+#   earlier failed rows for the same tracker ref (HERD-284).
+herd_console_section_tracker() {
+  local _cs_file="$1" _cs_limit="$2" _cs_render="$3" _cs_ack="${4:-}"
+  local _cs_line _cs_row _cs_rows=""
+  while IFS= read -r _cs_line; do
+    [ -n "$_cs_line" ] || continue
+    _cs_row="$("$_cs_render" "$_cs_line")" || continue
+    [ -n "$_cs_row" ] || continue
+    _cs_rows="${_cs_rows}${_cs_row}"$'\n'
+  done < <(herd_console_visible_lines_tracker "$_cs_file" "$_cs_limit" "$_cs_ack")
+  printf '%s' "$_cs_rows"
+}
+
 # herd_console_trim <file> [max]  — tail-keep the last <max> lines (default CONSOLE_LEDGER_MAX).
 #   Call on every append. Always returns 0: a ledger that cannot be trimmed is never a hard error.
 herd_console_trim() {
