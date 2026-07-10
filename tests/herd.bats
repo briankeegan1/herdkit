@@ -169,10 +169,29 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backlog-view resize repaint (HERD-288) test passes" {
+  run bash "$REPO/tests/test-backlog-view-resize.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "backlog-view rendered frame fits its render width (HERD-288)" {
+  run bash "$REPO/tests/test-backlog-view-width.sh"
+  [ "$status" -eq 0 ]
+  # glow is an OPTIONAL dep — a clean SKIP is a pass, never a red row.
+  [[ "$output" == *"ALL PASS"* || "$output" == *"SKIP"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic builder-note full-text sidecar test passes" {
+  run bash "$REPO/tests/test-note-full-sidecar.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
 }
 
 @test "hermetic Claude Code plugin manifest test passes" {
@@ -249,6 +268,18 @@ setup() {
 
 @test "hermetic journal self-audit gap-finder (HERD-238 + HERD-272 human-verify rule) test passes" {
   run bash "$REPO/tests/test-journal-audit.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic python read-only readers parity (HERD-302 P1 port) test passes" {
+  run bash "$REPO/tests/test-py-readers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic python decision-core parity (HERD-303 P2 port) test passes" {
+  run bash "$REPO/tests/test-py-decisions.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

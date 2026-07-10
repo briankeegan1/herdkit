@@ -101,5 +101,35 @@ printf '%s\n' "$out" | grep -q 'UNGATED test-orphan.sh' \
 pass
 echo "PASS (6) empty exempt file: no exemptions, unwired test still reds"
 
+# ── 7. EPIPE regression (HERD-297): a wired test referenced EARLY in a large herd.bats must be ────
+#       classified WIRED even under `set -o pipefail`. The pre-fix code piped the bats text into
+#       `grep -qF "$base"`; grep's early exit closed the pipe, the producer (printf) took EPIPE, and
+#       pipefail turned that wired test into a false UNGATED once herd.bats grew past a pipe buffer
+#       (16KB macOS / 64KB Linux). This whole file already runs under `set -o pipefail` (line 15), so
+#       it exercises the exact failure shape. Grepping the bats FILE directly removes the pipe.
+TP="$T/tree-epipe"; mkdir -p "$TP/tests"
+# herd.bats: reference the target test on the FIRST line (early match), then pad well past 64KB so
+# the producer is still mid-write when grep exits — reproducing the EPIPE on both pipe-buffer sizes.
+{
+  printf 'run bash "$REPO/tests/test-early.sh"\n'
+  epipe_i=0
+  while [ "$epipe_i" -lt 1500 ]; do
+    printf '# padding line %04d keeps the bats text large so the pre-fix pipe would EPIPE mid-write\n' "$epipe_i"
+    epipe_i=$((epipe_i + 1))
+  done
+} > "$TP/tests/herd.bats"
+printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TP/tests/test-early.sh"
+[ "$(wc -c < "$TP/tests/herd.bats")" -gt 65536 ] \
+  || fail "(7) fixture herd.bats must exceed 64KB to exercise the EPIPE shape"
+# Pure function, called directly under the file's active `set -o pipefail`.
+out="$(herd_gate_coverage_check "$TP/tests/herd.bats" "$TP/tests")"; rc=$?
+[ "$rc" -eq 0 ] \
+  || fail "(7) early-referenced test in a >64KB herd.bats must classify clean (exit 0, got $rc) — EPIPE regression: $out"
+printf '%s\n' "$out" | grep -q 'UNGATED' \
+  && fail "(7) test-early.sh is wired — must NOT be UNGATED (EPIPE misclassification): $out"
+printf '%s\n' "$out" | grep -q '^ADVISORY:' || fail "(7) advisory summary line missing"
+pass
+echo "PASS (7) EPIPE regression: early-referenced test in a >64KB herd.bats stays WIRED under pipefail"
+
 echo
 echo "ALL PASS ($PASS checks) — gate-coverage drift guard is live, fail-soft, and catches ungated tests."
