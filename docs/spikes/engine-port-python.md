@@ -86,8 +86,22 @@ park any of these; only the *shadow-mode acceptance discipline* in P3 is strongl
   behavior through stubs, not bash internals), so it is already the cross-implementation
   acceptance suite most ports have to build first. Only after sustained parity does a
   project opt in via a flag (e.g. `ENGINE_IMPL=python`, ship-dormant per doctrine).
+- **P3.5 — dual-engine safety (HERD-308, the hard gate before P4).** The moment two engines
+  can write the same worktree pool, "different behavior levels silently coexisting" becomes a
+  corruption source. This leg makes it unrepresentable: every mutable-state write carries its
+  writer's engine level through **one shared stamp** (`scripts/herd/engine-seat.sh`), reconciled
+  every watcher tick — a second level writing the pool halts the *stale* seat loudly (its
+  merge/blessing writes are HELD), so there are zero cross-mismatch writes. It also ships the
+  **quiesce gate** P4 depends on: `herd_engine_migration_guard` refuses a store migration unless
+  every seat has quiesced or a dual-write window is declared. Ship-dormant (`ENGINE_SEAT_RECONCILE`,
+  default off) and inert for a single seat. The bash stamp format is the one the P4 store accessors
+  adopt verbatim. Operational prescription (`ENGINE_AUTOUPDATE=check`, `WATCHER_SELF_RESTART=on`,
+  `ENGINE_MIN` bump at every phase flip) is in the *dual-engine window* section of
+  [`docs/multi-seat-doctrine.md`](../multi-seat-doctrine.md).
 - **P4 — state store.** Migrate the 45 state files to SQLite behind the same accessors,
-  with a one-shot migration + rollback path (the migrations/ convention already exists).
+  with a one-shot migration + rollback path (the migrations/ convention already exists). The
+  migration runner crosses `herd_engine_migration_guard` (P3.5) first, so it never runs while
+  another seat is still writing the store; the store accessors adopt P3.5's engine-level stamp.
 - **P5 — cutover + deletion.** Flag flips default, bash core moves to a deprecation window,
   then deletion. Celebrate by watching `herd cost` report what the port PRs cost.
 
@@ -96,7 +110,8 @@ park any of these; only the *shadow-mode acceptance discipline* in P3 is strongl
 - **Opportunity cost:** this competes with feature work (merge-result gate, forge/driver
   seams) for builder capacity. P0–P2 are cheap and hedge nothing; P3+ is the real spend.
 - **Dual-engine window:** between P3 and P5 there are two implementations to keep honest —
-  the journal-diff gate is what keeps that window safe; keep it short.
+  the journal-diff gate keeps parity, and P3.5's per-tick engine-level reconcile
+  (`ENGINE_SEAT_RECONCILE`) keeps two engines from silently clobbering one pool. Keep it short.
 - **Don't port the doctrine wrong:** the comments in `agent-watch.sh` are the spec of five
   months of scar tissue (row truth, positive-evidence death, once-guards). P0's contract
   doc is the mitigation — port from the *contract*, not by transliterating bash.
