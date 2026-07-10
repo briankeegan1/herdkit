@@ -1,15 +1,16 @@
-# tests/gate-coverage-exempt.tsv — explicit allowlist for tests/test-*.sh files that are NOT
-# currently wired into tests/herd.bats (the authoritative merge-gate test runner).
+# tests/gate-coverage-exempt.tsv — explicit skip-list for tests/test-*.sh files that must NOT run
+# in the authoritative merge gate (tests/herd.bats + scripts/ci/run-suite.sh).
 #
-# The gate-coverage drift guard (scripts/herd/gate-coverage-lint.sh, HERD-292) reds when a
-# tests/test-*.sh exists but is neither referenced in tests/herd.bats nor listed here.
-# Every row is a bare test filename (no path, no comment inline).
+# Under HERD-295 dynamic discovery, tests/herd.bats globs tests/test-*.sh and runs each one; a file
+# listed here is SKIPPED by discovery (and by the CI curated runner). The gate-coverage drift guard
+# (scripts/herd/gate-coverage-lint.sh) honors this list and never reds an exempt file.
+# Every row is a bare test filename (no path, no inline comment; whole-line match).
 #
-# Convention: add a row here ONLY when there is a known reason the test cannot yet be wired
-# (e.g. flaky on CI, depends on live env, or waiting on a follow-up PR to wire it properly).
-# Prefer wiring the test directly in herd.bats over adding an exemption.
+# Convention: add a row here ONLY when there is a known reason the test cannot run in the hermetic
+# gate (e.g. flaky on CI, depends on live env). A NEW hermetic test needs no edit here OR in
+# herd.bats — discovery picks it up automatically; only list it if it must be kept OUT.
 #
-# Populated by HERD-292 with tests that pre-existed the guard; a follow-up will wire them.
+# Populated by HERD-292 with tests that pre-existed the guard.
 test-agent-naming.sh
 test-agent-update.sh
 test-app-preview-config.sh
@@ -85,7 +86,6 @@ test-driver-lane-spawn.sh
 test-eco-starter-defaults.sh
 test-external-consumer-audit.sh
 test-externalize-task-specs.sh
-test-fleet-digest.sh
 test-fleet-discover.sh
 test-fleet-governance.sh
 test-fleet-inbox.sh
