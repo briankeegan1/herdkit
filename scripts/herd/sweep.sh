@@ -75,6 +75,12 @@ fi
 # shellcheck source=/dev/null
 . "$_SWEEP_HERE/derived-files.sh"
 
+# The shared watcher-identity check (HERD-266): watcher_list_mains + the exemption clauses that tell a
+# duplicate watcher apart from the canonical watcher's own argv0-inherited forks. Idempotent guard
+# inside. `herd status` (bin/herd) and leg 4 below now read the SAME answer from the SAME code.
+# shellcheck source=/dev/null
+. "$_SWEEP_HERE/watcher-exempt.sh"
+
 # ── tunables (deliberate constants, not config keys) ─────────────────────────────────────────────
 # REGENERABLE DIRT: untracked paths a merged worktree may carry without blocking its reap. These are
 # build/test/editor droppings that any checkout regenerates for free — refusing to reap over a stray
@@ -471,11 +477,11 @@ sweep_leg_markers() {
 
 # ── leg 4: orphaned processes + duplicate watchers ───────────────────────────────────────────────
 # _sweep_ps / _sweep_proc_cwd — the two OS probes, behind test seams so the unit test can plant a
-# synthetic process table and cwd map with no real processes at all.
-_sweep_ps() {
-  if [ -n "${HERD_SWEEP_PS_CMD:-}" ]; then "$HERD_SWEEP_PS_CMD"; return 0; fi
-  ps -eo pid=,ppid=,pgid=,command= 2>/dev/null || true
-}
+# synthetic process table and cwd map with no real processes at all. _sweep_ps is the historical name
+# for watcher-exempt.sh's watcher_ps_table (same $HERD_SWEEP_PS_CMD seam, one implementation): the
+# duplicate-watcher check reads the table through it from bin/herd too, so a planted table answers
+# every seat identically.
+_sweep_ps() { watcher_ps_table; }
 _sweep_proc_cwd() {
   if [ -n "${HERD_SWEEP_PROC_CWD_CMD:-}" ]; then "$HERD_SWEEP_PROC_CWD_CMD" "$1"; return 0; fi
   command -v lsof >/dev/null 2>&1 || return 0
@@ -494,14 +500,7 @@ _sweep_proc_cwd() {
 # HERD-237: .spawn-inflight-* joins the two gate families. The tick now forks its builder-lane and
 # resolver dispatches too, and a lane reparented to init by a watcher death is a live worker holding a
 # claimed spawn intent — not an orphan. Killing it strands the claim behind a lane that never lands.
-_sweep_live_marker_pids() {
-  local f
-  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-* "$TREES"/.spawn-inflight-*; do
-    [ -e "$f" ] || continue
-    _marker_live "$f" || continue
-    _marker_pid "$f"
-  done
-}
+_sweep_live_marker_pids() { watcher_marker_pids; }
 
 # _sweep_owns_path <path> — success iff <path> lies inside this project's main checkout or worktrees
 # dir. Uses a PATH-BOUNDARY test ("$MAIN/" …), never a bare substring: `/src/herdkit` is a prefix of
@@ -565,61 +564,40 @@ sweep_orphan_procs() {
   done < <(_sweep_ps)
 }
 
-# _sweep_watcher_has_gate_child <pid> <process-table> — success iff some process in the table is a
-# LIVE gate worker (healthcheck.sh / herd-review.sh) whose PARENT is <pid>. The table is passed in so
-# the parent/child relationship is resolved against the SAME `ps` snapshot the caller listed against —
-# no second, racy sample. This is the child-based half of the HERD-217 gate-worker exemption.
-_sweep_watcher_has_gate_child() {
-  local parent="${1:-}" table="${2:-}" cpid cppid cpgid ccmd
-  [ -n "$parent" ] || return 1
-  while read -r cpid cppid cpgid ccmd; do
-    [ "$cppid" = "$parent" ] || continue
-    case " $ccmd " in
-      # gate workers (HERD-245) + the backgrounded lane dispatches (HERD-237): a tagged fork that
-      # parents any of these is mid-flight work this seat spawned, never a duplicate watcher.
-      *healthcheck.sh*|*herd-review.sh*) return 0 ;;
-      *herd-feature.sh*|*herd-quick.sh*|*herd-resolve.sh*) return 0 ;;
-    esac
-  done <<EOF
-$table
-EOF
-  return 1
-}
+# _sweep_watcher_has_gate_child <pid> <process-table> — the historical name for watcher-exempt.sh's
+# watcher_has_gate_child (the child-based half of the HERD-217 gate-worker exemption). One
+# implementation, shared with bin/herd's duplicate-watcher check since HERD-266.
+_sweep_watcher_has_gate_child() { watcher_has_gate_child "$@"; }
 
-# sweep_stray_watchers — pids of argv0-tagged watchers for THIS workspace that are NOT the lockfile's
-# watcher: duplicates/zombies left by a crashed reload. Detection only — the KILL is delegated to
-# bin/herd's _stop_project_watcher during leg 5, so there is exactly ONE watcher-killing code path in
-# the engine (its SIGTERM-poll-SIGKILL-abort discipline, not a second copy here).
+# sweep_stray_watchers — pids of argv0-tagged watcher MAINS for THIS workspace that are NOT the
+# lockfile's watcher: duplicates/zombies left by a crashed reload. Detection only — the KILL is
+# delegated to bin/herd's _stop_project_watcher during leg 5, so there is exactly ONE watcher-killing
+# code path in the engine (its SIGTERM-poll-SIGKILL-abort discipline, not a second copy here).
 #
-# CRITICAL EXEMPTION (HERD-217). The canonical watcher FORKS its async gate workers (HERD-185): each
-# healthcheck/review subshell re-execs under this SAME argv0 ($HERD_WATCH_ARGV0), so a live gate
-# worker is argv0-indistinguishable from a duplicate watcher. Listing it here hands it to leg 5's
-# _stop_project_watcher, which SIGKILLs it — destroying in-flight gate work and stranding the PR
-# behind a corpse (observed live 2026-07-09: a MAIN_HEALTH_TICK heavy-healthcheck worker, a child of
-# the canonical watcher, was flagged '👻 duplicate watcher'). So — mirroring leg 4's live-worker
-# exemption — we skip any tagged pid that is a CHILD of the canonical (lockfile) watcher, or that
-# itself parents a live healthcheck.sh / herd-review.sh gate worker. A GENUINE orphan duplicate
-# (its parent dead, no gate child) is still listed.
+# "Watcher main" is decided by watcher_list_mains (scripts/herd/watcher-exempt.sh), the ONE shared
+# check — so this leg and `herd status` can never disagree about what a duplicate is (HERD-266). Its
+# exemptions spare the canonical watcher's own argv0-inherited forks: a marker-owned gate worker, a
+# child of the canonical (lockfile) watcher, and a reparented fork still parenting a live
+# healthcheck.sh / herd-review.sh. Listing one of those hands it to leg 5's _stop_project_watcher,
+# which SIGKILLs it — destroying in-flight gate work and stranding the PR behind a corpse (observed
+# live 2026-07-09: a MAIN_HEALTH_TICK heavy-healthcheck worker, a child of the canonical watcher, was
+# flagged '👻 duplicate watcher'). A GENUINE orphan duplicate (parent dead, no gate child) is still
+# listed here and still killed.
 #
-# The process table is read ONCE (through the _sweep_ps seam, so a unit test can plant a synthetic
-# one) and both the argv0 match AND the parent/child exemption resolve against that single snapshot.
+# We subtract the RECORDED lockfile pid (not merely the live one): watcher_list_mains omits it when
+# alive, and a dead recorded pid can only appear in a synthetic table. The process table is read ONCE
+# (through the _sweep_ps seam) and every argv0 match and parent/child exemption resolves against that
+# single snapshot.
 sweep_stray_watchers() {
-  local marker="${HERD_WATCH_ARGV0:-}" pid ppid pgid cmd argv0 wpid="" table
+  local marker="${HERD_WATCH_ARGV0:-}" wpid pid table
   [ -n "$marker" ] || return 0
-  [ -f "${HERD_WATCHER_LOCK:-/nonexistent}" ] && wpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+  wpid="$(watcher_lock_pid)"
   table="$(_sweep_ps)"
-  while read -r pid ppid pgid cmd; do
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
-    argv0="${cmd%%[[:space:]]*}"
-    [ "$argv0" = "$marker" ] || continue
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
     [ -n "$wpid" ] && [ "$pid" = "$wpid" ] && continue
-    # Gate-worker exemption: a child of the canonical watcher, or a fork parenting a live gate worker.
-    [ -n "$wpid" ] && [ "$ppid" = "$wpid" ] && continue
-    _sweep_watcher_has_gate_child "$pid" "$table" && continue
     printf '%s\n' "$pid"
-  done <<EOF
-$table
-EOF
+  done < <(watcher_list_mains "$table")
 }
 
 # _sweep_pgid_of <pid> — the process group id of <pid> (via the same seam as the process table, so a

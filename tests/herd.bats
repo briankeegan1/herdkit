@@ -509,6 +509,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic shared watcher-identity check (HERD-266) test passes" {
+  run bash "$REPO/tests/test-watcher-exempt.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic retirement-invariant (HERD-164) test passes" {
   run bash "$REPO/tests/test-retirement-invariant.sh"
   [ "$status" -eq 0 ]
