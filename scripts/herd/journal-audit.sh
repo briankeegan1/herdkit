@@ -7,13 +7,22 @@
 # is the reconcile layer: a cadenced, ADVISORY auditor that replays a BOUNDED journal window and
 # surfaces the known gap classes.
 #
-# Checks (exactly the N12 set):
+# Checks (the N12 set, plus the HERD-272 human-verify rule):
 #   (a) merge without a later reap for the same pr (or slug)
 #   (b) a *_dispatched event with no terminal outcome past a family TTL
 #   (c) a refix_bounce with no matching refix_wake_result (same pr + sha + round)
 #   (d) a red state (main_health result=red) older than a TTL with no later green
 #   (e) pushed=no never followed by a later pushed=yes (codemap/symbol_index refresh)
 #   (f) known-fixture slugs (retiree / conv / stuck / hd — the HERD-223 pollution set)
+#   (g) a MERGED PR whose body declares a HUMAN-VERIFY block but which carries NO sha-keyed approval
+#       record. Such a PR merged with its declared manual steps never run. This is not hypothetical:
+#       agent-watch.sh's `_pr_body` used to swallow gh's exit status, so any 5xx blip made an
+#       unreadable body indistinguishable from "declares no block" — and an absent block means MERGE
+#       (fixed in 65fe660 by making the rc three-valued). Every merge that predates that fix is
+#       therefore unproven. Because the audit replays a journal WINDOW, one check serves both readings:
+#       ONGOING, it re-examines each tick's fresh merges; RETROACTIVELY, a one-shot run with a widened
+#       JOURNAL_AUDIT_WINDOW_SECS sweeps as far back as the journal reaches. Approval records are read
+#       through approvals.sh — the same seam herd-approve.sh writes — never by re-deriving the path.
 #
 # BINDING CONSTRAINTS:
 #   • ADVISORY ONLY — never gates a merge, never mutates git/PRs/tracker/BACKLOG, never auto-heals.
@@ -42,12 +51,23 @@
 #   JOURNAL_AUDIT_MERGE_GRACE     seconds after merge before missing-reap is a finding (default 600).
 #   JOURNAL_AUDIT_PUSHED_GRACE    seconds after pushed=no before missing yes is a finding (default 1800).
 #   HERD_JOURNAL_AUDIT_FIXTURE_SLUGS  space-separated known-fixture slug list (default: retiree conv stuck hd).
+#   HERD_APPROVALS_FILE           approval-ledger path (approvals.sh seam; tests pin it).
+#   HERD_JOURNAL_AUDIT_PR_BODY_CMD  command invoked as `<cmd> <pr#>` printing the PR body on stdout and
+#                                 a MEANINGFUL exit status (non-zero ⇒ unreadable). Defaults to
+#                                 `gh pr view <pr#> --json body -q .body`. With no override and no gh,
+#                                 check (g) skips silently — a missing optional tool is never a finding.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/herd-config.sh"
 # shellcheck source=/dev/null
 . "$HERE/journal.sh"
+# HUMAN-VERIFY block parser (presence only) + the approval-ledger seam herd-approve.sh writes. Both
+# only define functions; check (g) below is their sole consumer here.
+# shellcheck source=/dev/null
+. "$HERE/human-verify.sh"
+# shellcheck source=/dev/null
+. "$HERE/approvals.sh"
 
 # ── ship-dormant gate ────────────────────────────────────────────────────────
 _ja_enabled() {
@@ -332,10 +352,7 @@ for kind, key, summary in findings:
 PY
 )" || FINDINGS=""
 
-# Clean / empty findings → silent (no journal spam on a healthy seat).
-[ -n "$FINDINGS" ] || exit 0
-
-# ── emit: dedup via seen-ledger, then journal + inbox ────────────────────────
+# ── seen-ledger: the idempotence substrate (also memoizes check (g)'s PR-body probes) ─────────
 _seen_has() {
   [ -s "$SEEN" ] || return 1
   grep -qxF -- "$1" "$SEEN" 2>/dev/null
@@ -351,6 +368,154 @@ _seen_mark() {
   fi
 }
 
+# ── (g) merged PR with a HUMAN-VERIFY block but no sha-keyed approval ────────
+# Three read-only sources meet here: the journal names every merge (pr + head sha), the PR body says
+# whether manual steps were ever declared, and approvals.sh says whether that exact sha was signed off.
+# A merge that satisfies the first two and not the third shipped its declared steps unrun.
+
+# _ja_pr_body <pr#> — the PR body on stdout, the fetch's EXIT STATUS preserved. The status is the whole
+# point (same lesson as agent-watch.sh's _pr_body): a swallowed failure makes an unreadable body look
+# exactly like a PR that declares no block, and "declares no block" is the answer that clears the PR.
+_ja_pr_body() {
+  if [ -n "${HERD_JOURNAL_AUDIT_PR_BODY_CMD:-}" ]; then
+    # Word-split deliberately: the seam is a command LINE, not a single argv[0].
+    # shellcheck disable=SC2086
+    $HERD_JOURNAL_AUDIT_PR_BODY_CMD "$1"
+    return $?
+  fi
+  # Bound the fetch where coreutils' timeout exists — a hung gh must never stall the watcher sweep.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 gh pr view "$1" --json body -q '.body' 2>/dev/null
+  else
+    gh pr view "$1" --json body -q '.body' 2>/dev/null
+  fi
+}
+
+# _ja_hv_add <kind> <key> <summary> — accumulate one finding line in the same TSV shape python emits.
+HV_FINDINGS=""
+_ja_hv_add() {
+  local _row
+  _row="$(printf '%s\t%s\t%s' "$1" "$2" "$3")"
+  if [ -n "$HV_FINDINGS" ]; then
+    HV_FINDINGS="$(printf '%s\n%s' "$HV_FINDINGS" "$_row")"
+  else
+    HV_FINDINGS="$_row"
+  fi
+}
+
+# No body source at all (no seam, no gh) → the check cannot run. A missing OPTIONAL tool skips
+# SILENTLY; it is never a finding, and never a red row.
+if [ -n "${HERD_JOURNAL_AUDIT_PR_BODY_CMD:-}" ] || command -v gh >/dev/null 2>&1; then
+  # Distinct merges in the window, oldest first: "<pr>\t<sha>". A merge with no pr is unauditable.
+  # shellcheck disable=SC2016
+  MERGES="$(
+    JOURNAL_FILE="$_jf" \
+    HERD_JOURNAL_AUDIT_NOW="${HERD_JOURNAL_AUDIT_NOW:-}" \
+    WINDOW_SECS="$WINDOW_SECS" \
+    python3 - <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+
+def parse_ts(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d %H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(int(s), tz=timezone.utc)
+    except Exception:
+        return None
+
+override = parse_ts(os.environ.get("HERD_JOURNAL_AUDIT_NOW") or "")
+now = override if override is not None else datetime.now(timezone.utc)
+cutoff = now.timestamp() - int(os.environ.get("WINDOW_SECS") or 86400)
+
+rows = []
+try:
+    with open(os.environ.get("JOURNAL_FILE") or "", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(o, dict) or o.get("event") != "merge":
+                continue
+            ts = parse_ts(o.get("ts"))
+            if ts is None or ts.timestamp() < cutoff:
+                continue
+            pr = o.get("pr")
+            if pr is None or str(pr).strip() in ("", "0"):
+                continue
+            rows.append((ts, str(pr).strip(), str(o.get("sha") or "").strip()))
+except OSError:
+    sys.exit(0)
+
+rows.sort(key=lambda r: r[0])
+seen = set()
+for _ts, pr, sha in rows:
+    if (pr, sha) in seen:
+        continue
+    seen.add((pr, sha))
+    print("%s\t%s" % (pr, sha))
+PY
+  )" || MERGES=""
+
+  while IFS=$'\t' read -r _hv_pr _hv_sha; do
+    [ -n "$_hv_pr" ] || continue
+    # A merged PR is settled: once a tick has proven it clean (no block, or block + approval), that
+    # verdict can never change, so memoize it in the seen-ledger. Without this, every tick re-fetches
+    # every body in the window. An UNKNOWN is never memoized — a transient fetch failure must heal.
+    _hv_memo="hv_clean|pr=${_hv_pr}|sha=${_hv_sha}"
+    _seen_has "$_hv_memo" && continue
+    _hv_rc=0
+    _hv_body="$(_ja_pr_body "$_hv_pr")" || _hv_rc=$?
+    if [ "$_hv_rc" -ne 0 ]; then
+      # UNKNOWN, not clean and not guilty: we could not read the body, so we cannot say whether steps
+      # were declared. Reported once (the seen-ledger keys it) so a human can look; never a crash.
+      _ja_hv_add "merged_hv_unknown" \
+        "merged_hv_unknown|pr=${_hv_pr}|sha=${_hv_sha}" \
+        "merged PR body unreadable — human-verify approval unverifiable · pr=${_hv_pr} sha=${_hv_sha:-?}"
+      continue
+    fi
+    if ! printf '%s' "$_hv_body" | human_verify_has; then
+      _seen_mark "$_hv_memo"; continue                       # no block declared → nothing to approve
+    fi
+    _hv_state="$(approval_state "$_hv_pr" "$_hv_sha")"
+    if [ "$_hv_state" = "approved" ]; then
+      _seen_mark "$_hv_memo"; continue
+    fi
+    # `hv-informed` means HUMAN_VERIFY_POLICY=auto merged it as informational: the steps were journaled
+    # and commented, never signed off. That is a weaker record than an approval, so it still surfaces —
+    # the summary names it so an operator can tell a deliberate posture from a fail-open merge.
+    _hv_why="no approval record"
+    [ "$_hv_state" = "hv-informed" ] && _hv_why="hv-informed only (never signed off)"
+    _ja_hv_add "merged_hv_no_approval" \
+      "merged_hv_no_approval|pr=${_hv_pr}|sha=${_hv_sha}" \
+      "merged with HUMAN-VERIFY steps, ${_hv_why} · pr=${_hv_pr} sha=${_hv_sha:-?}"
+  done <<EOF
+$MERGES
+EOF
+fi
+
+if [ -n "$HV_FINDINGS" ]; then
+  if [ -n "$FINDINGS" ]; then
+    FINDINGS="$(printf '%s\n%s' "$FINDINGS" "$HV_FINDINGS")"
+  else
+    FINDINGS="$HV_FINDINGS"
+  fi
+fi
+
+# Clean / empty findings → silent (no journal spam on a healthy seat).
+[ -n "$FINDINGS" ] || exit 0
+
+# ── emit: dedup via seen-ledger, then journal + inbox ────────────────────────
 _inbox_append() {
   # Same TSV shape as agent-watch.sh _inbox_record:
   #   <epoch>\t<source>\t<ref>\t<author>\t<snippet>

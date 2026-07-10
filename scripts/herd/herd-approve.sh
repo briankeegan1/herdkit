@@ -24,6 +24,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # HUMAN-VERIFY parser — so `list`/`why` can print the exact steps a held PR is waiting on.
 . "$HERE/human-verify.sh"
+# Approval-ledger seam (HERD-272): the ledger's path and row grammar live in ONE place, so the
+# auditor that later checks a merged PR against this ledger reads exactly the file this script wrote.
+. "$HERE/approvals.sh"
 # PUSH_GATE=human (HERD-123) — push-hold helpers so list/approve gain PRE-push hold coverage: a
 # finished builder that stopped before push/PR create is listed here, and `approve <slug>` resumes
 # its push + PR creation. Sourcing only defines functions (CLI dispatch is $0-guarded).
@@ -42,7 +45,7 @@ c_grn=""; c_red=""; c_dim=""; c_rst=""
 # shellcheck source=/dev/null
 [ -f "$HERE/theme.sh" ] && { . "$HERE/theme.sh"; herd_theme_load_cli; }
 
-APPROVALS="$WORKTREES_DIR/.agent-watch-approvals"
+APPROVALS="$(_approvals_file || true)"
 REVIEW_STATE="$WORKTREES_DIR/.agent-watch-reviewed"
 OVERRIDES="$WORKTREES_DIR/.agent-watch-overrides"
 # Merge/reap ledger the watcher appends to in do_merge ("<epoch> <pr#> <slug>"). Used as the

@@ -158,6 +158,7 @@ agent-watch.sh	sim	tests/test-sandbox-limit-resume.sh
 agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 agent-watch.sh	sim	scripts/herd/sim/tick-availability-sim.sh
 agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
+approvals.sh	unit	tests/test-journal-audit.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh
