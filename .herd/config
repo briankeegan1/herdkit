@@ -134,7 +134,7 @@ HEALTH_CONCURRENCY="2"
 # 'MAIN RED' alarm row + notification on a red main (alarm only — never gates/reverts). Enabled here
 # because herdkit dogfoods its own merge-time tripwire; ships OFF for other consumers.
 MAIN_HEALTH_TICK="on"
-REFIX_MAX_ROUNDS="3"
+REFIX_MAX_ROUNDS="6"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
 REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"
 # only used once REVIEW_ESCALATE_GLOB is set
@@ -186,3 +186,4 @@ SWEEP_AUTO="auto"
 MERGE_FAIRNESS="on"
 MAIN_HEALTH_AUTOFIX="on"
 WATCHER_SELF_RESTART="on"
+MAIN_HEALTH_RECHECK_MINS="30"

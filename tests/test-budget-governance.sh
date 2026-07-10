@@ -109,14 +109,22 @@ EOF
 enqueue(){ ( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$SPAWN" "$@" >/dev/null ); }
 
 DRAIN_SRC="$T/drain.sh"
-sed -n '/^_drain_spawn_queue()/,/^}/p' "$WATCH" > "$DRAIN_SRC"
-grep -q '_drain_spawn_queue()' "$DRAIN_SRC" || fail "could not extract _drain_spawn_queue from agent-watch.sh"
+: > "$DRAIN_SRC"
+# HERD-237: the drain fires its lane through a background worker behind an inflight marker.
+for fn in _spawn_slug_key _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+          _drain_lane_worker _drain_spawn_queue; do
+  sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$DRAIN_SRC"
+  grep -q "^$fn()" "$DRAIN_SRC" || fail "could not extract $fn from agent-watch.sh"
+done
 
 JLOG="$T/journal.evt"
 # run_drain <BUDGET_DAILY> [FORCE] — one drain pass with the REAL budget predicate over the fixture journal.
 run_drain() {
   ( export LANELOG JLOG
     HERE="$ENG"; TREES="$TREES"; FEATS=()
+    SPAWN_INFLIGHT_PREFIX="$TREES/.spawn-inflight-"
+    _marker_write(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
+    _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     export WORKTREES_DIR="$TREES"
     export BUDGET_DAILY="$1"
@@ -127,8 +135,10 @@ run_drain() {
     journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }   # log-only stub (overrides journal.sh's real one)
     . "$DRAIN_SRC"
     _drain_spawn_queue
+    wait
     # A second tick while still over budget must NOT re-journal the pause (once per stretch).
-    _drain_spawn_queue )
+    _drain_spawn_queue
+    wait )
 }
 
 # Over budget (ceiling 5, spend 7.50) → PAUSE: no lane invoked, intent survives, budget_drain_paused ONCE.
