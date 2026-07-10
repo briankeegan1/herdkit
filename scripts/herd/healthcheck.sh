@@ -80,24 +80,34 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/commit-lint.sh"
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # caps-sync guard (rc 2), never break the healthcheck it is a part of.
-if [ -f "$HERE/caps-sync-lint.sh" ]; then
-  . "$HERE/caps-sync-lint.sh"
+# Prefer the tree-under-test's copy when present so a branch that changes the lint is linted by
+# its own version; fall back to the engine's copy only when the tree lacks it (HERD-309).
+_HERD_LINT_SRC="$HERE/caps-sync-lint.sh"
+[ -f "$DIR/scripts/herd/caps-sync-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/caps-sync-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
 else
   HERD_CAPS_SYNC_SKIP_REASON="caps-sync-lint.sh not present"
   herd_caps_sync_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # doc-drift guard (rc 2), never break the healthcheck it is a part of.
-if [ -f "$HERE/doc-drift-lint.sh" ]; then
-  . "$HERE/doc-drift-lint.sh"
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/doc-drift-lint.sh"
+[ -f "$DIR/scripts/herd/doc-drift-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/doc-drift-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
 else
   HERD_DOC_DRIFT_SKIP_REASON="doc-drift-lint.sh not present"
   herd_doc_drift_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # gate-coverage guard (rc 2), never break the healthcheck it is a part of.
-if [ -f "$HERE/gate-coverage-lint.sh" ]; then
-  . "$HERE/gate-coverage-lint.sh"
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/gate-coverage-lint.sh"
+[ -f "$DIR/scripts/herd/gate-coverage-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/gate-coverage-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
 else
   HERD_GATE_COVERAGE_SKIP_REASON="gate-coverage-lint.sh not present"
   herd_gate_coverage_lint() { return 2; }

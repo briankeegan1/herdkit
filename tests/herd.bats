@@ -690,3 +690,9 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
+
+@test "hermetic lint-tree-under-test sourcing (HERD-309) test passes" {
+  run bash "$REPO/tests/test-healthcheck-lint-tree-under-test.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
