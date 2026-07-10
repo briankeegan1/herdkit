@@ -275,6 +275,46 @@ print(next((a for a in asg if a and a != who), ""))' 2>/dev/null)"
     fi
 }
 
+# _backend_release_item REF WHO — release OUR OWN claim (HERD-162 F12) by removing WHO from the issue's
+# assignees, the same marker _backend_claim_item added. The issue's OPEN/CLOSED state is never touched:
+# this un-claims, it does not reopen. Refuses when the assignee we would clear is not ours — a release
+# must never steal a live operator's claim. Sets:
+#   _RELEASE_RESULT = RELEASED | NOTOURS (unassigned, closed, or assigned to someone else) |
+#                     UNREACHABLE (no matching issue / gh read failed → caller fails soft)
+#   _RELEASE_OWNER  = the blocking login, when the refusal was NOTOURS
+_backend_release_item() {
+    local ref="$1" who="$2" num info parsed state other mine
+    _RELEASE_RESULT=""; _RELEASE_OWNER=""
+    _github_require_gh
+    [ -n "$who" ] || who="$(gh api user -q .login 2>/dev/null || true)"
+    [ -n "$who" ] || who="@me"
+    num="$(_github_resolve_issue "$ref")"
+    if [ -z "$num" ]; then _RELEASE_RESULT="UNREACHABLE"; return 0; fi
+
+    info="$(_gh issue view "$num" --json state,assignees 2>/dev/null)" || { _RELEASE_RESULT="UNREACHABLE"; return 0; }
+    [ -n "$info" ] || { _RELEASE_RESULT="UNREACHABLE"; return 0; }
+    parsed="$(printf '%s' "$info" | WHO="$who" python3 -c 'import sys, json, os
+who = os.environ["WHO"]
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+st = (d.get("state") or "OPEN").upper()
+asg = [a.get("login", "") for a in (d.get("assignees") or [])]
+other = next((a for a in asg if a and a != who), "")
+mine = "1" if who in asg else "0"
+print("%s\t%s\t%s" % (st, other, mine))' 2>/dev/null)"
+    state="${parsed%%	*}"; parsed="${parsed#*	}"
+    other="${parsed%%	*}"; mine="${parsed##*	}"
+
+    if [ "$state" = "CLOSED" ]; then _RELEASE_RESULT="NOTOURS"; _RELEASE_OWNER="a closed issue"; return 0; fi
+    if [ "$mine" != "1" ];     then _RELEASE_RESULT="NOTOURS"; _RELEASE_OWNER="${other:-nobody}";  return 0; fi
+
+    if ! _gh issue edit "$num" --remove-assignee "$who" >/dev/null 2>&1; then
+        _RELEASE_RESULT="UNREACHABLE"; return 0
+    fi
+    _RELEASE_RESULT="RELEASED"; _RELEASE_OWNER="$who"
+    _backend_tw_journal "$ref" open RELEASED   # HERD-85: a release is a tracker write
+}
+
 # ── Planned-work markers (HERD-52 / HERD-244) — cross-operator plan-time visibility ──────────────
 # A 📌 comment of the shared shape "📌 queued by <who>: sequenced after <blocker> [<epoch>]" plus
 # (HERD-244) setting the issue ASSIGNEE so a second operator sees the plan in every GitHub client

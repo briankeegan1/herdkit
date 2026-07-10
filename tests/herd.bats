@@ -588,6 +588,24 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic slug-ledger lifecycle: a reap closes every row it opened (HERD-162 F7)" {
+  run bash "$REPO/tests/test-reap-slug-ledgers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic claim release: a dead pre-PR builder hands its item back (HERD-162 F12)" {
+  run bash "$REPO/tests/test-claim-release.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "builder-chaos sim: a builder killed at every lifecycle stage leaves no corpse (HERD-162)" {
+  run bash "$REPO/scripts/herd/sim/builder-chaos-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "cross-seat BLOCK precedence: a foreign BLOCK outranks this seat's PASS (HERD-247)" {
   run bash "$REPO/tests/test-cross-seat-block.sh"
   [ "$status" -eq 0 ]

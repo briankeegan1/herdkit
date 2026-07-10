@@ -140,6 +140,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # tracker-heal and builder-note surfaces, so both age out by one rule. Defines functions + two
 # constants (CONSOLE_ROW_RETENTION, CONSOLE_LEDGER_MAX); display-only, lib-safe.
 . "$HERE/console-section.sh"
+# Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
+# the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
+# Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
+# byte-inert until CLAIM_RELEASE is opted in.
+# shellcheck source=/dev/null
+. "$HERE/herd-claim.sh"
 
 # ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
 # EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
@@ -5232,6 +5238,13 @@ _reap_slug() {
   # forever (the step-hold analogue of purge_pr_approvals). Fail-soft + idempotent; no-op when steps
   # are unused. Done before teardown so a teardown hiccup can't strand the phantom hold.
   command -v steps_hold_purge >/dev/null 2>&1 && steps_hold_purge "$_rp_slug" || true
+  # HERD-162 F7: the slug is terminal — close every slug-keyed ledger row it opened (dead anchor,
+  # respawn budget, limit target, sendkeys dedup). Slugs are reused by design, so a row that outlives
+  # its builder is inherited by the reincarnation: a stale limit target injects `claude --continue`
+  # into a healthy fresh builder, a stale dead anchor 💀s it on tick one, a spent respawn budget denies
+  # it the one restart it is owed. Idempotent + fail-soft; runs BEFORE the tabs close, so a teardown
+  # hiccup can never strand the rows (same reasoning as the step-hold purge above).
+  _purge_slug_ledgers "$_rp_slug" "$_rp_dir"
   journal_append reap pr "$_rp_pr" slug "$_rp_slug" sha "$_rp_sha" reason "$_rp_reason"
   herd_teardown_slug "$_rp_slug"
   return 0
@@ -8926,6 +8939,51 @@ clear_dead() {
   mv "$_cd_tmp" "$DEAD_STATE" 2>/dev/null || rm -f "$_cd_tmp" 2>/dev/null
 }
 
+# ── SLUG-LEDGER LIFECYCLE (HERD-162 F7) ───────────────────────────────────────────────────────────
+# The four line-oriented, SLUG-KEYED ledgers ($DEAD_STATE, $DEAD_RESPAWN_STATE, $LIMIT_STATE,
+# $SENDKEYS_STATE) are opened at spawn-time and, until now, closed by nothing: _reap_slug tore down the
+# worktree, the tabs and the ref marker, but left every slug-keyed ROW behind. Slugs are reused BY
+# DESIGN (a re-spawn of the same item rebuilds `<slug>`), so those rows outlive the builder that earned
+# them and are inherited by its reincarnation:
+#   • a stale $LIMIT_STATE row → the resume scheduler fires `claude --continue` INTO a healthy fresh
+#     builder at the old reset time (an injected --continue in the middle of a real build);
+#   • a stale $SENDKEYS_STATE row → the clean-menu-select dedup thinks the park is already handled;
+#   • a stale $DEAD_STATE `notified` row → the fresh builder is 💀 on its first tick, before any grace;
+#   • a stale $DEAD_RESPAWN_STATE row → the reincarnation is born with its at-most-once respawn budget
+#     already spent, so a genuine death escalates as "died again" instead of respawning.
+# A reaped slug is TERMINAL, so its rows are closed with it. Everything here is idempotent + fail-soft:
+# an absent ledger, an absent row, and a second call over an already-purged slug all no-op.
+
+# clear_respawn <slug> — drop the slug's auto-respawn budget rows. Called ONLY from the reap path: the
+# budget's whole purpose is to survive a clearing $DEAD_STATE record within one builder's life (that is
+# what makes "died AGAIN" detectable), so nothing short of the slug's death may clear it.
+clear_respawn() {
+  [ -s "$DEAD_RESPAWN_STATE" ] || return 0
+  local _cr_tmp="${DEAD_RESPAWN_STATE}.$$"
+  grep -v "^$1 " "$DEAD_RESPAWN_STATE" 2>/dev/null > "$_cr_tmp"
+  mv "$_cr_tmp" "$DEAD_RESPAWN_STATE" 2>/dev/null || rm -f "$_cr_tmp" 2>/dev/null
+}
+
+# _purge_slug_ledgers <slug> [worktree] — close EVERY slug-keyed ledger row this slug owns. The one
+# call site is _reap_slug, the shared teardown primitive every exit path funnels through (merge,
+# startup sweep, post-merge sweep, and retirement's abandon/dead convergence) — so "opened at spawn,
+# closed on every exit path" holds without each path remembering to do it. Journals ONE purge event
+# naming which ledgers actually carried a row, so a reap that cleaned nothing stays silent.
+_purge_slug_ledgers() {
+  local _ps_slug="$1" _ps_dir="${2:-}" _ps_had=""
+  [ -n "$_ps_slug" ] || return 0
+  [ -n "$(dead_first_seen "$_ps_slug")" ]        && _ps_had="${_ps_had}dead,"
+  respawn_recorded "$_ps_slug"                   && _ps_had="${_ps_had}respawn,"
+  [ -n "$(limit_state "$_ps_slug")" ]            && _ps_had="${_ps_had}limit,"
+  [ -n "$(sendkeys_state "$_ps_slug")" ]         && _ps_had="${_ps_had}sendkeys,"
+  clear_dead     "$_ps_slug"
+  clear_respawn  "$_ps_slug"
+  clear_limit    "$_ps_slug" "$_ps_dir"
+  clear_sendkeys "$_ps_slug"
+  [ -n "$_ps_had" ] && journal_append slug_ledgers_purged slug "$_ps_slug" ledgers "${_ps_had%,}"
+  return 0
+}
+
 # _classify_dead_builder <has-agent> <has-pr> <transcript-growing> <first-seen> <now> <grace> — the
 # pure verdict for a PR-less builder. Echoes exactly one token:
 #   ALIVE   — a liveness signal is present (live agent record, open PR, OR growing transcript) ⇒
@@ -8947,6 +9005,76 @@ _classify_dead_builder() {
     printf 'PENDING'; return 0
   fi
   printf 'DEAD'
+}
+
+# ── Claim release for an abandoned builder (HERD-162 F12) ────────────────────────────────────────
+# A claim was taken before the worktree existed and released by NOTHING. When the builder that took it
+# dies before opening a PR, the tracker item stays In Progress + assigned forever, and the other
+# operator's pre-spawn claim reads it as ALREADY and aborts — the item is wedged against everyone but
+# the original claimant, who is a dead process. The dead-builder reconcile is the one place that knows
+# the builder is gone, so it is where the claim is given back.
+#
+# WHEN a claim is released — all three must hold, and the rails are deliberately conservative:
+#   • CLAIM_RELEASE is opted in (off by default ⇒ this whole path is byte-inert);
+#   • the slug carries a tracker ref (the `.herd-ref-<slug>` marker the lane wrote at spawn) — an
+#     untracked spawn claimed nothing and has nothing to release;
+#   • the builder is genuinely ABANDONED: it will not be auto-respawned, and its worktree is clean.
+# The two refusals are the important half. A dead builder with COMMITS OR DIRT is a human-recovery
+# hold: releasing it invites a second operator to build a duplicate on top of work nobody has salvaged
+# yet. And a builder about to be RESPAWNED still owns its item — the fresh agent continues the claim.
+# Both refusals are journaled with their reason, and both say so on the 💀 notification, so a hold is
+# never a silence.
+#
+# Deliberately ASYMMETRIC with the respawn: we classify the respawn verdict here with the same PURE
+# classifier _maybe_autorespawn_dead_builder uses, but we do not wait to see whether the respawn
+# SUCCEEDS. A respawn that then fails escalates loudly ("restart by hand") with the claim still held —
+# holding a claim too long is recoverable by one command; releasing one out from under an agent that
+# did start is a double-build. We fail toward the hold.
+
+# _maybe_release_claim <slug> <worktree> — echo a SHORT clause to append to the 💀 notification body
+# (leading " · "), or NOTHING at all when CLAIM_RELEASE is off / the slug is untracked. Never fails.
+_maybe_release_claim() {
+  local _mr_slug="$1" _mr_wt="$2" _mr_mode _mr_ref _mr_on=0 _mr_done=0 _mr_who _mr_out
+  _mr_mode="$(herd_claim_release_mode)"
+  [ "$_mr_mode" = off ] && return 0
+  _mr_ref="$(_slug_ref "$_mr_slug")"
+  [ -n "$_mr_ref" ] || return 0        # untracked spawn — no claim was ever taken
+
+  # RAIL 1 — work in the tree, checked FIRST and INDEPENDENTLY of the respawn flag. Deliberately NOT
+  # read off _classify_respawn: that classifier answers "should we respawn?", so it short-circuits to
+  # OFF before it ever looks at has-work. Reusing its verdict here would release the claim of every
+  # dead builder that left work whenever DEAD_BUILDER_AUTORESPAWN happens to be off — precisely the
+  # duplicate-build-on-unrecovered-work hazard this rail exists to prevent.
+  if _worktree_has_work "$_mr_wt"; then
+    journal_append claim_release_held ref "$_mr_ref" slug "$_mr_slug" reason has-work
+    printf ' · claim %s HELD (worktree has work — recover it, then re-queue)' "$_mr_ref"; return 0
+  fi
+  # RAIL 2 — a builder about to be respawned still owns its item. The tree is provably clean by now,
+  # so the shared classifier is asked exactly the question it answers, with has-work pinned to 0.
+  _dead_autorespawn_on         && _mr_on=1
+  respawn_recorded "$_mr_slug" && _mr_done=1
+  if [ "$(_classify_respawn "$_mr_on" 0 "$_mr_done")" = RESPAWN ]; then
+    journal_append claim_release_skipped ref "$_mr_ref" slug "$_mr_slug" reason respawning
+    printf ' · claim %s held (respawning)' "$_mr_ref"; return 0
+  fi
+
+  # DRYRUN: name the intent, write nothing (mirrors every other mutation guard in the watcher).
+  if [ -n "${DRYRUN:-}" ]; then
+    printf ' · claim %s would be released (dry-run)' "$_mr_ref"; return 0
+  fi
+  _mr_who="$(_herd_claim_identity)"; [ -n "$_mr_who" ] || _mr_who="unknown-operator"
+  _mr_out="$(herd_claim_release "$_mr_ref" "$_mr_who" "$_mr_slug" dead-builder)"
+  case "$_mr_out" in
+    # The dead builder's WORKTREE still stands (this reconcile never reaps it — retirement owns that on
+    # its own cadence). Say so: whoever re-picks the item hits `git worktree add` on an existing path
+    # otherwise, and reads the collision as a herdkit bug rather than as leftover from a death.
+    released)    printf ' · claim %s released — re-pickable (sweep its worktree first)' "$_mr_ref" ;;
+    flagged)     printf ' · claim %s still held — re-queue it' "$_mr_ref" ;;
+    unsupported) printf ' · claim %s still held (backend cannot release) — re-queue it' "$_mr_ref" ;;
+    notours)     printf ' · claim %s belongs to another operator — left alone' "$_mr_ref" ;;
+    *)           : ;;
+  esac
+  return 0
 }
 
 # _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
@@ -8986,13 +9114,17 @@ _reconcile_dead_builder() {
         record_dead_notified "$_rd_slug"
         journal_append builder_dead slug "$_rd_slug" first_seen "${_rd_first:-$_rd_now}" \
           cause "$([ "$_rd_liveness" = "dead" ] && printf 'session-dead' || printf 'vanished')"
+        # CLAIM RELEASE (HERD-162 F12) runs BEFORE the 💀 surface so the notification can state what
+        # actually happened to the tracker item, rather than leaving the operator to discover the wedge
+        # later. Empty (and byte-inert) when CLAIM_RELEASE is off — the default.
+        local _rd_claim; _rd_claim="$(_maybe_release_claim "$_rd_slug" "$_rd_wt")"
         # Wording reflects the actual cause: a listed-but-unwakeable session vs a fully vanished agent.
         if [ "$_rd_liveness" = "dead" ]; then
           herd_driver_notify "💀 builder died: ${_rd_slug}" \
-            "${_rd_slug}: agent session dead (unwakeable, no PR) — re-spawn" default
+            "${_rd_slug}: agent session dead (unwakeable, no PR) — re-spawn${_rd_claim}" default
         else
           herd_driver_notify "💀 builder died: ${_rd_slug}" \
-            "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn" default
+            "${_rd_slug}: agent vanished (no agent, no PR) — re-spawn${_rd_claim}" default
         fi
         # Bounded, opt-in AUTO-RESPAWN fires exactly here — once per DEAD crossing (guarded by the
         # dead_notified dedup), AFTER the unconditional 💀 surface. Byte-inert when the flag is off.
@@ -9067,6 +9199,96 @@ _classify_respawn() {
   printf 'RESPAWN'
 }
 
+# ── Corpse cleanup: STEP 0 of every respawn (HERD-162 F6) ────────────────────────────────────────
+# A respawn used to create the NEW tab first and only then call `herdr agent start <slug>` — which
+# fails `agent_name_taken`, because the DEAD builder's agent registry row (and the tab whose pane holds
+# it) is still there. That is not an edge case: it is the HERD-114 crash the feature exists FOR, where
+# herdr keeps a listed agent whose process is dead. So the respawn structurally failed exactly when it
+# was needed, leaving the freshly-created tab as shrapnel. Reaping the corpse is therefore not cleanup
+# after the fact — it is the FIRST step, and the respawn is attempted only once the name is free.
+#
+# WORKTREE ORDERING (the claude-pane-root doctrine): a respawn restarts a builder IN PLACE, so unlike
+# the retire path it NEVER removes the worktree — the "remove the worktree before killing the panes"
+# rule has nothing to order here. What it does tell us still holds: `claude` is the pane's ROOT
+# process, so closing the corpse's tab is what actually frees its agent name.
+
+# _reap_builder_corpse <slug> [worktree] — drop the slug-keyed markers a reincarnated agent must not
+# inherit, then retire the dead builder's registry row + its tab. Returns 0 iff the agent NAME is free
+# afterwards (nothing left holding it), which is the only postcondition the respawn depends on.
+# Everything is fail-soft + idempotent: no corpse, no herdr, or a headless driver all no-op to success.
+# The MARKER purge runs under every driver; only the pane/tab half is herdr-specific.
+_reap_builder_corpse() {
+  local _rc_slug="$1" _rc_wt="${2:-}" _rc_pane _rc_tab _rc_reaped=""
+
+  # 0. The slug-keyed markers a FRESH agent in this same worktree must not inherit. FIRST, and above the
+  #    headless return, because these are plain files with nothing to do with panes: a stale limit target
+  #    would schedule a `claude --continue` into the new builder, and a stale sendkeys row would suppress
+  #    the clean menu-select on its first real park — and both hazards exist under EVERY driver. (The
+  #    dead anchor and the respawn budget deliberately survive: the caller is mid-decision on both.)
+  if [ -n "$(limit_state "$_rc_slug")" ]; then
+    clear_limit "$_rc_slug" "$_rc_wt"
+    _rc_reaped="${_rc_reaped}limit,"
+  fi
+  if [ -n "$(sendkeys_state "$_rc_slug")" ]; then
+    clear_sendkeys "$_rc_slug"
+    _rc_reaped="${_rc_reaped}sendkeys,"
+  fi
+
+  # headless has no tabs/panes and its `start_agent` overwrites the registry entry outright — there is
+  # no name to free, so the pane/tab half of the reap is a no-op there.
+  if [ "$(herd_driver_name)" = "headless" ] || ! command -v herdr >/dev/null 2>&1; then
+    [ -n "$_rc_reaped" ] && journal_append builder_corpse_reaped slug "$_rc_slug" reaped "${_rc_reaped%,}"
+    return 0
+  fi
+
+  # 1. The corpse's own agent pane, if the registry still names one. `claude` is the pane's ROOT
+  #    process, so closing the pane is what retires the agent row and frees the name. Routed through
+  #    the ONE guarded close (HERD-134) like every other engine actor: it re-reads the pane's LIVE
+  #    identity and REFUSES (loudly, via pane_close_refused) when the id has been recycled onto a
+  #    neighbour. A refusal is not fatal here — the name probe below decides.
+  _rc_pane="$(herd_driver_agent_pane_id "$_rc_slug" 2>/dev/null || true)"
+  if [ -n "$_rc_pane" ] && herd_close_pane_verified "$_rc_pane" "agent:$_rc_slug"; then
+    _rc_reaped="${_rc_reaped}pane,"
+  fi
+
+  # 2. The corpse's BUILDER tab(s). A tab whose agent pane already died still holds the tab-registry row
+  #    and, under a herdr crash, can still hold the name. Only the builder label (== slug) is ours here:
+  #    a dead PR-less builder has no review·/resolve· tab, and closing one on a respawn would be a bug.
+  while IFS= read -r _rc_tab; do
+    [ -n "$_rc_tab" ] || continue
+    herdr tab close "$_rc_tab" >/dev/null 2>&1 || true
+    _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rc_tab"
+    _rc_reaped="${_rc_reaped}tab,"
+  done < <(_slug_builder_tab_ids "$_rc_slug")
+
+  [ -n "$_rc_reaped" ] && journal_append builder_corpse_reaped slug "$_rc_slug" reaped "${_rc_reaped%,}"
+
+  # The postcondition, PROBED not assumed: is the name free? An agent still listed under this slug means
+  # `agent start` will fail agent_name_taken, and the caller must escalate rather than create a tab it
+  # will have to close again.
+  [ -z "$(_agent_status "$_rc_slug")" ]
+}
+
+# _slug_builder_tab_ids <slug> — the herdr tab ids labelled EXACTLY <slug> (the builder tab), scoped to
+# this project's workspace when it resolves. Deliberately NOT the review·/resolve· labels that
+# herd_teardown_slug also collects: those belong to a PR's gate, not to a pre-PR builder's corpse.
+# Empty (and silent) without herdr, on a parse failure, or when no such tab exists.
+_slug_builder_tab_ids() {
+  local _bt_slug="$1" _bt_wsid
+  command -v herdr >/dev/null 2>&1 || return 0
+  _bt_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  herdr tab list 2>/dev/null | SLUG="$_bt_slug" WS="$_bt_wsid" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]; ws = os.environ.get("WS", "")
+try:
+  for t in (json.load(sys.stdin).get("result") or {}).get("tabs") or []:
+    if t.get("label") == slug and (not ws or t.get("workspace_id", "") == ws):
+      print(t["tab_id"])
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
 # _respawn_builder_in_worktree <slug> <worktree> — surgically restart a FRESH builder agent in the
 # EXISTING worktree, pointed at the EXISTING $WORKTREES_DIR/<slug>.task.md. Returns 0 iff a tab AND
 # agent were started. Mirrors the herd-feature spawn WITHOUT re-running the lane (no new-feature.sh,
@@ -9077,6 +9299,14 @@ _respawn_builder_in_worktree() {
   # The builder was spawned against this externalized spec; if it has vanished we cannot re-point a
   # fresh agent at it — bail (the caller escalates rather than respawning against nothing).
   [ -s "$_rw_spec" ] || { printf '⚠️  herdkit: task spec %s missing — cannot auto-respawn %s\n' "$_rw_spec" "$_rw_slug" >&2; return 1; }
+  # STEP 0 — never stack a respawn on a corpse (HERD-162 F6). Retire the dead agent's pane/tab and its
+  # poisonous slug-keyed markers FIRST; only then is the agent name free for `agent start`. A corpse we
+  # could not clear means the name is still held, so bail BEFORE creating a tab we would have to close.
+  if ! _reap_builder_corpse "$_rw_slug" "$_rw_wt"; then
+    printf '⚠️  herdkit: agent name %s is still held by a corpse we could not retire — not respawning\n' "$_rw_slug" >&2
+    journal_append builder_respawn_blocked slug "$_rw_slug" reason agent-name-held
+    return 1
+  fi
   local _rw_model="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
   local _rw_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
   # SHORT pointer prompt — byte-identical to herd_write_task_spec's (the spec is already on disk).

@@ -653,6 +653,28 @@ fi
 # push serialization (the loser's push is rejected, a re-pull shows the item claimed, and it aborts).
 : "${CLAIM_REQUIRED:="off"}"     # off (default) → no claim, today's async-scribe behavior; on → claim id-bearing spawns
 
+# ── Claim RELEASE on an abandoned builder (HERD-162 F12) ─────────────────────
+# A claim is taken before the worktree and, until now, released by nothing. When the builder that
+# claimed an item DIES before it ever opens a PR, the item stays In Progress + assigned forever: the
+# other operator's `herd-claim.sh` reads it as ALREADY and aborts, so a wedged item can never be
+# re-picked by anyone but the original claimant, by hand. CLAIM_RELEASE closes that loop from the
+# watcher's dead-builder reconcile.
+#
+# off (DEFAULT) → byte-inert: no read, no tracker write, no journal event, and the 💀 notification is
+#                 the pre-HERD-162 string verbatim.
+# flag          → OBSERVE ONLY: journal a claim_release_flagged event naming the wedged ref and say so
+#                 on the 💀 notification. NO tracker write — a human (or the coordinator) re-queues it.
+# release       → also RELEASE the claim through the active SCRIBE_BACKEND's _backend_release_item op:
+#                 clear the assignee that marks the claim, so the item is re-pickable. The item's
+#                 workflow STATE is left alone — reopening/re-queuing stays a coordinator act.
+#
+# HARD RAILS, in both non-off modes. A claim is released ONLY for a builder that is genuinely
+# abandoned: dead, with a CLEAN worktree (no commits, no dirt), and NOT being auto-respawned. A dead
+# builder that left work is a human-recovery hold — releasing it would invite a second operator to
+# build a duplicate on top of unrecovered work — and a respawned builder still owns its item. A
+# backend with no release op FAILS SOFT to `flag` (never a red, never a hard error).
+: "${CLAIM_RELEASE:="off"}"      # off (default) → today's behavior; flag → journal+surface only; release → clear the claim
+
 # ── Tracker-routed spawn enforcement (HERD-64) ───────────────────────────────
 # TRACKED_SPAWNS makes "every builder is traceable to a tracked work item" a PROJECT POLICY the
 # committed baseline binds on all operators, instead of a convention the coordinator is merely asked

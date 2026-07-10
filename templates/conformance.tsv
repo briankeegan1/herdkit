@@ -325,6 +325,8 @@ scripts/herd/theme.sh	unit	tests/test-theme.sh
 .herd/themes	unit	tests/test-theme.sh
 herd theme <list|preview|set>	unit	tests/test-theme-cmd.sh
 CLAIM_REQUIRED	unit	tests/test-claim.sh
+CLAIM_RELEASE	unit	tests/test-claim-release.sh
+CLAIM_RELEASE	sim	scripts/herd/sim/builder-chaos-sim.sh
 TRACKED_SPAWNS	unit	tests/test-tracked-spawns.sh
 herd-claim.sh	unit	tests/test-claim.sh
 MCP_PROVISION	unit	tests/test-mcp-provision.sh

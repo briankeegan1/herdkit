@@ -537,6 +537,43 @@ proof: [`../../../tests/test-sandbox-self-restart.sh`](../../../tests/test-sandb
 > restart note). The real function's journal line and its fail-soft refusal are proven in
 > [`../../../tests/test-watcher-self-restart.sh`](../../../tests/test-watcher-self-restart.sh).
 
+## HERD-162 — recovery hygiene under chaos — `builder-chaos-sim.sh`
+
+The **adversary** for the recovery paths. Everything the watcher does when a builder dies is a claim
+about a world it did not observe fail, so this sim force-kills a builder at each lifecycle stage and
+checks that the recovery acts only on positive evidence.
+
+Its fidelity rests on one detail: the stub `herdr` **enforces `agent_name_taken`** — an agent name
+stays held until the pane or tab holding it is closed, exactly as under real herdr, where `claude` is
+the pane's root process. That is the single fact that made the pre-HERD-162 respawn fail structurally
+in the very crash it existed for (it created the new tab *first*, then collided with the corpse). A
+stub that let `agent start` succeed over a corpse would prove nothing; the last checkpoint asserts the
+constraint is real.
+
+| Stage the builder is killed at | Invariant the sim asserts |
+| --- | --- |
+| pre-commit, agent still registered | the corpse's pane + tab + registry row are reaped **before** the respawn creates anything; exactly one agent and one tab end the tick |
+| pre-commit, autorespawn **off** | nothing will restart it → the tracker **claim is released**, and the 💀 notification says so |
+| pre-commit, abandoned, **remote unreachable** | the release **fails loud**: the item stays claimed, nothing is journaled `claim_released`, the 💀 says *still held* (never "re-pickable"), and no orphan `Release:` commit is stranded on the branch |
+| mid-work (commits) / dirty tree | worktree, branch and tab all survive; the claim is **HELD** — releasing it would invite a duplicate build on unrecovered work |
+| died **again** after its one respawn | the at-most-once budget denies a second respawn (no loop); the claim goes back |
+| limit-parked, then killed | the stale limit + sendkeys rows are purged — no `claude --continue` is injected into the fresh builder |
+| listed-but-**unwakeable** (herdr crash) | a positive `liveness=dead` probe overrides the stale listing; the name is freed **before** `agent start` |
+| merged (the terminal reap) | all four slug-keyed ledgers close with the slug; a prefix-sharing neighbour's rows are untouched; re-reaping is a silent no-op |
+| **SIGKILL mid-corpse-reap** | pane closed, tab not — a brand-new process converges the orphan tab and registry row away, then respawns exactly once |
+
+```sh
+# Run the whole chaos matrix; inspect the scorecard:
+bash scripts/herd/sim/builder-chaos-sim.sh --artifacts /tmp/chaos
+cat /tmp/chaos/scorecard.json
+```
+
+Flags: `--artifacts DIR` (`--keep` implied), `--keep`. Fully hermetic (local git, stub `herdr`, no
+network, no model, no real tab). Unit companions:
+[`test-dead-builder-respawn.sh`](../../../tests/test-dead-builder-respawn.sh) (corpse cleanup),
+[`test-reap-slug-ledgers.sh`](../../../tests/test-reap-slug-ledgers.sh) (ledger lifecycle),
+[`test-claim-release.sh`](../../../tests/test-claim-release.sh) (claim release).
+
 ## Simulation tiers at a glance
 
 | Tier | Scenario | Drives | Proves |
@@ -551,6 +588,7 @@ proof: [`../../../tests/test-sandbox-self-restart.sh`](../../../tests/test-sandb
 | **HERD-127** | `sandbox-governance-scenario.sh` | the real HERD-119 adoption table **+** the shipped PUSH_GATE / ATTRIBUTION / BRANCH_TEMPLATE / COMMIT_CONVENTION gates | the whole governance **import→enforcement chain**: `CLAUDE.md` → mapped keys → held/refused/reddened at the gate (zero model calls) |
 | **HERD-236** | `sandbox-multiseat-scenario.sh` | **two real** watcher gate loops, two `$TREES`, one stub remote | multi-seat: `duplicate_gate_runs=0` / `duplicate_hold_comments=0` / `resolver_double_dispatch=0` / `max_restale_cycles` bounded / all-PRs-drained |
 | **HERD-251** | `sandbox-self-restart-scenario.sh` | the **real** watcher tick + a **real** background suite worker | stale-engine **quiesce → drain → in-place re-exec**: nothing dispatched mid-drain, nothing in flight discarded, cap expiry, kill-switch |
+| **HERD-162** | `builder-chaos-sim.sh` | the **real** dead-builder reconcile / corpse reap / respawn / `_reap_slug`, against a stub herdr that **enforces `agent_name_taken`** | recovery hygiene: a builder force-killed at **every lifecycle stage** (pre-commit, mid-work, dirty, limit-parked, died-again, listed-but-unwakeable) leaves **no corpse** (reaped before the respawn creates anything), **no stacked respawn**, **no immortal ledger row**, **no lost work**, and an **honest claim** (released iff genuinely abandoned) — plus a SIGKILL mid-corpse-reap that the next process converges |
 
 > P0/P1/P2a are stub-mode and fully hermetic (local git only, no hosted repo, **no herdr panes**, no
 > model). **P2b** is the pane/TUI tier: it drives a REAL but **disposable** herdr control room (unique
