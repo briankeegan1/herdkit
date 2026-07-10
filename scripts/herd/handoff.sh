@@ -117,7 +117,7 @@ handoff_field() {
   local _key="${1:-}"
   [ -n "$_key" ] || return 0
   _key="$(printf '%s' "$_key" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
-  handoff_fields | sed -n "s/^${_key}=//p" | head -n1
+  handoff_fields | sed -n "s/^${_key}=//p" | head -n1  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # ── Write side (rendering) ───────────────────────────────────────────────────────────────────────

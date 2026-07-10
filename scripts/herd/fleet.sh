@@ -248,7 +248,7 @@ fleet_discover() {
       found=$((found+1))
 
       local status
-      if printf '%s\n' "$registered_paths" | grep -qxF "$proj"; then
+      if printf '%s\n' "$registered_paths" | grep -qxF "$proj"; then  # pipe-ok: bounded membership list, under a pipe buffer
         already=$((already+1))
         status="${c_dim}registered${c_rst}"
       else

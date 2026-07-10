@@ -107,7 +107,7 @@ _state_upsert() {
 _research_question() {
   local num="$1" title="$2" body="$3" labels="$4" url="$5" repo="$6"
   # Cap body so a huge issue does not blow the research prompt.
-  body="$(printf '%s' "$body" | head -c 4000)"
+  body="$(printf '%s' "$body" | head -c 4000)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   cat <<EOF
 OSS-TRIAGE issue #${num} on ${repo}:
 Title: ${title}
@@ -141,7 +141,7 @@ _enqueue_research() {
   # research.sh may try to spawn a drainer; capture stdout and parse REQ_ID.
   # Fail-soft: a spawn/network failure still leaves the queue entry when using real research.sh.
   out="$(bash "$RESEARCH_BIN" "$question" 2>/dev/null || true)"
-  rid="$(printf '%s\n' "$out" | sed -n 's/^REQ_ID //p' | head -n1)"
+  rid="$(printf '%s\n' "$out" | sed -n 's/^REQ_ID //p' | head -n1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   if [ -z "$rid" ]; then
     _warn "research enqueue produced no REQ_ID"
     return 1
@@ -154,7 +154,7 @@ _parse_classification() {
   local f="$1" cls
   [ -f "$f" ] || { printf 'pending'; return 0; }
   cls="$(sed -nE 's/^##[[:space:]]*Classification:[[:space:]]*//p; s/^Classification:[[:space:]]*//p' "$f" \
-    | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   case "$cls" in
     bug|feature|question|duplicate) printf '%s' "$cls" ;;
     *) printf 'pending' ;;

@@ -55,7 +55,7 @@ herd_is_derived_path() {
   local _idp="${1:-}"
   _idp="${_idp#./}"; _idp="${_idp%/}"
   [ -n "$_idp" ] || return 1
-  herd_derived_paths | grep -qxF -- "$_idp"
+  herd_derived_paths | grep -qxF -- "$_idp"  # pipe-ok: bounded membership list, under a pipe buffer
 }
 
 # herd_strip_derived — read repo-relative paths on stdin, print only the ones that are NOT derived.
