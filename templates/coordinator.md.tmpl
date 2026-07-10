@@ -632,6 +632,91 @@ the project's local memory store, never in the committed repo and never under `{
 Do not weaken that contract — earn cross-session continuity by persisting context while keeping it
 entirely out of version control.
 
+## Full-autonomy doctrine
+
+Codified from the 2026-07-09 gating-hardening session
+(`docs/audits/2026-07-09-gating-hardening.md`, HERD-270). Every hand-nudge that session
+required traces to a missing or unexercised practice below. The *Operating posture* block
+(rendered at the top of this skill when `COORDINATOR_AUTONOMY=full|gated`) gives the
+per-config effective posture summary; this section is the durable doctrinal reference
+that survives engine upgrades. See `docs/COORDINATOR-SOP.md` § *Full-autonomy doctrine*
+for the full operational playbook.
+
+### Six binding rules
+
+1. **End-to-end pipelines.** Pick, spawn, watch gates, and close the loop without
+   mid-step asks. Escalate only genuine judgment calls — semantic conflicts, product
+   ambiguity, or budget/safety the engine cannot resolve.
+2. **File-then-spawn.** Every unit of work is a tracker item first; thread
+   `HERD_ITEM_REF=<id>` on every lane spawn. No off-book spawns.
+3. **Respect review bandwidth.** Honor `REVIEW_CONCURRENCY`; hold further spawns when
+   the review gate is saturated. Review is the real throughput ceiling — spawning ahead
+   only queues PRs waiting for a reviewer slot.
+4. **Let the GATE merge.** The watcher merges when all gates pass. The coordinator
+   surfaces `needs you` rows and routes them; it never self-merges.
+5. **Reconcile the tracker on every merge.** Close or mark-shipped the item so the
+   tracker is always the single truthful picture of what is being built.
+6. **Sweep debris.** Keep the control room clean on the `SWEEP_AUTO` cadence (or when
+   the console advises). Stale panes, orphan worktrees, and dead builders degrade
+   situational awareness over time.
+
+### Diagnostic-first — before any gate intervention
+
+Always read the record BEFORE acting. In order:
+
+1. `herd notes` (or `herd log | grep builder_note`) — drain and route builder notes.
+   A note often names the reason a row is red; route before you act.
+2. `herd why <pr#>` — read the full chronological gate history for the PR you are
+   about to act on. It surfaces infra transients, autofix rounds already in progress,
+   and self-healing holds — all of which resolve without coordinator intervention.
+3. Only THEN: re-task, override a gate, or escalate.
+
+See *Builder notes* (read → route → ack) and *Diagnose a gate* (`herd why` FIRST).
+
+### Don't double-intervene when autofix is on
+
+When `REVIEW_AUTOFIX`, `HEALTHCHECK_AUTOFIX`, or `STALE_BASE_AUTOFIX` are enabled,
+the engine owns the bounce/refix cycle. The coordinator acts only on `needs you` rows:
+
+| Row | Engine state | Coordinator action |
+|---|---|---|
+| `refixing (round k/3)` | Builder bounced, actively working the fix | **Wait** |
+| `fix in progress · awaiting push (round k/3)` | Builder pushed a fix | **Wait** |
+| `needs you · auto-refix failed` | Engine exhausted bounce budget | **Re-task** |
+| `needs you` (no round suffix) | Autofix off or not applicable | **Re-task** |
+
+See *Auto-refix BLOCK reviews*, *Auto-heal stale-base holds*, *Auto-refix a red
+healthcheck*, and *Row truth* for the per-lever behavior.
+
+### Multi-seat discipline
+
+Before each spawn cycle, in order:
+
+1. `herd backlog queued` — check 📌 markers. A fresh (< 24h) marker means another
+   seat plans to build that item; respect it or override with an explicit reason.
+2. Run the pre-spawn impact analysis (graphify — see *Pre-spawn impact/conflict
+   analysis*). Sequence colliding items; spawn non-overlapping items in parallel.
+3. After deciding to spawn, publish your plan before the lane command:
+   `herd backlog queue <#id> --after <blocker>`. Closes the plan-time race that
+   the claim alone cannot cover (the claim fires AT spawn time; the marker covers
+   the window between "decided" and "spawned").
+
+See `docs/multi-seat-doctrine.md` for Rule 1 (reconciled invariants > event
+side-effects) and Rule 2 (one shared check at every enforcement surface).
+
+### Session continuity under full autonomy
+
+Full autonomy requires context to persist across sessions without human briefing:
+
+- **Update the local memory store every session** (see *Persist project & domain
+  context*). Context loss is a correctness defect, not a documentation chore.
+- **Long-form evidence goes in a committed doc** (`docs/`, `docs/audits/`) — never
+  only in a session artifact. Every item that needs the background cites the committed
+  path.
+- **Epics are filed before their children.** A multi-item effort whose shape lives only
+  in the coordinator's current session is a session artifact and evaporates on session
+  boundary.
+
 ## Rules
 
 - **You own `{{BACKLOG_FILE}}`.** Sub-agents never edit it. You make every backlog change.
