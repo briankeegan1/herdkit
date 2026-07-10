@@ -25,4 +25,4 @@ Invocation adds pysrc/ to PYTHONPATH (bin/herd derives it from HERDKIT_HOME). No
 dependencies — python3 is already a hard engine dep; NONE are added here.
 """
 
-__all__ = ["why", "log", "cost", "decisions"]
+__all__ = ["why", "log", "cost", "decisions", "statemachine", "parity", "driver"]

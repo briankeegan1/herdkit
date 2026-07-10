@@ -64,13 +64,19 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 # render_at <width> <list…on stdin> — the exact pipeline the pane runs. glow picks its renderer from
 # the file EXTENSION, so the shaped markdown must land in a .md file or it is syntax-highlighted as
 # source instead of glamour-rendered (see test-backlog-view-render.sh).
+#
+# glow (glamour) adds a 2-column left/right margin to every frame, so `glow -w N` produces N+2 visible
+# cols. backlog-view.sh's render_width() compensates by subtracting 2 from the pane width before
+# invoking glow, making the rendered frame exactly pane-width cols. We mirror that subtraction here
+# so the assertion `got <= w` correctly tests "frame fits in a pane of w columns".
 render_at() {
   local w="$1" tmp="$T/frame.md"
+  local gw=$(( w - 2 ))   # match render_width()'s 2-col margin compensation
   bash "$SCRIPT" --emit-md > "$tmp" || return 1
   if [ -n "$STYLE" ] && [ -f "$STYLE" ]; then
-    CLICOLOR_FORCE=1 COLORTERM=truecolor glow -s "$STYLE" -w "$w" "$tmp" </dev/null
+    CLICOLOR_FORCE=1 COLORTERM=truecolor glow -s "$STYLE" -w "$gw" "$tmp" </dev/null
   else
-    CLICOLOR_FORCE=1 COLORTERM=truecolor glow -s dark -w "$w" "$tmp" </dev/null
+    CLICOLOR_FORCE=1 COLORTERM=truecolor glow -s dark -w "$gw" "$tmp" </dev/null
   fi
 }
 

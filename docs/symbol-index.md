@@ -53,10 +53,10 @@ this scan cannot see).
 - `_backend_tw_journal` — def `scripts/herd/backends/file.sh:18`, `scripts/herd/backends/github.sh:36`, `scripts/herd/backends/jira.sh:70`, `scripts/herd/backends/linear.sh:64` — callers: —
 - `_backend_unqueue_item` — def `scripts/herd/backends/file.sh:539`, `scripts/herd/backends/github.sh:392`, `scripts/herd/backends/jira.sh:690`, `scripts/herd/backends/linear.sh:984` — callers: `bin/herd:3747`
 - `_backend_update_state` — def `scripts/herd/backends/changelog.sh:58`, `scripts/herd/backends/github.sh:134`, `scripts/herd/backends/jira.sh:355`, `scripts/herd/backends/linear.sh:382` — callers: `scripts/herd/agent-watch.sh:4645`, `scripts/herd/scribe-step.sh:395`, `scripts/herd/tracker-state-sweep.sh:158`
-- `_baseline_all_inherited` — def `scripts/herd/healthcheck.sh:172` — callers: —
-- `_baseline_aware_enabled` — def `scripts/herd/healthcheck.sh:150` — callers: —
-- `_baseline_base_set` — def `scripts/herd/healthcheck.sh:182` — callers: —
-- `_baseline_notok_set` — def `scripts/herd/healthcheck.sh:163` — callers: —
+- `_baseline_all_inherited` — def `scripts/herd/healthcheck.sh:185` — callers: —
+- `_baseline_aware_enabled` — def `scripts/herd/healthcheck.sh:163` — callers: —
+- `_baseline_base_set` — def `scripts/herd/healthcheck.sh:195` — callers: —
+- `_baseline_notok_set` — def `scripts/herd/healthcheck.sh:176` — callers: —
 - `_bg_health_worker` — def `scripts/herd/agent-watch.sh:2473` — callers: —
 - `_bg_new_session` — def `scripts/herd/agent-watch.sh:2452` — callers: —
 - `_blk_trim` — def `scripts/herd/agent-watch.sh:1835` — callers: —
@@ -75,7 +75,7 @@ this scan cannot see).
 - `_builder_notes_journal` — def `scripts/herd/agent-watch.sh:1377` — callers: —
 - `_builder_notes_scan` — def `scripts/herd/agent-watch.sh:1386` — callers: —
 - `_cand_gates_ready` — def `scripts/herd/agent-watch.sh:3501` — callers: —
-- `_changed_files` — def `scripts/herd/healthcheck.sh:119` — callers: —
+- `_changed_files` — def `scripts/herd/healthcheck.sh:132` — callers: —
 - `_changelog_ensure_unreleased` — def `scripts/herd/backends/changelog.sh:13` — callers: —
 - `_ci_checks_normalize` — def `scripts/herd/agent-watch.sh:3633` — callers: —
 - `_ci_checks_noted` — def `scripts/herd/agent-watch.sh:3602` — callers: —
@@ -346,12 +346,12 @@ this scan cannot see).
 - `_healthcheck_template_for` — def `bin/herd:579` — callers: —
 - `_herd_agent_dir` — def `scripts/herd/driver.sh:372` — callers: —
 - `_herd_agents_dir` — def `scripts/herd/driver.sh:368` — callers: —
-- `_herd_attr_scan` — def `scripts/herd/commit-lint.sh:21` — callers: `scripts/herd/healthcheck.sh:470`
+- `_herd_attr_scan` — def `scripts/herd/commit-lint.sh:21` — callers: `scripts/herd/healthcheck.sh:483`
 - `_herd_branch_template` — def `scripts/herd/herd-config.sh:1424` — callers: —
 - `_herd_brand` — def `scripts/herd/herd-preflight.sh:31` — callers: `scripts/herd/posture-lint.sh:193`
 - `_herd_claim_dispatch` — def `scripts/herd/herd-claim.sh:79` — callers: —
 - `_herd_claim_identity` — def `scripts/herd/herd-claim.sh:67` — callers: `scripts/herd/agent-watch.sh:9197`
-- `_herd_commit_convention_scan` — def `scripts/herd/commit-lint.sh:47` — callers: `scripts/herd/healthcheck.sh:502`
+- `_herd_commit_convention_scan` — def `scripts/herd/commit-lint.sh:47` — callers: `scripts/herd/healthcheck.sh:515`
 - `_herd_commit_shas` — def `scripts/herd/commit-lint.sh:10` — callers: —
 - `_herd_config_dup_keys` — def `scripts/herd/herd-config.sh:39` — callers: `bin/herd:2375`, `bin/herd:2376`, `scripts/herd/herd-preflight.sh:575`, `scripts/herd/herd-preflight.sh:593`
 - `_herd_config_warn_dupes` — def `scripts/herd/herd-config.sh:60` — callers: —
@@ -1086,7 +1086,7 @@ this scan cannot see).
 - `herd_burst` — def `scripts/herd/burst.sh:63` — callers: `scripts/herd/herd-review.sh:467`, `scripts/herd/herd-review.sh:847`
 - `herd_burst_bound` — def `scripts/herd/burst.sh:46` — callers: `scripts/herd/herd-review.sh:149`, `scripts/herd/herd-review.sh:183`, `scripts/herd/research.sh:166`
 - `herd_burst_enabled` — def `scripts/herd/burst.sh:31` — callers: —
-- `herd_caps_sync_lint` — def `scripts/herd/caps-sync-lint.sh:27`, `scripts/herd/healthcheck.sh:87` — callers: —
+- `herd_caps_sync_lint` — def `scripts/herd/caps-sync-lint.sh:27`, `scripts/herd/healthcheck.sh:91` — callers: —
 - `herd_claim_or_abort` — def `scripts/herd/herd-claim.sh:141` — callers: —
 - `herd_claim_release` — def `scripts/herd/herd-claim.sh:258` — callers: `scripts/herd/agent-watch.sh:9198`
 - `herd_claim_release_mode` — def `scripts/herd/herd-claim.sh:213` — callers: `scripts/herd/agent-watch.sh:9170`
@@ -1105,7 +1105,7 @@ this scan cannot see).
 - `herd_context_pane_guard` — def `scripts/herd/context-guard.sh:224` — callers: —
 - `herd_context_provision_preamble` — def `scripts/herd/herd-config.sh:1151` — callers: `scripts/herd/herd-feature.sh:266`, `scripts/herd/herd-quick.sh:273`
 - `herd_derived_paths` — def `scripts/herd/derived-files.sh:44` — callers: `scripts/herd/sweep.sh:177`
-- `herd_doc_drift_lint` — def `scripts/herd/doc-drift-lint.sh:177`, `scripts/herd/healthcheck.sh:95` — callers: —
+- `herd_doc_drift_lint` — def `scripts/herd/doc-drift-lint.sh:177`, `scripts/herd/healthcheck.sh:102` — callers: —
 - `herd_doc_drift_report` — def `scripts/herd/doc-drift-lint.sh:46` — callers: —
 - `herd_doctor` — def `scripts/herd/herd-preflight.sh:443` — callers: `bin/herd:3504`
 - `herd_doctor_posture` — def `scripts/herd/posture-lint.sh:192` — callers: `bin/herd:3502`
@@ -1163,7 +1163,7 @@ this scan cannot see).
 - `herd_engine_warn_if_stale` — def `scripts/herd/engine-version.sh:118` — callers: `bin/herd:3528`
 - `herd_enum` — def `scripts/herd/herd-config.sh:1469` — callers: —
 - `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:39` — callers: —
-- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:94`, `scripts/herd/healthcheck.sh:103` — callers: —
+- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:94`, `scripts/herd/healthcheck.sh:113` — callers: —
 - `herd_is_derived_path` — def `scripts/herd/derived-files.sh:54` — callers: —
 - `herd_model_driver_for` — def `scripts/herd/driver.sh:182` — callers: `scripts/herd/herd-feature.sh:111`, `scripts/herd/herd-quick.sh:119`, `scripts/herd/herd-review.sh:364`
 - `herd_model_for_spawn` — def `scripts/herd/driver.sh:171` — callers: `scripts/herd/herd-feature.sh:110`, `scripts/herd/herd-quick.sh:118`, `scripts/herd/herd-review.sh:358`
@@ -1171,7 +1171,7 @@ this scan cannot see).
 - `herd_model_resolve` — def `scripts/herd/driver.sh:146` — callers: —
 - `herd_numeric` — def `scripts/herd/herd-config.sh:1498` — callers: `scripts/herd/agent-watch.sh:575`, `scripts/herd/agent-watch.sh:576`, `scripts/herd/agent-watch.sh:577`, `scripts/herd/agent-watch.sh:11536`, `scripts/herd/agent-watch.sh:11537`, `scripts/herd/herd-spawn-gate.sh:138`, `scripts/herd/herd-spawn-gate.sh:139`
 - `herd_pipe_safety_check` — def `scripts/herd/pipe-safety-lint.sh:58` — callers: —
-- `herd_pipe_safety_lint` — def `scripts/herd/healthcheck.sh:111`, `scripts/herd/pipe-safety-lint.sh:118` — callers: —
+- `herd_pipe_safety_lint` — def `scripts/herd/healthcheck.sh:124`, `scripts/herd/pipe-safety-lint.sh:118` — callers: —
 - `herd_pr_ref_from_body` — def `scripts/herd/agent-watch.sh:4585` — callers: —
 - `herd_preflight` — def `scripts/herd/herd-preflight.sh:41` — callers: `scripts/herd/coordinator.sh:37`, `scripts/herd/new-feature.sh:13`
 - `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:937` — callers: `scripts/herd/new-feature.sh:73`
@@ -1305,14 +1305,14 @@ this scan cannot see).
 - `review_verdict` — def `scripts/herd/agent-watch.sh:1686` — callers: —
 - `review_verdict_source` — def `scripts/herd/agent-watch.sh:1697` — callers: —
 - `rich_to_md` — def `scripts/herd/backlog-view.sh:327` — callers: —
-- `run_attribution_lint` — def `scripts/herd/healthcheck.sh:458` — callers: —
+- `run_attribution_lint` — def `scripts/herd/healthcheck.sh:471` — callers: —
 - `run_backend_mode` — def `scripts/herd/backlog-view.sh:512` — callers: —
-- `run_commit_convention_lint` — def `scripts/herd/healthcheck.sh:490` — callers: —
-- `run_heavy` — def `scripts/herd/healthcheck.sh:256` — callers: —
-- `run_interaction_gate` — def `scripts/herd/healthcheck.sh:518` — callers: —
-- `run_light` — def `scripts/herd/healthcheck.sh:299` — callers: —
+- `run_commit_convention_lint` — def `scripts/herd/healthcheck.sh:503` — callers: —
+- `run_heavy` — def `scripts/herd/healthcheck.sh:269` — callers: —
+- `run_interaction_gate` — def `scripts/herd/healthcheck.sh:531` — callers: —
+- `run_light` — def `scripts/herd/healthcheck.sh:312` — callers: —
 - `run_migrations` — def `bin/herd:1447` — callers: —
-- `run_profile` — def `scripts/herd/healthcheck.sh:548` — callers: —
+- `run_profile` — def `scripts/herd/healthcheck.sh:561` — callers: —
 - `say` — def `bin/herd:138` — callers: `scripts/herd/fleet.sh:153`, `scripts/herd/fleet.sh:164`, `scripts/herd/fleet.sh:166`, `scripts/herd/fleet.sh:167`, `scripts/herd/fleet.sh:271`, `scripts/herd/fleet.sh:273`, `scripts/herd/fleet.sh:275`, `scripts/herd/fleet.sh:277`, `scripts/herd/fleet.sh:279`, `scripts/herd/fleet.sh:369`, `scripts/herd/fleet.sh:388`, `scripts/herd/fleet.sh:392`, `scripts/herd/fleet.sh:393`, `scripts/herd/fleet.sh:425`, `scripts/herd/fleet.sh:426`, `scripts/herd/fleet.sh:723`, `scripts/herd/fleet.sh:730`, `scripts/herd/fleet.sh:1020`, `scripts/herd/fleet.sh:1027`, `scripts/herd/fleet.sh:1100`, `scripts/herd/fleet.sh:1104`, `scripts/herd/fleet.sh:1105`, `scripts/herd/fleet.sh:1139`, `scripts/herd/fleet.sh:1141`, `scripts/herd/fleet.sh:1256`, `scripts/herd/fleet.sh:1257`, `scripts/herd/fleet.sh:1258`, `scripts/herd/fleet.sh:1280`, `scripts/herd/fleet.sh:1331`, `scripts/herd/fleet.sh:1332`, `scripts/herd/fleet.sh:1336`
 - `scanq` — def `scripts/herd/codemap.sh:477` — callers: —
 - `scout_repo` — def `bin/herd:557` — callers: —

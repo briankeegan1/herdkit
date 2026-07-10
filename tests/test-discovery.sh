@@ -98,7 +98,11 @@ if [ "$_rc" -eq 2 ]; then
   bats_test_function --description "discovery matched zero tests/test-*.sh (glob typo / empty suite)" -- test_zero
 fi
 BATS
-  e2e="$(bats "$D6/herd.bats" 2>&1)"; e2e_rc=$?
+  # Never use $(bats …): a surviving /dev/tty grandchild keeps the pipe open and hangs
+  # inside the gate's own bats run (the healthcheck.project.sh pattern: write to a file).
+  _e2e_out="$T/e2e-bats.out"
+  bats "$D6/herd.bats" </dev/null >"$_e2e_out" 2>&1; e2e_rc=$?
+  e2e="$(cat "$_e2e_out")"
   [ "$e2e_rc" -ne 0 ] || fail "(6) an empty-suite discovery file must FAIL under bats (rc=$e2e_rc):\n$e2e"
   printf '%s\n' "$e2e" | grep -q 'not ok .* discovery matched zero' \
     || fail "(6) bats should report the loud zero-match test as failing:\n$e2e"
