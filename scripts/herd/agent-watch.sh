@@ -3599,6 +3599,83 @@ _resolve_result() {
   if grep -qi 'ESCALATE' "$f" 2>/dev/null; then printf 'ESCALATE'; else printf 'DONE'; fi
 }
 
+# ── Resolver-pane lifecycle (HERD-280) ────────────────────────────────────────────────────────────
+# The resolver is a PANE that retires on result-consumed, exactly like a reviewer pane. herd-resolve.sh
+# (under RESOLVER_PANE=on) writes ONE row per dispatch naming the pane it created:
+#
+#     .resolve-registry-<pr>-<sha>       "<pane> <tab> <placement> <pr> <sha>"
+#
+# placement is `split` (a guest pane in the builder's tab) or `tab` (the standalone resolve·<slug> tab).
+# pr + sha are carried IN the row, not parsed back out of the filename: an absent head sha is normalized
+# to "-", which would make `<pr>-<sha>` ambiguous to split on the last dash.
+_resolve_registry_file() { printf '%s' "$TREES/.resolve-registry-$1-$2"; }
+
+# _resolver_pane_enabled — the RESOLVER_PANE lever (default off, ship-dormant). An unrecognized value
+# reads OFF: a typo can never arm a path that closes panes.
+_resolver_pane_enabled() {
+  case "${RESOLVER_PANE:-off}" in on|true|yes|1) return 0 ;; *) return 1 ;; esac
+}
+
+# _retire_resolver_pane <pr#> <sha> [reason] — close this dispatch's resolver pane and drop its row.
+# Mirrors _retire_reviewer_pane: the close is GUARDED (HERD-134) — a stale/recycled pane id that now
+# names the BUILDER sharing the tab is REFUSED and journals pane_close_refused, so resolver_pane_retired
+# is journaled ONLY on a real close. The row is dropped unconditionally: a row pointing at the wrong pane
+# must not linger to be retried. In `tab` placement the (now empty) standalone tab is closed too and its
+# sweep-allowlist row pruned, so the retire leaves no corpse for _sweep_stale_resolve_tabs to find.
+#
+# The WORKTREE is untouched. Retiring the resolver's pane is not retiring the feature: the tree stays
+# checked out on the PR's branch and the retirement invariant still reaps it at merge.
+#
+# FAIL-SOFT + byte-quiet: no registry row (the RESOLVER_PANE=off default writes none), no pane, or an
+# already-gone pane ⇒ no console output, no journal line, no herdr call.
+_retire_resolver_pane() {
+  local pr="$1" sha="$2" reason="${3:-result-consumed}" reg pane tab placement
+  # DRY-RUN INERT: _classify_conflict renders under --dry-run, and a render must never close a pane.
+  [ -z "${DRYRUN:-}" ] || return 0
+  reg="$(_resolve_registry_file "$pr" "$sha")"
+  [ -f "$reg" ] || return 0
+  read -r pane tab placement _ < "$reg" 2>/dev/null || true
+  if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
+    if herd_close_pane_verified "$pane" "resolve·"; then
+      journal_append resolver_pane_retired pr "$pr" sha "$sha" pane "$pane" \
+        placement "${placement:--}" reason "$reason"
+      if [ "${placement:-}" = "tab" ] && [ -n "${tab:-}" ] && [ "$tab" != "-" ]; then
+        herdr tab close "$tab" >/dev/null 2>&1 || true
+        _herd_tabs_drop_row "$TREES/.herd-tabs" "$tab"
+      fi
+    fi
+  fi
+  rm -f "$reg" 2>/dev/null || true
+}
+
+# _reconcile_resolver_panes — the per-tick RECONCILE that retires finished resolver panes. Multi-seat by
+# construction: it decides from the OBSERVED verdict file, never from a dispatch-seat event, so a seat
+# that did not spawn the resolver still retires its pane once the verdict lands.
+#
+#   RESOLVE: DONE      the resolver's job is over → retire the pane immediately.
+#   RESOLVE: ESCALATE  the resolver stopped for a HUMAN. KEEP the pane open: its transcript is the
+#                      evidence the escalation's needs-you row points at. The row survives too, so no
+#                      later tick can retire it out from under the human.
+#   (no verdict yet)   in flight → hands off.
+#
+# This is a SEPARATE observer from the conflict classifier because a SUCCESSFUL resolve is exactly the
+# case the classifier never sees: a DONE resolver pushes, the PR flips CLEAN, and _classify_conflict is
+# never called for it again. Reconciling the registry against the result file catches both outcomes.
+# Idempotent, dry-run-inert, and byte-quiet on a seat with no resolver rows.
+_reconcile_resolver_panes() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local f pane tab placement pr sha
+  for f in "$TREES"/.resolve-registry-*; do
+    [ -e "$f" ] || continue
+    read -r pane tab placement pr sha < "$f" 2>/dev/null || true
+    [ -n "${pr:-}" ] && [ -n "${sha:-}" ] || continue
+    case "$(_resolve_result "$pr" "$sha" || true)" in
+      DONE) _retire_resolver_pane "$pr" "$sha" result-consumed ;;
+      *)    : ;;   # ESCALATE keeps the pane; no verdict keeps the resolver
+    esac
+  done
+}
+
 # ── Resolver liveness: POSITIVE-EVIDENCE-ONLY death (HERD-206) ────────────────────────────────────
 # Resolver rows now carry the SAME liveness discipline builders got in PR #260. The pre-HERD-206 rule
 # was "absent from $AGENTS_JSON ⇒ dead", which is NEGATIVE evidence and produced a false-dead respawn
@@ -3867,6 +3944,17 @@ _reap_idle_resolver_for_redispatch() {
       _herd_tabs_drop_row "$_rir_reg" "$_rir_tab"
     fi
   fi
+  # HERD-280: a SPLIT-placed resolver owns no tab row — the tab is the builder's. Its idle pane still
+  # holds the resolve·<slug> agent name, so free it the same way, by a GUARDED close that refuses any
+  # pane no longer carrying the resolver's identity (never the builder sharing the tab). Only reached
+  # under RESOLVER_PANE=on, so the pre-HERD-280 lane makes no extra driver call.
+  if _resolver_pane_enabled && [ -z "${_rir_tab:-}" ]; then
+    local _rir_pane; _rir_pane="$(herd_driver_agent_pane_id "resolve·${_rir_slug}" 2>/dev/null || true)"
+    if [ -n "$_rir_pane" ] && herd_close_pane_verified "$_rir_pane" "resolve·"; then
+      journal_append resolver_pane_retired slug "$_rir_slug" pane "$_rir_pane" \
+        placement split reason idle-redispatch
+    fi
+  fi
   # Headless registry: free the slot so the next launch owns a clean pid/status file (herdr tab
   # close is a no-op under HERD_DRIVER=headless). Best-effort kill of a still-live detached pid.
   _rir_adir="${WORKTREES_DIR:-${TREES:-.}}/.herd/agents/resolve·${_rir_slug}"
@@ -4060,8 +4148,20 @@ _spawn_resolver_lane() {
       detail "proceeding unserialized — a dropped dispatch would strand the conflict"
   fi
   _reap_idle_resolver_for_redispatch "$rs"
-  HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
-    bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
+  # HERD-280: the registry seam is handed over ONLY when the resolver-pane lever is on, so the default
+  # lane writes no row and the whole retire path stays byte-inert. pr + sha ride along so herd-resolve.sh
+  # can stamp them into the row it writes (the watcher's reconcile reads them back from there).
+  # A dispatch with no sha at all keys no registry row (its verdict file is unaddressable too) — it
+  # falls through to the plain lane rather than writing a row the reconcile could never join back.
+  if _resolver_pane_enabled && [ -n "$rsha" ]; then
+    HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
+    HERD_RESOLVE_REGISTRY_FILE="$(_resolve_registry_file "$rp" "$rsha")" \
+    HERD_RESOLVE_PR="$rp" HERD_RESOLVE_SHA="$rsha" \
+      bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
+  else
+    HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
+      bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
+  fi
   [ -n "$_sr_locked" ] && _resolve_lane_lock_release "$_sr_marker"
   # ACK probe: re-read the roster from the DRIVER (the tick's $AGENTS_JSON snapshot predates this
   # spawn and can never show it) and fall back to the pane probe, so 'acked' is observed, not assumed.
@@ -4121,6 +4221,10 @@ _classify_conflict() {
       DONE)
         # Resolver reported done yet the PR is STILL conflicting — it could not clear it. Do NOT
         # re-spawn on the same sha (that would loop); wait for a new commit or a human.
+        # HERD-280: DONE is DONE — the resolver has written its terminal verdict and will do nothing
+        # more, so its pane retires here too. (The per-tick reconcile retires the far commoner DONE:
+        # the one that CLEARED the conflict and so never reaches this classifier again.)
+        _retire_resolver_pane "$cpr" "$csha" result-consumed
         DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
         return ;;
     esac
@@ -11395,6 +11499,12 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     render
     spawn_resolver "$slug" "$prnum" "$branch" "$csha"
   done
+
+  # Resolver-pane reconcile (HERD-280): retire the pane of every resolver whose DONE verdict has landed.
+  # Runs OUTSIDE the conflict pass on purpose — a resolver that CLEARED its conflict leaves the pass's
+  # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.
+  # Byte-inert unless RESOLVER_PANE=on (no rows exist to reconcile).
+  _reconcile_resolver_panes
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
   _drain_spawn_queue
