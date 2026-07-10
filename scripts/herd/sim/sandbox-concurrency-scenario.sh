@@ -260,13 +260,25 @@ _missing=""
 for fn in _healthcheck_gate _review_gate_step _count_live_reviews _count_live_healthchecks \
           _health_slot_free _health_inflight_file _review_inflight_file do_merge already_merged \
           review_verdict _predispatch_review_if_parallel _gate_dispatch_mode \
-          _breaker_gate _breaker_record_infra _breaker_record_ok _breaker_read; do
+          _breaker_gate _breaker_record_infra _breaker_record_ok _breaker_read \
+          herd_driver_agent_resume_cmd herd_driver_agent_limit_pattern herd_driver_send_text \
+          herd_driver_switch_model; do
   type "$fn" >/dev/null 2>&1 || _missing="$_missing $fn"
 done
 if [ -z "$_missing" ]; then
   checkpoint watcher_bound pass "real agent-watch.sh gate functions sourced (lib mode)"
 else
   checkpoint watcher_bound fail "missing gate functions:$_missing"
+fi
+# HERD-176: watcher wake surface is driver-bound — default resume is the byte-identical claude shape.
+_resume_shape="$(herd_driver_agent_resume_cmd "continue" 2>/dev/null || true)"
+_lim_pat="$(herd_driver_agent_limit_pattern 2>/dev/null || true)"
+if printf '%s' "$_resume_shape" | grep -qF 'claude' \
+   && printf '%s' "$_resume_shape" | grep -qF -- '--continue' \
+   && [ "$_lim_pat" = 'usage limit|session limit|hit your (usage|session) limit' ]; then
+  checkpoint driver_wake_routing pass "resume=$_resume_shape; limit pattern bound (byte-identical claude default)"
+else
+  checkpoint driver_wake_routing fail "wake seam not bound (resume='$_resume_shape' lim='$_lim_pat')"
 fi
 
 # Neutralize the post-merge SIDE-QUESTS that are orthogonal to concurrency and would touch external

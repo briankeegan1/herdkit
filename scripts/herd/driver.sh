@@ -1017,6 +1017,90 @@ herd_driver_oneshot_exec() {
   fi
 }
 
+# ── watcher wake surface (HERD-176 — HERD-150 P4: resume / limit / model-switch) ──────────────────
+# The watcher's load-bearing wake paths used to hardcode claude-shaped incantations:
+#   • resume:        `claude <flags> --continue "<prompt>"` in the builder/coordinator pane
+#   • limit-banner:  `usage limit|session limit|hit your (usage|session) limit` phrase match
+#   • model-switch:  `/model <model>` typed into a live session via send-text
+#   • refix-wake:    already delivered via herd_driver_send_text (mux DRIVER_SEND_TEXT) for review;
+#                    health/stale rails follow the same seam
+# HERD-176 routes each through the P1 DRIVER_AGENT_* / DRIVER_SEND_TEXT bindings so a non-Claude
+# runtime (grok/codex/stub) resumes, limit-detects, and switches model correctly. BYTE-IDENTICAL for
+# herdr-claude / headless: the resume/limit/model-switch bindings carry today's exact strings, so the
+# composed argv and the banner phrase match pre-P4 hardcodes (tests/test-watcher-driver-wake.sh).
+
+# herd_driver_agent_resume_cmd <prompt> [flags] [driver] — compose the RESUME shell command from
+# <driver>'s DRIVER_AGENT_RESUME template (default: active driver). Substitutes:
+#   <prompt>                   → <prompt> (one token; shell-quoted on emit)
+#   the permission-flag token  → <flags>, whitespace-split (empty <flags> → driver's own flag /
+#                                HERD_CLAUDE_FLAGS via herd_driver_lane_permission_flags)
+#   anything else              → kept literally (runtime binary + --continue / resume / …)
+# FAIL-SOFT: an unreadable/absent binding falls back to today's exact claude resume shape so a
+# misconfigured driver never emits an empty command. Echoes a single shell-safe command line the
+# watcher wraps as `cd <wt> && <cmd>` and delivers via `herdr pane run` (a shell relaunch into an
+# ENDED session — not send-text, which would also Enter-submit into a still-present TUI).
+herd_driver_agent_resume_cmd() {
+  local prompt="${1:-continue}" flags="${2-}" drv="${3:-}" binding perm
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_RESUME "" "$drv")"
+  perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "" "$drv")"
+  [ -n "$binding" ] || binding='claude --dangerously-skip-permissions --continue "<prompt>"'
+  [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
+  # Empty/unset flags → the lane permission resolver (HERD_CLAUDE_FLAGS override, else driver's flag).
+  # Use ${2-} (not ${2:-}) so an explicit empty second arg still means "derive"; only a non-empty
+  # second arg pins the flags. Callers that want derived flags pass nothing or "".
+  if [ -z "${flags}" ]; then
+    flags="$(herd_driver_lane_permission_flags "$drv")"
+  fi
+  HERD_RESUME_BINDING="$binding" HERD_RESUME_PERM="$perm" \
+  HERD_RESUME_FLAGS="$flags" HERD_RESUME_PROMPT="$prompt" python3 -c '
+import os, shlex, sys
+binding = os.environ["HERD_RESUME_BINDING"]
+perm    = os.environ["HERD_RESUME_PERM"]
+flags   = os.environ["HERD_RESUME_FLAGS"].split()
+prompt  = os.environ["HERD_RESUME_PROMPT"]
+try:
+    toks = shlex.split(binding)
+    out = []
+    for t in toks:
+        if t == "<prompt>":
+            out.append(prompt)
+        elif t == perm:
+            out.extend(flags)
+        else:
+            out.append(t)
+except Exception:
+    out = ["claude"] + flags + ["--continue", prompt]
+sys.stdout.write(" ".join(shlex.quote(t) for t in out))
+'
+}
+
+# herd_driver_agent_limit_pattern [driver] — the usage-limit BANNER PHRASE regex from
+# DRIVER_AGENT_LIMIT_PATTERN (primary phrase half of _text_is_limit_banner). FAIL-SOFT: echoes the
+# herdr-claude default when the binding is unreadable so detection never goes silent under set -e.
+# A `@degrade:…` sentinel (codex/grok) is returned as-is; the caller treats it as never-match.
+herd_driver_agent_limit_pattern() {
+  local drv="${1:-}"
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  herd_driver_agent_value DRIVER_AGENT_LIMIT_PATTERN \
+    'usage limit|session limit|hit your (usage|session) limit' "$drv"
+}
+
+# herd_driver_switch_model <pane-or-slug> <model> [driver] — mid-session model switch: compose the
+# DRIVER_AGENT_MODEL_SWITCH template (`/model <model>` for every shipped driver today) and deliver it
+# via the mux DRIVER_SEND_TEXT seam (herd_driver_send_text → pane run + Enter for herdr; queue-append
+# for headless). FAIL-SOFT: empty target/model or a missing binding is a clean no-op — never aborts.
+herd_driver_switch_model() {
+  local target="${1:-}" model="${2:-}" drv="${3:-}" binding text
+  [ -n "$target" ] && [ -n "$model" ] || return 0
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_MODEL_SWITCH '/model <model>' "$drv")"
+  [ -n "$binding" ] || binding='/model <model>'
+  text="${binding//<model>/$model}"
+  herd_driver_send_text "$target" "$text"
+  return 0
+}
+
 # ── CLI entrypoint ───────────────────────────────────────────────────────────────────────────────
 # Only runs when EXECUTED (not sourced): `bash driver.sh <cap> …`. Sources herd-config.sh for
 # WORKTREES_DIR, then dispatches to the capability. This is what the rendered headless coordinator
@@ -1039,13 +1123,16 @@ _herd_driver_cli() {
     create-tab)  herd_driver_create_tab "$@" ;;
     oneshot-exec) herd_driver_oneshot_exec "$@" ;;   # <prompt> <model> [runtime-arg …] → <runtime> -p …
     agent-runtime) herd_driver_agent_runtime; echo ;;       # the active driver's runtime executable
+    resume-cmd)  herd_driver_agent_resume_cmd "$@"; echo ;;  # <prompt> [flags] [driver] → shell-safe resume cmd
+    limit-pattern) herd_driver_agent_limit_pattern "$@"; echo ;;  # [driver] → DRIVER_AGENT_LIMIT_PATTERN
+    switch-model) herd_driver_switch_model "$@" ;;   # <pane> <model> [driver]
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
     name)        herd_driver_name; echo ;;
     agent-value) herd_driver_agent_value "$@"; echo ;;   # <KEY> [default] → the active driver's DRIVER_AGENT_* value
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|resume-cmd <prompt> [flags] [driver]|limit-pattern [driver]|switch-model <pane> <model>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 

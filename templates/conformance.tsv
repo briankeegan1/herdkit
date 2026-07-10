@@ -150,8 +150,11 @@ agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
 agent-watch.sh	unit	tests/test-watcher-singleton.sh
 agent-watch.sh	unit	tests/test-postmerge-sweep.sh
+agent-watch.sh	unit	tests/test-watcher-driver-wake.sh
+agent-watch.sh	unit	tests/test-limit-resume.sh
 agent-watch.sh	unit	tests/test-watcher-gh-timeout.sh
 agent-watch.sh	sim	tests/test-sandbox-concurrency.sh
+agent-watch.sh	sim	tests/test-sandbox-limit-resume.sh
 agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 agent-watch.sh	sim	scripts/herd/sim/tick-availability-sim.sh
 agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
