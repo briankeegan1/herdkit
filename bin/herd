@@ -2614,7 +2614,7 @@ cmd_config_set() {
   #    operator to retire it now, so the next request spawns a fresh drainer on the new backend.
   if [ "$key" = "SCRIBE_BACKEND" ] && [ "$changed" -eq 1 ]; then
     say ""
-    warn "SCRIBE_BACKEND changed ${cur:+from \"$cur\" }to \"$val\" — an idle backlog scribe drainer spawned under the OLD backend may still be running and would drain queued requests in the stale mode. RETIRE it now (close its 'scribe-<workspace>' tab, e.g. 'herdr agent stop scribe-<workspace>') so the next request spawns a fresh drainer on the new backend."
+    warn "SCRIBE_BACKEND changed ${cur:+from \"$cur\" }to \"$val\" — an idle backlog scribe drainer spawned under the OLD backend may still be running and would drain queued requests in the stale mode. RETIRE it now (close its 'scribe-<workspace>' tab: find the tab id with 'herdr tab list' and run 'herdr tab close <tab-id>') so the next request spawns a fresh drainer on the new backend."
   fi
 }
 
