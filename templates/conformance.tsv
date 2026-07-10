@@ -171,6 +171,7 @@ console-section.sh	unit	tests/test-console-rows-ageout.sh
 console-section.sh	unit	tests/test-tracker-heal-supersede.sh
 watcher-exempt.sh	unit	tests/test-watcher-exempt.sh
 context-guard.sh	unit	tests/test-context-guard.sh
+gate-coverage-lint.sh	unit	tests/test-gate-coverage.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh

@@ -542,6 +542,31 @@ case "$_hc_sync_rc" in
      exit 1 ;;
 esac
 
+# 5b. gate-coverage guard (HERD-292) — every tests/test-*.sh must be wired into tests/herd.bats
+# or listed in tests/gate-coverage-exempt.tsv. ONE implementation shared with the builder's light
+# pre-PR gate (scripts/herd/gate-coverage-lint.sh), so the two gates can never disagree.
+gcov_note="gate-coverage: clean"
+HERD_GATE_COVERAGE_SKIP_REASON=""
+if [ -f scripts/herd/gate-coverage-lint.sh ]; then
+  . scripts/herd/gate-coverage-lint.sh
+  _hc_gcov_errs="$(herd_gate_coverage_lint ".")"; _hc_gcov_rc=$?
+else
+  _hc_gcov_errs=""; _hc_gcov_rc=2
+  HERD_GATE_COVERAGE_SKIP_REASON="scripts/herd/gate-coverage-lint.sh not present"
+fi
+case "$_hc_gcov_rc" in
+  0) gcov_note="gate-coverage: clean" ;;
+  2) gcov_note="gate-coverage: skipped ($HERD_GATE_COVERAGE_SKIP_REASON)" ;;
+  *) gcov_note="gate-coverage: UNGATED TESTS"
+     if [ -n "$ONELINE" ]; then
+       echo "gate-coverage: $(printf '%s' "$_hc_gcov_errs" | grep '^UNGATED' | head -1)"
+     else
+       echo "GATE-COVERAGE: tests/test-*.sh exists but is not wired into tests/herd.bats"
+       printf '%s\n' "$_hc_gcov_errs" | grep '^UNGATED' || printf '%s\n' "$_hc_gcov_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -562,5 +587,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $chl_note"; }
 exit 0
