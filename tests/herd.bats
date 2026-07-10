@@ -521,6 +521,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic control-room context guard (HERD-269) test passes" {
+  run bash "$REPO/tests/test-context-guard.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic shared watcher-identity check (HERD-266) test passes" {
   run bash "$REPO/tests/test-watcher-exempt.sh"
   [ "$status" -eq 0 ]
