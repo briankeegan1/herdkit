@@ -42,14 +42,18 @@ herd_caps_sync_lint() {
   case "$_cs_changed" in *"templates/capabilities.tsv"*) _cs_manifest_touched=1 ;; esac
   [ "$_cs_manifest_touched" -eq 1 ] && return 0    # manifest moved with the change → nothing to flag
 
-  if printf '%s\n' "$_cs_changed" | grep -qxE 'bin/herd'; then
+  # Grep a here-string, NOT `printf … | grep -qx` (HERD-297): grep -q closes the pipe at the first
+  # match, the producer takes EPIPE, and under a caller's `set -o pipefail` (e.g.
+  # tests/test-caps-sync-light.sh) the pipeline goes nonzero once the changed-file list exceeds a
+  # 16KB pipe buffer. A here-string is a temp file — no producer process, no EPIPE.
+  if grep -qxE 'bin/herd' <<< "$_cs_changed"; then
     _cs_new_cmds="$(git diff "$_cs_base" -- bin/herd 2>/dev/null \
       | grep -E '^\+[[:space:]]*cmd_[a-z_]+\(\)' || true)"
     [ -n "$_cs_new_cmds" ] \
       && _cs_errs="${_cs_errs}bin/herd adds cmd_*: also update templates/capabilities.tsv"$'\n'
   fi
 
-  if printf '%s\n' "$_cs_changed" | grep -qxE 'scripts/herd/herd-config\.sh'; then
+  if grep -qxE 'scripts/herd/herd-config\.sh' <<< "$_cs_changed"; then   # here-string, not a pipe (HERD-297)
     _cs_new_keys="$(git diff "$_cs_base" -- scripts/herd/herd-config.sh 2>/dev/null \
       | grep -E '^\+[[:space:]]*:[[:space:]]+"?\$\{[A-Z_]+:=' || true)"
     [ -n "$_cs_new_keys" ] \
