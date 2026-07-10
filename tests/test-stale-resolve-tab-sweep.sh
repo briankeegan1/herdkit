@@ -68,6 +68,9 @@ export PATH="$BIN:$PATH"
 export AGENT_WATCH_LIB=1
 export PROJECT_ROOT="$T/main"; mkdir -p "$PROJECT_ROOT"
 export WORKTREES_DIR="$T/trees"; mkdir -p "$WORKTREES_DIR"      # TREES + registry live here
+# HERD-310: hermetic sweep on a THROWAWAY fixture workspace with a STUB herdr — declare it disposable
+# so herd_context_pane_guard allows the fixture tab closes (see test-sweep.sh for the full rationale).
+export HERD_DISPOSABLE_WORKSPACE=1
 export HERD_CONFIG_FILE="$T/no-such-config"
 export JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
 # shellcheck source=/dev/null

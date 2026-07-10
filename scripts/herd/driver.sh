@@ -503,6 +503,15 @@ herd_driver_close_pane() {
   if _herd_driver_is_headless; then
     : # no-op: view-only — headless has no pane to close
   else
+    # HERD-310: route the live pane close through the shared invocation-context guard so a test that
+    # SOURCES the driver from a builder worktree can never close the operator's real panes. Fail-soft:
+    # when context-guard.sh is not in scope (driver.sh sourced standalone — its zero-dependency
+    # contract) the function is absent and the close proceeds exactly as before. From the control room
+    # the guard is a no-op, so a real reviewer/resolver retire is byte-identical.
+    if command -v herd_context_pane_guard >/dev/null 2>&1 \
+       && ! herd_context_pane_guard "herd_driver_close_pane $target"; then
+      return 0
+    fi
     herdr pane close "$target" >/dev/null 2>&1 || true
   fi
   return 0

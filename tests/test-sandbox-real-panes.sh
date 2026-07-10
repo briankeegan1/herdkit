@@ -302,9 +302,13 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 # PR #260 false-death shape). alive→dead on kill, →missing on pane removal, and claude-as-root ⇒ alive.
 for cpn in workspace_created control_room builder_tab pane_labels_on_spawn agent_idle agent_working \
            agent_done builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
-           builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
+           builder_refix_escalates_on_dead builder_agent_missing context_guard_refuses_real_teardown teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
+# HERD-310: the context-guard checkpoint proves a WORKTREE-context herd_teardown_slug against the live
+# control room is REFUSED (zero real closes + a journaled control_pane_mutation_refused).
+[ "$(cp_status "$SCR" context_guard_refuses_real_teardown)" = "pass" ] \
+  || fail "(B) context_guard_refuses_real_teardown must pass"
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
