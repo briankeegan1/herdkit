@@ -11613,6 +11613,16 @@ AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
 
 while true; do
+  # ENGINE_IMPL=python (HERD-320, P3f, EPIC HERD-300): hand this tick to the LIVE Python engine core.
+  # herd_engine_live_tick returns 0 only when Python is ARMED (ENGINE_IMPL=python) AND owned the tick
+  # successfully; in that case bash — the resident supervisor — skips its own tick body for this cycle
+  # and just sleeps. Under the ship default (bash) it returns 1 immediately having done NOTHING, so this
+  # guard is a byte-identical no-op and the existing body below runs exactly as before. A Python fault
+  # (non-zero exit / missing module) also returns 1 → instant fallback to the authoritative bash tick.
+  if herd_engine_live_tick; then
+    sleep 4
+    continue
+  fi
   # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
   _HEALTH_HEADROOM_APPROACHING=""
   # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
