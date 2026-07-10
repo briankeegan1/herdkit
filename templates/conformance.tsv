@@ -206,6 +206,7 @@ MODEL_SCRIBE	unit	tests/test-token-mode.sh
 MODEL_RESEARCH	unit	tests/test-token-mode.sh
 MODEL_REVIEW	unit	tests/test-token-mode.sh
 MODEL_REVIEW	unit	tests/test-eco-starter-defaults.sh
+MODEL_REVIEW	unit	tests/test-model-review-driver-validate.sh
 MODEL_RESOLVER	unit	tests/test-model-flags.sh
 MODEL_RESOLVER	unit	tests/test-token-mode.sh
 MODEL_ADVISE	unit	tests/test-advise.sh
