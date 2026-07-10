@@ -509,6 +509,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic tracker-create self-heal: durable retry + sweep relink (HERD-267) test passes" {
+  run bash "$REPO/tests/test-create-selfheal.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic retirement-invariant (HERD-164) test passes" {
   run bash "$REPO/tests/test-retirement-invariant.sh"
   [ "$status" -eq 0 ]

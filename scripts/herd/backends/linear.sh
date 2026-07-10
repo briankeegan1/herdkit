@@ -155,18 +155,44 @@ else:
     print(clause + "…")'
 }
 
+# _linear_error_text — read a GraphQL response on stdin and print the REASON Linear refused, as
+# "<code> <message>" (either half may be empty). HERD-267: the add path used to discard the response
+# body entirely, so a 400 USAGE_LIMIT_EXCEEDED (the free-tier ISSUE CAP) was indistinguishable from a
+# transient flake — the whole reason six coordinator filings vanished silently over two hours while
+# PR #377 blamed an "API flake". The code comes from errors[].extensions.code (Linear's machine key,
+# e.g. USAGE_LIMIT_EXCEEDED / AUTHENTICATION_ERROR); it is printed FIRST so create_retry_class matches
+# on the unambiguous key before falling back to prose. Empty output when the response carries no
+# errors array (a plain success:false), which classifies as 'unknown' and stays retryable.
+_linear_error_text() {
+    python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+errs = d.get("errors") or []
+if not errs:
+    sys.exit(0)
+e = errs[0] if isinstance(errs[0], dict) else {}
+ext = e.get("extensions") or {}
+code = ext.get("code") or ext.get("type") or ""
+msg = e.get("message") or ""
+print(" ".join(x for x in (str(code), str(msg)) if x).replace("\n", " ").strip())' 2>/dev/null || true
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
     # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
     # essay); description = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue (and surfaces
     # its URL), NOCHANGE if Linear declines or no team is available.
+    # HERD-267: on NOCHANGE it ALSO sets _BACKEND_ERROR to the reason Linear gave, so the caller's
+    # durable retry queue can tell a permanent wall (issue cap, bad key) from a retryable hiccup.
     local text="$2" title team mut vars resp parsed ok ident url
+    _BACKEND_ERROR=""
     _linear_require_key
     title="$(_linear_short_title "$text")"
     team="$(_linear_team_id)"
     if [ -z "$team" ]; then
         echo "linear backend: no team available to create the issue in (set LINEAR_TEAM_ID in .herd/secrets)" >&2
         _BACKEND_RESULT="NOCHANGE"
+        _BACKEND_ERROR="no team available (set LINEAR_TEAM_ID in .herd/secrets)"
         return 0
     fi
     mut='mutation Create($title: String!, $description: String, $teamId: String!) {
@@ -191,6 +217,12 @@ print("%s\t%s\t%s" % ("1" if ic.get("success") else "0", iss.get("identifier", "
         if [ -n "$url" ]; then printf '%s\n' "$url"; elif [ -n "$ident" ]; then printf '%s\n' "$ident"; fi
     else
         _BACKEND_RESULT="NOCHANGE"
+        # Surface WHY (HERD-267). Loud on stderr as well as in _BACKEND_ERROR: the drainer's report
+        # tail is not the only place an operator reads, and a silently-consumed cap is the incident.
+        _BACKEND_ERROR="$(printf '%s' "$resp" | _linear_error_text)"
+        if [ -n "$_BACKEND_ERROR" ]; then
+            echo "linear backend: issueCreate refused — $_BACKEND_ERROR" >&2
+        fi
     fi
 }
 

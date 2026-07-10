@@ -75,6 +75,11 @@ fi
 # shellcheck source=/dev/null
 . "$_SWEEP_HERE/derived-files.sh"
 
+# The durable tracker-create retry queue (HERD-267). Leg 6 narrates its rows and its own findings ride
+# the same queue's enqueue primitive. Pure library; inert while CREATE_SELFHEAL=off.
+# shellcheck source=/dev/null
+. "$_SWEEP_HERE/create-retry.sh"
+
 # ── tunables (deliberate constants, not config keys) ─────────────────────────────────────────────
 # REGENERABLE DIRT: untracked paths a merged worktree may carry without blocking its reap. These are
 # build/test/editor droppings that any checkout regenerates for free — refusing to reap over a stray
@@ -113,13 +118,17 @@ SWEEP_LEG5=0
 # Legs append one PLAN LINE per finding: "<verb>\t<what>\t<detail>". _sweep_emit prints it (the
 # dry-run plan IS the same text the live run narrates) and counts it. Counters drive the summary.
 SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0
+# Leg 6 (HERD-267) counts merged PRs whose tracker item never got created. Deliberately EXCLUDED from
+# the swept total and from sweep_swept_total: a relink is an ADVISORY enqueue, not a reap, and folding
+# it into the total would make the watcher's auto path read "progress" on a tick that deleted nothing.
+SWEEP_N_LINK=0
 
 # _sweep_reset_counters — zero the counters before a run. Load-bearing for the watcher's SWEEP_AUTO=auto
 # path, which calls sweep_run_safe_legs on EVERY cadence tick inside ONE long-lived process: without
 # this the counters accumulate for the life of the watcher and each `sweep_auto` journal line reports a
 # running total instead of what that tick actually swept.
 _sweep_reset_counters() {
-  SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0
+  SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0; SWEEP_N_LINK=0
 }
 
 # _sweep_say <icon> <line> — one narration line, themed when the console palette is loaded.
@@ -760,6 +769,162 @@ sweep_leg_procs() {
   return 0
 }
 
+# ── leg 6: retroactive tracker linkage (HERD-267) ────────────────────────────────────────────────
+# The OTHER half of the create-failure incident. When a coordinator's `scribe add` was eaten by the
+# Linear issue cap, the lane still spawned a builder — and that builder shipped a PR whose `Refs:`
+# line named a SLUG, not a tracker id, because no id was ever minted. The PR merged. The work is in
+# main. Nothing on the tracker records it, and no reaper looks for that shape, so the item is lost
+# forever unless a human happens to remember.
+#
+# This leg looks. For each recently-merged PR it reads the `Refs:` value and asks whether it points at
+# a tracker item that EXISTS. Two outcomes are PROVABLE, and only those are acted on:
+#   • the ref is not a tracker identifier at all (a slug, a branch name) — no lookup needed;
+#   • the ref parses as an identifier but the backend cannot resolve it to an issue.
+# Anything else (a resolvable item, an unreachable API, a backend with no single-item read op) is
+# left alone. Fail-soft to the point of uselessness is the correct failure mode here: a false relink
+# files a duplicate issue, and a control room that cries duplicate is a control room nobody reads.
+#
+# ADVISORY BY CONSTRUCTION. The leg never writes the tracker. It drops a scribe request into the
+# ordinary backlog queue — the same `.req` file `herd scribe` writes — asking the drainer to SEARCH
+# for an existing item first and only then file one, with the PR link attached. A seen-ledger keys
+# the enqueue by PR number so a leg that runs every cadence tick enqueues each PR exactly once.
+SWEEP_RELINK_LIMIT="${HERD_RELINK_LIMIT:-20}"   # merged PRs examined per run (test seam: HERD_RELINK_LIMIT)
+
+# _sweep_relink_pr_rows — one "<number>\t<url>\t<ref>" row per recently-merged PR that carries a
+# `Refs:` line, ref-less PRs omitted. HTML comment blocks are stripped first, exactly as
+# agent-watch.sh's _reconcile_pr_ref does: a classic PULL_REQUEST_TEMPLATE.md carries an EXAMPLE
+# `Refs:` inside a `<!-- … -->`, and reading it as real would have this leg file an issue for every
+# untracked PR in the repo. HERD_RELINK_PR_JSON is the hermetic seam (a file holding the same JSON
+# `gh pr list` returns), so the test never touches the network.
+_sweep_relink_pr_rows() {
+  local raw
+  if [ -n "${HERD_RELINK_PR_JSON-}" ] && [ -f "${HERD_RELINK_PR_JSON-}" ]; then
+    raw="$(cat "$HERD_RELINK_PR_JSON" 2>/dev/null || true)"
+  else
+    command -v gh >/dev/null 2>&1 || return 0
+    raw="$(gh pr list --state merged --limit "$SWEEP_RELINK_LIMIT" --json number,url,body 2>/dev/null || true)"
+  fi
+  [ -n "$raw" ] || return 0
+  printf '%s' "$raw" | python3 -c '
+import sys, json, re
+try: prs = json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(prs, list): sys.exit(0)
+PLACEHOLDER = {"", "none", "n/a", "na"}
+for p in prs:
+    body = re.sub(r"<!--.*?-->", "", p.get("body") or "", flags=re.DOTALL)
+    ref = ""
+    for line in body.splitlines():
+        m = re.match(r"^\s*refs:\s*(\S+)", line, re.IGNORECASE)
+        if m:
+            ref = m.group(1); break
+    if not ref or ref.startswith("<") or ref.lower() in PLACEHOLDER:
+        continue
+    print("%s\t%s\t%s" % (p.get("number", ""), p.get("url", ""), ref))
+' 2>/dev/null || true
+}
+
+# _sweep_relink_is_identifier <ref> — does the ref have the SHAPE of a tracker id (TEAMKEY-42, #42)?
+# A ref that fails this is proof-positive that no item was ever minted: the lanes only ever write a
+# bare slug into `Refs:` when the create they asked for came back empty.
+_sweep_relink_is_identifier() {
+  case "${1#\#}" in
+    [0-9]*)  case "${1#\#}" in *[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    *-*)     printf '%s' "${1##*-}" | grep -qE '^[0-9]+$' ;;
+    *)       return 1 ;;
+  esac
+}
+
+# _sweep_relink_missing <ref> — 0 when the tracker PROVABLY holds no item for this ref.
+# Non-identifier refs are missing by definition. An identifier is resolved through the ACTIVE backend's
+# OPTIONAL single-item read, sourced in a SUBSHELL so no _backend_* function leaks into the sweep's
+# namespace (the same isolation _reconcile_via_ref uses). A backend without that op, an unreadable
+# backend file, or any transport failure returns 1 — UNPROVEN, so the leg says nothing.
+_sweep_relink_missing() {
+  local ref="$1" bfile
+  _sweep_relink_is_identifier "$ref" || return 0
+  bfile="${SCRIBE_BACKEND_DIR:-$_SWEEP_HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$bfile" ] || return 1
+  (
+    # shellcheck source=/dev/null
+    [ -f "$MAIN/.herd/secrets" ] && . "$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    . "$bfile" 2>/dev/null || exit 1
+    command -v _backend_show_item >/dev/null 2>&1 || exit 1
+    _backend_show_item "$ref" >/dev/null 2>&1 && exit 1   # resolved → the item exists
+    exit 0
+  )
+}
+
+# _sweep_relink_request <pr> <url> <ref> — the scribe request text. First line is a SHORT title (the
+# Linear backend derives an issue title from it, and an essay-length first line becomes an essay-length
+# title); the body carries the SEARCH-FIRST instruction so a relink can never blindly duplicate an
+# item that was filed by hand in the meantime.
+_sweep_relink_request() {
+  local pr="$1" url="$2" ref="$3"
+  printf 'Relink merged PR #%s — its tracker item is missing\n\n' "$pr"
+  printf 'PR #%s (%s) merged with "Refs: %s", but no tracker item exists for that ref — the original create failed (see HERD-267: the tracker refused it, e.g. an issue cap, and the lane shipped a slug-only ref).\n\n' "$pr" "$url" "$ref"
+  printf 'SEARCH FIRST: look for an existing open or completed item covering this PR. If one exists, amend it with the PR link instead of filing a duplicate. Only if none exists, file a new item describing the merged work and link %s.\n' "$url"
+}
+
+# sweep_leg_links <dry> — narrate every merged PR with a missing tracker item, enqueue its retroactive
+# linkage request (once per PR), and surface the durable create-retry queue's coalesced rows. Emits
+# NOTHING and touches nothing when the queue is empty and every merged PR resolves, so a healthy
+# control room's sweep output is byte-identical to before HERD-267.
+# _sweep_relink_scan_due <throttle> — may we spend a `gh pr list` round-trip now? The CLI (throttle
+# empty) always may. The watcher's SWEEP_AUTO=auto path passes throttle=1 and gets at most one scan
+# per hour: a merged PR's missing tracker item is hours-old debris, not a per-tick emergency, and the
+# rest of the trigger pass is deliberately network-free.
+_sweep_relink_scan_due() {
+  [ -n "${1:-}" ] || return 0
+  local stamp="$TREES/.create-relink-stamp" prev now
+  now="$(_now_epoch 2>/dev/null || date +%s)"
+  prev="$(cat "$stamp" 2>/dev/null || echo 0)"
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  [ $(( now - prev )) -ge 3600 ] || return 1
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  return 0
+}
+
+sweep_leg_links() {
+  local dry="$1" throttle="${2:-}" seen="$TREES/.create-relink-seen" pr url ref q
+  create_retry_enabled || return 0
+
+  # The durable retry queue's own rows first: ONE line per distinct request, carrying its attempt
+  # count. A cap-killed filing that has failed nine times renders once here reading attempts=9 —
+  # coalesced, not stacked, so the console stays readable while the failure is impossible to miss.
+  while IFS=$'\t' read -r state class attempts title; do
+    [ -n "${state:-}" ] || continue
+    if [ "$state" = permanent ]; then
+      _sweep_say "🚫" "tracker create BLOCKED (${class}) after ${attempts} attempt(s) — request saved, NOT retrying: ${title}"
+    else
+      _sweep_say "⏳" "tracker create queued for retry (${class}, ${attempts} attempt(s)): ${title}"
+    fi
+  done <<< "$(create_retry_rows 2>/dev/null || true)"
+
+  _sweep_relink_scan_due "$throttle" || return 0
+
+  q="$TREES/backlog-queue"
+  while IFS=$'\t' read -r pr url ref; do
+    [ -n "${pr:-}" ] && [ -n "${ref:-}" ] || continue
+    grep -qxF "$pr" "$seen" 2>/dev/null && continue
+    _sweep_relink_missing "$ref" || continue
+    SWEEP_N_LINK=$(( SWEEP_N_LINK + 1 ))
+    _sweep_say "🔗" "relink PR #${pr} — 'Refs: ${ref}' names no tracker item (the create failed)"
+    [ -n "$dry" ] && continue
+    # Enqueue through the ordinary backlog-queue primitive (temp then atomic mv), never by touching
+    # the tracker directly. Record the PR in the seen-ledger only after the request is really queued,
+    # so a write that fails is retried on the next sweep rather than silently forgotten.
+    mkdir -p "$q" 2>/dev/null || continue
+    local tmp; tmp="$(mktemp "$q/.tmp.relink.XXXXXX" 2>/dev/null)" || continue
+    _sweep_relink_request "$pr" "$url" "$ref" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+    mv "$tmp" "$q/$(_now_epoch 2>/dev/null || date +%s)-relink-${pr}.req" 2>/dev/null || { rm -f "$tmp"; continue; }
+    printf '%s\n' "$pr" >> "$seen" 2>/dev/null || true
+    journal_append link_heal pr "$pr" ref "$ref" result enqueued
+  done <<< "$(_sweep_relink_pr_rows)"
+  return 0
+}
+
 # ── the trigger pass (SWEEP_AUTO) ────────────────────────────────────────────────────────────────
 # sweep_auto_mode — the normalized lever: off | advise | auto. Anything unrecognized reads as advise
 # (the ship default), so a typo degrades to "tell me", never to "act on my control room".
@@ -861,6 +1026,11 @@ sweep_run_safe_legs() {
   sweep_leg_procs ""
   sweep_leg_worktrees ""
   sweep_leg_tabs ""
+  # Leg 6 is SAFE by the same definition as the rest of this set: it deletes nothing and writes no
+  # tracker state — it only enqueues an advisory scribe request, once per PR (seen-ledger). Throttled
+  # here (and only here): the watcher runs this every cadence tick, and the rest of its trigger pass
+  # is network-free by design.
+  sweep_leg_links "" 1
   journal_append sweep_auto reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" \
     tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
   # Tell a live watcher the tally is stale so it recomputes now (HERD-215). Harmless in the auto path,
@@ -898,11 +1068,18 @@ sweep_main() {
   sweep_leg_procs     "$dry"
   sweep_leg_worktrees "$dry"
   sweep_leg_tabs      "$dry"
+  sweep_leg_links     "$dry"
 
   local total=$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC ))
   printf '\n'
+  if [ "$SWEEP_N_LINK" -gt 0 ]; then
+    printf '  🔗 %d merged PR(s) with a missing tracker item — retroactive linkage %s\n' \
+      "$SWEEP_N_LINK" "$([ -n "$dry" ] && printf 'would be enqueued' || printf 'enqueued for the scribe')"
+  fi
   if [ "$total" -eq 0 ] && [ "$SWEEP_N_FLAG" -eq 0 ]; then
-    printf '  ✅ control room clean — nothing to sweep\n'
+    # A leg-6 finding is not a "sweep", but it is not clean either — the 🔗 line above already said
+    # what happened, so stay silent rather than claiming a clean room over the top of it.
+    [ "$SWEEP_N_LINK" -eq 0 ] && printf '  ✅ control room clean — nothing to sweep\n'
   else
     printf '  %s %d worktree(s) · %d tab(s) · %d marker(s) · %d process(es)%s\n' \
       "$([ -n "$dry" ] && printf 'would sweep:' || printf 'swept:')" \
