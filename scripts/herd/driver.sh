@@ -185,6 +185,43 @@ herd_model_driver_for() {
   printf '%s' "${out%%$'\t'*}"
 }
 
+# ── Model accessibility preflight (HERD-282) ──────────────────────────────────────────────────────
+# herd_model_preflight_accessible <ref> <driver> <model> — fast, fail-soft pre-spawn check: is the
+# resolved runtime binary accessible on this machine? Call BEFORE worktree creation so a bad model
+# ref fails LOUD and EARLY instead of launching a doomed builder that wedges silently.
+#
+# CONTRACT:
+#   • Returns 0 when the model appears accessible (or when the check cannot determine inaccessibility).
+#   • Returns 1 (loud ❌ to stderr, naming the bad ref and missing binary) ONLY on DEFINITIVE 'no
+#     access': the runtime binary the resolved <driver> maps to is not on PATH. Any other failure
+#     condition (unreadable .driver file, empty binary name, API-level unavailability we cannot probe
+#     without a network round-trip) degrades to 0 — ONLY a definitive absence refuses.
+#   • Bypass: HERD_SKIP_MODEL_PREFLIGHT=1 (tests / CI that stub the binary; mirrors HERD_SKIP_PREFLIGHT).
+#   • Byte-identical when the model is fine: no output, no side effects, returns 0.
+herd_model_preflight_accessible() {
+  local ref="${1:-}" drv="${2:-}" model="${3:-}"
+  # Bypass for tests / CI — same knob pattern as HERD_SKIP_PREFLIGHT for herd_preflight.
+  [ "${HERD_SKIP_MODEL_PREFLIGHT:-}" = "1" ] && return 0
+  # Need a resolved driver name to look up the binary; fail-soft on empty.
+  [ -n "$drv" ] || return 0
+  # Resolve the runtime binary from the driver's exec binding (herd_driver_agent_runtime reads
+  # DRIVER_AGENT_ONESHOT_EXEC / INTERACTIVE_SPAWN from the .driver file; fail-soft: returns empty
+  # when the file is absent or carries no exec binding → we allow the spawn rather than false-refusing).
+  local binary; binary="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
+  [ -n "$binary" ] || return 0   # no binary resolved → can't check → fail-soft, allow spawn
+  # Definitive 'no access': the runtime binary is not on PATH — this spawn cannot possibly succeed
+  # regardless of the model id or API state.
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    local _display="${ref:-${drv}:${model}}"
+    printf '❌ herd: model %s cannot spawn — runtime binary %s (driver %s) is not on PATH.\n' \
+      "'$_display'" "'$binary'" "'$drv'" >&2
+    printf '   Fix: install %s, or use a bare claude model ref (e.g. MODEL_FEATURE=claude-sonnet-4-6).\n' \
+      "$binary" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ── Agent-runtime EXEC composition (HERD-150 P2 — route the lanes through the P1 bindings) ─────────
 # P1 (PR #264) CATALOGUED every claude-specific incantation into DRIVER_AGENT_* bindings carried as
 # DATA in templates/drivers/<name>.driver; nothing consumed them, so the tree stayed byte-identical.
