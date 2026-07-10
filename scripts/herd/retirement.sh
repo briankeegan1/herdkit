@@ -469,8 +469,14 @@ EOF
     else
       ahead="$(git -C "$MAIN" rev-list --count "${oid:-HEAD}..refs/heads/$br" 2>/dev/null || true)"
       case "$ahead" in ''|*[!0-9]*) ahead="?" ;; esac
-      printf 'held\x1f\x1f\x1fbranch %s has moved past the merged head of PR #%s (%s commit(s) exist only here) · commit or discard\x1f%s' \
-        "$br" "${num:-}" "$ahead" "$br"
+      if [ "$ahead" = "0" ]; then
+        # 0 unique commits vs the merged head: every bit of work is already in the PR. Auto-clear.
+        printf 'retiring\x1f%s\x1f\x1fPR #%s merged · worktree gone · branch tip is ancestor of merged head\x1f%s' \
+          "${num:-}" "${num:-}" "$br"
+      else
+        printf 'held\x1f\x1f\x1fbranch %s has moved past the merged head of PR #%s (%s commit(s) exist only here) · commit or discard\x1f%s' \
+          "$br" "${num:-}" "$ahead" "$br"
+      fi
     fi
     return 0
   fi
