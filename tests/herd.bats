@@ -241,7 +241,7 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
-@test "hermetic journal self-audit gap-finder (HERD-238) test passes" {
+@test "hermetic journal self-audit gap-finder (HERD-238 + HERD-272 human-verify rule) test passes" {
   run bash "$REPO/tests/test-journal-audit.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
