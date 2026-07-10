@@ -350,6 +350,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic resolver-pane lever (HERD-286) test passes" {
+  run bash "$REPO/tests/test-resolver-pane-lever.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic restart-safe gate dispatch (HERD-185) test passes" {
   run bash "$REPO/tests/test-restart-safe-dispatch.sh"
   [ "$status" -eq 0 ]
