@@ -618,6 +618,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic fleet digest test passes including merged_external leg (HERD-291)" {
+  run bash "$REPO/tests/test-fleet-digest.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic gate-coverage drift guard (HERD-292) test passes" {
   run bash "$REPO/tests/test-gate-coverage.sh"
   [ "$status" -eq 0 ]
