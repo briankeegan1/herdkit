@@ -38,6 +38,7 @@ Role summarized from each file's top-of-file comment.
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
+- `gate-coverage-lint.sh` — THE shared gate-coverage drift guard (HERD-292): every tests/test-*.sh
 - `governance-drift-sweep.sh` — periodic, ADVISORY governance-DRIFT sweep (HERD-125).
 - `governance-hook.sh` — governance-hook.sh <target> — the SESSION-TIME governance enforcer rendered into a project's
 - `governance.sh` — the SHARED, read-only governance EXTRACTION + MAPPING helpers (HERD-119 / HERD-125).
@@ -128,7 +129,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `engine-version.sh` → `journal.sh`
 - `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
-- `healthcheck.sh` → `caps-sync-lint.sh`, `commit-lint.sh`, `doc-drift-lint.sh`, `herd-config.sh`
+- `healthcheck.sh` → `caps-sync-lint.sh`, `commit-lint.sh`, `doc-drift-lint.sh`, `gate-coverage-lint.sh`, `herd-config.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
