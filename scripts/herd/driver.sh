@@ -117,17 +117,20 @@ herd_driver_agent_value() {
   [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$dflt"
 }
 
-# herd_driver_agent_runtime — the RUNTIME EXECUTABLE the active driver spawns: the first whitespace
+# herd_driver_agent_runtime [driver] — the RUNTIME EXECUTABLE a driver spawns: the first whitespace
 # token of its DRIVER_AGENT_ONESHOT_EXEC binding (the capability the one-shot seam implements), falling
 # back to DRIVER_AGENT_INTERACTIVE_SPAWN. Empty when neither is bound (a driver with no agent-exec
 # surface) — the caller then defaults to `claude`, so an absent binding degrades to today's behavior.
 # Built ON herd_driver_agent_value (PURE, no sourcing — HERD-149): for herdr-claude/headless/codex/grok
 # it is that driver's runtime binary; for the stub proof driver it is the stub runtime, proving the
 # one-shot seam is not hard-wired to `claude` by construction (HERD-177 P6).
+# [driver] defaults to the ACTIVE driver (herd_driver_agent_value's own default), so every pre-HERD-276
+# call site is unchanged; the mixed-vendor review panel passes the RESOLVED driver of a per-panelist
+# runtime-qualified MODEL ref so it can (a) pick that vendor's binary and (b) probe it before dispatch.
 herd_driver_agent_runtime() {
-  local b
-  b="$(herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC)"
-  [ -n "$b" ] || b="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN)"
+  local drv="${1:-}" b
+  b="$(herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC "" "$drv")"
+  [ -n "$b" ] || b="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN "" "$drv")"
   [ -n "$b" ] || return 0
   printf '%s' "${b%%[[:space:]]*}"
 }
@@ -1003,13 +1006,35 @@ herd_driver_launch_agent() {
 herd_driver_oneshot_exec() {
   local prompt="${1:-}" model="${2:-}"
   shift 2 2>/dev/null || set --
-  # HERD-177 P6: run the ACTIVE driver's runtime, not a hardwired `claude`. herd_driver_agent_runtime
+  herd_driver_oneshot_exec_as "" "$prompt" "$model" "$@"
+}
+
+# herd_driver_oneshot_exec_as <driver> <prompt> <model> [runtime-arg …] — the SAME one-shot capability,
+# aimed at an EXPLICIT driver instead of the active one. Empty <driver> ⇒ the active driver, so
+# herd_driver_oneshot_exec above delegates here and every pre-HERD-276 call site composes a
+# BYTE-IDENTICAL argv (the compose proof in tests/test-oneshot-exec-seam.sh is the rail).
+#
+# WHY (HERD-276): the mixed-vendor review panel dispatches each panelist through its OWN
+# runtime-qualified MODEL ref, so two panelists in the same fan-out run different vendors' binaries in
+# the same process tree. The active-driver lookup inside the old body made that unrepresentable — the
+# driver half of a resolved ref was discarded. Threading <driver> through keeps ONE composition site
+# (the DRIVER_AGENT_ONESHOT_EXEC binding remains the only place the incantation lives) while letting
+# a caller name the vendor. Callers pass the driver resolved by herd_model_driver_for.
+#
+# Same NOT-fail-soft contract as its delegate: the runtime's exit status is returned UNCHANGED so each
+# caller keeps its own degrade path. A runtime binary that does not EXIST is the caller's problem to
+# probe (herd_driver_agent_runtime + `command -v`) — the review panel does exactly that, so a missing
+# vendor binary reports INFRA rather than a shell "command not found" masquerading as a failed review.
+herd_driver_oneshot_exec_as() {
+  local drv="${1:-}" prompt="${2:-}" model="${3:-}"
+  shift 3 2>/dev/null || set --
+  # HERD-177 P6: run the RESOLVED driver's runtime, not a hardwired `claude`. herd_driver_agent_runtime
   # resolves the runtime executable from the driver's DRIVER_AGENT_ONESHOT_EXEC binding; a non-Claude
   # driver (stub/codex/grok) runs its own binary through the SAME arg composition. The default path is
   # the drift-guarded, BYTE-IDENTICAL `claude -p …` literal — taken whenever the runtime is claude OR
   # unresolvable (an absent binding degrades to today's behavior, never a crash). The compose proof +
   # the audit drift guard (tests/test-oneshot-exec-seam.sh, tests/test-driver-agent-exec.sh) are the rail.
-  local _rt; _rt="$(herd_driver_agent_runtime 2>/dev/null || true)"
+  local _rt; _rt="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
   if [ -n "$_rt" ] && [ "$_rt" != "claude" ]; then
     "$_rt" -p "$prompt" --model "$model" "$@"
   else
