@@ -11,9 +11,15 @@
 #   The Python shadow engine journals to  .herd/journal-shadow.jsonl  in the SAME event shapes as
 #   journal.sh. This harness compares the REAL sim journal (what the bash engine wrote) against that
 #   shadow journal, per scenario. Shadow-journal resolution order:
-#     1. --shadow FILE                                  (explicit; e.g. a captured P3c run)
-#     2. $ART/.herd/journal-shadow.jsonl                (the P3c shadow engine, once it exists)
-#     3. SELF-DIFF (default today): a --perturb copy of the real journal — volatile fields
+#     1. --shadow auto                                  (P3e HERD-319 — the scenario→fixture BRIDGE:
+#        EXTRACT a shadow-runtime fixture from the real journal via `python3 -m herd.fixture_extract`,
+#        then RUN `python3 -m herd.shadow_runtime` on it and diff the two streams. This is the genuine
+#        head-to-head — the Python engine processes the SAME subjects the bash engine just did. The
+#        two engines emit different event vocabularies, so `auto` is EXPECTED to report a real
+#        DIVERGENCE; that honest report is the P3e deliverable, NOT a green to be forced.)
+#     2. --shadow FILE                                  (explicit; e.g. a captured P3c run)
+#     3. $ART/.herd/journal-shadow.jsonl                (the P3c shadow engine, once it exists)
+#     4. SELF-DIFF (default today): a --perturb copy of the real journal — volatile fields
 #        (ts/pid/paths) rewritten, everything else identical. Canonicalization must fold the
 #        perturbation back to identity, so a green self-diff is a live proof of the canonicalizer
 #        on real journal data (item: "works TODAY with only the bash engine … proves canonicalization").
@@ -28,6 +34,8 @@
 #                       a bare name or a *.sh name both resolve).
 #     --artifacts DIR   run the scenario here and keep artifacts (default: fresh mktemp, kept).
 #     --shadow FILE     use FILE as the shadow journal instead of the self-diff default.
+#     --shadow auto     BRIDGE MODE (P3e): extract a fixture from the real journal and run the Python
+#                       shadow engine on it, then diff — a real head-to-head (expected: honest divergence).
 #     --max N           cap the number of divergence records printed (passed to parity.py).
 #     --keep            keep the artifacts dir (implied; the scenario needs --keep to leave journals).
 #
@@ -114,7 +122,28 @@ good "collected real journal: $real_lines events → $REAL"
 # ── resolve the SHADOW journal (see the interface-contract block above) ───────────────────────────
 SHADOW_JOURNAL="$ART/journal-shadow.jsonl"
 mode=""
-if [ -n "$SHADOW" ]; then
+if [ "$SHADOW" = "auto" ]; then
+  # ── P3e BRIDGE MODE (HERD-319): real head-to-head via the scenario→fixture bridge. ──────────────
+  # 1. EXTRACT a shadow-runtime fixture from the REAL journal (fixture_extract folds each PR's
+  #    candidate-pass events into a {config, candidates} subject list — every rule cites a contract §).
+  # 2. RUN the Python shadow engine on that fixture; its ShadowJournal writes SHADOW_JOURNAL_FILE.
+  # Both steps are pure/hermetic (no gh, no merge, no pane ops) — the shadow runtime is dry-run by
+  # construction. A non-zero from either is INFRA (exit 2), never a silent green.
+  FIXTURE="$ART/fixture.json"
+  if ! PYTHONPATH="$PYSRC" python3 -m herd.fixture_extract "$REAL" --out "$FIXTURE" 2>"$ART/extract.err"; then
+    bad "fixture extraction failed: $(cat "$ART/extract.err" 2>/dev/null)"; exit 2
+  fi
+  : > "$SHADOW_JOURNAL"
+  if ! SHADOW_JOURNAL_FILE="$SHADOW_JOURNAL" PYTHONPATH="$PYSRC" \
+       python3 -m herd.shadow_runtime --fixture "$FIXTURE" >"$ART/shadow-result.json" 2>"$ART/shadow.err"; then
+    bad "python shadow engine failed: $(cat "$ART/shadow.err" 2>/dev/null)"; exit 2
+  fi
+  if [ ! -s "$SHADOW_JOURNAL" ]; then
+    bad "python shadow engine produced no journal (loud: not a silent green)"; exit 2
+  fi
+  info "extracted fixture: $FIXTURE ($(PYTHONPATH="$PYSRC" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("%d candidates" % len(d.get("candidates",[])))' "$FIXTURE" 2>/dev/null || echo '?'))"
+  mode="auto (python shadow engine via extracted fixture)"
+elif [ -n "$SHADOW" ]; then
   [ -f "$SHADOW" ] || { bad "--shadow file not found: $SHADOW"; exit 2; }
   cp "$SHADOW" "$SHADOW_JOURNAL"; mode="explicit (--shadow)"
 elif [ -f "$ART/.herd/journal-shadow.jsonl" ]; then

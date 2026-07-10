@@ -320,6 +320,20 @@ esac
 # under `set -u`.
 : "${ENGINE_AUTOUPDATE:="off"}"
 
+# ENGINE_SEAT_RECONCILE — CROSS-SEAT DUAL-ENGINE SAFETY (HERD-308, engine-port P3.5): off (default) |
+# on. The complement to the ENGINE_MIN handshake — a POOL-LEVEL invariant that needs no committed
+# floor. With it on, the watcher STAMPS the engine level it writes at into a shared pool registry
+# ($WORKTREES_DIR/.herd/engine-seats.tsv) and RECONCILES it every tick: two DISTINCT engine levels
+# writing the same pool (the dual-engine window between the bash and Python engines, or two operators
+# on different checkouts) is never allowed to coexist silently — the STALE seat (the lower level) HALTS
+# loudly (a red console row, a journaled engine_seat_mismatch) and its merge/blessing writes are HELD,
+# so there are ZERO cross-mismatch writes; the leading seat proceeds but says so. off is a HARD no-op:
+# nothing is stamped, no registry is written, and the console/merge path is byte-identical to before.
+# Single-seat is always coherent, so even ON it is inert for a solo operator. The mechanism lives in
+# scripts/herd/engine-seat.sh (which also carries the P4 migration-quiesce gate). Defaulted here so the
+# watcher sees it under `set -u`.
+: "${ENGINE_SEAT_RECONCILE:="off"}"
+
 # ENGINE_IMPL — which ENGINE-CORE IMPLEMENTATION the watcher runs (HERD-316, EPIC HERD-300, the
 # Python port): bash (default) | shadow. bash is today's byte-identical behavior — the shell watcher
 # is authoritative and nothing else runs. shadow ADDITIONALLY runs the Python watcher
