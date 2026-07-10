@@ -155,18 +155,44 @@ else:
     print(clause + "…")'
 }
 
+# _linear_error_text — read a GraphQL response on stdin and print the REASON Linear refused, as
+# "<code> <message>" (either half may be empty). HERD-267: the add path used to discard the response
+# body entirely, so a 400 USAGE_LIMIT_EXCEEDED (the free-tier ISSUE CAP) was indistinguishable from a
+# transient flake — the whole reason six coordinator filings vanished silently over two hours while
+# PR #377 blamed an "API flake". The code comes from errors[].extensions.code (Linear's machine key,
+# e.g. USAGE_LIMIT_EXCEEDED / AUTHENTICATION_ERROR); it is printed FIRST so create_retry_class matches
+# on the unambiguous key before falling back to prose. Empty output when the response carries no
+# errors array (a plain success:false), which classifies as 'unknown' and stays retryable.
+_linear_error_text() {
+    python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+errs = d.get("errors") or []
+if not errs:
+    sys.exit(0)
+e = errs[0] if isinstance(errs[0], dict) else {}
+ext = e.get("extensions") or {}
+code = ext.get("code") or ext.get("type") or ""
+msg = e.get("message") or ""
+print(" ".join(x for x in (str(code), str(msg)) if x).replace("\n", " ").strip())' 2>/dev/null || true
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
     # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
     # essay); description = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue (and surfaces
     # its URL), NOCHANGE if Linear declines or no team is available.
+    # HERD-267: on NOCHANGE it ALSO sets _BACKEND_ERROR to the reason Linear gave, so the caller's
+    # durable retry queue can tell a permanent wall (issue cap, bad key) from a retryable hiccup.
     local text="$2" title team mut vars resp parsed ok ident url
+    _BACKEND_ERROR=""
     _linear_require_key
     title="$(_linear_short_title "$text")"
     team="$(_linear_team_id)"
     if [ -z "$team" ]; then
         echo "linear backend: no team available to create the issue in (set LINEAR_TEAM_ID in .herd/secrets)" >&2
         _BACKEND_RESULT="NOCHANGE"
+        _BACKEND_ERROR="no team available (set LINEAR_TEAM_ID in .herd/secrets)"
         return 0
     fi
     mut='mutation Create($title: String!, $description: String, $teamId: String!) {
@@ -191,6 +217,12 @@ print("%s\t%s\t%s" % ("1" if ic.get("success") else "0", iss.get("identifier", "
         if [ -n "$url" ]; then printf '%s\n' "$url"; elif [ -n "$ident" ]; then printf '%s\n' "$ident"; fi
     else
         _BACKEND_RESULT="NOCHANGE"
+        # Surface WHY (HERD-267). Loud on stderr as well as in _BACKEND_ERROR: the drainer's report
+        # tail is not the only place an operator reads, and a silently-consumed cap is the incident.
+        _BACKEND_ERROR="$(printf '%s' "$resp" | _linear_error_text)"
+        if [ -n "$_BACKEND_ERROR" ]; then
+            echo "linear backend: issueCreate refused — $_BACKEND_ERROR" >&2
+        fi
     fi
 }
 
@@ -578,6 +610,70 @@ if meta:
         echo "linear backend: no unique issue matching '$ref'" >&2
         return 1
     }
+}
+
+# _backend_ref_is_identifier <ref> — OPTIONAL. Does <ref> have the shape of an identifier THIS tracker
+# mints? Linear issues are TEAMKEY-NUMBER (HERD-267; a leading '#' is tolerated). Exit 0 = yes, 1 = no.
+#
+# This op exists so the SHAPE of a tracker's ids lives with the tracker, never in generic engine code.
+# The sweep's retroactive-linkage leg needs to know that `Refs: some-branch-slug` on a Linear project
+# is proof no id was ever minted — but that inference is FALSE for the default `file` backend, whose
+# item ref IS a title slug, and meaningless for `changelog`, which has no ids at all. A backend that
+# does not define this op tells the leg "I cannot judge a ref by its shape", and the leg stands down.
+_backend_ref_is_identifier() {
+    local slug="${1#\#}" num key
+    case "$slug" in *-*) ;; *) return 1 ;; esac
+    num="${slug##*-}"
+    key="${slug%-*}"
+    [ -n "$key" ] || return 1
+    case "$num" in ''|*[!0-9]*) return 1 ;; esac
+    return 0
+}
+
+# _backend_item_missing <ref> — OPTIONAL, TRI-STATE existence probe. The ONLY safe basis for an
+# automated "this tracker item was never created" verdict (HERD-267).
+#
+#   exit 0  PROVABLY MISSING — the API answered, cleanly, with zero matching issues.
+#   exit 1  EXISTS          — the API answered and resolved the ref.
+#   exit 2  UNPROVEN        — no key, no curl, an unparseable ref, a transport failure, an HTTP/GraphQL
+#                             error body (auth, rate limit, 5xx), or anything else that means WE DO NOT
+#                             KNOW. The caller must treat this exactly like EXISTS: say nothing, do nothing.
+#
+# Why this exists rather than reusing _backend_show_item: that op collapses not-found, transport
+# failure, auth error, rate limit and every GraphQL error body into ONE non-zero return. A caller that
+# reads non-zero as "missing" cannot tell a tracker that never minted the item from a tracker that is
+# DOWN or REFUSING — so a Linear outage (or an expired key) would read as "every merged PR's item is
+# missing" and drive a burst of duplicate filings. Worse, an expired key produces that misreading at
+# exactly the moment create_retry_class is correctly marking creates auth/permanent. The distinction
+# between "no answer" and "answered: nothing there" is the whole safety property, so it gets its own op.
+#
+# `errors` is checked before `data`: Linear returns HTTP 200 with a populated `errors` array (and a
+# null/empty `data`) for auth and rate-limit refusals, which the nodes parser alone would read as zero
+# matches. curl's exit status is checked too — an unreachable host yields an empty body, not an error body.
+_backend_item_missing() {
+    local ref="$1" resp
+    [ -n "${LINEAR_API_KEY:-}" ] || return 2
+    command -v curl >/dev/null 2>&1 || return 2
+    _linear_issue_query "$ref" 'identifier' || return 2   # not a TEAMKEY-NUMBER identifier → we cannot ask
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS" 2>/dev/null)" || return 2
+    [ -n "$resp" ] || return 2
+    printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)                       # unparseable body — the API did not answer us
+if not isinstance(d, dict) or d.get("errors"):
+    sys.exit(2)                       # auth / rate limit / 5xx / any GraphQL error → UNPROVEN
+data = d.get("data")
+if not isinstance(data, dict) or "issues" not in data:
+    sys.exit(2)                       # no data envelope at all → UNPROVEN
+nodes = ((data.get("issues") or {}).get("nodes"))
+if nodes is None:
+    sys.exit(2)
+sys.exit(0 if len(nodes) == 0 else 1)  # a clean answer: 0 matches = provably missing
+' 2>/dev/null
+    return $?
 }
 
 _backend_item_state() {

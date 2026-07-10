@@ -4178,36 +4178,79 @@ record_reconcile() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RECONCILE_STATE"
 }
 
+# HERD_PR_REF_PY — THE ONE implementation of "given a PR body, print its explicit `Refs:` value".
+# Every surface that reads a PR's tracker ref reuses this snippet rather than re-deriving the rules,
+# per the invariance-first doctrine (docs/multi-seat-doctrine.md): merge-time reconcile
+# (_reconcile_pr_ref, below) and the sweep's retroactive-linkage leg (sweep.sh) both parse the same
+# bytes, and a faithful copy in the second place is a copy that drifts. Same shape as
+# backends/linear.sh's _LINEAR_PICK_STATE_PY: a python function definition, prepended to whichever
+# driver the caller needs (one body on stdin, or a whole `gh pr list` array).
+#
+# The rules, in one place:
+#   • STRIP HTML COMMENT BLOCKS FIRST. `gh pr view --json body` returns raw markdown with `<!-- … -->`
+#     intact — GitHub does not strip them from a classic PULL_REQUEST_TEMPLATE.md. An example `Refs:`
+#     buried in the template's own comment would otherwise poison every untracked PR.
+#   • The FIRST `Refs:` line, case-insensitive, anchored at line start; first whitespace-delimited
+#     token after the colon.
+#   • STRIP TRAILING PUNCTUATION. `Refs: HERD-267,` and `Refs: HERD-267.` are the same ref as
+#     `Refs: HERD-267`. Without this the sweep's shape test reads `267,` as "not an identifier" and
+#     declares — with no lookup at all — that the item was never minted.
+#   • A template PLACEHOLDER (`<…>`, none, n/a, na) is NOT a ref.
+HERD_PR_REF_PY='
+import re
+_PR_REF_PLACEHOLDER = {"", "none", "n/a", "na"}
+def pr_ref_from_body(body):
+    body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
+    for line in body.splitlines():
+        m = re.match(r"^\s*refs:\s*(\S+)", line, re.IGNORECASE)
+        if not m:
+            continue
+        ref = m.group(1).rstrip(".,;:!)]}")
+        if ref.startswith("<") or ref.lower() in _PR_REF_PLACEHOLDER:
+            return ""
+        return ref
+    return ""
+'
+
+# herd_pr_ref_from_body — read a PR body on stdin, print its `Refs:` value (empty when there is none).
+# The shell-side entry point to HERD_PR_REF_PY.
+#
+# NO-PYTHON3 FALLBACK. python3 is a hard engine dep, but this function sits on the merge tail, and the
+# pre-HERD-267 code degraded to a grep/sed pass rather than silently dropping every explicit ref onto
+# the fuzzy path. That degradation is preserved: the comment strip is what needs python (a multi-line
+# regex), so without it we grep the RAW body — the line-start anchor and the placeholder guard are
+# still a partial defense, exactly as before.
+herd_pr_ref_from_body() {
+  local body ref
+  body="$(cat)"
+  if command -v python3 >/dev/null 2>&1; then
+    ref="$(printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
+import sys
+sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf '%s' "$ref"; return 0; }
+  fi
+  # Degraded path: same rules, minus the HTML-comment strip.
+  ref="$(printf '%s\n' "$body" \
+    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
+    | head -n1 \
+    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"
+  case "$ref" in
+    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
+  esac
+  printf '%s' "$ref"
+}
+
 # _reconcile_pr_ref <pr#> — deterministic tracker linkage (HERD-39): read the merged PR body and
 # print the explicit 'Refs: <ID>' tracker reference the builder carried (lanes REQUIRE it when the
 # coordinator spawned with HERD_ITEM_REF). Empty when the PR carries no ref, the body is unreadable,
 # or the value is still the template placeholder ('<...>' / none / n/a). Best-effort + fail-soft: a
 # missing 'gh', an offline run, or a body-less PR all yield an empty ref, so the caller cleanly falls
 # back to the fuzzy path — never a hard error on the merge tail.
-#
-# CRITICAL: `gh pr view --json body` returns the raw markdown WITH HTML comments intact — GitHub does
-# not strip `<!-- … -->` from a classic PR template. So we FIRST strip every HTML comment block (the
-# PULL_REQUEST_TEMPLATE.md carries example/instruction text inside a comment) before grepping; without
-# this an example 'Refs:' line buried in the template's own comment would poison the extractor and
-# silently mark an unrelated tracker item shipped on every merge of an untracked PR.
 _reconcile_pr_ref() {
   local body ref
   body="$(_gh_timeout reconcile_pr_ref pr view "$1" --json body -q .body 2>/dev/null || true)"
   [ -n "$body" ] || return 0
-  # Strip HTML comment blocks (possibly multi-line) so template instructions/examples can't be read as
-  # a real ref. python3 is already a hard dependency here; if it is somehow unavailable, fall back to
-  # the raw body (the line-start anchor + placeholder guard below are still a partial defense).
-  body="$(printf '%s' "$body" | python3 -c 'import sys,re
-sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 2>/dev/null || printf '%s' "$body")"
-  # First real 'Refs:' line, case-insensitive, anchored at line start; take the first
-  # whitespace-delimited token after the colon.
-  ref="$(printf '%s\n' "$body" \
-    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
-    | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//' 2>/dev/null || true)"
-  case "$ref" in
-    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;  # placeholder / unset → no explicit ref
-  esac
+  ref="$(printf '%s' "$body" | herd_pr_ref_from_body)"
+  [ -n "$ref" ] || return 0
   printf '%s' "$ref"
 }
 

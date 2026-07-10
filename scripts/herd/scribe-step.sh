@@ -47,6 +47,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Drainer singleton liveness (HERD-109): heartbeat helpers so a HUNG-but-listed drainer can be
 # detected and reclaimed by scribe.sh. Best-effort; never affects this script's stdout.
 . "$HERE/drainer-liveness.sh"
+# Durable tracker-create retry queue (HERD-267): a backend create that FAILS must not consume the
+# request. `next` re-injects every due retry before it polls; `add-item` enqueues on failure and
+# resolves on success. Pure library; every function is a no-op while CREATE_SELFHEAL=off or the retry
+# directory is empty, so a healthy engine is byte-identical to before.
+# shellcheck source=/dev/null
+. "$HERE/create-retry.sh"
 # Supervised-process contract (HERD-193): the drainer RETIRES ITS OWN lifecycle record on the normal
 # completion path below (`finish` → STOP). Without that, a cleanly-drained scribe would leave a record
 # behind whose heartbeat is frozen at its last beat, and the watcher's sweep would eventually report a
@@ -105,6 +111,74 @@ _report_and_cleanup() {
   herd_driver_notify "✍️ Backlog scribed" "$sum" done
   rm -f "$mine"
   echo "$out $short"
+}
+
+# _scribe_post_add <claimed-path> <text> — the shared tail for EVERY backend create (HERD-267).
+#
+# Before this existed, a create that came back NOCHANGE fell straight into _report_and_cleanup, which
+# `rm -f`'d the claimed request file. That is how Linear's free-tier ISSUE CAP silently swallowed six
+# coordinator filings over two hours: an empty queue, no journal line, no console row, and the one PR
+# that noticed called it an API flake. So a non-DONE create now DIVERTS into the durable retry queue
+# — the text is written to disk BEFORE the claim is dropped, and the reason (cap vs auth vs 5xx) is
+# classified, journaled, and shouted with its own distinct label.
+#
+# LOCAL backends are exempt (_scribe_backend_dispatches_creates). For `file` and `changelog` the "add"
+# is a local file edit, and NOCHANGE means "no staged edit" (the stale-drainer misroute guarded above),
+# not "the tracker refused". Feeding those into the retry queue would eventually render a
+# '🚫 tracker create BLOCKED' row for a condition no create can fix.
+#
+# On a CONFIRMED create the entry (if any) is resolved, which is what makes a first-ever success a
+# no-op: create_retry_resolve removes nothing and the report tail is byte-identical to before.
+#
+# The entry key is taken from the CLAIMED FILENAME when this request is itself a re-injection
+# (`<epoch>-retry-<hash>.req`), not from the text the drainer handed us: that text has been round-
+# tripped through an LLM and a single re-wrapped line would hash differently — forking a second entry
+# on failure and, worse, failing to resolve the original on success, so it would re-file forever.
+#
+# THE CLAIM IS ONLY DROPPED ONCE THE TEXT IS SAFE. If the durable write fails, we KEEP the claimed
+# `.req` (the sole surviving copy) and exit non-zero rather than print "request SAVED" over a request
+# we just lost. The `next` reclaim (find -mmin +5) then returns it to the queue for a later drainer.
+#
+# The claimed `.req` is handed to both calls as the BYTE SOURCE. It is still on disk at this point and
+# holds the requester's own bytes, whereas $text is whatever the drainer chose to pass along — and the
+# retry queue promises to store the request "byte-for-byte as the requester wrote it".
+_scribe_post_add() {
+  local mine="$1" text="$2" cls key
+  key="$(create_retry_path_key "$mine")"
+  if create_retry_enabled && _scribe_backend_dispatches_creates && [ "${_BACKEND_RESULT:-}" != "DONE" ]; then
+    cls="$(create_retry_class "${_BACKEND_ERROR:-}")"
+    if ! create_retry_enqueue "$text" "$cls" "${_BACKEND_ERROR:-}" "$key" "$mine" >/dev/null; then
+      echo "scribe-step: the tracker refused this create AND the durable retry write failed — LEAVING the request claimed at $mine so it is not lost. Fix the retry queue ($WORKTREES_DIR/.create-retry), then let the reclaim re-queue it. [HERD-267]" >&2
+      exit 1
+    fi
+    _report_and_cleanup "$mine" "$(create_retry_label "$cls") — request SAVED for retry (not lost)" "RETRY"
+    return 0
+  fi
+  create_retry_resolve "$text" "$key" "$mine"
+  _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"
+}
+
+# _scribe_backend_dispatches_creates — does the ACTIVE backend create items by dispatching to a remote
+# tracker that can REFUSE (an API: linear / github / jira / …)? The `file` and `changelog` backends
+# write a local file the drainer already edited; their NOCHANGE is a misroute, not a refusal, so they
+# never feed the retry queue.
+_scribe_backend_dispatches_creates() {
+  case "$SCRIBE_BACKEND" in file|changelog) return 1 ;; *) return 0 ;; esac
+}
+
+# _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL, SUCCESSFUL outcome:
+# the drainer decided it is not an add after all (skip), or the backend confirmed the transition it
+# routed to (update-state / amend → DONE). Drop its durable entry so it stops being re-injected.
+#
+# Only ever called once the outcome is known. A FAILED transition must NOT close the entry — that
+# would discard the durable copy of a request nothing has yet acted on. Such an entry keeps its place
+# in the queue and, because create_retry_reinject charges each dispatch, converges on
+# CREATE_RETRY_MAX rather than spinning. A no-op for an ordinary first-attempt request (no retry key
+# in its filename).
+_scribe_retry_close() {
+  local key; key="$(create_retry_path_key "$1")"
+  [ -n "$key" ] || return 0
+  create_retry_resolve "" "$key"
 }
 
 # ── HERD-183: MECHANICAL planned-marker from an EXPLICIT sequencing clause ────────────────────────
@@ -208,6 +282,13 @@ case "$cmd" in
     deadline=$((POLL + linger))
     # reclaim claims abandoned by a dead drainer
     find "$Q" -name '*.mine' -mmin +5 -exec sh -c 'mv -f "$1" "${1%.mine}"' _ {} \; 2>/dev/null || true
+    # HERD-267 RETRY RE-INJECTION: a create that the tracker refused lives on in the durable retry
+    # queue. Any entry whose backoff has elapsed is copied back into $Q here, so it is drained by the
+    # very drainer that is already running and applied by the SAME add path as a first attempt — no
+    # retry daemon, no second code path. PERMANENT entries (a cap/auth wall) are never due, so a
+    # doomed request shouts once and then sits still instead of spinning. A no-op — and byte-identical
+    # to the pre-HERD-267 poll — while the retry directory is empty or CREATE_SELFHEAL=off.
+    create_retry_reinject "$Q" >/dev/null 2>&1 || true
     waited=0
     while :; do
       # Atomic claim: walk the queue oldest-first and try to win each candidate via an atomic
@@ -250,8 +331,9 @@ case "$cmd" in
       echo "scribe-step: SCRIBE_BACKEND='$SCRIBE_BACKEND' but a file-mode 'commit' arrived — a stale file-mode drainer is running (retire it). Discarding its $BACKLOG_FILE edit and dispatching the request via the active backend. [issue #139]" >&2
       git checkout -- "$BACKLOG_FILE" 2>/dev/null || true
       _stale_text="$(cat "$mine" 2>/dev/null)"; [ -n "$_stale_text" ] || _stale_text="$sum"
+      _BACKEND_ERROR=""
       _backend_add_item "$mine" "$_stale_text"
-      _report_and_cleanup "$mine" "$_stale_text" "$_BACKEND_RESULT"
+      _scribe_post_add "$mine" "$_stale_text"
     fi
     ;;
   add-item)
@@ -267,6 +349,7 @@ case "$cmd" in
       echo "scribe-step: SCRIBE_BACKEND='file' but an 'add-item' dispatch arrived — a stale non-file drainer is running (retire it); this request needs a file-mode drainer to edit $BACKLOG_FILE. [issue #139]" >&2
     fi
     _BACKEND_RESULT=""
+    _BACKEND_ERROR=""   # HERD-267: backends that know WHY a create failed set this; absent → 'unknown'
     # HERD-183: parse the body FIRST (pure text). With no explicit sequencing clause we take the
     # unchanged path below — byte-identical to before, nothing extra published.
     _seq_blocker="$(_scribe_seq_blocker "$text")"
@@ -283,7 +366,7 @@ case "$cmd" in
     else
       _backend_add_item "$mine" "$text"
     fi
-    _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"
+    _scribe_post_add "$mine" "$text"
     ;;
   update-state)
     # Intent-dispatch path (gh #139, second half): transition an EXISTING item's state instead of
@@ -311,6 +394,10 @@ case "$cmd" in
     _BACKEND_RESULT=""
     _backend_update_state "$ref" "$state"
     sum="$ref → $state"
+    # HERD-267: release a re-injected retry's durable entry ONLY on a CONFIRMED transition. A failed or
+    # unmatched transition leaves the entry alone — dropping it would discard the durable copy of a
+    # request nothing has acted on.
+    [ "$_BACKEND_RESULT" = "DONE" ] && _scribe_retry_close "$mine"
     [ "$_BACKEND_RESULT" = "DONE" ] || sum="$sum (no matching item — nothing changed)"
     _report_and_cleanup "$mine" "$sum" "${_BACKEND_RESULT:-NOCHANGE}"
     ;;
@@ -335,6 +422,7 @@ case "$cmd" in
     _BACKEND_RESULT=""
     _backend_amend "$ref" "$note"
     if [ "$_BACKEND_RESULT" = "DONE" ]; then
+      _scribe_retry_close "$mine"   # HERD-267: terminal, and CONFIRMED (see update-state)
       _report_and_cleanup "$mine" "↳ amended $ref" "DONE"
     else
       # No unique matching item (ambiguous or not found): the backend already warned loudly on stderr
@@ -348,6 +436,9 @@ case "$cmd" in
     # issue. This is the safety valve that closes the junk-issue path for good. [issue #139]
     mine="${2:?claimed path}"; reason="${3:-unmappable request}"
     cd "$REPO" || exit 1
+    # HERD-267: `skip` cannot fail — its whole outcome is "file nothing, loudly" — so a re-injected
+    # retry that lands here is terminal and successful, and its durable entry is released.
+    _scribe_retry_close "$mine"
     echo "scribe-step: SKIPPED (not filed) — $reason" >&2
     _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): $reason" "SKIP"
     ;;
