@@ -304,7 +304,11 @@ OVERRIDES="$TREES/.agent-watch-overrides"
 # Format: "<epoch> awaiting <pr#> <headSha>"  — watcher noted gates passed, awaiting human approval
 #         "<epoch> approved <pr#> <headSha>"  — herd-approve.sh wrote explicit approval for this sha
 #         "<epoch> observed <pr#> <headSha>"  — watcher notified in observe mode (dedup guard)
-APPROVALS="$TREES/.agent-watch-approvals"
+# The path is resolved through approvals.sh so this reader and herd-approve.sh (the writer) can never
+# name two different files. Sourcing it only defines functions.
+# shellcheck source=/dev/null
+. "$HERE/approvals.sh"
+APPROVALS="$(_approvals_file || true)"
 # Transcript-growth ledger for the builder stall detector: one line per active worktree slug
 # ("<slug> <transcript-bytes> <newest-mtime>") caching the last poll's Claude session-transcript
 # observation. A grown transcript between polls is a liveness signal that vetoes a would-be stall

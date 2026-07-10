@@ -7,10 +7,20 @@
 #
 #   <epoch> <state> <pr#> <sha>        state ∈ awaiting | approved | hv-informed
 #
-# Three surfaces care about it: herd-approve.sh writes it, agent-watch.sh reads it before merging, and
-# journal-audit.sh audits merged PRs against it after the fact. Each one spelling the path itself is
-# how a ledger quietly forks into two; this file is the single place the path is spelled and the single
-# place a row is interpreted. Same doctrine as merge-policy.sh: one seam, one answer.
+# herd-approve.sh writes it and agent-watch.sh reads it before merging; both resolve the PATH here, so
+# a ledger cannot quietly fork into two (e.g. under HERD_APPROVALS_FILE). Same doctrine as
+# merge-policy.sh: one seam, one answer. Both callers still parse rows with their own literal patterns
+# for the states they own; approval_state below is the shared reader for callers that just want the
+# verdict.
+#
+# ⚠ THE LEDGER IS EPHEMERAL — IT DOES NOT SURVIVE THE MERGE. agent-watch.sh's do_merge calls
+# purge_pr_approvals the instant a PR merges, dropping EVERY row for that PR number: awaiting,
+# approved and hv-informed alike, across all shas (HERD-90 — a stale 'awaiting' row is a phantom hold).
+# `_reap_slug` and retirement.sh purge it again. So approval_state on a MERGED pr is always `none`, and
+# a post-merge auditor that trusts it would accuse every properly-approved merge of merging unverified.
+# The durable evidence lives in the append-only journal instead: `approval_recorded` (written by
+# herd-approve.sh) and `human_verify_policy … policy=auto` (written by agent-watch.sh). journal-audit.sh
+# check (g) reads those; it consults this ledger only for the PRE-merge window, where a row still exists.
 #
 # Sourcing only DEFINES functions — no side effects, no writes, no journal lines — so any caller may
 # source it at any point, before or after herd-config.sh. Bash 3.2 clean.

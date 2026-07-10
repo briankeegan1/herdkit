@@ -21,8 +21,20 @@
 #       (fixed in 65fe660 by making the rc three-valued). Every merge that predates that fix is
 #       therefore unproven. Because the audit replays a journal WINDOW, one check serves both readings:
 #       ONGOING, it re-examines each tick's fresh merges; RETROACTIVELY, a one-shot run with a widened
-#       JOURNAL_AUDIT_WINDOW_SECS sweeps as far back as the journal reaches. Approval records are read
-#       through approvals.sh — the same seam herd-approve.sh writes — never by re-deriving the path.
+#       JOURNAL_AUDIT_WINDOW_SECS sweeps as far back as the journal reaches.
+#
+#       WHERE THE EVIDENCE LIVES. Not in the approval ledger: do_merge calls purge_pr_approvals the
+#       instant a PR merges, dropping every row for it (HERD-90), so by the time this check sees a
+#       merge the ledger says `none` for approved and fail-open merges alike — zero discriminating
+#       power. The durable evidence is in this very journal, which nothing purges:
+#         `approval_recorded pr=<pr> sha=<sha> state=approved`  — a human signed that sha off
+#         `human_verify_policy pr=<pr> sha=<sha> policy=auto`   — HUMAN_VERIFY_POLICY=auto merged the
+#                                                                 steps as informational, unsigned
+#       The ledger is still consulted through approvals.sh (the seam herd-approve.sh writes), because a
+#       purge that failed, or a merge journaled without a later purge, leaves a real row worth reading.
+#       Evidence is the UNION; approval wins over hv-informed. A merge whose approval predates the
+#       `approval_recorded` event (i.e. history older than this check) has no evidence anywhere and is
+#       reported unproven — which is precisely what the retroactive sweep exists to surface.
 #
 # BINDING CONSTRAINTS:
 #   • ADVISORY ONLY — never gates a merge, never mutates git/PRs/tracker/BACKLOG, never auto-heals.
@@ -406,7 +418,10 @@ _ja_hv_add() {
 # No body source at all (no seam, no gh) → the check cannot run. A missing OPTIONAL tool skips
 # SILENTLY; it is never a finding, and never a red row.
 if [ -n "${HERD_JOURNAL_AUDIT_PR_BODY_CMD:-}" ] || command -v gh >/dev/null 2>&1; then
-  # Distinct merges in the window, oldest first: "<pr>\t<sha>". A merge with no pr is unauditable.
+  # Distinct merges in the window, oldest first: "<pr>\t<sha>\t<evidence>", where evidence is what the
+  # JOURNAL still knows about that pr+sha after the approval ledger was purged:
+  #   approved | hv-informed | none
+  # A merge with no pr is unauditable.
   # shellcheck disable=SC2016
   MERGES="$(
     JOURNAL_FILE="$_jf" \
@@ -434,7 +449,9 @@ override = parse_ts(os.environ.get("HERD_JOURNAL_AUDIT_NOW") or "")
 now = override if override is not None else datetime.now(timezone.utc)
 cutoff = now.timestamp() - int(os.environ.get("WINDOW_SECS") or 86400)
 
-rows = []
+rows = []          # merges: (ts, pr, sha)
+approved = []      # (pr, sha) a human signed off — approval_recorded
+informed = []      # (pr, sha) merged as informational under HUMAN_VERIFY_POLICY=auto
 try:
     with open(os.environ.get("JOURNAL_FILE") or "", "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -445,7 +462,10 @@ try:
                 o = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(o, dict) or o.get("event") != "merge":
+            if not isinstance(o, dict):
+                continue
+            ev = o.get("event")
+            if ev not in ("merge", "approval_recorded", "human_verify_policy"):
                 continue
             ts = parse_ts(o.get("ts"))
             if ts is None or ts.timestamp() < cutoff:
@@ -453,9 +473,31 @@ try:
             pr = o.get("pr")
             if pr is None or str(pr).strip() in ("", "0"):
                 continue
-            rows.append((ts, str(pr).strip(), str(o.get("sha") or "").strip()))
+            pr = str(pr).strip()
+            sha = str(o.get("sha") or "").strip()
+            if ev == "merge":
+                rows.append((ts, pr, sha))
+            elif ev == "approval_recorded":
+                if str(o.get("state") or "approved") == "approved":
+                    approved.append((pr, sha))
+            elif str(o.get("policy") or "") == "auto":
+                informed.append((pr, sha))
 except OSError:
     sys.exit(0)
+
+def sha_match(a, b):
+    """Anchored, bidirectional prefix match — `list` shows a short sha, the watcher records the full
+    oid. An EMPTY sha on either side matches any sha for that PR (a record that never carried one)."""
+    if not a or not b:
+        return True
+    return a == b or a.startswith(b) or b.startswith(a)
+
+def evidence(pr, sha):
+    if any(p == pr and sha_match(s, sha) for p, s in approved):
+        return "approved"
+    if any(p == pr and sha_match(s, sha) for p, s in informed):
+        return "hv-informed"
+    return "none"
 
 rows.sort(key=lambda r: r[0])
 seen = set()
@@ -463,11 +505,11 @@ for _ts, pr, sha in rows:
     if (pr, sha) in seen:
         continue
     seen.add((pr, sha))
-    print("%s\t%s" % (pr, sha))
+    print("%s\t%s\t%s" % (pr, sha, evidence(pr, sha)))
 PY
   )" || MERGES=""
 
-  while IFS=$'\t' read -r _hv_pr _hv_sha; do
+  while IFS=$'\t' read -r _hv_pr _hv_sha _hv_evidence; do
     [ -n "$_hv_pr" ] || continue
     # A merged PR is settled: once a tick has proven it clean (no block, or block + approval), that
     # verdict can never change, so memoize it in the seen-ledger. Without this, every tick re-fetches
@@ -475,7 +517,8 @@ PY
     _hv_memo="hv_clean|pr=${_hv_pr}|sha=${_hv_sha}"
     _seen_has "$_hv_memo" && continue
     _hv_rc=0
-    _hv_body="$(_ja_pr_body "$_hv_pr")" || _hv_rc=$?
+    # </dev/null: this loop's stdin is the merge list. A body command that read stdin would eat it.
+    _hv_body="$(_ja_pr_body "$_hv_pr" </dev/null)" || _hv_rc=$?
     if [ "$_hv_rc" -ne 0 ]; then
       # UNKNOWN, not clean and not guilty: we could not read the body, so we cannot say whether steps
       # were declared. Reported once (the seen-ledger keys it) so a human can look; never a crash.
@@ -487,7 +530,14 @@ PY
     if ! printf '%s' "$_hv_body" | human_verify_has; then
       _seen_mark "$_hv_memo"; continue                       # no block declared → nothing to approve
     fi
-    _hv_state="$(approval_state "$_hv_pr" "$_hv_sha")"
+    # Evidence is the UNION of the journal (durable, survives purge_pr_approvals) and the live ledger
+    # (authoritative only before the merge purges it, but a purge that failed leaves a real row).
+    _hv_state="$_hv_evidence"
+    _hv_ledger="$(approval_state "$_hv_pr" "$_hv_sha")"
+    case "$_hv_ledger" in
+      approved)    _hv_state="approved" ;;
+      hv-informed) [ "$_hv_state" = "approved" ] || _hv_state="hv-informed" ;;
+    esac
     if [ "$_hv_state" = "approved" ]; then
       _seen_mark "$_hv_memo"; continue
     fi

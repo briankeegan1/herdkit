@@ -223,6 +223,13 @@ EOF
       printf 'PR #%s commit %s is already approved.\n' "$prnum" "$sha"; exit 0
     fi
     printf '%s approved %s %s\n' "$(date +%s)" "$prnum" "$sha" >> "$APPROVALS"
+    # The ledger row above is EPHEMERAL: do_merge calls purge_pr_approvals as soon as this PR merges,
+    # dropping every row for it. So the fact that a human signed this sha off is ALSO written to the
+    # append-only journal, which nothing purges. That journal event is the only evidence a post-merge
+    # auditor (journal-audit.sh check (g), HERD-272) can still see; without it, an approved
+    # HUMAN-VERIFY merge is indistinguishable from one that fail-open merged with its steps unrun.
+    command -v journal_append >/dev/null 2>&1 \
+      && journal_append approval_recorded pr "$prnum" sha "$sha" state approved source herd-approve || true
     printf '✅ Approved PR #%s — approved commit %s. The watcher will merge on next poll (~4 s).\n' "$prnum" "$sha"
     ;;
 

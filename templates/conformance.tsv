@@ -106,6 +106,7 @@ herd-resolve.sh	sim	tests/test-sandbox-resolver-respawn.sh
 herd-resolve.sh	unit	tests/test-model-flags.sh
 herd-resolve.sh	unit	tests/test-driver-lane-spawn.sh
 herd-approve.sh	unit	tests/test-human-verify-hold.sh
+herd-approve.sh	unit	tests/test-journal-audit.sh
 herd-approve.sh	unit	tests/test-approval-purge.sh
 herd-approve.sh	unit	tests/test-human-verify-policy.sh
 push-gate.sh	sim	tests/test-sandbox-governance.sh
