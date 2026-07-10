@@ -5,11 +5,13 @@
 # (sandbox-concurrency-scenario.sh) drives the REAL watcher GATE loop, this P2a scenario drives the
 # REAL watcher LIMIT path (agent-watch.sh, sourced in lib mode): a builder hits the account usage
 # limit, the watcher DETECTS the park via the hook sentinel, SCHEDULES an in-place resume honoring
-# HERD_LIMIT_RESUME_BUFFER, and at the reset RELAUNCHES the builder via `claude --continue`. Every
-# step is the SHIPPED code — `_detect_limit_hit`, `_handle_limit_blocked`, `_resume_builder`,
+# HERD_LIMIT_RESUME_BUFFER, and at the reset RELAUNCHES the builder via the driver's
+# DRIVER_AGENT_RESUME binding (HERD-176; herdr-claude/headless: `claude --continue` — BYTE-IDENTICAL
+# to the pre-P4 hardcode). Every step is the SHIPPED code — `_detect_limit_hit`,
+# `_handle_limit_blocked`, `_resume_builder` (via herd_driver_agent_resume_cmd),
 # `record_limit`/`clear_limit`, `limit_state`/`limit_target_epoch` — called in the exact order and
-# under the exact guard the watcher's action pass uses (agent-watch.sh:2910–2913). So the auto-resume
-# accounting under test IS production's; this scenario breaks if that code regresses.
+# under the exact guard the watcher's action pass uses. So the auto-resume accounting under test IS
+# production's; this scenario breaks if that code regresses.
 #
 # The two moving parts that would be a live account + a live Claude session are the ONLY things
 # stubbed, and both through documented seams:
@@ -260,13 +262,25 @@ WATCH="$HERE/../agent-watch.sh"
 _missing=""
 for fn in _detect_limit_hit _handle_limit_blocked _resume_builder _limit_sentinel_file \
           _parse_reset_epoch limit_state limit_target_epoch record_limit clear_limit \
-          _find_builder_pane_id_any herd_write_ratelimit_hook; do
+          _find_builder_pane_id_any herd_write_ratelimit_hook \
+          herd_driver_agent_resume_cmd herd_driver_agent_limit_pattern; do
   type "$fn" >/dev/null 2>&1 || _missing="$_missing $fn"
 done
 if [ -z "$_missing" ]; then
   checkpoint watcher_bound pass "real agent-watch.sh limit functions sourced (lib mode)"
 else
   checkpoint watcher_bound fail "missing limit functions:$_missing"
+fi
+
+# HERD-176: the default (headless/herdr-claude) resume command is BYTE-IDENTICAL to the pre-P4
+# hardcode, and is composed by the driver seam (not a raw claude string in agent-watch).
+_resume_shape="$(herd_driver_agent_resume_cmd "continue" 2>/dev/null || true)"
+if printf '%s' "$_resume_shape" | grep -qF 'claude' \
+   && printf '%s' "$_resume_shape" | grep -qF -- '--continue' \
+   && printf '%s' "$_resume_shape" | grep -qF -- '--dangerously-skip-permissions'; then
+  checkpoint driver_resume_routing pass "herd_driver_agent_resume_cmd → $_resume_shape (byte-identical claude shape)"
+else
+  checkpoint driver_resume_routing fail "resume seam did not compose the claude --continue shape (got: $_resume_shape)"
 fi
 
 # Silence terminal output the way the unit tests / concurrency scenario do.

@@ -10,7 +10,6 @@ bin/herd	warn "no coordinator agent is live in pane ${agent_pane} — start it y
 scripts/herd/agent-watch.sh	"coordinator did not wake after the limit reset — resume by hand (claude --continue in the coordinator pane)" default
 scripts/herd/agent-watch.sh	"coordinator limit reset — resumed in place via claude --continue" default
 scripts/herd/agent-watch.sh	_claude_probe_run_timeout "$secs" claude --version || rc=$?
-scripts/herd/agent-watch.sh	_rb_cmd="cd $(_shq "$_rb_wt") && claude $_rb_flags --continue $(_shq "$_rb_prompt")"
 scripts/herd/agent-watch.sh	detail "claude --version did not return within ${secs}s (exec-hang) — holding review/refix dispatch" \
 scripts/herd/agent-watch.sh	detail "claude --version responded again — resuming review/refix dispatch"
 scripts/herd/agent-watch.sh	if herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1; then

@@ -75,8 +75,16 @@ grep -qF 'herd_driver_oneshot_exec "$PROMPT" "$ADVISE_MODEL"' "$ROOT/scripts/her
   || fail "herd-advise.sh no longer routes its one-shot query through the driver seam"
 grep -qF 'claude -p "$' "$ROOT/scripts/herd/herd-advise.sh" \
   && fail "herd-advise.sh still calls a RAW claude -p (must route through herd_driver_oneshot_exec)"
-grep -qF 'usage limit|session limit|hit your (usage|session) limit' "$ROOT/scripts/herd/agent-watch.sh" \
-  || fail "limit-detection audit site drifted (agent-watch.sh)"
+# resume + limit-detection have been ROUTED (HERD-176 / HERD-150 P4): the resume/limit phrase now
+# live in the driver seam; agent-watch resolves them via the helpers (not a raw hardcode).
+grep -qF "claude --dangerously-skip-permissions --continue" "$ROOT/scripts/herd/driver.sh" \
+  || fail "resume fallback/default drifted out of the driver seam (driver.sh: herd_driver_agent_resume_cmd)"
+grep -qF 'herd_driver_agent_resume_cmd' "$ROOT/scripts/herd/agent-watch.sh" \
+  || fail "agent-watch.sh no longer routes resume through herd_driver_agent_resume_cmd"
+grep -qF 'herd_driver_agent_limit_pattern' "$ROOT/scripts/herd/agent-watch.sh" \
+  || fail "agent-watch.sh no longer routes limit-banner through herd_driver_agent_limit_pattern"
+grep -qF 'usage limit|session limit|hit your (usage|session) limit' "$ROOT/scripts/herd/driver.sh" \
+  || fail "limit-detection default drifted out of the driver seam (driver.sh: herd_driver_agent_limit_pattern)"
 ok; echo "PASS (3) herdr-claude binds today's exact strings; audit sites still present"
 
 # ── seed a minimal herd project `herd render` accepts (mirrors test-driver-abstraction.sh). ───────

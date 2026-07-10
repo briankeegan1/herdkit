@@ -7422,11 +7422,13 @@ Why: ${_hsd_reason}"
   _hsd_pane_id="$(_find_builder_pane_id_any "$_hsd_slug")"
   if [ -n "$_hsd_pane_id" ]; then
     local _hsd_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
-    herdr pane run "$_hsd_pane_id" "$_hsd_prompt" >/dev/null 2>&1 || true
+    # Submit via the driver send-text seam (DRIVER_SEND_TEXT: pane run + Enter for herdr) — same
+    # wake path as the review refix (HERD-176 / HERD-186); never a raw herdr pane run alone.
+    herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
     if _wait_agent_working "$_hsd_slug" "$_hsd_wait"; then
       _hsd_woke=1
     else
-      herdr pane run "$_hsd_pane_id" "$_hsd_prompt" >/dev/null 2>&1 || true
+      herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
       if _wait_agent_working "$_hsd_slug" "$_hsd_wait"; then
         _hsd_woke=1
       else
@@ -7679,11 +7681,13 @@ Fix the failure, re-run until the healthcheck is green, then push."
   _hhc_pane_id="$(_find_builder_pane_id_any "$_hhc_slug")"
   if [ -n "$_hhc_pane_id" ]; then
     local _hhc_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
-    herdr pane run "$_hhc_pane_id" "$_hhc_prompt" >/dev/null 2>&1 || true
+    # Submit via the driver send-text seam (DRIVER_SEND_TEXT) — same wake path as review/stale refix
+    # (HERD-176 / HERD-186); never a raw herdr pane run alone.
+    herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
     if _wait_agent_working "$_hhc_slug" "$_hhc_wait"; then
       _hhc_woke=1
     else
-      herdr pane run "$_hhc_pane_id" "$_hhc_prompt" >/dev/null 2>&1 || true
+      herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
       if _wait_agent_working "$_hhc_slug" "$_hhc_wait"; then
         _hhc_woke=1
       else
@@ -7745,19 +7749,20 @@ except Exception:
 ' 2>/dev/null || true
 }
 
-# _resume_builder <slug> <worktree> <pane_id> [prompt] — relaunch a builder whose Claude session
-# ENDED, IN PLACE, via `claude --continue` in its worktree (full context preserved), then VERIFY the
-# agent flips to "working" within a bounded poll; retry ONCE. Returns 0 if it woke, 1 otherwise.
-# The CALLER owns journaling, the console row, and the loud escalation on failure — this helper only
-# performs + verifies the relaunch. [prompt] is the compose-turn text (default "continue"); the
-# refix path passes its "fix the review" instructions so the resumed builder wakes straight onto the
-# fix. SHARED by the auto-refix bounce (done builder) and the limit-auto-resume scheduler.
+# _resume_builder <slug> <worktree> <pane_id> [prompt] — relaunch a builder whose agent session
+# ENDED, IN PLACE, via the driver's DRIVER_AGENT_RESUME binding (herdr-claude: `claude --continue`)
+# in its worktree (full context preserved), then VERIFY the agent flips to "working" within a
+# bounded poll; retry ONCE. Returns 0 if it woke, 1 otherwise. The CALLER owns journaling, the
+# console row, and the loud escalation on failure — this helper only performs + verifies the
+# relaunch. [prompt] is the compose-turn text (default "continue"). HERD-176: the resume argv is
+# composed by herd_driver_agent_resume_cmd so a non-Claude runtime rebinds in one place; default
+# path is BYTE-IDENTICAL to the pre-P4 hardcoded `claude <flags> --continue <prompt>`.
 _resume_builder() {
   local _rb_slug="$1" _rb_wt="$2" _rb_pane="$3" _rb_prompt="${4:-continue}"
   [ -n "$_rb_pane" ] || return 1
-  # HARDENING (HERD-155 F1): NEVER type `cd … && claude --continue` into a pane still parked at the
+  # HARDENING (HERD-155 F1): NEVER type `cd … && <resume>` into a pane still parked at the
   # limit ARROW-MENU — the command line would be captured as MENU input (worst case: it lands on
-  # "Upgrade your plan" and strands the session at a login screen). The `--continue` backstop is only
+  # "Upgrade your plan" and strands the session at a login screen). The resume backstop is only
   # valid for a session that has actually ENDED (a normal REPL). Fire ONLY when a menu is NOT CONFIRMED
   # present; a confirmed menu means the clean-select degraded, so REFUSE and let the CALLER escalate
   # (record 'failed' + loud row / notification) rather than type blind. Empty/blind read → not a menu
@@ -7766,11 +7771,15 @@ _resume_builder() {
     journal_append limit_resume_refused slug "$_rb_slug" pane "$_rb_pane" reason menu_parked
     return 1
   fi
-  local _rb_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
-  # cd into the worktree so `claude --continue` resumes THAT worktree's session even if the pane's
-  # shell drifted; the explicit path also makes the invocation shape assertable in the hermetic tests.
-  local _rb_cmd
-  _rb_cmd="cd $(_shq "$_rb_wt") && claude $_rb_flags --continue $(_shq "$_rb_prompt")"
+  # Compose the resume command from the active driver's DRIVER_AGENT_RESUME binding (HERD-176).
+  # Permission flags: HERD_CLAUDE_FLAGS override when set, else the driver's own
+  # DRIVER_AGENT_PERMISSION_FLAG — byte-identical for herdr-claude (--dangerously-skip-permissions).
+  local _rb_flags _rb_resume _rb_cmd
+  _rb_flags="$(herd_driver_lane_permission_flags)"
+  _rb_resume="$(herd_driver_agent_resume_cmd "$_rb_prompt" "$_rb_flags")"
+  # cd into the worktree so the resume targets THAT worktree's session even if the pane's shell
+  # drifted; the explicit path also makes the invocation shape assertable in the hermetic tests.
+  _rb_cmd="cd $(_shq "$_rb_wt") && $_rb_resume"
   local _rb_wait="${HERD_RESUME_WAIT_TIMEOUT:-${HERD_REFIX_WAIT_TIMEOUT:-15}}"
   herdr pane run "$_rb_pane" "$_rb_cmd" >/dev/null 2>&1 || true
   _wait_agent_working "$_rb_slug" "$_rb_wait" && return 0
@@ -7869,20 +7878,24 @@ sys.stdout.write(str(int(cand.timestamp())))
 PY
 }
 
-# _text_is_limit_banner <text> — 0 iff <text> looks like Claude's actual usage-limit BANNER, not a
+# _text_is_limit_banner <text> — 0 iff <text> looks like the runtime's actual usage-limit BANNER, not a
 # builder merely DISCUSSING usage limits. HERD-155 F4: this repo's builders BUILD limit features, so
 # the bare phrase "usage limit" shows up in perfectly normal assistant output (task specs, PR bodies,
 # code comments — this very sentence). Detection now requires BOTH:
-#   1. the canonical usage-limit PHRASE — kept VERBATIM as the driver's DRIVER_AGENT_LIMIT_PATTERN
-#      mirror (the cross-driver conformance audit in test-driver-agent-exec.sh asserts this exact
-#      string is still present here), AND
+#   1. the canonical usage-limit PHRASE — resolved from the driver's DRIVER_AGENT_LIMIT_PATTERN
+#      (HERD-176; herdr-claude carries today's exact string; codex/grok bind a @degrade: sentinel that
+#      never matches, so an un-verified runtime never false-parks), AND
 #   2. the banner SHAPE — a "limit reached" / "limit will reset" / "reset at|in <time>" STATUS line.
 # Discussion carries the phrase but not the shape, so the transcript-scrape fallback no longer
 # self-triggers a phantom park on a limit-feature builder's own words. The hook sentinel (primary
 # signal) is unaffected — this only tightens the fallback.
 _text_is_limit_banner() {
-  local _tb="$1"
-  printf '%s' "$_tb" | grep -qiE 'usage limit|session limit|hit your (usage|session) limit' || return 1
+  local _tb="$1" _pat
+  _pat="$(herd_driver_agent_limit_pattern 2>/dev/null || true)"
+  [ -n "$_pat" ] || _pat='usage limit|session limit|hit your (usage|session) limit'
+  # Fail-safe: a @degrade:… sentinel (codex/grok) must NEVER match a real banner line.
+  case "$_pat" in @degrade:*) return 1 ;; esac
+  printf '%s' "$_tb" | grep -qiE "$_pat" || return 1
   printf '%s' "$_tb" | grep -qiE 'limit reached|will reset|reset[s]? (at|in) |reached your (usage|session) limit'
 }
 

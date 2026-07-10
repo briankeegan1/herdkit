@@ -97,6 +97,14 @@ spawn_resolver() {
 }
 
 export STUB_PANE_RUN_LOG="$T/pane-runs.txt"; : > "$STUB_PANE_RUN_LOG"
+# HERD-176: stale-base autofix wake routes through herd_driver_send_text (not raw herdr pane run).
+# Override the seam so deliveries are logged as "pane\ttext" lines, keeping bounce-count assertions intact.
+herd_driver_send_text() {
+  local target="${1:-}" text="${2:-}"
+  [ -n "${STUB_PANE_RUN_LOG:-}" ] \
+    && printf '%s\t%s\n' "$target" "$(printf '%s' "$text" | tr '\n' ' ')" >> "$STUB_PANE_RUN_LOG"
+  return 0
+}
 runs() { awk 'END{print NR+0}' "$STUB_PANE_RUN_LOG" 2>/dev/null || printf '0'; }
 rslv() { awk 'END{print NR+0}' "$RESOLVE_LOG" 2>/dev/null || printf '0'; }
 row()  { printf '%s\n' "${DISPLAY[0]:-}"; }
