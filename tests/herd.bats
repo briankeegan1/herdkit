@@ -361,6 +361,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic mixed-vendor review panel (HERD-276) test passes" {
+  run bash "$REPO/tests/test-review-panel-models.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic project-defined branch naming (HERD-120) test passes" {
   run bash "$REPO/tests/test-branch-template.sh"
   [ "$status" -eq 0 ]

@@ -524,6 +524,136 @@ XSJSON
   fi
 fi
 
+# ── mixed-vendor review panel (HERD-276): per-panelist driver refs + verdict merge policy ────────
+# The cross-seat phase above proves a FOREIGN seat's BLOCK is honored. This phase proves the gate's own
+# panel now reviews with SEVERAL VENDORS at once, and that the three ways a vendor can fail to vote all
+# land as INFRA (a bounded watcher retry) rather than as a BLOCK cached against the sha.
+#
+# Zero-quota by construction: every panelist runs the STUB PROOF DRIVER (templates/drivers/stub.driver),
+# whose runtime is a fictional `stub-agent`. We put a fake `stub-agent` on PATH that prints one
+# stream-json verdict line — so the REAL herd-review.sh, the REAL driver seam, and the REAL verdict
+# resolver execute end-to-end with NO model call and no network. That the stub driver names a NON-claude
+# binary is exactly what makes this a mixed-vendor proof: leg A observes two different binaries launched
+# from ONE panel.
+step review-panel "mixed-vendor panel — per-panelist runtimes, policy fold, INFRA never a false BLOCK"
+REVIEW_SH="$HERE/../herd-review.sh"
+if [ ! -f "$REVIEW_SH" ]; then
+  checkpoint review_panel_lib skip "herd-review.sh not found at $REVIEW_SH — review-panel phase skipped"
+else
+  RP="$ART/review-panel"; mkdir -p "$RP/bin" "$RP/trees"
+  # gh/git/herdr stubs: this phase asserts the VERDICT contract, not PR plumbing. herd-review.sh must
+  # never post a comment or fetch a pin here, and HERD_NO_PANE keeps it off the pane path.
+  for _c in gh git; do printf '#!/usr/bin/env bash\nexit 0\n' > "$RP/bin/$_c"; chmod +x "$RP/bin/$_c"; done
+  printf '#!/usr/bin/env bash\ncase "$1 $2" in "agent list") printf %s "{\\"result\\":{\\"agents\\":[]}}" ;; *) exit 0 ;; esac\n' > "$RP/bin/herdr"
+  chmod +x "$RP/bin/herdr"
+  # rp_runtime <binary> <verdict> — a fake agent runtime that RECORDS which binary ran with which
+  # --model, then prints one stream-json result line carrying <verdict>. The recording is what turns
+  # "the panel is mixed-vendor" from a claim into an observable fact.
+  rp_runtime() {
+    cat > "$RP/bin/$1" <<RPSTUB
+#!/usr/bin/env bash
+m=""; prev=""
+for a in "\$@"; do [ "\$prev" = "--model" ] && { m="\$a"; break; }; prev="\$a"; done
+printf '%s %s\n' "$1" "\$m" >> "\$RP_CALLS"
+printf '{"type":"result","subtype":"success","result":"%s"}\n' "$2"
+RPSTUB
+    chmod +x "$RP/bin/$1"
+  }
+  # rp_drive <leg> <refs> <policy> — run the REAL herd-review.sh in PR mode against the fixture repo.
+  # PATH is prefixed ONLY inside this subshell, so the stub `git` can never leak into a later phase.
+  # Echoes "<rc>|<verdict line>"; the per-leg call log lands in $RP/calls-<leg>.
+  rp_drive() {
+    local leg="$1" refs="$2" policy="$3" out rc
+    export RP_CALLS="$RP/calls-$leg"; : > "$RP_CALLS"
+    out="$( export PATH="$RP/bin:$PATH"; \
+            env RP_CALLS="$RP_CALLS" HERD_NO_PANE=1 NO_COLOR=1 \
+                REVIEW_PANEL_MODELS="$refs" REVIEW_PANEL_POLICY="$policy" \
+                HERD_REVIEW_MODEL="sim-review-model" \
+                WORKTREES_DIR="$RP/trees" HERD_CONFIG_FILE="$RP/.no-such-config" \
+                JOURNAL_FILE="$RP/journal-$leg.jsonl" \
+                bash "$REVIEW_SH" "77$leg" "sim-panel-$leg" 2>/dev/null )"
+    rc=$?
+    printf '%s|%s' "$rc" "$out"
+  }
+  _rp_rc()   { printf '%s' "${1%%|*}"; }
+  _rp_line() { printf '%s' "${1#*|}"; }
+
+  # ── Leg A — TWO VENDORS, one panel. A bare ref runs the default runtime (`claude`); a `stub:` ref
+  # runs `stub-agent`. Both PASS ⇒ combined PASS. This is the wiring HERD-276 exists for.
+  rp_runtime claude     'REVIEW: PASS'
+  rp_runtime stub-agent 'REVIEW: PASS'
+  RP_A="$(rp_drive a "bare-model stub:stub-model" any-block)"
+  _rp_calls_a="$(cat "$RP/calls-a" 2>/dev/null | tr '\n' ';')"
+  if [ "$(_rp_rc "$RP_A")" = "0" ] && [ "$(_rp_line "$RP_A")" = "REVIEW: PASS" ] \
+     && grep -qx 'claude bare-model' "$RP/calls-a" 2>/dev/null \
+     && grep -qx 'stub-agent stub-model' "$RP/calls-a" 2>/dev/null; then
+    checkpoint review_panel_mixed_dispatch pass "one panel launched TWO runtimes (claude + stub-agent), each on its own ref; combined PASS"
+  else
+    checkpoint review_panel_mixed_dispatch fail "mixed dispatch failed (rc=$(_rp_rc "$RP_A") line='$(_rp_line "$RP_A")' calls=$_rp_calls_a)"
+  fi
+
+  # ── Leg B — one vendor finds a real bug. A single BLOCK from ANY panelist blocks the merge under the
+  # default policy, and the structured HERD-104 line survives the fold intact (the auto-refix bounce
+  # reads rule/why/location out of it).
+  rp_runtime stub-agent 'REVIEW: BLOCK — rule: off-by-one | why: overshoots the last row | location: app/greet.sh:3'
+  RP_B="$(rp_drive b "bare-model stub:stub-model" any-block)"
+  if [ "$(_rp_rc "$RP_B")" = "1" ] \
+     && printf '%s' "$(_rp_line "$RP_B")" | grep -q '^REVIEW: BLOCK — rule: off-by-one'; then
+    checkpoint review_panel_vendor_block pass "a lone dissenting vendor's structured BLOCK gated the merge (exit 1) and survived the fold"
+  else
+    checkpoint review_panel_vendor_block fail "a vendor BLOCK did not gate the merge (rc=$(_rp_rc "$RP_B") line='$(_rp_line "$RP_B")')"
+  fi
+
+  # ── Leg C — the SAFETY invariant: a configured vendor whose binary is NOT installed must report INFRA,
+  # never a BLOCK. Under all-pass that coverage gap folds to INFRA-FAIL (exit 2 → the watcher RETRIES and
+  # must not cache it), and the clean co-panelist's PASS does not paper over the gap either. A false BLOCK
+  # here would be the worst outcome: a sticky, un-actionable refusal cached against the sha.
+  rp_runtime claude 'REVIEW: PASS'
+  rm -f "$RP/bin/stub-agent"
+  RP_C="$(rp_drive c "bare-model stub:stub-model" all-pass)"
+  _rp_line_c="$(_rp_line "$RP_C")"
+  if [ "$(_rp_rc "$RP_C")" = "2" ] && printf '%s' "$_rp_line_c" | grep -q '^REVIEW: INFRA-FAIL' \
+     && ! printf '%s' "$_rp_line_c" | grep -q 'BLOCK'; then
+    checkpoint review_panel_missing_binary_infra pass "an absent vendor binary folded to INFRA-FAIL (retry), never a BLOCK — under all-pass a clean co-panelist cannot mask the gap"
+  else
+    checkpoint review_panel_missing_binary_infra fail "an absent vendor binary did not fold to a BLOCK-free INFRA-FAIL (rc=$(_rp_rc "$RP_C") line='$_rp_line_c')"
+  fi
+
+  # ── Leg D — the same absent vendor under the DEFAULT policy is merely a lost vote: the reachable
+  # panelist's PASS still carries the merge. all-pass vs any-block must actually differ, or the policy
+  # key is decorative. Same inputs as leg C, one key changed.
+  RP_D="$(rp_drive d "bare-model stub:stub-model" any-block)"
+  if [ "$(_rp_rc "$RP_D")" = "0" ] && [ "$(_rp_line "$RP_D")" = "REVIEW: PASS" ]; then
+    checkpoint review_panel_policy_differs pass "policy is load-bearing: the SAME absent vendor is INFRA under all-pass but a lost vote under any-block (PASS)"
+  else
+    checkpoint review_panel_policy_differs fail "any-block did not tolerate the absent vendor (rc=$(_rp_rc "$RP_D") line='$(_rp_line "$RP_D")')"
+  fi
+
+  # ── Provenance — a folded one-line verdict cannot tell an operator WHICH vendor said what. Leg A's
+  # journal must carry one review_panelist_verdict row per panelist (with its ref) plus the sha-keyed
+  # review_panel_folded row naming the policy the gate applied.
+  RP_JA="$RP/journal-a.jsonl"
+  if [ -s "$RP_JA" ] && [ "$(grep -c 'review_panelist_verdict' "$RP_JA" 2>/dev/null | tr -cd '0-9')" = "2" ] \
+     && grep -q 'stub:stub-model' "$RP_JA" 2>/dev/null && grep -q 'review_panel_folded' "$RP_JA" 2>/dev/null; then
+    checkpoint review_panel_provenance pass "the journal attributes each verdict to its panelist ref, and records the policy the fold applied"
+  else
+    checkpoint review_panel_provenance fail "per-panelist provenance missing from the journal ($RP_JA)"
+  fi
+
+  # ── Dormancy — the whole feature is opt-in. With REVIEW_PANEL_MODELS EMPTY the review is the
+  # pre-HERD-276 single reviewer on REVIEW_MODEL: exactly one call, and never the stub runtime.
+  rp_runtime claude     'REVIEW: PASS'
+  rp_runtime stub-agent 'REVIEW: PASS'
+  RP_E="$(rp_drive e "" any-block)"
+  _rp_n_e="$(grep -c . "$RP/calls-e" 2>/dev/null | tr -cd '0-9')"
+  if [ "$(_rp_rc "$RP_E")" = "0" ] && [ "${_rp_n_e:-0}" = "1" ] \
+     && grep -qx 'claude sim-review-model' "$RP/calls-e" 2>/dev/null; then
+    checkpoint review_panel_dormant pass "REVIEW_PANEL_MODELS unset ⇒ ONE reviewer on REVIEW_MODEL via the default runtime (byte-identical single-model path)"
+  else
+    checkpoint review_panel_dormant fail "the dormant default did not run a single default-runtime reviewer (rc=$(_rp_rc "$RP_E") calls=$(tr '\n' ';' < "$RP/calls-e" 2>/dev/null))"
+  fi
+fi
+
 # ── push-gate (HERD-123): PUSH_GATE=human — hold BEFORE push, approve to resume push + PR ────────
 # Proves the seam the item exists for, driving the REAL push-gate.sh + herd-approve.sh entry points
 # against a throwaway fixture with a LOCAL bare 'origin' remote (so a real `git push` works with no
