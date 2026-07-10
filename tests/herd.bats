@@ -617,3 +617,9 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }
+
+@test "hermetic gate-coverage drift guard (HERD-292) test passes" {
+  run bash "$REPO/tests/test-gate-coverage.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
