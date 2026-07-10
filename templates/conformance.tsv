@@ -138,6 +138,7 @@ backlog-reconcile-sweep.sh	unit	tests/test-backlog-reconcile-sweep.sh
 governance-drift-sweep.sh	unit	tests/test-governance-drift.sh
 journal-audit.sh	unit	tests/test-journal-audit.sh
 lifecycle.sh	unit	tests/test-lifecycle-contracts.sh
+lifecycle.sh	unit	tests/test-lifecycle-lane-workers.sh
 JOURNAL_AUDIT	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_WINDOW_SECS	none-yet	unit: the test pins the window to its default; no test asserts an event OLDER than JOURNAL_AUDIT_WINDOW_SECS is excluded from the replay
 JOURNAL_AUDIT_DISPATCH_TTL	unit	tests/test-journal-audit.sh
@@ -146,6 +147,7 @@ JOURNAL_AUDIT_RED_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_MERGE_GRACE	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_PUSHED_GRACE	unit	tests/test-journal-audit.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-contracts.sh
+LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-lane-workers.sh
 agent-watch.sh	unit	tests/test-human-verify-hold.sh
 agent-watch.sh	unit	tests/test-healthcheck-gate.sh
 agent-watch.sh	unit	tests/test-merge-policy.sh
