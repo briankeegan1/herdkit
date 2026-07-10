@@ -1804,6 +1804,19 @@ cmd_note() {
 
   # Flatten whitespace + cap at ~300 chars so a journal line stays sub-PIPE_BUF and console rows stay
   # readable. Fail-soft: if python is missing, bash-prefix the first 300 bytes.
+  # HERD-298: also keep the FULL flattened (uncapped) text so an over-cap note can spill its tail to a
+  # sidecar below. A sub-cap note has full == text and spills nothing, so its journal line is
+  # byte-identical to before this change.
+  local full
+  full="$(printf '%s' "$text" | python3 -c '
+import sys
+sys.stdout.write(" ".join(sys.stdin.read().split()))
+' 2>/dev/null)" || full=""
+  if [ -z "$full" ]; then
+    # shell-only fallback: collapse runs of space, then strip the ends.
+    full="$(printf '%s' "$text" | tr -s '[:space:]' ' ')"
+    full="${full# }"; full="${full% }"
+  fi
   text="$(printf '%s' "$text" | python3 -c '
 import sys
 s = " ".join(sys.stdin.read().split())
@@ -1834,9 +1847,33 @@ sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
   fi
   [ -n "$slug" ] || slug="unknown"
 
+  # HERD-298: an over-cap note loses its tail on the capped journal line. Spill the FULL flattened text
+  # to a sidecar in the shared worktree pool (so any seat can resolve it) and carry the path on the
+  # event as note_full; `herd notes show <n>` prints it. Fail-soft: any failure (no WORKTREES_DIR,
+  # unwritable pool) degrades to today's capped-only behavior — a note is never blocked. A sub-cap note
+  # (full == text) spills nothing, so its journal line stays byte-identical.
+  local note_full=""
+  if [ "$full" != "$text" ] && [ -n "${WORKTREES_DIR:-}" ]; then
+    local _nf_dir="$WORKTREES_DIR/.builder-notes-full" _nf_epoch _nf_slug _nf_file _nf_n
+    if mkdir -p "$_nf_dir" 2>/dev/null; then
+      _nf_epoch="$(date +%s 2>/dev/null || echo 0)"
+      _nf_slug="$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '-')"
+      _nf_file="$_nf_dir/${_nf_epoch}-${_nf_slug}.txt"
+      _nf_n=0
+      while [ -e "$_nf_file" ]; do
+        _nf_n=$((_nf_n + 1)); _nf_file="$_nf_dir/${_nf_epoch}-${_nf_slug}-$$-${_nf_n}.txt"
+      done
+      printf '%s\n' "$full" > "$_nf_file" 2>/dev/null && note_full="$_nf_file"
+    fi
+  fi
+
   type journal_append >/dev/null 2>&1 || . "$SCRIPTS_DIR/journal.sh" 2>/dev/null || true
   if type journal_append >/dev/null 2>&1; then
-    WORKTREES_DIR="${WORKTREES_DIR:-}" journal_append builder_note component builder slug "$slug" text "$text"
+    if [ -n "$note_full" ]; then
+      WORKTREES_DIR="${WORKTREES_DIR:-}" journal_append builder_note component builder slug "$slug" text "$text" note_full "$note_full"
+    else
+      WORKTREES_DIR="${WORKTREES_DIR:-}" journal_append builder_note component builder slug "$slug" text "$text"
+    fi
   fi
   say "noted · ${c_bold}${slug}${c_rst}: $text"
 }
@@ -1845,17 +1882,19 @@ sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
 # `herd note` files a finding; the watcher renders it in the "builder notes" console section. Without
 # an ACK that row sits there until five newer notes displace it — an append-only surface the operator
 # learns to ignore. `herd notes` lists the notes currently taking console space (newest first,
-# numbered); `herd notes ack <n>` / `herd notes ack all` clears them from the DISPLAY immediately by
-# recording the exact ledger line in an ack sidecar. The journal is never touched: `herd log` still
-# has every note. Notes also age out of the display on their own after CONSOLE_ROW_RETENTION (2h).
-# Both the ledger and the ack sidecar are bounded on write (shared herd_console_trim).
+# numbered); `herd notes show <n>` prints one note's FULL finding (HERD-298: the sidecar tail an
+# over-cap note dropped, resolved from the note's builder_note event); `herd notes ack <n>` /
+# `herd notes ack all` clears them from the DISPLAY immediately by recording the exact ledger line in
+# an ack sidecar. The journal is never touched: `herd log` still has every note. Notes also age out of
+# the display on their own after CONSOLE_ROW_RETENTION (2h). Both the ledger and the ack sidecar are
+# bounded on write (shared herd_console_trim).
 cmd_notes() {
   local sub="list"
   case "${1:-}" in
-    -h|--help) say "usage: herd notes [list] | herd notes ack <n|all>"; return 0 ;;
+    -h|--help) say "usage: herd notes [list] | herd notes show <n> | herd notes ack <n|all>"; return 0 ;;
     "") ;;
-    list|ack) sub="$1"; shift ;;
-    *) die "herd notes: unknown subcommand $1 (usage: herd notes [list] | herd notes ack <n|all>)" ;;
+    list|ack|show) sub="$1"; shift ;;
+    *) die "herd notes: unknown subcommand $1 (usage: herd notes [list] | herd notes show <n> | herd notes ack <n|all>)" ;;
   esac
 
   _journal_load_config
@@ -1873,6 +1912,65 @@ cmd_notes() {
 
   if [ -z "$visible" ]; then
     say "no builder notes on the console"
+    return 0
+  fi
+
+  # ── show: print the FULL finding (HERD-298) ────────────────────────────────────────────────────
+  # The capped console row drops an over-cap note's tail; `herd note` spilled the full text to a
+  # sidecar and recorded its path on the builder_note event as note_full. Resolve that path from the
+  # note's journal event (matched by ts + slug + capped text) and print the sidecar. A sub-cap note has
+  # no sidecar — its capped row text IS the whole finding. Fail-soft: a gone sidecar or an unreadable
+  # journal falls back to the capped text, never an error.
+  if [ "$sub" = "show" ]; then
+    local which="${1:-}" total row r_slug r_text r_ts jf sidecar
+    [ -n "$which" ] || die "usage: herd notes show <n>"
+    case "$which" in ''|*[!0-9]*) die "herd notes show: <n> must be a number (got: $which)" ;; esac
+    total="$(printf '%s\n' "$visible" | grep -c .)"
+    { [ "$which" -ge 1 ] && [ "$which" -le "$total" ]; } \
+      || die "herd notes show: no note #$which (${total} on the console — run: herd notes)"
+    row="$(printf '%s\n' "$visible" | sed -n "${which}p")"
+    IFS=$'\t' read -r _ r_slug r_text r_ts <<EOF
+$row
+EOF
+    jf="${JOURNAL_FILE:-$JOURNAL_MAIN}"
+    sidecar=""
+    if [ -n "$jf" ] && [ -f "$jf" ]; then
+      sidecar="$(JF="$jf" TS="$r_ts" SLUG="$r_slug" TEXT="$r_text" python3 -c '
+import os, json, sys
+jf, ts, slug, text = os.environ["JF"], os.environ["TS"], os.environ["SLUG"], os.environ["TEXT"]
+found = ""
+try:
+    with open(jf, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("event") != "builder_note":
+                continue
+            if str(o.get("ts") or "") != ts:
+                continue
+            if slug and str(o.get("slug") or "") != slug:
+                continue
+            if text and str(o.get("text") or "") != text:
+                continue
+            nf = o.get("note_full")
+            if nf:
+                found = str(nf)
+except OSError:
+    pass
+sys.stdout.write(found)
+' 2>/dev/null)" || sidecar=""
+    fi
+    say "📝 ${c_bold}${r_slug}${c_rst}  ${c_dim}(${r_ts})${c_rst}"
+    if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
+      cat "$sidecar"
+    else
+      printf '%s\n' "$r_text"
+    fi
     return 0
   fi
 
@@ -6350,12 +6448,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd note "<finding>"               builder findings JOURNAL (HERD-202): file a load-bearing mid-
                                       build finding so the coordinator sees it in the watch stream
                                       within a tick (no human clipboard). Journals a builder_note
-                                      event (component=builder, slug, text ≤~300 chars). Ship-dormant:
+                                      event (component=builder, slug, text ≤~300 chars); an over-cap
+                                      note spills its FULL text to a sidecar (HERD-298). Ship-dormant:
                                       no behavior change unless a builder calls it
-  herd notes [list|ack <n|all>]       list the builder notes currently on the console (newest first,
-                                      numbered) and ACK the handled ones (HERD-243): an acked note
-                                      leaves the DISPLAY immediately; the journal keeps every note.
-                                      Unacked notes age out of the display on their own after 2h
+  herd notes [list|show <n>|ack <n|all>] list the builder notes currently on the console (newest first,
+                                      numbered), SHOW one note's full finding (HERD-298: prints the
+                                      sidecar tail an over-cap note dropped) and ACK the handled ones
+                                      (HERD-243): an acked note leaves the DISPLAY immediately; the
+                                      journal keeps every note. Unacked notes age out on their own after 2h
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value

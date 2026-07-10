@@ -188,6 +188,12 @@ setup() {
 	[[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic builder-note full-text sidecar test passes" {
+  run bash "$REPO/tests/test-note-full-sidecar.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic Claude Code plugin manifest test passes" {
   run bash "$REPO/tests/test-plugin-manifest.sh"
   [ "$status" -eq 0 ]
