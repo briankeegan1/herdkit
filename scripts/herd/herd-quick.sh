@@ -103,7 +103,7 @@ MODEL="${HERD_QUICK_MODEL:-$MODEL_QUICK}"
 # MODEL_QUICK or the HERD_QUICK_MODEL per-spawn override just resolved. This is the deterministic
 # backstop for the misjudgment case where an engine PR gets routed through the cheap quick lane.
 # Empty glob → off (zero behavior change). Announce only when it actually raises the tier.
-if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep -Eiq "$MODEL_ESCALATE_GLOB"; then
+if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep -Eiq "$MODEL_ESCALATE_GLOB"; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
   if [ "$MODEL" != "$MODEL_FEATURE" ]; then
     MODEL="$MODEL_FEATURE"
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"

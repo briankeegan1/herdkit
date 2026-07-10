@@ -143,7 +143,7 @@ fi
 
 # file_mtime / epoch_to_hhmm — portable helpers; detect BSD vs GNU once at startup.
 # GNU/Linux: stat -c %Y, date -d "@<epoch>". BSD/macOS: stat -f %m, date -r <epoch>.
-if stat --version 2>/dev/null | grep -q GNU; then
+if stat --version 2>/dev/null | grep -q GNU; then  # pipe-ok: fixed short version banner, far under a pipe buffer
   file_mtime()    { stat -c %Y "$1" 2>/dev/null || echo 0; }
   epoch_to_hhmm() { date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
 else

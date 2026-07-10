@@ -77,7 +77,7 @@ herd_preflight() {
   if [ -n "${HERDR_MIN_VERSION:-}" ]; then
     local raw found verdict
     raw="$(herdr --version 2>/dev/null || true)"
-    found="$(printf '%s' "$raw" | grep -oE '[0-9]+(\.[0-9]+){0,3}' | head -1)"
+    found="$(printf '%s' "$raw" | grep -oE '[0-9]+(\.[0-9]+){0,3}' | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
     verdict="$(MIN="$HERDR_MIN_VERSION" GOT="$found" python3 -c '
 import os
 def parse(s):
@@ -424,7 +424,7 @@ _herd_doctor_realpath() {
 # in _dyld_start (issue #137). Lists xattr names one-per-line and matches the exact attribute name;
 # the caller guards `xattr`'s availability (darwin-only, but present on all macOS).
 _herd_doctor_has_quarantine() {
-  xattr "$1" 2>/dev/null | grep -q '^com\.apple\.quarantine$'
+  xattr "$1" 2>/dev/null | grep -q '^com\.apple\.quarantine$'  # pipe-ok: bounded command output, under a pipe buffer
 }
 
 # _herd_doctor_find_config — resolve the project's .herd/config the way herd-config.sh does

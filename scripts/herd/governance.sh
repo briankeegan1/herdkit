@@ -73,7 +73,7 @@ _gov_match() {
   while IFS=$'\t' read -r pattern surface target label; do
     case "$pattern" in ''|'#'*|'pattern') continue ;; esac
     [ -n "$surface" ] || continue
-    if printf '%s' "$stmt" | grep -qiE "$pattern" 2>/dev/null; then
+    if printf '%s' "$stmt" | grep -qiE "$pattern" 2>/dev/null; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
       printf '%s\t%s\t%s' "$surface" "$target" "$label"
       return 0
     fi

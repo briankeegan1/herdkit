@@ -140,7 +140,7 @@ steps_list() {
 # builder-seam steps), and the watcher uses it to skip the pre/post-merge seams cheaply.
 steps_has_seam() {
   local want="$1"
-  [ -n "$(steps_list "$want" 2>/dev/null | head -1)" ]
+  [ -n "$(steps_list "$want" 2>/dev/null | head -1)" ]  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # steps_builder_rule <slug> <dir> <engine-dir> <pr-create-cmd> — the BUILDER-seam rule text threaded
@@ -307,7 +307,7 @@ steps_hold_list() {
     sha="${lh%%$'\t'*}"; step="${lh##*$'\t'}"
     dir=""
     detail="$(steps_hold_detail "$slug" "$step")" || true
-    [ -f "$detail" ] && dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"
+    [ -f "$detail" ] && dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
     printf '%s %s %s %s\n' "$slug" "$sha" "${step:-?}" "$dir"
   done <<EOF
 $slugs
@@ -379,8 +379,8 @@ steps_hold_release() {
     echo "🛑 steps: hold record for '$slug' step '$step' is missing its detail file ($detail) — REFUSING to resume a corrupt hold." >&2
     return 1
   fi
-  at="$(sed -n 's/^at=//p' "$detail" | head -1)"
-  dir="$(sed -n 's/^dir=//p' "$detail" | head -1)"
+  at="$(sed -n 's/^at=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
+  dir="$(sed -n 's/^dir=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   if [ -z "$step" ] || [ -z "$at" ]; then
     echo "🛑 steps: hold record for '$slug' is corrupt (step='$step' at='$at') — REFUSING to resume." >&2
     return 1
