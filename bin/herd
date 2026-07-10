@@ -5745,6 +5745,40 @@ for raw in sys.stdin:
     print("%s  %-22s %s" % (ts, ev, rest))
 '
 
+# ── P1 Python engine port (HERD-302, EPIC HERD-300) ──────────────────────────────────────────────
+# The read-only journal readers (`herd why` / `log` / `cost`) route through the stdlib `herd` package
+# (pysrc/herd/*.py) invoked as `python3 -m herd.<cmd>`, with a FAIL-SOFT fallback to the byte-identical
+# inline `python3 -c` program each command keeps below. If the package fails to import — or a module
+# exits nonzero with NO output — the reader silently uses the builtin, never a red row. The module
+# source and the inline fallback are the SAME program, so output is byte-for-byte identical either way
+# (the parity goldens in tests/test-py-readers.sh assert this by A/B-ing the two paths).
+# HERD_ENGINE_PY=0 forces the builtin path (used by those goldens); default is the python path.
+HERD_PYSRC="${HERD_PYSRC:-$HERDKIT_HOME/pysrc}"   # env override is a test seam (point at a broken tree)
+_HERD_PY_OK=""   # memoised across a process: "1" the package imports, "0" it does not
+_herd_py_ok() {
+  [ "${HERD_ENGINE_PY:-1}" = "0" ] && return 1
+  if [ -z "$_HERD_PY_OK" ]; then
+    if PYTHONPATH="$HERD_PYSRC${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import herd' >/dev/null 2>&1; then
+      _HERD_PY_OK=1
+    else
+      _HERD_PY_OK=0
+    fi
+  fi
+  [ "$_HERD_PY_OK" = "1" ]
+}
+# _herd_py_reader <module> — run `python3 -m herd.<module>` reading the caller's stdin + env, buffering
+# stdout to a temp file so a mid-stream failure never emits a half-rendered report. On success prints
+# the captured bytes verbatim (byte-identical to the inline program) and returns 0; on any nonzero exit
+# returns 1 WITHOUT emitting, so the caller replays the builtin fallback on its still-intact input.
+_herd_py_reader() {
+  local mod="$1" tmp rc
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  PYTHONPATH="$HERD_PYSRC${PYTHONPATH:+:$PYTHONPATH}" python3 -m "herd.$mod" >"$tmp" 2>/dev/null
+  rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return 1; fi
+  cat "$tmp"; rm -f "$tmp"
+}
+
 cmd_log() {
   local pr="" tail=0
   while [ $# -gt 0 ]; do
@@ -5764,8 +5798,18 @@ cmd_log() {
   export HERD_LOG_PR="$pr"
   if [ "$tail" -eq 1 ]; then
     say "${c_dim}tailing $JOURNAL_MAIN${pr:+ · PR #$pr} — Ctrl-C to stop${c_rst}"
-    tail -n 20 -f "$JOURNAL_MAIN" | python3 -c "$_JOURNAL_FMT"
+    # Streaming follow: the formatter is identical either way; preflight the package once (no mid-stream
+    # fallback is possible on a live `tail -f`), then pipe through the module or the builtin.
+    if _herd_py_ok; then
+      tail -n 20 -f "$JOURNAL_MAIN" | PYTHONPATH="$HERD_PYSRC${PYTHONPATH:+:$PYTHONPATH}" python3 -m herd.log
+    else
+      tail -n 20 -f "$JOURNAL_MAIN" | python3 -c "$_JOURNAL_FMT"
+    fi
   else
+    if _herd_py_ok; then
+      if _herd_py_reader log < "$JOURNAL_MAIN"; then return 0; fi
+      warn "herd log: python reader unavailable — using builtin fallback"
+    fi
     python3 -c "$_JOURNAL_FMT" < "$JOURNAL_MAIN"
   fi
 }
@@ -5783,7 +5827,12 @@ cmd_why() {
     return 0
   fi
   # Aggregate all events for this PR across the live journal + archives, chronologically.
-  printf '%s\n' "$files" | HERD_WHY_PR="$pr" python3 -c '
+  export HERD_WHY_PR="$pr"
+  if _herd_py_ok; then
+    if printf '%s\n' "$files" | _herd_py_reader why; then return 0; fi
+    warn "herd why: python reader unavailable — using builtin fallback"
+  fi
+  printf '%s\n' "$files" | python3 -c '
 import sys, os, json
 pr = os.environ["HERD_WHY_PR"]
 rows = []
@@ -5924,8 +5973,13 @@ cmd_cost() {
     say "  (the watcher writes cost events at merge time — none recorded yet)"
     return 0
   fi
-  printf '%s\n' "$files" | HERD_COST_PR="$pr" HERD_COST_FULL="$full" \
-    HERD_COST_FULL_LINES="$full_lines" HERD_COST_FULL_NOTE="$full_note" python3 -c '
+  export HERD_COST_PR="$pr" HERD_COST_FULL="$full" \
+    HERD_COST_FULL_LINES="$full_lines" HERD_COST_FULL_NOTE="$full_note"
+  if _herd_py_ok; then
+    if printf '%s\n' "$files" | _herd_py_reader cost; then return 0; fi
+    warn "herd cost: python reader unavailable — using builtin fallback"
+  fi
+  printf '%s\n' "$files" | python3 -c '
 import sys, os, json
 want_pr = os.environ.get("HERD_COST_PR", "")
 rows = []
