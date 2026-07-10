@@ -54,6 +54,11 @@ WT_A="$T/a"; write_journal "$WT_A"
   # shellcheck source=/dev/null
   . "$JOURNAL"; . "$COST"
   export WORKTREES_DIR="$WT_A"
+  # HERD-223 / suite hermeticity: cost_day_total resolves the journal via _journal_file, which
+  # honors JOURNAL_FILE first and otherwise redirects under HERMETIC_TEST/HERD_JOURNAL_HERMETIC
+  # to a throwaway path (never WORKTREES_DIR). Pin JOURNAL_FILE to the fixture so the summer
+  # actually reads the $7.50 we just wrote — without this the suite runner gets 0.000000.
+  export JOURNAL_FILE="$WT_A/.herd/journal.jsonl"
 
   total="$(cost_day_total)"
   case "$total" in 7.5*) : ;; *) fail "cost_day_total should sum ONLY today's cost usd (=7.50), got '$total'" ;; esac
@@ -127,6 +132,9 @@ run_drain() {
     _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     export WORKTREES_DIR="$TREES"
+    # Pin the fixture journal so budget_daily_exceeded → cost_day_total sees the $7.50 spend
+    # under the suite's HERMETIC_TEST / JOURNAL_FILE hermeticity layer (see Part A).
+    export JOURNAL_FILE="$TREES/.herd/journal.jsonl"
     export BUDGET_DAILY="$1"
     [ "${2:-}" = "force" ] && export HERD_FORCE_SPAWN=1
     _BUDGET_DRAIN_PAUSED=""
@@ -213,6 +221,9 @@ export HERD_SKIP_PREFLIGHT=1
 export HERD_NO_APP=1
 LTREES="$T/ltrees"; mkdir -p "$LTREES"
 write_journal "$LTREES"          # $7.50 spent today, in this lane's own worktrees journal
+# Same JOURNAL_FILE pin as Parts A/B: lane budget_daily_exceeded + journal_append must hit the
+# fixture path (assertions grep LTREES/.herd/journal.jsonl), not a hermetic throwaway.
+export JOURNAL_FILE="$LTREES/.herd/journal.jsonl"
 CFG="$T/lane-config"; export HERD_CONFIG_FILE="$CFG"
 cat > "$CFG" <<EOF
 PROJECT_ROOT="$REPO"

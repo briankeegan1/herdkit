@@ -1387,3 +1387,25 @@ setup() {
   run bash "$REPO/tests/test-worktree-born-stat.sh"
   [ "$status" -eq 0 ]
 }
+
+# ── HERD-257 follow-up: tests landed on main after the initial wire pass ─────────────
+
+@test "hermetic test-bash32-brace-multibyte.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-bash32-brace-multibyte.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-init-posture-profiles.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-init-posture-profiles.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-lifecycle-contracts.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-lifecycle-contracts.sh"
+  [ "$status" -eq 0 ]
+}
+
+@test "hermetic test-watcher-self-restart.sh (HERD-257 wiring) passes" {
+  run bash "$REPO/tests/test-watcher-self-restart.sh"
+  [ "$status" -eq 0 ]
+}

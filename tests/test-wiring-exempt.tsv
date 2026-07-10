@@ -29,3 +29,4 @@ test-sync-guard.sh	pre-existing red: caps-sync guard does not trip on new cmd_* 
 test-sandbox-concurrency.sh	pre-existing red: sandbox concurrency scorecard 33/1 (one checkpoint still fails under current engine); landed ungated
 test-sandbox-posture-matrix.sh	depends on sandbox-concurrency posture legs; pre-existing red (solo-auto/full-auto fail) while concurrency sim is red; landed ungated
 test-tracked-spawns.sh	pre-existing red: case 11 task remainder keeps a leading newline/space (' build the thing'); landed ungated
+test-sandbox-self-restart.sh	pre-existing red: self-restart sandbox scorecard 7/6 (engine-delta quiesce sim not green on this branch); landed ungated via main merge — wire once the sim is green
