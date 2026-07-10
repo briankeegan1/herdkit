@@ -379,9 +379,28 @@ ok; echo "PASS (14) local backends (file, changelog) never feed the tracker-crea
 # Source sweep.sh through agent-watch.sh's lib seam, exactly as `herd sweep` does.
 SWTREES="$T/swtrees"; SWQ="$SWTREES/backlog-queue"; mkdir -p "$SWTREES"
 SWBACKENDS="$T/swbackends"; mkdir -p "$SWBACKENDS"
-# A backend whose single-item read resolves HERD-1 and nothing else — so the leg can PROVE a miss.
+# The TRI-STATE probe: 1 = exists, 0 = provably missing (the API answered, zero matches), 2 = UNPROVEN.
+# HERD-77 stands in for a ref the tracker refuses to answer about (auth error / outage / rate limit).
 cat > "$SWBACKENDS/stub.sh" <<'SWEOF'
-_backend_show_item() { case "$1" in HERD-1) printf 'HERD-1 exists\n'; return 0 ;; *) return 1 ;; esac; }
+_backend_item_missing() {
+  case "$1" in
+    HERD-1)    return 1 ;;   # exists
+    HERD-4242) return 0 ;;   # the API answered: nothing there
+    *)         return 2 ;;   # we do not know
+  esac
+}
+_backend_add_item() { _BACKEND_RESULT="DONE"; }
+_backend_list_open() { :; }
+SWEOF
+# A backend with NO tri-state probe at all (the pre-fix shape): every identifier must read UNPROVEN.
+cat > "$SWBACKENDS/noprobe.sh" <<'SWEOF'
+_backend_show_item() { return 1; }   # collapses not-found and every transport failure — unusable as proof
+_backend_add_item() { _BACKEND_RESULT="DONE"; }
+_backend_list_open() { :; }
+SWEOF
+# A backend whose tracker is DOWN: every probe is UNPROVEN. This is the outage that must not relink.
+cat > "$SWBACKENDS/down.sh" <<'SWEOF'
+_backend_item_missing() { return 2; }
 _backend_add_item() { _BACKEND_RESULT="DONE"; }
 _backend_list_open() { :; }
 SWEOF
@@ -391,7 +410,9 @@ cat > "$T/prs.json" <<'PRJSON'
  {"number": 2, "url": "https://x/pull/2", "body": "Refs: tracker-create-selfheal\n"},
  {"number": 3, "url": "https://x/pull/3", "body": "Refs: HERD-4242\n"},
  {"number": 4, "url": "https://x/pull/4", "body": "no ref at all\n"},
- {"number": 5, "url": "https://x/pull/5", "body": "<!-- Refs: HERD-9999 (example) -->\nreal body\n"}
+ {"number": 5, "url": "https://x/pull/5", "body": "<!-- Refs: HERD-9999 (example) -->\nreal body\n"},
+ {"number": 6, "url": "https://x/pull/6", "body": "Refs: HERD-1,\n"},
+ {"number": 7, "url": "https://x/pull/7", "body": "Refs: HERD-77\n"}
 ]
 PRJSON
 SWJOURNAL="$T/sweep-journal.jsonl"; : > "$SWJOURNAL"
@@ -437,11 +458,80 @@ ls "$SWQ" | grep -q 'relink-3' || fail "(10) the unresolvable identifier (PR #3)
 ls "$SWQ" | grep -q 'relink-1' && fail "(10) PR #1's RESOLVABLE ref was wrongly relinked"
 ls "$SWQ" | grep -q 'relink-4' && fail "(10) a ref-less PR was wrongly relinked"
 ls "$SWQ" | grep -q 'relink-5' && fail "(10) a Refs: inside an HTML comment poisoned the extractor"
+ls "$SWQ" | grep -q 'relink-6' && fail "(10) 'Refs: HERD-1,' — trailing punctuation — was read as a non-identifier and relinked"
+ls "$SWQ" | grep -q 'relink-7' && fail "(10) an UNPROVEN ref (the tracker would not answer) was relinked"
+grep -q '"event":"link_heal"' "$SWJOURNAL"   || fail "(10) the relink was not journaled"
+grep -q '"result":"unproven"' "$SWJOURNAL"   || fail "(10) the leg did not journal that it stood down on an unanswerable ref"
+grep -q '🔗' "$SWOUT"                        || fail "(10) the leg narrated nothing"
+grep -q '⏸' "$SWOUT"                         || fail "(10) the stand-down was not narrated"
 head -n1 "$SWQ"/*relink-2*.req | grep -q '^Relink merged PR #2' \
   || fail "(10) the relink request's first line is not a short title (linear turns it into the issue title)"
 grep -q 'SEARCH FIRST' "$SWQ"/*relink-2*.req || fail "(10) the relink request does not instruct a search before filing"
-grep -q '"event":"link_heal"' "$SWJOURNAL"   || fail "(10) the relink was not journaled"
-grep -q '🔗' "$SWOUT"                        || fail "(10) the leg narrated nothing"
-ok; echo "PASS (10) merged PRs with a missing tracker item are detected, narrated, and relinked once"
+ok; echo "PASS (10) relink acts only on a PROVABLE miss: punctuation, comments, and unanswerable refs are left alone"
+
+# ══ (15) A TRACKER OUTAGE IS NOT PROOF THAT THE ITEM IS MISSING ═══════════════════════════════════
+# The blocking regression. sweep_run_safe_legs calls this leg with dry="" on every watcher tick, so
+# reading "the API did not answer" as "the item was never created" writes up to HERD_RELINK_LIMIT
+# duplicate scribe requests and stamps each PR into the one-way seen-ledger. It fires co-incident with
+# an expired key — exactly when create_retry_class is correctly calling creates auth/permanent.
+# Two shapes must both stand down: a tracker that is DOWN, and a backend with no tri-state probe at all.
+for backend in down noprobe; do
+  DTREES="$T/dtrees-$backend"; DQ="$DTREES/backlog-queue"; mkdir -p "$DTREES"
+  DJ="$T/d-$backend.jsonl"; : > "$DJ"
+  set +e
+  (
+    export AGENT_WATCH_LIB=1 HERD_DRIVER=headless HERMETIC_TEST=1
+    export PROJECT_ROOT="$REPO" WORKTREES_DIR="$DTREES" WORKSPACE_NAME=selfhealdown
+    export DEFAULT_BRANCH="origin/main" HERD_CONFIG_FILE="$T/no-such-config"
+    export JOURNAL_FILE="$DJ" SCRIBE_BACKEND="$backend" SCRIBE_BACKEND_DIR="$SWBACKENDS"
+    export HERD_RELINK_PR_JSON="$T/prs.json" CREATE_SELFHEAL=on
+    # shellcheck source=/dev/null
+    . "$WATCH" >/dev/null 2>&1 || exit 9
+    _sweep_reset_counters
+    sweep_leg_links "" > "$T/down-$backend.out" 2>&1
+    # ONLY the slug-only PR #2 is provable without a lookup. Every identifier is UNPROVEN.
+    [ "$SWEEP_N_LINK" -eq 1 ] || { echo "COUNT=$SWEEP_N_LINK"; exit 3; }
+    exit 0
+  )
+  DRC=$?
+  set -e
+  [ "$DRC" -eq 0 ] || fail "(15) [$backend] leg exited $DRC ($(cat "$T/down-$backend.out" 2>/dev/null))"
+  m="$(ls "$DQ"/*relink*.req 2>/dev/null | grep -c . || true)"
+  [ "$m" = "1" ] || fail "(15) [$backend] an unreachable/unprobeable tracker enqueued $m relinks — duplicates incoming"
+  ls "$DQ" | grep -q 'relink-2' || fail "(15) [$backend] the slug-only ref stopped relinking (it needs no lookup)"
+  ls "$DQ" | grep -q 'relink-1' && fail "(15) [$backend] an outage was read as proof that HERD-1 is missing"
+  ls "$DQ" | grep -q 'relink-3' && fail "(15) [$backend] an outage was read as proof that HERD-4242 is missing"
+  grep -q '"result":"unproven"' "$DJ" || fail "(15) [$backend] the stand-down was not journaled"
+  grep -q '⏸' "$T/down-$backend.out"  || fail "(15) [$backend] a zero-finding sweep silently hid the outage"
+done
+ok; echo "PASS (15) an unreachable / unprobeable tracker never proves an item missing (no duplicate filings)"
+
+# ══ (16) linear.sh's TRI-STATE probe tells 'nothing there' from 'no answer' ═══════════════════════
+export LINEAR_API_KEY=x
+# shellcheck source=/dev/null
+. "$LINEAR" >/dev/null 2>&1
+_probe() { _linear_gql() { printf '%s' "$STUBRESP"; }; _backend_item_missing HERD-267; printf '%s' "$?"; }
+STUBRESP='{"data":{"issues":{"nodes":[]}}}';                     [ "$(_probe)" = 0 ] || fail "(16) a clean zero-match answer is not PROVABLY MISSING"
+STUBRESP='{"data":{"issues":{"nodes":[{"identifier":"HERD-267"}]}}}'; [ "$(_probe)" = 1 ] || fail "(16) a resolved issue is not EXISTS"
+STUBRESP='{"errors":[{"message":"Authentication required","extensions":{"code":"AUTHENTICATION_ERROR"}}]}'
+[ "$(_probe)" = 2 ] || fail "(16) an AUTH error was read as 'missing' — an expired key would relink every PR"
+STUBRESP='{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}],"data":null}'
+[ "$(_probe)" = 2 ] || fail "(16) a RATE LIMIT was read as 'missing'"
+STUBRESP=''                                                    ; [ "$(_probe)" = 2 ] || fail "(16) an empty body (unreachable host) was read as 'missing'"
+STUBRESP='<html>502 Bad Gateway</html>'                        ; [ "$(_probe)" = 2 ] || fail "(16) an unparseable body was read as 'missing'"
+STUBRESP='{"data":{}}'                                         ; [ "$(_probe)" = 2 ] || fail "(16) a data envelope with no issues key was read as 'missing'"
+# A curl that cannot reach the host: _linear_gql itself fails.
+_linear_gql() { return 7; }; [ "$(_backend_item_missing HERD-267 >/dev/null 2>&1; printf '%s' "$?")" = 2 ] \
+  || fail "(16) a transport failure was read as 'missing'"
+ok; echo "PASS (16) linear's tri-state probe: missing / exists / UNPROVEN are three distinct answers"
+
+# ══ (17) THE Refs: EXTRACTOR IS ONE IMPLEMENTATION, SHARED ═══════════════════════════════════════
+# sweep.sh must not carry a second copy of merge-time reconcile's parser (docs/multi-seat-doctrine.md).
+grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/agent-watch.sh" || fail "(17) the shared extractor is gone"
+grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/sweep.sh" \
+  || fail "(17) sweep.sh no longer reuses the shared Refs: extractor"
+grep -q 'refs:' "$HERE/../scripts/herd/sweep.sh" \
+  && fail "(17) sweep.sh re-implements the Refs: regex instead of reusing HERD_PR_REF_PY"
+ok; echo "PASS (17) one Refs: implementation, reused at both surfaces"
 
 echo "ALL PASS ($PASS checks)"

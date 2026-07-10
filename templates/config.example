@@ -246,6 +246,21 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Combination is fail-safe: ANY member's BLOCK blocks the merge; a merge needs >=1 PASS and zero BLOCKs.
 # REVIEW_PANEL="1"         # concurrent reviewer passes when NATIVE_BURST=on (default 1)
 
+# mixed-vendor review panel (HERD-276) — one panelist per model ref, each launched through its OWN
+# runtime. Refs are optionally driver-qualified '<driver>:<model>' (see templates/drivers/*.driver).
+#   unset  default — DORMANT: the panel stays single-model on REVIEW_MODEL, byte-identical to today.
+#   set    panel size = the REF COUNT (REVIEW_PANEL is not consulted) and the panel engages even at
+#          one ref. NATIVE_BURST only decides whether the panelists run CONCURRENTLY (bounded by
+#          REVIEW_CONCURRENCY) or serially. A panelist whose driver binary is missing at dispatch
+#          reports INFRA, never a false BLOCK. `herd config set` validates every ref eagerly.
+# REVIEW_PANEL_MODELS=""   # e.g. "opus codex:gpt-5 grok:grok-4"
+# how the panel's per-panelist verdicts fold into the ONE verdict the merge gate reads:
+#   any-block  default — any BLOCK blocks; else any PASS passes; else INFRA (retry, never a cached BLOCK)
+#   all-pass   every DISPATCHED panelist must PASS; a silent panelist is a coverage gap → INFRA
+#   majority   blocks >= passes → BLOCK (ties fail safe toward BLOCK); a lone dissenter no longer blocks
+# A typo'd value fails STRICT to any-block, never to the laxest policy.
+# REVIEW_PANEL_POLICY="any-block"  # any-block (default) | all-pass | majority
+
 # stale-duplicate gate (HERD-188) — on (default) | off. on → the watcher HOLDS (never auto-merges,
 # loud 🛑 row + one PR comment) any PROVABLE stale duplicate BEFORE review/merge: a PR whose tracked
 # 'Refs: <ID>' item already shipped via another merged PR, OR whose touched files were materially

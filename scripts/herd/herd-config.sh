@@ -507,6 +507,21 @@ fi
 # today's byte-identical behavior (the panel only engages at >1 AND with NATIVE_BURST=on). Combination
 # is fail-safe: ANY member's BLOCK blocks the merge; a merge needs at least one PASS and zero BLOCKs.
 : "${REVIEW_PANEL:="1"}"         # concurrent reviewer passes when NATIVE_BURST=on (default 1 = single reviewer)
+# REVIEW_PANEL_MODELS (HERD-276) — the MIXED-VENDOR review panel. A space-separated list of model refs,
+# each optionally runtime-qualified as '<driver>:<model>' (HERD-151); ONE PANELIST PER REF, each
+# dispatched through its OWN runtime. Unset (default) → dormant: the panel stays single-model on
+# $REVIEW_MODEL and behavior is byte-identical. Set → the panel size is the REF COUNT (it no longer
+# reads REVIEW_PANEL) and it engages even at one ref; NATIVE_BURST only decides whether the panelists
+# run CONCURRENTLY (bounded by REVIEW_CONCURRENCY) or serially. A panelist whose driver binary is
+# absent at dispatch reports INFRA, never a false BLOCK. `herd config set` validates every ref eagerly.
+: "${REVIEW_PANEL_MODELS:=""}"   # e.g. "opus codex:gpt-5 grok:grok-4" — unset = single-model panel
+# REVIEW_PANEL_POLICY (HERD-276) — how the panel's per-panelist verdicts fold into ONE gate verdict.
+# any-block (default, today's fail-safe: any BLOCK blocks) | all-pass (every dispatched panelist must
+# PASS; a silent panelist is a coverage gap → INFRA, not a pass) | majority (blocks >= passes → BLOCK,
+# so a lone dissenting vendor no longer blocks; ties fail safe toward BLOCK). Resolved in exactly one
+# place (scripts/herd/review-panel.sh) so every enforcement surface folds identically. An unrecognized
+# value is a typo and fails STRICT to any-block — never to the laxest policy.
+: "${REVIEW_PANEL_POLICY:="any-block"}"  # any-block (default) | all-pass | majority
 # SPAWN_AHEAD — advisory spawn-rate lead over the review gate (herd-spawn-gate.sh, sourced by the
 # lanes). When the review pipeline is saturated (live+queued reviews ≥ REVIEW_CONCURRENCY), a lane
 # HOLDS a new spawn once in-flight builders already exceed REVIEW_CONCURRENCY + SPAWN_AHEAD — so the

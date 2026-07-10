@@ -237,6 +237,10 @@ REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_CONCURRENCY	unit	tests/test-gate-dispatch.sh
 NATIVE_BURST	unit	tests/test-native-burst.sh
 REVIEW_PANEL	unit	tests/test-native-burst.sh
+REVIEW_PANEL_MODELS	unit	tests/test-review-panel-models.sh
+REVIEW_PANEL_MODELS	sim	scripts/herd/sim/sandbox-scenario.sh
+REVIEW_PANEL_POLICY	unit	tests/test-review-panel-models.sh
+review-panel.sh	unit	tests/test-review-panel-models.sh
 SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh

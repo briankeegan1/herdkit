@@ -221,9 +221,11 @@ create_retry_path_key() {
     esac
 }
 
-# create_retry_enqueue <text> <class> <error> [entry-hash] — record (or COALESCE onto) a durable entry
-# for a create that failed, and print the entry's hash. This is the function that makes the incident
-# unrepeatable: after it returns, the request text exists on disk regardless of what happens next.
+# create_retry_enqueue <text> <class> <error> [entry-hash] [src-file] — record (or COALESCE onto) a
+# durable entry for a create that failed, and print the entry's hash. This is the function that makes
+# the incident unrepeatable: after it returns, the request text exists on disk regardless of what
+# happens next. <src-file> is the claimed `.req`, and when present its bytes — not <text> — are what
+# gets stored and hashed.
 #
 # An existing entry for the same request has its attempt count bumped and its next-attempt pushed out
 # by the exponential backoff. The entry becomes PERMANENT — never re-injected again — when the class
@@ -239,12 +241,12 @@ create_retry_path_key() {
 # still holds the ONLY copy — it must NOT delete the claimed request file. This is the one function in
 # the engine whose failure mode is the incident itself, so it does not get to fail silently.
 create_retry_enqueue() {
-    local text="$1" class="${2:-unknown}" err="${3:-}" key="${4:-}" dir hash meta attempts first now next state max
+    local text="$1" class="${2:-unknown}" err="${3:-}" key="${4:-}" src="${5:-}" dir hash meta attempts first now next state max
     create_retry_enabled || return 0
-    [ -n "$text" ] || return 0
+    [ -n "$text" ] || [ -f "$src" ] || return 0
     dir="$(create_retry_dir)" || { _create_retry_write_failed "no WORKTREES_DIR — cannot locate the retry queue"; return 1; }
     mkdir -p "$dir" 2>/dev/null || { _create_retry_write_failed "cannot create $dir"; return 1; }
-    hash="$(create_retry_key "$text" "$key")"
+    hash="$(create_retry_key "$text" "$key" "$src")"
     [ -n "$hash" ] || { _create_retry_write_failed "no digest tool (shasum/sha1sum/python3) — cannot key the entry"; return 1; }
     meta="$dir/$hash.meta"
     now="$(_create_retry_now)"
@@ -266,9 +268,19 @@ create_retry_enqueue() {
     # .text (harmless, and recoverable by hand) rather than a meta row pointing at nothing. An entry
     # that ALREADY holds text is never overwritten — on a retry the caller's $text has passed through
     # the drainer's LLM, and the copy on disk is the ORIGINAL. Keeping the original is the point.
+    #
+    # The claimed `.req` ($src), when we have it, is COPIED verbatim: it is the requester's own bytes,
+    # while $text is whatever the drainer chose to pass along. The file header promises byte-for-byte,
+    # and a `printf '%s' "$text"` cannot keep that promise (command substitution alone eats trailing
+    # newlines). Fall back to $text only when the claimed file is gone.
     if [ ! -f "$dir/$hash.text" ]; then
-        printf '%s' "$text" > "$dir/$hash.text" 2>/dev/null \
-          || { _create_retry_write_failed "cannot write $dir/$hash.text"; return 1; }
+        if [ -n "$src" ] && [ -f "$src" ]; then
+            cp "$src" "$dir/$hash.text" 2>/dev/null \
+              || { _create_retry_write_failed "cannot copy $src to $dir/$hash.text"; return 1; }
+        else
+            printf '%s' "$text" > "$dir/$hash.text" 2>/dev/null \
+              || { _create_retry_write_failed "cannot write $dir/$hash.text"; return 1; }
+        fi
     fi
     # A missing meta means the entry is never due and never renders — the text would sit on disk
     # unseen. That is a failed durable write too, so say so and keep the caller's copy alive.
@@ -305,17 +317,19 @@ create_retry_enqueue() {
 # being re-injected. A first-time success calls this too and removes nothing (no entry exists), which
 # is what keeps the happy path byte-identical.
 #
-# Either argument alone is enough: `<text>` for an ordinary request, or `"" <entry-hash>` for a
-# terminal verb (skip / amend / update-state) that never sees the item text but was handed a
-# re-injected `*-retry-<hash>.req`. Without the latter form such an entry would re-inject on every
-# backoff expiry forever, never advancing its attempt count toward CREATE_RETRY_MAX. Returns 0 always.
+# Any one argument is enough: `<text>` for an ordinary request, `"" <entry-hash>` for a terminal verb
+# (skip / amend / update-state) that never sees the item text but was handed a re-injected
+# `*-retry-<hash>.req`, or `<src-file>` for the claimed `.req` itself. Without the second form such an
+# entry would re-inject on every backoff expiry forever, never advancing its attempt count toward
+# CREATE_RETRY_MAX. The key is resolved by create_retry_key, so resolve and enqueue always agree on
+# identity — including the byte-for-byte `.req` hash. Returns 0 always.
 create_retry_resolve() {
     local dir hash
     create_retry_enabled || return 0
-    [ -n "${1:-}" ] || [ -n "${2:-}" ] || return 0
+    [ -n "${1:-}" ] || [ -n "${2:-}" ] || [ -f "${3:-}" ] || return 0
     dir="$(create_retry_dir)" || return 0
     [ -d "$dir" ] || return 0
-    hash="$(create_retry_key "${1:-}" "${2:-}")"
+    hash="$(create_retry_key "${1:-}" "${2:-}" "${3:-}")"
     [ -n "$hash" ] || return 0
     [ -f "$dir/$hash.meta" ] || [ -f "$dir/$hash.text" ] || return 0
     rm -f "$dir/$hash.meta" "$dir/$hash.text" 2>/dev/null || true

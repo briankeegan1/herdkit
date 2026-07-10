@@ -138,19 +138,23 @@ _report_and_cleanup() {
 # THE CLAIM IS ONLY DROPPED ONCE THE TEXT IS SAFE. If the durable write fails, we KEEP the claimed
 # `.req` (the sole surviving copy) and exit non-zero rather than print "request SAVED" over a request
 # we just lost. The `next` reclaim (find -mmin +5) then returns it to the queue for a later drainer.
+#
+# The claimed `.req` is handed to both calls as the BYTE SOURCE. It is still on disk at this point and
+# holds the requester's own bytes, whereas $text is whatever the drainer chose to pass along — and the
+# retry queue promises to store the request "byte-for-byte as the requester wrote it".
 _scribe_post_add() {
   local mine="$1" text="$2" cls key
   key="$(create_retry_path_key "$mine")"
   if create_retry_enabled && _scribe_backend_dispatches_creates && [ "${_BACKEND_RESULT:-}" != "DONE" ]; then
     cls="$(create_retry_class "${_BACKEND_ERROR:-}")"
-    if ! create_retry_enqueue "$text" "$cls" "${_BACKEND_ERROR:-}" "$key" >/dev/null; then
+    if ! create_retry_enqueue "$text" "$cls" "${_BACKEND_ERROR:-}" "$key" "$mine" >/dev/null; then
       echo "scribe-step: the tracker refused this create AND the durable retry write failed — LEAVING the request claimed at $mine so it is not lost. Fix the retry queue ($WORKTREES_DIR/.create-retry), then let the reclaim re-queue it. [HERD-267]" >&2
       exit 1
     fi
     _report_and_cleanup "$mine" "$(create_retry_label "$cls") — request SAVED for retry (not lost)" "RETRY"
     return 0
   fi
-  create_retry_resolve "$text" "$key"
+  create_retry_resolve "$text" "$key" "$mine"
   _report_and_cleanup "$mine" "$text" "$_BACKEND_RESULT"
 }
 
