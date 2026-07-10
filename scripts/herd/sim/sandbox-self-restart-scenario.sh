@@ -257,6 +257,7 @@ _held_review=$([ -z "$(ls "$TREES"/.review-inflight-$PR2-* 2>/dev/null)" ] && ! 
 _RESOLVE_RECORDED=""
 record_resolve_attempt() { _RESOLVE_RECORDED=1; }
 spawn_resolver "$SLUG2" "$PR2" "feat/$SLUG2" "$SHA2"
+_spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
 _held_resolver=$([ -z "$_RESOLVE_RECORDED" ] && echo 0 || echo 1)
 
 assert no_new_dispatch \

@@ -491,9 +491,12 @@ _sweep_proc_cwd() {
 # naive ppid==1 scan. Killing it would destroy in-flight gate work and strand the PR behind a
 # corpse — the precise failure HERD-185 set out to end. So leg 4 skips any pid a live marker owns,
 # and leaves it to _sweep_gate_corpses, which reaps it only once it is provably dead or past deadline.
+# HERD-237: .spawn-inflight-* joins the two gate families. The tick now forks its builder-lane and
+# resolver dispatches too, and a lane reparented to init by a watcher death is a live worker holding a
+# claimed spawn intent — not an orphan. Killing it strands the claim behind a lane that never lands.
 _sweep_live_marker_pids() {
   local f
-  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-*; do
+  for f in "$TREES"/.review-inflight-* "$TREES"/.health-inflight-* "$TREES"/.spawn-inflight-*; do
     [ -e "$f" ] || continue
     _marker_live "$f" || continue
     _marker_pid "$f"
@@ -572,7 +575,10 @@ _sweep_watcher_has_gate_child() {
   while read -r cpid cppid cpgid ccmd; do
     [ "$cppid" = "$parent" ] || continue
     case " $ccmd " in
+      # gate workers (HERD-245) + the backgrounded lane dispatches (HERD-237): a tagged fork that
+      # parents any of these is mid-flight work this seat spawned, never a duplicate watcher.
       *healthcheck.sh*|*herd-review.sh*) return 0 ;;
+      *herd-feature.sh*|*herd-quick.sh*|*herd-resolve.sh*) return 0 ;;
     esac
   done <<EOF
 $table

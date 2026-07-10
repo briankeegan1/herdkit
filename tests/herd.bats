@@ -539,6 +539,18 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic gh availability guard (HERD-237) test passes" {
+  run bash "$REPO/tests/test-watcher-gh-timeout.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "tick availability sim: a hung gh and a slow lane never wedge the tick (HERD-237)" {
+  run bash "$REPO/scripts/herd/sim/tick-availability-sim.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "herd render produces no leftover template tokens for this repo" {
   run bash "$REPO/bin/herd" render
   [ "$status" -eq 0 ]
