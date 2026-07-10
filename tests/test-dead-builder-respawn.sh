@@ -306,7 +306,16 @@ ok
 # decision state) are deliberately left for _reconcile_dead_builder / the reap to own.
 [ -z "$(limit_state corpse-slug)" ]                      || fail "(7) a stale limit target survived — would inject --continue into the fresh builder"
 [ -z "$(sendkeys_state corpse-slug)" ]                   || fail "(7) a stale sendkeys row survived the corpse reap"
-grep -q '"reaped":"pane,tab,limit"' "$JOURNAL_FILE"      || fail "(7) the corpse-reap event should name what it reaped: $(grep builder_corpse_reaped "$JOURNAL_FILE")"
+grep -q '"reaped":"limit,sendkeys,pane,tab"' "$JOURNAL_FILE" || fail "(7) the corpse-reap event should name each ledger it reaped separately: $(grep builder_corpse_reaped "$JOURNAL_FILE")"
+ok
+
+# (7b) the journal label is forensic output: a sendkeys-only purge must not be journaled as 'limit'.
+reset
+corpse_world label-slug
+record_sendkeys label-slug 900 cleared          # NO limit row
+_reap_builder_corpse label-slug "$T/wt-corpse" >/dev/null
+grep -q '"reaped":"sendkeys,pane,tab"' "$JOURNAL_FILE" \
+  || fail "(7b) a sendkeys-only purge must journal 'sendkeys', not 'limit': $(grep builder_corpse_reaped "$JOURNAL_FILE")"
 ok
 
 # ── (8) a corpse that CANNOT be retired blocks the respawn BEFORE a tab is created ─────────────────
@@ -337,8 +346,19 @@ ok
 
 reset
 corpse_world headless-slug
+record_limit    headless-slug 900 999999 scheduled
+record_sendkeys headless-slug 900 cleared
 HERD_DRIVER=headless _reap_builder_corpse headless-slug "$T/wt-corpse" || fail "(9) headless corpse reap must succeed"
 [ -s "$HERDR_ACTION_LOG" ] && fail "(9) headless has no panes/tabs — the corpse reap must touch herdr not at all"
+ok
+
+# (9b) …but the MARKER purge is driver-independent. A headless builder that limit-parked and then died
+#      is respawned by the same DEAD_BUILDER_AUTORESPAWN path, and a surviving limit row would schedule
+#      `claude --continue` into the fresh agent exactly as under herdr. The headless skip covers only
+#      the pane/tab half — there is no pane to close, but there is still a poisonous marker to drop.
+[ -z "$(limit_state headless-slug)" ]    || fail "(9b) headless skipped the stale limit purge — --continue would reach the fresh builder"
+[ -z "$(sendkeys_state headless-slug)" ] || fail "(9b) headless skipped the stale sendkeys purge"
+grep -q '"reaped":"limit,sendkeys"' "$JOURNAL_FILE" || fail "(9b) the headless purge must still be journaled: $(grep builder_corpse_reaped "$JOURNAL_FILE")"
 ok
 
 echo "ALL PASS ($pass checks)"

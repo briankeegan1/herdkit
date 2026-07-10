@@ -295,6 +295,25 @@ assert "abandoned · I6 the release is journaled" journaled "$scn" claim_release
 assert "abandoned · I5 the 💀 notification names the released claim" grep -q 'released — re-pickable' "$scn/notify.log"
 assert "abandoned · autorespawn off ⇒ the corpse is left exactly as found (byte-inert)" test "$(agents_named "$scn" "$SLUG")" = 1
 
+# ── stage: PRE-COMMIT, abandoned, but the tracker write CANNOT LAND (unreachable remote) ─────────
+# For the file backend the tracker IS the remote's BACKLOG.md — it is what every other operator reads.
+# A release whose push is rejected leaves the item wedged there, so reporting it released (and saying
+# "re-pickable" on the 💀) is strictly worse than the wedge: the second seat still aborts on ALREADY,
+# now without a warning. The recovery must fail LOUD, keep the claim, and strand no `Release:` commit
+# for the next `pull --rebase` + push to carry onto whatever that seat has since landed on the line.
+scn="$ART/s-pushfail"; SLUG=pushfail
+fixture "$scn" "$SLUG" clean live
+git -C "$scn/main" remote add origin "$scn/no-such-remote.git"
+head0="$(git -C "$scn/main" rev-parse HEAD)"
+v="$(CLAIM_RELEASE=release two_ticks "$scn" "$SLUG")"
+assert "pushfail · a dead builder whose claim cannot be released still crosses into DEAD" test "$v" = DEAD
+assert "pushfail · I5 the item stays claimed — the remote never saw the release" test "$(claimed "$scn")" = yes
+refute "pushfail · I5/I6 an unlanded release is NOT journaled as claim_released" journaled "$scn" claim_released
+assert "pushfail · I5 the 💀 notification says the claim is STILL HELD" grep -q 'still held' "$scn/notify.log"
+refute "pushfail · I5 the 💀 notification never calls a wedged item re-pickable" grep -q 're-pickable' "$scn/notify.log"
+assert "pushfail · no orphan 'Release:' commit is stranded on the branch" test "$(git -C "$scn/main" rev-parse HEAD)" = "$head0"
+assert "pushfail · the main checkout is left clean, never half-applied" test -z "$(git -C "$scn/main" status --porcelain)"
+
 # ── stage: MID-WORK (commits). Recovery must destroy nothing and must NOT hand the item away. ────
 scn="$ART/s-commits"; SLUG=midwork
 fixture "$scn" "$SLUG" commits live

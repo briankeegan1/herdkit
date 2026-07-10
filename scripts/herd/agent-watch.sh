@@ -9018,7 +9018,10 @@ _maybe_release_claim() {
   _mr_who="$(_herd_claim_identity)"; [ -n "$_mr_who" ] || _mr_who="unknown-operator"
   _mr_out="$(herd_claim_release "$_mr_ref" "$_mr_who" "$_mr_slug" dead-builder)"
   case "$_mr_out" in
-    released)    printf ' · claim %s released — re-pickable' "$_mr_ref" ;;
+    # The dead builder's WORKTREE still stands (this reconcile never reaps it — retirement owns that on
+    # its own cadence). Say so: whoever re-picks the item hits `git worktree add` on an existing path
+    # otherwise, and reads the collision as a herdkit bug rather than as leftover from a death.
+    released)    printf ' · claim %s released — re-pickable (sweep its worktree first)' "$_mr_ref" ;;
     flagged)     printf ' · claim %s still held — re-queue it' "$_mr_ref" ;;
     unsupported) printf ' · claim %s still held (backend cannot release) — re-queue it' "$_mr_ref" ;;
     notours)     printf ' · claim %s belongs to another operator — left alone' "$_mr_ref" ;;
@@ -9162,16 +9165,34 @@ _classify_respawn() {
 # rule has nothing to order here. What it does tell us still holds: `claude` is the pane's ROOT
 # process, so closing the corpse's tab is what actually frees its agent name.
 
-# _reap_builder_corpse <slug> — retire the dead builder's registry row + its tab, and drop the
-# slug-keyed markers a reincarnated agent must not inherit. Returns 0 iff the agent NAME is free
+# _reap_builder_corpse <slug> [worktree] — drop the slug-keyed markers a reincarnated agent must not
+# inherit, then retire the dead builder's registry row + its tab. Returns 0 iff the agent NAME is free
 # afterwards (nothing left holding it), which is the only postcondition the respawn depends on.
 # Everything is fail-soft + idempotent: no corpse, no herdr, or a headless driver all no-op to success.
+# The MARKER purge runs under every driver; only the pane/tab half is herdr-specific.
 _reap_builder_corpse() {
   local _rc_slug="$1" _rc_wt="${2:-}" _rc_pane _rc_tab _rc_reaped=""
+
+  # 0. The slug-keyed markers a FRESH agent in this same worktree must not inherit. FIRST, and above the
+  #    headless return, because these are plain files with nothing to do with panes: a stale limit target
+  #    would schedule a `claude --continue` into the new builder, and a stale sendkeys row would suppress
+  #    the clean menu-select on its first real park — and both hazards exist under EVERY driver. (The
+  #    dead anchor and the respawn budget deliberately survive: the caller is mid-decision on both.)
+  if [ -n "$(limit_state "$_rc_slug")" ]; then
+    clear_limit "$_rc_slug" "$_rc_wt"
+    _rc_reaped="${_rc_reaped}limit,"
+  fi
+  if [ -n "$(sendkeys_state "$_rc_slug")" ]; then
+    clear_sendkeys "$_rc_slug"
+    _rc_reaped="${_rc_reaped}sendkeys,"
+  fi
+
   # headless has no tabs/panes and its `start_agent` overwrites the registry entry outright — there is
-  # no name to free, so the corpse reap is a no-op there (and must stay byte-inert).
-  [ "$(herd_driver_name)" = "headless" ] && return 0
-  command -v herdr >/dev/null 2>&1 || return 0
+  # no name to free, so the pane/tab half of the reap is a no-op there.
+  if [ "$(herd_driver_name)" = "headless" ] || ! command -v herdr >/dev/null 2>&1; then
+    [ -n "$_rc_reaped" ] && journal_append builder_corpse_reaped slug "$_rc_slug" reaped "${_rc_reaped%,}"
+    return 0
+  fi
 
   # 1. The corpse's own agent pane, if the registry still names one. `claude` is the pane's ROOT
   #    process, so closing the pane is what retires the agent row and frees the name. Routed through
@@ -9192,16 +9213,6 @@ _reap_builder_corpse() {
     _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rc_tab"
     _rc_reaped="${_rc_reaped}tab,"
   done < <(_slug_builder_tab_ids "$_rc_slug")
-
-  # 3. The slug-keyed markers a FRESH agent in this same worktree must not inherit. The dead anchor and
-  #    the respawn budget deliberately survive — the caller is mid-decision on both — but a stale limit
-  #    target would schedule a `claude --continue` into the new builder, and a stale sendkeys row would
-  #    suppress the clean menu-select on its first real park.
-  if [ -n "$(limit_state "$_rc_slug")" ] || [ -n "$(sendkeys_state "$_rc_slug")" ]; then
-    clear_limit "$_rc_slug" "$_rc_wt"
-    clear_sendkeys "$_rc_slug"
-    _rc_reaped="${_rc_reaped}limit,"
-  fi
 
   [ -n "$_rc_reaped" ] && journal_append builder_corpse_reaped slug "$_rc_slug" reaped "${_rc_reaped%,}"
 

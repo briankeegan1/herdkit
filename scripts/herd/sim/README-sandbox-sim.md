@@ -554,6 +554,7 @@ constraint is real.
 | --- | --- |
 | pre-commit, agent still registered | the corpse's pane + tab + registry row are reaped **before** the respawn creates anything; exactly one agent and one tab end the tick |
 | pre-commit, autorespawn **off** | nothing will restart it → the tracker **claim is released**, and the 💀 notification says so |
+| pre-commit, abandoned, **remote unreachable** | the release **fails loud**: the item stays claimed, nothing is journaled `claim_released`, the 💀 says *still held* (never "re-pickable"), and no orphan `Release:` commit is stranded on the branch |
 | mid-work (commits) / dirty tree | worktree, branch and tab all survive; the claim is **HELD** — releasing it would invite a duplicate build on unrecovered work |
 | died **again** after its one respawn | the at-most-once budget denies a second respawn (no loop); the claim goes back |
 | limit-parked, then killed | the stale limit + sendkeys rows are purged — no `claude --continue` is injected into the fresh builder |

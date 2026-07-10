@@ -122,6 +122,36 @@ out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice s
 item_line | grep -q '✅'                   || fail "A5b a shipped line was rewritten: $(item_line)"
 ok
 
+# A5c — THE PUSH MUST LAND OR SAY IT DID NOT (review of PR #399). With a remote configured but
+#       unreachable, the local edit + commit succeed and the push is rejected — the remote still shows
+#       the item claimed, which is what every OTHER operator reads. Reporting RELEASED there is worse
+#       than the wedge this feature fixes: the item stays unpickable behind a "re-pickable" message.
+#       The release must report UNREACHABLE, and must leave the checkout exactly as it found it — not
+#       dirty, not ahead, no orphan `Release:` commit for the next pull+push to carry onto someone
+#       else's line.
+: > "$JOURNAL_FILE"
+seed_backlog
+git -C "$REPO" remote add origin "$T/no-such-remote.git" 2>/dev/null || true
+printf -- '- 🚧 wedge-item — a thing to build (claimed by alice)\n' > "$BACKLOG_FILE"
+git -C "$REPO" commit -qam "claim" >/dev/null 2>&1
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
+[ "$out" = unsupported ] || fail "A5c a release whose push is REJECTED must not report success, got '$out'"
+grep -q '"event":"claim_released"' "$JOURNAL_FILE" && fail "A5c an unlanded release must NOT journal claim_released"
+grep -q 'claimed by alice' "$BACKLOG_FILE" || fail "A5c the local backlog must be restored to what the remote still shows: $(item_line)"
+[ "$(git -C "$REPO" rev-parse HEAD)" = "$head_before" ] \
+  || fail "A5c an orphan 'Release:' commit was left on the branch — the next pull+push would carry it onto another operator's line"
+[ -z "$(git -C "$REPO" status --porcelain)" ] || fail "A5c the release left the main checkout dirty"
+ok
+
+# A5d — with NO remote configured, the commit IS the durable write (a solo operator's backlog is local),
+#       so the same release lands and reports RELEASED. The push check must not punish the solo case.
+git -C "$REPO" remote remove origin 2>/dev/null || true
+out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
+[ "$out" = released ] || fail "A5d a solo operator with no remote must still be able to release, got '$out'"
+item_line | grep -q 'claimed by' && fail "A5d the claim stamp survived a local release"
+ok
+
 # A6 — a backend with NO release op degrades to the flag contract: surfaced + journaled, never a red.
 : > "$JOURNAL_FILE"
 out="$(cd "$REPO" && SCRIBE_BACKEND=changelog CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
