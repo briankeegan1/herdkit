@@ -31,7 +31,7 @@
 # create.
 #
 # Sourced (never executed) after herd-config.sh, which provides WORKTREES_DIR. A tiny CLI tail is
-# provided for `herd` and for operators: list | rows | due | reinject <queue-dir> | path.
+# provided for `herd` and for operators: list | rows | due | revive [<hash>|all] | reinject <queue-dir> | path.
 #
 # FAIL-SOFT + BYTE-IDENTICAL WHEN EMPTY, by the same contract as journal.sh: every function returns 0
 # on an unwritable directory, a missing python3, or a malformed entry, and an EMPTY retry directory
@@ -149,6 +149,20 @@ _create_retry_meta_get() {
     sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1
 }
 
+# _create_retry_meta_set <meta-file> <key> <value> — rewrite one header value in place, appending the
+# key when it is absent (an entry written by an older engine). Best-effort; never breaks the caller.
+_create_retry_meta_set() {
+    local meta="$1" k="$2" v="$3"
+    [ -f "$meta" ] || return 0
+    if grep -q "^$k=" "$meta" 2>/dev/null; then
+        sed "s|^$k=.*|$k=$v|" "$meta" > "$meta.tmp" 2>/dev/null \
+          && mv -f "$meta.tmp" "$meta" 2>/dev/null || rm -f "$meta.tmp" 2>/dev/null
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$meta" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # _create_retry_backoff <attempts> — seconds until the next attempt: BASE * 2^(attempts-1), capped at
 # an hour so a long-lived transient outage settles into hourly probes rather than a busy loop.
 _create_retry_backoff() {
@@ -230,8 +244,8 @@ create_retry_path_key() {
 # An existing entry for the same request has its attempt count bumped and its next-attempt pushed out
 # by the exponential backoff. The entry becomes PERMANENT — never re-injected again — when the class
 # is permanent (a cap/auth wall) or the attempts reach CREATE_RETRY_MAX. Permanent means "stop
-# spinning and shout", not "give up": the text is still on disk, the row still renders, and a
-# `herd scribe` once the human raises the cap re-files it.
+# spinning and shout", not "give up": the text is still on disk, the row still renders, and once the
+# human raises the cap `create_retry_revive` re-arms it (`create-retry.sh revive`).
 #
 # Journals scribe_add_failed (every attempt) and create_retry_permanent (on the transition), so the
 # console is not the only place a cap can be learned.
@@ -251,9 +265,18 @@ create_retry_enqueue() {
     meta="$dir/$hash.meta"
     now="$(_create_retry_now)"
 
+    # ATTEMPTS COUNT DISPATCHES, not calls to this function. create_retry_reinject already charged the
+    # attempt when it handed this request back to the drainer (and set dispatched=1); charging it again
+    # here would double-count a retry and trip CREATE_RETRY_MAX at half the intended budget. A failure
+    # that did NOT come from a re-injection — a fresh request, or an identical one filed again — is a
+    # new dispatch and is charged here.
     attempts="$(_create_retry_meta_get "$meta" attempts)"
     case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
-    attempts=$(( attempts + 1 ))
+    if [ "$(_create_retry_meta_get "$meta" dispatched)" = 1 ]; then
+        [ "$attempts" -ge 1 ] || attempts=1
+    else
+        attempts=$(( attempts + 1 ))
+    fi
     first="$(_create_retry_meta_get "$meta" first_seen)"
     case "$first" in ''|*[!0-9]*) first="$now" ;; esac
 
@@ -289,6 +312,7 @@ create_retry_enqueue() {
         printf 'first_seen=%s\n' "$first"
         printf 'next_attempt=%s\n' "$next"
         printf 'state=%s\n' "$state"
+        printf 'dispatched=0\n'
         printf 'last_class=%s\n' "$class"
         printf 'last_error=%s\n' "$(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-300)"
     } > "$meta" 2>/dev/null || { _create_retry_write_failed "cannot write $meta"; return 1; }
@@ -303,7 +327,7 @@ create_retry_enqueue() {
 
     # LOUD, and honest about which kind of red this is. A permanent failure names the human action.
     if [ "$state" = permanent ]; then
-        printf 'create-retry: %s — the request is SAVED (not lost) and will NOT be retried automatically after %d attempt(s). Reason: %s. Fix the cause, then re-drain with `herd scribe` / `herd sweep`. [HERD-267]\n' \
+        printf 'create-retry: %s — the request is SAVED (not lost) and will NOT be retried automatically after %d attempt(s). Reason: %s. Fix the cause, then run `bash scripts/herd/create-retry.sh revive` to re-arm every blocked request. [HERD-267]\n' \
             "$(create_retry_label "$class")" "$attempts" "${err:-no reason reported by the backend}" >&2
     else
         printf 'create-retry: %s — the request is SAVED (not lost) and queued for retry (attempt %d of %s, next in %ds). Reason: %s. [HERD-267]\n' \
@@ -361,20 +385,29 @@ create_retry_due() {
 }
 
 # create_retry_reinject <queue-dir> — copy every DUE entry's text back into the scribe queue as an
-# ordinary .req file and push its next_attempt out by one backoff step. Prints the number re-injected.
+# ordinary .req file, CHARGE the attempt, and push its next_attempt out by one backoff step. Prints the
+# number re-injected.
 #
 # The entry is NOT removed here. If the drainer files it, `create_retry_resolve` removes it; if the
 # drainer dies mid-flight, the entry is still on disk and comes due again — which is precisely the
-# durability the incident lacked. A duplicate .req for an entry already in the queue is possible but
-# harmless: the second drain finds the item already filed, or files a coalescing duplicate the
-# coordinator can close. Losing the text is the only unrecoverable outcome, so the design errs there.
+# durability the incident lacked.
+#
+# A RE-INJECTION IS AN ATTEMPT, and is charged as one (attempts++ and dispatched=1). Charging it here
+# rather than only in create_retry_enqueue is what makes a dying drainer CONVERGE: a request that is
+# handed out and never comes back — the drainer is killed, or routes it somewhere that neither files
+# nor resolves it — would otherwise re-inject on every backoff expiry forever, since only a *failed
+# create* ever incremented the counter. Now the budget is spent by dispatches, so after
+# CREATE_RETRY_MAX of them the entry goes PERMANENT: loud, still holding its text, and no longer
+# spinning. create_retry_enqueue reads dispatched=1 and does not double-charge the same attempt.
 create_retry_reinject() {
-    local q="${1:-}" dir hash n=0 meta attempts next now
+    local q="${1:-}" dir hash n=0 meta attempts next now max state
     create_retry_enabled || { printf '0'; return 0; }
     [ -n "$q" ] && [ -d "$q" ] || { printf '0'; return 0; }
     dir="$(create_retry_dir)" || { printf '0'; return 0; }
     [ -d "$dir" ] || { printf '0'; return 0; }
     now="$(_create_retry_now)"
+    max="${CREATE_RETRY_MAX:-5}"
+    case "$max" in ''|*[!0-9]*) max=5 ;; esac
     while IFS= read -r hash; do
         [ -n "$hash" ] || continue
         meta="$dir/$hash.meta"
@@ -387,16 +420,60 @@ create_retry_reinject() {
         mv "$q/.tmp.retry.$hash" "$q/${now}-retry-${hash}.req" 2>/dev/null || { rm -f "$q/.tmp.retry.$hash"; continue; }
         attempts="$(_create_retry_meta_get "$meta" attempts)"
         case "$attempts" in ''|*[!0-9]*) attempts=1 ;; esac
-        next=$(( now + $(_create_retry_backoff $(( attempts + 1 )) ) ))
-        # Push the deadline out BEFORE the drainer touches it, so a drainer that dies mid-drain does
-        # not leave an entry that re-injects on every single poll.
-        sed "s/^next_attempt=.*/next_attempt=$next/" "$meta" > "$meta.tmp" 2>/dev/null \
-            && mv -f "$meta.tmp" "$meta" 2>/dev/null || rm -f "$meta.tmp" 2>/dev/null
+        attempts=$(( attempts + 1 ))
+        next=$(( now + $(_create_retry_backoff "$attempts") ))
+        state=pending
+        [ "$attempts" -ge "$max" ] && state=permanent
+        # Charge + push the deadline out BEFORE the drainer touches it, so a drainer that dies mid-drain
+        # neither re-injects on every poll nor keeps its budget.
+        _create_retry_meta_set "$meta" attempts "$attempts"
+        _create_retry_meta_set "$meta" next_attempt "$next"
+        _create_retry_meta_set "$meta" dispatched 1
+        _create_retry_meta_set "$meta" state "$state"
+        if [ "$state" = permanent ] && command -v journal_append >/dev/null 2>&1; then
+            journal_append create_retry_permanent reason budget-exhausted attempts "$attempts" hash "$hash"
+        fi
         n=$(( n + 1 ))
     done <<< "$(create_retry_due)"
     if [ "$n" -gt 0 ] && command -v journal_append >/dev/null 2>&1; then
         journal_append create_retry_reinjected count "$n"
     fi
+    printf '%s' "$n"
+}
+
+# create_retry_revive [<hash>|all] — flip PERMANENT entries back to pending and make them due NOW.
+# Prints the number revived.
+#
+# This is the other half of "permanent means stop retrying, never discard". A cap entry sits on disk
+# with its text intact and its row rendering, and the operator raises the cap — at which point there
+# has to be a way to say "try again". Without this verb the printed instruction ("fix the cause, then
+# re-drain") was a dead affordance: create_retry_due filters on state=pending, and nothing ever moved
+# an entry back. The only recovery was hand-editing the .meta.
+#
+# Defaults to `all` because that is the shape of the recovery: a cap or a bad key blocks EVERY create,
+# so every permanent entry is unblocked by the same fix. `attempts` is reset so the revived request
+# gets a full CREATE_RETRY_MAX budget rather than tripping straight back to permanent.
+create_retry_revive() {
+    local want="${1:-all}" dir meta hash n=0 now
+    create_retry_enabled || { printf '0'; return 0; }
+    dir="$(create_retry_dir)" || { printf '0'; return 0; }
+    [ -d "$dir" ] || { printf '0'; return 0; }
+    now="$(_create_retry_now)"
+    for meta in "$dir"/*.meta; do
+        [ -f "$meta" ] || continue
+        hash="$(basename "$meta" .meta)"
+        [ -f "$dir/$hash.text" ] || continue
+        [ "$want" = all ] || [ "$want" = "$hash" ] || continue
+        [ "$(_create_retry_meta_get "$meta" state)" = permanent ] || continue
+        _create_retry_meta_set "$meta" state pending
+        _create_retry_meta_set "$meta" attempts 0
+        _create_retry_meta_set "$meta" dispatched 0
+        _create_retry_meta_set "$meta" next_attempt "$now"
+        n=$(( n + 1 ))
+        if command -v journal_append >/dev/null 2>&1; then
+            journal_append create_retry_revived hash "$hash"
+        fi
+    done
     printf '%s' "$n"
 }
 
@@ -436,8 +513,9 @@ case "${BASH_SOURCE[0]}" in
       due)      create_retry_due ;;
       list)     create_retry_rows ;;
       reinject) create_retry_reinject "${2:?usage: create-retry.sh reinject <queue-dir>}"; printf '\n' ;;
+      revive)   create_retry_revive "${2:-all}"; printf '\n' ;;
       path)     create_retry_dir; printf '\n' ;;
-      *) printf 'usage: create-retry.sh rows | due | reinject <queue-dir> | path\n' >&2; exit 2 ;;
+      *) printf 'usage: create-retry.sh rows | due | revive [<hash>|all] | reinject <queue-dir> | path\n' >&2; exit 2 ;;
     esac
     ;;
 esac

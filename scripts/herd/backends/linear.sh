@@ -612,6 +612,24 @@ if meta:
     }
 }
 
+# _backend_ref_is_identifier <ref> — OPTIONAL. Does <ref> have the shape of an identifier THIS tracker
+# mints? Linear issues are TEAMKEY-NUMBER (HERD-267; a leading '#' is tolerated). Exit 0 = yes, 1 = no.
+#
+# This op exists so the SHAPE of a tracker's ids lives with the tracker, never in generic engine code.
+# The sweep's retroactive-linkage leg needs to know that `Refs: some-branch-slug` on a Linear project
+# is proof no id was ever minted — but that inference is FALSE for the default `file` backend, whose
+# item ref IS a title slug, and meaningless for `changelog`, which has no ids at all. A backend that
+# does not define this op tells the leg "I cannot judge a ref by its shape", and the leg stands down.
+_backend_ref_is_identifier() {
+    local slug="${1#\#}" num key
+    case "$slug" in *-*) ;; *) return 1 ;; esac
+    num="${slug##*-}"
+    key="${slug%-*}"
+    [ -n "$key" ] || return 1
+    case "$num" in ''|*[!0-9]*) return 1 ;; esac
+    return 0
+}
+
 # _backend_item_missing <ref> — OPTIONAL, TRI-STATE existence probe. The ONLY safe basis for an
 # automated "this tracker item was never created" verdict (HERD-267).
 #

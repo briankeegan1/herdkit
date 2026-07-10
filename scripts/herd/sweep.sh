@@ -809,15 +809,31 @@ for p in prs:
 ' 2>/dev/null || true
 }
 
-# _sweep_relink_is_identifier <ref> — does the ref have the SHAPE of a tracker id (TEAMKEY-42, #42)?
-# A ref that fails this is proof-positive that no item was ever minted: the lanes only ever write a
-# bare slug into `Refs:` when the create they asked for came back empty.
-_sweep_relink_is_identifier() {
-  case "${1#\#}" in
-    [0-9]*)  case "${1#\#}" in *[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
-    *-*)     printf '%s' "${1##*-}" | grep -qE '^[0-9]+$' ;;
-    *)       return 1 ;;
-  esac
+# _sweep_relink_backend_file — the ACTIVE backend's implementation path (test seam: SCRIBE_BACKEND_DIR).
+_sweep_relink_backend_file() {
+  printf '%s' "${SCRIBE_BACKEND_DIR:-$_SWEEP_HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
+}
+
+# _sweep_relink_backend_capable — can the ACTIVE backend answer "does this item exist?" at all?
+# True only when it implements the TRI-STATE probe `_backend_item_missing`. The default `file` backend
+# and `changelog` do not (and cannot: `file` records state in $BACKLOG_FILE, `changelog` is append-only
+# with no per-item identity), so on those projects this whole leg is inert — no `gh pr list`, no rows,
+# no enqueue. That is the correct answer, not a degraded one: a tracker with no minted ids has no
+# "the id was never minted" failure to heal.
+_sweep_relink_backend_capable() {
+  local bfile; bfile="$(_sweep_relink_backend_file)"
+  [ -f "$bfile" ] || return 1
+  (
+    # The probe must describe THE ACTIVE BACKEND, never a definition some earlier caller left in this
+    # process. `command -v` finds inherited shell functions, so a stray _backend_item_missing sourced
+    # upstream would make an incapable backend look capable — and a capable-looking `file` backend is
+    # exactly how a title slug gets judged a missing identifier.
+    unset -f _backend_item_missing _backend_ref_is_identifier 2>/dev/null || true
+    # shellcheck source=/dev/null
+    . "$bfile" 2>/dev/null || exit 1
+    command -v _backend_item_missing >/dev/null 2>&1 || exit 1
+    exit 0
+  )
 }
 
 # _sweep_relink_missing <ref> — 0 ONLY when the tracker PROVABLY holds no item for this ref.
@@ -827,10 +843,19 @@ _sweep_relink_is_identifier() {
 # files a duplicate tracker item, and stamps the PR into the one-way seen-ledger so the verdict is
 # never revisited. Two states are provable, and they are asked in this order:
 #
-#   1. the ref is not a tracker identifier at all (a bare slug, a branch name) — proof-positive that
-#      no id was ever minted, and it needs no network at all. This is the incident's own shape.
+#   1. the backend says the ref is not one of ITS identifiers (`_backend_ref_is_identifier` — a bare
+#      slug or branch name where the tracker mints TEAMKEY-42). Proof-positive that no id was ever
+#      minted, and it needs no network. This is the incident's own shape: the create failed, so the
+#      lane had no id to write and shipped the slug.
 #   2. the ref IS an identifier and the backend's TRI-STATE probe answers "the API replied cleanly
 #      with zero matches".
+#
+# THE SHAPE TEST BELONGS TO THE BACKEND, NOT TO US. An earlier revision of this function hardcoded the
+# Linear/GitHub id shape (`#N` / `KEY-N`) into the engine. On the DEFAULT `file` backend, whose item ref
+# IS a title slug, every healthy merged PR carrying `Refs: healthcheck-sha-cache` then failed the shape
+# test and was declared missing WITHOUT THE BACKEND EVER BEING CONSULTED — up to HERD_RELINK_LIMIT
+# duplicate filings per run, each PR stamped seen so the verdict was never revisited. So step 1 now asks
+# the backend, and a backend that does not define the op cannot reach step 1 at all.
 #
 # EVERYTHING ELSE IS UNPROVEN and the leg says nothing: a resolvable item, a backend with no probe op,
 # an unreadable backend file, no credential, an unreachable host, an auth or rate-limit refusal, a 5xx.
@@ -838,7 +863,7 @@ _sweep_relink_is_identifier() {
 # not-found together with every transport and API failure — reading that as "missing" turns a tracker
 # OUTAGE into a burst of duplicate filings (and does so precisely when an expired key is already making
 # create_retry_class mark creates auth/permanent). A tracker that will not answer is not a tracker that
-# said no.
+# said no, and a tracker that does not mint ids never failed to mint one.
 #
 # Sets _SWEEP_RELINK_UNPROVEN=1 when a lookup could not be resolved, so the leg can tell the operator
 # it stood down rather than silently reporting a clean sweep over an unreachable tracker.
@@ -847,21 +872,29 @@ _sweep_relink_is_identifier() {
 # namespace (the same isolation _reconcile_via_ref uses).
 _sweep_relink_missing() {
   local ref="$1" bfile rc
-  _sweep_relink_is_identifier "$ref" || return 0        # (1) provable with no lookup
-  bfile="${SCRIBE_BACKEND_DIR:-$_SWEEP_HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
+  bfile="$(_sweep_relink_backend_file)"
   [ -f "$bfile" ] || { _SWEEP_RELINK_UNPROVEN=1; return 1; }
   (
+    # Only the ACTIVE backend's ops may answer here — see _sweep_relink_backend_capable.
+    unset -f _backend_item_missing _backend_ref_is_identifier 2>/dev/null || true
     # shellcheck source=/dev/null
     [ -f "$MAIN/.herd/secrets" ] && . "$MAIN/.herd/secrets"
     # shellcheck source=/dev/null
     . "$bfile" 2>/dev/null || exit 2
     command -v _backend_item_missing >/dev/null 2>&1 || exit 2   # no tri-state probe → UNPROVEN
+    # (1) The backend's OWN shape test. Only a backend that mints identifiers can declare a ref
+    #     "not one of mine"; without the op we cannot tell a slug-because-the-create-failed from a
+    #     slug-because-that-is-what-this-tracker-calls-an-item.
+    if command -v _backend_ref_is_identifier >/dev/null 2>&1; then
+      _backend_ref_is_identifier "$ref" >/dev/null 2>&1 || exit 0
+    fi
+    # (2) The API's own answer.
     _backend_item_missing "$ref" >/dev/null 2>&1
     exit $?
   )
   rc=$?
   case "$rc" in
-    0) return 0 ;;                                      # (2) the API answered: nothing there
+    0) return 0 ;;                                      # provably missing
     1) return 1 ;;                                      # the item exists
     *) _SWEEP_RELINK_UNPROVEN=1; return 1 ;;            # we do not know — never act on that
   esac
@@ -916,6 +949,11 @@ sweep_leg_links() {
       _sweep_say "⏳" "tracker create queued for retry (${class}, ${attempts} attempt(s)): ${title}"
     fi
   done <<< "$(create_retry_rows 2>/dev/null || true)"
+
+  # A backend that cannot answer "does this item exist?" gets no scan at all — not a `gh pr list`, not
+  # a row, not a stand-down line. On the DEFAULT `file` backend (and on `changelog`) there are no minted
+  # ids, so there is no missing-id failure to heal, and the leg is completely inert.
+  _sweep_relink_backend_capable || return 0
 
   _sweep_relink_scan_due "$throttle" || return 0
 

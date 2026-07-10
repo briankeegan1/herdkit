@@ -4213,11 +4213,30 @@ def pr_ref_from_body(body):
 '
 
 # herd_pr_ref_from_body — read a PR body on stdin, print its `Refs:` value (empty when there is none).
-# The shell-side entry point to HERD_PR_REF_PY. Fail-soft: no python3, unreadable input → empty.
+# The shell-side entry point to HERD_PR_REF_PY.
+#
+# NO-PYTHON3 FALLBACK. python3 is a hard engine dep, but this function sits on the merge tail, and the
+# pre-HERD-267 code degraded to a grep/sed pass rather than silently dropping every explicit ref onto
+# the fuzzy path. That degradation is preserved: the comment strip is what needs python (a multi-line
+# regex), so without it we grep the RAW body — the line-start anchor and the placeholder guard are
+# still a partial defense, exactly as before.
 herd_pr_ref_from_body() {
-  python3 -c "$HERD_PR_REF_PY"'
+  local body ref
+  body="$(cat)"
+  if command -v python3 >/dev/null 2>&1; then
+    ref="$(printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
 import sys
-sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null || true
+sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf '%s' "$ref"; return 0; }
+  fi
+  # Degraded path: same rules, minus the HTML-comment strip.
+  ref="$(printf '%s\n' "$body" \
+    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
+    | head -n1 \
+    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"
+  case "$ref" in
+    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
+  esac
+  printf '%s' "$ref"
 }
 
 # _reconcile_pr_ref <pr#> — deterministic tracker linkage (HERD-39): read the merged PR body and

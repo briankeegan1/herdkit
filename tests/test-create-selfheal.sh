@@ -69,12 +69,14 @@ _backend_add_item() {
   printf 'HERD-900\n'
   _BACKEND_RESULT="DONE"
 }
-_backend_update_state() { _BACKEND_RESULT="DONE"; }
+_backend_update_state() { if [ -s "$T/verb-fails" ]; then _BACKEND_RESULT="NOCHANGE"; else _BACKEND_RESULT="DONE"; fi; }
+_backend_amend() { if [ -s "$T/verb-fails" ]; then _BACKEND_RESULT="NOCHANGE"; else _BACKEND_RESULT="DONE"; fi; }
 _backend_mark_shipped() { :; }
 _backend_list_open() { :; }
 _backend_item_state() { ITEM_STATE="open"; }
 STUBEOF
 : > "$T/fail-with"
+: > "$T/verb-fails"
 
 CFG="$T/config"
 cat > "$CFG" <<CFGEOF
@@ -263,12 +265,14 @@ printf '%s\n' "$OUT" | grep -q '^CLAIMED ' || fail "(5b) the throttled request w
 ok; echo "PASS (5b) a real Linear rate limit stays pending and is retried, never walled"
 
 # ══ (6) the linear backend reports WHY — the fact that was missing during the incident ═══════════
-# shellcheck source=/dev/null
-LINEAR_API_KEY=x . "$LINEAR" >/dev/null 2>&1
-E="$(printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text)"
+# Sourced in a SUBSHELL: linear.sh's _backend_* ops must not leak into this test's process, or a later
+# check would see an incapable backend as capable (shell functions are inherited by subshells).
+E="$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
+     printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text )"
 case "$E" in *USAGE_LIMIT_EXCEEDED*) : ;; *) fail "(6) _linear_error_text dropped the GraphQL error code (got '$E')" ;; esac
 [ "$(create_retry_class "$E")" = cap ] || fail "(6) a real Linear cap refusal does not classify as 'cap'"
-[ -z "$(printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text)" ] \
+[ -z "$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
+        printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text )" ] \
   || fail "(6) a response with no errors array invented an error"
 ok; echo "PASS (6) linear.sh lifts the refusal reason out of the GraphQL response"
 
@@ -338,7 +342,23 @@ for verb in skip amend update-state; do
   esac
   [ "$(entries)" = "0" ] || fail "(12) '$verb' left the durable entry behind — it will re-inject forever"
 done
-ok; echo "PASS (12) skip / amend / update-state release a re-injected entry (no infinite re-inject)"
+# …but a verb whose backend transition FAILS must NOT drop the entry: nothing has acted on the request,
+# so the durable copy is still the only record of it. (`skip` cannot fail — it files nothing by design.)
+printf 'fail\n' > "$T/verb-fails"
+for verb in amend update-state; do
+  rm -rf "$RETRY"; printf 'upstream timeout\n' > "$T/fail-with"
+  p="$(mkreq "81${#verb}" "Unconfirmed via $verb")"
+  NOW=9600 step add-item "$p" "Unconfirmed via $verb"
+  TH="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
+  RQ="$Q/9700-retry-${TH}.req.mine"; printf 'Unconfirmed via %s' "$verb" > "$RQ"
+  case "$verb" in
+    amend)        NOW=9700 step amend "$RQ" "HERD-22" "a note" ;;
+    update-state) NOW=9700 step update-state "$RQ" "HERD-22" "done" ;;
+  esac
+  [ "$(entries)" = "1" ] || fail "(12) an UNCONFIRMED '$verb' discarded the durable entry — the request is lost"
+done
+: > "$T/verb-fails"
+ok; echo "PASS (12) a confirmed terminal verb releases the entry; an unconfirmed one keeps it"
 
 # ══ (13) REINJECT IS DEDUPED — an entry already sitting in the queue is not queued twice ═════════
 rm -rf "$RETRY"; rm -f "$Q"/*.req "$Q"/*.mine 2>/dev/null
@@ -379,9 +399,15 @@ ok; echo "PASS (14) local backends (file, changelog) never feed the tracker-crea
 # Source sweep.sh through agent-watch.sh's lib seam, exactly as `herd sweep` does.
 SWTREES="$T/swtrees"; SWQ="$SWTREES/backlog-queue"; mkdir -p "$SWTREES"
 SWBACKENDS="$T/swbackends"; mkdir -p "$SWBACKENDS"
-# The TRI-STATE probe: 1 = exists, 0 = provably missing (the API answered, zero matches), 2 = UNPROVEN.
+# An ID-MINTING backend (like linear): it declares its own ref SHAPE, and probes with a TRI-STATE
+# answer — 1 = exists, 0 = provably missing (the API answered, zero matches), 2 = UNPROVEN.
 # HERD-77 stands in for a ref the tracker refuses to answer about (auth error / outage / rate limit).
 cat > "$SWBACKENDS/stub.sh" <<'SWEOF'
+_backend_ref_is_identifier() {
+  local s="${1#\#}"; case "$s" in *-*) ;; *) return 1 ;; esac
+  case "${s##*-}" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
 _backend_item_missing() {
   case "$1" in
     HERD-1)    return 1 ;;   # exists
@@ -392,15 +418,26 @@ _backend_item_missing() {
 _backend_add_item() { _BACKEND_RESULT="DONE"; }
 _backend_list_open() { :; }
 SWEOF
-# A backend with NO tri-state probe at all (the pre-fix shape): every identifier must read UNPROVEN.
+# A backend with NO tri-state probe at all (the pre-fix shape): the leg must be entirely inert.
 cat > "$SWBACKENDS/noprobe.sh" <<'SWEOF'
 _backend_show_item() { return 1; }   # collapses not-found and every transport failure — unusable as proof
 _backend_add_item() { _BACKEND_RESULT="DONE"; }
 _backend_list_open() { :; }
 SWEOF
-# A backend whose tracker is DOWN: every probe is UNPROVEN. This is the outage that must not relink.
+# A backend whose tracker is DOWN: it mints ids and declares its shape, but every probe is UNPROVEN.
 cat > "$SWBACKENDS/down.sh" <<'SWEOF'
+_backend_ref_is_identifier() {
+  local s="${1#\#}"; case "$s" in *-*) ;; *) return 1 ;; esac
+  case "${s##*-}" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
 _backend_item_missing() { return 2; }
+_backend_add_item() { _BACKEND_RESULT="DONE"; }
+_backend_list_open() { :; }
+SWEOF
+# A SLUG backend, the shape of the shipped default (`file`): its item ref IS a title slug, it mints no
+# identifiers, and it cannot probe. `Refs: healthcheck-sha-cache` is a perfectly healthy ref here.
+cat > "$SWBACKENDS/slug.sh" <<'SWEOF'
 _backend_add_item() { _BACKEND_RESULT="DONE"; }
 _backend_list_open() { :; }
 SWEOF
@@ -474,8 +511,16 @@ ok; echo "PASS (10) relink acts only on a PROVABLE miss: punctuation, comments, 
 # reading "the API did not answer" as "the item was never created" writes up to HERD_RELINK_LIMIT
 # duplicate scribe requests and stamps each PR into the one-way seen-ledger. It fires co-incident with
 # an expired key — exactly when create_retry_class is correctly calling creates auth/permanent.
-# Two shapes must both stand down: a tracker that is DOWN, and a backend with no tri-state probe at all.
-for backend in down noprobe; do
+# Three shapes must stand down: a tracker that is DOWN, a backend with no tri-state probe, and a SLUG
+# backend (the shipped default `file`) whose refs are title slugs and which mints no ids at all.
+#
+# The slug case is its own regression. An earlier revision hardcoded the Linear/GitHub id shape into
+# _sweep_relink_missing and treated "not #N and not KEY-N" as PROOF of a missing item, WITHOUT ever
+# consulting the backend. On a file-backend project every healthy merged PR carrying
+# `Refs: healthcheck-sha-cache` was declared missing, and the drainer committed the duplicates into
+# BACKLOG.md. The shape test belongs to the backend (_backend_ref_is_identifier); an engine that owns
+# it is an engine that has one consumer's tracker baked into it.
+for backend in down noprobe slug; do
   DTREES="$T/dtrees-$backend"; DQ="$DTREES/backlog-queue"; mkdir -p "$DTREES"
   DJ="$T/d-$backend.jsonl"; : > "$DJ"
   set +e
@@ -487,24 +532,92 @@ for backend in down noprobe; do
     export HERD_RELINK_PR_JSON="$T/prs.json" CREATE_SELFHEAL=on
     # shellcheck source=/dev/null
     . "$WATCH" >/dev/null 2>&1 || exit 9
+    # `down` mints ids and declares its shape, so the SLUG ref (PR #2) is still provable with no lookup
+    # — an outage does not change what `Refs: tracker-create-selfheal` means on a Linear project. Its
+    # IDENTIFIER refs are UNPROVEN. `noprobe` / `slug` cannot answer anything, so the leg is inert.
+    case "$SCRIBE_BACKEND" in down) want=1 ;; *) want=0 ;; esac
     _sweep_reset_counters
-    sweep_leg_links "" > "$T/down-$backend.out" 2>&1
-    # ONLY the slug-only PR #2 is provable without a lookup. Every identifier is UNPROVEN.
-    [ "$SWEEP_N_LINK" -eq 1 ] || { echo "COUNT=$SWEEP_N_LINK"; exit 3; }
+    sweep_leg_links "" > "$T/down-$SCRIBE_BACKEND.out" 2>&1
+    [ "$SWEEP_N_LINK" -eq "$want" ] || { echo "COUNT=$SWEEP_N_LINK want=$want"; exit 3; }
     exit 0
   )
   DRC=$?
   set -e
   [ "$DRC" -eq 0 ] || fail "(15) [$backend] leg exited $DRC ($(cat "$T/down-$backend.out" 2>/dev/null))"
   m="$(ls "$DQ"/*relink*.req 2>/dev/null | grep -c . || true)"
-  [ "$m" = "1" ] || fail "(15) [$backend] an unreachable/unprobeable tracker enqueued $m relinks — duplicates incoming"
-  ls "$DQ" | grep -q 'relink-2' || fail "(15) [$backend] the slug-only ref stopped relinking (it needs no lookup)"
-  ls "$DQ" | grep -q 'relink-1' && fail "(15) [$backend] an outage was read as proof that HERD-1 is missing"
-  ls "$DQ" | grep -q 'relink-3' && fail "(15) [$backend] an outage was read as proof that HERD-4242 is missing"
-  grep -q '"result":"unproven"' "$DJ" || fail "(15) [$backend] the stand-down was not journaled"
-  grep -q '⏸' "$T/down-$backend.out"  || fail "(15) [$backend] a zero-finding sweep silently hid the outage"
+  case "$backend" in
+    down)
+      [ "$m" = "1" ] || fail "(15) [down] enqueued $m relinks; expected only the slug ref (identifiers are UNPROVEN)"
+      ls "$DQ" | grep -q 'relink-2' || fail "(15) [down] the slug ref stopped relinking (it needs no lookup)"
+      ls "$DQ" | grep -q 'relink-1' && fail "(15) [down] an outage was read as proof that HERD-1 is missing"
+      ls "$DQ" | grep -q 'relink-3' && fail "(15) [down] an outage was read as proof that HERD-4242 is missing"
+      grep -q '"result":"unproven"' "$DJ" || fail "(15) [down] the stand-down was not journaled"
+      grep -q '⏸' "$T/down-$backend.out"  || fail "(15) [down] a zero-finding sweep silently hid the outage" ;;
+    noprobe|slug)
+      [ "$m" = "0" ] || fail "(15) [$backend] enqueued $m relink(s) with nothing proven — duplicate filings incoming"
+      ls "$DQ" 2>/dev/null | grep -q 'relink-2' && fail "(15) [$backend] a slug ref was judged missing on a backend that mints no ids"
+      grep -q '🔗' "$T/down-$backend.out" && fail "(15) [$backend] a backend that cannot answer still narrated a relink"
+      grep -q '"event":"link_heal"' "$DJ" && fail "(15) [$backend] a backend that cannot answer still journaled a link_heal" ;;
+  esac
 done
-ok; echo "PASS (15) an unreachable / unprobeable tracker never proves an item missing (no duplicate filings)"
+ok; echo "PASS (15) an outage proves nothing about identifiers; a slug-ref backend proves nothing at all"
+
+# ══ (18) NO CONSUMER'S ID SHAPE IS BAKED INTO THE ENGINE ═════════════════════════════════════════
+# The shape of a tracker's identifiers is the tracker's business. sweep.sh must ask the backend.
+grep -q '_backend_ref_is_identifier' "$HERE/../scripts/herd/sweep.sh" \
+  || fail "(18) sweep.sh no longer delegates the id-shape question to the backend"
+grep -q '_sweep_relink_is_identifier' "$HERE/../scripts/herd/sweep.sh" \
+  && fail "(18) sweep.sh still carries an engine-side tracker id-shape test (project leak)"
+grep -q '_backend_ref_is_identifier' "$HERE/../scripts/herd/backends/linear.sh" \
+  || fail "(18) linear.sh does not declare its own id shape"
+# The shipped local backends must NOT claim to mint identifiers.
+for b in file changelog; do
+  grep -q '_backend_ref_is_identifier' "$HERE/../scripts/herd/backends/$b.sh" \
+    && fail "(18) the $b backend claims an identifier shape it does not have"
+done
+ok; echo "PASS (18) the tracker id shape lives with the tracker, not in generic engine code"
+
+# ══ (19) A DYING DRAINER CONVERGES — a re-injection is an attempt, and the budget is finite ══════
+# create_retry_reinject used to push next_attempt out without charging the attempt, so a drainer that
+# died after re-injection but before reaching the request left the entry pending forever: only a FAILED
+# CREATE ever incremented `attempts`. Now dispatches spend the budget.
+rm -rf "$RETRY"; rm -f "$Q"/*.req "$Q"/*.mine 2>/dev/null
+printf 'upstream timeout\n' > "$T/fail-with"
+p="$(mkreq 970 "Dying drainer")"
+MAXTRY=3 NOW=11000 step add-item "$p" "Dying drainer"
+DD="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
+grep -q '^attempts=1' "$RETRY/$DD.meta" || fail "(19) the first failure did not charge attempt 1"
+rj() { HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on \
+  CREATE_RETRY_MAX=3 HERD_CREATE_RETRY_NOW="$1" bash "$LIB" reinject "$Q" 2>/dev/null; }
+# Each expiry hands the request out; the drainer never comes back (we just delete the .req).
+[ "$(rj 20000)" = "1" ] || fail "(19) not re-injected at the first expiry"
+rm -f "$Q"/*.req
+grep -q '^attempts=2' "$RETRY/$DD.meta" || fail "(19) a dispatch did not charge an attempt"
+[ "$(rj 40000)" = "1" ] || fail "(19) not re-injected at the second expiry"
+rm -f "$Q"/*.req
+grep -q '^attempts=3'   "$RETRY/$DD.meta" || fail "(19) the third dispatch was not charged"
+grep -q '^state=permanent' "$RETRY/$DD.meta" \
+  || fail "(19) the entry never converged on CREATE_RETRY_MAX — a dying drainer spins forever"
+[ "$(rj 90000)" = "0" ] || fail "(19) a PERMANENT entry was re-injected"
+[ -f "$RETRY/$DD.text" ] || fail "(19) converging on the budget discarded the request text"
+ok; echo "PASS (19) a dispatch spends the retry budget, so a dying drainer converges instead of spinning"
+
+# ══ (20) `revive` re-arms a PERMANENT entry — the printed recovery instruction actually works ════
+# The stderr shout tells the operator to fix the cause and re-drain. Before this verb existed nothing
+# ever moved permanent → pending, so the instruction was a dead affordance.
+[ "$(HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on \
+     HERD_CREATE_RETRY_NOW=100000 bash "$LIB" revive)" = "1" ] || fail "(20) revive did not re-arm the permanent entry"
+grep -q '^state=pending' "$RETRY/$DD.meta" || fail "(20) revive left the entry permanent"
+grep -q '^attempts=0'    "$RETRY/$DD.meta" || fail "(20) revive did not restore the attempt budget"
+[ "$(HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on \
+     HERD_CREATE_RETRY_NOW=100000 bash "$LIB" due | grep -c .)" = "1" ] \
+  || fail "(20) a revived entry is not due — it will never be retried"
+grep -q '"event":"create_retry_revived"' "$JOURNAL" || fail "(20) the revive was not journaled"
+# The shout must name the verb that exists.
+grep -q 'create-retry.sh revive' "$HERE/../scripts/herd/create-retry.sh" \
+  || fail "(20) the permanent-entry message does not name a working recovery command"
+rm -f "$Q"/*.req
+ok; echo "PASS (20) 'revive' flips permanent entries back to pending, as the operator message promises"
 
 # ══ (16) linear.sh's TRI-STATE probe tells 'nothing there' from 'no answer' ═══════════════════════
 export LINEAR_API_KEY=x
@@ -532,6 +645,28 @@ grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/sweep.sh" \
   || fail "(17) sweep.sh no longer reuses the shared Refs: extractor"
 grep -q 'refs:' "$HERE/../scripts/herd/sweep.sh" \
   && fail "(17) sweep.sh re-implements the Refs: regex instead of reusing HERD_PR_REF_PY"
-ok; echo "PASS (17) one Refs: implementation, reused at both surfaces"
+# …and it keeps the pre-HERD-267 no-python3 degradation: a host without python3 falls back to the
+# grep/sed pass rather than silently dropping every explicit ref onto the fuzzy reconcile path.
+REF_PY="$(
+  export AGENT_WATCH_LIB=1 HERD_DRIVER=headless HERMETIC_TEST=1 JOURNAL_FILE="$T/nopy.jsonl"
+  export PROJECT_ROOT="$REPO" WORKTREES_DIR="$T/trees" WORKSPACE_NAME=nopy DEFAULT_BRANCH="origin/main"
+  export HERD_CONFIG_FILE="$T/no-such-config"
+  # shellcheck source=/dev/null
+  . "$WATCH" >/dev/null 2>&1 || exit 1
+  printf '<!-- Refs: HERD-1 -->\nRefs: HERD-267.\n' | herd_pr_ref_from_body
+)"
+[ "$REF_PY" = "HERD-267" ] || fail "(17) the shared extractor returned '$REF_PY' (comment strip + punctuation)"
+REF_NOPY="$(
+  export AGENT_WATCH_LIB=1 HERD_DRIVER=headless HERMETIC_TEST=1 JOURNAL_FILE="$T/nopy.jsonl"
+  export PROJECT_ROOT="$REPO" WORKTREES_DIR="$T/trees" WORKSPACE_NAME=nopy DEFAULT_BRANCH="origin/main"
+  export HERD_CONFIG_FILE="$T/no-such-config"
+  # shellcheck source=/dev/null
+  . "$WATCH" >/dev/null 2>&1 || exit 1
+  python3() { return 127; }   # shadow the hard dep: the comment strip cannot run
+  printf 'Refs: HERD-267.\nbody\n' | herd_pr_ref_from_body
+)"
+[ "$REF_NOPY" = "HERD-267" ] \
+  || fail "(17) with python3 unavailable the extractor returned '$REF_NOPY' — every explicit ref would silently fall to the fuzzy path"
+ok; echo "PASS (17) one Refs: implementation, reused at both surfaces, degrading without python3"
 
 echo "ALL PASS ($PASS checks)"

@@ -166,11 +166,15 @@ _scribe_backend_dispatches_creates() {
   case "$SCRIBE_BACKEND" in file|changelog) return 1 ;; *) return 0 ;; esac
 }
 
-# _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL verb that files nothing
-# new (skip / amend / update-state): the drainer decided this request is not an add after all. Drop its
-# durable entry. Without this the entry would re-inject on every backoff expiry forever — `attempts` is
-# only ever bumped by create_retry_enqueue, so it could never converge on CREATE_RETRY_MAX either.
-# A no-op for an ordinary first-attempt request (no retry key in its filename).
+# _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL, SUCCESSFUL outcome:
+# the drainer decided it is not an add after all (skip), or the backend confirmed the transition it
+# routed to (update-state / amend → DONE). Drop its durable entry so it stops being re-injected.
+#
+# Only ever called once the outcome is known. A FAILED transition must NOT close the entry — that
+# would discard the durable copy of a request nothing has yet acted on. Such an entry keeps its place
+# in the queue and, because create_retry_reinject charges each dispatch, converges on
+# CREATE_RETRY_MAX rather than spinning. A no-op for an ordinary first-attempt request (no retry key
+# in its filename).
 _scribe_retry_close() {
   local key; key="$(create_retry_path_key "$1")"
   [ -n "$key" ] || return 0
@@ -372,9 +376,6 @@ case "$cmd" in
     # before this verb existed the drainer's only non-file option was add-item → a junk new issue.
     mine="${2:?claimed path}"; ref="${3:?item ref}"; state="${4:?target state (done|in-progress|canceled)}"
     cd "$REPO" || exit 1
-    # HERD-267: a re-injected retry the drainer re-classified as a state change is terminal here —
-    # release its durable entry, or it re-injects on every backoff expiry forever.
-    _scribe_retry_close "$mine"
     if [ "$SCRIBE_BACKEND" = "file" ]; then
       # The file backend records state IN the file: a state change is a $BACKLOG_FILE edit + commit,
       # not a dispatch. Reaching here means a stale non-file drainer was routed under the file backend
@@ -393,6 +394,10 @@ case "$cmd" in
     _BACKEND_RESULT=""
     _backend_update_state "$ref" "$state"
     sum="$ref → $state"
+    # HERD-267: release a re-injected retry's durable entry ONLY on a CONFIRMED transition. A failed or
+    # unmatched transition leaves the entry alone — dropping it would discard the durable copy of a
+    # request nothing has acted on.
+    [ "$_BACKEND_RESULT" = "DONE" ] && _scribe_retry_close "$mine"
     [ "$_BACKEND_RESULT" = "DONE" ] || sum="$sum (no matching item — nothing changed)"
     _report_and_cleanup "$mine" "$sum" "${_BACKEND_RESULT:-NOCHANGE}"
     ;;
@@ -407,7 +412,6 @@ case "$cmd" in
     # (component=scribe) via the backend's _backend_tw_journal (HERD-85 attribution contract).
     mine="${2:?claimed path}"; ref="${3:?item ref}"; note="${4:?note text}"
     cd "$REPO" || exit 1
-    _scribe_retry_close "$mine"   # HERD-267: terminal for a re-injected retry (see update-state)
     if ! command -v _backend_amend >/dev/null 2>&1; then
       # A backend with no amend op (e.g. changelog — an append-only tracker with no per-item comment
       # surface). FAIL-SOFT: print a soft note and record a skip; never file or post anything.
@@ -418,6 +422,7 @@ case "$cmd" in
     _BACKEND_RESULT=""
     _backend_amend "$ref" "$note"
     if [ "$_BACKEND_RESULT" = "DONE" ]; then
+      _scribe_retry_close "$mine"   # HERD-267: terminal, and CONFIRMED (see update-state)
       _report_and_cleanup "$mine" "↳ amended $ref" "DONE"
     else
       # No unique matching item (ambiguous or not found): the backend already warned loudly on stderr
@@ -431,7 +436,9 @@ case "$cmd" in
     # issue. This is the safety valve that closes the junk-issue path for good. [issue #139]
     mine="${2:?claimed path}"; reason="${3:-unmappable request}"
     cd "$REPO" || exit 1
-    _scribe_retry_close "$mine"   # HERD-267: terminal for a re-injected retry (see update-state)
+    # HERD-267: `skip` cannot fail — its whole outcome is "file nothing, loudly" — so a re-injected
+    # retry that lands here is terminal and successful, and its durable entry is released.
+    _scribe_retry_close "$mine"
     echo "scribe-step: SKIPPED (not filed) — $reason" >&2
     _report_and_cleanup "$mine" "⚠️ SKIPPED (not filed): $reason" "SKIP"
     ;;
