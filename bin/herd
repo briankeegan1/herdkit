@@ -92,6 +92,12 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/driver.sh" ] && . "$SCRIPTS_DIR/driver.sh"
 
+# The mixed-vendor review panel's shared resolver (HERD-276). Pure library. `herd config set` sources it
+# so REVIEW_PANEL_MODELS refs are validated EAGERLY at write time — against the same driver oracle the
+# review gate will use hours later — instead of surfacing mid-gate as a dead panelist.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/review-panel.sh" ] && . "$SCRIPTS_DIR/review-panel.sh"
+
 # The ONE shared watcher-identity check (HERD-266): watcher_list_mains + the exemption clauses that
 # tell a real duplicate watcher apart from the canonical watcher's own argv0-inherited forks. Sourced
 # by bin/herd, sweep.sh, status.sh and agent-watch.sh so no surface can disagree. Defines functions
@@ -2496,6 +2502,18 @@ cmd_config_set() {
         die "invalid value for $key: \"$val\" — allowed: ${shape} (see capabilities.tsv value_shape)"
         ;;
     esac
+  fi
+
+  # 2a-bis. EAGER REF VALIDATION (HERD-276). REVIEW_PANEL_MODELS's value_shape is `free` — a ref LIST is
+  #     not an enum — so the generic check above cannot catch `codx:gpt-5` or a dangling `grok:`. Resolve
+  #     every ref here against the shipped templates/drivers/*.driver oracle and REFUSE the write on the
+  #     first bad one. A typo'd panelist otherwise lands silently in .herd/config and only reveals itself
+  #     hours later, mid-gate, as a panelist that can never vote — which under all-pass wedges the merge
+  #     behind a permanent INFRA retry. herd_review_panel_validate_refs prints the loud per-ref why.
+  if [ "$key" = "REVIEW_PANEL_MODELS" ] && [ -n "$val" ] \
+     && command -v herd_review_panel_validate_refs >/dev/null 2>&1; then
+    herd_review_panel_validate_refs "$val" \
+      || die "refusing to set REVIEW_PANEL_MODELS — every panelist must be a bare model id (default driver) or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
   fi
 
   # 2b. Decide the TARGET file (HERD-47). A write lands in the per-user overlay .herd/config.local
