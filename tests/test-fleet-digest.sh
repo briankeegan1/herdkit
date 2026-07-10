@@ -160,4 +160,25 @@ out="$(bash "$HERD" fleet digest --help)"
 printf '%s' "$out" | grep -qi "standup\|--since" || fail "digest --help should describe the command"
 ok
 
+# ── 13. merged_external leg (HERD-291): explicit cross-seat merge marker ──────
+# A project whose journal has a merged_external event (no local `merge`) must show the PR as
+# shipped. A control PR with only a BLOCK and no merged_external must stay blocked, proving
+# the leg does not over-clear. Projects without merged_external events are already covered by
+# tests 1–12 (byte-identical output guarantee: the existing pass set must stay green).
+DELTA="$(_mkproj delta)"
+cat > "$T/proj/delta-trees/.herd/journal.jsonl" <<'JL'
+{"ts":"2026-07-03T08:00:00Z","event":"verdict_recorded","pr":55,"value":"BLOCK","source":"reviewer"}
+{"ts":"2026-07-03T09:00:00Z","event":"merged_external","pr":55,"slug":"my-feature","sha":"abc123"}
+{"ts":"2026-07-03T09:30:00Z","event":"verdict_recorded","pr":77,"value":"BLOCK","source":"reviewer"}
+JL
+bash "$HERD" fleet register "$DELTA" >/dev/null
+out="$(bash "$HERD" fleet digest)"
+delta_block="$(printf '%s' "$out" | awk '/^delta$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
+# #55 had a BLOCK then merged_external → must appear as shipped, not blocked.
+printf '%s' "$delta_block" | grep -Eq 'shipped: +1' || fail "merged_external: delta should have 1 shipped (#55), got: $delta_block"
+printf '%s' "$delta_block" | grep -q '#55'           || fail "merged_external: #55 must appear in shipped list"
+printf '%s' "$delta_block" | grep -E 'shipped:' | grep -q '#77' && fail "merged_external: #77 (BLOCK only, no merged_external) must not be shipped"
+printf '%s' "$delta_block" | grep -Eq 'blocked: +1'  || fail "merged_external: #77 (BLOCK, no merged_external) must remain blocked"
+ok
+
 echo "ALL PASS ($pass checks)"
