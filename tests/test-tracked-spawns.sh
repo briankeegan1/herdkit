@@ -140,14 +140,17 @@ pass; echo "PASS (10) spawn.sh enqueues a tracked intent + writes the HERD-64 re
 
 # ── 11. spawn-step.sh next emits the ref on line 3; done removes intent + sidecar ────────────────────
 # Parse via the SAME positional read block the watcher's _drain_spawn_queue uses (portable — no
-# mapfile, which macOS bash 3.2 lacks): marker, slug, lane, ref, then the task as the remainder.
-c0=""; c1=""; c2=""; c3=""; c4=""
-{ IFS= read -r c0; IFS= read -r c1; IFS= read -r c2; IFS= read -r c3; c4="$(cat)"; } < <(run_step next)
+# mapfile, which macOS bash 3.2 lacks): marker, slug, lane, ref, after (HERD-94; empty when the intent
+# carries no dependency), then the task as the remainder. Read every fixed line the producer emits —
+# an unread line silently prefixes the remainder and the task assertion fails on a phantom newline.
+c0=""; c1=""; c2=""; c3=""; c4=""; c5=""
+{ IFS= read -r c0; IFS= read -r c1; IFS= read -r c2; IFS= read -r c3; IFS= read -r c4; c5="$(cat)"; } < <(run_step next)
 [ "${c0#CLAIMED }" != "$c0" ] || fail "(11) spawn-step next did not CLAIM (got '$c0')"
 [ "$c1" = "build-it" ] || fail "(11) slug line wrong: '$c1'"
 [ "$c2" = "quick" ]    || fail "(11) lane line wrong: '$c2'"
 [ "$c3" = "HERD-64" ]  || fail "(11) ref line must be the threaded HERD-64, got '$c3'"
-[ "$c4" = "build the thing" ] || fail "(11) task remainder wrong: '$c4'"
+[ -z "$c4" ]           || fail "(11) intent with no after= must drain an EMPTY after line, got '$c4'"
+[ "$c5" = "build the thing" ] || fail "(11) task remainder wrong: '$c5'"
 claimed="${c0#CLAIMED }"
 run_step done "$claimed" >/dev/null 2>&1
 [ -e "$claimed" ] && fail "(11) done did not remove the claimed intent"
@@ -160,12 +163,13 @@ out="$(TRACKED_SPAWNS=off run_spawn plain-item quick "plain task")"
 echo "$out" | grep -q "SPAWN_RC=0" || fail "(12) off + no ref must enqueue (rc 0), got '$out'"
 req="$(ls "$Q"/*.req 2>/dev/null | head -1)"; [ -n "$req" ] || fail "(12) intent not enqueued under off"
 [ -f "${req%.req}.ref" ] && fail "(12) an untracked spawn must NOT write a ref sidecar"
-c0=""; c1=""; c2=""; c3=""; c4=""
-{ IFS= read -r c0; IFS= read -r c1; IFS= read -r c2; IFS= read -r c3; c4="$(cat)"; } < <(run_step next)
+c0=""; c1=""; c2=""; c3=""; c4=""; c5=""
+{ IFS= read -r c0; IFS= read -r c1; IFS= read -r c2; IFS= read -r c3; IFS= read -r c4; c5="$(cat)"; } < <(run_step next)
 [ "$c1" = "plain-item" ] || fail "(12) slug wrong: '$c1'"
 [ "$c2" = "quick" ]      || fail "(12) lane wrong: '$c2'"
 [ -z "$c3" ]             || fail "(12) untracked intent must drain an EMPTY ref line, got '$c3'"
-[ "$c4" = "plain task" ] || fail "(12) task wrong: '$c4'"
+[ -z "$c4" ]             || fail "(12) untracked intent must drain an EMPTY after line, got '$c4'"
+[ "$c5" = "plain task" ] || fail "(12) task wrong: '$c5'"
 pass; echo "PASS (12) off + no ref → normal enqueue, empty ref line (positional parse preserved)"
 
 # ============================ documentation: capabilities.tsv + config.example =======================
