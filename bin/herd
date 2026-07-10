@@ -100,6 +100,17 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/watcher-exempt.sh" ] && . "$SCRIPTS_DIR/watcher-exempt.sh"
 
+# The ONE shared INVOCATION-CONTEXT check (HERD-269): herd_context_guard refuses a CONTROL-ROOM
+# MUTATION (config set, reload, pane, sweep, update, upgrade, agent-update, theme set, backend
+# switch, governance apply) when the invocation cwd is a builder worktree rather than the main
+# checkout — a builder that actuates from its tree rebuilds the operator's panes and kills the live
+# watcher. READ-ONLY subcommands are untouched. Called ONCE from the dispatch at the bottom of this
+# file, so no actuator can grow a private copy. Defines functions only; it reads cwd/WORKTREES_DIR
+# lazily at call time, so sourcing here before .herd/config is loaded is safe. Sourced AFTER
+# journal.sh so its refusal/bypass events are journaled.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/context-guard.sh" ] && . "$SCRIPTS_DIR/context-guard.sh"
+
 # `herd status` helpers: the DETERMINISTIC, READ-ONLY one-shot health snapshot for THIS project
 # (watcher liveness, in-flight builders + DEAD detection, open PRs + gate state, backlog counts).
 # Defines functions only — its _status_watcher_pids late-binds _list_project_watchers (defined far
@@ -6493,6 +6504,11 @@ Engine scripts: $SCRIPTS_DIR
 Templates:      $TEMPLATES_DIR
 EOF
 }
+
+# HERD-269: one check, one call site. A control-room actuator invoked from a builder worktree exits
+# here (loudly, journaled) before its command body — or, with HERD_ALLOW_CONTROL_MUTATION=1, warns
+# and proceeds. Byte-inert from the main checkout and for every read-only subcommand.
+command -v herd_context_guard >/dev/null 2>&1 && herd_context_guard "$@"
 
 case "${1:-help}" in
   init)    shift; cmd_init "$@" ;;
