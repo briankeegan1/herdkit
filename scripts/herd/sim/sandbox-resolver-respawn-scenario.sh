@@ -345,6 +345,31 @@ else
   checkpoint spawn_ack fail "no resolver_spawn ACK event journaled"
 fi
 
+# (8d) DISPATCH-ID STAMPED (HERD-286) — every resolver_spawn event carries a dispatch_id for
+# attribution/journal correlation. A missing dispatch_id means the stamp is absent from the journal.
+if grep -q '"event":"resolver_spawn"' "$JOURNAL_FILE" && grep -q '"dispatch_id":' "$JOURNAL_FILE"; then
+  _did_vals="$(grep '"event":"resolver_spawn"' "$JOURNAL_FILE" | python3 -c '
+import json, sys
+ids = set()
+for line in sys.stdin:
+    try:
+        ev = json.loads(line)
+        d = ev.get("dispatch_id","")
+        if d and d != "-":
+            ids.add(d)
+    except Exception:
+        pass
+print(len(ids))
+' 2>/dev/null || echo 0)"
+  if [ "${_did_vals:-0}" -ge 1 ]; then
+    checkpoint dispatch_id_stamped pass "resolver_spawn events carry distinct dispatch_ids (${_did_vals} unique)"
+  else
+    checkpoint dispatch_id_stamped fail "resolver_spawn events have dispatch_id field but all are empty/dash"
+  fi
+else
+  checkpoint dispatch_id_stamped fail "resolver_spawn events missing dispatch_id field"
+fi
+
 # ── scorecard ───────────────────────────────────────────────────────────────────
 write_scorecard() {
   local out="$ART/scorecard.json" result="$1" i n; n=${#CP_NAMES[@]}

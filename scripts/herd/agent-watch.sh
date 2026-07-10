@@ -512,6 +512,8 @@ herd_theme_load_console
 # pure helper and only resolves.
 # shellcheck source=/dev/null
 . "$HERE/merge-policy.sh"
+# shellcheck source=/dev/null
+. "$HERE/resolver-pane.sh"
 _pol="$(_effective_merge_policy)"
 AUTOMERGE=""; MERGE_OBSERVE=""
 case "$_pol" in
@@ -3787,10 +3789,11 @@ _resolve_result() {
 # to "-", which would make `<pr>-<sha>` ambiguous to split on the last dash.
 _resolve_registry_file() { printf '%s' "$TREES/.resolve-registry-$1-$2"; }
 
-# _resolver_pane_enabled — the RESOLVER_PANE lever (default off, ship-dormant). An unrecognized value
-# reads OFF: a typo can never arm a path that closes panes.
+# _resolver_pane_enabled — the RESOLVER_PANE lever (default off, ship-dormant). Delegates to the
+# ONE shared resolver in scripts/herd/resolver-pane.sh (_effective_resolver_pane), so this file
+# and herd-resolve.sh can never disagree about which values arm the pane-closing path (HERD-286).
 _resolver_pane_enabled() {
-  case "${RESOLVER_PANE:-off}" in on|true|yes|1) return 0 ;; *) return 1 ;; esac
+  [ "$(_effective_resolver_pane)" = "on" ]
 }
 
 # _retire_resolver_pane <pr#> <sha> [reason] — close this dispatch's resolver pane and drop its row.
@@ -4183,9 +4186,12 @@ spawn_resolver() {
   # pr + sha keep the marker legible; the monotonic sequence makes it UNIQUE. An epoch alone would
   # alias two dispatches of the same pr+sha inside one second — unreachable today (the
   # _resolver_in_flight guard closes it) but exactly the aliasing hazard this name exists to avoid.
+  # HERD-286: the same key forms the DISPATCH-ID — a stable, unique token for journal correlation
+  # that ties resolver_spawn events and herd-resolve.sh's own journal events to the same dispatch.
   _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
-  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs" "${rp}-${rsha:--}-${_SPAWN_DISPATCH_SEQ}")"
-  _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha" "$_sr_marker"
+  local _sr_dispatch_id="${rp}-${rsha:--}-${_SPAWN_DISPATCH_SEQ}"
+  local _sr_marker; _sr_marker="$(_spawn_inflight_file resolve "$rs" "$_sr_dispatch_id")"
+  _spawn_inflight_bg "$_sr_marker" _spawn_resolver_lane "$rs" "$rp" "$rsha" "$_sr_marker" "$_sr_dispatch_id"
   return 0
 }
 
@@ -4317,6 +4323,9 @@ _resolve_lane_lock_release() {
 # live `_resolver_lane_starting` keeps this slug out of every death verdict.
 _spawn_resolver_lane() {
   local rs="$1" rp="$2" rsha="$3" _sr_marker="$4"
+  # HERD-286: dispatch-id for attribution/journal correlation. Passed by spawn_resolver from the
+  # same key that names the inflight marker; defaults so a direct call (tests/sims) works without it.
+  local _sr_dispatch_id="${5:-${rp}-${rsha:--}}"
   local _sr_rc=0 _sr_ack _sr_roster _sr_locked=""
   if _resolve_lane_lock_acquire "$_sr_marker"; then
     _sr_locked=1
@@ -4330,13 +4339,17 @@ _spawn_resolver_lane() {
   # can stamp them into the row it writes (the watcher's reconcile reads them back from there).
   # A dispatch with no sha at all keys no registry row (its verdict file is unaddressable too) — it
   # falls through to the plain lane rather than writing a row the reconcile could never join back.
+  # HERD-286: HERD_RESOLVE_DISPATCH_ID is passed in BOTH branches so herd-resolve.sh can stamp the
+  # dispatch-id into its own journal events regardless of the pane-lever state.
   if _resolver_pane_enabled && [ -n "$rsha" ]; then
     HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
     HERD_RESOLVE_REGISTRY_FILE="$(_resolve_registry_file "$rp" "$rsha")" \
     HERD_RESOLVE_PR="$rp" HERD_RESOLVE_SHA="$rsha" \
+    HERD_RESOLVE_DISPATCH_ID="$_sr_dispatch_id" \
       bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
   else
     HERD_RESOLVE_RESULT_FILE="$(_resolve_result_file "$rp" "$rsha")" \
+    HERD_RESOLVE_DISPATCH_ID="$_sr_dispatch_id" \
       bash "$HERD_RESOLVE_BIN" "$rs" >/dev/null 2>&1 || _sr_rc=$?
   fi
   [ -n "$_sr_locked" ] && _resolve_lane_lock_release "$_sr_marker"
@@ -4347,8 +4360,11 @@ _spawn_resolver_lane() {
   if ( AGENTS_JSON="$_sr_roster"; _resolver_roster_listed "$rs" ) || [ "$(_resolver_probe "$rs")" = "alive" ]; then
     _sr_ack="yes"
   fi
-  journal_append resolver_spawn pr "$rp" slug "$rs" sha "${rsha:--}" rc "$_sr_rc" acked "$_sr_ack"
-  [ "$_sr_rc" -eq 0 ] || journal_append resolver_spawn_failed pr "$rp" slug "$rs" sha "${rsha:--}" rc "$_sr_rc"
+  # HERD-286: include dispatch_id in the ACK journal event for attribution/correlation.
+  journal_append resolver_spawn pr "$rp" slug "$rs" sha "${rsha:--}" rc "$_sr_rc" acked "$_sr_ack" \
+    dispatch_id "$_sr_dispatch_id"
+  [ "$_sr_rc" -eq 0 ] || journal_append resolver_spawn_failed pr "$rp" slug "$rs" sha "${rsha:--}" \
+    rc "$_sr_rc" dispatch_id "$_sr_dispatch_id"
   return 0
 }
 

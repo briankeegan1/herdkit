@@ -75,7 +75,11 @@ TASK="You are a CONFLICT RESOLVER for one feature worktree. Goal: make this bran
 #    builder's own tab as a bottom split; `tab` is the shipped standalone resolve·<slug> tab in the
 #    control-room workspace — the fallback, and the ONLY mode when RESOLVER_PANE=off.
 TAB=""; ROOT=""; PLACEMENT=""
-case "${RESOLVER_PANE:-off}" in on|true|yes|1) _WANT_PANE=1 ;; *) _WANT_PANE=0 ;; esac
+# HERD-286: parse the lever through the ONE shared resolver so the placement decision and any
+# consumer that sources this file cannot silently disagree about which values arm the pane path.
+# shellcheck source=/dev/null
+. "$HERE/resolver-pane.sh"
+case "$(_effective_resolver_pane)" in on) _WANT_PANE=1 ;; *) _WANT_PANE=0 ;; esac
 
 # The builder's tab is the tab labelled EXACTLY $SLUG in this workspace (herd-feature.sh's label).
 # Only consulted in pane mode, so the default lane makes no extra herdr call.
@@ -101,7 +105,7 @@ if [ -n "$_BUILDER_TAB" ]; then
     model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK" >/dev/null 2>&1; then
     TAB="$_BUILDER_TAB"; PLACEMENT="split"
   else
-    command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason split_start_failed tab "$_BUILDER_TAB"
+    command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason split_start_failed tab "$_BUILDER_TAB" dispatch_id "${HERD_RESOLVE_DISPATCH_ID:--}"
   fi
 fi
 
@@ -124,7 +128,7 @@ if [ -z "$PLACEMENT" ]; then
     name="resolve·$SLUG" workspace="$_WS_ID" cwd="$DIR" tab="$TAB" split=right \
     model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK"; then
     herdr tab close "$TAB" >/dev/null 2>&1 || true
-    command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason spawn_agent_failed tab "$TAB"
+    command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason spawn_agent_failed tab "$TAB" dispatch_id "${HERD_RESOLVE_DISPATCH_ID:--}"
     echo "❌ herdr: could not start the resolver agent for '$SLUG' — closed the empty tab; worktree is at $DIR." >&2
     exit 1
   fi

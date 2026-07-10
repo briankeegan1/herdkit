@@ -48,7 +48,7 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCARD" || fail "(a)
 [ "$(sc "$SCARD" scenario)" = "resolver-respawn" ] || fail "(a) unexpected scenario name"
 [ "$(sc "$SCARD" result)" = "pass" ]               || fail "(a) result should be pass"$'\n'"$(cat "$T/out")"
 [ "$(sc "$SCARD" failed)" -eq 0 ]                  || fail "(a) failed should be 0 (got $(sc "$SCARD" failed))"
-[ "$(sc "$SCARD" passed)" -ge 8 ]                  || fail "(a) passed should be >= 8"
+[ "$(sc "$SCARD" passed)" -ge 9 ]                  || fail "(a) passed should be >= 9"
 echo "PASS (a) end-to-end drain + scorecard shape"
 
 # ── (b) THE RESPAWN CHAIN ───────────────────────────────────────────────────────
@@ -67,6 +67,10 @@ echo "PASS (c) escalate terminal + no double-dispatch (alive holds on same-sha A
 [ "$(cp_status "$SCARD" journal_trail)" = "pass" ]        || fail "(d) journal_trail not pass"
 [ "$(sc "$SCARD" resolver_respawn_events)" -ge 2 ]        || fail "(d) expected >= 2 resolver_respawn events"
 echo "PASS (d) resolver_respawn journal trail"
+
+# ── (d2) DISPATCH-ID STAMPED (HERD-286) ────────────────────────────────────────
+[ "$(cp_status "$SCARD" dispatch_id_stamped)" = "pass" ] || fail "(d2) dispatch_id_stamped not pass — resolver_spawn events missing dispatch_id"
+echo "PASS (d2) dispatch_id stamped on resolver_spawn journal events"
 
 # ── (e) HERMETIC — nothing leaked into the real repo tree ───────────────────────
 NOW_STATUS="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sort || true)"
