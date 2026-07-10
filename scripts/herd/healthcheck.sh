@@ -94,6 +94,14 @@ else
   HERD_DOC_DRIFT_SKIP_REASON="doc-drift-lint.sh not present"
   herd_doc_drift_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# gate-coverage guard (rc 2), never break the healthcheck it is a part of.
+if [ -f "$HERE/gate-coverage-lint.sh" ]; then
+  . "$HERE/gate-coverage-lint.sh"
+else
+  HERD_GATE_COVERAGE_SKIP_REASON="gate-coverage-lint.sh not present"
+  herd_gate_coverage_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -356,6 +364,19 @@ EOF
   if [ "$drift_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ doc-drift — $(printf '%s' "$drift_errs" | grep '^DRIFT' | head -1)";
     else echo "❌ DOC-DRIFT: README/docs/templates reference a command (or README key) absent from capabilities.tsv"; printf '%s\n' "$drift_errs" | grep '^DRIFT' || printf '%s\n' "$drift_errs"; fi
+    exit 1
+  fi
+
+  # gate-coverage guard (HERD-292) — every tests/test-*.sh must be referenced in tests/herd.bats
+  # OR listed in tests/gate-coverage-exempt.tsv. A new test file that never lands in herd.bats sits
+  # ungated at the merge gate indefinitely; this lint catches it pre-PR. Same red semantics as
+  # caps-sync / doc-drift. Skipped (never red) when the shared lint is absent or the tree has no
+  # tests/herd.bats (i.e. every consuming project).
+  local gcov_errs gcov_rc
+  gcov_errs="$(herd_gate_coverage_lint ".")"; gcov_rc=$?
+  if [ "$gcov_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ gate-coverage — $(printf '%s' "$gcov_errs" | grep '^UNGATED' | head -1)";
+    else echo "❌ GATE-COVERAGE: tests/test-*.sh exists but is not wired into tests/herd.bats (add to bats or to tests/gate-coverage-exempt.tsv)"; printf '%s\n' "$gcov_errs" | grep '^UNGATED' || printf '%s\n' "$gcov_errs"; fi
     exit 1
   fi
 
