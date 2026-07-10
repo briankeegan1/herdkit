@@ -299,5 +299,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
+- `WEDGE_AUTOWAKE` → `agent-watch.sh`
+- `WEDGE_GRACE_MIN` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`
 - `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
