@@ -180,6 +180,7 @@ run_conflict_tick() {
         round "$(( $(resolver_dispatch_count "$PR") + 1 ))"
     fi
     spawn_resolver "$SLUG" "$PR" "$BRANCH" "$csha"
+    _spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
   done
 }
 dispatch_count() { resolver_dispatch_count "$PR"; }

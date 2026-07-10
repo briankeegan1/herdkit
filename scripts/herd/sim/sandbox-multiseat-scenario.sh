@@ -584,6 +584,7 @@ run_conflict_tick() {
   for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
     reason="${CONF_REASON[k]}"; csha="${CONF_SHA[k]}"; k=$((k+1))
     spawn_resolver "$slug" "$pr" "$branch" "$csha"
+    _spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
   done
 }
 

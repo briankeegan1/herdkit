@@ -55,7 +55,12 @@ case "$1 $2" in
     num="$3"
     allargs="$*"
     case "$allargs" in
-      *"--json body"*)  [ -f "$BODIES/$num" ] && cat "$BODIES/$num" || true ;;
+      # HV_GH_FAIL / HV_GH_HANG (HERD-237): make the BODY read fail or wedge, so a test can prove the
+      # human-verify gate fails CLOSED rather than reading an unreadable body as "no steps declared".
+      *"--json body"*)
+        [ -n "${HV_GH_HANG:-}" ] && exec sleep 30
+        [ -n "${HV_GH_FAIL:-}" ] && exit 1
+        [ -f "$BODIES/$num" ] && cat "$BODIES/$num" || true ;;
       *"--json title"*) printf 'title for PR %s' "$num" ;;
       *)                : ;;
     esac
@@ -252,6 +257,53 @@ ok
 [ "$(_hold_decision approve '' '')"  = "$(_hold_decision approve '1' '')"  ] || fail "approve: hv must not change the unapproved decision (no double-hold)"
 ok
 [ "$(_hold_decision approve '' '1')" = "$(_hold_decision approve '1' '1')" ] || fail "approve: hv must not change the approved decision"
+ok
+
+# ── 9. HERD-237: an UNREADABLE body fails CLOSED (the merge gate's only human-verify signal) ──────
+# In AUTOMERGE mode pr_human_verify_held is the ONLY thing that turns a green-gated PR into a hold.
+# _gh_timeout returns 124 with EMPTY stdout on expiry; if _pr_body swallows that, an unreadable body is
+# indistinguishable from "no HUMAN-VERIFY block" and the PR merges with its manual steps never run.
+
+# (a) gh's own failure ⇒ _pr_body propagates the rc; pr_human_verify_held reports UNKNOWN (2).
+HV_GH_FAIL=1 _pr_body 100 >/dev/null 2>&1 && fail "(9a) _pr_body returned success on a failed gh"
+HV_GH_FAIL=1 pr_human_verify_held 100; hv_rc=$?
+[ "$hv_rc" -eq 2 ] || fail "(9a) an unreadable body must report UNKNOWN (2), got rc=$hv_rc"
+ok
+
+# (b) a WEDGED gh ⇒ the same, bounded by the deadline (this is the shipped 124 path).
+export HERD_GH_TIMEOUT_SECS=2
+_hv_start=$(date +%s)
+HV_GH_HANG=1 _pr_body 100 >/dev/null 2>&1; body_rc=$?
+_hv_elapsed=$(( $(date +%s) - _hv_start ))
+[ "$body_rc" -eq 124 ] || fail "(9b) a wedged body fetch must return 124, got $body_rc"
+[ "$_hv_elapsed" -lt 15 ] || fail "(9b) the body fetch was not bounded (${_hv_elapsed}s)"
+HV_GH_HANG=1 pr_human_verify_held 100; hv_rc=$?
+[ "$hv_rc" -eq 2 ] || fail "(9b) a timed-out body must report UNKNOWN (2), got rc=$hv_rc"
+unset HERD_GH_TIMEOUT_SECS
+ok
+
+# (c) an EMPTY body that was READ is still an honest "no hold" — rc 1, never 2.
+: > "$BODIES/300"
+pr_human_verify_held 300; hv_rc=$?
+[ "$hv_rc" -eq 1 ] || fail "(9c) a readable empty body must be 'no hold' (1), got rc=$hv_rc"
+ok
+
+# (d) THE TRAP, made explicit: a caller that treats the tri-state as a boolean merges an unreadable PR.
+# This is what the code did before HERD-237, and why the merge gate must branch on rc 2 by name.
+hv_bool=""; HV_GH_FAIL=1 pr_human_verify_held 100 && hv_bool=1
+[ -z "$hv_bool" ] || fail "(9d) precondition"
+[ "$(_hold_decision auto "$hv_bool" '')" = "MERGE" ] \
+  || fail "(9d) precondition: a boolean read of the unreadable case decides MERGE"
+# …so assert the SHIPPED gate does not do that: it must handle the non-zero rc before setting hv_hold.
+python3 - "$WATCH" <<'GATE' || fail "(9d) the merge gate does not fail CLOSED on an unreadable PR body"
+import re, sys
+src = open(sys.argv[1], encoding='utf-8').read()
+i = src.index('hv_rc=0; hv_body="$(_pr_body "$prnum")"')
+j = src.index('printf \'%s\' "$hv_body" | human_verify_has && hv_hold=1', i)
+between = src[i:j]
+# the unreadable branch must journal and `continue` BEFORE hv_hold can ever be set
+sys.exit(0 if ('hv_body_unreadable' in between and 'continue' in between) else 1)
+GATE
 ok
 
 echo "ALL PASS ($pass checks)"

@@ -72,7 +72,10 @@ done
 JLOG="$T/journal.log"
 DRAIN_SRC="$T/drain.sh"
 : > "$DRAIN_SRC"
-for fn in _spawn_dep_merged _spawn_held_epoch _spawn_mark_held _spawn_clear_held _drain_spawn_queue; do
+for fn in _gh_timeout_secs _gh_timeout_run _gh_timeout \
+          _spawn_slug_key _spawn_inflight_file _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+          _spawn_dep_merged _spawn_held_epoch _spawn_mark_held _spawn_clear_held \
+          _drain_lane_worker _drain_spawn_queue; do
   sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$DRAIN_SRC"
   grep -q "^$fn()" "$DRAIN_SRC" || fail "could not extract $fn from agent-watch.sh"
 done
@@ -80,9 +83,14 @@ done
 STATE="$T/trees/.agent-watch-merged"
 SPAWN_HELD_STATE="$T/trees/.agent-watch-spawn-held"
 
+# HERD-237: the lane is dispatched in a background worker; `wait` settles it before the assertions.
 run_drain() {
   ( export LANELOG JLOG
     HERE="$ENG"; TREES="$T/trees"; FEATS=()
+    SPAWN_INFLIGHT_PREFIX="$T/trees/.spawn-inflight-"
+    _GH_TIMEOUT_DEFAULT_SECS=15
+    _marker_write(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
+    _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     STATE="$STATE"; SPAWN_HELD_STATE="$SPAWN_HELD_STATE"; DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
     # HERD-95: the drain now consults budget_daily_exceeded + the _BUDGET_DRAIN_PAUSED tick state.
@@ -93,7 +101,8 @@ run_drain() {
     journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }
     # shellcheck source=/dev/null
     . "$DRAIN_SRC"
-    _drain_spawn_queue )
+    _drain_spawn_queue
+    wait )
 }
 
 enqueue(){ ( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$SPAWN" "$@" >/dev/null ); }

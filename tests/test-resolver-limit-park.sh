@@ -213,6 +213,7 @@ printf 'resolve·%s tab-idle resolve\n' "$SLUG" > "$REG"
 STUB_RESOLVE="$T/stub-resolve.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_RESOLVE"; chmod +x "$STUB_RESOLVE"
 HERD_RESOLVE_BIN="$STUB_RESOLVE" spawn_resolver "$SLUG" "$PR" "$BRANCH" "$SHA2"
+_spawn_resolver_wait   # HERD-237: the resolver lane is dispatched in the background
 grep -qxF "tab-idle" "$CLOSED" || fail "(4) an unparked idle resolver must be reaped for re-dispatch"
 ok
 
