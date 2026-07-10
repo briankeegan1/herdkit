@@ -109,6 +109,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic watcher driver-wake paths (HERD-176 P4) test passes" {
+  run bash "$REPO/tests/test-watcher-driver-wake.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic model-matrix (HERD-151) test passes" {
   run bash "$REPO/tests/test-model-matrix.sh"
   [ "$status" -eq 0 ]
