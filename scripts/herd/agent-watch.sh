@@ -732,8 +732,7 @@ EOF
 build_tracker_drift() {
   TRACKER_DRIFT=""
   local rows
-  rows="$(herd_console_section "$TRACKER_HEAL_FILE" 3 \
-    herd_console_classify_tracker_heal _tracker_heal_row)"
+  rows="$(herd_console_section_tracker "$TRACKER_HEAL_FILE" 3 _tracker_heal_row)"
   [ -n "$rows" ] && TRACKER_DRIFT="${rows}"$'\n'
   return 0
 }

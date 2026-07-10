@@ -79,6 +79,12 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic scribe backend-flip (issue #139 / HERD-287 remedy) test passes" {
+  run bash "$REPO/tests/test-scribe-backend-flip.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic CLI init/render/upgrade test passes" {
   run bash "$REPO/tests/test-cli.sh"
   [ "$status" -eq 0 ]
