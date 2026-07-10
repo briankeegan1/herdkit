@@ -601,6 +601,13 @@ def digest_project(files):
         pr = None if pr in (None, "") else str(pr)
         if ev == "merge" and pr:
             pr_state(pr)["merged"] = True
+        elif ev == "retire_converged" and pr:
+            # The retirement invariant (HERD-164) journals retire_converged once a branch has
+            # provably reached main and its worktree/tab/ref are torn down: the terminal proof a PR
+            # SHIPPED. It is the ONLY terminal signal for a PR merged OUT OF BAND (another seat, on
+            # GitHub), where this journal has no local merge event, only BLOCK verdicts on the
+            # superseded shas. Rank it as merged so shipped wins over a stale blocked/held (HERD-290).
+            pr_state(pr)["merged"] = True
         elif ev == "hold_applied" and pr:
             pr_state(pr)["held"] = True
         elif ev == "hold_released" and pr:
@@ -866,7 +873,12 @@ def reduce_journal(files):
         sl = o.get("slug")
         if sl:
             s["slug"] = str(sl)
-        if ev == "merge" or (ev == "reap" and str(o.get("reason", "")) == "merged"):
+        if ev == "merge" or (ev == "reap" and str(o.get("reason", "")) == "merged") \
+                or ev == "retire_converged":
+            # retire_converged (HERD-164) is the terminal proof the branch reached main. For a PR
+            # merged OUT OF BAND (another seat / GitHub) it is the ONLY local terminal signal, since
+            # this journal never saw a merge. Treat it as done so stale BLOCK rows on the superseded
+            # shas clear even when gh is down (fail-open) (HERD-290).
             s["done"] = True
             s["blocked"] = s["held"] = s["escalated"] = s["health"] = False
         elif ev == "verdict_recorded":

@@ -605,3 +605,9 @@ setup() {
   run grep -q '{{' "$REPO/.claude/commands/coordinator.md"
   [ "$status" -ne 0 ]
 }
+
+@test "hermetic externally-merged-PR terminal-signal test passes (HERD-290)" {
+  run bash "$REPO/tests/test-fleet-external-merge.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
