@@ -197,6 +197,7 @@ else
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
   for cp in workspace_created control_room reload_pane_verify_timeout builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
+            context_guard_refuses_real_teardown \
             resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
             builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
             builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
@@ -452,8 +453,11 @@ except Exception:
       printf 'REVIEW: PASS\n'          > "$RVT/.review-result-$RV_PR-$RV_SHA"
       # Drive the SHIPPED verdict-consumption path in a subshell so agent-watch.sh's globals/functions
       # never clobber this scenario's. HERD_DRIVER defaults to herdr-claude → a REAL `herdr pane close`.
+      # HERD_DISPOSABLE_WORKSPACE=1: this scenario runs from the healthcheck's builder WORKTREE, so the
+      # HERD-310 pane-mutation guard is armed — declare this a disposable sim close so it retires the
+      # scenario's OWN throwaway pane instead of being refused as if it were the operator's control room.
       ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
-               PROJECT_ROOT="$REPO" WORKTREES_DIR="$RVT" DEFAULT_BRANCH=main \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$RVT" DEFAULT_BRANCH=main HERD_DISPOSABLE_WORKSPACE=1 \
                WORKSPACE_NAME="rp-reviewpane-sim" JOURNAL_FILE="$RV_JOURNAL"
         # shellcheck source=/dev/null
         . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
@@ -538,6 +542,65 @@ except Exception:
     fi
   fi
 
+  # ── CONTEXT-GUARD (HERD-310): a test-side TAB teardown against the LIVE control room is REFUSED ─────
+  # Reproduce the 2026-07-10 incident directly against REAL panes. A test run from a builder WORKTREE
+  # drove herd_teardown_slug against the operator's LIVE socket and closed the {slug, review·slug,
+  # resolve·slug} tabs — severing an in-flight review and killing the builder agent. Here the FIXTURE
+  # workspace plays the operator's control room: we call the SHIPPED herd_teardown_slug on the builder
+  # slug from a WORKTREE context (WORKTREES_DIR + cwd inside it) with a NON-disposable WORKSPACE_NAME,
+  # and assert the shared guard (herd_context_pane_guard, HERD-310) REFUSES it: the builder pane/tab
+  # SURVIVES and a control_pane_mutation_refused is journaled. Non-vacuous: the refusal event only
+  # exists if the guard reached a would-be close and withheld it. (The disposable-workspace ALLOW
+  # direction — where a real sandbox-* sim tears down its own panes — is proven in the hermetic unit
+  # tests/test-context-guard-panes.sh; exercising it HERE would close the builder tab the downstream
+  # resolver/teardown checkpoints still need.)
+  if [ -n "$WSID" ] && [ -n "${BUILD_TAB:-}" ] && [ -n "$BUILD_PANE" ]; then
+    step contextguard "a WORKTREE-context herd_teardown_slug against the live room is REFUSED (HERD-310)"
+    _cg_present() {
+      pane_json "$WSID" | CGP="$1" python3 -c '
+import sys,json,os
+cgp=os.environ["CGP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==cgp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    if [ "$(_cg_present "$BUILD_PANE")" = yes ]; then
+      CGT="$ART/cg-trees"; mkdir -p "$CGT/wt/.herd"
+      CG_JOURNAL="$ART/cg-journal.jsonl"; : > "$CG_JOURNAL"
+      # Drive the SHIPPED teardown from a builder WORKTREE (cwd inside WORKTREES_DIR ⇒ clause B) against
+      # a NON-disposable workspace name, so the guard must refuse. journal.sh first so the refusal
+      # journals; herd-config.sh (which sources context-guard.sh + defines herd_teardown_slug) next.
+      ( cd "$CGT/wt" || exit 9
+        export WORKTREES_DIR="$CGT" WORKSPACE_NAME="rp-contextguard-operator" \
+               HERD_CONFIG_FILE="$ART/no-such-config" JOURNAL_FILE="$CG_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../journal.sh" >/dev/null 2>&1 || exit 8
+        # shellcheck source=/dev/null
+        . "$HERE/../herd-config.sh" >/dev/null 2>&1 || exit 7
+        herd_teardown_slug "rp-builder" >/dev/null 2>&1 || true
+      )
+      # The builder pane must SURVIVE (a would-be close would remove it), and the refusal must journal.
+      _cg_survived=yes; _i=0
+      while [ "$_i" -lt 12 ]; do
+        [ "$(_cg_present "$BUILD_PANE")" = yes ] || { _cg_survived=no; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _cg_refused=no; grep -q '"event":"control_pane_mutation_refused"' "$CG_JOURNAL" 2>/dev/null && _cg_refused=yes
+      if [ "$_cg_survived" = yes ] && [ "$_cg_refused" = yes ]; then
+        checkpoint context_guard_refuses_real_teardown pass \
+          "worktree-context herd_teardown_slug REFUSED: builder pane $BUILD_PANE SURVIVED; control_pane_mutation_refused journaled; ZERO real closes"
+      else
+        checkpoint context_guard_refuses_real_teardown fail \
+          "guard did not refuse the teardown (builder_survived=$_cg_survived refused=$_cg_refused)"
+      fi
+    else
+      checkpoint context_guard_refuses_real_teardown fail "builder pane not present to protect (BUILD_PANE='$BUILD_PANE')"
+    fi
+  fi
+
   # ── RESOLVER-PANE LIFECYCLE (HERD-280): retired on DONE, KEPT on ESCALATE ─────────────────────────
   # The resolver is a pane that retires on result-consumed, exactly like a reviewer pane — but its two
   # verdicts part ways. Stand up a REAL resolve split pane inside the builder's tab (the placement
@@ -574,8 +637,11 @@ except Exception:
     # Run the shipped reconcile against <trees> in a subshell so agent-watch.sh's globals never clobber
     # this scenario's. HERD_DRIVER defaults to herdr-claude → a REAL `herdr pane close` behind the guard.
     _rs_reconcile() {
+      # HERD_DISPOSABLE_WORKSPACE=1: as with the reviewer retire above, this real close runs from the
+      # healthcheck's builder worktree — declare it a disposable sim close so the HERD-310 guard allows
+      # the scenario to retire its OWN throwaway resolver pane (never the operator's control room).
       ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
-               PROJECT_ROOT="$REPO" WORKTREES_DIR="$1" DEFAULT_BRANCH=main RESOLVER_PANE=on \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$1" DEFAULT_BRANCH=main RESOLVER_PANE=on HERD_DISPOSABLE_WORKSPACE=1 \
                WORKSPACE_NAME="rp-resolverpane-sim" JOURNAL_FILE="$2"
         # shellcheck source=/dev/null
         . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3

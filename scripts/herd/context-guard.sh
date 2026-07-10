@@ -155,3 +155,93 @@ herd_context_guard() {
   } >&2
   exit 3
 }
+
+# ── test-safety pane/tab guard (HERD-310) ───────────────────────────────────────────────────────
+# A SECOND surface on the SAME invariance axis as herd_context_guard: a builder worktree may never
+# actuate the operator's control room. herd_context_guard covers the `herd` CLI ACTUATORS; this
+# covers LIVE-HERDR PANE/TAB MUTATIONS reached from SOURCED engine code — herd_teardown_slug's tab
+# close (herd-config.sh) and herd_driver_close_pane (driver.sh) — which no CLI dispatch passes
+# through, so herd_context_guard can never see them.
+#
+# THE INCIDENT (2026-07-10T20:45:17). A direct (non-bats) run of the watcher-* tests from INSIDE a
+# live builder tab drove the teardown path against the LIVE herdr socket and closed the operator's
+# REAL tabs: it severed an in-flight review (SIGTERM before a verdict) by closing the review·<slug>
+# TAB, and killed the builder's own agent by closing the builder <slug> tab. The pane-close IDENTITY
+# guard (HERD-134, herd_close_pane_verified) refused the PANE close (journaled pane_close_refused …
+# reason=identity-unreadable — it saved that one pane) but the TAB close bypasses it entirely. This
+# guard closes that gap at the one shared seam every test reaches by SOURCING the engine.
+#
+# THE RULE (mirrors herd_context_guard's control-room-is-byte-identical invariant). Refuse a
+# pane/tab mutation IFF all three hold:
+#   (1) a live herdr socket is present (a real, responding control surface exists to harm), AND
+#   (2) cwd is a builder worktree (_herd_context_is_worktree — clause A or B above), AND
+#   (3) the target workspace is NOT a disposable sim workspace (the sandbox-real-panes convention).
+# From the CONTROL ROOM (main checkout) clause (2) is false → the guard NEVER fires → the real
+# watcher/reconciler close their real panes exactly as before, BYTE-IDENTICAL. With NO herdr
+# (headless CI, the hermetic test suite) clause (1) is false → NEVER fires → byte-identical. A
+# disposable `sandbox-*` sim workspace stands up and tears down its OWN throwaway panes → allowed.
+# ESCAPE HATCH: HERD_ALLOW_REAL_PANE_MUTATION=1 permits the mutation and journals a bypass — env
+# only, never a config key, so it adds no gate/manifest surface.
+
+# _herd_context_socket_live — success iff a REAL, responding herdr control surface with REAL panes is
+# reachable: a live server answers `herdr workspace list`. Returns FAILURE (so the guard is inert and
+# BYTE-IDENTICAL) when:
+#   • the driver is HEADLESS (panes-as-a-view) — the engine creates NO herdr panes under headless, so
+#     there is nothing real to protect. The DEFAULT driver is herdr-claude, where real panes exist and
+#     the incident happened; headless is only ever an explicit opt-in (env HERD_DRIVER / config), so
+#     this never disarms the guard in a real control room, and
+#   • herdr is not on PATH, or no server answers (headless CI / the hermetic suite's no-herdr path).
+_herd_context_socket_live() {
+  if { command -v _herd_driver_is_headless >/dev/null 2>&1 && _herd_driver_is_headless; } \
+     || [ "${HERD_DRIVER:-}" = "headless" ]; then
+    return 1
+  fi
+  command -v herdr >/dev/null 2>&1 || return 1
+  herdr workspace list >/dev/null 2>&1
+}
+
+# _herd_context_workspace_disposable — success iff the caller's workspace is a DISPOSABLE SIM
+# workspace whose panes are throwaway (the sandbox-real-panes convention: the sim scenarios create a
+# fresh `sandbox-…` workspace, drive only panes they created there, and close the whole workspace on
+# teardown; no real project's WORKSPACE_NAME is ever `sandbox-*`). Keys on WORKSPACE_NAME — the
+# config the caller operates under, exactly what herd_teardown_slug scopes its closes to — plus an
+# explicit HERD_DISPOSABLE_WORKSPACE=1 override for a sim that uses a non-sandbox label. Fail-soft:
+# an unset/unknown workspace is NOT disposable, so the guard stays ARMED (protect by default).
+_herd_context_workspace_disposable() {
+  [ "${HERD_DISPOSABLE_WORKSPACE:-}" = "1" ] && return 0
+  case "${WORKSPACE_NAME:-}" in
+    sandbox-*) return 0 ;;
+  esac
+  return 1
+}
+
+# herd_context_pane_guard [description] — THE shared pane/tab-mutation safety check. Returns 0 (ALLOW)
+# for every safe context (no live socket, the control room, or a disposable sim workspace); returns 1
+# (REFUSE — loud on stderr + journaled control_pane_mutation_refused) only from a builder worktree
+# against a live, REAL control room. Callers SKIP the mutation on a non-zero return and NEVER abort
+# (best-effort — a refusal must never crash a `set -euo pipefail` reconciler). journal.sh may not be
+# in scope (driver.sh's zero-dependency sourcing) — _herd_context_journal degrades to a silent no-op.
+herd_context_pane_guard() {
+  local what="${1:-pane/tab mutation}"
+  _herd_context_socket_live          || return 0
+  _herd_context_is_worktree          || return 0
+  _herd_context_workspace_disposable && return 0
+
+  if [ "${HERD_ALLOW_REAL_PANE_MUTATION:-}" = "1" ]; then
+    _herd_context_journal control_pane_mutation_bypass "$what"
+    printf '%s⚠️  HERD_ALLOW_REAL_PANE_MUTATION=1 — %s from a builder worktree ACTUATES the operator'"'"'s LIVE herdr panes (journaled).%s\n' \
+      "${c_yel:-}" "$what" "${c_rst:-}" >&2
+    return 0
+  fi
+
+  _herd_context_journal control_pane_mutation_refused "$what"
+  {
+    printf '%s❌ REFUSED (%s): a builder worktree may not close the operator'"'"'s LIVE herdr panes/tabs.%s\n' \
+      "${c_red:-}" "$what" "${c_rst:-}"
+    printf '   A live herdr socket is present and this workspace (%s) is not a disposable sim workspace.\n' "${WORKSPACE_NAME:-?}"
+    printf '   Closing here would tear down the real control room and sever in-flight review/builder\n'
+    printf '   work (HERD-310). Drive real panes only from a disposable sandbox-* sim workspace, or set\n'
+    printf '   HERD_ALLOW_REAL_PANE_MUTATION=1 to bypass (journaled).\n'
+  } >&2
+  return 1
+}

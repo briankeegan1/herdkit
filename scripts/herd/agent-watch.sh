@@ -6123,6 +6123,14 @@ except Exception:
 # `gh pr list` round-trip per sweep. Absent ⇒ compute it here (the watcher's own every-15-tick path).
 _sweep_orphan_tabs() {
   [ -n "$DRYRUN" ] && return 0
+  # HERD-310: this migration-mode sweep enumerates the LIVE `herdr tab list` and closes every orphan
+  # review·/resolve· tab — the exact path that severed the operator's in-flight review when a test
+  # drove it from a builder worktree against the live socket. The guard is a no-op from the control
+  # room (the watcher runs from the main checkout, not a worktree), so a real sweep is byte-identical.
+  if command -v herd_context_pane_guard >/dev/null 2>&1 \
+     && ! herd_context_pane_guard "_sweep_orphan_tabs (orphan tab close)"; then
+    return 0
+  fi
   local _sw_registry="$TREES/.herd-tabs" _sw_orphans="${1:-}" _sw_id
   # HERD-215: make the registry SELF-CONSISTENT before counting or closing anything — drop rows for
   # tabs that no longer exist at all (closed by a crash / reload / foreign path), so they stop
@@ -6362,6 +6370,11 @@ except Exception:
 # closes can never be invisible in the plan or in SWEEP_N_TAB.
 _sweep_stale_resolve_tabs() {
   [ -n "$DRYRUN" ] && return 0
+  # HERD-310: same live-tab-close severing class as _sweep_orphan_tabs. No-op from the control room.
+  if command -v herd_context_pane_guard >/dev/null 2>&1 \
+     && ! herd_context_pane_guard "_sweep_stale_resolve_tabs (stale resolve tab close)"; then
+    return 0
+  fi
   local _srt_reg="$TREES/.herd-tabs" _srt_slug _srt_tab
   while IFS=$'\t' read -r _srt_slug _srt_tab; do
     [ -n "$_srt_slug" ] && [ -n "$_srt_tab" ] || continue

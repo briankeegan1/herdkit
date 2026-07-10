@@ -87,6 +87,11 @@ fi
 # 2. Left (root) pane = pinned live backlog viewer.
 herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null 2>"$_CE" \
   || _coord_die "backlog-view pane"
+# HERD-310 stamp coverage: give the backlog pane a readable IDENTITY LABEL at spawn so the pane-close
+# identity guard (HERD-134, herd_close_pane_verified) can prove it against an expected-kind and REFUSE
+# a stale/mismatched close of a control-room pane — the same protection the review·/resolve·/<slug>
+# panes already carry. Best-effort (a label is cosmetic to the pane itself).
+herd_driver_pane_rename "$ROOT" "backlog·$WORKSPACE_NAME"
 
 # 2b. Install the rate_limit StopFailure hook on the COORDINATOR's repo, exactly as new-feature.sh
 #     does for each builder worktree (herd_write_ratelimit_hook, from the herd-config.sh sourced
@@ -118,6 +123,10 @@ if [ "${HERD_NO_WATCH:-}" != "1" ]; then
     2>"$_CE") || _coord_die "watch pane/parse"
   herdr pane run "$WPANE" "bash $HERE/herd-watch.sh" >/dev/null 2>"$_CE" \
     || _coord_die "watch pane"
+  # HERD-310 stamp coverage: label the watch/health console pane (the pane the async healthcheck
+  # worker runs INSIDE) so the identity guard can refuse a mismatched close of it, just like the
+  # review/builder panes. This is the pane the 2026-07-10 incident's "healthcheck pane" belongs to.
+  herd_driver_pane_rename "$WPANE" "watch·$WORKSPACE_NAME"
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ⟂ 🐑 herd watch ]   tab $TAB"
 else
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ]   tab $TAB"

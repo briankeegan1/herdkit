@@ -127,6 +127,14 @@ _herd_read_project_config() {
 
 _HERD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _HERD_REPO_DEFAULT="$(cd "$_HERD_SCRIPT_DIR/../.." && pwd)"
+# The shared INVOCATION-CONTEXT check (HERD-269 / HERD-310). bin/herd sources it directly for the CLI
+# actuator guard; herd-config.sh is sourced by EVERY engine surface (agent-watch, the lanes, the
+# hermetic tests), so sourcing it here makes herd_context_pane_guard reachable wherever a pane/tab
+# close primitive lives (herd_teardown_slug below, herd_driver_close_pane) without each caller having
+# to source it. Defines functions only; reads cwd/WORKSPACE_NAME lazily at call time — no side effect
+# on source. Fail-soft if somehow absent (an older engine tree): the primitives guard on command -v.
+# shellcheck source=/dev/null
+[ -f "$_HERD_SCRIPT_DIR/context-guard.sh" ] && . "$_HERD_SCRIPT_DIR/context-guard.sh"
 # _herd_find_config records HOW the config resolved into _HERD_CONFIG_SOURCE (env | walkup |
 # fallback) alongside the path in _HERD_CONFIG_FILE. The source is load-bearing for the console
 # launch-binding guard (issue #60): a long-running console that resolved its config ONLY by the
@@ -813,6 +821,14 @@ except Exception:
 herd_teardown_slug() {
   local _td_slug="${1:-}"; [ -n "$_td_slug" ] || return 0
   command -v herdr >/dev/null 2>&1 || return 0
+  # HERD-310: the ONE test-safety seam for the tab-close path. Closing the {slug, review·slug,
+  # resolve·slug} tabs here severs an in-flight review and kills the builder agent — catastrophic when
+  # a test drives this against the operator's LIVE socket from a builder worktree. From the control
+  # room (main checkout) the guard is a no-op, so a real merge/retirement teardown is byte-identical.
+  if command -v herd_context_pane_guard >/dev/null 2>&1 \
+     && ! herd_context_pane_guard "herd_teardown_slug $_td_slug (tab close)"; then
+    return 0
+  fi
   local _td_wsid; _td_wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
   local _td_list; _td_list="$(herdr tab list 2>/dev/null || true)"
   [ -n "$_td_list" ] || return 0
