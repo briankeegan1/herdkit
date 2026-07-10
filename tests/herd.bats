@@ -272,7 +272,7 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
-@test "hermetic python read-only readers parity (HERD-302 P1 port) test passes" {
+@test "hermetic python engine-port parity — readers (HERD-302 P1) + status format (HERD-307 P1b) test passes" {
   run bash "$REPO/tests/test-py-readers.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
