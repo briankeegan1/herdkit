@@ -163,6 +163,19 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic backlog-view resize repaint (HERD-288) test passes" {
+  run bash "$REPO/tests/test-backlog-view-resize.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "backlog-view rendered frame fits its render width (HERD-288)" {
+  run bash "$REPO/tests/test-backlog-view-width.sh"
+  [ "$status" -eq 0 ]
+  # glow is an OPTIONAL dep — a clean SKIP is a pass, never a red row.
+  [[ "$output" == *"ALL PASS"* || "$output" == *"SKIP"* ]]
+}
+
 @test "hermetic TOKEN_MODE=eco tier test passes" {
 	run bash "$REPO/tests/test-token-mode.sh"
 	[ "$status" -eq 0 ]

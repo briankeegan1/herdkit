@@ -53,6 +53,17 @@ printf '%s\n' "#ABC-1 alpha render item" "#ABC-2 beta render item"
 FAKE
 chmod +x "$BIN/herd"
 
+# Pin the render WIDTH so this test is deterministic (HERD-288). The viewer now reads the pane's real
+# width from the tty, and `script`'s pty defaults to whatever size it inherits — often tiny — which
+# would make glamour hard-wrap the item text unpredictably across lines and between invocations. This
+# test asserts glamour-vs-chroma (no literal '**'/backtick markers), which does NOT depend on width,
+# so we drive a fixed wide width through the BACKLOG_VIEW_COLS_CMD seam and keep the assertion stable.
+cat > "$BIN/cols" <<'EOF'
+#!/usr/bin/env bash
+echo 120
+EOF
+chmod +x "$BIN/cols"
+
 # Temp project with a linear-backend config the loader can source.
 P="$T/proj"; mkdir -p "$P/.herd"
 cat > "$P/.herd/config" <<EOF
@@ -64,9 +75,26 @@ EOF
 
 # assert_glamour <capture-file> <label> — the frame must have rendered the item text (glow ran) but
 # NONE of the shaped markdown markers ('**' or a literal backtick) — i.e. glamour, not chroma/raw.
+#
+# The item-text check is done on a NEWLINE-FLATTENED copy of the capture: glow HARD-WRAPS to the
+# pane's real width, and `script`'s pty defaults to a tiny size, so glamour legitimately splits
+# "alpha render item" across lines (e.g. "alpha⏎render item"). That wrapping is the CORRECT behavior
+# — the width is now read honestly from the tty (HERD-288; the old code's `tput cols 2>/dev/null`
+# always answered terminfo's default 80 regardless of the real pty, so it never wrapped) — so the
+# presence check must be wrap-agnostic. The marker checks stay per-file: a literal '**'/backtick is a
+# render failure wherever it lands, wrapped or not.
 assert_glamour() {
-  local cap="$1" label="$2"
-  grep -q "alpha render item" "$cap" || fail "$label: item text missing — did glow render at all? ($cap)"
+  local cap="$1" label="$2" flat esc
+  esc="$(printf '\033')"
+  # Strip CSI escapes (ESC[…letter, e.g. the SGR color glow paints around each word) and newlines,
+  # then squeeze runs of blanks: glamour's per-word color + a wrap otherwise splits the phrase with
+  # both an SGR reset and a newline between "alpha" and "render item". Literal ESC in the sed pattern
+  # is portable across BSD/GNU sed. The item text survives; only formatting is dropped.
+  flat="$(sed "s/${esc}\[[0-9;?]*[A-Za-z]//g" <"$cap" | tr '\r\n' '  ' | tr -s ' ')"
+  case "$flat" in
+    *"alpha render item"*) : ;;
+    *) fail "$label: item text missing — did glow render at all? ($cap)" ;;
+  esac
   if grep -q '\*\*' "$cap"; then
     fail "$label: literal '**' in the frame — list rendered as raw/chroma source, not glamour"
   fi
@@ -80,6 +108,7 @@ assert_glamour() {
 # console cwd-guard; TERM lets `clear` work.
 COMMON_ENV=(LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:$GLOW_DIR:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm-256color
             HERD_CONFIG_FILE="$P/.herd/config" HERD_ALLOW_FOREIGN_CWD=1
+            BACKLOG_VIEW_COLS_CMD="$BIN/cols"
             BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0)
 
 # ── Case 1: piped capture (always runs; the deterministic, tty-free regression guard) ─────────────

@@ -49,6 +49,67 @@ fi
 last_frame=""
 BACKLOG_VIEW_TMP=""   # backend-mode scratch file for glow; cleaned up on exit
 
+# ── render width (HERD-288) ───────────────────────────────────────────────────
+# The pane's width is NOT fixed: the user zooms the font, resizes the window, or splits the pane.
+# glamour hard-wraps AND right-pads ~80% of its lines with trailing spaces to the exact -w it was
+# handed, so a frame rendered at 118 columns and left on screen in an 80-column pane re-wraps every
+# padded line into the double-spaced stray-char mess this fixes. The width therefore has to be (a)
+# re-read every tick and (b) folded into BOTH render loops' frame-latch keys, so a width change is
+# itself a repaint trigger — content-only keys can never see a resize.
+#
+# _MIN_RENDER_W — glow degrades into unreadable single-word columns below ~20, and a pane narrow
+# enough to drive w to 0 or NEGATIVE makes `glow -w -1` fail outright (a blank pane, not a narrow
+# one). Clamp the floor rather than pass the absurd value through.
+_MIN_RENDER_W=20
+
+# _term_cols — the pane's current column count, read straight off the pane tty (TIOCGWINSZ via
+# `stty size`, which prints "<rows> <cols>").
+#
+# WHY NOT `tput cols` (the historical call, and the DEEPER half of the HERD-288 bug): the width was
+# always read inside a command substitution, where stdout is a PIPE. ncurses then falls back to
+# STDERR to find a terminal to query — and the call was written `$(tput cols 2>/dev/null || echo 100)`,
+# sending stderr to /dev/null too. With no terminal fd left, ncurses silently answers terminfo's
+# DEFAULT: 80. Measured in a 120-column pty: `$(tput cols 2>/dev/null)` → 80, `$(tput cols)` → 120.
+# So the pane rendered at a FIXED w=78 in every pane at every zoom level, regardless of its real
+# width — which is what actually corrupts a pane narrower than 78 (glamour's 78-wide padded lines
+# hard-wrap), and which would have made folding the width into the frame key completely INERT.
+#
+# BACKLOG_VIEW_COLS_CMD is the test seam (invoked with no args, prints a column count) so the resize
+# unit can drive a width change without a terminal; unset in real use. With no readable pane tty
+# (headless driver, CI, tests) it degrades to `tput cols` and finally to 100 — the historical answer
+# on that path, so those frames stay byte-identical.
+_term_cols() {
+  local c="" size=""
+  if [ -n "${BACKLOG_VIEW_COLS_CMD:-}" ]; then
+    c="$($BACKLOG_VIEW_COLS_CMD 2>/dev/null)" || c=""
+  else
+    size="$(stty size <"${HERD_VIEW_TTY:-/dev/tty}" 2>/dev/null)" || size=""
+    case "$size" in *' '*) c="${size#* }" ;; esac
+    [ -n "$c" ] || { c="$(tput cols 2>/dev/null)" || c=""; }
+  fi
+  case "$c" in ''|*[!0-9]*) c=100 ;; esac
+  printf '%s' "$c"
+}
+
+# render_width — the width handed to glow: the pane's columns less the 2-column margin the viewer has
+# always reserved, clamped up to _MIN_RENDER_W so an absurdly narrow pane degrades to a narrow render
+# instead of a failed one.
+render_width() {
+  local w; w=$(( $(_term_cols) - 2 ))
+  [ "$w" -lt "$_MIN_RENDER_W" ] && w="$_MIN_RENDER_W"
+  printf '%s' "$w"
+}
+
+# _winch — set by the SIGWINCH trap below; consumed by _resize_pending(). A resize must repaint at
+# once, not at the end of a 30s backend poll.
+_winch=0
+# _resize_pending — true exactly once per resize (consumes the flag).
+_resize_pending() {
+  [ "$_winch" -eq 1 ] || return 1
+  _winch=0
+  return 0
+}
+
 # Quiet the pane's keyboard. The TTY line discipline echoes keystrokes (e.g. arrow keys -> ^[[A)
 # onto the rendered view, corrupting it. Disabling stdin reads is NOT enough — echo happens in the
 # kernel regardless — so we mute the tty itself with stty, then restore it (and the cursor) on any
@@ -70,6 +131,10 @@ if [ "$EMIT_MD" = 0 ]; then
   }
   trap 'restore_tty; exit 0' INT TERM
   trap restore_tty EXIT
+  # SIGWINCH — the pane was resized/zoomed. Bust the frame latch so the very next tick repaints
+  # unconditionally (a height-only resize leaves the width, and hence the frame key, unchanged, yet
+  # still needs a clear+repaint), and raise the flag poll_wait consumes to cut its wait short.
+  trap '_winch=1; last_frame=""' WINCH
   if [ -n "$saved_tty" ]; then
     stty -echo -icanon <"$HERD_VIEW_TTY" 2>/dev/null
     printf '\033[?25l'  # hide cursor
@@ -102,38 +167,77 @@ _poll_read_key() {
 }
 
 # poll_wait <secs> — the poll interval's wait, made interruptible for the manual-refresh key
-# (HERD-48). Normally waits <secs> and returns 0; if the pane is interactive and the user presses
-# 'r'/'R' during the wait, it returns 10 at once so the caller can force an immediate refetch+repaint.
-# Every OTHER key is ignored — we keep waiting out the REMAINING interval, so a stray keystroke never
-# shortens the poll cadence nor hammers the backend. The read IS the sleep: its timeout equals the
-# poll interval, so with no key pressed the cadence is byte-identical to the old plain `sleep`.
+# (HERD-48) and for a pane resize (HERD-288). Normally waits <secs> and returns 0. If the pane is
+# interactive and the user presses 'r'/'R' during the wait it returns 10 at once, so the caller can
+# force an immediate refetch+repaint. If the pane was RESIZED during the wait it returns 11, so the
+# caller can repaint at once from its CACHED list — 11 must never trigger a refetch, or a drag-resize
+# would hammer the backend. Every OTHER key is ignored — we keep waiting out the REMAINING interval,
+# so a stray keystroke never shortens the poll cadence nor hammers the backend.
+#
+# WHY THE WAIT IS SLICED (measured, not assumed): a trapped SIGWINCH does NOT cut a `read -t` short.
+# The trap runs, then bash RESTARTS the read and serves the full remaining timeout (verified: `read
+# -t 10` with a WINCH at t=0.4s still returns at t=10). So the WINCH trap alone would leave a resized
+# backend pane corrupt for up to a full 30s poll. Instead the tty wait is served in <=_WINCH_SLICE
+# second slices and the flag is checked between them, bounding repaint latency at ~1s while the
+# BACKEND FETCH CADENCE IS UNTOUCHED (the caller, not poll_wait, owns the fetch clock). Slicing is
+# limited to a real interactive tty; the key-hook/headless paths keep the single full-interval wait.
+#
+# WHY rc IS NOT USED TO DETECT THE TIMEOUT: `read -t` does NOT report a timeout portably. bash 5
+# returns >128, but bash 3.2 (macOS /bin/bash — what the hermetic suite runs under) returns 1, i.e.
+# the SAME code as EOF/error. The old `rc -gt 128` timeout branch was therefore dead code on 3.2 and
+# every timeout fell through the EOF branch (benign: both returned 0). Since a slice-per-second loop
+# CANNOT afford to treat a timeout as EOF (it would sleep out the rest of the interval and never
+# check for a resize again), the timeout is instead distinguished by the CLOCK: a slice that actually
+# blocked consumed >=1s, while EOF on a wedged/closed source returns instantly. Repeated instant
+# non-zero returns are the wedged-source signature — sleep out the remainder rather than busy-spin.
 #
 # FAIL-SOFT per the no-false-red rule: with no usable pane tty (headless driver, CI, tests — saved_tty
 # empty or the tty unreadable, and no key hook) it degrades to a plain `sleep` and never touches the
-# tty at all. The read never crashes and never busy-loops: rc >128 = timeout (interval elapsed), rc
-# 1..128 = EOF/error; only rc 0 carries a key. On a wedged tty (EOF/error) we sleep the remainder.
+# tty at all. The read never crashes and never busy-loops; only rc 0 carries a key.
+_WINCH_SLICE=1
+_POLL_WEDGED_SPINS=3   # consecutive instant non-zero reads that mark the key source as wedged/EOF
 poll_wait() {
-  local secs="$1" rc deadline now rem
+  local secs="$1" rc deadline now rem slice t0 spins=0
   case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  # A resize that landed while we were RENDERING (outside this wait) still owes a repaint.
+  _resize_pending && return 11
   if [ -z "${BACKLOG_VIEW_KEY_CMD:-}" ] && { [ -z "$saved_tty" ] || [ ! -r "$HERD_VIEW_TTY" ]; }; then
     [ "$secs" -gt 0 ] && sleep "$secs"
+    _resize_pending && return 11
     return 0
   fi
   now=$(date +%s); deadline=$(( now + secs )); rem="$secs"
   while [ "$rem" -gt 0 ]; do
-    _poll_read_key "$rem"; rc=$?
+    # Slice the wait ONLY on a real interactive tty (where a resize can happen and the read blocks in
+    # the kernel). The key-hook path keeps its single full-interval call, so the hook's contract — and
+    # the existing refresh-key test's cadence — are unchanged.
+    slice="$rem"
+    if [ -n "$saved_tty" ] && [ "$slice" -gt "$_WINCH_SLICE" ]; then slice="$_WINCH_SLICE"; fi
+    t0=$(date +%s)
+    _poll_read_key "$slice"; rc=$?
+    now=$(date +%s)
     if [ "$rc" -eq 0 ]; then
       case "$_poll_key" in r|R) return 10 ;; esac
       # any other key → keep waiting out the remaining interval
-    elif [ "$rc" -gt 128 ]; then
-      return 0            # timed out — full interval elapsed
+      spins=0
     else
-      # EOF/error on the source: don't spin — sleep any time left in the interval, then return.
-      now=$(date +%s); rem=$(( deadline - now ))
-      [ "$rem" -gt 0 ] && sleep "$rem"
-      return 0
+      # Non-zero: a timeout (blocked for the slice) or EOF/error (returned instantly). Only the
+      # instant kind can busy-spin, and only a RUN of them means the source is truly wedged.
+      if [ "$(( now - t0 ))" -eq 0 ]; then
+        spins=$(( spins + 1 ))
+        if [ "$spins" -ge "$_POLL_WEDGED_SPINS" ]; then
+          _resize_pending && return 11
+          rem=$(( deadline - now ))
+          [ "$rem" -gt 0 ] && sleep "$rem"
+          return 0
+        fi
+      else
+        spins=0
+      fi
     fi
-    now=$(date +%s); rem=$(( deadline - now ))
+    # Checked after EVERY slice — this, not the read's rc, is what makes a resize prompt.
+    _resize_pending && return 11
+    rem=$(( deadline - now ))
   done
   return 0
 }
@@ -361,19 +465,21 @@ fi
 #     keys color off stdOUT (the pane) and CLICOLOR_FORCE forces it on regardless of stdin.
 glow_pane() { CLICOLOR_FORCE=1 COLORTERM=truecolor glow "$@" </dev/null; }
 
-# render_backend_frame <list> <degraded 0|1> <since HH:MM> <refreshed HH:MM> <incoming>
+# render_backend_frame <list> <degraded 0|1> <since HH:MM> <refreshed HH:MM> <incoming> <width>
 # Clears + repaints the pane: styled header, then the list (glow if available, else plain text), then
 # — only when degraded — one dim last-good warning line, then the optional additive <incoming> block
 # (empty when BACKLOG_VIEW_EXTRAS is off → no change). Returns non-zero if the body render failed so
 # the caller can leave last_frame unlatched and retry (mirrors the file loop's success-latch).
+# <width> is passed in (not re-read) so the frame is painted at the EXACT width its frame key was
+# computed from — re-reading here could race a resize and latch a key that describes a different frame.
 render_backend_frame() {
-  local list="$1" degraded="$2" since="$3" refreshed="$4" incoming="${5:-}"
+  local list="$1" degraded="$2" since="$3" refreshed="$4" incoming="${5:-}" w="${6:-}"
   local hhmm="${refreshed:---:--}" rc=0
+  [ -n "$w" ] || w="$(render_width)"
   clear
   # e.g. '📋 herdkit · linear · live · 15:42'
   printf '\033[1;36m📋 %s\033[0m \033[2m· %s · live · %s\033[0m\n\n' \
     "$WORKSPACE_NAME" "$SCRIBE_BACKEND" "$hhmm"
-  local w; w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
   if [ -n "$list" ]; then
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then
       shape_md "$list" > "$BACKLOG_VIEW_TMP" && glow_pane -s "$STYLE" -w "$w" "$BACKLOG_VIEW_TMP" || rc=$?
@@ -429,42 +535,59 @@ run_backend_mode() {
   esac
 
   local last_good="" last_hash="" degraded=0 since="" refreshed="" frame="" polls=0
+  local raw="" rc=0 trimmed="" cur_hash="" incoming="" inc_hash="" w=""
+  # The FETCH clock, deliberately separate from the repaint clock (HERD-288). A resize must repaint
+  # promptly, but it must NOT refetch: a drag-resize would otherwise hammer the backend once per
+  # wiggle. next_fetch is the epoch second the backend may next be polled; a resize wake re-enters the
+  # loop, finds now < next_fetch, and repaints from the CACHED last_good instead.
+  local next_fetch=0 now=0 wait_secs=0 wrc=0
   while true; do
-    # Capture stdout only; DISCARD stderr — it may carry the backend's raw API error body or headers
-    # (secrets). Run from $REPO so `herd backlog` finds this project's .herd/config.
-    # Ask for --rich first (state-grouped TSV when the backend supports it; backends without the
-    # op serve the plain list under the same flag). A herd that predates --rich rejects the flag
-    # non-zero — retry plain so the viewer never degrades just because the CLI is older.
-    local raw rc trimmed cur_hash
-    raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog --rich 2>/dev/null)"; rc=$?
-    if [ "$rc" -ne 0 ]; then
-      raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
-    fi
-    trimmed="$(printf '%s' "$raw" | tr -d '[:space:]')"
-
-    # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS is on; its
-    # content is folded into the frame key so a change in the incoming list also triggers a repaint.
-    local incoming inc_hash
-    incoming="$(incoming_block)"
-    inc_hash="$(printf '%s' "$incoming" | cksum)"
-
-    if [ "$rc" -eq 0 ] && [ -n "$trimmed" ]; then
-      # Healthy poll. Re-render only when the list content actually changed (hash it).
-      degraded=0; since=""
-      cur_hash="$(printf '%s' "$raw" | cksum)"
-      if [ "$cur_hash" != "$last_hash" ]; then
-        last_hash="$cur_hash"; last_good="$raw"; refreshed="$(now_hhmm)"
+    now=$(date +%s)
+    if [ "$now" -ge "$next_fetch" ]; then
+      # Capture stdout only; DISCARD stderr — it may carry the backend's raw API error body or headers
+      # (secrets). Run from $REPO so `herd backlog` finds this project's .herd/config.
+      # Ask for --rich first (state-grouped TSV when the backend supports it; backends without the
+      # op serve the plain list under the same flag). A herd that predates --rich rejects the flag
+      # non-zero — retry plain so the viewer never degrades just because the CLI is older.
+      raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog --rich 2>/dev/null)"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
       fi
-      frame="ok|$last_hash|$refreshed|$inc_hash"
+      trimmed="$(printf '%s' "$raw" | tr -d '[:space:]')"
+
+      # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS is on; its
+      # content is folded into the frame key so a change in the incoming list also triggers a repaint.
+      # Refreshed on the FETCH tick only, so resize wakes never invoke `gh` either.
+      incoming="$(incoming_block)"
+      inc_hash="$(printf '%s' "$incoming" | cksum)"
+
+      if [ "$rc" -eq 0 ] && [ -n "$trimmed" ]; then
+        # Healthy poll. Re-render only when the list content actually changed (hash it).
+        degraded=0; since=""
+        cur_hash="$(printf '%s' "$raw" | cksum)"
+        if [ "$cur_hash" != "$last_hash" ]; then
+          last_hash="$cur_hash"; last_good="$raw"; refreshed="$(now_hhmm)"
+        fi
+      else
+        # Degraded poll (error or empty). Keep the last good list; never blank, never red. Stamp the
+        # unreachable-since time once, on the transition into degraded.
+        if [ "$degraded" -eq 0 ]; then degraded=1; since="$(now_hhmm)"; fi
+      fi
+      next_fetch=$(( now + poll ))
+    fi
+
+    # Re-read the width EVERY tick and fold it into the frame key: glamour pads its lines to the exact
+    # width it rendered at, so a stale-width frame left in a narrower pane re-wraps into garbage. A
+    # content-only key cannot see a resize — this is the core of the HERD-288 fix.
+    w="$(render_width)"
+    if [ "$degraded" -eq 0 ]; then
+      frame="ok|$last_hash|$refreshed|$inc_hash|$w"
     else
-      # Degraded poll (error or empty). Keep the last good list; never blank, never red. Stamp the
-      # unreachable-since time once, on the transition into degraded.
-      if [ "$degraded" -eq 0 ]; then degraded=1; since="$(now_hhmm)"; fi
-      frame="down|$last_hash|$since|$inc_hash"
+      frame="down|$last_hash|$since|$inc_hash|$w"
     fi
 
     if [ "$frame" != "$last_frame" ]; then
-      if render_backend_frame "$last_good" "$degraded" "$since" "$refreshed" "$incoming"; then
+      if render_backend_frame "$last_good" "$degraded" "$since" "$refreshed" "$incoming" "$w"; then
         last_frame="$frame"
       fi
     fi
@@ -475,12 +598,24 @@ run_backend_mode() {
     if [ -n "${BACKLOG_VIEW_MAX_POLLS:-}" ] && [ "$polls" -ge "$BACKLOG_VIEW_MAX_POLLS" ]; then
       break
     fi
-    # Wait out the poll interval — but let the user force an instant refresh with r/R (HERD-48). On
-    # refresh clear last_hash (so the NEXT poll treats the re-fetch as new → refreshes last_good and the
-    # HH:MM stamp) AND bust last_frame (so the repaint actually happens): the frame key is content-hash
-    # + HH:MM + incoming, so unchanged content polled twice inside the same minute is otherwise latched
-    # as an identical frame and would NOT repaint. Busting last_frame guarantees the requested repaint.
-    poll_wait "$poll" || { last_hash=""; last_frame=""; }
+    # Wait out what REMAINS of the poll interval — but let the user force an instant refresh with r/R
+    # (HERD-48), and wake at once on a resize (HERD-288). Never wait 0s while polling: poll_wait is
+    # also the only place a keypress is read, so a 0s wait would make r/R unreachable.
+    now=$(date +%s); wait_secs=$(( next_fetch - now ))
+    [ "$wait_secs" -lt 0 ] && wait_secs=0
+    if [ "$poll" -gt 0 ] && [ "$wait_secs" -eq 0 ]; then wait_secs=1; fi
+    poll_wait "$wait_secs"; wrc=$?
+    case "$wrc" in
+      # 'r' — force an immediate refetch+repaint. Clear last_hash (so the NEXT poll treats the
+      # re-fetch as new → refreshes last_good and the HH:MM stamp) AND bust last_frame (so the repaint
+      # actually happens): the frame key is content-hash + HH:MM + incoming + width, so unchanged
+      # content polled twice inside the same minute at one width is otherwise latched as an identical
+      # frame and would NOT repaint. Opening the fetch clock lets the refetch happen right away.
+      10) last_hash=""; last_frame=""; next_fetch=0 ;;
+      # Resize — repaint on the next tick from the CACHED list. next_fetch is deliberately untouched:
+      # the backend is NOT refetched, so a drag-resize cannot hammer it.
+      11) : ;;
+    esac
   done
 }
 
@@ -523,13 +658,15 @@ while true; do
     inc_next=$(( now + inc_poll ))
   fi
 
-  # render only when the file, banner, or incoming state changes -> idle pane never repaints
-  frame="$cur_mtime|$banner|$(printf '%s' "$incoming" | cksum)"
+  # render only when the file, banner, incoming state, or PANE WIDTH changes -> idle pane never
+  # repaints, but a resize/zoom always does (HERD-288: glamour pads every line to the width it
+  # rendered at, so a stale-width frame re-wraps into garbage in a narrower pane).
+  w="$(render_width)"
+  frame="$cur_mtime|$banner|$(printf '%s' "$incoming" | cksum)|$w"
   if [ "$frame" != "$last_frame" ]; then
     clear
     printf '\033[1;36m📋 %s\033[0m  \033[2m(live)\033[0m\n' "$BACKLOG_FILE"
     printf '%b\n\n' "$banner"
-    w=$(( $(tput cols 2>/dev/null || echo 100) - 2 ))
     if   command -v glow >/dev/null 2>&1 && [ -f "$STYLE" ]; then glow -s "$STYLE" -w "$w" "$f"
     elif command -v glow >/dev/null 2>&1;                    then glow -s dark     -w "$w" "$f"
     else cat "$f"; fi
@@ -545,8 +682,9 @@ while true; do
     # stale/blank content until mtime or banner changes again.
     if [ "$render_rc" -eq 0 ]; then last_frame="$frame"; fi
   fi
-  # Wait out the 2s tick — interruptible by the manual-refresh key (HERD-48). On r/R, bust the frame
-  # latch so the next iteration force-repaints with a fresh git-log freshness read even when the file
-  # (and banner) are unchanged.
+  # Wait out the 2s tick — interruptible by the manual-refresh key (HERD-48) and by a pane resize
+  # (HERD-288). Either way (rc 10 or 11) bust the frame latch so the next iteration force-repaints
+  # with a fresh git-log freshness read even when the file (and banner) are unchanged. This loop has
+  # no backend to spare, so a resize needs no special-casing here — unlike run_backend_mode's.
   poll_wait 2 || last_frame=""
 done
