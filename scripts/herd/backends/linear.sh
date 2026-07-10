@@ -612,6 +612,52 @@ if meta:
     }
 }
 
+# _backend_item_missing <ref> — OPTIONAL, TRI-STATE existence probe. The ONLY safe basis for an
+# automated "this tracker item was never created" verdict (HERD-267).
+#
+#   exit 0  PROVABLY MISSING — the API answered, cleanly, with zero matching issues.
+#   exit 1  EXISTS          — the API answered and resolved the ref.
+#   exit 2  UNPROVEN        — no key, no curl, an unparseable ref, a transport failure, an HTTP/GraphQL
+#                             error body (auth, rate limit, 5xx), or anything else that means WE DO NOT
+#                             KNOW. The caller must treat this exactly like EXISTS: say nothing, do nothing.
+#
+# Why this exists rather than reusing _backend_show_item: that op collapses not-found, transport
+# failure, auth error, rate limit and every GraphQL error body into ONE non-zero return. A caller that
+# reads non-zero as "missing" cannot tell a tracker that never minted the item from a tracker that is
+# DOWN or REFUSING — so a Linear outage (or an expired key) would read as "every merged PR's item is
+# missing" and drive a burst of duplicate filings. Worse, an expired key produces that misreading at
+# exactly the moment create_retry_class is correctly marking creates auth/permanent. The distinction
+# between "no answer" and "answered: nothing there" is the whole safety property, so it gets its own op.
+#
+# `errors` is checked before `data`: Linear returns HTTP 200 with a populated `errors` array (and a
+# null/empty `data`) for auth and rate-limit refusals, which the nodes parser alone would read as zero
+# matches. curl's exit status is checked too — an unreachable host yields an empty body, not an error body.
+_backend_item_missing() {
+    local ref="$1" resp
+    [ -n "${LINEAR_API_KEY:-}" ] || return 2
+    command -v curl >/dev/null 2>&1 || return 2
+    _linear_issue_query "$ref" 'identifier' || return 2   # not a TEAMKEY-NUMBER identifier → we cannot ask
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS" 2>/dev/null)" || return 2
+    [ -n "$resp" ] || return 2
+    printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)                       # unparseable body — the API did not answer us
+if not isinstance(d, dict) or d.get("errors"):
+    sys.exit(2)                       # auth / rate limit / 5xx / any GraphQL error → UNPROVEN
+data = d.get("data")
+if not isinstance(data, dict) or "issues" not in data:
+    sys.exit(2)                       # no data envelope at all → UNPROVEN
+nodes = ((data.get("issues") or {}).get("nodes"))
+if nodes is None:
+    sys.exit(2)
+sys.exit(0 if len(nodes) == 0 else 1)  # a clean answer: 0 matches = provably missing
+' 2>/dev/null
+    return $?
+}
+
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
     # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)

@@ -111,8 +111,10 @@ create_retry_class() {
         #    which is precisely what the retry queue is for.
         *ratelimit*|*rate_limit*|*rate-limit*|*rate\ limit*)
             printf 'transient' ;;
-        # 3. AUTH — a credential a human must fix.
-        *authentication*|*unauthenticated*|*unauthorized*|*forbidden*|*invalid\ api\ key*|*api\ key*|*401*|*403*)
+        # 3. AUTH — a credential a human must fix. The bare status codes are ANCHORED to an http-status
+        #    context (or a whole-string status), the same treatment the 5xx test gets below: an issue
+        #    identifier like PROJ-401, or a message mentioning "401 items", is not an auth failure.
+        *authentication*|*unauthenticated*|*unauthorized*|*forbidden*|*invalid\ api\ key*|*api\ key*|*http\ 40[13]*|*status\ 40[13]*|40[13])
             printf 'auth' ;;
         # 4. A generic "limit exceeded" that survived arms 1–3 is a cap by elimination.
         *limit_exceeded*|*limit\ exceeded*|*exceeded\ the\ limit*)
@@ -160,14 +162,6 @@ _create_retry_backoff() {
     printf '%s' "$delay"
 }
 
-# create_retry_key <text> [entry-hash] — the entry key for a request. The optional second argument is
-# the hash carried by a RE-INJECTED request's own filename, and it WINS when its entry still exists.
-#
-# Why the override matters: a retried request goes back through the scribe drainer, an LLM, which may
-# hand `add-item` a text that differs from the stored one by a stripped trailing newline or a
-# re-wrapped line. Hashing THAT text would (a) fail to resolve the original entry on success, leaving
-# it to re-inject and file a duplicate forever, and (b) fork a SECOND entry on failure, defeating the
-# coalescing. Keying off the filename the engine itself minted removes the LLM from the identity path.
 # _create_retry_write_failed <why> — the durable write could not be made. Shout, journal, and let the
 # caller's non-zero return keep the ONLY surviving copy of the request. Never swallowed: this is the
 # failure that, silent, reproduces the incident exactly.
@@ -178,11 +172,39 @@ _create_retry_write_failed() {
     fi
 }
 
+# _create_retry_hash_file <path> — the same short hash, taken over a file's exact BYTES.
+_create_retry_hash_file() {
+    [ -f "$1" ] || return 1
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 1 < "$1" 2>/dev/null | cut -c1-16
+    elif command -v sha1sum >/dev/null 2>&1; then
+        sha1sum < "$1" 2>/dev/null | cut -c1-16
+    else
+        python3 -c 'import sys, hashlib
+print(hashlib.sha1(open(sys.argv[1], "rb").read()).hexdigest()[:16])' "$1" 2>/dev/null
+    fi
+}
+
+# create_retry_key <text> [entry-hash] [src-file] — the entry key for a request. Identity is taken
+# from the most faithful source available, in this order:
+#
+#   1. <entry-hash>, the hash carried by a RE-INJECTED request's own filename, when its entry still
+#      exists. A retried request goes back through the scribe drainer — an LLM — which may hand
+#      `add-item` a text differing from the stored one by a stripped trailing newline or a re-wrapped
+#      line. Hashing THAT text would (a) fail to resolve the original entry on success, leaving it to
+#      re-inject and file a duplicate forever, and (b) fork a SECOND entry on failure, defeating the
+#      coalescing. The filename the engine itself minted keeps the LLM out of the identity path.
+#   2. <src-file>, the CLAIMED `.req` still on disk: the requester's bytes, exactly as written.
+#   3. <text>, the string the caller passed. The last resort.
 create_retry_key() {
-    local text="$1" override="${2:-}" dir
+    local text="$1" override="${2:-}" src="${3:-}" dir h
     if [ -n "$override" ]; then
         dir="$(create_retry_dir 2>/dev/null)" || dir=""
         if [ -n "$dir" ] && [ -f "$dir/$override.text" ]; then printf '%s' "$override"; return 0; fi
+    fi
+    if [ -n "$src" ] && [ -f "$src" ]; then
+        h="$(_create_retry_hash_file "$src")"
+        if [ -n "$h" ]; then printf '%s' "$h"; return 0; fi
     fi
     _create_retry_hash "$text"
 }

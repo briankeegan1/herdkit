@@ -776,12 +776,17 @@ sweep_leg_procs() {
 # the enqueue by PR number so a leg that runs every cadence tick enqueues each PR exactly once.
 SWEEP_RELINK_LIMIT="${HERD_RELINK_LIMIT:-20}"   # merged PRs examined per run (test seam: HERD_RELINK_LIMIT)
 
+# Set by _sweep_relink_missing when a lookup could NOT be resolved (no credential, unreachable host,
+# auth/rate-limit refusal, a backend with no tri-state probe). Always DEFINED so the watcher — which
+# sources this file under `set -u` — reads it safely. Reset per leg run.
+_SWEEP_RELINK_UNPROVEN=0
+
 # _sweep_relink_pr_rows — one "<number>\t<url>\t<ref>" row per recently-merged PR that carries a
-# `Refs:` line, ref-less PRs omitted. HTML comment blocks are stripped first, exactly as
-# agent-watch.sh's _reconcile_pr_ref does: a classic PULL_REQUEST_TEMPLATE.md carries an EXAMPLE
-# `Refs:` inside a `<!-- … -->`, and reading it as real would have this leg file an issue for every
-# untracked PR in the repo. HERD_RELINK_PR_JSON is the hermetic seam (a file holding the same JSON
-# `gh pr list` returns), so the test never touches the network.
+# `Refs:` line, ref-less PRs omitted. The ref extraction is NOT re-implemented here: it reuses
+# agent-watch.sh's HERD_PR_REF_PY, the same snippet merge-time reconcile parses with, so the two
+# surfaces cannot drift apart on HTML-comment stripping, placeholders, or trailing punctuation.
+# HERD_RELINK_PR_JSON is the hermetic seam (a file holding the same JSON `gh pr list` returns), so
+# the test never touches the network.
 _sweep_relink_pr_rows() {
   local raw
   if [ -n "${HERD_RELINK_PR_JSON-}" ] && [ -f "${HERD_RELINK_PR_JSON-}" ]; then
@@ -791,20 +796,14 @@ _sweep_relink_pr_rows() {
     raw="$(gh pr list --state merged --limit "$SWEEP_RELINK_LIMIT" --json number,url,body 2>/dev/null || true)"
   fi
   [ -n "$raw" ] || return 0
-  printf '%s' "$raw" | python3 -c '
-import sys, json, re
+  printf '%s' "$raw" | python3 -c "$HERD_PR_REF_PY"'
+import sys, json
 try: prs = json.load(sys.stdin)
 except Exception: sys.exit(0)
 if not isinstance(prs, list): sys.exit(0)
-PLACEHOLDER = {"", "none", "n/a", "na"}
 for p in prs:
-    body = re.sub(r"<!--.*?-->", "", p.get("body") or "", flags=re.DOTALL)
-    ref = ""
-    for line in body.splitlines():
-        m = re.match(r"^\s*refs:\s*(\S+)", line, re.IGNORECASE)
-        if m:
-            ref = m.group(1); break
-    if not ref or ref.startswith("<") or ref.lower() in PLACEHOLDER:
+    ref = pr_ref_from_body(p.get("body") or "")
+    if not ref:
         continue
     print("%s\t%s\t%s" % (p.get("number", ""), p.get("url", ""), ref))
 ' 2>/dev/null || true
@@ -821,25 +820,51 @@ _sweep_relink_is_identifier() {
   esac
 }
 
-# _sweep_relink_missing <ref> — 0 when the tracker PROVABLY holds no item for this ref.
-# Non-identifier refs are missing by definition. An identifier is resolved through the ACTIVE backend's
-# OPTIONAL single-item read, sourced in a SUBSHELL so no _backend_* function leaks into the sweep's
-# namespace (the same isolation _reconcile_via_ref uses). A backend without that op, an unreadable
-# backend file, or any transport failure returns 1 — UNPROVEN, so the leg says nothing.
+# _sweep_relink_missing <ref> — 0 ONLY when the tracker PROVABLY holds no item for this ref.
+#
+# "PROVABLY" is doing all the work, and getting it wrong is a LIVE WRITE: sweep_run_safe_legs calls
+# this leg with dry="" on the watcher's auto path, so a wrong verdict enqueues a scribe request that
+# files a duplicate tracker item, and stamps the PR into the one-way seen-ledger so the verdict is
+# never revisited. Two states are provable, and they are asked in this order:
+#
+#   1. the ref is not a tracker identifier at all (a bare slug, a branch name) — proof-positive that
+#      no id was ever minted, and it needs no network at all. This is the incident's own shape.
+#   2. the ref IS an identifier and the backend's TRI-STATE probe answers "the API replied cleanly
+#      with zero matches".
+#
+# EVERYTHING ELSE IS UNPROVEN and the leg says nothing: a resolvable item, a backend with no probe op,
+# an unreadable backend file, no credential, an unreachable host, an auth or rate-limit refusal, a 5xx.
+# We deliberately do NOT fall back to _backend_show_item, whose single non-zero return collapses
+# not-found together with every transport and API failure — reading that as "missing" turns a tracker
+# OUTAGE into a burst of duplicate filings (and does so precisely when an expired key is already making
+# create_retry_class mark creates auth/permanent). A tracker that will not answer is not a tracker that
+# said no.
+#
+# Sets _SWEEP_RELINK_UNPROVEN=1 when a lookup could not be resolved, so the leg can tell the operator
+# it stood down rather than silently reporting a clean sweep over an unreachable tracker.
+#
+# The backend is sourced in a SUBSHELL so no _backend_* function leaks into the long-lived watcher's
+# namespace (the same isolation _reconcile_via_ref uses).
 _sweep_relink_missing() {
-  local ref="$1" bfile
-  _sweep_relink_is_identifier "$ref" || return 0
+  local ref="$1" bfile rc
+  _sweep_relink_is_identifier "$ref" || return 0        # (1) provable with no lookup
   bfile="${SCRIBE_BACKEND_DIR:-$_SWEEP_HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
-  [ -f "$bfile" ] || return 1
+  [ -f "$bfile" ] || { _SWEEP_RELINK_UNPROVEN=1; return 1; }
   (
     # shellcheck source=/dev/null
     [ -f "$MAIN/.herd/secrets" ] && . "$MAIN/.herd/secrets"
     # shellcheck source=/dev/null
-    . "$bfile" 2>/dev/null || exit 1
-    command -v _backend_show_item >/dev/null 2>&1 || exit 1
-    _backend_show_item "$ref" >/dev/null 2>&1 && exit 1   # resolved → the item exists
-    exit 0
+    . "$bfile" 2>/dev/null || exit 2
+    command -v _backend_item_missing >/dev/null 2>&1 || exit 2   # no tri-state probe → UNPROVEN
+    _backend_item_missing "$ref" >/dev/null 2>&1
+    exit $?
   )
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;                                      # (2) the API answered: nothing there
+    1) return 1 ;;                                      # the item exists
+    *) _SWEEP_RELINK_UNPROVEN=1; return 1 ;;            # we do not know — never act on that
+  esac
 }
 
 # _sweep_relink_request <pr> <url> <ref> — the scribe request text. First line is a SHORT title (the
@@ -873,8 +898,12 @@ _sweep_relink_scan_due() {
 }
 
 sweep_leg_links() {
-  local dry="$1" throttle="${2:-}" seen="$TREES/.create-relink-seen" pr url ref q
+  # Every name declared local: this runs inside the long-lived watcher process, and a leaked `state`
+  # or `title` would quietly collide with the next caller's.
+  local dry="$1" throttle="${2:-}" seen="$TREES/.create-relink-seen" pr url ref q tmp
+  local state class attempts title
   create_retry_enabled || return 0
+  _SWEEP_RELINK_UNPROVEN=0
 
   # The durable retry queue's own rows first: ONE line per distinct request, carrying its attempt
   # count. A cap-killed filing that has failed nine times renders once here reading attempts=9 —
@@ -902,12 +931,18 @@ sweep_leg_links() {
     # the tracker directly. Record the PR in the seen-ledger only after the request is really queued,
     # so a write that fails is retried on the next sweep rather than silently forgotten.
     mkdir -p "$q" 2>/dev/null || continue
-    local tmp; tmp="$(mktemp "$q/.tmp.relink.XXXXXX" 2>/dev/null)" || continue
+    tmp="$(mktemp "$q/.tmp.relink.XXXXXX" 2>/dev/null)" || continue
     _sweep_relink_request "$pr" "$url" "$ref" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
     mv "$tmp" "$q/$(_now_epoch 2>/dev/null || date +%s)-relink-${pr}.req" 2>/dev/null || { rm -f "$tmp"; continue; }
     printf '%s\n' "$pr" >> "$seen" 2>/dev/null || true
     journal_append link_heal pr "$pr" ref "$ref" result enqueued
   done <<< "$(_sweep_relink_pr_rows)"
+  # A tracker we could not reach is not a clean tracker. Say so once, so an operator reading a
+  # zero-finding sweep during a Linear outage knows the leg stood down rather than passed.
+  if [ "$_SWEEP_RELINK_UNPROVEN" -ne 0 ]; then
+    _sweep_say "⏸ " "relink check stood down — the tracker did not answer for at least one ref (unproven ≠ missing)"
+    journal_append link_heal result unproven
+  fi
   return 0
 }
 
