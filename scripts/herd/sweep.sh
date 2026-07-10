@@ -576,13 +576,20 @@ _sweep_watcher_has_gate_child() { watcher_has_gate_child "$@"; }
 #
 # "Watcher main" is decided by watcher_list_mains (scripts/herd/watcher-exempt.sh), the ONE shared
 # check — so this leg and `herd status` can never disagree about what a duplicate is (HERD-266). Its
-# exemptions spare the canonical watcher's own argv0-inherited forks: a marker-owned gate worker, a
-# child of the canonical (lockfile) watcher, and a reparented fork still parenting a live
-# healthcheck.sh / herd-review.sh. Listing one of those hands it to leg 5's _stop_project_watcher,
-# which SIGKILLs it — destroying in-flight gate work and stranding the PR behind a corpse (observed
-# live 2026-07-09: a MAIN_HEALTH_TICK heavy-healthcheck worker, a child of the canonical watcher, was
-# flagged '👻 duplicate watcher'). A GENUINE orphan duplicate (parent dead, no gate child) is still
-# listed here and still killed.
+# listing already spares the canonical watcher's own argv0-inherited forks that can be PROVEN as such:
+# a marker-owned gate worker (clause 1) and a child of the canonical watcher (clause 2).
+#
+# On top of that, and ONLY here, we re-apply the HERD-217 gate-child guard: skip a tagged pid that
+# PARENTS a live healthcheck.sh / herd-review.sh gate worker. That guard belongs on this surface and
+# no other. It is a HEURISTIC — it cannot tell a reparented fork from a stray watcher MAIN that merely
+# dispatched a gate worker — and the cost of each mistake is asymmetric:
+#   • HERE (detection): a missed stray is re-detected on the next sweep, but a FALSE stray is handed to
+#     leg 5's _stop_project_watcher, which SIGKILLs it — destroying in-flight gate work and stranding
+#     the PR behind a corpse (observed live 2026-07-09: a MAIN_HEALTH_TICK heavy-healthcheck worker, a
+#     child of the canonical watcher, flagged '👻 duplicate watcher'). So we err toward sparing.
+#   • In watcher_list_mains: erring toward sparing would hide a gate-running duplicate from BOTH the
+#     `herd status` count and _stop_project_watcher's kill loop — the very safety rail. So we do not.
+# A GENUINE orphan duplicate (parent dead, no gate child) is still listed here and still killed.
 #
 # We subtract the RECORDED lockfile pid (not merely the live one): watcher_list_mains omits it when
 # alive, and a dead recorded pid can only appear in a synthetic table. The process table is read ONCE
@@ -596,6 +603,7 @@ sweep_stray_watchers() {
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ -n "$wpid" ] && [ "$pid" = "$wpid" ] && continue
+    _sweep_watcher_has_gate_child "$pid" "$table" && continue
     printf '%s\n' "$pid"
   done < <(watcher_list_mains "$table")
 }

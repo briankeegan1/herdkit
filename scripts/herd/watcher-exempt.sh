@@ -24,18 +24,31 @@
 # to prevent. This file is the reconciled invariant — ONE exemption check, sourced by BOTH seats (and
 # by status.sh's alarm), so no surface can disagree about what a duplicate watcher is.
 #
-# A pid carrying our argv0 is EXEMPT (i.e. not a main) when ANY of:
+# A pid carrying our argv0 is EXEMPT from the LISTING (i.e. is not a main) when EITHER of:
 #   (1) MARKER-OWNED     — a live .review-inflight-* / .health-inflight-* / .spawn-inflight-* marker
 #                          records it. It is mid-flight gate work, possibly reparented to init by a
 #                          watcher restart (HERD-185/217/237/245). SIGTERMing it destroys that work.
 #   (2) CHILD-OF-CANONICAL — its ppid is the pid recorded in $HERD_WATCHER_LOCK. A child of the
 #                          canonical watcher is that watcher's own fork, by construction.
-#   (3) PARENT-OF-GATE-WORKER — it parents a live healthcheck.sh / herd-review.sh / herd-feature.sh /
-#                          herd-quick.sh / herd-resolve.sh. A fork reparented to init when its watcher
-#                          died is still doing real work; the marker sweep reaps it on its own terms.
-# A GENUINE ORPHAN DUPLICATE — parent dead, no gate child, no marker — passes every clause and IS
-# listed. That is the real failure this machinery exists to catch (a duplicate races the shared .git
-# object store), and nothing here softens it.
+# A GENUINE ORPHAN DUPLICATE — parent dead, not marker-owned — passes both clauses and IS listed. That
+# is the real failure this machinery exists to catch (a duplicate races the shared .git object store),
+# and nothing here softens it.
+#
+# WHY PARENT-OF-GATE-WORKER IS **NOT** A LISTING CLAUSE. sweep_stray_watchers carries a third guard —
+# spare a tagged pid that PARENTS a live healthcheck.sh / herd-review.sh / herd-feature.sh — and it is
+# tempting to hoist it here too. It must not be hoisted, because that guard cannot tell a reparented
+# FORK from a watcher MAIN that merely dispatched a gate worker:
+#   • macOS has no setsid, so _bg_new_session's python3 os.setsid()+execvp branch leaves
+#     `bash …/herd-review.sh` a DIRECT CHILD of the dispatching watcher main;
+#   • the inflight marker records the WORKER's pid, not the dispatching watcher's, so clause (1) does
+#     not cover that main either.
+# So a lock-absent STRAY watcher that has dispatched a review would be exempted — invisible to `herd
+# status` (a calm green `alive`, precisely when the duplicate exists and its healthchecks restart
+# endlessly) and, worse, skipped by _stop_project_watcher, which would then report "no running watcher
+# found", drop the lockfile, and let the caller spawn a fresh watcher ON TOP of the survivor. That is
+# the exact emergency this machinery prevents. watcher_list_mains feeds BOTH the status count AND the
+# kill list, so it must count a gate-running stray as the main it is. The guard stays where it is safe:
+# sweep.sh's DETECTION-only surface, applied there via the shared watcher_has_gate_child predicate.
 #
 # HANDOFF (root cause 1). WATCHER_SELF_RESTART=on re-execs the watcher in place. exec preserves the
 # pid, but the OUTGOING image's still-running forks are momentarily neither marker-owned nor children
@@ -65,9 +78,6 @@ HERD_WATCHER_EXEMPT_LIB=1
 # not a config key: it is an upper bound on an exec, not an operator preference. A crashed exec's
 # marker stops masking after this, so a REAL duplicate can hide for at most this long.
 WATCHER_HANDOFF_TTL="${HERD_WATCHER_HANDOFF_TTL:-120}"
-
-# Gate workers + backgrounded lane dispatches a tagged fork may legitimately parent (clause 3).
-WATCHER_GATE_CHILD_RE='healthcheck\.sh|herd-review\.sh|herd-feature\.sh|herd-quick\.sh|herd-resolve\.sh'
 
 # _wx_trees — this project's worktrees dir under whichever name the caller has in scope: bin/herd and
 # status.sh export WORKTREES_DIR, agent-watch.sh/sweep.sh use TREES. Empty when none is set (a
@@ -170,39 +180,50 @@ watcher_handoff_active() {
 
 # ── The exemption check ──────────────────────────────────────────────────────────────────────────
 
-# watcher_has_gate_child <pid> <table> — success iff some row of <table> is a live gate worker or
-# lane dispatch whose PARENT is <pid> (clause 3). The table is passed in so the parent/child edge
-# resolves against the SAME snapshot the caller matched argv0 against — no second, racy `ps`.
+# watcher_has_gate_child <pid> <table> — success iff some row of <table> is a live gate worker or lane
+# dispatch whose PARENT is <pid>. The table is passed in so the parent/child edge resolves against the
+# SAME snapshot the caller matched argv0 against — no second, racy `ps`.
+#
+# NOT a listing clause (see the header): this predicate cannot tell a reparented fork from a watcher
+# main that dispatched a gate worker, so it is safe ONLY on a surface that never kills. Its one caller
+# is sweep.sh's sweep_stray_watchers (detection).
+#
+# Matched with `case` globs, not a grep: this runs per candidate pid per child row, and forking a grep
+# for each would allocate a process to answer a question about a string we already hold.
 watcher_has_gate_child() {
   local parent="${1:-}" table="${2:-}" cpid cppid cpgid ccmd
   [ -n "$parent" ] || return 1
   while read -r cpid cppid cpgid ccmd; do
     [ "$cppid" = "$parent" ] || continue
-    printf '%s' "$ccmd" | grep -Eq "$WATCHER_GATE_CHILD_RE" && return 0
+    case " $ccmd " in
+      # gate workers (HERD-245) + the backgrounded lane dispatches (HERD-237).
+      *healthcheck.sh*|*herd-review.sh*) return 0 ;;
+      *herd-feature.sh*|*herd-quick.sh*|*herd-resolve.sh*) return 0 ;;
+    esac
   done <<EOF
 $table
 EOF
   return 1
 }
 
-# _wx_exempt <pid> <ppid> <table> <lockpid> <live-pids-padded> — the pure predicate, with the two
-# expensive sets (canonical pid, live marker pids) precomputed by the caller so a whole listing pass
-# costs one marker glob, not one per pid. <live-pids-padded> is " p1 p2 … " for substring matching.
+# _wx_exempt <pid> <ppid> <lockpid> <live-pids-padded> — the pure LISTING predicate (clauses 1+2), with
+# the two expensive sets (lockfile pid, live marker pids) precomputed by the caller so a whole listing
+# pass costs one marker glob, not one per pid. <live-pids-padded> is " p1 p2 … " for substring matching.
+# Deliberately does NOT consult watcher_has_gate_child — that guard would exempt a gate-running stray
+# from the kill list. See the header.
 _wx_exempt() {
-  local pid="${1:-}" ppid="${2:-}" table="${3:-}" lockpid="${4:-}" live="${5:- }"
+  local pid="${1:-}" ppid="${2:-}" lockpid="${3:-}" live="${4:- }"
   case "$live" in *" $pid "*) return 0 ;; esac                       # (1) marker-owned
   [ -n "$lockpid" ] && [ "$ppid" = "$lockpid" ] && return 0          # (2) child of the canonical watcher
-  watcher_has_gate_child "$pid" "$table" && return 0                 # (3) parents a live gate worker
   return 1
 }
 
-# watcher_pid_exempt <pid> <ppid> [table] — the same predicate for a ONE-OFF caller, computing the
-# sets itself. Success ⇒ <pid> carries our argv0 but is NOT a watcher main.
+# watcher_pid_exempt <pid> <ppid> — the same LISTING predicate for a ONE-OFF caller, computing the sets
+# itself. Success ⇒ <pid> carries our argv0 but is NOT a watcher main.
 watcher_pid_exempt() {
-  local pid="${1:-}" ppid="${2:-}" table="${3:-}" live
-  [ -n "$table" ] || table="$(watcher_ps_table)"
+  local live
   live=" $(watcher_marker_pids | tr '\n' ' ')"
-  _wx_exempt "$pid" "$ppid" "$table" "$(watcher_lock_pid)" "$live"
+  _wx_exempt "${1:-}" "${2:-}" "$(watcher_lock_pid)" "$live"
 }
 
 # watcher_list_mains [table] — THE canonical enumeration of this project's watcher MAINS, one pid per
@@ -211,13 +232,15 @@ watcher_pid_exempt() {
 #   (b) every process whose argv0 is EXACTLY $HERD_WATCH_ARGV0 and which is not exempt per _wx_exempt.
 # argv0 is matched as the command's FIRST TOKEN, never as a pgrep substring, so workspace "north"
 # never captures "northern"'s watcher and "app" never captures "apple"'s (issue #60). Clause (b) finds
-# lock-ABSENT strays too — the "no running watcher found while 2 alive" case. UNTAGGED legacy watchers
-# carry no marker and are NOT returned; _stop_project_watcher still reaps those via its lsof/cwd
-# fallback. Callers may pass a table they already sampled; otherwise one is taken here.
+# lock-ABSENT strays too — the "no running watcher found while 2 alive" case — INCLUDING a stray that
+# has already dispatched a gate worker. UNTAGGED legacy watchers carry no marker and are NOT returned;
+# _stop_project_watcher still reaps those via its lsof/cwd fallback. Callers may pass a table they
+# already sampled; otherwise one is taken here.
 #
-# Every consumer of "how many watchers are alive" goes through this: `herd status`'s alarm,
-# bin/herd's _list_project_watchers (which feeds _stop_project_watcher's kill), and sweep.sh's
-# sweep_stray_watchers. One answer, three seats.
+# This list feeds BOTH the `herd status` count AND _stop_project_watcher's SIGTERM loop, so a pid
+# omitted here is a pid the duplicate safety rail will never stop. Nothing may be exempted from it
+# that has not been PROVEN to be a fork (clauses 1+2). sweep.sh's sweep_stray_watchers, which only
+# detects, layers its own extra gate-child guard on top of this listing.
 watcher_list_mains() {
   local table="${1:-}" marker="${HERD_WATCH_ARGV0:-}" lockpid canon live
   local pid ppid pgid cmd argv0 seen=" "
@@ -234,7 +257,7 @@ watcher_list_mains() {
     argv0="${cmd%%[[:space:]]*}"
     [ "$argv0" = "$marker" ] || continue
     case "$seen" in *" $pid "*) continue ;; esac
-    _wx_exempt "$pid" "$ppid" "$table" "$lockpid" "$live" && continue
+    _wx_exempt "$pid" "$ppid" "$lockpid" "$live" && continue
     printf '%s\n' "$pid"; seen="$seen$pid "
   done <<EOF
 $table

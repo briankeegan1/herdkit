@@ -4537,17 +4537,23 @@ _reload_reparent() {
 # _list_project_watchers — enumerate ONLY this project's watcher MAINS, one PID per line. A THIN
 # CALLER of watcher_list_mains (scripts/herd/watcher-exempt.sh), which is the ONE place the engine
 # decides what a watcher main is: the union of (a) the lockfile PID when alive and (b) every process
-# whose argv0 is EXACTLY $HERD_WATCH_ARGV0 and which is not exempt as one of the canonical watcher's
-# own forks (marker-owned gate worker / child of the canonical watcher / parent of a live gate
-# worker). Requires HERD_WATCHER_LOCK + HERD_WATCH_ARGV0 in scope (from .herd/config).
+# whose argv0 is EXACTLY $HERD_WATCH_ARGV0 and which is not PROVABLY one of the canonical watcher's
+# own forks (marker-owned gate worker, or a child of the canonical watcher).
+# Requires HERD_WATCHER_LOCK + HERD_WATCH_ARGV0 in scope (from .herd/config).
 #
 # WHY A SHARED HELPER (HERD-266). This function used to exempt ONLY marker-owned pids, while
 # sweep.sh's sweep_stray_watchers ALSO exempted a fork whose ppid is the canonical watcher. The tick
 # loop forks constantly and every fork inherits the argv0, so a sub-second marker-less fork alive at
 # sample time was counted here as a second watcher main — `herd status` alarmed '⚠ 2 watcher mains
 # alive' on a healthy control room (~20 such forks observed, all children of the canonical watcher).
-# Both seats now ask the same question of the same code. A GENUINE orphan duplicate — parent dead, no
-# gate child, no marker — is still listed, and _stop_project_watcher still kills it.
+# Both seats now ask the same question of the same code.
+#
+# THIS LIST IS THE KILL LIST. _stop_project_watcher (below) SIGTERMs every pid it returns, so it still
+# reaps lock-ABSENT strays — including a stray that has dispatched a gate worker. sweep.sh's
+# DETECTION-only surface layers an extra gate-child guard on top of this listing; that guard is
+# deliberately NOT part of the listing, because exempting a gate-running stray here would make
+# _stop_project_watcher report "no running watcher found", drop the lockfile, and let the caller spawn
+# a second main on top of the survivor. A GENUINE orphan duplicate is listed, and killed.
 _list_project_watchers() { watcher_list_mains; }
 
 # _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
@@ -4661,6 +4667,12 @@ _stop_project_watcher() {
       journal_append watcher_reaped pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd
     fi
   done < <(pgrep -f "agent-watch.sh" 2>/dev/null || true)
+
+  # No watcher of ours is running now, so no self-restart generation handoff can be in flight: drop a
+  # marker a crashed exec left behind (HERD-266) rather than leave it on disk until its TTL expires.
+  # The launch paths that call us go on to spawn a fresh watcher, whose startup clears it anyway; this
+  # covers the `herd reload` / sweep-leg-5 stop that never relaunches.
+  declare -f watcher_handoff_clear >/dev/null 2>&1 && watcher_handoff_clear
 
   [ "$killed" -eq 0 ] && say "  no running watcher found"
   return 0

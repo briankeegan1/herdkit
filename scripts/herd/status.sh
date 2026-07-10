@@ -146,6 +146,22 @@ _status_watcher_count() {
   printf '%s\n' "$pids" | grep -c . 2>/dev/null || printf 0
 }
 
+# _status_dup_sleep — pause one inter-sample gap. $HERD_STATUS_DUP_SLEEP is a test seam; a value that
+# is not a plain (possibly fractional) number is ignored. A `sleep` without fractional-second support
+# would reject "0.3" and, with a bare `|| true`, silently run the samples back-to-back — degrading the
+# PERSISTENCE check to a single sample. So a rejected fractional gap falls back to a whole second: a
+# slower `herd status` on that platform, never a weaker check. A gap of exactly 0 means "no pause"
+# (the unit tests' seam) and must not fall back.
+_status_dup_sleep() {
+  local gap="${HERD_STATUS_DUP_SLEEP:-0.3}"
+  case "$gap" in
+    ''|*[!0-9.]*|*.*.*) gap="0.3" ;;
+  esac
+  case "$gap" in 0|0.0|0.00) return 0 ;; esac
+  sleep "$gap" 2>/dev/null && return 0
+  sleep 1 2>/dev/null || true
+}
+
 # _status_dup_verified <first-sample-pids> — is the duplicate-watcher condition REAL? (HERD-266)
 #
 # A duplicate watcher is a genuine emergency (two mains race the shared .git object store), so the row
@@ -160,21 +176,29 @@ _status_watcher_count() {
 #   • PERSISTENCE — re-sample. A real duplicate is a long-lived process and survives every sample; a
 #     fork the exemptions could not attribute (its parent already reaped, its gate child not yet
 #     exec'd) is gone within a sample or two. We alarm only when EVERY sample still sees >1 main.
-# Returns 0 (alarm — verified real), 1 (do not alarm). Read-only. HERD_STATUS_DUP_SAMPLES /
-# HERD_STATUS_DUP_SLEEP are test seams; the defaults cost ~0.6s and only on the already-suspect path.
+# On success it PRINTS the pids of the LAST sample — the mains that actually survived every check, and
+# so the only ones the operator should be told to stop. The caller must render those, never the first
+# sample's: re-reading the list after verification (as an earlier revision did) can catch a shrunk
+# sample and print a nonsensical '⚠ 1 watcher mains alive (pids 12345)'.
+# Returns 0 (alarm — verified real, surviving pids on stdout), 1 (do not alarm). Read-only.
+# HERD_STATUS_DUP_SAMPLES / HERD_STATUS_DUP_SLEEP are test seams; the defaults cost ~0.6s and only on
+# the already-suspect path.
 _status_dup_verified() {
-  local samples="${HERD_STATUS_DUP_SAMPLES:-3}" gap="${HERD_STATUS_DUP_SLEEP:-0.3}" i=1 n
+  local pids="${1:-}" samples="${HERD_STATUS_DUP_SAMPLES:-3}" i=1
   if declare -f watcher_handoff_active >/dev/null 2>&1 && watcher_handoff_active; then
     return 1
   fi
-  case "$samples" in ''|*[!0-9]*) samples=3 ;; esac
+  case "$samples" in ''|*[!0-9]*|0) samples=3 ;; esac
+  # The caller's sample is sample 1; it already showed > 1 main. Re-sample until we have `samples` of
+  # them, and let the LAST one carry the pids we print.
   while [ "$i" -lt "$samples" ]; do
-    sleep "$gap" 2>/dev/null || true
-    n="$(_status_watcher_count "$(_status_watcher_pids)")"
-    [ "${n:-0}" -gt 1 ] || return 1     # the extra main is already gone ⇒ it was a transient fork
+    _status_dup_sleep
+    pids="$(_status_watcher_pids)"
+    # The extra main is already gone ⇒ it was a transient fork, not a duplicate.
+    [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
     i=$(( i + 1 ))
   done
-  return 0
+  printf '%s\n' "$pids"
 }
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────────────────────────
@@ -207,11 +231,12 @@ _status_run() {
     # But only once it is VERIFIED REAL (HERD-266): a single sample cannot tell a duplicate from a
     # transient fork or a self-restart handoff, and a false red is worse than a late one.
     wcount="$(_status_watcher_count "$wpids")"
-    if [ "${wcount:-1}" -gt 1 ] && _status_dup_verified "$wpids"; then
-      # Re-read: the surviving mains are what the operator must act on, not the first sample's pids.
-      wpids="$(_status_watcher_pids)"
-      wcount="$(_status_watcher_count "$wpids")"
-      local wall; wall="$(printf '%s' "$wpids" | tr '\n' ' ')"
+    local wsurv=""
+    if [ "${wcount:-1}" -gt 1 ] && wsurv="$(_status_dup_verified "$wpids")"; then
+      # The SURVIVING mains — the ones every sample saw — are what the operator must act on, and the
+      # only ones we count. _status_dup_verified has already proven there is more than one of them.
+      wcount="$(_status_watcher_count "$wsurv")"
+      local wall; wall="$(printf '%s' "$wsurv" | tr '\n' ' ')"
       printf '  %sWATCHER%s   %s⚠ %s watcher mains alive%s (pids %s) %s— duplicates race the gate; stop the extras: '"'"'herd pane watch'"'"' (or kill all but one)%s\n' \
         "$b" "$x" "$r" "$wcount" "$x" "${wall% }" "$d" "$x"
       attention=1; reasons="${reasons} duplicate-watchers:${wcount}"
