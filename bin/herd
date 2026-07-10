@@ -818,7 +818,7 @@ _gov_llm_classify() {
   command -v claude >/dev/null 2>&1 || return 0
   local stmt="$1" reply surface rest
   reply="$(claude -p "Map this project-governance sentence to AT MOST ONE herd enforcement surface, or reply NONE. Reply with a single line: '<surface>\t<target>\t<label>' where surface is one of config-key|provisioning|hook. config-key target is SPACE-separated KEY=VALUE using only these keys: PUSH_GATE MERGE_POLICY MERGE_METHOD PR_FLOW PR_READY_WHEN DELETE_BRANCH_ON_MERGE ATTRIBUTION_POLICY COMMIT_CONVENTION. provisioning target is 'review-checklist'. Reply NONE if unsure. Sentence: $stmt" 2>/dev/null || true)"
-  reply="$(printf '%s' "$reply" | head -1)"
+  reply="$(printf '%s' "$reply" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   case "$reply" in ''|NONE|none) return 0 ;; esac
   surface="${reply%%$'\t'*}"; rest="${reply#*$'\t'}"
   case "$surface" in
@@ -831,7 +831,7 @@ _gov_llm_classify() {
 # convention (→ provisioning) from noise (→ gap report). Only reached AFTER the table and the LLM
 # fallback both miss.
 _gov_is_convention() {
-  printf '%s' "$1" | grep -qiE '\b(prefer|preferred|use|using|avoid|style|format|formatting|naming|indent|indentation|tabs?|spaces|convention|conventions|docstring|comment|comments|type[- ]?hint|typed|snake_case|camelcase|line[- ]length|import|imports)\b' 2>/dev/null
+  printf '%s' "$1" | grep -qiE '\b(prefer|preferred|use|using|avoid|style|format|formatting|naming|indent|indentation|tabs?|spaces|convention|conventions|docstring|comment|comments|type[- ]?hint|typed|snake_case|camelcase|line[- ]length|import|imports)\b' 2>/dev/null  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _gov_review_checklist_path <project_root> — the repo-relative REVIEW_CHECKLIST path from .herd/config
@@ -1204,7 +1204,7 @@ EOF
           posture_mode="advanced"
         elif posture_exists "$choice" 2>/dev/null; then
           posture_mode="named"; posture_name="$choice"
-        elif printf '%s' "$choice" | grep -qE '^[0-9]+$'; then
+        elif printf '%s' "$choice" | grep -qE '^[0-9]+$'; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
           i=0; posture_name=""
           for n in $name_list; do
             i=$((i + 1))
@@ -2245,7 +2245,7 @@ _config_put_value() {
   local tmp; tmp="$(mktemp)"
   local replaced=0 line indent
   while IFS= read -r line || [ -n "$line" ]; do
-    if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE "^[[:space:]]*$key="; then
+    if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE "^[[:space:]]*$key="; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
       indent="$(printf '%s' "$line" | sed -E 's/^([[:space:]]*).*/\1/')"
       printf '%s%s="%s"\n' "$indent" "$key" "$val" >> "$tmp"
       replaced=1
@@ -3846,7 +3846,7 @@ cmd_backend_switch() {
       # shellcheck source=/dev/null
       . "$target_file"
       _linear_gql 'query { viewer { id } }' 2>/dev/null | grep -q '"id"' \
-        || die "Linear API round-trip FAILED (bad key or network) — nothing was changed"
+        || die "Linear API round-trip FAILED (bad key or network) — nothing was changed"  # pipe-ok: bounded command output, under a pipe buffer
       say "✓ Linear API reachable (viewer check passed)"
       ;;
     github)
@@ -3891,7 +3891,7 @@ cmd_backend_switch() {
       # shellcheck source=/dev/null
       . "$target_file"
       _jira_api GET /rest/api/3/myself 2>/dev/null | grep -q '"accountId"' \
-        || die "Jira API round-trip FAILED (bad creds or network) — nothing was changed"
+        || die "Jira API round-trip FAILED (bad creds or network) — nothing was changed"  # pipe-ok: bounded command output, under a pipe buffer
       say "✓ Jira API reachable (myself check passed)"
       ;;
   esac
@@ -3948,7 +3948,7 @@ cmd_backend_switch() {
       _mig_title="${text%% (migrated*}"
       if [ -n "$new_open" ] && printf '%s\n' "$new_open" \
            | sed -e 's/^#[^ ]* //' -e 's/^[-*] *//' -e 's/^🔜 *//' -e 's/^🚧 *//' -e 's/ (migrated from [^)]*)$//' \
-           | grep -qxF -- "$_mig_title"; then
+           | grep -qxF -- "$_mig_title"; then  # pipe-ok: bounded membership list, under a pipe buffer
         skipped=$((skipped + 1)); continue
       fi
       if (
@@ -4782,10 +4782,10 @@ _stop_project_watcher() {
     local is_ours=0
     if command -v lsof >/dev/null 2>&1; then
       # flock case: watcher holds fd 9 on the lockfile — lsof shows it.
-      if lsof -p "$stray" 2>/dev/null | grep -qF "$HERD_WATCHER_LOCK"; then
+      if lsof -p "$stray" 2>/dev/null | grep -qF "$HERD_WATCHER_LOCK"; then  # pipe-ok: bounded command output, under a pipe buffer
         is_ours=1
       # no-flock case: check the process's current working directory.
-      elif lsof -p "$stray" -a -d cwd 2>/dev/null | awk 'NR>1{print $NF}' | grep -qxF "$PROJECT_ROOT"; then
+      elif lsof -p "$stray" -a -d cwd 2>/dev/null | awk 'NR>1{print $NF}' | grep -qxF "$PROJECT_ROOT"; then  # pipe-ok: bounded command output, under a pipe buffer
         is_ours=1
       fi
     fi

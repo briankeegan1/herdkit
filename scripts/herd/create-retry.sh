@@ -146,7 +146,7 @@ create_retry_label() {
 # _create_retry_meta_get <meta-file> <key> — read one header value; empty when absent/unreadable.
 _create_retry_meta_get() {
     [ -f "$1" ] || return 0
-    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # _create_retry_meta_set <meta-file> <key> <value> — rewrite one header value in place, appending the

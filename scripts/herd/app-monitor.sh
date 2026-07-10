@@ -37,12 +37,12 @@ trap 'kill "$SERVER_PID" 2>/dev/null' EXIT INT TERM
 
 # newest mtime across tracked files — changes whenever the sub-agent edits the worktree.
 # stat mtime flag: GNU/Linux uses -c %Y; BSD/macOS uses -f %m.
-if stat --version 2>/dev/null | grep -q GNU; then
+if stat --version 2>/dev/null | grep -q GNU; then  # pipe-ok: fixed short version banner, far under a pipe buffer
   _STAT_MTIME=(-c %Y)
 else
   _STAT_MTIME=(-f %m)
 fi
-newest() { git ls-files -z 2>/dev/null | xargs -0 stat "${_STAT_MTIME[@]}" 2>/dev/null | sort -rn | head -1; }
+newest() { git ls-files -z 2>/dev/null | xargs -0 stat "${_STAT_MTIME[@]}" 2>/dev/null | sort -rn | head -1; }  # pipe-ok: head in a command or process substitution; pipeline status not gated
 
 # ── Health probe (CONFIGURABLE — see docs/external-consumer-audit.md "Leak C") ───────────────────
 # "Is it up?" is no longer a hardcoded HTTP GET /. Precedence, highest first:

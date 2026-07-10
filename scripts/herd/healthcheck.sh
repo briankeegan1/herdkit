@@ -112,6 +112,14 @@ else
   HERD_GATE_COVERAGE_SKIP_REASON="gate-coverage-lint.sh not present"
   herd_gate_coverage_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# pipe-safety guard (rc 2), never break the healthcheck it is a part of.
+if [ -f "$HERE/pipe-safety-lint.sh" ]; then
+  . "$HERE/pipe-safety-lint.sh"
+else
+  HERD_PIPE_SAFETY_SKIP_REASON="pipe-safety-lint.sh not present"
+  herd_pipe_safety_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -345,7 +353,7 @@ EOF
   fi
 
   if [ -n "$syntax_errs" ]; then
-    if [ -n "$ONELINE" ]; then echo "❌ light syntax — $(printf '%s' "$syntax_errs" | head -1)";
+    if [ -n "$ONELINE" ]; then echo "❌ light syntax — $(printf '%s' "$syntax_errs" | head -1)";  # pipe-ok: head in a command or process substitution; pipeline status not gated
     else echo "❌ LIGHT CHECK: SYNTAX ERROR"; printf '%s' "$syntax_errs"; fi
     exit 1
   fi
@@ -358,7 +366,7 @@ EOF
   local caps_errs caps_rc
   caps_errs="$(herd_caps_sync_lint "$DEFAULT_BRANCH")"; caps_rc=$?
   if [ "$caps_rc" -eq 1 ]; then
-    if [ -n "$ONELINE" ]; then echo "❌ caps-sync — $(printf '%s' "$caps_errs" | head -1)";
+    if [ -n "$ONELINE" ]; then echo "❌ caps-sync — $(printf '%s' "$caps_errs" | head -1)";  # pipe-ok: head in a command or process substitution; pipeline status not gated
     else echo "❌ CAPS-SYNC: capabilities manifest not updated alongside engine change"; printf '%s\n' "$caps_errs"; fi
     exit 1
   fi
@@ -372,7 +380,7 @@ EOF
   local drift_errs drift_rc
   drift_errs="$(herd_doc_drift_lint ".")"; drift_rc=$?
   if [ "$drift_rc" -eq 1 ]; then
-    if [ -n "$ONELINE" ]; then echo "❌ doc-drift — $(printf '%s' "$drift_errs" | grep '^DRIFT' | head -1)";
+    if [ -n "$ONELINE" ]; then echo "❌ doc-drift — $(printf '%s' "$drift_errs" | grep '^DRIFT' | head -1)";  # pipe-ok: head in a command or process substitution; pipeline status not gated
     else echo "❌ DOC-DRIFT: README/docs/templates reference a command (or README key) absent from capabilities.tsv"; printf '%s\n' "$drift_errs" | grep '^DRIFT' || printf '%s\n' "$drift_errs"; fi
     exit 1
   fi
@@ -385,8 +393,21 @@ EOF
   local gcov_errs gcov_rc
   gcov_errs="$(herd_gate_coverage_lint ".")"; gcov_rc=$?
   if [ "$gcov_rc" -eq 1 ]; then
-    if [ -n "$ONELINE" ]; then echo "❌ gate-coverage — $(printf '%s' "$gcov_errs" | grep '^UNGATED' | head -1)";
+    if [ -n "$ONELINE" ]; then echo "❌ gate-coverage — $(printf '%s' "$gcov_errs" | grep '^UNGATED' | head -1)";  # pipe-ok: head in a command or process substitution; pipeline status not gated
     else echo "❌ GATE-COVERAGE: tests/test-*.sh exists but is not wired into tests/herd.bats (add to bats or to tests/gate-coverage-exempt.tsv)"; printf '%s\n' "$gcov_errs" | grep '^UNGATED' || printf '%s\n' "$gcov_errs"; fi
+    exit 1
+  fi
+
+  # pipe-safety guard (HERD-299) — a NEW '<producer> | grep -q/-m' (or '| head') is a latent false-red
+  # under `set -o pipefail` (the EPIPE that turned macOS CI chronically red, HERD-297). The SAME lint
+  # the heavy gate runs (scripts/herd/pipe-safety-lint.sh), so it is caught here pre-PR. Same red
+  # semantics as caps-sync / gate-coverage. A verified-small producer opts out with '# pipe-ok: <why>'.
+  # Skipped (never red) when the shared lint is absent or the tree has no engine scan surface.
+  local pipe_errs pipe_rc
+  pipe_errs="$(herd_pipe_safety_lint ".")"; pipe_rc=$?
+  if [ "$pipe_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ pipe-safety — $(printf '%s' "$pipe_errs" | grep '^PIPE-UNSAFE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>' for a verified-small producer)"; printf '%s\n' "$pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$pipe_errs"; fi
     exit 1
   fi
 
@@ -462,7 +483,7 @@ run_attribution_lint() {
     return 0
   fi
   AL_STATE="CODEERROR"
-  AL_REASON="$(printf '%s' "$_al_violations" | head -1)"
+  AL_REASON="$(printf '%s' "$_al_violations" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   AL_FULL="$_al_violations"
 }
 
@@ -494,7 +515,7 @@ run_commit_convention_lint() {
     return 0
   fi
   CC_STATE="CODEERROR"
-  CC_REASON="$(printf '%s' "$_cc_violations" | head -1)"
+  CC_REASON="$(printf '%s' "$_cc_violations" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   CC_FULL="$_cc_violations"
 }
 

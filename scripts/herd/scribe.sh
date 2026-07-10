@@ -219,7 +219,7 @@ if _launch_out="$(herd_driver_launch_agent \
 else
   herdr tab close "$TAB" >/dev/null 2>&1 || true
   journal_append infra_event component scribe agent "$HERD_AGENT_SCRIBE" reason respawn_failed \
-    detail "$(printf '%s' "$_launch_out" | head -n1)"
+    detail "$(printf '%s' "$_launch_out" | head -n1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   echo "✍️  scribe: a drainer already holds the name — leaving the existing one in place; your request is queued and will be drained."
   exit 0
 fi

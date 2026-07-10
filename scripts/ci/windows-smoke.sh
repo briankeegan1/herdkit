@@ -58,7 +58,7 @@ parse_fail=0
 while IFS= read -r f; do
   bash -n "$f" 2>/dev/null || { bad "bash -n failed: $f"; parse_fail=1; }
 done < <(git ls-files -- 'scripts/herd/*.sh' 'scripts/ci/*.sh' 'bin/herd' 'install.sh' 'herd.sh')
-[ "$parse_fail" -eq 0 ] && ok "core scripts parse under $(bash --version | head -1 | grep -oE 'version [0-9.]+' || echo bash)"
+[ "$parse_fail" -eq 0 ] && ok "core scripts parse under $(bash --version | head -1 | grep -oE 'version [0-9.]+' || echo bash)"  # pipe-ok: fixed short version banner, far under a pipe buffer
 
 echo
 if [ "$fails" -eq 0 ]; then

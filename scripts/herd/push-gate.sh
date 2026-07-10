@@ -114,7 +114,7 @@ push_gate_list() {
     dir=""
     detail="$(push_gate_detail_file "$slug")" || true
     if [ -f "$detail" ]; then
-      dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"
+      dir="$(sed -n 's/^dir=//p' "$detail" 2>/dev/null | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
     fi
     printf '%s %s %s\n' "$slug" "$sha" "$dir"
   done <<EOF
@@ -245,10 +245,10 @@ push_gate_resume() {
     echo "🛑 push-gate: hold record for '$slug' is missing its detail file ($detail) — REFUSING to push a corrupt hold." >&2
     return 1
   fi
-  dir="$(sed -n 's/^dir=//p' "$detail" | head -1)"
-  branch="$(sed -n 's/^branch=//p' "$detail" | head -1)"
-  base="$(sed -n 's/^base=//p' "$detail" | head -1)"
-  title="$(sed -n 's/^title=//p' "$detail" | head -1)"
+  dir="$(sed -n 's/^dir=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
+  branch="$(sed -n 's/^branch=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
+  base="$(sed -n 's/^base=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
+  title="$(sed -n 's/^title=//p' "$detail" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   if [ -z "$dir" ] || [ -z "$branch" ] || [ ! -d "$dir" ]; then
     echo "🛑 push-gate: hold record for '$slug' is corrupt (dir='$dir' branch='$branch') — REFUSING to push." >&2
     return 1

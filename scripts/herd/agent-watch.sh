@@ -674,7 +674,7 @@ build_landed() {
     pnum="$(printf '#%-4s' "$prnum")"
     sl="$(_slug_cell "$slug" "$ref")"
     LANDED="${LANDED}    ${C_GREEN}✅${C_RESET} ${C_DIM}${pnum}${C_RESET} ${C_GREEN}${sl}${C_RESET} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$STATE" | head -3)
+  done < <(reverse_file "$STATE" | head -3)  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # _dep_state_style <state> — echo "<glyph>\t<color>" for a dep state. Keeps the palette mapping in
@@ -1310,7 +1310,7 @@ build_operator_inbox() {
     hhmm="$(epoch_to_hhmm "$epoch")"
     case "$source" in tracker) glyph='🗂' ;; audit) glyph='🔎' ;; *) glyph='📬' ;; esac
     rows="${rows}    ${C_CYAN}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${C_DIM}@${author}${C_RESET} ${snip} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$INBOX_LEDGER" | head -5)
+  done < <(reverse_file "$INBOX_LEDGER" | head -5)  # pipe-ok: head in a command or process substitution; pipeline status not gated
   [ -n "$rows" ] && OPERATOR_INBOX_ROWS="$rows"
 }
 
@@ -1729,7 +1729,7 @@ _delta_is_integration_only() {
   local auto rc newtree
   auto="$(git -C "$dir" merge-tree --write-tree "$branchp" "$mainp" 2>/dev/null)"; rc=$?
   [ "$rc" -eq 0 ] || return 1
-  auto="$(printf '%s\n' "$auto" | head -1)"
+  auto="$(printf '%s\n' "$auto" | head -1)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   [ -n "$auto" ] || return 1
   newtree="$(git -C "$dir" rev-parse --verify --quiet "${newfull}^{tree}" 2>/dev/null)" || return 1
   [ "$auto" = "$newtree" ] || return 1
@@ -2231,11 +2231,11 @@ _classify_review_tier() {
   [ -n "$paths" ] || { printf STRONG; return 0; }
   # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ — i.e. NO line fails to match
   # the docs/test pattern → skip the adversarial review entirely.
-  if ! printf '%s\n' "$paths" | grep -qvE '(\.md$)|(^tests/)'; then printf SKIP; return 0; fi
+  if ! printf '%s\n' "$paths" | grep -qvE '(\.md$)|(^tests/)'; then printf SKIP; return 0; fi  # pipe-ok: bounded membership list, under a pipe buffer
   # Engine-surface glob match → full strong review (escalation wins over the docs tier). The -n guard
   # keeps this classifier safe when only DOCS_ONLY_GLOB opted in: an empty REVIEW_ESCALATE_GLOB would
   # make `grep -qE ""` match every path and wrongly force STRONG.
-  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] && printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi
+  if [ -n "${REVIEW_ESCALATE_GLOB:-}" ] && printf '%s\n' "$paths" | grep -qE "$REVIEW_ESCALATE_GLOB"; then printf STRONG; return 0; fi  # pipe-ok: bounded membership list, under a pipe buffer
   # Large diff (many files) → strong even without a glob match (escalation wins over the docs tier).
   n="$(printf '%s\n' "$paths" | grep -c .)"
   max="${REVIEW_ESCALATE_MAXFILES:-10}"; case "$max" in ''|*[!0-9]*) max=10 ;; esac
@@ -2243,7 +2243,7 @@ _classify_review_tier() {
   # DOCS-ONLY (opt-in via DOCS_ONLY_GLOB): every changed path matches the operator's docs pattern → the
   # cheapest reviewer tier ($REVIEW_MODEL_DOCS). Distinct from SKIP: a real (cheap) adversarial review
   # still runs — for doc formats the hardcoded *.md/tests SKIP above doesn't cover (e.g. *.txt).
-  if [ -n "${DOCS_ONLY_GLOB:-}" ] && ! printf '%s\n' "$paths" | grep -qvE "$DOCS_ONLY_GLOB"; then
+  if [ -n "${DOCS_ONLY_GLOB:-}" ] && ! printf '%s\n' "$paths" | grep -qvE "$DOCS_ONLY_GLOB"; then  # pipe-ok: bounded membership list, under a pipe buffer
     printf DOCS; return 0
   fi
   # Small + low-risk → cheap reviewer tier.
@@ -4529,7 +4529,7 @@ sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf 
   ref="$(printf '%s\n' "$body" \
     | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
     | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"
+    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
   case "$ref" in
     ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
   esac
@@ -5072,7 +5072,7 @@ _main_fresh_generated_only() {
   local _mg_out
   _mg_out="$(git -C "$MAIN" diff --name-only "${1}...HEAD" 2>/dev/null)" || return 1
   [ -n "$_mg_out" ] || return 0
-  printf '%s\n' "$_mg_out" | grep -qvxE 'docs/(codemap|symbol-index)\.md' && return 1
+  printf '%s\n' "$_mg_out" | grep -qvxE 'docs/(codemap|symbol-index)\.md' && return 1  # pipe-ok: bounded membership list, under a pipe buffer
   return 0
 }
 
@@ -5082,7 +5082,7 @@ _main_fresh_generated_only() {
 # carries the pre-pull sha the note file itself cannot hold, for the journal's shas=<old>..<new> field.
 _main_fresh_note_restart() {
   git -C "$MAIN" diff --name-only "$1" "$2" 2>/dev/null \
-    | grep -qx 'scripts/herd/agent-watch.sh' || return 1
+    | grep -qx 'scripts/herd/agent-watch.sh' || return 1  # pipe-ok: bounded membership list, under a pipe buffer
   mkdir -p "$TREES" 2>/dev/null || true
   printf '%s\n' "$2" > "$MAIN_FRESH_RESTART" 2>/dev/null || true
   _SELF_RESTART_FROM="$1"
@@ -5455,10 +5455,10 @@ _main_health_clear() {
 _main_health_honest_identity() {
   local _hi_detail="${1:-}" _hi_id="${2:-}"
   [ -n "$_hi_id" ] || return 1
-  printf '%s\n' "$_hi_id" | grep -qiE "$_HFD_PASS_RE" 2>/dev/null && return 1
+  printf '%s\n' "$_hi_id" | grep -qiE "$_HFD_PASS_RE" 2>/dev/null && return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
   _health_is_leak_guard_detail "$_hi_detail" && return 1
-  printf '%s\n' "$_hi_detail" | grep -qE '^[[:space:]]*not ok( |$)' 2>/dev/null && return 0
-  printf '%s\n' "$_hi_id" | grep -qE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null
+  printf '%s\n' "$_hi_detail" | grep -qE '^[[:space:]]*not ok( |$)' 2>/dev/null && return 0  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  printf '%s\n' "$_hi_id" | grep -qE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _main_health_scribe <text> — the ENQUEUE edge of the autofix path, isolated in one function so a test
@@ -5920,7 +5920,7 @@ EOF
     fi
     # (3) …else fall back to the ledger's PR NUMBER (covers a branch deleted at merge). The sha match
     #     is STILL required, so a stale ledger row for a re-spawned slug can never reap a live worktree.
-    if [ -z "$_srs_pr" ] && [ -n "$_srs_ledger" ] && printf '%s\n' "$_srs_ledger" | grep -qxF "$_srs_slug"; then
+    if [ -z "$_srs_pr" ] && [ -n "$_srs_ledger" ] && printf '%s\n' "$_srs_ledger" | grep -qxF "$_srs_slug"; then  # pipe-ok: bounded membership list, under a pipe buffer
       local _srs_ledger_pr
       _srs_ledger_pr="$(awk -v s="$_srs_slug" 'NF>=3 && $3==s{p=$2} END{if(p!="")print p}' "$STATE" 2>/dev/null || true)"
       if [ -n "$_srs_ledger_pr" ]; then
@@ -6540,7 +6540,7 @@ _pms_journal_has() {
   type _journal_file >/dev/null 2>&1 || return 1
   local _pmj_f; _pmj_f="$(_journal_file 2>/dev/null || true)"
   [ -n "$_pmj_f" ] && [ -s "$_pmj_f" ] || return 1
-  grep -F "\"event\":\"$1\"" "$_pmj_f" 2>/dev/null | grep -qE "\"pr\":$2[,}]"
+  grep -F "\"event\":\"$1\"" "$_pmj_f" 2>/dev/null | grep -qE "\"pr\":$2[,}]"  # pipe-ok: bounded command output, under a pipe buffer
 }
 
 # _pms_tracker_ledgered <ref> — true iff the tracker-state sweep has already CONFIRMED this ref Done
@@ -8291,8 +8291,8 @@ _text_is_limit_banner() {
   [ -n "$_pat" ] || _pat='usage limit|session limit|hit your (usage|session) limit'
   # Fail-safe: a @degrade:… sentinel (codex/grok) must NEVER match a real banner line.
   case "$_pat" in @degrade:*) return 1 ;; esac
-  printf '%s' "$_tb" | grep -qiE "$_pat" || return 1
-  printf '%s' "$_tb" | grep -qiE 'limit reached|will reset|reset[s]? (at|in) |reached your (usage|session) limit'
+  printf '%s' "$_tb" | grep -qiE "$_pat" || return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  printf '%s' "$_tb" | grep -qiE 'limit reached|will reset|reset[s]? (at|in) |reached your (usage|session) limit'  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _detect_limit_hit <slug> <worktree> — is this builder blocked on the account usage limit?
@@ -8418,7 +8418,7 @@ _pane_shows_limit_menu() {
   local _pm_pane="$1" _pm_txt
   _pm_txt="$(herd_driver_read_pane "$_pm_pane" visible)"
   [ -n "$_pm_txt" ] || return 0   # no evidence → assume still parked (fail safe)
-  printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
+  printf '%s' "$_pm_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # ── Shared actuator surface-guards (HERD-155): never a keystroke without VERIFIED pane content ──────
@@ -8438,7 +8438,7 @@ _pane_menu_confirmed() {
   [ -n "$_pmc_pane" ] || return 1
   _pmc_txt="$(herd_driver_read_pane "$_pmc_pane" visible)"
   [ -n "$_pmc_txt" ] || return 1   # no evidence → NOT confirmed a menu
-  printf '%s' "$_pmc_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'
+  printf '%s' "$_pmc_txt" | grep -qiE 'Upgrade your plan|Stop and wait|(wait for|reset) .*limit|limit to reset'  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _pane_confirms_limit_wait <pane_id> [slug] — the DISTINCT post-select outcome check. "Menu gone" is
@@ -8456,9 +8456,9 @@ _pane_confirms_limit_wait() {
   _pw_txt="$(herd_driver_read_pane "$_pw_pane" visible)"
   [ -n "$_pw_txt" ] || return 1                                            # no evidence → unverified
   # Wrong selection (option 1) or a still-present menu OPTION line → never a success.
-  printf '%s' "$_pw_txt" | grep -qiE 'Upgrade your plan|Stop and wait|/login|Sign ?in|Choose .*plan' && return 1
+  printf '%s' "$_pw_txt" | grep -qiE 'Upgrade your plan|Stop and wait|/login|Sign ?in|Choose .*plan' && return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
   # Positive wait/working evidence that the "stop and wait" path took.
-  printf '%s' "$_pw_txt" | grep -qiE 'waiting.*(reset|limit)|limit.*will reset|resuming|auto-resume|esc to interrupt|Claude is working|working[.…]'
+  printf '%s' "$_pw_txt" | grep -qiE 'waiting.*(reset|limit)|limit.*will reset|resuming|auto-resume|esc to interrupt|Claude is working|working[.…]'  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _try_clean_limit_menu_select <slug> <worktree> [pane_id] — the CLEAN limit-resume path. Sends the
@@ -8765,7 +8765,7 @@ _handle_coordinator_watchdog() {
 # inline 'stat -f %B || stat -c %W' chain queries the WRONG thing instead of cleanly falling through
 # (HERD-207, regression of HERD-198). _stat_birth echoes the inode birth epoch, or 0 when the stat
 # flavor / filesystem does not expose one (GNU '%W' yields 0 when unknown).
-if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then
+if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then  # pipe-ok: fixed short version banner, far under a pipe buffer
   file_mtime()  { stat -c %Y "$1" 2>/dev/null || echo 0; }
   _file_size()  { stat -c %s "$1" 2>/dev/null || echo 0; }
   _stat_birth() { stat -c %W "$1" 2>/dev/null || echo 0; }
@@ -9742,8 +9742,8 @@ _HLG_NOTE_RE="${_HLG_PREFIX_RE}tab-leak-guard[[:space:]]*:[[:space:]]*(clean|ski
 # carry only the collected <detail> string (never the log), so they classify with this.
 _health_is_leak_guard_detail() {
   [ -n "${1:-}" ] || return 1
-  printf '%s\n' "$1" | grep -qiE "$_HLG_LINE_RE" 2>/dev/null || return 1
-  printf '%s\n' "$1" | grep -qiE "$_HLG_NOTE_RE" 2>/dev/null && return 1
+  printf '%s\n' "$1" | grep -qiE "$_HLG_LINE_RE" 2>/dev/null || return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  printf '%s\n' "$1" | grep -qiE "$_HLG_NOTE_RE" 2>/dev/null && return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
   return 0
 }
 
@@ -9903,8 +9903,8 @@ _health_fail_detail() {
       | grep -viE "$_HFD_PASS_RE" 2>/dev/null \
       | grep -viE "$_HFD_ZERO_RE" 2>/dev/null)"
     if [ -n "$_hfd_cand" ]; then
-      _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_MARK_RE" 2>/dev/null)"
-      [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_TOKEN_RE" 2>/dev/null)"
+      _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_MARK_RE" 2>/dev/null)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
+      [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_cand" | grep -m1 -iE "$_HFD_TOKEN_RE" 2>/dev/null)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
       [ -n "$_hfd_d" ] || _hfd_d="$(printf '%s\n' "$_hfd_cand" | sed -n '1p')"
     fi
     _hfd_d="$(printf '%s' "$_hfd_d" | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
@@ -11253,7 +11253,7 @@ _spawn_dep_merged() {
   local _sdm_after="${1:-}"
   [ -n "$_sdm_after" ] || return 0
   if [ -s "$STATE" ]; then
-    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then
+    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
       awk -v p="$_sdm_after" 'NF>=2 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
     else
       awk -v s="$_sdm_after" 'NF>=3 && $3==s{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
@@ -11267,7 +11267,7 @@ _spawn_dep_merged() {
   # hardcoded feat/ prefix, so a project with custom branch naming still resolves the gh fallback. The
   # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
   # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
-  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi  # pipe-ok: single short scalar (one line), far under a pipe buffer
   [ "$(_gh_timeout spawn_dep_state pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
   return 1
 }
@@ -11378,7 +11378,7 @@ _drain_lane_worker() {
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
   # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
-  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
     # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
     # a later tick. The drain already stopped for this tick when it launched this worker.
     if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
