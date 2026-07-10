@@ -311,4 +311,56 @@ _main_fresh_recheck
 [ ! -s "$JLOG" ]           || fail "(14) with no row held the recheck is not byte-inert: $(cat "$JLOG")"
 ok
 
+# ── (15) RE-DERIVE: a hold with FROZEN counts is recomputed from observed state (HERD-293) ─────────
+# The live incident 2026-07-10: the file held 'dirty-tree 3 0'; the operator pulled so HEAD caught up
+# (real behind=0) but the tree stayed dirty, so the old recheck returned early and the stale "behind by 3"
+# kept painting across restarts. Now the recheck RE-DERIVES the line — reason stays dirty-tree, the count
+# refreshes to the observed 0 — even while a live gate marker (the defer that used to starve the reconcile)
+# is present, because the recheck runs read-only ABOVE that defer.
+reset_state
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main                                  # HEAD caught up: real behind=0
+printf 'uncommitted work\n' > "$MAIN/WIP3.md"; git -C "$MAIN" add WIP3.md   # ...but the tree is dirty
+_main_fresh_hold dirty-tree 3 0                                             # the stale, frozen hold
+INF="$TREES/.review-inflight-97-shaFROZEN"
+_marker_write "$INF" "$$"                                                   # a live gate: recheck ignores it
+: > "$JLOG"
+_main_fresh_recheck
+[ "$(cat "$MAIN_FRESH_STATE" 2>/dev/null || true)" = "dirty-tree 0 0" ] \
+  || fail "(15) frozen counts not re-derived: $(cat "$MAIN_FRESH_STATE" 2>/dev/null || echo '<none>')"
+jhas 'main_freshness result held reason dirty-tree behind 0 ahead 0' \
+  || fail "(15) re-derived hold not journaled: $(cat "$JLOG")"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*"uncommitted changes"*) ;; *) fail "(15) re-derived dirty row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+# Re-run with the SAME observed state: the line is unchanged, so _main_fresh_hold dedups the journal.
+_main_fresh_recheck
+[ "$(jcount 'main_freshness result held')" = "1" ] || fail "(15) an unchanged re-derive re-journaled: $(jcount 'main_freshness result held') lines"
+# Now clean the tree: clean + 0-behind + 0-ahead clears the row in the same read-only recheck.
+git -C "$MAIN" reset -q --hard HEAD; rm -f "$MAIN/WIP3.md"
+: > "$JLOG"
+_main_fresh_recheck
+[ ! -e "$MAIN_FRESH_STATE" ]                     || fail "(15) a cleaned tree kept its held row: $(cat "$MAIN_FRESH_STATE")"
+jhas 'main_fresh_recovered reason dirty-tree'   || fail "(15) the cleared row was not journaled: $(cat "$JLOG")"
+rm -f "$INF"
+ok
+
+# ── (16) RE-DERIVE keeps a genuine local-commits hold current, and never invents one (HERD-293) ────
+# A clean, diverged checkout with a human commit: the recheck must re-hold 'local-commits' with fresh
+# counts (not clear it, not relabel it), and a generated-only divergence it must NOT re-hold (the reconcile
+# heals that) — it is left for the reconcile below the defer.
+reset_state
+printf 'a human wrote this three\n' > "$MAIN/NOTES3.md"
+git -C "$MAIN" add NOTES3.md; git -C "$MAIN" commit -q -m "wip: hand edit three"
+seat_push README.md "seat2 for 16" "feat: seat merge sixteen"
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1                         # local ref advances: real behind=1
+_main_fresh_hold local-commits 9 1                                         # stale behind count (9, not 1)
+: > "$JLOG"
+_main_fresh_recheck
+[ "$(cat "$MAIN_FRESH_STATE" 2>/dev/null || true)" = "local-commits 1 1" ] \
+  || fail "(16) local-commits counts not re-derived: $(cat "$MAIN_FRESH_STATE" 2>/dev/null || echo '<none>')"
+jhas 'main_freshness result held reason local-commits behind 1 ahead 1' \
+  || fail "(16) re-derived local-commits not journaled: $(cat "$JLOG")"
+git -C "$MAIN" reset -q --hard origin/main
+ok
+
 echo "PASS: test-main-freshness.sh ($pass checks)"
