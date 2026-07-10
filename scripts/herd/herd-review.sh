@@ -117,6 +117,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # diff — when NATIVE_BURST=on. Off (or REVIEW_PANEL<=1) → a single reviewer, byte-identical to before.
 # shellcheck source=/dev/null
 . "$HERE/burst.sh"
+# Mixed-vendor panel seam (HERD-276): ref parsing, the REVIEW_PANEL_POLICY resolver, and the ONE
+# verdict-merge fold both enforcement surfaces below (local pre-PR + PR pre-merge) share. Sourcing it
+# only defines functions; with REVIEW_PANEL_MODELS unset every helper is inert and the panel stays
+# single-model on $REVIEW_MODEL, byte-identical to before.
+# shellcheck source=/dev/null
+. "$HERE/review-panel.sh"
 MAIN="$PROJECT_ROOT"
 # Mode: default PR review (<pr> <slug>); --local reviews the worktree's LOCAL diff (<slug>) BEFORE any
 # PR exists. Local mode reuses the SAME adversarial prompt + PASS/BLOCK/INFRA-FAIL contract below, but
@@ -142,6 +148,51 @@ _WS_ID="$(herd_resolve_workspace_id)"
 # (agent-pane placement is skipped) and its verdicts are combined fail-safe (any BLOCK ⇒ BLOCK).
 _PANEL_N="$(herd_burst_bound "${REVIEW_PANEL:-1}")"
 case "$_PANEL_N" in ''|*[!0-9]*) _PANEL_N=1 ;; esac
+
+# ── MIXED-VENDOR panel (HERD-276) ────────────────────────────────────────────────────────────────
+# REVIEW_PANEL_MODELS turns the panel from "N passes of ONE model" into "one pass per REF", each ref
+# optionally runtime-qualified '<driver>:<model>' and dispatched through THAT vendor's runtime.
+#
+# Two orthogonal levers, deliberately not conflated:
+#   • REVIEW_PANEL_MODELS decides WHO reviews (the panel's composition, and therefore its SIZE).
+#   • NATIVE_BURST decides whether they run CONCURRENTLY. With burst off the mixed panel still runs —
+#     herd_burst at bound 1 is a strict serial loop — it just costs wall-clock instead of lanes.
+# So a ref list of ONE still engages the panel (that panelist must launch through ITS ref, not
+# $REVIEW_MODEL), while an EMPTY ref list leaves _PANEL_N exactly as computed above: dormant.
+_PANEL_REF_ARR=()
+if [ -n "${REVIEW_PANEL_MODELS:-}" ]; then
+  # Intentional word-splitting: the key's value shape IS a whitespace-separated ref list.
+  # shellcheck disable=SC2206,SC2086
+  _PANEL_REF_ARR=(${REVIEW_PANEL_MODELS})
+fi
+_PANEL_REF_N="${#_PANEL_REF_ARR[@]}"
+_PANEL_POLICY="$(herd_review_panel_policy)"
+if [ "$_PANEL_REF_N" -gt 0 ]; then
+  _PANEL_N="$_PANEL_REF_N"
+  # A typo'd policy already resolved fail-safe to any-block; say so ONCE, loudly, so the operator is
+  # not silently running a stricter gate than the key they wrote claims. Never fatal.
+  if herd_review_panel_policy_is_typo; then
+    echo "⚠️  herd-review: REVIEW_PANEL_POLICY='${REVIEW_PANEL_POLICY}' is not a known policy — falling back to the fail-safe 'any-block'." >&2
+    journal_append review_panel_policy_invalid pr "${PR:-}" slug "${SLUG:-}" \
+      value "${REVIEW_PANEL_POLICY:-}" effective "$_PANEL_POLICY"
+  fi
+fi
+# Concurrency is still bounded by the burst seam: at most min(panel size, REVIEW_CONCURRENCY) run at
+# once, and exactly 1 when NATIVE_BURST is off. This is the cap herd_burst is handed — NOT the panel
+# size — so a 4-vendor panel under burst-off runs all 4 panelists, one after another.
+_PANEL_BOUND="$(herd_burst_bound "$_PANEL_N")"
+case "$_PANEL_BOUND" in ''|*[!0-9]*) _PANEL_BOUND=1 ;; esac
+
+# _panel_engaged — does this review run as a PANEL (headless fan-out + verdict fold) rather than as the
+# classic single reviewer? True when a mixed-vendor ref list is configured (even a single ref: that
+# panelist must launch through ITS ref, not $REVIEW_MODEL) OR when native-burst sized the panel above 1.
+# With both levers off this is FALSE and every panel branch below is skipped — the dormant, byte-
+# identical single-reviewer path, agent pane and all.
+_panel_engaged() { [ "$_PANEL_REF_N" -gt 0 ] || [ "$_PANEL_N" -gt 1 ] 2>/dev/null; }
+
+# Human-readable panel description for the log banner / PR comment.
+_PANEL_DESC="${_PANEL_N}× ${REVIEW_MODEL}"
+[ "$_PANEL_REF_N" -gt 0 ] && _PANEL_DESC="${_PANEL_N} panelists [${REVIEW_PANEL_MODELS}] · policy ${_PANEL_POLICY}"
 
 # Review FROM the feature worktree if it still exists (gives the reviewer the diff's repo context
 # + any AGENTS.md/CLAUDE.md); otherwise fall back to the main checkout. The pinned dispatch-sha diff
@@ -241,42 +292,100 @@ for line in sys.stdin:
         if r: print(r, flush=True)
 '
 
-# ── Review panel (HERD-107, native-burst) ────────────────────────────────────────────────────────
-# _combine_verdicts <file>… — fold the per-member verdict files of a review PANEL into ONE verdict,
-# FAIL-SAFE for a merge gate: read each file's LAST 'REVIEW: PASS|BLOCK' line and
-#   • ANY member BLOCK  → echo that BLOCK (a single reviewer finding a real bug must block the merge);
-#   • else ANY PASS     → echo that PASS (one clean review is the same bar as today's single reviewer);
-#   • else (no verdict) → echo nothing + return 1 → the caller reports INFRA-FAIL (every member died).
-# This can only ever be STRICTER than a single reviewer: extra panel members add chances to BLOCK, never
-# a way to turn a BLOCK into a PASS. Pure (reads files, no side effects) so it is unit-tested directly.
+# ── Review panel (HERD-107 native-burst; HERD-276 mixed-vendor) ──────────────────────────────────
+# _combine_verdicts <file>… — fold the per-panelist verdict files of a review PANEL into ONE verdict.
+# This is a THIN ADAPTER over the SHARED resolver in review-panel.sh (herd_review_merge_verdicts) —
+# the single implementation both enforcement surfaces (local pre-PR review, watcher pre-merge gate)
+# fold through, so they can never disagree about what a panel decided. The policy comes from
+# REVIEW_PANEL_POLICY; its default, any-block, is the pre-HERD-276 fail-safe fold verbatim:
+#   • ANY panelist BLOCK  → echo that BLOCK (one reviewer finding a real bug must block the merge);
+#   • else ANY PASS       → echo that PASS (one clean review is the same bar as a single reviewer);
+#   • else (no verdict)   → echo nothing + return 1 → the caller reports INFRA-FAIL (every member died).
+# A panelist that reached no verdict is NON-REPORTING — it can only ever push the fold toward INFRA
+# (a retry), never toward BLOCK. On an INFRA fold the resolver's one-line reason is stashed in
+# $_PANEL_DIR/.reason for the caller (this function runs inside a $(…) subshell, so a global cannot
+# carry it out). Members are folded in ARGUMENT order, so a sorted glob folds deterministically.
 _combine_verdicts() {
-  local f line block="" pass=""
-  for f in "$@"; do
-    [ -f "$f" ] || continue
-    line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$f" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
-    [ -n "$line" ] || continue
-    case "$line" in
-      "REVIEW: BLOCK"*) [ -z "$block" ] && block="$line" ;;
-      "REVIEW: PASS"|"REVIEW: PASS "*) [ -z "$pass" ] && pass="$line" ;;
-    esac
-  done
-  if [ -n "$block" ]; then printf '%s' "$block"; return 0; fi
-  if [ -n "$pass" ];  then printf '%s' "$pass";  return 0; fi
-  return 1
+  local line rc=0
+  line="$(herd_review_merge_verdicts "$_PANEL_POLICY" "$@")" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    [ -n "${_PANEL_DIR:-}" ] && printf '%s' "$HERD_REVIEW_PANEL_REASON" > "$_PANEL_DIR/.reason" 2>/dev/null || true
+    return 1
+  fi
+  printf '%s' "$line"
+  return 0
 }
 
+# _panel_infra_reason <fallback> — the WHY for an INFRA-FAIL fold: the shared resolver's own reason
+# when it left one (policy-specific: all-pass names the panelists that never reported), else <fallback>.
+_panel_infra_reason() {
+  local r=""
+  [ -n "${_PANEL_DIR:-}" ] && [ -f "$_PANEL_DIR/.reason" ] && r="$(cat "$_PANEL_DIR/.reason" 2>/dev/null || true)"
+  [ -n "$r" ] && printf '%s' "$r" || printf '%s' "$1"
+}
+
+# _panel_ref_for <index> — the model ref panelist <index> reviews under. With REVIEW_PANEL_MODELS set
+# that is the index-th ref (mixed vendors); dormant, every panelist runs $REVIEW_MODEL, exactly as
+# the single-model panel always did.
+_panel_ref_for() {
+  if [ "$_PANEL_REF_N" -gt 0 ]; then printf '%s' "${_PANEL_REF_ARR[$1]}"; else printf '%s' "$REVIEW_MODEL"; fi
+}
+
+# _panel_member_file <index> — this panelist's private verdict file. Zero-padded so the shell's glob
+# order is the panelist order for any panel size (m.10 must not sort before m.2 — the fold echoes the
+# FIRST BLOCK, so its identity would otherwise depend on how many vendors you configured).
+_panel_member_file() { printf '%s/m.%03d' "$_PANEL_DIR" "$1"; }
+
 # _panel_member <index> — one read-only reviewer pass, run in a background subshell by herd_burst.
-# It streams `claude -p "$_PANEL_TASK"` (a NO-COMMENT, print-one-verdict task; the panel posts a single
-# combined PR comment itself) through the shared formatter and captures the output — including the final
-# 'REVIEW:' line — into this member's private file $_PANEL_DIR/m.<index>. Any failure is swallowed: a
-# dead member simply leaves no verdict, and _combine_verdicts treats it as absent (fail-safe).
+# It resolves this panelist's ref into a (driver, model) pair, then streams the NO-COMMENT
+# print-one-verdict task through THAT driver's one-shot runtime (the panel posts a single combined PR
+# comment itself), captures the output — including the final 'REVIEW:' line — into the panelist's
+# private file, and journals the panelist's verdict PROVENANCE so a mixed panel's disagreement is
+# forensically attributable to a vendor rather than lost in a folded line.
+#
+# THREE ways a panelist fails to vote, all of which must land as INFRA and NEVER as a BLOCK:
+#   • an UNRESOLVABLE ref (unknown driver prefix / empty model) — a config error, caught here;
+#   • a MISSING driver binary (grok configured, `grok` not installed) — probed BEFORE dispatch, so the
+#     panelist reports INFRA instead of a shell "command not found" that reads like a failed review;
+#   • a runtime that crashes or prints no verdict — it simply leaves no REVIEW line.
+# In every case the file carries an INFRA-FAIL line (never a verdict), the resolver counts the panelist
+# as non-reporting, and the fold degrades toward INFRA-FAIL — a bounded watcher RETRY, not a cached BLOCK.
 _panel_member() {
-  local i="$1"
-  local mfile="$_PANEL_DIR/m.$i"
+  local i="$1" ref drv mdl rt mfile
+  mfile="$(_panel_member_file "$i")"
+  ref="$(_panel_ref_for "$i")"
+
+  if ! mdl="$(herd_model_for_spawn "$ref" 2>/dev/null)"; then
+    printf 'REVIEW: INFRA-FAIL — panelist %s ref %s does not resolve to a known driver/model\n' "$i" "'$ref'" > "$mfile" 2>/dev/null || true
+    journal_append review_panelist_verdict pr "${PR:-}" slug "${SLUG:-}" sha "${_REVIEW_SHA:-}" \
+      panelist "$i" ref "$ref" driver "" model "" verdict INFRA reason "unresolvable model ref"
+    return 0
+  fi
+  drv="$(herd_model_driver_for "$ref" 2>/dev/null || true)"
+  rt="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
+  [ -n "$rt" ] || rt="claude"
+  if ! command -v "$rt" >/dev/null 2>&1; then
+    printf 'REVIEW: INFRA-FAIL — panelist %s (%s) driver binary %s is not installed\n' "$i" "$ref" "'$rt'" > "$mfile" 2>/dev/null || true
+    journal_append review_panelist_verdict pr "${PR:-}" slug "${SLUG:-}" sha "${_REVIEW_SHA:-}" \
+      panelist "$i" ref "$ref" driver "${drv:-}" model "$mdl" verdict INFRA reason "driver binary '$rt' not found"
+    return 0
+  fi
+
   ( cd "$CWD" 2>/dev/null && \
-    herd_driver_oneshot_exec "$_PANEL_TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
+    herd_driver_oneshot_exec_as "$drv" "$_PANEL_TASK" "$mdl" $CLAUDE_FLAGS \
       --output-format stream-json --verbose 2>/dev/null \
     | python3 -uc "$REVIEW_STREAM_FORMATTER" ) > "$mfile" 2>/dev/null || true
+
+  local _v _kind
+  _v="$(herd_review_panel_verdict_line "$mfile" 2>/dev/null || true)"
+  case "$_v" in
+    "REVIEW: BLOCK"*) _kind=BLOCK ;;
+    "REVIEW: PASS"*)  _kind=PASS ;;
+    *)                _kind=INFRA ;;
+  esac
+  journal_append review_panelist_verdict pr "${PR:-}" slug "${SLUG:-}" sha "${_REVIEW_SHA:-}" \
+    panelist "$i" ref "$ref" driver "${drv:-}" model "$mdl" verdict "$_kind" \
+    reason "${_v:-no verdict line printed}"
 }
 
 # _panel_indices <n> — echo "0 1 … n-1" (space-separated) for the herd_burst worklist.
@@ -341,22 +450,24 @@ if [ "$REVIEW_MODE" = "local" ]; then
   # on exit. (emit_infra_fail / the verdict handlers below all exit, firing this trap.)
   trap 'rm -f "$LLOG" 2>/dev/null || true' EXIT
 
-  if [ "$_PANEL_N" -gt 1 ] 2>/dev/null; then
-    # NATIVE-BURST review PANEL: fan out $_PANEL_N concurrent read-only reviewer passes over the SAME
-    # local diff (bounded by herd_burst), each writing its verdict to a private per-member file; then
-    # combine fail-safe (any BLOCK ⇒ BLOCK). LOCAL_TASK is already the no-comment print-one-verdict task,
-    # so it doubles as the panel-member task verbatim. A total infra wipeout (no member left a verdict)
-    # → INFRA-FAIL, exactly as a single dead reviewer would.
-    echo "🔬 Local pre-PR review of '${SLUG}' — bounded PANEL (${_PANEL_N}× ${REVIEW_MODEL}) adversarial correctness pass (${_local_diff_cmd})…" >&2
+  if _panel_engaged; then
+    # Review PANEL: fan out one read-only reviewer pass per panelist over the SAME local diff — each
+    # through its OWN driver-qualified ref when REVIEW_PANEL_MODELS is set (HERD-276), else $_PANEL_N
+    # passes of $REVIEW_MODEL (HERD-107). At most $_PANEL_BOUND run concurrently (exactly 1 when
+    # native-burst is off, i.e. a strict serial loop). Each writes its verdict to a private per-panelist
+    # file; the SHARED resolver then folds them under REVIEW_PANEL_POLICY. LOCAL_TASK is already the
+    # no-comment print-one-verdict task, so it doubles as the panelist task verbatim. No foldable
+    # verdict → INFRA-FAIL, exactly as a single dead reviewer would.
+    echo "🔬 Local pre-PR review of '${SLUG}' — bounded PANEL (${_PANEL_DESC}) adversarial correctness pass (${_local_diff_cmd})…" >&2
     _PANEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herd-review-panel-${SLUG}-XXXXXX")" \
       || emit_infra_fail "could not allocate local panel dir (mktemp -d failed)"
     trap 'rm -f "$LLOG" 2>/dev/null || true; rm -rf "$_PANEL_DIR" 2>/dev/null || true' EXIT
     _PANEL_TASK="$LOCAL_TASK"
     # shellcheck disable=SC2086  # $(_panel_indices) is an intentional space-separated worklist
-    herd_burst "$_PANEL_N" _panel_member $(_panel_indices "$_PANEL_N")
+    herd_burst "$_PANEL_BOUND" _panel_member $(_panel_indices "$_PANEL_N")
     verdict_line="$(_combine_verdicts "$_PANEL_DIR"/m.* 2>/dev/null || true)"
     [ -n "$verdict_line" ] \
-      || emit_infra_fail "local panel review produced no verdict from any of ${_PANEL_N} members — infrastructure failure, not a block"
+      || emit_infra_fail "$(_panel_infra_reason "local panel review produced no verdict from any of ${_PANEL_N} panelists — infrastructure failure, not a block")"
   else
     echo "🔬 Local pre-PR review of '${SLUG}' on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass (${_local_diff_cmd})…" >&2
 
@@ -578,10 +689,11 @@ except Exception:
 # Fallback: standalone review·<slug> tab when the builder tab is genuinely gone, when herdr is
 # unavailable, or when the agent start fails.
 TAB="" ROOT="" _AGENT_PANE_MODE=0
-# NATIVE-BURST (HERD-107): when a review PANEL is requested ($_PANEL_N>1) the review runs on the HEADLESS
-# fan-out path (N concurrent claude -p passes), so skip the single-agent-pane placement entirely. The
-# default ($_PANEL_N==1) keeps today's exact pane behavior — this guard is inert unless the panel engages.
-if [ "$_PANEL_N" -le 1 ] 2>/dev/null && [ "${HERD_NO_PANE:-}" != "1" ] && command -v herdr >/dev/null 2>&1 && [ -n "$_agent_result_file" ]; then
+# PANEL (HERD-107 native-burst / HERD-276 mixed-vendor): when a review PANEL is engaged the review runs
+# on the HEADLESS fan-out path (one one-shot pass per panelist), so skip the single-agent-pane placement
+# entirely — there is no single agent to place. The default (no ref list, panel size 1) keeps today's
+# exact pane behavior; this guard is inert unless the panel engages.
+if ! _panel_engaged && [ "${HERD_NO_PANE:-}" != "1" ] && command -v herdr >/dev/null 2>&1 && [ -n "$_agent_result_file" ]; then
 
   # One agent-list read, parsed twice: the builder's own pane (agent named $SLUG) and any STALE
   # review pane (agent named review·$SLUG) still occupying the builder's tab from a prior round.
@@ -718,28 +830,36 @@ if [ "$_AGENT_PANE_MODE" = "1" ]; then
   # Normal exact-path exit re-reads the verdict here (byte-identical to before); a near-miss
   # consumed above has already populated verdict_line, so leave it untouched in that case.
   [ -n "$verdict_line" ] || verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$_agent_result_file" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
-elif [ "$_PANEL_N" -gt 1 ] 2>/dev/null; then
-  # NATIVE-BURST review PANEL (headless): fan out $_PANEL_N concurrent read-only reviewer passes over the
-  # SAME PR diff (bounded by herd_burst), each PRINTING its verdict (no PR comment) into a private member
-  # file; then combine fail-safe (any member BLOCK ⇒ BLOCK, else any PASS ⇒ PASS, else INFRA-FAIL). ONE
-  # combined PR comment is posted by the harness (best-effort), so N members never spam N comments.
+elif _panel_engaged; then
+  # Review PANEL (headless): fan out one read-only reviewer pass per panelist over the SAME PR diff —
+  # each through its OWN driver-qualified ref when REVIEW_PANEL_MODELS is set (HERD-276), else $_PANEL_N
+  # passes of $REVIEW_MODEL (HERD-107) — at most $_PANEL_BOUND at a time. Each PRINTS its verdict (no PR
+  # comment) into a private panelist file; the SHARED resolver folds them under REVIEW_PANEL_POLICY
+  # (default any-block: any BLOCK ⇒ BLOCK, else any PASS ⇒ PASS, else INFRA-FAIL). ONE combined PR
+  # comment is posted by the harness (best-effort), so N panelists never spam N comments.
   _PANEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herd-review-panel-${PR}-XXXXXX")" \
     || emit_infra_fail "could not allocate panel dir (mktemp -d failed)"
   # $LOG is still the persistent forensic log; note the panel there. $_PANEL_DIR is cleaned on exit.
   trap 'rm -rf "$_PANEL_DIR" 2>/dev/null || true' EXIT
   _PANEL_TASK="$PR_PANEL_TASK"
-  printf '─── native-burst review panel: %s× %s ───\n' "$_PANEL_N" "$REVIEW_MODEL" >> "$LOG" 2>/dev/null || true
+  printf '─── review panel: %s ───\n' "$_PANEL_DESC" >> "$LOG" 2>/dev/null || true
   # shellcheck disable=SC2086  # $(_panel_indices) is an intentional space-separated worklist
-  herd_burst "$_PANEL_N" _panel_member $(_panel_indices "$_PANEL_N")
-  # Fold the members into the log for forensics, then combine.
+  herd_burst "$_PANEL_BOUND" _panel_member $(_panel_indices "$_PANEL_N")
+  # Fold the panelists into the log for forensics, then combine.
   cat "$_PANEL_DIR"/m.* >> "$LOG" 2>/dev/null || true
   verdict_line="$(_combine_verdicts "$_PANEL_DIR"/m.* 2>/dev/null || true)"
   [ -n "$verdict_line" ] \
-    || emit_infra_fail "review panel produced no verdict from any of ${_PANEL_N} members — infrastructure failure, not a block"
+    || emit_infra_fail "$(_panel_infra_reason "review panel produced no verdict from any of ${_PANEL_N} panelists — infrastructure failure, not a block")"
+  # The FOLD itself is recorded sha-keyed alongside the per-panelist provenance rows, so `herd why <pr>`
+  # can reconstruct WHICH vendor said what and under WHICH policy the gate reached this verdict — the
+  # combined line alone cannot answer that. The verdict the watcher reads is still the one _emit_verdict
+  # writes atomically to the sha-keyed result file; this only explains it.
+  journal_append review_panel_folded pr "$PR" slug "$SLUG" sha "${_REVIEW_SHA:-}" \
+    policy "$_PANEL_POLICY" panelists "$_PANEL_N" refs "${REVIEW_PANEL_MODELS:-}" verdict "$verdict_line"
   # ONE combined, non-authoritative PR comment (best-effort; the verdict line is the authority). Skipped
   # silently when gh is unavailable/unauthenticated — the merge gate never depends on the comment landing.
   if command -v gh >/dev/null 2>&1; then
-    gh pr comment "$PR" --body "🔬 Native-burst review panel (${_PANEL_N}× ${REVIEW_MODEL}) — combined verdict: ${verdict_line}" >/dev/null 2>&1 || true
+    gh pr comment "$PR" --body "🔬 Review panel (${_PANEL_DESC}) — combined verdict: ${verdict_line}" >/dev/null 2>&1 || true
   fi
 else
   # Headless mode: stream claude -p into $LOG with an informative formatter.
