@@ -1931,17 +1931,31 @@ _pid_starttime() {
   ps -o lstart= -p "$p" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
 }
 
-# _marker_write <file> <pid> — lay down a restart-safe inflight marker: pid, its start-time, dispatch ts.
+# _pid_pgid <pid> — the process GROUP id of <pid>, empty when the pid is gone or ps cannot answer. Used
+# to record a health worker's own process group at dispatch (HERD-283) so the whole suite subtree can be
+# reaped as one group. HERD_PID_PGID_CMD is a test seam (mirrors _pid_starttime's stub).
+_pid_pgid() {
+  local p="${1:-}"; [ -n "$p" ] || return 0
+  if [ -n "${HERD_PID_PGID_CMD:-}" ]; then "$HERD_PID_PGID_CMD" "$p" 2>/dev/null; return 0; fi
+  ps -o pgid= -p "$p" 2>/dev/null | tr -d '[:space:]'
+}
+
+# _marker_write <file> <pid> [pgid] — lay down a restart-safe inflight marker: pid, its start-time,
+# dispatch ts. An OPTIONAL 4th line records the pid's process GROUP (health workers only, HERD-283); when
+# absent the marker is byte-identical to the legacy 3-line body, so every existing reader is unaffected.
 _marker_write() {
-  local f="$1" p="$2"
-  { printf '%s\n' "$p"; printf '%s\n' "$(_pid_starttime "$p")"; printf '%s\n' "$(_now_epoch)"; } \
+  local f="$1" p="$2" pgid="${3:-}"
+  { printf '%s\n' "$p"; printf '%s\n' "$(_pid_starttime "$p")"; printf '%s\n' "$(_now_epoch)"
+    [ -n "$pgid" ] && printf '%s\n' "$pgid"; } \
     > "$f" 2>/dev/null || true
 }
 
-# _marker_pid / _marker_starttime / _marker_dispatch_ts <file> — read one field (line 1/2/3); empty if absent.
+# _marker_pid / _marker_starttime / _marker_dispatch_ts / _marker_pgid <file> — read one field
+# (line 1/2/3/4); empty if absent. Line 4 (pgid) is present only on markers written with a pgid.
 _marker_pid()         { sed -n '1p' "$1" 2>/dev/null; }
 _marker_starttime()   { sed -n '2p' "$1" 2>/dev/null; }
 _marker_dispatch_ts() { sed -n '3p' "$1" 2>/dev/null; }
+_marker_pgid()        { sed -n '4p' "$1" 2>/dev/null; }
 
 # _marker_live <file> — true iff the marker's pid is alive AND (recycling guard) its current start-time
 # still matches the recorded one. A marker with NO recorded start-time (a legacy pid-only marker, or a
@@ -2378,6 +2392,32 @@ _bg_new_session() {
     "$@" </dev/null >/dev/null 2>&1 &
   fi
   _BG_NEW_SESSION_PID=$!
+}
+
+# _bg_health_worker <fn> [args...] — background an IN-PROCESS health-suite worker in its OWN process
+# group, so the whole suite subtree (a full `bash healthcheck.sh` + its many children) is later killable
+# as ONE group without touching the watcher (HERD-283). Sets _BG_HEALTH_PID and _BG_HEALTH_PGID.
+#
+# This is _bg_new_session's isolation goal for a case setsid cannot serve: the worker is an in-process
+# bash function (it needs every helper + global in scope), so it CANNOT be exec'd as an external argv.
+# Instead, enabling monitor mode (`set -m`) for the single fork places the backgrounded subshell in its
+# own process group (leader pid == pgid); `disown %+` then drops that job from the shell's table so a
+# later `kill -<pgid>` from this same watcher prints no async job-control notice and leaves no tracked
+# job. Monitor mode is restored to its prior state immediately — only the one fork runs under it.
+_bg_health_worker() {
+  local _bhw_had_m; case "$-" in *m*) _bhw_had_m=1 ;; *) _bhw_had_m=0 ;; esac
+  set -m
+  ( "$@" ) &
+  _BG_HEALTH_PID=$!
+  [ "$_bhw_had_m" = 1 ] || set +m
+  disown %+ 2>/dev/null || true
+  # A monitor-mode background subshell is ALWAYS its own process-group leader, so pgid == pid by
+  # construction — recorded WITHOUT a `ps` call, both because it is exact and because a `ps` here would
+  # sit between the fork and the caller's marker write, widening the slot-accounting race (the marker
+  # must stay the parent's first act after the fork). _health_terminate_worker independently re-checks
+  # pgid == pid AND pgid != the watcher's own group before it ever signals a group, so a mis-recorded
+  # pgid can only ever DOWNGRADE to a single-pid kill — never endanger the watcher.
+  _BG_HEALTH_PGID="$_BG_HEALTH_PID"
 }
 
 # _pin_review_sha <pr#> <headSha> — HERD-230 pin helper for review dispatch.
@@ -5464,11 +5504,13 @@ _main_health_dispatch() {
   _health_slot_free || { _main_health_defer "$_mh_pr" "$_mh_sha" no-slot; return 1; }
   [ -f "$HERD_HEALTHCHECK_BIN" ] || { _main_health_defer "$_mh_pr" "$_mh_sha" no-bin; return 1; }
   rm -f "$MAIN_HEALTH_DEFER" 2>/dev/null || true            # dispatched — re-arm the deferral journal
-  # Background the heavy suite STREAMING to the tailable log; record the pr# for the collector.
+  # Background the heavy suite STREAMING to the tailable log; record the pr# for the collector. Its own
+  # process group (HERD-283) makes the suite subtree killable as one group if the corpse sweep times it
+  # out — the main-health worker shares the exact fork-bomb exposure the per-PR gate worker has.
   _mh_log="$(_health_log_file "$_mh_key")"
-  ( _main_health_worker "$_mh_sha" "$_mh_disp" "$_mh_log" ) &
-  _mh_wpid="$!"
-  _marker_write "$_mh_inflight" "$_mh_wpid"
+  _bg_health_worker _main_health_worker "$_mh_sha" "$_mh_disp" "$_mh_log"
+  _mh_wpid="$_BG_HEALTH_PID"
+  _marker_write "$_mh_inflight" "$_mh_wpid" "$_BG_HEALTH_PGID"
   _rotate_health_logs
   printf '%s\n' "$_mh_pr" > "$(_main_health_pr_file "$_mh_sha")" 2>/dev/null || true
   journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" \
@@ -9634,6 +9676,81 @@ _health_acquire() { printf '%s\n' "$$" > "$(_health_inflight_file "$1")"; }
 # _health_release <pr#> — drop the pr's marker, freeing its slot.
 _health_release() { rm -f "$(_health_inflight_file "$1")" 2>/dev/null || true; }
 
+# _health_term_sleep — one short (~0.1s) grace tick between a health worker's SIGTERM and SIGKILL. A
+# constant, not a config key: it is an upper bound on how long a doomed worker gets to unwind, never an
+# operator preference. HERD_HEALTH_TERM_SLEEP is a test seam so a unit test can drive the loop with no
+# real wall-clock. Fail-soft: an absent fractional `sleep` degrades to a whole second, never an error.
+_health_term_sleep() {
+  local s="${HERD_HEALTH_TERM_SLEEP:-0.1}"
+  sleep "$s" 2>/dev/null || sleep 1 2>/dev/null || true
+}
+
+# _health_terminate_worker <inflight-marker> — THE ONE shared seam that STOPS a running health worker and
+# its whole suite subtree before a slot is freed or a replacement is dispatched (HERD-283). Both the
+# inflight-TIMEOUT re-dispatch (_sweep_gate_corpses) and the STALE-SHA discard (_discard_stale_health)
+# call it — one implementation, never two divergent kills (multi-seat doctrine rule 2).
+#
+# WHY A GROUP KILL. The worker runs a full `bash healthcheck.sh` suite that forks many children. The old
+# `kill <worker-pid>` reaped only the worker SUBSHELL, leaving the suite's children running while the
+# marker was removed and a fresh suite dispatched — concurrent duplicate suites piled up on one worktree
+# (the 2026-07-10 fork-bomb; the operator's HEALTH_INFLIGHT_TIMEOUT=3600 was a mitigation, this is the
+# guard). The worker is dispatched into its OWN process group (see _bg_health_worker), so the RECORDED
+# pgid names exactly the suite subtree; SIGTERM → short grace → SIGKILL to that group reaps all of it,
+# and only it.
+#
+# SAFETY — never sever the watcher. Signals ONLY the group RECORDED in the marker, never a pid discovered
+# by pattern-match. Guards, any of which vetoes the group signal:
+#   • the recorded pid is dead/recycled (_marker_live false) — nothing to signal;
+#   • the recorded pid is THIS process ($$) — a legacy in-process synchronous holder is the watcher;
+#   • the recorded pid is the watcher's own recorded identity (watcher_canonical_pid, from the shared
+#     watcher-exempt.sh check) — never signal the watcher, even if a marker names it;
+#   • the recorded PGID is not the worker's OWN group (pgid != pid) or equals the watcher's own group —
+#     the isolation did not take, so a group-kill could hit the watcher; fall back to a single-pid kill.
+# Returns 0 when the worker (and its group) is gone, 1 when a live member survived — the caller then
+# KEEPS the marker so the slot stays held and the next tick retries, never re-dispatching over a live
+# suite.
+_health_terminate_worker() {
+  local f="${1:-}" pid pgid selfpg canon use_group=0 i
+  [ -e "$f" ] || return 0
+  pid="$(_marker_pid "$f")"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  # Already gone (dead or its pid recycled to another process) — the recycling guard prevents signaling
+  # a reused pid. Nothing to terminate; the caller may free the slot.
+  _marker_live "$f" || return 0
+  # Never the watcher itself.
+  [ "$pid" = "$$" ] && return 1
+  # Never the watcher's recorded identity (the shared watcher-exempt.sh check). A health worker is a
+  # fork, never the canonical watcher, so this refuses only a genuine watcher pid.
+  if declare -f watcher_canonical_pid >/dev/null 2>&1; then
+    canon="$(watcher_canonical_pid 2>/dev/null || true)"
+    if [ -n "$canon" ] && [ "$pid" = "$canon" ]; then
+      journal_append infra_event component agent-watch reason health_term_refused key "${f##*/.health-inflight-}" pid "$pid"
+      return 1
+    fi
+  fi
+  # Group-kill ONLY when the worker leads its own group and that group is not the watcher's.
+  pgid="$(_marker_pgid "$f")"; case "$pgid" in ''|*[!0-9]*) pgid="" ;; esac
+  selfpg="$(_pid_pgid "$$")"
+  if [ -n "$pgid" ] && [ "$pgid" = "$pid" ] && [ "$pgid" != "$selfpg" ]; then
+    use_group=1
+  fi
+  # SIGTERM.
+  if [ "$use_group" = 1 ]; then kill -TERM "-$pgid" 2>/dev/null || true
+  else kill -TERM "$pid" 2>/dev/null || true; fi
+  # Bounded grace (~0.6s worst case) so the tick is never stalled long; most suites die on TERM.
+  for i in 1 2 3 4 5 6; do _marker_live "$f" || break; _health_term_sleep; done
+  # SIGKILL any survivor, then a final short grace.
+  if _marker_live "$f"; then
+    if [ "$use_group" = 1 ]; then kill -KILL "-$pgid" 2>/dev/null || true
+    else kill -KILL "$pid" 2>/dev/null || true; fi
+    for i in 1 2 3; do _marker_live "$f" || break; _health_term_sleep; done
+  fi
+  # Verify gone: the leader must be dead AND (for a group kill) no group member may survive.
+  _marker_live "$f" && return 1
+  if [ "$use_group" = 1 ] && kill -0 "-$pgid" 2>/dev/null; then return 1; fi
+  return 0
+}
+
 # ── Sha-keyed healthcheck result cache (mirrors the review gate's .review-result-<pr>-<sha>) ──────
 # WHY: a held/awaiting-verify/awaiting-approval PR sits on the candidate list every ~90s tick with an
 # UNCHANGED head sha, yet the gate re-ran the FULL suite each tick (PR #65, 2026-07-02: ~8 full runs
@@ -9663,10 +9780,26 @@ record_health_result() {
 
 # _discard_stale_health <pr#> <currentSha> — a cached result for this PR keyed to ANY OTHER sha is
 # stale (the PR has a newer head; that verdict must never be reused). Discard it so the new commit
-# re-runs the full suite. Mirrors _discard_stale_reviews (result markers only — the health mutex
-# marker is keyed by pr alone and released synchronously within the gate, so it is never stale).
+# re-runs the full suite. Mirrors _discard_stale_reviews.
+#
+# The inflight marker is now keyed by pr+sha too (HERD-185), so a still-RUNNING worker for a superseded
+# sha is stale as well — its suite tests a commit nobody will merge, and it holds the single health slot
+# against the current sha. TERMINATE it (and its whole process group) through the ONE shared seam the
+# timeout re-dispatch path uses (_health_terminate_worker, HERD-283), then free its slot; a worker that
+# refuses to die is left for the next tick's corpse sweep. A marker for the CURRENT sha is never touched.
 _discard_stale_health() {
-  local pr="$1" sha="$2" f base
+  local pr="$1" sha="$2" f base msha key
+  for f in "$TREES/.health-inflight-$pr-"*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"; msha="${base##*-}"
+    [ "$msha" = "$sha" ] && continue
+    # A finished stale-sha suite's dispatch result is worthless (wrong commit); reap marker + result.
+    key="${base#.health-inflight-}"
+    if _health_terminate_worker "$f"; then
+      rm -f "$f" "$(_health_dispatch_file "$key")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason health_stale_sha_term pr "$pr" sha "$msha"
+    fi
+  done
   for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
@@ -9980,13 +10113,15 @@ _healthcheck_gate() {
   # restart-safe inflight marker with the WORKER'S pid (so a corpse sweep can detect it dying) + start-time
   # + dispatch ts SYNCHRONOUSLY here, so a same-tick sibling sees the slot taken and QUEUEs (never a second
   # overlapping suite). Mirrors _dispatch_review.
-  # Note (HERD-245): review workers use _bg_new_session (setsid) because they are an external argv;
-  # health workers are an in-process bash function so they stay a plain background subshell. Live
-  # health pids are still exempted from _list_project_watchers (HERD-217/245) so reload never
-  # SIGTERMs them as "stray watchers".
-  ( _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log" ) &
-  local _hg_wpid="$!"
-  _marker_write "$_hg_inflight" "$_hg_wpid"
+  # Note (HERD-245/283): review workers use _bg_new_session (setsid) because they are an external argv;
+  # health workers are an in-process bash function, so _bg_health_worker isolates them the equivalent way
+  # (monitor mode → own process group) instead. That own group is what lets the inflight-timeout /
+  # stale-sha kill reap the WHOLE suite subtree as one group (HERD-283), and it also keeps a reload's
+  # `kill -- -<watcher-pgid>` from ever reaching a live suite. Live health pids stay exempted from
+  # _list_project_watchers (HERD-217/245) so reload never SIGTERMs them as "stray watchers" either.
+  _bg_health_worker _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log"
+  local _hg_wpid="$_BG_HEALTH_PID"
+  _marker_write "$_hg_inflight" "$_hg_wpid" "$_BG_HEALTH_PGID"
   _rotate_health_logs
   DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
   _HC_RESULT="RUNNING"
@@ -10104,9 +10239,14 @@ _sweep_gate_corpses() {
       fi
       pid="$(_marker_pid "$f")"
       [ "$pid" = "$$" ] && continue
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-      rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
-      journal_append infra_event component agent-watch reason health_timeout key "$rest" age "$age"
+      # HERD-283: terminate the worker's WHOLE process group (TERM → grace → KILL) through the shared
+      # seam and only free the slot once it is verifiably gone — a bare `kill <pid>` reaped just the
+      # worker subshell, orphaning the suite subtree so the next tick re-dispatched a DUPLICATE over it.
+      # A worker that will not die keeps its marker (slot stays held); the next sweep escalates to KILL.
+      if _health_terminate_worker "$f"; then
+        rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
+        journal_append infra_event component agent-watch reason health_timeout key "$rest" age "$age"
+      fi
     else
       rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
       journal_append infra_event component agent-watch reason health_died key "$rest"
