@@ -114,8 +114,11 @@ else
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # pipe-safety guard (rc 2), never break the healthcheck it is a part of.
-if [ -f "$HERE/pipe-safety-lint.sh" ]; then
-  . "$HERE/pipe-safety-lint.sh"
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/pipe-safety-lint.sh"
+[ -f "$DIR/scripts/herd/pipe-safety-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/pipe-safety-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
 else
   HERD_PIPE_SAFETY_SKIP_REASON="pipe-safety-lint.sh not present"
   herd_pipe_safety_lint() { return 2; }
