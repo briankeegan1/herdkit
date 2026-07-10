@@ -367,6 +367,129 @@ _file_claim_verify() {
     esac
 }
 
+# _file_remote_configured — success iff $HERD_REMOTE is a real configured remote. A solo operator with
+# no remote keeps their backlog LOCALLY; there, the commit IS the durable write and there is nothing to
+# push. Everywhere else a write that never reached the remote is a write that never happened.
+_file_remote_configured() { git remote get-url "$HERD_REMOTE" >/dev/null 2>&1; }
+
+# _file_release_abort <pre-release-head> — undo our release commit so a failed release leaves the main
+# checkout EXACTLY as it found it: not dirty, not ahead, no `Release:` commit waiting for the next
+# `git pull --rebase` + push to carry it onto whatever another operator has since landed on that line.
+# Prefer the remote tip when it resolves (the claim path's rule); fall back to the sha we started at,
+# which is what an unreachable/absent remote leaves us with.
+_file_release_abort() {
+    git rebase --abort >/dev/null 2>&1 || true
+    if git rev-parse --verify -q "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+        git reset --hard "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1 || true
+    else
+        git reset --hard "${1:-HEAD}" >/dev/null 2>&1 || true
+    fi
+}
+
+# _backend_release_item REF WHO — release OUR OWN claim (HERD-162 F12), the inverse of the flip above:
+# strip the "(claimed by WHO)" stamp and put the line back to 🔜 so the item is re-pickable. It is a
+# CLAIM release, not a state reopen: a ✅ shipped line is never touched, and the 🔜 the claim flipped
+# FROM is the only state we restore. Refuses to release a stamp bearing another identity — a release
+# that could steal an in-flight operator's claim is worse than the wedge it fixes. Sets:
+#   _RELEASE_RESULT = RELEASED (our stamp is gone, and it LANDED where other operators read it) |
+#                     NOTOURS (someone else's claim, or none) |
+#                     UNREACHABLE (no backlog, item not found, or the write did not land → the caller
+#                                  fails soft to "still held — re-queue it")
+#   _RELEASE_OWNER  = the blocking identity, when the refusal was NOTOURS
+#
+# THE WRITE MUST LAND OR SAY IT DID NOT. This is the whole point of the feature: a release the remote
+# never saw leaves the item wedged against every other seat — behind a `claim_released` journal event
+# and a "re-pickable" notification, which is strictly worse than the wedge it was meant to fix. So the
+# commit is checked, the push is checked, and the result is VERIFIED by re-reading the synced line (the
+# same discipline _backend_claim_item's claim-verify and linear.sh's release-verify use). A rejected
+# push means another operator moved the line under us: we discard our commit rather than force it on
+# top of theirs, and report UNREACHABLE. Never destructive, never a false success.
+_backend_release_item() {
+    local ref="$1" who="$2" slug parsed status owner head0 line
+    _RELEASE_RESULT=""; _RELEASE_OWNER=""
+    slug="${ref#*#}"
+    [ -n "$who" ] || who="unknown-operator"
+    [ -f "$BACKLOG_FILE" ] || { _RELEASE_RESULT="UNREACHABLE"; return 0; }
+
+    git pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+    head0="$(git rev-parse HEAD 2>/dev/null)" || { _RELEASE_RESULT="UNREACHABLE"; return 0; }
+
+    parsed="$(BACKLOG_FILE="$BACKLOG_FILE" SLUG="$slug" WHO="$who" MARK_RE="$_FILE_MARK_RE" python3 - <<'PY'
+import os, re
+backlog = os.environ["BACKLOG_FILE"]; slug = os.environ["SLUG"]; who = os.environ["WHO"]
+mark = re.compile(os.environ["MARK_RE"])
+with open(backlog, encoding="utf-8") as f:
+    lines = f.readlines()
+idx = next((i for i, l in enumerate(lines) if slug in mark.sub("", l)), None)
+if idx is None:
+    print("MISSING\t"); raise SystemExit
+line = lines[idx]
+if "✅" in line:                  # a shipped item holds no claim to release
+    print("NOTOURS\ta completed item"); raise SystemExit
+m = re.search(r" ?\(claimed by ([^)]*)\)", line)
+if not m:
+    print("NOTOURS\t"); raise SystemExit  # 🚧 with no stamp, or an unclaimed line — not ours to clear
+owner = m.group(1).strip()
+if owner != who:
+    print("NOTOURS\t" + owner); raise SystemExit
+new = line[:m.start()] + line[m.end():]                                    # drop the claim stamp
+new = new.replace("\U0001f6a7", "\U0001f51c", 1) if "\U0001f6a7" in new else new  # 🚧 → 🔜
+lines[idx] = new
+with open(backlog, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+print("CLEARED\t" + who)
+PY
+)"
+    status="${parsed%%	*}"; owner="${parsed#*	}"
+    case "$status" in
+        MISSING) _RELEASE_RESULT="UNREACHABLE"; return 0 ;;
+        NOTOURS) _RELEASE_RESULT="NOTOURS"; _RELEASE_OWNER="$owner"; return 0 ;;
+        CLEARED) : ;;
+        *)       _RELEASE_RESULT="UNREACHABLE"; return 0 ;;
+    esac
+
+    # ── COMMIT: a commit that does not land (hook, index.lock, unset identity) is not a release ──────
+    git add "$BACKLOG_FILE" 2>/dev/null || true
+    if git diff --cached --quiet; then
+        # Our edit vanished between the write and the stage — nothing to commit, nothing was released.
+        _RELEASE_RESULT="UNREACHABLE"; return 0
+    fi
+    if ! git commit -q -m "Release: $slug → unclaimed ($who)" 2>/dev/null; then
+        # Never leave the operator's main checkout dirty with a half-applied release.
+        git reset -q HEAD -- "$BACKLOG_FILE" >/dev/null 2>&1 || true
+        git checkout -q -- "$BACKLOG_FILE" >/dev/null 2>&1 || true
+        _RELEASE_RESULT="UNREACHABLE"; return 0
+    fi
+
+    # ── PUSH: with a remote configured, the remote is where every other operator reads the claim ─────
+    # Deliberately NOT gated on `rev-list $DEFAULT_BRANCH..HEAD` being non-empty: when the remote-tracking
+    # ref is missing or stale that test is silently empty, and we would skip the push and call it a
+    # release. Pushing an already-current branch is a cheap no-op that still exits 0.
+    if _file_remote_configured; then
+        if ! git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then
+            # Rejected: someone landed on this branch first. Rebase onto their tip and retry ONCE — a
+            # release that touches a line nobody else moved still lands. Anything else (a conflict on
+            # our own line, an unreachable remote) discards our commit and reports the honest failure.
+            git fetch -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
+            if ! { git rebase -q "$HERD_REMOTE/$HERD_BRANCH_NAME" 2>/dev/null \
+                   && git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; }; then
+                _file_release_abort "$head0"
+                _RELEASE_RESULT="UNREACHABLE"; return 0
+            fi
+        fi
+    fi
+
+    # ── RELEASE-VERIFY: re-read the (now-synced) line. Whatever it says is the truth other operators
+    # will read. A stamp that survived means the release did not take — report it, never claim success.
+    line="$(_file_line_for_slug "$slug")"
+    case "$line" in
+        *"claimed by"*) _RELEASE_RESULT="UNREACHABLE"; return 0 ;;
+        "")             _RELEASE_RESULT="UNREACHABLE"; return 0 ;;
+    esac
+    _RELEASE_RESULT="RELEASED"; _RELEASE_OWNER="$who"
+    _backend_tw_journal "$ref" open RELEASED
+}
+
 # ── Planned-work markers (HERD-52) — cross-operator plan-time visibility ─────────────────────────
 # The plan-time complement to the pre-spawn CLAIM (_backend_claim_item, HERD-50): when a coordinator
 # SEQUENCES an item to spawn NEXT but hasn't spawned it yet, it publishes a lightweight PLANNED marker
