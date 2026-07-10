@@ -124,6 +124,14 @@ _DRIVER_RUNTIME="$(herd_model_driver_for "$_MODEL_REF" 2>/dev/null || true)"; [ 
 CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$_DRIVER_RUNTIME")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
+# Model accessibility preflight (HERD-282): refuse BEFORE any worktree/claim/tab/agent when the
+# resolved runtime binary is not on PATH, rather than launching a doomed builder that wedges silently
+# with an empty prompt. Fail-soft: a check that can't run never blocks. Byte-identical when fine.
+if ! herd_model_preflight_accessible "$_MODEL_REF" "$_DRIVER_RUNTIME" "$MODEL"; then
+  journal_append model_preflight_refused slug "$SLUG" lane quick model_ref "$_MODEL_REF"
+  exit 1
+fi
+
 # 0. Atomic claim (HERD-50) — BEFORE any worktree/tab/agent. Aborts the spawn (creating NOTHING) if
 #    the tracked item is already claimed by another operator; proceeds otherwise (including the
 #    off/no-id/backend-unreachable fail-soft paths). Must come before new-feature.sh below.
