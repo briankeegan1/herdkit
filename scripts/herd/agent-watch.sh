@@ -2033,6 +2033,20 @@ _spawn_inflight_file() {
 # never ran is reconciled there as `exited`, and one still ALIVE past its deadline is journaled +
 # inboxed as `lifecycle_expired`. Nothing here kills anything.
 #
+# THE THREE REASONS ARE A JOURNAL PREFERENCE, NOT A STATE MACHINE. Every one of them converges on the
+# same end state (record gone, worker accounted for), and the races between them are benign by
+# construction: a worker whose own `rm` lands between the sweep's `[ -e ]` and its `_marker_live` is
+# retired `swept` rather than `completed`; a worker that finishes before the parent registers it is
+# retired `exited` by the backstop. `lifecycle_retire`'s file guard and its `rm` are not atomic, so a
+# double-retire is VANISHINGLY narrow rather than impossible — and its only cost is a second journal
+# line for a worker that is, either way, correctly accounted for.
+#
+# PID RECYCLING is handled where the marker is: `_marker_live` compares the recorded start-time before
+# trusting `kill -0`, so a recycled lane pid is reaped + retired by `_spawn_inflight_sweep` on the next
+# tick, well inside `_LC_LANE_DEADLINE`. (lifecycle.sh's own `_lc_pid_live` has no such guard, so a
+# record that lost its marker AND had its pid recycled could reach `lifecycle_expired` — one
+# observability row, never a gate, and the same exposure `reviewer`/`health-worker` already carry.)
+#
 # The MARKER NAME is the record key: `<prefix><kind>-<slug>-<uniq>` is already unique per dispatch
 # (_SPAWN_DISPATCH_SEQ), so the lifecycle id needs no second identity to invent — and a corpse marker
 # found by a sweep that never saw its dispatch still resolves to the record that dispatch wrote.
@@ -2054,8 +2068,8 @@ _lane_lifecycle_key() {
 #
 # Both return IMMEDIATELY unless lifecycle.sh is sourced AND LIFECYCLE_CONTRACTS is on — the dispatch
 # path stays byte-inert by default, and the hermetic drain tests may extract these functions ALONE, with
-# no library behind them. lifecycle_retire itself refuses to journal a retirement it cannot evidence, so
-# a double-retire (the worker and the sweep racing) is silent. Always 0.
+# no library behind them. lifecycle_retire refuses to journal a retirement it cannot evidence, so the
+# ordinary worker-vs-sweep race resolves to ONE journal line. Always 0.
 _lane_lifecycle_spawn() {
   command -v lifecycle_enabled >/dev/null 2>&1 && lifecycle_enabled || return 0
   local _lls_k; _lls_k="$(_lane_lifecycle_key "$1")" || return 0
@@ -2079,22 +2093,33 @@ _lane_lifecycle_retire() {
 # got to write it — a race whose only cost is one skipped drain tick).
 #
 # The worker closes its own lifecycle contract (HERD-268) right where it clears its marker, so a clean
-# lane is accounted for the moment it lands rather than waiting on the sweep's exit grace. THE ORDER OF
-# THE FOUR WRITES IS LOAD-BEARING, because `&` forks before the parent records anything and a `true`-fast
-# worker can finish first. Parent: REGISTER, then write the marker. Worker: remove the marker, then
-# retire. That pairing makes every interleaving converge on an accounted-for worker:
-#   • the worker's retire lands after the record exists → retired `completed`, marker gone; or
-#   • it lands before (a silent no-op — lifecycle_retire never journals a retirement it cannot evidence),
-#     which means the worker's `rm` also preceded the parent's marker write, so the marker SURVIVES
-#     naming a dead pid, and the very next `_spawn_inflight_sweep` reaps marker + record together.
-# There is no interleaving that leaves a record without a marker to collect it. Nothing waits on any of
-# this, and with LIFECYCLE_CONTRACTS off both helpers return before touching anything.
+# lane is accounted for the moment it lands rather than waiting on the sweep's exit grace.
+#
+# `_marker_write` STAYS THE PARENT'S FIRST ACT AFTER THE FORK, ahead of the lifecycle bookkeeping. The
+# marker is not only a corpse-sweep token: it is the RESOLVER LANE LOCK'S HOLDER IDENTITY, and
+# `_resolve_lane_lock_acquire` breaks a held lock iff `! _marker_live <holder>` — for which a marker
+# that does not exist YET reads exactly like a dead one. `_lane_lifecycle_spawn` costs a dozen forks
+# (mktemp, mv, date, journal_append), each of which hands the CPU to the freshly-forked lane, whose very
+# first act is to take that lock. Registering before writing the marker therefore let a queued sibling
+# lane observe a live holder as dead, journal `resolver_lane_lock_broken reason=holder-dead` about it,
+# and run a second `git worktree add` against the shared $MAIN — the exact overlap HERD-237's
+# serialization exists to prevent. Marker first, always: bookkeeping never precedes a safety rail.
+#
+# What that costs is only a JOURNAL REASON, never state. A `true`-fast worker can remove the marker and
+# run its own retire before the parent has written the record; that retire is then a silent no-op
+# (lifecycle_retire never journals a retirement it cannot evidence) and the record it could not find is
+# left behind with no marker to collect it. `lifecycle_sweep`'s exited-after-grace reconcile is built
+# for precisely that: the worker is still accounted for, as `exited` rather than `completed`. Trading a
+# lock-safety window for a nicer retire reason would be the wrong way round.
+#
+# With LIFECYCLE_CONTRACTS off both helpers return before touching anything, so the dispatch path is the
+# pre-HERD-268 sequence, fork-for-fork.
 _spawn_inflight_bg() {
   local _sib_marker="$1"; shift
   ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true; _lane_lifecycle_retire "$_sib_marker" completed ) &
   _SPAWN_INFLIGHT_BG_PID="$!"
-  _lane_lifecycle_spawn "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
   _marker_write "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
+  _lane_lifecycle_spawn "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
   return 0
 }
 

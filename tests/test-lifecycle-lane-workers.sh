@@ -29,6 +29,9 @@
 #       pid becomes reason=exited once the exit grace lapses; a worker still ALIVE past its deadline is
 #       journaled `lifecycle_expired` + inboxed with its route, and is NEVER killed.
 #   (8) THE TABLE — both populations carry a deadline and a route naming a real actor.
+#   (9) THE MARKER PRECEDES THE BOOKKEEPING — the marker is the resolver lane lock's holder identity, so
+#       a lane that has taken the lock always reads LIVE to a queued sibling. Registering the contract
+#       before writing the marker made a live holder read DEAD and let two lanes run against $MAIN.
 #
 # Fully hermetic: writes only under a mktemp dir; no herdr, no gh, no network, no model, no watcher.
 # Run:  bash tests/test-lifecycle-lane-workers.sh
@@ -173,17 +176,29 @@ pass; echo "PASS (4) a completed lane worker clears its marker and retires its o
 # ── (5) the resolver lane is the same contract, under its own population ─────────────────────────
 reset_surfaces
 # `true` is the WORST CASE for the dispatch race: the worker's whole body runs before the parent has
-# recorded anything. Whichever way the writes interleave, the worker must end up accounted for — either
-# it retired itself, or its marker survived naming a dead pid and the corpse sweep retires it.
+# recorded anything. Whichever way the writes interleave, the worker must end up accounted for. WHICH
+# reason it lands under is a journal preference, not a state: the worker may retire itself (completed),
+# leave a dead-pid marker for the corpse sweep (swept), or — having retired a record that did not exist
+# yet — leave a markerless record for lifecycle_sweep's exited-after-grace reconcile. All three converge.
 _spawn_inflight_bg "$RESOLVE_M" true
 RESOLVE_PID="$_SPAWN_INFLIGHT_BG_PID"
 [ "$(jfield lifecycle_spawn population)" = "resolver-lane" ] || fail "(5) resolve marker did not register as resolver-lane"
 wait "$RESOLVE_PID" 2>/dev/null
 _spawn_inflight_sweep
+if [ "$(records)" != "0" ]; then                 # the markerless-record race → the documented backstop
+  FUT="$(( $(date +%s) + 7200 ))"
+  HERD_LIFECYCLE_NOW="$FUT" lifecycle_sweep >/dev/null                 # observes the exit
+  HERD_LIFECYCLE_NOW="$(( FUT + 120 ))" lifecycle_sweep >/dev/null     # grace lapsed → retire
+fi
 [ "$(records)" = "0" ]                 || fail "(5) a finished resolver lane left its contract open"
 [ "$(jcount lifecycle_retire)" = "1" ] || fail "(5) a finished resolver lane did not retire exactly once"
+[ "$(jcount lifecycle_expired)" = "0" ]|| fail "(5) a finished resolver lane must never be called hung"
 [ "$(jfield lifecycle_retire population)" = "resolver-lane" ] || fail "(5) retire carried the wrong population"
-pass; echo "PASS (5) the resolver lane registers + retires under its own population"
+case "$(jfield lifecycle_retire reason)" in
+  completed|swept|exited) ;;
+  *) fail "(5) unexpected retire reason: [$(jfield lifecycle_retire reason)]" ;;
+esac
+pass; echo "PASS (5) the resolver lane registers + retires under its own population, however the dispatch races"
 
 # ── (6) a DEAD worker is reaped AND retired by the lane populations' corpse sweep ────────────────
 reset_surfaces
@@ -253,5 +268,52 @@ pass; echo "PASS (7) backstop: dead ⇒ exited after the grace; alive-past-deadl
 [ "$(lifecycle_route resolver)"  = "resolver-escalation" ] || fail "(8) resolver (agent) route regressed"
 pass; echo "PASS (8) both lane populations carry a deadline + a route; the shipped populations are unchanged"
 
+# ── (9) THE MARKER IS THE LANE LOCK'S HOLDER IDENTITY — it must exist before the lane can take it ────
+# REGRESSION (pre-merge review of HERD-268): registering the lifecycle contract BETWEEN the `&` fork and
+# `_marker_write` cost a dozen forks, each handing the CPU to the freshly-forked lane — whose first act
+# is `_resolve_lane_lock_acquire "$marker"`. `_resolve_lane_lock_acquire` breaks a held lock iff
+# `! _marker_live <holder>`, and a marker that does not exist YET reads exactly like a dead one. So a
+# queued sibling lane scrapped a LIVE holder's lock (journaling reason=holder-dead about it) and ran a
+# second `git worktree add` against the shared $MAIN. Bookkeeping must never precede a safety rail.
+#
+# Asserted the way the review measured it. The probe must run AT THE INSTANT THE LANE TAKES THE LOCK —
+# probing later from the parent proves nothing, because by then the parent has finished writing the
+# marker whatever the order was. So the lane itself, immediately after `_resolve_lane_lock_acquire`
+# returns, asks the real `_marker_live` about its own published holder identity: that is precisely the
+# question a queued sibling asks one poll later, and the answer a sibling would act on.
+reset_surfaces
+export LIFECYCLE_CONTRACTS=on
+RESOLVE_LANE_LOCK="$TREES/.spawn-resolve-lane.lock"
+rm -rf "$RESOLVE_LANE_LOCK"
+PROBE="$T/holder.probe"; : > "$PROBE"
+
+# The lane body a real dispatch runs: take the lock, record how a sibling would see the holder, release.
+lock_taking_lane() {
+  _resolve_lane_lock_acquire "$1" || { printf 'no-lock\n' >> "$PROBE"; return 0; }
+  if _marker_live "$(cat "$RESOLVE_LANE_LOCK/holder" 2>/dev/null || true)" 2>/dev/null; then
+    printf 'live\n' >> "$PROBE"
+  else
+    printf 'FALSE-DEAD\n' >> "$PROBE"     # a sibling polling here would scrap this live lane's lock
+  fi
+  _resolve_lane_lock_release "$1"
+}
+
+BROKEN_BEFORE="$(jcount resolver_lane_lock_broken)"
+for i in 1 2 3 4 5 6 7 8; do
+  M="$(_spawn_inflight_file resolve fixit "77-abc-$i")"
+  _spawn_inflight_bg "$M" lock_taking_lane "$M"
+  wait "$_SPAWN_INFLIGHT_BG_PID" 2>/dev/null
+  _spawn_inflight_sweep
+done
+LIVE="$(grep -c '^live$' "$PROBE" 2>/dev/null | tr -cd '0-9')"
+FALSE_DEAD="$(grep -c '^FALSE-DEAD$' "$PROBE" 2>/dev/null | tr -cd '0-9')"
+[ "${FALSE_DEAD:-0}" = "0" ] || fail "(9) a LIVE lane holding the lane lock read DEAD ${FALSE_DEAD}/8 times — a queued sibling would scrap its lock and run a second worktree add against \$MAIN"
+[ "${LIVE:-0}" = "8" ]       || fail "(9) expected 8 live holders, got ${LIVE:-0} (probe: $(tr '\n' ' ' < "$PROBE"))"
+# And no lane ever broke a lock it should not have: a holder-dead break here is the bug's signature.
+[ "$(jcount resolver_lane_lock_broken)" = "$BROKEN_BEFORE" ] \
+  || fail "(9) a live holder's lane lock was broken (resolver_lane_lock_broken journaled)"
+rm -rf "$RESOLVE_LANE_LOCK"
+pass; echo "PASS (9) with the lever ON, a lane holding the lane lock always reads LIVE — the marker precedes the bookkeeping"
+
 echo
-echo "✅ test-lifecycle-lane-workers.sh — $PASS/8 checks passed — ALL PASS"
+echo "✅ test-lifecycle-lane-workers.sh — $PASS/9 checks passed — ALL PASS"
