@@ -69,6 +69,7 @@ Role summarized from each file's top-of-file comment.
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
 - `research.sh` — research.sh "<question>" — ENQUEUE a READ-ONLY repo research question and make sure exactly
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
+- `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
@@ -109,7 +110,7 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
+- `bin/herd` → `agent-update.sh`, `console-section.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
 - `agent-watch.sh` → `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`
 - `app-monitor.sh` → `herd-config.sh`
@@ -132,7 +133,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-preflight.sh` → `engine-version.sh`
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`
-- `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`
+- `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
 - `journal-audit.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
@@ -264,6 +265,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_MODEL_ESCALATED` → `agent-watch.sh`
 - `REVIEW_PANEL` → `herd-review.sh`
+- `REVIEW_PANEL_MODELS` → `bin/herd`, `herd-review.sh`, `review-panel.sh`
+- `REVIEW_PANEL_POLICY` → `herd-review.sh`, `review-panel.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SCRIBE_POLL` → `scribe-step.sh`
