@@ -284,7 +284,8 @@ Spawn an agent into a tab/pane on an opening prompt: `claude --model <model> --d
 | -------------------------------------- | -------------------------------------------------------- |
 | `scripts/herd/herd-feature.sh:230`     | builder lane (herdr `agent start … -- claude`)           |
 | `scripts/herd/herd-quick.sh:235`       | quick-builder lane                                        |
-| `scripts/herd/herd-resolve.sh:77`      | conflict-resolver lane (via `herd_driver_launch_agent`)  |
+| `scripts/herd/herd-resolve.sh:99`      | conflict-resolver lane, split into the builder's tab (HERD-280, `RESOLVER_PANE=on`) |
+| `scripts/herd/herd-resolve.sh:123`     | conflict-resolver lane, standalone `resolve·<slug>` tab (the default + fallback) |
 | `scripts/herd/herd-review.sh:505`      | agent-pane reviewer (via `herd_driver_launch_agent`)     |
 | `scripts/herd/scribe.sh:205`           | scribe drainer agent-pane                                |
 | `scripts/herd/research.sh:162`         | research drainer agent-pane                              |

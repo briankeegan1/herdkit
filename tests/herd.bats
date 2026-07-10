@@ -295,6 +295,24 @@ setup() {
   [[ "$output" == *"ALL PASS"* ]]
 }
 
+@test "hermetic supervised-process contract (HERD-193) test passes" {
+  run bash "$REPO/tests/test-lifecycle-contracts.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"checks passed"* ]]
+}
+
+@test "hermetic lane-worker lifecycle contracts (HERD-268) test passes" {
+  run bash "$REPO/tests/test-lifecycle-lane-workers.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic resolver-pane lifecycle (HERD-280) test passes" {
+  run bash "$REPO/tests/test-resolver-pane-lifecycle.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
 @test "hermetic restart-safe gate dispatch (HERD-185) test passes" {
   run bash "$REPO/tests/test-restart-safe-dispatch.sh"
   [ "$status" -eq 0 ]
@@ -327,6 +345,12 @@ setup() {
 
 @test "hermetic knob-aware operating doctrine (HERD-216) test passes" {
   run bash "$REPO/tests/test-knob-aware-doctrine.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALL PASS"* ]]
+}
+
+@test "hermetic wedged-builder classifier (HERD-278) test passes" {
+  run bash "$REPO/tests/test-wedged-builder.sh"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ALL PASS"* ]]
 }

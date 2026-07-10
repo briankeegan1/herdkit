@@ -305,6 +305,72 @@ printf '%s' "$rep2" | grep -q "^STATE $SLUG held" \
   && ok "the hold persists tick over tick (it is an invariant, not a notification)" \
   || bad "the hold vanished on the second tick: $rep2"
 
+# ── PART 3: HERD-279 — orphan with MERGED PR but tip ≠ oid and 0 unique commits → auto-clears ────
+# Regression case: branch tip is an ancestor of the merged head (0 commits unique vs the merged oid).
+# Before the fix this emitted 'held' with "(0 commit(s) exist only here)"; after the fix it must
+# auto-retire because every bit of work is provably in the merged PR.
+#
+# Fixture construction:
+#   sha_a ← first commit on feat/$SLUG
+#   sha_b ← second commit (PR merged at sha_b into main)
+#   local branch reset to sha_a   →  tip=sha_a, oid=sha_b, rev-list sha_b..feat/$SLUG = 0
+#   worktree removed before the tick   →  orphan path (_retire_classify_orphan)
+fixture_zerocommit() {
+  local scn="$1" slug="$2"
+  local main="$scn/main" trees="$scn/trees"
+  mkdir -p "$main" "$trees" "$scn/gh"
+  git -C "$main" init -q -b main
+  git -C "$main" config user.email sim@sim; git -C "$main" config user.name sim
+  echo base > "$main/file.txt"; git -C "$main" add -A; git -C "$main" commit -qm base
+
+  git -C "$main" worktree add -q -b "feat/$slug" "$trees/$slug" main
+  echo "step one" > "$trees/$slug/file.txt"
+  git -C "$trees/$slug" -c user.email=sim@sim -c user.name=sim commit -qam "step one"
+  local sha_a; sha_a="$(git -C "$trees/$slug" rev-parse HEAD)"
+  echo "step two" > "$trees/$slug/file.txt"
+  git -C "$trees/$slug" -c user.email=sim@sim -c user.name=sim commit -qam "step two"
+  local sha_b; sha_b="$(git -C "$trees/$slug" rev-parse HEAD)"
+
+  # PR merged at sha_b; gh reports MERGED at that exact sha.
+  git -C "$main" merge -q --no-ff -m "merge #99" "feat/$slug"
+  printf 'MERGED\t%s\t99\n' "$sha_b" > "$scn/gh/feat%$slug"
+
+  # Remove the worktree first (orphan path), then rewind the branch to sha_a so tip ≠ oid.
+  git -C "$main" worktree remove --force "$trees/$slug" 2>/dev/null || rm -rf "$trees/$slug"
+  git -C "$main" branch -f "feat/$slug" "$sha_a"
+
+  # Leave tab + registry debris so the orphan classifier has something to clean up.
+  cat > "$scn/tabs.json" <<EOF
+{"result":{"tabs":[
+  {"tab_id":"t-build","label":"$slug","workspace_id":"ws1"},
+  {"tab_id":"t-review","label":"review·$slug","workspace_id":"ws1"}]}}
+EOF
+  printf '%s t-build 0\nreview·%s t-review 0\n' "$slug" "$slug" > "$trees/.herd-tabs"
+  printf 'HERD-279\n' > "$trees/.herd-ref-$slug"
+}
+
+step zerocommit "HERD-279: orphan with MERGED PR + 0 unique commits must auto-clear (not needs-you)"
+SLUG_ZC=retiree-zc
+scn="$ART/scn-zerocommit"; rm -rf "$scn"; mkdir -p "$scn"
+fixture_zerocommit "$scn" "$SLUG_ZC"
+
+rep="$(tick "$scn" "$SLUG_ZC" none)"
+state="$(printf '%s' "$rep" | sed -n "s/^STATE $SLUG_ZC //p" | cut -d' ' -f1)"
+left="$(printf '%s' "$rep" | sed -n 's/^LEFT //p')"
+res="$(residue "$scn" "$SLUG_ZC")"
+
+[ "$state" != "held" ] \
+  && ok "0-unique-commit orphan is NOT held (state='${state:-<converged>}')" \
+  || bad "0-unique-commit orphan is held as needs-you — HERD-279 regression: state='$state'"
+
+if [ -z "$left" ] && [ -z "$res" ]; then
+  ok "auto-cleared in one tick (no leftovers, no residue)"
+elif [ "$state" = "retiring" ] || [ "$state" = "stuck" ]; then
+  ok "classified as '${state}' (teardown in progress, not needs-you)"
+else
+  bad "unexpected outcome: state='${state:-<none>}' left='${left:-}' res='${res:-}'"
+fi
+
 step done "scorecard"
 info "artifacts: $ART"
 printf '  %s%s passed%s · %s%s failed%s\n' "$c_grn" "$PASS" "$c_rst" \
