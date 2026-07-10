@@ -1,0 +1,15 @@
+COLORS
+WORKSPACEproj2
+ROOT/Users/dev/src/proj2
+WATCHERdown0
+BCOUNTS0012
+BUILDERdeadfeat-ghost
+BUILDERidlefeat-sleepy
+BUILDERagentmissingfeat-vanished201
+PRCOUNT2
+PR200feat/confCONFLICTINGDIRTY1
+PR201feat/vanishedMERGEABLEBLOCKEDCHANGES_REQUESTED1
+BACKLOGfile00
+CODEMAP10
+ATTENTION1
+REASONS dead-builder:feat-ghost agent-missing:feat-vanished conflicting-pr:#200 changes-requested:#201
