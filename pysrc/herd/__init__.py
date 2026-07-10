@@ -26,3 +26,4 @@ dependencies — python3 is already a hard engine dep; NONE are added here.
 """
 
 __all__ = ["why", "log", "cost", "decisions"]
+__all__.append("parity")  # P3a journal-diff parity harness (HERD-314)
