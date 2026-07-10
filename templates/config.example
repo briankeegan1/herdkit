@@ -559,6 +559,21 @@ WATCHER_AUTOMERGE="true"
 # CLAIM_REQUIRED enforces EXCLUSIVITY. Recommended for shared / multi-operator repos.
 # TRACKED_SPAWNS="off"   # off (default) | required
 
+# CLAIM_RELEASE (HERD-162) — the claim's missing other half. A claim is taken before the worktree and,
+# until this key, released by nothing: a builder that DIED before opening a PR left its tracker item
+# In Progress + assigned forever, so the other operator's pre-spawn claim read it as ALREADY and
+# aborted. The item was wedged against everyone but a dead process. With this on, the watcher's
+# dead-builder reconcile hands the claim back.
+#   off (default) — byte-inert: no read, no tracker write, and the 💀 notification is unchanged.
+#   flag          — observe only: journal the wedged ref and say so on the 💀 notification.
+#   release       — also clear the claim marker (the assignee on Linear/GitHub, the "(claimed by …)"
+#                   stamp on the file backend) so the item is re-pickable. The workflow STATE is never
+#                   touched — reopening / re-queuing stays a coordinator act.
+# Released ONLY for a builder that is dead, has a CLEAN worktree, and is NOT being auto-respawned: a
+# dead builder that left work is a human-recovery hold, and a respawning builder still owns its item.
+# Never steals another identity's claim. Backends with no release op fail soft to `flag`.
+# CLAIM_RELEASE="off"   # off (default) | flag | release
+
 # routing — where engine bugs escalate (herd report files a gh issue here)
 HERD_REPO="briankeegan1/herdkit"
 

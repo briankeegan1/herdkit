@@ -803,6 +803,74 @@ EOF
     fi
 }
 
+# _backend_release_item REF WHO — release OUR OWN claim (HERD-162 F12) by clearing the issue ASSIGNEE,
+# the marker _backend_claim_item set. Like the claim, the claimant identity is the API key's own user
+# (viewer{}), not WHO — WHO is informational. The workflow STATE is deliberately left as it stands: a
+# claim moves the issue to `started`, and moving it BACK is a re-queue, which is a coordinator act, not
+# a watcher's. An unassigned issue in a started state is exactly what the claim path treats as
+# re-pickable, so clearing the assignee alone un-wedges the other operator. Refuses to clear an
+# assignee that is not ours (never steal a live claim) and never touches a completed/canceled issue.
+#   _RELEASE_RESULT = RELEASED | NOTOURS (unassigned / another assignee / shipped) |
+#                     UNREACHABLE (unresolvable ref, no viewer → caller fails soft)
+#   _RELEASE_OWNER  = the blocking assignee's name, when the refusal was NOTOURS
+_backend_release_item() {
+    local ref="$1" who="$2" me_id resp issue_id assignee_id assignee_name stype
+    _RELEASE_RESULT=""; _RELEASE_OWNER=""
+    _linear_require_key
+    me_id="$(_linear_viewer_id)"
+    if [ -z "$me_id" ]; then _RELEASE_RESULT="UNREACHABLE"; return 0; fi
+
+    if ! _linear_issue_query "$ref" "id identifier assignee { id name } state { type }"; then
+        _RELEASE_RESULT="UNREACHABLE"; return 0
+    fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    # Split on the ASCII unit separator, NOT a tab — an unassigned issue's empty fields must survive
+    # `read` intact (the same collapse hazard _backend_claim_item documents at length).
+    IFS=$'\x1f' read -r issue_id assignee_id assignee_name stype <<EOF
+$(printf '%s' "$resp" | python3 -c 'import sys, json
+SEP = "\x1f"
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if not nodes:
+    print(SEP * 3)
+else:
+    n = nodes[0]
+    a = n.get("assignee") or {}
+    st = n.get("state") or {}
+    print(SEP.join([n.get("id", ""), a.get("id", "") or "",
+                    (a.get("name") or "").replace(SEP, " "), st.get("type", "")]))' 2>/dev/null)
+EOF
+    if [ -z "$issue_id" ]; then _RELEASE_RESULT="UNREACHABLE"; return 0; fi
+    case "$stype" in
+        completed|canceled|cancelled) _RELEASE_RESULT="NOTOURS"; _RELEASE_OWNER="a completed issue"; return 0 ;;
+    esac
+    if [ -z "$assignee_id" ] || [ "$assignee_id" != "$me_id" ]; then
+        _RELEASE_RESULT="NOTOURS"; _RELEASE_OWNER="${assignee_name:-nobody}"; return 0
+    fi
+
+    _linear_gql 'mutation Release($id: String!, $assignee: String) {
+  issueUpdate(id: $id, input: { assigneeId: $assignee }) { success }
+}' "$(ID="$issue_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "assignee": None}))')" >/dev/null 2>&1 || true
+
+    # RELEASE-VERIFY: re-read the assignee and confirm the claim marker is actually gone. A mutation
+    # that silently failed must not be reported as a release — the item would stay wedged in silence.
+    if ! _linear_issue_query "$ref" 'assignee { id }'; then _RELEASE_RESULT="UNREACHABLE"; return 0; fi
+    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
+    assignee_id="$(printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+a = (nodes[0].get("assignee") or {}) if nodes else {}
+print(a.get("id", "") or "")' 2>/dev/null)"
+    if [ -n "$assignee_id" ]; then
+        _RELEASE_RESULT="UNREACHABLE"; return 0     # the unassign did not stick — say nothing happened
+    fi
+    _RELEASE_RESULT="RELEASED"; _RELEASE_OWNER="${who:-viewer}"
+    _backend_tw_journal "$ref" open RELEASED        # HERD-85: a release is a tracker write
+}
+
 # ── Planned-work markers (HERD-52) — cross-operator plan-time visibility ─────────────────────────
 # A coordinator that has SEQUENCED an item to spawn NEXT (but not yet spawned it) publishes a
 # lightweight PLANNED marker so a second operator sees it and doesn't grab the same item. This

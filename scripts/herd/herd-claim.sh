@@ -28,6 +28,17 @@
 #     hard-block a solo operator on a backend hiccup.
 #   • Byte-identical behavior for a claim on a genuinely OPEN item (the added state read is read-only).
 #
+# CLAIM RELEASE (herd_claim_release <id> <who> <slug> <reason>, HERD-162 F12):
+#   The claim's missing other half. Nothing in the engine ever un-claimed an item, so a builder that
+#   died BEFORE opening a PR left its tracker item claimed forever — the ALREADY abort above then
+#   wedges it against every other operator, permanently, behind a message that is technically true and
+#   operationally useless. herd_claim_release releases OUR OWN claim through the backend's
+#   _backend_release_item op. It is gated by CLAIM_RELEASE (off | flag | release, default off), NEVER
+#   steals another identity's claim, and NEVER touches the item's workflow state (a reopen/re-queue is
+#   a coordinator act). The watcher's dead-builder reconcile is its only caller, and it owns the rails
+#   that decide WHEN an item is genuinely abandoned. Fail-soft everywhere: a backend with no release op
+#   degrades to `flag`.
+#
 # The claim itself is delegated to the active SCRIBE_BACKEND's _backend_claim_item op (backends/*.sh),
 # sourced in a SUBSHELL so the _backend_* helpers never leak into the lane's namespace — the same
 # discipline agent-watch.sh's _reconcile_via_ref and dep-watcher.sh's _dw_check_state use.
@@ -192,5 +203,86 @@ herd_claim_or_abort() {
     UNREACHABLE|*)
       echo "⚠️  could not verify a claim on $id (backend '${SCRIBE_BACKEND:-file}' unreachable or has no claim op) — proceeding as unclaimed (solo-operator fail-soft)." >&2
       return 0 ;;
+  esac
+}
+
+# ── CLAIM RELEASE (HERD-162 F12) ───────────────────────────────────────────────────────────────────
+
+# herd_claim_release_mode — the effective CLAIM_RELEASE mode as exactly one token: off | flag | release.
+# Any unrecognized value reads as off, so a typo can never start writing the tracker.
+herd_claim_release_mode() {
+  case "$(printf '%s' "${CLAIM_RELEASE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    release|on|true|yes|1) printf 'release' ;;
+    flag|observe|warn)     printf 'flag' ;;
+    *)                     printf 'off' ;;
+  esac
+}
+
+# _herd_release_dispatch <id> <identity> — source the active backend in a SUBSHELL and run its
+# _backend_release_item op, with the same namespace/secrets discipline as _herd_claim_dispatch (the
+# _backend_* helpers never leak into the caller). Prints "<RESULT>\t<OWNER>" where
+#   RELEASED    — our claim marker is gone; the item is re-pickable
+#   NOTOURS     — the claim belongs to another identity (or to nobody) → we release NOTHING
+#   UNREACHABLE — no backend file, no release op, a sourcing error, or a transport failure
+# A backend that defines no release op (jira, changelog) maps to UNREACHABLE so the caller fails soft.
+_herd_release_dispatch() {
+  local id="$1" who="$2" bdir bfile
+  bdir="${SCRIBE_BACKEND_DIR:-$_HERD_CLAIM_DIR/backends}"
+  bfile="$bdir/${SCRIBE_BACKEND:-file}.sh"
+  if [ ! -f "$bfile" ]; then printf 'UNREACHABLE\t'; return 0; fi
+  (
+    # API-backend credentials live in .herd/secrets (gitignored); file/changelog need none.
+    if [ -n "${PROJECT_ROOT:-}" ] && [ -f "$PROJECT_ROOT/.herd/secrets" ]; then
+      # shellcheck source=/dev/null
+      . "$PROJECT_ROOT/.herd/secrets"
+    fi
+    # shellcheck source=/dev/null
+    . "$bfile" 2>/dev/null || { printf 'UNREACHABLE\t'; exit 0; }
+    command -v _backend_release_item >/dev/null 2>&1 || { printf 'UNREACHABLE\t'; exit 0; }
+    [ -n "${PROJECT_ROOT:-}" ] && cd "$PROJECT_ROOT" 2>/dev/null
+    # Attribute the release's tracker_write (HERD-85) to the 'claim' component, as the claim itself is.
+    export HERD_COMPONENT="claim"
+    _RELEASE_RESULT=""; _RELEASE_OWNER=""
+    _backend_release_item "$id" "$who" 2>/dev/null || true
+    printf '%s\t%s' "${_RELEASE_RESULT:-UNREACHABLE}" "${_RELEASE_OWNER:-}"
+  )
+}
+
+# herd_claim_release <id> <who> <slug> <reason> — release OUR claim on <id> because <slug>'s builder is
+# gone. Echoes exactly one token for the caller to surface: released | flagged | notours | unsupported.
+# The CALLER owns the policy question ("is this builder genuinely abandoned?"); this function owns only
+# the mechanism. Never non-zero — a release that cannot happen is surfaced, never fatal.
+#   CLAIM_RELEASE=off      → 'off' and nothing else happens (this is also enforced by the caller).
+#   CLAIM_RELEASE=flag     → journal claim_release_flagged; NO tracker write.
+#   CLAIM_RELEASE=release  → dispatch to the backend; a backend with no release op degrades to 'flagged'.
+herd_claim_release() {
+  local id="${1:-}" who="${2:-}" slug="${3:-?}" reason="${4:-abandoned}" mode parsed result owner
+  [ -n "$id" ] || { printf 'off'; return 0; }
+  mode="$(herd_claim_release_mode)"
+  [ "$mode" = off ] && { printf 'off'; return 0; }
+  [ -n "$who" ] || who="$(_herd_claim_identity)"
+  [ -n "$who" ] || who="unknown-operator"
+
+  if [ "$mode" = flag ]; then
+    journal_append claim_release_flagged ref "$id" slug "$slug" reason "$reason" who "$who"
+    printf 'flagged'; return 0
+  fi
+
+  parsed="$(_herd_release_dispatch "$id" "$who")"
+  result="${parsed%%$'\t'*}"; owner="${parsed#*$'\t'}"
+  case "$result" in
+    RELEASED)
+      journal_append claim_released ref "$id" slug "$slug" reason "$reason" who "$who"
+      printf 'released' ;;
+    NOTOURS)
+      # Someone else holds it (or nobody does) — releasing would steal/no-op. Say so, write nothing.
+      journal_append claim_release_skipped ref "$id" slug "$slug" reason not-ours owner "${owner:-none}"
+      printf 'notours' ;;
+    UNREACHABLE|*)
+      # No release op on this backend, or the backend could not be reached. Degrade to the flag mode's
+      # contract — the wedge is surfaced and journaled, and a human re-queues it.
+      journal_append claim_release_flagged ref "$id" slug "$slug" reason "$reason" who "$who" \
+        detail "backend ${SCRIBE_BACKEND:-file} has no release op or was unreachable"
+      printf 'unsupported' ;;
   esac
 }
