@@ -371,3 +371,5 @@ CREATE_SELFHEAL	unit	tests/test-create-selfheal.sh
 CREATE_RETRY_MAX	unit	tests/test-create-selfheal.sh
 ENGINE_IMPL	unit	tests/test-py-shadow-runtime.sh
 ENGINE_IMPL	unit	tests/test-py-live-runtime.sh
+STORE_BACKEND	unit	tests/test-py-store.sh
+STORE_BACKEND	sim	tests/test-py-store.sh
