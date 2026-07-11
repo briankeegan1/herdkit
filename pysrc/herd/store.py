@@ -207,6 +207,16 @@ def _now():
     return int(time.time())
 
 
+def _thread_id():
+    """A per-thread id so a claim's staging temp file is unique across concurrent writers in ONE process
+    (os.getpid() alone collides between threads). stdlib; falls back to 0 if threading is unavailable."""
+    try:
+        import threading
+        return threading.get_ident()
+    except Exception:
+        return 0
+
+
 class _FlatBackend:
     """Accessors over the SAME flat files the bash engine owns. This is the current behavior expressed
     as the store's flat backend — so ``resolve_backend()==flat`` (the ship default) routes through code
@@ -333,19 +343,38 @@ class _FlatBackend:
         if not path:
             return owner
         _ensure_parent(path)
-        # O_CREAT|O_EXCL is the atomic primitive: the process that creates the file wins the race; a
-        # loser gets EEXIST and reads the winner's identity. No lost updates across concurrent writers.
+        # Atomic claim-or-abort with NO empty window: materialize a COMPLETE temp file (owner already
+        # written and closed) and hard-link it into place. os.link is atomic and fails EEXIST when a
+        # rival already linked — so the claim file, ONCE IT EXISTS, always carries the winner's identity.
+        #
+        # A plain O_CREAT|O_EXCL create is atomic for "who makes the file", but it leaves the file EMPTY
+        # until the winner's separate os.write lands. A loser that hits EEXIST in that window reads an
+        # empty file, gets no owner, and (via `or owner`) falsely reports ITSELF the winner — a real
+        # lost-update that surfaces as multiple "winners" under load (HERD-333). Writing the identity
+        # BEFORE the file is linkable closes that window entirely.
+        tmp = "%s.tmp-%d-%d" % (path, os.getpid(), _thread_id())
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            return self.claim_owner(item_id) or owner
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except Exception:
-            return owner
+            # Could not stage a temp file (e.g. a stale sibling from a crashed writer) — fall back to a
+            # committed read so we never invent a win; if truly nothing is there, contend as ourselves.
+            return self.claim_owner(item_id) or owner
         try:
             os.write(fd, ("%s\t%s\n" % (owner, _now())).encode("utf-8"))
         finally:
             os.close(fd)
-        return owner
+        try:
+            os.link(tmp, path)          # atomic publish: fails EEXIST if a rival won the race
+            return owner                # we won (the claim file now holds OUR identity)
+        except FileExistsError:
+            return self.claim_owner(item_id) or owner   # rival won; their id is already fully written
+        except Exception:
+            return owner
+        finally:
+            try:
+                os.remove(tmp)          # our temp is never the published file — always clean it up
+            except Exception:
+                pass
 
     def claim_owner(self, item_id):
         path = self._claim_file(item_id)
@@ -457,6 +486,11 @@ CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+# Bounded retries for the one-time WAL + schema setup when many connections open a fresh db at once
+# (200 × 10ms ≈ 2s worst case — far under the 30s busy_timeout, and only ever hit on first-touch races).
+_INIT_RETRIES = 200
+
+
 class _SqliteBackend:
     """The store on SQLite. WAL for concurrent readers/writers; every read-modify-write runs inside a
     ``BEGIN IMMEDIATE`` transaction so a contested claim / refix bump / once-guard resolves without a
@@ -468,9 +502,26 @@ class _SqliteBackend:
         _ensure_parent(path)
         self.path = path
         self._conn = sqlite3.connect(path, timeout=30, isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout FIRST, so every subsequent lock wait — including the one-time WAL + schema
+        # setup below — is patient rather than failing fast on a contended lock.
         self._conn.execute("PRAGMA busy_timeout=30000")
-        self._conn.executescript(_SCHEMA)
+        # One-time WAL enable + schema create is a WRITE, and when many connections open the SAME fresh
+        # db at once (the concurrent-claim path) it collides: CREATE TABLE contends for the write lock,
+        # and — critically — ``PRAGMA journal_mode=WAL`` can return SQLITE_BUSY *without* honoring
+        # busy_timeout (the journal-mode switch is not a normal statement the busy handler covers). A
+        # throw here is not benign: ``open_store`` catches it and SILENTLY downgrades that one caller to
+        # the FLAT backend, so the pool splits across two substrates and a second writer manufactures a
+        # false claim "winner" (HERD-333). Retry the setup a bounded number of times so concurrent opens
+        # converge to WAL instead of one of them tipping into flat. Idempotent (all IF NOT EXISTS).
+        for _attempt in range(_INIT_RETRIES):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.executescript(_SCHEMA)
+                break
+            except sqlite3.OperationalError:
+                if _attempt == _INIT_RETRIES - 1:
+                    raise
+                time.sleep(0.01)
 
     # _rmw — run a read-modify-write body inside a BEGIN IMMEDIATE … COMMIT transaction, RETRYING on a
     # transient lock error. BEGIN IMMEDIATE takes the write lock up front so a contended writer WAITS
