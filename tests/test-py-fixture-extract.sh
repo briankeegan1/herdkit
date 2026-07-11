@@ -61,8 +61,17 @@ cat > "$T/real.jsonl" <<'EOF'
 {"ts":"2026-07-10T00:00:13Z","event":"hold_applied","pr":606,"sha":"s606","slug":"hv-6","kind":"human-verify"}
 {"ts":"2026-07-10T00:00:14Z","event":"approval_recorded","pr":707,"sha":"s707","state":"approved","source":"human"}
 {"ts":"2026-07-10T00:00:15Z","event":"main_health","pr":999,"sha":"s999","result":"green"}
-{"ts":"2026-07-10T00:00:16Z","event":"symbol_index_refresh","pr":101,"result":"skipped","reason":"no-index"}
-{"ts":"2026-07-10T00:00:17Z","event":"infra_breaker_open","scope":"global","fails":3}
+{"ts":"2026-07-10T00:00:16Z","event":"main_health","pr":901,"sha":"s901","result":"dispatched","pid":71,"log_path":"/tmp/tr/.health-log-main-s901","provenance":"merge"}
+{"ts":"2026-07-10T00:00:17Z","event":"main_health","pr":901,"sha":"s901","result":"green"}
+{"ts":"2026-07-10T00:00:18Z","event":"main_health","pr":902,"sha":"s902","result":"dispatched","pid":72,"log_path":"/tmp/tr/.health-log-main-s902","provenance":"merge"}
+{"ts":"2026-07-10T00:00:19Z","event":"main_health","pr":902,"sha":"s902","result":"red","failed":"app/x.test.sh","since":902}
+{"ts":"2026-07-10T00:00:20Z","event":"push_hold_awaiting","slug":"pg-demo","sha":"pgs1","dir":"/tmp/pg-repo"}
+{"ts":"2026-07-10T00:00:21Z","event":"push_hold_approved","slug":"pg-demo","sha":"pgs1"}
+{"ts":"2026-07-10T00:00:22Z","event":"push_hold_resumed","slug":"pg-demo","sha":"pgs1"}
+{"ts":"2026-07-10T00:00:23Z","event":"push_hold_awaiting","slug":"pg-stale","sha":"pgs2","dir":"/tmp/pg-repo2"}
+{"ts":"2026-07-10T00:00:24Z","event":"push_hold_approved","slug":"pg-stale","sha":"pgs2"}
+{"ts":"2026-07-10T00:00:25Z","event":"symbol_index_refresh","pr":101,"result":"skipped","reason":"no-index"}
+{"ts":"2026-07-10T00:00:26Z","event":"infra_breaker_open","scope":"global","fails":3}
 EOF
 
 FX="$T/fixture.json"
@@ -86,6 +95,18 @@ elif op == "cfg":
     print(d.get("config", {}).get(sys.argv[3], "∅"))
 elif op == "excluded":
     print(d["_extracted"]["excluded_events"].get(sys.argv[3], 0))
+elif op == "mhcount":
+    print(len(d.get("main_healths", [])))
+elif op == "mhfield":
+    # mhfield <pr> <key>: find the main_healths entry for <pr>, print <key> (∅ if absent).
+    mh = {m["pr"]: m for m in d.get("main_healths", [])}
+    print(mh.get(sys.argv[3], {}).get(sys.argv[4], "∅"))
+elif op == "phcount":
+    print(len(d.get("push_holds", [])))
+elif op == "phfield":
+    # phfield <slug> <key>
+    ph = {p["slug"]: p for p in d.get("push_holds", [])}
+    print(ph.get(sys.argv[3], {}).get(sys.argv[4], "∅"))
 PY
 }
 
@@ -111,13 +132,38 @@ ok "stale from restale/starvation, and the last candidate-signal sha wins (contr
 [ "$(probe field 707 approved)" = "True" ] || fail "PR707 approval_recorded should set approved=true (§5.5)"
 ok "human-verify hold → hv_hold, approval_recorded → approved (contract §5.4/§5.5)"
 
-# main_health / reap / symbol_index_refresh / infra_breaker are AUXILIARY — never candidates, always tallied.
-[ "$(probe has 999)" = "no" ] || fail "main_health PR999 must NOT become a candidate (auxiliary, §3.4)"
+# reap / symbol_index_refresh / infra_breaker are AUXILIARY — never candidates, always tallied. main_health
+# and push_hold_* are now MODELED (their own lists), so they must NOT be candidates NOR excluded (HERD-325).
+[ "$(probe has 999)" = "no" ] || fail "main_health PR999 must NOT become a candidate (§3.4)"
+[ "$(probe has 901)" = "no" ] && [ "$(probe has 902)" = "no" ] || fail "main_health PRs must NOT become candidates"
 [ "$(probe count)" = "7" ] || fail "expected 7 gate-subject candidates (101,202,303,404,505,606,707), got $(probe count)"
-[ "$(probe excluded main_health)" = "1" ] && [ "$(probe excluded reap)" = "1" ] \
+[ "$(probe excluded reap)" = "1" ] \
   && [ "$(probe excluded symbol_index_refresh)" = "1" ] && [ "$(probe excluded infra_breaker_open)" = "1" ] \
   || fail "auxiliary events not tallied in the excluded provenance block"
-ok "auxiliary events excluded from candidates and honestly tallied (never fabricated, contract §2.1)"
+[ "$(probe excluded main_health)" = "0" ] || fail "main_health is now modeled — it must NOT be in the excluded tally (HERD-325)"
+[ "$(probe excluded push_hold_awaiting)" = "0" ] || fail "push_hold_* is now modeled — it must NOT be in the excluded tally (HERD-325)"
+ok "auxiliary events excluded + tallied; main_health/push_hold modeled, neither candidate nor excluded (§2.1/§3.4/§5.4)"
+
+# ── (A') non-candidate engine families now MODELED into ordered fixture lists (HERD-325 oracle v2) ────
+# main_health folds by (pr,sha): a lone green (999), a dispatched+green pair (901), a dispatched+red pair
+# (902) carrying failed/since. push_hold folds by (slug,sha): a full awaiting→approved→resumed (pg-demo)
+# and an awaiting→approved with no resume (pg-stale).
+[ "$(probe mhcount)" = "3" ] || fail "expected 3 main_health subjects (999,901,902), got $(probe mhcount)"
+[ "$(probe mhfield 999 result)" = "green" ] || fail "main_health 999 should be green"
+[ "$(probe mhfield 999 dispatched)" = "∅" ] || fail "main_health 999 (lone result, no dispatch) must NOT carry dispatched"
+[ "$(probe mhfield 901 result)" = "green" ] && [ "$(probe mhfield 901 dispatched)" = "True" ] \
+  || fail "main_health 901 should be a dispatched green"
+[ "$(probe mhfield 902 result)" = "red" ] && [ "$(probe mhfield 902 failed)" = "app/x.test.sh" ] \
+  && [ "$(probe mhfield 902 since)" = "902" ] \
+  || fail "main_health 902 should be a red carrying failed + since"
+ok "main_health folds by (pr,sha) into main_healths: lone/green/red, failed+since preserved (§3.4)"
+
+[ "$(probe phcount)" = "2" ] || fail "expected 2 push_hold subjects (pg-demo, pg-stale), got $(probe phcount)"
+[ "$(probe phfield pg-demo approved)" = "True" ] && [ "$(probe phfield pg-demo resumed)" = "True" ] \
+  || fail "pg-demo should be awaiting→approved→resumed"
+[ "$(probe phfield pg-stale approved)" = "True" ] && [ "$(probe phfield pg-stale resumed)" = "∅" ] \
+  || fail "pg-stale should be awaiting→approved with NO resume"
+ok "push_hold_* folds by (slug,sha) into push_holds: full resume vs held-only (§5.4)"
 
 # ── (B) config inference + override ─────────────────────────────────────────────────────────────────
 [ "$(probe cfg MERGE_POLICY)" = "auto" ] || fail "a gates_passed merge should infer MERGE_POLICY=auto (§5.5)"
@@ -167,6 +213,8 @@ cat > "$T/fam.jsonl" <<'EOF'
 {"ts":"2026-07-10T00:01:04Z","event":"review_panel_folded","pr":"77a","slug":"sim-panel-a","sha":"","policy":"any-block","panelists":2,"refs":"bare-model stub:stub-model","verdict":"REVIEW: BLOCK — rule: x"}
 {"ts":"2026-07-10T00:01:05Z","event":"review_panelist_verdict","pr":"77c","slug":"sim-panel-c","sha":"","panelist":0,"ref":"bare-model","driver":"herdr-claude","model":"bare-model","verdict":"PASS","reason":"REVIEW: PASS"}
 {"ts":"2026-07-10T00:01:06Z","event":"infra_event","component":"herd-review","pr":"77c","slug":"sim-panel-c","exit_code":2,"stderr_tail":"no verdict"}
+{"ts":"2026-07-10T00:01:06Z","event":"review_log_retained","pr":"77e","slug":"sim-panel-e","path":"/var/T//herd-review-77e-y","keep":5}
+{"ts":"2026-07-10T00:01:06Z","event":"review_pin_soft","pr":"77e","sha":"","reason":"pin objects unavailable; live-diff fallback","pin_mode":""}
 {"ts":"2026-07-10T00:01:07Z","event":"step_run","name":"gate-lint","at":"post-build","kind":"shell","slug":"demo","sha":"cea","outcome":"pass"}
 {"ts":"2026-07-10T00:01:08Z","event":"step_run","name":"peer-review","at":"post-build","kind":"shell","slug":"demo","sha":"cea","outcome":"pass"}
 {"ts":"2026-07-10T00:01:09Z","event":"step_hold_awaiting","slug":"demo","step":"peer-review","at":"post-build","sha":"cea","dir":"/tmp/st-repo"}
@@ -194,12 +242,15 @@ elif q == "rowkind":    print(d["steps"][0]["rows"][int(sys.argv[3])].get("kind"
 elif q == "gatepr":     print(d["gate_statuses"][0]["pr"])
 PY
 }
-[ "$(famprobe panels)" = "2" ] || fail "expected 2 panel subjects (77a, 77c), got $(famprobe panels)"
+[ "$(famprobe panels)" = "3" ] || fail "expected 3 panel subjects (77a, 77c, 77e), got $(famprobe panels)"
 [ "$(famprobe cands)"  = "0" ] || fail "panel/step/gate events must NOT become gate candidates, got $(famprobe cands)"
 [ "$(famprobe panelists 0)" = "2" ] || fail "panel 77a should carry 2 panelist verdicts"
 [ "$(famprobe policy 0)" = "any-block" ] || fail "panel 77a policy should read from its folded event"
 # 77c folded to a herd-review infra_event while carrying a PASS panelist ⇒ inferred all-pass policy.
 [ "$(famprobe policy 1)" = "all-pass" ] || fail "panel 77c (infra despite a PASS) should infer all-pass, got $(famprobe policy 1)"
+# 77e is a LONE single-reviewer dispatch (log/pin notes, no panelist) — modeled as a 0-panelist panel so
+# the shadow re-emits those two notes and the head-to-head matches (HERD-325 closed the P3e residual).
+[ "$(famprobe panelists 2)" = "0" ] || fail "panel 77e (lone reviewer) should be a 0-panelist panel, got $(famprobe panelists 2)"
 [ "$(famprobe steps)" = "1" ] || fail "expected 1 steps run (demo)"
 [ "$(famprobe steprows)" = "3" ] || fail "demo should reconstruct 3 distinct rows, got $(famprobe steprows)"
 [ "$(famprobe rowhold 1)" = "approve" ] || fail "peer-review hold=approve should be inferred from step_hold_awaiting"

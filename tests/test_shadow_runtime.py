@@ -344,6 +344,69 @@ class TestScenarioFamilies(TempJournalCase):
                          ["review_log_retained", "review_pin_soft"])
         self.assertFalse(self._family(ev, {"infra_event"}))
 
+    def test_main_health_emission_dispatched_result_and_lone(self):
+        # A dispatched+green pair, a dispatched+red pair (failed/since), and a lone result (no dispatch).
+        mh = [{"pr": "901", "sha": "s901", "result": "green", "dispatched": True, "provenance": "merge"},
+              {"pr": "902", "sha": "s902", "result": "red", "dispatched": True,
+               "failed": "app/x.test.sh", "since": 902},
+              {"pr": "999", "sha": "s999", "result": "green"}]
+        ev = self._run(main_healths=mh)
+        seq = [(o["event"], o.get("result")) for o in ev if o["event"] == "main_health"]
+        self.assertEqual(seq, [("main_health", "dispatched"), ("main_health", "green"),
+                               ("main_health", "dispatched"), ("main_health", "red"),
+                               ("main_health", "green")])  # 999 has only the result row, no dispatch
+        disp = [o for o in ev if o["event"] == "main_health" and o.get("result") == "dispatched"][0]
+        self.assertEqual(disp["provenance"], "merge")
+        self.assertIn("log_path", disp)   # a volatile path the parity oracle canonicalizes to <PATH>
+        red = [o for o in ev if o["event"] == "main_health" and o.get("result") == "red"][0]
+        self.assertEqual((red["failed"], red["since"]), ("app/x.test.sh", 902))  # since coerces to int
+
+    def test_push_hold_lifecycle_emission(self):
+        ph = [{"slug": "pg-demo", "sha": "s1", "approved": True, "resumed": True},
+              {"slug": "pg-stale", "sha": "s2", "approved": True}]   # a hold that never resumed
+        ev = self._run(push_holds=ph)
+        seq = [o["event"] for o in ev if o["event"].startswith("push_hold_")]
+        self.assertEqual(seq, ["push_hold_awaiting", "push_hold_approved", "push_hold_resumed",
+                               "push_hold_awaiting", "push_hold_approved"])
+        aw = [o for o in ev if o["event"] == "push_hold_awaiting"][0]
+        self.assertEqual(aw["slug"], "pg-demo")
+        self.assertIn("dir", aw)          # a volatile worktree path the oracle canonicalizes to <PATH>
+
+    def test_non_candidate_families_are_never_shadow_private(self):
+        # main_health / push_hold_* are REAL engine families — their names must NOT be namespaced
+        # under shadow_, or the parity oracle's leg-1 filter would wrongly drop them.
+        ev = self._run(main_healths=[{"pr": "9", "sha": "s", "result": "green"}],
+                       push_holds=[{"slug": "pg", "sha": "s", "approved": True}])
+        for o in ev:
+            if o["event"] in ("main_health", "push_hold_awaiting", "push_hold_approved"):
+                self.assertFalse(o["event"].startswith("shadow_"))
+
+    def test_non_candidate_family_emission_order(self):
+        # The sim's path-sorted leg order: main_health, then push_hold, then panels, steps, gate_status.
+        ev = self._run(main_healths=[{"pr": "9", "sha": "s", "result": "green"}],
+                       push_holds=[{"slug": "pg", "sha": "s", "approved": True}],
+                       panels=[{"pr": "77e", "slug": "e", "panelists": []}],
+                       steps=[{"slug": "d", "sha": "s", "rows": [{"name": "n", "outcome": "pass"}]}],
+                       gate_statuses=[{"pr": 1, "sha": "y"}])
+        fams = [o["event"] for o in ev if not o["event"].startswith("shadow_")]
+        self.assertLess(fams.index("main_health"), fams.index("push_hold_awaiting"))
+        self.assertLess(fams.index("push_hold_awaiting"), fams.index("review_log_retained"))
+        self.assertLess(fams.index("review_log_retained"), fams.index("step_run"))
+        self.assertLess(fams.index("step_run"), fams.index("gate_status"))
+
+    def test_steps_held_count_replays_repeated_holds(self):
+        # A step held across N watcher re-ticks journals N held markers (steps.sh re-runs pre-merge each
+        # tick); the shadow replays exactly held_count of them, between awaiting and approved.
+        run = {"slug": "demo-two", "sha": "s",
+               "rows": [{"name": "check-b", "at": "pre-merge", "kind": "shell",
+                         "hold": "approve", "outcome": "pass", "held_count": 2}]}
+        ev = self._run(steps=[run])
+        seq = [o["event"] for o in ev if o["event"].startswith("step_")]
+        self.assertEqual(seq, ["step_run", "step_hold_awaiting", "step_run", "step_run",
+                               "step_hold_approved", "step_hold_released"])
+        held = [o for o in ev if o["event"] == "step_run" and o.get("outcome") == "held"]
+        self.assertEqual(len(held), 2)
+
     def test_steps_hold_lifecycle_order(self):
         run = {"slug": "demo", "sha": "s", "dir": "/tmp/st",
                "rows": [{"name": "gate-lint", "at": "post-build", "kind": "shell",

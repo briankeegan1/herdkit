@@ -100,6 +100,43 @@ parity "$T/real.jsonl" "$T/perturbed-div.jsonl" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 1 ] || fail "a real (method) divergence under perturbation should still exit 1, got $rc"
 ok "a non-volatile divergence is NOT masked by perturbation (exit 1)"
 
+# ── (A7) shadow-private frames are canonicalized AWAY (oracle v2, HERD-325 leg 1) ────────────────
+# The shadow engine narrates its run with shadow_* diagnostics that the bash tree never emits. A
+# shadow stream that is IDENTICAL to real except for interleaved shadow_* frames must still be PARITY,
+# and a REAL engine family (main_health / push_hold_*) must NEVER be filtered.
+cat > "$T/priv-real.jsonl" <<'EOF'
+{"ts":"2026-07-10T00:00:01Z","event":"main_health","pr":901,"sha":"s","result":"green"}
+{"ts":"2026-07-10T00:00:02Z","event":"merge","pr":42,"slug":"feat","sha":"abc","method":"squash","reason":"gates_passed"}
+EOF
+cat > "$T/priv-shadow.jsonl" <<'EOF'
+{"ts":"2026-07-10T09:00:00Z","event":"shadow_tick_start","candidates":1,"impl":"python-shadow"}
+{"ts":"2026-07-10T09:00:01Z","event":"main_health","pr":901,"sha":"s","result":"green"}
+{"ts":"2026-07-10T09:00:02Z","event":"shadow_state","pr":42,"state_from":"BLESSED","state_to":"MERGED"}
+{"ts":"2026-07-10T09:00:03Z","event":"merge","pr":42,"slug":"feat","sha":"abc","method":"squash","reason":"gates_passed"}
+{"ts":"2026-07-10T09:00:04Z","event":"shadow_tick_end","merged":1}
+EOF
+out="$(parity "$T/priv-real.jsonl" "$T/priv-shadow.jsonl" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] || fail "shadow-private frames were not filtered — stream diverged (rc=$rc): $out"
+printf '%s\n' "$out" | grep -q "shadow-private frame" || fail "OK line should note the filtered shadow-private frames"
+# The real families survive the filter: dropping main_health from the shadow makes it DIVERGE.
+grep -v main_health "$T/priv-shadow.jsonl" > "$T/priv-shadow-nomh.jsonl"
+parity "$T/priv-real.jsonl" "$T/priv-shadow-nomh.jsonl" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] || fail "a REAL family (main_health) must not be filtered — dropping it should DIVERGE, got rc=$rc"
+ok "shadow-private (shadow_*) frames filtered; real families (main_health) never filtered (leg 1)"
+
+# ── (A8) alignment-based diff: one inserted event does NOT cascade (oracle v2, HERD-325 leg 2) ────
+# The old positional diff reported EVERY event after a single insertion as divergent. The alignment
+# differ reports just the one insertion. Shadow = real with ONE extra event spliced in the middle.
+head -2 "$T/real.jsonl"  > "$T/align-shadow.jsonl"
+echo '{"ts":"2026-07-10T00:00:99Z","event":"reap","pr":42,"slug":"feat","sha":"abc123","reason":"merged"}' >> "$T/align-shadow.jsonl"
+tail -n +3 "$T/real.jsonl" >> "$T/align-shadow.jsonl"
+out="$(parity "$T/real.jsonl" "$T/align-shadow.jsonl" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] || fail "an inserted event should DIVERGE (exit 1), got $rc"
+ndiv="$(printf '%s\n' "$out" | sed -n 's/^  divergences: \([0-9]*\).*/\1/p')"
+[ "$ndiv" = "1" ] || fail "one inserted event must yield exactly ONE divergence (no positional cascade), got $ndiv"
+printf '%s\n' "$out" | grep -qi "MISSING from real" || fail "the lone insertion should read as MISSING from real"
+ok "alignment diff: a single inserted event is ONE divergence, not a cascade (leg 2)"
+
 # ── (B) SELF-DIFF GREEN on the sandbox scenario via parity-run.sh, scorecard read from file ───────
 # Runs the repo's deterministic sim (no model call). An infra inability to run the scenario SKIPS;
 # a genuine parity divergence FAILS.
