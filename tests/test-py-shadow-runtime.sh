@@ -11,12 +11,13 @@
 #   (2) JOURNAL PARITY — the shadow journal ENCODING is BYTE-IDENTICAL to what scripts/herd/journal.sh
 #       writes for the same (event, args). Drives the REAL journal.sh and herd.shadow_journal off one
 #       set of cases and diffs the lines — the parity oracle P3 shadow mode depends on (contract §7).
-#   (3) BYTE-IDENTICAL-OFF — the bash ENGINE_IMPL wiring (engine-version.sh) is a HARD no-op under the
-#       ship default ENGINE_IMPL=bash: herd_engine_impl resolves 'bash' (and a typo reads as 'bash'),
-#       and herd_engine_shadow_tick returns 0 having written NOTHING.
-#   (4) DRY-RUN DISPATCH — armed with ENGINE_IMPL=shadow + a sim fixture, herd_engine_shadow_tick runs
-#       the Python runtime and it writes ONLY the shadow journal; the real journal.jsonl gains no gate
-#       events from the shadow pass (the engine's own engine_shadow_dispatched marker aside).
+#   (3) RETIRED RESOLUTION (HERD-306) — post-cutover herd_engine_impl resolves the SOLE engine 'python'
+#       (unset and typo alike), and the retired ENGINE_IMPL=shadow WARNs loudly. The shadow_journal
+#       ENCODER stays — it is the parity oracle, not the retired live dispatch.
+#   (4) RETIRED SHADOW TICK — the live per-tick shadow dispatch is gone: herd_engine_shadow_tick is a
+#       HARD no-op (returns 0, writes NO shadow journal) even when armed with ENGINE_IMPL=shadow + a
+#       fixture. Only the retired-value warning fires. The parity oracle (parity-run.sh → shadow_runtime)
+#       is invoked out-of-band and is unaffected.
 #
 # Run:  bash tests/test-py-shadow-runtime.sh
 set -uo pipefail
@@ -98,20 +99,16 @@ if ! cmp -s "$BOUT" "$POUT"; then
 fi
 pass
 
-# ── (3) byte-identical-OFF: the bash wiring is a hard no-op under the ship default ─────────────────
-off_impl="$(bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl')"
-[ "$off_impl" = bash ] || fail "default ENGINE_IMPL must resolve 'bash', got '$off_impl'"
-typo_impl="$(bash -c 'ENGINE_IMPL=pythonn; . "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl')"
-[ "$typo_impl" = bash ] || fail "a typo ENGINE_IMPL must read as 'bash', got '$typo_impl'"
-# The dormant tick writes nothing while off: run it with a shadow-journal path set and assert absence.
-offdir="$T/off"; mkdir -p "$offdir/.herd"
-SHADOW_JOURNAL_FILE="$offdir/.herd/journal-shadow.jsonl" WORKTREES_DIR="$offdir" \
-  bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_shadow_tick' \
-  || fail "herd_engine_shadow_tick returned nonzero while OFF (must be a hard no-op)"
-[ ! -e "$offdir/.herd/journal-shadow.jsonl" ] || fail "shadow tick wrote a journal while ENGINE_IMPL=bash (not a no-op)"
+# ── (3) retired resolution: the sole engine is 'python'; ENGINE_IMPL=shadow WARNs (HERD-306) ────────
+off_impl="$(bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>/dev/null)"
+[ "$off_impl" = python ] || fail "default ENGINE_IMPL must resolve the sole engine 'python', got '$off_impl'"
+typo_impl="$(bash -c 'ENGINE_IMPL=pythonn; . "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>/dev/null)"
+[ "$typo_impl" = python ] || fail "a typo ENGINE_IMPL must resolve 'python', got '$typo_impl'"
+warn="$(bash -c 'ENGINE_IMPL=shadow; . "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
+printf '%s' "$warn" | grep -qi 'RETIRED' || fail "ENGINE_IMPL=shadow must WARN that it is retired (got: '$warn')"
 pass
 
-# ── (4) armed dry-run dispatch writes ONLY the shadow journal ──────────────────────────────────────
+# ── (4) retired shadow tick: a HARD no-op even when armed — writes NO shadow journal ────────────────
 ondir="$T/on"; mkdir -p "$ondir/.herd"
 cat > "$T/fixture.json" <<'JSON'
 {"config":{"MERGE_POLICY":"auto","REVIEW_CONCURRENCY":2,"HEALTH_CONCURRENCY":1},
@@ -124,19 +121,14 @@ JSON
 HERDKIT_HOME="$REPO" WORKTREES_DIR="$ondir" ENGINE_IMPL=shadow HERD_ENGINE_SHADOW_SYNC=1 \
   HERD_ENGINE_SHADOW_FIXTURE="$T/fixture.json" \
   SHADOW_JOURNAL_FILE="$ondir/.herd/journal-shadow.jsonl" \
-  bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_shadow_tick' \
-  || fail "armed shadow tick returned nonzero"
-[ -s "$ondir/.herd/journal-shadow.jsonl" ] || fail "armed shadow tick produced no shadow journal"
-# The shadow stream must carry the expected terminal events and NEVER perform a real merge elsewhere.
-grep -q '"event":"merge"' "$ondir/.herd/journal-shadow.jsonl" || fail "no merge event in shadow stream"
-grep -q '"event":"stale_dup_hold"' "$ondir/.herd/journal-shadow.jsonl" || fail "no stale hold in shadow stream"
-# The real journal.jsonl must contain ONLY the engine's own engine_shadow_dispatched marker (if any) —
-# never a gate event (verdict_recorded / healthcheck_outcome / merge) from the shadow pass.
+  bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_shadow_tick' 2>/dev/null \
+  || fail "retired herd_engine_shadow_tick must still return 0 (a hard no-op)"
+[ ! -e "$ondir/.herd/journal-shadow.jsonl" ] || fail "retired shadow tick wrote a shadow journal (must be a no-op)"
+# No gate event leaks anywhere.
 if [ -f "$ondir/.herd/journal.jsonl" ]; then
-  if grep -Eq '"event":"(merge|verdict_recorded|healthcheck_outcome|stale_dup_hold)"' "$ondir/.herd/journal.jsonl"; then
-    fail "a shadow-pass gate event leaked into the REAL journal.jsonl (must be dry-run)"
-  fi
+  grep -Eq '"event":"(merge|verdict_recorded|healthcheck_outcome|stale_dup_hold)"' "$ondir/.herd/journal.jsonl" \
+    && fail "the retired shadow tick leaked a gate event into the journal"
 fi
 pass
 
-echo "ALL PASS ($PASS/4 shadow-runtime checks: unit invariants, journal parity, byte-identical-off, dry-run dispatch)"
+echo "ALL PASS ($PASS/4 shadow-runtime checks: unit invariants, journal parity, retired resolution, retired shadow tick)"

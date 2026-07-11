@@ -454,6 +454,54 @@ class TestScenarioFamilies(TempJournalCase):
         self.assertEqual((runs[0]["name"], runs[0]["outcome"], runs[0]["rc"]), ("will-fail", "fail", 1))
         self.assertFalse([o for o in ev if o.get("name") == "must-not-run"])
 
+    def test_main_events_and_fairness_replay(self):
+        # The verbatim-replay families (main_ff / main_freshness, §3.4; merge_fairness_priority /
+        # pr_restale / pr_starvation, §6.2) re-emit their non-event fields exactly, in list order —
+        # including a JSON key that is a Python reserved word (`from` on main_ff).
+        me = [{"event": "main_ff", "behind": 1, "from": "abc", "to": "def", "restart": "no"},
+              {"event": "main_freshness", "result": "held", "reason": "local-commits",
+               "behind": 1, "ahead": 1}]
+        fa = [{"event": "merge_fairness_priority", "promoted": 1, "deferred": 2, "prs": 9003},
+              {"event": "pr_restale", "pr": 9002, "sha": "s0", "slug": "fair", "kind": "stale-base",
+               "laps": 1},
+              {"event": "pr_starvation", "pr": 9002, "sha": "s0", "slug": "fair", "laps": 3,
+               "threshold": 3}]
+        ev = self._run(main_events=me, fairness=fa)
+        seq = [o["event"] for o in ev if not o["event"].startswith("shadow_")]
+        self.assertEqual(seq, ["main_ff", "main_freshness", "merge_fairness_priority",
+                               "pr_restale", "pr_starvation"])
+        ff = [o for o in ev if o["event"] == "main_ff"][0]
+        self.assertEqual((ff["from"], ff["to"], ff["behind"], ff["restart"]), ("abc", "def", 1, "no"))
+        star = [o for o in ev if o["event"] == "pr_starvation"][0]
+        self.assertEqual((star["pr"], star["laps"], star["threshold"]), (9002, 3, 3))
+        # None of these real families may be namespaced shadow_* or the parity oracle would drop them.
+        for o in ev:
+            if o["event"] in ("main_ff", "pr_restale", "pr_starvation"):
+                self.assertFalse(o["event"].startswith("shadow_"))
+
+    def test_main_health_died_replays_kill_and_redispatch(self):
+        # A suite killed mid-flight (HERD-222, §3.4): the first dispatch, an infra_event{health_died},
+        # a second dispatch (provenance "died"), then the green result — five rows for one subject.
+        mh = [{"pr": "4243", "sha": "s43", "result": "green", "dispatched": True,
+               "provenance": "observed-sha", "died": True, "redispatch_provenance": "died"}]
+        ev = self._run(main_healths=mh)
+        seq = [(o["event"], o.get("result") or o.get("reason")) for o in ev
+               if o["event"] in ("main_health", "infra_event")]
+        self.assertEqual(seq, [("main_health", "dispatched"), ("infra_event", "health_died"),
+                               ("main_health", "dispatched"), ("main_health", "green")])
+        disp = [o for o in ev if o["event"] == "main_health" and o.get("result") == "dispatched"]
+        self.assertEqual((disp[0]["provenance"], disp[1]["provenance"]), ("observed-sha", "died"))
+        infra = [o for o in ev if o["event"] == "infra_event"][0]
+        self.assertEqual((infra["component"], infra["key"]), ("agent-watch", "main-s43"))
+
+    def test_panel_log_retained_suppressed_when_absent(self):
+        # A lone review-rail pin note with NO herd-review log-retention row (log_retained False, the
+        # concurrency stub reviewer) emits review_pin_soft ONLY — never a spurious review_log_retained.
+        ev = self._run(panels=[{"pr": "7", "slug": "s", "policy": "any-block", "panelists": [],
+                                "log_retained": False}])
+        seq = [o["event"] for o in ev if o["event"].startswith("review_")]
+        self.assertEqual(seq, ["review_pin_soft"])
+
     def test_gate_status_shape(self):
         ev = self._run(gate_statuses=[{"pr": 343, "sha": "simsha", "state": "success",
                                        "context": "herd/gates"}])
@@ -473,6 +521,94 @@ class TestScenarioFamilies(TempJournalCase):
             self.assertEqual(list(o.keys())[:2], ["ts", "event"])
         awaiting = [o for o in ev if o["event"] == "step_hold_awaiting"][0]
         self.assertEqual(list(awaiting.keys()), ["ts", "event", "slug", "step", "at", "sha", "dir"])
+
+
+class TestGateSchedule(TempJournalCase):
+    """The per-candidate GATE SCHEDULE (HERD-335, P3j) — cache hits, review-entry, stop-after, and
+    post-merge housekeeping. Every field is OFF by default, so a plain candidate is byte-identical to
+    the pre-P3j stream; each ON assertion is paired with its byte-identical-OFF counterpart."""
+
+    def _events(self, **kw):
+        w = self.watcher({"MERGE_POLICY": "auto"})
+        run(w, [cand(1, **kw)])
+        return [o["event"] for o in events(self.jpath)
+                if not o["event"].startswith("shadow_")]
+
+    def test_plain_candidate_is_byte_identical_to_pre_p3j(self):
+        # No schedule fields ⇒ exactly the old health→review→merge stream (the byte-identical-off rule).
+        self.assertEqual(self._events(review="PASS", health="CLEAN"),
+                         ["healthcheck_started", "healthcheck_outcome", "review_dispatched",
+                          "verdict_recorded", "merge"])
+
+    def test_cache_family_emitted_only_when_flagged(self):
+        seq = self._events(review="PASS", health="CLEAN", health_attempted=True, cache_hit=True)
+        self.assertEqual(seq[:4], ["healthcheck_started", "healthcheck_attempted",
+                                   "healthcheck_outcome", "healthcheck_cache_hit"])
+        # attempted carries a lowercase `result`, cache_hit an uppercase `outcome` (real journal shapes).
+        w = self.watcher({"MERGE_POLICY": "auto"})
+        run(w, [cand(2, review="PASS", health="CLEAN", health_attempted=True, cache_hit=True)])
+        objs = events(self.jpath)
+        att = [o for o in objs if o["event"] == "healthcheck_attempted"][0]
+        chit = [o for o in objs if o["event"] == "healthcheck_cache_hit"][0]
+        self.assertEqual(att["result"], "clean")
+        self.assertEqual(chit["outcome"], "CLEAN")
+
+    def test_skip_health_enters_at_review_no_health_events(self):
+        # A review-injected subject journals NO health-rail events, but still records its verdict.
+        seq = self._events(review="BLOCK", skip_health=True, stop_after="verdict")
+        self.assertNotIn("healthcheck_started", seq)
+        self.assertNotIn("healthcheck_outcome", seq)
+        self.assertIn("verdict_recorded", seq)
+
+    def test_stop_after_verdict_records_but_never_dispatches_or_merges(self):
+        # A PLANTED verdict (agent-watch's _review_gate_step collecting a result file) records the
+        # verdict with NO review_dispatched and NO merge — and a BLOCK bounces no builder.
+        seq = self._events(review="BLOCK", skip_health=True, stop_after="verdict")
+        self.assertIn("verdict_recorded", seq)
+        self.assertNotIn("review_dispatched", seq)
+        self.assertNotIn("merge", seq)
+        self.assertNotIn("refix_bounce", seq)
+        # A recorded-only PASS likewise never merges (an injected breaker-recovery probe).
+        seq_pass = self._events(review="PASS", skip_health=True, stop_after="verdict")
+        self.assertIn("verdict_recorded", seq_pass)
+        self.assertNotIn("merge", seq_pass)
+
+    def test_stop_after_dispatch_dispatches_but_no_verdict(self):
+        # A reviewer dispatched then torn down (the restart probe): a dispatch, no verdict, no merge.
+        seq = self._events(review="PASS", skip_health=True, stop_after="dispatch")
+        self.assertIn("review_dispatched", seq)
+        self.assertNotIn("verdict_recorded", seq)
+        self.assertNotIn("merge", seq)
+
+    def test_post_merge_housekeeping_only_when_flagged(self):
+        off = self._events(review="PASS", health="CLEAN")
+        self.assertNotIn("symbol_index_refresh", off)
+        self.assertNotIn("reap", off)
+        on = self._events(review="PASS", health="CLEAN", post_merge=True)
+        self.assertEqual(on[-3:], ["merge", "symbol_index_refresh", "reap"])
+
+    def test_pin_soft_is_inline_before_dispatch(self):
+        seq = self._events(review="PASS", health="CLEAN", pin_soft=True,
+                           pin_reason="fetch failed; live-diff fallback")
+        self.assertEqual(seq.index("review_pin_soft") + 1, seq.index("review_dispatched"))
+        self.setUp()  # fresh journal so the reason assertion reads only this run's pin note
+        w = self.watcher({"MERGE_POLICY": "auto"})
+        run(w, [cand(3, review="PASS", health="CLEAN", pin_soft=True, pin_reason="rz")])
+        pin = [o for o in events(self.jpath) if o["event"] == "review_pin_soft"][0]
+        self.assertEqual(pin["reason"], "rz")   # a semantic field carried verbatim (not canonicalized)
+
+    def test_schedule_survives_supersession_respin(self):
+        # The gate schedule is a property of the SUBJECT: a re-gated sha caches + housekeeps as before.
+        c = cand(1, sha="old", review="PASS", health="CLEAN", cache_hit=True, post_merge=True,
+                 supersede_to="new", supersede_at="review")
+        w = self.watcher({"MERGE_POLICY": "auto"})
+        run(w, [c])
+        objs = events(self.jpath)
+        merge = [o for o in objs if o["event"] == "merge"][0]
+        self.assertEqual(merge["sha"], "new")
+        # the respun sha still emitted the cache hit + the post-merge housekeeping.
+        self.assertTrue([o for o in objs if o["event"] == "healthcheck_cache_hit" and o["sha"] == "new"])
+        self.assertTrue([o for o in objs if o["event"] == "reap" and o["sha"] == "new"])
 
 
 if __name__ == "__main__":

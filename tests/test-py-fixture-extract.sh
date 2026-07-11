@@ -107,6 +107,13 @@ elif op == "phfield":
     # phfield <slug> <key>
     ph = {p["slug"]: p for p in d.get("push_holds", [])}
     print(ph.get(sys.argv[3], {}).get(sys.argv[4], "∅"))
+elif op == "faircount":
+    print(len(d.get("fairness", [])))
+elif op == "fairevents":
+    # the ordered list of fairness event names
+    print(" ".join(e.get("event", "?") for e in d.get("fairness", [])))
+elif op == "mecount":
+    print(len(d.get("main_events", [])))
 PY
 }
 
@@ -122,27 +129,36 @@ ok "rail outcomes map: health CLEAN/CODEERROR, reviewer PASS/BLOCK (contract §2
   || fail "PR404 non-reviewer verdict leaked into review (must ignore source!=reviewer, §3.2)"
 ok "only reviewer-provenance verdicts count — a non-reviewer BLOCK is ignored (contract §3.2)"
 
-# stale from restale/starvation; sha last-wins (lap-bumped s505-1 over s505-0, §2.4).
-[ "$(probe field 505 stale)" = "True" ] || fail "PR505 restale/starvation should set stale=true (§2.1/§6.2)"
-[ "$(probe field 505 sha)" = "s505-1" ] || fail "PR505 sha should be the LAST lap (s505-1), got $(probe field 505 sha)"
-ok "stale from restale/starvation, and the last candidate-signal sha wins (contract §2.1/§6.2/§2.4)"
+# restale/starvation is the merge-FAIRNESS family (HERD-335): NOT a gate candidate (a fairness re-stale
+# is a scheduler fixed-point, not a health/review verdict on a sha), so PR505 must NOT be a candidate —
+# its pr_restale/pr_restale/pr_starvation fold into the ordered `fairness` replay list verbatim (§6.2).
+[ "$(probe has 505)" = "no" ] || fail "PR505 (restale/starvation) must NOT become a gate candidate (HERD-335, §6.2)"
+[ "$(probe faircount)" = "3" ] || fail "expected 3 fairness replay events (2 pr_restale + 1 pr_starvation), got $(probe faircount)"
+[ "$(probe fairevents)" = "pr_restale pr_restale pr_starvation" ] \
+  || fail "fairness list should preserve event ORDER, got '$(probe fairevents)'"
+ok "restale/starvation fold into the ordered fairness replay list, never a candidate (contract §6.2, HERD-335)"
 
 # holds
 [ "$(probe field 606 hv_hold)" = "True" ] || fail "PR606 human-verify hold should set hv_hold=true (§5.4)"
 [ "$(probe field 707 approved)" = "True" ] || fail "PR707 approval_recorded should set approved=true (§5.5)"
 ok "human-verify hold → hv_hold, approval_recorded → approved (contract §5.4/§5.5)"
 
-# reap / symbol_index_refresh / infra_breaker are AUXILIARY — never candidates, always tallied. main_health
-# and push_hold_* are now MODELED (their own lists), so they must NOT be candidates NOR excluded (HERD-325).
+# infra_breaker is AUXILIARY — never a candidate, always tallied. reap / symbol_index_refresh are the
+# post-merge housekeeping the candidate now MODELS (they set post_merge on PR101, HERD-335), so they are
+# neither excluded nor their own subject. main_health / push_hold_* / fairness / main_events are MODELED
+# into their own lists, so none of them is a candidate NOR excluded.
 [ "$(probe has 999)" = "no" ] || fail "main_health PR999 must NOT become a candidate (§3.4)"
 [ "$(probe has 901)" = "no" ] && [ "$(probe has 902)" = "no" ] || fail "main_health PRs must NOT become candidates"
-[ "$(probe count)" = "7" ] || fail "expected 7 gate-subject candidates (101,202,303,404,505,606,707), got $(probe count)"
-[ "$(probe excluded reap)" = "1" ] \
-  && [ "$(probe excluded symbol_index_refresh)" = "1" ] && [ "$(probe excluded infra_breaker_open)" = "1" ] \
-  || fail "auxiliary events not tallied in the excluded provenance block"
+[ "$(probe count)" = "6" ] || fail "expected 6 gate-subject candidates (101,202,303,404,606,707), got $(probe count)"
+[ "$(probe field 101 post_merge)" = "True" ] || fail "PR101 (reap + symbol_index_refresh) should set post_merge=true (HERD-335, §3.4)"
+[ "$(probe excluded infra_breaker_open)" = "1" ] || fail "infra_breaker_open should be tallied excluded"
+[ "$(probe excluded reap)" = "0" ] && [ "$(probe excluded symbol_index_refresh)" = "0" ] \
+  || fail "reap/symbol_index_refresh are now modeled as post-merge housekeeping — not excluded (HERD-335)"
+[ "$(probe excluded pr_restale)" = "0" ] && [ "$(probe excluded pr_starvation)" = "0" ] \
+  || fail "restale/starvation are now modeled fairness — not excluded (HERD-335)"
 [ "$(probe excluded main_health)" = "0" ] || fail "main_health is now modeled — it must NOT be in the excluded tally (HERD-325)"
 [ "$(probe excluded push_hold_awaiting)" = "0" ] || fail "push_hold_* is now modeled — it must NOT be in the excluded tally (HERD-325)"
-ok "auxiliary events excluded + tallied; main_health/push_hold modeled, neither candidate nor excluded (§2.1/§3.4/§5.4)"
+ok "infra_breaker excluded + tallied; reap/symbol_index/fairness/main_health/push_hold modeled, none excluded (§2.1/§3.4/§5.4/§6.2)"
 
 # ── (A') non-candidate engine families now MODELED into ordered fixture lists (HERD-325 oracle v2) ────
 # main_health folds by (pr,sha): a lone green (999), a dispatched+green pair (901), a dispatched+red pair
@@ -192,11 +208,13 @@ SJ="$T/journal-shadow.jsonl"; : > "$SJ"
 SHADOW_JOURNAL_FILE="$SJ" PYTHONPATH="$PYSRC" python3 -m herd.shadow_runtime --fixture "$FX" > "$T/shadow-result.json" \
   || fail "shadow_runtime errored on the extracted fixture"
 [ -s "$SJ" ] || fail "bridge produced an empty shadow journal"
-# The fixture's subjects reach their expected terminals in the shadow stream: PR101 merges, PR303
-# blocks (refix_bounce), PR505 holds (stale_dup_hold). This is the head-to-head INPUT the diff needs.
+# The fixture's subjects reach their expected terminals in the shadow stream: PR101 merges (+ its
+# post-merge housekeeping), PR303 blocks (its verdict — a planted BLOCK, so no builder bounce), PR505's
+# fairness re-stale + starvation replay verbatim. This is the head-to-head INPUT the diff needs.
 grep -q '"event":"merge".*"pr":101' "$SJ" || fail "shadow stream missing the PR101 merge"
-grep -q '"event":"stale_dup_hold".*"pr":505' "$SJ" || fail "shadow stream missing the PR505 stale hold"
-grep -q '"event":"refix_bounce".*"pr":303' "$SJ" || fail "shadow stream missing the PR303 review block"
+grep -q '"event":"symbol_index_refresh".*"pr":101' "$SJ" || fail "shadow stream missing PR101 post-merge housekeeping"
+grep -q '"event":"pr_starvation".*"pr":505' "$SJ" || fail "shadow stream missing the PR505 fairness starvation replay"
+grep -q '"event":"verdict_recorded".*"pr":303.*"BLOCK"' "$SJ" || fail "shadow stream missing the PR303 review BLOCK verdict"
 outc="$(PYTHONPATH="$PYSRC" python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["outcomes"]["202"])' "$T/shadow-result.json")"
 [ "$outc" = "BLOCK" ] || fail "PR202 (health CODEERROR) should terminate BLOCK in the shadow run, got $outc"
 ok "bridge pipeline: extracted fixture drives the shadow engine to the matching terminals (merge/block/hold)"

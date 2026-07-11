@@ -96,14 +96,12 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # Any other value is treated as off.
 # ENGINE_AUTOUPDATE="off"             # off (default) | check | auto
 
-# ENGINE_IMPL — which engine-core implementation the watcher runs (HERD-316, the Python port). "bash"
-# (default) is today's byte-identical behavior — the shell watcher is authoritative and nothing else
-# runs. "shadow" ADDITIONALLY runs the Python watcher (pysrc/herd/shadow_runtime.py) beside it in
-# DRY-RUN mode: same candidate → gate → decision walk, but it MUTATES NOTHING (no gh, no merge, no pane
-# ops) — its only output is .herd/journal-shadow.jsonl in journal.sh-identical shapes, so the two event
-# streams can be diffed for parity. "shadow" never changes what the bash engine does; it only observes.
-# Any value other than "shadow" reads as "bash". Ship default "bash" = inert.
-# ENGINE_IMPL="bash"                  # bash (default, authoritative) | shadow (also run the dry-run port)
+# ENGINE_IMPL — the engine-core implementation the watcher runs (EPIC HERD-300, the Python port).
+# After the P5 cutover (HERD-306) there is exactly ONE engine core: "python". The bash action pass was
+# DELETED, so the supervisor hands every tick to the Python live engine (pysrc/herd/live_runtime.py)
+# with a fault watchdog — no bash fallback. The old values "bash" and "shadow" are RETIRED: they WARN
+# loudly (once) and are treated as "python". Just leave this unset. Default: python.
+# ENGINE_IMPL="python"                # python (the sole engine core) — "bash"/"shadow" are retired no-ops
 
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A

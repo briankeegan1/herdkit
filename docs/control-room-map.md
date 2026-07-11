@@ -316,6 +316,13 @@ instantly, and exactly one drainer batches the queue:
   row; teardown is recomputed every tick from the world, so a crash mid-teardown self-heals.
 - **Verdicts are sha-keyed** — a new commit invalidates a cached BLOCK/override and re-gates from
   the top; nothing merges on a stale verdict.
+- **One engine core, watchdogged** — the action pass (gate → verdict → merge → refix) is owned by the
+  Python live engine (`pysrc/herd/live_runtime.py`); the bash supervisor hands it every tick and, on a
+  fault, RETRIES with backoff rather than half-running. Past a fault streak it paints a loud
+  **`🛑 ENGINE DOWN · manual intervention`** banner at the top of the console, journals `engine_down`,
+  and notifies once — *no gates or merges run until it recovers* (a fault is a safe HOLD, never a
+  partial merge). If you see that banner, check `python3 -m herd.live_runtime --tick`. (`ENGINE_IMPL` is
+  retired — python is the only engine core; a leftover `bash`/`shadow` value just warns.)
 - **Escalate engine bugs OUT** — never patch the engine in a consuming clone; `herd report` files it
   upstream so the fix survives `herd upgrade` and reaches every consumer.
 

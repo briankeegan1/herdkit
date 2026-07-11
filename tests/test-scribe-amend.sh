@@ -261,4 +261,48 @@ step "$BACKENDS" file bogus-verb
 printf '%s\n' "$OUT" | grep -q 'amend' || fail "8: usage does not mention amend ($OUT)"
 ok
 
+# ══ 9. DISPATCH: FIELDS: prefix parsed → _AMEND_FIELDS exported, body stripped (HERD-312) ══════
+FAKEDIR2="$T/fakebackends2"; mkdir -p "$FAKEDIR2"
+DISPATCH2="$T/dispatch2.log"; : > "$DISPATCH2"
+cat > "$FAKEDIR2/fake.sh" <<FAKEEOF
+#!/usr/bin/env bash
+_backend_add_item()    { _BACKEND_RESULT="DONE"; }
+_backend_amend()       { printf 'AMEND\t%s\t%s\n' "\${_AMEND_FIELDS:-}" "\$2" >> "$DISPATCH2"; _BACKEND_RESULT="DONE"; }
+_backend_mark_shipped(){ :; }
+_backend_list_open()   { :; }
+_backend_item_state()  { ITEM_STATE="open"; }
+FAKEEOF
+p="$(mkreq 900 "FIELDS:assignee")"
+step "$FAKEDIR2" fake amend "$p" "HERD-300" "FIELDS:assignee"
+[ "$RC" -eq 0 ] || fail "9: FIELDS: amend exited $RC ($OUT)"
+grep -qE $'^AMEND\tassignee\t' "$DISPATCH2" || fail "9: _AMEND_FIELDS not parsed or note body not stripped ($(cat "$DISPATCH2"))"
+[ ! -e "$p" ] || fail "9: claimed file not cleaned up"
+ok
+
+# ══ 9b. LINEAR adapter: assignee-only amend issues issueUpdate with assigneeId only (HERD-312) ══
+LIN_CALLS2="$T/linear-312.calls"; : > "$LIN_CALLS2"; : > "$JF"
+(
+  set -e
+  export WORKTREES_DIR="$TREES" JOURNAL_FILE="$JF" HERD_COMPONENT="scribe" LINEAR_API_KEY="dummy"
+  export _AMEND_FIELDS="assignee"
+  . "$ROOT/scripts/herd/journal.sh"
+  . "$BACKENDS/linear.sh"
+  _linear_gql() {
+    case "$1" in
+      *viewer*)        echo '{"data":{"viewer":{"id":"me_123"}}}' ;;
+      *issueUpdate*)   printf 'UPDATE %s\n' "$1" >> "$LIN_CALLS2"; echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      *commentCreate*) printf 'COMMENT\n'        >> "$LIN_CALLS2"; echo '{"data":{"commentCreate":{"success":true}}}' ;;
+      *)               echo '{"data":{"issues":{"nodes":[{"id":"iss_300","identifier":"HERD-300"}]}}}' ;;
+    esac
+  }
+  _BACKEND_RESULT=""
+  _backend_amend "HERD-300" ""
+  [ "$_BACKEND_RESULT" = "DONE" ] || { echo "linear assignee-only amend result=$_BACKEND_RESULT" >&2; exit 1; }
+) || fail "9b: linear assignee-only amend did not report DONE"
+grep -q 'stateId' "$LIN_CALLS2"    && fail "9b: assignee-only amend included stateId — state would flip (HERD-312)"
+grep -q 'assigneeId' "$LIN_CALLS2" || fail "9b: assignee-only amend did not update assigneeId ($(cat "$LIN_CALLS2"))"
+grep -q '^COMMENT' "$LIN_CALLS2"     && fail "9b: assignee-only amend with empty body posted a spurious comment"
+grep -q '"requested":"amend"' "$JF"  || fail "9b: assignee-only amend did not journal requested=amend ($(cat "$JF"))"
+ok
+
 echo "ALL PASS ($pass checks)"

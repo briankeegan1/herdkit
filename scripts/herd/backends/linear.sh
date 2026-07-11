@@ -451,6 +451,9 @@ _backend_amend() {
     # as _backend_update_state (issueSearch was deprecated/removed by Linear 2026-07). Conservative:
     # resolve to EXACTLY ONE issue (identifier, or a UNIQUE title match) — zero/ambiguous → NOCHANGE +
     # a LOUD reason (skip-over-guess), nothing posted. Sets _BACKEND_RESULT=DONE|NOCHANGE.
+    # HERD-312: if _AMEND_FIELDS is non-empty, only touch the listed fields — never mutate unrequested
+    # ones. An "assignee"-only amend sends issueUpdate with JUST assigneeId in the input (no stateId),
+    # so an explicit "Assignee only, do not change state" request cannot flip the item's workflow state.
     local ref="$1" note="$2" resp issue_id ok
     _BACKEND_RESULT="NOCHANGE"
     _linear_require_key
@@ -470,15 +473,45 @@ print(nodes[0].get("id", "") if len(nodes) == 1 else "")' 2>/dev/null)"
         _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution (records the attempt)
         return 0
     fi
-    ok="$(_linear_gql 'mutation Amend($issueId: String!, $body: String!) {
+    # HERD-312: field-scoped mutations. Only touch the fields explicitly named in _AMEND_FIELDS;
+    # unrecognised or absent fields are skipped (fail-soft). An assignee-only amend constructs the
+    # issueUpdate input with JUST assigneeId — no stateId — so the item's state cannot flip.
+    local fields="${_AMEND_FIELDS:-}"
+    if [ -n "$fields" ]; then
+        case "$fields" in
+            *assignee*)
+                local me_id assign_ok
+                me_id="$(_linear_gql 'query { viewer { id } }' | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print(((d.get("data") or {}).get("viewer") or {}).get("id") or "")' 2>/dev/null)"
+                if [ -n "$me_id" ]; then
+                    assign_ok="$(_linear_gql 'mutation Assign($id: String!, $assignee: String!) {
+  issueUpdate(id: $id, input: { assigneeId: $assignee }) { success }
+}' "$(ID="$issue_id" A="$me_id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"], "assignee": os.environ["A"]}))')" 2>/dev/null \
+                      | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+print("1" if (((d.get("data") or {}).get("issueUpdate") or {}).get("success")) else "0")' 2>/dev/null)"
+                    [ "$assign_ok" = "1" ] && _BACKEND_RESULT="DONE"
+                fi
+                ;;
+        esac
+    fi
+    # Post the note body as a comment when present (plain amend or a field amend that also carries a
+    # note). Skipped when note is empty (a pure field amend with no comment body).
+    if [ -n "$note" ]; then
+        ok="$(_linear_gql 'mutation Amend($issueId: String!, $body: String!) {
   commentCreate(input: { issueId: $issueId, body: $body }) { success }
 }' "$(ID="$issue_id" BODY="$note" python3 -c 'import os, json
 print(json.dumps({"issueId": os.environ["ID"], "body": os.environ["BODY"]}))')" 2>/dev/null \
-      | python3 -c 'import sys, json
+          | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 print("1" if (((d.get("data") or {}).get("commentCreate") or {}).get("success")) else "0")' 2>/dev/null)"
-    [ "$ok" = "1" ] && _BACKEND_RESULT="DONE"
+        [ "$ok" = "1" ] && _BACKEND_RESULT="DONE"
+    fi
     _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"   # HERD-85 attribution
 }
 
