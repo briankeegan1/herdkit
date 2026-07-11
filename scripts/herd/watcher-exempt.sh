@@ -131,6 +131,31 @@ watcher_marker_pids() {
   done
 }
 
+# watcher_marker_sessions — the SESSION id each LIVE inflight marker RECORDS on its 4th line
+# (live_runtime.py:_marker_write, HERD-348), one per line; markers without the line (the bash writer,
+# a marker predating it) contribute nothing here. Same live-marker enumeration as watcher_marker_pids —
+# ONE glob, ONE liveness rule — so the two can never disagree about which markers are in flight; the
+# sweep unions this with each live pid's expanded session, so a missing line is only ever a fallback,
+# never a miss. Used solely to SPARE a live gate worker's detached subtree; never to kill.
+watcher_marker_sessions() {
+  local trees f sess
+  trees="$(_wx_trees)"
+  [ -n "$trees" ] || return 0
+  for f in "$trees"/.review-inflight-* "$trees"/.health-inflight-* "$trees"/.spawn-inflight-*; do
+    [ -e "$f" ] || continue
+    if declare -f _marker_live >/dev/null 2>&1; then
+      _marker_live "$f" || continue
+    else
+      local mp; mp="$(head -1 "$f" 2>/dev/null || true)"
+      case "$mp" in ''|*[!0-9]*) continue ;; esac
+      kill -0 "$mp" 2>/dev/null || continue
+    fi
+    sess="$(sed -n '4p' "$f" 2>/dev/null | tr -d '[:space:]')"
+    case "$sess" in ''|*[!0-9]*) continue ;; esac
+    printf '%s\n' "$sess"
+  done
+}
+
 # ── Self-restart generation handoff ──────────────────────────────────────────────────────────────
 
 # watcher_handoff_file — the marker path, or empty when no worktrees dir is in scope.

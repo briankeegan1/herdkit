@@ -225,12 +225,28 @@ def _pid_live(pid):
         return False
 
 
+def _pid_session(pid):
+    """The SESSION id of <pid> (``os.getsid``) — the identity the sweep spares a detached gate worker's
+    WHOLE subtree by (HERD-348). We dispatch the async health/review worker with
+    ``start_new_session=True``, so the worker is a session LEADER and its own bats subtree runs under a
+    DIFFERENT process group within that session (GNU ``timeout`` re-groups its child). The recorded pid
+    therefore never names the pid the sweep is about to kill — but the session does. Empty when the pid
+    is gone or the platform refuses, so a caller never over-reads an absent token as a match."""
+    try:
+        return str(os.getsid(int(pid)))
+    except Exception:
+        return ""
+
+
 def _marker_write(path, pid):
-    """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts (agent-watch.sh:2012).
+    """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts, SESSION id
+    (agent-watch.sh:2012 + the HERD-348 session line). The 4th line lets the sweep exempt the worker's
+    whole detached subtree by a DIRECT lookup — no ``ps`` needed; older 3-line markers (the bash writer,
+    a marker predating this line) still work, the sweep falls back to expanding the recorded pid.
     Best-effort — an unwritable path drops the marker, never raises into the tick."""
     try:
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write("%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch()))
+            fh.write("%s\n%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch(), _pid_session(pid)))
     except Exception:
         pass
 
