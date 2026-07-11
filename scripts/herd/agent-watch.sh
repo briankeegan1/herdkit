@@ -2575,14 +2575,17 @@ _discard_stale_reviews() {
 # Preferred: util-linux `setsid` (no -f: $! IS the worker). Fallback: python os.setsid + exec (macOS
 # has no setsid(1)). Last resort: plain background (no isolation). MUST NOT run inside $() — a command
 # substitution subshell would reap/SIGHUP the child when it exits. stdin/stdout/stderr → /dev/null
-# (gate workers communicate via result files, never the watcher's tty).
+# (gate workers communicate via result files, never the watcher's tty). fd 9 is CLOSED for the same
+# reason _bg_health_worker closes it (HERD-339): a long-lived reviewer must not pin the watcher's
+# singleton flock via the shared open-file description, or a HERD-266 self-restart cannot re-acquire it.
+# `9>&-` is a hard no-op when fd 9 was never opened (mkdir-mutex path / lib-mode test), so always safe.
 _bg_new_session() {
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$@" </dev/null >/dev/null 2>&1 &
+    setsid "$@" </dev/null >/dev/null 2>&1 9>&- &
   elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >/dev/null 2>&1 &
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >/dev/null 2>&1 9>&- &
   else
-    "$@" </dev/null >/dev/null 2>&1 &
+    "$@" </dev/null >/dev/null 2>&1 9>&- &
   fi
   _BG_NEW_SESSION_PID=$!
 }
@@ -2597,10 +2600,29 @@ _bg_new_session() {
 # own process group (leader pid == pgid); `disown %+` then drops that job from the shell's table so a
 # later `kill -<pgid>` from this same watcher prints no async job-control notice and leaves no tracked
 # job. Monitor mode is restored to its prior state immediately — only the one fork runs under it.
+#
+# FD ISOLATION (HERD-339, live incident): the worker subtree must inherit NONE of the watcher's OWN
+# descriptors. A bare `( "$@" ) &` kept the watcher's fd 0/1/2 AND its singleton-lock fd 9 open for the
+# suite's whole ~9-min life, and two regressions followed:
+#   • UNDRAINED PIPE — when the watcher runs under a pipe-stdout parent (`herd-watch | reader`, the
+#     control-room render seam the last day's healthcheck-visibility merges lean on), the worker holds
+#     the inherited write-end open, so the reader never sees EOF and blocks on an undrained pipe until
+#     the suite ends. The suite itself streams to its own log at full speed, which is exactly why the
+#     freeze looked like an "invisible" healthcheck rather than a dead one.
+#   • LOCK PIN — the worker holds the flock singleton lock (fd 9) via the SHARED open-file description,
+#     so a HERD-266 self-restart that deliberately outlives its in-flight workers cannot re-`flock -n 9`
+#     (the old description is never dropped while a child still holds it).
+# Detach at the subshell boundary EXACTLY as live_runtime's _HEALTH_WORKER_SH is launched
+# (stdout/stderr=DEVNULL + start_new_session) and as _bg_new_session isolates reviewers: stdin/stdout/
+# stderr → /dev/null and CLOSE fd 9. The worker's OWN inner `bash healthcheck > "$log" 2>&1` still
+# streams the suite into its log — the boundary redirect only stops the subtree from pinning the parent
+# pipe or the lock, so /dev/null (not the log) is correct and caller-agnostic (a caller that passes no
+# log, e.g. a lib-mode test, never has its stdout guessed at). `9>&-` is a hard no-op when fd 9 was
+# never opened (the mkdir-mutex singleton path, or a test), so it is always safe.
 _bg_health_worker() {
   local _bhw_had_m; case "$-" in *m*) _bhw_had_m=1 ;; *) _bhw_had_m=0 ;; esac
   set -m
-  ( "$@" ) &
+  ( "$@" ) </dev/null >/dev/null 2>&1 9>&- &
   _BG_HEALTH_PID=$!
   [ "$_bhw_had_m" = 1 ] || set +m
   disown %+ 2>/dev/null || true
