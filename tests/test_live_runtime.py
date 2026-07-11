@@ -27,7 +27,18 @@ import unittest
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
-                               _select_candidates, _marker_write, _marker_live, WAIT, PENDING)
+                               _select_candidates, _marker_write, _marker_live, WAIT, PENDING,
+                               branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
+
+
+def _make_worktree(pool, slug):
+    """Create a minimal on-disk git worktree ``<pool>/<slug>`` (a dir with a ``.git`` pointer) so the
+    pool-membership / pre-dispatch guards see a real worktree — hermetic, no ``git`` invoked."""
+    d = os.path.join(pool, slug)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".git"), "w", encoding="utf-8") as fh:
+        fh.write("gitdir: /pool/.git/worktrees/%s\n" % slug)
+    return d
 
 
 def events(path):
@@ -561,6 +572,197 @@ class TestScopeFilter(unittest.TestCase):
             self.assertNotIn("2", res["outcomes"])       # bob never classified
         finally:
             os.environ.pop("HERD_JOURNAL_NOW", None)
+
+
+class TestSlugDerivation(unittest.TestCase):
+    """HERD-346 leg 1: derive the SLUG from the head branch (bash ``herd_branch_parse`` convention) so the
+    worktree resolves — the live tick shelled healthcheck.sh with slug=full-branch + an empty worktree (#453)."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("BRANCH_TEMPLATE", "TREES", "WORKTREES_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_template_strips_feat_prefix(self):
+        self.assertEqual(branch_to_slug("feat/unlock-supersession-cancel"), "unlock-supersession-cancel")
+
+    def test_empty_branch_is_empty_slug(self):
+        self.assertEqual(branch_to_slug(""), "")
+
+    def test_non_matching_branch_keeps_whole_name(self):
+        # A branch without the template prefix parses to itself (bash herd_branch_parse: no prefix strip).
+        self.assertEqual(branch_to_slug("hotfix-1"), "hotfix-1")
+
+    def test_custom_prefix_template(self):
+        os.environ["BRANCH_TEMPLATE"] = "wip/{slug}"
+        self.assertEqual(branch_to_slug("wip/foo-bar"), "foo-bar")
+
+    def test_ref_prefix_template_treats_ref_as_wildcard(self):
+        # '{ref}/{slug}' — strip up to the last '/' (the separator trailing {ref}), leaving the slug.
+        os.environ["BRANCH_TEMPLATE"] = "{ref}/{slug}"
+        self.assertEqual(branch_to_slug("HERD-346/live-slug-regression"), "live-slug-regression")
+
+    def test_suffix_template(self):
+        os.environ["BRANCH_TEMPLATE"] = "{slug}-dev"
+        self.assertEqual(branch_to_slug("payment-dev"), "payment")
+
+    def test_unusable_template_degrades_to_default(self):
+        os.environ["BRANCH_TEMPLATE"] = "no-placeholder"     # no {slug} → default feat/{slug}
+        self.assertEqual(branch_to_slug("feat/x"), "x")
+
+    def test_worktree_for_slug_is_pool_join(self):
+        os.environ["TREES"] = "/pool"
+        self.assertEqual(_worktree_for_slug("unlock-supersession-cancel"),
+                         "/pool/unlock-supersession-cancel")
+
+    def test_worktree_for_slug_empty_without_pool(self):
+        self.assertEqual(_worktree_for_slug("x"), "")        # no pool configured → no fabricated path
+
+    def test_discovery_derives_slug_and_worktree(self):
+        # discover_via_graphql maps headRefName -> slug -> worktree; stub gh so nothing shells out.
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "unlock-supersession-cancel")
+        payload = {"data": {"repository": {"pullRequests": {"nodes": [
+            {"number": 450, "headRefName": "feat/unlock-supersession-cancel",
+             "headRefOid": "3ca3eab", "baseRefName": "main", "mergeStateStatus": "CLEAN",
+             "reviewDecision": "", "author": {"login": "brian"},
+             "assignees": {"nodes": []}, "labels": {"nodes": []}}]}}}}
+
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(payload)
+                return R()
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            cands = LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].slug, "unlock-supersession-cancel")     # not the full branch
+        self.assertEqual(cands[0].worktree, os.path.join(pool, "unlock-supersession-cancel"))
+
+
+class TestPoolScope(unittest.TestCase):
+    """HERD-346 leg 3: a PR with NO worktree in this pool is FOREIGN and never a candidate — the port of
+    bash's worktree-first discovery (_discover_feature_worktrees). Fail-soft when no pool is configured."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("TREES", "WORKTREES_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_foreign_pool_pr_is_dropped(self):
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "mine")                          # PR 1 has a real worktree
+        mine = LiveCandidate(pr=1, sha="a", slug="mine", worktree=os.path.join(pool, "mine"))
+        foreign = LiveCandidate(pr=2, sha="b", slug="theirs", worktree=os.path.join(pool, "theirs"))
+        kept = _pool_scoped([mine, foreign])
+        self.assertEqual([c.pr for c in kept], ["1"])         # #2 (no worktree on disk) never classified
+
+    def test_fail_soft_passthrough_without_pool(self):
+        # No $TREES/$WORKTREES_DIR configured → the pool check no-ops (byte-identical to before).
+        a = LiveCandidate(pr=1, sha="a", slug="x", worktree="/nope/x")
+        b = LiveCandidate(pr=2, sha="b", slug="y", worktree="")
+        self.assertEqual([c.pr for c in _pool_scoped([a, b])], ["1", "2"])
+
+    def test_is_worktree_predicate(self):
+        pool = tempfile.mkdtemp()
+        real = _make_worktree(pool, "real")
+        self.assertTrue(_is_worktree(real))
+        self.assertFalse(_is_worktree(os.path.join(pool, "absent")))
+        self.assertFalse(_is_worktree(""))
+        os.makedirs(os.path.join(pool, "bare"))              # a dir with no .git is not a worktree
+        self.assertFalse(_is_worktree(os.path.join(pool, "bare")))
+
+    def test_graphql_discovery_applies_pool_scope(self):
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "mine")
+        cands = [LiveCandidate(pr=1, sha="a", slug="mine", author="me",
+                               worktree=os.path.join(pool, "mine")),
+                 LiveCandidate(pr=2, sha="b", slug="gone", author="me",
+                               worktree=os.path.join(pool, "gone"))]
+        disc = LR._GraphQLDiscovery({"WATCHER_SCOPE": "mine"})
+        orig = LR.discover_via_graphql
+        LR.discover_via_graphql = lambda repo=None: list(cands)
+        try:
+            got = disc.discover()
+        finally:
+            LR.discover_via_graphql = orig
+        self.assertEqual([c.pr for c in got], ["1"])
+
+
+class TestPreDispatchWorktreeGuard(unittest.TestCase):
+    """HERD-346 leg 2: a resolved-but-ABSENT worktree REFUSES health dispatch (dispatch_refused,
+    reason=no-worktree) and HOLDS — never shells healthcheck.sh into a phantom CODEERROR (#453)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        self.state = LiveState(self.tmp)
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        self.journal = LiveJournal(self.jpath)
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _gates(self):
+        dispatched = []
+
+        class Stub(LiveGates):
+            def _dispatch_health(self, cand):
+                dispatched.append(cand.pr)
+                _marker_write(self.state.health_inflight_file(cand), os.getpid())
+
+        return Stub("/home", self.state, self.journal), dispatched
+
+    def _events(self):
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    def test_missing_worktree_refuses_dispatch(self):
+        c = LiveCandidate(pr=7, sha="s", slug="gone", worktree=os.path.join(self.tmp, "gone"))
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)                  # holds, never CODEERROR
+        self.assertEqual(dispatched, [])                     # the suite is never shelled at a missing tree
+        refused = [e for e in self._events() if e["event"] == "dispatch_refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["reason"], "no-worktree")
+        self.assertEqual(refused[0]["rail"], "health")
+        self.assertEqual(str(refused[0]["pr"]), "7")
+
+    def test_present_worktree_dispatches(self):
+        _make_worktree(self.tmp, "here")
+        c = LiveCandidate(pr=8, sha="s", slug="here", worktree=os.path.join(self.tmp, "here"))
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)
+        self.assertEqual(dispatched, ["8"])                  # real worktree → normal async dispatch
+        self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
+
+    def test_empty_worktree_is_byte_identical(self):
+        # A hermetic/legacy candidate carrying no worktree is UNKNOWN, not absent → dispatch unchanged.
+        c = LiveCandidate(pr=9, sha="s", slug="feat-9")
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)
+        self.assertEqual(dispatched, ["9"])
+        self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
 
 
 if __name__ == "__main__":
