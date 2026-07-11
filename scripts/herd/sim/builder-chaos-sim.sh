@@ -150,6 +150,7 @@ LIMIT_STATE="$TREES/.agent-watch-limit"
 SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 DEFAULT_BRANCH="main"; DRYRUN=""; WORKSPACE_NAME="simws"
 export WORKSPACE_NAME
+export HERD_DISPOSABLE_WORKSPACE=1  # sim creates/tears down its own stub tabs (HERD-310 guard)
 
 crash_after() {
   eval "$(declare -f "$1" | sed "1s/^$1/__orig_$1/")"
