@@ -102,8 +102,14 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # DRY-RUN mode: same candidate → gate → decision walk, but it MUTATES NOTHING (no gh, no merge, no pane
 # ops) — its only output is .herd/journal-shadow.jsonl in journal.sh-identical shapes, so the two event
 # streams can be diffed for parity. "shadow" never changes what the bash engine does; it only observes.
-# Any value other than "shadow" reads as "bash". Ship default "bash" = inert.
-# ENGINE_IMPL="bash"                  # bash (default, authoritative) | shadow (also run the dry-run port)
+# "python" (HERD-320, P3f — and the P5a cutover default for herdkit's own dogfood config) is the LIVE
+# posture: bash stays the resident watch-loop supervisor but hands each tick to the Python live engine
+# (pysrc/herd/live_runtime.py via `python3 -m herd.live_runtime --tick`), which discovers PRs, dispatches
+# the gate rails to the existing leaf scripts, and on green MERGES + REAPS — writing the SAME
+# .herd/journal.jsonl. Instant-fallback kill-switch: a non-zero Python tick (fault / missing module)
+# falls back to the authoritative bash tick, and flipping back to "bash" disables Python next tick.
+# Any value other than the exact tokens "shadow" / "python" reads as "bash". Ship default "bash" = inert.
+# ENGINE_IMPL="bash"                  # bash (default, authoritative) | shadow (dry-run port) | python (live port)
 
 # HERD_THEME — pluggable theming across ALL herd color surfaces (consoles, glow viewers, the CLI).
 # Default "tokyonight" (the shipped built-in), byte-identical to the pre-theme hardcoded palettes. A

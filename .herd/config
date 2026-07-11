@@ -175,6 +175,15 @@ ENGINE_MIN=1
 # (HERD-179), so this project's watcher pulls the engine forward on its own once a merge raises
 # the floor. `herd update`'s builders-mid-flight refusal is the quiescent-window guard.
 ENGINE_AUTOUPDATE="auto"
+# ENGINE_IMPL — the engine-port P5a cutover (HERD-306, EPIC HERD-300): the COMMITTED baseline flips
+# from bash to `python`, so bash stays the resident watch-loop supervisor but hands each tick to the
+# Python live engine (pysrc/herd/live_runtime.py). Both live seats already ran this via config.local,
+# so committing it is a NO-OP for them and BINDING for any future seat. Instant-fallback kill-switch:
+# a non-zero Python tick (fault / missing module) falls back to the authoritative bash tick, and
+# flipping this back to `bash` disables Python on the next tick. See ENGINE_MIN below — this project
+# pins its floor to the current engine level so a stale checkout (which lacks the live runtime) halts
+# loudly on write paths rather than silently running the old bash-only world.
+ENGINE_IMPL=python
 DOCS_ONLY_GLOB="[.](md|txt)"
 GATE_DISPATCH="parallel"
 SCRIBE_LINGER_SECS="90"
