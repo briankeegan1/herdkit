@@ -49,6 +49,14 @@ the subject's in-flight work and terminates its workers. Every non-terminal stat
 ``new_sha`` and ``sibling_restale`` edges to :data:`SUPERSEDED` — generalizing the live new-sha
 cancel (``_discard_stale_reviews`` / ``_discard_stale_health``) to the cross-sibling cancel §6.1
 names as TARGET. The re-armed subject starts a fresh :data:`INTAKE` for the new ``(pr, sha)``.
+
+STARVATION FREEZE (§6.2, HERD-340). A blessed sibling that would merge can instead be *frozen* for
+one merge window — the ``merge_frozen`` edge :data:`BLESSED` → :data:`HOLD` — so a starved
+head-of-line PR (one re-staled past threshold, kept from landing by siblings that keep merging ahead
+of it) gets a clean base to finish its final gate. The freeze is a HOLD, never an outcome: the
+sibling lands on a later window once the starved PR clears. Like the other levers this edge is
+ship-dormant — :mod:`herd.live_runtime` emits ``merge_frozen`` ONLY under ``MERGE_FAIRNESS`` (default
+off), so with the lever off the row is unreachable and the merge path is byte-identical.
 """
 
 from herd import decisions
@@ -102,6 +110,7 @@ DECIDE_HOLD = "decide_hold"          # policy decision = HOLD (§5.4–§5.5)
 DECIDE_OBSERVE = "decide_observe"    # policy decision = OBSERVE, never merge (§5.5)
 APPROVED = "approved"                # a sha-keyed approval cleared the hold (§5.5)
 MERGE_REFUSED = "merge_refused"      # --match-head-commit refused: sha moved at apply (§2.4)
+MERGE_FROZEN = "merge_frozen"        # merge-fairness held this sibling one window for a starved head (§6.2)
 NEW_SHA = "new_sha"                  # a new head sha superseded this one (§2.4)
 SIBLING_RESTALE = "sibling_restale"  # a sibling merge re-staled this still-valid sha (§6.1)
 
@@ -110,7 +119,7 @@ EVENTS = (
     DISPATCH_HEALTH, HEALTH_CLEAN, HEALTH_FLAKY, HEALTH_CODEERROR, HEALTH_INFRA,
     REVIEW_PASS, REVIEW_BLOCK, REVIEW_INFRA,
     REFIX_BOUNCE, REFIX_EXHAUSTED, BLESSING_POSTED,
-    DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED,
+    DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN,
     NEW_SHA, SIBLING_RESTALE,
 )
 
@@ -169,6 +178,13 @@ _BASE_TRANSITIONS = {
     (BLESSED, DECIDE_HOLD): HOLD,
     (BLESSED, DECIDE_OBSERVE): OBSERVE,
     (BLESSED, MERGE_REFUSED): SUPERSEDED,
+    # HERD-340/§6.2 starvation freeze: a BLESSED sibling that WOULD merge is held for one merge window
+    # so a starved head-of-line PR can finish its final gate and land without the base moving out from
+    # under it. This is a HOLD, not a merge — the frozen sibling merges on a later window (the freeze
+    # is bounded to one window per sha; it lifts once the starved PR lands). Ship-dormant: the port
+    # emits this event ONLY under MERGE_FAIRNESS (live_runtime), so with the lever off it never fires
+    # and the table row is unreachable, keeping the merge path byte-identical.
+    (BLESSED, MERGE_FROZEN): HOLD,
 
     # HOLD — a gates-green PR awaiting a human/coordinator signal (§5.4 human-verify, §5.5 approval).
     # The hold is loud and owned (§5.6); an approval clears it to merge. A hold is sha-keyed, so a

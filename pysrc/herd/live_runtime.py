@@ -101,11 +101,12 @@ class LiveCandidate:
     """
 
     __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
-                 "hv_body", "author", "assignees", "labels", "review_decision", "merge_status")
+                 "hv_body", "author", "assignees", "labels", "review_decision", "merge_status",
+                 "restale_laps")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
                  hv_hold=False, approved=False, hv_body="", author="", assignees=None,
-                 labels=None, review_decision="", merge_status=""):
+                 labels=None, review_decision="", merge_status="", restale_laps=0):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
@@ -123,6 +124,10 @@ class LiveCandidate:
         self.labels = list(labels or [])
         self.review_decision = str(review_decision or "")
         self.merge_status = str(merge_status or "")
+        # MERGE_FAIRNESS (§6.2, HERD-340): this PR's re-stale lap count. In live mode the freeze reads
+        # the persistent ledger (LiveState.restale_count); a sim with a black-hole state dir carries the
+        # laps here instead, so a scenario can inject a starved candidate. Absent → 0 (never starved).
+        self.restale_laps = int(restale_laps or 0)
 
     @classmethod
     def from_dict(cls, d):
@@ -133,6 +138,7 @@ class LiveCandidate:
             hv_body=d.get("hv_body", ""), author=d.get("author", ""),
             assignees=d.get("assignees"), labels=d.get("labels"),
             review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
+            restale_laps=d.get("restale_laps", 0),
         )
 
 
@@ -411,6 +417,76 @@ class LiveState:
                 except OSError:
                     pass
 
+    # re-stale / starvation substrate (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────────
+    def restale_ledger(self):
+        return self._p(".agent-watch-restale")            # RESTALE_STATE (agent-watch.sh:407)
+
+    def gate_work_invested(self, cand):
+        """True iff this watcher has ALREADY spent (or is spending) gate work on this exact ``(pr, sha)``
+        — a cached health verdict, a health worker in flight / awaiting collection, a reviewer in flight,
+        or a recorded review verdict (agent-watch.sh:_gate_work_invested:3539). A re-stale lap counts
+        only for a sha that carried real investment ('measure work thrown away, not holds'): a PR held
+        on its first tick, before any gate ran, has lost nothing. All LOCAL reads — no network, no git."""
+        if not cand.pr or not cand.sha or cand.sha == "-":
+            return False
+        if self.health_cached_verdict(cand):
+            return True
+        for p in (self.health_inflight_file(cand), self.health_dispatch_file(cand),
+                  self.review_inflight_file(cand)):
+            if p and os.path.exists(p):
+                return True
+        return bool(self.recorded_review(cand.pr, cand.sha))
+
+    def restale_counted(self, pr, sha, kind):
+        """True iff this exact ``(pr, sha, kind)`` lap is already on the ledger — the dedup that keeps a
+        hold lingering across many ticks from inflating the count (agent-watch.sh:restale_counted:3552)."""
+        path = self.restale_ledger()
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha) and f[3] == str(kind):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def restale_count(self, pr):
+        """How many laps this PR has lost across every sha and kind (agent-watch.sh:restale_count:3559).
+        ``0`` when the ledger is absent, so callers compare without guarding."""
+        path = self.restale_ledger()
+        if not path or not os.path.exists(path):
+            return 0
+        n = 0
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 2 and f[1] == str(pr):
+                        n += 1
+        except Exception:
+            return 0
+        return n
+
+    def note_restale(self, pr, sha, kind):
+        """Record ONE lost lap for ``(pr, sha, kind)``, deduped. Returns the PR's new lap total, or
+        ``None`` when nothing was recorded (no state dir, missing key, or already counted). Mirrors
+        agent-watch.sh:_restale_note:3568 minus the journal side effect — the caller journals — so the
+        ledger row format ``<epoch> <pr> <sha> <kind>`` stays byte-identical to the bash tree's."""
+        path = self.restale_ledger()
+        if not path or not pr or not sha:
+            return None
+        if self.restale_counted(pr, sha, kind):
+            return None
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s %s %s %s\n" % (_now_epoch(), pr, sha, kind))
+        except Exception:
+            return None
+        return self.restale_count(pr)
+
 
 # _health_worker mirror (agent-watch.sh:_health_worker): the ASYNC suite the port dispatches for one
 # (pr, sha). Runs healthcheck.sh BASELINE-AWARE (HERD-190: $MAIN as the base tree, $TREES as the sha-keyed
@@ -501,6 +577,33 @@ def discover_via_graphql(repo=None, limit=50):
 
 _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
                  "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER")
+
+# ── merge fairness / starvation freeze (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────
+# SHIP-DORMANT. MERGE_FAIRNESS=off (the default, and any unrecognized value) disables every re-stale
+# count and every freeze, so the candidate walk — and every event, dispatch and merge that follows —
+# is BYTE-IDENTICAL to today. The keys are READ from the same watcher-exported config the bash engine
+# reads; nothing is added to herd-config.sh (MERGE_FAIRNESS is already a registered bash key).
+_FAIRNESS_KEYS = ("MERGE_FAIRNESS", "MERGE_FAIRNESS_STARVE_THRESHOLD")
+_DEFAULT_STARVE_THRESHOLD = 3         # agent-watch.sh:_RESTALE_STARVE_THRESHOLD=3 (line 410)
+
+
+def _merge_fairness_enabled(config):
+    """True iff ``MERGE_FAIRNESS`` opts in (agent-watch.sh:_merge_fairness_enabled:3619). Any
+    unrecognized value → off, so the default and any typo preserve today's EXACT behavior."""
+    val = str((config or {}).get("MERGE_FAIRNESS", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def _starve_threshold(config):
+    """Laps at or past which a would-auto-merge PR is head-of-line-starved and freezes its siblings for
+    one window (agent-watch.sh:_RESTALE_STARVE_THRESHOLD). A missing / non-positive / non-integer
+    ``MERGE_FAIRNESS_STARVE_THRESHOLD`` falls back to the bash default (3)."""
+    raw = str((config or {}).get("MERGE_FAIRNESS_STARVE_THRESHOLD", "") or "").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_STARVE_THRESHOLD
+    return n if n >= 1 else _DEFAULT_STARVE_THRESHOLD
 
 
 def _watcher_scope(config):
@@ -899,6 +1002,11 @@ class LiveTick:
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
         self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
+        # MERGE_FAIRNESS / starvation freeze (§6.2, HERD-340). OFF (default) → _fairness False and
+        # _starved always empty, so the merge path below is byte-identical to before this feature.
+        self._fairness = _merge_fairness_enabled(self.config)
+        self._starve_threshold = _starve_threshold(self.config)
+        self._starved = set()  # PRs that are head-of-line-starved THIS tick (drives the sibling freeze)
 
     def _next_refix_round(self, pr, rule):
         """The round number this rail's refix_bounce carries: the per-``(pr, rule)`` bounce count so
@@ -923,6 +1031,53 @@ class LiveTick:
         self.journal.append("live_state", "pr", cand.pr, "sha", cand.sha, "trigger", event,
                             "state_from", prev, "state_to", nxt)
         return nxt
+
+    # ── merge fairness / starvation freeze (§6.2, HERD-340) ───────────────────────────────────────
+    def _effective_laps(self, cand):
+        """This PR's re-stale lap total: the persistent ledger count (live), else the fixture-injected
+        ``restale_laps`` (a sim with a black-hole state dir carries the laps on the candidate)."""
+        n = self.state.restale_count(cand.pr)
+        return n if n > 0 else int(getattr(cand, "restale_laps", 0) or 0)
+
+    def _would_automerge(self, cand):
+        """True iff this candidate's resolved merge policy would MERGE it (not HOLD on approve/human-
+        verify, not OBSERVE) once its gates are green. The head-of-line test that keeps the freeze from
+        deadlocking behind a human hold: a PR parked on a human never triggers a sibling freeze."""
+        return D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy) == "MERGE"
+
+    def _fairness_prepass(self, candidates):
+        """Resolve the starvation state for this tick BEFORE any candidate is walked (§6.2, HERD-340).
+
+        A strict NO-OP when ``MERGE_FAIRNESS`` is off — ``_starved`` stays empty, so the merge path is
+        byte-identical to today. When on it does two things:
+
+          (a) COUNT this tick's fresh re-stale laps. A candidate re-staled (behind base) this tick that
+              already carried real gate investment lost a lap (agent-watch.sh:_restale_note — 'measure
+              work thrown away, not holds'); it is recorded once per ``(pr, sha, kind)`` and journaled
+              ``pr_restale`` (plus ``pr_starvation`` at/above threshold), reusing the existing bash
+              journal schema so the counter is cross-implementation-identical.
+          (b) RESOLVE the head-of-line starved set. A PR is head-of-line-starved when its laps reach the
+              threshold AND its own policy would auto-merge it once it gets a clean window. It is bounded
+              to ONE window per ``(pr, sha)`` via the once-guard, so a PR that cannot land never freezes
+              the queue forever ('for one merge window', §6.2); a rebased sha re-arms it.
+        """
+        if not self._fairness:
+            return
+        for cand in candidates:
+            if cand.stale and self.state.gate_work_invested(cand):
+                laps = self.state.note_restale(cand.pr, cand.sha, "stale")
+                if laps is not None:
+                    self.journal.append("pr_restale", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "kind", "stale", "laps", laps)
+                    if laps >= self._starve_threshold:
+                        self.journal.append("pr_starvation", "pr", cand.pr, "sha", cand.sha,
+                                            "slug", cand.slug, "laps", laps,
+                                            "threshold", self._starve_threshold)
+        for cand in candidates:
+            if (self._effective_laps(cand) >= self._starve_threshold
+                    and self._would_automerge(cand)
+                    and self.state.once(cand.pr, cand.sha, "fairness_window")):
+                self._starved.add(cand.pr)
 
     def _walk(self, cand):
         """Walk one candidate's gate DAG; actuate the terminal; return the action string.
@@ -1001,6 +1156,21 @@ class LiveTick:
 
         # 5. the pure hold / merge / observe decision (reused from P2, contract §2.2/§5.4-§5.5).
         action = D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy)
+
+        # 5b. MERGE_FAIRNESS starvation freeze (§6.2, HERD-340): a would-be sibling merge is HELD for one
+        #     window when a starved head-of-line PR (some OTHER candidate re-staled past threshold) needs
+        #     a clean base to finish its final gate and land. The starved PR is excluded from its own
+        #     freeze, so it still merges. Off / no starvation → the branch is never taken and the decide
+        #     advance + apply below are byte-identical to today.
+        if action == "MERGE" and self._fairness and (self._starved - {cand.pr}):
+            self._advance(cand, "merge_frozen")               # BLESSED --merge_frozen--> HOLD
+            if self.state.once(cand.pr, cand.sha, "fairness_freeze"):
+                self.journal.append("merge_fairness_freeze", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug,
+                                    "starved", ",".join(sorted(self._starved - {cand.pr})),
+                                    "threshold", self._starve_threshold)
+            return HOLD
+
         self._advance(cand, {"MERGE": "decide_merge", "HOLD": "decide_hold",
                              "OBSERVE": "decide_observe"}[action])
 
@@ -1025,6 +1195,9 @@ class LiveTick:
         candidates = self.discovery.discover()
         self.journal.append("live_tick_start", "candidates", len(candidates), "impl", "python",
                             "merge_policy", self._merge_policy)
+        # Resolve this tick's starvation state before any candidate is walked (§6.2, HERD-340). A strict
+        # no-op under MERGE_FAIRNESS=off, so the loop below stays byte-identical to before this feature.
+        self._fairness_prepass(candidates)
         for cand in candidates:
             try:
                 self._outcome[cand.pr] = self._walk(cand)
@@ -1047,7 +1220,7 @@ class LiveTick:
 
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
-    knobs = ("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY") + _WATCHER_KEYS
+    knobs = ("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY") + _WATCHER_KEYS + _FAIRNESS_KEYS
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]

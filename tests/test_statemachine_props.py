@@ -259,6 +259,45 @@ class HappyPath(unittest.TestCase):
         self.assertEqual(SM.transition(SM.HEALTH, SM.HEALTH_INFRA), SM.HEALTH)
 
 
+class MergeFairnessFreeze(unittest.TestCase):
+    """§6.2 / HERD-340 starvation freeze: a BLESSED sibling that would merge is held one window via the
+    ``merge_frozen`` edge. It is a HOLD (never an outcome), it is NOT a self-loop, and it does not
+    perturb the existing BLESSED exits."""
+
+    def test_merge_frozen_holds_a_blessed_sibling(self):
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_FROZEN), SM.HOLD)
+        self.assertTrue(SM.can(SM.BLESSED, SM.MERGE_FROZEN))
+
+    def test_merge_frozen_is_a_registered_event(self):
+        self.assertIn(SM.MERGE_FROZEN, SM.EVENTS)
+        self.assertEqual(SM.MERGE_FROZEN, "merge_frozen")
+
+    def test_merge_frozen_is_only_legal_from_blessed(self):
+        for state in SM.STATES:
+            if state == SM.BLESSED:
+                continue
+            self.assertFalse(SM.can(state, SM.MERGE_FROZEN),
+                             "%r must not accept merge_frozen" % (state,))
+
+    def test_freeze_lands_in_a_live_non_terminal_hold(self):
+        # HOLD is where a frozen sibling rests until it merges on a later window — it must stay a live
+        # non-terminal with the usual approval/supersession exits (never a dead end).
+        self.assertFalse(SM.is_terminal(SM.HOLD))
+        self.assertEqual(SM.transition(SM.HOLD, SM.APPROVED), SM.MERGED)
+
+    def test_frozen_sibling_is_still_supersedable(self):
+        # A frozen sibling parked in HOLD is re-armed by a new sha / sibling re-stale like any hold.
+        for ev in (SM.NEW_SHA, SM.SIBLING_RESTALE):
+            self.assertEqual(SM.transition(SM.HOLD, ev), SM.SUPERSEDED)
+
+    def test_blessed_keeps_every_prior_exit(self):
+        # The new edge is purely additive — the four original BLESSED decisions are untouched.
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_MERGE), SM.MERGED)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_HOLD), SM.HOLD)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_OBSERVE), SM.OBSERVE)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_REFUSED), SM.SUPERSEDED)
+
+
 # ── OPTIONAL hypothesis pass — extra fuzz when installed; skip-soft otherwise (never a red) ──────
 try:
     from hypothesis import given, settings, strategies as st

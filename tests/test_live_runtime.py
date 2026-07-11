@@ -563,5 +563,145 @@ class TestScopeFilter(unittest.TestCase):
             os.environ.pop("HERD_JOURNAL_NOW", None)
 
 
+class MergeFairnessFreeze(unittest.TestCase):
+    """MERGE_FAIRNESS starvation freeze (§6.2, HERD-340): a would-be sibling merge is held one window
+    for a starved head-of-line PR, and the whole feature is byte-identical when the lever is off."""
+
+    def _run(self, scenario):
+        # A fresh, isolated state dir per run: the dry-run tick uses it as the freeze substrate, so the
+        # one-window guard never carries across scenarios that reuse a (pr,sha). Passing an explicit dir
+        # (not LiveState(None)) also keeps the test hermetic if the gate env has WORKTREES_DIR set.
+        tmp = tempfile.mkdtemp()
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        tick = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                        DryRunActuator(journal), journal, state=LiveState(os.path.join(tmp, "state")))
+        return tick.run(), journal.path
+
+    def _scenario(self, fairness, starved_laps=3, starved_review="PASS"):
+        return {"config": {"MERGE_POLICY": "auto", "MERGE_FAIRNESS": fairness},
+                "candidates": [
+                    {"pr": 1, "sha": "a1", "slug": "starved", "review": starved_review,
+                     "health": "CLEAN", "worktree": "/wt/1", "restale_laps": starved_laps},
+                    {"pr": 2, "sha": "a2", "slug": "sibling", "review": "PASS",
+                     "health": "CLEAN", "worktree": "/wt/2"}]}
+
+    def test_off_is_byte_identical_the_sibling_merges(self):
+        # Lever off: the exact scenario that freezes when on must merge the ready sibling, with NO
+        # fairness event of any kind — the byte-identical-when-off doctrine (AGENTS.md).
+        res, jpath = self._run(self._scenario("off"))
+        self.assertIn("2", res["merged"])
+        self.assertEqual(res["outcomes"]["2"], "MERGE")
+        evs = {e["event"] for e in events(jpath)}
+        self.assertNotIn("merge_fairness_freeze", evs)
+        self.assertNotIn("pr_restale", evs)
+        self.assertNotIn("pr_starvation", evs)
+
+    def test_on_freezes_the_sibling_while_the_starved_pr_is_still_gating(self):
+        # pr1 starved and still finishing its final gate (review WAIT → PENDING); pr2 would merge but is
+        # frozen for one window so pr1 keeps its clean base.
+        res, jpath = self._run(self._scenario("on", starved_review="WAIT"))
+        self.assertEqual(res["merged"], [])
+        self.assertEqual(res["outcomes"]["1"], PENDING)
+        self.assertEqual(res["outcomes"]["2"], "HOLD")     # frozen, not merged
+        frz = [e for e in events(jpath) if e["event"] == "merge_fairness_freeze"]
+        self.assertEqual(len(frz), 1)
+        self.assertEqual(frz[0]["pr"], 2)
+        # journal.sh integer-coercion renders a lone "1" as 1 — the head-of-line PR it is held for.
+        self.assertEqual(str(frz[0]["starved"]), "1")
+
+    def test_starved_pr_is_excluded_from_its_own_freeze_and_still_merges(self):
+        # When the starved PR is itself gates-ready this tick it MERGES (the win), while its sibling
+        # freezes — a starved PR never blocks itself.
+        res, _ = self._run(self._scenario("on", starved_review="PASS"))
+        self.assertEqual(res["merged"], ["1"])
+        self.assertEqual(res["outcomes"]["2"], "HOLD")
+
+    def test_below_threshold_never_freezes(self):
+        # laps=2 < threshold(3): no head-of-line starvation, so both green PRs merge exactly as off.
+        res, jpath = self._run(self._scenario("on", starved_laps=2))
+        self.assertEqual(sorted(res["merged"]), ["1", "2"])
+        self.assertNotIn("merge_fairness_freeze", {e["event"] for e in events(jpath)})
+
+    def test_human_verify_hold_never_triggers_a_freeze(self):
+        # A starved PR parked on a human-verify hold would NOT auto-merge even with a clean window, so it
+        # must never freeze siblings (that would deadlock the queue behind a human). The sibling merges.
+        scen = {"config": {"MERGE_POLICY": "auto", "MERGE_FAIRNESS": "on"},
+                "candidates": [
+                    {"pr": 1, "sha": "a1", "slug": "held", "review": "PASS", "health": "CLEAN",
+                     "hv_hold": True, "restale_laps": 5},
+                    {"pr": 2, "sha": "a2", "slug": "sibling", "review": "PASS", "health": "CLEAN",
+                     "worktree": "/wt/2"}]}
+        res, jpath = self._run(scen)
+        self.assertIn("2", res["merged"])
+        self.assertNotIn("merge_fairness_freeze", {e["event"] for e in events(jpath)})
+
+    def test_lever_off_leaves_the_candidate_out_of_the_starved_set(self):
+        # The internal starved set is only populated under the lever — a direct assertion on the guard.
+        scen = self._scenario("off")
+        t = LiveTick(scen["config"], FixtureDiscovery(scen), FixtureGates(scen),
+                     DryRunActuator(LiveJournal(None)), LiveJournal(None), state=LiveState(None))
+        t.run()
+        self.assertEqual(t._starved, set())
+        self.assertFalse(t._fairness)
+
+    def test_threshold_is_configurable(self):
+        # MERGE_FAIRNESS_STARVE_THRESHOLD lowers the bar: laps=1 now starves and freezes the sibling.
+        scen = self._scenario("on", starved_laps=1, starved_review="WAIT")
+        scen["config"]["MERGE_FAIRNESS_STARVE_THRESHOLD"] = "1"
+        res, _ = self._run(scen)
+        self.assertEqual(res["outcomes"]["2"], "HOLD")
+
+
+class MergeFairnessState(unittest.TestCase):
+    """The re-stale ledger (LiveState) — the always-local counter the freeze reads (§6.2 / HERD-340)."""
+
+    def test_restale_ledger_counts_and_dedups(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        self.assertEqual(st.restale_count("7"), 0)
+        # first lap on sha a → 1; a REPEAT of the same (pr,sha,kind) is deduped (no inflation).
+        self.assertEqual(st.note_restale("7", "a", "stale"), 1)
+        self.assertIsNone(st.note_restale("7", "a", "stale"))
+        self.assertEqual(st.restale_count("7"), 1)
+        # a new sha is a new lap.
+        self.assertEqual(st.note_restale("7", "b", "stale"), 2)
+        self.assertEqual(st.restale_count("7"), 2)
+        # ledger row format matches the bash tree: "<epoch> <pr> <sha> <kind>".
+        with open(st.restale_ledger(), encoding="utf-8") as fh:
+            rows = [ln.split() for ln in fh if ln.strip()]
+        self.assertTrue(all(len(r) == 4 and r[1] == "7" and r[3] == "stale" for r in rows))
+
+    def test_black_hole_state_records_nothing(self):
+        st = LiveState(None)
+        st.dir = None                    # force the no-dir degrade, independent of the ambient env
+        self.assertIsNone(st.note_restale("7", "a", "stale"))
+        self.assertEqual(st.restale_count("7"), 0)
+
+    def test_gate_work_invested_needs_real_investment(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        cand = LiveCandidate(pr=9, sha="s9")
+        self.assertFalse(st.gate_work_invested(cand))       # nothing spent yet → no lap owed
+        st.record_review("9", "s9", "PASS")
+        self.assertTrue(st.gate_work_invested(cand))         # a recorded verdict IS investment
+
+    def test_fairness_prepass_journals_starvation_past_threshold(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        # pre-seed 2 laps so this tick's 3rd lap crosses the threshold and journals pr_starvation.
+        st.note_restale("3", "x1", "stale")
+        st.note_restale("3", "x2", "stale")
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        cand = LiveCandidate(pr=3, sha="x3", stale=True)
+        st.record_review("3", "x3", "PASS")                  # investment on the re-staled sha
+        scen = {"config": {"MERGE_FAIRNESS": "on"}, "candidates": []}
+        tick = LiveTick(scen["config"], FixtureDiscovery(scen), FixtureGates(scen),
+                        DryRunActuator(journal), journal, state=st)
+        tick._fairness_prepass([cand])
+        evs = [e["event"] for e in events(journal.path)]
+        self.assertIn("pr_restale", evs)
+        self.assertIn("pr_starvation", evs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
