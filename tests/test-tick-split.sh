@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# test-tick-split.sh — gate proof for the tick factoring (HERD-323, P3g, EPIC HERD-300).
+# test-tick-split.sh — gate proof for the tick after the P5 CUTOVER (HERD-306, EPIC HERD-300 FINALE).
 #
-# P3g splits agent-watch.sh's tick body into two halves so the live-engine cutover seat stops flying
-# instrument-only: when ENGINE_IMPL=python owns a tick, the whole bash body used to be skipped, so
-# nothing rendered and no queued spawn drained. The factoring:
+# P5b DELETED the bash action pass (_tick_act): pysrc/herd/live_runtime.py is now the SOLE engine core,
+# and the supervisor hands it every tick through a WATCHDOG instead of a bash fallback. The tick shape:
 #
-#   _tick_act              — the ACTION pass (gate dispatch, the auto-merge candidate loop, conflict-
-#                            resolver bounces). This is the half the Python engine replaces; it is
-#                            SKIPPED in bash whenever Python owned the tick.
-#   _tick_render_reconcile — runs EVERY cycle regardless of tick owner: observe + console paint
-#                            (Phase A), the herd_engine_live_tick guard around the action pass, then
-#                            the spawn-queue drain + reconcile/sweep legs (Phase C).
+#   _engine_tick_watchdog  — runs the Python live tick (herd_engine_live_tick); a FAULT is retried
+#                            in-tick with backoff, a fault streak past _ENGINE_FAULT_MAX paints a loud
+#                            'engine down' banner + journals engine_down + fires ONE notification, and it
+#                            NEVER runs a gate/merge in bash (there is none) — a fault is a safe HOLD.
+#   _tick_render_reconcile — runs EVERY cycle: observe + console paint (Phase A), the engine watchdog,
+#                            then the spawn-queue drain + reconcile/sweep legs (Phase C).
 #
-# This is a PURE factoring, so the load-bearing claims are about CONTROL FLOW, proven hermetically by
-# sourcing the REAL watcher in lib mode and driving the two entry points with the leaf helpers stubbed
-# as trace recorders (the leaves are unchanged; only which half runs when is under test):
+# The load-bearing claims are about CONTROL FLOW, proven hermetically by sourcing the REAL watcher in
+# lib mode and driving the entry points with the leaf helpers stubbed as trace recorders:
 #
-#   (1) both halves are defined after a lib-mode source (i.e. before the lib-return, usable by tests).
-#   (2) STRUCTURE — _tick_render_reconcile guards _tick_act behind herd_engine_live_tick; _tick_act
-#       carries the action pass (do_merge + spawn_resolver moved into it wholesale).
-#   (3) BASH MODE (byte-identical) — herd_engine_live_tick returns non-zero, so _tick_render_reconcile
-#       paints (render), THEN runs the action pass (_tick_act), THEN drains + reconciles (Phase C).
-#   (4) PYTHON-OWNED — herd_engine_live_tick returns zero, so _tick_act is SKIPPED, but the console
-#       still renders AND the spawn queue still drains: the instrument panel keeps painting.
+#   (1) _tick_render_reconcile + _engine_tick_watchdog are defined after a lib-mode source, and the
+#       DELETED _tick_act is gone (no bash action pass survives).
+#   (2) STRUCTURE — _tick_render_reconcile drives the action pass through _engine_tick_watchdog (never a
+#       direct _tick_act), and the watchdog gates the action on herd_engine_live_tick.
+#   (3) CLEAN tick — a Python tick that exits 0: the watchdog reports success (no engine-down banner) and
+#       runs NO bash action pass.
+#   (4) FAULTED tick — a Python tick that keeps faulting: NO merge/gate/resolver runs in bash (there is
+#       no action pass), and past _ENGINE_FAULT_MAX consecutive faulty ticks the watchdog paints the loud
+#       engine-down banner, journals engine_down, and fires exactly one notification — the safe HOLD.
 #
 # Run:  bash tests/test-tick-split.sh
 set -uo pipefail
@@ -36,9 +36,7 @@ PASS=0
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass(){ PASS=$((PASS + 1)); }
 
-# Source the REAL watcher in lib mode: helpers + the factored halves, no loop, no re-exec. The
-# lib-mode source returns before the startup one-shots and the while loop, so both halves must be
-# defined BEFORE that return to be reachable here.
+# Source the REAL watcher in lib mode: helpers + the factored halves, no loop, no re-exec.
 source_lib() {
   export AGENT_WATCH_LIB=1
   export HERD_CONFIG_FILE="$T/no-such-config"
@@ -49,110 +47,74 @@ source_lib() {
   . "$WATCH" || { echo "FAIL: lib-mode source failed" >&2; exit 1; }
 }
 
-# ── (1) both halves defined after a lib-mode source ─────────────────────────────────────────────
-( source_lib; declare -F _tick_act >/dev/null || exit 1; declare -F _tick_render_reconcile >/dev/null || exit 1 ) \
-  || fail "the factored halves are not both defined after a lib-mode source (must be before the lib-return)"
+# ── (1) the watchdog + render half are defined; the deleted action pass is GONE ──────────────────
+(
+  source_lib
+  declare -F _tick_render_reconcile >/dev/null || exit 1
+  declare -F _engine_tick_watchdog  >/dev/null || exit 1
+  declare -F _tick_act >/dev/null && { echo "still-defined" >&2; exit 2; }
+  exit 0
+) || fail "post-cutover the watchdog + render half must be defined and _tick_act must be DELETED"
 pass
 
-# ── (2) structure: the guard wires the action pass; the action pass carries the merges/resolvers ──
+# ── (2) structure: the render half drives the action through the watchdog, which gates on the live tick
 (
   source_lib
   rbody="$(declare -f _tick_render_reconcile)"
-  # herd_engine_live_tick must appear BEFORE _tick_act in the render half (the guard order)
-  pre="${rbody%%_tick_act*}"
-  case "$pre" in *herd_engine_live_tick*) : ;; *) echo "no-guard" >&2; exit 1 ;; esac
-  abody="$(declare -f _tick_act)"
-  case "$abody" in *do_merge*spawn_resolver*) : ;; *) echo "no-action-pass" >&2; exit 1 ;; esac
-) || fail "_tick_render_reconcile must guard _tick_act behind herd_engine_live_tick, and _tick_act must carry the action pass (do_merge + spawn_resolver)"
+  case "$rbody" in *_engine_tick_watchdog*) : ;; *) echo "no-watchdog" >&2; exit 1 ;; esac
+  case "$rbody" in *_tick_act*) echo "still-calls-action-pass" >&2; exit 1 ;; *) : ;; esac
+  wbody="$(declare -f _engine_tick_watchdog)"
+  case "$wbody" in *herd_engine_live_tick*) : ;; *) echo "no-live-tick" >&2; exit 1 ;; esac
+) || fail "_tick_render_reconcile must drive the action pass via _engine_tick_watchdog, which gates on herd_engine_live_tick"
 pass
 
-# ── shared harness: stub every leaf the two halves call, so only the tick's control flow runs ─────
-# Records the ordered call trace to $TRACE; herd_engine_live_tick's return code (the tick owner) and
-# the trace path are injected per scenario.
-run_tick() {
-  local owner_rc="$1" trace="$2"
+# ── shared harness: drive _engine_tick_watchdog with the leaves stubbed as recorders ─────────────
+# $1 = a shell snippet defining herd_engine_live_tick (the tick outcome under test); prints the trace.
+run_watchdog() {
+  local live_def="$1" ticks="${2:-1}" trace="$T/wd.trace"
   (
     source_lib
     : > "$trace"
     _rec(){ printf '%s\n' "$1" >> "$trace"; }
-
-    # tick owner under test: 0 = Python owned this tick, non-zero = bash owns it
-    herd_engine_live_tick(){ _rec engine_live_tick; return "$owner_rc"; }
-
-    # the two things we assert on
+    # the engine-down side effects we assert on
+    journal_append(){ _rec "journal:$1"; }
+    herd_driver_notify(){ _rec "notify:$1"; }
     render(){ _rec render; }
-    _drain_spawn_queue(){ _rec drain; }
-    _tick_act(){ _rec ACT; }
-
-    # Phase A leaves → recorders / inert stubs
-    for fn in _sweep_gate_corpses _collect_main_health _sweep_lifecycle _sweep_trigger_tick \
-              _engine_seat_reconcile_tick build_header build_landed build_blocked \
-              build_tracker_drift build_spawn_holds build_engine_note build_engine_seat_note \
-              build_main_health _main_fresh_recheck build_main_freshness build_sweep_note \
-              build_health_headroom_note build_retiring build_celebrate build_pasture \
-              _inbox_scan build_operator_inbox _builder_notes_scan build_builder_notes; do
-      eval "$fn(){ :; }"
-    done
-    _prs_fetch_tick(){ PRS_JSON='[]'; PRS_LOOKUP_OK=1; }
-    herd_driver_agent_list_json(){ printf '{}'; }
-    retirement_tick(){ RETIRE_REAPED=0; }
-    _discover_feature_worktrees(){ :; }                 # no worktrees → the classification loop is skipped
-    _operator_inbox_enabled(){ return 1; }              # inbox off → _inbox_scan never reached
-
-    # Phase C leaves → recorders / inert stubs (the gated sweeps are held off via high intervals below)
-    for fn in _reconcile_resolver_panes _handle_coordinator_watchdog reconcile_main_freshness \
-              reconcile_map_freshness _self_restart_tick reconcile_main_health \
-              _sweep_orphan_tabs _sweep_tracker_state _sweep_journal_audit _sweep_merged_prs \
-              herd_engine_autoupdate_tick herd_engine_shadow_tick; do
-      eval "$fn(){ :; }"
-    done
-
-    # per-tick state the inline body reads (initialised after the lib-return in real runs)
-    MAIN="$T"; TREES="$T/trees"; DEFAULT_BRANCH="main"; DRYRUN=""
-    PRS_JSON='[]'; PRS_LOOKUP_OK=1; AGENTS_JSON='{}'; WT=""; RETIRE_REAPED=0
-    _INBOX_SCAN_TICK=0;   _INBOX_SCAN_INTERVAL=999
-    _ORPHAN_SWEEP_TICK=0; _ORPHAN_SWEEP_INTERVAL=999
-    _TRACKER_SWEEP_TICK=0; _TRACKER_SWEEP_INTERVAL=999
-    _PMS_SWEEP_TICK=0;    _PMS_SWEEP_INTERVAL=999
-    _ENGINE_TICK=0;       _ENGINE_INTERVAL=999
-
-    _tick_render_reconcile
+    # any bash action-pass leaf MUST NOT be reachable — record it loudly if it ever runs
+    do_merge(){ _rec ACTION:do_merge; }
+    spawn_resolver(){ _rec ACTION:spawn_resolver; }
+    post_gate_status(){ _rec ACTION:post_gate_status; }
+    _review_gate_step(){ _rec ACTION:review; }
+    _healthcheck_gate(){ _rec ACTION:health; }
+    # the tick outcome under test
+    eval "$live_def"
+    # watchdog state (initialised after the lib-return in real runs) — tuned tiny, DRYRUN skips sleeps
+    DRYRUN=1
+    ENGINE_DOWN_ROW=""
+    C_RED=""; C_BOLD=""; C_RESET=""; C_DIM=""
+    _ENGINE_FAULT_STREAK=0; _ENGINE_FAULT_MAX=3; _ENGINE_TICK_RETRIES=2; _ENGINE_BACKOFF_BASE=1
+    _ENGINE_DOWN_DECLARED=""
+    local i
+    for (( i=0; i<ticks; i++ )); do _engine_tick_watchdog || true; done
+    [ -n "$ENGINE_DOWN_ROW" ] && _rec "BANNER_SET"
   )
+  cat "$trace"
 }
 
-# an ordered-subsequence check: does $2 contain the space-separated markers of $1, in order?
-has_order() {
-  local want="$1" file="$2" line
-  while read -r line; do
-    grep -qxF "$line" "$file" || return 1
-  done < <(printf '%s\n' $want)
-  # order check
-  local prev=0 n
-  for tok in $want; do
-    n="$(grep -nxF "$tok" "$file" | head -1 | cut -d: -f1)"
-    [ -n "$n" ] || return 1
-    [ "$n" -ge "$prev" ] || return 1
-    prev="$n"
-  done
-  return 0
-}
-
-# ── (3) bash mode (byte-identical): render → action pass → drain, all in one cycle ───────────────
-BTRACE="$T/bash.trace"
-run_tick 1 "$BTRACE" || fail "bash-mode tick errored"
-grep -qxF ACT   "$BTRACE" || fail "bash mode: the action pass (_tick_act) did not run"
-grep -qxF render "$BTRACE" || fail "bash mode: the console did not render"
-grep -qxF drain  "$BTRACE" || fail "bash mode: the spawn queue did not drain"
-has_order "render ACT drain" "$BTRACE" || fail "bash mode: expected order render → action pass → drain"
+# ── (3) clean tick: succeeds, NO engine-down, NO bash action ─────────────────────────────────────
+CLEAN="$(run_watchdog 'herd_engine_live_tick(){ return 0; }' 1)"
+printf '%s\n' "$CLEAN" | grep -q '^journal:engine_down$'  && fail "clean tick must not journal engine_down"
+printf '%s\n' "$CLEAN" | grep -q '^BANNER_SET$'           && fail "clean tick must not set the engine-down banner"
+printf '%s\n' "$CLEAN" | grep -q '^ACTION:'               && fail "clean tick must run NO bash action pass (Python owns it)"
 pass
 
-# ── (4) python-owned tick: action pass SKIPPED, but console renders + spawn queue drains ─────────
-PTRACE="$T/py.trace"
-run_tick 0 "$PTRACE" || fail "python-owned tick errored"
-grep -qxF ACT   "$PTRACE" && fail "python-owned tick: the action pass must be SKIPPED (Python owns it)"
-grep -qxF render "$PTRACE" || fail "python-owned tick: the console must still render (instrument panel)"
-grep -qxF drain  "$PTRACE" || fail "python-owned tick: the spawn queue must still drain"
-has_order "render drain" "$PTRACE" || fail "python-owned tick: render must precede the drain leg"
+# ── (4) faulted tick: no bash action, and past the fault streak → loud banner + journal + one notify ─
+FAULT="$(run_watchdog 'herd_engine_live_tick(){ return 1; }' 3)"
+printf '%s\n' "$FAULT" | grep -q '^ACTION:' && fail "a faulted tick must run NO bash gate/merge/resolver (no action pass exists)"
+printf '%s\n' "$FAULT" | grep -q '^BANNER_SET$' || fail "past _ENGINE_FAULT_MAX faulty ticks the engine-down banner must be set"
+printf '%s\n' "$FAULT" | grep -q '^journal:engine_down$' || fail "engine down must be journaled"
+[ "$(printf '%s\n' "$FAULT" | grep -c '^journal:engine_down$')" = 1 ] || fail "engine_down must be journaled exactly once per episode"
+[ "$(printf '%s\n' "$FAULT" | grep -c '^notify:')" = 1 ] || fail "engine down must fire exactly one notification per episode"
 pass
 
-echo "ok — tick factoring: $PASS checks passed"
+echo "ok — post-cutover tick (HERD-306): $PASS checks passed"
