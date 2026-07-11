@@ -185,6 +185,7 @@ tick() {
   HERD_CONFIG_FILE="$scn/no-config" JOURNAL_FILE="$scn/journal.jsonl" HERD_JOURNAL_HERMETIC=1 \
   PROJECT_ROOT="$scn/main" BACKLOG_FILE="$scn/main/BACKLOG.md" SCRIBE_BACKEND=file \
   HERD_REMOTE=origin HERD_BRANCH_NAME=main WATCHER_OWNER=simop DEAD_GRACE_MIN=0 \
+  HERD_DISPOSABLE_WORKSPACE=1 \
     bash "$ART/tick.sh" 2>/dev/null
 }
 
