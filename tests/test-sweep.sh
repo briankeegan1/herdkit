@@ -56,7 +56,7 @@ WATCH="$HERE/../scripts/herd/agent-watch.sh"
 SWEEPSH="$HERE/../scripts/herd/sweep.sh"
 
 T="$(mktemp -d)"
-trap 'kill "${VICTIM:-}" "${LIVEWORKER:-}" 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill "${VICTIM:-}" "${LIVEWORKER:-}" "${SESS_WRAP:-}" "${SESS_BATS:-}" 2>/dev/null || true; rm -rf "$T"' EXIT
 PASS=0
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 ok(){ PASS=$((PASS+1)); }
@@ -162,7 +162,8 @@ render() { :; }
 for fn in sweep_main sweep_auto_mode sweep_scan_counts sweep_advice_line sweep_dead_marker_keys \
           sweep_orphan_procs sweep_run_safe_legs sweep_leg_worktrees sweep_leg_tabs \
           sweep_leg_markers sweep_leg_procs sweep_journal_advice_once _sweep_owns_path \
-          _sweep_live_marker_pids _orphan_tab_ids build_sweep_note _sweep_trigger_tick; do
+          _sweep_live_marker_pids _sweep_live_marker_sessions _sweep_sess_of \
+          _orphan_tab_ids build_sweep_note _sweep_trigger_tick; do
   type "$fn" >/dev/null 2>&1 || fail "(1) $fn not defined after sourcing"
 done
 case "$(_journal_file)" in "$T"/*) : ;; *) fail "(1) journal path escapes the sandbox: $(_journal_file)" ;; esac
@@ -209,6 +210,18 @@ cat > "$T/inuse-stub" <<EOF
 case "\${1:-}" in *tmp-inuse) exit 0 ;; *) exit 1 ;; esac
 EOF
 chmod +x "$T/inuse-stub"; export HERD_SWEEP_DIR_INUSE_CMD="$T/inuse-stub"
+# Session seam (HERD-348): resolve a pid's SESSION deterministically instead of shelling `os.getsid`,
+# so the session-exemption is exercised hermetically. A pid's session is the LEADER recorded for it in
+# sess-map ("<pid> <leader>" lines), else the pid itself — i.e. every process is its own session island
+# unless we explicitly place it in another's. So the genuine orphan VICTIM never shares a live worker's
+# session, while (19) plants a bats subtree that does.
+: > "$T/sess-map"
+cat > "$T/sess-stub" <<EOF
+#!/usr/bin/env bash
+led="\$(awk -v p="\${1:-}" '\$1==p{print \$2; exit}' "$T/sess-map" 2>/dev/null)"
+printf '%s' "\${led:-\${1:-}}"
+EOF
+chmod +x "$T/sess-stub"; export HERD_SWEEP_SESS_CMD="$T/sess-stub"
 
 # ── (6) attribution + live-marker exemption ──────────────────────────────────
 MAIN=/x/proj TREES=/x/proj-trees _sweep_owns_path /x/proj-other/t.sh \
@@ -221,6 +234,52 @@ printf '%s' "$PROCS" | grep -q "^$VICTIM	" || fail "(6) the orphan victim was no
 printf '%s' "$PROCS" | grep -q "^$LIVEWORKER	" && fail "(6) a LIVE gate worker was listed as an orphan — killing it strands the PR"
 printf '%s' "$PROCS" | grep -q '9999901' && fail "(6) a foreign project's process was listed as an orphan"
 ok; echo "PASS (6) attribution rejects sibling/foreign paths; a live gate worker is never an orphan"
+
+# ── (20) HERD-348: session exemption spares a detached gate worker's WHOLE subtree ────────────────
+# The python engine dispatches the health suite with start_new_session=True, so the worker is a session
+# LEADER and its `timeout … bats` subtree runs in a DIFFERENT process group inside that session (GNU
+# timeout re-groups its child). The marker records the worker PID — which is NOT the pid the sweep sees
+# for the reparented bats — so a pid-ONLY exemption reaps a LIVE suite mid-run: logs freeze, no outcome
+# lands, the inflight times out and re-dispatches forever (the #450/#451/#452 stall). The fix spares by
+# SESSION. Here SESS_BATS shares the live worker's session but carries its own pid/pgid.
+# NB: sourcing agent-watch.sh reassigned HERE to scripts/herd, so derive pysrc from the stable $WATCH.
+PYSRC="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc"
+bash -c 'sleep 60' & SESS_WRAP=$!; disown 2>/dev/null || true   # the detached worker (session leader)
+bash -c 'sleep 60' & SESS_BATS=$!; disown 2>/dev/null || true   # its bats subtree: own pid/pgid, same session
+printf '%s %s\n' "$SESS_BATS" "$SESS_WRAP" >> "$T/sess-map"     # bats' session leader is the worker
+SESSMARK="$TREESDIR/.health-inflight-919-sesssha"
+# leg (b): the REAL python worker writes its SESSION on the marker's 4th line. Assert the writer does so
+# — this is the "direct lookup" half of the fix (a candidate whose recorded session matches is spared
+# without any ps of the marker pid).
+PYTHONPATH="$PYSRC" python3 -c 'import sys
+from herd.live_runtime import _marker_write
+_marker_write(sys.argv[1], int(sys.argv[2]))' "$SESSMARK" "$SESS_WRAP" \
+  || fail "(20) real _marker_write raised"
+L4="$(sed -n '4p' "$SESSMARK" | tr -d '[:space:]')"
+EXP4="$(PYTHONPATH="$PYSRC" python3 -c 'import os,sys; print(os.getsid(int(sys.argv[1])))' "$SESS_WRAP")"
+[ -n "$L4" ] && [ "$L4" = "$EXP4" ] \
+  || fail "(20) leg-b: the python marker did not record the worker's session on line 4 (got '$L4', want '$EXP4')"
+# SURVIVE MID-SWEEP: with the marker live, neither the worker pid (marker-exempt) nor its bats subtree
+# (session-exempt) is listed as an orphan.
+cat > "$T/ps-sess" <<EOF
+#!/usr/bin/env bash
+printf '%s 1 %s bash %s/scripts/herd/healthcheck.sh %s/merged-clean\n' "$SESS_WRAP" "$SESS_WRAP" "$MAINDIR" "$TREESDIR"
+printf '%s 1 %s bash %s/scripts/herd/healthcheck.sh %s/merged-clean\n' "$SESS_BATS" "$SESS_BATS" "$MAINDIR" "$TREESDIR"
+EOF
+chmod +x "$T/ps-sess"
+_sweep_live_marker_sessions | grep -qx "$SESS_WRAP" \
+  || fail "(20) leg-a/b: the live marker's session was not reported"
+PROCS2="$(HERD_SWEEP_PS_CMD="$T/ps-sess" sweep_orphan_procs)"
+printf '%s' "$PROCS2" | grep -q "^$SESS_WRAP	" && fail "(20) the live worker (marker pid) was listed as an orphan"
+printf '%s' "$PROCS2" | grep -q "^$SESS_BATS	" \
+  && fail "(20) a LIVE suite's bats subtree (session-exempt) was reaped mid-run — the #450/#451/#452 stall"
+# GENUINE ORPHAN: once the marker is gone, nothing proves the session live, so the same bats IS reaped.
+rm -f "$SESSMARK"
+PROCS3="$(HERD_SWEEP_PS_CMD="$T/ps-sess" sweep_orphan_procs)"
+printf '%s' "$PROCS3" | grep -q "^$SESS_BATS	" \
+  || fail "(20) a genuinely orphaned bats (marker gone) must still be reaped"
+kill "$SESS_WRAP" "$SESS_BATS" 2>/dev/null || true
+ok; echo "PASS (20) a detached gate worker's whole subtree is session-exempt; a marker-gone orphan is still reaped"
 
 # ── (2) detection + console row ──────────────────────────────────────────────
 read -r C_TABS C_MARKERS C_PROCS <<< "$(sweep_scan_counts)"

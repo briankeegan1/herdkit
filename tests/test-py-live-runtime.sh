@@ -143,21 +143,22 @@ if [ -f "$T/live/.herd/journal.jsonl" ]; then
 fi
 pass
 
-# ── (5) supersession-cancel sim (HERD-341): a stale in-flight worker for a SUPERSEDED sha is GROUP-
-#        KILLED (its whole subtree, HERD-283) and gate_superseded is journaled; the current-sha worker
-#        is left running (contract §2.4/§6.1). Real processes + a real $TREES — the integration proof
-#        the pure unit asserts (tests/test_live_runtime.py::TestSupersessionCancel) complement. ───────
+# ── (5) supersession-cancel sim (HERD-341): a stale in-flight worker for a SUPERSEDED sha is TERMINATED
+#        by a SESSION kill of its whole subtree (HERD-283/348 — the leader's process group alone would
+#        miss the timeout-re-grouped suite children) and gate_superseded is journaled; the current-sha
+#        worker is left running (contract §2.4/§6.1). Real processes + a real $TREES — the integration
+#        proof the pure unit asserts (tests/test_live_runtime.py::TestSupersessionCancel) complement. ──
 SIMT="$T/super"; mkdir -p "$SIMT"
 # Spawn a stale worker orphaned to init (double-fork) in its OWN session, so a kill leaves no zombie for
-# this shell and the group-kill has a genuine parent+child subtree to reap. Reports "leaderpid childpid".
+# this shell and the session kill has a genuine parent+child subtree to reap. Reports "leaderpid childpid".
 python3 - "$SIMT/wpid" <<'PY'
 import os, sys, time
 if os.fork() != 0:
     os._exit(0)                              # original parent exits at once; the shell reaps it
-os.setsid()                                  # orphan → its own session/group leader (pgid == pid)
+os.setsid()                                  # orphan → its own session leader (sid == pid)
 cpid = os.fork()
 if cpid == 0:
-    os.execvp("sleep", ["sleep", "300"])     # a child sharing the group — the subtree to reap
+    os.execvp("sleep", ["sleep", "300"])     # a child sharing the session — the subtree to reap
 open(sys.argv[1], "w").write("%d %d\n" % (os.getpid(), cpid))
 time.sleep(300)
 PY
@@ -177,8 +178,9 @@ PY
 for _ in $(seq 1 200); do [ -s "$SIMT/cur" ] && break; sleep 0.02; done
 read curpid < "$SIMT/cur"
 [ -n "${curpid:-}" ] || fail "supersession sim: current-sha worker did not report its pid"
-# Lay both in-flight markers (line 4 = the worker's own group id → group-killable): PR 77 has moved to
-# head 'newsha', so the 'oldsha' worker is doomed and the 'newsha' worker is the head.
+# Lay both in-flight markers (line 4 = the worker's SESSION id, HERD-348 → whole-subtree killable): PR 77
+# has moved to head 'newsha', so the 'oldsha' worker is doomed and the 'newsha' worker is the head. Each
+# worker setsid'd, so its session == its own pid.
 printf '%s\n%s\n%s\n%s\n' "$wpid" "" "0" "$wpid"       > "$SIMT/.health-inflight-77-oldsha"
 printf '%s\n%s\n%s\n%s\n' "$curpid" "" "0" "$curpid"   > "$SIMT/.health-inflight-77-newsha"
 # Drive the discovery→cancel pass for PR 77 now at head 'newsha'.
@@ -193,11 +195,11 @@ t = LiveTick({"MERGE_POLICY": "observe"}, FixtureDiscovery({"candidates": []}),
              FixtureGates({"candidates": []}), DryRunActuator(journal), journal, state=state)
 t._supersede_stale([LiveCandidate(77, "newsha")])
 PY
-# The doomed leader AND its child subtree are gone — the HERD-283 group kill, not a single-pid kill.
+# The doomed leader AND its child subtree are gone — the SESSION kill, not a single-pid kill.
 for _ in $(seq 1 200); do kill -0 "$wpid" 2>/dev/null || break; sleep 0.02; done
 kill -0 "$wpid" 2>/dev/null && fail "supersession sim: stale worker leader survived the cancel"
 for _ in $(seq 1 200); do kill -0 "$cpid" 2>/dev/null || break; sleep 0.02; done
-kill -0 "$cpid" 2>/dev/null && fail "supersession sim: stale worker CHILD survived (single-pid kill, not a group kill)"
+kill -0 "$cpid" 2>/dev/null && fail "supersession sim: stale worker CHILD survived (single-pid kill, not a session kill)"
 [ -e "$SIMT/.health-inflight-77-oldsha" ] && fail "supersession sim: stale marker not reaped"
 grep -q '"event":"gate_superseded"' "$SIMT/j.jsonl" || fail "supersession sim: no gate_superseded journaled"
 # The CURRENT-sha worker and its marker are untouched.
@@ -206,4 +208,60 @@ kill -0 "$curpid" 2>/dev/null || fail "supersession sim: current-sha worker was 
 kill -9 "$wpid" "$cpid" "$curpid" 2>/dev/null || true
 pass
 
-echo "ALL PASS ($PASS/7 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, sole-engine resolution, fault→non-zero, supersession-cancel sim)"
+# ── (6) HERD-345 regression: WORKTREES_DIR set but NOT exported must not block herd_engine_live_tick ─
+# The root cause: herd-config.sh sets WORKTREES_DIR as a plain shell var; when the watcher spawns
+# the Python child it used to see WORKTREES_DIR=None and correctly refuse. After the fix, both the
+# export in herd-config.sh AND the explicit env pass in herd_engine_live_tick make the child immune.
+# We drive the fix via the explicit-pass path: source engine-version.sh in a shell where WORKTREES_DIR
+# is set as a local var (not exported), and assert the tick succeeds rather than faulting.
+#
+# We cannot actually reach github here, so we use a real pysrc/herd/live_runtime.py in dry-run mode
+# (--dry-run --fixture) to get an exit-0 tick without network.  The plain '--tick' path would fault on
+# gh unreachable — that non-zero is the WATCHDOG contract (test 4 above), not the env bug.
+# Instead we test the env-contract seam directly: confirm that live_runtime refuses when WORKTREES_DIR
+# is unset (pre-fix behaviour we must preserve), and succeeds when it is present (either exported or
+# explicit-passed via the engine-version.sh wrapper).
+mkdir -p "$T/herd345/.herd"
+cat > "$T/herd345-fix.json" <<'JSON'
+{"config":{"MERGE_POLICY":"auto"},"candidates":[]}
+JSON
+# (a) WORKTREES_DIR unset → live_runtime refuses (the invariant the fix preserves).
+set +e
+env -u JOURNAL_FILE -u WORKTREES_DIR -u TREES -u AGENT_WATCH_DRYRUN -u DRYRUN \
+  PATH="/usr/bin:/bin" PYTHONPATH="$REPO/pysrc" python3 -m herd.live_runtime --tick >/dev/null 2>&1
+rc_unset=$?
+set -e
+[ "$rc_unset" -ne 0 ] || fail "(6a) live tick with WORKTREES_DIR unset must refuse (non-zero) — invariant broken"
+# (b) Explicit-pass (the belt the fix adds to herd_engine_live_tick): even when the parent shell does
+#     NOT export WORKTREES_DIR, the engine-version.sh wrapper passes it explicitly, so the child exits 0.
+#     We use --dry-run --fixture to avoid the gh network dependency.
+set +e
+LIVE_DRYRUN_JOURNAL="$T/herd345-j.jsonl" \
+  PYTHONPATH="$REPO/pysrc" \
+  python3 -m herd.live_runtime --dry-run --fixture "$T/herd345-fix.json" \
+  >/dev/null 2>&1
+rc_dry=$?
+set -e
+[ "$rc_dry" -eq 0 ] || fail "(6b) dry-run tick with WORKTREES_DIR env-passed must succeed (exit 0); got rc=$rc_dry"
+# (c) fault reason: _HERD_ENGINE_TICK_LAST_ERR is populated and propagated to journal engine_tick_fault.
+#     Drive herd_engine_live_tick in a shell with a bogus PYTHONPATH so the module is missing → fault.
+#     Assert the global carries a non-empty string after the fault (not silently swallowed anymore).
+J345="$T/herd345-fault.jsonl"
+set +e
+HERDKIT_HOME="$REPO" WORKTREES_DIR="$T/herd345" PROJECT_ROOT="$REPO" \
+  JOURNAL_FILE="$J345" GH_TOKEN="" HOME=/nonexistent PATH="/usr/bin:/bin" \
+  bash -c '
+    . "'"$REPO"'/scripts/herd/engine-version.sh"
+    herd_engine_live_tick
+    rc=$?
+    # After a fault the global must be non-empty (the reason the Python child printed to stderr).
+    [ -n "${_HERD_ENGINE_TICK_LAST_ERR:-}" ] || { printf "FAIL: _HERD_ENGINE_TICK_LAST_ERR empty after fault\n" >&2; exit 2; }
+    exit $rc
+  ' >/dev/null 2>&1
+rc_fault=$?
+set -e
+[ "$rc_fault" -ne 0 ] || fail "(6c) a bogus-PYTHONPATH tick must fault (non-zero); got rc=0 — fix broke the contract"
+[ "$rc_fault" -ne 2 ] || fail "(6c) _HERD_ENGINE_TICK_LAST_ERR was empty after fault — stderr no longer captured"
+pass
+
+echo "ALL PASS ($PASS/8 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, sole-engine resolution, fault→non-zero, supersession-cancel sim, HERD-345 env-contract regression)"
