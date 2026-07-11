@@ -177,6 +177,7 @@ EXEMPT_NAMES = {
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
     "TAB", "TEMPLATES_DIR", "TMPDIR", "TRACKER_DRIFT", "TREES", "TSWEEP_LIMIT", "WPANE",
     "WT",  # agent-watch.sh: git worktree list --porcelain for this tick
+    "HOSTNAME",  # bash shell built-in (set by the shell, never a .herd/config knob)
 }
 def exempt(k, declared, file_locals):
     if k in declared:        # already declared → not a ghost
