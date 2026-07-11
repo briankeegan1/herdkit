@@ -32,4 +32,4 @@ dependencies — python3 is already a hard engine dep; NONE are added here.
 """
 
 __all__ = ["why", "log", "cost", "status", "decisions", "statemachine", "parity", "driver",
-           "shadow_journal", "shadow_runtime", "fixture_extract", "live_runtime"]
+           "shadow_journal", "shadow_runtime", "fixture_extract", "live_runtime", "store"]
