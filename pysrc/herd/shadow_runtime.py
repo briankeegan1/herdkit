@@ -180,13 +180,43 @@ class Candidate:
     gate; ``health`` ∈ CLEAN|FLAKY|CODEERROR the health rail; ``review`` ∈ PASS|BLOCK|INFRA the
     review rail; ``hv_hold`` / ``approved`` the hold decision. ``supersede_to`` + ``supersede_at``
     script a new-sha supersession fired while the named stage is in-flight.
+
+    THE PER-CANDIDATE GATE SCHEDULE (HERD-335, P3j — the concurrency-parity burn-down). A real
+    candidate does NOT always traverse the whole health→review→merge DAG: the concurrency scenario
+    injects some subjects DIRECTLY at the review gate (a planted verdict file, never a healthcheck),
+    and the drain PRs are re-gated across ticks so their health result is served from CACHE the
+    second time. ``fixture_extract`` reads the actual stage schedule each candidate walked out of the
+    real journal and carries it here (contract §2.1 the candidate pass, §3.4 the caching family), so
+    the shadow re-walks the SAME schedule instead of a one-size gate:
+
+      * ``skip_health`` — the candidate entered at the REVIEW gate (no ``healthcheck_started`` in the
+        real run); the state machine still advances INTAKE→HEALTH→REVIEW, but no health-rail events
+        are journaled (an injected reviewer probe — 921-925/941/900 in the sim).
+      * ``health_attempted`` / ``cache_hit`` — the health-result caching family (§3.4): a first run
+        journals ``healthcheck_attempted`` then ``healthcheck_outcome``; a later re-gate on the same
+        sha serves ``healthcheck_cache_hit`` instead of re-running (the ``sha-keyed cache`` §2.4).
+      * ``stop_after`` ∈ {None, "verdict", "dispatch"} — where the candidate's real event stream
+        stopped. ``None`` = the full pipeline (dispatch → verdict → blessing → merge/hold, the drain
+        PRs). ``"verdict"`` = a planted verdict was RECORDED but nothing dispatched or merged (the
+        injected breaker-test verdicts — a BLOCK never bounced a builder, a PASS never merged).
+        ``"dispatch"`` = a reviewer was dispatched but torn down before any verdict (the restart
+        probe). This is the "concurrency slot serialization" the port must not over-emit: an injected
+        review-only subject must not manufacture a healthcheck run or a merge the bash tree never did.
+      * ``post_merge`` — the merge was followed by the post-merge housekeeping the watcher runs
+        (``symbol_index_refresh`` + ``reap``, agent-watch.sh post-merge; §3.4).
+
+    All default to the pre-P3j behavior (full DAG, no caching, no housekeeping), so a candidate that
+    carries none of them emits BYTE-IDENTICALLY to before this change — every existing test/caller.
     """
 
     __slots__ = ("pr", "sha", "slug", "stale", "health", "review", "hv_hold", "approved",
-                 "supersede_to", "supersede_at")
+                 "supersede_to", "supersede_at", "skip_health", "health_attempted", "cache_hit",
+                 "stop_after", "post_merge", "pin_soft", "pin_reason")
 
     def __init__(self, pr, sha, slug="", stale=False, health="CLEAN", review="PASS",
-                 hv_hold=False, approved=False, supersede_to=None, supersede_at=None):
+                 hv_hold=False, approved=False, supersede_to=None, supersede_at=None,
+                 skip_health=False, health_attempted=False, cache_hit=False,
+                 stop_after=None, post_merge=False, pin_soft=False, pin_reason=""):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
@@ -197,6 +227,16 @@ class Candidate:
         self.approved = bool(approved)
         self.supersede_to = supersede_to
         self.supersede_at = supersede_at
+        self.skip_health = bool(skip_health)
+        self.health_attempted = bool(health_attempted)
+        self.cache_hit = bool(cache_hit)
+        self.stop_after = stop_after if stop_after in ("verdict", "dispatch") else None
+        self.post_merge = bool(post_merge)
+        # A review-rail soft-pin note (herd-review.sh live-diff fallback) emitted INLINE right before
+        # the reviewer is dispatched — the concurrency scenario's stub reviewer path. Carries its own
+        # reason (a semantic field the parity oracle does NOT canonicalize, so it must match verbatim).
+        self.pin_soft = bool(pin_soft)
+        self.pin_reason = pin_reason or ""
 
     @classmethod
     def from_dict(cls, d):
@@ -206,12 +246,26 @@ class Candidate:
             review=d.get("review", "PASS"), hv_hold=d.get("hv_hold", False),
             approved=d.get("approved", False),
             supersede_to=d.get("supersede_to"), supersede_at=d.get("supersede_at"),
+            skip_health=d.get("skip_health", False),
+            health_attempted=d.get("health_attempted", False),
+            cache_hit=d.get("cache_hit", False),
+            stop_after=d.get("stop_after"), post_merge=d.get("post_merge", False),
+            pin_soft=d.get("pin_soft", False), pin_reason=d.get("pin_reason", ""),
         )
 
     def respun(self, new_sha):
-        """A copy of this candidate at a new sha — its supersession is single-shot (cleared)."""
+        """A copy of this candidate at a new sha — its supersession is single-shot (cleared).
+
+        The gate schedule (skip_health / caching / stop_after / post_merge) is a property of the
+        SUBJECT, not the sha, so a re-gate on a fresh sha carries it forward — a re-gated drain PR
+        still caches + housekeeps exactly as its first sha did.
+        """
         return Candidate(self.pr, new_sha, self.slug, self.stale, self.health, self.review,
-                         self.hv_hold, self.approved, supersede_to=None, supersede_at=None)
+                         self.hv_hold, self.approved, supersede_to=None, supersede_at=None,
+                         skip_health=self.skip_health, health_attempted=self.health_attempted,
+                         cache_hit=self.cache_hit, stop_after=self.stop_after,
+                         post_merge=self.post_merge, pin_soft=self.pin_soft,
+                         pin_reason=self.pin_reason)
 
 
 class ShadowWatcher:
@@ -224,7 +278,7 @@ class ShadowWatcher:
 
     def __init__(self, config=None, journal=None, stage_delay=0.0,
                  panels=None, steps=None, gate_statuses=None,
-                 main_healths=None, push_holds=None):
+                 main_healths=None, push_holds=None, main_events=None, fairness=None):
         cfg = config or {}
         self.config = cfg
         self.journal = journal or ShadowJournal()
@@ -249,6 +303,19 @@ class ShadowWatcher:
         # candidate-only fixture (every existing caller/test) emits byte-identically to before.
         self._main_healths = list(main_healths or [])
         self._push_holds = list(push_holds or [])
+        # ── Verbatim-replay engine families the concurrency scenario also drives (HERD-335, P3j) ──
+        # The MAIN fast-forward / freshness reconcile (agent-watch.sh:reconcile_main_freshness — main_ff
+        # / main_freshness §3.4) and the MERGE-FAIRNESS reorder + starvation counter (agent-watch.sh:
+        # _merge_fairness_reorder / _restale_note — merge_fairness_priority / pr_restale / pr_starvation
+        # §6.2) are REAL engine families that are NOT gate subjects (no candidate pass): a fairness
+        # re-stale is a fixed-point of the SCHEDULER, not a health/review verdict on a sha. Like the
+        # main-health / push-hold families, fixture_extract folds them out of the real journal into
+        # ordered lists the shadow replays VERBATIM (each entry is one journalled event, non-volatile
+        # fields carried through), so the head-to-head sees them family-for-family. Both DEFAULT EMPTY —
+        # a candidate-only fixture emits byte-identically to before this seam. NEVER shadow_* frames, so
+        # the parity oracle's leg-1 filter passes them through untouched.
+        self._main_events = list(main_events or [])
+        self._fairness = list(fairness or [])
         # Rail concurrency ceilings, sized from the knobs (contract §2.3). A garbage/absent value
         # coerces to the documented default (2 review, 1 health) — a typo never unbounds a rail. The
         # Semaphores themselves are created in run_async, once the event loop is running: an
@@ -375,7 +442,18 @@ class ShadowWatcher:
             if self._stage_delay:
                 await asyncio.sleep(self._stage_delay)
             outcome = cand.health if cand.health in ("CLEAN", "FLAKY", "CODEERROR") else "CLEAN"
+            # The health-result caching family (contract §3.4). A candidate whose real run RAN the
+            # suite journals a `healthcheck_attempted{result}` before the outcome; one whose sha was
+            # already gated serves `healthcheck_cache_hit{outcome}` on the re-gate instead of re-running
+            # (the sha-keyed cache, §2.4). Both are OFF by default (a candidate that carries neither
+            # emits exactly the pre-P3j started+outcome pair), so every existing test is byte-identical.
+            if cand.health_attempted:
+                self.journal.append("healthcheck_attempted", pr=cand.pr, slug=cand.slug,
+                                    result=outcome.lower())
             self.journal.append("healthcheck_outcome", pr=cand.pr, slug=cand.slug, outcome=outcome)
+            if cand.cache_hit:
+                self.journal.append("healthcheck_cache_hit", pr=cand.pr, slug=cand.slug,
+                                    sha=cand.sha, outcome=outcome)
             return {"CLEAN": "health_clean", "FLAKY": "health_flaky",
                     "CODEERROR": "health_codeerror"}[outcome]
 
@@ -390,11 +468,27 @@ class ShadowWatcher:
         ``infra_event`` instead, so an outage can never cache as a per-PR code BLOCK.
         """
         async def body():
-            self.journal.append("review_dispatched", pr=cand.pr, sha=cand.sha, pid=0,
-                                model="(shadow)", log_path="(shadow)", pin=cand.sha)
-            await self._maybe_inject_supersession(cand, "review")
-            if self._stage_delay:
-                await asyncio.sleep(self._stage_delay)
+            # A planted verdict (``stop_after == "verdict"``) was RECORDED into the ledger without a
+            # reviewer ever being dispatched (the sim injects it via a result file, agent-watch.sh's
+            # _review_gate_step then just collects it), so it emits NO review_dispatched — modeling it
+            # would over-emit a dispatch the bash tree never journaled (contract §3.2 provenance).
+            if cand.stop_after != "verdict":
+                # The soft-pin note is a review-rail event journaled INLINE right before the dispatch
+                # (herd-review.sh live-diff fallback); a candidate that carried one in the real run
+                # emits it here so its placement matches, instead of being buffered into an end panel.
+                if cand.pin_soft:
+                    self.journal.append("review_pin_soft", pr=cand.pr, sha=cand.sha,
+                                        reason=cand.pin_reason)
+                self.journal.append("review_dispatched", pr=cand.pr, sha=cand.sha, pid=0,
+                                    model="(shadow)", log_path="(shadow)", pin=cand.sha)
+                await self._maybe_inject_supersession(cand, "review")
+                if self._stage_delay:
+                    await asyncio.sleep(self._stage_delay)
+            # A reviewer that was dispatched but torn down before any verdict (``stop_after ==
+            # "dispatch"`` — the mid-review restart probe): a dispatch is journaled, no verdict is ever
+            # collected. Return the dispatch-only sentinel so the gate walk stops without a verdict.
+            if cand.stop_after == "dispatch":
+                return "review_dispatch_only"
             verdict = cand.review if cand.review in ("PASS", "BLOCK", "INFRA") else "PASS"
             if verdict == "INFRA":
                 # Infra death: not a verdict. Bounded retry + breaker; forensic record is infra_event.
@@ -422,27 +516,47 @@ class ShadowWatcher:
             return HOLD
 
         # 2. health rail (deterministic-slow). dispatch_health advances INTAKE → HEALTH.
-        self._advance(cand, "dispatch_health")
-        health = await self._health_rail(cand)  # returns the health OUTCOME event name
-        self._advance(cand, health)
-        if health == "health_codeerror":
-            self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
-                                round=self._next_refix_round(cand.pr, "healthcheck"),
-                                agent_status_before="idle", rule="healthcheck",
-                                location="(shadow)")
-            return BLOCK
+        #    A candidate that entered at the REVIEW gate (``skip_health`` — an injected reviewer probe
+        #    the real run never healthchecked) still walks the lifecycle INTAKE→HEALTH→REVIEW so the
+        #    state machine stays legal, but journals NO health-rail events (the transitions are
+        #    shadow_state frames the parity oracle filters). This is the concurrency scenario's
+        #    review-injected subject: modeling a healthcheck for it would over-emit vs the bash tree.
+        if cand.skip_health:
+            self._advance(cand, "dispatch_health")
+            self._advance(cand, "health_clean")
+        else:
+            self._advance(cand, "dispatch_health")
+            health = await self._health_rail(cand)  # returns the health OUTCOME event name
+            self._advance(cand, health)
+            if health == "health_codeerror":
+                self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
+                                    round=self._next_refix_round(cand.pr, "healthcheck"),
+                                    agent_status_before="idle", rule="healthcheck",
+                                    location="(shadow)")
+                return BLOCK
 
-        # 3. review rail (LLM). The rail returns the verdict EVENT (review_pass|review_block|review_infra).
+        # 3. review rail (LLM). The rail returns the verdict EVENT (review_pass|review_block|review_infra),
+        #    or the dispatch-only sentinel for a torn-down reviewer (stop_after == "dispatch").
         verdict = await self._review_rail(cand)
+        if verdict == "review_dispatch_only":
+            return ESCALATE                # dispatched, no verdict collected: never blessed, never merged
         self._advance(cand, verdict)
         if verdict == "review_infra":
             return ESCALATE
         if verdict == "review_block":
-            self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
-                                round=self._next_refix_round(cand.pr, "review"),
-                                agent_status_before="idle", rule="review",
-                                location="(shadow)")
+            # An INJECTED verdict (stop_after == "verdict") was only RECORDED — it never bounced a
+            # builder, so it journals no refix_bounce (the sim plants the verdict file directly). A
+            # real gated BLOCK still bounces exactly as before.
+            if cand.stop_after != "verdict":
+                self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
+                                    round=self._next_refix_round(cand.pr, "review"),
+                                    agent_status_before="idle", rule="review",
+                                    location="(shadow)")
             return BLOCK
+        # 3b. A recorded-only PASS (stop_after == "verdict" — an injected breaker-recovery probe): the
+        #     verdict is on the ledger but the harness never blessed or merged it. Stop after the verdict.
+        if cand.stop_after == "verdict":
+            return PASS
 
         # 4. the blessing — both rails passed (review_pass advanced REVIEW → BLESSED above). The
         #    cross-seat shared artifact herd/gates=success (contract §2.3). Shadow: journal only, no
@@ -478,6 +592,14 @@ class ShadowWatcher:
         self.journal.append("merge", pr=cand.pr, slug=cand.slug, sha=cand.sha,
                             method="squash", reason="gates_passed")
         self._merged_prs.append(cand.pr)
+        # POST-MERGE HOUSEKEEPING (contract §3.4): a real merge is followed by the watcher's post-merge
+        # pass — a symbol-index refresh (skipped when no index is present) then the worktree reap. The
+        # shadow re-journals both when the candidate's real run showed them (``post_merge``); OFF by
+        # default so a merge without the flag emits exactly the pre-P3j lone ``merge`` event.
+        if cand.post_merge:
+            self.journal.append("symbol_index_refresh", pr=cand.pr, result="skipped",
+                                reason="no-index")
+            self.journal.append("reap", pr=cand.pr, slug=cand.slug, sha=cand.sha, reason="merged")
         held = getattr(SM, "HOLD", "HOLD")
         for other_pr, st in self._state.items():
             if other_pr != cand.pr and st == held:
@@ -503,6 +625,16 @@ class ShadowWatcher:
                 self.journal.append("main_health", pr=pr, sha=sha, result="dispatched",
                                     pid=0, log_path="/shadow-tmp/.health-log-main-%s" % sha,
                                     provenance=mh.get("provenance", "merge"))
+            # A suite KILLED mid-flight (agent-watch.sh corpse sweep, contract §3.4 / HERD-222): the
+            # first dispatch died, journaling an ``infra_event{reason:health_died}`` keyed by the sha,
+            # and the very next tick RE-DISPATCHED the same sha (it must never strand unchecked). When
+            # the real run showed that, replay the died marker + the re-dispatch before the result.
+            if mh.get("died"):
+                self.journal.append("infra_event", component="agent-watch", reason="health_died",
+                                    key="main-%s" % sha)
+                self.journal.append("main_health", pr=pr, sha=sha, result="dispatched",
+                                    pid=0, log_path="/shadow-tmp/.health-log-main-%s" % sha,
+                                    provenance=mh.get("redispatch_provenance", "died"))
             result = mh.get("result", "green")
             if result == "red":
                 self.journal.append("main_health", pr=pr, sha=sha, result="red",
@@ -546,12 +678,16 @@ class ShadowWatcher:
             slug = panel.get("slug", "")
             sha = panel.get("sha", "")
             panelists = panel.get("panelists", [])
-            # 1. log-retention bookkeeping — one per review dispatch (herd-review.sh:541). The path
-            #    mirrors the real mktemp shape ($TMPDIR//herd-review-<pr>-<rand>, TMPDIR carrying a
+            # 1. log-retention bookkeeping — one per herd-review.sh dispatch (herd-review.sh:541). The
+            #    path mirrors the real mktemp shape ($TMPDIR//herd-review-<pr>-<rand>, TMPDIR carrying a
             #    trailing slash) so it canonicalizes to the same <PATH>/<PATH> as the bash tree; the
             #    parity canonicalizer neutralizes the tmp path either way (it carries no meaning).
-            self.journal.append("review_log_retained", pr=pr, slug=slug,
-                                path="/shadow-tmp//herd-review-%s" % pr, keep=panel.get("keep", 5))
+            #    SUPPRESSED when the real subject carried no review_log_retained (``log_retained`` is
+            #    False) — a plain review-rail pin note with no herd-review log row (the concurrency
+            #    scenario's stub reviewer, HERD-335), so emitting it would over-emit vs the bash tree.
+            if panel.get("log_retained", True):
+                self.journal.append("review_log_retained", pr=pr, slug=slug,
+                                    path="/shadow-tmp//herd-review-%s" % pr, keep=panel.get("keep", 5))
             # 2. soft-pin note: shadow never has real pin objects, so the live-diff fallback fires
             #    (herd-review.sh:585). pin_mode carried from the fixture (empty in the sim).
             self.journal.append("review_pin_soft", pr=pr, sha=sha,
@@ -662,6 +798,35 @@ class ShadowWatcher:
                                 state=g.get("state", "success"),
                                 context=g.get("context", "herd/gates"))
 
+    # ── verbatim-replay families (main_ff / main_freshness / fairness; contract §3.4, §6.2) ────────
+    def _replay(self, entries):
+        """Replay a list of ``{event, …fields}`` dicts VERBATIM through the journal, in order.
+
+        Each entry is one journalled event fixture_extract folded out of the real journal; its
+        non-volatile fields are re-emitted exactly (positional (k, v) pairs so a JSON key that is a
+        Python reserved word — ``from`` on ``main_ff`` — is carried without a keyword-arg clash). This
+        is the same faithful-replay model panels/steps/main_health use for their non-candidate
+        families: the shadow does not RE-DERIVE a scheduler re-stale or a fast-forward, it re-emits
+        the family the bash tree already journaled so the head-to-head matches event-for-event.
+        """
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("event")
+            if not name:
+                continue
+            pairs = [(k, v) for k, v in entry.items() if k != "event"]
+            self.journal.append(name, *pairs)
+
+    def _emit_main_events(self):
+        """Replay the MAIN fast-forward / freshness reconcile (main_ff / main_freshness, §3.4)."""
+        self._replay(self._main_events)
+
+    def _emit_fairness(self):
+        """Replay the merge-fairness reorder + starvation counter (merge_fairness_priority /
+        pr_restale / pr_starvation, contract §6.2)."""
+        self._replay(self._fairness)
+
     async def _process_candidate(self, cand):
         """Process one candidate to a terminal, re-gating a fresh sha on supersession.
 
@@ -703,19 +868,29 @@ class ShadowWatcher:
         self.journal.append("shadow_tick_start", candidates=len(candidates), impl="python-shadow",
                             statemachine="p3b" if _HAVE_P3B else "fallback")
 
+        # The post-merge MAIN-HEALTH tripwire is journalled by the bash tree BEFORE the candidate drain
+        # in the concurrency scenario (the path-sorted union puts the main-health leg's journal first),
+        # so the shadow emits it up front too — the alignment differ needs the two streams in the same
+        # order to match a run, not just the same multiset (HERD-335). A candidate-only fixture has no
+        # main_healths, so this is a no-op there and the tick still opens with the task group.
+        self._emit_main_healths()
+
         async with _task_group() as tg:
             for cand in candidates:
                 tg.create_task(self._process_candidate(cand))
 
-        # The non-candidate sub-pipelines the scenario also exercises, emitted SERIALLY after the
+        # The remaining non-candidate sub-pipelines the scenario exercises, emitted SERIALLY after the
         # candidate task group settles (deterministic order for the parity diff; all no-ops when their
-        # fixture lists are empty, i.e. every candidate-only run). Order mirrors the sim's path-sorted
-        # leg order — main-health, push-holds, panels, steps, then the gate-status post.
-        self._emit_main_healths()
+        # fixture lists are empty, i.e. every candidate-only run). Order mirrors the sim's leg order —
+        # push-holds, panels, steps, the gate-status post, then the MAIN reconcile (main_ff /
+        # main_freshness) and the merge-FAIRNESS reorder + starvation counter, which the scenario runs
+        # after the candidate drain.
         self._emit_push_holds()
         self._emit_review_panels()
         self._emit_pipeline_steps()
         self._emit_gate_statuses()
+        self._emit_main_events()
+        self._emit_fairness()
 
         self.journal.append("shadow_tick_end", merged=len(self._merged_prs))
         return {
@@ -840,7 +1015,9 @@ def main(argv=None):
                             panels=scenario.get("panels"), steps=scenario.get("steps"),
                             gate_statuses=scenario.get("gate_statuses"),
                             main_healths=scenario.get("main_healths"),
-                            push_holds=scenario.get("push_holds"))
+                            push_holds=scenario.get("push_holds"),
+                            main_events=scenario.get("main_events"),
+                            fairness=scenario.get("fairness"))
     result = watcher.run(candidates)
     # P4 store-backend seam (HERD-305): surface the resolved mutable-state backend so a sim can drive
     # the SAME shadow scenario on BOTH substrates and assert identical decisions. SHIP-DORMANT: with the
