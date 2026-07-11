@@ -131,6 +131,7 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 POSTMERGE_SWEPT_LEDGER="$TREES/.agent-watch-postmerge-swept"
 DEFAULT_BRANCH="main"; DRYRUN=""; WORKSPACE_NAME="simws"; export WORKSPACE_NAME
+export HERD_DISPOSABLE_WORKSPACE=1  # sim creates/tears down its own stub tabs (HERD-310 guard)
 
 # The scribe drainer is out of scope: log the enqueue instead of spawning it. ($HERE is read at call
 # time by reconcile_backlog, so redirecting it after sourcing captures every enqueue.)
