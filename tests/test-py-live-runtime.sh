@@ -143,4 +143,67 @@ if [ -f "$T/live/.herd/journal.jsonl" ]; then
 fi
 pass
 
-echo "ALL PASS ($PASS/6 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, sole-engine resolution, fault→non-zero)"
+# ── (5) supersession-cancel sim (HERD-341): a stale in-flight worker for a SUPERSEDED sha is GROUP-
+#        KILLED (its whole subtree, HERD-283) and gate_superseded is journaled; the current-sha worker
+#        is left running (contract §2.4/§6.1). Real processes + a real $TREES — the integration proof
+#        the pure unit asserts (tests/test_live_runtime.py::TestSupersessionCancel) complement. ───────
+SIMT="$T/super"; mkdir -p "$SIMT"
+# Spawn a stale worker orphaned to init (double-fork) in its OWN session, so a kill leaves no zombie for
+# this shell and the group-kill has a genuine parent+child subtree to reap. Reports "leaderpid childpid".
+python3 - "$SIMT/wpid" <<'PY'
+import os, sys, time
+if os.fork() != 0:
+    os._exit(0)                              # original parent exits at once; the shell reaps it
+os.setsid()                                  # orphan → its own session/group leader (pgid == pid)
+cpid = os.fork()
+if cpid == 0:
+    os.execvp("sleep", ["sleep", "300"])     # a child sharing the group — the subtree to reap
+open(sys.argv[1], "w").write("%d %d\n" % (os.getpid(), cpid))
+time.sleep(300)
+PY
+for _ in $(seq 1 200); do [ -s "$SIMT/wpid" ] && break; sleep 0.02; done
+read wpid cpid < "$SIMT/wpid"
+[ -n "${wpid:-}" ] && [ -n "${cpid:-}" ] || fail "supersession sim: worker did not report its pids"
+kill -0 "$wpid" 2>/dev/null || fail "supersession sim: stale worker not alive before cancel"
+# A live worker for the CURRENT head sha, to prove it is PRESERVED.
+python3 - "$SIMT/cur" <<'PY'
+import os, sys, time
+if os.fork() != 0:
+    os._exit(0)
+os.setsid()
+open(sys.argv[1], "w").write("%d\n" % os.getpid())
+time.sleep(300)
+PY
+for _ in $(seq 1 200); do [ -s "$SIMT/cur" ] && break; sleep 0.02; done
+read curpid < "$SIMT/cur"
+[ -n "${curpid:-}" ] || fail "supersession sim: current-sha worker did not report its pid"
+# Lay both in-flight markers (line 4 = the worker's own group id → group-killable): PR 77 has moved to
+# head 'newsha', so the 'oldsha' worker is doomed and the 'newsha' worker is the head.
+printf '%s\n%s\n%s\n%s\n' "$wpid" "" "0" "$wpid"       > "$SIMT/.health-inflight-77-oldsha"
+printf '%s\n%s\n%s\n%s\n' "$curpid" "" "0" "$curpid"   > "$SIMT/.health-inflight-77-newsha"
+# Drive the discovery→cancel pass for PR 77 now at head 'newsha'.
+HERD_HEALTH_TERM_SLEEP=0.02 TREES="$SIMT" HERD_JOURNAL_NOW="2026-07-10T00:00:00Z" \
+  PYTHONPATH="$REPO/pysrc" python3 - "$SIMT/j.jsonl" <<'PY' || fail "supersession driver errored"
+import sys
+from herd.live_runtime import (LiveTick, LiveState, LiveJournal, FixtureDiscovery,
+                               FixtureGates, DryRunActuator, LiveCandidate)
+journal = LiveJournal(sys.argv[1])
+state = LiveState()                                    # reads $TREES
+t = LiveTick({"MERGE_POLICY": "observe"}, FixtureDiscovery({"candidates": []}),
+             FixtureGates({"candidates": []}), DryRunActuator(journal), journal, state=state)
+t._supersede_stale([LiveCandidate(77, "newsha")])
+PY
+# The doomed leader AND its child subtree are gone — the HERD-283 group kill, not a single-pid kill.
+for _ in $(seq 1 200); do kill -0 "$wpid" 2>/dev/null || break; sleep 0.02; done
+kill -0 "$wpid" 2>/dev/null && fail "supersession sim: stale worker leader survived the cancel"
+for _ in $(seq 1 200); do kill -0 "$cpid" 2>/dev/null || break; sleep 0.02; done
+kill -0 "$cpid" 2>/dev/null && fail "supersession sim: stale worker CHILD survived (single-pid kill, not a group kill)"
+[ -e "$SIMT/.health-inflight-77-oldsha" ] && fail "supersession sim: stale marker not reaped"
+grep -q '"event":"gate_superseded"' "$SIMT/j.jsonl" || fail "supersession sim: no gate_superseded journaled"
+# The CURRENT-sha worker and its marker are untouched.
+kill -0 "$curpid" 2>/dev/null || fail "supersession sim: current-sha worker was wrongly terminated"
+[ -e "$SIMT/.health-inflight-77-newsha" ] || fail "supersession sim: current-sha marker wrongly removed"
+kill -9 "$wpid" "$cpid" "$curpid" 2>/dev/null || true
+pass
+
+echo "ALL PASS ($PASS/7 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, sole-engine resolution, fault→non-zero, supersession-cancel sim)"

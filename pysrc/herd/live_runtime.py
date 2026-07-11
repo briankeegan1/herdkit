@@ -59,8 +59,10 @@ Stdlib-only (the P1 packaging rule). CLI:
 Unit-driven by ``tests/test_live_runtime.py`` + gate wrapper ``tests/test-py-live-runtime.sh``.
 """
 
+import glob
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -225,14 +227,128 @@ def _pid_live(pid):
         return False
 
 
-def _marker_write(path, pid):
-    """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts (agent-watch.sh:2012).
+def _marker_write(path, pid, pgid=None):
+    """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts (agent-watch.sh:2136).
+    An OPTIONAL 4th line records the pid's process GROUP — written for gate workers dispatched into
+    their own session (HERD-283) so a supersession can reap the whole suite subtree as one group.
     Best-effort — an unwritable path drops the marker, never raises into the tick."""
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch()))
+            if pgid is not None and str(pgid) != "":
+                fh.write("%s\n" % pgid)
     except Exception:
         pass
+
+
+def _marker_pgid(path):
+    """The process GROUP recorded on line 4 of an in-flight marker (agent-watch.sh:_marker_pgid);
+    '' when the marker carries none (a review marker written without a group, or an unreadable file)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except Exception:
+        return ""
+    return lines[3].strip() if len(lines) > 3 else ""
+
+
+def _own_pgid(pid):
+    """The process group id of ``pid`` — a worker launched ``start_new_session`` is its OWN group leader
+    (``pgid == pid``), which ``os.getpgid`` confirms; falls back to the pid if the child already exited."""
+    try:
+        return os.getpgid(int(pid))
+    except Exception:
+        return int(pid)
+
+
+def _term_sleep():
+    """One short (~0.1s) grace tick between a stale worker's SIGTERM and SIGKILL, mirroring
+    ``agent-watch.sh:_health_term_sleep`` — a constant upper bound on unwind time, not a knob.
+    ``HERD_HEALTH_TERM_SLEEP`` is the test seam so a unit drives the loop with no real wall-clock."""
+    try:
+        time.sleep(float(os.environ.get("HERD_HEALTH_TERM_SLEEP", "0.1")))
+    except Exception:
+        pass
+
+
+def _reap(pid):
+    """Best-effort reap of a signaled child so its zombie does not read as 'alive' to ``kill -0`` within
+    the same tick. A no-op (ECHILD) when ``pid`` is not our child — the common case, a worker orphaned
+    to init by the PRIOR tick that dispatched it, which init reaps for us."""
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except Exception:
+        pass
+
+
+def _signal_worker(pid, pgid, use_group, sig):
+    """Signal the worker: its whole process GROUP when ``use_group`` (HERD-283), else the bare pid."""
+    try:
+        if use_group:
+            os.killpg(int(pgid), sig)
+        else:
+            os.kill(int(pid), sig)
+    except Exception:
+        pass
+
+
+def _terminate_worker_group(path):
+    """TERM → grace → KILL a stale in-flight worker and its whole process group — the ONE shared cancel
+    primitive supersession reuses (port of ``agent-watch.sh:_health_terminate_worker``, HERD-283).
+
+    Returns ``True`` when the worker (and, for a group kill, every group member) is gone; ``False`` when
+    a live member survived — the caller then KEEPS the marker so the next tick retries, never
+    re-terminating blind over a live suite.
+
+    SAFETY — never sever the tick/watcher. Signals ONLY the pid/pgid RECORDED in the marker, never a
+    pattern-matched one, and:
+      * a dead / pid-recycled marker (``_marker_live`` false) is already gone — nothing to signal;
+      * a marker naming THIS process is refused (a legacy in-process holder is the tick itself);
+      * a GROUP kill fires ONLY when the recorded pgid is the worker's OWN group (``pgid == pid``) and
+        is not this process's group — otherwise the isolation did not take and it DOWNGRADES to a
+        single-pid kill, exactly as the bash seam does.
+    """
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        with open(path, encoding="utf-8") as fh:
+            pid = (fh.read().splitlines() or [""])[0].strip()
+    except Exception:
+        return True
+    if not pid.isdigit():
+        return True
+    if not _marker_live(path):
+        return True                       # dead / recycled — the recycling guard prevents signaling it
+    if pid == str(os.getpid()):
+        return False                      # never signal ourselves
+    pgid = _marker_pgid(path)
+    try:
+        selfpg = str(os.getpgid(0))
+    except Exception:
+        selfpg = ""
+    use_group = bool(pgid) and pgid.isdigit() and pgid == pid and pgid != selfpg
+    _signal_worker(pid, pgid, use_group, signal.SIGTERM)
+    for _ in range(6):
+        _reap(pid)
+        if not _marker_live(path):
+            break
+        _term_sleep()
+    if _marker_live(path):
+        _signal_worker(pid, pgid, use_group, signal.SIGKILL)
+        for _ in range(3):
+            _reap(pid)
+            if not _marker_live(path):
+                break
+            _term_sleep()
+    if _marker_live(path):
+        return False
+    if use_group:
+        try:
+            os.killpg(int(pgid), 0)
+            return False                  # a group member survived the kill
+        except Exception:
+            pass
+    return True
 
 
 def _marker_live(path):
@@ -410,6 +526,52 @@ class LiveState:
                     os.remove(p)
                 except OSError:
                     pass
+
+    # supersession substrate ($TREES) — the sha-keyed scratch a superseded sha's workers leave behind,
+    # resolved for an ARBITRARY (pr, sha) so the discovery→cancel pass can reap a PRIOR head's files.
+    def _sha_path(self, prefix, pr, sha):
+        return self._p("%s-%s-%s" % (prefix, pr, sha)) if self.dir else None
+
+    def health_dispatch_file_sha(self, pr, sha):
+        return self._sha_path(".health-dispatch", pr, sha)
+
+    def health_result_file_sha(self, pr, sha):
+        return self._sha_path(".health-result", pr, sha)
+
+    def health_log_file_sha(self, pr, sha):
+        return self._sha_path(".health-log", pr, sha)
+
+    def review_result_file_sha(self, pr, sha):
+        return self._sha_path(".review-result", pr, sha)
+
+    def review_registry_file_sha(self, pr, sha):
+        return self._sha_path(".review-registry", pr, sha)
+
+    def stale_inflight(self, prefix, pr, cur_sha):
+        """DYNAMIC discovery of doomed workers: yield ``(marker_path, sha)`` for every
+        ``$TREES/<prefix>-<pr>-<sha>`` in-flight marker whose ``sha`` differs from the PR's current head
+        ``cur_sha`` (a prior head this PR has moved past). No hardcoded candidate list — the stale set is
+        globbed off disk, exactly as ``_discard_stale_health`` walks ``.health-inflight-$pr-*``
+        (agent-watch.sh:10420). Empty with no state dir (a sim/dry-run tick has no on-disk workers)."""
+        if not self.dir:
+            return
+        for path in sorted(glob.glob(self._p("%s-%s-*" % (prefix, pr)))):
+            sha = os.path.basename(path).rsplit("-", 1)[-1]
+            if sha and sha != str(cur_sha):
+                yield path, sha
+
+    def read_review_pane(self, pr, sha):
+        """The reviewer's STAMPED pane id from its dispatch registry row ``<pid> <pane>``
+        (agent-watch.sh:2505); '' when there is no registry row — the pane a supersession retires."""
+        path = self.review_registry_file_sha(pr, sha)
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                parts = fh.readline().split()
+        except Exception:
+            return ""
+        return parts[1] if len(parts) > 1 else ""
 
 
 # _health_worker mirror (agent-watch.sh:_health_worker): the ASYNC suite the port dispatches for one
@@ -691,7 +853,9 @@ class LiveGates:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "health",
                                 "detail", "health dispatch failed: %s" % str(exc)[:160])
             return
-        _marker_write(inflight, proc.pid)
+        # Record the worker's OWN process group (HERD-283): start_new_session makes it a group leader
+        # (pgid == pid), so a later supersession can reap the whole suite subtree as one group.
+        _marker_write(inflight, proc.pid, _own_pgid(proc.pid))
         self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "pid", proc.pid, "log_path", log or "")
 
@@ -749,7 +913,9 @@ class LiveGates:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
                                 "detail", "review dispatch failed: %s" % str(exc)[:160])
             return
-        _marker_write(inflight, proc.pid)
+        # Record the reviewer's OWN process group (start_new_session → group leader) so a superseding
+        # push can group-terminate it, then retire its stamped pane (HERD-341 supersession-cancel).
+        _marker_write(inflight, proc.pid, _own_pgid(proc.pid))
         # Contract §3.4 requires the full shape (pr, sha, pid, model, log_path, pin) — the same six
         # keys bash emits (agent-watch.sh:2545) and the shadow twin emits (shadow_runtime.py:382), so
         # `herd why`/`herd log`/cost read `model`+`log_path` and a shadow↔live parity diff stays clean.
@@ -924,6 +1090,50 @@ class LiveTick:
                             "state_from", prev, "state_to", nxt)
         return nxt
 
+    def _supersede_stale(self, candidates):
+        """Discovery → cancel: TERM every doomed in-flight worker a candidate has moved PAST (contract
+        §2.4/§6.1, HERD-341). For each current candidate, DYNAMICALLY discover the in-flight markers
+        left for a SUPERSEDED sha (a prior head), then reap them — a health suite worker by an HERD-283
+        GROUP-KILL of its whole subtree, a stale reviewer by a group-terminate + its STAMPED PANE
+        retired — and journal ``gate_superseded`` for each. This is the shadow's task-group cancel
+        (P3c ``_maybe_inject_supersession``) generalized to the live tick's on-disk substrate: the
+        production tree already performs it on a new head sha (``_discard_stale_health`` /
+        ``_discard_stale_reviews``); the port carries the same invariant into the typed core.
+
+        BYTE-INERT when nothing is superseded: with no state dir (a sim/dry-run tick) or no stale marker,
+        the glob is empty and this journals nothing — the stream is identical to before. A worker that
+        refuses to die keeps its marker (the terminate returned False) and is retried next tick, never
+        re-terminated blind and never falsely reported superseded.
+        """
+        st = self.state
+        if not st.dir:
+            return
+        for cand in candidates:
+            try:
+                cur = str(cand.sha)
+                # health rail — group-kill the stale suite worker (HERD-283), then reap its sha scratch.
+                for path, sha in st.stale_inflight(".health-inflight", cand.pr, cur):
+                    if _terminate_worker_group(path):
+                        st.rm(path, st.health_dispatch_file_sha(cand.pr, sha),
+                              st.health_result_file_sha(cand.pr, sha),
+                              st.health_log_file_sha(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "health",
+                                            "old_sha", sha, "new_sha", cur, "action", "group_kill")
+                # review rail — group-terminate the stale reviewer, retire its stamped pane, reap scratch.
+                for path, sha in st.stale_inflight(".review-inflight", cand.pr, cur):
+                    if _terminate_worker_group(path):
+                        pane = st.read_review_pane(cand.pr, sha)
+                        st.rm(path, st.review_result_file_sha(cand.pr, sha),
+                              st.review_registry_file_sha(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "review",
+                                            "old_sha", sha, "new_sha", cur, "action", "pane_retired",
+                                            "pane", pane)
+            except Exception as exc:
+                # A supersession scan fault for one candidate must never sink the tick (parking a doomed
+                # worker for the next tick's corpse sweep is always safe); journal it and move on.
+                self.journal.append("live_candidate_error", "pr", cand.pr, "sha", cand.sha,
+                                    "detail", "supersede: %s" % str(exc)[:180])
+
     def _walk(self, cand):
         """Walk one candidate's gate DAG; actuate the terminal; return the action string.
 
@@ -1025,6 +1235,10 @@ class LiveTick:
         candidates = self.discovery.discover()
         self.journal.append("live_tick_start", "candidates", len(candidates), "impl", "python",
                             "merge_policy", self._merge_policy)
+        # Discovery → supersession-cancel (§2.4/§6.1): before the gate walk, TERM the doomed in-flight
+        # workers any candidate has moved past, so a superseded sha never holds a rail slot or races a
+        # fresh dispatch. No-op with no state dir / no stale marker (byte-inert when nothing superseded).
+        self._supersede_stale(candidates)
         for cand in candidates:
             try:
                 self._outcome[cand.pr] = self._walk(cand)
