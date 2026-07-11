@@ -72,6 +72,24 @@ CANDIDATE_EVENTS = frozenset((
     "merge", "merge_refused_sha_moved", "pr_restale", "pr_starvation",
 ))
 
+# ── staged-subsystem events (HERD-304, P3 parity burn-down) ──────────────────────────────────────
+# Beyond the candidate pass, the sim scenario drives three MORE journalled subsystems the shadow
+# engine now models (herd.shadow_runtime): the review PANEL, the pipeline STEPS runner, and the
+# herd/gates commit-STATUS post. Their events are folded into ordered fixture lists (panels / steps /
+# gate_statuses) rather than into candidates — they are NOT gate subjects (contract §2.1), so they
+# are neither candidates nor auxiliary-excluded; they carry their own scenario state to the shadow.
+#
+# PANEL-EXCLUSIVE vs SHARED review bookkeeping: a review PANEL is established ONLY by a per-panelist
+# verdict or the panel fold — the events a single-reviewer dispatch never emits. review_log_retained
+# and review_pin_soft are emitted on EVERY review path (panel or lone reviewer, herd-review.sh:541/
+# 585), so they only ATTACH to a panel that materializes; a lone pair with no panelist stays a plain
+# review-rail note (excluded), never a spurious 0-panelist panel (which would over-emit vs the bash).
+PANEL_ANCHOR_EVENTS = frozenset(("review_panelist_verdict", "review_panel_folded"))
+PANEL_ATTACH_EVENTS = frozenset(("review_log_retained", "review_pin_soft"))
+STEP_EVENTS = frozenset((
+    "step_run", "step_hold_awaiting", "step_hold_approved", "step_hold_released",
+))
+
 # The four health outcomes (contract §2.2); anything else coerces to CLEAN like the shadow runtime.
 _HEALTH_OUTCOMES = frozenset(("CLEAN", "FLAKY", "CODEERROR"))
 # The recorded review verdicts (contract §2.2 / §3.2); INFRA is derived separately (never recorded).
@@ -153,6 +171,132 @@ class _CandidateFold:
         return cand
 
 
+class _PanelFold:
+    """Fold one PR's review-PANEL events into a shadow-runtime panel entry (herd-review.sh).
+
+    Accumulates the per-panelist verdict PROVENANCE (ref/driver/model/verdict/reason, contract
+    §3.2), the log-retention ``keep`` and soft-pin note, and the fold POLICY. The policy is read from
+    a ``review_panel_folded`` when the panel folded to a verdict; a panel that instead emitted a
+    herd-review ``infra_event`` while still carrying a reporting (PASS/BLOCK) panelist can only have
+    folded under ``all-pass`` (any-block would have let the clean co-panelist through), so that case
+    is inferred — the shadow runtime re-derives the fold from policy + panelists (never replayed).
+    """
+
+    __slots__ = ("pr", "slug", "sha", "keep", "pin_mode", "pin_reason", "policy", "refs",
+                 "panelists", "_saw_infra")
+
+    def __init__(self, pr):
+        self.pr = pr
+        self.slug = ""
+        self.sha = ""
+        self.keep = None
+        self.pin_mode = None
+        self.pin_reason = None
+        self.policy = None
+        self.refs = None
+        self.panelists = []
+        self._saw_infra = False
+
+    def observe(self, ev, obj):
+        slug = obj.get("slug")
+        if isinstance(slug, str) and slug:
+            self.slug = slug
+        sha = obj.get("sha")
+        if isinstance(sha, str):
+            self.sha = sha
+        if ev == "review_log_retained":
+            self.keep = obj.get("keep", 5)
+        elif ev == "review_pin_soft":
+            self.pin_mode = obj.get("pin_mode", "")
+            self.pin_reason = obj.get("reason", "")
+        elif ev == "review_panelist_verdict":
+            self.panelists.append({
+                "panelist": obj.get("panelist", len(self.panelists)),
+                "ref": obj.get("ref", ""), "driver": obj.get("driver", ""),
+                "model": obj.get("model", ""), "verdict": str(obj.get("verdict", "")).upper(),
+                "reason": obj.get("reason", ""),
+            })
+        elif ev == "review_panel_folded":
+            self.policy = obj.get("policy")
+            self.refs = obj.get("refs")
+        elif ev == "infra_event":
+            self._saw_infra = True
+
+    def to_dict(self):
+        reporting = [p for p in self.panelists if p["verdict"] in ("PASS", "BLOCK")]
+        # all-pass is the only policy under which a panel with a reporting panelist still folds to
+        # INFRA (herd-review.sh §305) — infer it when that is exactly what the real journal showed.
+        policy = self.policy or ("all-pass" if (self._saw_infra and reporting) else "any-block")
+        panel = {"pr": self.pr, "slug": self.slug, "sha": self.sha, "policy": policy,
+                 "panelists": self.panelists}
+        if self.keep is not None:
+            panel["keep"] = self.keep
+        panel["pin_mode"] = self.pin_mode or ""
+        if self.pin_reason:
+            panel["pin_reason"] = self.pin_reason
+        if self.refs:
+            panel["refs"] = self.refs
+        return panel
+
+
+class _StepFold:
+    """Fold one slug's pipeline-STEPS events back into an ordered rows list (steps.sh).
+
+    The journal records each step's execution (``step_run`` name/at/kind/outcome, contract §5.4) and,
+    for a ``hold=approve`` step, the awaiting/approved/released triple. This reconstructs the input
+    ROWS the shadow runtime re-models: one row per distinct step name in first-seen order, its at/
+    kind/outcome from its ``step_run``, ``hold=approve`` inferred from a ``step_hold_awaiting`` on
+    that step, and ``on_fail=block`` (the steps.sh default) hardened when a step failed (its failure
+    halted the lane, so later rows never journaled). A ``held`` step_run is a halt MARKER, not a
+    fresh execution outcome, so it never overwrites the row's real pass/fail.
+    """
+
+    __slots__ = ("slug", "sha", "dir", "rows", "_by_name")
+
+    def __init__(self, slug):
+        self.slug = slug
+        self.sha = ""
+        self.dir = ""
+        self.rows = []
+        self._by_name = {}
+
+    def _row(self, name):
+        row = self._by_name.get(name)
+        if row is None:
+            row = {"name": name, "at": "", "kind": "shell", "on_fail": "block",
+                   "hold": "none", "outcome": "pass"}
+            self._by_name[name] = row
+            self.rows.append(row)
+        return row
+
+    def observe(self, ev, obj):
+        sha = obj.get("sha")
+        if isinstance(sha, str) and sha:
+            self.sha = sha
+        if ev == "step_run":
+            row = self._row(obj.get("name", ""))
+            at = obj.get("at")
+            if isinstance(at, str) and at:
+                row["at"] = at
+            kind = obj.get("kind")
+            if isinstance(kind, str) and kind:
+                row["kind"] = kind
+            outcome = obj.get("outcome", "pass")
+            if outcome in ("pass", "warn", "fail"):        # a real execution outcome, not "held"
+                row["outcome"] = outcome
+                if outcome == "fail":
+                    row["on_fail"] = "block"               # it halted the lane
+                    if "rc" in obj:
+                        row["rc"] = obj["rc"]
+        elif ev == "step_hold_awaiting":
+            self.dir = obj.get("dir") or self.dir
+            self._row(obj.get("step", ""))["hold"] = "approve"
+
+    def to_dict(self):
+        return {"slug": self.slug, "sha": self.sha, "dir": self.dir or "(shadow)",
+                "rows": self.rows}
+
+
 def _norm_health(outcome):
     """Coerce a raw health value (any case) to CLEAN|FLAKY|CODEERROR; unknown → CLEAN (§2.2)."""
     val = str(outcome or "").upper()
@@ -179,8 +323,23 @@ def extract_fixture(events, config_overrides=None):
     """
     folds = {}                 # pr(str) -> _CandidateFold, insertion-ordered (first appearance)
     order = []                 # pr(str) in first-seen order, for a deterministic candidate list
+    panels = {}                # pr(str) -> _PanelFold (review-panel subjects, first-seen order)
+    panel_order = []
+    pending_review = {}        # pr(str) -> [(ev, obj)] shared review notes buffered until a panel anchors
+    steps = {}                 # slug(str) -> _StepFold (pipeline-steps runs, first-seen order)
+    step_order = []
+    gate_statuses = []         # ordered herd/gates commit-status posts
     excluded = {}              # event name -> count, for the provenance tally
     saw_gates_passed_merge = False
+
+    def _get_panel(pr):
+        panel = panels.get(pr)
+        if panel is None:
+            panel = panels[pr] = _PanelFold(pr)
+            panel_order.append(pr)
+            for bev, bobj in pending_review.pop(pr, ()):   # flush buffered log/pin notes into it
+                panel.observe(bev, bobj)
+        return panel
 
     for obj in events:
         if not isinstance(obj, dict):
@@ -188,6 +347,47 @@ def extract_fixture(events, config_overrides=None):
         ev = obj.get("event")
         if ev == "merge" and obj.get("reason") == "gates_passed":
             saw_gates_passed_merge = True
+
+        # ── review PANEL (herd-review.sh): a per-panel subject, NOT a gate candidate. A herd-review
+        #    infra_event (component=herd-review) is the panel's INFRA fold, not a review-rail INFRA,
+        #    so it routes here — leaving the candidate-pass infra_event handling (§3.3) untouched.
+        is_panel_infra = ev == "infra_event" and obj.get("component") == "herd-review"
+        if ev in PANEL_ANCHOR_EVENTS or is_panel_infra:
+            pr = _pr_key(obj)
+            if pr is not None:
+                _get_panel(pr).observe(ev, obj)
+                continue
+            # A panel anchor with no PR can't key a subject — fall through to the excluded tally.
+        elif ev in PANEL_ATTACH_EVENTS:
+            pr = _pr_key(obj)
+            if pr is not None:
+                if pr in panels:
+                    panels[pr].observe(ev, obj)          # a panel already anchored — attach directly
+                else:
+                    pending_review.setdefault(pr, []).append((ev, obj))  # buffer until one anchors
+                continue
+            # A note with no PR falls through to the excluded tally.
+
+        # ── pipeline STEPS (steps.sh): a per-slug run, keyed by slug (steps carry no PR).
+        if ev in STEP_EVENTS:
+            slug = obj.get("slug")
+            if isinstance(slug, str) and slug:
+                run = steps.get(slug)
+                if run is None:
+                    run = steps[slug] = _StepFold(slug)
+                    step_order.append(slug)
+                run.observe(ev, obj)
+                continue
+
+        # ── herd/gates commit STATUS (contract §2.3): an ordered blessing-artifact post.
+        if ev == "gate_status":
+            gate_statuses.append({
+                "pr": obj.get("pr", ""), "sha": obj.get("sha", ""),
+                "state": obj.get("state", "success"),
+                "context": obj.get("context", "herd/gates"),
+            })
+            continue
+
         if ev not in CANDIDATE_EVENTS:
             if isinstance(ev, str):
                 excluded[ev] = excluded.get(ev, 0) + 1
@@ -204,7 +404,16 @@ def extract_fixture(events, config_overrides=None):
             order.append(pr)
         fold.observe(ev, obj)
 
+    # Review notes that never anchored a panel (a lone single-reviewer log/pin, or a panel that only
+    # ever emitted bookkeeping) are plain review-rail auxiliary events — tally them as excluded,
+    # exactly as they were before panels existed (no spurious 0-panelist panel is ever fabricated).
+    for buffered in pending_review.values():
+        for bev, _ in buffered:
+            excluded[bev] = excluded.get(bev, 0) + 1
+
     candidates = [folds[pr].to_dict() for pr in order]
+    panel_list = [panels[pr].to_dict() for pr in panel_order]
+    step_list = [steps[slug].to_dict() for slug in step_order]
 
     config = {}
     # MERGE POLICY inference (contract §5.5): the run automerged ⇒ drive the shadow engine to auto too,
@@ -219,8 +428,19 @@ def extract_fixture(events, config_overrides=None):
     fixture = {"candidates": candidates}
     if config:
         fixture["config"] = config
+    # Staged-subsystem lists are OMITTED when empty, so a candidate-only journal folds to a
+    # byte-identical fixture (the shadow runtime defaults each to empty).
+    if panel_list:
+        fixture["panels"] = panel_list
+    if step_list:
+        fixture["steps"] = step_list
+    if gate_statuses:
+        fixture["gate_statuses"] = gate_statuses
     fixture["_extracted"] = {
         "candidate_count": len(candidates),
+        "panel_count": len(panel_list),
+        "step_run_count": len(step_list),
+        "gate_status_count": len(gate_statuses),
         "excluded_events": dict(sorted(excluded.items())),
     }
     return fixture
