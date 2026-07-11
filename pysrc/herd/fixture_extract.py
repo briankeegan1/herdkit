@@ -15,15 +15,20 @@ the real one.
 
 HONEST BY CONSTRUCTION (the item's non-negotiable — "a real divergence list is a SUCCESS
 deliverable, never force a green by over-canonicalizing"). This extractor's job is only to give the
-shadow engine the same INPUTS (subjects + rail outcomes + the non-candidate subsystem lists); it
-never rewrites the real stream to manufacture agreement. Oracle v2 (HERD-325, the P3i parity finish
-line) closed the last real families the shadow did not model — ``main_health`` (the post-merge
-tripwire, §3.4) and the ``push_hold_*`` push-gate lifecycle (§5.4) now fold into ordered fixture
-lists the shadow replays, and a lone single-reviewer's ``review_log_retained`` / ``review_pin_soft``
-notes fold into a 0-panelist panel — so ``parity-run.sh --shadow auto`` reaches JOURNAL PARITY on
-the sandbox scenario LEGITIMATELY, matched family-for-family, not forced. The residual auxiliary
-events the shadow still does not model (``symbol_index_refresh`` / ``reap`` / ``cost`` / …) stay in
-the honest excluded tally.
+shadow engine the same INPUTS (subjects + the per-candidate gate schedule + the non-candidate
+subsystem lists); it never rewrites the real stream to manufacture agreement. Oracle v2 (HERD-325,
+the P3i parity finish line) closed the non-candidate families on the sandbox scenario — ``main_health``
+(§3.4) and the ``push_hold_*`` lifecycle (§5.4) fold into ordered fixture lists the shadow replays.
+P3j (HERD-335) then closes the CANDIDATE-PASS vocabulary the sandbox-CONCURRENCY scenario drives: the
+per-candidate GATE SCHEDULE (which stages each subject actually walked — ``skip_health`` entry, the
+``healthcheck_attempted`` / ``healthcheck_cache_hit`` caching family §3.4, ``stop_after`` for
+injected review-only subjects, the ``symbol_index_refresh`` / ``reap`` post-merge housekeeping), and
+the ``main_ff`` / ``main_freshness`` reconcile (§3.4) + the ``merge_fairness_priority`` /
+``pr_restale`` / ``pr_starvation`` fairness family (§6.2) as VERBATIM-replay lists. Every event
+family and count now matches on the concurrency scenario; the honest residual is the candidate-pass
+EMISSION ORDER (the shadow's per-candidate structured-concurrency pipeline vs the bash watcher's
+tick-synchronized waves) and the ``infra_breaker_*`` review-breaker internal state (§3.3), which stay
+in the excluded tally.
 
 EXTRACTION RULES — every rule cites the engine contract section (``docs/engine-contract.md``) that
 gives it meaning, so each mapping from a real event to a candidate field is auditable:
@@ -46,8 +51,18 @@ gives it meaning, so each mapping from a real event to a candidate field is audi
     provenance that may bounce a builder (contract §3.2). A non-reviewer verdict is ignored. An
     ``infra_event`` with ``rail == review`` and no reviewer verdict maps to INFRA (a bounded retry,
     never a cached BLOCK — contract §2.2 / §3.3).
-  * STALE ← ``stale_dup_hold`` (kind=stale, §2.1 step 1) OR ``pr_restale`` / ``pr_starvation`` (the
-    starvation-freeze seam, contract §6.2) — a behind-base sha holds, it never merges.
+  * STALE ← ``stale_dup_hold`` (kind=stale, §2.1 step 1) — a behind-base sha holds, it never merges.
+    (``pr_restale`` / ``pr_starvation`` are NO LONGER a candidate stale signal: they are the
+    merge-FAIRNESS family, folded into the verbatim ``fairness`` replay list below — HERD-335.)
+  * GATE SCHEDULE (contract §2.1 / §2.4 / §3.4, HERD-335) ← which stages each candidate walked:
+    ``skip_health`` (a review-injected subject with no ``healthcheck_started``); ``health_attempted``
+    / ``cache_hit`` (the caching family); ``stop_after`` (``"verdict"`` = a planted verdict recorded
+    but never dispatched/merged, ``"dispatch"`` = a reviewer dispatched then torn down before a
+    verdict); ``pin_soft`` (an inline review-rail soft-pin note); ``post_merge`` (``symbol_index_refresh``
+    / ``reap`` housekeeping). Each is emitted only when non-default, so a plain candidate is unchanged.
+  * FAIRNESS ← ``merge_fairness_priority`` / ``pr_restale`` / ``pr_starvation`` (§6.2) and MAIN-EVENTS
+    ← ``main_ff`` / ``main_freshness`` (§3.4) fold into ordered VERBATIM-replay lists (``fairness`` /
+    ``main_events``) — NOT gate subjects, NOT excluded, re-emitted field-for-field in journal order.
   * HV_HOLD ← ``hold_applied`` (kind=human-verify) or ``human_verify_policy`` (contract §5.4).
   * APPROVED ← ``approval_recorded`` (state=approved, contract §5.5).
   * SHA ← the sha from the LAST candidate-signal event that carried one (input order is the
@@ -75,9 +90,9 @@ from herd.parity import ParityError, load_events
 # Anything not here is auxiliary and is excluded (and tallied), never turned into a candidate.
 CANDIDATE_EVENTS = frozenset((
     "healthcheck_started", "healthcheck_outcome", "healthcheck_attempted", "healthcheck_cache_hit",
-    "review_dispatched", "verdict_recorded", "infra_event",
+    "review_dispatched", "verdict_recorded", "infra_event", "symbol_index_refresh", "reap",
     "stale_dup_hold", "refix_bounce", "hold_applied", "human_verify_policy", "approval_recorded",
-    "merge", "merge_refused_sha_moved", "pr_restale", "pr_starvation",
+    "merge", "merge_refused_sha_moved",
 ))
 
 # ── staged-subsystem events (HERD-304, P3 parity burn-down) ──────────────────────────────────────
@@ -108,6 +123,26 @@ PUSH_HOLD_EVENTS = frozenset((
     "push_hold_awaiting", "push_hold_approved", "push_hold_resumed",
 ))
 
+# ── verbatim-replay engine families (HERD-335, P3j concurrency-parity burn-down) ──────────────────
+# The MERGE-FAIRNESS reorder + starvation counter (merge_fairness_priority / pr_restale /
+# pr_starvation, contract §6.2) and the MAIN fast-forward / freshness reconcile (main_ff /
+# main_freshness, §3.4) are REAL engine families that are NOT gate subjects — a fairness re-stale is a
+# fixed-point of the scheduler, not a health/review verdict on one sha. Like main_health / push_hold
+# they fold into ordered lists the shadow replays VERBATIM (fairness / main_events), NOT into
+# candidates and NOT into the excluded tally. Before P3j pr_restale/pr_starvation were mapped to a
+# candidate `stale` flag (which emitted a spurious stale_dup_hold) and merge_fairness_priority /
+# main_ff / main_freshness were dropped as auxiliary; the shadow now emits all five, so the
+# head-to-head diff sees them family-for-family.
+FAIRNESS_EVENTS = frozenset((
+    "merge_fairness_priority", "pr_restale", "pr_starvation",
+))
+MAIN_EVENT_EVENTS = frozenset((
+    "main_ff", "main_freshness",
+))
+# The non-volatile fields dropped from a verbatim replay (ts is re-stamped; pid/log_path/dir are the
+# volatile categories the parity oracle canonicalizes anyway — carrying them would only add noise).
+_REPLAY_DROP_KEYS = frozenset(("ts", "pid", "log_path", "dir", "path"))
+
 # The four health outcomes (contract §2.2); anything else coerces to CLEAN like the shadow runtime.
 _HEALTH_OUTCOMES = frozenset(("CLEAN", "FLAKY", "CODEERROR"))
 # The recorded review verdicts (contract §2.2 / §3.2); INFRA is derived separately (never recorded).
@@ -124,7 +159,9 @@ class _CandidateFold:
     """
 
     __slots__ = ("pr", "sha", "slug", "health", "review", "stale", "hv_hold", "approved",
-                 "_saw_reviewer_verdict")
+                 "_saw_reviewer_verdict", "_saw_health_started", "_saw_health_attempted",
+                 "_saw_cache_hit", "_saw_review_dispatched", "_saw_merge", "_saw_post_merge",
+                 "pin_soft", "pin_reason")
 
     def __init__(self, pr):
         self.pr = pr
@@ -136,6 +173,17 @@ class _CandidateFold:
         self.hv_hold = False
         self.approved = False
         self._saw_reviewer_verdict = False
+        # ── the per-candidate GATE SCHEDULE signals (HERD-335, P3j) ──────────────────────────────
+        # Which stages the real run actually walked, so the shadow re-walks the SAME schedule instead
+        # of a one-size health→review→merge DAG (see herd.shadow_runtime.Candidate).
+        self._saw_health_started = False      # a real healthcheck RAN (else the subject entered at review)
+        self._saw_health_attempted = False    # the caching family's first-run marker (§3.4)
+        self._saw_cache_hit = False           # a sha-keyed cache hit on a re-gate (§2.4 / §3.4)
+        self._saw_review_dispatched = False   # a reviewer was actually dispatched (vs a planted verdict)
+        self._saw_merge = False               # the candidate reached merge (the full pipeline)
+        self._saw_post_merge = False          # post-merge housekeeping ran (symbol_index_refresh / reap)
+        self.pin_soft = False                 # a review-rail soft-pin note fired inline (set post-fold)
+        self.pin_reason = ""                  # its reason (a semantic field, carried verbatim)
 
     def observe(self, ev, obj):
         # SHA (contract §2.4): the last candidate-signal sha wins (lap-bumped / merged sha over an
@@ -147,12 +195,20 @@ class _CandidateFold:
         if isinstance(slug, str) and slug:
             self.slug = slug
 
-        if ev == "healthcheck_outcome":                       # contract §2.2 / §3.4
+        if ev == "healthcheck_started":                       # a real suite ran (gate schedule §2.1)
+            self._saw_health_started = True
+        elif ev == "healthcheck_outcome":                     # contract §2.2 / §3.4
             self.health = _norm_health(obj.get("outcome"))
-        elif ev == "healthcheck_cache_hit" and self.health is None:
-            self.health = _norm_health(obj.get("outcome"))
-        elif ev == "healthcheck_attempted" and self.health is None:
-            self.health = _norm_health(obj.get("result"))
+        elif ev == "healthcheck_cache_hit":                   # sha-keyed cache hit (§2.4 / §3.4)
+            self._saw_cache_hit = True
+            if self.health is None:
+                self.health = _norm_health(obj.get("outcome"))
+        elif ev == "healthcheck_attempted":                   # the caching family's first-run marker
+            self._saw_health_attempted = True
+            if self.health is None:
+                self.health = _norm_health(obj.get("result"))
+        elif ev == "review_dispatched":                       # a reviewer was actually dispatched
+            self._saw_review_dispatched = True
         elif ev == "verdict_recorded":                        # contract §3.2: reviewer provenance only
             if obj.get("source") == "reviewer":
                 val = str(obj.get("value", "")).upper()
@@ -162,8 +218,12 @@ class _CandidateFold:
         elif ev == "infra_event":                             # contract §3.3: INFRA, never a BLOCK
             if obj.get("rail") == "review" and not self._saw_reviewer_verdict:
                 self.review = "INFRA"
-        elif ev in ("stale_dup_hold", "pr_restale", "pr_starvation"):   # contract §2.1 step 1 / §6.2
+        elif ev == "stale_dup_hold":                          # contract §2.1 step 1
             self.stale = True
+        elif ev == "merge":                                   # the full pipeline reached merge (§5.5)
+            self._saw_merge = True
+        elif ev in ("symbol_index_refresh", "reap"):          # post-merge housekeeping (§3.4)
+            self._saw_post_merge = True
         elif ev == "hold_applied":                            # contract §5.4
             if str(obj.get("kind", "")).startswith("human"):
                 self.hv_hold = True
@@ -172,6 +232,22 @@ class _CandidateFold:
         elif ev == "approval_recorded":                       # contract §5.5
             if obj.get("state") == "approved":
                 self.approved = True
+
+    def _stop_after(self):
+        """Where the candidate's real event stream stopped — the gate-schedule terminal (§2.1).
+
+        A merge means the FULL pipeline ran (None). Otherwise a recorded reviewer verdict that never
+        merged is a planted, review-only subject (``"verdict"``); a bare review dispatch with no
+        verdict is a torn-down reviewer probe (``"dispatch"``). None otherwise (a health-only subject
+        walks the default DAG).
+        """
+        if self._saw_merge:
+            return None
+        if self._saw_reviewer_verdict:
+            return "verdict"
+        if self._saw_review_dispatched:
+            return "dispatch"
+        return None
 
     def to_dict(self):
         """The shadow-runtime candidate dict — explicit health/review, flags only when set."""
@@ -186,6 +262,24 @@ class _CandidateFold:
             cand["hv_hold"] = True
         if self.approved:
             cand["approved"] = True
+        # ── gate-schedule fields (HERD-335): emitted ONLY when non-default, so a candidate that walked
+        #    the plain health→review→merge DAG folds to a BYTE-IDENTICAL dict (every pre-P3j fixture).
+        # A subject that recorded a review signal but never ran a healthcheck entered at the review gate.
+        saw_review = self._saw_review_dispatched or self._saw_reviewer_verdict
+        if saw_review and not self._saw_health_started:
+            cand["skip_health"] = True
+        if self._saw_health_attempted:
+            cand["health_attempted"] = True
+        if self._saw_cache_hit:
+            cand["cache_hit"] = True
+        stop_after = self._stop_after()
+        if stop_after:
+            cand["stop_after"] = stop_after
+        if self._saw_post_merge:
+            cand["post_merge"] = True
+        if self.pin_soft:
+            cand["pin_soft"] = True
+            cand["pin_reason"] = self.pin_reason
         return cand
 
 
@@ -252,6 +346,14 @@ class _PanelFold:
                  "panelists": self.panelists}
         if self.keep is not None:
             panel["keep"] = self.keep
+        else:
+            # NO review_log_retained was journaled for this subject: a review-rail pin note WITHOUT
+            # the herd-review log-retention row (the concurrency scenario's stub reviewer emits
+            # review_pin_soft but no review_log_retained — herd-review.sh is never on that path). Tell
+            # the shadow to SUPPRESS the log-retained row so it does not over-emit vs the bash tree
+            # (HERD-335). Omitted when a log-retained row WAS seen, keeping every sandbox panel dict
+            # byte-identical to before.
+            panel["log_retained"] = False
         panel["pin_mode"] = self.pin_mode or ""
         if self.pin_reason:
             panel["pin_reason"] = self.pin_reason
@@ -334,7 +436,7 @@ class _MainHealthFold:
     modeled, not fabricated into a candidate and not excluded.
     """
 
-    __slots__ = ("pr", "sha", "dispatched", "result", "failed", "since", "provenance")
+    __slots__ = ("pr", "sha", "dispatched", "result", "failed", "since", "_provenances", "died")
 
     def __init__(self, pr, sha):
         self.pr = pr
@@ -343,27 +445,38 @@ class _MainHealthFold:
         self.result = None
         self.failed = None
         self.since = None
-        self.provenance = None
+        self._provenances = []   # dispatch provenances in order (first, then a re-dispatch after a kill)
+        self.died = False        # an infra_event{reason:health_died} keyed this sha (HERD-222 kill)
 
     def observe(self, obj):
         result = obj.get("result")
         if result == "dispatched":
             self.dispatched = True
             prov = obj.get("provenance")
-            if isinstance(prov, str) and prov:
-                self.provenance = prov
+            self._provenances.append(prov if isinstance(prov, str) and prov else "")
         elif result in ("green", "red"):
             self.result = result
             if result == "red":
                 self.failed = obj.get("failed", "")
                 self.since = obj.get("since", "")
 
+    def mark_died(self):
+        """A mid-flight suite kill (infra_event health_died) touched this sha — it re-dispatched (§3.4)."""
+        self.died = True
+
     def to_dict(self):
         d = {"pr": self.pr, "sha": self.sha, "result": self.result or "green"}
         if self.dispatched:
             d["dispatched"] = True
-        if self.provenance:
-            d["provenance"] = self.provenance
+        if self._provenances and self._provenances[0]:
+            d["provenance"] = self._provenances[0]
+        # A killed suite (HERD-222): the first dispatch died and the sha was RE-DISPATCHED on the next
+        # tick (a second dispatch row, provenance "died"). Preserve the died marker + the re-dispatch
+        # provenance so the shadow replays the death + re-dispatch, not a single clean run.
+        if self.died or len(self._provenances) > 1:
+            d["died"] = True
+            redis = self._provenances[1] if len(self._provenances) > 1 else "died"
+            d["redispatch_provenance"] = redis or "died"
         if self.result == "red":
             d["failed"] = self.failed if self.failed is not None else ""
             d["since"] = self.since if self.since is not None else ""
@@ -438,6 +551,8 @@ def extract_fixture(events, config_overrides=None):
     mh_order = []
     push_holds = {}            # (slug,sha) -> _PushHoldFold (push-gate holds, first-seen order)
     ph_order = []
+    main_events = []           # ordered main_ff / main_freshness replay (HERD-335, §3.4)
+    fairness = []              # ordered merge_fairness_priority / pr_restale / pr_starvation (§6.2)
     excluded = {}              # event name -> count, for the provenance tally
     saw_gates_passed_merge = False
 
@@ -447,6 +562,14 @@ def extract_fixture(events, config_overrides=None):
             panel = panels[pr] = _PanelFold(pr)
             panel_order.append(pr)
         return panel
+
+    def _replay_entry(obj):
+        """One verbatim-replay entry: {event + non-volatile fields}, in journal.sh field order."""
+        entry = {"event": obj.get("event")}
+        for k, v in obj.items():
+            if k not in _REPLAY_DROP_KEYS and k != "event":
+                entry[k] = v
+        return entry
 
     for obj in events:
         if not isinstance(obj, dict):
@@ -527,6 +650,31 @@ def extract_fixture(events, config_overrides=None):
             })
             continue
 
+        # ── a MAIN-HEALTH suite kill (HERD-222): an infra_event{reason:health_died} keyed by
+        #    `main-<sha>` marks its main_health subject as died-and-re-dispatched (§3.4). It is folded
+        #    INTO that subject (not a gate candidate, not excluded) so the shadow replays the death +
+        #    re-dispatch. The subject was created by its earlier main_health dispatch row (same stream).
+        if ev == "infra_event" and obj.get("reason") == "health_died":
+            key_field = obj.get("key", "")
+            if isinstance(key_field, str) and key_field.startswith("main-"):
+                died_sha = key_field[len("main-"):]
+                for (mh_pr, mh_sha), mh in main_healths.items():
+                    if mh_sha == died_sha:
+                        mh.mark_died()
+                        break
+                continue
+
+        # ── verbatim-replay families (HERD-335): the MAIN reconcile (main_ff / main_freshness, §3.4)
+        #    and the merge-FAIRNESS reorder + starvation counter (merge_fairness_priority / pr_restale
+        #    / pr_starvation, §6.2). NOT gate subjects — folded into ordered lists the shadow replays
+        #    verbatim, matched family-for-family, never fabricated into candidates or excluded.
+        if ev in MAIN_EVENT_EVENTS:
+            main_events.append(_replay_entry(obj))
+            continue
+        if ev in FAIRNESS_EVENTS:
+            fairness.append(_replay_entry(obj))
+            continue
+
         if ev not in CANDIDATE_EVENTS:
             if isinstance(ev, str):
                 excluded[ev] = excluded.get(ev, 0) + 1
@@ -542,6 +690,21 @@ def extract_fixture(events, config_overrides=None):
             fold = folds[pr] = _CandidateFold(pr)
             order.append(pr)
         fold.observe(ev, obj)
+
+    # ── reroute a candidate PR's LONE review-rail pin note out of the panel and INLINE onto the
+    #    candidate (HERD-335). review_pin_soft fires on every review dispatch; for a PR that is ALSO a
+    #    gate candidate with no panel fan-out (0 panelists, no log-retained row — the concurrency stub
+    #    reviewer), it is a review-rail note the candidate should emit inline right before its
+    #    review_dispatched, not a buffered end-of-stream panel. So fold it onto the candidate and drop
+    #    the now-empty panel. A NON-candidate lone reviewer (the sandbox scenario, 0 candidates) keeps
+    #    its panel untouched — that is the oracle-v2 lone-reviewer case (HERD-325).
+    for pr in list(panel_order):
+        panel = panels[pr]
+        if pr in folds and not panel.panelists and panel.keep is None and panel.pin_reason is not None:
+            folds[pr].pin_soft = True
+            folds[pr].pin_reason = panel.pin_reason
+            panel_order.remove(pr)
+            del panels[pr]
 
     candidates = [folds[pr].to_dict() for pr in order]
     panel_list = [panels[pr].to_dict() for pr in panel_order]
@@ -574,6 +737,10 @@ def extract_fixture(events, config_overrides=None):
         fixture["main_healths"] = main_health_list
     if push_hold_list:
         fixture["push_holds"] = push_hold_list
+    if main_events:
+        fixture["main_events"] = main_events
+    if fairness:
+        fixture["fairness"] = fairness
     fixture["_extracted"] = {
         "candidate_count": len(candidates),
         "panel_count": len(panel_list),
@@ -581,6 +748,8 @@ def extract_fixture(events, config_overrides=None):
         "gate_status_count": len(gate_statuses),
         "main_health_count": len(main_health_list),
         "push_hold_count": len(push_hold_list),
+        "main_event_count": len(main_events),
+        "fairness_count": len(fairness),
         "excluded_events": dict(sorted(excluded.items())),
     }
     return fixture
