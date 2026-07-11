@@ -130,7 +130,11 @@ APPROVALS="$TREES/.agent-watch-approvals"
 CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 POSTMERGE_SWEPT_LEDGER="$TREES/.agent-watch-postmerge-swept"
-DEFAULT_BRANCH="main"; DRYRUN=""; WORKSPACE_NAME="simws"; export WORKSPACE_NAME
+DEFAULT_BRANCH="main"; DRYRUN=""; WORKSPACE_NAME="simws"
+# HERD-310: the pane guard requires sandbox-* or HERD_DISPOSABLE_WORKSPACE=1; declare disposable so
+# the sim's retirement tick can close stub tabs without being refused.
+HERD_DISPOSABLE_WORKSPACE=1
+export WORKSPACE_NAME HERD_DISPOSABLE_WORKSPACE
 
 # The scribe drainer is out of scope: log the enqueue instead of spawning it. ($HERE is read at call
 # time by reconcile_backlog, so redirecting it after sourcing captures every enqueue.)

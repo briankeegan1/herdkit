@@ -149,7 +149,10 @@ DEAD_RESPAWN_STATE="$TREES/.agent-watch-respawn"
 LIMIT_STATE="$TREES/.agent-watch-limit"
 SENDKEYS_STATE="$TREES/.agent-watch-limit-sendkeys"
 DEFAULT_BRANCH="main"; DRYRUN=""; WORKSPACE_NAME="simws"
-export WORKSPACE_NAME
+# HERD-310: the pane guard requires sandbox-* or HERD_DISPOSABLE_WORKSPACE=1; declare disposable so
+# the sim's retirement tick can close stub tabs without being refused.
+HERD_DISPOSABLE_WORKSPACE=1
+export WORKSPACE_NAME HERD_DISPOSABLE_WORKSPACE
 
 crash_after() {
   eval "$(declare -f "$1" | sed "1s/^$1/__orig_$1/")"
