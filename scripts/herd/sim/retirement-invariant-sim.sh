@@ -118,8 +118,11 @@ DEFAULT_BRANCH="main"; DRYRUN=""; PRS_JSON='[]'; WORKSPACE_NAME="simws"
 # the operator's policy says a landed branch should go away. (The retain-by-default policy is proven in
 # the unit suite instead, where the branch must survive AND not count as a leftover.)
 DELETE_BRANCH_ON_MERGE="${SIM_DELETE_BRANCH:-true}"
+# HERD-310: the pane guard requires either a sandbox-* workspace name or HERD_DISPOSABLE_WORKSPACE=1.
+# This sim's workspace is named "simws" (not sandbox-*), so declare it disposable explicitly so
+# retirement tick can close the stub tabs it owns without being refused by the guard.
 export WORKSPACE_NAME
-export HERD_DISPOSABLE_WORKSPACE=1  # sim creates/tears down its own stub tabs (HERD-310 guard)
+export HERD_DISPOSABLE_WORKSPACE=1
 
 # crash_after <fn> — run the shipped <fn>, then die. Simulates `kill -9` landing between two teardown
 # steps: the step's effect is durable on disk, the steps after it never happened.

@@ -172,19 +172,22 @@ ok "(3b) a TERM-ignoring gh is escalated to SIGKILL — the coreutils path carri
 ) || fail "(4) a hung gh did not land in the existing fail-soft path at some call site"
 ok "(4) hung gh → each site FAILS CLOSED (no fabricated PR list / body / blessing / reap)"
 
-# ── (4e) HONEST LABELS: an unreadable merge re-verify is never a 'PR no longer maps' needs-you row ──
-# The guard turns an outage from a wedge into a routine outcome, so the outage's LABEL now matters:
-# an all-empty re-verify read must journal merge_reverify_unreadable, not paint a red mapping row.
-grep -q 'merge_reverify_unreadable' "$WATCH" \
-  || fail "(4e) the merge re-verify does not distinguish an unreadable gh from a moved PR"
-python3 - "$WATCH" <<'PY' || fail "(4e) the unreadable-gh branch is not ordered BEFORE the 'no longer maps' red row"
+# ── (4e) HONEST LABELS: an unreadable merge is never a fabricated success/moved state ──────────────
+# The bash merge re-verify that carried this (merge_reverify_unreadable, ordered before the 'no longer
+# maps' red row) lived in the action pass (_tick_act), DELETED at the P5 cutover (HERD-306). The Python
+# live engine now owns the merge: on an unreadable gh it FAILS CLOSED — journals merge_gh_unreadable and
+# returns False (no merge, no fabricated moved/merged row), the same honest-labels invariant.
+PYLIVE="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc/herd/live_runtime.py"
+grep -q 'merge_gh_unreadable' "$PYLIVE" \
+  || fail "(4e) the Python merge does not distinguish an unreadable gh (must journal merge_gh_unreadable, fail closed)"
+python3 - "$PYLIVE" <<'PY' || fail "(4e) the unreadable-gh merge branch must journal then FAIL CLOSED (return False), never fabricate a merge"
 import sys
 s = open(sys.argv[1]).read()
-i = s.index('merge_reverify_unreadable')
-j = s.index('no longer maps to')
-sys.exit(0 if i < j else 1)
+i = s.index('merge_gh_unreadable')
+# the very next non-trivial thing on that branch is a fail-closed `return False` (no merge)
+sys.exit(0 if 'return False' in s[i:i+200] else 1)
 PY
-ok "(4e) an unreadable merge re-verify journals merge_reverify_unreadable before any red mapping row"
+ok "(4e) an unreadable gh read journals merge_gh_unreadable and fails closed — no fabricated merge/moved row"
 
 # ── (5) HEALTHY tick fetch is byte-identical: lookup OK, payload verbatim, journal silent ──────────
 (

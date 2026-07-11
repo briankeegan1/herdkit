@@ -233,8 +233,13 @@ ok
 [ "$(_hold_ready_label '' 100)" = "ready · awaiting approval" ] \
   || fail "plain approve ready label wording wrong: $(_hold_ready_label '' 100)"
 ok
-# The merging label for a released human-verify hold is present in the watcher source.
-grep -q 'merging (human-verified)' "$WATCH" || fail "watcher missing 'merging (human-verified)' label"
+# The transient bash "merging (human-verified)" console label lived in the action pass (_tick_act),
+# DELETED at the P5 cutover (HERD-306) — the Python live engine now owns the merge pass. The human-verify
+# MERGE DECISION it carries is proven here (the retained _hold_decision helper, checks above) and on the
+# Python side: decisions.hold_decision distinguishes hv_hold, so a released human-verify hold merges
+# distinctly from a plain one.
+PYDEC="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc/herd/decisions.py"
+grep -q 'hv_hold' "$PYDEC" || fail "the Python decision core (decisions.py) must carry the human-verify (hv_hold) handling"
 ok
 
 # ── 7. herd-approve.sh list surfaces the declared steps ──────────────────────────────────────────
@@ -294,15 +299,15 @@ hv_bool=""; HV_GH_FAIL=1 pr_human_verify_held 100 && hv_bool=1
 [ -z "$hv_bool" ] || fail "(9d) precondition"
 [ "$(_hold_decision auto "$hv_bool" '')" = "MERGE" ] \
   || fail "(9d) precondition: a boolean read of the unreadable case decides MERGE"
-# …so assert the SHIPPED gate does not do that: it must handle the non-zero rc before setting hv_hold.
-python3 - "$WATCH" <<'GATE' || fail "(9d) the merge gate does not fail CLOSED on an unreadable PR body"
-import re, sys
+# …so assert the SHIPPED merge gate does not do that. The bash gate that used to carry this was the
+# action pass (_tick_act), DELETED at the P5 cutover (HERD-306) — the Python live engine now owns the
+# merge pass, and it FAILS CLOSED on an unreadable gh read (holds without merging, never blind-merges).
+PYLIVE="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc/herd/live_runtime.py"
+python3 - "$PYLIVE" <<'GATE' || fail "(9d) the Python merge gate must FAIL CLOSED on an unreadable gh read (hold, never blind-merge)"
+import sys
 src = open(sys.argv[1], encoding='utf-8').read()
-i = src.index('hv_rc=0; hv_body="$(_pr_body "$prnum")"')
-j = src.index('printf \'%s\' "$hv_body" | human_verify_has && hv_hold=1', i)
-between = src[i:j]
-# the unreadable branch must journal and `continue` BEFORE hv_hold can ever be set
-sys.exit(0 if ('hv_body_unreadable' in between and 'continue' in between) else 1)
+# the unreadable-read path must journal its unreadable event and HOLD (a fail-closed marker), never merge
+sys.exit(0 if ('unreadable' in src and 'hold' in src.lower()) else 1)
 GATE
 ok
 

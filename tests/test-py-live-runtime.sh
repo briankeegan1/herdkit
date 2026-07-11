@@ -18,13 +18,14 @@
 #   (2c) JOURNAL FAIL-LOUD (HERD-324 leg 2) — a live (non-dry) `--tick` with no resolvable journal path
 #       (no JOURNAL_FILE / WORKTREES_DIR) REFUSES to run, exiting non-zero BEFORE any actuation, so an
 #       actuating tick is never run unjournaled (journal:null).
-#   (3) BYTE-IDENTICAL-OFF — the bash ENGINE_IMPL wiring (engine-version.sh) is a HARD no-op under the
-#       ship default: herd_engine_impl resolves 'bash' for unset / bash / a typo / mis-cased 'PYTHON',
-#       and herd_engine_live_tick returns NON-ZERO (so the watcher runs its own tick) having written
-#       nothing — the guard `if herd_engine_live_tick; then …` in agent-watch.sh's loop is inert.
-#   (4) ARMED FALLBACK (the kill-switch) — with ENGINE_IMPL=python but no reachable gh/repo, the live
-#       tick fails discovery and returns NON-ZERO, so the bash supervisor instantly falls back to its
-#       own authoritative tick. A port fault never stalls the watcher and never half-merges.
+#   (3) SOLE-ENGINE RESOLUTION (HERD-306 cutover) — post-deletion there is ONE engine core, so
+#       herd_engine_impl ALWAYS resolves 'python'; the retired values 'bash'/'shadow' (and a typo) WARN
+#       loudly once and still resolve 'python' — a stale config value can never divert or disable the
+#       sole engine core.
+#   (4) FAULT → NON-ZERO (the watchdog contract) — herd_engine_live_tick ALWAYS attempts the Python tick
+#       (no ENGINE_IMPL gate); with no reachable gh/repo it fails discovery and returns NON-ZERO. There
+#       is no bash fallback anymore — the supervisor's watchdog retries then HOLDS. A fault never stalls
+#       the watcher and never half-merges (no actuation event leaks into the real journal).
 #
 # Run:  bash tests/test-py-live-runtime.sh
 set -uo pipefail
@@ -106,41 +107,40 @@ rc=$?
 [ "$rc" -ne 0 ] || fail "an unjournaled live tick must fail loud (non-zero), never run journal:null"
 pass
 
-# ── (3) byte-identical-off: the bash seam is inert under the ship default ────────────────────────
-for v in "" bash typo PYTHON shadow; do
-  got="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl')"
-  case "$v" in
-    shadow) [ "$got" = shadow ] || fail "ENGINE_IMPL=shadow resolved '$got'" ;;
-    *)      [ "$got" = bash ]   || fail "ENGINE_IMPL='$v' should resolve bash, got '$got'" ;;
-  esac
+# ── (3) sole-engine resolution: python always wins; bash/shadow/typo are RETIRED (warn + python) ──
+for v in "" python bash shadow typo PYTHON; do
+  got="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>/dev/null)"
+  [ "$got" = python ] || fail "ENGINE_IMPL='$v' must resolve the sole engine 'python', got '$got'"
 done
-[ "$(ENGINE_IMPL=python bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl')" = python ] \
-  || fail "ENGINE_IMPL=python did not resolve python"
-# herd_engine_live_tick returns NON-ZERO (bash owns the tick) for every non-python posture, silently.
-for v in "" bash shadow typo; do
-  o="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick' 2>&1)"
-  rc=$?
-  [ "$rc" -ne 0 ] || fail "herd_engine_live_tick should fall back (rc!=0) for ENGINE_IMPL='$v'"
-  [ -z "$o" ]     || fail "herd_engine_live_tick emitted output while disabled ('$o')"
+# The retired values WARN loudly on stderr (once); the live values are silent.
+for v in bash shadow; do
+  w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
+  printf '%s' "$w" | grep -qi 'RETIRED' || fail "ENGINE_IMPL='$v' must WARN that it is retired (got: '$w')"
+done
+for v in "" python; do
+  w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
+  [ -z "$w" ] || fail "ENGINE_IMPL='$v' must resolve silently (no warning), got: '$w'"
 done
 pass
 
-# ── (4) armed fallback (kill-switch): python armed + unreachable gh -> non-zero, safe fallback ───
-# A live tick with no reachable gh/repo fails discovery; herd_engine_live_tick must return non-zero so
-# the bash supervisor runs its own tick body. Point WORKTREES_DIR at an empty dir and confirm no real
-# journal gains a gate event from the aborted tick.
+# ── (4) fault → non-zero (watchdog contract): the live tick ALWAYS attempts python, and a discovery
+#        failure returns non-zero with no leaked actuation. There is no bash fallback anymore. ──────
 mkdir -p "$T/live/.herd"
-set +e
-ENGINE_IMPL=python HERDKIT_HOME="$REPO" WORKTREES_DIR="$T/live" GH_TOKEN="" \
-  HOME=/nonexistent PATH="/usr/bin:/bin" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick' \
-  >/dev/null 2>&1
-rc=$?
-set -e
-[ "$rc" -ne 0 ] || fail "armed live tick with unreachable gh should return non-zero (fallback)"
+# Even a RETIRED ENGINE_IMPL no longer diverts the engine — the live tick still attempts python and
+# faults to non-zero (unreachable gh), which the supervisor's watchdog, not a bash pass, handles.
+for v in python bash shadow ""; do
+  set +e
+  ENGINE_IMPL="$v" HERDKIT_HOME="$REPO" WORKTREES_DIR="$T/live" GH_TOKEN="" \
+    HOME=/nonexistent PATH="/usr/bin:/bin" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick' \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "live tick with unreachable gh must return non-zero (fault → watchdog) for ENGINE_IMPL='$v'"
+done
 if [ -f "$T/live/.herd/journal.jsonl" ]; then
   grep -Eq '"event":"(merge|reap|verdict_recorded)"' "$T/live/.herd/journal.jsonl" \
     && fail "an aborted live tick leaked an actuation event into the real journal"
 fi
 pass
 
-echo "ALL PASS ($PASS/6 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, byte-identical-off, armed fallback)"
+echo "ALL PASS ($PASS/6 live-runtime checks: unit invariants, full dry-run loop, dispatch-and-wait + scope, journal fail-loud, sole-engine resolution, fault→non-zero)"

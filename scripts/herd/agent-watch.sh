@@ -617,6 +617,7 @@ TRACKER_DRIFT=""
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
+ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -1626,6 +1627,12 @@ build_orphan_prs() {
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # ENGINE DOWN alarm (HERD-306) — the LOUDEST row, pinned above even the default-branch alarm. Set by
+  # _engine_tick_watchdog when the SOLE (Python) engine core has faulted past its tolerance: no gates or
+  # merges are running until a human intervenes. Empty (byte-identical console) whenever the engine ticks.
+  if [ -n "${ENGINE_DOWN_ROW:-}" ]; then
+    frame="${frame}  ${C_RED}engine${C_RESET}"$'\n'"${ENGINE_DOWN_ROW}"$'\n'
+  fi
   # Post-merge main-health ALARM (HERD-129) — pinned at the TOP so a red default branch is the first
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
   # MAIN-freshness (HERD-233) shares that section: a diverged/held checkout, and the restart note
@@ -2858,19 +2865,10 @@ EOF
   printf PASS
 }
 
-# _breaker_cooldown_remaining — seconds left before an OPEN breaker admits a probe (0 if elapsed / not
-# open). Purely for the status row.
-_breaker_cooldown_remaining() {
-  local st fa op pb now cd rem
-  read -r st fa op pb <<EOF
-$(_breaker_read)
-EOF
-  [ "$st" = "open" ] || { printf '0'; return 0; }
-  now="$(date +%s)"; cd="$(_breaker_cooldown)"
-  rem=$(( ${op:-0} + cd - now ))
-  [ "$rem" -lt 0 ] && rem=0
-  printf '%s' "$rem"
-}
+# (HERD-306) _breaker_cooldown_remaining was DELETED with the bash action pass: it existed only to
+# render the OPEN-breaker cooldown seconds in _tick_act's status row and had no other consumer. The
+# breaker gate itself (_breaker_gate + the _breaker_* state helpers) stays — the sim/test suite and the
+# Python engine's dispatch both rely on it.
 
 # ── Claude exec-hang probe (HERD-108) ─────────────────────────────────────────────────────────────
 # On some environments `claude` WEDGES on invocation — every exec hangs before the process finishes
@@ -11502,489 +11500,62 @@ _acquire_watcher_singleton() {
   return 0
 }
 
-# ── The watcher tick, factored for the live-engine cutover (HERD-323, P3g, EPIC HERD-300) ────────
-# The tick splits into two halves so ENGINE_IMPL=python can own ONLY the action pass while the
-# console keeps painting and the sweeps keep reconciling on EVERY cycle (the cutover seat used to
-# fly instrument-only: when Python owned a tick the whole bash body was skipped, so nothing
-# rendered and no queued spawn drained). This is a PURE factoring: in bash mode the two halves run
-# back-to-back and the tick is byte-identical to before.
+# ── The watcher tick after the P5 CUTOVER (HERD-306, EPIC HERD-300 FINALE) ───────────────────────
+# The bash ACTION PASS (_tick_act — gate dispatch, the auto-merge candidate loop, the block-verdict
+# refix bounces, the conflict-resolver (re)spawns) was DELETED here. pysrc/herd/live_runtime.py is now
+# the SOLE engine core, and the supervisor hands it EVERY tick via herd_engine_live_tick. There is no
+# bash fallback anymore, so the failure story is a WATCHDOG, not a half-run:
 #
-#   _tick_act            — the ACTION pass: gate dispatch, the auto-merge candidate loop, and the
-#                          conflict-resolver (re)spawn bounces. This is the half the Python engine
-#                          replaces; it is SKIPPED in bash whenever Python owned the tick.
-#   _tick_render_reconcile — runs EVERY cycle regardless of tick owner: it observes the world and
-#                          paints the console (Phase A), hands the action pass to Python-or-bash via
-#                          the herd_engine_live_tick guard, then drains the spawn queue and runs the
-#                          reconcile/sweep legs (Phase C) over the same state files + journal the
-#                          Python engine writes.
-_tick_act() {
-  # CLAUDE EXEC-HANG PROBE (HERD-108): before dispatching any review/refix into a possibly-wedged claude,
-  # probe it ONCE per tick under a hard timeout. A wedge (probe times out) sets $_claude_hung, which the
-  # per-candidate guard below uses to HOLD review/refix (a cached-PASS PR still merges). Byte-inert unless
-  # WATCH_CLAUDE_PROBE_TIMEOUT is armed; the probe only runs when there is at least one candidate to protect.
-  _claude_hung=""
-  if [ -n "${CAND_IDX[*]:-}" ] && [ "$(_claude_exec_hung)" = "HUNG" ]; then _claude_hung=1; fi
-
-  # MERGE FAIRNESS (HERD-231, MERGE_FAIRNESS=on — dormant by default). Visit every candidate whose gates
-  # are ALREADY green for its head sha before any candidate that still needs gate work, so a ready PR
-  # merges this tick instead of waiting behind dispatches for its siblings — dispatches whose eventual
-  # merge is precisely what re-stales it (PR #328 lost four laps that way, PR #347 three). Ordering only:
-  # a promoted candidate still runs the pre-merge re-verify, the unconditional stale-base re-check and
-  # the merge-policy decision below. With the knob off the arrays are untouched and this pass is
-  # byte-identical to before the feature. See _merge_fairness_reorder.
-  _merge_fairness_reorder
-
-  # Action pass: gate + auto-merge each CLEAN/MERGEABLE candidate.
-  j=0
-  for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}; do
-    dir="${CAND_DIR[j]}"; slug="${CAND_SLUG[j]}"; prnum="${CAND_PR[j]}"; branch="${CAND_BRANCH[j]}"; candsha="${CAND_SHA[j]}"; j=$((j + 1))
-    already_merged "$prnum" "$slug" && continue
-    sl="$(_slug_cell "$slug")"
-    pn=" ${C_DIM}#${prnum}${C_RESET} ·"
-
-    # INFRA CIRCUIT BREAKER (HERD-110): when consecutive non-verdict reviewer deaths (a claude
-    # exec-hang / env failure — NEVER a real BLOCK verdict) have tripped the GLOBAL breaker, STOP
-    # dispatching new gates into a dead env. Byte-inert unless INFRA_BREAKER_MAX is set. A BLOCKED
-    # candidate is skipped entirely (no health, no review) with a loud row; a PROBE (half-open) falls
-    # through to dispatch normally as the single recovery probe.
-    case "$(_breaker_gate "$prnum")" in
-      BLOCKED)
-        DISPLAY[idx]="    ${C_RED}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}infra circuit open — environment looks dead · cooldown $(_breaker_cooldown_remaining)s${C_RESET}"
-        render
-        continue ;;
-      PROBE)
-        DISPLAY[idx]="    ${C_YELLOW}🔌${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}infra circuit half-open · probing environment…${C_RESET}"
-        render ;;
-      *) : ;;
-    esac
-
-    # CROSS-SEAT GATE DEDUP (HERD-194). BEFORE dispatching our own (expensive) gates, check whether the
-    # head sha already carries a herd/gates=success status (posted by ANOTHER operator's watcher, or by
-    # US before a $GATE_STATUS_STATE ledger loss). Team mode only (WATCHER_SCOPE=all): in the solo
-    # default no other seat sees this PR, so no per-tick status read runs (byte-inert). We do NOT `skip`
-    # the candidate — a skip would strand an OWNED, CLEAN, already-blessed PR forever on a ledger loss.
-    # Instead we HEAL the ledger from the observed blessing (so the redundant status re-POST is deduped)
-    # and fall through to the normal action pass, which merges an owned CLEAN PR as usual. Our own
-    # already-recorded blessing never reaches this (the ledger check short-circuits).
-    if _gate_status_enabled && _watcher_team_mode \
-       && ! _gate_status_posted "$prnum" "$candsha" success \
-       && _gate_status_blessed "$candsha"; then
-      _record_gate_status "$prnum" "$candsha" success
-    fi
-
-    # NOTE (HERD-194): we deliberately do NOT post a `pending` herd/gates status here. A pending
-    # NON-passing commit status flips a CLEAN sha to mergeStateStatus=UNSTABLE — which is neither CLEAN
-    # (so it drops out of the merge path) nor BLOCKED (so it is not gate-eligible), a self-inflicted
-    # deadlock in the DEFAULT unprotected config. The fail-safe rests only on the ABSENCE of `success`
-    # (which keeps the PR unmergeable under `require herd/gates` protection), and GitHub already
-    # represents a missing REQUIRED check as "Expected / waiting", so a pending write buys nothing.
-    # Only the terminal success/failure are ever posted (below).
-
-    # GATE ORDER (HERD-227): the stale/duplicate gate decides FIRST — before the parallel review
-    # pre-dispatch and before the healthcheck. It is deterministic (a duplicate tracker ref, or a
-    # pure-git merge-base file overlap) and its hold is TERMINAL for this sha: the stale-base autofix
-    # bounces the builder, superseding the very sha a review/suite would be grading. Running it last
-    # burned one ~9-min heavy suite plus one Opus review per stale cycle (PR #328, 2026-07-09). On a
-    # hold we dispatch NOTHING expensive for this sha; the hold row, comment and STALE_BASE_AUTOFIX
-    # bounce proceed exactly as before. Proceeding is byte-quiet — no events, no side effects — so a
-    # fresh-base PR's dispatch order is unchanged. Keyed on $candsha (this tick's head, free). This is a
-    # CHEAPENING pass, not the safety rail: the base tip can advance under us while the suite runs, so
-    # the merge decision still rests on the unconditional re-evaluation just before do_merge below.
-    if ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx"; then
-      continue
-    fi
-
-    # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel, HERD-73 — opt-in, dormant by default). Kick the
-    # pre-merge review off NOW, at the same tick the healthcheck below starts, so the two gates overlap
-    # instead of running serially (review only after health lands). Byte-inert under the default serial
-    # mode. The merge decision downstream is UNCHANGED — it still requires BOTH the healthcheck AND a
-    # review PASS; this only overlaps their wall-clock. See _predispatch_review_if_parallel.
-    _predispatch_review_if_parallel "$prnum" "$slug" "$candsha"
-
-    # SERIALIZED, retry-before-red healthcheck: never runs a suite that overlaps another (they
-    # share one git object store and race on shared .git locks), and only paints red on a CODE
-    # error that REPRODUCES on an immediate solo retry — a transient self-heals as "flaky · infra".
-    # sha-keyed: an UNCHANGED commit reuses the cached terminal verdict (no re-run); a new commit
-    # invalidates the cache and re-runs the full suite. This ends the every-tick re-run of a held PR.
-    _HC_RESULT=""
-    _healthcheck_gate "$prnum" "$slug" "$dir" "$idx" "$candsha"
-    render
-    case "$_HC_RESULT" in
-      CLEAN|FLAKY) : ;;            # passed (clean, tolerated data/env, or flaky-then-passed) → gate on
-      QUEUED)      continue ;;     # slot busy — re-evaluate next tick, do NOT merge
-      CODEERROR)   continue ;;    # reproduced code error (red) — held for a human, do NOT merge. No
-                                  # herd/gates status: success is simply never posted (its ABSENCE keeps
-                                  # the PR unmergeable under protection). Posting a `failure` here would
-                                  # flip a CLEAN sha to UNSTABLE and strand it — see post_gate_status.
-      *) continue ;;              # unknown/empty result — hold, do NOT merge (no status either way)
-    esac
-
-    if [ -n "$DRYRUN" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔬${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would review PR #${prnum} (then merge on PASS)${C_RESET}"
-      render
-      continue
-    fi
-
-    # Re-verify in the instant before merging — guard the window between classification and merge.
-    IFS=$'\t' read -r rmergeable rmstate rbranch rsha rauthor < <(
-      _gh_timeout merge_reverify pr view "$prnum" --json mergeable,mergeStateStatus,headRefName,headRefOid,author 2>/dev/null | python3 -c '
-import sys, json
-try: d = json.load(sys.stdin)
-except Exception: d = {}
-print("\t".join([str(d.get("mergeable","")), str(d.get("mergeStateStatus","")), str(d.get("headRefName","")), str(d.get("headRefOid","")), str((d.get("author") or {}).get("login",""))]))
-')
-    # HONEST LABELS (HERD-237, the HERD-232/G6 convention): an ALL-EMPTY read is gh being unreadable —
-    # timed out at the guard above, rate-limited, auth expired — NOT a PR that moved. Calling it "no
-    # longer maps to <branch>" paints a ⚠️ needs-you row for a network blip, and the timeout guard would
-    # have made that the routine outcome of every outage. Both branches refuse the merge and re-gate
-    # next tick; only the label differs. Unreachable on a healthy gh (a live PR always has a branch).
-    if [ -z "$rbranch" ] && [ -z "$rsha" ] && [ -z "$rmstate" ]; then
-      journal_append merge_reverify_unreadable pr "$prnum" slug "$slug" sha "$candsha"
-      DISPLAY[idx]="    ${C_DIM}⋯${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}gh unreadable · re-checking next tick${C_RESET}"
-      render
-      continue
-    fi
-    if [ "$rbranch" != "$branch" ]; then
-      DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · PR #${prnum} no longer maps to ${branch}${C_RESET}"
-      render
-      continue
-    fi
-    # SAFETY-CRITICAL defense-in-depth: re-confirm ownership on FRESH author data in the instant
-    # before merging. Even if a teammate's PR reached this candidate path (a classification race, or
-    # an author that resolved only just now), the scope gate blocks the auto-merge here — never
-    # blind-merge a PR the operator does not own.
-    if ! _scope_permits_automerge "$rauthor"; then
-      DISPLAY[idx]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${rauthor:-unknown})${C_RESET}"
-      render
-      continue
-    fi
-    # bless_only (HERD-194): this candidate is MERGEABLE but NOT CLEAN, held BLOCKED only because its
-    # herd/gates blessing is not yet posted. We still run the gates below and post the blessing, but we
-    # must NOT merge (still not CLEAN) — the merge is skipped right after the success post. Empty for a
-    # normal CLEAN candidate, which flows through to the merge decision unchanged.
-    bless_only=""
-    if [ "$rmergeable" != "MERGEABLE" ] || ! _should_automerge "$rmstate"; then
-      if [ "$rmergeable" = "MERGEABLE" ] && _gate_bless_eligible "$prnum" "$rsha" "$rmstate"; then
-        # Blocked only by the missing herd/gates check (unblessed for this sha): fall through to run the
-        # gates + post the blessing. The merge stays gated on CLEAN (enforced after the success post).
-        bless_only=1
-      elif [ "$rmergeable" = "MERGEABLE" ]; then
-        # Still conflict-free but a gate regressed since classification (e.g. a required check went
-        # pending, or the branch fell BEHIND), or we already blessed this sha and it is blocked by
-        # something else: soft-hold, re-evaluate next tick — not a ⚠️.
-        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${rmstate:-?})${C_RESET}"
-        render
-        continue
-      else
-        if [ "$rmergeable" = "CONFLICTING" ]; then rreason="conflict"; else rreason="${rmstate:-unknown}"; fi
-        DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · changed under us · ${rreason}${C_RESET}"
-        render
-        continue
-      fi
-    fi
-
-    # PRE-MERGE STALE / DUPLICATE GATE (HERD-188 + HERD-199), re-evaluated in the instant before the
-    # merge — exactly where it ran before HERD-227, and for exactly the same reason.
-    #
-    # WHY THIS IS NOT REDUNDANT with the top-of-pass call. A stale-base clearance is a function of TWO
-    # inputs: the head sha AND the base tip (stale_dup_base_overlap compares `merge-base $base $head`
-    # against `rev-parse $base`). Only the head sha belongs to this PR. Between the top-of-pass gate and
-    # do_merge below, this pass waits out the review pre-dispatch, a full healthcheck suite, and the
-    # review verdict — minutes during which ANOTHER SEAT's watcher can merge and ff-pull $DEFAULT_BRANCH
-    # (a LOCAL ref, shared across every worktree via one common .git). Our head sha never moves, so a
-    # sha-keyed skip would merge on a clearance computed against a base tip that no longer exists — the
-    # clean-but-behind merge that silently clobbers newer main (#236 → revert #280). Nothing downstream
-    # re-catches it: a behind branch is still MERGEABLE/CLEAN in the default unprotected config.
-    #
-    # The invariant is therefore "no merge without a clearance against the CURRENT base", not "…against
-    # this sha" — and it must be re-established from observed state, never inferred from what THIS seat
-    # did (multi-seat doctrine R1). So: always re-run, unconditionally. Cost is one stale_dup_check per
-    # merge-ready candidate per tick, identical to the pre-HERD-227 code, which paid it at this very
-    # spot. HERD-227's win is the EARLY evaluation above, which skips the doomed review + suite — not a
-    # skipped re-check here.
-    if [ -n "$rsha" ] && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then
-      continue
-    fi
-
-    # PRE-MERGE ADVERSARIAL REVIEW GATE. Keyed by PR + head sha so each commit is reviewed once.
-    if [ -z "$rsha" ]; then
-      DISPLAY[idx]="    ${C_DIM}🔬${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}awaiting head sha for review…${C_RESET}"
-      render
-      continue
-    fi
-    prior="$(review_verdict "$prnum" "$rsha" || true)"
-    # CLAUDE EXEC-HANG GUARD (HERD-108): claude is wedged this tick (the per-tick probe timed out). A
-    # review dispatch would spawn a reviewer that hangs; an auto-refix bounce would land on a dead
-    # session. HOLD both — but ONLY when this candidate actually needs claude: a cached PASS (or a
-    # BLOCK the operator has overridden) falls straight through to the merge path below, so healthy
-    # already-reviewed PRs keep flowing. The probe already journaled the infra_event (once per episode).
-    if [ -n "${_claude_hung:-}" ] && [ "$prior" != "PASS" ] && ! { [ "$prior" = "BLOCK" ] && override_exists "$prnum" "$rsha"; }; then
-      DISPLAY[idx]="    ${C_RED}🧟${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}claude exec-hang — probe timed out; holding review/refix (fix: herd doctor)${C_RESET}"
-      render
-      continue
-    fi
-    if [ "$prior" = "BLOCK" ]; then
-      if override_exists "$prnum" "$rsha"; then
-        # Human override recorded for this sha — treat as PASS and proceed to merge path.
-        prior="PASS"
-      else
-        _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
-        render
-        continue
-      fi
-    fi
-    if [ "$prior" != "PASS" ]; then
-      # BACKGROUND review: advance the non-blocking state machine one step. Reviews for other
-      # PRs run concurrently (bounded by REVIEW_CONCURRENCY) and merges keep flowing — a PR with
-      # a cached PASS never waits behind someone else's in-flight review.
-      step="$(_review_gate_step "$prnum" "$slug" "$rsha")"
-      case "$step" in
-        PASS) : ;;  # verdict just collected + recorded — fall through to the merge path
-        BLOCK)
-          _handle_block_verdict "$prnum" "$slug" "$rsha" "$idx" "$dir"
-          render
-          continue ;;
-        QUEUED)
-          # Console honesty (HERD-185): name the STAGE (review) + WHY it waits (how many are ahead of
-          # it holding the cap) — never a bare gate label a health-stage wait could be confused with.
-          # A quiesce hold (HERD-251) is not a full cap: say which it is, so "queued (0 ahead)" can
-          # never read as a stuck console.
-          if _self_restart_hold_dispatch; then
-            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · held (watcher restarting on new engine code)${C_RESET}"
-          else
-            DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · queued ($(_count_live_reviews) ahead)${C_RESET}"
-          fi
-          render
-          continue ;;
-        RETRY)
-          # An INFRA death (EMPTY capture / rc0-no-verdict / severed reviewer) — NOT a refused
-          # verdict. Say so plainly and show the bounded retry budget; never "reviewer blocked".
-          _rv_k="$(_review_retry_count "$prnum" "$rsha")"
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review infra failed (no verdict) · retrying (${_rv_k}/${_REVIEW_RETRY_MAX})${C_RESET}"
-          render
-          continue ;;
-        FAILED)
-          DISPLAY[idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · review infra failed ${_REVIEW_RETRY_MAX}× for this commit${C_RESET}"
-          render
-          continue ;;
-        ESCALATED)
-          # (d) The review gate just stepped up to Opus on evidence (a failed refix round proved the
-          # cheap reviewer wrong). Mirror the builder lanes' '⬆️  escalated to $MODEL' step-up on the
-          # REVIEW lane so the console shows the upgrade — reviewing continues as normal underneath.
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}reviewing… ⬆️  escalated to ${REVIEW_MODEL_ESCALATED:-claude-opus-4-8} ($(refix_round_count "$prnum") failed refix rounds)${C_RESET}"
-          render
-          continue ;;
-        *)
-          # RUNNING — a reviewer is in flight. Console honesty: name the STAGE + how long it's been
-          # running (from the inflight marker's dispatch ts — an age any restarted watcher can read).
-          DISPLAY[idx]="    ${C_YELLOW}🔬${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}review · running ($(_fmt_age "$(_marker_age "$(_review_inflight_file "$prnum" "$rsha")")"))${C_RESET}"
-          render
-          continue ;;
-      esac
-    fi
-    # MERGE GUARD — cross-seat BLOCK precedence (HERD-247). THIS seat's gates are green for (pr,rsha),
-    # but green here means "no seat I can see refused it" only in a single-seat world. Before the
-    # blessing and before `gh pr merge`, re-establish the invariant from SHARED state: if another seat's
-    # BLOCK on this exact sha is still standing (its own later PASS, or a sha-keyed human override, would
-    # have resolved it), our PASS does NOT get to overwrite it. Hold, journal, and paint the row that
-    # tells the operator which seat to reconcile with. Fail-soft: an unreadable scan reports no block and
-    # this tick behaves exactly as it did before the guard existed. See _cross_seat_block_standing.
-    if _cross_seat_block_standing "$prnum" "$rsha"; then
-      _xseat_journal_honored "$prnum" "$rsha" "$_XSEAT_SEAT" merge
-      DISPLAY[idx]="$(_cross_seat_block_row "$sl" "$pn" "$_XSEAT_SEAT")"
-      render
-      continue
-    fi
-
-    # herd/gates → success (HERD-194). Both gates are now green for this (pr,sha): the healthcheck
-    # passed above (CLEAN/FLAKY) and the review verdict is PASS. Post the success status BEFORE the
-    # merge-policy decision below — the blessing reflects the GATE outcome, independent of any
-    # approve/observe/human-verify HOLD (a hold is a merge-policy choice, not a gate failure), and it
-    # must be on the head sha before do_merge so the watcher's own `gh pr merge` clears branch
-    # protection. Once per sha via the ledger; a new commit re-runs the gates and posts afresh.
-    post_gate_status "$prnum" "$rsha" success
-
-    # GATE-ONLY candidate (HERD-194): this PR reached here only to be BLESSED — it is MERGEABLE but not
-    # CLEAN (blocked by the required herd/gates check we just satisfied). The blessing is posted; the
-    # actual merge stays gated on CLEAN, so STOP here. GitHub recomputes mergeStateStatus once the status
-    # lands; a later tick sees CLEAN and takes the normal merge path. Never merge a non-CLEAN PR.
-    if [ -n "${bless_only:-}" ]; then
-      # Console honesty: only claim "blessed" if the success status ACTUALLY landed (the ledger row is
-      # written only on a successful POST). If the POST failed (best-effort, retries next tick), say
-      # "blessing…" — never assert a blessing that is not on the commit.
-      if _gate_status_posted "$prnum" "$rsha" success; then
-        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}gates green · herd/gates blessed · awaiting branch-protection recheck${C_RESET}"
-      else
-        DISPLAY[idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gates green · posting herd/gates blessing…${C_RESET}"
-      fi
-      render
-      continue
-    fi
-
-    # PASS (just now, or recorded for this sha) → proceed based on the effective merge policy AND,
-    # in auto mode, whether this specific PR declares a HUMAN-VERIFY block (which converts it to an
-    # approve-style hold on top of auto). The parse only runs in auto mode (a body fetch per PASS
-    # candidate) — approve/observe already hold every PR, so the marker is moot there.
-    mode="auto"; [ -z "$AUTOMERGE" ] && mode="approve"; [ -n "$MERGE_OBSERVE" ] && mode="observe"
-    hv_hold=""; hv_body=""
-    if [ "$mode" = "auto" ]; then
-      # Read the body ONCE and branch on the READ, not on its emptiness (HERD-237). In auto mode this
-      # parse is the ONLY thing that converts a green-gated PR into a human-verify hold, so an
-      # unreadable body must never be spent as "nothing to verify". FAIL CLOSED: skip the merge for
-      # this tick, journal it, and re-gate next tick — no ledger row is written, so a transient gh
-      # timeout costs one tick, and a persistent one holds the PR loudly instead of merging it blind.
-      hv_rc=0; hv_body="$(_pr_body "$prnum")" || hv_rc=$?
-      if [ "$hv_rc" -ne 0 ]; then
-        journal_append hv_body_unreadable pr "$prnum" sha "$rsha" slug "$slug" rc "$hv_rc" \
-          detail "cannot read the PR body — holding rather than merging a possibly human-verify PR"
-        DISPLAY[idx]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gh unreadable · holding (cannot read HUMAN-VERIFY block)${C_RESET}"
-        render
-        continue
-      fi
-      printf '%s' "$hv_body" | human_verify_has && hv_hold=1
-    fi
-    hold_kind="approve"; [ -n "$hv_hold" ] && hold_kind="human-verify"
-    # A hold is in effect when the policy holds (approve) OR this PR is human-verify-held AND
-    # HUMAN_VERIFY_POLICY still HOLDS (hold|coordinator). Under HUMAN_VERIFY_POLICY=auto (HERD-59) a
-    # human-verify PR is NOT held — its declared steps are recorded as informational, then it merges.
-    held=""
-    if [ "$mode" = "approve" ]; then
-      held=1
-    elif [ -n "$hv_hold" ] && [ "$HV_POLICY" != "auto" ]; then
-      held=1
-    fi
-    approved=""; approval_is_approved "$prnum" "$rsha" && approved=1
-
-    case "$(_hold_decision "$mode" "$hv_hold" "$approved" "$HV_POLICY")" in
-      OBSERVE)
-        # observe: run all gates, report + notify once per sha, NEVER merge.
-        if ! observe_noted "$prnum" "$rsha"; then
-          record_observe_noted "$prnum" "$rsha"
-          herd_driver_notify "🐑 PR #${prnum} ready (observe)" "${slug}: review passed — observe mode, not merging" default
-        fi
-        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}ready · observe mode${C_RESET}"
-        render
-        continue ;;
-
-      HOLD)
-        # First time gates pass for this sha: record the awaiting entry (reusing the approve
-        # ledger), journal the hold, and post a comment + notification. Sha-keyed, so a new commit
-        # (new sha) records a fresh awaiting entry — re-holding the PR until the new sha is approved.
-        if ! approval_awaiting_noted "$prnum" "$rsha"; then
-          record_approval_awaiting "$prnum" "$rsha"
-          if [ "$HV_POLICY" = "coordinator" ] && [ -n "$hv_hold" ]; then
-            # HUMAN_VERIFY_POLICY=coordinator: still a hold, but journaled with the policy + surfaced
-            # loudly as coordinator-actionable so a coordinator/agent runs the steps then approves.
-            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" human_verify_policy coordinator
-            hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
-            _gh_timeout hv_coordinator_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual steps and \`HUMAN_VERIFY_POLICY=coordinator\`, so it is held as **coordinator-actionable**: a coordinator/agent should execute these steps, then approve:
-
-${hv_steps}
-
-Once executed, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
-            herd_driver_notify "🐑 PR #${prnum} human-verify — coordinator action needed" "${slug}: gates passed — a coordinator/agent should run the steps then herd approve ${prnum}" default
-          elif [ -n "$hv_hold" ]; then
-            # HUMAN_VERIFY_POLICY=hold (default): byte-identical to today's per-PR human-verify hold.
-            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
-            hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
-            _gh_timeout hv_hold_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares manual steps that must be **human-verified** before merge:
-
-${hv_steps}
-
-Once verified, run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge. A new commit re-holds until re-verified." >/dev/null 2>&1 || true
-            herd_driver_notify "🐑 PR #${prnum} human-verify pending" "${slug}: gates passed — verify manual steps, then herd approve ${prnum}" default
-          else
-            journal_append hold_applied pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind"
-            _gh_timeout approve_hold_comment pr comment "$prnum" --body "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before merge.
-
-Run \`herd approve ${prnum}\` (or \`bash scripts/herd/herd-approve.sh approve ${prnum}\`) to approve commit \`${rsha:0:8}\` for merge." >/dev/null 2>&1 || true
-            herd_driver_notify "🐑 PR #${prnum} awaiting approval" "${slug}: gates passed — herd approve ${prnum}" default
-          fi
-        fi
-        DISPLAY[idx]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$hv_hold" "$prnum" "$HV_POLICY")${C_RESET}"
-        render
-        continue ;;
-
-      MERGE)
-        # HUMAN_VERIFY_POLICY=auto (HERD-59): a PR that declared HUMAN-VERIFY steps merges on green,
-        # with the declared steps recorded as INFORMATIONAL — journaled + PR-commented exactly once per
-        # sha. The journal line makes it explicit + auditable that the steps were NOT human-executed.
-        if [ -n "$hv_hold" ] && [ "$HV_POLICY" = "auto" ] && ! hv_informed_noted "$prnum" "$rsha"; then
-          record_hv_informed "$prnum" "$rsha"
-          hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"   # already-read body: no second fetch, no second timeout
-          journal_append human_verify_policy pr "$prnum" sha "$rsha" slug "$slug" policy auto action merged-with-declared-steps
-          _gh_timeout hv_auto_comment pr comment "$prnum" --body "🐑 **herd watch** · \`HUMAN_VERIFY_POLICY=auto\` — this PR declared manual verify steps, treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These steps were NOT executed before merge:
-
-${hv_steps}
-
-Recorded in the engine journal as \`human_verify_policy=auto merged-with-declared-steps\`." >/dev/null 2>&1 || true
-        fi
-        if [ -n "$held" ]; then
-          # A held PR (approve policy, or a human-verify hold) that now has a sha-keyed approval.
-          journal_append hold_released pr "$prnum" sha "$rsha" slug "$slug" kind "$hold_kind" reason approved
-          if [ -n "$hv_hold" ]; then
-            DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (human-verified)${C_RESET}"
-          else
-            DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging (approved)${C_RESET}"
-          fi
-        else
-          DISPLAY[idx]="    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}merging${C_RESET}"
-        fi
-        render
-        do_merge "$slug" "$prnum" "$dir" "$rsha"
-        continue ;;
-    esac
+#   _engine_tick_watchdog  — runs the Python live tick; a FAULT (non-zero exit / missing module) is
+#                          retried in-tick with backoff, a fault streak past _ENGINE_FAULT_MAX paints a
+#                          LOUD 'engine down · manual intervention' banner + journals engine_down + fires
+#                          ONE notification, and it keeps retrying so a transient self-recovers. CRITICAL:
+#                          no gate/merge/refix EVER runs in bash now, so a fault is simply "no engine
+#                          actions this tick" — the safe hold, never a partial merge.
+#   _tick_render_reconcile — runs EVERY cycle regardless of the tick's outcome: it observes the world and
+#                          paints the console (Phase A), hands the action pass to the Python engine via
+#                          the watchdog, then drains the spawn queue and runs the reconcile/sweep legs
+#                          (Phase C) over the same state files + journal the Python engine writes. This
+#                          half stays bash per the port spike (console, sweeps, notes, retirement).
+_engine_tick_watchdog() {
+  # Run the sole engine core (the Python live tick) with an in-tick backoff RETRY, then translate a
+  # persistent fault into the loud engine-down HOLD. State is carried in the long-lived watcher process
+  # via the module globals initialised near the other tick counters (_ENGINE_FAULT_STREAK etc.).
+  local attempt=1 ok=""
+  while : ; do
+    if herd_engine_live_tick; then ok=1; break; fi
+    [ "$attempt" -ge "$_ENGINE_TICK_RETRIES" ] && break
+    # Backoff between in-tick attempts (skipped in dry-run so a hermetic/sim run never sleeps).
+    [ -n "${DRYRUN:-}" ] || sleep "$(( attempt * _ENGINE_BACKOFF_BASE ))"
+    attempt=$(( attempt + 1 ))
   done
-
-  # Resolve pass: auto-(re)spawn the isolated conflict resolver for each queued CONFLICTING PR. A
-  # `first` reason is today's newly-conflicting spawn; `new-commit` / `dead-resolver` are HERD-55
-  # RESPAWNS (a new sha reshaped the conflict, or the prior resolver died) — journaled resolver_respawn.
-  k=0
-  for idx in ${CONF_IDX[@]+"${CONF_IDX[@]}"}; do
-    slug="${CONF_SLUG[k]}"; prnum="${CONF_PR[k]}"; branch="${CONF_BRANCH[k]}"; csha="${CONF_SHA[k]}"; creason="${CONF_REASON[k]}"; k=$((k + 1))
-    sl="$(_slug_cell "$slug")"
-    pn=" ${C_DIM}#${prnum}${C_RESET} ·"
-    # SELF-RESTART QUIESCE (HERD-251): a resolver is new gate work — hold it while the watcher drains
-    # toward its in-place re-exec. Nothing is recorded, so the restarted watcher dispatches it cleanly
-    # on the first tick after startup. Byte-inert with the lever off.
-    if _self_restart_hold_dispatch; then
-      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}conflict · held (watcher restarting on new engine code)${C_RESET}"
-      render
-      continue
+  if [ -n "$ok" ]; then
+    # Clean tick. If we had been declared down, announce the recovery once and clear the alarm.
+    if [ -n "$_ENGINE_DOWN_DECLARED" ]; then
+      journal_append engine_recovered after_fault_streak "$_ENGINE_FAULT_STREAK"
+      herd_driver_notify "🐑 herd engine recovered" "The Python engine core is ticking again after ${_ENGINE_FAULT_STREAK} faulty tick(s)." default
     fi
-    # A prior attempt at a DIFFERENT sha means this spawn is a cross-sha RETRY (a new commit arrived on
-    # a still-conflicting PR); no prior attempt at all means a fresh first conflict. record happens in
-    # spawn_resolver, so this read still sees only prior ticks' attempts.
-    _retry_reason="resolving conflict…"
-    resolver_ever_attempted "$branch" && _retry_reason="resolving (retry · new commit)"
-    # SUITE WRITE INTERLOCK (HERD-227): the resolver merges the base INSIDE this worktree. A PR that was
-    # CLEAN last tick (suite dispatched) and CONFLICTING this one still has that suite running here — the
-    # marker outlives the mergeability flip. Defer the spawn; nothing is recorded, so the resolver
-    # dispatches normally on the first tick after the suite collects.
-    if [ -z "$DRYRUN" ] && _defer_for_suite "$prnum" "$slug" "$csha" "$idx" resolver "conflict"; then
-      render
-      continue
+    _ENGINE_FAULT_STREAK=0
+    _ENGINE_DOWN_DECLARED=""
+    ENGINE_DOWN_ROW=""
+    return 0
+  fi
+  # The tick faulted through every retry. Grow the consecutive-fault streak and journal it.
+  _ENGINE_FAULT_STREAK=$(( _ENGINE_FAULT_STREAK + 1 ))
+  journal_append engine_tick_fault streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES"
+  if [ "$_ENGINE_FAULT_STREAK" -ge "$_ENGINE_FAULT_MAX" ]; then
+    # Past tolerance: paint the loud banner EVERY down-tick (so a restarted render always shows it) and,
+    # once per episode, journal engine_down + fire the notification path. No bash action runs — holds are
+    # the failure posture.
+    ENGINE_DOWN_ROW="    ${C_RED}🛑 ${C_BOLD}ENGINE DOWN${C_RESET}${C_RED} · manual intervention — the Python engine core faulted ${_ENGINE_FAULT_STREAK}× · NO gates/merges are running · check: ${C_DIM}python3 -m herd.live_runtime --tick${C_RESET}"$'\n'
+    if [ -z "$_ENGINE_DOWN_DECLARED" ]; then
+      _ENGINE_DOWN_DECLARED=1
+      journal_append engine_down streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES"
+      herd_driver_notify "🛑 herd engine down — manual intervention" "The Python engine core faulted ${_ENGINE_FAULT_STREAK}× consecutively; no merges or gates are running. Check python3 -m herd.live_runtime." default
     fi
-    if [ -n "$DRYRUN" ]; then
-      if [ "$creason" = "first" ]; then
-        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would spawn resolver for PR #${prnum}${C_RESET}"
-      else
-        DISPLAY[idx]="    ${C_DIM}🔀${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}[dry-run] would re-spawn resolver for PR #${prnum} (${creason})${C_RESET}"
-      fi
-      render
-      continue
-    fi
-    if [ "$creason" != "first" ]; then
-      _rr_round="$(( $(resolver_dispatch_count "$prnum") + 1 ))"
-      journal_append resolver_respawn pr "$prnum" slug "$slug" \
-        old_sha "$(resolver_last_sha "$prnum")" new_sha "$csha" reason "$creason" round "$_rr_round"
-      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}re-resolving conflict (round ${_rr_round})…${C_RESET}"
-    else
-      DISPLAY[idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}resolving conflict…${C_RESET}"
-    fi
-    render
-    spawn_resolver "$slug" "$prnum" "$branch" "$csha"
-  done
+    render   # repaint THIS tick so the engine-down banner shows immediately (render already ran once above)
+  fi
+  return 1
 }
 
 _tick_render_reconcile() {
@@ -12361,16 +11932,13 @@ EOF
   build_orphan_prs
 
   render
-  # ENGINE_IMPL=python (HERD-320/HERD-323, EPIC HERD-300): hand ONLY the action pass to the LIVE
-  # Python engine core. herd_engine_live_tick returns 0 only when Python is ARMED (ENGINE_IMPL=python)
-  # AND owned this tick successfully; then bash skips its own action pass and the render/reconcile
-  # legs above and below run against the state Python just wrote. Under the ship default (bash) it
-  # returns 1 IMMEDIATELY having done NOTHING, so `! herd_engine_live_tick` is always true and the
-  # bash action pass runs exactly as before — byte-identical. A Python fault (non-zero exit / missing
-  # module) also returns 1 → instant fallback to the authoritative bash action pass.
-  if ! herd_engine_live_tick; then
-    _tick_act
-  fi
+  # ENGINE (HERD-306, EPIC HERD-300 FINALE): hand the action pass to the SOLE engine core — the LIVE
+  # Python engine (pysrc/herd/live_runtime.py) — through the watchdog. There is NO bash action pass to
+  # fall back to anymore (_tick_act was deleted): the watchdog runs the Python tick, RETRIES a fault
+  # with backoff, and past a fault streak HOLDS loudly (engine-down banner + journal + notification)
+  # while it keeps retrying. A fault means "no engine actions this tick" — never a half-run. The render
+  # above and the reconcile/sweep legs below run every cycle regardless, against the state Python wrote.
+  _engine_tick_watchdog
   # Resolver-pane reconcile (HERD-280): retire the pane of every resolver whose DONE verdict has landed.
   # Runs OUTSIDE the conflict pass on purpose — a resolver that CLEARED its conflict leaves the pass's
   # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.
@@ -12454,9 +12022,9 @@ EOF
   if [ "$_ENGINE_TICK" -ge "$_ENGINE_INTERVAL" ]; then
     _ENGINE_TICK=0
     [ -n "$DRYRUN" ] || herd_engine_autoupdate_tick
-    # ENGINE_IMPL=shadow (HERD-316): run the Python shadow watcher beside this one, DRY-RUN. A HARD
-    # no-op under the ship default ENGINE_IMPL=bash, so the live tick is byte-identical when off.
-    herd_engine_shadow_tick
+    # (HERD-306) The live per-tick shadow dispatch is RETIRED: with the bash action pass deleted there
+    # is no live pipeline for a shadow run to parallel. The parity SHADOW oracle still exists, invoked
+    # out-of-band by scripts/herd/sim/parity-run.sh — never from this watch-time seam.
   fi
 }
 
@@ -12855,6 +12423,18 @@ _ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s s
 _INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
                             # reads (gh pr comments + tracker) never ride the 4 s repaint
 _INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
+
+# ENGINE WATCHDOG state (HERD-306) — the resident supervisor's fault memory across ticks. There is no
+# bash action-pass fallback anymore: _engine_tick_watchdog runs the sole (Python) engine core, RETRIES
+# a fault _ENGINE_TICK_RETRIES× with an _ENGINE_BACKOFF_BASE-second step, and after _ENGINE_FAULT_MAX
+# consecutive faulty ticks declares the engine DOWN loudly (banner + engine_down journal + one notify),
+# resetting on the first clean tick. Tuned for a ~4 s loop: 3 in-tick attempts, 3 faulty ticks (~tens of
+# seconds) before the alarm — long enough to ride out a transient, short enough to be noticed.
+_ENGINE_FAULT_STREAK=0      # consecutive faulty ticks (reset to 0 on any clean Python tick)
+_ENGINE_FAULT_MAX=3         # declare 'engine down' after this many consecutive faulty ticks
+_ENGINE_TICK_RETRIES=3      # in-tick attempts of the Python live tick before the tick counts as faulted
+_ENGINE_BACKOFF_BASE=2      # seconds; in-tick backoff between attempts is attempt × this (2 s, 4 s)
+_ENGINE_DOWN_DECLARED=""    # set once the loud engine-down posture is active; cleared on recovery
 
 # One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a

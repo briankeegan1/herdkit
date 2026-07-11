@@ -186,6 +186,19 @@ _posture_coherence_rules() {
       "REVIEW_MODEL_DOCS is set but DOCS_ONLY_GLOB is blank: the docs-only reviewer tier never triggers, so it has no effect." \
       "Set DOCS_ONLY_GLOB to route pure-docs diffs to REVIEW_MODEL_DOCS, or drop it."
   fi
+
+  # R6 — ENGINE_IMPL=bash | shadow is RETIRED (HERD-306, EPIC HERD-300): the bash engine core was
+  #      DELETED at the P5 cutover, so the only engine core is python. A retired value is a no-op that
+  #      WARNs loudly at runtime (engine-version.sh's herd_engine_impl) — the config still carries a
+  #      value the engine ignores, which is exactly the silent dead-end this lint exists to surface.
+  if _posture_is_set ENGINE_IMPL "$cfg" "$local"; then
+    case "$(printf '%s' "${ENGINE_IMPL:-}" | tr '[:upper:]' '[:lower:]')" in
+      bash|shadow)
+        _posture_add_finding \
+          "ENGINE_IMPL=${ENGINE_IMPL} is RETIRED: the bash engine core was deleted at the P5 cutover (HERD-306); the Python engine is now the SOLE engine core, so this value is a no-op that only warns." \
+          "Delete ENGINE_IMPL from .herd/config (the default is python — the only engine core)." ;;
+    esac
+  fi
 }
 
 # ── herd_doctor_posture — the `herd doctor --posture` entry point. Report-only; always returns 0. ────

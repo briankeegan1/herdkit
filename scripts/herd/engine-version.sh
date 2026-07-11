@@ -45,7 +45,11 @@
 #     HERD_ENGINE_UPDATE_SYNC, HERD_ENGINE_COOLDOWN_FILE, HERD_ENGINE_COOLDOWN_SECS.
 
 # The LOCAL engine's behavior level. Monotonic. See "BUMPING" above before you touch this.
-_HERD_ENGINE_LEVEL=1
+# Bumped 1→2 at the P5 cutover (HERD-306, EPIC HERD-300): a pre-P5b engine still carries the bash
+# action-pass fallback; a P5b+ engine has DELETED it (the Python live engine is the sole engine core),
+# so a project that has cut over depends on this level's behavior — the dual-engine doctrine's
+# "ENGINE_MIN bump at every phase flip".
+_HERD_ENGINE_LEVEL=2
 
 # journal.sh provides journal_append (best-effort, never fails a caller). Source it only if the
 # caller has not already — the same discipline herd-claim.sh uses. A journal that cannot resolve a
@@ -261,69 +265,66 @@ herd_engine_autoupdate_tick() {
   return 0
 }
 
-# ── ENGINE_IMPL: the engine-core implementation selector (HERD-316, EPIC HERD-300) ────────────────
-# The strangler port runs the Python engine core in SHADOW mode beside the authoritative bash watcher.
-# ENGINE_IMPL selects the posture; this seam resolves + dispatches it, ship-dormant and default-off.
+# ── ENGINE_IMPL after the P5 CUTOVER (HERD-306, EPIC HERD-300 FINALE) ─────────────────────────────
+# The bash engine-core ACTION PASS was DELETED in P5b (agent-watch.sh's _tick_act): the Python live
+# engine (pysrc/herd/live_runtime.py) is now the SOLE engine core, and the supervisor hands it every
+# tick with a watchdog (agent-watch.sh's _engine_tick_watchdog) instead of a bash fallback. ENGINE_IMPL
+# therefore no longer SELECTS an implementation — there is only one. The historical values `bash` and
+# `shadow` are RETIRED: they WARN loudly (once per process) and are treated as `python`, because there
+# is no bash action pass left to divert to and no live bash pipeline for a shadow run to parallel. The
+# parity SHADOW RUNTIME (pysrc/herd/shadow_runtime.py / shadow_journal.py) still exists as the
+# out-of-band parity oracle (scripts/herd/sim/parity-run.sh); only the LIVE per-tick shadow dispatch is
+# gone. The `herd_engine_shadow_tick` name survives as a retired no-op so nothing that called it breaks.
 
-# herd_engine_impl — the normalized implementation knob: bash | shadow | python. Anything but the
-# exact tokens `shadow` / `python` reads as `bash`, so a typo can never divert the authoritative
-# engine to the (dry-run) shadow port OR to the (live) Python tick — the safe default always wins.
+# herd_engine_impl — the resolved engine core. Post-cutover there is exactly one, so this ALWAYS
+# resolves `python`. The retired tokens `bash`/`shadow` (and any typo) WARN loudly ONCE per process and
+# journal the retirement, then resolve `python` — a stale config value can never divert or disable the
+# sole engine core, and the operator is told to drop the key.
+_HERD_ENGINE_IMPL_WARNED=""
 herd_engine_impl() {
-  case "${ENGINE_IMPL:-bash}" in
-    shadow) printf 'shadow' ;;
-    python) printf 'python' ;;
-    *)      printf 'bash' ;;
+  case "${ENGINE_IMPL:-python}" in
+    python|"") : ;;
+    bash|shadow)
+      if [ -z "$_HERD_ENGINE_IMPL_WARNED" ]; then
+        _HERD_ENGINE_IMPL_WARNED=1
+        printf 'herd: ENGINE_IMPL=%s is RETIRED (HERD-306) — the bash engine core was deleted; the Python engine is now the SOLE engine core. Treating as python; remove ENGINE_IMPL from .herd/config.\n' "${ENGINE_IMPL}" >&2
+        _herd_engine_journal engine_impl_retired "${ENGINE_IMPL}"
+      fi ;;
+    *)
+      if [ -z "$_HERD_ENGINE_IMPL_WARNED" ]; then
+        _HERD_ENGINE_IMPL_WARNED=1
+        printf 'herd: ENGINE_IMPL=%s is not a recognized value — the Python engine is the only engine core (HERD-306). Treating as python.\n' "${ENGINE_IMPL}" >&2
+      fi ;;
   esac
+  printf 'python'
 }
 
-# herd_engine_shadow_tick — dispatch the Python SHADOW watcher for one tick. A HARD no-op unless
-# ENGINE_IMPL=shadow (the ship default `bash` returns before doing ANYTHING, so the watcher's console,
-# argv, task-specs and journal are byte-identical to before this key existed). When armed it runs
-# `python3 -m herd.shadow_runtime` over a caller-provided sim fixture — DRY-RUN by construction: the
-# module writes ONLY .herd/journal-shadow.jsonl and mutates nothing the live engine reads (no gh, no
-# merge, no pane ops). Detached so a slow shadow pass never wedges the real tick. Fail-soft: a missing
-# python3, a missing package, or a missing fixture skips SILENTLY (a shadow miss is a parity gap, never
-# a red row). Always returns 0. The parity DIFF against the live journal is the P3 acceptance gate, run
-# out-of-band; this tick only PRODUCES the shadow stream. Test seam: HERD_ENGINE_SHADOW_SYNC=1 runs it
-# inline (not detached) so a unit can await the journal; HERD_ENGINE_SHADOW_FIXTURE points at the
-# scenario JSON (the sim rig feeds it — never the live control room, per the VERIFY discipline).
+# herd_engine_shadow_tick — RETIRED (HERD-306). The live per-tick shadow dispatch is gone: with no bash
+# action pass to run beside, ENGINE_IMPL=shadow no longer means anything at watch time. Kept as a hard
+# no-op (returns 0, mutates nothing, writes no journal) so any residual caller is inert; if the retired
+# `shadow` value is still in a config, the one-shot warning fires via herd_engine_impl. The parity
+# oracle path (python3 -m herd.shadow_runtime, driven by scripts/herd/sim/parity-run.sh) is UNAFFECTED —
+# it is invoked directly by the sim harness, never through this watch-time seam.
 herd_engine_shadow_tick() {
-  [ "$(herd_engine_impl)" = shadow ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  local home fixture pyp
-  home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
-  pyp="$home/pysrc"
-  [ -f "$pyp/herd/shadow_runtime.py" ] || return 0
-  fixture="${HERD_ENGINE_SHADOW_FIXTURE:-}"
-  [ -n "$fixture" ] && [ -f "$fixture" ] || return 0
-  _herd_engine_journal engine_shadow_dispatched shadow
-  if [ -n "${HERD_ENGINE_SHADOW_SYNC:-}" ]; then
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 || true
-    return 0
-  fi
-  ( PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" nohup python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 & ) \
-    >/dev/null 2>&1 || true
+  herd_engine_impl >/dev/null 2>&1   # fires the retired-value warning once if ENGINE_IMPL=shadow
   return 0
 }
 
-# herd_engine_live_tick — hand ONE watcher tick to the LIVE Python engine (HERD-320, P3f). This is the
-# CUTOVER seam: bash stays the resident supervisor of the `while true` loop, and each tick asks this
-# whether Python owned it. The return code IS the contract the loop reads:
+# herd_engine_live_tick — hand ONE watcher tick to the LIVE Python engine, the SOLE engine core
+# (HERD-306). No longer gated on ENGINE_IMPL (python is mandatory): it ALWAYS attempts
+# `python3 -m herd.live_runtime --tick` synchronously (the tick MUST complete before the supervisor
+# sleeps). The return code is the WATCHDOG contract the supervisor reads:
 #
-#   return 1 (Python did NOT own the tick)  ⇒  the bash tick body runs — the DEFAULT and the fallback.
-#   return 0 (Python OWNED the tick)         ⇒  the bash tick body is SKIPPED for this cycle.
+#   return 0  ⇒  the Python tick ran and exited 0 (clean tick).
+#   return 1  ⇒  a FAULT — missing python3 / missing module / a NON-ZERO Python exit. There is NO bash
+#                fallback anymore: the supervisor's _engine_tick_watchdog retries with backoff and, past
+#                a fault streak, HOLDS loudly (engine-down banner + journal + notification). A fault is
+#                therefore "no engine actions this tick" (the safe hold), never a partial/half merge.
 #
-# It returns 1 IMMEDIATELY (no output, nothing touched) unless ENGINE_IMPL=python — so under the ship
-# default (bash) the watcher is byte-identical: the loop's `if herd_engine_live_tick; then …` is always
-# false and the existing body runs exactly as before. Armed (ENGINE_IMPL=python) it runs
-# `python3 -m herd.live_runtime --tick` synchronously (the tick MUST complete before the loop sleeps)
-# and returns 0 only if that exits 0; a missing python3 / missing module / a NON-ZERO Python exit all
-# return 1, so a port fault instantly falls back to the authoritative bash tick — the kill-switch
-# (flip ENGINE_IMPL back to bash and Python is disabled on the very next tick). The Python side inherits
-# the watcher's dry-run switch (AGENT_WATCH_DRYRUN/DRYRUN): a dry-run watcher drives a dry-run tick that
-# actuates nothing, exactly as the bash dry-run does everything except the real merge/remove.
+# The Python side inherits the watcher's dry-run switch (AGENT_WATCH_DRYRUN/DRYRUN): a dry-run watcher
+# drives a dry-run tick that actuates nothing, exactly as the bash dry-run did.
 herd_engine_live_tick() {
-  [ "$(herd_engine_impl)" = python ] || return 1
+  herd_engine_impl >/dev/null 2>&1   # resolve (fires the retired-value warning once if ENGINE_IMPL is stale)
   command -v python3 >/dev/null 2>&1 || return 1
   local home pyp
   home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
