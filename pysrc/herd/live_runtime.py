@@ -63,6 +63,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from herd import decisions as D
 from herd import shadow_runtime as _shadow
@@ -80,6 +81,13 @@ IllegalTransition = _shadow.IllegalTransition
 # The four normalized gate outcomes a rail resolves to (contract §2.2) — shared with shadow mode.
 PASS, BLOCK, ESCALATE, HOLD = "PASS", "BLOCK", "ESCALATE", "HOLD"
 
+# A FIFTH terminal the live async model needs: a rail whose verdict is not in yet. WAIT is the rail's
+# "DISPATCH-AND-WAIT" token (contract §2.1 the gate is async dispatch/collect) — a reviewer/suite was
+# just dispatched OR is still in flight for this exact (pr, sha). The candidate is NOT ready this tick;
+# it holds WITHOUT merging and re-evaluates next tick when the verdict lands. It is NEVER a BLOCK — a
+# missing verdict is not a defect (task HERD-324 leg 1). PENDING is the candidate outcome WAIT maps to.
+WAIT, PENDING = "WAIT", "PENDING"
+
 
 # ── the subject under gate ────────────────────────────────────────────────────────────────────────
 
@@ -92,10 +100,12 @@ class LiveCandidate:
     record; ``worktree`` is the path reaped on merge.
     """
 
-    __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved", "hv_body")
+    __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
+                 "hv_body", "author", "assignees", "labels", "review_decision", "merge_status")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
-                 hv_hold=False, approved=False, hv_body=""):
+                 hv_hold=False, approved=False, hv_body="", author="", assignees=None,
+                 labels=None, review_decision="", merge_status=""):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
@@ -105,6 +115,14 @@ class LiveCandidate:
         self.hv_hold = bool(hv_hold)
         self.approved = bool(approved)
         self.hv_body = str(hv_body)
+        # SCOPE fields (task HERD-324 leg 3): the identity/labels the watcher-view lens + the
+        # WATCHER_SCOPE ownership gate filter discovery on, so a foreign-owner PR never enters
+        # classification. Absent in a legacy fixture → empty, which the default (mine/all) passes.
+        self.author = str(author or "")
+        self.assignees = list(assignees or [])
+        self.labels = list(labels or [])
+        self.review_decision = str(review_decision or "")
+        self.merge_status = str(merge_status or "")
 
     @classmethod
     def from_dict(cls, d):
@@ -112,7 +130,9 @@ class LiveCandidate:
             pr=d["pr"], sha=d["sha"], slug=d.get("slug", ""), base=d.get("base", ""),
             worktree=d.get("worktree", ""), stale=d.get("stale", False),
             hv_hold=d.get("hv_hold", False), approved=d.get("approved", False),
-            hv_body=d.get("hv_body", ""),
+            hv_body=d.get("hv_body", ""), author=d.get("author", ""),
+            assignees=d.get("assignees"), labels=d.get("labels"),
+            review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
         )
 
 
@@ -170,6 +190,236 @@ def _iter_pairs(seq):
         yield seq[i], seq[i + 1]
 
 
+# ── the shared on-disk gate contract ($TREES) — sha-keyed ledgers + in-flight markers ─────────────
+# The gate rails are ASYNC dispatch/collect state machines whose truth lives in flat files under the
+# watcher's state dir ``$TREES`` (== ``$WORKTREES_DIR``): the review ledger, the sha-keyed verdict/health
+# caches, the per-``(pr, sha)`` result/dispatch files a finished worker leaves, and the in-flight markers
+# that say "a worker is already on this exact (pr, sha)". :class:`LiveState` resolves EXACTLY the same
+# paths and formats ``agent-watch.sh`` uses, so a python tick and a bash tick share one substrate: a flip
+# between them REUSES a recorded verdict (review-once) and RESPECTS a live marker (never double-dispatch).
+# Every path/format anchor is an ``agent-watch.sh`` line; the port must not drift from them.
+
+def _now_epoch():
+    """Wall-clock epoch seconds, honoring the ``HERD_FAKE_NOW`` test seam (agent-watch.sh:_now_epoch)."""
+    fake = os.environ.get("HERD_FAKE_NOW")
+    return fake if fake else str(int(time.time()))
+
+
+def _pid_starttime(pid):
+    """A stable per-pid start-time token (agent-watch.sh:_pid_starttime) — the marker's recycling guard.
+    ``ps -o lstart=`` is portable across macOS/BSD+Linux; empty when ps cannot answer (caller then falls
+    back to a bare liveness check rather than over-reaping a live worker)."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        return " ".join(out.split())
+    except Exception:
+        return ""
+
+
+def _pid_live(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _marker_write(path, pid):
+    """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts (agent-watch.sh:2012).
+    Best-effort — an unwritable path drops the marker, never raises into the tick."""
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch()))
+    except Exception:
+        pass
+
+
+def _marker_live(path):
+    """True iff the marker's pid is alive AND (recycling guard) its start-time still matches
+    (agent-watch.sh:_marker_live). No recorded start-time → a bare kill -0 (fail toward NOT reaping)."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return False
+    pid = (lines[0].strip() if lines else "")
+    if not pid or not _pid_live(pid):
+        return False
+    st = (lines[1].strip() if len(lines) > 1 else "")
+    if not st:
+        return True
+    cur = _pid_starttime(pid)
+    return (not cur) or (cur == st)
+
+
+class LiveState:
+    """Resolver for the sha-keyed gate ledgers + in-flight markers under ``$TREES`` (== ``$WORKTREES_DIR``).
+
+    ``dir`` is the watcher's exported state dir. When it cannot resolve (neither env set) every path is
+    ``None`` and every read is empty / every write a no-op — the safe degrade for a sim with no state dir.
+    All formats mirror ``agent-watch.sh`` verbatim so the two implementations interoperate on one substrate.
+    """
+
+    def __init__(self, state_dir=None):
+        self.dir = state_dir or os.environ.get("TREES") or os.environ.get("WORKTREES_DIR") or None
+
+    def _p(self, name):
+        return os.path.join(self.dir, name) if self.dir else None
+
+    # review substrate ─────────────────────────────────────────────────────────────────────────────
+    def review_ledger(self):
+        return self._p(".agent-watch-reviewed")            # REVIEW_STATE (agent-watch.sh:301)
+
+    def review_result_file(self, cand):
+        return self._p(".review-result-%s-%s" % (cand.pr, cand.sha))     # agent-watch.sh:1946
+
+    def review_inflight_file(self, cand):
+        return self._p(".review-inflight-%s-%s" % (cand.pr, cand.sha))   # agent-watch.sh:1945
+
+    def review_registry_file(self, cand):
+        return self._p(".review-registry-%s-%s" % (cand.pr, cand.sha))   # agent-watch.sh:1966
+
+    def recorded_review(self, pr, sha):
+        """The recorded verdict for this exact ``(pr, sha)`` — review-once reuse (agent-watch.sh:1687).
+        ``awk '$2==pr && $3==sha {v=$4} END{print v}'`` — the LAST matching row wins."""
+        path = self.review_ledger()
+        if not path or not os.path.exists(path):
+            return None
+        verdict = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha):
+                        verdict = f[3]
+        except Exception:
+            return None
+        return verdict
+
+    def record_review(self, pr, sha, verdict, source="reviewer"):
+        """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source>`` (agent-watch.sh:1820)."""
+        path = self.review_ledger()
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s %s %s %s %s\n" % (_now_epoch(), pr, sha, verdict, source))
+        except Exception:
+            pass
+
+    def reviewer_registry_live(self, cand):
+        """True iff a reviewer pane is still registered live for this ``(pr, sha)`` (agent-watch.sh:2355):
+        a poller may have died but the pane persists — one reviewer IS already on it, so do not spawn a
+        second (the 2026-07-08 double-Opus incident). The registry row is ``<pid> <pane>``; pid live ⇒ live."""
+        path = self.review_registry_file(cand)
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().split()
+        except Exception:
+            return False
+        return bool(first) and _pid_live(first[0])
+
+    # health substrate ─────────────────────────────────────────────────────────────────────────────
+    def health_result_file(self, cand):
+        return self._p(".health-result-%s-%s" % (cand.pr, cand.sha))     # sha-cache (agent-watch.sh)
+
+    def _health_key(self, cand):
+        return "%s-%s" % (cand.pr, cand.sha)
+
+    def health_dispatch_file(self, cand):
+        return self._p(".health-dispatch-%s" % self._health_key(cand))   # worker output (agent-watch.sh)
+
+    def health_inflight_file(self, cand):
+        return self._p(".health-inflight-%s" % self._health_key(cand))   # agent-watch.sh:_health_inflight_file
+
+    def health_log_file(self, cand):
+        return self._p(".health-log-%s" % self._health_key(cand))
+
+    def health_cached_verdict(self, cand):
+        """The TERMINAL health verdict cached for this exact head sha — reuse with no suite re-run
+        (agent-watch.sh:10237). The cache line is ``<verdict>\\t<detail>``; verdict ∈ CLEAN|FLAKY|CODEERROR."""
+        path = self.health_result_file(cand)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\n")
+        except Exception:
+            return None
+        verdict = first.split("\t", 1)[0]
+        return verdict if verdict in ("CLEAN", "FLAKY", "CODEERROR") else None
+
+    def record_health_result(self, cand, verdict, detail=""):
+        """Cache a terminal health verdict for this exact commit (agent-watch.sh:record_health_result)."""
+        path = self.health_result_file(cand)
+        if not path or not cand.sha:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\t%s\n" % (verdict, detail or ""))
+        except Exception:
+            pass
+
+    # shared helpers ───────────────────────────────────────────────────────────────────────────────
+    def once(self, pr, sha, kind):
+        """Fire a hold's side effects exactly once per ``(pr, sha, kind)`` (once-guard doctrine, §5.3).
+        Returns True the first time (proceed + record the marker), False thereafter. With no state dir it
+        always proceeds — a sim/dry-run tick has no cross-tick state to dedup against, so it never suppresses."""
+        path = self._p(".live-noted-%s-%s-%s" % (kind, pr, sha))
+        if not path:
+            return True
+        if os.path.exists(path):
+            return False
+        try:
+            open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+        return True
+
+    def rm(self, *paths):
+        for p in paths:
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+# _health_worker mirror (agent-watch.sh:_health_worker): the ASYNC suite the port dispatches for one
+# (pr, sha). Runs healthcheck.sh BASELINE-AWARE (HERD-190: $MAIN as the base tree, $TREES as the sha-keyed
+# base cache) streaming to a tailable log, keeps the SAME retry-before-red (a rc-1 code error is re-run
+# ONCE, solo — a transient self-heals to FLAKY, only a reproducing failure reds), and writes its TERMINAL
+# verdict atomically (temp+mv) as one ``<verdict>\t<detail>`` line the collector consumes:
+#   CLEAN\t{clean|dataenv}  — passed (clean, or a tolerated data/env ⚠️ first line, healthcheck.sh exit 0)
+#   FLAKY\t<detail>         — first run code-errored but the solo retry PASSED
+#   CODEERROR\t<detail>     — code error reproduced on the retry; drives the red row
+# Args: $1 healthcheck.sh  $2 worktree  $3 dispatch-out  $4 log  $5 MAIN(base)  $6 TREES(base cache).
+_HEALTH_WORKER_SH = r'''
+set -u
+hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"
+_run() { HERD_BASELINE_DIR="$base" HERD_BASELINE_CACHE="$cache" bash "$hc" "$dir" > "$1" 2>&1; }
+_run "$log"; rc=$?
+first="$(sed -n '1p' "$log" 2>/dev/null)"
+if [ "$rc" -eq 0 ]; then
+  case "$first" in "⚠️"*) line="CLEAN"$'\t'"dataenv" ;; *) line="CLEAN"$'\t'"clean" ;; esac
+else
+  notok="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$notok" ] || notok="$first"
+  _run "$log.retry"; rc2=$?
+  if [ "$rc2" -eq 0 ]; then
+    rm -f "$log.retry" 2>/dev/null || true
+    d="$(printf '%s' "$notok" | tr '\t\n' '  ')"; line="FLAKY"$'\t'"${d:0:200}"
+  else
+    mv "$log.retry" "$log" 2>/dev/null || true
+    d="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$d" ] || d="$notok"
+    d="$(printf '%s' "$d" | tr '\t\n' '  ')"; line="CODEERROR"$'\t'"${d:0:200}"
+  fi
+fi
+printf '%s\n' "$line" > "$out.tmp.$$" 2>/dev/null && mv "$out.tmp.$$" "$out" 2>/dev/null || true
+'''
+
+
 # ── discovery: where candidates come from ─────────────────────────────────────────────────────────
 
 def discover_via_graphql(repo=None, limit=50):
@@ -188,7 +438,8 @@ def discover_via_graphql(repo=None, limit=50):
     query = (
         "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){"
         "pullRequests(states:OPEN,first:$n){nodes{number headRefName mergeStateStatus "
-        "headRefOid baseRefName}}}}"
+        "headRefOid baseRefName reviewDecision author{login} "
+        "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
     owner, name = _repo_owner_name(repo)
     out = subprocess.run(
@@ -205,8 +456,90 @@ def discover_via_graphql(repo=None, limit=50):
             pr=node.get("number"), sha=node.get("headRefOid", ""),
             slug=node.get("headRefName", ""), base=node.get("baseRefName", ""),
             stale=(node.get("mergeStateStatus") == "BEHIND"),
+            merge_status=node.get("mergeStateStatus", ""),
+            author=((node.get("author") or {}).get("login", "")),
+            assignees=[(a or {}).get("login", "") for a in
+                       ((node.get("assignees") or {}).get("nodes") or [])],
+            labels=[(l or {}).get("name", "") for l in
+                    ((node.get("labels") or {}).get("nodes") or [])],
+            review_decision=node.get("reviewDecision", ""),
         ))
     return cands
+
+
+# ── scope: which discovered PRs may ENTER classification (task HERD-324 leg 3) ─────────────────────
+# The watcher-view lens (WATCHER_VIEW*) and the WATCHER_SCOPE ownership gate NARROW discovery exactly
+# as the bash tick does (agent-watch.sh:10620–10810): a foreign-owner PR never enters the gate DAG, so
+# the port can never merge a teammate's PR. Both are read-time SELECTION filters — they only ever
+# WITHHOLD a candidate, never authorize a merge the gates would otherwise deny. Default (WATCHER_VIEW
+# unset/all + WATCHER_SCOPE unset/mine) is a byte-identical passthrough: every discovered PR flows through.
+
+_WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
+                 "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER")
+
+
+def _watcher_scope(config):
+    v = str(config.get("WATCHER_SCOPE", "") or "mine")
+    return v if v in ("mine", "all") else "mine"                      # unknown → safe default (10764)
+
+
+def _resolve_owner(config):
+    """The operator identity that owns auto-merge: WATCHER_OWNER → WATCHER_VIEW_AUTHOR → ``gh api user``
+    (agent-watch.sh:10784). The gh probe is LIVE-only and reached solely in team mode with no configured
+    identity; a sim always supplies WATCHER_OWNER, so a test never runs gh."""
+    owner = config.get("WATCHER_OWNER") or config.get("WATCHER_VIEW_AUTHOR")
+    if owner:
+        return owner
+    try:
+        out = subprocess.run(["gh", "api", "user", "-q", ".login"],
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _view_keeps(cand, config):
+    """Port of the bash watcher-view ``keep(pr)`` predicate (agent-watch.sh:10731): lens narrowing
+    (mine/deps/review-queue) AND'd with the author/assignee/label/status filters. An unknown lens
+    degrades to ``all`` (shows every PR, never fewer-by-accident)."""
+    lens = str(config.get("WATCHER_VIEW", "") or "all")
+    if lens not in ("all", "mine", "deps", "review-queue"):
+        lens = "all"
+    author = config.get("WATCHER_VIEW_AUTHOR") or (_resolve_owner(config) if lens == "mine" else "")
+    assignee = config.get("WATCHER_VIEW_ASSIGNEE") or ""
+    label = config.get("WATCHER_VIEW_LABEL") or ""
+    status = config.get("WATCHER_VIEW_STATUS") or ""
+    deps_label = config.get("WATCHER_VIEW_DEPS_LABEL") or "dependencies"
+    if lens == "mine":
+        if not author or cand.author != author:
+            return False
+    elif lens == "review-queue":
+        if cand.review_decision != "REVIEW_REQUIRED":
+            return False
+    elif lens == "deps":
+        if deps_label not in cand.labels:
+            return False
+    if author and lens != "mine" and cand.author != author:
+        return False
+    if assignee and assignee not in cand.assignees:
+        return False
+    if label and label not in cand.labels:
+        return False
+    if status and cand.merge_status != status:
+        return False
+    return True
+
+
+def _select_candidates(cands, config):
+    """Apply the watcher-view lens then the WATCHER_SCOPE ownership gate to a discovered candidate list.
+    In team mode (scope=all) a PR NOT authored by the resolved operator identity is dropped — FAIL-CLOSED:
+    an unresolvable owner drops every foreign candidate rather than blind-merge one (agent-watch.sh:10801)."""
+    config = config or {}
+    kept = [c for c in cands if _view_keeps(c, config)]
+    if _watcher_scope(config) == "all":
+        owner = _resolve_owner(config)
+        kept = [c for c in kept if owner and c.author == owner]
+    return kept
 
 
 def _repo_owner_name(repo=None):
@@ -224,61 +557,176 @@ def _repo_owner_name(repo=None):
 
 
 class FixtureDiscovery:
-    """Sim/dry-run discovery: candidates injected from a scenario dict, never the live control room."""
+    """Sim/dry-run discovery: candidates injected from a scenario dict, never the live control room.
+    The scope/view filter (leg 3) is applied HERE too, so a sim can prove foreign-owner exclusion
+    hermetically (no gh) via a scenario ``config`` carrying WATCHER_SCOPE/WATCHER_VIEW/WATCHER_OWNER."""
 
     def __init__(self, scenario):
         self._cands = [LiveCandidate.from_dict(c) for c in (scenario.get("candidates") or [])]
+        self._config = dict((scenario or {}).get("config") or {})
 
     def discover(self):
-        return list(self._cands)
+        return _select_candidates(list(self._cands), self._config)
 
 
 class _GraphQLDiscovery:
-    """Thin adapter so the live entrypoint has the same ``.discover()`` shape as the fixture one."""
+    """Thin adapter so the live entrypoint has the same ``.discover()`` shape as the fixture one, with
+    the scope/view ownership gate applied to the batched GraphQL result before anything is classified."""
 
-    def __init__(self, repo=None):
+    def __init__(self, config=None, repo=None):
+        self._config = config or {}
         self._repo = repo
 
     def discover(self):
-        return discover_via_graphql(self._repo)
+        return _select_candidates(discover_via_graphql(self._repo), self._config)
 
 
 # ── gate dispatch: shell out to the existing leaf scripts, consume their contract output ───────────
 
 class LiveGates:
-    """Dispatch the gate rails by SHELLING OUT to the existing leaf scripts (the port's whole point).
+    """Dispatch the gate rails by SHELLING OUT to the existing leaf scripts — ASYNC, sha-keyed, and
+    marker-aware, EXACTLY as the bash tick does (task HERD-324 leg 1, agent-watch.sh:_review_gate_step /
+    :_healthcheck_gate). Each rail is a NON-BLOCKING dispatch/collect step over the shared ``$TREES``
+    substrate (:class:`LiveState`), so a python↔bash flip on the very same ``(pr, sha)`` can never
+    double-dispatch and never re-runs a review whose verdict is already recorded:
 
-    ``health`` runs ``scripts/herd/healthcheck.sh <worktree> --heavy --oneline`` and maps its exit
-    code by the leaf's documented contract (healthcheck.sh:2): ``0`` clean, ``2`` tolerated data/env
-    (a FLAKY pass), ``1`` a real CODE error. ``review`` runs ``scripts/herd/herd-review.sh <pr>
-    <slug>`` and parses its single ``REVIEW:`` verdict line (herd-review.sh CONTRACT): ``PASS`` /
-    ``BLOCK`` are recorded verdicts, ``INFRA-FAIL`` (or no parseable line) is a transient INFRA outcome
-    — NEVER a cached code verdict. Never reached under ``--dry-run`` (that uses :class:`FixtureGates`).
+      1. REVIEW-ONCE — a verdict recorded for this exact ``(pr, sha)`` is REUSED, no reviewer/suite runs.
+      2. COLLECT — a finished worker's result/dispatch file is consumed into the ledger/sha-cache.
+      3. IN FLIGHT — a live marker (or, for review, a live reviewer registry) means one is ALREADY on it
+         → :data:`WAIT` (dispatch-and-wait), NEVER a second dispatch.
+      4. DISPATCH — nothing recorded, nothing in flight → launch the leaf ASYNC, lay the marker, WAIT.
+
+    A missing verdict is :data:`WAIT`, NEVER :data:`BLOCK`. ``health`` runs ``healthcheck.sh`` baseline-aware
+    via the :data:`_HEALTH_WORKER_SH` worker; ``review`` runs ``herd-review.sh`` with the same result-file /
+    sha-pin env the bash dispatcher uses. Never reached under ``--dry-run`` (that uses :class:`FixtureGates`).
+    The ``reused_*`` flags tell the walk a terminal was REUSED (not freshly collected), so it does not
+    re-journal a ``verdict_recorded`` / ``healthcheck_outcome`` for a held PR every tick.
     """
 
-    def __init__(self, home):
+    def __init__(self, home, state, journal):
         self.home = home
+        self.state = state
+        self.journal = journal
+        self.reused_review = False
+        self.reused_health = False
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
 
+    # ── health rail ────────────────────────────────────────────────────────────────────────────────
     def health(self, cand):
-        rc = subprocess.run(
-            ["bash", self._script("healthcheck.sh"), cand.worktree, "--heavy", "--oneline"],
-            capture_output=True, text=True,
-        ).returncode
-        if rc == 0:
-            return "CLEAN"
-        if rc == 2:
-            return "FLAKY"          # tolerated data/env — counts as a health pass (contract §2.2)
-        return "CODEERROR"
+        st = self.state
+        self.reused_health = False
+        # 1. REVIEW-ONCE: an unchanged commit cannot yield a different verdict — reuse the sha-cache.
+        cached = st.health_cached_verdict(cand)
+        if cached:
+            self.reused_health = True
+            return cached
+        # 2. COLLECT a finished worker's terminal verdict into the sha-cache (at-least-once: record the
+        #    durable cache, THEN drop the scratch — a crash mid-collect re-reads the dispatch file next tick).
+        disp = st.health_dispatch_file(cand)
+        if disp and os.path.exists(disp):
+            try:
+                with open(disp, encoding="utf-8") as fh:
+                    first = fh.readline().rstrip("\n")
+            except Exception:
+                first = ""
+            verdict, _, detail = first.partition("\t")
+            if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                st.record_health_result(cand, verdict, detail)
+                st.rm(disp, st.health_inflight_file(cand))
+                return verdict
+            # Unparseable / truncated worker output → an infra death, NOT a verdict; never cache. Drop
+            # it and re-dispatch on the next tick (bounded implicitly once the suite finally succeeds).
+            st.rm(disp)
+            return WAIT
+        # 3. IN FLIGHT: a live worker on this exact (pr, sha) → wait, never a second overlapping suite.
+        inflight = st.health_inflight_file(cand)
+        if inflight and _marker_live(inflight):
+            return WAIT
+        # 4. DISPATCH the async suite worker + lay the marker → wait.
+        self._dispatch_health(cand)
+        return WAIT
 
+    def _dispatch_health(self, cand):
+        st = self.state
+        disp = st.health_dispatch_file(cand)
+        inflight = st.health_inflight_file(cand)
+        log = st.health_log_file(cand)
+        if not disp:
+            return
+        base = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", _HEALTH_WORKER_SH, "_",
+                 self._script("healthcheck.sh"), cand.worktree, disp, log, base, st.dir or ""],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except Exception as exc:
+            self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "health",
+                                "detail", "health dispatch failed: %s" % str(exc)[:160])
+            return
+        _marker_write(inflight, proc.pid)
+        self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                            "pid", proc.pid, "log_path", log or "")
+
+    # ── review rail ────────────────────────────────────────────────────────────────────────────────
     def review(self, cand):
-        out = subprocess.run(
-            ["bash", self._script("herd-review.sh"), cand.pr, cand.slug],
-            capture_output=True, text=True,
-        )
-        return parse_review_verdict(out.stdout)
+        st = self.state
+        self.reused_review = False
+        # 1. REVIEW-ONCE: a recorded PASS/BLOCK for this exact (pr, sha) is reused — no reviewer runs.
+        rec = st.recorded_review(cand.pr, cand.sha)
+        if rec in ("PASS", "BLOCK"):
+            self.reused_review = True
+            return rec
+        # 2. COLLECT a finished reviewer verdict: record PASS/BLOCK durably to the ledger FIRST, then drop
+        #    the scratch (record-before-rm, agent-watch.sh:2863). INFRA-FAIL / no verdict is never cached.
+        result = st.review_result_file(cand)
+        inflight = st.review_inflight_file(cand)
+        if result and os.path.exists(result):
+            try:
+                with open(result, encoding="utf-8") as fh:
+                    verdict = parse_review_verdict(fh.read())
+            except Exception:
+                verdict = "INFRA"
+            if verdict in ("PASS", "BLOCK"):
+                st.record_review(cand.pr, cand.sha, verdict, "reviewer")
+                st.rm(result, inflight, st.review_registry_file(cand))
+                return verdict
+            st.rm(result, inflight, st.review_registry_file(cand))
+            return "INFRA"          # infra death — a transient the caller escalates, never a cached BLOCK
+        # 3. IN FLIGHT: a live reviewer poller (marker) OR its pane (registry) → dispatch-and-wait.
+        if inflight and _marker_live(inflight):
+            return WAIT
+        if st.reviewer_registry_live(cand):
+            return WAIT
+        # 4. DISPATCH the reviewer async + lay the marker → wait.
+        self._dispatch_review(cand)
+        return WAIT
+
+    def _dispatch_review(self, cand):
+        st = self.state
+        result = st.review_result_file(cand)
+        inflight = st.review_inflight_file(cand)
+        registry = st.review_registry_file(cand)
+        if not result:
+            return
+        env = dict(os.environ)
+        env["HERD_REVIEW_RESULT_FILE"] = result
+        env["HERD_REVIEW_REGISTRY_FILE"] = registry or ""
+        env["HERD_REVIEW_SHA"] = cand.sha          # pin the reviewer's diff input to this dispatch sha
+        try:
+            proc = subprocess.Popen(
+                ["bash", self._script("herd-review.sh"), cand.pr, cand.slug],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=env,
+            )
+        except Exception as exc:
+            self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
+                                "detail", "review dispatch failed: %s" % str(exc)[:160])
+            return
+        _marker_write(inflight, proc.pid)
+        self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pid", proc.pid,
+                            "pin", cand.sha)
 
 
 def parse_review_verdict(text):
@@ -307,10 +755,14 @@ def parse_review_verdict(text):
 class FixtureGates:
     """Sim/dry-run gates: return the rail outcomes SCRIPTED per-candidate in the scenario.
 
-    Reads ``health`` ∈ CLEAN|FLAKY|CODEERROR and ``review`` ∈ PASS|BLOCK|INFRA off the candidate's own
-    fixture fields (stashed on the object by :meth:`_stash`), so a scenario drives the whole DAG with
-    NO subprocess — the side-effect-free VERIFY path.
+    Reads ``health`` ∈ CLEAN|FLAKY|CODEERROR|WAIT and ``review`` ∈ PASS|BLOCK|INFRA|WAIT off the
+    candidate's own fixture fields, so a scenario drives the whole DAG (including the async
+    dispatch-and-wait path) with NO subprocess — the side-effect-free VERIFY path. ``reused_*`` are
+    inert here (a sim rail is always "fresh"), so the walk journals its outcome exactly as before.
     """
+
+    reused_review = False
+    reused_health = False
 
     def __init__(self, scenario):
         self._by_pr = {str(c["pr"]): c for c in (scenario.get("candidates") or [])}
@@ -320,11 +772,11 @@ class FixtureGates:
 
     def health(self, cand):
         v = str(self._spec(cand).get("health", "CLEAN")).upper()
-        return v if v in ("CLEAN", "FLAKY", "CODEERROR") else "CLEAN"
+        return v if v in ("CLEAN", "FLAKY", "CODEERROR", WAIT) else "CLEAN"
 
     def review(self, cand):
         v = str(self._spec(cand).get("review", "PASS")).upper()
-        return v if v in ("PASS", "BLOCK", "INFRA") else "PASS"
+        return v if v in ("PASS", "BLOCK", "INFRA", WAIT) else "PASS"
 
 
 # ── apply: actuate the terminal action (merge / reap) or, in dry-run, journal only ────────────────
@@ -401,12 +853,16 @@ class LiveTick:
     observe decision is :func:`herd.decisions.hold_decision`, reused verbatim.
     """
 
-    def __init__(self, config, discovery, gates, actuator, journal):
+    def __init__(self, config, discovery, gates, actuator, journal, state=None):
         self.config = config or {}
         self.discovery = discovery
         self.gates = gates
         self.actuator = actuator
         self.journal = journal
+        # The shared on-disk state ($TREES) — used here for the once-per-(pr,sha) hold guards (§5.3).
+        # None → a black-hole LiveState (no dir): a sim/dry-run tick has no cross-tick state and never
+        # writes a marker, so the fixture path stays hermetic.
+        self.state = state if state is not None else LiveState(None)
         self._merge_policy = D.effective_merge_policy(
             self.config.get("MERGE_POLICY"), self.config.get("WATCHER_AUTOMERGE"))
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
@@ -428,22 +884,34 @@ class LiveTick:
         return nxt
 
     def _walk(self, cand):
-        """Walk one candidate's gate DAG; actuate the terminal; return the action string."""
+        """Walk one candidate's gate DAG; actuate the terminal; return the action string.
+
+        A rail that returns :data:`WAIT` (a reviewer/suite dispatched or in flight for this ``(pr, sha)``)
+        short-circuits to :data:`PENDING`: the candidate holds WITHOUT merging and re-evaluates next tick
+        when the verdict lands — a missing verdict is never a BLOCK (task HERD-324 leg 1). ``reused_*``
+        from the gate suppresses re-journaling a verdict/outcome for a terminal REUSED from the sha ledger.
+        """
         self._state.setdefault(cand.pr, _S_INTAKE)
 
         # 1. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
-            self.journal.append("stale_dup_hold", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "kind", "stale", "reason", "behind base")
+            if self.state.once(cand.pr, cand.sha, "stale"):
+                self.journal.append("stale_dup_hold", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "kind", "stale", "reason", "behind base")
             self._advance(cand, "stale_detected")
             return HOLD
 
-        # 2. health rail (deterministic-slow) — dispatched by shelling out to the health runner.
-        self._advance(cand, "dispatch_health")
-        self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha)
+        # 2. health rail (deterministic-slow) — DISPATCHED async by shelling out to the health runner
+        #    (the dispatch/started event is journaled by the gate, only on an actual dispatch).
         health = self.gates.health(cand)
-        health = health if health in ("CLEAN", "FLAKY", "CODEERROR") else "CLEAN"
-        self.journal.append("healthcheck_outcome", "pr", cand.pr, "slug", cand.slug, "outcome", health)
+        health = health if health in ("CLEAN", "FLAKY", "CODEERROR", WAIT) else "CLEAN"
+        if health == WAIT:
+            self.journal.append("health_pending", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+            self._advance(cand, "dispatch_health")
+            return PENDING
+        self._advance(cand, "dispatch_health")
+        if not getattr(self.gates, "reused_health", False):
+            self.journal.append("healthcheck_outcome", "pr", cand.pr, "slug", cand.slug, "outcome", health)
         self._advance(cand, {"CLEAN": "health_clean", "FLAKY": "health_flaky",
                              "CODEERROR": "health_codeerror"}[health])
         if health == "CODEERROR":
@@ -451,27 +919,32 @@ class LiveTick:
                                 "round", 1, "rule", "healthcheck")
             return BLOCK
 
-        # 3. review rail (LLM) — dispatched by shelling out to the adversarial reviewer.
-        self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pin", cand.sha)
+        # 3. review rail (LLM) — DISPATCHED async by shelling out to the adversarial reviewer.
         verdict = self.gates.review(cand)
-        verdict = verdict if verdict in ("PASS", "BLOCK", "INFRA") else "PASS"
+        verdict = verdict if verdict in ("PASS", "BLOCK", "INFRA", WAIT) else "PASS"
+        if verdict == WAIT:
+            self.journal.append("review_pending", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+            return PENDING
         if verdict == "INFRA":
             # Infra death is not a verdict — forensic record is infra_event, the caller retries (§2.2).
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
                                 "detail", "no parseable verdict")
             self._advance(cand, "review_infra")
             return ESCALATE
-        self.journal.append("verdict_recorded", "pr", cand.pr, "sha", cand.sha, "value", verdict,
-                            "source", "reviewer")
+        if not getattr(self.gates, "reused_review", False):
+            self.journal.append("verdict_recorded", "pr", cand.pr, "sha", cand.sha, "value", verdict,
+                                "source", "reviewer")
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                 "round", 1, "rule", "review")
             return BLOCK
 
-        # 4. the blessing — both rails passed (review_pass advanced the lifecycle to BLESSED).
-        self.journal.append("blessing", "pr", cand.pr, "sha", cand.sha, "context", "herd/gates",
-                            "state", "success")
+        # 4. the blessing — both rails passed (review_pass advanced the lifecycle to BLESSED). Once per
+        #    (pr, sha): a held-but-blessed PR re-walked every tick posts the blessing exactly once (§5.3).
+        if self.state.once(cand.pr, cand.sha, "blessing"):
+            self.journal.append("blessing", "pr", cand.pr, "sha", cand.sha, "context", "herd/gates",
+                                "state", "success")
 
         # 5. the pure hold / merge / observe decision (reused from P2, contract §2.2/§5.4-§5.5).
         action = D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy)
@@ -485,11 +958,13 @@ class LiveTick:
                 return "MERGE"
             return ESCALATE                        # merge failed → escalate, never a silent drop
         if action == "HOLD":
-            self.journal.append("hold_applied", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "kind", "approval" if self._merge_policy == "approve" else "human-verify")
+            if self.state.once(cand.pr, cand.sha, "hold"):
+                self.journal.append("hold_applied", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "kind", "approval" if self._merge_policy == "approve" else "human-verify")
             return HOLD
         # OBSERVE — observe mode never merges.
-        self.journal.append("observe_noted", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+        if self.state.once(cand.pr, cand.sha, "observe"):
+            self.journal.append("observe_noted", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
         return "OBSERVE"
 
     def run(self):
@@ -508,8 +983,10 @@ class LiveTick:
                 self._outcome[cand.pr] = ESCALATE
         merged = [pr for pr, a in self._outcome.items() if a == "MERGE"]
         held = [pr for pr, a in self._outcome.items() if a == HOLD]
-        self.journal.append("live_tick_end", "merged", len(merged), "held", len(held))
-        return {"outcomes": dict(self._outcome), "merged": merged, "held": held,
+        pending = [pr for pr, a in self._outcome.items() if a == PENDING]
+        self.journal.append("live_tick_end", "merged", len(merged), "held", len(held),
+                            "pending", len(pending))
+        return {"outcomes": dict(self._outcome), "merged": merged, "held": held, "pending": pending,
                 "journal": self.journal.path}
 
 
@@ -517,7 +994,8 @@ class LiveTick:
 
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
-    for knob in ("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY"):
+    knobs = ("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY") + _WATCHER_KEYS
+    for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
     return config
@@ -567,8 +1045,9 @@ def _run_dry_run(fixture):
     scenario = json.loads(raw) if raw.strip() else {}
     config = _config_from_env(scenario)
     journal = LiveJournal(os.environ.get("LIVE_DRYRUN_JOURNAL"))
+    # A black-hole LiveState (no dir): the fixture path writes NO on-disk marker, stays hermetic.
     tick = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
-                    DryRunActuator(journal), journal)
+                    DryRunActuator(journal), journal, state=LiveState(None))
     return tick.run()
 
 
@@ -579,12 +1058,27 @@ def _run_live_tick():
     DryRunActuator (journals, no gh/git), exactly as the bash watcher's dry-run does everything except
     the real merge/remove. Returns the summary; the ``main`` wrapper turns any exception into a
     non-zero exit so the bash supervisor falls back to its own tick body for this cycle.
+
+    JOURNAL WIRING (task HERD-324 leg 2): the journal path is resolved from the SAME watcher-exported
+    config the bash engine reads (``JOURNAL_FILE`` else ``<WORKTREES_DIR>/.herd/journal.jsonl``). A live
+    (actuating) tick REFUSES to run unjournaled — if the path cannot resolve we FAIL LOUD so ``main``
+    returns non-zero and the bash supervisor owns the tick, rather than actuate merges with a null
+    journal (the manual-tick ``journal:null`` this fixes). A dry-run tick actuates nothing, so a
+    black-hole journal there is tolerated.
     """
     home = _home()
     config = _config_from_env()
-    journal = LiveJournal(LiveJournal.resolve_live_path())
-    actuator = DryRunActuator(journal) if _dryrun_env() else LiveActuator(home, journal)
-    tick = LiveTick(config, _GraphQLDiscovery(), LiveGates(home), actuator, journal)
+    dry = _dryrun_env()
+    path = LiveJournal.resolve_live_path()
+    if not path and not dry:
+        raise RuntimeError(
+            "live tick refuses to run unjournaled: neither JOURNAL_FILE nor WORKTREES_DIR resolves a "
+            "journal path (docs/engine-contract.md §3) — never actuate a merge with journal:null")
+    journal = LiveJournal(path)
+    state = LiveState()          # $TREES / $WORKTREES_DIR — the shared sha-keyed ledger + marker substrate
+    actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal)
+    tick = LiveTick(config, _GraphQLDiscovery(config), LiveGates(home, state, journal),
+                    actuator, journal, state=state)
     return tick.run()
 
 
