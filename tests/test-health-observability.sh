@@ -110,6 +110,31 @@ kill "$PP" 2>/dev/null || true
 rm -f "$INF" "$(_health_log_file "601-shaPROG")" 2>/dev/null || true
 ok
 
+# ── (2b) EMPTY-LOG CRASH vs SLOW SUITE (HERD-313) — the in-flight note is three-valued ───────────────
+# The liveness clause distinguishes a suite that has produced NOTHING (a likely crash/wedge) from one
+# that is slow but alive, so a climbing elapsed time is never an unreadable stopwatch.
+#   • TAP stream     → the live 'test X/Y'.
+#   • bytes, no plan → '<n> lines' (a non-TAP suite that IS emitting output — alive).
+#   • empty / absent → 'no output yet' (the crash signal).
+[ "$(_health_inflight_note "$PLOG")" = "test 3/168" ] || fail "(2b) TAP note should be 'test 3/168' (got '$(_health_inflight_note "$PLOG")')"
+NONTAP="$T/nontap"; printf 'configuring…\nrunning suite\n' > "$NONTAP"
+[ "$(_health_inflight_note "$NONTAP")" = "2 lines" ] || fail "(2b) a non-TAP producing log should read '2 lines' (got '$(_health_inflight_note "$NONTAP")')"
+EMPTY="$T/emptylog"; : > "$EMPTY"
+[ "$(_health_inflight_note "$EMPTY")" = "no output yet" ] || fail "(2b) an empty log should read 'no output yet' (got '$(_health_inflight_note "$EMPTY")')"
+[ "$(_health_inflight_note "$T/does-not-exist")" = "no output yet" ] || fail "(2b) an absent log should read 'no output yet'"
+# … and the gate's in-flight running row surfaces the empty-log crash signal (not just elapsed time).
+sleep 300 & PP2=$!; disown "$PP2" 2>/dev/null || true
+INF2="$(_health_inflight_file "603-shaEMPTY")"
+_marker_write "$INF2" "$PP2"
+: > "$(_health_log_file "603-shaEMPTY")"
+_HC_RESULT=""; DISPLAY=()
+_healthcheck_gate 603 slug-empty "$T/wt" 0 shaEMPTY
+[ "$_HC_RESULT" = "RUNNING" ] || fail "(2b) an in-flight empty-log suite should read RUNNING (got '$_HC_RESULT')"
+printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'no output yet' || fail "(2b) the running row must surface 'no output yet' for an empty log (got: ${DISPLAY[0]:-})"
+kill "$PP2" 2>/dev/null || true
+rm -f "$INF2" "$(_health_log_file "603-shaEMPTY")" 2>/dev/null || true
+ok
+
 # ── (3) HONEST FAILURE LABEL — outcome detail quotes the FIRST 'not ok', never a passing 'ok NN' ────
 # The failing TAP stream ends with a passing 'ok' summary-ish line AFTER the real 'not ok' — the exact
 # shape that made the old --oneline tail mislabel the failure. The detail must be the not-ok line.

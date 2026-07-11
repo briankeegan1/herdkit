@@ -4041,6 +4041,102 @@ _reconcile_resolver_panes() {
   done
 }
 
+# ── HEALTHCHECK-AS-A-DISPOSABLE-PANE (HERD-313 leg a, HEALTH_PANE) ─────────────────────────────────
+# Leg (b) makes the in-flight suite VISIBLE in the console row. Leg (a) — ship-dormant behind
+# HEALTH_PANE — additionally stands up a stamped, disposable `health·<slug>` pane that STREAMS the live
+# suite log, so the operator can watch the actual suite output, and RETIRES it the moment the suite
+# ends. Modelled exactly on the resolver-pane lifecycle above: the lane-equivalent (the render pass)
+# spawns + registers; every tick the watcher reconciles the registry against the OBSERVED inflight
+# marker and retires through the SAME HERD-134 guarded close. The pane is a VIEW only — a plain
+# `tail -F`, no model, no gate authority — so a bug in this seam can never affect a merge decision.
+
+# _effective_health_pane — echo "on" | "off". Mirrors _effective_resolver_pane's fail-soft contract:
+# a recognized on-value arms it; empty/unset/typo reads off, so a bad value can never arm a
+# pane-closing path. Ship-dormant default off ⇒ byte-identical when unset.
+_effective_health_pane() {
+  case "${HEALTH_PANE:-off}" in on|true|yes|1) printf 'on' ;; *) printf 'off' ;; esac
+}
+
+# _health_pane_registry_file <pr#> <sha> — the sha-scoped record of the disposable pane this seat stood
+# up for a given (pr,sha). One row: "<pane> <tab> health·<slug>". Keyed like the health markers so the
+# reconcile stays in lock-step with the inflight marker.
+_health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
+
+# _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
+# pane for an in-flight suite, ONCE. Called from the render pass while a suite is genuinely in flight
+# (a live inflight marker), so it rides the same signal leg (b)'s row does — and works identically
+# whether the bash gate or the Python engine is running the suite. Self-gating + idempotent + fail-soft:
+#   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
+#   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
+# The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
+# with a `health·<slug>` label so the guarded close recognizes it and a neighbour is never mistaken.
+_spawn_health_pane() {
+  local _shp_pr="$1" _shp_slug="$2" _shp_sha="$3" _shp_dir="$4"
+  [ "$(_effective_health_pane)" = on ] || return 0
+  [ -z "${DRYRUN:-}" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _shp_reg; _shp_reg="$(_health_pane_registry_file "$_shp_pr" "$_shp_sha")"
+  [ -f "$_shp_reg" ] && return 0
+  local _shp_log _shp_ws _shp_created _shp_tab _shp_root
+  _shp_log="$(_health_log_file "${_shp_pr}-${_shp_sha}")"
+  _shp_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
+  _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
+  read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+  [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+  herdr pane rename "$_shp_root" "health·$_shp_slug" >/dev/null 2>&1 || true
+  # `tail -F` (retry+follow) tolerates the log not existing yet or being rotated under it.
+  herdr pane run "$_shp_root" "tail -n +1 -F $_shp_log" >/dev/null 2>&1 || true
+  printf '%s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
+  printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
+  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log"
+}
+
+# _retire_health_pane <pr#> <sha> [reason] — close the disposable pane once its suite has ended. Mirrors
+# _retire_resolver_pane: read the registry row and, if it still names a LIVE pane, close it via the
+# HERD-134 guarded close (which REFUSES + journals pane_close_refused if the id was recycled onto a
+# neighbour), journal `health_pane_retired` on a real close, close the now-empty tab, then drop the row
+# unconditionally. FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
+_retire_health_pane() {
+  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab
+  [ -z "${DRYRUN:-}" ] || return 0
+  _rhp_reg="$(_health_pane_registry_file "$_rhp_pr" "$_rhp_sha")"
+  [ -f "$_rhp_reg" ] || return 0
+  read -r _rhp_pane _rhp_tab _ < "$_rhp_reg" 2>/dev/null || true
+  if [ -n "${_rhp_pane:-}" ] && [ "$_rhp_pane" != "-" ] && herd_driver_pane_alive "$_rhp_pane"; then
+    if herd_close_pane_verified "$_rhp_pane" "health·"; then
+      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" reason "$_rhp_reason"
+      if [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
+        herdr tab close "$_rhp_tab" >/dev/null 2>&1 || true
+        _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rhp_tab"
+      fi
+    fi
+  fi
+  rm -f "$_rhp_reg" 2>/dev/null || true
+}
+
+# _reconcile_health_panes — retire every disposable health pane whose suite has ENDED, EVERY tick,
+# whoever ran (or killed) the suite. Byte-quiet on a seat with no health-pane rows — the overwhelming
+# common case, and the whole of the HEALTH_PANE=off default (spawn never wrote a row). A pane is kept
+# ONLY while its (pr,sha) inflight marker is still pid-live; the instant the suite finishes, is
+# collected, or its worker dies, the marker stops being live and the pane is retired. Dry-run-inert.
+_reconcile_health_panes() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf
+  for _rcp_f in "$TREES"/.health-pane-registry-*; do
+    [ -e "$_rcp_f" ] || continue
+    _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-pane-registry-}"
+    _rcp_pr="${_rcp_rest%-*}"; _rcp_sha="${_rcp_rest##*-}"
+    [ -n "$_rcp_pr" ] && [ -n "$_rcp_sha" ] || continue
+    _rcp_inf="$(_health_inflight_file "${_rcp_pr}-${_rcp_sha}")"
+    # Still genuinely in flight → keep the pane (the operator is watching the live suite).
+    { [ -f "$_rcp_inf" ] && _health_pid_live "$_rcp_inf"; } && continue
+    _retire_health_pane "$_rcp_pr" "$_rcp_sha" outcome-landed
+  done
+}
+
 # ── Resolver liveness: POSITIVE-EVIDENCE-ONLY death (HERD-206) ────────────────────────────────────
 # Resolver rows now carry the SAME liveness discipline builders got in PR #260. The pre-HERD-206 rule
 # was "absent from $AGENTS_JSON ⇒ dead", which is NEGATIVE evidence and produced a false-dead respawn
@@ -10131,6 +10227,36 @@ _health_progress() {
   [ "${_hp_done:-0}" -gt 0 ] 2>/dev/null && printf 'test %s/%s' "$_hp_done" "$_hp_plan"
 }
 
+# _health_inflight_note <log> — the liveness clause the running row appends after the elapsed time
+# (HERD-313), so an in-flight suite is never a bare stopwatch the operator can't read. Three-valued,
+# in precedence order, so an EMPTY-LOG CRASH is distinguishable from a SLOW SUITE within a single tick:
+#   • TAP stream     → the live 'test X/Y' from _health_progress (the suite is emitting a plan).
+#   • bytes, no plan → '<n> lines' — a non-TAP suite that IS producing output (alive, just slow).
+#   • empty / absent → 'no output yet' — the worker has written NOTHING; if this persists next to a
+#                      climbing elapsed time it is a crashed/wedged suite, not a slow one.
+# Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
+# mutation, so the render half can call it every tick.
+_health_inflight_note() {
+  local _hin_log="$1" _hin_prog
+  _hin_prog="$(_health_progress "$_hin_log")"
+  if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
+  if [ -s "$_hin_log" ]; then
+    printf '%s lines' "$(grep -c '' "$_hin_log" 2>/dev/null || printf 0)"
+  else
+    printf 'no output yet'
+  fi
+}
+
+# _health_running_row <slug-cell> <pn> <inflight-file> <log-file> — THE one in-flight health row string
+# (HERD-313). Both the render half (the classification pass, so the row paints even when the Python
+# engine owns the action pass and the bash gate step never runs) and the bash gate step below emit this
+# EXACT line, so the row never flickers between the two renders in a single tick. Reads only the marker
+# + log the engine writes; side-effect-free.
+_health_running_row() {
+  local _hrr_sl="$1" _hrr_pn="$2" _hrr_inf="$3" _hrr_log="$4"
+  printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hrr_sl}${C_RESET}${_hrr_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hrr_inf")") · $(_health_inflight_note "$_hrr_log")${C_RESET}"
+}
+
 # _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
 # via the recycling guard, still the SAME process). Shares the restart-safe substrate with the review side.
 _health_pid_live() { _marker_live "$1"; }
@@ -10554,13 +10680,9 @@ _healthcheck_gate() {
   # re-dispatch below.
   if [ -f "$_hg_inflight" ]; then
     if _health_pid_live "$_hg_inflight"; then
-      # Elapsed + (cheap, if the log is a TAP stream) live progress: 'running 3m · test 41/168'.
-      local _hg_prog; _hg_prog="$(_health_progress "$_hg_log")"
-      if [ -n "$_hg_prog" ]; then
-        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hg_inflight")") · ${_hg_prog}${C_RESET}"
-      else
-        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running ($(_fmt_age "$(_marker_age "$_hg_inflight")"))${C_RESET}"
-      fi
+      # Elapsed + a liveness clause (live TAP progress, a byte-count, or 'no output yet') via the ONE
+      # shared row the render half also paints — 'running 3m · test 41/168' / '… · no output yet'.
+      DISPLAY[_hg_idx]="$(_health_running_row "$_hg_sl" "$_hg_pn" "$_hg_inflight" "$_hg_log")"
       _HC_RESULT="RUNNING"
       return 0
     fi
@@ -12104,7 +12226,22 @@ EOF
       # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
       if _scope_permits_automerge "$prauthor"; then
         if _should_automerge "$mstate"; then
-          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+          # HERD-313: when a suite is ALREADY in flight for this exact (pr,sha), paint the live running
+          # row here in the RENDER pass — reading the same .health-inflight / .health-log state files the
+          # health worker (bash gate OR the Python engine's action pass) writes. Under ENGINE_IMPL=python
+          # the bash gate step (_healthcheck_gate, which used to be the ONLY place this row was drawn) is
+          # skipped, so without this the console showed a frozen bare 'health-check' for the whole ~9-min
+          # suite — the invisible-healthcheck the operator hit twice. No live marker yet (pre-dispatch,
+          # or between ticks) ⇒ the bare placeholder, exactly as before. Side-effect-free.
+          _hc_inf="$(_health_inflight_file "${prnum}-${headsha}")"
+          if [ -n "$headsha" ] && _health_pid_live "$_hc_inf"; then
+            DISPLAY[i]="$(_health_running_row "$sl" "$pn" "$_hc_inf" "$(_health_log_file "${prnum}-${headsha}")")"
+            # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
+            # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
+            _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
+          else
+            DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+          fi
         else
           DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
         fi
@@ -12239,6 +12376,11 @@ EOF
   # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.
   # Byte-inert unless RESOLVER_PANE=on (no rows exist to reconcile).
   _reconcile_resolver_panes
+
+  # Health-pane reconcile (HERD-313 leg a): retire the disposable `health·<slug>` view pane of every
+  # suite that has ENDED, whoever ran it (mirrors the resolver-pane reconcile above). Byte-inert unless
+  # HEALTH_PANE=on left rows to reconcile — under the ship default there are none, so this does nothing.
+  _reconcile_health_panes
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
   _drain_spawn_queue
