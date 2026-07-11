@@ -160,6 +160,21 @@ class TestGateOutcomes(LiveCase):
             for k in ("pr", "sha", "slug", "round", "agent_status_before", "rule", "location"):
                 self.assertIn(k, rb[0], "%s missing %s" % (rule, k))
 
+    def test_refix_round_is_real_not_hardcoded(self):
+        # HERD-328 S2: the round a refix_bounce carries is the per-(pr, rule) bounce count + 1
+        # (bash's `refix_rail_count + 1`), NOT a hardcoded 1. The first bounce reads round=1, then the
+        # rail counter increments per rail INDEPENDENTLY of the other rail and of other PRs.
+        _, ev = self._out(health="CODEERROR")
+        rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
+        self.assertEqual(rb[0]["round"], 1)
+        # Drive the counter directly on one tick instance: it is per (pr, rule), monotonic, isolated.
+        t = LiveTick({"MERGE_POLICY": "auto"}, FixtureDiscovery({"candidates": []}),
+                     FixtureGates({"candidates": []}), DryRunActuator(LiveJournal(None)),
+                     LiveJournal(None))
+        self.assertEqual([t._next_refix_round(1, "review") for _ in range(3)], [1, 2, 3])
+        self.assertEqual(t._next_refix_round(1, "healthcheck"), 1)   # a different rail is its own count
+        self.assertEqual(t._next_refix_round(2, "review"), 1)        # a different pr is its own count
+
 
 class TestReapAndActuation(LiveCase):
     def test_merge_reaps(self):

@@ -137,6 +137,54 @@ ndiv="$(printf '%s\n' "$out" | sed -n 's/^  divergences: \([0-9]*\).*/\1/p')"
 printf '%s\n' "$out" | grep -qi "MISSING from real" || fail "the lone insertion should read as MISSING from real"
 ok "alignment diff: a single inserted event is ONE divergence, not a cascade (leg 2)"
 
+# ── (A9) S2: the oracle folds bash's health_refix_bounce onto refix_bounce{rule=healthcheck} ──────
+# Contract §3.4 has ONE bounce event keyed by `rule`; bash's health rail still emits the pre-contract
+# `health_refix_bounce` (with `detail`, no `rule`/`location`). The oracle maps the two to one event
+# so a bash<->python health bounce is PARITY, while the REVIEW rail's semantic `location` still counts.
+cat > "$T/refix-real.jsonl" <<'EOF'
+{"ts":"2026-07-10T00:00:01Z","event":"health_refix_bounce","pr":7,"sha":"deadbeef","slug":"feat","round":1,"agent_status_before":"unknown","detail":"health-check failed: 1 test"}
+{"ts":"2026-07-10T00:00:02Z","event":"refix_bounce","pr":8,"sha":"c0ffee","slug":"feat2","round":1,"agent_status_before":"unknown","rule":"review","location":"app/greet.sh:12"}
+EOF
+cat > "$T/refix-shadow.jsonl" <<'EOF'
+{"ts":"2026-07-10T09:00:01Z","event":"refix_bounce","pr":7,"sha":"deadbeef","slug":"feat","round":1,"agent_status_before":"unknown","rule":"healthcheck","location":"(shadow)"}
+{"ts":"2026-07-10T09:00:02Z","event":"refix_bounce","pr":8,"sha":"c0ffee","slug":"feat2","round":1,"agent_status_before":"unknown","rule":"review","location":"app/greet.sh:12"}
+EOF
+parity "$T/refix-real.jsonl" "$T/refix-shadow.jsonl" >/dev/null 2>&1 \
+  || fail "health_refix_bounce did not fold onto refix_bounce{rule=healthcheck} — S2 mapping missing"
+ok "S2: bash health_refix_bounce ↔ python refix_bounce{rule=healthcheck} folds to PARITY"
+
+# The REVIEW rail's `location` is SEMANTIC (a finding anchor) and must NOT be dropped: a review
+# bounce that flags a different file must still DIVERGE (the mapping is scoped to the health rail).
+sed 's#app/greet.sh:12#app/other.sh:99#' "$T/refix-shadow.jsonl" > "$T/refix-shadow-div.jsonl"
+parity "$T/refix-real.jsonl" "$T/refix-shadow-div.jsonl" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] || fail "a review-rail location divergence must NOT be masked by the refix mapping, got rc=$rc"
+ok "S2: the review rail's semantic location is preserved (a mismatch still DIVERGES)"
+
+# ── (A10) S3: path folding is scoped to volatile path keys; the (shadow) log_path sentinel neutralized
+# The shadow engine stubs `log_path="(shadow)"`; the real bash log_path is an absolute tmp path. Both
+# are volatile and must fold to the same <PATH> — the un-folded sentinel used to read as a divergence.
+cat > "$T/path-real.jsonl" <<'EOF'
+{"ts":"2026-07-10T00:00:01Z","event":"healthcheck_started","pr":9,"slug":"feat","sha":"abc","pid":100,"log_path":"/private/tmp/run-x/health.log"}
+EOF
+cat > "$T/path-shadow.jsonl" <<'EOF'
+{"ts":"2026-07-10T09:00:01Z","event":"healthcheck_started","pr":9,"slug":"feat","sha":"abc","pid":200,"log_path":"(shadow)"}
+EOF
+parity "$T/path-real.jsonl" "$T/path-shadow.jsonl" >/dev/null 2>&1 \
+  || fail "the (shadow) log_path sentinel did not fold to <PATH> — S3 sentinel neutralization missing"
+ok "S3: the (shadow) log_path sentinel folds to <PATH> like a real absolute path"
+
+# Path folding is SCOPED: an absolute path in a SEMANTIC field (a review location) is preserved, so a
+# genuine "reviewer flagged the wrong file" divergence with an absolute anchor is never masked.
+cat > "$T/loc-real.jsonl" <<'EOF'
+{"ts":"2026-07-10T00:00:01Z","event":"refix_bounce","pr":9,"sha":"abc","slug":"feat","round":1,"agent_status_before":"unknown","rule":"review","location":"/private/tmp/wt/app/greet.sh:5"}
+EOF
+cat > "$T/loc-shadow.jsonl" <<'EOF'
+{"ts":"2026-07-10T09:00:01Z","event":"refix_bounce","pr":9,"sha":"abc","slug":"feat","round":1,"agent_status_before":"unknown","rule":"review","location":"/private/tmp/wt/app/other.sh:5"}
+EOF
+parity "$T/loc-real.jsonl" "$T/loc-shadow.jsonl" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] || fail "an absolute-path location divergence must NOT be masked by global path folding, got rc=$rc"
+ok "S3: a semantic field's absolute path is NOT folded — a real location divergence still surfaces"
+
 # ── (B) SELF-DIFF GREEN on the sandbox scenario via parity-run.sh, scorecard read from file ───────
 # Runs the repo's deterministic sim (no model call). An infra inability to run the scenario SKIPS;
 # a genuine parity divergence FAILS.

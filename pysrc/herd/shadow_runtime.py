@@ -274,6 +274,17 @@ class ShadowWatcher:
         self._state = {}       # pr -> lifecycle state
         self._outcome = {}     # pr -> terminal action (MERGE|HOLD|OBSERVE|BLOCK|ESCALATE)
         self._merged_prs = []  # dry-run merge order, for the sibling re-stale journal
+        self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
+
+    def _next_refix_round(self, pr, rule):
+        """The round this rail's refix_bounce carries: the per-``(pr, rule)`` bounce count so far + 1,
+        matching bash's ``round = refix_rail_count + 1`` (``agent-watch.sh:7519,:8260``). The rail
+        budget is per (pr, rule), NOT sha-keyed (contract §4), so a repeat bounce on the same rail
+        increments the real round instead of the old hardcoded 1 — the live twin does the same."""
+        key = (pr, rule)
+        n = self._refix_rounds.get(key, 0) + 1
+        self._refix_rounds[key] = n
+        return n
 
     # ── lifecycle transitions through the state machine (real P3b or the fallback) ────────────────
     def _advance(self, cand, event):
@@ -416,7 +427,8 @@ class ShadowWatcher:
         self._advance(cand, health)
         if health == "health_codeerror":
             self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
-                                round=1, agent_status_before="idle", rule="healthcheck",
+                                round=self._next_refix_round(cand.pr, "healthcheck"),
+                                agent_status_before="idle", rule="healthcheck",
                                 location="(shadow)")
             return BLOCK
 
@@ -427,7 +439,8 @@ class ShadowWatcher:
             return ESCALATE
         if verdict == "review_block":
             self.journal.append("refix_bounce", pr=cand.pr, sha=cand.sha, slug=cand.slug,
-                                round=1, agent_status_before="idle", rule="review",
+                                round=self._next_refix_round(cand.pr, "review"),
+                                agent_status_before="idle", rule="review",
                                 location="(shadow)")
             return BLOCK
 
