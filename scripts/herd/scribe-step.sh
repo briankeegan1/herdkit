@@ -412,6 +412,19 @@ case "$cmd" in
     # (component=scribe) via the backend's _backend_tw_journal (HERD-85 attribution contract).
     mine="${2:?claimed path}"; ref="${3:?item ref}"; note="${4:?note text}"
     cd "$REPO" || exit 1
+    # HERD-312: parse the field scope from the note. A leading "FIELDS:<csv>" token (before the
+    # first space or end-of-string) names the ONLY fields this amend may touch; the backend
+    # restricts its write to that set, never mutating unrequested fields (e.g. an assignee-only
+    # amend must not flip state). No prefix → old comment-only path, byte-identical to before.
+    _AMEND_FIELDS=""
+    _amend_note="$note"
+    case "$note" in
+      FIELDS:?*)
+        _AMEND_FIELDS="${note%% *}"; _AMEND_FIELDS="${_AMEND_FIELDS#FIELDS:}"
+        _rest="${note#* }"; [ "$_rest" = "$note" ] && _amend_note="" || _amend_note="$_rest"
+        ;;
+    esac
+    export _AMEND_FIELDS
     if ! command -v _backend_amend >/dev/null 2>&1; then
       # A backend with no amend op (e.g. changelog — an append-only tracker with no per-item comment
       # surface). FAIL-SOFT: print a soft note and record a skip; never file or post anything.
@@ -420,7 +433,7 @@ case "$cmd" in
       exit 0
     fi
     _BACKEND_RESULT=""
-    _backend_amend "$ref" "$note"
+    _backend_amend "$ref" "$_amend_note"
     if [ "$_BACKEND_RESULT" = "DONE" ]; then
       _scribe_retry_close "$mine"   # HERD-267: terminal, and CONFIRMED (see update-state)
       _report_and_cleanup "$mine" "↳ amended $ref" "DONE"

@@ -84,9 +84,11 @@ else
   herdr tab rename "$TAB" "$HERD_TAB_COORDINATOR" >/dev/null 2>&1 || true
 fi
 
-# 2. Left (root) pane = pinned live backlog viewer.
-herdr pane run "$ROOT" "bash $HERE/backlog-view.sh" >/dev/null 2>"$_CE" \
-  || _coord_die "backlog-view pane"
+# 2. Left (root) pane = pinned live backlog viewer. Route through herd_pane_launch (HERD-322):
+# the one shared helper that guards against herdr's first-character drop by prepending a leading
+# space and submitting with an explicit Enter — so 'bash …/backlog-view.sh' lands intact, not
+# truncated to 'ash …'. Verification happens at the STARTUP-RESTORE probe below.
+herd_pane_launch "$ROOT" "bash $HERE/backlog-view.sh"
 # HERD-310 stamp coverage: give the backlog pane a readable IDENTITY LABEL at spawn so the pane-close
 # identity guard (HERD-134, herd_close_pane_verified) can prove it against an expected-kind and REFUSE
 # a stale/mismatched close of a control-room pane — the same protection the review·/resolve·/<slug>
@@ -121,8 +123,7 @@ if [ "${HERD_NO_WATCH:-}" != "1" ]; then
   WPANE=$(printf '%s' "$split" | python3 -c \
     'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])' \
     2>"$_CE") || _coord_die "watch pane/parse"
-  herdr pane run "$WPANE" "bash $HERE/herd-watch.sh" >/dev/null 2>"$_CE" \
-    || _coord_die "watch pane"
+  herd_pane_launch "$WPANE" "bash $HERE/herd-watch.sh"
   # HERD-310 stamp coverage: label the watch/health console pane (the pane the async healthcheck
   # worker runs INSIDE) so the identity guard can refuse a mismatched close of it, just like the
   # review/builder panes. This is the pane the 2026-07-10 incident's "healthcheck pane" belongs to.

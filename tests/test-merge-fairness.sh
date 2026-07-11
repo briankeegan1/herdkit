@@ -44,24 +44,18 @@ ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 [ -f "$WATCH" ] || fail "agent-watch.sh not found at $WATCH"
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 
-# ── STRUCTURAL: the reorder runs BEFORE the action pass, never inside it ────────────────────────
-# Match CODE only — a prose mention of the call in a comment must never satisfy the assertion.
-code_lines() { grep -F -n -- "$1" "$WATCH" | awk '{ rest = substr($0, index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }'; }
-line_of()  { code_lines "$1" | head -n1 | cut -d: -f1; }
-count_of() { code_lines "$1" | awk 'END{print NR+0}'; }
-
-# CALLSITES only: drop the `_merge_fairness_reorder() {` definition line, so this pins where the
-# reorder RUNS — not merely that it exists somewhere above the action pass.
-callsites() { code_lines '_merge_fairness_reorder' | grep -vF '_merge_fairness_reorder()'; }
-L_REORDER="$(callsites | head -n1 | cut -d: -f1)"
-L_LOOP="$(line_of 'for idx in ${CAND_IDX[@]+"${CAND_IDX[@]}"}')"
-L_HEALTH="$(line_of '_healthcheck_gate "$prnum"')"
-[ -n "$L_REORDER" ] || fail "(0) no _merge_fairness_reorder call in the main loop"
-[ -n "$L_LOOP" ]    || fail "(0) could not locate the action-pass candidate loop"
-[ "$L_REORDER" -lt "$L_LOOP" ]   || fail "(0) the reorder (line $L_REORDER) must precede the action pass (line $L_LOOP)"
-[ "$L_REORDER" -lt "$L_HEALTH" ] || fail "(0) the reorder must precede any healthcheck dispatch"
-[ "$(callsites | awk 'END{print NR+0}')" = "1" ] || fail "(0) expected exactly one reorder callsite"
-ok "(0) the candidate order is fixed once, before the action pass dispatches anything"
+# ── STRUCTURAL: the reorder helper survives the P5 cutover (HERD-306) ────────────────────────────
+# The bash ACTION PASS (_tick_act) that USED to call _merge_fairness_reorder was DELETED — the Python
+# live engine (pysrc/herd/live_runtime.py) now owns the live candidate ordering, and the ready-first
+# fairness BEHAVIOR is proven behaviorally below (checks 2–7, which drive the reorder helper directly)
+# and end-to-end by the sim acceptance suite (scripts/herd/sim/sandbox-concurrency-scenario.sh). The
+# reorder is retained as a pure, side-effect-free HELPER for exactly those proofs, so assert it still
+# exists and that no bash action-pass callsite lingers (the ordering is single-owner: Python).
+( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1; declare -F _merge_fairness_reorder >/dev/null ) \
+  || fail "(0) the _merge_fairness_reorder helper must survive (retained for the acceptance sim + the checks below)"
+grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }' | grep -q . \
+  && fail "(0) the deleted bash action pass (_tick_act) must not be referenced in code — the ordering is Python-owned now"
+ok "(0) the reorder helper survives for the behavioral + sim proofs; the live ordering is Python-owned (no bash action pass)"
 
 # ── Stubs + lib-mode source ─────────────────────────────────────────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"

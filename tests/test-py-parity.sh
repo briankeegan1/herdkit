@@ -188,6 +188,26 @@ ok "S3: a semantic field's absolute path is NOT folded — a real location diver
 # ── (B) SELF-DIFF GREEN on the sandbox scenario via parity-run.sh, scorecard read from file ───────
 # Runs the repo's deterministic sim (no model call). An infra inability to run the scenario SKIPS;
 # a genuine parity divergence FAILS.
+#
+# LOAD-SENSITIVE (HERD-333, the same treatment tests/herd.bats' herd_run_loadsim applies under
+# HERD-326): this leg drives a REAL git sim whose asserts await terminal STATE, so on a heavily loaded
+# CI box a single poll can miss its window and paint a SPURIOUS divergence (rc 1) — the macOS-CI
+# false-red this PR fixes (green 13/13 locally, red only under runner load). So a FIRST-attempt real-red
+# quiets the box and retries EXACTLY once before alarming: a retry that goes GREEN is a flaky/load pass
+# (labeled distinctly, never a code red); a retry that REPRODUCES the divergence is a REAL red, with both
+# attempts surfaced so it reads as code, not load. rc 2 (infra) keeps its existing loud SKIP — no retry.
+# INERT on a first-try green: no sleep, no retry, no label — byte-identical to before this treatment.
+HERD_SIM_LOAD_RETRY_QUIET="${HERD_SIM_LOAD_RETRY_QUIET:-3}"   # quiet interval (s) before the one retry
+
+parity_leg_assert_green() {   # <artifacts-dir> <captured-output> — the green-path invariants
+  printf '%s\n' "$2" | grep -q "journal parity: OK" \
+    || fail "parity-run exited 0 but did not report journal parity OK"
+  printf '%s\n' "$2" | grep -q "scorecard:" \
+    || fail "parity-run did not read/surface the scorecard from file"
+  [ -f "$1/scorecard.json" ] || fail "scenario scorecard.json missing after parity-run"
+  [ -s "$1/journal-real.jsonl" ] || fail "parity-run collected an empty real journal"
+}
+
 if ! command -v git >/dev/null 2>&1; then
   skip "parity-run self-diff: git unavailable"
 else
@@ -195,12 +215,7 @@ else
   run_out="$(bash "$PARITY_RUN" --artifacts "$RUN_ART" 2>&1)"; rc=$?
   case "$rc" in
     0)
-      printf '%s\n' "$run_out" | grep -q "journal parity: OK" \
-        || fail "parity-run exited 0 but did not report journal parity OK"
-      printf '%s\n' "$run_out" | grep -q "scorecard:" \
-        || fail "parity-run did not read/surface the scorecard from file"
-      [ -f "$RUN_ART/scorecard.json" ] || fail "scenario scorecard.json missing after parity-run"
-      [ -s "$RUN_ART/journal-real.jsonl" ] || fail "parity-run collected an empty real journal"
+      parity_leg_assert_green "$RUN_ART" "$run_out"
       ok "parity-run self-diff on sandbox-scenario.sh: GREEN + scorecard read from file"
       ;;
     2)
@@ -208,8 +223,30 @@ else
       printf '%s\n' "$run_out" | tail -4 | sed 's/^/      /'
       ;;
     *)
-      printf '%s\n' "$run_out" | tail -15 >&2
-      fail "parity-run reported a real journal DIVERGENCE on a self-diff (rc=$rc) — canon bug"
+      # First attempt was a real-red. Quiet the box, then retry EXACTLY once into a FRESH artifacts dir.
+      first_rc="$rc"; first_out="$run_out"
+      sleep "$HERD_SIM_LOAD_RETRY_QUIET"
+      RUN_ART2="$T/sandbox-retry"; mkdir -p "$RUN_ART2"
+      run_out="$(bash "$PARITY_RUN" --artifacts "$RUN_ART2" 2>&1)"; rc=$?
+      case "$rc" in
+        0)
+          parity_leg_assert_green "$RUN_ART2" "$run_out"
+          # Flaky/load: diverged under load then PASSED on the quiet retry — a load pass, NOT a code red.
+          ok "parity-run self-diff: flaky/load — diverged under load then PASSED on the quiet retry (not a code red)"
+          ;;
+        2)
+          skip "parity-run self-diff: scenario could not run on the quiet retry (infra, rc=2)"
+          printf '%s\n' "$run_out" | tail -4 | sed 's/^/      /'
+          ;;
+        *)
+          # Reproduced on the retry → a REAL red. Surface BOTH attempts so it reads as code, not load.
+          printf -- '--- attempt 1 (rc %s) ---\n' "$first_rc" >&2
+          printf '%s\n' "$first_out" | tail -15 >&2
+          printf -- '--- attempt 2 (rc %s) ---\n' "$rc" >&2
+          printf '%s\n' "$run_out" | tail -15 >&2
+          fail "parity-run reproduced a real journal DIVERGENCE on the quiet retry (rc=$rc) — REAL red (not flaky/load)"
+          ;;
+      esac
       ;;
   esac
 fi

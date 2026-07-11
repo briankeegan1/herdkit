@@ -40,34 +40,26 @@ ok()   { pass=$((pass+1)); echo "PASS: $1"; }
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 command -v git >/dev/null 2>&1 || fail "git required"
 
-# ── (1) STRUCTURAL: the action pass decides stale-dup before it dispatches anything ───────────
-# Match CODE only: a comment line carrying the same literal must never satisfy (or shadow) the
-# assertion — otherwise a prose mention of `_healthcheck_gate "$prnum"` would pass it vacuously.
-code_lines() { grep -F -n -- "$1" "$WATCH" | awk '{ rest = substr($0, index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }'; }
-line_of()  { code_lines "$1" | head -n1 | cut -d: -f1; }
-count_of() { code_lines "$1" | awk 'END{print NR+0}'; }
+# ── (1) STRUCTURAL: the gate helpers survive the P5 cutover (HERD-306) ────────────────────────
+# The bash ACTION PASS (_tick_act) that USED to order stale-dup → review pre-dispatch → healthcheck was
+# DELETED: the Python live engine (pysrc/herd/live_runtime.py) now owns the live per-candidate order,
+# and the ORDERING invariant is proven on the Python side (tests/test-py-live-runtime.sh: a stale
+# candidate → HOLD with zero review/health dispatch) plus the sim acceptance suite. The gate STEPS are
+# retained as pure, side-effect-honest HELPERS, and the behavioral checks (2–8) below replay their call
+# order faithfully. So here assert the helpers still exist and that no bash action pass lingers.
+( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1
+  declare -F _stale_dup_gate_step _predispatch_review_if_parallel _healthcheck_gate >/dev/null ) \
+  || fail "(1) the stale-dup/review/health gate helpers must survive the cutover (retained for the checks below + the sim)"
+grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }' | grep -q . \
+  && fail "(1) the deleted bash action pass (_tick_act) must not be referenced in code — the gate order is Python-owned now"
+ok "(1) the gate-step helpers survive; the live gate order is Python-owned (no bash action pass)"
 
-L_GATE="$(line_of '_stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha"')"
-L_REVIEW="$(line_of '_predispatch_review_if_parallel "$prnum"')"
-L_HEALTH="$(line_of '_healthcheck_gate "$prnum"')"
-[ -n "$L_GATE" ]   || fail "(1) no _stale_dup_gate_step call on \$candsha in the action pass"
-[ -n "$L_REVIEW" ] || fail "(1) no _predispatch_review_if_parallel call found"
-[ -n "$L_HEALTH" ] || fail "(1) no _healthcheck_gate call found"
-[ "$(count_of '_predispatch_review_if_parallel "$prnum"')" = "1" ] || fail "(1) expected exactly one review pre-dispatch callsite"
-[ "$(count_of '_healthcheck_gate "$prnum"')" = "1" ]               || fail "(1) expected exactly one healthcheck gate callsite"
-[ "$L_GATE" -lt "$L_REVIEW" ] || fail "(1) stale-dup gate (line $L_GATE) must precede the review pre-dispatch (line $L_REVIEW)"
-[ "$L_GATE" -lt "$L_HEALTH" ] || fail "(1) stale-dup gate (line $L_GATE) must precede the healthcheck gate (line $L_HEALTH)"
-ok "(1) action pass evaluates stale-dup before review pre-dispatch and healthcheck"
-
-# The pre-merge leg, lifted VERBATIM from the source so check (8) exercises the real condition rather
-# than a paraphrase of it. It must be one self-contained `if …; then` line ending in `continue`.
-PREMERGE_SRC="$(code_lines '_stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha"' | head -n1 | cut -d: -f2-)"
-[ -n "$PREMERGE_SRC" ] || fail "(1c) no pre-merge _stale_dup_gate_step callsite on \$rsha found"
-case "$PREMERGE_SRC" in
-  *'; then') : ;;
-  *) fail "(1c) pre-merge callsite is not a single-line 'if …; then' — check (8) can no longer eval it: $PREMERGE_SRC" ;;
-esac
-ok "(1c) pre-merge gate callsite is liftable for the behavioral safety-rail check"
+# The pre-merge leg — the UNCONDITIONAL re-evaluation of the stale-dup gate against $rsha, in the instant
+# before a merge. The bash action pass that carried it verbatim is gone (Python owns the live pass), so
+# it is stated here as the CANONICAL replay leg that drives the real (kept) _stale_dup_gate_step helper.
+# check (8) eval's it with `continue` rewritten as `return 1`, so the safety-rail is exercised for real.
+PREMERGE_SRC='if [ -n "$rsha" ] && ! _stale_dup_gate_step "$prnum" "$slug" "$dir" "$rsha" "$branch" "$idx"; then'
+ok "(1c) canonical pre-merge gate leg drives the real helper for the behavioral safety-rail check"
 
 # ── Stubs ─────────────────────────────────────────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"

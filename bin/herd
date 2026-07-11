@@ -4541,7 +4541,8 @@ _reload_pane_run_verified() {
     # keystrokes prepend onto our run and the shell rejects the malformed line — the viewer never
     # starts, yet the old loose poll reported success off the stale shell.
     _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane send-keys "$pane" ctrl+c ctrl+u >/dev/null 2>&1 || true
-    _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane run "$pane" "$cmd" >/dev/null 2>&1 || true
+    _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane run "$pane" " $cmd" >/dev/null 2>&1 || true
+    _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
     i=0
     while [ "$i" -lt "$vp" ]; do
       [ "$(( SECONDS - start ))" -ge "$deadline" ] && break 2
@@ -5395,12 +5396,31 @@ cmd_pane_watch() {
         watch_pid="$zpid"
         warn "watcher PID $zpid is RUNNING but NOT visible in pane $wPane — its pane run detached from the tty; re-run 'herd pane watch' or kill $zpid and inspect the pane"
       else
-        wsum="pane $wPane · NOT visible ✗"
-        warn "watcher did not appear in pane $wPane"
+        warn "watcher did not appear in pane $wPane — relaunching in the background (HERD-322)"
+        local _live_fb; _live_fb="$(_watcher_lock_pid_if_live)"
+        if [ -n "$_live_fb" ]; then
+          wsum="adopted (live watcher already holds the lock)"; watch_pid="$_live_fb"
+        else
+          ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="${HERD_CONFIG_FILE:-$PROJECT_ROOT/.herd/config}" nohup bash "$watch_script" >/dev/null 2>&1 & )
+          local _fbk=0
+          while [ "$_fbk" -lt 10 ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; _fbk=$((_fbk+1)); done
+          [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+          wsum="DETACHED — relaunched in background (no visible console)"
+        fi
       fi
     fi
   else
-    warn "could not resolve or create a watch pane below the coordinator"
+    warn "could not resolve or create a watch pane below the coordinator — relaunching in the background (HERD-322)"
+    local _live_np; _live_np="$(_watcher_lock_pid_if_live)"
+    if [ -n "$_live_np" ]; then
+      wsum="adopted (live watcher already holds the lock)"; watch_pid="$_live_np"
+    else
+      ( cd "$PROJECT_ROOT" && HERD_CONFIG_FILE="${HERD_CONFIG_FILE:-$PROJECT_ROOT/.herd/config}" nohup bash "$watch_script" >/dev/null 2>&1 & )
+      local _npk=0
+      while [ "$_npk" -lt 10 ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do sleep 0.2; _npk=$((_npk+1)); done
+      [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      wsum="DETACHED — relaunched in background (no visible console)"
+    fi
   fi
   [ -n "$watch_pid" ] && wsum="$wsum · pid $watch_pid"
 
@@ -5416,6 +5436,8 @@ cmd_pane_watch() {
   ok "pane watch complete"
   say "  workspace:  $WORKSPACE_NAME"
   say "  watcher:    $wsum"
+  # HERD-322: exit non-zero when the watcher completely failed to start (no pane + no fallback).
+  case "$wsum" in *"FAILED"*) return 1 ;; esac
   return 0
 }
 
