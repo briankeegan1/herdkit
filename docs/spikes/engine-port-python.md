@@ -4,6 +4,12 @@
 coordinator owns how this is decomposed, sequenced into the backlog, and whether/when each
 phase is worth scheduling  
 **Status:** design spike only — **no engine code changes** in this PR  
+**STATUS: P5a executed** (2026-07-11, HERD-306) — the committed engine default has been flipped to
+`ENGINE_IMPL=python` in herdkit's own `.herd/config`, with `ENGINE_MIN` pinned to the current engine
+level (`_HERD_ENGINE_LEVEL` in `scripts/herd/engine-version.sh`) so a stale checkout halts loudly on
+write paths instead of silently running the old bash-only world. Byte-identical for both live seats
+(they already ran `python` via `config.local`). Bash remains the resident watch-loop supervisor and
+the instant-fallback path; the P5 bash-core deprecation/deletion window (below) is a *later* leg.  
 **Date:** 2026-07-10  
 **Audience:** coordinator + engine maintainers  
 **Grounding:** external review of the engine (2026-07-10), measured against the tree at
@@ -104,6 +110,8 @@ park any of these; only the *shadow-mode acceptance discipline* in P3 is strongl
   another seat is still writing the store; the store accessors adopt P3.5's engine-level stamp.
 - **P5 — cutover + deletion.** Flag flips default, bash core moves to a deprecation window,
   then deletion. Celebrate by watching `herd cost` report what the port PRs cost.
+  *P5a EXECUTED (HERD-306):* the committed default is now `ENGINE_IMPL=python` with `ENGINE_MIN`
+  pinned to the engine level; the bash-core deprecation window + deletion remain a later leg.
 
 ## 4. Risks the coordinator should weigh
 
