@@ -222,10 +222,22 @@ class ShadowWatcher:
     assert on. NOTHING here mutates anything but the shadow journal.
     """
 
-    def __init__(self, config=None, journal=None, stage_delay=0.0):
+    def __init__(self, config=None, journal=None, stage_delay=0.0,
+                 panels=None, steps=None, gate_statuses=None):
         cfg = config or {}
         self.config = cfg
         self.journal = journal or ShadowJournal()
+        # ── Scenario sub-pipelines the shadow engine also MODELS (HERD-304, P3 parity burn-down) ──
+        # Beyond the candidate gate DAG, the bash engine journals three more staged subsystems the
+        # sim scenario exercises: the review PANEL (per-panelist verdict fold, herd-review.sh), the
+        # pipeline STEPS runner (staged step_run + approve-hold lifecycle, steps.sh), and the herd/
+        # gates commit-STATUS post. These arrive as ordered fixture lists (fixture_extract folds them
+        # out of the real journal) and are replayed through faithful MODELS below — the emissions
+        # mirror docs/engine-contract.md §3.4 + journal.sh shapes EXACTLY. All three DEFAULT EMPTY, so
+        # a candidate-only fixture (every existing caller/test) emits byte-identically to before.
+        self._panels = list(panels or [])
+        self._steps = list(steps or [])
+        self._gate_statuses = list(gate_statuses or [])
         # Rail concurrency ceilings, sized from the knobs (contract §2.3). A garbage/absent value
         # coerces to the documented default (2 review, 1 health) — a typo never unbounds a rail. The
         # Semaphores themselves are created in run_async, once the event loop is running: an
@@ -448,6 +460,132 @@ class ShadowWatcher:
                 self.journal.append("pr_restale", pr=other_pr, sha=self._head.get(other_pr, ""),
                                     slug="pr-%s" % other_pr, kind="sibling-merge")
 
+    # ── staged review PANEL model (herd-review.sh; contract §2.3, §3.2) ───────────────────────────
+    def _emit_review_panels(self):
+        """Replay each fixture panel through the herd-review.sh emission order + verdict fold.
+
+        For one panel the bash tree journals, IN ORDER (herd-review.sh): a ``review_log_retained``
+        retention note, a ``review_pin_soft`` fallback note when pin objects are unavailable, one
+        ``review_panelist_verdict`` per panelist (its ref/driver/model PROVENANCE, contract §3.2),
+        then the FOLD — ``review_panel_folded`` under :func:`_fold_panel`, or an ``infra_event`` when
+        the panel reached no usable verdict. Shapes mirror journal.sh byte-for-byte.
+        """
+        for panel in self._panels:
+            pr = panel.get("pr", "")
+            slug = panel.get("slug", "")
+            sha = panel.get("sha", "")
+            panelists = panel.get("panelists", [])
+            # 1. log-retention bookkeeping — one per review dispatch (herd-review.sh:541). The path
+            #    mirrors the real mktemp shape ($TMPDIR//herd-review-<pr>-<rand>, TMPDIR carrying a
+            #    trailing slash) so it canonicalizes to the same <PATH>/<PATH> as the bash tree; the
+            #    parity canonicalizer neutralizes the tmp path either way (it carries no meaning).
+            self.journal.append("review_log_retained", pr=pr, slug=slug,
+                                path="/shadow-tmp//herd-review-%s" % pr, keep=panel.get("keep", 5))
+            # 2. soft-pin note: shadow never has real pin objects, so the live-diff fallback fires
+            #    (herd-review.sh:585). pin_mode carried from the fixture (empty in the sim).
+            self.journal.append("review_pin_soft", pr=pr, sha=sha,
+                                reason=panel.get("pin_reason",
+                                                 "pin objects unavailable; live-diff fallback"),
+                                pin_mode=panel.get("pin_mode", ""))
+            # 3. per-panelist verdict provenance (herd-review.sh:360/369/386).
+            for p in panelists:
+                self.journal.append("review_panelist_verdict", pr=pr, slug=slug, sha=sha,
+                                    panelist=p.get("panelist", 0), ref=p.get("ref", ""),
+                                    driver=p.get("driver", ""), model=p.get("model", ""),
+                                    verdict=p.get("verdict", ""), reason=p.get("reason", ""))
+            # 4. the fold.
+            self._fold_panel(pr, slug, sha, panel, panelists)
+
+    def _fold_panel(self, pr, slug, sha, panel, panelists):
+        """Fold a panel's per-panelist verdicts into ONE outcome (herd-review.sh:_combine_verdicts).
+
+        POLICY (herd-review.sh §296-307): ``any-block`` (the fail-safe default) — any BLOCK ⇒ BLOCK,
+        else any PASS ⇒ PASS, else INFRA-FAIL. ``all-pass`` is stricter: a NON-REPORTING panelist
+        (INFRA / absent binary) can only push the fold toward INFRA (the gap can't be masked by a
+        clean co-panelist), never toward BLOCK. A fold that reaches no usable verdict journals an
+        ``infra_event`` (component herd-review, exit 2) — a bounded retry, NEVER a cached BLOCK
+        (contract §2.2/§3.3). The folded ``verdict`` line is the DECIDING panelist's reason.
+        """
+        # A single-reviewer dispatch (no panel fan-out, e.g. REVIEW_PANEL_MODELS unset) journals its
+        # log/pin notes but NO panelist verdicts and NO fold — so a zero-panelist panel folds to
+        # nothing (never a spurious infra_event, which would over-emit vs the bash tree).
+        if not panelists:
+            return
+        policy = panel.get("policy", "any-block")
+        block = next((p for p in panelists if str(p.get("verdict", "")).upper() == "BLOCK"), None)
+        clean = next((p for p in panelists if str(p.get("verdict", "")).upper() == "PASS"), None)
+        nonreporting = [p for p in panelists
+                        if str(p.get("verdict", "")).upper() not in ("PASS", "BLOCK")]
+        refs = panel.get("refs") or " ".join(p.get("ref", "") for p in panelists)
+
+        if policy == "all-pass" and nonreporting:
+            verdict_line = None                         # a masked gap folds to INFRA-FAIL, not PASS
+        elif block is not None:
+            verdict_line = block.get("reason", "REVIEW: BLOCK")
+        elif clean is not None:
+            verdict_line = clean.get("reason", "REVIEW: PASS")
+        else:
+            verdict_line = None                         # all panelists non-reporting ⇒ INFRA-FAIL
+
+        if verdict_line is None:
+            self.journal.append(
+                "infra_event", component="herd-review", pr=pr, slug=slug, exit_code=2,
+                stderr_tail="review panel produced no verdict from any of %d panelists — "
+                            "infrastructure failure, not a block" % len(panelists))
+            return
+        self.journal.append("review_panel_folded", pr=pr, slug=slug, sha=sha, policy=policy,
+                            panelists=len(panelists), refs=refs, verdict=verdict_line)
+
+    # ── pipeline STEPS model (steps.sh; contract §5.4 hold lifecycle) ─────────────────────────────
+    def _emit_pipeline_steps(self):
+        """Replay each fixture steps run through steps.sh's staged execution + approve-hold lifecycle.
+
+        Rows run IN ORDER at their seam. Each execution journals a ``step_run`` carrying its outcome
+        (pass|warn|fail|held; a fail also carries ``rc``). ``on_fail=block`` on a failing step STOPS
+        the pipeline (later rows never run — steps.sh §21). ``hold=approve`` records the sha-keyed
+        hold triple (``step_hold_awaiting`` → a ``step_run`` HELD marker → ``step_hold_approved`` →
+        ``step_hold_released``) that steps.sh drives through the herd-approve ledger (steps.sh §35),
+        then resumes to the next row. Shapes + field order mirror journal.sh exactly.
+        """
+        for run in self._steps:
+            slug = run.get("slug", "")
+            sha = run.get("sha", "")
+            hold_dir = run.get("dir", "(shadow)")
+            for row in run.get("rows", []):
+                name = row.get("name", "")
+                at = row.get("at", "")
+                kind = row.get("kind", "shell")
+                outcome = row.get("outcome", "pass")
+                if outcome == "fail":
+                    self.journal.append("step_run", name=name, at=at, kind=kind, slug=slug,
+                                        sha=sha, outcome="fail", rc=row.get("rc", 1))
+                else:
+                    self.journal.append("step_run", name=name, at=at, kind=kind, slug=slug,
+                                        sha=sha, outcome=outcome)
+                # on_fail=block halts the lane at a failing step (steps.sh §21).
+                if outcome == "fail" and row.get("on_fail", "block") == "block":
+                    break
+                # hold=approve: the sha-keyed awaiting → held → approved → released lifecycle.
+                if row.get("hold", "none") == "approve":
+                    self.journal.append("step_hold_awaiting", slug=slug, step=name, at=at,
+                                        sha=sha, dir=hold_dir)
+                    self.journal.append("step_run", name=name, at=at, kind=kind, slug=slug,
+                                        sha=sha, outcome="held")
+                    self.journal.append("step_hold_approved", slug=slug, step=name, sha=sha)
+                    self.journal.append("step_hold_released", slug=slug, step=name, at=at, sha=sha)
+
+    # ── herd/gates commit-STATUS post (contract §2.3) ─────────────────────────────────────────────
+    def _emit_gate_statuses(self):
+        """Journal each fixture gate-status post — the cross-seat ``herd/gates`` commit status.
+
+        The bash tree posts one ``gate_status`` when all gates clear on a sha (the shared blessing
+        artifact, contract §2.3). Shadow re-journals it verbatim (dry-run: no real commit status).
+        """
+        for g in self._gate_statuses:
+            self.journal.append("gate_status", pr=g.get("pr", ""), sha=g.get("sha", ""),
+                                state=g.get("state", "success"),
+                                context=g.get("context", "herd/gates"))
+
     async def _process_candidate(self, cand):
         """Process one candidate to a terminal, re-gating a fresh sha on supersession.
 
@@ -492,6 +630,14 @@ class ShadowWatcher:
         async with _task_group() as tg:
             for cand in candidates:
                 tg.create_task(self._process_candidate(cand))
+
+        # The staged sub-pipelines the scenario also exercises, emitted SERIALLY after the candidate
+        # task group settles (deterministic order for the parity diff; all no-ops when their fixture
+        # lists are empty, i.e. every candidate-only run). Order mirrors the sim's leg order —
+        # panels, then steps, then the gate-status post.
+        self._emit_review_panels()
+        self._emit_pipeline_steps()
+        self._emit_gate_statuses()
 
         self.journal.append("shadow_tick_end", merged=len(self._merged_prs))
         return {
@@ -612,7 +758,9 @@ def main(argv=None):
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
     candidates = [Candidate.from_dict(c) for c in scenario.get("candidates", [])]
-    watcher = ShadowWatcher(config=config, stage_delay=stage_delay)
+    watcher = ShadowWatcher(config=config, stage_delay=stage_delay,
+                            panels=scenario.get("panels"), steps=scenario.get("steps"),
+                            gate_statuses=scenario.get("gate_statuses"))
     result = watcher.run(candidates)
     sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n")
     return 0
