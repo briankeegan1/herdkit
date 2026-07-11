@@ -243,6 +243,24 @@ live_pr_intact() {
 scribe_calls() { [ -s "$1/scribe.log" ] && grep -c . "$1/scribe.log" || echo 0; }
 state_rows()   { awk -v p="$PR" '$2==p{n++} END{print n+0}' "$1/trees/.agent-watch-merged" 2>/dev/null; }
 
+# await_swept <scn> <slug> <sha> — leg (a) of HERD-326: AWAIT the swept terminal STATE (every merged-PR
+# obligation discharged, residue empty) rather than reading it once. Runs the cadence sweep and, only
+# if the PR's obligations are not yet fully discharged, runs up to a bounded number of further sweeps
+# until they are OR the budget is spent. A converged sweep is byte-inert (PART 1's fixed-point check
+# below proves it), so on the happy path this runs EXACTLY one sweep and is byte-identical; only a
+# load-starved child that lands a post-merge hook a sweep late gets the extra polls, where a one-shot
+# residue read would false-red.
+await_swept() {
+  local _scn="$1" _slug="$2" _sha="$3" _tries=20 _i=0
+  while :; do
+    tick "$_scn" "$_slug" "$_sha" sweep >/dev/null
+    [ -z "$(residue "$_scn" "$_slug")" ] && return 0        # converged
+    _i=$((_i+1))
+    [ "$_i" -ge "$_tries" ] && return 1                     # budget spent — explicit timeout
+    sleep 0.1
+  done
+}
+
 # ── PART 1: kill the merge at every post-merge hook; the next sweep must converge ────────────────
 step crash "kill the watcher at every post-merge hook — the next sweep pass must converge"
 SLUG=postmerge
@@ -261,8 +279,9 @@ for crash in none before-hooks after-purges after-reconcile; do
     *) bad "crash=$crash → the fixture merge did not land; the scenario is invalid"; continue ;;
   esac
 
-  # Tick 2 — a brand-new watcher process running only the cadence sweep. This is the whole claim.
-  tick "$scn" "$SLUG" "$sha" sweep >/dev/null
+  # Tick 2 — a brand-new watcher process running only the cadence sweep. This is the whole claim. AWAIT
+  # the swept terminal STATE (poll, don't one-shot) so heavy box load never paints a spurious red.
+  await_swept "$scn" "$SLUG" "$sha"
 
   res="$(residue "$scn" "$SLUG")"
   if [ -n "$res" ]; then

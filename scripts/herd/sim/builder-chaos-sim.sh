@@ -250,11 +250,40 @@ ledger_rows()   {
   for f in dead respawn limit limit-sendkeys; do ledger_has "$1" "$2" "$f" && out="${out}$f "; done
   printf '%s' "$out"; }
 journaled()     { grep -q "\"event\":\"$2\"" "$1/journal.jsonl" 2>/dev/null; }
-# ordered <scn> <earlier-pattern> <later-pattern> — 0 iff BOTH appear and the first precedes the second.
+
+# ── terminal-corpse-STATE probes (HERD-326) ───────────────────────────────────────────────────────
+# The reap's END STATE, polled — a timing-tolerant read of the same invariants, not a WEAKER one. These
+# sit ALONGSIDE the ORDERING checks below (they do not replace them): `ordered` still proves the corpse
+# is reaped BEFORE the respawn creates anything (the anti-stacking / agent_name_taken guard), while
+# these state polls absorb a late herdr round-trip under heavy box load (the PR #431 false-red) where a
+# one-shot read would false-red. Each predicate is a plain 0/1 on the world file.
+corpse_tab_gone() { [ "$(tab_exists "$1" tab-corpse)" = no ]; }
+agents_is()       { [ "$(agents_named "$1" "$2")" = "$3" ]; }
+tablabel_is()     { [ "$(tabs_labelled "$1" "$2")" = "$3" ]; }
+# poll_state <tries> <sleep> <predicate…> — succeed the INSTANT <predicate> holds; else re-check up to
+# <tries> times, sleeping <sleep> between tries. On the happy path the first check already holds — no
+# sleep, no behavioural change, byte-identical output.
+poll_state() {
+  local _t="$1" _s="$2"; shift 2
+  local _i=0
+  while [ "$_i" -lt "$_t" ]; do "$@" && return 0; _i=$((_i+1)); [ "$_i" -lt "$_t" ] && sleep "$_s"; done
+  return 1
+}
+# ordered <scn> <earlier-pattern> <later-pattern> — the ORDERING invariant, kept but made TIMING-
+# TOLERANT (HERD-326). Under heavy box load a child can flush its actions-log lines a beat late, so we
+# POLL until BOTH patterns are present (or the budget is spent) BEFORE comparing their line numbers —
+# only the racy "read before the lines exist" is removed, never the invariant. 0 IFF both appear AND
+# the first precedes the second. A respawn that stacks on a corpse — the new agent starting BEFORE the
+# corpse pane closes, the agent_name_taken bug — still FAILS here (later line < earlier line), which a
+# terminal state-only check could NOT catch.
 ordered() {
-  local a b
-  a="$(grep -n -- "$2" "$1/actions.log" | head -1 | cut -d: -f1)"
-  b="$(grep -n -- "$3" "$1/actions.log" | head -1 | cut -d: -f1)"
+  local scn="$1" early="$2" late="$3" a="" b="" i=0
+  while [ "$i" -lt 30 ]; do
+    a="$(grep -n -- "$early" "$scn/actions.log" 2>/dev/null | head -1 | cut -d: -f1)"
+    b="$(grep -n -- "$late"  "$scn/actions.log" 2>/dev/null | head -1 | cut -d: -f1)"
+    { [ -n "$a" ] && [ -n "$b" ]; } && break
+    i=$((i+1)); sleep 0.1
+  done
   [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
 }
 
@@ -274,9 +303,9 @@ scn="$ART/s-precommit"; SLUG=precommit
 fixture "$scn" "$SLUG" clean live
 v="$(DEAD_BUILDER_AUTORESPAWN=on CLAIM_RELEASE=release two_ticks "$scn" "$SLUG")"
 assert "precommit · a vanished-but-registered builder crosses into DEAD" test "$v" = DEAD
-assert "precommit · I2 exactly ONE agent holds the slug after the respawn (no stacking)" test "$(agents_named "$scn" "$SLUG")" = 1
-assert "precommit · I1 the corpse tab is gone" test "$(tab_exists "$scn" tab-corpse)" = no
-assert "precommit · I2 exactly ONE tab carries the slug label (no orphan)" test "$(tabs_labelled "$scn" "$SLUG")" = 1
+assert "precommit · I2 exactly ONE agent holds the slug after the respawn (no stacking)" poll_state 30 0.1 agents_is "$scn" "$SLUG" 1
+assert "precommit · I1 the corpse tab reaches its terminal reaped state (gone)" poll_state 30 0.1 corpse_tab_gone "$scn"
+assert "precommit · I2 exactly ONE tab carries the slug label (no orphan)" poll_state 30 0.1 tablabel_is "$scn" "$SLUG" 1
 assert "precommit · I1 the corpse is reaped BEFORE the respawn tab is created" ordered "$scn" 'pane close pane-corpse' 'tab create'
 refute "precommit · I1 the corpse's tab-registry row is pruned" grep -q "^precommit tab-corpse" "$scn/trees/.herd-tabs"
 assert "precommit · I6 the corpse reap is journaled" journaled "$scn" builder_corpse_reaped
@@ -365,7 +394,8 @@ tick "$scn" "$SLUG" >/dev/null
 v="$(SIM_ASTATUS=idle SIM_LIVENESS=dead DEAD_BUILDER_AUTORESPAWN=on CLAIM_RELEASE=release \
        tick "$scn" "$SLUG" | sed -n 's/^VERDICT //p')"
 assert "unwakeable · a positive liveness=dead probe overrides the stale listing" test "$v" = DEAD
-assert "unwakeable · I1/I2 the corpse is reaped and exactly one fresh agent holds the name" test "$(agents_named "$scn" "$SLUG")" = 1
+assert "unwakeable · I1/I2 the corpse is reaped and exactly one fresh agent holds the name" poll_state 30 0.1 agents_is "$scn" "$SLUG" 1
+assert "unwakeable · I1 the corpse tab reaches its terminal reaped state (gone)" poll_state 30 0.1 corpse_tab_gone "$scn"
 assert "unwakeable · I1 the name is freed BEFORE agent start (the agent_name_taken bug)" ordered "$scn" 'pane close pane-corpse' 'agent start'
 
 # ══ PART 2 — the terminal reap closes every ledger the slug opened ════════════════════════════════
