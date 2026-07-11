@@ -11572,20 +11572,23 @@ _engine_tick_watchdog() {
     fi
     _ENGINE_FAULT_STREAK=0
     _ENGINE_DOWN_DECLARED=""
+    _HERD_ENGINE_TICK_LAST_ERR=""
     ENGINE_DOWN_ROW=""
     return 0
   fi
   # The tick faulted through every retry. Grow the consecutive-fault streak and journal it.
   _ENGINE_FAULT_STREAK=$(( _ENGINE_FAULT_STREAK + 1 ))
-  journal_append engine_tick_fault streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES"
+  journal_append engine_tick_fault streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES" reason "${_HERD_ENGINE_TICK_LAST_ERR:-}"
   if [ "$_ENGINE_FAULT_STREAK" -ge "$_ENGINE_FAULT_MAX" ]; then
     # Past tolerance: paint the loud banner EVERY down-tick (so a restarted render always shows it) and,
     # once per episode, journal engine_down + fire the notification path. No bash action runs — holds are
     # the failure posture.
-    ENGINE_DOWN_ROW="    ${C_RED}🛑 ${C_BOLD}ENGINE DOWN${C_RESET}${C_RED} · manual intervention — the Python engine core faulted ${_ENGINE_FAULT_STREAK}× · NO gates/merges are running · check: ${C_DIM}python3 -m herd.live_runtime --tick${C_RESET}"$'\n'
+    local _edr_reason=""
+    [ -n "${_HERD_ENGINE_TICK_LAST_ERR:-}" ] && _edr_reason=" · last error: ${_HERD_ENGINE_TICK_LAST_ERR}"
+    ENGINE_DOWN_ROW="    ${C_RED}🛑 ${C_BOLD}ENGINE DOWN${C_RESET}${C_RED} · manual intervention — the Python engine core faulted ${_ENGINE_FAULT_STREAK}×${_edr_reason} · NO gates/merges are running · check: ${C_DIM}python3 -m herd.live_runtime --tick${C_RESET}"$'\n'
     if [ -z "$_ENGINE_DOWN_DECLARED" ]; then
       _ENGINE_DOWN_DECLARED=1
-      journal_append engine_down streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES"
+      journal_append engine_down streak "$_ENGINE_FAULT_STREAK" attempts "$_ENGINE_TICK_RETRIES" reason "${_HERD_ENGINE_TICK_LAST_ERR:-}"
       herd_driver_notify "🛑 herd engine down — manual intervention" "The Python engine core faulted ${_ENGINE_FAULT_STREAK}× consecutively; no merges or gates are running. Check python3 -m herd.live_runtime." default
     fi
     render   # repaint THIS tick so the engine-down banner shows immediately (render already ran once above)
@@ -12470,6 +12473,7 @@ _ENGINE_FAULT_MAX=3         # declare 'engine down' after this many consecutive 
 _ENGINE_TICK_RETRIES=3      # in-tick attempts of the Python live tick before the tick counts as faulted
 _ENGINE_BACKOFF_BASE=2      # seconds; in-tick backoff between attempts is attempt × this (2 s, 4 s)
 _ENGINE_DOWN_DECLARED=""    # set once the loud engine-down posture is active; cleared on recovery
+_HERD_ENGINE_TICK_LAST_ERR="" # last non-empty stderr line from the Python live tick (HERD-345); cleared on clean tick
 
 # One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
