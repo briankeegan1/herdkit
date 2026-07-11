@@ -100,8 +100,10 @@ fi
 BATS
   # Never use $(bats …): a surviving /dev/tty grandchild keeps the pipe open and hangs
   # inside the gate's own bats run (the healthcheck.project.sh pattern: write to a file).
+  # --formatter tap: avoids the pretty formatter subprocess which opens /dev/tty and can
+  # hang the outer bats run when this test is itself running inside the gate's bats suite.
   _e2e_out="$T/e2e-bats.out"
-  bats "$D6/herd.bats" </dev/null >"$_e2e_out" 2>&1; e2e_rc=$?
+  bats --formatter tap "$D6/herd.bats" </dev/null >"$_e2e_out" 2>&1; e2e_rc=$?
   e2e="$(cat "$_e2e_out")"
   [ "$e2e_rc" -ne 0 ] || fail "(6) an empty-suite discovery file must FAIL under bats (rc=$e2e_rc):\n$e2e"
   printf '%s\n' "$e2e" | grep -q 'not ok .* discovery matched zero' \
