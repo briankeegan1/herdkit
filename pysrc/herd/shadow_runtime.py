@@ -829,6 +829,17 @@ def main(argv=None):
                             main_healths=scenario.get("main_healths"),
                             push_holds=scenario.get("push_holds"))
     result = watcher.run(candidates)
+    # P4 store-backend seam (HERD-305): surface the resolved mutable-state backend so a sim can drive
+    # the SAME shadow scenario on BOTH substrates and assert identical decisions. SHIP-DORMANT: with the
+    # default (auto → flat, no lever set) the key is OMITTED, so shadow stdout is byte-identical to
+    # before this seam; it appears only once sqlite is engaged or STORE_BACKEND is set explicitly.
+    try:
+        from herd import store as _store_mod
+        _be = _store_mod.resolve_backend()
+        if _be != "flat":
+            result["store_backend"] = _be
+    except Exception:
+        pass
     sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n")
     return 0
 

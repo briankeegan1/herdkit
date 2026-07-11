@@ -262,6 +262,19 @@ class LiveState:
 
     def __init__(self, state_dir=None):
         self.dir = state_dir or os.environ.get("TREES") or os.environ.get("WORKTREES_DIR") or None
+        # P4 store-backend seam (HERD-305). Resolve the mutable-state store: flat (default) reads the
+        # flat files below verbatim; sqlite (engaged only post-migration, via the marker resolve_backend
+        # honours) routes the sha-keyed accessors through the SQLite store. Fail-soft + SHIP-DORMANT: any
+        # import/resolve error leaves _store=None and every method runs its existing flat path unchanged.
+        self._store = None
+        try:
+            from herd import store as _store_mod
+            if _store_mod.resolve_backend(self.dir) == "sqlite":
+                self._store = _store_mod.open_store(self.dir)
+                if not getattr(self._store, "is_sqlite", False):
+                    self._store = None
+        except Exception:
+            self._store = None
 
     def _p(self, name):
         return os.path.join(self.dir, name) if self.dir else None
@@ -282,6 +295,8 @@ class LiveState:
     def recorded_review(self, pr, sha):
         """The recorded verdict for this exact ``(pr, sha)`` — review-once reuse (agent-watch.sh:1687).
         ``awk '$2==pr && $3==sha {v=$4} END{print v}'`` — the LAST matching row wins."""
+        if self._store is not None:
+            return self._store.recorded_review(pr, sha)
         path = self.review_ledger()
         if not path or not os.path.exists(path):
             return None
@@ -298,6 +313,9 @@ class LiveState:
 
     def record_review(self, pr, sha, verdict, source="reviewer"):
         """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source>`` (agent-watch.sh:1820)."""
+        if self._store is not None:
+            self._store.record_review(pr, sha, verdict, source)
+            return
         path = self.review_ledger()
         if not path:
             return
@@ -340,6 +358,8 @@ class LiveState:
     def health_cached_verdict(self, cand):
         """The TERMINAL health verdict cached for this exact head sha — reuse with no suite re-run
         (agent-watch.sh:10237). The cache line is ``<verdict>\\t<detail>``; verdict ∈ CLEAN|FLAKY|CODEERROR."""
+        if self._store is not None:
+            return self._store.health_cached_verdict(cand.pr, cand.sha)
         path = self.health_result_file(cand)
         if not path or not os.path.exists(path):
             return None
@@ -353,6 +373,9 @@ class LiveState:
 
     def record_health_result(self, cand, verdict, detail=""):
         """Cache a terminal health verdict for this exact commit (agent-watch.sh:record_health_result)."""
+        if self._store is not None:
+            self._store.record_health_result(cand.pr, cand.sha, verdict, detail)
+            return
         path = self.health_result_file(cand)
         if not path or not cand.sha:
             return
@@ -367,6 +390,8 @@ class LiveState:
         """Fire a hold's side effects exactly once per ``(pr, sha, kind)`` (once-guard doctrine, §5.3).
         Returns True the first time (proceed + record the marker), False thereafter. With no state dir it
         always proceeds — a sim/dry-run tick has no cross-tick state to dedup against, so it never suppresses."""
+        if self._store is not None:
+            return self._store.once("live-%s-%s-%s" % (kind, pr, sha))
         path = self._p(".live-noted-%s-%s-%s" % (kind, pr, sha))
         if not path:
             return True

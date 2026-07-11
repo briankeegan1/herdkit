@@ -501,6 +501,18 @@ BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
 BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
 BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
+# Orphan-PR advisory surface (HERD-330). The watcher gates work it DISCOVERS via git worktrees; an
+# open PR with no live builder worktree in this workspace (a collaborator PR, a main-checkout PR, a
+# PR whose worktree was reaped) is therefore never adopted — it sits ungated and, today, invisible.
+# Under ORPHAN_PR_ROWS=on the render/reconcile tick REWRITES this ledger each cycle with one
+# "<epoch>\t<pr>\t<title>\t<branch>" row per such PR, computed from the tick's ALREADY-fetched open-PR
+# roster (PRS_JSON) minus the PRs the discovered worktrees claim — DYNAMIC discovery, zero extra gh.
+# Rewritten-each-tick means it self-corrects the instant a worktree adopts the PR or the PR closes
+# (the row simply stops being written). build_orphan_prs renders its tail through the shared
+# bounded-section helper (console-section.sh). Off (default) → never written, so a no-orphan/off
+# watcher is byte-identical to before this feature.
+ORPHAN_PR_LEDGER="$TREES/.agent-watch-orphan-prs"
+ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the ledger is rewritten whole each tick)
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -604,6 +616,7 @@ BLOCKED=""
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
+ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -1508,6 +1521,108 @@ build_builder_notes() {
   return 0
 }
 
+# ── Orphan PRs (HERD-330) ─────────────────────────────────────────────────────────────────────────
+# `_orphan_prs_scan` rewrites the orphan-PR ledger each tick from the world it OBSERVED (PRS_JSON minus
+# the PRs the discovered worktrees claim); `build_orphan_prs` is the pure console renderer of its tail.
+# Both self-gate on ORPHAN_PR_ROWS so an off (or no-orphan) watcher is byte-identical to before.
+
+# _orphan_pr_rows_enabled — true iff ORPHAN_PR_ROWS opts in. Default OFF (mirrors _operator_inbox_enabled);
+# any unrecognized value reads as off (fail toward the byte-identical console).
+_orphan_pr_rows_enabled() {
+  case "$(printf '%s' "${ORPHAN_PR_ROWS:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _orphan_pr_classify <line>  ("<epoch>\t<pr>\t<title>\t<branch>")
+#   Prints "<epoch>\tcalm" for the shared bounded-section renderer. Every orphan row is advisory: the
+#   ledger is rewritten whole each tick with a fresh epoch, so a still-orphan PR is always visible and
+#   an adopted/closed one simply stops being written (no stale row lingers).
+_orphan_pr_classify() {
+  local _op_epoch
+  IFS=$'\t' read -r _op_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tcalm' "${_op_epoch:-}"
+}
+
+# _orphan_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row (advisory, never
+#   red). Fail-soft: a row missing its PR number renders nothing (drops out of the section).
+_orphan_pr_row() {
+  local _op_epoch _op_pr _op_title _op_branch
+  IFS=$'\t' read -r _op_epoch _op_pr _op_title _op_branch <<EOF
+$1
+EOF
+  [ -n "${_op_pr:-}" ] || return 0
+  printf '    %s🪹%s %s#%s%s %s %s%s · no worktree here — adopt or handle manually%s' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_op_pr" "$C_RESET" "${_op_title:-}" \
+    "$C_DIM" "${_op_branch:-}" "$C_RESET"
+}
+
+# _orphan_prs_scan <prs-json> <claimed-pr-numbers-newline-list>
+#   REWRITE the orphan-PR ledger from live state: one row per OPEN PR in $1 whose number is not in the
+#   claimed set $2 (the PRs the discovered worktrees own this tick). No-op — and no ledger write —
+#   when ORPHAN_PR_ROWS is off OR the open-PR lookup FAILED this tick (a failed fetch is not positive
+#   evidence of "no PR"; HERD-224), so the previous tick's rows are never fabricated away by a blip.
+#   Rewritten whole (never appended) so the ledger cannot grow unbounded and self-corrects each tick.
+#   Zero network: it reads the tick's already-fetched roster. Fail-soft: malformed JSON → empty ledger.
+_orphan_prs_scan() {
+  _orphan_pr_rows_enabled || return 0
+  [ "${PRS_LOOKUP_OK:-1}" = "1" ] || return 0
+  local _op_json="${1:-[]}" _op_claimed="${2:-}" _op_epoch _op_out
+  _op_epoch="$(_console_now_epoch)"
+  _op_out="$(PRS_JSON="$_op_json" CLAIMED="$_op_claimed" EPOCH="$_op_epoch" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)   # malformed roster → empty ledger (fail-soft), never a crash
+claimed = set(n for n in (os.environ.get("CLAIMED") or "").split() if n)
+epoch = os.environ.get("EPOCH", "")
+def flat(s):
+    return " ".join(str(s or "").split())
+for pr in prs:
+    if not isinstance(pr, dict):
+        continue
+    num = pr.get("number")
+    if num is None:
+        continue
+    if str(num) in claimed:
+        continue
+    title = flat(pr.get("title"))
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    branch = flat(pr.get("headRefName"))
+    # TAB-separated, matching _orphan_pr_classify/_orphan_pr_row; whitespace already flattened so a
+    # title/branch can never inject a TAB or newline into the ledger shape.
+    print("%s\t%s\t%s\t%s" % (epoch, num, title, branch))
+' 2>/dev/null)" || _op_out=""
+  # Rewrite the ledger atomically-ish: a truncate to empty when there are no orphans clears the section.
+  if [ -n "$_op_out" ]; then
+    printf '%s\n' "$_op_out" > "$ORPHAN_PR_LEDGER" 2>/dev/null || true
+  else
+    : > "$ORPHAN_PR_LEDGER" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# build_orphan_prs — the "orphan PRs" advisory section: the orphan-PR ledger tail, newest-first, one
+# row each, bounded to ORPHAN_PR_ROWS_LIMIT via the shared helper. Empty (ORPHAN_PR_SECTION_ROWS="")
+# when the feature is off OR no PR is orphaned, so render() omits the section and the console is
+# byte-identical when unused. A pure renderer — the discovery (and its only write) is _orphan_prs_scan.
+build_orphan_prs() {
+  ORPHAN_PR_SECTION_ROWS=""
+  _orphan_pr_rows_enabled || return 0
+  [ -s "$ORPHAN_PR_LEDGER" ] || return 0
+  local rows
+  rows="$(herd_console_section "$ORPHAN_PR_LEDGER" "$ORPHAN_PR_ROWS_LIMIT" \
+    _orphan_pr_classify _orphan_pr_row)"
+  [ -n "$rows" ] && ORPHAN_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -1565,6 +1680,11 @@ render() {
   # unless a builder has filed a note since the cursor advanced, so byte-identical when unused.
   if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
+  fi
+  # ORPHAN PRs (HERD-330) — open PRs no live builder worktree owns, needs-you-adjacent. Empty unless
+  # ORPHAN_PR_ROWS is on AND at least one open PR is orphaned this tick, so byte-identical when unused.
+  if [ -n "${ORPHAN_PR_SECTION_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}orphan PRs${C_RESET}"$'\n'"${ORPHAN_PR_SECTION_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -12221,6 +12341,24 @@ EOF
   # ledger ⇒ build_builder_notes leaves BUILDER_NOTES_ROWS empty ⇒ byte-identical console when unused.
   _builder_notes_scan
   build_builder_notes
+
+  # HERD-330 orphan PRs — rewrite + render the advisory section listing each open PR (in the tick's
+  # already-fetched PRS_JSON) that NO discovered builder worktree owns. The claimed set is derived from
+  # this tick's FEATS records (field 4 = PR number); an orphan is any open PR not in it. _orphan_prs_scan
+  # self-gates on ORPHAN_PR_ROWS (no scan, no ledger write when off) and on PRS_LOOKUP_OK (never
+  # fabricates on a failed fetch); build_orphan_prs leaves ORPHAN_PR_SECTION_ROWS empty when off/none, so
+  # the frame is byte-identical to before the feature. Zero extra gh — no new `gh pr list`.
+  _orphan_claimed=""
+  if _orphan_pr_rows_enabled; then
+    for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+      IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
+$_orphan_rec
+EOF
+      [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
+    done
+    _orphan_prs_scan "$PRS_JSON" "$_orphan_claimed"
+  fi
+  build_orphan_prs
 
   render
   # ENGINE_IMPL=python (HERD-320/HERD-323, EPIC HERD-300): hand ONLY the action pass to the LIVE
