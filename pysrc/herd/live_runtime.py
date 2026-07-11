@@ -725,8 +725,13 @@ class LiveGates:
                                 "detail", "review dispatch failed: %s" % str(exc)[:160])
             return
         _marker_write(inflight, proc.pid)
+        # Contract §3.4 requires the full shape (pr, sha, pid, model, log_path, pin) — the same six
+        # keys bash emits (agent-watch.sh:2545) and the shadow twin emits (shadow_runtime.py:382), so
+        # `herd why`/`herd log`/cost read `model`+`log_path` and a shadow↔live parity diff stays clean.
+        # `model` mirrors bash's env fallback chain; `log_path` is the reviewer's result file.
+        model = os.environ.get("HERD_REVIEW_MODEL") or os.environ.get("MODEL_REVIEW") or ""
         self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pid", proc.pid,
-                            "pin", cand.sha)
+                            "model", model, "log_path", result, "pin", cand.sha)
 
 
 def parse_review_verdict(text):
@@ -915,8 +920,14 @@ class LiveTick:
         self._advance(cand, {"CLEAN": "health_clean", "FLAKY": "health_flaky",
                              "CODEERROR": "health_codeerror"}[health])
         if health == "CODEERROR":
+            # Contract §3.4 refix_bounce shape (pr, sha, slug, round, agent_status_before, rule,
+            # location) — the port unifies both rails under one event keyed by `rule` (there is no
+            # `health_refix_bounce` in the catalog). Match the shadow twin's field SET
+            # (shadow_runtime.py:418) with bash-faithful defaults: the live tick does not probe the
+            # pane here (bash's own fallback is "unknown") and parses no finding location.
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "rule", "healthcheck")
+                                "round", 1, "agent_status_before", "unknown", "rule", "healthcheck",
+                                "location", "")
             return BLOCK
 
         # 3. review rail (LLM) — DISPATCHED async by shelling out to the adversarial reviewer.
@@ -936,8 +947,12 @@ class LiveTick:
                                 "source", "reviewer")
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
+            # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
+            # bash (agent-watch.sh:7321) with bash-faithful defaults for the fields the live tick does
+            # not compute here (pane status → "unknown"; finding location unparsed → "").
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "rule", "review")
+                                "round", 1, "agent_status_before", "unknown", "rule", "review",
+                                "location", "")
             return BLOCK
 
         # 4. the blessing — both rails passed (review_pass advanced the lifecycle to BLESSED). Once per
