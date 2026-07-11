@@ -445,6 +445,78 @@ printf '%s\n' "$line" > "$out.tmp.$$" 2>/dev/null && mv "$out.tmp.$$" "$out" 2>/
 '''
 
 
+# ── branch → slug → worktree (task HERD-346): resolve the POOL worktree a candidate lives in ───────
+# Live GraphQL discovery yields a PR's HEAD BRANCH, but the gate rails (healthcheck.sh, herd-review.sh)
+# operate on its WORKTREE, keyed by the SLUG. bash derives the slug from the branch with
+# ``herd_branch_parse`` (herd-config.sh:1557) under BRANCH_TEMPLATE, and the worktree as ``$TREES/<slug>``
+# (agent-watch.sh:1934). This port mirrors that EXACTLY so a python tick dispatches the same suite on the
+# same tree the bash tick would — instead of shelling ``healthcheck.sh`` with an EMPTY worktree, which
+# usage-errors into a phantom CODEERROR + an endless refix_bounce (the HERD-346 live regression, #453).
+
+def _branch_template():
+    """The active BRANCH_TEMPLATE (default ``feat/{slug}``); an unusable value (no ``{slug}``) degrades
+    to the default, mirroring the bash inline parser (agent-watch.sh:6341) and ``_herd_branch_template``."""
+    tmpl = os.environ.get("BRANCH_TEMPLATE") or "feat/{slug}"
+    return tmpl if "{slug}" in tmpl else "feat/{slug}"
+
+
+def branch_to_slug(branch):
+    """Port of ``herd_branch_parse`` (herd-config.sh:1557): echo the slug encoded in ``branch`` under
+    the active BRANCH_TEMPLATE. Strips the template's literal prefix (everything up to ``{slug}``, any
+    ``{ref}`` a wildcard) and its literal suffix. Empty when the branch does not fit the template."""
+    if not branch:
+        return ""
+    pre, _, post = _branch_template().partition("{slug}")
+    slug = branch
+    if "{ref}" in pre:                                   # drop up to the last separator trailing {ref}
+        sep = pre.rsplit("{ref}", 1)[1]
+        if sep:
+            i = slug.rfind(sep)
+            if i >= 0:
+                slug = slug[i + len(sep):]
+    elif pre and slug.startswith(pre):                   # else drop the fixed literal prefix
+        slug = slug[len(pre):]
+    if "{ref}" in post:                                  # cut from the first separator leading {ref}
+        sep2 = post.split("{ref}", 1)[0]
+        if sep2:
+            i = slug.find(sep2)
+            if i >= 0:
+                slug = slug[:i]
+    elif post and slug.endswith(post):                   # else drop the fixed literal suffix
+        slug = slug[:len(slug) - len(post)]
+    return slug
+
+
+def _pool_dir():
+    """The worktree POOL root — ``$TREES`` else ``$WORKTREES_DIR`` (identical to :class:`LiveState.dir`).
+    Empty when neither is set (an unconfigured pool: the scope/dispatch guards then fail-soft)."""
+    return os.environ.get("TREES") or os.environ.get("WORKTREES_DIR") or ""
+
+
+def _worktree_for_slug(slug):
+    """The pool worktree path for ``slug``: ``$TREES/<slug>`` (agent-watch.sh:1934). Empty when there is
+    no slug or no configured pool — fail-soft: we never fabricate a worktree path we cannot ground."""
+    pool = _pool_dir()
+    return os.path.join(pool, slug) if (slug and pool) else ""
+
+
+def _is_worktree(path):
+    """True iff ``path`` is a checked-out git worktree (its ``.git`` pointer file/dir exists). Backs the
+    pool-membership scope (leg 3) and the pre-dispatch guard (leg 2): a PR whose slug has no worktree on
+    disk is FOREIGN to this pool — its suite would usage-error, so it is never classified nor dispatched."""
+    return bool(path) and os.path.isdir(path) and os.path.exists(os.path.join(path, ".git"))
+
+
+def _pool_scoped(cands):
+    """Drop candidates NOT backed by a real worktree in this pool (task HERD-346, leg 3) — the port of
+    bash's worktree-first discovery (``_discover_feature_worktrees``, agent-watch.sh:11211), where a PR
+    with no ``$TREES`` worktree never becomes a candidate. FAIL-SOFT: with no pool configured the check is
+    skipped (byte-identical passthrough), exactly as bash's ``_under_trees`` no-ops when ``$TREES`` is unset."""
+    if not _pool_dir():
+        return list(cands)
+    return [c for c in cands if _is_worktree(c.worktree)]
+
+
 # ── discovery: where candidates come from ─────────────────────────────────────────────────────────
 
 def discover_via_graphql(repo=None, limit=50):
@@ -477,9 +549,15 @@ def discover_via_graphql(repo=None, limit=50):
              .get("pullRequests") or {}).get("nodes") or []
     cands = []
     for node in nodes:
+        # leg 1: derive the SLUG from the head branch (bash convention, herd_branch_parse) and resolve
+        # the POOL worktree ($TREES/<slug>) the rails run on — never leave worktree empty, which shells
+        # healthcheck.sh with no tree and usage-errors into a phantom CODEERROR (HERD-346, #453).
+        branch = node.get("headRefName", "")
+        slug = branch_to_slug(branch)
         cands.append(LiveCandidate(
             pr=node.get("number"), sha=node.get("headRefOid", ""),
-            slug=node.get("headRefName", ""), base=node.get("baseRefName", ""),
+            slug=slug, base=node.get("baseRefName", ""),
+            worktree=_worktree_for_slug(slug),
             stale=(node.get("mergeStateStatus") == "BEHIND"),
             merge_status=node.get("mergeStateStatus", ""),
             author=((node.get("author") or {}).get("login", "")),
@@ -603,7 +681,9 @@ class _GraphQLDiscovery:
         self._repo = repo
 
     def discover(self):
-        return _select_candidates(discover_via_graphql(self._repo), self._config)
+        # owner/view scope, THEN pool scope (leg 3): a PR with no worktree in this pool is foreign and
+        # never enters classification — the port of bash's worktree-first discovery.
+        return _pool_scoped(_select_candidates(discover_via_graphql(self._repo), self._config))
 
 
 # ── gate dispatch: shell out to the existing leaf scripts, consume their contract output ───────────
@@ -668,6 +748,17 @@ class LiveGates:
         # 3. IN FLIGHT: a live worker on this exact (pr, sha) → wait, never a second overlapping suite.
         inflight = st.health_inflight_file(cand)
         if inflight and _marker_live(inflight):
+            return WAIT
+        # 3.5 HARD pre-dispatch worktree validation (task HERD-346, leg 2): NEVER shell the suite at a
+        #     worktree that isn't there — healthcheck.sh <missing> usage-errors into a phantom CODEERROR
+        #     and an endless refix_bounce (#453). A resolved-but-ABSENT worktree REFUSES dispatch and
+        #     HOLDS (WAIT, re-evaluated next tick) — never a red row, never a merge. The pool scope (leg 3)
+        #     normally drops such a PR at discovery, so this is the belt-and-suspenders guard for a worktree
+        #     reaped between discovery and dispatch. An EMPTY worktree (a hermetic/legacy candidate that
+        #     carries none) is UNKNOWN, not absent → fall through, byte-identical to before.
+        if cand.worktree and not _is_worktree(cand.worktree):
+            self.journal.append("dispatch_refused", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "rail", "health", "reason", "no-worktree", "worktree", cand.worktree)
             return WAIT
         # 4. DISPATCH the async suite worker + lay the marker → wait.
         self._dispatch_health(cand)
