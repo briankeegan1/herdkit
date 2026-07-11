@@ -511,6 +511,49 @@ _sweep_proc_cwd() {
 # claimed spawn intent — not an orphan. Killing it strands the claim behind a lane that never lands.
 _sweep_live_marker_pids() { watcher_marker_pids; }
 
+# _sweep_sess_of <pid> — the SESSION id of <pid>, via the same seam discipline as the process table so
+# a test can inject sessions deterministically (HERD_SWEEP_SESS_CMD). `ps -o sess=` is NOT portable
+# for this: on macOS it prints an opaque session-structure address (often 0), not the leader pid, so it
+# cannot be compared against the leader pid the python worker records. `os.getsid` returns the real
+# session-leader pid on both macOS and Linux, and it is exactly what live_runtime.py:_pid_session writes
+# — so the marker's recorded session and a candidate's computed session are the SAME kind of token and
+# compare cleanly. Empty when the pid is gone / python is absent (fail-soft: a caller then skips the
+# session exemption for that candidate rather than treating an empty token as a match).
+_sweep_sess_of() {
+  local p="${1:-}"; [ -n "$p" ] || return 0
+  if [ -n "${HERD_SWEEP_SESS_CMD:-}" ]; then "$HERD_SWEEP_SESS_CMD" "$p"; return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys
+try: print(os.getsid(int(sys.argv[1])))
+except Exception: pass' "$p" 2>/dev/null
+    return 0
+  fi
+  return 0
+}
+
+# _sweep_live_marker_sessions — the SESSION ids owned by LIVE inflight markers, one per line. Companion
+# to _sweep_live_marker_pids for the HERD-348 exemption: the python gate worker detaches into its OWN
+# session (start_new_session=True) and its bats subtree runs in a DIFFERENT process group within that
+# session (GNU `timeout` re-groups its child), so the recorded marker PID never names the pid the sweep
+# is about to kill — but the SESSION does. Two sources, unioned (dedup is unnecessary for substring
+# matching):
+#   • the session the python worker RECORDS in the marker (leg b, live_runtime.py:_marker_write line 4),
+#     read straight back through watcher_marker_sessions — a direct lookup, no ps;
+#   • each live marker pid EXPANDED to its session (leg a) — covers bash-written 3-line markers and any
+#     marker predating the recorded-session line. Gated on the SAME liveness (_sweep_live_marker_pids
+#     only returns pids of markers that are live), so a dead marker's session is never spared.
+_sweep_live_marker_sessions() {
+  watcher_marker_sessions
+  local p s
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # Normalize onto its own line: _sweep_sess_of's backends differ on the trailing newline (python
+    # print adds one, ps/seam do not), and two newline-less expansions would otherwise concatenate.
+    s="$(_sweep_sess_of "$p")"
+    [ -n "$s" ] && printf '%s\n' "$s"
+  done < <(_sweep_live_marker_pids)
+}
+
 # _sweep_owns_path <path> — success iff <path> lies inside this project's main checkout or worktrees
 # dir. Uses a PATH-BOUNDARY test ("$MAIN/" …), never a bare substring: `/src/herdkit` is a prefix of
 # the sibling `/src/herdkit-trees`, so a substring match would attribute (and kill) another project's
@@ -542,10 +585,11 @@ _sweep_owns_path() {
 # pid/pgid recycled inside that window. Same discipline as _marker_write, which persists the
 # start-time at dispatch rather than re-reading it at collect.
 sweep_orphan_procs() {
-  local pid ppid pgid cmd cwd tok mypgid wpid="" live owned st
+  local pid ppid pgid cmd cwd tok mypgid wpid="" live livesess csess owned st
   mypgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
   [ -f "${HERD_WATCHER_LOCK:-/nonexistent}" ] && wpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
   live=" $(_sweep_live_marker_pids | tr '\n' ' ')"
+  livesess=" $(_sweep_live_marker_sessions | tr '\n' ' ')"
   while read -r pid ppid pgid cmd; do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     [ "$ppid" = "1" ] || continue
@@ -554,6 +598,15 @@ sweep_orphan_procs() {
     [ -n "$mypgid" ] && [ "$pgid" = "$mypgid" ] && continue
     case "$live" in *" $pid "*) continue ;; esac
     printf '%s' "$cmd" | grep -Eq "$SWEEP_ORPHAN_CMD_RE" || continue  # pipe-ok: single short scalar (one line), far under a pipe buffer
+    # HERD-348: spare any candidate whose SESSION matches a live gate worker's session. The python
+    # health/review worker detaches into its own session and its bats subtree runs in a DIFFERENT pgid
+    # inside it, so the marker's recorded PID misses the pid that is about to be killed — the session
+    # does not. A candidate whose session is unknowable (python absent, pid gone) yields no token and is
+    # judged on attribution alone, exactly as before this change. Only a NON-empty match spares.
+    csess="$(_sweep_sess_of "$pid")"
+    if [ -n "$csess" ]; then
+      case "$livesess" in *" $csess "*) continue ;; esac
+    fi
     # Project attribution: some whitespace-separated token of the command line is a path we own …
     # (noglob: a command line legitimately contains `*`, which must never pathname-expand here)
     owned=""

@@ -326,11 +326,18 @@ herd_engine_shadow_tick() {
 herd_engine_live_tick() {
   herd_engine_impl >/dev/null 2>&1   # resolve (fires the retired-value warning once if ENGINE_IMPL is stale)
   command -v python3 >/dev/null 2>&1 || return 1
-  local home pyp
+  local home pyp _tick_stderr _tick_rc
   home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
   _herd_engine_journal engine_live_dispatched python
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
+  _tick_stderr="$(mktemp 2>/dev/null || printf '%s' "/tmp/herd-tick-err-$$")"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" PROJECT_ROOT="${PROJECT_ROOT:-}" \
+    python3 -m herd.live_runtime --tick >/dev/null 2>"$_tick_stderr"
+  _tick_rc=$?
+  # Capture the last non-empty stderr line so the caller can surface a self-explaining fault reason.
+  _HERD_ENGINE_TICK_LAST_ERR="$(grep -v '^[[:space:]]*$' "$_tick_stderr" 2>/dev/null | tail -1)"
+  rm -f "$_tick_stderr"
+  [ "$_tick_rc" -eq 0 ] || return 1
   return 0
 }
