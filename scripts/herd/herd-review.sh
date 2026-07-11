@@ -140,6 +140,22 @@ fi
 DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
+
+# HERD-311: resolve the REVIEW_MODEL ref once at startup so the single-reviewer dispatch paths can
+# honor a driver-qualified ref correctly and fail loud early rather than silently passing a broken
+# '<driver>:<model>' string to claude as a literal model id. A bare value resolves to
+# (default-driver, itself) — byte-identical. The panel path resolves each panelist's ref independently
+# (review-panel.sh), so this resolution is for the NON-PANEL single-reviewer dispatch only.
+_REVIEW_DRV="$(herd_driver_name 2>/dev/null || true)"
+_REVIEW_MDL="$REVIEW_MODEL"
+if [ -n "$REVIEW_MODEL" ] && command -v herd_model_resolve >/dev/null 2>&1; then
+  _res="$(herd_model_resolve "$REVIEW_MODEL")" \
+    || { printf '❌ herd-review: MODEL_REVIEW=%s does not resolve to a usable model ref — refusing to dispatch a broken review; set a valid bare model id or a shipped <driver>:<model> ref (see the error above).\n' \
+           "'$REVIEW_MODEL'" >&2; exit 1; }
+  _REVIEW_DRV="${_res%%$'\t'*}"
+  _REVIEW_MDL="${_res#*$'\t'}"
+fi
+
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # REVIEW PANEL size (HERD-107, native-burst): number of CONCURRENT read-only reviewer passes over this
@@ -474,7 +490,7 @@ if [ "$REVIEW_MODE" = "local" ]; then
     # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
     # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
     (set -o pipefail; cd "$CWD" 2>/dev/null && \
-      herd_driver_oneshot_exec "$LOCAL_TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
+      herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$LOCAL_TASK" "$_REVIEW_MDL" $CLAUDE_FLAGS \
         --output-format stream-json --verbose 2>&1 | \
       python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
     rc=${PIPESTATUS[0]}
@@ -866,7 +882,7 @@ else
   # The formatter emits: tool name + one-line input summary (bash command, file path, etc.)
   # and the reviewer's reasoning text — never the old bare '[tool] Bash'.
   (set -o pipefail; cd "$CWD" 2>/dev/null && \
-    herd_driver_oneshot_exec "$TASK" "$REVIEW_MODEL" $CLAUDE_FLAGS \
+    herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$TASK" "$_REVIEW_MDL" $CLAUDE_FLAGS \
       --output-format stream-json --verbose 2>&1 | \
     python3 -uc "$REVIEW_STREAM_FORMATTER") >>"$LOG" 2>&1
   rc=$?

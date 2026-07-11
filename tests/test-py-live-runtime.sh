@@ -132,7 +132,7 @@ pass
 mkdir -p "$T/live/.herd"
 set +e
 ENGINE_IMPL=python HERDKIT_HOME="$REPO" WORKTREES_DIR="$T/live" GH_TOKEN="" \
-  PATH="/usr/bin:/bin" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick' \
+  HOME=/nonexistent PATH="/usr/bin:/bin" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick' \
   >/dev/null 2>&1
 rc=$?
 set -e
