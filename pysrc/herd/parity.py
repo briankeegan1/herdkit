@@ -32,11 +32,24 @@ The volatile categories are neutralized by VALUE (``<TS>``/``<PID>``/``<PATH>``)
 dropped, so a structural difference — a field PRESENT in one stream and ABSENT in the other — is
 still caught; only the noisy value is erased.
 
-THE DIFF (``compare``) is positional: the sim scenarios this drives are deterministic and serial,
-so event *N* of the real stream must canonically equal event *N* of the shadow stream. A count
-mismatch is reported as trailing added/removed events. Each mismatch yields ONE readable
-divergence record (index, event name(s), the differing fields, and the raw pre-canonicalization
-lines for forensics) — the item's "one readable divergence report per mismatch".
+SHADOW-PRIVATE FRAMES (oracle v2, HERD-325 leg 1). The Python shadow engine narrates its own run
+with ``shadow_*`` diagnostic events (``shadow_tick_start``/``shadow_state``/``shadow_blessing``/…)
+— its assertion layer over the real output, NOT engine events the bash tree ever emits. The oracle
+canonicalizes them AWAY before the diff (:func:`is_shadow_private`), so the shadow's instrumentation
+never reads as a divergence. The filter is namespaced to the ``shadow_`` PREFIX, which no REAL
+engine family uses (the catalog is ``merge``/``verdict_recorded``/``main_health``/``push_hold_*``/…,
+contract §3.4) — so a genuine engine event can NEVER be filtered. That is the load-bearing rule:
+only the shadow's OWN diagnostics are dropped; real families pass through untouched.
+
+THE DIFF (``compare``) is ALIGNMENT-based (oracle v2, HERD-325 leg 2), not positional. The old
+positional diff compared event *N* to event *N*, so a SINGLE inserted or deleted event knocked every
+following event out of position and cascaded into a wall of false divergences. The alignment differ
+runs a longest-common-subsequence match (:mod:`difflib`) over the canonical event lines and reports
+only the TRUE edits: an INSERT (present only in shadow), a DELETE (present only in real), or a
+MUTATION (an aligned pair whose canonical payload differs). One offset stays one edit. Each edit
+yields ONE readable divergence record (stream index, event name(s), the differing fields, and the
+raw pre-canonicalization lines for forensics) — the item's "one readable divergence report per
+mismatch".
 
 EXIT CONTRACT (mirrors the reviewer's ``0/1/2`` in contract §2.2): ``0`` = identical after
 canonicalization (parity), ``1`` = divergent (report printed), ``2`` = INFRA (a journal was
@@ -55,6 +68,7 @@ already a hard engine dependency. ZERO model calls, no config keys, no mutation 
 a pure reader + a perturbation writer that only ever writes to stdout.
 """
 
+import difflib
 import json
 import re
 import sys
@@ -81,6 +95,29 @@ def _canon_value(key, value):
     if isinstance(value, str):
         return _ABS_PATH_RE.sub(PATH_TOKEN, value)
     return value
+
+
+# ── shadow-private frame filter (oracle v2, HERD-325 leg 1) ───────────────────────────────────────
+# The Python shadow engine's own diagnostic namespace: every event it emits to NARRATE its run —
+# tick frames, lifecycle transitions, the dry-run blessing/observe/supersede notes — is prefixed
+# "shadow_". None of these has a bash-engine counterpart (they are the shadow's assertion layer over
+# the real output, not engine events), so the oracle drops them before the diff. The prefix is the
+# whole contract: no REAL engine family is named "shadow_*" (see the event catalog, contract §3.4), so
+# this can NEVER filter a genuine engine event — including main_health / push_hold_* (HERD-325 leg 3).
+_SHADOW_PRIVATE_PREFIX = "shadow_"
+
+
+def is_shadow_private(obj):
+    """True iff ``obj`` is a shadow-private diagnostic frame (event name starts with ``shadow_``)."""
+    if not isinstance(obj, dict):
+        return False
+    ev = obj.get("event")
+    return isinstance(ev, str) and ev.startswith(_SHADOW_PRIVATE_PREFIX)
+
+
+def filter_shadow_private(events):
+    """Return ``events`` with shadow-private frames removed (leg 1). Real families pass through."""
+    return [e for e in events if not is_shadow_private(e)]
 
 
 def canonicalize_event(obj):
@@ -170,17 +207,44 @@ class Divergence:
         return "\n".join(lines)
 
 
+def _divergence(index, real, shadow):
+    """Build a :class:`Divergence`, canonicalizing whichever side(s) are present."""
+    cr = canonicalize_event(real) if real is not None else None
+    cs = canonicalize_event(shadow) if shadow is not None else None
+    return Divergence(index, real, shadow, cr, cs)
+
+
 def compare(real_events, shadow_events):
-    """Positional canonical comparison → the list of :class:`Divergence` (empty = parity)."""
+    """Alignment-based canonical comparison → the list of :class:`Divergence` (empty = parity).
+
+    Shadow-private frames are filtered first (leg 1), then the two canonical streams are aligned by
+    a longest-common-subsequence match (leg 2). Only the true edits are reported — a run of matched
+    events aligns as ``equal`` (no divergence); an unmatched real event is a DELETE (MISSING from
+    shadow), an unmatched shadow event is an INSERT (MISSING from real), and an aligned pair whose
+    canonical payload differs is a MUTATION. A single inserted/deleted event no longer cascades.
+    """
+    real = filter_shadow_private(real_events)
+    shadow = filter_shadow_private(shadow_events)
+    # difflib matches HASHABLE opaque tokens — the canonical one-line serialization of each event, so
+    # two events "match" iff they are identical after canonicalization (the parity definition).
+    rc = [canon_line(e) for e in real]
+    sc = [canon_line(e) for e in shadow]
     divs = []
-    n = max(len(real_events), len(shadow_events))
-    for i in range(n):
-        r = real_events[i] if i < len(real_events) else None
-        s = shadow_events[i] if i < len(shadow_events) else None
-        cr = canonicalize_event(r) if r is not None else None
-        cs = canonicalize_event(s) if s is not None else None
-        if cr != cs:
-            divs.append(Divergence(i, r, s, cr, cs))
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, rc, sc, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete":                                  # real[i1:i2] present only in real
+            for i in range(i1, i2):
+                divs.append(_divergence(i, real[i], None))
+        elif tag == "insert":                                # shadow[j1:j2] present only in shadow
+            for j in range(j1, j2):
+                divs.append(_divergence(j, None, shadow[j]))
+        else:                                                # replace: pair as mutations, surplus = ins/del
+            rn, sn = i2 - i1, j2 - j1
+            for k in range(max(rn, sn)):
+                r = real[i1 + k] if k < rn else None
+                s = shadow[j1 + k] if k < sn else None
+                divs.append(_divergence(i1 + k if r is not None else j1 + k, r, s))
     return divs
 
 
@@ -303,15 +367,22 @@ def main(argv):
         sys.stderr.write("herd.parity: %s\n" % exc)
         return 2
 
+    # Filtered stream lengths (leg 1): the counts that actually enter the diff, so the report and the
+    # OK line are honest about what was compared and how many shadow-private frames were dropped.
+    real_kept = filter_shadow_private(real_events)
+    shadow_kept = filter_shadow_private(shadow_events)
+    dropped = len(shadow_events) - len(shadow_kept)
+
     divs = compare(real_events, shadow_events)
     if not divs:
         if not quiet:
-            sys.stdout.write("JOURNAL PARITY: OK (%d events, identical after canonicalization)\n"
-                             % len(real_events))
+            note = (" · %d shadow-private frame(s) filtered" % dropped) if dropped else ""
+            sys.stdout.write("JOURNAL PARITY: OK (%d events, identical after canonicalization%s)\n"
+                             % (len(real_kept), note))
         return 0
 
     sys.stdout.write(format_report(divs, label_real, label_shadow,
-                                   len(real_events), len(shadow_events), max_show) + "\n")
+                                   len(real_kept), len(shadow_kept), max_show) + "\n")
     return 1
 
 

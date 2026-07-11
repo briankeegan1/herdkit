@@ -14,24 +14,32 @@ then feeds that fixture to ``python3 -m herd.shadow_runtime`` and diffs the shad
 the real one.
 
 HONEST BY CONSTRUCTION (the item's non-negotiable — "a real divergence list is a SUCCESS
-deliverable, never force a green by over-canonicalizing"). The two engines emit DIFFERENT event
-vocabularies: the bash tree journals ``healthcheck_started`` / ``review_pin_soft`` /
-``symbol_index_refresh`` / ``reap`` / ``main_health`` that the shadow runtime does not model, and
-the shadow runtime journals ``shadow_tick_start`` / ``shadow_state`` / ``shadow_blessing`` the
-bash tree does not. So an ``auto`` head-to-head is EXPECTED to diverge, and that divergence report
-is the deliverable. This extractor's job is only to give the shadow engine the same INPUTS
-(subjects + rail outcomes); it never rewrites the real stream to manufacture agreement.
+deliverable, never force a green by over-canonicalizing"). This extractor's job is only to give the
+shadow engine the same INPUTS (subjects + rail outcomes + the non-candidate subsystem lists); it
+never rewrites the real stream to manufacture agreement. Oracle v2 (HERD-325, the P3i parity finish
+line) closed the last real families the shadow did not model — ``main_health`` (the post-merge
+tripwire, §3.4) and the ``push_hold_*`` push-gate lifecycle (§5.4) now fold into ordered fixture
+lists the shadow replays, and a lone single-reviewer's ``review_log_retained`` / ``review_pin_soft``
+notes fold into a 0-panelist panel — so ``parity-run.sh --shadow auto`` reaches JOURNAL PARITY on
+the sandbox scenario LEGITIMATELY, matched family-for-family, not forced. The residual auxiliary
+events the shadow still does not model (``symbol_index_refresh`` / ``reap`` / ``cost`` / …) stay in
+the honest excluded tally.
 
 EXTRACTION RULES — every rule cites the engine contract section (``docs/engine-contract.md``) that
 gives it meaning, so each mapping from a real event to a candidate field is auditable:
 
   * CANDIDATE SUBJECTS (contract §2.1, the candidate pass). Only the events in
-    :data:`CANDIDATE_EVENTS` establish a PR as a gate subject. Every OTHER journal event —
-    ``main_health`` (§3.4, a post-merge default-branch tick, not a gate subject), ``infra_breaker_*``
-    (§3.3), ``review_pin_soft`` / ``symbol_index_refresh`` / ``reap`` / ``cost`` / ``step_*`` — is an
-    AUXILIARY engine event and is counted in the excluded tally, never fabricated into a candidate.
-    Dropping them is honest SCOPING (the shadow runtime models the candidate pass, contract §2.1),
-    not canonicalization.
+    :data:`CANDIDATE_EVENTS` establish a PR as a gate subject. A journal event that is neither a
+    candidate signal nor one of the MODELED non-candidate families (panels / steps / gate_status /
+    ``main_health`` §3.4 / ``push_hold_*`` §5.4) — e.g. ``infra_breaker_*`` (§3.3),
+    ``symbol_index_refresh`` / ``reap`` / ``cost`` — is an AUXILIARY engine event, counted in the
+    excluded tally, never fabricated into a candidate. Dropping those is honest SCOPING, not
+    canonicalization.
+  * MAIN-HEALTH ← ``main_health`` ticks (contract §3.4), folded by (pr, sha) into an ordered
+    ``main_healths`` list: the dispatch row + the green/red result (with ``failed`` / ``since`` on a
+    red). NOT a gate subject; modeled, not excluded (oracle v2, HERD-325).
+  * PUSH-HOLD ← the ``push_hold_awaiting`` / ``push_hold_approved`` / ``push_hold_resumed`` lifecycle
+    (contract §5.4), folded by (slug, sha) into an ordered ``push_holds`` list. Modeled, not excluded.
   * HEALTH ← ``healthcheck_outcome.outcome`` (CLEAN|FLAKY|CODEERROR, contract §2.2 / §3.4), with
     ``healthcheck_cache_hit.outcome`` and ``healthcheck_attempted.result`` as fallbacks (§3.4).
   * REVIEW ← ``verdict_recorded.value`` (PASS|BLOCK) but ONLY when ``source == reviewer`` — the sole
@@ -88,6 +96,16 @@ PANEL_ANCHOR_EVENTS = frozenset(("review_panelist_verdict", "review_panel_folded
 PANEL_ATTACH_EVENTS = frozenset(("review_log_retained", "review_pin_soft"))
 STEP_EVENTS = frozenset((
     "step_run", "step_hold_awaiting", "step_hold_approved", "step_hold_released",
+))
+
+# ── non-candidate engine families (HERD-325, P3i oracle v2) ───────────────────────────────────────
+# main_health (the post-merge default-branch tripwire, contract §3.4) and the push-gate hold
+# lifecycle (contract §5.4) are REAL engine families the shadow now MODELS. Like panels/steps/gate
+# statuses they fold into ordered fixture lists (main_healths / push_holds), NOT into candidates
+# (they are not gate subjects, §2.1) and NOT into the excluded tally. Before P3i these were auxiliary
+# and dropped; the shadow engine now emits them, so the head-to-head diff sees them on both sides.
+PUSH_HOLD_EVENTS = frozenset((
+    "push_hold_awaiting", "push_hold_approved", "push_hold_resumed",
 ))
 
 # The four health outcomes (contract §2.2); anything else coerces to CLEAN like the shadow runtime.
@@ -248,7 +266,10 @@ class _StepFold:
     kind/outcome from its ``step_run``, ``hold=approve`` inferred from a ``step_hold_awaiting`` on
     that step, and ``on_fail=block`` (the steps.sh default) hardened when a step failed (its failure
     halted the lane, so later rows never journaled). A ``held`` step_run is a halt MARKER, not a
-    fresh execution outcome, so it never overwrites the row's real pass/fail.
+    fresh execution outcome, so it never overwrites the row's real pass/fail — but the COUNT of held
+    markers is preserved as ``held_count`` (a step held across N watcher re-ticks journals N held
+    markers; the shadow replays exactly that many), so the oracle-v2 head-to-head matches marker-for-
+    marker instead of collapsing a re-held step to one (HERD-325).
     """
 
     __slots__ = ("slug", "sha", "dir", "rows", "_by_name")
@@ -288,6 +309,8 @@ class _StepFold:
                     row["on_fail"] = "block"               # it halted the lane
                     if "rc" in obj:
                         row["rc"] = obj["rc"]
+            elif outcome == "held":                        # a halt marker — count it, don't overwrite
+                row["held_count"] = row.get("held_count", 0) + 1
         elif ev == "step_hold_awaiting":
             self.dir = obj.get("dir") or self.dir
             self._row(obj.get("step", ""))["hold"] = "approve"
@@ -295,6 +318,86 @@ class _StepFold:
     def to_dict(self):
         return {"slug": self.slug, "sha": self.sha, "dir": self.dir or "(shadow)",
                 "rows": self.rows}
+
+
+class _MainHealthFold:
+    """Fold one main_health SUBJECT (a (pr, sha) tick) into a shadow-runtime main_healths entry.
+
+    The post-merge default-branch tripwire (agent-watch.sh:main_health_tick, contract §3.4) journals
+    a ``main_health`` DISPATCH (``result=dispatched``) then a ``main_health`` RESULT (green, or red
+    with the failing test + since-PR). This accumulates both into one subject so the shadow re-emits
+    the same two-row shape. A subject with only a result row (no dispatch) replays only the result —
+    faithful to whatever the real journal held. main_health is NOT a gate subject (§2.1); it is
+    modeled, not fabricated into a candidate and not excluded.
+    """
+
+    __slots__ = ("pr", "sha", "dispatched", "result", "failed", "since", "provenance")
+
+    def __init__(self, pr, sha):
+        self.pr = pr
+        self.sha = sha
+        self.dispatched = False
+        self.result = None
+        self.failed = None
+        self.since = None
+        self.provenance = None
+
+    def observe(self, obj):
+        result = obj.get("result")
+        if result == "dispatched":
+            self.dispatched = True
+            prov = obj.get("provenance")
+            if isinstance(prov, str) and prov:
+                self.provenance = prov
+        elif result in ("green", "red"):
+            self.result = result
+            if result == "red":
+                self.failed = obj.get("failed", "")
+                self.since = obj.get("since", "")
+
+    def to_dict(self):
+        d = {"pr": self.pr, "sha": self.sha, "result": self.result or "green"}
+        if self.dispatched:
+            d["dispatched"] = True
+        if self.provenance:
+            d["provenance"] = self.provenance
+        if self.result == "red":
+            d["failed"] = self.failed if self.failed is not None else ""
+            d["since"] = self.since if self.since is not None else ""
+        return d
+
+
+class _PushHoldFold:
+    """Fold one push-gate hold (a (slug, sha) subject) into a shadow-runtime push_holds entry.
+
+    PUSH_GATE=human (push-gate.sh + herd-approve.sh, contract §5.4) journals ``push_hold_awaiting``
+    when a finished build is held, then ``push_hold_approved`` and ``push_hold_resumed`` once a human
+    releases it. A hold that never cleared carries only the awaiting row. Keyed by (slug, sha); the
+    worktree dir is a volatile path the shadow re-synthesizes, so it is not carried here. Not a gate
+    subject — modeled, never a candidate or excluded.
+    """
+
+    __slots__ = ("slug", "sha", "approved", "resumed")
+
+    def __init__(self, slug, sha):
+        self.slug = slug
+        self.sha = sha
+        self.approved = False
+        self.resumed = False
+
+    def observe(self, ev):
+        if ev == "push_hold_approved":
+            self.approved = True
+        elif ev == "push_hold_resumed":
+            self.resumed = True
+
+    def to_dict(self):
+        d = {"slug": self.slug, "sha": self.sha}
+        if self.approved:
+            d["approved"] = True
+        if self.resumed:
+            d["resumed"] = True
+        return d
 
 
 def _norm_health(outcome):
@@ -325,10 +428,13 @@ def extract_fixture(events, config_overrides=None):
     order = []                 # pr(str) in first-seen order, for a deterministic candidate list
     panels = {}                # pr(str) -> _PanelFold (review-panel subjects, first-seen order)
     panel_order = []
-    pending_review = {}        # pr(str) -> [(ev, obj)] shared review notes buffered until a panel anchors
     steps = {}                 # slug(str) -> _StepFold (pipeline-steps runs, first-seen order)
     step_order = []
     gate_statuses = []         # ordered herd/gates commit-status posts
+    main_healths = {}          # (pr,sha) -> _MainHealthFold (main-health ticks, first-seen order)
+    mh_order = []
+    push_holds = {}            # (slug,sha) -> _PushHoldFold (push-gate holds, first-seen order)
+    ph_order = []
     excluded = {}              # event name -> count, for the provenance tally
     saw_gates_passed_merge = False
 
@@ -337,8 +443,6 @@ def extract_fixture(events, config_overrides=None):
         if panel is None:
             panel = panels[pr] = _PanelFold(pr)
             panel_order.append(pr)
-            for bev, bobj in pending_review.pop(pr, ()):   # flush buffered log/pin notes into it
-                panel.observe(bev, bobj)
         return panel
 
     for obj in events:
@@ -361,12 +465,44 @@ def extract_fixture(events, config_overrides=None):
         elif ev in PANEL_ATTACH_EVENTS:
             pr = _pr_key(obj)
             if pr is not None:
-                if pr in panels:
-                    panels[pr].observe(ev, obj)          # a panel already anchored — attach directly
-                else:
-                    pending_review.setdefault(pr, []).append((ev, obj))  # buffer until one anchors
+                # review_log_retained / review_pin_soft are emitted on EVERY review dispatch — a panel
+                # OR a lone single-reviewer (REVIEW_PANEL_MODELS unset, herd-review.sh:541/585). Attach
+                # the note to the PR's panel, CREATING it if this is the first sign of it. A PR that
+                # never anchors a panelist stays a 0-panelist panel whose only rows are the log/pin
+                # notes — which is EXACTLY what the bash tree journaled for that lone reviewer, so the
+                # shadow re-emits them and the head-to-head diff matches (oracle v2, HERD-325 closes
+                # the lone-reviewer residual the P3e buffering deliberately dropped).
+                _get_panel(pr).observe(ev, obj)
                 continue
             # A note with no PR falls through to the excluded tally.
+
+        # ── post-merge MAIN-HEALTH tick (contract §3.4): a (pr, sha) subject, NOT a gate candidate.
+        if ev == "main_health":
+            pr = _pr_key(obj)
+            sha = obj.get("sha", "")
+            if pr is not None:
+                key = (pr, str(sha))
+                mh = main_healths.get(key)
+                if mh is None:
+                    mh = main_healths[key] = _MainHealthFold(pr, str(sha))
+                    mh_order.append(key)
+                mh.observe(obj)
+                continue
+            # A main_health with no PR can't key a subject — fall through to the excluded tally.
+
+        # ── PUSH-GATE hold lifecycle (contract §5.4): a (slug, sha) subject, keyed by slug.
+        if ev in PUSH_HOLD_EVENTS:
+            slug = obj.get("slug")
+            if isinstance(slug, str) and slug:
+                sha = str(obj.get("sha", ""))
+                key = (slug, sha)
+                ph = push_holds.get(key)
+                if ph is None:
+                    ph = push_holds[key] = _PushHoldFold(slug, sha)
+                    ph_order.append(key)
+                ph.observe(ev)
+                continue
+            # A push-hold with no slug can't key a subject — fall through to the excluded tally.
 
         # ── pipeline STEPS (steps.sh): a per-slug run, keyed by slug (steps carry no PR).
         if ev in STEP_EVENTS:
@@ -404,16 +540,11 @@ def extract_fixture(events, config_overrides=None):
             order.append(pr)
         fold.observe(ev, obj)
 
-    # Review notes that never anchored a panel (a lone single-reviewer log/pin, or a panel that only
-    # ever emitted bookkeeping) are plain review-rail auxiliary events — tally them as excluded,
-    # exactly as they were before panels existed (no spurious 0-panelist panel is ever fabricated).
-    for buffered in pending_review.values():
-        for bev, _ in buffered:
-            excluded[bev] = excluded.get(bev, 0) + 1
-
     candidates = [folds[pr].to_dict() for pr in order]
     panel_list = [panels[pr].to_dict() for pr in panel_order]
     step_list = [steps[slug].to_dict() for slug in step_order]
+    main_health_list = [main_healths[k].to_dict() for k in mh_order]
+    push_hold_list = [push_holds[k].to_dict() for k in ph_order]
 
     config = {}
     # MERGE POLICY inference (contract §5.5): the run automerged ⇒ drive the shadow engine to auto too,
@@ -436,11 +567,17 @@ def extract_fixture(events, config_overrides=None):
         fixture["steps"] = step_list
     if gate_statuses:
         fixture["gate_statuses"] = gate_statuses
+    if main_health_list:
+        fixture["main_healths"] = main_health_list
+    if push_hold_list:
+        fixture["push_holds"] = push_hold_list
     fixture["_extracted"] = {
         "candidate_count": len(candidates),
         "panel_count": len(panel_list),
         "step_run_count": len(step_list),
         "gate_status_count": len(gate_statuses),
+        "main_health_count": len(main_health_list),
+        "push_hold_count": len(push_hold_list),
         "excluded_events": dict(sorted(excluded.items())),
     }
     return fixture

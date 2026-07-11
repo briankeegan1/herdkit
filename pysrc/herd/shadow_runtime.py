@@ -223,7 +223,8 @@ class ShadowWatcher:
     """
 
     def __init__(self, config=None, journal=None, stage_delay=0.0,
-                 panels=None, steps=None, gate_statuses=None):
+                 panels=None, steps=None, gate_statuses=None,
+                 main_healths=None, push_holds=None):
         cfg = config or {}
         self.config = cfg
         self.journal = journal or ShadowJournal()
@@ -238,6 +239,16 @@ class ShadowWatcher:
         self._panels = list(panels or [])
         self._steps = list(steps or [])
         self._gate_statuses = list(gate_statuses or [])
+        # ── Non-candidate engine families the sim scenario also drives (HERD-325, P3i oracle v2) ──
+        # The post-merge MAIN-HEALTH tripwire (agent-watch.sh:main_health_tick) and the PUSH-GATE hold
+        # lifecycle (push-gate.sh + herd-approve.sh) are REAL engine event families the bash tree
+        # journals, but they are NOT gate subjects (no candidate pass) — so, like panels/steps/gate
+        # statuses, they arrive as ordered fixture lists (fixture_extract folds them out of the real
+        # journal) and are replayed through faithful MODELS below. They are NEVER shadow_* frames, so
+        # the parity oracle's leg-1 filter passes them through untouched. Both DEFAULT EMPTY, so a
+        # candidate-only fixture (every existing caller/test) emits byte-identically to before.
+        self._main_healths = list(main_healths or [])
+        self._push_holds = list(push_holds or [])
         # Rail concurrency ceilings, sized from the knobs (contract §2.3). A garbage/absent value
         # coerces to the documented default (2 review, 1 health) — a typo never unbounds a rail. The
         # Semaphores themselves are created in run_async, once the event loop is running: an
@@ -460,6 +471,53 @@ class ShadowWatcher:
                 self.journal.append("pr_restale", pr=other_pr, sha=self._head.get(other_pr, ""),
                                     slug="pr-%s" % other_pr, kind="sibling-merge")
 
+    # ── post-merge MAIN-HEALTH model (agent-watch.sh:main_health_tick; contract §3.4) ─────────────
+    def _emit_main_healths(self):
+        """Replay each fixture main_health tick — the post-merge default-branch tripwire (§3.4).
+
+        For one tick the bash tree journals, IN ORDER: a ``main_health`` DISPATCH row
+        (``result=dispatched``, carrying the async suite's ``pid`` + ``log_path`` + ``provenance``,
+        agent-watch.sh) then a ``main_health`` RESULT row — ``green``, or ``red`` naming the failing
+        test (``failed``) and the PR the breakage is ``since``. The pid/log_path are VOLATILE (the
+        oracle canonicalizes them to <PID>/<PATH>), so the shadow emits a stub pid and an
+        absolute-path-shaped log_path that folds to the same <PATH> as the real tmp path. This is a
+        REAL engine family (never a ``shadow_*`` frame), so the parity filter must never drop it.
+        """
+        for mh in self._main_healths:
+            pr = mh.get("pr", "")
+            sha = mh.get("sha", "")
+            if mh.get("dispatched"):
+                self.journal.append("main_health", pr=pr, sha=sha, result="dispatched",
+                                    pid=0, log_path="/shadow-tmp/.health-log-main-%s" % sha,
+                                    provenance=mh.get("provenance", "merge"))
+            result = mh.get("result", "green")
+            if result == "red":
+                self.journal.append("main_health", pr=pr, sha=sha, result="red",
+                                    failed=mh.get("failed", ""), since=mh.get("since", ""))
+            else:
+                self.journal.append("main_health", pr=pr, sha=sha, result=result)
+
+    # ── PUSH-GATE hold model (push-gate.sh + herd-approve.sh; contract §5.4, PUSH_GATE) ────────────
+    def _emit_push_holds(self):
+        """Replay each fixture push-gate hold — PUSH_GATE=human holds a build BEFORE the push (§5.4).
+
+        The bash tree journals a sha-keyed ``push_hold_awaiting`` (slug/sha/worktree dir) when a
+        finished builder is held, then — once a human approves — ``push_hold_approved`` and, as the
+        push+PR resume, ``push_hold_resumed``. A hold that never cleared carries only the awaiting
+        row. The worktree ``dir`` is a volatile absolute path the oracle neutralizes to <PATH>; the
+        shadow emits an absolute-path-shaped stub that folds identically. A REAL engine family — never
+        a ``shadow_*`` frame — so the parity filter passes it through.
+        """
+        for ph in self._push_holds:
+            slug = ph.get("slug", "")
+            sha = ph.get("sha", "")
+            self.journal.append("push_hold_awaiting", slug=slug, sha=sha,
+                                dir="/shadow-tmp/push-hold-%s" % (slug or sha))
+            if ph.get("approved"):
+                self.journal.append("push_hold_approved", slug=slug, sha=sha)
+            if ph.get("resumed"):
+                self.journal.append("push_hold_resumed", slug=slug, sha=sha)
+
     # ── staged review PANEL model (herd-review.sh; contract §2.3, §3.2) ───────────────────────────
     def _emit_review_panels(self):
         """Replay each fixture panel through the herd-review.sh emission order + verdict fold.
@@ -565,12 +623,17 @@ class ShadowWatcher:
                 # on_fail=block halts the lane at a failing step (steps.sh §21).
                 if outcome == "fail" and row.get("on_fail", "block") == "block":
                     break
-                # hold=approve: the sha-keyed awaiting → held → approved → released lifecycle.
+                # hold=approve: the sha-keyed awaiting → held → approved → released lifecycle. A step
+                # held across N watcher re-ticks journals N ``held`` markers (steps.sh re-runs the
+                # pre-merge seam from the top each tick until every gate is approved), so replay
+                # held_count of them — default 1 for a single-tick hold (HERD-325 oracle v2).
                 if row.get("hold", "none") == "approve":
                     self.journal.append("step_hold_awaiting", slug=slug, step=name, at=at,
                                         sha=sha, dir=hold_dir)
-                    self.journal.append("step_run", name=name, at=at, kind=kind, slug=slug,
-                                        sha=sha, outcome="held")
+                    held_n = _pos_int(row.get("held_count", 1), 1)
+                    for _ in range(held_n):
+                        self.journal.append("step_run", name=name, at=at, kind=kind, slug=slug,
+                                            sha=sha, outcome="held")
                     self.journal.append("step_hold_approved", slug=slug, step=name, sha=sha)
                     self.journal.append("step_hold_released", slug=slug, step=name, at=at, sha=sha)
 
@@ -631,10 +694,12 @@ class ShadowWatcher:
             for cand in candidates:
                 tg.create_task(self._process_candidate(cand))
 
-        # The staged sub-pipelines the scenario also exercises, emitted SERIALLY after the candidate
-        # task group settles (deterministic order for the parity diff; all no-ops when their fixture
-        # lists are empty, i.e. every candidate-only run). Order mirrors the sim's leg order —
-        # panels, then steps, then the gate-status post.
+        # The non-candidate sub-pipelines the scenario also exercises, emitted SERIALLY after the
+        # candidate task group settles (deterministic order for the parity diff; all no-ops when their
+        # fixture lists are empty, i.e. every candidate-only run). Order mirrors the sim's path-sorted
+        # leg order — main-health, push-holds, panels, steps, then the gate-status post.
+        self._emit_main_healths()
+        self._emit_push_holds()
         self._emit_review_panels()
         self._emit_pipeline_steps()
         self._emit_gate_statuses()
@@ -760,7 +825,9 @@ def main(argv=None):
     candidates = [Candidate.from_dict(c) for c in scenario.get("candidates", [])]
     watcher = ShadowWatcher(config=config, stage_delay=stage_delay,
                             panels=scenario.get("panels"), steps=scenario.get("steps"),
-                            gate_statuses=scenario.get("gate_statuses"))
+                            gate_statuses=scenario.get("gate_statuses"),
+                            main_healths=scenario.get("main_healths"),
+                            push_holds=scenario.get("push_holds"))
     result = watcher.run(candidates)
     sys.stdout.write(json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n")
     return 0
