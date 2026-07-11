@@ -331,6 +331,6 @@ herd_engine_live_tick() {
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
   _herd_engine_journal engine_live_dispatched python
-  PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
   return 0
 }
