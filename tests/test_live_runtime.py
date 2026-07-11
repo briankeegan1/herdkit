@@ -25,8 +25,9 @@ import tempfile
 import unittest
 
 from herd import live_runtime as LR
-from herd.live_runtime import (LiveTick, LiveJournal, FixtureDiscovery, FixtureGates,
-                               DryRunActuator, parse_review_verdict)
+from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
+                               FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
+                               _select_candidates, _marker_write, _marker_live, WAIT, PENDING)
 
 
 def events(path):
@@ -236,6 +237,267 @@ class TestManyCandidates(LiveCase):
         end = [o for o in ev if o["event"] == "live_tick_end"][0]
         self.assertEqual(end["merged"], 1)
         self.assertEqual(end["held"], 2)
+
+
+class TestPendingDAG(LiveCase):
+    """The async DISPATCH-AND-WAIT path: a WAIT rail holds the candidate as PENDING, never a BLOCK,
+    and never merges (task HERD-324 leg 1)."""
+
+    def test_health_wait_is_pending_not_block(self):
+        res, ev = self.tick([self.one(1, health=WAIT)])
+        self.assertEqual(res["outcomes"]["1"], PENDING)
+        self.assertTrue([o for o in ev if o["event"] == "health_pending"])
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+        # A missing health verdict must never short-circuit to review.
+        self.assertFalse([o for o in ev if o["event"] == "verdict_recorded"])
+
+    def test_review_wait_is_pending_not_merge(self):
+        res, ev = self.tick([self.one(1, health="CLEAN", review=WAIT)])
+        self.assertEqual(res["outcomes"]["1"], PENDING)
+        self.assertTrue([o for o in ev if o["event"] == "review_pending"])
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+
+    def test_pending_counted_in_summary(self):
+        res, _ = self.tick([self.one(1, health="CLEAN", review="PASS"),
+                            self.one(2, review=WAIT)])
+        self.assertEqual(res["merged"], ["1"])
+        self.assertEqual(res["pending"], ["2"])
+
+
+class TestReviewOnceAndMarkers(unittest.TestCase):
+    """Leg 1: the sha-keyed review-once ledger + in-flight markers shared with bash. All hermetic —
+    the actual dispatch (Popen herd-review.sh / the health worker) is stubbed, so no gh / git / suite
+    runs; only the shared on-disk contract under $TREES is exercised."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        self.state = LiveState(self.tmp)
+        self.journal = LiveJournal(os.path.join(self.tmp, "j.jsonl"))
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _gates(self):
+        disp_r, disp_h = [], []
+
+        class Stub(LiveGates):
+            def _dispatch_review(self, cand):
+                disp_r.append(cand.pr)
+                _marker_write(self.state.review_inflight_file(cand), os.getpid())
+
+            def _dispatch_health(self, cand):
+                disp_h.append(cand.pr)
+                _marker_write(self.state.health_inflight_file(cand), os.getpid())
+
+        g = Stub("/home", self.state, self.journal)
+        return g, disp_r, disp_h
+
+    def cand(self, pr=1, sha="s1"):
+        return LiveCandidate(pr=pr, sha=sha, slug="feat-%s" % pr)
+
+    # ── review-once reuse ──
+    def test_recorded_verdict_reused_no_dispatch(self):
+        c = self.cand()
+        self.state.record_review(c.pr, c.sha, "PASS")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        self.assertTrue(g.reused_review)
+        self.assertEqual(dr, [])                       # review-once: a recorded verdict never re-dispatches
+
+    def test_recorded_verdict_is_sha_keyed(self):
+        c1, c2 = self.cand(1, "old"), self.cand(1, "new")
+        self.state.record_review(c1.pr, c1.sha, "PASS")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c1), "PASS")         # old sha: reuse
+        self.assertEqual(g.review(c2), WAIT)           # new sha: no verdict → dispatch-and-wait
+        self.assertEqual(dr, ["1"])
+
+    # ── dispatch-and-wait + no double-dispatch across a flip ──
+    def test_missing_verdict_dispatches_and_waits(self):
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(self.cand()), WAIT)  # a missing verdict is WAIT, never BLOCK
+        self.assertEqual(dr, ["1"])
+
+    def test_live_inflight_marker_blocks_second_dispatch(self):
+        c = self.cand()
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), WAIT)            # tick 1: dispatch, lay marker
+        self.assertEqual(g.review(c), WAIT)            # tick 2 (a bash↔python flip): marker live → wait
+        self.assertEqual(dr, ["1"])                    # dispatched exactly once — no double-Opus
+
+    def test_registry_live_blocks_dispatch(self):
+        c = self.cand()
+        with open(self.state.review_registry_file(c), "w") as fh:
+            fh.write("%s pane-7\n" % os.getpid())      # a live reviewer pane, poller dead
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), WAIT)
+        self.assertEqual(dr, [])
+
+    # ── collect a finished verdict into the ledger ──
+    def test_collect_pass_records_ledger_and_clears_scratch(self):
+        c = self.cand()
+        result = self.state.review_result_file(c)
+        with open(result, "w") as fh:
+            fh.write("REVIEW: PASS\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        self.assertFalse(g.reused_review)              # freshly collected, not reused
+        self.assertEqual(self.state.recorded_review(c.pr, c.sha), "PASS")   # durably recorded
+        self.assertFalse(os.path.exists(result))       # scratch dropped after the durable record
+        # A later tick reuses the ledger verdict without re-dispatch.
+        self.assertEqual(g.review(c), "PASS")
+        self.assertEqual(dr, [])
+
+    def test_collect_infra_never_cached(self):
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("REVIEW: INFRA-FAIL — model timed out\n")
+        g, _, _ = self._gates()
+        self.assertEqual(g.review(c), "INFRA")
+        self.assertIsNone(self.state.recorded_review(c.pr, c.sha))   # infra death is never a verdict
+
+    # ── health: sha-cache reuse, collect, dispatch-and-wait ──
+    def test_health_cache_reused(self):
+        c = self.cand()
+        self.state.record_health_result(c, "CLEAN", "clean")
+        g, _, dh = self._gates()
+        self.assertEqual(g.health(c), "CLEAN")
+        self.assertTrue(g.reused_health)
+        self.assertEqual(dh, [])
+
+    def test_health_collect_writes_sha_cache(self):
+        c = self.cand()
+        with open(self.state.health_dispatch_file(c), "w") as fh:
+            fh.write("CODEERROR\tnot ok 3 - foo.bats\n")
+        g, _, dh = self._gates()
+        self.assertEqual(g.health(c), "CODEERROR")
+        self.assertEqual(self.state.health_cached_verdict(c), "CODEERROR")
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file(c)))
+
+    def test_health_missing_dispatches_and_waits_once(self):
+        c = self.cand()
+        g, _, dh = self._gates()
+        self.assertEqual(g.health(c), WAIT)
+        self.assertEqual(g.health(c), WAIT)            # marker live → no second suite
+        self.assertEqual(dh, ["1"])
+
+    def test_marker_live_dead_pid(self):
+        c = self.cand()
+        f = self.state.review_inflight_file(c)
+        with open(f, "w") as fh:
+            fh.write("999999\n\n0\n")                  # a pid that isn't alive
+        self.assertFalse(_marker_live(f))
+
+
+class TestJournalWiring(unittest.TestCase):
+    """Leg 2: a live actuating tick REFUSES to run unjournaled — never journal:null."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                       ("JOURNAL_FILE", "WORKTREES_DIR", "TREES", "AGENT_WATCH_DRYRUN", "DRYRUN")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_live_tick_refuses_unjournaled(self):
+        # No JOURNAL_FILE, no WORKTREES_DIR, not dry-run → resolve_live_path is None → FAIL LOUD before
+        # any discovery/actuation (so no gh runs). main() turns the raise into a non-zero exit.
+        with self.assertRaises(RuntimeError):
+            LR._run_live_tick()
+        self.assertEqual(LR.main(["--tick"]), 1)
+
+    def test_resolve_live_path_from_worktrees_dir(self):
+        os.environ["WORKTREES_DIR"] = "/pool"
+        self.assertEqual(LR.LiveJournal.resolve_live_path(), "/pool/.herd/journal.jsonl")
+
+    def test_journal_file_override_wins(self):
+        os.environ["WORKTREES_DIR"] = "/pool"
+        os.environ["JOURNAL_FILE"] = "/x/j.jsonl"
+        self.assertEqual(LR.LiveJournal.resolve_live_path(), "/x/j.jsonl")
+
+
+class TestScopeFilter(unittest.TestCase):
+    """Leg 3: WATCHER_SCOPE/WATCHER_VIEW/owner filters narrow discovery so a foreign-owner PR never
+    enters classification — identical to the bash tick, hermetic (owner supplied, no gh)."""
+
+    def cands(self):
+        return [LiveCandidate(pr=1, sha="a", author="alice", labels=["dependencies"],
+                              review_decision="REVIEW_REQUIRED", assignees=["carol"]),
+                LiveCandidate(pr=2, sha="b", author="bob", labels=[], assignees=[])]
+
+    def prs(self, cs):
+        return sorted(c.pr for c in cs)
+
+    def test_default_passthrough(self):
+        self.assertEqual(self.prs(_select_candidates(self.cands(), {})), ["1", "2"])
+
+    def test_scope_all_drops_foreign_owner(self):
+        got = _select_candidates(self.cands(), {"WATCHER_SCOPE": "all", "WATCHER_OWNER": "alice"})
+        self.assertEqual(self.prs(got), ["1"])          # bob's PR never enters classification
+
+    def test_scope_all_failclosed_when_owner_unresolved(self):
+        orig = LR._resolve_owner
+        LR._resolve_owner = lambda cfg: ""
+        try:
+            got = _select_candidates(self.cands(), {"WATCHER_SCOPE": "all"})
+        finally:
+            LR._resolve_owner = orig
+        self.assertEqual(got, [])                        # fail-closed: no owner → never merge a foreign PR
+
+    def test_scope_mine_default_no_owner_probe(self):
+        # solo default: no ownership gate, every candidate flows (byte-identical to today's solo watcher).
+        got = _select_candidates(self.cands(), {"WATCHER_SCOPE": "mine"})
+        self.assertEqual(self.prs(got), ["1", "2"])
+
+    def test_view_mine_lens(self):
+        got = _select_candidates(self.cands(), {"WATCHER_VIEW": "mine", "WATCHER_VIEW_AUTHOR": "bob"})
+        self.assertEqual(self.prs(got), ["2"])
+
+    def test_view_label_filter(self):
+        got = _select_candidates(self.cands(), {"WATCHER_VIEW_LABEL": "dependencies"})
+        self.assertEqual(self.prs(got), ["1"])
+
+    def test_view_deps_lens(self):
+        got = _select_candidates(self.cands(), {"WATCHER_VIEW": "deps"})
+        self.assertEqual(self.prs(got), ["1"])
+
+    def test_view_review_queue_lens(self):
+        got = _select_candidates(self.cands(), {"WATCHER_VIEW": "review-queue"})
+        self.assertEqual(self.prs(got), ["1"])
+
+    def test_fixture_discovery_applies_scope(self):
+        scenario = {"config": {"WATCHER_SCOPE": "all", "WATCHER_OWNER": "alice"},
+                    "candidates": [{"pr": 1, "sha": "a", "author": "alice"},
+                                   {"pr": 2, "sha": "b", "author": "bob"}]}
+        got = FixtureDiscovery(scenario).discover()
+        self.assertEqual([c.pr for c in got], ["1"])
+
+    def test_foreign_owner_never_merges_end_to_end(self):
+        # A green teammate PR under scope=all is dropped at discovery → no merge event for it.
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        try:
+            tmp = tempfile.mkdtemp()
+            jpath = os.path.join(tmp, "j.jsonl")
+            journal = LiveJournal(jpath)
+            scenario = {"config": {"MERGE_POLICY": "auto", "WATCHER_SCOPE": "all",
+                                   "WATCHER_OWNER": "alice"},
+                        "candidates": [
+                            {"pr": 1, "sha": "a", "author": "alice", "review": "PASS", "health": "CLEAN"},
+                            {"pr": 2, "sha": "b", "author": "bob", "review": "PASS", "health": "CLEAN"}]}
+            t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                         DryRunActuator(journal), journal, state=LiveState(None))
+            res = t.run()
+            self.assertEqual(res["merged"], ["1"])
+            self.assertNotIn("2", res["outcomes"])       # bob never classified
+        finally:
+            os.environ.pop("HERD_JOURNAL_NOW", None)
 
 
 if __name__ == "__main__":
