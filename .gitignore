@@ -49,3 +49,6 @@
 # `graphify update --no-cluster` in the main checkout, which writes this machine-local, regenerable
 # graph here. Never committed; keeps the analysis from dirtying the working tree.
 graphify-out/
+
+# Python bytecode cache (HERD-337) — written by ENGINE_IMPL=python tick; never committed.
+__pycache__/

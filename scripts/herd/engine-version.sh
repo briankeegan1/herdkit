@@ -298,10 +298,10 @@ herd_engine_shadow_tick() {
   [ -n "$fixture" ] && [ -f "$fixture" ] || return 0
   _herd_engine_journal engine_shadow_dispatched shadow
   if [ -n "${HERD_ENGINE_SHADOW_SYNC:-}" ]; then
-    PYTHONPATH="$pyp" python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 || true
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 || true
     return 0
   fi
-  ( PYTHONPATH="$pyp" nohup python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 & ) \
+  ( PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" nohup python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 & ) \
     >/dev/null 2>&1 || true
   return 0
 }
@@ -330,6 +330,6 @@ herd_engine_live_tick() {
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
   _herd_engine_journal engine_live_dispatched python
-  PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
   return 0
 }
