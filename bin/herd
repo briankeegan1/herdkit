@@ -5659,8 +5659,34 @@ print("\n".join(working))
   say "  pulling $engine_dir …"
   local pull_out
   if ! pull_out="$(git -C "$engine_dir" pull --ff-only 2>&1)"; then
-    printf '%s\n' "$pull_out" >&2
-    die "git pull --ff-only failed — the engine branch may have diverged; run 'git -C $engine_dir fetch && git -C $engine_dir merge --ff-only' to diagnose, then re-run 'herd update'"
+    # Self-heal for HERD-338: when local-only commits touch ONLY the regenerable engine maps
+    # (docs/codemap.md, docs/symbol-index.md — the pushed=no corpse from a protected-branch
+    # rejection), auto-reset to the remote and retry. These files are deterministic; resetting is
+    # byte-safe and restores the seat's ability to take engine updates.
+    local _ud_branch _ud_remote _ud_local_only _ud_healed=0
+    _ud_branch="$(git -C "$engine_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+    git -C "$engine_dir" fetch --quiet 2>/dev/null || true
+    _ud_remote="origin/${_ud_branch}"
+    if git -C "$engine_dir" rev-parse --verify --quiet "${_ud_remote}" >/dev/null 2>&1; then
+      _ud_local_only="$(git -C "$engine_dir" diff --name-only \
+        "${_ud_remote}...HEAD" 2>/dev/null || true)"
+      if [ -n "$_ud_local_only" ]; then
+        _ud_has_nonregen=0
+        grep -qvxE 'docs/(codemap|symbol-index)\.md' <<< "$_ud_local_only" \
+          && _ud_has_nonregen=1 || true
+        if [ "${_ud_has_nonregen}" -eq 0 ]; then
+          warn "auto-healing: engine diverged with only regenerable artifact commits (HERD-338) — resetting to ${_ud_remote}"
+          git -C "$engine_dir" reset --hard "${_ud_remote}" >/dev/null 2>&1 || true
+          if pull_out="$(git -C "$engine_dir" pull --ff-only 2>&1)"; then
+            _ud_healed=1
+          fi
+        fi
+      fi
+    fi
+    if [ "${_ud_healed}" -eq 0 ]; then
+      printf '%s\n' "$pull_out" >&2
+      die "git pull --ff-only failed — the engine branch may have diverged; run 'git -C $engine_dir fetch && git -C $engine_dir merge --ff-only' to diagnose, then re-run 'herd update'"
+    fi
   fi
   printf '%s\n' "$pull_out"
 

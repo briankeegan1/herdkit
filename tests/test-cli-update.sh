@@ -82,6 +82,8 @@ printf 'uncommitted\n' >> "$DIRTY_ENGINE/version.txt"
 #   → git pull --ff-only fails (histories diverged).
 DIVERGED_ENGINE="$T/diverged_engine"
 git clone "$UPSTREAM" "$DIVERGED_ENGINE" -q 2>/dev/null
+git -C "$DIVERGED_ENGINE" config user.email t@t.t
+git -C "$DIVERGED_ENGINE" config user.name t
 git -C "$DIVERGED_ENGINE" reset --hard HEAD~2 -q 2>/dev/null
 printf 'local only\n' >> "$DIVERGED_ENGINE/version.txt"
 git -C "$DIVERGED_ENGINE" add -A
