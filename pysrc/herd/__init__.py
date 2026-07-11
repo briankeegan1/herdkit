@@ -21,9 +21,15 @@ Layout (this phase proves the packaging story):
     pysrc/herd/log.py        `herd log`  formatter
     pysrc/herd/cost.py       `herd cost` reader
 
+Later phases (P1b/P2/P3, HERD-307..320) grew the package beyond the P1 readers: the
+`herd status` formatter (status.py, P1b), the pure decision core + typed state machine
+(decisions.py / statemachine.py, P2/P3b), and the parity harness + shadow/live runtimes and
+their bridges (parity/shadow_journal/shadow_runtime/fixture_extract/live_runtime, P3a–P3f).
+Every importable submodule is listed in ``__all__`` below.
+
 Invocation adds pysrc/ to PYTHONPATH (bin/herd derives it from HERDKIT_HOME). No external
 dependencies — python3 is already a hard engine dep; NONE are added here.
 """
 
-__all__ = ["why", "log", "cost", "decisions", "statemachine", "parity", "driver",
-           "shadow_journal", "shadow_runtime", "fixture_extract", "live_runtime"]
+__all__ = ["why", "log", "cost", "status", "decisions", "statemachine", "parity", "driver",
+           "shadow_journal", "shadow_runtime", "fixture_extract", "live_runtime", "store"]

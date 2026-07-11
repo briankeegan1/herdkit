@@ -501,6 +501,18 @@ BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
 BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
 BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
+# Orphan-PR advisory surface (HERD-330). The watcher gates work it DISCOVERS via git worktrees; an
+# open PR with no live builder worktree in this workspace (a collaborator PR, a main-checkout PR, a
+# PR whose worktree was reaped) is therefore never adopted — it sits ungated and, today, invisible.
+# Under ORPHAN_PR_ROWS=on the render/reconcile tick REWRITES this ledger each cycle with one
+# "<epoch>\t<pr>\t<title>\t<branch>" row per such PR, computed from the tick's ALREADY-fetched open-PR
+# roster (PRS_JSON) minus the PRs the discovered worktrees claim — DYNAMIC discovery, zero extra gh.
+# Rewritten-each-tick means it self-corrects the instant a worktree adopts the PR or the PR closes
+# (the row simply stops being written). build_orphan_prs renders its tail through the shared
+# bounded-section helper (console-section.sh). Off (default) → never written, so a no-orphan/off
+# watcher is byte-identical to before this feature.
+ORPHAN_PR_LEDGER="$TREES/.agent-watch-orphan-prs"
+ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the ledger is rewritten whole each tick)
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -604,6 +616,7 @@ BLOCKED=""
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
+ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -1508,6 +1521,108 @@ build_builder_notes() {
   return 0
 }
 
+# ── Orphan PRs (HERD-330) ─────────────────────────────────────────────────────────────────────────
+# `_orphan_prs_scan` rewrites the orphan-PR ledger each tick from the world it OBSERVED (PRS_JSON minus
+# the PRs the discovered worktrees claim); `build_orphan_prs` is the pure console renderer of its tail.
+# Both self-gate on ORPHAN_PR_ROWS so an off (or no-orphan) watcher is byte-identical to before.
+
+# _orphan_pr_rows_enabled — true iff ORPHAN_PR_ROWS opts in. Default OFF (mirrors _operator_inbox_enabled);
+# any unrecognized value reads as off (fail toward the byte-identical console).
+_orphan_pr_rows_enabled() {
+  case "$(printf '%s' "${ORPHAN_PR_ROWS:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _orphan_pr_classify <line>  ("<epoch>\t<pr>\t<title>\t<branch>")
+#   Prints "<epoch>\tcalm" for the shared bounded-section renderer. Every orphan row is advisory: the
+#   ledger is rewritten whole each tick with a fresh epoch, so a still-orphan PR is always visible and
+#   an adopted/closed one simply stops being written (no stale row lingers).
+_orphan_pr_classify() {
+  local _op_epoch
+  IFS=$'\t' read -r _op_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tcalm' "${_op_epoch:-}"
+}
+
+# _orphan_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row (advisory, never
+#   red). Fail-soft: a row missing its PR number renders nothing (drops out of the section).
+_orphan_pr_row() {
+  local _op_epoch _op_pr _op_title _op_branch
+  IFS=$'\t' read -r _op_epoch _op_pr _op_title _op_branch <<EOF
+$1
+EOF
+  [ -n "${_op_pr:-}" ] || return 0
+  printf '    %s🪹%s %s#%s%s %s %s%s · no worktree here — adopt or handle manually%s' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_op_pr" "$C_RESET" "${_op_title:-}" \
+    "$C_DIM" "${_op_branch:-}" "$C_RESET"
+}
+
+# _orphan_prs_scan <prs-json> <claimed-pr-numbers-newline-list>
+#   REWRITE the orphan-PR ledger from live state: one row per OPEN PR in $1 whose number is not in the
+#   claimed set $2 (the PRs the discovered worktrees own this tick). No-op — and no ledger write —
+#   when ORPHAN_PR_ROWS is off OR the open-PR lookup FAILED this tick (a failed fetch is not positive
+#   evidence of "no PR"; HERD-224), so the previous tick's rows are never fabricated away by a blip.
+#   Rewritten whole (never appended) so the ledger cannot grow unbounded and self-corrects each tick.
+#   Zero network: it reads the tick's already-fetched roster. Fail-soft: malformed JSON → empty ledger.
+_orphan_prs_scan() {
+  _orphan_pr_rows_enabled || return 0
+  [ "${PRS_LOOKUP_OK:-1}" = "1" ] || return 0
+  local _op_json="${1:-[]}" _op_claimed="${2:-}" _op_epoch _op_out
+  _op_epoch="$(_console_now_epoch)"
+  _op_out="$(PRS_JSON="$_op_json" CLAIMED="$_op_claimed" EPOCH="$_op_epoch" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)   # malformed roster → empty ledger (fail-soft), never a crash
+claimed = set(n for n in (os.environ.get("CLAIMED") or "").split() if n)
+epoch = os.environ.get("EPOCH", "")
+def flat(s):
+    return " ".join(str(s or "").split())
+for pr in prs:
+    if not isinstance(pr, dict):
+        continue
+    num = pr.get("number")
+    if num is None:
+        continue
+    if str(num) in claimed:
+        continue
+    title = flat(pr.get("title"))
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    branch = flat(pr.get("headRefName"))
+    # TAB-separated, matching _orphan_pr_classify/_orphan_pr_row; whitespace already flattened so a
+    # title/branch can never inject a TAB or newline into the ledger shape.
+    print("%s\t%s\t%s\t%s" % (epoch, num, title, branch))
+' 2>/dev/null)" || _op_out=""
+  # Rewrite the ledger atomically-ish: a truncate to empty when there are no orphans clears the section.
+  if [ -n "$_op_out" ]; then
+    printf '%s\n' "$_op_out" > "$ORPHAN_PR_LEDGER" 2>/dev/null || true
+  else
+    : > "$ORPHAN_PR_LEDGER" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# build_orphan_prs — the "orphan PRs" advisory section: the orphan-PR ledger tail, newest-first, one
+# row each, bounded to ORPHAN_PR_ROWS_LIMIT via the shared helper. Empty (ORPHAN_PR_SECTION_ROWS="")
+# when the feature is off OR no PR is orphaned, so render() omits the section and the console is
+# byte-identical when unused. A pure renderer — the discovery (and its only write) is _orphan_prs_scan.
+build_orphan_prs() {
+  ORPHAN_PR_SECTION_ROWS=""
+  _orphan_pr_rows_enabled || return 0
+  [ -s "$ORPHAN_PR_LEDGER" ] || return 0
+  local rows
+  rows="$(herd_console_section "$ORPHAN_PR_LEDGER" "$ORPHAN_PR_ROWS_LIMIT" \
+    _orphan_pr_classify _orphan_pr_row)"
+  [ -n "$rows" ] && ORPHAN_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
@@ -1565,6 +1680,11 @@ render() {
   # unless a builder has filed a note since the cursor advanced, so byte-identical when unused.
   if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
+  fi
+  # ORPHAN PRs (HERD-330) — open PRs no live builder worktree owns, needs-you-adjacent. Empty unless
+  # ORPHAN_PR_ROWS is on AND at least one open PR is orphaned this tick, so byte-identical when unused.
+  if [ -n "${ORPHAN_PR_SECTION_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}orphan PRs${C_RESET}"$'\n'"${ORPHAN_PR_SECTION_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -3918,6 +4038,102 @@ _reconcile_resolver_panes() {
       DONE) _retire_resolver_pane "$pr" "$sha" result-consumed ;;
       *)    : ;;   # ESCALATE keeps the pane; no verdict keeps the resolver
     esac
+  done
+}
+
+# ── HEALTHCHECK-AS-A-DISPOSABLE-PANE (HERD-313 leg a, HEALTH_PANE) ─────────────────────────────────
+# Leg (b) makes the in-flight suite VISIBLE in the console row. Leg (a) — ship-dormant behind
+# HEALTH_PANE — additionally stands up a stamped, disposable `health·<slug>` pane that STREAMS the live
+# suite log, so the operator can watch the actual suite output, and RETIRES it the moment the suite
+# ends. Modelled exactly on the resolver-pane lifecycle above: the lane-equivalent (the render pass)
+# spawns + registers; every tick the watcher reconciles the registry against the OBSERVED inflight
+# marker and retires through the SAME HERD-134 guarded close. The pane is a VIEW only — a plain
+# `tail -F`, no model, no gate authority — so a bug in this seam can never affect a merge decision.
+
+# _effective_health_pane — echo "on" | "off". Mirrors _effective_resolver_pane's fail-soft contract:
+# a recognized on-value arms it; empty/unset/typo reads off, so a bad value can never arm a
+# pane-closing path. Ship-dormant default off ⇒ byte-identical when unset.
+_effective_health_pane() {
+  case "${HEALTH_PANE:-off}" in on|true|yes|1) printf 'on' ;; *) printf 'off' ;; esac
+}
+
+# _health_pane_registry_file <pr#> <sha> — the sha-scoped record of the disposable pane this seat stood
+# up for a given (pr,sha). One row: "<pane> <tab> health·<slug>". Keyed like the health markers so the
+# reconcile stays in lock-step with the inflight marker.
+_health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
+
+# _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
+# pane for an in-flight suite, ONCE. Called from the render pass while a suite is genuinely in flight
+# (a live inflight marker), so it rides the same signal leg (b)'s row does — and works identically
+# whether the bash gate or the Python engine is running the suite. Self-gating + idempotent + fail-soft:
+#   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
+#   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
+# The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
+# with a `health·<slug>` label so the guarded close recognizes it and a neighbour is never mistaken.
+_spawn_health_pane() {
+  local _shp_pr="$1" _shp_slug="$2" _shp_sha="$3" _shp_dir="$4"
+  [ "$(_effective_health_pane)" = on ] || return 0
+  [ -z "${DRYRUN:-}" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local _shp_reg; _shp_reg="$(_health_pane_registry_file "$_shp_pr" "$_shp_sha")"
+  [ -f "$_shp_reg" ] && return 0
+  local _shp_log _shp_ws _shp_created _shp_tab _shp_root
+  _shp_log="$(_health_log_file "${_shp_pr}-${_shp_sha}")"
+  _shp_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
+  _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
+  read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
+    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+  [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+  herdr pane rename "$_shp_root" "health·$_shp_slug" >/dev/null 2>&1 || true
+  # `tail -F` (retry+follow) tolerates the log not existing yet or being rotated under it.
+  herdr pane run "$_shp_root" "tail -n +1 -F $_shp_log" >/dev/null 2>&1 || true
+  printf '%s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
+  printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
+  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log"
+}
+
+# _retire_health_pane <pr#> <sha> [reason] — close the disposable pane once its suite has ended. Mirrors
+# _retire_resolver_pane: read the registry row and, if it still names a LIVE pane, close it via the
+# HERD-134 guarded close (which REFUSES + journals pane_close_refused if the id was recycled onto a
+# neighbour), journal `health_pane_retired` on a real close, close the now-empty tab, then drop the row
+# unconditionally. FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
+_retire_health_pane() {
+  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab
+  [ -z "${DRYRUN:-}" ] || return 0
+  _rhp_reg="$(_health_pane_registry_file "$_rhp_pr" "$_rhp_sha")"
+  [ -f "$_rhp_reg" ] || return 0
+  read -r _rhp_pane _rhp_tab _ < "$_rhp_reg" 2>/dev/null || true
+  if [ -n "${_rhp_pane:-}" ] && [ "$_rhp_pane" != "-" ] && herd_driver_pane_alive "$_rhp_pane"; then
+    if herd_close_pane_verified "$_rhp_pane" "health·"; then
+      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" reason "$_rhp_reason"
+      if [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
+        herdr tab close "$_rhp_tab" >/dev/null 2>&1 || true
+        _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rhp_tab"
+      fi
+    fi
+  fi
+  rm -f "$_rhp_reg" 2>/dev/null || true
+}
+
+# _reconcile_health_panes — retire every disposable health pane whose suite has ENDED, EVERY tick,
+# whoever ran (or killed) the suite. Byte-quiet on a seat with no health-pane rows — the overwhelming
+# common case, and the whole of the HEALTH_PANE=off default (spawn never wrote a row). A pane is kept
+# ONLY while its (pr,sha) inflight marker is still pid-live; the instant the suite finishes, is
+# collected, or its worker dies, the marker stops being live and the pane is retired. Dry-run-inert.
+_reconcile_health_panes() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf
+  for _rcp_f in "$TREES"/.health-pane-registry-*; do
+    [ -e "$_rcp_f" ] || continue
+    _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-pane-registry-}"
+    _rcp_pr="${_rcp_rest%-*}"; _rcp_sha="${_rcp_rest##*-}"
+    [ -n "$_rcp_pr" ] && [ -n "$_rcp_sha" ] || continue
+    _rcp_inf="$(_health_inflight_file "${_rcp_pr}-${_rcp_sha}")"
+    # Still genuinely in flight → keep the pane (the operator is watching the live suite).
+    { [ -f "$_rcp_inf" ] && _health_pid_live "$_rcp_inf"; } && continue
+    _retire_health_pane "$_rcp_pr" "$_rcp_sha" outcome-landed
   done
 }
 
@@ -10011,6 +10227,36 @@ _health_progress() {
   [ "${_hp_done:-0}" -gt 0 ] 2>/dev/null && printf 'test %s/%s' "$_hp_done" "$_hp_plan"
 }
 
+# _health_inflight_note <log> — the liveness clause the running row appends after the elapsed time
+# (HERD-313), so an in-flight suite is never a bare stopwatch the operator can't read. Three-valued,
+# in precedence order, so an EMPTY-LOG CRASH is distinguishable from a SLOW SUITE within a single tick:
+#   • TAP stream     → the live 'test X/Y' from _health_progress (the suite is emitting a plan).
+#   • bytes, no plan → '<n> lines' — a non-TAP suite that IS producing output (alive, just slow).
+#   • empty / absent → 'no output yet' — the worker has written NOTHING; if this persists next to a
+#                      climbing elapsed time it is a crashed/wedged suite, not a slow one.
+# Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
+# mutation, so the render half can call it every tick.
+_health_inflight_note() {
+  local _hin_log="$1" _hin_prog
+  _hin_prog="$(_health_progress "$_hin_log")"
+  if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
+  if [ -s "$_hin_log" ]; then
+    printf '%s lines' "$(grep -c '' "$_hin_log" 2>/dev/null || printf 0)"
+  else
+    printf 'no output yet'
+  fi
+}
+
+# _health_running_row <slug-cell> <pn> <inflight-file> <log-file> — THE one in-flight health row string
+# (HERD-313). Both the render half (the classification pass, so the row paints even when the Python
+# engine owns the action pass and the bash gate step never runs) and the bash gate step below emit this
+# EXACT line, so the row never flickers between the two renders in a single tick. Reads only the marker
+# + log the engine writes; side-effect-free.
+_health_running_row() {
+  local _hrr_sl="$1" _hrr_pn="$2" _hrr_inf="$3" _hrr_log="$4"
+  printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hrr_sl}${C_RESET}${_hrr_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hrr_inf")") · $(_health_inflight_note "$_hrr_log")${C_RESET}"
+}
+
 # _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
 # via the recycling guard, still the SAME process). Shares the restart-safe substrate with the review side.
 _health_pid_live() { _marker_live "$1"; }
@@ -10434,13 +10680,9 @@ _healthcheck_gate() {
   # re-dispatch below.
   if [ -f "$_hg_inflight" ]; then
     if _health_pid_live "$_hg_inflight"; then
-      # Elapsed + (cheap, if the log is a TAP stream) live progress: 'running 3m · test 41/168'.
-      local _hg_prog; _hg_prog="$(_health_progress "$_hg_log")"
-      if [ -n "$_hg_prog" ]; then
-        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hg_inflight")") · ${_hg_prog}${C_RESET}"
-      else
-        DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running ($(_fmt_age "$(_marker_age "$_hg_inflight")"))${C_RESET}"
-      fi
+      # Elapsed + a liveness clause (live TAP progress, a byte-count, or 'no output yet') via the ONE
+      # shared row the render half also paints — 'running 3m · test 41/168' / '… · no output yet'.
+      DISPLAY[_hg_idx]="$(_health_running_row "$_hg_sl" "$_hg_pn" "$_hg_inflight" "$_hg_log")"
       _HC_RESULT="RUNNING"
       return 0
     fi
@@ -11984,7 +12226,22 @@ EOF
       # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
       if _scope_permits_automerge "$prauthor"; then
         if _should_automerge "$mstate"; then
-          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+          # HERD-313: when a suite is ALREADY in flight for this exact (pr,sha), paint the live running
+          # row here in the RENDER pass — reading the same .health-inflight / .health-log state files the
+          # health worker (bash gate OR the Python engine's action pass) writes. Under ENGINE_IMPL=python
+          # the bash gate step (_healthcheck_gate, which used to be the ONLY place this row was drawn) is
+          # skipped, so without this the console showed a frozen bare 'health-check' for the whole ~9-min
+          # suite — the invisible-healthcheck the operator hit twice. No live marker yet (pre-dispatch,
+          # or between ticks) ⇒ the bare placeholder, exactly as before. Side-effect-free.
+          _hc_inf="$(_health_inflight_file "${prnum}-${headsha}")"
+          if [ -n "$headsha" ] && _health_pid_live "$_hc_inf"; then
+            DISPLAY[i]="$(_health_running_row "$sl" "$pn" "$_hc_inf" "$(_health_log_file "${prnum}-${headsha}")")"
+            # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
+            # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
+            _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
+          else
+            DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+          fi
         else
           DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
         fi
@@ -12085,6 +12342,24 @@ EOF
   _builder_notes_scan
   build_builder_notes
 
+  # HERD-330 orphan PRs — rewrite + render the advisory section listing each open PR (in the tick's
+  # already-fetched PRS_JSON) that NO discovered builder worktree owns. The claimed set is derived from
+  # this tick's FEATS records (field 4 = PR number); an orphan is any open PR not in it. _orphan_prs_scan
+  # self-gates on ORPHAN_PR_ROWS (no scan, no ledger write when off) and on PRS_LOOKUP_OK (never
+  # fabricates on a failed fetch); build_orphan_prs leaves ORPHAN_PR_SECTION_ROWS empty when off/none, so
+  # the frame is byte-identical to before the feature. Zero extra gh — no new `gh pr list`.
+  _orphan_claimed=""
+  if _orphan_pr_rows_enabled; then
+    for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+      IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
+$_orphan_rec
+EOF
+      [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
+    done
+    _orphan_prs_scan "$PRS_JSON" "$_orphan_claimed"
+  fi
+  build_orphan_prs
+
   render
   # ENGINE_IMPL=python (HERD-320/HERD-323, EPIC HERD-300): hand ONLY the action pass to the LIVE
   # Python engine core. herd_engine_live_tick returns 0 only when Python is ARMED (ENGINE_IMPL=python)
@@ -12101,6 +12376,11 @@ EOF
   # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.
   # Byte-inert unless RESOLVER_PANE=on (no rows exist to reconcile).
   _reconcile_resolver_panes
+
+  # Health-pane reconcile (HERD-313 leg a): retire the disposable `health·<slug>` view pane of every
+  # suite that has ENDED, whoever ran it (mirrors the resolver-pane reconcile above). Byte-inert unless
+  # HEALTH_PANE=on left rows to reconcile — under the ship default there are none, so this does nothing.
+  _reconcile_health_panes
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
   _drain_spawn_queue

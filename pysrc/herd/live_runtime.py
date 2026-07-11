@@ -262,6 +262,19 @@ class LiveState:
 
     def __init__(self, state_dir=None):
         self.dir = state_dir or os.environ.get("TREES") or os.environ.get("WORKTREES_DIR") or None
+        # P4 store-backend seam (HERD-305). Resolve the mutable-state store: flat (default) reads the
+        # flat files below verbatim; sqlite (engaged only post-migration, via the marker resolve_backend
+        # honours) routes the sha-keyed accessors through the SQLite store. Fail-soft + SHIP-DORMANT: any
+        # import/resolve error leaves _store=None and every method runs its existing flat path unchanged.
+        self._store = None
+        try:
+            from herd import store as _store_mod
+            if _store_mod.resolve_backend(self.dir) == "sqlite":
+                self._store = _store_mod.open_store(self.dir)
+                if not getattr(self._store, "is_sqlite", False):
+                    self._store = None
+        except Exception:
+            self._store = None
 
     def _p(self, name):
         return os.path.join(self.dir, name) if self.dir else None
@@ -282,6 +295,8 @@ class LiveState:
     def recorded_review(self, pr, sha):
         """The recorded verdict for this exact ``(pr, sha)`` — review-once reuse (agent-watch.sh:1687).
         ``awk '$2==pr && $3==sha {v=$4} END{print v}'`` — the LAST matching row wins."""
+        if self._store is not None:
+            return self._store.recorded_review(pr, sha)
         path = self.review_ledger()
         if not path or not os.path.exists(path):
             return None
@@ -298,6 +313,9 @@ class LiveState:
 
     def record_review(self, pr, sha, verdict, source="reviewer"):
         """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source>`` (agent-watch.sh:1820)."""
+        if self._store is not None:
+            self._store.record_review(pr, sha, verdict, source)
+            return
         path = self.review_ledger()
         if not path:
             return
@@ -340,6 +358,8 @@ class LiveState:
     def health_cached_verdict(self, cand):
         """The TERMINAL health verdict cached for this exact head sha — reuse with no suite re-run
         (agent-watch.sh:10237). The cache line is ``<verdict>\\t<detail>``; verdict ∈ CLEAN|FLAKY|CODEERROR."""
+        if self._store is not None:
+            return self._store.health_cached_verdict(cand.pr, cand.sha)
         path = self.health_result_file(cand)
         if not path or not os.path.exists(path):
             return None
@@ -353,6 +373,9 @@ class LiveState:
 
     def record_health_result(self, cand, verdict, detail=""):
         """Cache a terminal health verdict for this exact commit (agent-watch.sh:record_health_result)."""
+        if self._store is not None:
+            self._store.record_health_result(cand.pr, cand.sha, verdict, detail)
+            return
         path = self.health_result_file(cand)
         if not path or not cand.sha:
             return
@@ -367,6 +390,8 @@ class LiveState:
         """Fire a hold's side effects exactly once per ``(pr, sha, kind)`` (once-guard doctrine, §5.3).
         Returns True the first time (proceed + record the marker), False thereafter. With no state dir it
         always proceeds — a sim/dry-run tick has no cross-tick state to dedup against, so it never suppresses."""
+        if self._store is not None:
+            return self._store.once("live-%s-%s-%s" % (kind, pr, sha))
         path = self._p(".live-noted-%s-%s-%s" % (kind, pr, sha))
         if not path:
             return True
@@ -725,8 +750,13 @@ class LiveGates:
                                 "detail", "review dispatch failed: %s" % str(exc)[:160])
             return
         _marker_write(inflight, proc.pid)
+        # Contract §3.4 requires the full shape (pr, sha, pid, model, log_path, pin) — the same six
+        # keys bash emits (agent-watch.sh:2545) and the shadow twin emits (shadow_runtime.py:382), so
+        # `herd why`/`herd log`/cost read `model`+`log_path` and a shadow↔live parity diff stays clean.
+        # `model` mirrors bash's env fallback chain; `log_path` is the reviewer's result file.
+        model = os.environ.get("HERD_REVIEW_MODEL") or os.environ.get("MODEL_REVIEW") or ""
         self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pid", proc.pid,
-                            "pin", cand.sha)
+                            "model", model, "log_path", result, "pin", cand.sha)
 
 
 def parse_review_verdict(text):
@@ -868,6 +898,17 @@ class LiveTick:
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
+        self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
+
+    def _next_refix_round(self, pr, rule):
+        """The round number this rail's refix_bounce carries: the per-``(pr, rule)`` bounce count so
+        far + 1 — matching bash's ``round = refix_rail_count + 1`` (``agent-watch.sh:7519,:8260``).
+        The rail budget is per (pr, rule), NOT sha-keyed (contract §4; ``decisions.refix_rail_count``),
+        so a repeat bounce on the same rail increments the real round instead of a hardcoded 1."""
+        key = (pr, rule)
+        n = self._refix_rounds.get(key, 0) + 1
+        self._refix_rounds[key] = n
+        return n
 
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
@@ -915,8 +956,15 @@ class LiveTick:
         self._advance(cand, {"CLEAN": "health_clean", "FLAKY": "health_flaky",
                              "CODEERROR": "health_codeerror"}[health])
         if health == "CODEERROR":
+            # Contract §3.4 refix_bounce shape (pr, sha, slug, round, agent_status_before, rule,
+            # location) — the port unifies both rails under one event keyed by `rule` (there is no
+            # `health_refix_bounce` in the catalog). Match the shadow twin's field SET
+            # (shadow_runtime.py:418) with bash-faithful defaults: the live tick does not probe the
+            # pane here (bash's own fallback is "unknown") and parses no finding location.
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "rule", "healthcheck")
+                                "round", self._next_refix_round(cand.pr, "healthcheck"),
+                                "agent_status_before", "unknown", "rule", "healthcheck",
+                                "location", "")
             return BLOCK
 
         # 3. review rail (LLM) — DISPATCHED async by shelling out to the adversarial reviewer.
@@ -936,8 +984,13 @@ class LiveTick:
                                 "source", "reviewer")
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
+            # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
+            # bash (agent-watch.sh:7321) with bash-faithful defaults for the fields the live tick does
+            # not compute here (pane status → "unknown"; finding location unparsed → "").
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "rule", "review")
+                                "round", self._next_refix_round(cand.pr, "review"),
+                                "agent_status_before", "unknown", "rule", "review",
+                                "location", "")
             return BLOCK
 
         # 4. the blessing — both rails passed (review_pass advanced the lifecycle to BLESSED). Once per

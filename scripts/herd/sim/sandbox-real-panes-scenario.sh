@@ -199,6 +199,7 @@ else
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
             context_guard_refuses_real_teardown \
             resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
+            health_pane_retired_on_outcome \
             builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
             builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
@@ -704,6 +705,65 @@ except Exception:
       fi
     else
       checkpoint resolver_pane_kept_on_escalate fail "could not stand up the escalate split pane (ES_PANE='$ES_PANE')"
+    fi
+  fi
+
+  # ── HEALTH-PANE LIFECYCLE (HERD-313 leg a): retired the instant the suite ENDS ─────────────────────
+  # The disposable `health·<slug>` view pane is a plain tail of the live suite log (no agent, no model);
+  # it is stamped with a `health·<slug>` label so the HERD-134 guarded close recognizes it, and the
+  # watcher's per-tick reconcile retires it the moment the (pr,sha) inflight marker is gone (the suite
+  # finished/collected/died). Stand up a REAL split pane labelled `health·rp-builder`, plant its registry
+  # row with NO inflight marker (the ended state), drive the SHIPPED reconcile (_reconcile_health_panes,
+  # from agent-watch.sh in lib mode) against a REAL herdr pane close, and assert the pane is CLOSED, the
+  # row dropped, and health_pane_retired journaled — the disposable-pane analogue of the reviewer/resolver
+  # retire legs above.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step healthpane "health pane retires on outcome (shipped reconcile, real pane)"
+    HP_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    HP_PANE="$(printf '%s' "$HP_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    [ -n "$HP_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); herdr pane rename "$HP_PANE" "health·rp-builder" >/dev/null 2>&1 || true; }
+    _hp_present() {
+      pane_json "$WSID" | HPP="$1" python3 -c '
+import sys,json,os
+hpp=os.environ["HPP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("pane_id",""))==hpp for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    if [ -n "$HP_PANE" ] && [ "$(_hp_present "$HP_PANE")" = yes ]; then
+      HPT="$ART/healthtrees"; mkdir -p "$HPT/.herd"
+      HP_PR=557; HP_SHA="hpsha557"
+      HP_JOURNAL="$ART/hp-journal.jsonl"; : > "$HP_JOURNAL"
+      # Registry row for an ENDED suite (no .health-inflight-* marker planted ⇒ reconcile retires it).
+      printf '%s - health·rp-builder\n' "$HP_PANE" > "$HPT/.health-pane-registry-$HP_PR-$HP_SHA"
+      # HERD_DISPOSABLE_WORKSPACE=1: the real close runs from the healthcheck's builder worktree, so the
+      # HERD-310 guard is armed — declare a disposable sim close so it retires the scenario's OWN pane.
+      ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$HPT" DEFAULT_BRANCH=main HEALTH_PANE=on HERD_DISPOSABLE_WORKSPACE=1 \
+               WORKSPACE_NAME="rp-healthpane-sim" JOURNAL_FILE="$HP_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        _reconcile_health_panes
+      ) ; HP_RC=$?
+      _hp_gone="no"; _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_hp_present "$HP_PANE")" = no ] && { _hp_gone=yes; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+      _hp_reg_dropped=no; [ ! -f "$HPT/.health-pane-registry-$HP_PR-$HP_SHA" ] && _hp_reg_dropped=yes
+      _hp_journaled=no; grep -q '"event":"health_pane_retired"' "$HP_JOURNAL" 2>/dev/null && _hp_journaled=yes
+      if [ "$HP_RC" = 0 ] && [ "$_hp_gone" = yes ] && [ "$_hp_reg_dropped" = yes ] && [ "$_hp_journaled" = yes ]; then
+        checkpoint health_pane_retired_on_outcome pass \
+          "health pane $HP_PANE closed once the suite ended; registry row dropped; health_pane_retired journaled"
+      else
+        checkpoint health_pane_retired_on_outcome fail \
+          "pane not retired as expected (rc=$HP_RC gone=$_hp_gone reg_dropped=$_hp_reg_dropped journaled=$_hp_journaled)"
+      fi
+    else
+      checkpoint health_pane_retired_on_outcome fail "could not stand up the health split pane (HP_PANE='$HP_PANE')"
     fi
   fi
 

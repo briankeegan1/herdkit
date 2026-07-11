@@ -135,6 +135,10 @@ _BASE_TRANSITIONS = {
 
     # STALE_HELD — the stale rail carries a refix budget (§4). base_fresh is progress (rail reset,
     # §4 refund-on-green) and re-enters the pipeline; an exhausted budget escalates to a human.
+    # A SURVIVING budget has NO edge here on purpose: an open stale bounce is an implicit self-hold
+    # (wake the builder to rebase), and re-gating is deferred to base_fresh — a
+    # `(STALE_HELD, refix_bounce)` mapping would wrongly re-gate before the rebase (§6.2). Stale
+    # callers branch on :func:`classify_block` themselves rather than composing through the table.
     (STALE_HELD, BASE_FRESH): INTAKE,
     (STALE_HELD, REFIX_EXHAUSTED): ESCALATED,
 
@@ -262,9 +266,19 @@ def classify_gates_passed(mode, hv_hold, approved, hv_policy="hold"):
 
 
 def next_after_block(state, rows, pr, sha, kind, refix_max_rounds):
-    """Drive one BLOCK step end-to-end: classify the budget, then transition. Convenience over
-    ``transition(state, classify_block(...))`` — the composed form callers use from :data:`BLOCKED`
-    (or :data:`STALE_HELD` for the stale rail)."""
+    """Drive one rail BLOCK step end-to-end: classify the budget, then transition. Convenience over
+    ``transition(state, classify_block(...))`` — the composed form callers use from :data:`BLOCKED`,
+    where BOTH budget outcomes are table events (``refix_bounce`` → :data:`INTAKE`,
+    ``refix_exhausted`` → :data:`ESCALATED`).
+
+    NOT the stale rail's path for a surviving budget. From :data:`STALE_HELD` only the EXHAUSTED
+    branch is a table event (``refix_exhausted`` → :data:`ESCALATED`); an open stale budget is an
+    implicit self-hold that stays in :data:`STALE_HELD` awaiting ``base_fresh`` (the rebase), NOT a
+    ``refix_bounce`` edge — there is deliberately no ``(STALE_HELD, refix_bounce)`` transition (a
+    stale bounce only wakes the builder to rebase; re-gating happens later, on ``base_fresh``). So a
+    STALE_HELD caller must branch on :func:`classify_block` itself — escalate on
+    :data:`REFIX_EXHAUSTED`, self-hold on :data:`REFIX_BOUNCE` — rather than composing through this
+    function, which raises :class:`IllegalTransition` by design on a surviving stale budget."""
     return transition(state, classify_block(rows, pr, sha, kind, refix_max_rounds))
 
 

@@ -220,7 +220,10 @@ class _PanelFold:
         if isinstance(slug, str) and slug:
             self.slug = slug
         sha = obj.get("sha")
-        if isinstance(sha, str):
+        # Require a NON-EMPTY sha, consistent with _CandidateFold / _StepFold: a late
+        # review_log_retained/review_pin_soft carrying an explicit empty "sha" must not clobber the
+        # panel's real sha back to "" and desync its subject key from the candidate/step spine.
+        if isinstance(sha, str) and sha:
             self.sha = sha
         if ev == "review_log_retained":
             self.keep = obj.get("keep", 5)

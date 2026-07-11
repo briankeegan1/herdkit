@@ -59,6 +59,44 @@ setup() {
 }
 
 # ── sim blocks (run scripts/herd/sim/*.sh — not tests/test-*.sh, so discovery never sees them) ───
+
+# ── HERD-326: load-sensitive sim retry ───────────────────────────────────────────────────────────
+# tests 7/8/9 below (builder-chaos / retirement-invariant / postmerge-reconcile) drive many
+# short-lived child processes + real git under a hermetic fixture. Their asserts await terminal STATE
+# (leg (a)), so they are correct — but under a heavily loaded box a single leg can still miss its poll
+# window and paint a spurious red (the PR #431 false-red). These three legs — and ONLY these — are
+# TAGGED load-sensitive by running through herd_run_loadsim: on a FIRST-attempt failure the harness
+# waits a quiet interval and retries EXACTLY once before alarming. A leg that passes on the quiet retry
+# is a flaky/load pass, not a code red — labeled 'flaky/load' distinctly in the console row (via bats
+# FD 3). A leg that REPRODUCES the failure on the retry is a real red, surfaced with both attempts.
+# Product-assert @tests are never tagged and never retry. BYTE-IDENTICAL when the sim passes first try:
+# no retry, no label, no sleep — the tag path is inert on green.
+HERD_SIM_LOAD_RETRY_QUIET="${HERD_SIM_LOAD_RETRY_QUIET:-3}"   # quiet interval (s) before the one retry
+
+herd_run_loadsim() {   # <sim-basename> <pass-marker>
+  local _sim="$1" _marker="$2" _path
+  _path="$REPO/scripts/herd/sim/$_sim"   # separate stmt: `local a=$1 b=$a` expands $a BEFORE a is set
+  run bash "$_path"
+  if [ "$status" -eq 0 ] && [[ "$output" == *"$_marker"* ]]; then
+    return 0                                    # passed first try — byte-identical happy path
+  fi
+  # First attempt failed. Quiet the box, then retry EXACTLY once before alarming.
+  local _first_status="$status" _first_out="$output"
+  sleep "$HERD_SIM_LOAD_RETRY_QUIET"
+  run bash "$_path"
+  if [ "$status" -eq 0 ] && [[ "$output" == *"$_marker"* ]]; then
+    # Flaky/load: failed under load, passed on the quiet retry. A DISTINCT console row (FD 3 prints even
+    # for a passing bats test), never a silent green and never a code red.
+    echo "flaky/load: $_sim failed under load then PASSED on the quiet retry — not a code red" >&3
+    return 0
+  fi
+  # Reproduced on the retry → a REAL red. Surface both attempts so it reads as code, not load.
+  echo "$_sim reproduced its failure on the quiet retry — REAL red (not flaky/load)"
+  echo "--- attempt 1 (status $_first_status) ---"; echo "$_first_out"
+  echo "--- attempt 2 (status $status) ---";        echo "$output"
+  return 1
+}
+
 @test "hermetic rubric-screening disagreement-surface sim (HERD-166) passes" {
   run bash "$REPO/scripts/herd/sim/rubric-screen-sim.sh"
   [ "$status" -eq 0 ]
@@ -66,21 +104,15 @@ setup() {
 }
 
 @test "builder-chaos sim: a builder killed at every lifecycle stage leaves no corpse (HERD-162)" {
-  run bash "$REPO/scripts/herd/sim/builder-chaos-sim.sh"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"ALL PASS"* ]]
+  herd_run_loadsim builder-chaos-sim.sh "ALL PASS"
 }
 
 @test "retirement-invariant sim: watcher killed at every teardown step still converges (HERD-164)" {
-  run bash "$REPO/scripts/herd/sim/retirement-invariant-sim.sh"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"ALL PASS"* ]]
+  herd_run_loadsim retirement-invariant-sim.sh "ALL PASS"
 }
 
 @test "post-merge reconcile sim: a foreign or crashed merge still gets its hooks (HERD-232)" {
-  run bash "$REPO/scripts/herd/sim/postmerge-reconcile-sim.sh"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"ALL PASS"* ]]
+  herd_run_loadsim postmerge-reconcile-sim.sh "ALL PASS"
 }
 
 @test "tick availability sim: a hung gh and a slow lane never wedge the tick (HERD-237)" {

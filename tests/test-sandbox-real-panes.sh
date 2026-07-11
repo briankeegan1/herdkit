@@ -312,17 +312,20 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Two tabs (control room + builder) and seven panes (watcher, backlog, builder, the reviewer split for
+# Two tabs (control room + builder) and eight panes (watcher, backlog, builder, the reviewer split for
 # the reviewer-pane-lifecycle checkpoint, the two resolver splits for the HERD-280 retire/escalate legs,
-# and the claude-as-root pane for the alive checkpoint). All but the ESCALATE resolver pane are closed
-# again within their own steps — that one stays open BY DESIGN and goes with the workspace at teardown.
+# the health split for the HERD-313 retire-on-outcome checkpoint, and the claude-as-root pane for the
+# alive checkpoint). All but the ESCALATE resolver pane are closed again within their own steps — that
+# one stays open BY DESIGN and goes with the workspace at teardown.
 [ "$(sc "$SCR" tabs_created)" -eq 2 ]  || fail "(B) tabs_created should be 2 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 7 ] || fail "(B) panes_created should be 7 (got $(sc "$SCR" panes_created))"
+[ "$(sc "$SCR" panes_created)" -eq 8 ] || fail "(B) panes_created should be 8 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
 [ "$(cp_status "$SCR" resolver_pane_retired_on_done)" = "pass" ]  || fail "(B) resolver_pane_retired_on_done not pass"
 [ "$(cp_status "$SCR" resolver_pane_kept_on_escalate)" = "pass" ] || fail "(B) resolver_pane_kept_on_escalate not pass"
+# The disposable health pane retires the moment its suite ends (HERD-313 leg a).
+[ "$(cp_status "$SCR" health_pane_retired_on_outcome)" = "pass" ] || fail "(B) health_pane_retired_on_outcome not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.
 [ "$(sc "$SCR" leaked_tabs)" -eq 0 ] || fail "(B) leaked_tabs must be 0 (got $(sc "$SCR" leaked_tabs))"
 LEFT="$(python3 -c 'import json; print(len(json.load(open("'"$STATE"'"))["workspaces"]))')"
