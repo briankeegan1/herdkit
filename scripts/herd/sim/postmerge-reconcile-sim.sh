@@ -174,7 +174,7 @@ tick() {
   SIM_SHA="$sha" SIM_PR="$PR" SIM_STUB_HERD="$scn/herd-stub" \
   GH_DIR="$scn/gh" HERDR_TABS="$scn/tabs.json" HERD_CONFIG_FILE="$scn/no-config" \
   JOURNAL_FILE="$scn/journal.jsonl" HERD_TRANSCRIPT_ROOT="$scn/transcripts" \
-  MODE="$mode" CRASH_AFTER="$crash" \
+  MODE="$mode" CRASH_AFTER="$crash" HERD_DISPOSABLE_WORKSPACE=1 \
     bash "$ART/tick.sh" 2>/dev/null
 }
 

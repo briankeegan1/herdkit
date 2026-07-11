@@ -155,6 +155,62 @@ outc="$(PYTHONPATH="$PYSRC" python3 -c 'import json,sys;print(json.load(open(sys
 [ "$outc" = "BLOCK" ] || fail "PR202 (health CODEERROR) should terminate BLOCK in the shadow run, got $outc"
 ok "bridge pipeline: extracted fixture drives the shadow engine to the matching terminals (merge/block/hold)"
 
+# ── (D2) staged-subsystem extraction: panels / steps / gate_status (HERD-304) ─────────────────────────
+# A journal carrying the review-PANEL, pipeline-STEPS and gate-STATUS families folds into the ordered
+# fixture lists the shadow engine models — NOT into candidates (they are not gate subjects), NOT into
+# the excluded tally. A herd-review infra_event routes to its panel; a rail infra_event still doesn't.
+cat > "$T/fam.jsonl" <<'EOF'
+{"ts":"2026-07-10T00:01:00Z","event":"review_log_retained","pr":"77a","slug":"sim-panel-a","path":"/var/T//herd-review-77a-x","keep":5}
+{"ts":"2026-07-10T00:01:01Z","event":"review_pin_soft","pr":"77a","sha":"","reason":"pin objects unavailable; live-diff fallback","pin_mode":""}
+{"ts":"2026-07-10T00:01:02Z","event":"review_panelist_verdict","pr":"77a","slug":"sim-panel-a","sha":"","panelist":0,"ref":"bare-model","driver":"herdr-claude","model":"bare-model","verdict":"PASS","reason":"REVIEW: PASS"}
+{"ts":"2026-07-10T00:01:03Z","event":"review_panelist_verdict","pr":"77a","slug":"sim-panel-a","sha":"","panelist":1,"ref":"stub:stub-model","driver":"stub","model":"stub-model","verdict":"BLOCK","reason":"REVIEW: BLOCK — rule: x"}
+{"ts":"2026-07-10T00:01:04Z","event":"review_panel_folded","pr":"77a","slug":"sim-panel-a","sha":"","policy":"any-block","panelists":2,"refs":"bare-model stub:stub-model","verdict":"REVIEW: BLOCK — rule: x"}
+{"ts":"2026-07-10T00:01:05Z","event":"review_panelist_verdict","pr":"77c","slug":"sim-panel-c","sha":"","panelist":0,"ref":"bare-model","driver":"herdr-claude","model":"bare-model","verdict":"PASS","reason":"REVIEW: PASS"}
+{"ts":"2026-07-10T00:01:06Z","event":"infra_event","component":"herd-review","pr":"77c","slug":"sim-panel-c","exit_code":2,"stderr_tail":"no verdict"}
+{"ts":"2026-07-10T00:01:07Z","event":"step_run","name":"gate-lint","at":"post-build","kind":"shell","slug":"demo","sha":"cea","outcome":"pass"}
+{"ts":"2026-07-10T00:01:08Z","event":"step_run","name":"peer-review","at":"post-build","kind":"shell","slug":"demo","sha":"cea","outcome":"pass"}
+{"ts":"2026-07-10T00:01:09Z","event":"step_hold_awaiting","slug":"demo","step":"peer-review","at":"post-build","sha":"cea","dir":"/tmp/st-repo"}
+{"ts":"2026-07-10T00:01:10Z","event":"step_run","name":"peer-review","at":"post-build","kind":"shell","slug":"demo","sha":"cea","outcome":"held"}
+{"ts":"2026-07-10T00:01:11Z","event":"step_hold_approved","slug":"demo","step":"peer-review","sha":"cea"}
+{"ts":"2026-07-10T00:01:12Z","event":"step_hold_released","slug":"demo","step":"peer-review","at":"post-build","sha":"cea"}
+{"ts":"2026-07-10T00:01:13Z","event":"step_run","name":"doc-pass","at":"post-build","kind":"skill","slug":"demo","sha":"cea","outcome":"pass"}
+{"ts":"2026-07-10T00:01:14Z","event":"gate_status","pr":343,"sha":"simsha","state":"success","context":"herd/gates"}
+EOF
+FAM_FX="$T/fam-fixture.json"
+extract "$T/fam.jsonl" --out "$FAM_FX" || fail "extract errored on the families journal"
+famprobe() { PYTHONPATH="$PYSRC" python3 - "$FAM_FX" "$@" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+q = sys.argv[2]
+if q == "panels":       print(len(d.get("panels", [])))
+elif q == "steps":      print(len(d.get("steps", [])))
+elif q == "gates":      print(len(d.get("gate_statuses", [])))
+elif q == "cands":      print(len(d.get("candidates", [])))
+elif q == "panelists":  print(len(d["panels"][int(sys.argv[3])]["panelists"]))
+elif q == "policy":     print(d["panels"][int(sys.argv[3])]["policy"])
+elif q == "steprows":   print(len(d["steps"][0]["rows"]))
+elif q == "rowhold":    print(d["steps"][0]["rows"][int(sys.argv[3])].get("hold"))
+elif q == "rowkind":    print(d["steps"][0]["rows"][int(sys.argv[3])].get("kind"))
+elif q == "gatepr":     print(d["gate_statuses"][0]["pr"])
+PY
+}
+[ "$(famprobe panels)" = "2" ] || fail "expected 2 panel subjects (77a, 77c), got $(famprobe panels)"
+[ "$(famprobe cands)"  = "0" ] || fail "panel/step/gate events must NOT become gate candidates, got $(famprobe cands)"
+[ "$(famprobe panelists 0)" = "2" ] || fail "panel 77a should carry 2 panelist verdicts"
+[ "$(famprobe policy 0)" = "any-block" ] || fail "panel 77a policy should read from its folded event"
+# 77c folded to a herd-review infra_event while carrying a PASS panelist ⇒ inferred all-pass policy.
+[ "$(famprobe policy 1)" = "all-pass" ] || fail "panel 77c (infra despite a PASS) should infer all-pass, got $(famprobe policy 1)"
+[ "$(famprobe steps)" = "1" ] || fail "expected 1 steps run (demo)"
+[ "$(famprobe steprows)" = "3" ] || fail "demo should reconstruct 3 distinct rows, got $(famprobe steprows)"
+[ "$(famprobe rowhold 1)" = "approve" ] || fail "peer-review hold=approve should be inferred from step_hold_awaiting"
+[ "$(famprobe rowkind 2)" = "skill" ] || fail "doc-pass kind=skill should survive extraction"
+[ "$(famprobe gates)" = "1" ] || fail "expected 1 gate_status"
+[ "$(famprobe gatepr)" = "343" ] || fail "gate_status pr should extract as 343"
+# The families must NOT pollute the excluded-events tally (they are modeled, not dropped).
+excl="$(PYTHONPATH="$PYSRC" python3 -c 'import json,sys;print(",".join(json.load(open(sys.argv[1]))["_extracted"]["excluded_events"].keys()))' "$FAM_FX")"
+case "$excl" in *step_run*|*review_panelist_verdict*|*gate_status*) fail "a modeled family event leaked into the excluded tally: $excl" ;; esac
+ok "panels/steps/gate_status fold into ordered fixture lists (not candidates, not excluded); policy inferred (HERD-304)"
+
 # ── (E) end-to-end parity-run --shadow auto + byte-identical-off (skip-guarded on git) ───────────────
 if ! command -v git >/dev/null 2>&1; then
   skip "parity-run --shadow auto: git unavailable"
