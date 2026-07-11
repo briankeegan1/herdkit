@@ -84,7 +84,7 @@ pass
 echo "PASS (5) absent / empty exempt file → no exemptions, not an error"
 
 # ── 6. END-TO-END loud empty suite under bats (skipped when bats is absent) ──────────────────────
-if command -v bats >/dev/null 2>&1; then
+if command -v bats >/dev/null 2>&1 && [ -z "${BATS_VERSION:-}" ]; then
   D6="$T/e2e-empty/tests"; mkdir -p "$D6"
   cp "$LIB" "$D6/discover-tests.bash"
   # A minimal herd.bats-shaped discovery file over a dir with NO test-*.sh files.

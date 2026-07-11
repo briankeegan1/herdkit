@@ -265,11 +265,13 @@ herd_engine_autoupdate_tick() {
 # The strangler port runs the Python engine core in SHADOW mode beside the authoritative bash watcher.
 # ENGINE_IMPL selects the posture; this seam resolves + dispatches it, ship-dormant and default-off.
 
-# herd_engine_impl — the normalized implementation knob: bash | shadow. Anything but the exact token
-# `shadow` reads as `bash`, so a typo can never divert the authoritative engine to the (dry-run) port.
+# herd_engine_impl — the normalized implementation knob: bash | shadow | python. Anything but the
+# exact tokens `shadow` / `python` reads as `bash`, so a typo can never divert the authoritative
+# engine to the (dry-run) shadow port OR to the (live) Python tick — the safe default always wins.
 herd_engine_impl() {
   case "${ENGINE_IMPL:-bash}" in
     shadow) printf 'shadow' ;;
+    python) printf 'python' ;;
     *)      printf 'bash' ;;
   esac
 }
@@ -301,5 +303,33 @@ herd_engine_shadow_tick() {
   fi
   ( PYTHONPATH="$pyp" nohup python3 -m herd.shadow_runtime --fixture "$fixture" >/dev/null 2>&1 & ) \
     >/dev/null 2>&1 || true
+  return 0
+}
+
+# herd_engine_live_tick — hand ONE watcher tick to the LIVE Python engine (HERD-320, P3f). This is the
+# CUTOVER seam: bash stays the resident supervisor of the `while true` loop, and each tick asks this
+# whether Python owned it. The return code IS the contract the loop reads:
+#
+#   return 1 (Python did NOT own the tick)  ⇒  the bash tick body runs — the DEFAULT and the fallback.
+#   return 0 (Python OWNED the tick)         ⇒  the bash tick body is SKIPPED for this cycle.
+#
+# It returns 1 IMMEDIATELY (no output, nothing touched) unless ENGINE_IMPL=python — so under the ship
+# default (bash) the watcher is byte-identical: the loop's `if herd_engine_live_tick; then …` is always
+# false and the existing body runs exactly as before. Armed (ENGINE_IMPL=python) it runs
+# `python3 -m herd.live_runtime --tick` synchronously (the tick MUST complete before the loop sleeps)
+# and returns 0 only if that exits 0; a missing python3 / missing module / a NON-ZERO Python exit all
+# return 1, so a port fault instantly falls back to the authoritative bash tick — the kill-switch
+# (flip ENGINE_IMPL back to bash and Python is disabled on the very next tick). The Python side inherits
+# the watcher's dry-run switch (AGENT_WATCH_DRYRUN/DRYRUN): a dry-run watcher drives a dry-run tick that
+# actuates nothing, exactly as the bash dry-run does everything except the real merge/remove.
+herd_engine_live_tick() {
+  [ "$(herd_engine_impl)" = python ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  local home pyp
+  home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
+  pyp="$home/pysrc"
+  [ -f "$pyp/herd/live_runtime.py" ] || return 1
+  _herd_engine_journal engine_live_dispatched python
+  PYTHONPATH="$pyp" python3 -m herd.live_runtime --tick >/dev/null 2>&1 || return 1
   return 0
 }

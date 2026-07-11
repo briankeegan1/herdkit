@@ -2625,6 +2625,17 @@ cmd_config_set() {
       || die "refusing to set REVIEW_PANEL_MODELS — every panelist must be a bare model id (default driver) or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
   fi
 
+  # HERD-311: refuse a driver-qualified MODEL_REVIEW whose driver prefix is not a shipped
+  # templates/drivers/*.driver. A typo'd driver (e.g. codex:gpt-5.4 on a machine with no codex driver)
+  # would otherwise land silently in .herd/config and only reveal itself at review-dispatch time — hours
+  # later, when the watcher dispatches a review against a model the engine cannot reach. herd_model_resolve
+  # prints the loud one-line why to stderr; this die adds the config-set refusal context.
+  if [ "$key" = "MODEL_REVIEW" ] && [ -n "$val" ] \
+     && command -v herd_model_resolve >/dev/null 2>&1; then
+    herd_model_resolve "$val" >/dev/null \
+      || die "refusing to set MODEL_REVIEW — '$val' does not resolve to a usable model ref (see the error above); use a bare model id or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
+  fi
+
   # 2b. Decide the TARGET file (HERD-47). A write lands in the per-user overlay .herd/config.local
   #     when EITHER --local was passed OR the key is machine-scoped in the manifest (scope=machine:
   #     driver, model tiers, operator-posture opt-ins — per-user state that must not diverge the

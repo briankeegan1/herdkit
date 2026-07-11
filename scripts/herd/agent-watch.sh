@@ -11260,773 +11260,22 @@ _acquire_watcher_singleton() {
   return 0
 }
 
-# Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
-# merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
-# the live watch loop. Direct execution runs the loop normally.
-if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
-
-# ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
-# The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
-# run (the dogfood healthcheck, or any test) may set HERD_HERMETIC_GUARD to a log-file path; any
-# watcher that reaches this point — spawned via cmd_reload's pane-run/background fallback, `herd pane
-# watch`, herd-watch.sh, coordinator.sh, or direct execution — records the leak and EXITS BEFORE the
-# argv0 re-exec and the loop. So a test that forgot to stub a watcher spawn is caught LOUDLY (the
-# healthcheck fails on a non-empty log) instead of silently leaving a real daemon behind. This is the
-# single choke point every launch path funnels through. INERT in production: with the var unset this
-# is byte-identical to before (the real console-room watcher never sets it).
-if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
-  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
-    >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
-  exit 0
-fi
-
-# ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
-# Re-exec ONCE under a distinctive per-workspace argv0 ($HERD_WATCH_ARGV0, e.g. herd-watch-<slug>)
-# so the process table shows which workspace this watcher serves. Without it, two projects' watchers
-# are indistinguishable in ps (`bash .../agent-watch.sh`) and a good-faith "kill the duplicate
-# watcher" in project A can SIGTERM project B's live watcher. argv0 is visible via ps/pgrep on every
-# platform; an env-var marker is NOT reliably readable via ps on modern macOS — which is why the
-# marker is argv0. _list_project_watchers (bin/herd) reaps ONLY processes whose argv0 equals this
-# exact string. Every launch site (coordinator.sh, cmd_reload's pane-run + background fallback,
-# herd pane watch, herd-watch.sh) ultimately runs agent-watch.sh, so this single re-exec tags them
-# all. The guard env var makes it a one-shot (no infinite re-exec loop); $0/BASH_SOURCE stay the
-# script path so HERE still resolves after the re-exec.
-if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
-  export HERD_WATCH_REEXEC=1
-  exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
-fi
-# This watcher's own positional args, so the HERD-251 self-restart's exec replays exactly what the
-# re-exec above passes through ("$@" is not visible inside a function). Empty today — agent-watch.sh
-# parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
-_WATCH_ARGV=("$@")
-
-# ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
-# Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
-# HERD_ALLOW_FOREIGN_CWD=1). Placed AFTER the argv0 re-exec so it prints exactly once, in the final
-# tagged process. The config-source refusal (herd-config.sh) already fired on the first pass if the
-# config was engine-dogfood-only; this catches the complementary case — a real config but a $PWD
-# that is not inside the project it resolves to.
-herd_console_guard "herd watch" || exit 1
-
-# ── Singleton spawn-lock: exactly one watcher per project (HERD-209 / HERD-252) ─────────────────
-# The race-safe acquisition lives in _acquire_watcher_singleton (defined above the AGENT_WATCH_LIB
-# return so the unit test can drive it): it REFUSES when a LIVE watcher is already recorded in
-# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then non-blocking flock/mkdir), and ADOPTS a
-# stale/absent lock. A LIVE-lock refusal is LOUD and NON-ZERO (HERD-252): stderr names the holder
-# pid (`herd-watch: already running (pid <N>) — refusing duplicate`) and we exit 1 immediately —
-# never hang, never soft-exit 0 that looks like a successful launch. Keyed by WORKSPACE_NAME
-# (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
-# (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
-# launcher too.
-_acquire_watcher_singleton || exit 1
-# The incoming generation owns the lock: any self-restart handoff window is over (HERD-266). Clearing
-# it HERE — after the acquire, in both the exec'd image and a cold launch — means the duplicate alarm
-# is suppressed for exactly the exec, never a tick longer. A crashed exec that never reached this line
-# leaves a marker that ages out on its own (WATCHER_HANDOFF_TTL).
-watcher_handoff_clear
-# ───────────────────────────────────────────────────────────────────────────────────────────────
-
-# ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
-# _spawn_dep_merged <after> — is a spawn intent's after=<slug|pr#> dependency MERGED? Returns 0 (met)
-# for an EMPTY dependency (an intent with no after= is trivially releasable — the byte-identical path).
-# Otherwise consult the SAME source _startup_reap_sweep trusts: the reap ledger $STATE, whose rows are
-# "<epoch> <pr#> <slug> [ref]". A numeric dependency matches the PR column ($2); a slug matches the
-# slug column ($3). If the ledger has no record (e.g. a collaborator/main-checkout merge this watcher
-# never ledgered), FALL BACK to exactly one gh check: a PR number by itself, a slug by its feat/<slug>
-# branch. Any non-MERGED / gh-unreachable result => not met (0/return 1) so the intent stays held —
-# a held intent is loud (the stalled row), never a silently-dropped one.
-_spawn_dep_merged() {
-  local _sdm_after="${1:-}"
-  [ -n "$_sdm_after" ] || return 0
-  if [ -s "$STATE" ]; then
-    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
-      awk -v p="$_sdm_after" 'NF>=2 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
-    else
-      awk -v s="$_sdm_after" 'NF>=3 && $3==s{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
-    fi
-  fi
-  # Fallback: one gh state read (the ledger is authoritative for THIS watcher's merges but blind to a
-  # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
-  [ -z "${DRYRUN:-}" ] || return 1
-  local _sdm_target
-  # A slug dependency resolves to its branch via the shared BRANCH_TEMPLATE helper (HERD-120), not a
-  # hardcoded feat/ prefix, so a project with custom branch naming still resolves the gh fallback. The
-  # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
-  # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
-  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi  # pipe-ok: single short scalar (one line), far under a pipe buffer
-  [ "$(_gh_timeout spawn_dep_state pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
-  return 1
-}
-
-# _spawn_held_epoch <intent_id> — echo the first-held epoch recorded for this intent (empty if none).
-_spawn_held_epoch() {
-  [ -s "$SPAWN_HELD_STATE" ] || return 0
-  awk -v id="$1" '$1==id{e=$2} END{if(e)print e}' "$SPAWN_HELD_STATE" 2>/dev/null
-}
-
-# _spawn_mark_held <intent_id> <slug> <lane> <after> — record a hold the FIRST time only, journaling
-# spawn_held ONCE with the dependency named. Idempotent across ticks: a row already present (the intent
-# was held on a prior tick and released back to .req) is left untouched, so the stall TTL keeps accruing
-# from the original hold and spawn_held is never re-journaled tick-over-tick.
-_spawn_mark_held() {
-  local _smh_id="$1" _smh_slug="$2" _smh_lane="$3" _smh_after="$4"
-  [ -n "$(_spawn_held_epoch "$_smh_id")" ] && return 0
-  printf '%s %s %s %s %s\n' "$_smh_id" "$(date +%s)" "$_smh_slug" "$_smh_lane" "$_smh_after" >> "$SPAWN_HELD_STATE"
-  journal_append spawn_held slug "$_smh_slug" lane "$_smh_lane" after "$_smh_after"
-}
-
-# _spawn_clear_held <intent_id> — drop this intent's hold row (dependency met / spawned / skipped). A
-# no-op when no row exists, so calling it on an intent that was never held is harmless.
-_spawn_clear_held() {
-  [ -s "$SPAWN_HELD_STATE" ] || return 0
-  local _sch_tmp; _sch_tmp="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null)" || return 0
-  if awk -v id="$1" '$1!=id' "$SPAWN_HELD_STATE" > "$_sch_tmp" 2>/dev/null; then
-    mv -f "$_sch_tmp" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$_sch_tmp" 2>/dev/null
-  else
-    rm -f "$_sch_tmp" 2>/dev/null
-  fi
-}
-
-# ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
-# _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
-# ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
-# lane advisory gate: REVIEW_CONCURRENCY + SPAWN_AHEAD total active builders. FEATS (the live
-# worktree roster) is computed earlier this tick, so active count is its length.
+# ── The watcher tick, factored for the live-engine cutover (HERD-323, P3g, EPIC HERD-300) ────────
+# The tick splits into two halves so ENGINE_IMPL=python can own ONLY the action pass while the
+# console keeps painting and the sweeps keep reconciling on EVERY cycle (the cutover seat used to
+# fly instrument-only: when Python owned a tick the whole bash body was skipped, so nothing
+# rendered and no queued spawn drained). This is a PURE factoring: in bash mode the two halves run
+# back-to-back and the tick is byte-identical to before.
 #
-# DURABILITY CONTRACT (review gate, PR #151): an intent is consumed (`done`, rm) ONLY after its
-# lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
-# never see:
-#   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
-#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
-#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
-#     stops for this tick (siblings would also defer against the same gate);
-#   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
-#     is dropped LOUDLY (skip + journal), never silently.
-# Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
-# post-mortem can answer "why did nothing spawn?" from `herd log` alone.
-#
-# HERD-237 — the lane no longer runs in the tick's foreground. The contract above is UNCHANGED: the
-# lane's output and exit status are still captured and still decide the intent's fate, but that whole
-# observe-and-consume tail moved WITH the lane into `_drain_lane_worker`, which runs in a background
-# subshell (`_spawn_inflight_bg`). The tick fires it and moves on; a lane that takes 30 s to clone a
-# worktree no longer stalls merges, collections and limit-parks for every other PR. Until its worker
-# finishes, the intent stays CLAIMED (.req.mine) — so the drain is durable across a watcher death at
-# any instant, exactly as before.
-#
-# THE CLAIM MUST NOW OUTLIVE A TICK, so `spawn-step.sh next`'s five-minute stale reclaim can no longer
-# treat a surviving claim as proof of a dead watcher. The worker's first act is `spawn-step.sh own
-# <claim> $BASHPID`, and the reclaim skips any claim whose owner is alive. Without that, a lane slower
-# than five minutes has its intent re-served while it is still launching, its `done` becomes a no-op on
-# a moved path, and the next free tick spawns the same slug again. Every `done`/`release`/`skip` now
-# fails LOUD (exit 3 → a `spawn_claim_lost` journal line) when the claim it was handed has vanished,
-# so a lost claim can never be mistaken for a consumed one.
-#
-# ONE LANE AT A TIME, still. The foreground drain implicitly serialized lanes, and stopped the tick
-# outright on a saturation defer (`break`) so siblings would not defer against the same gate. Both
-# properties survive without blocking: at most ONE lane is launched per tick, and none at all while a
-# previous tick's lane is still in flight (`_lane_spawn_inflight`). A saturated gate therefore still
-# costs exactly one lane invocation per tick, never one per queued intent.
-#
-# What does NOT change is the SCAN. The loop still walks the queue to its budget every tick, so a
-# dependency hold is still recorded and journaled (spawn_held) on the tick it becomes visible — the
-# HERD-94 invariant that one stalled dependency never freezes the queue. A runnable intent that cannot
-# launch this tick (its slot is taken by a live lane) is simply RELEASED with the held ones and
-# re-claimed next tick, in the same FIFO order. Net effect: the queue drains one intent per tick
-# instead of N-in-one-blocking-tick — faster in wall-clock whenever a lane outlives the 4 s tick,
-# which is every real lane.
-#
-# DEPENDENCY ORDERING (HERD-94): an intent may carry an after=<slug|pr#> (the .after sidecar, surfaced
-# as the 4th claim line). While that dependency is NOT yet MERGED the intent is HELD: it stays claimed
-# (.req.mine) for THIS tick so `next` skips past it to younger, independent intents — one stalled
-# dependency never freezes the whole queue — and every held intent is RELEASED back to .req at the end
-# of the tick to be re-checked next time. The hold is journaled spawn_held ONCE (via $SPAWN_HELD_STATE)
-# and surfaces on the console (build_spawn_holds), going LOUD (stalled) past DEP_STALE_TTL. When the
-# dependency finally merges the intent spawns in the same FIFO order it would have without after=, and
-# spawn_released is journaled. Intents with NO after= are byte-identical to the pre-HERD-94 path.
-#
-# The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
-# multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
-#
-# Fail-soft: a malformed intent is skipped with a logged warning — never crashes the watcher loop.
-# Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
-_drain_lane_worker() {
-  local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
-  local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
-  [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
-  # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
-  # see `spawn-step.sh own` at the launch site. $BASHPID would let the worker do it itself, but bash
-  # 3.2 — still macOS's /bin/bash — has no BASHPID, and the parent already holds the pid as `$!`.)
-  # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
-  # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
-  # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
-  # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
-  _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
-  # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
-  # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
-  # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
-  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
-    # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
-    # a later tick. The drain already stopped for this tick when it launched this worker.
-    if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
-      journal_append spawn_deferred slug "$_dlw_slug" lane "$_dlw_lane"
-    else
-      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action release
-    fi
-  elif [ "$_dlw_rc" -ne 0 ]; then
-    # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the journal
-    # records why, so a lost spawn is always visible in `herd log`.
-    if bash "$HERE/spawn-step.sh" skip "$_dlw_claimed" "lane exited $_dlw_rc" >/dev/null 2>&1; then
-      journal_append spawn_skipped slug "$_dlw_slug" lane "$_dlw_lane" reason "lane exited $_dlw_rc"
-    else
-      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action skip
-    fi
-  else
-    # Spawned: only now is the intent consumed.
-    if bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1; then
-      journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
-    else
-      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action done
-    fi
-  fi
-  return 0
-}
-
-_drain_spawn_queue() {
-  [ -z "${DRYRUN:-}" ] || return 0
-  # Sweep dead spawn markers on EVERY tick — ABOVE the queue-empty fast exits below. A project with an
-  # idle spawn queue still dispatches resolvers, and a `.spawn-inflight-resolve-*` corpse left here
-  # keeps exempting its (possibly recycled) pid from bin/herd's duplicate-watcher reap.
-  _spawn_inflight_sweep
-  local _dsq_q="$TREES/spawn-queue"
-  [ -d "$_dsq_q" ] || return 0
-  ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
-  # This tick's ONE launch slot. Taken already when a lane launched by an earlier tick is still
-  # running (its intent is claimed, its outcome not yet observed) — the pre-HERD-237 foreground drain
-  # could not have started a second lane there either.
-  local _dsq_can_launch=1
-  _lane_spawn_inflight && _dsq_can_launch=0
-
-  # Daily-budget governance (HERD-95): PAUSE draining when today's recorded spend has EXCEEDED
-  # BUDGET_DAILY. The lanes refuse a spawn individually too, but pausing the drain here stops the
-  # watcher from feeding the queue into those refusals every tick and burning claim churn. The pause is
-  # journaled ONCE per continuous over-budget stretch ($_BUDGET_DRAIN_PAUSED) and cleared when spend
-  # falls back under the ceiling. DORMANT when BUDGET_DAILY is empty (budget_daily_exceeded returns 1
-  # with no work) → byte-identical to before. HERD_FORCE_SPAWN=1 on the watcher overrides the pause.
-  if [ "${HERD_FORCE_SPAWN:-}" != "1" ]; then
-    local _dsq_over
-    if _dsq_over="$(budget_daily_exceeded)"; then
-      if [ "$_BUDGET_DRAIN_PAUSED" != "1" ]; then
-        journal_append budget_drain_paused spent "${_dsq_over%% *}" budget "${_dsq_over##* }"
-        _BUDGET_DRAIN_PAUSED=1
-      fi
-      return 0
-    fi
-  fi
-  if [ "$_BUDGET_DRAIN_PAUSED" = "1" ]; then
-    journal_append budget_drain_resumed
-    _BUDGET_DRAIN_PAUSED=""
-  fi
-
-  # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
-  # HERD-159: sanitize via herd_numeric (or a pure case fallback when the helper is unavailable —
-  # hermetic tests extract this function alone). Raw ${REVIEW_CONCURRENCY}+${SPAWN_AHEAD}
-  # arithmetic aborts on a non-numeric typo and freezes the spawn queue.
-  local _dsq_cap _dsq_budget _dsq_rc _dsq_sa
-  if type herd_numeric >/dev/null 2>&1; then
-    _dsq_rc="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
-    _dsq_sa="$(herd_numeric SPAWN_AHEAD 1)" || true
-  else
-    _dsq_rc="${REVIEW_CONCURRENCY:-2}"; case "$_dsq_rc" in ''|*[!0-9]*) _dsq_rc=2 ;; esac
-    _dsq_sa="${SPAWN_AHEAD:-1}";       case "$_dsq_sa" in ''|*[!0-9]*) _dsq_sa=1 ;; esac
-  fi
-  _dsq_cap=$(( _dsq_rc + _dsq_sa ))
-  _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
-  [ "$_dsq_budget" -le 0 ] && return 0
-
-  local _dsq_n=0 _dsq_held=()
-  while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
-    # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
-    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), after
-    # dependency (HERD-94; empty for none), then the task as EVERYTHING after them. The ref AND after
-    # lines are ALWAYS present so this positional read stays fixed.
-    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_after="" _dsq_task=""
-    {
-      IFS= read -r _dsq_line1
-      IFS= read -r _dsq_slug
-      IFS= read -r _dsq_lane
-      IFS= read -r _dsq_ref
-      IFS= read -r _dsq_after
-      _dsq_task="$(cat)"
-    } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
-
-    case "${_dsq_line1:-}" in
-      EMPTY|'') break ;;
-      CLAIMED*)
-        local _dsq_claimed="${_dsq_line1#CLAIMED }"
-        # Fail-soft: validate slug and lane before launching.
-        if [ -z "$_dsq_slug" ] || [ -z "$_dsq_lane" ]; then
-          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "empty slug or lane" >/dev/null 2>&1 || true
-          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "empty slug or lane"
-          _dsq_n=$(( _dsq_n + 1 )); continue
-        fi
-        case "$_dsq_lane" in
-          quick|feature) ;;
-          *)
-            bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "unknown lane '$_dsq_lane'" >/dev/null 2>&1 || true
-            journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "unknown lane"
-            _dsq_n=$(( _dsq_n + 1 )); continue ;;
-        esac
-        # HERD-94 dependency hold: an intent with after=<slug|pr#> waits until that dependency shows
-        # MERGED. Unmet → DEFER: keep the claim (so this tick's later `next` calls skip it) and stash it
-        # for an end-of-tick release; record + journal the hold ONCE. Crucially we do NOT spend budget
-        # (_dsq_n unchanged) or `break`, so independent younger intents keep draining past a held one.
-        local _dsq_id; _dsq_id="$(basename "${_dsq_claimed%.req.mine}")"
-        if [ -n "$_dsq_after" ] && ! _spawn_dep_merged "$_dsq_after"; then
-          _spawn_mark_held "$_dsq_id" "$_dsq_slug" "$_dsq_lane" "$_dsq_after"
-          _dsq_held+=("$_dsq_claimed")
-          continue
-        fi
-        # The launch slot is already spent this tick (a lane is running). Release this intent with the
-        # dependency-held ones and re-claim it next tick — FIFO order is preserved by the INTENT_ID
-        # filenames. It still SPENDS budget, so a long queue is walked at most _dsq_budget deep per
-        # tick, exactly as the foreground drain walked it. Checked ABOVE the spawn_released announce
-        # so a release is only ever announced on the tick that acts on it.
-        if [ "$_dsq_can_launch" != "1" ]; then
-          _dsq_held+=("$_dsq_claimed")
-          _dsq_n=$(( _dsq_n + 1 )); continue
-        fi
-        # Dependency met (or none). If this intent had been held on a prior tick, announce the release
-        # (spawn_released, dependency named) and clear its hold row before it spawns below.
-        if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
-          journal_append spawn_released slug "$_dsq_slug" lane "$_dsq_lane" after "$_dsq_after"
-          _spawn_clear_held "$_dsq_id"
-        fi
-        # Launch the lane in the BACKGROUND (HERD-237). The worker observes the lane's output + exit
-        # status and only then consumes/releases the intent, so the PR #151 durability contract is
-        # unchanged; the tick just no longer waits for it. The marker keeps the worker out of
-        # `_list_project_watchers` and holds the launch slot shut until the lane lands.
-        _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
-        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "${_dsq_id}-${_SPAWN_DISPATCH_SEQ}")" \
-          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
-        # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
-        # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
-        # dead watcher leaves one behind — true while the lane ran in this loop's foreground, false now
-        # that the worker holds the claim for the lane's whole duration. Recording the worker's pid
-        # makes that reclaim liveness-aware, so a lane slower than five minutes (a slow clone, a wedged
-        # driver call — the exact fault this design exists to tolerate) is never re-served and launched
-        # a second time underneath us. If the worker already finished, `own` refuses (exit 3) rather
-        # than leave a sidecar for a consumed intent; the 5-minute clock makes that window unreachable
-        # by any reclaim anyway.
-        bash "$HERE/spawn-step.sh" own "$_dsq_claimed" "$_SPAWN_INFLIGHT_BG_PID" >/dev/null 2>&1 || true
-        _dsq_can_launch=0
-        _dsq_n=$(( _dsq_n + 1 ))
-        ;;
-    esac
-  done
-  # Release every dependency-held intent back to .req for a later tick. They were kept claimed only so
-  # `next` skipped them this tick; releasing preserves the .after (+ .ref) sidecar so the hold — and its
-  # accruing stall TTL — survives. Order is preserved: they re-enter under their original INTENT_ID
-  # filenames, which sort oldest-first, so FIFO among releasable intents holds.
-  if [ "${#_dsq_held[@]}" -gt 0 ]; then
-    local _dsq_h
-    for _dsq_h in "${_dsq_held[@]}"; do
-      bash "$HERE/spawn-step.sh" release "$_dsq_h" >/dev/null 2>&1 || true
-    done
-  fi
-}
-
-_ORPHAN_SWEEP_TICK=0
-_ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
-_TRACKER_SWEEP_TICK=0
-_TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
-_PMS_SWEEP_INTERVAL=45      # post-merge hook reconcile (HERD-232) every ~3 min — one `gh pr list`, then
-                            # a run-once ledger hit per PR. Shares the tracker sweep's cadence class:
-                            # the drift it catches (a foreign/crashed merge's unrun hooks) is a rare
-                            # merge-tail condition, not a per-tick one
-_PMS_SWEEP_TICK=$_PMS_SWEEP_INTERVAL  # PRIMED so the FIRST tick sweeps, then every interval. The
-                            # grounding incident is a watcher that died mid-do_merge: the restart that
-                            # follows is exactly when the stranded hooks must be replayed, so a fresh
-                            # process must not idle 3 min before noticing. (This is the cadence sibling
-                            # of the one-shot _startup_reap_sweep above, which covers worktrees only.)
-_ENGINE_TICK=0
-_ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
-                            # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
-                            # further rate-limited by engine-version.sh's cooldown (HERD-179)
-_INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
-                            # reads (gh pr comments + tracker) never ride the 4 s repaint
-_INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
-
-# One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
-# (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
-# stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
-_startup_reap_sweep
-
-# One-shot at STARTUP: this process just loaded the engine code that is on disk NOW, so any pending
-# "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
-# restart that got us here. Drop it, or the row would outlive the condition it warns about.
-rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
-
-# …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
-# to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved
-# came back with the new process. Both freshness rows are now derived from observed state at startup.
-# (The tick loop re-derives it before every render too; this one-shot is what makes the FIRST paint of a
-# new process honest, since nothing else has run yet.)
-_main_fresh_recheck
-
-# One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
-# or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
-# panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
-# Byte-inert when there are no reviewer rows (the common startup) — no journal line, no pane touched.
-_sweep_reviewer_registry
-
-# One-shot at STARTUP: proactively close any STALE resolve·<slug> conflict-resolver tab (HERD-54) —
-# a resolver that died/finished for a slug whose PR is no longer CONFLICTING. Prime AGENTS_JSON first
-# so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
-AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
-_sweep_stale_resolve_tabs
-
-while true; do
-  # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
-  _HEALTH_HEADROOM_APPROACHING=""
-  # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
-  # review or health worker (corpse sweep), then collect any finished ASYNC main-health suite. Both run
-  # BEFORE the candidate pass so a freed slot is available to dispatch this same tick and a landed
-  # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
-  _sweep_gate_corpses
-  _collect_main_health
-  # SUPERVISED-PROCESS sweep (HERD-193): immediately after the corpse sweep has had its say, account
-  # for every population's spawns — retire the ones that exited, journal + inbox the ones past their
-  # deadline (routed to the owner that tears that population down). Observability only; never kills.
-  _sweep_lifecycle
-  # CONTROL-ROOM SWEEP trigger (HERD-191): refresh the cheap debris counts on the orphan-sweep
-  # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
-  _sweep_trigger_tick
-
-  # Cross-seat dual-engine reconcile (HERD-308), BEFORE the build + action passes so a detected halt
-  # both paints this tick and holds this tick's writes. Under ENGINE_SEAT_RECONCILE=on it stamps this
-  # seat's engine level into the pool registry and, if a second engine at a different level is writing
-  # the same pool, arms $_ENGINE_SEAT_HALT (the stale seat) so do_merge/post_gate_status refuse. A hard
-  # no-op when the lever is off or in dry-run; guarded so nothing inside it can end the loop.
-  _engine_seat_reconcile_tick || true
-
-  build_header
-  build_landed
-  build_blocked
-  build_tracker_drift
-  build_spawn_holds
-  build_engine_note
-  build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
-  build_main_health
-  # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
-  # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
-  # row whose condition healed while this watcher was down paints for a whole tick after every restart —
-  # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
-  _main_fresh_recheck
-  build_main_freshness
-  build_sweep_note
-  build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
-
-  # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
-  # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
-  # is a read-time SELECTION filter only — it narrows which PRs this tick displays/considers and
-  # never relaxes any merge gate. Default (all lens, no filters) requests the base fields and
-  # passes the JSON through unchanged, preserving today's exact behavior on a successful fetch.
-  _prs_fetch_tick
-  # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
-  # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
-  # reconciliation keys off, so it must reflect real liveness with OR without panes.
-  AGENTS_JSON="$(herd_driver_agent_list_json)"
-  WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
-
-  # RETIREMENT INVARIANT (HERD-164), reconciled EVERY tick against the world we just observed: a slug
-  # whose PR is MERGED or CLOSED (or whose worktree is gone) owns no agent, tab, worktree, branch, or
-  # ledger row. Drives the idempotent teardown one step further and records what it could not finish;
-  # a slug carrying real work is HELD (loud, never deleted). Runs BEFORE row classification so a
-  # retiring slug can never be mistaken for an 'awaiting task' spare — and after $PRS_JSON/$AGENTS_JSON
-  # are fetched, because those ARE the observation. Restart-proof: nothing here is event-driven.
-  retirement_tick
-  # A reap this tick invalidated the worktree snapshot — re-read it so the reaped tree does not render
-  # one last phantom in-flight row. Zero reaps (the steady state) costs zero git calls.
-  [ "$RETIRE_REAPED" -gt 0 ] && WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
-  build_retiring
-
-  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
-  # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
-  # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
-  # the main checkout is excluded as before. See _discover_feature_worktrees.
-  # Each record also carries HERD-226's join provenance: matchkind (branch | sha | ambig | "") and a
-  # matchdetail (the PR's own branch name for a sha join; which PRs collide for an ambiguous one).
-  FEATS=()
-  while IFS= read -r rec; do
-    [ -n "$rec" ] && FEATS+=("$rec")
-  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
-
-  # Classify each feature into a display line; collect merge candidates separately.
-  DISPLAY=()
-  FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
-  CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
-  i=0
-  for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
-$rec
-EOF
-    sl="$(_slug_cell "$slug")"
-    pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
-    # HERD-226: this row's PR was found by HEAD commit, not by branch name — the worktree sits on some
-    # other ref (a resolver's scratch branch). Try the lossless repair; if it takes, the row is an
-    # ordinary branch-matched one from here down (and stays so next tick, via the cheap name join).
-    # If it cannot (dirty tree, diverged ref), the sha-join match STILL stands — gates are (pr,sha)-
-    # keyed — and we hang the truthful mismatch note on whatever row the classification produces.
-    # $SELF_WT is exempt: never swap the branch out from under the checkout this watcher is running.
-    _bmismatch=""
-    if [ "$matchkind" = "sha" ]; then
-      if [ "$dir" != "$SELF_WT" ] \
-         && [ "$(_repair_branch_ref "$dir" "$branch" "$matchdetail" "$headsha" "$prnum" "$slug")" = "REPAIRED" ]; then
-        branch="$matchdetail"
-      else
-        _bmismatch="$(_branch_mismatch_text "$branch" "$matchdetail")"
-      fi
-    fi
-    if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
-      # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
-      # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
-      # worktree PATH so a human reviews the LOCAL diff, and short-circuit the idle/dead/building
-      # classification below — a push-held builder's agent has exited CLEANLY, which the dead-builder
-      # path would otherwise mis-flag as died. Presence-driven: no hold record → this branch is skipped
-      # and the console is byte-identical to before the feature.
-      DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
-      FLAIR_STATE[i]="pen"
-    elif [ -z "$prnum" ] && _rt_state="$(_retire_state_of "$slug")" && [ "$_rt_state" != "active" ]; then
-      # RETIREMENT (HERD-164): this tick's invariant pass proved the slug terminal — its PR is merged
-      # or closed. It is NOT an 'awaiting task' spare, whatever its agent status says, and it is not a
-      # dead builder either: its work landed. Render whose move it is (the herd's while teardown
-      # converges; yours once it is stuck or holding real work) and skip the limit/dead/idle
-      # classification entirely — those all key off "PR-less", which a merged builder trivially is.
-      DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
-      case "$_rt_state" in
-        retiring) FLAIR_STATE[i]="busy" ;;
-        *)        FLAIR_STATE[i]="attention" ;;
-      esac
-    elif [ -z "$prnum" ]; then
-      if [ "$matchkind" = "ambig" ]; then
-        # HERD-226: this worktree's HEAD is the head commit of MORE THAN ONE open PR (or it shares that
-        # commit with a sibling worktree). A PR-less row would read 'awaiting task · assign or retire'
-        # — the exact lie that hid PR #328. The commit is claimed; which PR is yours to say.
-        DISPLAY[i]="$(_row_branch_mismatch "$sl" "$(_branch_mismatch_text "$branch" "$matchdetail")")"
-        FLAIR_STATE[i]="attention"
-      elif [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
-        # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
-        # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
-        # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
-        DISPLAY[i]="$(_row_pr_match_pending "$sl")"
-        FLAIR_STATE[i]="busy"
-      elif [ "$astatus" != "working" ]; then
-        # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
-        # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
-        # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
-        # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
-        # otherwise it is the benign "awaiting task" spare row. An existing record keeps the row (and the
-        # scheduled resume) alive across ticks even after the transient signal clears.
-        # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
-        if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
-        if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
-          _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
-        else
-          # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
-          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list — OR is
-          # still LISTED but whose PROCESS is dead (HERD-114: a herdr crash leaves a stale 'idle'/'done'
-          # over a killed session) — while its worktree lives on with no PR. astatus is EMPTY only when
-          # the slug has NO agent record; the liveness probe additionally catches a listed-but-dead
-          # session. Surface a persistently-dead builder LOUDLY (💀 + notification) so it is never lost.
-          _live="$(_agent_liveness "$slug")"
-          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
-            DEAD)
-              # A dead builder is not a wedge — 💀 is the louder, truer row, and a corpse cannot be
-              # woken. Drop any wedge record so the two ledgers never both claim the same slug.
-              clear_wedge "$slug"
-              if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
-                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
-              else
-                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
-              fi
-              FLAIR_STATE[i]="dead" ;;
-            *)
-              # ALIVE (or still PENDING death): the agent is listed. Two very different builders land
-              # here. HERD-278: one whose agent reads 'done' over a branch with no PR and nothing
-              # pushable is a WEDGE — it was tasked and abandoned the task mid-delivery — and calling
-              # it a spare ("assign or retire") is the lie that hid three of them on 2026-07-09.
-              # Everything else is a genuine spare. A wedge must age past the grace window first, so a
-              # builder inside `gh pr create` keeps the row it had.
-              _wedge="$(_reconcile_wedged_builder "$slug" "$dir" "$astatus")"
-              if [ "$_wedge" = "WEDGED" ]; then
-                _wfirst="$(wedge_first_seen "$slug")"; _wwoke=""
-                if wedge_woken "$slug"; then _wwoke="woken"; fi
-                DISPLAY[i]="$(_row_wedged "$sl" "$(_fmt_age "$(( $(_now) - ${_wfirst:-$(_now)} ))")" "$_wwoke")"
-                FLAIR_STATE[i]="attention"
-              else
-                # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
-                # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
-                # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
-                DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
-                FLAIR_STATE[i]="idle"
-              fi ;;
-          esac
-        fi
-      else
-        # A working agent means any earlier limit hold has cleared (a human intervened, or the
-        # scheduled resume flipped it working). HERD-155 F4: a working agent is DEFINITIVELY not
-        # limit-parked, so clear the ledger record AND any stale hook sentinel UNCONDITIONALLY (both
-        # clears no-op when absent) — a leftover sentinel must never survive to re-trigger a false park
-        # on a later idle tick. Also drop any stale clean-select record (the same singleton could re-park).
-        clear_limit "$slug" "$dir"; clear_sendkeys "$slug"
-        # A working agent is DEFINITIVELY not wedged (HERD-278) — it is delivering. Drop any wedge
-        # record so a builder that was woken (by the auto-wake, or by a human) and later stops again
-        # must serve the FULL grace window before it re-surfaces. No-ops when absent.
-        clear_wedge "$slug"
-        # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
-        # helpers) instead of the old commit-count heuristic, which false-flagged every normal
-        # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
-        # transcript-growing worktree reads as building; only a clean, commitless, quiet tree
-        # earns the warning.
-        _quiet="$(_stall_quiet_secs)"
-        _now="$(date +%s)"
-        _newest_edit="$(_worktree_newest_edit "$dir")"
-        if [ -n "$_newest_edit" ]; then _changes=1; _edit_age=$(( _now - _newest_edit )); else _changes=0; _edit_age=-1; fi
-        _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
-        _tgrow="$(_transcript_growing "$slug" "$(_transcript_obs "$dir")" "$_now" "$_quiet")"
-        # How long the tree has ACTUALLY been quiet: since the newest dirty edit if any, else since
-        # the worktree was born (nothing produced yet). This is both the STALL floor and, if it does
-        # stall, the honest "no activity" age.
-        _born="$(_worktree_born "$dir")"
-        if [ "$_changes" -eq 1 ]; then _qelapsed="$_edit_age"; else _qelapsed=$(( _now - _born )); fi
-        case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet" "$_qelapsed")" in
-          BUILD_UNCOMMITTED)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}"
-            FLAIR_STATE[i]="grazing" ;;
-          STALL)
-            # Reached only when _qelapsed ≥ _quiet, so this age is a real, ≥-window duration.
-            _qmins=$(( _qelapsed / 60 ))
-            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}"
-            FLAIR_STATE[i]="warn" ;;
-          *)
-            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
-            FLAIR_STATE[i]="grazing" ;;
-        esac
-      fi
-    elif [ "$dir" = "$SELF_WT" ]; then
-      DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
-      FLAIR_STATE[i]="self"
-    elif [ "$mergeable" = "MERGEABLE" ] && { _should_automerge "$mstate" || _gate_bless_eligible "$prnum" "$headsha" "$mstate"; }; then
-      # CLEAN → a normal merge candidate (run gates, then merge). BLOCKED-but-unblessed (HERD-194) → a
-      # GATE-ONLY candidate: run the gates + post herd/gates so branch protection can clear, but the
-      # merge itself still waits for CLEAN (re-verified in the action pass). Without this a PR under
-      # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
-      if _scope_permits_automerge "$prauthor"; then
-        if _should_automerge "$mstate"; then
-          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
-        else
-          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
-        fi
-        FLAIR_STATE[i]="busy"
-        CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
-      else
-        # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,
-        # but it is NOT owned by the configured operator. DISPLAY it so a teammate's progress is
-        # visible, but NEVER add it to the merge-candidate set — a human merges a teammate's PR.
-        DISPLAY[i]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${prauthor:-unknown})${C_RESET}"
-        FLAIR_STATE[i]="other"
-      fi
-    elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
-      DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
-      FLAIR_STATE[i]="verify"
-    elif [ "$mergeable" = "CONFLICTING" ]; then
-      # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
-      # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
-      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
-      # HERD-231: whichever row that painted, a starving PR says so underneath it.
-      _restale_decorate_row "$i" "$prnum"
-    elif [ "$mergeable" = "MERGEABLE" ]; then
-      # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
-      # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
-      # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
-      # is transient, NOT a human-action error, so no ⚠️ "needs you".
-      #
-      # HERD-197: UNSTABLE is opaque — it never names the check. When the hold is UNSTABLE, fetch the
-      # GH check-run rollup, journal each landed result as a `ci_check` gate event + notify once on a
-      # newly-landed failure, and surface WHICH check is failing/pending in the row instead of the bare
-      # (UNSTABLE). A genuine FAILING required check is a human-action stop — it will NEVER merge until
-      # fixed — so it graduates to a LOUD red 'needs you · <check>' row (the grounded #293 macOS leg);
-      # pending-only checks stay a yellow hold, just named. Fail-soft: a PR with no checks / an offline
-      # gh yields no summary and the row is BYTE-IDENTICAL to before.
-      #
-      # HERD-250: when the fail is the INHERITED-red case (CI red + herd/gates green + branch behind
-      # main) and CI_AUTOREPAIR=on, _handle_ci_repair dispatches a base-refresh instead of needs-you.
-      # NEVER silent-merges a red PR; a real new-code failure (not behind / no gates) still needs-you.
-      _ci_sum=""
-      if [ "$mstate" = "UNSTABLE" ]; then _ci_sum="$(_ci_gate_eval "$prnum" "$headsha" "$slug")"; fi
-      if [ -n "$_ci_sum" ]; then
-        _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
-        if [ "$_ci_bucket" = "fail" ]; then
-          if _handle_ci_repair "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
-            FLAIR_STATE[i]="busy"
-          else
-            DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
-            FLAIR_STATE[i]="attention"
-          fi
-        else
-          DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · ${_ci_text}${C_RESET}"
-          FLAIR_STATE[i]="busy"
-        fi
-      else
-        DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
-        FLAIR_STATE[i]="busy"
-      fi
-    else
-      reason="not mergeable (${mstate})"
-      DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
-      FLAIR_STATE[i]="attention"
-    fi
-    # A sha-joined worktree we could not repair keeps its real row — health-check, blocked, conflict,
-    # whatever the PR's state is — with the mismatch named after it. The gate outcome is the headline;
-    # the stale ref is the footnote. Empty (the overwhelmingly common case) leaves the row untouched.
-    [ -n "$_bmismatch" ] && DISPLAY[i]="${DISPLAY[i]} ${C_YELLOW}· ${_bmismatch}${C_RESET}"
-    i=$((i + 1))
-  done
-
-  # HERD-147 flair — assemble the pasture header + any queued merge celebration from THIS tick's herd
-  # snapshot, BEFORE render. Both no-op (leave PASTURE/CELEBRATE empty) when WATCHER_FLAIR is off, so
-  # the frame is byte-identical to before the feature. The celebration's "<n> grazing" count is the
-  # number of builders classified as building this tick.
-  _flair_grazing=0
-  for _fs in ${FLAIR_STATE[@]+"${FLAIR_STATE[@]}"}; do
-    [ "$_fs" = "grazing" ] && _flair_grazing=$((_flair_grazing + 1))
-  done
-  build_celebrate "$_flair_grazing"
-  build_pasture
-
-  # HERD-184 operator inbox — refresh the cross-seat inbox on the throttled interval (network reads
-  # never ride the 4 s repaint), then render the section from its ledger. _inbox_scan self-gates on
-  # OPERATOR_INBOX (no-op when off), and build_operator_inbox leaves OPERATOR_INBOX_ROWS empty when
-  # off/none, so the frame is byte-identical to before the feature. PRS_JSON is the tick's already-
-  # fetched open-PR set — no extra `gh pr list`.
-  if _operator_inbox_enabled; then
-    _INBOX_SCAN_TICK=$((_INBOX_SCAN_TICK + 1))
-    if [ "$_INBOX_SCAN_TICK" -ge "$_INBOX_SCAN_INTERVAL" ]; then
-      _INBOX_SCAN_TICK=0
-      _inbox_scan "$PRS_JSON"
-    fi
-  fi
-  build_operator_inbox
-
-  # HERD-202 builder notes — drain NEW builder_note journal events into the ledger + notify stream,
-  # then render the section. Cheap (local journal tail via byte cursor); every tick is fine. Empty
-  # ledger ⇒ build_builder_notes leaves BUILDER_NOTES_ROWS empty ⇒ byte-identical console when unused.
-  _builder_notes_scan
-  build_builder_notes
-
-  render
-
+#   _tick_act            — the ACTION pass: gate dispatch, the auto-merge candidate loop, and the
+#                          conflict-resolver (re)spawn bounces. This is the half the Python engine
+#                          replaces; it is SKIPPED in bash whenever Python owned the tick.
+#   _tick_render_reconcile — runs EVERY cycle regardless of tick owner: it observes the world and
+#                          paints the console (Phase A), hands the action pass to Python-or-bash via
+#                          the herd_engine_live_tick guard, then drains the spawn queue and runs the
+#                          reconcile/sweep legs (Phase C) over the same state files + journal the
+#                          Python engine writes.
+_tick_act() {
   # CLAUDE EXEC-HANG PROBE (HERD-108): before dispatching any review/refix into a possibly-wedged claude,
   # probe it ONCE per tick under a hard timeout. A wedge (probe times out) sets $_claude_hung, which the
   # per-candidate guard below uses to HOLD review/refix (a cached-PASS PR still merges). Byte-inert unless
@@ -12494,7 +11743,359 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     render
     spawn_resolver "$slug" "$prnum" "$branch" "$csha"
   done
+}
 
+_tick_render_reconcile() {
+  # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
+  _HEALTH_HEADROOM_APPROACHING=""
+  # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
+  # review or health worker (corpse sweep), then collect any finished ASYNC main-health suite. Both run
+  # BEFORE the candidate pass so a freed slot is available to dispatch this same tick and a landed
+  # main-health verdict paints/clears its row immediately. Byte-quiet when there is nothing to do.
+  _sweep_gate_corpses
+  _collect_main_health
+  # SUPERVISED-PROCESS sweep (HERD-193): immediately after the corpse sweep has had its say, account
+  # for every population's spawns — retire the ones that exited, journal + inbox the ones past their
+  # deadline (routed to the owner that tears that population down). Observability only; never kills.
+  _sweep_lifecycle
+  # CONTROL-ROOM SWEEP trigger (HERD-191): refresh the cheap debris counts on the orphan-sweep
+  # cadence and, under SWEEP_AUTO=auto, run the SAFE legs. Inert under SWEEP_AUTO=off.
+  _sweep_trigger_tick
+
+  # Cross-seat dual-engine reconcile (HERD-308), BEFORE the build + action passes so a detected halt
+  # both paints this tick and holds this tick's writes. Under ENGINE_SEAT_RECONCILE=on it stamps this
+  # seat's engine level into the pool registry and, if a second engine at a different level is writing
+  # the same pool, arms $_ENGINE_SEAT_HALT (the stale seat) so do_merge/post_gate_status refuse. A hard
+  # no-op when the lever is off or in dry-run; guarded so nothing inside it can end the loop.
+  _engine_seat_reconcile_tick || true
+
+  build_header
+  build_landed
+  build_blocked
+  build_tracker_drift
+  build_spawn_holds
+  build_engine_note
+  build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
+  build_main_health
+  # HERD-259: the render pass runs ABOVE reconcile_main_freshness in this tick, and the reconcile is the
+  # only other place a held MAIN-STALE row is dropped. Re-derive it from observed git state first, or a
+  # row whose condition healed while this watcher was down paints for a whole tick after every restart —
+  # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
+  _main_fresh_recheck
+  build_main_freshness
+  build_sweep_note
+  build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
+
+  # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
+  # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
+  # is a read-time SELECTION filter only — it narrows which PRs this tick displays/considers and
+  # never relaxes any merge gate. Default (all lens, no filters) requests the base fields and
+  # passes the JSON through unchanged, preserving today's exact behavior on a successful fetch.
+  _prs_fetch_tick
+  # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
+  # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
+  # reconciliation keys off, so it must reflect real liveness with OR without panes.
+  AGENTS_JSON="$(herd_driver_agent_list_json)"
+  WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+
+  # RETIREMENT INVARIANT (HERD-164), reconciled EVERY tick against the world we just observed: a slug
+  # whose PR is MERGED or CLOSED (or whose worktree is gone) owns no agent, tab, worktree, branch, or
+  # ledger row. Drives the idempotent teardown one step further and records what it could not finish;
+  # a slug carrying real work is HELD (loud, never deleted). Runs BEFORE row classification so a
+  # retiring slug can never be mistaken for an 'awaiting task' spare — and after $PRS_JSON/$AGENTS_JSON
+  # are fetched, because those ARE the observation. Restart-proof: nothing here is event-driven.
+  retirement_tick
+  # A reap this tick invalidated the worktree snapshot — re-read it so the reaped tree does not render
+  # one last phantom in-flight row. Zero reaps (the steady state) costs zero git calls.
+  [ "$RETIRE_REAPED" -gt 0 ] && WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  build_retiring
+
+  # Parse worktrees + match each to its open PR and its agent, emitting one tab-separated record per
+  # LEGITIMATE builder worktree. Discovery is SCOPED to $WORKTREES_DIR and filters detached-HEAD /
+  # non-builder worktrees (HERD-182) so a stray checkout never renders as a phantom dead-builder row;
+  # the main checkout is excluded as before. See _discover_feature_worktrees.
+  # Each record also carries HERD-226's join provenance: matchkind (branch | sha | ambig | "") and a
+  # matchdetail (the PR's own branch name for a sha join; which PRs collide for an ambiguous one).
+  FEATS=()
+  while IFS= read -r rec; do
+    [ -n "$rec" ] && FEATS+=("$rec")
+  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
+
+  # Classify each feature into a display line; collect merge candidates separately.
+  DISPLAY=()
+  FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
+  CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
+  i=0
+  for rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
+$rec
+EOF
+    sl="$(_slug_cell "$slug")"
+    pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
+    # HERD-226: this row's PR was found by HEAD commit, not by branch name — the worktree sits on some
+    # other ref (a resolver's scratch branch). Try the lossless repair; if it takes, the row is an
+    # ordinary branch-matched one from here down (and stays so next tick, via the cheap name join).
+    # If it cannot (dirty tree, diverged ref), the sha-join match STILL stands — gates are (pr,sha)-
+    # keyed — and we hang the truthful mismatch note on whatever row the classification produces.
+    # $SELF_WT is exempt: never swap the branch out from under the checkout this watcher is running.
+    _bmismatch=""
+    if [ "$matchkind" = "sha" ]; then
+      if [ "$dir" != "$SELF_WT" ] \
+         && [ "$(_repair_branch_ref "$dir" "$branch" "$matchdetail" "$headsha" "$prnum" "$slug")" = "REPAIRED" ]; then
+        branch="$matchdetail"
+      else
+        _bmismatch="$(_branch_mismatch_text "$branch" "$matchdetail")"
+      fi
+    fi
+    if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
+      # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
+      # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
+      # worktree PATH so a human reviews the LOCAL diff, and short-circuit the idle/dead/building
+      # classification below — a push-held builder's agent has exited CLEANLY, which the dead-builder
+      # path would otherwise mis-flag as died. Presence-driven: no hold record → this branch is skipped
+      # and the console is byte-identical to before the feature.
+      DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_GREEN}ready · awaiting push approval${C_RESET} ${C_DIM}${dir}${C_RESET}"
+      FLAIR_STATE[i]="pen"
+    elif [ -z "$prnum" ] && _rt_state="$(_retire_state_of "$slug")" && [ "$_rt_state" != "active" ]; then
+      # RETIREMENT (HERD-164): this tick's invariant pass proved the slug terminal — its PR is merged
+      # or closed. It is NOT an 'awaiting task' spare, whatever its agent status says, and it is not a
+      # dead builder either: its work landed. Render whose move it is (the herd's while teardown
+      # converges; yours once it is stuck or holding real work) and skip the limit/dead/idle
+      # classification entirely — those all key off "PR-less", which a merged builder trivially is.
+      DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
+      case "$_rt_state" in
+        retiring) FLAIR_STATE[i]="busy" ;;
+        *)        FLAIR_STATE[i]="attention" ;;
+      esac
+    elif [ -z "$prnum" ]; then
+      if [ "$matchkind" = "ambig" ]; then
+        # HERD-226: this worktree's HEAD is the head commit of MORE THAN ONE open PR (or it shares that
+        # commit with a sibling worktree). A PR-less row would read 'awaiting task · assign or retire'
+        # — the exact lie that hid PR #328. The commit is claimed; which PR is yours to say.
+        DISPLAY[i]="$(_row_branch_mismatch "$sl" "$(_branch_mismatch_text "$branch" "$matchdetail")")"
+        FLAIR_STATE[i]="attention"
+      elif [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+        # HERD-224: the open-PR roster could not be fetched this tick. An empty match is NOT positive
+        # evidence of "no PR" — never paint the definitive "awaiting task · assign or retire" or
+        # "died (no PR)" claims from a lookup FAILURE. Neutral degraded row; next tick retries.
+        DISPLAY[i]="$(_row_pr_match_pending "$sl")"
+        FLAIR_STATE[i]="busy"
+      elif [ "$astatus" != "working" ]; then
+        # A non-working, PR-less builder is USUALLY just idle waiting for a task. But it may instead
+        # be frozen on the ACCOUNT usage limit — its session ended and no typed nudge can revive it
+        # (2026-07-02 incident). Detect that (hook sentinel → banner-scrape fallback) and, if so,
+        # surface a distinct hold row + schedule an in-place `claude --continue` resume at the reset;
+        # otherwise it is the benign "awaiting task" spare row. An existing record keeps the row (and the
+        # scheduled resume) alive across ticks even after the transient signal clears.
+        # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
+        if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
+        if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
+          _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
+        else
+          # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
+          # just waiting for a task) from a DEAD builder whose agent has VANISHED from the list — OR is
+          # still LISTED but whose PROCESS is dead (HERD-114: a herdr crash leaves a stale 'idle'/'done'
+          # over a killed session) — while its worktree lives on with no PR. astatus is EMPTY only when
+          # the slug has NO agent record; the liveness probe additionally catches a listed-but-dead
+          # session. Surface a persistently-dead builder LOUDLY (💀 + notification) so it is never lost.
+          _live="$(_agent_liveness "$slug")"
+          case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
+            DEAD)
+              # A dead builder is not a wedge — 💀 is the louder, truer row, and a corpse cannot be
+              # woken. Drop any wedge record so the two ledgers never both claim the same slug.
+              clear_wedge "$slug"
+              if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
+              else
+                DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
+              fi
+              FLAIR_STATE[i]="dead" ;;
+            *)
+              # ALIVE (or still PENDING death): the agent is listed. Two very different builders land
+              # here. HERD-278: one whose agent reads 'done' over a branch with no PR and nothing
+              # pushable is a WEDGE — it was tasked and abandoned the task mid-delivery — and calling
+              # it a spare ("assign or retire") is the lie that hid three of them on 2026-07-09.
+              # Everything else is a genuine spare. A wedge must age past the grace window first, so a
+              # builder inside `gh pr create` keeps the row it had.
+              _wedge="$(_reconcile_wedged_builder "$slug" "$dir" "$astatus")"
+              if [ "$_wedge" = "WEDGED" ]; then
+                _wfirst="$(wedge_first_seen "$slug")"; _wwoke=""
+                if wedge_woken "$slug"; then _wwoke="woken"; fi
+                DISPLAY[i]="$(_row_wedged "$sl" "$(_fmt_age "$(( $(_now) - ${_wfirst:-$(_now)} ))")" "$_wwoke")"
+                FLAIR_STATE[i]="attention"
+              else
+                # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
+                # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
+                # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
+                DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
+                FLAIR_STATE[i]="idle"
+              fi ;;
+          esac
+        fi
+      else
+        # A working agent means any earlier limit hold has cleared (a human intervened, or the
+        # scheduled resume flipped it working). HERD-155 F4: a working agent is DEFINITIVELY not
+        # limit-parked, so clear the ledger record AND any stale hook sentinel UNCONDITIONALLY (both
+        # clears no-op when absent) — a leftover sentinel must never survive to re-trigger a false park
+        # on a later idle tick. Also drop any stale clean-select record (the same singleton could re-park).
+        clear_limit "$slug" "$dir"; clear_sendkeys "$slug"
+        # A working agent is DEFINITIVELY not wedged (HERD-278) — it is delivering. Drop any wedge
+        # record so a builder that was woken (by the auto-wake, or by a human) and later stops again
+        # must serve the FULL grace window before it re-surfaces. No-ops when absent.
+        clear_wedge "$slug"
+        # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
+        # helpers) instead of the old commit-count heuristic, which false-flagged every normal
+        # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
+        # transcript-growing worktree reads as building; only a clean, commitless, quiet tree
+        # earns the warning.
+        _quiet="$(_stall_quiet_secs)"
+        _now="$(date +%s)"
+        _newest_edit="$(_worktree_newest_edit "$dir")"
+        if [ -n "$_newest_edit" ]; then _changes=1; _edit_age=$(( _now - _newest_edit )); else _changes=0; _edit_age=-1; fi
+        _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
+        _tgrow="$(_transcript_growing "$slug" "$(_transcript_obs "$dir")" "$_now" "$_quiet")"
+        # How long the tree has ACTUALLY been quiet: since the newest dirty edit if any, else since
+        # the worktree was born (nothing produced yet). This is both the STALL floor and, if it does
+        # stall, the honest "no activity" age.
+        _born="$(_worktree_born "$dir")"
+        if [ "$_changes" -eq 1 ]; then _qelapsed="$_edit_age"; else _qelapsed=$(( _now - _born )); fi
+        case "$(_classify_builder "$_edit_age" "$_changes" "${_commits:-0}" "$astatus" "$_tgrow" "$_quiet" "$_qelapsed")" in
+          BUILD_UNCOMMITTED)
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building (uncommitted changes)${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
+          STALL)
+            # Reached only when _qelapsed ≥ _quiet, so this age is a real, ≥-window duration.
+            _qmins=$(( _qelapsed / 60 ))
+            DISPLAY[i]="    ${C_YELLOW}⚠️${C_RESET}  ${C_BOLD}${sl}${C_RESET} ${C_YELLOW}no activity ${_qmins}m · check pane${C_RESET}"
+            FLAIR_STATE[i]="warn" ;;
+          *)
+            DISPLAY[i]="    ${C_BLUE}🔨${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_BLUE}building${C_RESET}"
+            FLAIR_STATE[i]="grazing" ;;
+        esac
+      fi
+    elif [ "$dir" = "$SELF_WT" ]; then
+      DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
+      FLAIR_STATE[i]="self"
+    elif [ "$mergeable" = "MERGEABLE" ] && { _should_automerge "$mstate" || _gate_bless_eligible "$prnum" "$headsha" "$mstate"; }; then
+      # CLEAN → a normal merge candidate (run gates, then merge). BLOCKED-but-unblessed (HERD-194) → a
+      # GATE-ONLY candidate: run the gates + post herd/gates so branch protection can clear, but the
+      # merge itself still waits for CLEAN (re-verified in the action pass). Without this a PR under
+      # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
+      if _scope_permits_automerge "$prauthor"; then
+        if _should_automerge "$mstate"; then
+          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
+        else
+          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
+        fi
+        FLAIR_STATE[i]="busy"
+        CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
+      else
+        # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,
+        # but it is NOT owned by the configured operator. DISPLAY it so a teammate's progress is
+        # visible, but NEVER add it to the merge-candidate set — a human merges a teammate's PR.
+        DISPLAY[i]="    ${C_DIM}👥${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_DIM}not mine — manual (@${prauthor:-unknown})${C_RESET}"
+        FLAIR_STATE[i]="other"
+      fi
+    elif [ "$mergeable" = "UNKNOWN" ] || [ "$mstate" = "UNKNOWN" ] || [ -z "$mergeable" ]; then
+      DISPLAY[i]="    ${C_DIM}🔍${C_RESET} ${C_DIM}${sl}${C_RESET}${pn} ${C_DIM}verifying mergeability…${C_RESET}"
+      FLAIR_STATE[i]="verify"
+    elif [ "$mergeable" = "CONFLICTING" ]; then
+      # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
+      # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
+      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
+      # HERD-231: whichever row that painted, a starving PR says so underneath it.
+      _restale_decorate_row "$i" "$prnum"
+    elif [ "$mergeable" = "MERGEABLE" ]; then
+      # MERGEABLE (no conflict) but mergeStateStatus != CLEAN: branch-protection gates aren't
+      # satisfied yet — BLOCKED (required reviews/CODEOWNERS), BEHIND (out of date), or UNSTABLE
+      # (pending/failing required checks). Do NOT merge; soft-hold and re-evaluate next tick. This
+      # is transient, NOT a human-action error, so no ⚠️ "needs you".
+      #
+      # HERD-197: UNSTABLE is opaque — it never names the check. When the hold is UNSTABLE, fetch the
+      # GH check-run rollup, journal each landed result as a `ci_check` gate event + notify once on a
+      # newly-landed failure, and surface WHICH check is failing/pending in the row instead of the bare
+      # (UNSTABLE). A genuine FAILING required check is a human-action stop — it will NEVER merge until
+      # fixed — so it graduates to a LOUD red 'needs you · <check>' row (the grounded #293 macOS leg);
+      # pending-only checks stay a yellow hold, just named. Fail-soft: a PR with no checks / an offline
+      # gh yields no summary and the row is BYTE-IDENTICAL to before.
+      #
+      # HERD-250: when the fail is the INHERITED-red case (CI red + herd/gates green + branch behind
+      # main) and CI_AUTOREPAIR=on, _handle_ci_repair dispatches a base-refresh instead of needs-you.
+      # NEVER silent-merges a red PR; a real new-code failure (not behind / no gates) still needs-you.
+      _ci_sum=""
+      if [ "$mstate" = "UNSTABLE" ]; then _ci_sum="$(_ci_gate_eval "$prnum" "$headsha" "$slug")"; fi
+      if [ -n "$_ci_sum" ]; then
+        _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
+        if [ "$_ci_bucket" = "fail" ]; then
+          if _handle_ci_repair "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
+            FLAIR_STATE[i]="busy"
+          else
+            DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
+            FLAIR_STATE[i]="attention"
+          fi
+        else
+          DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · ${_ci_text}${C_RESET}"
+          FLAIR_STATE[i]="busy"
+        fi
+      else
+        DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
+        FLAIR_STATE[i]="busy"
+      fi
+    else
+      reason="not mergeable (${mstate})"
+      DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
+      FLAIR_STATE[i]="attention"
+    fi
+    # A sha-joined worktree we could not repair keeps its real row — health-check, blocked, conflict,
+    # whatever the PR's state is — with the mismatch named after it. The gate outcome is the headline;
+    # the stale ref is the footnote. Empty (the overwhelmingly common case) leaves the row untouched.
+    [ -n "$_bmismatch" ] && DISPLAY[i]="${DISPLAY[i]} ${C_YELLOW}· ${_bmismatch}${C_RESET}"
+    i=$((i + 1))
+  done
+
+  # HERD-147 flair — assemble the pasture header + any queued merge celebration from THIS tick's herd
+  # snapshot, BEFORE render. Both no-op (leave PASTURE/CELEBRATE empty) when WATCHER_FLAIR is off, so
+  # the frame is byte-identical to before the feature. The celebration's "<n> grazing" count is the
+  # number of builders classified as building this tick.
+  _flair_grazing=0
+  for _fs in ${FLAIR_STATE[@]+"${FLAIR_STATE[@]}"}; do
+    [ "$_fs" = "grazing" ] && _flair_grazing=$((_flair_grazing + 1))
+  done
+  build_celebrate "$_flair_grazing"
+  build_pasture
+
+  # HERD-184 operator inbox — refresh the cross-seat inbox on the throttled interval (network reads
+  # never ride the 4 s repaint), then render the section from its ledger. _inbox_scan self-gates on
+  # OPERATOR_INBOX (no-op when off), and build_operator_inbox leaves OPERATOR_INBOX_ROWS empty when
+  # off/none, so the frame is byte-identical to before the feature. PRS_JSON is the tick's already-
+  # fetched open-PR set — no extra `gh pr list`.
+  if _operator_inbox_enabled; then
+    _INBOX_SCAN_TICK=$((_INBOX_SCAN_TICK + 1))
+    if [ "$_INBOX_SCAN_TICK" -ge "$_INBOX_SCAN_INTERVAL" ]; then
+      _INBOX_SCAN_TICK=0
+      _inbox_scan "$PRS_JSON"
+    fi
+  fi
+  build_operator_inbox
+
+  # HERD-202 builder notes — drain NEW builder_note journal events into the ledger + notify stream,
+  # then render the section. Cheap (local journal tail via byte cursor); every tick is fine. Empty
+  # ledger ⇒ build_builder_notes leaves BUILDER_NOTES_ROWS empty ⇒ byte-identical console when unused.
+  _builder_notes_scan
+  build_builder_notes
+
+  render
+  # ENGINE_IMPL=python (HERD-320/HERD-323, EPIC HERD-300): hand ONLY the action pass to the LIVE
+  # Python engine core. herd_engine_live_tick returns 0 only when Python is ARMED (ENGINE_IMPL=python)
+  # AND owned this tick successfully; then bash skips its own action pass and the render/reconcile
+  # legs above and below run against the state Python just wrote. Under the ship default (bash) it
+  # returns 1 IMMEDIATELY having done NOTHING, so `! herd_engine_live_tick` is always true and the
+  # bash action pass runs exactly as before — byte-identical. A Python fault (non-zero exit / missing
+  # module) also returns 1 → instant fallback to the authoritative bash action pass.
+  if ! herd_engine_live_tick; then
+    _tick_act
+  fi
   # Resolver-pane reconcile (HERD-280): retire the pane of every resolver whose DONE verdict has landed.
   # Runs OUTSIDE the conflict pass on purpose — a resolver that CLEARED its conflict leaves the pass's
   # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.
@@ -12577,6 +12178,434 @@ Recorded in the engine journal as \`human_verify_policy=auto merged-with-declare
     # no-op under the ship default ENGINE_IMPL=bash, so the live tick is byte-identical when off.
     herd_engine_shadow_tick
   fi
+}
 
+# Sourcing this file (e.g. from the hermetic test) loads the helper functions — including the pure
+# merge-decision predicate _should_automerge and the watcher-view selectors above — WITHOUT entering
+# the live watch loop. Direct execution runs the loop normally.
+if [ "${AGENT_WATCH_LIB:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+# ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
+# The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
+# run (the dogfood healthcheck, or any test) may set HERD_HERMETIC_GUARD to a log-file path; any
+# watcher that reaches this point — spawned via cmd_reload's pane-run/background fallback, `herd pane
+# watch`, herd-watch.sh, coordinator.sh, or direct execution — records the leak and EXITS BEFORE the
+# argv0 re-exec and the loop. So a test that forgot to stub a watcher spawn is caught LOUDLY (the
+# healthcheck fails on a non-empty log) instead of silently leaving a real daemon behind. This is the
+# single choke point every launch path funnels through. INERT in production: with the var unset this
+# is byte-identical to before (the real console-room watcher never sets it).
+if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
+  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
+    >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
+  exit 0
+fi
+
+# ── Per-workspace argv0 marker: make this watcher ATTRIBUTABLE in ps/pgrep (issue #60) ──────────
+# Re-exec ONCE under a distinctive per-workspace argv0 ($HERD_WATCH_ARGV0, e.g. herd-watch-<slug>)
+# so the process table shows which workspace this watcher serves. Without it, two projects' watchers
+# are indistinguishable in ps (`bash .../agent-watch.sh`) and a good-faith "kill the duplicate
+# watcher" in project A can SIGTERM project B's live watcher. argv0 is visible via ps/pgrep on every
+# platform; an env-var marker is NOT reliably readable via ps on modern macOS — which is why the
+# marker is argv0. _list_project_watchers (bin/herd) reaps ONLY processes whose argv0 equals this
+# exact string. Every launch site (coordinator.sh, cmd_reload's pane-run + background fallback,
+# herd pane watch, herd-watch.sh) ultimately runs agent-watch.sh, so this single re-exec tags them
+# all. The guard env var makes it a one-shot (no infinite re-exec loop); $0/BASH_SOURCE stay the
+# script path so HERE still resolves after the re-exec.
+if [ "${HERD_WATCH_REEXEC:-}" != "1" ]; then
+  export HERD_WATCH_REEXEC=1
+  exec -a "$HERD_WATCH_ARGV0" bash "$HERE/agent-watch.sh" "$@"
+fi
+# This watcher's own positional args, so the HERD-251 self-restart's exec replays exactly what the
+# re-exec above passes through ("$@" is not visible inside a function). Empty today — agent-watch.sh
+# parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
+_WATCH_ARGV=("$@")
+
+# ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
+# Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
+# HERD_ALLOW_FOREIGN_CWD=1). Placed AFTER the argv0 re-exec so it prints exactly once, in the final
+# tagged process. The config-source refusal (herd-config.sh) already fired on the first pass if the
+# config was engine-dogfood-only; this catches the complementary case — a real config but a $PWD
+# that is not inside the project it resolves to.
+herd_console_guard "herd watch" || exit 1
+
+# ── Singleton spawn-lock: exactly one watcher per project (HERD-209 / HERD-252) ─────────────────
+# The race-safe acquisition lives in _acquire_watcher_singleton (defined above the AGENT_WATCH_LIB
+# return so the unit test can drive it): it REFUSES when a LIVE watcher is already recorded in
+# HERD_WATCHER_LOCK (kill -0 on the recorded pid, then non-blocking flock/mkdir), and ADOPTS a
+# stale/absent lock. A LIVE-lock refusal is LOUD and NON-ZERO (HERD-252): stderr names the holder
+# pid (`herd-watch: already running (pid <N>) — refusing duplicate`) and we exit 1 immediately —
+# never hang, never soft-exit 0 that looks like a successful launch. Keyed by WORKSPACE_NAME
+# (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
+# (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
+# launcher too.
+_acquire_watcher_singleton || exit 1
+# The incoming generation owns the lock: any self-restart handoff window is over (HERD-266). Clearing
+# it HERE — after the acquire, in both the exec'd image and a cold launch — means the duplicate alarm
+# is suppressed for exactly the exec, never a tick longer. A crashed exec that never reached this line
+# leaves a marker that ages out on its own (WATCHER_HANDOFF_TTL).
+watcher_handoff_clear
+# ───────────────────────────────────────────────────────────────────────────────────────────────
+
+# ── Spawn-queue dependency ordering (HERD-94) ────────────────────────────────────────────────────
+# _spawn_dep_merged <after> — is a spawn intent's after=<slug|pr#> dependency MERGED? Returns 0 (met)
+# for an EMPTY dependency (an intent with no after= is trivially releasable — the byte-identical path).
+# Otherwise consult the SAME source _startup_reap_sweep trusts: the reap ledger $STATE, whose rows are
+# "<epoch> <pr#> <slug> [ref]". A numeric dependency matches the PR column ($2); a slug matches the
+# slug column ($3). If the ledger has no record (e.g. a collaborator/main-checkout merge this watcher
+# never ledgered), FALL BACK to exactly one gh check: a PR number by itself, a slug by its feat/<slug>
+# branch. Any non-MERGED / gh-unreachable result => not met (0/return 1) so the intent stays held —
+# a held intent is loud (the stalled row), never a silently-dropped one.
+_spawn_dep_merged() {
+  local _sdm_after="${1:-}"
+  [ -n "$_sdm_after" ] || return 0
+  if [ -s "$STATE" ]; then
+    if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
+      awk -v p="$_sdm_after" 'NF>=2 && $2==p{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    else
+      awk -v s="$_sdm_after" 'NF>=3 && $3==s{f=1} END{exit !f}' "$STATE" 2>/dev/null && return 0
+    fi
+  fi
+  # Fallback: one gh state read (the ledger is authoritative for THIS watcher's merges but blind to a
+  # merge performed elsewhere). Skipped in dry-run so a hermetic/observation run never hits the network.
+  [ -z "${DRYRUN:-}" ] || return 1
+  local _sdm_target
+  # A slug dependency resolves to its branch via the shared BRANCH_TEMPLATE helper (HERD-120), not a
+  # hardcoded feat/ prefix, so a project with custom branch naming still resolves the gh fallback. The
+  # ref is unknown here (we hold only the dep's slug); a {ref}-bearing template renders without it and
+  # a mismatch simply keeps the intent HELD (loud), never silently released — see the header note.
+  if printf '%s' "$_sdm_after" | grep -qE '^[0-9]+$'; then _sdm_target="$_sdm_after"; else _sdm_target="$(herd_branch_render "$_sdm_after")"; fi  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  [ "$(_gh_timeout spawn_dep_state pr view "$_sdm_target" --json state -q .state 2>/dev/null)" = "MERGED" ] && return 0
+  return 1
+}
+
+# _spawn_held_epoch <intent_id> — echo the first-held epoch recorded for this intent (empty if none).
+_spawn_held_epoch() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  awk -v id="$1" '$1==id{e=$2} END{if(e)print e}' "$SPAWN_HELD_STATE" 2>/dev/null
+}
+
+# _spawn_mark_held <intent_id> <slug> <lane> <after> — record a hold the FIRST time only, journaling
+# spawn_held ONCE with the dependency named. Idempotent across ticks: a row already present (the intent
+# was held on a prior tick and released back to .req) is left untouched, so the stall TTL keeps accruing
+# from the original hold and spawn_held is never re-journaled tick-over-tick.
+_spawn_mark_held() {
+  local _smh_id="$1" _smh_slug="$2" _smh_lane="$3" _smh_after="$4"
+  [ -n "$(_spawn_held_epoch "$_smh_id")" ] && return 0
+  printf '%s %s %s %s %s\n' "$_smh_id" "$(date +%s)" "$_smh_slug" "$_smh_lane" "$_smh_after" >> "$SPAWN_HELD_STATE"
+  journal_append spawn_held slug "$_smh_slug" lane "$_smh_lane" after "$_smh_after"
+}
+
+# _spawn_clear_held <intent_id> — drop this intent's hold row (dependency met / spawned / skipped). A
+# no-op when no row exists, so calling it on an intent that was never held is harmless.
+_spawn_clear_held() {
+  [ -s "$SPAWN_HELD_STATE" ] || return 0
+  local _sch_tmp; _sch_tmp="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null)" || return 0
+  if awk -v id="$1" '$1!=id' "$SPAWN_HELD_STATE" > "$_sch_tmp" 2>/dev/null; then
+    mv -f "$_sch_tmp" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$_sch_tmp" 2>/dev/null
+  else
+    rm -f "$_sch_tmp" 2>/dev/null
+  fi
+}
+
+# ── Spawn-queue drain ────────────────────────────────────────────────────────────────────────────
+# _drain_spawn_queue — called once per tick to pop pending spawn intents from the durable queue
+# ($WORKTREES_DIR/spawn-queue/) and launch the matching builder lane. Concurrency cap mirrors the
+# lane advisory gate: REVIEW_CONCURRENCY + SPAWN_AHEAD total active builders. FEATS (the live
+# worktree roster) is computed earlier this tick, so active count is its length.
+#
+# DURABILITY CONTRACT (review gate, PR #151): an intent is consumed (`done`, rm) ONLY after its
+# lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
+# never see:
+#   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
+#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
+#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
+#     stops for this tick (siblings would also defer against the same gate);
+#   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
+#     is dropped LOUDLY (skip + journal), never silently.
+# Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
+# post-mortem can answer "why did nothing spawn?" from `herd log` alone.
+#
+# HERD-237 — the lane no longer runs in the tick's foreground. The contract above is UNCHANGED: the
+# lane's output and exit status are still captured and still decide the intent's fate, but that whole
+# observe-and-consume tail moved WITH the lane into `_drain_lane_worker`, which runs in a background
+# subshell (`_spawn_inflight_bg`). The tick fires it and moves on; a lane that takes 30 s to clone a
+# worktree no longer stalls merges, collections and limit-parks for every other PR. Until its worker
+# finishes, the intent stays CLAIMED (.req.mine) — so the drain is durable across a watcher death at
+# any instant, exactly as before.
+#
+# THE CLAIM MUST NOW OUTLIVE A TICK, so `spawn-step.sh next`'s five-minute stale reclaim can no longer
+# treat a surviving claim as proof of a dead watcher. The worker's first act is `spawn-step.sh own
+# <claim> $BASHPID`, and the reclaim skips any claim whose owner is alive. Without that, a lane slower
+# than five minutes has its intent re-served while it is still launching, its `done` becomes a no-op on
+# a moved path, and the next free tick spawns the same slug again. Every `done`/`release`/`skip` now
+# fails LOUD (exit 3 → a `spawn_claim_lost` journal line) when the claim it was handed has vanished,
+# so a lost claim can never be mistaken for a consumed one.
+#
+# ONE LANE AT A TIME, still. The foreground drain implicitly serialized lanes, and stopped the tick
+# outright on a saturation defer (`break`) so siblings would not defer against the same gate. Both
+# properties survive without blocking: at most ONE lane is launched per tick, and none at all while a
+# previous tick's lane is still in flight (`_lane_spawn_inflight`). A saturated gate therefore still
+# costs exactly one lane invocation per tick, never one per queued intent.
+#
+# What does NOT change is the SCAN. The loop still walks the queue to its budget every tick, so a
+# dependency hold is still recorded and journaled (spawn_held) on the tick it becomes visible — the
+# HERD-94 invariant that one stalled dependency never freezes the queue. A runnable intent that cannot
+# launch this tick (its slot is taken by a live lane) is simply RELEASED with the held ones and
+# re-claimed next tick, in the same FIFO order. Net effect: the queue drains one intent per tick
+# instead of N-in-one-blocking-tick — faster in wall-clock whenever a lane outlives the 4 s tick,
+# which is every real lane.
+#
+# DEPENDENCY ORDERING (HERD-94): an intent may carry an after=<slug|pr#> (the .after sidecar, surfaced
+# as the 4th claim line). While that dependency is NOT yet MERGED the intent is HELD: it stays claimed
+# (.req.mine) for THIS tick so `next` skips past it to younger, independent intents — one stalled
+# dependency never freezes the whole queue — and every held intent is RELEASED back to .req at the end
+# of the tick to be re-checked next time. The hold is journaled spawn_held ONCE (via $SPAWN_HELD_STATE)
+# and surfaces on the console (build_spawn_holds), going LOUD (stalled) past DEP_STALE_TTL. When the
+# dependency finally merges the intent spawns in the same FIFO order it would have without after=, and
+# spawn_released is journaled. Intents with NO after= are byte-identical to the pre-HERD-94 path.
+#
+# The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
+# multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
+#
+# Fail-soft: a malformed intent is skipped with a logged warning — never crashes the watcher loop.
+# Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
+_drain_lane_worker() {
+  local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
+  local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
+  [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
+  # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
+  # see `spawn-step.sh own` at the launch site. $BASHPID would let the worker do it itself, but bash
+  # 3.2 — still macOS's /bin/bash — has no BASHPID, and the parent already holds the pid as `$!`.)
+  # Re-export the threaded tracker ref (HERD-64) as HERD_ITEM_REF so the lane carries it into the
+  # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
+  # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
+  # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
+  _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
+  # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
+  # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
+    # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
+    # a later tick. The drain already stopped for this tick when it launched this worker.
+    if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
+      journal_append spawn_deferred slug "$_dlw_slug" lane "$_dlw_lane"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action release
+    fi
+  elif [ "$_dlw_rc" -ne 0 ]; then
+    # Hard failure: no builder exists. Drop the intent LOUDLY — skip logs a warning and the journal
+    # records why, so a lost spawn is always visible in `herd log`.
+    if bash "$HERE/spawn-step.sh" skip "$_dlw_claimed" "lane exited $_dlw_rc" >/dev/null 2>&1; then
+      journal_append spawn_skipped slug "$_dlw_slug" lane "$_dlw_lane" reason "lane exited $_dlw_rc"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action skip
+    fi
+  else
+    # Spawned: only now is the intent consumed.
+    if bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1; then
+      journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
+    else
+      journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action done
+    fi
+  fi
+  return 0
+}
+
+_drain_spawn_queue() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  # Sweep dead spawn markers on EVERY tick — ABOVE the queue-empty fast exits below. A project with an
+  # idle spawn queue still dispatches resolvers, and a `.spawn-inflight-resolve-*` corpse left here
+  # keeps exempting its (possibly recycled) pid from bin/herd's duplicate-watcher reap.
+  _spawn_inflight_sweep
+  local _dsq_q="$TREES/spawn-queue"
+  [ -d "$_dsq_q" ] || return 0
+  ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+  # This tick's ONE launch slot. Taken already when a lane launched by an earlier tick is still
+  # running (its intent is claimed, its outcome not yet observed) — the pre-HERD-237 foreground drain
+  # could not have started a second lane there either.
+  local _dsq_can_launch=1
+  _lane_spawn_inflight && _dsq_can_launch=0
+
+  # Daily-budget governance (HERD-95): PAUSE draining when today's recorded spend has EXCEEDED
+  # BUDGET_DAILY. The lanes refuse a spawn individually too, but pausing the drain here stops the
+  # watcher from feeding the queue into those refusals every tick and burning claim churn. The pause is
+  # journaled ONCE per continuous over-budget stretch ($_BUDGET_DRAIN_PAUSED) and cleared when spend
+  # falls back under the ceiling. DORMANT when BUDGET_DAILY is empty (budget_daily_exceeded returns 1
+  # with no work) → byte-identical to before. HERD_FORCE_SPAWN=1 on the watcher overrides the pause.
+  if [ "${HERD_FORCE_SPAWN:-}" != "1" ]; then
+    local _dsq_over
+    if _dsq_over="$(budget_daily_exceeded)"; then
+      if [ "$_BUDGET_DRAIN_PAUSED" != "1" ]; then
+        journal_append budget_drain_paused spent "${_dsq_over%% *}" budget "${_dsq_over##* }"
+        _BUDGET_DRAIN_PAUSED=1
+      fi
+      return 0
+    fi
+  fi
+  if [ "$_BUDGET_DRAIN_PAUSED" = "1" ]; then
+    journal_append budget_drain_resumed
+    _BUDGET_DRAIN_PAUSED=""
+  fi
+
+  # Budget = pipeline cap minus currently active worktrees (FEATS already computed this tick).
+  # HERD-159: sanitize via herd_numeric (or a pure case fallback when the helper is unavailable —
+  # hermetic tests extract this function alone). Raw ${REVIEW_CONCURRENCY}+${SPAWN_AHEAD}
+  # arithmetic aborts on a non-numeric typo and freezes the spawn queue.
+  local _dsq_cap _dsq_budget _dsq_rc _dsq_sa
+  if type herd_numeric >/dev/null 2>&1; then
+    _dsq_rc="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+    _dsq_sa="$(herd_numeric SPAWN_AHEAD 1)" || true
+  else
+    _dsq_rc="${REVIEW_CONCURRENCY:-2}"; case "$_dsq_rc" in ''|*[!0-9]*) _dsq_rc=2 ;; esac
+    _dsq_sa="${SPAWN_AHEAD:-1}";       case "$_dsq_sa" in ''|*[!0-9]*) _dsq_sa=1 ;; esac
+  fi
+  _dsq_cap=$(( _dsq_rc + _dsq_sa ))
+  _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
+  [ "$_dsq_budget" -le 0 ] && return 0
+
+  local _dsq_n=0 _dsq_held=()
+  while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
+    # Claim one intent via spawn-step.sh (atomic rename, stale-reclaim, immediate return).
+    # Payload lines: slug, lane, tracker ref (HERD-64; empty for an untracked/older intent), after
+    # dependency (HERD-94; empty for none), then the task as EVERYTHING after them. The ref AND after
+    # lines are ALWAYS present so this positional read stays fixed.
+    local _dsq_line1="" _dsq_slug="" _dsq_lane="" _dsq_ref="" _dsq_after="" _dsq_task=""
+    {
+      IFS= read -r _dsq_line1
+      IFS= read -r _dsq_slug
+      IFS= read -r _dsq_lane
+      IFS= read -r _dsq_ref
+      IFS= read -r _dsq_after
+      _dsq_task="$(cat)"
+    } < <(bash "$HERE/spawn-step.sh" next 2>/dev/null || true)
+
+    case "${_dsq_line1:-}" in
+      EMPTY|'') break ;;
+      CLAIMED*)
+        local _dsq_claimed="${_dsq_line1#CLAIMED }"
+        # Fail-soft: validate slug and lane before launching.
+        if [ -z "$_dsq_slug" ] || [ -z "$_dsq_lane" ]; then
+          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "empty slug or lane" >/dev/null 2>&1 || true
+          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "empty slug or lane"
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
+        case "$_dsq_lane" in
+          quick|feature) ;;
+          *)
+            bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "unknown lane '$_dsq_lane'" >/dev/null 2>&1 || true
+            journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" reason "unknown lane"
+            _dsq_n=$(( _dsq_n + 1 )); continue ;;
+        esac
+        # HERD-94 dependency hold: an intent with after=<slug|pr#> waits until that dependency shows
+        # MERGED. Unmet → DEFER: keep the claim (so this tick's later `next` calls skip it) and stash it
+        # for an end-of-tick release; record + journal the hold ONCE. Crucially we do NOT spend budget
+        # (_dsq_n unchanged) or `break`, so independent younger intents keep draining past a held one.
+        local _dsq_id; _dsq_id="$(basename "${_dsq_claimed%.req.mine}")"
+        if [ -n "$_dsq_after" ] && ! _spawn_dep_merged "$_dsq_after"; then
+          _spawn_mark_held "$_dsq_id" "$_dsq_slug" "$_dsq_lane" "$_dsq_after"
+          _dsq_held+=("$_dsq_claimed")
+          continue
+        fi
+        # The launch slot is already spent this tick (a lane is running). Release this intent with the
+        # dependency-held ones and re-claim it next tick — FIFO order is preserved by the INTENT_ID
+        # filenames. It still SPENDS budget, so a long queue is walked at most _dsq_budget deep per
+        # tick, exactly as the foreground drain walked it. Checked ABOVE the spawn_released announce
+        # so a release is only ever announced on the tick that acts on it.
+        if [ "$_dsq_can_launch" != "1" ]; then
+          _dsq_held+=("$_dsq_claimed")
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
+        # Dependency met (or none). If this intent had been held on a prior tick, announce the release
+        # (spawn_released, dependency named) and clear its hold row before it spawns below.
+        if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
+          journal_append spawn_released slug "$_dsq_slug" lane "$_dsq_lane" after "$_dsq_after"
+          _spawn_clear_held "$_dsq_id"
+        fi
+        # Launch the lane in the BACKGROUND (HERD-237). The worker observes the lane's output + exit
+        # status and only then consumes/releases the intent, so the PR #151 durability contract is
+        # unchanged; the tick just no longer waits for it. The marker keeps the worker out of
+        # `_list_project_watchers` and holds the launch slot shut until the lane lands.
+        _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
+        _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "${_dsq_id}-${_SPAWN_DISPATCH_SEQ}")" \
+          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
+        # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
+        # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
+        # dead watcher leaves one behind — true while the lane ran in this loop's foreground, false now
+        # that the worker holds the claim for the lane's whole duration. Recording the worker's pid
+        # makes that reclaim liveness-aware, so a lane slower than five minutes (a slow clone, a wedged
+        # driver call — the exact fault this design exists to tolerate) is never re-served and launched
+        # a second time underneath us. If the worker already finished, `own` refuses (exit 3) rather
+        # than leave a sidecar for a consumed intent; the 5-minute clock makes that window unreachable
+        # by any reclaim anyway.
+        bash "$HERE/spawn-step.sh" own "$_dsq_claimed" "$_SPAWN_INFLIGHT_BG_PID" >/dev/null 2>&1 || true
+        _dsq_can_launch=0
+        _dsq_n=$(( _dsq_n + 1 ))
+        ;;
+    esac
+  done
+  # Release every dependency-held intent back to .req for a later tick. They were kept claimed only so
+  # `next` skipped them this tick; releasing preserves the .after (+ .ref) sidecar so the hold — and its
+  # accruing stall TTL — survives. Order is preserved: they re-enter under their original INTENT_ID
+  # filenames, which sort oldest-first, so FIFO among releasable intents holds.
+  if [ "${#_dsq_held[@]}" -gt 0 ]; then
+    local _dsq_h
+    for _dsq_h in "${_dsq_held[@]}"; do
+      bash "$HERE/spawn-step.sh" release "$_dsq_h" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+_ORPHAN_SWEEP_TICK=0
+_ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
+_TRACKER_SWEEP_TICK=0
+_TRACKER_SWEEP_INTERVAL=45  # tracker-state self-heal every ~3 min (45 × 4 s sleep) — cheap + advisory
+_PMS_SWEEP_INTERVAL=45      # post-merge hook reconcile (HERD-232) every ~3 min — one `gh pr list`, then
+                            # a run-once ledger hit per PR. Shares the tracker sweep's cadence class:
+                            # the drift it catches (a foreign/crashed merge's unrun hooks) is a rare
+                            # merge-tail condition, not a per-tick one
+_PMS_SWEEP_TICK=$_PMS_SWEEP_INTERVAL  # PRIMED so the FIRST tick sweeps, then every interval. The
+                            # grounding incident is a watcher that died mid-do_merge: the restart that
+                            # follows is exactly when the stranded hooks must be replayed, so a fresh
+                            # process must not idle 3 min before noticing. (This is the cadence sibling
+                            # of the one-shot _startup_reap_sweep above, which covers worktrees only.)
+_ENGINE_TICK=0
+_ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
+                            # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
+                            # further rate-limited by engine-version.sh's cooldown (HERD-179)
+_INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
+                            # reads (gh pr comments + tracker) never ride the 4 s repaint
+_INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
+
+# One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
+# (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
+# stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
+_startup_reap_sweep
+
+# One-shot at STARTUP: this process just loaded the engine code that is on disk NOW, so any pending
+# "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
+# restart that got us here. Drop it, or the row would outlive the condition it warns about.
+rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
+
+# …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
+# to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved
+# came back with the new process. Both freshness rows are now derived from observed state at startup.
+# (The tick loop re-derives it before every render too; this one-shot is what makes the FIRST paint of a
+# new process honest, since nothing else has run yet.)
+_main_fresh_recheck
+
+# One-shot at STARTUP: reconcile the reviewer dispatch registry (HERD-113). After a herdr death+reload
+# or a watcher restart, a reviewer pane can outlive its poller: this retires such orphaned/completed
+# panes and clears their markers so a re-dispatch is clean and never duplicates a still-live reviewer.
+# Byte-inert when there are no reviewer rows (the common startup) — no journal line, no pane touched.
+_sweep_reviewer_registry
+
+# One-shot at STARTUP: proactively close any STALE resolve·<slug> conflict-resolver tab (HERD-54) —
+# a resolver that died/finished for a slug whose PR is no longer CONFLICTING. Prime AGENTS_JSON first
+# so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
+AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
+_sweep_stale_resolve_tabs
+
+while true; do
+  _tick_render_reconcile
   sleep 4
 done

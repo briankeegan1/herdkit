@@ -269,5 +269,199 @@ class TestStateMachineGuard(unittest.TestCase):
         self.assertTrue([o for o in objs if o["event"] == "illegal_transition"])
 
 
+class TestScenarioFamilies(TempJournalCase):
+    """The staged sub-pipelines the shadow engine also models (HERD-304, P3 parity burn-down):
+    review PANELS, pipeline STEPS, and the herd/gates STATUS post — all fixture-driven, all no-ops
+    when their lists are empty (byte-identical-off)."""
+
+    def _run(self, **kw):
+        w = SR.ShadowWatcher(config={"MERGE_POLICY": "auto"}, journal=ShadowJournal(self.jpath), **kw)
+        w.run([])
+        return events(self.jpath)
+
+    def _family(self, ev, names):
+        return [o for o in ev if o["event"] in names]
+
+    def test_off_is_byte_identical(self):
+        # No panels/steps/gate lists ⇒ the stream is exactly the candidate-only tick (the invariant
+        # every pre-existing caller relies on): only the shadow tick frame, nothing else.
+        ev = self._run()
+        self.assertEqual([o["event"] for o in ev], ["shadow_tick_start", "shadow_tick_end"])
+
+    def test_panel_emission_order_and_provenance(self):
+        panel = {"pr": "77a", "slug": "sim-panel-a", "sha": "", "policy": "any-block", "keep": 5,
+                 "refs": "bare-model stub:stub-model",
+                 "panelists": [
+                     {"panelist": 0, "ref": "bare-model", "driver": "herdr-claude",
+                      "model": "bare-model", "verdict": "PASS", "reason": "REVIEW: PASS"},
+                     {"panelist": 1, "ref": "stub:stub-model", "driver": "stub",
+                      "model": "stub-model", "verdict": "PASS", "reason": "REVIEW: PASS"}]}
+        ev = self._run(panels=[panel])
+        seq = [o["event"] for o in ev if o["event"].startswith("review_")]
+        self.assertEqual(seq, ["review_log_retained", "review_pin_soft",
+                               "review_panelist_verdict", "review_panelist_verdict",
+                               "review_panel_folded"])
+        v0 = [o for o in ev if o["event"] == "review_panelist_verdict"][0]
+        self.assertEqual((v0["ref"], v0["driver"], v0["model"], v0["verdict"]),
+                         ("bare-model", "herdr-claude", "bare-model", "PASS"))
+        fold = [o for o in ev if o["event"] == "review_panel_folded"][0]
+        self.assertEqual(fold["policy"], "any-block")
+        self.assertEqual(fold["panelists"], 2)
+        self.assertEqual(fold["verdict"], "REVIEW: PASS")
+
+    def test_panel_any_block_folds_block_on_a_lone_dissent(self):
+        panel = {"pr": "77b", "slug": "b", "policy": "any-block",
+                 "panelists": [{"panelist": 0, "verdict": "PASS", "reason": "REVIEW: PASS"},
+                               {"panelist": 1, "verdict": "BLOCK",
+                                "reason": "REVIEW: BLOCK — rule: off-by-one"}]}
+        ev = self._run(panels=[panel])
+        fold = [o for o in ev if o["event"] == "review_panel_folded"][0]
+        self.assertEqual(fold["verdict"], "REVIEW: BLOCK — rule: off-by-one")
+
+    def test_panel_policy_is_load_bearing_all_pass_vs_any_block(self):
+        # The SAME PASS+INFRA panelists fold to PASS under any-block but INFRA under all-pass — the
+        # "a masked gap can't be papered over" semantics (herd-review.sh §305; scenario leg C vs D).
+        panelists = [{"panelist": 0, "verdict": "PASS", "reason": "REVIEW: PASS"},
+                     {"panelist": 1, "verdict": "INFRA", "reason": "driver binary not found"}]
+        ev_any = self._run(panels=[{"pr": "77d", "slug": "d", "policy": "any-block",
+                                    "panelists": panelists}])
+        self.assertTrue(self._family(ev_any, {"review_panel_folded"}))
+        self.assertFalse(self._family(ev_any, {"infra_event"}))
+
+        self.setUp()  # fresh journal
+        ev_all = self._run(panels=[{"pr": "77c", "slug": "c", "policy": "all-pass",
+                                    "panelists": panelists}])
+        self.assertFalse(self._family(ev_all, {"review_panel_folded"}))
+        infra = self._family(ev_all, {"infra_event"})
+        self.assertEqual(len(infra), 1)
+        self.assertEqual(infra[0]["component"], "herd-review")
+        self.assertEqual(infra[0]["exit_code"], 2)
+
+    def test_panel_zero_panelists_never_folds(self):
+        # A single-reviewer dispatch (no fan-out) journals log/pin only — never a spurious infra fold.
+        ev = self._run(panels=[{"pr": "77e", "slug": "e", "policy": "any-block", "panelists": []}])
+        self.assertEqual([o["event"] for o in ev if o["event"].startswith("review_")],
+                         ["review_log_retained", "review_pin_soft"])
+        self.assertFalse(self._family(ev, {"infra_event"}))
+
+    def test_main_health_emission_dispatched_result_and_lone(self):
+        # A dispatched+green pair, a dispatched+red pair (failed/since), and a lone result (no dispatch).
+        mh = [{"pr": "901", "sha": "s901", "result": "green", "dispatched": True, "provenance": "merge"},
+              {"pr": "902", "sha": "s902", "result": "red", "dispatched": True,
+               "failed": "app/x.test.sh", "since": 902},
+              {"pr": "999", "sha": "s999", "result": "green"}]
+        ev = self._run(main_healths=mh)
+        seq = [(o["event"], o.get("result")) for o in ev if o["event"] == "main_health"]
+        self.assertEqual(seq, [("main_health", "dispatched"), ("main_health", "green"),
+                               ("main_health", "dispatched"), ("main_health", "red"),
+                               ("main_health", "green")])  # 999 has only the result row, no dispatch
+        disp = [o for o in ev if o["event"] == "main_health" and o.get("result") == "dispatched"][0]
+        self.assertEqual(disp["provenance"], "merge")
+        self.assertIn("log_path", disp)   # a volatile path the parity oracle canonicalizes to <PATH>
+        red = [o for o in ev if o["event"] == "main_health" and o.get("result") == "red"][0]
+        self.assertEqual((red["failed"], red["since"]), ("app/x.test.sh", 902))  # since coerces to int
+
+    def test_push_hold_lifecycle_emission(self):
+        ph = [{"slug": "pg-demo", "sha": "s1", "approved": True, "resumed": True},
+              {"slug": "pg-stale", "sha": "s2", "approved": True}]   # a hold that never resumed
+        ev = self._run(push_holds=ph)
+        seq = [o["event"] for o in ev if o["event"].startswith("push_hold_")]
+        self.assertEqual(seq, ["push_hold_awaiting", "push_hold_approved", "push_hold_resumed",
+                               "push_hold_awaiting", "push_hold_approved"])
+        aw = [o for o in ev if o["event"] == "push_hold_awaiting"][0]
+        self.assertEqual(aw["slug"], "pg-demo")
+        self.assertIn("dir", aw)          # a volatile worktree path the oracle canonicalizes to <PATH>
+
+    def test_non_candidate_families_are_never_shadow_private(self):
+        # main_health / push_hold_* are REAL engine families — their names must NOT be namespaced
+        # under shadow_, or the parity oracle's leg-1 filter would wrongly drop them.
+        ev = self._run(main_healths=[{"pr": "9", "sha": "s", "result": "green"}],
+                       push_holds=[{"slug": "pg", "sha": "s", "approved": True}])
+        for o in ev:
+            if o["event"] in ("main_health", "push_hold_awaiting", "push_hold_approved"):
+                self.assertFalse(o["event"].startswith("shadow_"))
+
+    def test_non_candidate_family_emission_order(self):
+        # The sim's path-sorted leg order: main_health, then push_hold, then panels, steps, gate_status.
+        ev = self._run(main_healths=[{"pr": "9", "sha": "s", "result": "green"}],
+                       push_holds=[{"slug": "pg", "sha": "s", "approved": True}],
+                       panels=[{"pr": "77e", "slug": "e", "panelists": []}],
+                       steps=[{"slug": "d", "sha": "s", "rows": [{"name": "n", "outcome": "pass"}]}],
+                       gate_statuses=[{"pr": 1, "sha": "y"}])
+        fams = [o["event"] for o in ev if not o["event"].startswith("shadow_")]
+        self.assertLess(fams.index("main_health"), fams.index("push_hold_awaiting"))
+        self.assertLess(fams.index("push_hold_awaiting"), fams.index("review_log_retained"))
+        self.assertLess(fams.index("review_log_retained"), fams.index("step_run"))
+        self.assertLess(fams.index("step_run"), fams.index("gate_status"))
+
+    def test_steps_held_count_replays_repeated_holds(self):
+        # A step held across N watcher re-ticks journals N held markers (steps.sh re-runs pre-merge each
+        # tick); the shadow replays exactly held_count of them, between awaiting and approved.
+        run = {"slug": "demo-two", "sha": "s",
+               "rows": [{"name": "check-b", "at": "pre-merge", "kind": "shell",
+                         "hold": "approve", "outcome": "pass", "held_count": 2}]}
+        ev = self._run(steps=[run])
+        seq = [o["event"] for o in ev if o["event"].startswith("step_")]
+        self.assertEqual(seq, ["step_run", "step_hold_awaiting", "step_run", "step_run",
+                               "step_hold_approved", "step_hold_released"])
+        held = [o for o in ev if o["event"] == "step_run" and o.get("outcome") == "held"]
+        self.assertEqual(len(held), 2)
+
+    def test_steps_hold_lifecycle_order(self):
+        run = {"slug": "demo", "sha": "s", "dir": "/tmp/st",
+               "rows": [{"name": "gate-lint", "at": "post-build", "kind": "shell",
+                         "on_fail": "block", "hold": "none", "outcome": "pass"},
+                        {"name": "peer-review", "at": "post-build", "kind": "shell",
+                         "on_fail": "block", "hold": "approve", "outcome": "pass"},
+                        {"name": "doc-pass", "at": "post-build", "kind": "skill",
+                         "on_fail": "warn", "hold": "none", "outcome": "pass"}]}
+        ev = self._run(steps=[run])
+        seq = [(o["event"], o.get("name") or o.get("step"), o.get("outcome"))
+               for o in ev if o["event"].startswith("step_")]
+        self.assertEqual(seq, [
+            ("step_run", "gate-lint", "pass"),
+            ("step_run", "peer-review", "pass"),
+            ("step_hold_awaiting", "peer-review", None),
+            ("step_run", "peer-review", "held"),
+            ("step_hold_approved", "peer-review", None),
+            ("step_hold_released", "peer-review", None),
+            ("step_run", "doc-pass", "pass"),
+        ])
+        docp = [o for o in ev if o["event"] == "step_run" and o["name"] == "doc-pass"][0]
+        self.assertEqual(docp["kind"], "skill")  # a skill step keeps its kind
+
+    def test_steps_on_fail_block_halts_the_lane(self):
+        run = {"slug": "demo-block", "sha": "s",
+               "rows": [{"name": "will-fail", "at": "post-build", "kind": "shell",
+                         "on_fail": "block", "hold": "none", "outcome": "fail", "rc": 1},
+                        {"name": "must-not-run", "at": "post-build", "kind": "shell",
+                         "on_fail": "block", "hold": "none", "outcome": "pass"}]}
+        ev = self._run(steps=[run])
+        runs = [o for o in ev if o["event"] == "step_run"]
+        self.assertEqual(len(runs), 1)             # the second row never runs
+        self.assertEqual((runs[0]["name"], runs[0]["outcome"], runs[0]["rc"]), ("will-fail", "fail", 1))
+        self.assertFalse([o for o in ev if o.get("name") == "must-not-run"])
+
+    def test_gate_status_shape(self):
+        ev = self._run(gate_statuses=[{"pr": 343, "sha": "simsha", "state": "success",
+                                       "context": "herd/gates"}])
+        g = [o for o in ev if o["event"] == "gate_status"]
+        self.assertEqual(len(g), 1)
+        self.assertEqual((g[0]["pr"], g[0]["sha"], g[0]["state"], g[0]["context"]),
+                         (343, "simsha", "success", "herd/gates"))  # pr coerces to a JSON number
+
+    def test_family_field_order_matches_journal_sh(self):
+        # Every emitted family line leads with ts+event and coerces ints — the journal.sh contract the
+        # bash oracle test (test-py-shadow-runtime.sh §2) enforces on the shared encoder.
+        run = {"slug": "s", "sha": "x",
+               "rows": [{"name": "n", "at": "pre-merge", "kind": "shell", "hold": "approve",
+                         "outcome": "pass"}]}
+        ev = self._run(steps=[run], gate_statuses=[{"pr": 1, "sha": "y"}])
+        for o in ev:
+            self.assertEqual(list(o.keys())[:2], ["ts", "event"])
+        awaiting = [o for o in ev if o["event"] == "step_hold_awaiting"][0]
+        self.assertEqual(list(awaiting.keys()), ["ts", "event", "slug", "step", "at", "sha", "dir"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

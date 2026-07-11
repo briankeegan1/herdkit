@@ -155,7 +155,7 @@ tick() {
   PATH="$BIN:$PATH" \
   WATCH_SH="$WATCH" SIM_MAIN="$scn/main" SIM_TREES="$scn/trees" SIM_SLUG="$slug" \
   GH_DIR="$scn/gh" HERDR_TABS="$scn/tabs.json" HERD_CONFIG_FILE="$scn/no-config" \
-  CRASH_AFTER="$crash" HERD_RETIRE_STUCK_TICKS=3 \
+  CRASH_AFTER="$crash" HERD_RETIRE_STUCK_TICKS=3 HERD_DISPOSABLE_WORKSPACE=1 \
     bash "$ART/tick.sh" 2>/dev/null
 }
 
