@@ -4985,7 +4985,11 @@ refresh_codemap() {
     _rc_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  _rc_j result committed pushed no
+  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+  # never drifts ahead of origin. The map is regenerable — not committing is byte-safe. A stranded
+  # commit here would permanently diverge the seat and make herd update die on ff-only forever.
+  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+  _rc_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5048,7 +5052,11 @@ refresh_symbol_index() {
     _rs_j result committed pushed yes-after-rebase; return 0
   fi
   git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  _rs_j result committed pushed no
+  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+  # never drifts ahead of origin. The index is regenerable — not committing is byte-safe. A
+  # stranded commit here would permanently diverge the seat and make herd update die forever.
+  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+  _rs_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5464,9 +5472,14 @@ reconcile_main_freshness() {
     journal_append main_heal ahead "$_mf_ahead" behind "$_mf_behind" result pushed restart "$_mf_restart"
     _main_fresh_clear
   else
-    # The push lost a race (or the remote refused): hold, and retry from scratch next tick — the
-    # divergence is still generated-only, so the next reconcile re-rebases and re-pushes.
-    _main_fresh_hold push-failed "$_mf_behind" "$_mf_ahead"
+    # Push refused (protected branch or an unresolvable race). The local commits are only
+    # regenerable maps — stranding them breaks herd update forever (ff-only dies). Drop them with a
+    # hard reset to the remote ref. The maps are deterministic and regenerable; losing them costs
+    # nothing and makes the seat clean again on this tick.
+    git -C "$MAIN" reset --hard "${_mf_up}" >/dev/null 2>&1 || true
+    journal_append main_freshness result error reason push-rejected-reset \
+      ahead "$_mf_ahead" behind "$_mf_behind"
+    _main_fresh_clear
   fi
   return 0
 }
