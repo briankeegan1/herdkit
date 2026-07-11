@@ -147,6 +147,19 @@ class TestGateOutcomes(LiveCase):
         self.assertEqual(out, "OBSERVE")
         self.assertFalse([o for o in ev if o["event"] == "merge"])
 
+    def test_refix_bounce_carries_contract_fields(self):
+        # HERD-321: the authoritative live writer must emit the full contract §3.4 refix_bounce shape
+        # for BOTH rails (pr, sha, slug, round, agent_status_before, rule, location) — matching the
+        # shadow twin so a shadow<->live parity diff stays clean.
+        for rule, kw in (("healthcheck", dict(health="CODEERROR")),
+                         ("review", dict(review="BLOCK", health="CLEAN"))):
+            _, ev = self._out(**kw)
+            # ev reads the shared per-test journal (setUp runs once), so filter by rail.
+            rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == rule]
+            self.assertEqual(len(rb), 1, rule)
+            for k in ("pr", "sha", "slug", "round", "agent_status_before", "rule", "location"):
+                self.assertIn(k, rb[0], "%s missing %s" % (rule, k))
+
 
 class TestReapAndActuation(LiveCase):
     def test_merge_reaps(self):
@@ -184,6 +197,41 @@ class TestJournalShapes(LiveCase):
         self.assertEqual(m["pr"], 1)          # integer coercion (journal.sh parity)
         start = [o for o in ev if o["event"] == "live_tick_start"][0]
         self.assertEqual(start["impl"], "python")
+
+
+class TestReviewDispatchShape(LiveCase):
+    """HERD-321: the real _dispatch_review path (bypassed by FixtureGates) must emit review_dispatched
+    with the full contract §3.4 shape (pr, sha, pid, model, log_path, pin). Hermetic: a fresh temp
+    state dir forces a dispatch and subprocess.Popen is stubbed, so no reviewer is ever launched."""
+
+    def test_review_dispatched_carries_contract_fields(self):
+        class _Proc:
+            pid = 4242
+
+        class _FakeSub:
+            DEVNULL = LR.subprocess.DEVNULL
+
+            def Popen(self, *a, **k):
+                return _Proc()
+
+        state = LiveState(state_dir=self.tmp)          # real (empty) state dir -> no cached verdict/marker
+        journal = LiveJournal(self.jpath)
+        gates = LiveGates("/nonexistent-home", state, journal)
+        orig = LR.subprocess
+        LR.subprocess = _FakeSub()
+        os.environ["MODEL_REVIEW"] = "opus-x"
+        try:
+            v = gates.review(LiveCandidate(7, "deadbeef", slug="feat-x"))
+        finally:
+            LR.subprocess = orig
+            os.environ.pop("MODEL_REVIEW", None)
+        self.assertEqual(v, WAIT)                       # dispatched -> WAIT
+        rd = [o for o in events(self.jpath) if o["event"] == "review_dispatched"]
+        self.assertEqual(len(rd), 1)
+        for k in ("pr", "sha", "pid", "model", "log_path", "pin"):
+            self.assertIn(k, rd[0])
+        self.assertEqual(rd[0]["model"], "opus-x")      # bash env-fallback chain
+        self.assertTrue(rd[0]["log_path"])              # the reviewer's result-file path, non-empty
 
 
 class TestVerdictParser(unittest.TestCase):
