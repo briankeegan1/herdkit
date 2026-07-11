@@ -219,6 +219,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
 - `HEALTH_INFLIGHT_TIMEOUT` → `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
+- `HEALTH_PANE` → `agent-watch.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
 - `HERD_BRAND` → `herd-preflight.sh`
 - `HERD_DRIVER` → `bin/herd`, `context-guard.sh`, `driver.sh`, `herd-preflight.sh`
@@ -261,6 +262,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
 - `NATIVE_BURST` → `burst.sh`
 - `OPERATOR_INBOX` → `agent-watch.sh`
+- `ORPHAN_PR_ROWS` → `agent-watch.sh`
 - `OSS_TRIAGE` → `bin/herd`, `oss-triage.sh`
 - `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
@@ -293,6 +295,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `STALE_BASE_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`
+- `STORE_BACKEND` → —
 - `SWEEP_AUTO` → `bin/herd`, `sweep.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
 - `TOKEN_MODE` → `bin/herd`
