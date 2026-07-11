@@ -2328,7 +2328,7 @@ _lane_lifecycle_retire() {
 # pre-HERD-268 sequence, fork-for-fork.
 _spawn_inflight_bg() {
   local _sib_marker="$1"; shift
-  ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true; _lane_lifecycle_retire "$_sib_marker" completed ) &
+  ( "$@"; rm -f "$_sib_marker" 2>/dev/null || true; _lane_lifecycle_retire "$_sib_marker" completed ) 9>&- &
   _SPAWN_INFLIGHT_BG_PID="$!"
   _marker_write "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
   _lane_lifecycle_spawn "$_sib_marker" "$_SPAWN_INFLIGHT_BG_PID"
@@ -11490,11 +11490,29 @@ _acquire_watcher_singleton() {
       _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
       if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
         _watcher_singleton_refuse_msg "$_wl_rec"
-      else
-        _watcher_singleton_refuse_msg ""
+        return 1
       fi
-      return 1
+      # HERD-344: recorded pid is dead but flock is held by an orphaned gate worker that inherited
+      # fd 9 before it was marked close-on-exec. Adopt by re-keying to a fresh inode: close our
+      # handle on the old inode, unlink it so a new open creates an independent inode whose lock
+      # state is clean, then re-acquire. The orphan retains its flock on the now-unlinked inode
+      # and eventually releases it on exit — harmless once we hold the canonical path's lock.
+      exec 9>&-
+      rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+      exec 9>>"$HERD_WATCHER_LOCK"
+      if ! flock -n 9; then
+        _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+        _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
+        if [ -n "$_wl_rec" ] && kill -0 "$_wl_rec" 2>/dev/null; then
+          _watcher_singleton_refuse_msg "$_wl_rec"
+        else
+          _watcher_singleton_refuse_msg ""
+        fi
+        return 1
+      fi
     fi
+    # HERD-344: mark close-on-exec so no child gate worker can inherit the singleton lock fd.
+    { python3 -c 'import fcntl,os; fcntl.fcntl(9, fcntl.F_SETFD, fcntl.FD_CLOEXEC)'; } 2>/dev/null || true
     printf '%s\n' "$$" >"$HERD_WATCHER_LOCK"   # informational PID for diagnostics
     return 0
   fi
