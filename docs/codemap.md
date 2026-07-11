@@ -208,6 +208,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DOCTOR_STARTUP_HINT` → `bin/herd`, `herd-preflight.sh`
 - `DRAINER_HEARTBEAT_TIMEOUT` → `lifecycle.sh`, `research.sh`, `scribe.sh`
 - `ENGINE_AUTOUPDATE` → `engine-version.sh`
+- `ENGINE_IMPL` → `engine-version.sh`
 - `ENGINE_MIN` → `bin/herd`, `agent-watch.sh`, `engine-version.sh`
 - `ENGINE_SEAT_RECONCILE` → `agent-watch.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
