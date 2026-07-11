@@ -237,11 +237,12 @@ await_converged() {
   local _scn="$1" _slug="$2" _tries=20 _i=0 _rep
   while :; do
     _rep="$(tick "$_scn" "$_slug" none)"
-    if { [ -z "$(printf '%s' "$_rep" | sed -n 's/^LEFT //p')" ] && [ -z "$(residue "$_scn" "$_slug")" ]; } \
-       || [ "$_i" -ge "$_tries" ]; then
-      printf '%s' "$_rep"; return 0
+    if [ -z "$(printf '%s' "$_rep" | sed -n 's/^LEFT //p')" ] && [ -z "$(residue "$_scn" "$_slug")" ]; then
+      printf '%s' "$_rep"; return 0                       # converged
     fi
-    _i=$((_i+1)); sleep 0.1
+    _i=$((_i+1))
+    [ "$_i" -ge "$_tries" ] && { printf '%s' "$_rep"; return 1; }   # budget spent — explicit timeout
+    sleep 0.1
   done
 }
 

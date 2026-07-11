@@ -254,8 +254,10 @@ await_swept() {
   local _scn="$1" _slug="$2" _sha="$3" _tries=20 _i=0
   while :; do
     tick "$_scn" "$_slug" "$_sha" sweep >/dev/null
-    { [ -z "$(residue "$_scn" "$_slug")" ] || [ "$_i" -ge "$_tries" ]; } && return 0
-    _i=$((_i+1)); sleep 0.1
+    [ -z "$(residue "$_scn" "$_slug")" ] && return 0        # converged
+    _i=$((_i+1))
+    [ "$_i" -ge "$_tries" ] && return 1                     # budget spent — explicit timeout
+    sleep 0.1
   done
 }
 
