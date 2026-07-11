@@ -178,6 +178,38 @@ class BlockBridgeMatchesDecisions(unittest.TestCase):
         self.assertEqual(SM.transition(SM.STALE_HELD, SM.BASE_FRESH), SM.INTAKE)
 
 
+class StaleBounceIsAnImplicitSelfHold(unittest.TestCase):
+    """HERD-328 S1: an OPEN stale budget is an implicit self-hold awaiting ``base_fresh`` — there is
+    deliberately NO ``(STALE_HELD, refix_bounce)`` table edge, and a ``→INTAKE`` mapping would be
+    wrong (a stale bounce only wakes the builder to rebase; re-gating is deferred to ``base_fresh``).
+    The repro that surfaced the docstring lie is pinned here as the regression guard."""
+
+    def test_no_refix_bounce_edge_from_stale_held(self):
+        # NO →INTAKE (or any) mapping: the edge must stay absent from the table.
+        self.assertFalse(SM.can(SM.STALE_HELD, SM.REFIX_BOUNCE))
+        self.assertNotIn((SM.STALE_HELD, SM.REFIX_BOUNCE), SM.TRANSITIONS)
+
+    def test_open_stale_budget_classifies_as_a_bounce_not_a_crash(self):
+        # classify_block is a PURE budget read and must return REFIX_BOUNCE for a surviving stale
+        # budget (the branch a stale caller keys on) — it never itself raises.
+        self.assertEqual(SM.classify_block(ledger(), "8", "a", "stale", "3"), SM.REFIX_BOUNCE)
+
+    def test_next_after_block_raises_on_a_surviving_stale_budget(self):
+        # THE REPRO (PR #435 forensics): composing through the table from STALE_HELD on a surviving
+        # budget raises IllegalTransition BY DESIGN — stale callers must branch on classify_block,
+        # not use this composite for the bounce case.
+        with self.assertRaises(SM.IllegalTransition):
+            SM.next_after_block(SM.STALE_HELD, ledger(), "8", "a", "stale", "3")
+
+    def test_the_only_progress_out_of_stale_held_is_base_fresh_or_exhaustion(self):
+        # A stale caller's two real exits: escalate on an exhausted budget, else self-hold in
+        # STALE_HELD until base_fresh (the rebase) re-enters the pipeline at INTAKE.
+        self.assertEqual(SM.events_from(SM.STALE_HELD),
+                         tuple(sorted((SM.BASE_FRESH, SM.REFIX_EXHAUSTED,
+                                       SM.NEW_SHA, SM.SIBLING_RESTALE))))
+        self.assertEqual(SM.transition(SM.STALE_HELD, SM.BASE_FRESH), SM.INTAKE)
+
+
 class GatesPassedBridgeMatchesDecisions(unittest.TestCase):
     """classify_gates_passed MUST agree with decisions.hold_decision over the whole truth table
     (§5.4–§5.5) — the policy decision has exactly one home."""

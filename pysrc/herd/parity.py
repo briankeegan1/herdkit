@@ -20,11 +20,17 @@ stable field order":
 
   * ``ts``                      → ``"<TS>"``    (the ISO-8601 stamp from ``journal.sh:_journal_ts``)
   * ``pid`` / any ``*_pid`` key → ``"<PID>"``   (worker pids: review_dispatched, healthcheck_started)
-  * every string VALUE          → absolute-path substrings collapsed to ``"<PATH>"`` (log_path, and
-                                  any absolute path embedded in a value such as an absolute
-                                  ``location`` prefix). A RELATIVE path (``app/greet.sh``) has no
-                                  leading slash and is preserved as semantic; a ``sha``/``pin`` is
-                                  hex/``base..sha`` with no leading slash and is preserved.
+  * a KNOWN-VOLATILE PATH KEY   → ``"<PATH>"``  (S3: folding is scoped to the fields that actually
+                                  carry a volatile tmp path — ``log_path`` / ``path`` / ``dir`` — and
+                                  the whole value is collapsed, so a real ``/private/tmp/...`` path
+                                  and the shadow engine's ``(shadow)`` / ``/shadow-tmp/...`` stubs all
+                                  fold to the same token. A SEMANTIC field that merely embeds an
+                                  absolute path (a review ``location``, a ``detail``) is NOT folded, so
+                                  a genuine "reviewer flagged the wrong file" divergence is never
+                                  masked. See :data:`_VOLATILE_PATH_KEYS`.
+  * a HEALTH-rail bounce        → folded onto the contract's one ``refix_bounce{rule=healthcheck}``
+                                  event (S2: bash's pre-contract ``health_refix_bounce`` is the
+                                  deviant; see :func:`_canon_refix_bounce`).
   * keys are SORTED             → stable field order, so a differing key-insertion order between
                                   two implementations never reads as a divergence.
 
@@ -70,7 +76,6 @@ a pure reader + a perturbation writer that only ever writes to stdout.
 
 import difflib
 import json
-import re
 import sys
 
 # A canonicalization token per volatile category. Distinct, self-describing, and — critically — not
@@ -79,11 +84,17 @@ TS_TOKEN = "<TS>"
 PID_TOKEN = "<PID>"
 PATH_TOKEN = "<PATH>"
 
-# An ABSOLUTE-path token inside a string value: a leading "/" at a boundary (NOT preceded by a colon
-# or word char, so "https://host/x" and "base..sha" are untouched) followed by one or more
-# slash-separated path segments. Matches "/tmp/a/b.log", "/private/tmp/x/repo/app/greet.sh"; leaves
-# a relative "app/greet.sh" and a bare "/" alone.
-_ABS_PATH_RE = re.compile(r"(?<![:\w])/[\w.\-]+(?:/[\w.\-]+)*")
+# The KNOWN-VOLATILE PATH KEYS (S3, HERD-328). Path folding is scoped to exactly the journal fields
+# that carry a volatile absolute tmp path with NO cross-implementation meaning: the reviewer/suite
+# log (`log_path`, contract §3.4 review_dispatched/healthcheck_started/main_health), the review-log
+# retention note (`path`), and a push/step hold's worktree (`dir`). Their whole value is collapsed
+# to <PATH> regardless of shape — so a real `/private/tmp/...` path AND the shadow engine's
+# `(shadow)` / `/shadow-tmp/...` stubs all fold to the SAME token (the fix for the un-folded
+# `(shadow)` log_path sentinel). Folding is NOT applied to every string value anymore: a semantic
+# field that happens to embed an absolute path — a review `location`, an `infra_event`/`step`
+# `detail` — is preserved verbatim so a genuine "reviewer flagged the wrong file" divergence is
+# never masked by an indiscriminate global sub.
+_VOLATILE_PATH_KEYS = frozenset({"log_path", "path", "dir"})
 
 
 def _canon_value(key, value):
@@ -92,8 +103,8 @@ def _canon_value(key, value):
         return TS_TOKEN
     if key == "pid" or key.endswith("_pid"):
         return PID_TOKEN
-    if isinstance(value, str):
-        return _ABS_PATH_RE.sub(PATH_TOKEN, value)
+    if key in _VOLATILE_PATH_KEYS and isinstance(value, str):
+        return PATH_TOKEN
     return value
 
 
@@ -120,13 +131,54 @@ def filter_shadow_private(events):
     return [e for e in events if not is_shadow_private(e)]
 
 
+# ── refix-bounce oracle mapping (S2, HERD-328) ────────────────────────────────────────────────────
+# Contract §3.4 names ONE bounce event — ``refix_bounce`` keyed by ``rule`` — but bash's health rail
+# still emits a distinct ``health_refix_bounce`` (round, agent_status_before, detail; no rule, no
+# location; ``agent-watch.sh:8265``), the pre-contract shape. The CONTRACT is the truth and bash's
+# emitter is the deviant, so the oracle FOLDS the health bounce onto the canonical event before the
+# diff: rename ``health_refix_bounce`` → ``refix_bounce``, key it ``rule=healthcheck``, and drop the
+# rail's narration that carries no cross-implementation meaning for the health rail — bash's
+# ``detail`` and the python twin's empty/sentinel ``location`` (``shadow_runtime.py:420`` emits
+# ``location="(shadow)"``; live emits ``""``). The REVIEW rail already emits the canonical
+# ``refix_bounce`` with a SEMANTIC ``location`` (the finding anchor), so it is deliberately left
+# untouched — its location must stay comparable (S3).
+_HEALTH_REFIX_EVENT = "health_refix_bounce"
+_REFIX_EVENT = "refix_bounce"
+_REFIX_HEALTH_RULE = "healthcheck"
+# The rail-narration fields dropped when folding a HEALTH bounce onto the canonical shape.
+_HEALTH_REFIX_DROP = ("detail", "location")
+
+
+def _canon_refix_bounce(obj):
+    """Fold a health-rail bounce onto the contract's ``refix_bounce{rule=healthcheck}`` shape.
+
+    Maps bash's ``health_refix_bounce`` and python's ``refix_bounce{rule=healthcheck}`` to one
+    canonical event so the two align across implementations; any other event (including a REVIEW-rail
+    ``refix_bounce`` with a semantic ``location``) is returned unchanged.
+    """
+    if not isinstance(obj, dict):
+        return obj
+    ev = obj.get("event")
+    is_health = ev == _HEALTH_REFIX_EVENT or (
+        ev == _REFIX_EVENT and obj.get("rule") == _REFIX_HEALTH_RULE)
+    if not is_health:
+        return obj
+    out = {k: v for k, v in obj.items() if k not in _HEALTH_REFIX_DROP}
+    out["event"] = _REFIX_EVENT
+    out["rule"] = _REFIX_HEALTH_RULE
+    return out
+
+
 def canonicalize_event(obj):
     """Return a canonical dict for one journal event: volatile fields neutralized, keys sorted.
 
     Key order is normalized by returning a plain dict built in sorted-key order; callers compare
     the dicts (order-independent) or serialize via :func:`canon_line` (sorted). ``obj`` is the
-    parsed JSON object for one journal line.
+    parsed JSON object for one journal line. A health-rail bounce is first folded onto the contract's
+    single ``refix_bounce`` event (:func:`_canon_refix_bounce`) so bash's pre-contract
+    ``health_refix_bounce`` aligns with the port's ``refix_bounce{rule=healthcheck}``.
     """
+    obj = _canon_refix_bounce(obj)
     return {k: _canon_value(k, obj[k]) for k in sorted(obj)}
 
 
@@ -282,8 +334,11 @@ def perturb_event(obj):
                 out[k] = int(v) + 100000
             except (TypeError, ValueError):
                 out[k] = "999999"
-        elif isinstance(v, str):
-            out[k] = _ABS_PATH_RE.sub(lambda m: "/perturbed" + m.group(0), v)
+        elif k in _VOLATILE_PATH_KEYS and isinstance(v, str):
+            # Rewrite ONLY the known-volatile path fields (the same keys :func:`_canon_value` folds),
+            # so perturb and canonicalize stay inverse: a semantic string carrying an absolute path is
+            # left untouched here precisely because canonicalization no longer folds it either.
+            out[k] = "/perturbed" + v
         else:
             out[k] = v
     return out

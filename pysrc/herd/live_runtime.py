@@ -898,6 +898,17 @@ class LiveTick:
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
+        self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
+
+    def _next_refix_round(self, pr, rule):
+        """The round number this rail's refix_bounce carries: the per-``(pr, rule)`` bounce count so
+        far + 1 — matching bash's ``round = refix_rail_count + 1`` (``agent-watch.sh:7519,:8260``).
+        The rail budget is per (pr, rule), NOT sha-keyed (contract §4; ``decisions.refix_rail_count``),
+        so a repeat bounce on the same rail increments the real round instead of a hardcoded 1."""
+        key = (pr, rule)
+        n = self._refix_rounds.get(key, 0) + 1
+        self._refix_rounds[key] = n
+        return n
 
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
@@ -951,7 +962,8 @@ class LiveTick:
             # (shadow_runtime.py:418) with bash-faithful defaults: the live tick does not probe the
             # pane here (bash's own fallback is "unknown") and parses no finding location.
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "agent_status_before", "unknown", "rule", "healthcheck",
+                                "round", self._next_refix_round(cand.pr, "healthcheck"),
+                                "agent_status_before", "unknown", "rule", "healthcheck",
                                 "location", "")
             return BLOCK
 
@@ -976,7 +988,8 @@ class LiveTick:
             # bash (agent-watch.sh:7321) with bash-faithful defaults for the fields the live tick does
             # not compute here (pane status → "unknown"; finding location unparsed → "").
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", 1, "agent_status_before", "unknown", "rule", "review",
+                                "round", self._next_refix_round(cand.pr, "review"),
+                                "agent_status_before", "unknown", "rule", "review",
                                 "location", "")
             return BLOCK
 

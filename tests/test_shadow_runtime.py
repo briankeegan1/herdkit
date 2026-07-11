@@ -171,6 +171,18 @@ class TestGateOutcomes(TempJournalCase):
         self.assertEqual(verdicts[0]["value"], "BLOCK")
         self.assertEqual(verdicts[0]["source"], "reviewer")
 
+    def test_refix_round_is_real_not_hardcoded(self):
+        # HERD-328 S2: the shadow twin tracks the real per-(pr, rule) round (bounce count + 1) rather
+        # than the old hardcoded 1, exactly like the live twin. First bounce reads round=1; the rail
+        # counter increments per rail, isolated across rails and PRs.
+        _, ev = self._run_one(review="PASS", health="CODEERROR")
+        rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
+        self.assertEqual(rb[0]["round"], 1)
+        w = self.watcher({"MERGE_POLICY": "auto"})
+        self.assertEqual([w._next_refix_round(1, "review") for _ in range(3)], [1, 2, 3])
+        self.assertEqual(w._next_refix_round(1, "healthcheck"), 1)   # a different rail is its own count
+        self.assertEqual(w._next_refix_round(2, "review"), 1)        # a different pr is its own count
+
     def test_infra_is_never_a_cached_verdict(self):
         out, ev = self._run_one(review="INFRA", health="CLEAN")
         self.assertEqual(out, "ESCALATE")
