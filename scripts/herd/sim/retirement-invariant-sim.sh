@@ -119,6 +119,7 @@ DEFAULT_BRANCH="main"; DRYRUN=""; PRS_JSON='[]'; WORKSPACE_NAME="simws"
 # the unit suite instead, where the branch must survive AND not count as a leftover.)
 DELETE_BRANCH_ON_MERGE="${SIM_DELETE_BRANCH:-true}"
 export WORKSPACE_NAME
+export HERD_DISPOSABLE_WORKSPACE=1  # sim creates/tears down its own stub tabs (HERD-310 guard)
 
 # crash_after <fn> — run the shipped <fn>, then die. Simulates `kill -9` landing between two teardown
 # steps: the step's effect is durable on disk, the steps after it never happened.
