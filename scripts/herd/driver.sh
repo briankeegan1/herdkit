@@ -492,6 +492,27 @@ herd_driver_send_text() {
   return 0
 }
 
+# ── pane-launch (HERD-322) ───────────────────────────────────────────────────────────────────────
+# herd_pane_launch <pane> <cmd> — type a shell command into a BARE pane, robust to herdr's
+# first-character drop (HERD-322). herdr drops the leading char at the tty input boundary, so
+# `bash /path/to/backlog-view.sh` arrives as `ash /path/to/backlog-view.sh` and the launch fails.
+# The fix: prepend a throwaway leading SPACE (absorbs the dropped char, leaving the real command
+# intact) and send an explicit Enter to ensure the shell actually executes it. This is THE ONE
+# shared helper all control-room pane launches route through — coordinator.sh (backlog/watch pane
+# launches) and _reload_pane_run_verified in bin/herd both use this guard internally.
+# herdr-claude: pane run " <cmd>" + send-keys Enter. headless: NO-OP (panes-as-a-view).
+# FAIL-SOFT: always returns 0; a missing herdr / pane / cmd is silently swallowed.
+herd_pane_launch() {
+  local pane="${1:-}" cmd="${2:-}"
+  [ -n "$pane" ] && [ -n "$cmd" ] || return 0
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  # Leading space absorbs herdr's first-character drop; explicit Enter submits the command.
+  herdr pane run "$pane" " $cmd" >/dev/null 2>&1 || true
+  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  return 0
+}
+
 # ── send-keys ────────────────────────────────────────────────────────────────────────────────────
 # herd_driver_close_pane <pane-id> — RETIRE a pane (the reviewer-pane lifecycle, HERD-113). herdr-claude:
 # `herdr pane close`. headless: NO-OP (panes-as-a-view — a detached reviewer has no pane to close; its
