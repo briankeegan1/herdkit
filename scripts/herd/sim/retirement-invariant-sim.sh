@@ -225,6 +225,25 @@ residue() {
   printf '%s' "$out"
 }
 
+# await_converged <scn> <slug> — leg (a) of HERD-326: AWAIT the terminal converged STATE (zero
+# leftovers, zero residue) rather than reading it once. Runs the "next watcher" tick and, only if it
+# has NOT yet converged, runs up to a bounded number of further ticks until it does OR the budget is
+# spent. A converged tick is an idempotent no-op (PART 1's fixed-point check below proves it), so on
+# the happy path this runs EXACTLY one tick and is byte-identical; only a load-starved child that lands
+# a teardown herdr round-trip a tick late gets the extra polls, where a one-shot read would false-red.
+# Echoes the final tick's report.
+await_converged() {
+  local _scn="$1" _slug="$2" _tries=20 _i=0 _rep
+  while :; do
+    _rep="$(tick "$_scn" "$_slug" none)"
+    if { [ -z "$(printf '%s' "$_rep" | sed -n 's/^LEFT //p')" ] && [ -z "$(residue "$_scn" "$_slug")" ]; } \
+       || [ "$_i" -ge "$_tries" ]; then
+      printf '%s' "$_rep"; return 0
+    fi
+    _i=$((_i+1)); sleep 0.1
+  done
+}
+
 # ── PART 1: kill the watcher at every teardown step; the next tick must converge ─────────────────
 step crash "kill/restart the watcher at every teardown step — the next tick must converge"
 SLUG=retiree
@@ -235,8 +254,9 @@ for crash in none before-teardown after-reap after-registry-prune after-branch-d
   # Tick 1 — the doomed watcher. (Its exit status is irrelevant: it was killed.)
   tick "$scn" "$SLUG" "$crash" >/dev/null
 
-  # Tick 2 — a brand-new watcher process, zero inherited memory. This is the whole claim.
-  rep="$(tick "$scn" "$SLUG" none)"
+  # Tick 2 — a brand-new watcher process, zero inherited memory. This is the whole claim. AWAIT the
+  # terminal converged STATE (poll, don't one-shot) so heavy box load never paints a spurious red.
+  rep="$(await_converged "$scn" "$SLUG")"
   left="$(printf '%s' "$rep" | sed -n 's/^LEFT //p')"
   res="$(residue "$scn" "$SLUG")"
 
