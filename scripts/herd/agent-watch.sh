@@ -11459,6 +11459,35 @@ build_sweep_note() {
 # under an alive holder (rm+recreate) — the recorded pid still proves a watcher is up. Lib-visible
 # (defined above the AGENT_WATCH_LIB return) so the unit test can drive it directly; called once at
 # main startup below.
+_watcher_holder_argv() {
+  # _watcher_holder_argv <pid> — command line of <pid>, ≤100 chars. Diagnostic only; fail-soft.
+  local p="${1:-}"
+  [ -n "$p" ] || return 0
+  local a
+  a="$(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null \
+      || ps -o command= -p "$p" 2>/dev/null || true)"
+  printf '%s' "${a:0:100}"
+}
+
+_watcher_lock_flock_holder() {
+  # _watcher_lock_flock_holder — print the pid holding the flock on HERD_WATCHER_LOCK, or empty.
+  local lock="${HERD_WATCHER_LOCK:-}"
+  [ -n "$lock" ] && [ -f "$lock" ] || return 0
+  if command -v lsof >/dev/null 2>&1; then
+    local _wlfh_all; _wlfh_all="$(lsof -t -- "$lock" 2>/dev/null || true)"
+    printf '%s\n' "${_wlfh_all%%$'\n'*}"
+    return 0
+  fi
+  if [ -f /proc/locks ]; then
+    local inode
+    inode="$(stat -c '%i' "$lock" 2>/dev/null || true)"
+    [ -n "$inode" ] || return 0
+    awk -v ino="$inode" '
+      /FLOCK/ { n=split($6,a,":"); if (n>=3 && a[3]+0==ino+0) { print $5+0; exit } }
+    ' /proc/locks 2>/dev/null || true
+  fi
+}
+
 _watcher_singleton_refuse_msg() {
   # _watcher_singleton_refuse_msg <pid-or-empty> — one-line LOUD refuse on stderr (HERD-252).
   local _wl_holder="${1:-}"
@@ -11467,6 +11496,18 @@ _watcher_singleton_refuse_msg() {
   else
     printf 'herd-watch: already running — refusing duplicate\n' >&2
   fi
+}
+
+_watcher_singleton_refuse() {
+  # _watcher_singleton_refuse <pid-or-empty> — refuse loudly + journal watcher_restart_blocked.
+  # (c) HERD-342: every refused startup journals the holder identity so JOURNAL_AUDIT can surface it.
+  local _wlr_pid="${1:-}"
+  _watcher_singleton_refuse_msg "$_wlr_pid"
+  local _wlr_argv; _wlr_argv="$(_watcher_holder_argv "$_wlr_pid")"
+  journal_append watcher_restart_blocked \
+    holder_pid "${_wlr_pid:-unknown}" \
+    holder_argv "$_wlr_argv" \
+    workspace "${WORKSPACE_NAME:-}"
 }
 
 _acquire_watcher_singleton() {
@@ -11478,7 +11519,21 @@ _acquire_watcher_singleton() {
   # Trim trailing whitespace/newlines so a pid line is a clean integer for kill -0 + messaging.
   _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
   if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-    _watcher_singleton_refuse_msg "$_wl_rec"
+    # (d) HERD-342: if the live holder is marker-owned (an inflight gate worker, not a watcher main),
+    # reap it and retry once. Route through watcher-exempt.sh's predicate (HERD-266 seam).
+    local _wl_pp; _wl_pp="$(ps -o ppid= -p "$_wl_rec" 2>/dev/null | tr -d '[:space:]')" || _wl_pp="0"
+    if watcher_pid_exempt "$_wl_rec" "${_wl_pp:-0}"; then
+      kill "$_wl_rec" 2>/dev/null || true
+      local _wl_ki=0
+      while [ "$_wl_ki" -lt 5 ] && kill -0 "$_wl_rec" 2>/dev/null; do
+        sleep 0.1; _wl_ki=$((_wl_ki + 1))
+      done
+      if ! kill -0 "$_wl_rec" 2>/dev/null; then
+        rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+        _acquire_watcher_singleton; return $?  # holder gone — re-enter to take the lock
+      fi
+    fi
+    _watcher_singleton_refuse "$_wl_rec"
     return 1
   fi
   if command -v flock >/dev/null 2>&1; then
@@ -11489,7 +11544,7 @@ _acquire_watcher_singleton() {
       _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
       _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
       if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-        _watcher_singleton_refuse_msg "$_wl_rec"
+        _watcher_singleton_refuse "$_wl_rec"
         return 1
       fi
       # HERD-344: recorded pid is dead but flock is held by an orphaned gate worker that inherited
@@ -11497,6 +11552,15 @@ _acquire_watcher_singleton() {
       # handle on the old inode, unlink it so a new open creates an independent inode whose lock
       # state is clean, then re-acquire. The orphan retains its flock on the now-unlinked inode
       # and eventually releases it on exit — harmless once we hold the canonical path's lock.
+      # (b) HERD-342: capture the orphaned flock holder before unlinking — its identity lands in
+      # the bypass journal event so the operator can trace what was running.
+      local _wl_bh _wl_ba
+      _wl_bh="$(_watcher_lock_flock_holder 2>/dev/null || true)"
+      _wl_ba="$(_watcher_holder_argv "$_wl_bh" 2>/dev/null || true)"
+      journal_append watcher_singleton_bypass \
+        holder_pid "${_wl_bh:-unknown}" \
+        holder_argv "$_wl_ba" \
+        workspace "${WORKSPACE_NAME:-}"
       exec 9>&-
       rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
       exec 9>>"$HERD_WATCHER_LOCK"
@@ -11504,9 +11568,9 @@ _acquire_watcher_singleton() {
         _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
         _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
         if [ -n "$_wl_rec" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-          _watcher_singleton_refuse_msg "$_wl_rec"
+          _watcher_singleton_refuse "$_wl_rec"
         else
-          _watcher_singleton_refuse_msg ""
+          _watcher_singleton_refuse ""
         fi
         return 1
       fi
@@ -11524,7 +11588,7 @@ _acquire_watcher_singleton() {
     _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
     _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
     if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
-      _watcher_singleton_refuse_msg "$_wl_pid"
+      _watcher_singleton_refuse "$_wl_pid"
       return 1
     fi
     [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
@@ -11534,7 +11598,7 @@ _acquire_watcher_singleton() {
   _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
   if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
     rmdir "$_wl_mtx" 2>/dev/null || true
-    _watcher_singleton_refuse_msg "$_wl_pid"
+    _watcher_singleton_refuse "$_wl_pid"
     return 1
   fi
   # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).

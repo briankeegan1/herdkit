@@ -120,7 +120,7 @@ FIXTURE_SLUGS="${HERD_JOURNAL_AUDIT_FIXTURE_SLUGS:-retiree conv stuck hd}"
 # ── replay: pure python scanner → one finding line per violation ─────────────
 # Each stdout line:  kind\tkey\tsummary
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
-#        red_state_stale | pushed_no_unresolved | fixture_slug
+#        red_state_stale | pushed_no_unresolved | fixture_slug | watcher_restart_blocked
 # key is a stable dedup token; summary is a short human phrase for the inbox row.
 # shellcheck disable=SC2016
 FINDINGS="$(
@@ -355,6 +355,21 @@ for e in events:
         key = "fixture_slug|%s" % slug
         summary = "known-fixture slug in journal · slug=%s event=%s" % (slug, e.get("event") or "?")
         findings.append(("fixture_slug", key, summary))
+
+# ── (h) watcher_restart_blocked events (HERD-342) ──────────────────────────
+# A blocked restart is a direct signal that an orphaned lock holder is preventing engine recovery.
+# Any event in the window is a finding — the operator needs to know about it.
+for e in events:
+    if e.get("event") != "watcher_restart_blocked":
+        continue
+    holder = str(e.get("holder_pid") or "unknown")
+    workspace = str(e.get("workspace") or "")
+    key = "watcher_restart_blocked|workspace=%s|holder=%s" % (workspace, holder)
+    summary = "watcher restart blocked · holder_pid=%s%s" % (
+        holder,
+        (" workspace=%s" % workspace) if workspace else "",
+    )
+    findings.append(("watcher_restart_blocked", key, summary))
 
 for kind, key, summary in findings:
     # TAB-separated; summary flattened (no tabs/newlines).
