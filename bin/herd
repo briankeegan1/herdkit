@@ -4731,6 +4731,38 @@ _watcher_lock_holder_msg() {
   fi
 }
 
+# _watcher_restart_verify <watch_pid> <pre_pid> <cmd_ticks> <context> — HERD-342 leg (a).
+# After a restart attempt verify a NEW LIVE watcher is running. Prints a LOUD error and returns 1
+# on any of three failure modes: (1) no live pid in the lockfile, (2) same pid as before the stop,
+# (3) new pid whose start-time predates this command (a stale pid that was never killed).
+_watcher_restart_verify() {
+  local _wrv_pid="${1:-}" _wrv_pre="${2:-}" _wrv_cticks="${3:-0}" _wrv_ctx="${4:-herd restart}"
+  local _wrv_blocked=0 _wrv_reason=""
+  if [ -z "$_wrv_pid" ] || ! kill -0 "$_wrv_pid" 2>/dev/null; then
+    _wrv_blocked=1; _wrv_reason="no live watcher after restart attempt"
+  elif [ "$_wrv_pid" = "$_wrv_pre" ]; then
+    _wrv_blocked=1; _wrv_reason="the running watcher did not change"
+  else
+    local _wrv_nticks; _wrv_nticks="$(_watcher_proc_start_ticks "$_wrv_pid")"
+    if { [ "$_wrv_nticks" -gt 0 ] 2>/dev/null; } \
+       && { [ "$_wrv_cticks" -gt 0 ] 2>/dev/null; } \
+       && { [ "$_wrv_nticks" -le "$_wrv_cticks" ] 2>/dev/null; }; then
+      _wrv_blocked=1; _wrv_reason="the running watcher did not change"
+    fi
+  fi
+  if [ "$_wrv_blocked" -eq 1 ]; then
+    local _wrv_h; _wrv_h="$(_watcher_lock_holder_msg)"
+    printf '%s❌ watcher restart BLOCKED — %s%s\n' "$c_red" "$_wrv_reason" "$c_rst" >&2
+    printf '   lock holder: %s\n' "$_wrv_h" >&2
+    printf '   remedy: kill the holder, then re-run '"'"'%s'"'"'\n' "$_wrv_ctx" >&2
+    journal_append watcher_restart_verify_failed \
+      pre_pid "${_wrv_pre:-}" new_pid "${_wrv_pid:-}" holder "$_wrv_h" \
+      workspace "${WORKSPACE_NAME:-}"
+    return 1
+  fi
+  return 0
+}
+
 # _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
 # else echo nothing (HERD-209). The atomic REFUSE-or-ADOPT read the launch paths (cmd_pane_watch /
 # cmd_reload) consult right before spawning: a non-empty result means a watcher already owns this
@@ -5248,27 +5280,8 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
     "pane below coordinator"|"herdr tab"*) wsum="$wsum · pane $watch_pane · visible ✓" ;;
   esac
 
-  # HERD-342 leg (a): verify the new watcher PID actually CHANGED and postdates this command.
-  if [ -n "$watch_pid" ]; then
-    local _cr_new_ticks; _cr_new_ticks="$(_watcher_proc_start_ticks "$watch_pid")"
-    local _cr_blocked=0
-    if [ "$watch_pid" = "$_cr_pre_pid" ]; then
-      _cr_blocked=1
-    elif [ "$_cr_new_ticks" -gt 0 ] && [ "$_cr_cmd_ticks" -gt 0 ] \
-         && [ "$_cr_new_ticks" -le "$_cr_cmd_ticks" ] 2>/dev/null; then
-      _cr_blocked=1
-    fi
-    if [ "$_cr_blocked" -eq 1 ]; then
-      local _cr_holder_desc; _cr_holder_desc="$(_watcher_lock_holder_msg)"
-      printf '%s❌ watcher restart BLOCKED — the running watcher did not change%s\n' "$c_red" "$c_rst" >&2
-      printf '   lock holder: %s\n' "$_cr_holder_desc" >&2
-      printf '   remedy: kill the holder, then re-run '"'"'herd reload'"'"'\n' >&2
-      journal_append watcher_restart_verify_failed \
-        pre_pid "${_cr_pre_pid:-}" new_pid "$watch_pid" holder "$_cr_holder_desc" \
-        workspace "$WORKSPACE_NAME"
-      return 1
-    fi
-  fi
+  # HERD-342 leg (a): verify a NEW LIVE watcher is running after the restart attempt.
+  _watcher_restart_verify "$watch_pid" "$_cr_pre_pid" "$_cr_cmd_ticks" "herd reload" || return 1
 
   # Journal the outcome of each rebuilt component so a post-mortem can see when/what a reload touched.
   journal_append reload_outcome component skill   result rendered
@@ -5487,36 +5500,17 @@ cmd_pane_watch() {
   fi
   [ -n "$watch_pid" ] && wsum="$wsum · pid $watch_pid"
 
-  # HERD-342 leg (a): verify the new watcher PID actually CHANGED and postdates this command.
-  # On failure, name the lock holder loudly and exit non-zero — never lie about a blocked restart.
-  if [ -n "$watch_pid" ]; then
-    local _wpw_new_ticks; _wpw_new_ticks="$(_watcher_proc_start_ticks "$watch_pid")"
-    local _wpw_blocked=0
-    if [ "$watch_pid" = "$_wpw_pre_pid" ]; then
-      _wpw_blocked=1  # same pid as before the stop — restart was blocked
-    elif [ "$_wpw_new_ticks" -gt 0 ] && [ "$_wpw_cmd_ticks" -gt 0 ] \
-         && [ "$_wpw_new_ticks" -le "$_wpw_cmd_ticks" ] 2>/dev/null; then
-      _wpw_blocked=1  # new watcher started before this command — stale pid
-    fi
-    if [ "$_wpw_blocked" -eq 1 ]; then
-      local _wpw_holder_desc; _wpw_holder_desc="$(_watcher_lock_holder_msg)"
-      printf '%s❌ watcher restart BLOCKED — the running watcher did not change%s\n' "$c_red" "$c_rst" >&2
-      printf '   lock holder: %s\n' "$_wpw_holder_desc" >&2
-      printf '   remedy: kill the holder, then re-run '"'"'herd pane watch'"'"'\n' >&2
-      journal_append watcher_restart_verify_failed \
-        pre_pid "${_wpw_pre_pid:-}" new_pid "$watch_pid" holder "$_wpw_holder_desc" \
-        workspace "$WORKSPACE_NAME"
-      return 1
-    fi
-  fi
-
   # REPAINT the width-sensitive backlog viewer if the geometry changed (see cmd_reload).
   if [ "$geom_changed" -eq 1 ] && [ -n "${BACKLOG_FILE:-}" ] && [ -f "$PANE_ROOT/$BACKLOG_FILE" ]; then
     touch "$PANE_ROOT/$BACKLOG_FILE" 2>/dev/null || true
   fi
 
   # 4. Registry from the observed final state (backlog row preserved from the registry).
+  # Write unconditionally — even a blocked restart must not leak an unregistered pane.
   _pane_write_registry "$PANE_AGENT" "$PANE_REG_B" "$wPane"
+
+  # HERD-342 leg (a): verify a NEW LIVE watcher is running after the restart attempt.
+  _watcher_restart_verify "$watch_pid" "$_wpw_pre_pid" "$_wpw_cmd_ticks" "herd pane watch" || return 1
 
   say ""
   ok "pane watch complete"
