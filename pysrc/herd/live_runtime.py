@@ -261,15 +261,20 @@ def _read_refix_ledger(state_dir):
 
 
 def _append_refix_ledger(state_dir, line):
-    """Append one row to the durable refix ledger; fail-soft (never raises)."""
+    """Append one row to the durable refix ledger; return True on success, False on I/O failure.
+
+    A False return with a non-None ``state_dir`` means the ledger is UNWRITABLE — the once-guard
+    will not hold on the next tick and the PR will re-bounce indefinitely until the underlying I/O
+    problem is resolved.  Callers should journal a one-shot warning when this happens."""
     path = _refix_ledger_path(state_dir)
     if not path:
-        return
+        return True   # no state dir = sim/dry-run context, treat as success
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _pid_starttime(pid):
@@ -1526,28 +1531,61 @@ class LiveTick:
         self._starve_threshold = _starve_threshold(self.config)
         self._starved = set()  # PRs that are head-of-line-starved THIS tick (drives the sibling freeze)
 
-    def _refix_check_and_record(self, cand, kind):
-        """Check the per-rail/total budget and, when budget remains, append a bounce row to the
-        durable ledger (``$REFIX_STATE``).  Returns ``(round_num, None)`` when the bounce is
-        recorded, or ``(None, reason)`` when the budget is already exhausted (caller escalates).
+    # Return sentinel for _refix_check_and_record: sha already bounced, hold silently.
+    _REFIX_ALREADY_ATTEMPTED = object()
 
-        ``kind`` is the LEDGER kind (``"health"`` or ``"review"``) matching bash's positional ``$5``
-        field (``agent-watch.sh:7293``).  Round number = ``refix_rail_count + 1`` read BEFORE the
-        append, matching bash's ``_hhc_round_num=$((_hhc_rounds + 1))`` (:8389, :7648).
-        Fail-soft: an unwritable ledger records nothing and returns round=1 (budget appears unlimited);
-        this is the same behaviour as before the fix for a no-dir (sim/dry-run) tick."""
+    def _refix_check_and_record(self, cand, kind):
+        """Gate the bounce: check once-guard → check budget → append bounce row.
+
+        Returns one of three shapes, mirroring bash's pre-bounce checks
+        (``agent-watch.sh:8334-8346`` health / ``:7600-7609`` review):
+
+          ``(round_num, None)``              — fresh bounce recorded; emit ``refix_bounce``
+          ``(None, None)``                   — sha already bounced for this rail; hold silently
+                                               (agent was re-tasked; wait for push)
+          ``(None, <reason_str>)``           — budget exhausted; escalate to needs-you
+
+        ``kind`` is the LEDGER kind (``"health"`` or ``"review"``) — bash's ``$5`` field.
+        Round = ``refix_rail_count + 1`` before the append (bash ``:8389, :7648``).
+
+        **Once-guard** (``refix_attempted``, ``agent-watch.sh:8340/:7605``): a (pr, sha, kind)
+        triple that is already in the ledger MUST NOT produce a second bounce row — the tick
+        re-walks every open candidate on every ~8s cycle using the cached verdict, so without
+        this guard the same sha would burn its entire per-rail budget in one minute while the
+        woken agent is still working and has not yet pushed.
+
+        **Ledger-fault advisory**: if the write succeeds on no ledger and state_dir is set, the
+        once-guard will never hold → infinite re-bounce on the next tick.  A one-shot journal
+        event ``refix_ledger_fault`` is emitted so the operator can see the underlying I/O
+        problem instead of diagnosing runaway bounces."""
         state_dir = self.state.dir
         text = _read_refix_ledger(state_dir)
         rows = D.parse_refix_ledger(text)
         pr_str = str(cand.pr)
+        sha_str = str(cand.sha)
+
+        # 1. Once-guard: if already bounced for this exact (pr, sha, kind), hold silently.
+        if D.refix_attempted(rows, pr_str, sha_str, kind):
+            return None, None
+
+        # 2. Budget check: exhausted → needs-you escalation, no bounce.
         reason = D.refix_budget_reason(rows, pr_str, kind, self.config.get("REFIX_MAX_ROUNDS"))
         if reason:
             return None, reason
+
+        # 3. Fresh (pr, sha, kind) with budget remaining → record the bounce.
         rail = D.refix_rail_count(rows, pr_str, kind)
         round_num = rail + 1
         slug = str(cand.slug) if cand.slug else "-"
-        _append_refix_ledger(state_dir,
-                             "%s %s %s %s %s\n" % (_now_epoch(), cand.pr, cand.sha, slug, kind))
+        wrote = _append_refix_ledger(
+            state_dir,
+            "%s %s %s %s %s\n" % (_now_epoch(), cand.pr, cand.sha, slug, kind))
+        if not wrote and state_dir:
+            # Ledger unwritable: the once-guard will not hold next tick → emit advisory once.
+            if self.state.once(cand.pr, cand.sha, "refix_ledger_fault_%s" % kind):
+                self.journal.append("refix_ledger_fault", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "kind", kind,
+                                    "detail", "refix ledger unwritable — once-guard will not hold")
         return round_num, None
 
     def _refix_rail_reset(self, cand, kind):
@@ -1717,9 +1755,14 @@ class LiveTick:
             # Rail resolved → refund its per-rail budget (contract §4, bash line 10419).
             self._refix_rail_reset(cand, "health")
         if health == "CODEERROR":
-            # Budget check (HERD-358): exhausted → needs-you escalation, no bounce.
+            # Three-way bounce gate (HERD-358).  See _refix_check_and_record for the semantics.
             round_num, reason = self._refix_check_and_record(cand, "health")
+            if round_num is None and reason is None:
+                # Once-guard: already bounced for this (pr, sha, kind) — hold silently while the
+                # agent works (bash: refix_attempted true + _active_fix_note check at :8334-8338).
+                return BLOCK
             if reason is not None:
+                # Budget exhausted → needs-you escalation, no bounce.
                 if self.state.once(cand.pr, cand.sha, "refix_escalated_health"):
                     rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
                     total = D.refix_total_count(rows_after, str(cand.pr))
@@ -1755,9 +1798,13 @@ class LiveTick:
                                 "source", "reviewer")
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
-            # Budget check (HERD-358): exhausted → needs-you escalation, no bounce.
+            # Three-way bounce gate (HERD-358).  See _refix_check_and_record for the semantics.
             round_num, reason = self._refix_check_and_record(cand, "review")
+            if round_num is None and reason is None:
+                # Once-guard: already bounced for this (pr, sha, kind) — hold silently.
+                return BLOCK
             if reason is not None:
+                # Budget exhausted → needs-you escalation, no bounce.
                 if self.state.once(cand.pr, cand.sha, "refix_escalated_review"):
                     rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
                     total = D.refix_total_count(rows_after, str(cand.pr))

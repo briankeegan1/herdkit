@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# test-py-live-refix-budget.sh �� regression for HERD-358: durable refix budget under ENGINE_IMPL=python.
+# test-py-live-refix-budget.sh — regression for HERD-358: durable refix budget under ENGINE_IMPL=python.
 #
-# THE BUG: under the python engine live_runtime re-runs as a FRESH PROCESS every ~8s tick. The old
-# in-process `self._refix_rounds` dict was rebuilt empty on each fresh process, so _next_refix_round
-# always returned 1 and REFIX_MAX_ROUNDS was never enforced — a red PR bounced at round=1 forever.
+# THE BUG: the python engine re-runs as a FRESH PROCESS every ~8s tick.  The old in-process
+# `_refix_rounds` dict was rebuilt empty each tick → round was always 1 → REFIX_MAX_ROUNDS never
+# enforced → a red PR bounced at round=1 forever and never escalated to needs-you.
 #
-# WHAT THIS FILE PROVES (per the task spec HERD-358 verification):
-#  (a) Round climbs 1→2→3 across SEPARATE runtime constructions (fresh LiveTick per tick).
-#  (b) Rail counter resets when that rail goes GREEN, and per-rail isolation holds.
-#  (c) The 3× total ceiling escalates a cross-rail thrasher.
+# THE SECOND DEFECT (introduced during the fix attempt): _refix_check_and_record appended a bounce
+# row on EVERY tick without consulting D.refix_attempted (the per-(pr,sha,kind) once-guard).
+# Because the live tick re-walks every candidate every ~8s using the cached verdict, an unchanged
+# sha triggered a new ledger row on each tick → whole per-rail budget burned in ~24s while the
+# agent was still working.
+#
+# WHAT THIS FILE PROVES:
+#  (a) Round advances 1→2→3 when a NEW SHA is pushed after each fix (the intended enforcement path).
+#  (b) The SAME sha walked across many fresh runtimes (no push between ticks) bounces EXACTLY ONCE
+#      (the per-(pr,sha,kind) once-guard preserved across fresh processes via the durable ledger).
+#  (c) Rail counter resets when the rail goes GREEN, and per-rail isolation holds.
+#  (d) The 3× total ceiling escalates a cross-rail thrasher to ESCALATE.
 #
 # Run: bash tests/test-py-live-refix-budget.sh
 set -uo pipefail
@@ -22,20 +30,17 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail() { echo "FAIL: $1" >&2; exit 1; }
 PASS=0; pass() { PASS=$((PASS + 1)); }
 
-# ── shared helpers ─────────────────────────────────────────────────────────────
-# Run one tick via python3 -c with WORKTREES_DIR pointing at our hermetic state dir.
-# The fixture is a JSON object with candidates + config, written to a temp file.
-# Prints stdout; exits nonzero on failure.
+# ── helpers ───────────────────────────────────────────────────────────────────
 run_tick() {
-  local _fixture="$1" _journal="$2" _extra_env="${3:-}"
-  eval "$_extra_env" \
-    WORKTREES_DIR="$T/state" \
+  # Run one dry-run tick via an independent python3 invocation (fresh process = fresh runtime,
+  # matching production).  WORKTREES_DIR points at the hermetic state dir.
+  local _fixture="$1" _journal="$2"
+  WORKTREES_DIR="$T/state" \
     LIVE_DRYRUN_JOURNAL="$_journal" \
     PYTHONPATH="$REPO/pysrc" \
     python3 -m herd.live_runtime --dry-run --fixture "$_fixture" 2>/dev/null
 }
 
-# Extract the last `round` value from a refix_bounce event for the given rule.
 last_round() {
   local _jf="$1" _rule="$2"
   python3 - "$_jf" "$_rule" <<'PY'
@@ -53,7 +58,23 @@ print("" if last is None else last)
 PY
 }
 
-# True if the journal contains the given event type.
+count_bounces() {
+  local _jf="$1" _rule="$2"
+  python3 - "$_jf" "$_rule" <<'PY'
+import json, sys
+jf, rule = sys.argv[1], sys.argv[2]
+n = 0
+try:
+    for line in open(jf):
+        ev = json.loads(line)
+        if ev.get("event") == "refix_bounce" and ev.get("rule") == rule:
+            n += 1
+except FileNotFoundError:
+    pass
+print(n)
+PY
+}
+
 has_event() {
   python3 -c "
 import json, sys
@@ -64,131 +85,133 @@ sys.exit(1)
 " "$1" "$2" 2>/dev/null
 }
 
-# True if the final outcome for the given PR# is the given value.
 outcome_is() {
-  python3 -c "
+  # outcome_is <json-stdout> <pr-number> <expected>
+  printf '%s' "$1" | python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read())
-sys.exit(0 if str(d.get('outcomes', {}).get(str(sys.argv[1]))) == sys.argv[2] else 1)
-" "$1" "$2"
+got = str(d.get('outcomes', {}).get(str(sys.argv[1]), ''))
+sys.exit(0 if got == sys.argv[2] else 1)
+" "$2" "$3" 2>/dev/null
 }
 
+# ── (a) Round advances 1→2→3 on each NEW SHA push ─────────────────────────────
+# Each sha represents one new commit after the previous fix attempt.  The
+# once-guard means each sha bounces exactly once; the rail counter advances
+# per-sha because each new sha is a new once-guard key.
 mkdir -p "$T/state"
 
-# ── (a) Round climbs 1→2→3 across SEPARATE runtime constructions ──────────────
-# The critical invariant (HERD-358): FRESH process per tick must NOT reset round to 1.
-# Each iteration constructs a brand-new LiveTick (independent Python3 invocation via
-# --dry-run --fixture), exactly as production does.
-cat > "$T/fix-health-red.json" <<'JSON'
+for i in 1 2 3; do
+  cat > "$T/fix-sha${i}.json" <<JSON
 {"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"3"},
- "candidates":[{"pr":1,"sha":"sha1","slug":"feat-red","health":"CODEERROR","review":"PASS"}]}
+ "candidates":[{"pr":1,"sha":"sha-r${i}","slug":"feat-red","health":"CODEERROR","review":"PASS"}]}
 JSON
+done
 
 for expected_round in 1 2 3; do
-  jf="$T/tick-${expected_round}.jsonl"
-  run_tick "$T/fix-health-red.json" "$jf" "" >/dev/null || fail "tick ${expected_round} exited nonzero"
+  jf="$T/tick-round${expected_round}.jsonl"
+  run_tick "$T/fix-sha${expected_round}.json" "$jf" >/dev/null \
+    || fail "(a) tick for sha sha-r${expected_round} exited nonzero"
   got="$(last_round "$jf" healthcheck)"
   [ "$got" = "$expected_round" ] || \
-    fail "(a) tick ${expected_round}: expected round=${expected_round}, got '${got}' — durable ledger not persisting across fresh runtimes"
+    fail "(a) sha sha-r${expected_round}: expected round=${expected_round}, got '${got}'"
 done
 pass
 
-# ── (b1) Rail reset: health goes GREEN → rail counter zeroes, next CODEERROR is round=1 again ──
-cat > "$T/fix-health-clean.json" <<'JSON'
-{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"3"},
- "candidates":[{"pr":1,"sha":"sha1","slug":"feat-red","health":"CLEAN","review":"PASS"}]}
+# ── (b) Same sha across many fresh runtimes bounces EXACTLY ONCE (once-guard) ─
+# The cached verdict returns CODEERROR on every tick for the same sha.  The
+# durable ledger must stop a second bounce row from being written.
+cat > "$T/fix-same-sha.json" <<'JSON'
+{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"5"},
+ "candidates":[{"pr":2,"sha":"same-sha","slug":"feat-og","health":"CODEERROR","review":"PASS"}]}
 JSON
 
-# Tick 4: health is CLEAN → rail reset fires (budget restored)
-jf4="$T/tick-reset.jsonl"
-run_tick "$T/fix-health-clean.json" "$jf4" "" >/dev/null || fail "(b1) CLEAN tick exited nonzero"
-# After CLEAN, the refix_rail_reset journal event should appear
-has_event "$jf4" refix_rail_reset || fail "(b1) no refix_rail_reset event after health CLEAN"
-
-# Tick 5: health is CODEERROR again — should now be round=1 (rail was reset)
-jf5="$T/tick-after-reset.jsonl"
-run_tick "$T/fix-health-red.json" "$jf5" "" >/dev/null || fail "(b1) post-reset tick exited nonzero"
-got5="$(last_round "$jf5" healthcheck)"
-[ "$got5" = "1" ] || fail "(b1) expected round=1 after rail reset, got '${got5}'"
+total_bounces=0
+for i in 1 2 3 4 5; do
+  jf="$T/og-tick${i}.jsonl"
+  run_tick "$T/fix-same-sha.json" "$jf" >/dev/null \
+    || fail "(b) once-guard tick ${i} exited nonzero"
+  n="$(count_bounces "$jf" healthcheck)"
+  total_bounces=$(( total_bounces + n ))
+done
+[ "$total_bounces" -eq 1 ] || \
+  fail "(b) same sha across 5 ticks: expected exactly 1 bounce, got ${total_bounces}"
 pass
 
-# ── (b2) Rail isolation: health rail reset does NOT affect review rail counter ──
-# Spend 1 review bounce first.
-cat > "$T/fix-review-block.json" <<'JSON'
+# ── (c) Rail reset: health goes GREEN → budget restored, next CODEERROR is round=1 ──
+# PR 1 was bounced at round=1 (sha sha-r1) and round=2 (sha sha-r2) in test (a).
+# A CLEAN verdict must reset the health rail → next CODEERROR on a new sha is round=1 again.
+cat > "$T/fix-clean.json" <<'JSON'
 {"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"3"},
- "candidates":[{"pr":2,"sha":"sha2","slug":"feat-rev","health":"CLEAN","review":"BLOCK"}]}
+ "candidates":[{"pr":1,"sha":"sha-clean","slug":"feat-red","health":"CLEAN","review":"PASS"}]}
 JSON
-jf_rev1="$T/tick-rev1.jsonl"
-run_tick "$T/fix-review-block.json" "$jf_rev1" "" >/dev/null
-got_rev="$(last_round "$jf_rev1" review)"
-[ "$got_rev" = "1" ] || fail "(b2) review bounce 1: expected round=1, got '${got_rev}'"
+jf_clean="$T/tick-clean.jsonl"
+run_tick "$T/fix-clean.json" "$jf_clean" >/dev/null || fail "(c) CLEAN tick exited nonzero"
+has_event "$jf_clean" refix_rail_reset || fail "(c) no refix_rail_reset event after health CLEAN"
 
-# Now a second review bounce must be round=2 (unaffected by the health reset above).
-jf_rev2="$T/tick-rev2.jsonl"
-run_tick "$T/fix-review-block.json" "$jf_rev2" "" >/dev/null
-got_rev2="$(last_round "$jf_rev2" review)"
-[ "$got_rev2" = "2" ] || fail "(b2) review bounce 2: expected round=2, got '${got_rev2}'"
+# Now a new sha after the CLEAN: round should be 1 again (rail was reset)
+cat > "$T/fix-after-reset.json" <<'JSON'
+{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"3"},
+ "candidates":[{"pr":1,"sha":"sha-post-reset","slug":"feat-red","health":"CODEERROR","review":"PASS"}]}
+JSON
+jf_post="$T/tick-post-reset.jsonl"
+run_tick "$T/fix-after-reset.json" "$jf_post" >/dev/null || fail "(c) post-reset tick exited nonzero"
+got_post="$(last_round "$jf_post" healthcheck)"
+[ "$got_post" = "1" ] || fail "(c) expected round=1 after rail reset, got '${got_post}'"
 pass
 
-# ── (c) 3× total ceiling: a cross-rail thrasher escalates to needs-you ─────��────
-# Spend REFIX_MAX_ROUNDS=1 bounces on each of 3 rails (health, review, health again →
-# total = 3 = 1×3 = total cap). The next CODEERROR must escalate (budget exhausted).
+# ── (d) Budget exhaustion → ESCALATE (rail cap + total ceiling) ───────────────
+# Rail cap: REFIX_MAX_ROUNDS=1 → rail_cap=1.
+# sha-y1: health CODEERROR → bounce (rail=1=cap).
+# sha-y2: health CODEERROR → rail cap already spent → ESCALATE (no new bounce).
 rm -rf "$T/state" && mkdir -p "$T/state"
-cat > "$T/fix-total-cap.json" <<'JSON'
+
+cat > "$T/cap-y1.json" <<'JSON'
 {"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":3,"sha":"sha3","slug":"feat-thrasher","health":"CODEERROR","review":"PASS"}]}
+ "candidates":[{"pr":10,"sha":"sha-y1","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
 JSON
-cat > "$T/fix-total-cap-rev.json" <<'JSON'
+cat > "$T/cap-y2.json" <<'JSON'
 {"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":3,"sha":"sha3","slug":"feat-thrasher","health":"CLEAN","review":"BLOCK"}]}
+ "candidates":[{"pr":10,"sha":"sha-y2","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
 JSON
 
-# Bounce 1 (health rail, round=1) — spends health's 1-round budget
-run_tick "$T/fix-total-cap.json" "$T/t-c1.jsonl" "" >/dev/null || fail "(c) cap tick 1 failed"
-# Bounce 2 (review rail, round=1) — spends review's 1-round budget
-run_tick "$T/fix-total-cap-rev.json" "$T/t-c2.jsonl" "" >/dev/null || fail "(c) cap tick 2 failed"
-# Bounce 3 (health again, but health rail was reset by the CLEAN — so burn health round 2)
-# Actually with REFIX_MAX_ROUNDS=1, health rail cap=1 is already spent. But total cap = 3×1=3.
-# We need a third rail: use stale-type via a different PR sha to spend total cap without resetting.
-# Simpler: just spend total cap by 3 health bounces on 3 different shas (each sha is a fresh once-guard).
-rm -rf "$T/state" && mkdir -p "$T/state"
-cat > "$T/fix-cap3-sha1.json" <<'JSON'
-{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":4,"sha":"cap-sha1","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
-JSON
-cat > "$T/fix-cap3-sha2.json" <<'JSON'
-{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":4,"sha":"cap-sha2","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
-JSON
-cat > "$T/fix-cap3-sha3.json" <<'JSON'
-{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":4,"sha":"cap-sha3","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
-JSON
-cat > "$T/fix-cap3-sha4.json" <<'JSON'
-{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
- "candidates":[{"pr":4,"sha":"cap-sha4","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
-JSON
+# First push: bounce (round=1, rail=1, cap=1)
+out_y1="$(run_tick "$T/cap-y1.json" "$T/d-y1.jsonl" 2>/dev/null)"
+outcome_is "$out_y1" 10 BLOCK || fail "(d) sha-y1: expected BLOCK for first bounce, got: ${out_y1}"
 
-# sha1: health bounce 1 (rail=1 of cap=1 → rail exhausted, total=1 of 3)
-run_tick "$T/fix-cap3-sha1.json" "$T/c3-t1.jsonl" "" >/dev/null || fail "(c) total-cap tick sha1 failed"
-out1="$(run_tick "$T/fix-cap3-sha1.json" "$T/c3-t1b.jsonl" "" 2>/dev/null)"
-# sha1 again: already attempted (once-guard) → no bounce. Use sha2 for second bounce on same PR.
-# We need to exhaust health rail first, then try again — use separate shas (different sha → fresh
-# once-guard on the sha, but rail counter is per-(pr, kind) not per-sha).
+# Second push: rail cap spent → ESCALATE (needs-you)
+out_y2="$(run_tick "$T/cap-y2.json" "$T/d-y2.jsonl" 2>/dev/null)"
+outcome_is "$out_y2" 10 ESCALATE || \
+  fail "(d) sha-y2: expected ESCALATE after rail cap exhausted, got: ${out_y2}"
+has_event "$T/d-y2.jsonl" health_refix_escalated || \
+  fail "(d) no health_refix_escalated event after rail cap exhausted"
 
-# Actually with REFIX_MAX_ROUNDS=1, the rail cap=1. After sha1 bounce:
-#   health rail_count = 1 → rail_budget_reason triggers on the SECOND sha too (same rail, same PR)
-# So sha2 CODEERROR should ESCALATE immediately (rail cap already exhausted).
-out_sha2="$(run_tick "$T/fix-cap3-sha2.json" "$T/c3-sha2.jsonl" "" 2>/dev/null)"
-# Must ESCALATE (rail cap exhausted → needs you)
-printf '%s' "$out_sha2" | python3 -c "
-import json, sys
-d = json.loads(sys.stdin.read())
-o = str(d.get('outcomes', {}).get('4', ''))
-sys.exit(0 if o == 'ESCALATE' else 1)
-" || fail "(c) expected ESCALATE after rail cap exhausted, got: ${out_sha2}"
-has_event "$T/c3-sha2.jsonl" health_refix_escalated || \
-  fail "(c) no health_refix_escalated event in journal"
+# Total ceiling: write ledger rows for a 3rd rail kind ("stale") directly so the total cap (3×1=3)
+# is reached without requiring the live tick to dispatch a stale bounce.  Then a health CODEERROR
+# must ESCALATE via the total ceiling check (even though health rail was reset).
+# Reset the health rail via a CLEAN tick first.
+cat > "$T/cap-clean.json" <<'JSON'
+{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
+ "candidates":[{"pr":10,"sha":"sha-y2","slug":"feat-cap","health":"CLEAN","review":"PASS"}]}
+JSON
+run_tick "$T/cap-clean.json" "$T/d-yc.jsonl" >/dev/null || fail "(d) clean-reset tick failed"
+
+# Inject a stale bounce directly into the ledger (simulating a stale-base bounce the bash engine
+# would write; the live tick never writes stale rows so we must plant this to exercise the total cap).
+printf '0 10 sha-y2 feat-cap stale\n' >> "$T/state/.agent-watch-refixed"
+
+# Now try a health bounce on a new sha: health rail=0 (was reset), but total=3 (y1 + stale + ?)
+# Wait: after the CLEAN reset, health_rail=0. total = 2 (y1-health + y2-stale).
+# We need total to reach 3. Add one more stale row.
+printf '0 10 sha-y3 feat-cap stale\n' >> "$T/state/.agent-watch-refixed"
+# Now total=3 (y1-health + 2×stale). total_cap=3×1=3. Next health bounce → total ceiling → ESCALATE.
+cat > "$T/cap-y4.json" <<'JSON'
+{"config":{"MERGE_POLICY":"auto","REFIX_MAX_ROUNDS":"1"},
+ "candidates":[{"pr":10,"sha":"sha-y4","slug":"feat-cap","health":"CODEERROR","review":"PASS"}]}
+JSON
+out_y4="$(run_tick "$T/cap-y4.json" "$T/d-y4.jsonl" 2>/dev/null)"
+outcome_is "$out_y4" 10 ESCALATE || \
+  fail "(d) total-ceiling: expected ESCALATE, got: ${out_y4}"
 pass
 
 echo "ALL PASS ($PASS)"

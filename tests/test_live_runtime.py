@@ -68,11 +68,17 @@ class LiveCase(unittest.TestCase):
         os.environ.pop("HERD_JOURNAL_NOW", None)
 
     def tick(self, candidates, config=None):
-        """A dry-run tick over injected candidates; returns (summary, events)."""
+        """A dry-run tick over injected candidates; returns (summary, events).
+
+        Passes the per-test tmp dir as the LiveState dir so the durable ledger path is always
+        hermetic (never leaks to WORKTREES_DIR from the environment) and each test method gets
+        an isolated ledger.  Within a single test method multiple tick() calls share the same
+        tmp dir — that is intentional: the once-guard should hold intra-method just as it does
+        across ticks in production."""
         scenario = {"candidates": candidates, "config": config or {"MERGE_POLICY": "auto"}}
         journal = LiveJournal(self.jpath)
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
-                     DryRunActuator(journal), journal)
+                     DryRunActuator(journal), journal, state=LiveState(self.tmp))
         res = t.run()
         return res, (events(self.jpath) if os.path.exists(self.jpath) else [])
 
@@ -183,28 +189,51 @@ class TestGateOutcomes(LiveCase):
         _, ev = self._out(health="CODEERROR")
         rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
         self.assertEqual(rb[0]["round"], 1)
-        # With a durable state dir, the round ACCUMULATES across FRESH tick instances (fresh process
-        # per tick is the bug scenario — the fix makes round=1,2,3 across three separate runtimes).
-        state_dir = os.path.join(self.tmp, "state-durable")
+
+    def test_refix_round_advances_per_new_sha(self):
+        # HERD-358: round climbs 1→2→3 only when a NEW SHA is pushed (each sha bounces exactly once).
+        # Each push is a new commit → different sha → once-guard opens → round counter advances.
+        # This MUST use a fresh LiveTick per tick (process boundary is the bug scenario).
+        state_dir = os.path.join(self.tmp, "state-sha-advance")
         os.makedirs(state_dir)
-        jpath = os.path.join(self.tmp, "durable-rounds.jsonl")
         config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
-        cand = {"pr": 99, "sha": "dursha", "slug": "dur-feat", "health": "CODEERROR"}
         rounds = []
-        for _ in range(3):
+        for i, sha in enumerate(["sha-a", "sha-b", "sha-c"], 1):
+            cand = {"pr": 77, "sha": sha, "slug": "feat-adv", "health": "CODEERROR"}
             scenario = {"candidates": [cand], "config": config}
+            jpath = os.path.join(self.tmp, "adv-%d.jsonl" % i)
             j = LiveJournal(jpath)
             state = LiveState(state_dir)
             t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
                          DryRunActuator(j), j, state=state)
             t.run()
-            if os.path.exists(jpath):
-                bounces = [o for o in events(jpath)
-                           if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
-                if bounces:
-                    rounds.append(bounces[-1]["round"])
-            os.remove(jpath)
-        self.assertEqual(rounds, [1, 2, 3], "round must climb via durable ledger, got %s" % rounds)
+            evs = events(jpath) if os.path.exists(jpath) else []
+            rb = [o for o in evs if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
+            self.assertEqual(len(rb), 1, "sha %s: expected exactly 1 refix_bounce" % sha)
+            rounds.append(rb[0]["round"])
+        self.assertEqual(rounds, [1, 2, 3], "round must advance per new sha: %s" % rounds)
+
+    def test_refix_same_sha_bounces_exactly_once(self):
+        # HERD-358 once-guard: walking the SAME (pr,sha,kind) 5 times (simulating 5 ticks on an
+        # unchanged sha) must produce exactly ONE refix_bounce — not 5.
+        state_dir = os.path.join(self.tmp, "state-once-guard")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "5"}
+        cand = {"pr": 88, "sha": "same-sha", "slug": "feat-og", "health": "CODEERROR"}
+        total_bounces = 0
+        for i in range(5):
+            scenario = {"candidates": [cand], "config": config}
+            jpath = os.path.join(self.tmp, "og-%d.jsonl" % i)
+            j = LiveJournal(jpath)
+            state = LiveState(state_dir)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                         DryRunActuator(j), j, state=state)
+            t.run()
+            evs = events(jpath) if os.path.exists(jpath) else []
+            total_bounces += sum(1 for o in evs
+                                 if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck")
+        self.assertEqual(total_bounces, 1,
+                         "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
 class TestReapAndActuation(LiveCase):
