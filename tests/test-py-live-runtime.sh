@@ -44,7 +44,9 @@ PASS=0
 pass() { PASS=$((PASS + 1)); }
 
 # ── (1) unit invariants ─────────────────────────────────────────────────────────────────────────
-PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_live_runtime.py" >/dev/null 2>&1 \
+mkdir -p "$T/hermetic"
+HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$T/hermetic" \
+  PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_live_runtime.py" >/dev/null 2>&1 \
   || fail "stdlib unit tests failed (run: PYTHONPATH=pysrc python3 tests/test_live_runtime.py)"
 pass
 

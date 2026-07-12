@@ -44,9 +44,12 @@ run() {  # run <fixture> <journal> — dry-run the tick, echo the result JSON (n
 }
 
 # ── (1) unit invariants ─────────────────────────────────────────────────────────────────────────
-PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_statemachine_props.py" >/dev/null 2>&1 \
+mkdir -p "$T/hermetic"
+HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$T/hermetic" \
+  PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_statemachine_props.py" >/dev/null 2>&1 \
   || fail "statemachine unit invariants failed (run: PYTHONPATH=pysrc python3 tests/test_statemachine_props.py)"
-PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_live_runtime.py" >/dev/null 2>&1 \
+HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$T/hermetic" \
+  PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_live_runtime.py" >/dev/null 2>&1 \
   || fail "live-runtime unit invariants failed (run: PYTHONPATH=pysrc python3 tests/test_live_runtime.py)"
 pass
 

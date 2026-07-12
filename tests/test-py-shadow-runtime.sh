@@ -36,7 +36,11 @@ PASS=0
 pass() { PASS=$((PASS + 1)); }
 
 # ── (1) unit invariants ───────────────────────────────────────────────────────────────────────────
-PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_shadow_runtime.py" >/dev/null 2>&1 \
+# WORKTREES_DIR="" (empty, falsy) so ShadowJournal(path=None) finds no destination, as the
+# test_journal_failure_never_raises assertion requires; a non-empty WORKTREES_DIR would resolve a
+# path and cause that test to return True instead of False.
+HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="" \
+  PYTHONPATH="$REPO/pysrc" python3 "$HERE/test_shadow_runtime.py" >/dev/null 2>&1 \
   || fail "stdlib unit tests failed (run: PYTHONPATH=pysrc python3 tests/test_shadow_runtime.py)"
 pass
 
