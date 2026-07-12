@@ -24,10 +24,26 @@ import os
 import tempfile
 import unittest
 
+import subprocess
+import time
+
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
+                               LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
-                               _select_candidates, _marker_write, _marker_live, WAIT, PENDING)
+                               _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               WAIT, PENDING,
+                               branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
+
+
+def _make_worktree(pool, slug):
+    """Create a minimal on-disk git worktree ``<pool>/<slug>`` (a dir with a ``.git`` pointer) so the
+    pool-membership / pre-dispatch guards see a real worktree — hermetic, no ``git`` invoked."""
+    d = os.path.join(pool, slug)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".git"), "w", encoding="utf-8") as fh:
+        fh.write("gitdir: /pool/.git/worktrees/%s\n" % slug)
+    return d
 
 
 def events(path):
@@ -184,7 +200,9 @@ class TestReapAndActuation(LiveCase):
         self.assertEqual(len(reaps), 1)
         self.assertEqual(reaps[0]["reason"], "merged")
 
-    def test_failed_merge_escalates_and_never_reaps(self):
+    def test_refused_merge_stays_blessed_and_never_reaps(self):
+        # HERD-352: a refused merge (actuator returns False) STAYS BLESSED — it HOLDS and re-attempts next
+        # tick, never reaps, never a silent drop. Escalation is only after N consecutive refusals (below).
         class FailMerge(DryRunActuator):
             def merge(self, cand):
                 return False
@@ -194,7 +212,29 @@ class TestReapAndActuation(LiveCase):
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
                      FailMerge(journal), journal)
         res = t.run()
-        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        self.assertEqual(res["outcomes"]["1"], "HOLD")   # stays blessed, not ESCALATE on the first refusal
+        self.assertFalse([o for o in events(self.jpath) if o["event"] == "reap"])
+
+    def test_repeated_refusals_escalate_with_loud_row_after_n(self):
+        # HERD-352: with a REAL state dir the refusal counter persists across ticks; the Nth consecutive
+        # refusal escalates and journals a loud needs_you row so a wedged merge cannot fail silently.
+        class FailMerge(DryRunActuator):
+            def merge(self, cand):
+                return False
+        scenario = {"candidates": [self.one(1, review="PASS", health="CLEAN")],
+                    "config": {"MERGE_POLICY": "auto"}}
+        outcomes = []
+        for _ in range(LR._MERGE_REFUSE_MAX):
+            journal = LiveJournal(self.jpath)
+            t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                         FailMerge(journal), journal, state=LiveState(self.tmp))
+            outcomes.append(t.run()["outcomes"]["1"])
+        self.assertEqual(outcomes[:-1], ["HOLD"] * (LR._MERGE_REFUSE_MAX - 1))  # below N: stays blessed
+        self.assertEqual(outcomes[-1], "ESCALATE")                               # at N: escalate
+        needs = [o for o in events(self.jpath) if o["event"] == "merge_refused_escalated"]
+        self.assertEqual(len(needs), 1)
+        self.assertEqual(needs[0]["reason"], "merge refused")
+        self.assertEqual(needs[0]["count"], LR._MERGE_REFUSE_MAX)
         self.assertFalse([o for o in events(self.jpath) if o["event"] == "reap"])
 
 
@@ -247,6 +287,162 @@ class TestReviewDispatchShape(LiveCase):
             self.assertIn(k, rd[0])
         self.assertEqual(rd[0]["model"], "opus-x")      # bash env-fallback chain
         self.assertTrue(rd[0]["log_path"])              # the reviewer's result-file path, non-empty
+
+
+class _FakeCompleted:
+    """Stand-in for a subprocess.CompletedProcess — carries a captured stdout for the API verify read."""
+
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+
+
+class _RecordingSub:
+    """A subprocess stand-in that RECORDS every argv and returns scripted results — proves the LIVE
+    actuator's gh shape without ever launching gh. ``view_state`` scripts what ``gh pr view`` reports;
+    ``fail`` (a set of subcommand tokens) makes those calls raise, simulating a gh outage / non-zero exit."""
+
+    DEVNULL = subprocess.DEVNULL
+
+    def __init__(self, view_state="MERGED", fail=()):
+        self.calls = []
+        self.view_state = view_state
+        self.fail = set(fail)
+
+    def run(self, argv, *a, **k):
+        self.calls.append(list(argv))
+        # argv[1] is the gh subcommand: "pr" (merge/view) or "api" (statuses post).
+        if "api" in argv and "api" in self.fail:
+            raise subprocess.CalledProcessError(1, argv)
+        if argv[:3] == ["gh", "pr", "merge"]:
+            if "merge" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted("")
+        if argv[:3] == ["gh", "pr", "view"]:
+            if "view" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted(self.view_state + "\n")
+        return _FakeCompleted("")
+
+
+class TestLiveMergeVerify(LiveCase):
+    """HERD-352: the LIVE merge actuator verifies via the GitHub API that the PR actually reached MERGED
+    before it treats the merge as done — a stubbed-gh 'refusal sim' proves an unconfirmed merge is
+    journaled `merge_refused`, never `merge`, never reaped. Hermetic: subprocess is stubbed, no gh runs."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def _cand(self):
+        return LiveCandidate(7, "deadbeef", slug="feat-x", worktree="")
+
+    def test_merged_state_journals_merge_and_returns_true(self):
+        sub = _RecordingSub(view_state="MERGED")
+        act = self._actuator(sub)
+        self.assertTrue(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertEqual(len([o for o in ev if o["event"] == "merge"]), 1)
+        self.assertFalse([o for o in ev if o["event"] == "merge_refused"])
+        # It ran `gh pr view` to VERIFY, not just `gh pr merge`.
+        self.assertTrue(any(c[:3] == ["gh", "pr", "view"] for c in sub.calls))
+
+    def test_unmerged_state_is_refused_not_merged(self):
+        sub = _RecordingSub(view_state="OPEN")
+        act = self._actuator(sub)
+        self.assertFalse(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertFalse([o for o in ev if o["event"] == "merge"])       # never claims a merge it can't confirm
+        ref = [o for o in ev if o["event"] == "merge_refused"]
+        self.assertEqual(len(ref), 1)
+        self.assertEqual(ref[0]["state"], "OPEN")
+
+    def test_nonzero_merge_exit_but_api_confirms_merged(self):
+        # HERD-221 shape: gh pr merge exits non-zero (e.g. branch-delete race) yet the PR IS merged —
+        # the API state, not the exit code, is authoritative, so this is a real merge, not a refusal.
+        sub = _RecordingSub(view_state="MERGED", fail={"merge"})
+        act = self._actuator(sub)
+        self.assertTrue(act.merge(self._cand()))
+        self.assertEqual(len([o for o in events(self.jpath) if o["event"] == "merge"]), 1)
+
+    def test_unreadable_state_fails_closed_with_honest_label(self):
+        # HONEST LABELS (HERD-232): a gh outage on the verify read is NOT a genuine refusal — it fails
+        # CLOSED as merge_gh_unreadable (an infra event), never merge, never a fabricated merge_refused.
+        sub = _RecordingSub(fail={"view"})
+        act = self._actuator(sub)
+        self.assertFalse(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertEqual(len([o for o in ev if o["event"] == "merge_gh_unreadable"]), 1)
+        self.assertFalse([o for o in ev if o["event"] == "merge_refused"])
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+
+
+class TestLiveGateStatusPost(LiveCase):
+    """HERD-352: on gates-clear the LIVE actuator posts a herd/gates=success commit status (GATE_STATUS=on
+    contract) and journals `gate_status`; GATE_STATUS=off is byte-inert. Hermetic: subprocess is stubbed."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_post_uses_success_only_status_shape(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        self.assertTrue(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        # The gh api call carries the exact success-only status shape bash posts.
+        api = [c for c in sub.calls if "api" in c][0]
+        self.assertIn("repos/{owner}/{repo}/statuses/deadbeef", api)
+        self.assertIn("state=success", api)
+        self.assertIn("context=herd/gates", api)
+        gs = [o for o in events(self.jpath) if o["event"] == "gate_status"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual(gs[0]["state"], "success")
+        self.assertEqual(gs[0]["context"], "herd/gates")
+
+    def test_failed_post_journals_nothing_and_retries(self):
+        sub = _RecordingSub(fail={"api"})
+        act = self._actuator(sub)
+        self.assertFalse(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []   # a failed post journals nothing
+        self.assertFalse([o for o in ev if o["event"] == "gate_status"])
+
+    def test_tick_posts_once_when_on_and_never_when_off(self):
+        # Drive the whole blessed tick with a recording actuator to prove the LEVER: on → exactly one post
+        # per (pr,sha) across re-walks; off → byte-inert (zero posts, zero gate_status journal lines).
+        class Recorder(DryRunActuator):
+            def __init__(self, journal):
+                super().__init__(journal)
+                self.posts = 0
+
+            def post_gate_status(self, cand):
+                self.posts += 1
+                self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
+                                    "context", "herd/gates")
+                return True
+
+        def run(config):
+            journal = LiveJournal(self.jpath)
+            rec = Recorder(journal)
+            state = LiveState(self.tmp)
+            t1 = LiveTick(config, FixtureDiscovery({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          FixtureGates({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          rec, journal, state=state)
+            t1.run()
+            # Re-walk the same (pr,sha): the ledger marker must suppress a second post.
+            t2 = LiveTick(config, FixtureDiscovery({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          FixtureGates({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          rec, journal, state=LiveState(self.tmp))
+            t2.run()
+            return rec.posts
+
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "on"}), 1)   # posted once, deduped
+        # Fresh state dir for the off run so the on-run's ledger marker doesn't mask the lever.
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "live-test.jsonl")
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "off"}), 0)  # byte-inert
 
 
 class TestVerdictParser(unittest.TestCase):
@@ -561,6 +757,500 @@ class TestScopeFilter(unittest.TestCase):
             self.assertNotIn("2", res["outcomes"])       # bob never classified
         finally:
             os.environ.pop("HERD_JOURNAL_NOW", None)
+
+
+class MergeFairnessFreeze(unittest.TestCase):
+    """MERGE_FAIRNESS starvation freeze (§6.2, HERD-340): a would-be sibling merge is held one window
+    for a starved head-of-line PR, and the whole feature is byte-identical when the lever is off."""
+
+    def _run(self, scenario):
+        # A fresh, isolated state dir per run: the dry-run tick uses it as the freeze substrate, so the
+        # one-window guard never carries across scenarios that reuse a (pr,sha). Passing an explicit dir
+        # (not LiveState(None)) also keeps the test hermetic if the gate env has WORKTREES_DIR set.
+        tmp = tempfile.mkdtemp()
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        tick = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                        DryRunActuator(journal), journal, state=LiveState(os.path.join(tmp, "state")))
+        return tick.run(), journal.path
+
+    def _scenario(self, fairness, starved_laps=3, starved_review="PASS"):
+        return {"config": {"MERGE_POLICY": "auto", "MERGE_FAIRNESS": fairness},
+                "candidates": [
+                    {"pr": 1, "sha": "a1", "slug": "starved", "review": starved_review,
+                     "health": "CLEAN", "worktree": "/wt/1", "restale_laps": starved_laps},
+                    {"pr": 2, "sha": "a2", "slug": "sibling", "review": "PASS",
+                     "health": "CLEAN", "worktree": "/wt/2"}]}
+
+    def test_off_is_byte_identical_the_sibling_merges(self):
+        # Lever off: the exact scenario that freezes when on must merge the ready sibling, with NO
+        # fairness event of any kind — the byte-identical-when-off doctrine (AGENTS.md).
+        res, jpath = self._run(self._scenario("off"))
+        self.assertIn("2", res["merged"])
+        self.assertEqual(res["outcomes"]["2"], "MERGE")
+        evs = {e["event"] for e in events(jpath)}
+        self.assertNotIn("merge_fairness_freeze", evs)
+        self.assertNotIn("pr_restale", evs)
+        self.assertNotIn("pr_starvation", evs)
+
+    def test_on_freezes_the_sibling_while_the_starved_pr_is_still_gating(self):
+        # pr1 starved and still finishing its final gate (review WAIT → PENDING); pr2 would merge but is
+        # frozen for one window so pr1 keeps its clean base.
+        res, jpath = self._run(self._scenario("on", starved_review="WAIT"))
+        self.assertEqual(res["merged"], [])
+        self.assertEqual(res["outcomes"]["1"], PENDING)
+        self.assertEqual(res["outcomes"]["2"], "HOLD")     # frozen, not merged
+        frz = [e for e in events(jpath) if e["event"] == "merge_fairness_freeze"]
+        self.assertEqual(len(frz), 1)
+        self.assertEqual(frz[0]["pr"], 2)
+        # journal.sh integer-coercion renders a lone "1" as 1 — the head-of-line PR it is held for.
+        self.assertEqual(str(frz[0]["starved"]), "1")
+
+    def test_starved_pr_is_excluded_from_its_own_freeze_and_still_merges(self):
+        # When the starved PR is itself gates-ready this tick it MERGES (the win), while its sibling
+        # freezes — a starved PR never blocks itself.
+        res, _ = self._run(self._scenario("on", starved_review="PASS"))
+        self.assertEqual(res["merged"], ["1"])
+        self.assertEqual(res["outcomes"]["2"], "HOLD")
+
+    def test_below_threshold_never_freezes(self):
+        # laps=2 < threshold(3): no head-of-line starvation, so both green PRs merge exactly as off.
+        res, jpath = self._run(self._scenario("on", starved_laps=2))
+        self.assertEqual(sorted(res["merged"]), ["1", "2"])
+        self.assertNotIn("merge_fairness_freeze", {e["event"] for e in events(jpath)})
+
+    def test_human_verify_hold_never_triggers_a_freeze(self):
+        # A starved PR parked on a human-verify hold would NOT auto-merge even with a clean window, so it
+        # must never freeze siblings (that would deadlock the queue behind a human). The sibling merges.
+        scen = {"config": {"MERGE_POLICY": "auto", "MERGE_FAIRNESS": "on"},
+                "candidates": [
+                    {"pr": 1, "sha": "a1", "slug": "held", "review": "PASS", "health": "CLEAN",
+                     "hv_hold": True, "restale_laps": 5},
+                    {"pr": 2, "sha": "a2", "slug": "sibling", "review": "PASS", "health": "CLEAN",
+                     "worktree": "/wt/2"}]}
+        res, jpath = self._run(scen)
+        self.assertIn("2", res["merged"])
+        self.assertNotIn("merge_fairness_freeze", {e["event"] for e in events(jpath)})
+
+    def test_lever_off_leaves_the_candidate_out_of_the_starved_set(self):
+        # The internal starved set is only populated under the lever — a direct assertion on the guard.
+        scen = self._scenario("off")
+        t = LiveTick(scen["config"], FixtureDiscovery(scen), FixtureGates(scen),
+                     DryRunActuator(LiveJournal(None)), LiveJournal(None), state=LiveState(None))
+        t.run()
+        self.assertEqual(t._starved, set())
+        self.assertFalse(t._fairness)
+
+    def test_threshold_is_configurable(self):
+        # MERGE_FAIRNESS_STARVE_THRESHOLD lowers the bar: laps=1 now starves and freezes the sibling.
+        scen = self._scenario("on", starved_laps=1, starved_review="WAIT")
+        scen["config"]["MERGE_FAIRNESS_STARVE_THRESHOLD"] = "1"
+        res, _ = self._run(scen)
+        self.assertEqual(res["outcomes"]["2"], "HOLD")
+
+
+class MergeFairnessState(unittest.TestCase):
+    """The re-stale ledger (LiveState) — the always-local counter the freeze reads (§6.2 / HERD-340)."""
+
+    def test_restale_ledger_counts_and_dedups(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        self.assertEqual(st.restale_count("7"), 0)
+        # first lap on sha a → 1; a REPEAT of the same (pr,sha,kind) is deduped (no inflation).
+        self.assertEqual(st.note_restale("7", "a", "stale"), 1)
+        self.assertIsNone(st.note_restale("7", "a", "stale"))
+        self.assertEqual(st.restale_count("7"), 1)
+        # a new sha is a new lap.
+        self.assertEqual(st.note_restale("7", "b", "stale"), 2)
+        self.assertEqual(st.restale_count("7"), 2)
+        # ledger row format matches the bash tree: "<epoch> <pr> <sha> <kind>".
+        with open(st.restale_ledger(), encoding="utf-8") as fh:
+            rows = [ln.split() for ln in fh if ln.strip()]
+        self.assertTrue(all(len(r) == 4 and r[1] == "7" and r[3] == "stale" for r in rows))
+
+    def test_black_hole_state_records_nothing(self):
+        st = LiveState(None)
+        st.dir = None                    # force the no-dir degrade, independent of the ambient env
+        self.assertIsNone(st.note_restale("7", "a", "stale"))
+        self.assertEqual(st.restale_count("7"), 0)
+
+    def test_gate_work_invested_needs_real_investment(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        cand = LiveCandidate(pr=9, sha="s9")
+        self.assertFalse(st.gate_work_invested(cand))       # nothing spent yet → no lap owed
+        st.record_review("9", "s9", "PASS")
+        self.assertTrue(st.gate_work_invested(cand))         # a recorded verdict IS investment
+
+    def test_fairness_prepass_journals_starvation_past_threshold(self):
+        tmp = tempfile.mkdtemp()
+        st = LiveState(tmp)
+        # pre-seed 2 laps so this tick's 3rd lap crosses the threshold and journals pr_starvation.
+        st.note_restale("3", "x1", "stale")
+        st.note_restale("3", "x2", "stale")
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        cand = LiveCandidate(pr=3, sha="x3", stale=True)
+        st.record_review("3", "x3", "PASS")                  # investment on the re-staled sha
+        scen = {"config": {"MERGE_FAIRNESS": "on"}, "candidates": []}
+        tick = LiveTick(scen["config"], FixtureDiscovery(scen), FixtureGates(scen),
+                        DryRunActuator(journal), journal, state=st)
+        tick._fairness_prepass([cand])
+        evs = [e["event"] for e in events(journal.path)]
+        self.assertIn("pr_restale", evs)
+        self.assertIn("pr_starvation", evs)
+
+class TestSupersessionCancel(unittest.TestCase):
+    """HERD-341: discovery → supersession-cancel. A candidate whose head sha has moved past an in-flight
+    worker's sha TERMs that doomed worker — by a SESSION kill of its whole detached subtree (HERD-283/348:
+    the worker is a session leader, so the leader's process group alone would miss the timeout-re-grouped
+    suite children), plus the reviewer's STAMPED PANE retired — and journals `gate_superseded` (contract
+    §2.4/§6.1). Hermetic: the only processes are throwaway `sleep`s this test spawns; no gh/git/model."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = LiveState(self.tmp)
+        self.journal = LiveJournal(os.path.join(self.tmp, "j.jsonl"))
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        os.environ["HERD_HEALTH_TERM_SLEEP"] = "0.01"    # no real wall-clock in the TERM→KILL grace
+        self._procs = []
+
+    def tearDown(self):
+        for p in self._procs:
+            try:
+                p.kill(); p.wait(timeout=2)
+            except Exception:
+                pass
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+        os.environ.pop("HERD_HEALTH_TERM_SLEEP", None)
+
+    def _worker(self):
+        """A throwaway worker in its OWN session (start_new_session → session leader, sid == pid), like a
+        dispatched gate worker. Its marker records that session; a supersession reaps it. Returns Popen."""
+        p = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self._procs.append(p)
+        return p
+
+    def _events(self):
+        jp = self.journal.path
+        return events(jp) if os.path.exists(jp) else []
+
+    def _tick(self):
+        return LiveTick({"MERGE_POLICY": "observe"}, FixtureDiscovery({"candidates": []}),
+                        FixtureGates({"candidates": []}), DryRunActuator(self.journal),
+                        self.journal, state=self.state)
+
+    def _alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    # ── health rail: a superseded sha's suite worker is session-killed + journaled ──
+    def test_stale_health_worker_terminated_and_journaled(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 5, "oldsha")
+        _marker_write(marker, p.pid)                       # records the worker's session (line 4)
+        # scratch the worker left behind, keyed to the OLD sha, must be reaped too.
+        for f in (self.state.health_dispatch_file_sha(5, "oldsha"),
+                  self.state.health_result_file_sha(5, "oldsha")):
+            open(f, "w").close()
+        self._tick()._supersede_stale([LiveCandidate(5, "newsha")])
+        self.assertFalse(self._alive(p.pid))              # the doomed worker is dead
+        self.assertFalse(os.path.exists(marker))          # marker reaped
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file_sha(5, "oldsha")))
+        gs = [o for o in self._events() if o["event"] == "gate_superseded"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual((gs[0]["rail"], gs[0]["old_sha"], gs[0]["new_sha"], gs[0]["action"]),
+                         ("health", "oldsha", "newsha", "session_kill"))
+
+    # ── review rail: a superseded reviewer is terminated + its stamped pane retired ──
+    def test_stale_reviewer_terminated_pane_retired_and_journaled(self):
+        p = self._worker()
+        marker = self.state._sha_path(".review-inflight", 8, "old8")
+        _marker_write(marker, p.pid)
+        with open(self.state.review_registry_file_sha(8, "old8"), "w") as fh:
+            fh.write("%s review-pane-42\n" % p.pid)        # the reviewer's STAMPED pane
+        self._tick()._supersede_stale([LiveCandidate(8, "new8")])
+        self.assertFalse(self._alive(p.pid))
+        self.assertFalse(os.path.exists(marker))
+        self.assertFalse(os.path.exists(self.state.review_registry_file_sha(8, "old8")))
+        gs = [o for o in self._events() if o["event"] == "gate_superseded" and o["rail"] == "review"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual(gs[0]["action"], "pane_retired")
+        self.assertEqual(gs[0]["pane"], "review-pane-42")   # the stamp is carried into the forensic record
+
+    # ── the CURRENT sha's worker is NEVER touched ──
+    def test_current_sha_worker_is_preserved(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 5, "cur")
+        _marker_write(marker, p.pid)
+        self._tick()._supersede_stale([LiveCandidate(5, "cur")])
+        self.assertTrue(self._alive(p.pid))               # still running — its sha IS the head
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual([o for o in self._events() if o["event"] == "gate_superseded"], [])
+
+    # ── a foreign PR's stale worker is not touched by an unrelated candidate ──
+    def test_only_matching_pr_is_superseded(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 7, "old7")
+        _marker_write(marker, p.pid)
+        self._tick()._supersede_stale([LiveCandidate(5, "newsha")])   # candidate is PR 5, not 7
+        self.assertTrue(self._alive(p.pid))
+        self.assertTrue(os.path.exists(marker))
+
+    # ── a dead/recycled marker is reaped with no signal, no false gate_superseded ──
+    def test_dead_marker_reaped_without_signal(self):
+        marker = self.state._sha_path(".health-inflight", 5, "old")
+        with open(marker, "w") as fh:
+            fh.write("999999\n\n0\n999999\n")             # a pid that isn't alive
+        self.assertTrue(_terminate_worker(marker))        # already gone → True
+        self._tick()._supersede_stale([LiveCandidate(5, "new")])
+        self.assertFalse(os.path.exists(marker))          # reaped
+        gs = [o for o in self._events() if o["event"] == "gate_superseded"]
+        self.assertEqual(len(gs), 1)                      # journaled once (the stale sha was cleared)
+
+    # ── the session kill reaps a whole SUBTREE, not just the leader (the HERD-283/348 property) ──
+    def test_session_kill_reaps_child_subtree(self):
+        # A leader in its own session that forks a child sharing that session; a single-pid kill of the
+        # leader would leave the child running — the SESSION kill reaps both.
+        script = ("import os,sys,time\n"
+                  "cpid=os.fork()\n"
+                  "if cpid==0:\n"
+                  "  os.execvp('sleep',['sleep','300'])\n"
+                  "open(sys.argv[1],'w').write(str(cpid))\n"
+                  "time.sleep(300)\n")
+        pidfile = os.path.join(self.tmp, "child.pid")
+        leader = subprocess.Popen(["python3", "-c", script, pidfile], start_new_session=True)
+        self._procs.append(leader)
+        for _ in range(200):
+            if os.path.exists(pidfile) and open(pidfile).read().strip():
+                break
+            time.sleep(0.01)
+        child = int(open(pidfile).read().strip())
+        marker = self.state._sha_path(".health-inflight", 9, "old9")
+        _marker_write(marker, leader.pid)                 # records the leader's session
+        self._tick()._supersede_stale([LiveCandidate(9, "new9")])
+        self.assertFalse(self._alive(leader.pid))
+        # The child (a separate pid in the same session) must also be gone — proves the session kill.
+        for _ in range(200):
+            if not self._alive(child):
+                break
+            time.sleep(0.01)
+        self.assertFalse(self._alive(child), "session-kill must reap the child subtree, not just the leader")
+
+    # ── sim/dry-run (no state dir) is a hard no-op ──
+    def test_no_state_dir_is_noop(self):
+        j = LiveJournal(None)
+        t = LiveTick({"MERGE_POLICY": "auto"}, FixtureDiscovery({"candidates": []}),
+                     FixtureGates({"candidates": []}), DryRunActuator(j), j, state=LiveState(None))
+        t._supersede_stale([LiveCandidate(1, "s1")])       # must not raise, must not journal
+        self.assertEqual(list(LiveState(None).stale_inflight(".health-inflight", 1, "s1")), [])
+
+    # ── end-to-end: a full tick supersedes a stale worker, then walks the fresh candidate to merge ──
+    def test_full_tick_supersedes_then_walks(self):
+        p = self._worker()
+        _marker_write(self.state._sha_path(".health-inflight", 3, "old3"), p.pid)
+        scenario = {"candidates": [{"pr": 3, "sha": "new3", "review": "PASS", "health": "CLEAN"}],
+                    "config": {"MERGE_POLICY": "auto"}}
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(self.journal), self.journal, state=self.state)
+        res = t.run()
+        self.assertEqual(res["outcomes"]["3"], "MERGE")
+        self.assertFalse(self._alive(p.pid))
+        ev = self._events()
+        self.assertTrue([o for o in ev if o["event"] == "gate_superseded"])
+        self.assertTrue([o for o in ev if o["event"] == "merge"])
+
+
+class TestSlugDerivation(unittest.TestCase):
+    """HERD-346 leg 1: derive the SLUG from the head branch (bash ``herd_branch_parse`` convention) so the
+    worktree resolves — the live tick shelled healthcheck.sh with slug=full-branch + an empty worktree (#453)."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("BRANCH_TEMPLATE", "TREES", "WORKTREES_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_template_strips_feat_prefix(self):
+        self.assertEqual(branch_to_slug("feat/unlock-supersession-cancel"), "unlock-supersession-cancel")
+
+    def test_empty_branch_is_empty_slug(self):
+        self.assertEqual(branch_to_slug(""), "")
+
+    def test_non_matching_branch_keeps_whole_name(self):
+        # A branch without the template prefix parses to itself (bash herd_branch_parse: no prefix strip).
+        self.assertEqual(branch_to_slug("hotfix-1"), "hotfix-1")
+
+    def test_custom_prefix_template(self):
+        os.environ["BRANCH_TEMPLATE"] = "wip/{slug}"
+        self.assertEqual(branch_to_slug("wip/foo-bar"), "foo-bar")
+
+    def test_ref_prefix_template_treats_ref_as_wildcard(self):
+        # '{ref}/{slug}' — strip up to the last '/' (the separator trailing {ref}), leaving the slug.
+        os.environ["BRANCH_TEMPLATE"] = "{ref}/{slug}"
+        self.assertEqual(branch_to_slug("HERD-346/live-slug-regression"), "live-slug-regression")
+
+    def test_suffix_template(self):
+        os.environ["BRANCH_TEMPLATE"] = "{slug}-dev"
+        self.assertEqual(branch_to_slug("payment-dev"), "payment")
+
+    def test_unusable_template_degrades_to_default(self):
+        os.environ["BRANCH_TEMPLATE"] = "no-placeholder"     # no {slug} → default feat/{slug}
+        self.assertEqual(branch_to_slug("feat/x"), "x")
+
+    def test_worktree_for_slug_is_pool_join(self):
+        os.environ["TREES"] = "/pool"
+        self.assertEqual(_worktree_for_slug("unlock-supersession-cancel"),
+                         "/pool/unlock-supersession-cancel")
+
+    def test_worktree_for_slug_empty_without_pool(self):
+        self.assertEqual(_worktree_for_slug("x"), "")        # no pool configured → no fabricated path
+
+    def test_discovery_derives_slug_and_worktree(self):
+        # discover_via_graphql maps headRefName -> slug -> worktree; stub gh so nothing shells out.
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "unlock-supersession-cancel")
+        payload = {"data": {"repository": {"pullRequests": {"nodes": [
+            {"number": 450, "headRefName": "feat/unlock-supersession-cancel",
+             "headRefOid": "3ca3eab", "baseRefName": "main", "mergeStateStatus": "CLEAN",
+             "reviewDecision": "", "author": {"login": "brian"},
+             "assignees": {"nodes": []}, "labels": {"nodes": []}}]}}}}
+
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(payload)
+                return R()
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            cands = LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].slug, "unlock-supersession-cancel")     # not the full branch
+        self.assertEqual(cands[0].worktree, os.path.join(pool, "unlock-supersession-cancel"))
+
+
+class TestPoolScope(unittest.TestCase):
+    """HERD-346 leg 3: a PR with NO worktree in this pool is FOREIGN and never a candidate — the port of
+    bash's worktree-first discovery (_discover_feature_worktrees). Fail-soft when no pool is configured."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in ("TREES", "WORKTREES_DIR")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_foreign_pool_pr_is_dropped(self):
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "mine")                          # PR 1 has a real worktree
+        mine = LiveCandidate(pr=1, sha="a", slug="mine", worktree=os.path.join(pool, "mine"))
+        foreign = LiveCandidate(pr=2, sha="b", slug="theirs", worktree=os.path.join(pool, "theirs"))
+        kept = _pool_scoped([mine, foreign])
+        self.assertEqual([c.pr for c in kept], ["1"])         # #2 (no worktree on disk) never classified
+
+    def test_fail_soft_passthrough_without_pool(self):
+        # No $TREES/$WORKTREES_DIR configured → the pool check no-ops (byte-identical to before).
+        a = LiveCandidate(pr=1, sha="a", slug="x", worktree="/nope/x")
+        b = LiveCandidate(pr=2, sha="b", slug="y", worktree="")
+        self.assertEqual([c.pr for c in _pool_scoped([a, b])], ["1", "2"])
+
+    def test_is_worktree_predicate(self):
+        pool = tempfile.mkdtemp()
+        real = _make_worktree(pool, "real")
+        self.assertTrue(_is_worktree(real))
+        self.assertFalse(_is_worktree(os.path.join(pool, "absent")))
+        self.assertFalse(_is_worktree(""))
+        os.makedirs(os.path.join(pool, "bare"))              # a dir with no .git is not a worktree
+        self.assertFalse(_is_worktree(os.path.join(pool, "bare")))
+
+    def test_graphql_discovery_applies_pool_scope(self):
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "mine")
+        cands = [LiveCandidate(pr=1, sha="a", slug="mine", author="me",
+                               worktree=os.path.join(pool, "mine")),
+                 LiveCandidate(pr=2, sha="b", slug="gone", author="me",
+                               worktree=os.path.join(pool, "gone"))]
+        disc = LR._GraphQLDiscovery({"WATCHER_SCOPE": "mine"})
+        orig = LR.discover_via_graphql
+        LR.discover_via_graphql = lambda repo=None: list(cands)
+        try:
+            got = disc.discover()
+        finally:
+            LR.discover_via_graphql = orig
+        self.assertEqual([c.pr for c in got], ["1"])
+
+
+class TestPreDispatchWorktreeGuard(unittest.TestCase):
+    """HERD-346 leg 2: a resolved-but-ABSENT worktree REFUSES health dispatch (dispatch_refused,
+    reason=no-worktree) and HOLDS — never shells healthcheck.sh into a phantom CODEERROR (#453)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        self.state = LiveState(self.tmp)
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        self.journal = LiveJournal(self.jpath)
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _gates(self):
+        dispatched = []
+
+        class Stub(LiveGates):
+            def _dispatch_health(self, cand):
+                dispatched.append(cand.pr)
+                _marker_write(self.state.health_inflight_file(cand), os.getpid())
+
+        return Stub("/home", self.state, self.journal), dispatched
+
+    def _events(self):
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    def test_missing_worktree_refuses_dispatch(self):
+        c = LiveCandidate(pr=7, sha="s", slug="gone", worktree=os.path.join(self.tmp, "gone"))
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)                  # holds, never CODEERROR
+        self.assertEqual(dispatched, [])                     # the suite is never shelled at a missing tree
+        refused = [e for e in self._events() if e["event"] == "dispatch_refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["reason"], "no-worktree")
+        self.assertEqual(refused[0]["rail"], "health")
+        self.assertEqual(str(refused[0]["pr"]), "7")
+
+    def test_present_worktree_dispatches(self):
+        _make_worktree(self.tmp, "here")
+        c = LiveCandidate(pr=8, sha="s", slug="here", worktree=os.path.join(self.tmp, "here"))
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)
+        self.assertEqual(dispatched, ["8"])                  # real worktree → normal async dispatch
+        self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
+
+    def test_empty_worktree_is_byte_identical(self):
+        # A hermetic/legacy candidate carrying no worktree is UNKNOWN, not absent → dispatch unchanged.
+        c = LiveCandidate(pr=9, sha="s", slug="feat-9")
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(c), WAIT)
+        self.assertEqual(dispatched, ["9"])
+        self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
 
 
 if __name__ == "__main__":

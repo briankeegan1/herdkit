@@ -243,6 +243,9 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
 | `merge` | pr, slug, sha, method, reason(gates_passed) | `agent-watch.sh:5788` |
 | `merge_refused_sha_moved` | pr, slug, sha, state | `agent-watch.sh:5764` |
+| `gate_status` | pr, sha, state(success), context(herd/gates) | `agent-watch.sh:3205` / port `live_runtime.py:LiveActuator.post_gate_status` |
+| `merge_refused` | pr, slug, sha, state, reason(api_not_merged) | port `live_runtime.py:LiveActuator.merge` (HERD-352 — the API verify refuses an unconfirmed merge) |
+| `merge_refused_escalated` | pr, sha, slug, count, reason | port `live_runtime.py:LiveTick._walk` (HERD-352 — loud needs-you row after N refusals) |
 | `main_health` | pr, sha, result(green\|red) | `agent-watch.sh:5420` / red `:5494` |
 | `reconcile` | pr, slug, sha, ref, resolution(explicit-ref\|fuzzy) | `agent-watch.sh:4591` |
 | `reap` | pr, slug, sha, reason | `agent-watch.sh:5278` |
