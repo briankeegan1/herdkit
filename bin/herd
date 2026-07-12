@@ -4702,6 +4702,35 @@ _reload_reparent() {
 # a second main on top of the survivor. A GENUINE orphan duplicate is listed, and killed.
 _list_project_watchers() { watcher_list_mains; }
 
+# _watcher_proc_start_ticks <pid> — start time in jiffies from /proc/<pid>/stat (field 22), or 0.
+# Linux-only; returns 0 gracefully on macOS/other. Used for post-restart age verification.
+_watcher_proc_start_ticks() {
+  awk '{print $22}' /proc/"${1:-0}"/stat 2>/dev/null || printf '0'
+}
+
+# _watcher_lock_holder_msg — describe the current lock holder for a LOUD restart-blocked error.
+# Prints "pid <N> (command…)" when lsof or procfs can identify the holder; "(unknown)" otherwise.
+_watcher_lock_holder_msg() {
+  local holder="" argv=""
+  [ -f "$HERD_WATCHER_LOCK" ] || { printf '(lock absent — no holder found)'; return 0; }
+  if command -v lsof >/dev/null 2>&1; then
+    local _wlhm_all; _wlhm_all="$(lsof -t -- "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+    holder="${_wlhm_all%%$'\n'*}"
+  fi
+  if [ -z "$holder" ]; then
+    holder="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null | tr -dc '0-9')"
+    kill -0 "$holder" 2>/dev/null || holder=""
+  fi
+  if [ -n "$holder" ]; then
+    local _wlhm_argv; _wlhm_argv="$(tr '\0' ' ' </proc/"$holder"/cmdline 2>/dev/null \
+            || ps -o command= -p "$holder" 2>/dev/null || true)"
+    argv="${_wlhm_argv:0:80}"
+    printf 'pid %s%s' "$holder" "${argv:+ (${argv%% })}"
+  else
+    printf '(unknown — check %s)' "$HERD_WATCHER_LOCK"
+  fi
+}
+
 # _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
 # else echo nothing (HERD-209). The atomic REFUSE-or-ADOPT read the launch paths (cmd_pane_watch /
 # cmd_reload) consult right before spawning: a non-empty result means a watcher already owns this
@@ -4840,6 +4869,12 @@ cmd_reload() {
   # printed at the end of the summary below (no-op unless DOCTOR_STARTUP_HINT=on).
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-preflight.sh"
+
+  # HERD-342 leg (a): capture pre-stop identity for post-restart verification.
+  local _cr_pre_pid="" _cr_pre_ticks="0" _cr_cmd_ticks
+  _cr_pre_pid="$(_watcher_lock_pid_if_live)"
+  [ -n "$_cr_pre_pid" ] && _cr_pre_ticks="$(_watcher_proc_start_ticks "$_cr_pre_pid")"
+  _cr_cmd_ticks="$(_watcher_proc_start_ticks "$$")"
 
   # 1. Stop this project's watcher(s) — SIGTERM-poll-SIGKILL-abort + duplicate-watcher guard.
   _stop_project_watcher
@@ -5213,6 +5248,28 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
     "pane below coordinator"|"herdr tab"*) wsum="$wsum · pane $watch_pane · visible ✓" ;;
   esac
 
+  # HERD-342 leg (a): verify the new watcher PID actually CHANGED and postdates this command.
+  if [ -n "$watch_pid" ]; then
+    local _cr_new_ticks; _cr_new_ticks="$(_watcher_proc_start_ticks "$watch_pid")"
+    local _cr_blocked=0
+    if [ "$watch_pid" = "$_cr_pre_pid" ]; then
+      _cr_blocked=1
+    elif [ "$_cr_new_ticks" -gt 0 ] && [ "$_cr_cmd_ticks" -gt 0 ] \
+         && [ "$_cr_new_ticks" -le "$_cr_cmd_ticks" ] 2>/dev/null; then
+      _cr_blocked=1
+    fi
+    if [ "$_cr_blocked" -eq 1 ]; then
+      local _cr_holder_desc; _cr_holder_desc="$(_watcher_lock_holder_msg)"
+      printf '%s❌ watcher restart BLOCKED — the running watcher did not change%s\n' "$c_red" "$c_rst" >&2
+      printf '   lock holder: %s\n' "$_cr_holder_desc" >&2
+      printf '   remedy: kill the holder, then re-run '"'"'herd reload'"'"'\n' >&2
+      journal_append watcher_restart_verify_failed \
+        pre_pid "${_cr_pre_pid:-}" new_pid "$watch_pid" holder "$_cr_holder_desc" \
+        workspace "$WORKSPACE_NAME"
+      return 1
+    fi
+  fi
+
   # Journal the outcome of each rebuilt component so a post-mortem can see when/what a reload touched.
   journal_append reload_outcome component skill   result rendered
   journal_append reload_outcome component watcher result "$launch_desc"
@@ -5346,6 +5403,12 @@ cmd_pane_watch() {
   local watch_script="$SCRIPTS_DIR/herd-watch.sh"
   local watch_match="agent-watch.sh|herd-watch.sh"   # herd-watch.sh execs agent-watch.sh
 
+  # HERD-342 leg (a): capture pre-stop identity for post-restart verification.
+  local _wpw_pre_pid="" _wpw_pre_ticks="0" _wpw_cmd_ticks
+  _wpw_pre_pid="$(_watcher_lock_pid_if_live)"
+  [ -n "$_wpw_pre_pid" ] && _wpw_pre_ticks="$(_watcher_proc_start_ticks "$_wpw_pre_pid")"
+  _wpw_cmd_ticks="$(_watcher_proc_start_ticks "$$")"
+
   # 1. Stop this project's watcher (SIGTERM-poll-SIGKILL-abort; dies if unstoppable).
   _stop_project_watcher
   say ""
@@ -5423,6 +5486,29 @@ cmd_pane_watch() {
     fi
   fi
   [ -n "$watch_pid" ] && wsum="$wsum · pid $watch_pid"
+
+  # HERD-342 leg (a): verify the new watcher PID actually CHANGED and postdates this command.
+  # On failure, name the lock holder loudly and exit non-zero — never lie about a blocked restart.
+  if [ -n "$watch_pid" ]; then
+    local _wpw_new_ticks; _wpw_new_ticks="$(_watcher_proc_start_ticks "$watch_pid")"
+    local _wpw_blocked=0
+    if [ "$watch_pid" = "$_wpw_pre_pid" ]; then
+      _wpw_blocked=1  # same pid as before the stop — restart was blocked
+    elif [ "$_wpw_new_ticks" -gt 0 ] && [ "$_wpw_cmd_ticks" -gt 0 ] \
+         && [ "$_wpw_new_ticks" -le "$_wpw_cmd_ticks" ] 2>/dev/null; then
+      _wpw_blocked=1  # new watcher started before this command — stale pid
+    fi
+    if [ "$_wpw_blocked" -eq 1 ]; then
+      local _wpw_holder_desc; _wpw_holder_desc="$(_watcher_lock_holder_msg)"
+      printf '%s❌ watcher restart BLOCKED — the running watcher did not change%s\n' "$c_red" "$c_rst" >&2
+      printf '   lock holder: %s\n' "$_wpw_holder_desc" >&2
+      printf '   remedy: kill the holder, then re-run '"'"'herd pane watch'"'"'\n' >&2
+      journal_append watcher_restart_verify_failed \
+        pre_pid "${_wpw_pre_pid:-}" new_pid "$watch_pid" holder "$_wpw_holder_desc" \
+        workspace "$WORKSPACE_NAME"
+      return 1
+    fi
+  fi
 
   # REPAINT the width-sensitive backlog viewer if the geometry changed (see cmd_reload).
   if [ "$geom_changed" -eq 1 ] && [ -n "${BACKLOG_FILE:-}" ] && [ -f "$PANE_ROOT/$BACKLOG_FILE" ]; then
