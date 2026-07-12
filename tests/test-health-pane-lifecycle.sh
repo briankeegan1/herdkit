@@ -102,6 +102,7 @@ print(json.dumps({"result": {"panes": [{"pane_id": p, "label": lb} for p, lb in 
 esac
 STUB
 chmod +x "$BIN/herdr"
+printf '#!/usr/bin/env bash\nprintf "claude 0.0.0-stub\\n"; exit 0\n' > "$BIN/claude"; chmod +x "$BIN/claude"
 export PATH="$BIN:$PATH" ALIVE_PANES PANE_LABELS CLOSE_LOG TAB_CLOSE_LOG HERDR_LOG PANE_CTR
 
 # ── Source agent-watch.sh in lib mode (DEFAULT herdr-claude driver) ──────────
@@ -124,7 +125,7 @@ ok
 WT="$T/wt"; mkdir -p "$WT"
 # live_marker <pr> <sha> — plant a pid-live inflight marker (a real sleeper as the holder).
 LIVE_PIDS=""
-live_marker() { local p; sleep 300 & p=$!; disown "$p" 2>/dev/null || true; LIVE_PIDS="$LIVE_PIDS $p"; _marker_write "$(_health_inflight_file "$1-$2")" "$p"; }
+live_marker() { local p; sleep 300 </dev/null >/dev/null 2>/dev/null & p=$!; disown "$p" 2>/dev/null || true; LIVE_PIDS="$LIVE_PIDS $p"; _marker_write "$(_health_inflight_file "$1-$2")" "$p"; }
 cleanup_pids() { for p in $LIVE_PIDS; do kill "$p" 2>/dev/null || true; done; }
 trap 'cleanup_pids; rm -rf "$T"' EXIT
 
