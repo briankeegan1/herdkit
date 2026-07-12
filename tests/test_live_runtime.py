@@ -24,10 +24,14 @@ import os
 import tempfile
 import unittest
 
+import subprocess
+import time
+
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
-                               _select_candidates, _marker_write, _marker_live, WAIT, PENDING,
+                               _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               WAIT, PENDING,
                                branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
 
 
@@ -572,6 +576,170 @@ class TestScopeFilter(unittest.TestCase):
             self.assertNotIn("2", res["outcomes"])       # bob never classified
         finally:
             os.environ.pop("HERD_JOURNAL_NOW", None)
+
+
+class TestSupersessionCancel(unittest.TestCase):
+    """HERD-341: discovery → supersession-cancel. A candidate whose head sha has moved past an in-flight
+    worker's sha TERMs that doomed worker — by a SESSION kill of its whole detached subtree (HERD-283/348:
+    the worker is a session leader, so the leader's process group alone would miss the timeout-re-grouped
+    suite children), plus the reviewer's STAMPED PANE retired — and journals `gate_superseded` (contract
+    §2.4/§6.1). Hermetic: the only processes are throwaway `sleep`s this test spawns; no gh/git/model."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = LiveState(self.tmp)
+        self.journal = LiveJournal(os.path.join(self.tmp, "j.jsonl"))
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-10T00:00:00Z"
+        os.environ["HERD_HEALTH_TERM_SLEEP"] = "0.01"    # no real wall-clock in the TERM→KILL grace
+        self._procs = []
+
+    def tearDown(self):
+        for p in self._procs:
+            try:
+                p.kill(); p.wait(timeout=2)
+            except Exception:
+                pass
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+        os.environ.pop("HERD_HEALTH_TERM_SLEEP", None)
+
+    def _worker(self):
+        """A throwaway worker in its OWN session (start_new_session → session leader, sid == pid), like a
+        dispatched gate worker. Its marker records that session; a supersession reaps it. Returns Popen."""
+        p = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self._procs.append(p)
+        return p
+
+    def _events(self):
+        jp = self.journal.path
+        return events(jp) if os.path.exists(jp) else []
+
+    def _tick(self):
+        return LiveTick({"MERGE_POLICY": "observe"}, FixtureDiscovery({"candidates": []}),
+                        FixtureGates({"candidates": []}), DryRunActuator(self.journal),
+                        self.journal, state=self.state)
+
+    def _alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    # ── health rail: a superseded sha's suite worker is session-killed + journaled ──
+    def test_stale_health_worker_terminated_and_journaled(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 5, "oldsha")
+        _marker_write(marker, p.pid)                       # records the worker's session (line 4)
+        # scratch the worker left behind, keyed to the OLD sha, must be reaped too.
+        for f in (self.state.health_dispatch_file_sha(5, "oldsha"),
+                  self.state.health_result_file_sha(5, "oldsha")):
+            open(f, "w").close()
+        self._tick()._supersede_stale([LiveCandidate(5, "newsha")])
+        self.assertFalse(self._alive(p.pid))              # the doomed worker is dead
+        self.assertFalse(os.path.exists(marker))          # marker reaped
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file_sha(5, "oldsha")))
+        gs = [o for o in self._events() if o["event"] == "gate_superseded"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual((gs[0]["rail"], gs[0]["old_sha"], gs[0]["new_sha"], gs[0]["action"]),
+                         ("health", "oldsha", "newsha", "session_kill"))
+
+    # ── review rail: a superseded reviewer is terminated + its stamped pane retired ──
+    def test_stale_reviewer_terminated_pane_retired_and_journaled(self):
+        p = self._worker()
+        marker = self.state._sha_path(".review-inflight", 8, "old8")
+        _marker_write(marker, p.pid)
+        with open(self.state.review_registry_file_sha(8, "old8"), "w") as fh:
+            fh.write("%s review-pane-42\n" % p.pid)        # the reviewer's STAMPED pane
+        self._tick()._supersede_stale([LiveCandidate(8, "new8")])
+        self.assertFalse(self._alive(p.pid))
+        self.assertFalse(os.path.exists(marker))
+        self.assertFalse(os.path.exists(self.state.review_registry_file_sha(8, "old8")))
+        gs = [o for o in self._events() if o["event"] == "gate_superseded" and o["rail"] == "review"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual(gs[0]["action"], "pane_retired")
+        self.assertEqual(gs[0]["pane"], "review-pane-42")   # the stamp is carried into the forensic record
+
+    # ── the CURRENT sha's worker is NEVER touched ──
+    def test_current_sha_worker_is_preserved(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 5, "cur")
+        _marker_write(marker, p.pid)
+        self._tick()._supersede_stale([LiveCandidate(5, "cur")])
+        self.assertTrue(self._alive(p.pid))               # still running — its sha IS the head
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual([o for o in self._events() if o["event"] == "gate_superseded"], [])
+
+    # ── a foreign PR's stale worker is not touched by an unrelated candidate ──
+    def test_only_matching_pr_is_superseded(self):
+        p = self._worker()
+        marker = self.state._sha_path(".health-inflight", 7, "old7")
+        _marker_write(marker, p.pid)
+        self._tick()._supersede_stale([LiveCandidate(5, "newsha")])   # candidate is PR 5, not 7
+        self.assertTrue(self._alive(p.pid))
+        self.assertTrue(os.path.exists(marker))
+
+    # ── a dead/recycled marker is reaped with no signal, no false gate_superseded ──
+    def test_dead_marker_reaped_without_signal(self):
+        marker = self.state._sha_path(".health-inflight", 5, "old")
+        with open(marker, "w") as fh:
+            fh.write("999999\n\n0\n999999\n")             # a pid that isn't alive
+        self.assertTrue(_terminate_worker(marker))        # already gone → True
+        self._tick()._supersede_stale([LiveCandidate(5, "new")])
+        self.assertFalse(os.path.exists(marker))          # reaped
+        gs = [o for o in self._events() if o["event"] == "gate_superseded"]
+        self.assertEqual(len(gs), 1)                      # journaled once (the stale sha was cleared)
+
+    # ── the session kill reaps a whole SUBTREE, not just the leader (the HERD-283/348 property) ──
+    def test_session_kill_reaps_child_subtree(self):
+        # A leader in its own session that forks a child sharing that session; a single-pid kill of the
+        # leader would leave the child running — the SESSION kill reaps both.
+        script = ("import os,sys,time\n"
+                  "cpid=os.fork()\n"
+                  "if cpid==0:\n"
+                  "  os.execvp('sleep',['sleep','300'])\n"
+                  "open(sys.argv[1],'w').write(str(cpid))\n"
+                  "time.sleep(300)\n")
+        pidfile = os.path.join(self.tmp, "child.pid")
+        leader = subprocess.Popen(["python3", "-c", script, pidfile], start_new_session=True)
+        self._procs.append(leader)
+        for _ in range(200):
+            if os.path.exists(pidfile) and open(pidfile).read().strip():
+                break
+            time.sleep(0.01)
+        child = int(open(pidfile).read().strip())
+        marker = self.state._sha_path(".health-inflight", 9, "old9")
+        _marker_write(marker, leader.pid)                 # records the leader's session
+        self._tick()._supersede_stale([LiveCandidate(9, "new9")])
+        self.assertFalse(self._alive(leader.pid))
+        # The child (a separate pid in the same session) must also be gone — proves the session kill.
+        for _ in range(200):
+            if not self._alive(child):
+                break
+            time.sleep(0.01)
+        self.assertFalse(self._alive(child), "session-kill must reap the child subtree, not just the leader")
+
+    # ── sim/dry-run (no state dir) is a hard no-op ──
+    def test_no_state_dir_is_noop(self):
+        j = LiveJournal(None)
+        t = LiveTick({"MERGE_POLICY": "auto"}, FixtureDiscovery({"candidates": []}),
+                     FixtureGates({"candidates": []}), DryRunActuator(j), j, state=LiveState(None))
+        t._supersede_stale([LiveCandidate(1, "s1")])       # must not raise, must not journal
+        self.assertEqual(list(LiveState(None).stale_inflight(".health-inflight", 1, "s1")), [])
+
+    # ── end-to-end: a full tick supersedes a stale worker, then walks the fresh candidate to merge ──
+    def test_full_tick_supersedes_then_walks(self):
+        p = self._worker()
+        _marker_write(self.state._sha_path(".health-inflight", 3, "old3"), p.pid)
+        scenario = {"candidates": [{"pr": 3, "sha": "new3", "review": "PASS", "health": "CLEAN"}],
+                    "config": {"MERGE_POLICY": "auto"}}
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(self.journal), self.journal, state=self.state)
+        res = t.run()
+        self.assertEqual(res["outcomes"]["3"], "MERGE")
+        self.assertFalse(self._alive(p.pid))
+        ev = self._events()
+        self.assertTrue([o for o in ev if o["event"] == "gate_superseded"])
+        self.assertTrue([o for o in ev if o["event"] == "merge"])
 
 
 class TestSlugDerivation(unittest.TestCase):
