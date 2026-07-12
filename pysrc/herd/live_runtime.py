@@ -1290,19 +1290,45 @@ class DryRunActuator:
         return False
 
 
+# ── merge actuation config (MERGE_METHOD + DELETE_BRANCH_ON_MERGE, HERD-354) ──────────────────────
+# The live merge actuator must honor the SAME two knobs bash do_merge composes into `gh pr merge`
+# (agent-watch.sh:_merge_method_flag / _delete_branch_flag). Hardcoding `--squash --delete-branch`
+# refused EVERY merge on a repo whose branch protection disallows squash (53 refusals on PR #451).
+_MERGE_METHODS = ("merge", "squash", "rebase")
+
+
+def _merge_method(config):
+    """The configured gh merge strategy (agent-watch.sh:_merge_method_flag:3951). Default ``merge`` —
+    an unrecognized value falls back to ``merge``, exactly as the bash ``case`` default does, so the gh
+    flag is ``--`` + this."""
+    val = str((config or {}).get("MERGE_METHOD", "") or "").strip().lower()
+    return val if val in _MERGE_METHODS else "merge"
+
+
+def _delete_branch_on_merge(config):
+    """True iff ``DELETE_BRANCH_ON_MERGE`` opts in (agent-watch.sh:_delete_branch_flag:3963). Default
+    false; only ``1/true/yes/on`` enable it, matching the bash ``case`` — every other value (and the
+    absent default) contributes NO ``--delete-branch`` argument, so a merged branch is retained."""
+    val = str((config or {}).get("DELETE_BRANCH_ON_MERGE", "") or "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
 
-    ``merge`` squash-merges the PR (``gh pr merge --squash --delete-branch``); ``reap`` removes the
+    ``merge`` merges the PR via ``gh pr merge`` with the strategy/deletion resolved from config
+    (``MERGE_METHOD`` → ``--merge``/``--squash``/``--rebase``, ``DELETE_BRANCH_ON_MERGE`` →
+    ``--delete-branch`` when true), exactly as bash do_merge composes them; ``reap`` removes the
     builder worktree (``git worktree remove --force``). Both journal the SAME event the dry-run twin
     does, so the forensic stream is identical shape whether or not actuation ran. Each actuation is
     guarded so a single failing merge/reap surfaces (returns ``False``) without sinking the whole tick.
     Reached only from ``--tick`` in genuine live mode — never from any test.
     """
 
-    def __init__(self, home, journal):
+    def __init__(self, home, journal, config=None):
         self.home = home
         self.journal = journal
+        self.config = config or {}
 
     def merge(self, cand):
         # Run the squash-merge, then VERIFY via the API that the PR actually reached state=MERGED before
@@ -1311,15 +1337,18 @@ class LiveActuator:
         # local branch delete on a still-checked-out worktree) AND exit zero without merging is possible
         # under a mergeability regression / branch-protection race. We never infer the merge from the exit
         # code — we read the PR's real state.
+        method = _merge_method(self.config)                       # merge | squash | rebase (default merge)
+        argv = ["gh", "pr", "merge", cand.pr, "--" + method]
+        if _delete_branch_on_merge(self.config):                  # default false → no --delete-branch, branch retained
+            argv.append("--delete-branch")
         try:
-            subprocess.run(["gh", "pr", "merge", cand.pr, "--squash", "--delete-branch"],
-                           capture_output=True, text=True, check=True)
+            subprocess.run(argv, capture_output=True, text=True, check=True)
         except Exception:
             pass  # non-zero is NOT authoritative — the API state below is the only truth that merges
         state = self._merged_state(cand)
         if state == "MERGED":
             self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
-                                "method", "squash", "reason", "gates_passed")
+                                "method", method, "reason", "gates_passed")
             return True
         if not state:
             # HONEST LABELS (HERD-232): an EMPTY/unreadable state (network blip, rate limit, expired auth)
@@ -1707,7 +1736,8 @@ class LiveTick:
 
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
-    knobs = ("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY") + _WATCHER_KEYS + _FAIRNESS_KEYS
+    knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
+              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE") + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
@@ -1789,7 +1819,7 @@ def _run_live_tick():
             "journal path (docs/engine-contract.md §3) — never actuate a merge with journal:null")
     journal = LiveJournal(path)
     state = LiveState()          # $TREES / $WORKTREES_DIR — the shared sha-keyed ledger + marker substrate
-    actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal)
+    actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal, config)
     tick = LiveTick(config, _GraphQLDiscovery(config), LiveGates(home, state, journal),
                     actuator, journal, state=state)
     return tick.run()

@@ -378,6 +378,59 @@ class TestLiveMergeVerify(LiveCase):
         self.assertFalse([o for o in ev if o["event"] == "merge"])
 
 
+class TestLiveMergeMethodConfig(LiveCase):
+    """HERD-354: the live merge actuator composes ``gh pr merge`` from MERGE_METHOD +
+    DELETE_BRANCH_ON_MERGE exactly as bash do_merge does (agent-watch.sh:_merge_method_flag /
+    _delete_branch_flag), NOT a hardcoded ``--squash --delete-branch``. A repo whose branch protection
+    disallows squash refused every engine merge until this landed. Hermetic: subprocess is stubbed."""
+
+    def _run(self, config):
+        sub = _RecordingSub(view_state="MERGED")
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        act = LiveActuator("/nonexistent-home", LiveJournal(self.jpath), config)
+        self.assertTrue(act.merge(LiveCandidate(7, "deadbeef", slug="feat-x", worktree="")))
+        merges = [c for c in sub.calls if c[:3] == ["gh", "pr", "merge"]]
+        self.assertEqual(len(merges), 1)
+        return merges[0]
+
+    def _method_journaled(self):
+        m = [o for o in events(self.jpath) if o["event"] == "merge"]
+        self.assertEqual(len(m), 1)
+        return m[0]["method"]
+
+    def test_default_is_merge_no_delete(self):
+        # No config → bash default MERGE_METHOD=merge, DELETE_BRANCH_ON_MERGE=false. The old code
+        # hardcoded --squash --delete-branch here; that is the exact 53-refusal bug HERD-354 fixes.
+        argv = self._run({})
+        self.assertEqual(argv, ["gh", "pr", "merge", "7", "--merge"])
+        self.assertEqual(self._method_journaled(), "merge")
+
+    def test_merge_method_maps_to_flag(self):
+        for method, flag in (("merge", "--merge"), ("squash", "--squash"), ("rebase", "--rebase")):
+            with self.subTest(method=method):
+                argv = self._run({"MERGE_METHOD": method})
+                self.assertEqual(argv[-1], flag)
+                self.assertNotIn("--delete-branch", argv)     # deletion default false
+
+    def test_unrecognized_method_falls_back_to_merge(self):
+        argv = self._run({"MERGE_METHOD": "ff-only"})
+        self.assertEqual(argv, ["gh", "pr", "merge", "7", "--merge"])
+
+    def test_delete_branch_appends_flag_when_true(self):
+        for truthy in ("true", "1", "yes", "on"):
+            with self.subTest(val=truthy):
+                argv = self._run({"MERGE_METHOD": "squash", "DELETE_BRANCH_ON_MERGE": truthy})
+                self.assertEqual(argv, ["gh", "pr", "merge", "7", "--squash", "--delete-branch"])
+
+    def test_delete_branch_false_omits_flag(self):
+        for falsy in ("false", "0", "no", "off", ""):
+            with self.subTest(val=falsy):
+                argv = self._run({"DELETE_BRANCH_ON_MERGE": falsy})
+                self.assertNotIn("--delete-branch", argv)
+
+
 class TestLiveGateStatusPost(LiveCase):
     """HERD-352: on gates-clear the LIVE actuator posts a herd/gates=success commit status (GATE_STATUS=on
     contract) and journals `gate_status`; GATE_STATUS=off is byte-inert. Hermetic: subprocess is stubbed."""
