@@ -113,4 +113,32 @@ rm -f "$LOCK"
 ok
 echo "PASS (d) bin/herd _watcher_lock_pid_if_live adopt/stale/absent signalling"
 
+# ── (e) HERD-344: flock held by orphan but recorded pid DEAD → adopt (stale-flock backstop) ───
+# Simulate the exact incident: a gate worker inherits fd 9, holding the flock via the SHARED
+# open-file description, while the main watcher dies (recorded pid goes dead). A new watcher
+# must adopt the lock rather than refusing forever.
+#
+# Build a dead pid guaranteed to not be recycled for the duration of this test.
+sleep 0 & DEAD2=$!; wait "$DEAD2" 2>/dev/null || true
+# Write the dead pid to the lock so the pre-flock check sees a stale holder.
+printf '%s\n' "$DEAD2" > "$LOCK"
+# Spawn an "orphan" that opens the lockfile, takes the flock, and holds it for 60s.
+# Use a subshell so bash can wait on it cleanly. Two distinct layers: outer (gets the fd)
+# and inner (holds it via flock 9), so "wait" on the outer process proves the inner is live.
+( exec 9>>"$LOCK"; flock 9; sleep 60 ) &
+ORPHAN=$!
+trap 'kill "$LIVE" 2>/dev/null || true; kill "$ORPHAN" 2>/dev/null || true; rm -rf "$T"' EXIT
+# Give the orphan a moment to take the flock.
+sleep 0.2
+# Verify the orphan is alive and holds a lock on the lockfile, otherwise the test is vacuous.
+kill -0 "$ORPHAN" 2>/dev/null || fail "(e) orphan process unexpectedly dead before the test"
+# The acquire must succeed despite the orphan holding the flock — stale-flock adoption.
+[ "$(acquire)" = "ACQUIRE" ] || fail "(e) a launch with a dead recorded pid and an orphan-held flock must ADOPT (got REFUSE)"
+# A subsequent acquire must also succeed (the new lock is on the fresh inode).
+[ "$(acquire)" = "ACQUIRE" ] || fail "(e) second acquire after stale-flock adoption must also succeed"
+# Clean up the orphan.
+kill "$ORPHAN" 2>/dev/null || true
+ok
+echo "PASS (e) stale-flock adoption: dead recorded pid + orphan-held flock → ACQUIRE"
+
 echo "ALL PASS ($pass checks)"
