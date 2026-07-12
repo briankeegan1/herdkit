@@ -29,6 +29,7 @@ import time
 
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
+                               LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
                                WAIT, PENDING,
@@ -199,7 +200,9 @@ class TestReapAndActuation(LiveCase):
         self.assertEqual(len(reaps), 1)
         self.assertEqual(reaps[0]["reason"], "merged")
 
-    def test_failed_merge_escalates_and_never_reaps(self):
+    def test_refused_merge_stays_blessed_and_never_reaps(self):
+        # HERD-352: a refused merge (actuator returns False) STAYS BLESSED — it HOLDS and re-attempts next
+        # tick, never reaps, never a silent drop. Escalation is only after N consecutive refusals (below).
         class FailMerge(DryRunActuator):
             def merge(self, cand):
                 return False
@@ -209,7 +212,29 @@ class TestReapAndActuation(LiveCase):
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
                      FailMerge(journal), journal)
         res = t.run()
-        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        self.assertEqual(res["outcomes"]["1"], "HOLD")   # stays blessed, not ESCALATE on the first refusal
+        self.assertFalse([o for o in events(self.jpath) if o["event"] == "reap"])
+
+    def test_repeated_refusals_escalate_with_loud_row_after_n(self):
+        # HERD-352: with a REAL state dir the refusal counter persists across ticks; the Nth consecutive
+        # refusal escalates and journals a loud needs_you row so a wedged merge cannot fail silently.
+        class FailMerge(DryRunActuator):
+            def merge(self, cand):
+                return False
+        scenario = {"candidates": [self.one(1, review="PASS", health="CLEAN")],
+                    "config": {"MERGE_POLICY": "auto"}}
+        outcomes = []
+        for _ in range(LR._MERGE_REFUSE_MAX):
+            journal = LiveJournal(self.jpath)
+            t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                         FailMerge(journal), journal, state=LiveState(self.tmp))
+            outcomes.append(t.run()["outcomes"]["1"])
+        self.assertEqual(outcomes[:-1], ["HOLD"] * (LR._MERGE_REFUSE_MAX - 1))  # below N: stays blessed
+        self.assertEqual(outcomes[-1], "ESCALATE")                               # at N: escalate
+        needs = [o for o in events(self.jpath) if o["event"] == "merge_refused_escalated"]
+        self.assertEqual(len(needs), 1)
+        self.assertEqual(needs[0]["reason"], "merge refused")
+        self.assertEqual(needs[0]["count"], LR._MERGE_REFUSE_MAX)
         self.assertFalse([o for o in events(self.jpath) if o["event"] == "reap"])
 
 
@@ -262,6 +287,162 @@ class TestReviewDispatchShape(LiveCase):
             self.assertIn(k, rd[0])
         self.assertEqual(rd[0]["model"], "opus-x")      # bash env-fallback chain
         self.assertTrue(rd[0]["log_path"])              # the reviewer's result-file path, non-empty
+
+
+class _FakeCompleted:
+    """Stand-in for a subprocess.CompletedProcess — carries a captured stdout for the API verify read."""
+
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+
+
+class _RecordingSub:
+    """A subprocess stand-in that RECORDS every argv and returns scripted results — proves the LIVE
+    actuator's gh shape without ever launching gh. ``view_state`` scripts what ``gh pr view`` reports;
+    ``fail`` (a set of subcommand tokens) makes those calls raise, simulating a gh outage / non-zero exit."""
+
+    DEVNULL = subprocess.DEVNULL
+
+    def __init__(self, view_state="MERGED", fail=()):
+        self.calls = []
+        self.view_state = view_state
+        self.fail = set(fail)
+
+    def run(self, argv, *a, **k):
+        self.calls.append(list(argv))
+        # argv[1] is the gh subcommand: "pr" (merge/view) or "api" (statuses post).
+        if "api" in argv and "api" in self.fail:
+            raise subprocess.CalledProcessError(1, argv)
+        if argv[:3] == ["gh", "pr", "merge"]:
+            if "merge" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted("")
+        if argv[:3] == ["gh", "pr", "view"]:
+            if "view" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted(self.view_state + "\n")
+        return _FakeCompleted("")
+
+
+class TestLiveMergeVerify(LiveCase):
+    """HERD-352: the LIVE merge actuator verifies via the GitHub API that the PR actually reached MERGED
+    before it treats the merge as done — a stubbed-gh 'refusal sim' proves an unconfirmed merge is
+    journaled `merge_refused`, never `merge`, never reaped. Hermetic: subprocess is stubbed, no gh runs."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def _cand(self):
+        return LiveCandidate(7, "deadbeef", slug="feat-x", worktree="")
+
+    def test_merged_state_journals_merge_and_returns_true(self):
+        sub = _RecordingSub(view_state="MERGED")
+        act = self._actuator(sub)
+        self.assertTrue(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertEqual(len([o for o in ev if o["event"] == "merge"]), 1)
+        self.assertFalse([o for o in ev if o["event"] == "merge_refused"])
+        # It ran `gh pr view` to VERIFY, not just `gh pr merge`.
+        self.assertTrue(any(c[:3] == ["gh", "pr", "view"] for c in sub.calls))
+
+    def test_unmerged_state_is_refused_not_merged(self):
+        sub = _RecordingSub(view_state="OPEN")
+        act = self._actuator(sub)
+        self.assertFalse(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertFalse([o for o in ev if o["event"] == "merge"])       # never claims a merge it can't confirm
+        ref = [o for o in ev if o["event"] == "merge_refused"]
+        self.assertEqual(len(ref), 1)
+        self.assertEqual(ref[0]["state"], "OPEN")
+
+    def test_nonzero_merge_exit_but_api_confirms_merged(self):
+        # HERD-221 shape: gh pr merge exits non-zero (e.g. branch-delete race) yet the PR IS merged —
+        # the API state, not the exit code, is authoritative, so this is a real merge, not a refusal.
+        sub = _RecordingSub(view_state="MERGED", fail={"merge"})
+        act = self._actuator(sub)
+        self.assertTrue(act.merge(self._cand()))
+        self.assertEqual(len([o for o in events(self.jpath) if o["event"] == "merge"]), 1)
+
+    def test_unreadable_state_fails_closed_with_honest_label(self):
+        # HONEST LABELS (HERD-232): a gh outage on the verify read is NOT a genuine refusal — it fails
+        # CLOSED as merge_gh_unreadable (an infra event), never merge, never a fabricated merge_refused.
+        sub = _RecordingSub(fail={"view"})
+        act = self._actuator(sub)
+        self.assertFalse(act.merge(self._cand()))
+        ev = events(self.jpath)
+        self.assertEqual(len([o for o in ev if o["event"] == "merge_gh_unreadable"]), 1)
+        self.assertFalse([o for o in ev if o["event"] == "merge_refused"])
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+
+
+class TestLiveGateStatusPost(LiveCase):
+    """HERD-352: on gates-clear the LIVE actuator posts a herd/gates=success commit status (GATE_STATUS=on
+    contract) and journals `gate_status`; GATE_STATUS=off is byte-inert. Hermetic: subprocess is stubbed."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_post_uses_success_only_status_shape(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        self.assertTrue(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        # The gh api call carries the exact success-only status shape bash posts.
+        api = [c for c in sub.calls if "api" in c][0]
+        self.assertIn("repos/{owner}/{repo}/statuses/deadbeef", api)
+        self.assertIn("state=success", api)
+        self.assertIn("context=herd/gates", api)
+        gs = [o for o in events(self.jpath) if o["event"] == "gate_status"]
+        self.assertEqual(len(gs), 1)
+        self.assertEqual(gs[0]["state"], "success")
+        self.assertEqual(gs[0]["context"], "herd/gates")
+
+    def test_failed_post_journals_nothing_and_retries(self):
+        sub = _RecordingSub(fail={"api"})
+        act = self._actuator(sub)
+        self.assertFalse(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []   # a failed post journals nothing
+        self.assertFalse([o for o in ev if o["event"] == "gate_status"])
+
+    def test_tick_posts_once_when_on_and_never_when_off(self):
+        # Drive the whole blessed tick with a recording actuator to prove the LEVER: on → exactly one post
+        # per (pr,sha) across re-walks; off → byte-inert (zero posts, zero gate_status journal lines).
+        class Recorder(DryRunActuator):
+            def __init__(self, journal):
+                super().__init__(journal)
+                self.posts = 0
+
+            def post_gate_status(self, cand):
+                self.posts += 1
+                self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
+                                    "context", "herd/gates")
+                return True
+
+        def run(config):
+            journal = LiveJournal(self.jpath)
+            rec = Recorder(journal)
+            state = LiveState(self.tmp)
+            t1 = LiveTick(config, FixtureDiscovery({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          FixtureGates({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          rec, journal, state=state)
+            t1.run()
+            # Re-walk the same (pr,sha): the ledger marker must suppress a second post.
+            t2 = LiveTick(config, FixtureDiscovery({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          FixtureGates({"candidates": [self.one(1, review="PASS", health="CLEAN")]}),
+                          rec, journal, state=LiveState(self.tmp))
+            t2.run()
+            return rec.posts
+
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "on"}), 1)   # posted once, deduped
+        # Fresh state dir for the off run so the on-run's ledger marker doesn't mask the lever.
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "live-test.jsonl")
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "off"}), 0)  # byte-inert
 
 
 class TestVerdictParser(unittest.TestCase):

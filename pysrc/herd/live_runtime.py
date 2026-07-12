@@ -546,6 +546,56 @@ class LiveState:
             pass
         return True
 
+    def posted(self, pr, sha, kind):
+        """True iff a SUCCESSFUL ``<kind>`` network post was already recorded for this ``(pr, sha)``.
+        Unlike :meth:`once`, the marker is written SEPARATELY (:meth:`record_posted`) only AFTER the post
+        succeeds — so a failed post retries next tick, mirroring bash's success-only ledger row
+        (agent-watch.sh:_gate_status_posted). With no state dir there is no marker → never posted."""
+        path = self._p(".live-posted-%s-%s-%s" % (kind, pr, sha))
+        return bool(path) and os.path.exists(path)
+
+    def record_posted(self, pr, sha, kind):
+        """Record a SUCCESSFUL ``<kind>`` post for this ``(pr, sha)`` — the at-most-once ledger for a
+        network write (agent-watch.sh:_record_gate_status). No-op with no state dir."""
+        path = self._p(".live-posted-%s-%s-%s" % (kind, pr, sha))
+        if not path:
+            return
+        try:
+            open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    def merge_refusals(self, pr, sha):
+        """The count of consecutive merge REFUSALS recorded for this ``(pr, sha)`` (0 if none / no dir)."""
+        path = self._p(".live-merge-refused-%s-%s" % (pr, sha))
+        if not path or not os.path.exists(path):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return int((fh.readline() or "0").strip() or "0")
+        except Exception:
+            return 0
+
+    def bump_merge_refusal(self, pr, sha):
+        """Increment and return the consecutive-refusal count for this ``(pr, sha)``. With no state dir (a
+        sim/dry-run tick has no cross-tick memory) it cannot persist, so it always reports 1 — a stateless
+        tick never accumulates toward the escalation threshold (task HERD-352)."""
+        path = self._p(".live-merge-refused-%s-%s" % (pr, sha))
+        if not path:
+            return 1
+        n = self.merge_refusals(pr, sha) + 1
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%d\n" % n)
+        except Exception:
+            pass
+        return n
+
+    def clear_merge_refusal(self, pr, sha):
+        """Drop the refusal counter for this ``(pr, sha)`` — called on a VERIFIED merge so the ledger
+        never carries a stale count forward. No-op with no state dir."""
+        self.rm(self._p(".live-merge-refused-%s-%s" % (pr, sha)))
+
     def rm(self, *paths):
         for p in paths:
             if p:
@@ -767,7 +817,8 @@ def discover_via_graphql(repo=None, limit=50):
 # unset/all + WATCHER_SCOPE unset/mine) is a byte-identical passthrough: every discovered PR flows through.
 
 _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
-                 "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER")
+                 "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER",
+                 "GATE_STATUS")
 
 
 def _watcher_scope(config):
@@ -1095,6 +1146,19 @@ class FixtureGates:
 
 # ── apply: actuate the terminal action (merge / reap) or, in dry-run, journal only ────────────────
 
+# The herd/gates commit-status contract (GATE_STATUS=on), mirrored VERBATIM from the bash watcher so a
+# python-posted blessing is indistinguishable from a bash-posted one. ONLY `success` is ever posted — a
+# non-passing status flips a CLEAN sha to mergeStateStatus=UNSTABLE and strands it, so the fail-safe rests
+# entirely on the ABSENCE of success (agent-watch.sh:GATE_STATUS_CONTEXT / :_gate_status_desc).
+_GATE_STATUS_CONTEXT = "herd/gates"
+_GATE_STATUS_DESC = "healthcheck + adversarial review passed"
+
+# Consecutive merge REFUSALS (the API did not confirm state=MERGED) tolerated before the tick escalates
+# with a loud needs-you row. Below the threshold the PR STAYS BLESSED and re-attempts next tick; at it,
+# a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
+_MERGE_REFUSE_MAX = 3
+
+
 class DryRunActuator:
     """The side-effect-free apply twin: journals the SAME terminal events, actuates NOTHING.
 
@@ -1116,6 +1180,12 @@ class DryRunActuator:
                             "reason", "merged")
         return True
 
+    def post_gate_status(self, cand):
+        """PURE no-op twin of the herd/gates commit-status post: no network, no ledger, no journal —
+        exactly as bash's ``post_gate_status`` returns early under ``--dry-run``. Returns False (nothing
+        posted) so the side-effect-free VERIFY column never records a blessing it did not actually land."""
+        return False
+
 
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
@@ -1132,15 +1202,66 @@ class LiveActuator:
         self.journal = journal
 
     def merge(self, cand):
+        # Run the squash-merge, then VERIFY via the API that the PR actually reached state=MERGED before
+        # we treat it as merged (task HERD-352). A merge is the one UNRECOVERABLE action, so its exit code
+        # is not authoritative: `gh pr merge` can exit non-zero AFTER a successful merge (HERD-221: a failed
+        # local branch delete on a still-checked-out worktree) AND exit zero without merging is possible
+        # under a mergeability regression / branch-protection race. We never infer the merge from the exit
+        # code — we read the PR's real state.
         try:
             subprocess.run(["gh", "pr", "merge", cand.pr, "--squash", "--delete-branch"],
                            capture_output=True, text=True, check=True)
-        except Exception as exc:
-            self.journal.append("merge_gh_unreadable", "pr", cand.pr, "sha", cand.sha,
-                                "detail", str(exc)[:200])
+        except Exception:
+            pass  # non-zero is NOT authoritative — the API state below is the only truth that merges
+        state = self._merged_state(cand)
+        if state == "MERGED":
+            self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                                "method", "squash", "reason", "gates_passed")
+            return True
+        if not state:
+            # HONEST LABELS (HERD-232): an EMPTY/unreadable state (network blip, rate limit, expired auth)
+            # is NOT evidence of anything — it must NOT be labelled a genuine refusal. It is an infra event,
+            # so FAIL CLOSED (no merge, no fabricated moved/merged row) and re-gate next tick.
+            self.journal.append("merge_gh_unreadable", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha)
             return False
-        self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
-                            "method", "squash", "reason", "gates_passed")
+        # A READABLE non-MERGED state is a GENUINE refusal (a mergeability regression / branch-protection
+        # race). Name the state it actually saw so the label and the evidence agree, and NEVER reap or
+        # transition — return False so the tick keeps the PR BLESSED and re-attempts next tick (HERD-352).
+        self.journal.append("merge_refused", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                            "state", state, "reason", "api_not_merged")
+        return False
+
+    def _merged_state(self, cand):
+        """The PR's real state per the GitHub API (``gh pr view --json state``) — the ONLY confirmation
+        that authorizes reaping the worktree. An unreadable state (network/auth/rate-limit) returns ``""``,
+        which the caller treats as an infra outage (merge_gh_unreadable), NOT a genuine refusal — the
+        honest-labels split (HERD-232). Either way it fails closed: an unconfirmed merge never reaps."""
+        try:
+            out = subprocess.run(["gh", "pr", "view", cand.pr, "--json", "state,mergedAt", "-q", ".state"],
+                                 capture_output=True, text=True, check=True)
+        except Exception:
+            return ""
+        return out.stdout.strip()
+
+    def post_gate_status(self, cand):
+        """POST the herd/gates=success commit status for this ``(pr, sha)`` via the GitHub Statuses API
+        (GATE_STATUS=on contract, agent-watch.sh:post_gate_status). ONLY ``success`` is ever posted — a
+        non-passing status flips a CLEAN sha to UNSTABLE and strands it, so the fail-safe rests on the
+        ABSENCE of success. Journals ``gate_status`` (bash-identical shape) on a successful write and
+        returns True; a failed/empty write journals NOTHING and returns False, so the tick retries next
+        round — the blessing MUST land for the ``require herd/gates`` fail-safe to hold. Never raises."""
+        if not cand.sha:
+            return False
+        try:
+            subprocess.run(
+                ["gh", "api", "repos/{owner}/{repo}/statuses/%s" % cand.sha,
+                 "-f", "state=success", "-f", "context=%s" % _GATE_STATUS_CONTEXT,
+                 "-f", "description=%s" % _GATE_STATUS_DESC],
+                capture_output=True, text=True, check=True)
+        except Exception:
+            return False   # best-effort: a failed post lands NO ledger row, so it retries next tick
+        self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
+                            "context", _GATE_STATUS_CONTEXT)
         return True
 
     def reap(self, cand):
@@ -1180,6 +1301,9 @@ class LiveTick:
         self._merge_policy = D.effective_merge_policy(
             self.config.get("MERGE_POLICY"), self.config.get("WATCHER_AUTOMERGE"))
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
+        # GATE_STATUS master lever (HERD-194 contract): on (default) → post the herd/gates commit status
+        # on gates-clear; off → byte-inert (no post, no journal, no ledger). Consumed at the blessing seam.
+        self._gate_status = str(self.config.get("GATE_STATUS", "on") or "on")
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
         self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
@@ -1193,6 +1317,12 @@ class LiveTick:
         n = self._refix_rounds.get(key, 0) + 1
         self._refix_rounds[key] = n
         return n
+
+    def _gate_status_enabled(self):
+        """GATE_STATUS master lever — ``off`` disables the herd/gates commit-status post entirely
+        (byte-inert: no post, no journal, no ledger). Any other value is on
+        (agent-watch.sh:_gate_status_enabled — unknown value → on)."""
+        return self._gate_status != "off"
 
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
@@ -1328,6 +1458,16 @@ class LiveTick:
             self.journal.append("blessing", "pr", cand.pr, "sha", cand.sha, "context", "herd/gates",
                                 "state", "success")
 
+        # 4b. POST the herd/gates=success commit status (GATE_STATUS=on contract, agent-watch.sh:
+        #     post_gate_status). ONLY the actuator touches the network; the DryRunActuator twin is a pure
+        #     no-op, so the side-effect-free VERIFY column never posts. At-most-once per (pr,sha): the
+        #     ledger marker is recorded ONLY on a successful post, so a failed network write retries next
+        #     tick — the blessing MUST land for the `require herd/gates` fail-safe to hold. Byte-inert when
+        #     GATE_STATUS=off (no post, no journal, no ledger).
+        if self._gate_status_enabled() and cand.sha and not self.state.posted(cand.pr, cand.sha, "gate_status"):
+            if self.actuator.post_gate_status(cand):
+                self.state.record_posted(cand.pr, cand.sha, "gate_status")
+
         # 5. the pure hold / merge / observe decision (reused from P2, contract §2.2/§5.4-§5.5).
         action = D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy)
         self._advance(cand, {"MERGE": "decide_merge", "HOLD": "decide_hold",
@@ -1336,9 +1476,22 @@ class LiveTick:
         # 6. apply — the ONLY step that actuates (and only under LiveActuator).
         if action == "MERGE":
             if self.actuator.merge(cand):
+                self.state.clear_merge_refusal(cand.pr, cand.sha)
                 self.actuator.reap(cand)          # reap-on-merge (contract §6.1)
                 return "MERGE"
-            return ESCALATE                        # merge failed → escalate, never a silent drop
+            # Merge REFUSED — the actuator's API verify did not confirm state=MERGED (it journaled the
+            # refusal: `merge_refused` for a readable non-MERGED state, `merge_gh_unreadable` for an infra
+            # outage). A merge is the one unrecoverable action, so an UNCONFIRMED merge is never
+            # treated as done: the PR STAYS BLESSED (no reap, no silent drop) and re-attempts next tick.
+            # Only after _MERGE_REFUSE_MAX consecutive refusals do we ESCALATE with a loud needs-you row,
+            # so a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
+            n = self.state.bump_merge_refusal(cand.pr, cand.sha)
+            if n >= _MERGE_REFUSE_MAX:
+                # The loud needs-you row: N consecutive refusals means the merge is genuinely wedged.
+                self.journal.append("merge_refused_escalated", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "count", n, "reason", "merge refused")
+                return ESCALATE
+            return HOLD                            # stay BLESSED, re-attempt next tick
         if action == "HOLD":
             if self.state.once(cand.pr, cand.sha, "hold"):
                 self.journal.append("hold_applied", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
