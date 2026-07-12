@@ -198,6 +198,32 @@ def _iter_pairs(seq):
         yield seq[i], seq[i + 1]
 
 
+def _pos_int(value, default):
+    """A positive int, else ``default`` — fail-soft concurrency-knob coercion (contract §2.3).
+    Mirrors ``shadow_runtime._pos_int``: a typo in HEALTH_CONCURRENCY / REVIEW_CONCURRENCY never
+    unbounds a rail (0/None → default) or crashes dispatch."""
+    try:
+        n = int(str(value))
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+def _count_live_inflight(state_dir, prefix):
+    """Count live in-flight markers across ALL candidates for one rail.
+
+    ``prefix`` is the glob prefix, e.g. ``.health-inflight`` or ``.review-inflight``. Dead markers are
+    not counted — a crashed worker never wedges a slot (mirrors bash's ``_count_live_healthchecks`` /
+    ``_count_live_reviews``). Zero with no state dir (a sim/dry-run tick has no on-disk markers)."""
+    if not state_dir:
+        return 0
+    n = 0
+    for path in glob.glob(os.path.join(state_dir, prefix + "-*")):
+        if _marker_live(path):
+            n += 1
+    return n
+
+
 # ── the shared on-disk gate contract ($TREES) — sha-keyed ledgers + in-flight markers ─────────────
 # The gate rails are ASYNC dispatch/collect state machines whose truth lives in flat files under the
 # watcher's state dir ``$TREES`` (== ``$WORKTREES_DIR``): the review ledger, the sha-keyed verdict/health
@@ -1051,12 +1077,15 @@ class LiveGates:
     re-journal a ``verdict_recorded`` / ``healthcheck_outcome`` for a held PR every tick.
     """
 
-    def __init__(self, home, state, journal):
+    def __init__(self, home, state, journal, config=None):
         self.home = home
         self.state = state
         self.journal = journal
         self.reused_review = False
         self.reused_health = False
+        cfg = config or {}
+        self._health_max = _pos_int(cfg.get("HEALTH_CONCURRENCY"), 1)
+        self._review_max = _pos_int(cfg.get("REVIEW_CONCURRENCY"), 2)
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
@@ -1102,6 +1131,17 @@ class LiveGates:
         if cand.worktree and not _is_worktree(cand.worktree):
             self.journal.append("dispatch_refused", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                 "rail", "health", "reason", "no-worktree", "worktree", cand.worktree)
+            return WAIT
+        # 3.7 CONCURRENCY SLOT CHECK (HEALTH_CONCURRENCY, default 1): never dispatch when the global
+        #     in-flight count reaches the limit — all worktrees share one git object store, so concurrent
+        #     suites race on object refs and blow past HEALTH_INFLIGHT_TIMEOUT (live regression 2026-07-12:
+        #     PRs 450+451 ran concurrently, both reaped at timeout, re-dispatched, looping forever).
+        #     Dead markers are not counted — a crashed worker never wedges a slot (mirrors bash's
+        #     ``_count_live_healthchecks`` / ``_health_slot_free``, agent-watch.sh:10297,10311).
+        _hc_n = _count_live_inflight(st.dir, ".health-inflight")
+        if _hc_n >= self._health_max:
+            self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "inflight", _hc_n, "limit", self._health_max)
             return WAIT
         # 4. DISPATCH the async suite worker + lay the marker → wait.
         self._dispatch_health(cand)
@@ -1160,6 +1200,15 @@ class LiveGates:
         if inflight and _marker_live(inflight):
             return WAIT
         if st.reviewer_registry_live(cand):
+            return WAIT
+        # 3.5 CONCURRENCY SLOT CHECK (REVIEW_CONCURRENCY, default 2): never dispatch when the global
+        #     in-flight reviewer count reaches the limit (mirrors bash's ``_count_live_reviews >= _review_conc``
+        #     QUEUED path, agent-watch.sh:3115). Dead markers are not counted — a crashed reviewer never
+        #     wedges a slot (``_count_live_reviews``, agent-watch.sh:2455).
+        _rv_n = _count_live_inflight(st.dir, ".review-inflight")
+        if _rv_n >= self._review_max:
+            self.journal.append("review_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "inflight", _rv_n, "limit", self._review_max)
             return WAIT
         # 4. DISPATCH the reviewer async + lay the marker → wait.
         self._dispatch_review(cand)
@@ -1734,10 +1783,13 @@ class LiveTick:
 
 # ── config assembly (read the same knobs the bash watcher reads; env is READ-ONLY) ────────────────
 
+_CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
+
+
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
-              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE") + _WATCHER_KEYS + _FAIRNESS_KEYS)
+              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
@@ -1820,7 +1872,7 @@ def _run_live_tick():
     journal = LiveJournal(path)
     state = LiveState()          # $TREES / $WORKTREES_DIR — the shared sha-keyed ledger + marker substrate
     actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal, config)
-    tick = LiveTick(config, _GraphQLDiscovery(config), LiveGates(home, state, journal),
+    tick = LiveTick(config, _GraphQLDiscovery(config), LiveGates(home, state, journal, config),
                     actuator, journal, state=state)
     return tick.run()
 
