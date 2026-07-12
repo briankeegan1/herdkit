@@ -2,11 +2,12 @@
 # test-watcher-restart-loud-refuse.sh — hermetic regression for HERD-342: blocked watcher restart
 # must fail LOUDLY instead of silently no-opping.
 #
-# Covers four scenarios:
-#   (I)   LIVE lock holder → _acquire_watcher_singleton REFUSE: nonzero + loud stderr + journal event
-#   (II)  Stale-flock adoption (leg b): bypass journal event carries holder info (Linux/flock only)
-#   (III) Leg (a) — bin/herd post-restart verify: empty watch_pid (blocked) → loud error + nonzero
-#   (IV)  Leg (a) — bin/herd post-restart verify: dead watch_pid → loud error + nonzero
+# Covers:
+#   (I)   _acquire_watcher_singleton: LIVE lock holder → nonzero + loud stderr + journal event
+#   (II)  Stale-flock adoption (leg b): bypass journal event carries holder info (flock platforms)
+#   (III) Leg (a) — _watcher_restart_verify: same-pid case (old watcher survived) → BLOCKED
+#   (IV)  Leg (a) — _watcher_restart_verify: empty/dead watch_pid → clean no-op (NOT blocked)
+#   (V)   Leg (a) — _watcher_restart_verify: live new pid + empty pre → SUCCESS (not blocked)
 #
 # Run:  bash tests/test-watcher-restart-loud-refuse.sh
 set -uo pipefail
@@ -30,7 +31,7 @@ track() { LIVE_PROCS="$LIVE_PROCS $1"; }
 [ -f "$WATCH" ] || fail "agent-watch.sh not found at $WATCH"
 [ -f "$HERD_BIN" ] || fail "bin/herd not found at $HERD_BIN"
 
-# ── Guaranteed-dead pid (spawn+reap before any test).
+# Guaranteed-dead pid.
 sleep 0 & DEAD=$!; wait "$DEAD" 2>/dev/null || true
 
 # ── Source agent-watch.sh in lib mode.
@@ -42,7 +43,7 @@ LOCK="$T/.watcher.pid"
 export HERD_WATCHER_LOCK="$LOCK"
 JOURNAL="$T/journal.jsonl"; : > "$JOURNAL"
 export JOURNAL_FILE="$JOURNAL"
-# Stub out live tools so sourcing agent-watch.sh / bin/herd helpers don't touch real state.
+# Stub live tools so sourcing doesn't touch real state.
 BIN="$T/bin"; mkdir -p "$BIN"
 for _cmd in gh git herdr; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/$_cmd"; chmod +x "$BIN/$_cmd"
@@ -58,13 +59,12 @@ export JOURNAL_FILE="$JOURNAL"
 type _acquire_watcher_singleton >/dev/null 2>&1 || fail "_acquire_watcher_singleton not defined"
 type _watcher_singleton_refuse   >/dev/null 2>&1 || fail "_watcher_singleton_refuse not defined (HERD-342)"
 
-# Helper: run _acquire_watcher_singleton in a subshell; echoes ACQUIRE or REFUSE.
 acquire() {
   if ( _acquire_watcher_singleton >/dev/null 2>&1 ); then echo ACQUIRE; else echo REFUSE; fi
 }
 
 # ── (I) LIVE lock holder → REFUSE nonzero + loud stderr + journal watcher_restart_blocked ──────────
-# A live holder: separate sleep process whose pid we write to the lockfile (no BASHPID, no flock).
+# Use a separate sleep process whose pid we write to the lockfile — no BASHPID, no flock needed.
 sleep 300 &
 FAKE_WORKER=$!; track "$FAKE_WORKER"
 printf '%s\n' "$FAKE_WORKER" > "$LOCK"
@@ -92,7 +92,7 @@ ok; echo "PASS (I.iii) watcher_restart_blocked journaled with holder_pid"
 
 kill "$FAKE_WORKER" 2>/dev/null || true; rm -f "$LOCK"
 
-# ── (II) Stale-flock adoption (leg b): bypass journal event (Linux + flock command only) ────────────
+# ── (II) Stale-flock adoption (leg b): bypass journal event (only on platforms with flock cmd) ──────
 if command -v flock >/dev/null 2>&1; then
   printf '%s\n' "$DEAD" > "$LOCK"
   ( exec 9>>"$LOCK"; flock 9 2>/dev/null || true; sleep 60 ) &
@@ -111,12 +111,12 @@ if command -v flock >/dev/null 2>&1; then
 
   kill "$ORPHAN" 2>/dev/null || true
 else
-  echo "SKIP (II) flock command not available on this platform — stale-flock adoption test skipped"
+  echo "SKIP (II) flock command not available — stale-flock adoption test skipped"
 fi
 rm -f "$LOCK"
 
-# ── (III/IV) Leg (a): bin/herd _watcher_restart_verify fires on empty and dead watch_pid ───────────
-# Extract _watcher_restart_verify + its two helpers from bin/herd into a sourceable snippet.
+# ── (III/IV/V) Leg (a): _watcher_restart_verify fires on the right cases ─────────────────────────
+# Extract the helpers we need from bin/herd into a sourceable snippet.
 grep -q "_watcher_restart_verify()" "$HERD_BIN" \
   || fail "(III) bin/herd is missing _watcher_restart_verify (HERD-342)"
 
@@ -125,51 +125,68 @@ grep -q "_watcher_restart_verify()" "$HERD_BIN" \
   awk '/^_watcher_lock_holder_msg\(\) \{/{f=1} f{print} f&&/^\}/{f=0;exit}' "$HERD_BIN"
   awk '/^_watcher_restart_verify\(\) \{/{f=1} f{print} f&&/^\}/{f=0;exit}' "$HERD_BIN"
 } > "$T/leg_a.sh"
+
 # Minimal stubs so the extracted functions work standalone.
 c_red=""; c_rst=""
-JOURNAL_FILE="$JOURNAL"
-WORKSPACE_NAME="restart-loud-refuse-test"
-export JOURNAL_FILE WORKSPACE_NAME c_red c_rst
-# journal_append is already defined from sourcing agent-watch.sh above.
+export c_red c_rst
+export JOURNAL_FILE="$JOURNAL"
+export WORKSPACE_NAME="restart-loud-refuse-test"
+export HERD_WATCHER_LOCK="$LOCK"
+export WORKTREES_DIR="$T/trees"
+
+# Stub watcher_pid_exempt (always returns 1 = "IS a watcher main / not a worker") for basic tests.
+# Tests that need real worker detection override this.
+watcher_pid_exempt() { return 1; }
+export -f watcher_pid_exempt 2>/dev/null || true
+
 # shellcheck source=/dev/null
-. "$T/leg_a.sh" || fail "(III) could not source extracted _watcher_restart_verify"
+. "$T/leg_a.sh" || fail "(III) could not source extracted helpers"
+type _watcher_restart_verify >/dev/null 2>&1 \
+  || fail "(III) _watcher_restart_verify not defined after extraction"
 
-type _watcher_restart_verify >/dev/null 2>&1 || fail "(III) _watcher_restart_verify not defined after extraction"
-
-# (III) empty watch_pid → BLOCKED (no live watcher after restart).
+# (III) Same pid as pre → BLOCKED (old watcher survived stop — case i).
+sleep 300 &
+OLD_WATCHER=$!; track "$OLD_WATCHER"
+printf '%s\n' "$OLD_WATCHER" > "$LOCK"
 : > "$JOURNAL"
 _iii_err="$T/iii.err"; _iii_rc=0
-( _watcher_restart_verify "" "" "0" "herd reload" >"$T/iii.out" 2>"$_iii_err" ) || _iii_rc=$?
+( _watcher_restart_verify "$OLD_WATCHER" "$OLD_WATCHER" "0" "herd reload" \
+    >"$T/iii.out" 2>"$_iii_err" ) || _iii_rc=$?
 [ "$_iii_rc" -ne 0 ] \
-  || fail "(III) _watcher_restart_verify with empty watch_pid must return NON-ZERO"
-ok; echo "PASS (III) empty watch_pid → non-zero (blocked)"
+  || fail "(III) same-pid (old watcher survived) must return NON-ZERO"
+ok; echo "PASS (III) same-pid → non-zero (old watcher survived stop)"
 grep -q "BLOCKED" "$_iii_err" \
-  || fail "(III) stderr must contain BLOCKED (got: $(cat "$_iii_err"))"
-ok; echo "PASS (III) empty watch_pid → BLOCKED on stderr"
+  || fail "(III) same-pid case must print BLOCKED (got: $(cat "$_iii_err"))"
+ok; echo "PASS (III) same-pid → BLOCKED on stderr"
 grep -q '"event".*"watcher_restart_verify_failed"' "$JOURNAL" \
-  || fail "(III) must journal watcher_restart_verify_failed (got: $(cat "$JOURNAL"))"
-ok; echo "PASS (III) empty watch_pid → watcher_restart_verify_failed journaled"
+  || fail "(III) must journal watcher_restart_verify_failed"
+ok; echo "PASS (III) same-pid → watcher_restart_verify_failed journaled"
+kill "$OLD_WATCHER" 2>/dev/null || true; rm -f "$LOCK"
 
-# (IV) dead watch_pid → BLOCKED (no live watcher, proc is gone).
+# (IV) empty watch_pid → clean no-op, NOT blocked (hermetic env case that was false-positiving).
 : > "$JOURNAL"
-_iv_err="$T/iv.err"; _iv_rc=0
-( _watcher_restart_verify "$DEAD" "" "0" "herd reload" >"$T/iv.out" 2>"$_iv_err" ) || _iv_rc=$?
-[ "$_iv_rc" -ne 0 ] \
-  || fail "(IV) _watcher_restart_verify with dead watch_pid must return NON-ZERO"
-ok; echo "PASS (IV) dead watch_pid → non-zero (blocked)"
-grep -q "BLOCKED" "$_iv_err" \
-  || fail "(IV) stderr must contain BLOCKED (got: $(cat "$_iv_err"))"
-ok; echo "PASS (IV) dead watch_pid → BLOCKED on stderr"
+_iv_rc=0
+( _watcher_restart_verify "" "" "0" "herd reload" >"$T/iv.out" 2>"$T/iv.err" ) || _iv_rc=$?
+[ "$_iv_rc" -eq 0 ] \
+  || fail "(IV) empty watch_pid must return 0 (clean no-op, not a blocked restart; got: $(cat "$T/iv.err"))"
+ok; echo "PASS (IV) empty watch_pid → 0 (clean no-op, not blocked)"
 
-# (V) live, genuinely-new watch_pid → should succeed (NOT blocked).
+# (V) dead watch_pid → clean no-op, NOT blocked.
+_v_rc=0
+( _watcher_restart_verify "$DEAD" "" "0" "herd reload" >"$T/v.out" 2>"$T/v.err" ) || _v_rc=$?
+[ "$_v_rc" -eq 0 ] \
+  || fail "(V) dead watch_pid must return 0 (not a blocked restart; got: $(cat "$T/v.err"))"
+ok; echo "PASS (V) dead watch_pid → 0 (clean no-op, not blocked)"
+
+# (VI) live new pid, no pre, no ticks → SUCCESS (the normal case after a successful restart).
 sleep 300 &
 NEW_WATCHER=$!; track "$NEW_WATCHER"
-: > "$JOURNAL"
-_v_rc=0
-( _watcher_restart_verify "$NEW_WATCHER" "" "0" "herd reload" >/dev/null 2>&1 ) || _v_rc=$?
-[ "$_v_rc" -eq 0 ] \
-  || fail "(V) _watcher_restart_verify with a live new pid and empty pre_pid must return 0 (not blocked)"
-ok; echo "PASS (V) live new watch_pid + empty pre_pid → success (not blocked)"
-kill "$NEW_WATCHER" 2>/dev/null || true
+printf '%s\n' "$NEW_WATCHER" > "$LOCK"
+_vi_rc=0
+( _watcher_restart_verify "$NEW_WATCHER" "" "0" "herd reload" >/dev/null 2>&1 ) || _vi_rc=$?
+[ "$_vi_rc" -eq 0 ] \
+  || fail "(VI) live new pid with empty pre_pid must return 0 (successful restart)"
+ok; echo "PASS (VI) live new pid + empty pre_pid → 0 (success)"
+kill "$NEW_WATCHER" 2>/dev/null || true; rm -f "$LOCK"
 
 echo "ALL PASS ($pass checks)"

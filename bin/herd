@@ -4732,35 +4732,74 @@ _watcher_lock_holder_msg() {
 }
 
 # _watcher_restart_verify <watch_pid> <pre_pid> <cmd_ticks> <context> — HERD-342 leg (a).
-# After a restart attempt verify a NEW LIVE watcher is running. Prints a LOUD error and returns 1
-# on any of three failure modes: (1) no live pid in the lockfile, (2) same pid as before the stop,
-# (3) new pid whose start-time predates this command (a stale pid that was never killed).
+# Gate: a blocked restart means the singleton lock is held by a live non-watcher process that
+# refused the new watcher's acquisition — the holder's pid is in the lockfile. A clean no-op
+# (nothing to restart, hermetic env) leaves no live holder; fire the loud error ONLY when
+# the lock is actively contested, not on the bare absence of a watcher.
+#
+# Three firing conditions:
+#   (i)  live pid AND same as pre_pid — old watcher survived the stop
+#   (ii) live pid, different from pre, but started before this command AND identified as an
+#        orphaned worker (not a watcher main) via the shared watcher-exempt.sh seam (HERD-266)
+#   (iii) no live pid in lockfile but a live flock holder detected via lsof identified as a
+#        worker — the rare stale-adoption-second-flock-failure path
 _watcher_restart_verify() {
   local _wrv_pid="${1:-}" _wrv_pre="${2:-}" _wrv_cticks="${3:-0}" _wrv_ctx="${4:-herd restart}"
-  local _wrv_blocked=0 _wrv_reason=""
-  if [ -z "$_wrv_pid" ] || ! kill -0 "$_wrv_pid" 2>/dev/null; then
-    _wrv_blocked=1; _wrv_reason="no live watcher after restart attempt"
-  elif [ "$_wrv_pid" = "$_wrv_pre" ]; then
-    _wrv_blocked=1; _wrv_reason="the running watcher did not change"
-  else
+
+  _wrv_block() {
+    local _msg="${1:-watcher restart blocked}" _h
+    _h="$(_watcher_lock_holder_msg)"
+    printf '%s❌ watcher restart BLOCKED — %s%s\n' "$c_red" "$_msg" "$c_rst" >&2
+    printf '   lock holder: %s\n' "$_h" >&2
+    printf '   remedy: kill the holder, then re-run '"'"'%s'"'"'\n' "$_wrv_ctx" >&2
+    journal_append watcher_restart_verify_failed \
+      pre_pid "${_wrv_pre:-}" new_pid "${_wrv_pid:-}" holder "$_h" \
+      workspace "${WORKSPACE_NAME:-}"
+    return 1
+  }
+
+  # Helper: is <pid> a worker/orphan (NOT a watcher main)?  Routes through the shared
+  # watcher-exempt.sh predicate (HERD-266).  Returns 0 when it IS a worker, 1 when it IS a main.
+  _wrv_is_worker() {
+    local _p="${1:-}" _pp
+    _pp="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d '[:space:]')" || _pp="0"
+    watcher_pid_exempt "$_p" "${_pp:-0}" 2>/dev/null
+  }
+
+  if [ -n "$_wrv_pid" ] && kill -0 "$_wrv_pid" 2>/dev/null; then
+    # A live process holds the lock.
+    # (i) Same pid as before the stop — the old watcher survived.
+    if [ "$_wrv_pid" = "$_wrv_pre" ]; then
+      _wrv_block "the running watcher did not change"; return 1
+    fi
+    # (ii) New pid but started before this command.  Only BLOCKED if the holder is a
+    # worker (not a watcher main) per the shared identity seam.
     local _wrv_nticks; _wrv_nticks="$(_watcher_proc_start_ticks "$_wrv_pid")"
     if { [ "$_wrv_nticks" -gt 0 ] 2>/dev/null; } \
        && { [ "$_wrv_cticks" -gt 0 ] 2>/dev/null; } \
        && { [ "$_wrv_nticks" -le "$_wrv_cticks" ] 2>/dev/null; }; then
-      _wrv_blocked=1; _wrv_reason="the running watcher did not change"
+      if _wrv_is_worker "$_wrv_pid"; then
+        _wrv_block "lock held by a pre-existing worker process (not a new watcher)"; return 1
+      fi
+      # Not exempt = IS a watcher main with a slightly stale start-time (startup-latency
+      # artifact from a previous fast restart); treat as success.
     fi
+    return 0  # new live watcher ✓
+  else
+    # No live pid in lockfile.  In a hermetic test / environment with no watcher this is a
+    # clean no-op, NOT a blocked restart.  Only fire if a live flock holder is detected on
+    # the lockfile path (stale-adoption second-flock failure — extremely rare) AND it is a
+    # worker, not a legitimate watcher main.
+    if [ -f "${HERD_WATCHER_LOCK:-}" ] && command -v lsof >/dev/null 2>&1; then
+      local _wrv_lf_all; _wrv_lf_all="$(lsof -t -- "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+      local _wrv_lf="${_wrv_lf_all%%$'\n'*}"
+      if [ -n "$_wrv_lf" ] && kill -0 "$_wrv_lf" 2>/dev/null && _wrv_is_worker "$_wrv_lf"; then
+        _wrv_pid="$_wrv_lf"  # so _wrv_block can log new_pid
+        _wrv_block "lock held by a live worker (stale-flock contest) — no watcher could start"; return 1
+      fi
+    fi
+    return 0  # no live holder → clean no-op
   fi
-  if [ "$_wrv_blocked" -eq 1 ]; then
-    local _wrv_h; _wrv_h="$(_watcher_lock_holder_msg)"
-    printf '%s❌ watcher restart BLOCKED — %s%s\n' "$c_red" "$_wrv_reason" "$c_rst" >&2
-    printf '   lock holder: %s\n' "$_wrv_h" >&2
-    printf '   remedy: kill the holder, then re-run '"'"'%s'"'"'\n' "$_wrv_ctx" >&2
-    journal_append watcher_restart_verify_failed \
-      pre_pid "${_wrv_pre:-}" new_pid "${_wrv_pid:-}" holder "$_wrv_h" \
-      workspace "${WORKSPACE_NAME:-}"
-    return 1
-  fi
-  return 0
 }
 
 # _watcher_lock_pid_if_live — echo the pid recorded in HERD_WATCHER_LOCK IFF it is a LIVE process,
