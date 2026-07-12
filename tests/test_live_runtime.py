@@ -177,19 +177,34 @@ class TestGateOutcomes(LiveCase):
                 self.assertIn(k, rb[0], "%s missing %s" % (rule, k))
 
     def test_refix_round_is_real_not_hardcoded(self):
-        # HERD-328 S2: the round a refix_bounce carries is the per-(pr, rule) bounce count + 1
-        # (bash's `refix_rail_count + 1`), NOT a hardcoded 1. The first bounce reads round=1, then the
-        # rail counter increments per rail INDEPENDENTLY of the other rail and of other PRs.
+        # HERD-328 S2 / HERD-358: the round a refix_bounce carries is the per-(pr, rule) bounce count
+        # + 1 read from the DURABLE ledger, NOT a hardcoded 1 and NOT a process-local counter.
+        # First bounce (no state dir): round=1 regardless.
         _, ev = self._out(health="CODEERROR")
         rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
         self.assertEqual(rb[0]["round"], 1)
-        # Drive the counter directly on one tick instance: it is per (pr, rule), monotonic, isolated.
-        t = LiveTick({"MERGE_POLICY": "auto"}, FixtureDiscovery({"candidates": []}),
-                     FixtureGates({"candidates": []}), DryRunActuator(LiveJournal(None)),
-                     LiveJournal(None))
-        self.assertEqual([t._next_refix_round(1, "review") for _ in range(3)], [1, 2, 3])
-        self.assertEqual(t._next_refix_round(1, "healthcheck"), 1)   # a different rail is its own count
-        self.assertEqual(t._next_refix_round(2, "review"), 1)        # a different pr is its own count
+        # With a durable state dir, the round ACCUMULATES across FRESH tick instances (fresh process
+        # per tick is the bug scenario — the fix makes round=1,2,3 across three separate runtimes).
+        state_dir = os.path.join(self.tmp, "state-durable")
+        os.makedirs(state_dir)
+        jpath = os.path.join(self.tmp, "durable-rounds.jsonl")
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+        cand = {"pr": 99, "sha": "dursha", "slug": "dur-feat", "health": "CODEERROR"}
+        rounds = []
+        for _ in range(3):
+            scenario = {"candidates": [cand], "config": config}
+            j = LiveJournal(jpath)
+            state = LiveState(state_dir)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                         DryRunActuator(j), j, state=state)
+            t.run()
+            if os.path.exists(jpath):
+                bounces = [o for o in events(jpath)
+                           if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
+                if bounces:
+                    rounds.append(bounces[-1]["round"])
+            os.remove(jpath)
+        self.assertEqual(rounds, [1, 2, 3], "round must climb via durable ledger, got %s" % rounds)
 
 
 class TestReapAndActuation(LiveCase):

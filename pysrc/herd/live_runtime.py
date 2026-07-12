@@ -239,6 +239,39 @@ def _now_epoch():
     return fake if fake else str(int(time.time()))
 
 
+# ── durable refix ledger I/O ($REFIX_STATE = $TREES/.agent-watch-refixed) ───────────────────────────
+# Mirrors record_refix + refix_rail_reset (agent-watch.sh:7291, :7300). Fail-soft throughout: a missing
+# or unwritable ledger loses a record, never aborts the tick.
+
+def _refix_ledger_path(state_dir):
+    """Path to the durable refix ledger; ``None`` when there is no state dir (sim/dry-run)."""
+    return os.path.join(state_dir, ".agent-watch-refixed") if state_dir else None
+
+
+def _read_refix_ledger(state_dir):
+    """Read the durable refix ledger; return empty string on any I/O error (fail-soft)."""
+    path = _refix_ledger_path(state_dir)
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _append_refix_ledger(state_dir, line):
+    """Append one row to the durable refix ledger; fail-soft (never raises)."""
+    path = _refix_ledger_path(state_dir)
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
 def _pid_starttime(pid):
     """A stable per-pid start-time token (agent-watch.sh:_pid_starttime) — the marker's recycling guard.
     ``ps -o lstart=`` is portable across macOS/BSD+Linux; empty when ps cannot answer (caller then falls
@@ -1487,22 +1520,55 @@ class LiveTick:
         self._gate_status = str(self.config.get("GATE_STATUS", "on") or "on")
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
-        self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
         # MERGE_FAIRNESS / starvation freeze (§6.2, HERD-340). OFF (default) → _fairness False and
         # _starved always empty, so the merge path below is byte-identical to before this feature.
         self._fairness = _merge_fairness_enabled(self.config)
         self._starve_threshold = _starve_threshold(self.config)
         self._starved = set()  # PRs that are head-of-line-starved THIS tick (drives the sibling freeze)
 
-    def _next_refix_round(self, pr, rule):
-        """The round number this rail's refix_bounce carries: the per-``(pr, rule)`` bounce count so
-        far + 1 — matching bash's ``round = refix_rail_count + 1`` (``agent-watch.sh:7519,:8260``).
-        The rail budget is per (pr, rule), NOT sha-keyed (contract §4; ``decisions.refix_rail_count``),
-        so a repeat bounce on the same rail increments the real round instead of a hardcoded 1."""
-        key = (pr, rule)
-        n = self._refix_rounds.get(key, 0) + 1
-        self._refix_rounds[key] = n
-        return n
+    def _refix_check_and_record(self, cand, kind):
+        """Check the per-rail/total budget and, when budget remains, append a bounce row to the
+        durable ledger (``$REFIX_STATE``).  Returns ``(round_num, None)`` when the bounce is
+        recorded, or ``(None, reason)`` when the budget is already exhausted (caller escalates).
+
+        ``kind`` is the LEDGER kind (``"health"`` or ``"review"``) matching bash's positional ``$5``
+        field (``agent-watch.sh:7293``).  Round number = ``refix_rail_count + 1`` read BEFORE the
+        append, matching bash's ``_hhc_round_num=$((_hhc_rounds + 1))`` (:8389, :7648).
+        Fail-soft: an unwritable ledger records nothing and returns round=1 (budget appears unlimited);
+        this is the same behaviour as before the fix for a no-dir (sim/dry-run) tick."""
+        state_dir = self.state.dir
+        text = _read_refix_ledger(state_dir)
+        rows = D.parse_refix_ledger(text)
+        pr_str = str(cand.pr)
+        reason = D.refix_budget_reason(rows, pr_str, kind, self.config.get("REFIX_MAX_ROUNDS"))
+        if reason:
+            return None, reason
+        rail = D.refix_rail_count(rows, pr_str, kind)
+        round_num = rail + 1
+        slug = str(cand.slug) if cand.slug else "-"
+        _append_refix_ledger(state_dir,
+                             "%s %s %s %s %s\n" % (_now_epoch(), cand.pr, cand.sha, slug, kind))
+        return round_num, None
+
+    def _refix_rail_reset(self, cand, kind):
+        """Append a ``reset`` row when the rail has unresolved bounces (fail-soft no-op otherwise).
+
+        Mirrors ``refix_rail_reset`` (``agent-watch.sh:7300``): only writes when the rail counter is
+        > 0 so the ledger does not accumulate reset rows on a clean path, and journals
+        ``refix_rail_reset`` so the coordinator sees the rail budget restored."""
+        state_dir = self.state.dir
+        text = _read_refix_ledger(state_dir)
+        rows = D.parse_refix_ledger(text)
+        n = D.refix_rail_count(rows, str(cand.pr), kind)
+        if n <= 0:
+            return
+        sha = str(cand.sha) if cand.sha else "-"
+        slug = str(cand.slug) if cand.slug else "-"
+        _append_refix_ledger(state_dir,
+                             "%s %s %s %s %s reset\n" % (_now_epoch(), cand.pr, sha, slug, kind))
+        self.journal.append("refix_rail_reset", "pr", cand.pr, "sha", cand.sha,
+                            "slug", cand.slug, "kind", kind, "rounds", n,
+                            "reason", "rail resolved its red — per-rail refix budget restored")
 
     def _gate_status_enabled(self):
         """GATE_STATUS master lever — ``off`` disables the herd/gates commit-status post entirely
@@ -1647,14 +1713,27 @@ class LiveTick:
             self.journal.append("healthcheck_outcome", "pr", cand.pr, "slug", cand.slug, "outcome", health)
         self._advance(cand, {"CLEAN": "health_clean", "FLAKY": "health_flaky",
                              "CODEERROR": "health_codeerror"}[health])
+        if health in ("CLEAN", "FLAKY"):
+            # Rail resolved → refund its per-rail budget (contract §4, bash line 10419).
+            self._refix_rail_reset(cand, "health")
         if health == "CODEERROR":
+            # Budget check (HERD-358): exhausted → needs-you escalation, no bounce.
+            round_num, reason = self._refix_check_and_record(cand, "health")
+            if reason is not None:
+                if self.state.once(cand.pr, cand.sha, "refix_escalated_health"):
+                    rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+                    total = D.refix_total_count(rows_after, str(cand.pr))
+                    self.journal.append("health_refix_escalated", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "rounds", total,
+                                        "reason", reason + " — health-check still red")
+                return ESCALATE
             # Contract §3.4 refix_bounce shape (pr, sha, slug, round, agent_status_before, rule,
             # location) — the port unifies both rails under one event keyed by `rule` (there is no
             # `health_refix_bounce` in the catalog). Match the shadow twin's field SET
             # (shadow_runtime.py:418) with bash-faithful defaults: the live tick does not probe the
             # pane here (bash's own fallback is "unknown") and parses no finding location.
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", self._next_refix_round(cand.pr, "healthcheck"),
+                                "round", round_num,
                                 "agent_status_before", "unknown", "rule", "healthcheck",
                                 "location", "")
             return BLOCK
@@ -1676,14 +1755,26 @@ class LiveTick:
                                 "source", "reviewer")
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
+            # Budget check (HERD-358): exhausted → needs-you escalation, no bounce.
+            round_num, reason = self._refix_check_and_record(cand, "review")
+            if reason is not None:
+                if self.state.once(cand.pr, cand.sha, "refix_escalated_review"):
+                    rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+                    total = D.refix_total_count(rows_after, str(cand.pr))
+                    self.journal.append("refix_escalated", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "rounds", total,
+                                        "reason", reason + " — review still blocked")
+                return ESCALATE
             # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
             # bash (agent-watch.sh:7321) with bash-faithful defaults for the fields the live tick does
             # not compute here (pane status → "unknown"; finding location unparsed → "").
             self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", self._next_refix_round(cand.pr, "review"),
+                                "round", round_num,
                                 "agent_status_before", "unknown", "rule", "review",
                                 "location", "")
             return BLOCK
+        # verdict == "PASS" — rail resolved; refund its per-rail budget (contract §4, bash line 1952).
+        self._refix_rail_reset(cand, "review")
 
         # 4. the blessing — both rails passed (review_pass advanced the lifecycle to BLESSED). Once per
         #    (pr, sha): a held-but-blessed PR re-walked every tick posts the blessing exactly once (§5.3).
@@ -1789,7 +1880,7 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
-              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
