@@ -59,8 +59,10 @@ Stdlib-only (the P1 packaging rule). CLI:
 Unit-driven by ``tests/test_live_runtime.py`` + gate wrapper ``tests/test-py-live-runtime.sh``.
 """
 
+import glob
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -232,12 +234,12 @@ def _pid_live(pid):
 
 
 def _pid_session(pid):
-    """The SESSION id of <pid> (``os.getsid``) — the identity the sweep spares a detached gate worker's
-    WHOLE subtree by (HERD-348). We dispatch the async health/review worker with
-    ``start_new_session=True``, so the worker is a session LEADER and its own bats subtree runs under a
-    DIFFERENT process group within that session (GNU ``timeout`` re-groups its child). The recorded pid
-    therefore never names the pid the sweep is about to kill — but the session does. Empty when the pid
-    is gone or the platform refuses, so a caller never over-reads an absent token as a match."""
+    """The SESSION id of <pid> (``os.getsid``) — the identity a detached gate worker's WHOLE subtree
+    shares (HERD-348). We dispatch the async health/review worker with ``start_new_session=True``, so the
+    worker is a session LEADER and its own bats subtree runs under a DIFFERENT process group within that
+    session (GNU ``timeout`` re-groups its child). The recorded pid therefore never names every pid in
+    the subtree — but the session does: the sweep EXEMPTS it and a supersession CANCELS it by session.
+    Empty when the pid is gone or the platform refuses, so a caller never over-reads an absent token."""
     try:
         return str(os.getsid(int(pid)))
     except Exception:
@@ -246,15 +248,140 @@ def _pid_session(pid):
 
 def _marker_write(path, pid):
     """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts, SESSION id
-    (agent-watch.sh:2012 + the HERD-348 session line). The 4th line lets the sweep exempt the worker's
-    whole detached subtree by a DIRECT lookup — no ``ps`` needed; older 3-line markers (the bash writer,
-    a marker predating this line) still work, the sweep falls back to expanding the recorded pid.
-    Best-effort — an unwritable path drops the marker, never raises into the tick."""
+    (agent-watch.sh:2012 + the HERD-348 session line). The 4th line lets the sweep exempt — and a
+    supersession cancel — the worker's whole detached subtree by session; older 3-line markers (the bash
+    writer, a marker predating this line) still work, the reader falls back to the recorded pid's own
+    session. Best-effort — an unwritable path drops the marker, never raises into the tick."""
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("%s\n%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch(), _pid_session(pid)))
     except Exception:
         pass
+
+
+def _term_sleep():
+    """One short (~0.1s) grace tick between a stale worker's SIGTERM and SIGKILL, mirroring
+    ``agent-watch.sh:_health_term_sleep`` — a constant upper bound on unwind time, not a knob.
+    ``HERD_HEALTH_TERM_SLEEP`` is the test seam so a unit drives the loop with no real wall-clock."""
+    try:
+        time.sleep(float(os.environ.get("HERD_HEALTH_TERM_SLEEP", "0.1")))
+    except Exception:
+        pass
+
+
+def _reap(pid):
+    """Best-effort reap of a signaled child so its zombie does not read as 'alive' to ``kill -0`` within
+    the same tick. A no-op (ECHILD) when ``pid`` is not our child — the common case, a worker orphaned
+    to init by the PRIOR tick that dispatched it, which init reaps for us."""
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except Exception:
+        pass
+
+
+def _session_pids(sess):
+    """Live pids whose SESSION == ``sess``, enumerated portably via ``ps -A -o pid=`` + ``os.getsid``.
+    macOS' ``ps -o sess=`` prints a hex handle, not the leader pid (sweep.sh:515), so membership is
+    resolved by ``os.getsid`` per pid — the same call ``_pid_session`` records. Empty on any ps fault."""
+    if not sess:
+        return []
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True).stdout
+    except Exception:
+        return []
+    pids = []
+    for tok in out.split():
+        if not tok.isdigit():
+            continue
+        try:
+            if str(os.getsid(int(tok))) == str(sess):
+                pids.append(int(tok))
+        except Exception:
+            pass
+    return pids
+
+
+def _worker_gone(pid, sess, use_session):
+    """True iff the worker is gone — for a SESSION kill, no session member survives; else the bare pid."""
+    if use_session:
+        return not _session_pids(sess)
+    return not _pid_live(pid)
+
+
+def _signal_session(pid, sess, use_session, sig):
+    """Signal the worker's whole SESSION — every member (HERD-348: the ``timeout``-re-grouped suite
+    children the leader's process group alone would miss) — when ``use_session``; else the bare pid."""
+    if use_session:
+        for p in _session_pids(sess):
+            try:
+                os.kill(p, sig)
+            except Exception:
+                pass
+    else:
+        try:
+            os.kill(int(pid), sig)
+        except Exception:
+            pass
+
+
+def _terminate_worker(path):
+    """TERM → grace → KILL a stale in-flight worker and its WHOLE detached subtree — the shared cancel
+    primitive supersession reuses (the port's analogue of ``agent-watch.sh:_health_terminate_worker``,
+    unified with the HERD-348 session identity).
+
+    The worker is a session LEADER (``start_new_session``), and its suite children may re-group under a
+    DIFFERENT process group within that session (GNU ``timeout`` re-groups its child, HERD-348), so the
+    whole subtree is reaped by SESSION — the leader's process group alone would leave the re-grouped
+    children orphaned-but-alive. Returns ``True`` when every session member is gone; ``False`` when a
+    live member survived — the caller then KEEPS the marker so the next tick retries, never re-terminating
+    blind over a live suite.
+
+    SAFETY — never sever the tick/watcher. Acts ONLY on the pid/session RECORDED in the marker (or, for a
+    legacy 3-line marker, the recorded pid's own session), never a pattern-matched one, and:
+      * a dead / pid-recycled marker (``_marker_live`` false) is already gone — nothing to signal;
+      * a marker naming THIS process, or whose session is OURS, DOWNGRADES to a bare-pid kill (the
+        isolation did not take) — never a session kill that could reach the tick itself.
+    """
+    if not path or not os.path.exists(path):
+        return True
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except Exception:
+        return True
+    pid = (lines[0].strip() if lines else "")
+    if not pid.isdigit():
+        return True
+    if not _marker_live(path):
+        return True                       # dead / recycled — the recycling guard prevents signaling it
+    if pid == str(os.getpid()):
+        return False                      # never signal ourselves
+    # The session to reap: the recorded line 4 (HERD-348) else the pid's own session (a 3-line marker).
+    sess = lines[3].strip() if len(lines) > 3 and lines[3].strip() else _pid_session(pid)
+    try:
+        selfsess = str(os.getsid(0))
+    except Exception:
+        selfsess = ""
+    # SESSION kill only when the recorded session is the worker's OWN and is NOT ours — else DOWNGRADE to
+    # a single-pid kill, exactly as the bash seam downgrades a mis-recorded group.
+    use_session = bool(sess) and sess.isdigit() and sess != selfsess and sess != str(os.getpid())
+    _signal_session(pid, sess, use_session, signal.SIGTERM)
+    for _ in range(6):
+        _reap(pid)
+        if _worker_gone(pid, sess, use_session):
+            break
+        _term_sleep()
+    if not _worker_gone(pid, sess, use_session):
+        _signal_session(pid, sess, use_session, signal.SIGKILL)
+        for _ in range(3):
+            _reap(pid)
+            if _worker_gone(pid, sess, use_session):
+                break
+            _term_sleep()
+    # Collect a just-signaled DIRECT-child zombie (ps no longer lists it, but its pid entry lingers until
+    # reaped) so kill -0 reflects real death — a no-op (ECHILD) for the common orphan-of-a-prior-tick.
+    _reap(pid)
+    return _worker_gone(pid, sess, use_session)
 
 
 def _marker_live(path):
@@ -425,6 +552,56 @@ class LiveState:
             pass
         return True
 
+    def posted(self, pr, sha, kind):
+        """True iff a SUCCESSFUL ``<kind>`` network post was already recorded for this ``(pr, sha)``.
+        Unlike :meth:`once`, the marker is written SEPARATELY (:meth:`record_posted`) only AFTER the post
+        succeeds — so a failed post retries next tick, mirroring bash's success-only ledger row
+        (agent-watch.sh:_gate_status_posted). With no state dir there is no marker → never posted."""
+        path = self._p(".live-posted-%s-%s-%s" % (kind, pr, sha))
+        return bool(path) and os.path.exists(path)
+
+    def record_posted(self, pr, sha, kind):
+        """Record a SUCCESSFUL ``<kind>`` post for this ``(pr, sha)`` — the at-most-once ledger for a
+        network write (agent-watch.sh:_record_gate_status). No-op with no state dir."""
+        path = self._p(".live-posted-%s-%s-%s" % (kind, pr, sha))
+        if not path:
+            return
+        try:
+            open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    def merge_refusals(self, pr, sha):
+        """The count of consecutive merge REFUSALS recorded for this ``(pr, sha)`` (0 if none / no dir)."""
+        path = self._p(".live-merge-refused-%s-%s" % (pr, sha))
+        if not path or not os.path.exists(path):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return int((fh.readline() or "0").strip() or "0")
+        except Exception:
+            return 0
+
+    def bump_merge_refusal(self, pr, sha):
+        """Increment and return the consecutive-refusal count for this ``(pr, sha)``. With no state dir (a
+        sim/dry-run tick has no cross-tick memory) it cannot persist, so it always reports 1 — a stateless
+        tick never accumulates toward the escalation threshold (task HERD-352)."""
+        path = self._p(".live-merge-refused-%s-%s" % (pr, sha))
+        if not path:
+            return 1
+        n = self.merge_refusals(pr, sha) + 1
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%d\n" % n)
+        except Exception:
+            pass
+        return n
+
+    def clear_merge_refusal(self, pr, sha):
+        """Drop the refusal counter for this ``(pr, sha)`` — called on a VERIFIED merge so the ledger
+        never carries a stale count forward. No-op with no state dir."""
+        self.rm(self._p(".live-merge-refused-%s-%s" % (pr, sha)))
+
     def rm(self, *paths):
         for p in paths:
             if p:
@@ -502,6 +679,52 @@ class LiveState:
         except Exception:
             return None
         return self.restale_count(pr)
+
+    # supersession substrate ($TREES) — the sha-keyed scratch a superseded sha's workers leave behind,
+    # resolved for an ARBITRARY (pr, sha) so the discovery→cancel pass can reap a PRIOR head's files.
+    def _sha_path(self, prefix, pr, sha):
+        return self._p("%s-%s-%s" % (prefix, pr, sha)) if self.dir else None
+
+    def health_dispatch_file_sha(self, pr, sha):
+        return self._sha_path(".health-dispatch", pr, sha)
+
+    def health_result_file_sha(self, pr, sha):
+        return self._sha_path(".health-result", pr, sha)
+
+    def health_log_file_sha(self, pr, sha):
+        return self._sha_path(".health-log", pr, sha)
+
+    def review_result_file_sha(self, pr, sha):
+        return self._sha_path(".review-result", pr, sha)
+
+    def review_registry_file_sha(self, pr, sha):
+        return self._sha_path(".review-registry", pr, sha)
+
+    def stale_inflight(self, prefix, pr, cur_sha):
+        """DYNAMIC discovery of doomed workers: yield ``(marker_path, sha)`` for every
+        ``$TREES/<prefix>-<pr>-<sha>`` in-flight marker whose ``sha`` differs from the PR's current head
+        ``cur_sha`` (a prior head this PR has moved past). No hardcoded candidate list — the stale set is
+        globbed off disk, exactly as ``_discard_stale_health`` walks ``.health-inflight-$pr-*``
+        (agent-watch.sh:10420). Empty with no state dir (a sim/dry-run tick has no on-disk workers)."""
+        if not self.dir:
+            return
+        for path in sorted(glob.glob(self._p("%s-%s-*" % (prefix, pr)))):
+            sha = os.path.basename(path).rsplit("-", 1)[-1]
+            if sha and sha != str(cur_sha):
+                yield path, sha
+
+    def read_review_pane(self, pr, sha):
+        """The reviewer's STAMPED pane id from its dispatch registry row ``<pid> <pane>``
+        (agent-watch.sh:2505); '' when there is no registry row — the pane a supersession retires."""
+        path = self.review_registry_file_sha(pr, sha)
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                parts = fh.readline().split()
+        except Exception:
+            return ""
+        return parts[1] if len(parts) > 1 else ""
 
 
 # _health_worker mirror (agent-watch.sh:_health_worker): the ASYNC suite the port dispatches for one
@@ -670,7 +893,8 @@ def discover_via_graphql(repo=None, limit=50):
 # unset/all + WATCHER_SCOPE unset/mine) is a byte-identical passthrough: every discovered PR flows through.
 
 _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
-                 "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER")
+                 "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER",
+                 "GATE_STATUS")
 
 # ── merge fairness / starvation freeze (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────
 # SHIP-DORMANT. MERGE_FAIRNESS=off (the default, and any unrecognized value) disables every re-stale
@@ -901,6 +1125,8 @@ class LiveGates:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "health",
                                 "detail", "health dispatch failed: %s" % str(exc)[:160])
             return
+        # The marker records the worker's SESSION (HERD-348): start_new_session makes it a session
+        # leader, so a supersession (and the sweep) reaps its whole detached suite subtree by session.
         _marker_write(inflight, proc.pid)
         self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "pid", proc.pid, "log_path", log or "")
@@ -959,6 +1185,8 @@ class LiveGates:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
                                 "detail", "review dispatch failed: %s" % str(exc)[:160])
             return
+        # The marker records the reviewer's SESSION (start_new_session → session leader) so a superseding
+        # push can terminate its whole subtree, then retire its stamped pane (HERD-341 + HERD-348).
         _marker_write(inflight, proc.pid)
         # Contract §3.4 requires the full shape (pr, sha, pid, model, log_path, pin) — the same six
         # keys bash emits (agent-watch.sh:2545) and the shadow twin emits (shadow_runtime.py:382), so
@@ -1021,6 +1249,19 @@ class FixtureGates:
 
 # ── apply: actuate the terminal action (merge / reap) or, in dry-run, journal only ────────────────
 
+# The herd/gates commit-status contract (GATE_STATUS=on), mirrored VERBATIM from the bash watcher so a
+# python-posted blessing is indistinguishable from a bash-posted one. ONLY `success` is ever posted — a
+# non-passing status flips a CLEAN sha to mergeStateStatus=UNSTABLE and strands it, so the fail-safe rests
+# entirely on the ABSENCE of success (agent-watch.sh:GATE_STATUS_CONTEXT / :_gate_status_desc).
+_GATE_STATUS_CONTEXT = "herd/gates"
+_GATE_STATUS_DESC = "healthcheck + adversarial review passed"
+
+# Consecutive merge REFUSALS (the API did not confirm state=MERGED) tolerated before the tick escalates
+# with a loud needs-you row. Below the threshold the PR STAYS BLESSED and re-attempts next tick; at it,
+# a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
+_MERGE_REFUSE_MAX = 3
+
+
 class DryRunActuator:
     """The side-effect-free apply twin: journals the SAME terminal events, actuates NOTHING.
 
@@ -1042,6 +1283,12 @@ class DryRunActuator:
                             "reason", "merged")
         return True
 
+    def post_gate_status(self, cand):
+        """PURE no-op twin of the herd/gates commit-status post: no network, no ledger, no journal —
+        exactly as bash's ``post_gate_status`` returns early under ``--dry-run``. Returns False (nothing
+        posted) so the side-effect-free VERIFY column never records a blessing it did not actually land."""
+        return False
+
 
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
@@ -1058,15 +1305,66 @@ class LiveActuator:
         self.journal = journal
 
     def merge(self, cand):
+        # Run the squash-merge, then VERIFY via the API that the PR actually reached state=MERGED before
+        # we treat it as merged (task HERD-352). A merge is the one UNRECOVERABLE action, so its exit code
+        # is not authoritative: `gh pr merge` can exit non-zero AFTER a successful merge (HERD-221: a failed
+        # local branch delete on a still-checked-out worktree) AND exit zero without merging is possible
+        # under a mergeability regression / branch-protection race. We never infer the merge from the exit
+        # code — we read the PR's real state.
         try:
             subprocess.run(["gh", "pr", "merge", cand.pr, "--squash", "--delete-branch"],
                            capture_output=True, text=True, check=True)
-        except Exception as exc:
-            self.journal.append("merge_gh_unreadable", "pr", cand.pr, "sha", cand.sha,
-                                "detail", str(exc)[:200])
+        except Exception:
+            pass  # non-zero is NOT authoritative — the API state below is the only truth that merges
+        state = self._merged_state(cand)
+        if state == "MERGED":
+            self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                                "method", "squash", "reason", "gates_passed")
+            return True
+        if not state:
+            # HONEST LABELS (HERD-232): an EMPTY/unreadable state (network blip, rate limit, expired auth)
+            # is NOT evidence of anything — it must NOT be labelled a genuine refusal. It is an infra event,
+            # so FAIL CLOSED (no merge, no fabricated moved/merged row) and re-gate next tick.
+            self.journal.append("merge_gh_unreadable", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha)
             return False
-        self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
-                            "method", "squash", "reason", "gates_passed")
+        # A READABLE non-MERGED state is a GENUINE refusal (a mergeability regression / branch-protection
+        # race). Name the state it actually saw so the label and the evidence agree, and NEVER reap or
+        # transition — return False so the tick keeps the PR BLESSED and re-attempts next tick (HERD-352).
+        self.journal.append("merge_refused", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                            "state", state, "reason", "api_not_merged")
+        return False
+
+    def _merged_state(self, cand):
+        """The PR's real state per the GitHub API (``gh pr view --json state``) — the ONLY confirmation
+        that authorizes reaping the worktree. An unreadable state (network/auth/rate-limit) returns ``""``,
+        which the caller treats as an infra outage (merge_gh_unreadable), NOT a genuine refusal — the
+        honest-labels split (HERD-232). Either way it fails closed: an unconfirmed merge never reaps."""
+        try:
+            out = subprocess.run(["gh", "pr", "view", cand.pr, "--json", "state,mergedAt", "-q", ".state"],
+                                 capture_output=True, text=True, check=True)
+        except Exception:
+            return ""
+        return out.stdout.strip()
+
+    def post_gate_status(self, cand):
+        """POST the herd/gates=success commit status for this ``(pr, sha)`` via the GitHub Statuses API
+        (GATE_STATUS=on contract, agent-watch.sh:post_gate_status). ONLY ``success`` is ever posted — a
+        non-passing status flips a CLEAN sha to UNSTABLE and strands it, so the fail-safe rests on the
+        ABSENCE of success. Journals ``gate_status`` (bash-identical shape) on a successful write and
+        returns True; a failed/empty write journals NOTHING and returns False, so the tick retries next
+        round — the blessing MUST land for the ``require herd/gates`` fail-safe to hold. Never raises."""
+        if not cand.sha:
+            return False
+        try:
+            subprocess.run(
+                ["gh", "api", "repos/{owner}/{repo}/statuses/%s" % cand.sha,
+                 "-f", "state=success", "-f", "context=%s" % _GATE_STATUS_CONTEXT,
+                 "-f", "description=%s" % _GATE_STATUS_DESC],
+                capture_output=True, text=True, check=True)
+        except Exception:
+            return False   # best-effort: a failed post lands NO ledger row, so it retries next tick
+        self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
+                            "context", _GATE_STATUS_CONTEXT)
         return True
 
     def reap(self, cand):
@@ -1106,6 +1404,9 @@ class LiveTick:
         self._merge_policy = D.effective_merge_policy(
             self.config.get("MERGE_POLICY"), self.config.get("WATCHER_AUTOMERGE"))
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
+        # GATE_STATUS master lever (HERD-194 contract): on (default) → post the herd/gates commit status
+        # on gates-clear; off → byte-inert (no post, no journal, no ledger). Consumed at the blessing seam.
+        self._gate_status = str(self.config.get("GATE_STATUS", "on") or "on")
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
         self._refix_rounds = {}  # (pr, rule) -> refix rounds spent on that rail (S2: real round, not 1)
@@ -1124,6 +1425,12 @@ class LiveTick:
         n = self._refix_rounds.get(key, 0) + 1
         self._refix_rounds[key] = n
         return n
+
+    def _gate_status_enabled(self):
+        """GATE_STATUS master lever — ``off`` disables the herd/gates commit-status post entirely
+        (byte-inert: no post, no journal, no ledger). Any other value is on
+        (agent-watch.sh:_gate_status_enabled — unknown value → on)."""
+        return self._gate_status != "off"
 
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
@@ -1185,6 +1492,51 @@ class LiveTick:
                     and self._would_automerge(cand)
                     and self.state.once(cand.pr, cand.sha, "fairness_window")):
                 self._starved.add(cand.pr)
+
+    def _supersede_stale(self, candidates):
+        """Discovery → cancel: TERM every doomed in-flight worker a candidate has moved PAST (contract
+        §2.4/§6.1, HERD-341). For each current candidate, DYNAMICALLY discover the in-flight markers
+        left for a SUPERSEDED sha (a prior head), then reap them — a health suite worker by a SESSION
+        kill of its whole detached subtree (HERD-283/348: the leader's process group alone would miss the
+        ``timeout``-re-grouped suite children), a stale reviewer likewise + its STAMPED PANE retired —
+        and journal ``gate_superseded`` for each. This is the shadow's task-group cancel
+        (P3c ``_maybe_inject_supersession``) generalized to the live tick's on-disk substrate: the
+        production tree already performs it on a new head sha (``_discard_stale_health`` /
+        ``_discard_stale_reviews``); the port carries the same invariant into the typed core.
+
+        BYTE-INERT when nothing is superseded: with no state dir (a sim/dry-run tick) or no stale marker,
+        the glob is empty and this journals nothing — the stream is identical to before. A worker that
+        refuses to die keeps its marker (the terminate returned False) and is retried next tick, never
+        re-terminated blind and never falsely reported superseded.
+        """
+        st = self.state
+        if not st.dir:
+            return
+        for cand in candidates:
+            try:
+                cur = str(cand.sha)
+                # health rail — session-kill the stale suite worker's subtree (HERD-283/348), reap scratch.
+                for path, sha in st.stale_inflight(".health-inflight", cand.pr, cur):
+                    if _terminate_worker(path):
+                        st.rm(path, st.health_dispatch_file_sha(cand.pr, sha),
+                              st.health_result_file_sha(cand.pr, sha),
+                              st.health_log_file_sha(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "health",
+                                            "old_sha", sha, "new_sha", cur, "action", "session_kill")
+                # review rail — terminate the stale reviewer's subtree, retire its stamped pane, reap scratch.
+                for path, sha in st.stale_inflight(".review-inflight", cand.pr, cur):
+                    if _terminate_worker(path):
+                        pane = st.read_review_pane(cand.pr, sha)
+                        st.rm(path, st.review_result_file_sha(cand.pr, sha),
+                              st.review_registry_file_sha(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "review",
+                                            "old_sha", sha, "new_sha", cur, "action", "pane_retired",
+                                            "pane", pane)
+            except Exception as exc:
+                # A supersession scan fault for one candidate must never sink the tick (parking a doomed
+                # worker for the next tick's corpse sweep is always safe); journal it and move on.
+                self.journal.append("live_candidate_error", "pr", cand.pr, "sha", cand.sha,
+                                    "detail", "supersede: %s" % str(exc)[:180])
 
     def _walk(self, cand):
         """Walk one candidate's gate DAG; actuate the terminal; return the action string.
@@ -1261,6 +1613,16 @@ class LiveTick:
             self.journal.append("blessing", "pr", cand.pr, "sha", cand.sha, "context", "herd/gates",
                                 "state", "success")
 
+        # 4b. POST the herd/gates=success commit status (GATE_STATUS=on contract, agent-watch.sh:
+        #     post_gate_status). ONLY the actuator touches the network; the DryRunActuator twin is a pure
+        #     no-op, so the side-effect-free VERIFY column never posts. At-most-once per (pr,sha): the
+        #     ledger marker is recorded ONLY on a successful post, so a failed network write retries next
+        #     tick — the blessing MUST land for the `require herd/gates` fail-safe to hold. Byte-inert when
+        #     GATE_STATUS=off (no post, no journal, no ledger).
+        if self._gate_status_enabled() and cand.sha and not self.state.posted(cand.pr, cand.sha, "gate_status"):
+            if self.actuator.post_gate_status(cand):
+                self.state.record_posted(cand.pr, cand.sha, "gate_status")
+
         # 5. the pure hold / merge / observe decision (reused from P2, contract §2.2/§5.4-§5.5).
         action = D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy)
 
@@ -1284,9 +1646,22 @@ class LiveTick:
         # 6. apply — the ONLY step that actuates (and only under LiveActuator).
         if action == "MERGE":
             if self.actuator.merge(cand):
+                self.state.clear_merge_refusal(cand.pr, cand.sha)
                 self.actuator.reap(cand)          # reap-on-merge (contract §6.1)
                 return "MERGE"
-            return ESCALATE                        # merge failed → escalate, never a silent drop
+            # Merge REFUSED — the actuator's API verify did not confirm state=MERGED (it journaled the
+            # refusal: `merge_refused` for a readable non-MERGED state, `merge_gh_unreadable` for an infra
+            # outage). A merge is the one unrecoverable action, so an UNCONFIRMED merge is never
+            # treated as done: the PR STAYS BLESSED (no reap, no silent drop) and re-attempts next tick.
+            # Only after _MERGE_REFUSE_MAX consecutive refusals do we ESCALATE with a loud needs-you row,
+            # so a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
+            n = self.state.bump_merge_refusal(cand.pr, cand.sha)
+            if n >= _MERGE_REFUSE_MAX:
+                # The loud needs-you row: N consecutive refusals means the merge is genuinely wedged.
+                self.journal.append("merge_refused_escalated", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "count", n, "reason", "merge refused")
+                return ESCALATE
+            return HOLD                            # stay BLESSED, re-attempt next tick
         if action == "HOLD":
             if self.state.once(cand.pr, cand.sha, "hold"):
                 self.journal.append("hold_applied", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
@@ -1302,6 +1677,11 @@ class LiveTick:
         candidates = self.discovery.discover()
         self.journal.append("live_tick_start", "candidates", len(candidates), "impl", "python",
                             "merge_policy", self._merge_policy)
+        # Discovery → supersession-cancel (§2.4/§6.1): before the gate walk, TERM the doomed in-flight
+        # workers any candidate has moved past, so a superseded sha never holds a rail slot or races a
+        # fresh dispatch. No-op with no state dir / no stale marker (byte-inert when nothing superseded).
+        self._supersede_stale(candidates)
+
         # Resolve this tick's starvation state before any candidate is walked (§6.2, HERD-340). A strict
         # no-op under MERGE_FAIRNESS=off, so the loop below stays byte-identical to before this feature.
         self._fairness_prepass(candidates)
