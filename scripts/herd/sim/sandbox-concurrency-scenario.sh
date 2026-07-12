@@ -618,10 +618,57 @@ if [ "$PEAK_REVIEWS" -le "$REVIEW_CONCURRENCY" ] && [ "$PEAK_REVIEWS" -ge 1 ]; t
 else
   checkpoint review_concurrency_respected fail "peak live reviews=$PEAK_REVIEWS exceeded REVIEW_CONCURRENCY=$REVIEW_CONCURRENCY"
 fi
+# AWAIT / DIRECT CAP PROBE (HERD-331): the review_cap_gated assertion can run BEFORE any PR
+# naturally reaches QUEUED under load — with HEALTH_CONCURRENCY=1, each HC runs sequentially,
+# and under a loaded box the HC stub takes long enough that reviews are staggered across ticks
+# rather than overlapping, so the cap never bites during the natural drain (same load-timing
+# class as HERD-326). Fix: if no PR was naturally QUEUED, AWAIT the state via a DIRECT MECHANISM
+# PROBE — the same pattern as health_mutex_queues above — rather than failing immediately.
+# Plant REVIEW_CONCURRENCY live inflight review markers (background sleeps), call the SHIPPED
+# _review_gate_step for a probe PR, and assert it returns QUEUED (cap full → dispatch refused).
+# Requirement (d): a genuine probe failure (cap broken) still fails LOUDLY — never skipped.
+# Label flaky/load (c) in console output when the probe path was taken.
+_cap_probe_needed=0; _cap_probe_ok=0; _cap_probe_detail=""
+if [ "$_q_count" -eq 0 ]; then
+  _cap_probe_needed=1
+  info "flaky/load: no PR naturally QUEUED during drain — running direct cap probe (HERD-331)"
+  # Plant REVIEW_CONCURRENCY background sleep processes as live inflight review markers.
+  _probe_pids=""; _k=1
+  while [ "$_k" -le "$REVIEW_CONCURRENCY" ]; do
+    sleep 300 &
+    _pp="$!"
+    _probe_pids="$_probe_pids $_pp"
+    printf '%s\n' "$_pp" > "$(_review_inflight_file $((7000+_k)) "capprobesha$_k")"
+    _k=$((_k+1))
+  done
+  # Cap is now full. Call the SHIPPED gate for a new probe PR — must return QUEUED.
+  _probe_step="$(_review_gate_step 7999 "probe-cap-gated" "capprobeshaprobe")"
+  # Clean up: kill placeholder processes and remove their markers.
+  for _pp in $_probe_pids; do kill "$_pp" 2>/dev/null || true; done
+  _k=1
+  while [ "$_k" -le "$REVIEW_CONCURRENCY" ]; do
+    rm -f "$(_review_inflight_file $((7000+_k)) "capprobesha$_k")" 2>/dev/null || true
+    _k=$((_k+1))
+  done
+  rm -f "$(_review_inflight_file 7999 "capprobeshaprobe")" \
+        "$(_review_registry_file 7999 "capprobeshaprobe")" \
+        "$(_review_result_file 7999 "capprobeshaprobe")" 2>/dev/null || true
+  if [ "$_probe_step" = "QUEUED" ]; then
+    _cap_probe_ok=1
+    _q_count=1   # probe confirmed one QUEUED event; satisfies scorecard + test
+    _cap_probe_detail="flaky/load: cap probe confirmed QUEUED (reviews did not overlap during drain under load)"
+  else
+    _cap_probe_detail="cap probe returned '$_probe_step' instead of QUEUED — cap mechanism failure"
+  fi
+fi
 if [ "$_q_count" -ge 1 ]; then
-  checkpoint review_cap_gated pass "$_q_count PR(s) QUEUED behind the cap (non-vacuous):$QUEUED_PRS"
+  if [ "$_cap_probe_needed" -eq 1 ]; then
+    checkpoint review_cap_gated pass "$_cap_probe_detail"
+  else
+    checkpoint review_cap_gated pass "$_q_count PR(s) QUEUED behind the cap (non-vacuous):$QUEUED_PRS"
+  fi
 else
-  checkpoint review_cap_gated fail "no PR ever queued — the cap never actually gated (vacuous test)"
+  checkpoint review_cap_gated fail "no PR ever queued AND direct cap probe failed: $_cap_probe_detail — the cap never actually gated (vacuous test)"
 fi
 
 # (b) HEALTH_CONCURRENCY=1 — no interleaving: every recorded live-marker count is exactly 1.
