@@ -124,6 +124,10 @@ SWEEP_LEG5=0
 # Legs append one PLAN LINE per finding: "<verb>\t<what>\t<detail>". _sweep_emit prints it (the
 # dry-run plan IS the same text the live run narrates) and counts it. Counters drive the summary.
 SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0
+# HERD-356: worktrees whose merged/closed reap was DEFERRED because a builder is still working there.
+# EXCLUDED from the swept total (nothing was deleted) and from the FLAG total (it is not a judgment hold a
+# human must resolve — it clears itself the moment the agent goes idle); its own calm line reports it.
+SWEEP_N_DEFER=0
 # Leg 6 (HERD-267) counts merged PRs whose tracker item never got created. Deliberately EXCLUDED from
 # the swept total and from sweep_swept_total: a relink is an ADVISORY enqueue, not a reap, and folding
 # it into the total would make the watcher's auto path read "progress" on a tick that deleted nothing.
@@ -135,6 +139,7 @@ SWEEP_N_LINK=0
 # running total instead of what that tick actually swept.
 _sweep_reset_counters() {
   SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0; SWEEP_N_LINK=0
+  SWEEP_N_DEFER=0
 }
 
 # _sweep_say <icon> <line> — one narration line, themed when the console palette is loaded.
@@ -317,6 +322,8 @@ EOF
       MERGED)
         if [ "$dirt" = "dirty" ]; then
           _sweep_emit_flag "$slug" merged-dirty "$evidence (PR #$num merged; commit or discard, then re-run)"
+        elif _reap_agent_working "$slug"; then
+          _sweep_emit_defer "$slug" "PR #$num merged · builder still working — reap deferred until it goes idle"
         else
           _sweep_emit_reap "$slug" "$dir" "$num" "$head" merged "$dry"
         fi
@@ -329,6 +336,8 @@ EOF
           _sweep_emit_flag "$slug" closed-unique-commits "$uniq commit(s) exist only here (PR #$num closed unmerged)"
         elif [ "$dirt" = "dirty" ]; then
           _sweep_emit_flag "$slug" closed-dirty "$evidence (PR #$num closed)"
+        elif _reap_agent_working "$slug"; then
+          _sweep_emit_defer "$slug" "PR #$num closed · builder still working — reap deferred until it goes idle"
         else
           _sweep_emit_reap "$slug" "$dir" "$num" "$head" closed "$dry"
         fi
@@ -358,6 +367,18 @@ _sweep_emit_flag() {
   SWEEP_N_FLAG=$(( SWEEP_N_FLAG + 1 ))
   _sweep_say "🚩" "FLAG ${slug} — ${reason}: ${evidence}"
   journal_append sweep_flag slug "$slug" reason "$reason" evidence "$evidence"
+}
+
+# _sweep_emit_defer <slug> <reason> — a merged/closed worktree whose reap is DEFERRED because a builder is
+# still WORKING there (HERD-356, _reap_agent_working). Distinct from a FLAG: a flag is a judgment a human
+# must resolve, whereas a defer clears itself the moment the agent goes idle — so it is neither reaped nor
+# flagged, just narrated calmly (⏸️) and journaled. Emitted in EVERY mode (the dry-run plan prints the same
+# line the live run would), and its own counter keeps the reap/flag tallies honest.
+_sweep_emit_defer() {
+  local slug="$1" reason="$2"
+  SWEEP_N_DEFER=$(( SWEEP_N_DEFER + 1 ))
+  _sweep_say "⏸️" "defer ${slug} — ${reason}"
+  journal_append sweep_defer slug "$slug" reason "$reason"
 }
 
 # ── leg 2: stale tabs ────────────────────────────────────────────────────────────────────────────
@@ -1143,7 +1164,7 @@ sweep_run_safe_legs() {
   # here (and only here): the watcher runs this every cadence tick, and the rest of its trigger pass
   # is network-free by design.
   sweep_leg_links "" 1
-  journal_append sweep_auto reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" \
+  journal_append sweep_auto reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" deferred "$SWEEP_N_DEFER" \
     tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
   # Tell a live watcher the tally is stale so it recomputes now (HERD-215). Harmless in the auto path,
   # which recomputes in-process anyway; load-bearing for a manual `herd sweep` from another process.
@@ -1188,7 +1209,7 @@ sweep_main() {
     printf '  🔗 %d merged PR(s) with a missing tracker item — retroactive linkage %s\n' \
       "$SWEEP_N_LINK" "$([ -n "$dry" ] && printf 'would be enqueued' || printf 'enqueued for the scribe')"
   fi
-  if [ "$total" -eq 0 ] && [ "$SWEEP_N_FLAG" -eq 0 ]; then
+  if [ "$total" -eq 0 ] && [ "$SWEEP_N_FLAG" -eq 0 ] && [ "$SWEEP_N_DEFER" -eq 0 ]; then
     # A leg-6 finding is not a "sweep", but it is not clean either — the 🔗 line above already said
     # what happened, so stay silent rather than claiming a clean room over the top of it.
     [ "$SWEEP_N_LINK" -eq 0 ] && printf '  ✅ control room clean — nothing to sweep\n'
@@ -1198,9 +1219,11 @@ sweep_main() {
       "$SWEEP_N_REAP" "$SWEEP_N_TAB" "$SWEEP_N_MARKER" "$SWEEP_N_PROC" \
       "$([ "$SWEEP_N_FLAG" -gt 0 ] && printf ' · %d FLAGGED for you' "$SWEEP_N_FLAG")"
     [ "$SWEEP_N_FLAG" -gt 0 ] && printf '  🚩 flagged items are NEVER auto-deleted — resolve them by hand\n'
+    # HERD-356: a deferred reap is not a failure — it clears itself when the still-working builder goes idle.
+    [ "$SWEEP_N_DEFER" -gt 0 ] && printf '  ⏸️  %d worktree(s) merged/closed but a builder is still working — reap deferred (will reap when idle)\n' "$SWEEP_N_DEFER"
   fi
 
-  journal_append sweep_done mode "$mode" reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" \
+  journal_append sweep_done mode "$mode" reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" deferred "$SWEEP_N_DEFER" \
     tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
   # Invalidate a live watcher's cached tally so its housekeeping line recomputes next tick (HERD-215).
   # Skip on --dry-run: it touched nothing, so the mess is still there and the cached count is still true.

@@ -1014,6 +1014,9 @@ _row_wedged() {
 #             been converging so a wedged one is legible before it even turns red.
 #   stuck     YOUR move — teardown has failed _RETIRE_STUCK_TICKS ticks running. RED, and it NAMES the
 #             blocker (the first leftover kind that would not die) plus the remedy.
+#   deferred  the HERD's move — terminal + disposable, but a builder is still WORKING in the tree
+#             (HERD-356). CALM-but-visible (⏸️ yellow, never red — nothing is wrong, we are waiting): the
+#             reap runs itself the moment the agent goes idle. <detail> names why.
 #   held      YOUR move — the slug is terminal but carries REAL WORK (uncommitted tracked files, or
 #             commits that exist nowhere else). RED, with the evidence verbatim. Retirement will not
 #             touch it, this tick or ever, until a human commits or discards.
@@ -1027,6 +1030,9 @@ _row_retirement() {
     stuck)
       printf '    %s⚠️%s  %s%s%s %sneeds-you · retirement stuck: %s · run `herd sweep` or close it by hand · %s%s' \
         "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$_age" "$C_RESET" ;;
+    deferred)
+      printf '    %s⏸️%s  %s%s%s %sreap deferred · %s · %s%s' \
+        "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_YELLOW" "$_detail" "$_age" "$C_RESET" ;;
     held)
       printf '    %s⚠️%s  %s%s%s %sneeds-you · %s%s' \
         "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$C_RESET" ;;
@@ -11798,8 +11804,8 @@ EOF
       # classification entirely — those all key off "PR-less", which a merged builder trivially is.
       DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
       case "$_rt_state" in
-        retiring) FLAIR_STATE[i]="busy" ;;
-        *)        FLAIR_STATE[i]="attention" ;;
+        retiring|deferred) FLAIR_STATE[i]="busy" ;;   # HERD-356: deferred is the herd waiting, not your move
+        *)                 FLAIR_STATE[i]="attention" ;;
       esac
     elif [ -z "$prnum" ]; then
       if [ "$matchkind" = "ambig" ]; then

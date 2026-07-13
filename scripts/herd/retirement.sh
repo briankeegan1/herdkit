@@ -133,7 +133,7 @@ _retire_state_clear() {
   # `retire_hold` journal line forever, defeating the very once-per-(slug,kind) dedupe the marker exists
   # for. The kind is a closed set, so enumerate it; _retire_tail_ok cannot help here (its tails are shas,
   # and `hold`/`stuck` are not hex).
-  for k in hold stuck; do
+  for k in hold stuck defer; do
     rm -f "$TREES/.retire-noted-$1-$k" 2>/dev/null || true
   done
 }
@@ -179,6 +179,38 @@ try:
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0 if any(a.get("name") == slug for a in ags) else 1)
+' 2>/dev/null
+}
+
+# _reap_agent_working <slug> — the SHARED reap liveness gate (HERD-356). Success iff a resident agent for
+# this slug is POSITIVELY working (agent_status=="working"). Read by BOTH bash reap legs — retire_classify
+# here and sweep_leg_worktrees in sweep.sh — so a merged/closed worktree gets ONE liveness verdict, not
+# two that can disagree. Reads the tick's already-fetched $AGENTS_JSON (no round-trip), falling back to a
+# live query for the CLI/`herd sweep`/test callers, exactly like _retire_agent_listed.
+#
+# ONLY a positive "working" defers the reap. This is deliberately one-directional:
+#   • a merged/closed PR's builder is DONE by definition, so an idle/done agent (or a builder that went
+#     idle instead of exiting — the HERD-356 grounding) NEVER blocks the reap: the worktree is reaped and
+#     its idle pane retired with it (identity-guarded, via _reap_slug → herd_teardown_slug).
+#   • an ABSENT roster, an unreadable/blind list, or a headless driver all return 1 (not working), so the
+#     reap PROCEEDS on unknown — we never strand a merged worktree on a list we could not read; we only
+#     ever WAIT on a builder we can positively see is mid-work (a re-tasked builder still delivering).
+# Fail-soft: any parse/exec failure exits 1 (proceed). See decisions-parity note in live_runtime.py's reap.
+_reap_agent_working() {
+  local slug="$1" json="${AGENTS_JSON:-}"
+  [ -n "$json" ] || json="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
+  printf '%s' "$json" | SLUG="$slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+    ags = (json.load(sys.stdin).get("result") or {}).get("agents") or []
+except Exception:
+    raise SystemExit(1)
+for a in ags:
+    ident = a.get("name") or a.get("agent") or ""
+    if ident == slug:
+        raise SystemExit(0 if a.get("agent_status") == "working" else 1)
+raise SystemExit(1)
 ' 2>/dev/null
 }
 
@@ -496,13 +528,17 @@ EOF
 
 # retire_classify <slug> <dir> <branch> <has-open-pr> — the CLASSIFIER, the unit-testable heart of this
 # file. Echoes "<state> <pr> <sha> <detail> <branch>", \x1f-separated (NEVER tab: tab is IFS whitespace and
-# `read` would collapse the empty <pr>/<sha> the orphan path emits), with state in a closed set of three:
+# `read` would collapse the empty <pr>/<sha> the orphan path emits), with state in a closed set of four:
 #
 #   active   — nothing to retire: an open PR, an in-flight builder with no PR yet, no sha anchor, or a
 #              `gh` we could not reach. The default for everything unproven; no action, ever.
 #   retiring — PROVABLY terminal and PROVABLY disposable: the worktree is already gone, or its HEAD is
 #              the head of a MERGED PR (dirt-free or regenerable-only), or of a CLOSED PR that carries
 #              zero unique commits and no real dirt. Drive teardown.
+#   deferred — PROVABLY terminal and disposable, BUT a builder agent is still WORKING in the tree (HERD-356,
+#              _reap_agent_working). The reap is safe but would yank mid-flight work, so it WAITS, loudly,
+#              until the agent goes idle. Only ever reached with a live worktree + a positive "working"
+#              read; the very next idle tick re-classifies it 'retiring' and the teardown runs.
 #   held     — PROVABLY terminal but carrying REAL WORK: uncommitted tracked changes, or commits that
 #              exist nowhere else, or a base ref we cannot resolve to prove otherwise. NEVER touched;
 #              <detail> is the evidence a human needs, verbatim.
@@ -539,6 +575,12 @@ EOF
       if [ "$dirt" = "dirty" ]; then
         printf 'held\x1f%s\x1f%s\x1funcommitted work: %s (PR #%s merged; commit or discard)\x1f%s' \
           "$num" "$head" "$evidence" "$num" "$branch"
+      elif _reap_agent_working "$slug"; then
+        # HERD-356: the PR is merged and the tree is clean, so the reap is SAFE — but a builder that is
+        # still WORKING (re-tasked after the merge) would be yanked out from under mid-flight work. Defer
+        # the reap loudly until it goes idle; an idle/absent agent never reaches here (it reaps normally).
+        printf 'deferred\x1f%s\x1f%s\x1fPR #%s merged · builder still working — reap deferred until it goes idle\x1f%s' \
+          "$num" "$head" "$num" "$branch"
       else
         printf 'retiring\x1f%s\x1f%s\x1fPR #%s merged\x1f%s' "$num" "$head" "$num" "$branch"
       fi
@@ -553,6 +595,11 @@ EOF
           "$num" "$head" "$uniq" "$num" "$branch"
       elif [ "$dirt" = "dirty" ]; then
         printf 'held\x1f%s\x1f%s\x1funcommitted work: %s (PR #%s closed)\x1f%s' "$num" "$head" "$evidence" "$num" "$branch"
+      elif _reap_agent_working "$slug"; then
+        # HERD-356: same defer as the merged path — a CLOSED PR that carries nothing is reapable, but a
+        # builder still working in the tree is not yanked mid-flight; wait for idle, then reap.
+        printf 'deferred\x1f%s\x1f%s\x1fPR #%s closed · builder still working — reap deferred until it goes idle\x1f%s' \
+          "$num" "$head" "$num" "$branch"
       else
         printf 'retiring\x1f%s\x1f%s\x1fPR #%s closed\x1f%s' "$num" "$head" "$num" "$branch"
       fi
@@ -963,6 +1010,14 @@ EOF
   case "$state" in
     active)
       _retire_state_clear "$slug"
+      return 0 ;;
+    deferred)
+      # HERD-356: terminal + disposable, but a builder is still WORKING here. Do NOT tear down — record a
+      # loud row saying why and journal it ONCE. The worktree keeps the slug discoverable, so no escalation
+      # state is needed; the next idle tick classifies it 'retiring' and the reap proceeds. Not a stuck/red
+      # condition (nothing is wrong — we are deliberately waiting), so it never bumps the stuck counter.
+      _retire_note_once "$slug" defer "$detail"
+      _retire_record "$slug" deferred "$detail" "$dir"
       return 0 ;;
     held)
       # Persist the escalation state even though nothing is torn down. It is what keeps a HELD ORPHAN

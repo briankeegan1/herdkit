@@ -1263,6 +1263,18 @@ class LiveGates:
         env["HERD_REVIEW_RESULT_FILE"] = result
         env["HERD_REVIEW_REGISTRY_FILE"] = registry or ""
         env["HERD_REVIEW_SHA"] = cand.sha          # pin the reviewer's diff input to this dispatch sha
+        # HERD-353: resolve the reviewer model ONCE — from the effective config env herd-config.sh
+        # exports to this engine child (HERD_REVIEW_MODEL override wins, else MODEL_REVIEW — the SAME
+        # fallback chain herd-review.sh's REVIEW_MODEL uses) — and PIN it into the reviewer's env so the
+        # process runs on EXACTLY the model we journal. That single resolution point is the invariant:
+        # `review_dispatched.model` can never diverge from what the reviewer actually ran, and it never
+        # reads a second, drifting lookup. (The port regressed this — the field journaled empty because
+        # MODEL_REVIEW is an UNEXPORTED shell var the python child never saw; the reviewer, which sources
+        # config itself, still ran the right model, so only the journal was wrong. Pinning + the
+        # herd-config.sh export close both halves.)
+        model = env.get("HERD_REVIEW_MODEL") or env.get("MODEL_REVIEW") or ""
+        if model:
+            env["HERD_REVIEW_MODEL"] = model
         try:
             proc = subprocess.Popen(
                 ["bash", self._script("herd-review.sh"), cand.pr, cand.slug],
@@ -1276,10 +1288,10 @@ class LiveGates:
         # push can terminate its whole subtree, then retire its stamped pane (HERD-341 + HERD-348).
         _marker_write(inflight, proc.pid)
         # Contract §3.4 requires the full shape (pr, sha, pid, model, log_path, pin) — the same six
-        # keys bash emits (agent-watch.sh:2545) and the shadow twin emits (shadow_runtime.py:382), so
+        # keys bash emits (agent-watch.sh:2754) and the shadow twin emits (shadow_runtime.py:482), so
         # `herd why`/`herd log`/cost read `model`+`log_path` and a shadow↔live parity diff stays clean.
-        # `model` mirrors bash's env fallback chain; `log_path` is the reviewer's result file.
-        model = os.environ.get("HERD_REVIEW_MODEL") or os.environ.get("MODEL_REVIEW") or ""
+        # `model` is the SAME value pinned into the reviewer's env above (single source); `log_path` is
+        # the reviewer's result file.
         self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pid", proc.pid,
                             "model", model, "log_path", result, "pin", cand.sha)
 
@@ -1484,6 +1496,15 @@ class LiveActuator:
         return True
 
     def reap(self, cand):
+        # REAP-ON-MERGE only: this fires the instant THIS tick merged ``cand`` on green gates, so the
+        # builder is DONE by definition — there is no separate resident builder to defer for here, and no
+        # roster is fetched on this path. The HERD-356 liveness gate ("a still-WORKING builder defers the
+        # reap; an idle/merged builder's pane is retired with the worktree") lives in the ONE place that
+        # reaps a merge THIS seat did not perform: the bash sweep (``sweep.sh:sweep_leg_worktrees`` and
+        # ``retirement.sh:retire_classify``, both keying off the shared ``_reap_agent_working`` verdict).
+        # That is the multi-seat authority the contract requires — it reconciles observed PR state each
+        # sweep tick, so the gate holds regardless of which seat merged. Keeping it single-sourced there
+        # (rather than re-deriving a roster verdict on this already-post-gate path) is deliberate.
         if cand.worktree:
             try:
                 subprocess.run(["git", "worktree", "remove", "--force", cand.worktree],

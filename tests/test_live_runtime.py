@@ -303,34 +303,67 @@ class TestReviewDispatchShape(LiveCase):
     with the full contract §3.4 shape (pr, sha, pid, model, log_path, pin). Hermetic: a fresh temp
     state dir forces a dispatch and subprocess.Popen is stubbed, so no reviewer is ever launched."""
 
-    def test_review_dispatched_carries_contract_fields(self):
+    class _RecordingReviewSub:
+        """A subprocess stand-in that RECORDS the env handed to Popen — proves the reviewer is launched
+        with the SAME model the dispatch journals (HERD-353 single resolution point), never a divergent
+        second lookup, without ever launching a reviewer."""
+
+        DEVNULL = LR.subprocess.DEVNULL
+
         class _Proc:
             pid = 4242
 
-        class _FakeSub:
-            DEVNULL = LR.subprocess.DEVNULL
+        def __init__(self):
+            self.env = None
 
-            def Popen(self, *a, **k):
-                return _Proc()
+        def Popen(self, *a, **k):
+            self.env = k.get("env")
+            return self._Proc()
 
+    def _dispatch_once(self, env_overrides):
+        """Force ONE real _dispatch_review with a stubbed subprocess; return (verdict, journal, sub)."""
         state = LiveState(state_dir=self.tmp)          # real (empty) state dir -> no cached verdict/marker
         journal = LiveJournal(self.jpath)
         gates = LiveGates("/nonexistent-home", state, journal)
+        sub = self._RecordingReviewSub()
         orig = LR.subprocess
-        LR.subprocess = _FakeSub()
-        os.environ["MODEL_REVIEW"] = "opus-x"
+        LR.subprocess = sub
+        saved = {k: os.environ.get(k) for k in env_overrides}
+        os.environ.update(env_overrides)
         try:
             v = gates.review(LiveCandidate(7, "deadbeef", slug="feat-x"))
         finally:
             LR.subprocess = orig
-            os.environ.pop("MODEL_REVIEW", None)
+            for k, old in saved.items():
+                if old is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = old
+        return v, [o for o in events(self.jpath) if o["event"] == "review_dispatched"], sub
+
+    def test_review_dispatched_carries_contract_fields(self):
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "opus-x"})
         self.assertEqual(v, WAIT)                       # dispatched -> WAIT
-        rd = [o for o in events(self.jpath) if o["event"] == "review_dispatched"]
         self.assertEqual(len(rd), 1)
         for k in ("pr", "sha", "pid", "model", "log_path", "pin"):
             self.assertIn(k, rd[0])
         self.assertEqual(rd[0]["model"], "opus-x")      # bash env-fallback chain
         self.assertTrue(rd[0]["log_path"])              # the reviewer's result-file path, non-empty
+
+    def test_journaled_model_is_pinned_into_reviewer_env(self):
+        # SINGLE RESOLUTION POINT (HERD-353): the model journaled is the SAME value handed to the
+        # reviewer process — never empty when MODEL_REVIEW resolves, never a drifting second lookup.
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "claude-opus-4-8", "HERD_REVIEW_MODEL": ""})
+        self.assertEqual(rd[0]["model"], "claude-opus-4-8")
+        self.assertTrue(rd[0]["model"])                 # regression guard: NEVER empty when config resolves
+        self.assertEqual(sub.env.get("HERD_REVIEW_MODEL"), rd[0]["model"])  # reviewer runs EXACTLY this
+
+    def test_review_model_override_wins_and_is_journaled(self):
+        # An operator HERD_REVIEW_MODEL override wins the fallback chain and is what the reviewer runs.
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "claude-opus-4-8",
+                                          "HERD_REVIEW_MODEL": "claude-sonnet-4-6"})
+        self.assertEqual(rd[0]["model"], "claude-sonnet-4-6")
+        self.assertEqual(sub.env.get("HERD_REVIEW_MODEL"), "claude-sonnet-4-6")
 
 
 class _FakeCompleted:
