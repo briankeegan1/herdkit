@@ -122,7 +122,8 @@ FIXTURE_SLUGS="${HERD_JOURNAL_AUDIT_FIXTURE_SLUGS:-retiree conv stuck hd}"
 # ── replay: pure python scanner → one finding line per violation ─────────────
 # Each stdout line:  kind\tkey\tsummary
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
-#        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked
+#        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked |
+#        checkout_unclean
 # key is a stable dedup token; summary is a short human phrase for the inbox row.
 # shellcheck disable=SC2016
 FINDINGS="$(
@@ -390,6 +391,25 @@ for e in events:
         (" workspace=%s" % workspace) if workspace else "",
     )
     findings.append(("watcher_restart_blocked", key, summary))
+
+# ── (j) unclean shared checkout (HERD-361) ──────────────────────────────────
+# reconcile_checkout_cleanliness journals `checkout_unclean result=detected/violation` when the shared
+# coordinator checkout carries staged/tracked contamination (the fingerprint of a suite test that staged
+# in $PWD) or sits detached. It is a per-tick invariant already deduped by the watcher, so ANY occurrence
+# in the window is worth an inbox row — the operator needs to know evidence is sitting in $MAIN awaiting
+# a human (the watcher never auto-discards it).
+for e in events:
+    if e.get("event") != "checkout_unclean":
+        continue
+    if str(e.get("result") or "") not in ("violation", "detected"):
+        continue
+    head = str(e.get("head") or "")
+    paths = str(e.get("paths") or "")
+    detached = str(e.get("detached") or "no")
+    key = "checkout_unclean|sha=%s|files=%s" % (head, paths)
+    summary = "shared checkout UNCLEAN (evidence preserved) · head=%s detached=%s paths=%s" % (
+        (head[:8] if head else "?"), detached, (paths[:80] if paths else "?"))
+    findings.append(("checkout_unclean", key, summary))
 
 for kind, key, summary in findings:
     # TAB-separated; summary flattened (no tabs/newlines).

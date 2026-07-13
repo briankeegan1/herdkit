@@ -37,6 +37,16 @@ The test: *does this hold regardless of which seat performed the triggering even
   merge the seat performed, so panes belonging to work merged elsewhere were never retired. The
   invariant form: *no pane/worktree exists for a branch already merged into `$MAIN`* — evaluated
   against observed state each tick.
+- **HERD-361 — the shared checkout left staged/contaminated.** A pre-merge healthcheck's baseline leg
+  ran the full suite INSIDE the live shared checkout, and a suite test that staged in `$PWD` left
+  `$MAIN` with a whole PR's diff staged. `reconcile_main_freshness` did not catch it: it returns clean
+  the instant `$MAIN` is at origin (ahead=0 behind=0), *before* it inspects the tree, so a
+  staged-but-otherwise-fresh checkout slips past. The invariant form — `reconcile_checkout_cleanliness`
+  on every watcher tick — is: *`$MAIN` is attached to the default branch with no staged changes or
+  tracked modifications other than the derived docs a refresh commit absorbs* — probed from observed
+  git state each tick, surfaced as a loud row + `checkout_unclean` journal event naming the offending
+  paths, and NEVER auto-discarded (the staged diff is the evidence). The class was also closed at the
+  source: the baseline leg now always runs in a disposable worktree, never the live checkout.
 
 ## Rule 2 — One shared deterministic check, enforced identically at every surface
 

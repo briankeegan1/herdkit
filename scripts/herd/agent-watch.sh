@@ -929,6 +929,38 @@ build_main_freshness() {
   fi
 }
 
+# build_checkout_cleanliness — the HERD-361 shared-checkout cleanliness row, read from the state file
+# reconcile_checkout_cleanliness writes (absent on the happy path → renders NOTHING, console stays
+# byte-identical). A LOUD row when $MAIN carries staged/tracked contamination (the fingerprint of a
+# suite test that staged in $PWD) or sits detached: it names the count + the offending paths so an
+# operator can root-cause, and says the evidence is preserved (nothing was discarded).
+build_checkout_cleanliness() {
+  CHECKOUT_CLEAN=""
+  [ -s "${CHECKOUT_CLEAN_STATE:-}" ] || return 0
+  local _bc_i=0 _bc_head="" _bc_det="" _bc_line _bc_n=0 _bc_paths="" _bc_why=""
+  while IFS= read -r _bc_line; do
+    _bc_i=$((_bc_i + 1))
+    case "$_bc_i" in
+      1) continue ;;                     # line 1 = dedup signature (not for display)
+      2) _bc_head="$_bc_line"; continue ;;
+      3) _bc_det="$_bc_line"; continue ;;
+    esac
+    [ -n "$_bc_line" ] || continue
+    _bc_n=$((_bc_n + 1))
+    if [ "$_bc_n" -le 4 ]; then
+      if [ -z "$_bc_paths" ]; then _bc_paths="$_bc_line"; else _bc_paths="$_bc_paths, $_bc_line"; fi
+    fi
+  done < "$CHECKOUT_CLEAN_STATE"
+  [ "$_bc_det" = "detached" ] && _bc_why="DETACHED HEAD"
+  if [ "$_bc_n" -gt 0 ]; then
+    local _bc_more=""
+    [ "$_bc_n" -gt 4 ] && _bc_more=" (+$((_bc_n - 4)) more)"
+    local _bc_pathpart="${_bc_n} contaminated path(s): ${_bc_paths}${_bc_more}"
+    if [ -n "$_bc_why" ]; then _bc_why="${_bc_why} + ${_bc_pathpart}"; else _bc_why="$_bc_pathpart"; fi
+  fi
+  CHECKOUT_CLEAN="    ${C_RED}🚨 ${C_BOLD}CHECKOUT UNCLEAN${C_RESET}${C_RED} — ${_bc_why} · a tool wrote the shared checkout; investigate in ${MAIN} before discarding (evidence preserved, never auto-cleaned)${C_RESET}"$'\n'
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -1651,8 +1683,8 @@ render() {
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
   # MAIN-freshness (HERD-233) shares that section: a diverged/held checkout, and the restart note
   # after a pull carried new engine code. Both empty on the happy path.
-  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ]; then
-    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}"$'\n'
+  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ] || [ -n "${CHECKOUT_CLEAN:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}${CHECKOUT_CLEAN:-}"$'\n'
   fi
   # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
   # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
@@ -5246,6 +5278,7 @@ refresh_symbol_index() {
 MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALABLE: "<reason> <behind> <ahead>"
 MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
 MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
+CHECKOUT_CLEAN_STATE="$TREES/.agent-watch-checkout-clean" # HERD-361: the shared-checkout cleanliness violation signature (absent = clean); drives the row + dedups the journal
 
 # _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
 # MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
@@ -5686,6 +5719,83 @@ reconcile_main_freshness() {
       ahead "$_mf_ahead" behind "$_mf_behind"
     _main_fresh_clear
   fi
+  return 0
+}
+
+# ── Shared-checkout cleanliness invariant (HERD-361) ──────────────────────────────────────────────
+# Multi-seat doctrine Rule 1: the shared checkout ($MAIN) must be ATTACHED to the default branch with
+# NO staged changes and no tracked modifications other than the derived docs a refresh commit absorbs.
+# A violation is the fingerprint of a suite test (or any tool) that staged/stashed in $PWD while running
+# FROM the shared checkout — exactly the HERD-361 contamination (PR #466's whole diff found staged in
+# $MAIN, byte-identical to the builder's commit). reconcile_main_freshness returns clean the instant
+# $MAIN is at origin (ahead=0 behind=0) BEFORE it looks at the tree, so a staged-but-otherwise-fresh
+# checkout slips past it — this check closes that hole by keying off observed git state EVERY tick,
+# independent of any merge event, so it fires no matter which seat caused it.
+#
+# ADVISORY + EVIDENCE-PRESERVING: a loud console row (build_checkout_cleanliness) + one journal event
+# naming the offending paths. It NEVER discards (no git reset/checkout/clean) — the staged diff is the
+# evidence a human needs to root-cause. Deduped per (head + detached + path-set) so a standing violation
+# journals once; the console row paints every tick it stands. Fully fail-soft; never blocks a tick.
+
+# _checkout_offenders — emit, one repo-relative path per line, every $MAIN path that is STAGED (index
+# differs from HEAD) or tracked-MODIFIED in the worktree, EXCLUDING untracked scratch (?? — not a
+# tracked modification) and the regenerable derived files a refresh commit legitimately owns (the
+# render/config-local set via herd_strip_derived, plus docs/codemap.md + docs/symbol-index.md).
+_checkout_offenders() {
+  git -C "$MAIN" status --porcelain 2>/dev/null | while IFS= read -r _co_line; do
+    [ -n "$_co_line" ] || continue
+    local _co_xy="${_co_line:0:2}" _co_x="${_co_line:0:1}" _co_y="${_co_line:1:1}" _co_path="${_co_line:3}"
+    case "$_co_xy" in '??'*) continue ;; esac      # untracked — neither staged nor a tracked modification
+    # Staged iff the index column is not blank; tracked-worktree-modified iff the worktree column is not blank.
+    if [ "$_co_x" != ' ' ] || [ "$_co_y" != ' ' ]; then
+      case "$_co_path" in *' -> '*) _co_path="${_co_path##* -> }" ;; esac   # rename "orig -> new" → report new
+      printf '%s\n' "$_co_path"
+    fi
+  done | herd_strip_derived | grep -vxE 'docs/(codemap|symbol-index)\.md' || true
+}
+
+# reconcile_checkout_cleanliness — call once per watcher tick (after the freshness reconciles so it
+# reads the ff'd HEAD). Safe to call repeatedly; byte-inert on a clean checkout (no state file, no
+# journal, no row). A $MAIN parked on some OTHER named branch is a human's deliberate state → out of
+# scope. A DETACHED HEAD is itself a violation of "attached to the default branch" (reconcile_main_
+# freshness owns the reattach; here it is only recorded as part of the cleanliness signal — never
+# discarded). Records the violation signature to $CHECKOUT_CLEAN_STATE for the row and dedups the journal.
+reconcile_checkout_cleanliness() {
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  local _cc_sref _cc_head _cc_detached="" _cc_offenders _cc_key _cc_prev _cc_paths
+  _cc_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_cc_sref" ] && [ "$_cc_sref" != "${HERD_BRANCH_NAME:-main}" ]; then
+    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true        # parked on another branch → out of scope, clear
+    return 0
+  fi
+  [ -z "$_cc_sref" ] && _cc_detached="detached"
+  _cc_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_cc_head" ] || return 0
+  _cc_offenders="$(_checkout_offenders)"
+  # Clean AND attached → drop any standing row (byte-inert happy path).
+  if [ -z "$_cc_offenders" ] && [ -z "$_cc_detached" ]; then
+    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true
+    return 0
+  fi
+  # Dedup the journal per (head + detached + offender-set); the console row is re-derived each tick.
+  _cc_key="$_cc_head|${_cc_detached:-attached}|$(printf '%s' "$_cc_offenders" | tr '\n' ',')"
+  _cc_prev="$(sed -n '1p' "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true)"
+  mkdir -p "$TREES" 2>/dev/null || true
+  # State file: line 1 = dedup signature; line 2 = head; line 3 = detached flag; lines 4+ = offenders.
+  {
+    printf '%s\n' "$_cc_key"
+    printf '%s\n' "$_cc_head"
+    printf '%s\n' "${_cc_detached:-attached}"
+    [ -n "$_cc_offenders" ] && printf '%s\n' "$_cc_offenders"
+  } > "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true
+  [ "$_cc_prev" = "$_cc_key" ] && return 0                   # unchanged since last tick → paint, don't re-journal
+  _cc_paths="$(printf '%s' "$_cc_offenders" | tr '\n' ' ')"
+  journal_append checkout_unclean head "$_cc_head" \
+    detached "${_cc_detached:-no}" \
+    paths "${_cc_paths:-none}" \
+    result violation component audit
   return 0
 }
 
@@ -11987,6 +12097,7 @@ _tick_render_reconcile() {
   # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
   _main_fresh_recheck
   build_main_freshness
+  build_checkout_cleanliness   # HERD-361: the shared-checkout cleanliness row (empty unless contaminated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
 
@@ -12389,6 +12500,13 @@ EOF
   # config key), independent of CODEMAP_AUTOREFRESH, byte-inert when $MAIN is already current.
   reconcile_main_freshness
   reconcile_map_freshness
+
+  # Shared-checkout cleanliness invariant (HERD-361): the shared checkout must be attached to the default
+  # branch with no staged changes / tracked modifications other than derived docs awaiting a refresh
+  # commit. A violation (the fingerprint of a tool that staged/stashed in $PWD from $MAIN) is surfaced as
+  # a loud console row + one journal event naming the offending paths, and NEVER auto-discarded (evidence
+  # preservation). Keyed off observed git state each tick, so it holds no matter which seat caused it.
+  reconcile_checkout_cleanliness
 
   # Watcher SELF-RESTART (HERD-251): the reconcile above may have left a "new engine code" note. With
   # WATCHER_SELF_RESTART=on that note arms a QUIESCE (no new gate dispatch) and, once the in-flight
