@@ -19,6 +19,11 @@
 # WORKTREES_DIR/.herd/ (covered by *-trees/, but named explicitly for a .herd-inside-the-tree layout).
 .herd/ledger.jsonl
 
+# Config-viability report (HERD-355) — the machine-readable external-consistency snapshot the probes
+# write to WORKTREES_DIR/.herd/ (covered by *-trees/, but named explicitly for a .herd-inside-the-tree
+# layout). Regenerated live on every `herd doctor` / coupled-key `herd config set`; never committed.
+.herd/config-viability.json
+
 # Conformance run artifact (HERD-144) — `herd conformance run` writes this machine-local, regenerable
 # scorecard (capability→verdict→sha→timestamp). Never committed; the committed proof map is
 # templates/conformance.tsv, this is only the per-run verdict output.

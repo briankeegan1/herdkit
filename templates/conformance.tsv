@@ -166,6 +166,7 @@ agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
 approvals.sh	unit	tests/test-journal-audit.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
+config-viability.sh	unit	tests/test-config-viability.sh
 resolver-pane.sh	unit	tests/test-resolver-pane-lever.sh
 resolver-pane.sh	sim	tests/test-sandbox-resolver-respawn.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh

@@ -614,6 +614,15 @@ herd_doctor() {
     herd_engine_doctor_row
   fi
 
+  # ── Config viability (HERD-355): external-consistency probes for externally-coupled config keys
+  #    (repo merge flags, branch protection, driver-qualified runtime bindings). Rendered ONLY when
+  #    config-viability.sh is loaded (i.e. via `herd doctor`, which sources it through bin/herd) — a
+  #    bare-sourced herd_doctor (tests, install.sh) skips it. ADVISORY: it probes live external state
+  #    and reports each ✓/⚠/✗, but never touches hard_fail/warn or the doctor's exit contract. ──────
+  if command -v herd_config_viability_doctor_section >/dev/null 2>&1; then
+    herd_config_viability_doctor_section || true
+  fi
+
   printf '\n'
   if [ "$cfg_dup" -ne 0 ]; then
     printf 'doctor: \xe2\x9a\xa0 .herd/config has duplicate key(s) (see Config above) \xe2\x80\x94 run `herd config lint`; shell last-wins can silently disable a gate (issue #115).\n'
