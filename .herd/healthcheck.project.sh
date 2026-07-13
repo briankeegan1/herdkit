@@ -356,11 +356,28 @@ dh_note="daemon-hermeticity: clean"
 # the journal.sh fail-safe still redirects if a child unsets it). Complements the engine guard in
 # scripts/herd/journal.sh; kept in lockstep with tests/test-journal-hermeticity.sh. INERT if a tmp
 # dir can't be made (the journal.sh guard still fires on HERMETIC_TEST / HERD_HERMETIC_GUARD alone).
+#
+# HERD-363 PER-SUITE-RUN PIN: suffix the pinned path with THIS suite process's pid ($$) so two suite
+# instances running CONCURRENTLY in the same environment always write to DISJOINT journals. Since the
+# HERD-361 baseline-aware gate spawns a SECOND full suite (the sandboxed base run) that inherits this
+# process's environment, a journal-grepping test (e.g. the sandbox-concurrency fairness leg) could
+# otherwise count the other run's fair-shaped events (observed as exact multiples of one OFF-leg's 6).
+# A line-count mark fences HISTORY but never a concurrent writer — only a disjoint path does. mktemp -d
+# is already per-invocation unique; the $$ suffix makes the per-run keying explicit AND keeps the
+# mktemp-unavailable fallback below per-PROCESS instead of one shared file. Keyed per-PROCESS, never
+# per-seat (multi-seat safe). Byte-identical for a single suite run apart from the path suffix.
 _hk_jh_dir="$(mktemp -d 2>/dev/null || echo '')"
 _hk_jh_file=""
+if [ -z "$_hk_jh_dir" ]; then
+  # mktemp unavailable: still pin a per-PROCESS dir (never a single shared path) so concurrent suites
+  # stay disjoint. Fail-soft: if even this can't be created the inline JOURNAL_FILE stays empty and
+  # journal.sh's $$-keyed test-context redirect takes over.
+  _hk_jh_dir="${TMPDIR:-/tmp}/herd-jherm-$$"
+  mkdir -p "$_hk_jh_dir" 2>/dev/null || _hk_jh_dir=""
+fi
 if [ -n "$_hk_jh_dir" ]; then
-  _hk_jh_file="$_hk_jh_dir/journal.jsonl"
-  : > "$_hk_jh_file"
+  _hk_jh_file="$_hk_jh_dir/journal.$$.jsonl"
+  : > "$_hk_jh_file" 2>/dev/null || _hk_jh_file=""
 fi
 
 _hk_dh_verdict() {
