@@ -32,6 +32,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
                                WAIT, PENDING,
                                branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
@@ -365,6 +366,64 @@ class TestReviewDispatchShape(LiveCase):
                                           "HERD_REVIEW_MODEL": "claude-sonnet-4-6"})
         self.assertEqual(rd[0]["model"], "claude-sonnet-4-6")
         self.assertEqual(sub.env.get("HERD_REVIEW_MODEL"), "claude-sonnet-4-6")
+
+
+class TestHealthDispatchFreshness(LiveCase):
+    """HERD-349: the REAL _dispatch_health path (bypassed by the stubs above) must (a) DELETE any
+    pre-existing out-file before spawning the worker and (b) stamp a nonce into BOTH the in-flight
+    marker and the worker's argv — the two ends the collector matches. Hermetic: subprocess.Popen is
+    stubbed, so no worker is ever launched."""
+
+    class _RecordingHealthSub:
+        """A subprocess stand-in that RECORDS the argv handed to Popen — proves the worker receives the
+        dispatch nonce as its final script arg, without ever launching a suite."""
+
+        DEVNULL = LR.subprocess.DEVNULL
+
+        class _Proc:
+            pid = 5151
+
+        def __init__(self):
+            self.argv = None
+
+        def Popen(self, argv, *a, **k):
+            self.argv = list(argv)
+            return self._Proc()
+
+    def test_predispatch_deletes_stale_out_and_stamps_matching_nonce(self):
+        state = LiveState(state_dir=self.tmp)
+        gates = LiveGates("/nonexistent-home", state, LiveJournal(self.jpath))
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x", worktree=self.tmp)
+        disp, inflight = state.health_dispatch_file(cand), state.health_inflight_file(cand)
+        with open(disp, "w") as fh:                       # a leftover out-file a prior run left in the slot
+            fh.write("old.1\tCLEAN\tclean\n")
+        sub = self._RecordingHealthSub()
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates._dispatch_health(cand)
+        finally:
+            LR.subprocess = orig
+        # (a) the pre-existing out-file is deleted BEFORE the worker is spawned — the slot is owned.
+        self.assertFalse(os.path.exists(disp))
+        # (b) the worker argv carries the nonce as its final arg, and it equals the marker's nonce line —
+        #     the exact pair the collector compares to prove a result belongs to this dispatch.
+        self.assertIsNotNone(sub.argv)
+        worker_nonce = sub.argv[-1]
+        self.assertTrue(worker_nonce)
+        self.assertEqual(_marker_nonce(inflight), worker_nonce)
+
+    def test_nonce_written_only_for_health_marker_review_byte_identical(self):
+        # A review marker (no nonce) stays 4 lines; a health marker adds the 5th nonce line. Guards the
+        # byte-identical-when-absent contract for the shared _marker_write.
+        review_m = os.path.join(self.tmp, ".review-inflight-x")
+        health_m = os.path.join(self.tmp, ".health-inflight-x")
+        _marker_write(review_m, os.getpid())
+        _marker_write(health_m, os.getpid(), nonce=_dispatch_nonce())
+        self.assertEqual(len(open(review_m).read().splitlines()), 4)
+        self.assertEqual(_marker_nonce(review_m), "")     # legacy 4-line marker → no nonce
+        self.assertEqual(len(open(health_m).read().splitlines()), 5)
+        self.assertTrue(_marker_nonce(health_m))
 
 
 class _FakeCompleted:
@@ -758,12 +817,51 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
 
     def test_health_collect_writes_sha_cache(self):
         c = self.cand()
+        # HERD-349: a result is collected ONLY when its first-field nonce matches the LIVE dispatch
+        # marker. Plant the matched pair (marker nonce == out-file first field) a real dispatch would lay.
+        _marker_write(self.state.health_inflight_file(c), os.getpid(), nonce="n-live")
         with open(self.state.health_dispatch_file(c), "w") as fh:
-            fh.write("CODEERROR\tnot ok 3 - foo.bats\n")
+            fh.write("n-live\tCODEERROR\tnot ok 3 - foo.bats\n")
         g, _, dh = self._gates()
         self.assertEqual(g.health(c), "CODEERROR")
         self.assertEqual(self.state.health_cached_verdict(c), "CODEERROR")
         self.assertFalse(os.path.exists(self.state.health_dispatch_file(c)))
+        self.assertFalse(os.path.exists(self.state.health_inflight_file(c)))  # marker cleared on collect
+
+    def test_health_stale_out_file_ignored_and_redispatched(self):
+        """HERD-349: an out-file that predates the live dispatch (no live marker, so no matching nonce)
+        is NEVER consumed — it is dropped, `stale_result_ignored` is journaled, and a fresh suite is
+        re-dispatched so a real run actually happens (the 2026-07-11 PR450/451 same-tick stale-consume)."""
+        c = self.cand()
+        # A leftover verdict from a prior/garbage run, with NO live in-flight marker keying it.
+        with open(self.state.health_dispatch_file(c), "w") as fh:
+            fh.write("old.999\tCLEAN\tclean\n")
+        g, _, dh = self._gates()
+        self.assertEqual(g.health(c), WAIT)                        # holds; never the stale CLEAN
+        self.assertIsNone(self.state.health_cached_verdict(c))     # stale result is never cached
+        self.assertEqual(dh, ["1"])                                # a real suite IS re-dispatched
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file(c)))  # stale file removed
+        evs = events(os.path.join(self.tmp, "j.jsonl"))
+        stale = [e for e in evs if e["event"] == "stale_result_ignored"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["rail"], "health")
+        self.assertEqual(str(stale[0]["pr"]), "1")
+
+    def test_health_nonce_mismatch_ignored_under_live_marker(self):
+        """A stale out-file whose nonce does NOT match a LIVE dispatch marker is ignored, and the tick
+        WAITS on the live worker instead of consuming the mismatched result (never a second suite)."""
+        c = self.cand()
+        _marker_write(self.state.health_inflight_file(c), os.getpid(), nonce="fresh-nonce")
+        with open(self.state.health_dispatch_file(c), "w") as fh:
+            fh.write("stale-nonce\tCODEERROR\tnot ok 9 - boom\n")   # predates the live dispatch
+        g, _, dh = self._gates()
+        self.assertEqual(g.health(c), WAIT)                        # waits on the live worker
+        self.assertIsNone(self.state.health_cached_verdict(c))     # mismatched result never cached
+        self.assertEqual(dh, [])                                   # marker live → no re-dispatch
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file(c)))  # mismatched file removed
+        self.assertTrue(os.path.exists(self.state.health_inflight_file(c)))   # live marker preserved
+        evs = events(os.path.join(self.tmp, "j.jsonl"))
+        self.assertEqual(len([e for e in evs if e["event"] == "stale_result_ignored"]), 1)
 
     def test_health_missing_dispatches_and_waits_once(self):
         c = self.cand()
