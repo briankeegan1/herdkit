@@ -14,8 +14,12 @@
 #       (pr,sha). Under the TTL, not blessed, or AGING_PR_TTL=0 → byte-identical (no row, no event).
 #   (b) BRANCH-CI MAIN-RED — _main_health_ci_leg fires the EXISTING MAIN RED row when the latest CI run
 #       for the current main HEAD is FAILING, deduped once per (sha,conclusion); a SUCCESS run is inert.
-#   (c) JOURNAL-AUDIT — a `blessing` (gates passed) with no later `merge` past the TTL surfaces a
+#   (c) JOURNAL-AUDIT — a gates-passed marker with no later `merge` past the TTL surfaces a
 #       `gates_passed_no_merge` finding; a later merge clears it; AGING_PR_TTL=0 disables the leg.
+#       BOTH real markers are proven: `gate_status` state=success context=herd/gates (the shape
+#       journal_append gets from bash post_gate_status / the python actuator on the successful
+#       herd/gates=success API write) and `blessing` state=success (the python engine core's
+#       once-per-(pr,sha) BLESSED marker, live_runtime.py).
 #
 # Run:  bash tests/test-aging-pr-alarm.sh
 # No `set -e`: several predicates deliberately return non-zero; every assertion is explicit.
@@ -242,7 +246,7 @@ _main_health_ci_leg
 unset GH_RUNS
 ok "(b) a green CI run sets no red, and MAIN_HEALTH_TICK=off is byte-inert on the branch-CI leg"
 
-# ── (c) JOURNAL-AUDIT: gates_passed_no_merge from a blessing with no later merge past the TTL ─────────
+# ── (c) JOURNAL-AUDIT: gates_passed_no_merge from a gates-passed marker with no later merge past TTL ──
 run_audit() {  # run_audit <journal-file> ; echoes the audit's journal_audit events on the SAME file
   JOURNAL_AUDIT=on JOURNAL_FILE="$1" WORKTREES_DIR="$T" \
     HERD_JOURNAL_AUDIT_NOW="${AUDIT_NOW:-2026-07-13T12:00:00Z}" \
@@ -253,40 +257,64 @@ run_audit() {  # run_audit <journal-file> ; echoes the audit's journal_audit eve
 }
 jf_finding() { local n; n="$(grep -c '"kind":"gates_passed_no_merge"' "$1" 2>/dev/null)" || n=0; printf '%s' "${n:-0}"; }
 
-# A blessing 2h old with NO later merge → a gates_passed_no_merge finding (TTL default 3600 = 1h).
+# Fixture lines below are REAL journal shapes, byte-shaped like the writers produce them:
+#   gate_status — journal_append gate_status pr <pr> sha <sha> state success context herd/gates
+#                 (bash post_gate_status; the python actuator emits the identical shape). Note pr is
+#                 a JSON NUMBER: journal_append int-coerces digit-only values (journal.sh).
+#   blessing    — the python engine core's BLESSED marker (live_runtime.py: journal.append("blessing",
+#                 "pr", …, "sha", …, "context", "herd/gates", "state", "success")).
+# NO code journals any other gates-passed event — the audit must key on these, or the finding is dead.
+
+# A gate_status success 2h old with NO later merge → a gates_passed_no_merge finding (TTL 3600 = 1h).
 JA="$T/ja1.jsonl"
 {
-  printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"blessing","pr":"440","sha":"beef1234","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"gate_status","pr":440,"sha":"beef1234","state":"success","context":"herd/gates"}'
 } > "$JA"
 AGING_PR_TTL=3600 run_audit "$JA"
-[ "$(jf_finding "$JA")" -ge 1 ] || fail "(c) a blessing older than the TTL with no merge must surface gates_passed_no_merge"
-ok "(c) a gates-passed PR unmerged past the TTL surfaces a gates_passed_no_merge finding"
+[ "$(jf_finding "$JA")" -ge 1 ] || fail "(c) a gate_status success older than the TTL with no merge must surface gates_passed_no_merge"
+ok "(c) a gates-passed PR (real gate_status shape) unmerged past the TTL surfaces a gates_passed_no_merge finding"
 
-# The SAME blessing but WITH a later merge for the pr → cleared, no finding.
+# The SAME marker but WITH a later merge for the pr → cleared, no finding.
 JA2="$T/ja2.jsonl"
 {
-  printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"blessing","pr":"441","sha":"cafe0001","context":"herd/gates","state":"success"}'
-  printf '%s\n' '{"ts":"2026-07-13T10:05:00Z","event":"merge","pr":"441","slug":"feat","sha":"cafe0001","reason":"gates_passed"}'
+  printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"gate_status","pr":441,"sha":"cafe0001","state":"success","context":"herd/gates"}'
+  printf '%s\n' '{"ts":"2026-07-13T10:05:00Z","event":"merge","pr":441,"slug":"feat","sha":"cafe0001","reason":"gates_passed"}'
 } > "$JA2"
 AGING_PR_TTL=3600 run_audit "$JA2"
-[ "$(jf_finding "$JA2")" -eq 0 ] || fail "(c) a blessing cleared by a later merge must NOT be flagged"
+[ "$(jf_finding "$JA2")" -eq 0 ] || fail "(c) a gates-passed marker cleared by a later merge must NOT be flagged"
 ok "(c) a later merge for the pr clears the finding"
 
-# A blessing still WITHIN the TTL → no finding.
+# A gates-passed marker still WITHIN the TTL → no finding.
 JA3="$T/ja3.jsonl"
 {
-  printf '%s\n' '{"ts":"2026-07-13T11:30:00Z","event":"blessing","pr":"442","sha":"fresh001","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-07-13T11:30:00Z","event":"gate_status","pr":442,"sha":"fresh001","state":"success","context":"herd/gates"}'
 } > "$JA3"
 AGING_PR_TTL=3600 run_audit "$JA3"
-[ "$(jf_finding "$JA3")" -eq 0 ] || fail "(c) a blessing within the TTL must NOT be flagged"
-ok "(c) a blessing still within the TTL is not flagged"
+[ "$(jf_finding "$JA3")" -eq 0 ] || fail "(c) a gates-passed marker within the TTL must NOT be flagged"
+ok "(c) a gates-passed marker still within the TTL is not flagged"
 
 # AGING_PR_TTL=0 disables leg (c) entirely (fresh journal — the first run mutated $JA in place).
 JA4="$T/ja4.jsonl"
-printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"blessing","pr":"443","sha":"beef4444","context":"herd/gates","state":"success"}' > "$JA4"
+printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"gate_status","pr":443,"sha":"beef4444","state":"success","context":"herd/gates"}' > "$JA4"
 AGING_PR_TTL=0 run_audit "$JA4"
 [ "$(jf_finding "$JA4")" -eq 0 ] || fail "(c) AGING_PR_TTL=0 must disable the gates_passed_no_merge finding"
 AGING_PR_TTL=3600
 ok "(c) AGING_PR_TTL=0 disables the journal-audit leg"
+
+# The python engine core's `blessing` marker (the OTHER real writer) fires the finding too.
+JA5="$T/ja5.jsonl"
+printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"blessing","pr":444,"sha":"feed0005","context":"herd/gates","state":"success"}' > "$JA5"
+AGING_PR_TTL=3600 run_audit "$JA5"
+[ "$(jf_finding "$JA5")" -ge 1 ] || fail "(c) the python engine's blessing marker past the TTL must surface gates_passed_no_merge"
+ok "(c) the python engine core's blessing marker is accepted too"
+
+# A non-gates commit-status context must NOT count as gates-passed (and a non-success state never did).
+JA6="$T/ja6.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-07-13T10:00:00Z","event":"gate_status","pr":445,"sha":"aaaa0006","state":"success","context":"some/other"}'
+} > "$JA6"
+AGING_PR_TTL=3600 run_audit "$JA6"
+[ "$(jf_finding "$JA6")" -eq 0 ] || fail "(c) a gate_status with a non-herd/gates context must NOT be treated as gates-passed"
+ok "(c) a foreign-context gate_status is excluded"
 
 printf '\nAll %d aging-PR alarm assertions passed.\n' "$pass"

@@ -335,16 +335,24 @@ for r in reds:
         findings.append(("red_state_stale", key, summary))
 
 # ── (k) gates passed but no merge older than TTL (HERD-334) ──────────────────
-# A `blessing` (event=blessing, state=success) is the engine's single unambiguous "all gates passed /
-# herd/gates=success" marker, emitted the instant a PR reaches BLESSED and BEFORE the hold/merge
-# decision. When branch protection then keeps blocking the merge on a required CI check, the PR sits
+# A `gate_status` (state=success, context=herd/gates) event is the engine's marker for "all gates
+# passed / herd/gates=success" — journaled by bash post_gate_status and the python actuator on the
+# successful commit-status API write. The python engine core additionally journals event=blessing,
+# state=success, context=herd/gates — once per pr+sha the instant a PR reaches BLESSED, BEFORE the
+# hold/merge decision and regardless of GATE_STATUS. Both markers are accepted below — no other
+# event marks gates-passed. The context guard tolerates an absent field but excludes any future
+# non-gates status context; herd/gates mirrors GATE_STATUS_CONTEXT, a deliberate constant in
+# agent-watch.sh that is not a config key, so naming it here cannot drift.
+# When branch protection then keeps blocking the merge on a required CI check, the PR sits
 # engine-approved-but-unmerged with nothing progressing — the exact silent state PRs #440/#441 sat in
 # for 7h. A later `merge` for the same pr clears it (any sha — a merge merges the PR). Past AGING_PR_TTL
 # with no such merge → a gates_passed_no_merge finding. Shares the render pass's AGING_PR_TTL threshold
 # (aging-pr.sh); 0 disables this leg. Advisory only — the auditor never merges or clears anything.
 if aging_pr_ttl > 0:
     blessings = [e for e in events
-                 if e.get("event") == "blessing" and str(e.get("state") or "") == "success"]
+                 if e.get("event") in ("gate_status", "blessing")
+                 and str(e.get("state") or "") == "success"
+                 and str(e.get("context") or "herd/gates") == "herd/gates"]
     for b in blessings:
         if age_secs(now, b["_ts"]) < aging_pr_ttl:
             continue
