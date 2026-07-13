@@ -352,17 +352,43 @@ def _pid_session(pid):
         return ""
 
 
-def _marker_write(path, pid):
+def _dispatch_nonce():
+    """A per-dispatch nonce — dispatch epoch + dispatcher pid — stamped into the in-flight marker and
+    echoed back by the worker into its out-file's first field (HERD-349). It keys a result to the EXACT
+    dispatch that produced it regardless of which seat/process wrote the file, so the collector never
+    consumes a verdict that predates the live dispatch (it never trusts mtime). A ``.``-joined pair keeps
+    it a single whitespace-free token that survives the marker's line-oriented format verbatim."""
+    return "%s.%s" % (_now_epoch(), os.getpid())
+
+
+def _marker_write(path, pid, nonce=""):
     """Lay down a restart-safe in-flight marker: pid, its start-time, dispatch ts, SESSION id
-    (agent-watch.sh:2012 + the HERD-348 session line). The 4th line lets the sweep exempt — and a
-    supersession cancel — the worker's whole detached subtree by session; older 3-line markers (the bash
-    writer, a marker predating this line) still work, the reader falls back to the recorded pid's own
-    session. Best-effort — an unwritable path drops the marker, never raises into the tick."""
+    (agent-watch.sh:2012 + the HERD-348 session line), plus an OPTIONAL 5th line — the dispatch nonce
+    (HERD-349). The 4th line lets the sweep exempt — and a supersession cancel — the worker's whole
+    detached subtree by session; older 3-line markers (the bash writer, a marker predating this line)
+    still work, the reader falls back to the recorded pid's own session. The 5th line is written ONLY
+    when a nonce is supplied, so a marker with no nonce (review, bash) stays byte-identical to before.
+    Best-effort — an unwritable path drops the marker, never raises into the tick."""
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("%s\n%s\n%s\n%s\n" % (pid, _pid_starttime(pid), _now_epoch(), _pid_session(pid)))
+            if nonce:
+                fh.write("%s\n" % nonce)
     except Exception:
         pass
+
+
+def _marker_nonce(path):
+    """The dispatch nonce recorded on line 5 of an in-flight marker (HERD-349), or ``""`` when the
+    marker is missing, unreadable, or predates the nonce line (a legacy ≤4-line marker). Fail-soft: any
+    fault reads as no-nonce, so the collector treats a result it cannot key to a live dispatch as stale."""
+    if not path:
+        return ""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    return lines[4].strip() if len(lines) > 4 else ""
 
 
 def _term_sleep():
@@ -837,14 +863,18 @@ class LiveState:
 # (pr, sha). Runs healthcheck.sh BASELINE-AWARE (HERD-190: $MAIN as the base tree, $TREES as the sha-keyed
 # base cache) streaming to a tailable log, keeps the SAME retry-before-red (a rc-1 code error is re-run
 # ONCE, solo — a transient self-heals to FLAKY, only a reproducing failure reds), and writes its TERMINAL
-# verdict atomically (temp+mv) as one ``<verdict>\t<detail>`` line the collector consumes:
-#   CLEAN\t{clean|dataenv}  — passed (clean, or a tolerated data/env ⚠️ first line, healthcheck.sh exit 0)
-#   FLAKY\t<detail>         — first run code-errored but the solo retry PASSED
-#   CODEERROR\t<detail>     — code error reproduced on the retry; drives the red row
-# Args: $1 healthcheck.sh  $2 worktree  $3 dispatch-out  $4 log  $5 MAIN(base)  $6 TREES(base cache).
+# verdict atomically (temp+mv) as one ``<nonce>\t<verdict>\t<detail>`` line the collector consumes:
+#   <nonce>\tCLEAN\t{clean|dataenv} — passed (clean, or a tolerated data/env ⚠️ first line, exit 0)
+#   <nonce>\tFLAKY\t<detail>        — first run code-errored but the solo retry PASSED
+#   <nonce>\tCODEERROR\t<detail>    — code error reproduced on the retry; drives the red row
+# The FIRST field is the dispatch nonce ($7) the dispatcher stamped into the in-flight marker (HERD-349):
+# the collector consumes this out-file ONLY when the nonce matches the LIVE marker, so a result that
+# predates the dispatch (a leftover from a prior/garbage run) is never trusted regardless of its mtime.
+# Args: $1 healthcheck.sh  $2 worktree  $3 dispatch-out  $4 log  $5 MAIN(base)  $6 TREES(base cache)
+#       $7 dispatch-nonce (epoch.pid — echoed verbatim as the out-file's first field).
 _HEALTH_WORKER_SH = r'''
 set -u
-hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"
+hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"
 _run() { HERD_BASELINE_DIR="$base" HERD_BASELINE_CACHE="$cache" bash "$hc" "$dir" > "$1" 2>&1; }
 _run "$log"; rc=$?
 first="$(sed -n '1p' "$log" 2>/dev/null)"
@@ -862,7 +892,7 @@ else
     d="$(printf '%s' "$d" | tr '\t\n' '  ')"; line="CODEERROR"$'\t'"${d:0:200}"
   fi
 fi
-printf '%s\n' "$line" > "$out.tmp.$$" 2>/dev/null && mv "$out.tmp.$$" "$out" 2>/dev/null || true
+printf '%s\t%s\n' "$nonce" "$line" > "$out.tmp.$$" 2>/dev/null && mv "$out.tmp.$$" "$out" 2>/dev/null || true
 '''
 
 
@@ -1182,23 +1212,39 @@ class LiveGates:
         # 2. COLLECT a finished worker's terminal verdict into the sha-cache (at-least-once: record the
         #    durable cache, THEN drop the scratch — a crash mid-collect re-reads the dispatch file next tick).
         disp = st.health_dispatch_file(cand)
+        inflight = st.health_inflight_file(cand)
         if disp and os.path.exists(disp):
             try:
                 with open(disp, encoding="utf-8") as fh:
                     first = fh.readline().rstrip("\n")
             except Exception:
                 first = ""
-            verdict, _, detail = first.partition("\t")
-            if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
-                st.record_health_result(cand, verdict, detail)
-                st.rm(disp, st.health_inflight_file(cand))
-                return verdict
-            # Unparseable / truncated worker output → an infra death, NOT a verdict; never cache. Drop
-            # it and re-dispatch on the next tick (bounded implicitly once the suite finally succeeds).
-            st.rm(disp)
-            return WAIT
+            # 2a. FRESHNESS GUARD (HERD-349): the worker echoes its dispatch nonce as the out-file's FIRST
+            #     field. A result is trustworthy ONLY when that nonce matches the LIVE in-flight marker's
+            #     nonce; a missing/mismatched nonce means the file predates this dispatch (a leftover from a
+            #     prior or garbage run — the 2026-07-11 PR450/451 same-tick stale-consume). Fail-soft: drop
+            #     it, journal `stale_result_ignored`, and FALL THROUGH so a real suite is re-dispatched — a
+            #     stale out-file is NEVER consumed as a verdict, never trusts mtime, and never crashes the tick.
+            nonce, _, rest = first.partition("\t")
+            expected = _marker_nonce(inflight)
+            if not expected or nonce != expected:
+                self.journal.append("stale_result_ignored", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "rail", "health", "nonce", nonce or "",
+                                    "expected", expected or "")
+                st.rm(disp)
+                # no return: a live worker (if any) still owns the marker and will write a fresh,
+                # nonce-matched result; otherwise the dispatch legs below start one.
+            else:
+                verdict, _, detail = rest.partition("\t")
+                if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                    st.record_health_result(cand, verdict, detail)
+                    st.rm(disp, inflight)
+                    return verdict
+                # Nonce matched but the payload is unparseable / truncated → an infra death, NOT a verdict;
+                # never cache. Drop it and re-dispatch next tick (bounded once the suite finally succeeds).
+                st.rm(disp)
+                return WAIT
         # 3. IN FLIGHT: a live worker on this exact (pr, sha) → wait, never a second overlapping suite.
-        inflight = st.health_inflight_file(cand)
         if inflight and _marker_live(inflight):
             return WAIT
         # 3.5 HARD pre-dispatch worktree validation (task HERD-346, leg 2): NEVER shell the suite at a
@@ -1240,11 +1286,19 @@ class LiveGates:
         log = st.health_log_file(cand)
         if not disp:
             return
+        # (a) A dispatch OWNS its result slot (HERD-349): DELETE any pre-existing out-file BEFORE spawning,
+        #     so a leftover from a prior/garbage run can never be mistaken for this worker's result — the
+        #     collect leg runs before dispatch, so a stale file left in place would be consumed same-tick.
+        st.rm(disp)
+        # (b) Belt-and-braces: a per-dispatch nonce keys the result to THIS dispatch. It is stamped into the
+        #     in-flight marker AND handed to the worker, which echoes it as the out-file's first field; the
+        #     collector ignores any out-file whose nonce does not match the live marker (never trusts mtime).
+        nonce = _dispatch_nonce()
         base = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", _HEALTH_WORKER_SH, "_",
-                 self._script("healthcheck.sh"), cand.worktree, disp, log, base, st.dir or ""],
+                 self._script("healthcheck.sh"), cand.worktree, disp, log, base, st.dir or "", nonce],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
             )
         except Exception as exc:
@@ -1253,7 +1307,8 @@ class LiveGates:
             return
         # The marker records the worker's SESSION (HERD-348): start_new_session makes it a session
         # leader, so a supersession (and the sweep) reaps its whole detached suite subtree by session.
-        _marker_write(inflight, proc.pid)
+        # It also carries the dispatch nonce (line 5) the collector matches the out-file's first field against.
+        _marker_write(inflight, proc.pid, nonce=nonce)
         self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "pid", proc.pid, "log_path", log or "")
 
