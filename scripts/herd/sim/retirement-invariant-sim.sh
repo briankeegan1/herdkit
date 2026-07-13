@@ -90,7 +90,10 @@ json.dump(d, open(p, "w"))
   "agent list")     python3 -c '
 import json, os
 d = json.load(open(os.environ["HERDR_TABS"]))
-ags = [{"name": t["label"], "agent_status": "idle"}
+# Every builder agent lives in its tab. Its status is idle unless SIM_AGENT_STATUS overrides it — the
+# HERD-356 scenario plants a still-WORKING builder to prove a merged worktree DEFERS rather than reaps.
+st = os.environ.get("SIM_AGENT_STATUS", "idle") or "idle"
+ags = [{"name": t["label"], "agent_status": st}
        for t in d["result"]["tabs"] if "·" not in t["label"]]
 print(json.dumps({"result": {"agents": ags}}))
 ' ;;
@@ -156,6 +159,7 @@ tick() {
   WATCH_SH="$WATCH" SIM_MAIN="$scn/main" SIM_TREES="$scn/trees" SIM_SLUG="$slug" \
   GH_DIR="$scn/gh" HERDR_TABS="$scn/tabs.json" HERD_CONFIG_FILE="$scn/no-config" \
   CRASH_AFTER="$crash" HERD_RETIRE_STUCK_TICKS=3 HERD_DISPOSABLE_WORKSPACE=1 \
+  SIM_AGENT_STATUS="${SIM_AGENT_STATUS:-idle}" \
     bash "$ART/tick.sh" 2>/dev/null
 }
 
@@ -394,6 +398,46 @@ elif [ "$state" = "retiring" ] || [ "$state" = "stuck" ]; then
   ok "classified as '${state}' (teardown in progress, not needs-you)"
 else
   bad "unexpected outcome: state='${state:-<none>}' left='${left:-}' res='${res:-}'"
+fi
+
+# ── PART 4: HERD-356 — a merged worktree DEFERS its reap while a builder is still WORKING ─────────
+# The retirement/reap legs used to treat ANY resident agent pane as builder-liveness, so a merged PR
+# whose builder went idle instead of exiting survived every sweep. The fix splits idle from working:
+#   • an IDLE agent's merged worktree REAPS (PART 1 already proves this — its stub agents are idle);
+#   • a still-WORKING builder's merged worktree DEFERS, loudly, until it goes idle — then it reaps.
+step defer "a merged worktree with a WORKING builder defers the reap; goes idle → reaps"
+SLUG_DEF=retiree-working
+scn="$ART/scn-defer"; rm -rf "$scn"; mkdir -p "$scn"
+fixture "$scn" "$SLUG_DEF" merged
+
+# Tick 1 — the builder is WORKING. The reap MUST be deferred: the worktree, tab, and agent all survive.
+rep="$(SIM_AGENT_STATUS=working tick "$scn" "$SLUG_DEF" none)"
+state="$(printf '%s' "$rep" | sed -n "s/^STATE $SLUG_DEF //p" | cut -d' ' -f1)"
+[ "$state" = deferred ] && ok "the row is DEFERRED (not retiring, not reaped)" \
+                        || bad "expected a deferred row, got: ${state:-<none>}"
+[ -d "$scn/trees/$SLUG_DEF" ] && ok "the worktree survives while the builder works" \
+                             || bad "a WORKING builder's worktree was reaped — work in flight LOST"
+grep -q "\"label\":\"$SLUG_DEF\"" "$scn/tabs.json" \
+  && ok "the builder tab (and its working agent) survives" \
+  || bad "a deferred slug's tab was closed out from under a working builder"
+printf '%s' "$rep" | grep -q "^STATE $SLUG_DEF deferred .*still working" \
+  && ok "the deferred row says WHY (builder still working)" \
+  || bad "the deferred row does not explain itself: $rep"
+
+# A second working tick must keep deferring — the defer is a property of the world, not a one-shot notice.
+rep2="$(SIM_AGENT_STATUS=working tick "$scn" "$SLUG_DEF" none)"
+printf '%s' "$rep2" | grep -q "^STATE $SLUG_DEF deferred" \
+  && ok "the defer persists tick over tick while the builder keeps working" \
+  || bad "the defer vanished on the second working tick: $rep2"
+
+# Now the builder goes IDLE (finished, waiting). The very next tick must REAP — converge to zero.
+rep3="$(SIM_AGENT_STATUS=idle await_converged "$scn" "$SLUG_DEF")"
+left3="$(printf '%s' "$rep3" | sed -n 's/^LEFT //p')"
+res3="$(residue "$scn" "$SLUG_DEF")"
+if [ -z "$left3" ] && [ -z "$res3" ]; then
+  ok "builder went idle → merged worktree reaped within one sweep (zero leftovers, zero residue)"
+else
+  bad "builder idle but the merged worktree did NOT reap — left='${left3:-}' res='${res3:-}'"
 fi
 
 step done "scorecard"
