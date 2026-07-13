@@ -344,6 +344,14 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # journal line).
 # MAIN_HEALTH_AUTOFIX="off"   # off (default) | on
 
+# AGING-PR alarm TTL in SECONDS (HERD-334). An engine-approved PR (herd/gates PASSED) that branch
+# protection keeps blocking on a required CI check is invisible today — no TTL covers "engine approved
+# it, CI blocks it, nothing is progressing" (PRs #440/#441 sat 7h with gates PASSED + required CI red,
+# no alarm). Past this TTL the watcher paints a loud ADVISORY 'aging · engine-approved but blocked on
+# <check>' row (never a hold) + journals `pr_aging` once per (pr,sha); journal-audit.sh (when on) reports
+# a matching gates_passed_no_merge finding. 0 DISABLES the alarm (byte-inert on both surfaces).
+# AGING_PR_TTL="3600"   # seconds, default 3600 (60m); 0 = off
+
 # Control-room SWEEP triggers (HERD-191) — off | advise (default) | auto. `herd sweep` is the
 # one-command cleanup: it reaps merged/closed-PR worktrees (sha-anchored), closes stale engine tabs,
 # drops dead inflight markers, and kills orphaned bats/healthcheck process trees. This key controls

@@ -127,6 +127,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # required CI is FAILING, herd/gates already PASSED, and the branch is BEHIND main is base-refreshed
 # (not silently merged). Sourcing DEFINES functions only; ship-dormant under CI_AUTOREPAIR=off.
 . "$HERE/ci-repair.sh"
+# AGING-PR alarm (HERD-334) — THE shared TTL helper (_aging_pr_ttl_secs / _aging_pr_armed /
+# _aging_pr_over_ttl) both this render pass and journal-audit.sh read AGING_PR_TTL through, so the two
+# surfaces can never disagree on the threshold. Sourcing DEFINES functions only; byte-inert when
+# AGING_PR_TTL=0 (the alarm disabled).
+. "$HERE/aging-pr.sh"
 # PUSH_GATE=human (HERD-123) — the push-hold helper. Sourced for push_gate_awaiting_sha, which drives
 # the 'ready · awaiting push approval' console row below. Sourcing only DEFINES functions (its CLI
 # dispatch is $0-guarded), so this is inert until a builder has recorded a push-hold.
@@ -3911,6 +3916,81 @@ EOF
   fi
 }
 
+# ── AGING-PR alarm render leg (HERD-334) ─────────────────────────────────────────────────────────
+# GROUNDED (2026-07-11: PRs #440/#441 sat 7h with herd/gates PASSED but a required CI suite red — zero
+# alarms): the console shows a PR blocked on a required check as a quiet steady state. No TTL covers
+# "engine approved it, branch protection blocks it, nothing is progressing". This leg AGES every open PR
+# that is MERGEABLE-but-not-CLEAN off OBSERVED state each tick (not off an event a single seat saw): a
+# first-seen marker is laid the tick the block is first observed, and once that age crosses AGING_PR_TTL
+# AND the sha still carries a herd/gates=success blessing AND a required check is still red/pending, the
+# row grows a loud ADVISORY continuation line and a `pr_aging` event is journaled ONCE per (pr,sha). The
+# TTL comparison is the ONE shared implementation in aging-pr.sh, so render + journal-audit never drift.
+#
+# ADVISORY only (never a hold), config-gated (AGING_PR_TTL=0 → byte-inert), fail-soft: if gh cannot read
+# the blessing or the check rollup, the leg skips SILENTLY — it never paints a red row on an API hiccup.
+
+# _aging_seen_file <pr> <sha> — the shared FIRST-SEEN marker: the epoch (from _now_epoch, HERD_FAKE_NOW-
+# overridable) at which ANY seat first observed this (pr,sha) blocked on a required check. Keyed by
+# (pr,sha) and living in $TREES, so a second seat coming online later reads the SAME clock, not its own.
+_aging_seen_file()  { printf '%s' "$TREES/.aging-seen-$1-$2"; }
+# _aging_noted_file <pr> <sha> — the once-per-threshold-crossing guard for the `pr_aging` journal event
+# (mirrors _ci_checks_noted): its presence means this (pr,sha) already journaled its crossing.
+_aging_noted_file() { printf '%s' "$TREES/.aging-noted-$1-$2"; }
+
+# purge_pr_aging <pr#> — drop every aging marker for this PR (all shas) on merge/reap, so the markers
+# cannot accumulate as PRs come and go (mirrors purge_pr_ci_checks). The trailing '-' in the glob keeps
+# PR 9's markers from matching PR 90's. Fail-soft — a marker hiccup must never touch the merge.
+purge_pr_aging() { rm -f "$TREES"/.aging-seen-"$1"-* "$TREES"/.aging-noted-"$1"-* 2>/dev/null || true; }
+
+# _aging_decorate_row <display-idx> <pr#> <sha> <slug> <mergeStateStatus> <ci-summary> — the render hook,
+# called from the MERGEABLE-but-not-CLEAN branch. Lays/advances the first-seen clock, and once the PR has
+# been engine-approved-but-required-check-blocked past AGING_PR_TTL, appends the loud aging line and
+# journals `pr_aging` once. <ci-summary> is the UNSTABLE-path "<bucket>\t<text>" already computed by
+# _ci_gate_eval (empty on the BLOCKED path); we only spend the extra rollup fetch on a PR that has
+# actually AGED, never on every blocked PR every tick. Fully fail-soft; never fails the caller.
+_aging_decorate_row() {
+  local _ai="$1" _apr="$2" _asha="$3" _aslug="$4" _amstate="$5" _acisum="${6:-}"
+  _aging_pr_armed || return 0                              # AGING_PR_TTL=0 → byte-inert
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "$_apr" ] && [ -n "$_asha" ] || return 0
+  # Only BLOCKED / UNSTABLE are the "engine did its part, a required check holds it" states. BEHIND (out
+  # of date) is a self-resolving rebase, not a stuck alarm — never age it.
+  case "$_amstate" in BLOCKED|UNSTABLE) ;; *) return 0 ;; esac
+  local _seen _now _first _age
+  _seen="$(_aging_seen_file "$_apr" "$_asha")"
+  _now="$(_now_epoch)"
+  if [ ! -f "$_seen" ]; then
+    printf '%s\n' "$_now" > "$_seen" 2>/dev/null || true    # clock starts on first observation — no row yet
+    return 0
+  fi
+  _first="$(cat "$_seen" 2>/dev/null || printf '%s' "$_now")"
+  case "$_first" in ''|*[!0-9]*) _first="$_now" ;; esac
+  _age="$(_aging_pr_over_ttl "$_first" "$_now")" || return 0   # still under the TTL → nothing
+  # AGED. Confirm the two facts the alarm asserts, from OBSERVED GitHub state, fail-soft (any gh miss →
+  # skip silently, never a red row): (1) the sha carries herd/gates=success (engine-approved);
+  _gate_status_blessed "$_asha" || return 0
+  # (2) a required check is still red/pending, and NAME it. Reuse the UNSTABLE summary if present; else
+  # probe the rollup now — bounded to already-aged PRs, so the BLOCKED path costs one fetch only when it
+  # matters. _ci_gate_eval is idempotent (its journal/notify are once-guarded), so this never double-fires.
+  local _bucket _text
+  if [ -n "$_acisum" ]; then
+    _bucket="${_acisum%%$'\t'*}"; _text="${_acisum#*$'\t'}"
+  else
+    _acisum="$(_ci_gate_eval "$_apr" "$_asha" "$_aslug")"
+    [ -n "$_acisum" ] || return 0                          # no required check red/pending → not our case
+    _bucket="${_acisum%%$'\t'*}"; _text="${_acisum#*$'\t'}"
+  fi
+  DISPLAY[$_ai]="${DISPLAY[$_ai]:-}"$'\n'"       ${C_RED}└─ aging ${C_BOLD}$(_fmt_age "$_age")${C_RESET}${C_RED} · engine-approved but ${_text} — nothing is merging${C_RESET}"
+  # Journal ONCE per (pr,sha) threshold crossing (sha-keyed, no per-tick spam).
+  local _noted; _noted="$(_aging_noted_file "$_apr" "$_asha")"
+  if [ ! -e "$_noted" ]; then
+    : > "$_noted" 2>/dev/null || true
+    journal_append pr_aging pr "$_apr" sha "$_asha" slug "$_aslug" check "$_text" \
+      age_secs "$_age" threshold "$(_aging_pr_ttl_secs)" result aging
+  fi
+  return 0
+}
+
 # ── Per-PR human-verify hold ──────────────────────────────────────────────────────────────────
 # A PR whose body declares a `HUMAN-VERIFY:` block (see human-verify.sh) names manual steps the
 # builder could not run itself. Under MERGE_POLICY=auto such a PR is individually switched to an
@@ -5965,6 +6045,12 @@ _reap_slug() {
 MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"        # one line while RED: "<sha> <since_pr> <failing test…>"
 MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" — the last journaled defer
 MAIN_HEALTH_FIX_STATE="$TREES/.agent-watch-main-health-fix" # the failing identity autofix already filed
+MAIN_HEALTH_CI_STATE="$TREES/.agent-watch-main-health-ci"  # "<sha> <conclusion>" — the last branch-CI red we fired (HERD-334)
+
+# Throttle the branch-CI probe (HERD-334 leg b): one `gh run list` every ~40 s (10 × 4 s sleep) instead
+# of every tick, so the steady-state network profile barely moves. Inline constant — no config key
+# (mirrors _MAIN_HEALTH_DIED_MAX / _ENGINE_INTERVAL). Byte-inert when MAIN_HEALTH_TICK=off.
+_MAIN_CI_SCAN_INTERVAL=10
 
 # A worker that keeps DYING before it can collect must not be re-dispatched forever: after this many
 # consecutive deaths the sha is marked (run-once) and the deaths surface as an infra_event instead of a
@@ -6254,6 +6340,78 @@ _main_health_file_age_mins() {
   printf '%s' "$(( (_fa_now - _fa_mt) / 60 ))"
 }
 
+# ── Branch-CI main-red leg (HERD-334) ────────────────────────────────────────────────────────────
+# GROUNDED (2026-07-11): main CI was red 6h after PR #439 with ZERO alarm — the MAIN RED machinery only
+# ever reflected the LOCAL healthcheck suite, which can be green while the DEFAULT branch's required CI
+# is red. This leg fires the EXISTING main-red row when the latest CI run FOR THE CURRENT main HEAD has a
+# failing conclusion, reusing _main_health_set_red (same state file, same row, same notify-once).
+#
+# Rides the MAIN_HEALTH_TICK lever (byte-inert when off) and is fully fail-soft: an offline/old gh, no
+# runs, or a run that is not yet COMPLETED yields NOTHING and never paints a red row. Deduped by
+# (sha, conclusion) via $MAIN_HEALTH_CI_STATE so a standing CI red fires the row + journal exactly ONCE,
+# never per tick. The local-suite green→clear path still owns clearing (a new green sha drops the state).
+
+# _main_ci_classify <expected-sha> — read a `gh run list --json headSha,status,conclusion,workflowName`
+# array on stdin and emit "<bucket>\t<workflow>\t<conclusion>" for the most-recent COMPLETED run whose
+# headSha matches <expected-sha> (bucket ∈ pass|fail|pending), or NOTHING (a run still in progress, a run
+# for an older sha, bad JSON, no runs). Uses the SAME PASS/FAIL conclusion vocabulary as
+# _ci_checks_normalize — CANCELLED/STALE/unknown are deliberately never red. python3 stdlib only.
+_main_ci_classify() {
+  python3 -c '
+import sys, json
+expected = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    runs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(runs, list):
+    sys.exit(0)
+PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+def clean(s):
+    return str(s or "").replace("\t", " ").replace("\n", " ").strip()
+for r in runs:                       # gh returns newest-first
+    if not isinstance(r, dict):
+        continue
+    if expected and r.get("headSha") != expected:
+        continue
+    if str(r.get("status") or "").upper() != "COMPLETED":
+        continue                     # not terminal for this sha yet → no verdict
+    concl = str(r.get("conclusion") or "").upper()
+    if concl in FAIL:   bucket = "fail"
+    elif concl in PASS: bucket = "pass"
+    else:               bucket = "pending"   # CANCELLED / STALE / unknown → never red
+    sys.stdout.write("%s\t%s\t%s\n" % (bucket, clean(r.get("workflowName")), concl or "?"))
+    break
+' "$1"
+}
+
+# _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs, and if
+# the latest COMPLETED run for the CURRENT main HEAD is FAILING, fires _main_health_set_red once per
+# (sha, conclusion). Lever-gated + fail-soft; always returns 0.
+_main_health_ci_leg() {
+  _main_health_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  local _sha _json _res _bucket _wf _concl _line _prev
+  _sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_sha" ] || return 0
+  _json="$(_gh_timeout main_health_ci run list --branch "$DEFAULT_BRANCH" --limit 20 \
+             --json headSha,status,conclusion,workflowName 2>/dev/null)" || return 0
+  [ -n "$_json" ] || return 0                              # offline gh / no Actions → byte-identical
+  _res="$(printf '%s' "$_json" | _main_ci_classify "$_sha")"
+  [ -n "$_res" ] || return 0
+  IFS=$'\t' read -r _bucket _wf _concl <<EOF
+$_res
+EOF
+  [ "$_bucket" = "fail" ] || return 0                      # green / pending / stale → never a red row
+  _line="$_sha $_concl"
+  _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
+  [ "$_prev" = "$_line" ] && return 0                      # already fired for this sha+conclusion — no spam
+  printf '%s\n' "$_line" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
+  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}"
+  return 0
+}
+
 # reconcile_main_health — the HERD-222 tick-level invariant: EVERY observed main sha ends with a
 # collected health verdict, no matter who merged it. Call once per tick, AFTER reconcile_main_freshness
 # (so $MAIN's HEAD is the real default-branch HEAD, not a stale checkout). Safe to call repeatedly.
@@ -6454,6 +6612,9 @@ do_merge() {
   # HERD-197: drop this PR's CI-check gate-event ledger rows too — the PR is merged, so its check
   # results are terminal and never re-evaluated; keeps $CI_CHECKS_STATE from growing unbounded.
   purge_pr_ci_checks "$dp"
+  # HERD-334: drop this PR's aging-alarm markers (first-seen + noted, all shas) — the PR merged, so it
+  # can never age again; keeps the marker set from growing unbounded (mirrors purge_pr_ci_checks).
+  purge_pr_aging "$dp"
   # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and journal
   #    a `cost` event (builder — and the in-worktree review, if captured) BEFORE the worktree is
   #    reaped. Never affects the merge; a missing transcript / python3 just drops the event.
@@ -12372,6 +12533,10 @@ EOF
         DISPLAY[i]="    ${C_YELLOW}⏸${C_RESET}  ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}blocked · awaiting required checks/reviews (${mstate:-?})${C_RESET}"
         FLAIR_STATE[i]="busy"
       fi
+      # AGING-PR alarm (HERD-334): a PR that has sat engine-approved (herd/gates PASSED) but blocked on a
+      # required check past AGING_PR_TTL grows a loud advisory line + journals `pr_aging` once. Byte-inert
+      # when AGING_PR_TTL=0 and until a PR actually ages; never a hold. Reuses the _ci_sum already fetched.
+      _aging_decorate_row "$i" "$prnum" "$headsha" "$slug" "$mstate" "$_ci_sum"
     else
       reason="not mergeable (${mstate})"
       DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${reason}${C_RESET}"
@@ -12521,6 +12686,16 @@ EOF
   # merge, a no-slot deferral, a killed worker), and re-verifies a standing red on the
   # MAIN_HEALTH_RECHECK_MINS cadence. Byte-inert when MAIN_HEALTH_TICK=off.
   reconcile_main_health
+
+  # Branch-CI main-red leg (HERD-334): the MAIN RED machinery reflected only the LOCAL suite, which can be
+  # green while the DEFAULT branch's required CI is red (main sat CI-red 6h after #439 with no alarm). On a
+  # throttled cadence, probe the branch's latest CI run and fire the SAME main-red row on a failing
+  # conclusion. Byte-inert when MAIN_HEALTH_TICK=off; fail-soft (no gh / no runs → no row).
+  _MAIN_CI_SCAN_TICK=$((_MAIN_CI_SCAN_TICK + 1))
+  if [ "$_MAIN_CI_SCAN_TICK" -ge "$_MAIN_CI_SCAN_INTERVAL" ]; then
+    _MAIN_CI_SCAN_TICK=0
+    _main_health_ci_leg
+  fi
 
   # Engine auto-update (HERD-179): every _ENGINE_INTERVAL ticks, and only under ENGINE_AUTOUPDATE=auto
   # with a genuinely stale engine, dispatch `herd update` DETACHED — it ends in a reload that restarts
@@ -12925,6 +13100,7 @@ _PMS_SWEEP_TICK=$_PMS_SWEEP_INTERVAL  # PRIMED so the FIRST tick sweeps, then ev
                             # follows is exactly when the stranded hooks must be replayed, so a fresh
                             # process must not idle 3 min before noticing. (This is the cadence sibling
                             # of the one-shot _startup_reap_sweep above, which covers worktrees only.)
+_MAIN_CI_SCAN_TICK=$_MAIN_CI_SCAN_INTERVAL  # HERD-334: primed so the FIRST MAIN_HEALTH_TICK=on tick probes branch CI, then every interval
 _ENGINE_TICK=0
 _ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s sleep). Byte-inert unless
                             # ENGINE_AUTOUPDATE=auto AND the engine is stale; the dispatch itself is
