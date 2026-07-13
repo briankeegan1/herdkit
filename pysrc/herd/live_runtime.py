@@ -1496,6 +1496,15 @@ class LiveActuator:
         return True
 
     def reap(self, cand):
+        # REAP-ON-MERGE only: this fires the instant THIS tick merged ``cand`` on green gates, so the
+        # builder is DONE by definition — there is no separate resident builder to defer for here, and no
+        # roster is fetched on this path. The HERD-356 liveness gate ("a still-WORKING builder defers the
+        # reap; an idle/merged builder's pane is retired with the worktree") lives in the ONE place that
+        # reaps a merge THIS seat did not perform: the bash sweep (``sweep.sh:sweep_leg_worktrees`` and
+        # ``retirement.sh:retire_classify``, both keying off the shared ``_reap_agent_working`` verdict).
+        # That is the multi-seat authority the contract requires — it reconciles observed PR state each
+        # sweep tick, so the gate holds regardless of which seat merged. Keeping it single-sourced there
+        # (rather than re-deriving a roster verdict on this already-post-gate path) is deliberate.
         if cand.worktree:
             try:
                 subprocess.run(["git", "worktree", "remove", "--force", cand.worktree],
