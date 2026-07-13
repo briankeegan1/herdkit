@@ -13,7 +13,14 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 # Source loader in a subshell with a given config file, from a cwd with no .herd/config above it.
 load_vars() {
   local cfg="$1"
-  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c ". '$LOADER'
+  # Shield the loader from inherited config env (HERD-362): the coordinator/watcher sources
+  # herd-config.sh, which EXPORTS MODEL_REVIEW (HERD-353, line ~640). When the gate spawns this
+  # suite as a child, that exported MODEL_REVIEW=<machine value> is in the environment and the
+  # loader's `: "${MODEL_REVIEW:=default}"` keeps it — reddening a machine-agnostic baseline
+  # assertion. Clear the model-resolution inputs so we assert PURE baseline regardless of the
+  # host's config or a coordinator-exported override.
+  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c "unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
+. '$LOADER'
 echo SCRIBE_BACKEND=\$SCRIBE_BACKEND
 echo BACKLOG_FILE=\$BACKLOG_FILE
 echo MODEL_FEATURE=\$MODEL_FEATURE
