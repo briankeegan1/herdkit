@@ -37,6 +37,17 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                WAIT, PENDING,
                                branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
 
+# HERMETICITY (HERD-331 gate red): a watcher/healthcheck-descended environment EXPORTS the live
+# engine's main-health coordinates — herd-config.sh exports MAIN_HEALTH_TICK (HERD-359) and
+# PROJECT_ROOT, and this repo's .herd/config arms the tick. Inside these fixtures,
+# _main_health_pending() would then consult the REAL repo's HEAD and reserve the single health
+# slot, deterministically failing every dispatch assert whenever real main happens to sit
+# verdict-pending (exactly the window in which a PR gate runs after a merge). Scrub the trio once
+# at import — the same set TestMainHealthSlotPriority scrubs per-test; tests that exercise the
+# reservation set them explicitly.
+for _k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
+    os.environ.pop(_k, None)
+
 
 def _make_worktree(pool, slug):
     """Create a minimal on-disk git worktree ``<pool>/<slug>`` (a dir with a ``.git`` pointer) so the

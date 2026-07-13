@@ -236,6 +236,14 @@ export HERD_DRIVER=headless                       # panes-as-a-view: no herdr ta
 export WORKSPACE_NAME="sandbox-conc-sim"          # isolated name (tab-leak-guard cannot miscount us)
 export PROJECT_ROOT="$REPO"                        # → MAIN for do_merge's git ops
 export WORKTREES_DIR="$TREES"                      # → TREES: all ledgers/markers/journal land here
+# HERD-331: the drain asserts EXACTLY one healthcheck per PR. An inherited MAIN_HEALTH_TICK=on
+# (herd-config.sh EXPORTS it since HERD-359, so every watcher/healthcheck-descended env carries
+# this repo's configured 'on'; HERD_CONFIG_FILE above only shields the ambient config file, not
+# the inherited export) would make the drain's real ticks ALSO dispatch a main-health stub suite
+# for the fixture HEAD — a 4th run that reds the wrapper's one-per-PR count and injects a
+# background worker into the later legs. Pin it OFF; the [mainhealth] legs below flip it on
+# explicitly against their own fixture.
+export MAIN_HEALTH_TICK=off
 export DEFAULT_BRANCH="main"
 # MERGE_POLICY defaults to auto (today's behavior) but a --posture may already have set it
 # (team-approve→approve, observe-only→observe) via posture_apply above; never clobber that.
