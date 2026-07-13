@@ -210,6 +210,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ENGINE_AUTOUPDATE` → `engine-version.sh`
 - `ENGINE_IMPL` → `engine-version.sh`, `posture-lint.sh`
 - `ENGINE_MIN` → `bin/herd`, `agent-watch.sh`, `engine-version.sh`
+- `ENGINE_PAUSE` → `agent-watch.sh`
 - `ENGINE_SEAT_RECONCILE` → `agent-watch.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`

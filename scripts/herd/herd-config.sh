@@ -345,6 +345,20 @@ esac
 # scripts/herd/engine-version.sh (herd_engine_impl); config lint flags a retired value.
 : "${ENGINE_IMPL:="python"}"
 
+# ENGINE_PAUSE — the OPERATOR EMERGENCY-OFF switch (HERD-347): off (default) | on. The first-class
+# replacement for the pre-P5b `ENGINE_IMPL=bash` no-op pause that config validation now refuses. With
+# it on, the watcher's supervisor SKIPS the Python live tick every cycle — zero gate/merge/refix
+# dispatch — WITHOUT counting the skipped tick as a fault (the engine-down watchdog is untouched), and
+# paints a loud "⏸ engine paused by operator" console banner. Render, reconcile, sweeps and every
+# alarm keep running, so the control room stays live; only the action engine is held. Machine-scoped
+# so it routes to .herd/config.local, and the watcher reads it FRESH from the config file each tick
+# (NOT from this env default — that is why the key carries no requires=watcher restart), so any seat's
+# `herd config set ENGINE_PAUSE on|off` takes effect on the shared watcher's very next tick with no
+# restart. off is a HARD no-op: byte-identical console + engine behavior to before this key existed.
+# The guard lives in scripts/herd/agent-watch.sh (_engine_tick_watchdog / _engine_paused). Defaulted
+# here so every path sees it under `set -u`.
+: "${ENGINE_PAUSE:="off"}"
+
 # HERD_THEME — pluggable theming across all herd color surfaces. Default "tokyonight" (the shipped
 # built-in), which renders byte-identically to the pre-theme hardcoded palettes. A theme is a
 # directory holding palette.sh (the console C_* truecolor + optional C_CLI_* 16-color CLI overrides)

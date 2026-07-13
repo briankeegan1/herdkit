@@ -618,6 +618,7 @@ SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
+ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -1633,6 +1634,13 @@ build_orphan_prs() {
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # ENGINE PAUSED banner (HERD-347) — the operator emergency-off switch, pinned ABOVE even the
+  # engine-down alarm: a deliberate operator pause is the single most important fact on the console.
+  # Set by _engine_tick_watchdog while ENGINE_PAUSE=on; empty (byte-identical console) whenever the
+  # lever is off/unset — the ship default — so this adds NO always-on row.
+  if [ -n "${ENGINE_PAUSE_ROW:-}" ]; then
+    frame="${frame}  ${C_YELLOW}engine${C_RESET}"$'\n'"${ENGINE_PAUSE_ROW}"$'\n'
+  fi
   # ENGINE DOWN alarm (HERD-306) — the LOUDEST row, pinned above even the default-branch alarm. Set by
   # _engine_tick_watchdog when the SOLE (Python) engine core has faulted past its tolerance: no gates or
   # merges are running until a human intervenes. Empty (byte-identical console) whenever the engine ticks.
@@ -11640,7 +11648,70 @@ _acquire_watcher_singleton() {
 #                          the watchdog, then drains the spawn queue and runs the reconcile/sweep legs
 #                          (Phase C) over the same state files + journal the Python engine writes. This
 #                          half stays bash per the port spike (console, sweeps, notes, retirement).
+# ── OPERATOR EMERGENCY PAUSE (HERD-347) ──────────────────────────────────────────────────────────
+# _engine_pause_config_value — read ENGINE_PAUSE FRESH from the config files THIS tick. Deliberately
+# reads the FILE, never $ENGINE_PAUSE — the loader UNSETS its internal path vars and a sourced env
+# value would only change on a watcher restart, but a pause lever must take effect on the next tick
+# with NO restart and no seat-local cache. The path is the config the watcher was launched bound to
+# ($HERD_CONFIG_FILE, exported into its env at launch), else the standard per-project path under
+# $PROJECT_ROOT — the SAME pair `herd config set` writes from the project root, so any seat's set is
+# what we read here. Machine-scope: the .herd/config.local overlay WINS over the committed baseline
+# (mirrors the load order in herd-config.sh). Fail-soft: an absent/unreadable file contributes
+# nothing; garbage is treated as off by _engine_paused. Byte-quiet — a pure read, no output/mutation.
+_engine_pause_config_value() {
+  local _ep_base _ep_dir _ep_f _ep_line _ep_val=""
+  _ep_base="${HERD_CONFIG_FILE:-}"
+  [ -n "$_ep_base" ] || { [ -n "${PROJECT_ROOT:-}" ] && _ep_base="${PROJECT_ROOT}/.herd/config"; }
+  [ -n "$_ep_base" ] || return 0
+  _ep_dir="$(dirname "$_ep_base" 2>/dev/null)" || return 0
+  for _ep_f in "$_ep_dir/config.local" "$_ep_base"; do
+    [ -n "$_ep_f" ] && [ -r "$_ep_f" ] || continue
+    _ep_line="$(grep -E '^[[:space:]]*ENGINE_PAUSE[[:space:]]*=' "$_ep_f" 2>/dev/null | tail -n1)" || _ep_line=""
+    [ -n "$_ep_line" ] || continue
+    # Strip `KEY =`, any trailing comment, and surrounding quotes/whitespace.
+    _ep_val="$(printf '%s\n' "$_ep_line" \
+      | sed -E 's/^[[:space:]]*ENGINE_PAUSE[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//; s/[[:space:]]*$//')"
+    break
+  done
+  printf '%s' "$_ep_val"
+}
+
+# _engine_paused — true iff ENGINE_PAUSE opts in (on). Default/unset/garbage → off (fail toward the
+# engine RUNNING, never a silent pause). Mirrors the truthy-token leniency of _flair_enabled so a
+# hand-edited ON/true/1 still holds, but `herd config set` only ever writes off|on (value_shape).
+_engine_paused() {
+  case "$(_engine_pause_config_value)" in
+    on|ON|On|true|TRUE|1|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _engine_tick_watchdog() {
+  # OPERATOR EMERGENCY PAUSE (HERD-347) — checked FRESH each tick, BEFORE the engine core runs. With
+  # ENGINE_PAUSE=on the Python live tick is SKIPPED entirely (zero gate/merge/refix dispatch), and the
+  # skipped tick is NOT counted as a fault: the fault streak, the engine-down banner, and its one-shot
+  # notification are all left untouched, so a deliberate pause never trips the 'engine down' alarm. The
+  # supervisor loop continues past this early return, so render, reconcile, sweeps and every alarm keep
+  # running — only the action engine is held. A LOUD '⏸ engine paused by operator' banner is painted;
+  # resume is one `herd config set ENGINE_PAUSE off`, effective on the very next tick with no restart.
+  if _engine_paused; then
+    ENGINE_PAUSE_ROW="    ${C_YELLOW}⏸ ${C_BOLD}engine paused by operator${C_RESET}${C_YELLOW} · ENGINE_PAUSE=on — NO gates/merges/refix are dispatching (render, reconcile & sweeps continue) · resume: ${C_DIM}herd config set ENGINE_PAUSE off${C_RESET}"$'\n'
+    if [ -z "${_ENGINE_PAUSE_DECLARED:-}" ]; then
+      _ENGINE_PAUSE_DECLARED=1
+      journal_append engine_paused by operator
+      herd_driver_notify "⏸ herd engine paused" "ENGINE_PAUSE=on — the engine core is not dispatching gates/merges; render/reconcile/sweeps continue. Resume with herd config set ENGINE_PAUSE off." default
+    fi
+    render   # repaint THIS tick so the paused banner shows immediately (mirrors the engine-down path)
+    return 0
+  fi
+  # NOT paused. If we WERE paused, announce the resume ONCE and clear the banner before the engine core
+  # runs again, so a resumed engine picks up cleanly this very tick.
+  if [ -n "${_ENGINE_PAUSE_DECLARED:-}" ]; then
+    _ENGINE_PAUSE_DECLARED=""
+    ENGINE_PAUSE_ROW=""
+    journal_append engine_resumed by operator
+    herd_driver_notify "🐑 herd engine resumed" "ENGINE_PAUSE=off — the engine core is dispatching gates and merges again." default
+  fi
   # Run the sole engine core (the Python live tick) with an in-tick backoff RETRY, then translate a
   # persistent fault into the loud engine-down HOLD. State is carried in the long-lived watcher process
   # via the module globals initialised near the other tick counters (_ENGINE_FAULT_STREAK etc.).
@@ -12562,6 +12633,7 @@ _ENGINE_TICK_RETRIES=3      # in-tick attempts of the Python live tick before th
 _ENGINE_BACKOFF_BASE=2      # seconds; in-tick backoff between attempts is attempt × this (2 s, 4 s)
 _ENGINE_DOWN_DECLARED=""    # set once the loud engine-down posture is active; cleared on recovery
 _HERD_ENGINE_TICK_LAST_ERR="" # last non-empty stderr line from the Python live tick (HERD-345); cleared on clean tick
+_ENGINE_PAUSE_DECLARED=""   # HERD-347: set while the operator ENGINE_PAUSE banner/journal/notify is active; cleared on resume
 
 # One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
