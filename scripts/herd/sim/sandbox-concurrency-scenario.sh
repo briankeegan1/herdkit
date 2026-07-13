@@ -1239,6 +1239,17 @@ fi
 #         is not vacuous — the invariant it asserts is one the engine can actually violate.
 step fairness "drive $NPRS PRs under merge pressure through the SHIPPED reorder + re-stale counter (HERD-231)"
 
+# PRIVATE journal for the fairness legs (HERD-331 round 3). The gate suite pins ONE shared
+# JOURNAL_FILE for the whole run (.herd/healthcheck.project.sh, HERD-223) and — since the
+# sandboxed baseline leg (HERD-361) — a SECOND full suite can run CONCURRENTLY in the same
+# environment, inheriting the SAME exported JOURNAL_FILE (journal-test-env.sh keeps an already-
+# exported value). The baseline's test-merge-fairness.sh drives these exact shipped legs with the
+# same 9xxx PRs and fair-* slugs, so its pr_starvation/merge_fairness_priority events land in the
+# shared file AFTER this run's _FAIR_MARK and get counted as ours (the observed
+# "pr_starvation=6/15 while max laps=1" impossibility — the counts were exact multiples of one
+# OFF-leg's 6 events). A mark can fence off HISTORY but never a CONCURRENT writer; only a private
+# file can. Save/restore like every other swapped fixture coordinate.
+_fair_sv_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$ART/fairness-journal.jsonl"; : > "$JOURNAL_FILE"
 _FAIR_JOURNAL="$(_journal_file)"
 _FAIR_ROUNDS=$(( _RESTALE_STARVE_THRESHOLD + 2 ))
 _fair_prs=""; _fair_i=0
@@ -1432,6 +1443,7 @@ fi
 
 # Leave no fairness fixtures behind for the scorecard/tail steps.
 rm -f "$TREES"/.health-result-9* "$TREES"/.health-inflight-9* 2>/dev/null || true
+if [ -n "$_fair_sv_jf" ]; then export JOURNAL_FILE="$_fair_sv_jf"; else unset JOURNAL_FILE; fi
 
 
 
