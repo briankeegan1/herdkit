@@ -98,6 +98,14 @@ TEMPLATES_DIR="$HERDKIT_HOME/templates"
 # shellcheck source=/dev/null
 [ -f "$SCRIPTS_DIR/review-panel.sh" ] && . "$SCRIPTS_DIR/review-panel.sh"
 
+# EXTERNAL-CONSISTENCY PROBES (HERD-355): the ONE shared implementation validating .herd/config
+# against LIVE external reality (repo merge flags, branch protection, driver-qualified runtime
+# bindings). Sourced here so BOTH `herd config set` (a targeted probe that REFUSES a proven mismatch)
+# and `herd doctor` (an advisory viability section) drive the same check — never forked logic. Pure
+# library (defines functions only); depends on driver.sh + journal.sh, both sourced above.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/config-viability.sh" ] && . "$SCRIPTS_DIR/config-viability.sh"
+
 # The ONE shared watcher-identity check (HERD-266): watcher_list_mains + the exemption clauses that
 # tell a real duplicate watcher apart from the canonical watcher's own argv0-inherited forks. Sourced
 # by bin/herd, sweep.sh, status.sh and agent-watch.sh so no surface can disagree. Defines functions
@@ -2634,6 +2642,32 @@ cmd_config_set() {
      && command -v herd_model_resolve >/dev/null 2>&1; then
     herd_model_resolve "$val" >/dev/null \
       || die "refusing to set MODEL_REVIEW — '$val' does not resolve to a usable model ref (see the error above); use a bare model id or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
+  fi
+
+  # 2a-ter. EXTERNAL-CONSISTENCY PROBE (HERD-355). For an externally-coupled key (env_coupling in
+  #     capabilities.tsv), probe the just-supplied VALUE against LIVE external reality — the repo's
+  #     merge flags, its branch protection, the resolved driver's runtime binding — so a config-vs-
+  #     ENVIRONMENT mismatch surfaces HERE, at set time, not hours later as a silent gate failure
+  #     (HERD-354 / HERD-352 / HERD-311). A PROVEN mismatch REFUSES the write naming BOTH sides; an
+  #     unprovable/offline probe WARNS and proceeds (fail-soft). Skipped entirely on a batch apply
+  #     (HERD_INIT_DEFER_APPLY=1: init / governance apply) — a bulk configuration must stay fast and
+  #     offline-safe and never refuse; the operator runs `herd doctor` for the viability picture after.
+  if [ "${HERD_INIT_DEFER_APPLY:-}" != "1" ] && command -v herd_config_viability_probe >/dev/null 2>&1; then
+    local _cv_out _cv_status _cv_msg _cv_wt
+    _cv_out="$(herd_config_viability_probe "$key" "$val" 2>/dev/null || true)"
+    _cv_status="${_cv_out%%$'\t'*}"; _cv_msg="${_cv_out#*$'\t'}"
+    # Resolve WORKTREES_DIR the way journal writes do (subshell-source the baseline) so the probe
+    # result lands in the shared-pool journal + report the coordinator reads.
+    _cv_wt="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
+    case "$_cv_status" in
+      MISMATCH|WARN|OK)
+        WORKTREES_DIR="$_cv_wt" herd_config_viability_note "$key" "$val" "$_cv_status" "$_cv_msg" config-set ;;
+    esac
+    case "$_cv_status" in
+      MISMATCH) die "refusing to set $key — config-vs-reality mismatch: $_cv_msg" ;;
+      WARN)     warn "$_cv_msg" ;;
+      OK)       [ -n "$_cv_msg" ] && say "  ${c_dim}(external check ✓: ${_cv_msg})${c_rst}" ;;
+    esac
   fi
 
   # 2b. Decide the TARGET file (HERD-47). A write lands in the per-user overlay .herd/config.local
