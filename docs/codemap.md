@@ -15,6 +15,7 @@ Role summarized from each file's top-of-file comment.
 
 - `agent-update.sh` — the AGENT_UPDATE mechanism (HERD-149): keep the AGENT RUNTIME up to date SAFELY,
 - `agent-watch.sh` — live "herd watch" status console for the coordinator.
+- `aging-pr.sh` — THE shared AGING-PR TTL helper (HERD-334): ONE implementation of "how long may an
 - `app-monitor.sh` — app-monitor.sh <port> — the left-pane app preview for a feature worktree.
 - `approvals.sh` — ONE seam for where the sha-keyed approval ledger lives and what it says.
 - `backlog-reconcile-sweep.sh` — periodic, ADVISORY reconcile SWEEP for backlog drift.
@@ -119,7 +120,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -134,7 +135,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `engine-version.sh` → `journal.sh`
 - `fleet.sh` → `herd-config.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
-- `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`
+- `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`, `journal.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
@@ -144,7 +145,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
-- `journal-audit.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`
+- `journal-audit.sh` → `aging-pr.sh`, `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
 - `oss-triage.sh` → `herd-config.sh`
@@ -172,6 +173,7 @@ Which script(s) reference each `kind=config` key from `templates/capabilities.ts
 loader `herd-config.sh` (which only sets defaults) is omitted, so this shows real consumers.
 
 - `AGENT_UPDATE` → `bin/herd`, `agent-update.sh`
+- `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
 - `APP_PREVIEW_CMD` → `bin/herd`, `app-monitor.sh`, `herd-feature.sh`, `herd-resolve.sh`
 - `APP_PREVIEW_HEALTH_CMD` → `app-monitor.sh`
