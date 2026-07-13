@@ -8,8 +8,10 @@
 #       the default branch (message "chore: refresh codemap after PR #N"), scoped to docs/codemap.md,
 #       pushed ff-safe (origin advances); journals result=committed pushed=yes
 #   (3) FRESH: the regen matches the committed map → NO commit, tree clean; journals result=fresh
-#   (4) DIRTY PATH: docs/codemap.md already carries an uncommitted change → skip untouched (never
-#       clobber or bundle a concurrent writer's edit); journals result=skipped reason=dirty-path
+#   (4) DIRTY DERIVED (HERD-336): docs/codemap.md already carries an uncommitted change (a stranded
+#       regeneration from a crashed/detached leg, NOT a human edit — the map is engine-generated) →
+#       ABSORB it into the regen commit rather than skip forever; journals result=absorbing
+#       reason=dirty-derived then result=committed pushed=yes
 #   (5) NOT ADOPTED: no committed docs/codemap.md → skip, never materialize one; result=skipped no-codemap
 #
 # Sources agent-watch.sh in lib mode (AGENT_WATCH_LIB=1) and drives refresh_codemap directly against
@@ -104,13 +106,14 @@ CODEMAP_AUTOREFRESH=true refresh_codemap 8
 jhas 'result fresh'                          || fail "(3) did not journal fresh: $(cat "$JLOG")"
 ok
 
-# ── (4) DIRTY PATH → skip, never touch a concurrent writer's edit ─────────────────────────────────
-: > "$JLOG"; printf 'HAND-EDIT IN FLIGHT\n' > "$MAIN/docs/codemap.md"; STUB_MAP="MAP v3"; c0="$(commits)"
+# ── (4) DIRTY DERIVED → ABSORB the stranded regen into the refresh commit (HERD-336) ──────────────
+: > "$JLOG"; printf 'STRANDED REGEN\n' > "$MAIN/docs/codemap.md"; STUB_MAP="MAP v3"; c0="$(commits)"
 CODEMAP_AUTOREFRESH=true refresh_codemap 9
-[ "$(commits)" = "$c0" ]                       || fail "(4) DIRTY created a commit — must skip"
-[ "$(mapfile_content)" = "HAND-EDIT IN FLIGHT" ] || fail "(4) DIRTY was overwritten by the regen — must skip untouched"
-jhas 'result skipped reason dirty-path'        || fail "(4) did not journal skipped/dirty-path: $(cat "$JLOG")"
-git -C "$MAIN" checkout -- docs/codemap.md      # restore clean state for (5)
+[ "$(commits)" = "$((c0 + 1))" ]           || fail "(4) DIRTY-DERIVED did not absorb into one commit"
+[ "$(mapfile_content)" = "MAP v3" ]        || fail "(4) DIRTY-DERIVED not regenerated fresh (got: $(mapfile_content))"
+[ -z "$(git -C "$MAIN" status --porcelain)" ] || fail "(4) DIRTY-DERIVED left the tree dirty after absorb"
+jhas 'result absorbing reason dirty-derived' || fail "(4) did not journal absorbing/dirty-derived: $(cat "$JLOG")"
+jhas 'result committed pushed yes'         || fail "(4) absorbed change was not committed: $(cat "$JLOG")"
 ok
 
 # ── (5) NOT ADOPTED (no committed map) → skip, never materialize one ──────────────────────────────
