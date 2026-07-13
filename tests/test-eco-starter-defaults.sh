@@ -32,7 +32,12 @@ command -v git >/dev/null 2>&1 || fail "git required to run this test"
 # walk-up discovery can't pick up a stray config), and dump the resolved model keys.
 load_models() {
   local cfg="$1"
-  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c ". '$LOADER'
+  # Shield the loader from inherited config env (HERD-362): the coordinator/watcher exports
+  # MODEL_REVIEW (HERD-353), so a gate-spawned child inherits it and the loader's
+  # `: "${MODEL_REVIEW:=default}"` keeps the leaked value — reddening the resolved-value
+  # assertions. Clear the model-resolution inputs so the loader resolves purely from $cfg.
+  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c "unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
+. '$LOADER'
 echo MODEL_COORDINATOR=\$MODEL_COORDINATOR
 echo MODEL_FEATURE=\$MODEL_FEATURE
 echo MODEL_QUICK=\$MODEL_QUICK

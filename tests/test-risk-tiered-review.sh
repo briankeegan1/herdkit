@@ -81,6 +81,11 @@ export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
 export HERD_CONFIG_FILE="$T/no-such-config"
 export HERD_REVIEW_BIN="$STUB_REVIEW"
 export REVIEW_CONCURRENCY=5     # high enough that nothing QUEUEs in these tests
+# Shield from inherited config env (HERD-362): the coordinator/watcher exports MODEL_REVIEW
+# (HERD-353), and this suite sources herd-config.sh (via agent-watch.sh) in the CURRENT shell,
+# then asserts the baseline MODEL_REVIEW default below. A leaked export would keep the machine's
+# value and red the assertion — clear the model-resolution inputs so the loader resolves baseline.
+unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 

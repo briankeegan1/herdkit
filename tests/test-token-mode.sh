@@ -20,7 +20,12 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 # walk-up discovery can't pick up a stray config), and dump TOKEN_MODE + the seven model keys.
 load_models() {
   local cfg="$1"
-  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c ". '$LOADER'
+  # Shield the loader from inherited config env (HERD-362): the coordinator/watcher exports
+  # MODEL_REVIEW (HERD-353), so a gate-spawned child inherits it and the loader's
+  # `: "${MODEL_REVIEW:=default}"` keeps the leaked value — reddening the eco/standard tier
+  # assertions below. Clear the model-resolution inputs so we assert the loader's PURE tiers.
+  ( cd "$T" && HERD_CONFIG_FILE="$cfg" bash -c "unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
+. '$LOADER'
 echo TOKEN_MODE=\$TOKEN_MODE
 echo MODEL_COORDINATOR=\$MODEL_COORDINATOR
 echo MODEL_FEATURE=\$MODEL_FEATURE
