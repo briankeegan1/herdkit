@@ -1370,7 +1370,7 @@ class TestMainHealthSlotPriority(unittest.TestCase):
 
     def setUp(self):
         self._orig_env = {}
-        for k in ("MAIN_HEALTH_TICK", "MAIN"):
+        for k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
             self._orig_env[k] = os.environ.pop(k, None)
         import tempfile as _t
         self.tmp = _t.mkdtemp()
@@ -1412,8 +1412,29 @@ class TestMainHealthSlotPriority(unittest.TestCase):
         self.assertFalse(_main_health_pending(None))
 
     def test_no_main_env(self):
+        """Neither MAIN nor PROJECT_ROOT set → False (fail-safe, never blocks the PR rail)."""
         os.environ["MAIN_HEALTH_TICK"] = "on"
         self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_project_root_fallback(self):
+        """MAIN unset (a plain var in agent-watch.sh, it never crosses the --tick subprocess
+        boundary) → the exported PROJECT_ROOT resolves the main checkout (HERD-345 precedent)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        p = os.path.join(self.tmp, "main")
+        _git_init_repo(p)
+        os.environ["PROJECT_ROOT"] = p
+        self.assertTrue(_main_health_pending(self.tmp))
+
+    def test_truthy_set_matches_bash(self):
+        """The truthy set matches bash _main_health_enabled (1|true|on|yes|enable|enabled) —
+        a value that arms the bash reconcile must also arm the python-side reservation."""
+        self._main_repo()
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "Enabled"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertTrue(_main_health_pending(self.tmp), "expected pending for %r" % v)
+        for v in ("off", "0", "no", "false", "bogus"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertFalse(_main_health_pending(self.tmp), "expected off for %r" % v)
 
     def test_pending_when_no_markers(self):
         """MAIN_HEALTH_TICK=on, valid MAIN, no markers → True (main-health needs a slot)."""

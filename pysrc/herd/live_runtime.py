@@ -236,10 +236,15 @@ def _main_health_pending(state_dir):
     Mirrors bash ``_main_health_enabled`` + ``reconcile_main_health`` guard
     (agent-watch.sh:5656, :5962)."""
     try:
+        # Same truthy set as bash _main_health_enabled (1|true|on|yes|enable|enabled) — a value that
+        # arms the bash reconcile must also arm the reservation, or the two seats disagree per tick.
         tick = os.environ.get("MAIN_HEALTH_TICK", "off").lower()
-        if tick not in ("on", "1", "yes", "true"):
+        if tick not in ("1", "true", "on", "yes", "enable", "enabled"):
             return False
-        main_dir = os.environ.get("MAIN", "")
+        # MAIN is a plain (unexported) shell var in agent-watch.sh — it never crosses the
+        # `--tick` subprocess boundary; fall back to the exported PROJECT_ROOT (HERD-345),
+        # exactly like _dispatch_health below.
+        main_dir = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
         if not main_dir or not state_dir:
             return False
         out = subprocess.check_output(

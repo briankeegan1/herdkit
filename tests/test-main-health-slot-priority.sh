@@ -8,6 +8,11 @@
 # Also proves the Python sentinel _main_health_pending() correctly reports pending/done so
 # LiveGates.health() can reserve the slot.
 #
+# Section (d) proves it ACROSS THE SUBPROCESS BOUNDARY (the review-BLOCK regression): a config-armed
+# MAIN_HEALTH_TICK must survive watcher → `python3 -m herd.live_runtime --tick` (herd-config.sh must
+# EXPORT it), and the child must fall back to the exported PROJECT_ROOT when MAIN (a plain shell var
+# in agent-watch.sh) does not cross. Sections (a)/(b) set env in-process and cannot catch that.
+#
 # Hermetic: local git only, no herdr, no network, no model. Sources agent-watch.sh in lib mode.
 # Run:  bash tests/test-main-health-slot-priority.sh
 set -uo pipefail
@@ -209,5 +214,58 @@ _BASH_JOURNAL="$BTREES/.herd/journal.jsonl"
 ) || fail "(c) bash starvation: deferred-then-dispatch invariant broken"
 pass
 echo "PASS (c) bash starvation: no-slot defers, then dispatches+collects once slot is free"
+
+# ── (d) SUBPROCESS BOUNDARY: config-sourced env reaches a real `--tick` child ───────────────────
+# The regression sections (a)/(b) missed: they set MAIN_HEALTH_TICK/MAIN in-process, but in production
+# the watcher arms them as PLAIN shell vars and the engine runs in a `python3 -m herd.live_runtime
+# --tick` CHILD — only exported vars cross. Arm MAIN_HEALTH_TICK the production way (a plain
+# assignment in a .herd/config fixture, sourced by the real herd-config.sh), leave MAIN unset (as it
+# is for any --tick child), and prove the reservation still fires inside a REAL --tick subprocess:
+# the PR candidate is health_queued and lays NO inflight marker (main-health kept the last slot).
+DROOT="$T/tick"; DTREES="$DROOT/trees"; DBIN="$DROOT/bin"
+mkdir -p "$DTREES/.herd" "$DBIN"
+DSHA="feedfacefeedfacefeedfacefeedfacefeedface"
+# Pool worktree backing the discovered PR (pool-scope + pre-dispatch guard need the .git pointer).
+mkdir -p "$DTREES/feat-77"; printf 'gitdir: /pool\n' > "$DTREES/feat-77/.git"
+# The production shape: .herd/config is shell-sourced PLAIN assignments — no `export` here. The
+# fixture reuses $PMAIN (an unverified HEAD sha, no markers under $DTREES → main-health pending).
+cat > "$DROOT/config" <<EOF
+MAIN_HEALTH_TICK=on
+PROJECT_ROOT=$PMAIN
+WORKTREES_DIR=$DTREES
+EOF
+# gh stub: one-PR GraphQL roster — discovery is the only gh the tick needs before the health gate.
+cat > "$DBIN/gh" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "repo view")   printf 'sim\thk\n' ;;
+  "api graphql") printf '%s' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":77,"headRefName":"feat/feat-77","mergeStateStatus":"CLEAN","headRefOid":"$DSHA","baseRefName":"main","reviewDecision":"","author":{"login":"sim"},"assignees":{"nodes":[]},"labels":{"nodes":[]}}]}}}}' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$DBIN/gh"
+# Run with the boundary-relevant vars SCRUBBED from the harness env, so only what herd-config.sh
+# EXPORTS (the fix under test) reaches the python child.
+env -u MAIN -u MAIN_HEALTH_TICK -u PROJECT_ROOT -u WORKTREES_DIR -u TREES -u JOURNAL_FILE \
+    -u HERDKIT_HOME -u BRANCH_TEMPLATE -u AGENT_WATCH_DRYRUN -u DRYRUN \
+    HERD_CONFIG_FILE="$DROOT/config" REPO="$REPO" DROOT="$DROOT" DBIN="$DBIN" bash -c '
+  set -u
+  . "$REPO/scripts/herd/herd-config.sh" || exit 40
+  # (d1) the export line itself: a REAL python child must see the config-armed value.
+  python3 -c "import os,sys; sys.exit(0 if os.environ.get(\"MAIN_HEALTH_TICK\",\"\").lower()==\"on\" else 1)" \
+    || { echo "FAIL: MAIN_HEALTH_TICK did not cross the subprocess boundary (herd-config.sh export missing)" >&2; exit 41; }
+  # (d2) one authoritative live tick — MAIN deliberately unset (PROJECT_ROOT fallback under test).
+  PATH="$DBIN:$PATH" PYTHONPATH="$REPO/pysrc" PYTHONDONTWRITEBYTECODE=1 \
+    python3 -m herd.live_runtime --tick > "$DROOT/out.json" 2> "$DROOT/err.txt" \
+    || { echo "FAIL: --tick exited non-zero: $(cat "$DROOT/err.txt")" >&2; exit 42; }
+' || fail "(d) subprocess boundary run (see FAIL line above)"
+DJOURNAL="$DTREES/.herd/journal.jsonl"
+[ -f "$DJOURNAL" ] || fail "(d) --tick wrote no journal at $DJOURNAL"
+grep -q '"event":"health_queued".*"pr":77' "$DJOURNAL" \
+  || fail "(d) no health_queued for PR 77 — the reservation did NOT fire across the --tick boundary"
+ls "$DTREES"/.health-inflight-77-* >/dev/null 2>&1 \
+  && fail "(d) PR 77 laid an inflight marker — it claimed the slot main-health needed"
+pass
+echo "PASS (d) subprocess boundary: config-armed MAIN_HEALTH_TICK crosses --tick; PR queued, slot reserved"
 
 printf '\nALL PASS (%d)\n' "$PASS"
