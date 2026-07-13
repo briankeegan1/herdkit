@@ -51,6 +51,39 @@ _journal_in_test_context() {
   return 1
 }
 
+# _journal_path_is_verdict <path> — TRUE when a path-typed value is actually a REVIEWER VERDICT that
+# leaked into a filesystem seam (HERD-360). Two tells, neither of which any legitimate journal path
+# carries: it begins with the literal 'REVIEW:' verdict prefix, or it contains an embedded newline.
+# Cheap + pure (no subshell), so it is safe to call on every _journal_file resolution.
+_journal_path_is_verdict() {
+  case "$1" in
+    "REVIEW:"*) return 0 ;;
+  esac
+  case "$1" in
+    *"
+"*) return 0 ;;   # an embedded newline — a verdict/multiline blob, never a real path
+  esac
+  return 1
+}
+
+# _journal_reject_verdict_path <bad-path> — a verdict-shaped value reached the journal path seam. Point
+# this process's journal at a SAFE per-process fallback (deterministic from $$, never the bad path) and
+# record ONE loud infra_event there naming the offending value (truncated + newline-stripped so it can
+# never itself re-contaminate a path). Idempotent per process via a file-presence check (the redirect
+# variable cannot persist — journal_append runs _journal_impl in a subshell — so the guard is on disk).
+_journal_reject_verdict_path() {
+  _HERD_JOURNAL_VERDICT_REDIRECT="${TMPDIR:-/tmp}/herd-journal-verdict-reject-$$.jsonl"
+  if ! grep -q 'verdict-shaped journal path rejected' "$_HERD_JOURNAL_VERDICT_REDIRECT" 2>/dev/null; then
+    # Neutralize the bad seam INSIDE this subshell (JOURNAL_FILE = the clean fallback, WORKTREES_DIR
+    # empty) so this append resolves straight to the fallback and never re-enters the reject branch.
+    ( JOURNAL_FILE="$_HERD_JOURNAL_VERDICT_REDIRECT" WORKTREES_DIR="" \
+        journal_append infra_event component journal \
+          reason "verdict-shaped journal path rejected (HERD-360) — channel leak, never mkdir'd" \
+          offending "$(printf '%.160s' "$1" | tr '\n' ' ')" ) 2>/dev/null || true
+  fi
+  return 0
+}
+
 # _journal_file — resolve the journal path LAZILY on every call, so a component that sets
 # WORKTREES_DIR after sourcing (the hermetic tests do) still lands in the right place. A test seam,
 # JOURNAL_FILE, overrides the derived path outright. Empty output ⇒ no destination ⇒ caller drops.
@@ -60,18 +93,36 @@ _journal_in_test_context() {
 # (a test inside a worktree sources the committed .herd/config, which pins WORKTREES_DIR to the
 # main checkout's pool). Fail-safe redirect to a throwaway per-process file under TMPDIR instead.
 # Production is byte-identical: the test signals are unset, so the historical path is used.
+#
+# HERD-360 CHANNEL GUARD: a journal path is a FILESYSTEM path; a reviewer VERDICT is not. A severed
+# review prints 'REVIEW: INFRA-FAIL — … (SIGTERM/SIGPIPE) …' to stdout, and a caller that captures that
+# stdout into a path-typed variable (JOURNAL_FILE / WORKTREES_DIR) once fed it straight into the mkdir
+# in _journal_impl — mkdir -p split it at the 'SIGTERM/SIGPIPE' slash and grew a stray dir tree in the
+# shared checkout. REFUSE any resolved path that is verdict-shaped: redirect this process's journal to a
+# safe fallback and record ONE loud infra_event there, so the leak is visible but NEVER becomes a
+# filesystem call. Production paths are never verdict-shaped, so this branch is byte-inert on real lanes.
 _journal_file() {
-  if [ -n "${JOURNAL_FILE:-}" ]; then printf '%s' "$JOURNAL_FILE"; return 0; fi
-  if _journal_in_test_context; then
+  local _jf=""
+  if [ -n "${JOURNAL_FILE:-}" ]; then
+    _jf="$JOURNAL_FILE"
+  elif _journal_in_test_context; then
     # Stable per-process redirect so concurrent appends inside one test land in one file.
     if [ -z "${_HERD_TEST_JOURNAL_REDIRECT:-}" ]; then
       _HERD_TEST_JOURNAL_REDIRECT="${TMPDIR:-/tmp}/herd-test-journal-$$.jsonl"
     fi
-    printf '%s' "$_HERD_TEST_JOURNAL_REDIRECT"
+    _jf="$_HERD_TEST_JOURNAL_REDIRECT"
+  elif [ -n "${WORKTREES_DIR:-}" ]; then
+    _jf="$WORKTREES_DIR/.herd/journal.jsonl"
+  else
+    return 1
+  fi
+  if _journal_path_is_verdict "$_jf"; then
+    _journal_reject_verdict_path "$_jf"
+    printf '%s' "$_HERD_JOURNAL_VERDICT_REDIRECT"
     return 0
   fi
-  [ -n "${WORKTREES_DIR:-}" ] || return 1
-  printf '%s' "$WORKTREES_DIR/.herd/journal.jsonl"
+  printf '%s' "$_jf"
+  return 0
 }
 
 # _journal_max_bytes — rotation threshold. JOURNAL_MAX_BYTES (test seam) wins; else JOURNAL_MAX_MB
