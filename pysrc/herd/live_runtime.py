@@ -146,6 +146,14 @@ class LiveCandidate:
 
 # ── the real journal (journal.sh-identical shapes, best-effort, never raises) ──────────────────────
 
+def _is_verdict_shaped_path(path):
+    """A path-typed value that is actually a REVIEWER VERDICT leaked into a filesystem seam (HERD-360):
+    it begins with the literal ``REVIEW:`` verdict prefix, or it carries an embedded newline. No real
+    journal path does either, so such a value must never reach ``os.makedirs`` — mirrors bash's
+    ``_journal_path_is_verdict``."""
+    return bool(path) and (path.startswith("REVIEW:") or "\n" in path)
+
+
 class LiveJournal:
     """Append-only writer to the REAL ``.herd/journal.jsonl``, in ``journal.sh`` shapes.
 
@@ -157,15 +165,21 @@ class LiveJournal:
     ``None`` is a black hole (every append is a no-op) — the safe default when no destination resolves.
     """
 
+    _verdict_reject_logged = False
+
     def __init__(self, path=None):
         self.path = path
 
     @classmethod
     def resolve_live_path(cls):
         """Resolve the LIVE journal path: ``JOURNAL_FILE`` (the bash engine's own knob) else
-        ``<WORKTREES_DIR>/.herd/journal.jsonl``; ``None`` when neither is set."""
+        ``<WORKTREES_DIR>/.herd/journal.jsonl``; ``None`` when neither is set.
+
+        HERD-360: a ``JOURNAL_FILE`` override that is verdict-shaped (a reviewer verdict captured into a
+        path-typed variable) is DROPPED, not honoured — it falls through to the derived path so a leaked
+        verdict never reaches ``os.makedirs``. ``append`` re-checks belt-and-braces."""
         override = os.environ.get("JOURNAL_FILE")
-        if override:
+        if override and not _is_verdict_shaped_path(override):
             return override
         base = os.environ.get("WORKTREES_DIR")
         if not base:
@@ -176,6 +190,13 @@ class LiveJournal:
         """Append one event. Best-effort + silent — a journal hiccup is never fatal to a tick."""
         try:
             if not self.path:
+                return False
+            # HERD-360 CHANNEL GUARD: never mkdir a verdict-shaped path. A severed-review verdict string
+            # ('REVIEW: INFRA-FAIL — … SIGTERM/SIGPIPE …') that reached a path-typed variable would grow a
+            # stray dir tree at os.makedirs below. Refuse it, record ONE loud infra_event to a safe
+            # fallback, and drop this write. Production paths are never verdict-shaped (byte-inert).
+            if _is_verdict_shaped_path(self.path):
+                self._reject_verdict_path()
                 return False
             items = list(_iter_pairs(list(pairs)))
             items.extend(kv.items())
@@ -190,6 +211,26 @@ class LiveJournal:
             return True
         except Exception:
             return False
+
+    def _reject_verdict_path(self):
+        """Record ONE loud infra_event to a SAFE per-process fallback (never the verdict-shaped path)
+        naming the offending value. Idempotent per process; mirrors bash's _journal_reject_verdict_path."""
+        if LiveJournal._verdict_reject_logged:
+            return
+        LiveJournal._verdict_reject_logged = True
+        try:
+            safe = os.path.join(os.environ.get("TMPDIR") or "/tmp",
+                                "herd-journal-verdict-reject-%d.jsonl" % os.getpid())
+            line = encode_event("infra_event", [
+                ("component", "journal"),
+                ("reason", "verdict-shaped journal path rejected (HERD-360) — channel leak, never mkdir'd"),
+                ("offending", (self.path or "").replace("\n", " ")[:160]),
+            ])
+            if line:
+                with open(safe, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception:
+            pass
 
 
 def _iter_pairs(seq):
