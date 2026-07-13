@@ -286,6 +286,8 @@ MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
 MAIN_HEALTH_TICK	unit	tests/test-main-health-invariant.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-concurrency.sh
 MAIN_HEALTH_RECHECK_MINS	unit	tests/test-main-health-invariant.sh
+AGING_PR_TTL	unit	tests/test-aging-pr-alarm.sh
+aging-pr.sh	unit	tests/test-aging-pr-alarm.sh
 MAIN_HEALTH_AUTOFIX	unit	tests/test-main-health-invariant.sh
 SWEEP_AUTO	unit	tests/test-sweep.sh
 WATCHER_FLAIR	unit	tests/test-watcher-flair.sh

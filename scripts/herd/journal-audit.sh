@@ -82,6 +82,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/human-verify.sh"
 # shellcheck source=/dev/null
 . "$HERE/approvals.sh"
+# AGING-PR alarm (HERD-334) — THE shared TTL helper. Sourced so this auditor reads AGING_PR_TTL through
+# the SAME _aging_pr_ttl_secs getter the watcher render pass uses: the gates_passed_no_merge finding
+# below and the render row can never disagree on the threshold. Defines functions only; no side effects.
+# shellcheck source=/dev/null
+. "$HERE/aging-pr.sh"
 
 # ── ship-dormant gate ────────────────────────────────────────────────────────
 _ja_enabled() {
@@ -118,12 +123,15 @@ RED_TTL="$(_num_or "${JOURNAL_AUDIT_RED_TTL:-}" 7200)"
 MERGE_GRACE="$(_num_or "${JOURNAL_AUDIT_MERGE_GRACE:-}" 600)"
 PUSHED_GRACE="$(_num_or "${JOURNAL_AUDIT_PUSHED_GRACE:-}" 1800)"
 FIXTURE_SLUGS="${HERD_JOURNAL_AUDIT_FIXTURE_SLUGS:-retiree conv stuck hd}"
+# AGING-PR TTL in seconds via the SHARED getter (HERD-334): the ONE source of the threshold, sanitized
+# (non-numeric → default 3600). 0 disables the gates_passed_no_merge finding (leg c goes byte-inert).
+AGING_PR_TTL_SECS="$(_aging_pr_ttl_secs)"
 
 # ── replay: pure python scanner → one finding line per violation ─────────────
 # Each stdout line:  kind\tkey\tsummary
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
 #        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked |
-#        checkout_unclean
+#        checkout_unclean | gates_passed_no_merge
 # key is a stable dedup token; summary is a short human phrase for the inbox row.
 # shellcheck disable=SC2016
 FINDINGS="$(
@@ -136,6 +144,7 @@ FINDINGS="$(
   MERGE_GRACE="$MERGE_GRACE" \
   PUSHED_GRACE="$PUSHED_GRACE" \
   FIXTURE_SLUGS="$FIXTURE_SLUGS" \
+  AGING_PR_TTL="$AGING_PR_TTL_SECS" \
   python3 - <<'PY'
 import json, os, re, sys
 from datetime import datetime, timezone
@@ -176,6 +185,7 @@ refix_ttl = int(os.environ.get("REFIX_TTL") or 300)
 red_ttl = int(os.environ.get("RED_TTL") or 7200)
 merge_grace = int(os.environ.get("MERGE_GRACE") or 600)
 pushed_grace = int(os.environ.get("PUSHED_GRACE") or 1800)
+aging_pr_ttl = int(os.environ.get("AGING_PR_TTL") or 3600)
 fixtures = set((os.environ.get("FIXTURE_SLUGS") or "retiree conv stuck hd").split())
 
 now = now_dt()
@@ -323,6 +333,40 @@ for r in reds:
         summary = "MAIN RED older than TTL · sha=%s failed=%s" % (
             (sha[:8] if sha else "?"), str(r.get("failed") or r.get("detail") or "")[:60])
         findings.append(("red_state_stale", key, summary))
+
+# ── (k) gates passed but no merge older than TTL (HERD-334) ──────────────────
+# A `gate_status` (state=success, context=herd/gates) event is the engine's marker for "all gates
+# passed / herd/gates=success" — journaled by bash post_gate_status and the python actuator on the
+# successful commit-status API write. The python engine core additionally journals event=blessing,
+# state=success, context=herd/gates — once per pr+sha the instant a PR reaches BLESSED, BEFORE the
+# hold/merge decision and regardless of GATE_STATUS. Both markers are accepted below — no other
+# event marks gates-passed. The context guard tolerates an absent field but excludes any future
+# non-gates status context; herd/gates mirrors GATE_STATUS_CONTEXT, a deliberate constant in
+# agent-watch.sh that is not a config key, so naming it here cannot drift.
+# When branch protection then keeps blocking the merge on a required CI check, the PR sits
+# engine-approved-but-unmerged with nothing progressing — the exact silent state PRs #440/#441 sat in
+# for 7h. A later `merge` for the same pr clears it (any sha — a merge merges the PR). Past AGING_PR_TTL
+# with no such merge → a gates_passed_no_merge finding. Shares the render pass's AGING_PR_TTL threshold
+# (aging-pr.sh); 0 disables this leg. Advisory only — the auditor never merges or clears anything.
+if aging_pr_ttl > 0:
+    blessings = [e for e in events
+                 if e.get("event") in ("gate_status", "blessing")
+                 and str(e.get("state") or "") == "success"
+                 and str(e.get("context") or "herd/gates") == "herd/gates"]
+    for b in blessings:
+        if age_secs(now, b["_ts"]) < aging_pr_ttl:
+            continue
+        pr = b.get("pr")
+        # Cleared by a later merge for the same pr (a blessing is per-(pr,sha), but the merge that
+        # clears it may land on a newer sha — so match on pr, not sha).
+        if pr is not None and any(m.get("pr") is not None and str(m.get("pr")) == str(pr)
+                                  and m["_ts"] >= b["_ts"] for m in merges):
+            continue
+        sha = str(b.get("sha") or "")
+        key = "gates_passed_no_merge|pr=%s|sha=%s" % (pr if pr is not None else "", sha)
+        summary = "engine-approved but unmerged past TTL · pr=%s sha=%s — blocked on a required check?" % (
+            pr if pr is not None else "?", (sha[:8] if sha else "?"))
+        findings.append(("gates_passed_no_merge", key, summary))
 
 # ── (e) pushed=no never followed by pushed=yes ──────────────────────────────
 # Match codemap_refresh / symbol_index_refresh (and any event carrying pushed=no).
