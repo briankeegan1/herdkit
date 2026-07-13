@@ -32,6 +32,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               _main_health_pending,
                                WAIT, PENDING,
                                branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
 
@@ -1381,6 +1382,152 @@ class TestPreDispatchWorktreeGuard(unittest.TestCase):
         self.assertEqual(g.health(c), WAIT)
         self.assertEqual(dispatched, ["9"])
         self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
+
+
+def _git_init_repo(path):
+    """Create a bare-minimum git repo with one commit; return the HEAD SHA."""
+    os.makedirs(path, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", path], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.email", "t@test"], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.name", "t"], check=True)
+    open(os.path.join(path, "f"), "w").write("x")
+    subprocess.run(["git", "-C", path, "add", "f"], check=True)
+    subprocess.run(["git", "-C", path, "commit", "-q", "-m", "init"], check=True)
+    return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"]).decode().strip()
+
+
+class TestMainHealthSlotPriority(unittest.TestCase):
+    """HERD-359 regression: PR health must never starve main-health when HEALTH_CONCURRENCY=1.
+
+    _main_health_pending() is the sentinel; LiveGates.health() reserves a slot when it is True."""
+
+    def setUp(self):
+        self._orig_env = {}
+        for k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
+            self._orig_env[k] = os.environ.pop(k, None)
+        import tempfile as _t
+        self.tmp = _t.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _main_repo(self):
+        p = os.path.join(self.tmp, "main")
+        sha = _git_init_repo(p)
+        os.environ["MAIN"] = p
+        return p, sha
+
+    def _make_gates(self, jpath):
+        """LiveGates wired to self.tmp as state dir."""
+        state = LiveState(state_dir=self.tmp)
+        state.dir = self.tmp
+        journal = LiveJournal(jpath)
+        return LiveGates("/nonexistent-home", state, journal, config={"HEALTH_CONCURRENCY": "1"})
+
+    # ── _main_health_pending unit tests ───────────────────────────────────────────────────────────
+
+    def test_off_by_default(self):
+        """MAIN_HEALTH_TICK unset → False (byte-inert)."""
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_off_explicit(self):
+        os.environ["MAIN_HEALTH_TICK"] = "off"
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_no_state_dir(self):
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self.assertFalse(_main_health_pending(None))
+
+    def test_no_main_env(self):
+        """Neither MAIN nor PROJECT_ROOT set → False (fail-safe, never blocks the PR rail)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_project_root_fallback(self):
+        """MAIN unset (a plain var in agent-watch.sh, it never crosses the --tick subprocess
+        boundary) → the exported PROJECT_ROOT resolves the main checkout (HERD-345 precedent)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        p = os.path.join(self.tmp, "main")
+        _git_init_repo(p)
+        os.environ["PROJECT_ROOT"] = p
+        self.assertTrue(_main_health_pending(self.tmp))
+
+    def test_truthy_set_matches_bash(self):
+        """The truthy set matches bash _main_health_enabled (1|true|on|yes|enable|enabled) —
+        a value that arms the bash reconcile must also arm the python-side reservation."""
+        self._main_repo()
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "Enabled"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertTrue(_main_health_pending(self.tmp), "expected pending for %r" % v)
+        for v in ("off", "0", "no", "false", "bogus"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertFalse(_main_health_pending(self.tmp), "expected off for %r" % v)
+
+    def test_pending_when_no_markers(self):
+        """MAIN_HEALTH_TICK=on, valid MAIN, no markers → True (main-health needs a slot)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self._main_repo()
+        self.assertTrue(_main_health_pending(self.tmp))
+
+    def test_false_when_run_once_marker_exists(self):
+        """Run-once marker present → this sha already has a verdict → not pending."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        open(os.path.join(self.tmp, ".main-health-" + sha), "w").close()
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_false_when_live_inflight(self):
+        """A live in-flight marker for this sha → already dispatched → not pending."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        inflight = os.path.join(self.tmp, ".health-inflight-main-" + sha)
+        _marker_write(inflight, os.getpid())
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    # ── LiveGates.health() slot reservation tests ─────────────────────────────────────────────────
+
+    def test_pr_health_waits_when_main_pending(self):
+        """With HEALTH_CONCURRENCY=1 and main-health pending, no PR health starts (slot reserved)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self._main_repo()
+        _make_worktree(self.tmp, "feat-1")
+        cand = LiveCandidate(pr=1, sha="abc123", slug="feat-1",
+                             worktree=os.path.join(self.tmp, "feat-1"))
+        jpath = os.path.join(self.tmp, "j1.jsonl")
+        gates = self._make_gates(jpath)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        # No inflight marker must exist for this PR (dispatch must not have happened).
+        inflight = os.path.join(self.tmp, ".health-inflight-1-abc123")
+        self.assertFalse(os.path.exists(inflight), "PR health must not lay inflight marker when main-health is pending")
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(len(queued), 1, "health_queued must be journaled for the deferred PR")
+
+    def test_pr_health_proceeds_when_main_done(self):
+        """Main-health done (run-once marker written) → PR health proceeds past the slot check."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        open(os.path.join(self.tmp, ".main-health-" + sha), "w").close()
+        _make_worktree(self.tmp, "feat-2")
+        cand = LiveCandidate(pr=2, sha="def456", slug="feat-2",
+                             worktree=os.path.join(self.tmp, "feat-2"))
+        jpath = os.path.join(self.tmp, "j2.jsonl")
+        gates = self._make_gates(jpath)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        # With no PR inflight and main-health done, the slot check passes — no health_queued event.
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(queued, [], "health_queued must NOT be emitted when main-health slot is free")
 
 
 if __name__ == "__main__":

@@ -1113,12 +1113,43 @@ MHSTUB
     _MH_OK=0
   fi
 
+  # (c) SLOT STARVATION (HERD-359): a live PR health check occupies the slot when reconcile_main_health
+  #     is called. The invariant: no-slot is a WAIT, not a skip — main-health defers once and dispatches
+  #     the MOMENT the slot is free on the next "tick" call.
+  printf 'green\n' > "$_mh_mode"
+  printf 'starvation probe commit\n' >> "$_mh_repo/README.md"
+  git -C "$_mh_repo" commit -q -am "Merge pull request #4244 from other/seat"
+  _mh_sha3="$(git -C "$_mh_repo" rev-parse HEAD)"
+  # Plant a live PR-health inflight holder (current test PID stays alive for the duration).
+  _mh_holder="$_mh_trees/.health-inflight-9999-deadbeef0000000000000000000000000000000000"
+  printf '%s\n' "$$" > "$_mh_holder"
+  # Call reconcile — slot occupied by holder → expect deferral (infra_event reason=no-slot).
+  _mh_ni_before="$(_mh_count '"infra_event"')"
+  reconcile_main_health
+  _mh_ni_after="$(_mh_count '"infra_event"')"
+  _mh_deferred=$(( _mh_ni_after - _mh_ni_before ))
+  # Remove holder (simulating the PR suite completing) → next reconcile must dispatch.
+  rm -f "$_mh_holder"
+  _mh_nd_before="$(_mh_count '"result":"dispatched"')"
+  reconcile_main_health
+  _mh_settle
+  _mh_nd_after="$(_mh_count '"result":"dispatched"')"
+  _mh_disp3=$(( _mh_nd_after - _mh_nd_before ))
+  _mh_green3="$(_mh_count '"result":"green"')"
+  if [ "$_mh_deferred" -ge 1 ] && [ "$_mh_disp3" -ge 1 ] && [ "$_mh_green3" -ge 3 ]; then
+    checkpoint main_health_slot_starvation pass "slot starvation: no-slot deferred (deferred=$_mh_deferred) then dispatched (disp=$_mh_disp3 green=$_mh_green3) — no-slot is a WAIT not a SKIP"
+  else
+    checkpoint main_health_slot_starvation fail "slot starvation invariant broken: expected >=1 deferral then dispatch+verdict (deferred=$_mh_deferred disp=$_mh_disp3 green=$_mh_green3)"
+    _MH_OK=0
+  fi
+
   MAIN="$_mh_sv_main"; TREES="$_mh_sv_trees"; export WORKTREES_DIR="$_mh_sv_wt"
   export HERD_HEALTHCHECK_BIN="$_mh_sv_hc"; MAIN_HEALTH_TICK="$_mh_sv_tick"
   MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"; MAIN_HEALTH_FIX_STATE="$_mh_sv_fix"
 else
   checkpoint main_health_observed_dispatch fail "reconcile_main_health not defined (lib-mode source did not expose the tick reconcile)"
   checkpoint main_health_kill_redispatch   fail "reconcile_main_health not defined"
+  checkpoint main_health_slot_starvation  fail "reconcile_main_health not defined"
   _MH_OK=0
 fi
 

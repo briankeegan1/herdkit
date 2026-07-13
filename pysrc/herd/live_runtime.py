@@ -224,6 +224,48 @@ def _count_live_inflight(state_dir, prefix):
     return n
 
 
+def _main_health_pending(state_dir):
+    """True iff the current main branch HEAD needs a health slot — no verdict yet and no live suite.
+
+    HERD-359: when True the PR health slot check MUST reserve capacity for bash's
+    ``reconcile_main_health`` (Phase C). PR candidates MUST NOT claim the last slot when main-health
+    is pending: doing so starves the default-branch suite indefinitely when back-to-back PRs keep the
+    single HEALTH_CONCURRENCY=1 slot occupied between every pair of ticks.
+
+    Fail-safe: any exception returns False so a misconfigured env never blocks the PR rail.
+    Mirrors bash ``_main_health_enabled`` + ``reconcile_main_health`` guard
+    (agent-watch.sh:5656, :5962)."""
+    try:
+        # Same truthy set as bash _main_health_enabled (1|true|on|yes|enable|enabled) — a value that
+        # arms the bash reconcile must also arm the reservation, or the two seats disagree per tick.
+        tick = os.environ.get("MAIN_HEALTH_TICK", "off").lower()
+        if tick not in ("1", "true", "on", "yes", "enable", "enabled"):
+            return False
+        # MAIN is a plain (unexported) shell var in agent-watch.sh — it never crosses the
+        # `--tick` subprocess boundary; fall back to the exported PROJECT_ROOT (HERD-345),
+        # exactly like _dispatch_health below.
+        main_dir = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+        if not main_dir or not state_dir:
+            return False
+        out = subprocess.check_output(
+            ["git", "-C", main_dir, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        )
+        sha = out.decode().strip()
+        if len(sha) != 40:
+            return False
+        # Run-once marker: this sha already has a collected verdict.
+        if os.path.exists(os.path.join(state_dir, ".main-health-" + sha)):
+            return False
+        # Live in-flight marker: a worker is already dispatched for this sha.
+        inflight = os.path.join(state_dir, ".health-inflight-main-" + sha)
+        if os.path.exists(inflight) and _marker_live(inflight):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 # ── the shared on-disk gate contract ($TREES) — sha-keyed ledgers + in-flight markers ─────────────
 # The gate rails are ASYNC dispatch/collect state machines whose truth lives in flat files under the
 # watcher's state dir ``$TREES`` (== ``$WORKTREES_DIR``): the review ledger, the sha-keyed verdict/health
@@ -1177,7 +1219,13 @@ class LiveGates:
         #     Dead markers are not counted — a crashed worker never wedges a slot (mirrors bash's
         #     ``_count_live_healthchecks`` / ``_health_slot_free``, agent-watch.sh:10297,10311).
         _hc_n = _count_live_inflight(st.dir, ".health-inflight")
-        if _hc_n >= self._health_max:
+        # HERD-359: if the default-branch sha is unverified and not yet in-flight, reserve one slot
+        # so bash's reconcile_main_health (Phase C) always finds capacity within the same tick.
+        # With HEALTH_CONCURRENCY=1 this collapses the effective limit to 0 — no new PR health suite
+        # starts until main-health is dispatched. Fail-safe: _main_health_pending returns False on
+        # any env error (missing MAIN, no git, etc.) so a misconfigured seat never blocks the PR rail.
+        _effective_max = self._health_max - (1 if _main_health_pending(st.dir) else 0)
+        if _hc_n >= _effective_max:
             self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                 "inflight", _hc_n, "limit", self._health_max)
             return WAIT
