@@ -1020,6 +1020,11 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   _mf_saved_main="$MAIN"; _mf_saved_remote="$HERD_REMOTE"; _mf_saved_branch="$HERD_BRANCH_NAME"
   MAIN="$_mf_main"; HERD_REMOTE=origin; HERD_BRANCH_NAME=main
   _mf_journal="$TREES/.herd/journal.jsonl"
+  # PIN the journal onto the path this leg greps (restored below). Without the pin, running this sim
+  # INSIDE bats (HERD-331 wires it into herd.bats) trips journal.sh's HERD-223 test-context guard
+  # (BATS_TEST_* set, JOURNAL_FILE not) and every journal_append silently redirects to a $TMPDIR
+  # per-process file — the ff succeeds but main_ff reads 0→0 (the false-red this pin prevents).
+  _mf_saved_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$_mf_journal"
   # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
   _mf_ff_count() { local c; c="$(grep -c '"event":"main_ff"' "$_mf_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
   _mf_ff_before="$(_mf_ff_count)"
@@ -1056,6 +1061,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
 
   rm -f "$TREES/.agent-watch-main-freshness" "$TREES/.agent-watch-main-restart" 2>/dev/null || true
   MAIN="$_mf_saved_main"; HERD_REMOTE="$_mf_saved_remote"; HERD_BRANCH_NAME="$_mf_saved_branch"
+  if [ -n "$_mf_saved_jf" ]; then export JOURNAL_FILE="$_mf_saved_jf"; else unset JOURNAL_FILE; fi
 else
   checkpoint main_freshness_ff       fail "reconcile_main_freshness not defined (lib-mode source did not expose the tick reconcile)"
   checkpoint main_freshness_no_guess fail "reconcile_main_freshness not defined"
@@ -1106,6 +1112,10 @@ MHSTUB
   MAIN_HEALTH_DEFER="$_mh_trees/.agent-watch-main-health-defer"
   MAIN_HEALTH_FIX_STATE="$_mh_trees/.agent-watch-main-health-fix"
   _mh_journal="$_mh_trees/.herd/journal.jsonl"
+  # PIN the journal onto the fixture path this leg greps (restored below) — same HERD-223/bats
+  # redirect hazard as the mainfresh leg above: without JOURNAL_FILE exported, journal_append under
+  # bats writes to a $TMPDIR per-process file and every dispatch/verdict/defer count reads 0.
+  _mh_sv_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$_mh_journal"
   # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
   _mh_count() { local c; c="$(grep -c "$1" "$_mh_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
   # _mh_settle — await the backgrounded suite's result (bounded), then collect it, as the tick top does.
@@ -1193,6 +1203,7 @@ MHSTUB
   MAIN="$_mh_sv_main"; TREES="$_mh_sv_trees"; export WORKTREES_DIR="$_mh_sv_wt"
   export HERD_HEALTHCHECK_BIN="$_mh_sv_hc"; MAIN_HEALTH_TICK="$_mh_sv_tick"
   MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"; MAIN_HEALTH_FIX_STATE="$_mh_sv_fix"
+  if [ -n "$_mh_sv_jf" ]; then export JOURNAL_FILE="$_mh_sv_jf"; else unset JOURNAL_FILE; fi
 else
   checkpoint main_health_observed_dispatch fail "reconcile_main_health not defined (lib-mode source did not expose the tick reconcile)"
   checkpoint main_health_kill_redispatch   fail "reconcile_main_health not defined"
