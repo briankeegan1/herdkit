@@ -9,8 +9,9 @@
 #       to the default branch (message "chore: refresh symbol-index after PR #N"), scoped to
 #       docs/symbol-index.md, pushed ff-safe; journals result=committed pushed=yes
 #   (3) FRESH: the regen matches the committed index → NO commit, tree clean; journals result=fresh
-#   (4) DIRTY PATH: docs/symbol-index.md already carries an uncommitted change → skip untouched;
-#       journals result=skipped reason=dirty-path
+#   (4) DIRTY DERIVED (HERD-336): docs/symbol-index.md already carries an uncommitted change (a
+#       stranded regeneration, NOT a human edit) → ABSORB it into the regen commit rather than skip
+#       forever; journals result=absorbing reason=dirty-derived then result=committed pushed=yes
 #   (5) NOT ADOPTED: no committed docs/symbol-index.md → skip, never materialize one; result=skipped no-index
 #
 # Sources agent-watch.sh in lib mode (AGENT_WATCH_LIB=1) and drives refresh_symbol_index directly
@@ -104,13 +105,14 @@ CODEMAP_AUTOREFRESH=true refresh_symbol_index 8
 jhas 'result fresh'                           || fail "(3) did not journal fresh: $(cat "$JLOG")"
 ok
 
-# ── (4) DIRTY PATH → skip, never touch a concurrent writer's edit ─────────────────────────────────
-: > "$JLOG"; printf 'HAND-EDIT IN FLIGHT\n' > "$MAIN/docs/symbol-index.md"; STUB_INDEX="INDEX v3"; c0="$(commits)"
+# ── (4) DIRTY DERIVED → ABSORB the stranded regen into the refresh commit (HERD-336) ──────────────
+: > "$JLOG"; printf 'STRANDED REGEN\n' > "$MAIN/docs/symbol-index.md"; STUB_INDEX="INDEX v3"; c0="$(commits)"
 CODEMAP_AUTOREFRESH=true refresh_symbol_index 9
-[ "$(commits)" = "$c0" ]                         || fail "(4) DIRTY created a commit — must skip"
-[ "$(idxfile_content)" = "HAND-EDIT IN FLIGHT" ] || fail "(4) DIRTY was overwritten by the regen — must skip untouched"
-jhas 'result skipped reason dirty-path'          || fail "(4) did not journal skipped/dirty-path: $(cat "$JLOG")"
-git -C "$MAIN" checkout -- docs/symbol-index.md   # restore clean state for (5)
+[ "$(commits)" = "$((c0 + 1))" ]           || fail "(4) DIRTY-DERIVED did not absorb into one commit"
+[ "$(idxfile_content)" = "INDEX v3" ]      || fail "(4) DIRTY-DERIVED not regenerated fresh (got: $(idxfile_content))"
+[ -z "$(git -C "$MAIN" status --porcelain)" ] || fail "(4) DIRTY-DERIVED left the tree dirty after absorb"
+jhas 'result absorbing reason dirty-derived' || fail "(4) did not journal absorbing/dirty-derived: $(cat "$JLOG")"
+jhas 'result committed pushed yes'         || fail "(4) absorbed change was not committed: $(cat "$JLOG")"
 ok
 
 # ── (5) NOT ADOPTED (no committed index) → skip, never materialize one ────────────────────────────

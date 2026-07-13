@@ -4923,6 +4923,92 @@ reconcile_backlog() {
   return 0
 }
 
+# ── Post-merge refresh SERIALIZATION + detached-HEAD guard (HERD-336) ─────────────────────────────
+# The codemap/symbol-index refresh legs (refresh_codemap / refresh_symbol_index) each run a
+# pull→regenerate→commit→push sequence against the SHARED coordinator checkout ($MAIN). Two legs ~30s
+# apart (two merges) once ran concurrently: the second started mid-rebase of the first, committed two
+# refresh commits onto a DETACHED HEAD, and left $MAIN detached until a later human `git pull` failed
+# with `not on a branch`. These helpers make the leg SERIAL per-checkout and REFUSE to commit on a
+# detached HEAD (reconciling the invariant "shared checkout always attached, derived docs committed or
+# untouched" on every refresh run, not just the happy path). Fully fail-soft: a lock that cannot be
+# acquired = skip + journal, never a red row or a hung watcher.
+
+# _refresh_lock_file — the per-checkout refresh lock path. Lives inside $MAIN's own git dir so it is
+# (a) per-checkout ON DISK — any seat's watcher/merge that refreshes the SAME shared checkout contends
+# for the SAME file, even across seats whose $TREES differ — and (b) never committed (git ignores its
+# own dir). Fail-soft derivation: `--absolute-git-dir` else a plain $MAIN/.git fallback.
+_refresh_lock_file() {
+  local _gd
+  _gd="$(git -C "$MAIN" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$_gd" ] || _gd="$MAIN/.git"
+  printf '%s/herd-refresh.lock' "$_gd"
+}
+
+# _refresh_run_locked <body-fn> — run <body-fn> holding the per-checkout refresh lock so concurrent
+# refresh legs SERIALIZE against the shared checkout. NON-BLOCKING: if a live leg already holds the
+# lock, <body-fn> is NOT run and this returns 1 — the caller journals a skip, which is correct because
+# the winning leg's regeneration is fresh (a second regen would be redundant). Returns 0 when the body
+# ran. Fail-soft: a lock left by a CRASHED leg (mutex older than the 10-minute stale cap) is stolen
+# once. A plain atomic-mkdir mutex (works with no flock(1) — the macOS default), released explicitly
+# on return; the body only has file/git side effects, so running it inline needs no subshell.
+_refresh_run_locked() {
+  local _rl_body="$1" _rl_dir _rl_took=""
+  _rl_dir="$(_refresh_lock_file).d"
+  mkdir -p "$(dirname "$_rl_dir")" 2>/dev/null || true
+  if mkdir "$_rl_dir" 2>/dev/null; then
+    _rl_took=1
+  elif [ -z "$(find "$_rl_dir" -prune -mmin -10 2>/dev/null)" ]; then
+    # Holder mutex older than 10 min → a crashed leg. Steal it once (the mutex, not a live process).
+    rm -rf "$_rl_dir" 2>/dev/null || true
+    mkdir "$_rl_dir" 2>/dev/null && _rl_took=1
+  fi
+  [ -n "$_rl_took" ] || return 1        # a live leg holds it — skip (the winner's regen is fresh)
+  printf '%s\n' "$$" > "$_rl_dir/pid" 2>/dev/null || true   # diagnostic only; never load-bearing
+  "$_rl_body"
+  rm -rf "$_rl_dir" 2>/dev/null || true
+  return 0
+}
+
+# _main_head_attached — success iff $MAIN's HEAD is the default branch (attached, not detached). The
+# read-only predicate every refresh commit consults before it writes.
+_main_head_attached() {
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-main}" ]
+}
+
+# _journal_main_detached <result> [head] — one `main_detached` audit breadcrumb (result=detected on
+# discovery, result=reattached after a successful reattach). journal-audit.sh surfaces a `detected`
+# that no later `reattached` clears (a shared checkout that sat detached — the HERD-336 corpse).
+_journal_main_detached() {
+  journal_append main_detached head "${2:-}" branch "${HERD_BRANCH_NAME:-main}" result "${1:-detected}"
+}
+
+# _reattach_default_branch — best-effort: abort any in-progress rebase and reattach $MAIN to the
+# default branch, aligning to origin. The only thing that can be lost is a regenerable derived map
+# committed on the detached HEAD — cheap to redo. Fail-soft; returns the resulting attach status.
+_reattach_default_branch() {
+  local _rb="${HERD_BRANCH_NAME:-main}" _ru="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+  git -C "$MAIN" checkout --quiet --force "$_rb" >/dev/null 2>&1 \
+    || git -C "$MAIN" symbolic-ref HEAD "refs/heads/$_rb" >/dev/null 2>&1 || true
+  if git -C "$MAIN" rev-parse --verify --quiet "$_ru" >/dev/null 2>&1; then
+    git -C "$MAIN" reset --hard "$_ru" >/dev/null 2>&1 || true
+  fi
+  _main_head_attached
+}
+
+# _refresh_guard_attached — the refresh legs' commit gate. Success (0) when HEAD is safely on the
+# default branch (silent on the happy path). On a DETACHED HEAD it journals main_detached, reattaches
+# loudly, and returns 1 so the caller REFUSES to commit its refresh (the regen is cheap to redo).
+_refresh_guard_attached() {
+  _main_head_attached && return 0
+  local _h; _h="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  _journal_main_detached detected "$_h"
+  if _reattach_default_branch; then
+    _journal_main_detached reattached "$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  return 1
+}
+
 # refresh_codemap <pr#> [provenance] — POST-MERGE codemap freshness hook (best-effort, NEVER
 # blocks/fails the merge). After a PR lands on the default branch and $MAIN is fast-forwarded,
 # regenerate the committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan
@@ -4936,11 +5022,14 @@ reconcile_backlog() {
 # tick-level reconcile (HERD-218) passes `reconcile` so out-of-band merges are auditable.
 #
 # Gated by CODEMAP_AUTOREFRESH: off → byte-inert (we never run the scan, never touch the tree).
-# Race-guarded three ways: (1) only when the project has already ADOPTED the codemap (the committed
-# docs/codemap.md exists — never materialize a new one); (2) skip if that path already carries an
-# uncommitted change (a concurrent writer owns it this tick — never clobber or bundle their edit);
-# (3) codemap.sh rewrites the file ONLY when content changed, so a clean tree after regen = fresh,
-# nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
+# Race-guarded four ways: (1) only when the project has already ADOPTED the codemap (the committed
+# docs/codemap.md exists — never materialize a new one); (2) HERD-336: the whole regenerate→commit→push
+# leg SERIALIZES per-checkout (_refresh_run_locked) so two concurrent legs can never race the shared
+# checkout's rebase; a lock held by a live leg → skip; (3) a PRE-EXISTING dirty docs/codemap.md is a
+# stranded regeneration (the map is engine-generated, so under the lock it is never a concurrent human
+# edit) → ABSORB it into this regen commit rather than skip forever; (4) codemap.sh rewrites the file
+# ONLY when content changed, so a clean tree after regen = fresh, nothing to commit. The commit is
+# scoped to docs/codemap.md alone, and NEVER lands on a detached HEAD (_refresh_guard_attached).
 # HERD-159: unrecognized values fail soft toward ACTIVE via _codemap_auto (cosmetic key).
 refresh_codemap() {
   local rc_pr="${1:-}" rc_prov="${2:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh" rc_msg
@@ -4959,43 +5048,72 @@ refresh_codemap() {
   esac
   [ -f "$rc_script" ]      || { _rc_j result skipped reason no-script;  return 0; }
   [ -f "$MAIN/$rc_out" ]   || { _rc_j result skipped reason no-codemap; return 0; }
-  # A pending change already on docs/codemap.md means someone else is mid-edit — leave it alone.
-  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    _rc_j result skipped reason dirty-path; return 0
+  # HERD-336 (a): SERIALIZE the whole regenerate→commit→push leg per checkout. The cheap guards above
+  # stay OUTSIDE the lock so OFF and an unadopted repo remain byte-inert and take on no lock churn.
+  _rc_body() {
+    # HERD-336 (b): a PRE-EXISTING dirty docs/codemap.md is NOT a concurrent human edit — the map is
+    # engine-generated, and under the serialization lock no other refresh leg can own it. It is a
+    # stranded regeneration from a crashed/detached leg; ABSORB it into this regeneration commit
+    # rather than skipping forever (the old dirty-path skip stranded it — the live symbol-index corpse).
+    if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+      _rc_j result absorbing reason dirty-derived
+    fi
+    # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+    if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
+      _rc_j result error reason regen-failed; return 0
+    fi
+    # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
+    if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+      _rc_j result fresh; return 0
+    fi
+    # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
+    # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+    if [ -n "$rc_pr" ]; then
+      rc_msg="chore: refresh codemap after PR #${rc_pr}"
+    elif [ "$rc_prov" = "reconcile" ]; then
+      rc_msg="chore: refresh codemap (reconcile)"
+    else
+      rc_msg="chore: refresh codemap"
+    fi
+    # HERD-336 (b): NEVER commit onto a detached HEAD (the refresh-race corpse). Journal it, reattach
+    # the default branch, and skip — the regeneration is cheap to redo on a later tick.
+    if ! _refresh_guard_attached; then
+      _rc_j result skipped reason detached-head pushed no; return 0
+    fi
+    if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
+      _rc_j result error reason commit-failed; return 0
+    fi
+    if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      _rc_j result committed pushed yes; return 0
+    fi
+    # Push rejected → rebase once and retry. HERD-336: a rebase-pull can leave HEAD detached — verify
+    # attachment BEFORE the retry push, and reattach (never HEAD~1-reset a detached HEAD, which would
+    # strand the branch) if it did.
+    if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      if _main_head_attached; then
+        if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+          _rc_j result committed pushed yes-after-rebase; return 0
+        fi
+      else
+        _refresh_guard_attached || true
+        _rc_j result error reason detached-head pushed no; return 0
+      fi
+    fi
+    if ! _main_head_attached; then
+      _refresh_guard_attached || true
+      _rc_j result error reason detached-head pushed no; return 0
+    fi
+    git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+    # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+    # never drifts ahead of origin. The map is regenerable — not committing is byte-safe. A stranded
+    # commit here would permanently diverge the seat and make herd update die on ff-only forever.
+    git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+    _rc_j result error reason push-rejected pushed no
+    return 0
+  }
+  if ! _refresh_run_locked _rc_body; then
+    _rc_j result skipped reason locked
   fi
-  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
-  if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
-    _rc_j result error reason regen-failed; return 0
-  fi
-  # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
-  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    _rc_j result fresh; return 0
-  fi
-  # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
-  # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if [ -n "$rc_pr" ]; then
-    rc_msg="chore: refresh codemap after PR #${rc_pr}"
-  elif [ "$rc_prov" = "reconcile" ]; then
-    rc_msg="chore: refresh codemap (reconcile)"
-  else
-    rc_msg="chore: refresh codemap"
-  fi
-  if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
-    _rc_j result error reason commit-failed; return 0
-  fi
-  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rc_j result committed pushed yes; return 0
-  fi
-  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
-     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rc_j result committed pushed yes-after-rebase; return 0
-  fi
-  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
-  # never drifts ahead of origin. The map is regenerable — not committing is byte-safe. A stranded
-  # commit here would permanently diverge the seat and make herd update die on ff-only forever.
-  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
-  _rc_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5007,10 +5125,13 @@ refresh_codemap() {
 # non-zero into do_merge. Optional <provenance> mirrors refresh_codemap (HERD-218 reconcile path).
 #
 # Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
-# and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
-# (the committed docs/symbol-index.md exists — never materialize a new one); (2) skip if that path
-# already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
-# changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
+# and the same guards as refresh_codemap: (1) only when the project has ADOPTED the index (the committed
+# docs/symbol-index.md exists — never materialize a new one); (2) HERD-336: the whole regenerate→commit→
+# push leg SERIALIZES per-checkout so concurrent legs never race the shared rebase (lock held → skip);
+# (3) a PRE-EXISTING dirty docs/symbol-index.md is a stranded regeneration → ABSORB it into this regen
+# commit rather than skip forever; (4) symbol-index.sh rewrites the file ONLY when content changed, so a
+# clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md; never commits onto
+# a detached HEAD (_refresh_guard_attached).
 refresh_symbol_index() {
   local rs_pr="${1:-}" rs_prov="${2:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh" rs_msg
   _rs_j() {
@@ -5026,43 +5147,68 @@ refresh_symbol_index() {
   esac
   [ -f "$rs_script" ]    || { _rs_j result skipped reason no-script; return 0; }
   [ -f "$MAIN/$rs_out" ] || { _rs_j result skipped reason no-index;  return 0; }
-  # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
-  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    _rs_j result skipped reason dirty-path; return 0
+  # HERD-336 (a): SERIALIZE the whole regenerate→commit→push leg per checkout (cheap guards above stay
+  # outside the lock so OFF / an unadopted repo remain byte-inert).
+  _rs_body() {
+    # HERD-336 (b): ABSORB a PRE-EXISTING dirty docs/symbol-index.md (a stranded regeneration from a
+    # crashed/detached leg — the map is engine-generated, so under the lock it is never a human edit)
+    # into this regeneration commit rather than skipping forever.
+    if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+      _rs_j result absorbing reason dirty-derived
+    fi
+    # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+    if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
+      _rs_j result error reason regen-failed; return 0
+    fi
+    # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
+    if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+      _rs_j result fresh; return 0
+    fi
+    # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
+    # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+    if [ -n "$rs_pr" ]; then
+      rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
+    elif [ "$rs_prov" = "reconcile" ]; then
+      rs_msg="chore: refresh symbol-index (reconcile)"
+    else
+      rs_msg="chore: refresh symbol-index"
+    fi
+    # HERD-336 (b): NEVER commit onto a detached HEAD; journal, reattach, skip (regen is cheap to redo).
+    if ! _refresh_guard_attached; then
+      _rs_j result skipped reason detached-head pushed no; return 0
+    fi
+    if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
+      _rs_j result error reason commit-failed; return 0
+    fi
+    if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      _rs_j result committed pushed yes; return 0
+    fi
+    # Push rejected → rebase once and retry; verify HEAD attachment before the retry push (HERD-336).
+    if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      if _main_head_attached; then
+        if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+          _rs_j result committed pushed yes-after-rebase; return 0
+        fi
+      else
+        _refresh_guard_attached || true
+        _rs_j result error reason detached-head pushed no; return 0
+      fi
+    fi
+    if ! _main_head_attached; then
+      _refresh_guard_attached || true
+      _rs_j result error reason detached-head pushed no; return 0
+    fi
+    git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+    # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+    # never drifts ahead of origin. The index is regenerable — not committing is byte-safe. A
+    # stranded commit here would permanently diverge the seat and make herd update die forever.
+    git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+    _rs_j result error reason push-rejected pushed no
+    return 0
+  }
+  if ! _refresh_run_locked _rs_body; then
+    _rs_j result skipped reason locked
   fi
-  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
-  if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
-    _rs_j result error reason regen-failed; return 0
-  fi
-  # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
-  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    _rs_j result fresh; return 0
-  fi
-  # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
-  # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if [ -n "$rs_pr" ]; then
-    rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
-  elif [ "$rs_prov" = "reconcile" ]; then
-    rs_msg="chore: refresh symbol-index (reconcile)"
-  else
-    rs_msg="chore: refresh symbol-index"
-  fi
-  if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
-    _rs_j result error reason commit-failed; return 0
-  fi
-  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rs_j result committed pushed yes; return 0
-  fi
-  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
-     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rs_j result committed pushed yes-after-rebase; return 0
-  fi
-  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
-  # never drifts ahead of origin. The index is regenerable — not committing is byte-safe. A
-  # stranded commit here would permanently diverge the seat and make herd update die forever.
-  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
-  _rs_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5091,6 +5237,7 @@ refresh_symbol_index() {
 
 MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALABLE: "<reason> <behind> <ahead>"
 MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
+MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
 
 # _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
 # MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
@@ -5404,22 +5551,66 @@ _main_fresh_note_restart() {
   return 0
 }
 
+# _main_reattach_if_detached — HERD-336 shared-checkout invariant. Returns 0 when $MAIN's HEAD is
+# ATTACHED (the caller proceeds); returns 1 when it was DETACHED and handled this tick (the caller must
+# stop — the next tick reconciles on the reattached branch). A detached HEAD in the shared checkout is
+# never a human's deliberate state (a human parks on a NAMED branch); it is the refresh-race corpse that
+# once sat detached until a human `git pull` failed. Journals main_detached ONCE per detached sha
+# (deduped via $MAIN_DETACHED_STATE so a persisting detachment does not spam), then reattaches to the
+# default branch IFF every commit the detached HEAD holds beyond origin is one of our own regenerable
+# maps (or there are none) — a detached HEAD carrying a human's real commit is journaled but LEFT for a
+# human, never silently discarded. Fully fail-soft.
+_main_reattach_if_detached() {
+  local _rd_sref _rd_head _rd_up _rd_prev
+  _rd_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_rd_sref" ]; then
+    rm -f "$MAIN_DETACHED_STATE" 2>/dev/null || true    # attached → clear any prior detached row
+    return 0
+  fi
+  _rd_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  _rd_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  _rd_prev="$(cat "$MAIN_DETACHED_STATE" 2>/dev/null || true)"
+  if [ "$_rd_prev" != "$_rd_head" ]; then
+    mkdir -p "$TREES" 2>/dev/null || true
+    printf '%s\n' "$_rd_head" > "$MAIN_DETACHED_STATE" 2>/dev/null || true
+    _journal_main_detached detected "$_rd_head"
+  fi
+  # Reattach only when the detached commits beyond origin are our own regenerable maps (or none).
+  if git -C "$MAIN" rev-parse --verify --quiet "$_rd_up" >/dev/null 2>&1 \
+     && _main_fresh_generated_only "$_rd_up"; then
+    if _reattach_default_branch; then
+      _journal_main_detached reattached "$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+      rm -f "$MAIN_DETACHED_STATE" 2>/dev/null || true
+    fi
+  fi
+  return 1
+}
+
 # reconcile_main_freshness — the HERD-233 tick-level invariant. Call once per watcher tick, before
 # the map reconcile (so the maps are probed against a fresh HEAD). Safe to call repeatedly.
 reconcile_main_freshness() {
-  local _mf_up _mf_head _mf_new _mf_counts _mf_ahead _mf_behind _mf_dirty _mf_restart=no
+  local _mf_up _mf_head _mf_new _mf_counts _mf_ahead _mf_behind _mf_dirty _mf_restart=no _mf_sref
   [ -n "${DRYRUN:-}" ] && return 0
   [ -n "${MAIN:-}" ] || return 0
   { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
-  # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
-  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
-    || return 0
+  # A $MAIN parked on some other NAMED branch is a human's deliberate state — out of scope, not an
+  # alarm. A DETACHED HEAD (symbolic-ref empty) is different: HERD-336's refresh-race corpse, handled
+  # below the read-only recheck and the gate defer.
+  _mf_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_mf_sref" ] && [ "$_mf_sref" != "${HERD_BRANCH_NAME:-}" ]; then
+    return 0
+  fi
   # HERD-259: a standing held row is re-derived from observed git state BEFORE any defer below it —
   # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
   # fetch is failing. Read-only, and a no-op when no row is held.
   _main_fresh_recheck
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
+  # HERD-336: a detached shared checkout — journal + reattach (when the detached commits are only our
+  # regenerable maps), then defer the rest of the reconcile to the next tick on the reattached branch.
+  if [ -z "$_mf_sref" ]; then
+    _main_reattach_if_detached || return 0
+  fi
 
   _mf_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
   # Fail-soft: a fetch failure NEVER blocks the tick and never alarms (offline, or a gh/network blip
@@ -5506,12 +5697,15 @@ reconcile_main_freshness() {
 #     merge the maps are fresh, so the probe no-ops; the sha memo prevents re-probe until HEAD moves.
 # Fully fail-soft; never blocks a tick.
 
-# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted change,
-# so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted NON-map
+# change, so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+# HERD-336: a dirty docs/codemap.md / docs/symbol-index.md is EXCUSED — those are the maps this reconcile
+# itself owns, and a stranded dirty one (the live symbol-index corpse) must NOT block the reconcile that
+# would ABSORB it forever; refresh_codemap / refresh_symbol_index fold it into their next regen commit.
 _map_reconcile_mid_op() {
   _watch_gate_inflight && return 0
-  # Any dirty path on $MAIN → a concurrent writer (or a partial write) owns the tree this tick.
-  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ] && return 0
+  # Any dirty NON-derived-map path on $MAIN → a concurrent writer (or a partial write) owns the tree.
+  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null | grep -vE ' docs/(codemap|symbol-index)\.md$')" ] && return 0
   return 1
 }
 
