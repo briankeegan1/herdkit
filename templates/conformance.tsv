@@ -166,6 +166,7 @@ agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
 approvals.sh	unit	tests/test-journal-audit.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
+config-viability.sh	unit	tests/test-config-viability.sh
 resolver-pane.sh	unit	tests/test-resolver-pane-lever.sh
 resolver-pane.sh	sim	tests/test-sandbox-resolver-respawn.sh
 retirement.sh	unit	tests/test-retirement-invariant.sh
@@ -377,5 +378,7 @@ ENGINE_IMPL	unit	tests/test-py-shadow-runtime.sh
 ENGINE_IMPL	unit	tests/test-py-live-runtime.sh
 ENGINE_IMPL	unit	tests/test-tick-split.sh
 ENGINE_IMPL	sim	scripts/herd/sim/engine-down-scenario.sh
+ENGINE_PAUSE	unit	tests/test-engine-pause.sh
+ENGINE_PAUSE	sim	scripts/herd/sim/engine-pause-scenario.sh
 STORE_BACKEND	unit	tests/test-py-store.sh
 STORE_BACKEND	sim	tests/test-py-store.sh

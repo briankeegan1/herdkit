@@ -129,6 +129,19 @@ cold; [ "$(state_of merged-clean "$WTREES/merged-clean" feat/merged-clean 0)" = 
   || fail "(4) MERGED + clean must classify retiring"
 ok
 
+# ── (4b) HERD-356: MERGED + clean but a builder is still WORKING → deferred; IDLE still reaps ──────
+# The reap legs used to treat ANY resident agent pane as builder-liveness, stranding a merged worktree
+# whose builder went idle. The split: only a POSITIVE "working" read defers; idle is done → reap.
+WORKING_JSON='{"result":{"agents":[{"name":"merged-clean","agent_status":"working"}]}}'
+IDLE_JSON='{"result":{"agents":[{"name":"merged-clean","agent_status":"idle"}]}}'
+cold; [ "$(AGENTS_JSON="$WORKING_JSON" retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = deferred ] \
+  || fail "(4b) MERGED + clean + a WORKING builder must DEFER the reap"
+cold; d="$(AGENTS_JSON="$WORKING_JSON" retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f4)"
+case "$d" in *"still working"*) : ;; *) fail "(4b) the deferred detail must say why (still working), got: $d" ;; esac
+cold; [ "$(AGENTS_JSON="$IDLE_JSON" retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = retiring ] \
+  || fail "(4b) MERGED + clean + an IDLE builder must still REAP (idle is done, not working)"
+ok
+
 # ── (5) MERGED + regenerable dirt → still retiring (droppings, not work) ─────────────────────────
 sha_d="$(mkwt merged-dropping)"
 gh_says "feat/merged-dropping" MERGED "$sha_d" 14

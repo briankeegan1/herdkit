@@ -13,6 +13,8 @@
 #   (c) a refix_bounce with no matching refix_wake_result (same pr + sha + round)
 #   (d) a red state (main_health result=red) older than a TTL with no later green
 #   (e) pushed=no never followed by a later pushed=yes (codemap/symbol_index refresh)
+#   (i) a DETACHED shared checkout (HERD-336): a main_detached result=detected not cleared by a later
+#       result=reattached — the coordinator checkout sat on a detached HEAD (the refresh-race corpse)
 #   (f) known-fixture slugs (retiree / conv / stuck / hd — the HERD-223 pollution set)
 #   (g) a MERGED PR whose body declares a HUMAN-VERIFY block but which carries NO sha-keyed approval
 #       record. Such a PR merged with its declared manual steps never run. This is not hypothetical:
@@ -120,7 +122,8 @@ FIXTURE_SLUGS="${HERD_JOURNAL_AUDIT_FIXTURE_SLUGS:-retiree conv stuck hd}"
 # ── replay: pure python scanner → one finding line per violation ─────────────
 # Each stdout line:  kind\tkey\tsummary
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
-#        red_state_stale | pushed_no_unresolved | fixture_slug
+#        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked |
+#        checkout_unclean
 # key is a stable dedup token; summary is a short human phrase for the inbox row.
 # shellcheck disable=SC2016
 FINDINGS="$(
@@ -343,6 +346,24 @@ for p in pushed_no:
         summary = "pushed=no never followed by pushed=yes · %s" % (ev or "event")
         findings.append(("pushed_no_unresolved", key, summary))
 
+# ── (i) detached shared checkout (HERD-336) ─────────────────────────────────
+# main_detached result=detected not cleared by a later result=reattached (same head, or an empty head
+# on either side) → the shared coordinator checkout sat on a detached HEAD (the refresh-race corpse
+# that once sat detached until a human `git pull` failed). Surfaces even when auto-healed only after
+# sitting unresolved for a window; a detected immediately followed by a reattached is clean.
+det = [e for e in events if e.get("event") == "main_detached" and str(e.get("result") or "") == "detected"]
+reatt = [e for e in events if e.get("event") == "main_detached" and str(e.get("result") or "") == "reattached"]
+for d in det:
+    head = str(d.get("head") or "")
+    # A reattach lands the branch on a DIFFERENT sha than the detached commit, so pair chronologically
+    # (any later reattached clears a detection) rather than by head — like pushed=no ↔ pushed=yes.
+    ok = any(r["_ts"] >= d["_ts"] for r in reatt)
+    if not ok:
+        key = "main_detached|sha=%s|ts=%s" % (head, d["_ts"].strftime("%Y%m%dT%H%M%SZ"))
+        summary = "shared checkout DETACHED (never reattached) · head=%s branch=%s" % (
+            (head[:8] if head else "?"), str(d.get("branch") or "?"))
+        findings.append(("main_detached", key, summary))
+
 # ── (f) known-fixture slugs ─────────────────────────────────────────────────
 seen_fixture = set()
 for e in events:
@@ -355,6 +376,40 @@ for e in events:
         key = "fixture_slug|%s" % slug
         summary = "known-fixture slug in journal · slug=%s event=%s" % (slug, e.get("event") or "?")
         findings.append(("fixture_slug", key, summary))
+
+# ── (h) watcher_restart_blocked events (HERD-342) ──────────────────────────
+# A blocked restart is a direct signal that an orphaned lock holder is preventing engine recovery.
+# Any event in the window is a finding — the operator needs to know about it.
+for e in events:
+    if e.get("event") != "watcher_restart_blocked":
+        continue
+    holder = str(e.get("holder_pid") or "unknown")
+    workspace = str(e.get("workspace") or "")
+    key = "watcher_restart_blocked|workspace=%s|holder=%s" % (workspace, holder)
+    summary = "watcher restart blocked · holder_pid=%s%s" % (
+        holder,
+        (" workspace=%s" % workspace) if workspace else "",
+    )
+    findings.append(("watcher_restart_blocked", key, summary))
+
+# ── (j) unclean shared checkout (HERD-361) ──────────────────────────────────
+# reconcile_checkout_cleanliness journals `checkout_unclean result=detected/violation` when the shared
+# coordinator checkout carries staged/tracked contamination (the fingerprint of a suite test that staged
+# in $PWD) or sits detached. It is a per-tick invariant already deduped by the watcher, so ANY occurrence
+# in the window is worth an inbox row — the operator needs to know evidence is sitting in $MAIN awaiting
+# a human (the watcher never auto-discards it).
+for e in events:
+    if e.get("event") != "checkout_unclean":
+        continue
+    if str(e.get("result") or "") not in ("violation", "detected"):
+        continue
+    head = str(e.get("head") or "")
+    paths = str(e.get("paths") or "")
+    detached = str(e.get("detached") or "no")
+    key = "checkout_unclean|sha=%s|files=%s" % (head, paths)
+    summary = "shared checkout UNCLEAN (evidence preserved) · head=%s detached=%s paths=%s" % (
+        (head[:8] if head else "?"), detached, (paths[:80] if paths else "?"))
+    findings.append(("checkout_unclean", key, summary))
 
 for kind, key, summary in findings:
     # TAB-separated; summary flattened (no tabs/newlines).

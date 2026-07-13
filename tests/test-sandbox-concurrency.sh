@@ -150,7 +150,8 @@ echo "PASS (i) watcher singleton: live lock → refuse (no duplicate), stale loc
 [ "$(sc "$SCARD" main_health_ok)" = "True" ]                            || fail "(j) main_health_ok should be true"
 [ "$(cp_status "$SCARD" main_health_observed_dispatch)" = "pass" ]      || fail "(j) main_health_observed_dispatch not pass (a cross-seat merge must dispatch within one tick)"
 [ "$(cp_status "$SCARD" main_health_kill_redispatch)" = "pass" ]        || fail "(j) main_health_kill_redispatch not pass (a killed suite must leave a re-dispatchable sha)"
-echo "PASS (j) main-health invariant: other-seat merge dispatches within one tick; killed suite re-dispatches"
+[ "$(cp_status "$SCARD" main_health_slot_starvation)" = "pass" ]        || fail "(j) main_health_slot_starvation not pass (HERD-359: no-slot must be a WAIT not a SKIP)"
+echo "PASS (j) main-health invariant: other-seat merge dispatches within one tick; killed suite re-dispatches; slot starvation is a wait not a skip"
 
 # ── (f) HERMETIC — nothing leaked into the real repo tree ────────────────────────
 # The scenario writes only under its --artifacts dir. Compare against the baseline captured before

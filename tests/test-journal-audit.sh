@@ -12,6 +12,7 @@
 #         (c) refix_bounce with no refix_wake_result
 #         (d) main_health red older than TTL
 #         (e) pushed=no never followed by pushed=yes
+#         (e''') an unclean shared checkout (checkout_unclean result=violation, HERD-361)
 #         (f) known-fixture slug
 #         (g) a MERGED PR that declared HUMAN-VERIFY steps but carries no sha-keyed approval (HERD-272)
 #   (3) A CLEAN journal (every invariant satisfied) emits ZERO journal_audit events and ZERO inbox
@@ -230,6 +231,31 @@ out="$(run_audit on)" || fail "(2e) audit exited non-zero: $out"
 [ "$(count_audit pushed_no_unresolved)" = "1" ] || fail "(2e) expected 1 pushed_no_unresolved, got $(count_audit pushed_no_unresolved)"
 pass
 echo "PASS (2e) pushed=no without later yes → finding"
+
+# ── (2e') detached shared checkout: detected without a later reattached → finding (HERD-336) ─────
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_detached","head":"deadbeefcafe","branch":"main","result":"detected"'
+out="$(run_audit on)" || fail "(2e') audit exited non-zero: $out"
+[ "$(count_audit main_detached)" = "1" ] || fail "(2e') expected 1 main_detached, got $(count_audit main_detached); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2e') detached shared checkout never reattached → finding"
+
+# ── (2e'') a detected followed by a reattached (same head) is CLEAN ──────────────────────────────
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_detached","head":"deadbeefcafe","branch":"main","result":"detected"'
+jline "2026-07-09T12:00:30Z" '"event":"main_detached","head":"feedface0001","branch":"main","result":"reattached"'
+out="$(run_audit on)" || fail "(2e'') audit exited non-zero: $out"
+[ "$(count_audit main_detached)" = "0" ] || fail "(2e'') a reattached detachment must be clean, got $(count_audit main_detached)"
+pass
+echo "PASS (2e'') detected + later reattached → no finding"
+
+# ── (2e''') an unclean shared checkout (HERD-361) → finding ──────────────────────────────────────
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"checkout_unclean","head":"cafef00dbabe","detached":"no","paths":"lib.sh newfile.txt","result":"violation"'
+out="$(run_audit on)" || fail "(2e''') audit exited non-zero: $out"
+[ "$(count_audit checkout_unclean)" = "1" ] || fail "(2e''') expected 1 checkout_unclean, got $(count_audit checkout_unclean); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2e''') unclean shared checkout → finding"
 
 # ── (2f) known-fixture slug ──────────────────────────────────────────────────
 reset_surfaces

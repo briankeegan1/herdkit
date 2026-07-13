@@ -32,6 +32,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               _main_health_pending,
                                WAIT, PENDING,
                                branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
 
@@ -68,11 +69,17 @@ class LiveCase(unittest.TestCase):
         os.environ.pop("HERD_JOURNAL_NOW", None)
 
     def tick(self, candidates, config=None):
-        """A dry-run tick over injected candidates; returns (summary, events)."""
+        """A dry-run tick over injected candidates; returns (summary, events).
+
+        Passes the per-test tmp dir as the LiveState dir so the durable ledger path is always
+        hermetic (never leaks to WORKTREES_DIR from the environment) and each test method gets
+        an isolated ledger.  Within a single test method multiple tick() calls share the same
+        tmp dir — that is intentional: the once-guard should hold intra-method just as it does
+        across ticks in production."""
         scenario = {"candidates": candidates, "config": config or {"MERGE_POLICY": "auto"}}
         journal = LiveJournal(self.jpath)
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
-                     DryRunActuator(journal), journal)
+                     DryRunActuator(journal), journal, state=LiveState(self.tmp))
         res = t.run()
         return res, (events(self.jpath) if os.path.exists(self.jpath) else [])
 
@@ -177,19 +184,57 @@ class TestGateOutcomes(LiveCase):
                 self.assertIn(k, rb[0], "%s missing %s" % (rule, k))
 
     def test_refix_round_is_real_not_hardcoded(self):
-        # HERD-328 S2: the round a refix_bounce carries is the per-(pr, rule) bounce count + 1
-        # (bash's `refix_rail_count + 1`), NOT a hardcoded 1. The first bounce reads round=1, then the
-        # rail counter increments per rail INDEPENDENTLY of the other rail and of other PRs.
+        # HERD-328 S2 / HERD-358: the round a refix_bounce carries is the per-(pr, rule) bounce count
+        # + 1 read from the DURABLE ledger, NOT a hardcoded 1 and NOT a process-local counter.
+        # First bounce (no state dir): round=1 regardless.
         _, ev = self._out(health="CODEERROR")
         rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
         self.assertEqual(rb[0]["round"], 1)
-        # Drive the counter directly on one tick instance: it is per (pr, rule), monotonic, isolated.
-        t = LiveTick({"MERGE_POLICY": "auto"}, FixtureDiscovery({"candidates": []}),
-                     FixtureGates({"candidates": []}), DryRunActuator(LiveJournal(None)),
-                     LiveJournal(None))
-        self.assertEqual([t._next_refix_round(1, "review") for _ in range(3)], [1, 2, 3])
-        self.assertEqual(t._next_refix_round(1, "healthcheck"), 1)   # a different rail is its own count
-        self.assertEqual(t._next_refix_round(2, "review"), 1)        # a different pr is its own count
+
+    def test_refix_round_advances_per_new_sha(self):
+        # HERD-358: round climbs 1→2→3 only when a NEW SHA is pushed (each sha bounces exactly once).
+        # Each push is a new commit → different sha → once-guard opens → round counter advances.
+        # This MUST use a fresh LiveTick per tick (process boundary is the bug scenario).
+        state_dir = os.path.join(self.tmp, "state-sha-advance")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+        rounds = []
+        for i, sha in enumerate(["sha-a", "sha-b", "sha-c"], 1):
+            cand = {"pr": 77, "sha": sha, "slug": "feat-adv", "health": "CODEERROR"}
+            scenario = {"candidates": [cand], "config": config}
+            jpath = os.path.join(self.tmp, "adv-%d.jsonl" % i)
+            j = LiveJournal(jpath)
+            state = LiveState(state_dir)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                         DryRunActuator(j), j, state=state)
+            t.run()
+            evs = events(jpath) if os.path.exists(jpath) else []
+            rb = [o for o in evs if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck"]
+            self.assertEqual(len(rb), 1, "sha %s: expected exactly 1 refix_bounce" % sha)
+            rounds.append(rb[0]["round"])
+        self.assertEqual(rounds, [1, 2, 3], "round must advance per new sha: %s" % rounds)
+
+    def test_refix_same_sha_bounces_exactly_once(self):
+        # HERD-358 once-guard: walking the SAME (pr,sha,kind) 5 times (simulating 5 ticks on an
+        # unchanged sha) must produce exactly ONE refix_bounce — not 5.
+        state_dir = os.path.join(self.tmp, "state-once-guard")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "5"}
+        cand = {"pr": 88, "sha": "same-sha", "slug": "feat-og", "health": "CODEERROR"}
+        total_bounces = 0
+        for i in range(5):
+            scenario = {"candidates": [cand], "config": config}
+            jpath = os.path.join(self.tmp, "og-%d.jsonl" % i)
+            j = LiveJournal(jpath)
+            state = LiveState(state_dir)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                         DryRunActuator(j), j, state=state)
+            t.run()
+            evs = events(jpath) if os.path.exists(jpath) else []
+            total_bounces += sum(1 for o in evs
+                                 if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck")
+        self.assertEqual(total_bounces, 1,
+                         "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
 class TestReapAndActuation(LiveCase):
@@ -259,34 +304,67 @@ class TestReviewDispatchShape(LiveCase):
     with the full contract §3.4 shape (pr, sha, pid, model, log_path, pin). Hermetic: a fresh temp
     state dir forces a dispatch and subprocess.Popen is stubbed, so no reviewer is ever launched."""
 
-    def test_review_dispatched_carries_contract_fields(self):
+    class _RecordingReviewSub:
+        """A subprocess stand-in that RECORDS the env handed to Popen — proves the reviewer is launched
+        with the SAME model the dispatch journals (HERD-353 single resolution point), never a divergent
+        second lookup, without ever launching a reviewer."""
+
+        DEVNULL = LR.subprocess.DEVNULL
+
         class _Proc:
             pid = 4242
 
-        class _FakeSub:
-            DEVNULL = LR.subprocess.DEVNULL
+        def __init__(self):
+            self.env = None
 
-            def Popen(self, *a, **k):
-                return _Proc()
+        def Popen(self, *a, **k):
+            self.env = k.get("env")
+            return self._Proc()
 
+    def _dispatch_once(self, env_overrides):
+        """Force ONE real _dispatch_review with a stubbed subprocess; return (verdict, journal, sub)."""
         state = LiveState(state_dir=self.tmp)          # real (empty) state dir -> no cached verdict/marker
         journal = LiveJournal(self.jpath)
         gates = LiveGates("/nonexistent-home", state, journal)
+        sub = self._RecordingReviewSub()
         orig = LR.subprocess
-        LR.subprocess = _FakeSub()
-        os.environ["MODEL_REVIEW"] = "opus-x"
+        LR.subprocess = sub
+        saved = {k: os.environ.get(k) for k in env_overrides}
+        os.environ.update(env_overrides)
         try:
             v = gates.review(LiveCandidate(7, "deadbeef", slug="feat-x"))
         finally:
             LR.subprocess = orig
-            os.environ.pop("MODEL_REVIEW", None)
+            for k, old in saved.items():
+                if old is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = old
+        return v, [o for o in events(self.jpath) if o["event"] == "review_dispatched"], sub
+
+    def test_review_dispatched_carries_contract_fields(self):
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "opus-x"})
         self.assertEqual(v, WAIT)                       # dispatched -> WAIT
-        rd = [o for o in events(self.jpath) if o["event"] == "review_dispatched"]
         self.assertEqual(len(rd), 1)
         for k in ("pr", "sha", "pid", "model", "log_path", "pin"):
             self.assertIn(k, rd[0])
         self.assertEqual(rd[0]["model"], "opus-x")      # bash env-fallback chain
         self.assertTrue(rd[0]["log_path"])              # the reviewer's result-file path, non-empty
+
+    def test_journaled_model_is_pinned_into_reviewer_env(self):
+        # SINGLE RESOLUTION POINT (HERD-353): the model journaled is the SAME value handed to the
+        # reviewer process — never empty when MODEL_REVIEW resolves, never a drifting second lookup.
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "claude-opus-4-8", "HERD_REVIEW_MODEL": ""})
+        self.assertEqual(rd[0]["model"], "claude-opus-4-8")
+        self.assertTrue(rd[0]["model"])                 # regression guard: NEVER empty when config resolves
+        self.assertEqual(sub.env.get("HERD_REVIEW_MODEL"), rd[0]["model"])  # reviewer runs EXACTLY this
+
+    def test_review_model_override_wins_and_is_journaled(self):
+        # An operator HERD_REVIEW_MODEL override wins the fallback chain and is what the reviewer runs.
+        v, rd, sub = self._dispatch_once({"MODEL_REVIEW": "claude-opus-4-8",
+                                          "HERD_REVIEW_MODEL": "claude-sonnet-4-6"})
+        self.assertEqual(rd[0]["model"], "claude-sonnet-4-6")
+        self.assertEqual(sub.env.get("HERD_REVIEW_MODEL"), "claude-sonnet-4-6")
 
 
 class _FakeCompleted:
@@ -1304,6 +1382,152 @@ class TestPreDispatchWorktreeGuard(unittest.TestCase):
         self.assertEqual(g.health(c), WAIT)
         self.assertEqual(dispatched, ["9"])
         self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
+
+
+def _git_init_repo(path):
+    """Create a bare-minimum git repo with one commit; return the HEAD SHA."""
+    os.makedirs(path, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", path], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.email", "t@test"], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.name", "t"], check=True)
+    open(os.path.join(path, "f"), "w").write("x")
+    subprocess.run(["git", "-C", path, "add", "f"], check=True)
+    subprocess.run(["git", "-C", path, "commit", "-q", "-m", "init"], check=True)
+    return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"]).decode().strip()
+
+
+class TestMainHealthSlotPriority(unittest.TestCase):
+    """HERD-359 regression: PR health must never starve main-health when HEALTH_CONCURRENCY=1.
+
+    _main_health_pending() is the sentinel; LiveGates.health() reserves a slot when it is True."""
+
+    def setUp(self):
+        self._orig_env = {}
+        for k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
+            self._orig_env[k] = os.environ.pop(k, None)
+        import tempfile as _t
+        self.tmp = _t.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _main_repo(self):
+        p = os.path.join(self.tmp, "main")
+        sha = _git_init_repo(p)
+        os.environ["MAIN"] = p
+        return p, sha
+
+    def _make_gates(self, jpath):
+        """LiveGates wired to self.tmp as state dir."""
+        state = LiveState(state_dir=self.tmp)
+        state.dir = self.tmp
+        journal = LiveJournal(jpath)
+        return LiveGates("/nonexistent-home", state, journal, config={"HEALTH_CONCURRENCY": "1"})
+
+    # ── _main_health_pending unit tests ───────────────────────────────────────────────────────────
+
+    def test_off_by_default(self):
+        """MAIN_HEALTH_TICK unset → False (byte-inert)."""
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_off_explicit(self):
+        os.environ["MAIN_HEALTH_TICK"] = "off"
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_no_state_dir(self):
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self.assertFalse(_main_health_pending(None))
+
+    def test_no_main_env(self):
+        """Neither MAIN nor PROJECT_ROOT set → False (fail-safe, never blocks the PR rail)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_project_root_fallback(self):
+        """MAIN unset (a plain var in agent-watch.sh, it never crosses the --tick subprocess
+        boundary) → the exported PROJECT_ROOT resolves the main checkout (HERD-345 precedent)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        p = os.path.join(self.tmp, "main")
+        _git_init_repo(p)
+        os.environ["PROJECT_ROOT"] = p
+        self.assertTrue(_main_health_pending(self.tmp))
+
+    def test_truthy_set_matches_bash(self):
+        """The truthy set matches bash _main_health_enabled (1|true|on|yes|enable|enabled) —
+        a value that arms the bash reconcile must also arm the python-side reservation."""
+        self._main_repo()
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "Enabled"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertTrue(_main_health_pending(self.tmp), "expected pending for %r" % v)
+        for v in ("off", "0", "no", "false", "bogus"):
+            os.environ["MAIN_HEALTH_TICK"] = v
+            self.assertFalse(_main_health_pending(self.tmp), "expected off for %r" % v)
+
+    def test_pending_when_no_markers(self):
+        """MAIN_HEALTH_TICK=on, valid MAIN, no markers → True (main-health needs a slot)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self._main_repo()
+        self.assertTrue(_main_health_pending(self.tmp))
+
+    def test_false_when_run_once_marker_exists(self):
+        """Run-once marker present → this sha already has a verdict → not pending."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        open(os.path.join(self.tmp, ".main-health-" + sha), "w").close()
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    def test_false_when_live_inflight(self):
+        """A live in-flight marker for this sha → already dispatched → not pending."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        inflight = os.path.join(self.tmp, ".health-inflight-main-" + sha)
+        _marker_write(inflight, os.getpid())
+        self.assertFalse(_main_health_pending(self.tmp))
+
+    # ── LiveGates.health() slot reservation tests ─────────────────────────────────────────────────
+
+    def test_pr_health_waits_when_main_pending(self):
+        """With HEALTH_CONCURRENCY=1 and main-health pending, no PR health starts (slot reserved)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self._main_repo()
+        _make_worktree(self.tmp, "feat-1")
+        cand = LiveCandidate(pr=1, sha="abc123", slug="feat-1",
+                             worktree=os.path.join(self.tmp, "feat-1"))
+        jpath = os.path.join(self.tmp, "j1.jsonl")
+        gates = self._make_gates(jpath)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        # No inflight marker must exist for this PR (dispatch must not have happened).
+        inflight = os.path.join(self.tmp, ".health-inflight-1-abc123")
+        self.assertFalse(os.path.exists(inflight), "PR health must not lay inflight marker when main-health is pending")
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(len(queued), 1, "health_queued must be journaled for the deferred PR")
+
+    def test_pr_health_proceeds_when_main_done(self):
+        """Main-health done (run-once marker written) → PR health proceeds past the slot check."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        open(os.path.join(self.tmp, ".main-health-" + sha), "w").close()
+        _make_worktree(self.tmp, "feat-2")
+        cand = LiveCandidate(pr=2, sha="def456", slug="feat-2",
+                             worktree=os.path.join(self.tmp, "feat-2"))
+        jpath = os.path.join(self.tmp, "j2.jsonl")
+        gates = self._make_gates(jpath)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        # With no PR inflight and main-health done, the slot check passes — no health_queued event.
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(queued, [], "health_queued must NOT be emitted when main-health slot is free")
 
 
 if __name__ == "__main__":

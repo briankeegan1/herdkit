@@ -618,6 +618,7 @@ SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
+ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -928,6 +929,38 @@ build_main_freshness() {
   fi
 }
 
+# build_checkout_cleanliness — the HERD-361 shared-checkout cleanliness row, read from the state file
+# reconcile_checkout_cleanliness writes (absent on the happy path → renders NOTHING, console stays
+# byte-identical). A LOUD row when $MAIN carries staged/tracked contamination (the fingerprint of a
+# suite test that staged in $PWD) or sits detached: it names the count + the offending paths so an
+# operator can root-cause, and says the evidence is preserved (nothing was discarded).
+build_checkout_cleanliness() {
+  CHECKOUT_CLEAN=""
+  [ -s "${CHECKOUT_CLEAN_STATE:-}" ] || return 0
+  local _bc_i=0 _bc_head="" _bc_det="" _bc_line _bc_n=0 _bc_paths="" _bc_why=""
+  while IFS= read -r _bc_line; do
+    _bc_i=$((_bc_i + 1))
+    case "$_bc_i" in
+      1) continue ;;                     # line 1 = dedup signature (not for display)
+      2) _bc_head="$_bc_line"; continue ;;
+      3) _bc_det="$_bc_line"; continue ;;
+    esac
+    [ -n "$_bc_line" ] || continue
+    _bc_n=$((_bc_n + 1))
+    if [ "$_bc_n" -le 4 ]; then
+      if [ -z "$_bc_paths" ]; then _bc_paths="$_bc_line"; else _bc_paths="$_bc_paths, $_bc_line"; fi
+    fi
+  done < "$CHECKOUT_CLEAN_STATE"
+  [ "$_bc_det" = "detached" ] && _bc_why="DETACHED HEAD"
+  if [ "$_bc_n" -gt 0 ]; then
+    local _bc_more=""
+    [ "$_bc_n" -gt 4 ] && _bc_more=" (+$((_bc_n - 4)) more)"
+    local _bc_pathpart="${_bc_n} contaminated path(s): ${_bc_paths}${_bc_more}"
+    if [ -n "$_bc_why" ]; then _bc_why="${_bc_why} + ${_bc_pathpart}"; else _bc_why="$_bc_pathpart"; fi
+  fi
+  CHECKOUT_CLEAN="    ${C_RED}🚨 ${C_BOLD}CHECKOUT UNCLEAN${C_RESET}${C_RED} — ${_bc_why} · a tool wrote the shared checkout; investigate in ${MAIN} before discarding (evidence preserved, never auto-cleaned)${C_RESET}"$'\n'
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -1014,6 +1047,9 @@ _row_wedged() {
 #             been converging so a wedged one is legible before it even turns red.
 #   stuck     YOUR move — teardown has failed _RETIRE_STUCK_TICKS ticks running. RED, and it NAMES the
 #             blocker (the first leftover kind that would not die) plus the remedy.
+#   deferred  the HERD's move — terminal + disposable, but a builder is still WORKING in the tree
+#             (HERD-356). CALM-but-visible (⏸️ yellow, never red — nothing is wrong, we are waiting): the
+#             reap runs itself the moment the agent goes idle. <detail> names why.
 #   held      YOUR move — the slug is terminal but carries REAL WORK (uncommitted tracked files, or
 #             commits that exist nowhere else). RED, with the evidence verbatim. Retirement will not
 #             touch it, this tick or ever, until a human commits or discards.
@@ -1027,6 +1063,9 @@ _row_retirement() {
     stuck)
       printf '    %s⚠️%s  %s%s%s %sneeds-you · retirement stuck: %s · run `herd sweep` or close it by hand · %s%s' \
         "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$_age" "$C_RESET" ;;
+    deferred)
+      printf '    %s⏸️%s  %s%s%s %sreap deferred · %s · %s%s' \
+        "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_YELLOW" "$_detail" "$_age" "$C_RESET" ;;
     held)
       printf '    %s⚠️%s  %s%s%s %sneeds-you · %s%s' \
         "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_detail" "$C_RESET" ;;
@@ -1627,6 +1666,13 @@ build_orphan_prs() {
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # ENGINE PAUSED banner (HERD-347) — the operator emergency-off switch, pinned ABOVE even the
+  # engine-down alarm: a deliberate operator pause is the single most important fact on the console.
+  # Set by _engine_tick_watchdog while ENGINE_PAUSE=on; empty (byte-identical console) whenever the
+  # lever is off/unset — the ship default — so this adds NO always-on row.
+  if [ -n "${ENGINE_PAUSE_ROW:-}" ]; then
+    frame="${frame}  ${C_YELLOW}engine${C_RESET}"$'\n'"${ENGINE_PAUSE_ROW}"$'\n'
+  fi
   # ENGINE DOWN alarm (HERD-306) — the LOUDEST row, pinned above even the default-branch alarm. Set by
   # _engine_tick_watchdog when the SOLE (Python) engine core has faulted past its tolerance: no gates or
   # merges are running until a human intervenes. Empty (byte-identical console) whenever the engine ticks.
@@ -1637,8 +1683,8 @@ render() {
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
   # MAIN-freshness (HERD-233) shares that section: a diverged/held checkout, and the restart note
   # after a pull carried new engine code. Both empty on the happy path.
-  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ]; then
-    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}"$'\n'
+  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ] || [ -n "${CHECKOUT_CLEAN:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}${CHECKOUT_CLEAN:-}"$'\n'
   fi
   # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
   # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
@@ -4917,6 +4963,92 @@ reconcile_backlog() {
   return 0
 }
 
+# ── Post-merge refresh SERIALIZATION + detached-HEAD guard (HERD-336) ─────────────────────────────
+# The codemap/symbol-index refresh legs (refresh_codemap / refresh_symbol_index) each run a
+# pull→regenerate→commit→push sequence against the SHARED coordinator checkout ($MAIN). Two legs ~30s
+# apart (two merges) once ran concurrently: the second started mid-rebase of the first, committed two
+# refresh commits onto a DETACHED HEAD, and left $MAIN detached until a later human `git pull` failed
+# with `not on a branch`. These helpers make the leg SERIAL per-checkout and REFUSE to commit on a
+# detached HEAD (reconciling the invariant "shared checkout always attached, derived docs committed or
+# untouched" on every refresh run, not just the happy path). Fully fail-soft: a lock that cannot be
+# acquired = skip + journal, never a red row or a hung watcher.
+
+# _refresh_lock_file — the per-checkout refresh lock path. Lives inside $MAIN's own git dir so it is
+# (a) per-checkout ON DISK — any seat's watcher/merge that refreshes the SAME shared checkout contends
+# for the SAME file, even across seats whose $TREES differ — and (b) never committed (git ignores its
+# own dir). Fail-soft derivation: `--absolute-git-dir` else a plain $MAIN/.git fallback.
+_refresh_lock_file() {
+  local _gd
+  _gd="$(git -C "$MAIN" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$_gd" ] || _gd="$MAIN/.git"
+  printf '%s/herd-refresh.lock' "$_gd"
+}
+
+# _refresh_run_locked <body-fn> — run <body-fn> holding the per-checkout refresh lock so concurrent
+# refresh legs SERIALIZE against the shared checkout. NON-BLOCKING: if a live leg already holds the
+# lock, <body-fn> is NOT run and this returns 1 — the caller journals a skip, which is correct because
+# the winning leg's regeneration is fresh (a second regen would be redundant). Returns 0 when the body
+# ran. Fail-soft: a lock left by a CRASHED leg (mutex older than the 10-minute stale cap) is stolen
+# once. A plain atomic-mkdir mutex (works with no flock(1) — the macOS default), released explicitly
+# on return; the body only has file/git side effects, so running it inline needs no subshell.
+_refresh_run_locked() {
+  local _rl_body="$1" _rl_dir _rl_took=""
+  _rl_dir="$(_refresh_lock_file).d"
+  mkdir -p "$(dirname "$_rl_dir")" 2>/dev/null || true
+  if mkdir "$_rl_dir" 2>/dev/null; then
+    _rl_took=1
+  elif [ -z "$(find "$_rl_dir" -prune -mmin -10 2>/dev/null)" ]; then
+    # Holder mutex older than 10 min → a crashed leg. Steal it once (the mutex, not a live process).
+    rm -rf "$_rl_dir" 2>/dev/null || true
+    mkdir "$_rl_dir" 2>/dev/null && _rl_took=1
+  fi
+  [ -n "$_rl_took" ] || return 1        # a live leg holds it — skip (the winner's regen is fresh)
+  printf '%s\n' "$$" > "$_rl_dir/pid" 2>/dev/null || true   # diagnostic only; never load-bearing
+  "$_rl_body"
+  rm -rf "$_rl_dir" 2>/dev/null || true
+  return 0
+}
+
+# _main_head_attached — success iff $MAIN's HEAD is the default branch (attached, not detached). The
+# read-only predicate every refresh commit consults before it writes.
+_main_head_attached() {
+  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-main}" ]
+}
+
+# _journal_main_detached <result> [head] — one `main_detached` audit breadcrumb (result=detected on
+# discovery, result=reattached after a successful reattach). journal-audit.sh surfaces a `detected`
+# that no later `reattached` clears (a shared checkout that sat detached — the HERD-336 corpse).
+_journal_main_detached() {
+  journal_append main_detached head "${2:-}" branch "${HERD_BRANCH_NAME:-main}" result "${1:-detected}"
+}
+
+# _reattach_default_branch — best-effort: abort any in-progress rebase and reattach $MAIN to the
+# default branch, aligning to origin. The only thing that can be lost is a regenerable derived map
+# committed on the detached HEAD — cheap to redo. Fail-soft; returns the resulting attach status.
+_reattach_default_branch() {
+  local _rb="${HERD_BRANCH_NAME:-main}" _ru="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+  git -C "$MAIN" checkout --quiet --force "$_rb" >/dev/null 2>&1 \
+    || git -C "$MAIN" symbolic-ref HEAD "refs/heads/$_rb" >/dev/null 2>&1 || true
+  if git -C "$MAIN" rev-parse --verify --quiet "$_ru" >/dev/null 2>&1; then
+    git -C "$MAIN" reset --hard "$_ru" >/dev/null 2>&1 || true
+  fi
+  _main_head_attached
+}
+
+# _refresh_guard_attached — the refresh legs' commit gate. Success (0) when HEAD is safely on the
+# default branch (silent on the happy path). On a DETACHED HEAD it journals main_detached, reattaches
+# loudly, and returns 1 so the caller REFUSES to commit its refresh (the regen is cheap to redo).
+_refresh_guard_attached() {
+  _main_head_attached && return 0
+  local _h; _h="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  _journal_main_detached detected "$_h"
+  if _reattach_default_branch; then
+    _journal_main_detached reattached "$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  return 1
+}
+
 # refresh_codemap <pr#> [provenance] — POST-MERGE codemap freshness hook (best-effort, NEVER
 # blocks/fails the merge). After a PR lands on the default branch and $MAIN is fast-forwarded,
 # regenerate the committed docs/codemap.md against $MAIN and, ONLY when the deterministic scan
@@ -4930,11 +5062,14 @@ reconcile_backlog() {
 # tick-level reconcile (HERD-218) passes `reconcile` so out-of-band merges are auditable.
 #
 # Gated by CODEMAP_AUTOREFRESH: off → byte-inert (we never run the scan, never touch the tree).
-# Race-guarded three ways: (1) only when the project has already ADOPTED the codemap (the committed
-# docs/codemap.md exists — never materialize a new one); (2) skip if that path already carries an
-# uncommitted change (a concurrent writer owns it this tick — never clobber or bundle their edit);
-# (3) codemap.sh rewrites the file ONLY when content changed, so a clean tree after regen = fresh,
-# nothing to commit. The commit is scoped to docs/codemap.md alone so nothing else is swept in.
+# Race-guarded four ways: (1) only when the project has already ADOPTED the codemap (the committed
+# docs/codemap.md exists — never materialize a new one); (2) HERD-336: the whole regenerate→commit→push
+# leg SERIALIZES per-checkout (_refresh_run_locked) so two concurrent legs can never race the shared
+# checkout's rebase; a lock held by a live leg → skip; (3) a PRE-EXISTING dirty docs/codemap.md is a
+# stranded regeneration (the map is engine-generated, so under the lock it is never a concurrent human
+# edit) → ABSORB it into this regen commit rather than skip forever; (4) codemap.sh rewrites the file
+# ONLY when content changed, so a clean tree after regen = fresh, nothing to commit. The commit is
+# scoped to docs/codemap.md alone, and NEVER lands on a detached HEAD (_refresh_guard_attached).
 # HERD-159: unrecognized values fail soft toward ACTIVE via _codemap_auto (cosmetic key).
 refresh_codemap() {
   local rc_pr="${1:-}" rc_prov="${2:-}" rc_out="docs/codemap.md" rc_script="$HERE/codemap.sh" rc_msg
@@ -4953,43 +5088,72 @@ refresh_codemap() {
   esac
   [ -f "$rc_script" ]      || { _rc_j result skipped reason no-script;  return 0; }
   [ -f "$MAIN/$rc_out" ]   || { _rc_j result skipped reason no-codemap; return 0; }
-  # A pending change already on docs/codemap.md means someone else is mid-edit — leave it alone.
-  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    _rc_j result skipped reason dirty-path; return 0
+  # HERD-336 (a): SERIALIZE the whole regenerate→commit→push leg per checkout. The cheap guards above
+  # stay OUTSIDE the lock so OFF and an unadopted repo remain byte-inert and take on no lock churn.
+  _rc_body() {
+    # HERD-336 (b): a PRE-EXISTING dirty docs/codemap.md is NOT a concurrent human edit — the map is
+    # engine-generated, and under the serialization lock no other refresh leg can own it. It is a
+    # stranded regeneration from a crashed/detached leg; ABSORB it into this regeneration commit
+    # rather than skipping forever (the old dirty-path skip stranded it — the live symbol-index corpse).
+    if [ -n "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+      _rc_j result absorbing reason dirty-derived
+    fi
+    # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+    if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
+      _rc_j result error reason regen-failed; return 0
+    fi
+    # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
+    if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
+      _rc_j result fresh; return 0
+    fi
+    # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
+    # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+    if [ -n "$rc_pr" ]; then
+      rc_msg="chore: refresh codemap after PR #${rc_pr}"
+    elif [ "$rc_prov" = "reconcile" ]; then
+      rc_msg="chore: refresh codemap (reconcile)"
+    else
+      rc_msg="chore: refresh codemap"
+    fi
+    # HERD-336 (b): NEVER commit onto a detached HEAD (the refresh-race corpse). Journal it, reattach
+    # the default branch, and skip — the regeneration is cheap to redo on a later tick.
+    if ! _refresh_guard_attached; then
+      _rc_j result skipped reason detached-head pushed no; return 0
+    fi
+    if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
+      _rc_j result error reason commit-failed; return 0
+    fi
+    if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      _rc_j result committed pushed yes; return 0
+    fi
+    # Push rejected → rebase once and retry. HERD-336: a rebase-pull can leave HEAD detached — verify
+    # attachment BEFORE the retry push, and reattach (never HEAD~1-reset a detached HEAD, which would
+    # strand the branch) if it did.
+    if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      if _main_head_attached; then
+        if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+          _rc_j result committed pushed yes-after-rebase; return 0
+        fi
+      else
+        _refresh_guard_attached || true
+        _rc_j result error reason detached-head pushed no; return 0
+      fi
+    fi
+    if ! _main_head_attached; then
+      _refresh_guard_attached || true
+      _rc_j result error reason detached-head pushed no; return 0
+    fi
+    git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+    # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+    # never drifts ahead of origin. The map is regenerable — not committing is byte-safe. A stranded
+    # commit here would permanently diverge the seat and make herd update die on ff-only forever.
+    git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+    _rc_j result error reason push-rejected pushed no
+    return 0
+  }
+  if ! _refresh_run_locked _rc_body; then
+    _rc_j result skipped reason locked
   fi
-  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
-  if ! HERD_CODEMAP_ROOT="$MAIN" HERD_CODEMAP_OUT="$MAIN/$rc_out" bash "$rc_script" >/dev/null 2>&1; then
-    _rc_j result error reason regen-failed; return 0
-  fi
-  # Unchanged content → codemap.sh left the file (and its mtime) alone → nothing to commit.
-  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rc_out" 2>/dev/null)" ]; then
-    _rc_j result fresh; return 0
-  fi
-  # Content changed → commit ONLY docs/codemap.md and push ff-safe (never --force). A rejected push
-  # (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if [ -n "$rc_pr" ]; then
-    rc_msg="chore: refresh codemap after PR #${rc_pr}"
-  elif [ "$rc_prov" = "reconcile" ]; then
-    rc_msg="chore: refresh codemap (reconcile)"
-  else
-    rc_msg="chore: refresh codemap"
-  fi
-  if ! git -C "$MAIN" commit -q -m "$rc_msg" -- "$rc_out" >/dev/null 2>&1; then
-    _rc_j result error reason commit-failed; return 0
-  fi
-  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rc_j result committed pushed yes; return 0
-  fi
-  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
-     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rc_j result committed pushed yes-after-rebase; return 0
-  fi
-  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
-  # never drifts ahead of origin. The map is regenerable — not committing is byte-safe. A stranded
-  # commit here would permanently diverge the seat and make herd update die on ff-only forever.
-  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
-  _rc_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5001,10 +5165,13 @@ refresh_codemap() {
 # non-zero into do_merge. Optional <provenance> mirrors refresh_codemap (HERD-218 reconcile path).
 #
 # Shares the CODEMAP_AUTOREFRESH lever (both are committed engine maps kept fresh at zero token cost)
-# and the same three race guards as refresh_codemap: (1) only when the project has ADOPTED the index
-# (the committed docs/symbol-index.md exists — never materialize a new one); (2) skip if that path
-# already carries an uncommitted change; (3) symbol-index.sh rewrites the file ONLY when content
-# changed, so a clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md.
+# and the same guards as refresh_codemap: (1) only when the project has ADOPTED the index (the committed
+# docs/symbol-index.md exists — never materialize a new one); (2) HERD-336: the whole regenerate→commit→
+# push leg SERIALIZES per-checkout so concurrent legs never race the shared rebase (lock held → skip);
+# (3) a PRE-EXISTING dirty docs/symbol-index.md is a stranded regeneration → ABSORB it into this regen
+# commit rather than skip forever; (4) symbol-index.sh rewrites the file ONLY when content changed, so a
+# clean tree after regen = fresh, nothing to commit. Scoped to docs/symbol-index.md; never commits onto
+# a detached HEAD (_refresh_guard_attached).
 refresh_symbol_index() {
   local rs_pr="${1:-}" rs_prov="${2:-}" rs_out="docs/symbol-index.md" rs_script="$HERE/symbol-index.sh" rs_msg
   _rs_j() {
@@ -5020,43 +5187,68 @@ refresh_symbol_index() {
   esac
   [ -f "$rs_script" ]    || { _rs_j result skipped reason no-script; return 0; }
   [ -f "$MAIN/$rs_out" ] || { _rs_j result skipped reason no-index;  return 0; }
-  # A pending change already on docs/symbol-index.md means someone else is mid-edit — leave it alone.
-  if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    _rs_j result skipped reason dirty-path; return 0
+  # HERD-336 (a): SERIALIZE the whole regenerate→commit→push leg per checkout (cheap guards above stay
+  # outside the lock so OFF / an unadopted repo remain byte-inert).
+  _rs_body() {
+    # HERD-336 (b): ABSORB a PRE-EXISTING dirty docs/symbol-index.md (a stranded regeneration from a
+    # crashed/detached leg — the map is engine-generated, so under the lock it is never a human edit)
+    # into this regeneration commit rather than skipping forever.
+    if [ -n "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+      _rs_j result absorbing reason dirty-derived
+    fi
+    # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
+    if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
+      _rs_j result error reason regen-failed; return 0
+    fi
+    # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
+    if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
+      _rs_j result fresh; return 0
+    fi
+    # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
+    # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
+    if [ -n "$rs_pr" ]; then
+      rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
+    elif [ "$rs_prov" = "reconcile" ]; then
+      rs_msg="chore: refresh symbol-index (reconcile)"
+    else
+      rs_msg="chore: refresh symbol-index"
+    fi
+    # HERD-336 (b): NEVER commit onto a detached HEAD; journal, reattach, skip (regen is cheap to redo).
+    if ! _refresh_guard_attached; then
+      _rs_j result skipped reason detached-head pushed no; return 0
+    fi
+    if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
+      _rs_j result error reason commit-failed; return 0
+    fi
+    if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      _rs_j result committed pushed yes; return 0
+    fi
+    # Push rejected → rebase once and retry; verify HEAD attachment before the retry push (HERD-336).
+    if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+      if _main_head_attached; then
+        if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+          _rs_j result committed pushed yes-after-rebase; return 0
+        fi
+      else
+        _refresh_guard_attached || true
+        _rs_j result error reason detached-head pushed no; return 0
+      fi
+    fi
+    if ! _main_head_attached; then
+      _refresh_guard_attached || true
+      _rs_j result error reason detached-head pushed no; return 0
+    fi
+    git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
+    # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
+    # never drifts ahead of origin. The index is regenerable — not committing is byte-safe. A
+    # stranded commit here would permanently diverge the seat and make herd update die forever.
+    git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
+    _rs_j result error reason push-rejected pushed no
+    return 0
+  }
+  if ! _refresh_run_locked _rs_body; then
+    _rs_j result skipped reason locked
   fi
-  # Regenerate in place against the freshly ff'd $MAIN (the seams the hermetic tests also drive).
-  if ! HERD_SYMBOL_INDEX_ROOT="$MAIN" HERD_SYMBOL_INDEX_OUT="$MAIN/$rs_out" bash "$rs_script" >/dev/null 2>&1; then
-    _rs_j result error reason regen-failed; return 0
-  fi
-  # Unchanged content → symbol-index.sh left the file (and its mtime) alone → nothing to commit.
-  if [ -z "$(git -C "$MAIN" status --porcelain -- "$rs_out" 2>/dev/null)" ]; then
-    _rs_j result fresh; return 0
-  fi
-  # Content changed → commit ONLY docs/symbol-index.md and push ff-safe (never --force). A rejected
-  # push (another direct-commit landed first) rebases once and retries; a genuine failure fails soft.
-  if [ -n "$rs_pr" ]; then
-    rs_msg="chore: refresh symbol-index after PR #${rs_pr}"
-  elif [ "$rs_prov" = "reconcile" ]; then
-    rs_msg="chore: refresh symbol-index (reconcile)"
-  else
-    rs_msg="chore: refresh symbol-index"
-  fi
-  if ! git -C "$MAIN" commit -q -m "$rs_msg" -- "$rs_out" >/dev/null 2>&1; then
-    _rs_j result error reason commit-failed; return 0
-  fi
-  if git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rs_j result committed pushed yes; return 0
-  fi
-  if git -C "$MAIN" pull --rebase --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1 \
-     && git -C "$MAIN" push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
-    _rs_j result committed pushed yes-after-rebase; return 0
-  fi
-  git -C "$MAIN" rebase --abort >/dev/null 2>&1 || true
-  # Push rejected (protected branch hook or a permanent race): roll back the commit so local main
-  # never drifts ahead of origin. The index is regenerable — not committing is byte-safe. A
-  # stranded commit here would permanently diverge the seat and make herd update die forever.
-  git -C "$MAIN" reset --hard HEAD~1 >/dev/null 2>&1 || true
-  _rs_j result error reason push-rejected pushed no
   return 0
 }
 
@@ -5085,6 +5277,8 @@ refresh_symbol_index() {
 
 MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALABLE: "<reason> <behind> <ahead>"
 MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
+MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
+CHECKOUT_CLEAN_STATE="$TREES/.agent-watch-checkout-clean" # HERD-361: the shared-checkout cleanliness violation signature (absent = clean); drives the row + dedups the journal
 
 # _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
 # MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
@@ -5398,22 +5592,66 @@ _main_fresh_note_restart() {
   return 0
 }
 
+# _main_reattach_if_detached — HERD-336 shared-checkout invariant. Returns 0 when $MAIN's HEAD is
+# ATTACHED (the caller proceeds); returns 1 when it was DETACHED and handled this tick (the caller must
+# stop — the next tick reconciles on the reattached branch). A detached HEAD in the shared checkout is
+# never a human's deliberate state (a human parks on a NAMED branch); it is the refresh-race corpse that
+# once sat detached until a human `git pull` failed. Journals main_detached ONCE per detached sha
+# (deduped via $MAIN_DETACHED_STATE so a persisting detachment does not spam), then reattaches to the
+# default branch IFF every commit the detached HEAD holds beyond origin is one of our own regenerable
+# maps (or there are none) — a detached HEAD carrying a human's real commit is journaled but LEFT for a
+# human, never silently discarded. Fully fail-soft.
+_main_reattach_if_detached() {
+  local _rd_sref _rd_head _rd_up _rd_prev
+  _rd_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_rd_sref" ]; then
+    rm -f "$MAIN_DETACHED_STATE" 2>/dev/null || true    # attached → clear any prior detached row
+    return 0
+  fi
+  _rd_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  _rd_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+  _rd_prev="$(cat "$MAIN_DETACHED_STATE" 2>/dev/null || true)"
+  if [ "$_rd_prev" != "$_rd_head" ]; then
+    mkdir -p "$TREES" 2>/dev/null || true
+    printf '%s\n' "$_rd_head" > "$MAIN_DETACHED_STATE" 2>/dev/null || true
+    _journal_main_detached detected "$_rd_head"
+  fi
+  # Reattach only when the detached commits beyond origin are our own regenerable maps (or none).
+  if git -C "$MAIN" rev-parse --verify --quiet "$_rd_up" >/dev/null 2>&1 \
+     && _main_fresh_generated_only "$_rd_up"; then
+    if _reattach_default_branch; then
+      _journal_main_detached reattached "$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+      rm -f "$MAIN_DETACHED_STATE" 2>/dev/null || true
+    fi
+  fi
+  return 1
+}
+
 # reconcile_main_freshness — the HERD-233 tick-level invariant. Call once per watcher tick, before
 # the map reconcile (so the maps are probed against a fresh HEAD). Safe to call repeatedly.
 reconcile_main_freshness() {
-  local _mf_up _mf_head _mf_new _mf_counts _mf_ahead _mf_behind _mf_dirty _mf_restart=no
+  local _mf_up _mf_head _mf_new _mf_counts _mf_ahead _mf_behind _mf_dirty _mf_restart=no _mf_sref
   [ -n "${DRYRUN:-}" ] && return 0
   [ -n "${MAIN:-}" ] || return 0
   { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
-  # A $MAIN parked on some other branch is a human's deliberate state — out of scope, not an alarm.
-  [ "$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${HERD_BRANCH_NAME:-}" ] \
-    || return 0
+  # A $MAIN parked on some other NAMED branch is a human's deliberate state — out of scope, not an
+  # alarm. A DETACHED HEAD (symbolic-ref empty) is different: HERD-336's refresh-race corpse, handled
+  # below the read-only recheck and the gate defer.
+  _mf_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_mf_sref" ] && [ "$_mf_sref" != "${HERD_BRANCH_NAME:-}" ]; then
+    return 0
+  fi
   # HERD-259: a standing held row is re-derived from observed git state BEFORE any defer below it —
   # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
   # fetch is failing. Read-only, and a no-op when no row is held.
   _main_fresh_recheck
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
+  # HERD-336: a detached shared checkout — journal + reattach (when the detached commits are only our
+  # regenerable maps), then defer the rest of the reconcile to the next tick on the reattached branch.
+  if [ -z "$_mf_sref" ]; then
+    _main_reattach_if_detached || return 0
+  fi
 
   _mf_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
   # Fail-soft: a fetch failure NEVER blocks the tick and never alarms (offline, or a gh/network blip
@@ -5484,6 +5722,83 @@ reconcile_main_freshness() {
   return 0
 }
 
+# ── Shared-checkout cleanliness invariant (HERD-361) ──────────────────────────────────────────────
+# Multi-seat doctrine Rule 1: the shared checkout ($MAIN) must be ATTACHED to the default branch with
+# NO staged changes and no tracked modifications other than the derived docs a refresh commit absorbs.
+# A violation is the fingerprint of a suite test (or any tool) that staged/stashed in $PWD while running
+# FROM the shared checkout — exactly the HERD-361 contamination (PR #466's whole diff found staged in
+# $MAIN, byte-identical to the builder's commit). reconcile_main_freshness returns clean the instant
+# $MAIN is at origin (ahead=0 behind=0) BEFORE it looks at the tree, so a staged-but-otherwise-fresh
+# checkout slips past it — this check closes that hole by keying off observed git state EVERY tick,
+# independent of any merge event, so it fires no matter which seat caused it.
+#
+# ADVISORY + EVIDENCE-PRESERVING: a loud console row (build_checkout_cleanliness) + one journal event
+# naming the offending paths. It NEVER discards (no git reset/checkout/clean) — the staged diff is the
+# evidence a human needs to root-cause. Deduped per (head + detached + path-set) so a standing violation
+# journals once; the console row paints every tick it stands. Fully fail-soft; never blocks a tick.
+
+# _checkout_offenders — emit, one repo-relative path per line, every $MAIN path that is STAGED (index
+# differs from HEAD) or tracked-MODIFIED in the worktree, EXCLUDING untracked scratch (?? — not a
+# tracked modification) and the regenerable derived files a refresh commit legitimately owns (the
+# render/config-local set via herd_strip_derived, plus docs/codemap.md + docs/symbol-index.md).
+_checkout_offenders() {
+  git -C "$MAIN" status --porcelain 2>/dev/null | while IFS= read -r _co_line; do
+    [ -n "$_co_line" ] || continue
+    local _co_xy="${_co_line:0:2}" _co_x="${_co_line:0:1}" _co_y="${_co_line:1:1}" _co_path="${_co_line:3}"
+    case "$_co_xy" in '??'*) continue ;; esac      # untracked — neither staged nor a tracked modification
+    # Staged iff the index column is not blank; tracked-worktree-modified iff the worktree column is not blank.
+    if [ "$_co_x" != ' ' ] || [ "$_co_y" != ' ' ]; then
+      case "$_co_path" in *' -> '*) _co_path="${_co_path##* -> }" ;; esac   # rename "orig -> new" → report new
+      printf '%s\n' "$_co_path"
+    fi
+  done | herd_strip_derived | grep -vxE 'docs/(codemap|symbol-index)\.md' || true
+}
+
+# reconcile_checkout_cleanliness — call once per watcher tick (after the freshness reconciles so it
+# reads the ff'd HEAD). Safe to call repeatedly; byte-inert on a clean checkout (no state file, no
+# journal, no row). A $MAIN parked on some OTHER named branch is a human's deliberate state → out of
+# scope. A DETACHED HEAD is itself a violation of "attached to the default branch" (reconcile_main_
+# freshness owns the reattach; here it is only recorded as part of the cleanliness signal — never
+# discarded). Records the violation signature to $CHECKOUT_CLEAN_STATE for the row and dedups the journal.
+reconcile_checkout_cleanliness() {
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -n "${MAIN:-}" ] || return 0
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
+  local _cc_sref _cc_head _cc_detached="" _cc_offenders _cc_key _cc_prev _cc_paths
+  _cc_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$_cc_sref" ] && [ "$_cc_sref" != "${HERD_BRANCH_NAME:-main}" ]; then
+    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true        # parked on another branch → out of scope, clear
+    return 0
+  fi
+  [ -z "$_cc_sref" ] && _cc_detached="detached"
+  _cc_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_cc_head" ] || return 0
+  _cc_offenders="$(_checkout_offenders)"
+  # Clean AND attached → drop any standing row (byte-inert happy path).
+  if [ -z "$_cc_offenders" ] && [ -z "$_cc_detached" ]; then
+    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true
+    return 0
+  fi
+  # Dedup the journal per (head + detached + offender-set); the console row is re-derived each tick.
+  _cc_key="$_cc_head|${_cc_detached:-attached}|$(printf '%s' "$_cc_offenders" | tr '\n' ',')"
+  _cc_prev="$(sed -n '1p' "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true)"
+  mkdir -p "$TREES" 2>/dev/null || true
+  # State file: line 1 = dedup signature; line 2 = head; line 3 = detached flag; lines 4+ = offenders.
+  {
+    printf '%s\n' "$_cc_key"
+    printf '%s\n' "$_cc_head"
+    printf '%s\n' "${_cc_detached:-attached}"
+    [ -n "$_cc_offenders" ] && printf '%s\n' "$_cc_offenders"
+  } > "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true
+  [ "$_cc_prev" = "$_cc_key" ] && return 0                   # unchanged since last tick → paint, don't re-journal
+  _cc_paths="$(printf '%s' "$_cc_offenders" | tr '\n' ' ')"
+  journal_append checkout_unclean head "$_cc_head" \
+    detached "${_cc_detached:-no}" \
+    paths "${_cc_paths:-none}" \
+    result violation component audit
+  return 0
+}
+
 # ── Tick-level map-freshness reconcile (HERD-218) ─────────────────────────────────────────────────
 # Multi-seat doctrine Rule 1: map freshness is a RECONCILED INVARIANT, not a do_merge side-effect.
 # refresh_codemap / refresh_symbol_index still fire on THIS seat's merges (fast path). When another
@@ -5500,12 +5815,15 @@ reconcile_main_freshness() {
 #     merge the maps are fresh, so the probe no-ops; the sha memo prevents re-probe until HEAD moves.
 # Fully fail-soft; never blocks a tick.
 
-# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted change,
-# so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+# _map_reconcile_mid_op — true when a builder/gate is mid-flight OR $MAIN has any uncommitted NON-map
+# change, so the tick-level map reconcile must defer (no double-commit; never step on an in-flight op).
+# HERD-336: a dirty docs/codemap.md / docs/symbol-index.md is EXCUSED — those are the maps this reconcile
+# itself owns, and a stranded dirty one (the live symbol-index corpse) must NOT block the reconcile that
+# would ABSORB it forever; refresh_codemap / refresh_symbol_index fold it into their next regen commit.
 _map_reconcile_mid_op() {
   _watch_gate_inflight && return 0
-  # Any dirty path on $MAIN → a concurrent writer (or a partial write) owns the tree this tick.
-  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null)" ] && return 0
+  # Any dirty NON-derived-map path on $MAIN → a concurrent writer (or a partial write) owns the tree.
+  [ -n "$(git -C "$MAIN" status --porcelain 2>/dev/null | grep -vE ' docs/(codemap|symbol-index)\.md$')" ] && return 0
   return 1
 }
 
@@ -11459,6 +11777,35 @@ build_sweep_note() {
 # under an alive holder (rm+recreate) — the recorded pid still proves a watcher is up. Lib-visible
 # (defined above the AGENT_WATCH_LIB return) so the unit test can drive it directly; called once at
 # main startup below.
+_watcher_holder_argv() {
+  # _watcher_holder_argv <pid> — command line of <pid>, ≤100 chars. Diagnostic only; fail-soft.
+  local p="${1:-}"
+  [ -n "$p" ] || return 0
+  local a
+  a="$(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null \
+      || ps -o command= -p "$p" 2>/dev/null || true)"
+  printf '%s' "${a:0:100}"
+}
+
+_watcher_lock_flock_holder() {
+  # _watcher_lock_flock_holder — print the pid holding the flock on HERD_WATCHER_LOCK, or empty.
+  local lock="${HERD_WATCHER_LOCK:-}"
+  [ -n "$lock" ] && [ -f "$lock" ] || return 0
+  if command -v lsof >/dev/null 2>&1; then
+    local _wlfh_all; _wlfh_all="$(lsof -t -- "$lock" 2>/dev/null || true)"
+    printf '%s\n' "${_wlfh_all%%$'\n'*}"
+    return 0
+  fi
+  if [ -f /proc/locks ]; then
+    local inode
+    inode="$(stat -c '%i' "$lock" 2>/dev/null || true)"
+    [ -n "$inode" ] || return 0
+    awk -v ino="$inode" '
+      /FLOCK/ { n=split($6,a,":"); if (n>=3 && a[3]+0==ino+0) { print $5+0; exit } }
+    ' /proc/locks 2>/dev/null || true
+  fi
+}
+
 _watcher_singleton_refuse_msg() {
   # _watcher_singleton_refuse_msg <pid-or-empty> — one-line LOUD refuse on stderr (HERD-252).
   local _wl_holder="${1:-}"
@@ -11467,6 +11814,18 @@ _watcher_singleton_refuse_msg() {
   else
     printf 'herd-watch: already running — refusing duplicate\n' >&2
   fi
+}
+
+_watcher_singleton_refuse() {
+  # _watcher_singleton_refuse <pid-or-empty> — refuse loudly + journal watcher_restart_blocked.
+  # (c) HERD-342: every refused startup journals the holder identity so JOURNAL_AUDIT can surface it.
+  local _wlr_pid="${1:-}"
+  _watcher_singleton_refuse_msg "$_wlr_pid"
+  local _wlr_argv; _wlr_argv="$(_watcher_holder_argv "$_wlr_pid")"
+  journal_append watcher_restart_blocked \
+    holder_pid "${_wlr_pid:-unknown}" \
+    holder_argv "$_wlr_argv" \
+    workspace "${WORKSPACE_NAME:-}"
 }
 
 _acquire_watcher_singleton() {
@@ -11478,7 +11837,21 @@ _acquire_watcher_singleton() {
   # Trim trailing whitespace/newlines so a pid line is a clean integer for kill -0 + messaging.
   _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
   if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-    _watcher_singleton_refuse_msg "$_wl_rec"
+    # (d) HERD-342: if the live holder is marker-owned (an inflight gate worker, not a watcher main),
+    # reap it and retry once. Route through watcher-exempt.sh's predicate (HERD-266 seam).
+    local _wl_pp; _wl_pp="$(ps -o ppid= -p "$_wl_rec" 2>/dev/null | tr -d '[:space:]')" || _wl_pp="0"
+    if watcher_pid_exempt "$_wl_rec" "${_wl_pp:-0}"; then
+      kill "$_wl_rec" 2>/dev/null || true
+      local _wl_ki=0
+      while [ "$_wl_ki" -lt 5 ] && kill -0 "$_wl_rec" 2>/dev/null; do
+        sleep 0.1; _wl_ki=$((_wl_ki + 1))
+      done
+      if ! kill -0 "$_wl_rec" 2>/dev/null; then
+        rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+        _acquire_watcher_singleton; return $?  # holder gone — re-enter to take the lock
+      fi
+    fi
+    _watcher_singleton_refuse "$_wl_rec"
     return 1
   fi
   if command -v flock >/dev/null 2>&1; then
@@ -11489,7 +11862,7 @@ _acquire_watcher_singleton() {
       _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
       _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
       if [ -n "$_wl_rec" ] && [ "$_wl_rec" != "$$" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-        _watcher_singleton_refuse_msg "$_wl_rec"
+        _watcher_singleton_refuse "$_wl_rec"
         return 1
       fi
       # HERD-344: recorded pid is dead but flock is held by an orphaned gate worker that inherited
@@ -11497,6 +11870,15 @@ _acquire_watcher_singleton() {
       # handle on the old inode, unlink it so a new open creates an independent inode whose lock
       # state is clean, then re-acquire. The orphan retains its flock on the now-unlinked inode
       # and eventually releases it on exit — harmless once we hold the canonical path's lock.
+      # (b) HERD-342: capture the orphaned flock holder before unlinking — its identity lands in
+      # the bypass journal event so the operator can trace what was running.
+      local _wl_bh _wl_ba
+      _wl_bh="$(_watcher_lock_flock_holder 2>/dev/null || true)"
+      _wl_ba="$(_watcher_holder_argv "$_wl_bh" 2>/dev/null || true)"
+      journal_append watcher_singleton_bypass \
+        holder_pid "${_wl_bh:-unknown}" \
+        holder_argv "$_wl_ba" \
+        workspace "${WORKSPACE_NAME:-}"
       exec 9>&-
       rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
       exec 9>>"$HERD_WATCHER_LOCK"
@@ -11504,9 +11886,9 @@ _acquire_watcher_singleton() {
         _wl_rec="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
         _wl_rec="${_wl_rec%%[$'\t\r\n ']*}"
         if [ -n "$_wl_rec" ] && kill -0 "$_wl_rec" 2>/dev/null; then
-          _watcher_singleton_refuse_msg "$_wl_rec"
+          _watcher_singleton_refuse "$_wl_rec"
         else
-          _watcher_singleton_refuse_msg ""
+          _watcher_singleton_refuse ""
         fi
         return 1
       fi
@@ -11524,7 +11906,7 @@ _acquire_watcher_singleton() {
     _wl_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
     _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
     if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
-      _watcher_singleton_refuse_msg "$_wl_pid"
+      _watcher_singleton_refuse "$_wl_pid"
       return 1
     fi
     [ -z "$(find "$_wl_mtx" -prune -mmin -1 2>/dev/null)" ] && { rmdir "$_wl_mtx" 2>/dev/null || true; continue; }
@@ -11534,7 +11916,7 @@ _acquire_watcher_singleton() {
   _wl_pid="${_wl_pid%%[$'\t\r\n ']*}"
   if [ -n "$_wl_pid" ] && [ "$_wl_pid" != "$$" ] && kill -0 "$_wl_pid" 2>/dev/null; then
     rmdir "$_wl_mtx" 2>/dev/null || true
-    _watcher_singleton_refuse_msg "$_wl_pid"
+    _watcher_singleton_refuse "$_wl_pid"
     return 1
   fi
   # Stale or absent lock: write our PID (temp+mv for atomicity so readers never see a partial write).
@@ -11570,7 +11952,70 @@ _acquire_watcher_singleton() {
 #                          the watchdog, then drains the spawn queue and runs the reconcile/sweep legs
 #                          (Phase C) over the same state files + journal the Python engine writes. This
 #                          half stays bash per the port spike (console, sweeps, notes, retirement).
+# ── OPERATOR EMERGENCY PAUSE (HERD-347) ──────────────────────────────────────────────────────────
+# _engine_pause_config_value — read ENGINE_PAUSE FRESH from the config files THIS tick. Deliberately
+# reads the FILE, never $ENGINE_PAUSE — the loader UNSETS its internal path vars and a sourced env
+# value would only change on a watcher restart, but a pause lever must take effect on the next tick
+# with NO restart and no seat-local cache. The path is the config the watcher was launched bound to
+# ($HERD_CONFIG_FILE, exported into its env at launch), else the standard per-project path under
+# $PROJECT_ROOT — the SAME pair `herd config set` writes from the project root, so any seat's set is
+# what we read here. Machine-scope: the .herd/config.local overlay WINS over the committed baseline
+# (mirrors the load order in herd-config.sh). Fail-soft: an absent/unreadable file contributes
+# nothing; garbage is treated as off by _engine_paused. Byte-quiet — a pure read, no output/mutation.
+_engine_pause_config_value() {
+  local _ep_base _ep_dir _ep_f _ep_line _ep_val=""
+  _ep_base="${HERD_CONFIG_FILE:-}"
+  [ -n "$_ep_base" ] || { [ -n "${PROJECT_ROOT:-}" ] && _ep_base="${PROJECT_ROOT}/.herd/config"; }
+  [ -n "$_ep_base" ] || return 0
+  _ep_dir="$(dirname "$_ep_base" 2>/dev/null)" || return 0
+  for _ep_f in "$_ep_dir/config.local" "$_ep_base"; do
+    [ -n "$_ep_f" ] && [ -r "$_ep_f" ] || continue
+    _ep_line="$(grep -E '^[[:space:]]*ENGINE_PAUSE[[:space:]]*=' "$_ep_f" 2>/dev/null | tail -n1)" || _ep_line=""
+    [ -n "$_ep_line" ] || continue
+    # Strip `KEY =`, any trailing comment, and surrounding quotes/whitespace.
+    _ep_val="$(printf '%s\n' "$_ep_line" \
+      | sed -E 's/^[[:space:]]*ENGINE_PAUSE[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//; s/[[:space:]]*$//')"
+    break
+  done
+  printf '%s' "$_ep_val"
+}
+
+# _engine_paused — true iff ENGINE_PAUSE opts in (on). Default/unset/garbage → off (fail toward the
+# engine RUNNING, never a silent pause). Mirrors the truthy-token leniency of _flair_enabled so a
+# hand-edited ON/true/1 still holds, but `herd config set` only ever writes off|on (value_shape).
+_engine_paused() {
+  case "$(_engine_pause_config_value)" in
+    on|ON|On|true|TRUE|1|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _engine_tick_watchdog() {
+  # OPERATOR EMERGENCY PAUSE (HERD-347) — checked FRESH each tick, BEFORE the engine core runs. With
+  # ENGINE_PAUSE=on the Python live tick is SKIPPED entirely (zero gate/merge/refix dispatch), and the
+  # skipped tick is NOT counted as a fault: the fault streak, the engine-down banner, and its one-shot
+  # notification are all left untouched, so a deliberate pause never trips the 'engine down' alarm. The
+  # supervisor loop continues past this early return, so render, reconcile, sweeps and every alarm keep
+  # running — only the action engine is held. A LOUD '⏸ engine paused by operator' banner is painted;
+  # resume is one `herd config set ENGINE_PAUSE off`, effective on the very next tick with no restart.
+  if _engine_paused; then
+    ENGINE_PAUSE_ROW="    ${C_YELLOW}⏸ ${C_BOLD}engine paused by operator${C_RESET}${C_YELLOW} · ENGINE_PAUSE=on — NO gates/merges/refix are dispatching (render, reconcile & sweeps continue) · resume: ${C_DIM}herd config set ENGINE_PAUSE off${C_RESET}"$'\n'
+    if [ -z "${_ENGINE_PAUSE_DECLARED:-}" ]; then
+      _ENGINE_PAUSE_DECLARED=1
+      journal_append engine_paused by operator
+      herd_driver_notify "⏸ herd engine paused" "ENGINE_PAUSE=on — the engine core is not dispatching gates/merges; render/reconcile/sweeps continue. Resume with herd config set ENGINE_PAUSE off." default
+    fi
+    render   # repaint THIS tick so the paused banner shows immediately (mirrors the engine-down path)
+    return 0
+  fi
+  # NOT paused. If we WERE paused, announce the resume ONCE and clear the banner before the engine core
+  # runs again, so a resumed engine picks up cleanly this very tick.
+  if [ -n "${_ENGINE_PAUSE_DECLARED:-}" ]; then
+    _ENGINE_PAUSE_DECLARED=""
+    ENGINE_PAUSE_ROW=""
+    journal_append engine_resumed by operator
+    herd_driver_notify "🐑 herd engine resumed" "ENGINE_PAUSE=off — the engine core is dispatching gates and merges again." default
+  fi
   # Run the sole engine core (the Python live tick) with an in-tick backoff RETRY, then translate a
   # persistent fault into the loud engine-down HOLD. State is carried in the long-lived watcher process
   # via the module globals initialised near the other tick counters (_ENGINE_FAULT_STREAK etc.).
@@ -11652,6 +12097,7 @@ _tick_render_reconcile() {
   # and forever if the reconcile keeps deferring. Byte-inert (one `[ -s ]`) with no row held.
   _main_fresh_recheck
   build_main_freshness
+  build_checkout_cleanliness   # HERD-361: the shared-checkout cleanliness row (empty unless contaminated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
 
@@ -11734,8 +12180,8 @@ EOF
       # classification entirely — those all key off "PR-less", which a merged builder trivially is.
       DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rt_state" "$(_retire_detail_of "$slug")")"
       case "$_rt_state" in
-        retiring) FLAIR_STATE[i]="busy" ;;
-        *)        FLAIR_STATE[i]="attention" ;;
+        retiring|deferred) FLAIR_STATE[i]="busy" ;;   # HERD-356: deferred is the herd waiting, not your move
+        *)                 FLAIR_STATE[i]="attention" ;;
       esac
     elif [ -z "$prnum" ]; then
       if [ "$matchkind" = "ambig" ]; then
@@ -12054,6 +12500,13 @@ EOF
   # config key), independent of CODEMAP_AUTOREFRESH, byte-inert when $MAIN is already current.
   reconcile_main_freshness
   reconcile_map_freshness
+
+  # Shared-checkout cleanliness invariant (HERD-361): the shared checkout must be attached to the default
+  # branch with no staged changes / tracked modifications other than derived docs awaiting a refresh
+  # commit. A violation (the fingerprint of a tool that staged/stashed in $PWD from $MAIN) is surfaced as
+  # a loud console row + one journal event naming the offending paths, and NEVER auto-discarded (evidence
+  # preservation). Keyed off observed git state each tick, so it holds no matter which seat caused it.
+  reconcile_checkout_cleanliness
 
   # Watcher SELF-RESTART (HERD-251): the reconcile above may have left a "new engine code" note. With
   # WATCHER_SELF_RESTART=on that note arms a QUIESCE (no new gate dispatch) and, once the in-flight
@@ -12492,6 +12945,7 @@ _ENGINE_TICK_RETRIES=3      # in-tick attempts of the Python live tick before th
 _ENGINE_BACKOFF_BASE=2      # seconds; in-tick backoff between attempts is attempt × this (2 s, 4 s)
 _ENGINE_DOWN_DECLARED=""    # set once the loud engine-down posture is active; cleared on recovery
 _HERD_ENGINE_TICK_LAST_ERR="" # last non-empty stderr line from the Python live tick (HERD-345); cleared on clean tick
+_ENGINE_PAUSE_DECLARED=""   # HERD-347: set while the operator ENGINE_PAUSE banner/journal/notify is active; cleared on resume
 
 # One-shot at STARTUP: resume teardown for any worktree whose PR merged but whose reap never ran
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a

@@ -28,6 +28,12 @@ in parallel.
      you (`herd note "<finding>"`). Drain and route them per *Builder notes* below **before** you act
      on any red row — a note is often the reason a row is red, and it is state no pane transcript
      will hand you.
+   - `herd log | grep config_viability` — **config viability**: external-consistency probe results
+     (HERD-355). A `status":"MISMATCH"` line means `.herd/config` disagrees with LIVE external reality
+     (a `MERGE_METHOD` the repo disallows, a required `herd/gates` check `GATE_STATUS=off` never posts,
+     an undriveable `MODEL_REVIEW` driver) — the reason a gate is "mysteriously stuck". The full
+     machine-readable snapshot is `$WORKTREES_DIR/.herd/config-viability.json`; run `herd doctor` to
+     refresh every probe. Fix the config (or the external side) before spawning against that gate.
 3. Present the menu with **AskUserQuestion**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo

@@ -654,6 +654,54 @@ RPSTUB
   fi
 fi
 
+# ── engine review-dispatch model (HERD-353): the python engine's review_dispatched event MUST record
+# the EFFECTIVE reviewer model — non-empty AND == the configured MODEL_REVIEW. The port regressed this:
+# MODEL_REVIEW is a NON-EXPORTED shell var in herd-config.sh, so the engine child (spawned by the
+# watcher) never saw it and journaled `model=` empty (the reviewer, which sources config itself, still
+# ran the right model — only the journal was wrong). This phase drives the REAL engine dispatch
+# (pysrc/herd/live_runtime.py LiveGates.review) end-to-end through the SAME chain the watcher uses: a
+# config file sets MODEL_REVIEW (deliberately NOT pre-exported into the caller env), herd-config.sh
+# sources + EXPORTS it, and the python child journals it. A stub herd-review.sh keeps the dispatch
+# hermetic (no reviewer spawned, no model call, no network). If either half regresses — the export in
+# herd-config.sh or the journal threading in live_runtime — the model field is empty and this fails.
+step engine-review-model "engine review dispatch journals the effective MODEL_REVIEW (non-empty, == config)"
+ROOT="$HERE/../../.."
+CFG_SH="$HERE/../herd-config.sh"
+if [ ! -f "$CFG_SH" ] || [ ! -d "$ROOT/pysrc/herd" ]; then
+  checkpoint engine_review_model_lib skip "herd-config.sh or pysrc/herd absent — engine review-dispatch phase skipped"
+else
+  ERM="$ART/engine-review-model"; mkdir -p "$ERM/home/scripts/herd" "$ERM/state" "$ERM/trees"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$ERM/home/scripts/herd/herd-review.sh"
+  chmod +x "$ERM/home/scripts/herd/herd-review.sh"
+  printf 'MODEL_REVIEW=sim-effective-review-model\n' > "$ERM/config"
+  ERM_JOURNAL="$ERM/journal.jsonl"; : > "$ERM_JOURNAL"
+  # -u MODEL_REVIEW / -u HERD_REVIEW_MODEL: prove the value flows from CONFIG (via the export), not a
+  # value the sim runner happened to inherit. herd-config.sh resolves + exports it; the python child reads it.
+  _erm_model="$( env -u MODEL_REVIEW -u HERD_REVIEW_MODEL \
+      HERD_CONFIG_FILE="$ERM/config" WORKTREES_DIR="$ERM/trees" PROJECT_ROOT="$ROOT" \
+      bash -c '
+        . "'"$CFG_SH"'" >/dev/null 2>&1
+        PYTHONPATH="'"$ROOT"'/pysrc" python3 - "'"$ERM/home"'" "'"$ERM/state"'" "'"$ERM_JOURNAL"'" <<'\''PY'\''
+import json, sys
+from herd.live_runtime import LiveGates, LiveState, LiveJournal, LiveCandidate
+home, state_dir, jpath = sys.argv[1], sys.argv[2], sys.argv[3]
+LiveGates(home, LiveState(state_dir), LiveJournal(jpath)).review(
+    LiveCandidate(913, "51de57ac", slug="sim-review-model-arg"))
+model = ""
+for line in open(jpath, encoding="utf-8"):
+    obj = json.loads(line)
+    if obj.get("event") == "review_dispatched":
+        model = obj.get("model", "")
+print(model)
+PY
+      ' 2>/dev/null | tail -1 )"
+  if [ "$_erm_model" = "sim-effective-review-model" ]; then
+    checkpoint engine_review_model pass "review_dispatched.model resolved the effective config MODEL_REVIEW (non-empty, exact match): $_erm_model"
+  else
+    checkpoint engine_review_model fail "review_dispatched.model was not the effective MODEL_REVIEW (got '$_erm_model', want 'sim-effective-review-model')"
+  fi
+fi
+
 # ── push-gate (HERD-123): PUSH_GATE=human — hold BEFORE push, approve to resume push + PR ────────
 # Proves the seam the item exists for, driving the REAL push-gate.sh + herd-approve.sh entry points
 # against a throwaway fixture with a LOCAL bare 'origin' remote (so a real `git push` works with no
