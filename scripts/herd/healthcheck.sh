@@ -78,6 +78,13 @@ done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
 . "$HERE/commit-lint.sh"
+# journal.sh only defines functions (no source-time side effects) and journal_append is best-effort +
+# always-0, so a partially-upgraded tree missing it must not break the healthcheck. Sourced solely so
+# the HERD-361 baseline-sandbox breadcrumb can journal a loud note when the sandbox can't be created.
+if [ -f "$HERE/journal.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/journal.sh"
+fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # caps-sync guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present so a branch that changes the lint is linted by
@@ -153,9 +160,12 @@ _changed_files() {
 # Scope: the GATING (full, non --oneline) path only — the --oneline status pane emits one summary line
 # with no TAP to diff, and it does not gate merges. The base suite runs at most once per red PR and is
 # cached by base sha (HERD_BASELINE_CACHE), so the two-fix-PR deadlock reuses one base run.
-#   HERD_BASELINE_DIR   — optional existing base (origin/main) checkout to run the base suite in; the
-#                         watcher passes $MAIN so no throwaway worktree is created. Absent → a detached
-#                         worktree of $DEFAULT_BRANCH is added + removed (fail-soft if that is refused).
+#   HERD_BASELINE_DIR   — optional existing base (origin/main) checkout whose HEAD supplies the base
+#                         SHA (the watcher passes $MAIN, the authoritative default-branch tree). HERD-361:
+#                         the base suite is NEVER run inside this live checkout — it is always run in a
+#                         DISPOSABLE detached worktree at that sha, so a suite test that stages/stashes in
+#                         $PWD can only contaminate the throwaway, never the shared checkout. Absent → the
+#                         base sha is resolved from this worktree's view of $DEFAULT_BRANCH instead.
 #   HERD_BASELINE_CACHE — optional dir for the sha-keyed base known-failure cache (watcher passes $TREES).
 
 # _baseline_aware_enabled — the feature is on (BASELINE_AWARE_GATE, default "on") AND this is the
@@ -187,51 +197,77 @@ _baseline_all_inherited() {
   [ -z "$(comm -23 <(printf '%s\n' "$1") <(printf '%s\n' "$2"))" ]
 }
 
+# _baseline_sandbox_note <why> <base-sha> — HERD-361 fail-soft breadcrumb: the base suite could NOT be
+# sandboxed (mktemp / worktree add refused), so the caller returns the empty set (classic block) rather
+# than fall back to running INSIDE the live shared checkout. Loud on stderr (lands in the streamed
+# healthcheck log) AND journaled when journal_append is in scope, so the skip is never silent.
+_baseline_sandbox_note() {
+  printf '⚠️  baseline sandbox unavailable (%s) — base suite NOT run; blocking on the classic absolute verdict (never run in the live shared checkout)\n' "${1:-unknown}" >&2
+  if command -v journal_append >/dev/null 2>&1; then
+    journal_append baseline_sandbox result unavailable reason "${1:-unknown}" base "${2:-}" component healthcheck
+  fi
+}
+
 # _baseline_base_set — the base (origin/main) known-failure set, printed as a sorted-unique newline
-# set (empty = base green / unresolvable → caller blocks). Resolves a base checkout (an explicit
-# HERD_BASELINE_DIR, else a throwaway detached worktree of $DEFAULT_BRANCH), runs the SAME heavy suite
-# there in FULL mode, and caches the extracted set by base sha. Fail-soft throughout: any git/worktree
-# failure yields the empty set, which routes the caller to the classic absolute (blocking) verdict.
+# set (empty = base green / unresolvable → caller blocks). Resolves the base SHA (an explicit
+# HERD_BASELINE_DIR's HEAD, else this worktree's view of $DEFAULT_BRANCH), then runs the SAME heavy
+# suite in FULL mode inside a DISPOSABLE detached worktree at that sha, and caches the extracted set by
+# base sha. HERD-361: the suite is ALWAYS sandboxed — even when HERD_BASELINE_DIR ($MAIN) is supplied it
+# is only read for the sha, never used as the run dir, so a suite test that stages/stashes in $PWD can
+# only ever dirty the throwaway. Fail-soft throughout: any git/worktree failure yields the empty set
+# (classic blocking verdict) — with a LOUD note, never a silent fall-through to the live checkout.
 _baseline_base_set() {
   local _bl_dir="" _bl_created="" _bl_base_sha _bl_pr_sha _bl_cache_dir _bl_cache _bl_out _bl_set _bl_tmp
+  # Resolve the base SHA. Prefer HERD_BASELINE_DIR's HEAD (the authoritative default-branch tree the
+  # watcher passes) so the cache key matches its intent; else this worktree's default-branch ref.
   if [ -n "${HERD_BASELINE_DIR:-}" ] && [ -d "$HERD_BASELINE_DIR" ] \
      && _bl_base_sha="$(git -C "$HERD_BASELINE_DIR" rev-parse HEAD 2>/dev/null)" && [ -n "$_bl_base_sha" ]; then
-    _bl_dir="$HERD_BASELINE_DIR"
+    :
   else
     _bl_base_sha="$(git -C "$DIR" rev-parse "$DEFAULT_BRANCH" 2>/dev/null || true)"
-    [ -n "$_bl_base_sha" ] || return 0                       # base ref unresolvable → empty set (block)
-    _bl_tmp="$(mktemp -d 2>/dev/null || true)"
-    [ -n "$_bl_tmp" ] || return 0
-    _bl_dir="$_bl_tmp/base"
-    if ! git -C "$DIR" worktree add --detach "$_bl_dir" "$_bl_base_sha" >/dev/null 2>&1; then
-      rm -rf "$_bl_tmp" 2>/dev/null || true
-      return 0                                                # base checkout refused → empty set (block)
-    fi
-    _bl_created="$_bl_tmp"
   fi
+  [ -n "$_bl_base_sha" ] || return 0                          # base ref unresolvable → empty set (block)
 
   # Self-comparison guard: if the worktree IS the base commit, nothing could have been introduced —
   # but an empty/degenerate PR is not the deadlock this fixes, so fall back to the classic verdict.
   _bl_pr_sha="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
   if [ -n "$_bl_pr_sha" ] && [ "$_bl_pr_sha" = "$_bl_base_sha" ]; then
-    [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
     return 0
   fi
 
+  # Cache hit → return the memoized set with NO suite run at all (so no sandbox is even created).
   _bl_cache_dir="${HERD_BASELINE_CACHE:-${TMPDIR:-/tmp}}"
   _bl_cache="$_bl_cache_dir/.herd-baseline-notok-$_bl_base_sha"
   if [ -f "$_bl_cache" ]; then
     cat "$_bl_cache" 2>/dev/null || true
-    [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
     return 0
   fi
+
+  # HERD-361: SANDBOX the base suite in a throwaway detached worktree at the base sha — NEVER run inside
+  # the live HERD_BASELINE_DIR. `git worktree add` only registers under the source's .git and never
+  # touches its working tree or index, so adding FROM the live shared checkout leaves it pristine while
+  # guaranteeing the base sha is reachable (it is that checkout's own HEAD). Prefer HERD_BASELINE_DIR as
+  # the source for exactly that reachability; else $DIR (which shares $MAIN's object store).
+  local _bl_src="$DIR"
+  [ -n "${HERD_BASELINE_DIR:-}" ] && [ -d "$HERD_BASELINE_DIR" ] && _bl_src="$HERD_BASELINE_DIR"
+  _bl_tmp="$(mktemp -d 2>/dev/null || true)"
+  if [ -z "$_bl_tmp" ]; then
+    _baseline_sandbox_note "mktemp failed" "$_bl_base_sha"; return 0
+  fi
+  _bl_dir="$_bl_tmp/base"
+  if ! git -C "$_bl_src" worktree add --detach "$_bl_dir" "$_bl_base_sha" >/dev/null 2>&1; then
+    rm -rf "$_bl_tmp" 2>/dev/null || true
+    _baseline_sandbox_note "worktree add refused" "$_bl_base_sha"; return 0
+  fi
+  _bl_created="$_bl_tmp"
 
   # Run the base suite in FULL mode (TAP), extract + cache its known-failure set. A tolerated data/env
   # (⚠️, rc 2) or clean (rc 0) base simply yields no 'not ok' lines → an empty set (base green).
   _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir'" 2>&1)"
   _bl_set="$(_baseline_notok_set "$_bl_out")"
   printf '%s\n' "$_bl_set" > "$_bl_cache" 2>/dev/null || true
-  [ -n "$_bl_created" ] && { git -C "$DIR" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true; rm -rf "$_bl_created" 2>/dev/null || true; }
+  git -C "$_bl_src" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true
+  rm -rf "$_bl_created" 2>/dev/null || true
   printf '%s\n' "$_bl_set"
 }
 
