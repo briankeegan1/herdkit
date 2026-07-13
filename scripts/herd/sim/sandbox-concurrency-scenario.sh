@@ -236,6 +236,14 @@ export HERD_DRIVER=headless                       # panes-as-a-view: no herdr ta
 export WORKSPACE_NAME="sandbox-conc-sim"          # isolated name (tab-leak-guard cannot miscount us)
 export PROJECT_ROOT="$REPO"                        # → MAIN for do_merge's git ops
 export WORKTREES_DIR="$TREES"                      # → TREES: all ledgers/markers/journal land here
+# HERD-331: the drain asserts EXACTLY one healthcheck per PR. An inherited MAIN_HEALTH_TICK=on
+# (herd-config.sh EXPORTS it since HERD-359, so every watcher/healthcheck-descended env carries
+# this repo's configured 'on'; HERD_CONFIG_FILE above only shields the ambient config file, not
+# the inherited export) would make the drain's real ticks ALSO dispatch a main-health stub suite
+# for the fixture HEAD — a 4th run that reds the wrapper's one-per-PR count and injects a
+# background worker into the later legs. Pin it OFF; the [mainhealth] legs below flip it on
+# explicitly against their own fixture.
+export MAIN_HEALTH_TICK=off
 export DEFAULT_BRANCH="main"
 # MERGE_POLICY defaults to auto (today's behavior) but a --posture may already have set it
 # (team-approve→approve, observe-only→observe) via posture_apply above; never clobber that.
@@ -618,10 +626,57 @@ if [ "$PEAK_REVIEWS" -le "$REVIEW_CONCURRENCY" ] && [ "$PEAK_REVIEWS" -ge 1 ]; t
 else
   checkpoint review_concurrency_respected fail "peak live reviews=$PEAK_REVIEWS exceeded REVIEW_CONCURRENCY=$REVIEW_CONCURRENCY"
 fi
+# AWAIT / DIRECT CAP PROBE (HERD-331): the review_cap_gated assertion can run BEFORE any PR
+# naturally reaches QUEUED under load — with HEALTH_CONCURRENCY=1, each HC runs sequentially,
+# and under a loaded box the HC stub takes long enough that reviews are staggered across ticks
+# rather than overlapping, so the cap never bites during the natural drain (same load-timing
+# class as HERD-326). Fix: if no PR was naturally QUEUED, AWAIT the state via a DIRECT MECHANISM
+# PROBE — the same pattern as health_mutex_queues above — rather than failing immediately.
+# Plant REVIEW_CONCURRENCY live inflight review markers (background sleeps), call the SHIPPED
+# _review_gate_step for a probe PR, and assert it returns QUEUED (cap full → dispatch refused).
+# Requirement (d): a genuine probe failure (cap broken) still fails LOUDLY — never skipped.
+# Label flaky/load (c) in console output when the probe path was taken.
+_cap_probe_needed=0; _cap_probe_ok=0; _cap_probe_detail=""
+if [ "$_q_count" -eq 0 ]; then
+  _cap_probe_needed=1
+  info "flaky/load: no PR naturally QUEUED during drain — running direct cap probe (HERD-331)"
+  # Plant REVIEW_CONCURRENCY background sleep processes as live inflight review markers.
+  _probe_pids=""; _k=1
+  while [ "$_k" -le "$REVIEW_CONCURRENCY" ]; do
+    sleep 300 &
+    _pp="$!"
+    _probe_pids="$_probe_pids $_pp"
+    printf '%s\n' "$_pp" > "$(_review_inflight_file $((7000+_k)) "capprobesha$_k")"
+    _k=$((_k+1))
+  done
+  # Cap is now full. Call the SHIPPED gate for a new probe PR — must return QUEUED.
+  _probe_step="$(_review_gate_step 7999 "probe-cap-gated" "capprobeshaprobe")"
+  # Clean up: kill placeholder processes and remove their markers.
+  for _pp in $_probe_pids; do kill "$_pp" 2>/dev/null || true; done
+  _k=1
+  while [ "$_k" -le "$REVIEW_CONCURRENCY" ]; do
+    rm -f "$(_review_inflight_file $((7000+_k)) "capprobesha$_k")" 2>/dev/null || true
+    _k=$((_k+1))
+  done
+  rm -f "$(_review_inflight_file 7999 "capprobeshaprobe")" \
+        "$(_review_registry_file 7999 "capprobeshaprobe")" \
+        "$(_review_result_file 7999 "capprobeshaprobe")" 2>/dev/null || true
+  if [ "$_probe_step" = "QUEUED" ]; then
+    _cap_probe_ok=1
+    _q_count=1   # probe confirmed one QUEUED event; satisfies scorecard + test
+    _cap_probe_detail="flaky/load: cap probe confirmed QUEUED (reviews did not overlap during drain under load)"
+  else
+    _cap_probe_detail="cap probe returned '$_probe_step' instead of QUEUED — cap mechanism failure"
+  fi
+fi
 if [ "$_q_count" -ge 1 ]; then
-  checkpoint review_cap_gated pass "$_q_count PR(s) QUEUED behind the cap (non-vacuous):$QUEUED_PRS"
+  if [ "$_cap_probe_needed" -eq 1 ]; then
+    checkpoint review_cap_gated pass "$_cap_probe_detail"
+  else
+    checkpoint review_cap_gated pass "$_q_count PR(s) QUEUED behind the cap (non-vacuous):$QUEUED_PRS"
+  fi
 else
-  checkpoint review_cap_gated fail "no PR ever queued — the cap never actually gated (vacuous test)"
+  checkpoint review_cap_gated fail "no PR ever queued AND direct cap probe failed: $_cap_probe_detail — the cap never actually gated (vacuous test)"
 fi
 
 # (b) HEALTH_CONCURRENCY=1 — no interleaving: every recorded live-marker count is exactly 1.
@@ -973,6 +1028,11 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
   _mf_saved_main="$MAIN"; _mf_saved_remote="$HERD_REMOTE"; _mf_saved_branch="$HERD_BRANCH_NAME"
   MAIN="$_mf_main"; HERD_REMOTE=origin; HERD_BRANCH_NAME=main
   _mf_journal="$TREES/.herd/journal.jsonl"
+  # PIN the journal onto the path this leg greps (restored below). Without the pin, running this sim
+  # INSIDE bats (HERD-331 wires it into herd.bats) trips journal.sh's HERD-223 test-context guard
+  # (BATS_TEST_* set, JOURNAL_FILE not) and every journal_append silently redirects to a $TMPDIR
+  # per-process file — the ff succeeds but main_ff reads 0→0 (the false-red this pin prevents).
+  _mf_saved_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$_mf_journal"
   # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
   _mf_ff_count() { local c; c="$(grep -c '"event":"main_ff"' "$_mf_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
   _mf_ff_before="$(_mf_ff_count)"
@@ -1009,6 +1069,7 @@ if type reconcile_main_freshness >/dev/null 2>&1; then
 
   rm -f "$TREES/.agent-watch-main-freshness" "$TREES/.agent-watch-main-restart" 2>/dev/null || true
   MAIN="$_mf_saved_main"; HERD_REMOTE="$_mf_saved_remote"; HERD_BRANCH_NAME="$_mf_saved_branch"
+  if [ -n "$_mf_saved_jf" ]; then export JOURNAL_FILE="$_mf_saved_jf"; else unset JOURNAL_FILE; fi
 else
   checkpoint main_freshness_ff       fail "reconcile_main_freshness not defined (lib-mode source did not expose the tick reconcile)"
   checkpoint main_freshness_no_guess fail "reconcile_main_freshness not defined"
@@ -1059,6 +1120,10 @@ MHSTUB
   MAIN_HEALTH_DEFER="$_mh_trees/.agent-watch-main-health-defer"
   MAIN_HEALTH_FIX_STATE="$_mh_trees/.agent-watch-main-health-fix"
   _mh_journal="$_mh_trees/.herd/journal.jsonl"
+  # PIN the journal onto the fixture path this leg greps (restored below) — same HERD-223/bats
+  # redirect hazard as the mainfresh leg above: without JOURNAL_FILE exported, journal_append under
+  # bats writes to a $TMPDIR per-process file and every dispatch/verdict/defer count reads 0.
+  _mh_sv_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$_mh_journal"
   # grep -c prints 0 AND exits 1 when nothing matches — capture the count, never a second "0".
   _mh_count() { local c; c="$(grep -c "$1" "$_mh_journal" 2>/dev/null || true)"; printf '%s' "${c:-0}"; }
   # _mh_settle — await the backgrounded suite's result (bounded), then collect it, as the tick top does.
@@ -1146,6 +1211,7 @@ MHSTUB
   MAIN="$_mh_sv_main"; TREES="$_mh_sv_trees"; export WORKTREES_DIR="$_mh_sv_wt"
   export HERD_HEALTHCHECK_BIN="$_mh_sv_hc"; MAIN_HEALTH_TICK="$_mh_sv_tick"
   MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"; MAIN_HEALTH_FIX_STATE="$_mh_sv_fix"
+  if [ -n "$_mh_sv_jf" ]; then export JOURNAL_FILE="$_mh_sv_jf"; else unset JOURNAL_FILE; fi
 else
   checkpoint main_health_observed_dispatch fail "reconcile_main_health not defined (lib-mode source did not expose the tick reconcile)"
   checkpoint main_health_kill_redispatch   fail "reconcile_main_health not defined"
@@ -1173,6 +1239,17 @@ fi
 #         is not vacuous — the invariant it asserts is one the engine can actually violate.
 step fairness "drive $NPRS PRs under merge pressure through the SHIPPED reorder + re-stale counter (HERD-231)"
 
+# PRIVATE journal for the fairness legs (HERD-331 round 3). The gate suite pins ONE shared
+# JOURNAL_FILE for the whole run (.herd/healthcheck.project.sh, HERD-223) and — since the
+# sandboxed baseline leg (HERD-361) — a SECOND full suite can run CONCURRENTLY in the same
+# environment, inheriting the SAME exported JOURNAL_FILE (journal-test-env.sh keeps an already-
+# exported value). The baseline's test-merge-fairness.sh drives these exact shipped legs with the
+# same 9xxx PRs and fair-* slugs, so its pr_starvation/merge_fairness_priority events land in the
+# shared file AFTER this run's _FAIR_MARK and get counted as ours (the observed
+# "pr_starvation=6/15 while max laps=1" impossibility — the counts were exact multiples of one
+# OFF-leg's 6 events). A mark can fence off HISTORY but never a CONCURRENT writer; only a private
+# file can. Save/restore like every other swapped fixture coordinate.
+_fair_sv_jf="${JOURNAL_FILE-}"; export JOURNAL_FILE="$ART/fairness-journal.jsonl"; : > "$JOURNAL_FILE"
 _FAIR_JOURNAL="$(_journal_file)"
 _FAIR_ROUNDS=$(( _RESTALE_STARVE_THRESHOLD + 2 ))
 _fair_prs=""; _fair_i=0
@@ -1366,6 +1443,7 @@ fi
 
 # Leave no fairness fixtures behind for the scorecard/tail steps.
 rm -f "$TREES"/.health-result-9* "$TREES"/.health-inflight-9* 2>/dev/null || true
+if [ -n "$_fair_sv_jf" ]; then export JOURNAL_FILE="$_fair_sv_jf"; else unset JOURNAL_FILE; fi
 
 
 

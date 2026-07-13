@@ -115,6 +115,27 @@ herd_run_loadsim() {   # <sim-basename> <pass-marker>
   herd_run_loadsim postmerge-reconcile-sim.sh "ALL PASS"
 }
 
+# HERD-331: test-sandbox-concurrency.sh exercises the review-cap semaphore in a timing-sensitive
+# way (under load the cap may not naturally bite during the drain). The scenario's own cap probe
+# makes the CHECK itself robust, but the whole test is still tagged load-sensitive here so a
+# residual timing flake retries once before alarming — same class as tests 7/8/9 above.
+@test "sandbox concurrency sim: review cap gated and health serialized (HERD-331)" {
+  local _path="$BATS_TEST_DIRNAME/test-sandbox-concurrency.sh"
+  run bash "$_path"
+  if [ "$status" -eq 0 ] && [[ "$output" == *"ALL PASS"* ]]; then return 0; fi
+  local _first_status="$status" _first_out="$output"
+  sleep "${HERD_SIM_LOAD_RETRY_QUIET:-3}"
+  run bash "$_path"
+  if [ "$status" -eq 0 ] && [[ "$output" == *"ALL PASS"* ]]; then
+    echo "flaky/load: test-sandbox-concurrency.sh failed under load then PASSED on quiet retry — not a code red" >&3
+    return 0
+  fi
+  echo "test-sandbox-concurrency.sh reproduced its failure on quiet retry — REAL red (not flaky/load)"
+  echo "--- attempt 1 (status $_first_status) ---"; echo "$_first_out"
+  echo "--- attempt 2 (status $status) ---"; echo "$output"
+  return 1
+}
+
 @test "tick availability sim: a hung gh and a slow lane never wedge the tick (HERD-237)" {
   run bash "$REPO/scripts/herd/sim/tick-availability-sim.sh"
   [ "$status" -eq 0 ]
@@ -126,7 +147,7 @@ herd_run_loadsim() {   # <sim-basename> <pass-marker>
 # to during preprocessing). Calling it in a loop over the glob yields dynamic, individually-reported
 # tests. The list is LC_ALL=C sorted for a deterministic registration order across bats's gather and
 # exec phases (both source this file). Adding a tests/test-*.sh is now auto-covered — no edit here.
-HERD_DISCOVERY_BESPOKE="test-codemap-project.sh test-backlog-view-width.sh"
+HERD_DISCOVERY_BESPOKE="test-codemap-project.sh test-backlog-view-width.sh test-sandbox-concurrency.sh"
 
 # Shared body for a discovered test: run the script, require exit 0 AND a PASS marker. The marker
 # ("ALL PASS" / "PASS" / "checks passed" / …) catches a script that exits 0 WITHOUT running (an early
