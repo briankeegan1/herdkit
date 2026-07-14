@@ -5085,6 +5085,16 @@ _refresh_run_locked() {
   [ -n "$_rl_took" ] || return 1        # a live leg holds it — skip (the winner's regen is fresh)
   printf '%s\n' "$$" > "$_rl_dir/pid" 2>/dev/null || true   # diagnostic only; never load-bearing
   "$_rl_body"
+  # HERD-364: the checkout-attached EXIT INVARIANT. The body reaches its many exits — success, refusal,
+  # regen/commit error, the push-rejected `reset --hard HEAD~1` rollback, a rebase abort — and any one of
+  # them (or a concurrent seat's rebase-pull racing our reset, the #471/#462-seconds-apart window) can
+  # leave $MAIN on a DETACHED HEAD, the corpse HERD-336's happy-path guards missed. Reattaching HERE,
+  # once, past EVERY body path but still UNDER the lock (no concurrent leg can be mid-write), makes
+  # "attached to the default branch" the leg's guaranteed post-condition rather than a best-effort call
+  # scattered through the body. Byte-inert when already attached (_refresh_guard_attached returns 0
+  # silently on the happy path); on a real detachment it journals main_detached detected+reattached and
+  # heals. Fail-soft — never aborts the tick.
+  _refresh_guard_attached || true
   rm -rf "$_rl_dir" 2>/dev/null || true
   return 0
 }

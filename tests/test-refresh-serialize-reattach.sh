@@ -124,4 +124,58 @@ jhas 'main_detached head .* result detected'   || fail "(3) reconcile did not jo
 jhas 'main_detached head .* result reattached' || fail "(3) reconcile did not journal main_detached reattached: $(cat "$JLOG")"
 ok
 
+# ── (4) EXIT INVARIANT (HERD-364): a body that DETACHES $MAIN mid-leg is reattached on exit ─────────
+# The refresh leg has paths (the push-rejected `reset --hard HEAD~1` rollback, a rebase-pull racing a
+# concurrent seat) that can leave $MAIN detached AFTER the body's own happy-path guards. _refresh_run_
+# locked must make "attached to the default branch" the leg's guaranteed post-condition — a finally-style
+# reattach past EVERY body path, not a happy-path call. Drive a body that detaches and returns; assert
+# the leg comes back attached and journaled the heal. Without the exit invariant $MAIN stays detached.
+new_repo four
+: > "$JLOG"
+_detaching_body() {                    # models a leg whose git churn ended on a detached HEAD
+  git -C "$MAIN" checkout -q --detach HEAD
+  return 0
+}
+_refresh_run_locked _detaching_body
+attached                                 || fail "(4) EXIT INVARIANT: a leg that detached mid-body was left detached — reattach must run on every exit path"
+[ -z "$(git -C "$MAIN" status --porcelain)" ] || fail "(4) EXIT INVARIANT left the tree dirty"
+[ "$(head_sha)" = "$(orig_sha)" ]        || fail "(4) EXIT INVARIANT did not align HEAD to origin after reattach"
+jhas 'main_detached head .* result detected'   || fail "(4) EXIT INVARIANT did not journal main_detached detected: $(cat "$JLOG")"
+jhas 'main_detached head .* result reattached' || fail "(4) EXIT INVARIANT did not journal main_detached reattached: $(cat "$JLOG")"
+ok
+
+# ── (5) EXIT INVARIANT byte-inert on the happy path: an ATTACHED body journals NO detachment ────────
+# The finally guard must be silent when the leg already ended attached (the common case), or every merge
+# would spam main_detached. Drive a body that stays on main; assert zero detachment journal lines.
+new_repo five
+: > "$JLOG"
+_attached_body() { return 0; }
+_refresh_run_locked _attached_body
+attached                                 || fail "(5) fixture: an attached body must stay attached"
+jhas 'main_detached'                     && fail "(5) the exit invariant journaled a detachment on the happy path — it must be byte-inert when attached: $(cat "$JLOG")"
+ok
+
+# ── (6) TWO-MERGES-SECONDS-APART window: a competing merge lands before our push → rebase, end attached ─
+# Reproduces the HERD-364 trigger: a second merge landed on origin seconds after ours, so the refresh
+# leg's push is rejected and it must pull --rebase + retry. Assert the leg ends ATTACHED, tree clean,
+# HEAD == origin, and the refresh commit landed — never a lingering detached corpse.
+new_repo six
+: > "$JLOG"; STUB_MAP="MAP v2"; c0="$(commits)"
+# A competing seat merges to origin between our regen and our push (advance origin/main out-of-band).
+COMPETITOR="$T/competitor-six"; git clone -q "$ORIGIN" "$COMPETITOR" 2>/dev/null
+git -C "$COMPETITOR" config user.email c@c.test; git -C "$COMPETITOR" config user.name competitor
+printf 'competing change\n' > "$COMPETITOR/other.txt"
+git -C "$COMPETITOR" add other.txt; git -C "$COMPETITOR" commit -q -m "feat: a competing merge"
+git -C "$COMPETITOR" push -q origin main
+# Our refresh leg now regenerates, commits locally, gets its push REJECTED (origin advanced), pulls
+# --rebase onto the competitor, and retries — the reset-HEAD~1 contention window.
+CODEMAP_AUTOREFRESH=true refresh_codemap 6
+attached                                 || fail "(6) TWO-MERGES window left \$MAIN detached"
+[ -z "$(git -C "$MAIN" status --porcelain)" ] || fail "(6) TWO-MERGES window left the tree dirty"
+[ "$(head_sha)" = "$(orig_sha)" ]        || fail "(6) TWO-MERGES window did not converge HEAD to origin/main"
+_six_log="$(git -C "$MAIN" log --oneline)"
+case "$_six_log" in *"refresh codemap"*) : ;; *) fail "(6) the refresh commit did not survive the rebase-retry: $_six_log" ;; esac
+jhas 'main_detached'                     && fail "(6) the rebase-retry path journaled a detachment — it must end cleanly attached: $(cat "$JLOG")"
+ok
+
 echo "PASS: test-refresh-serialize-reattach.sh ($pass checks)"
