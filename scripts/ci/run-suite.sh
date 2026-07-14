@@ -52,9 +52,20 @@ export HERD_RELOAD_SKIP_LAUNCH="${HERD_RELOAD_SKIP_LAUNCH:-1}"
 # fixture that journals cannot append to a live project journal (mirrors the dogfood healthcheck
 # sandbox + scripts/herd/journal-test-env.sh). HERD_JOURNAL_HERMETIC keeps the journal.sh fail-safe
 # armed even if a child unsets JOURNAL_FILE. A test that needs its own journal re-exports JOURNAL_FILE.
+#
+# HERD-363 PER-RUN KEYING: this is a SUITE runner, so it must not inherit a journal pinned by ANOTHER
+# suite instance running concurrently in the same environment (else the two runs share one file and a
+# journal-grepping test counts the other's events). Suffix the path with THIS process's pid and stamp
+# HERD_JOURNAL_PIN_PID; re-pin an inherited value only when it was pinned by a DIFFERENT process
+# (pid mismatch). A value with no pin stamp (an explicit caller pin) is respected — byte-identical for
+# a standalone CI run apart from the path suffix. Per-PROCESS keying ($$), never per-seat.
 _hk_ci_jh_dir="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/herd-ci-jherm-$$")"
 mkdir -p "$_hk_ci_jh_dir" 2>/dev/null || true
-export JOURNAL_FILE="${JOURNAL_FILE:-$_hk_ci_jh_dir/journal.jsonl}"
+if [ -z "${JOURNAL_FILE:-}" ] \
+   || { [ -n "${HERD_JOURNAL_PIN_PID:-}" ] && [ "${HERD_JOURNAL_PIN_PID}" != "$$" ]; }; then
+  export JOURNAL_FILE="$_hk_ci_jh_dir/journal.$$.jsonl"
+  export HERD_JOURNAL_PIN_PID="$$"
+fi
 : >> "$JOURNAL_FILE" 2>/dev/null || true
 export HERD_JOURNAL_HERMETIC=1
 trap 'rm -rf "$_hk_ci_jh_dir"' EXIT
