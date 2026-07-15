@@ -1237,9 +1237,21 @@ class LiveGates:
         cfg = config or {}
         self._health_max = _pos_int(cfg.get("HEALTH_CONCURRENCY"), 1)
         self._review_max = _pos_int(cfg.get("REVIEW_CONCURRENCY"), 2)
+        # HERD-373: a LiveGates instance is constructed fresh once per tick (_run_live_tick), so
+        # memoizing here is tick-scoped for free — never persisted, a new tick always re-evaluates.
+        self._main_health_pending_cache = None
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
+
+    def _main_health_pending_memo(self, state_dir):
+        """Memoized ``_main_health_pending(state_dir)`` — ONE ``rev-parse`` per tick, not one per
+        PR-health candidate (HERD-373). Cached on ``self`` because a LiveGates instance lives exactly
+        one tick (a fresh instance is constructed per ``--tick`` invocation, ``_run_live_tick``) — the
+        cache is never persisted and a new tick always re-evaluates."""
+        if self._main_health_pending_cache is None:
+            self._main_health_pending_cache = _main_health_pending(state_dir)
+        return self._main_health_pending_cache
 
     # ── health rail ────────────────────────────────────────────────────────────────────────────────
     def health(self, cand):
@@ -1311,7 +1323,7 @@ class LiveGates:
         # With HEALTH_CONCURRENCY=1 this collapses the effective limit to 0 — no new PR health suite
         # starts until main-health is dispatched. Fail-safe: _main_health_pending returns False on
         # any env error (missing MAIN, no git, etc.) so a misconfigured seat never blocks the PR rail.
-        _effective_max = self._health_max - (1 if _main_health_pending(st.dir) else 0)
+        _effective_max = self._health_max - (1 if self._main_health_pending_memo(st.dir) else 0)
         if _hc_n >= _effective_max:
             self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                 "inflight", _hc_n, "limit", self._health_max)

@@ -1638,6 +1638,67 @@ class TestMainHealthSlotPriority(unittest.TestCase):
         queued = [e for e in evs if e.get("event") == "health_queued"]
         self.assertEqual(queued, [], "health_queued must NOT be emitted when main-health slot is free")
 
+    # ── HERD-373: tick-scoped memoization of _main_health_pending ────────────────────────────────
+
+    class _CountingCheckOutputSub:
+        """Subprocess stand-in counting `check_output` calls — proves the memo collapses N candidates'
+        identical rev-parse subprocess spawns into exactly one per tick, never zero and never N."""
+
+        DEVNULL = subprocess.DEVNULL
+
+        def __init__(self, sha):
+            self.sha = sha
+            self.calls = 0
+
+        def check_output(self, *a, **k):
+            self.calls += 1
+            return (self.sha + "\n").encode()
+
+    def test_memo_one_rev_parse_across_multiple_candidates_same_tick(self):
+        """Two PR candidates walked through the SAME LiveGates (one tick) → exactly ONE rev-parse
+        subprocess spawn, not one per candidate (HERD-373)."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        _make_worktree(self.tmp, "feat-a")
+        _make_worktree(self.tmp, "feat-b")
+        cand_a = LiveCandidate(pr=10, sha="aaa111", slug="feat-a",
+                               worktree=os.path.join(self.tmp, "feat-a"))
+        cand_b = LiveCandidate(pr=11, sha="bbb222", slug="feat-b",
+                               worktree=os.path.join(self.tmp, "feat-b"))
+        gates = self._make_gates(os.path.join(self.tmp, "j-memo.jsonl"))
+        sub = self._CountingCheckOutputSub(sha)
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            r1 = gates.health(cand_a)
+            r2 = gates.health(cand_b)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(r1, WAIT)
+        self.assertEqual(r2, WAIT)
+        self.assertEqual(sub.calls, 1,
+                         "expected exactly ONE rev-parse across two candidates in the same tick")
+
+    def test_memo_new_tick_reevaluates(self):
+        """A NEW LiveGates instance (a new tick) re-runs the rev-parse — the memo is tick-scoped
+        ONLY, never cross-tick / persisted."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        _, sha = self._main_repo()
+        _make_worktree(self.tmp, "feat-c")
+        cand = LiveCandidate(pr=12, sha="ccc333", slug="feat-c",
+                             worktree=os.path.join(self.tmp, "feat-c"))
+        sub = self._CountingCheckOutputSub(sha)
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates1 = self._make_gates(os.path.join(self.tmp, "j-tick1.jsonl"))
+            gates1.health(cand)
+            gates2 = self._make_gates(os.path.join(self.tmp, "j-tick2.jsonl"))
+            gates2.health(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(sub.calls, 2, "a new LiveGates (new tick) must re-run the rev-parse")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
