@@ -6613,7 +6613,11 @@ _main_health_file_age_mins() {
 # runs, or a run that is not yet COMPLETED yields NOTHING and never paints a red row. Deduped by
 # (sha, conclusion) via $MAIN_HEALTH_CI_STATE so a standing CI red fires the row + journal exactly ONCE,
 # never per tick. The local-suite green→clear path (kind=local) only ever drops the LOCAL identity field
-# now (HERD-372) — a live CI red keeps standing, with zero re-set churn, until CI itself recovers.
+# now (HERD-372) — a live CI red keeps standing, with zero re-set churn, until CI ITSELF recovers, which
+# THIS leg — not the local-suite collector — is responsible for: a PASS bucket clears the CI identity
+# (kind=ci) and resets $MAIN_HEALTH_CI_STATE, but ONLY when a red was actually standing (a non-empty
+# dedup memo), so a routinely-green branch never journals a green/clear on every ~40s scan (the memo IS
+# the guard: no prior fire ⇒ nothing to clear ⇒ byte-quiet, same as before this leg ever fired once).
 
 # _main_ci_classify <expected-sha> — read a `gh run list --json headSha,status,conclusion,workflowName`
 # array on stdin and emit "<bucket>\t<workflow>\t<conclusion>" for the most-recent COMPLETED run whose
@@ -6650,9 +6654,11 @@ for r in runs:                       # gh returns newest-first
 ' "$1"
 }
 
-# _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs, and if
-# the latest COMPLETED run for the CURRENT main HEAD is FAILING, fires _main_health_set_red once per
-# (sha, conclusion). Lever-gated + fail-soft; always returns 0.
+# _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs. On a
+# FAILING conclusion for the CURRENT main HEAD, fires _main_health_set_red once per (sha, conclusion). On
+# a PASSING conclusion, clears the CI identity (HERD-372) — but only when $MAIN_HEALTH_CI_STATE shows a
+# red was actually standing, so a normally-green branch never journals on every scan. Lever-gated +
+# fail-soft; always returns 0.
 _main_health_ci_leg() {
   _main_health_enabled || return 0
   [ -n "${DRYRUN:-}" ] && return 0
@@ -6667,7 +6673,14 @@ _main_health_ci_leg() {
   IFS=$'\t' read -r _bucket _wf _concl <<EOF
 $_res
 EOF
-  [ "$_bucket" = "fail" ] || return 0                      # green / pending / stale → never a red row
+  if [ "$_bucket" = "pass" ]; then
+    _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
+    [ -n "$_prev" ] || return 0                            # no standing CI red to clear — byte-quiet
+    rm -f "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true       # re-arm: a later regression fires fresh
+    _main_health_clear "?" "$_sha" ci
+    return 0
+  fi
+  [ "$_bucket" = "fail" ] || return 0                      # pending / stale → never a red row, never a clear
   _line="$_sha $_concl"
   _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
   [ "$_prev" = "$_line" ] && return 0                      # already fired for this sha+conclusion — no spam

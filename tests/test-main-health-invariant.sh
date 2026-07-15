@@ -442,6 +442,21 @@ _main_health_ci_leg
 [ "$(jcount '"result":"red"')" -eq "$RED_JOURNAL_BEFORE" ] || fail "(g) a standing CI red re-set (re-journaled) after an unrelated local clear"
 [ "$(ncount 'MAIN RED')" -eq "$NOTIFY_BEFORE" ] || fail "(g) a standing CI red re-notified after an unrelated local clear"
 ok "(g) a local-suite green clears only the local identity: the CI red stands with zero re-set churn"
+
+# (h) CI itself recovering (a PASS bucket) clears the CI identity and the row disappears, since the
+# local identity was already cleared in (g). A repeat PASS probe (nothing standing) must stay byte-quiet.
+GREEN_JOURNAL_BEFORE="$(jcount '"result":"green"')"
+export GH_RUNS='[{"headSha":"'"$SHA372"'","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"build"}]'
+_main_health_ci_leg
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(h) a CI recovery (PASS) did not clear the standing CI identity: $(cat "$MAIN_HEALTH_STATE")"
+[ -z "$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)" ] || fail "(h) the CI dedup memo was not reset on recovery"
+[ "$(ncount 'main green')" -eq 1 ] || fail "(h) the final (both-identities-clear) recovery did not notify once"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+[ -z "$ROW" ] || fail "(h) the row survived once both identities cleared: $ROW"
+# A repeat PASS probe with nothing standing must stay byte-quiet (no green re-journal every ~40s scan).
+_main_health_ci_leg
+[ "$(jcount '"result":"green"')" -eq "$((GREEN_JOURNAL_BEFORE + 1))" ] || fail "(h) a routinely-green branch-CI probe journaled on every scan"
+ok "(h) a branch-CI recovery (PASS) clears the CI identity exactly once; a routinely-green branch stays byte-quiet"
 unset GH_RUNS
 
 # ── PR attribution: a trailing "(#N)" (the squash form) outranks an issue ref earlier in the subject ──
