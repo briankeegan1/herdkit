@@ -518,6 +518,21 @@ BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # watcher is byte-identical to before this feature.
 ORPHAN_PR_LEDGER="$TREES/.agent-watch-orphan-prs"
 ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the ledger is rewritten whole each tick)
+# Adopt-remote-PRs ledgers (HERD-369), sibling of the orphan-PR ledger above. Under ADOPT_REMOTE_PRS=on
+# the tick's ADOPT leg (built on top of the SAME orphan diff) attempts `git fetch` + `git worktree add`
+# per orphan PR. TWO separate ledgers, ADVISED (herd-advise.sh) against conflating "succeeded" with
+# "gave up": a fetch/worktree-add failure is not a completed operation — it is usually transient (a
+# network blip, a momentary ref lock) and self-heals on the next ~60s scan, so it is NEVER once-
+# guarded; only a SUCCESSFUL adopt is terminal for that (pr,sha) — a re-tick must never re-adopt an
+# already-adopted branch, even before the next worktree-rediscovery pass has folded it into the
+# claimed set.
+#   • ADOPT_PR_LEDGER            — one "<pr>\t<sha>\tadopted" row per SUCCESSFUL adopt (the once-guard).
+#   • ADOPT_FAILED_SEEN_LEDGER   — one "<pr>\t<sha>" row per (pr,sha) whose FAILURE has already been
+#     journaled, so a permanently-broken branch retried every scan does not spam `adopt_failed` once
+#     per tick forever — the ATTEMPT still retries every scan; only the journal EVENT is deduped, and
+#     a new sha (a fresh push) always re-journals.
+ADOPT_PR_LEDGER="$TREES/.agent-watch-adopted-prs"
+ADOPT_FAILED_SEEN_LEDGER="$TREES/.agent-watch-adopt-failed-seen"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -1665,6 +1680,140 @@ build_orphan_prs() {
   rows="$(herd_console_section "$ORPHAN_PR_LEDGER" "$ORPHAN_PR_ROWS_LIMIT" \
     _orphan_pr_classify _orphan_pr_row)"
   [ -n "$rows" ] && ORPHAN_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
+# ── Adopt remote PRs (HERD-369) ──────────────────────────────────────────────────────────────────
+# Builds ON TOP of the HERD-330 orphan diff above (the same open-PR-vs-pool computation, zero extra
+# `gh pr list`): for every OPEN, NON-DRAFT PR that diff finds no discovered worktree owns, `git fetch`
+# + `git worktree add` its branch into WORKTREES_DIR so the worktree-gated watcher discovers and gates
+# it on the VERY NEXT tick — closing the gap that left #462/#463/#478 sitting ungated 16-18h until a
+# human hand-ran `git worktree add`. Both legs self-gate independently (ADOPT_REMOTE_PRS vs
+# ORPHAN_PR_ROWS) so either works without the other.
+
+# _adopt_remote_prs_enabled — true iff ADOPT_REMOTE_PRS opts in. Default OFF (mirrors
+# _orphan_pr_rows_enabled); any unrecognized value reads as off (fail toward the byte-identical pool).
+_adopt_remote_prs_enabled() {
+  case "$(printf '%s' "${ADOPT_REMOTE_PRS:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _adopt_pr_recorded <pr> <sha> — true iff this (pr,sha) was ALREADY SUCCESSFULLY adopted, so a
+# re-tick never re-attempts `git fetch`/`worktree add` on a branch already in the pool — including
+# BEFORE the next worktree-rediscovery pass has had a chance to fold it into the claimed set. A prior
+# FAILURE never satisfies this (see the ledger-split rationale above) — a failed (pr,sha) keeps retrying.
+_adopt_pr_recorded() {
+  [ -s "$ADOPT_PR_LEDGER" ] || return 1
+  awk -F'\t' -v p="$1" -v s="$2" '$1==p && $2==s{f=1} END{exit !f}' "$ADOPT_PR_LEDGER" 2>/dev/null
+}
+
+# _adopt_pr_mark_adopted <pr> <sha> — append-only; the once-guard for a SUCCESSFUL adopt.
+_adopt_pr_mark_adopted() {
+  printf '%s\t%s\tadopted\n' "$1" "$2" >> "$ADOPT_PR_LEDGER" 2>/dev/null || true
+}
+
+# _adopt_failed_journaled <pr> <sha> — true iff a FAILURE for this exact (pr,sha) was already
+# journaled, so the journal event is emitted at most once per commit even while the underlying attempt
+# keeps retrying every scan.
+_adopt_failed_journaled() {
+  [ -s "$ADOPT_FAILED_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v p="$1" -v s="$2" '$1==p && $2==s{f=1} END{exit !f}' "$ADOPT_FAILED_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_journal_failed <pr> <sha> <branch> <reason> — journal `adopt_failed` ONCE per (pr,sha),
+# deduping repeat scans of a still-broken branch; a new sha (a fresh push) always re-journals.
+_adopt_journal_failed() {
+  local _ajf_pr="$1" _ajf_sha="$2" _ajf_branch="$3" _ajf_reason="$4"
+  _adopt_failed_journaled "$_ajf_pr" "$_ajf_sha" && return 0
+  journal_append adopt_failed pr "$_ajf_pr" sha "$_ajf_sha" branch "$_ajf_branch" reason "$_ajf_reason"
+  printf '%s\t%s\n' "$_ajf_pr" "$_ajf_sha" >> "$ADOPT_FAILED_SEEN_LEDGER" 2>/dev/null || true
+}
+
+# _adopt_branch_checked_out <branch> <wt-porcelain> — true when ANY worktree in this tick's already-
+# fetched `git worktree list --porcelain` text ($WT) has this branch checked out — the main checkout,
+# a builder worktree, or a stray manual worktree a human already added. Reads the raw porcelain text
+# verbatim (not the $TREES-scoped $FEATS subset), matching the spec's "anywhere", not just the pool.
+_adopt_branch_checked_out() {
+  local _abc_branch="$1" _abc_wt="$2"
+  grep -qxF "branch refs/heads/$_abc_branch" <<EOF
+$_abc_wt
+EOF
+}
+
+# _adopt_remote_pr <pr> <branch> <sha> — the mutating half: fetch the branch, then `git worktree add`
+# it into WORKTREES_DIR/<slug> (slug = branch with every "/" flattened to "-", so a fork's namespaced
+# branch never nests a stray directory). FAIL-SOFT throughout: any step's failure journals
+# `adopt_failed` (deduped per (pr,sha) via _adopt_journal_failed) and returns WITHOUT once-guarding —
+# a transient failure (network blip, momentary ref lock) is retried on the next scan; only a
+# SUCCESSFUL adopt is terminal (_adopt_pr_mark_adopted) and journals `pr_adopted` once.
+_adopt_remote_pr() {
+  local _arp_pr="$1" _arp_branch="$2" _arp_sha="$3"
+  local _arp_slug _arp_dir
+  _arp_slug="$(printf '%s' "$_arp_branch" | tr '/' '-')"
+  _arp_dir="$TREES/$_arp_slug"
+  if [ -e "$_arp_dir" ]; then
+    _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "worktree path already exists: $_arp_dir"
+    return 0
+  fi
+  if ! git -C "$MAIN" fetch -q origin "$_arp_branch" >/dev/null 2>&1; then
+    _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git fetch failed"
+    return 0
+  fi
+  if ! git -C "$MAIN" worktree add "$_arp_dir" "$_arp_branch" >/dev/null 2>&1; then
+    _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git worktree add failed"
+    return 0
+  fi
+  journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
+  _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
+  return 0
+}
+
+# _adopt_remote_prs_scan <prs-json> <claimed-pr-numbers-newline-list> <wt-porcelain>
+#   For each OPEN PR in $1 not in the claimed set $2 (the SAME diff _orphan_prs_scan computes — no
+#   second gh call): skip a draft, skip a branch already checked out anywhere ($3), skip a (pr,sha)
+#   already recorded, else adopt. Self-gates on ADOPT_REMOTE_PRS and PRS_LOOKUP_OK exactly like the
+#   orphan scan (a failed open-PR fetch is not positive evidence of "no PR" — never fabricated into a
+#   spurious adopt attempt). Zero network beyond the per-PR fetch+worktree-add themselves.
+_adopt_remote_prs_scan() {
+  _adopt_remote_prs_enabled || return 0
+  [ "${PRS_LOOKUP_OK:-1}" = "1" ] || return 0
+  local _ars_json="${1:-[]}" _ars_claimed="${2:-}" _ars_wt="${3:-}" _ars_out
+  _ars_out="$(PRS_JSON="$_ars_json" CLAIMED="$_ars_claimed" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)   # malformed roster → nothing to adopt this tick (fail-soft), never a crash
+claimed = set(n for n in (os.environ.get("CLAIMED") or "").split() if n)
+for pr in prs:
+    if not isinstance(pr, dict):
+        continue
+    num = pr.get("number")
+    if num is None:
+        continue
+    if str(num) in claimed:
+        continue
+    if pr.get("isDraft"):
+        continue   # never adopt a draft
+    branch = pr.get("headRefName") or ""
+    sha = pr.get("headRefOid") or ""
+    if not branch or not sha:
+        continue
+    print("%s\t%s\t%s" % (num, branch, sha))
+' 2>/dev/null)" || _ars_out=""
+  [ -n "$_ars_out" ] || return 0
+  local _ars_pr _ars_branch _ars_sha
+  while IFS=$'\t' read -r _ars_pr _ars_branch _ars_sha; do
+    [ -n "${_ars_pr:-}" ] || continue
+    _adopt_pr_recorded "$_ars_pr" "$_ars_sha" && continue
+    _adopt_branch_checked_out "$_ars_branch" "$_ars_wt" && continue
+    _adopt_remote_pr "$_ars_pr" "$_ars_branch" "$_ars_sha"
+  done <<EOF
+$_ars_out
+EOF
   return 0
 }
 
@@ -11574,12 +11723,16 @@ _scope_permits_automerge() {
 }
 
 # The --json fields for the tick's `gh pr list`. In team mode we additionally need each PR's `author`
-# to enforce the ownership gate even when NO view lens is active; fold it in (deduped). In the default
-# solo scope this is exactly _watcher_view_fields — the base set — so the default gh call is unchanged.
+# to enforce the ownership gate even when NO view lens is active; fold it in (deduped). HERD-369 needs
+# `isDraft` (never adopt a draft) ONLY when ADOPT_REMOTE_PRS is on. In the default solo scope with
+# adopt off this is exactly _watcher_view_fields — the base set — so the default gh call is unchanged.
 _watcher_tick_fields() {
   _wtf="$(_watcher_view_fields)"
   if _watcher_team_mode; then
     case ",$_wtf," in *,author,*) ;; *) _wtf="${_wtf},author" ;; esac
+  fi
+  if _adopt_remote_prs_enabled; then
+    case ",$_wtf," in *,isDraft,*) ;; *) _wtf="${_wtf},isDraft" ;; esac
   fi
   printf '%s' "$_wtf"
 }
@@ -12596,17 +12749,34 @@ EOF
   # self-gates on ORPHAN_PR_ROWS (no scan, no ledger write when off) and on PRS_LOOKUP_OK (never
   # fabricates on a failed fetch); build_orphan_prs leaves ORPHAN_PR_SECTION_ROWS empty when off/none, so
   # the frame is byte-identical to before the feature. Zero extra gh — no new `gh pr list`.
+  # HERD-369 reuses this SAME claimed-set diff for the adopt leg below, so the computation now also
+  # runs under ADOPT_REMOTE_PRS alone — when BOTH levers are off (the ship default) this is byte-
+  # identical to before either feature: the condition is false||false, same as false.
   _orphan_claimed=""
-  if _orphan_pr_rows_enabled; then
+  if _orphan_pr_rows_enabled || _adopt_remote_prs_enabled; then
     for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
       IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
 $_orphan_rec
 EOF
       [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
     done
+  fi
+  if _orphan_pr_rows_enabled; then
     _orphan_prs_scan "$PRS_JSON" "$_orphan_claimed"
   fi
   build_orphan_prs
+
+  # HERD-369 adopt remote PRs — throttled to the ~60 s scan cadence (network + git mutation, unlike
+  # the zero-network orphan render above): `git fetch` + `git worktree add` each orphan PR's branch
+  # into the pool. Self-gates on ADOPT_REMOTE_PRS; off (default) is byte-inert — no scan, no fetch, no
+  # worktree add, no ledger write.
+  if _adopt_remote_prs_enabled; then
+    _ADOPT_SCAN_TICK=$((_ADOPT_SCAN_TICK + 1))
+    if [ "$_ADOPT_SCAN_TICK" -ge "$_ADOPT_SCAN_INTERVAL" ]; then
+      _ADOPT_SCAN_TICK=0
+      _adopt_remote_prs_scan "$PRS_JSON" "$_orphan_claimed" "$WT"
+    fi
+  fi
 
   render
   # ENGINE (HERD-306, EPIC HERD-300 FINALE): hand the action pass to the SOLE engine core — the LIVE
@@ -13118,6 +13288,9 @@ _ENGINE_INTERVAL=75         # engine auto-update check every ~5 min (75 × 4 s s
 _INBOX_SCAN_INTERVAL=15     # HERD-184: operator-inbox refresh every ~60 s (15 × 4 s sleep) — the network
                             # reads (gh pr comments + tracker) never ride the 4 s repaint
 _INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
+_ADOPT_SCAN_INTERVAL=15     # HERD-369: adopt-remote-PRs scan every ~60 s (15 × 4 s sleep) — the fetch +
+                            # worktree-add mutation never rides the 4 s repaint
+_ADOPT_SCAN_TICK=$_ADOPT_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
 
 # ENGINE WATCHDOG state (HERD-306) — the resident supervisor's fault memory across ticks. There is no
 # bash action-pass fallback anymore: _engine_tick_watchdog runs the sole (Python) engine core, RETRIES

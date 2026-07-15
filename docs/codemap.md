@@ -172,6 +172,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 Which script(s) reference each `kind=config` key from `templates/capabilities.tsv`. The
 loader `herd-config.sh` (which only sets defaults) is omitted, so this shows real consumers.
 
+- `ADOPT_REMOTE_PRS` → `agent-watch.sh`
 - `AGENT_UPDATE` → `bin/herd`, `agent-update.sh`
 - `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
