@@ -18,6 +18,10 @@
 #       surfaces as an infra_event instead of looping a heavy suite forever.
 #   (d) AUTOFIX — MAIN_HEALTH_AUTOFIX=on files ONE scribe item per distinct HONEST failing identity
 #       (a TAP 'not ok' line, or a concrete test file); a content-free classifier banner files nothing.
+#       Dedup is a SHARED-POOL invariant (HERD-371, pysrc/herd/store.py), not seat memory: a second
+#       reproduction of the SAME identity journals result=dedup instead of silently doing nothing; a
+#       green run clears the marker so a LATER regression of the same test files fresh; a DIFFERENT
+#       failing test is never conflated with an already-marked one.
 #   (e) LEVERS OFF → BYTE-IDENTICAL — MAIN_HEALTH_RECHECK_MINS=0 never re-runs a marked sha,
 #       MAIN_HEALTH_AUTOFIX=off never enqueues or journals, MAIN_HEALTH_TICK=off is fully inert.
 #
@@ -299,13 +303,36 @@ grep -q '^MAIN RED: fix app/greet.test.sh$' "$SCRIBE_LOG" || fail "(d) the scrib
 grep -q 'Failing test:' "$SCRIBE_LOG" || fail "(d) the scribe body does not cite the failing test"
 ok "(d) MAIN_HEALTH_AUTOFIX=on files ONE scribe item citing the failing test"
 
-# The SAME failure reproduced by a re-verify must not re-file (the once-per-identity guard).
+# The SAME failure reproduced by a re-verify must not re-file (the shared-pool dedup marker, HERD-371):
+# exactly one enqueue overall, and the SECOND reproduction is journaled as an honest dedup — never a
+# silent no-op indistinguishable from "nothing happened".
 MAIN_HEALTH_RECHECK_MINS=30
 touch -t 200001010000 "$(_main_health_marker "$(head_sha)")"
 reconcile_main_health; settle
 [ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(d) the same failure was re-filed"
+[ "$(jcount '"event":"main_health_autofix".*"result":"dedup"')" -eq 1 ]    || fail "(d) the second reproduction was not journaled as a dedup"
 MAIN_HEALTH_RECHECK_MINS=0
-ok "(d) a re-verify that reproduces the same failure files nothing more"
+ok "(d) a re-verify that reproduces the same failure files nothing more, journaled as a dedup"
+
+# A green run clears the shared-pool marker, so a LATER regression of the SAME test files fresh.
+printf 'green\n' > "$HC_MODE"
+MAIN_HEALTH_RECHECK_MINS=30
+touch -t 200001010000 "$(_main_health_marker "$(head_sha)")"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] && fail "(d) the green re-verify did not clear main red"
+MAIN_HEALTH_RECHECK_MINS=0
+printf 'red-file\n' > "$HC_MODE"
+new_sha "feat: the same failing test regresses again after main went green"
+reconcile_main_health; settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 2 ] || fail "(d) a regression of the same test after green did not file fresh"
+ok "(d) a green run clears the marker: a LATER regression of the same test files fresh"
+
+# A DIFFERENT failing test is never conflated with an already-marked one — it always files.
+printf 'red-tap\n' > "$HC_MODE"
+new_sha "feat: a different test reds main while the pool still holds no marker for it"
+reconcile_main_health; settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 3 ] || fail "(d) a different failing test did not file"
+ok "(d) a different failing test files fresh, independent of any other identity's marker"
 
 # A content-free classifier banner is NOT an honest identity: skip, file nothing.
 reset_state

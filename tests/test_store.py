@@ -104,6 +104,28 @@ class AccessorParity(_PoolCase):
             self.assertTrue(st.release_claim("HERD-1", "alice"), be)
             self.assertIsNone(st.claim_owner("HERD-1"), be)
 
+    def test_main_health_fix_dedup_and_clear(self):
+        """HERD-371: the MAIN RED autofix filing leg's dedup marker, keyed by failing-test identity.
+        A second claim for the SAME identity must NOT win (that is exactly the HERD-362/HERD-365
+        duplicate-filing bug); clearing re-arms it for a later regression; a different identity is
+        never blocked by another identity's marker."""
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            identity = "test-herd-config.sh MAIN RED"
+            self.assertFalse(st.main_health_fix_marked(identity), be)
+            self.assertTrue(st.mark_main_health_fix(identity, "480", "deadbeef"),
+                            "%s: the first claim did not win" % be)
+            self.assertTrue(st.main_health_fix_marked(identity), be)
+            self.assertFalse(st.mark_main_health_fix(identity, "481", "beadfeed"),
+                             "%s: a second claim for the SAME identity re-won (would double-file)" % be)
+            self.assertTrue(st.mark_main_health_fix("a different failing test", "482", "cafefeed"),
+                            "%s: a different identity was blocked by another identity's marker" % be)
+            st.clear_main_health_fix(identity)
+            self.assertFalse(st.main_health_fix_marked(identity), "%s: clear did not drop the marker" % be)
+            self.assertTrue(st.mark_main_health_fix(identity, "483", "0000"),
+                            "%s: a regression after clear could not re-claim" % be)
+
 
 class RoundTrip(_PoolCase):
     """files → db → files is byte-for-byte identical — the migration's lossless core."""

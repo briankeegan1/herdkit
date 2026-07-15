@@ -6203,7 +6203,9 @@ _reap_slug() {
 #     item naming that test. It files work; it does NOT spawn a builder in this increment.
 MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"        # one line while RED: "<sha> <since_pr> <failing test…>"
 MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" — the last journaled defer
-MAIN_HEALTH_FIX_STATE="$TREES/.agent-watch-main-health-fix" # the failing identity autofix already filed
+# The AUTOFIX filed-identity marker is no longer a bare seat-local flat file (HERD-371): it lives in the
+# SHARED POOL through pysrc/herd/store.py's main_health_fix_* accessors (see _main_health_fix_mark /
+# _main_health_fix_clear below) so every seat sees the same "already filed" state, not just this process.
 MAIN_HEALTH_CI_STATE="$TREES/.agent-watch-main-health-ci"  # "<sha> <conclusion>" — the last branch-CI red we fired (HERD-334)
 
 # Throttle the branch-CI probe (HERD-334 leg b): one `gh run list` every ~40 s (10 × 4 s sleep) instead
@@ -6305,11 +6307,17 @@ _main_health_worker() {
 # also never paints red, so there is nothing to falsely clear.)
 
 # _main_health_clear <pr#> <sha> — a main sha went GREEN. Drop any standing red state (which removes
-# the console row), journal the green result, and on a RED→green TRANSITION notify recovery once.
+# the console row), CLEAR the shared-pool autofix marker for whichever identity was red (HERD-371: so a
+# LATER regression of the SAME test files fresh instead of staying dedup'd forever), journal the green
+# result, and on a RED→green TRANSITION notify recovery once.
 _main_health_clear() {
-  local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0
-  [ -s "$MAIN_HEALTH_STATE" ] && _mc_wasred=1
-  rm -f "$MAIN_HEALTH_STATE" "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true
+  local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0 _mc_pv_sha _mc_pv_since _mc_pv_id
+  if [ -s "$MAIN_HEALTH_STATE" ]; then
+    _mc_wasred=1
+    read -r _mc_pv_sha _mc_pv_since _mc_pv_id < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+    [ -n "$_mc_pv_id" ] && _main_health_fix_clear "$_mc_pv_id"
+  fi
+  rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
   if [ "$_mc_wasred" -eq 1 ]; then
     herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
@@ -6342,24 +6350,74 @@ _main_health_honest_identity() {
 # can spy on it without spawning a real drainer. Best-effort by construction: an alarm never fails a tick.
 _main_health_scribe() { bash "$HERE/scribe.sh" "$1" >/dev/null 2>&1 || true; }
 
+# _main_health_fix_pysrc — locate pysrc/ for the store-accessor shellout below (mirrors
+# herd_engine_live_tick's HERDKIT_HOME resolution in engine-version.sh), or empty when the module cannot
+# be found — every caller then fails soft (dedup treated as "skip filing", never a crash).
+_main_health_fix_pysrc() {
+  local _fp_home _fp_pyp
+  _fp_home="${HERDKIT_HOME:-$(cd "$HERE/../.." 2>/dev/null && pwd)}"
+  _fp_pyp="$_fp_home/pysrc"
+  [ -f "$_fp_pyp/herd/store.py" ] && printf '%s' "$_fp_pyp"
+}
+
+# _main_health_fix_mark <identity> <pr> <sha> — ATOMIC claim-or-abort against the SHARED-POOL marker
+# (pysrc/herd/store.py main_health_fix_*, HERD-371). Returns the store CLI's own rc so the caller can
+# tell a genuine dedup from an infra failure:
+#   0 ⇒ THIS call is the first across every seat to see this failing-test identity — file it.
+#   3 ⇒ another seat (or an earlier tick on this seat) already filed for the SAME identity — dedup.
+#   2 ⇒ no python3 / no store module / a store error — unknown, so the caller must NOT file (skip).
+_main_health_fix_mark() {
+  local _fm_id="$1" _fm_pr="$2" _fm_sha="$3" _fm_pyp
+  _fm_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fm_pyp" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fm_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --main-health-fix-mark "$_fm_id" --pr "$_fm_pr" --sha "$_fm_sha" >/dev/null 2>&1
+  return $?
+}
+
+# _main_health_fix_clear <identity> — drop the shared-pool marker once main is GREEN for that identity, so
+# a LATER regression of the same test files fresh. Best-effort; a failure here never blocks the green
+# transition — worst case a stale marker suppresses one future re-file, which is the safe direction to
+# fail (never a crash, never a double-file).
+_main_health_fix_clear() {
+  local _fc_id="$1" _fc_pyp
+  [ -n "$_fc_id" ] || return 0
+  _fc_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fc_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fc_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --main-health-fix-clear "$_fc_id" >/dev/null 2>&1 || true
+  return 0
+}
+
 # _main_health_autofix <pr#> <sha> <identity> <detail> — MAIN_HEALTH_AUTOFIX (default off, ship-dormant).
 # On a REPRODUCED red whose identity is honest, enqueue ONE scribe item citing the failing test and
 # journal that we did. Scoped DELIBERATELY narrow for this increment: it FILES work, it never spawns a
 # builder — an agent that fixes main unattended is a separate, riskier decision.
 #
-# Enqueued at most once per distinct failing identity while main is red ($MAIN_HEALTH_FIX_STATE, dropped
-# by _main_health_clear). So a RECHECK that reproduces the SAME failure re-files nothing, while a red
-# that MUTATES into a different failing test files the new one. Fully fail-soft; always returns 0.
+# DEDUP is now a SHARED-POOL invariant, not seat memory (HERD-371 — HERD-362/HERD-365 duplicated the same
+# failing test because each seat's dedup only ever consulted its OWN local flat file). _main_health_fix_mark
+# atomically claims the marker across the whole pool: the first seat to see this failing identity files it
+# and every OTHER seat (or a later tick on this seat) that reproduces the SAME identity sees the marker
+# already claimed and journals result=dedup instead of re-filing. The marker is dropped by
+# _main_health_clear once main goes green for that identity, so a LATER regression files fresh. Fully
+# fail-soft; always returns 0.
 _main_health_autofix() {
-  local _af_pr="$1" _af_sha="$2" _af_id="$3" _af_detail="$4" _af_prev
+  local _af_pr="$1" _af_sha="$2" _af_id="$3" _af_detail="$4" _af_mark_rc
   _main_health_autofix_enabled || return 0
   if ! _main_health_honest_identity "$_af_detail" "$_af_id"; then
     journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" result skipped reason dishonest-identity
     return 0
   fi
-  _af_prev="$(cat "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true)"
-  [ "$_af_prev" = "$_af_id" ] && return 0                  # already filed for this failure — never re-file
-  printf '%s\n' "$_af_id" > "$MAIN_HEALTH_FIX_STATE" 2>/dev/null || true
+  _main_health_fix_mark "$_af_id" "$_af_pr" "$_af_sha"; _af_mark_rc=$?
+  case "$_af_mark_rc" in
+    0) : ;;                                                  # we won the claim — file it below
+    3) journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result dedup
+       return 0 ;;
+    *) journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result skipped reason store-unavailable
+       return 0 ;;
+  esac
   # First line is the tracker TITLE (the backend takes it verbatim) — keep it short; body carries context.
   _main_health_scribe "MAIN RED: fix ${_af_id}
 The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
