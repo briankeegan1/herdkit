@@ -249,6 +249,116 @@ class TestGateOutcomes(LiveCase):
                          "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
+class TestRefixWakeVerification(LiveCase):
+    """HERD-370: a review-BLOCK refix bounced PR #471 with the wake never even attempted — no
+    refix_wake_result followed, and the PR sat BLOCKED ~70 minutes with the once-guard silently
+    holding any retry. Asserts the fix, driven entirely through the fixture wake surface
+    (LiveCandidate.agent_status / .wake_succeeds — see DryRunActuator.wake_builder):
+
+      * every refix_bounce is paired with exactly one refix_wake_result (journal-audit.sh's
+        refix_bounce_no_wake check reads this pairing as ground truth) — for BOTH rails;
+      * a wake that lands (idle/done -> working, or already working) records woke=1, escalated=false,
+        and the candidate stays BLOCK;
+      * a wake that fails (idle/done that never flips) OR a dead/missing/absent agent records woke=0,
+        escalated=true, and the candidate ESCALATES immediately in the SAME tick;
+      * an escalated (unwoken) bounce REFUNDS its round: the rail's ledger count goes back to 0, so a
+        later, actually-woken bounce on a fresh sha starts at round=1, not round=2;
+      * a legacy fixture that never sets agent_status (every scenario written before this task) stays
+        byte-identical: BLOCK, no escalation, woke=1.
+    """
+
+    def test_legacy_fixture_default_wakes_and_blocks(self):
+        # No agent_status at all (every pre-HERD-370 fixture) — byte-compatible: BLOCK, woke=1.
+        out, ev = (lambda r, e: (r["outcomes"]["1"], e))(
+            *self.tick([self.one(1, health="CODEERROR")]))
+        self.assertEqual(out, "BLOCK")
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(len(wr), 1)
+        self.assertEqual(wr[0]["woke"], 1)
+        self.assertEqual(wr[0]["escalated"], "false")
+
+    def test_idle_agent_wakes_blocks_and_records_transition(self):
+        res, ev = self.tick([self.one(1, health="CODEERROR", agent_status="idle")])
+        self.assertEqual(res["outcomes"]["1"], "BLOCK")
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(len(wr), 1)
+        self.assertEqual(wr[0]["woke"], 1)
+        self.assertEqual(wr[0]["escalated"], "false")
+        self.assertEqual(wr[0]["agent_status_before"], "idle")
+        self.assertEqual(wr[0]["agent_status_after"], "working")
+
+    def test_done_agent_that_never_wakes_escalates_immediately(self):
+        # The exact PR #471 shape: a 'done' pane that the bounce could not actually wake.
+        res, ev = self.tick([self.one(1, health="CODEERROR", agent_status="done",
+                                      wake_succeeds=False)])
+        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        rb = [o for o in ev if o["event"] == "refix_bounce"]
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(len(rb), 1, "the bounce is still recorded (round consumed then refunded)")
+        self.assertEqual(len(wr), 1, "every refix_bounce must pair with exactly one refix_wake_result")
+        self.assertEqual(wr[0]["woke"], 0)
+        self.assertEqual(wr[0]["escalated"], "true")
+        self.assertEqual(wr[0]["agent_status_before"], "done")
+        esc = [o for o in ev if o["event"] == "refix_escalated_no_wake"]
+        self.assertEqual(len(esc), 1)
+        self.assertEqual(esc[0]["reason"], "no-live-builder")
+
+    def test_dead_agent_escalates_without_attempting_a_submit(self):
+        res, ev = self.tick([self.one(1, review="BLOCK", health="CLEAN", agent_status="dead")])
+        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(wr[0]["woke"], 0)
+        self.assertEqual(wr[0]["agent_status_before"], "dead")
+
+    def test_missing_agent_escalates(self):
+        res, ev = self.tick([self.one(1, health="CODEERROR", agent_status="missing")])
+        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(wr[0]["woke"], 0)
+
+    def test_unwoken_bounce_refunds_the_round(self):
+        # sha-1: agent dead -> escalate, round refunded (rail reset to 0).
+        # sha-2 (a fresh push): a real, woken bounce must start at round=1, not round=2 — proving the
+        # failed sha-1 attempt never counted against the rail budget.
+        state_dir = os.path.join(self.tmp, "refund-state")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+
+        cand1 = {"pr": 5, "sha": "sha-dead", "slug": "feat-refund", "health": "CODEERROR",
+                 "agent_status": "dead"}
+        j1 = LiveJournal(os.path.join(self.tmp, "refund-1.jsonl"))
+        t1 = LiveTick(config, FixtureDiscovery({"candidates": [cand1], "config": config}),
+                     FixtureGates({"candidates": [cand1], "config": config}),
+                     DryRunActuator(j1), j1, state=LiveState(state_dir))
+        r1 = t1.run()
+        self.assertEqual(r1["outcomes"]["5"], "ESCALATE")
+        reset_ev = [o for o in events(j1.path) if o["event"] == "refix_rail_reset"]
+        self.assertEqual(len(reset_ev), 1, "the refund must write a refix_rail_reset row")
+
+        cand2 = {"pr": 5, "sha": "sha-fixed", "slug": "feat-refund", "health": "CODEERROR",
+                 "agent_status": "idle"}
+        j2 = LiveJournal(os.path.join(self.tmp, "refund-2.jsonl"))
+        t2 = LiveTick(config, FixtureDiscovery({"candidates": [cand2], "config": config}),
+                     FixtureGates({"candidates": [cand2], "config": config}),
+                     DryRunActuator(j2), j2, state=LiveState(state_dir))
+        r2 = t2.run()
+        self.assertEqual(r2["outcomes"]["5"], "BLOCK")
+        rb2 = [o for o in events(j2.path) if o["event"] == "refix_bounce"]
+        self.assertEqual(rb2[0]["round"], 1,
+                         "round must be 1 (refunded), not 2, after the unwoken sha-1 attempt")
+
+    def test_review_rail_wake_also_paired_and_escalates(self):
+        # The review rail (not just health) must carry the same wake-verification contract.
+        res, ev = self.tick([self.one(1, review="BLOCK", health="CLEAN", agent_status="done",
+                                      wake_succeeds=False)])
+        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+        rb = [o for o in ev if o["event"] == "refix_bounce" and o.get("rule") == "review"]
+        wr = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(len(rb), 1)
+        self.assertEqual(len(wr), 1)
+        self.assertEqual(wr[0]["woke"], 0)
+
+
 class TestReapAndActuation(LiveCase):
     def test_merge_reaps(self):
         _, ev = self.tick([self.one(1, review="PASS", health="CLEAN", worktree="/wt/1")])

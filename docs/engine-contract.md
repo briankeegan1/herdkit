@@ -238,6 +238,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `stale_dup_hold` | pr, sha, slug, kind, reason | `agent-watch.sh:7896` |
 | `refix_bounce` | pr, sha, slug, round, agent_status_before, rule, location | `agent-watch.sh:7321` |
 | `refix_wake_result` | pr, sha, slug, round, agent_status_before, agent_status_after, woke, escalated | `agent-watch.sh:7359` |
+| `refix_escalated_no_wake` | pr, sha, slug, kind, reason(no-live-builder), agent_status | port `live_runtime.py:LiveTick._bounce_and_wake` (HERD-370 — an unwoken bounce escalates to needs-you immediately, in the same tick, instead of holding silently) |
 | `hold_applied` | pr, sha, slug, kind | `agent-watch.sh:12287` |
 | `human_verify_policy` | pr, sha, slug, policy(auto), action | `agent-watch.sh:12314` |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
