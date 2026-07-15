@@ -37,7 +37,7 @@ trap 'kill "$SERVER_PID" 2>/dev/null' EXIT INT TERM
 
 # newest mtime across tracked files — changes whenever the sub-agent edits the worktree.
 # stat mtime flag: GNU/Linux uses -c %Y; BSD/macOS uses -f %m.
-if stat --version 2>/dev/null | grep -q GNU; then  # pipe-ok: fixed short version banner, far under a pipe buffer
+if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then  # pipe-ok: fixed short version banner, far under a pipe buffer
   _STAT_MTIME=(-c %Y)
 else
   _STAT_MTIME=(-f %m)
