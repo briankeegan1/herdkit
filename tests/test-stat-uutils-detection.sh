@@ -70,4 +70,17 @@ ok
 grep -q 'grep -qE "GNU|uutils"' "$WATCH" || fail "agent-watch.sh should use the updated regex 'grep -qE \"GNU|uutils\"'"
 ok
 
+# ── Test 5: Tree-wide regression — no bare 'grep -q GNU' stat detection ──
+# Fail if any file in scripts/ or bin/ still uses the old bare-GNU idiom instead
+# of the uutils-aware 'grep -qE "GNU|uutils"' form.
+REPO_ROOT="$HERE/.."
+offenders="$(grep -rl 'stat --version' "$REPO_ROOT/scripts" "$REPO_ROOT/bin" 2>/dev/null \
+  | xargs grep -l 'grep -q GNU' 2>/dev/null || true)"
+if [ -n "$offenders" ]; then
+  echo "FAIL: tree-wide stat-flavor check — found bare 'grep -q GNU' in:" >&2
+  echo "$offenders" >&2
+  exit 1
+fi
+ok
+
 echo "PASS test-stat-uutils-detection.sh ($pass checks)"
