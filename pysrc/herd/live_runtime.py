@@ -104,11 +104,12 @@ class LiveCandidate:
 
     __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
                  "hv_body", "author", "assignees", "labels", "review_decision", "merge_status",
-                 "restale_laps")
+                 "restale_laps", "agent_status", "wake_succeeds")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
                  hv_hold=False, approved=False, hv_body="", author="", assignees=None,
-                 labels=None, review_decision="", merge_status="", restale_laps=0):
+                 labels=None, review_decision="", merge_status="", restale_laps=0,
+                 agent_status="", wake_succeeds=True):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
@@ -130,6 +131,16 @@ class LiveCandidate:
         # the persistent ledger (LiveState.restale_count); a sim with a black-hole state dir carries the
         # laps here instead, so a scenario can inject a starved candidate. Absent → 0 (never starved).
         self.restale_laps = int(restale_laps or 0)
+        # FIXTURE-ONLY wake surface (HERD-370, unit/fixture verification of the bounce's pane-wake
+        # check — LiveActuator ignores both and reads the OBSERVED pane state for real; see
+        # DryRunActuator.wake_builder). ``agent_status`` is the fixture's simulated pre-bounce pane
+        # read ("" | "idle" | "done" | "working" | "dead" | "missing"); "" (the legacy-fixture default,
+        # never set before this task) is a sentinel for "not modeled by this fixture" and simulates a
+        # successful wake, so every scenario written before HERD-370 stays byte-identical.
+        # ``wake_succeeds`` only matters for "idle"/"done" — whether the type+Enter submit flips the
+        # agent to "working".
+        self.agent_status = str(agent_status or "")
+        self.wake_succeeds = bool(wake_succeeds) if wake_succeeds is not None else True
 
     @classmethod
     def from_dict(cls, d):
@@ -141,6 +152,7 @@ class LiveCandidate:
             assignees=d.get("assignees"), labels=d.get("labels"),
             review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
             restale_laps=d.get("restale_laps", 0),
+            agent_status=d.get("agent_status", ""), wake_succeeds=d.get("wake_succeeds", True),
         )
 
 
@@ -1517,6 +1529,30 @@ _GATE_STATUS_DESC = "healthcheck + adversarial review passed"
 _MERGE_REFUSE_MAX = 3
 
 
+class WakeResult:
+    """The outcome of one refix-bounce wake attempt (HERD-370).
+
+    ``status_before``/``status_after`` are the observed pane state (``""`` when unreadable) straddling
+    the wake; ``woke`` is True iff the agent is confirmed WORKING after the attempt (or was already).
+    This is the single shape both actuators return so :meth:`LiveTick._bounce_and_wake` never branches
+    on which column produced it — dry-run simulates it from fixture data, live probes the real pane.
+    """
+
+    __slots__ = ("status_before", "status_after", "woke")
+
+    def __init__(self, status_before="", status_after="", woke=False):
+        self.status_before = str(status_before or "")
+        self.status_after = str(status_after or "")
+        self.woke = bool(woke)
+
+
+# Agent states a bounce may actually WAKE by typing the re-task prompt + Enter (HERD-186's single wake
+# path for idle AND done — a 'done' agent's TUI is still up and waiting). "working" is already-awake
+# (no submit needed); anything else observed ("dead", "missing", "" — an unreadable/absent roster read)
+# is nobody to wake, so the caller escalates the bounce instead of spending a round on a doomed submit.
+_WAKEABLE_STATUSES = ("idle", "done")
+
+
 class DryRunActuator:
     """The side-effect-free apply twin: journals the SAME terminal events, actuates NOTHING.
 
@@ -1537,6 +1573,26 @@ class DryRunActuator:
         self.journal.append("reap", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "reason", "merged")
         return True
+
+    def wake_builder(self, cand, prompt):
+        """Simulate the refix-bounce wake check from the candidate's fixture-declared pane state.
+
+        ``cand.agent_status`` unset (``""``) is the LEGACY-FIXTURE sentinel — no scenario written
+        before HERD-370 models a pane at all, so it simulates an immediate successful wake (byte-
+        identical outcome for every pre-existing fixture/test). A scenario that opts into modeling the
+        wake surface sets ``agent_status`` explicitly: "working" is already-awake; "idle"/"done" attempt
+        a wake, gated by ``cand.wake_succeeds`` (default True); any other value ("dead", "missing", ...)
+        is nobody to wake.
+        """
+        status = str(getattr(cand, "agent_status", "") or "")
+        if not status:
+            return WakeResult("working", "working", True)
+        if status == "working":
+            return WakeResult(status, status, True)
+        if status in _WAKEABLE_STATUSES:
+            woke = bool(getattr(cand, "wake_succeeds", True))
+            return WakeResult(status, "working" if woke else status, woke)
+        return WakeResult(status, status, False)
 
     def post_gate_status(self, cand):
         """PURE no-op twin of the herd/gates commit-status post: no network, no ledger, no journal —
@@ -1671,6 +1727,86 @@ class LiveActuator:
                             "reason", "merged")
         return True
 
+    # ── refix-bounce wake verification (HERD-370) ─────────────────────────────────────────────────
+    # A fresh `herdr agent list` read on every call, by design (multi-seat contract): wake verification
+    # must read the OBSERVED pane state, not a dispatching seat's cache — a second coordinator seat's
+    # stale in-process view of "who's on this red" is exactly how a bounce can silently land on nobody.
+
+    def _herdr_agents(self):
+        """The live ``herdr agent list`` roster, parsed; ``[]`` on ANY read fault.
+
+        Fail-soft, not fail-dead: an unreadable/blank roster is BLINDNESS, never evidence of a dead or
+        missing agent (contract §5.2) — the caller's wake check reads an empty roster exactly like a
+        genuinely absent agent (nobody found, no live target), which is the conservative call for THIS
+        seam: a bounce that cannot positively confirm a live builder must escalate, not spin silently.
+        """
+        try:
+            out = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=10)
+            data = json.loads(out.stdout or "{}")
+            return (data.get("result") or {}).get("agents") or []
+        except Exception:
+            return []
+
+    def _agent_lookup(self, slug):
+        """``(agent_status, pane_id)`` for the agent whose identity (``name`` else ``agent``) == slug;
+        ``("", "")`` when absent or the roster read failed. Mirrors ``_agent_status`` /
+        ``_find_builder_pane_id_any`` (``agent-watch.sh:7948``/``:8955``) folded into one read."""
+        for a in self._herdr_agents():
+            ident = a.get("name") or a.get("agent") or ""
+            if ident == slug:
+                return str(a.get("agent_status") or ""), str(a.get("pane_id") or "")
+        return "", ""
+
+    def _send_wake(self, pane_id, prompt):
+        """Type the re-task prompt then an explicit Enter (HERD-186: `pane run` alone leaves it sitting
+        in the prompt buffer un-submitted). Best-effort — a failed send is caught by the poll below."""
+        try:
+            subprocess.run(["herdr", "pane", "run", pane_id, prompt],
+                           capture_output=True, text=True, timeout=10)
+            subprocess.run(["herdr", "pane", "send-keys", pane_id, "Enter"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+    def _wait_agent_working(self, slug, window):
+        """Poll ``herdr agent list`` for this agent to flip to "working", on a backed-off cadence (an
+        immediate check, then 1s, 2s, 3s… capped at 5s) across ``window`` seconds. Mirrors
+        ``_wait_agent_working`` (``agent-watch.sh:7979``) — several spread checks catch a submit that
+        takes a few seconds to land without hammering herdr every second for the whole window."""
+        deadline = time.time() + window
+        if self._agent_lookup(slug)[0] == "working":
+            return True
+        interval = 1
+        while time.time() < deadline:
+            time.sleep(interval)
+            if self._agent_lookup(slug)[0] == "working":
+                return True
+            interval = min(interval + 1, 5)
+        return False
+
+    def wake_builder(self, cand, prompt):
+        """The REAL refix-bounce wake check: read the observed pane, and — only for a wakeable state
+        ("idle"/"done") — type the re-task prompt + Enter and verify the flip to "working" over a
+        bounded, backed-off window, re-sending once on a silent first attempt (mirrors the review bounce
+        wake path, ``agent-watch.sh:8164-8202``). "working" already is a wake with no submit needed.
+        Anything else observed (absent, "dead", or any other value) is nobody to wake — no submit is
+        attempted, so a doomed bounce never spends a live round on a target that cannot receive it."""
+        slug = cand.slug
+        status_before, pane_id = self._agent_lookup(slug)
+        if status_before == "working":
+            return WakeResult(status_before, status_before, True)
+        if not pane_id or status_before not in _WAKEABLE_STATUSES:
+            return WakeResult(status_before, status_before, False)
+        timeout = _pos_int(self.config.get("HERD_REFIX_WAIT_TIMEOUT"), 15)
+        self._send_wake(pane_id, prompt)
+        if self._wait_agent_working(slug, timeout):
+            return WakeResult(status_before, "working", True)
+        self._send_wake(pane_id, prompt)
+        if self._wait_agent_working(slug, timeout):
+            return WakeResult(status_before, "working", True)
+        status_after, _ = self._agent_lookup(slug)
+        return WakeResult(status_before, status_after or status_before, False)
+
 
 # ── the live tick: the minimal correct loop ───────────────────────────────────────────────────────
 
@@ -1765,12 +1901,15 @@ class LiveTick:
                                     "detail", "refix ledger unwritable — once-guard will not hold")
         return round_num, None
 
-    def _refix_rail_reset(self, cand, kind):
+    def _refix_rail_reset(self, cand, kind,
+                          reason="rail resolved its red — per-rail refix budget restored"):
         """Append a ``reset`` row when the rail has unresolved bounces (fail-soft no-op otherwise).
 
         Mirrors ``refix_rail_reset`` (``agent-watch.sh:7300``): only writes when the rail counter is
         > 0 so the ledger does not accumulate reset rows on a clean path, and journals
-        ``refix_rail_reset`` so the coordinator sees the rail budget restored."""
+        ``refix_rail_reset`` so the coordinator sees the rail budget restored. ``reason`` defaults to
+        the refund-on-green wording; :meth:`_bounce_and_wake` (HERD-370) overrides it for the OTHER
+        refund case — an unwoken bounce, where the red is emphatically NOT resolved."""
         state_dir = self.state.dir
         text = _read_refix_ledger(state_dir)
         rows = D.parse_refix_ledger(text)
@@ -1782,8 +1921,62 @@ class LiveTick:
         _append_refix_ledger(state_dir,
                              "%s %s %s %s %s reset\n" % (_now_epoch(), cand.pr, sha, slug, kind))
         self.journal.append("refix_rail_reset", "pr", cand.pr, "sha", cand.sha,
-                            "slug", cand.slug, "kind", kind, "rounds", n,
-                            "reason", "rail resolved its red — per-rail refix budget restored")
+                            "slug", cand.slug, "kind", kind, "rounds", n, "reason", reason)
+
+    def _refix_prompt(self, cand, kind):
+        """The re-task prompt text typed into the builder's pane for this rail's bounce."""
+        if kind == "health":
+            return ("PR #%s failed the healthcheck (CODEERROR).\n"
+                    "Read the failing suite output, fix every CODE error, run the healthcheck, and "
+                    "push your fix." % cand.pr)
+        return ("PR #%s was review-blocked.\n"
+                "Read the full review: gh pr view %s\n"
+                "Fix every issue the reviewer raised, run the healthcheck, push your fix, and "
+                "reply to the review comment once done." % (cand.pr, cand.pr))
+
+    def _bounce_and_wake(self, cand, kind, round_num, rule):
+        """Record the bounce, ALWAYS verify + journal the wake, and escalate immediately (with the
+        round refunded) when nobody actually woke (HERD-370).
+
+        The grounding incident: a review-BLOCK refix bounced PR #471 with the wake never even
+        attempted — no ``refix_wake_result`` followed, and the PR sat BLOCKED ~70 minutes with the
+        sha-keyed once-guard silently holding any retry. The fix has two parts, both unconditional:
+
+          1. Every ``refix_bounce`` this walk emits is IMMEDIATELY paired with exactly one
+             ``refix_wake_result`` (``woke`` 1|0), regardless of what the wake check finds — the
+             journal-audit ``refix_bounce_no_wake`` check (``journal-audit.sh:293``) reads this pairing
+             as its ground truth, and a bounce with no matching wake result is exactly the gap it flags.
+          2. ``woke=False`` — whether because the wake attempt failed or because the observed agent was
+             already dead/missing/absent (:data:`_WAKEABLE_STATUSES` — both actuators fold every
+             non-wakeable observed state into ``woke=False`` the same way) — escalates to needs-you
+             RIGHT HERE, in this same tick, naming the slug so a human knows who to re-task by hand, and
+             REFUNDS the round via a ``reset`` ledger row: an unwoken bounce spent no real attempt, so it
+             must not count against the rail's budget (a later, ACTUALLY-woken bounce starts clean).
+
+        Returns :data:`BLOCK` (bounce landed on a live builder, wait for its push) or :data:`ESCALATE`
+        (nobody is on it — needs-you).
+        """
+        prompt = self._refix_prompt(cand, kind)
+        wake = self.actuator.wake_builder(cand, prompt)
+        status_before = wake.status_before or "unknown"
+        self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                            "round", round_num, "agent_status_before", status_before,
+                            "rule", rule, "location", "")
+        escalated = not wake.woke
+        self.journal.append("refix_wake_result", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                            "round", round_num, "agent_status_before", status_before,
+                            "agent_status_after", wake.status_after or "unknown",
+                            "woke", 1 if wake.woke else 0,
+                            "escalated", "true" if escalated else "false")
+        if wake.woke:
+            return BLOCK
+        self._refix_rail_reset(
+            cand, kind,
+            reason="unwoken bounce refunded — no live builder (%s), round not spent" % status_before)
+        self.journal.append("refix_escalated_no_wake", "pr", cand.pr, "sha", cand.sha,
+                            "slug", cand.slug, "kind", kind, "reason", "no-live-builder",
+                            "agent_status", wake.status_after or status_before)
+        return ESCALATE
 
     def _gate_status_enabled(self):
         """GATE_STATUS master lever — ``off`` disables the herd/gates commit-status post entirely
@@ -1950,13 +2143,11 @@ class LiveTick:
             # Contract §3.4 refix_bounce shape (pr, sha, slug, round, agent_status_before, rule,
             # location) — the port unifies both rails under one event keyed by `rule` (there is no
             # `health_refix_bounce` in the catalog). Match the shadow twin's field SET
-            # (shadow_runtime.py:418) with bash-faithful defaults: the live tick does not probe the
-            # pane here (bash's own fallback is "unknown") and parses no finding location.
-            self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", round_num,
-                                "agent_status_before", "unknown", "rule", "healthcheck",
-                                "location", "")
-            return BLOCK
+            # (shadow_runtime.py:418); the live tick parses no finding location for either rail.
+            # HERD-370: the bounce is not "sent and forgotten" — _bounce_and_wake ALWAYS journals the
+            # paired refix_wake_result and escalates immediately (refunding this round) when nobody
+            # woke, so a red never sits BLOCKED with no evidence of whether the builder ever heard it.
+            return self._bounce_and_wake(cand, "health", round_num, "healthcheck")
 
         # 3. review rail (LLM) — DISPATCHED async by shelling out to the adversarial reviewer.
         verdict = self.gates.review(cand)
@@ -1990,13 +2181,10 @@ class LiveTick:
                                         "reason", reason + " — review still blocked")
                 return ESCALATE
             # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
-            # bash (agent-watch.sh:7321) with bash-faithful defaults for the fields the live tick does
-            # not compute here (pane status → "unknown"; finding location unparsed → "").
-            self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "round", round_num,
-                                "agent_status_before", "unknown", "rule", "review",
-                                "location", "")
-            return BLOCK
+            # bash (agent-watch.sh:7321); the live tick parses no finding location for either rail.
+            # HERD-370: see the health leg above — _bounce_and_wake owns the wake verification the
+            # PR #471 incident found silently missing (refix_bounce with no paired refix_wake_result).
+            return self._bounce_and_wake(cand, "review", round_num, "review")
         # verdict == "PASS" — rail resolved; refund its per-rail budget (contract §4, bash line 1952).
         self._refix_rail_reset(cand, "review")
 
@@ -2104,7 +2292,8 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
-              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS",
+              "HERD_REFIX_WAIT_TIMEOUT") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
