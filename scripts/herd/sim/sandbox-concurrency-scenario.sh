@@ -1112,13 +1112,12 @@ MHSTUB
   # Swap the watcher's coordinates onto the fixture. The main-health state paths were bound to $TREES at
   # source time, so they must be re-bound explicitly (the drain's $TREES must stay pristine).
   _mh_sv_main="$MAIN"; _mh_sv_trees="$TREES"; _mh_sv_wt="$WORKTREES_DIR"; _mh_sv_hc="$HERD_HEALTHCHECK_BIN"
-  _mh_sv_state="$MAIN_HEALTH_STATE"; _mh_sv_defer="$MAIN_HEALTH_DEFER"; _mh_sv_fix="$MAIN_HEALTH_FIX_STATE"
+  _mh_sv_state="$MAIN_HEALTH_STATE"; _mh_sv_defer="$MAIN_HEALTH_DEFER"
   _mh_sv_tick="${MAIN_HEALTH_TICK:-off}"
   MAIN="$_mh_repo"; TREES="$_mh_trees"; export WORKTREES_DIR="$_mh_trees"
   export HERD_HEALTHCHECK_BIN="$_mh_hc"; MAIN_HEALTH_TICK=on
   MAIN_HEALTH_STATE="$_mh_trees/.agent-watch-main-health"
   MAIN_HEALTH_DEFER="$_mh_trees/.agent-watch-main-health-defer"
-  MAIN_HEALTH_FIX_STATE="$_mh_trees/.agent-watch-main-health-fix"
   _mh_journal="$_mh_trees/.herd/journal.jsonl"
   # PIN the journal onto the fixture path this leg greps (restored below) — same HERD-223/bats
   # redirect hazard as the mainfresh leg above: without JOURNAL_FILE exported, journal_append under
@@ -1210,7 +1209,7 @@ MHSTUB
 
   MAIN="$_mh_sv_main"; TREES="$_mh_sv_trees"; export WORKTREES_DIR="$_mh_sv_wt"
   export HERD_HEALTHCHECK_BIN="$_mh_sv_hc"; MAIN_HEALTH_TICK="$_mh_sv_tick"
-  MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"; MAIN_HEALTH_FIX_STATE="$_mh_sv_fix"
+  MAIN_HEALTH_STATE="$_mh_sv_state"; MAIN_HEALTH_DEFER="$_mh_sv_defer"
   if [ -n "$_mh_sv_jf" ]; then export JOURNAL_FILE="$_mh_sv_jf"; else unset JOURNAL_FILE; fi
 else
   checkpoint main_health_observed_dispatch fail "reconcile_main_health not defined (lib-mode source did not expose the tick reconcile)"

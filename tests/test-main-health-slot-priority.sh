@@ -172,7 +172,6 @@ _BASH_JOURNAL="$BTREES/.herd/journal.jsonl"
   MAIN="$BREPO"; TREES="$BTREES"
   MAIN_HEALTH_STATE="$BTREES/.agent-watch-main-health"
   MAIN_HEALTH_DEFER="$BTREES/.agent-watch-main-health-defer"
-  MAIN_HEALTH_FIX_STATE="$BTREES/.agent-watch-main-health-fix"
   MAIN_HEALTH_TICK=on
   HERD_HEALTHCHECK_BIN="$_HC"
 

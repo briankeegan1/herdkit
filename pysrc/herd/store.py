@@ -40,6 +40,9 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
     python3 -m herd.store --migrate [--pool DIR]     # flat → db (guarded); --verify to prove round-trip
     python3 -m herd.store --rollback [--pool DIR]    # db → flat (byte-identical), drop the marker
     python3 -m herd.store --verify  [--pool DIR]     # files → db → files byte-identical proof, no marker
+    python3 -m herd.store --main-health-fix-mark ID [--pr P] [--sha S] [--pool DIR]  # HERD-371 dedup
+        # claim: rc 0 = won (file it), rc 3 = already marked (dedup), rc 2 = no pool
+    python3 -m herd.store --main-health-fix-clear ID [--pool DIR]                    # drop the marker
 """
 
 import os
@@ -198,6 +201,22 @@ class Store:
     def seat_rows(self):
         """Latest ``(id, level, epoch, state)`` per seat (chronological fold — last row per id wins)."""
         return self._b.seat_rows()
+
+    # main-health-fix marker ── HERD-371: the MAIN RED autofix filing leg's dedup marker, keyed by the
+    # FAILING-TEST IDENTITY (not sha, not pr) so it survives a sha change and is visible to every seat ──
+    def main_health_fix_marked(self, identity):
+        return self._b.main_health_fix_marked(identity)
+
+    def mark_main_health_fix(self, identity, pr="", sha=""):
+        """Atomic claim-or-abort for ``identity`` (mirrors ``claim``/``once``). True iff THIS call is the
+        FIRST across the whole pool to see this failing-test identity — the caller should file. False iff
+        it is already marked (another seat, or an earlier tick on this seat, already filed) — the caller
+        must dedup, never re-file."""
+        return self._b.mark_main_health_fix(identity, pr, sha)
+
+    def clear_main_health_fix(self, identity):
+        """Drop the marker once main is GREEN for this identity, so a LATER regression files fresh."""
+        return self._b.clear_main_health_fix(identity)
 
 
 # ── flat backend: the current substrate, verbatim ─────────────────────────────────────────────────
@@ -466,6 +485,42 @@ class _FlatBackend:
             return []
         return [latest[k] for k in latest]
 
+    # main-health-fix marker ─────────────────────────────────────────────────────────────────────
+    def _main_health_fix_file(self, identity):
+        return self._p(".agent-watch-main-health-fix-%s" % _safe(identity))
+
+    def main_health_fix_marked(self, identity):
+        path = self._main_health_fix_file(identity)
+        return bool(path and os.path.isfile(path))
+
+    def mark_main_health_fix(self, identity, pr="", sha=""):
+        path = self._main_health_fix_file(identity)
+        if not path:
+            return True
+        _ensure_parent(path)
+        # Atomic claim-or-abort, exactly like `once()`: O_CREAT|O_EXCL never leaves a lost-update window
+        # between two seats racing to file the SAME failing-test identity.
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        except Exception:
+            return True
+        try:
+            os.write(fd, ("%s\t%s\t%s\n" % (_now(), pr, sha)).encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+
+    def clear_main_health_fix(self, identity):
+        path = self._main_health_fix_file(identity)
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 
 # ── sqlite backend: the same accessors, transactional under WAL ───────────────────────────────────
 
@@ -481,6 +536,7 @@ CREATE TABLE IF NOT EXISTS refix_rounds (key TEXT, sha TEXT, n INTEGER, PRIMARY 
 CREATE TABLE IF NOT EXISTS once_guards  (key TEXT PRIMARY KEY, epoch INTEGER);
 CREATE TABLE IF NOT EXISTS seat_registry(epoch INTEGER, id TEXT, level INTEGER, state TEXT);
 CREATE INDEX IF NOT EXISTS seat_id ON seat_registry(id);
+CREATE TABLE IF NOT EXISTS main_health_fix(identity TEXT PRIMARY KEY, epoch INTEGER, pr TEXT, sha TEXT);
 CREATE TABLE IF NOT EXISTS state_blob  (path TEXT PRIMARY KEY, content BLOB, mode INTEGER);
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -674,6 +730,34 @@ class _SqliteBackend:
             latest[sid] = (sid, _int(lvl), _int(ep), st or "active")
         return [latest[k] for k in latest]
 
+    # main-health-fix marker ─────────────────────────────────────────────────────────────────────
+    def main_health_fix_marked(self, identity):
+        row = self._conn.execute(
+            "SELECT 1 FROM main_health_fix WHERE identity=?", (str(identity),)).fetchone()
+        return row is not None
+
+    def mark_main_health_fix(self, identity, pr="", sha=""):
+        def body(conn):
+            return conn.execute(
+                "INSERT OR IGNORE INTO main_health_fix(identity, epoch, pr, sha) VALUES (?,?,?,?)",
+                (str(identity), _now(), str(pr), str(sha))).rowcount > 0
+        try:
+            return self._rmw(body)
+        except Exception:
+            # Fail CLOSED like `once()`: if the marker cannot be durably recorded, never claim a win —
+            # missing one filing is safe, double-filing a duplicate tracker item is the bug this exists
+            # to remove.
+            return False
+
+    def clear_main_health_fix(self, identity):
+        def body(conn):
+            conn.execute("DELETE FROM main_health_fix WHERE identity=?", (str(identity),))
+            return True
+        try:
+            self._rmw(body)
+        except Exception:
+            pass
+
     # ── migration substrate (state_blob + meta): NOT part of the accessor surface ─────────────────
     def put_blob(self, path, content, mode):
         self._conn.execute(
@@ -696,7 +780,7 @@ class _SqliteBackend:
     def counts(self):
         out = {}
         for t in ("approvals", "review_ledger", "health_results", "claims", "refix_rounds",
-                  "once_guards", "seat_registry", "state_blob"):
+                  "once_guards", "seat_registry", "main_health_fix", "state_blob"):
             try:
                 out[t] = self._conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
             except Exception:
@@ -1033,14 +1117,27 @@ def main(argv=None):
     action = None
     pool = None
     do_verify = False
+    identity = None
+    pr = ""
+    sha = ""
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--migrate", "--rollback", "--status", "--verify"):
+        if a in ("--migrate", "--rollback", "--status", "--verify",
+                  "--main-health-fix-mark", "--main-health-fix-clear"):
             action = a
+            if a in ("--main-health-fix-mark", "--main-health-fix-clear"):
+                i += 1
+                identity = argv[i] if i < len(argv) else None
         elif a == "--pool":
             i += 1
             pool = argv[i] if i < len(argv) else None
+        elif a == "--pr":
+            i += 1
+            pr = argv[i] if i < len(argv) else ""
+        elif a == "--sha":
+            i += 1
+            sha = argv[i] if i < len(argv) else ""
         elif a in ("--do-verify", "--check"):
             do_verify = True
         elif a in ("-h", "--help"):
@@ -1052,6 +1149,18 @@ def main(argv=None):
         return migrate(pool, verify=True)         # migrate ALWAYS proves the round-trip before engaging
     if action == "--rollback":
         return rollback(pool)
+    if action == "--main-health-fix-mark":
+        # HERD-371: the shared-pool dedup marker the bash main-health autofix leg claims before filing.
+        # rc 0 = we won (caller should file); rc 3 = already marked (caller must dedup); rc 2 = no pool.
+        if not identity:
+            sys.stderr.write("herd store: --main-health-fix-mark requires an identity\n")
+            return 2
+        st = open_store(pool)
+        return 0 if st.mark_main_health_fix(identity, pr, sha) else 3
+    if action == "--main-health-fix-clear":
+        if identity:
+            open_store(pool).clear_main_health_fix(identity)
+        return 0
     if action == "--verify":
         if not pool or not os.path.isdir(pool):
             sys.stderr.write("herd store: no pool to verify\n")
