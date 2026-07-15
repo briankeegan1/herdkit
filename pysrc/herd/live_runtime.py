@@ -1039,7 +1039,7 @@ def discover_via_graphql(repo=None, limit=50):
     query = (
         "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){"
         "pullRequests(states:OPEN,first:$n){nodes{number headRefName mergeStateStatus "
-        "headRefOid baseRefName reviewDecision author{login} "
+        "headRefOid baseRefName reviewDecision isDraft author{login} "
         "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
     owner, name = _repo_owner_name(repo)
@@ -1053,6 +1053,8 @@ def discover_via_graphql(repo=None, limit=50):
              .get("pullRequests") or {}).get("nodes") or []
     cands = []
     for node in nodes:
+        if node.get("isDraft"):
+            continue  # never adopt a draft (parity: agent-watch.sh ~line 1805)
         # leg 1: derive the SLUG from the head branch (bash convention, herd_branch_parse) and resolve
         # the POOL worktree ($TREES/<slug>) the rails run on — never leave worktree empty, which shells
         # healthcheck.sh with no tree and usage-errors into a phantom CODEERROR (HERD-346, #453).
