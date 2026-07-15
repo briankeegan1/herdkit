@@ -888,12 +888,17 @@ _engine_seat_reconcile_tick() {
 }
 
 # build_main_health — the post-merge main-health ALARM row (HERD-129). One LOUD persistent red line
-# while the default branch is red, read from $MAIN_HEALTH_STATE ("<sha> <since_pr> <failing test…>",
-# written by _main_health_set_red and cleared by _main_health_clear). Empty (MAIN_HEALTH="") when the
-# file is absent — so a green main renders NOTHING. Also GATED on the lever: if an operator flips
-# MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no tick is left to
-# clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature whenever the
-# feature is off, red state file or not.
+# while the default branch is red, read from $MAIN_HEALTH_STATE (US-joined "<sha>US<since_pr>US<local
+# identity>US<CI identity>", written by _main_health_set_red and cleared by _main_health_clear). Empty
+# (MAIN_HEALTH="") when the file is absent — so a green main renders NOTHING. Also GATED on the lever:
+# if an operator flips MAIN_HEALTH_TICK=off while main is red, the row stops rendering immediately (no
+# tick is left to clear a stale state file) — so the console is BYTE-IDENTICAL to before this feature
+# whenever the feature is off, red state file or not.
+#
+# HERD-372: the row renders the MOST SPECIFIC identity available — a local-suite failing test/TAP line
+# names exactly what to fix, while a branch-CI conclusion ("CI <workflow>: FAILURE") is comparatively
+# generic — so the local identity wins whenever both are standing. Byte-identical to the pre-HERD-372
+# single-field row whenever only one identity exists (the other field is simply empty).
 #
 # HONEST 'since' (HERD-222): an OBSERVED-SHA tick — a main sha this seat never merged — often has no PR
 # number to attribute the break to (the sha is recorded as "?"). Printing "(since #?)" would name a PR
@@ -903,8 +908,9 @@ build_main_health() {
   MAIN_HEALTH=""
   _main_health_enabled || return 0
   [ -s "$MAIN_HEALTH_STATE" ] || return 0
-  local _bm_sha _bm_since _bm_fail _bm_attr
-  read -r _bm_sha _bm_since _bm_fail < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  local _bm_sha _bm_since _bm_local _bm_ci _bm_fail _bm_attr
+  IFS=$'\x1f' read -r _bm_sha _bm_since _bm_local _bm_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  _bm_fail="$_bm_local"; [ -n "$_bm_fail" ] || _bm_fail="$_bm_ci"
   [ -n "${_bm_fail:-}" ] || _bm_fail="unknown"
   case "${_bm_since:-}" in
     ''|*[!0-9]*) _bm_attr="observed" ;;
@@ -6201,7 +6207,17 @@ _reap_slug() {
 #     existing green→clear path instead of shouting for 19 hours.
 #   • MAIN_HEALTH_AUTOFIX — on a REPRODUCED red with an HONEST failing-test identity, enqueue ONE scribe
 #     item naming that test. It files work; it does NOT spawn a builder in this increment.
-MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"        # one line while RED: "<sha> <since_pr> <failing test…>"
+MAIN_HEALTH_STATE="$TREES/.agent-watch-main-health"        # one line while RED, fields joined by US (0x1f):
+                                                            # "<sha>US<since_pr>US<local identity>US<CI identity>"
+                                                            # (HERD-372: two SEPARATE identity fields, so a
+                                                            # branch-CI red merges into, never replaces, a
+                                                            # standing local-suite identity, and vice versa).
+                                                            # US, NOT a tab: the local/CI field is EMPTY
+                                                            # whenever only one identity is standing, and tab
+                                                            # is IFS-whitespace — `read` would collapse the
+                                                            # empty field and shift every later column (mirrors
+                                                            # governance-drift-sweep.sh's SEP). Failing-test
+                                                            # identities are plain text and never contain US.
 MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" — the last journaled defer
 # The AUTOFIX filed-identity marker is no longer a bare seat-local flat file (HERD-371): it lives in the
 # SHARED POOL through pysrc/herd/store.py's main_health_fix_* accessors (see _main_health_fix_mark /
@@ -6306,20 +6322,37 @@ _main_health_worker() {
 # with no HEALTHCHECK_CMD, healthcheck.sh's --heavy falls back to light anyway — but such a project
 # also never paints red, so there is nothing to falsely clear.)
 
-# _main_health_clear <pr#> <sha> — a main sha went GREEN. Drop any standing red state (which removes
-# the console row), CLEAR the shared-pool autofix marker for whichever identity was red (HERD-371: so a
-# LATER regression of the SAME test files fresh instead of staying dedup'd forever), journal the green
-# result, and on a RED→green TRANSITION notify recovery once.
+# _main_health_clear <pr#> <sha> [kind=local|ci] — a main sha went GREEN in the given SCOPE (HERD-372:
+# "local" for the healthcheck suite, "ci" for the branch-CI leg; local is the default so the existing
+# single caller — the local-suite collector — needs no change). SCOPE-AWARE: clears only the identity
+# field owned by <kind>, and CLEARS the shared-pool autofix marker for THAT identity only (HERD-371: so
+# a LATER regression of the SAME test files fresh). If the OTHER identity is still standing red, the
+# row stays up unchanged and NOTHING re-fires for it — a local-suite green must never mask (or churn) a
+# live branch-CI red, and a CI recovery must never mask a live local red. Only when BOTH identities are
+# now clear does the state file drop, the green result journal, and (on a RED→green TRANSITION) recovery
+# notify once. Byte-identical to the pre-HERD-372 behavior whenever only one identity ever existed.
 _main_health_clear() {
-  local _mc_pr="$1" _mc_sha="$2" _mc_wasred=0 _mc_pv_sha _mc_pv_since _mc_pv_id
+  local _mc_pr="$1" _mc_sha="$2" _mc_kind="${3:-local}"
+  local _mc_pv_sha="" _mc_pv_since="" _mc_pv_local="" _mc_pv_ci="" _mc_own="" _mc_other=""
   if [ -s "$MAIN_HEALTH_STATE" ]; then
-    _mc_wasred=1
-    read -r _mc_pv_sha _mc_pv_since _mc_pv_id < "$MAIN_HEALTH_STATE" 2>/dev/null || true
-    [ -n "$_mc_pv_id" ] && _main_health_fix_clear "$_mc_pv_id"
+    IFS=$'\x1f' read -r _mc_pv_sha _mc_pv_since _mc_pv_local _mc_pv_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  fi
+  case "$_mc_kind" in
+    ci) _mc_own="$_mc_pv_ci"; _mc_other="$_mc_pv_local" ;;
+    *)  _mc_own="$_mc_pv_local"; _mc_other="$_mc_pv_ci" ;;
+  esac
+  [ -n "$_mc_own" ] && _main_health_fix_clear "$_mc_own"
+  if [ -n "$_mc_other" ]; then
+    case "$_mc_kind" in
+      ci) printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" "$_mc_other" ""           > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
+      *)  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" ""           "$_mc_other" > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
+    esac
+    [ -n "$_mc_own" ] && journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result partial_clear kind "$_mc_kind"
+    return 0
   fi
   rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
-  if [ "$_mc_wasred" -eq 1 ]; then
+  if [ -n "$_mc_own" ]; then
     herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
   fi
 }
@@ -6427,26 +6460,37 @@ Add a 🔜 item to fix it. Do not close it until main-health goes green."
   return 0
 }
 
-# _main_health_set_red <pr#> <sha> <healthcheck-oneline> — a main sha REPRODUCED a red. Persist the
-# red state (which drives the console row), journal the failing test via the HERD-76 identity
-# extraction, and notify ONCE on the green→red transition. The 'since #N' PR is STICKY: if main was
-# already red, keep the FIRST offending PR so a run of red merges all point back to where main broke.
+# _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] — a main sha REPRODUCED a red
+# in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the branch-CI leg; local is
+# the default so the existing local-suite caller needs no change). MERGES into the state — it writes
+# ONLY the <kind> identity field, leaving whichever OTHER identity already stood untouched, so a
+# branch-CI red can never OVERWRITE (and thereby degrade) a standing local-suite failing-test identity,
+# and vice versa. The rendered/journaled/notified/autofixed identity is the MOST SPECIFIC one standing
+# (local wins over CI — mirrors build_main_health). The 'since #N' PR is STICKY: if main was already
+# red, keep the FIRST offending PR so a run of red merges all point back to where main broke.
 _main_health_set_red() {
-  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_fail _sr_since _sr_wasred=0 _sr_pv_sha _sr_pv_since _sr_rest
+  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_kind="${4:-local}"
+  local _sr_fail _sr_since _sr_wasred=0 _sr_pv_sha="" _sr_pv_since="" _sr_pv_local="" _sr_pv_ci="" _sr_local _sr_ci _sr_render
   _sr_fail="$(_health_fail_identity "$_sr_out")"
   [ -n "$_sr_fail" ] || _sr_fail="$_sr_out"
   _sr_since="$_sr_pr"
   if [ -s "$MAIN_HEALTH_STATE" ]; then
     _sr_wasred=1
-    read -r _sr_pv_sha _sr_pv_since _sr_rest < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+    IFS=$'\x1f' read -r _sr_pv_sha _sr_pv_since _sr_pv_local _sr_pv_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
     [ -n "${_sr_pv_since:-}" ] && _sr_since="$_sr_pv_since"
   fi
-  printf '%s %s %s\n' "$_sr_sha" "$_sr_since" "$_sr_fail" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
-  journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_fail" since "$_sr_since"
+  _sr_local="$_sr_pv_local"; _sr_ci="$_sr_pv_ci"
+  case "$_sr_kind" in
+    ci) _sr_ci="$_sr_fail" ;;
+    *)  _sr_local="$_sr_fail" ;;
+  esac
+  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
+  journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
   if [ "$_sr_wasred" -eq 0 ]; then
-    herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_fail} (since #${_sr_since})" default
+    herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
-  _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_fail" "$_sr_out"
+  _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_render" "$_sr_out"
 }
 
 # _main_health_defer <pr#> <sha> <reason> — journal a DEFERRAL (no slot, no bin) at most once per
@@ -6561,12 +6605,15 @@ _main_health_file_age_mins() {
 # GROUNDED (2026-07-11): main CI was red 6h after PR #439 with ZERO alarm — the MAIN RED machinery only
 # ever reflected the LOCAL healthcheck suite, which can be green while the DEFAULT branch's required CI
 # is red. This leg fires the EXISTING main-red row when the latest CI run FOR THE CURRENT main HEAD has a
-# failing conclusion, reusing _main_health_set_red (same state file, same row, same notify-once).
+# failing conclusion, reusing _main_health_set_red (same state file, same row, same notify-once) — passing
+# kind=ci (HERD-372) so it MERGES its own identity field rather than clobbering a standing local-suite
+# failing-test identity (or being clobbered by one).
 #
 # Rides the MAIN_HEALTH_TICK lever (byte-inert when off) and is fully fail-soft: an offline/old gh, no
 # runs, or a run that is not yet COMPLETED yields NOTHING and never paints a red row. Deduped by
 # (sha, conclusion) via $MAIN_HEALTH_CI_STATE so a standing CI red fires the row + journal exactly ONCE,
-# never per tick. The local-suite green→clear path still owns clearing (a new green sha drops the state).
+# never per tick. The local-suite green→clear path (kind=local) only ever drops the LOCAL identity field
+# now (HERD-372) — a live CI red keeps standing, with zero re-set churn, until CI itself recovers.
 
 # _main_ci_classify <expected-sha> — read a `gh run list --json headSha,status,conclusion,workflowName`
 # array on stdin and emit "<bucket>\t<workflow>\t<conclusion>" for the most-recent COMPLETED run whose
@@ -6625,7 +6672,7 @@ EOF
   _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
   [ "$_prev" = "$_line" ] && return 0                      # already fired for this sha+conclusion — no spam
   printf '%s\n' "$_line" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
-  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}"
+  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}" ci
   return 0
 }
 

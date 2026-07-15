@@ -66,6 +66,19 @@ HCSTUB
 chmod +x "$HC"
 export HC_MODE="$T/hc-mode"; printf 'green\n' > "$HC_MODE"
 
+# `gh` stub for the branch-CI leg (HERD-334/HERD-372): _main_health_ci_leg → `gh run list … --json …` →
+# GH_RUNS (network-free, no real Actions calls).
+BIN="$T/bin"; mkdir -p "$BIN"
+cat > "$BIN/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "run list") printf '%s\n' "${GH_RUNS:-}"; exit 0 ;;
+esac
+exit 0
+GHSTUB
+chmod +x "$BIN/gh"
+export PATH="$BIN:$PATH"
+
 # ── source the real engine in lib mode, with every state path pinned into the sandbox ────────────────
 # WORKTREES_DIR must be exported BEFORE sourcing: $TREES (and the main-health state paths derived from
 # it at source time) are bound there. journal_append resolves its own path from WORKTREES_DIR too.
@@ -378,15 +391,58 @@ MAIN_HEALTH_TICK=on
 ok "(e) MAIN_HEALTH_TICK=off is byte-inert: no suite, no journal, no marker"
 
 # ── honest 'since' label: an observed sha with no PR renders "(observed)", never "(since #?)" ────────
+# State fields are US(0x1f)-joined, not tab — tab is IFS-whitespace and `read` collapses an empty field.
 reset_state
-printf '%s %s %s\n' "deadbeef" "?" "app/greet.test.sh" > "$MAIN_HEALTH_STATE"
+printf '%s\x1f%s\x1f%s\x1f%s\n' "deadbeef" "?" "app/greet.test.sh" "" > "$MAIN_HEALTH_STATE"
 ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
 printf '%s' "$ROW" | grep -q '(observed)'  || fail "(a) an unattributed red renders a fictional PR: $ROW"
 printf '%s' "$ROW" | grep -q 'since #'     && fail "(a) an unattributed red claims a 'since #' PR: $ROW"
-printf '%s %s %s\n' "deadbeef" "226" "app/greet.test.sh" > "$MAIN_HEALTH_STATE"
+printf '%s\x1f%s\x1f%s\x1f%s\n' "deadbeef" "226" "app/greet.test.sh" "" > "$MAIN_HEALTH_STATE"
 ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
 printf '%s' "$ROW" | grep -q 'since #226' || fail "(a) an attributed red lost its 'since #N': $ROW"
 ok "(a) the row names the PR when it knows one, and says (observed) when it does not"
+
+# ── HERD-372: identity preservation + scope-aware clear ─────────────────────────────────────────────
+# (f) a branch-CI red MERGES into, never replaces, a standing local-suite failing-test identity: set
+# local red, then fire a CI red (via the REAL _main_health_ci_leg) for the SAME sha — both identities
+# survive, and the row still names the MORE SPECIFIC (local) identity, not the generic CI conclusion.
+reset_state
+printf 'red-file\n' > "$HC_MODE"
+new_sha "feat: reds main locally so HERD-372 can layer a CI red on top"
+SHA372="$(head_sha)"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(f) setup: the local suite did not paint MAIN RED"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+printf '%s' "$ROW" | grep -q 'app/greet.test.sh' || fail "(f) setup: the row does not name the local failing test: $ROW"
+export GH_RUNS='[{"headSha":"'"$SHA372"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}]'
+_main_health_ci_leg
+IFS=$'\x1f' read -r _f_sha _f_since _f_local _f_ci < "$MAIN_HEALTH_STATE"
+[ "$_f_local" = "app/greet.test.sh" ] || fail "(f) the CI red overwrote the standing local identity: '$_f_local'"
+printf '%s' "$_f_ci" | grep -q 'CI build: FAILURE' || fail "(f) the CI identity was not recorded: '$_f_ci'"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+printf '%s' "$ROW" | grep -q 'app/greet.test.sh' || fail "(f) the row stopped naming the specific local test once CI also reds: $ROW"
+ok "(f) a branch-CI red merges into (never replaces) a standing local-suite identity; the row keeps naming the specific test"
+
+# (g) a local-suite green clears ONLY the local identity — a live CI red keeps standing, with ZERO
+# re-set churn on a later CI tick that reproduces the exact same (sha, conclusion).
+RED_JOURNAL_BEFORE="$(jcount '"result":"red"')"
+NOTIFY_BEFORE="$(ncount 'MAIN RED')"
+printf 'green\n' > "$HC_MODE"
+: > "$(_main_health_marker "$SHA372")"          # simulate the local suite's own collect calling clear(local)
+_main_health_clear "?" "$SHA372" local
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(g) the CI red vanished when only the LOCAL identity cleared"
+IFS=$'\x1f' read -r _g_sha _g_since _g_local _g_ci < "$MAIN_HEALTH_STATE"
+[ -z "$_g_local" ] || fail "(g) the local identity was not cleared: '$_g_local'"
+printf '%s' "$_g_ci" | grep -q 'CI build: FAILURE' || fail "(g) the CI identity did not survive the local clear: '$_g_ci'"
+[ "$(ncount 'main green')" -eq 0 ] || fail "(g) a partial (local-only) clear falsely notified full recovery"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+printf '%s' "$ROW" | grep -q 'MAIN RED' || fail "(g) the row disappeared while the CI identity still stands: $ROW"
+# The exact same (sha, conclusion) probed again (GH_RUNS unchanged) must not re-journal red or re-notify.
+_main_health_ci_leg
+[ "$(jcount '"result":"red"')" -eq "$RED_JOURNAL_BEFORE" ] || fail "(g) a standing CI red re-set (re-journaled) after an unrelated local clear"
+[ "$(ncount 'MAIN RED')" -eq "$NOTIFY_BEFORE" ] || fail "(g) a standing CI red re-notified after an unrelated local clear"
+ok "(g) a local-suite green clears only the local identity: the CI red stands with zero re-set churn"
+unset GH_RUNS
 
 # ── PR attribution: a trailing "(#N)" (the squash form) outranks an issue ref earlier in the subject ──
 new_sha "Merge pull request #456 from other/seat"
