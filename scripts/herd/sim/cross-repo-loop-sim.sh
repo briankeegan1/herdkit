@@ -125,22 +125,10 @@ esac
 GH_STUB
 chmod +x "$T/bin/gh"
 
-# ── STUB primitives — simulating missing machinery ─────────────────────────────
-
-# STUB: record / remove a blocked-on dep in .herd/deps.
-# Real: would be written by "herd depend <link>#<id>" and removed by "herd deps rm".
-# Gap:  BACKLOG.md § "Dispatch vs. dependency intent"  (Gap 3 — not yet built)
+# herd depend / herd deps rm (Gap 3, shipped PR #90) write/remove the blocked-on row for real —
+# no stub needed for steps 3 and 8 below. DEPS_FILE mirrors what "herd depend" resolves
+# PROJECT_ROOT/.herd/deps to for the consumer fixture, so later steps can inspect it directly.
 DEPS_FILE="$CONSUMER/.herd/deps"
-_record_dep_stub() {
-  printf 'blocked-on: %s\n' "$1" >> "$DEPS_FILE"
-}
-_remove_dep_stub() {
-  local ref="$1"
-  [ -f "$DEPS_FILE" ] || return 0
-  local tmp; tmp="$(mktemp)"
-  grep -v "blocked-on: $ref" "$DEPS_FILE" > "$tmp" 2>/dev/null || true
-  mv "$tmp" "$DEPS_FILE"
-}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THE SIMULATION
@@ -185,9 +173,13 @@ fi
 
 # ── Step 3: Consumer records blocked-on dep ───────────────────────────────────
 step "3" "Consumer records blocked-on: provider-lib#${ISSUE_NUMBER}"
-stub "Writing 'blocked-on: provider-lib#${ISSUE_NUMBER}' to .herd/deps"
-stub "GAP: no 'herd depend' command; no .herd/deps schema (Gap 3 — separate backlog item)"
-_record_dep_stub "provider-lib#${ISSUE_NUMBER}"
+real "herd depend provider-lib#${ISSUE_NUMBER}  →  writes a blocked-on: row to .herd/deps (Gap 3, PR #90)"
+depend_out="$(cd "$CONSUMER" \
+    && PATH="$T/bin:$PATH" \
+       HERD_CONFIG_FILE="$CONSUMER/.herd/config" \
+       HERD_NONINTERACTIVE=1 \
+       bash "$HERD_CLI" depend "provider-lib#${ISSUE_NUMBER}" 2>&1)"
+printf '%s\n' "$depend_out" | while IFS= read -r line; do info "$line"; done
 ok "Recorded: $(cat "$DEPS_FILE")"
 
 # ── Step 4: Provider builds and ships (closes the issue) ─────────────────────
@@ -252,9 +244,14 @@ fi
 
 # ── Step 8: Consumer removes blocked-on → unblocked ──────────────────────────
 step "8" "Consumer removes blocked-on annotation → unblocked"
-stub "GAP: no 'herd deps rm' command; no unblock hook; no lane-restart signal (Gap 3)"
-_remove_dep_stub "provider-lib#${ISSUE_NUMBER}"
-remaining="$(cat "$DEPS_FILE" 2>/dev/null || true)"
+real "herd deps rm provider-lib#${ISSUE_NUMBER}  →  drops the blocked-on row (Gap 3, PR #90)"
+rm_out="$(cd "$CONSUMER" \
+    && PATH="$T/bin:$PATH" \
+       HERD_CONFIG_FILE="$CONSUMER/.herd/config" \
+       HERD_NONINTERACTIVE=1 \
+       bash "$HERD_CLI" deps rm "provider-lib#${ISSUE_NUMBER}" 2>&1)"
+printf '%s\n' "$rm_out" | while IFS= read -r line; do info "$line"; done
+remaining="$(grep '^blocked-on:' "$DEPS_FILE" 2>/dev/null || true)"
 if [ -z "$remaining" ]; then
   ok ".herd/deps cleared — consumer-app is unblocked"
 else
@@ -271,14 +268,14 @@ printf '\n'
 printf '  %s[REAL] primitives exercised (confirmed working):%s\n' "$c_grn" "$c_rst"
 printf '    1. herd link list       .herd/links registry (PR #14)\n'
 printf '    2. herd report --to     cross-repo issue filing (PR #10, #14)\n'
+printf '    3. herd depend          blocked-on record in .herd/deps (Gap 3, PR #90)\n'
 printf '    4. provider ship        provider closes issue via normal coordinator/scribe (Gap 5 resolved)\n'
 printf '    5. _backend_item_state  4th adapter op in all backends/*.sh\n'
 printf '    6. dep-watcher          per-project singleton with spawn-lock + backoff\n'
 printf '    7. herd upgrade         coordinator skill re-render\n'
+printf '    8. herd deps rm         drops the blocked-on row (Gap 3, PR #90)\n'
 printf '\n'
 printf '  %s[STUB] gaps (primitives missing — see docs/gap-report-cross-repo-loop.md):%s\n' "$c_yel" "$c_rst"
-printf '    3. blocked-on record    no herd depend / .herd/deps schema (Gap 3)\n'
 printf '   7b. migrations/vN→vM    herd upgrade lacks versioned migration scripts (Gap 4)\n'
-printf '    8. herd deps rm         no unblock primitive (Gap 3)\n'
 printf '\n'
 printf '  Gap report: docs/gap-report-cross-repo-loop.md\n\n'

@@ -178,7 +178,8 @@ When the remaining primitives are implemented, run this sequence to verify the r
 
 1. In a consumer project, add a `.herd/links` entry pointing at a real provider repo.
 2. `herd report --to <provider> "blocked on X"` — verify issue created on provider. ✅ REAL
-3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated, watcher started. ✅ REAL (Gap 3)
+3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated. ✅ REAL (Gap 3). Note: this only
+   records the row; it does not itself spawn `dep-watcher.sh` (a separate long-running process).
 4. `herd deps list` — verify dep shows OPEN state. ✅ REAL (Gap 3)
 5. On the provider side, close the issue (PR merge or manual close). ✅ REAL
 6. `herd deps list` again — verify watcher detected CLOSED. ✅ REAL (dep-watcher.sh)
@@ -186,7 +187,9 @@ When the remaining primitives are implemented, run this sequence to verify the r
 8. `herd upgrade` — verify coordinator skill re-rendered; any applicable migration ran. (Gap 4)
 
 **Regression check:** run `bash scripts/herd/sim/cross-repo-loop-sim.sh` and confirm all
-steps still pass. Steps 1–7 are now [REAL]; only step 7b/8 (Gap 4) remains [STUB].
+steps still pass. The sim's own steps 1–8 are now [REAL] (steps 3 and 8 call the real
+`herd depend` / `herd deps rm` as of this PR); only its step 7b (Gap 4 migrations) remains
+[STUB].
 
 ---
 
