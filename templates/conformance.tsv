@@ -325,7 +325,7 @@ HERD_FORCE_SPAWN	unit	tests/test-spawn-rate-match.sh
 HERD_FORCE_SPAWN	unit	tests/test-tracked-spawns.sh
 HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
 HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
-HERD_LIMIT_UNKNOWN_WAIT	none-yet	unit: no test references HERD_LIMIT_UNKNOWN_WAIT or asserts the unparseable-reset blind-resume wait
+HERD_LIMIT_UNKNOWN_WAIT	unit	tests/test-limit-resume.sh
 COORDINATOR_WATCHDOG	unit	tests/test-coordinator-watchdog.sh
 COORDINATOR_AUTONOMY	unit	tests/test-knob-aware-doctrine.sh
 DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh
