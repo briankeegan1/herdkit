@@ -77,33 +77,50 @@ flock(1) when available, atomic-mkdir PID-file otherwise; per-project lock key f
 
 ---
 
-## Gap 3 — Blocked-on state: `.herd/deps` schema and `herd depend` command
+## ✅ Gap 3 — Blocked-on state: `.herd/deps` schema and `herd depend` command — SHIPPED (PR #90, HERD-385)
 
 **Sim steps:** 3, 8  
 **Backlog item:** `Dispatch vs. dependency intent`  
-**What the stub does:** appends `blocked-on: <ref>` to `.herd/deps`; removes it with `grep -v`.
+**What the stub did:** appended `blocked-on: <ref>` to `.herd/deps`; removed it with `grep -v`.
 
-### What needs to be built
+### What was built
 
-**`.herd/deps` file format** (proposed):
+**`.herd/deps` file format** (`bin/herd: _deps_ensure_file`):
 
 ```
-# .herd/deps — recorded cross-repo dependencies. Commit this; zero-secret.
-# Format: blocked-on: <link-name>#<id>  [optional: since=<ISO-date>]
-blocked-on: provider-lib#42
+# .herd/deps — recorded cross-repo dependencies (herd deps). Commit this; zero-secret.
+# Format: blocked-on: <link>#<id>  since=<epoch>   — watched by dep-watcher.sh
+#         watch: <link>#<id>  since=<epoch>        — demoted, non-blocking (ignored by the watcher)
+blocked-on: provider-lib#42  since=1751000000
 ```
 
-**`herd depend <link>#<id>`** — records the dep, wires the watcher, and stamps `since=`.
+The row is byte-compatible with the parser `dep-watcher.sh` already shipped in Gap 2 — `ref` is
+everything up to the first whitespace, so the trailing ` since=<epoch>` field is invisible to it.
 
-**`herd deps list`** — shows all active blocked-on deps with their current state (calls
-`_backend_item_state` for each).
-
-**`herd deps rm <link>#<id>`** — removes the entry and confirms the dep is actually closed
-(warn if still open).
+- **`herd depend <link>#<id>`** — records a `blocked-on:` row (resolves the peer via
+  `.herd/links` first), stamped with `since=`. Re-running it on a demoted `watch:` row promotes
+  the row back to `blocked-on:` — a dep is never stuck.
+- **`herd deps list`** — shows every recorded dep (both `blocked-on` and `watch` kinds) with its
+  live upstream state via `_backend_item_state`.
+- **`herd deps rm <link>#<id>`** — removes the row outright; warns (does not block) if the
+  upstream is still open.
+- **`herd deps demote <link>#<id>`** — reclassifies a `blocked-on:` row into a non-blocking
+  `watch:` row, invisible to the watcher's parser, so the lane un-blocks instantly while the item
+  stays on the radar.
+- **`herd report --to <link> --dep`** — files the issue on the peer AND records the resulting
+  item as a dep in one step (recovers the id from the backend's create result). The bare
+  `--to` form (no `--dep`) stays fire-and-forget, recording no dep.
 
 **Distinction from `herd report --to`:** `herd report` is fire-and-forget (dispatch intent);
 `herd depend` is a watched dependency (tracked, blocks a lane). Same link registry; different
 lifecycle.
+
+Capability rows in `templates/capabilities.tsv` (`herd depend`, `herd deps`, `herd report --dep`,
+`.herd/deps`) and conformance proof in `templates/conformance.tsv`
+(`tests/test-dispatch-deps.sh`). Hermetic test asserts the add/list/rm/demote/promote round-trip,
+ref-validation refusals, and that the recorded row is accepted by `dep-watcher.sh`'s own
+`_dw_remove_dep` — proving byte-compatibility against the real consumer, not just a
+self-consistent shape.
 
 ---
 
@@ -161,15 +178,15 @@ When the remaining primitives are implemented, run this sequence to verify the r
 
 1. In a consumer project, add a `.herd/links` entry pointing at a real provider repo.
 2. `herd report --to <provider> "blocked on X"` — verify issue created on provider. ✅ REAL
-3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated, watcher started. (Gap 3)
-4. `herd deps list` — verify dep shows OPEN state. (Gap 3)
+3. `herd depend <provider>#<issue>` — verify `.herd/deps` updated, watcher started. ✅ REAL (Gap 3)
+4. `herd deps list` — verify dep shows OPEN state. ✅ REAL (Gap 3)
 5. On the provider side, close the issue (PR merge or manual close). ✅ REAL
 6. `herd deps list` again — verify watcher detected CLOSED. ✅ REAL (dep-watcher.sh)
-7. `herd deps rm <provider>#<issue>` — verify clean removal. (Gap 3)
+7. `herd deps rm <provider>#<issue>` — verify clean removal. ✅ REAL (Gap 3)
 8. `herd upgrade` — verify coordinator skill re-rendered; any applicable migration ran. (Gap 4)
 
 **Regression check:** run `bash scripts/herd/sim/cross-repo-loop-sim.sh` and confirm all
-steps still pass. Steps 1, 2, 4, 5, 6, and 7 are now [REAL]; only steps 3, 7b, and 8 remain [STUB].
+steps still pass. Steps 1–7 are now [REAL]; only step 7b/8 (Gap 4) remains [STUB].
 
 ---
 
@@ -179,4 +196,4 @@ steps still pass. Steps 1, 2, 4, 5, 6, and 7 are now [REAL]; only steps 3, 7b, a
 |---|---|---|
 | `_backend_item_state <id> op + dependency-watcher` | Gap 1, Gap 2, Gap 5 | ✅ Shipped (PR #25) |
 | `herd upgrade versioned migrations` | Gap 4 | Pending |
-| `Dispatch vs. dependency intent` (enterprise section) | Gap 3 | Pending |
+| `Dispatch vs. dependency intent` (enterprise section) | Gap 3 | ✅ Shipped (PR #90, HERD-385) |
