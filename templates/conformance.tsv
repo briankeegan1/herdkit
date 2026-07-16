@@ -46,7 +46,7 @@ APP_PREVIEW_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_SERVER_ARGS	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_CMD	unit	tests/test-app-preview-config.sh
 APP_PREVIEW_HEALTH_PATH	unit	tests/test-app-preview-config.sh
-APP_PREVIEW_PORT_BASE	none-yet	unit: no test asserts the free-port base-scan (herd-feature.sh:260 / herd-resolve.sh) — test-app-preview-config.sh drives app-monitor launch+probe only, never APP_PREVIEW_PORT_BASE
+APP_PREVIEW_PORT_BASE	unit	tests/test-app-preview-port-scan.sh
 #
 # ── BACKFILL wave 1 (HERD-152): every remaining capability, mapped or noted ──────────────────────
 herd init	unit	tests/test-cli.sh
