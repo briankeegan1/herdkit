@@ -1813,6 +1813,9 @@ _adopt_self_heal_mismatch() {
 # step's failure journals `adopt_failed` (deduped per (pr,sha) via _adopt_journal_failed) and returns
 # WITHOUT once-guarding — a transient failure (network blip, momentary ref lock) is retried on the next
 # scan; only a SUCCESSFUL adopt is terminal (_adopt_pr_mark_adopted) and journals `pr_adopted` once.
+# Returns 0 on a successful adopt, 1 on any failure — the caller (_adopt_remote_prs_scan) uses this to
+# tally the scan's outcome for the throttled `adopt_scan` summary event (HERD-388); it does not change
+# the fail-soft contract above (a nonzero return is never treated as fatal by the caller).
 _adopt_remote_pr() {
   local _arp_pr="$1" _arp_branch="$2" _arp_sha="$3"
   local _arp_slug _arp_dir
@@ -1820,15 +1823,15 @@ _adopt_remote_pr() {
   _arp_dir="$TREES/$_arp_slug"
   if [ -e "$_arp_dir" ]; then
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "worktree path already exists: $_arp_dir"
-    return 0
+    return 1
   fi
   if ! git -C "$MAIN" fetch -q origin "$_arp_branch" >/dev/null 2>&1; then
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git fetch failed"
-    return 0
+    return 1
   fi
   if ! git -C "$MAIN" worktree add "$_arp_dir" "$_arp_branch" >/dev/null 2>&1; then
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git worktree add failed"
-    return 0
+    return 1
   fi
   journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
   _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
@@ -1841,9 +1844,23 @@ _adopt_remote_pr() {
 #   already recorded, else adopt. Self-gates on ADOPT_REMOTE_PRS and PRS_LOOKUP_OK exactly like the
 #   orphan scan (a failed open-PR fetch is not positive evidence of "no PR" — never fabricated into a
 #   spurious adopt attempt). Zero network beyond the per-PR fetch+worktree-add themselves.
+#
+# OBSERVABILITY (HERD-388): GROUNDED INCIDENT — three eligible, non-draft, worktree-less PRs sat for
+# 30+ minutes under ADOPT_REMOTE_PRS=on with NO pr_adopted, NO adopt_failed, and NO orphan rows: total
+# silence, indistinguishable from "nothing to adopt". The root cause is that BOTH this scan and the
+# orphan-PR scan self-gate on PRS_LOOKUP_OK — so a `gh pr list` failure that is NOT a hard timeout (the
+# only case _gh_timeout itself journals, via `gh_timeout`) degrades PRS_LOOKUP_OK to 0 with no journal
+# record anywhere. From the operator's console/journal there is no way to tell "the scan ran and found
+# nothing" apart from "the scan has not been able to run for N ticks". Every invocation of this
+# function (already throttled to the ~60s scan cadence by its caller) now emits exactly ONE `adopt_scan`
+# summary event — result ∈ {empty, adopted, failed} + count — so a silently-dead leg is visible in the
+# journal the very next scan, not just in retrospect.
 _adopt_remote_prs_scan() {
   _adopt_remote_prs_enabled || return 0
-  [ "${PRS_LOOKUP_OK:-1}" = "1" ] || return 0
+  if [ "${PRS_LOOKUP_OK:-1}" != "1" ]; then
+    journal_append adopt_scan result failed count 0 reason lookup_failed
+    return 0
+  fi
   local _ars_json="${1:-[]}" _ars_claimed="${2:-}" _ars_wt="${3:-}" _ars_out
   _ars_out="$(PRS_JSON="$_ars_json" CLAIMED="$_ars_claimed" python3 -c '
 import os, sys, json
@@ -1869,8 +1886,11 @@ for pr in prs:
         continue
     print("%s\t%s\t%s" % (num, branch, sha))
 ' 2>/dev/null)" || _ars_out=""
-  [ -n "$_ars_out" ] || return 0
-  local _ars_pr _ars_branch _ars_sha
+  if [ -z "$_ars_out" ]; then
+    journal_append adopt_scan result empty count 0
+    return 0
+  fi
+  local _ars_pr _ars_branch _ars_sha _ars_attempted=0 _ars_adopted=0 _ars_failed=0
   while IFS=$'\t' read -r _ars_pr _ars_branch _ars_sha; do
     [ -n "${_ars_pr:-}" ] || continue
     # A prior (pre-fix) adopt may have this branch checked out at the WRONG (mismatched-slug) path —
@@ -1879,10 +1899,22 @@ for pr in prs:
     _adopt_self_heal_mismatch "$_ars_branch" "$TREES/$(herd_branch_slug "$_ars_branch")" "$_ars_wt"
     _adopt_pr_recorded "$_ars_pr" "$_ars_sha" && continue
     _adopt_branch_checked_out "$_ars_branch" "$_ars_wt" && continue
-    _adopt_remote_pr "$_ars_pr" "$_ars_branch" "$_ars_sha"
+    _ars_attempted=$((_ars_attempted + 1))
+    if _adopt_remote_pr "$_ars_pr" "$_ars_branch" "$_ars_sha"; then
+      _ars_adopted=$((_ars_adopted + 1))
+    else
+      _ars_failed=$((_ars_failed + 1))
+    fi
   done <<EOF
 $_ars_out
 EOF
+  if [ "$_ars_attempted" -eq 0 ]; then
+    journal_append adopt_scan result empty count 0
+  elif [ "$_ars_failed" -gt 0 ]; then
+    journal_append adopt_scan result failed count "$_ars_failed" adopted "$_ars_adopted"
+  else
+    journal_append adopt_scan result adopted count "$_ars_adopted"
+  fi
   return 0
 }
 

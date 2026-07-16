@@ -137,6 +137,11 @@ grep -q "leak" "$GIT_CALL_LOG" && fail "claimed PR 202 must never be touched: $(
 grep -q '"event":"pr_adopted"' "$JOURNAL_FILE" || fail "pr_adopted not journaled: $(cat "$JOURNAL_FILE")"
 grep -q '"pr":201' "$JOURNAL_FILE" || fail "pr_adopted missing pr:201: $(cat "$JOURNAL_FILE")"
 grep -q -- "$(printf '201\tsha201\tadopted')" "$ADOPT_PR_LEDGER" || fail "ledger missing adopted row: $(cat "$ADOPT_PR_LEDGER" 2>/dev/null)"
+# HERD-388: the throttled per-scan summary reports the successful adopt too, count=1 (only PR 201 was
+# eligible — 202 was already claimed and never entered the attempt tally).
+grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "expected the throttled adopt_scan summary: $(cat "$JOURNAL_FILE")"
+grep -q '"result":"adopted"' "$JOURNAL_FILE" || fail "a successful adopt must summarize as result=adopted"
+grep -q '"count":1' "$JOURNAL_FILE" || fail "expected count=1 (one PR adopted this scan)"
 pass
 
 # ── 3b. herd_branch_slug matches branch_to_slug's convention directly (unit-level parity check) ────
@@ -148,11 +153,16 @@ pass
 pass
 
 # ── 4. A DRAFT orphan PR is never adopted, even though it is otherwise eligible ──────────────────────
+# (it DOES still produce the throttled `adopt_scan result=empty` summary — HERD-388: the scan RAN and
+# found nothing to do, which is the whole point of the summary event, and is distinct from never having
+# run at all.)
 reset_state
 DRAFT_PRS='[{"number":301,"title":"wip thing","headRefName":"feat/wip","headRefOid":"sha301","isDraft":true}]'
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$DRAFT_PRS" "" ""
 [ ! -s "$GIT_CALL_LOG" ] || fail "a draft PR must never trigger fetch/worktree add: $(cat "$GIT_CALL_LOG")"
-[ ! -s "$JOURNAL_FILE" ] || fail "a draft PR must never journal anything: $(cat "$JOURNAL_FILE")"
+grep -q '"pr":301' "$JOURNAL_FILE" 2>/dev/null && fail "a draft PR must never journal a pr_adopted/adopt_failed row: $(cat "$JOURNAL_FILE")"
+grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "expected the throttled adopt_scan summary even for a draft-only roster: $(cat "$JOURNAL_FILE")"
+grep -q '"result":"empty"' "$JOURNAL_FILE" || fail "a draft-only roster must summarize as result=empty (nothing eligible), not adopted/failed"
 [ ! -e "$WORKTREES_DIR/wip" ] || fail "a draft PR must never get a worktree"
 pass
 
@@ -182,23 +192,31 @@ pass
 
 # ── 7. Fail-soft: a fetch failure journals adopt_failed, never a crash, and is NEVER once-guarded —
 #      a still-broken branch RETRIES the attempt every scan, but the journal EVENT is deduped so a
-#      permanently-broken branch does not spam adopt_failed once per tick forever ──────────────────
+#      permanently-broken branch does not spam adopt_failed once per tick forever. Each scan ALSO
+#      emits exactly one throttled adopt_scan summary (HERD-388) — that one is NOT deduped, since it is
+#      the per-scan "did this leg run, and what happened" signal, not a per-(pr,sha) once-guard ──────
 reset_state
 FAIL_FETCH_PRS='[{"number":401,"title":"x","headRefName":"feat/fail-fetch","headRefOid":"sha401","isDraft":false}]'
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAIL_FETCH_PRS" "" || fail "a fetch failure must not abort the scan"
 grep -q '"event":"adopt_failed"' "$JOURNAL_FILE" || fail "adopt_failed not journaled on fetch failure: $(cat "$JOURNAL_FILE")"
 grep -q '"pr":401' "$JOURNAL_FILE" || fail "adopt_failed missing pr:401"
+grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "expected a throttled adopt_scan summary: $(cat "$JOURNAL_FILE")"
+grep -q '"result":"failed"' "$JOURNAL_FILE" || fail "a scan with a failed attempt must summarize as result=failed"
 [ ! -e "$ADOPT_PR_LEDGER" ] || fail "a failure must never write the SUCCESS once-guard ledger: $(cat "$ADOPT_PR_LEDGER")"
 [ ! -d "$WORKTREES_DIR/fail-fetch" ] || fail "a failed fetch must never leave a worktree dir"
 first_fetch_calls="$(wc -l < "$GIT_CALL_LOG" | tr -cd '0-9')"
-first_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
+first_adopt_failed_lines="$(grep -c '"event":"adopt_failed"' "$JOURNAL_FILE")"
+first_adopt_scan_lines="$(grep -c '"event":"adopt_scan"' "$JOURNAL_FILE")"
 # A SECOND scan of the SAME still-failing (pr,sha): the attempt retries (git called again)...
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAIL_FETCH_PRS" ""
 second_fetch_calls="$(wc -l < "$GIT_CALL_LOG" | tr -cd '0-9')"
 [ "$second_fetch_calls" -gt "$first_fetch_calls" ] || fail "a failed (pr,sha) must be RETRIED on the next scan, not once-guarded"
-# ...but the journal event for this exact (pr,sha) is deduped, not doubled.
-second_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
-[ "$second_journal_lines" = "$first_journal_lines" ] || fail "adopt_failed must be deduped per (pr,sha), not re-journaled every scan"
+# ...the adopt_failed EVENT for this exact (pr,sha) is deduped, not doubled...
+second_adopt_failed_lines="$(grep -c '"event":"adopt_failed"' "$JOURNAL_FILE")"
+[ "$second_adopt_failed_lines" = "$first_adopt_failed_lines" ] || fail "adopt_failed must be deduped per (pr,sha), not re-journaled every scan"
+# ...but the per-scan adopt_scan summary is NOT deduped — a second scan is a second throttled tick.
+second_adopt_scan_lines="$(grep -c '"event":"adopt_scan"' "$JOURNAL_FILE")"
+[ "$second_adopt_scan_lines" -gt "$first_adopt_scan_lines" ] || fail "adopt_scan must summarize EVERY scan, not just the first"
 pass
 
 # ── 8. Fail-soft: a worktree-add failure journals adopt_failed too (fetch succeeded, add did not) ──
@@ -209,10 +227,16 @@ grep -q '"event":"adopt_failed"' "$JOURNAL_FILE" || fail "adopt_failed not journ
 grep -q '"pr":402' "$JOURNAL_FILE" || fail "adopt_failed missing pr:402"
 pass
 
-# ── 9. A FAILED open-PR fetch (PRS_LOOKUP_OK=0) never fabricates an adopt attempt ───────────────────
+# ── 9. A FAILED open-PR fetch (PRS_LOOKUP_OK=0) never fabricates an adopt attempt — but IS visible ──
+# HERD-388 GROUNDED INCIDENT: this is exactly the leg that went silent for 30+ minutes with no
+# pr_adopted, no adopt_failed, and no orphan rows — indistinguishable from "nothing to adopt". The scan
+# must now say so explicitly (result=failed, reason=lookup_failed) instead of silently no-opping.
 reset_state
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=0 _adopt_remote_prs_scan "$PRS" ""
 [ ! -s "$GIT_CALL_LOG" ] || fail "PRS_LOOKUP_OK=0 must never attempt an adopt: $(cat "$GIT_CALL_LOG")"
+grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "a failed PR lookup must still emit the throttled adopt_scan summary: $(cat "$JOURNAL_FILE")"
+grep -q '"result":"failed"' "$JOURNAL_FILE" || fail "a failed PR lookup must summarize as result=failed, not empty"
+grep -q '"reason":"lookup_failed"' "$JOURNAL_FILE" || fail "expected reason=lookup_failed so this is distinguishable from an adopt/worktree failure"
 pass
 
 # ── 10. Malformed roster is fail-soft: no ledger write, never a crash ────────────────────────────────
@@ -257,12 +281,88 @@ ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAILMOVE_PRS" "" "$
 grep -q '"event":"adopt_selfheal_failed"' "$JOURNAL_FILE" || fail "adopt_selfheal_failed not journaled on move failure"
 [ -d "$WORKTREES_DIR/feat-fail-move-thing" ] || fail "a failed move must leave the stale dir in place, not lose it"
 first_move_calls="$(grep -c 'worktree move' "$GIT_CALL_LOG" || true)"
-first_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
+first_selfheal_failed_lines="$(grep -c '"event":"adopt_selfheal_failed"' "$JOURNAL_FILE")"
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAILMOVE_PRS" "" "$FAILMOVE_WT"
 second_move_calls="$(grep -c 'worktree move' "$GIT_CALL_LOG" || true)"
 [ "$second_move_calls" -gt "$first_move_calls" ] || fail "a failed self-heal must be RETRIED on the next scan"
-second_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
-[ "$second_journal_lines" = "$first_journal_lines" ] || fail "adopt_selfheal_failed must be deduped per (branch,dir), not re-journaled every scan"
+# The branch stays checked out at the (unmoved) stale path both scans, so nothing was ELIGIBLE to
+# adopt either time — the per-scan adopt_scan summary correctly reads result=empty on both, same as
+# any tick where the scan ran and found nothing new to do.
+second_selfheal_failed_lines="$(grep -c '"event":"adopt_selfheal_failed"' "$JOURNAL_FILE")"
+[ "$second_selfheal_failed_lines" = "$first_selfheal_failed_lines" ] || fail "adopt_selfheal_failed must be deduped per (branch,dir), not re-journaled every scan"
+adopt_scan_lines="$(grep -c '"event":"adopt_scan"' "$JOURNAL_FILE")"
+[ "$adopt_scan_lines" = "2" ] || fail "expected exactly one adopt_scan summary per scan (2 scans, 2 summaries), got $adopt_scan_lines"
+pass
+
+# ── 13. LIVE LOOP SHAPE regression (HERD-388): the SAME wiring the real tick loop uses — including
+#        _prs_fetch_tick's live `gh pr list` field-list construction, worktree discovery producing the
+#        claimed-set, and the _ADOPT_SCAN_TICK/_ADOPT_SCAN_INTERVAL cadence gate — drives a fixture
+#        worktree-less orphan PR to pr_adopted within two scan intervals. Every test above calls
+#        _adopt_remote_prs_scan DIRECTLY with hand-fed PRS_JSON/claimed/wt arguments — that is the
+#        HERD-377 test's shape too: it asserts POST-adoption classification, never the scan's
+#        DISCOVERY. This is the first test that exercises the actual glue a live tick runs: a broken
+#        _prs_fetch_tick field list, a claimed-set miscomputation, or a tick counter that never reaches
+#        its threshold would all pass every test above yet reproduce the grounded incident — three real
+#        orphan PRs sitting silent for 30+ minutes despite the scan logic being provably correct in
+#        isolation.
+reset_state
+cat > "$BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s' "${LIVE_TICK_PRS_JSON:-[]}"
+  exit 0
+fi
+echo SENTINEL-NETWORK-LEAK
+exit 0
+STUB
+chmod +x "$BIN/gh"
+export LIVE_TICK_PRS_JSON='[{"number":501,"title":"live orphan","headRefName":"feat/live-orphan","headRefOid":"sha501","isDraft":false}]'
+
+# Mirror the EXACT per-tick sequence agent-watch.sh's live loop runs (fetch PRs, snapshot worktrees,
+# discover claimed PRs, gate on the scan cadence) — see the "HERD-369 adopt remote PRs" block in
+# _tick_render_reconcile. AGENT_WATCH_LIB mode returns before the bottom-of-file cadence-state init and
+# the live `while true` loop, so this primes _ADOPT_SCAN_TICK/_ADOPT_SCAN_INTERVAL exactly as
+# production does and drives the real functions through the real call sequence.
+_ADOPT_SCAN_INTERVAL=15
+_ADOPT_SCAN_TICK=$_ADOPT_SCAN_INTERVAL
+_live_tick() {
+  _prs_fetch_tick
+  WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  AGENTS_JSON='{"result":{"agents":[]}}'
+  FEATS=()
+  while IFS= read -r rec; do
+    [ -n "$rec" ] && FEATS+=("$rec")
+  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
+  _orphan_claimed=""
+  for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
+$_orphan_rec
+EOF
+    [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
+  done
+  _ADOPT_SCAN_TICK=$((_ADOPT_SCAN_TICK + 1))
+  if [ "$_ADOPT_SCAN_TICK" -ge "$_ADOPT_SCAN_INTERVAL" ]; then
+    _ADOPT_SCAN_TICK=0
+    _adopt_remote_prs_scan "$PRS_JSON" "$_orphan_claimed" "$WT"
+  fi
+}
+
+ADOPT_REMOTE_PRS=on
+_tick_n=0
+_adopted_by_tick=""
+while [ "$_tick_n" -lt "$((2 * _ADOPT_SCAN_INTERVAL))" ]; do
+  _tick_n=$((_tick_n + 1))
+  _live_tick
+  if [ -z "$_adopted_by_tick" ] && grep -q '"pr":501' "$JOURNAL_FILE" 2>/dev/null; then
+    _adopted_by_tick="$_tick_n"
+  fi
+done
+
+[ -n "$_adopted_by_tick" ] || fail "live-loop-shape: PR 501 was never adopted within $((2 * _ADOPT_SCAN_INTERVAL)) ticks (two scan intervals): $(cat "$JOURNAL_FILE")"
+grep -q '"event":"pr_adopted"' "$JOURNAL_FILE" || fail "live-loop-shape: pr_adopted not journaled: $(cat "$JOURNAL_FILE")"
+grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "live-loop-shape: expected throttled adopt_scan summaries too"
+[ -d "$WORKTREES_DIR/live-orphan" ] || fail "live-loop-shape: expected the adopted worktree at the slug-parity path"
+unset ADOPT_REMOTE_PRS
 pass
 
 echo "ok — $PASS adopt-remote-PRs assertions passed"
