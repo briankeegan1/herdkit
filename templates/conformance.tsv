@@ -298,6 +298,7 @@ ORPHAN_PR_ROWS	unit	tests/test-orphan-pr-rows.sh
 ADOPT_REMOTE_PRS	unit	tests/test-adopt-remote-prs.sh
 BUDGET_DAILY	unit	tests/test-budget-governance.sh
 MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh
+MODEL_ESCALATE	unit	tests/test-model-escalate.sh
 REVIEW_ESCALATE_GLOB	unit	tests/test-risk-tiered-review.sh
 REVIEW_MODEL_CHEAP	unit	tests/test-risk-tiered-review.sh
 REVIEW_ESCALATE_MAXFILES	unit	tests/test-risk-tiered-review.sh

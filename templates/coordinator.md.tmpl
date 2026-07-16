@@ -137,9 +137,11 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
    review/resolve logic) wants the feature tier — either pick the feature lane or pass a per-spawn
    override (`HERD_QUICK_MODEL=<model>` / `HERD_FEATURE_MODEL=<model>` in front of the lane command).
    `MODEL_ESCALATE_GLOB` in `.herd/config` is the deterministic backstop: when a task's text matches
-   it the lane forces the `MODEL_FEATURE` tier on its own (overriding `MODEL_QUICK` and any per-spawn
+   it the lane forces the escalation target on its own (overriding `MODEL_QUICK` and any per-spawn
    override) and prints an `escalated to …` notice — so your judgment sets the default and the glob
-   catches the costly misjudgments.
+   catches the costly misjudgments. The forced model is `MODEL_ESCALATE` if set, else `MODEL_FEATURE`
+   — set `MODEL_ESCALATE` when `MODEL_FEATURE` itself is a cheap default and the glob needs to reach a
+   genuinely stronger tier.
 4. Enqueue the status change (don't edit `{{BACKLOG_FILE}}` yourself — see *Backlog writes*):
    `bash {{SCRIPTS_DIR}}/scribe.sh "Mark '<item>' 🚧 in progress (worktree <slug>)"`
 5. Report back the tab id, how to jump (`{{DRIVER_FOCUS_AGENT}}`), and the preview URL if any. <!-- DRIVER:focus-agent -->

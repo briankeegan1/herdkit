@@ -428,6 +428,15 @@ fi
 # zero behavior change. See herd-quick.sh / herd-feature.sh for the resolution point.
 : "${MODEL_ESCALATE_GLOB:=""}"
 
+# MODEL_ESCALATE (HERD-376) — the model a matched MODEL_ESCALATE_GLOB forces. EMPTY (default) → the
+# glob forces MODEL_FEATURE exactly as before (ship-dormant, byte-identical). Set it to force a
+# DIFFERENT model on match instead — the backstop this exists for: MODEL_FEATURE itself now defaults
+# to a sonnet tier (HERD-102), so the glob alone no longer guarantees a STRONGER model on judgment-
+# heavy surfaces unless the operator names one here. Accepts a bare model id or a runtime-qualified
+# '<driver>:<model>' ref (HERD-151), resolved through the same herd_model_for_spawn/_driver_for shim
+# as every other MODEL_* key. See herd_model_escalate_target() in driver.sh for the resolution point.
+: "${MODEL_ESCALATE:=""}"
+
 # ── Risk-tiered pre-merge review (REVIEW_ESCALATE_GLOB) ───────────────────────
 # By DEFAULT the adversarial review gate runs EVERY PR through the full $MODEL_REVIEW (Opus) — the
 # single biggest recurring engine cost. Setting REVIEW_ESCALATE_GLOB opts into RISK-PROPORTIONAL

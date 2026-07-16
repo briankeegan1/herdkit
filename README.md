@@ -76,7 +76,8 @@ a docs typo:
   review). When set, engine-critical paths or a large diff get the strong reviewer; a docs/test-only
   diff is **skipped** with a `source=skipped-low-risk` PASS; any other small low-risk diff uses the
   cheaper `REVIEW_MODEL_CHEAP` tier. Classification fails safe (an unreadable diff → strong). A
-  sibling `MODEL_ESCALATE_GLOB` steps the *builder* model up for judgment-heavy tasks the same way.
+  sibling `MODEL_ESCALATE_GLOB` steps the *builder* model up for judgment-heavy tasks the same way —
+  to MODEL_ESCALATE if set, else MODEL_FEATURE.
 - **Healthcheck profiles — `HEALTHCHECK_HEAVY_GLOB`.** Match the diff paths that warrant the full
   suite (e.g. `^app/`); everything else runs the light `bash -n` profile. Blank means every change is
   heavy (today's behavior).

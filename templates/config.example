@@ -160,6 +160,7 @@ MODEL_SCRIBE="claude-sonnet-4-6"
 MODEL_RESEARCH="claude-sonnet-4-6"
 MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIEW_ESCALATE_GLOB
 # MODEL_ADVISE="claude-opus-4-8"    # `herd advise` one-shot advisor; defaults to the MODEL_FEATURE tier
+# MODEL_ESCALATE=""                 # model a matched MODEL_ESCALATE_GLOB forces; blank (default) → MODEL_FEATURE, e.g. "claude-opus-4-8"
 
 # Claude Code custom endpoint (HERD-171) — MACHINE-scoped, secrets-adjacent. Points the claude
 # runtime at an enterprise/BAA-covered gateway or a local model server via the standard

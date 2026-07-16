@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# test-model-escalate.sh — hermetic proof of MODEL_ESCALATE_GLOB, the deterministic model step-up.
+# test-model-escalate.sh — hermetic proof of MODEL_ESCALATE_GLOB, the deterministic model step-up,
+# and MODEL_ESCALATE (HERD-376), the key naming WHICH model a match forces.
 #
 # Both lanes (herd-quick.sh, herd-feature.sh) resolve the model they pass to `claude --model` and,
-# BEFORE spawning, force the MODEL_FEATURE tier when the coordinator-passed task text matches the
-# egrep -i MODEL_ESCALATE_GLOB — overriding MODEL_QUICK and any per-spawn HERD_QUICK_MODEL /
-# HERD_FEATURE_MODEL override. This guards the misjudgment case where a judgment-heavy engine PR is
-# routed through the cheap quick lane.
+# BEFORE spawning, force the escalation target — MODEL_ESCALATE if the operator set one, else
+# MODEL_FEATURE (today's default) — when the coordinator-passed task text matches the egrep -i
+# MODEL_ESCALATE_GLOB — overriding MODEL_QUICK and any per-spawn HERD_QUICK_MODEL / HERD_FEATURE_MODEL
+# override. This guards the misjudgment case where a judgment-heavy engine PR is routed through the
+# cheap quick lane, and (via MODEL_ESCALATE) lets the glob still reach a genuinely stronger tier now
+# that MODEL_FEATURE itself defaults to a cheaper sonnet tier (HERD-102).
 #
 # Asserts, for BOTH lanes:
-#   (a) glob MATCHES  → resolves MODEL_FEATURE even when MODEL_QUICK is cheaper AND even when a
-#       per-spawn quick/feature override is set.
+#   (a) glob MATCHES, MODEL_ESCALATE UNSET → resolves MODEL_FEATURE even when MODEL_QUICK is cheaper
+#       AND even when a per-spawn quick/feature override is set (today's exact behavior, unchanged).
 #   (b) glob EMPTY or NON-MATCHING → normal per-lane resolution is unchanged (regression guard).
 #   (c) the 'escalated to <model> (MODEL_ESCALATE_GLOB matched)' notice is printed on match.
+#   (d) glob MATCHES, MODEL_ESCALATE SET → resolves MODEL_ESCALATE (not MODEL_FEATURE), even over a
+#       per-spawn override, and the notice names the MODEL_ESCALATE value.
+#   (e) MODEL_ESCALATE explicitly EMPTY behaves byte-identically to unset (ship-dormant default).
+#   (f) a runtime-qualified MODEL_ESCALATE ref ('<driver>:<model>') resolves through the SAME
+#       herd_model_for_spawn/herd_model_driver_for shim as every other MODEL_* key.
 #
 # Fully hermetic: a throwaway git repo (so new-feature.sh's worktree add works) + stubbed herdr/claude
 # (NETWORK-FREE, no real tabs, no real agent). We assert on the resolved `--model` arg in the logged
@@ -21,6 +29,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 QUICK="$HERE/../scripts/herd/herd-quick.sh"
 FEATURE="$HERE/../scripts/herd/herd-feature.sh"
+DRIVER_SH="$HERE/../scripts/herd/driver.sh"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
@@ -69,7 +78,8 @@ export HERD_SKIP_PREFLIGHT=1      # no real herdr contract to probe
 CFG="$T/config"
 export HERD_CONFIG_FILE="$CFG"
 
-# mkconfig <escalate_glob> — write the project config with a given MODEL_ESCALATE_GLOB value.
+# mkconfig <escalate_glob> [model_escalate] — write the project config with a given MODEL_ESCALATE_GLOB
+# (and, optionally, MODEL_ESCALATE — the key naming which model a match forces) value.
 mkconfig() {
   cat > "$CFG" <<EOF
 PROJECT_ROOT="$REPO"
@@ -80,6 +90,7 @@ APP_PREVIEW_CMD=""
 MODEL_QUICK="$Q_MODEL"
 MODEL_FEATURE="$F_MODEL"
 MODEL_ESCALATE_GLOB='${1:-}'
+MODEL_ESCALATE='${2:-}'
 EOF
 }
 
@@ -156,5 +167,64 @@ mkconfig ""
   m="$(resolved_model esc-feat-empty)"
   [ "$m" = "$F_MODEL" ] || fail "feature lane: empty glob changed model resolution (got '$m', want '$F_MODEL')"
 ) || exit 1
+
+# ── (d) MODEL_ESCALATE set: a matched glob forces MODEL_ESCALATE, NOT MODEL_FEATURE ─────────────
+ESCALATE_MODEL="MODEL-ESCALATE-STRONG"
+
+# QUICK lane, glob matches, MODEL_ESCALATE set, no per-spawn override → forces MODEL_ESCALATE + notice
+mkconfig "$GLOB" "$ESCALATE_MODEL"
+( unset HERD_QUICK_MODEL HERD_FEATURE_MODEL; run_lane "$QUICK" "esc-quick-me" "$MATCH_TASK"
+  m="$(resolved_model esc-quick-me)"
+  [ "$m" = "$ESCALATE_MODEL" ] || fail "quick lane: MODEL_ESCALATE set but glob match resolved '$m' (want '$ESCALATE_MODEL')"
+  grep -qE "escalated to $ESCALATE_MODEL \(MODEL_ESCALATE_GLOB matched\)" "$OUT" \
+    || fail "quick lane: escalation notice did not name MODEL_ESCALATE"$'\n'"$(cat "$OUT")"
+) || exit 1
+
+# QUICK lane, glob matches, MODEL_ESCALATE set, WITH a per-spawn override → MODEL_ESCALATE still wins
+mkconfig "$GLOB" "$ESCALATE_MODEL"
+( export HERD_QUICK_MODEL="$OVERRIDE"; run_lane "$QUICK" "esc-quick-me-ovr" "$MATCH_TASK"
+  m="$(resolved_model esc-quick-me-ovr)"
+  [ "$m" = "$ESCALATE_MODEL" ] || fail "quick lane: per-spawn override survived a matched glob over MODEL_ESCALATE (got '$m')"
+) || exit 1
+
+# FEATURE lane, glob matches, MODEL_ESCALATE set, WITH a per-spawn override → MODEL_ESCALATE still wins + notice
+mkconfig "$GLOB" "$ESCALATE_MODEL"
+( export HERD_FEATURE_MODEL="$OVERRIDE"; run_lane "$FEATURE" "esc-feat-me-ovr" "$MATCH_TASK"
+  m="$(resolved_model esc-feat-me-ovr)"
+  [ "$m" = "$ESCALATE_MODEL" ] || fail "feature lane: per-spawn override survived a matched glob over MODEL_ESCALATE (got '$m')"
+  grep -qE "escalated to $ESCALATE_MODEL \(MODEL_ESCALATE_GLOB matched\)" "$OUT" \
+    || fail "feature lane: escalation notice did not name MODEL_ESCALATE"$'\n'"$(cat "$OUT")"
+) || exit 1
+
+# ── (e) MODEL_ESCALATE explicitly EMPTY behaves byte-identically to unset (ship-dormant default) ──
+mkconfig "$GLOB" ""
+( unset HERD_QUICK_MODEL HERD_FEATURE_MODEL; run_lane "$QUICK" "esc-quick-me-empty" "$MATCH_TASK"
+  m="$(resolved_model esc-quick-me-empty)"
+  [ "$m" = "$F_MODEL" ] || fail "quick lane: empty MODEL_ESCALATE did not fall back to MODEL_FEATURE (got '$m')"
+) || exit 1
+
+# ── (f) a runtime-qualified MODEL_ESCALATE ref resolves through the SAME driver shim as MODEL_FEATURE ─
+# Mirrors tests/test-driver-lane-spawn.sh's foreign-driver proof: a made-up runtime driver, catalogued
+# only in a throwaway HERD_DRIVERS_DIR, must still split correctly — proving MODEL_ESCALATE is not a
+# second, parallel resolution path but flows through herd_model_for_spawn/herd_model_driver_for exactly
+# as MODEL_FEATURE always has.
+DD="$T/drivers"; mkdir -p "$DD"
+cat > "$DD/foreign.driver" <<'DRV'
+DRIVER_AGENT_INTERACTIVE_SPAWN='myrt run --model <model> --yolo "<prompt>"'
+DRIVER_AGENT_PERMISSION_FLAG='--yolo'
+DRV
+( set +e
+  export HERD_DRIVERS_DIR="$DD"
+  MODEL_FEATURE="$F_MODEL" MODEL_ESCALATE="foreign:strong-ref"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  target="$(herd_model_escalate_target)"
+  [ "$target" = "foreign:strong-ref" ] || { echo "FAIL: herd_model_escalate_target → '$target' (want 'foreign:strong-ref')"; exit 1; }
+  drv="$(herd_model_driver_for "$target")" || { echo "FAIL: herd_model_driver_for could not resolve '$target'"; exit 1; }
+  mdl="$(herd_model_for_spawn "$target")"  || { echo "FAIL: herd_model_for_spawn could not resolve '$target'"; exit 1; }
+  [ "$drv" = "foreign" ]    || { echo "FAIL: resolved driver '$drv' != 'foreign'"; exit 1; }
+  [ "$mdl" = "strong-ref" ] || { echo "FAIL: resolved model '$mdl' != 'strong-ref'"; exit 1; }
+  exit 0
+) || fail "runtime-qualified MODEL_ESCALATE did not resolve through the shared driver shim (see FAIL above)"
 
 echo "ALL PASS"
