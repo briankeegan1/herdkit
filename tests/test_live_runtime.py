@@ -1491,6 +1491,102 @@ class TestSlugDerivation(unittest.TestCase):
         self.assertEqual(cands[0].worktree, os.path.join(pool, "unlock-supersession-cancel"))
 
 
+class TestDraftPRDiscovery(unittest.TestCase):
+    """HERD-374: draft PRs must be skipped at discovery and never reach the merge actuator.
+    Parity target: agent-watch.sh ~line 1805 `if pr.get("isDraft"): continue`."""
+
+    def setUp(self):
+        self._saved = os.environ.get("TREES")
+        self._pool = tempfile.mkdtemp()
+        os.environ["TREES"] = self._pool
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("TREES", None)
+        else:
+            os.environ["TREES"] = self._saved
+
+    def _stub_graphql(self, nodes):
+        payload = {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
+
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(payload)
+                return R()
+        return _Stub()
+
+    def test_draft_pr_is_skipped_at_discovery(self):
+        # A draft PR must never appear in the returned candidates.
+        _make_worktree(self._pool, "my-feature")
+        node = {"number": 479, "headRefName": "feat/my-feature", "headRefOid": "abc123",
+                "baseRefName": "main", "mergeStateStatus": "CLEAN", "isDraft": True,
+                "reviewDecision": "", "author": {"login": "me"},
+                "assignees": {"nodes": []}, "labels": {"nodes": []}}
+        orig = LR.subprocess
+        LR.subprocess = self._stub_graphql([node])
+        try:
+            cands = LR.discover_via_graphql(repo="owner/repo")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(cands, [], "draft PR must be excluded from discovery results")
+
+    def test_non_draft_pr_is_unaffected(self):
+        # A non-draft PR with isDraft=False must still be returned (byte-identical behavior).
+        _make_worktree(self._pool, "ready-feature")
+        node = {"number": 480, "headRefName": "feat/ready-feature", "headRefOid": "def456",
+                "baseRefName": "main", "mergeStateStatus": "CLEAN", "isDraft": False,
+                "reviewDecision": "", "author": {"login": "me"},
+                "assignees": {"nodes": []}, "labels": {"nodes": []}}
+        orig = LR.subprocess
+        LR.subprocess = self._stub_graphql([node])
+        try:
+            cands = LR.discover_via_graphql(repo="owner/repo")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].pr, "480")
+
+    def test_missing_is_draft_field_treated_as_non_draft(self):
+        # Legacy nodes with no isDraft field must be treated as non-draft (fail-soft).
+        _make_worktree(self._pool, "legacy-feature")
+        node = {"number": 481, "headRefName": "feat/legacy-feature", "headRefOid": "ghi789",
+                "baseRefName": "main", "mergeStateStatus": "CLEAN",
+                "reviewDecision": "", "author": {"login": "me"},
+                "assignees": {"nodes": []}, "labels": {"nodes": []}}
+        orig = LR.subprocess
+        LR.subprocess = self._stub_graphql([node])
+        try:
+            cands = LR.discover_via_graphql(repo="owner/repo")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len(cands), 1, "absent isDraft must be treated as non-draft")
+        self.assertEqual(cands[0].pr, "481")
+
+    def test_draft_pr_never_reaches_merge_actuator(self):
+        # Verify that the tick produces no merge_refused events when only non-draft PRs are present.
+        # This exercises the end-to-end path: discovery skips drafts, so no merge_refused hot-loop.
+        tmp = tempfile.mkdtemp()
+        journal_path = os.path.join(tmp, "j.jsonl")
+        journal = LiveJournal(journal_path)
+        # A non-draft candidate with all gates green should merge, never merge_refused.
+        cand_dict = {"pr": 482, "sha": "aaa", "slug": "ready", "stale": False,
+                     "approved": True, "review_decision": "APPROVED",
+                     "hv_hold": False, "hv_body": ""}
+        scenario = {"candidates": [cand_dict],
+                    "health": "PASS", "review": "PASS", "config": {}}
+        disc = FixtureDiscovery(scenario)
+        gates = FixtureGates(scenario)
+        act = DryRunActuator(journal)
+        tick = LiveTick({}, disc, gates, act, journal)
+        tick.run()
+        with open(journal_path) as f:
+            events = [json.loads(l)["event"] for l in f if l.strip()]
+        self.assertNotIn("merge_refused", events,
+                         "merge_refused must never appear when no draft reaches the actuator")
+        self.assertIn("merge", events, "a ready non-draft PR must merge")
+
+
 class TestPoolScope(unittest.TestCase):
     """HERD-346 leg 3: a PR with NO worktree in this pool is FOREIGN and never a candidate — the port of
     bash's worktree-first discovery (_discover_feature_worktrees). Fail-soft when no pool is configured."""
