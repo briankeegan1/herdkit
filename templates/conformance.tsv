@@ -142,7 +142,7 @@ journal-audit.sh	unit	tests/test-journal-audit.sh
 lifecycle.sh	unit	tests/test-lifecycle-contracts.sh
 lifecycle.sh	unit	tests/test-lifecycle-lane-workers.sh
 JOURNAL_AUDIT	unit	tests/test-journal-audit.sh
-JOURNAL_AUDIT_WINDOW_SECS	none-yet	unit: the test pins the window to its default; no test asserts an event OLDER than JOURNAL_AUDIT_WINDOW_SECS is excluded from the replay
+JOURNAL_AUDIT_WINDOW_SECS	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_DISPATCH_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_REFIX_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_RED_TTL	unit	tests/test-journal-audit.sh
