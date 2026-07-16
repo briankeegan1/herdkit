@@ -27,6 +27,7 @@ import unittest
 import subprocess
 import time
 
+from herd import cost_emit as CE
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                LiveActuator,
@@ -1808,6 +1809,173 @@ class TestMainHealthSlotPriority(unittest.TestCase):
         finally:
             LR.subprocess = orig
         self.assertEqual(sub.calls, 2, "a new LiveGates (new tick) must re-run the rev-parse")
+
+
+def _write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+
+
+class TestCostEmitScanner(unittest.TestCase):
+    """HERD-375: the ported cost.sh summer (herd.cost_emit) — dedup by message id, builder/review
+    split by the reviewer fingerprint, priced against a stubbed table. Mirrors tests/test-cost.sh's
+    scanner coverage (items 1-3) for the Python port."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.prices_path = os.path.join(self.tmp, "prices.json")
+        with open(self.prices_path, "w", encoding="utf-8") as fh:
+            json.dump({"claude-opus-4-8": {"in": 10.0, "out": 100.0}}, fh)
+        os.environ["HERD_COST_PRICE_FILE"] = self.prices_path
+
+    def tearDown(self):
+        os.environ.pop("HERD_COST_PRICE_FILE", None)
+
+    def test_dedup_and_split_and_price(self):
+        d = os.path.join(self.tmp, "transcript")
+        os.makedirs(d)
+        _write_jsonl(os.path.join(d, "builder.jsonl"), [
+            {"type": "user", "message": {"role": "user", "content": "build the thing"}},
+            {"type": "assistant", "message": {"role": "assistant", "id": "a1", "model": "claude-opus-4-8",
+             "usage": {"input_tokens": 1000000, "output_tokens": 0,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+            {"type": "assistant", "message": {"role": "assistant", "id": "b2", "model": "claude-opus-4-8",
+             "usage": {"input_tokens": 0, "output_tokens": 1000000,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+            {"type": "assistant", "message": {"role": "assistant", "id": "a1", "model": "claude-opus-4-8",
+             "usage": {"input_tokens": 1000000, "output_tokens": 0,   # duplicate a1 — must dedup
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+        ])
+        _write_jsonl(os.path.join(d, "review.jsonl"), [
+            {"type": "user", "message": {"role": "user",
+             "content": "You are an ADVERSARIAL PRE-MERGE CORRECTNESS REVIEWER for the project "
+                         "'herdkit'. THIS REVIEW: PR #42 (branch slug 'slug1')."}},
+            {"type": "assistant", "message": {"role": "assistant", "id": "r1", "model": "claude-opus-4-8",
+             "usage": {"input_tokens": 0, "output_tokens": 500000,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+        ])
+        prices = CE._load_prices()
+        comps = CE._scan_dir(d, prices)
+        self.assertEqual(comps["builder"]["in"], 1000000)
+        self.assertEqual(comps["builder"]["out"], 1000000)
+        self.assertEqual(len(comps["builder"]["msgs"]), 2)     # a1 counted once despite the replay
+        self.assertAlmostEqual(comps["builder"]["usd"], 110.0)
+        self.assertEqual(comps["review"]["out"], 500000)
+        self.assertAlmostEqual(comps["review"]["usd"], 50.0)
+
+    def test_unknown_model_flagged_and_zero(self):
+        d = os.path.join(self.tmp, "unknown")
+        os.makedirs(d)
+        _write_jsonl(os.path.join(d, "b.jsonl"), [
+            {"type": "assistant", "message": {"role": "assistant", "id": "u1", "model": "claude-mystery-9",
+             "usage": {"input_tokens": 1000000, "output_tokens": 1000000,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+        ])
+        prices = CE._load_prices()
+        comps = CE._scan_dir(d, prices)
+        self.assertEqual(comps["builder"]["usd"], 0.0)           # unpriced -> $0, never guessed
+        self.assertEqual(CE._primary_model(comps["builder"], prices), "claude-mystery-9?")
+
+
+class TestCostEmitPricing(unittest.TestCase):
+    def test_claude_sonnet_5_priced_nonzero(self):
+        # HERD-375(c): claude-sonnet-5 is now the default builder tier — it must price non-zero,
+        # not silently bill as $0 (herd cost flags an unpriced model with a `?` suffix instead).
+        self.assertIn("claude-sonnet-5", CE.BUILTIN_PRICES)
+        pin, pout = CE._price_of("claude-sonnet-5", CE.BUILTIN_PRICES)
+        self.assertGreater(pin, 0)
+        self.assertGreater(pout, 0)
+
+
+class TestCostEmitMerge(LiveCase):
+    """HERD-375: emit_merge_cost resolves the transcript dir via the exact munging cost.sh used and
+    journals `cost` events with the fields herd.cost's reader expects (tests/test-cost.sh item 4,
+    ported), and both actuators' reap() wire it in before the worktree is reaped."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.tmp, "transcript-root")
+        os.environ["HERD_TRANSCRIPT_ROOT"] = self.root
+        self.prices_path = os.path.join(self.tmp, "prices.json")
+        with open(self.prices_path, "w", encoding="utf-8") as fh:
+            json.dump({"claude-opus-4-8": {"in": 10.0, "out": 100.0}}, fh)
+        os.environ["HERD_COST_PRICE_FILE"] = self.prices_path
+
+    def tearDown(self):
+        os.environ.pop("HERD_TRANSCRIPT_ROOT", None)
+        os.environ.pop("HERD_COST_PRICE_FILE", None)
+        super().tearDown()
+
+    def _seed_transcript(self, worktree):
+        munged = worktree.replace("/", "-").replace(".", "-")
+        d = os.path.join(self.root, munged)
+        os.makedirs(d)
+        _write_jsonl(os.path.join(d, "builder.jsonl"), [
+            {"type": "user", "message": {"role": "user", "content": "build the thing"}},
+            {"type": "assistant", "message": {"role": "assistant", "id": "a1", "model": "claude-opus-4-8",
+             "usage": {"input_tokens": 1000000, "output_tokens": 500000,
+                       "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}},
+        ])
+        return d
+
+    def test_emit_merge_cost_journals_typed_fields(self):
+        wt = "/fake/wt/slug1"
+        self._seed_transcript(wt)
+        journal = LiveJournal(self.jpath)
+        CE.emit_merge_cost(journal, "42", "slug1", wt)
+        cost = [o for o in events(self.jpath) if o["event"] == "cost"]
+        self.assertEqual(len(cost), 1)
+        b = cost[0]
+        self.assertEqual(b["component"], "builder")
+        self.assertEqual(b["pr"], 42)
+        self.assertIsInstance(b["pr"], int)
+        self.assertEqual(b["slug"], "slug1")
+        self.assertEqual(b["model"], "claude-opus-4-8")
+        self.assertEqual(b["in"], 1000000)
+        self.assertEqual(b["out"], 500000)
+        self.assertIsInstance(b["in"], int)
+        self.assertEqual(b["usd"], "60.000000")
+        self.assertEqual(b["msgs"], 1)
+
+    def test_no_transcript_dir_is_silent_noop(self):
+        journal = LiveJournal(self.jpath)
+        CE.emit_merge_cost(journal, "42", "slug1", "/no/such/worktree")
+        self.assertFalse(os.path.exists(self.jpath))
+
+    def test_empty_worktree_never_scans_real_transcript_root(self):
+        # Guard: a fixture/dry-run candidate carries no real worktree ("") — this must never resolve
+        # to the bare $HERD_TRANSCRIPT_ROOT and scan whatever transcripts happen to sit there.
+        journal = LiveJournal(self.jpath)
+        CE.emit_merge_cost(journal, "42", "slug1", "")
+        self.assertFalse(os.path.exists(self.jpath))
+
+    def test_reap_wiring_emits_cost_before_worktree_removed(self):
+        wt = os.path.join(self.tmp, "pool", "slug1")
+        os.makedirs(wt)
+        self._seed_transcript(wt)
+        sub = _RecordingSub(view_state="MERGED")
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        journal = LiveJournal(self.jpath)
+        act = LiveActuator("/nonexistent-home", journal)
+        cand = LiveCandidate(42, "deadbeef", slug="slug1", worktree=wt)
+        act.reap(cand)
+        names = [o["event"] for o in events(self.jpath)]
+        self.assertIn("cost", names)
+        self.assertIn("reap", names)
+        self.assertLess(names.index("cost"), names.index("reap"))
+
+    def test_dry_run_reap_also_emits_cost(self):
+        wt = os.path.join(self.tmp, "pool", "slug2")
+        os.makedirs(wt)
+        self._seed_transcript(wt)
+        journal = LiveJournal(self.jpath)
+        act = DryRunActuator(journal)
+        cand = LiveCandidate(43, "cafebabe", slug="slug2", worktree=wt)
+        act.reap(cand)
+        self.assertTrue([o for o in events(self.jpath) if o["event"] == "cost"])
 
 
 if __name__ == "__main__":
