@@ -218,7 +218,7 @@ HEALTHCHECK_HEAVY_GLOB	unit	tests/test-healthcheck-routing.sh
 APP_SURFACE_GLOB	unit	tests/test-healthcheck-interaction.sh
 INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh
 SMOKE_CMD	unit	tests/test-resolve-smoke-gate.sh
-DENY_PATHS	none-yet	unit: no test asserts scribe/lane path-scoping away from DENY_PATHS (only the config-set refusal is tested)
+DENY_PATHS	unit	tests/test-scribe-deny-paths.sh
 REVIEW_CHECKLIST	unit	tests/test-review-checklist-injection.sh
 COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
