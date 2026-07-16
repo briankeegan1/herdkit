@@ -533,6 +533,11 @@ ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the
 #     a new sha (a fresh push) always re-journals.
 ADOPT_PR_LEDGER="$TREES/.agent-watch-adopted-prs"
 ADOPT_FAILED_SEEN_LEDGER="$TREES/.agent-watch-adopt-failed-seen"
+# ADOPT_SELFHEAL_SEEN_LEDGER (HERD-377) — dedupes the `adopt_selfheal_failed` journal event per
+# (branch,stale-dir), mirroring ADOPT_FAILED_SEEN_LEDGER: a still-broken `git worktree move` RETRIES
+# every scan, but the journal EVENT for that exact pair fires once. A SUCCESSFUL move needs no ledger
+# at all — the next scan finds the branch already checked out at the expected path and self-terminates.
+ADOPT_SELFHEAL_SEEN_LEDGER="$TREES/.agent-watch-adopt-selfheal-seen"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -1748,16 +1753,70 @@ $_abc_wt
 EOF
 }
 
+# _adopt_branch_worktree_dir <branch> <wt-porcelain> — echo the worktree PATH currently checked out
+# for <branch> in $2 (the same porcelain text _adopt_branch_checked_out reads), or nothing when the
+# branch is not checked out anywhere. Backs the self-heal below: it needs the ACTUAL path, not just
+# the yes/no _adopt_branch_checked_out already answers.
+_adopt_branch_worktree_dir() {
+  local _abwd_branch="$1" _abwd_wt="$2"
+  printf '%s\n' "$_abwd_wt" | awk -v want="branch refs/heads/$_abwd_branch" '
+    /^worktree /{dir=substr($0,10)}
+    $0==want{print dir; exit}
+  '
+}
+
+# _adopt_selfheal_failed_journaled <branch> <dir> — true iff an `adopt_selfheal_failed` for this exact
+# (branch,dir) was already journaled, so a still-broken move does not spam the journal every scan.
+_adopt_selfheal_failed_journaled() {
+  [ -s "$ADOPT_SELFHEAL_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v b="$1" -v d="$2" '$1==b && $2==d{f=1} END{exit !f}' "$ADOPT_SELFHEAL_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_self_heal_mismatch <branch> <expected-dir> <wt-porcelain> — HERD-377 leftover: an adopt from
+# BEFORE the slug-parity fix may have checked <branch> out at the WRONG path (the old unconditional
+# `tr '/' '-'` slug, e.g. TREES/feat-python-draft-pr-hold, instead of herd_branch_slug's
+# TREES/python-draft-pr-hold). Detect that mismatch from the SAME worktree porcelain text the
+# checked-out-anywhere guard already has, and `git worktree move` it onto the CORRECT path so
+# discovery (branch_to_slug/_worktree_for_slug) finds it on the very next tick — a re-adopt at the
+# right path with the stale dir swept. Fail-soft throughout: never returns non-zero, a move failure is
+# journaled ONCE per (branch,dir) (_adopt_selfheal_failed_journaled) and simply retried next scan, and
+# an occupied target is left untouched for a human rather than clobbered.
+#
+# SAFETY: only ever moves a dir that is ALREADY a direct child of the pool ($TREES/<something>) — an
+# adopt leftover is, by construction, always exactly that. This is NOT the same predicate as "checked
+# out anywhere": a branch checked out at the MAIN checkout (or any human-managed worktree outside the
+# pool) is never mistaken for a stale adopt and never moved.
+_adopt_self_heal_mismatch() {
+  local _ash_branch="$1" _ash_expected="$2" _ash_wt="$3"
+  local _ash_actual; _ash_actual="$(_adopt_branch_worktree_dir "$_ash_branch" "$_ash_wt")"
+  [ -n "$_ash_actual" ] || return 0                    # not checked out anywhere — nothing to heal
+  [ "$_ash_actual" != "$_ash_expected" ] || return 0    # already at the right path
+  [ "$(dirname "$_ash_actual")" = "$TREES" ] || return 0  # not a pool worktree (e.g. the main checkout) — never touch it
+  [ -e "$_ash_expected" ] && return 0                   # target occupied — never clobber, leave for a human
+  if git -C "$MAIN" worktree move "$_ash_actual" "$_ash_expected" >/dev/null 2>&1; then
+    journal_append adopt_selfheal branch "$_ash_branch" from "$_ash_actual" to "$_ash_expected"
+    return 0
+  fi
+  _adopt_selfheal_failed_journaled "$_ash_branch" "$_ash_actual" && return 0
+  journal_append adopt_selfheal_failed branch "$_ash_branch" from "$_ash_actual" to "$_ash_expected"
+  printf '%s\t%s\n' "$_ash_branch" "$_ash_actual" >> "$ADOPT_SELFHEAL_SEEN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
 # _adopt_remote_pr <pr> <branch> <sha> — the mutating half: fetch the branch, then `git worktree add`
-# it into WORKTREES_DIR/<slug> (slug = branch with every "/" flattened to "-", so a fork's namespaced
-# branch never nests a stray directory). FAIL-SOFT throughout: any step's failure journals
-# `adopt_failed` (deduped per (pr,sha) via _adopt_journal_failed) and returns WITHOUT once-guarding —
-# a transient failure (network blip, momentary ref lock) is retried on the next scan; only a
-# SUCCESSFUL adopt is terminal (_adopt_pr_mark_adopted) and journals `pr_adopted` once.
+# it into WORKTREES_DIR/<slug>, where <slug> is resolved by herd_branch_slug — the SAME slugifier
+# candidate discovery uses (branch_to_slug/_worktree_for_slug, pysrc/herd/live_runtime.py), so the
+# worktree this leg creates is the EXACT path discovery will look for on the very next tick (HERD-377:
+# a second, independently-invented slugifier here — the old unconditional `tr '/' '-'` — put PR #484 at
+# TREES/feat-python-draft-pr-hold while discovery resolved TREES/python-draft-pr-hold, dropping it from
+# candidates for an hour despite pr_adopted having already claimed success). FAIL-SOFT throughout: any
+# step's failure journals `adopt_failed` (deduped per (pr,sha) via _adopt_journal_failed) and returns
+# WITHOUT once-guarding — a transient failure (network blip, momentary ref lock) is retried on the next
+# scan; only a SUCCESSFUL adopt is terminal (_adopt_pr_mark_adopted) and journals `pr_adopted` once.
 _adopt_remote_pr() {
   local _arp_pr="$1" _arp_branch="$2" _arp_sha="$3"
   local _arp_slug _arp_dir
-  _arp_slug="$(printf '%s' "$_arp_branch" | tr '/' '-')"
+  _arp_slug="$(herd_branch_slug "$_arp_branch")"
   _arp_dir="$TREES/$_arp_slug"
   if [ -e "$_arp_dir" ]; then
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "worktree path already exists: $_arp_dir"
@@ -1814,6 +1873,10 @@ for pr in prs:
   local _ars_pr _ars_branch _ars_sha
   while IFS=$'\t' read -r _ars_pr _ars_branch _ars_sha; do
     [ -n "${_ars_pr:-}" ] || continue
+    # A prior (pre-fix) adopt may have this branch checked out at the WRONG (mismatched-slug) path —
+    # heal it onto the correct one BEFORE the recorded/checked-out-anywhere skips below, since a
+    # once-guarded successful adopt is exactly the case that needs healing (HERD-377).
+    _adopt_self_heal_mismatch "$_ars_branch" "$TREES/$(herd_branch_slug "$_ars_branch")" "$_ars_wt"
     _adopt_pr_recorded "$_ars_pr" "$_ars_sha" && continue
     _adopt_branch_checked_out "$_ars_branch" "$_ars_wt" && continue
     _adopt_remote_pr "$_ars_pr" "$_ars_branch" "$_ars_sha"

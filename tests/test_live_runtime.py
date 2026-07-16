@@ -36,7 +36,8 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
                                WAIT, PENDING,
-                               branch_to_slug, _worktree_for_slug, _is_worktree, _pool_scoped)
+                               branch_to_slug, _branch_worktree_slug, _worktree_for_slug,
+                               _is_worktree, _pool_scoped)
 
 # HERMETICITY (HERD-331 gate red): a watcher/healthcheck-descended environment EXPORTS the live
 # engine's main-health coordinates — herd-config.sh exports MAIN_HEALTH_TICK (HERD-359) and
@@ -1464,6 +1465,21 @@ class TestSlugDerivation(unittest.TestCase):
     def test_worktree_for_slug_empty_without_pool(self):
         self.assertEqual(_worktree_for_slug("x"), "")        # no pool configured → no fabricated path
 
+    def test_branch_worktree_slug_matches_branch_to_slug_when_it_fits(self):
+        # The common case (branch fits BRANCH_TEMPLATE): identical to branch_to_slug, no fallback.
+        self.assertEqual(_branch_worktree_slug("feat/gizmo"), "gizmo")
+        self.assertEqual(_branch_worktree_slug("feat/python-draft-pr-hold"), "python-draft-pr-hold")
+
+    def test_branch_worktree_slug_falls_back_when_slash_remains(self):
+        # HERD-377: a branch that does not fit BRANCH_TEMPLATE keeps its raw form (branch_to_slug does
+        # not strip an unmatched prefix) — a bare '/' left in that would nest a stray subdirectory
+        # under $TREES/<slug>, so the fallback flattens it. This is the SAME fallback herd_branch_slug
+        # (herd-config.sh) applies for the bash ADOPT_REMOTE_PRS leg — one shared convention.
+        self.assertEqual(_branch_worktree_slug("someuser:feature/x"), "someuser:feature-x")
+
+    def test_branch_worktree_slug_empty_branch_is_empty(self):
+        self.assertEqual(_branch_worktree_slug(""), "")
+
     def test_discovery_derives_slug_and_worktree(self):
         # discover_via_graphql maps headRefName -> slug -> worktree; stub gh so nothing shells out.
         pool = tempfile.mkdtemp()
@@ -1697,6 +1713,93 @@ class TestPreDispatchWorktreeGuard(unittest.TestCase):
         g, dispatched = self._gates()
         self.assertEqual(g.health(c), WAIT)
         self.assertEqual(dispatched, ["9"])
+        self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
+
+
+class TestAdoptSlugParityRegression(unittest.TestCase):
+    """HERD-377 REGRESSION: the ADOPT_REMOTE_PRS leg (agent-watch.sh) and candidate discovery
+    (branch_to_slug/_worktree_for_slug, above) must resolve the SAME worktree path for the same
+    branch. Before the fix, the adopt leg flattened the RAW branch ('feat/x' -> 'feat-x') while
+    discovery derived the slug via branch_to_slug ('feat/x' -> 'x') — so an adopted PR's candidate
+    carried a worktree path nothing on disk backed, and it was silently dropped from classification
+    for as long as an hour (PR #484) despite `pr_adopted` having already claimed success.
+
+    Both directions of the fixture, entirely in Python terms (worktree existing at a path or not),
+    mirroring what tests/test-adopt-remote-prs.sh proves for the bash slugifier itself:
+      (a) MISMATCH reproduces the drop — a candidate whose worktree is the pre-fix (flattened-raw-
+          branch) path is dropped by pool-scoping and refused at the health gate.
+      (b) POST-FIX the adopted PR gates — a candidate whose worktree is the SAME path
+          _branch_worktree_slug/discover_via_graphql would resolve survives pool-scoping and reaches
+          health dispatch (candidates>=1 and a health dispatch for it).
+    """
+
+    def setUp(self):
+        self.pool = tempfile.mkdtemp()
+        self._saved_trees = os.environ.get("TREES")
+        os.environ["TREES"] = self.pool
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-16T00:00:00Z"
+        self.jpath = os.path.join(self.pool, "j.jsonl")
+        self.journal = LiveJournal(self.jpath)
+        self.state = LiveState(self.pool)
+
+    def tearDown(self):
+        if self._saved_trees is None:
+            os.environ.pop("TREES", None)
+        else:
+            os.environ["TREES"] = self._saved_trees
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _gates(self):
+        dispatched = []
+
+        class Stub(LiveGates):
+            def _dispatch_health(self, cand):
+                dispatched.append(cand.pr)
+                _marker_write(self.state.health_inflight_file(cand), os.getpid())
+
+        return Stub("/home", self.state, self.journal), dispatched
+
+    def _events(self):
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    def test_mismatched_slug_worktree_is_dropped(self):
+        # The PRE-FIX adopt leg only ever created TREES/feat-python-draft-pr-hold — never the
+        # slug-parity path — so a candidate resolved the way discovery resolves it (branch ->
+        # _branch_worktree_slug -> _worktree_for_slug) points at a directory that does not exist.
+        branch = "feat/python-draft-pr-hold"
+        correct_slug = _branch_worktree_slug(branch)
+        self.assertEqual(correct_slug, "python-draft-pr-hold")
+        mismatched_dir = os.path.join(self.pool, "feat-python-draft-pr-hold")  # the pre-fix path
+        _make_worktree(self.pool, "feat-python-draft-pr-hold")                # only THIS dir exists
+        cand = LiveCandidate(pr=484, sha="deadbeef", slug=correct_slug,
+                              worktree=_worktree_for_slug(correct_slug))       # discovery's resolution
+        self.assertNotEqual(cand.worktree, mismatched_dir)
+        # Dropped at pool-scoping — never even reaches classification.
+        self.assertEqual(_pool_scoped([cand]), [])
+        # And belt-and-suspenders: the health gate itself refuses a resolved-but-absent worktree.
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, [])
+        refused = [e for e in self._events() if e["event"] == "dispatch_refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["reason"], "no-worktree")
+
+    def test_slug_parity_worktree_gates(self):
+        # POST-FIX: the adopt leg (herd_branch_slug) and discovery (_branch_worktree_slug) resolve the
+        # SAME path, so the worktree the adopt leg actually created on disk is exactly the one the
+        # candidate carries.
+        branch = "feat/python-draft-pr-hold"
+        slug = _branch_worktree_slug(branch)
+        _make_worktree(self.pool, slug)                    # what the FIXED adopt leg creates
+        cand = LiveCandidate(pr=484, sha="deadbeef", slug=slug,
+                              worktree=_worktree_for_slug(slug))   # what discovery resolves
+        # candidates >= 1: the adopted PR survives pool-scoping.
+        kept = _pool_scoped([cand])
+        self.assertEqual([c.pr for c in kept], ["484"])
+        # A health dispatch for it: the gate proceeds past the worktree guard to a real dispatch.
+        g, dispatched = self._gates()
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, ["484"])
         self.assertEqual([e for e in self._events() if e["event"] == "dispatch_refused"], [])
 
 

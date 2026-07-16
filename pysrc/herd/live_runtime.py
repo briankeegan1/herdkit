@@ -992,6 +992,24 @@ def branch_to_slug(branch):
     return slug
 
 
+def _branch_worktree_slug(branch):
+    """The WORKTREE-SAFE slug for ``branch``: :func:`branch_to_slug`'s result, unless that result is
+    empty or still carries a literal ``/`` (the branch does not fit BRANCH_TEMPLATE) — in which case it
+    falls back to flattening every ``/`` in ``branch`` to ``-``. A raw ``/`` left in a slug would nest a
+    stray subdirectory under ``$TREES/<slug>`` instead of naming one worktree.
+
+    ONE shared fallback used by BOTH candidate discovery (here) and the ``ADOPT_REMOTE_PRS`` leg
+    (``herd_branch_slug``, herd-config.sh) — never a second, independently-invented slugifier. Their
+    prior divergence (this port's ``branch_to_slug`` vs. the adopt leg's unconditional ``tr '/' '-'``)
+    is exactly what shipped the HERD-377 regression: the adopt leg checked a PR's branch out at
+    ``TREES/feat-python-draft-pr-hold`` while discovery resolved ``TREES/python-draft-pr-hold`` for the
+    same branch, so the adopted PR was dropped from candidates."""
+    slug = branch_to_slug(branch)
+    if not slug or "/" in slug:
+        return (branch or "").replace("/", "-")
+    return slug
+
+
 def _pool_dir():
     """The worktree POOL root — ``$TREES`` else ``$WORKTREES_DIR`` (identical to :class:`LiveState.dir`).
     Empty when neither is set (an unconfigured pool: the scope/dispatch guards then fail-soft)."""
@@ -1060,7 +1078,7 @@ def discover_via_graphql(repo=None, limit=50):
         # the POOL worktree ($TREES/<slug>) the rails run on — never leave worktree empty, which shells
         # healthcheck.sh with no tree and usage-errors into a phantom CODEERROR (HERD-346, #453).
         branch = node.get("headRefName", "")
-        slug = branch_to_slug(branch)
+        slug = _branch_worktree_slug(branch)
         cands.append(LiveCandidate(
             pr=node.get("number"), sha=node.get("headRefOid", ""),
             slug=slug, base=node.get("baseRefName", ""),

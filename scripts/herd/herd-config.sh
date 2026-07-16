@@ -1602,3 +1602,24 @@ herd_branch_parse() {
   esac
   printf '%s' "$_bp_out"
 }
+
+# herd_branch_slug <branch> — the WORKTREE-SAFE slug for <branch>: herd_branch_parse's result, unless
+# it is empty or still contains a literal '/' (the branch does not fit BRANCH_TEMPLATE), in which case
+# it falls back to flattening every '/' in <branch> to '-'. A raw '/' left in a slug would nest a stray
+# subdirectory under $TREES/<slug> instead of naming one worktree.
+#
+# ONE shared fallback used by BOTH candidate discovery (pysrc/herd/live_runtime.py:_branch_worktree_slug)
+# and the ADOPT_REMOTE_PRS leg (agent-watch.sh:_adopt_remote_pr) — never a second, independently-invented
+# slugifier (HERD-377). Their prior divergence — discovery derived the slug via herd_branch_parse's port
+# while the adopt leg unconditionally flattened the RAW branch — is exactly what shipped the regression:
+# the adopt leg checked PR #484 out at TREES/feat-python-draft-pr-hold while discovery resolved
+# TREES/python-draft-pr-hold for the same branch, so the adopted PR sat dropped from candidates for an
+# hour while pr_adopted had already claimed success.
+herd_branch_slug() {
+  local _bs_branch="${1:-}" _bs_slug
+  _bs_slug="$(herd_branch_parse "$_bs_branch")"
+  case "$_bs_slug" in
+    ''|*/*) printf '%s' "$_bs_branch" | tr '/' '-' ;;
+    *)      printf '%s' "$_bs_slug" ;;
+  esac
+}
