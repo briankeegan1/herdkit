@@ -371,4 +371,42 @@ printf '%s\n' "$d" | grep -q "limit-hit" || fail "8: the row must show the limit
 ok
 unset HERD_NOW_EPOCH
 
+
+# ── (9) HERD-380: unparseable reset → blind-resume waits HERD_LIMIT_UNKNOWN_WAIT, not 0/immediate ──
+# A garbage sentinel (no clock the parser can anchor on) must still register as a HIT — reset=0,
+# "unknown" — and the scheduler must hold for the FULL blind-resume window, never treat reset=0 as
+# "resume right now" (that would hammer a still-blocked account) and never fail the tick outright.
+rm -f "$LIMIT_STATE" "$JOURNAL_FILE"
+WT_U="$T/trees/lim-unknown"; mkdir -p "$WT_U"
+printf 'garbled sentinel text with no parseable reset clock' > "$(_limit_sentinel_file "$WT_U")"
+r="$(_detect_limit_hit "lim-unknown" "$WT_U")" || fail "9: a garbage sentinel must still be detected as a hit (return 0)"
+[ "$r" = "0" ] || fail "9: an unparseable sentinel must echo reset=0 (unknown), not a bogus epoch (got '$r')"
+ok
+
+export HERD_NOW_EPOCH=1000000
+export HERD_LIMIT_UNKNOWN_WAIT=7200
+DISPLAY=()
+_handle_limit_blocked "lim-unknown" "$WT_U" "0" "$r"
+d="${DISPLAY[0]:-}"
+printf '%s\n' "$d" | grep -q "auto-resume at" || fail "9: unknown-reset hold row should say 'auto-resume at' (got: $d)"
+ok
+printf '%s\n' "$d" | grep -q "needs you" && fail "9: unknown-reset hold row must NOT be a red 'needs you' row (got: $d)"
+ok
+[ "$(limit_state "lim-unknown")" = "scheduled" ] || fail "9: state should be 'scheduled' after an unparseable-reset hit"
+ok
+[ "$(limit_target_epoch "lim-unknown")" = "1007200" ] || fail "9: target must be now+HERD_LIMIT_UNKNOWN_WAIT=1007200 (got $(limit_target_epoch "lim-unknown")), not now+0 (immediate resume) or a bogus epoch"
+ok
+grep -q '"event":"limit_detected"' "$JOURNAL_FILE" || fail "9: limit_detected must be journaled for an unparseable-reset hit too"
+ok
+unset HERD_LIMIT_UNKNOWN_WAIT
+
+# Unset HERD_LIMIT_UNKNOWN_WAIT (no override) → falls back to the documented ~5h window (18000s).
+rm -f "$LIMIT_STATE"; : > "$JOURNAL_FILE"
+export HERD_NOW_EPOCH=2000000
+DISPLAY=()
+_handle_limit_blocked "lim-unknown2" "$T/trees/lim-unknown2" "0" "0"
+[ "$(limit_target_epoch "lim-unknown2")" = "2018000" ] || fail "9: default unknown-wait must be now+18000 (got $(limit_target_epoch "lim-unknown2"))"
+ok
+unset HERD_NOW_EPOCH
+
 echo "ALL PASS ($pass checks)"
