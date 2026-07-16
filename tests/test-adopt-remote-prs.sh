@@ -48,6 +48,12 @@ if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   mkdir -p "$dir" 2>/dev/null
   exit 0
 fi
+if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "move" ]; then
+  from="$5"; to="$6"
+  case "$from" in *fail-move*) exit 1 ;; esac
+  mv "$from" "$to" 2>/dev/null
+  exit 0
+fi
 exit 0
 STUB
 chmod +x "$BIN/git"
@@ -68,6 +74,7 @@ export JOURNAL_FILE="$T/journal.jsonl"
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in _adopt_remote_prs_enabled _adopt_pr_recorded _adopt_pr_mark_adopted _adopt_branch_checked_out \
           _adopt_failed_journaled _adopt_journal_failed _adopt_remote_pr _adopt_remote_prs_scan \
+          _adopt_branch_worktree_dir _adopt_self_heal_mismatch herd_branch_slug \
           _watcher_tick_fields; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
@@ -115,16 +122,29 @@ esac
 pass
 
 # ── 3. ON: PR 201 (unclaimed, non-draft, branch free) is adopted; PR 202 (claimed) is left alone ────
+# The adopted worktree dir must be "gizmo", NOT "feat-gizmo" — herd_branch_slug strips the default
+# BRANCH_TEMPLATE prefix ('feat/{slug}') exactly like branch_to_slug does for candidate discovery
+# (pysrc/herd/live_runtime.py:branch_to_slug), the parity HERD-377 fixes. A naive `tr '/' '-'` of the
+# raw branch — the pre-fix behavior — would produce "feat-gizmo", a path discovery never resolves to.
 reset_state
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
 grep -q -- "-C $PROJECT_ROOT fetch -q origin feat/gizmo" "$GIT_CALL_LOG" || fail "expected a fetch of feat/gizmo: $(cat "$GIT_CALL_LOG")"
-grep -q -- "-C $PROJECT_ROOT worktree add $WORKTREES_DIR/feat-gizmo feat/gizmo" "$GIT_CALL_LOG" \
-  || fail "expected a worktree add of feat/gizmo: $(cat "$GIT_CALL_LOG")"
+grep -q -- "-C $PROJECT_ROOT worktree add $WORKTREES_DIR/gizmo feat/gizmo" "$GIT_CALL_LOG" \
+  || fail "expected a worktree add of feat/gizmo at the SLUG-PARITY path (gizmo, not feat-gizmo): $(cat "$GIT_CALL_LOG")"
 grep -q "leak" "$GIT_CALL_LOG" && fail "claimed PR 202 must never be touched: $(cat "$GIT_CALL_LOG")"
-[ -d "$WORKTREES_DIR/feat-gizmo" ] || fail "adopted worktree dir was not created"
+[ -d "$WORKTREES_DIR/gizmo" ] || fail "adopted worktree dir was not created at the slug-parity path"
+[ ! -e "$WORKTREES_DIR/feat-gizmo" ] || fail "adopted worktree must not use the old mismatched-slug path"
 grep -q '"event":"pr_adopted"' "$JOURNAL_FILE" || fail "pr_adopted not journaled: $(cat "$JOURNAL_FILE")"
 grep -q '"pr":201' "$JOURNAL_FILE" || fail "pr_adopted missing pr:201: $(cat "$JOURNAL_FILE")"
 grep -q -- "$(printf '201\tsha201\tadopted')" "$ADOPT_PR_LEDGER" || fail "ledger missing adopted row: $(cat "$ADOPT_PR_LEDGER" 2>/dev/null)"
+pass
+
+# ── 3b. herd_branch_slug matches branch_to_slug's convention directly (unit-level parity check) ────
+[ "$(herd_branch_slug "feat/gizmo")" = "gizmo" ] || fail "herd_branch_slug should strip the feat/ prefix"
+[ "$(herd_branch_slug "feat/python-draft-pr-hold")" = "python-draft-pr-hold" ] \
+  || fail "herd_branch_slug regression: must match branch_to_slug for the real HERD-377 branch"
+[ "$(herd_branch_slug "someuser:feature/x")" = "someuser:feature-x" ] \
+  || fail "herd_branch_slug must fall back to flattening '/' when the branch does not fit BRANCH_TEMPLATE"
 pass
 
 # ── 4. A DRAFT orphan PR is never adopted, even though it is otherwise eligible ──────────────────────
@@ -133,7 +153,7 @@ DRAFT_PRS='[{"number":301,"title":"wip thing","headRefName":"feat/wip","headRefO
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$DRAFT_PRS" "" ""
 [ ! -s "$GIT_CALL_LOG" ] || fail "a draft PR must never trigger fetch/worktree add: $(cat "$GIT_CALL_LOG")"
 [ ! -s "$JOURNAL_FILE" ] || fail "a draft PR must never journal anything: $(cat "$JOURNAL_FILE")"
-[ ! -e "$WORKTREES_DIR/feat-wip" ] || fail "a draft PR must never get a worktree"
+[ ! -e "$WORKTREES_DIR/wip" ] || fail "a draft PR must never get a worktree"
 pass
 
 # ── 5. A branch already checked out ANYWHERE (main checkout or a stray worktree) is never touched ──
@@ -169,7 +189,7 @@ ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAIL_FETCH_PRS" "" 
 grep -q '"event":"adopt_failed"' "$JOURNAL_FILE" || fail "adopt_failed not journaled on fetch failure: $(cat "$JOURNAL_FILE")"
 grep -q '"pr":401' "$JOURNAL_FILE" || fail "adopt_failed missing pr:401"
 [ ! -e "$ADOPT_PR_LEDGER" ] || fail "a failure must never write the SUCCESS once-guard ledger: $(cat "$ADOPT_PR_LEDGER")"
-[ ! -d "$WORKTREES_DIR/feat-fail-fetch" ] || fail "a failed fetch must never leave a worktree dir"
+[ ! -d "$WORKTREES_DIR/fail-fetch" ] || fail "a failed fetch must never leave a worktree dir"
 first_fetch_calls="$(wc -l < "$GIT_CALL_LOG" | tr -cd '0-9')"
 first_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
 # A SECOND scan of the SAME still-failing (pr,sha): the attempt retries (git called again)...
@@ -199,6 +219,50 @@ pass
 reset_state
 ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan 'not json' "" || fail "malformed roster must not error"
 [ ! -s "$GIT_CALL_LOG" ] || fail "malformed roster must never attempt an adopt"
+pass
+
+# ── 11. HERD-377 leftover self-heal: a PRE-FIX adopt checked a branch out at the OLD mismatched-slug
+#        path (mirrors the real PR #484: TREES/feat-python-draft-pr-hold instead of the slug-parity
+#        TREES/python-draft-pr-hold). A scan detects the mismatch from the SAME worktree porcelain text
+#        the checked-out-anywhere guard reads and `git worktree move`s it onto the correct path — a
+#        re-adopt at the right path with the stale dir swept — instead of re-fetching/re-adding ──────
+reset_state
+mkdir -p "$WORKTREES_DIR/feat-python-draft-pr-hold"
+STALE_WT="worktree $WORKTREES_DIR/feat-python-draft-pr-hold
+HEAD deadbeef
+branch refs/heads/feat/python-draft-pr-hold
+
+"
+REGRESSION_PRS='[{"number":484,"title":"python draft pr hold","headRefName":"feat/python-draft-pr-hold","headRefOid":"sha484","isDraft":false}]'
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$REGRESSION_PRS" "" "$STALE_WT"
+grep -q -- "-C $PROJECT_ROOT worktree move $WORKTREES_DIR/feat-python-draft-pr-hold $WORKTREES_DIR/python-draft-pr-hold" "$GIT_CALL_LOG" \
+  || fail "expected a self-heal worktree move onto the slug-parity path: $(cat "$GIT_CALL_LOG")"
+[ -d "$WORKTREES_DIR/python-draft-pr-hold" ] || fail "self-heal must leave the worktree at the slug-parity path"
+[ ! -e "$WORKTREES_DIR/feat-python-draft-pr-hold" ] || fail "self-heal must sweep the stale mismatched-slug dir"
+grep -q '"event":"adopt_selfheal"' "$JOURNAL_FILE" || fail "adopt_selfheal not journaled: $(cat "$JOURNAL_FILE")"
+grep -q "worktree add" "$GIT_CALL_LOG" && fail "a self-healed branch must never ALSO be re-fetched/re-added: $(cat "$GIT_CALL_LOG")"
+pass
+
+# ── 12. Self-heal move failure is fail-soft: retried every scan, but the journal event is deduped ───
+reset_state
+mkdir -p "$WORKTREES_DIR/feat-fail-move-thing"
+FAILMOVE_WT="worktree $WORKTREES_DIR/feat-fail-move-thing
+HEAD deadbeef
+branch refs/heads/feat/fail-move-thing
+
+"
+FAILMOVE_PRS='[{"number":403,"title":"x","headRefName":"feat/fail-move-thing","headRefOid":"sha403","isDraft":false}]'
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAILMOVE_PRS" "" "$FAILMOVE_WT" \
+  || fail "a self-heal move failure must not abort the scan"
+grep -q '"event":"adopt_selfheal_failed"' "$JOURNAL_FILE" || fail "adopt_selfheal_failed not journaled on move failure"
+[ -d "$WORKTREES_DIR/feat-fail-move-thing" ] || fail "a failed move must leave the stale dir in place, not lose it"
+first_move_calls="$(grep -c 'worktree move' "$GIT_CALL_LOG" || true)"
+first_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$FAILMOVE_PRS" "" "$FAILMOVE_WT"
+second_move_calls="$(grep -c 'worktree move' "$GIT_CALL_LOG" || true)"
+[ "$second_move_calls" -gt "$first_move_calls" ] || fail "a failed self-heal must be RETRIED on the next scan"
+second_journal_lines="$(wc -l < "$JOURNAL_FILE" | tr -cd '0-9')"
+[ "$second_journal_lines" = "$first_journal_lines" ] || fail "adopt_selfheal_failed must be deduped per (branch,dir), not re-journaled every scan"
 pass
 
 echo "ok — $PASS adopt-remote-PRs assertions passed"
