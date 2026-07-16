@@ -11,7 +11,8 @@
 #                   --to <name>) via HERD_REPORT_BACKEND (default github), stamped with this
 #                   project + the lane involved + the version pin. Dedups before filing.
 #   herd link       manage the cross-repo link registry (.herd/links): list shows all configured
-#                   peer repos. Use a link with: herd report --to <name> "<symptom>".
+#                   peer repos; --scan proposes new ones from the fleet registry (dry-run by
+#                   default, --write applies). Use a link with: herd report --to <name> "<symptom>".
 #   herd depend     record a WATCHED blocked-on dependency (<link>#<id>) in .herd/deps — dep-watcher
 #                   polls it until the upstream item closes. `herd report --to --dep` files AND deps.
 #   herd deps       list / rm / demote recorded dependencies — a dep is editable data, never stuck.
@@ -4062,13 +4063,111 @@ cmd_link_list() {
   if [ "$count" -eq 0 ]; then say "(no links defined)"; fi
 }
 
+# cmd_link_scan [--write] (HERD-384) — propose candidate peer links from the fleet registry
+# (~/.herd/fleet, override HERD_FLEET_FILE) into THIS project's .herd/links. For every OTHER
+# registered project, resolve its repo identity fresh from its OWN origin remote (via fleet.sh's
+# _fleet_repo_slug — same freshness discipline as `herd fleet register`, never the stale registry
+# field alone) and propose `name|repo|github|` unless a link with that name or repo already exists.
+# DRY-RUN by default (prints proposals, writes nothing); --write appends them to .herd/links,
+# creating it with a header if absent. Idempotent: re-running after --write recomputes proposals
+# against the now-updated file, so a second `--write` finds nothing new (a true no-op), matching the
+# herd-links.sh resolver's own convention of one canonical row per name. Fail-soft: no fleet registry
+# → a soft note and exit 0 (never a red — the registry is optional infrastructure).
+cmd_link_scan() {
+  local do_write=""
+  case "${1:-}" in --write) do_write=1; shift ;; esac
+
+  local root; root="$(pwd)"
+  local cfg="$root/.herd/config"
+  [ -f "$cfg" ] && export HERD_CONFIG_FILE="$cfg"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-config.sh"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-links.sh"
+
+  local reg; reg="$(_fleet_registry_file)"
+  if [ ! -f "$reg" ]; then
+    say "herd link --scan: no fleet registry found ($reg) — nothing to scan"
+    say "register peer projects first with: herd fleet register <project-path>"
+    return 0
+  fi
+
+  local self_root="${PROJECT_ROOT:-$root}"
+  local links_file; links_file="$(_herd_find_links)"
+  [ -n "$links_file" ] || links_file="$self_root/.herd/links"
+
+  # Snapshot existing names/repos (newline-delimited) to dedup proposals against.
+  local existing_names="" existing_repos=""
+  if [ -f "$links_file" ]; then
+    local eline ename erepo erest
+    while IFS= read -r eline; do
+      case "$eline" in '#'*|'') continue ;; esac
+      ename="${eline%%|*}"; erest="${eline#*|}"
+      erepo="${erest%%|*}"
+      existing_names="$existing_names
+$ename"
+      existing_repos="$existing_repos
+$erepo"
+    done < "$links_file"
+  fi
+
+  local proposals=() rname rpath rrepo
+  while IFS='|' read -r rname rpath rrepo; do
+    case "$rname" in ''|'#'*) continue ;; esac
+    [ -n "$rpath" ] || continue
+    local rpath_real; rpath_real="$(cd "$rpath" 2>/dev/null && pwd -P)" || continue
+    [ "$rpath_real" = "$self_root" ] && continue   # never propose a link to ourselves
+
+    # Freshness over the registry's cached field (issue #128 discipline): re-resolve the peer's
+    # repo identity from ITS OWN origin remote; fall back to the registry field if that fails.
+    local fresh_repo; fresh_repo="$(_fleet_repo_slug "$rpath_real")"
+    [ -n "$fresh_repo" ] || fresh_repo="$rrepo"
+    [ -n "$fresh_repo" ] || continue               # no resolvable repo identity — nothing to link
+
+    grep -qxF "$rname" <<< "$existing_names" && continue
+    grep -qxF "$fresh_repo" <<< "$existing_repos" && continue
+
+    proposals+=("$rname|$fresh_repo|github|")
+  done < "$reg"
+
+  if [ "${#proposals[@]}" -eq 0 ]; then
+    say "herd link --scan: no new peer links to propose (registry and $links_file already agree)"
+    return 0
+  fi
+
+  if [ -z "$do_write" ]; then
+    say "herd link --scan (dry run) — candidate peer link(s):"
+    local p pn pr pb pt
+    for p in "${proposals[@]}"; do
+      pn="${p%%|*}"; pt="${p#*|}"
+      pr="${pt%%|*}"; pt="${pt#*|}"
+      pb="${pt%%|*}"
+      printf '  + %-20s  %-30s  [%s]\n' "$pn" "$pr" "$pb"
+    done
+    say ""
+    say "re-run with --write to add ${#proposals[@]} link(s) to $links_file"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$links_file")" 2>/dev/null || die "cannot create dir for $links_file"
+  if [ ! -f "$links_file" ]; then
+    printf '# .herd/links — cross-repo link registry (herd link --scan). Commit this; zero-secret.\n' > "$links_file"
+    printf '# name|owner/repo|backend|tracker_target\n' >> "$links_file"
+  fi
+  local p added=0
+  for p in "${proposals[@]}"; do
+    printf '%s\n' "$p" >> "$links_file"
+    added=$((added + 1))
+  done
+  ok "herd link --scan: added $added link(s) to $links_file"
+}
+
 cmd_link() {
   local sub="${1:-list}"
   case "$sub" in
     list)   cmd_link_list ;;
-    # TODO(backlog): herd link --scan — walk sibling repos' .herd/config to auto-populate links
-    --scan) warn "herd link --scan: scanning sibling repos to populate links is TODO"; return 0 ;;
-    *)      die "usage: herd link list" ;;
+    --scan) shift; cmd_link_scan "$@" ;;
+    *)      die "usage: herd link list | herd link --scan [--write]" ;;
   esac
 }
 
@@ -6859,6 +6958,8 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       dependency in .herd/deps (requires --to); without it
                                       report stays fire-and-forget
   herd link list                      list peer repos registered in .herd/links
+  herd link --scan [--write]          propose candidate peer links from the fleet registry
+                                      (~/.herd/fleet); dry-run by default, --write applies
   herd depend <link>#<id>             record a blocked-on dependency in .herd/deps (watched by
                                       dep-watcher.sh until the upstream item closes)
   herd deps <list|rm|demote>          manage recorded dependencies:

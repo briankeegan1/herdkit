@@ -280,6 +280,7 @@ herd cost [--pr N]           # per-builder + review token/$ accounting; cost-per
 herd changelog generate      # journal-driven CHANGELOG.md [Unreleased] (deterministic, no LLM)
 herd changelog tag <ver>     # promote [Unreleased] + local git tag (see docs/releasing.md)
 herd link list               # list peer repos registered in .herd/links
+herd link --scan [--write]   # propose peer links from the fleet registry; --write applies
 
 # Manage several herd projects at once — deterministic, no-LLM fan-out (see below):
 herd fleet status            # per-project rollup: branch, open PRs, watcher alive?, last activity
