@@ -142,7 +142,7 @@ journal-audit.sh	unit	tests/test-journal-audit.sh
 lifecycle.sh	unit	tests/test-lifecycle-contracts.sh
 lifecycle.sh	unit	tests/test-lifecycle-lane-workers.sh
 JOURNAL_AUDIT	unit	tests/test-journal-audit.sh
-JOURNAL_AUDIT_WINDOW_SECS	none-yet	unit: the test pins the window to its default; no test asserts an event OLDER than JOURNAL_AUDIT_WINDOW_SECS is excluded from the replay
+JOURNAL_AUDIT_WINDOW_SECS	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_DISPATCH_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_REFIX_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_RED_TTL	unit	tests/test-journal-audit.sh
@@ -217,9 +217,9 @@ HEALTHCHECK_CMD	unit	tests/test-healthcheck-interaction.sh
 HEALTHCHECK_HEAVY_GLOB	unit	tests/test-healthcheck-routing.sh
 APP_SURFACE_GLOB	unit	tests/test-healthcheck-interaction.sh
 INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh
-SMOKE_CMD	none-yet	unit: no test asserts herd-resolve.sh runs $SMOKE_CMD before push (real consumer, zero test references)
+SMOKE_CMD	unit	tests/test-resolve-smoke-gate.sh
 DENY_PATHS	unit	tests/test-scribe-deny-paths.sh
-REVIEW_CHECKLIST	none-yet	unit: no test asserts the checklist injection into the pre-merge review gate (herd-review.sh)
+REVIEW_CHECKLIST	unit	tests/test-review-checklist-injection.sh
 COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh
@@ -325,7 +325,7 @@ HERD_FORCE_SPAWN	unit	tests/test-spawn-rate-match.sh
 HERD_FORCE_SPAWN	unit	tests/test-tracked-spawns.sh
 HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
 HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
-HERD_LIMIT_UNKNOWN_WAIT	none-yet	unit: no test references HERD_LIMIT_UNKNOWN_WAIT or asserts the unparseable-reset blind-resume wait
+HERD_LIMIT_UNKNOWN_WAIT	unit	tests/test-limit-resume.sh
 COORDINATOR_WATCHDOG	unit	tests/test-coordinator-watchdog.sh
 COORDINATOR_AUTONOMY	unit	tests/test-knob-aware-doctrine.sh
 DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh

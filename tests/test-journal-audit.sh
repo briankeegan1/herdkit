@@ -495,4 +495,19 @@ printf '1 hv-informed 304 aaa\n' >> "$HERD_APPROVALS_FILE"
 pass
 echo "PASS (8) approvals.sh: sha-prefix matching, state precedence, fail-soft on a missing ledger"
 
+# ── (9) JOURNAL_AUDIT_WINDOW_SECS: an event OLDER than the window is excluded from the replay ────
+# Narrow the window so a merge 6h back falls OUTSIDE it while a merge 30min back stays INSIDE it.
+# Both are otherwise identical merge-without-reap violations (well past MERGE_GRACE) — the only
+# variable is age relative to the pinned "now" (2026-07-09T16:00:00Z) vs the window. If the window
+# were not honored, both would fire; if it were honored too eagerly, neither would.
+reset_surfaces
+jline "2026-07-09T10:00:00Z" '"event":"merge","pr":901,"slug":"too-old","sha":"old1"'   # 6h back — OUTSIDE the 1h window
+jline "2026-07-09T15:30:00Z" '"event":"merge","pr":900,"slug":"in-window","sha":"new1"' # 30m back — INSIDE the 1h window
+out="$(JOURNAL_AUDIT_WINDOW_SECS=3600 run_audit on)" || fail "(9) audit exited non-zero: $out"
+[ "$(count_audit merge_without_reap)" = "1" ] || fail "(9) expected exactly 1 merge_without_reap (only the in-window merge), got $(count_audit merge_without_reap); $(grep journal_audit "$JOURNAL_FILE" || true)"
+grep -q '"key":"merge_without_reap|pr=900|slug=in-window"' "$JOURNAL_FILE" || fail "(9) the surviving finding must be the IN-WINDOW merge (pr=900), got: $(grep journal_audit "$JOURNAL_FILE" || true)"
+grep -q 'pr=901' "$JOURNAL_FILE" && fail "(9) the OLDER-THAN-WINDOW merge (pr=901) must never surface a finding"
+pass
+echo "PASS (9) JOURNAL_AUDIT_WINDOW_SECS excludes an event older than the window from the replay"
+
 echo "ALL PASS ($PASS checks) — journal-audit self-audit (HERD-238 + HERD-272 human-verify rule)."
