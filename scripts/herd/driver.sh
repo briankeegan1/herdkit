@@ -185,6 +185,15 @@ herd_model_driver_for() {
   printf '%s' "${out%%$'\t'*}"
 }
 
+# herd_model_escalate_target — the model a matched MODEL_ESCALATE_GLOB forces (HERD-376): MODEL_ESCALATE
+# when the operator set it, else MODEL_FEATURE (today's behavior). Both herd-feature.sh and
+# herd-quick.sh's glob-escalation branch call this so the "which model does a match force" decision
+# lives in exactly one place. BYTE-IDENTICAL when MODEL_ESCALATE is unset: echoes MODEL_FEATURE, same
+# as the inline literal it replaces.
+herd_model_escalate_target() {
+  printf '%s' "${MODEL_ESCALATE:-$MODEL_FEATURE}"
+}
+
 # ── Model accessibility preflight (HERD-282) ──────────────────────────────────────────────────────
 # herd_model_preflight_accessible <ref> <driver> <model> — fast, fail-soft pre-spawn check: is the
 # resolved runtime binary accessible on this machine? Call BEFORE worktree creation so a bad model

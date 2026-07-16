@@ -258,8 +258,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `merge-policy.sh`, `posture-lint.sh`
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
+- `MODEL_ESCALATE` → `driver.sh`
 - `MODEL_ESCALATE_GLOB` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
-- `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `driver.sh`, `herd-feature.sh`, `herd-quick.sh`
+- `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `driver.sh`, `herd-feature.sh`
 - `MODEL_QUICK` → `bin/herd`, `herd-quick.sh`
 - `MODEL_RESEARCH` → `bin/herd`, `research.sh`
 - `MODEL_RESOLVER` → `herd-resolve.sh`

@@ -90,12 +90,14 @@ fi
 DIR="$WORKTREES_DIR/$SLUG"
 MODEL="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
 # Deterministic model step-up: if the coordinator-passed task text matches MODEL_ESCALATE_GLOB
-# (egrep -i, e.g. judgment-heavy engine surface), force the MODEL_FEATURE tier — REGARDLESS of the
+# (egrep -i, e.g. judgment-heavy engine surface), force the escalation target — MODEL_ESCALATE if the
+# operator set one (HERD-376), else MODEL_FEATURE (today's default) — REGARDLESS of the
 # HERD_FEATURE_MODEL per-spawn override just resolved (a cheaper override cannot survive a matched
 # escalation glob). Empty glob → off (zero behavior change). Announce only when it raises the tier.
 if [ -n "$MODEL_ESCALATE_GLOB" ] && [ -n "$TASK" ] && printf '%s' "$TASK" | grep -Eiq "$MODEL_ESCALATE_GLOB"; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
-  if [ "$MODEL" != "$MODEL_FEATURE" ]; then
-    MODEL="$MODEL_FEATURE"
+  _ESCALATE_TARGET="$(herd_model_escalate_target)"
+  if [ "$MODEL" != "$_ESCALATE_TARGET" ]; then
+    MODEL="$_ESCALATE_TARGET"
     echo "⬆️  escalated to $MODEL (MODEL_ESCALATE_GLOB matched)"
   fi
 fi
