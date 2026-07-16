@@ -67,6 +67,7 @@ import subprocess
 import sys
 import time
 
+from herd import cost_emit as _cost_emit
 from herd import decisions as D
 from herd import shadow_runtime as _shadow
 from herd.shadow_journal import encode_event
@@ -1570,6 +1571,7 @@ class DryRunActuator:
         return True
 
     def reap(self, cand):
+        _cost_emit.emit_merge_cost(self.journal, cand.pr, cand.slug, cand.worktree)
         self.journal.append("reap", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "reason", "merged")
         return True
@@ -1717,6 +1719,10 @@ class LiveActuator:
         # That is the multi-seat authority the contract requires — it reconciles observed PR state each
         # sweep tick, so the gate holds regardless of which seat merged. Keeping it single-sourced there
         # (rather than re-deriving a roster verdict on this already-post-gate path) is deliberate.
+        # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and
+        #    journal a `cost` event (builder — and the in-worktree review, if captured) BEFORE the
+        #    worktree is reaped (mirrors agent-watch.sh do_merge's step 0). Never affects the reap.
+        _cost_emit.emit_merge_cost(self.journal, cand.pr, cand.slug, cand.worktree)
         if cand.worktree:
             try:
                 subprocess.run(["git", "worktree", "remove", "--force", cand.worktree],
