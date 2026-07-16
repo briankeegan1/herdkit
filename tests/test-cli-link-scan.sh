@@ -90,4 +90,42 @@ out6="$( ( cd "$ALPHA" && HERD_CONFIG_FILE="$ALPHA/.herd/config" HERD_NONINTERAC
 echo "$out6" | grep -qi "no fleet registry" || fail "missing-registry case did not soft-note — got: $out6"
 pass
 
+# ── 7. --write onto a PRE-EXISTING, UNTERMINATED .herd/links never glues onto the last row ────────
+# .herd/links predates this command as a writer — a hand-authored (or templates/links.example-
+# copied) file with no trailing newline on its last line is ordinary operator state, not exotic.
+ZETA="$(_make_project zeta)"
+GAMMA="$(_make_project gamma)"
+bash "$HERD" fleet register "$ZETA"  >/dev/null
+bash "$HERD" fleet register "$GAMMA" >/dev/null
+printf 'upstream|vendor/sdk|linear|ENG-7' > "$ZETA/.herd/links"   # deliberately NO trailing newline
+out7="$(run_from "$ZETA" link --scan --write 2>&1)" || fail "link --scan --write onto unterminated file exited non-zero: $out7"
+grep -qxF 'upstream|vendor/sdk|linear|ENG-7' "$ZETA/.herd/links" \
+  || fail "the pre-existing unterminated row was corrupted — file: $(cat "$ZETA/.herd/links")"
+grep -qxF 'gamma|acme/gamma|github|' "$ZETA/.herd/links" \
+  || fail "the new row was glued onto the pre-existing line instead of appended cleanly — file: $(cat "$ZETA/.herd/links")"
+n7="$(wc -l < "$ZETA/.herd/links" | tr -d ' ')"
+[ "$n7" -ge 2 ] || fail "expected at least 2 distinct lines after --write, got $n7 — file: $(cat "$ZETA/.herd/links")"
+outlist7="$(run_from "$ZETA" link list 2>&1)" || fail "link list after unterminated-file --write exited non-zero: $outlist7"
+echo "$outlist7" | grep -q "vendor/sdk" || fail "link list lost the pre-existing 'upstream' row — got: $outlist7"
+echo "$outlist7" | grep -q "acme/gamma" || fail "link list lost the newly-scanned 'gamma' row — got: $outlist7"
+pass
+
+# ── 8. cross-proposal collision: two registry rows proposing the SAME name dedup against each ─────
+#    other within one scan (only the first is written; the second never silently shadows it).
+DUP1="$(_make_project dup1)"; sed -i.bak 's/WORKSPACE_NAME="dup1"/WORKSPACE_NAME="dup"/' "$DUP1/.herd/config"
+DUP2="$(_make_project dup2)"; sed -i.bak 's/WORKSPACE_NAME="dup2"/WORKSPACE_NAME="dup"/' "$DUP2/.herd/config"
+rm -f "$DUP1/.herd/config.bak" "$DUP2/.herd/config.bak"
+git -C "$DUP1" remote set-url origin "git@github.com:acme/dup1.git"
+git -C "$DUP2" remote set-url origin "git@github.com:acme/dup2.git"
+REG8="$T/registry8/fleet"
+HERD_FLEET_FILE="$REG8" bash "$HERD" fleet register "$DUP1" >/dev/null
+HERD_FLEET_FILE="$REG8" bash "$HERD" fleet register "$DUP2" >/dev/null
+ETA="$(_make_project eta)"
+out8="$( cd "$ETA" && HERD_CONFIG_FILE="$ETA/.herd/config" HERD_NONINTERACTIVE=1 \
+           HERD_FLEET_FILE="$REG8" bash "$HERD" link --scan --write 2>&1 )" \
+  || fail "link --scan --write (collision case) exited non-zero: $out8"
+n8="$(grep -c '^dup|' "$ETA/.herd/links" || true)"
+[ "$n8" = "1" ] || fail "colliding 'dup' entries both got written ($n8 rows) — file: $(cat "$ETA/.herd/links")"
+pass
+
 echo "ALL PASS ($PASS checks)"

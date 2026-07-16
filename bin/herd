@@ -4063,19 +4063,39 @@ cmd_link_list() {
   if [ "$count" -eq 0 ]; then say "(no links defined)"; fi
 }
 
+# _link_scan_peer_backend <project-path> — that peer's own SCRIBE_BACKEND (file/github/linear/jira/
+# changelog), read directly off its .herd/config (grep, not a full source — sourcing herd-config.sh
+# again would clobber OUR OWN PROJECT_ROOT/WORKSPACE_NAME/etc). Falls back to "github", the same
+# default herd-links.sh's own resolver uses for a blank backend field, when the peer has none set.
+_link_scan_peer_backend() {
+  local pcfg="$1/.herd/config" pb
+  [ -f "$pcfg" ] || { printf 'github'; return; }
+  pb="$(grep -m1 '^SCRIBE_BACKEND=' "$pcfg" 2>/dev/null | sed -E 's/^SCRIBE_BACKEND=//; s/^"//; s/"$//; s/\r$//')"
+  printf '%s' "${pb:-github}"
+}
+
 # cmd_link_scan [--write] (HERD-384) — propose candidate peer links from the fleet registry
 # (~/.herd/fleet, override HERD_FLEET_FILE) into THIS project's .herd/links. For every OTHER
 # registered project, resolve its repo identity fresh from its OWN origin remote (via fleet.sh's
 # _fleet_repo_slug — same freshness discipline as `herd fleet register`, never the stale registry
-# field alone) and propose `name|repo|github|` unless a link with that name or repo already exists.
-# DRY-RUN by default (prints proposals, writes nothing); --write appends them to .herd/links,
-# creating it with a header if absent. Idempotent: re-running after --write recomputes proposals
-# against the now-updated file, so a second `--write` finds nothing new (a true no-op), matching the
-# herd-links.sh resolver's own convention of one canonical row per name. Fail-soft: no fleet registry
-# → a soft note and exit 0 (never a red — the registry is optional infrastructure).
+# field alone) and its own SCRIBE_BACKEND, and propose `name|repo|backend|` unless a link with that
+# name or repo already exists (checked against BOTH the file's existing rows and every proposal
+# already accepted this run, so two registry entries that would collide on name/repo never both
+# land in one --write). DRY-RUN by default (prints proposals, writes nothing); --write appends them
+# to .herd/links — terminating the file with a newline first if a hand-edited last line lacks one,
+# so an append never glues onto (and corrupts) an existing row — creating it with a header if
+# absent. Idempotent: re-running after --write recomputes proposals against the now-updated file, so
+# a second `--write` finds nothing new (a true no-op), matching the herd-links.sh resolver's own
+# convention of one canonical row per name. Fail-soft: no fleet registry → a soft note and exit 0
+# (never a red — the registry is optional infrastructure).
 cmd_link_scan() {
   local do_write=""
-  case "${1:-}" in --write) do_write=1; shift ;; esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --write) do_write=1; shift ;;
+      *) die "usage: herd link --scan [--write]" ;;
+    esac
+  done
 
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -4096,11 +4116,14 @@ cmd_link_scan() {
   local links_file; links_file="$(_herd_find_links)"
   [ -n "$links_file" ] || links_file="$self_root/.herd/links"
 
-  # Snapshot existing names/repos (newline-delimited) to dedup proposals against.
+  # Snapshot existing names/repos (newline-delimited) to dedup proposals against. `|| [ -n "$eline" ]`
+  # captures a final line with no trailing newline — an ORDINARY state for a hand-authored
+  # .herd/links (this command is the file's first writer; a plain `read` would silently drop that
+  # row from the snapshot, and --write would then propose a colliding name/repo as if it were new).
   local existing_names="" existing_repos=""
   if [ -f "$links_file" ]; then
     local eline ename erepo erest
-    while IFS= read -r eline; do
+    while IFS= read -r eline || [ -n "$eline" ]; do
       case "$eline" in '#'*|'') continue ;; esac
       ename="${eline%%|*}"; erest="${eline#*|}"
       erepo="${erest%%|*}"
@@ -4127,7 +4150,18 @@ $erepo"
     grep -qxF "$rname" <<< "$existing_names" && continue
     grep -qxF "$fresh_repo" <<< "$existing_repos" && continue
 
-    proposals+=("$rname|$fresh_repo|github|")
+    local rbackend; rbackend="$(_link_scan_peer_backend "$rpath_real")"
+    proposals+=("$rname|$fresh_repo|$rbackend|")
+
+    # Fold the accepted proposal into the running snapshot: two registry rows that would BOTH
+    # propose the same name or repo (e.g. two fleet entries sharing a WORKSPACE_NAME, or two
+    # forks of the same upstream) must dedup against EACH OTHER too, not just against the file as
+    # it stood before this scan — otherwise a single --write could emit two colliding rows for the
+    # same name and silently strand the second one (a link name resolves to only its FIRST row).
+    existing_names="$existing_names
+$rname"
+    existing_repos="$existing_repos
+$fresh_repo"
   done < "$reg"
 
   if [ "${#proposals[@]}" -eq 0 ]; then
@@ -4153,6 +4187,11 @@ $erepo"
   if [ ! -f "$links_file" ]; then
     printf '# .herd/links — cross-repo link registry (herd link --scan). Commit this; zero-secret.\n' > "$links_file"
     printf '# name|owner/repo|backend|tracker_target\n' >> "$links_file"
+  elif [ -s "$links_file" ] && [ -n "$(tail -c1 "$links_file")" ]; then
+    # A pre-existing (hand-edited, or copied from templates/links.example) file may end without a
+    # trailing newline — this command is the file's FIRST writer, so terminate it before appending
+    # or the append would glue onto the final existing row instead of starting a new line.
+    printf '\n' >> "$links_file"
   fi
   local p added=0
   for p in "${proposals[@]}"; do
