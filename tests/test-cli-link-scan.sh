@@ -128,4 +128,50 @@ n8="$(grep -c '^dup|' "$ETA/.herd/links" || true)"
 [ "$n8" = "1" ] || fail "colliding 'dup' entries both got written ($n8 rows) — file: $(cat "$ETA/.herd/links")"
 pass
 
+# ── 9. self-link guard must survive a LOGICAL (symlinked) PROJECT_ROOT ────────────────────────────
+# `herd init` writes PROJECT_ROOT verbatim from a plain `pwd` prompt (logical, not `pwd -P`), so a
+# project reached through a symlink is the ORDINARY case, not exotic. Force a real symlink layer
+# (independent of whether the test's own tmpdir happens to be symlinked) so this reproduces anywhere.
+T_REAL="$(cd "$T" && pwd -P)"
+mkdir -p "$T_REAL/reallinkproj/.herd" "$T_REAL/alias"
+git -C "$T_REAL/reallinkproj" init -q
+git -C "$T_REAL/reallinkproj" config user.email t@t.t
+git -C "$T_REAL/reallinkproj" config user.name t
+( cd "$T_REAL/reallinkproj" && git commit -q --allow-empty -m init )
+git -C "$T_REAL/reallinkproj" remote add origin "git@github.com:acme/linkproj.git"
+ln -s "$T_REAL/reallinkproj" "$T_REAL/alias/linkproj"
+LINKPROJ="$T_REAL/alias/linkproj"                          # the LOGICAL (symlinked) spelling
+cat > "$T_REAL/reallinkproj/.herd/config" <<CFG
+PROJECT_ROOT="$LINKPROJ"
+WORKSPACE_NAME="linkproj"
+HERD_REPO="me/linkproj"
+CFG
+REG9="$T/registry9/fleet"
+HERD_FLEET_FILE="$REG9" bash "$HERD" fleet register "$LINKPROJ" >/dev/null
+grep -q "^linkproj|$LINKPROJ|acme/linkproj$" "$REG9" \
+  || fail "registry did not record the logical PROJECT_ROOT spelling verbatim — file: $(cat "$REG9")"
+out9="$( cd "$LINKPROJ" && HERD_CONFIG_FILE="$LINKPROJ/.herd/config" HERD_NONINTERACTIVE=1 \
+           HERD_FLEET_FILE="$REG9" bash "$HERD" link --scan 2>&1 )" \
+  || fail "link --scan (logical-root self case) exited non-zero: $out9"
+echo "$out9" | grep -qi "no new" \
+  || fail "logical PROJECT_ROOT defeated the self-link guard — scan proposed a self-link: $out9"
+pass
+
+# ── 10. peer backend: .herd/config.local overlay wins over the base config, and a blank ──────────
+#     linear/jira tracker_target is flagged in the dry-run output.
+IOTA="$(_make_project iota)"
+printf 'SCRIBE_BACKEND="file"\n' >> "$IOTA/.herd/config"        # base config: file
+printf 'SCRIBE_BACKEND="linear"\n' > "$IOTA/.herd/config.local"  # overlay: linear (must win)
+REG10="$T/registry10/fleet"
+HERD_FLEET_FILE="$REG10" bash "$HERD" fleet register "$IOTA" >/dev/null
+KAPPA="$(_make_project kappa)"
+out10="$( cd "$KAPPA" && HERD_CONFIG_FILE="$KAPPA/.herd/config" HERD_NONINTERACTIVE=1 \
+            HERD_FLEET_FILE="$REG10" bash "$HERD" link --scan 2>&1 )" \
+  || fail "link --scan (config.local overlay case) exited non-zero: $out10"
+echo "$out10" | grep -qE '\+\s+iota\s+acme/iota\s+\[linear\]' \
+  || fail "config.local's SCRIBE_BACKEND=linear did not win over the base config's 'file' — got: $out10"
+echo "$out10" | grep -qi "no tracker_target" || fail "dry-run did not flag the blank linear tracker_target — got: $out10"
+echo "$out10" | grep -q "iota" || fail "tracker_target warning did not name 'iota' — got: $out10"
+pass
+
 echo "ALL PASS ($PASS checks)"

@@ -4064,13 +4064,20 @@ cmd_link_list() {
 }
 
 # _link_scan_peer_backend <project-path> — that peer's own SCRIBE_BACKEND (file/github/linear/jira/
-# changelog), read directly off its .herd/config (grep, not a full source — sourcing herd-config.sh
-# again would clobber OUR OWN PROJECT_ROOT/WORKSPACE_NAME/etc). Falls back to "github", the same
-# default herd-links.sh's own resolver uses for a blank backend field, when the peer has none set.
+# changelog), read directly off its .herd/config + the gitignored .herd/config.local overlay (grep,
+# not a full source — sourcing herd-config.sh again would clobber OUR OWN PROJECT_ROOT/WORKSPACE_
+# NAME/etc). config.local is real overlay state (`herd config set --local`), so it is read AFTER
+# config and `tail -1` takes the LAST match across both — the same "last assignment wins" shell
+# semantics that apply when herd-config.sh sources config.local after config, and that also apply to
+# a duplicate key within one file (a plain `grep -m1` would wrongly take the FIRST match instead).
+# Falls back to "github", the same default herd-links.sh's own resolver uses for a blank field.
 _link_scan_peer_backend() {
-  local pcfg="$1/.herd/config" pb
-  [ -f "$pcfg" ] || { printf 'github'; return; }
-  pb="$(grep -m1 '^SCRIBE_BACKEND=' "$pcfg" 2>/dev/null | sed -E 's/^SCRIBE_BACKEND=//; s/^"//; s/"$//; s/\r$//')"
+  local proot="$1" pb
+  local files=()
+  [ -f "$proot/.herd/config" ]       && files+=("$proot/.herd/config")
+  [ -f "$proot/.herd/config.local" ] && files+=("$proot/.herd/config.local")
+  [ "${#files[@]}" -gt 0 ] || { printf 'github'; return; }
+  pb="$(grep -h '^SCRIBE_BACKEND=' "${files[@]}" 2>/dev/null | tail -1 | sed -E 's/^SCRIBE_BACKEND=//; s/^"//; s/"$//; s/\r$//')"
   printf '%s' "${pb:-github}"
 }
 
@@ -4112,7 +4119,12 @@ cmd_link_scan() {
     return 0
   fi
 
-  local self_root="${PROJECT_ROOT:-$root}"
+  # Physically resolve OUR OWN root before comparing it against each peer's `pwd -P` path below — a
+  # logical PROJECT_ROOT (the ordinary case: `herd init` writes it verbatim from a `pwd` prompt) would
+  # otherwise never equal a symlink-collapsed peer path, and the self-link guard would silently never
+  # fire for any project reached through a symlink. Same idiom as herd-config.sh's foreign-cwd guard
+  # and codemap.sh's root resolution.
+  local self_root; self_root="$(cd "${PROJECT_ROOT:-$root}" 2>/dev/null && pwd -P)" || self_root="${PROJECT_ROOT:-$root}"
   local links_file; links_file="$(_herd_find_links)"
   [ -n "$links_file" ] || links_file="$self_root/.herd/links"
 
@@ -4169,15 +4181,31 @@ $fresh_repo"
     return 0
   fi
 
+  # A blank tracker_target is a real gap for linear/jira, not just github: _linear_team_id falls
+  # back to OUR OWN LINEAR_TEAM_ID (or the first team our key can see) when a link's target is
+  # empty, so an auto-proposed linear/jira row silently routes `herd report --to <name>` at OUR
+  # tracker, not the peer's, until a human fills in the target by hand. Flag it rather than let a
+  # scanned-in row look identical to a deliberately-blank one.
+  local needs_target=() p pn pr pb pt
+  for p in "${proposals[@]}"; do
+    pn="${p%%|*}"; pt="${p#*|}"
+    pr="${pt%%|*}"; pt="${pt#*|}"
+    pb="${pt%%|*}"
+    case "$pb" in linear|jira) needs_target+=("$pn") ;; esac
+  done
+
   if [ -z "$do_write" ]; then
     say "herd link --scan (dry run) — candidate peer link(s):"
-    local p pn pr pb pt
     for p in "${proposals[@]}"; do
       pn="${p%%|*}"; pt="${p#*|}"
       pr="${pt%%|*}"; pt="${pt#*|}"
       pb="${pt%%|*}"
       printf '  + %-20s  %-30s  [%s]\n' "$pn" "$pr" "$pb"
     done
+    if [ "${#needs_target[@]}" -gt 0 ]; then
+      say ""
+      warn "no tracker_target for: ${needs_target[*]} — a blank linear/jira target routes to YOUR OWN team/project until you fill it in"
+    fi
     say ""
     say "re-run with --write to add ${#proposals[@]} link(s) to $links_file"
     return 0
@@ -4193,12 +4221,15 @@ $fresh_repo"
     # or the append would glue onto the final existing row instead of starting a new line.
     printf '\n' >> "$links_file"
   fi
-  local p added=0
+  local added=0
   for p in "${proposals[@]}"; do
     printf '%s\n' "$p" >> "$links_file"
     added=$((added + 1))
   done
   ok "herd link --scan: added $added link(s) to $links_file"
+  if [ "${#needs_target[@]}" -gt 0 ]; then
+    warn "no tracker_target for: ${needs_target[*]} — edit $links_file to set the correct one (a blank linear/jira target routes to YOUR OWN team/project)"
+  fi
 }
 
 cmd_link() {
