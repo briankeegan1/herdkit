@@ -85,7 +85,8 @@ herd backend switch	unit	tests/test-cli-backend-switch.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-links.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-dispatch-deps.sh
-herd link list	unit	tests/test-cli-links.sh
+herd link <list|--scan>	unit	tests/test-cli-links.sh
+herd link <list|--scan>	unit	tests/test-cli-link-scan.sh
 herd depend <link>#<id>	unit	tests/test-dispatch-deps.sh
 herd deps <list|rm|demote>	unit	tests/test-dispatch-deps.sh
 herd governance <export|apply>	unit	tests/test-governance-profiles.sh

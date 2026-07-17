@@ -5,7 +5,7 @@
 #
 #   name            short identifier (alphanumeric + hyphens recommended)
 #   owner/repo      repository slug — same format as HERD_REPO and gh -R
-#   backend         adapter to use: github | linear | file | changelog
+#   backend         adapter to use: github | linear | jira | file | changelog
 #   tracker_target  optional extra routing (e.g. Linear team ID); blank = adapter default
 #
 # Blank lines and # comments are ignored.
