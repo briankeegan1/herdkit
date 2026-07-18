@@ -29,6 +29,11 @@
 #                          NOTHING (never a junk new issue).
 #   finish                 race-safe stop: if the queue is now empty, close the scribe tab
 #                          ($SCRIBE_TAB) and print STOP; else print MORE (keep draining).
+#
+# HERD-391: whenever a request reaches the report/cleanup tail WITHOUT being filed (a commit/add-item
+# NOCHANGE, or any SKIP) it is dead-lettered into $WORKTREES_DIR/.scribe-deadletter/ with a scribe_drop
+# journal event, so a silently-guarded or unmapped request is never just deleted with no trace. See
+# _scribe_deadletter.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -101,10 +106,50 @@ case "$cmd" in
     herd_engine_guard "scribe-step apply ($cmd)" || exit 1 ;;
 esac
 
+# _scribe_deadletter <claimed-path> <reason> <result> — HERD-391: a request that reaches the cleanup
+# tail WITHOUT being filed (NOCHANGE) or already durably retried (RETRY, HERD-267) must still leave a
+# trace. Before this existed, a NOCHANGE on a plain `commit` (a guard silently declining to edit
+# BACKLOG_FILE — e.g. a request body carrying a private absolute path — or a stale-drainer misroute)
+# and every `skip`/no-match SKIP fell straight into _report_and_cleanup, which deleted the claimed
+# request with nothing durable left behind: no tracker_write, no create event, no retry entry, no
+# error a coordinator could find later — an identical re-file vanished identically. The drainer's own
+# stderr note (if any) lives only in a pane's scrollback and is gone once the tab closes.
+#
+# This journals scribe_drop and copies the CLAIMED file's own bytes (not $reason, which may be a short
+# summary or an LLM-rewrapped line) into $WORKTREES_DIR/.scribe-deadletter/, so the coordinator can
+# inspect the ORIGINAL request and re-route it by hand. A guard may still refuse to file something —
+# refusal is fine, silence is the bug.
+#
+# Gated on create_retry_enabled (CREATE_SELFHEAL) — the SAME lever HERD-267 already introduced for
+# "never lose a request that didn't get filed" — so CREATE_SELFHEAL=off stays byte-identical to before
+# this fix, exactly as it already does for the tracker-create retry path. Fail-soft throughout: a
+# dead-letter write problem must never block the caller from finishing its cleanup.
+_scribe_deadletter() {
+  local mine="$1" reason="$2" result="$3" dir base
+  create_retry_enabled || return 0
+  dir="$TREES/.scribe-deadletter"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  base="$(date +%s 2>/dev/null || echo 0)-$$-$RANDOM"
+  [ -f "$mine" ] && cp "$mine" "$dir/$base.req" 2>/dev/null
+  {
+    printf 'result=%s\n' "$result"
+    printf 'reason=%s\n' "$(printf '%s' "$reason" | tr '\t\n' '  ' | cut -c1-300)"
+  } > "$dir/$base.meta" 2>/dev/null
+  if command -v journal_append >/dev/null 2>&1; then
+    journal_append scribe_drop result "$result" \
+      reason "$(printf '%s' "$reason" | tr '\t\n' '  ' | cut -c1-200)" \
+      component "${HERD_COMPONENT:-scribe}" deadletter "$dir/$base.req"
+  fi
+}
+
 # _report_and_cleanup <claimed-path> <summary> <result> — shared post-write tail for both
 # commit (file) and add-item (api/changelog): live-view receipt, inbox line, notify, unclaim.
 _report_and_cleanup() {
   local mine="$1" sum="$2" out="$3" short
+  case "$out" in
+    DONE|RETRY) : ;;  # filed, or already durably tracked by the HERD-267 retry queue
+    *) _scribe_deadletter "$mine" "$sum" "$out" ;;
+  esac
   short=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '-------')
   printf '%s · %s\n' "$sum" "$short" > "$RECEIPT"
   printf '[%s] %s · %s\n' "$(date '+%H:%M')" "$sum" "$short" >> "$INBOX"
