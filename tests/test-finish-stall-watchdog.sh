@@ -60,7 +60,7 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 for fn in _finish_stall_min _finish_stall_enabled _finish_stall_grace_secs \
           _finish_stall_commits_ahead _classify_finish_stall _finish_stall_record \
           _finish_stall_mark _finish_stall_state _finish_stall_reset _finish_stall_clear \
-          _finish_stall_retask _row_finish_stall _reconcile_finish_stall; do
+          _finish_stall_retask _row_finish_stall _reconcile_finish_stall _finish_stall_note_escape; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -174,6 +174,38 @@ _finish_stall_mark seatslug "$NOW" >/dev/null
   || fail "a fresh read must see the SAME anchor another call just wrote (shared pool, not seat memory)"
 ok
 
+# ── _finish_stall_note_escape (PR #502 review fix) ──────────────────────────────────────────────
+# Called from a tick branch where the signature does not hold THIS tick (working / limit-parked) but
+# the slug has not necessarily truly escaped. MUST preserve 'retasked'/'escalated' (the record has to
+# survive the very working period a delivered re-task itself causes), and MUST clear an un-actioned
+# 'pending' anchor (or nothing) so a self-resuming builder serves a fresh grace window.
+FINISH_STALL_MIN=30
+_finish_stall_mark note-pending "$NOW" >/dev/null
+_finish_stall_note_escape note-pending
+[ -z "$(_finish_stall_record note-pending)" ] || fail "note-escape must clear an un-actioned pending record"
+
+_finish_stall_reset note-retasked "$NOW" retasked
+_finish_stall_note_escape note-retasked
+[ "$(_finish_stall_record note-retasked)" = "$(printf '%s\tretasked' "$NOW")" ] \
+  || fail "note-escape must PRESERVE a retasked record — this is the exact PR #502 BLOCK"
+
+_finish_stall_reset note-escalated "$NOW" escalated
+_finish_stall_note_escape note-escalated
+[ "$(_finish_stall_record note-escalated)" = "$(printf '%s\tescalated' "$NOW")" ] \
+  || fail "note-escape must PRESERVE an escalated record"
+
+_finish_stall_note_escape note-absent   # never seen — must not create anything or crash
+[ -z "$(_finish_stall_record note-absent)" ] || fail "note-escape on an unseen slug must stay unseen"
+
+( unset FINISH_STALL_MIN
+  _finish_stall_reset note-off "$NOW" retasked
+  _finish_stall_note_escape note-off
+)
+[ "$(_finish_stall_record note-off)" = "$(printf '%s\tretasked' "$NOW")" ] \
+  || fail "note-escape must be a hard no-op (touch nothing) when the leg is off"
+_finish_stall_clear note-off
+ok
+
 # ── console rows ─────────────────────────────────────────────────────────────────────────────────
 row="$(NO_COLOR=1 _row_finish_stall "slugcell" "12m")"
 case "$row" in *"needs-you"*"push + open the PR by hand"*) : ;; *) fail "the needs-you row must name the remedy, got: $row" ;; esac
@@ -241,11 +273,29 @@ grep -q '⚠️' "$HERDR_NOTIFY_LOG" && fail "tick3: a delivered re-task must NO
 grep -q finish_stall_wake "$JOURNAL_FILE" || fail "tick3: the wake must be journaled"
 ok
 
+# tick 3b: the nudge just delivered flips the agent to 'working' — the REAL tick loop routes a
+# working, PR-less builder to the working branch, which calls _finish_stall_note_escape, NEVER
+# _reconcile_finish_stall (PR #502 review: the previous unconditional clear() there wiped the
+# 'retasked' record the instant the nudge landed, so SECOND_STALL could never be reached and the
+# watchdog re-nudged forever instead of escalating). Simulate that exact branch here.
+_finish_stall_note_escape e2e-slug
+rec="$(_finish_stall_record e2e-slug)"
+[ "$rec" = "$(printf '%s\tretasked' "$T3")" ] \
+  || fail "tick3b: the working-branch escape must PRESERVE the retasked record, got: $rec"
+ok
+
 # tick 4: right after the reset, still within the SECOND grace window ⇒ PENDING again (quiet)
 : > "$HERDR_NOTIFY_LOG"; : > "$SENT"
 v="$(HERD_NOW_EPOCH="$((T3 + 5))" _reconcile_finish_stall e2e-slug "$DIRTY_WT" done feat)"
 [ "$v" = "PENDING" ] || fail "tick4: right after the reset should be PENDING (quiet), got $v"
 [ -s "$SENT" ] && fail "tick4: must not re-send during the second grace window"
+ok
+
+# tick 4b: the agent dips back to 'working' again for a moment mid-window (still no PR) — the escape
+# call must keep preserving 'retasked' through EVERY such dip, not just the first.
+_finish_stall_note_escape e2e-slug
+[ "$(_finish_stall_record e2e-slug)" = "$(printf '%s\tretasked' "$T3")" ] \
+  || fail "tick4b: a second working dip must still preserve the retasked record"
 ok
 
 # tick 5: a SECOND full grace window elapses without escaping ⇒ escalate

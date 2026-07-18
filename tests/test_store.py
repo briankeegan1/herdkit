@@ -284,6 +284,68 @@ class ConcurrentClaim(_PoolCase):
         self.assertEqual(len(winners), 1, "flat finish-stall lost-update: %r" % winners)
         self.assertIn(final, winners)
 
+    def test_flat_finish_stall_state_reset_mutual_exclusion(self):
+        """PR #502 review (advisory): the flat backend's `set_finish_stall_state` reads the anchor
+        before rewriting it — unguarded, a concurrent `reset_finish_stall` landing in that window has
+        its epoch change silently clobbered by the stale-read rewrite. `_finish_stall_lock` serializes
+        the two; prove it directly by having many threads race BOTH ops on one slug and asserting no
+        two critical sections ever overlap (the load-bearing guarantee, independent of interleaving
+        order)."""
+        os.environ["STORE_BACKEND"] = "flat"
+        st = S.open_store(self.pool)
+        st.mark_finish_stall_seen("HERD-LOCK-SLUG", 1000)
+        n = 16
+        barrier = threading.Barrier(n)
+        inside = {"n": 0, "max": 0}
+        lock = threading.Lock()
+        violated = threading.Event()
+
+        real_lock = st._b._finish_stall_lock
+        real_unlock = st._b._finish_stall_unlock
+
+        def counted_lock(slug, timeout=2.0):
+            got = real_lock(slug, timeout)
+            with lock:
+                inside["n"] += 1
+                inside["max"] = max(inside["max"], inside["n"])
+                if inside["n"] > 1:
+                    violated.set()
+            return got
+
+        def counted_unlock(path):
+            with lock:
+                inside["n"] -= 1
+            real_unlock(path)
+
+        st._b._finish_stall_lock = counted_lock
+        st._b._finish_stall_unlock = counted_unlock
+
+        errors = []
+
+        def worker(i):
+            barrier.wait()
+            try:
+                if i % 2 == 0:
+                    st.reset_finish_stall("HERD-LOCK-SLUG", 2000 + i, "retasked")
+                else:
+                    st.set_finish_stall_state("HERD-LOCK-SLUG", "escalated")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], "worker thread(s) raised: %r" % errors)
+        self.assertFalse(violated.is_set(), "two finish-stall critical sections overlapped")
+        self.assertEqual(inside["max"], 1, "lock allowed concurrent entry: max=%d" % inside["max"])
+        # the record must always be a well-formed, non-corrupted (epoch, state) pair afterward
+        rec = st.finish_stall_record("HERD-LOCK-SLUG")
+        self.assertIsNotNone(rec)
+        self.assertIsInstance(rec[0], int)
+        self.assertIn(rec[1], ("retasked", "escalated"))
+
 
 class BackendResolution(_PoolCase):
     def test_default_is_flat(self):

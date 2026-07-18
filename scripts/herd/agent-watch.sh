@@ -11019,6 +11019,28 @@ _finish_stall_clear() {
     python3 -m herd.store --finish-stall-clear "$1" >/dev/null 2>&1 || true
 }
 
+# _finish_stall_note_escape <slug> — called from a tick branch where the STALL SIGNATURE itself does
+# not apply this tick (the agent is working, or it is limit-parked) — NOT a call site that already
+# knows the slug truly escaped (a PR opened; that path clears unconditionally via _finish_stall_clear
+# directly, e.g. the DEAD branch). PRESERVES a 'retasked'/'escalated' record — it must survive the very
+# working period the re-task nudge ITSELF causes (and any limit-park mid-task), or the classifier can
+# never reach SECOND_STALL: a delivered nudge would be silently wiped the moment the agent starts
+# working, and the very next stall would re-fire ANOTHER nudge forever instead of escalating (PR #502
+# review — the "at most ONE re-task, then terminal escalation" rail is the whole point of this leg).
+# An un-actioned 'pending' anchor (or no record at all) IS cleared, so a builder that goes back to
+# work on its own (no re-task fired) — or resumes from an account-usage-limit park — serves a FRESH
+# grace window rather than inheriting a stale, already-aging anchor.
+_finish_stall_note_escape() {
+  _finish_stall_enabled || return 0
+  local _ne_rec _ne_state="" _ne_anchor=""
+  _ne_rec="$(_finish_stall_record "$1")"
+  [ -n "$_ne_rec" ] && IFS=$'\t' read -r _ne_anchor _ne_state <<< "$_ne_rec"
+  case "$_ne_state" in
+    retasked|escalated) : ;;
+    *) _finish_stall_clear "$1" ;;
+  esac
+}
+
 # _finish_stall_wake_prompt <slug> — the finish-line nudge: explicit steps, not just "you stopped".
 _finish_stall_wake_prompt() {
   printf 'Your worktree for %s has unfinished work (uncommitted changes or unpushed commits) and no open PR, and your agent has stopped.\nValidate your work, run the healthcheck, then commit it (include the Refs line from your task spec), push, and open a NON-DRAFT PR with `gh pr create` (no --draft).\nDo not merge the PR and do not edit BACKLOG.md.' "$1"
@@ -13016,6 +13038,12 @@ EOF
         # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
         if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
+          # HERD-392 review fix: a limit-parked builder never reaches _reconcile_finish_stall (this
+          # branch owns the tick instead), so an un-actioned anchor would otherwise keep aging through
+          # the ENTIRE park and read as already-past-grace the instant it resumes. Preserve a
+          # 'retasked'/'escalated' record (the re-task itself may be what put it mid-task when the
+          # limit hit); clear a merely-'pending' one so resuming serves a fresh grace window.
+          _finish_stall_note_escape "$slug"
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
         else
           # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
@@ -13049,7 +13077,10 @@ EOF
                   [ -n "$_fsrec" ] && IFS=$'\t' read -r _fsfirst _fsstate <<< "$_fsrec"
                   _fsretasked=""; [ "$_fsstate" = "retasked" ] && _fsretasked="retasked"
                   DISPLAY[i]="$(_row_finish_stall "$sl" "$(_fmt_age "$(( $(_now) - ${_fsfirst:-$(_now)} ))")" "$_fsretasked")"
-                  FLAIR_STATE[i]="attention" ;;
+                  # A delivered re-task is calm/in-progress (🩺 'busy', matching the resolving/limit-
+                  # resume glyph family), never the LOUD ⚠️ 'attention' glyph the row text itself is
+                  # careful NOT to be (PR #502 review) — only the needs-you variants earn 'attention'.
+                  if [ -n "$_fsretasked" ]; then FLAIR_STATE[i]="busy"; else FLAIR_STATE[i]="attention"; fi ;;
                 *)
                   # Two very different builders land here. HERD-278: one whose agent reads 'done' over
                   # a branch with no PR and nothing pushable is a WEDGE — it was tasked and abandoned
@@ -13083,10 +13114,14 @@ EOF
         # record so a builder that was woken (by the auto-wake, or by a human) and later stops again
         # must serve the FULL grace window before it re-surfaces. No-ops when absent.
         clear_wedge "$slug"
-        # Same for the finish-line watchdog (HERD-392): a working agent is definitively not stalled.
-        # Gated on the leg being enabled — else this is a python3 shellout on EVERY working builder
-        # EVERY tick, which is not byte-identical-when-off even though it would always no-op downstream.
-        _finish_stall_enabled && _finish_stall_clear "$slug"
+        # Same for the finish-line watchdog (HERD-392): the signature (done/idle) does not hold while
+        # working. BUT unlike wedge, a 'retasked'/'escalated' record must SURVIVE this branch — a
+        # delivered re-task nudge is exactly what puts the agent into "working" on the very next tick,
+        # so an unconditional clear here would wipe the record the instant the nudge succeeds and make
+        # SECOND_STALL/escalation unreachable (PR #502 review). _finish_stall_note_escape clears only
+        # an un-actioned 'pending' anchor (or nothing); it self-gates on the leg being enabled, so this
+        # stays a hard no-op (no shellout) when FINISH_STALL_MIN is unset.
+        _finish_stall_note_escape "$slug"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or

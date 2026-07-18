@@ -608,13 +608,55 @@ class _FlatBackend:
             except Exception:
                 pass
 
-    def set_finish_stall_state(self, slug, state):
-        rec = self.finish_stall_record(slug)
-        if rec is None:
+    def _finish_stall_lock(self, slug, timeout=2.0):
+        """Best-effort mutual exclusion for the finish-stall record's read-modify-write ops
+        (set-state reads the anchor before rewriting it; unguarded, a concurrent `reset_finish_stall`
+        landing in that window has its epoch change silently clobbered by the stale-read rewrite —
+        PR #502 review). A sibling lockfile via O_CREAT|O_EXCL, bounded retry: on timeout proceeds
+        UNLOCKED rather than hanging (fail-soft — the flat backend is the ship-dormant default, not a
+        hardened multi-writer store; STORE_BACKEND=sqlite's single atomic UPDATE has no such window).
+        Returns the lock path to pass to `_finish_stall_unlock`, or None if never acquired."""
+        lock_path = self._finish_stall_file(slug) + ".lock"
+        _ensure_parent(lock_path)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+                return lock_path
+            except FileExistsError:
+                if time.time() >= deadline:
+                    return None
+                time.sleep(0.01)
+            except Exception:
+                return None
+
+    def _finish_stall_unlock(self, lock_path):
+        if not lock_path:
             return
-        self.reset_finish_stall(slug, rec[0], state)
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+
+    def set_finish_stall_state(self, slug, state):
+        lock = self._finish_stall_lock(slug)
+        try:
+            rec = self.finish_stall_record(slug)
+            if rec is None:
+                return
+            self._reset_finish_stall_unlocked(slug, rec[0], state)
+        finally:
+            self._finish_stall_unlock(lock)
 
     def reset_finish_stall(self, slug, epoch, state):
+        lock = self._finish_stall_lock(slug)
+        try:
+            self._reset_finish_stall_unlocked(slug, epoch, state)
+        finally:
+            self._finish_stall_unlock(lock)
+
+    def _reset_finish_stall_unlocked(self, slug, epoch, state):
         path = self._finish_stall_file(slug)
         if not path:
             return
