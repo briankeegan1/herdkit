@@ -145,4 +145,28 @@ pass
 run report --dep "orphan dep" >/dev/null 2>&1 && fail "report --dep without --to should fail loudly"
 pass
 
+# ── 10. Anchored-ref-match (HERD-389): with provider-lib#4 AND provider-lib#42 both recorded,
+# rm/demote of #4 must address EXACTLY that row and leave #42 untouched — a substring/prefix ref
+# test (the pre-fix bug) would also strip or reclassify #42 when closing #4.
+rm -f "$DEPS"; : > "$GHLOG"; echo '[]' > "$T/open.json"
+run depend provider-lib#4  >/dev/null 2>&1 || fail "depend provider-lib#4 exited non-zero"
+run depend provider-lib#42 >/dev/null 2>&1 || fail "depend provider-lib#42 exited non-zero"
+grep -q '^blocked-on: provider-lib#4  ' "$DEPS"  || fail "expected a blocked-on row for #4 — ($(cat "$DEPS"))"
+grep -q '^blocked-on: provider-lib#42' "$DEPS"   || fail "expected a blocked-on row for #42 — ($(cat "$DEPS"))"
+
+out="$(run deps rm provider-lib#4 2>&1)" || fail "deps rm provider-lib#4 exited non-zero: $out"
+grep -q '^blocked-on: provider-lib#4  ' "$DEPS" \
+  && fail "deps rm of #4 left the #4 row in place — ($(cat "$DEPS"))" || true
+grep -q '^blocked-on: provider-lib#42' "$DEPS" \
+  || fail "deps rm of #4 also stripped #42 — anchored-ref-match regression ($(cat "$DEPS"))"
+watcher_accepts "$DEPS" "provider-lib#42" || fail "dep-watcher.sh's parser no longer accepts #42 after rm of #4"
+pass
+
+run depend provider-lib#4 >/dev/null 2>&1 || fail "re-depend provider-lib#4 exited non-zero"
+out="$(run deps demote provider-lib#4 2>&1)" || fail "deps demote provider-lib#4 exited non-zero: $out"
+grep -q '^watch: provider-lib#4  '        "$DEPS" || fail "demote of #4 did not write its watch row — ($(cat "$DEPS"))"
+grep -q '^blocked-on: provider-lib#42'    "$DEPS" \
+  || fail "demote of #4 also reclassified #42 — anchored-ref-match regression ($(cat "$DEPS"))"
+pass
+
 echo "ALL PASS ($PASS checks)"
