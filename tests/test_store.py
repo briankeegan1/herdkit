@@ -284,6 +284,86 @@ class ConcurrentClaim(_PoolCase):
         self.assertEqual(len(winners), 1, "flat finish-stall lost-update: %r" % winners)
         self.assertIn(final, winners)
 
+    def _race_main_health_fix(self, backend, n=40):
+        """HERD-393: many seats racing the FIRST filing of the SAME failing-test identity must
+        converge on EXACTLY ONE winner — a second true winner would double-file the tracker item
+        (the HERD-362/HERD-365 bug HERD-371's marker exists to prevent)."""
+        os.environ["STORE_BACKEND"] = backend
+        results = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(n)
+
+        def worker(i):
+            st = S.open_store(self.pool)
+            barrier.wait()
+            r = st.mark_main_health_fix("HERD-RACE-IDENTITY", "pr%d" % i, "sha%d" % i)
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def test_sqlite_main_health_fix_single_winner(self):
+        results = self._race_main_health_fix("sqlite")
+        self.assertEqual(results.count(True), 1, "sqlite main-health-fix lost-update: %r" % results)
+
+    def test_flat_main_health_fix_single_winner(self):
+        results = self._race_main_health_fix("flat")
+        self.assertEqual(results.count(True), 1, "flat main-health-fix lost-update: %r" % results)
+
+    def test_flat_main_health_fix_no_empty_window(self):
+        """HERD-393: pre-fix, `mark_main_health_fix` created the marker via a bare O_CREAT|O_EXCL
+        and then wrote its payload in a SEPARATE step — the exact shape HERD-333 fixed in `claim()`
+        — so the marker file existed but was EMPTY for a real window between create and write. A
+        rival seat polling the shared-pool marker in that window would see it exist yet read no
+        content (and via an `or`-style fallback could self-report as winner too). Race 40 create
+        rounds against a pool of readers hammering the file directly: pre-fix this reliably observes
+        an empty read under load; the write-temp-then-os.link pattern (mirroring `claim()` /
+        `mark_finish_stall_seen()`) closes the window so the marker is only ever linked into place
+        once fully written — a reader can never observe it empty."""
+        os.environ["STORE_BACKEND"] = "flat"
+        st = S.open_store(self.pool)
+        identity = "HERD-RACE-EMPTY-WINDOW"
+        path = st._b._main_health_fix_file(identity)
+        stop = threading.Event()
+        empty_seen = []
+        empty_lock = threading.Lock()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    if data == b"":
+                        with empty_lock:
+                            empty_seen.append(True)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
+        readers = [threading.Thread(target=reader) for _ in range(16)]
+        for t in readers:
+            t.start()
+        try:
+            for i in range(40):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                st.mark_main_health_fix(identity, "pr%d" % i, "sha%d" % i)
+        finally:
+            stop.set()
+            for t in readers:
+                t.join()
+        self.assertEqual(empty_seen, [],
+                          "a reader observed the main-health-fix marker EMPTY mid-write (%d times)"
+                          % len(empty_seen))
+
     def test_flat_finish_stall_state_reset_mutual_exclusion(self):
         """PR #502 review (advisory): the flat backend's `set_finish_stall_state` reads the anchor
         before rewriting it — unguarded, a concurrent `reset_finish_stall` landing in that window has
