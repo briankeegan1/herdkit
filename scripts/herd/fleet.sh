@@ -132,18 +132,24 @@ _fleet_repo_slug() {
 # REPLACES the row's alias set with exactly what was given (drop all with `--alias ''` — an empty
 # value sanitizes to nothing and is skipped, so this is really "no aliases").
 fleet_register() {
-  local raw="" aliases=()
+  local raw="" aliases=() no_more_opts=""
   while [ "$#" -gt 0 ]; do
+    if [ -n "$no_more_opts" ]; then
+      [ -z "$raw" ] || die "usage: herd fleet register <project-path> [--alias <name>]..."
+      raw="$1"; shift; continue
+    fi
     case "$1" in
+      --)
+        no_more_opts=1; shift ;;   # end-of-options: a path starting with '-' is still registerable
       --alias)
         [ -n "${2+set}" ] || die "--alias requires a value"
         aliases+=("$2"); shift 2 ;;
       --alias=*)
         aliases+=("${1#--alias=}"); shift ;;
       -h|--help)
-        say "usage: herd fleet register <project-path> [--alias <name>]..."
+        say "usage: herd fleet register <project-path> [--alias <name>]...   (use '--' before a path starting with '-')"
         return 0 ;;
-      -*) die "unknown option: $1 (try: herd fleet register --help)" ;;
+      -*) die "unknown option: $1 (try: herd fleet register --help; use '--' before a path starting with '-')" ;;
       *)
         [ -z "$raw" ] || die "usage: herd fleet register <project-path> [--alias <name>]..."
         raw="$1"; shift ;;
@@ -151,7 +157,10 @@ fleet_register() {
   done
   [ -n "$raw" ] || die "usage: herd fleet register <project-path> [--alias <name>]..."
   local path
-  path="$(cd "$raw" 2>/dev/null && pwd -P)" || die "no such directory: $raw"
+  # `cd --` (not a bare `cd`): bash's cd builtin treats ANY leading-'-' argument as an option itself
+  # (not just the exact `-`), so a genuinely dash-leading relative path would fail to resolve here
+  # even after the argv parser above got past it via its own `--` terminator.
+  path="$(cd -- "$raw" 2>/dev/null && pwd -P)" || die "no such directory: $raw"
   [ -f "$path/.herd/config" ] || die "not a herd project (no .herd/config): $path"
 
   local row; row="$(_fleet_read_config "$path")" || die "could not read $path/.herd/config"
@@ -177,7 +186,15 @@ fleet_register() {
       seen_a="$seen_a,$a_clean"
       out_a+=("$a_clean")
     done
-    local IFS=','; new_alias_csv="${out_a[*]}"; unset IFS
+    # Guard the join on a non-empty out_a: under bash 3.2 (stock macOS `/usr/bin/bash`, what `env
+    # bash` resolves to there) `"${out_a[*]}"` on a DECLARED-BUT-EMPTY array is an unbound-variable
+    # error under `set -u` — the documented "--alias '' drops all aliases" path (every supplied
+    # alias sanitizes to nothing, e.g. `--alias ''` / `--alias '  '` / `--alias ','`) hit exactly
+    # this and aborted the function before the registry was ever rewritten (bash 4.4+ fixed this
+    # array quirk, but bin/herd must not assume a modern bash).
+    if [ "${#out_a[@]}" -gt 0 ]; then
+      local IFS=','; new_alias_csv="${out_a[*]}"; unset IFS
+    fi
   fi
 
   local reg; reg="$(_fleet_registry_file)"
@@ -284,6 +301,14 @@ if not rows:
     sys.stderr.write("no fleet registry yet — add a project with: herd fleet register <path>\n")
     sys.exit(1)
 
+# An empty/whitespace-only query is NO INFORMATION, not a valid target: every name/alias trivially
+# "starts with" "" (str.startswith("") is always True), so the prefix tier would otherwise resolve
+# it with total confidence whenever exactly one project happens to be registered — a false-confident
+# answer for a caller that trusts exit 0 as a proven resolution. Refuse explicitly instead.
+if not qlow:
+    sys.stderr.write("usage: herd fleet resolve <free text>   (empty query cannot resolve anything)\n")
+    sys.exit(1)
+
 def label(name, path):
     return "%s (%s)" % (name, path) if path else name
 
@@ -330,6 +355,8 @@ sys.exit(1)
 # does not have to fight shell quoting for a natural phrase like `herd fleet resolve the alpha one`.
 fleet_resolve() {
   case "${1:-}" in
+    --)
+      shift ;;   # explicit end-of-options: everything after is literal query text (even -h/a leading '-')
     -h|--help)
       cat <<EOF
 usage: herd fleet resolve <free text>
@@ -343,6 +370,8 @@ usage: herd fleet resolve <free text>
   name, exit 0). More than one hit at that tier is ambiguous (candidates listed, exit 2). No hit at
   any tier exits 1. Intended as the deterministic FIRST call for the 'fleet room' NL
   master-coordinator before it falls back to its own judgment.
+  Use 'herd fleet resolve -- <text>' to resolve a query that itself starts with '-' (e.g. a project
+  literally named '-h').
 EOF
       return 0 ;;
   esac

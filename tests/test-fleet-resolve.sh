@@ -65,6 +65,25 @@ grep -qE '^alpha\|.*\|only-this$' "$REG1" \
 if grep -q "alpha-svc" "$REG1"; then fail "old aliases should be gone after a replacing --alias register"; fi
 ok
 
+# ── 3b. --alias '' (every supplied alias sanitizes to nothing) DROPS all aliases, not a crash ──
+# Regression for the bash-3.2 unbound-variable bug: an empty out_a[] array must never be referenced
+# via "${out_a[*]}" without a non-empty guard (bash < 4.4 treats that as unbound under `set -u`).
+for dropper in '' '   ' ','; do
+  HERD_FLEET_FILE="$REG1" bash "$HERD" fleet register "$ALPHA" --alias "$dropper" >/dev/null \
+    || fail "register --alias '$dropper' (sanitizes to nothing) must exit 0, not crash"
+  alpha_row="$(grep '^alpha|' "$REG1")"
+  alpha_nf="$(awk -F'|' '{print NF}' <<< "$alpha_row")"
+  [ "$alpha_nf" -eq 3 ] \
+    || fail "register --alias '$dropper' should drop to a 3-field (no-aliases) row, got: $alpha_row"
+done
+# The dropped alias must no longer resolve.
+set +e
+HERD_FLEET_FILE="$REG1" bash "$HERD" fleet resolve only-this >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "an alias dropped via --alias '' must stop resolving"
+ok
+
 # ── 4. precedence fixture registry (hand-authored so exact/alias/prefix ties are reachable) ──
 REG2="$T/reg2/fleet"
 mkdir -p "$(dirname "$REG2")"
@@ -164,6 +183,46 @@ ok
 
 out="$(HERD_FLEET_FILE="$REG2" bash "$HERD" fleet resolve --help)"
 printf '%s' "$out" | grep -qi "precedence\|exact" || fail "--help should describe the precedence"
+ok
+
+# ── 6. an empty/whitespace-only query refuses instead of confidently matching everything ──────
+# With only ONE project registered, an empty query would otherwise satisfy every name's/alias's
+# str.startswith("") at the prefix tier and resolve with false confidence.
+REG3="$T/reg3/fleet"
+SOLO="$(_make_project solo-project)"
+HERD_FLEET_FILE="$REG3" bash "$HERD" fleet register "$SOLO" >/dev/null
+set +e
+out="$(HERD_FLEET_FILE="$REG3" bash "$HERD" fleet resolve '   ' 2>&1)"; rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "a whitespace-only query must refuse, not confidently resolve the lone project"
+ok
+
+# ── 7. '--' terminator: a RELATIVE path/query that itself starts with '-' still works ──────────
+# register's argv parser treats a leading '-' as an option and dies on it (`-*) die "unknown
+# option"`) unless it is an ABSOLUTE path (which never starts with '-'). Exercise the actual failure
+# shape with a genuinely dash-leading RELATIVE arg, from the parent dir, resolved via '--'.
+DASHY="$(_make_project -dashy-name)"
+( cd "$(dirname "$DASHY")" \
+  && HERD_FLEET_FILE="$REG3" bash "$HERD" fleet register -- "-dashy-name" >/dev/null ) \
+  || fail "register -- <relative path starting with '-'> should still register the project"
+grep -q '^-dashy-name|' "$REG3" || fail "the dashy project should be registered under its real name"
+set +e
+( cd "$(dirname "$DASHY")" \
+  && HERD_FLEET_FILE="$REG3" bash "$HERD" fleet register "-dashy-name" >/dev/null 2>&1 )
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "sanity: WITHOUT '--' a leading-dash relative path should still be rejected as an unknown option"
+
+# resolve's case-statement special-cases the LITERAL strings '-h'/'--help'; a project genuinely
+# named '-h' is only reachable past the '--' terminator.
+HELPNAME="$(_make_project -h)"
+HERD_FLEET_FILE="$REG3" bash "$HERD" fleet register "$HELPNAME" >/dev/null   # path is absolute, no '--' needed here
+out="$(HERD_FLEET_FILE="$REG3" bash "$HERD" fleet resolve -h)"
+printf '%s' "$out" | grep -qi "usage: herd fleet resolve" \
+  || fail "sanity: WITHOUT '--', the query '-h' should print help, not resolve the '-h' project"
+out="$(HERD_FLEET_FILE="$REG3" bash "$HERD" fleet resolve -- -h)"; rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "-h" ] \
+  || fail "resolve -- -h should resolve the literal '-h' project past the terminator, got: $out (rc=$rc)"
 ok
 
 echo "ALL PASS ($pass checks)"
