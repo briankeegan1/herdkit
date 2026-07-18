@@ -43,6 +43,13 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
     python3 -m herd.store --main-health-fix-mark ID [--pr P] [--sha S] [--pool DIR]  # HERD-371 dedup
         # claim: rc 0 = won (file it), rc 3 = already marked (dedup), rc 2 = no pool
     python3 -m herd.store --main-health-fix-clear ID [--pool DIR]                    # drop the marker
+    python3 -m herd.store --finish-stall-record SLUG [--pool DIR]                    # HERD-392 clock
+        # prints "<epoch>\t<state>" (rc 0) or nothing (rc 1) if never seen
+    python3 -m herd.store --finish-stall-mark SLUG --epoch E [--pool DIR]   # get-or-create the anchor
+        # prints the WINNING "<epoch>\t<state>" (ours, or another seat's earlier record)
+    python3 -m herd.store --finish-stall-state SLUG --state S [--pool DIR] # flip state, keep the anchor
+    python3 -m herd.store --finish-stall-reset SLUG --epoch E --state S [--pool DIR]  # overwrite both
+    python3 -m herd.store --finish-stall-clear SLUG [--pool DIR]                     # drop the record
 """
 
 import os
@@ -217,6 +224,36 @@ class Store:
     def clear_main_health_fix(self, identity):
         """Drop the marker once main is GREEN for this identity, so a LATER regression files fresh."""
         return self._b.clear_main_health_fix(identity)
+
+    # finish-stall clock ── HERD-392: the shared-pool anchor + state for the finish-line watchdog, so
+    # multiple seats ticking the SAME PR-less worktree converge on ONE first-seen anchor instead of
+    # each free-running its own local grace timer (the doctrine: "the stall clock derives from
+    # observed transitions, not seat memory").
+    def finish_stall_record(self, slug):
+        """The current ``(epoch, state)`` for ``slug``, or ``None`` if never seen (or already
+        cleared)."""
+        return self._b.finish_stall_record(slug)
+
+    def mark_finish_stall_seen(self, slug, epoch):
+        """Get-or-create: record ``epoch`` as the anchor (state ``pending``) iff no record exists yet.
+        Returns the WINNING ``(epoch, state)`` — ours if we are first, another seat's earlier record
+        otherwise — so every seat that ticks this slug converges on the same clock."""
+        return self._b.mark_finish_stall_seen(slug, epoch)
+
+    def set_finish_stall_state(self, slug, state):
+        """Flip the record's state word, PRESERVING its anchor epoch. No-op if no record exists."""
+        return self._b.set_finish_stall_state(slug, state)
+
+    def reset_finish_stall(self, slug, epoch, state):
+        """Unconditionally overwrite BOTH fields. Used once, by the seat whose re-task nudge just woke
+        the agent, to start the SECOND-STALL clock from the observed wake transition rather than the
+        original sighting."""
+        return self._b.reset_finish_stall(slug, epoch, state)
+
+    def clear_finish_stall(self, slug):
+        """Drop the record: the slug escaped (a PR opened, the agent is working, or the git/pane
+        signature cleared)."""
+        return self._b.clear_finish_stall(slug)
 
 
 # ── flat backend: the current substrate, verbatim ─────────────────────────────────────────────────
@@ -521,6 +558,87 @@ class _FlatBackend:
         except Exception:
             pass
 
+    # finish-stall clock ─────────────────────────────────────────────────────────────────────────────
+    def _finish_stall_file(self, slug):
+        return self._p(".agent-watch-finish-stall-%s" % _safe(slug))
+
+    def finish_stall_record(self, slug):
+        path = self._finish_stall_file(slug)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                f = (fh.readline() or "").rstrip("\n").split("\t")
+        except Exception:
+            return None
+        if len(f) < 2 or not f[0].isdigit():
+            return None
+        return (int(f[0]), f[1])
+
+    def mark_finish_stall_seen(self, slug, epoch):
+        path = self._finish_stall_file(slug)
+        if not path:
+            return (int(epoch), "pending")
+        _ensure_parent(path)
+        # Atomic get-or-create with NO empty window (mirrors `claim()`, HERD-333): materialize a
+        # COMPLETE temp file first, then hard-link it into place. A plain O_CREAT|O_EXCL create is
+        # atomic for "who makes the file" but leaves it EMPTY until the winner's separate os.write
+        # lands — a rival that hits EEXIST in that window would read an empty/partial record and
+        # (via the `or` fallback) falsely report ITSELF the anchor, exactly the multi-winner
+        # lost-update this accessor's whole reason for existing is to prevent.
+        tmp = "%s.tmp-%d-%d" % (path, os.getpid(), _thread_id())
+        try:
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except Exception:
+            return self.finish_stall_record(slug) or (int(epoch), "pending")
+        try:
+            os.write(fd, ("%d\tpending\n" % int(epoch)).encode("utf-8"))
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)                                   # atomic publish
+            return (int(epoch), "pending")                       # we won
+        except FileExistsError:
+            return self.finish_stall_record(slug) or (int(epoch), "pending")  # rival won; fully written
+        except Exception:
+            return (int(epoch), "pending")
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    def set_finish_stall_state(self, slug, state):
+        rec = self.finish_stall_record(slug)
+        if rec is None:
+            return
+        self.reset_finish_stall(slug, rec[0], state)
+
+    def reset_finish_stall(self, slug, epoch, state):
+        path = self._finish_stall_file(slug)
+        if not path:
+            return
+        _ensure_parent(path)
+        tmp = "%s.tmp.%d.%d" % (path, os.getpid(), _thread_id())
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("%d\t%s\n" % (int(epoch), state))
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    def clear_finish_stall(self, slug):
+        path = self._finish_stall_file(slug)
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
 
 # ── sqlite backend: the same accessors, transactional under WAL ───────────────────────────────────
 
@@ -537,6 +655,7 @@ CREATE TABLE IF NOT EXISTS once_guards  (key TEXT PRIMARY KEY, epoch INTEGER);
 CREATE TABLE IF NOT EXISTS seat_registry(epoch INTEGER, id TEXT, level INTEGER, state TEXT);
 CREATE INDEX IF NOT EXISTS seat_id ON seat_registry(id);
 CREATE TABLE IF NOT EXISTS main_health_fix(identity TEXT PRIMARY KEY, epoch INTEGER, pr TEXT, sha TEXT);
+CREATE TABLE IF NOT EXISTS finish_stall(slug TEXT PRIMARY KEY, epoch INTEGER, state TEXT);
 CREATE TABLE IF NOT EXISTS state_blob  (path TEXT PRIMARY KEY, content BLOB, mode INTEGER);
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -758,6 +877,51 @@ class _SqliteBackend:
         except Exception:
             pass
 
+    # finish-stall clock ─────────────────────────────────────────────────────────────────────────────
+    def finish_stall_record(self, slug):
+        row = self._conn.execute("SELECT epoch, state FROM finish_stall WHERE slug=?",
+                                 (str(slug),)).fetchone()
+        return (int(row[0]), row[1]) if row else None
+
+    def mark_finish_stall_seen(self, slug, epoch):
+        def body(conn):
+            conn.execute("INSERT OR IGNORE INTO finish_stall(slug, epoch, state) VALUES (?,?,?)",
+                        (str(slug), int(epoch), "pending"))
+            row = conn.execute("SELECT epoch, state FROM finish_stall WHERE slug=?",
+                               (str(slug),)).fetchone()
+            return (int(row[0]), row[1]) if row else (int(epoch), "pending")
+        try:
+            return self._rmw(body)
+        except Exception:
+            return self.finish_stall_record(slug) or (int(epoch), "pending")
+
+    def set_finish_stall_state(self, slug, state):
+        def body(conn):
+            conn.execute("UPDATE finish_stall SET state=? WHERE slug=?", (state, str(slug)))
+        try:
+            self._rmw(body)
+        except Exception:
+            pass
+
+    def reset_finish_stall(self, slug, epoch, state):
+        def body(conn):
+            conn.execute(
+                "INSERT INTO finish_stall(slug, epoch, state) VALUES (?,?,?) "
+                "ON CONFLICT(slug) DO UPDATE SET epoch=excluded.epoch, state=excluded.state",
+                (str(slug), int(epoch), state))
+        try:
+            self._rmw(body)
+        except Exception:
+            pass
+
+    def clear_finish_stall(self, slug):
+        def body(conn):
+            conn.execute("DELETE FROM finish_stall WHERE slug=?", (str(slug),))
+        try:
+            self._rmw(body)
+        except Exception:
+            pass
+
     # ── migration substrate (state_blob + meta): NOT part of the accessor surface ─────────────────
     def put_blob(self, path, content, mode):
         self._conn.execute(
@@ -780,7 +944,7 @@ class _SqliteBackend:
     def counts(self):
         out = {}
         for t in ("approvals", "review_ledger", "health_results", "claims", "refix_rounds",
-                  "once_guards", "seat_registry", "main_health_fix", "state_blob"):
+                  "once_guards", "seat_registry", "main_health_fix", "finish_stall", "state_blob"):
             try:
                 out[t] = self._conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
             except Exception:
@@ -1120,13 +1284,17 @@ def main(argv=None):
     identity = None
     pr = ""
     sha = ""
+    epoch = ""
+    state = ""
+    _FINISH_STALL_ACTIONS = ("--finish-stall-record", "--finish-stall-mark",
+                             "--finish-stall-state", "--finish-stall-reset", "--finish-stall-clear")
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--migrate", "--rollback", "--status", "--verify",
-                  "--main-health-fix-mark", "--main-health-fix-clear"):
+        if a in (("--migrate", "--rollback", "--status", "--verify",
+                  "--main-health-fix-mark", "--main-health-fix-clear") + _FINISH_STALL_ACTIONS):
             action = a
-            if a in ("--main-health-fix-mark", "--main-health-fix-clear"):
+            if a in ("--main-health-fix-mark", "--main-health-fix-clear") + _FINISH_STALL_ACTIONS:
                 i += 1
                 identity = argv[i] if i < len(argv) else None
         elif a == "--pool":
@@ -1138,6 +1306,12 @@ def main(argv=None):
         elif a == "--sha":
             i += 1
             sha = argv[i] if i < len(argv) else ""
+        elif a == "--epoch":
+            i += 1
+            epoch = argv[i] if i < len(argv) else ""
+        elif a == "--state":
+            i += 1
+            state = argv[i] if i < len(argv) else ""
         elif a in ("--do-verify", "--check"):
             do_verify = True
         elif a in ("-h", "--help"):
@@ -1160,6 +1334,38 @@ def main(argv=None):
     if action == "--main-health-fix-clear":
         if identity:
             open_store(pool).clear_main_health_fix(identity)
+        return 0
+    if action == "--finish-stall-record":
+        if not identity:
+            sys.stderr.write("herd store: --finish-stall-record requires a slug\n")
+            return 2
+        rec = open_store(pool).finish_stall_record(identity)
+        if rec is None:
+            return 1
+        sys.stdout.write("%s\t%s\n" % rec)
+        return 0
+    if action == "--finish-stall-mark":
+        if not identity:
+            sys.stderr.write("herd store: --finish-stall-mark requires a slug\n")
+            return 2
+        rec = open_store(pool).mark_finish_stall_seen(identity, _int(epoch) or _now())
+        sys.stdout.write("%s\t%s\n" % rec)
+        return 0
+    if action == "--finish-stall-state":
+        if not identity or not state:
+            sys.stderr.write("herd store: --finish-stall-state requires a slug and --state\n")
+            return 2
+        open_store(pool).set_finish_stall_state(identity, state)
+        return 0
+    if action == "--finish-stall-reset":
+        if not identity or not state:
+            sys.stderr.write("herd store: --finish-stall-reset requires a slug, --epoch and --state\n")
+            return 2
+        open_store(pool).reset_finish_stall(identity, _int(epoch) or _now(), state)
+        return 0
+    if action == "--finish-stall-clear":
+        if identity:
+            open_store(pool).clear_finish_stall(identity)
         return 0
     if action == "--verify":
         if not pool or not os.path.isdir(pool):

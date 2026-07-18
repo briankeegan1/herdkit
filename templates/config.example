@@ -647,3 +647,18 @@ HERD_REPO="briankeegan1/herdkit"
 # back to 'working'; at most once per wedge, and only after the grace window. This is the remedy a
 # coordinator applied by hand 3/3 times. Off (default) is detect-and-surface only, byte-identical.
 # WEDGE_AUTOWAKE="off"   # off (default) | on
+
+# ── Finish-line watchdog: real work stalled with no PR (HERD-392) ──────────────────────────────
+# A builder whose agent went done/idle over a worktree that carries GENUINE unshipped work
+# (uncommitted tracked changes, or commits ahead of its OWN remote branch — unlike WEDGE_GRACE_MIN,
+# which measures "ahead of base" and deliberately exempts a clean, committed-ahead tree as "in
+# flight") with no open PR did not cross the finish line. Unlike wedge, this leg does not just detect
+# and surface — it re-tasks the builder once, because "push it yourself" is a one-line ask.
+#
+# FINISH_STALL_MIN — minutes the signature must persist, continuously, before the watcher acts.
+# SHIP-DORMANT, more strictly than WEDGE_GRACE_MIN: this ENTIRE leg (detection, re-task, escalation)
+# is a hard no-op — zero extra git probes, zero shared-pool shellouts, byte-identical console — until
+# this is set to a positive integer. On the first crossing the watcher sends ONE re-task nudge; on a
+# nudge that does not land, or a SECOND stall after a delivered nudge, it escalates to a needs-you row
+# and stops (terminal — never a runaway loop). Unset (default) leaves this feature entirely off.
+# FINISH_STALL_MIN="30"
