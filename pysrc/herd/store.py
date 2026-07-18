@@ -50,6 +50,8 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
     python3 -m herd.store --finish-stall-state SLUG --state S [--pool DIR] # flip state, keep the anchor
     python3 -m herd.store --finish-stall-reset SLUG --epoch E --state S [--pool DIR]  # overwrite both
     python3 -m herd.store --finish-stall-clear SLUG [--pool DIR]                     # drop the record
+    python3 -m herd.store --once KEY [--pool DIR]     # generic shared-pool once-guard
+        # rc 0 = won (fire the side effect), rc 3 = already claimed (dedup)
 """
 
 import os
@@ -1330,13 +1332,14 @@ def main(argv=None):
     state = ""
     _FINISH_STALL_ACTIONS = ("--finish-stall-record", "--finish-stall-mark",
                              "--finish-stall-state", "--finish-stall-reset", "--finish-stall-clear")
+    _IDENTITY_ACTIONS = ("--main-health-fix-mark", "--main-health-fix-clear", "--once") \
+        + _FINISH_STALL_ACTIONS
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in (("--migrate", "--rollback", "--status", "--verify",
-                  "--main-health-fix-mark", "--main-health-fix-clear") + _FINISH_STALL_ACTIONS):
+        if a in (("--migrate", "--rollback", "--status", "--verify") + _IDENTITY_ACTIONS):
             action = a
-            if a in ("--main-health-fix-mark", "--main-health-fix-clear") + _FINISH_STALL_ACTIONS:
+            if a in _IDENTITY_ACTIONS:
                 i += 1
                 identity = argv[i] if i < len(argv) else None
         elif a == "--pool":
@@ -1409,6 +1412,14 @@ def main(argv=None):
         if identity:
             open_store(pool).clear_finish_stall(identity)
         return 0
+    if action == "--once":
+        # Generic shared-pool once-guard (fires a side effect exactly once per key, across every
+        # seat). rc 0 = we won (the FIRST caller to see this key — proceed); rc 3 = already claimed
+        # (dedup — some other seat, or an earlier tick on this seat, already won it).
+        if not identity:
+            sys.stderr.write("herd store: --once requires a key\n")
+            return 2
+        return 0 if open_store(pool).once(identity) else 3
     if action == "--verify":
         if not pool or not os.path.isdir(pool):
             sys.stderr.write("herd store: no pool to verify\n")

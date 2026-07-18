@@ -58,9 +58,10 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in _finish_stall_min _finish_stall_enabled _finish_stall_grace_secs \
-          _finish_stall_commits_ahead _classify_finish_stall _finish_stall_record \
+          _finish_stall_commits_ahead _finish_stall_dirty _classify_finish_stall _finish_stall_record \
           _finish_stall_mark _finish_stall_state _finish_stall_reset _finish_stall_clear \
-          _finish_stall_retask _row_finish_stall _reconcile_finish_stall _finish_stall_note_escape; do
+          _finish_stall_retask _row_finish_stall _reconcile_finish_stall _finish_stall_note_escape \
+          _finish_stall_note_pr_opened _finish_stall_action_once; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -116,9 +117,10 @@ ok
   || fail "past grace + already escalated ⇒ stays ESCALATED"
 ok
 
-# a non-numeric age comparison never crashes (garbage state falls to FIRST_STALL, the safe default)
-[ "$(_classify_finish_stall done 0 1 0 junk "$PAST" "$NOW" "$GRACE")" = "FIRST_STALL" ] \
-  || fail "garbage state should read as a first crossing, not crash"
+# a corrupt/unrecognized state word fails toward INACTION (PR #502 review advisory #4): the ladder
+# must never re-fire a nudge it cannot prove is still unspent. Never crashes either.
+[ "$(_classify_finish_stall done 0 1 0 junk "$PAST" "$NOW" "$GRACE")" = "ESCALATED" ] \
+  || fail "garbage state should fail toward ESCALATED (inaction), never re-fire as a first crossing"
 ok
 
 # ── the real git probes ─────────────────────────────────────────────────────────────────────────
@@ -150,6 +152,25 @@ printf 'w2\n' > "$WT_PUSHED/w2.txt"; git -C "$WT_PUSHED" add -A; git -C "$WT_PUS
 ok
 
 [ "$(_finish_stall_commits_ahead "$T" nosuchbranch)" = "0" ] || fail "a non-repo path should read 0"
+ok
+
+# ── _finish_stall_dirty: TRACKED changes only (PR #502 review advisory #1) ────────────────────────
+# capabilities.tsv / config.example / this leg's own header all say "uncommitted TRACKED changes" —
+# a spare with one stray untracked scratch file must never count as "has real work".
+WT_CLEAN2="$T/wt-clean-dirty-probe"; mkgit "$WT_CLEAN2"
+[ "$(_finish_stall_dirty "$WT_CLEAN2")" = "0" ] || fail "a committed, untouched tree must read 0"
+
+printf 'scratch\n' > "$WT_CLEAN2/scratch.txt"   # untracked only
+[ "$(_finish_stall_dirty "$WT_CLEAN2")" = "0" ] \
+  || fail "an UNTRACKED-only file must read 0 (unlike _wedge_dirty, which counts it)"
+[ "$(_wedge_dirty "$WT_CLEAN2")" = "1" ] \
+  || fail "sanity: _wedge_dirty SHOULD count the untracked file (proves the two probes differ on purpose)"
+
+printf 'edit\n' >> "$WT_CLEAN2/base.txt"        # tracked, unstaged modification
+[ "$(_finish_stall_dirty "$WT_CLEAN2")" = "1" ] || fail "a tracked unstaged edit must read 1"
+
+git -C "$WT_CLEAN2" add base.txt                # tracked, staged
+[ "$(_finish_stall_dirty "$WT_CLEAN2")" = "1" ] || fail "a tracked staged edit must read 1"
 ok
 
 # ── the shared-pool clock, direct accessor exercise ────────────────────────────────────────────
@@ -206,6 +227,35 @@ _finish_stall_note_escape note-absent   # never seen — must not create anythin
 _finish_stall_clear note-off
 ok
 
+# ── _finish_stall_note_pr_opened (PR #502 review advisory #2) ──────────────────────────────────────
+# A PR existing is unconditionally a real escape — a FULL clear, even of 'retasked'/'escalated' —
+# unlike _finish_stall_note_escape. Without this, a slug reused by a later builder would inherit a
+# days-old anchor and render needs-you on tick one, skipping every rung.
+_finish_stall_reset pr-pending "$NOW" pending;   _finish_stall_note_pr_opened pr-pending
+_finish_stall_reset pr-retasked "$NOW" retasked; _finish_stall_note_pr_opened pr-retasked
+_finish_stall_reset pr-escalated "$NOW" escalated; _finish_stall_note_pr_opened pr-escalated
+[ -z "$(_finish_stall_record pr-pending)" ]   || fail "a PR must clear a pending record"
+[ -z "$(_finish_stall_record pr-retasked)" ]  || fail "a PR must clear a retasked record (unlike note-escape, PR is a REAL escape)"
+[ -z "$(_finish_stall_record pr-escalated)" ] || fail "a PR must clear an escalated record too"
+
+( unset FINISH_STALL_MIN
+  _finish_stall_reset pr-off "$NOW" escalated
+  _finish_stall_note_pr_opened pr-off
+)
+[ "$(_finish_stall_record pr-off)" = "$(printf '%s\tescalated' "$NOW")" ] \
+  || fail "note-pr-opened must be a hard no-op when the leg is off"
+_finish_stall_clear pr-off
+ok
+
+# ── _finish_stall_action_once (PR #502 review advisory #3) ─────────────────────────────────────────
+# Shared-pool "AT MOST ONCE" guard for the action itself (the anchor alone is not enough — two seats
+# can both classify the SAME (slug, anchor) as FIRST_STALL in the same window).
+_finish_stall_action_once once-slug "$NOW" || fail "the first call for a fresh (slug, anchor) must win"
+_finish_stall_action_once once-slug "$NOW" && fail "a second call for the SAME (slug, anchor) must lose"
+_finish_stall_action_once once-slug "$((NOW + 1))" \
+  || fail "a DIFFERENT anchor (a fresh stall incident) must get its own fresh guard"
+ok
+
 # ── console rows ─────────────────────────────────────────────────────────────────────────────────
 row="$(NO_COLOR=1 _row_finish_stall "slugcell" "12m")"
 case "$row" in *"needs-you"*"push + open the PR by hand"*) : ;; *) fail "the needs-you row must name the remedy, got: $row" ;; esac
@@ -230,7 +280,9 @@ herd_driver_send_text()     { printf '%s\n' "$2" >> "$SENT"; }
 _wait_agent_working()       { [ "$WAKE_OK" = "1" ]; }
 
 DIRTY_WT="$T/wt-dirty-e2e"; mkgit "$DIRTY_WT"
-printf 'wip\n' > "$DIRTY_WT/wip.txt"   # uncommitted tracked-worthy change (untracked counts as dirty)
+printf 'wip\n' > "$DIRTY_WT/wip.txt"; git -C "$DIRTY_WT" add wip.txt   # TRACKED (staged) uncommitted
+                                                                        # change — _finish_stall_dirty
+                                                                        # only counts tracked changes
 
 # off (the default): FINISH_STALL_MIN unset ⇒ OFF, hard no-op — no journal, no pane, no notification.
 ( unset FINISH_STALL_MIN
@@ -244,6 +296,39 @@ ok
 
 export FINISH_STALL_MIN=30
 GRACE="$(_finish_stall_grace_secs)"
+
+# ── AGENT_WATCH_DRYRUN must never mutate a live builder (PR #502 review BLOCK) ─────────────────────
+# The stated dry-run contract: "does everything EXCEPT the real merge / worktree remove / scribe /
+# ff-pull, and never spawns the reviewer/resolver or writes their state files." The re-task nudge
+# types into a REAL agent pane and can cause it to actually push and open a PR — the one mutation this
+# leg has — so it is the one seam DRYRUN must gate, exactly like _maybe_autowake_wedged_builder.
+DRYRUN_WT="$T/wt-dryrun"; mkgit "$DRYRUN_WT"
+printf 'wip\n' > "$DRYRUN_WT/wip.txt"; git -C "$DRYRUN_WT" add wip.txt
+: > "$SENT"; : > "$HERDR_NOTIFY_LOG"
+v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall dryrun-slug "$DRYRUN_WT" done feat)"
+[ "$v" = "PENDING" ] || fail "dryrun: first sighting should be PENDING, got $v"
+v="$(DRYRUN=1 HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall dryrun-slug "$DRYRUN_WT" done feat 2>/dev/null)"
+[ "$v" = "FIRST_STALL" ] || fail "dryrun: past grace should still classify FIRST_STALL, got $v"
+[ -s "$SENT" ] && fail "dryrun: MUST NEVER type into the pane"
+[ -s "$HERDR_NOTIFY_LOG" ] && fail "dryrun: must never fire a re-task/escalation notification"
+rec="$(_finish_stall_record dryrun-slug)"
+[ "$rec" = "$(printf '%s\tpending' "$NOW")" ] \
+  || fail "dryrun: must NOT flip state (no retasked, no escalated) — the record must be untouched, got: $rec"
+! grep -q finish_stall_wake "$JOURNAL_FILE" || fail "dryrun: must never journal the (non-existent) wake"
+DRYVERDICT="$(DRYRUN=1 _finish_stall_retask dryrun-slug 2>/dev/null)"
+[ "$DRYVERDICT" = "DRYRUN" ] || fail "_finish_stall_retask must echo DRYRUN under DRYRUN=1, got $DRYVERDICT"
+_finish_stall_clear dryrun-slug
+ok
+
+# a real (non-dry) tick on the SAME slug afterward still works normally — DRYRUN is not sticky
+v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall dryrun-slug "$DRYRUN_WT" done feat)"
+[ "$v" = "PENDING" ] || fail "post-dryrun: first sighting should be PENDING, got $v"
+v="$(HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall dryrun-slug "$DRYRUN_WT" done feat)"
+[ "$v" = "FIRST_STALL" ] || fail "post-dryrun: past grace should be FIRST_STALL, got $v"
+[ "$(grep -c . "$SENT")" -ge 1 ] || fail "post-dryrun: a real run must send the nudge normally"
+_finish_stall_clear dryrun-slug
+: > "$SENT"; : > "$HERDR_NOTIFY_LOG"
+ok
 
 # tick 1: first sighting ⇒ PENDING, no side effects yet
 v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall e2e-slug "$DIRTY_WT" done feat)"
@@ -330,7 +415,7 @@ ok
 
 # a wake that never lands escalates on the VERY FIRST crossing (no second chance)
 : > "$SENT"; : > "$HERDR_NOTIFY_LOG"; WAKE_OK=0
-NOWAKE_WT="$T/wt-nowake"; mkgit "$NOWAKE_WT"; printf 'x\n' > "$NOWAKE_WT/x.txt"
+NOWAKE_WT="$T/wt-nowake"; mkgit "$NOWAKE_WT"; printf 'x\n' > "$NOWAKE_WT/x.txt"; git -C "$NOWAKE_WT" add x.txt
 v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall nowake-slug "$NOWAKE_WT" done feat)"
 [ "$v" = "PENDING" ] || fail "nowake: first sighting should be PENDING, got $v"
 v="$(HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall nowake-slug "$NOWAKE_WT" done feat)"
@@ -344,7 +429,7 @@ ok
 
 # no agent pane at all ⇒ still escalates (never crashes, never silently drops the slug)
 : > "$SENT"; : > "$HERDR_NOTIFY_LOG"; PANE_ID=""
-NOPANE_WT="$T/wt-nopane"; mkgit "$NOPANE_WT"; printf 'x\n' > "$NOPANE_WT/x.txt"
+NOPANE_WT="$T/wt-nopane"; mkgit "$NOPANE_WT"; printf 'x\n' > "$NOPANE_WT/x.txt"; git -C "$NOPANE_WT" add x.txt
 v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall nopane-slug "$NOPANE_WT" done feat)"
 v="$(HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall nopane-slug "$NOPANE_WT" done feat)"
 [ "$v" = "FIRST_STALL" ] || fail "nopane: past grace should be FIRST_STALL, got $v"
