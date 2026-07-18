@@ -65,4 +65,17 @@ rm -f "$DEPS_FILE"
 _dw_remove_dep "no-such-ref#1" || fail "_dw_remove_dep with missing file should not error"
 pass
 
+# 6. Anchored-ref-match (HERD-389): removing provider-lib#4 must NOT also strip provider-lib#42 —
+# a substring/prefix test (e.g. grep -Fv "blocked-on: ${ref}") would match both rows.
+cat > "$DEPS_FILE" <<'DEPS'
+blocked-on: provider-lib#4  since=1700000000
+blocked-on: provider-lib#42  since=1700000000
+DEPS
+_dw_remove_dep "provider-lib#4"
+grep -q '^blocked-on: provider-lib#42' "$DEPS_FILE" \
+  || fail "_dw_remove_dep of #4 must leave #42 intact (substring-match regression)"
+grep -q '^blocked-on: provider-lib#4  ' "$DEPS_FILE" \
+  && fail "_dw_remove_dep did not remove the targeted #4 row" || true
+pass
+
 echo "ALL PASS ($PASS checks)"

@@ -4118,60 +4118,11 @@ _deps_ensure_file() {
   } > "$f"
 }
 
-# _deps_kind_of <file> <ref> → prints "blocked-on" | "watch" | "" (empty = not present).
-_deps_kind_of() {
-  local f="$1" ref="$2" line r
-  [ -f "$f" ] || return 0
-  while IFS= read -r line; do
-    case "$line" in
-      'blocked-on: '*) r="${line#blocked-on: }" ;;
-      'watch: '*)      r="${line#watch: }" ;;
-      *) continue ;;
-    esac
-    r="${r%%[[:space:]]*}"
-    [ "$r" = "$ref" ] || continue
-    case "$line" in 'blocked-on: '*) printf 'blocked-on' ;; *) printf 'watch' ;; esac
-    return 0
-  done < "$f"
-}
-
-# _deps_set_kind <file> <ref> <new-kind> — rewrite the row's prefix, PRESERVING trailing fields
-# (since=…). Atomic via temp file + mv, the same shape dep-watcher.sh uses.
-_deps_set_kind() {
-  local f="$1" ref="$2" newkind="$3" tmp line rest r
-  [ -f "$f" ] || return 1
-  tmp="${f}.$$"
-  while IFS= read -r line; do
-    case "$line" in
-      'blocked-on: '*) rest="${line#blocked-on: }" ;;
-      'watch: '*)      rest="${line#watch: }" ;;
-      *) printf '%s\n' "$line"; continue ;;
-    esac
-    r="${rest%%[[:space:]]*}"
-    if [ "$r" = "$ref" ]; then printf '%s: %s\n' "$newkind" "$rest"; else printf '%s\n' "$line"; fi
-  done < "$f" > "$tmp"
-  mv "$tmp" "$f"
-}
-
-# _deps_remove <file> <ref> — drop the row (blocked-on OR watch) for <ref>. Returns 0 if one was
-# removed, 1 if the ref was absent. Atomic temp-file + mv.
-_deps_remove() {
-  local f="$1" ref="$2" tmp line r removed=1
-  [ -f "$f" ] || return 1
-  tmp="${f}.$$"
-  while IFS= read -r line; do
-    case "$line" in
-      'blocked-on: '*) r="${line#blocked-on: }" ;;
-      'watch: '*)      r="${line#watch: }" ;;
-      *) printf '%s\n' "$line"; continue ;;
-    esac
-    r="${r%%[[:space:]]*}"
-    if [ "$r" = "$ref" ]; then removed=0; continue; fi
-    printf '%s\n' "$line"
-  done < "$f" > "$tmp"
-  mv "$tmp" "$f"
-  return "$removed"
-}
+# _deps_kind_of / _deps_set_kind / _deps_remove — the shared anchored-ref-match row parser
+# (deps-parse.sh, HERD-389), also sourced by dep-watcher.sh so the two consumers can never
+# re-diverge on how a <ref> is matched against a row.
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/deps-parse.sh" ] && . "$SCRIPTS_DIR/deps-parse.sh"
 
 # _deps_state <ref> — best-effort current state of the upstream item (open|in-progress|closed|
 # unknown). Resolves the link + report backend in a SUBSHELL so HERD_REPO is not clobbered; any

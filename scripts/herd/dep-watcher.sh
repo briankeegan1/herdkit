@@ -44,6 +44,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # "unblocked" alert fires with OR without herdr panes (headless → notifications.log + native).
 # shellcheck source=driver.sh
 . "$HERE/driver.sh"
+# The shared anchored-ref-match row parser (_deps_remove et al., HERD-389) — also sourced by
+# bin/herd, so the two consumers can never re-diverge on how a <ref> is matched against a row.
+# shellcheck source=deps-parse.sh
+. "$HERE/deps-parse.sh"
 
 DEPS_FILE="${DEPS_FILE:-$PROJECT_ROOT/.herd/deps}"
 # Poll-cadence + stall-TTL config keys: herd-config.sh (sourced above) has already applied any value
@@ -92,12 +96,13 @@ _dw_clear_since() {
 }
 
 _dw_remove_dep() {
-    # Atomically remove the blocked-on: <ref> line from .herd/deps.
+    # Atomically remove the blocked-on: <ref> line from .herd/deps via the shared anchored-ref-match
+    # helper (deps-parse.sh, HERD-389). A substring test here (e.g. `grep -Fv "blocked-on: ${ref}"`)
+    # would also strip provider-lib#42 while removing provider-lib#4 — _deps_remove matches the row's
+    # whole ref FIELD, not a prefix.
     local ref="$1"
     [ -f "$DEPS_FILE" ] || return 0
-    local tmp; tmp="${DEPS_FILE}.$$"
-    grep -Fv "blocked-on: ${ref}" "$DEPS_FILE" > "$tmp" 2>/dev/null || true
-    mv "$tmp" "$DEPS_FILE"
+    _deps_remove "$DEPS_FILE" "$ref" || true
     _dw_clear_since "$ref"
 }
 

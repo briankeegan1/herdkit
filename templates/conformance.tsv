@@ -119,6 +119,8 @@ herd-approve.sh override <pr#>	unit	tests/test-review-visibility.sh
 dep-watcher.sh	unit	tests/test-dep-watcher.sh
 dep-watcher.sh	unit	tests/test-dep-states.sh
 dep-watcher.sh	unit	tests/test-dispatch-deps.sh
+deps-parse.sh	unit	tests/test-dep-watcher.sh
+deps-parse.sh	unit	tests/test-dispatch-deps.sh
 coordinator.sh	unit	tests/test-launch-binding-guard.sh
 coordinator.sh	unit	tests/test-model-flags.sh
 coordinator.sh	unit	tests/test-utf8-control-room.sh
