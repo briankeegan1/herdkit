@@ -9,9 +9,13 @@
 # delegated command already does. Read-mostly by construction.
 #
 # Registry file (default ~/.herd/fleet; override with HERD_FLEET_FILE for tests / alt homes):
-#   one record per line, pipe-delimited:  name|path|repo
+#   one record per line, pipe-delimited:  name|path|repo|aliases
 #   blank lines and #-comments are ignored. `name` is the project's WORKSPACE_NAME, `path` its
-#   PROJECT_ROOT, `repo` its HERD_REPO (may be empty).
+#   PROJECT_ROOT, `repo` its HERD_REPO (may be empty). `aliases` (HERD-387) is OPTIONAL and
+#   comma-separated (e.g. `alpha-svc,alpha`); a row with no aliases omits the trailing field
+#   entirely, so every pre-existing 3-field row (and every register call that never used --alias)
+#   stays byte-identical to before this field existed. `herd fleet resolve` is the ONE consumer that
+#   matches free text against name + aliases; every other reader still only cares about name/path/repo.
 #
 # Dependencies it leans on: each project's committed `.herd/config` (WORKSPACE_NAME / PROJECT_ROOT /
 # WORKTREES_DIR / DEFAULT_BRANCH / HERD_REPO), the per-project journal at
@@ -36,6 +40,17 @@ _fleet_slug() {
 # into a registry record, so a stray char can never corrupt the one-record-per-line format.
 _fleet_sanitize() { printf '%s' "$1" | tr -d '|\r\n'; }
 
+# _fleet_sanitize_alias <value> — like _fleet_sanitize, plus strips the comma (the aliases-field
+# join delimiter) and trims surrounding whitespace, so a stray char in a free-typed --alias value
+# can never corrupt the CSV aliases field or produce a blank-looking candidate.
+_fleet_sanitize_alias() {
+  local v; v="$(_fleet_sanitize "$1")"
+  v="${v//,/}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
+}
+
 # _fleet_read_config <project-path> — read that project's .herd/config and print one TAB-delimited row:
 #   workspace<TAB>project_root<TAB>worktrees_dir<TAB>default_branch<TAB>repo
 # Thin adopter of the shared _herd_read_project_config seam (scripts/herd/herd-config.sh), which owns
@@ -54,18 +69,21 @@ _fleet_read_config() {
   _herd_read_project_config "$1"
 }
 
-# _fleet_each REGISTRY-CALLBACK — read the registry and call `$1 name path repo` per valid record,
-# skipping blanks/comments. Returns 1 (and the caller reports empty) when the registry is missing or
-# has no records. Central so every subcommand iterates the registry identically.
+# _fleet_each REGISTRY-CALLBACK — read the registry and call `$1 name path repo [aliases]` per valid
+# record, skipping blanks/comments. Returns 1 (and the caller reports empty) when the registry is
+# missing or has no records. Central so every subcommand iterates the registry identically. The read
+# always captures a 4th (aliases) field even though most callbacks ignore it — otherwise a row that
+# HAS aliases would spill its 4th field into `repo` (bash's `read` appends any extra fields, IFS
+# chars and all, onto the last named variable).
 _fleet_each() {
   local cb="$1" reg; reg="$(_fleet_registry_file)"
   [ -f "$reg" ] || return 1
-  local seen=0 line name path repo
-  while IFS='|' read -r name path repo; do
+  local seen=0 line name path repo alias
+  while IFS='|' read -r name path repo alias; do
     case "$name" in ''|'#'*) continue ;; esac
     [ -n "$path" ] || continue
     seen=1
-    "$cb" "$name" "$path" "$repo"
+    "$cb" "$name" "$path" "$repo" "$alias"
   done < "$reg"
   [ "$seen" -eq 1 ]
 }
@@ -103,12 +121,35 @@ _fleet_repo_slug() {
 
 # ── register / list / discover ───────────────────────────────────────────────
 
-# fleet_register <path> — resolve <path>, read its .herd/config, and append (or refresh) its
-# name|path|repo record in the registry. Idempotent: re-registering the same path rewrites its row
-# rather than duplicating it. Fails loudly (die) when the path has no .herd/config.
+# fleet_register <path> [--alias <name>]... — resolve <path>, read its .herd/config, and append
+# (or refresh) its name|path|repo[|aliases] record in the registry. Idempotent: re-registering the
+# same path rewrites its row rather than duplicating it. Fails loudly (die) when the path has no
+# .herd/config. --alias (repeatable, HERD-387) sets the row's ALIASES — free-text names `herd fleet
+# resolve` also matches, e.g. a project whose WORKSPACE_NAME is "svc-alpha" registered with
+# --alias alpha --alias alpha-svc so "alpha" resolves it. A register call that passes NO --alias
+# preserves whatever aliases the row already had (a plain re-register, e.g. from `discover
+# --register` or a re-run script, must never silently wipe curated aliases); passing --alias always
+# REPLACES the row's alias set with exactly what was given (drop all with `--alias ''` — an empty
+# value sanitizes to nothing and is skipped, so this is really "no aliases").
 fleet_register() {
-  local raw="${1:-}"
-  [ -n "$raw" ] || die "usage: herd fleet register <project-path>"
+  local raw="" aliases=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --alias)
+        [ -n "${2+set}" ] || die "--alias requires a value"
+        aliases+=("$2"); shift 2 ;;
+      --alias=*)
+        aliases+=("${1#--alias=}"); shift ;;
+      -h|--help)
+        say "usage: herd fleet register <project-path> [--alias <name>]..."
+        return 0 ;;
+      -*) die "unknown option: $1 (try: herd fleet register --help)" ;;
+      *)
+        [ -z "$raw" ] || die "usage: herd fleet register <project-path> [--alias <name>]..."
+        raw="$1"; shift ;;
+    esac
+  done
+  [ -n "$raw" ] || die "usage: herd fleet register <project-path> [--alias <name>]..."
   local path
   path="$(cd "$raw" 2>/dev/null && pwd -P)" || die "no such directory: $raw"
   [ -f "$path/.herd/config" ] || die "not a herd project (no .herd/config): $path"
@@ -124,41 +165,64 @@ fleet_register() {
   repo="$(_fleet_sanitize "$(_fleet_repo_slug "$path")")"
   [ -n "$repo" ] || warn "no parseable origin remote at $path — registered with an empty repo field"
 
+  # Sanitize + de-dup the requested aliases (order-preserving), then CSV-join. Empty after sanitize
+  # (e.g. `--alias ' '`) is dropped rather than stored as a blank candidate.
+  local new_alias_csv=""
+  if [ "${#aliases[@]}" -gt 0 ]; then
+    local a a_clean seen_a="" out_a=()
+    for a in "${aliases[@]}"; do
+      a_clean="$(_fleet_sanitize_alias "$a")"
+      [ -n "$a_clean" ] || continue
+      case ",$seen_a," in *",$a_clean,"*) continue ;; esac
+      seen_a="$seen_a,$a_clean"
+      out_a+=("$a_clean")
+    done
+    local IFS=','; new_alias_csv="${out_a[*]}"; unset IFS
+  fi
+
   local reg; reg="$(_fleet_registry_file)"
   mkdir -p "$(dirname "$reg")" 2>/dev/null || die "cannot create registry dir: $(dirname "$reg")"
   if [ ! -f "$reg" ]; then
-    printf '# herdkit fleet registry — one project per line: name|path|repo\n' > "$reg" \
+    printf '# herdkit fleet registry — one project per line: name|path|repo|aliases\n' > "$reg" \
       || die "cannot write registry: $reg"
   fi
 
-  # Drop any existing record for this path (idempotent refresh), then append the fresh row.
+  # Drop any existing record for this path (idempotent refresh), then append the fresh row. Every
+  # OTHER row (including its own aliases field, if any) is reconstructed byte-for-byte via the same
+  # split/rejoin the original 3-field code used — `la` is simply empty for a 3-field row, so
+  # `$ln|$lp|$lr${la:+|$la}` degrades back to `$ln|$lp|$lr` and the format stays untouched for every
+  # project that never used --alias.
   local tmp; tmp="$(mktemp)" || die "mktemp failed"
-  local ln lp lr
-  while IFS='|' read -r ln lp lr; do
-    case "$ln" in '#'*) printf '%s\n' "$ln|$lp|$lr" >> "$tmp"; continue ;; esac
-    [ "$lp" = "$path" ] && continue          # replaced below
-    [ -n "$ln" ] && printf '%s\n' "$ln|$lp|$lr" >> "$tmp"
+  local ln lp lr la final_alias="$new_alias_csv"
+  while IFS='|' read -r ln lp lr la; do
+    case "$ln" in '#'*) printf '%s\n' "$ln|$lp|$lr${la:+|$la}" >> "$tmp"; continue ;; esac
+    if [ "$lp" = "$path" ]; then
+      [ "${#aliases[@]}" -eq 0 ] && final_alias="$la"   # no --alias this call: keep what was there
+      continue                                          # replaced below
+    fi
+    [ -n "$ln" ] && printf '%s\n' "$ln|$lp|$lr${la:+|$la}" >> "$tmp"
   done < "$reg"
-  printf '%s|%s|%s\n' "$name" "$path" "$repo" >> "$tmp"
+  printf '%s|%s|%s%s\n' "$name" "$path" "$repo" "${final_alias:+|$final_alias}" >> "$tmp"
   mv "$tmp" "$reg" || { rm -f "$tmp"; die "cannot update registry: $reg"; }
 
-  ok "registered ${c_bold}$name${c_rst} → $path${repo:+  ($repo)}"
+  ok "registered ${c_bold}$name${c_rst} → $path${repo:+  ($repo)}${final_alias:+  [aliases: ${final_alias//,/, }]}"
 }
 
-# fleet_list — print the registry as a simple table (name, path, repo). Empty registry is a
-# friendly note, not an error.
+# fleet_list — print the registry as a simple table (name, path, repo, aliases). Empty registry is
+# a friendly note, not an error.
 fleet_list() {
   local reg; reg="$(_fleet_registry_file)"
   if [ ! -f "$reg" ]; then
     say "no fleet registry yet ($reg) — add a project with: herd fleet register <path>"
     return 0
   fi
-  local n=0 name path repo
-  printf '%s%-16s %-44s %s%s\n' "$c_bold" "PROJECT" "PATH" "REPO" "$c_rst"
-  while IFS='|' read -r name path repo; do
+  local n=0 name path repo alias disp
+  printf '%s%-16s %-44s %-14s %s%s\n' "$c_bold" "PROJECT" "PATH" "REPO" "ALIASES" "$c_rst"
+  while IFS='|' read -r name path repo alias; do
     case "$name" in ''|'#'*) continue ;; esac
     n=$((n+1))
-    printf '%-16s %-44s %s\n' "$name" "$path" "${repo:-—}"
+    disp="${alias:-—}"; [ -n "$alias" ] && disp="${alias//,/, }"
+    printf '%-16s %-44s %-14s %s\n' "$name" "$path" "${repo:-—}" "$disp"
   done < "$reg"
   if [ "$n" -eq 0 ]; then
     say "(registry is empty — add a project with: herd fleet register <path>)"
@@ -168,6 +232,125 @@ fleet_list() {
   fi
 }
 
+# ── resolve — deterministic NL pre-resolver (HERD-387) ───────────────────────
+# `herd fleet resolve <free text>` matches free text against the registry (name + --alias values)
+# with a FIXED precedence, so the `fleet room` NL master-coordinator (templates/fleet-coordinator.md.tmpl)
+# can resolve "the obvious case" without ever calling an LLM, and only falls back to its own judgment
+# when this refuses. Case-insensitive throughout (free text from a human/agent, not a slug). Tiers,
+# evaluated in order — the FIRST tier with any hit decides the outcome (a later tier is never tried
+# once an earlier one matched anything, even ambiguously):
+#   1. exact       — the input equals a project's canonical name
+#   2. alias       — the input equals one of a project's --alias values
+#   3. prefix      — the input is an unambiguous PREFIX of a project's name or an alias
+#   4. FAIL        — nothing matched any tier
+# Exactly one hit at a tier resolves (prints the canonical NAME on stdout, exit 0). More than one hit
+# at a tier is AMBIGUOUS (candidates listed on stderr, exit 2) — it never silently falls through to a
+# later, looser tier. No hit at any tier exits 1 listing the registered projects. Read-only.
+_fleet_resolve_candidates() {
+  local reg; reg="$(_fleet_registry_file)"
+  [ -f "$reg" ] || return 0
+  local name path repo alias
+  while IFS='|' read -r name path repo alias; do
+    case "$name" in ''|'#'*) continue ;; esac
+    [ -n "$path" ] || continue
+    printf '%s\t%s\t%s\n' "$name" "$path" "$alias"
+  done < "$reg"
+}
+
+_FLEET_RESOLVE_PY='
+import sys, os
+
+query = os.environ.get("FLEET_RESOLVE_QUERY", "").strip()
+qlow = query.lower()
+
+# Each row keeps its PATH alongside name/aliases: uniqueness is judged per REGISTRY ROW, not per
+# printed name — two different rows that happen to share a canonical name (a hand-edited registry,
+# or two directories both registered as e.g. "app") are two DIFFERENT projects and must still be
+# flagged ambiguous, never silently collapsed into "pick one" just because their names print the same.
+rows = []
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    name = parts[0] if len(parts) > 0 else ""
+    path = parts[1] if len(parts) > 1 else ""
+    aliases_raw = parts[2] if len(parts) > 2 else ""
+    aliases = [a for a in aliases_raw.split(",") if a]
+    if name:
+        rows.append((name, path, aliases))
+
+if not rows:
+    sys.stderr.write("no fleet registry yet — add a project with: herd fleet register <path>\n")
+    sys.exit(1)
+
+def label(name, path):
+    return "%s (%s)" % (name, path) if path else name
+
+def emit_ambiguous(tier, hits):
+    uniq = sorted(set(hits), key=lambda h: (h[0], h[1]))
+    sys.stderr.write("ambiguous fleet target %r (%s match on: %s)\n" %
+                      (query, tier, ", ".join(label(n, p) for n, p in uniq)))
+    sys.stderr.write("candidates:\n")
+    for n, p in uniq:
+        sys.stderr.write("  - %s\n" % label(n, p))
+    sys.exit(2)
+
+tiers = []
+
+exact = [(name, path) for name, path, aliases in rows if name.lower() == qlow]
+tiers.append(("exact", exact))
+
+alias_hits = [(name, path) for name, path, aliases in rows if qlow in (a.lower() for a in aliases)]
+tiers.append(("alias", alias_hits))
+
+prefix_hits = []
+for name, path, aliases in rows:
+    if name.lower().startswith(qlow) or any(a.lower().startswith(qlow) for a in aliases):
+        prefix_hits.append((name, path))
+tiers.append(("prefix", prefix_hits))
+
+for tier, hits in tiers:
+    uniq = sorted(set(hits))
+    if len(uniq) == 1:
+        print(uniq[0][0])
+        sys.exit(0)
+    if len(uniq) > 1:
+        emit_ambiguous(tier, uniq)
+
+sys.stderr.write("no fleet project matches %r\n" % query)
+sys.stderr.write("registered projects: %s\n" % ", ".join(sorted({n for n, _, _ in rows})))
+sys.exit(1)
+'
+
+# fleet_resolve <free text> — resolve free text to exactly one registered project's canonical name
+# (see the tier doc above). Prints the resolved name on stdout and exits 0 on a clean match; prints
+# an explanation + candidates on stderr and exits non-zero (2 = ambiguous, 1 = no match / no
+# registry / usage) otherwise. `<free text>` may be multiple words (joined with spaces) so a caller
+# does not have to fight shell quoting for a natural phrase like `herd fleet resolve the alpha one`.
+fleet_resolve() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: herd fleet resolve <free text>
+
+  Deterministic (no-LLM) pre-resolver: matches <free text> against the fleet registry's project
+  names and --alias values, case-insensitive, with fixed precedence:
+    1. exact name match
+    2. alias match
+    3. unambiguous prefix match (name or alias)
+  The first tier with any hit decides the outcome. Exactly one hit resolves (prints the canonical
+  name, exit 0). More than one hit at that tier is ambiguous (candidates listed, exit 2). No hit at
+  any tier exits 1. Intended as the deterministic FIRST call for the 'fleet room' NL
+  master-coordinator before it falls back to its own judgment.
+EOF
+      return 0 ;;
+  esac
+  [ "$#" -ge 1 ] || die "usage: herd fleet resolve <free text>"
+  local query="$*"
+  FLEET_RESOLVE_QUERY="$query" python3 -c "$_FLEET_RESOLVE_PY" < <(_fleet_resolve_candidates)
+}
+
 # _fleet_registered_paths — print the canonical PROJECT_ROOT of every registered project, one per
 # line (skipping blanks/comments). Discover uses this to DEDUP projects already in the registry, and
 # to derive its default scan roots. The registry stores the SAME resolved PROJECT_ROOT that
@@ -175,8 +358,8 @@ fleet_list() {
 _fleet_registered_paths() {
   local reg; reg="$(_fleet_registry_file)"
   [ -f "$reg" ] || return 0
-  local n p r
-  while IFS='|' read -r n p r; do
+  local n p r a
+  while IFS='|' read -r n p r a; do
     case "$n" in ''|'#'*) continue ;; esac
     [ -n "$p" ] && printf '%s\n' "$p"
   done < "$reg"
@@ -401,15 +584,15 @@ _fleet_graph_link_repo() {
 # Repo match wins (the durable cross-project identity); name match is the fallback for a peer whose
 # .herd/links has no repo recorded yet.
 _fleet_graph_resolve() {
-  local reg="$1" pname="$2" prepo="$3" name path repo mname="" mpath=""
+  local reg="$1" pname="$2" prepo="$3" name path repo alias mname="" mpath=""
   if [ -n "$prepo" ] && [ -f "$reg" ]; then
-    while IFS='|' read -r name path repo; do
+    while IFS='|' read -r name path repo alias; do
       case "$name" in ''|'#'*) continue ;; esac
       if [ "$repo" = "$prepo" ]; then mname="$name"; mpath="$path"; break; fi
     done < "$reg"
   fi
   if [ -z "$mname" ] && [ -f "$reg" ]; then
-    while IFS='|' read -r name path repo; do
+    while IFS='|' read -r name path repo alias; do
       case "$name" in ''|'#'*) continue ;; esac
       if [ "$name" = "$pname" ]; then mname="$name"; mpath="$path"; break; fi
     done < "$reg"
@@ -432,8 +615,8 @@ _fleet_graph_resolve() {
 _fleet_graph_manifest() {
   local reg; reg="$(_fleet_registry_file)"
   [ -f "$reg" ] || return 0
-  local name path repo
-  while IFS='|' read -r name path repo; do
+  local name path repo alias
+  while IFS='|' read -r name path repo alias; do
     case "$name" in ''|'#'*) continue ;; esac
     [ -n "$path" ] || continue
     if [ ! -d "$path" ] || [ ! -f "$path/.herd/config" ]; then
@@ -583,8 +766,8 @@ _fleet_fanout() {
   say ""
   printf '%s%-16s %-9s %s%s\n' "$c_bold" "PROJECT" "OUTCOME" "DETAIL" "$c_rst"
 
-  local ok_n=0 fail_n=0 skip_n=0 name path repo
-  while IFS='|' read -r name path repo; do
+  local ok_n=0 fail_n=0 skip_n=0 name path repo alias
+  while IFS='|' read -r name path repo alias; do
     case "$name" in ''|'#'*) continue ;; esac
     [ -n "$path" ] || continue
 
@@ -1295,8 +1478,8 @@ EOF
   say ""
   printf '%s%-16s %8s %8s %9s  %-7s%s\n' "$c_bold" "PROJECT" "BUILDERS" "REVIEWS" "IN-FLIGHT" "WATCHER" "$c_rst"
 
-  local tot_b=0 tot_r=0 nproj=0 nmiss=0 name path repo
-  while IFS='|' read -r name path repo; do
+  local tot_b=0 tot_r=0 nproj=0 nmiss=0 name path repo alias
+  while IFS='|' read -r name path repo alias; do
     case "$name" in ''|'#'*) continue ;; esac
     [ -n "$path" ] || continue
 
@@ -1384,15 +1567,18 @@ render_fleet_skill() {
   mkdir -p "$out_dir" || die "cannot create fleet room commands dir: $out_dir"
   local out="$out_dir/fleet-coordinator.md"
 
-  # Build {{FLEET_PROJECTS}} — one bullet per registered project (name · path · repo).
+  # Build {{FLEET_PROJECTS}} — one bullet per registered project (name · path · repo · aliases). The
+  # canonical name AND its aliases are baked in so the room's NL dispatch (and its `herd fleet
+  # resolve` pre-resolver, HERD-387) can be resolved straight from this list without re-reading the
+  # registry file itself.
   local reg; reg="$(_fleet_registry_file)"
-  local FLEET_PROJECTS='' count=0 name path repo
+  local FLEET_PROJECTS='' count=0 name path repo alias
   if [ -f "$reg" ]; then
-    while IFS='|' read -r name path repo; do
+    while IFS='|' read -r name path repo alias; do
       case "$name" in ''|'#'*) continue ;; esac
       [ -n "$path" ] || continue
       count=$((count+1))
-      FLEET_PROJECTS="${FLEET_PROJECTS}"$'\n'"- **${name}** — \`${path}\`${repo:+  (${repo})}"
+      FLEET_PROJECTS="${FLEET_PROJECTS}"$'\n'"- **${name}** — \`${path}\`${repo:+  (${repo})}${alias:+  · aliases: ${alias//,/, }}"
     done < "$reg"
   fi
   FLEET_PROJECTS="${FLEET_PROJECTS#$'\n'}"   # drop the leading newline for a clean first bullet

@@ -77,7 +77,7 @@ ok
 # ── 2. register two projects, then launch the room ───────────────────────────
 ALPHA="$(_make_project alpha)"
 BETA="$(_make_project beta)"
-bash "$HERD" fleet register "$ALPHA" >/dev/null
+bash "$HERD" fleet register "$ALPHA" --alias alpha-svc >/dev/null
 bash "$HERD" fleet register "$BETA"  >/dev/null
 
 : > "$HERDR_LOG"   # fresh log for the launch assertions
@@ -96,6 +96,22 @@ grep -q "2" "$SKILL" || fail "rendered skill missing the project count"
 if grep -q '{{' "$SKILL"; then fail "rendered skill still contains an unsubstituted {{TOKEN}}"; fi
 grep -qi "fleet inbox" "$SKILL" || fail "rendered skill should tell the master to surface the inbox first"
 grep -qi "never" "$SKILL" || fail "rendered skill should state the never-edit/never-merge rules"
+grep -q "alpha-svc" "$SKILL" || fail "rendered skill missing alpha's registered alias (HERD-387)"
+ok
+
+# ── 3b. the skill instructs the room to call the deterministic pre-resolver FIRST (HERD-387) ──
+grep -q "herd fleet resolve" "$SKILL" \
+  || fail "rendered skill should tell the master to call 'herd fleet resolve' when dispatching"
+grep -qi "precedence\|exact.*alias.*prefix\|exact name match" "$SKILL" \
+  || fail "rendered skill should describe the resolver's exact > alias > prefix precedence"
+grep -qi "fall back\|fallback" "$SKILL" \
+  || fail "rendered skill should say LLM judgment is only the FALLBACK, after the resolver refuses"
+# The resolver-first instruction must appear BEFORE the coordinator-pane lookup step it feeds —
+# a room agent reading top-to-bottom must not be told to guess a pane before it is told to resolve.
+resolve_line="$(grep -n "herd fleet resolve" "$SKILL" | head -1 | cut -d: -f1)"
+pane_line="$(grep -n "herdr agent list" "$SKILL" | head -1 | cut -d: -f1)"
+[ -n "$resolve_line" ] && [ -n "$pane_line" ] && [ "$resolve_line" -lt "$pane_line" ] \
+  || fail "the resolver call should be instructed BEFORE the coordinator-pane lookup"
 ok
 
 # ── 4. the launcher invocation shape (stubbed herdr) ─────────────────────────

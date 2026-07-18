@@ -4146,8 +4146,8 @@ $erepo"
     done < "$links_file"
   fi
 
-  local proposals=() rname rpath rrepo
-  while IFS='|' read -r rname rpath rrepo; do
+  local proposals=() rname rpath rrepo ralias
+  while IFS='|' read -r rname rpath rrepo ralias; do
     case "$rname" in ''|'#'*) continue ;; esac
     [ -n "$rpath" ] || continue
     local rpath_real; rpath_real="$(cd "$rpath" 2>/dev/null && pwd -P)" || continue
@@ -6623,6 +6623,7 @@ cmd_fleet() {
     register)  fleet_register "$@" ;;
     list)      fleet_list "$@" ;;
     discover)  fleet_discover "$@" ;;
+    resolve)   fleet_resolve "$@" ;;
     status)    fleet_status "$@" ;;
     graph)     fleet_graph "$@" ;;
     digest)    fleet_digest "$@" ;;
@@ -6636,12 +6637,18 @@ cmd_fleet() {
       cat <<EOF
 usage: herd fleet <subcommand>
 
-  register <path>            add a herd project (reads its .herd/config) to the registry
-  list                       list registered projects (name · path · repo)
+  register <path> [--alias <name>]...
+                             add a herd project (reads its .herd/config) to the registry; repeat
+                             --alias to record free-text names 'herd fleet resolve' should also match
+  list                       list registered projects (name · path · repo · aliases)
   discover [--register|--yes] [<root>...]
                              scan roots (default: sensible parent dirs) for .herd/config; print each
                              project + whether it is already registered; --register adds the new ones
                              (dry-run by default — writes nothing)
+  resolve <free text>        deterministic (no-LLM) NL pre-resolver: match free text against project
+                             names + aliases (exact > alias > unambiguous-prefix); prints the resolved
+                             name and exits 0, or refuses (exit non-zero) on no match / ambiguity,
+                             listing candidates (herd fleet resolve --help for the precedence detail)
   status                     per-project rollup: branch, open PRs, watcher alive?, last activity
   graph [--json]             relationship-graph rollup: registry projects as nodes, each project's OWN
                              .herd/links + .herd/deps as labeled edges (link / blocked-on / watch);
@@ -6995,12 +7002,18 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                             blocking watch (un-blocks the lane)
   herd fleet <sub>                    DETERMINISTIC multi-project fan-out (no LLM) over a project
                                       registry (default ~/.herd/fleet):
-                                        register <path>     add a herd project to the registry
-                                        list                list registered projects
+                                        register <path> [--alias <name>]...
+                                                            add a herd project to the registry;
+                                                            repeatable --alias records free-text names
+                                                            'resolve' should also match
+                                        list                list registered projects (+ aliases)
                                         discover [--register] [<root>...]
                                                             scan roots (default: sensible parents) for
                                                             .herd/config projects; dedups already-
                                                             registered; --register adds the new ones
+                                        resolve <text>      deterministic NL pre-resolver: match free
+                                                            text to one project (exact > alias >
+                                                            unambiguous-prefix); refuses on ambiguity
                                         status              per-project rollup (branch, open PRs,
                                                             watcher alive?, last journal activity)
                                         graph [--json]      relationship-graph rollup: registry nodes

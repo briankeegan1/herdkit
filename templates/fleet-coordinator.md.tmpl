@@ -54,7 +54,10 @@ After any action, return to this menu until the operator stops.
   `herd config set` (never hand-edits a `.herd/config`)
 - `herd fleet upgrade` — run `herd update` in every project (per-project outcomes)
 - `herd fleet reload` — run `herd reload` in every project
-- `herd fleet register <path>` / `herd fleet discover [--register]` — grow the registry
+- `herd fleet register <path> [--alias <name>]...` / `herd fleet discover [--register]` — grow the
+  registry (`--alias` records extra free-text names for the resolver below to match)
+- `herd fleet resolve "<free text>"` — the deterministic NL pre-resolver (exact > alias >
+  unambiguous-prefix, case-insensitive); call this FIRST when dispatching to a project (see below)
 
 ### Per-project drill-down (each project's OWN `herd`, run with that project's cwd)
 
@@ -70,11 +73,27 @@ These are READ-ONLY. You surface what they show; you never act inside the projec
 ### NL dispatch DOWN to a project coordinator
 
 When the operator says "send this to <project>" / "have <project> build X" / "ask <project> to look
-at Y", you DELEGATE it — you do not do it. Resolve the target project from the list above, then nudge
-its **coordinator agent** the same way a project coordinator nudges its builders — via
-`herdr pane run` into that coordinator's live agent pane:
+at Y", you DELEGATE it — you do not do it. Resolve the target project, then nudge its **coordinator
+agent** the same way a project coordinator nudges its builders — via `herdr pane run` into that
+coordinator's live agent pane:
 
-1. Find the target's coordinator agent pane (its name is `coordinator-<workspace-slug>`):
+1. **Resolve the target project — call the deterministic pre-resolver FIRST** (HERD-387), before
+   reaching for your own judgment:
+
+       herd fleet resolve "<the operator's project reference, verbatim>"
+
+   - **Exit 0** — the pre-resolver matched exactly one project (exact name > alias > unambiguous
+     name/alias prefix, case-insensitive). Its stdout IS the canonical project name; use it and go
+     straight to step 2. This is the common case and needs no LLM judgment at all.
+   - **Non-zero exit** — the resolver refused: either nothing matched, or more than one project tied
+     at the same precedence tier (ambiguous). Its stderr lists the candidates it saw. ONLY now fall
+     back to your own judgment over the registered-project list above (which already shows each
+     project's canonical name plus its aliases) — and if it is still genuinely unclear, ask the
+     operator to disambiguate rather than guessing. The skill stays thin: the resolver handles every
+     case it can prove deterministically, and your judgment is the fallback for the rest, not the
+     default path.
+
+2. Find the target's coordinator agent pane (its name is `coordinator-<workspace-slug>`):
 
        herdr agent list
 
@@ -82,14 +101,14 @@ its **coordinator agent** the same way a project coordinator nudges its builders
    `idle`/`working` — that is the AGENT pane. Never send to a tab's root shell pane; text sent there
    vanishes and the agent never wakes.
 
-2. Send the task as a natural-language instruction into that coordinator's pane:
+3. Send the task as a natural-language instruction into that coordinator's pane:
 
        herdr pane run <coordinator-agent-pane> "<the task, in full: what to build / look into>"
 
    The project coordinator then does its own thing — picks the lane, spins a worktree sub-agent,
    updates its own backlog, and its watcher reviews + merges the PR. You do NOT bypass it.
 
-3. If the target project's coordinator is not running, tell the operator to bring its control room up
+4. If the target project's coordinator is not running, tell the operator to bring its control room up
    in that project (`herd reload` / the project's coordinator launcher) — do NOT try to spawn builders
    for it yourself.
 

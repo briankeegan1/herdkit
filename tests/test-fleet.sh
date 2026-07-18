@@ -100,6 +100,21 @@ grep -q "^alpha|$ALPHA|acme/alpha$" "$HERD_FLEET_FILE" \
   || fail "registry line for alpha not in name|path|repo form with the remote-derived repo"
 ok
 
+# ── 1b. register --alias (HERD-387): stored, listed, and preserved across a plain re-register ──
+# Isolated registry — this must never perturb the exact 3-field row format the checks above and
+# below assert for the shared $HERD_FLEET_FILE registry.
+REG_ALIAS="$T/registry-alias/fleet"
+HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet register "$ALPHA" --alias alpha-svc --alias "Alpha Service" >/dev/null
+grep -q "^alpha|$ALPHA|acme/alpha|alpha-svc,Alpha Service$" "$REG_ALIAS" \
+  || fail "register --alias should append a comma-joined aliases field, got: $(grep '^alpha|' "$REG_ALIAS" || true)"
+out="$(HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet list)"
+printf '%s' "$out" | grep -q "alpha-svc" || fail "list should surface a registered alias"
+# A plain re-register (no --alias) must PRESERVE the existing aliases, not silently wipe them.
+HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet register "$ALPHA" >/dev/null
+grep -q "^alpha|$ALPHA|acme/alpha|alpha-svc,Alpha Service$" "$REG_ALIAS" \
+  || fail "a plain re-register must preserve alpha's existing aliases"
+ok
+
 # ── 2. register is idempotent (re-register does not duplicate) ────────────────
 bash "$HERD" fleet register "$ALPHA" >/dev/null
 n="$(grep -c "^alpha|" "$HERD_FLEET_FILE" || true)"
