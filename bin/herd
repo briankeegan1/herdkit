@@ -6504,6 +6504,7 @@ cmd_fleet() {
     list)      fleet_list "$@" ;;
     discover)  fleet_discover "$@" ;;
     status)    fleet_status "$@" ;;
+    graph)     fleet_graph "$@" ;;
     digest)    fleet_digest "$@" ;;
     inbox)     fleet_inbox "$@" ;;
     governance) fleet_governance "$@" ;;
@@ -6522,6 +6523,10 @@ usage: herd fleet <subcommand>
                              project + whether it is already registered; --register adds the new ones
                              (dry-run by default — writes nothing)
   status                     per-project rollup: branch, open PRs, watcher alive?, last activity
+  graph [--json]             relationship-graph rollup: registry projects as nodes, each project's OWN
+                             .herd/links + .herd/deps as labeled edges (link / blocked-on / watch);
+                             an edge's peer is flagged registered/unreachable/unregistered against the
+                             fleet registry; --json for machine use; no LLM
   digest [--since <dur>]     cross-project standup from each project's journal (shipped / needs-you /
                              blocked / in-flight / gate failures over a window; default 24h; no LLM)
   inbox                      cross-project ATTENTION INBOX: one view of what needs you right now
@@ -6876,6 +6881,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                             registered; --register adds the new ones
                                         status              per-project rollup (branch, open PRs,
                                                             watcher alive?, last journal activity)
+                                        graph [--json]      relationship-graph rollup: registry nodes
+                                                            + .herd/links/.herd/deps labeled edges
+                                                            (link/blocked-on/watch), unregistered/
+                                                            unreachable peers flagged
                                         digest [--since D]  cross-project standup from journals
                                                             (shipped/needs-you/blocked/in-flight)
                                         inbox               attention inbox: what needs you now

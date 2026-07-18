@@ -92,10 +92,12 @@ herd governance <export|apply>	unit	tests/test-governance-profiles.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-digest.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-inbox.sh
+herd fleet graph [--json]	unit	tests/test-fleet-graph.sh
 herd governance hooks render [--shared]	unit	tests/test-governance-hooks-render.sh
 fleet.sh	unit	tests/test-fleet.sh
 fleet.sh	unit	tests/test-fleet-discover.sh
 fleet.sh	unit	tests/test-fleet-digest.sh
+fleet.sh	unit	tests/test-fleet-graph.sh
 herd-feature.sh	unit	tests/test-scoped-builder-verification.sh
 herd-feature.sh	unit	tests/test-flow-preference.sh
 herd-feature.sh	unit	tests/test-app-preview-config.sh

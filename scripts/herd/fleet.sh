@@ -371,6 +371,196 @@ fleet_status() {
   fi
 }
 
+# ── relationship graph (HERD-386) ────────────────────────────────────────────
+# `herd fleet graph` rolls up the registry (nodes) plus each project's OWN `.herd/links` (edges
+# labeled "link") and `.herd/deps` (edges labeled "blocked-on"/"watch", reusing the exact row format
+# `herd depend`/dep-watcher.sh already own — see bin/herd's _deps_kind_of / DEPS_FILE minimal-read
+# comment) into ONE deterministic text or --json rollup. A link/dep target is resolved against the
+# SAME registry: matched by repo identity first (byte-for-byte against a registry row's repo field —
+# the same identity fleet_register/_fleet_repo_slug derive), falling back to a name match when the
+# repo is empty/unknown. Never mutates anything; a missing registry/links/deps file is simply an
+# empty graph (fail-soft), never an error.
+
+# _fleet_graph_link_repo <links-file> <link-name> — the repo field for <link-name> in a project's OWN
+# .herd/links (name|repo|backend|target, same parse as cmd_link_list); empty if absent/not found.
+_fleet_graph_link_repo() {
+  local f="$1" name="$2" line lname lrest lrepo
+  [ -f "$f" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in '#'*|'') continue ;; esac
+    lname="${line%%|*}"; lrest="${line#*|}"; lrepo="${lrest%%|*}"
+    [ "$lname" = "$name" ] && { printf '%s' "$lrepo"; return 0; }
+  done < "$f"
+}
+
+# _fleet_graph_resolve <registry-file> <peer-name> <peer-repo> — resolve a link/dep peer against the
+# fleet registry. Prints "STATUS<TAB>resolved-name":
+#   registered    — matched a registry row whose project path + .herd/config are present
+#   unreachable   — matched a registry row whose project path/.herd/config is gone
+#   unregistered  — no matching registry row at all (resolved-name is empty)
+# Repo match wins (the durable cross-project identity); name match is the fallback for a peer whose
+# .herd/links has no repo recorded yet.
+_fleet_graph_resolve() {
+  local reg="$1" pname="$2" prepo="$3" name path repo mname="" mpath=""
+  if [ -n "$prepo" ] && [ -f "$reg" ]; then
+    while IFS='|' read -r name path repo; do
+      case "$name" in ''|'#'*) continue ;; esac
+      if [ "$repo" = "$prepo" ]; then mname="$name"; mpath="$path"; break; fi
+    done < "$reg"
+  fi
+  if [ -z "$mname" ] && [ -f "$reg" ]; then
+    while IFS='|' read -r name path repo; do
+      case "$name" in ''|'#'*) continue ;; esac
+      if [ "$name" = "$pname" ]; then mname="$name"; mpath="$path"; break; fi
+    done < "$reg"
+  fi
+  if [ -z "$mname" ]; then
+    printf 'unregistered\t'
+  elif [ -d "$mpath" ] && [ -f "$mpath/.herd/config" ]; then
+    printf 'registered\t%s' "$mname"
+  else
+    printf 'unreachable\t%s' "$mname"
+  fi
+}
+
+# _fleet_graph_manifest — walk the registry and emit a TSV manifest on stdout for the renderer:
+#   P<TAB>name<TAB>path<TAB>repo<TAB>ok|missing
+#   E<TAB>name<TAB>kind<TAB>ref<TAB>repo<TAB>status<TAB>resolved-name   (0+ per project)
+# kind is "link" (from .herd/links; ref = the link name) or "blocked-on"/"watch" (from .herd/deps;
+# ref = "<link>#<id>", the SAME ref format herd depend/deps already use). A project whose path or
+# .herd/config is gone contributes only its P row (missing), never an error.
+_fleet_graph_manifest() {
+  local reg; reg="$(_fleet_registry_file)"
+  [ -f "$reg" ] || return 0
+  local name path repo
+  while IFS='|' read -r name path repo; do
+    case "$name" in ''|'#'*) continue ;; esac
+    [ -n "$path" ] || continue
+    if [ ! -d "$path" ] || [ ! -f "$path/.herd/config" ]; then
+      printf 'P\t%s\t%s\t%s\tmissing\n' "$name" "$path" "$repo"
+      continue
+    fi
+    printf 'P\t%s\t%s\t%s\tok\n' "$name" "$path" "$repo"
+
+    local links_file="$path/.herd/links" line lname lrest lrepo target status rname
+    if [ -f "$links_file" ]; then
+      while IFS= read -r line; do
+        case "$line" in '#'*|'') continue ;; esac
+        lname="${line%%|*}"; lrest="${line#*|}"; lrepo="${lrest%%|*}"
+        [ -n "$lname" ] || continue
+        target="$(_fleet_graph_resolve "$reg" "$lname" "$lrepo")"
+        status="${target%%$'\t'*}"; rname="${target#*$'\t'}"
+        printf 'E\t%s\tlink\t%s\t%s\t%s\t%s\n' "$name" "$lname" "$lrepo" "$status" "$rname"
+      done < "$links_file"
+    fi
+
+    local deps_file="$path/.herd/deps" kind rest ref lname2 lrepo2
+    if [ -f "$deps_file" ]; then
+      while IFS= read -r line; do
+        case "$line" in
+          'blocked-on: '*) kind="blocked-on"; rest="${line#blocked-on: }" ;;
+          'watch: '*)      kind="watch";      rest="${line#watch: }" ;;
+          *) continue ;;
+        esac
+        ref="${rest%%[[:space:]]*}"
+        [ -n "$ref" ] || continue
+        lname2="${ref%%#*}"
+        lrepo2="$(_fleet_graph_link_repo "$links_file" "$lname2")"
+        target="$(_fleet_graph_resolve "$reg" "$lname2" "$lrepo2")"
+        status="${target%%$'\t'*}"; rname="${target#*$'\t'}"
+        printf 'E\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$kind" "$ref" "$lrepo2" "$status" "$rname"
+      done < "$deps_file"
+    fi
+  done < "$reg"
+}
+
+# The renderer (python): reads the P/E manifest on stdin and prints either the human tree/edge-list
+# (default) or the --json shape (AS_JSON=1) — one analysis pass, two presentations, mirroring
+# cmd_conformance_report's text/--json split.
+_FLEET_GRAPH_PY='
+import sys, os, json
+
+projects = []
+by_name = {}
+for raw in sys.stdin:
+    line = raw.rstrip("\n")
+    if not line:
+        continue
+    parts = line.split("\t")
+    tag = parts[0]
+    if tag == "P":
+        name = parts[1] if len(parts) > 1 else "?"
+        path = parts[2] if len(parts) > 2 else ""
+        repo = parts[3] if len(parts) > 3 else ""
+        status = parts[4] if len(parts) > 4 else "ok"
+        p = {"name": name, "path": path, "repo": repo, "reachable": status == "ok", "edges": []}
+        projects.append(p)
+        by_name[name] = p
+    elif tag == "E":
+        name = parts[1] if len(parts) > 1 else ""
+        p = by_name.get(name)
+        if p is None:
+            continue
+        kind = parts[2] if len(parts) > 2 else ""
+        ref = parts[3] if len(parts) > 3 else ""
+        repo = parts[4] if len(parts) > 4 else ""
+        status = parts[5] if len(parts) > 5 else "unregistered"
+        to_project = parts[6] if len(parts) > 6 else ""
+        p["edges"].append({
+            "kind": kind, "ref": ref, "repo": repo, "status": status,
+            "to_project": to_project or None,
+        })
+
+registry = os.environ.get("REGFILE", "")
+
+if os.environ.get("AS_JSON") == "1":
+    out = {
+        "registry": registry,
+        "nodes": [
+            {"name": p["name"], "path": p["path"], "repo": p["repo"], "reachable": p["reachable"]}
+            for p in projects
+        ],
+        "edges": [dict(e, **{"from": p["name"]}) for p in projects for e in p["edges"]],
+    }
+    json.dump(out, sys.stdout, indent=2)
+    print()
+else:
+    if not projects:
+        print("no fleet registry yet (%s) — add a project with: herd fleet register <path>" % registry)
+        sys.exit(0)
+    for p in projects:
+        header = p["name"] + (("  (%s)" % p["repo"]) if p["repo"] else "")
+        print(header)
+        if not p["reachable"]:
+            print("  (unreachable — path or .herd/config missing)")
+            print("")
+            continue
+        if not p["edges"]:
+            print("  (no links or deps)")
+            print("")
+            continue
+        for e in p["edges"]:
+            extra = ("  (%s)" % e["repo"]) if e["repo"] else ""
+            resolved = ("  = %s" % e["to_project"]) if e["to_project"] else ""
+            print("  %-11s -> %-24s%s  [%s]%s" % (e["kind"], e["ref"], extra, e["status"], resolved))
+        print("")
+'
+
+# fleet_graph [--json] — the deterministic relationship-graph rollup (HERD-386): registry projects as
+# nodes, each project's OWN .herd/links + .herd/deps as labeled edges. Plain text by default
+# (tree/edge-list, glow-friendly); --json for machine use. Fail-soft: an empty/missing registry prints
+# the same friendly note as fleet_status/fleet_list rather than an error.
+fleet_graph() {
+  local as_json=0
+  case "${1:-}" in
+    --json) as_json=1; shift ;;
+    -h|--help) say "usage: herd fleet graph [--json]"; return 0 ;;
+  esac
+  [ "$#" -eq 0 ] || die "usage: herd fleet graph [--json]"
+  local reg; reg="$(_fleet_registry_file)"
+  REGFILE="$reg" AS_JSON="$as_json" python3 -c "$_FLEET_GRAPH_PY" < <(_fleet_graph_manifest)
+}
+
 # ── upgrade / reload fan-out ─────────────────────────────────────────────────
 
 # _fleet_fanout <verb> <herd-arg>... — run `herd <herd-arg>...` inside every registered project and
