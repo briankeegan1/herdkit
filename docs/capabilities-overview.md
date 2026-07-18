@@ -59,15 +59,16 @@ merge control, the feedback loop) see [`../README.md`](../README.md).
 ### Fleet — deterministic multi-project fan-out
 
 `herd fleet <sub>` is a **no-LLM** fan-out over a flat project registry (default `~/.herd/fleet`,
-one `name|path|repo` line per project). It never mutates a project's tree beyond what a delegated
-per-project command already does; a missing / dirty / `gh`-unavailable project is reported, not
-fatal.
+one `name|path|repo|aliases` line per project — `aliases` is optional and comma-separated). It never
+mutates a project's tree beyond what a delegated per-project command already does; a missing / dirty
+/ `gh`-unavailable project is reported, not fatal.
 
 | subcommand | what it does |
 |---|---|
-| `register <path>` | Add a herd project (read from its `.herd/config`) to the registry. |
-| `list` | List registered projects (name · path · repo). |
+| `register <path> [--alias <name>]...` | Add a herd project (read from its `.herd/config`) to the registry. Repeatable `--alias` records extra free-text names `resolve` also matches; a plain re-register with no `--alias` preserves whatever aliases the row already had. |
+| `list` | List registered projects (name · path · repo · aliases). |
 | `discover [--register] <root>...` | Scan roots for `.herd/config` projects; print, and with `--register` add, each one found. |
+| `resolve <free text>` | Deterministic **NL pre-resolver** (HERD-387): match free text against project names + aliases with fixed precedence — exact name > alias > unambiguous prefix (name or alias), case-insensitive. Prints the resolved canonical name and exits 0; refuses (non-zero, candidates listed) on no match or a tie. The `fleet room` NL master-coordinator calls this first and only falls back to its own judgment when it refuses. |
 | `status` | Read-only per-project rollup: branch, open PR count, watcher alive? (via the `herd-watch-<workspace>` argv0 marker), last journal activity. |
 | `digest [--since <dur>]` | Cross-project standup aggregating each project's journal over a window (default 24h): per project — shipped/merged, needs-you holds + escalations, blocked verdicts, in-flight reviews, gate-failure count — plus a fleet summary line. |
 | `inbox` | The cross-project **attention inbox** — one view of what needs you right now (blocked PRs, human-verify/approval holds, `gh`-live CONFLICTING PRs, failed health gates), each as `PR# · reason · suggested action`; a clean project shown as clean. |
