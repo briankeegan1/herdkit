@@ -339,6 +339,7 @@ COORDINATOR_AUTONOMY	unit	tests/test-knob-aware-doctrine.sh
 DEAD_BUILDER_AUTORESPAWN	unit	tests/test-dead-builder-respawn.sh
 WEDGE_GRACE_MIN	unit	tests/test-wedged-builder.sh
 WEDGE_AUTOWAKE	unit	tests/test-wedged-builder.sh
+FINISH_STALL_MIN	unit	tests/test-finish-stall-watchdog.sh
 scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
 TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh
 DOCTOR_STARTUP_HINT	unit	tests/test-doctor-point-of-need.sh

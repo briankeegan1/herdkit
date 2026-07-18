@@ -60,6 +60,8 @@ class AccessorParity(_PoolCase):
         st.bump_refix("k", "sha1")
         st.seat_stamp("s1", 5, 1000, "active")
         st.seat_stamp("s1", 6, 1001, "active")               # latest per seat wins
+        st.mark_finish_stall_seen("fs-slug", 2000)
+        st.mark_finish_stall_seen("fs-slug", 9999)           # get-or-create: must NOT move the anchor
         return {
             "approval": st.approval_state("42", "abcdef"),   # strongest = approved
             "approval_none": st.approval_state("99"),
@@ -69,6 +71,7 @@ class AccessorParity(_PoolCase):
             "once_first": st.once("g1"),
             "once_second": st.once("g1"),
             "seat": sorted(st.seat_rows()),
+            "finish_stall": st.finish_stall_record("fs-slug"),
         }
 
     def test_parity(self):
@@ -84,6 +87,7 @@ class AccessorParity(_PoolCase):
         self.assertEqual(flat["refix"], 2)
         self.assertTrue(flat["once_first"] and not flat["once_second"])
         self.assertEqual(flat["seat"], [("s1", 6, 1001, "active")])
+        self.assertEqual(flat["finish_stall"], (2000, "pending"))
 
     def test_approval_purge_by_pr(self):
         for be in ("flat", "sqlite"):
@@ -125,6 +129,32 @@ class AccessorParity(_PoolCase):
             self.assertFalse(st.main_health_fix_marked(identity), "%s: clear did not drop the marker" % be)
             self.assertTrue(st.mark_main_health_fix(identity, "483", "0000"),
                             "%s: a regression after clear could not re-claim" % be)
+
+    def test_finish_stall_clock_lifecycle(self):
+        """HERD-392: the finish-line watchdog's shared-pool clock. get-or-create never moves an
+        existing anchor (so two seats racing the first sighting converge on ONE epoch); set-state
+        preserves the anchor; reset overwrites both; clear drops the record for a later regression."""
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            slug = "builder-42"
+            self.assertIsNone(st.finish_stall_record(slug), be)
+            self.assertEqual(st.mark_finish_stall_seen(slug, 1000), (1000, "pending"), be)
+            # a second seat's mark with a DIFFERENT epoch must not move the anchor
+            self.assertEqual(st.mark_finish_stall_seen(slug, 9999), (1000, "pending"),
+                              "%s: get-or-create moved an existing anchor" % be)
+            st.set_finish_stall_state(slug, "retasked")
+            self.assertEqual(st.finish_stall_record(slug), (1000, "retasked"),
+                              "%s: set-state must preserve the anchor" % be)
+            st.reset_finish_stall(slug, 2000, "escalated")
+            self.assertEqual(st.finish_stall_record(slug), (2000, "escalated"),
+                              "%s: reset must overwrite both fields" % be)
+            st.clear_finish_stall(slug)
+            self.assertIsNone(st.finish_stall_record(slug), "%s: clear did not drop the record" % be)
+            # a different slug is never blocked by another slug's record
+            self.assertEqual(st.mark_finish_stall_seen("other-slug", 5000), (5000, "pending"), be)
+            self.assertEqual(st.mark_finish_stall_seen(slug, 3000), (3000, "pending"),
+                              "%s: a regression after clear could not re-anchor" % be)
 
 
 class RoundTrip(_PoolCase):
@@ -220,6 +250,101 @@ class ConcurrentClaim(_PoolCase):
         winners, final = self._race("flat")
         self.assertEqual(len(winners), 1, "flat lost-update: %r" % winners)
         self.assertIn(final, winners)
+
+    def _race_finish_stall_anchor(self, backend, n=24):
+        """HERD-392: many 'seats' racing the FIRST sighting of the same slug's stall clock must
+        converge on exactly ONE anchor epoch — the load-bearing claim of the shared-pool clock."""
+        os.environ["STORE_BACKEND"] = backend
+        results = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(n)
+
+        def worker(epoch):
+            st = S.open_store(self.pool)
+            barrier.wait()
+            r = st.mark_finish_stall_seen("HERD-RACE-SLUG", epoch)
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker, args=(1000 + i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        final = S.open_store(self.pool).finish_stall_record("HERD-RACE-SLUG")
+        return set(results), final
+
+    def test_sqlite_finish_stall_single_anchor(self):
+        winners, final = self._race_finish_stall_anchor("sqlite")
+        self.assertEqual(len(winners), 1, "sqlite finish-stall lost-update: %r" % winners)
+        self.assertIn(final, winners)
+
+    def test_flat_finish_stall_single_anchor(self):
+        winners, final = self._race_finish_stall_anchor("flat")
+        self.assertEqual(len(winners), 1, "flat finish-stall lost-update: %r" % winners)
+        self.assertIn(final, winners)
+
+    def test_flat_finish_stall_state_reset_mutual_exclusion(self):
+        """PR #502 review (advisory): the flat backend's `set_finish_stall_state` reads the anchor
+        before rewriting it — unguarded, a concurrent `reset_finish_stall` landing in that window has
+        its epoch change silently clobbered by the stale-read rewrite. `_finish_stall_lock` serializes
+        the two; prove it directly by having many threads race BOTH ops on one slug and asserting no
+        two critical sections ever overlap (the load-bearing guarantee, independent of interleaving
+        order)."""
+        os.environ["STORE_BACKEND"] = "flat"
+        st = S.open_store(self.pool)
+        st.mark_finish_stall_seen("HERD-LOCK-SLUG", 1000)
+        n = 16
+        barrier = threading.Barrier(n)
+        inside = {"n": 0, "max": 0}
+        lock = threading.Lock()
+        violated = threading.Event()
+
+        real_lock = st._b._finish_stall_lock
+        real_unlock = st._b._finish_stall_unlock
+
+        def counted_lock(slug, timeout=2.0):
+            got = real_lock(slug, timeout)
+            with lock:
+                inside["n"] += 1
+                inside["max"] = max(inside["max"], inside["n"])
+                if inside["n"] > 1:
+                    violated.set()
+            return got
+
+        def counted_unlock(path):
+            with lock:
+                inside["n"] -= 1
+            real_unlock(path)
+
+        st._b._finish_stall_lock = counted_lock
+        st._b._finish_stall_unlock = counted_unlock
+
+        errors = []
+
+        def worker(i):
+            barrier.wait()
+            try:
+                if i % 2 == 0:
+                    st.reset_finish_stall("HERD-LOCK-SLUG", 2000 + i, "retasked")
+                else:
+                    st.set_finish_stall_state("HERD-LOCK-SLUG", "escalated")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], "worker thread(s) raised: %r" % errors)
+        self.assertFalse(violated.is_set(), "two finish-stall critical sections overlapped")
+        self.assertEqual(inside["max"], 1, "lock allowed concurrent entry: max=%d" % inside["max"])
+        # the record must always be a well-formed, non-corrupted (epoch, state) pair afterward
+        rec = st.finish_stall_record("HERD-LOCK-SLUG")
+        self.assertIsNotNone(rec)
+        self.assertIsInstance(rec[0], int)
+        self.assertIn(rec[1], ("retasked", "escalated"))
 
 
 class BackendResolution(_PoolCase):

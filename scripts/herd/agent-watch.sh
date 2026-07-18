@@ -10848,6 +10848,376 @@ _reconcile_wedged_builder() {
   printf '%s' "$_rw_verdict"
 }
 
+# ── Finish-line watchdog (HERD-392) ───────────────────────────────────────────────────────────────
+# GROUNDED in six live instances 2026-07-16..18: a builder produced real work — a committed-but-
+# unpushed series, or an uncommitted diff — then its agent went quiet with NO PR ever opened, and
+# nobody noticed until a human happened to look. WEDGE (above, HERD-278) deliberately treats a clean,
+# committed-ahead tree as NOT wedged ("its PR is a push away, in flight") — exactly the gap these six
+# incidents sat in. This leg closes it, and goes one step further than wedge's detect-and-surface
+# stance: it actively RE-TASKS the builder once, because "push it yourself" is a one-line ask.
+#
+# SHIP-DORMANT, and more strictly than WEDGE_GRACE_MIN (which always defaults to a live 10m grace):
+# this ENTIRE leg — detection, re-task, escalation, every store shellout — does not exist until an
+# operator sets FINISH_STALL_MIN to a positive integer. Unset/non-numeric/<=0 is a hard no-op: zero
+# git probes beyond what the tick already ran, zero python3 shellouts, byte-identical console.
+#
+# THE SIGNATURE — all hold, simultaneously:
+#   • agent_status reads 'done' OR 'idle' continuously (an idle agent counts here, unlike wedge —
+#     the discriminator is the WORK itself, not the pane status: an agent that produced a commit or a
+#     diff was plainly tasked, whatever its pane now reads)
+#   • the tree carries genuine work: uncommitted tracked changes, OR commits ahead of its OWN remote
+#     branch (origin/<branch> — never "ahead of base branch", which is what wedge measures and would
+#     re-flag the exact in-flight case wedge exists to exempt)
+#   • the open-PR roster positively has NO PR (the caller only reaches here when PRS_LOOKUP_OK=1)
+#   • the agent is not currently limit-parked (a parked agent cannot act on a nudge; its own hold row
+#     owns the tick)
+#   • it has PERSISTED past FINISH_STALL_MIN, continuously
+#
+# MULTI-SEAT: the clock is a SHARED-POOL anchor (pysrc/herd/store.py finish_stall_* accessors, sqlite
+# or flat backend), not seat memory — every seat ticking the same slug converges on the same first-seen
+# epoch and the same state word, so a restart or a seat handoff never resets (or double-fires) the
+# clock. On a store failure every accessor fails toward "never seen" / "no-op", which only ever DELAYS
+# a flag, never fabricates one.
+#
+# THE REMEDY LADDER (bounded to two rungs, mirroring the refix budget doctrine — never open-ended):
+#   1. FIRST crossing (state 'pending') ⇒ deliver ONE re-task nudge through the SAME driver seam /
+#      verified-wake discipline the refix bounce uses (pane run + explicit Enter, then poll
+#      agent_status). Delivered + accepted ⇒ record 'retasked' and RESET the anchor to the observed
+#      wake moment — the SECOND-STALL clock starts fresh from that real transition, never from the
+#      original sighting. Undelivered / not accepted ⇒ record 'escalated' immediately (a nudge that
+#      cannot land gets no second chance) and journal finish_stall_escalated.
+#   2. A SECOND full grace window elapses while still signatured (state 'retasked') ⇒ record
+#      'escalated' and journal finish_stall_escalated — the re-task did not finish the job.
+#   3. 'escalated' is terminal: the needs-you row keeps rendering, nothing fires again, until the slug
+#      escapes (a PR opens, the agent starts working, or the signature clears).
+
+# _finish_stall_min — FINISH_STALL_MIN in whole minutes on stdout + rc 0, or rc 1 (nothing printed)
+# when the leg is OFF: unset, empty, non-numeric, or <= 0. A typo can never turn this on.
+_finish_stall_min() {
+  case "${FINISH_STALL_MIN:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$FINISH_STALL_MIN" -gt 0 ] 2>/dev/null || return 1
+  printf '%s' "$FINISH_STALL_MIN"
+}
+# _finish_stall_enabled — true iff FINISH_STALL_MIN opts this whole leg in.
+_finish_stall_enabled() { _finish_stall_min >/dev/null; }
+# _finish_stall_grace_secs — FINISH_STALL_MIN in seconds, or 0 when the leg is off (a pure unit
+# conversion; callers gate on _finish_stall_enabled, not on a nonzero grace).
+_finish_stall_grace_secs() {
+  local _fg_m
+  _fg_m="$(_finish_stall_min)" || { printf '0'; return 0; }
+  printf '%s' $(( _fg_m * 60 ))
+}
+
+# _finish_stall_commits_ahead <worktree> <branch> — commits this branch carries that its OWN remote
+# ref does NOT (origin/<branch>) — genuinely unpushed work. Deliberately NOT "ahead of base"
+# (_wedge_commits_ahead): a clean, committed, base-ahead tree is exactly the case wedge exempts as
+# "in flight", and this leg exists to catch precisely that when it sits unpushed/un-PR'd too long.
+# When origin/<branch> does not exist (never pushed at all), every commit not on DEFAULT_BRANCH counts
+# — there is nothing on origin to be ahead of. A git failure or a non-numeric result reads as 0.
+_finish_stall_commits_ahead() {
+  local _fca_wt="$1" _fca_branch="$2" _fca_n
+  if git -C "$_fca_wt" rev-parse --verify -q "refs/remotes/origin/${_fca_branch}" >/dev/null 2>&1; then
+    _fca_n="$(git -C "$_fca_wt" rev-list --count "origin/${_fca_branch}..HEAD" 2>/dev/null || printf 0)"
+  else
+    _fca_n="$(git -C "$_fca_wt" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || printf 0)"
+  fi
+  case "$_fca_n" in ''|*[!0-9]*) _fca_n=0 ;; esac
+  printf '%s' "$_fca_n"
+}
+
+# _finish_stall_dirty <worktree> — 1 iff the tree has UNCOMMITTED TRACKED changes (staged or
+# unstaged), else 0. Deliberately narrower than _wedge_dirty (git status --porcelain non-empty, which
+# ALSO counts untracked files): capabilities.tsv, config.example, and this leg's own header comment
+# all say "uncommitted TRACKED changes" — a spare/never-tasked builder with one stray untracked
+# scratch file must never be nudged to "commit it, push, and open a PR" (PR #502 review). A herestring,
+# not a pipe, into grep -v — no producer process, no EPIPE under set -o pipefail (HERD-297 doctrine).
+_finish_stall_dirty() {
+  local _fsd_out
+  _fsd_out="$(git -C "$1" status --porcelain 2>/dev/null)"
+  [ -n "$_fsd_out" ] || { printf 0; return 0; }
+  grep -qv '^?? ' <<< "$_fsd_out" && printf 1 || printf 0
+}
+
+# _classify_finish_stall <agent-status> <has-pr> <has-work> <limit-parked> <state> <first-seen> <now>
+# <grace> — the PURE verdict for a live, non-working, PR-less builder once FINISH_STALL_MIN is enabled.
+# Echoes exactly one token:
+#   NOT_STALLED  — an escape hatch holds (a PR; the agent is working; nothing pushable/uncommitted; or
+#                  the account usage limit is parking it) ⇒ the caller clears any record
+#   PENDING      — the signature holds but has not yet persisted past <grace> ⇒ hold
+#   FIRST_STALL  — past grace, no re-task has fired yet for this anchor (<state> pending/empty) ⇒ the
+#                  caller should attempt the ONE re-task
+#   SECOND_STALL — past grace AGAIN after a successful re-task (<state> retasked) ⇒ escalate
+#   ESCALATED    — already escalated (<state> escalated), OR <state> is anything else UNRECOGNIZED ⇒
+#                  keep rendering the needs-you row, never re-fire an action. A corrupt/garbage state
+#                  word fails toward INACTION, not toward "fresh, first crossing" (PR #502 review
+#                  advisory #4): the ladder considers a nudge already spent whenever it cannot PROVE
+#                  otherwise, mirroring the once-guard doctrine's "fail closed" default elsewhere.
+# <has-pr>/<has-work>/<limit-parked> are "1"/"0"; a non-numeric elapsed comparison never crashes because
+# <first-seen> empty is checked FIRST, short-circuiting the arithmetic.
+_classify_finish_stall() {
+  local astatus="$1" has_pr="${2:-0}" haswork="${3:-0}" limitp="${4:-0}" state="${5:-}" \
+        first_seen="$6" now="${7:-0}" grace="${8:-0}"
+  [ "$has_pr" = "1" ] && { printf 'NOT_STALLED'; return 0; }
+  case "$astatus" in done|idle) : ;; *) printf 'NOT_STALLED'; return 0 ;; esac
+  [ "$haswork" = "1" ] || { printf 'NOT_STALLED'; return 0; }
+  [ "$limitp" = "1" ] && { printf 'NOT_STALLED'; return 0; }
+  if [ -z "$first_seen" ] || [ "$(( now - first_seen ))" -lt "$grace" ]; then
+    printf 'PENDING'; return 0
+  fi
+  case "$state" in
+    retasked)    printf 'SECOND_STALL' ;;
+    ''|pending)  printf 'FIRST_STALL' ;;
+    *)           printf 'ESCALATED' ;;   # 'escalated', or any unrecognized/corrupt word
+  esac
+}
+
+# ── shared-pool clock accessors (pysrc/herd/store.py finish_stall_*, HERD-392) ─────────────────────
+# Multi-seat doctrine: the anchor + state word live in the shared pool, not a seat-local flat file, so
+# two coordinator seats ticking the same PR-less worktree never free-run their own clocks. Every
+# wrapper fails SOFT toward "never seen" — a missing python3/store degrades the leg to "always PENDING
+# from this seat's point of view", which only ever DELAYS a flag, never fabricates one.
+
+# _finish_stall_record <slug> — the shared-pool "<epoch>\t<state>" for <slug> on stdout (rc 0), or
+# nothing (rc 1, or a store/python3 failure) when unseen.
+_finish_stall_record() {
+  local _fr_pyp; _fr_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fr_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fr_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --finish-stall-record "$1" 2>/dev/null
+}
+
+# _finish_stall_mark <slug> <epoch> — atomically anchor <slug>'s clock at <epoch> iff no record exists
+# yet; echoes the WINNING "<epoch>\t<state>" (ours, or another seat's earlier record) either way, so
+# every seat converges on the same clock. Falls back to "<epoch>\tpending" on a store/python3 failure
+# (fail-soft: the clock simply restarts on THIS seat until the pool is reachable again).
+_finish_stall_mark() {
+  local _fm_pyp _fm_out
+  _fm_pyp="$(_main_health_fix_pysrc)"
+  if [ -n "$_fm_pyp" ] && command -v python3 >/dev/null 2>&1; then
+    _fm_out="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fm_pyp" WORKTREES_DIR="${TREES:-}" \
+      python3 -m herd.store --finish-stall-mark "$1" --epoch "$2" 2>/dev/null)"
+    [ -n "$_fm_out" ] && { printf '%s' "$_fm_out"; return 0; }
+  fi
+  printf '%s\tpending' "$2"
+}
+
+# _finish_stall_state <slug> <state> — flip the record's state word, PRESERVING its anchor. Best-effort
+# (a failure here only means the ⚠️/🔁 dedup re-evaluates next tick — never a crash, never a lost
+# escalation: the classifier recomputes FIRST_STALL/SECOND_STALL fresh from the still-standing anchor).
+_finish_stall_state() {
+  local _fs_pyp; _fs_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fs_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fs_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --finish-stall-state "$1" --state "$2" >/dev/null 2>&1 || true
+}
+
+# _finish_stall_reset <slug> <epoch> <state> — unconditionally overwrite BOTH fields. Used exactly
+# once, right after a successful re-task nudge, to start the SECOND-STALL clock from the OBSERVED wake
+# transition rather than the original sighting ("the stall clock derives from observed transitions").
+_finish_stall_reset() {
+  local _fx_pyp; _fx_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fx_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fx_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --finish-stall-reset "$1" --epoch "$2" --state "$3" >/dev/null 2>&1 || true
+}
+
+# _finish_stall_clear <slug> — drop the shared-pool record (the slug escaped: a PR opened, the agent
+# is working, or the signature otherwise cleared).
+_finish_stall_clear() {
+  local _fc_pyp; _fc_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fc_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fc_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --finish-stall-clear "$1" >/dev/null 2>&1 || true
+}
+
+# _finish_stall_note_escape <slug> — called from a tick branch where the STALL SIGNATURE itself does
+# not apply this tick (the agent is working, or it is limit-parked) — NOT a call site that already
+# knows the slug truly escaped (a PR opened; that path clears unconditionally via _finish_stall_clear
+# directly, e.g. the DEAD branch). PRESERVES a 'retasked'/'escalated' record — it must survive the very
+# working period the re-task nudge ITSELF causes (and any limit-park mid-task), or the classifier can
+# never reach SECOND_STALL: a delivered nudge would be silently wiped the moment the agent starts
+# working, and the very next stall would re-fire ANOTHER nudge forever instead of escalating (PR #502
+# review — the "at most ONE re-task, then terminal escalation" rail is the whole point of this leg).
+# An un-actioned 'pending' anchor (or no record at all) IS cleared, so a builder that goes back to
+# work on its own (no re-task fired) — or resumes from an account-usage-limit park — serves a FRESH
+# grace window rather than inheriting a stale, already-aging anchor.
+_finish_stall_note_escape() {
+  _finish_stall_enabled || return 0
+  local _ne_rec _ne_state="" _ne_anchor=""
+  _ne_rec="$(_finish_stall_record "$1")"
+  [ -n "$_ne_rec" ] && IFS=$'\t' read -r _ne_anchor _ne_state <<< "$_ne_rec"
+  case "$_ne_state" in
+    retasked|escalated) : ;;
+    *) _finish_stall_clear "$1" ;;
+  esac
+}
+
+# _finish_stall_note_pr_opened <slug> — called from the SINGLE choke point in the tick loop the
+# instant a PR is observed for <slug>, whichever downstream branch (mergeable, blocked, push-gate,
+# …) ends up handling it. A PR existing is unconditionally a real escape — never merely a
+# working/limit-park transient — so this is a FULL, unconditional clear (unlike
+# _finish_stall_note_escape, which preserves retasked/escalated). Without this, a LATER slug reusing
+# the same name (a fresh worktree/agent, no PR yet) would inherit a days-old 'escalated' anchor and
+# render needs-you on tick ONE, skipping the PENDING/FIRST_STALL rungs entirely (PR #502 review
+# advisory #2). Self-gates on the leg being enabled, so this stays a hard no-op when off.
+_finish_stall_note_pr_opened() {
+  _finish_stall_enabled && _finish_stall_clear "$1"
+}
+
+# _finish_stall_wake_prompt <slug> — the finish-line nudge: explicit steps, not just "you stopped".
+_finish_stall_wake_prompt() {
+  printf 'Your worktree for %s has unfinished work (uncommitted changes or unpushed commits) and no open PR, and your agent has stopped.\nValidate your work, run the healthcheck, then commit it (include the Refs line from your task spec), push, and open a NON-DRAFT PR with `gh pr create` (no --draft).\nDo not merge the PR and do not edit BACKLOG.md.' "$1"
+}
+
+# _finish_stall_retask <slug> — deliver the ONE re-task nudge through the SAME driver seam / verified-
+# wake discipline the refix bounce uses (herd_driver_send_text, then poll agent_status). Journals
+# finish_stall_wake / finish_stall_wake_result exactly like a refix wake. Echoes exactly one token
+# (mirrors _maybe_autowake_wedged_builder's verdict style): DRYRUN | NO_PANE | NO_WAKE | WOKE.
+# NEVER runs the real nudge under DRYRUN — checked FIRST, before any pane lookup, exactly like
+# _maybe_autowake_wedged_builder (PR #502 review: this is the ONE seam in this leg that mutates a
+# LIVE builder — types into its pane and can cause it to actually push/open a PR — so it is the one
+# seam the watcher's stated dry-run contract ("does everything EXCEPT ... never spawns the
+# reviewer/resolver or writes their state files") requires gating; detection/journal/notify bookkeeping
+# is unaffected, matching wedge's own precedent).
+_finish_stall_retask() {
+  local _ft_slug="$1" _ft_pane _ft_before _ft_after _ft_woke=0
+  if [ -n "${DRYRUN:-}" ]; then
+    printf '🐑 (dry-run) would re-task stalled builder %s\n' "$_ft_slug" >&2
+    printf 'DRYRUN'; return 0
+  fi
+  _ft_pane="$(_find_builder_pane_id_any "$_ft_slug")"
+  if [ -z "$_ft_pane" ]; then
+    journal_append finish_stall_wake_result slug "$_ft_slug" woke 0 reason "no agent pane to deliver the nudge to"
+    printf 'NO_PANE'; return 0
+  fi
+  _ft_before="$(_agent_status "$_ft_slug")"
+  journal_append finish_stall_wake slug "$_ft_slug" agent_status_before "${_ft_before:-unknown}"
+  herd_driver_send_text "$_ft_pane" "$(_finish_stall_wake_prompt "$_ft_slug")"
+  _wait_agent_working "$_ft_slug" "${HERD_REFIX_WAIT_TIMEOUT:-15}" && _ft_woke=1
+  _ft_after="$(_agent_status "$_ft_slug")"
+  journal_append finish_stall_wake_result slug "$_ft_slug" agent_status_before "${_ft_before:-unknown}" \
+    agent_status_after "${_ft_after:-unknown}" woke "$_ft_woke"
+  if [ "$_ft_woke" = "1" ]; then printf 'WOKE'; else printf 'NO_WAKE'; fi
+}
+
+# _finish_stall_action_once <slug> <anchor> — atomic, shared-pool "AT MOST ONCE" guard for the
+# FIRST_STALL/SECOND_STALL action itself (PR #502 review advisory #3): the anchor is already atomic
+# across seats, but two seats can both classify the SAME (slug, anchor) as FIRST_STALL in the same
+# window and both call _finish_stall_retask — a benign duplicate pane nudge, but it breaks the stated
+# "AT MOST ONCE" guarantee. Keyed by <slug>::<anchor> so a FRESH anchor (a new stall incident) always
+# gets a fresh guard. True iff THIS call is the first across the whole pool to win this exact
+# (slug, anchor, phase); fails OPEN (proceeds as the actor) when the store/python3 is unavailable —
+# the safe direction here is "this leg already fails toward inaction elsewhere" is NOT available for a
+# missing python3, so a duplicate nudge in that narrow failure mode is preferred over the leg going
+# silently inert; the shared-pool anchor's OWN fail-soft (never fabricates a flag) is what actually
+# protects against a false positive.
+_finish_stall_action_once() {
+  local _fao_pyp _fao_key="finish_stall_action::$1::$2"
+  _fao_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_fao_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_fao_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --once "$_fao_key" >/dev/null 2>&1
+  [ $? -ne 3 ]
+}
+
+# _row_finish_stall <slug-cell> <age> [retasked] — the console row for the finish-line watchdog
+# (HERD-392). Calm 🔁 the instant the ONE re-task nudge lands (the herd's move again — an operator
+# whose builder is working again must not be told to go push it by hand). RED ⚠️ needs-you the moment
+# that nudge fails to land OR the builder stalls a SECOND time after it: the herd will not clear this
+# on its own. Never renders 'idle' or 'awaiting task' — this builder was tasked and produced real work.
+_row_finish_stall() {
+  local _sl="$1" _age="$2" _retasked="${3:-}"
+  if [ -n "$_retasked" ]; then
+    printf '    %s🔁%s %s%s%s %sunfinished work · re-task sent · %s%s' \
+      "$C_CYAN" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_CYAN" "$_age" "$C_RESET"
+  else
+    printf '    %s⚠️%s  %s%s%s %sneeds-you · stalled with unfinished work (no PR) · push + open the PR by hand · %s%s' \
+      "$C_RED" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_RED" "$_age" "$C_RESET"
+  fi
+}
+
+# _reconcile_finish_stall <slug> <worktree> <agent-status> <branch> — drive the ledger + re-task +
+# escalation for ONE PR-less, non-working builder, and echo the verdict (OFF | NOT_STALLED | PENDING |
+# FIRST_STALL | SECOND_STALL | ESCALATED). Called from the tick's no-PR/non-working branch, alongside
+# _reconcile_wedged_builder — has_pr is 0 by construction (the caller only reaches this on a PR-less
+# slug, and only when PRS_LOOKUP_OK=1), and a limit-parked agent is routed to _handle_limit_blocked
+# BEFORE this is ever reached, so "not currently limit-parked" already holds structurally; the explicit
+# _detect_limit_hit probe below is belt-and-suspenders against a future caller that reaches this
+# differently.
+_reconcile_finish_stall() {
+  local _rfs_slug="$1" _rfs_wt="$2" _rfs_astatus="$3" _rfs_branch="$4"
+  _finish_stall_enabled || { printf 'OFF'; return 0; }
+  local _rfs_now _rfs_grace _rfs_rec _rfs_first="" _rfs_state="" _rfs_commits=0 _rfs_dirty=0 \
+        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict
+  _rfs_now="$(_now)"
+  _rfs_grace="$(_finish_stall_grace_secs)"
+  case "$_rfs_astatus" in
+    done|idle)
+      _rfs_commits="$(_finish_stall_commits_ahead "$_rfs_wt" "$_rfs_branch")"
+      _rfs_dirty="$(_finish_stall_dirty "$_rfs_wt")"
+      if [ "$_rfs_commits" -gt 0 ] || [ "$_rfs_dirty" = "1" ]; then
+        _rfs_haswork=1
+        _detect_limit_hit "$_rfs_slug" "$_rfs_wt" >/dev/null 2>&1 && _rfs_limit=1
+      fi
+      ;;
+  esac
+  _rfs_rec="$(_finish_stall_record "$_rfs_slug")"
+  if [ -n "$_rfs_rec" ]; then
+    IFS=$'\t' read -r _rfs_first _rfs_state <<< "$_rfs_rec"
+  fi
+  _rfs_verdict="$(_classify_finish_stall "$_rfs_astatus" 0 "$_rfs_haswork" "$_rfs_limit" \
+    "$_rfs_state" "$_rfs_first" "$_rfs_now" "$_rfs_grace")"
+  case "$_rfs_verdict" in
+    NOT_STALLED)
+      [ -n "$_rfs_first" ] && _finish_stall_clear "$_rfs_slug" ;;
+    PENDING)
+      [ -n "$_rfs_first" ] || _finish_stall_mark "$_rfs_slug" "$_rfs_now" >/dev/null ;;
+    FIRST_STALL)
+      journal_append finish_stall_detected slug "$_rfs_slug" first_seen "${_rfs_first:-$_rfs_now}" \
+        commits "$_rfs_commits" dirty "$_rfs_dirty"
+      # DRYRUN is checked BEFORE the once-guard, never after: the guard marks the action SPENT, and a
+      # dry run must never spend it — an operator who explores with AGENT_WATCH_DRYRUN=1 and then
+      # disables it must still get the real nudge on the next tick, not find it silently pre-consumed
+      # by the observation run. _finish_stall_retask itself re-checks DRYRUN first and never touches a
+      # pane; this call exists only so its stderr "(dry-run) would re-task" line still fires.
+      if [ -n "${DRYRUN:-}" ]; then
+        _finish_stall_retask "$_rfs_slug" >/dev/null
+      elif _finish_stall_action_once "$_rfs_slug" "${_rfs_first:-$_rfs_now}"; then
+        # "AT MOST ONCE" across every seat (PR #502 review advisory #3): the anchor is atomic, but the
+        # ACTION was not — two seats classifying the SAME (slug, anchor) as FIRST_STALL in the same
+        # window could otherwise both deliver a nudge. Only the winner acts; a loser does nothing this
+        # tick (the winner's outcome lands in the shared record for everyone on the next tick).
+        case "$(_finish_stall_retask "$_rfs_slug")" in
+          WOKE)
+            _finish_stall_reset "$_rfs_slug" "$_rfs_now" retasked
+            herd_driver_notify "🔁 stalled builder re-tasked: ${_rfs_slug}" \
+              "${_rfs_slug}: unfinished work with no PR — finish-line nudge delivered, agent is working again" default ;;
+          *)
+            _finish_stall_state "$_rfs_slug" escalated
+            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed"
+            herd_driver_notify "⚠️ builder stalled before opening a PR: ${_rfs_slug}" \
+              "${_rfs_slug}: work exists (uncommitted or unpushed) but the agent stopped and the auto re-task did not land — push + open the PR by hand" default ;;
+        esac
+      fi ;;
+    SECOND_STALL)
+      if _finish_stall_action_once "$_rfs_slug" "escalate:${_rfs_first:-$_rfs_now}"; then
+        _finish_stall_state "$_rfs_slug" escalated
+        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task"
+        herd_driver_notify "⚠️ builder stalled again before opening a PR: ${_rfs_slug}" \
+          "${_rfs_slug}: re-tasked once already but stopped again with work still unshipped — push + open the PR by hand" default
+      fi ;;
+    ESCALATED) : ;;   # already surfaced (or an unrecognized state); keep rendering, never re-fire
+  esac
+  printf '%s' "$_rfs_verdict"
+}
+
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
 # WHY: every feature worktree shares ONE git object store and one .git/worktrees lock namespace, so
 # two full healthcheck suites running at once race on shared git locks (empirically: concurrent
@@ -12700,6 +13070,11 @@ EOF
         _bmismatch="$(_branch_mismatch_text "$branch" "$matchdetail")"
       fi
     fi
+    # HERD-392 review fix (advisory #2): _reconcile_finish_stall is reached ONLY on the PR-less branch
+    # below, so nothing ever cleared a slug's finish-stall record once a PR actually opened for it —
+    # see _finish_stall_note_pr_opened. ONE choke point covers every downstream has-PR branch
+    # (mergeable, blocked, push-gate-awaiting, …).
+    [ -n "$prnum" ] && _finish_stall_note_pr_opened "$slug"
     if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
       # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
       # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
@@ -12743,6 +13118,12 @@ EOF
         # Reached only when PRS_LOOKUP_OK=1: a successful list positively has no PR for this branch.
         if _lim_reset="$(_detect_limit_hit "$slug" "$dir")"; then _lim_hit=1; else _lim_hit=0; fi
         if [ "$_lim_hit" = "1" ] || [ -n "$(limit_state "$slug")" ]; then
+          # HERD-392 review fix: a limit-parked builder never reaches _reconcile_finish_stall (this
+          # branch owns the tick instead), so an un-actioned anchor would otherwise keep aging through
+          # the ENTIRE park and read as already-past-grace the instant it resumes. Preserve a
+          # 'retasked'/'escalated' record (the re-task itself may be what put it mid-task when the
+          # limit hit); clear a merely-'pending' one so resuming serves a fresh grace window.
+          _finish_stall_note_escape "$slug"
           _handle_limit_blocked "$slug" "$dir" "$i" "${_lim_reset:-0}"
         else
           # Not limit-blocked. Distinguish a benign idle agent (still listed in `herdr agent list`,
@@ -12755,8 +13136,9 @@ EOF
           case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
             DEAD)
               # A dead builder is not a wedge — 💀 is the louder, truer row, and a corpse cannot be
-              # woken. Drop any wedge record so the two ledgers never both claim the same slug.
+              # woken. Drop any wedge/finish-stall record so no ledger keeps claiming this slug.
               clear_wedge "$slug"
+              _finish_stall_enabled && _finish_stall_clear "$slug"
               if [ "$_live" = "dead" ] && [ -n "$astatus" ]; then
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}agent dead · session unwakeable (no PR) · re-spawn${C_RESET}"
               else
@@ -12764,25 +13146,41 @@ EOF
               fi
               FLAIR_STATE[i]="dead" ;;
             *)
-              # ALIVE (or still PENDING death): the agent is listed. Two very different builders land
-              # here. HERD-278: one whose agent reads 'done' over a branch with no PR and nothing
-              # pushable is a WEDGE — it was tasked and abandoned the task mid-delivery — and calling
-              # it a spare ("assign or retire") is the lie that hid three of them on 2026-07-09.
-              # Everything else is a genuine spare. A wedge must age past the grace window first, so a
-              # builder inside `gh pr create` keeps the row it had.
-              _wedge="$(_reconcile_wedged_builder "$slug" "$dir" "$astatus")"
-              if [ "$_wedge" = "WEDGED" ]; then
-                _wfirst="$(wedge_first_seen "$slug")"; _wwoke=""
-                if wedge_woken "$slug"; then _wwoke="woken"; fi
-                DISPLAY[i]="$(_row_wedged "$sl" "$(_fmt_age "$(( $(_now) - ${_wfirst:-$(_now)} ))")" "$_wwoke")"
-                FLAIR_STATE[i]="attention"
-              else
-                # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting a
-                # task (YOUR move: assign work or retire it), rendered with the idle age. FLAIR_STATE
-                # keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
-                DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
-                FLAIR_STATE[i]="idle"
-              fi ;;
+              # ALIVE (or still PENDING death): the agent is listed. HERD-392: check the finish-line
+              # watchdog FIRST — ship-dormant (OFF unless FINISH_STALL_MIN is set), so with it unset
+              # this always reads NOT_STALLED/OFF and falls straight through to the wedge/spare
+              # classification below, byte-identical to before this leg existed.
+              _fstall="$(_reconcile_finish_stall "$slug" "$dir" "$astatus" "$branch")"
+              case "$_fstall" in
+                FIRST_STALL|SECOND_STALL|ESCALATED)
+                  _fsrec="$(_finish_stall_record "$slug")"; _fsfirst=""; _fsstate=""
+                  [ -n "$_fsrec" ] && IFS=$'\t' read -r _fsfirst _fsstate <<< "$_fsrec"
+                  _fsretasked=""; [ "$_fsstate" = "retasked" ] && _fsretasked="retasked"
+                  DISPLAY[i]="$(_row_finish_stall "$sl" "$(_fmt_age "$(( $(_now) - ${_fsfirst:-$(_now)} ))")" "$_fsretasked")"
+                  # A delivered re-task is calm/in-progress (🩺 'busy', matching the resolving/limit-
+                  # resume glyph family), never the LOUD ⚠️ 'attention' glyph the row text itself is
+                  # careful NOT to be (PR #502 review) — only the needs-you variants earn 'attention'.
+                  if [ -n "$_fsretasked" ]; then FLAIR_STATE[i]="busy"; else FLAIR_STATE[i]="attention"; fi ;;
+                *)
+                  # Two very different builders land here. HERD-278: one whose agent reads 'done' over
+                  # a branch with no PR and nothing pushable is a WEDGE — it was tasked and abandoned
+                  # the task mid-delivery — and calling it a spare ("assign or retire") is the lie that
+                  # hid three of them on 2026-07-09. Everything else is a genuine spare. A wedge must
+                  # age past the grace window first, so a builder inside `gh pr create` keeps its row.
+                  _wedge="$(_reconcile_wedged_builder "$slug" "$dir" "$astatus")"
+                  if [ "$_wedge" = "WEDGED" ]; then
+                    _wfirst="$(wedge_first_seen "$slug")"; _wwoke=""
+                    if wedge_woken "$slug"; then _wwoke="woken"; fi
+                    DISPLAY[i]="$(_row_wedged "$sl" "$(_fmt_age "$(( $(_now) - ${_wfirst:-$(_now)} ))")" "$_wwoke")"
+                    FLAIR_STATE[i]="attention"
+                  else
+                    # Closed vocabulary (HERD-172): a live spare builder is not "idle" — it is awaiting
+                    # a task (YOUR move: assign work or retire it), rendered with the idle age.
+                    # FLAIR_STATE keeps its internal "idle" enum → the pasture glyph (💤) is byte-identical.
+                    DISPLAY[i]="$(_row_awaiting_task "$sl" "$dir")"
+                    FLAIR_STATE[i]="idle"
+                  fi ;;
+              esac ;;
           esac
         fi
       else
@@ -12796,6 +13194,14 @@ EOF
         # record so a builder that was woken (by the auto-wake, or by a human) and later stops again
         # must serve the FULL grace window before it re-surfaces. No-ops when absent.
         clear_wedge "$slug"
+        # Same for the finish-line watchdog (HERD-392): the signature (done/idle) does not hold while
+        # working. BUT unlike wedge, a 'retasked'/'escalated' record must SURVIVE this branch — a
+        # delivered re-task nudge is exactly what puts the agent into "working" on the very next tick,
+        # so an unconditional clear here would wipe the record the instant the nudge succeeds and make
+        # SECOND_STALL/escalation unreachable (PR #502 review). _finish_stall_note_escape clears only
+        # an un-actioned 'pending' anchor (or nothing); it self-gates on the leg being enabled, so this
+        # stays a hard no-op (no shellout) when FINISH_STALL_MIN is unset.
+        _finish_stall_note_escape "$slug"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
