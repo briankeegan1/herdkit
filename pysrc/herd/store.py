@@ -537,19 +537,37 @@ class _FlatBackend:
         if not path:
             return True
         _ensure_parent(path)
-        # Atomic claim-or-abort, exactly like `once()`: O_CREAT|O_EXCL never leaves a lost-update window
-        # between two seats racing to file the SAME failing-test identity.
+        # Atomic claim-or-abort with NO empty window (mirrors `claim()` / `mark_finish_stall_seen()`,
+        # HERD-333/HERD-393): materialize a COMPLETE temp file (epoch/pr/sha already written and
+        # closed) and hard-link it into place. A plain O_CREAT|O_EXCL create is atomic for "who makes
+        # the file" but leaves it EMPTY until the winner's separate os.write lands — a rival that hits
+        # FileExistsError in that window would read the empty marker and could self-report as winner
+        # too, risking a double-filed tracker item under concurrent seats. Writing the payload BEFORE
+        # the file is linkable closes that window entirely.
+        tmp = "%s.tmp-%d-%d" % (path, os.getpid(), _thread_id())
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            return False
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except Exception:
-            return True
+            # Could not even stage a temp file — fail CLOSED like `once()` / the sqlite backend:
+            # never claim a win we can't durably back. Missing one filing is safe; double-filing a
+            # duplicate tracker item is the bug this accessor exists to remove.
+            return False
         try:
             os.write(fd, ("%s\t%s\t%s\n" % (_now(), pr, sha)).encode("utf-8"))
         finally:
             os.close(fd)
-        return True
+        try:
+            os.link(tmp, path)          # atomic publish: fails EEXIST if a rival won the race
+            return True                  # we won (the marker now holds our filing)
+        except FileExistsError:
+            return False                 # rival won; their marker is already fully written
+        except Exception:
+            return False
+        finally:
+            try:
+                os.remove(tmp)           # our temp is never the published file — always clean it up
+            except Exception:
+                pass
 
     def clear_main_health_fix(self, identity):
         path = self._main_health_fix_file(identity)
