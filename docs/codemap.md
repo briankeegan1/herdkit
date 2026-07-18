@@ -34,6 +34,7 @@ Role summarized from each file's top-of-file comment.
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `create-retry.sh` — the DURABLE RETRY QUEUE for failed tracker-item CREATES (HERD-267).
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
+- `deps-parse.sh` — THE shared .herd/deps row parser (HERD-389): exact-field ref matching for
 - `derived-files.sh` — the ONE list of REGENERABLE DERIVED FILES the engine writes into a project
 - `doc-drift-lint.sh` — THE shared doc-drift guard (HERD-168 / extends HERD-96; HERD-254
 - `drainer-liveness.sh` — shared LIVENESS helpers for the async drainer singletons (HERD-109).
@@ -118,7 +119,7 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
+- `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
 - `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`
 - `app-monitor.sh` → `herd-config.sh`
@@ -129,7 +130,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `codemap.sh` → `herd-config.sh`
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
 - `create-retry.sh` → `herd-config.sh`, `journal.sh`
-- `dep-watcher.sh` → `driver.sh`, `herd-config.sh`, `herd-links.sh`
+- `dep-watcher.sh` → `deps-parse.sh`, `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`
 - `engine-seat.sh` → `engine-version.sh`, `journal.sh`
 - `engine-version.sh` → `journal.sh`
