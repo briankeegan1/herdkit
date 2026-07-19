@@ -36,14 +36,25 @@
 #   • Fail-soft only where the underlying op already is: a wrapper never adds a new failure mode; it
 #     returns whatever its delegate returns.
 
+_WUNIT_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 # ── borrow agent-watch.sh's function bank (git-pr adapter body) ────────────────────────────────────
 if ! command -v do_merge >/dev/null 2>&1; then
-  _WUNIT_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
   # shellcheck disable=SC2034  # read by agent-watch.sh's own lib-mode guard on the next line
   AGENT_WATCH_LIB=1
   # shellcheck source=/dev/null
   . "$_WUNIT_HERE/agent-watch.sh"
   unset AGENT_WATCH_LIB
+fi
+
+# ── borrow journal.sh's unit-ref composer if not already in scope ──────────────────────────────────
+# The common path above already pulls this in (agent-watch.sh sources journal.sh), so this is a
+# no-op there. It only fires for a caller that pre-defines do_merge (skipping the borrow above)
+# without having sourced journal.sh itself — makes wunit_ref's dependency explicit rather than
+# conventional (HERD-397 review: a bare "already in scope by convention" comment left it unasserted).
+if ! command -v journal_unit_ref >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$_WUNIT_HERE/journal.sh"
 fi
 
 # ── open / list_open / inspect — passthrough to `gh pr …` (today's git-pr open + discovery path) ──
@@ -103,12 +114,11 @@ wunit_teardown() {
 # ── ref — the shared unit-id composer (HERD-397, Phase 2 dual-write) ───────────────────────────────
 
 # wunit_ref <kind> <id> — compose a namespaced unit ref, e.g. `wunit_ref git-pr 42` → "git-pr:42".
-# Delegates to journal.sh's journal_unit_ref, which is ALREADY in scope by the time this file finishes
-# loading (the agent-watch.sh borrow above transitively sources journal.sh; a caller with do_merge
-# pre-defined has, by this codebase's convention, sourced journal.sh too). This file never re-derives
-# the format itself — journal_unit_ref is THE single place it is composed, so the ref this facade
-# hands out and the ref journal.sh's own pr→unit dual-write writes to every journal event can never
-# diverge (spike docs/spikes/work-unit-abstraction.md §2.2 unit_id).
+# Delegates to journal.sh's journal_unit_ref, which the borrow block above GUARANTEES is in scope
+# (explicitly sourced if not already, not left to convention). This file never re-derives the format
+# itself — journal_unit_ref is THE single place it is composed, so the ref this facade hands out and
+# the ref journal.sh's own pr→unit dual-write writes to every journal event can never diverge (spike
+# docs/spikes/work-unit-abstraction.md §2.2 unit_id).
 wunit_ref() {
   journal_unit_ref "$@"
 }

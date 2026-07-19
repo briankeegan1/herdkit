@@ -90,6 +90,13 @@ def _coerce(value):
     return s
 
 
+# HERD-397: additive journal keys that exist for forensic/cross-implementation-parity purposes but
+# that NO raw-dump reader may surface yet (the dual-write contract below). ONE shared constant, so
+# herd.log and herd.why can't each independently forget to exclude a future additive key — the exact
+# gap a review caught: `unit` was excluded from herd log's dump but not herd why's identical one.
+NOT_YET_SURFACED_KEYS = frozenset({"unit"})
+
+
 def _journal_unit_ref(kind, ident):
     """Compose a namespaced work-unit ref, e.g. ``_journal_unit_ref("git-pr", 42)`` -> ``"git-pr:42"``.
 
@@ -99,7 +106,7 @@ def _journal_unit_ref(kind, ident):
     return "%s:%s" % (kind, ident)
 
 
-def _dual_write_unit(obj):
+def _dual_write_unit(obj, raw_pr):
     """HERD-397 dual-write: an event carrying a ``pr`` key also gets an additive
     ``unit="git-pr:<n>"`` key, unless the caller already supplied its own ``unit``. ADDITIVE ONLY —
     every existing key (including ``pr``) is left exactly as built; no ``pr`` key -> ``obj``
@@ -107,11 +114,16 @@ def _dual_write_unit(obj):
     (:class:`ShadowJournal`, :class:`herd.live_runtime.LiveJournal`, ``herd.store._journal``) and
     mirrors bash ``journal.sh``'s ``_journal_impl`` dual-write byte-for-byte — the exact invariant
     ``tests/test-py-shadow-runtime.sh``'s journal-encoding parity oracle enforces.
+
+    ``raw_pr`` is the PRE-coercion ``pr`` value (the last one seen in ``pairs``), not
+    ``obj["pr"]``: bash's ``journal_unit_ref`` composes the ref from the raw argv string, with no
+    numeric coercion at all, so a caller must hand this function that same pre-coercion value or the
+    two encoders disagree whenever coercion is not identity (e.g. a leading-zero ``pr`` — unreachable
+    from real ``gh`` PR numbers today, but exactly the cross-encoder drift HERD-397 exists to close).
     """
-    pr = obj.get("pr")
-    if pr in (None, "") or "unit" in obj:
+    if raw_pr in (None, "") or "unit" in obj:
         return obj
-    obj["unit"] = _journal_unit_ref("git-pr", pr)
+    obj["unit"] = _journal_unit_ref("git-pr", raw_pr)
     return obj
 
 
@@ -127,9 +139,13 @@ def encode_event(event, pairs, ts=None):
     filesystem.
     """
     obj = {"ts": _journal_ts() if ts is None else ts, "event": str(event)}
+    raw_pr = None
     for k, v in _iter_pairs(pairs):
-        obj[str(k)] = _coerce(v)
-    obj = _dual_write_unit(obj)
+        k = str(k)
+        if k == "pr":
+            raw_pr = v   # pre-coercion, last-one-wins — matches obj[k] overwrite semantics below
+        obj[k] = _coerce(v)
+    obj = _dual_write_unit(obj, raw_pr)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 

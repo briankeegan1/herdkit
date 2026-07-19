@@ -124,23 +124,35 @@ WORKTREES_DIR="$TREES"
 WORKSPACE_NAME="dualwrite-rtest"
 CFG
 
-# Fixture A: today's shape (no unit field) — the pre-dual-write baseline.
+# Fixture A: today's shape (no unit field) — the pre-dual-write baseline. Includes `pr_restale`,
+# which has NO dedicated describe() branch in herd why (bin/herd, pysrc/herd/why.py) — it hits the
+# GENERIC fallback dump both readers fall back to for the ~200 event types describe() doesn't
+# special-case. A review caught that an earlier version of this fixture used ONLY describe()-branch
+# events, so it could never fail on a fallback-dump regression even though the fallback is the common
+# path (describe() special-cases ~18 of the ~200+ events scripts/herd/*.sh emits).
 cat > "$TREES/.herd/journal.jsonl" <<'JNL'
 {"ts":"2026-07-02T14:03:12Z","event":"review_dispatched","pr":54,"sha":"abc1234def","pid":12345,"model":"claude-opus-4-8"}
 {"ts":"2026-07-02T14:09:44Z","event":"healthcheck_attempted","pr":54,"slug":"feat-x","attempt":1,"result":"clean"}
 {"ts":"2026-07-02T14:09:45Z","event":"healthcheck_outcome","pr":54,"slug":"feat-x","outcome":"CLEAN"}
+{"ts":"2026-07-02T14:10:00Z","event":"pr_restale","pr":54,"sha":"abc1234def","slug":"feat-x","kind":"health","laps":2}
 {"ts":"2026-07-02T14:10:01Z","event":"verdict_recorded","pr":54,"sha":"abc1234def","value":"PASS","source":"reviewer"}
 {"ts":"2026-07-02T14:10:02Z","event":"merge","pr":54,"slug":"feat-x","sha":"abc1234def","method":"--merge","reason":"gates_passed"}
 {"ts":"2026-07-02T14:10:05Z","event":"reap","pr":54,"slug":"feat-x","sha":"abc1234def","reason":"merged"}
 JNL
 why_before="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" why 54 2>&1)"
 log_before="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" log --pr 54 2>&1)"
+# Sanity: the fallback dump actually renders pr_restale's non-pr fields, so this fixture would have
+# caught a regression that leaks `unit=` into it (if it doesn't, the byte-identical diff below is
+# vacuous for the exact gap this test exists to close).
+printf '%s\n' "$why_before" | grep -q 'kind=health' || fail "fixture sanity: pr_restale must hit herd why's fallback dump"
+ok
 
 # Fixture B: same events, dual-written (unit= additive on every line) — what journal_append now emits.
 cat > "$TREES/.herd/journal.jsonl" <<'JNL'
 {"ts":"2026-07-02T14:03:12Z","event":"review_dispatched","pr":54,"sha":"abc1234def","pid":12345,"model":"claude-opus-4-8","unit":"git-pr:54"}
 {"ts":"2026-07-02T14:09:44Z","event":"healthcheck_attempted","pr":54,"slug":"feat-x","attempt":1,"result":"clean","unit":"git-pr:54"}
 {"ts":"2026-07-02T14:09:45Z","event":"healthcheck_outcome","pr":54,"slug":"feat-x","outcome":"CLEAN","unit":"git-pr:54"}
+{"ts":"2026-07-02T14:10:00Z","event":"pr_restale","pr":54,"sha":"abc1234def","slug":"feat-x","kind":"health","laps":2,"unit":"git-pr:54"}
 {"ts":"2026-07-02T14:10:01Z","event":"verdict_recorded","pr":54,"sha":"abc1234def","value":"PASS","source":"reviewer","unit":"git-pr:54"}
 {"ts":"2026-07-02T14:10:02Z","event":"merge","pr":54,"slug":"feat-x","sha":"abc1234def","method":"--merge","reason":"gates_passed","unit":"git-pr:54"}
 {"ts":"2026-07-02T14:10:05Z","event":"reap","pr":54,"slug":"feat-x","sha":"abc1234def","reason":"merged","unit":"git-pr:54"}
