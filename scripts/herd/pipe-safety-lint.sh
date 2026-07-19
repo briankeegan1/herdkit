@@ -38,8 +38,9 @@
 #   pipefail-safe, the very property it enforces).
 #
 # herd_pipe_safety_lint [<root>]
-#   Entrypoint for the gate surfaces. Scans scripts/herd/*.sh + scripts/ci/*.sh + bin/herd under
-#   <root> (or cwd). Exit: 0 = clean · 1 = hit(s) · 2 = skipped (infra; NEVER a red).
+#   Entrypoint for the gate surfaces. Scans scripts/herd/*.sh + scripts/herd/work-units/*.sh +
+#   scripts/ci/*.sh + bin/herd under <root> (or cwd). Exit: 0 = clean · 1 = hit(s) · 2 = skipped
+#   (infra; NEVER a red).
 #   On a skip, $HERD_PIPE_SAFETY_SKIP_REASON carries the one-line why.
 #
 # Fail-soft by construction: a tree with none of the scan surface (every consuming project — this is
@@ -121,8 +122,9 @@ herd_pipe_safety_lint() {
   HERD_PIPE_SAFETY_SKIP_REASON=""
 
   # An unmatched glob expands to the literal pattern; the `[ -f ]` guard drops it (no nullglob needed,
-  # bash 3.2-safe). scripts/herd/*.sh + scripts/ci/*.sh + bin/herd — whichever exist.
-  for _ps_f in "$_ps_root"/scripts/herd/*.sh "$_ps_root"/scripts/ci/*.sh; do
+  # bash 3.2-safe). scripts/herd/*.sh + scripts/herd/work-units/*.sh + scripts/ci/*.sh + bin/herd —
+  # whichever exist.
+  for _ps_f in "$_ps_root"/scripts/herd/*.sh "$_ps_root"/scripts/herd/work-units/*.sh "$_ps_root"/scripts/ci/*.sh; do
     [ -f "$_ps_f" ] && _ps_files+=("$_ps_f")
   done
   [ -f "$_ps_root/bin/herd" ] && _ps_files+=("$_ps_root/bin/herd")

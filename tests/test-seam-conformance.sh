@@ -9,8 +9,8 @@
 # contract-drift audit catalogued. This lint makes that drift a RED test instead of a code review a
 # human might miss.
 #
-# It enforces FOUR architectural rules over the engine surface (scripts/herd/*.sh, its backends/, and
-# bin/herd):
+# It enforces FOUR architectural rules over the engine surface (scripts/herd/*.sh, its backends/, its
+# work-units/ adapter bodies, and bin/herd):
 #   1. raw-runtime  — a raw `herdr notification|agent list|pane run` OUTSIDE the driver seam
 #                     (scripts/herd/driver.sh) and its sim stubs. This rule is ALSO the enforcement
 #                     rail for the driver-portability migration (HERD-150 P2–P5): P5 extends
@@ -95,9 +95,9 @@ EX_journal="driver.sh"                # the driver guards journal_append; it is 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 # _engine_files — the scanned surface, one path per line: every scripts/herd/*.sh (NOT the sim/
-# subdir — a non-recursive glob), the pluggable backends, and bin/herd.
+# subdir — a non-recursive glob), the pluggable backends, the work-unit adapter bodies, and bin/herd.
 _engine_files() {
-  ls "$ROOT"/scripts/herd/*.sh "$ROOT"/scripts/herd/backends/*.sh "$ROOT/bin/herd" 2>/dev/null
+  ls "$ROOT"/scripts/herd/*.sh "$ROOT"/scripts/herd/backends/*.sh "$ROOT"/scripts/herd/work-units/*.sh "$ROOT/bin/herd" 2>/dev/null
 }
 
 # _code_stream <file> — emit the file with NON-CODE lines BLANKED (line count + numbering preserved):

@@ -16,8 +16,10 @@
 #     are grandfathered in the baseline below until the routing phases retire them.
 #
 # HOW THE RATCHET WORKS: the SCANNED surface is the engine tree — scripts/herd/*.sh (top level only,
-# so the driver seam driver.sh, the sim/ sandbox scripts, and backends/ are out) plus bin/herd. Every
-# NON-comment line that INVOKES `claude` (or carries a claude-specific incantation) is fingerprinted as
+# so the driver seam driver.sh, the sim/ sandbox scripts, and backends/ are out) plus
+# scripts/herd/work-units/*.sh (the work-unit adapter bodies — engine-owned delivery code, unlike the
+# tracker-integration backends/, so it stays IN scope) plus bin/herd. Every NON-comment line that
+# INVOKES `claude` (or carries a claude-specific incantation) is fingerprinted as
 # `<relpath>\t<whitespace-collapsed line>`. The committed baseline (.herd/claude-hardcode-baseline.tsv)
 # is the grandfather set of sites that exist TODAY (the P1 audit, still awaiting routing). A current
 # fingerprint ABSENT from the baseline is a NEW hardcoded `claude` → the lint fails, naming file:line.
@@ -58,6 +60,7 @@ _CHL_PAT='(^|[^[:alnum:]_./-])claude[[:space:]]+(--?[a-z]|["'\''$])'
 _chl_matches() {
   local root="$1" abs rel files
   files="$( { find "$root/scripts/herd" -maxdepth 1 -type f -name '*.sh' ! -name 'driver.sh' 2>/dev/null
+              find "$root/scripts/herd/work-units" -maxdepth 1 -type f -name '*.sh' 2>/dev/null
               [ -f "$root/bin/herd" ] && printf '%s\n' "$root/bin/herd"; } | sort -u )"
   [ -n "$files" ] || return 0
   while IFS= read -r abs; do

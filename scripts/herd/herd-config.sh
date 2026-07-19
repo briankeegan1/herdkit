@@ -529,6 +529,15 @@ fi
 #   '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'
 : "${COMMIT_CONVENTION:=""}"      # '' (default, off) | egrep pattern every commit subject must match
 
+# WORK_UNIT_KIND — the delivery-vehicle adapter (HERD-398, Phase 3 of docs/spikes/work-unit-
+# abstraction.md). Ships with exactly ONE implemented kind: git-pr (default), whose body lives at
+# scripts/herd/work-units/git-pr.sh behind the scripts/herd/work-unit.sh facade — today's exact
+# open/gate/apply/reconcile/teardown pipeline (gh pr create/list/view/diff/merge), unchanged. Any
+# other value is NOT YET SUPPORTED (P4 adds the second kind, doc-apply); the resolver in work-unit.sh
+# (wunit_resolve_adapter) REFUSES it — a loud, hard failure, not a silent downgrade to git-pr — while
+# the watcher itself still only ever runs the git-pr pipeline (nothing branches on this key yet), so a
+# typo here can never silently change engine behavior.
+: "${WORK_UNIT_KIND:="git-pr"}"
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
 : "${REVIEW_CHECKLIST:=""}"     # project risk list injected into the review gate
 # RUBRIC_FILE — structured per-unit review rubric (HERD-400, docs/rubric-primitive.md). '' (default,

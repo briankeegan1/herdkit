@@ -2,11 +2,12 @@
 # symbol-index.sh — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 # to codemap.sh: where codemap maps FILE-level structure (module roles, who-sources-whom, config
 # wiring), this maps FUNCTION-level structure — for every shell function defined under bin/ and
-# scripts/herd/ (incl. scripts/herd/backends/), its definition site(s) and every CROSS-FILE call
-# site. It fills the gap graphify leaves in this bash-heavy tree (measured: zero cross-file call
-# links resolved in the big engine scripts), so a builder can answer "who calls _backend_update_state"
-# with one lookup instead of a grep-and-read session, and the coordinator can sharpen its pre-spawn
-# overlap read from file-level to symbol-level when two items touch the same file.
+# scripts/herd/ (incl. scripts/herd/backends/ and scripts/herd/work-units/), its definition site(s)
+# and every CROSS-FILE call site. It fills the gap graphify leaves in this bash-heavy tree (measured:
+# zero cross-file call links resolved in the big engine scripts), so a builder can answer "who calls
+# _backend_update_state" with one lookup instead of a grep-and-read session, and the coordinator can
+# sharpen its pre-spawn overlap read from file-level to symbol-level when two items touch the same
+# file.
 #
 # Invoked by bin/herd (cmd_symbol_index runs `bash "$SCRIPTS_DIR/symbol-index.sh"`); also
 # standalone-runnable (`bash scripts/herd/symbol-index.sh`) and driven that way by
@@ -95,8 +96,9 @@ _si_render() {
   local f defs calls nnames ncallers ncollide
   local files=()
   [ -f bin/herd ] && files+=(bin/herd)
-  for f in scripts/herd/*.sh;          do [ -f "$f" ] && files+=("$f"); done
-  for f in scripts/herd/backends/*.sh; do [ -f "$f" ] && files+=("$f"); done
+  for f in scripts/herd/*.sh;            do [ -f "$f" ] && files+=("$f"); done
+  for f in scripts/herd/backends/*.sh;   do [ -f "$f" ] && files+=("$f"); done
+  for f in scripts/herd/work-units/*.sh; do [ -f "$f" ] && files+=("$f"); done
 
   # Two sorted, deterministic streams: definitions and cross-file call sites (line-numeric key so
   # sites read top-to-bottom within a file, LC_ALL=C so ordering is machine-independent).

@@ -23,7 +23,7 @@ setup() {
 
 # ── inline structural blocks (no single tests/test-*.sh to shell out to) ─────────────────────────
 @test "all engine + CLI scripts are bash -n clean" {
-  for f in "$REPO"/scripts/herd/*.sh "$REPO"/scripts/herd/backends/*.sh "$REPO"/bin/herd; do
+  for f in "$REPO"/scripts/herd/*.sh "$REPO"/scripts/herd/backends/*.sh "$REPO"/scripts/herd/work-units/*.sh "$REPO"/bin/herd; do
     run bash -n "$f"
     [ "$status" -eq 0 ] || { echo "syntax error in $f"; return 1; }
   done
