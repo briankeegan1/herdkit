@@ -99,3 +99,16 @@ wunit_reconcile() {
 wunit_teardown() {
   _reap_slug "$@"
 }
+
+# ── ref — the shared unit-id composer (HERD-397, Phase 2 dual-write) ───────────────────────────────
+
+# wunit_ref <kind> <id> — compose a namespaced unit ref, e.g. `wunit_ref git-pr 42` → "git-pr:42".
+# Delegates to journal.sh's journal_unit_ref, which is ALREADY in scope by the time this file finishes
+# loading (the agent-watch.sh borrow above transitively sources journal.sh; a caller with do_merge
+# pre-defined has, by this codebase's convention, sourced journal.sh too). This file never re-derives
+# the format itself — journal_unit_ref is THE single place it is composed, so the ref this facade
+# hands out and the ref journal.sh's own pr→unit dual-write writes to every journal event can never
+# diverge (spike docs/spikes/work-unit-abstraction.md §2.2 unit_id).
+wunit_ref() {
+  journal_unit_ref "$@"
+}

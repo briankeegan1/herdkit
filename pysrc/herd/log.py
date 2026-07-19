@@ -25,7 +25,9 @@ def main():
             continue
         ts = str(o.get("ts", ""))
         ev = str(o.get("event", "?"))
-        rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event"))
+        # "unit" (HERD-397 work-unit dual-write) is excluded from the raw dump: no reader may depend
+        # on it yet, and `herd log`'s output must stay byte-identical to before the dual-write landed.
+        rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event", "unit"))
         print("%s  %-22s %s" % (ts, ev, rest))
 
 

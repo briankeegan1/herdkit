@@ -159,6 +159,35 @@ class LiveCandidate:
 
 # ── the real journal (journal.sh-identical shapes, best-effort, never raises) ──────────────────────
 
+def _journal_unit_ref(kind, ident):
+    """Compose a namespaced work-unit ref, e.g. ``_journal_unit_ref("git-pr", 42)`` -> ``"git-pr:42"``.
+
+    THE single place this format is composed on the Python side (HERD-397, spike
+    docs/spikes/work-unit-abstraction.md Sec 2.2 unit_id / Sec 5 Phase 2 dual-write) — mirrors bash
+    ``journal.sh``'s ``journal_unit_ref`` so the two writers can never format the ref differently."""
+    return "%s:%s" % (kind, ident)
+
+
+def _dual_write_unit(items):
+    """HERD-397 dual-write: given the ordered ``(k, v)`` pairs of one event, return them with an
+    additive ``("unit", "git-pr:<n>")`` pair appended when a ``pr`` pair is present and no ``unit``
+    pair was already supplied. ADDITIVE ONLY: every existing pair (including ``pr``) passes through
+    unchanged and in order; a caller that already supplies its own ``unit`` (a future non-git-pr
+    writer) is left untouched; no ``pr`` pair -> ``items`` returned unchanged, no ``unit`` added.
+    Mirrors bash ``journal.sh``'s ``_journal_impl`` dual-write so both journal writers emit the SAME
+    additive shape for the same ``(event, kv...)``."""
+    pr_value = None
+    has_unit = False
+    for k, v in items:
+        if k == "pr":
+            pr_value = v
+        elif k == "unit":
+            has_unit = True
+    if has_unit or pr_value is None or pr_value == "":
+        return items
+    return items + [("unit", _journal_unit_ref("git-pr", pr_value))]
+
+
 def _is_verdict_shaped_path(path):
     """A path-typed value that is actually a REVIEWER VERDICT leaked into a filesystem seam (HERD-360):
     it begins with the literal ``REVIEW:`` verdict prefix, or it carries an embedded newline. No real
@@ -213,6 +242,7 @@ class LiveJournal:
                 return False
             items = list(_iter_pairs(list(pairs)))
             items.extend(kv.items())
+            items = _dual_write_unit(items)
             line = encode_event(event, items)
             if not line:
                 return False

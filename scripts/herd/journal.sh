@@ -135,11 +135,40 @@ _journal_max_bytes() {
   printf '%s' "$(( mb * 1048576 ))"
 }
 
+# journal_unit_ref <kind> <id> — compose a namespaced work-unit ref, e.g. `journal_unit_ref git-pr 42`
+# → "git-pr:42". THE single place this format is composed (HERD-397, spike docs/spikes/work-unit-
+# abstraction.md §2.2 unit_id / §5 Phase 2 dual-write) so the journal's own pr→unit dual-write below,
+# `scripts/herd/work-unit.sh`'s wunit_ref (which delegates here), and any future ledger/CLI consumer
+# cannot drift into two different formats. Pure string composition — no I/O, always succeeds.
+journal_unit_ref() {
+  printf '%s:%s' "$1" "$2"
+}
+
 # _journal_impl — the real work, run inside a strict-mode-neutralized subshell by journal_append.
 # May exit non-zero / early at any point; the wrapper absorbs it.
 _journal_impl() {
   local event="${1:-}"; [ -n "$event" ] || return 0
   shift || true
+
+  # HERD-397 dual-write (spike docs/spikes/work-unit-abstraction.md §5 Phase 2): additive
+  # unit="git-pr:<n>" alongside every pr-carrying event's args, computed ONCE here via
+  # journal_unit_ref so every journal_append call site gets it for free — no per-call-site edits, and
+  # the format cannot drift into a second copy. ADDITIVE ONLY: every existing key (including `pr`)
+  # passes through byte-for-byte and in order; a caller that already supplies its own `unit` (a future
+  # non-git-pr writer) is left untouched; no `pr` key present → args stay unchanged, no `unit` added,
+  # so an already-unit-less event (e.g. `sweep_closed tab_id … reason …`) stays byte-identical.
+  local -a _ji_args=("$@")
+  local _ji_pr="" _ji_has_unit=0 _ji_i
+  for (( _ji_i = 0; _ji_i < ${#_ji_args[@]}; _ji_i += 2 )); do
+    case "${_ji_args[_ji_i]}" in
+      pr)   _ji_pr="${_ji_args[_ji_i+1]:-}" ;;
+      unit) _ji_has_unit=1 ;;
+    esac
+  done
+  if [ -n "$_ji_pr" ] && [ "$_ji_has_unit" -eq 0 ]; then
+    _ji_args+=(unit "$(journal_unit_ref git-pr "$_ji_pr")")
+  fi
+  set -- "${_ji_args[@]}"
 
   local jf; jf="$(_journal_file)" || return 0
   [ -n "$jf" ] || return 0
