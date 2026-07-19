@@ -131,6 +131,24 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # _watcher_tick_fields, _prs_fetch_tick) under the SAME names they always had, so every existing call
 # site below is unchanged — this is a pure relocation, not a behavior change.
 . "$HERE/work-units/git-pr.sh"
+# work-unit FACADE (HERD-401, Phase 3b) — the wunit_* wrappers named by the spike's 2.2 interface.
+# Sourced HERE, right after the git-pr adapter body above, so its own "borrow do_merge from
+# agent-watch.sh if not yet in scope" guard (work-unit.sh top) sees do_merge ALREADY defined and
+# skips re-sourcing this file — no recursion. Defines wunit_open/list_open/inspect/gate/apply/
+# reconcile/teardown/ref, each a one-line delegation to the function immediately above (or a bare
+# `gh pr …`); this file's own reconcile/teardown call sites below use wunit_reconcile/wunit_teardown
+# instead of reconcile_backlog/_reap_slug directly (HERD-401's rewiring), so behavior is unchanged —
+# same functions run, just resolved through the facade's name.
+#
+# WHY wunit_apply (→ do_merge) has no call site to rewire here: HERD-306 (the Python engine-port
+# finale) deleted the bash ACTION PASS that used to walk merge candidates and call do_merge — see
+# _engine_tick_watchdog below. pysrc/herd/live_runtime.py's LiveActuator is the SOLE merge/reap
+# actuator in production now (its own gh pr merge / gh pr view calls, independently ported — it does
+# NOT shell out to this file's do_merge). do_merge/wunit_apply survive as the git-pr adapter body
+# exercised directly by the sim scenario suite and the hermetic tests (their own reference-model
+# dispatch), and remain available for any future bash-mode caller, but there is no "apply" leg left
+# in the watcher's own tick to route through the facade — noted via herd note, not silently assumed.
+. "$HERE/work-unit.sh"
 # CI auto-repair (HERD-250) — pure predicate for the inherited-red healer: a MERGEABLE+UNSTABLE PR whose
 # required CI is FAILING, herd/gates already PASSED, and the branch is BEHIND main is base-refreshed
 # (not silently merged). Sourcing DEFINES functions only; ship-dormant under CI_AUTOREPAIR=off.
@@ -3953,6 +3971,13 @@ _merge_fairness_reorder() {
   local _mfr_n=${#CAND_IDX[@]} _mfr_k
   [ "$_mfr_n" -gt 1 ] || return 0
 
+  # HERD-401: deliberately NOT routed through wunit_gate. wunit_gate's contract (work-unit.sh) prints
+  # "pass"/"wait" on STDOUT as its status signal — fine for a caller that captures it, but this is a
+  # tight per-candidate boolean check inside the tick's own render pass, whose stdout IS the console
+  # output stream. Swapping in wunit_gate here would leak a "pass"/"wait" line per candidate into the
+  # rendered frame every tick MERGE_FAIRNESS is on — a real behavior change, not a rename. Left calling
+  # _cand_gates_ready directly (per the P3 precedent of leaving already-kind-agnostic gate composition
+  # in place); noted via herd note rather than silently skipped.
   local _mfr_ready=() _mfr_rest=()
   for ((_mfr_k = 0; _mfr_k < _mfr_n; _mfr_k++)); do
     if _cand_gates_ready "${CAND_PR[_mfr_k]}" "${CAND_SHA[_mfr_k]}"; then
@@ -6897,7 +6922,8 @@ EOF
       journal_append startup_reap_skip slug "$_srs_slug" pr "$_srs_pr" reason dirty-worktree
       continue
     fi
-    _reap_slug "$_srs_slug" "$_srs_dir" "$_srs_pr" "$_srs_head" startup-sweep
+    # HERD-401: wunit_teardown (facade) → _reap_slug (same function, resolved by the work-unit name).
+    wunit_teardown "$_srs_slug" "$_srs_dir" "$_srs_pr" "$_srs_head" startup-sweep
     _srs_n=$(( _srs_n + 1 ))
   done < <(WT="$_srs_wt" MAIN="$MAIN" python3 -c '
 import os
@@ -7692,9 +7718,12 @@ _pms_reconcile_one() {
   case " $_pm_missing " in
     *' cost '*) type cost_emit_merge >/dev/null 2>&1 && cost_emit_merge "$_pm_pr" "$_pm_slug" "$_pm_dir" ;;
   esac
-  case " $_pm_missing " in *' reconcile '*) reconcile_backlog "$_pm_pr" "$_pm_slug" "$_pm_sha" ;; esac
+  # HERD-401: routed through the wunit_* facade (wunit_reconcile/wunit_teardown) rather than calling
+  # reconcile_backlog/_reap_slug by name — one-line delegations, so this is the SAME function call,
+  # just resolved through the work-unit interface's names.
+  case " $_pm_missing " in *' reconcile '*) wunit_reconcile "$_pm_pr" "$_pm_slug" "$_pm_sha" ;; esac
   case " $_pm_missing " in
-    *' reap '*) _reap_slug "$_pm_slug" "$_pm_dir" "$_pm_pr" "$_pm_sha" postmerge-sweep ;;   # last: it deletes $_pm_dir
+    *' reap '*) wunit_teardown "$_pm_slug" "$_pm_dir" "$_pm_pr" "$_pm_sha" postmerge-sweep ;;   # last: it deletes $_pm_dir
   esac
 
   journal_append postmerge_reconciled pr "$_pm_pr" slug "$_pm_slug" sha "$_pm_sha" \
@@ -12761,6 +12790,16 @@ _tick_render_reconcile() {
   # is a read-time SELECTION filter only — it narrows which PRs this tick displays/considers and
   # never relaxes any merge gate. Default (all lens, no filters) requests the base fields and
   # passes the JSON through unchanged, preserving today's exact behavior on a successful fetch.
+  #
+  # HERD-401: this is the tick's "list_open" leg, but it is deliberately NOT called via wunit_list_open.
+  # The facade's wunit_list_open (work-unit.sh) is a raw `gh pr list "$@"` passthrough — argv straight
+  # to gh, stdout straight back, no defaults. _prs_fetch_tick is a different shape entirely: it takes NO
+  # argv, resolves the field set itself (_watcher_tick_fields), timeout-wraps the gh call, distinguishes
+  # a genuine empty roster from a failed fetch (PRS_LOOKUP_OK), and applies the watcher's view filter —
+  # then sets PRS_JSON/PRS_LOOKUP_OK as globals rather than returning a value. Routing this call through
+  # wunit_list_open would either drop all of that (a real behavior change) or require wunit_list_open to
+  # grow tick-specific side effects the spike's interface never gave it. Left calling _prs_fetch_tick
+  # directly; noted via herd note rather than silently forced through a facade op that doesn't fit it.
   _prs_fetch_tick
   # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
   # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
