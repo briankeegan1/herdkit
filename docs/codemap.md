@@ -295,6 +295,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_PANEL` → `herd-review.sh`
 - `REVIEW_PANEL_MODELS` → `bin/herd`, `herd-review.sh`, `review-panel.sh`
 - `REVIEW_PANEL_POLICY` → `herd-review.sh`, `review-panel.sh`
+- `RUBRIC_FILE` → `herd-review.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `sweep.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SCRIBE_POLL` → `scribe-step.sh`
