@@ -93,6 +93,7 @@ Role summarized from each file's top-of-file comment.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
 - `triggers.sh` — SCHEDULED / TRIGGERED RUNS (HERD-169): a cron-style trigger spawns a defined workflow
 - `watcher-exempt.sh` — THE ONE shared WATCHER-IDENTITY check (HERD-266).
+- `work-unit.sh` — Phase 1 of the work-unit delivery abstraction (HERD-395/HERD-396): NAME the spine,
 
 ### Templates (`templates/`)
 
@@ -167,6 +168,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
+- `work-unit.sh` → `agent-watch.sh`
 
 ## Config key → consumers
 
