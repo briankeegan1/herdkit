@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 1485 (defined in >1 file: 33) · with cross-file callers: 242
+- Functions indexed: 1492 (defined in >1 file: 33) · with cross-file callers: 244
 
 ## Functions (def → cross-file callers)
 
@@ -694,7 +694,7 @@ this scan cannot see).
 - `_reap_agent_working` — def `scripts/herd/retirement.sh:199` — callers: `scripts/herd/sweep.sh:325`, `scripts/herd/sweep.sh:339`
 - `_reap_builder_corpse` — def `scripts/herd/agent-watch.sh:10452` — callers: —
 - `_reap_idle_resolver_for_redispatch` — def `scripts/herd/agent-watch.sh:4787` — callers: —
-- `_reap_slug` — def `scripts/herd/agent-watch.sh:6250` — callers: `scripts/herd/retirement.sh:669`, `scripts/herd/sweep.sh:359`
+- `_reap_slug` — def `scripts/herd/agent-watch.sh:6250` — callers: `scripts/herd/retirement.sh:669`, `scripts/herd/sweep.sh:359`, `scripts/herd/work-unit.sh:100`
 - `_reattach_default_branch` — def `scripts/herd/agent-watch.sh:5368` — callers: —
 - `_recent_commits` — def `scripts/herd/backlog-reconcile-sweep.sh:92` — callers: —
 - `_recon_backend_manages_backlog` — def `scripts/herd/backlog-reconcile.sh:50` — callers: —
@@ -1161,7 +1161,7 @@ this scan cannot see).
 - `dead_notified` — def `scripts/herd/agent-watch.sh:10149` — callers: —
 - `detect_github` — def `bin/herd:674` — callers: —
 - `die` — def `bin/herd:150` — callers: `scripts/herd/agent-watch.sh:246`, `scripts/herd/fleet.sh:138`, `scripts/herd/fleet.sh:145`, `scripts/herd/fleet.sh:152`, `scripts/herd/fleet.sh:154`, `scripts/herd/fleet.sh:158`, `scripts/herd/fleet.sh:163`, `scripts/herd/fleet.sh:164`, `scripts/herd/fleet.sh:166`, `scripts/herd/fleet.sh:201`, `scripts/herd/fleet.sh:204`, `scripts/herd/fleet.sh:212`, `scripts/herd/fleet.sh:223`, `scripts/herd/fleet.sh:378`, `scripts/herd/fleet.sh:439`, `scripts/herd/fleet.sh:771`, `scripts/herd/fleet.sh:853`, `scripts/herd/fleet.sh:854`, `scripts/herd/fleet.sh:856`, `scripts/herd/fleet.sh:863`, `scripts/herd/fleet.sh:1104`, `scripts/herd/fleet.sh:1105`, `scripts/herd/fleet.sh:1119`, `scripts/herd/fleet.sh:1416`, `scripts/herd/fleet.sh:1496`, `scripts/herd/fleet.sh:1593`, `scripts/herd/fleet.sh:1596`, `scripts/herd/fleet.sh:1654`, `scripts/herd/fleet.sh:1667`, `scripts/herd/fleet.sh:1668`, `scripts/herd/fleet.sh:1671`, `scripts/herd/fleet.sh:1707`, `scripts/herd/fleet.sh:1710`, `scripts/herd/fleet.sh:1715`, `scripts/herd/fleet.sh:1719`, `scripts/herd/fleet.sh:1733`
-- `do_merge` — def `scripts/herd/agent-watch.sh:6886` — callers: —
+- `do_merge` — def `scripts/herd/agent-watch.sh:6886` — callers: `scripts/herd/work-unit.sh:89`
 - `emit` — def `scripts/herd/codemap.sh:379`, `scripts/herd/codemap.sh:398`, `scripts/herd/codemap.sh:420`, `scripts/herd/codemap.sh:438`, `scripts/herd/codemap.sh:473` — callers: `scripts/herd/agent-watch.sh:7128`, `scripts/herd/agent-watch.sh:7131`, `scripts/herd/cost.sh:247`, `scripts/herd/cost.sh:273`, `scripts/herd/handoff.sh:214`, `scripts/herd/handoff.sh:253`, `scripts/herd/handoff.sh:260`, `scripts/herd/sweep.sh:164`, `scripts/herd/sweep.sh:169`
 - `emit_infra_fail` — def `scripts/herd/herd-review.sh:442` — callers: —
 - `epoch_to_hhmm` — def `scripts/herd/agent-watch.sh:667`, `scripts/herd/backlog-view.sh:148`, `scripts/herd/backlog-view.sh:151`, `scripts/herd/herd-approve.sh:59` — callers: —
@@ -1362,7 +1362,7 @@ this scan cannot see).
 - `push_gate_list` — def `scripts/herd/push-gate.sh:104` — callers: `scripts/herd/herd-approve.sh:106`
 - `push_gate_mode` — def `scripts/herd/push-gate.sh:46` — callers: —
 - `push_gate_resume` — def `scripts/herd/push-gate.sh:234` — callers: `scripts/herd/herd-approve.sh:195`
-- `reconcile_backlog` — def `scripts/herd/agent-watch.sh:5272` — callers: —
+- `reconcile_backlog` — def `scripts/herd/agent-watch.sh:5272` — callers: `scripts/herd/work-unit.sh:95`
 - `reconcile_checkout_cleanliness` — def `scripts/herd/agent-watch.sh:6103` — callers: —
 - `reconcile_enqueued` — def `scripts/herd/agent-watch.sh:5145` — callers: —
 - `reconcile_main_freshness` — def `scripts/herd/agent-watch.sh:5972` — callers: —
@@ -1508,3 +1508,10 @@ this scan cannot see).
 - `wedge_notified` — def `scripts/herd/agent-watch.sh:10668` — callers: —
 - `wedge_state_of` — def `scripts/herd/agent-watch.sh:10662` — callers: —
 - `wedge_woken` — def `scripts/herd/agent-watch.sh:10673` — callers: —
+- `wunit_apply` — def `scripts/herd/work-unit.sh:88` — callers: —
+- `wunit_gate` — def `scripts/herd/work-unit.sh:75` — callers: —
+- `wunit_inspect` — def `scripts/herd/work-unit.sh:64` — callers: —
+- `wunit_list_open` — def `scripts/herd/work-unit.sh:59` — callers: —
+- `wunit_open` — def `scripts/herd/work-unit.sh:54` — callers: —
+- `wunit_reconcile` — def `scripts/herd/work-unit.sh:94` — callers: —
+- `wunit_teardown` — def `scripts/herd/work-unit.sh:99` — callers: —
