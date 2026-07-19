@@ -168,7 +168,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
-- `work-unit.sh` → `agent-watch.sh`
+- `work-unit.sh` → `agent-watch.sh`, `journal.sh`
 
 ## Config key → consumers
 
