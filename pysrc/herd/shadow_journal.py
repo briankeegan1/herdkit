@@ -90,19 +90,46 @@ def _coerce(value):
     return s
 
 
+def _journal_unit_ref(kind, ident):
+    """Compose a namespaced work-unit ref, e.g. ``_journal_unit_ref("git-pr", 42)`` -> ``"git-pr:42"``.
+
+    THE single place this format is composed on the Python side (HERD-397, spike
+    docs/spikes/work-unit-abstraction.md Sec 2.2 unit_id / Sec 5 Phase 2 dual-write) — mirrors bash
+    ``journal.sh``'s ``journal_unit_ref`` so the two encoders can never format the ref differently."""
+    return "%s:%s" % (kind, ident)
+
+
+def _dual_write_unit(obj):
+    """HERD-397 dual-write: an event carrying a ``pr`` key also gets an additive
+    ``unit="git-pr:<n>"`` key, unless the caller already supplied its own ``unit``. ADDITIVE ONLY —
+    every existing key (including ``pr``) is left exactly as built; no ``pr`` key -> ``obj``
+    unchanged. Lives HERE (not in a caller) so it applies to every ``encode_event`` caller alike
+    (:class:`ShadowJournal`, :class:`herd.live_runtime.LiveJournal`, ``herd.store._journal``) and
+    mirrors bash ``journal.sh``'s ``_journal_impl`` dual-write byte-for-byte — the exact invariant
+    ``tests/test-py-shadow-runtime.sh``'s journal-encoding parity oracle enforces.
+    """
+    pr = obj.get("pr")
+    if pr in (None, "") or "unit" in obj:
+        return obj
+    obj["unit"] = _journal_unit_ref("git-pr", pr)
+    return obj
+
+
 def encode_event(event, pairs, ts=None):
     """Encode ONE event to the exact JSON line ``journal.sh`` would write (no I/O).
 
     ``pairs`` is a flat sequence ``[k1, v1, k2, v2, …]`` (the ``journal_append`` argv shape) OR an
     iterable of ``(k, v)`` tuples OR a mapping — all normalized to ordered key/value pairs. The
-    object is ``{"ts", "event"}`` then the pairs in order; values pass through :func:`_coerce`;
-    serialization is ``separators=(",", ":")`` with ``ensure_ascii=False`` (``journal.sh:147``).
-    Exposed separately from :func:`ShadowJournal.append` so the parity test can assert the encoding
-    without a filesystem.
+    object is ``{"ts", "event"}`` then the pairs in order (then an additive ``unit`` key per
+    :func:`_dual_write_unit`); values pass through :func:`_coerce`; serialization is
+    ``separators=(",", ":")`` with ``ensure_ascii=False`` (``journal.sh:147``). Exposed separately
+    from :func:`ShadowJournal.append` so the parity test can assert the encoding without a
+    filesystem.
     """
     obj = {"ts": _journal_ts() if ts is None else ts, "event": str(event)}
     for k, v in _iter_pairs(pairs):
         obj[str(k)] = _coerce(v)
+    obj = _dual_write_unit(obj)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 

@@ -466,9 +466,23 @@ class TestWorkUnitDualWrite(unittest.TestCase):
 
     def test_bash_and_python_writers_emit_the_same_unit_format(self):
         # Cross-implementation parity: bash journal.sh's journal_unit_ref and Python's
-        # _journal_unit_ref must compose IDENTICAL refs for the same (kind, id) — the exact
-        # invariant HERD-397 exists to keep from drifting apart.
-        self.assertEqual(LR._journal_unit_ref("git-pr", 42), "git-pr:42")
+        # shadow_journal._journal_unit_ref (the single encoder LiveJournal AND ShadowJournal both
+        # route through) must compose IDENTICAL refs for the same (kind, id) — the exact invariant
+        # HERD-397 exists to keep from drifting apart.
+        from herd.shadow_journal import _journal_unit_ref
+        self.assertEqual(_journal_unit_ref("git-pr", 42), "git-pr:42")
+
+    def test_shadow_journal_also_dual_writes(self):
+        # The parity oracle (tests/test-py-shadow-runtime.sh) diffs journal.sh against
+        # herd.shadow_journal.encode_event byte-for-byte — the dual-write MUST live in the shared
+        # encoder both LiveJournal and ShadowJournal call, not be duplicated per-writer, or the two
+        # journals would disagree on every pr-carrying event.
+        from herd.shadow_journal import ShadowJournal
+        spath = os.path.join(self.tmp, "shadow.jsonl")
+        sj = ShadowJournal(spath)
+        sj.append("merge", "pr", 42, "slug", "feat-x", "sha", "deadbeef")
+        ev = events(spath)[0]
+        self.assertEqual(ev["unit"], "git-pr:42")
 
 
 class TestReviewDispatchShape(LiveCase):
