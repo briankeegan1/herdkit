@@ -167,6 +167,16 @@ _cm_render() {
   _cm_module_lines scripts/herd/*.sh | while IFS=$'\t' read -r f role; do
     printf -- '- `%s` — %s\n' "${f##*/}" "$role"
   done
+  # Work-unit adapters: the per-kind delivery-vehicle bodies behind scripts/herd/work-unit.sh
+  # (HERD-398). Own subsection, mirroring Templates below, so a new adapter kind is never silently
+  # missing from the map.
+  local wu=(); for f in scripts/herd/work-units/*.sh; do [ -f "$f" ] && wu+=("$f"); done
+  if [ "${#wu[@]}" -gt 0 ]; then
+    printf '\n### Work-unit adapters (`scripts/herd/work-units/`)\n\n'
+    _cm_module_lines "${wu[@]}" | while IFS=$'\t' read -r f role; do
+      printf -- '- `%s` — %s\n' "${f#scripts/herd/}" "$role"
+    done
+  fi
   # Templates: the top-level render surface only (skip drivers/ and themes/ subdirs).
   local tmpl=(); for f in templates/*; do [ -f "$f" ] && tmpl+=("$f"); done
   printf '\n### Templates (`templates/`)\n\n'
@@ -182,7 +192,7 @@ _cm_render() {
   # Set of engine-script basenames as a space-delimited string (bash 3.2 has no associative arrays;
   # basenames never contain spaces, so a padded ' name ' glob is an exact membership test).
   local _isscript=" "
-  for f in scripts/herd/*.sh; do _isscript="$_isscript${f##*/} "; done
+  for f in scripts/herd/*.sh scripts/herd/work-units/*.sh; do [ -f "$f" ] && _isscript="$_isscript${f##*/} "; done
   cur=""; targets=""
   while IFS=$'\t' read -r path tgt; do
     [ -n "$path" ] || continue
@@ -195,7 +205,7 @@ _cm_render() {
       cur="$path"; targets=""
     fi
     targets="${targets:+$targets, }\`$tgt\`"
-  done < <(_cm_source_edges bin/herd scripts/herd/*.sh | sort)
+  done < <(_cm_source_edges bin/herd scripts/herd/*.sh scripts/herd/work-units/*.sh | sort)
   if [ -n "$cur" ] && [ -n "$targets" ]; then
     case "$cur" in bin/herd) lbl="bin/herd" ;; *) lbl="${cur##*/}" ;; esac
     printf -- '- `%s` → %s\n' "$lbl" "$targets"
@@ -206,9 +216,11 @@ _cm_render() {
   printf 'Which script(s) reference each `kind=config` key from `templates/capabilities.tsv`. The\n'
   printf 'loader `herd-config.sh` (which only sets defaults) is omitted, so this shows real consumers.\n\n'
   if [ -f "$caps" ]; then
-    # Files scanned for consumers: bin/herd + every engine script EXCEPT the loader itself.
+    # Files scanned for consumers: bin/herd + every engine script (incl. the work-unit adapter
+    # bodies) EXCEPT the loader itself.
     local scan=(bin/herd)
-    for f in scripts/herd/*.sh; do
+    for f in scripts/herd/*.sh scripts/herd/work-units/*.sh; do
+      [ -f "$f" ] || continue
       case "$f" in scripts/herd/herd-config.sh) continue ;; esac
       scan+=("$f")
     done

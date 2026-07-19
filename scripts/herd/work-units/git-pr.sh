@@ -57,6 +57,19 @@
 # of that needs to exist yet AT SOURCE TIME — only at CALL time, long after agent-watch.sh has finished
 # loading — so sourcing this file early in agent-watch.sh's own load sequence is safe.
 
+# ── borrow journal.sh's journal_append if not already in scope ─────────────────────────────────────
+# agent-watch.sh sources journal.sh (scripts/herd/journal.sh) near the top of its own load sequence,
+# well before it reaches the point where this file is sourced — in the real pipeline this is always a
+# no-op. Explicit, not conventional, so every journal_append call below (reconcile/do_merge) has the
+# machinery loaded even for a caller that sources this file standalone (a test, or a future caller
+# that hasn't sourced agent-watch.sh at all). Mirrors work-unit.sh's own borrow-if-not-in-scope pattern
+# for journal_unit_ref.
+if ! command -v journal_append >/dev/null 2>&1; then
+  _GITPR_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+  # shellcheck source=/dev/null
+  . "$_GITPR_HERE/journal.sh"
+fi
+
 # already_merged <pr#> <slug> — idempotency guard against the persistent state file. Matches the
 # "<epoch> <pr#> <slug>" prefix followed by end-of-line OR a space (a HERD-92 4th tracker-ref field),
 # so appending the ref never regresses this guard.

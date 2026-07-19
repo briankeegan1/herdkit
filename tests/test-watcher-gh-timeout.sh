@@ -31,6 +31,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WATCH="$ROOT/scripts/herd/agent-watch.sh"
+GITPR="$ROOT/scripts/herd/work-units/git-pr.sh"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 PASS=0
@@ -221,16 +222,18 @@ grep -q 'HERD_GH_TIMEOUT_SECS' "$ROOT/scripts/herd/herd-config.sh" \
   && fail "(6) HERD_GH_TIMEOUT_SECS leaked into herd-config.sh — the budget must stay inline"
 ok "(6b) HERD_GH_TIMEOUT_SECS is not a config key (the budget stays inline in the watcher)"
 
-# ── (7) DRIFT GUARD: every gh call in the watcher goes through the wrapper ─────────────────────────
-# A bare `gh pr …` / `gh api …` added later would silently re-open G4. Scan executable lines only
-# (comments and string literals such as the builder's task-spec pointer are not call sites).
-RAW="$(grep -nE '(^|[^_[:alnum:]])gh[[:space:]]+(pr|api)[[:space:]]' "$WATCH" \
+# ── (7) DRIFT GUARD: every gh call in the watcher (+ the git-pr work-unit adapter, HERD-398 — the
+# merge/list/view/diff calls this guard was written to police now live there, not in agent-watch.sh)
+# goes through the wrapper. A bare `gh pr …` / `gh api …` added later would silently re-open G4. Scan
+# executable lines only (comments and string literals such as the builder's task-spec pointer are not
+# call sites).
+RAW="$(grep -nHE '(^|[^_[:alnum:]])gh[[:space:]]+(pr|api)[[:space:]]' "$WATCH" "$GITPR" \
         | grep -v '_gh_timeout' \
-        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' \
         | grep -vE ':[^#]*#.*gh[[:space:]]+(pr|api)' \
         | grep -vE 'Read the full review|herd pr create|gh pr create' || true)"
 [ -z "$RAW" ] || fail "(7) unwrapped gh call(s) on the tick path — every one must go through _gh_timeout:
 $RAW"
-ok "(7) drift guard: no raw 'gh pr' / 'gh api' call survives in agent-watch.sh"
+ok "(7) drift guard: no raw 'gh pr' / 'gh api' call survives in agent-watch.sh or work-units/git-pr.sh"
 
 echo "ALL PASS ($PASS checks) — test-watcher-gh-timeout.sh"

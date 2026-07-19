@@ -43,7 +43,7 @@ fi
 # 2. shellcheck (best-effort lint — only fail on errors, not style).
 sc_note="shellcheck: skipped (not installed)"
 if command -v shellcheck >/dev/null 2>&1; then
-  if sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; then
+  if sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh scripts/herd/work-units/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; then
     sc_note="shellcheck: clean"
   else
     [ -n "$ONELINE" ] && echo "shellcheck: $(printf '%s' "$sc" | head -1)" || { echo "SHELLCHECK ERRORS"; printf '%s\n' "$sc"; }

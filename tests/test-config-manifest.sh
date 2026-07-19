@@ -92,6 +92,7 @@ with open(CAPS, encoding="utf-8") as f:
 def engine_files():
     fs = glob.glob(os.path.join(ROOT, "scripts/herd/*.sh"))
     fs += glob.glob(os.path.join(ROOT, "scripts/herd/backends/*.sh"))
+    fs += glob.glob(os.path.join(ROOT, "scripts/herd/work-units/*.sh"))
     herd = os.path.join(ROOT, "bin/herd")
     if os.path.isfile(herd):
         fs.append(herd)
@@ -172,6 +173,9 @@ EXEMPT_NAMES = {
     "OSC8_LINK_BASE",  # backlog-view.sh: computed from the Linear slug for OSC-8 hyperlinks (not a config knob)
     "PASTURE",
     "PR", "PRS_JSON",  # agent-watch.sh: live gh pr list JSON for this tick
+    "PRS_LOOKUP_OK",  # assigned in work-units/git-pr.sh's _prs_fetch_tick, read in agent-watch.sh — a
+                       # deliberate cross-file contract (HERD-398) between the git-pr adapter and the
+                       # watcher tick, mirroring PRS_JSON above, not a .herd/config knob
     "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
     "RESEARCH_REPORTS", "RESEARCH_TAB", "RESEARCH_TREES", "RESOLVER_MODEL", "ROOT",
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
