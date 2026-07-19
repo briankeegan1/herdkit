@@ -399,3 +399,8 @@ ENGINE_PAUSE	unit	tests/test-engine-pause.sh
 ENGINE_PAUSE	sim	scripts/herd/sim/engine-pause-scenario.sh
 STORE_BACKEND	unit	tests/test-py-store.sh
 STORE_BACKEND	sim	tests/test-py-store.sh
+work-units/git-pr.sh	unit	tests/test-work-unit-kind.sh
+work-units/git-pr.sh	unit	tests/test-work-unit.sh
+work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-scenario.sh
+work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-concurrency-scenario.sh
+WORK_UNIT_KIND	unit	tests/test-work-unit-kind.sh

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# work-unit.sh — Phase 1 of the work-unit delivery abstraction (HERD-395/HERD-396): NAME the spine,
-# implement nothing new. Full design: docs/spikes/work-unit-abstraction.md (interface at ~2.2,
-# git-pr adapter table at ~2.3, phased migration at ~5, Phase 1 at ~396-405).
+# work-unit.sh — the work-unit delivery abstraction facade (HERD-395/HERD-396/HERD-398). Phase 1 NAMED
+# the spine; Phase 3 (HERD-398) MOVED the git-pr implementations behind it into
+# scripts/herd/work-units/git-pr.sh, selected by WORK_UNIT_KIND. Full design:
+# docs/spikes/work-unit-abstraction.md (interface at ~2.2, git-pr adapter table at ~2.3, phased
+# migration at ~5, Phase 1 at ~396-405, Phase 3 at ~414-419).
 #
 # WHY: herdkit's "work unit" is today a git PR end-to-end (open → gate → apply → reconcile →
 # teardown, all PR-shaped through agent-watch.sh). The spike proposes a thin work-unit interface so a
@@ -56,6 +58,33 @@ if ! command -v journal_unit_ref >/dev/null 2>&1; then
   # shellcheck source=/dev/null
   . "$_WUNIT_HERE/journal.sh"
 fi
+
+# ── resolve — validate a work-unit kind against what this build actually implements ────────────────
+
+# wunit_resolve_adapter [kind] — validate a work-unit kind (arg1, else WORK_UNIT_KIND, else "git-pr")
+# against what this build actually implements. Phase 3 (HERD-398) ships EXACTLY one adapter — git-pr
+# (scripts/herd/work-units/git-pr.sh) — already loaded by the borrow block above, so every wunit_*
+# wrapper below already IS the git-pr adapter body; this resolver is for a caller that wants to ASK
+# "is <kind> supported" before routing through the facade (a future per-spawn WORK_UNIT_KIND override).
+# UNLIKE agent-watch.sh's own boot-time WORK_UNIT_KIND check (herd-config.sh/agent-watch.sh: fails
+# STRICT to git-pr with a loud warning, because the watcher itself must keep running through a config
+# typo), this is a HARD refusal: prints the resolved kind on stdout and returns 0 for "git-pr"; prints
+# a loud not-yet-supported message on stderr and returns 1 for anything else. There is no second
+# adapter to fall back to here, so silently resolving an unimplemented kind to git-pr would be a lie
+# this facade's whole purpose is to prevent.
+wunit_resolve_adapter() {
+  local _wra_kind="${1:-${WORK_UNIT_KIND:-git-pr}}"
+  case "$_wra_kind" in
+    git-pr)
+      printf 'git-pr'
+      return 0
+      ;;
+    *)
+      printf '❌ herdkit: work-unit kind "%s" is not supported yet — only "git-pr" ships today (P4 adds the second kind, HERD-395/HERD-398).\n' "$_wra_kind" >&2
+      return 1
+      ;;
+  esac
+}
 
 # ── open / list_open / inspect — passthrough to `gh pr …` (today's git-pr open + discovery path) ──
 
