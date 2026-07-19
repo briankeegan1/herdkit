@@ -2354,9 +2354,13 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
+    # WORK_UNIT_KIND (HERD-403): carried into the assembled config so herd.work_unit.resolve_adapter
+    # can read it from the SAME dict this tick already builds. Nothing in this module branches on it
+    # yet — the key is inert here, read only by the unwired adapter skeleton.
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
               "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS",
-              "HERD_REFIX_WAIT_TIMEOUT") + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND")
+             + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]

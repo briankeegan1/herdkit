@@ -501,4 +501,145 @@ sed -n '5185,5189p' bin/herd                       # herd why <pr#>
 
 ---
 
-*End of spike. Implementation, if approved, starts at Phase 1 under a new tracker item — not as a silent follow-on in this PR.*
+## 9. Post-port amendment (HERD-403, 2026-07-19)
+
+**Status:** design amendment, landed alongside a python interface SKELETON (this PR). Supersedes
+none of §§1–8 as history — the bash inventory above is still an accurate description of the bash
+tree — but corrects where **production** delivery actually runs today, and re-targets Phase 4.
+
+### 9.0 The finding this amendment is built on
+
+Phases 0, 1, 2, 3 and 3b of §5 all landed as designed, **on the bash side**: the spike (HERD-163),
+the `wunit_*` façade (HERD-396, `scripts/herd/work-unit.sh`), the journal dual-write (HERD-397), the
+git-pr adapter extraction (HERD-398, `scripts/herd/work-units/git-pr.sh`), and the tick's
+reconcile/teardown call sites rewired through the façade (HERD-401). Every one of those PRs is real,
+tested, and byte-identical-by-construction, exactly as designed.
+
+But **in parallel**, a separate epic (HERD-300, the engine port; finale HERD-306) replaced the bash
+watcher's own tick loop with a Python core, `pysrc/herd/live_runtime.py`. By the time HERD-401 went
+looking for a production call site to rewire `do_merge` through the façade, there wasn't one: HERD-306
+had already deleted the bash tick's action pass (`_tick_act`) that used to walk merge candidates and
+call `do_merge`. `LiveActuator` (`live_runtime.py:1686`) independently reimplements merge/reap via its
+own `gh pr merge` / `git worktree remove` subprocess calls — it does not shell out to bash's
+`do_merge` at all. This is the filed finding (`herd note`, HERD-401's commit message) that this
+amendment writes down formally: **the live work-unit seam is the Python engine; the bash `wunit_*`
+façade + git-pr adapter are the sim-exercised reference model**, not the production path.
+
+### 9.1 Where the live seams actually are
+
+| Spike §2.2 op | Live (production) implementation | Reference model (bash, still real, no longer live) |
+|---|---|---|
+| discovery / `list_open` | `discover_via_graphql` (`live_runtime.py:1045`) — ONE batched GraphQL round-trip, wrapped by `_GraphQLDiscovery` (`:1228`) | `wunit_list_open` → `gh pr list` (`work-unit.sh`) |
+| gate | `LiveGates` (`live_runtime.py:1244`) — `.health()` / `.review()`, the ASYNC dispatch/collect rails; these still SHELL OUT to the same bash leaf scripts (`healthcheck.sh`, `herd-review.sh`) — "Python replaces the loop, bash leaves stay leaves" (module docstring) | `wunit_gate` → `_cand_gates_ready` (`work-unit.sh`) |
+| apply | `LiveActuator.merge` (`live_runtime.py:1703`) — `gh pr merge`, verified via `gh pr view --json state` (never trusts the merge command's own exit code, HERD-352) | `wunit_apply` → `do_merge` (`work-unit.sh`) — **zero production call sites** (HERD-401 finding) |
+| the refix-bounce prompts | `LiveTick._refix_prompt` (`live_runtime.py:1989`) — the re-task text typed into a builder's pane on a health/review bounce, plus `LiveActuator.wake_builder`'s real pane-wake verification (`:1850`) | bash's own refix prompt strings (`agent-watch.sh`, pre-port) — same text, no longer the live sender |
+| reconcile | **bash**, still: `agent-watch.sh`'s `_pms_reconcile_one` (`:7618`) calls `wunit_reconcile` → `reconcile_backlog` (`:7724`) for every merge, regardless of which engine actuated it | same — this leg never moved |
+| teardown | **bash**, still: `_pms_reconcile_one` (`:7726`) and `_startup_reap_sweep` (`:6876`, call at `:6926`) call `wunit_teardown` → `_reap_slug` | same — this leg never moved, and `LiveActuator.reap`'s own docstring says why: the cross-seat reap authority is deliberately the bash sweep, not the actuator that merged |
+
+In short: **discovery, gate, and apply crossed to Python; reconcile and teardown stay in bash**,
+because they are POST-MERGE sweep concerns that must fire identically whichever engine (bash or
+Python, on whichever seat) performed the merge — `_pms_reconcile_one` and `_startup_reap_sweep` are
+the one shared place that watches "is this PR merged yet" and cleans up, and HERD-401 already routed
+both through the `wunit_*` names. The gate DAG's *leaves* (the health/review rails) did not move
+either, in the sense that matters for this spike: they are still `healthcheck.sh` / `herd-review.sh`,
+bash scripts, dispatched now by a Python caller instead of a bash one — "leaves stay leaves" holds
+across the port, not just within it.
+
+### 9.2 The python-side WorkUnit adapter interface (this PR's skeleton)
+
+`pysrc/herd/work_unit.py` lands the interface's Python half, mirroring the bash façade's own shape
+(`WorkUnitAdapter` base + one concrete adapter, spike §2.2's five ops + two queries) rather than
+inventing a different vocabulary:
+
+- **Shared types** (§2.2), as plain `__slots__` classes (matching `live_runtime.py`'s own
+  `LiveCandidate`/`WakeResult` convention, not `@dataclass` — no new style for one module):
+  `WorkUnit` (`unit_id`, `kind`, `slug`, `revision`, `item_ref`, `artifact`), `GateResult` (`status`
+  ∈ `pass|hold|block|wait|error`, `reason`, `holds`, `evidence`), `ApplyResult` (`status` ∈
+  `applied|refused|already|error`, `reason`).
+- **`WorkUnitAdapter`** — the base class. Every op raises `NotImplementedError`, named with the op
+  and the adapter's own kind, so a half-built adapter fails loud instead of silently no-op-ing.
+- **`GitPrAdapter(WorkUnitAdapter)`**, `kind = "git-pr"` — WRAPS the existing pieces from §9.1,
+  reimplementing none of them:
+  - `list_open` → one-line delegation to `_GraphQLDiscovery(config, repo).discover()`.
+  - `inspect` → the candidate `list_open` already produced (the batched GraphQL query bundles every
+    inspect-shaped field into the same round-trip; there is no separate git-pr fetch to wrap).
+  - `gate` → composes `LiveGates.health` + `.review` into one `GateResult` (rail readiness only —
+    the merge-POLICY holds stay in `herd.decisions`, reused verbatim, per §2.4).
+  - `apply` → one-line delegation to `LiveActuator.merge`.
+  - `open`, `reconcile`, `teardown` → deliberately **NOT implemented** (`NotImplementedError`, each
+    docstring naming why): `open` is a builder-lane concern (`gh pr create`) the watcher engine core
+    never performed even in bash; `reconcile`/`teardown` are §9.1's bash-owned legs — there is no
+    existing Python code path to wrap yet, and this skeleton does not invent one.
+  - Every collaborator (`gates`, `actuator`, `discovery`) is constructor-injectable, the same
+    Live\*/Fixture\* seam `LiveTick` already offers, so a caller — or a test — can hand the adapter
+    `FixtureGates`/`DryRunActuator` instead of the real, subprocess-shelling live pieces.
+- **`resolve_adapter(kind=None, **kwargs)`** — how `WORK_UNIT_KIND` selects the adapter in Python:
+  explicit `kind` arg, else `kwargs["config"]["WORK_UNIT_KIND"]` (the same config dict
+  `live_runtime._config_from_env` assembles — extended by this PR to carry the key through, inertly),
+  else the `WORK_UNIT_KIND` env var, else `"git-pr"`. An unsupported kind is a **hard refusal**
+  (`UnsupportedWorkUnitKind`), mirroring `wunit_resolve_adapter`'s own hard-refusal contract — not
+  `agent-watch.sh`'s boot-time SOFT fallback (which protects the resident bash watcher process from
+  dying over a config typo; this module has no resident process to protect, so it refuses loudly
+  instead of quietly substituting a different adapter than the one asked for).
+
+**This is a skeleton, not a wired call site.** Nothing in `live_runtime.py` imports or calls
+`herd.work_unit` — `LiveTick` still talks to `_GraphQLDiscovery`/`LiveGates`/`LiveActuator` directly,
+by name, exactly as before this file existed. Landing it changes no observable behavior (the
+byte-identical checklist, §5, holds): the one one-line addition to `live_runtime.py` itself (carrying
+`WORK_UNIT_KIND` into the assembled config dict) is inert until something reads that key, and nothing
+does yet.
+
+### 9.3 Bash `wunit_*` remains the reference model — the conformance tie
+
+The bash façade (`scripts/herd/work-unit.sh`, `scripts/herd/work-units/git-pr.sh`) is not being
+retired or deprecated by this amendment. It stays the **reference model** the spike's interface was
+designed against: it is exercised live by the sandbox sim scenario suite
+(`scripts/herd/sim/sandbox-*.sh`) and by the hermetic bash tests (`tests/test-work-unit.sh`,
+`tests/test-work-unit-kind.sh`, and the rest of the HERD-401 verification list), so the interface's
+SEMANTICS — what "gate", "apply", "reconcile", "teardown" mean, and how a kind gets resolved — stay
+proven even though production traffic no longer flows through `do_merge`.
+
+The **conformance tie** keeping the two implementations semantically paired, so they can never
+silently drift onto different definitions of "supported kind": `templates/conformance.tsv`'s
+`WORK_UNIT_KIND` row points at `tests/test-work-unit-kind.sh` on the bash side; this PR's
+`tests/test_live_runtime.py` adapter-resolution tests are the Python-side half of that SAME tie —
+both assert the identical resolution contract (default `git-pr`; anything else is a **hard**,
+loud refusal, never a silent fallback to a different kind). A future kind that ships on one side
+without an equivalent assertion on the other is exactly the drift this pairing is meant to catch;
+`WORK_UNIT_KIND`'s `templates/capabilities.tsv` row (already registered, HERD-398) needs no new row
+for this PR — it still describes the one kind either engine implements.
+
+### 9.4 Phase 4 (`doc-apply`), re-planned for the python engine
+
+§5's original Phase 4 planned `scripts/herd/work-units/doc-apply.sh` — a second BASH adapter,
+because at spike-writing time bash was the only engine. That target is now wrong: building a bash
+`doc-apply` rail would create a second reference-model-only adapter nobody actuates, mirroring
+`git-pr`'s own post-port fate before it ships. The re-plan:
+
+1. A real `doc-apply` kind is a Python adapter — `DocApplyAdapter(WorkUnitAdapter)` (a sibling class
+   in `work_unit.py`, or its own `pysrc/herd/work_units/doc_apply.py` if it grows large), registered
+   in `work_unit._ADAPTERS` next to `git-pr`, following §3.2's lifecycle (manifest-based `open`,
+   filesystem-glob `list_open`, path-allowlisted `gate`, scoped-checkout `apply` onto the default
+   branch — no `gh pr create` anywhere in the chain).
+2. **Proof is a sim scenario**, reusing the SAME hermetic rig `LiveTick` already has
+   (`FixtureDiscovery`/`FixtureGates`/`DryRunActuator`) rather than a new bash sim script — a
+   `doc-apply` scenario dict drives `resolve_adapter("doc-apply", …)` through open → gate → apply →
+   (reconcile/teardown remain bash's job, §9.1) exactly as `tests/test_live_runtime.py` already
+   drives the git-pr gate DAG hermetically, no `gh`/`git`/pane ever invoked.
+3. Capabilities + conformance rows are still required at that point (a real second kind, a real new
+   `WORK_UNIT_KIND=doc-apply` value) — this PR adds neither, because it ships no second kind, only
+   the interface + the one already-registered kind.
+4. `git-pr` stays default and stays first-class; `doc-apply` is additive, opt-in, and — per §3.5 —
+   still not a coordinator auto-choice from path heuristics.
+
+### 9.5 What did not change
+
+- The decision record (§6), the risk table (§4), and §§1–3's inventory stand as an accurate account
+  of the bash tree at the time each was written.
+- `WORK_UNIT_KIND` default (`git-pr`) and its bash boot-time soft-fallback behavior are unchanged.
+- No capabilities/conformance rows are added by this PR (§9.2's skeleton adds no `cmd_*`, no config
+  key, no `scripts/herd/*.sh` file — `WORK_UNIT_KIND` was already registered by HERD-398).
+
+---
+
+*End of spike. Implementation, if approved, starts at Phase 1 under a new tracker item — not as a silent follow-on in this PR.* Post-port amendment §9 (HERD-403) landed alongside the Python interface skeleton it describes, per that item's own task spec — not a silent follow-on either.
