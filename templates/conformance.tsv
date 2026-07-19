@@ -228,6 +228,8 @@ INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh
 SMOKE_CMD	unit	tests/test-resolve-smoke-gate.sh
 DENY_PATHS	unit	tests/test-scribe-deny-paths.sh
 REVIEW_CHECKLIST	unit	tests/test-review-checklist-injection.sh
+RUBRIC_FILE	unit	tests/test-review-rubric-injection.sh
+RUBRIC_FILE	unit	tests/test_live_runtime.py
 COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{COORDINATOR_CMD}} substitution, only config resolution
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh

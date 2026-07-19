@@ -531,6 +531,13 @@ fi
 
 : "${DENY_PATHS:=""}"            # never committed; the scribe/local lane is scoped away from these
 : "${REVIEW_CHECKLIST:=""}"     # project risk list injected into the review gate
+# RUBRIC_FILE — structured per-unit review rubric (HERD-400, docs/rubric-primitive.md). '' (default,
+# off) → byte-identical to today: no rubric block in the reviewer prompt, no rubric_verdicts journal
+# event. When set AND the named repo-relative file exists (same worktree-then-main resolution order
+# as REVIEW_CHECKLIST), the review gate renders its criteria as an explicit checklist and asks the
+# reviewer for one 'RUBRIC: <id> | PASS|FAIL | <reason>' line per criterion ahead of the final
+# REVIEW: verdict line — which still alone decides PASS/BLOCK/INFRA-FAIL, unchanged.
+: "${RUBRIC_FILE:=""}"
 
 : "${COORDINATOR_CMD:="/coordinator"}"  # the generated coordinator skill the control room runs
 : "${HERD_VERSION:="1"}"

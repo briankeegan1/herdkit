@@ -32,6 +32,7 @@ from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                LiveActuator,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
+                               parse_rubric_verdicts,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
                                _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
@@ -782,6 +783,50 @@ class TestVerdictParser(unittest.TestCase):
         self.assertEqual(parse_review_verdict(""), "INFRA")
 
 
+class TestRubricVerdictParser(unittest.TestCase):
+    """parse_rubric_verdicts (HERD-400): a second, independent pass over the SAME text
+    parse_review_verdict reads — never able to change its PASS/BLOCK/INFRA result."""
+
+    def test_extracts_well_formed_lines(self):
+        text = "RUBRIC: scoped | PASS | tight diff\nRUBRIC: tested | FAIL | no new test\nREVIEW: BLOCK — rule: x | why: y | location: f:1"
+        got = parse_rubric_verdicts(text)
+        self.assertEqual(got, [
+            {"id": "scoped", "verdict": "PASS", "reason": "tight diff"},
+            {"id": "tested", "verdict": "FAIL", "reason": "no new test"},
+        ])
+
+    def test_no_rubric_lines_is_empty_list(self):
+        self.assertEqual(parse_rubric_verdicts("REVIEW: PASS"), [])
+        self.assertEqual(parse_rubric_verdicts(""), [])
+
+    def test_malformed_lines_are_skipped_not_raised(self):
+        text = "\n".join([
+            "RUBRIC: missing-fields | PASS",                 # only 2 fields
+            "RUBRIC: | PASS | empty id",                     # empty id
+            "RUBRIC: bad-verdict | MAYBE | not pass or fail", # unrecognized verdict word
+            "RUBRIC: ok | PASS | this one is fine",
+            "REVIEW: PASS",
+        ])
+        self.assertEqual(parse_rubric_verdicts(text),
+                          [{"id": "ok", "verdict": "PASS", "reason": "this one is fine"}])
+
+    def test_case_insensitive_verdict_and_prefix(self):
+        self.assertEqual(parse_rubric_verdicts("rubric: x | pass | ok"),
+                          [{"id": "x", "verdict": "PASS", "reason": "ok"}])
+
+    def test_duplicate_ids_all_kept_not_folded(self):
+        # A review PANEL: every panelist judges the same criterion independently (docs/rubric-primitive.md).
+        text = "RUBRIC: scoped | PASS | panelist a\nRUBRIC: scoped | FAIL | panelist b"
+        got = parse_rubric_verdicts(text)
+        self.assertEqual(len(got), 2)
+        self.assertEqual([g["verdict"] for g in got], ["PASS", "FAIL"])
+
+    def test_never_affects_the_review_verdict(self):
+        text = "RUBRIC: x | MAYBE | garbage\nRUBRIC: y | PASS | fine\nREVIEW: BLOCK — rule: x | why: y | location: f:1"
+        self.assertEqual(parse_review_verdict(text), "BLOCK")   # unaffected by rubric lines, garbled or not
+        self.assertEqual(len(parse_rubric_verdicts(text)), 1)   # only the well-formed one survives
+
+
 class TestLifecycleAssertion(LiveCase):
     def test_illegal_transition_is_observed_not_fatal(self):
         scenario = {"candidates": [], "config": {"MERGE_POLICY": "auto"}}
@@ -920,6 +965,49 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         # A later tick reuses the ledger verdict without re-dispatch.
         self.assertEqual(g.review(c), "PASS")
         self.assertEqual(dr, [])
+
+    # ── rubric-primitive (HERD-400): a fixture rubric through the review-collect gate ──
+    def test_collect_pass_with_rubric_journals_event(self):
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("RUBRIC: scoped | PASS | tight diff\nRUBRIC: tested | FAIL | no new test\nREVIEW: BLOCK — rule: x | why: y | location: f:1\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "BLOCK")          # the REVIEW: line alone decides — unchanged contract
+        self.assertEqual(self.state.recorded_review(c.pr, c.sha), "BLOCK")
+        rows = [e for e in events(self.journal.path) if e["event"] == "rubric_verdicts"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pr"], 1)
+        self.assertEqual(rows[0]["verdict"], "BLOCK")
+        self.assertEqual(rows[0]["criteria_count"], 2)
+        criteria = json.loads(rows[0]["criteria"])
+        self.assertEqual(criteria, [
+            {"id": "scoped", "verdict": "PASS", "reason": "tight diff"},
+            {"id": "tested", "verdict": "FAIL", "reason": "no new test"},
+        ])
+
+    def test_collect_pass_no_rubric_lines_journals_nothing(self):
+        # RUBRIC_FILE-unset (or a rubric-blind reviewer): byte-identical to before the primitive existed.
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("REVIEW: PASS\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        rows = [e for e in events(self.journal.path) if e["event"] == "rubric_verdicts"] \
+            if os.path.exists(self.journal.path) else []
+        self.assertEqual(rows, [])
+
+    def test_collect_malformed_rubric_lines_degrades_to_plain_verdict(self):
+        # Every RUBRIC: line is malformed — the review verdict is STILL a clean PASS (never INFRA-FAIL),
+        # and no rubric_verdicts event is journaled (zero criteria parsed cleanly).
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("RUBRIC: only-two-fields | PASS\nRUBRIC: | PASS | empty id\nRUBRIC: x | MAYBE | bad verdict word\nREVIEW: PASS\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        self.assertEqual(self.state.recorded_review(c.pr, c.sha), "PASS")
+        rows = [e for e in events(self.journal.path) if e["event"] == "rubric_verdicts"] \
+            if os.path.exists(self.journal.path) else []
+        self.assertEqual(rows, [])
 
     def test_collect_infra_never_cached(self):
         c = self.cand()
