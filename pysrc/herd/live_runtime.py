@@ -1414,11 +1414,21 @@ class LiveGates:
         if result and os.path.exists(result):
             try:
                 with open(result, encoding="utf-8") as fh:
-                    verdict = parse_review_verdict(fh.read())
+                    text = fh.read()
+                verdict = parse_review_verdict(text)
             except Exception:
-                verdict = "INFRA"
+                text, verdict = "", "INFRA"
             if verdict in ("PASS", "BLOCK"):
                 st.record_review(cand.pr, cand.sha, verdict, "reviewer")
+                # RUBRIC_FILE (HERD-400): a second, independent pass over the SAME text — a malformed
+                # or absent RUBRIC: line never affects the verdict just recorded above. Journaled only
+                # when >=1 criterion parsed cleanly (RUBRIC_FILE unset, or every line malformed, stays
+                # a silent no-op — byte-identical to before this key existed).
+                rubric = parse_rubric_verdicts(text)
+                if rubric:
+                    self.journal.append("rubric_verdicts", "pr", cand.pr, "sha", cand.sha,
+                                        "verdict", verdict, "criteria_count", len(rubric),
+                                        "criteria", json.dumps(rubric, separators=(",", ":")))
                 st.rm(result, inflight, st.review_registry_file(cand))
                 return verdict
             st.rm(result, inflight, st.review_registry_file(cand))
@@ -1506,6 +1516,33 @@ def parse_review_verdict(text):
             # INFRA-FAIL, an empty body, or any unrecognized word — a transient, never a code verdict.
             verdict = "INFRA"
     return verdict
+
+
+def parse_rubric_verdicts(text):
+    """Extract ``RUBRIC: <id> | PASS|FAIL | <reason>`` lines (rubric-primitive, HERD-400).
+
+    A SECOND, independent pass over the exact same text :func:`parse_review_verdict` reads — never
+    consulted by it, and never able to change its PASS/BLOCK/INFRA result. Returns an ordered list of
+    ``{"id", "verdict", "reason"}`` dicts, one per well-formed line (duplicates — e.g. one per review-
+    panel member — are kept, not folded). A malformed line (not exactly three ``|``-separated fields,
+    an empty id, or a verdict word that isn't ``PASS``/``FAIL``) is SILENTLY SKIPPED: it degrades to
+    "this one criterion produced no signal", matching herd-review.sh's own fail-soft contract — it
+    NEVER raises and never turns into an INFRA-FAIL of the review it was found in.
+    """
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.upper().startswith("RUBRIC:"):
+            continue
+        parts = s.split(":", 1)[1].split("|")
+        if len(parts) != 3:
+            continue
+        cid, verdict, reason = (p.strip() for p in parts)
+        verdict = verdict.upper()
+        if not cid or verdict not in ("PASS", "FAIL"):
+            continue
+        out.append({"id": cid, "verdict": verdict, "reason": reason})
+    return out
 
 
 class FixtureGates:
