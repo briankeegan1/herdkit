@@ -387,6 +387,7 @@ ENGINE_SEAT_RECONCILE	unit	tests/test-engine-seat.sh
 engine-seat.sh	unit	tests/test-engine-seat.sh
 engine-seat.sh	sim	scripts/herd/sim/engine-dual-engine-scenario.sh
 work-unit.sh	unit	tests/test-work-unit.sh
+work-unit.sh	unit	tests/test-journal-unit-dualwrite.sh
 create-retry.sh	unit	tests/test-create-selfheal.sh
 CREATE_SELFHEAL	unit	tests/test-create-selfheal.sh
 CREATE_RETRY_MAX	unit	tests/test-create-selfheal.sh

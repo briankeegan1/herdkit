@@ -424,6 +424,68 @@ class TestJournalShapes(LiveCase):
         self.assertEqual(start["impl"], "python")
 
 
+class TestWorkUnitDualWrite(unittest.TestCase):
+    """HERD-397 (work-unit dual-write, spike docs/spikes/work-unit-abstraction.md Sec 5 Phase 2):
+    every LiveJournal event carrying a `pr` pair also carries an additive `unit="git-pr:<n>"` pair —
+    mirroring bash journal.sh's own dual-write (tests/test-journal-unit-dualwrite.sh)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-19T00:00:00Z"
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def test_pr_event_gets_additive_unit(self):
+        j = LiveJournal(self.jpath)
+        j.append("merge", "pr", 42, "slug", "feat-x", "sha", "deadbeef")
+        ev = events(self.jpath)[0]
+        self.assertEqual(ev["pr"], 42)
+        self.assertEqual(ev["unit"], "git-pr:42")
+        # additive, not a replacement: every original field survives unchanged.
+        self.assertEqual(ev["slug"], "feat-x")
+        self.assertEqual(ev["sha"], "deadbeef")
+
+    def test_no_pr_no_unit(self):
+        j = LiveJournal(self.jpath)
+        j.append("sweep_closed", "tab_id", "tab-1", "reason", "orphan")
+        ev = events(self.jpath)[0]
+        self.assertNotIn("unit", ev)
+
+    def test_explicit_unit_not_overridden(self):
+        j = LiveJournal(self.jpath)
+        j.append("custom", "pr", 7, "unit", "doc:xyz")
+        ev = events(self.jpath)[0]
+        self.assertEqual(ev["unit"], "doc:xyz")
+
+    def test_kwargs_call_shape_also_dual_writes(self):
+        j = LiveJournal(self.jpath)
+        j.append("healthcheck_outcome", pr=9, slug="feat-y", outcome="CLEAN")
+        ev = events(self.jpath)[0]
+        self.assertEqual(ev["unit"], "git-pr:9")
+
+    def test_bash_and_python_writers_emit_the_same_unit_format(self):
+        # Cross-implementation parity: bash journal.sh's journal_unit_ref and Python's
+        # shadow_journal._journal_unit_ref (the single encoder LiveJournal AND ShadowJournal both
+        # route through) must compose IDENTICAL refs for the same (kind, id) — the exact invariant
+        # HERD-397 exists to keep from drifting apart.
+        from herd.shadow_journal import _journal_unit_ref
+        self.assertEqual(_journal_unit_ref("git-pr", 42), "git-pr:42")
+
+    def test_shadow_journal_also_dual_writes(self):
+        # The parity oracle (tests/test-py-shadow-runtime.sh) diffs journal.sh against
+        # herd.shadow_journal.encode_event byte-for-byte — the dual-write MUST live in the shared
+        # encoder both LiveJournal and ShadowJournal call, not be duplicated per-writer, or the two
+        # journals would disagree on every pr-carrying event.
+        from herd.shadow_journal import ShadowJournal
+        spath = os.path.join(self.tmp, "shadow.jsonl")
+        sj = ShadowJournal(spath)
+        sj.append("merge", "pr", 42, "slug", "feat-x", "sha", "deadbeef")
+        ev = events(spath)[0]
+        self.assertEqual(ev["unit"], "git-pr:42")
+
+
 class TestReviewDispatchShape(LiveCase):
     """HERD-321: the real _dispatch_review path (bypassed by FixtureGates) must emit review_dispatched
     with the full contract §3.4 shape (pr, sha, pid, model, log_path, pin). Hermetic: a fresh temp

@@ -6073,7 +6073,9 @@ for raw in sys.stdin:
         continue
     ts = str(o.get("ts", ""))
     ev = str(o.get("event", "?"))
-    rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event"))
+    # "unit" (HERD-397 work-unit dual-write) is excluded from the raw dump: no reader may depend
+    # on it yet, and herd log output must stay byte-identical to before the dual-write landed.
+    rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event", "unit"))
     print("%s  %-22s %s" % (ts, ev, rest))
 '
 
@@ -6238,7 +6240,9 @@ def describe(o):
         return "cost", "%s · %s · $%s (in %s out %s cache_r %s cache_w %s)" % (
             g(o,"component") or "?", g(o,"model") or "?", g(o,"usd") or "?",
             g(o,"in") or "0", g(o,"out") or "0", g(o,"cache_read") or "0", g(o,"cache_write") or "0")
-    extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr"))
+    # "unit" (HERD-397 work-unit dual-write) is excluded here too: no reader may surface it yet, and
+    # this is the SAME generic fallback herd log guards — every describe()-less event hits it.
+    extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr","unit"))
     return ev, extra
 
 print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))

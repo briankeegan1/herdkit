@@ -136,10 +136,32 @@ EOF
   grep -qx "_reap_slug myslug /path/to/wt 42 deadbeef merged" "$CALLS" || { echo "FAIL: (1h) wunit_teardown did not delegate full argv to _reap_slug"; exit 1; }
   [ "$rc" -eq 5 ] || { echo "FAIL: (1h) wunit_teardown did not propagate _reap_slug's exit code (got $rc)"; exit 1; }
 
+  # (1i) wunit_ref composes a namespaced ref, via journal.sh's journal_unit_ref — borrowed by
+  # work-unit.sh's own guard even though only do_merge/reconcile_backlog/_reap_slug/_cand_gates_ready
+  # were stubbed here (journal.sh was never sourced by this subshell) — HERD-397 review: this used to
+  # be an unasserted "already in scope by convention" dependency.
+  out="$(wunit_ref git-pr 42)"
+  [ "$out" = "git-pr:42" ] || { echo "FAIL: (1i) wunit_ref git-pr 42 = '$out', expected git-pr:42"; exit 1; }
+
   echo DELEGATION-OK
 ) > "$T/delegation.out" 2>&1 || { cat "$T/delegation.out" >&2; fail "(1) delegation subshell failed"; }
 grep -q DELEGATION-OK "$T/delegation.out" || { cat "$T/delegation.out" >&2; fail "(1) delegation checks did not complete"; }
 ok; echo "PASS (1)+(3) every wunit_* wrapper delegates argv+rc to its named underlying function, no re-source when already in scope"
+
+# ── (4) journal_unit_ref already in scope -> work-unit.sh must NOT override it with journal.sh's ──
+(
+  set -uo pipefail
+  do_merge() { :; }; reconcile_backlog() { :; }; _reap_slug() { :; }; _cand_gates_ready() { :; }
+  journal_unit_ref() { printf 'STUBBED\n'; }
+  export -f do_merge reconcile_backlog _reap_slug _cand_gates_ready journal_unit_ref
+  # shellcheck source=/dev/null
+  . "$LIB" || { echo "FAIL: (4) sourcing work-unit.sh with journal_unit_ref pre-stubbed failed"; exit 1; }
+  out="$(wunit_ref git-pr 42)"
+  [ "$out" = "STUBBED" ] || { echo "FAIL: (4) work-unit.sh overrode an already-in-scope journal_unit_ref (got '$out')"; exit 1; }
+  echo NO_REBORROW_OK
+) > "$T/noreborrow.out" 2>&1 || { cat "$T/noreborrow.out" >&2; fail "(4) journal_unit_ref no-reborrow subshell failed"; }
+grep -q NO_REBORROW_OK "$T/noreborrow.out" || { cat "$T/noreborrow.out" >&2; fail "(4) journal_unit_ref no-reborrow check did not complete"; }
+ok; echo "PASS (4) an already-in-scope journal_unit_ref is never re-sourced/overridden"
 
 echo
 echo "ALL PASS ($pass checks)"

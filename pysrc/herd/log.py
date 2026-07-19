@@ -7,6 +7,8 @@ program in bin/herd, kept there as the fail-soft fallback; the two share this ex
 """
 import sys, os, json
 
+from herd.shadow_journal import NOT_YET_SURFACED_KEYS
+
 
 def main():
     want_pr = os.environ.get("HERD_LOG_PR", "")
@@ -25,7 +27,8 @@ def main():
             continue
         ts = str(o.get("ts", ""))
         ev = str(o.get("event", "?"))
-        rest = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts", "event"))
+        rest = " ".join("%s=%s" % (k, o[k]) for k in o
+                        if k not in ("ts", "event") and k not in NOT_YET_SURFACED_KEYS)
         print("%s  %-22s %s" % (ts, ev, rest))
 
 

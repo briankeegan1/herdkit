@@ -64,6 +64,12 @@ CASES="$T/cases"
     "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP"
   printf 'coerce_edges%sa%s5%sb%s-5%sc%s007%sd%s-%se%s%sf%s1.5%sg%shello\n' \
     "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP"
+  # HERD-397 dual-write, leading-zero pr: journal.sh composes unit from the RAW argv string (no
+  # numeric coercion at all), so a leading-zero pr must yield unit="git-pr:007", not "git-pr:7" —
+  # guards the cross-encoder drift a review caught (unreachable from real gh PR numbers today, but
+  # exactly what this oracle exists to pin).
+  printf 'merge%spr%s007%sslug%sfeat-z%ssha%sbbb\n' \
+    "$SEP" "$SEP" "$SEP" "$SEP" "$SEP" "$SEP"
 } > "$CASES"
 
 export HERD_JOURNAL_NOW="2026-07-10T00:00:00Z"

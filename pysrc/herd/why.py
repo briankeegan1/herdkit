@@ -8,6 +8,8 @@ fallback); the two share this exact source.
 """
 import sys, os, json
 
+from herd.shadow_journal import NOT_YET_SURFACED_KEYS
+
 
 def main():
     pr = os.environ["HERD_WHY_PR"]
@@ -82,7 +84,8 @@ def main():
             return "cost", "%s · %s · $%s (in %s out %s cache_r %s cache_w %s)" % (
                 g(o,"component") or "?", g(o,"model") or "?", g(o,"usd") or "?",
                 g(o,"in") or "0", g(o,"out") or "0", g(o,"cache_read") or "0", g(o,"cache_write") or "0")
-        extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr"))
+        extra = " ".join("%s=%s" % (k, o[k]) for k in o
+                         if k not in ("ts","event","pr") and k not in NOT_YET_SURFACED_KEYS)
         return ev, extra
 
     print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
