@@ -39,6 +39,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                WAIT, PENDING,
                                branch_to_slug, _branch_worktree_slug, _worktree_for_slug,
                                _is_worktree, _pool_scoped)
+from herd import work_unit as WU
 
 # HERMETICITY (HERD-331 gate red): a watcher/healthcheck-descended environment EXPORTS the live
 # engine's main-health coordinates — herd-config.sh exports MAIN_HEALTH_TICK (HERD-359) and
@@ -2325,6 +2326,158 @@ class TestCostEmitMerge(LiveCase):
         cand = LiveCandidate(43, "cafebabe", slug="slug2", worktree=wt)
         act.reap(cand)
         self.assertTrue([o for o in events(self.jpath) if o["event"] == "cost"])
+
+
+class TestWorkUnitAdapterSkeleton(unittest.TestCase):
+    """HERD-403 (post-port amendment, docs/spikes/work-unit-abstraction.md §9): the python-side
+    WorkUnit adapter interface skeleton — resolve_adapter's WORK_UNIT_KIND selection, the base
+    adapter's named NotImplementedError, and GitPrAdapter's composition of the EXISTING gate/apply
+    pieces. Unwired from the live tick (nothing in live_runtime calls herd.work_unit), so these tests
+    exercise the skeleton directly, hermetically — FixtureGates/DryRunActuator, never a subprocess."""
+
+    def tearDown(self):
+        os.environ.pop("WORK_UNIT_KIND", None)
+
+    # ── resolve_adapter: kind selection ───────────────────────────────────────────────────────────
+    def test_default_kind_resolves_to_git_pr_adapter(self):
+        adapter = WU.resolve_adapter()
+        self.assertEqual(adapter.kind, "git-pr")
+        self.assertIsInstance(adapter, WU.GitPrAdapter)
+
+    def test_explicit_kind_arg_wins(self):
+        adapter = WU.resolve_adapter("git-pr")
+        self.assertEqual(adapter.kind, "git-pr")
+
+    def test_config_work_unit_kind_selects_adapter(self):
+        adapter = WU.resolve_adapter(config={"WORK_UNIT_KIND": "git-pr"})
+        self.assertEqual(adapter.kind, "git-pr")
+
+    def test_env_work_unit_kind_is_read_when_no_explicit_kind_or_config(self):
+        os.environ["WORK_UNIT_KIND"] = "git-pr"
+        adapter = WU.resolve_adapter()
+        self.assertEqual(adapter.kind, "git-pr")
+
+    def test_explicit_kind_wins_over_env(self):
+        os.environ["WORK_UNIT_KIND"] = "does-not-matter"
+        with self.assertRaises(WU.UnsupportedWorkUnitKind):
+            WU.resolve_adapter()  # env value is bogus and nothing overrides it -> hard refusal
+        adapter = WU.resolve_adapter("git-pr")  # explicit arg wins regardless
+        self.assertEqual(adapter.kind, "git-pr")
+
+    def test_unsupported_kind_is_a_hard_refusal_not_a_silent_fallback(self):
+        with self.assertRaises(WU.UnsupportedWorkUnitKind):
+            WU.resolve_adapter("doc-apply")
+
+    def test_unsupported_kind_from_config_is_also_a_hard_refusal(self):
+        with self.assertRaises(WU.UnsupportedWorkUnitKind):
+            WU.resolve_adapter(config={"WORK_UNIT_KIND": "config-apply"})
+
+    # ── base adapter: every op is a NAMED NotImplementedError ────────────────────────────────────
+    def test_base_adapter_ops_are_unimplemented_and_named(self):
+        base = WU.WorkUnitAdapter()
+        ops = (("open", (None,)), ("list_open", ()), ("inspect", (None,)),
+               ("gate", (None, None)), ("apply", (None, None)),
+               ("reconcile", (None,)), ("teardown", (None,)))
+        for op, args in ops:
+            with self.assertRaises(NotImplementedError) as ctx:
+                getattr(base, op)(*args)
+            self.assertIn(op, str(ctx.exception))
+
+    # ── GitPrAdapter: open/reconcile/teardown are honest gaps, not silent no-ops ────────────────
+    def test_git_pr_adapter_open_reconcile_teardown_not_implemented(self):
+        adapter = WU.GitPrAdapter()
+        with self.assertRaises(NotImplementedError):
+            adapter.open(None)
+        with self.assertRaises(NotImplementedError):
+            adapter.reconcile(None)
+        with self.assertRaises(NotImplementedError):
+            adapter.teardown(None)
+
+    # ── GitPrAdapter.list_open: one-line delegation to the injected discovery ───────────────────
+    def test_git_pr_adapter_list_open_delegates_to_injected_discovery(self):
+        calls = {}
+
+        class _StubDiscovery:
+            def discover(self):
+                calls["called"] = True
+                return ["stub-unit"]
+
+        adapter = WU.GitPrAdapter(discovery=_StubDiscovery())
+        self.assertEqual(adapter.list_open(), ["stub-unit"])
+        self.assertTrue(calls.get("called"))
+
+    # ── GitPrAdapter.gate: composes LiveGates.health/.review into a GateResult ──────────────────
+    def _gate_adapter(self, tmp, pr, sha, **spec):
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        scenario = {"candidates": [dict(pr=pr, sha=sha, **spec)]}
+        return WU.GitPrAdapter(gates=FixtureGates(scenario), actuator=DryRunActuator(journal))
+
+    def test_gate_passes_on_clean_health_and_pass_review(self):
+        tmp = tempfile.mkdtemp()
+        adapter = self._gate_adapter(tmp, 1, "abc", health="CLEAN", review="PASS")
+        cand = LiveCandidate(pr=1, sha="abc", slug="feat-x")
+        result = adapter.gate(cand, cand.sha)
+        self.assertIsInstance(result, WU.GateResult)
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(result.evidence, {"health": "CLEAN", "review": "PASS"})
+
+    def test_gate_blocks_on_health_codeerror(self):
+        tmp = tempfile.mkdtemp()
+        adapter = self._gate_adapter(tmp, 2, "def", health="CODEERROR", review="PASS")
+        cand = LiveCandidate(pr=2, sha="def", slug="feat-y")
+        self.assertEqual(adapter.gate(cand, cand.sha).status, "block")
+
+    def test_gate_blocks_on_review_block(self):
+        tmp = tempfile.mkdtemp()
+        adapter = self._gate_adapter(tmp, 3, "ghi", health="CLEAN", review="BLOCK")
+        cand = LiveCandidate(pr=3, sha="ghi", slug="feat-z")
+        self.assertEqual(adapter.gate(cand, cand.sha).status, "block")
+
+    def test_gate_errors_on_review_infra(self):
+        tmp = tempfile.mkdtemp()
+        adapter = self._gate_adapter(tmp, 4, "jkl", health="CLEAN", review="INFRA")
+        cand = LiveCandidate(pr=4, sha="jkl", slug="feat-w")
+        self.assertEqual(adapter.gate(cand, cand.sha).status, "error")
+
+    def test_gate_waits_while_a_rail_is_still_dispatching(self):
+        tmp = tempfile.mkdtemp()
+        adapter = self._gate_adapter(tmp, 5, "mno", health=WAIT, review="PASS")
+        cand = LiveCandidate(pr=5, sha="mno", slug="feat-v")
+        self.assertEqual(adapter.gate(cand, cand.sha).status, "wait")
+
+    # ── GitPrAdapter.apply: one-line delegation to the injected actuator's merge ────────────────
+    def test_apply_wraps_actuator_merge_success(self):
+        tmp = tempfile.mkdtemp()
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.GitPrAdapter(actuator=DryRunActuator(journal))
+        cand = LiveCandidate(pr=6, sha="pqr", slug="feat-u")
+        result = adapter.apply(cand, cand.sha)
+        self.assertIsInstance(result, WU.ApplyResult)
+        self.assertEqual(result.status, "applied")
+        names = [e["event"] for e in events(os.path.join(tmp, "j.jsonl"))]
+        self.assertIn("merge", names)
+
+    def test_apply_reports_refused_when_actuator_merge_returns_false(self):
+        class _RefusingActuator:
+            def merge(self, cand):
+                return False
+
+        adapter = WU.GitPrAdapter(actuator=_RefusingActuator())
+        cand = LiveCandidate(pr=7, sha="stu", slug="feat-t")
+        self.assertEqual(adapter.apply(cand, cand.sha).status, "refused")
+
+    # ── GitPrAdapter.to_unit: spike-shaped WorkUnit, unit_id matches the HERD-397 journal ref ────
+    def test_to_unit_shape_matches_journal_unit_ref(self):
+        adapter = WU.GitPrAdapter()
+        cand = LiveCandidate(pr=42, sha="deadbeef", slug="feat-w", base="main")
+        unit = adapter.to_unit(cand)
+        self.assertIsInstance(unit, WU.WorkUnit)
+        self.assertEqual(unit.unit_id, "git-pr:42")
+        self.assertEqual(unit.kind, "git-pr")
+        self.assertEqual(unit.slug, "feat-w")
+        self.assertEqual(unit.revision, "deadbeef")
+        self.assertEqual(unit.artifact["pr_number"], cand.pr)
+        self.assertEqual(unit.artifact["base_ref"], "main")
 
 
 if __name__ == "__main__":
