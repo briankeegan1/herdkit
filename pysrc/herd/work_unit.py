@@ -267,6 +267,13 @@ _DOC_APPLY_MANIFEST_SUFFIX = ".unit.json"
 # the doc-apply allowlist, so an operator's own definition of "this is a docs path" is not duplicated
 # under a second key. An unparseable operator pattern is DROPPED in favor of the hardcoded default
 # rather than raising — this is a safety gate, so a bad regex must never silently widen it.
+#
+# MATCHED WITH re.match, NOT re.search (review fix, HERD-399): this is a fail-CLOSED gate, not the
+# docs-review-tier classifier DOCS_ONLY_GLOB otherwise feeds — an un-anchored operator pattern (e.g.
+# "docs/" with no leading "^") must never widen the allowlist to "matches anywhere in the path" (a
+# path like "src/docs/x" is NOT a docs path just because the substring "docs/" occurs in it). match()
+# requires the pattern to align at position 0, so the DEFAULT pattern's own "^" is redundant-but-kept
+# for readability, and a customized pattern is a PREFIX by construction, never a substring search.
 _DEFAULT_DOC_APPLY_PATH_RE = re.compile(r"^docs/")
 
 
@@ -280,13 +287,77 @@ def _doc_apply_path_pattern(config):
     return _DEFAULT_DOC_APPLY_PATH_RE
 
 
-def _path_allowed(path, config):
-    """A single manifest path clears the doc-apply allowlist. Empty/falsy is NEVER allowed — the
-    caller treats "no paths" the same as "a disallowed path" (fail closed, never an empty no-op that
-    could be mistaken for a passing gate)."""
+def _safe_manifest_path(path):
+    """Normalize ONE manifest path and reject anything unsafe — empty, absolute, drive-qualified, or
+    escaping via any ``..`` component — BEFORE the allowlist pattern (or git) ever sees it (review fix,
+    HERD-399). The allowlist is a STRING match, not a filesystem-containment check: an un-normalized
+    ``"docs/../src/x.py"`` clears ``^docs/`` while actually resolving to ``src/x.py`` — verified
+    empirically, ``git checkout <rev> -- "docs/../src/x.py"`` exits 0 and lands the OTHER file. Returns
+    the normalized POSIX-relative path (the form used for every downstream check AND every git
+    operation — the raw manifest string is never trusted again once this returns), or ``None`` when the
+    path is unsafe.
+    """
     if not path:
+        return None
+    p = str(path).replace("\\", "/")
+    if p.startswith("/") or p.startswith("~") or (len(p) > 1 and p[1] == ":"):
+        return None
+    norm = os.path.normpath(p).replace("\\", "/")
+    if norm in (".", ""):
+        return None
+    if norm == ".." or norm.startswith("../"):
+        return None
+    return norm
+
+
+def _path_allowed(path, config):
+    """A single manifest path clears the doc-apply allowlist: normalize FIRST (rejecting any ``..``
+    escape or absolute path), THEN match the allowlist pattern against the normalized form — so a
+    traversal path can never borrow a legitimate ``docs/`` prefix to smuggle a non-docs path past the
+    gate (review fix, HERD-399). Empty/unsafe is NEVER allowed — the caller treats that the same as "a
+    disallowed path" (fail closed, never an empty no-op mistaken for a passing gate)."""
+    safe = _safe_manifest_path(path)
+    if safe is None:
         return False
-    return bool(_doc_apply_path_pattern(config).search(str(path)))
+    return bool(_doc_apply_path_pattern(config).match(safe))
+
+
+def _safe_paths(paths, config):
+    """Normalize + allowlist-check every manifest path in one pass. Returns ``(safe_paths,
+    disallowed_raw)``: ``safe_paths`` is the CANONICAL form — the ONLY form ever handed to git — for
+    every path that cleared the gate; ``disallowed_raw`` lists the original (raw) strings that did not,
+    for the caller to journal exactly what was rejected. A caller must refuse whenever ``disallowed_raw``
+    is non-empty (fail closed on ANY bad path, not just drop it silently from the set)."""
+    safe_paths, disallowed = [], []
+    for p in paths:
+        if _path_allowed(p, config):
+            safe_paths.append(_safe_manifest_path(p))
+        else:
+            disallowed.append(p)
+    return safe_paths, disallowed
+
+
+def _is_tree_path(worktree, revision, path):
+    """True iff ``path`` names a TREE (directory), not a blob, at ``revision`` in ``worktree``'s repo.
+    Used to fail closed on directory-shaped manifest paths (review advisory, HERD-399): a scoped
+    ``git checkout <rev> -- <dir>`` can only ADD/UPDATE files present in ``<dir>`` at ``<rev>`` — it
+    never removes a file that existed in MAIN's copy of ``<dir>`` but was deleted in ``<rev>``, so a doc
+    deletion expressed via a directory path would silently fail to land while ``apply`` still reports
+    ``applied``. Best-effort: an unreadable ``ls-tree`` (no worktree, bad revision) returns False rather
+    than blocking on an inconclusive read — the worktree-HEAD divergence guard elsewhere already covers
+    an unreadable/absent worktree."""
+    if not worktree or not path:
+        return False
+    try:
+        out = subprocess.run(["git", "-C", worktree, "ls-tree", revision, "--", path],
+                             capture_output=True, text=True, check=True)
+    except Exception:
+        return False
+    line = (out.stdout or "").strip()
+    if not line:
+        return False
+    fields = line.split("\t", 1)[0].split()
+    return len(fields) >= 2 and fields[1] == "tree"
 
 
 def _read_manifest(path):
@@ -384,24 +455,59 @@ class LiveDocApply:
                             slug=unit.slug, reason=reason, **extra)
         return ApplyResult(status="error", reason=reason)
 
+    def _refused(self, unit, reason, **extra):
+        self.journal.append("doc_apply_apply_refused", unit=unit.unit_id, kind="doc-apply",
+                            slug=unit.slug, reason=reason, **extra)
+        return ApplyResult(status="refused", reason=reason)
+
+    def _landed(self, unit, revision, paths):
+        new_sha = _git_head(self._main())
+        self.journal.append("apply", unit=unit.unit_id, kind="doc-apply", slug=unit.slug,
+                            sha=new_sha, revision=revision, item_ref=unit.item_ref or "",
+                            paths=",".join(paths), reason="gates_passed")
+        return ApplyResult(status="applied", reason="gates_passed")
+
     def apply(self, unit):
         art = unit.artifact or {}
         main = self._main()
         worktree = str(art.get("worktree") or "")
-        paths = list(art.get("paths") or [])
         revision = unit.revision
         remote, branch = self._remote(), self._branch()
 
+        # DEFENSE IN DEPTH (review fix, HERD-399): this is "the ONLY thing standing between a
+        # builder-authored manifest ... and a direct commit to main" — it never trusts a caller's
+        # allowlist check alone. Re-normalize + re-validate every path here too, and use ONLY the
+        # normalized form for every git invocation below (never the raw manifest string, which is
+        # exactly what let a "docs/../src/x.py" traversal clear an un-normalized "^docs/" match).
+        raw_paths = list(art.get("paths") or [])
+        safe_paths, disallowed = _safe_paths(raw_paths, self.config)
+        if not raw_paths or disallowed:
+            return self._refused(unit, "path allowlist refused",
+                                 disallowed=",".join(str(p) for p in disallowed))
+        paths = safe_paths
+
         if not main or not os.path.isdir(main):
             return self._err(unit, "no-main")
-        if not paths:
-            return self._err(unit, "no-paths")
         if worktree:
             live_head = _git_head(worktree)
             if live_head and revision and live_head != revision:
                 return self._err(unit, "revision-diverged")
+            # A directory-shaped path cannot express a DELETION (a scoped checkout only ever adds/
+            # updates files present at <revision> — a file removed there but still on MAIN silently
+            # survives). Fail closed rather than silently under-apply (review advisory, HERD-399).
+            tree_paths = [p for p in paths if _is_tree_path(worktree, revision, p)]
+            if tree_paths:
+                return self._refused(unit, "directory-path-not-supported",
+                                     paths=",".join(tree_paths))
         if not _git_attached(main, branch):
             return self._err(unit, "detached-head")
+
+        # Never checkout OVER uncommitted local edits under these paths in the shared checkout — that
+        # would silently discard them (review advisory, HERD-399).
+        pre_status = subprocess.run(["git", "-C", main, "status", "--porcelain", "--"] + paths,
+                                    capture_output=True, text=True)
+        if (pre_status.stdout or "").strip():
+            return self._err(unit, "dirty-local-changes")
 
         try:
             subprocess.run(["git", "-C", main, "checkout", revision, "--"] + paths,
@@ -428,25 +534,41 @@ class LiveDocApply:
             subprocess.run(["git", "-C", main, "checkout", "--"] + paths, capture_output=True, text=True)
             return self._err(unit, "commit-failed", detail=str(exc)[:160])
 
+        commit_sha = _git_head(main)   # OUR commit — checked before any rollback ever touches HEAD
+
         push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
                               capture_output=True, text=True)
-        if push.returncode != 0:
-            pull = subprocess.run(["git", "-C", main, "pull", "--rebase", "--quiet", remote, branch],
-                                  capture_output=True, text=True)
-            if pull.returncode == 0 and _git_attached(main, branch):
-                push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
-                                      capture_output=True, text=True)
-            if push.returncode != 0:
-                subprocess.run(["git", "-C", main, "rebase", "--abort"], capture_output=True, text=True)
-                subprocess.run(["git", "-C", main, "reset", "--hard", "HEAD~1"],
-                               capture_output=True, text=True)
-                return self._err(unit, "push-rejected")
+        if push.returncode == 0:
+            return self._landed(unit, revision, paths)
 
-        new_sha = _git_head(main)
-        self.journal.append("apply", unit=unit.unit_id, kind="doc-apply", slug=unit.slug,
-                            sha=new_sha, revision=revision, item_ref=unit.item_ref or "",
-                            paths=",".join(paths), reason="gates_passed")
-        return ApplyResult(status="applied", reason="gates_passed")
+        pull = subprocess.run(["git", "-C", main, "pull", "--rebase", "--quiet", remote, branch],
+                              capture_output=True, text=True)
+        if pull.returncode == 0:
+            if not _git_attached(main, branch):
+                # HERD-336: a rebase-pull can leave HEAD detached — NEVER reset a detached HEAD (that
+                # would strand the branch further, the exact corpse agent-watch.sh's refresh legs
+                # guard against). Stop here; a human/reconcile sweep resumes.
+                return self._err(unit, "push-rejected-detached-head")
+            push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
+                                  capture_output=True, text=True)
+            if push.returncode == 0:
+                return self._landed(unit, revision, paths)
+
+        # Rollback path. A conflicted `pull --rebase` may have left the checkout mid-rebase — abort it
+        # (best-effort) BEFORE inspecting HEAD, mirroring agent-watch.sh's refresh_codemap discipline
+        # (HERD-336). Two independent guards before the destructive reset (review fix, HERD-399):
+        #   (1) never reset a DETACHED HEAD — that stresses/strands the branch rather than repairing it;
+        #   (2) never reset unless HEAD is still EXACTLY the commit we just made — if a concurrent seat
+        #       committed to this shared checkout in between, `reset --hard HEAD~1` would destroy THEIR
+        #       work, not ours. Either guard failing leaves the commit in place (a stuck-but-honest state
+        #       a human/reconcile sweep resolves) rather than risk a bigger loss than the one being fixed.
+        subprocess.run(["git", "-C", main, "rebase", "--abort"], capture_output=True, text=True)
+        if not _git_attached(main, branch):
+            return self._err(unit, "push-rejected-detached-head")
+        if _git_head(main) != commit_sha:
+            return self._err(unit, "push-rejected-head-moved")
+        subprocess.run(["git", "-C", main, "reset", "--hard", "HEAD~1"], capture_output=True, text=True)
+        return self._err(unit, "push-rejected")
 
 
 class DocApplyAdapter(WorkUnitAdapter):
@@ -584,10 +706,10 @@ class DocApplyAdapter(WorkUnitAdapter):
         if manifest is None:
             return GateResult(status="error", reason="doc-apply manifest unreadable")
         paths = list(manifest.get("paths") or [])
-        disallowed = [p for p in paths if not _path_allowed(p, self.config)]
+        _safe, disallowed = _safe_paths(paths, self.config)
         if not paths or disallowed:
             self.journal.append("doc_apply_gate_refused", unit=unit.unit_id, kind=self.kind,
-                                slug=unit.slug, disallowed=",".join(disallowed))
+                                slug=unit.slug, disallowed=",".join(str(p) for p in disallowed))
             return GateResult(status="block", reason="doc-apply path allowlist refused",
                               evidence={"disallowed": disallowed, "paths": paths})
         if self._gates is None:
@@ -612,8 +734,13 @@ class DocApplyAdapter(WorkUnitAdapter):
     def apply(self, unit, revision):
         """Re-checks the allowlist (defense in depth — a caller MUST have already gated, but apply
         never trusts that alone) then delegates the actual landing to :class:`LiveDocApply` (or an
-        injected twin). At-most-once via the manifest's own ``state`` field: an already-applied unit
-        short-circuits to ``already`` with no git op and no double journal (spike §3.2 step 4)."""
+        injected twin), handing it the NORMALIZED path list — never the raw manifest strings (review
+        fix, HERD-399: a raw ``docs/../src/x.py`` would clear an un-normalized allowlist check while
+        resolving to a completely different file once it reaches git). At-most-once via the manifest's
+        own ``state`` field: an already-applied unit short-circuits to ``already`` with no git op and
+        no double journal (spike §3.2 step 4). A terminal ``already`` (nothing to land — MAIN already
+        matches) is ALSO persisted (review advisory, HERD-399) — else a no-diff unit stays in
+        ``list_open`` and re-runs a checkout+status probe forever."""
         manifest_path = self._manifest_path(unit.slug)
         manifest = _read_manifest(manifest_path)
         if manifest is None:
@@ -621,13 +748,14 @@ class DocApplyAdapter(WorkUnitAdapter):
         if manifest.get("state") == "applied":
             return ApplyResult(status="already", reason="already applied")
         paths = list(manifest.get("paths") or [])
-        disallowed = [p for p in paths if not _path_allowed(p, self.config)]
+        safe_paths, disallowed = _safe_paths(paths, self.config)
         if not paths or disallowed:
             self.journal.append("doc_apply_apply_refused", unit=unit.unit_id, kind=self.kind,
-                                slug=unit.slug, disallowed=",".join(disallowed))
+                                slug=unit.slug, disallowed=",".join(str(p) for p in disallowed))
             return ApplyResult(status="refused", reason="path allowlist refused")
+        unit.artifact["paths"] = safe_paths
         result = self._land.apply(unit)
-        if result.status == "applied":
+        if result.status in ("applied", "already"):
             manifest["state"] = "applied"
             _write_manifest(manifest_path, manifest)
         return result
