@@ -108,7 +108,7 @@ ok "(2) sourcing agent-watch.sh transitively loads every moved git-pr function u
 
   err="$(wunit_resolve_adapter doc-apply 2>&1 1>/dev/null)"; rc=$?
   [ "$rc" -eq 1 ] || { echo "FAIL: (3d) unsupported kind must return rc 1 (got rc=$rc)"; exit 1; }
-  printf '%s' "$err" | grep -qi 'not supported yet' || { echo "FAIL: (3d) refusal must be LOUD (stderr), got: $err"; exit 1; }
+  printf '%s' "$err" | grep -qi 'not supported' || { echo "FAIL: (3d) refusal must be LOUD (stderr), got: $err"; exit 1; }
   out="$(wunit_resolve_adapter doc-apply 2>/dev/null)"
   [ -z "$out" ] || { echo "FAIL: (3e) unsupported kind must print NOTHING on stdout (a silent fallback), got: '$out'"; exit 1; }
 
@@ -122,8 +122,8 @@ ok "(3) wunit_resolve_adapter resolves git-pr and hard-refuses any other kind"
 # ══════════════════════════════════════════════════════════════════════════════
 grep -q 'work_unit_kind_invalid' "$WATCH" \
   || fail "(4a) agent-watch.sh must journal work_unit_kind_invalid on an unsupported WORK_UNIT_KIND"
-grep -qi 'is not supported yet' "$WATCH" \
-  || fail "(4b) agent-watch.sh must print a not-supported-yet console line on an unsupported WORK_UNIT_KIND"
+grep -qi 'is not supported' "$WATCH" \
+  || fail "(4b) agent-watch.sh must print a not-supported console line on an unsupported WORK_UNIT_KIND"
 grep -q 'WORK_UNIT_KIND:-git-pr' "$WATCH" \
   || fail "(4c) agent-watch.sh's boot check must fail STRICT to the git-pr default"
 ok "(4) agent-watch.sh boot-time WORK_UNIT_KIND check journals + warns, never crashes"

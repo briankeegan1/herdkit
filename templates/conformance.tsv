@@ -388,6 +388,7 @@ engine-seat.sh	unit	tests/test-engine-seat.sh
 engine-seat.sh	sim	scripts/herd/sim/engine-dual-engine-scenario.sh
 work-unit.sh	unit	tests/test-work-unit.sh
 work-unit.sh	unit	tests/test-journal-unit-dualwrite.sh
+work-unit.sh	unit	tests/test-work-unit-conformance.sh
 create-retry.sh	unit	tests/test-create-selfheal.sh
 CREATE_SELFHEAL	unit	tests/test-create-selfheal.sh
 CREATE_RETRY_MAX	unit	tests/test-create-selfheal.sh
@@ -405,6 +406,7 @@ work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-scenario.sh
 work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-concurrency-scenario.sh
 WORK_UNIT_KIND	unit	tests/test-work-unit-kind.sh
 WORK_UNIT_KIND	unit	tests/test_live_runtime.py
+WORK_UNIT_KIND	unit	tests/test-work-unit-conformance.sh
 herd.work_unit.DocApplyAdapter	unit	tests/test_live_runtime.py
 <slug>.unit.json	unit	tests/test_live_runtime.py
 DOC_APPLY_PATH_GLOB	unit	tests/test_live_runtime.py

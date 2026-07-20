@@ -604,20 +604,21 @@ if [ "${AGENT_WATCH_LIB:-}" != "1" ] && _merge_policy_is_typo; then
 fi
 unset _pol
 
-# WORK_UNIT_KIND (HERD-398) — only git-pr ships (P4 adds the second kind). An explicitly-set but
-# UNSUPPORTED kind fails STRICT to git-pr (the only adapter that exists) — journal it once at launch
-# and print a red console line, mirroring the MERGE_POLICY typo handling above, so a typo
-# (WORK_UNIT_KIND=doc-apply, not yet shipped) never silently changes engine behavior: the watcher
-# unconditionally runs the git-pr pipeline either way (nothing branches on this key yet), so the
-# fallback here is cosmetic-honest, not a real behavior switch. Skipped in lib mode, same as its
-# neighbors. The STRICTER hard refusal for an actual adapter-resolution caller lives in
-# wunit_resolve_adapter (work-unit.sh) — this block is the boot-time advisory, not the enforcement.
+# WORK_UNIT_KIND (HERD-398) — the BASH watcher only ever runs git-pr (doc-apply is a PYTHON-only
+# adapter, HERD-399; see spike §9.4 for why bash never gets a second kind). An explicitly-set but
+# UNSUPPORTED kind fails STRICT to git-pr (the only adapter this engine has) — journal it once at
+# launch and print a red console line, mirroring the MERGE_POLICY typo handling above, so a typo here
+# never silently changes engine behavior: the watcher unconditionally runs the git-pr pipeline either
+# way (nothing branches on this key yet), so the fallback here is cosmetic-honest, not a real behavior
+# switch. Skipped in lib mode, same as its neighbors. The STRICTER hard refusal for an actual
+# adapter-resolution caller lives in wunit_resolve_adapter (work-unit.sh) — this block is the boot-time
+# advisory, not the enforcement.
 if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
   case "${WORK_UNIT_KIND:-git-pr}" in
     git-pr) ;;
     *)
       journal_append work_unit_kind_invalid value "$WORK_UNIT_KIND" fell_back_to git-pr 2>/dev/null || true
-      printf '%s⚠️  herdkit: WORK_UNIT_KIND=%s is not supported yet — only "git-pr" ships today (P4 adds the second kind, HERD-395/HERD-398); running the git-pr pipeline%s\n' \
+      printf '%s⚠️  herdkit: WORK_UNIT_KIND=%s is not supported by the bash watcher — only "git-pr" ships here (doc-apply is python-engine-only, HERD-399); running the git-pr pipeline%s\n' \
         "$C_RED" "$WORK_UNIT_KIND" "$C_RESET" >&2
       ;;
   esac
