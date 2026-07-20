@@ -404,3 +404,7 @@ work-units/git-pr.sh	unit	tests/test-work-unit.sh
 work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-scenario.sh
 work-units/git-pr.sh	sim	scripts/herd/sim/sandbox-concurrency-scenario.sh
 WORK_UNIT_KIND	unit	tests/test-work-unit-kind.sh
+WORK_UNIT_KIND	unit	tests/test_live_runtime.py
+herd.work_unit.DocApplyAdapter	unit	tests/test_live_runtime.py
+<slug>.unit.json	unit	tests/test_live_runtime.py
+DOC_APPLY_PATH_GLOB	unit	tests/test_live_runtime.py
