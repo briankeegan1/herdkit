@@ -2564,6 +2564,26 @@ class TestDocApplyAdapter(unittest.TestCase):
         self.assertEqual(u1.unit_id, u2.unit_id)
         self.assertEqual(u1.revision, u2.revision)
 
+    def test_open_at_same_revision_is_idempotent_even_when_already_applied(self):
+        # review fix (HERD-399 round 3): the prior condition also required state != "applied", which
+        # INVERTED the documented idempotent-on-same-revision contract — re-opening an ALREADY-APPLIED
+        # unit at the same revision reset its state back to "open", re-opening a completed unit.
+        tmp = tempfile.mkdtemp()
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=LiveJournal(None))
+        unit = adapter.open({"slug": "s9", "worktree": "", "revision": "rev9", "paths": ["docs/a.md"]})
+        path = adapter._manifest_path("s9")
+        obj = WU._read_manifest(path)
+        obj["state"] = "applied"
+        WU._write_manifest(path, obj)
+        self.assertEqual(adapter.list_open(), [])   # correctly excluded
+
+        reopened = adapter.open({"slug": "s9", "worktree": "", "revision": "rev9",
+                                 "paths": ["docs/a.md"]})
+        self.assertEqual(reopened.unit_id, unit.unit_id)
+        still = WU._read_manifest(path)
+        self.assertEqual(still["state"], "applied")   # NOT reset back to "open"
+        self.assertEqual(adapter.list_open(), [])   # still excluded after the re-open
+
     # ── list_open: strictly opt-in + fail-soft (spike §3.2 step 2) ───────────────────────────────
     def test_list_open_empty_with_no_manifests_strictly_opt_in(self):
         tmp = tempfile.mkdtemp()
@@ -2636,24 +2656,40 @@ class TestDocApplyAdapter(unittest.TestCase):
         adapter, unit = self._gated_unit(tmp, LiveJournal(None), FixtureGates(scenario), ["docs/a.md"])
         self.assertEqual(adapter.gate(unit, unit.revision).status, "block")
 
-    def test_gate_respects_operator_docs_only_glob_as_the_allowlist(self):
-        # Matched via re.match (prefix-anchored, HERD-399 review fix) — a custom operator pattern is a
-        # PREFIX by construction, never an un-anchored substring search, so "notes/" here allows
-        # "notes/readme.txt" without also (wrongly) allowing something like "src/notes/x".
+    def test_gate_respects_operator_doc_apply_path_glob_as_the_allowlist(self):
+        # DOC_APPLY_PATH_GLOB (HERD-399 round 3) — a DEDICATED key, not a DOCS_ONLY_GLOB reuse (round 2
+        # discovered reusing DOCS_ONLY_GLOB is unsafe in BOTH matching directions: unanchored search
+        # widens it, anchored match breaks it for that key's own real-world suffix-shaped patterns).
+        # Matched via re.match (prefix-anchored) — a custom operator pattern is a PREFIX by construction,
+        # never an un-anchored substring search, so "notes/" here allows "notes/readme.txt" without also
+        # (wrongly) allowing something like "src/notes/x".
         tmp = tempfile.mkdtemp()
         scenario = {"candidates": [dict(pr="doc-slug", sha="rev-x", health="CLEAN", review="PASS")]}
         adapter, unit = self._gated_unit(tmp, LiveJournal(None), FixtureGates(scenario),
-                                         ["notes/readme.txt"], config={"DOCS_ONLY_GLOB": r"^(docs|notes)/"})
+                                         ["notes/readme.txt"],
+                                         config={"DOC_APPLY_PATH_GLOB": r"^(docs|notes)/"})
         self.assertEqual(adapter.gate(unit, unit.revision).status, "pass")
 
-    def test_gate_operator_docs_only_glob_is_prefix_anchored_not_substring_search(self):
-        # The exact footgun the review flagged: an operator pattern without its own "^" must NOT match
-        # a path merely because the substring occurs somewhere inside it.
+    def test_gate_operator_doc_apply_path_glob_is_prefix_anchored_not_substring_search(self):
+        # The exact footgun round 1 flagged: an operator pattern without its own "^" must NOT match a
+        # path merely because the substring occurs somewhere inside it.
         tmp = tempfile.mkdtemp()
         scenario = {"candidates": [dict(pr="doc-slug", sha="rev-x", health="CLEAN", review="PASS")]}
         adapter, unit = self._gated_unit(tmp, LiveJournal(None), FixtureGates(scenario),
-                                         ["src/docs/x.py"], config={"DOCS_ONLY_GLOB": r"docs/"})
+                                         ["src/docs/x.py"], config={"DOC_APPLY_PATH_GLOB": r"docs/"})
         self.assertEqual(adapter.gate(unit, unit.revision).status, "block")
+
+    def test_gate_a_docs_only_glob_shaped_for_review_tier_no_longer_breaks_doc_apply(self):
+        # The round-2 regression this repo's OWN .herd/config would have hit: DOCS_ONLY_GLOB="[.](md|txt)"
+        # is a suffix-shaped egrep pattern for review-tier classification — under the round-2 fix
+        # (re.match against a REUSED DOCS_ONLY_GLOB) this could never match "docs/x.md" at all, refusing
+        # every doc-apply unit. Now that the two keys are fully decoupled, DOCS_ONLY_GLOB in config has
+        # NO effect on doc-apply's allowlist — the hardcoded ^docs/ default still applies.
+        tmp = tempfile.mkdtemp()
+        scenario = {"candidates": [dict(pr="doc-slug", sha="rev-x", health="CLEAN", review="PASS")]}
+        adapter, unit = self._gated_unit(tmp, LiveJournal(None), FixtureGates(scenario),
+                                         ["docs/x.md"], config={"DOCS_ONLY_GLOB": r"[.](md|txt)"})
+        self.assertEqual(adapter.gate(unit, unit.revision).status, "pass")
 
     # ── apply: real git — scoped checkout + commit + push onto the default branch, no PR ──────────
     def test_apply_lands_a_real_commit_on_the_default_branch(self):
@@ -2719,6 +2755,92 @@ class TestDocApplyAdapter(unittest.TestCase):
         result = adapter.apply(unit, init_sha)
         self.assertEqual(result.status, "already")
         self.assertEqual(adapter.list_open(), [])   # persisted -> never re-offered
+        # ...and the no-diff terminal is NO LONGER a silent state transition (review fix, HERD-399
+        # round 3): a genuine "already landed" now journals a doc_apply_apply_noop event, so an
+        # open -> applied flip always leaves exactly one trace on this path just like every other exit.
+        noops = [e for e in events(os.path.join(tmp, "j.jsonl"))
+                 if e.get("event") == "doc_apply_apply_noop"]
+        self.assertEqual(len(noops), 1)
+        self.assertEqual(noops[0].get("reason"), "no diff to land")
+
+    # ── review BLOCK fix, round 3 (HERD-399): a locally-committed-but-never-pushed apply must NEVER
+    #    be silently reclassified as "already"/"applied" ──────────────────────────────────────────
+    def test_second_apply_after_a_leave_in_place_exit_never_marks_applied_until_actually_pushed(self):
+        """The core composition bug the review caught: LiveDocApply's two deliberate leave-in-place
+        exits (detached-head / head-moved) commit LOCALLY without pushing. A prior fix already proved
+        neither exit resets that commit away; this proves the NEXT apply() call doesn't then mistake
+        the resulting clean working tree for proof the change reached origin."""
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        bare = os.path.join(tmp, "origin.git")
+        subprocess.run(["git", "-C", main, "remote", "set-url", "origin", "/no/such/path"], check=True)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "doc-slug", "worktree": worktree, "revision": revision,
+                             "paths": ["docs/x.md"], "title": "t", "body": "b"})
+
+        real_head = WU._git_head
+        main_calls = {"n": 0}
+
+        def fake_head(path):
+            if path == main:
+                main_calls["n"] += 1
+                if main_calls["n"] >= 2:
+                    return "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            return real_head(path)
+
+        with mock.patch.object(WU, "_git_head", side_effect=fake_head):
+            first = adapter.apply(unit, revision)
+        self.assertEqual(first.status, "error")
+        self.assertEqual(first.reason, "push-rejected-head-moved")
+        self.assertEqual(len(adapter.list_open()), 1)   # NEVER marked applied
+        local_log = subprocess.check_output(
+            ["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
+        self.assertEqual(len(local_log), 2)   # init + our commit — real, but unpushed
+
+        # A bare "apply again with a broken remote" retry must ALSO refuse — never silently "already".
+        second = adapter.apply(unit, revision)
+        self.assertEqual(second.status, "error")
+        self.assertEqual(second.reason, "committed-locally-but-unpushed")
+        self.assertEqual(len(adapter.list_open()), 1)   # still never marked applied
+
+        # "the transient issue is now resolved" — point the remote back at the real origin and retry.
+        subprocess.run(["git", "-C", main, "remote", "set-url", "origin", bare], check=True)
+        third = adapter.apply(unit, revision)
+        self.assertEqual(third.status, "applied")
+        origin_head = subprocess.check_output(["git", "-C", bare, "rev-parse", "main"]).decode().strip()
+        main_head = subprocess.check_output(["git", "-C", main, "rev-parse", "HEAD"]).decode().strip()
+        self.assertEqual(origin_head, main_head)   # NOW genuinely landed
+        self.assertEqual(adapter.list_open(), [])   # correctly marked applied ONLY now
+
+        # ...and EVERY exit was journaled (review fix, HERD-399 round 3: silence was the bug class —
+        # the leave-in-place, the never-pushed refusal, and the eventual real landing each leave a trace,
+        # and NO "already"/noop event was ever emitted, because it was never a genuine no-diff landing).
+        reasons = [e.get("reason") for e in events(os.path.join(tmp, "j.jsonl"))]
+        kinds = [e.get("event") for e in events(os.path.join(tmp, "j.jsonl"))]
+        self.assertIn("push-rejected-head-moved", reasons)       # tick 1 leave-in-place, journaled
+        self.assertIn("committed-locally-but-unpushed", reasons)  # tick 2 refusal, journaled
+        self.assertIn("apply", kinds)                             # tick 3 real landing, journaled
+        self.assertNotIn("doc_apply_apply_noop", kinds)          # never a silent "already" masquerade
+
+    # ── review advisory, round 3 (HERD-399): apply() must never mutate the caller's WorkUnit ───────
+    def test_apply_does_not_mutate_the_callers_unit_artifact(self):
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        # a raw path that NORMALIZES to something different ("docs/./x.md" -> "docs/x.md") so an
+        # in-place mutation to the normalized form would be observable.
+        unit = adapter.open({"slug": "doc-slug", "worktree": worktree, "revision": revision,
+                             "paths": ["docs/./x.md"], "title": "t", "body": "b"})
+        before_paths = list(unit.artifact["paths"])
+        result = adapter.apply(unit, revision)
+        self.assertEqual(result.status, "applied")
+        self.assertEqual(unit.artifact["paths"], before_paths)   # never mutated in place
 
     def test_a_failing_gate_blocks_the_apply(self):
         """The core interface proof (spike §9.4 point 2): a doc-apply unit whose gate BLOCKS must

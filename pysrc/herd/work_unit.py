@@ -262,23 +262,27 @@ class GitPrAdapter(WorkUnitAdapter):
 _DOC_APPLY_MANIFEST_SUFFIX = ".unit.json"
 
 # The default PATH ALLOWLIST (fail-CLOSED, spike §3.2 step 3): only paths under docs/ may ever be
-# landed by a doc-apply unit. When the operator has set DOCS_ONLY_GLOB (HERD-89, already documented —
-# the egrep pattern that opts a diff into the cheapest docs review tier) that SAME pattern doubles as
-# the doc-apply allowlist, so an operator's own definition of "this is a docs path" is not duplicated
-# under a second key. An unparseable operator pattern is DROPPED in favor of the hardcoded default
-# rather than raising — this is a safety gate, so a bad regex must never silently widen it.
+# landed by a doc-apply unit. An operator may override the prefix via DOC_APPLY_PATH_GLOB — a
+# DEDICATED key (review fix, HERD-399 round 3), NOT a reuse of DOCS_ONLY_GLOB. The two rounds of prior
+# review here are why: round 1 found that reusing DOCS_ONLY_GLOB unanchored (re.search) let an
+# un-anchored operator pattern match ANYWHERE in a path; the round-2 fix (re.match, prefix-anchored)
+# then made the SAME reused key silently WRONG the other way — this repo's own .herd/config sets
+# DOCS_ONLY_GLOB="[.](md|txt)" (a suffix-shaped egrep pattern, by design, for its ACTUAL job: classifying
+# a diff into the cheapest review tier), which under re.match can never match "docs/x.md" at all,
+# refusing every doc-apply unit outright. The two consumers want genuinely different semantics — one an
+# unanchored "does this diff touch only docs-ish files" classifier, the other a prefix-anchored
+# write-authorization allowlist — so they can never safely share one key's format. DOC_APPLY_PATH_GLOB
+# is unset by default (the hardcoded ^docs/ prefix applies); an unparseable operator pattern is DROPPED
+# in favor of that hardcoded default rather than raising — this is a safety gate, so a bad regex must
+# never silently widen it.
 #
-# MATCHED WITH re.match, NOT re.search (review fix, HERD-399): this is a fail-CLOSED gate, not the
-# docs-review-tier classifier DOCS_ONLY_GLOB otherwise feeds — an un-anchored operator pattern (e.g.
-# "docs/" with no leading "^") must never widen the allowlist to "matches anywhere in the path" (a
-# path like "src/docs/x" is NOT a docs path just because the substring "docs/" occurs in it). match()
-# requires the pattern to align at position 0, so the DEFAULT pattern's own "^" is redundant-but-kept
-# for readability, and a customized pattern is a PREFIX by construction, never a substring search.
+# MATCHED WITH re.match, NOT re.search: a PREFIX-anchored allowlist by construction, never a substring
+# search — a path like "src/docs/x" is NOT a docs path just because the substring "docs/" occurs in it.
 _DEFAULT_DOC_APPLY_PATH_RE = re.compile(r"^docs/")
 
 
 def _doc_apply_path_pattern(config):
-    pattern = (config or {}).get("DOCS_ONLY_GLOB") or ""
+    pattern = (config or {}).get("DOC_APPLY_PATH_GLOB") or ""
     if pattern:
         try:
             return re.compile(pattern)
@@ -428,9 +432,20 @@ class LiveDocApply:
     committed and pushed ff-only (never ``--force``) — the SAME direct-commit posture
     ``agent-watch.sh``'s post-merge codemap/symbol-index refresh already uses (spike §3.1), just for a
     builder-declared path set instead of a generated map. NO ``gh pr create``, NO ``gh pr merge``
-    anywhere in this chain. On a rejected push: one ``pull --rebase`` retry, then a hard rollback
-    (``reset --hard HEAD~1``) so ``MAIN`` can never strand ahead of origin — mirrors
-    ``refresh_codemap``'s own rollback discipline (``agent-watch.sh:5436-5441``) in spirit.
+    anywhere in this chain.
+
+    On a rejected push: one ``pull --rebase`` retry, then — ONLY when it is safe (HEAD attached AND
+    still exactly the commit this call made) — a hard rollback (``reset --hard HEAD~1``) so ``MAIN``
+    is restored to its pre-apply state (docstring corrected, review fix HERD-399 round 3: this is
+    narrower than "MAIN can never strand ahead of origin" — a detached-HEAD or HEAD-moved race
+    DELIBERATELY leaves the commit in place rather than risk a worse rollback, see the two guards in
+    ``apply`` below). Because that leave-in-place path is real (not just a rare race — the ordinary
+    "push rejected, rebase, still rejected" case for a genuinely protected branch lands there via the
+    head-moved guard, since ``pull --rebase`` necessarily rewrites HEAD on success), a LOCALLY
+    committed-but-never-pushed state can persist across ticks. A later ``apply`` call on the SAME
+    revision therefore never trusts "the working tree already matches" as proof the content reached
+    ``origin`` — it verifies against the remote-tracking ref first (:meth:`_ahead_of_remote`) before
+    ever returning a terminal ``already``, so that state can never be mistaken for a genuine landing.
 
     Every git subprocess failure is caught and journaled (never raised) — an apply that cannot land
     returns :class:`ApplyResult` status ``error``, leaving the manifest untouched so the unit is
@@ -467,7 +482,44 @@ class LiveDocApply:
                             paths=",".join(paths), reason="gates_passed")
         return ApplyResult(status="applied", reason="gates_passed")
 
-    def apply(self, unit):
+    def _already(self, unit, revision, reason):
+        """A no-op terminal: nothing to land because ``origin`` ALREADY carries this revision's content
+        for these paths (verified against the remote-tracking ref, not merely the local tree — see
+        :meth:`_ahead_of_remote`). Journaled explicitly (review fix, HERD-399 round 3): the reviewer's
+        whole finding was that this exit was SILENT — an ``open -> applied`` state transition with no
+        journal record on either the engine or adapter layer, so a mis-classification here left NO trace.
+        Every exit of :meth:`apply` now emits exactly one event; silence is the bug class this fix
+        closes, so the benign no-op is journaled too, not just the failures."""
+        self.journal.append("doc_apply_apply_noop", unit=unit.unit_id, kind="doc-apply",
+                            slug=unit.slug, sha=_git_head(self._main()), revision=revision, reason=reason)
+        return ApplyResult(status="already", reason=reason)
+
+    def _ahead_of_remote(self, main, remote, branch):
+        """True iff local HEAD carries commits the remote-tracking ref does not (review BLOCK fix,
+        HERD-399 round 3): the two deliberate leave-in-place exits below
+        (``push-rejected-detached-head`` / ``push-rejected-head-moved``) commit LOCALLY but never reach
+        ``origin`` — a later no-diff comparison against the WORKING TREE alone cannot tell "already
+        pushed" from "committed here but never landed remotely". A live ``fetch`` (not just the cached
+        remote-tracking ref) so a genuinely stale local view is never mistaken for "synced": a failed or
+        unreadable fetch/rev-list is treated as "cannot prove synced" -> True, so the caller never
+        silently trusts an unverifiable state."""
+        try:
+            subprocess.run(["git", "-C", main, "fetch", "-q", remote, branch],
+                           capture_output=True, text=True, timeout=30, check=True)
+            out = subprocess.run(["git", "-C", main, "rev-list", "--count",
+                                  "%s/%s..HEAD" % (remote, branch)],
+                                 capture_output=True, text=True, check=True)
+            return int((out.stdout or "0").strip() or "0") > 0
+        except Exception:
+            return True
+
+    def apply(self, unit, paths=None):
+        """``paths`` is normally the caller's already-normalized+allowlisted list (``DocApplyAdapter.
+        apply`` passes it explicitly rather than mutating ``unit.artifact`` in place — review fix,
+        HERD-399 round 3: mutating a caller-owned ``WorkUnit`` was a surprising side effect, and would
+        raise if a caller ever handed in one with ``artifact=None``). When omitted (a direct caller,
+        e.g. a test), falls back to ``unit.artifact['paths']``, re-normalized+re-validated here exactly
+        as before — the defense-in-depth re-check is unconditional either way."""
         art = unit.artifact or {}
         main = self._main()
         worktree = str(art.get("worktree") or "")
@@ -479,7 +531,7 @@ class LiveDocApply:
         # allowlist check alone. Re-normalize + re-validate every path here too, and use ONLY the
         # normalized form for every git invocation below (never the raw manifest string, which is
         # exactly what let a "docs/../src/x.py" traversal clear an un-normalized "^docs/" match).
-        raw_paths = list(art.get("paths") or [])
+        raw_paths = list(paths if paths is not None else (art.get("paths") or []))
         safe_paths, disallowed = _safe_paths(raw_paths, self.config)
         if not raw_paths or disallowed:
             return self._refused(unit, "path allowlist refused",
@@ -522,7 +574,19 @@ class LiveDocApply:
         status = subprocess.run(["git", "-C", main, "status", "--porcelain", "--"] + paths,
                                 capture_output=True, text=True)
         if not (status.stdout or "").strip():
-            return ApplyResult(status="already", reason="no diff to land")
+            # BLOCK fix (review round 3, HERD-399): a clean working tree does NOT by itself prove the
+            # content reached origin — a PRIOR apply attempt may have committed locally and then hit one
+            # of the two deliberate leave-in-place exits below (push-rejected-detached-head / -head-
+            # moved), leaving MAIN ahead of its upstream. Verify against the remote-tracking ref before
+            # ever calling this terminal; if we're ahead, the local commit might just need a retry push
+            # (a prior failure can be transient) rather than being silently declared "already landed".
+            if self._ahead_of_remote(main, remote, branch):
+                retry = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
+                                       capture_output=True, text=True)
+                if retry.returncode == 0:
+                    return self._landed(unit, revision, paths)
+                return self._err(unit, "committed-locally-but-unpushed")
+            return self._already(unit, revision, "no diff to land")
 
         title = str(art.get("title") or "") or ("doc-apply: %s" % unit.slug)
         body = str(art.get("body") or "")
@@ -567,7 +631,19 @@ class LiveDocApply:
             if push.returncode == 0:
                 return self._landed(unit, revision, paths)
 
-        # Rollback path. A conflicted `pull --rebase` may have left the checkout mid-rebase — abort it
+        # Rollback path. PER-EXIT DECISION (review fix, HERD-399 round 3): each of the three exits below
+        # is a DELIBERATE choice between "roll back" and "leave the commit and mark the unit retryable":
+        #   - the two guarded exits (detached-HEAD, HEAD-moved) LEAVE the commit — resetting either would
+        #     do more damage than the diverge it repairs (strand the branch / destroy a concurrent seat's
+        #     work), so we prefer a stuck-but-honest MAIN-ahead-of-origin over an unsafe reset;
+        #   - the fully-safe exit (attached, HEAD still exactly ours) ROLLS BACK, restoring pre-apply MAIN.
+        # A left-in-place commit is NOT silently accepted as landed: every one of these exits returns
+        # `error` (journaled, manifest stays `open` -> retried), and the next apply() on this revision
+        # cannot mistake the resulting clean tree for a landing because the no-diff terminal is grounded
+        # in `_ahead_of_remote` (fetch + rev-list), which re-attempts the push and only ever declares
+        # `already` once origin genuinely carries it. That is what makes a MAIN-ahead-of-origin corpse
+        # impossible to persist silently (the exact ff-only-forever break refresh_codemap warns about).
+        # A conflicted `pull --rebase` may have left the checkout mid-rebase — abort it
         # (best-effort) BEFORE inspecting HEAD, mirroring agent-watch.sh's refresh_codemap discipline
         # (HERD-336). Two independent guards before the destructive reset (review fix, HERD-399):
         #   (1) never reset a DETACHED HEAD — that stresses/strands the branch rather than repairing it;
@@ -658,7 +734,11 @@ class DocApplyAdapter(WorkUnitAdapter):
         paths = list(ctx.get("paths") or [])
         manifest_path = self._manifest_path(slug)
         existing = _read_manifest(manifest_path)
-        if existing and existing.get("revision") == revision and existing.get("state") != "applied":
+        # Idempotent on an unchanged revision REGARDLESS of state (review fix, HERD-399 round 3): the
+        # prior condition also required state != "applied", which INVERTED the intent — a re-open of an
+        # ALREADY-APPLIED unit at the same revision fell through to the write below and reset state back
+        # to "open", re-opening a completed unit instead of leaving it alone.
+        if existing and existing.get("revision") == revision:
             return self._unit_from_manifest(slug, existing)
         obj = {
             "kind": self.kind, "slug": slug, "revision": revision,
@@ -766,10 +846,14 @@ class DocApplyAdapter(WorkUnitAdapter):
         ``list_open`` and re-runs a checkout+status probe forever. Like ``gate``, ``revision`` MUST
         agree with ``unit.revision`` — never land a different revision than the one that was gated."""
         if revision and unit.revision and revision != unit.revision:
+            self.journal.append("doc_apply_apply_error", unit=unit.unit_id, kind=self.kind,
+                                slug=unit.slug, reason="revision-argument-mismatch")
             return ApplyResult(status="error", reason="revision argument does not match unit.revision")
         manifest_path = self._manifest_path(unit.slug)
         manifest = _read_manifest(manifest_path)
         if manifest is None:
+            self.journal.append("doc_apply_apply_error", unit=unit.unit_id, kind=self.kind,
+                                slug=unit.slug, reason="manifest-unreadable")
             return ApplyResult(status="error", reason="doc-apply manifest unreadable")
         if manifest.get("state") == "applied":
             return ApplyResult(status="already", reason="already applied")
@@ -779,8 +863,7 @@ class DocApplyAdapter(WorkUnitAdapter):
             self.journal.append("doc_apply_apply_refused", unit=unit.unit_id, kind=self.kind,
                                 slug=unit.slug, disallowed=",".join(str(p) for p in disallowed))
             return ApplyResult(status="refused", reason="path allowlist refused")
-        unit.artifact["paths"] = safe_paths
-        result = self._land.apply(unit)
+        result = self._land.apply(unit, paths=safe_paths)
         if result.status in ("applied", "already"):
             manifest["state"] = "applied"
             _write_manifest(manifest_path, manifest)
