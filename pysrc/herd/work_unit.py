@@ -24,9 +24,15 @@ call site through, not a call site itself.
 Stdlib-only (the P1 packaging rule).
 """
 
+import glob
+import json
 import os
+import re
+import subprocess
+import time
 
-from herd.live_runtime import LiveGates, LiveActuator, _GraphQLDiscovery, WAIT
+from herd.live_runtime import (LiveGates, LiveActuator, LiveJournal, LiveCandidate,
+                               _GraphQLDiscovery, _is_worktree, _pool_dir, WAIT)
 from herd.shadow_journal import _journal_unit_ref
 
 # ── the shared vocabulary (spike §2.2) ──────────────────────────────────────────────────────────────
@@ -240,12 +246,405 @@ class GitPrAdapter(WorkUnitAdapter):
         )
 
 
+# ── doc-apply: the second kind (HERD-399, spike §9.4's re-planned Phase 4) ─────────────────────────
+# WHY PYTHON-FIRST, NOT A BASH RAIL: the spike's original §5 Phase 4 target was a bash
+# scripts/herd/work-units/doc-apply.sh, written before the engine port. The post-port amendment (§9.4)
+# re-scoped it: git-pr's own bash adapter is already reference-model-only (§9.1's HERD-401 finding), so
+# a bash doc-apply rail would ship a SECOND reference-model-only adapter nobody actuates. doc-apply
+# instead lands here, in the live python engine's own adapter module, following §3.2's lifecycle.
+
+# The manifest convention (spike §3.2 step 1, capabilities.tsv row 'doc-apply <slug>.unit.json'):
+# `<WORKTREES_DIR>/<slug>.unit.json` — kind, slug, revision, item_ref, paths, title, body, worktree,
+# opened_at, state. STRICTLY OPT-IN: with no manifest on disk, `list_open` returns `[]` and nothing
+# about the git-pr path is touched — this file adds no new call site to `live_runtime.py`, exactly as
+# the §9.2 skeleton's `GitPrAdapter` did not.
+
+_DOC_APPLY_MANIFEST_SUFFIX = ".unit.json"
+
+# The default PATH ALLOWLIST (fail-CLOSED, spike §3.2 step 3): only paths under docs/ may ever be
+# landed by a doc-apply unit. When the operator has set DOCS_ONLY_GLOB (HERD-89, already documented —
+# the egrep pattern that opts a diff into the cheapest docs review tier) that SAME pattern doubles as
+# the doc-apply allowlist, so an operator's own definition of "this is a docs path" is not duplicated
+# under a second key. An unparseable operator pattern is DROPPED in favor of the hardcoded default
+# rather than raising — this is a safety gate, so a bad regex must never silently widen it.
+_DEFAULT_DOC_APPLY_PATH_RE = re.compile(r"^docs/")
+
+
+def _doc_apply_path_pattern(config):
+    pattern = (config or {}).get("DOCS_ONLY_GLOB") or ""
+    if pattern:
+        try:
+            return re.compile(pattern)
+        except re.error:
+            pass
+    return _DEFAULT_DOC_APPLY_PATH_RE
+
+
+def _path_allowed(path, config):
+    """A single manifest path clears the doc-apply allowlist. Empty/falsy is NEVER allowed — the
+    caller treats "no paths" the same as "a disallowed path" (fail closed, never an empty no-op that
+    could be mistaken for a passing gate)."""
+    if not path:
+        return False
+    return bool(_doc_apply_path_pattern(config).search(str(path)))
+
+
+def _read_manifest(path):
+    """Read one `<slug>.unit.json`; ``None`` on ANY fault (missing file, bad JSON, not an object) —
+    the spike's explicit fail-soft contract: 'malformed manifest = journaled skip, never a crash or a
+    red row'. The caller journals the skip; this function itself never raises."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _write_manifest(path, obj):
+    """Atomic write (temp file + :func:`os.replace`) so a crash mid-write can never leave a
+    half-written, malformed manifest for the next ``list_open`` to trip over. Best-effort: returns
+    False on any fault, never raises into the caller."""
+    try:
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        tmp = "%s.tmp-%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, separators=(",", ":"), ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _git_head(path):
+    """``git rev-parse HEAD`` at ``path``; ``""`` on any fault (not a repo, no commits, git missing)."""
+    if not path:
+        return ""
+    try:
+        out = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _git_attached(path, branch):
+    """True iff ``path`` is a git checkout with HEAD attached to ``branch`` (never detached) — the
+    same invariant agent-watch.sh's post-merge refresh legs guard before committing (HERD-336)."""
+    try:
+        out = subprocess.run(["git", "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD"],
+                             capture_output=True, text=True)
+        return out.returncode == 0 and out.stdout.strip() == branch
+    except Exception:
+        return False
+
+
+def _unit_candidate(unit, manifest):
+    """A synthetic :class:`herd.live_runtime.LiveCandidate` for a doc-apply unit, for reuse of
+    ``LiveGates.health`` (spike §3.2 step 3): the health rail is entirely worktree-shaped — it never
+    reads PR semantics beyond using ``cand.pr`` as a ledger-file identity key — so the unit's own slug
+    (unique per builder, exactly as a real PR number is unique per PR) stands in for it unchanged."""
+    art = manifest or {}
+    return LiveCandidate(pr=unit.slug, sha=unit.revision, slug=unit.slug,
+                         worktree=str(art.get("worktree") or ""))
+
+
+class LiveDocApply:
+    """The REAL doc-apply landing op (spike §3.2 step 4): a SCOPED checkout of the manifest's declared
+    paths from the builder worktree's revision onto the shared default-branch checkout (``MAIN``),
+    committed and pushed ff-only (never ``--force``) — the SAME direct-commit posture
+    ``agent-watch.sh``'s post-merge codemap/symbol-index refresh already uses (spike §3.1), just for a
+    builder-declared path set instead of a generated map. NO ``gh pr create``, NO ``gh pr merge``
+    anywhere in this chain. On a rejected push: one ``pull --rebase`` retry, then a hard rollback
+    (``reset --hard HEAD~1``) so ``MAIN`` can never strand ahead of origin — mirrors
+    ``refresh_codemap``'s own rollback discipline (``agent-watch.sh:5436-5441``) in spirit.
+
+    Every git subprocess failure is caught and journaled (never raised) — an apply that cannot land
+    returns :class:`ApplyResult` status ``error``, leaving the manifest untouched so the unit is
+    retried, never left half-applied.
+    """
+
+    def __init__(self, journal, config=None):
+        self.journal = journal
+        self.config = config or {}
+
+    def _main(self):
+        return self.config.get("MAIN") or os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+
+    def _remote(self):
+        return self.config.get("HERD_REMOTE") or os.environ.get("HERD_REMOTE") or "origin"
+
+    def _branch(self):
+        return self.config.get("HERD_BRANCH_NAME") or os.environ.get("HERD_BRANCH_NAME") or "main"
+
+    def _err(self, unit, reason, **extra):
+        self.journal.append("doc_apply_apply_error", unit=unit.unit_id, kind="doc-apply",
+                            slug=unit.slug, reason=reason, **extra)
+        return ApplyResult(status="error", reason=reason)
+
+    def apply(self, unit):
+        art = unit.artifact or {}
+        main = self._main()
+        worktree = str(art.get("worktree") or "")
+        paths = list(art.get("paths") or [])
+        revision = unit.revision
+        remote, branch = self._remote(), self._branch()
+
+        if not main or not os.path.isdir(main):
+            return self._err(unit, "no-main")
+        if not paths:
+            return self._err(unit, "no-paths")
+        if worktree:
+            live_head = _git_head(worktree)
+            if live_head and revision and live_head != revision:
+                return self._err(unit, "revision-diverged")
+        if not _git_attached(main, branch):
+            return self._err(unit, "detached-head")
+
+        try:
+            subprocess.run(["git", "-C", main, "checkout", revision, "--"] + paths,
+                           capture_output=True, text=True, check=True)
+        except Exception as exc:
+            return self._err(unit, "checkout-failed", detail=str(exc)[:160])
+
+        status = subprocess.run(["git", "-C", main, "status", "--porcelain", "--"] + paths,
+                                capture_output=True, text=True)
+        if not (status.stdout or "").strip():
+            return ApplyResult(status="already", reason="no diff to land")
+
+        title = str(art.get("title") or "") or ("doc-apply: %s" % unit.slug)
+        body = str(art.get("body") or "")
+        msg = title if not body else "%s\n\n%s" % (title, body)
+        if "Work-Unit:" not in msg:
+            msg = "%s\n\nWork-Unit: %s" % (msg, unit.unit_id)
+        try:
+            subprocess.run(["git", "-C", main, "add", "--"] + paths,
+                           capture_output=True, text=True, check=True)
+            subprocess.run(["git", "-C", main, "commit", "-q", "-m", msg, "--"] + paths,
+                           capture_output=True, text=True, check=True)
+        except Exception as exc:
+            subprocess.run(["git", "-C", main, "checkout", "--"] + paths, capture_output=True, text=True)
+            return self._err(unit, "commit-failed", detail=str(exc)[:160])
+
+        push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
+                              capture_output=True, text=True)
+        if push.returncode != 0:
+            pull = subprocess.run(["git", "-C", main, "pull", "--rebase", "--quiet", remote, branch],
+                                  capture_output=True, text=True)
+            if pull.returncode == 0 and _git_attached(main, branch):
+                push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
+                                      capture_output=True, text=True)
+            if push.returncode != 0:
+                subprocess.run(["git", "-C", main, "rebase", "--abort"], capture_output=True, text=True)
+                subprocess.run(["git", "-C", main, "reset", "--hard", "HEAD~1"],
+                               capture_output=True, text=True)
+                return self._err(unit, "push-rejected")
+
+        new_sha = _git_head(main)
+        self.journal.append("apply", unit=unit.unit_id, kind="doc-apply", slug=unit.slug,
+                            sha=new_sha, revision=revision, item_ref=unit.item_ref or "",
+                            paths=",".join(paths), reason="gates_passed")
+        return ApplyResult(status="applied", reason="gates_passed")
+
+
+class DocApplyAdapter(WorkUnitAdapter):
+    """The doc-apply work-unit adapter — HERD-399, spike §9.4's re-planned Phase 4: a real SECOND
+    kind, landed PYTHON-FIRST (there is no bash doc-apply rail; see the module-level note above).
+    Delivers a documentation change-set to the default branch WITHOUT a GitHub PR: ``open`` writes a
+    manifest file (``<WORKTREES_DIR>/<slug>.unit.json``, spike §3.2), ``list_open``/``inspect`` read it
+    back, ``gate`` composes a FAIL-CLOSED path allowlist with the SAME health+review rail-readiness
+    shape :class:`GitPrAdapter`'s own ``gate`` composes, and ``apply`` lands the manifest's declared
+    paths onto ``MAIN`` via :class:`LiveDocApply` — never ``gh pr create``, never ``gh pr merge``.
+
+    STRICTLY OPT-IN (byte-identical checklist): with no ``<slug>.unit.json`` manifest on disk,
+    ``list_open`` returns ``[]`` and nothing about the git-pr path changes — this adapter is reached
+    only when a caller explicitly resolves ``WORK_UNIT_KIND=doc-apply`` AND a manifest exists.
+
+    UNLIKE :class:`GitPrAdapter`, this adapter does NOT auto-construct a live ``gates`` collaborator:
+    ``LiveGates.review``'s dispatch argv (``herd-review.sh <pr> <slug>``, no ``--local``) is git-pr
+    shaped — reusing it unmodified for a doc-apply unit (which has no real PR number) would dispatch a
+    REAL reviewer subprocess against a fabricated PR identity. A caller must inject a ``gates``
+    collaborator that knows how to gate a doc-apply unit (the hermetic :class:`herd.live_runtime.
+    FixtureGates` today, a local-review-aware live dispatcher in a future phase); with none injected,
+    ``gate`` fails CLOSED (``status="error"``) rather than guess.
+
+    ``reconcile``/``teardown`` are deliberately NOT IMPLEMENTED here, mirroring :class:`GitPrAdapter`'s
+    own honest gaps: the spike's post-port amendment (§9.1/§9.4) keeps those two legs BASH's job for
+    every kind, including doc-apply — ``_reconcile_via_ref`` and ``_reap_slug``
+    (``scripts/herd/work-units/git-pr.sh``'s own header comments) are ALREADY kind-agnostic, and the
+    spike names them, by function, as reusable AS-IS by "a future manifest-based kind" with no code
+    change on either side. Wiring this python adapter's ``reconcile``/``teardown`` to actually call them
+    (or a python-native equivalent) is future work this build does not ship.
+    """
+
+    kind = "doc-apply"
+
+    def __init__(self, home=None, journal=None, config=None, worktrees_dir=None, gates=None, land=None):
+        self.home = home
+        self.journal = journal if journal is not None else LiveJournal(None)
+        self.config = config or {}
+        self._worktrees_dir = worktrees_dir or _pool_dir()
+        self._gates = gates
+        self._land = land if land is not None else LiveDocApply(self.journal, self.config)
+
+    def _manifest_path(self, slug):
+        return os.path.join(self._worktrees_dir, "%s%s" % (slug, _DOC_APPLY_MANIFEST_SUFFIX))
+
+    def _unit_from_manifest(self, slug, obj):
+        return WorkUnit(
+            unit_id=_journal_unit_ref(self.kind, slug),
+            kind=self.kind,
+            slug=slug,
+            revision=obj.get("revision", ""),
+            item_ref=obj.get("item_ref"),
+            artifact={"paths": list(obj.get("paths") or []), "title": obj.get("title", ""),
+                      "body": obj.get("body", ""), "worktree": obj.get("worktree", "")},
+        )
+
+    def open(self, ctx):
+        """Publish a candidate doc-apply delivery: write ``<slug>.unit.json`` (spike §3.2 step 1).
+        Idempotent on an unchanged revision (a re-open with the SAME revision returns the existing
+        unit rather than clobbering it — the interface's own "Idempotent on same revision when the
+        kind allows" semantics, spike §2.2)."""
+        ctx = ctx or {}
+        slug = str(ctx.get("slug") or "")
+        if not slug or not self._worktrees_dir:
+            return None
+        worktree = str(ctx.get("worktree") or "")
+        revision = str(ctx.get("revision") or "") or _git_head(worktree)
+        paths = list(ctx.get("paths") or [])
+        manifest_path = self._manifest_path(slug)
+        existing = _read_manifest(manifest_path)
+        if existing and existing.get("revision") == revision and existing.get("state") != "applied":
+            return self._unit_from_manifest(slug, existing)
+        obj = {
+            "kind": self.kind, "slug": slug, "revision": revision,
+            "item_ref": ctx.get("item_ref"), "paths": paths,
+            "title": str(ctx.get("title") or ""), "body": str(ctx.get("body") or ""),
+            "worktree": worktree, "opened_at": ctx.get("opened_at", int(time.time())),
+            "state": "open",
+        }
+        if not _write_manifest(manifest_path, obj):
+            self.journal.append("doc_apply_open_error", kind=self.kind, slug=slug,
+                                reason="manifest-write-failed")
+            return None
+        self.journal.append("doc_apply_opened", unit=_journal_unit_ref(self.kind, slug),
+                            kind=self.kind, slug=slug, sha=revision)
+        return self._unit_from_manifest(slug, obj)
+
+    def list_open(self):
+        """Filesystem-glob discovery (spike §3.2 step 2): every ``*.unit.json`` of this kind whose
+        state is not terminal. STRICTLY OPT-IN — an empty/absent ``WORKTREES_DIR`` or no manifests at
+        all returns ``[]``, never an error. A malformed manifest is journaled and skipped, never a
+        crash (the spike's explicit fail-soft contract); a manifest whose worktree HEAD has moved past
+        its declared revision is STALE and is skipped too (re-evaluated once the builder re-opens it)."""
+        if not self._worktrees_dir:
+            return []
+        units = []
+        for path in sorted(glob.glob(os.path.join(self._worktrees_dir, "*" + _DOC_APPLY_MANIFEST_SUFFIX))):
+            obj = _read_manifest(path)
+            if obj is None:
+                self.journal.append("doc_apply_manifest_invalid", path=os.path.basename(path))
+                continue
+            if obj.get("kind") != self.kind:
+                continue
+            if obj.get("state") in ("applied", "reaped"):
+                continue
+            slug = str(obj.get("slug") or "")
+            if not slug:
+                self.journal.append("doc_apply_manifest_invalid", path=os.path.basename(path),
+                                    reason="no-slug")
+                continue
+            worktree = str(obj.get("worktree") or "")
+            if worktree and _is_worktree(worktree):
+                live_head = _git_head(worktree)
+                if live_head and live_head != obj.get("revision"):
+                    self.journal.append("doc_apply_manifest_stale", slug=slug,
+                                        manifest_revision=obj.get("revision", ""),
+                                        worktree_revision=live_head)
+                    continue
+            units.append(self._unit_from_manifest(slug, obj))
+        return units
+
+    def inspect(self, unit):
+        obj = _read_manifest(self._manifest_path(unit.slug)) or {}
+        return {
+            "revision": obj.get("revision", ""), "state": obj.get("state", "open"),
+            "body": obj.get("body", ""), "paths": list(obj.get("paths") or []),
+            "item_ref": obj.get("item_ref"),
+        }
+
+    def gate(self, unit, revision):
+        """Path allowlist (cheap, fail-closed) FIRST, then the SAME health+review composition
+        :class:`GitPrAdapter.gate` runs — cost-classed DAG order (spike's own LiveTick docstring: cheap
+        checks before slow ones)."""
+        manifest = _read_manifest(self._manifest_path(unit.slug))
+        if manifest is None:
+            return GateResult(status="error", reason="doc-apply manifest unreadable")
+        paths = list(manifest.get("paths") or [])
+        disallowed = [p for p in paths if not _path_allowed(p, self.config)]
+        if not paths or disallowed:
+            self.journal.append("doc_apply_gate_refused", unit=unit.unit_id, kind=self.kind,
+                                slug=unit.slug, disallowed=",".join(disallowed))
+            return GateResult(status="block", reason="doc-apply path allowlist refused",
+                              evidence={"disallowed": disallowed, "paths": paths})
+        if self._gates is None:
+            return GateResult(status="error", reason="no gates collaborator injected")
+        cand = _unit_candidate(unit, manifest)
+        health = self._gates.health(cand)
+        review = self._gates.review(cand)
+        evidence = {"health": health, "review": review}
+        if health == "CODEERROR":
+            return GateResult(status="block", reason="health CODEERROR", evidence=evidence)
+        if review == "BLOCK":
+            return GateResult(status="block", reason="review BLOCK", evidence=evidence)
+        if review == "INFRA":
+            return GateResult(status="error", reason="review INFRA-FAIL", evidence=evidence)
+        if health == WAIT or review == WAIT:
+            return GateResult(status="wait", reason="rail dispatch/collect in flight", evidence=evidence)
+        if health in ("CLEAN", "FLAKY") and review == "PASS":
+            return GateResult(status="pass", reason="health+review both green + path allowlist clean",
+                              evidence=evidence)
+        return GateResult(status="wait", reason="rail outcome not yet terminal", evidence=evidence)
+
+    def apply(self, unit, revision):
+        """Re-checks the allowlist (defense in depth — a caller MUST have already gated, but apply
+        never trusts that alone) then delegates the actual landing to :class:`LiveDocApply` (or an
+        injected twin). At-most-once via the manifest's own ``state`` field: an already-applied unit
+        short-circuits to ``already`` with no git op and no double journal (spike §3.2 step 4)."""
+        manifest_path = self._manifest_path(unit.slug)
+        manifest = _read_manifest(manifest_path)
+        if manifest is None:
+            return ApplyResult(status="error", reason="doc-apply manifest unreadable")
+        if manifest.get("state") == "applied":
+            return ApplyResult(status="already", reason="already applied")
+        paths = list(manifest.get("paths") or [])
+        disallowed = [p for p in paths if not _path_allowed(p, self.config)]
+        if not paths or disallowed:
+            self.journal.append("doc_apply_apply_refused", unit=unit.unit_id, kind=self.kind,
+                                slug=unit.slug, disallowed=",".join(disallowed))
+            return ApplyResult(status="refused", reason="path allowlist refused")
+        result = self._land.apply(unit)
+        if result.status == "applied":
+            manifest["state"] = "applied"
+            _write_manifest(manifest_path, manifest)
+        return result
+
+    def reconcile(self, unit):
+        self._unimplemented("reconcile")
+
+    def teardown(self, unit):
+        self._unimplemented("teardown")
+
+
 # ── resolve: WORK_UNIT_KIND selects the adapter (spike §9) ─────────────────────────────────────────
 
-SUPPORTED_KINDS = ("git-pr",)
+SUPPORTED_KINDS = ("git-pr", "doc-apply")
 DEFAULT_KIND = "git-pr"
 
-_ADAPTERS = {"git-pr": GitPrAdapter}
+_ADAPTERS = {"git-pr": GitPrAdapter, "doc-apply": DocApplyAdapter}
 
 
 def resolve_adapter(kind=None, **kwargs):
