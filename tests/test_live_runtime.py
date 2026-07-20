@@ -2753,6 +2753,11 @@ class TestDocApplyAdapter(unittest.TestCase):
         self.assertEqual(second.status, "already")
         head_after_second = subprocess.check_output(["git", "-C", main, "rev-parse", "HEAD"]).decode()
         self.assertEqual(head_after_first, head_after_second)   # no second commit landed
+        # review advisory (HERD-399 round 5): the at-most-once short-circuit was the ONE apply exit
+        # with no journal event — it now emits a noop like every other exit.
+        noops = [e for e in events(os.path.join(tmp, "j.jsonl"))
+                 if e.get("event") == "doc_apply_apply_noop"]
+        self.assertEqual([e.get("reason") for e in noops], ["already-applied"])
 
     def test_apply_no_diff_result_is_persisted_so_it_never_reruns_forever(self):
         # review advisory (HERD-399): "already" (nothing to land) must ALSO flip manifest state, or
@@ -3118,6 +3123,82 @@ class TestDocApplyAdapter(unittest.TestCase):
         self.assertEqual(status.strip(), "")   # index AND worktree both clean
         # not permanently wedged: the unit is retried (no stale "dirty-local-changes" false-positive).
         self.assertEqual(len(adapter.list_open()), 1)
+
+    # ── review BLOCK fix, round 5 (HERD-399): the rollback must also cover a NEWLY-ADDED file ──────
+    def test_apply_commit_failure_rollback_leaves_shared_checkout_clean_for_a_newly_added_file(self):
+        """The round-2 form (`checkout HEAD -- <paths>`) no-ops for a path NOT present at HEAD — the
+        pathspec matches nothing, git hard-errors, and the ADD stays staged. Verified worse: in a
+        MIXED add+modify set the unmatched pathspec aborts the whole restore, so even the modify
+        stayed dirty. Consequences the reviewer verified: the unit bricks forever on the
+        dirty-local-changes pre-check, and the stray staged blob can ride the scribe backend's
+        pathspec-less backlog commits (backends/file.sh) onto the default branch un-gated. The
+        rollback must leave the WHOLE shared checkout clean — adds gone, modifies reverted."""
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        # the reviewer's shape PLUS the mixed-set aggravation: a NEW file and a modify in one unit
+        with open(os.path.join(worktree, "docs", "new.md"), "w", encoding="utf-8") as fh:
+            fh.write("brand new\n")
+        subprocess.run(["git", "-C", worktree, "add", "docs/new.md"], check=True)
+        subprocess.run(["git", "-C", worktree, "commit", "-q", "-m", "add new.md"], check=True)
+        add_rev = subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"]).decode().strip()
+        hook_path = os.path.join(main, ".git", "hooks", "pre-commit")
+        with open(hook_path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook_path, 0o755)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "add-slug", "worktree": worktree, "revision": add_rev,
+                             "paths": ["docs/new.md", "docs/x.md"], "title": "t", "body": "b"})
+        result = adapter.apply(unit, add_rev)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.reason, "commit-failed")
+        # THE core assertion: the WHOLE shared checkout is clean — no staged "A " row for the scribe
+        # backend's index-wide backlog commits to sweep onto the default branch un-gated.
+        status = subprocess.check_output(["git", "-C", main, "status", "--porcelain"]).decode()
+        self.assertEqual(status.strip(), "")
+        self.assertFalse(os.path.exists(os.path.join(main, "docs", "new.md")))   # the add is GONE
+        with open(os.path.join(main, "docs", "x.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "orig\n")   # the modify reverted too (mixed set, round-5 find)
+        # and NOT bricked: with the hook gone, the very next tick lands it
+        os.remove(hook_path)
+        retry = adapter.apply(unit, add_rev)
+        self.assertEqual(retry.status, "applied")
+        with open(os.path.join(main, "docs", "new.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "brand new\n")
+
+    # ── review advisory, round 5 (HERD-399): "exactly one blob" is now PROVEN, never assumed ───────
+    def test_apply_refuses_a_path_that_cannot_be_proven_a_blob_at_revision(self):
+        """The old tree-guard answered "not a tree -> proceed" on ANY inconclusive read, so a missing
+        path (e.g. a single-file deletion attempt) fell through to a retry-forever checkout error and
+        a transient ls-tree failure re-opened the directory under-apply hole. Now: no proof, no apply."""
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "ghost-slug", "worktree": worktree, "revision": revision,
+                             "paths": ["docs/does-not-exist.md"], "title": "t", "body": "b"})
+        result = adapter.apply(unit, revision)
+        self.assertEqual(result.status, "refused")
+        self.assertEqual(result.reason, "path-not-a-blob-at-revision")
+        log = subprocess.check_output(["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
+        self.assertEqual(len(log), 1)   # nothing landed
+        # the classifier itself: blob/tree recognized, everything inconclusive is None (fail closed)
+        self.assertEqual(WU._revision_path_kind(main, revision, "docs/x.md"), "blob")
+        self.assertEqual(WU._revision_path_kind(main, revision, "docs/sub"), "tree")
+        self.assertIsNone(WU._revision_path_kind(main, revision, "docs/absent.md"))
+        self.assertIsNone(WU._revision_path_kind(os.path.join(tmp, "no-such-repo"), revision, "docs/x.md"))
+        self.assertIsNone(WU._revision_path_kind(main, "not-a-revision", "docs/x.md"))
+
+    # ── review advisory, round 5 (HERD-399): a typo'd kwarg still fails LOUD ────────────────────────
+    def test_resolve_adapter_rejects_a_kwarg_no_kind_accepts(self):
+        # the round-4 cross-kind filter must not swallow the typo signal: only kwargs some kind's
+        # constructor declares are filterable; anything outside the union raises like before.
+        with self.assertRaises(TypeError):
+            WU.resolve_adapter("doc-apply", confg={"MAIN": "/m"})   # sic: misspelled "config"
 
     # ── review advisory, round 2 (HERD-399): gate/apply must catch a revision-argument mismatch ─────
     def test_gate_and_apply_refuse_when_revision_argument_disagrees_with_unit_revision(self):

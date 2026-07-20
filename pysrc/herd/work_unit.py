@@ -28,8 +28,8 @@ matching the docs allowlist, resolving to exactly one blob at ``<revision>``) is
 :func:`_safe_manifest_path`, and every violation fails CLOSED at both ``gate`` and ``apply``. A
 consequence worth naming: doc-apply cannot express a DELETION at all today — a scoped
 ``git checkout <rev> -- <path>`` can only add/update, and a single-file path deleted at
-``<revision>`` hard-errors the checkout (an honest, retryable ``checkout-failed``) rather than
-silently under-applying.
+``<revision>`` is refused up front (``path-not-a-blob-at-revision``, the round-5 strict blob check)
+rather than silently under-applying.
 
 Stdlib-only (the P1 packaging rule).
 """
@@ -323,7 +323,7 @@ def _safe_manifest_path(path):
         files, period — a request that needs a pattern must enumerate the files instead);
       * matching the docs allowlist prefix (enforced by :func:`_path_allowed` on the normalized form);
       * resolving to exactly one BLOB at ``<revision>``, never a tree (enforced by
-        :func:`_is_tree_path` + the scoped checkout's own hard error on a nonexistent path).
+        :func:`_revision_path_kind`, which refuses trees AND anything it cannot prove is a blob).
     Returns the normalized POSIX-relative path (the form used for every downstream check AND every
     git operation — the raw manifest string is never trusted again once this returns), or ``None``
     when the path violates any clause above (the caller fails closed).
@@ -370,27 +370,32 @@ def _safe_paths(paths, config):
     return safe_paths, disallowed
 
 
-def _is_tree_path(worktree, revision, path):
-    """True iff ``path`` names a TREE (directory), not a blob, at ``revision`` in ``worktree``'s repo.
-    Used to fail closed on directory-shaped manifest paths (review advisory, HERD-399): a scoped
-    ``git checkout <rev> -- <dir>`` can only ADD/UPDATE files present in ``<dir>`` at ``<rev>`` — it
-    never removes a file that existed in MAIN's copy of ``<dir>`` but was deleted in ``<rev>``, so a doc
-    deletion expressed via a directory path would silently fail to land while ``apply`` still reports
-    ``applied``. Best-effort: an unreadable ``ls-tree`` (no worktree, bad revision) returns False rather
-    than blocking on an inconclusive read — the worktree-HEAD divergence guard elsewhere already covers
-    an unreadable/absent worktree."""
-    if not worktree or not path:
-        return False
+def _revision_path_kind(repo, revision, path):
+    """Classify ``path`` at ``revision``: ``"blob"``, ``"tree"``, or ``None`` when it cannot be PROVEN
+    to name exactly one entry (missing at ``revision``, ambiguous ls-tree output, name mismatch, or a
+    transient/unreadable git read). Callers fail CLOSED on ``None`` (review advisory, HERD-399 round
+    5): the predecessor guard (``_is_tree_path``) answered False — "not a tree, proceed" — on ANY
+    exception, so a transient ``ls-tree`` failure let a directory-shaped path slip past into exactly
+    the silent under-apply the guard exists to block. The round-4 invariant (:func:`_safe_manifest_path`)
+    says a manifest path must resolve to exactly one BLOB at ``<revision>``; this is the function that
+    enforces the "exactly one blob" clause, so "could not tell" must never classify as "fine"."""
+    if not repo or not path:
+        return None
     try:
-        out = subprocess.run(["git", "-C", worktree, "ls-tree", revision, "--", path],
-                             capture_output=True, text=True, check=True)
+        out = subprocess.run(["git", "-C", repo, "ls-tree", revision, "--", path],
+                             capture_output=True, text=True, check=True, timeout=30)
     except Exception:
-        return False
-    line = (out.stdout or "").strip()
-    if not line:
-        return False
-    fields = line.split("\t", 1)[0].split()
-    return len(fields) >= 2 and fields[1] == "tree"
+        return None
+    lines = [l for l in (out.stdout or "").splitlines() if l.strip()]
+    if len(lines) != 1:
+        return None
+    fields = lines[0].split("\t", 1)
+    if len(fields) != 2 or fields[1] != path:
+        return None
+    meta = fields[0].split()
+    if len(meta) >= 2 and meta[1] in ("blob", "tree"):
+        return meta[1]
+    return None
 
 
 def _read_manifest(path):
@@ -523,6 +528,17 @@ class LiveDocApply:
                             slug=unit.slug, sha=_git_head(self._main()), revision=revision, reason=reason)
         return ApplyResult(status="already", reason=reason)
 
+    def _git_net(self, main, args, timeout=120):
+        """A network-facing git op (push / pull) with a hang guard (review advisory, HERD-399 round
+        5: these were the only remote-touching calls with NO timeout — a hung remote would stall the
+        whole tick once this is wired in). A timeout is reported as a plain nonzero returncode, never
+        raised, so every caller's existing failure branch handles it unchanged."""
+        argv = ["git", "-C", main] + list(args)
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(argv, 124, "", "timed out after %ss" % timeout)
+
     def _ahead_of_remote(self, main, remote, branch):
         """True iff local HEAD carries commits the remote-tracking ref does not (review BLOCK fix,
         HERD-399 round 3): the two deliberate leave-in-place exits below
@@ -537,10 +553,54 @@ class LiveDocApply:
                            capture_output=True, text=True, timeout=30, check=True)
             out = subprocess.run(["git", "-C", main, "rev-list", "--count",
                                   "%s/%s..HEAD" % (remote, branch)],
-                                 capture_output=True, text=True, check=True)
+                                 capture_output=True, text=True, check=True, timeout=30)
             return int((out.stdout or "0").strip() or "0") > 0
         except Exception:
             return True
+
+    def _restore_pre_apply(self, main, paths):
+        """Restore MAIN's index AND worktree to the exact pre-apply (HEAD) state for ``paths`` —
+        correct for BOTH shapes a scoped ``checkout <revision> -- <paths>`` can stage (review BLOCK
+        fix, HERD-399 round 5):
+
+        * a MODIFY (path exists at HEAD): ``checkout HEAD -- <path>`` rewrites index+worktree back —
+          the round-2 form, still right for this shape;
+        * an ADD (path NOT at HEAD — the most common doc-apply shape): ``checkout HEAD`` matches no
+          pathspec at HEAD, hard-errors (rc=1) and restores NOTHING — verified: in a MIXED add+modify
+          set the unmatched pathspec makes git bail before restoring even the modify. The add stayed
+          STAGED, which is worse than a wedge: the scribe backend's backlog commits
+          (``scripts/herd/backends/file.sh`` ``_backend_add_item``/``_file_marker_commit``) are
+          INDEX-WIDE (``git add <file>`` then ``git commit`` with NO pathspec) in this same shared
+          checkout and push to the default branch — a leftover staged blob would ride an unrelated
+          "Backlog:" commit onto main UN-GATED, under a message that never mentions it.
+
+        So: classify each path with ``cat-file -e HEAD:<path>`` FIRST, restore the two shapes
+        separately (never one mixed pathspec list), and for adds also unstage (``reset -q HEAD --``),
+        delete the file, and prune any now-empty parent dirs the add created (best-effort;
+        ``os.removedirs`` stops at the first non-empty dir, and ``main`` itself can never empty —
+        it contains ``.git``). Best-effort by design: this runs on failure paths that must never
+        raise past the caller's own error return."""
+        at_head, added = [], []
+        for p in paths:
+            probe = subprocess.run(["git", "-C", main, "cat-file", "-e", "HEAD:%s" % p],
+                                   capture_output=True, text=True)
+            (at_head if probe.returncode == 0 else added).append(p)
+        if at_head:
+            subprocess.run(["git", "-C", main, "checkout", "HEAD", "--"] + at_head,
+                           capture_output=True, text=True)
+        if added:
+            subprocess.run(["git", "-C", main, "reset", "-q", "HEAD", "--"] + added,
+                           capture_output=True, text=True)
+            for p in added:
+                full = os.path.join(main, p)
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+                try:
+                    os.removedirs(os.path.dirname(full))
+                except OSError:
+                    pass   # parent dir non-empty (or already gone) — the correct place to stop
 
     def apply(self, unit, paths=None):
         """``paths`` is normally the caller's already-normalized+allowlisted list (``DocApplyAdapter.
@@ -573,17 +633,24 @@ class LiveDocApply:
             live_head = _git_head(worktree)
             if live_head and revision and live_head != revision:
                 return self._err(unit, "revision-diverged")
-        # A directory-shaped path cannot express a DELETION (a scoped checkout only ever adds/updates
-        # files present at <revision> — a file removed there but still on MAIN silently survives). Fail
-        # closed rather than silently under-apply (review advisory, HERD-399). Checked against `main`,
-        # NOT gated on `worktree` being set (review fix, HERD-399 round 2): main and the builder worktree
-        # share the same object store (a `git worktree add` sibling), so <revision> is reachable from
-        # main regardless of whether the manifest happens to carry a worktree path — gating this check
-        # on worktree presence let an empty-worktree manifest skip it entirely, exactly the silent-
-        # under-apply case the guard exists to close.
-        tree_paths = [p for p in paths if _is_tree_path(main, revision, p)]
+        # Every path must PROVE it resolves to exactly one BLOB at <revision> — the round-4 invariant's
+        # final clause, now enforced strictly (review advisory, HERD-399 round 5). Two distinct refusals:
+        #   * a TREE (directory) cannot express a DELETION (a scoped checkout only ever adds/updates
+        #     files present at <revision> — a file removed there but still on MAIN silently survives);
+        #   * anything that cannot be CLASSIFIED (missing at <revision> — which includes a single-file
+        #     deletion attempt — or a transient/unreadable ls-tree) is refused too, never waved through:
+        #     the old guard's "exception -> not a tree -> proceed" posture let a transient git failure
+        #     re-open the silent-under-apply hole for a directory path.
+        # Checked against `main`, NOT gated on `worktree` being set (review fix, HERD-399 round 2): main
+        # and the builder worktree share the same object store (a `git worktree add` sibling), so
+        # <revision> is reachable from main regardless of whether the manifest carries a worktree path.
+        kinds = [(p, _revision_path_kind(main, revision, p)) for p in paths]
+        tree_paths = [p for p, k in kinds if k == "tree"]
         if tree_paths:
             return self._refused(unit, "directory-path-not-supported", paths=",".join(tree_paths))
+        unproven = [p for p, k in kinds if k != "blob" and k != "tree"]
+        if unproven:
+            return self._refused(unit, "path-not-a-blob-at-revision", paths=",".join(unproven))
         if not _git_attached(main, branch):
             return self._err(unit, "detached-head")
 
@@ -598,6 +665,11 @@ class LiveDocApply:
             subprocess.run(["git", "-C", main, "checkout", revision, "--"] + paths,
                            capture_output=True, text=True, check=True)
         except Exception as exc:
+            # Same-class hardening as the commit-failed arm (round-5 audit): an unmatched-pathspec
+            # failure applies nothing (git verifies pathspecs before writing — verified), but a
+            # mid-write failure (disk full, killed subprocess) can leave a PARTIAL apply staged.
+            # Best-effort restore so no failure mode of this exit can leave the shared checkout dirty.
+            self._restore_pre_apply(main, paths)
             return self._err(unit, "checkout-failed", detail=str(exc)[:160])
 
         status = subprocess.run(["git", "-C", main, "status", "--porcelain", "--"] + paths,
@@ -610,8 +682,7 @@ class LiveDocApply:
             # ever calling this terminal; if we're ahead, the local commit might just need a retry push
             # (a prior failure can be transient) rather than being silently declared "already landed".
             if self._ahead_of_remote(main, remote, branch):
-                retry = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
-                                       capture_output=True, text=True)
+                retry = self._git_net(main, ["push", "-q", remote, branch])
                 if retry.returncode == 0:
                     return self._landed(unit, revision, paths)
                 return self._err(unit, "committed-locally-but-unpushed")
@@ -628,35 +699,34 @@ class LiveDocApply:
             subprocess.run(["git", "-C", main, "commit", "-q", "-m", msg, "--"] + paths,
                            capture_output=True, text=True, check=True)
         except Exception as exc:
-            # BLOCK fix (review round 2, HERD-399): "checkout -- <paths>" restores from the INDEX, and
-            # the index already holds the new content (the scoped checkout a few lines above wrote both
-            # index AND worktree) — that "rollback" was a no-op, permanently leaving MAIN's shared
-            # checkout dirty (staged + working tree) whenever the commit itself fails (missing
-            # user.email/user.name, a rejecting pre-commit hook, gpgsign with no key, ...). "checkout
-            # HEAD -- <paths>" is the form that actually discards the index change and restores the
-            # pre-apply content — verified: only the HEAD-qualified form reverts a path whose index was
-            # already updated by a prior scoped checkout.
-            subprocess.run(["git", "-C", main, "checkout", "HEAD", "--"] + paths,
-                           capture_output=True, text=True)
+            # BLOCK fix, rounds 2 AND 5 (HERD-399): round 2 replaced the index-relative no-op
+            # ("checkout -- <paths>" restores FROM the index, which already held the new content) with
+            # "checkout HEAD -- <paths>" — which is still a no-op for a path NOT present at HEAD (a
+            # NEWLY-ADDED doc, the most common doc-apply shape): the pathspec matches nothing, git
+            # hard-errors, the add stays staged — and in a MIXED set the unmatched pathspec aborts the
+            # whole restore, so even the modifies stayed dirty. _restore_pre_apply classifies each
+            # path against HEAD and restores adds (unstage + delete) and modifies (checkout HEAD)
+            # separately, so a commit failure (missing user.email/user.name, a rejecting pre-commit
+            # hook, gpgsign with no key, ...) always leaves the shared checkout CLEAN — never a
+            # bricked-forever dirty-local-changes wedge, and never a stray staged blob for the scribe
+            # backend's pathspec-less backlog commits to sweep onto the default branch un-gated.
+            self._restore_pre_apply(main, paths)
             return self._err(unit, "commit-failed", detail=str(exc)[:160])
 
         commit_sha = _git_head(main)   # OUR commit — checked before any rollback ever touches HEAD
 
-        push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
-                              capture_output=True, text=True)
+        push = self._git_net(main, ["push", "-q", remote, branch])
         if push.returncode == 0:
             return self._landed(unit, revision, paths)
 
-        pull = subprocess.run(["git", "-C", main, "pull", "--rebase", "--quiet", remote, branch],
-                              capture_output=True, text=True)
+        pull = self._git_net(main, ["pull", "--rebase", "--quiet", remote, branch])
         if pull.returncode == 0:
             if not _git_attached(main, branch):
                 # HERD-336: a rebase-pull can leave HEAD detached — NEVER reset a detached HEAD (that
                 # would strand the branch further, the exact corpse agent-watch.sh's refresh legs
                 # guard against). Stop here; a human/reconcile sweep resumes.
                 return self._err(unit, "push-rejected-detached-head")
-            push = subprocess.run(["git", "-C", main, "push", "-q", remote, branch],
-                                  capture_output=True, text=True)
+            push = self._git_net(main, ["push", "-q", remote, branch])
             if push.returncode == 0:
                 return self._landed(unit, revision, paths)
 
@@ -885,6 +955,11 @@ class DocApplyAdapter(WorkUnitAdapter):
                                 slug=unit.slug, reason="manifest-unreadable")
             return ApplyResult(status="error", reason="doc-apply manifest unreadable")
         if manifest.get("state") == "applied":
+            # Journaled like every other exit (review advisory, HERD-399 round 5): this at-most-once
+            # short-circuit was the ONE apply exit with no event, sitting against the round-3
+            # every-exit-journals invariant.
+            self.journal.append("doc_apply_apply_noop", unit=unit.unit_id, kind=self.kind,
+                                slug=unit.slug, reason="already-applied")
             return ApplyResult(status="already", reason="already applied")
         paths = list(manifest.get("paths") or [])
         safe_paths, disallowed = _safe_paths(paths, self.config)
@@ -952,5 +1027,17 @@ def resolve_adapter(kind=None, **kwargs):
     params = inspect.signature(adapter_cls.__init__).parameters
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return adapter_cls(**kwargs)   # the constructor takes **kwargs — nothing to filter
+    # A kwarg NO kind's constructor accepts is a typo, not a cross-kind extra — keep that signal LOUD
+    # (review advisory, HERD-399 round 5: the round-4 filter silently dropped e.g. `confg=`, trading
+    # the previous TypeError for a silent fall-through to defaults). Only kwargs in the cross-kind
+    # UNION are filterable; anything outside it still raises.
+    union = set()
+    for cls in _ADAPTERS.values():
+        cls_params = inspect.signature(cls.__init__).parameters
+        union |= set(cls_params) - {"self"}
+    unknown = sorted(set(kwargs) - union)
+    if unknown:
+        raise TypeError("resolve_adapter got kwarg(s) no work-unit kind's constructor accepts: %s"
+                        % ", ".join(unknown))
     accepted = set(params) - {"self"}
     return adapter_cls(**{k: v for k, v in kwargs.items() if k in accepted})
