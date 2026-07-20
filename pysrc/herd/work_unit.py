@@ -492,13 +492,17 @@ class LiveDocApply:
             live_head = _git_head(worktree)
             if live_head and revision and live_head != revision:
                 return self._err(unit, "revision-diverged")
-            # A directory-shaped path cannot express a DELETION (a scoped checkout only ever adds/
-            # updates files present at <revision> — a file removed there but still on MAIN silently
-            # survives). Fail closed rather than silently under-apply (review advisory, HERD-399).
-            tree_paths = [p for p in paths if _is_tree_path(worktree, revision, p)]
-            if tree_paths:
-                return self._refused(unit, "directory-path-not-supported",
-                                     paths=",".join(tree_paths))
+        # A directory-shaped path cannot express a DELETION (a scoped checkout only ever adds/updates
+        # files present at <revision> — a file removed there but still on MAIN silently survives). Fail
+        # closed rather than silently under-apply (review advisory, HERD-399). Checked against `main`,
+        # NOT gated on `worktree` being set (review fix, HERD-399 round 2): main and the builder worktree
+        # share the same object store (a `git worktree add` sibling), so <revision> is reachable from
+        # main regardless of whether the manifest happens to carry a worktree path — gating this check
+        # on worktree presence let an empty-worktree manifest skip it entirely, exactly the silent-
+        # under-apply case the guard exists to close.
+        tree_paths = [p for p in paths if _is_tree_path(main, revision, p)]
+        if tree_paths:
+            return self._refused(unit, "directory-path-not-supported", paths=",".join(tree_paths))
         if not _git_attached(main, branch):
             return self._err(unit, "detached-head")
 
@@ -531,7 +535,16 @@ class LiveDocApply:
             subprocess.run(["git", "-C", main, "commit", "-q", "-m", msg, "--"] + paths,
                            capture_output=True, text=True, check=True)
         except Exception as exc:
-            subprocess.run(["git", "-C", main, "checkout", "--"] + paths, capture_output=True, text=True)
+            # BLOCK fix (review round 2, HERD-399): "checkout -- <paths>" restores from the INDEX, and
+            # the index already holds the new content (the scoped checkout a few lines above wrote both
+            # index AND worktree) — that "rollback" was a no-op, permanently leaving MAIN's shared
+            # checkout dirty (staged + working tree) whenever the commit itself fails (missing
+            # user.email/user.name, a rejecting pre-commit hook, gpgsign with no key, ...). "checkout
+            # HEAD -- <paths>" is the form that actually discards the index change and restores the
+            # pre-apply content — verified: only the HEAD-qualified form reverts a path whose index was
+            # already updated by a prior scoped checkout.
+            subprocess.run(["git", "-C", main, "checkout", "HEAD", "--"] + paths,
+                           capture_output=True, text=True)
             return self._err(unit, "commit-failed", detail=str(exc)[:160])
 
         commit_sha = _git_head(main)   # OUR commit — checked before any rollback ever touches HEAD
@@ -567,6 +580,12 @@ class LiveDocApply:
             return self._err(unit, "push-rejected-detached-head")
         if _git_head(main) != commit_sha:
             return self._err(unit, "push-rejected-head-moved")
+        # NOTE (review round 2, HERD-399, non-blocking by design): `reset --hard HEAD~1` here discards
+        # the ENTIRE working tree back to the pre-apply commit, not just the paths this unit touched —
+        # any unrelated uncommitted edit elsewhere in the shared MAIN checkout is lost too. This mirrors
+        # `refresh_codemap`'s own posture (agent-watch.sh) exactly; it is not a regression this module
+        # introduces, and narrowing the reset to only this unit's paths is a separate, larger change to
+        # the shared-checkout contract than this fix round scopes.
         subprocess.run(["git", "-C", main, "reset", "--hard", "HEAD~1"], capture_output=True, text=True)
         return self._err(unit, "push-rejected")
 
@@ -701,7 +720,11 @@ class DocApplyAdapter(WorkUnitAdapter):
     def gate(self, unit, revision):
         """Path allowlist (cheap, fail-closed) FIRST, then the SAME health+review composition
         :class:`GitPrAdapter.gate` runs — cost-classed DAG order (spike's own LiveTick docstring: cheap
-        checks before slow ones)."""
+        checks before slow ones). The ``revision`` argument MUST agree with ``unit.revision`` (review
+        advisory, HERD-399 round 2) — a caller that gates one revision and applies another must be
+        caught here, not silently gate a different change than the one that lands."""
+        if revision and unit.revision and revision != unit.revision:
+            return GateResult(status="error", reason="revision argument does not match unit.revision")
         manifest = _read_manifest(self._manifest_path(unit.slug))
         if manifest is None:
             return GateResult(status="error", reason="doc-apply manifest unreadable")
@@ -740,7 +763,10 @@ class DocApplyAdapter(WorkUnitAdapter):
         own ``state`` field: an already-applied unit short-circuits to ``already`` with no git op and
         no double journal (spike §3.2 step 4). A terminal ``already`` (nothing to land — MAIN already
         matches) is ALSO persisted (review advisory, HERD-399) — else a no-diff unit stays in
-        ``list_open`` and re-runs a checkout+status probe forever."""
+        ``list_open`` and re-runs a checkout+status probe forever. Like ``gate``, ``revision`` MUST
+        agree with ``unit.revision`` — never land a different revision than the one that was gated."""
+        if revision and unit.revision and revision != unit.revision:
+            return ApplyResult(status="error", reason="revision argument does not match unit.revision")
         manifest_path = self._manifest_path(unit.slug)
         manifest = _read_manifest(manifest_path)
         if manifest is None:

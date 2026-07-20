@@ -2498,9 +2498,11 @@ def _doc_apply_fixture(tmp):
     subprocess.run(["git", "-C", main, "config", "user.email", "t@test"], check=True)
     subprocess.run(["git", "-C", main, "config", "user.name", "t"], check=True)
     subprocess.run(["git", "-C", main, "remote", "add", "origin", bare], check=True)
-    os.makedirs(os.path.join(main, "docs"), exist_ok=True)
+    os.makedirs(os.path.join(main, "docs", "sub"), exist_ok=True)
     with open(os.path.join(main, "docs", "x.md"), "w", encoding="utf-8") as fh:
         fh.write("orig\n")
+    with open(os.path.join(main, "docs", "sub", "y.md"), "w", encoding="utf-8") as fh:
+        fh.write("sub\n")   # gives directory-path tests a real "docs/sub" tree to target
     subprocess.run(["git", "-C", main, "add", "."], check=True)
     subprocess.run(["git", "-C", main, "commit", "-q", "-m", "init"], check=True)
     subprocess.run(["git", "-C", main, "push", "-q", "-u", "origin", "main"], check=True)
@@ -2836,11 +2838,75 @@ class TestDocApplyAdapter(unittest.TestCase):
                                      config={"MAIN": main, "HERD_REMOTE": "origin",
                                             "HERD_BRANCH_NAME": "main"})
         unit = adapter.open({"slug": "dir-slug", "worktree": worktree, "revision": revision,
-                             "paths": ["docs"], "title": "t", "body": "b"})
+                             "paths": ["docs/sub"], "title": "t", "body": "b"})
         result = adapter.apply(unit, revision)
         self.assertEqual(result.status, "refused")
+        self.assertEqual(result.reason, "directory-path-not-supported")
         log = subprocess.check_output(["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
         self.assertEqual(len(log), 1)   # nothing landed
+
+    def test_apply_refuses_directory_shaped_path_even_with_no_worktree_declared(self):
+        # review fix, round 2: the guard used to live INSIDE `if worktree:`, so a manifest with a blank
+        # worktree field skipped it entirely — exactly the silent-under-apply case it exists to close.
+        # main and the builder worktree share the same object store, so the check must (and now does)
+        # work off `main` alone, with no worktree field required.
+        tmp = tempfile.mkdtemp()
+        main, _worktree, revision = _doc_apply_fixture(tmp)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "dir-slug-2", "worktree": "", "revision": revision,
+                             "paths": ["docs/sub"], "title": "t", "body": "b"})
+        result = adapter.apply(unit, revision)
+        self.assertEqual(result.status, "refused")
+        self.assertEqual(result.reason, "directory-path-not-supported")
+        log = subprocess.check_output(["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
+        self.assertEqual(len(log), 1)   # nothing landed
+
+    # ── review BLOCK fix, round 2 (HERD-399): the commit-failure rollback was a no-op ──────────────
+    def test_apply_commit_failure_rollback_actually_reverts_not_a_no_op(self):
+        """`checkout -- <paths>` restores from the INDEX, which the earlier scoped checkout already
+        updated to the NEW content — so the old rollback left MAIN permanently dirty at the new content
+        whenever the commit itself failed. `checkout HEAD -- <paths>` is the form that actually reverts."""
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        hook_path = os.path.join(main, ".git", "hooks", "pre-commit")
+        with open(hook_path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook_path, 0o755)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "doc-slug", "worktree": worktree, "revision": revision,
+                             "paths": ["docs/x.md"], "title": "t", "body": "b"})
+        result = adapter.apply(unit, revision)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.reason, "commit-failed")
+        with open(os.path.join(main, "docs", "x.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "orig\n")   # actually reverted, not left at the new content
+        status = subprocess.check_output(
+            ["git", "-C", main, "status", "--porcelain", "--", "docs/x.md"]).decode()
+        self.assertEqual(status.strip(), "")   # index AND worktree both clean
+        # not permanently wedged: the unit is retried (no stale "dirty-local-changes" false-positive).
+        self.assertEqual(len(adapter.list_open()), 1)
+
+    # ── review advisory, round 2 (HERD-399): gate/apply must catch a revision-argument mismatch ─────
+    def test_gate_and_apply_refuse_when_revision_argument_disagrees_with_unit_revision(self):
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        scenario = {"candidates": [dict(pr="doc-slug", sha=revision, health="CLEAN", review="PASS")]}
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal, gates=FixtureGates(scenario),
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "doc-slug", "worktree": worktree, "revision": revision,
+                             "paths": ["docs/x.md"], "title": "t", "body": "b"})
+        self.assertEqual(adapter.gate(unit, "some-other-sha-entirely").status, "error")
+        self.assertEqual(adapter.apply(unit, "some-other-sha-entirely").status, "error")
+        # the correct revision still works fine
+        self.assertEqual(adapter.gate(unit, revision).status, "pass")
 
     # ── review fix (HERD-399): the push-rejected rollback must never reset a detached HEAD or a HEAD
     #    that has moved past OUR OWN commit (a concurrent seat's work) ─────────────────────────────
