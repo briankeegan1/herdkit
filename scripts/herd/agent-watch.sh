@@ -10883,6 +10883,67 @@ _finish_stall_note_pr_opened() {
   _finish_stall_enabled && _finish_stall_clear "$1"
 }
 
+# _finish_stall_note_still_working <slug> <worktree> <branch> — called from the tick branch where the
+# agent reads 'working' THIS tick (HERD-402). Unlike a limit-park (_finish_stall_note_escape, which
+# deliberately serves a FRESH grace window on resume — downtime the builder could not act on should
+# never count against it), a 'working' pane reading is NOT reliable evidence the builder actually
+# escaped the stall.
+#
+# GROUNDED INCIDENT (2026-07-20, HERD-404 builder, ~45-min eligible window, zero finish_stall* events):
+# a builder's OWN backgrounded healthcheck run — exactly the step AGENTS.md requires before every PR —
+# makes the pane read 'working' for stretches while the git tree, the actual signature this leg cares
+# about, never changes. The OLD unconditional clear() here (the same code _finish_stall_note_escape
+# still runs for the limit-park caller) wiped the anchor on every such blip, so the clock never
+# accrued past a few seconds and FINISH_STALL_MIN was never reached — outcome indistinguishable from
+# a genuine self-recovery, which is exactly what made the incident hard to diagnose after the fact.
+#
+# Keys the decision on the SAME git signature _reconcile_finish_stall itself uses (uncommitted tracked
+# changes, or commits ahead of origin) instead of the pane status alone: unresolved ⇒ PRESERVE the
+# anchor through the blip (the clock keeps accruing from the ORIGINAL first-seen, exactly as if the
+# pane had stayed done/idle the whole time); resolved ⇒ the builder genuinely finished (everything
+# committed and pushed with still no PR — a real PR clears unconditionally via
+# _finish_stall_note_pr_opened before this is ever reached), so a merely-'pending' record is forgiven
+# exactly like note-escape. PRESERVES 'retasked'/'escalated' unconditionally, same as note-escape — the
+# ladder is bounded to two rungs and is never re-examined once actioned, whatever the tree looks like.
+_finish_stall_note_still_working() {
+  _finish_stall_enabled || return 0
+  local _nw_slug="$1" _nw_wt="$2" _nw_branch="$3" _nw_rec _nw_state="" _nw_anchor=""
+  _nw_rec="$(_finish_stall_record "$_nw_slug")"
+  [ -n "$_nw_rec" ] || return 0
+  IFS=$'\t' read -r _nw_anchor _nw_state <<< "$_nw_rec"
+  case "$_nw_state" in
+    retasked|escalated) return 0 ;;
+  esac
+  if [ "$(_finish_stall_commits_ahead "$_nw_wt" "$_nw_branch")" -gt 0 ] \
+     || [ "$(_finish_stall_dirty "$_nw_wt")" = "1" ]; then
+    return 0   # the signature still holds — a busy pane this tick is not proof of escape
+  fi
+  _finish_stall_clear "$_nw_slug"
+}
+
+# _finish_stall_scan_summary <eligible> <retasked> <escalated> — the throttled per-scan journal
+# heartbeat (HERD-402), exactly the shape adopt_scan got in HERD-388: journals exactly ONE
+# finish_stall_scan event per call, result ∈ {empty, eligible, retasked, escalated} chosen by priority
+# (escalated > retasked > eligible > empty) with count = the tally in that bucket — so a silently-dead
+# leg (zero of everything, every scan) is visible in the journal the very next scan, not just in
+# retrospect, and a genuine fire (retasked/escalated) is provable without grepping for the granular
+# finish_stall_detected/wake/escalated events individually. The caller tallies this tick's
+# _reconcile_finish_stall verdicts (PENDING → eligible, FIRST_STALL → retasked, SECOND_STALL/ESCALATED
+# → escalated) and throttles the CALL to the ~60s scan cadence; this function itself does no throttling
+# and no gating — it is a pure "given these counts, journal the summary" step, callable in isolation.
+_finish_stall_scan_summary() {
+  local _fss_eligible="${1:-0}" _fss_retasked="${2:-0}" _fss_escalated="${3:-0}"
+  if [ "$_fss_escalated" -gt 0 ]; then
+    journal_append finish_stall_scan result escalated count "$_fss_escalated"
+  elif [ "$_fss_retasked" -gt 0 ]; then
+    journal_append finish_stall_scan result retasked count "$_fss_retasked"
+  elif [ "$_fss_eligible" -gt 0 ]; then
+    journal_append finish_stall_scan result eligible count "$_fss_eligible"
+  else
+    journal_append finish_stall_scan result empty count 0
+  fi
+}
+
 # _finish_stall_wake_prompt <slug> — the finish-line nudge: explicit steps, not just "you stopped".
 _finish_stall_wake_prompt() {
   printf 'Your worktree for %s has unfinished work (uncommitted changes or unpushed commits) and no open PR, and your agent has stopped.\nValidate your work, run the healthcheck, then commit it (include the Refs line from your task spec), push, and open a NON-DRAFT PR with `gh pr create` (no --draft).\nDo not merge the PR and do not edit BACKLOG.md.' "$1"
@@ -10968,7 +11029,7 @@ _reconcile_finish_stall() {
   local _rfs_slug="$1" _rfs_wt="$2" _rfs_astatus="$3" _rfs_branch="$4"
   _finish_stall_enabled || { printf 'OFF'; return 0; }
   local _rfs_now _rfs_grace _rfs_rec _rfs_first="" _rfs_state="" _rfs_commits=0 _rfs_dirty=0 \
-        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict
+        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state
   _rfs_now="$(_now)"
   _rfs_grace="$(_finish_stall_grace_secs)"
   case "$_rfs_astatus" in
@@ -10991,7 +11052,17 @@ _reconcile_finish_stall() {
     NOT_STALLED)
       [ -n "$_rfs_first" ] && _finish_stall_clear "$_rfs_slug" ;;
     PENDING)
-      [ -n "$_rfs_first" ] || _finish_stall_mark "$_rfs_slug" "$_rfs_now" >/dev/null ;;
+      if [ -z "$_rfs_first" ]; then
+        # HERD-402: journal the anchor write itself (first-seen), not just the eventual FIRST_STALL —
+        # so the timeline is reconstructable even for a slug that never crosses the grace window (e.g.
+        # it escapes mid-way). Journal ONLY when THIS call actually won the shared-pool race: a losing
+        # seat's mark echoes back another seat's already-anchored epoch, and journaling that here would
+        # fabricate a second first-seen event for an anchor this seat did not create.
+        _rfs_mark_out="$(_finish_stall_mark "$_rfs_slug" "$_rfs_now")"
+        IFS=$'\t' read -r _rfs_mark_epoch _rfs_mark_state <<< "$_rfs_mark_out"
+        [ "$_rfs_mark_epoch" = "$_rfs_now" ] && \
+          journal_append finish_stall_anchor slug "$_rfs_slug" first_seen "$_rfs_now"
+      fi ;;
     FIRST_STALL)
       journal_append finish_stall_detected slug "$_rfs_slug" first_seen "${_rfs_first:-$_rfs_now}" \
         commits "$_rfs_commits" dirty "$_rfs_dirty"
@@ -12836,6 +12907,9 @@ _tick_render_reconcile() {
   FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
   CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
+  # HERD-402: this tick's finish-stall verdict tally, fed into the throttled finish_stall_scan summary
+  # once the FEATS loop below finishes classifying every builder.
+  _FSS_ELIGIBLE=0; _FSS_RETASKED=0; _FSS_ESCALATED=0
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
@@ -12939,6 +13013,14 @@ EOF
               # this always reads NOT_STALLED/OFF and falls straight through to the wedge/spare
               # classification below, byte-identical to before this leg existed.
               _fstall="$(_reconcile_finish_stall "$slug" "$dir" "$astatus" "$branch")"
+              # HERD-402: tally this tick's verdict for the throttled finish_stall_scan summary below.
+              # Pure counting, no side effect — a hard no-op (all verdicts read OFF/NOT_STALLED, never
+              # matching a case here) when FINISH_STALL_MIN is unset, so this stays byte-inert off.
+              case "$_fstall" in
+                PENDING)                _FSS_ELIGIBLE=$((_FSS_ELIGIBLE + 1)) ;;
+                FIRST_STALL)            _FSS_RETASKED=$((_FSS_RETASKED + 1)) ;;
+                SECOND_STALL|ESCALATED) _FSS_ESCALATED=$((_FSS_ESCALATED + 1)) ;;
+              esac
               case "$_fstall" in
                 FIRST_STALL|SECOND_STALL|ESCALATED)
                   _fsrec="$(_finish_stall_record "$slug")"; _fsfirst=""; _fsstate=""
@@ -12986,10 +13068,15 @@ EOF
         # working. BUT unlike wedge, a 'retasked'/'escalated' record must SURVIVE this branch — a
         # delivered re-task nudge is exactly what puts the agent into "working" on the very next tick,
         # so an unconditional clear here would wipe the record the instant the nudge succeeds and make
-        # SECOND_STALL/escalation unreachable (PR #502 review). _finish_stall_note_escape clears only
-        # an un-actioned 'pending' anchor (or nothing); it self-gates on the leg being enabled, so this
-        # stays a hard no-op (no shellout) when FINISH_STALL_MIN is unset.
-        _finish_stall_note_escape "$slug"
+        # SECOND_STALL/escalation unreachable (PR #502 review). HERD-402: a plain 'pending' anchor does
+        # NOT unconditionally clear here (unlike the limit-park branch's _finish_stall_note_escape) —
+        # a 'working' pane reading alone is not proof of escape (the grounding incident: a builder's own
+        # backgrounded healthcheck run reads as 'working' for stretches with the git tree unchanged, so
+        # the old unconditional clear() here perpetually reset the clock and it never reached
+        # FINISH_STALL_MIN). _finish_stall_note_still_working keys the decision on the SAME git
+        # signature the reconcile itself uses instead of the pane status alone; it self-gates on the
+        # leg being enabled, so this stays a hard no-op (no shellout) when FINISH_STALL_MIN is unset.
+        _finish_stall_note_still_working "$slug" "$dir" "$branch"
         # Agent is "working" with no PR yet. Walk the liveness ladder (see the "Builder liveness"
         # helpers) instead of the old commit-count heuristic, which false-flagged every normal
         # >5-min build because builders commit exactly ONCE at the very end. A fresh/edited or
@@ -13182,6 +13269,19 @@ EOF
     if [ "$_ADOPT_SCAN_TICK" -ge "$_ADOPT_SCAN_INTERVAL" ]; then
       _ADOPT_SCAN_TICK=0
       _adopt_remote_prs_scan "$PRS_JSON" "$_orphan_claimed" "$WT"
+    fi
+  fi
+
+  # HERD-402 finish-stall scan observability — throttled to the ~60 s scan cadence, exactly like
+  # adopt_scan above (HERD-388): the leg's own detection/action runs every tick inside the FEATS loop
+  # (it cannot be throttled without breaking the grace-window clock), but the journal HEARTBEAT is,
+  # so a silent leg (zero eligible, zero fired, every scan) is distinguishable in the journal from a
+  # dead one. Self-gates on FINISH_STALL_MIN; off (default) is byte-inert — no scan, no journal write.
+  if _finish_stall_enabled; then
+    _FINISH_STALL_SCAN_TICK=$((_FINISH_STALL_SCAN_TICK + 1))
+    if [ "$_FINISH_STALL_SCAN_TICK" -ge "$_FINISH_STALL_SCAN_INTERVAL" ]; then
+      _FINISH_STALL_SCAN_TICK=0
+      _finish_stall_scan_summary "$_FSS_ELIGIBLE" "$_FSS_RETASKED" "$_FSS_ESCALATED"
     fi
   fi
 
@@ -13698,6 +13798,11 @@ _INBOX_SCAN_TICK=$_INBOX_SCAN_INTERVAL  # primed so the FIRST enabled tick scans
 _ADOPT_SCAN_INTERVAL=15     # HERD-369: adopt-remote-PRs scan every ~60 s (15 × 4 s sleep) — the fetch +
                             # worktree-add mutation never rides the 4 s repaint
 _ADOPT_SCAN_TICK=$_ADOPT_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
+_FINISH_STALL_SCAN_INTERVAL=15   # HERD-402: finish_stall_scan journal summary every ~60 s (15 × 4 s
+                                  # sleep) — mirrors adopt_scan's cadence (HERD-388); only the summary
+                                  # emission is throttled, the leg's own detection/action still runs
+                                  # every tick (see the FEATS loop's _reconcile_finish_stall call)
+_FINISH_STALL_SCAN_TICK=$_FINISH_STALL_SCAN_INTERVAL  # primed so the FIRST enabled tick emits, then every interval
 
 # ENGINE WATCHDOG state (HERD-306) — the resident supervisor's fault memory across ticks. There is no
 # bash action-pass fallback anymore: _engine_tick_watchdog runs the sole (Python) engine core, RETRIES

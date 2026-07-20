@@ -61,6 +61,7 @@ for fn in _finish_stall_min _finish_stall_enabled _finish_stall_grace_secs \
           _finish_stall_commits_ahead _finish_stall_dirty _classify_finish_stall _finish_stall_record \
           _finish_stall_mark _finish_stall_state _finish_stall_reset _finish_stall_clear \
           _finish_stall_retask _row_finish_stall _reconcile_finish_stall _finish_stall_note_escape \
+          _finish_stall_note_still_working _finish_stall_scan_summary \
           _finish_stall_note_pr_opened _finish_stall_action_once; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
@@ -436,6 +437,116 @@ v="$(HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall nopane-slug "
 [ -s "$SENT" ] && fail "nopane: must never send when there is no pane"
 case "$(_finish_stall_record nopane-slug)" in *escalated) : ;; *) fail "nopane: must escalate when no pane exists" ;; esac
 PANE_ID="pane-1"
+ok
+
+# ── HERD-402: _finish_stall_note_still_working — an oscillating 'working' pane must NOT reset the
+# clock ──────────────────────────────────────────────────────────────────────────────────────────────
+# Grounded incident (2026-07-20, HERD-404 builder, ~45-min eligible window, zero finish_stall* events):
+# the builder's OWN backgrounded healthcheck run flips astatus to 'working' for stretches while the git
+# tree is UNCHANGED the whole time. The LIVE tick loop routes a 'working' PR-less builder to
+# _finish_stall_note_still_working (never _reconcile_finish_stall, never the old _finish_stall_note_escape
+# either) — assert the clock survives every such dip, from the pane's point of view, and the nudge still
+# fires once the ORIGINAL first-seen ages past grace.
+OSC_WT="$T/wt-oscillate"; mkgit "$OSC_WT"
+git -C "$OSC_WT" checkout -q -b osc-feat
+printf 'wip\n' > "$OSC_WT/wip.txt"; git -C "$OSC_WT" add wip.txt   # tracked, uncommitted — the signature
+                                                                     # never changes across the dips below
+: > "$SENT"; : > "$HERDR_NOTIFY_LOG"
+
+# tick 1: first sighting (agent reads done) ⇒ PENDING, anchors at NOW
+v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall osc-slug "$OSC_WT" done osc-feat)"
+[ "$v" = "PENDING" ] || fail "osc tick1: first sighting should be PENDING, got $v"
+rec="$(_finish_stall_record osc-slug)"
+[ "$rec" = "$(printf '%s\tpending' "$NOW")" ] || fail "osc tick1: should anchor at NOW/pending, got: $rec"
+ok
+
+# ticks 2..4: the pane oscillates to 'working' repeatedly (its own healthcheck run) while the tree
+# stays exactly as dirty as before — the still-working seam must preserve the anchor every single time.
+for _bump in 1 2 3; do
+  _finish_stall_note_still_working osc-slug "$OSC_WT" osc-feat
+  rec="$(_finish_stall_record osc-slug)"
+  [ "$rec" = "$(printf '%s\tpending' "$NOW")" ] \
+    || fail "osc dip $_bump: a working blip over an UNCHANGED tree must preserve the anchor, got: $rec"
+done
+ok
+
+# past the ORIGINAL grace window (from the tick-1 anchor, never restarted by any of the dips) ⇒ the
+# builder reads 'done' again and the nudge fires exactly like an uninterrupted stall would.
+OSC_PAST="$((NOW + GRACE + 1))"
+v="$(HERD_NOW_EPOCH="$OSC_PAST" _reconcile_finish_stall osc-slug "$OSC_WT" done osc-feat)"
+[ "$v" = "FIRST_STALL" ] || fail "osc past-grace: should be FIRST_STALL despite the working dips, got $v"
+[ "$(grep -c . "$SENT")" -ge 1 ] || fail "osc past-grace: the nudge must still fire"
+_finish_stall_clear osc-slug
+ok
+
+# once the tree actually resolves (everything committed+pushed, still no PR), a working dip DOES clear
+# a merely-'pending' anchor — the leg forgives a genuine finish, not just a busy pane.
+RESOLVED_WT="$T/wt-oscillate-resolved"; mkgit "$RESOLVED_WT"
+_finish_stall_mark osc-resolved-slug "$NOW" >/dev/null
+_finish_stall_note_still_working osc-resolved-slug "$RESOLVED_WT" main
+[ -z "$(_finish_stall_record osc-resolved-slug)" ] \
+  || fail "osc resolved: a working dip over a CLEAN, nothing-ahead tree must clear the pending anchor"
+ok
+
+# a retasked/escalated record must survive an oscillation exactly like note-escape (bounded ladder —
+# never re-examined once actioned, whatever the tree looks like).
+_finish_stall_reset osc-retasked "$NOW" retasked
+_finish_stall_note_still_working osc-retasked "$OSC_WT" osc-feat
+[ "$(_finish_stall_record osc-retasked)" = "$(printf '%s\tretasked' "$NOW")" ] \
+  || fail "osc retasked: a working dip must preserve a retasked record regardless of the tree"
+_finish_stall_clear osc-retasked
+
+# hard no-op when the leg is off.
+( unset FINISH_STALL_MIN
+  _finish_stall_reset osc-off "$NOW" pending
+  _finish_stall_note_still_working osc-off "$OSC_WT" osc-feat
+)
+[ "$(_finish_stall_record osc-off)" = "$(printf '%s\tpending' "$NOW")" ] \
+  || fail "osc off: note-still-working must be a hard no-op when the leg is off"
+_finish_stall_clear osc-off
+ok
+
+# ── HERD-402: _finish_stall_scan_summary — the throttled journal heartbeat ─────────────────────────
+: > "$JOURNAL_FILE"
+_finish_stall_scan_summary 0 0 0
+grep -q '"event":"finish_stall_scan"' "$JOURNAL_FILE" || fail "scan summary: expected a finish_stall_scan event"
+grep -q '"result":"empty"' "$JOURNAL_FILE" || fail "scan summary: all-zero tally should journal result=empty"
+grep -q '"count":0' "$JOURNAL_FILE" || fail "scan summary: all-zero tally should journal count=0"
+
+: > "$JOURNAL_FILE"
+_finish_stall_scan_summary 3 0 0
+grep -q '"result":"eligible"' "$JOURNAL_FILE" || fail "scan summary: eligible-only tally should journal result=eligible"
+grep -q '"count":3' "$JOURNAL_FILE" || fail "scan summary: expected count=3"
+
+: > "$JOURNAL_FILE"
+_finish_stall_scan_summary 1 2 0
+grep -q '"result":"retasked"' "$JOURNAL_FILE" || fail "scan summary: retasked outranks eligible"
+grep -q '"count":2' "$JOURNAL_FILE" || fail "scan summary: expected count=2 (the retasked tally, not eligible)"
+
+: > "$JOURNAL_FILE"
+_finish_stall_scan_summary 1 2 4
+grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "scan summary: escalated outranks everything else"
+grep -q '"count":4' "$JOURNAL_FILE" || fail "scan summary: expected count=4 (the escalated tally)"
+ok
+
+# ── HERD-402: the stall-clock anchor write itself is journaled ─────────────────────────────────────
+: > "$JOURNAL_FILE"
+_finish_stall_clear anchor-slug
+ANCHOR_WT="$T/wt-anchor"; mkgit "$ANCHOR_WT"
+printf 'wip\n' > "$ANCHOR_WT/wip.txt"; git -C "$ANCHOR_WT" add wip.txt
+v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall anchor-slug "$ANCHOR_WT" done feat)"
+[ "$v" = "PENDING" ] || fail "anchor: first sighting should be PENDING, got $v"
+grep -q '"event":"finish_stall_anchor"' "$JOURNAL_FILE" \
+  || fail "anchor: the first-seen mark must be journaled as finish_stall_anchor"
+grep -q '"slug":"anchor-slug"' "$JOURNAL_FILE" || fail "anchor: expected slug=anchor-slug"
+grep -q "\"first_seen\":$NOW" "$JOURNAL_FILE" || fail "anchor: expected first_seen=$NOW"
+BEFORE_ANCHOR_LINES="$(wc -l < "$JOURNAL_FILE")"
+v="$(HERD_NOW_EPOCH="$((NOW + 1))" _reconcile_finish_stall anchor-slug "$ANCHOR_WT" done feat)"
+[ "$v" = "PENDING" ] || fail "anchor tick2: still within grace should be PENDING, got $v"
+AFTER_ANCHOR_LINES="$(wc -l < "$JOURNAL_FILE")"
+[ "$BEFORE_ANCHOR_LINES" = "$AFTER_ANCHOR_LINES" ] \
+  || fail "anchor: a slug with an EXISTING anchor must not re-journal on every tick"
+_finish_stall_clear anchor-slug
 ok
 
 echo "ALL PASS ($pass checks)"
