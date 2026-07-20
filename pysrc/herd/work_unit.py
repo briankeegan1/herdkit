@@ -21,10 +21,21 @@ imports or calls this module. ``LiveTick`` still talks to ``_GraphQLDiscovery``/
 changes NO observable behavior of the live engine — it is additive surface a future phase wires a
 call site through, not a call site itself.
 
+DOC-APPLY MANIFEST PATHS ARE LITERAL FILE PATHS, PERIOD (HERD-399 round 4): a ``<slug>.unit.json``
+``paths`` entry names exactly one file — never a glob, never a directory, never pathspec magic. The
+full accepted-input invariant (normalized relative literal path, no ``..``/absolute, no wildcard,
+matching the docs allowlist, resolving to exactly one blob at ``<revision>``) is stated once, on
+:func:`_safe_manifest_path`, and every violation fails CLOSED at both ``gate`` and ``apply``. A
+consequence worth naming: doc-apply cannot express a DELETION at all today — a scoped
+``git checkout <rev> -- <path>`` can only add/update, and a single-file path deleted at
+``<revision>`` hard-errors the checkout (an honest, retryable ``checkout-failed``) rather than
+silently under-applying.
+
 Stdlib-only (the P1 packaging rule).
 """
 
 import glob
+import inspect
 import json
 import os
 import re
@@ -291,20 +302,38 @@ def _doc_apply_path_pattern(config):
     return _DEFAULT_DOC_APPLY_PATH_RE
 
 
+# Git pathspec WILDCARD characters (gitglossary: pathspecs are glob patterns unless :(literal) magic
+# is in force). A manifest path containing any of these is NOT a literal file name to git.
+_PATHSPEC_WILDCARD_RE = re.compile(r"[*?\[]")
+
+
 def _safe_manifest_path(path):
-    """Normalize ONE manifest path and reject anything unsafe — empty, absolute, drive-qualified, or
-    escaping via any ``..`` component — BEFORE the allowlist pattern (or git) ever sees it (review fix,
-    HERD-399). The allowlist is a STRING match, not a filesystem-containment check: an un-normalized
-    ``"docs/../src/x.py"`` clears ``^docs/`` while actually resolving to ``src/x.py`` — verified
-    empirically, ``git checkout <rev> -- "docs/../src/x.py"`` exits 0 and lands the OTHER file. Returns
-    the normalized POSIX-relative path (the form used for every downstream check AND every git
-    operation — the raw manifest string is never trusted again once this returns), or ``None`` when the
-    path is unsafe.
+    """Normalize ONE manifest path and reject anything unsafe BEFORE the allowlist pattern (or git)
+    ever sees it. THE ACCEPTED-INPUT INVARIANT (stated once, here — every other check in the chain
+    enforces one leg of it): a doc-apply manifest path is a **normalized, relative, LITERAL file
+    path** —
+      * relative and non-escaping: no absolute/drive-qualified/``~`` form, no ``..`` component
+        surviving normalization (rejected here; round-1 review — ``"docs/../src/x.py"`` cleared
+        ``^docs/`` as a string while resolving to ``src/x.py``);
+      * LITERAL, never a pattern: no git pathspec wildcard (``*``/``?``/``[``) anywhere, and no
+        leading ``:`` (pathspec magic) (rejected here; round-4 review BLOCK — ``"docs/*"`` cleared
+        the allowlist, defeated the non-recursive ``ls-tree`` tree-guard which sees no match for a
+        glob, and then matched RECURSIVELY at checkout, which can only add/update: a file deleted at
+        ``<revision>`` silently survived while ``apply`` recorded a clean landing. Manifests name
+        files, period — a request that needs a pattern must enumerate the files instead);
+      * matching the docs allowlist prefix (enforced by :func:`_path_allowed` on the normalized form);
+      * resolving to exactly one BLOB at ``<revision>``, never a tree (enforced by
+        :func:`_is_tree_path` + the scoped checkout's own hard error on a nonexistent path).
+    Returns the normalized POSIX-relative path (the form used for every downstream check AND every
+    git operation — the raw manifest string is never trusted again once this returns), or ``None``
+    when the path violates any clause above (the caller fails closed).
     """
     if not path:
         return None
     p = str(path).replace("\\", "/")
-    if p.startswith("/") or p.startswith("~") or (len(p) > 1 and p[1] == ":"):
+    if p.startswith("/") or p.startswith("~") or p.startswith(":") or (len(p) > 1 and p[1] == ":"):
+        return None
+    if _PATHSPEC_WILDCARD_RE.search(p):
         return None
     norm = os.path.normpath(p).replace("\\", "/")
     if norm in (".", ""):
@@ -865,8 +894,20 @@ class DocApplyAdapter(WorkUnitAdapter):
             return ApplyResult(status="refused", reason="path allowlist refused")
         result = self._land.apply(unit, paths=safe_paths)
         if result.status in ("applied", "already"):
-            manifest["state"] = "applied"
-            _write_manifest(manifest_path, manifest)
+            # COMPARE-AND-SET on revision before the write-back (review advisory, HERD-399 round 4):
+            # a builder `open()` at a NEW revision landing during the apply window must never be
+            # clobbered back to the old object with state=applied — that would bury the new change
+            # forever (list_open would never re-offer it). Re-read and only flip state when the
+            # manifest still describes the revision this apply just landed; otherwise leave the newer
+            # manifest untouched (journaled) — the new revision is discovered on the next tick.
+            current = _read_manifest(manifest_path)
+            if current is None or current.get("revision") != manifest.get("revision"):
+                self.journal.append("doc_apply_manifest_cas_skip", unit=unit.unit_id, kind=self.kind,
+                                    slug=unit.slug, applied_revision=str(manifest.get("revision") or ""),
+                                    manifest_revision=str((current or {}).get("revision") or ""))
+                return result
+            current["state"] = "applied"
+            _write_manifest(manifest_path, current)
         return result
 
     def reconcile(self, unit):
@@ -887,9 +928,15 @@ _ADAPTERS = {"git-pr": GitPrAdapter, "doc-apply": DocApplyAdapter}
 def resolve_adapter(kind=None, **kwargs):
     """Resolve the :class:`WorkUnitAdapter` for ``kind`` — else ``kwargs["config"]["WORK_UNIT_KIND"]``
     (the same config dict :func:`herd.live_runtime._config_from_env` assembles), else the
-    ``WORK_UNIT_KIND`` env var, else :data:`DEFAULT_KIND` ("git-pr"). Any remaining ``kwargs`` (home,
-    journal, state, config, repo, gates, actuator, discovery) pass straight through to the adapter's
-    constructor.
+    ``WORK_UNIT_KIND`` env var, else :data:`DEFAULT_KIND` ("git-pr"). Remaining ``kwargs`` (home,
+    journal, state, config, repo, gates, actuator, discovery, worktrees_dir, land, ...) pass through
+    to the adapter's constructor, FILTERED to the parameters that constructor actually declares
+    (review advisory, HERD-399 round 4): the kwarg vocabulary is the UNION across kinds, not the
+    intersection — a generic caller resolving with the git-pr set (``state``/``repo``/``actuator``/
+    ``discovery``) must get a working :class:`DocApplyAdapter` (which takes none of those), not a
+    ``TypeError``. Filtering is on declared parameter NAMES via :func:`inspect.signature`, so a
+    kwarg every kind understands (``journal``, ``config``) always lands and a kind-specific one is
+    dropped only for the kinds it does not apply to.
 
     A kind this build does not ship raises :class:`UnsupportedWorkUnitKind` — a HARD refusal, mirroring
     ``wunit_resolve_adapter`` (``scripts/herd/work-unit.sh``), not ``agent-watch.sh``'s boot-time soft
@@ -902,4 +949,8 @@ def resolve_adapter(kind=None, **kwargs):
         raise UnsupportedWorkUnitKind(
             "work-unit kind %r is not supported yet — only %s ships today (P4 adds a second kind; "
             "HERD-395/HERD-398/HERD-403)" % (resolved, ", ".join(SUPPORTED_KINDS)))
-    return adapter_cls(**kwargs)
+    params = inspect.signature(adapter_cls.__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return adapter_cls(**kwargs)   # the constructor takes **kwargs — nothing to filter
+    accepted = set(params) - {"self"}
+    return adapter_cls(**{k: v for k, v in kwargs.items() if k in accepted})

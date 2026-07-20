@@ -2376,6 +2376,22 @@ class TestWorkUnitAdapterSkeleton(unittest.TestCase):
         with self.assertRaises(WU.UnsupportedWorkUnitKind):
             WU.resolve_adapter(config={"WORK_UNIT_KIND": "config-apply"})
 
+    def test_resolve_adapter_filters_kwargs_to_what_each_kinds_constructor_accepts(self):
+        # review advisory (HERD-399 round 4): the kwarg vocabulary is the UNION across kinds — a
+        # generic caller resolving doc-apply with the git-pr kwarg set (state/repo/actuator/discovery)
+        # must get a working adapter, never a TypeError; and vice versa with doc-apply's own extras.
+        journal = LiveJournal(None)
+        doc = WU.resolve_adapter("doc-apply", home="/h", journal=journal, state=object(),
+                                 config={"MAIN": "/m"}, repo="o/r", gates=None,
+                                 actuator=object(), discovery=object())
+        self.assertIsInstance(doc, WU.DocApplyAdapter)
+        self.assertIs(doc.journal, journal)              # shared kwargs still land
+        self.assertEqual(doc.config, {"MAIN": "/m"})
+        gitpr = WU.resolve_adapter("git-pr", journal=journal, config={},
+                                   worktrees_dir="/tmp/x", land=object())
+        self.assertIsInstance(gitpr, WU.GitPrAdapter)
+        self.assertIs(gitpr.journal, journal)
+
     # ── base adapter: every op is a NAMED NotImplementedError ────────────────────────────────────
     def test_base_adapter_ops_are_unimplemented_and_named(self):
         base = WU.WorkUnitAdapter()
@@ -2985,6 +3001,95 @@ class TestDocApplyAdapter(unittest.TestCase):
         self.assertEqual(result.reason, "directory-path-not-supported")
         log = subprocess.check_output(["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
         self.assertEqual(len(log), 1)   # nothing landed
+
+    # ── review BLOCK fix, round 4 (HERD-399): a WILDCARD manifest path is refused at BOTH surfaces ──
+    def test_wildcard_manifest_path_is_refused_at_gate_and_apply_never_a_silent_under_apply(self):
+        """The round-4 composition: "docs/*" cleared the allowlist, blinded the NON-recursive ls-tree
+        tree-guard (a glob matches no root-tree entry -> guard says False), then matched RECURSIVELY at
+        checkout — and a scoped checkout can only add/update, so a file DELETED at <revision> silently
+        survived while apply recorded a clean landing (verified by the reviewer end-to-end). Manifest
+        paths are literal file paths, period: any pathspec wildcard (* ? [) is refused loudly at gate
+        AND apply, proven against the reviewer's exact delete-plus-rewrite scenario."""
+        tmp = tempfile.mkdtemp()
+        main, worktree, revision = _doc_apply_fixture(tmp)
+        # the reviewer's scenario: the worktree revision DELETES docs/x.md and rewrites docs/sub/y.md
+        subprocess.run(["git", "-C", worktree, "rm", "-q", "docs/x.md"], check=True)
+        with open(os.path.join(worktree, "docs", "sub", "y.md"), "w", encoding="utf-8") as fh:
+            fh.write("rewritten\n")
+        subprocess.run(["git", "-C", worktree, "add", "docs/sub/y.md"], check=True)
+        subprocess.run(["git", "-C", worktree, "commit", "-q", "-m", "delete x, rewrite y"], check=True)
+        del_rev = subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"]).decode().strip()
+
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal,
+                                     config={"MAIN": main, "HERD_REMOTE": "origin",
+                                            "HERD_BRANCH_NAME": "main"})
+        unit = adapter.open({"slug": "glob-slug", "worktree": worktree, "revision": del_rev,
+                             "paths": ["docs/*"], "title": "t", "body": "b"})
+
+        # surface 1: gate refuses LOUDLY (path allowlist, before any gates collaborator is consulted)
+        gate = adapter.gate(unit, del_rev)
+        self.assertEqual(gate.status, "block")
+        self.assertEqual(gate.reason, "doc-apply path allowlist refused")
+        self.assertIn("doc_apply_gate_refused",
+                      [e["event"] for e in events(os.path.join(tmp, "j.jsonl"))])
+
+        # surface 2: apply refuses too (defense in depth), journaled — and NOTHING lands anywhere
+        result = adapter.apply(unit, del_rev)
+        self.assertEqual(result.status, "refused")
+        self.assertIn("doc_apply_apply_refused",
+                      [e["event"] for e in events(os.path.join(tmp, "j.jsonl"))])
+        log = subprocess.check_output(["git", "-C", main, "log", "--oneline"]).decode().strip().splitlines()
+        self.assertEqual(len(log), 1)                     # no commit on MAIN
+        self.assertTrue(os.path.exists(os.path.join(main, "docs", "x.md")))
+        with open(os.path.join(main, "docs", "sub", "y.md"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "sub\n")          # y.md NOT half-applied either
+        self.assertNotEqual((WU._read_manifest(adapter._manifest_path("glob-slug")) or {}).get("state"),
+                            "applied")                    # never recorded as landed
+        self.assertEqual(len(adapter.list_open()), 1)     # still open, never silently terminal
+
+        # AND the land layer refuses even when a caller bypasses the adapter's own check entirely
+        land = WU.LiveDocApply(journal, config={"MAIN": main})
+        raw_unit = WU.WorkUnit(unit_id="doc-apply:glob-slug", kind="doc-apply", slug="glob-slug",
+                               revision=del_rev,
+                               artifact={"worktree": worktree, "paths": ["docs/*"]})
+        self.assertEqual(land.apply(raw_unit).status, "refused")
+
+        # the other pathspec special forms are refused by the same clause
+        for bad in ("docs/x?.md", "docs/[ab].md", ":(top)docs/x.md"):
+            self.assertIsNone(WU._safe_manifest_path(bad))
+
+    # ── review advisory, round 4 (HERD-399): compare-and-set on revision before the write-back ─────
+    def test_apply_write_back_never_clobbers_a_reopen_at_a_new_revision(self):
+        """A builder open() at a NEW revision landing during the apply window must not be clobbered
+        back to the old object with state=applied — that would bury the new change forever."""
+        tmp = tempfile.mkdtemp()
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+
+        class _ReopeningLand:
+            """A land twin whose apply simulates the race: mid-apply, a builder re-opens the manifest
+            at a NEW revision, then the (old-revision) landing reports success."""
+            def __init__(self, manifest_path):
+                self.manifest_path = manifest_path
+            def apply(self, unit, paths=None):
+                obj = WU._read_manifest(self.manifest_path)
+                obj["revision"] = "rev-NEW"
+                obj["state"] = "open"
+                WU._write_manifest(self.manifest_path, obj)
+                return WU.ApplyResult(status="applied", reason="gates_passed")
+
+        adapter = WU.DocApplyAdapter(worktrees_dir=tmp, journal=journal, config={})
+        adapter._land = _ReopeningLand(adapter._manifest_path("race-slug"))
+        unit = adapter.open({"slug": "race-slug", "worktree": "", "revision": "rev-OLD",
+                             "paths": ["docs/a.md"], "title": "t", "body": "b"})
+        result = adapter.apply(unit, "rev-OLD")
+        self.assertEqual(result.status, "applied")        # the old-revision landing itself succeeded
+        obj = WU._read_manifest(adapter._manifest_path("race-slug"))
+        self.assertEqual(obj["revision"], "rev-NEW")      # the re-open SURVIVED — not clobbered
+        self.assertEqual(obj["state"], "open")            # the new revision will be discovered
+        self.assertEqual(len(adapter.list_open()), 1)
+        self.assertIn("doc_apply_manifest_cas_skip",
+                      [e["event"] for e in events(os.path.join(tmp, "j.jsonl"))])
 
     # ── review BLOCK fix, round 2 (HERD-399): the commit-failure rollback was a no-op ──────────────
     def test_apply_commit_failure_rollback_actually_reverts_not_a_no_op(self):
