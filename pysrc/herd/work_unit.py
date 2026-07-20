@@ -1022,8 +1022,8 @@ def resolve_adapter(kind=None, **kwargs):
     adapter_cls = _ADAPTERS.get(resolved)
     if adapter_cls is None:
         raise UnsupportedWorkUnitKind(
-            "work-unit kind %r is not supported yet — only %s ships today (P4 adds a second kind; "
-            "HERD-395/HERD-398/HERD-403)" % (resolved, ", ".join(SUPPORTED_KINDS)))
+            "work-unit kind %r is not supported — only %s ships today (HERD-395/HERD-398/HERD-399/"
+            "HERD-403)" % (resolved, ", ".join(SUPPORTED_KINDS)))
     params = inspect.signature(adapter_cls.__init__).parameters
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return adapter_cls(**kwargs)   # the constructor takes **kwargs — nothing to filter

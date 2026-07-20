@@ -1,8 +1,15 @@
 # SPIKE: Work-unit delivery abstraction
 
-**Tracker:** HERD-163  
-**Status:** design spike only — **no engine code changes** in this PR  
-**Date:** 2026-07-09  
+**Tracker:** HERD-163 (epic: HERD-395)  
+**Status:** **SHIPPED** — the epic closed at Phase 5 (HERD-404, this doc's own §10). Two kinds ship
+today: `git-pr` (default, both engines — the byte-identical original pipeline) and `doc-apply` (opt-in,
+**python engine only**, HERD-399 — a manifest-driven docs-only delivery gated by the
+`_safe_manifest_path` invariant, §9.3/`docs/capabilities-overview.md`'s "Work-unit delivery kind"
+section). The bash `wunit_*` facade stays the tested **reference model**; the live seam is the python
+engine (§9.1). Originally landed as a design-only spike (no engine changes) on 2026-07-09; every
+section below this line documents the phase it was written at — read §9 and §10 for what actually
+shipped and where the two implementations diverged from the original plan.  
+**Date:** 2026-07-09 (spike) → 2026-07-20 (epic close)  
 **Audience:** coordinator + engine maintainers  
 
 ## 0. Why this spike exists
@@ -611,6 +618,14 @@ for this PR — it still describes the one kind either engine implements.
 
 ### 9.4 Phase 4 (`doc-apply`), re-planned for the python engine
 
+**SHIPPED as PR #511 (HERD-399), per the re-plan below** — `DocApplyAdapter` landed as a sibling class
+in `pysrc/herd/work_unit.py` (not a separate `doc_apply.py`; the module never grew large enough to
+warrant the split), registered in `work_unit._ADAPTERS` next to `git-pr`, proven by
+`tests/test_live_runtime.py`'s hermetic `TestDocApplyAdapter` suite (no sim scenario script was
+needed — the existing `unittest` rig covered it), with capabilities.tsv + conformance.tsv rows added
+in that same PR (`herd.work_unit.DocApplyAdapter`, `<slug>.unit.json`, `DOC_APPLY_PATH_GLOB`). The
+plan below is left as written — it is an accurate account of what was decided and then built.
+
 §5's original Phase 4 planned `scripts/herd/work-units/doc-apply.sh` — a second BASH adapter,
 because at spike-writing time bash was the only engine. That target is now wrong: building a bash
 `doc-apply` rail would create a second reference-model-only adapter nobody actuates, mirroring
@@ -642,4 +657,29 @@ because at spike-writing time bash was the only engine. That target is now wrong
 
 ---
 
-*End of spike. Implementation, if approved, starts at Phase 1 under a new tracker item — not as a silent follow-on in this PR.* Post-port amendment §9 (HERD-403) landed alongside the Python interface skeleton it describes, per that item's own task spec — not a silent follow-on either.
+## 10. Phase-completion table — epic closure (HERD-404, P5)
+
+The epic (HERD-395) is CLOSED as of this PR. Every phase below shipped exactly the scope its own PR
+description claims; nothing here was reverted or re-planned away except doc-apply's vehicle (bash →
+python, §9.4).
+
+| Phase | PR | Tracker | What shipped |
+|---|---|---|---|
+| P1 | #505 | HERD-396 | Named the spine: `scripts/herd/work-unit.sh`'s `wunit_*` façade, git-pr only, every wrapper a one-line delegation — byte-identical, no caller switched over. |
+| P2 | #507 | HERD-397 | Journal dual-write: every `pr`-carrying event also gets an additive `unit="git-pr:<n>"` field (`journal.sh` / `shadow_journal.py`), so a future reader can key on `unit` without breaking `--pr`. |
+| P3 | #508 | HERD-398 | Extracted the git-pr adapter body out of `agent-watch.sh` into `scripts/herd/work-units/git-pr.sh` — a pure move, same function names, zero behavior change. |
+| P3b | #509 | HERD-401 | Rewired the watcher tick's reconcile/teardown call sites through the `wunit_*` facade; filed the finding this whole §9 amendment is built on — `do_merge`/`wunit_apply` had zero production call sites left, because HERD-306 (engine port) had already deleted the bash action pass that used to call it. |
+| P3c | #510 | HERD-403 | Landed the python-side `WorkUnitAdapter` interface skeleton (`pysrc/herd/work_unit.py`) — `GitPrAdapter` wrapping the live engine's discovery/gates/actuator pieces; the §9 post-port amendment (this doc) documenting where the live seam actually is. |
+| P4 | #511 | HERD-399 | Shipped `doc-apply` — a real second kind, python-only, manifest-driven (`<slug>.unit.json`), gated by the `_safe_manifest_path` accepted-input invariant; opt-in via `WORK_UNIT_KIND=doc-apply`. |
+| P5 | this PR | HERD-404 | Epic closure: the bash/python conformance tie (`tests/test-work-unit-conformance.sh`) the P3c amendment promised (§9.3); reference-model-only markings on every `wunit_*` wrapper that has no live call site; retired stale "P4 adds a second kind" phase language now that P4 shipped; `docs/capabilities-overview.md` + this doc's status header brought to the shipped state; this table. |
+
+**Byte-identical-by-construction holds across every phase**: P1–P3c never switched a production caller
+onto the bash facade (P3b's own finding is that there was no live caller left to switch), and P4's
+`doc-apply` is strictly opt-in (no manifest on disk → `list_open` returns `[]`, nothing about the
+`git-pr` path is touched). The sim scenario suite (`scripts/herd/sim/sandbox-scenario.sh`,
+`sandbox-concurrency-scenario.sh`) and the hermetic bash + python test suites stay green with
+`WORK_UNIT_KIND` unset, proving the default git-pr pipeline never moved.
+
+---
+
+*End of spike. Implementation, if approved, starts at Phase 1 under a new tracker item — not as a silent follow-on in this PR.* Post-port amendment §9 (HERD-403) landed alongside the Python interface skeleton it describes, per that item's own task spec — not a silent follow-on either. Phase-completion table (§10, HERD-404) closes the epic — also per that item's own task spec, not a silent follow-on.

@@ -135,6 +135,32 @@ metadata is in `templates/capabilities.tsv` and viewable live with `herd config 
 | `REVIEW_ESCALATE_GLOB` / `REVIEW_MODEL_CHEAP` / `REVIEW_ESCALATE_MAXFILES` | Risk-tiered review: reserve the expensive reviewer for engine-critical paths and large diffs; docs/test-only diffs can be skipped with a recorded low-risk PASS. Classification **fails safe** (unreadable diff → strong tier). Blank glob → every PR gets the full review, unchanged. |
 | `REVIEW_CONCURRENCY` / `SPAWN_AHEAD` / `HEALTH_CONCURRENCY` | Pipeline throughput knobs: parallel reviews, builder spawn lead over the gate, and serialized healthchecks (default 1 — feature worktrees share one git object store, so overlapping suites can false-red a clean PR). |
 
+### Work-unit delivery kind (`WORK_UNIT_KIND`)
+
+herdkit's delivery pipeline (open → gate → apply → reconcile → teardown) is built behind a thin
+**work-unit interface** (design: `docs/spikes/work-unit-abstraction.md`) so the vehicle a change ships
+through doesn't have to be a GitHub PR. Two kinds ship today:
+
+| kind | default? | vehicle | engine |
+|---|---|---|---|
+| `git-pr` | **yes**, both engines | `gh pr create` → review + health gates → `gh pr merge` — today's exact pipeline, unchanged | live on the python engine (`herd.work_unit.GitPrAdapter`, wrapping `pysrc/herd/live_runtime.py`'s discovery/gates/actuator); the bash `wunit_*` facade (`scripts/herd/work-unit.sh` + `scripts/herd/work-units/git-pr.sh`) is the **reference model** — proven by the sim scenario suite and the hermetic bash tests, but superseded as the production path by the python engine port (HERD-306) |
+| `doc-apply` | opt-in, **python engine only** | a `<slug>.unit.json` manifest declaring a set of `docs/`-scoped file paths, landed straight onto the default branch with a scoped `git checkout <revision> -- <paths>` + commit + push — no `gh pr create`, no `gh pr merge` anywhere in the chain | `herd.work_unit.DocApplyAdapter` (`pysrc/herd/work_unit.py`); never shipped in bash — see the spike's §9.4 re-plan for why (a second reference-model-only bash adapter nobody would actuate) |
+
+`WORK_UNIT_KIND` unset (or set to anything a given engine doesn't implement) always resolves `git-pr`
+— the bash boot check fails **soft** to `git-pr` with a loud warning (the watcher process must keep
+running through a config typo); a direct adapter-resolution call on either side (bash's
+`wunit_resolve_adapter`, python's `herd.work_unit.resolve_adapter`) fails **hard** instead — never a
+silent substitution of a different kind than the one asked for.
+
+**The manifest contract**, for anyone landing (or debugging) a `doc-apply` unit — the accepted-input
+invariant, stated once on `herd.work_unit._safe_manifest_path` and enforced at both `gate` and
+`apply`: a `<slug>.unit.json` `paths` entry is a **normalized, relative, literal file path** — no
+absolute/`~`/`..`-escaping form, no git pathspec wildcard (`*`/`?`/`[`) or leading-`:` pathspec magic,
+matching the `DOC_APPLY_PATH_GLOB` allowlist (default `^docs/`), and resolving to exactly one **blob**
+at `<revision>` (never a tree — a directory path is refused, and anything that can't be proven a blob,
+including a deletion, is refused too, never silently under-applied). Manifests name files, period; a
+change that needs a pattern must enumerate the files instead.
+
 ### Watcher lens + team mode
 
 | key | purpose |
