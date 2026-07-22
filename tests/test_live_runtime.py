@@ -76,6 +76,21 @@ class _Poison:
         raise AssertionError("dry-run must not shell out (subprocess.run called)")
 
 
+class _PromptRecordingActuator(DryRunActuator):
+    """HERD-420: a DryRunActuator that records every prompt text handed to wake_builder, so a test
+    can assert the completion leg's "finish your uncommitted work" nudge (LiveTick._refix_finish_prompt)
+    is genuinely a different string from the original bounce prompt — the journal itself never
+    carries the prompt text, so this is the only observable seam."""
+
+    def __init__(self, journal):
+        super().__init__(journal)
+        self.prompts = []
+
+    def wake_builder(self, cand, prompt):
+        self.prompts.append(prompt)
+        return super().wake_builder(cand, prompt)
+
+
 class LiveCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -362,6 +377,232 @@ class TestRefixWakeVerification(LiveCase):
         self.assertEqual(len(rb), 1)
         self.assertEqual(len(wr), 1)
         self.assertEqual(wr[0]["woke"], 0)
+
+
+class TestRefixCompletionTracking(LiveCase):
+    """HERD-420: a refix_wake_result woke=1 only proves the agent's pane came back to "working" —
+    NOT that it committed or pushed anything. Live incident: PR #531 — a review-BLOCK bounced the
+    builder, it edited bin/herd, then went back to "done" with the edit never committed or pushed;
+    the sha-keyed once-guard held silently forever and the PR sat blocked on the same sha
+    indefinitely, caught only because a human happened to look.
+
+    Every test drives independent LiveTick instances sharing one on-disk state dir (the multi-tick
+    pattern TestGateOutcomes.test_refix_round_advances_per_new_sha already establishes — a fresh
+    LiveTick per tick is the production process-boundary shape) with HERD_FAKE_NOW pinned per call,
+    so the completion window's elapsed-time arithmetic is exact and hermetic (no real sleeping)."""
+
+    def _tick(self, state_dir, jpath, cand, config, fake_now, actuator_cls=DryRunActuator):
+        old = os.environ.get("HERD_FAKE_NOW")
+        os.environ["HERD_FAKE_NOW"] = str(fake_now)
+        try:
+            scenario = {"candidates": [cand], "config": config}
+            j = LiveJournal(jpath)
+            act = actuator_cls(j)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), act, j,
+                        state=LiveState(state_dir))
+            res = t.run()
+        finally:
+            if old is None:
+                os.environ.pop("HERD_FAKE_NOW", None)
+            else:
+                os.environ["HERD_FAKE_NOW"] = old
+        return res, (events(jpath) if os.path.exists(jpath) else []), act
+
+    def test_window_not_yet_elapsed_holds_silently(self):
+        state_dir = os.path.join(self.tmp, "state-window")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_000_000_000
+        pr, sha, slug = 531, "sha-531", "feat-531"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR", "agent_status": "idle"}
+        res1, ev1, _ = self._tick(state_dir, os.path.join(self.tmp, "w1.jsonl"), cand, config, T0)
+        self.assertEqual(res1["outcomes"][str(pr)], "BLOCK")
+        rb1 = [o for o in ev1 if o["event"] == "refix_bounce"]
+        self.assertEqual(rb1[0]["round"], 1)
+
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR",
+                     "agent_status": "done"}
+        res2, ev2, _ = self._tick(state_dir, os.path.join(self.tmp, "w2.jsonl"), cand_done, config,
+                                  T0 + 9 * 60)   # 9 minutes < REFIX_COMPLETE_MIN=10
+        self.assertEqual(res2["outcomes"][str(pr)], "BLOCK")
+        self.assertFalse([o for o in ev2 if o["event"] == "refix_incomplete"])
+        self.assertFalse([o for o in ev2 if o["event"] == "refix_bounce"])
+
+    def test_incomplete_after_window_rebounces_then_escalates_on_budget_exhaustion(self):
+        state_dir = os.path.join(self.tmp, "state-completion")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "2", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_000_000_000
+        pr, sha, slug = 531, "sha-531", "feat-531"
+
+        # tick 1: health CODEERROR, idle builder wakes — round 1 bounce recorded.
+        cand = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR", "agent_status": "idle"}
+        res1, ev1, _ = self._tick(state_dir, os.path.join(self.tmp, "c1.jsonl"), cand, config, T0)
+        self.assertEqual(res1["outcomes"][str(pr)], "BLOCK")
+        self.assertEqual([o for o in ev1 if o["event"] == "refix_bounce"][0]["round"], 1)
+
+        # tick 2 (+10 min, window elapsed): SAME sha, builder now reads "done" — INCOMPLETE: journal
+        # refix_incomplete for round 1, then spend round 2 of the SAME rail's budget.
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR",
+                     "agent_status": "done"}
+        res2, ev2, _ = self._tick(state_dir, os.path.join(self.tmp, "c2.jsonl"), cand_done, config,
+                                  T0 + 10 * 60)
+        self.assertEqual(res2["outcomes"][str(pr)], "BLOCK")
+        inc2 = [o for o in ev2 if o["event"] == "refix_incomplete"]
+        self.assertEqual(len(inc2), 1)
+        self.assertEqual(inc2[0]["pr"], pr)
+        self.assertEqual(inc2[0]["sha"], sha)
+        self.assertEqual(inc2[0]["kind"], "health")
+        self.assertEqual(inc2[0]["round"], 1)
+        self.assertEqual(inc2[0]["agent_status"], "done")
+        self.assertEqual(inc2[0]["dirty"], "no")
+        rb2 = [o for o in ev2 if o["event"] == "refix_bounce"]
+        self.assertEqual(len(rb2), 1)
+        self.assertEqual(rb2[0]["round"], 2)
+        wr2 = [o for o in ev2 if o["event"] == "refix_wake_result"]
+        self.assertEqual(len(wr2), 1)
+        self.assertEqual(wr2[0]["woke"], 1)
+
+        # tick 3 (+another 10 min, same sha, still "done"): the rail's budget (cap=2) is now
+        # exhausted — escalate through the SAME needs-you path a normal BLOCK exhaustion uses,
+        # never a third bounce.
+        res3, ev3, _ = self._tick(state_dir, os.path.join(self.tmp, "c3.jsonl"), cand_done, config,
+                                  T0 + 20 * 60)
+        self.assertEqual(res3["outcomes"][str(pr)], "ESCALATE")
+        inc3 = [o for o in ev3 if o["event"] == "refix_incomplete"]
+        self.assertEqual(len(inc3), 1)
+        self.assertEqual(inc3[0]["round"], 2)
+        self.assertFalse([o for o in ev3 if o["event"] == "refix_bounce"],
+                         "budget exhausted — no third bounce")
+        esc3 = [o for o in ev3 if o["event"] == "health_refix_escalated"]
+        self.assertEqual(len(esc3), 1)
+
+    def test_review_rail_also_tracked_with_its_own_finish_prompt(self):
+        state_dir = os.path.join(self.tmp, "state-review-completion")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_100_000_000
+        pr, sha, slug = 532, "sha-532", "feat-532"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "review": "BLOCK", "health": "CLEAN",
+                "agent_status": "idle"}
+        _, ev1, act1 = self._tick(state_dir, os.path.join(self.tmp, "r1.jsonl"), cand, config, T0,
+                                  actuator_cls=_PromptRecordingActuator)
+        self.assertEqual(len(act1.prompts), 1)
+        self.assertIn("review-blocked", act1.prompts[0])
+
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "review": "BLOCK", "health": "CLEAN",
+                     "agent_status": "done"}
+        res2, ev2, act2 = self._tick(state_dir, os.path.join(self.tmp, "r2.jsonl"), cand_done,
+                                     config, T0 + 10 * 60, actuator_cls=_PromptRecordingActuator)
+        self.assertEqual(res2["outcomes"][str(pr)], "BLOCK")
+        inc2 = [o for o in ev2 if o["event"] == "refix_incomplete"]
+        self.assertEqual(len(inc2), 1)
+        self.assertEqual(inc2[0]["kind"], "review")
+        rb2 = [o for o in ev2 if o["event"] == "refix_bounce" and o.get("rule") == "review"]
+        self.assertEqual(len(rb2), 1)
+        # the completion nudge is a DIFFERENT prompt from the original review-BLOCK bounce — it
+        # tells the builder its wake did not ship anything, not the original review findings.
+        self.assertEqual(len(act2.prompts), 1)
+        self.assertIn("finish it now", act2.prompts[0])
+        self.assertNotIn("Read the full review", act2.prompts[0])
+
+    def test_dirty_worktree_recorded_on_the_incomplete_event(self):
+        state_dir = os.path.join(self.tmp, "state-dirty")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_200_000_000
+        pr, sha, slug = 533, "sha-533", "feat-533"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR", "agent_status": "idle"}
+        self._tick(state_dir, os.path.join(self.tmp, "d1.jsonl"), cand, config, T0)
+
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR",
+                     "agent_status": "done", "dirty": True}
+        _, ev, _ = self._tick(state_dir, os.path.join(self.tmp, "d2.jsonl"), cand_done, config,
+                              T0 + 10 * 60)
+        inc = [o for o in ev if o["event"] == "refix_incomplete"]
+        self.assertEqual(inc[0]["dirty"], "yes")
+
+    def test_still_working_never_triggers_completion(self):
+        # The agent may just be slow, not silently done-without-shipping — only an observed
+        # done/idle after the window elapses is evidence of an incomplete round.
+        state_dir = os.path.join(self.tmp, "state-working")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_300_000_000
+        pr, sha, slug = 534, "sha-534", "feat-534"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR", "agent_status": "idle"}
+        self._tick(state_dir, os.path.join(self.tmp, "wk1.jsonl"), cand, config, T0)
+
+        cand_working = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR",
+                        "agent_status": "working"}
+        res, ev, _ = self._tick(state_dir, os.path.join(self.tmp, "wk2.jsonl"), cand_working,
+                                config, T0 + 60 * 60)
+        self.assertEqual(res["outcomes"][str(pr)], "BLOCK")
+        self.assertFalse([o for o in ev if o["event"] == "refix_incomplete"])
+
+    def test_normal_push_never_triggers_completion(self):
+        # A builder that pushes a real fix opens a NEW sha — the once-guard for that sha was never
+        # attempted, so the walk takes the ordinary fresh-gate path, never the completion leg, no
+        # matter how much time has passed since the earlier sha's bounce.
+        state_dir = os.path.join(self.tmp, "state-pushed")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "10"}
+        T0 = 2_400_000_000
+        pr, slug = 535, "feat-535"
+
+        cand1 = {"pr": pr, "sha": "sha-a", "slug": slug, "health": "CODEERROR",
+                 "agent_status": "idle"}
+        self._tick(state_dir, os.path.join(self.tmp, "p1.jsonl"), cand1, config, T0)
+
+        cand2 = {"pr": pr, "sha": "sha-b", "slug": slug, "health": "CLEAN", "review": "PASS"}
+        res2, ev2, _ = self._tick(state_dir, os.path.join(self.tmp, "p2.jsonl"), cand2, config,
+                                  T0 + 30 * 60)
+        self.assertEqual(res2["outcomes"][str(pr)], "MERGE")
+        self.assertFalse([o for o in ev2 if o["event"] == "refix_incomplete"])
+
+    def test_disabled_by_zero_never_fires_byte_identical(self):
+        state_dir = os.path.join(self.tmp, "state-off")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3", "REFIX_COMPLETE_MIN": "0"}
+        T0 = 2_500_000_000
+        pr, sha, slug = 536, "sha-536", "feat-536"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "review": "BLOCK", "health": "CLEAN",
+                "agent_status": "idle"}
+        self._tick(state_dir, os.path.join(self.tmp, "o1.jsonl"), cand, config, T0)
+
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "review": "BLOCK", "health": "CLEAN",
+                     "agent_status": "done"}
+        res2, ev2, _ = self._tick(state_dir, os.path.join(self.tmp, "o2.jsonl"), cand_done, config,
+                                  T0 + 24 * 60 * 60)   # a full day later — still never fires
+        self.assertEqual(res2["outcomes"][str(pr)], "BLOCK")
+        self.assertFalse([o for o in ev2 if o["event"] == "refix_incomplete"])
+        self.assertFalse([o for o in ev2 if o["event"] == "refix_bounce"])
+
+    def test_default_is_ten_minutes_when_unset(self):
+        state_dir = os.path.join(self.tmp, "state-default")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}   # REFIX_COMPLETE_MIN unset
+        T0 = 2_600_000_000
+        pr, sha, slug = 537, "sha-537", "feat-537"
+
+        cand = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR", "agent_status": "idle"}
+        self._tick(state_dir, os.path.join(self.tmp, "def1.jsonl"), cand, config, T0)
+
+        cand_done = {"pr": pr, "sha": sha, "slug": slug, "health": "CODEERROR",
+                     "agent_status": "done"}
+        _, ev_early, _ = self._tick(state_dir, os.path.join(self.tmp, "def2.jsonl"), cand_done,
+                                    config, T0 + 9 * 60)
+        self.assertFalse([o for o in ev_early if o["event"] == "refix_incomplete"])
+
+        _, ev_late, _ = self._tick(state_dir, os.path.join(self.tmp, "def3.jsonl"), cand_done,
+                                   config, T0 + 10 * 60)
+        self.assertTrue([o for o in ev_late if o["event"] == "refix_incomplete"],
+                        "unset REFIX_COMPLETE_MIN must default to 10 minutes (ships ON)")
 
 
 class TestReapAndActuation(LiveCase):
