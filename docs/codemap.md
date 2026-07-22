@@ -193,7 +193,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `APP_PREVIEW_SERVER_ARGS` → `app-monitor.sh`
 - `APP_SURFACE_GLOB` → `healthcheck.sh`
 - `ATTRIBUTION_POLICY` → `bin/herd`, `governance-hook.sh`, `healthcheck.sh`
-- `BACKLOG_FILE` → `bin/herd`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
+- `BACKLOG_FILE` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `coordinator.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`
 - `BACKLOG_VIEW_EXTRAS` → `backlog-view.sh`
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
