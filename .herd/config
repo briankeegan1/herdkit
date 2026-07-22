@@ -200,3 +200,4 @@ HEALTH_INFLIGHT_TIMEOUT="1800"
 RESOLVER_PANE="on"
 # HERD-392: finish-line watchdog default-on for this project.
 FINISH_STALL_MIN="30"
+JOURNAL_AUDIT="on"
