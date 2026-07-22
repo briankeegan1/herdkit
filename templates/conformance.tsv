@@ -63,9 +63,12 @@ herd map	unit	tests/test-map.sh
 herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
+herd ledger <set|get|list|rm|compact|path>	unit	tests/test-cli-note-context.sh
 herd advise "<question>" [context…]	unit	tests/test-advise.sh
+herd advise "<question>" [context…]	unit	tests/test-cli-note-context.sh
 herd note "<finding>"	unit	tests/test-builder-notes-journal.sh
 herd note "<finding>"	unit	tests/test-note-full-sidecar.sh
+herd note "<finding>"	unit	tests/test-cli-note-context.sh
 herd notes [list|ack <n|all>]	unit	tests/test-console-rows-ageout.sh
 herd notes [list|ack <n|all>]	unit	tests/test-note-full-sidecar.sh
 herd reload	unit	tests/test-cli-reload.sh
