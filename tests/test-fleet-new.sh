@@ -157,10 +157,21 @@ repo_field="$(awk -F'|' '$1=="moneybet-3"{print $3}' "$HERD_FLEET_FILE")"
 ok
 
 # ── (4) gh NOT on PATH: fail-soft degrade, never a crash ──────────────────────────────────────────
-# 'gh' lives only under a package-manager prefix (e.g. /opt/homebrew/bin), never under the base
-# system dirs — a bare /usr/bin:/bin (plus /usr/sbin:/sbin) keeps every coreutil this chain needs
-# (git, mv, mkdir, cp, chmod, sed, awk, mktemp, ...) while guaranteeing no 'gh' resolves.
-NOGH_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+# Where 'gh' lives varies by box (a package-manager prefix on a dev machine; GitHub-hosted CI
+# runners ship it pre-installed under a base system dir like /usr/bin) — rather than guess a fixed
+# "safe" PATH, walk the CURRENT $PATH and drop only the directory(ies) that actually contain a 'gh'
+# executable, keeping every other dir (so git/mv/mkdir/cp/chmod/sed/awk/mktemp/... stay resolvable
+# from wherever they really live on THIS box).
+NOGH_PATH=""
+_ngp_save_ifs="$IFS"; IFS=':'; set -f
+for _ngp_dir in $PATH; do
+  IFS="$_ngp_save_ifs"
+  [ -n "$_ngp_dir" ] || continue
+  [ -x "$_ngp_dir/gh" ] && continue
+  NOGH_PATH="${NOGH_PATH:+$NOGH_PATH:}$_ngp_dir"
+  IFS=':'
+done
+IFS="$_ngp_save_ifs"; set +f
 PATH="$NOGH_PATH" command -v gh >/dev/null 2>&1 \
   && fail "(4) test setup bug: gh is still resolvable under $NOGH_PATH"
 proj4="$T/moneybet-4"
