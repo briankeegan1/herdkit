@@ -476,4 +476,31 @@ set -e
 printf '%s' "$out" | grep -qi "unknown 'herd pane' target" || fail "unknown-target error not clear"
 ok
 
+# ── 11. HERD-405: subdirectory walks up to the project's .herd/config via git toplevel ────────────
+P="$T/p11"; mkdir "$P"; _make_project "$P" "panetest"; R11="$(cd "$P" && pwd -P)"
+mkdir -p "$P/scripts/herd"   # no .herd/config here — only at the project root
+S="$T/s11"; _coord_state "$S" "$R11"
+rm -rf "$S/panes/pL"; rm -f "$S/neighbors/pA.left"   # force a recreate so --cwd is logged
+cat > "$R11/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL_gone tC
+watch pW tC
+REG
+out="$(_pane_run "$P/scripts/herd" "$S" backlog)" || fail "pane backlog failed from a project subdirectory (walk-up)"
+grep -q -- "--cwd $R11 " "$S/log" || fail "walked-up config did not bind PANE_ROOT to the project root ($R11)"
+printf '%s' "$out" | grep -q "recreated ✓" || fail "subdir walk-up recreate not reported"
+ok
+
+# ── 12. outside any git repo — no toplevel to walk up to, still refuses with the same message ─────
+P="$T/p12"; mkdir -p "$P/sub"   # plain directories, no git repo anywhere
+set +e
+out="$( cd "$P/sub" && env PATH="$RICH:$BIN:$PATH" HERDR_STATE="$T/s12" FAKE_WS_LABEL="panetest" \
+    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1 )"
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "pane watch should fail outside any git repo"
+printf '%s' "$out" | grep -qi "no .herd/config" || fail "missing-config error not clear outside a repo"
+printf '%s' "$out" | grep -qi "dogfood" || fail "should mention refusing the dogfood fallback outside a repo"
+ok
+
 echo "ALL PASS ($pass checks)"
