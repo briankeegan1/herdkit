@@ -5527,9 +5527,23 @@ _pane_write_registry() {
 # coordinator tab + anchor (coordinator) pane, and reads the .herd-panes registry rows. Dies with a
 # clear message when the control room is not up. Sets PANE_* globals for the caller:
 #   PANE_ROOT PANE_CFG PANE_WS PANE_COORD_TAB PANE_AGENT PANE_AGENT_LIVE PANE_REG_A/W/B
+#
+# HERD-405: `pwd` alone refused to dogfood from a subdirectory (e.g. scripts/herd) even though the
+# project's config sits one or more levels up. When pwd/.herd/config is missing, walk up ONE hop via
+# `git rev-parse --show-toplevel` and bind there iff toplevel/.herd/config exists — never further, and
+# never the engine-dogfood fallback in HERDKIT_HOME, so a repo boundary is still never crossed. Any
+# other miss (no git repo, or the toplevel itself lacks a config) keeps the EXACT original die message.
 _pane_init() {
   PANE_ROOT="$(pwd)"
   PANE_CFG="$PANE_ROOT/.herd/config"
+  if [ ! -f "$PANE_CFG" ]; then
+    local _pane_top
+    _pane_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$_pane_top" ] && [ -f "$_pane_top/.herd/config" ]; then
+      PANE_ROOT="$_pane_top"
+      PANE_CFG="$PANE_ROOT/.herd/config"
+    fi
+  fi
   [ -f "$PANE_CFG" ] || die "no .herd/config at $PANE_ROOT — run 'herd init' first (refusing the engine dogfood config)"
   export HERD_CONFIG_FILE="$PANE_CFG"
   # shellcheck source=/dev/null
