@@ -40,15 +40,24 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { pass=$((pass+1)); }
 plain() { printf '%s' "$1" | sed $'s/\x1b\\[[0-9;]*m//g'; }
 
-# Isolate HOME so the default ~/.herd/fleet is never touched even if a seam is missed.
+# Isolate HOME so the default ~/.herd/fleet is never touched even if a seam is missed. This also
+# means fleet_new's `git commit` cannot see a real operator's ~/.gitconfig, and a CI runner ships
+# NO global git identity at all (the workflow's own comment: "runners ship none") — supply one via
+# env vars (git honors these with no config file needed at all) so the commit step never depends on
+# ambient global config, on this box or any other.
 export HOME="$T/home"; mkdir -p "$HOME"
 export HERD_FLEET_FILE="$T/registry/fleet"
+export GIT_AUTHOR_NAME="herdkit test" GIT_AUTHOR_EMAIL="test@herdkit.local"
+export GIT_COMMITTER_NAME="herdkit test" GIT_COMMITTER_EMAIL="test@herdkit.local"
 
-# NOTE: deliberately NOT setting HERMETIC_TEST=1 — journal.sh redirects writes to a throwaway
-# per-process file under that signal (HERD-223), and (1) below asserts the real per-project journal
-# at $WORKTREES_DIR/.herd/journal.jsonl. Isolation instead comes from every path here living under
-# the temp $T (a fresh project root + a fresh sibling -trees pool each time) plus the temp $HOME /
-# HERD_FLEET_FILE registry — nothing this test does can touch a real project.
+# NOTE: deliberately NOT setting HERMETIC_TEST=1 ourselves — journal.sh redirects writes to a
+# throwaway per-process file under that signal (HERD-223), and (1) below asserts the
+# fleet_project_created event landed somewhere real. The CI suite runner (scripts/ci/run-suite.sh)
+# exports JOURNAL_FILE + HERD_JOURNAL_HERMETIC=1 for the WHOLE suite regardless (its own
+# hermeticity contract) — journal.sh's _journal_file() honors an inherited JOURNAL_FILE FIRST,
+# ahead of the $WORKTREES_DIR-derived path, so (1) below checks JOURNAL_FILE when the caller set
+# one and falls back to the real per-project journal otherwise, mirroring that exact precedence
+# rather than assuming either shape.
 COMMON_ENV=(HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1)
 
 # ── (1) --no-remote, explicit flags: full local chain, secrets/config.local never committed ──────
@@ -79,9 +88,13 @@ grep -qxF ".herd/config.local" "$proj1/.gitignore" || fail "(1) .herd/config.loc
 [ -z "$(git -C "$proj1" remote)" ] || fail "(1) --no-remote should leave no git remote: $(git -C "$proj1" remote -v)"
 
 wt="$(grep -E '^WORKTREES_DIR=' "$proj1/.herd/config" | sed -E 's/^WORKTREES_DIR="(.*)"$/\1/')"
-[ -f "$wt/.herd/journal.jsonl" ] || fail "(1) no journal written at $wt/.herd/journal.jsonl"
-grep -q '"event":"fleet_project_created"' "$wt/.herd/journal.jsonl" \
-  || fail "(1) fleet_project_created event missing: $(cat "$wt/.herd/journal.jsonl")"
+# journal.sh's _journal_file() honors an inherited JOURNAL_FILE FIRST (HERD-223) — the CI suite
+# runner exports one suite-wide for hermeticity, so check that path when set, else the real
+# per-project journal a standalone run (no JOURNAL_FILE in the environment) actually writes to.
+jf="${JOURNAL_FILE:-$wt/.herd/journal.jsonl}"
+[ -f "$jf" ] || fail "(1) no journal written at $jf"
+grep -q '"event":"fleet_project_created"' "$jf" \
+  || fail "(1) fleet_project_created event missing: $(cat "$jf")"
 ok
 
 # ── (2) no flags, no tty: LOUD default banner, defaults land in config ────────────────────────────
