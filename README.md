@@ -3,7 +3,7 @@
 <img width="3478" height="2228" alt="image" src="https://github.com/user-attachments/assets/bcaa4bfe-ecf0-4fab-a5b6-0c7a6332962f" />
 
 **A durable, config-driven engine for running autonomous work through gated pipelines — built on
-the [herdr](https://github.com/) terminal multiplexer and [Claude Code](https://claude.com/claude-code).**
+the herdr terminal multiplexer and [Claude Code](https://claude.com/claude-code).**
 
 herdkit drains a backlog of **work items** into **work units** — one delivery attempt per item —
 each built in isolation, gated on a healthcheck plus an adversarial review, and landed by a
