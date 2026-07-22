@@ -1780,6 +1780,10 @@ cmd_map() {
 # picture instead of re-deriving it every session. Coordinator-side only — NOT a watcher gate.
 # Delegates to scripts/herd/ledger.sh; state lives in the local (never-committed) worktree pool at
 # WORKTREES_DIR/.herd/ledger.jsonl. Default-dormant: with no writes, no file exists and nothing runs.
+# The dispatch case pins HERD_CONFIG_FILE via the shared worktree-run seam
+# (_herd_require_project_config — HERD-412) before calling this, so a builder worktree with no
+# committed config resolves its OWNING project (or refuses loudly) instead of ledger.sh's own
+# herd-config.sh source silently dogfooding.
 cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
 
 # ── herd advise: a mid-flight strong-model second opinion for a builder (HERD-101) ───────────────
@@ -1788,6 +1792,9 @@ cmd_ledger() { bash "$SCRIPTS_DIR/ledger.sh" "$@"; }
 # its whole lane. The advice is printed to stdout for the builder to read; no agent, no tab, no repo
 # mutation. Delegates to scripts/herd/herd-advise.sh, which is ADDITIVE + FAIL-SOFT: an absent
 # advisor model or a failed model call degrades to a clear one-line message, never a hard error.
+# The dispatch case pins HERD_CONFIG_FILE via the shared worktree-run seam
+# (_herd_require_project_config — HERD-412) before calling this, for the same reason cmd_ledger's
+# dispatch arm does.
 cmd_advise() { bash "$SCRIPTS_DIR/herd-advise.sh" "$@"; }
 
 # ── herd note: builder findings → journal for the coordinator (HERD-202) ─────────────────────────
@@ -5496,6 +5503,64 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   _herd_soft_dep_startup_notice
 }
 
+# ── shared project-config resolution (HERD-412, extends the HERD-405/#523 walk-up) ──────────────
+# _herd_resolve_project_config — locate THIS invocation's project .herd/config without ever
+# silently crossing into a foreign repo or binding the engine's own dogfood config. Resolution
+# order:
+#   1. cwd itself:              $(pwd)/.herd/config
+#   2. this repo's toplevel:    a subdirectory of the project (HERD-405) — `git rev-parse
+#      --show-toplevel`, bound iff toplevel/.herd/config exists; never further within the SAME repo.
+#   3. the OWNING main checkout: only when cwd is itself a builder worktree
+#      (_herd_context_is_worktree, context-guard.sh/HERD-269 — the one shared worktree-detection
+#      seam) — `git worktree list`'s FIRST entry is always the main working tree (git lists it
+#      first), bound iff ITS .herd/config exists.
+# A worktree whose own checkout carries no committed .herd/config still belongs to a real project
+# one hop away via git — never herd-config.sh's own plain-directory PWD walk-up + $_HERD_REPO_DEFAULT
+# dogfood fallback (the HERD-412 incident: a foreign builder worktree's `herd note` silently bound
+# herdkit's own dogfood config and wrote its finding onto herdkit-trees/.agent-watch-builder-notes —
+# a different project's operator saw a foreign note). Sets _HERD_RESOLVED_ROOT / _HERD_RESOLVED_CFG
+# on a hit (both "" on a miss — never partially set). Read-only (no git writes); never sources
+# herd-config.sh itself — callers decide how to react to a miss.
+_herd_resolve_project_config() {
+  _HERD_RESOLVED_ROOT=""; _HERD_RESOLVED_CFG=""
+  local root; root="$(pwd)"
+  if [ -f "$root/.herd/config" ]; then
+    _HERD_RESOLVED_ROOT="$root"; _HERD_RESOLVED_CFG="$root/.herd/config"; return 0
+  fi
+
+  local top; top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ] && [ -f "$top/.herd/config" ]; then
+    _HERD_RESOLVED_ROOT="$top"; _HERD_RESOLVED_CFG="$top/.herd/config"; return 0
+  fi
+
+  if command -v _herd_context_is_worktree >/dev/null 2>&1 && _herd_context_is_worktree; then
+    local main
+    main="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}' || true)"
+    if [ -n "$main" ] && [ -f "$main/.herd/config" ]; then
+      _HERD_RESOLVED_ROOT="$main"; _HERD_RESOLVED_CFG="$main/.herd/config"; return 0
+    fi
+  fi
+
+  return 1
+}
+
+# _herd_require_project_config — the shared, non-actuator seam for a worktree-run subcommand that
+# reads a project's config (herd note/notes/log/why/cost/stats/advise/ledger — HERD-412).
+# HERD_CONFIG_FILE already set by the caller (env — tests, or a nested invocation) wins outright,
+# matching herd-config.sh's own rule-1. Otherwise resolves via _herd_resolve_project_config; a
+# TOTAL miss refuses loudly with the exact dogfood-refusal message `herd pane` uses (HERD-405/#60)
+# instead of falling through to herd-config.sh's own resolution — one shared check, never a third
+# resolution path per caller.
+_herd_require_project_config() {
+  [ -n "${HERD_CONFIG_FILE:-}" ] && return 0
+  _herd_resolve_project_config || true
+  if [ -n "$_HERD_RESOLVED_CFG" ]; then
+    export HERD_CONFIG_FILE="$_HERD_RESOLVED_CFG"
+    return 0
+  fi
+  die "no .herd/config at $(pwd) — run 'herd init' first (refusing the engine dogfood config)"
+}
+
 # ── herd pane <watch|backlog|coordinator>: single-pane restart shortcuts ─────────────────────────
 # Re-run ONE control-room pane in place without a full `herd reload`. Each reuses the reload helpers
 # (observe-before-mutate pane plumbing) and the `.herd-panes` role registry, rewrites that registry
@@ -5529,21 +5594,15 @@ _pane_write_registry() {
 #   PANE_ROOT PANE_CFG PANE_WS PANE_COORD_TAB PANE_AGENT PANE_AGENT_LIVE PANE_REG_A/W/B
 #
 # HERD-405: `pwd` alone refused to dogfood from a subdirectory (e.g. scripts/herd) even though the
-# project's config sits one or more levels up. When pwd/.herd/config is missing, walk up ONE hop via
-# `git rev-parse --show-toplevel` and bind there iff toplevel/.herd/config exists — never further, and
+# project's config sits one or more levels up. Delegates to _herd_resolve_project_config (shared with
+# herd note/advise/ledger — HERD-412), which walks up to the git toplevel and never further within
+# the SAME repo, plus an extra hop to the OWNING main checkout when cwd is itself a builder worktree —
 # never the engine-dogfood fallback in HERDKIT_HOME, so a repo boundary is still never crossed. Any
-# other miss (no git repo, or the toplevel itself lacks a config) keeps the EXACT original die message.
+# miss keeps the EXACT original die message.
 _pane_init() {
-  PANE_ROOT="$(pwd)"
-  PANE_CFG="$PANE_ROOT/.herd/config"
-  if [ ! -f "$PANE_CFG" ]; then
-    local _pane_top
-    _pane_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ -n "$_pane_top" ] && [ -f "$_pane_top/.herd/config" ]; then
-      PANE_ROOT="$_pane_top"
-      PANE_CFG="$PANE_ROOT/.herd/config"
-    fi
-  fi
+  _herd_resolve_project_config || true
+  PANE_ROOT="${_HERD_RESOLVED_ROOT:-$(pwd)}"
+  PANE_CFG="${_HERD_RESOLVED_CFG:-$PANE_ROOT/.herd/config}"
   [ -f "$PANE_CFG" ] || die "no .herd/config at $PANE_ROOT — run 'herd init' first (refusing the engine dogfood config)"
   export HERD_CONFIG_FILE="$PANE_CFG"
   # shellcheck source=/dev/null
@@ -6046,12 +6105,12 @@ cmd_agent_update() {
 # herd-review.sh, cmd_reload) via scripts/herd/journal.sh. `herd log` pages it; `herd why <pr>`
 # summarizes one PR's full gate history chronologically. Both are READ-ONLY.
 
-# _journal_load_config — resolve WORKTREES_DIR (and thus the journal path) via the shared loader,
-# pinned to this repo's .herd/config when present. Sets the global JOURNAL_MAIN to the live journal.
+# _journal_load_config — resolve WORKTREES_DIR (and thus the journal path) via the shared
+# non-actuator config seam (_herd_require_project_config — HERD-412), refusing loudly on a total
+# miss instead of silently binding a foreign or dogfood config. Sets the global JOURNAL_MAIN to the
+# live journal.
 _journal_load_config() {
-  local root; root="$(pwd)"
-  local cfg="$root/.herd/config"
-  [ -f "$cfg" ] && export HERD_CONFIG_FILE="$cfg"
+  _herd_require_project_config
   # shellcheck source=/dev/null
   . "$SCRIPTS_DIR/herd-config.sh"
   JOURNAL_MAIN="$WORKTREES_DIR/.herd/journal.jsonl"
@@ -7071,8 +7130,8 @@ case "${1:-help}" in
   codemap) shift; cmd_codemap "$@" ;;
   symbol-index) shift; cmd_symbol_index "$@" ;;
   map)     shift; cmd_map "$@" ;;
-  ledger)  shift; cmd_ledger "$@" ;;
-  advise)  shift; cmd_advise "$@" ;;
+  ledger)  shift; _herd_require_project_config; cmd_ledger "$@" ;;
+  advise)  shift; _herd_require_project_config; cmd_advise "$@" ;;
   note)    shift; cmd_note "$@" ;;
   notes)   shift; cmd_notes "$@" ;;
   config)  shift; cmd_config "$@" ;;
