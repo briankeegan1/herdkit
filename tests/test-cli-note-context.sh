@@ -84,18 +84,29 @@ sys.stdout.write(str(o.get(sys.argv[3], "<MISSING>")))
 
 # _run ENVVAR=VAL... -- cmd args...  — invoke bin/herd with an explicitly EMPTY environment for the
 # resolution-sensitive vars (HERD_CONFIG_FILE/WORKTREES_DIR/PROJECT_ROOT), so nothing leaks from this
-# test process's own real .herd/config into the child. Also strips the bats/hermetic-test SIGNALS
-# (BATS_TEST_FILENAME/BATS_TEST_NAME/HERMETIC_TEST/HERD_HERMETIC_GUARD/HERD_JOURNAL_HERMETIC) this
-# script inherits when run UNDER bats (tests/herd.bats shells out to every tests/test-*.sh) — left
-# alone, journal.sh's _journal_in_test_context (HERD-223) sees them and redirects the write to a
-# throwaway TMPDIR file instead of the resolved WORKTREES_DIR/.herd/journal.jsonl, which is exactly
-# the resolution this test asserts. Stripping them makes the child behave like a REAL invocation.
+# test process's own real .herd/config into the child. Also strips every journal-hermeticity SIGNAL
+# this script itself inherits when run UNDER the outer test harness (bats' tests/herd.bats shells out
+# to every tests/test-*.sh; scripts/ci/run-suite.sh and .herd/healthcheck.project.sh's bats leg do
+# too) — left alone:
+#   • JOURNAL_FILE (HERD-223, top priority in journal.sh's _journal_file) — the CI runner
+#     (scripts/ci/run-suite.sh) and the local heavy healthcheck (.herd/healthcheck.project.sh) BOTH
+#     export this globally, pinned to their OWN throwaway sidecar, before invoking each test. It wins
+#     over EVERYTHING else in _journal_file, including a correctly-resolved WORKTREES_DIR — so a
+#     `herd note` run under either harness silently lands in the harness's sidecar, never
+#     WORKTREES_DIR/.herd/journal.jsonl, no matter how bin/herd resolves the project. This is exactly
+#     the resolution this test asserts, so it must not be shadowed.
+#   • BATS_TEST_FILENAME/BATS_TEST_NAME/HERMETIC_TEST/HERD_HERMETIC_GUARD/HERD_JOURNAL_HERMETIC —
+#     journal.sh's _journal_in_test_context (HERD-223) fail-safe, checked only when JOURNAL_FILE is
+#     unset; stripped for the same reason.
+# Stripping all of these makes the child behave like a REAL invocation regardless of which harness
+# (or none) drove this script.
 _run() {
   local -a envs=() args=()
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   args=("$@")
   env -u HERD_CONFIG_FILE -u WORKTREES_DIR -u PROJECT_ROOT -u HERD_SLUG \
+    -u JOURNAL_FILE -u HERD_JOURNAL_PIN_PID \
     -u BATS_TEST_FILENAME -u BATS_TEST_NAME -u HERMETIC_TEST -u HERD_HERMETIC_GUARD -u HERD_JOURNAL_HERMETIC \
     ${envs[@]+"${envs[@]}"} HERD_NONINTERACTIVE=1 bash "$HERD_BIN" ${args[@]+"${args[@]}"} 2>&1
 }
