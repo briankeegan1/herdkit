@@ -266,10 +266,14 @@ fleet_new() {
 
   # 6. gh repo create — fail-soft optional leg. --no-remote skips cleanly; a missing/unauthenticated
   #    gh degrades to the SAME "no remote" outcome with a loud warning, never a crash.
+  #    HERD_SKIP_GH_REMOTE (test seam, mirrors cmd_init's HERD_SKIP_GH_DETECT) forces the same
+  #    "not found" branch — 'gh' cannot be reliably hidden from PATH across every environment (a
+  #    hosted CI runner may ship it in the SAME directory as bash/coreutils), so tests exercising
+  #    this leg use the seam instead of PATH surgery.
   local repo_slug=""
   if [ -n "$no_remote" ]; then
     say "  ${c_dim}--no-remote: skipping gh repo create${c_rst}"
-  elif ! command -v gh >/dev/null 2>&1; then
+  elif [ -n "${HERD_SKIP_GH_REMOTE:-}" ] || ! command -v gh >/dev/null 2>&1; then
     warn "gh CLI not found — skipping remote repo creation (degrades to --no-remote); create one later with 'gh repo create' + 'git remote add origin <url>'"
   elif ! gh auth status >/dev/null 2>&1; then
     warn "gh not authenticated (gh auth status failed) — skipping remote repo creation (degrades to --no-remote); run 'gh auth login', then create the remote by hand"

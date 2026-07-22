@@ -157,26 +157,13 @@ repo_field="$(awk -F'|' '$1=="moneybet-3"{print $3}' "$HERD_FLEET_FILE")"
 ok
 
 # ── (4) gh NOT on PATH: fail-soft degrade, never a crash ──────────────────────────────────────────
-# Where 'gh' lives varies by box (a package-manager prefix on a dev machine; GitHub-hosted CI
-# runners ship it pre-installed under a base system dir like /usr/bin) — rather than guess a fixed
-# "safe" PATH, walk the CURRENT $PATH and drop only the directory(ies) that actually contain a 'gh'
-# executable, keeping every other dir (so git/mv/mkdir/cp/chmod/sed/awk/mktemp/... stay resolvable
-# from wherever they really live on THIS box).
-NOGH_PATH=""
-_ngp_save_ifs="$IFS"; IFS=':'; set -f
-for _ngp_dir in $PATH; do
-  IFS="$_ngp_save_ifs"
-  [ -n "$_ngp_dir" ] || continue
-  [ -x "$_ngp_dir/gh" ] && continue
-  NOGH_PATH="${NOGH_PATH:+$NOGH_PATH:}$_ngp_dir"
-  IFS=':'
-done
-IFS="$_ngp_save_ifs"; set +f
-PATH="$NOGH_PATH" command -v gh >/dev/null 2>&1 \
-  && fail "(4) test setup bug: gh is still resolvable under $NOGH_PATH"
+# Where 'gh' lives varies by box — a package-manager prefix on a dev machine, but a GitHub-hosted CI
+# runner ships it pre-installed in the SAME directory as bash/coreutils (a merged-/usr layout), so
+# there is no PATH we can construct that hides 'gh' while keeping every tool this chain needs
+# resolvable on every box. Use fleet_new's own HERD_SKIP_GH_REMOTE test seam (mirrors cmd_init's
+# HERD_SKIP_GH_DETECT) to force the identical "not found" branch deterministically instead.
 proj4="$T/moneybet-4"
-out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" \
-        PATH="$NOGH_PATH" \
+out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" HERD_SKIP_GH_REMOTE=1 \
         bash "$HERD" fleet new "$proj4" --archetype code --posture solo-auto < /dev/null 2>&1)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "(4) fleet new should degrade cleanly, not fail (rc=$rc): $out"
