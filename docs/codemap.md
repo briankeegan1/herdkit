@@ -141,7 +141,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `driver.sh` → `herd-config.sh`
 - `engine-seat.sh` → `engine-version.sh`, `journal.sh`
 - `engine-version.sh` → `journal.sh`
-- `fleet.sh` → `herd-config.sh`
+- `fleet.sh` → `herd-config.sh`, `journal.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
 - `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`, `journal.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`

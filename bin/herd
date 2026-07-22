@@ -1041,15 +1041,34 @@ cmd_init() {
   # (HERD-126): validated up front (a malformed profile aborts BEFORE any config is written), then
   # applied non-interactively after the interview writes .herd/config. One optional source among many
   # — it composes with the interview and the CLAUDE.md adoption pass; it never overrides them blindly.
-  local gov_profile=""
+  #
+  # --archetype <name> / --posture <name> (HERD-410): name a templates/archetypes.tsv /
+  # templates/postures.tsv row directly, so a NON-interactive `herd init` (no tty, or
+  # HERD_NONINTERACTIVE=1 — e.g. `herd fleet new`) can still pick a real archetype/posture instead of
+  # silently falling to the code/GitHub-derived defaults. Validated up front (an unknown name dies
+  # before any file is written); when given, the corresponding interview is skipped even if a tty IS
+  # present (an explicit flag always wins over asking). Omit either flag to keep today's behavior:
+  # interactive tty ⇒ the picker; non-interactive ⇒ the seeded default, now called out LOUDLY below
+  # (HERD-410 fixes the silent-default bug — the whole reason this item exists).
+  local gov_profile="" flag_archetype="" flag_posture=""
   while [ "$#" -gt 0 ]; do
     case "${1:-}" in
       --governance) gov_profile="${2:-}"; [ -n "$gov_profile" ] || die "usage: herd init [--governance <file>]"; shift 2 ;;
+      --archetype)  flag_archetype="${2:-}"; [ -n "$flag_archetype" ] || die "usage: herd init [--archetype <name>]"; shift 2 ;;
+      --posture)    flag_posture="${2:-}"; [ -n "$flag_posture" ] || die "usage: herd init [--posture <name>]"; shift 2 ;;
       --)           shift; break ;;
-      -?*)          die "unknown flag '$1' — usage: herd init [--governance <file>]" ;;
+      -?*)          die "unknown flag '$1' — usage: herd init [--governance <file>] [--archetype <name>] [--posture <name>]" ;;
       *)            break ;;
     esac
   done
+  if [ -n "$flag_archetype" ]; then
+    type archetype_exists >/dev/null 2>&1 && archetype_exists "$flag_archetype" \
+      || die "unknown --archetype '$flag_archetype' — see templates/archetypes.tsv for the canonical names"
+  fi
+  if [ -n "$flag_posture" ]; then
+    type posture_exists >/dev/null 2>&1 && posture_exists "$flag_posture" \
+      || die "unknown --posture '$flag_posture' — see templates/postures.tsv for the canonical names"
+  fi
   local root; root="$(pwd)"
   [ -d "$root/.git" ] || warn "no .git here — herdkit expects a git repo at $root"
 
@@ -1100,7 +1119,13 @@ cmd_init() {
   #     Non-interactive / no-tty init NEVER enters this interview and stays archetype=code —
   #     byte-identical to pre-HERD-409 init (same seeded healthcheck, same config key set otherwise).
   local archetype="code"
-  if _archetype_interactive && type archetype_names >/dev/null 2>&1 && [ -f "$(archetype_file 2>/dev/null || true)" ]; then
+  if [ -n "$flag_archetype" ]; then
+    # --archetype flag (HERD-410): already validated above; wins over the interview even under a tty.
+    archetype="$flag_archetype"
+    say "${c_bold}Project archetype${c_rst} ${c_dim}— from --archetype flag${c_rst}"
+    say "  ${c_bold}→ archetype=${archetype}${c_rst}  ${c_dim}$(archetype_intent "$archetype" 2>/dev/null)${c_rst}"
+    say ""
+  elif _archetype_interactive && type archetype_names >/dev/null 2>&1 && [ -f "$(archetype_file 2>/dev/null || true)" ]; then
     local ai=0 achoice aname_list="" an
     say "${c_bold}Project archetype${c_rst} ${c_dim}— what kind of project is this?${c_rst}"
     say "  ${c_dim}(canonical archetypes from templates/archetypes.tsv)${c_rst}"
@@ -1132,6 +1157,12 @@ EOF
     say "  ${c_bold}→ archetype=${archetype}${c_rst}  ${c_dim}$(archetype_intent "$archetype" 2>/dev/null)${c_rst}"
     say ""
   fi
+  # NOTE (HERD-410): a plain non-interactive `herd init` with NO --archetype flag stays byte-identical
+  # to pre-HERD-410 (silently archetype=code — tests/test-init-archetypes.sh (3) pins this). The
+  # "never silent defaulting" fix lives one layer up, in `herd fleet new` (scripts/herd/fleet.sh),
+  # which is the actual caller the HERD-410 grounding scenario is about: it computes and PRINTS its
+  # own archetype/posture defaults LOUDLY before delegating here, passing them as explicit flags
+  # whenever neither a flag nor a tty is available. Direct `herd init` callers are unaffected.
 
   # 2. Interview (detected values as defaults).
   local def_branch; def_branch="$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
@@ -1295,7 +1326,15 @@ EOF
   say "  ${c_bold}approve${c_rst}  the watcher HOLDS each PR for an explicit human sign-off before merging"
   say "  ${c_bold}observe${c_rst}  the watcher NEVER merges — it only reports; you merge by hand"
 
-  if _posture_interactive && type posture_names >/dev/null 2>&1 && [ -f "$(posture_file 2>/dev/null || true)" ]; then
+  if [ -n "$flag_posture" ]; then
+    # --posture flag (HERD-410): already validated above; wins over the interview even under a tty.
+    _posture_apply_bundle "$flag_posture"
+    posture_name="$flag_posture"; posture_mode="named"
+    say "${c_bold}Operating posture${c_rst} ${c_dim}— from --posture flag${c_rst}"
+    say "  ${c_bold}→ posture=${posture_name}${c_rst}  ${c_dim}$(posture_intent "$posture_name")${c_rst}"
+    say "  ${c_dim}rendered: $(posture_keys "$posture_name")${c_rst}"
+    say "  ${c_dim}MERGE_METHOD=${merge_method} (from GitHub detection / default; override later with 'herd config set')${c_rst}"
+  elif _posture_interactive && type posture_names >/dev/null 2>&1 && [ -f "$(posture_file 2>/dev/null || true)" ]; then
     local def_posture; def_posture="$(_posture_default_for_policy "$det_policy")"
     local i=0 choice name_list="" n adv_n
     # Bash 3.2-clean: collect names into a space-separated list for number→name resolution.
@@ -6816,6 +6855,7 @@ if not rows:
 cmd_fleet() {
   local sub="${1:-}"; shift || true
   case "$sub" in
+    new)       fleet_new "$@" ;;
     register)  fleet_register "$@" ;;
     list)      fleet_list "$@" ;;
     discover)  fleet_discover "$@" ;;
@@ -6833,6 +6873,12 @@ cmd_fleet() {
       cat <<EOF
 usage: herd fleet <subcommand>
 
+  new <path> [--archetype <name>] [--posture <name>] [--no-remote]
+                             one-command spin-up (HERD-410): mkdir + git init + 'herd init' + commit
+                             the rendered .herd/ project files + 'gh repo create' (unless --no-remote)
+                             + register. --archetype/--posture pass straight to 'herd init'; with
+                             neither flag AND no tty, defaults are chosen AND PRINTED LOUDLY (never
+                             silently) before delegating (herd fleet new --help for every flag)
   register <path> [--alias <name>]...
                              add a herd project (reads its .herd/config) to the registry; repeat
                              --alias to record free-text names 'herd fleet resolve' should also match

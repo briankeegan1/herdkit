@@ -94,6 +94,8 @@ herd link <list|--scan>	unit	tests/test-cli-link-scan.sh
 herd depend <link>#<id>	unit	tests/test-dispatch-deps.sh
 herd deps <list|rm|demote>	unit	tests/test-dispatch-deps.sh
 herd governance <export|apply>	unit	tests/test-governance-profiles.sh
+herd fleet new <path> [--archetype X --posture Y --no-remote]	unit	tests/test-fleet-new.sh
+herd init	unit	tests/test-init-flags.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-digest.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet-inbox.sh

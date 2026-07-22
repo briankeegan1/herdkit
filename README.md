@@ -222,6 +222,9 @@ matching, never an LLM guess, and every source is optional and coequal).
 `~/.herd/fleet`) for running one herd install across many repos:
 
 ```sh
+herd fleet new <path> [--archetype X --posture Y --no-remote]  # one-command spin-up: mkdir + git
+                                  # init + herd init + commit the rendered .herd/ files + gh repo
+                                  # create (unless --no-remote) + register (herd fleet new --help)
 herd fleet register <path>       # add a project to the registry
 herd fleet status                # per-project rollup: branch, open PRs, watcher alive?, last activity
 herd fleet inbox                 # cross-project attention inbox: what needs you right now
@@ -231,8 +234,11 @@ herd fleet set <KEY> <VALUE>     # propagate one policy across the fleet (valida
 herd fleet upgrade | reload      # run 'herd update' / 'herd reload' in every registered project
 ```
 
-It never mutates a project's tree beyond what the delegated per-project command already does; a
-missing / dirty / `gh`-unavailable project is reported, not fatal.
+Every subcommand delegates to each project's own `herd` command and never mutates a tree beyond
+what that delegated command already does, with one exception: `herd fleet new` seeds a BRAND NEW
+project (that is its job) — `--archetype`/`--posture` pass straight to `herd init`; with neither
+flag and no tty, it picks defaults itself and prints them loudly rather than silently defaulting to
+a code-shaped project. A missing / dirty / `gh`-unavailable project is reported, not fatal.
 
 ---
 
