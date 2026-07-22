@@ -40,15 +40,20 @@ class RefixRow:
 
     Positional fields are read the way ``awk`` reads them: whitespace-split, missing fields
     empty. ``kind`` mirrors the ``$5``-or-legacy-``review`` rule; ``is_reset`` is ``$6 == "reset"``.
+    ``ts`` (``$1``, the leading ``date +%s`` epoch every writer — bash's ``record_refix``
+    (``agent-watch.sh:8013``) and Python's ``_append_refix_ledger`` — already stamps) is parsed as
+    an int for HERD-420's completion-window arithmetic; ``0`` when absent/non-numeric (a
+    pre-existing row shape no writer has ever produced, but a short/garbled line must not raise).
     """
 
-    __slots__ = ("pr", "sha", "kind", "is_reset")
+    __slots__ = ("pr", "sha", "kind", "is_reset", "ts")
 
-    def __init__(self, pr, sha, kind, is_reset):
+    def __init__(self, pr, sha, kind, is_reset, ts=0):
         self.pr = pr
         self.sha = sha
         self.kind = kind
         self.is_reset = is_reset
+        self.ts = ts
 
     # A row's kind MATCHES a queried rail exactly, OR the query is "review" and the row's kind
     # is empty (a legacy 4-field bounce). This is the awk clause `($5==k) || (k=="review" && $5=="")`
@@ -61,19 +66,21 @@ def parse_refix_ledger(text):
     """Parse raw ledger text into a list of :class:`RefixRow`, matching awk field-splitting.
 
     ``text`` is the whole ``$REFIX_STATE`` file (or ``""``). Blank lines are skipped exactly as
-    awk skips records with no fields. Field indices mirror the bash: ``$2`` pr, ``$3`` sha,
-    ``$5`` kind, ``$6`` reset marker; a short line leaves the missing fields empty.
+    awk skips records with no fields. Field indices mirror the bash: ``$1`` epoch, ``$2`` pr,
+    ``$3`` sha, ``$5`` kind, ``$6`` reset marker; a short line leaves the missing fields empty.
     """
     rows = []
     for line in text.splitlines():
         f = line.split()
         if not f:
             continue
+        ts_raw = f[0] if len(f) > 0 else ""
         pr = f[1] if len(f) > 1 else ""
         sha = f[2] if len(f) > 2 else ""
         kind = f[4] if len(f) > 4 else ""
         is_reset = (f[5] if len(f) > 5 else "") == "reset"
-        rows.append(RefixRow(pr, sha, kind, is_reset))
+        ts = int(ts_raw) if ts_raw.isdigit() else 0
+        rows.append(RefixRow(pr, sha, kind, is_reset, ts))
     return rows
 
 
@@ -190,6 +197,61 @@ def refix_budget_reason(rows, pr, kind, refix_max_rounds):
     if total >= tcap:
         return "refix limit (%s total rounds across rails) reached" % tcap
     return None
+
+
+# ── post-bounce completion tracking (HERD-420) ───────────────────────────────────────────────
+# A `refix_wake_result` with woke=1 proves the agent's pane came back to "working" — nothing more.
+# Live incident (PR #531): a review-BLOCK bounced the builder, it edited a file, then went back to
+# "done" without ever committing or pushing; the PR head stayed on the blocked sha and the
+# once-guard (refix_attempted) held silently forever, since nothing else re-evaluates a sha the
+# ledger already recorded a bounce for. These two functions are the pure half of the fix: given
+# the ledger and a fresh clock reading, do we owe this (pr, sha, kind) a completion check? The
+# impure half (peeking the live agent status, probing the worktree, spending another round) lives
+# in live_runtime.LiveTick — this module stays read-only arithmetic, as everywhere else in it.
+
+def refix_last_bounce_ts(rows, pr, sha, kind):
+    """The epoch of the MOST RECENT non-reset bounce recorded for this exact ``(pr, sha, kind)``,
+    or ``None`` when there is none. Mirrors :func:`refix_attempted`'s matching rule (exact sha,
+    ``kind_matches`` for the rail) but reports WHEN instead of just IF, so the completion leg can
+    measure elapsed time since the wake this once-guard is holding on. Chronological-scan safe
+    (ledger rows are append-only, but a garbled/reordered ts still picks the max rather than the
+    last-seen, so a clock skew in the underlying file can only ever make the window look LONGER,
+    never shorter — the fail-safe direction for a leg that re-bounces a live builder)."""
+    best = None
+    for r in rows:
+        if r.pr == pr and r.sha == sha and not r.is_reset and r.kind_matches(kind):
+            if best is None or r.ts > best:
+                best = r.ts
+    return best
+
+
+def refix_complete_min_num(value):
+    """``REFIX_COMPLETE_MIN`` in whole minutes, fail-soft — but SHIPS ON (default 10), unlike
+    ``FINISH_STALL_MIN``'s unset-is-off convention, because this leg closes a proven silent-failure
+    class (PR #531) rather than adding new autonomous behavior. Unset/empty/non-numeric all coerce
+    to the documented default (10, matching the capabilities.tsv row); an explicit ``"0"`` (or any
+    non-positive integer) is a REAL opt-out — Byte-identical-when-off (AGENTS.md) still holds via
+    that explicit zero, exercised by the OFF-leg test."""
+    if value is None:
+        return 10
+    s = str(value).strip()
+    if not s or (s[0] in "+-" and not s[1:].isdigit()) or (s[0] not in "+-" and not s.isdigit()):
+        return 10
+    return int(s)
+
+
+def refix_complete_window_elapsed(now_epoch, bounce_ts, complete_min):
+    """True iff at least ``complete_min`` minutes have passed since ``bounce_ts``.
+
+    ``bounce_ts`` of ``None`` (no recorded bounce to measure from — should not happen given the
+    caller only reaches this on an already-attempted once-guard hold, but defensive) or
+    ``complete_min <= 0`` (the leg is off) both hold False, never raise."""
+    if bounce_ts is None or complete_min <= 0:
+        return False
+    try:
+        return (int(now_epoch) - int(bounce_ts)) >= complete_min * 60
+    except (TypeError, ValueError):
+        return False
 
 
 # ── merge-policy resolver (merge-policy.sh) ──────────────────────────────────────────────────

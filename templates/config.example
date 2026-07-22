@@ -679,3 +679,19 @@ HERD_REPO="briankeegan1/herdkit"
 # nudge that does not land, or a SECOND stall after a delivered nudge, it escalates to a needs-you row
 # and stops (terminal — never a runaway loop). Unset (default) leaves this feature entirely off.
 # FINISH_STALL_MIN="30"
+
+# ── Post-bounce completion tracking (HERD-420) ──────────────────────────────────────────────
+# A refix wake (refix_wake_result woke=1) proves the builder's pane came back to "working" — not
+# that it committed or pushed a fix. PR #531: a review-BLOCK bounced the builder, it edited a
+# file, then went back to "done" with the edit never committed/pushed; the sha-keyed once-guard
+# then held silently forever, and the PR sat blocked until a human happened to notice.
+#
+# REFIX_COMPLETE_MIN — minutes after the wake before the watcher checks the SAME (pr, sha)
+# actually shipped. Past this window, if the builder still reads done/idle (a read-only pane
+# peek, never another wake attempt) with no new sha on the PR, the watcher journals
+# refix_incomplete and re-bounces ONCE — through the SAME rail's REFIX_MAX_ROUNDS budget, no
+# parallel path — with a "finish your uncommitted work" prompt; budget exhaustion escalates
+# exactly like a normal BLOCK exhaustion. Ships ON (default 10) — unlike WEDGE_GRACE_MIN /
+# FINISH_STALL_MIN, this closes a proven silent-failure class rather than adding new autonomous
+# behavior. Set to 0 to opt out (byte-identical to pre-HERD-420: the once-guard just holds).
+# REFIX_COMPLETE_MIN="10"

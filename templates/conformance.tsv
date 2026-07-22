@@ -282,6 +282,7 @@ INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+REFIX_COMPLETE_MIN	unit	tests/test-py-live-refix-complete.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh

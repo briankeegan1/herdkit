@@ -105,12 +105,12 @@ class LiveCandidate:
 
     __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
                  "hv_body", "author", "assignees", "labels", "review_decision", "merge_status",
-                 "restale_laps", "agent_status", "wake_succeeds")
+                 "restale_laps", "agent_status", "wake_succeeds", "dirty")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
                  hv_hold=False, approved=False, hv_body="", author="", assignees=None,
                  labels=None, review_decision="", merge_status="", restale_laps=0,
-                 agent_status="", wake_succeeds=True):
+                 agent_status="", wake_succeeds=True, dirty=False):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
@@ -142,6 +142,11 @@ class LiveCandidate:
         # agent to "working".
         self.agent_status = str(agent_status or "")
         self.wake_succeeds = bool(wake_succeeds) if wake_succeeds is not None else True
+        # FIXTURE-ONLY worktree-dirty surface (HERD-420, the same pattern as agent_status/
+        # wake_succeeds above): DryRunActuator.worktree_dirty reads this directly; LiveActuator
+        # ignores it and probes the real worktree (see _worktree_dirty). Absent -> False, so no
+        # fixture written before this task changes shape.
+        self.dirty = bool(dirty)
 
     @classmethod
     def from_dict(cls, d):
@@ -154,6 +159,7 @@ class LiveCandidate:
             review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
             restale_laps=d.get("restale_laps", 0),
             agent_status=d.get("agent_status", ""), wake_succeeds=d.get("wake_succeeds", True),
+            dirty=d.get("dirty", False),
         )
 
 
@@ -1659,6 +1665,18 @@ class DryRunActuator:
         posted) so the side-effect-free VERIFY column never records a blessing it did not actually land."""
         return False
 
+    def peek_status(self, cand):
+        """HERD-420: a READ-ONLY pane-status check — unlike :meth:`wake_builder`, never types
+        anything. Simulated straight off the fixture's ``agent_status`` (the same field
+        ``wake_builder`` reads); no legacy-sentinel special case here — an unset ``""`` genuinely
+        means "not modeled by this fixture", so the completion leg (which requires an observed
+        done/idle) correctly no-ops on every pre-HERD-420 fixture."""
+        return cand.agent_status
+
+    def worktree_dirty(self, cand):
+        """HERD-420: the fixture's scripted dirty bit — see :attr:`LiveCandidate.dirty`."""
+        return bool(cand.dirty)
+
 
 # ── merge actuation config (MERGE_METHOD + DELETE_BRANCH_ON_MERGE, HERD-354) ──────────────────────
 # The live merge actuator must honor the SAME two knobs bash do_merge composes into `gh pr merge`
@@ -1870,6 +1888,31 @@ class LiveActuator:
         status_after, _ = self._agent_lookup(slug)
         return WakeResult(status_before, status_after or status_before, False)
 
+    def peek_status(self, cand):
+        """HERD-420: a READ-ONLY pane-status read for the post-bounce completion check — the same
+        fresh ``herdr agent list`` roster :meth:`wake_builder` consults, but never types into the
+        pane. Reuses ``_agent_lookup`` (multi-seat contract: always the observed roster, never a
+        dispatching seat's cache)."""
+        return self._agent_lookup(cand.slug)[0]
+
+    def worktree_dirty(self, cand):
+        """HERD-420: True iff ``cand.worktree`` carries UNCOMMITTED TRACKED changes (staged or
+        unstaged) — untracked files do NOT count, mirroring bash's narrow ``_finish_stall_dirty``
+        (agent-watch.sh:10813) rather than wedge's broader definition: a stray scratch file must
+        not read as "the fix is sitting right there uncommitted." Fail-soft: no worktree path, or
+        any git-status fault, reads as clean (never escalates the round on a probe failure)."""
+        if not cand.worktree:
+            return False
+        try:
+            out = subprocess.run(["git", "-C", cand.worktree, "status", "--porcelain"],
+                                 capture_output=True, text=True, timeout=10)
+        except Exception:
+            return False
+        for line in (out.stdout or "").splitlines():
+            if not line.startswith("??"):
+                return True
+        return False
+
 
 # ── the live tick: the minimal correct loop ───────────────────────────────────────────────────────
 
@@ -1997,7 +2040,21 @@ class LiveTick:
                 "Fix every issue the reviewer raised, run the healthcheck, push your fix, and "
                 "reply to the review comment once done." % (cand.pr, cand.pr))
 
-    def _bounce_and_wake(self, cand, kind, round_num, rule):
+    def _refix_finish_prompt(self, cand, kind):
+        """HERD-420: the post-bounce completion nudge — distinct from :meth:`_refix_prompt` because
+        the builder does not need to be told the ORIGINAL problem again (it already woke for that);
+        it needs to be told the wake did not finish the job. Grounding incident: PR #531 woke,
+        edited ``bin/herd``, then read done again with the edit never committed or pushed — the PR
+        head sat on the still-blocked sha with nobody watching for exactly this gap."""
+        return ("PR #%s: you were re-tasked for a %s failure and your pane went back to idle/done, "
+                "but no new commit has reached this PR — the head sha is still %s. If you have "
+                "uncommitted or unpushed work in your worktree, finish it now: commit it, push it, "
+                "and confirm (git log / gh pr view %s) that the PR head sha moved. If you believe "
+                "the fix already left the worktree, run git status and git log again — something "
+                "did not make it out." % (cand.pr, "healthcheck" if kind == "health" else "review",
+                                          cand.sha, cand.pr))
+
+    def _bounce_and_wake(self, cand, kind, round_num, rule, prompt=None):
         """Record the bounce, ALWAYS verify + journal the wake, and escalate immediately (with the
         round refunded) when nobody actually woke (HERD-370).
 
@@ -2017,9 +2074,11 @@ class LiveTick:
              must not count against the rail's budget (a later, ACTUALLY-woken bounce starts clean).
 
         Returns :data:`BLOCK` (bounce landed on a live builder, wait for its push) or :data:`ESCALATE`
-        (nobody is on it — needs-you).
+        (nobody is on it — needs-you). ``prompt`` overrides the canned re-task text — the HERD-420
+        completion leg passes its own "finish your uncommitted work" nudge through this same seam
+        rather than the original problem statement.
         """
-        prompt = self._refix_prompt(cand, kind)
+        prompt = prompt if prompt is not None else self._refix_prompt(cand, kind)
         wake = self.actuator.wake_builder(cand, prompt)
         status_before = wake.status_before or "unknown"
         self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
@@ -2040,6 +2099,70 @@ class LiveTick:
                             "slug", cand.slug, "kind", kind, "reason", "no-live-builder",
                             "agent_status", wake.status_after or status_before)
         return ESCALATE
+
+    _DONE_IDLE_STATUSES = ("done", "idle")
+
+    def _refix_completion_incomplete(self, cand, kind):
+        """HERD-420: the post-bounce COMPLETION check, reached only when :meth:`_refix_check_and_record`
+        found the once-guard already holding (this exact ``(pr, sha, kind)`` has a recorded bounce, so
+        the sha has not moved since). A paired ``refix_wake_result`` with ``woke=1`` proves the agent's
+        pane came back to "working" — it does NOT prove the agent committed or pushed anything. Live
+        incident: PR #531 woke, edited ``bin/herd``, then went back to "done" with the edit still sitting
+        uncommitted in the worktree; the once-guard held silently and the PR sat BLOCKED on the same sha
+        indefinitely, caught only because a human happened to look.
+
+        If ``REFIX_COMPLETE_MIN`` minutes have passed since THIS round's bounce (:func:`D.refix_last_bounce_ts`)
+        and the agent now reads done/idle again (a fresh, non-mutating :meth:`peek_status` — never another
+        wake attempt), the round is INCOMPLETE: journal ``refix_incomplete`` (pr, sha, slug, kind, round,
+        agent_status, dirty), then spend ANOTHER round of the SAME rail's budget through the SAME
+        machinery :meth:`_refix_check_and_record`'s fresh-bounce branch uses (budget check, ledger
+        append, :meth:`_bounce_and_wake`) — no parallel path, no separate cap. Budget exhausted → the
+        same needs-you escalation the normal BLOCK path uses. A completion re-bounce re-arms the
+        once-guard with a NEW bounce row/timestamp, so a LATER incomplete round (another full window
+        with still no push) is a genuinely fresh detection, not a retrigger of this one — the state.once
+        guard below is keyed on this round's bounce_ts specifically so it fires exactly once per round.
+
+        Returns :data:`BLOCK` / :data:`ESCALATE` when the completion leg acted this tick, or ``None``
+        when it does not apply (disabled, window not yet elapsed, agent still working/unreadable, or
+        already handled this round) — the caller falls back to a plain silent :data:`BLOCK`, byte-identical
+        to pre-HERD-420 behavior."""
+        complete_min = D.refix_complete_min_num(self.config.get("REFIX_COMPLETE_MIN"))
+        if complete_min <= 0:
+            return None
+        state_dir = self.state.dir
+        rows = D.parse_refix_ledger(_read_refix_ledger(state_dir))
+        pr_str, sha_str = str(cand.pr), str(cand.sha)
+        bounce_ts = D.refix_last_bounce_ts(rows, pr_str, sha_str, kind)
+        if not D.refix_complete_window_elapsed(_now_epoch(), bounce_ts, complete_min):
+            return None
+        status = str(self.actuator.peek_status(cand) or "")
+        if status not in self._DONE_IDLE_STATUSES:
+            return None
+        # AT-MOST-ONCE per round: keyed on bounce_ts so a later round (a fresh bounce row, a fresh
+        # timestamp) gets its own detection rather than being swallowed by this marker.
+        if not self.state.once(cand.pr, cand.sha, "refix_incomplete_%s_%s" % (kind, bounce_ts)):
+            return None
+        dirty = self.actuator.worktree_dirty(cand)
+        round_before = D.refix_rail_count(rows, pr_str, kind)
+        self.journal.append("refix_incomplete", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                            "kind", kind, "round", round_before, "agent_status", status,
+                            "dirty", "yes" if dirty else "no")
+        reason = D.refix_budget_reason(rows, pr_str, kind, self.config.get("REFIX_MAX_ROUNDS"))
+        if reason:
+            if self.state.once(cand.pr, cand.sha, "refix_escalated_%s" % kind):
+                total = D.refix_total_count(rows, pr_str)
+                self.journal.append(
+                    "refix_escalated" if kind == "review" else "health_refix_escalated",
+                    "pr", cand.pr, "sha", cand.sha, "slug", cand.slug, "rounds", total,
+                    "reason", reason + " — builder went silent without shipping a fix")
+            return ESCALATE
+        round_num = round_before + 1
+        slug = str(cand.slug) if cand.slug else "-"
+        _append_refix_ledger(state_dir,
+                             "%s %s %s %s %s\n" % (_now_epoch(), cand.pr, cand.sha, slug, kind))
+        rule = "healthcheck" if kind == "health" else "review"
+        return self._bounce_and_wake(cand, kind, round_num, rule,
+                                     prompt=self._refix_finish_prompt(cand, kind))
 
     def _gate_status_enabled(self):
         """GATE_STATUS master lever — ``off`` disables the herd/gates commit-status post entirely
@@ -2193,7 +2316,10 @@ class LiveTick:
             if round_num is None and reason is None:
                 # Once-guard: already bounced for this (pr, sha, kind) — hold silently while the
                 # agent works (bash: refix_attempted true + _active_fix_note check at :8334-8338).
-                return BLOCK
+                # HERD-420: unless REFIX_COMPLETE_MIN has elapsed with the agent back to done/idle
+                # and still no new sha — then this is an INCOMPLETE round, not a live one.
+                outcome = self._refix_completion_incomplete(cand, "health")
+                return outcome if outcome is not None else BLOCK
             if reason is not None:
                 # Budget exhausted → needs-you escalation, no bounce.
                 if self.state.once(cand.pr, cand.sha, "refix_escalated_health"):
@@ -2233,7 +2359,10 @@ class LiveTick:
             round_num, reason = self._refix_check_and_record(cand, "review")
             if round_num is None and reason is None:
                 # Once-guard: already bounced for this (pr, sha, kind) — hold silently.
-                return BLOCK
+                # HERD-420: unless REFIX_COMPLETE_MIN has elapsed with the agent back to done/idle
+                # and still no new sha — then this is an INCOMPLETE round, not a live one.
+                outcome = self._refix_completion_incomplete(cand, "review")
+                return outcome if outcome is not None else BLOCK
             if reason is not None:
                 # Budget exhausted → needs-you escalation, no bounce.
                 if self.state.once(cand.pr, cand.sha, "refix_escalated_review"):
@@ -2358,7 +2487,7 @@ def _config_from_env(scenario=None):
     # can read it from the SAME dict this tick already builds. Nothing in this module branches on it
     # yet — the key is inert here, read only by the unwired adapter skeleton.
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
-              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS",
+              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
               "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND")
              + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
