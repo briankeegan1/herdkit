@@ -5583,6 +5583,7 @@ MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALA
 MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
 MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
 CHECKOUT_CLEAN_STATE="$TREES/.agent-watch-checkout-clean" # HERD-361: the shared-checkout cleanliness violation signature (absent = clean); drives the row + dedups the journal
+CHECKOUT_CLEAN_PENDING="$TREES/.agent-watch-checkout-clean.pending" # HERD-414: one-tick-old offender signature; a signature must repeat here before it is promoted into CHECKOUT_CLEAN_STATE
 
 # _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
 # MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
@@ -6040,11 +6041,21 @@ reconcile_main_freshness() {
 # naming the offending paths. It NEVER discards (no git reset/checkout/clean) — the staged diff is the
 # evidence a human needs to root-cause. Deduped per (head + detached + path-set) so a standing violation
 # journals once; the console row paints every tick it stands. Fully fail-soft; never blocks a tick.
+#
+# HERD-414: two false-red fixes, both aimed at the scribe's own sanctioned $BACKLOG_FILE write-to-commit
+# window under SCRIBE_BACKEND=file, which a bare sample can catch mid-flight on an otherwise healthy repo:
+#   (1) EXEMPTION — _checkout_offenders drops the exact configured $BACKLOG_FILE, but ONLY while the
+#       active backend is 'file' (see _checkout_exempt_backlog). Any other backend never touches it from
+#       $MAIN, so a dirty $BACKLOG_FILE there stays a real offender.
+#   (2) DEBOUNCE — reconcile_checkout_cleanliness requires the SAME offender signature on 2 consecutive
+#       ticks (tracked in $CHECKOUT_CLEAN_PENDING) before it is promoted into $CHECKOUT_CLEAN_STATE (the
+#       row + the journal). A one-tick sample that resolves clean next tick never raises anything.
 
 # _checkout_offenders — emit, one repo-relative path per line, every $MAIN path that is STAGED (index
 # differs from HEAD) or tracked-MODIFIED in the worktree, EXCLUDING untracked scratch (?? — not a
-# tracked modification) and the regenerable derived files a refresh commit legitimately owns (the
-# render/config-local set via herd_strip_derived, plus docs/codemap.md + docs/symbol-index.md).
+# tracked modification), the regenerable derived files a refresh commit legitimately owns (the
+# render/config-local set via herd_strip_derived, plus docs/codemap.md + docs/symbol-index.md), and —
+# only under SCRIBE_BACKEND=file — the configured $BACKLOG_FILE (see _checkout_exempt_backlog, HERD-414).
 _checkout_offenders() {
   git -C "$MAIN" status --porcelain 2>/dev/null | while IFS= read -r _co_line; do
     [ -n "$_co_line" ] || continue
@@ -6055,7 +6066,20 @@ _checkout_offenders() {
       case "$_co_path" in *' -> '*) _co_path="${_co_path##* -> }" ;; esac   # rename "orig -> new" → report new
       printf '%s\n' "$_co_path"
     fi
-  done | herd_strip_derived | grep -vxE 'docs/(codemap|symbol-index)\.md' || true
+  done | herd_strip_derived | grep -vxE 'docs/(codemap|symbol-index)\.md' | _checkout_exempt_backlog || true
+}
+
+# _checkout_exempt_backlog — HERD-414: filter, read repo-relative paths on stdin, drop the configured
+# $BACKLOG_FILE IFF the active scribe backend is 'file' — the file backend's write-then-commit is its
+# own sanctioned mutation of $MAIN, not foreign contamination, and a bare tick sample can catch it
+# mid-window on a perfectly healthy repo. Under any OTHER backend the scribe never writes $BACKLOG_FILE
+# from $MAIN, so a dirty one there is real and must keep reding. Exact configured path only, never a glob.
+_checkout_exempt_backlog() {
+  if [ "${SCRIBE_BACKEND:-file}" = "file" ] && [ -n "${BACKLOG_FILE:-}" ]; then
+    grep -vxF "$BACKLOG_FILE" || true
+  else
+    cat
+  fi
 }
 
 # reconcile_checkout_cleanliness — call once per watcher tick (after the freshness reconciles so it
@@ -6063,30 +6087,40 @@ _checkout_offenders() {
 # journal, no row). A $MAIN parked on some OTHER named branch is a human's deliberate state → out of
 # scope. A DETACHED HEAD is itself a violation of "attached to the default branch" (reconcile_main_
 # freshness owns the reattach; here it is only recorded as part of the cleanliness signal — never
-# discarded). Records the violation signature to $CHECKOUT_CLEAN_STATE for the row and dedups the journal.
+# discarded). HERD-414: a dirty signature is DEBOUNCED through $CHECKOUT_CLEAN_PENDING — it must repeat
+# on the very next tick, unchanged, before it is promoted into $CHECKOUT_CLEAN_STATE for the row and the
+# journal, so a one-tick sample of a write-then-commit window that resolves clean by the next tick never
+# raises. Records the promoted violation signature to $CHECKOUT_CLEAN_STATE for the row and dedups the journal.
 reconcile_checkout_cleanliness() {
   [ -n "${DRYRUN:-}" ] && return 0
   [ -n "${MAIN:-}" ] || return 0
   { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 0
-  local _cc_sref _cc_head _cc_detached="" _cc_offenders _cc_key _cc_prev _cc_paths
+  local _cc_sref _cc_head _cc_detached="" _cc_offenders _cc_key _cc_prev _cc_pending _cc_paths
   _cc_sref="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   if [ -n "$_cc_sref" ] && [ "$_cc_sref" != "${HERD_BRANCH_NAME:-main}" ]; then
-    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true        # parked on another branch → out of scope, clear
+    rm -f "$CHECKOUT_CLEAN_STATE" "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true  # parked on another branch → out of scope, clear
     return 0
   fi
   [ -z "$_cc_sref" ] && _cc_detached="detached"
   _cc_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_cc_head" ] || return 0
   _cc_offenders="$(_checkout_offenders)"
-  # Clean AND attached → drop any standing row (byte-inert happy path).
+  # Clean AND attached → drop any standing row AND any in-progress debounce (byte-inert happy path).
   if [ -z "$_cc_offenders" ] && [ -z "$_cc_detached" ]; then
-    rm -f "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true
+    rm -f "$CHECKOUT_CLEAN_STATE" "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true
+    return 0
+  fi
+  _cc_key="$_cc_head|${_cc_detached:-attached}|$(printf '%s' "$_cc_offenders" | tr '\n' ',')"
+  mkdir -p "$TREES" 2>/dev/null || true
+  # DEBOUNCE: promote only on the signature's SECOND consecutive sighting. First sighting just parks
+  # it in $CHECKOUT_CLEAN_PENDING and returns — no state file, no journal, no row this tick.
+  _cc_pending="$(sed -n '1p' "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true)"
+  if [ "$_cc_pending" != "$_cc_key" ]; then
+    printf '%s\n' "$_cc_key" > "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true
     return 0
   fi
   # Dedup the journal per (head + detached + offender-set); the console row is re-derived each tick.
-  _cc_key="$_cc_head|${_cc_detached:-attached}|$(printf '%s' "$_cc_offenders" | tr '\n' ',')"
   _cc_prev="$(sed -n '1p' "$CHECKOUT_CLEAN_STATE" 2>/dev/null || true)"
-  mkdir -p "$TREES" 2>/dev/null || true
   # State file: line 1 = dedup signature; line 2 = head; line 3 = detached flag; lines 4+ = offenders.
   {
     printf '%s\n' "$_cc_key"
