@@ -83,9 +83,10 @@ was_closed()    { grep -qxF "$1" "$CLOSED" 2>/dev/null; }
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 # agents_json <slug>...  — a driver roster JSON naming a live resolve·<slug> agent for each slug.
+# HERD-418: herdr stores the SANITIZED name, never the raw dotted role — mirror that here.
 agents_json() {
   local names="" s
-  for s in "$@"; do names="${names:+$names, }{\"name\": \"resolve·$s\", \"agent_status\": \"working\"}"; done
+  for s in "$@"; do names="${names:+$names, }{\"name\": \"$(herd_agent_name_sanitize "resolve·$s")\", \"agent_status\": \"working\"}"; done
   printf '{"result":{"agents":[%s]}}' "$names"
 }
 # pr_list "slug mergeable" ...  — fixture open-PR list (branch feat/<slug>, given mergeable state).
