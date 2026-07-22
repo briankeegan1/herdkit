@@ -363,7 +363,10 @@ herd_driver_report_agent() {
   [ -n "$slug" ] && [ -n "$pane" ] || return 0
   _herd_driver_is_headless && return 0
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr pane report-agent "$pane" --agent "$slug" --state "$state" >/dev/null 2>&1 || true
+  # herdr 0.7.5 made --source REQUIRED (issue #514 fallout); older herdr may not know the flag, so
+  # fall back to the bare shape it accepted. Best-effort either way (the fail-soft contract above).
+  herdr pane report-agent "$pane" --source herd --agent "$slug" --state "$state" >/dev/null 2>&1 \
+    || herdr pane report-agent "$pane" --agent "$slug" --state "$state" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -879,6 +882,113 @@ herd_driver_focus_agent() {
   return 0
 }
 
+# ── herdr agent-start CLI bridge (issue #514) ──────────────────────────────────────────────────────
+# herdr 0.7.5 (protocol 17) replaced the pane-CREATING `agent start <name> --workspace … --cwd …
+# --tab … [--split …] --no-focus [--env K=V]… -- <runtime argv>` with an ATTACH contract:
+#     herdr agent start <NAME> --kind <KIND> --pane <ID> [-- <AGENT_ARG>…]
+# Pane creation moved to `tab create` / `pane split` (which own --env now — `agent start` has none),
+# and --kind names the runtime's canonical executable, which herdr PREPENDS itself — so the argv
+# after `--` must NOT repeat it (proven live: `-- --model …` yielded argv ["claude","--model",…]).
+# Other machines still run pre-0.7.5 herdr (fail-soft portability), so BOTH CLIs are supported: a
+# one-time per-process capability probe picks the path, and the old argv stays byte-identical.
+# The attach result still carries result.agent.pane_id, so every existing stdout parser holds.
+
+# _herd_herdr_attach_cli — success iff the installed herdr speaks the attach CLI (its
+# `agent start --help` documents --pane). Probed ONCE per process (cached in a plain global —
+# bash-3.2 safe); HERD_HERDR_ATTACH_CLI=yes|no bypasses the probe (tests / a wedged herdr).
+_herd_herdr_attach_cli() {
+  case "${HERD_HERDR_ATTACH_CLI:-}" in yes) return 0 ;; no) return 1 ;; esac
+  if [ -z "${_HERD_HERDR_ATTACH_CACHE:-}" ]; then
+    local _hs_help; _hs_help="$(herdr agent start --help 2>&1 || true)"
+    case "$_hs_help" in
+      *--pane*) _HERD_HERDR_ATTACH_CACHE=yes ;;
+      *)        _HERD_HERDR_ATTACH_CACHE=no ;;
+    esac
+  fi
+  [ "$_HERD_HERDR_ATTACH_CACHE" = yes ]
+}
+
+# herd_driver_agent_herdr_kind <driver> <rt0> — the --kind value for the attach CLI: an explicit
+# DRIVER_AGENT_HERDR_KIND binding wins (the escape hatch for a runtime whose binary name is not its
+# herdr kind), else the basename of the composed argv[0] — exact for every shipped driver (claude /
+# codex / grok name their binaries after their kind). A runtime herdr does not know then fails LOUD
+# at `agent start` (herdr rejects the kind) instead of silently running claude; an empty argv
+# degrades to claude, the default runtime.
+herd_driver_agent_herdr_kind() {
+  local drv="${1:-}" rt0="${2:-}" k
+  k="$(herd_driver_agent_value DRIVER_AGENT_HERDR_KIND "" "$drv")"
+  [ -n "$k" ] || k="${rt0##*/}"
+  printf '%s' "${k:-claude}"
+}
+
+# _herd_herdr_tab_root_pane <tab> — the FIRST pane herdr lists for <tab>: a lane-created tab holds
+# exactly its root at launch time, and for a shared tab the first-listed pane is the root the splits
+# hang off (`tab get` carries no pane ids). Empty on any failure — fail-soft.
+_herd_herdr_tab_root_pane() {
+  local tab="${1:-}"
+  [ -n "$tab" ] || return 0
+  herdr pane list 2>/dev/null | TAB="$tab" python3 -c '
+import sys, json, os
+tab = os.environ["TAB"]
+try:
+  for p in (json.load(sys.stdin).get("result") or {}).get("panes") or []:
+    if p.get("tab_id") == tab:
+      print(p.get("pane_id", "") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# herd_driver_herdr_attach_agent <name> <driver> <root-pane> <cwd> <split> <focus> [K=V …] -- <rt …>
+# The attach-CLI launch, shared by every herdr spawn site: give the agent its OWN pane — split
+# <root-pane> when <split> is right|down (env pairs ride `pane split --env`, the pane-creating
+# command, so they still reach the agent through the pane's shell), attach straight to <root-pane>
+# when <split> is empty — then `agent start <name> --kind … --pane … -- <rt minus argv[0]>`.
+# stdout = the `agent start` JSON (result.agent.pane_id — the shape the lanes' parsers consume);
+# returns the launch status. A REQUESTED split that yields no pane is a hard failure: attaching to
+# the root instead would type over a neighbour pane (the #249 incident class), never fail-soft that.
+herd_driver_herdr_attach_agent() {
+  local an_name="$1" an_driver="$2" an_root="$3" an_cwd="$4" an_split="$5" an_focus="$6"
+  shift 6
+  local -a an_env=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do an_env+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  local pane="$an_root"
+  if [ -n "$an_split" ]; then
+    local -a sp=(herdr pane split "$an_root" --direction "$an_split" --cwd "$an_cwd")
+    local _kv
+    for _kv in ${an_env[@]+"${an_env[@]}"}; do sp+=(--env "$_kv"); done
+    if [ "$an_focus" = "yes" ]; then sp+=(--focus); else sp+=(--no-focus); fi
+    pane="$("${sp[@]}" 2>/dev/null | python3 -c '
+import sys, json
+try:
+  print((json.load(sys.stdin)["result"]["pane"]["pane_id"]) or "", end="")
+except Exception:
+  pass
+' 2>/dev/null || true)"
+    [ -n "$pane" ] || return 1
+  fi
+  local kind; kind="$(herd_driver_agent_herdr_kind "$an_driver" "${1:-}")"
+  [ $# -gt 0 ] && shift   # drop argv[0]: --kind names the canonical executable; herdr prepends it
+  # A just-created pane may not have finished spawning its shell yet — herdr refuses the attach with
+  # agent_pane_busy (an error JSON on STDERR) until the pane sits at an available prompt (observed
+  # live on a scripted split→start). Bounded retry (~10s) instead of a racy sleep; the last attempt's
+  # stdout (the JSON the callers parse) / stderr / exit status flow through on their own streams.
+  local out rc try=0 errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/herd-attach-err.XXXXXX" 2>/dev/null)" || errf=/dev/null
+  while :; do
+    out="$(herdr agent start "$an_name" --kind "$kind" --pane "$pane" -- "$@" 2>"$errf")"; rc=$?
+    [ "$rc" -eq 0 ] && break
+    case "$out$(cat "$errf" 2>/dev/null)" in *agent_pane_busy*) ;; *) break ;; esac
+    try=$((try+1)); [ "$try" -ge 20 ] && break
+    sleep 0.5
+  done
+  [ -n "$out" ] && printf '%s\n' "$out"
+  [ -s "$errf" ] && cat "$errf" >&2
+  [ "$errf" != /dev/null ] && rm -f "$errf" 2>/dev/null
+  return "$rc"
+}
+
 # ── start-agent ──────────────────────────────────────────────────────────────────────────────────
 # herd_driver_start_agent <slug> <worktree> <model> <flags> <pointer> [split] — spawn a builder agent
 # on a task. herdr-claude: a fresh herdr tab + `herdr agent start … claude`. headless: a DETACHED
@@ -932,12 +1042,24 @@ _herd_herdr_start_agent() {
   # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
-  # HERD-171: inject ANTHROPIC_BASE_URL as --env when set (no-op / byte-identical when unset).
-  local -a envargs=(); local _ep
-  while IFS= read -r _ep; do [ -n "$_ep" ] && envargs+=(--env "$_ep"); done < <(herd_driver_endpoint_env_lines)
-  # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
-  if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus "${envargs[@]}" -- "${rt[@]}" >/dev/null 2>&1; then
-    return 0
+  # HERD-171: inject ANTHROPIC_BASE_URL when set (no-op / byte-identical when unset).
+  local -a envkv=(); local _ep
+  while IFS= read -r _ep; do [ -n "$_ep" ] && envkv+=("$_ep"); done < <(herd_driver_endpoint_env_lines)
+  if _herd_herdr_attach_cli; then
+    # herdr ≥0.7.5 (issue #514): the tab root stays an idle shell (the lane's preview/task-spec pane);
+    # the agent gets its own split pane — the same layout the old --tab/--split argv produced. An
+    # unspecified split direction defaults right, the old own-pane placement.
+    if herd_driver_herdr_attach_agent "$slug" "${rt_driver:-}" "$root" "$wt" "${split:-right}" "" \
+         ${envkv[@]+"${envkv[@]}"} -- "${rt[@]}" >/dev/null 2>&1; then
+      return 0
+    fi
+  else
+    local -a envargs=()
+    for _ep in ${envkv[@]+"${envkv[@]}"}; do envargs+=(--env "$_ep"); done
+    # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
+    if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus ${envargs[@]+"${envargs[@]}"} -- "${rt[@]}" >/dev/null 2>&1; then
+      return 0
+    fi
   fi
   # HERD-136: agent start failed after we created the tab — close it so no empty corpse tab lingers,
   # then journal the reap (guarded: not every caller of this helper sources journal.sh).
@@ -1041,11 +1163,48 @@ herd_driver_launch_agent() {
     return
   fi
 
-  # herdr-claude: build the exact argv the lane hardcoded (indexed array — bash-3.2 safe). The MUX
-  # prefix (herdr agent start …) is the active driver's; the RUNTIME tail (after `--`) is composed from
-  # the RESOLVED runtime driver's DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2) instead of hardcoded.
+  # herdr-claude: the RUNTIME tail (after `--`) is composed from the RESOLVED runtime driver's
+  # DRIVER_AGENT_INTERACTIVE_SPAWN binding (P2); the MUX prefix depends on the installed herdr CLI
+  # (issue #514) — the attach CLI on ≥0.7.5, the byte-identical pre-0.7.5 argv otherwise.
   local ws
   if [ "$sa_ws_set" = 1 ]; then ws="$sa_ws"; else ws="$(herd_resolve_workspace_id 2>/dev/null || true)"; fi
+  local -a rt=(); local _t
+  while IFS= read -r -d '' _t; do rt+=("$_t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
+  if _herd_herdr_attach_cli; then
+    local -a envkv=(); local _l
+    if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && envkv+=("$_l"); done <<< "$sa_env"; fi
+    local base="" atsplit="$sa_split"
+    if [ -n "$sa_tab" ]; then
+      # A pre-created tab: the agent gets its OWN pane split off the tab's root — the old
+      # `agent start --tab` shape, whose root stayed an idle shell some lanes reuse (the quick
+      # lane's task-spec viewer). No caller split direction → right, the old own-pane placement.
+      base="$(_herd_herdr_tab_root_pane "$sa_tab")"
+      [ -n "$base" ] || { printf '⚠️  driver: launch-agent found no pane in tab %s for %s\n' "$sa_tab" "$sa_name" >&2; return 1; }
+      [ -n "$atsplit" ] || atsplit=right
+    else
+      # No tab given (the old CLI let `agent start` create everything): create one and attach
+      # straight to its root — env pairs ride `tab create --env`, the pane-creating command.
+      local -a tc=(herdr tab create)
+      [ -n "$ws" ] && tc+=(--workspace "$ws")
+      tc+=(--cwd "$sa_cwd" --label "$sa_name")
+      local _kv
+      for _kv in ${envkv[@]+"${envkv[@]}"}; do tc+=(--env "$_kv"); done
+      if [ "$sa_focus" = "yes" ]; then tc+=(--focus); else tc+=(--no-focus); fi
+      base="$("${tc[@]}" 2>/dev/null | python3 -c '
+import sys, json
+try:
+  print((json.load(sys.stdin)["result"]["root_pane"]["pane_id"]) or "", end="")
+except Exception:
+  pass
+' 2>/dev/null || true)"
+      [ -n "$base" ] || { printf '⚠️  driver: launch-agent could not create a tab for %s\n' "$sa_name" >&2; return 1; }
+      atsplit=""; envkv=()   # env + focus already applied at tab create; attach to the fresh root
+    fi
+    herd_driver_herdr_attach_agent "$sa_name" "$sa_driver" "$base" "$sa_cwd" "$atsplit" "$sa_focus" \
+      ${envkv[@]+"${envkv[@]}"} -- "${rt[@]}"
+    return
+  fi
+  # pre-0.7.5 herdr: build the exact argv the lane hardcoded (indexed array — bash-3.2 safe).
   local -a argv
   argv=(herdr agent start "$sa_name")
   [ -n "$ws" ] && argv+=(--workspace "$ws")
@@ -1054,9 +1213,7 @@ herd_driver_launch_agent() {
   [ -n "$sa_split" ] && argv+=(--split "$sa_split")
   [ "$sa_focus" != "yes" ] && argv+=(--no-focus)
   if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && argv+=(--env "$_l"); done <<< "$sa_env"; fi
-  argv+=(--)
-  local _t
-  while IFS= read -r -d '' _t; do argv+=("$_t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
+  argv+=(-- "${rt[@]}")
   "${argv[@]}"
 }
 

@@ -205,7 +205,9 @@ if cmd == "pane rename":
     save(s); emit({"type": "ok"})
 
 if cmd == "pane report-agent":
-    pane = args[2]; custom = opt("--custom-status"); st = opt("--state", "unknown")
+    # herdr 0.7.5 renamed the custom-status word to --message (issue #514); model BOTH so the
+    # scenario's new-first/old-fallback report helper lands the word on either CLI generation.
+    pane = args[2]; custom = opt("--custom-status") or opt("--message"); st = opt("--state", "unknown")
     for _, _, p_id, p in all_panes(s):
         if p_id == pane:
             p["agent"] = opt("--agent"); p["agent_status"] = custom if custom else st
@@ -227,6 +229,11 @@ if cmd == "pane run":
                                             stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     p["fg_pid"] = proc.pid; p["fg_cmd"] = runcmd
+                    # `exec <cmd>` replaces the pane's shell, so the command BECOMES the pane root
+                    # (shell_pid == its pid) — the claude-as-root shape the scenario stands up
+                    # CLI-agnostically since issue #514 (0.7.5 agent start can't launch a stub).
+                    if runcmd.strip().startswith("exec "):
+                        p["fg_root"] = True
                     save(s)
                 except Exception:
                     pass

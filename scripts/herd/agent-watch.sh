@@ -10371,8 +10371,22 @@ _respawn_builder_in_worktree() {
   [ -n "$_rw_tab" ] || { printf '⚠️  herdkit: could not create a tab to auto-respawn %s\n' "$_rw_slug" >&2; return 1; }
   # Register in the sweep allowlist so only engine-created tabs are ever swept (mirrors the lane).
   printf '%s %s builder\n' "$_rw_slug" "$_rw_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
-  # shellcheck disable=SC2086  # $_rw_flags intentionally word-splits (mirrors the lane's $CLAUDE_FLAGS).
-  if herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- claude --model "$_rw_model" $_rw_flags "$_rw_ptr" >/dev/null 2>&1; then
+  # Resolve the (possibly runtime-qualified) model ref and compose the runtime tail through the
+  # driver seam (HERD-150 P2) — the same composition the lanes use, no hardcoded claude outside the
+  # seam. Byte-identical to the old inline `claude --model … <flags> "<ptr>"` for a bare model.
+  local _rw_res _rw_driver
+  _rw_res="$(herd_model_resolve "$_rw_model")" || return 1
+  _rw_driver="${_rw_res%%$'\t'*}"; _rw_model="${_rw_res#*$'\t'}"
+  local -a _rw_rt=(); local _rw_t
+  while IFS= read -r -d '' _rw_t; do _rw_rt+=("$_rw_t"); done < <(herd_driver_agent_spawn_argv "$_rw_driver" "$_rw_model" "$_rw_flags" "$_rw_ptr")
+  # Launch through the shared herdr CLI bridge (issue #514): the attach CLI splits the fresh tab's
+  # root and attaches (same one-pane-right layout); pre-0.7.5 keeps the byte-identical argv.
+  # shellcheck disable=SC2086  # $_rw_wsid intentionally word-splits (mirrors the lane's args).
+  if _herd_herdr_attach_cli; then
+    if herd_driver_herdr_attach_agent "$_rw_slug" "$_rw_driver" "$_rw_root" "$_rw_wt" right "" -- "${_rw_rt[@]}" >/dev/null 2>&1; then
+      return 0
+    fi
+  elif herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- "${_rw_rt[@]}" >/dev/null 2>&1; then
     return 0
   fi
   # agent start FAILED after the tab was already created — the exact HERD-136 corpse-tab shape: a

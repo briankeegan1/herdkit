@@ -153,6 +153,15 @@ except Exception:
 ' "$1" 2>/dev/null
 }
 
+# report_agent_done <pane> <slug> — flip a stub agent's reported status word to 'done'. herdr 0.7.5
+# renamed the custom-status word to `--message` (issue #514 fallout: --custom-status is gone; herdr
+# surfaces the message word as agent_status); older herdr still speaks --custom-status. Try new,
+# fall back to old — best-effort either way (the pre-#514 call was already `|| true`).
+report_agent_done() {
+  herdr pane report-agent "$1" --source rp-sim --agent "$2" --state idle --message "done" >/dev/null 2>&1 \
+    || herdr pane report-agent "$1" --source rp-sim --agent "$2" --state idle --custom-status "done" >/dev/null 2>&1 || true
+}
+
 # take_screenshot <label> — macOS screencapture at a checkpoint. DEGRADES GRACEFULLY (no-false-red):
 # skips — never fails — when opted out / not macOS / tool absent / permission missing (empty capture).
 take_screenshot() {
@@ -374,9 +383,9 @@ except Exception:
       checkpoint agent_working fail "expected working, herdr agent list reports '$st'"
     fi
 
-    # done (herdr surfaces the custom-status word as agent_status).
+    # done (herdr surfaces the custom-status/message word as agent_status).
     herdr pane run "$BUILD_PANE" "printf 'rp stub builder: done\n'" >/dev/null 2>&1 || true
-    herdr pane report-agent "$BUILD_PANE" --source rp-sim --agent "rp-builder" --state idle --custom-status "done" >/dev/null 2>&1 || true
+    report_agent_done "$BUILD_PANE" "rp-builder"
     st="$(agent_status_of rp-builder)"
     if [ "$st" = done ]; then
       TRANSITIONS+=("done"); checkpoint agent_done pass "herdr agent list reports rp-builder = done"
@@ -777,11 +786,19 @@ except Exception:
   if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
     step clauderoot "claude launched AS the pane root (shell_pid == claude pid) reads 'alive', not a fabricated death"
     CR_BIN="$ART/clauderootbin"; mkdir -p "$CR_BIN"
-    # A resident fake claude whose cmdline retains 'claude' (a bash script — NOT exec'd, so the process
-    # name stays '…/claude', exactly the argv the real binary carries). It sleeps until we kill it.
+    # A resident fake claude whose cmdline retains 'claude' (a bash script sleeping until killed).
     printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CR_BIN/claude"; chmod +x "$CR_BIN/claude"
-    CR_START="$(herdr agent start cair-root-builder --workspace "$WSID" --cwd "$REPO" --tab "$BUILD_TAB" --split down --no-focus -- "$CR_BIN/claude" 2>/dev/null || true)"
-    CR_PANE="$(printf '%s' "$CR_START" | hj 'd["result"]["agent"]["pane_id"]')"
+    # Stand the pane up CLI-agnostically (issue #514): herdr ≥0.7.5 `agent start` no longer creates
+    # panes and its --kind runs the CANONICAL executable, so it cannot launch this stub. Split a real
+    # pane and `exec` the stub as the pane's ROOT process — the exact shell_pid == claude-pid shape
+    # the pre-0.7.5 lane's `agent start … -- claude` produced (and old-herdr machines still produce).
+    CR_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    CR_PANE="$(printf '%s' "$CR_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    if [ -n "$CR_PANE" ]; then
+      herdr pane run "$CR_PANE" "exec $CR_BIN/claude" >/dev/null 2>&1 || true
+      # Register the identity the probe resolves (the pre-0.7.5 flow registered it via agent start).
+      herdr pane report-agent "$CR_PANE" --source rp-sim --agent "cair-root-builder" --state working >/dev/null 2>&1 || true
+    fi
     [ -z "$CR_PANE" ] && CR_PANE="$(herd_driver_agent_pane_id cair-root-builder 2>/dev/null || true)"
     [ -n "$CR_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))
     # Poll until the probe sees the live claude root.
@@ -839,7 +856,7 @@ print(pi.get("foreground_process_group_id") or "")
       _i=$((_i+1)); sleep 0.2
     done
     # Builder reads 'done' (session still up, awaiting re-task) — the HERD-186 stuck-prompt shape.
-    herdr pane report-agent "$BUILD_PANE" --source rp-sim --agent "rp-builder" --state idle --custom-status "done" >/dev/null 2>&1 || true
+    report_agent_done "$BUILD_PANE" "rp-builder"
 
     if [ "$_wake_alive" = yes ]; then
       WT="$ART/waketrees"; mkdir -p "$WT"
@@ -906,7 +923,7 @@ WAKEHERDR
           "re-task did not wake (rc=$W_RC woke=$_w_woke status='$_w_st' enter_consumed=$_w_enter disp='$(cat "$W_DISPLAY" 2>/dev/null | tr -d '\n')')"
       fi
       # Reset agent to done for the deadeyes step that follows (it expects a non-working target).
-      herdr pane report-agent "$BUILD_PANE" --source rp-sim --agent "rp-builder" --state idle --custom-status "done" >/dev/null 2>&1 || true
+      report_agent_done "$BUILD_PANE" "rp-builder"
     else
       checkpoint builder_retask_wakes_on_enter fail \
         "could not stand up a live session to re-task (liveness='$(herd_driver_agent_liveness rp-builder "$BUILD_PANE" 2>/dev/null)')"
