@@ -39,8 +39,10 @@ pre-merge gate. Each self-healing rail has its own toggle: `REVIEW_AUTOFIX`, `HE
 ### Named governance postures
 
 `templates/postures.tsv` is the canonical, committed set of posture bundles — a posture is a
-human-named group of config keys that select one coherent stance. Six ship: `solo-auto`,
-`team-approve`, `gated-push`, `custom-steps`, `observe-only`, `full-auto`. `herd init` (v2 posture
+human-named group of config keys that select one coherent stance. Seven ship: `solo-auto`,
+`team-approve`, `gated-push`, `custom-steps`, `observe-only`, `full-auto`, `docs-lab` (HERD-409/#520
+— pairs with the docs/research-lab PROJECT ARCHETYPE: a cheap docs review tier + lighter model
+tiers). `herd init` (v2 posture
 profiles, HERD-141/153) consumes the file to offer them at setup time and render the chosen bundle
 into `.herd/config`; the posture-matrix sim (`scripts/herd/sim/sandbox-posture-matrix.sh`) proves the
 gate loop under each one. Adding a posture to that file — not to the sim or the installer — is what

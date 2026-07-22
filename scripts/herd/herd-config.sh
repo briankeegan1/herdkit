@@ -201,6 +201,10 @@ fi
 : "${WORKTREES_DIR:="${PROJECT_ROOT}-trees"}"
 : "${DEFAULT_BRANCH:="origin/main"}"
 : "${WORKSPACE_NAME:="$(basename "$PROJECT_ROOT")"}"
+# PROJECT_ARCHETYPE (HERD-409) — what kind of project this is: code (default) | research-lab | docs.
+# See templates/archetypes.tsv. Default "code" is byte-identical to pre-HERD-409 behavior (stack-aware
+# healthcheck seeding from scout's detected language, unaffected by this key).
+: "${PROJECT_ARCHETYPE:="code"}"
 # Project-defined branch naming for the builder lanes (HERD-120). The DEFAULT 'feat/{slug}' renders
 # byte-identical to the historically-hardcoded feat/<slug>, so an unset key is zero behavior change.
 # Tokens: {slug} (required — the coordinator-chosen kebab name) and optional {ref} (the tracker id).

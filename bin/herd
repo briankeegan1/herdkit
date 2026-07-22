@@ -184,6 +184,35 @@ _ground_ask() {
 # _ground_yes <answer> — success for an affirmative interview answer (y / yes, case-insensitive).
 _ground_yes() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; *) return 1 ;; esac; }
 
+# ── init project archetype (HERD-409) ───────────────────────────────────────────────────────────
+# Offers the named PROJECT ARCHETYPES from templates/archetypes.tsv (via archetype-lib.sh) — the
+# "what IS this project" axis, orthogonal to the operating postures below ("who merges"). Selects
+# the seeded healthcheck template and frames the health/preview interview questions. Non-interactive
+# / no-tty init never enters this interview and defaults to archetype=code — byte-identical to
+# pre-HERD-409 init. HERD_ARCHETYPE_ASSUME_TTY is its own hermetic test seam, separate from the
+# posture/grounding ones, so a scripted test for one interview never consumes another's stdin.
+
+# Source the shared archetypes reader once (idempotent; defines archetype_* helpers).
+# shellcheck source=/dev/null
+[ -f "$SCRIPTS_DIR/sim/archetype-lib.sh" ] && . "$SCRIPTS_DIR/sim/archetype-lib.sh"
+
+# _archetype_interactive — true when the archetype interview should prompt.
+_archetype_interactive() {
+  { [ -t 0 ] || [ -n "${HERD_ARCHETYPE_ASSUME_TTY:-}" ]; } && [ -z "${HERD_NONINTERACTIVE:-}" ]
+}
+
+# _archetype_ask <prompt> <default> — like ask(), but interactive under _archetype_interactive.
+_archetype_ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if _archetype_interactive; then
+    printf '%s%s%s' "$c_bold" "$prompt" "$c_rst" >&2
+    [ -n "$def" ] && printf ' %s[%s]%s' "$c_dim" "$def" "$c_rst" >&2
+    printf ': ' >&2
+    read -r ans || true
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
 # ── init posture profiles (HERD-141) ─────────────────────────────────────────────────────────────
 # Intent-first interview helpers for `herd init`: offer the named postures from templates/postures.tsv
 # (via posture-lib.sh) and render the chosen KEY=VALUE bundle into .herd/config. The advanced path
@@ -224,9 +253,13 @@ _posture_default_for_policy() {
 }
 
 # _posture_apply_bundle <name> — parse posture_keys into shell variables used by cmd_init's config
-# write. Sets: merge_policy, pr_flow, pr_ready, delete_branch, local_review, merge_method (only when
-# the bundle names them), posture_extra (SPACE-separated KEY=VALUE for keys not in the standard
-# init template), steps_profile (STEPS_PROFILE id, or empty). Caller's locals must already exist.
+# write. Sets: merge_policy, pr_flow, pr_ready, delete_branch, local_review, merge_method, and the
+# model_* vars (only when the bundle names them — HERD-409/#520, e.g. docs-lab's lighter feature/
+# review tiers), posture_extra (SPACE-separated KEY=VALUE for keys not in the standard init
+# template), steps_profile (STEPS_PROFILE id, or empty). Caller's locals must already exist. MODEL_*
+# keys are named here (not left to fall into posture_extra) so a posture-chosen tier INTERPOLATES
+# into the base template's model-map block instead of appending a second, later-wins DUPLICATE
+# MODEL_* line — .herd/config stays clean (one line per key), same discipline as merge_policy et al.
 _posture_apply_bundle() {
   local name="$1" kv k v
   steps_profile=""
@@ -242,6 +275,12 @@ _posture_apply_bundle() {
       PR_READY_WHEN)          pr_ready="$v" ;;
       DELETE_BRANCH_ON_MERGE) delete_branch="$v" ;;
       LOCAL_REVIEW)           local_review="$v" ;;
+      MODEL_COORDINATOR)      model_coordinator="$v" ;;
+      MODEL_FEATURE)          model_feature="$v" ;;
+      MODEL_QUICK)            model_quick="$v" ;;
+      MODEL_SCRIBE)           model_scribe="$v" ;;
+      MODEL_RESEARCH)         model_research="$v" ;;
+      MODEL_REVIEW)           model_review="$v" ;;
       *)
         # Real config key not in the standard init template — append after the base write.
         posture_extra="${posture_extra:+$posture_extra }$k=$v"
@@ -579,14 +618,28 @@ scout_repo() {
   printf 'lang=%s\nbacklog=%s\ntracker=%s\n' "$lang" "$backlog" "$tracker_hint"
 }
 
-# ── stack-aware init: map scout's detected lang → the healthcheck template to seed ──────────────
+# ── stack-aware init: map scout's detected lang (+ HERD-409 archetype) → the healthcheck template ─
 # Threads scout's `lang` through to the per-project healthcheck so a non-Python/Node consumer gets a
 # runnable heavy-profile gate in their own toolchain instead of the reference stack's Python example (the
 # single highest-leverage external-consumer fix — see docs/external-consumer-audit.md, leaks D & B).
 # python and unknown BOTH map to the existing healthcheck.project.sh so today's behavior is preserved
 # exactly. Prints the template basename under $TEMPLATES_DIR.
+#
+# <archetype> (HERD-409, optional, defaults "code") takes PRECEDENCE over lang when the archetype's
+# templates/archetypes.tsv row names a FIXED template (docs/research-lab → healthcheck.docs.sh — no
+# test suite to run, so lang is irrelevant); the "code" archetype's row is the sentinel "auto",
+# meaning "keep deferring to the lang switch below" — so archetype=code (the default, including every
+# call site that still passes only <lang>) is byte-identical to pre-HERD-409 behavior.
 _healthcheck_template_for() {
-  case "$1" in
+  local lang="$1" archetype="${2:-code}" tmpl
+  if [ -n "$archetype" ] && [ "$archetype" != "code" ] && type archetype_healthcheck_template >/dev/null 2>&1; then
+    tmpl="$(archetype_healthcheck_template "$archetype" 2>/dev/null)"
+    if [ -n "$tmpl" ] && [ "$tmpl" != "auto" ]; then
+      printf '%s' "$tmpl"
+      return 0
+    fi
+  fi
+  case "$lang" in
     node)  printf 'healthcheck.node.sh' ;;
     go)    printf 'healthcheck.go.sh' ;;
     rust)  printf 'healthcheck.rust.sh' ;;
@@ -1038,6 +1091,48 @@ cmd_init() {
   fi
   say ""
 
+  # 1b. Project archetype (HERD-409) — INTENT-FIRST, like the posture pick below, but answers a
+  #     different question: what KIND of project is this (a codebase with a test suite, or a
+  #     docs/research repo with none)? Orthogonal to the operating posture (who merges); this
+  #     selects the seeded healthcheck template (5b below) and reframes the health/preview questions
+  #     (4 below). scout's language=unknown is exactly the signal this axis exists to disambiguate:
+  #     "no code stack detected" no longer forces the Python-test-suite example on a non-code repo.
+  #     Non-interactive / no-tty init NEVER enters this interview and stays archetype=code —
+  #     byte-identical to pre-HERD-409 init (same seeded healthcheck, same config key set otherwise).
+  local archetype="code"
+  if _archetype_interactive && type archetype_names >/dev/null 2>&1 && [ -f "$(archetype_file 2>/dev/null || true)" ]; then
+    local ai=0 achoice aname_list="" an
+    say "${c_bold}Project archetype${c_rst} ${c_dim}— what kind of project is this?${c_rst}"
+    say "  ${c_dim}(canonical archetypes from templates/archetypes.tsv)${c_rst}"
+    while IFS= read -r an; do
+      [ -n "$an" ] || continue
+      ai=$((ai + 1))
+      aname_list="${aname_list:+$aname_list }$an"
+      say "  ${c_bold}$ai)${c_rst} ${c_bold}$an${c_rst}  ${c_dim}— $(archetype_intent "$an")${c_rst}"
+    done <<EOF
+$(archetype_names)
+EOF
+    achoice="$(_archetype_ask "Archetype (name or number)" "code")"
+    if archetype_exists "$achoice" 2>/dev/null; then
+      archetype="$achoice"
+    elif printf '%s' "$achoice" | grep -qE '^[0-9]+$'; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
+      ai=0
+      for an in $aname_list; do
+        ai=$((ai + 1))
+        if [ "$ai" = "$achoice" ]; then archetype="$an"; break; fi
+      done
+      if ! archetype_exists "$archetype" 2>/dev/null; then
+        warn "unknown archetype choice '$achoice' — defaulting to 'code'"
+        archetype="code"
+      fi
+    else
+      warn "unknown archetype '$achoice' — defaulting to 'code'"
+      archetype="code"
+    fi
+    say "  ${c_bold}→ archetype=${archetype}${c_rst}  ${c_dim}$(archetype_intent "$archetype" 2>/dev/null)${c_rst}"
+    say ""
+  fi
+
   # 2. Interview (detected values as defaults).
   local def_branch; def_branch="$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
   local project_root worktrees default_branch workspace
@@ -1143,12 +1238,23 @@ cmd_init() {
     esac
   fi
 
-  # 4. Health + preview.
+  # 4. Health + preview. Framing (HERD-409): archetype=code (default) keeps these prompts BYTE-
+  #    IDENTICAL to pre-HERD-409 init. A docs/research-lab archetype has no test suite or app to
+  #    preview, so HEALTHCHECK_CMD is reframed around the seeded markdown/link/template-conformance
+  #    lint (5b below still seeds .herd/healthcheck.project.sh from healthcheck.docs.sh) and
+  #    APP_PREVIEW_CMD is skipped outright rather than asked.
   say ""
   local healthcheck heavy_glob preview deny
-  healthcheck="$(ask "HEALTHCHECK_CMD (exit 0 clean / 1 code error / 2 data-env; blank = syntax-only)" ".herd/healthcheck.project.sh")"
-  heavy_glob="$(ask "HEALTHCHECK_HEAVY_GLOB (diff paths forcing the heavy profile; blank = always heavy)" "")"
-  preview="$(ask "APP_PREVIEW_CMD (live preview; blank = none → quick-only)" "")"
+  if [ "$archetype" = "code" ]; then
+    healthcheck="$(ask "HEALTHCHECK_CMD (exit 0 clean / 1 code error / 2 data-env; blank = syntax-only)" ".herd/healthcheck.project.sh")"
+    heavy_glob="$(ask "HEALTHCHECK_HEAVY_GLOB (diff paths forcing the heavy profile; blank = always heavy)" "")"
+    preview="$(ask "APP_PREVIEW_CMD (live preview; blank = none → quick-only)" "")"
+  else
+    healthcheck="$(ask "HEALTHCHECK_CMD (markdown/link/template-conformance lint; exit 0 clean / 1 code error / 2 data-env; blank = syntax-only)" ".herd/healthcheck.project.sh")"
+    heavy_glob="$(ask "HEALTHCHECK_HEAVY_GLOB (diff paths forcing the heavy profile; blank = always heavy)" "")"
+    preview=""
+    say "  ${c_dim}(archetype=$archetype — no app to preview; skipping APP_PREVIEW_CMD)${c_rst}"
+  fi
   deny="$(ask "DENY_PATHS (never-committed dirs)" "")"
 
   local herd_repo; herd_repo="$(ask "HERD_REPO (where engine bugs escalate)" "briankeegan1/herdkit")"
@@ -1167,12 +1273,17 @@ cmd_init() {
   #         MERGE_POLICY=auto) produces the SAME key set as today's init (no behavior regression).
   #       • Posture-only keys (HUMAN_VERIFY_POLICY, PUSH_GATE, …) are appended only when the
   #         chosen bundle names them. STEPS_PROFILE seeds .herd/steps.tsv (not a config key).
-  #       • Model map stays HARDCODED into the config write (never asked).
+  #       • Model map stays HARDCODED into the config write (never asked interactively); a posture
+  #         MAY still override an individual MODEL_* tier (HERD-409/#520 docs-lab) — the bundle
+  #         value interpolates into the same base line rather than appending a duplicate.
   #
   #     SAFE DEFAULTS for keys a posture does not set preserve today's EXACT behavior: direct PRs
   #     opened ready, builder-owned readiness, branches retained on merge, no pre-PR local review.
   local merge_policy="$det_policy" merge_method="$det_method"
   local pr_flow="direct" pr_ready="builder" delete_branch="false" local_review="none"
+  local model_coordinator="claude-opus-4-8" model_feature="claude-sonnet-4-6"
+  local model_quick="claude-haiku-4-5" model_scribe="claude-sonnet-4-6"
+  local model_research="claude-sonnet-4-6" model_review="claude-sonnet-4-6"
   local posture_name="" posture_extra="" steps_profile="" posture_mode=""
 
   # Always print the MERGE_POLICY consequence block (HERD-140) so an operator never lands on a
@@ -1297,6 +1408,11 @@ WORKTREES_DIR="$worktrees"
 DEFAULT_BRANCH="$default_branch"
 WORKSPACE_NAME="$workspace"
 
+# PROJECT_ARCHETYPE (HERD-409) — what kind of project this is: code (default, a test/lint suite
+# exists to run) | research-lab | docs (no test suite — 5b below seeds the markdown/link/
+# template-conformance healthcheck instead). See templates/archetypes.tsv.
+PROJECT_ARCHETYPE="$archetype"
+
 BACKLOG_FILE="$backlog_file"
 SCRIBE_BACKEND="$backend"
 SHARE_LINKS=""
@@ -1309,12 +1425,12 @@ SMOKE_CMD=""
 # model map — eco-leaning STARTER defaults. Opus is now an ESCALATION tier, not a default:
 # reach it deterministically via MODEL_ESCALATE_GLOB (feature lane) / REVIEW_ESCALATE_GLOB
 # (review gate), not by paying for it on every quick/feature/review run.
-MODEL_COORDINATOR="claude-opus-4-8"
-MODEL_FEATURE="claude-sonnet-4-6"
-MODEL_QUICK="claude-haiku-4-5"
-MODEL_SCRIBE="claude-sonnet-4-6"
-MODEL_RESEARCH="claude-sonnet-4-6"
-MODEL_REVIEW="claude-sonnet-4-6"
+MODEL_COORDINATOR="$model_coordinator"
+MODEL_FEATURE="$model_feature"
+MODEL_QUICK="$model_quick"
+MODEL_SCRIBE="$model_scribe"
+MODEL_RESEARCH="$model_research"
+MODEL_REVIEW="$model_review"
 
 DENY_PATHS="$deny"
 REVIEW_CHECKLIST=".herd/review-checklist.md"
@@ -1381,18 +1497,21 @@ EOF
     ok "seeded $backlog_file"
   fi
 
-  # 5b. Seed the per-project healthcheck from the template matching scout's detected lang, so a
-  # Go/Rust/Java (or Node) consumer gets a heavy-profile gate in their OWN toolchain rather than the
-  # reference stack's Python example. Only when HEALTHCHECK_CMD still points at the default path and no script
-  # exists yet — NEVER clobbers a consumer's own healthcheck. python/unknown map to the current
-  # healthcheck.project.sh, so Python consumers are unchanged. (external-consumer-audit.md, leaks D,B.)
+  # 5b. Seed the per-project healthcheck from the template matching scout's detected lang (or, when
+  # set, the HERD-409 archetype's fixed template — docs/research-lab have no test suite to run, so
+  # lang is irrelevant), so a Go/Rust/Java/Node consumer gets a heavy-profile gate in their OWN
+  # toolchain and a docs/research-lab consumer gets a markdown lint, rather than the reference
+  # stack's Python example. Only when HEALTHCHECK_CMD still points at the default path and no script
+  # exists yet — NEVER clobbers a consumer's own healthcheck. python/unknown + archetype=code map to
+  # the current healthcheck.project.sh, so today's consumers are unchanged. (external-consumer-audit.md,
+  # leaks D,B.)
   if [ "$healthcheck" = ".herd/healthcheck.project.sh" ]; then
     local hc_target="$project_root/.herd/healthcheck.project.sh"
-    local hc_tmpl; hc_tmpl="$(_healthcheck_template_for "$lang")"
+    local hc_tmpl; hc_tmpl="$(_healthcheck_template_for "$lang" "$archetype")"
     if [ ! -e "$hc_target" ] && [ -f "$TEMPLATES_DIR/$hc_tmpl" ]; then
       cp "$TEMPLATES_DIR/$hc_tmpl" "$hc_target"
       chmod +x "$hc_target" 2>/dev/null || true
-      ok "seeded .herd/healthcheck.project.sh from $hc_tmpl (lang=${lang:-unknown})"
+      ok "seeded .herd/healthcheck.project.sh from $hc_tmpl (lang=${lang:-unknown} archetype=$archetype)"
     fi
   fi
 

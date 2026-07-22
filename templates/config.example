@@ -16,6 +16,21 @@ PROJECT_ROOT="$HOME/source/myproject"          # the main checkout
 WORKTREES_DIR="$HOME/source/myproject-trees"   # the worktree pool (sibling, never committed)
 DEFAULT_BRANCH="origin/main"                   # branch off / push to this
 WORKSPACE_NAME="myproject"                     # herdr workspace label
+
+# PROJECT_ARCHETYPE — the PROJECT ARCHETYPE axis (HERD-409): what KIND of project this is, orthogonal
+# to the operating postures below (who merges). `herd init` offers the named archetypes from
+# templates/archetypes.tsv and seeds this from your answer.
+#   code          default — a codebase with a test/lint suite. Seeded healthcheck is chosen from
+#                 scout's detected language (Go/Rust/Java/Node/Python) — byte-identical to
+#                 pre-HERD-409 init.
+#   research-lab  a research/experiment repo with no runnable app or test suite. Seeded healthcheck
+#                 lints markdown docs (fenced-block + relative-link + template-conformance checks)
+#                 instead; the init interview skips the app-preview question.
+#   docs          a documentation-only project. Same markdown-lint healthcheck as research-lab.
+# Only consulted by `herd init` at seed time (5b: which healthcheck template to copy) and by the
+# interview's health/preview question framing; changing it post-init does not re-seed the healthcheck.
+PROJECT_ARCHETYPE="code"             # code (default) | research-lab | docs
+
 # BRANCH_TEMPLATE — how the lanes name their feature branches (HERD-120). Default 'feat/{slug}' is
 # byte-identical to the historically-hardcoded feat/<slug>. Tokens: {slug} (required) and optional
 # {ref} (the tracker id, filled when the coordinator spawns from a tracked item). A malformed
@@ -117,7 +132,9 @@ SHARE_LINKS=""                      # gitignored dirs symlinked into each worktr
 # health + preview — the two big project-specific commands.
 # `herd init` seeds .herd/healthcheck.project.sh from the template matching scout's detected stack
 # (Go → healthcheck.go.sh, Rust → healthcheck.rust.sh, Java → healthcheck.java.sh, Node →
-# healthcheck.node.sh, Python/unknown → healthcheck.project.sh); swap the body for your own gate.
+# healthcheck.node.sh, Python/unknown → healthcheck.project.sh) UNLESS PROJECT_ARCHETYPE above is
+# research-lab/docs, which always seeds healthcheck.docs.sh (a markdown/link/template-conformance
+# lint) regardless of detected language; swap the body for your own gate.
 HEALTHCHECK_CMD=".herd/healthcheck.project.sh"  # exit 0 clean/data-env, 1 code error, 2 data/env
 HEALTHCHECK_HEAVY_GLOB=""            # egrep of diff paths that force the heavy profile; BLANK (default) → every change is heavy. Set a layout-specific value (e.g. "^app/", "^cmd/|^internal/", "^src/") only if some changes can skip the full suite.
 APP_SURFACE_GLOB=""                 # optional; egrep of diff paths that are the app surface (e.g. "^app/", "^cmd/", "^src/"); BLANK (default) → interaction gate off

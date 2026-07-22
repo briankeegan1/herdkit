@@ -52,7 +52,7 @@ for c in d["checkpoints"]:
 . "$PLIB"
 POSTURES_FILE="$POSTURES"
 _names="$(posture_names | tr '\n' ' ')"
-for p in solo-auto team-approve gated-push custom-steps observe-only full-auto; do
+for p in solo-auto team-approve gated-push custom-steps observe-only full-auto docs-lab; do
   case " $_names " in *" $p "*) : ;; *) fail "(a) postures.tsv missing posture: $p" ;; esac
 done
 case "$(posture_keys full-auto)" in *MERGE_POLICY=auto*) : ;; *) fail "(a) full-auto must set MERGE_POLICY=auto" ;; esac
@@ -61,7 +61,12 @@ case "$(posture_keys full-auto)" in *MERGE_POLICY=auto*) : ;; *) fail "(a) full-
 [ "$(posture_keys observe-only)" = "MERGE_POLICY=observe" ] || fail "(a) observe-only keys wrong"
 case "$(posture_keys gated-push)" in *PUSH_GATE=human*) : ;; *) fail "(a) gated-push must set PUSH_GATE=human" ;; esac
 [ "$(posture_steps_profile custom-steps)" = "approve-stage" ] || fail "(a) custom-steps STEPS_PROFILE wrong"
-echo "PASS (a) postures.tsv defines the six canonical postures; posture-lib reads their keys"
+# docs-lab (HERD-409/#520): a docs/research-lab bundle — cheap docs review tier + lighter models.
+case "$(posture_keys docs-lab)" in *MERGE_POLICY=auto*) : ;; *) fail "(a) docs-lab must set MERGE_POLICY=auto" ;; esac
+case "$(posture_keys docs-lab)" in *DOCS_ONLY_GLOB=*)   : ;; *) fail "(a) docs-lab must set DOCS_ONLY_GLOB" ;; esac
+case "$(posture_keys docs-lab)" in *MODEL_FEATURE=*)    : ;; *) fail "(a) docs-lab must set MODEL_FEATURE" ;; esac
+case "$(posture_keys docs-lab)" in *MODEL_REVIEW=*)     : ;; *) fail "(a) docs-lab must set MODEL_REVIEW" ;; esac
+echo "PASS (a) postures.tsv defines the seven canonical postures; posture-lib reads their keys"
 
 # ── (b) MATRIX GREEN + per-posture invariants ──────────────────────────────────────
 ART="$T/matrix"
@@ -73,11 +78,11 @@ MJ="$ART/matrix.json"
 [ -f "$MJ" ] || fail "(b) matrix.json not emitted"
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$MJ" || fail "(b) matrix.json is not valid JSON"
 [ "$(sc "$MJ" result)" = "pass" ]           || fail "(b) matrix result should be pass"
-[ "$(sc "$MJ" postures_total)" -eq 6 ]      || fail "(b) postures_total should be 6"
-[ "$(sc "$MJ" postures_green)" -eq 6 ]      || fail "(b) postures_green should be 6 (got $(sc "$MJ" postures_green))"
+[ "$(sc "$MJ" postures_total)" -eq 7 ]      || fail "(b) postures_total should be 7"
+[ "$(sc "$MJ" postures_green)" -eq 7 ]      || fail "(b) postures_green should be 7 (got $(sc "$MJ" postures_green))"
 
 # Each posture's own scorecard: result=pass + its invariant checkpoint(s).
-for p in solo-auto team-approve gated-push custom-steps observe-only full-auto; do
+for p in solo-auto team-approve gated-push custom-steps observe-only full-auto docs-lab; do
   card="$ART/$p/scorecard.json"
   [ -f "$card" ] || fail "(b) no scorecard for posture $p"
   [ "$(sc "$card" result)" = "pass" ]     || fail "(b) posture $p result should be pass"
@@ -87,6 +92,8 @@ done
   || fail "(b) solo-auto must fully drain (queue_drained pass)"
 [ "$(cp_status "$ART/full-auto/scorecard.json" queue_drained)" = "pass" ] \
   || fail "(b) full-auto (MERGE_POLICY=auto) must fully drain (queue_drained pass)"
+[ "$(cp_status "$ART/docs-lab/scorecard.json" queue_drained)" = "pass" ] \
+  || fail "(b) docs-lab (MERGE_POLICY=auto) must fully drain (queue_drained pass)"
 [ "$(cp_status "$ART/team-approve/scorecard.json" posture_approve_no_merge_preapproval)" = "pass" ] \
   || fail "(b) team-approve must not merge before an approval"
 [ "$(cp_status "$ART/team-approve/scorecard.json" posture_approve_merges_only_approved)" = "pass" ] \
@@ -99,7 +106,7 @@ done
   || fail "(b) gated-push posture_invariant must pass (nothing reaches the remote pre-approval)"
 [ "$(cp_status "$ART/custom-steps/scorecard.json" posture_invariant)" = "pass" ] \
   || fail "(b) custom-steps posture_invariant must pass (release-once per sha,step)"
-echo "PASS (b) matrix green 6/6 — every posture scorecard passes its own invariant"
+echo "PASS (b) matrix green 7/7 — every posture scorecard passes its own invariant"
 
 # ── (c) FAULT CAUGHT — the injected #249 defect must go RED, flipping exactly posture_invariant ────
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fault_injection"]["caught"])' "$MJ")" = "yes" ] \

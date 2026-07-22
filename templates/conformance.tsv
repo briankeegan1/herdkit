@@ -53,6 +53,7 @@ herd init	unit	tests/test-cli.sh
 herd init	unit	tests/test-stack-aware-init.sh
 herd init	unit	tests/test-init-grounding-interview.sh
 herd init	unit	tests/test-init-posture-profiles.sh
+herd init	unit	tests/test-init-archetypes.sh
 herd doctor	unit	tests/test-doctor.sh
 herd doctor	unit	tests/test-doctor-posture.sh
 herd upgrade	unit	tests/test-cli.sh
@@ -222,6 +223,7 @@ MODEL_ADVISE	unit	tests/test-advise.sh
 TOKEN_MODE	unit	tests/test-token-mode.sh
 TOKEN_MODE	unit	tests/test-eco-starter-defaults.sh
 HEALTHCHECK_CMD	unit	tests/test-healthcheck-interaction.sh
+PROJECT_ARCHETYPE	unit	tests/test-init-archetypes.sh
 HEALTHCHECK_HEAVY_GLOB	unit	tests/test-healthcheck-routing.sh
 APP_SURFACE_GLOB	unit	tests/test-healthcheck-interaction.sh
 INTERACTION_TEST_CMD	unit	tests/test-healthcheck-interaction.sh

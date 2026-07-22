@@ -91,7 +91,7 @@ if [ -n "$POSTURE" ]; then
   # sandbox-scenario.sh. Refuse the others LOUDLY so the matrix wrapper's routing can never silently
   # run a posture through the wrong scenario.
   case "$POSTURE" in
-    solo-auto|full-auto|team-approve|observe-only) : ;;
+    solo-auto|full-auto|team-approve|observe-only|docs-lab) : ;;
     *) echo "sandbox-concurrency-scenario: posture '$POSTURE' is not a merge-policy posture (use sandbox-scenario.sh)" >&2; exit 1 ;;
   esac
   # Apply the posture's real config keys BEFORE agent-watch.sh is sourced, so its module-level
