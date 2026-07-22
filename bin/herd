@@ -2236,10 +2236,10 @@ _config_key_requires() {
 }
 
 # _config_key_value_shape <caps> <KEY> → print the value_shape token for KEY's kind==config row
-# (HERD-159). The optional 8th column of capabilities.tsv: "numeric" | "free" | a pipe-separated
-# enum list (e.g. auto|approve|observe). Empty / missing → free (backward-compatible). Presence of
-# an empty enum member (leading/trailing/double pipe, e.g. "|no-ai-coauthor") means the empty string
-# is an allowed value.
+# (HERD-159). The optional 8th column of capabilities.tsv: "numeric" | "free" | "glob" (HERD-413) |
+# a pipe-separated enum list (e.g. auto|approve|observe). Empty / missing → free (backward-compatible).
+# Presence of an empty enum member (leading/trailing/double pipe, e.g. "|no-ai-coauthor") means the
+# empty string is an allowed value.
 _config_key_value_shape() {
   awk -F'\t' -v k="$2" '
     $2=="config" && $1==k { s=$8; gsub(/[[:space:]]+$/,"",s); print s; exit }
@@ -2247,10 +2247,17 @@ _config_key_value_shape() {
 }
 
 # _config_validate_value <shape> <VALUE> — exit 0 when VALUE matches the shape, 1 when it does not.
-# Shapes (HERD-159):
+# Shapes (HERD-159, glob added HERD-413):
 #   free / empty  — any value (including empty)
 #   numeric       — non-negative integer (digits only); empty is NOT numeric (caller may allow empty
 #                   separately by treating free). Used for concurrency / timeout keys.
+#   glob          — the vetted charset for *_GLOB egrep-pattern keys (HERD-413): word chars plus
+#                   . * + ? [ ] ( ) { } | ^ $ \ / , -  so an anchored pattern like ^docs/.*[.]md$ is
+#                   expressible. A WHITELIST, not a relaxed blacklist — backtick, double quote, space,
+#                   and anything else outside the set stay refused (which also makes a newline
+#                   structurally impossible). Every read site of a glob key is audited to use the
+#                   value only as a grep -E pattern argument or a case match, never eval'd or
+#                   command-substituted — see the HERD-413 PR body for the site-by-site audit.
 #   a|b|c         — VALUE must equal one of the pipe-separated members exactly. A leading/trailing/
 #                   double pipe admits the empty string as a member.
 # Pure predicate: no I/O beyond the exit status.
@@ -2261,6 +2268,12 @@ _config_validate_value() {
     numeric)
       case "$val" in
         ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    glob)
+      case "$val" in
+        *[!]A-Za-z0-9_.*+?[\(\)\{\}\|^\$\\/,-]*) return 1 ;;
         *) return 0 ;;
       esac
       ;;
@@ -2709,15 +2722,8 @@ cmd_config_set() {
   local caps; caps="$(_config_caps_file)"
 
   # .herd/config is SOURCED AS SHELL (herd-config.sh and render_skill both `. "$cfg"`), but
-  # `herd config get`/`list` read it back with awk (no shell). To keep get == the shell-sourced
-  # value AND to guarantee a stored value can NEVER be expanded or executed at source time, reject
-  # any value containing a shell-active character ($ ` \ ") or a newline — otherwise e.g.
-  # `set WORKSPACE_NAME 'a$(id)'` would be echoed literally by `get` yet run `id` on every source.
-  # Such values are rare in config (e.g. a regex '$' anchor); set them by editing .herd/config.
-  case "$val" in
-    *'$'*|*'`'*|*'\'*|*'"'*)
-      die "value contains a shell-active character (\$, \`, \\, or \") — .herd/config is sourced as shell, so it would be expanded/executed at source time and would diverge from what 'herd config get' reports; edit .herd/config directly for such a value" ;;
-  esac
+  # `herd config get`/`list` read it back with awk (no shell). A newline breaks the KEY="VALUE" line
+  # format outright, so every key is refused a newline value regardless of shape.
   case "$val" in *$'\n'*) die "value may not contain a newline" ;; esac
 
   # 1. Safety FIRST (independent of the manifest): never touch the path-scoping key or any
@@ -2732,15 +2738,37 @@ cmd_config_set() {
   local requires
   requires="$(_config_key_requires "$caps" "$key")" \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
-
-  # 2a. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
-  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
-  #     the capabilities.tsv value_shape column (enum list | numeric | free). free/empty → no check.
   local shape; shape="$(_config_key_value_shape "$caps" "$key")"
+
+  # 2a. CHARSET validation. To guarantee a stored value can NEVER be expanded or executed when
+  #     .herd/config is (re-)sourced as shell, reject any value containing a shell-active character
+  #     ($ ` \ ") — otherwise e.g. `set WORKSPACE_NAME 'a$(id)'` would be echoed literally by `get`
+  #     yet run `id` on every source. EXCEPTION (HERD-413): a value_shape=glob key (the *_GLOB
+  #     egrep-pattern keys — DOCS_ONLY_GLOB, REVIEW_ESCALATE_GLOB, HEALTHCHECK_HEAVY_GLOB,
+  #     MODEL_ESCALATE_GLOB, APP_SURFACE_GLOB, LOCAL_REVIEW_GLOB, DOC_APPLY_PATH_GLOB) is validated
+  #     against the dedicated whitelist charset in _config_validate_value's `glob` case instead — $
+  #     and \ are load-bearing there (anchors, escapes) for an expressible anchored pattern like
+  #     ^docs/.*[.]md$, and every read site of a glob key is audited to use the value only as a
+  #     grep -E pattern argument or a case match, never eval'd or command-substituted. Every other
+  #     key keeps this exact blacklist, byte-identical to before HERD-413.
+  if [ "$shape" != "glob" ]; then
+    case "$val" in
+      *'$'*|*'`'*|*'\'*|*'"'*)
+        die "value contains a shell-active character (\$, \`, \\, or \") — .herd/config is sourced as shell, so it would be expanded/executed at source time and would diverge from what 'herd config get' reports; edit .herd/config directly for such a value" ;;
+    esac
+  fi
+
+  # 2b. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
+  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
+  #     the capabilities.tsv value_shape column (enum list | numeric | glob | free). free/empty → no
+  #     check; glob is enforced by its whitelist charset (HERD-413).
   if ! _config_validate_value "$shape" "$val"; then
     case "$shape" in
       numeric)
         die "invalid value for $key: \"$val\" — want a non-negative integer (see capabilities.tsv value_shape)"
+        ;;
+      glob)
+        die "invalid value for $key: \"$val\" — glob keys accept only word characters and . * + ? [ ] ( ) { } | ^ \$ \\ / , - (see capabilities.tsv value_shape)"
         ;;
       *)
         die "invalid value for $key: \"$val\" — allowed: ${shape} (see capabilities.tsv value_shape)"
@@ -2748,7 +2776,7 @@ cmd_config_set() {
     esac
   fi
 
-  # 2a-bis. EAGER REF VALIDATION (HERD-276). REVIEW_PANEL_MODELS's value_shape is `free` — a ref LIST is
+  # 2b-bis. EAGER REF VALIDATION (HERD-276). REVIEW_PANEL_MODELS's value_shape is `free` — a ref LIST is
   #     not an enum — so the generic check above cannot catch `codx:gpt-5` or a dangling `grok:`. Resolve
   #     every ref here against the shipped templates/drivers/*.driver oracle and REFUSE the write on the
   #     first bad one. A typo'd panelist otherwise lands silently in .herd/config and only reveals itself
@@ -2771,7 +2799,7 @@ cmd_config_set() {
       || die "refusing to set MODEL_REVIEW — '$val' does not resolve to a usable model ref (see the error above); use a bare model id or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
   fi
 
-  # 2a-ter. EXTERNAL-CONSISTENCY PROBE (HERD-355). For an externally-coupled key (env_coupling in
+  # 2b-ter. EXTERNAL-CONSISTENCY PROBE (HERD-355). For an externally-coupled key (env_coupling in
   #     capabilities.tsv), probe the just-supplied VALUE against LIVE external reality — the repo's
   #     merge flags, its branch protection, the resolved driver's runtime binding — so a config-vs-
   #     ENVIRONMENT mismatch surfaces HERE, at set time, not hours later as a silent gate failure
