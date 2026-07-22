@@ -119,6 +119,223 @@ _fleet_repo_slug() {
   [ -n "$owner" ] && [ -n "$repo" ] && printf '%s/%s' "$owner" "$repo"
 }
 
+# ── new — one-command spin-up (HERD-410) ─────────────────────────────────────
+# `herd fleet new <path>` replaces the hand-rolled chain a fleet-room operator used to type by hand
+# to stand up a NEW money-bet project: mkdir + git init + gh repo create + herd init + register.
+# Orchestrates that chain deterministically, delegating every step to the SAME command a human would
+# run (never re-implementing git/gh/herd init logic here) — mirroring fleet.sh's existing "delegate,
+# never reimplement" discipline (see the file header). Fail-soft on the optional remote leg
+# (--no-remote / no gh / no gh auth all degrade to "no remote", never a crash); everything else is a
+# hard failure (die) since a half-seeded project is worse than a refused one.
+#
+# PRESERVING OPTIONALITY (the actual bug this item fixes): the fleet path used to run `herd init`
+# under HERD_NONINTERACTIVE=1, which silently skipped the archetype/posture interviews and dropped a
+# non-code money-bet to code-shaped defaults with zero mention. `herd fleet new` fixes this at the
+# ORCHESTRATION layer (not inside `herd init` itself — direct `herd init` callers keep their existing
+# byte-identical non-interactive contract, see bin/herd's HERD-410 note above cmd_init's interview):
+#   • --archetype / --posture given            → passed straight through to `herd init` as flags.
+#   • neither flag given, but a real tty IS present → no flags passed; `herd init`'s OWN interactive
+#     archetype/posture interviews run, so a human still gets full optionality.
+#   • neither flag given AND no tty (scripted / HERD_NONINTERACTIVE)  → THIS function picks the
+#     defaults itself (archetype=code, posture=solo-auto — today's implicit shape) and PRINTS them
+#     loudly BEFORE delegating, then passes them to `herd init` as explicit flags so the choice is
+#     recorded, never silent.
+_fleet_new_usage() {
+  cat <<EOF
+usage: herd fleet new <path> [--archetype <name>] [--posture <name>] [--no-remote]
+                       [--repo-name <name>] [--public] [--alias <name>]...
+
+  One-command project spin-up (HERD-410): mkdir + git init + 'herd init' + commit the rendered
+  .herd/ project files + 'gh repo create' (unless --no-remote) + 'herd fleet register'.
+
+  <path>              directory to create (or reuse, if empty / not yet a herd project)
+  --archetype <name>  project archetype (templates/archetypes.tsv) — passed to 'herd init'
+  --posture <name>    operating posture (templates/postures.tsv) — passed to 'herd init'
+                       Neither flag + a real tty: 'herd init' runs its own interactive interview.
+                       Neither flag + no tty: defaults (archetype=code, posture=solo-auto) are
+                       applied AND PRINTED LOUDLY — never silently.
+  --no-remote          skip 'gh repo create' — local-only repo, registered with an empty repo field
+  --repo-name <name>  override the GitHub repo name (default: the sanitized directory basename)
+  --public             create the GitHub repo public (default: private)
+  --alias <name>       passed through to 'herd fleet register' (repeatable)
+
+Archetypes: $(type archetype_names >/dev/null 2>&1 && archetype_names | tr '\n' ' ' || printf '(unavailable)')
+Postures:   $(type posture_names >/dev/null 2>&1 && posture_names | tr '\n' ' ' || printf '(unavailable)')
+EOF
+}
+
+fleet_new() {
+  local raw="" archetype="" posture="" no_remote="" repo_name="" visibility="--private"
+  local aliases=() no_more_opts=""
+  while [ "$#" -gt 0 ]; do
+    if [ -n "$no_more_opts" ]; then
+      [ -z "$raw" ] || die "usage: herd fleet new <path> [...]  (try: herd fleet new --help)"
+      raw="$1"; shift; continue
+    fi
+    case "$1" in
+      --)              no_more_opts=1; shift ;;
+      --archetype)     [ -n "${2+set}" ] || die "--archetype requires a value"; archetype="$2"; shift 2 ;;
+      --archetype=*)   archetype="${1#--archetype=}"; shift ;;
+      --posture)       [ -n "${2+set}" ] || die "--posture requires a value"; posture="$2"; shift 2 ;;
+      --posture=*)     posture="${1#--posture=}"; shift ;;
+      --no-remote)     no_remote=1; shift ;;
+      --repo-name)     [ -n "${2+set}" ] || die "--repo-name requires a value"; repo_name="$2"; shift 2 ;;
+      --repo-name=*)   repo_name="${1#--repo-name=}"; shift ;;
+      --public)        visibility="--public"; shift ;;
+      --alias)         [ -n "${2+set}" ] || die "--alias requires a value"; aliases+=("$2"); shift 2 ;;
+      --alias=*)       aliases+=("${1#--alias=}"); shift ;;
+      -h|--help)       _fleet_new_usage; return 0 ;;
+      -*)              die "unknown option: $1 (try: herd fleet new --help; use '--' before a path starting with '-')" ;;
+      *)
+        [ -z "$raw" ] || die "usage: herd fleet new <path> [...]  (try: herd fleet new --help)"
+        raw="$1"; shift ;;
+    esac
+  done
+  [ -n "$raw" ] || { _fleet_new_usage >&2; die "usage: herd fleet new <path> [--archetype <name>] [--posture <name>] [--no-remote]"; }
+
+  # Validate archetype/posture NAMES up front (before touching the filesystem) when given, so a typo
+  # refuses cleanly rather than after mkdir/git init have already run.
+  if [ -n "$archetype" ]; then
+    type archetype_exists >/dev/null 2>&1 && archetype_exists "$archetype" \
+      || die "unknown --archetype '$archetype' — see templates/archetypes.tsv for the canonical names"
+  fi
+  if [ -n "$posture" ]; then
+    type posture_exists >/dev/null 2>&1 && posture_exists "$posture" \
+      || die "unknown --posture '$posture' — see templates/postures.tsv for the canonical names"
+  fi
+
+  mkdir -p -- "$raw" || die "cannot create directory: $raw"
+  local path; path="$(cd -- "$raw" 2>/dev/null && pwd -P)" || die "cannot resolve directory: $raw"
+
+  say "${c_bold}herd fleet new${c_rst} — spinning up $path"
+  say ""
+
+  # 1. git init (idempotent — a pre-existing .git is left alone).
+  if [ -d "$path/.git" ]; then
+    say "  ${c_dim}git: $path already a repo${c_rst}"
+  else
+    git -C "$path" init -q || die "git init failed at $path"
+    ok "git init: $path"
+  fi
+
+  # 2. PRESERVE OPTIONALITY (HERD-410): neither flag + no tty ⇒ pick + LOUDLY print the defaults
+  #    ourselves and pass them through explicitly, so the choice is recorded, never silent. Neither
+  #    flag + a real tty ⇒ pass nothing; 'herd init' runs its own interactive interview below.
+  if [ -z "$archetype" ] && [ -z "$posture" ] && { [ ! -t 0 ] || [ -n "${HERD_NONINTERACTIVE:-}" ]; }; then
+    archetype="code"; posture="solo-auto"
+    warn "no --archetype/--posture flags and no tty — applying defaults LOUDLY (never silently): archetype=$archetype posture=$posture. Override with 'herd fleet new $raw --archetype <name> --posture <name>'."
+  fi
+
+  # 3. herd init — delegated (never re-implemented here). Flags win when set; otherwise 'herd init'
+  #    decides for itself (its own interactive picker, or its own byte-identical non-interactive
+  #    default) exactly as a direct 'herd init' call would.
+  local herd_bin="${HERD_FLEET_HERD_BIN:-${HERDKIT_HOME:-}/bin/herd}"
+  local init_args=(init)
+  [ -n "$archetype" ] && init_args+=(--archetype "$archetype")
+  [ -n "$posture" ]   && init_args+=(--posture "$posture")
+  say ""
+  say "${c_bold}herd init${c_rst} ${c_dim}(delegated)${c_rst}"
+  ( cd "$path" && "$herd_bin" "${init_args[@]}" ) || die "herd init failed at $path"
+  [ -f "$path/.herd/config" ] || die "herd init did not produce $path/.herd/config"
+
+  # 4. NEVER .herd/secrets or .herd/config.local (amendment): 'herd init' only gitignores these on
+  #    conditional/interactive paths (a linear key given; the grounding interview's graphify yes) —
+  #    guarantee both are covered regardless, so a scripted spin-up can never leak either into git.
+  _ensure_gitignored "$path" '.herd/secrets'
+  _ensure_gitignored "$path" '.herd/config.local'
+
+  # 5. Commit the rendered .herd/ project files (amendment) — config, healthcheck.project.sh,
+  #    steps.tsv/links if created, .gitignore, and a seeded BACKLOG.md — so builder worktrees inherit
+  #    the gates from day one. Named `git add`, never `git add -A`: secrets/config.local and the
+  #    per-machine rendered skill (.claude/commands/*.md, already gitignored by render_skill) must
+  #    never land in this commit even if something else stages them first.
+  local commit_paths=() f
+  for f in .gitignore .herd/config .herd/healthcheck.project.sh .herd/steps.tsv .herd/links BACKLOG.md; do
+    [ -e "$path/$f" ] && commit_paths+=("$f")
+  done
+  if [ "${#commit_paths[@]}" -gt 0 ]; then
+    ( cd "$path" && git add -- "${commit_paths[@]}" ) || die "git add failed at $path"
+    if ( cd "$path" && git diff --cached --quiet 2>/dev/null ); then
+      say "  ${c_dim}(nothing new to commit)${c_rst}"
+    else
+      ( cd "$path" && git commit -q -m "chore: seed herd project (herd fleet new)" ) \
+        || die "git commit failed at $path"
+      ok "committed: ${commit_paths[*]}"
+    fi
+  fi
+
+  # 6. gh repo create — fail-soft optional leg. --no-remote skips cleanly; a missing/unauthenticated
+  #    gh degrades to the SAME "no remote" outcome with a loud warning, never a crash.
+  #    HERD_SKIP_GH_REMOTE (test seam, mirrors cmd_init's HERD_SKIP_GH_DETECT) forces the same
+  #    "not found" branch — 'gh' cannot be reliably hidden from PATH across every environment (a
+  #    hosted CI runner may ship it in the SAME directory as bash/coreutils), so tests exercising
+  #    this leg use the seam instead of PATH surgery.
+  local repo_slug=""
+  if [ -n "$no_remote" ]; then
+    say "  ${c_dim}--no-remote: skipping gh repo create${c_rst}"
+  elif [ -n "${HERD_SKIP_GH_REMOTE:-}" ] || ! command -v gh >/dev/null 2>&1; then
+    warn "gh CLI not found — skipping remote repo creation (degrades to --no-remote); create one later with 'gh repo create' + 'git remote add origin <url>'"
+  elif ! gh auth status >/dev/null 2>&1; then
+    warn "gh not authenticated (gh auth status failed) — skipping remote repo creation (degrades to --no-remote); run 'gh auth login', then create the remote by hand"
+  else
+    local name owner
+    name="${repo_name:-$(_fleet_slug "$(basename "$path")")}"
+    owner="$(gh api user --jq .login 2>/dev/null || true)"
+    if [ -z "$owner" ]; then
+      warn "could not resolve the gh account (gh api user) — skipping remote repo creation"
+    elif gh repo create "$owner/$name" "$visibility" >/dev/null 2>&1; then
+      repo_slug="$owner/$name"
+      local push_url; push_url="$(gh repo view "$repo_slug" --json url --jq .url 2>/dev/null)"
+      [ -n "$push_url" ] && push_url="${push_url}.git"
+      if [ -n "$push_url" ]; then
+        git -C "$path" remote add origin "$push_url" 2>/dev/null \
+          || git -C "$path" remote set-url origin "$push_url"
+        local branch; branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || echo main)"
+        if git -C "$path" push -q -u origin "$branch" 2>/dev/null; then
+          ok "gh repo create: $repo_slug ($visibility) — pushed $branch"
+        else
+          warn "created $repo_slug but 'git push' failed — push by hand: git -C $path push -u origin $branch"
+        fi
+      else
+        warn "created $repo_slug but could not resolve its clone URL (gh repo view) — add the remote by hand"
+      fi
+    else
+      warn "gh repo create failed for $owner/$name — continuing without a remote (create it by hand, then 'git remote add origin <url>')"
+    fi
+  fi
+
+  # 7. Register in the fleet registry (requirement 6) — delegates to fleet_register, never
+  #    re-implementing the registry write here.
+  local reg_args=("$path") a
+  # Bash-3.2-clean: "${aliases[@]}" on a declared-but-EMPTY array is an unbound-variable error under
+  # `set -u` on stock macOS bash (see fleet_register's own out_a guard above) — skip the loop entirely
+  # when no --alias was given, the common case.
+  if [ "${#aliases[@]}" -gt 0 ]; then
+    for a in "${aliases[@]}"; do reg_args+=(--alias "$a"); done
+  fi
+  fleet_register "${reg_args[@]}"
+
+  # 8. Journal the create (requirement 6) — best-effort, isolated subshell (mirrors _fleet_read_config's
+  #    lazy-source technique) so it can NEVER clobber this process's own ambient env, and never fatal.
+  (
+    cd "$path" 2>/dev/null || exit 0
+    HERD_CONFIG_FILE="$path/.herd/config"; export HERD_CONFIG_FILE
+    _fn_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=/dev/null
+    . "$_fn_dir/herd-config.sh"  2>/dev/null || exit 0
+    # shellcheck source=/dev/null
+    . "$_fn_dir/journal.sh"      2>/dev/null || exit 0
+    journal_append fleet_project_created path "$path" archetype "${archetype:-}" posture "${posture:-}" \
+      remote "${repo_slug:-none}"
+  ) 2>/dev/null || true
+
+  say ""
+  ok "herd fleet new complete: $path"
+  [ -n "$repo_slug" ] && say "  remote:      $repo_slug ($visibility)"
+  say "  registry:    $(_fleet_registry_file)"
+  say "  Next:        cd $path && bash ${HERDKIT_HOME:-\$HERDKIT_HOME}/scripts/herd/coordinator.sh   # launch the control room"
+}
+
 # ── register / list / discover ───────────────────────────────────────────────
 
 # fleet_register <path> [--alias <name>]... — resolve <path>, read its .herd/config, and append
