@@ -21,6 +21,13 @@
 # probe token there. The probe tokens config-viability.sh implements are: merge_method, delete_branch,
 # required_checks, model_driver.
 #
+# ONE probe is NOT config-key-keyed: the HERD-407 driver-CLI spawn-contract probe (_cv_probe_driver_cli)
+# checks the installed herdr against the driver seam's spawn contract (scripts/herd/driver.sh's
+# herd_driver_herdr_spawn_shape — the SAME cached detection the driver seam itself uses, never a second
+# parallel check) and always renders in the doctor section, independent of any coupled key resolving a
+# value. Grounded in herdr 0.7.5 (issues #514/#516/#526), which broke every spawn SILENTLY while the
+# control room looked healthy — this probe announces that class of drift at `herd doctor` time.
+#
 # CONVENTIONS (mirror AGENTS.md's fail-soft doctrine):
 #   • probes read LIVE external state on EVERY run — no seat-local cache that can go stale (multi-seat).
 #   • fail-soft OFFLINE: a probe that cannot reach gh / read the repo WARNS, never a red, never blocks.
@@ -270,6 +277,31 @@ _cv_probe_model_driver() {
   printf 'OK\t%s=%s — driver `%s` runtime `%s` is present and its one-shot exec is driveable.' "$key" "$val" "$drv" "${binary:-<default>}"
 }
 
+# ── Probe: driver-CLI spawn contract vs the installed herdr (HERD-407) ──────────────────────────────
+# NOT keyed to a config value — always run (see herd_config_viability_doctor_section). REUSES
+# scripts/herd/driver.sh's herd_driver_herdr_spawn_shape, the SAME cached help-text classification the
+# driver seam itself probes before a spawn, so this can never drift out of sync with the real dispatch
+# path. Read-only: no spawn, no tab, no pane. Fail-soft: herdr missing entirely is doctor's existing
+# hard-dependency check's job, so `absent` WARNs and never MISMATCHes.
+_cv_probe_driver_cli() {
+  if ! command -v herd_driver_herdr_spawn_shape >/dev/null 2>&1; then
+    printf 'WARN\tdriver-CLI spawn-contract probe unavailable (scripts/herd/driver.sh not loaded); not checked.'
+    return 0
+  fi
+  local shape; shape="$(herd_driver_herdr_spawn_shape 2>/dev/null || true)"
+  case "$shape" in
+    attach)
+      printf 'OK\therdr speaks the attach spawn CLI (`agent start --pane`) — matches the driver seam'"'"'s ATTACH contract.' ;;
+    legacy)
+      printf 'OK\therdr speaks the legacy spawn CLI (`agent start --workspace/--cwd`) — matches the driver seam'"'"'s pre-0.7.5 fallback.' ;;
+    absent)
+      printf 'WARN\therdr is not on PATH — the hard-dependency check already covers this; driver-CLI spawn-contract not checked.' ;;
+    *)
+      printf 'MISMATCH\therdr'"'"'s `agent start --help` matches NEITHER the attach CLI (--pane) nor the legacy CLI (--workspace/--cwd) shape the driver seam speaks — a spawn-contract drift (the HERD-407 class of footgun: herdr 0.7.5 broke every spawn SILENTLY, issues #514/#516/#526) that will fail every spawn. Fix: check the installed herdr version against docs/driver-abstraction.md, or update driver.sh for the new shape.' ;;
+  esac
+  return 0
+}
+
 # herd_config_viability_probe <key> <value> — dispatch KEY's declared env_coupling probe. Prints one
 # "<STATUS>\t<message>" line and ALWAYS returns 0; SKIP (empty message) when KEY is not coupled.
 herd_config_viability_probe() {
@@ -371,6 +403,16 @@ _cv_doctor_render_rows() {
     esac
     herd_config_viability_note "$key" "$val" "$status" "$msg" doctor
   done < <(_cv_coupled_keys)
+  # HERD-407: the driver-CLI spawn-contract probe is NOT keyed to a config value, so it always renders
+  # here rather than through the coupled-keys loop above.
+  out="$(_cv_probe_driver_cli 2>/dev/null || true)"
+  status="${out%%$'\t'*}"; msg="${out#*$'\t'}"
+  case "$status" in
+    OK)       printf '  \xe2\x9c\x93 %s\n' "$msg"; any=1 ;;
+    WARN)     printf '  \xe2\x9a\xa0 %s\n' "$msg"; any=1 ;;
+    MISMATCH) printf '  \xe2\x9c\x97 %s\n' "$msg"; any=1 ;;
+  esac
+  herd_config_viability_note DRIVER_CLI "$(herd_driver_herdr_spawn_shape 2>/dev/null || true)" "$status" "$msg" doctor
   [ "$any" -eq 1 ] || printf '  \xe2\x9c\x93 no externally-coupled config keys resolve a value in this project.\n'
   printf '  \033[2m(advisory — probes read live GitHub / PATH state each run; an offline probe warns, never blocks)\033[0m\n'
 }

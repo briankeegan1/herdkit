@@ -918,19 +918,52 @@ herd_driver_focus_agent() {
 # herd_write_task_spec's externalize-then-short-pointer shape) — ONE fix here heals every lane that
 # routes through this bridge, never a per-lane patch. The pre-0.7.5 argv path is untouched.
 
+# _herd_herdr_agent_start_help — the raw `herdr agent start --help` text, queried ONCE per process and
+# cached in a plain global (bash-3.2 safe) so every caller that needs to read the installed herdr's
+# spawn-contract shape (the attach-CLI probe below, and the HERD-407 driver-CLI viability probe in
+# config-viability.sh) shares the SAME one herdr call — never a second parallel detection path. Empty
+# when herdr is not on PATH; cached as a single space so a genuinely-empty help text is not re-probed.
+_herd_herdr_agent_start_help() {
+  if [ -z "${_HERD_HERDR_HELP_CACHE:-}" ]; then
+    _HERD_HERDR_HELP_CACHE="$(herdr agent start --help 2>&1 || true)"
+    [ -n "$_HERD_HERDR_HELP_CACHE" ] || _HERD_HERDR_HELP_CACHE=' '
+  fi
+  printf '%s' "$_HERD_HERDR_HELP_CACHE"
+}
+
 # _herd_herdr_attach_cli — success iff the installed herdr speaks the attach CLI (its
 # `agent start --help` documents --pane). Probed ONCE per process (cached in a plain global —
 # bash-3.2 safe); HERD_HERDR_ATTACH_CLI=yes|no bypasses the probe (tests / a wedged herdr).
 _herd_herdr_attach_cli() {
   case "${HERD_HERDR_ATTACH_CLI:-}" in yes) return 0 ;; no) return 1 ;; esac
-  if [ -z "${_HERD_HERDR_ATTACH_CACHE:-}" ]; then
-    local _hs_help; _hs_help="$(herdr agent start --help 2>&1 || true)"
-    case "$_hs_help" in
-      *--pane*) _HERD_HERDR_ATTACH_CACHE=yes ;;
-      *)        _HERD_HERDR_ATTACH_CACHE=no ;;
-    esac
+  case "$(_herd_herdr_agent_start_help)" in
+    *--pane*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# herd_driver_herdr_spawn_shape — classify the installed herdr's `agent start` spawn contract, read
+# from its --help text (HERD-407, grounded in issues #514/#516/#526: herdr 0.7.5 broke every spawn
+# SILENTLY while the control room looked healthy). Prints exactly one of:
+#   attach   herdr documents --pane (>=0.7.5) — the driver seam's ATTACH contract applies.
+#   legacy   herdr documents the pre-0.7.5 pane-creating flags (--workspace/--cwd) — the driver seam's
+#            legacy argv applies.
+#   unknown  herdr is on PATH but its help text matches NEITHER shape — a real spawn-contract drift.
+#   absent   herdr is not on PATH at all. Doctor's hard-dependency check already covers this; callers
+#            MUST treat `absent` as fail-soft, never as a contract mismatch.
+# Reuses _herd_herdr_agent_start_help's cached text — never a second `agent start --help` call.
+# HERD_HERDR_ATTACH_CLI=yes|no short-circuits to attach|legacy (tests that stub the boolean only).
+herd_driver_herdr_spawn_shape() {
+  case "${HERD_HERDR_ATTACH_CLI:-}" in yes) printf attach; return 0 ;; no) printf legacy; return 0 ;; esac
+  command -v herdr >/dev/null 2>&1 || { printf absent; return 0; }
+  local help; help="$(_herd_herdr_agent_start_help)"
+  case "$help" in
+    *--pane*) printf attach; return 0 ;;
+  esac
+  if grep -q -- '--workspace' <<< "$help" && grep -q -- '--cwd' <<< "$help"; then
+    printf legacy; return 0
   fi
-  [ "$_HERD_HERDR_ATTACH_CACHE" = yes ]
+  printf unknown
 }
 
 # _herd_externalize_pointer_arg <name> <arg> — issue #516: herdr's attach CLI cannot shell-encode a

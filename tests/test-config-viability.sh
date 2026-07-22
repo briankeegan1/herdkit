@@ -16,6 +16,9 @@
 #   (7) the same set is fail-soft when gh is offline (WARNS, proceeds, writes the value).
 #   (8) the doctor "Config viability" section renders each probe's ✓/⚠/✗ line.
 #   (9) a probe result lands as a config_viability journal event + a machine-readable report file.
+#   (10) HERD-407 driver-CLI spawn-contract probe (a stubbed `herdr agent start --help`, NOT keyed to
+#        a config value): the attach shape (--pane) → OK; the legacy shape (--workspace/--cwd) → OK;
+#        a garbage/unrecognized shape → MISMATCH; herdr absent from PATH → WARN (fail-soft).
 #
 # Run:  bash tests/test-config-viability.sh
 set -uo pipefail
@@ -227,5 +230,49 @@ assert "MERGE_METHOD" in d.get("mismatches",[]), d
 ' "$HERD_CONFIG_VIABILITY_REPORT" || fail "(9c) report JSON did not record the MERGE_METHOD MISMATCH"
 ok; echo "PASS (9) probe result lands as a config_viability journal event + machine-readable report"
 
+# ══ (10) HERD-407 driver-CLI spawn-contract probe ═════════════════════════════════════════════════
+# A stub herdr whose `agent start --help` shape is chosen via $HERDR_HELP_MODE (attach/legacy/garbage).
+HERDR_STUB="$T/herdr_stub"; mkdir -p "$HERDR_STUB"
+cat > "$HERDR_STUB/herdr" <<'EOF'
+#!/usr/bin/env bash
+case "${HERDR_HELP_MODE:-}" in
+  attach)  echo 'Usage: herdr agent start NAME --kind KIND --pane ID [-- ARG...]' ;;
+  legacy)  echo 'Usage: herdr agent start NAME --workspace WS --cwd DIR --tab TAB [--split DIR] --no-focus -- ARG...' ;;
+  garbage) echo 'Usage: herdr frobnicate --wat' ;;
+  *)       echo 'unrecognized' ;;
+esac
+exit 0
+EOF
+chmod +x "$HERDR_STUB/herdr"
+EMPTYBIN="$T/emptybin"; mkdir -p "$EMPTYBIN"
+
+# probe_driver_cli <status-var> <msg-var> <mode> [path] — run _cv_probe_driver_cli in a FRESH process
+# (per-process help-text cache) with the stub herdr's shape mode; PATH defaults to the stub.
+probe_driver_cli(){
+  local _sv="$1" _mv="$2" _mode="$3" _path="${4:-$HERDR_STUB:$PATH}"
+  local _out; _out="$(HERDR_HELP_MODE="$_mode" PATH="$_path" bash -c '
+    unset HERD_HERDR_ATTACH_CLI
+    . "'"$DRIVER"'"; . "'"$JOURNAL"'"; . "'"$CV"'"
+    _cv_probe_driver_cli' 2>/dev/null || true)"
+  printf -v "$_sv" '%s' "${_out%%$'\t'*}"
+  printf -v "$_mv" '%s' "${_out#*$'\t'}"
+}
+
+probe_driver_cli ST MSG attach
+[ "$ST" = OK ] || fail "(10a) the attach shape (--pane) must be OK (got '$ST': $MSG)"
+case "$MSG" in *attach*) : ;; *) fail "(10a) OK message should name the attach contract: $MSG" ;; esac
+
+probe_driver_cli ST MSG legacy
+[ "$ST" = OK ] || fail "(10b) the legacy shape (--workspace/--cwd) must be OK (got '$ST': $MSG)"
+case "$MSG" in *legacy*) : ;; *) fail "(10b) OK message should name the legacy contract: $MSG" ;; esac
+
+probe_driver_cli ST MSG garbage
+[ "$ST" = MISMATCH ] || fail "(10c) an unrecognized shape must MISMATCH (got '$ST': $MSG)"
+case "$MSG" in *attach*legacy*|*NEITHER*) : ;; *) : ;; esac
+
+probe_driver_cli ST MSG '' "/usr/bin:/bin:$EMPTYBIN"
+[ "$ST" = WARN ] || fail "(10d) herdr absent from PATH must WARN, never MISMATCH (got '$ST': $MSG)"
+ok; echo "PASS (10) HERD-407 driver-CLI spawn contract: attach→OK, legacy→OK, garbage→MISMATCH, absent→WARN"
+
 echo ""
-echo "ALL $PASSN tests PASSED — HERD-355 config viability preflight"
+echo "ALL $PASSN tests PASSED — HERD-355 config viability + HERD-407 driver-CLI probe"
