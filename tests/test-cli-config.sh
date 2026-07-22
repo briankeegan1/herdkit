@@ -261,4 +261,20 @@ run "$P7" config set WORKSPACE_NAME 'a$(id)'
 printf '%s\n' "$OUT" | grep -qi 'shell-active'    || fail "non-glob rejection message regressed ($OUT)"
 ok
 
+# ══ 15. HERD-413 SECURITY regression: the glob whitelist admits $ ( ) { } (real egrep syntax), so a
+# value SHAPED like a command substitution — e.g. $(touch<IFS>marker) — must never execute when
+# .herd/config is (re-)sourced as shell. Storage must single-quote a glob value (not the double-quote
+# format every other key uses), or $(...) would command-substitute at source time.
+P8="$T/p8"; mkdir "$P8"; _make_project "$P8"
+marker="$P8/PWNED"; rm -f "$marker"
+payload='$(touch$IFS'"$marker"')'
+run "$P8" config set TEST_PATH_GLOB "$payload"
+[ "$RC" -eq 0 ]                                   || fail "glob key rejected a \$(...)-shaped pattern ($OUT)"
+grep -qE "^TEST_PATH_GLOB='" "$P8/.herd/config"    || fail "glob value not stored single-quoted (command-substitution risk): $(grep TEST_PATH_GLOB "$P8/.herd/config")"
+( set +u; cd "$P8" && . ./.herd/config ) >/dev/null 2>&1
+[ -e "$marker" ]                                  && fail "SECURITY: sourcing .herd/config executed a \$(...) payload stored in a glob key"
+run "$P8" config get TEST_PATH_GLOB
+[ "$OUT" = "$payload" ]                           || fail "glob \$(...) payload did not round-trip byte-identical (got '$OUT')"
+ok
+
 echo "ALL PASS ($pass tests)"
