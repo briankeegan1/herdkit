@@ -102,14 +102,22 @@ fi
 ok
 
 # ── (4) shipped starter surfaces agree: cmd_init defaults == documented config.example tiers ──────
-for f in "$HERD" "$CFG_EXAMPLE"; do
-  grep -qE '^MODEL_QUICK="claude-haiku-4-5"'    "$f" || fail "(4) $f: MODEL_QUICK not eco haiku"
-  grep -qE '^MODEL_FEATURE="claude-sonnet-4-6"' "$f" || fail "(4) $f: MODEL_FEATURE not eco sonnet"
-  grep -qE '^MODEL_REVIEW="claude-sonnet-4-6"'  "$f" || fail "(4) $f: MODEL_REVIEW not eco sonnet"
-  # the starter surfaces must NOT default the escalation-reachable lanes to Opus anymore:
-  grep -qE '^MODEL_FEATURE="claude-opus-4-8"' "$f" && fail "(4) $f: MODEL_FEATURE still defaults to Opus"
-  grep -qE '^MODEL_REVIEW="claude-opus-4-8"'  "$f" && fail "(4) $f: MODEL_REVIEW still defaults to Opus"
-done
+# config.example still writes the literal KEY="value" line; bin/herd (HERD-409/#520) now defaults
+# these via `local model_*="<tier>"` so a named posture (docs-lab) can override the tier WITHOUT
+# duplicating the .herd/config line the base template already writes (see _posture_apply_bundle).
+# Both forms are checked for their respective file, so a drift in either still fails this test.
+grep -qE '(^|[[:space:]])model_quick="claude-haiku-4-5"($|[[:space:]])'   "$HERD" || fail "(4) $HERD: model_quick default not eco haiku"
+grep -qE '(^|[[:space:]])model_feature="claude-sonnet-4-6"($|[[:space:]])' "$HERD" || fail "(4) $HERD: model_feature default not eco sonnet"
+grep -qE '(^|[[:space:]])model_review="claude-sonnet-4-6"($|[[:space:]])'  "$HERD" || fail "(4) $HERD: model_review default not eco sonnet"
+# the starter surfaces must NOT default the escalation-reachable lanes to Opus anymore:
+grep -qE '(^|[[:space:]])model_feature="claude-opus-4-8"($|[[:space:]])' "$HERD" && fail "(4) $HERD: model_feature still defaults to Opus"
+grep -qE '(^|[[:space:]])model_review="claude-opus-4-8"($|[[:space:]])'  "$HERD" && fail "(4) $HERD: model_review still defaults to Opus"
+
+grep -qE '^MODEL_QUICK="claude-haiku-4-5"'    "$CFG_EXAMPLE" || fail "(4) $CFG_EXAMPLE: MODEL_QUICK not eco haiku"
+grep -qE '^MODEL_FEATURE="claude-sonnet-4-6"' "$CFG_EXAMPLE" || fail "(4) $CFG_EXAMPLE: MODEL_FEATURE not eco sonnet"
+grep -qE '^MODEL_REVIEW="claude-sonnet-4-6"'  "$CFG_EXAMPLE" || fail "(4) $CFG_EXAMPLE: MODEL_REVIEW not eco sonnet"
+grep -qE '^MODEL_FEATURE="claude-opus-4-8"' "$CFG_EXAMPLE" && fail "(4) $CFG_EXAMPLE: MODEL_FEATURE still defaults to Opus"
+grep -qE '^MODEL_REVIEW="claude-opus-4-8"'  "$CFG_EXAMPLE" && fail "(4) $CFG_EXAMPLE: MODEL_REVIEW still defaults to Opus"
 ok
 
 echo "ALL PASS ($pass checks)"

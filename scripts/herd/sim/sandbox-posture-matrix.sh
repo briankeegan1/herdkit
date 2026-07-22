@@ -58,8 +58,8 @@ if [ -z "$KEEP" ]; then trap 'rm -rf "$ART"' EXIT; fi
 # _scenario_for <posture> — echo the scenario path that proves this posture's invariant.
 _scenario_for() {
   case "$1" in
-    solo-auto|full-auto|team-approve|observe-only) printf '%s' "$CONC" ;;
-    gated-push|custom-steps)             printf '%s' "$GATE" ;;
+    solo-auto|full-auto|team-approve|observe-only|docs-lab) printf '%s' "$CONC" ;;
+    gated-push|custom-steps)                       printf '%s' "$GATE" ;;
     *) return 1 ;;
   esac
 }

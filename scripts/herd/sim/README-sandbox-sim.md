@@ -178,6 +178,7 @@ v2 will consume the same file). Each posture is a small named bundle of `.herd/c
 | `custom-steps` | `STEPS_PROFILE=approve-stage` | an approve-stage hold **releases exactly once per (sha,step)** |
 | `observe-only` | `MERGE_POLICY=observe` | **nothing merges, ever** |
 | `full-auto` | `MERGE_POLICY=auto` `REVIEW_AUTOFIX=true` `HEALTHCHECK_AUTOFIX=true` `COORDINATOR_AUTONOMY=full` `DEAD_BUILDER_AUTORESPAWN=on` `HUMAN_VERIFY_POLICY=coordinator` `STALE_BASE_AUTOFIX=on` `SWEEP_AUTO=auto` | drains fully — the engine-autonomous **hands-off** bundle (auto-merges on green like `solo-auto`, with the autofix/respawn/self-heal levers on) |
+| `docs-lab` | `MERGE_POLICY=auto` `DOCS_ONLY_GLOB=\.(md\|txt)$` `REVIEW_MODEL_DOCS=claude-haiku-4-5` `MODEL_FEATURE=claude-haiku-4-5` `MODEL_REVIEW=claude-haiku-4-5` | drains fully like `solo-auto` (HERD-409/#520: pairs with the docs/research-lab PROJECT ARCHETYPE — a cheap docs review tier + lighter model tiers, no merge-behavior change) |
 
 Each posture routes to the scenario that structurally exercises its invariant and runs it with the new
 `--posture` flag (the merge-policy postures through `sandbox-concurrency-scenario.sh`, which drives the
@@ -202,7 +203,7 @@ The default (no `--posture`) invocation of either scenario is **byte-identical**
 logic is inert when unset, so the per-merge sims stay cheap. The matrix is an **explicit** invocation
 (a nightly candidate, not a per-merge gate). Hermetic proof:
 [`../../../tests/test-sandbox-posture-matrix.sh`](../../../tests/test-sandbox-posture-matrix.sh) — the
-six posture invariants, the caught fault, and the byte-identical solo-auto check.
+seven posture invariants, the caught fault, and the byte-identical solo-auto check.
 
 ## P2a — end-to-end LIMIT-PARK / AUTO-RESUME scenario — `sandbox-limit-resume-scenario.sh`
 

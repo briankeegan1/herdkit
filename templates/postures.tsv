@@ -21,7 +21,7 @@
 #   intent  one-line human description of the stance — what this posture is FOR (surfaced by HERD-141).
 #
 # Blank lines and lines whose first field starts with '#' are ignored; the columns are tab-separated.
-# The six rows below are the canonical postures the posture-matrix sim asserts an invariant for.
+# The seven rows below are the canonical postures the posture-matrix sim asserts an invariant for.
 name	keys	intent
 solo-auto	MERGE_POLICY=auto	Solo operator, full autonomy: the watcher runs every gate and auto-merges — today's fixture default, no human in the merge loop.
 team-approve	MERGE_POLICY=approve HUMAN_VERIFY_POLICY=hold	Team review: gates run to green, then the merge HOLDS for a sha-keyed human approval — nothing lands without an explicit approve.
@@ -29,3 +29,4 @@ gated-push	PUSH_GATE=human PR_FLOW=draft	Locked-down egress: a finished builder 
 custom-steps	STEPS_PROFILE=approve-stage	Operator-defined pipeline: a .herd/steps.tsv adds an approve-stage the lane must hold on and a human must release, on top of the built-in review/health floor.
 observe-only	MERGE_POLICY=observe	Watch-only shadow mode: the watcher runs every gate and reports/notifies but NEVER merges — for dry-running the loop against a repo you do not yet let it land into.
 full-auto	MERGE_POLICY=auto REVIEW_AUTOFIX=true HEALTHCHECK_AUTOFIX=true COORDINATOR_AUTONOMY=full DEAD_BUILDER_AUTORESPAWN=on HUMAN_VERIFY_POLICY=coordinator STALE_BASE_AUTOFIX=on SWEEP_AUTO=auto	Engine-autonomous ops: the human steers WHAT — or delegates even that to a full-autonomy coordinator — while the engine owns the rest: auto-merge on green, auto-fix BLOCK reviews and red healthchecks, respawn dead builders, self-heal stale bases, run human-verify steps via the coordinator, and self-sweep debris — a hands-off unattended loop.
+docs-lab	MERGE_POLICY=auto DOCS_ONLY_GLOB=\.(md|txt)$ REVIEW_MODEL_DOCS=claude-haiku-4-5 MODEL_FEATURE=claude-haiku-4-5 MODEL_REVIEW=claude-haiku-4-5	Docs/research-lab bundle (HERD-409, issue #520): pairs with the docs/research-lab PROJECT ARCHETYPE (templates/archetypes.tsv) — pure-doc diffs route to the cheap DOCS_ONLY_GLOB review tier, and the feature/review model tiers default to the cheapest (haiku), since a markdown-lint healthcheck needs no heavy model.

@@ -1,0 +1,29 @@
+# templates/archetypes.tsv — the CANONICAL PROJECT ARCHETYPES (HERD-409): the committed,
+# authoritative axis of PROJECT KIND, orthogonal to the operating postures in templates/postures.tsv
+# (postures answer "who merges / does a human approve"; archetypes answer "what IS this project" —
+# a codebase with a test suite, or a docs/research repo with none). `herd init` (bin/herd) offers the
+# named archetypes here at init time, records the choice as the validated PROJECT_ARCHETYPE key in
+# .herd/config, and consults it to pick the seeded healthcheck template + frame the health/preview
+# interview questions. Keep it authoritative: add an archetype here (not hardcoded in bin/herd) and
+# every consumer picks it up.
+#
+# Grounding (HERD-409): a non-code project ran `herd init`; scout correctly reported
+# language=unknown, but init still seeded the Python-test-suite EXAMPLE healthcheck and the
+# interview assumed a test/lint/app-preview shape — there was no way to say "this project has no
+# test suite to run."
+#
+# Format — one TAB-SEPARATED row per archetype (columns separated by a literal tab, NOT spaces):
+#     name <TAB> healthcheck_template <TAB> intent
+#
+#   name                 kebab-case archetype id — stable; the PROJECT_ARCHETYPE config value.
+#   healthcheck_template the templates/healthcheck.*.sh basename `herd init` seeds
+#                         .herd/healthcheck.project.sh from for this archetype, OR the literal
+#                         token "auto" meaning "defer to scout's detected language" (the `code`
+#                         archetype's stack-aware behavior, unchanged since before HERD-409).
+#   intent                one-line human description of what kind of project this is FOR.
+#
+# Blank lines and lines whose first field starts with '#' are ignored; the columns are tab-separated.
+name	healthcheck_template	intent
+code	auto	Software project: a test/lint suite exists to run. Seeded healthcheck is chosen from scout's detected language (Go/Rust/Java/Node/Python) via the stack-aware templates — the default archetype, byte-identical to pre-HERD-409 init.
+research-lab	healthcheck.docs.sh	Research/experiment repo: no runnable app or test suite. Seeded healthcheck lints markdown docs (fenced-block + relative-link + template-conformance checks) instead of running a test suite; the interview skips app-preview framing.
+docs	healthcheck.docs.sh	Documentation-only project: same markdown/link/template-conformance healthcheck as research-lab; the interview frames the health question around doc linting, not a test/lint/app-preview stack.

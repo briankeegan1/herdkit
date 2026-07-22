@@ -101,6 +101,7 @@ Role summarized from each file's top-of-file comment.
 
 ### Templates (`templates/`)
 
+- `archetypes.tsv` — templates/archetypes.tsv — the CANONICAL PROJECT ARCHETYPES (HERD-409): the committed,
 - `capabilities.tsv` — (tab-separated manifest — no header comment)
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
 - `conformance.tsv` — (tab-separated manifest — no header comment)
@@ -109,6 +110,7 @@ Role summarized from each file's top-of-file comment.
 - `coordinator.md.tmpl` — (render template — no header comment)
 - `fleet-coordinator.md.tmpl` — (render template — no header comment)
 - `governance-map.tsv` — templates/governance-map.tsv — the DETERMINISTIC governance-adoption pattern table (HERD-119).
+- `healthcheck.docs.sh` — healthcheck.docs.sh (EXAMPLE) — the per-project health command for a docs / research-lab
 - `healthcheck.go.sh` — healthcheck.go.sh (EXAMPLE) — a per-project health command for a Go project.
 - `healthcheck.java.sh` — healthcheck.java.sh (EXAMPLE) — a per-project health command for a Java project (Maven or Gradle).
 - `healthcheck.node.sh` — healthcheck.node.sh (EXAMPLE) — a per-project health command for a Node project.
@@ -280,6 +282,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `OPERATOR_INBOX` → `agent-watch.sh`
 - `ORPHAN_PR_ROWS` → `agent-watch.sh`
 - `OSS_TRIAGE` → `bin/herd`, `oss-triage.sh`
+- `PROJECT_ARCHETYPE` → `bin/herd`
 - `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`

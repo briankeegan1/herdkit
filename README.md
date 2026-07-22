@@ -392,7 +392,11 @@ herd init          # interviews + scouts the repo, writes .herd/config, renders 
 `herd init` **scouts** the repo (language/build, CI, branch protection, existing trackers) — and is
 **stack-aware**: it detects the language (node / python / go / rust / java) and seeds
 `.herd/healthcheck.project.sh` from the matching template, leaving non-Python repos free of
-Python-shaped defaults. It runs the **work-tracker discovery dialogue** (detects `BACKLOG.md` /
+Python-shaped defaults. It also asks for a **project archetype** — `code` (default; the stack-aware
+seeding above), `research-lab`, or `docs` — for a repo with no test suite to run: those two seed a
+markdown/link/template-conformance lint instead, so a docs-only or research repo with
+`language=unknown` never gets stuck with the Python-test-suite example. It runs the **work-tracker
+discovery dialogue** (detects `BACKLOG.md` /
 `TODO.md` / `CHANGELOG` / GitHub Issues; asks whether you use Linear/Jira), then writes:
 
 - **`.herd/config`** — your project's answers (paths, default branch, model map, health/preview
