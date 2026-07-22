@@ -2815,9 +2815,13 @@ _retire_reviewer_pane() {
     # mismatch the guard REFUSES and journals pane_close_refused, so we journal reviewer_pane_retired
     # ONLY on a real close. The registry row is dropped unconditionally below either way — a row that
     # pointed at the wrong pane must not linger to be retried.
-    # HERD-418: "review" (no separator) matches BOTH the pretty label ("pane:review·<slug>") and the
-    # sanitized registered agent name ("agent:review-<slug>") — a dotted kind would miss the latter.
-    if herd_close_pane_verified "$pane" "review"; then
+    # HERD-418 (review fix): ":review" — colon-anchored, not a bare word — matches BOTH the pretty
+    # label ("pane:review·<slug>") and the sanitized registered agent name ("agent:review-<slug>"),
+    # because herd_driver_pane_identity's tag:value shape carries exactly ONE colon (right after
+    # "agent"/"pane"), so ":review" can only match immediately after it — never a co-tab pane whose
+    # SLUG merely contains "review" (e.g. a builder on "fix-review-race", identity "agent:fix-review-
+    # race", has no colon before "review" and is correctly excluded).
+    if herd_close_pane_verified "$pane" ":review"; then
       journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
     fi
   fi
@@ -4394,9 +4398,10 @@ _retire_resolver_pane() {
   [ -f "$reg" ] || return 0
   read -r pane tab placement _ < "$reg" 2>/dev/null || true
   if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
-    # HERD-418: "resolve" (no separator) matches BOTH the pretty label and the sanitized registered
-    # agent name ("agent:resolve-<slug>").
-    if herd_close_pane_verified "$pane" "resolve"; then
+    # HERD-418 (review fix): ":resolve" — colon-anchored — matches BOTH the pretty label
+    # ("pane:resolve·<slug>") and the sanitized agent name ("agent:resolve-<slug>") without matching
+    # an unrelated co-tab slug that merely CONTAINS "resolve" (e.g. "agent:fix-resolve-race").
+    if herd_close_pane_verified "$pane" ":resolve"; then
       journal_append resolver_pane_retired pr "$pr" sha "$sha" pane "$pane" \
         placement "${placement:--}" reason "$reason"
       if [ "${placement:-}" = "tab" ] && [ -n "${tab:-}" ] && [ "$tab" != "-" ]; then
@@ -4808,8 +4813,9 @@ _reap_idle_resolver_for_redispatch() {
   # under RESOLVER_PANE=on, so the pre-HERD-280 lane makes no extra driver call.
   if _resolver_pane_enabled && [ -z "${_rir_tab:-}" ]; then
     local _rir_pane; _rir_pane="$(herd_driver_agent_pane_id "resolve·${_rir_slug}" 2>/dev/null || true)"
-    # HERD-418: "resolve" (no separator) matches both the pretty label and the sanitized agent name.
-    if [ -n "$_rir_pane" ] && herd_close_pane_verified "$_rir_pane" "resolve"; then
+    # HERD-418 (review fix): ":resolve" — colon-anchored — matches both the pretty label and the
+    # sanitized agent name without matching an unrelated co-tab slug that merely contains "resolve".
+    if [ -n "$_rir_pane" ] && herd_close_pane_verified "$_rir_pane" ":resolve"; then
       journal_append resolver_pane_retired slug "$_rir_slug" pane "$_rir_pane" \
         placement split reason idle-redispatch
     fi

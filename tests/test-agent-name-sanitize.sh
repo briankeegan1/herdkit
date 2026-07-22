@@ -15,6 +15,11 @@
 #   3. LOOKUP: herd_driver_agent_pane_id and herd_driver_agent_liveness find the pane of an agent
 #      registered under the sanitized name when QUERIED with the original dotted request — the exact
 #      registration/lookup agreement HERD-418 requires.
+#   4. GUARDED CLOSE (HERD-134) stays PRECISE after sanitization: herd_close_pane_verified's
+#      colon-anchored ":review"/":resolve" kind closes a genuine reviewer/resolver pane (whether its
+#      live identity is the sanitized agent-name form or the pretty label form) but REFUSES an
+#      unrelated co-tab pane whose slug merely CONTAINS the word (e.g. a builder on "fix-resolve-race"
+#      — the pre-merge review finding this test locks in).
 #
 # Fully hermetic: local temp dirs + a stub herdr on PATH. NO real herdr/claude/gh/network.
 # Run:  bash tests/test-agent-name-sanitize.sh
@@ -221,5 +226,80 @@ JSON
 ) || fail "herd_driver_agent_liveness did not resolve the dotted request against the sanitized roster entry"
 ok
 echo "PASS (3b) herd_driver_agent_liveness resolves a dotted request via the sanitized roster name (never 'missing')"
+
+# ── 4. guarded close stays precise: colon-anchored kind vs. a merely-substring-matching neighbour ──
+
+BIN3="$T/bin3"; mkdir -p "$BIN3"
+STATE3="$T/state3"; mkdir -p "$STATE3"
+cat > "$BIN3/herdr" <<'STUB'
+#!/usr/bin/env bash
+STATE="${HERDR_STUB_STATE:?HERDR_STUB_STATE unset}"
+if [ "${1:-}" = "agent" ] && [ "${2:-}" = "list" ]; then
+  cat "$STATE/agents.json" 2>/dev/null || printf '{"result":{"agents":[]}}\n'
+  exit 0
+fi
+if [ "${1:-}" = "pane" ] && [ "${2:-}" = "list" ]; then
+  cat "$STATE/panes.json" 2>/dev/null || printf '{"result":{"panes":[]}}\n'
+  exit 0
+fi
+if [ "${1:-}" = "pane" ] && [ "${2:-}" = "close" ]; then
+  printf '%s\n' "${3:-}" >> "$STATE/closed.log"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$BIN3/herdr"
+
+# (4a) BLOCKING finding repro: a builder pane whose SLUG merely contains "resolve" must survive a
+# resolver-pane retire — a bare "resolve" kind would wrongly close it; ":resolve" must not.
+( set +e
+  export HERD_DRIVER="herdr-claude" PATH="$BIN3:$PATH" HERDR_STUB_STATE="$STATE3"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  : > "$STATE3/closed.log"
+  cat > "$STATE3/agents.json" <<'JSON'
+{"result":{"agents":[{"name":"fix-resolve-race","agent":"","pane_id":"pane-builder"}]}}
+JSON
+  herd_close_pane_verified pane-builder ":resolve"
+  rc=$?
+  closed="$(cat "$STATE3/closed.log" 2>/dev/null || true)"
+  if [ -n "$closed" ]; then
+    echo "FAIL: an unrelated builder pane (identity agent:fix-resolve-race) was closed by kind ':resolve'"; exit 1
+  fi
+  [ "$rc" -ne 0 ] || { echo "FAIL: herd_close_pane_verified returned success for a non-match"; exit 1; }
+  exit 0
+) || fail "guarded close wrongly closed a co-tab pane whose slug merely contains the role word"
+ok
+echo "PASS (4a) a co-tab pane whose slug merely CONTAINS 'resolve' survives a ':resolve' guarded close"
+
+# (4b) the real cases still work: a resolver registered under the sanitized agent-name form closes.
+( set +e
+  export HERD_DRIVER="herdr-claude" PATH="$BIN3:$PATH" HERDR_STUB_STATE="$STATE3"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  : > "$STATE3/closed.log"
+  reg_name="$(herd_agent_name_sanitize 'resolve·myslug')"
+  printf '{"result":{"agents":[{"name":"%s","agent":"","pane_id":"pane-r1"}]}}\n' "$reg_name" > "$STATE3/agents.json"
+  herd_close_pane_verified pane-r1 ":resolve" || { echo "FAIL: rc"; exit 1; }
+  grep -qxF pane-r1 "$STATE3/closed.log" || { echo "FAIL: sanitized-agent-name resolver pane was not closed"; exit 1; }
+  exit 0
+) || fail "guarded close failed to close a real resolver pane registered under its sanitized agent name"
+ok
+echo "PASS (4b) a resolver pane registered as the SANITIZED agent name closes on ':resolve'"
+
+# (4c) the pretty-label form (a delisted agent / the standalone fallback tab) still closes too.
+( set +e
+  export HERD_DRIVER="herdr-claude" PATH="$BIN3:$PATH" HERDR_STUB_STATE="$STATE3"
+  # shellcheck source=/dev/null
+  . "$DRIVER_SH"
+  : > "$STATE3/closed.log"
+  printf '{"result":{"agents":[]}}\n' > "$STATE3/agents.json"
+  printf '{"result":{"panes":[{"pane_id":"pane-r2","label":"resolve·myslug"}]}}\n' > "$STATE3/panes.json"
+  herd_close_pane_verified pane-r2 ":resolve" || { echo "FAIL: rc"; exit 1; }
+  grep -qxF pane-r2 "$STATE3/closed.log" || { echo "FAIL: pretty-label resolver pane was not closed"; exit 1; }
+  exit 0
+) || fail "guarded close failed to close a resolver pane identified only by its pretty label"
+ok
+echo "PASS (4c) a resolver pane identified only by its pretty 'resolve·' label closes on ':resolve'"
 
 echo "ALL PASS ($pass checks)"

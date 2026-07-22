@@ -244,8 +244,12 @@ _teardown_reviewer() {
     # GUARDED CLOSE (HERD-134): ROOT is our own review split inside the builder's SHARED tab. Verify it
     # is still a reviewer pane before closing so a stale/recycled id cannot vaporise the builder pane on
     # our way out; a mismatch REFUSES + journals pane_close_refused rather than killing a neighbour.
-    # HERD-418: "review" (no separator) matches BOTH the pretty label and the sanitized agent name.
-    herd_close_pane_verified "$ROOT" "review" || true
+    # HERD-418 (review fix): ":review" — colon-anchored, not a bare word — matches BOTH the pretty
+    # label ("pane:review·<slug>") and the sanitized agent name ("agent:review-<slug>") without
+    # matching a co-tab pane whose SLUG merely contains "review" (herd_driver_pane_identity's
+    # tag:value shape carries exactly one colon, right after "agent"/"pane", so ":review" can only
+    # match there).
+    herd_close_pane_verified "$ROOT" ":review" || true
   fi
   # We closed our own pane here, so drop the dispatch-registry row too (HERD-113) — nothing survives
   # this exit path for the watcher to retire. Best-effort; a missing file is fine.
@@ -790,7 +794,8 @@ except Exception:
     # the id can go stale/recycled before we close it — and it lives INSIDE the builder's shared tab,
     # so a wrong id vaporises the live builder pane. Verify it is still a reviewer before closing; on a
     # mismatch the guard REFUSES + journals pane_close_refused instead of killing a neighbour.
-    [ -n "${_stale_review_pane:-}" ] && herd_close_pane_verified "$_stale_review_pane" "review" || true
+    # HERD-418 (review fix): ":review" is colon-anchored — see _teardown_reviewer above.
+    [ -n "${_stale_review_pane:-}" ] && herd_close_pane_verified "$_stale_review_pane" ":review" || true
     # Also retire any standalone review·<slug> fallback tab (+ its registry line) from an earlier
     # round, so flipping from standalone back to builder-tab placement never orphans a tab.
     _purge_stale_review_tab

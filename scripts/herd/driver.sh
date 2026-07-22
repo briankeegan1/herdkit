@@ -639,11 +639,20 @@ _herd_pane_close_refused_journal() {
 
 # herd_close_pane_verified <pane-id> <expected-kind> — the ONE guarded pane-close every engine actor
 # routes through (HERD-134). Reads the pane's LIVE identity (herd_driver_pane_identity) and closes it
-# ONLY when that identity CONTAINS <expected-kind> (e.g. "review·" for a reviewer split/pane). On a
-# mismatch — the pane id is stale/recycled and now names an innocent neighbour (the builder kill) — it
-# REFUSES the close and journals pane_close_refused with BOTH identities. On an unreadable identity it
-# also refuses (fail-soft: never close blind, journal and move on). Returns 0 IFF the pane was closed.
-# BYTE-IDENTICAL when identities match: a normal retire closes exactly as before.
+# ONLY when that identity CONTAINS <expected-kind> (e.g. "agent:builder-slug" for a builder's own
+# pane). On a mismatch — the pane id is stale/recycled and now names an innocent neighbour (the
+# builder kill) — it REFUSES the close and journals pane_close_refused with BOTH identities. On an
+# unreadable identity it also refuses (fail-soft: never close blind, journal and move on). Returns 0
+# IFF the pane was closed. BYTE-IDENTICAL when identities match: a normal retire closes exactly as
+# before.
+# HERD-418: <expected-kind> is matched as a plain SUBSTRING anywhere in the identity, so a bare role
+# word (e.g. "review") also matches any co-tab pane whose slug merely CONTAINS that word (a builder on
+# "fix-review-race" reads "agent:fix-review-race"). A caller whose role can surface under BOTH the
+# sanitized agent-name form ("agent:review-<slug>") and the pretty label form ("pane:review·<slug>")
+# — the reviewer/resolver panes, since herd_agent_name_sanitize maps their middle-dot separator to a
+# dash — must pass a COLON-ANCHORED kind (":review", not "review") so it only matches immediately
+# after the fixed "agent:"/"pane:" tag, where herd_driver_pane_identity's tag:value shape carries its
+# one and only colon.
 herd_close_pane_verified() {
   local pane="${1:-}" kind="${2:-}"
   [ -n "$pane" ] || return 1
@@ -969,6 +978,14 @@ herd_driver_agent_herdr_kind() {
 # remaining character outside [a-z0-9_-] to a single dash; a result not starting with a lowercase
 # letter is prefixed with a single 'a' (spends 1 of the 32 chars, not the 2 an 'a-' filler would); then
 # truncated to the 32-char budget.
+# COLLISION NOTE: the mapping is many-to-one, not a namespaced encoding, so two DIFFERENT requested
+# names can sanitize to the SAME herdr name — e.g. a reviewer role 'review·widget' and a builder slug
+# literally named 'review-widget' both map to 'review-widget'; a 32+ char slug that only differs past
+# char 32 also collides on truncation. Both are narrow (a builder slug colliding with a role prefix, or
+# two slugs differing only past the 32-char mark) and unresolved here — callers that need to tell such
+# collisions apart should keep the role/slug namespaces disjoint at the point they choose names, not
+# rely on the registered herdr name for that distinction (herd_close_pane_verified's callers must, for
+# exactly this reason, colon-anchor an expected-kind — see its own header comment).
 herd_agent_name_sanitize() {
   local raw="${1:-}"
   printf '%s' "$raw" | python3 -c '
