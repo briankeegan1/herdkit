@@ -225,6 +225,11 @@ _tsweep_ref_backend_mismatch() {
 # unresolvable journal event's detail. Never a resolution path — mixing github's numbering into a
 # non-github backend's heal would risk resolving the WRONG item if a numeric id ever collides with a
 # real local one (the latent hazard above). Fail-soft: prints nothing on any absence/error.
+# HERD_REPO is NOT set by this script — it is the existing config key herd-config.sh already sources
+# above (default EMPTY: `: "${HERD_REPO:=""}"`), the same one the github backend uses for its own
+# issue ops. This function adds no new required input: on a project that has it configured, the
+# evidence lookup fires for free; everywhere else it stays silently empty (fail-soft), exactly as
+# before this function existed.
 _tsweep_gh_evidence() {
   local num="${1#\#}"
   [ -n "${HERD_REPO:-}" ] || return 0
