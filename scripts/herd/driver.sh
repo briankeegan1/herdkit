@@ -363,6 +363,8 @@ herd_driver_report_agent() {
   [ -n "$slug" ] && [ -n "$pane" ] || return 0
   _herd_driver_is_headless && return 0
   command -v herdr >/dev/null 2>&1 || return 0
+  # HERD-418: sanitize the registered `--agent` identity, same as every other herdr registration seam.
+  slug="$(herd_agent_name_sanitize "$slug")"
   # herdr 0.7.5 made --source REQUIRED (issue #514 fallout); older herdr may not know the flag, so
   # fall back to the bare shape it accepted. Best-effort either way (the fail-soft contract above).
   herdr pane report-agent "$pane" --source herd --agent "$slug" --state "$state" >/dev/null 2>&1 \
@@ -637,11 +639,20 @@ _herd_pane_close_refused_journal() {
 
 # herd_close_pane_verified <pane-id> <expected-kind> — the ONE guarded pane-close every engine actor
 # routes through (HERD-134). Reads the pane's LIVE identity (herd_driver_pane_identity) and closes it
-# ONLY when that identity CONTAINS <expected-kind> (e.g. "review·" for a reviewer split/pane). On a
-# mismatch — the pane id is stale/recycled and now names an innocent neighbour (the builder kill) — it
-# REFUSES the close and journals pane_close_refused with BOTH identities. On an unreadable identity it
-# also refuses (fail-soft: never close blind, journal and move on). Returns 0 IFF the pane was closed.
-# BYTE-IDENTICAL when identities match: a normal retire closes exactly as before.
+# ONLY when that identity CONTAINS <expected-kind> (e.g. "agent:builder-slug" for a builder's own
+# pane). On a mismatch — the pane id is stale/recycled and now names an innocent neighbour (the
+# builder kill) — it REFUSES the close and journals pane_close_refused with BOTH identities. On an
+# unreadable identity it also refuses (fail-soft: never close blind, journal and move on). Returns 0
+# IFF the pane was closed. BYTE-IDENTICAL when identities match: a normal retire closes exactly as
+# before.
+# HERD-418: <expected-kind> is matched as a plain SUBSTRING anywhere in the identity, so a bare role
+# word (e.g. "review") also matches any co-tab pane whose slug merely CONTAINS that word (a builder on
+# "fix-review-race" reads "agent:fix-review-race"). A caller whose role can surface under BOTH the
+# sanitized agent-name form ("agent:review-<slug>") and the pretty label form ("pane:review·<slug>")
+# — the reviewer/resolver panes, since herd_agent_name_sanitize maps their middle-dot separator to a
+# dash — must pass a COLON-ANCHORED kind (":review", not "review") so it only matches immediately
+# after the fixed "agent:"/"pane:" tag, where herd_driver_pane_identity's tag:value shape carries its
+# one and only colon.
 herd_close_pane_verified() {
   local pane="${1:-}" kind="${2:-}"
   [ -n "$pane" ] || return 1
@@ -715,12 +726,17 @@ herd_driver_agent_liveness() {
     return 0
   fi
   command -v herdr >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  # HERD-418: the roster's `name`/`agent` identity is whatever herdr actually REGISTERED — the
+  # sanitized name for a dotted role (resolve·/review·) — while a pane LABEL stays the pretty
+  # requested form (set via herd_driver_pane_rename / --label, never sanitized). Match each against
+  # the right form so a delisted-but-labelled pane and a live-but-renamed-roster pane both resolve.
+  local reg_slug; reg_slug="$(herd_agent_name_sanitize "$slug")"
   # Resolve the agent's pane when the caller didn't pass one. herdr carries the identity in EITHER
   # `name` (a builder started via `herdr agent start <slug>`) or `agent` (one reported via
   # `herdr pane report-agent --agent <slug>`), so match both — the same tolerance herdr's own consumers
   # use — so the probe finds the pane however the agent was registered.
   if [ -z "$pane" ]; then
-    pane="$(herdr agent list 2>/dev/null | SLUG="$slug" python3 -c '
+    pane="$(herdr agent list 2>/dev/null | SLUG="$reg_slug" python3 -c '
 import sys, json, os
 slug = os.environ["SLUG"]
 try:
@@ -821,7 +837,9 @@ herd_driver_agent_pane_id() {
   [ -n "$slug" ] || return 0
   _herd_driver_is_headless && return 0
   command -v herdr >/dev/null 2>&1 || return 0
-  herdr agent list 2>/dev/null | SLUG="$slug" python3 -c '
+  # HERD-418: match on the REGISTERED (sanitized) name — a dotted role request (resolve·/review·)
+  # never appears verbatim in the roster, so a raw comparison would never find the pane.
+  herdr agent list 2>/dev/null | SLUG="$(herd_agent_name_sanitize "$slug")" python3 -c '
 import sys, json, os
 slug = os.environ["SLUG"]
 try:
@@ -877,7 +895,8 @@ herd_driver_focus_agent() {
   if _herd_driver_is_headless; then
     printf 'headless: no pane to focus for %s. Tail its log:\n  tail -f %s\n' "$slug" "$(_herd_agent_dir "$slug")/log"
   else
-    herdr agent focus "$slug" 2>/dev/null || true
+    # HERD-418: focus by the REGISTERED (sanitized) name — a raw dotted role name was never registered.
+    herdr agent focus "$(herd_agent_name_sanitize "$slug")" 2>/dev/null || true
   fi
   return 0
 }
@@ -947,6 +966,38 @@ herd_driver_agent_herdr_kind() {
   printf '%s' "${k:-claude}"
 }
 
+# herd_agent_name_sanitize <name> — HERD-418: herdr ≥0.7.5 validates the agent NAME strictly (must
+# start with a lowercase letter; only lowercase letters, digits, dash, underscore; 1-32 chars), so the
+# engine's dotted role names (resolve·<slug>, review·<slug> — the middle-dot separator, kept elsewhere
+# as the pretty pane/tab LABEL) fail outright with invalid_agent_name. This is the ONE sanitizer every
+# registration AND lookup site routes through, so the two can never derive a different name for the
+# same request. PURE (no herdr call, no side effects) and DETERMINISTIC: the same input always maps to
+# the same output, so a caller that re-derives the name at lookup time (rather than remembering the
+# exact string it registered) still finds the right agent — no hash suffix needed for that stability.
+# Case-folds first (so an uppercase letter survives instead of becoming a dash), then maps every
+# remaining character outside [a-z0-9_-] to a single dash; a result not starting with a lowercase
+# letter is prefixed with a single 'a' (spends 1 of the 32 chars, not the 2 an 'a-' filler would); then
+# truncated to the 32-char budget.
+# COLLISION NOTE: the mapping is many-to-one, not a namespaced encoding, so two DIFFERENT requested
+# names can sanitize to the SAME herdr name — e.g. a reviewer role 'review·widget' and a builder slug
+# literally named 'review-widget' both map to 'review-widget'; a 32+ char slug that only differs past
+# char 32 also collides on truncation. Both are narrow (a builder slug colliding with a role prefix, or
+# two slugs differing only past the 32-char mark) and unresolved here — callers that need to tell such
+# collisions apart should keep the role/slug namespaces disjoint at the point they choose names, not
+# rely on the registered herdr name for that distinction (herd_close_pane_verified's callers must, for
+# exactly this reason, colon-anchor an expected-kind — see its own header comment).
+herd_agent_name_sanitize() {
+  local raw="${1:-}"
+  printf '%s' "$raw" | python3 -c '
+import re, sys
+s = sys.stdin.read().lower()
+s = re.sub(r"[^a-z0-9_-]", "-", s)
+if not re.match(r"^[a-z]", s):
+    s = "a" + s
+sys.stdout.write(s[:32])
+'
+}
+
 # _herd_herdr_tab_root_pane <tab> — the FIRST pane herdr lists for <tab>: a lane-created tab holds
 # exactly its root at launch time, and for a shared tab the first-listed pane is the root the splits
 # hang off (`tab get` carries no pane ids). Empty on any failure — fail-soft.
@@ -976,6 +1027,9 @@ except Exception:
 herd_driver_herdr_attach_agent() {
   local an_name="$1" an_driver="$2" an_root="$3" an_cwd="$4" an_split="$5" an_focus="$6"
   shift 6
+  # HERD-418: sanitize the REGISTERED name here — the one seam every attach-CLI caller (builder start
+  # + the generalized launch-agent seam) funnels through — so a dotted role name never reaches herdr.
+  an_name="$(herd_agent_name_sanitize "$an_name")"
   local -a an_env=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do an_env+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
@@ -1113,7 +1167,9 @@ _herd_herdr_start_agent() {
     local -a envargs=()
     for _ep in ${envkv[@]+"${envkv[@]}"}; do envargs+=(--env "$_ep"); done
     # shellcheck disable=SC2086  # $wsid intentionally word-splits (mirrors the lane's args)
-    if herdr agent start "$slug" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus ${envargs[@]+"${envargs[@]}"} -- "${rt[@]}" >/dev/null 2>&1; then
+    # HERD-418: pre-0.7.5 herdr also validates the agent name; sanitizing here too is simpler than
+    # branching — a builder slug is already valid so this is a no-op for the common case.
+    if herdr agent start "$(herd_agent_name_sanitize "$slug")" ${wsid:+--workspace "$wsid"} --cwd "$wt" --tab "$tab" ${split:+--split "$split"} --no-focus ${envargs[@]+"${envargs[@]}"} -- "${rt[@]}" >/dev/null 2>&1; then
       return 0
     fi
   fi
@@ -1261,8 +1317,9 @@ except Exception:
     return
   fi
   # pre-0.7.5 herdr: build the exact argv the lane hardcoded (indexed array — bash-3.2 safe).
+  # HERD-418: sanitize the REGISTERED name; a bare-CLI herdr validates it exactly like the attach CLI.
   local -a argv
-  argv=(herdr agent start "$sa_name")
+  argv=(herdr agent start "$(herd_agent_name_sanitize "$sa_name")")
   [ -n "$ws" ] && argv+=(--workspace "$ws")
   argv+=(--cwd "$sa_cwd")
   [ -n "$sa_tab" ] && argv+=(--tab "$sa_tab")

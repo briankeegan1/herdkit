@@ -199,6 +199,7 @@ echo "🔀 Resolver agent 'resolve·$SLUG' running (claude $CLAUDE_FLAGS) in her
 [ "$PLACEMENT" = "split" ] && echo "   placement: split pane inside the builder's tab — retired as soon as its DONE verdict is consumed"
 echo "   task: merge $DEFAULT_BRANCH → resolve mechanical conflicts → smoke + healthcheck → push (never force/default branch)"
 [ -n "$PORT" ] && echo "   🌐 app preview: http://localhost:$PORT   (hot-reloads as the agent resolves)"
-echo "   jump to it:   herdr agent focus resolve·$SLUG"
+# HERD-418: print the REGISTERED (sanitized) name — 'herdr agent focus' rejects the pretty dotted form.
+echo "   jump to it:   herdr agent focus $(herd_agent_name_sanitize "resolve·$SLUG")"
 echo "   on a green resolve it pushes the branch → PR flips CLEAN → the auto-merge watcher merges it."
 echo "   on a SEMANTICALLY-AMBIGUOUS conflict it aborts, comments on the PR, prints 'ESCALATE: …', and stops for a human."
