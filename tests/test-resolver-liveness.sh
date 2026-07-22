@@ -101,10 +101,12 @@ GRACE_DEFAULT=90
 # ── fixtures ──────────────────────────────────────────────────────────────────
 # roster_empty     — a READABLE roster carrying zero agents (positive absence)
 # roster_unreadable— what herd_driver_agent_list_json emits when `herdr agent list` fails
-# roster_named KEY — a roster listing resolve·$SLUG under the given identity key (name|agent)
+# roster_named KEY — a roster listing resolve·$SLUG under the given identity key (name|agent).
+# HERD-418: herdr never carries the raw dotted role name — it validates + stores the SANITIZED
+# form — so the fixture mirrors that (matching what _resolver_roster_listed now compares against).
 roster_empty()      { printf '{"result":{"agents":[]}}'; }
 roster_unreadable() { printf '{}'; }
-roster_named()      { printf '{"result":{"agents":[{"%s":"resolve·%s","agent_status":"working"}]}}' "$1" "$SLUG"; }
+roster_named()      { printf '{"result":{"agents":[{"%s":"%s","agent_status":"working"}]}}' "$1" "$(herd_agent_name_sanitize "resolve·$SLUG")"; }
 
 # probe_alive / probe_dead / probe_blind — write (or clear) the headless registry pid file the
 # liveness probe reads for the resolve·<slug> agent. A live pid ⇒ 'alive'; a recorded-but-gone pid ⇒

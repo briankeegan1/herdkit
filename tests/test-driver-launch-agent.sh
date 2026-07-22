@@ -85,15 +85,17 @@ emit(){ for a in "$@"; do printf '[%s]\n' "$a"; done; }
     name=coord workspace=ws1 cwd=/repo tab=tabA split=right focus=yes model=opus pointer=/coordinator \
     --SEP-- agent start coord --workspace ws1 --cwd /repo --tab tabA --split right -- claude --model opus /coordinator
 
-  # herd-resolve.sh (WS set): --split right --no-focus, yolo flags.
+  # herd-resolve.sh (WS set): --split right --no-focus, yolo flags. HERD-418: the caller's requested
+  # name carries the dotted role separator, but the REGISTERED name (what herdr actually sees) is the
+  # sanitized form — herdr 0.7.5 rejects the raw dotted name outright (invalid_agent_name).
   chk resolve-ws \
     name=resolve·x workspace=ws1 cwd=/dir tab=tabB split=right model=sonnet flags=--dangerously-skip-permissions pointer=TASK \
-    --SEP-- agent start resolve·x --workspace ws1 --cwd /dir --tab tabB --split right --no-focus -- claude --model sonnet --dangerously-skip-permissions TASK
+    --SEP-- agent start resolve-x --workspace ws1 --cwd /dir --tab tabB --split right --no-focus -- claude --model sonnet --dangerously-skip-permissions TASK
 
   # herd-resolve.sh (WS empty, mirrors ${_WS_ID:+…}): --workspace omitted entirely.
   chk resolve-nows \
     name=resolve·x workspace= cwd=/dir tab=tabB split=right model=sonnet flags=--dangerously-skip-permissions pointer=TASK \
-    --SEP-- agent start resolve·x --cwd /dir --tab tabB --split right --no-focus -- claude --model sonnet --dangerously-skip-permissions TASK
+    --SEP-- agent start resolve-x --cwd /dir --tab tabB --split right --no-focus -- claude --model sonnet --dangerously-skip-permissions TASK
 
   # research.sh: no split, --no-focus, --env passthrough.
   chk research \
@@ -110,10 +112,10 @@ emit(){ for a in "$@"; do printf '[%s]\n' "$a"; done; }
     name=coord workspace=ws1 cwd=/repo tab=tabE split=down focus=yes pointer=/coordinator \
     --SEP-- agent start coord --workspace ws1 --cwd /repo --tab tabE --split down -- claude /coordinator
 
-  # herd-review.sh: --split down --no-focus, yolo flags.
+  # herd-review.sh: --split down --no-focus, yolo flags. HERD-418: registered name is sanitized.
   chk review \
     name=review·x workspace=ws1 cwd=/cwd tab=btab split=down model=opus flags=--dangerously-skip-permissions pointer=ATASK \
-    --SEP-- agent start review·x --workspace ws1 --cwd /cwd --tab btab --split down --no-focus -- claude --model opus --dangerously-skip-permissions ATASK
+    --SEP-- agent start review-x --workspace ws1 --cwd /cwd --tab btab --split down --no-focus -- claude --model opus --dangerously-skip-permissions ATASK
   exit 0
 ) || fail "herdr-claude byte-identical argv checks failed (see FAIL above)"
 ok; echo "PASS (1) herdr-claude: every routed lane shape emits byte-identical argv"

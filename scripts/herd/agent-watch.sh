@@ -2815,7 +2815,9 @@ _retire_reviewer_pane() {
     # mismatch the guard REFUSES and journals pane_close_refused, so we journal reviewer_pane_retired
     # ONLY on a real close. The registry row is dropped unconditionally below either way — a row that
     # pointed at the wrong pane must not linger to be retried.
-    if herd_close_pane_verified "$pane" "review·"; then
+    # HERD-418: "review" (no separator) matches BOTH the pretty label ("pane:review·<slug>") and the
+    # sanitized registered agent name ("agent:review-<slug>") — a dotted kind would miss the latter.
+    if herd_close_pane_verified "$pane" "review"; then
       journal_append reviewer_pane_retired pr "$pr" sha "$sha" pane "$pane" reason "$reason"
     fi
   fi
@@ -4392,7 +4394,9 @@ _retire_resolver_pane() {
   [ -f "$reg" ] || return 0
   read -r pane tab placement _ < "$reg" 2>/dev/null || true
   if [ -n "${pane:-}" ] && [ "$pane" != "-" ] && herd_driver_pane_alive "$pane"; then
-    if herd_close_pane_verified "$pane" "resolve·"; then
+    # HERD-418: "resolve" (no separator) matches BOTH the pretty label and the sanitized registered
+    # agent name ("agent:resolve-<slug>").
+    if herd_close_pane_verified "$pane" "resolve"; then
       journal_append resolver_pane_retired pr "$pr" sha "$sha" pane "$pane" \
         placement "${placement:--}" reason "$reason"
       if [ "${placement:-}" = "tab" ] && [ -n "${tab:-}" ] && [ "$tab" != "-" ]; then
@@ -4571,7 +4575,8 @@ sys.exit(0 if isinstance(r.get("agents"), list) else 1)
 # signal (mirrors the builder rule): a resolver that finished and went 'done' is listed, not dead.
 _resolver_roster_listed() {
   [ -n "${AGENTS_JSON:-}" ] || return 1
-  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+  # HERD-418: match the REGISTERED (sanitized) name — herdr never carries the dotted role form.
+  printf '%s' "$AGENTS_JSON" | NAME="$(herd_agent_name_sanitize "resolve·$1")" python3 -c '
 import sys, json, os
 name = os.environ["NAME"]
 try:
@@ -4653,7 +4658,8 @@ _resolver_liveness_verdict() {
 # under test and consistent with every other resolver oracle on this path.
 _resolver_agent_status() {
   [ -n "${AGENTS_JSON:-}" ] || { printf ''; return 0; }
-  printf '%s' "$AGENTS_JSON" | NAME="resolve·$1" python3 -c '
+  # HERD-418: match the REGISTERED (sanitized) name — herdr never carries the dotted role form.
+  printf '%s' "$AGENTS_JSON" | NAME="$(herd_agent_name_sanitize "resolve·$1")" python3 -c '
 import sys, json, os
 name = os.environ["NAME"]
 try:
@@ -4802,7 +4808,8 @@ _reap_idle_resolver_for_redispatch() {
   # under RESOLVER_PANE=on, so the pre-HERD-280 lane makes no extra driver call.
   if _resolver_pane_enabled && [ -z "${_rir_tab:-}" ]; then
     local _rir_pane; _rir_pane="$(herd_driver_agent_pane_id "resolve·${_rir_slug}" 2>/dev/null || true)"
-    if [ -n "$_rir_pane" ] && herd_close_pane_verified "$_rir_pane" "resolve·"; then
+    # HERD-418: "resolve" (no separator) matches both the pretty label and the sanitized agent name.
+    if [ -n "$_rir_pane" ] && herd_close_pane_verified "$_rir_pane" "resolve"; then
       journal_append resolver_pane_retired slug "$_rir_slug" pane "$_rir_pane" \
         placement split reason idle-redispatch
     fi

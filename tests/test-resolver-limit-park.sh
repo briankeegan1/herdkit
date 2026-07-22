@@ -107,9 +107,10 @@ WT="$WORKTREES_DIR/$SLUG"; mkdir -p "$WT"
 SENTINEL="$WT/.herd-limit-sentinel"
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+# HERD-418: herdr stores the SANITIZED name, never the raw dotted role — mirror that here.
 roster_status() {
-  printf '{"result":{"agents":[{"name":"resolve·%s","agent_status":"%s","pane_id":"pane-r1"}]}}' \
-    "$SLUG" "$1"
+  printf '{"result":{"agents":[{"name":"%s","agent_status":"%s","pane_id":"pane-r1"}]}}' \
+    "$(herd_agent_name_sanitize "resolve·$SLUG")" "$1"
 }
 roster_empty() { printf '{"result":{"agents":[]}}'; }
 
