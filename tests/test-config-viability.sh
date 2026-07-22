@@ -208,12 +208,15 @@ WORKSPACE_NAME="viab"
 MERGE_METHOD="merge"
 GATE_STATUS="off"
 CFG
+# HERD_HERDR_ATTACH_CLI=yes bypasses the driver-CLI probe's own herdr call (HERD-407) so this render
+# stays hermetic — no real/tripwire herdr invocation from a doctor render that isn't testing that probe.
 DOCOUT="$(HERD_CAPABILITIES_FILE="$STUBCAPS" HERD_CONFIG_FILE="$P/.herd/config" \
-  HERD_CV_GH="$GH" HERD_CV_REPO="acme/widgets" GH_ALLOW_MERGE=false \
+  HERD_CV_GH="$GH" HERD_CV_REPO="acme/widgets" GH_ALLOW_MERGE=false HERD_HERDR_ATTACH_CLI=yes \
   bash -c '. "'"$PREFLIGHT"'"; . "'"$DRIVER"'"; . "'"$JOURNAL"'"; . "'"$CV"'"; herd_config_viability_doctor_section' 2>&1 || true)"
 printf '%s\n' "$DOCOUT" | grep -qi 'Config viability' || fail "(8a) doctor section header missing (out=$DOCOUT)"
 printf '%s\n' "$DOCOUT" | grep -q 'MERGE_METHOD=merge' || fail "(8b) doctor section did not render the MERGE_METHOD row (out=$DOCOUT)"
-ok; echo "PASS (8) doctor Config-viability section renders per-key verdicts"
+printf '%s\n' "$DOCOUT" | grep -qi 'attach spawn CLI' || fail "(8c) doctor section did not render the HERD-407 driver-CLI row (out=$DOCOUT)"
+ok; echo "PASS (8) doctor Config-viability section renders per-key verdicts, including the driver-CLI row"
 
 # ══ (9) journal event + machine-readable report ═══════════════════════════════════════════════════
 : > "$JOURNAL_FILE"; rm -f "$HERD_CONFIG_VIABILITY_REPORT"

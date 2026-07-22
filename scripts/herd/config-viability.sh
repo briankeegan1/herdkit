@@ -404,7 +404,10 @@ _cv_doctor_render_rows() {
     herd_config_viability_note "$key" "$val" "$status" "$msg" doctor
   done < <(_cv_coupled_keys)
   # HERD-407: the driver-CLI spawn-contract probe is NOT keyed to a config value, so it always renders
-  # here rather than through the coupled-keys loop above.
+  # here rather than through the coupled-keys loop above. ONE call only — _cv_probe_driver_cli's own
+  # herd_driver_herdr_spawn_shape call is the SOLE herdr invocation; a second call here (even a cached
+  # one) would run in its OWN command-substitution subshell and re-pay the herdr call, since bash never
+  # propagates a subshell's cache mutation back to its parent.
   out="$(_cv_probe_driver_cli 2>/dev/null || true)"
   status="${out%%$'\t'*}"; msg="${out#*$'\t'}"
   case "$status" in
@@ -412,7 +415,7 @@ _cv_doctor_render_rows() {
     WARN)     printf '  \xe2\x9a\xa0 %s\n' "$msg"; any=1 ;;
     MISMATCH) printf '  \xe2\x9c\x97 %s\n' "$msg"; any=1 ;;
   esac
-  herd_config_viability_note DRIVER_CLI "$(herd_driver_herdr_spawn_shape 2>/dev/null || true)" "$status" "$msg" doctor
+  herd_config_viability_note DRIVER_CLI "" "$status" "$msg" doctor
   [ "$any" -eq 1 ] || printf '  \xe2\x9c\x93 no externally-coupled config keys resolve a value in this project.\n'
   printf '  \033[2m(advisory — probes read live GitHub / PATH state each run; an offline probe warns, never blocks)\033[0m\n'
 }
