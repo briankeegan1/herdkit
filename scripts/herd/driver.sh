@@ -882,7 +882,7 @@ herd_driver_focus_agent() {
   return 0
 }
 
-# ── herdr agent-start CLI bridge (issue #514) ──────────────────────────────────────────────────────
+# ── herdr agent-start CLI bridge (issue #514, #516) ─────────────────────────────────────────────────
 # herdr 0.7.5 (protocol 17) replaced the pane-CREATING `agent start <name> --workspace … --cwd …
 # --tab … [--split …] --no-focus [--env K=V]… -- <runtime argv>` with an ATTACH contract:
 #     herdr agent start <NAME> --kind <KIND> --pane <ID> [-- <AGENT_ARG>…]
@@ -892,6 +892,12 @@ herd_driver_focus_agent() {
 # Other machines still run pre-0.7.5 herdr (fail-soft portability), so BOTH CLIs are supported: a
 # one-time per-process capability probe picks the path, and the old argv stays byte-identical.
 # The attach result still carries result.agent.pane_id, so every existing stdout parser holds.
+# issue #516: the attach flow also cannot shell-encode a MULTILINE agent arg — a drainer lane's
+# multi-KB multiline PROMPT rejected with invalid_agent_argument where builder lanes (already
+# task-spec-externalized to a one-line pointer) sail through. herd_driver_herdr_attach_agent
+# externalizes any multiline runtime arg to a file under the worktree pool before attaching (mirrors
+# herd_write_task_spec's externalize-then-short-pointer shape) — ONE fix here heals every lane that
+# routes through this bridge, never a per-lane patch. The pre-0.7.5 argv path is untouched.
 
 # _herd_herdr_attach_cli — success iff the installed herdr speaks the attach CLI (its
 # `agent start --help` documents --pane). Probed ONCE per process (cached in a plain global —
@@ -906,6 +912,26 @@ _herd_herdr_attach_cli() {
     esac
   fi
   [ "$_HERD_HERDR_ATTACH_CACHE" = yes ]
+}
+
+# _herd_externalize_pointer_arg <name> <arg> — issue #516: herdr's attach CLI cannot shell-encode a
+# MULTILINE agent argument ("agent arguments cannot be encoded safely for the target shell"). Builder
+# lanes never hit this — they already externalize their full task spec to a file
+# (herd_write_task_spec) and hand the agent a one-line pointer — but the drainer lanes (scribe.sh,
+# research.sh) still pass a multi-KB multiline PROMPT straight through as the pointer arg. Mirrors
+# herd_write_task_spec's shape: write <arg> verbatim to a file under the worktree pool, named after
+# the agent, and print a SHORT single-line pointer in its place. FAIL-SOFT (unlike
+# herd_write_task_spec's fail-loud contract): a write failure here must not abort an attach that would
+# otherwise succeed inline, so on any failure it prints <arg> UNCHANGED — the caller falls back to
+# today's behavior and herdr reports the encoding error as before.
+_herd_externalize_pointer_arg() {
+  local _ep_name="${1:?}" _ep_arg="${2:-}" _ep_file
+  _ep_file="${WORKTREES_DIR:-${TREES:-.}}/.pointer-${_ep_name}.md"
+  if printf '%s\n' "$_ep_arg" > "$_ep_file" 2>/dev/null && [ -s "$_ep_file" ]; then
+    printf 'Read %s and follow it exactly as your instructions.' "$_ep_file"
+  else
+    printf '%s' "$_ep_arg"
+  fi
 }
 
 # herd_driver_agent_herdr_kind <driver> <rt0> — the --kind value for the attach CLI: an explicit
@@ -970,16 +996,46 @@ except Exception:
   fi
   local kind; kind="$(herd_driver_agent_herdr_kind "$an_driver" "${1:-}")"
   [ $# -gt 0 ] && shift   # drop argv[0]: --kind names the canonical executable; herdr prepends it
+  # issue #516: the attach CLI cannot shell-encode a MULTILINE arg ("agent arguments cannot be
+  # encoded safely for the target shell") — a drainer lane's multi-KB multiline PROMPT rides in here
+  # verbatim. Externalize any such arg UP FRONT (see _herd_externalize_pointer_arg above) so the
+  # common case never even round-trips through herdr's error path.
+  local -a an_rt=("$@")
+  local an_had_nl=0 an_i
+  for ((an_i = 0; an_i < ${#an_rt[@]}; an_i++)); do
+    case "${an_rt[$an_i]}" in
+      *$'\n'*)
+        an_rt[an_i]="$(_herd_externalize_pointer_arg "$an_name" "${an_rt[$an_i]}")"
+        an_had_nl=1
+        ;;
+    esac
+  done
   # A just-created pane may not have finished spawning its shell yet — herdr refuses the attach with
   # agent_pane_busy (an error JSON on STDERR) until the pane sits at an available prompt (observed
   # live on a scripted split→start). Bounded retry (~10s) instead of a racy sleep; the last attempt's
   # stdout (the JSON the callers parse) / stderr / exit status flow through on their own streams.
-  local out rc try=0 errf
+  local out rc try=0 errf an_iaa_retried=0
   errf="$(mktemp "${TMPDIR:-/tmp}/herd-attach-err.XXXXXX" 2>/dev/null)" || errf=/dev/null
   while :; do
-    out="$(herdr agent start "$an_name" --kind "$kind" --pane "$pane" -- "$@" 2>"$errf")"; rc=$?
+    out="$(herdr agent start "$an_name" --kind "$kind" --pane "$pane" -- "${an_rt[@]}" 2>"$errf")"; rc=$?
     [ "$rc" -eq 0 ] && break
-    case "$out$(cat "$errf" 2>/dev/null)" in *agent_pane_busy*) ;; *) break ;; esac
+    case "$out$(cat "$errf" 2>/dev/null)" in
+      *agent_pane_busy*) ;;
+      *invalid_agent_argument*)
+        # Defensive (cheap): no arg LOOKED multiline but herdr still rejected the argv — some other
+        # unsafe-for-shell content. Externalize the LAST arg (the pointer, by the spawn binding's
+        # convention of trailing <prompt>) and retry ONCE; this is not a transient like
+        # agent_pane_busy, so never loop on it.
+        if [ "$an_had_nl" = 0 ] && [ "$an_iaa_retried" = 0 ] && [ "${#an_rt[@]}" -gt 0 ]; then
+          an_iaa_retried=1
+          local an_last=$((${#an_rt[@]} - 1))
+          an_rt[an_last]="$(_herd_externalize_pointer_arg "$an_name" "${an_rt[$an_last]}")"
+          continue
+        fi
+        break
+        ;;
+      *) break ;;
+    esac
     try=$((try+1)); [ "$try" -ge 20 ] && break
     sleep 0.5
   done
