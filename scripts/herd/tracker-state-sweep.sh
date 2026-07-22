@@ -41,11 +41,18 @@
 #     the first _TSWEEP_UNRESOLVABLE_AFTER-1 sweeps (transient blips retry quietly) and only escalates
 #     to unresolvable after that many CONSECUTIVE failures.
 # Either path journals ONE tracker_state_unresolvable event and ledgers the ref with a trailing
-# `unresolvable` marker (_tsweep_ledgered only reads column 2, so this is byte-compatible with the
-# existing healed/closed ledger rows) so it is never re-probed and never re-alarmed. It deliberately
-# never touches the console-note ledger for this case: console-section.sh's tracker-heal renderer
-# treats any non-`healed` status as a permanently-loud row, and an unresolvable ref will never produce
-# a future `healed` row to supersede it — writing there would recreate the exact every-sweep-⚠ this
+# `unresolvable` marker (this sweep's own _tsweep_ledgered only reads column 2, so THIS reader is
+# byte-compatible with the existing healed/closed ledger rows). BUT $LEDGER (a.k.a.
+# $TRACKER_SWEEP_LEDGER) has a SECOND reader outside this file: agent-watch.sh's
+# _pms_tracker_ledgered, whose contract is "the tracker sweep CONFIRMED this ref Done" — column-2-only
+# would wrongly satisfy that for an unresolvable row too, silently deferring reconcile_backlog for an
+# item that never shipped (HERD-411 review finding). _pms_tracker_ledgered guards against this itself
+# (it requires NF==3), but any THIRD reader of this file must apply the same guard — column 2 alone
+# means "this ref appears in the ledger", not "this ref is Done"; column count (3 vs 4) is what
+# distinguishes them. It deliberately never touches the console-note ledger for this case:
+# console-section.sh's tracker-heal renderer treats any non-`healed` status as a permanently-loud row,
+# and an unresolvable ref will never produce a future `healed` row to supersede it — writing there
+# would recreate the exact every-sweep-⚠ this
 # fixes. LATENT HAZARD, noted honestly: if a numeric-only slug were ever a real identifier on some
 # future non-github backend, this shape check would misclassify it before ever probing — no backend in
 # this repo uses bare-number identifiers today.

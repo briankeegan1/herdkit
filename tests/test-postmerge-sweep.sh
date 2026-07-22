@@ -256,6 +256,25 @@ grep -q '"event":"postmerge_deferred".*"evidence":"tracker-swept"' "$JOURNAL_FIL
 [ "$(state_rows 92)" -eq 1 ] || fail "a deferred reconcile must not block THIS seat's own obligations"
 [ "$(jmissing)" = "state_row" ] || fail "missing list should be 'state_row' only, got '$(jmissing)'"
 ok
+
+# ── (4b) an UNRESOLVABLE-marked tracker-sweep row must NOT count as confirmed-Done (HERD-411 review) ──
+# tracker-state-sweep.sh now also ledgers a ref it gave up ever resolving, with a trailing 4th-column
+# marker in the SAME file ("<epoch> <ref> <pr#> unresolvable" vs the confirmed-Done "<epoch> <ref>
+# <pr#>"). _pms_tracker_ledgered's contract is "the tracker sweep CONFIRMED this ref Done" — a marked
+# row is the opposite (the sweep explicitly could NOT resolve it) and must not satisfy that contract,
+# or reconcile_backlog silently never runs for a merged PR whose backlog item never actually shipped.
+reset_world
+prs 94 bbb222 feat/unresolvable-ref
+PR_REF="#514"
+printf '%s #514 94 unresolvable\n' "$(date +%s)" >> "$TRACKER_SWEEP_LEDGER"
+_pms_tracker_ledgered "#514" && fail "an unresolvable-marked row must not satisfy _pms_tracker_ledgered"
+_pms_reconcile_handled 94 bbb222 >/dev/null \
+  && fail "an unresolvable-marked ref must not be treated as reconcile-handled evidence"
+_sweep_merged_prs || fail "_sweep_merged_prs returned non-zero on the unresolvable-marker path"
+[ "$(scribe_calls)" -eq 1 ] \
+  || fail "an unresolvable-marked ref must still fall through to the real (fuzzy) reconcile, got $(scribe_calls) calls"
+jhas postmerge_deferred && fail "an unresolvable-marked row must never be reported as a deferral"
+ok
 # The journal is an evidence source in its own right: a `reconcile` row for the PR defers too.
 reset_world
 prs 93 aaa111 feat/journal-evidence
