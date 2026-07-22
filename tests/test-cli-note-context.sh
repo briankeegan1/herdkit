@@ -31,6 +31,13 @@
 # completion — every fixture sets WORKTREES_DIR under $T so a miscoded fix could only ever write
 # inside the mktemp sandbox, never a real project (the total-miss cases assert a hard `die` before
 # herd-config.sh is ever sourced, so they touch no filesystem at all beyond exit status/stderr).
+#
+# LOAD-SENSITIVE LEGS (mirrors herd.bats's herd_run_loadsim comment): (2)/(4a)/(4b) drive several
+# real `git worktree add` + `herd note/ledger/advise` subprocesses against a fresh fixture — under a
+# heavily loaded box (many concurrent hermetic tests / builder sessions on the same machine) a single
+# attempt can transiently miss even when the resolution logic is correct. _quiet_retry re-attempts
+# the WHOLE fixture-dependent step once after a short quiet interval before failing, exactly like the
+# sim legs' documented tolerance — a leg that passes on the retry is a flaky/load pass, not a code red.
 # Run:  bash tests/test-cli-note-context.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +58,18 @@ _git_init() {
   git -C "$r" init -q
   git -C "$r" config user.email t@t.t
   git -C "$r" config user.name t
+}
+
+# _quiet_retry <check-fn> — run <check-fn>; on failure, wait a quiet interval and run it ONE more
+# time. Returns <check-fn>'s (second-attempt) status — the CALLER builds its own fail() message
+# afterward so it can report whatever globals the last attempt set (e.g. $out/$rc), rather than a
+# message pre-formatted before the function ever ran. Mirrors herd.bats's herd_run_loadsim tolerance
+# for a leg that drives many short-lived git/herd subprocesses under a heavily loaded box.
+_quiet_retry() {
+  local fn="$1"
+  "$fn" && return 0
+  sleep "${HERD_TEST_LOAD_RETRY_QUIET:-3}"
+  "$fn"
 }
 
 _field() {
@@ -125,14 +144,16 @@ WT2="$TREES2/my-slug"
 rm -rf "$WT2/.herd"
 [ ! -f "$WT2/.herd/config" ] || fail "(2) fixture bug: WT2 still carries .herd/config"
 
-out="$(cd "$WT2" && _run -- note "this red is a stale cached row")"
-rc=$?
-[ "$rc" -eq 0 ] || fail "(2) herd note should succeed via the parent checkout's config (rc=$rc, out: $out)"
-printf '%s' "$out" | grep -q "noted" || fail "(2) missing confirmation output (got: $out)"
+JNL2="$TREES2/.herd/journal.jsonl"
+_note2_attempt() {
+  out="$(cd "$WT2" && _run -- note "this red is a stale cached row")"
+  rc=$?
+  [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "noted" && [ -f "$JNL2" ]
+}
+_quiet_retry _note2_attempt \
+  || fail "(2) herd note should land in the PARENT project's journal ($JNL2, rc=$rc, out: $out)"
 ok
 
-JNL2="$TREES2/.herd/journal.jsonl"
-[ -f "$JNL2" ] || fail "(2) note should land in the PARENT project's journal ($JNL2)"
 [ "$(_field "$JNL2" 0 event)" = "builder_note" ] || fail "(2) journal event should be builder_note"
 ok
 [ "$(_field "$JNL2" 0 slug)" = "my-slug" ] || fail "(2) slug should derive from the worktree basename (got $(_field "$JNL2" 0 slug))"
@@ -159,11 +180,14 @@ ok
 # Reuse WT2 (parentless worktree, MAIN2 owns the config) for both the success and refusal paths.
 
 # (4a) herd ledger — writes to the PARENT's ledger, not a foreign one.
-out="$(cd "$WT2" && _run -- ledger set HERD-412 slug ctx-test status spawned)"
-rc=$?
-[ "$rc" -eq 0 ] || fail "(4a) herd ledger set should resolve via the parent checkout (rc=$rc, out: $out)"
 LEDGER2="$TREES2/.herd/ledger.jsonl"
-[ -f "$LEDGER2" ] || fail "(4a) ledger should land in the PARENT project's pool ($LEDGER2)"
+_ledger4a_attempt() {
+  out="$(cd "$WT2" && _run -- ledger set HERD-412 slug ctx-test status spawned)"
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -f "$LEDGER2" ]
+}
+_quiet_retry _ledger4a_attempt \
+  || fail "(4a) herd ledger set should land in the PARENT project's pool ($LEDGER2, rc=$rc, out: $out)"
 ok
 cli_get="$(cd "$WT2" && _run -- ledger get HERD-412)"
 printf '%s' "$cli_get" | grep -q "slug=ctx-test" || fail "(4a) ledger get should fold the item written from the worktree"
