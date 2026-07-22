@@ -44,19 +44,28 @@ printf '# backlog\n- untouched sentinel line\n' > "$REPO/BACKLOG.md"
 BACKLOG_SHA_BEFORE="$(cksum "$REPO/BACKLOG.md")"
 
 # ── stub backend: state read from a file, state write logged to a file ────────
-# STUB_STATES: "<ref> <state>" lines (state ∈ open|in-progress|closed). Missing ref → open.
+# STUB_STATES: "<ref> <state>" lines (state ∈ open|in-progress|closed|FAIL). Missing ref → open.
+#   FAIL simulates a genuine resolve-FAILURE (HERD-411): _backend_item_state returns 1, ITEM_STATE unset
+#   — as opposed to a backend explicitly resolving a ref to `open`.
 # STUB_RESULTS: "<ref> <result>" lines forcing _backend_update_state's _BACKEND_RESULT (default DONE).
 # STUB_UPDATES: appended one "<ref> <want> <component> <pr>" line per _backend_update_state call.
+# STUB_READS: appended one "<ref>" line per _backend_item_state call — proves whether a ref was probed.
 BACKENDS="$T/backends"; mkdir -p "$BACKENDS"
 export STUB_STATES="$T/states.txt"
 export STUB_RESULTS="$T/results.txt"
 export STUB_UPDATES="$T/updates.log"
-: > "$STUB_RESULTS"; : > "$STUB_UPDATES"
+export STUB_READS="$T/reads.log"
+: > "$STUB_RESULTS"; : > "$STUB_UPDATES"; : > "$STUB_READS"
 cat > "$BACKENDS/stub.sh" <<'STUB'
 #!/usr/bin/env bash
 _backend_item_state() {
   local ref="$1" s
+  printf '%s\n' "$ref" >> "$STUB_READS"
   s="$(awk -v r="$ref" '$1==r{print $2; exit}' "$STUB_STATES" 2>/dev/null)"
+  if [ "$s" = "FAIL" ]; then
+    ITEM_STATE=""
+    return 1
+  fi
   ITEM_STATE="${s:-open}"
 }
 _backend_update_state() {
@@ -75,6 +84,7 @@ export SCRIBE_BACKEND_DIR="$BACKENDS"
 
 export HERD_TSWEEP_LEDGER="$T/trees/.tracker-swept"
 export HERD_TSWEEP_NOTE_FILE="$T/trees/.tracker-heals"
+export HERD_TSWEEP_UNRESOLVED_FILE="$T/trees/.tracker-unresolved-counts"
 export JOURNAL_FILE="$T/trees/journal.jsonl"
 
 run_sweep() { HERD_TSWEEP_PRS_FILE="$1" bash "$SCRIPT"; }
@@ -172,6 +182,64 @@ grep -q '^HERD-91 done sweep 211$' "$STUB_UPDATES" \
 # The HTML-comment decoy ref must never be healed, and the ref-less PR must be skipped.
 grep -q 'HERD-DECOY' "$STUB_UPDATES" && fail "an HTML-comment decoy Refs was wrongly parsed"
 [ "$(grep -c . "$STUB_UPDATES")" -eq 1 ] || fail "expected exactly ONE heal from the JSON path, got $(grep -c . "$STUB_UPDATES")"
+pass
+
+# ── (7) HERD-411: a resolve-FAILURE ref goes silent, then ledgers after N sweeps with ONE event ─
+: > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; : > "$STUB_UPDATES"; : > "$STUB_READS"
+: > "$HERD_TSWEEP_NOTE_FILE"; : > "$JOURNAL_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-99 FAIL
+S
+printf '199\tHERD-99\n' > "$T/prs3.tsv"
+
+out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 1/3 (resolve-failure) exited non-zero: $out"
+[ "$(journal_events tracker_state_unresolvable)" -eq 0 ] || fail "escalated on sweep 1 (too early)"
+awk '$2=="HERD-99"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null && fail "ledgered on sweep 1 (too early)"
+[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "a resolve-failure must never write the console-note ledger (sweep 1)"
+
+out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 2/3 (resolve-failure) exited non-zero: $out"
+[ "$(journal_events tracker_state_unresolvable)" -eq 0 ] || fail "escalated on sweep 2 (too early)"
+
+out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 3/3 (resolve-failure) exited non-zero: $out"
+[ "$(journal_events tracker_state_unresolvable)" -eq 1 ] || fail "expected exactly 1 tracker_state_unresolvable event by sweep 3, got $(journal_events tracker_state_unresolvable)"
+grep -q '"ref":"HERD-99"' "$JOURNAL_FILE"                     || fail "unresolvable event does not name HERD-99"
+awk '$2=="HERD-99"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "HERD-99 was not ledgered as unresolvable after 3 sweeps"
+grep -qF 'HERD-99' "$HERD_TSWEEP_UNRESOLVED_FILE" 2>/dev/null && fail "the per-ref counter should be cleared once ledgered"
+[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "an unresolvable ref must never write the console-note ledger (it would render as a permanent loud row)"
+[ "$(journal_events tracker_state_heal_failed)" -eq 0 ] || fail "a resolve-failure must never journal tracker_state_heal_failed"
+reads_before="$(grep -c . "$STUB_READS" 2>/dev/null || echo 0)"
+
+# Once ledgered, a 4th sweep must never probe the backend again for HERD-99.
+: > "$STUB_READS"
+out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 4 (post-unresolvable) exited non-zero: $out"
+[ -s "$STUB_READS" ] && fail "a ledgered-unresolvable ref must never be re-probed ($(cat "$STUB_READS"))"
+[ "$(journal_events tracker_state_unresolvable)" -eq 1 ] || fail "sweep 4 must not re-journal tracker_state_unresolvable"
+pass
+
+# ── (8) HERD-411: a genuinely-open ref among resolve-failures still heals exactly as today ────
+: > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; : > "$STUB_UPDATES"; : > "$JOURNAL_FILE"; : > "$HERD_TSWEEP_NOTE_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-100 open
+S
+printf '200\tHERD-100\n' > "$T/prs4.tsv"
+out="$(run_sweep "$T/prs4.tsv")" || fail "sweep (genuinely-open) exited non-zero: $out"
+grep -q '^HERD-100 done sweep 200$' "$STUB_UPDATES" || fail "a genuinely-open ref must still heal unchanged ($(cat "$STUB_UPDATES"))"
+printf '%s\n' "$out" | grep -q 'healed 1' || fail "genuinely-open ref should report 1 heal ($out)"
+pass
+
+# ── (9) HERD-411: a bare github-shaped ref under the (non-github) stub backend classifies
+#        unresolvable IMMEDIATELY — no waiting for N sweeps, and the backend is NEVER even probed ──
+: > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; : > "$STUB_UPDATES"; : > "$STUB_READS"
+: > "$JOURNAL_FILE"; : > "$HERD_TSWEEP_NOTE_FILE"
+: > "$STUB_STATES"      # the backend has NOTHING for #514 — proves it's never even asked
+printf '515\t#514\n' > "$T/prs5.tsv"
+out="$(run_sweep "$T/prs5.tsv")" || fail "sweep (shape-mismatch) exited non-zero: $out"
+[ "$(journal_events tracker_state_unresolvable)" -eq 1 ] || fail "shape-mismatch did not journal exactly 1 tracker_state_unresolvable event ($out)"
+grep -q '"ref":"#514"' "$JOURNAL_FILE"                        || fail "unresolvable event does not name #514"
+awk '$2=="#514"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "#514 was not ledgered as unresolvable"
+[ -s "$STUB_READS" ] && fail "a ref-shape mismatch must never probe the backend at all ($(cat "$STUB_READS"))"
+[ -s "$STUB_UPDATES" ] && fail "a ref-shape mismatch must never attempt a state write"
+[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "a shape-mismatch ref must never write the console-note ledger"
 pass
 
 # ── (6) the file backend (no update-state op) makes the sweep byte-inert ───────

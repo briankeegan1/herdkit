@@ -27,14 +27,46 @@
 #   tracker-state-sweep.sh [--limit N]
 #     --limit N   how many recent merged PRs to look back over (default 50).
 #
+# UNRESOLVABLE refs (HERD-411, evidence 2026-07-22): PR #515 carried `Refs: #514` — a GitHub-style
+# issue ref filed while the Linear scribe was down. #514 can NEVER resolve through SCRIBE_BACKEND=linear
+# (or any non-github backend), yet the old probe defaulted every read failure to `open` (the
+# `${ITEM_STATE:-open}` fallback) and re-tried the impossible heal EVERY sweep, journaling
+# tracker_state_heal_failed found_state=open result=NOCHANGE and re-posting a console ⚠ row on a
+# ~22min cadence forever (no-false-red-consoles). Two independent defenses now short-circuit that:
+#   • ref/backend SHAPE mismatch (_tsweep_ref_backend_mismatch) — a bare `#N`/`N` numeric ref can only
+#     ever resolve against github (linear/jira/changelog identifiers always carry a non-numeric team
+#     key, e.g. HERD-411); classified unresolvable on sight, never even probed.
+#   • generic resolve-FAILURE (the `unknown` branch) — when `_backend_item_state` itself fails or
+#     leaves ITEM_STATE unset (vs a backend explicitly resolving to `open`), the ref goes silent for
+#     the first _TSWEEP_UNRESOLVABLE_AFTER-1 sweeps (transient blips retry quietly) and only escalates
+#     to unresolvable after that many CONSECUTIVE failures.
+# Either path journals ONE tracker_state_unresolvable event and ledgers the ref with a trailing
+# `unresolvable` marker (this sweep's own _tsweep_ledgered only reads column 2, so THIS reader is
+# byte-compatible with the existing healed/closed ledger rows). BUT $LEDGER (a.k.a.
+# $TRACKER_SWEEP_LEDGER) has a SECOND reader outside this file: agent-watch.sh's
+# _pms_tracker_ledgered, whose contract is "the tracker sweep CONFIRMED this ref Done" — column-2-only
+# would wrongly satisfy that for an unresolvable row too, silently deferring reconcile_backlog for an
+# item that never shipped (HERD-411 review finding). _pms_tracker_ledgered guards against this itself
+# (it requires NF==3), but any THIRD reader of this file must apply the same guard — column 2 alone
+# means "this ref appears in the ledger", not "this ref is Done"; column count (3 vs 4) is what
+# distinguishes them. It deliberately never touches the console-note ledger for this case:
+# console-section.sh's tracker-heal renderer treats any non-`healed` status as a permanently-loud row,
+# and an unresolvable ref will never produce a future `healed` row to supersede it — writing there
+# would recreate the exact every-sweep-⚠ this
+# fixes. LATENT HAZARD, noted honestly: if a numeric-only slug were ever a real identifier on some
+# future non-github backend, this shape check would misclassify it before ever probing — no backend in
+# this repo uses bare-number identifiers today.
+#
 # Hermetic seams (default to the real gh/backend; the tests override them):
 #   HERD_TSWEEP_PRS_FILE      file of "<pr#>\t<ref>" lines, bypassing gh AND the body-parse entirely.
 #   HERD_TSWEEP_PRS_JSON_FILE file of RAW `gh pr list --json number,body` output — exercises the real
 #                             multi-line-body parse path (the seam the line-oriented bug had escaped).
-#   SCRIBE_BACKEND[_DIR]   the active backend + its dir (same seam scribe-step.sh / _reconcile use).
-#   HERD_TSWEEP_LEDGER     confirmed-Done ledger path (default $WORKTREES_DIR/.agent-watch-tracker-swept).
-#   HERD_TSWEEP_NOTE_FILE  console-note surface the watcher renders (default …/.agent-watch-tracker-heals).
-#   JOURNAL_FILE           journal.sh's own test seam for the tracker_state_healed events.
+#   SCRIBE_BACKEND[_DIR]      the active backend + its dir (same seam scribe-step.sh / _reconcile use).
+#   HERD_TSWEEP_LEDGER        confirmed-Done ledger path (default $WORKTREES_DIR/.agent-watch-tracker-swept).
+#   HERD_TSWEEP_NOTE_FILE     console-note surface the watcher renders (default …/.agent-watch-tracker-heals).
+#   HERD_TSWEEP_UNRESOLVED_FILE  per-ref consecutive-resolve-failure counters (HERD-411), default
+#                             $WORKTREES_DIR/.agent-watch-tracker-unresolved-counts.
+#   JOURNAL_FILE              journal.sh's own test seam for the tracker_state_healed events.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
@@ -65,6 +97,11 @@ case "$LIMIT" in ''|*[!0-9]*) LIMIT=50 ;; esac
 
 LEDGER="${HERD_TSWEEP_LEDGER:-$WORKTREES_DIR/.agent-watch-tracker-swept}"
 NOTE_FILE="${HERD_TSWEEP_NOTE_FILE:-$WORKTREES_DIR/.agent-watch-tracker-heals}"
+UNRESOLVED_FILE="${HERD_TSWEEP_UNRESOLVED_FILE:-$WORKTREES_DIR/.agent-watch-tracker-unresolved-counts}"
+# Consecutive resolve-failures a ref tolerates (silent retry) before it is classified unresolvable and
+# ledgered off. Small on purpose: this is a backstop for a ref the backend provably cannot see, not a
+# retry budget for a slow network — a genuinely transient blip clears the streak on its next success.
+_TSWEEP_UNRESOLVABLE_AFTER=3
 
 # ── backend resolution (mirrors scribe-step.sh / _reconcile_via_ref) ──────────
 BACKEND_DIR="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
@@ -130,11 +167,17 @@ for pr in prs if isinstance(prs, list) else []:
 }
 
 # ── heal one ref through the active backend, in an isolated subshell ───────────
-# Prints one TAB line "<item-state>\t<heal-result>" where item-state ∈ open|in-progress|closed and
-# heal-result ∈ "" (no heal attempted — already closed) | DONE | NOCHANGE. Sources the backend the
-# way _reconcile_via_ref does (secrets + backend inside a subshell so the _backend_* funcs never leak),
-# and, when the item is NOT closed, re-issues the VERIFIED update-state with the HERD-85 attribution
-# envs so the backend's own tracker_write event is stamped component=sweep + the healing PR.
+# Prints one TAB line "<item-state>\t<heal-result>" where item-state ∈ open|in-progress|closed|unknown
+# and heal-result ∈ "" (no heal attempted — already closed, or unresolvable) | DONE | NOCHANGE.
+# Sources the backend the way _reconcile_via_ref does (secrets + backend inside a subshell so the
+# _backend_* funcs never leak), and, when the item is NOT closed, re-issues the VERIFIED update-state
+# with the HERD-85 attribution envs so the backend's own tracker_write event is stamped
+# component=sweep + the healing PR.
+#
+# HERD-411: `state` is `unknown` ONLY when `_backend_item_state` itself failed (nonzero) or left
+# ITEM_STATE unset — NOT whenever it happens to resolve to `open`. The old code collapsed both into
+# `open` (`${ITEM_STATE:-open}`) and drove every genuine resolve-failure through the heal-attempt path
+# forever; a backend that explicitly resolves a ref to open is still trusted exactly as before.
 _tsweep_probe_and_heal() {
   local ref="$1" pr="$2"
   (
@@ -145,9 +188,12 @@ _tsweep_probe_and_heal() {
     . "$BACKEND_FILE" 2>/dev/null || { printf 'unknown\t\n'; exit 0; }
     cd "$REPO" 2>/dev/null || true
     ITEM_STATE=""
-    _backend_item_state "$ref" >/dev/null 2>&1 || true
-    state="${ITEM_STATE:-open}"
-    if [ "$state" = "closed" ]; then
+    if _backend_item_state "$ref" >/dev/null 2>&1; then
+      state="${ITEM_STATE:-unknown}"
+    else
+      state="unknown"
+    fi
+    if [ "$state" = "closed" ] || [ "$state" = "unknown" ]; then
       printf '%s\t\n' "$state"
       exit 0
     fi
@@ -158,6 +204,82 @@ _tsweep_probe_and_heal() {
     _backend_update_state "$ref" done >/dev/null 2>&1 || true
     printf '%s\t%s\n' "$state" "${_BACKEND_RESULT:-NOCHANGE}"
   )
+}
+
+# ── HERD-411: unresolvable-ref classification ───────────────────────────────────
+# _tsweep_ref_backend_mismatch REF — true when REF is shaped like a bare GitHub issue ref (optionally
+# `#`-prefixed digits, e.g. `#514` or `514`) while the ACTIVE backend is not github. Every non-github
+# backend's identifiers carry a non-numeric key (HERD-411, PROJ-7, a changelog slug) — a bare number
+# can only ever resolve against github, so probing it through any other backend is provably wasted,
+# not a transient miss. See the file-header LATENT HAZARD note.
+_tsweep_ref_backend_mismatch() {
+  local bare="${1#\#}"
+  [ -n "$bare" ] || return 1
+  case "$bare" in *[!0-9]*) return 1 ;; esac
+  [ "${SCRIBE_BACKEND:-file}" = "github" ] && return 1
+  return 0
+}
+
+# _tsweep_gh_evidence REF — best-effort, READ-ONLY: when HERD_REPO names a repo and gh is on PATH,
+# looks up the bare numeric ref as a github issue purely to record found-state EVIDENCE in the
+# unresolvable journal event's detail. Never a resolution path — mixing github's numbering into a
+# non-github backend's heal would risk resolving the WRONG item if a numeric id ever collides with a
+# real local one (the latent hazard above). Fail-soft: prints nothing on any absence/error.
+# HERD_REPO is NOT set by this script — it is the existing config key herd-config.sh already sources
+# above (default EMPTY: `: "${HERD_REPO:=""}"`), the same one the github backend uses for its own
+# issue ops. This function adds no new required input: on a project that has it configured, the
+# evidence lookup fires for free; everywhere else it stays silently empty (fail-soft), exactly as
+# before this function existed.
+_tsweep_gh_evidence() {
+  local num="${1#\#}"
+  [ -n "${HERD_REPO:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  gh issue view "$num" -R "$HERD_REPO" --json state 2>/dev/null \
+    | python3 -c 'import sys, json
+try: print(json.load(sys.stdin).get("state", "").lower())
+except Exception: pass' 2>/dev/null || true
+}
+
+# ── HERD-411: per-ref consecutive resolve-failure counters ─────────────────────
+# One "<ref> <count>" line per ref currently mid-streak; a ref that resolves (or is ledgered) has no
+# line at all, so a healthy sweep carries none. Rewritten wholesale on each bump/clear — these files
+# stay tiny (only refs actively failing to resolve appear).
+_tsweep_unresolved_count() {
+  [ -s "$UNRESOLVED_FILE" ] || { printf '0'; return 0; }
+  local n
+  n="$(awk -v r="$1" '$1==r{print $2; exit}' "$UNRESOLVED_FILE" 2>/dev/null)"
+  case "${n:-}" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$n" ;; esac
+}
+_tsweep_unresolved_bump() {
+  local ref="$1" n dir
+  n="$(_tsweep_unresolved_count "$ref")"; n=$((n + 1))
+  dir="${UNRESOLVED_FILE%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || { printf '%s' "$n"; return 0; }
+  if [ -s "$UNRESOLVED_FILE" ]; then
+    awk -v r="$ref" '$1!=r{print}' "$UNRESOLVED_FILE" > "$UNRESOLVED_FILE.tmp" 2>/dev/null \
+      && mv "$UNRESOLVED_FILE.tmp" "$UNRESOLVED_FILE"
+  fi
+  printf '%s %s\n' "$ref" "$n" >> "$UNRESOLVED_FILE" 2>/dev/null || true
+  printf '%s' "$n"
+}
+_tsweep_unresolved_clear() {
+  [ -s "$UNRESOLVED_FILE" ] || return 0
+  awk -v r="$1" '$1!=r{print}' "$UNRESOLVED_FILE" > "$UNRESOLVED_FILE.tmp" 2>/dev/null \
+    && mv "$UNRESOLVED_FILE.tmp" "$UNRESOLVED_FILE" || true
+}
+
+# _tsweep_mark_unresolvable REF PR REASON — the backend can PROVABLY never resolve REF (a shape
+# mismatch) or has failed to resolve it _TSWEEP_UNRESOLVABLE_AFTER sweeps running. Journal ONE event
+# for the audit trail, then ledger it with a trailing `unresolvable` marker so _tsweep_ledgered skips
+# it on every future sweep — no more backend reads, no more per-sweep ⚠ for a ref the backend cannot
+# even see (no-false-red-consoles). Deliberately never writes the console-note ledger — see the
+# file-header rationale (a non-`healed` note there renders as a PERMANENT loud row that can never be
+# superseded).
+_tsweep_mark_unresolvable() {
+  local ref="$1" pr="$2" reason="$3"
+  journal_append tracker_state_unresolvable ref "$ref" pr "$pr" component sweep reason "$reason"
+  _tsweep_record "$ref" "$pr" unresolvable
+  echo "tracker-state-sweep: $ref is unresolvable ($reason) — ledgered; no further sweeps will probe it."
 }
 
 # ── console-note surface (the watcher renders the last lines) ──────────────────
@@ -181,10 +303,16 @@ _tsweep_ledgered() {
   [ -s "$LEDGER" ] || return 1
   awk -v r="$1" '$2==r{f=1} END{exit !f}' "$LEDGER" 2>/dev/null
 }
+# $3 (optional) appends a 4th column marker (HERD-411: "unresolvable"). _tsweep_ledgered only ever
+# reads column 2, so an omitted $3 stays byte-identical to the pre-HERD-411 3-column row.
 _tsweep_record() {
-  local dir="${LEDGER%/*}"
+  local dir="${LEDGER%/*}" marker="${3:-}"
   [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
-  printf '%s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$1" "$2" >> "$LEDGER" 2>/dev/null || true
+  if [ -n "$marker" ]; then
+    printf '%s %s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$1" "$2" "$marker" >> "$LEDGER" 2>/dev/null || true
+  else
+    printf '%s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$1" "$2" >> "$LEDGER" 2>/dev/null || true
+  fi
 }
 
 # ── run ────────────────────────────────────────────────────────────────────────
@@ -193,20 +321,41 @@ if ! _tsweep_backend_supported; then
   exit 0
 fi
 
-healed=0 failed=0 checked=0 scanned=0
+healed=0 failed=0 checked=0 scanned=0 unresolvable=0
 while IFS=$'\t' read -r pr ref; do
   [ -n "${ref:-}" ] || continue
   scanned=$((scanned + 1))
-  _tsweep_ledgered "$ref" && continue          # already confirmed Done — no backend read
+  _tsweep_ledgered "$ref" && continue          # already confirmed Done (or unresolvable) — no backend read
+
+  # HERD-411: a ref/backend shape mismatch (a bare github-style #N under a non-github backend) can
+  # NEVER resolve — classify it unresolvable immediately, without ever probing the backend.
+  if _tsweep_ref_backend_mismatch "$ref"; then
+    reason="ref-shape mismatch: '$ref' cannot resolve under SCRIBE_BACKEND=${SCRIBE_BACKEND:-file}"
+    gh_state="$(_tsweep_gh_evidence "$ref")"
+    [ -n "$gh_state" ] && reason="$reason (github issue currently $gh_state)"
+    _tsweep_mark_unresolvable "$ref" "$pr" "$reason"
+    unresolvable=$((unresolvable + 1))
+    continue
+  fi
+
   checked=$((checked + 1))
   IFS=$'\t' read -r state result < <(_tsweep_probe_and_heal "$ref" "$pr")
   case "$state" in
     closed)
+      _tsweep_unresolved_clear "$ref"
       _tsweep_record "$ref" "$pr" ;;           # confirmed Done at read time — ledger + move on
     unknown)
-      : ;;                                      # backend read errored — retry next sweep, no note
+      # HERD-411: the backend genuinely FAILED to resolve this ref (vs resolving it to open) — go
+      # silent for the first few sweeps (a transient blip retries quietly), then stop alarming.
+      n="$(_tsweep_unresolved_bump "$ref")"
+      if [ "$n" -ge "$_TSWEEP_UNRESOLVABLE_AFTER" ]; then
+        _tsweep_mark_unresolvable "$ref" "$pr" "backend failed to resolve $n consecutive sweeps"
+        _tsweep_unresolved_clear "$ref"
+        unresolvable=$((unresolvable + 1))
+      fi ;;
     *)
       # The item drifted (open / in-progress) despite a merged PR — heal it.
+      _tsweep_unresolved_clear "$ref"
       if [ "$result" = "DONE" ]; then
         journal_append tracker_state_healed ref "$ref" pr "$pr" found_state "$state" component sweep
         _tsweep_note healed "$ref" "$pr" "$state"
@@ -222,9 +371,9 @@ while IFS=$'\t' read -r pr ref; do
   esac
 done < <(_merged_refs)
 
-if [ "$healed" -eq 0 ] && [ "$failed" -eq 0 ]; then
+if [ "$healed" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$unresolvable" -eq 0 ]; then
   echo "tracker-state-sweep: no tracker drift — $scanned merged ref(s) scanned, $checked re-checked, all Done. Nothing to heal."
 else
-  echo "tracker-state-sweep: healed $healed, $failed still unhealed (of $checked re-checked / $scanned scanned)."
+  echo "tracker-state-sweep: healed $healed, $failed still unhealed, $unresolvable unresolvable (of $checked re-checked / $scanned scanned)."
 fi
 exit 0

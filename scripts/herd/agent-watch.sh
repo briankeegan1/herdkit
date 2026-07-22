@@ -7587,12 +7587,21 @@ _pms_journal_has() {
 }
 
 # _pms_tracker_ledgered <ref> — true iff the tracker-state sweep has already CONFIRMED this ref Done
-# (ledger row "<epoch> <ref> <pr#>"). That sweep scans every recently-merged PR regardless of which
-# seat merged it, so a hit here means the tracker obligation is discharged no matter who discharged it.
+# (ledger row "<epoch> <ref> <pr#>", exactly 3 columns). That sweep scans every recently-merged PR
+# regardless of which seat merged it, so a hit here means the tracker obligation is discharged no
+# matter who discharged it.
+#
+# NF==3 excludes a 4-column "<epoch> <ref> <pr#> unresolvable" row (HERD-411 review finding): the
+# tracker sweep also ledgers a ref it gave up ever resolving (a github-shaped ref under a non-github
+# backend, or one whose backend read failed N sweeps running) so it stops re-probing it — that row's
+# whole point is "we could NOT confirm this", the opposite of this predicate's contract. Matching it
+# here would defer reconcile_backlog for an item that never actually shipped, and unlike a genuine
+# cross-seat race (documented below) the fuzzy scribe fallback this defer would suppress is the ONLY
+# resolution path left for a ref the tracker sweep cannot even read.
 _pms_tracker_ledgered() {
   [ -n "${1:-}" ] || return 1
   [ -s "$TRACKER_SWEEP_LEDGER" ] || return 1
-  awk -v r="$1" '$2==r{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
+  awk -v r="$1" '$2==r && NF==3{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
 }
 
 # _pms_reconcile_handled <pr#> <sha> — the DEFER predicate for the one hook with a shared side effect.
