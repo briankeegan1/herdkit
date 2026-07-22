@@ -48,6 +48,7 @@ CAPS="$T/capabilities.tsv"
   printf 'HERD_REPO\tconfig\tGitHub repo engine bugs escalate to (skill token only)\tFor herd report\trender\t\t\tfree\n'
   printf 'SCRIBE_BACKEND\tconfig\tWork-tracker backend adapter\tSet for a tracker\t\t\t\tfree\n'
   printf 'DENY_PATHS\tconfig\tNever-committed paths\tFor secrets\trender\t\t\tfree\n'
+  printf 'TEST_PATH_GLOB\tconfig\tStub egrep-pattern key (HERD-413)\tExercise glob charset validation\t\t\t\tglob\n'
 } > "$CAPS"
 export HERD_CAPABILITIES_FILE="$CAPS"
 
@@ -224,6 +225,56 @@ printf '%s\n' "$OUT" | grep -qi 'invalid value\|non-negative integer' \
 grep -qE '^REVIEW_CONCURRENCY="two"' "$P6/.herd/config" && fail "non-numeric concurrency was written"
 run "$P6" config set REVIEW_CONCURRENCY 3
 [ "$RC" -eq 0 ]                                   || fail "set valid REVIEW_CONCURRENCY=3 failed ($OUT)"
+ok
+
+# ══ 14. HERD-413: value_shape=glob keys get a vetted charset (word chars + . * + ? [ ] ( ) { } | ^ $ \ / , -)
+# instead of the blanket shell-active blacklist, so an anchored egrep pattern is expressible.
+P7="$T/p7"; mkdir "$P7"; _make_project "$P7"
+anchored='^docs/.*[.]md$'
+run "$P7" config set TEST_PATH_GLOB "$anchored"
+[ "$RC" -eq 0 ]                                   || fail "glob key rejected an anchored pattern ($OUT)"
+run "$P7" config get TEST_PATH_GLOB
+[ "$OUT" = "$anchored" ]                          || fail "glob key set→get roundtrip not byte-identical (got '$OUT')"
+# the stored value works as a real grep -E pattern (proves it round-tripped uncorrupted, not just as text).
+printf 'docs/readme.md\n' | grep -qE "$OUT"        || fail "roundtripped glob value does not behave as a grep -E pattern"
+printf 'src/main.go\n'   | grep -qE "$OUT"         && fail "roundtripped glob value matched a path it should not"
+ok
+
+# a glob key still refuses a newline (breaks the KEY="VALUE" line format regardless of shape).
+run "$P7" config set TEST_PATH_GLOB "$(printf 'a\nb')"
+[ "$RC" -ne 0 ]                                   || fail "glob key accepted a newline value"
+printf '%s\n' "$OUT" | grep -qi 'newline'         || fail "glob newline rejection missing message ($OUT)"
+ok
+
+# a glob key still refuses characters outside the vetted set (backtick, double-quote, space) — this is
+# a WHITELIST, not merely a narrower blacklist.
+for bad in 'x`id`' 'q"r' 'has space'; do
+  run "$P7" config set TEST_PATH_GLOB "$bad"
+  [ "$RC" -ne 0 ]                                 || fail "glob key accepted out-of-charset value: [$bad]"
+  printf '%s\n' "$OUT" | grep -qi 'invalid value'  || fail "glob rejection message wrong for [$bad] ($OUT)"
+done
+ok
+
+# non-glob keys keep the EXACT prior strict charset (byte-identical behavior) — $ and \ still refused.
+run "$P7" config set WORKSPACE_NAME 'a$(id)'
+[ "$RC" -ne 0 ]                                   || fail "non-glob key wrongly widened: accepted a shell-active value"
+printf '%s\n' "$OUT" | grep -qi 'shell-active'    || fail "non-glob rejection message regressed ($OUT)"
+ok
+
+# ══ 15. HERD-413 SECURITY regression: the glob whitelist admits $ ( ) { } (real egrep syntax), so a
+# value SHAPED like a command substitution — e.g. $(touch<IFS>marker) — must never execute when
+# .herd/config is (re-)sourced as shell. Storage must single-quote a glob value (not the double-quote
+# format every other key uses), or $(...) would command-substitute at source time.
+P8="$T/p8"; mkdir "$P8"; _make_project "$P8"
+marker="$P8/PWNED"; rm -f "$marker"
+payload='$(touch$IFS'"$marker"')'
+run "$P8" config set TEST_PATH_GLOB "$payload"
+[ "$RC" -eq 0 ]                                   || fail "glob key rejected a \$(...)-shaped pattern ($OUT)"
+grep -qE "^TEST_PATH_GLOB='" "$P8/.herd/config"    || fail "glob value not stored single-quoted (command-substitution risk): $(grep TEST_PATH_GLOB "$P8/.herd/config")"
+( set +u; cd "$P8" && . ./.herd/config ) >/dev/null 2>&1
+[ -e "$marker" ]                                  && fail "SECURITY: sourcing .herd/config executed a \$(...) payload stored in a glob key"
+run "$P8" config get TEST_PATH_GLOB
+[ "$OUT" = "$payload" ]                           || fail "glob \$(...) payload did not round-trip byte-identical (got '$OUT')"
 ok
 
 echo "ALL PASS ($pass tests)"

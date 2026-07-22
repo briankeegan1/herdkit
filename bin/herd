@@ -2236,10 +2236,10 @@ _config_key_requires() {
 }
 
 # _config_key_value_shape <caps> <KEY> → print the value_shape token for KEY's kind==config row
-# (HERD-159). The optional 8th column of capabilities.tsv: "numeric" | "free" | a pipe-separated
-# enum list (e.g. auto|approve|observe). Empty / missing → free (backward-compatible). Presence of
-# an empty enum member (leading/trailing/double pipe, e.g. "|no-ai-coauthor") means the empty string
-# is an allowed value.
+# (HERD-159). The optional 8th column of capabilities.tsv: "numeric" | "free" | "glob" (HERD-413) |
+# a pipe-separated enum list (e.g. auto|approve|observe). Empty / missing → free (backward-compatible).
+# Presence of an empty enum member (leading/trailing/double pipe, e.g. "|no-ai-coauthor") means the
+# empty string is an allowed value.
 _config_key_value_shape() {
   awk -F'\t' -v k="$2" '
     $2=="config" && $1==k { s=$8; gsub(/[[:space:]]+$/,"",s); print s; exit }
@@ -2247,10 +2247,17 @@ _config_key_value_shape() {
 }
 
 # _config_validate_value <shape> <VALUE> — exit 0 when VALUE matches the shape, 1 when it does not.
-# Shapes (HERD-159):
+# Shapes (HERD-159, glob added HERD-413):
 #   free / empty  — any value (including empty)
 #   numeric       — non-negative integer (digits only); empty is NOT numeric (caller may allow empty
 #                   separately by treating free). Used for concurrency / timeout keys.
+#   glob          — the vetted charset for *_GLOB egrep-pattern keys (HERD-413): word chars plus
+#                   . * + ? [ ] ( ) { } | ^ $ \ / , -  so an anchored pattern like ^docs/.*[.]md$ is
+#                   expressible. A WHITELIST, not a relaxed blacklist — backtick, double quote, space,
+#                   and anything else outside the set stay refused (which also makes a newline
+#                   structurally impossible). Every read site of a glob key is audited to use the
+#                   value only as a grep -E pattern argument or a case match, never eval'd or
+#                   command-substituted — see the HERD-413 PR body for the site-by-site audit.
 #   a|b|c         — VALUE must equal one of the pipe-separated members exactly. A leading/trailing/
 #                   double pipe admits the empty string as a member.
 # Pure predicate: no I/O beyond the exit status.
@@ -2261,6 +2268,12 @@ _config_validate_value() {
     numeric)
       case "$val" in
         ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    glob)
+      case "$val" in
+        *[!]A-Za-z0-9_.*+?[\(\)\{\}\|^\$\\/,-]*) return 1 ;;
         *) return 0 ;;
       esac
       ;;
@@ -2349,13 +2362,16 @@ _config_secret_key() {
 }
 
 # _config_file_value <cfg> <KEY> → the raw value assigned to KEY in the config file (one layer of
-# surrounding double-quotes stripped), or empty when unset. First assignment only; comments ignored.
+# surrounding quotes stripped — double OR single, HERD-413: _config_put_value single-quotes a
+# value_shape=glob write so $/\ never expand when .herd/config is sourced), or empty when unset.
+# First assignment only; comments ignored.
 _config_file_value() {
-  awk -v k="$2" '
+  awk -v k="$2" -v sq="'" '
     { line=$0; sub(/^[[:space:]]+/,"",line) }
     index(line, k "=")==1 {
       v=substr(line, length(k)+2)
       if (v ~ /^".*"$/) v=substr(v,2,length(v)-2)
+      else if (length(v)>=2 && substr(v,1,1)==sq && substr(v,length(v),1)==sq) v=substr(v,2,length(v)-2)
       print v; exit
     }' "$1"
 }
@@ -2371,24 +2387,30 @@ _config_file_has_key() {
     END { exit(found?0:1) }' "$1"
 }
 
-# _config_put_value <cfg> <KEY> <VALUE> — idempotent, targeted in-place write of KEY="VALUE" into the
-# config: replaces the FIRST KEY= line (preserving its leading indentation) or appends when absent,
-# leaving every other line and comment untouched. This is the SAME edit primitive `herd config set`
-# uses; the upgrade migration runner exports it so migration scripts reuse it instead of re-parsing.
+# _config_put_value <cfg> <KEY> <VALUE> [QUOTE] — idempotent, targeted in-place write of KEY="VALUE"
+# (or KEY='VALUE' when QUOTE is a single quote — HERD-413) into the config: replaces the FIRST KEY=
+# line (preserving its leading indentation) or appends when absent, leaving every other line and
+# comment untouched. QUOTE defaults to `"`, byte-identical to before HERD-413. A value_shape=glob
+# write passes QUOTE=' so a stored $ ( ) { } never expands when .herd/config is (re-)sourced as
+# shell — a double-quoted glob value would let $(...) command-substitute at source time (the
+# whitelist charset in _config_validate_value's `glob` case admits $ ( ) for egrep syntax, so the
+# STORAGE format, not the charset, is what must neutralize it). This is the SAME edit primitive
+# `herd config set` uses; the upgrade migration runner exports it so migration scripts reuse it
+# instead of re-parsing.
 _config_put_value() {
-  local cfg="$1" key="$2" val="$3"
+  local cfg="$1" key="$2" val="$3" q="${4:-\"}"
   local tmp; tmp="$(mktemp)"
   local replaced=0 line indent
   while IFS= read -r line || [ -n "$line" ]; do
     if [ "$replaced" -eq 0 ] && printf '%s' "$line" | grep -qE "^[[:space:]]*$key="; then  # pipe-ok: single short scalar (one line), far under a pipe buffer
       indent="$(printf '%s' "$line" | sed -E 's/^([[:space:]]*).*/\1/')"
-      printf '%s%s="%s"\n' "$indent" "$key" "$val" >> "$tmp"
+      printf '%s%s=%s%s%s\n' "$indent" "$key" "$q" "$val" "$q" >> "$tmp"
       replaced=1
     else
       printf '%s\n' "$line" >> "$tmp"
     fi
   done < "$cfg"
-  [ "$replaced" -eq 1 ] || printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+  [ "$replaced" -eq 1 ] || printf '%s=%s%s%s\n' "$key" "$q" "$val" "$q" >> "$tmp"
   mv "$tmp" "$cfg"
 }
 
@@ -2609,7 +2631,8 @@ cmd_config_list() {
   # .herd/config.local once, when present) and emits byte-identical rows: baseline keys in file order
   # (a key also assigned in the overlay shows the OVERRIDING local value tagged [local]), then
   # overlay-only keys tagged [local-only]. Value parsing mirrors _config_file_value (first assignment,
-  # one layer of surrounding double-quotes stripped) and masking mirrors _config_secret_key.
+  # one layer of surrounding quotes stripped — double OR single, HERD-413) and masking mirrors
+  # _config_secret_key.
   local prog='
     function stripws(s) { sub(/^[[:space:]]+/, "", s); return s }
     function keyof(s,   k) {
@@ -2620,6 +2643,7 @@ cmd_config_list() {
     function valof(s, k,   v) {
       s = stripws(s); v = substr(s, length(k) + 2)
       if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+      else if (length(v)>=2 && substr(v,1,1)==sq && substr(v,length(v),1)==sq) v = substr(v, 2, length(v) - 2)
       return v
     }
     function is_secret(k) {
@@ -2652,9 +2676,9 @@ cmd_config_list() {
       }
     }'
   if [ -f "$local_cfg" ]; then
-    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="$local_cfg" "$prog" "$local_cfg" "$cfg"
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="$local_cfg" -v sq="'" "$prog" "$local_cfg" "$cfg"
   else
-    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="" "$prog" "$cfg"
+    awk -v dim="$c_dim" -v rst="$c_rst" -v localfile="" -v sq="'" "$prog" "$cfg"
   fi
 }
 
@@ -2709,15 +2733,8 @@ cmd_config_set() {
   local caps; caps="$(_config_caps_file)"
 
   # .herd/config is SOURCED AS SHELL (herd-config.sh and render_skill both `. "$cfg"`), but
-  # `herd config get`/`list` read it back with awk (no shell). To keep get == the shell-sourced
-  # value AND to guarantee a stored value can NEVER be expanded or executed at source time, reject
-  # any value containing a shell-active character ($ ` \ ") or a newline — otherwise e.g.
-  # `set WORKSPACE_NAME 'a$(id)'` would be echoed literally by `get` yet run `id` on every source.
-  # Such values are rare in config (e.g. a regex '$' anchor); set them by editing .herd/config.
-  case "$val" in
-    *'$'*|*'`'*|*'\'*|*'"'*)
-      die "value contains a shell-active character (\$, \`, \\, or \") — .herd/config is sourced as shell, so it would be expanded/executed at source time and would diverge from what 'herd config get' reports; edit .herd/config directly for such a value" ;;
-  esac
+  # `herd config get`/`list` read it back with awk (no shell). A newline breaks the KEY="VALUE" line
+  # format outright, so every key is refused a newline value regardless of shape.
   case "$val" in *$'\n'*) die "value may not contain a newline" ;; esac
 
   # 1. Safety FIRST (independent of the manifest): never touch the path-scoping key or any
@@ -2732,15 +2749,37 @@ cmd_config_set() {
   local requires
   requires="$(_config_key_requires "$caps" "$key")" \
     || die "unknown config key '$key' — see 'herd config list' (valid keys come from capabilities.tsv)"
-
-  # 2a. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
-  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
-  #     the capabilities.tsv value_shape column (enum list | numeric | free). free/empty → no check.
   local shape; shape="$(_config_key_value_shape "$caps" "$key")"
+
+  # 2a. CHARSET validation. To guarantee a stored value can NEVER be expanded or executed when
+  #     .herd/config is (re-)sourced as shell, reject any value containing a shell-active character
+  #     ($ ` \ ") — otherwise e.g. `set WORKSPACE_NAME 'a$(id)'` would be echoed literally by `get`
+  #     yet run `id` on every source. EXCEPTION (HERD-413): a value_shape=glob key (the *_GLOB
+  #     egrep-pattern keys — DOCS_ONLY_GLOB, REVIEW_ESCALATE_GLOB, HEALTHCHECK_HEAVY_GLOB,
+  #     MODEL_ESCALATE_GLOB, APP_SURFACE_GLOB, LOCAL_REVIEW_GLOB, DOC_APPLY_PATH_GLOB) is validated
+  #     against the dedicated whitelist charset in _config_validate_value's `glob` case instead — $
+  #     and \ are load-bearing there (anchors, escapes) for an expressible anchored pattern like
+  #     ^docs/.*[.]md$, and every read site of a glob key is audited to use the value only as a
+  #     grep -E pattern argument or a case match, never eval'd or command-substituted. Every other
+  #     key keeps this exact blacklist, byte-identical to before HERD-413.
+  if [ "$shape" != "glob" ]; then
+    case "$val" in
+      *'$'*|*'`'*|*'\'*|*'"'*)
+        die "value contains a shell-active character (\$, \`, \\, or \") — .herd/config is sourced as shell, so it would be expanded/executed at source time and would diverge from what 'herd config get' reports; edit .herd/config directly for such a value" ;;
+    esac
+  fi
+
+  # 2b. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
+  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
+  #     the capabilities.tsv value_shape column (enum list | numeric | glob | free). free/empty → no
+  #     check; glob is enforced by its whitelist charset (HERD-413).
   if ! _config_validate_value "$shape" "$val"; then
     case "$shape" in
       numeric)
         die "invalid value for $key: \"$val\" — want a non-negative integer (see capabilities.tsv value_shape)"
+        ;;
+      glob)
+        die "invalid value for $key: \"$val\" — glob keys accept only word characters and . * + ? [ ] ( ) { } | ^ \$ \\ / , - (see capabilities.tsv value_shape)"
         ;;
       *)
         die "invalid value for $key: \"$val\" — allowed: ${shape} (see capabilities.tsv value_shape)"
@@ -2748,7 +2787,7 @@ cmd_config_set() {
     esac
   fi
 
-  # 2a-bis. EAGER REF VALIDATION (HERD-276). REVIEW_PANEL_MODELS's value_shape is `free` — a ref LIST is
+  # 2b-bis. EAGER REF VALIDATION (HERD-276). REVIEW_PANEL_MODELS's value_shape is `free` — a ref LIST is
   #     not an enum — so the generic check above cannot catch `codx:gpt-5` or a dangling `grok:`. Resolve
   #     every ref here against the shipped templates/drivers/*.driver oracle and REFUSE the write on the
   #     first bad one. A typo'd panelist otherwise lands silently in .herd/config and only reveals itself
@@ -2771,7 +2810,7 @@ cmd_config_set() {
       || die "refusing to set MODEL_REVIEW — '$val' does not resolve to a usable model ref (see the error above); use a bare model id or a '<driver>:<model>' ref naming a shipped templates/drivers/<driver>.driver"
   fi
 
-  # 2a-ter. EXTERNAL-CONSISTENCY PROBE (HERD-355). For an externally-coupled key (env_coupling in
+  # 2b-ter. EXTERNAL-CONSISTENCY PROBE (HERD-355). For an externally-coupled key (env_coupling in
   #     capabilities.tsv), probe the just-supplied VALUE against LIVE external reality — the repo's
   #     merge flags, its branch protection, the resolved driver's runtime binding — so a config-vs-
   #     ENVIRONMENT mismatch surfaces HERE, at set time, not hours later as a silent gate failure
@@ -2833,8 +2872,15 @@ cmd_config_set() {
     ok "$key already = \"$val\" in $target_label (no change)"
     return 0
   fi
+  # HERD-413: a glob-shaped value is stored SINGLE-quoted so a $/`/\ it legitimately carries (an
+  # egrep anchor/escape) never expands when .herd/config is (re-)sourced as shell — the whitelist in
+  # _config_validate_value's `glob` case admits $ ( ) { }, so the STORAGE quote style, not the
+  # charset, is what neutralizes command substitution. Every other key keeps the double-quote
+  # storage byte-identical to before. Safe: the glob whitelist admits no single-quote character, so
+  # no value that passed validation can ever break out of a single-quoted KEY='VALUE' line.
+  local q='"'; [ "$shape" = "glob" ] && q="'"
   if [ "$changed" -eq 1 ]; then
-    _config_put_value "$target" "$key" "$val"
+    _config_put_value "$target" "$key" "$val" "$q"
     ok "set $key = \"$val\" in $target_label"
     [ "$target" = "$local_cfg" ] && say "  ${c_dim}(per-user overlay — overrides the baseline .herd/config; gitignored)${c_rst}"
   else
@@ -2881,7 +2927,7 @@ cmd_config_set() {
   # 4b. HERD-62 propagation: open (or refresh) the single-file config PR so every operator receives
   #     this baseline change through the normal watcher gate + `git pull`/`herd update` sync loop.
   if [ "$force_shared" -eq 1 ]; then
-    _config_open_shared_pr "$root" "$cfg" "$key" "$cur" "$val" "$reason"
+    _config_open_shared_pr "$root" "$cfg" "$key" "$cur" "$val" "$reason" "$q"
   fi
 
   # 5. SCRIBE_BACKEND change-awareness (issue #139): flipping the backend does NOT retire an already
@@ -2895,17 +2941,21 @@ cmd_config_set() {
   fi
 }
 
-# _config_open_shared_pr <root> <cfg> <key> <old> <new> <reason> — HERD-62. Open (or refresh) a tiny
-# single-file PR that carries the just-applied PROJECT-scoped baseline change to every operator via
-# the normal watcher gate. The local baseline (.herd/config) is ALREADY edited by the caller; this
-# only proposes the SAME one-key change on a dedicated branch so a coordinator who cannot push to the
-# default branch still propagates policy the gated way. It works from a THROWAWAY git worktree so the
-# operator's current checkout/branch is never switched or dirtied, bases the branch off the committed
-# DEFAULT_BRANCH tip (so the diff is exactly old->new for this one key), pushes branch config/<key>,
-# and runs `gh pr create`. DEGRADES GRACEFULLY: a missing gh, an unpushable/non-GitHub remote, or any
-# git/gh failure warns with copy-paste manual steps instead of dying — the local change already stuck.
+# _config_open_shared_pr <root> <cfg> <key> <old> <new> <reason> [quote] — HERD-62. Open (or refresh)
+# a tiny single-file PR that carries the just-applied PROJECT-scoped baseline change to every
+# operator via the normal watcher gate. The local baseline (.herd/config) is ALREADY edited by the
+# caller; this only proposes the SAME one-key change on a dedicated branch so a coordinator who
+# cannot push to the default branch still propagates policy the gated way. It works from a THROWAWAY
+# git worktree so the operator's current checkout/branch is never switched or dirtied, bases the
+# branch off the committed DEFAULT_BRANCH tip (so the diff is exactly old->new for this one key),
+# pushes branch config/<key>, and runs `gh pr create`. DEGRADES GRACEFULLY: a missing gh, an
+# unpushable/non-GitHub remote, or any git/gh failure warns with copy-paste manual steps instead of
+# dying — the local change already stuck. `quote` (HERD-413) is the SAME quote character the caller
+# just used to store `new` in the local baseline — the worktree copy below must match it, or a
+# glob-shaped value would round-trip double-quoted on the PR branch and command-substitute on the
+# next operator's `git pull` + implicit re-source.
 _config_open_shared_pr() {
-  local root="$1" cfg="$2" key="$3" old="$4" new="$5" reason="$6"
+  local root="$1" cfg="$2" key="$3" old="$4" new="$5" reason="$6" q="${7:-\"}"
   local branch="config/$key"
 
   # Resolve the default branch's remote + base from the committed baseline (no shell-sourcing side
@@ -2971,7 +3021,7 @@ _config_open_shared_pr() {
   # the branch carries exactly old->new for this key and nothing else. Reuse the shared edit primitive.
   local push_ok=0 keep_wt=0
   if [ -f "$wt/.herd/config" ]; then
-    _config_put_value "$wt/.herd/config" "$key" "$new"
+    _config_put_value "$wt/.herd/config" "$key" "$new" "$q"
     if ! git -C "$wt" diff --quiet -- .herd/config; then
       git -C "$wt" add .herd/config
       git -C "$wt" commit -q -m "config: set $key=$new (herd config set --shared)" \
