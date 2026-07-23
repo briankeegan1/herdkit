@@ -6387,16 +6387,32 @@ _main_health_observed_pr() {
 # route. On a reproduced red, <detail> is the FIRST 'not ok' TAP line (HERD-173 honest label; the
 # tab-leak-guard line is preserved when present so the collector's transient exemption still fires).
 # (see the always-heavy note below)
+#
+# SHA-STABILITY GUARD (HERD-421): $MAIN is a SHARED checkout — the post-merge codemap/symbol-index
+# refresh commits and rewrites files in it directly, which can race a concurrently-running suite (live
+# case 2026-07-22: a shellcheck leg reading a script the symbol-index push was mid-rewrite on). A red
+# reproduced while $MAIN's HEAD moved out from under this run was never verified against a STABLE tree,
+# so it is downgraded to rc 3 ("checkout moved") instead of a confirmed red — the collector journals it
+# as an infra_event and reconcile_main_health picks up the NEW HEAD as a fresh observed-sha next tick.
 _main_health_worker() {
-  local _mw_sha="$1" _mw_out="$2" _mw_log="$3" _mw_rc _mw_detail
+  local _mw_sha="$1" _mw_out="$2" _mw_log="$3" _mw_rc _mw_detail _mw_head0 _mw_head1
+  _mw_head0="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
   if [ "$_mw_rc" -eq 1 ]; then
     bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   if [ "$_mw_rc" -eq 1 ]; then
+    _mw_head1="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$_mw_head0" ] && [ -n "$_mw_head1" ] && [ "$_mw_head0" != "$_mw_head1" ]; then
+      _mw_rc=3
+    fi
+  fi
+  if [ "$_mw_rc" -eq 1 ]; then
     _mw_detail="$(_health_leak_guard_line "$_mw_log")"
     [ -n "$_mw_detail" ] || _mw_detail="$(_health_fail_detail "$_mw_log")"
+  elif [ "$_mw_rc" -eq 3 ]; then
+    _mw_detail="checkout moved during run: ${_mw_head0:-?} -> ${_mw_head1:-?}"
   else
     _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
   fi
@@ -6872,6 +6888,8 @@ _collect_main_health() {
          else
            _main_health_set_red "$_cm_pr" "$_cm_sha" "$_cm_out"
          fi ;;
+      3) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason checkout-moved \
+           detail "$_cm_out" ;;                                   # HERD-421: $MAIN moved mid-run, unverified
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \

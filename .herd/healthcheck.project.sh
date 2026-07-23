@@ -41,11 +41,34 @@ if [ -n "$errs" ]; then
 fi
 
 # 2. shellcheck (best-effort lint — only fail on errors, not style).
+#
+# HERD-421: a nonzero exit with EMPTY captured output is not a verified finding — it's the signature
+# of a transient race (live case 2026-07-22: the watcher's own symbol-index push rewrote a script out
+# from under shellcheck mid-read on sha 46f9857; the identical invocation passed minutes later). A
+# genuine lint failure always prints its findings on the FIRST run, so we retry ONLY the empty-nonzero
+# shape, ONCE, after a short settle — red only if the retry ALSO fails. The settle delay is
+# HERD_SHELLCHECK_RETRY_SECS (default 2; set 0 in hermetic tests to skip the wait). Either way we now
+# always emit the captured output (stdout+stderr already combined via 2>&1) plus a retried=yes/no
+# marker, so an empty red can never again be undiagnosable from the log alone.
 sc_note="shellcheck: skipped (not installed)"
 if command -v shellcheck >/dev/null 2>&1; then
-  if sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh scripts/herd/work-units/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; then
-    sc_note="shellcheck: clean"
+  sc_retried="no"
+  sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh scripts/herd/work-units/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; sc_rc=$?
+  if [ "$sc_rc" -ne 0 ] && [ -z "$sc" ]; then
+    sc_sleep="${HERD_SHELLCHECK_RETRY_SECS:-2}"
+    case "$sc_sleep" in ''|*[!0-9]*) sc_sleep=2 ;; esac
+    [ "$sc_sleep" -gt 0 ] && sleep "$sc_sleep"
+    sc_retried="yes"
+    sc="$(shellcheck -S error scripts/herd/*.sh scripts/herd/backends/*.sh scripts/herd/work-units/*.sh bin/herd .herd/claude-hardcode-lint.sh 2>&1)"; sc_rc=$?
+  fi
+  if [ "$sc_rc" -eq 0 ]; then
+    sc_note="shellcheck: clean (retried=$sc_retried)"
   else
+    if [ -z "$sc" ]; then
+      sc="shellcheck exited $sc_rc with EMPTY output (retried=$sc_retried) — no findings captured; likely an infra race, not a lint failure"
+    else
+      sc="${sc}"$'\n'"(retried=$sc_retried)"
+    fi
     [ -n "$ONELINE" ] && echo "shellcheck: $(printf '%s' "$sc" | head -1)" || { echo "SHELLCHECK ERRORS"; printf '%s\n' "$sc"; }
     exit 1
   fi
