@@ -363,4 +363,59 @@ jhas 'main_freshness result held reason local-commits behind 1 ahead 1' \
 git -C "$MAIN" reset -q --hard origin/main
 ok
 
+# ── (17) BEHIND + UNTRACKED-ONLY → still fast-forwards (HERD-422) ─────────────────────────────────
+# An untracked file sitting in $MAIN must NOT be treated as tree dirt: before the fix this painted a
+# false MAIN STALE (dirty-tree) and never even attempted the ff, forever, since nothing ever removes
+# the untracked file on its own.
+reset_state
+seat_push README.md "seat2 while untracked cruft sat around" "feat: seat merge past untracked cruft"
+printf 'scratch, never added\n' > "$MAIN/SCRATCH.md"
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$(origin_sha)" ] || fail "(17) untracked-only tree was NOT fast-forwarded"
+[ "$(head_sha)" != "$h0" ]          || fail "(17) untracked-only left HEAD stale"
+jhas 'main_ff behind 1 from'        || fail "(17) missing main_ff journal: $(cat "$JLOG")"
+[ ! -e "$MAIN_FRESH_STATE" ]        || fail "(17) a healed ff left a held state file"
+[ "$(cat "$MAIN/SCRATCH.md" 2>/dev/null || true)" = "scratch, never added" ] \
+                                     || fail "(17) the untracked file was touched by the ff"
+rm -f "$MAIN/SCRATCH.md"
+ok
+
+# ── (18) BEHIND + a TRACKED (unstaged) modification → still HELD (dirty-tree) ─────────────────────
+# The untracked exemption must not leak into tracked dirt: an unstaged edit to a file git already
+# tracks is real work and must still refuse the pull, exactly like the staged case in (7).
+reset_state
+seat_push README.md "seat2 while a tracked file was dirty" "feat: seat merge past tracked edit"
+printf 'hello\nlocal edit, not staged\n' > "$MAIN/README.md"
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]           || fail "(18) tracked-dirty tree was pulled over"
+jhas 'main_freshness result held reason dirty-tree behind 1 ahead 0' \
+                                     || fail "(18) missing dirty-tree held journal: $(cat "$JLOG")"
+git -C "$MAIN" checkout -q -- README.md
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main   # catch up: (19) needs a known behind=1 to start from
+ok
+
+# ── (19) UNTRACKED COLLISION → left to `git merge --ff-only` to refuse safely, never overwritten ───
+# The one real case where an untracked path matters: the incoming commit would create a file that
+# already sits untracked in $MAIN. The fix must not pre-emptively hold on it (it is still untracked
+# status), but ff-only itself must refuse rather than silently clobbering the untracked content, and
+# the existing ff-failed path must surface that as an honest hold.
+reset_state
+seat_push COLLIDE.md "seat2's version" "feat: seat adds a file that collides with local untracked"
+printf 'local untracked version, never added\n' > "$MAIN/COLLIDE.md"
+h0="$(head_sha)"
+reconcile_main_freshness
+[ "$(head_sha)" = "$h0" ]           || fail "(19) an untracked collision let the ff proceed"
+[ "$(head_sha)" != "$(origin_sha)" ] || fail "(19) an untracked collision converged with origin"
+[ "$(cat "$MAIN/COLLIDE.md")" = "local untracked version, never added" ] \
+                                     || fail "(19) the untracked file was overwritten by the ff attempt"
+jhas 'main_freshness result held reason ff-failed behind 1 ahead 0' \
+                                     || fail "(19) missing ff-failed held journal: $(cat "$JLOG")"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) ;; *) fail "(19) ff-failed row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+rm -f "$MAIN/COLLIDE.md"
+ok
+
 echo "PASS: test-main-freshness.sh ($pass checks)"

@@ -5783,6 +5783,18 @@ _main_fresh_recovered() {
   return 0
 }
 
+# _main_fresh_dirty_status — the ONE classification of "$MAIN's tree is too dirty to touch", shared by
+# _main_fresh_recheck and reconcile_main_freshness (HERD-422). An untracked entry ('?? path') is NOT
+# dirt: it never blocks `git merge --ff-only` unless the incoming commits would actually overwrite it,
+# and in that one real-collision case ff-only itself refuses (git's own safety check) and the caller's
+# existing ff-failed hold surfaces an honest error — so pre-emptively holding on untracked-only status
+# only ever produced a FALSE MAIN STALE with nothing for a human to act on. Staged and tracked-modified
+# entries (any porcelain code other than '??') still count as dirt, unchanged. Derived-file paths are
+# still excused via herd_strip_derived. Read-only: status only, no tree mutation.
+_main_fresh_dirty_status() {
+  git -C "$MAIN" status --porcelain 2>/dev/null | grep -v '^??' | cut -c4- | herd_strip_derived
+}
+
 # _main_fresh_recheck — the OBSERVED-state recovery probe (HERD-259). The held row is a STATE FILE, and
 # before this every path that could delete it sat BELOW a defer in reconcile_main_freshness: a live gate
 # marker, a failed fetch, or a $MAIN parked off-branch all returned early, so a row whose condition had
@@ -5833,7 +5845,7 @@ _main_fresh_recheck() {
   local _mk_up _mk_dirty _mk_counts _mk_ahead _mk_behind
   _mk_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
   git -C "$MAIN" rev-parse --verify --quiet "$_mk_up" >/dev/null 2>&1 || return 0
-  _mk_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  _mk_dirty="$(_main_fresh_dirty_status)"
   _mk_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_mk_up" 2>/dev/null || true)"
   _mk_ahead="$(printf '%s' "$_mk_counts" | awk '{print $1}')"
   _mk_behind="$(printf '%s' "$_mk_counts" | awk '{print $2}')"
@@ -5980,7 +5992,7 @@ reconcile_main_freshness() {
 
   # A dirty tree means a human (or a concurrent writer) owns $MAIN: never pull over their work.
   # Regenerable derived files are excused from the same ONE list every reaper/gate uses.
-  _mf_dirty="$(git -C "$MAIN" status --porcelain 2>/dev/null | cut -c4- | herd_strip_derived)"
+  _mf_dirty="$(_main_fresh_dirty_status)"
   if [ -n "$_mf_dirty" ]; then
     _main_fresh_hold dirty-tree "$_mf_behind" "$_mf_ahead"; return 0
   fi
