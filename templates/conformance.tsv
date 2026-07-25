@@ -290,6 +290,8 @@ CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
+MERGE_RESULT_GATE	unit	tests/test_live_runtime.py
+MERGE_RESULT_GATE	sim	tests/test-merge-result-gate-sim.sh
 RESOLVER_PANE	unit	tests/test-resolver-pane-lifecycle.sh
 RESOLVER_PANE	sim	tests/test-sandbox-real-panes.sh
 HEALTH_PANE	unit	tests/test-health-pane-lifecycle.sh

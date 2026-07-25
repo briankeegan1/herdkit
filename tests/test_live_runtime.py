@@ -39,7 +39,9 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                _main_health_pending,
                                WAIT, PENDING,
                                branch_to_slug, _branch_worktree_slug, _worktree_for_slug,
-                               _is_worktree, _pool_scoped)
+                               _is_worktree, _pool_scoped,
+                               _merge_result_gate_enabled, _resolve_default_branch_sha,
+                               _dispatch_nonce_with_base, _nonce_base, _total_health_inflight)
 from herd import work_unit as WU
 
 # HERMETICITY (HERD-331 gate red): a watcher/healthcheck-descended environment EXPORTS the live
@@ -3547,6 +3549,265 @@ class TestDocApplyAdapter(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             adapter.teardown(None)
         self.assertIn("teardown", str(ctx.exception))
+
+
+class TestMergeResultGateConfig(unittest.TestCase):
+    """HERD-296/§6.4: MERGE_RESULT_GATE is a STRICT validated gate key — an unrecognized value must
+    read off (the safe, byte-identical default), never accidentally on from a typo."""
+
+    def test_truthy_set_matches_other_gate_keys(self):
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "Enabled"):
+            self.assertTrue(_merge_result_gate_enabled({"MERGE_RESULT_GATE": v}), v)
+
+    def test_absent_off_and_typo_all_read_off(self):
+        for cfg in ({}, {"MERGE_RESULT_GATE": ""}, {"MERGE_RESULT_GATE": "off"},
+                    {"MERGE_RESULT_GATE": "0"}, {"MERGE_RESULT_GATE": "bogus"}, None):
+            self.assertFalse(_merge_result_gate_enabled(cfg), cfg)
+
+    def test_nonce_with_base_round_trips(self):
+        nonce = _dispatch_nonce_with_base("a" * 40)
+        self.assertEqual(_nonce_base(nonce), "a" * 40)
+
+    def test_nonce_without_base_component_yields_empty(self):
+        self.assertEqual(_nonce_base(_dispatch_nonce()), "")
+        self.assertEqual(_nonce_base(""), "")
+        self.assertEqual(_nonce_base(None), "")
+
+
+class TestMergeResultGateByteIdentical(LiveCase):
+    """gate OFF (default, and every tick before this feature existed) must be a hard no-op: the
+    classic health substrate is untouched, no `.merge-result-*` file is ever written, and every
+    existing dry-run/fixture assertion in this file (never exercising MERGE_RESULT_GATE) keeps
+    passing unmodified — that whole-file regression IS the strongest byte-identical proof; this
+    class adds the targeted one: LiveGates.health() never even LOOKS at the merge-result path."""
+
+    def test_health_off_never_reaches_merge_result_branch(self):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        gates = LiveGates("/nonexistent-home", state, journal, config={})
+        self.assertFalse(gates._merge_result_gate)
+        # Poison the merge-result path: if health() ever reached it with the lever off, this raises.
+        gates._merge_result_health = lambda cand: (_ for _ in ()).throw(
+            AssertionError("merge-result path reached with MERGE_RESULT_GATE off"))
+        wt = _make_worktree(self.tmp, "feat-x")
+        cand = LiveCandidate(pr=1, sha="deadbeef", slug="feat-x", worktree=wt)
+        self.assertEqual(gates.health(cand), WAIT)   # classic dispatch-and-wait, untouched
+        self.assertTrue(os.path.exists(state.health_inflight_file(cand)))
+        self.assertFalse(any(n.startswith(".merge-result-") for n in os.listdir(self.tmp)))
+
+
+class TestMergeResultGateDispatch(unittest.TestCase):
+    """LiveGates._merge_result_health / _dispatch_merge_result: cache reuse keyed on (pr, sha, base),
+    collect-and-cache, base-move re-arm, conflict sentinel, and combined concurrency accounting.
+    Hermetic: `_materialize_merge_tree` and `subprocess.Popen` are both stubbed — no real git merge
+    or suite runs here (the real end-to-end path is proven by tests/test-merge-result-gate-sim.sh)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        self._orig_materialize = LR._materialize_merge_tree
+        self._orig_subprocess = LR.subprocess
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-25T00:00:00Z"
+
+    def tearDown(self):
+        LR._materialize_merge_tree = self._orig_materialize
+        LR.subprocess = self._orig_subprocess
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _gates(self, config=None):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        cfg = dict(config or {})
+        cfg.setdefault("MERGE_RESULT_GATE", "on")
+        return LiveGates("/nonexistent-home", state, journal, config=cfg), state, journal
+
+    def _events(self):
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    class _PopenStub:
+        DEVNULL = subprocess.DEVNULL
+
+        class _Proc:
+            pid = 9191
+
+        def __init__(self):
+            self.calls = 0
+
+        def Popen(self, *a, **k):
+            self.calls += 1
+            return self._Proc()
+
+    def test_conflict_never_cached_and_never_dispatches_a_suite(self):
+        LR._materialize_merge_tree = lambda src, head, base, tree: (False, "merge conflict: boom")
+        sub = self._PopenStub()
+        LR.subprocess = sub
+        gates, state, _ = self._gates()
+        cand = LiveCandidate(pr=1, sha="head1", slug="feat-x", worktree=_make_worktree(self.tmp, "feat-x"))
+        with mock.patch.object(LR, "_resolve_default_branch_sha", return_value="b" * 40):
+            result = gates.health(cand)
+        self.assertEqual(result, "CONFLICT")
+        self.assertEqual(sub.calls, 0)               # no suite ever dispatched on a conflict
+        self.assertIsNone(state.merge_result_verdict(cand.pr, cand.sha, "b" * 40))
+        conflicts = [e for e in self._events() if e["event"] == "merge_result_conflict"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["base"], "b" * 40)
+
+    def test_base_unresolved_holds_never_dispatches(self):
+        gates, state, _ = self._gates()
+        cand = LiveCandidate(pr=1, sha="head1", slug="feat-x", worktree=_make_worktree(self.tmp, "feat-x2"))
+        with mock.patch.object(LR, "_resolve_default_branch_sha", return_value=""):
+            self.assertEqual(gates.health(cand), WAIT)
+        self.assertEqual(len([e for e in self._events() if e["event"] == "dispatch_refused"]), 1)
+
+    def test_dispatch_then_collect_caches_by_head_and_base(self):
+        LR._materialize_merge_tree = lambda src, head, base, tree: (True, "")
+        LR.subprocess = self._PopenStub()
+        gates, state, _ = self._gates()
+        cand = LiveCandidate(pr=2, sha="head2", slug="feat-y", worktree=_make_worktree(self.tmp, "feat-y"))
+        base = "c" * 40
+        with mock.patch.object(LR, "_resolve_default_branch_sha", return_value=base):
+            self.assertEqual(gates.health(cand), WAIT)      # dispatched
+            inflight = state.merge_result_inflight_file(cand.pr, cand.sha)
+            self.assertTrue(os.path.exists(inflight))
+            nonce = _marker_nonce(inflight)
+            self.assertEqual(_nonce_base(nonce), base)      # the base actually tested travels in the nonce
+            # Simulate the worker finishing: it echoes the nonce + the terminal verdict.
+            disp = state.merge_result_dispatch_file(cand.pr, cand.sha)
+            with open(disp, "w") as fh:
+                fh.write("%s\tCODEERROR\tnot ok 1 - contract mismatch\n" % nonce)
+            result = gates.health(cand)
+            self.assertEqual(result, "CODEERROR")
+            self.assertEqual(state.merge_result_verdict(cand.pr, cand.sha, base), "CODEERROR")
+            self.assertFalse(os.path.exists(disp))
+            self.assertFalse(os.path.exists(inflight))
+            gate_ev = [e for e in self._events() if e["event"] == "merge_result_gate"]
+            self.assertEqual(len(gate_ev), 1)
+            self.assertEqual(gate_ev[0]["base"], base)
+            self.assertEqual(gate_ev[0]["verdict"], "CODEERROR")
+            # A later call reuses the cached verdict — no second dispatch.
+            popen = LR.subprocess
+            calls_before = popen.calls
+            self.assertEqual(gates.health(cand), "CODEERROR")
+            self.assertTrue(gates.reused_health)
+            self.assertEqual(popen.calls, calls_before)
+
+    def test_base_move_is_a_cache_miss_and_rearms(self):
+        LR._materialize_merge_tree = lambda src, head, base, tree: (True, "")
+        gates, state, _ = self._gates()
+        cand = LiveCandidate(pr=3, sha="head3", slug="feat-z", worktree=_make_worktree(self.tmp, "feat-z"))
+        state.record_merge_result_verdict(cand.pr, cand.sha, "old" + "d" * 37, "CLEAN", "clean")
+        sub = self._PopenStub()
+        LR.subprocess = sub
+        with mock.patch.object(LR, "_resolve_default_branch_sha", return_value="new" + "e" * 37):
+            result = gates.health(cand)
+        self.assertEqual(result, WAIT)                 # cache miss on the NEW base -> fresh dispatch
+        self.assertEqual(sub.calls, 1)
+
+    def test_combined_concurrency_counts_both_prefixes(self):
+        state = LiveState(state_dir=self.tmp)
+        _marker_write(state._p(".health-inflight-1-a"), os.getpid())
+        _marker_write(state._p(".merge-result-inflight-2-b"), os.getpid())
+        self.assertEqual(_total_health_inflight(self.tmp), 2)
+
+    def test_slot_check_refuses_dispatch_when_saturated(self):
+        gates, state, _ = self._gates(config={"HEALTH_CONCURRENCY": "1"})
+        # Occupy the ONE slot via the CLASSIC health-inflight namespace — the merge-result path must
+        # still see it (combined accounting) and refuse to dispatch a second suite.
+        _marker_write(state._p(".health-inflight-99-other"), os.getpid())
+        cand = LiveCandidate(pr=4, sha="head4", slug="feat-w", worktree=_make_worktree(self.tmp, "feat-w"))
+        sub = self._PopenStub()
+        LR.subprocess = sub
+        with mock.patch.object(LR, "_resolve_default_branch_sha", return_value="f" * 40):
+            result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        self.assertEqual(sub.calls, 0)
+        self.assertEqual(len([e for e in self._events() if e["event"] == "health_queued"]), 1)
+
+
+class TestMergeResultGateWalk(LiveCase):
+    """LiveTick._walk: the CONFLICT sentinel folds into the SAME honest hold path as the stale-dup
+    gate — HOLD, once-guarded, never a bounce, never cached as a red — and is unreachable with the
+    lever off."""
+
+    class _ConflictGates:
+        reused_health = False
+        reused_review = False
+
+        def health(self, cand):
+            return "CONFLICT"
+
+        def review(self, cand):
+            raise AssertionError("review must never be reached past a merge-result CONFLICT")
+
+    def _tick(self):
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        return LiveTick({"MERGE_POLICY": "auto", "MERGE_RESULT_GATE": "on"}, None,
+                        self._ConflictGates(), DryRunActuator(journal), journal, state=state)
+
+    def test_conflict_holds_never_blocks_or_merges(self):
+        t = self._tick()
+        cand = LiveCandidate(pr=1, sha="s1", slug="feat-x")
+        self.assertEqual(t._walk(cand), "HOLD")
+        evs = events(self.jpath)
+        holds = [e for e in evs if e["event"] == "stale_dup_hold"]
+        self.assertEqual(len(holds), 1)
+        self.assertEqual(holds[0]["kind"], "merge_result_conflict")
+
+    def test_conflict_hold_is_once_guarded(self):
+        t = self._tick()
+        cand = LiveCandidate(pr=1, sha="s1", slug="feat-x")
+        t._walk(cand)
+        t._walk(cand)   # a second tick over the SAME (pr, sha) must not re-journal the hold
+        evs = events(self.jpath)
+        holds = [e for e in evs if e["event"] == "stale_dup_hold"]
+        self.assertEqual(len(holds), 1)
+
+
+class TestMergeResultGateSupersession(unittest.TestCase):
+    """_supersede_stale must cancel a stale merge-result-gate worker exactly like the classic
+    health/review rails (§6.1) — same session-kill primitive, same gate_superseded event shape,
+    with rail="merge_result"."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        os.environ["HERD_JOURNAL_NOW"] = "2026-07-25T00:00:00Z"
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def test_stale_merge_result_worker_terminated_and_journaled(self):
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        # A DEAD marker for a superseded sha ("oldsha") — _terminate_worker treats a dead/recycled
+        # marker as already-gone, so this exercises the cancel WITHOUT spawning a real process.
+        old_inflight = state._p(".merge-result-inflight-77-oldsha")
+        _marker_write(old_inflight, 999999)   # a pid that (almost certainly) is not alive
+        open(state._p(".merge-result-dispatch-77-oldsha"), "w").close()
+        open(state._p(".merge-result-log-77-oldsha"), "w").close()
+        t = LiveTick({"MERGE_POLICY": "observe"}, None, None, DryRunActuator(journal), journal,
+                    state=state)
+        t._supersede_stale([LiveCandidate(pr=77, sha="newsha")])
+        self.assertFalse(os.path.exists(old_inflight))
+        self.assertFalse(os.path.exists(state._p(".merge-result-dispatch-77-oldsha")))
+        self.assertFalse(os.path.exists(state._p(".merge-result-log-77-oldsha")))
+        evs = events(self.jpath)
+        superseded = [e for e in evs if e["event"] == "gate_superseded" and e.get("rail") == "merge_result"]
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0]["old_sha"], "oldsha")
+        self.assertEqual(superseded[0]["new_sha"], "newsha")
+
+    def test_off_lever_leaves_nothing_to_supersede(self):
+        # With no .merge-result-* marker ever written (the gate-off default), the glob is empty and
+        # _supersede_stale journals nothing for that rail — byte-inert.
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        t = LiveTick({"MERGE_POLICY": "observe"}, None, None, DryRunActuator(journal), journal,
+                    state=state)
+        t._supersede_stale([LiveCandidate(pr=1, sha="s1")])
+        evs = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertEqual([e for e in evs if e.get("rail") == "merge_result"], [])
 
 
 if __name__ == "__main__":
