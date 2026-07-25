@@ -113,6 +113,9 @@ MERGE_REFUSED = "merge_refused"      # --match-head-commit refused: sha moved at
 MERGE_FROZEN = "merge_frozen"        # merge-fairness held this sibling one window for a starved head (§6.2)
 NEW_SHA = "new_sha"                  # a new head sha superseded this one (§2.4)
 SIBLING_RESTALE = "sibling_restale"  # a sibling merge re-staled this still-valid sha (§6.1)
+MERGE_RESULT_CONFLICT = "merge_result_conflict"  # HERD-296/§6.4: the merged (head+base) candidate tree
+                                                  # would not merge cleanly — resolver-owned, held exactly
+                                                  # like a stale-base hold, never a bounce/BLOCK.
 
 EVENTS = (
     BREAKER_OPEN, BREAKER_CLOSE, STALE_DETECTED, BASE_FRESH,
@@ -120,7 +123,7 @@ EVENTS = (
     REVIEW_PASS, REVIEW_BLOCK, REVIEW_INFRA,
     REFIX_BOUNCE, REFIX_EXHAUSTED, BLESSING_POSTED,
     DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN,
-    NEW_SHA, SIBLING_RESTALE,
+    NEW_SHA, SIBLING_RESTALE, MERGE_RESULT_CONFLICT,
 )
 
 # The two events that supersede a subject from ANY non-terminal state (§2.4 new-sha cancel; §6.1
@@ -158,6 +161,11 @@ _BASE_TRANSITIONS = {
     (HEALTH, HEALTH_FLAKY): REVIEW,
     (HEALTH, HEALTH_CODEERROR): BLOCKED,
     (HEALTH, HEALTH_INFRA): HEALTH,
+    # HERD-296/§6.4 (MERGE_RESULT_GATE, ship-dormant): materializing the merge candidate (head + base)
+    # ahead of the suite hit a real conflict — resolver-owned, exactly like the stale-base hold (§2.1
+    # step 3), never a builder bounce. Ship-dormant: live_runtime emits this ONLY under
+    # MERGE_RESULT_GATE (default off), so with the lever off this row is unreachable.
+    (HEALTH, MERGE_RESULT_CONFLICT): STALE_HELD,
 
     # REVIEW — the adversarial correctness rail (§2.3). PASS blesses (both rails now green);
     # BLOCK bounces; INFRA-FAIL retries (§2.2), never a cached code BLOCK.

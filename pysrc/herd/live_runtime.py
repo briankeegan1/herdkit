@@ -62,6 +62,7 @@ Unit-driven by ``tests/test_live_runtime.py`` + gate wrapper ``tests/test-py-liv
 import glob
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -726,6 +727,52 @@ class LiveState:
         except Exception:
             pass
 
+    # merge-result-gate substrate (MERGE_RESULT_GATE, §6.4, HERD-296) ─────────────────────────────
+    # A SEPARATE namespace from the classic health substrate above — never shares a filename with it —
+    # so gate-off leaves zero markers behind (byte-identical: the glob a gate-off tick performs against
+    # ``.health-inflight``/``.health-result`` never sees one of these) and the classic health dispatch/
+    # collect code above is never touched by this feature. Dispatch/inflight/log/tree are keyed by
+    # ``(pr, sha)`` only — ONE merge-result suite may be in flight per head sha regardless of which base
+    # it is being tested against (the base actually tested travels inside the dispatch nonce, see
+    # ``_dispatch_nonce_with_base`` / ``_nonce_base``); the DURABLE verdict cache is keyed by
+    # ``(pr, sha, base)`` so a base move naturally re-arms the gate (a new base sha is simply a cache miss).
+    def merge_result_dispatch_file(self, pr, sha):
+        return self._p(".merge-result-dispatch-%s-%s" % (pr, sha))
+
+    def merge_result_inflight_file(self, pr, sha):
+        return self._p(".merge-result-inflight-%s-%s" % (pr, sha))
+
+    def merge_result_log_file(self, pr, sha):
+        return self._p(".merge-result-log-%s-%s" % (pr, sha))
+
+    def merge_result_tree_path(self, pr, sha):
+        return self._p(".merge-result-tree-%s-%s" % (pr, sha))
+
+    def merge_result_verdict(self, pr, sha, base):
+        """The TERMINAL merge-result verdict already proven for this EXACT (head, base) pair — reused
+        with no suite re-run. ``None`` on any miss (never tested, or tested against a DIFFERENT base —
+        the base-move re-arm, §6.4 target 4)."""
+        path = self._p(".merge-result-verdict-%s-%s-%s" % (pr, sha, base))
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\n")
+        except Exception:
+            return None
+        verdict = first.split("\t", 1)[0]
+        return verdict if verdict in ("CLEAN", "FLAKY", "CODEERROR") else None
+
+    def record_merge_result_verdict(self, pr, sha, base, verdict, detail=""):
+        path = self._p(".merge-result-verdict-%s-%s-%s" % (pr, sha, base))
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\t%s\n" % (verdict, detail or ""))
+        except Exception:
+            pass
+
     # shared helpers ───────────────────────────────────────────────────────────────────────────────
     def once(self, pr, sha, kind):
         """Fire a hold's side effects exactly once per ``(pr, sha, kind)`` (once-guard doctrine, §5.3).
@@ -892,6 +939,15 @@ class LiveState:
     def review_registry_file_sha(self, pr, sha):
         return self._sha_path(".review-registry", pr, sha)
 
+    def merge_result_dispatch_file_sha(self, pr, sha):
+        return self._sha_path(".merge-result-dispatch", pr, sha)
+
+    def merge_result_log_file_sha(self, pr, sha):
+        return self._sha_path(".merge-result-log", pr, sha)
+
+    def merge_result_tree_path_sha(self, pr, sha):
+        return self._sha_path(".merge-result-tree", pr, sha)
+
     def stale_inflight(self, prefix, pr, cur_sha):
         """DYNAMIC discovery of doomed workers: yield ``(marker_path, sha)`` for every
         ``$TREES/<prefix>-<pr>-<sha>`` in-flight marker whose ``sha`` differs from the PR's current head
@@ -917,6 +973,117 @@ class LiveState:
         except Exception:
             return ""
         return parts[1] if len(parts) > 1 else ""
+
+
+# ── MERGE_RESULT_GATE (§6.4, HERD-296) — materialize head+base, gate THAT tree ──────────────────────
+# Ship-dormant (default off): every function below is reached ONLY when LiveGates._merge_result_gate is
+# True, and every filename this namespace touches (``.merge-result-*``) is disjoint from the classic
+# health substrate above, so an off tick — the default, and every tick before this feature existed —
+# never globs, opens, or writes one of these paths. Off is a hard byte-identical no-op.
+
+def _merge_result_gate_enabled(config):
+    """STRICT validated gate key: an unrecognized/absent ``MERGE_RESULT_GATE`` value is OFF — the safe,
+    byte-identical default — never accidentally on from a typo (mirrors ``_merge_fairness_enabled``)."""
+    val = str((config or {}).get("MERGE_RESULT_GATE", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def _resolve_default_branch_sha():
+    """The CURRENT default-branch tip sha — the base the merge-result gate tests against. ``MAIN`` is
+    the watcher's (unexported, HERD-345) default-branch checkout dir; ``PROJECT_ROOT`` is the exported
+    fallback the classic health dispatch already relies on (mirrors ``_main_health_pending``). Fail-soft:
+    any resolution fault (missing dir, no git, detached weirdness) returns ``""`` — the caller then HOLDS
+    (never gates un-based, never crashes the tick)."""
+    try:
+        main_dir = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+        if not main_dir:
+            return ""
+        out = subprocess.check_output(["git", "-C", main_dir, "rev-parse", "HEAD"],
+                                      stderr=subprocess.DEVNULL)
+        sha = out.decode().strip()
+        return sha if len(sha) == 40 else ""
+    except Exception:
+        return ""
+
+
+def _dispatch_nonce_with_base(base_sha):
+    """A dispatch nonce (HERD-349 shape: ``<epoch>.<pid>.…``) that ALSO carries the base sha this
+    dispatch tests against, so the collector can key the durable verdict to the EXACT (head, base) pair
+    a worker actually ran — even if the default branch has since moved on to a newer tip. A 40-char hex
+    sha has no ``.``, so the 3-field join round-trips through :func:`_nonce_base` unambiguously."""
+    return "%s.%s.%s" % (_now_epoch(), os.getpid(), base_sha)
+
+
+def _nonce_base(nonce):
+    """The base sha embedded by :func:`_dispatch_nonce_with_base`, or ``""`` for a plain (non-base)
+    nonce / malformed value — fail-soft, never raises."""
+    parts = (nonce or "").split(".", 2)
+    return parts[2] if len(parts) == 3 else ""
+
+
+def _remove_merge_tree(src_worktree, tree_path):
+    """Tear down a throwaway merge-result worktree, leaving NEITHER a registered worktree NOR a
+    directory behind (task HERD-296: 'without leaving merge commits or temporary state'). Best-effort +
+    silent — a cleanup fault never raises into the tick; a future tick's materialize call removes any
+    stale leftover before reusing the path (belt-and-braces)."""
+    if not tree_path:
+        return
+    try:
+        subprocess.run(["git", "-C", src_worktree, "worktree", "remove", "--force", tree_path],
+                       capture_output=True, text=True)
+    except Exception:
+        pass
+    if os.path.isdir(tree_path):
+        try:
+            shutil.rmtree(tree_path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _materialize_merge_tree(src_worktree, head_sha, base_sha, tree_path):
+    """Build a DETACHED, throwaway worktree at ``head_sha`` merged with ``base_sha`` — the exact
+    candidate tree the gate suite runs against (spike §2 step 1: 'the same dance STALE_BASE_AUTOFIX
+    already performs, minus the push'). Never touches ``src_worktree`` (the builder's own branch) or the
+    shared default-branch checkout: ``git worktree add --detach`` only REGISTERS a new linked worktree
+    under the shared ``.git`` — no branch ref is created or moved, so neither the builder branch nor
+    main is contaminated. Returns ``(True, "")`` on a clean merge (the tree is left in place for the
+    caller to dispatch the suite against) or ``(False, detail)`` on ANY failure — a real conflict, a
+    worktree-add fault, an unreadable src — in which case the attempt is fully unwound (worktree removed,
+    directory gone) before returning, so a failed materialize never leaks a merge commit or a stray dir.
+    """
+    try:
+        if os.path.exists(tree_path):
+            _remove_merge_tree(src_worktree, tree_path)
+        added = subprocess.run(
+            ["git", "-C", src_worktree, "worktree", "add", "--detach", tree_path, head_sha],
+            capture_output=True, text=True,
+        )
+        if added.returncode != 0:
+            _remove_merge_tree(src_worktree, tree_path)
+            return False, ("worktree add failed: %s" % (added.stderr or added.stdout or "")).strip()[:200]
+        merged = subprocess.run(
+            ["git", "-C", tree_path, "merge", "--no-edit", base_sha],
+            capture_output=True, text=True,
+        )
+        if merged.returncode != 0:
+            subprocess.run(["git", "-C", tree_path, "merge", "--abort"], capture_output=True, text=True)
+            _remove_merge_tree(src_worktree, tree_path)
+            detail = ("merge conflict: %s" % (merged.stderr or merged.stdout or "")).strip()
+            return False, detail[:200]
+        return True, ""
+    except Exception as exc:
+        _remove_merge_tree(src_worktree, tree_path)
+        return False, str(exc)[:200]
+
+
+def _total_health_inflight(state_dir):
+    """The suite-running slot count that must never exceed ``HEALTH_CONCURRENCY`` (spike §2 cleanup
+    note: 'respect HEALTH_CONCURRENCY') — the classic health workers PLUS any merge-result-gate workers,
+    since both shell the same heavy suite against the same shared git object store. With
+    MERGE_RESULT_GATE off (the default) no ``.merge-result-inflight-*`` marker is ever written, so this
+    is byte-identical to counting the classic prefix alone."""
+    return (_count_live_inflight(state_dir, ".health-inflight")
+            + _count_live_inflight(state_dir, ".merge-result-inflight"))
 
 
 # _health_worker mirror (agent-watch.sh:_health_worker): the ASYNC suite the port dispatches for one
@@ -1279,6 +1446,10 @@ class LiveGates:
         # HERD-373: a LiveGates instance is constructed fresh once per tick (_run_live_tick), so
         # memoizing here is tick-scoped for free — never persisted, a new tick always re-evaluates.
         self._main_health_pending_cache = None
+        # MERGE_RESULT_GATE (§6.4, HERD-296): ship-dormant, default off. Resolved ONCE per tick (a
+        # LiveGates instance lives exactly one tick) so `health()` branches on a plain bool, never a
+        # re-parsed env lookup per candidate.
+        self._merge_result_gate = _merge_result_gate_enabled(cfg)
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
@@ -1294,6 +1465,12 @@ class LiveGates:
 
     # ── health rail ────────────────────────────────────────────────────────────────────────────────
     def health(self, cand):
+        # MERGE_RESULT_GATE (§6.4, HERD-296): ON diverts the ENTIRE health rail to the merge-result
+        # path below — the suite runs against the materialized (head + base) tree instead of the
+        # branch as-is, so there is exactly ONE suite run per candidate, never a doubled gate latency
+        # (spike §2 cleanup note). OFF (default) never reaches `_merge_result_health` — byte-identical.
+        if self._merge_result_gate:
+            return self._merge_result_health(cand)
         st = self.state
         self.reused_health = False
         # 1. REVIEW-ONCE: an unchanged commit cannot yield a different verdict — reuse the sha-cache.
@@ -1356,7 +1533,7 @@ class LiveGates:
         #     PRs 450+451 ran concurrently, both reaped at timeout, re-dispatched, looping forever).
         #     Dead markers are not counted — a crashed worker never wedges a slot (mirrors bash's
         #     ``_count_live_healthchecks`` / ``_health_slot_free``, agent-watch.sh:10297,10311).
-        _hc_n = _count_live_inflight(st.dir, ".health-inflight")
+        _hc_n = _total_health_inflight(st.dir)
         # HERD-359: if the default-branch sha is unverified and not yet in-flight, reserve one slot
         # so bash's reconcile_main_health (Phase C) always finds capacity within the same tick.
         # With HEALTH_CONCURRENCY=1 this collapses the effective limit to 0 — no new PR health suite
@@ -1403,6 +1580,116 @@ class LiveGates:
         _marker_write(inflight, proc.pid, nonce=nonce)
         self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "pid", proc.pid, "log_path", log or "")
+
+    # ── merge-result gate (§6.4, HERD-296) — the whole health rail, retargeted at head+base ────────
+    def _merge_result_health(self, cand):
+        """The health rail under ``MERGE_RESULT_GATE=on``: before gating, materialize the candidate
+        tree — the PR's exact head sha merged with the CURRENT default-branch tip — and run the suite
+        against THAT, never the branch as-is (spike §2). Same async dispatch/collect/in-flight shape as
+        the classic rail above (:meth:`health`), so refix/bounce, concurrency and supersession all reuse
+        their existing machinery unchanged; only the substrate namespace and the cache key (``pr, sha,
+        base`` — a base move is a cache miss, i.e. the base moving RE-ARMS the gate) differ. A real merge
+        conflict is reported as the sentinel ``"CONFLICT"`` (never a cached verdict, never a rail BLOCK)
+        — the caller (:meth:`LiveTick._walk`) folds that into the existing honest hold path, resolver-owned.
+        """
+        st = self.state
+        self.reused_health = False
+        base_sha = _resolve_default_branch_sha()
+        if not base_sha:
+            # Fail-soft: cannot resolve what to merge against — hold and retry, never gate un-based and
+            # never silently fall through to the classic (un-gated) branch-as-is suite.
+            self.journal.append("dispatch_refused", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "rail", "merge_result", "reason", "base-unresolved")
+            return WAIT
+        # 1. REUSE: this EXACT (head, base) pair already has a terminal verdict.
+        cached = st.merge_result_verdict(cand.pr, cand.sha, base_sha)
+        if cached:
+            self.reused_health = True
+            return cached
+        disp = st.merge_result_dispatch_file(cand.pr, cand.sha)
+        inflight = st.merge_result_inflight_file(cand.pr, cand.sha)
+        tree = st.merge_result_tree_path(cand.pr, cand.sha)
+        # 2. COLLECT a finished worker's terminal verdict (same freshness-guard discipline as classic
+        #    health: only a nonce-matched out-file is ever trusted, HERD-349).
+        if disp and os.path.exists(disp):
+            try:
+                with open(disp, encoding="utf-8") as fh:
+                    first = fh.readline().rstrip("\n")
+            except Exception:
+                first = ""
+            nonce, _, rest = first.partition("\t")
+            expected = _marker_nonce(inflight)
+            if not expected or nonce != expected:
+                self.journal.append("stale_result_ignored", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "rail", "merge_result", "nonce", nonce or "",
+                                    "expected", expected or "")
+                st.rm(disp)
+            else:
+                tested_base = _nonce_base(nonce) or base_sha
+                verdict, _, detail = rest.partition("\t")
+                if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                    st.record_merge_result_verdict(cand.pr, cand.sha, tested_base, verdict, detail)
+                    st.rm(disp, inflight)
+                    _remove_merge_tree(cand.worktree, tree)
+                    self.journal.append("merge_result_gate", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "base", tested_base, "verdict", verdict)
+                    return verdict
+                st.rm(disp)
+                return WAIT
+        # 3. IN FLIGHT: a live worker already materializing/testing this exact head sha → wait.
+        if inflight and _marker_live(inflight):
+            return WAIT
+        # 3.5 same pre-dispatch worktree validation as the classic rail (task HERD-346) — the source
+        #     worktree the materialize step reads from must actually be there.
+        if cand.worktree and not _is_worktree(cand.worktree):
+            self.journal.append("dispatch_refused", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "rail", "merge_result", "reason", "no-worktree", "worktree", cand.worktree)
+            return WAIT
+        # 3.7 same concurrency slot check as the classic rail, over the COMBINED count (spike cleanup
+        #     note: 'respect HEALTH_CONCURRENCY') — a merge-result suite and a classic suite are never
+        #     dispatched past the same shared-object-store budget.
+        _hc_n = _total_health_inflight(st.dir)
+        _effective_max = self._health_max - (1 if self._main_health_pending_memo(st.dir) else 0)
+        if _hc_n >= _effective_max:
+            self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "inflight", _hc_n, "limit", self._health_max)
+            return WAIT
+        # 4. MATERIALIZE + DISPATCH.
+        return self._dispatch_merge_result(cand, base_sha)
+
+    def _dispatch_merge_result(self, cand, base_sha):
+        st = self.state
+        disp = st.merge_result_dispatch_file(cand.pr, cand.sha)
+        inflight = st.merge_result_inflight_file(cand.pr, cand.sha)
+        log = st.merge_result_log_file(cand.pr, cand.sha)
+        tree = st.merge_result_tree_path(cand.pr, cand.sha)
+        if not disp or not tree:
+            return WAIT
+        st.rm(disp)
+        ok, detail = _materialize_merge_tree(cand.worktree, cand.sha, base_sha, tree)
+        if not ok:
+            # A real conflict (or a materialize fault) — resolver-owned, fail soft into the honest hold
+            # path (never a cached verdict, never a rail BLOCK/bounce). The caller folds this into HOLD.
+            self.journal.append("merge_result_conflict", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "base", base_sha, "detail", detail)
+            return "CONFLICT"
+        nonce = _dispatch_nonce_with_base(base_sha)
+        main_dir = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", _HEALTH_WORKER_SH, "_",
+                 self._script("healthcheck.sh"), tree, disp, log, main_dir, st.dir or "", nonce],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except Exception as exc:
+            _remove_merge_tree(cand.worktree, tree)
+            self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "merge_result",
+                                "detail", "merge-result dispatch failed: %s" % str(exc)[:160])
+            return WAIT
+        _marker_write(inflight, proc.pid, nonce=nonce)
+        self.journal.append("merge_result_gate_dispatched", "pr", cand.pr, "slug", cand.slug,
+                            "sha", cand.sha, "base", base_sha, "pid", proc.pid, "log_path", log or "")
+        return WAIT
 
     # ── review rail ────────────────────────────────────────────────────────────────────────────────
     def review(self, cand):
@@ -2270,6 +2557,17 @@ class LiveTick:
                         self.journal.append("gate_superseded", "pr", cand.pr, "rail", "review",
                                             "old_sha", sha, "new_sha", cur, "action", "pane_retired",
                                             "pane", pane)
+                # merge-result-gate rail (§6.4, HERD-296) — same session-kill cancel, plus tear down the
+                # doomed sha's throwaway merged worktree so a superseded head never leaks temporary state.
+                # BYTE-INERT with the lever off: no ``.merge-result-inflight-*`` marker is ever written,
+                # so this glob is always empty and nothing is journaled.
+                for path, sha in st.stale_inflight(".merge-result-inflight", cand.pr, cur):
+                    if _terminate_worker(path):
+                        st.rm(path, st.merge_result_dispatch_file_sha(cand.pr, sha),
+                              st.merge_result_log_file_sha(cand.pr, sha))
+                        _remove_merge_tree(cand.worktree, st.merge_result_tree_path_sha(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "merge_result",
+                                            "old_sha", sha, "new_sha", cur, "action", "session_kill")
             except Exception as exc:
                 # A supersession scan fault for one candidate must never sink the tick (parking a doomed
                 # worker for the next tick's corpse sweep is always safe); journal it and move on.
@@ -2297,6 +2595,18 @@ class LiveTick:
         # 2. health rail (deterministic-slow) — DISPATCHED async by shelling out to the health runner
         #    (the dispatch/started event is journaled by the gate, only on an actual dispatch).
         health = self.gates.health(cand)
+        # 2a. MERGE_RESULT_GATE (§6.4, HERD-296): materializing the candidate tree hit a real conflict
+        #     against the current base — resolver-owned, folded into the SAME honest hold path as the
+        #     stale/dup gate above (once-guarded, no bounce, never cached as a red). Unreachable with the
+        #     lever off (the gate never returns this sentinel), so the branch is byte-inert by default.
+        if health == "CONFLICT":
+            self._advance(cand, "dispatch_health")
+            if self.state.once(cand.pr, cand.sha, "merge_result_conflict"):
+                self.journal.append("stale_dup_hold", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "kind", "merge_result_conflict",
+                                    "reason", "merge conflict against base — resolver-owned")
+            self._advance(cand, "merge_result_conflict")
+            return HOLD
         health = health if health in ("CLEAN", "FLAKY", "CODEERROR", WAIT) else "CLEAN"
         if health == WAIT:
             self.journal.append("health_pending", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
@@ -2488,7 +2798,7 @@ def _config_from_env(scenario=None):
     # yet — the key is inert here, read only by the unwired adapter skeleton.
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
               "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
-              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND")
+              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE")
              + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:
