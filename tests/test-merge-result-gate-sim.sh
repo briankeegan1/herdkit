@@ -65,6 +65,19 @@ import json, os, subprocess, sys, time
 REPO = os.environ["HERDKIT_REPO"]
 T = os.environ["SIMDIR"]
 
+# HERMETICITY (mirrors tests/test_live_runtime.py's module-level scrub): a healthcheck-descended
+# environment EXPORTS herdkit's OWN live-engine main-health coordinates — MAIN_HEALTH_TICK=on,
+# PROJECT_ROOT/MAIN pointing at the real herdkit checkout (herd-config.sh:678, HERD-359). Left in
+# place, _main_health_pending() would consult THIS sim's own throwaway MAIN dir (set below) with no
+# markers yet and reserve the single HEALTH_CONCURRENCY slot for a "main-health" verdict that never
+# arrives — collapsing the effective slot count to 0 and wedging poll_health() in WAIT forever (the
+# 2026-07-25 PR #541 CODEERROR: this sim timed out under the real heavy suite, which sources the
+# project's own .herd/config, but passed standalone where no such env is exported). Scrub the trio
+# before touching MAIN ourselves so the sim's health dispatch is never held hostage by the outer
+# project's own main-health reservation.
+for _k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
+    os.environ.pop(_k, None)
+
 from herd.live_runtime import LiveGates, LiveState, LiveJournal, LiveCandidate, WAIT
 
 scorecard = {}
