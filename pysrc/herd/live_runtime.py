@@ -1307,6 +1307,34 @@ def _starve_threshold(config):
     return n if n >= 1 else _DEFAULT_STARVE_THRESHOLD
 
 
+# ── MERGE_QUEUE — the ordered integration queue / merge train (§6.3, HERD-273) ─────────────────────
+
+def _merge_queue_enabled(config):
+    """STRICT validated gate key: an unrecognized/absent ``MERGE_QUEUE`` value is OFF — the safe,
+    byte-identical default — never accidentally on from a typo (mirrors ``_merge_result_gate_enabled`` /
+    ``_merge_fairness_enabled``).
+
+    ON implies :class:`LiveGates`'s per-slot merge-result verification UNCONDITIONALLY (wired at
+    ``LiveGates.__init__``) — the queue's correctness requirement (contract §6.3: "verified against
+    the virtual tip") is NOT a second, independently-toggleable config key a project could leave
+    mismatched (queue on, verification off). Setting ``MERGE_RESULT_GATE`` explicitly stays supported
+    for a project that wants the single-PR gate WITHOUT the queue; setting it ``off`` while
+    ``MERGE_QUEUE`` is ``on`` changes nothing — the queue's own requirement already forces the
+    verification on, so the two keys can never disagree in a way that matters."""
+    val = str((config or {}).get("MERGE_QUEUE", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def _queue_sort_key(pr):
+    """The queue's total order key: ascending PR NUMBER — the one stable, collision-free, cross-seat-
+    identical order every seat derives with no shared ledger (a PR's number never changes). Numeric
+    when possible so ``9`` sorts before ``10`` (plain string order would not); a non-numeric ``pr``
+    (a legacy fixture, a non-numeric work-unit id) sorts after every numeric one, deterministically,
+    rather than raising."""
+    s = str(pr)
+    return (0, int(s)) if s.isdigit() else (1, s)
+
+
 def _watcher_scope(config):
     v = str(config.get("WATCHER_SCOPE", "") or "mine")
     return v if v in ("mine", "all") else "mine"                      # unknown → safe default (10764)
@@ -1448,8 +1476,10 @@ class LiveGates:
         self._main_health_pending_cache = None
         # MERGE_RESULT_GATE (§6.4, HERD-296): ship-dormant, default off. Resolved ONCE per tick (a
         # LiveGates instance lives exactly one tick) so `health()` branches on a plain bool, never a
-        # re-parsed env lookup per candidate.
-        self._merge_result_gate = _merge_result_gate_enabled(cfg)
+        # re-parsed env lookup per candidate. MERGE_QUEUE (§6.3, HERD-273) implies the SAME
+        # verification unconditionally — see _merge_queue_enabled's docstring for why the queue is
+        # never a "set two config keys coherently" trap.
+        self._merge_result_gate = _merge_result_gate_enabled(cfg) or _merge_queue_enabled(cfg)
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
@@ -2236,6 +2266,10 @@ class LiveTick:
         self._fairness = _merge_fairness_enabled(self.config)
         self._starve_threshold = _starve_threshold(self.config)
         self._starved = set()  # PRs that are head-of-line-starved THIS tick (drives the sibling freeze)
+        # MERGE_QUEUE / ordered integration queue (§6.3, HERD-273). OFF (default) → _queue False and
+        # _queue_front always None, so the merge path below is byte-identical to before this feature.
+        self._queue = _merge_queue_enabled(self.config)
+        self._queue_front = None   # this tick's queue-front pr (resolved by _queue_prepass, once)
 
     # Return sentinel for _refix_check_and_record: sha already bounced, hold silently.
     _REFIX_ALREADY_ATTEMPTED = object()
@@ -2518,6 +2552,53 @@ class LiveTick:
                     and self.state.once(cand.pr, cand.sha, "fairness_window")):
                 self._starved.add(cand.pr)
 
+    # ── ordered integration queue / merge train (§6.3, HERD-273) ─────────────────────────────────
+    def _queue_eligible(self, cand):
+        """True iff ``cand`` currently holds a QUEUE POSITION — "eligible" (task HERD-273): not stale,
+        and a merge policy that would land it once its gates clear (the SAME pure test
+        :meth:`_would_automerge` already uses for the fairness freeze).
+
+        Deliberately NOT "blessed this tick" — membership does not wait on this tick's (base-
+        sensitive) health outcome at all, so it is available from a candidate's VERY FIRST tick (no
+        cold-start lag: a lone ready candidate merges immediately, exactly as with the lever off) AND
+        it never silently lapses while a previously-assigned front is mid-re-verification against a
+        moved virtual tip (§6.4) or genuinely stuck (CODEERROR/CONFLICT). :meth:`_queue_prepass` picks
+        the front from this same set every tick, and :meth:`_walk` never promotes a non-front
+        candidate no matter how green its own gates are — that is exactly what makes "a red/
+        conflicting head cannot let later candidates merge past it" true. The tradeoff, by design and
+        documented posture (mirrors HERD-296's resolver-owned CONFLICT, which carries no refix budget
+        of its own): a front stuck needs-you or in a standing conflict blocks the WHOLE queue until a
+        human/resolver clears it (a new sha, or closing the PR) — row-truth (§5.1) makes that stall
+        loud, never silent; throughput is deliberately not this PR's concern (task HERD-273: batch/
+        speculative slots are out of scope for the ordering primitive).
+        """
+        if cand.stale:
+            return False
+        return self._would_automerge(cand)
+
+    def _queue_prepass(self, candidates):
+        """Resolve THIS tick's queue front BEFORE any candidate is walked (§6.3, HERD-273) — the same
+        prepass shape as :meth:`_fairness_prepass`. A strict NO-OP when ``MERGE_QUEUE`` is off:
+        ``_queue_front`` stays ``None``, so :meth:`_walk`'s queue branch is never taken and the merge
+        path is byte-identical to before this feature.
+
+        The front is the MINIMUM pr (:func:`_queue_sort_key`, a stable total order every seat derives
+        identically with no shared ledger) among :meth:`_queue_eligible` candidates — "treat its front
+        as the only merge head for the window" (task HERD-273): at most one candidate applies a merge
+        this tick, and it is always the deterministically-first queue member, never whichever candidate
+        merely happened to turn green first.
+        """
+        if not self._queue:
+            return
+        eligible = [c for c in candidates if self._queue_eligible(c)]
+        if not eligible:
+            self._queue_front = None
+            return
+        front = min(eligible, key=lambda c: _queue_sort_key(c.pr))
+        self._queue_front = front.pr
+        self.journal.append("merge_queue_window", "front_pr", front.pr, "front_sha", front.sha,
+                            "eligible", len(eligible))
+
     def _supersede_stale(self, candidates):
         """Discovery → cancel: TERM every doomed in-flight worker a candidate has moved PAST (contract
         §2.4/§6.1, HERD-341). For each current candidate, DYNAMICALLY discover the in-flight markers
@@ -2723,6 +2804,20 @@ class LiveTick:
                                     "threshold", self._starve_threshold)
             return HOLD
 
+        # 5c. MERGE_QUEUE ordering (§6.3, HERD-273): the front of the deterministic queue — resolved
+        #     once per tick by _queue_prepass, BEFORE any candidate walked — is the ONLY candidate this
+        #     window may actually apply a merge. Every OTHER candidate that would otherwise merge now
+        #     HOLDS instead, even one whose own gates are green: two blessed siblings never land out of
+        #     queue order, and a front stuck red/CONFLICT blocks every later position too (nobody is
+        #     promoted to fill its slot this window — see _queue_eligible). Off / this candidate already
+        #     IS the front → the branch is never taken and the decide+apply below are byte-identical.
+        if action == "MERGE" and self._queue and str(cand.pr) != str(self._queue_front):
+            self._advance(cand, "queue_wait")                  # BLESSED --queue_wait--> HOLD
+            if self.state.once(cand.pr, cand.sha, "queue_hold"):
+                self.journal.append("merge_queue_hold", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "front_pr", self._queue_front or "")
+            return HOLD
+
         self._advance(cand, {"MERGE": "decide_merge", "HOLD": "decide_hold",
                              "OBSERVE": "decide_observe"}[action])
 
@@ -2768,6 +2863,9 @@ class LiveTick:
         # Resolve this tick's starvation state before any candidate is walked (§6.2, HERD-340). A strict
         # no-op under MERGE_FAIRNESS=off, so the loop below stays byte-identical to before this feature.
         self._fairness_prepass(candidates)
+        # Resolve this tick's queue front before any candidate is walked (§6.3, HERD-273). A strict
+        # no-op under MERGE_QUEUE=off, so the loop below stays byte-identical to before this feature.
+        self._queue_prepass(candidates)
         for cand in candidates:
             try:
                 self._outcome[cand.pr] = self._walk(cand)
@@ -2798,7 +2896,7 @@ def _config_from_env(scenario=None):
     # yet — the key is inert here, read only by the unwired adapter skeleton.
     knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
               "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
-              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE")
+              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
              + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
     for knob in knobs:
         if knob not in config and os.environ.get(knob) is not None:

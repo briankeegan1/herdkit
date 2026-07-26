@@ -292,6 +292,9 @@ MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
 MERGE_RESULT_GATE	unit	tests/test_live_runtime.py
 MERGE_RESULT_GATE	sim	tests/test-merge-result-gate-sim.sh
+MERGE_QUEUE	unit	tests/test_live_runtime.py
+MERGE_QUEUE	unit	tests/test_statemachine_props.py
+MERGE_QUEUE	sim	tests/test-merge-queue-sim.sh
 RESOLVER_PANE	unit	tests/test-resolver-pane-lifecycle.sh
 RESOLVER_PANE	sim	tests/test-sandbox-real-panes.sh
 HEALTH_PANE	unit	tests/test-health-pane-lifecycle.sh

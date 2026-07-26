@@ -268,6 +268,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MERGE_FAIRNESS` → `agent-watch.sh`
 - `MERGE_METHOD` → `bin/herd`, `config-viability.sh`, `git-pr.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `merge-policy.sh`, `posture-lint.sh`
+- `MERGE_QUEUE` → —
 - `MERGE_RESULT_GATE` → —
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`

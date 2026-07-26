@@ -57,6 +57,13 @@ of it) gets a clean base to finish its final gate. The freeze is a HOLD, never a
 sibling lands on a later window once the starved PR clears. Like the other levers this edge is
 ship-dormant — :mod:`herd.live_runtime` emits ``merge_frozen`` ONLY under ``MERGE_FAIRNESS`` (default
 off), so with the lever off the row is unreachable and the merge path is byte-identical.
+
+ORDERED INTEGRATION QUEUE (§6.3, HERD-273). A blessed candidate that is NOT this tick's queue front
+is held the same shape — the ``queue_wait`` edge :data:`BLESSED` → :data:`HOLD` — so two siblings
+blessed in the same window never land out of the deterministic queue order (the lapping the train
+exists to make structurally impossible). Ship-dormant like ``merge_frozen``: :mod:`herd.live_runtime`
+emits ``queue_wait`` ONLY under ``MERGE_QUEUE`` (default off), so with the lever off this row is
+unreachable too.
 """
 
 from herd import decisions
@@ -111,6 +118,7 @@ DECIDE_OBSERVE = "decide_observe"    # policy decision = OBSERVE, never merge (�
 APPROVED = "approved"                # a sha-keyed approval cleared the hold (§5.5)
 MERGE_REFUSED = "merge_refused"      # --match-head-commit refused: sha moved at apply (§2.4)
 MERGE_FROZEN = "merge_frozen"        # merge-fairness held this sibling one window for a starved head (§6.2)
+QUEUE_WAIT = "queue_wait"            # HERD-273/§6.3: not this tick's queue front — held one window (§6.3)
 NEW_SHA = "new_sha"                  # a new head sha superseded this one (§2.4)
 SIBLING_RESTALE = "sibling_restale"  # a sibling merge re-staled this still-valid sha (§6.1)
 MERGE_RESULT_CONFLICT = "merge_result_conflict"  # HERD-296/§6.4: the merged (head+base) candidate tree
@@ -122,7 +130,7 @@ EVENTS = (
     DISPATCH_HEALTH, HEALTH_CLEAN, HEALTH_FLAKY, HEALTH_CODEERROR, HEALTH_INFRA,
     REVIEW_PASS, REVIEW_BLOCK, REVIEW_INFRA,
     REFIX_BOUNCE, REFIX_EXHAUSTED, BLESSING_POSTED,
-    DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN,
+    DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN, QUEUE_WAIT,
     NEW_SHA, SIBLING_RESTALE, MERGE_RESULT_CONFLICT,
 )
 
@@ -193,6 +201,11 @@ _BASE_TRANSITIONS = {
     # emits this event ONLY under MERGE_FAIRNESS (live_runtime), so with the lever off it never fires
     # and the table row is unreachable, keeping the merge path byte-identical.
     (BLESSED, MERGE_FROZEN): HOLD,
+    # HERD-273/§6.3 ordered integration queue: a BLESSED candidate that is NOT this tick's queue
+    # front is held one window — exactly the merge_frozen shape, different trigger (queue order
+    # instead of starvation). Ship-dormant: live_runtime emits this ONLY under MERGE_QUEUE (default
+    # off), so with the lever off this row is unreachable and the merge path is byte-identical.
+    (BLESSED, QUEUE_WAIT): HOLD,
 
     # HOLD — a gates-green PR awaiting a human/coordinator signal (§5.4 human-verify, §5.5 approval).
     # The hold is loud and owned (§5.6); an approval clears it to merge. A hold is sha-keyed, so a
