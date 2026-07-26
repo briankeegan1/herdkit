@@ -298,6 +298,43 @@ class MergeFairnessFreeze(unittest.TestCase):
         self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_REFUSED), SM.SUPERSEDED)
 
 
+class MergeQueueOrdering(unittest.TestCase):
+    """§6.3 / HERD-273 ordered integration queue: a BLESSED candidate that is not this tick's queue
+    front is held one window via the ``queue_wait`` edge — the exact same shape as ``merge_frozen``
+    (different trigger: queue order, not starvation), and purely additive."""
+
+    def test_queue_wait_holds_a_blessed_non_front(self):
+        self.assertEqual(SM.transition(SM.BLESSED, SM.QUEUE_WAIT), SM.HOLD)
+        self.assertTrue(SM.can(SM.BLESSED, SM.QUEUE_WAIT))
+
+    def test_queue_wait_is_a_registered_event(self):
+        self.assertIn(SM.QUEUE_WAIT, SM.EVENTS)
+        self.assertEqual(SM.QUEUE_WAIT, "queue_wait")
+
+    def test_queue_wait_is_only_legal_from_blessed(self):
+        for state in SM.STATES:
+            if state == SM.BLESSED:
+                continue
+            self.assertFalse(SM.can(state, SM.QUEUE_WAIT),
+                             "%r must not accept queue_wait" % (state,))
+
+    def test_queue_wait_lands_in_a_live_non_terminal_hold(self):
+        self.assertFalse(SM.is_terminal(SM.HOLD))
+        self.assertEqual(SM.transition(SM.HOLD, SM.APPROVED), SM.MERGED)
+
+    def test_queued_candidate_is_still_supersedable(self):
+        for ev in (SM.NEW_SHA, SM.SIBLING_RESTALE):
+            self.assertEqual(SM.transition(SM.HOLD, ev), SM.SUPERSEDED)
+
+    def test_blessed_keeps_every_prior_exit_including_merge_frozen(self):
+        # The new edge coexists with merge_frozen and the four original decisions — purely additive.
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_MERGE), SM.MERGED)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_HOLD), SM.HOLD)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_OBSERVE), SM.OBSERVE)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_REFUSED), SM.SUPERSEDED)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_FROZEN), SM.HOLD)
+
+
 # ── OPTIONAL hypothesis pass — extra fuzz when installed; skip-soft otherwise (never a red) ──────
 try:
     from hypothesis import given, settings, strategies as st

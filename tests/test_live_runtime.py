@@ -1645,6 +1645,155 @@ class MergeFairnessState(unittest.TestCase):
         self.assertIn("pr_restale", evs)
         self.assertIn("pr_starvation", evs)
 
+
+class TestMergeQueueConfig(unittest.TestCase):
+    """MERGE_QUEUE (§6.3, HERD-273): a STRICT validated key — an unrecognized/absent value is OFF,
+    never accidentally on from a typo (mirrors MERGE_RESULT_GATE / MERGE_FAIRNESS)."""
+
+    def test_recognized_truthy_values_are_on(self):
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "True"):
+            self.assertTrue(LR._merge_queue_enabled({"MERGE_QUEUE": v}), v)
+
+    def test_unrecognized_or_absent_is_off(self):
+        for cfg in ({}, {"MERGE_QUEUE": ""}, {"MERGE_QUEUE": "flase"}, {"MERGE_QUEUE": "0"},
+                    {"MERGE_QUEUE": "off"}, {"MERGE_QUEUE": "no"}):
+            self.assertFalse(LR._merge_queue_enabled(cfg), cfg)
+
+    def test_queue_on_forces_merge_result_gate_even_when_explicitly_off(self):
+        # The "avoid a second contradictory config requirement" posture: MERGE_QUEUE=on implies the
+        # SAME per-slot verification MERGE_RESULT_GATE=on would provide, regardless of that key's own
+        # (even explicitly-off) value — a project never has to set both coherently.
+        state = LiveState(tempfile.mkdtemp())
+        journal = LiveJournal(None)
+        gates = LiveGates("/no/such/home", state, journal,
+                          config={"MERGE_QUEUE": "on", "MERGE_RESULT_GATE": "off"})
+        self.assertTrue(gates._merge_result_gate)
+
+    def test_merge_result_gate_alone_does_not_imply_queue(self):
+        state = LiveState(tempfile.mkdtemp())
+        t = LiveTick({"MERGE_RESULT_GATE": "on"}, FixtureDiscovery({}), FixtureGates({}),
+                     DryRunActuator(LiveJournal(None)), LiveJournal(None), state=state)
+        self.assertFalse(t._queue)
+
+
+class TestMergeQueueOrdering(unittest.TestCase):
+    """MERGE_QUEUE ordered integration queue (§6.3, HERD-273): at most one blessed candidate applies
+    a merge per window — the deterministic front (ascending PR number) — and every other candidate
+    that would otherwise merge now HOLDS, even one whose own gates are green. Off is byte-identical."""
+
+    def _run(self, config, candidates, state=None):
+        tmp = tempfile.mkdtemp()
+        state = state if state is not None else LiveState(os.path.join(tmp, "state"))
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        scen = {"config": config, "candidates": candidates}
+        tick = LiveTick(config, FixtureDiscovery(scen), FixtureGates(scen),
+                        DryRunActuator(journal), journal, state=state)
+        res = tick.run()
+        return res, events(journal.path), state
+
+    def _cand(self, pr, **kw):
+        kw.setdefault("sha", "s%s" % pr)
+        kw.setdefault("review", "PASS")
+        kw.setdefault("health", "CLEAN")
+        kw.setdefault("worktree", "/wt/%s" % pr)
+        return dict(pr=pr, **kw)
+
+    def test_off_is_byte_identical_both_merge_same_tick(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "off"}
+        cands = [self._cand(7), self._cand(3)]
+        res, evs, _ = self._run(cfg, cands)
+        self.assertEqual(sorted(res["merged"]), ["3", "7"])
+        self.assertFalse([e for e in evs if "queue" in e["event"]])
+
+    def test_on_only_the_lowest_pr_merges_this_window(self):
+        # Two candidates both green in the SAME tick: only pr 3 (lower) merges; pr 7 HOLDS even though
+        # its own gates are just as green — no cold-start lag (works on each candidate's VERY FIRST
+        # tick, unlike a scheme keyed off a lagging cross-tick ledger).
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on"}
+        cands = [self._cand(7), self._cand(3)]
+        res, evs, _ = self._run(cfg, cands)
+        self.assertEqual(res["merged"], ["3"])
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        holds = [e for e in evs if e["event"] == "merge_queue_hold"]
+        self.assertEqual(len(holds), 1)
+        self.assertEqual(holds[0]["pr"], 7)
+        self.assertEqual(str(holds[0]["front_pr"]), "3")
+
+    def test_front_promotes_next_tick_after_merge(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on"}
+        state = LiveState(tempfile.mkdtemp())
+        cands = [self._cand(7), self._cand(3)]
+        res1, _, _ = self._run(cfg, cands, state=state)
+        self.assertEqual(res1["merged"], ["3"])
+        # pr 3 is gone (merged+reaped); pr 7 is now the only — and therefore front — candidate.
+        res2, _, _ = self._run(cfg, [self._cand(7)], state=state)
+        self.assertEqual(res2["merged"], ["7"])
+
+    def test_a_stuck_front_blocks_a_ready_later_candidate(self):
+        # pr 3 (lower/front) is CODEERROR with no live builder to bounce -> ESCALATE, never reaching
+        # MERGE. pr 7 is individually green but must NOT be promoted to fill the window.
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on", "REFIX_MAX_ROUNDS": "0"}
+        cands = [self._cand(3, health="CODEERROR", agent_status="dead"), self._cand(7)]
+        res, _, _ = self._run(cfg, cands)
+        self.assertEqual(res["outcomes"]["3"], "ESCALATE")
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        self.assertEqual(res["merged"], [])
+
+    def test_hv_hold_candidate_is_not_queue_eligible_and_does_not_block(self):
+        # A human-verify hold would never auto-merge, so it must not occupy a queue slot (mirrors the
+        # fairness freeze's own "a human hold never triggers a freeze" rule).
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on"}
+        cands = [self._cand(3, hv_hold=True), self._cand(7)]
+        res, _, _ = self._run(cfg, cands)
+        self.assertEqual(res["outcomes"]["3"], "HOLD")
+        self.assertEqual(res["merged"], ["7"])
+
+    def test_stale_candidate_is_not_queue_eligible_and_does_not_block(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on"}
+        cands = [self._cand(3, stale=True), self._cand(7)]
+        res, _, _ = self._run(cfg, cands)
+        self.assertEqual(res["outcomes"]["3"], "HOLD")
+        self.assertEqual(res["merged"], ["7"])
+
+    def test_queue_hold_once_guard_no_duplicate_journal_across_ticks(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on", "REFIX_MAX_ROUNDS": "0"}
+        state = LiveState(tempfile.mkdtemp())
+        cands = [self._cand(3, health="CODEERROR", agent_status="dead"), self._cand(7)]
+        self._run(cfg, cands, state=state)
+        _, evs2, _ = self._run(cfg, cands, state=state)
+        self.assertFalse([e for e in evs2 if e["event"] == "merge_queue_hold"])
+
+    def test_lone_ready_candidate_merges_immediately_no_lag(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on"}
+        res, _, _ = self._run(cfg, [self._cand(9)])
+        self.assertEqual(res["merged"], ["9"])
+
+    def test_lever_off_leaves_queue_front_none(self):
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "off"}
+        state = LiveState(tempfile.mkdtemp())
+        tick = LiveTick(cfg, FixtureDiscovery({"candidates": [self._cand(3), self._cand(7)],
+                                              "config": cfg}),
+                        FixtureGates({"candidates": [self._cand(3), self._cand(7)]}),
+                        DryRunActuator(LiveJournal(None)), LiveJournal(None), state=state)
+        tick.run()
+        self.assertFalse(tick._queue)
+        self.assertIsNone(tick._queue_front)
+
+    def test_fairness_and_queue_compose_without_ever_merging_the_non_front(self):
+        # Both levers on: FAIRNESS freezes every non-starved sibling (pr 3, the queue front) because
+        # pr 9 is starved; QUEUE holds pr 9 because it is not the front. The two levers AND — each may
+        # independently veto a merge — and never contradict each other into merging the wrong PR: this
+        # tick lands nobody, but nobody lands OUT OF ORDER either.
+        cfg = {"MERGE_POLICY": "auto", "MERGE_QUEUE": "on", "MERGE_FAIRNESS": "on"}
+        cands = [self._cand(3), self._cand(9, restale_laps=5)]
+        res, evs, _ = self._run(cfg, cands)
+        self.assertEqual(res["merged"], [])
+        self.assertEqual(res["outcomes"]["3"], "HOLD")
+        self.assertEqual(res["outcomes"]["9"], "HOLD")
+        self.assertTrue([e for e in evs if e["event"] == "merge_fairness_freeze"])
+        self.assertFalse([e for e in evs if e["event"] == "merge_queue_hold" and e["pr"] == 3])
+
+
 class TestSupersessionCancel(unittest.TestCase):
     """HERD-341: discovery → supersession-cancel. A candidate whose head sha has moved past an in-flight
     worker's sha TERMs that doomed worker — by a SESSION kill of its whole detached subtree (HERD-283/348:

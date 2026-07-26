@@ -254,8 +254,10 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `pr_restale` / `pr_starvation` | pr, sha, slug, kind (+ lap count) | `agent-watch.sh:3371`–`:3374` |
 | `infra_breaker_open` / `_close` | — | `agent-watch.sh:2621` / `:2643` |
 
-Note `merge_result_gate` is **absent** — HERD-296 is folded into the port, not built in bash
-(§6.4). The port introduces it.
+`merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296) and `merge_queue_hold` /
+`merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with
+no bash anchor by design: both items are folded into the port, never built in the retired bash
+action pass (`pysrc/herd/live_runtime.py`, anchored in §6.3/§6.4).
 
 ---
 
@@ -446,56 +448,86 @@ with the risk until P3, per the epic decision):
 
 ### 6.3 HERD-273 — ordered integration queue (merge train)
 
-**Live state. NOT PRESENT.** There is no merge train, no virtual-tip, no serialized merge
-window — the only ordering primitive is the dormant fairness partition (§6.2). The current merge
-happens per-candidate at `do_merge` (`agent-watch.sh:12333`, def `agent-watch.sh:5708`). The
-health rail is already single-slot-serialized (`_health_slot_free` `agent-watch.sh:9930`,
-`HEALTH_CONCURRENCY` default 1), which is the throughput seam a train piggybacks.
+**Live state. IMPLEMENTED** (Python port only; the bash action pass never grows this — the classic
+merge is untouched there). `MERGE_QUEUE` (`live_runtime.py:_merge_queue_enabled`, strict-validated
+like every other gate lever) is ship-dormant, default off. When on, `LiveTick` resolves this tick's
+**queue front** *before* any candidate is walked — `LiveTick._queue_prepass`
+(`live_runtime.py:2580`) — from the set `LiveTick._queue_eligible` (`live_runtime.py:2557`)
+returns: every open, non-stale candidate whose merge policy would land it once green (the SAME
+pure `_would_automerge` test §6.2's freeze uses), **independent of this tick's own health
+outcome**. The front is the MINIMUM PR **number** (`_queue_sort_key`, `live_runtime.py:1329`) among
+that set — a stable, collision-free total order every seat derives identically with no shared
+ledger, since a PR's number never changes.
 
-**TARGET.** An ordered integration queue: each candidate is verified against the **virtual tip**
-(the default branch + the train ahead), gated there, and merged **in order** — which makes
-lapping structurally impossible and retires the starvation/fairness politeness of §6.2 at scale
-(`docs/spikes/merge-result-gate.md` §3). HERD-296 (§6.4) is the train's **per-slot verifier**;
-this item is the ordering around it. Batch-verify-N + bisect-on-red and speculative slots are
-concurrency work layered on the same primitive. The port builds the queue with the merge-result
-gate as the per-position check; a native GitHub merge queue and an engine-native queue both
-require the §6.4 gate as the check they re-run per position, so §6.4 is the prerequisite either
-way.
+`LiveTick._walk` (§2.1 step 11, `live_runtime.py:2808`) then gates the apply step itself: a
+candidate whose gates are green and whose policy says MERGE, but which is **not** this tick's
+front, HOLDS instead (`queue_wait`, a new lifecycle edge BLESSED→HOLD,
+`statemachine.py:QUEUE_WAIT`/`:208`, journaled once per `(pr, sha)` as `merge_queue_hold`) — even
+though its own gates are exactly as green as the front's. Only the front actually reaches
+`actuator.merge`. This makes lapping structurally impossible: two siblings blessed in the same
+window can never land out of order, and — because membership does not depend on this tick's health
+result — a front that is genuinely stuck (a real `CONFLICT` against a base a sibling just
+advanced, or an exhausted refix budget) is **never silently vacated** for a later candidate to fill
+its slot; the whole queue holds until a human/resolver clears it (a new sha re-arms membership;
+row-truth §5.1 makes the stall loud, never silent). `merge_queue_window` is journaled every tick
+the lever is on, naming the resolved front and the eligible-set size, for observability.
+
+The **virtual tip** (§2.1's phrase for "default branch + the train ahead") needs no synthetic
+chaining to generalize the §6.4 per-slot verifier: because only the front ever actually applies a
+*real* merge, by the time a later queue position becomes front every already-ordered candidate
+ahead of it has already really landed — the plain current default-branch tip **already is** the
+virtual tip. `MERGE_QUEUE=on` implies the §6.4 verification unconditionally
+(`LiveGates.__init__`, `live_runtime.py:1483`: `_merge_result_gate_enabled(cfg) or
+_merge_queue_enabled(cfg)`) so the queue's correctness requirement is never a second,
+independently-toggleable config key a project could leave mismatched — setting
+`MERGE_RESULT_GATE` explicitly (on **or** off) alongside `MERGE_QUEUE=on` changes nothing.
+
+Batch-verify-N + bisect-on-red and speculative parallel slots — pre-verifying position 2 against a
+*projected*, not-yet-real, virtual tip while position 1 is still gating — are explicitly **not**
+implemented; this ships only the ordering primitive (`docs/spikes/merge-result-gate.md` §3 calls
+these out as pure concurrency work layered on the same primitive, the train's Phase 4 proper). The
+tradeoff is throughput, not correctness: with `HEALTH_CONCURRENCY`'s default single slot already
+serializing most of the work, a stuck front blocks the whole queue until cleared — accepted
+per-doctrine (mirrors §6.4's own resolver-owned `CONFLICT`, which carries no refix budget either).
+Proven by `tests/test_live_runtime.py` (`TestMergeQueueConfig`, `TestMergeQueueOrdering`),
+`tests/test_statemachine_props.py` (`MergeQueueOrdering`), and the hermetic multi-seat sim
+`tests/test-merge-queue-sim.sh` (real git, six candidate PRs, one genuinely conflicting against an
+already-landed sibling — proving bounded slots, no lapping, and that the conflicting head blocks
+every later candidate until re-armed by a new sha).
 
 ### 6.4 HERD-296 — merge-result gate
 
-**Live state. NOT PRESENT** (`MERGE_RESULT_GATE` / `merge_result_gate` do not exist). The
-pre-merge health gate runs the suite on the **branch worktree as-is** — `_health_worker` runs
-`healthcheck.sh` on the candidate dir with no merge materialized (`agent-watch.sh:10169`,`:10178`;
-inside, the project command runs against `$DIR` as-is `healthcheck.sh:255`). This is exactly the
-gap: PR A and PR B can each test green on their own stale base, merge textually clean, and
-interact only through behavior — every gate passes, main breaks
-(`docs/spikes/merge-result-gate.md` §1). Baseline-aware inheritance (§2.3, `healthcheck.sh:201`)
-compares branch-vs-base as **two independent suite runs** — it forgives inherited reds but does
-**not** close the merge-result gap. The stale-base autofix that *does* run `git merge <default
-tip>` is delegated to the live builder or the conflict resolver, not performed in-process
-(`_stale_base_autofix_enabled` `agent-watch.sh:7387`, doc `agent-watch.sh:7378`); it is also
-default-off, so there is no reusable in-watcher "merge PR+base into a temp tree" routine yet.
+**Live state. IMPLEMENTED** (Python port only, `MERGE_RESULT_GATE`, ship-dormant default off,
+strict-validated: `live_runtime.py:_merge_result_gate_enabled`, `:985`). The classic bash pre-merge
+health gate still runs the suite on the **branch worktree as-is** and is untouched — this item
+lives entirely in `pysrc/herd/live_runtime.py`, never in `agent-watch.sh`. With the lever on,
+`LiveGates.health` (`live_runtime.py:1498`) diverts the whole health rail to
+`LiveGates._merge_result_health` (`:1616`): before dispatch, `_resolve_default_branch_sha`
+(`:992`) reads the current default-branch tip and `_materialize_merge_tree` (`:1044`) builds a
+DETACHED, throwaway worktree at the PR's exact head sha merged with that tip (`git worktree add
+--detach` + `git merge --no-edit`, never touching the builder's own branch or the shared default
+checkout). The healthcheck suite then runs against **that** materialized tree via the same async
+dispatch/collect/in-flight machinery the classic rail uses (`LiveGates._dispatch_merge_result`,
+`:1691`), so refix/bounce, `HEALTH_CONCURRENCY` accounting (`_total_health_inflight`, combining the
+classic and merge-result in-flight counts) and supersession-cancel all compose unchanged.
 
-**TARGET** (`docs/spikes/merge-result-gate.md` §2). Before the pre-merge health gate,
-materialize the merge and gate **that**:
+The tested `(head, base)` pair is cached (`LiveState.merge_result_verdict`/`record_merge_result_verdict`)
+keyed on all three of `pr, sha, base` — a base move is simply a cache miss, which **re-arms** the
+gate for the new pair (§2.4 sha-keying discipline, generalized to a compound key) — and a
+`merge_result_gate` event journals the base actually tested. A real merge conflict never becomes a
+cached verdict or a rail BLOCK: `_materialize_merge_tree` fails soft to the sentinel `"CONFLICT"`,
+which `LiveTick._walk` folds into the SAME honest, resolver-owned hold the stale-dup gate uses
+(`merge_result_conflict`, a new lifecycle edge HEALTH→STALE_HELD, `statemachine.py:MERGE_RESULT_CONFLICT`)
+— never a bounce, never a red. Off (default): `LiveGates.health` never even reaches
+`_merge_result_health`, no `.merge-result-*` file is ever written, and the classic per-branch
+healthcheck dispatch is byte-identical to before the feature existed.
 
-1. In the PR's worktree (or a temp copy), `git merge <DEFAULT_BRANCH tip>` — the same dance the
-   stale-base autofix performs, minus the push.
-2. Merge conflicts remain the resolver's lane (nothing new).
-3. Run the healthcheck on the **merged tree**; green → proceed to review/merge as today. The
-   slot it inserts before is the health gate (`agent-watch.sh:12009`).
-4. Journal a `merge_result_gate` event carrying the base sha tested against; a base that moves
-   between gate and merge **re-arms** the gate for the new `(head, base)` pair — the same
-   sha-keying discipline as verdicts (§2.4).
-5. **Baseline-aware inheritance must evaluate against the merged tree's base**, not the branch's
-   old merge-base, or an inherited-failure downgrade could mask a real interaction failure
-   (`docs/spikes/merge-result-gate.md` §2).
-6. Ship-dormant: `MERGE_RESULT_GATE` default off, byte-identical merge path until a project opts
-   in (herdkit's ship-dormant / byte-identical-when-off doctrine, `AGENTS.md`).
-
-The port implements this as the per-slot verifier the integration queue (§6.3) re-runs per
-position, with the base generalized to the virtual tip.
+Proven by `tests/test_live_runtime.py` (`TestMergeResultGateConfig`, `TestMergeResultGateDispatch`,
+`TestMergeResultGateWalk`, `TestMergeResultGateSupersession`, `TestMergeResultGateByteIdentical`)
+and the hermetic sim `tests/test-merge-result-gate-sim.sh` (real git, two textually-disjoint PRs
+that are each individually green but semantically incompatible once merged, plus a genuinely
+conflicting third). §6.3's ordered queue reuses this verifier verbatim as its per-slot check, with
+the base generalized to the virtual tip as described there.
 
 ---
 
@@ -532,8 +564,10 @@ Per the P0 acceptance criteria (HERD-301):
 - **IMPLEMENTED vs. TARGET is stated explicitly** for the four folded items (§6): HERD-235 gate
   order and new-sha supersession-cancel are IMPLEMENTED (DAG + cross-sibling cancel are TARGET);
   HERD-294's starvation counter is IMPLEMENTED and the reorder is ship-dormant (the freeze is
-  TARGET); HERD-273 and HERD-296 are NOT PRESENT (TARGET), with the seams they slot into
-  anchored.
+  TARGET); HERD-296 (§6.4, `MERGE_RESULT_GATE`) and HERD-273 (§6.3, `MERGE_QUEUE`) are both
+  IMPLEMENTED — Python-port-only, ship-dormant, default off — with batch-verify-N/bisect-on-red and
+  speculative parallel slots (the train's Phase 4 proper) left as TARGET, out of scope for the
+  ordering primitive.
 
 ---
 
