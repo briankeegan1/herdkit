@@ -32,6 +32,14 @@ capability	proof_kind	proof_ref
 # BACKFILL (HERD-152): every capabilities.tsv row now carries either a real proof or a none-yet note, so
 # the report's unmapped count is ~0 and the ratchet catches only genuinely new, unproven capabilities.
 # Grow this file as coverage is claimed: when a none-yet's proof lands, replace the note row with it.
+#
+# GATE/AUTOFIX RATCHET (HERD-424): a FOURTH sibling, templates/capability-class.tsv, explicitly (never
+# by description-guessing) marks a subset of capabilities gate | autofix. PLAIN `herd conformance
+# report` / `run` (no flag) require every such capability to carry a REAL, EXISTING proof_kind=sim row
+# here — a none-yet note or a unit/render-only mapping is a loud, default-visible failure for a
+# classified capability (a capability with NO class row keeps its old advisory-only read, unchanged).
+# See templates/capability-class.tsv for the classification doctrine and the currently-classified
+# cohort.
 herd config <list|get|set>	unit	tests/test-cli-config.sh
 herd config <list|get|set>	unit	tests/test-config-local-overlay.sh
 herd config <list|get|set>	unit	tests/test-cli-config-sync.sh
@@ -197,6 +205,7 @@ HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
 herd-review.sh	unit	tests/test-review-verdict-integrity.sh
 herd-review.sh	unit	tests/test-structured-block-verdict.sh
+herd-review.sh	sim	tests/test-sandbox-sim.sh
 PROJECT_ROOT	unit	tests/test-launch-binding-guard.sh
 WORKTREES_DIR	unit	tests/test-branch-template.sh
 WORKTREES_DIR	unit	tests/test-builder-secrets-isolation.sh
@@ -276,16 +285,22 @@ REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
 GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
+GATE_DISPATCH	sim	tests/test-sandbox-concurrency.sh
 GATE_STATUS	unit	tests/test-gate-status.sh
 DELTA_REVIEW	unit	tests/test-delta-review.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
+INFRA_BREAKER_MAX	sim	tests/test-sandbox-concurrency.sh
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
+INFRA_BREAKER_COOLDOWN	sim	tests/test-sandbox-concurrency.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
+REVIEW_AUTOFIX	sim	tests/test-sandbox-real-panes.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
 REFIX_COMPLETE_MIN	unit	tests/test-py-live-refix-complete.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
+STALE_DUP_DETECT	sim	tests/test-sandbox-self-restart.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
+STALE_BASE_AUTOFIX	sim	tests/test-sandbox-self-restart.sh
 CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh

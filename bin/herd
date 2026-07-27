@@ -3474,12 +3474,26 @@ cmd_config_sync() {
 # map is a SIBLING of capabilities.tsv (keyed by capability NAME) so the manifest stays byte-identical
 # for its other consumers (herd config/upgrade/codemap and the queued HERD-140/141/143).
 #
+# GATE/AUTOFIX SIM RATCHET (HERD-424, audit P3.2 docs/audits/2026-07-09-gating-hardening.md): the audit's
+# own words — "make herd conformance report red on gate-class gaps" — so this is NOT an opt-in flag.
+# Whenever the THIRD sibling templates/capability-class.tsv CLASSIFIES a capability gate|autofix, PLAIN
+# `report` and `run` (no flag) already require it to carry a REAL, EXISTING proof_kind=sim row — a
+# none-yet note or a unit/render-only mapping is a loud, default-visible FAILURE (human text + --json)
+# for that capability, on top of (never instead of) the existing mapped/rot/none-yet/unmapped advisory
+# read every OTHER capability still gets. Classification is EXPLICIT, hand-maintained metadata keyed by
+# capability name (never inferred from description prose — that guessing is exactly what the audit
+# flagged: "today none-yet is allowed silently"). FAIL-SOFT IS PRESERVED two ways: a capability absent
+# from the class file carries no requirement at all, and a WHOLLY ABSENT class file (or proof map) means
+# nothing to enforce — the base command's existing fail-soft doctrine, never a hard error against a
+# project that never opted into classification. See templates/capability-class.tsv for the doctrine.
+#
 # All paths are overridable for hermetic tests: the manifest is _config_caps_file (shared with `herd
-# config`); the proof map is _conformance_map_file; proof_refs resolve relative to _conformance_root
-# (the repo root); `run` output goes to _conformance_out.
-_conformance_map_file() { printf '%s' "${HERD_CONFORMANCE_FILE:-$TEMPLATES_DIR/conformance.tsv}"; }
-_conformance_root()     { printf '%s' "${HERD_CONFORMANCE_ROOT:-$HERDKIT_HOME}"; }
-_conformance_out()      { printf '%s' "${HERD_CONFORMANCE_OUT:-$(_conformance_root)/.herd/conformance.json}"; }
+# config`); the proof map is _conformance_map_file; the class map is _conformance_class_file; proof_refs
+# resolve relative to _conformance_root (the repo root); `run` output goes to _conformance_out.
+_conformance_map_file()   { printf '%s' "${HERD_CONFORMANCE_FILE:-$TEMPLATES_DIR/conformance.tsv}"; }
+_conformance_class_file() { printf '%s' "${HERD_CAPABILITY_CLASS_FILE:-$TEMPLATES_DIR/capability-class.tsv}"; }
+_conformance_root()       { printf '%s' "${HERD_CONFORMANCE_ROOT:-$HERDKIT_HOME}"; }
+_conformance_out()        { printf '%s' "${HERD_CONFORMANCE_OUT:-$(_conformance_root)/.herd/conformance.json}"; }
 
 # _conformance_analyze <caps> <map> <root> — emit ONE analysis row per capability (in manifest order),
 # TAB-separated: "<capability>\t<status>\t<proofs>\t<note>", where status ∈ mapped|rot|none-yet|unmapped,
@@ -3540,23 +3554,76 @@ _conformance_analyze() {
   rm -rf "$tmp"
 }
 
+# _conformance_class_violations <analysis> <classfile> — <analysis> is _conformance_analyze's TAB
+# output (computed once by the caller, never re-derived). Emits one TAB row per GATE/AUTOFIX RATCHET
+# VIOLATION, "<capability>\t<class>\t<reason>", reason ∈ missing|rot, for every capability CLASSIFIED
+# gate|autofix in <classfile> that lacks a REAL, EXISTING proof_kind=sim row: reason=rot when a sim row
+# exists but its ref does not, reason=missing otherwise (unmapped, none-yet, or only non-sim proofs —
+# all read the same: no honest sim proof). A capability absent from <classfile> — or the file itself
+# absent — NEVER appears (classification is explicit metadata, never guessed from description prose).
+# Deterministic: manifest order (the order <analysis> already carries).
+_conformance_class_violations() {
+  local analysis="$1" classfile="$2"
+  [ -f "$classfile" ] || return 0
+  local tmp; tmp="$(mktemp)"; printf '%s\n' "$analysis" > "$tmp"
+  awk -F'\t' '
+    FNR==NR {
+      if ($0 ~ /^#/ || $1=="capability" || $1=="" || NF<2) next
+      cls=$2
+      if (cls!="gate" && cls!="autofix") next
+      if (!($1 in class)) class[$1]=cls
+      next
+    }
+    {
+      cap=$1; enc=$3
+      if (!(cap in class)) next
+      has_sim=0; has_sim_rot=0
+      n=split(enc, toks, ";")
+      for (i=1;i<=n;i++){
+        if (toks[i]=="") continue
+        m=split(toks[i], f, "|")
+        if (m<3) continue
+        if (f[1]=="sim"){ if (f[3]=="1") has_sim=1; else has_sim_rot=1 }
+      }
+      if (has_sim) next
+      print cap "\t" class[cap] "\t" (has_sim_rot ? "rot" : "missing")
+    }
+  ' "$classfile" "$tmp"
+  rm -f "$tmp"
+}
+
 # cmd_conformance_report [--json] — the deterministic coverage report. Human text by default; --json
 # emits a machine-ingestable object. Four statuses: mapped, rot, none-yet (an explicit missing-proof
 # note), and unmapped (NO row at all). The no-new-unmapped RATCHET: after the backfill every existing
 # capability carries a row, so any UNMAPPED capability is one added since mapping began that never got a
-# proof row or a none-yet note — surfaced as a LOUD ADVISORY (never a gate). Exits NON-ZERO only when ROT
+# proof row or a none-yet note — surfaced as a LOUD ADVISORY (never a gate). Exits NON-ZERO when ROT
 # is present (a proof_ref no longer exists — a real, actionable breakage); none-yet AND unmapped alone
 # never fail (advisory only). An absent proof map is a soft note (all unmapped), exit 0.
+# GATE/AUTOFIX RATCHET (HERD-424, no flag — see the header comment above _conformance_map_file): every
+# capability CLASSIFIED gate|autofix in templates/capability-class.tsv must ALSO carry a real, existing
+# proof_kind=sim row, or it is a loud violation (its own JSON/human section) that ALSO drives the
+# non-zero exit — on top of, never instead of, the mapped/rot/none-yet/unmapped read above. A wholly
+# absent class file (nothing classified) or proof map (nothing to check against) is fail-soft: zero
+# violations, no behavior change from before this ratchet existed.
 cmd_conformance_report() {
   local as_json=0 a
   for a in "$@"; do case "$a" in --json) as_json=1 ;; -h|--help) say "usage: herd conformance report [--json]"; return 0 ;; *) die "unknown 'herd conformance report' flag: $a" ;; esac; done
-  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  local caps map root classfile; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"; classfile="$(_conformance_class_file)"
   [ -f "$caps" ] || die "no capabilities manifest at $caps"
   local analysis; analysis="$(_conformance_analyze "$caps" "$map" "$root")"
   local map_present=1; [ -f "$map" ] || map_present=0
+  local class_present=1; [ -f "$classfile" ] || class_present=0
+
+  # Fail-soft: an absent proof map has nothing to check classified capabilities against, so violations
+  # stay empty rather than flagging every classified capability as a false red.
+  local violations=""
+  if [ "$map_present" -eq 1 ]; then
+    violations="$(_conformance_class_violations "$analysis" "$classfile")"
+  fi
 
   if [ "$as_json" -eq 1 ]; then
     ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    CLASS_PRESENT="$class_present" VIOLATIONS="$violations" \
     python3 -c '
 import os, json, sys
 caps = []
@@ -3587,6 +3654,13 @@ for line in os.environ.get("ANALYSIS", "").splitlines():
     key = "none_yet" if status == "none-yet" else status
     counts[key] = counts.get(key, 0) + 1
     caps.append({"capability": cap, "status": status, "note": note, "proofs": proofs})
+violations = []
+for line in os.environ.get("VIOLATIONS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    vcap = parts[0]; vcls = parts[1] if len(parts) > 1 else ""; vreason = parts[2] if len(parts) > 2 else ""
+    violations.append({"capability": vcap, "class": vcls, "reason": vreason})
 out = {
     "source": os.environ.get("CAPS_BASE", ""),
     "map": os.environ.get("MAP_BASE", ""),
@@ -3597,12 +3671,19 @@ out = {
     "none_yet": none_yet,
     "unmapped": unmapped,
     "rot": rot,
+    "ratchet": {
+        "class_present": os.environ.get("CLASS_PRESENT", "0") == "1",
+        "map_present": os.environ.get("MAP_PRESENT", "1") == "1",
+        "count": len(violations),
+        "violations": violations,
+    },
 }
 json.dump(out, sys.stdout, indent=2)
 print()
 '
   else
     ANALYSIS="$analysis" CAPS_BASE="$(basename "$caps")" MAP_BASE="$(basename "$map")" MAP_PRESENT="$map_present" \
+    CLASS_PRESENT="$class_present" VIOLATIONS="$violations" \
     python3 -c '
 import os
 mapped = noneyetl = unmappedl = rotl = dangling = 0
@@ -3645,19 +3726,43 @@ if none_yets:
     print("  NONE-YET (no proof mapped — explicit missing-proof note):")
     for cap, note in none_yets:
         print("    - %s%s" % (cap, ("  —  " + note) if note else ""))
+if os.environ.get("CLASS_PRESENT", "0") == "1":
+    print("")
+    if os.environ.get("MAP_PRESENT", "1") != "1":
+        print("  GATE/AUTOFIX RATCHET: skipped — no proof map found (fail-soft; nothing to enforce)")
+    else:
+        vlines = [l for l in os.environ.get("VIOLATIONS", "").splitlines() if l]
+        if vlines:
+            print("  🔴 GATE/AUTOFIX RATCHET — %d classified capabilit%s missing required sim proof:"
+                  % (len(vlines), "y" if len(vlines) == 1 else "ies"))
+            for line in vlines:
+                parts = line.split("\t")
+                vcap = parts[0]; vcls = parts[1] if len(parts) > 1 else ""; vreason = parts[2] if len(parts) > 2 else ""
+                why = "sim proof_ref no longer exists (rot)" if vreason == "rot" else "no real, existing proof_kind=sim mapping"
+                print("    - %s [%s]  →  %s" % (vcap, vcls, why))
+        else:
+            print("  GATE/AUTOFIX RATCHET: clean — every classified capability has a real sim proof")
 '
   fi
 
-  # Exit status: rot present → non-zero (actionable dangling ref); gaps alone → 0 (report-only).
-  printf '%s\n' "$analysis" | awk -F'\t' '$2=="rot"{r=1} $3 ~ /\|0(;|$)/ {r=1} END{exit(r?1:0)}'
+  # Exit status: rot present, or a classified gate/autofix capability without real sim proof → non-zero.
+  local rc=0
+  printf '%s\n' "$analysis" | awk -F'\t' '$2=="rot"{r=1} $3 ~ /\|0(;|$)/ {r=1} END{exit(r?1:0)}' || rc=1
+  [ -n "$violations" ] && rc=1
+  return "$rc"
 }
 
 # cmd_conformance_run [--kind KIND] [--out FILE] — execute the mapped proofs and write conformance.json
 # (capability → verdict → sha → timestamp). Each mapping is run in the repo root: proof_kind=unit →
 # `bash <ref>` (0=pass, else fail); a missing ref → verdict "missing"; a none-yet note or any non-unit
 # kind (or a unit mapping filtered out by --kind) → "skipped" (no runner, never "missing"). Deterministic
-# file except the recorded sha +
-# timestamp. Exits non-zero when any proof FAILS. REPORT-ONLY — not wired into any merge gate.
+# file except the recorded sha + timestamp. Exits non-zero when any proof FAILS.
+# GATE/AUTOFIX RATCHET (HERD-424, no flag): also requires every gate|autofix-classified capability
+# (templates/capability-class.tsv) to carry a real, existing proof_kind=sim row (existence, same check
+# as the report — this command never EXECUTES a sim, only unit proofs run); a violation is written into
+# the "ratchet" key of the output file and ALSO drives a non-zero exit, on top of an actual proof FAIL.
+# Fail-soft: a wholly absent class file or proof map means nothing to enforce (zero violations).
+# REPORT-ONLY — not wired into any merge gate.
 cmd_conformance_run() {
   local kind="" out="" a
   while [ "$#" -gt 0 ]; do
@@ -3670,10 +3775,12 @@ cmd_conformance_run() {
       *) die "unknown 'herd conformance run' arg: $1" ;;
     esac
   done
-  local caps map root; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"
+  local caps map root classfile; caps="$(_config_caps_file)"; map="$(_conformance_map_file)"; root="$(_conformance_root)"; classfile="$(_conformance_class_file)"
   [ -f "$caps" ] || die "no capabilities manifest at $caps"
   [ -n "$out" ] || out="$(_conformance_out)"
-  if [ ! -f "$map" ]; then warn "no proof map at $map — nothing to run (fail-soft)"; fi
+  local map_present=1
+  if [ ! -f "$map" ]; then warn "no proof map at $map — nothing to run (fail-soft)"; map_present=0; fi
+  local class_present=1; [ -f "$classfile" ] || class_present=0
 
   local sha ts; sha="$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
@@ -3699,8 +3806,16 @@ cmd_conformance_run() {
       done
   )"
 
+  # Same existence-based violation check the report uses, fail-soft on an absent proof map.
+  local violations=""
+  if [ "$map_present" -eq 1 ]; then
+    local analysis; analysis="$(_conformance_analyze "$caps" "$map" "$root")"
+    violations="$(_conformance_class_violations "$analysis" "$classfile")"
+  fi
+
   mkdir -p "$(dirname "$out")"
-  RESULTS="$results" SHA="$sha" TS="$ts" KIND="${kind:-}" OUT="$out" python3 -c '
+  RESULTS="$results" SHA="$sha" TS="$ts" KIND="${kind:-}" OUT="$out" \
+  CLASS_PRESENT="$class_present" MAP_PRESENT="$map_present" VIOLATIONS="$violations" python3 -c '
 import os, json, sys
 results = []
 summary = {"pass": 0, "fail": 0, "skipped": 0, "missing": 0}
@@ -3710,19 +3825,35 @@ for line in os.environ.get("RESULTS", "").splitlines():
     cap, k, r, v = (line.split("\t", 3) + ["", "", "", ""])[:4]
     results.append({"capability": cap, "kind": k, "ref": r, "verdict": v})
     summary[v] = summary.get(v, 0) + 1
+violations = []
+for line in os.environ.get("VIOLATIONS", "").splitlines():
+    if not line:
+        continue
+    parts = line.split("\t")
+    vcap = parts[0]; vcls = parts[1] if len(parts) > 1 else ""; vreason = parts[2] if len(parts) > 2 else ""
+    violations.append({"capability": vcap, "class": vcls, "reason": vreason})
 out = {
     "sha": os.environ.get("SHA", "unknown"),
     "timestamp": os.environ.get("TS", "unknown"),
     "kind_filter": os.environ.get("KIND", "") or None,
     "summary": summary,
     "results": results,
+    "ratchet": {
+        "class_present": os.environ.get("CLASS_PRESENT", "0") == "1",
+        "map_present": os.environ.get("MAP_PRESENT", "1") == "1",
+        "count": len(violations),
+        "violations": violations,
+    },
 }
 with open(os.environ["OUT"], "w") as f:
     json.dump(out, f, indent=2)
     f.write("\n")
 print("wrote %s — %d pass · %d fail · %d skipped · %d missing"
       % (os.environ["OUT"], summary["pass"], summary["fail"], summary["skipped"], summary["missing"]))
-sys.exit(1 if summary["fail"] else 0)
+if violations:
+    print("wrote %s — GATE/AUTOFIX RATCHET: %d classified capability(ies) missing required sim proof"
+          % (os.environ["OUT"], len(violations)))
+sys.exit(1 if (summary["fail"] or violations) else 0)
 '
 }
 
@@ -7174,7 +7305,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       no longer exists (rot); non-zero only on rot
                                         run [--kind unit]  execute the mapped proofs, write
                                                       conformance.json (capability→verdict→sha→timestamp)
-                                      Fail-soft (absent map = soft note) + report-only (no merge gate)
+                                        GATE/AUTOFIX RATCHET (no flag)  every capability explicitly
+                                                      classified gate|autofix in
+                                                      templates/capability-class.tsv must ALSO carry a
+                                                      real, existing proof_kind=sim row; non-zero + a
+                                                      loud section (report + run) on any missing/rotted
+                                                      required sim proof
+                                      Fail-soft (absent map/class file = soft note) + report-only
   herd governance <export|apply>      export/apply a project's governance as a portable, versioned
                                         export [--file <path>]  write the governance-scoped config key
                                                       subset (secrets/machine keys never travel) to a

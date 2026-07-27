@@ -104,6 +104,7 @@ Role summarized from each file's top-of-file comment.
 
 - `archetypes.tsv` — templates/archetypes.tsv — the CANONICAL PROJECT ARCHETYPES (HERD-409): the committed,
 - `capabilities.tsv` — (tab-separated manifest — no header comment)
+- `capability-class.tsv` — (tab-separated manifest — no header comment)
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
 - `conformance.tsv` — (tab-separated manifest — no header comment)
 - `connector-fetch.sh` — connector-fetch.sh (TEMPLATE) — the FETCH edge of the herdkit connector seams (HERD-170).
