@@ -580,6 +580,18 @@ WATCHER_AUTOMERGE="true"
 # WATCHER_SCOPE="mine"
 # WATCHER_OWNER=""
 
+# cross-seat resolver-dispatch CLAIM (HERD-423, resolver-claim.sh) — closes the gap where two team
+# seats (WATCHER_SCOPE=all above) with separate local worktrees but one shared GitHub remote could
+# each independently dispatch a conflict resolver onto the SAME (PR, head sha), racing pushes.
+# Ship-dormant: default off, and only armed when ALSO WATCHER_SCOPE=all — a solo install leaves both
+# unset and gets byte-identical (zero extra gh calls) behavior.
+#   RESOLVE_CLAIM:     off (default) | on — arms a repo-visible v1 claim (a single HTML-hidden PR
+#     comment, upserted in place) so at most one seat resolves a given conflicting (pr, exact head sha).
+#   RESOLVE_CLAIM_TTL: seconds a foreign "claimed" row stays binding before a bounded steal is allowed
+#     (default 2700 = 45 min). Non-numeric falls back to the default.
+# RESOLVE_CLAIM="off"
+# RESOLVE_CLAIM_TTL="2700"
+
 # tracker-routed spawn enforcement (HERD-64) — make "every builder is traceable to a tracked work
 # item" a PROJECT POLICY, not just a coordinator convention. DEFAULT off: the spawn surfaces
 # (herd-quick.sh / herd-feature.sh / spawn.sh) impose no gate, byte-identical to today.

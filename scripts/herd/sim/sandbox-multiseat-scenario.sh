@@ -226,6 +226,52 @@ for a in "$@"; do
   prev="$a"
 done
 case "$url" in
+  */issues/comments/*)
+    # HERD-423: an API-DOWN leg flips this so the claim SURFACE fails while everything else (merge,
+    # statuses, pr view/list, etc.) keeps working — proves the claim's fail-soft path end-to-end
+    # through the REAL gh call, not just the unit test's direct function call.
+    [ -n "${SANDBOX_GH_ISSUES_API_DOWN:-}" ] && exit 1
+    # PATCH — edit an existing resolve-claim marker comment in place, by id.
+    id="${url##*/}"
+    body=""; prev=""
+    for a in "$@"; do
+      if [ "$prev" = "-f" ]; then case "$a" in body=*) body="${a#body=}" ;; esac; fi
+      prev="$a"
+    done
+    ICJ="$S/issue-comments.json"; [ -f "$ICJ" ] || printf '[]' > "$ICJ"
+    jq --arg id "$id" --arg body "$body" \
+      'map(if (.id|tostring)==$id then .body=$body else . end)' "$ICJ" > "$ICJ.tmp" && mv "$ICJ.tmp" "$ICJ"
+    exit 0
+    ;;
+  */issues/*/comments)
+    # HERD-423: the resolve-claim substrate — a plain issue-comments GET (raw aggregated array) or
+    # POST (-f body= create). Distinct store from comments.log above (that one is a lossy
+    # fingerprint log for the legacy `pr comment`/`pr view` paths; this one is the full-fidelity
+    # JSON the claim protocol's find-by-marker / upsert-in-place logic actually needs).
+    [ -n "${SANDBOX_GH_ISSUES_API_DOWN:-}" ] && exit 1
+    ICJ="$S/issue-comments.json"; [ -f "$ICJ" ] || printf '[]' > "$ICJ"
+    jqexpr=""; body=""; has_body=0; prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--jq" ]; then jqexpr="$a"; fi
+      if [ "$prev" = "-f" ]; then case "$a" in body=*) body="${a#body=}"; has_body=1 ;; esac; fi
+      prev="$a"
+    done
+    if [ "$has_body" -eq 1 ]; then
+      jq --arg body "$body" '. + [{"id": (([.[].id, 0] | max) + 1), "body": $body}]' "$ICJ" > "$ICJ.tmp" && mv "$ICJ.tmp" "$ICJ"
+    else
+      # REVIEW FIX (HERD-423): resolver-claim.sh's read no longer passes --jq alongside
+      # --paginate — real gh applies --jq PER PAGE, not on the aggregated array, which silently
+      # corrupted `last` across a multi-page comment thread. It fetches the raw array and filters
+      # with its OWN `jq` call instead, so this stub hands back the full aggregated array here
+      # (still honoring --jq if a caller ever passes one, for back-compat).
+      if [ -n "$jqexpr" ]; then
+        jq -r "$jqexpr" "$ICJ"
+      else
+        cat "$ICJ"
+      fi
+    fi
+    exit 0
+    ;;
   */statuses/*)
     # POST a commit status. Parse -f state= -f context= from argv; sha from the path.
     sha="${url##*/statuses/}"
@@ -475,6 +521,9 @@ export DEFAULT_BRANCH="main"
 export MERGE_POLICY="${MERGE_POLICY:-auto}"
 export WATCHER_SCOPE=all
 export WATCHER_OWNER="$SEAT"
+# HERD-423: off by default (byte-identical baseline for every OTHER leg in this scenario) — the
+# conflict-drive leg below flips this to "on" for its own cross-seat sub-leg only, then restores off.
+export RESOLVE_CLAIM="${RESOLVE_CLAIM:-off}"
 export GATE_STATUS=on
 export MERGE_FAIRNESS="${MERGE_FAIRNESS:-on}"
 export REVIEW_CONCURRENCY="${REVIEW_CONCURRENCY:-4}"
@@ -853,7 +902,74 @@ else
   RESOLVER_DOUBLE_DISPATCH=$(( OWNER_DISPATCHES > 1 ? OWNER_DISPATCHES - 1 : 1 ))
   checkpoint resolver_double_dispatch fail "owner conflict dispatches=$OWNER_DISPATCHES (expected 1 — in-flight hold failed)"
 fi
-info "cross_seat_resolver_probe=$CROSS_SEAT_RESOLVER_PROBE (seat-b dispatches on its own ledger; G5 observation)"
+info "cross_seat_resolver_probe (RESOLVE_CLAIM=off baseline)=$CROSS_SEAT_RESOLVER_PROBE (seat-b dispatches on its own ledger; the G5 gap — expected >0 here, unchanged/byte-identical while the lever stays off)"
+
+# (3b) HERD-423: cross-seat resolver claim — the REAL fail gate. Same setup as above (fresh ledgers,
+# no-verdict stub so a dispatched-but-unresolved sha never HOLDs on liveness alone), but now with
+# RESOLVE_CLAIM=on: seat-a's dispatch publishes the shared v1 claim comment BEFORE its local record,
+# so seat-b's independent, EMPTY local ledger must see that foreign claim and HOLD instead of also
+# dispatching — turning the G5 observation above into an asserted invariant. RESOLVE_CLAIM reverts to
+# off immediately after so every later leg in this scenario stays on the byte-identical baseline.
+step conflict-drive-xseat "RESOLVE_CLAIM=on: seat-b must HOLD behind seat-a's shared claim (real fail-gate)"
+rm -f "$SEAT_A/trees"/.agent-watch-resolve-attempts \
+      "$SEAT_B/trees"/.agent-watch-resolve-attempts \
+      "$SEAT_A/trees"/.resolve-result-* \
+      "$SEAT_B/trees"/.resolve-result-* 2>/dev/null || true
+rm -f "$SHARED/issue-comments.json" 2>/dev/null || true
+: > "$SHARED/resolver-dispatches.log"
+export HERD_RESOLVE_BIN="$NOVERDICT_RESOLVE"
+export RESOLVE_CLAIM=on
+
+HERD_SIM_SEAT=seat-a bash "$SEAT_RUNNER" conflict-tick 2>>"$ART/seat-a.log" || true
+XSEAT_OWNER_DISPATCHES="$(wc -l < "$SHARED/resolver-dispatches.log" 2>/dev/null | tr -d ' ')"
+XSEAT_OWNER_DISPATCHES="${XSEAT_OWNER_DISPATCHES:-0}"
+
+HERD_SIM_SEAT=seat-b bash "$SEAT_RUNNER" conflict-tick 2>>"$ART/seat-b.log" || true
+XSEAT_TOTAL_DISPATCHES="$(wc -l < "$SHARED/resolver-dispatches.log" 2>/dev/null | tr -d ' ')"
+XSEAT_TOTAL_DISPATCHES="${XSEAT_TOTAL_DISPATCHES:-0}"
+CROSS_SEAT_RESOLVER_PROBE=$(( XSEAT_TOTAL_DISPATCHES > XSEAT_OWNER_DISPATCHES ? XSEAT_TOTAL_DISPATCHES - XSEAT_OWNER_DISPATCHES : 0 ))
+
+# Restore the byte-identical-when-off baseline for every later leg.
+export RESOLVE_CLAIM=off
+export HERD_RESOLVE_BIN="$STUB_RESOLVE"
+
+if [ "$XSEAT_OWNER_DISPATCHES" -eq 1 ] && [ "$CROSS_SEAT_RESOLVER_PROBE" -eq 0 ]; then
+  checkpoint cross_seat_resolver_probe pass "seat-a dispatched once, seat-b held behind the shared claim (cross_seat_resolver_probe=0)"
+else
+  checkpoint cross_seat_resolver_probe fail "seat-a dispatches=$XSEAT_OWNER_DISPATCHES seat-b extra dispatches=$CROSS_SEAT_RESOLVER_PROBE (expected 1 and 0 — cross-seat claim did not hold)"
+fi
+
+# (3c) HERD-423: API-DOWN leg — RESOLVE_CLAIM=on but the claim's OWN gh surface (issues/comments) is
+# unavailable (SANDBOX_GH_ISSUES_API_DOWN=1: both the read and the create/edit case in the stub `gh`
+# exit 1, unconditionally — merge/statuses/pr-view etc. keep working normally). The fail-soft doctrine
+# says an outage on the claim surface must never block local progress: seat-a must still dispatch its
+# resolver via the ordinary same-seat path, exactly as if RESOLVE_CLAIM were off. Scored as a real
+# checkpoint (api_down_local_progress), not just the unit test's direct function-level outage assertion.
+step conflict-drive-api-down "RESOLVE_CLAIM=on + claim API down: seat-a must still dispatch locally (fail-soft)"
+rm -f "$SEAT_A/trees"/.agent-watch-resolve-attempts \
+      "$SEAT_A/trees"/.resolve-result-* 2>/dev/null || true
+rm -f "$SHARED/issue-comments.json" 2>/dev/null || true
+: > "$SHARED/resolver-dispatches.log"
+export HERD_RESOLVE_BIN="$NOVERDICT_RESOLVE"
+export RESOLVE_CLAIM=on
+export SANDBOX_GH_ISSUES_API_DOWN=1
+
+HERD_SIM_SEAT=seat-a bash "$SEAT_RUNNER" conflict-tick 2>>"$ART/seat-a.log" || true
+APIDOWN_DISPATCHES="$(wc -l < "$SHARED/resolver-dispatches.log" 2>/dev/null | tr -d ' ')"
+APIDOWN_DISPATCHES="${APIDOWN_DISPATCHES:-0}"
+APIDOWN_CLAIM_ROWS="$(jq 'length' "$SHARED/issue-comments.json" 2>/dev/null || echo 0)"
+APIDOWN_CLAIM_ROWS="${APIDOWN_CLAIM_ROWS:-0}"
+
+# Restore the byte-identical-when-off baseline for every later leg.
+unset SANDBOX_GH_ISSUES_API_DOWN
+export RESOLVE_CLAIM=off
+export HERD_RESOLVE_BIN="$STUB_RESOLVE"
+
+if [ "$APIDOWN_DISPATCHES" -eq 1 ] && [ "$APIDOWN_CLAIM_ROWS" -eq 0 ]; then
+  checkpoint api_down_local_progress pass "claim API down: seat-a still dispatched locally (1 dispatch, no claim row written — fail-soft, not fabricated)"
+else
+  checkpoint api_down_local_progress fail "claim API down: expected 1 local dispatch + 0 claim rows, got dispatches=$APIDOWN_DISPATCHES claim_rows=$APIDOWN_CLAIM_ROWS"
+fi
 
 # (4) max_restale_cycles bounded under MERGE_FAIRNESS=on
 step fairness "drive MERGE_FAIRNESS=on restale-pressure leg (HERD-231) on seat-a"
@@ -913,6 +1029,7 @@ write_scorecard() {
     printf '  "resolver_double_dispatch": %d,\n' "${RESOLVER_DOUBLE_DISPATCH:-0}"
     printf '  "resolver_owner_dispatches": %d,\n' "${OWNER_DISPATCHES:-0}"
     printf '  "cross_seat_resolver_probe": %d,\n' "${CROSS_SEAT_RESOLVER_PROBE:-0}"
+    printf '  "api_down_local_dispatches": %d,\n' "${APIDOWN_DISPATCHES:-0}"
     printf '  "max_restale_cycles": %d,\n' "${MAX_RESTALE:-0}"
     printf '  "restale_threshold": %d,\n' "${RESTALE_THRESH:-3}"
     printf '  "blessings_posted": %d,\n' "${BLESS_COUNT:-0}"
@@ -941,6 +1058,7 @@ printf '  prs / merges:              %d / %d\n' "$NPRS" "$_merged_ct"
 printf '  duplicate_gate_runs:       %s\n' "${DUP_GATE_RUNS:-0}"
 printf '  duplicate_hold_comments:   %s\n' "${DUP_HOLD_COMMENTS:-0}"
 printf '  resolver_double_dispatch:  %s\n' "${RESOLVER_DOUBLE_DISPATCH:-0}"
+printf '  cross_seat_resolver_probe: %s (RESOLVE_CLAIM=on leg)\n' "${CROSS_SEAT_RESOLVER_PROBE:-0}"
 printf '  max_restale_cycles:        %s (threshold %s)\n' "${MAX_RESTALE:-0}" "${RESTALE_THRESH:-3}"
 printf '  queue_drained:             %s\n' "$([ "${_merged_ct:-0}" -eq "$NPRS" ] && echo true || echo false)"
 printf '  scorecard:                 %s\n' "$SCARD"

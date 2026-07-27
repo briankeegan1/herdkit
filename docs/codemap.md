@@ -76,6 +76,7 @@ Role summarized from each file's top-of-file comment.
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
 - `research.sh` — research.sh "<question>" — ENQUEUE a READ-ONLY repo research question and make sure exactly
+- `resolver-claim.sh` — HERD-423: cross-seat resolver-dispatch claim (Phase 1 of
 - `resolver-pane.sh` — THE shared resolver for the RESOLVER_PANE lever (HERD-286).
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
 - `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
@@ -128,7 +129,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -147,7 +148,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
-- `herd-config.sh` → `context-guard.sh`
+- `herd-config.sh` → `context-guard.sh`, `resolver-claim.sh`
 - `herd-feature.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-preflight.sh` → `engine-version.sh`
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
@@ -293,6 +294,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
 - `RESOLVER_PANE` → `resolver-pane.sh`
+- `RESOLVE_CLAIM` → `resolver-claim.sh`
+- `RESOLVE_CLAIM_TTL` → `resolver-claim.sh`
 - `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`
@@ -325,12 +328,12 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `TRACKED_SPAWNS` → `bin/herd`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
-- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`
-- `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`
+- `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
-- `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`
+- `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `resolver-claim.sh`
 - `WATCHER_VIEW_DEPS_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`

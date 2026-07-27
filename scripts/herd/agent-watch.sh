@@ -587,6 +587,8 @@ herd_theme_load_console
 . "$HERE/merge-policy.sh"
 # shellcheck source=/dev/null
 . "$HERE/resolver-pane.sh"
+# shellcheck source=/dev/null
+. "$HERE/resolver-claim.sh"
 _pol="$(_effective_merge_policy)"
 AUTOMERGE=""; MERGE_OBSERVE=""
 case "$_pol" in
@@ -4858,7 +4860,24 @@ _reap_idle_resolver_for_redispatch() {
 # dies mid-spawn) — both stay foreground, in order, above the fork. A same-slug re-dispatch on the
 # NEXT tick is prevented exactly as before: the ledger row is already written, so _resolver_in_flight
 # reads STARTING for the whole _RESOLVER_DEAD_GRACE window that this very race motivated.
+# spawn_resolver <slug> <pr#> <branch> <sha> — public entry point every caller uses. HERD-423: before
+# any of the local, same-seat work below, consult the cross-seat claim (resolver-claim.sh). A live
+# FOREIGN claim on this exact (pr,sha) holds here — same non-zero refusal contract as the
+# self-restart-quiesce guard below, so callers' `_resolver_in_flight … || spawn_resolver …` idiom is
+# unchanged. Off (WATCHER_SCOPE=mine, or RESOLVE_CLAIM off) ⇒ _resolve_claim_should_hold/
+# _resolve_claim_publish_claimed are no-ops with zero gh calls — byte-identical to pre-HERD-423.
 spawn_resolver() {
+  rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
+  if _resolve_claim_should_hold "$rp" "$rsha" "$rs"; then
+    journal_append resolve_claim_held pr "$rp" sha "${rsha:--}" slug "$rs"
+    return 1
+  fi
+  _spawn_resolver_local "$rs" "$rp" "$rb" "$rsha"
+}
+
+# _spawn_resolver_local <slug> <pr#> <branch> <sha> — the original same-seat dispatch body (unchanged
+# since before HERD-423): record-first keeps the respawn budget sound; the spawn is best-effort.
+_spawn_resolver_local() {
   rs="$1"; rp="$2"; rb="$3"; rsha="${4:-}"
   # SELF-RESTART QUIESCE (HERD-251): defence in depth. Both callers hold ABOVE their own ledger writes
   # (the resolve pass at its row, _handle_stale_dup above record_refix), so this is unreachable
@@ -4867,6 +4886,7 @@ spawn_resolver() {
   # push` over nothing. Refused before record_resolve_attempt, so no respawn round is burned either.
   # Byte-inert with the lever off.
   _self_restart_hold_dispatch && return 1
+  _resolve_claim_publish_claimed "$rp" "$rsha" "$rs"
   record_resolve_attempt "$rp" "$rs" "$rb" "$rsha"
   # pr + sha keep the marker legible; the monotonic sequence makes it UNIQUE. An epoch alone would
   # alias two dispatches of the same pr+sha inside one second — unreachable today (the
@@ -5094,6 +5114,10 @@ _classify_conflict() {
       ESCALATE)
         # Promote the resolver's ESCALATE verdict to a terminal marker for this sha.
         record_resolve_escalated "$cpr" "$cslug" "$cbranch" "$csha"
+        # HERD-423: best-effort terminal update to the shared claim so a foreign seat sees ESCALATE
+        # instead of an aging "claimed" row and never re-dispatches its own resolver for this sha.
+        # No-op (no gh call) unless the cross-seat claim lever is on.
+        _resolve_claim_publish_terminal "$cpr" "$csha" "$cslug" escalated
         DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver escalated (ambiguous conflict)${C_RESET}"
         return ;;
       DONE)
@@ -5103,6 +5127,8 @@ _classify_conflict() {
         # more, so its pane retires here too. (The per-tick reconcile retires the far commoner DONE:
         # the one that CLEARED the conflict and so never reaches this classifier again.)
         _retire_resolver_pane "$cpr" "$csha" result-consumed
+        # HERD-423: same best-effort shared-claim terminal update as the ESCALATE branch above.
+        _resolve_claim_publish_terminal "$cpr" "$csha" "$cslug" done
         DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver failed${C_RESET}"
         return ;;
     esac
@@ -8602,6 +8628,15 @@ _handle_ci_repair() {
       DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
       return 0
     fi
+    # HERD-423 (review fix): peek the cross-seat claim BEFORE record_refix — a foreign seat already
+    # resolving this exact (pr,sha) must defer here too, without burning a ci-repair round. Without
+    # this, a HOLD inside spawn_resolver (which runs after record_refix) still cost this rail's
+    # budget even though no resolver was actually dispatched this round. Byte-inert when the lever
+    # is off (WATCHER_SCOPE=mine or RESOLVE_CLAIM off) — zero extra gh calls.
+    if _resolve_claim_should_hold "$_hcr_pr" "$_hcr_sha" "$_hcr_slug"; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · held — another seat is resolving${C_RESET}"
+      return 0
+    fi
     record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
     DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair · resolver (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     render
@@ -8872,6 +8907,12 @@ _handle_stale_dup() {
     # A working builder must never reach spawn_resolver — defer without burning the once-guard.
     if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
+      return 0
+    fi
+    # HERD-423 (review fix): peek the cross-seat claim BEFORE record_refix — see the matching note
+    # in _handle_ci_repair. Byte-inert when the lever is off.
+    if _resolve_claim_should_hold "$_hsd_pr" "$_hsd_sha" "$_hsd_slug"; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · held — another seat is resolving${C_RESET}"
       return 0
     fi
     # Record-first once-guard so a later tick never double-dispatches.
