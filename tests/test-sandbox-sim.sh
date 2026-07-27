@@ -87,6 +87,7 @@ EXPECTED = (
   "cross_seat_block_held", "cross_seat_block_no_bless", "cross_seat_block_resolved",
   "review_panel_mixed_dispatch", "review_panel_vendor_block", "review_panel_missing_binary_infra",
   "review_panel_policy_differs", "review_panel_provenance", "review_panel_dormant",
+  "engine_review_model",
   "push_gate_held_no_push", "push_gate_listed", "push_gate_resumed", "push_gate_stale_refused",
   "pipeline_steps_held", "pipeline_steps_listed", "pipeline_steps_released", "pipeline_steps_order",
   "pipeline_steps_block", "pipeline_steps_off", "pipeline_steps_merge_resume", "pipeline_steps_two_approve",

@@ -1,0 +1,49 @@
+capability	class	note
+# templates/capability-class.tsv — explicit GATE/AUTOFIX classification (HERD-424, audit P3.2
+# docs/audits/2026-07-09-gating-hardening.md). A THIRD sibling manifest, keyed by capability NAME
+# exactly as templates/capabilities.tsv column 1 (the SAME join key templates/conformance.tsv uses),
+# so templates/capabilities.tsv stays byte-identical for its other consumers. PLAIN `herd conformance
+# report` / `run` (bin/herd — no flag; the audit's own words were "make herd conformance report red on
+# gate-class gaps") read this file to decide which capabilities MUST carry a real, EXISTING
+# proof_kind=sim mapping in templates/conformance.tsv — NEVER an inference from capabilities.tsv's
+# description prose (that was the audit's complaint: "today none-yet is allowed silently"). A capability
+# absent from this file — the vast majority — carries NO requirement; the ratchet is a no-op for it and
+# it keeps today's advisory mapped/rot/none-yet/unmapped behavior exactly as before this file existed.
+#
+# Columns:
+#   capability   MUST match column 1 of templates/capabilities.tsv EXACTLY.
+#   class        gate | autofix.
+#                  gate    = decides WHETHER or WHEN a candidate proceeds toward merge: a pre-merge
+#                            hold, a dispatch-order decision, a circuit breaker gating dispatch, the
+#                            review gate itself, or fairness/queue ordering of a gates-passed PR.
+#                  autofix = an AUTOMATIC repair action the watcher takes mid-pipeline on the
+#                            candidate's behalf (a re-task bounce, a base-refresh heal).
+#   note         free text — why this capability earned a class. Not read by any code path; the class
+#                column alone drives the ratchet, so a note can never silently reclassify a capability.
+#
+# THE TEST: AGENTS.md's own "Sim-first for load-bearing changes" doctrine — "Any change to gate /
+# merge / concurrency / limit / pane behavior must be proven with a simulation, not only unit asserts."
+# A row here sits inside that doctrine's MERGE-DECISION or AUTO-REPAIR slice specifically (not every
+# concurrency/pane capability the doctrine also covers — e.g. RESOLVER_PANE/HEALTH_PANE already carry
+# real sim proof of their own but stay unclassified here: they are pane INFRA, not a merge decision or
+# a repair action, so this ratchet does not require them to justify their sim on pain of a red report).
+#
+# INCREMENTAL BY DESIGN: this is the FIRST classified cohort (HERD-424), not an exhaustive one-shot
+# re-audit of every capabilities.tsv row. Add a row whenever a NEW gate/autofix capability ships — that
+# IS the ratchet: plain `herd conformance report` fails loudly the moment a classified capability has no
+# honest sim proof, so a new gate/autofix ships with sim proof BY CONSTRUCTION instead of being
+# discovered missing later. FAIL-SOFT is still absolute for a project that never creates this file at
+# all — nothing is enforced against classification that was never opted into.
+push-gate.sh	gate	PUSH_GATE=human hold — governs whether a builder's change proceeds toward a PR at all
+PUSH_GATE	gate	the lever push-gate.sh reads to decide whether to hold
+GATE_STATUS	gate	posts the herd/gates commit-status blessing other tooling reads as the merge signal
+MERGE_RESULT_GATE	gate	post-merge reconcile invariant gating the $STATE row a merged PR is allowed to read
+MERGE_QUEUE	gate	orders WHEN a gates-passed PR is allowed to merge
+MERGE_FAIRNESS	gate	orders WHICH gates-passed PR merges next under contention
+STALE_DUP_DETECT	gate	pre-merge stale/duplicate HOLD — the audit's own P3.2 motivating example
+GATE_DISPATCH	gate	the review-vs-health dispatch ORDER for a (pr,sha) — serial/parallel is a gate-timing decision
+INFRA_BREAKER_MAX	gate	the infra circuit breaker that STOPS new gate dispatch after consecutive infra deaths
+INFRA_BREAKER_COOLDOWN	gate	how long the infra circuit breaker opened by INFRA_BREAKER_MAX stays open
+herd-review.sh	gate	the adversarial pre-merge review dispatcher — THE review gate
+STALE_BASE_AUTOFIX	autofix	auto-heals a STALE-BASE hold with a git-merge re-task bounce
+REVIEW_AUTOFIX	autofix	auto-bounces a BLOCK review verdict to the builder agent
