@@ -41,14 +41,14 @@ cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 echo "gh $*" >> "$GHLOG"
 [ -f "$GH_OUTAGE_FLAG" ] && exit 1
-method="GET"; jqexpr=""; body=""; path=""
+method="GET"; jqexpr=""; body=""; has_body=0; path=""
 shift # drop leading "api"
 while [ $# -gt 0 ]; do
   case "$1" in
     --paginate) shift ;;
     --jq) shift; jqexpr="$1"; shift ;;
     -X) shift; method="$1"; shift ;;
-    -f) shift; case "$1" in body=*) body="${1#body=}" ;; esac; shift ;;
+    -f) shift; case "$1" in body=*) body="${1#body=}"; has_body=1 ;; esac; shift ;;
     *) path="$1"; shift ;;
   esac
 done
@@ -60,12 +60,23 @@ case "$path" in
     exit 0
     ;;
   */comments)
-    if [ -n "$jqexpr" ]; then
-      jq -r "$jqexpr" "$STORE"
-      exit 0
-    else
+    if [ "$has_body" -eq 1 ]; then
+      # CREATE (POST) — a real comment, never gated on --jq (gh only applies --jq to a GET's
+      # response; a write's response body is irrelevant here).
       jq --arg body "$body" \
         '. + [{"id": (([.[].id, 0] | max) + 1), "body": $body}]' "$STORE" > "$STORE.tmp" && mv "$STORE.tmp" "$STORE"
+      exit 0
+    else
+      # GET — REVIEW FIX (HERD-423): resolver-claim.sh no longer passes --jq alongside
+      # --paginate (real gh applies --jq PER PAGE, not on the aggregated array — verified live
+      # against a real multi-page issue). It fetches the raw array and filters with its OWN `jq`
+      # call, so this stub must hand back the full aggregated array here, exactly like real gh's
+      # --paginate-without---jq behavior. Still honor --jq if a caller ever passes one (back-compat).
+      if [ -n "$jqexpr" ]; then
+        jq -r "$jqexpr" "$STORE"
+      else
+        cat "$STORE"
+      fi
       exit 0
     fi
     ;;
@@ -168,6 +179,20 @@ _resolve_claim_load 42 && fail "empty store must return 1 (no claim)"; ok
 put_claim 42 deadbeef bob feat-x 1700000000 claimed
 _resolve_claim_load 42 || fail "valid claim must load (rc 0)"
 [ "$RC_ID" = "1" ] && [ "$RC_SHA" = "deadbeef" ] && [ "$RC_SEAT" = "bob" ] && [ "$RC_STATE" = "claimed" ] || fail "loaded fields mismatch"
+ok
+
+# REVIEW FIX regression guard: `gh api --paginate --jq EXPR` applies EXPR PER PAGE and concatenates
+# the per-page outputs rather than aggregating pages first (verified live against a real >1-page
+# GitHub issue) — a claim comment that isn't on the LAST page fetched could then be missed or
+# corrupted. The fix fetches the raw --paginate array with NO --jq and filters it in a SEPARATE,
+# single `jq` call. Assert the actual read invocation never combines the two on this repo's `gh`.
+_read_line="$(grep -F 'issues/42/comments' "$GHLOG" | grep -v '\-X PATCH' | grep -v -- '-f body=' | tail -1)"
+[ -n "$_read_line" ] || fail "expected a GET .../issues/42/comments call in the gh log: $(cat "$GHLOG")"
+case "$_read_line" in
+  *--paginate*--jq*|*--jq*--paginate*)
+    fail "REGRESSION: --paginate combined with --jq on a comments GET — gh applies --jq per-page, not on the aggregated array: $_read_line" ;;
+esac
+case "$_read_line" in *--paginate*) ;; *) fail "expected --paginate on the comments GET: $_read_line" ;; esac
 ok
 
 # Malformed claim on the wire (bad sha) → treated as no claim, never a crash.

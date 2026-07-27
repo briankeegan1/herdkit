@@ -128,14 +128,26 @@ _resolve_claim_fields_valid() {
 # — callers never distinguish "no claim" from "unreadable claim", both mean "proceed as solo").
 RC_ID=""; RC_PR=""; RC_SHA=""; RC_SEAT=""; RC_SLUG=""; RC_EPOCH=""; RC_STATE=""
 _resolve_claim_load() {
-  local _rcl_pr="$1" _rcl_line _rcl_body _rcl_jq _rcl_k _rcl_v
+  local _rcl_pr="$1" _rcl_json _rcl_line _rcl_body _rcl_jq _rcl_k _rcl_v
   RC_ID=""; RC_PR=""; RC_SHA=""; RC_SEAT=""; RC_SLUG=""; RC_EPOCH=""; RC_STATE=""
+  # REVIEW FIX: `gh api --paginate --jq EXPR` runs EXPR PER PAGE and concatenates the per-page
+  # outputs — it does NOT aggregate the pages into one array first (verified live against a
+  # real >1-page issue: `--paginate --jq '[.[]]|length'` emits one line PER PAGE, e.g. "5 5 5 5 4",
+  # never a single combined count). Any page without our marker comment still emits an empty
+  # `{}`-shaped line, so on a PR whose claim comment isn't on the LAST page fetched, a stray blank
+  # line could land before the real id/body pair and corrupt the split below. Fetching WITHOUT
+  # --jq sidesteps this entirely: gh's --paginate then aggregates same-shaped array pages into ONE
+  # combined JSON array (confirmed live: a 29-comment, 6-page issue read back as a single 29-element
+  # array), so our OWN single `jq` pass below sees every comment across every page at once, and
+  # `last` is unambiguous. Fail-soft the same way as before on a `gh` outage (empty/failed read).
+  _rcl_json="$(_resolve_claim_gh resolve_claim_read api "repos/{owner}/{repo}/issues/$_rcl_pr/comments" --paginate 2>/dev/null || true)"
+  [ -n "$_rcl_json" ] || return 1
   # jq prints "<id>\n<body>" -- id on the first line, body the rest. An id is plain digits (never
   # contains a newline), so a plain bash prefix-strip cleanly separates them without an exotic
   # delimiter byte or a `read` call (`read` always stops at the first newline regardless of IFS,
   # which does not fit a multi-line body).
   _rcl_jq='([.[] | select(.body != null and (.body|startswith("<!-- herd:resolve-claim v1")))] | last // {}) | "\(.id // "")\n\(.body // "")"'
-  _rcl_line="$(_resolve_claim_gh resolve_claim_read api "repos/{owner}/{repo}/issues/$_rcl_pr/comments" --paginate --jq "$_rcl_jq" 2>/dev/null || true)"
+  _rcl_line="$(printf '%s' "$_rcl_json" | jq -r "$_rcl_jq" 2>/dev/null || true)"
   [ -n "$_rcl_line" ] || return 1
   RC_ID="${_rcl_line%%$'\n'*}"
   _rcl_body="${_rcl_line#*$'\n'}"

@@ -8628,6 +8628,15 @@ _handle_ci_repair() {
       DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · builder busy — heal deferred until it finishes${C_RESET}"
       return 0
     fi
+    # HERD-423 (review fix): peek the cross-seat claim BEFORE record_refix — a foreign seat already
+    # resolving this exact (pr,sha) must defer here too, without burning a ci-repair round. Without
+    # this, a HOLD inside spawn_resolver (which runs after record_refix) still cost this rail's
+    # budget even though no resolver was actually dispatched this round. Byte-inert when the lever
+    # is off (WATCHER_SCOPE=mine or RESOLVE_CLAIM off) — zero extra gh calls.
+    if _resolve_claim_should_hold "$_hcr_pr" "$_hcr_sha" "$_hcr_slug"; then
+      DISPLAY[_hcr_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_YELLOW}ci-repair · held — another seat is resolving${C_RESET}"
+      return 0
+    fi
     record_refix "$_hcr_pr" "$_hcr_sha" "$_hcr_slug" ci
     DISPLAY[_hcr_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_CYAN}ci-repair · resolver (round ${_hcr_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
     render
@@ -8898,6 +8907,12 @@ _handle_stale_dup() {
     # A working builder must never reach spawn_resolver — defer without burning the once-guard.
     if [ "$(_agent_status "$_hsd_slug")" = "working" ]; then
       DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · builder busy — heal deferred until it finishes${C_RESET}"
+      return 0
+    fi
+    # HERD-423 (review fix): peek the cross-seat claim BEFORE record_refix — see the matching note
+    # in _handle_ci_repair. Byte-inert when the lever is off.
+    if _resolve_claim_should_hold "$_hsd_pr" "$_hsd_sha" "$_hsd_slug"; then
+      DISPLAY[_hsd_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_YELLOW}stale base · held — another seat is resolving${C_RESET}"
       return 0
     fi
     # Record-first once-guard so a later tick never double-dispatches.

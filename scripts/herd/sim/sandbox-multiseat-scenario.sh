@@ -244,22 +244,31 @@ case "$url" in
     exit 0
     ;;
   */issues/*/comments)
-    # HERD-423: the resolve-claim substrate — a plain issue-comments GET (--jq read) or POST
-    # (-f body= create). Distinct store from comments.log above (that one is a lossy fingerprint
-    # log for the legacy `pr comment`/`pr view` paths; this one is the full-fidelity JSON the claim
-    # protocol's find-by-marker / upsert-in-place logic actually needs).
+    # HERD-423: the resolve-claim substrate — a plain issue-comments GET (raw aggregated array) or
+    # POST (-f body= create). Distinct store from comments.log above (that one is a lossy
+    # fingerprint log for the legacy `pr comment`/`pr view` paths; this one is the full-fidelity
+    # JSON the claim protocol's find-by-marker / upsert-in-place logic actually needs).
     [ -n "${SANDBOX_GH_ISSUES_API_DOWN:-}" ] && exit 1
     ICJ="$S/issue-comments.json"; [ -f "$ICJ" ] || printf '[]' > "$ICJ"
-    jqexpr=""; body=""; prev=""
+    jqexpr=""; body=""; has_body=0; prev=""
     for a in "$@"; do
       if [ "$prev" = "--jq" ]; then jqexpr="$a"; fi
-      if [ "$prev" = "-f" ]; then case "$a" in body=*) body="${a#body=}" ;; esac; fi
+      if [ "$prev" = "-f" ]; then case "$a" in body=*) body="${a#body=}"; has_body=1 ;; esac; fi
       prev="$a"
     done
-    if [ -n "$jqexpr" ]; then
-      jq -r "$jqexpr" "$ICJ"
-    else
+    if [ "$has_body" -eq 1 ]; then
       jq --arg body "$body" '. + [{"id": (([.[].id, 0] | max) + 1), "body": $body}]' "$ICJ" > "$ICJ.tmp" && mv "$ICJ.tmp" "$ICJ"
+    else
+      # REVIEW FIX (HERD-423): resolver-claim.sh's read no longer passes --jq alongside
+      # --paginate — real gh applies --jq PER PAGE, not on the aggregated array, which silently
+      # corrupted `last` across a multi-page comment thread. It fetches the raw array and filters
+      # with its OWN `jq` call instead, so this stub hands back the full aggregated array here
+      # (still honoring --jq if a caller ever passes one, for back-compat).
+      if [ -n "$jqexpr" ]; then
+        jq -r "$jqexpr" "$ICJ"
+      else
+        cat "$ICJ"
+      fi
     fi
     exit 0
     ;;
