@@ -423,3 +423,8 @@ WORK_UNIT_KIND	unit	tests/test-work-unit-conformance.sh
 herd.work_unit.DocApplyAdapter	unit	tests/test_live_runtime.py
 <slug>.unit.json	unit	tests/test_live_runtime.py
 DOC_APPLY_PATH_GLOB	unit	tests/test_live_runtime.py
+resolver-claim.sh	unit	tests/test-resolver-claim.sh
+resolver-claim.sh	sim	tests/test-sandbox-multiseat.sh
+RESOLVE_CLAIM	unit	tests/test-resolver-claim.sh
+RESOLVE_CLAIM	sim	tests/test-sandbox-multiseat.sh
+RESOLVE_CLAIM_TTL	unit	tests/test-resolver-claim.sh

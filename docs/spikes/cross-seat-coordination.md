@@ -389,13 +389,29 @@ plus a ship-dormant `CROSS_SEAT_LEDGER=off|on` if we need finer control).
 - No engine code.
 - Unblocks sequencing for resolver single-flight.
 
-### Phase 1 — Resolver single-flight (follow-up item)
+### Phase 1 — Resolver single-flight (HERD-423) ✅
 
-- Implement §5 behind `WATCHER_SCOPE=all` (no-op in default `mine`).
-- Local `$RESOLVE_STATE` remains source of truth for same-seat budget/rows; shared claim is an
-  **additional** guard, not a rewrite.
-- Tests: unit parse/claim helpers; multi-seat sim scorecard (N10).
-- Conformance row when capability is real.
+- Implemented behind `WATCHER_SCOPE=all` **and** the ship-dormant `RESOLVE_CLAIM` lever (ONE choke
+  point: `spawn_resolver` in `agent-watch.sh`, wrapping the original body — now `_spawn_resolver_local`
+  — so the two live fallback dispatch sites (`_handle_ci_repair`, `_handle_stale_dup`) and any restored
+  conflict-dispatch pass all inherit the guard for free). No-op in the default `mine` scope or with the
+  lever off — zero `gh` calls, byte-identical to pre-HERD-423.
+- Substrate: `scripts/herd/resolver-claim.sh` — a single HTML-hidden `<!-- herd:resolve-claim v1 -->`
+  PR-comment marker, upserted in place via `gh api .../issues/comments` (never a Statuses/Check-Run
+  write). Local `$RESOLVE_STATE` remains source of truth for same-seat budget/rows; the shared claim is
+  an **additional** guard, not a rewrite — `_resolve_claim_should_hold` runs before
+  `record_resolve_attempt`/the spawn, `_resolve_claim_publish_claimed` publishes before the local
+  record, and `_resolve_claim_publish_terminal` best-effort-updates the claim to done/escalated at the
+  `_classify_conflict` result/escalation seam.
+- Bounded TTL steal (`RESOLVE_CLAIM_TTL`, default 45 min) for a dead/stuck foreign claim; a claim for a
+  different sha reads as stale (a new commit re-arms); untrusted/malformed comment fields are rejected
+  field-by-field (never `eval`'d) and read as "no claim"; any `gh` read/write outage fails soft to the
+  local-only path — never a fabricated foreign claim, never a held gate.
+- Tests: `tests/test-resolver-claim.sh` (unit — gate matrix, TTL, parse/validate, injection-safety,
+  hold/proceed/steal/outage decision matrix, publish upsert semantics); `sandbox-multiseat-scenario.sh`'s
+  `conflict-drive-xseat` leg (sim — `cross_seat_resolver_probe` is now an asserted `pass`/`fail`
+  checkpoint, not an observational metric).
+- Conformance rows registered for `resolver-claim.sh`, `RESOLVE_CLAIM`, `RESOLVE_CLAIM_TTL`.
 
 ### Phase 2 — Approvals as shared truth
 

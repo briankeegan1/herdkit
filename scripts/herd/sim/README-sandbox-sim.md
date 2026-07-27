@@ -480,10 +480,15 @@ Flags: `--artifacts DIR` (`--keep` implied), `--keep`, `-n/--prs N` (default 4, 
 `MERGE_FAIRNESS` (default `on`), `SANDBOX_REVIEW_DELAY` (default 0). Hermetic proof:
 `../../../tests/test-sandbox-multiseat.sh`.
 
-> Two seats, one stub remote, zero model calls, no herdr panes. The scorecard also records
-> `cross_seat_resolver_probe` (whether a second seat's empty local ledger would also dispatch a
-> resolver for the same CONFLICTING sha — the G5 observation from the multi-seat doctrine audit);
-> the shippable fail-gate is per-seat single-flight (`resolver_double_dispatch=0`).
+> Two seats, one stub remote, zero model calls, no herdr panes. `resolver_double_dispatch=0` proves
+> per-seat single-flight (unconditional). `cross_seat_resolver_probe` is now a REAL fail gate
+> (HERD-423, Phase 1 of `docs/spikes/cross-seat-coordination.md`): a `conflict-drive-xseat` leg turns
+> `RESOLVE_CLAIM=on` (with `WATCHER_SCOPE=all`, already the scenario's default) and asserts seat-b's
+> independent, empty local ledger HOLDS behind seat-a's shared `<!-- herd:resolve-claim v1 -->` PR
+> comment instead of also dispatching — i.e. `cross_seat_resolver_probe == 0` under the armed lever.
+> The scenario's earlier `conflict-drive` leg still runs the SAME probe with the lever at its default
+> (off) and reports it as informational only — that leg is the G5 observation from the multi-seat
+> doctrine audit, preserved to prove the lever is byte-identical/off by default.
 
 ## HERD-251 — WATCHER SELF-RESTART scenario — `sandbox-self-restart-scenario.sh`
 
