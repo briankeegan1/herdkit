@@ -3798,7 +3798,12 @@ cmd_conformance_run() {
         elif [ ! -e "$root/$pref" ]; then
           verdict="missing"
         elif [ "$pkind" = "unit" ]; then
-          if ( cd "$root" && bash "$pref" ) >/dev/null 2>&1; then verdict="pass"; else verdict="fail"; fi
+          # </dev/null: a proof under this loop's stdin (the awk pipe feeding `read`) must never let a
+          # test that itself reads piped stdin (e.g. one exercising `herd advise`, which treats a
+          # non-tty stdin as extra context) siphon the REMAINING rows off the pipe — that silently
+          # truncates every proof after it with no error, no fail, just a short run (found running the
+          # full unfiltered `run` for HERD-424's verification: it stopped dead at row 31/393).
+          if ( cd "$root" && bash "$pref" </dev/null ) >/dev/null 2>&1; then verdict="pass"; else verdict="fail"; fi
         else
           verdict="skipped"
         fi
