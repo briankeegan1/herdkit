@@ -418,33 +418,68 @@ natural implementation.
 
 ### 6.2 HERD-294 — starvation freeze
 
-**Live state.** Candidate iteration is **worktree-discovery order** with no priority queue
-(`FEATS` filled from `_discover_feature_worktrees` `agent-watch.sh:10834`, iterated
-`agent-watch.sh:11660`, pushed `agent-watch.sh:11822`). A **starvation counter is implemented**
-(observability): `restale_count` (`agent-watch.sh:3352`), `_restale_note`
-(`agent-watch.sh:3361`) journals `pr_restale` per lap and `pr_starvation` past threshold
-(`agent-watch.sh:3371`), wired at both lap-losing surfaces — conflict (`agent-watch.sh:4382`) and
-stale-base hold (`agent-watch.sh:7917`) — and it decorates the row with a loud
-`└─ starving · N re-stale laps` line (`_restale_decorate_row` `agent-watch.sh:3385`). A
-**priority reorder exists but is ship-dormant** (`_merge_fairness_reorder`
-`agent-watch.sh:3457`, guarded `MERGE_FAIRNESS` off by default `agent-watch.sh:3458`, called
-`agent-watch.sh:11934`). Holds do **not** block siblings — each candidate is an independent loop
-iteration that `continue`s (`HOLD)` case `agent-watch.sh:12268`,`:12305`) — but a held PR remains
-a candidate every tick, so a sibling merge advancing the shared base re-stales the held sha. With
-fairness off, that interaction is unmitigated.
+**Bash live state.** The bash **action pass that used to decide merges is gone**: `_tick_act` was
+deleted at the P5 cutover (HERD-306, EPIC HERD-300's finale), and `ENGINE_IMPL` set to anything but
+`python` is now treated as `python` with a loud one-time retirement warning
+(`scripts/herd/engine-version.sh:290`) — the Python engine (`pysrc/herd/live_runtime.py`) is the
+SOLE live core. What survives in `agent-watch.sh`, the live status console for the coordinator
+(`docs/codemap.md`), is: (1) the re-stale lap **counter**, still wired live at both lap-losing
+surfaces — the conflict classifier (`_classify_conflict` → `_restale_note`, `agent-watch.sh:5103`)
+and the stale/duplicate hold path (`_restale_note` `agent-watch.sh:9059`) — recording into a shared
+ledger file (`RESTALE_STATE=.agent-watch-restale`, `agent-watch.sh:438`,
+`_RESTALE_STARVE_THRESHOLD=3` `:441`) via `restale_counted` (`:3866`)/`restale_count` (`:3873`)/
+`_restale_note` (`:3882`, journals `pr_restale` `:3892` and, at/past threshold, `pr_starvation`
+`:3894`), decorating the row with the loud `└─ starving · N re-stale laps` line (`_starvation_row`
+`:3903`, `_restale_decorate_row` `:3912`, called `:9062` and `:13297`); and (2) the priority-**reorder**
+helper, `_merge_fairness_reorder` (`:3978`, guarded by `_merge_fairness_enabled`/`MERGE_FAIRNESS`
+`:3933`) — but with the action pass deleted it now has **no production callsite**.
+`tests/test-merge-fairness.sh:47`–`:58` asserts exactly that: the helper still exists (kept for the
+checks below and for the sim acceptance suite,
+`scripts/herd/sim/sandbox-concurrency-scenario.sh:1327`,`:1391`) and that no `_tick_act` reference
+lingers anywhere in the file. Candidate ordering — and therefore whether a starved PR ever actually
+gets a clean merge window — is single-owner: Python.
 
-**TARGET** (the semantics the port must carry — the reason the user chose to fold this and live
-with the risk until P3, per the epic decision):
+**Python typed live runtime. IMPLEMENTED** (`MERGE_FAIRNESS`, HERD-340, folding this section closed
+— the design-basis incident is PR #399's re-stale livelock, `tests/test-py-merge-fairness.sh:2`–`:3`).
+Ship-dormant, default off, strict-validated like every other gate lever:
+`_merge_fairness_enabled` (`live_runtime.py:1324`) treats any unrecognized `MERGE_FAIRNESS` value as
+off — the byte-identical default — and `_starve_threshold` (`:1331`) falls back to the SAME default
+as the bash counter (3, `agent-watch.sh:441`) when `MERGE_FAIRNESS_STARVE_THRESHOLD` is absent or
+non-positive.
 
-1. **A gates-passed PR sitting in a HOLD counts as the pipeline head.** It is not "done" and not
-   "failed" — it is the front of the integration queue, and it must not be starved by siblings
-   that keep merging ahead of it. The port must treat a held-but-blessed sha as head-of-line,
-   not as an ignorable `continue`.
-2. **Re-stale laps are bounded and, past threshold, freeze the competition.** The port surfaces
-   `restale_count` (already built) and, past a threshold, **holds sibling `do_merge`s for one
-   merge window** so the starved PR can finish its final gate and land — the promotion of the
-   dormant `_merge_fairness_reorder` from observability to enforcement.
-3. **Holds must notify loudly** (already true, §5.6) — a PR frozen in a hold is never silent.
+Each tick, `LiveTick._fairness_prepass` (`:2578`, called `:2922`, strictly before any candidate is
+walked) is a no-op when the lever is off. When on, it (a) counts this tick's fresh re-stale laps for
+a candidate that re-staled with real gate work already invested (`state.note_restale`, `:2598`),
+journaling `pr_restale` (`:2600`) and, at/past threshold, `pr_starvation` (`:2602`) — the exact bash
+journal schema (§3.4) — into the SAME shared ledger file bash's still-live conflict/stale-dup
+classifiers also write to, so `_effective_laps` (`:2566`) sees every lap either implementation ever
+recorded for that PR, not only the ones Python itself counted this tick; then (b) resolves the
+head-of-line **starved set**: a candidate is starved when its laps reach threshold AND its own
+merge policy would auto-merge it once green (`_would_automerge`, `:2572` — a PR parked on a human
+hold never starves-and-freezes), bounded to ONE window per `(pr, sha)` via the once-guard (`:2609`,
+`"fairness_window"`) so a rebased sha re-arms it and a PR that can never land does not freeze the
+queue forever.
+
+At the merge decision (`LiveTick._walk`), a candidate whose action would be MERGE is instead frozen
+whenever some OTHER candidate is in the starved set (`:2855`, `self._starved - {cand.pr}`) — a new
+`merge_frozen` edge, BLESSED→HOLD (`statemachine.py:120`,`:203`), journaled once as
+`merge_fairness_freeze` (`live_runtime.py:2856`–`:2858`). The starved PR is excluded from its own
+freeze set, so it still merges once it is itself ready. This is exactly the promotion this section
+used to describe as TARGET: the ship-dormant bash reorder's *intent* ("merge the ready one first, so
+the merge that would re-stale it never runs") realized as an actual HOLD enforcement — in the Python
+core, not the bash tree, which never grows this. Proven by `tests/test_statemachine_props.py`
+(`MergeFairnessFreeze`, `:262`), `tests/test_live_runtime.py` (`MergeFairnessFreeze` `:1510`,
+`MergeFairnessState` `:1599`), and the hermetic dry-run sim `tests/test-py-merge-fairness.sh`
+(freeze-on, byte-identical-off, no self-block, no freeze behind a human hold).
+
+**TARGET — closed.** The three semantics this section asked the port to carry are all now
+implemented: a gates-passed PR sitting in a HOLD is re-walked as a real candidate every tick, never
+dropped (`LiveTick._walk` returns `HOLD` and re-attempts next tick, §5.1's row-truth doctrine); past
+threshold, re-stale laps now freeze sibling `do_merge`s for one window (`merge_frozen`, above — the
+piece that was genuinely missing before HERD-340); and holds notify loudly (§5.6, unchanged).
+Nothing in §6.2 remains TARGET. The bash `_merge_fairness_reorder` stays the dormant, callsite-less
+helper described above by design — folding HERD-294 closed means the semantics live in the Python
+port, not that bash grows an enforcement path of its own (§6's intro).
 
 ### 6.3 HERD-273 — ordered integration queue (merge train)
 
@@ -563,11 +598,13 @@ Per the P0 acceptance criteria (HERD-301):
   any anchor with `sed -n '<line>p' <file>`.
 - **IMPLEMENTED vs. TARGET is stated explicitly** for the four folded items (§6): HERD-235 gate
   order and new-sha supersession-cancel are IMPLEMENTED (DAG + cross-sibling cancel are TARGET);
-  HERD-294's starvation counter is IMPLEMENTED and the reorder is ship-dormant (the freeze is
-  TARGET); HERD-296 (§6.4, `MERGE_RESULT_GATE`) and HERD-273 (§6.3, `MERGE_QUEUE`) are both
-  IMPLEMENTED — Python-port-only, ship-dormant, default off — with batch-verify-N/bisect-on-red and
-  speculative parallel slots (the train's Phase 4 proper) left as TARGET, out of scope for the
-  ordering primitive.
+  HERD-294 (§6.2, `MERGE_FAIRNESS`, HERD-340) is now fully IMPLEMENTED — Python-port-only,
+  ship-dormant, default off — closing what was TARGET here (the bash re-stale counter stays
+  IMPLEMENTED-and-live, the bash reorder stays a dormant helper with no production callsite since
+  `_tick_act`'s deletion, HERD-306); HERD-296 (§6.4, `MERGE_RESULT_GATE`) and HERD-273 (§6.3,
+  `MERGE_QUEUE`) are both IMPLEMENTED — Python-port-only, ship-dormant, default off — with
+  batch-verify-N/bisect-on-red and speculative parallel slots (the train's Phase 4 proper) left as
+  TARGET, out of scope for the ordering primitive.
 
 ---
 
