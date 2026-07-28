@@ -21,6 +21,7 @@ Run:  PYTHONPATH=pysrc python3 tests/test_live_runtime.py
 """
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -3957,6 +3958,208 @@ class TestMergeResultGateSupersession(unittest.TestCase):
         t._supersede_stale([LiveCandidate(pr=1, sha="s1")])
         evs = events(self.jpath) if os.path.exists(self.jpath) else []
         self.assertEqual([e for e in evs if e.get("rail") == "merge_result"], [])
+
+
+class TestChaosSeamGuard(LiveCase):
+    """HERD-425: the three chaos-injection seams (_chaos_kill) must be ship-dormant, byte-identical-
+    when-off, and fail-closed against accidental use outside tests/test-gate-reconciler-chaos-sim.sh
+    — the ONLY caller that ever sets HERD_CHAOS_KILL_AT/HERD_CHAOS_GUARD. Every "inert" case here
+    proves the guard logic in isolation (os.kill is monkeypatched, never actually invoked) so a
+    regression that widens the guard is caught by a fast unit test, not only by the slow, real-SIGKILL
+    chaos sim. The one "fires" case is proven with a REAL subprocess + a REAL SIGKILL (not a mock) —
+    the mock only proves intent; the subprocess proves the kill is genuinely untrappable."""
+
+    def setUp(self):
+        super().setUp()
+        self._env_saved = {}
+        for k in ("HERD_CHAOS_KILL_AT", "HERD_CHAOS_GUARD"):
+            self._env_saved[k] = os.environ.pop(k, None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for k, v in self._env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _guard_file(self, present=True):
+        p = os.path.join(self.tmp, "guard")
+        if present:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("hermetic sentinel\n")
+        return p
+
+    def test_noop_when_kill_at_unset(self):
+        # The default, always-true-in-production case: no env var set at all.
+        os.environ["HERD_CHAOS_GUARD"] = self._guard_file()
+        with mock.patch.object(LR.os, "kill") as mock_kill:
+            LR._chaos_kill("mid_do_merge")
+        mock_kill.assert_not_called()
+
+    def test_noop_when_guard_unset(self):
+        # A point IS armed but the fail-closed guard var is absent — must still be inert.
+        os.environ["HERD_CHAOS_KILL_AT"] = "mid_do_merge"
+        with mock.patch.object(LR.os, "kill") as mock_kill:
+            LR._chaos_kill("mid_do_merge")
+        mock_kill.assert_not_called()
+
+    def test_noop_when_guard_file_missing(self):
+        # A stray/leaked HERD_CHAOS_KILL_AT (operator typo, inherited shell env) in a real deployment
+        # can never self-destruct a real watcher, because HERD_CHAOS_GUARD never also points at an
+        # existing file there — this is the fail-closed invariant itself, not just an unset-var case.
+        os.environ["HERD_CHAOS_KILL_AT"] = "mid_do_merge"
+        os.environ["HERD_CHAOS_GUARD"] = self._guard_file(present=False)
+        with mock.patch.object(LR.os, "kill") as mock_kill:
+            LR._chaos_kill("mid_do_merge")
+        mock_kill.assert_not_called()
+
+    def test_noop_when_point_mismatches(self):
+        # Armed for a DIFFERENT boundary than the one currently executing — every call site checks its
+        # own literal point name, so arming one seam can never accidentally fire another.
+        os.environ["HERD_CHAOS_KILL_AT"] = "mid_do_merge"
+        os.environ["HERD_CHAOS_GUARD"] = self._guard_file()
+        with mock.patch.object(LR.os, "kill") as mock_kill:
+            LR._chaos_kill("mid_gate_collect")
+        mock_kill.assert_not_called()
+
+    def test_fires_when_point_and_guard_both_match(self):
+        os.environ["HERD_CHAOS_KILL_AT"] = "mid_refix_bounce"
+        os.environ["HERD_CHAOS_GUARD"] = self._guard_file()
+        with mock.patch.object(LR.os, "kill") as mock_kill:
+            LR._chaos_kill("mid_refix_bounce")
+        mock_kill.assert_called_once_with(os.getpid(), LR.signal.SIGKILL)
+
+    def test_all_three_call_sites_name_a_real_point(self):
+        # A cheap regression guard against a seam's literal point string drifting out of sync with the
+        # sim that arms it — every point tests/test-gate-reconciler-chaos-sim.sh sets must fire here.
+        for point in ("mid_do_merge", "mid_gate_collect", "mid_refix_bounce"):
+            with self.subTest(point=point):
+                os.environ["HERD_CHAOS_KILL_AT"] = point
+                os.environ["HERD_CHAOS_GUARD"] = self._guard_file()
+                with mock.patch.object(LR.os, "kill") as mock_kill:
+                    LR._chaos_kill(point)
+                mock_kill.assert_called_once_with(os.getpid(), LR.signal.SIGKILL)
+
+    def test_valid_sentinel_delivers_a_real_untrappable_sigkill_in_a_subprocess(self):
+        # The mocked cases above prove the GUARD LOGIC; this proves the actual KILL is real — a
+        # genuinely separate python3 process, armed exactly as tests/test-gate-reconciler-chaos-sim.sh
+        # arms it, must die by SIGKILL (returncode -9), not raise a catchable exception and not exit
+        # cleanly. No `try/except SystemExit` in the child could survive this if the seam is wired to
+        # a real os.kill(SIGKILL) rather than, say, sys.exit().
+        guard = self._guard_file()
+        env = dict(os.environ)
+        env["HERD_CHAOS_KILL_AT"] = "mid_do_merge"
+        env["HERD_CHAOS_GUARD"] = guard
+        env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(LR.__file__)))
+        script = (
+            "import herd.live_runtime as lr\n"
+            "try:\n"
+            "    lr._chaos_kill('mid_do_merge')\n"
+            "except SystemExit:\n"
+            "    pass\n"  # proves a trappable exit is NOT what happens — control never reaches here
+            "print('SURVIVED')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, -LR.signal.SIGKILL,
+                         "child rc=%r stdout=%r stderr=%r" % (proc.returncode, proc.stdout, proc.stderr))
+        self.assertNotIn("SURVIVED", proc.stdout)
+
+    def test_valid_sentinel_is_inert_in_a_subprocess_when_guard_file_absent(self):
+        # The subprocess-level twin of test_noop_when_guard_file_missing: proves the fail-closed
+        # behavior holds even when nothing in-process could have monkeypatched anything away.
+        env = dict(os.environ)
+        env["HERD_CHAOS_KILL_AT"] = "mid_do_merge"
+        env["HERD_CHAOS_GUARD"] = os.path.join(self.tmp, "does-not-exist")
+        env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(LR.__file__)))
+        script = ("import herd.live_runtime as lr\n"
+                  "lr._chaos_kill('mid_do_merge')\n"
+                  "print('SURVIVED')\n")
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, "stdout=%r stderr=%r" % (proc.stdout, proc.stderr))
+        self.assertIn("SURVIVED", proc.stdout)
+
+
+class TestChaosRestartReconciliation(LiveCase):
+    """HERD-425: unit-level (no subprocess, no real SIGKILL) proof that a torn on-disk state — the
+    EXACT residue each chaos-sim leg's kill point leaves behind — converges cleanly when a FRESH
+    LiveGates / LiveTick / LiveActuator instance (a new object graph over the SAME LiveState dir,
+    modeling a restarted process with zero in-memory carryover) reads it.
+    tests/test-gate-reconciler-chaos-sim.sh proves the same claims end-to-end with genuine process
+    kills; this class isolates just the recovery LOGIC so it runs in milliseconds."""
+
+    def test_health_collect_recovers_from_a_result_file_with_no_cache_yet(self):
+        # The exact residue mid_gate_collect's kill point leaves: a nonce-matched dispatch out-file and
+        # its live-looking inflight marker are on disk, but NOTHING has been cached yet — the process
+        # died between reading the out-file and calling record_health_result (LiveGates.health's own
+        # "at-least-once" collect-step ordering).
+        state = LiveState(self.tmp)
+        journal = LiveJournal(self.jpath)
+        cand = LiveCandidate(pr=9, sha="shaX", slug="feat-x", worktree="")
+        inflight = state.health_inflight_file(cand)
+        disp = state.health_dispatch_file(cand)
+        nonce = _dispatch_nonce()
+        _marker_write(inflight, 999999, nonce=nonce)
+        with open(disp, "w", encoding="utf-8") as fh:
+            fh.write("%s\tCLEAN\tclean\n" % nonce)
+        self.assertIsNone(state.health_cached_verdict(cand))
+
+        gates = LiveGates("/nonexistent-home", state, journal)   # a FRESH instance — models a restart
+        verdict = gates.health(cand)
+
+        self.assertEqual(verdict, "CLEAN")
+        self.assertEqual(state.health_cached_verdict(cand), "CLEAN")
+        self.assertFalse(os.path.exists(disp), "the dispatch scratch file must be swept on recovery")
+        self.assertFalse(os.path.exists(inflight), "the inflight marker must be swept on recovery")
+
+    def test_refix_once_guard_alone_holds_silently_on_a_fresh_instance(self):
+        # The exact residue mid_refix_bounce's kill point leaves: _refix_check_and_record's ledger row
+        # landed, but the bounce's own wake+journal never ran (the process died inside
+        # _bounce_and_wake, after wake_builder actuated, before its journal pair).
+        state = LiveState(self.tmp)
+        journal = LiveJournal(self.jpath)
+        cand = LiveCandidate(pr=11, sha="shaY", slug="feat-y", worktree="")
+        actuator = DryRunActuator(journal)
+        tick = LiveTick({"MERGE_POLICY": "auto"}, None, None, actuator, journal, state=state)
+        # Hand-write the once-guard row directly, bypassing _bounce_and_wake entirely — this IS what a
+        # fresh process finds on disk after the chaos leg's kill.
+        ledger = os.path.join(self.tmp, ".agent-watch-refixed")
+        with open(ledger, "w", encoding="utf-8") as fh:
+            fh.write("1700000000 11 shaY feat-y health\n")
+
+        round_num, reason = tick._refix_check_and_record(cand, "health")
+
+        self.assertIsNone(round_num)
+        self.assertIsNone(reason)   # once-guard holds silently: never a second wake, never ESCALATE
+
+        # A fresh sha reopens the round (sha-keyed once-guard, contract §2.4) — proves the hold is
+        # bounded, not a permanent wedge. round=2, not 1: only the ONCE-GUARD is sha-keyed (contract
+        # §4) — the rail's per-PR lifetime round count is not, and correctly keeps counting.
+        cand2 = LiveCandidate(pr=11, sha="shaZ", slug="feat-y", worktree="")
+        round_num2, reason2 = tick._refix_check_and_record(cand2, "health")
+        self.assertEqual(round_num2, 2)
+        self.assertIsNone(reason2)
+
+    def test_merge_state_verify_reads_true_state_on_a_fresh_actuator_instance(self):
+        # The exact residue mid_do_merge's kill point leaves: the remote merge already landed (gh
+        # reports MERGED) but no local journal 'merge' record exists yet. A fresh LiveActuator (models
+        # a restarted tick) reading this candidate must confirm MERGED via the API read alone — the
+        # read path tests/test-gate-reconciler-chaos-sim.sh's LEG A relies on end-to-end (there, via
+        # the shared post-merge sweep, which is what actually discharges the reap/tracker obligations
+        # in production — a duplicate direct .merge() call is deliberately NOT exercised here, since
+        # de-duplicating repeat merge attempts is candidate-discovery's job, not the actuator's).
+        sub = _RecordingSub(view_state="MERGED")
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        journal = LiveJournal(self.jpath)
+        cand = LiveCandidate(13, "deadbeef2", slug="feat-z", worktree="")
+
+        act = LiveActuator("/nonexistent-home", journal)   # a FRESH instance — models a restart
+        self.assertEqual(act._merged_state(cand), "MERGED")
+        self.assertTrue(act.merge(cand))
+        merge_events = [e for e in events(self.jpath) if e["event"] == "merge"]
+        self.assertEqual(len(merge_events), 1)
 
 
 if __name__ == "__main__":

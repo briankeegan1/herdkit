@@ -93,6 +93,39 @@ PASS, BLOCK, ESCALATE, HOLD = "PASS", "BLOCK", "ESCALATE", "HOLD"
 WAIT, PENDING = "WAIT", "PENDING"
 
 
+# ── chaos-injection seams (HERD-425, test-only) ─────────────────────────────────────────────────────
+# Three production boundaries where an untrappable hard watcher death is a genuine live risk — mid
+# do_merge (LiveActuator.merge, after the merge actuates but before it is durably recorded), mid
+# gate-result collect (LiveGates.health, after a dispatched worker's verdict is readable but before it
+# is durably cached), and mid refix-bounce (LiveTick._bounce_and_wake, after the builder wake attempt
+# actuates but before its refix_bounce/refix_wake_result journal pair lands). The refix-bounce wake
+# ITSELF is never repeated on restart — the once-guard ledger row was already written durably by the
+# caller, _refix_check_and_record, BEFORE _bounce_and_wake is even reached, so it blocks any further
+# bounce attempt for this (pr, sha, kind) regardless of what happens next. What a death here actually
+# costs is narrower: only the refix_bounce/refix_wake_result journal PAIR — an observability record,
+# not a functional guard — is missing after restart; the builder was genuinely woken exactly once.
+# ``tests/test-gate-reconciler-chaos-sim.sh`` is the ONLY caller that ever sets these env vars.
+#
+# SHIP-DORMANT / BYTE-IDENTICAL-WHEN-OFF (AGENTS.md): with HERD_CHAOS_KILL_AT unset (always true in
+# production and in every other test), _chaos_kill is one cheap os.environ.get returning None — no
+# journal write, no state mutation, no behavior change at any of the three call sites.
+#
+# FAIL-CLOSED: firing ALSO requires HERD_CHAOS_GUARD to name an EXISTING file. A stray/leaked
+# HERD_CHAOS_KILL_AT in a real environment (operator typo, inherited shell env) can still never
+# self-destruct a real watcher, because no real deployment ever also has HERD_CHAOS_GUARD pointing at
+# an existing sentinel the hermetic harness created for itself.
+def _chaos_kill(point):
+    target = os.environ.get("HERD_CHAOS_KILL_AT")
+    if not target or target != point:
+        return
+    guard = os.environ.get("HERD_CHAOS_GUARD")
+    if not guard or not os.path.isfile(guard):
+        return
+    # SIGKILL, not sys.exit/raise: an untrappable kernel-level death — no atexit, no finally, no
+    # cleanup — the exact failure mode the chaos sim must prove the NEXT tick recovers from.
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
 # ── the subject under gate ────────────────────────────────────────────────────────────────────────
 
 class LiveCandidate:
@@ -1536,6 +1569,13 @@ class LiveGates:
             else:
                 verdict, _, detail = rest.partition("\t")
                 if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                    # CHAOS SEAM (mid_gate_collect, HERD-425): the async worker's terminal verdict is
+                    # already durable on disk (the dispatch out-file, nonce-matched) — a hard death here
+                    # models "the suite finished, the watcher died before recording/caching it." The
+                    # dispatch + in-flight scratch files are UNTOUCHED at this point, so the next tick's
+                    # step-2 collect re-reads this exact same out-file and completes the record+rm in one
+                    # shot — no re-dispatch of the underlying suite, no lost result.
+                    _chaos_kill("mid_gate_collect")
                     st.record_health_result(cand, verdict, detail)
                     st.rm(disp, inflight)
                     return verdict
@@ -2050,6 +2090,13 @@ class LiveActuator:
             subprocess.run(argv, capture_output=True, text=True, check=True)
         except Exception:
             pass  # non-zero is NOT authoritative — the API state below is the only truth that merges
+        # CHAOS SEAM (mid_do_merge, HERD-425): the merge action above has already landed (or genuinely
+        # failed) on the remote — the one truly unrecoverable step. Everything below this line is local
+        # bookkeeping (the state verify + the journal "merge" record + the caller's reap). A hard death
+        # here models "the merge reached GitHub, our record of it did not" — the exact shape a foreign
+        # merge already leaves, which the existing post-merge reconcile sweep (_sweep_merged_prs,
+        # agent-watch.sh) is built to discharge regardless of who performed the merge.
+        _chaos_kill("mid_do_merge")
         state = self._merged_state(cand)
         if state == "MERGED":
             self.journal.append("merge", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
@@ -2401,6 +2448,16 @@ class LiveTick:
         """
         prompt = prompt if prompt is not None else self._refix_prompt(cand, kind)
         wake = self.actuator.wake_builder(cand, prompt)
+        # CHAOS SEAM (mid_refix_bounce, HERD-425): the once-guard ledger row for this (pr, sha, kind)
+        # was already appended by the caller's _refix_check_and_record BEFORE _bounce_and_wake was even
+        # invoked, so it is already durable when a death happens here — a restart's own
+        # _refix_check_and_record sees it and holds silently, never re-actuating the wake. A hard
+        # death here models "the builder was genuinely woken, the journal pair
+        # (refix_bounce/refix_wake_result) never landed": the wake side effect is not undone and is
+        # never repeated, only its completion RECORD is missing. The safe, honest convergence is:
+        # hold silently (never a second wake, never a duplicate bounce) — exactly the same
+        # "already bounced" path a normal budget-spent tick takes.
+        _chaos_kill("mid_refix_bounce")
         status_before = wake.status_before or "unknown"
         self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                             "round", round_num, "agent_status_before", status_before,
