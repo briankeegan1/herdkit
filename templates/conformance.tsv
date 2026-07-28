@@ -185,6 +185,7 @@ agent-watch.sh	sim	tests/test-sandbox-limit-resume.sh
 agent-watch.sh	sim	scripts/herd/sim/postmerge-reconcile-sim.sh
 agent-watch.sh	sim	scripts/herd/sim/tick-availability-sim.sh
 agent-watch.sh	sim	tests/test-sandbox-multiseat.sh
+agent-watch.sh	sim	tests/test-gate-reconciler-chaos-sim.sh
 approvals.sh	unit	tests/test-journal-audit.sh
 merge-policy.sh	unit	tests/test-merge-policy.sh
 merge-policy.sh	unit	tests/test-cli-reload.sh
@@ -281,6 +282,7 @@ REVIEW_PANEL_POLICY	unit	tests/test-review-panel-models.sh
 review-panel.sh	unit	tests/test-review-panel-models.sh
 SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
+HEALTH_CONCURRENCY	sim	tests/test-gate-reconciler-chaos-sim.sh
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
@@ -295,6 +297,7 @@ INFRA_BREAKER_COOLDOWN	sim	tests/test-sandbox-concurrency.sh
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REVIEW_AUTOFIX	sim	tests/test-sandbox-real-panes.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
+REFIX_MAX_ROUNDS	sim	tests/test-gate-reconciler-chaos-sim.sh
 REFIX_COMPLETE_MIN	unit	tests/test-py-live-refix-complete.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
