@@ -5430,6 +5430,17 @@ _stop_project_watcher() {
 }
 
 cmd_reload() {
+  # HERD-427: opt-in, default-off. Flag NOT passed → with_coordinator stays 0 and every branch
+  # below that checks it is a no-op, so output/behavior stays byte-identical to pre-HERD-427.
+  local with_coordinator=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-coordinator) with_coordinator=1; shift ;;
+      -h|--help) say "usage: herd reload [--with-coordinator]"; return 0 ;;
+      *) die "herd reload: unknown option '$1' (try --with-coordinator)" ;;
+    esac
+  done
+
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
@@ -5475,6 +5486,7 @@ cmd_reload() {
   local watch_match="agent-watch.sh|herd-watch.sh"   # herd-watch.sh execs agent-watch.sh
   local launch_desc="background" watch_pid="" watch_pane=""
   local backlog_desc="not managed (herdr unavailable)"
+  local coordinator_desc=""
   local herdr_attempted=0
   # rebuild_desc — the ALWAYS-printed verdict distinguishing a full control-room rebuild from a
   # skill-only + headless-watcher fallback, so `herd reload`'s outcome is never ambiguous (issue #60,
@@ -5759,11 +5771,39 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
         touch "$PROJECT_ROOT/$BACKLOG_FILE" 2>/dev/null || true
       fi
 
-      # COORDINATOR AGENT: reload never starts or hijacks it. If none is live, everything else is
-      # restored and we tell the human exactly how to bring it back — never type into a shell they
-      # may be using.
+      # COORDINATOR AGENT: reload never HIJACKS a live agent, and by default never starts one either
+      # — never type into a shell the human may be using. --with-coordinator (HERD-427) opts into
+      # starting one when NONE is live, based on the same OBSERVED pane state resolved above (never
+      # on which seat invoked the command). A live agent is still NEVER touched: refuse instead.
       if [ "$agent_live" -eq 0 ] && [ -n "$agent_pane" ]; then
-        warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  claude ${COORDINATOR_CMD}"
+        if [ "$with_coordinator" -eq 1 ]; then
+          say "  --with-coordinator: starting the coordinator agent in pane ${agent_pane}…"
+          # The pane is BARE (agent_live=0 — nothing live to lose); close it and relaunch through
+          # the SAME path `herd pane coordinator` uses (_pane_agent_start → herd_driver_launch_agent)
+          # so there is exactly one place that composes the coordinator's launch argv.
+          herdr pane close "$agent_pane" >/dev/null 2>&1 || true
+          local new_agent_pane=""
+          new_agent_pane="$(_pane_agent_start "$HERD_AGENT_COORDINATOR" "$ws" "$root" "$coord_tab" right)"
+          if [ -n "$new_agent_pane" ]; then
+            agent_pane="$new_agent_pane"
+            if [ -n "$wPane" ]; then
+              case "$(_reload_pane_state "$wPane" "")" in
+                GONE) : ;;
+                *) _reload_reparent "$wPane" "$coord_tab" down "$agent_pane" 0.72 || true ;;
+              esac
+            fi
+            coordinator_desc="pane ${agent_pane} · started ✓"
+            ok "coordinator agent started in pane ${agent_pane}"
+          else
+            agent_pane=""
+            coordinator_desc="FAILED to start ✗"
+            warn "coordinator agent did not start — inspect tab ${coord_tab} (rest of the control room is still rebuilt)"
+          fi
+        else
+          warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  claude ${COORDINATOR_CMD}"
+        fi
+      elif [ "$agent_live" -eq 1 ] && [ "$with_coordinator" -eq 1 ]; then
+        warn "--with-coordinator: a coordinator agent is already live in pane ${agent_pane} — refusing to restart it (never kills a live coordinator implicitly); use 'herd pane coordinator' to relaunch it explicitly"
       fi
 
       # REGISTRY: rewrite from the OBSERVED final state on every path via the shared writer,
@@ -5832,6 +5872,7 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   journal_append reload_outcome component watcher result "$launch_desc"
   journal_append reload_outcome component backlog result "$backlog_desc"
   journal_append reload_outcome component control_room result "$rebuild_desc"
+  [ -n "$coordinator_desc" ] && journal_append reload_outcome component coordinator result "$coordinator_desc"
 
   say ""
   ok "reload complete"
@@ -5840,6 +5881,8 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   say "  skill:         $skill"
   say "  watcher:       $wsum"
   say "  backlog:       $backlog_desc"
+  # --with-coordinator only: byte-identical summary when the flag is off (coordinator_desc stays "").
+  [ -n "$coordinator_desc" ] && say "  coordinator:   $coordinator_desc"
   say "  MERGE_POLICY:  ${c_bold}$effective_policy${c_rst}"
 
   # PROACTIVE soft-dep surfacing (HERD-45) — opt-in via DOCTOR_STARTUP_HINT; a no-op (byte-identical
@@ -7333,11 +7376,14 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       .claude/settings.json with --shared) preserving existing entries;
                                       marker-keyed so re-render is idempotent. No hook rows → no-op
   herd reload                         rebuild the control room around the coordinator: stop +
-                                      relaunch the watcher (pane visibility verified), ensure
+              [--with-coordinator]     relaunch the watcher (pane visibility verified), ensure
                                       the pinned backlog pane, re-render the coordinator skill;
                                       prints a per-component summary + effective MERGE_POLICY.
-                                      Never closes the coordinator tab/agent — safe to run
-                                      from inside the coordinator
+                                      Never closes a LIVE coordinator tab/agent — safe to run
+                                      from inside the coordinator. --with-coordinator (default
+                                      off) additionally starts the coordinator agent when NONE
+                                      is live (e.g. run from a bare terminal); refuses instead
+                                      of touching one that is already live
   herd pane <target>                  restart ONE control-room pane in place (no full reload):
                                         watch        stop + rerun the watcher in its pane
                                         backlog      rerun the backlog viewer in its pane
