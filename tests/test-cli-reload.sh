@@ -337,6 +337,18 @@ PY
     printf '{"result":{}}\n' ;;
   "agent list")
     if [ -f "$S/agents.json" ]; then cat "$S/agents.json"; else printf '{"result":{"agents":[]}}\n'; fi ;;
+  "agent start")
+    # agent start <name> --workspace W --cwd R --tab T --split D -- claude /coordinator
+    # (mirrors test-cli-pane.sh's stub — the --with-coordinator launch reuses the SAME
+    # _pane_agent_start/herd_driver_launch_agent path `herd pane coordinator` exercises there)
+    name="${3:-}"; tab=""; shift 3 2>/dev/null || shift $#
+    while [ $# -gt 0 ]; do case "$1" in --tab) tab="${2:-}"; shift 2 ;; --) shift; break ;; *) shift ;; esac; done
+    pid="p$(next_id)"; mkdir -p "$S/panes/$pid"; printf '%s' "$tab" > "$S/panes/$pid/tab"
+    printf 'claude' > "$S/panes/$pid/cmd"
+    # Reflect the new agent into agent list so a follow-up anchor resolve finds it.
+    printf '{"result":{"agents":[{"name":"%s","pane_id":"%s","tab_id":"%s","workspace_id":"w1"}]}}\n' \
+      "$name" "$pid" "$tab" > "$S/agents.json"
+    printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "$pid" ;;
   "pane list")
     # Enumerate every pane with its current tab_id (from $S/panes/<id>/tab). --workspace is
     # accepted and ignored; cmd_reload filters by tab_id itself.
@@ -1002,6 +1014,77 @@ set -e
 printf '%s' "$out" | grep -qi "hard timeout" || fail "wedged verify did not emit the hard-timeout degraded note"
 printf '%s' "$out" | grep -qi "headless"     || fail "wedged verify did not name the headless-watcher fallback"
 printf '%s' "$out" | grep -q  "NOT relaunched" || fail "wedged verify did not reach the (suppressed) watcher fallback"
+ok
+
+# ═══ --with-coordinator (HERD-427): opt-in coordinator start on `herd reload` ═══════════════════════
+# Default is OFF (ship-dormant). herd reload never HIJACKS a live coordinator agent; the flag only
+# opts into STARTING one when none is live, reusing the exact launch path `herd pane coordinator`
+# already uses (_pane_agent_start → herd_driver_launch_agent — see the "agent start" stub op above,
+# mirrored from test-cli-pane.sh).
+
+# ── 38. flag OFF (default): coordinator pane stays bare, restart hint is BYTE-IDENTICAL to before ──
+P="$T/p38"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P38_REAL="$(cd "$P" && pwd -P)"
+S="$T/state38"; _rich_coord_state "$S"
+printf '{"result":{"agents":[]}}\n' > "$S/agents.json"   # no live coordinator agent
+cat > "$P38_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL tC
+watch pW tC
+REG
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (--with-coordinator OFF, no agent)"
+printf '%s' "$out" | grep -qF "no coordinator agent is live in pane pA — start it yourself:  claude /coordinator" \
+  || fail "default reload's restart hint changed — must stay byte-identical with the flag off"
+grep -q "agent start" "$S/log" && fail "flag OFF but reload started a coordinator agent" || true
+grep -q "pane close pA" "$S/log" && fail "flag OFF but reload closed the (bare) coordinator anchor pane" || true
+grep -q "^coordinator-agent pA tC" "$P38_REAL/trees/.herd-panes" || fail "registry coordinator-agent row changed with the flag off"
+ok
+
+# ── 39. --with-coordinator, no live agent: starts one via the SAME path 'herd pane coordinator' uses ─
+P="$T/p39"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P39_REAL="$(cd "$P" && pwd -P)"
+S="$T/state39"; _rich_coord_state "$S"
+printf '{"result":{"agents":[]}}\n' > "$S/agents.json"   # no live coordinator agent
+cat > "$P39_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL tC
+watch pW tC
+REG
+out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="reloadtest" \
+    HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 \
+    HERD_RELOAD_LOCKPID_POLLS=1 \
+    bash "$HERD" reload --with-coordinator 2>&1 )" || fail "reload failed (--with-coordinator, no agent)"
+grep -q "pane close pA" "$S/log" || fail "did not close the bare coordinator anchor before relaunching"
+grep -q "agent start coordinator-reloadtest" "$S/log" || fail "did not start a fresh coordinator agent"
+printf '%s' "$out" | grep -q "started ✓" || fail "summary missing the coordinator 'started ✓' line"
+printf '%s' "$out" | grep -q "start it yourself" && fail "printed the manual-start hint despite --with-coordinator succeeding" || true
+new_c="$(awk '$1=="coordinator-agent" {print $2}' "$P39_REAL/trees/.herd-panes")"
+[ -n "$new_c" ] && [ "$new_c" != "pA" ] || fail "registry coordinator-agent not updated to the freshly-started pane (got '$new_c')"
+grep -q "^backlog pL" "$P39_REAL/trees/.herd-panes" || fail "registry backlog row not preserved"
+grep -q "^watch "     "$P39_REAL/trees/.herd-panes" || fail "registry watch row not preserved"
+ok
+
+# ── 40. --with-coordinator, agent ALREADY live: refuses, never kills it ─────────────────────────────
+P="$T/p40"; mkdir "$P"
+_make_project "$P" "reloadtest"
+P40_REAL="$(cd "$P" && pwd -P)"
+S="$T/state40"; _rich_coord_state "$S"   # fixture's agents.json already has a live agent at pA
+cat > "$P40_REAL/trees/.herd-panes" <<REG
+coordinator-agent pA tC
+backlog pL tC
+watch pW tC
+REG
+out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="reloadtest" \
+    HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 \
+    HERD_RELOAD_LOCKPID_POLLS=1 \
+    bash "$HERD" reload --with-coordinator 2>&1 )" || fail "reload failed (--with-coordinator, agent live)"
+grep -q "pane close pA" "$S/log" && fail "--with-coordinator killed the LIVE coordinator pane" || true
+grep -q "agent start" "$S/log" && fail "--with-coordinator started a second agent over a live one" || true
+printf '%s' "$out" | grep -qi "refusing to restart it" || fail "missing the live-agent refusal message"
+printf '%s' "$out" | grep -q "herd pane coordinator" || fail "refusal message did not point at 'herd pane coordinator'"
+grep -q "^coordinator-agent pA tC" "$P40_REAL/trees/.herd-panes" || fail "registry coordinator-agent row changed despite the refusal"
 ok
 
 echo "ALL PASS ($pass checks)"
