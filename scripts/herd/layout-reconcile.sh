@@ -21,6 +21,9 @@
 #   . "$SCRIPTS_DIR/layout-reconcile.sh"
 # It depends only on `herdr` + `python3`; every call degrades gracefully when herdr is absent or its
 # JSON does not parse (a pane resolves to `gone`, a scan to empty), so callers fail loud, not crash.
+# It OPTIONALLY consults `driver.sh`'s herd_driver_agent_process_signature (HERD-428, pane-role
+# classification) when that has ALSO been sourced — never a hard dependency: absent, it falls back to
+# the literal 'claude' unchanged.
 
 # ── the hard-timeout guard (HERD-208) ────────────────────────────────────────
 # _reload_timeout <secs> <cmd> [args...] — run <cmd> under a HARD wall-clock timeout, PRESERVING its
@@ -86,20 +89,37 @@ for p in panes:
 
 # _reload_pane_role <pane_id> → backlog|watch|agent|bare|busy|gone. Classifies a pane by the
 # process in its foreground (process-info) — the ground truth the canonical roles map onto: the
-# backlog viewer, the watcher (herd-watch execs agent-watch), a claude agent, an idle shell
-# (BARE, safe to reuse), or something else the human is running (BUSY — never hijacked).
+# backlog viewer, the watcher (herd-watch execs agent-watch), a live agent of the ACTIVE driver's
+# runtime, an idle shell (BARE, safe to reuse), or something else the human is running (BUSY — never
+# hijacked).
+#
+# DRIVER-AWARE (HERD-428): the 'agent' branch used to substring-match the literal 'claude', so a
+# codex/grok pane (HERD_DRIVER=codex|grok) matched none of the branches and fell through to 'busy' —
+# the coordinator's own pane was then never classified 'agent', so layout_reconcile's agents list
+# stayed empty for every non-Claude driver. It now reads the ACTIVE driver's
+# DRIVER_AGENT_PROCESS_SIGNATURE (scripts/herd/driver.sh's herd_driver_agent_process_signature) — one
+# or more space-separated literal substrings — instead of the hardcoded literal. FAIL-SOFT: when
+# driver.sh has not been sourced (the function is absent) or the binding is unset/unreadable, this
+# falls back to 'claude' — TODAY'S exact literal — so the default driver's classification and every
+# caller's behavior stay byte-identical.
 _reload_pane_role() {
-  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | python3 -c '
-import sys,json
+  local sig=""
+  if command -v herd_driver_agent_process_signature >/dev/null 2>&1; then
+    sig="$(herd_driver_agent_process_signature 2>/dev/null || true)"
+  fi
+  [ -n "$sig" ] || sig='claude'
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | SIG="$sig" python3 -c '
+import sys,json,os
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: print("gone"); sys.exit(0)
 sh=pi.get("shell_pid") or 0
 if not sh: print("gone"); sys.exit(0)
 fg=[p for p in (pi.get("foreground_processes") or []) if p.get("pid")!=sh]
 def has(*subs): return any(any(s in (p.get("cmdline") or "") for s in subs) for p in fg)
+agent_sigs=os.environ.get("SIG","claude").split() or ["claude"]
 if has("backlog-view.sh"): print("backlog")
 elif has("agent-watch.sh","herd-watch.sh"): print("watch")
-elif has("claude"): print("agent")
+elif has(*agent_sigs): print("agent")
 elif fg: print("busy")
 else: print("bare")
 ' 2>/dev/null || printf 'gone\n'

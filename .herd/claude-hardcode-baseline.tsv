@@ -6,7 +6,6 @@
 # (P2-P6) retire a site, drop its row so the ratchet only ever tightens. Comment/blank lines ignored.
 bin/herd	claude -p "Scout this repo at $root for a multi-agent workflow config. In <=10 lines report: the default branch, the test/lint command to use as a healthcheck, whether there is an app preview command, the privacy/gitignored dirs, and which work tracker it uses. Read-only." 2>/dev/null || warn "scout pass skipped (claude error)"
 bin/herd	reply="$(claude -p "Map this project-governance sentence to AT MOST ONE herd enforcement surface, or reply NONE. Reply with a single line: '<surface>\t<target>\t<label>' where surface is one of config-key|provisioning|hook. config-key target is SPACE-separated KEY=VALUE using only these keys: PUSH_GATE MERGE_POLICY MERGE_METHOD PR_FLOW PR_READY_WHEN DELETE_BRANCH_ON_MERGE ATTRIBUTION_POLICY COMMIT_CONVENTION. provisioning target is 'review-checklist'. Reply NONE if unsure. Sentence: $stmt" 2>/dev/null || true)"
-bin/herd	warn "no coordinator agent is live in pane ${agent_pane} — start it yourself: claude ${COORDINATOR_CMD}"
 scripts/herd/agent-watch.sh	"coordinator did not wake after the limit reset — resume by hand (claude --continue in the coordinator pane)" default
 scripts/herd/agent-watch.sh	"coordinator limit reset — resumed in place via claude --continue" default
 scripts/herd/agent-watch.sh	_claude_probe_run_timeout "$secs" claude --version || rc=$?

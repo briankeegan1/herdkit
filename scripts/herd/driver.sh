@@ -135,6 +135,23 @@ herd_driver_agent_runtime() {
   printf '%s' "${b%%[[:space:]]*}"
 }
 
+# herd_driver_agent_process_signature [driver] — the PANE-CMDLINE substring(s) that identify a LIVE
+# agent of <driver>'s runtime in a pane's foreground process list (HERD-428). One or more
+# WHITESPACE-SEPARATED literal substrings (mirrors DRIVER_AGENT_COST_USAGE_KEYS's space-separated
+# convention, not DRIVER_AGENT_LIMIT_PATTERN's regex-alternation convention — the pane-role classifier
+# does a plain substring `in` test against a cmdline, so a driver never has to escape regex metachars
+# to name its own binary). [driver] defaults to the ACTIVE driver (herd_driver_agent_value's own
+# default). This is the FIRST consumer of the DRIVER_AGENT_* exec block (docs/driver-abstraction.md §
+# agent-runtime portability, P1) — the pane-role probe (scripts/herd/layout-reconcile.sh's
+# _reload_pane_role) reads it instead of a hardcoded 'claude' substring match. FAIL-SOFT: a driver
+# missing this binding (or an unreadable/absent driver file) falls back to 'claude' — TODAY'S literal —
+# so an out-of-tree driver never reds the control room and the default driver is byte-identical.
+herd_driver_agent_process_signature() {
+  local drv="${1:-}"
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  herd_driver_agent_value DRIVER_AGENT_PROCESS_SIGNATURE claude "$drv"
+}
+
 # herd_model_resolve <ref> — resolve an optionally runtime-qualified MODEL_* value into its concrete
 # driver + model. On success echoes two TAB-separated tokens "<driver>\t<model>" and returns 0:
 #   • BARE (no colon)                → "<default-driver>\t<ref>"  (herd_driver_name; byte-identical)
@@ -1529,6 +1546,7 @@ _herd_driver_cli() {
     agent-runtime) herd_driver_agent_runtime; echo ;;       # the active driver's runtime executable
     resume-cmd)  herd_driver_agent_resume_cmd "$@"; echo ;;  # <prompt> [flags] [driver] → shell-safe resume cmd
     limit-pattern) herd_driver_agent_limit_pattern "$@"; echo ;;  # [driver] → DRIVER_AGENT_LIMIT_PATTERN
+    process-signature) herd_driver_agent_process_signature "$@"; echo ;;  # [driver] → DRIVER_AGENT_PROCESS_SIGNATURE
     switch-model) herd_driver_switch_model "$@" ;;   # <pane> <model> [driver]
     focus)       herd_driver_focus_agent "$@" ;;
     notify)      herd_driver_notify "$@" ;;
@@ -1536,7 +1554,7 @@ _herd_driver_cli() {
     agent-value) herd_driver_agent_value "$@"; echo ;;   # <KEY> [default] → the active driver's DRIVER_AGENT_* value
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|resume-cmd <prompt> [flags] [driver]|limit-pattern [driver]|switch-model <pane> <model>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|resume-cmd <prompt> [flags] [driver]|limit-pattern [driver]|process-signature [driver]|switch-model <pane> <model>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
   esac
 }
 
