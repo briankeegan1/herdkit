@@ -147,7 +147,6 @@ test-sandbox-multiseat.sh
 test-sandbox-posture-matrix.sh
 test-sandbox-real-panes.sh
 test-sandbox-real-remote.sh
-test-sandbox-resolver-respawn.sh
 test-sandbox-self-restart.sh
 test-sandbox-shared-config.sh
 test-sandbox-sim.sh
