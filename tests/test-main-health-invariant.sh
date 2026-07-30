@@ -66,11 +66,15 @@ HCSTUB
 chmod +x "$HC"
 export HC_MODE="$T/hc-mode"; printf 'green\n' > "$HC_MODE"
 
-# `gh` stub for the branch-CI leg (HERD-334/HERD-372): _main_health_ci_leg → `gh run list … --json …` →
-# GH_RUNS (network-free, no real Actions calls).
+# `gh` stub for the branch-CI leg (HERD-334/HERD-372/HERD-434): _main_health_ci_leg → `gh run list …
+# --json …` → GH_RUNS (network-free, no real Actions calls). Every invocation's argv is ALSO appended
+# to GH_CALLS (HERD-434) so a test can assert not just the RESULT but the exact `--branch` value the
+# leg passed — the regression this closes (`--branch origin/main` silently matching zero runs) was
+# invisible to a stub that only ever checked "$1 $2", never the rest of argv.
 BIN="$T/bin"; mkdir -p "$BIN"
 cat > "$BIN/gh" <<'GHSTUB'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${GH_CALLS:-/dev/null}"
 case "$1 $2" in
   "run list") printf '%s\n' "${GH_RUNS:-}"; exit 0 ;;
 esac
@@ -78,6 +82,8 @@ exit 0
 GHSTUB
 chmod +x "$BIN/gh"
 export PATH="$BIN:$PATH"
+export GH_CALLS="$T/gh-calls.log"; : > "$GH_CALLS"
+gcount() { local n; n="$(grep -c "$1" "$GH_CALLS" 2>/dev/null)" || n=0; printf '%s' "${n:-0}"; }
 
 # ── source the real engine in lib mode, with every state path pinned into the sandbox ────────────────
 # WORKTREES_DIR must be exported BEFORE sourcing: $TREES (and the main-health state paths derived from
@@ -87,7 +93,10 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 export PROJECT_ROOT="$REPO" WORKTREES_DIR="$TREES_DIR"
 export JOURNAL_FILE="$T/journal.jsonl"
 export HERD_HEALTHCHECK_BIN="$HC"
-export DEFAULT_BRANCH=main
+# HERD-434: the REALISTIC remote-qualified form herd-config.sh itself defaults DEFAULT_BRANCH to
+# ("origin/main") — not the bare "main" a bug-masking fixture would use. $HERD_BRANCH_NAME (derived
+# from this at source time, herd-config.sh:794) is the bare form `gh run list --branch` actually wants.
+export DEFAULT_BRANCH=origin/main
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in reconcile_main_health _main_health_dispatch _main_health_died _main_health_autofix \
@@ -133,6 +142,9 @@ new_sha() {
 MAIN_HEALTH_TICK=on
 MAIN_HEALTH_RECHECK_MINS=0
 MAIN_HEALTH_AUTOFIX=off
+MAIN_HEALTH_CI_GATE=on
+
+[ "$HERD_BRANCH_NAME" = "main" ] || fail "setup: HERD_BRANCH_NAME did not derive to 'main' from DEFAULT_BRANCH=$DEFAULT_BRANCH (got '$HERD_BRANCH_NAME')"
 
 # ── (a) OBSERVED-SHA: a HEAD nobody announced dispatches exactly one suite ───────────────────────────
 reset_state
@@ -458,6 +470,77 @@ _main_health_ci_leg
 [ "$(jcount '"result":"green"')" -eq "$((GREEN_JOURNAL_BEFORE + 1))" ] || fail "(h) a routinely-green branch-CI probe journaled on every scan"
 ok "(h) a branch-CI recovery (PASS) clears the CI identity exactly once; a routinely-green branch stays byte-quiet"
 unset GH_RUNS
+
+# ── HERD-434: default branch's CI conclusion as a MAIN_HEALTH_TICK input ────────────────────────────
+# GROUNDED: main merged 5 PRs (2026-07-28) while GitHub Actions CI stayed red on every one and
+# MAIN_HEALTH_TICK reported green throughout — its local re-suite runs on the WATCHER'S OWN host, which
+# can be green on a sha CI itself reds. _main_health_ci_leg (HERD-334) already probed `gh run list`, but
+# passed the RAW $DEFAULT_BRANCH ("origin/main", herd-config.sh's own default) as `--branch`, which `gh
+# run list` silently matches against ZERO runs — so the leg had been permanently, silently inert since
+# it shipped. The fix passes $HERD_BRANCH_NAME (the bare form) instead, gated behind its own
+# MAIN_HEALTH_CI_GATE (default off, ship-dormant, decoupled from MAIN_HEALTH_TICK's local re-suite).
+
+# (i) the leg queries the BARE branch name, never the remote-qualified $DEFAULT_BRANCH — the exact
+# regression that made every prior probe silently match nothing.
+reset_state
+new_sha "feat: a sha CI reds while local stays green"
+SHA434="$(head_sha)"
+printf 'green\n' > "$HC_MODE"
+: > "$GH_CALLS"
+export GH_RUNS='[{"headSha":"'"$SHA434"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI"}]'
+_main_health_ci_leg
+[ "$(gcount 'run list --branch main --limit')" -ge 1 ] || fail "(i) the leg did not query the BARE branch name 'main': $(cat "$GH_CALLS")"
+[ "$(gcount 'branch origin/main')" -eq 0 ] || fail "(i) the leg queried the remote-qualified 'origin/main' (the HERD-434 regression): $(cat "$GH_CALLS")"
+ok "(i) _main_health_ci_leg queries gh run list with the bare branch name, not the remote-qualified DEFAULT_BRANCH"
+
+# (a, CI-gate) a red CI conclusion on the default branch's CURRENT head surfaces as a red main — the
+# leg from (i) above already painted it; assert the row + journal + notify all agree.
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(a-ci) a failing CI conclusion did not paint MAIN RED"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+printf '%s' "$ROW" | grep -q 'MAIN RED' || fail "(a-ci) the console row did not surface the CI-sourced red: $ROW"
+[ "$(jcount "\"sha\":\"$SHA434\".*\"result\":\"red\"")" -ge 1 ] || fail "(a-ci) no red journal event named the CI-red sha"
+ok "(a-ci) a failing default-branch CI conclusion surfaces as a red main (row + journal + notify)"
+unset GH_RUNS
+
+# (b1) gh UNAVAILABLE (offline/uninstalled) is fail-soft: never a red, never a crash, always rc 0.
+reset_state
+new_sha "feat: a sha probed while gh itself is unavailable"
+SHA_OFFLINE="$(head_sha)"
+mv "$BIN/gh" "$BIN/gh.disabled"
+_main_health_ci_leg; RC=$?
+mv "$BIN/gh.disabled" "$BIN/gh"
+[ "$RC" -eq 0 ] || fail "(b1) _main_health_ci_leg did not fail-soft (rc=$RC) when gh is unavailable"
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(b1) an unavailable gh painted a red anyway"
+ok "(b1) an unavailable gh binary is fail-soft: no red, rc=0"
+
+# (b2) a run still IN PROGRESS (not COMPLETED) for the current head is fail-soft: never a red — a
+# pending CI run carries no verdict yet, the same "missing verdict is WAIT, never BLOCK" contract the
+# health rail itself honors.
+reset_state
+new_sha "feat: a sha whose CI run has not completed yet"
+SHA_PENDING="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_PENDING"'","status":"IN_PROGRESS","conclusion":"","workflowName":"CI"}]'
+_main_health_ci_leg; RC=$?
+[ "$RC" -eq 0 ] || fail "(b2) _main_health_ci_leg did not fail-soft (rc=$RC) on a pending run"
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(b2) a still-pending CI run painted a red"
+unset GH_RUNS
+ok "(b2) a CI run still IN PROGRESS for the current head is fail-soft: no red"
+
+# (c) MAIN_HEALTH_CI_GATE=off is byte-identical to before this feature: even with MAIN_HEALTH_TICK=on
+# and a red CI conclusion sitting right there, the leg must not make a SINGLE `gh run list` call.
+reset_state
+new_sha "feat: a sha CI reds while the new gate stays off"
+SHA_GATEOFF="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_GATEOFF"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI"}]'
+: > "$GH_CALLS"
+MAIN_HEALTH_CI_GATE=off
+_main_health_ci_leg; RC=$?
+MAIN_HEALTH_CI_GATE=on
+[ "$RC" -eq 0 ] || fail "(c) _main_health_ci_leg did not return 0 with the gate off"
+[ ! -s "$GH_CALLS" ] || fail "(c) MAIN_HEALTH_CI_GATE=off still called gh: $(cat "$GH_CALLS")"
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(c) MAIN_HEALTH_CI_GATE=off painted a red anyway"
+unset GH_RUNS
+ok "(c) MAIN_HEALTH_CI_GATE=off never calls gh and never paints a red — byte-identical to before HERD-434"
 
 # ── PR attribution: a trailing "(#N)" (the squash form) outranks an issue ref earlier in the subject ──
 new_sha "Merge pull request #456 from other/seat"

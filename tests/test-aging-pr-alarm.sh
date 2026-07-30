@@ -207,6 +207,7 @@ ok "(a) purge_pr_aging drops only the named PR's markers (no 9-vs-90 collision)"
 reset_state
 unset HERD_FAKE_NOW 2>/dev/null || true
 MAIN_HEALTH_TICK=on
+MAIN_HEALTH_CI_GATE=on   # HERD-434: the leg's own lever, decoupled from MAIN_HEALTH_TICK — see (b2) below
 HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 
 # _main_ci_classify: newest COMPLETED run for the expected sha wins; other-sha / in-progress runs skipped.
@@ -243,8 +244,17 @@ export GH_RUNS="$RUNS"                                 # failing again, but the 
 _main_health_ci_leg
 [ -e "$TREES_DIR/.agent-watch-main-health" ] && fail "(b) MAIN_HEALTH_TICK=off must be byte-inert" || true
 [ "$(jcount '"result":"red"')" -eq 0 ] || fail "(b) MAIN_HEALTH_TICK=off must journal no red"
-unset GH_RUNS
 ok "(b) a green CI run sets no red, and MAIN_HEALTH_TICK=off is byte-inert on the branch-CI leg"
+
+# (b2) HERD-434: MAIN_HEALTH_CI_GATE=off is its OWN independent byte-inert lever — even with
+# MAIN_HEALTH_TICK back on and a failing run sitting right there, the leg must not fire.
+MAIN_HEALTH_TICK=on
+MAIN_HEALTH_CI_GATE=off
+_main_health_ci_leg
+[ -e "$TREES_DIR/.agent-watch-main-health" ] && fail "(b2) MAIN_HEALTH_CI_GATE=off must be byte-inert" || true
+[ "$(jcount '"result":"red"')" -eq 0 ] || fail "(b2) MAIN_HEALTH_CI_GATE=off must journal no red"
+unset GH_RUNS
+ok "(b2) MAIN_HEALTH_CI_GATE=off is independently byte-inert, decoupled from MAIN_HEALTH_TICK"
 
 # ── (c) JOURNAL-AUDIT: gates_passed_no_merge from a gates-passed marker with no later merge past TTL ──
 run_audit() {  # run_audit <journal-file> ; echoes the audit's journal_audit events on the SAME file
