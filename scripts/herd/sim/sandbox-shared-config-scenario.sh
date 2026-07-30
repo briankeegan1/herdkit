@@ -52,7 +52,7 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 ART=""; KEEP=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "sandbox-shared-config-scenario: --artifacts requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-shared-config-scenario: unknown arg: $1" >&2; exit 1 ;;

@@ -63,9 +63,9 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 STATE=""; N=10; KILL_AT=""; FRESH=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --state|--artifacts) STATE="${2:-}"; shift 2 ;;
-    -n|--items)          N="${2:-}"; shift 2 ;;
-    --kill-at)           KILL_AT="${2:-}"; shift 2 ;;
+    --state|--artifacts) [ $# -ge 2 ] || { echo "benchmark-drain: $1 requires a value" >&2; exit 1; }; STATE="$2"; shift 2 ;;
+    -n|--items)          [ $# -ge 2 ] || { echo "benchmark-drain: $1 requires a value" >&2; exit 1; }; N="$2"; shift 2 ;;
+    --kill-at)           [ $# -ge 2 ] || { echo "benchmark-drain: --kill-at requires a value" >&2; exit 1; }; KILL_AT="$2"; shift 2 ;;
     --fresh)             FRESH=1; shift ;;
     --real-builders)     echo "benchmark-drain: --real-builders not implemented in stub mode — see the herdkit-vs-harness EPIC in BACKLOG.md (live run = this harness with real builders + real limit resets)."; exit 0 ;;
     -h|--help)           grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

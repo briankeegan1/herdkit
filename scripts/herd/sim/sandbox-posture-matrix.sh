@@ -44,9 +44,9 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 ART=""; KEEP=""; ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "sandbox-posture-matrix: --artifacts requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
-    --posture)   ONLY="${2:-}"; shift 2 ;;
+    --posture)   [ $# -ge 2 ] || { echo "sandbox-posture-matrix: --posture requires a value" >&2; exit 1; }; ONLY="$2"; shift 2 ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-posture-matrix: unknown arg: $1" >&2; exit 1 ;;
   esac

@@ -95,7 +95,7 @@ run_sweep() {
 ART=""; KEEP=""; SWEEP=""; SWEEP_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "sandbox-real-remote-scenario: --artifacts requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
     --sweep)     SWEEP=1; shift ;;
     --yes)       SWEEP_YES=1; shift ;;

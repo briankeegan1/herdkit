@@ -34,7 +34,7 @@ SCENARIO="engine-operator-pause"
 ART=""; KEEP=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "engine-pause-scenario: --artifacts requires a value" >&2; exit 2; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep) KEEP=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac

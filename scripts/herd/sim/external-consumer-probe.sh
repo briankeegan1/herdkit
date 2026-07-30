@@ -26,7 +26,7 @@ HEALTHCHECK="$REPO_ROOT/scripts/herd/healthcheck.sh"
 ARTIFACTS=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ARTIFACTS="${2:-}"; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "external-consumer-probe: --artifacts requires a value" >&2; exit 2; }; ARTIFACTS="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
