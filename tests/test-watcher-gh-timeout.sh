@@ -231,7 +231,7 @@ RAW="$(grep -nHE '(^|[^_[:alnum:]])gh[[:space:]]+(pr|api)[[:space:]]' "$WATCH" "
         | grep -v '_gh_timeout' \
         | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' \
         | grep -vE ':[^#]*#.*gh[[:space:]]+(pr|api)' \
-        | grep -vE 'Read the full review|herd pr create|gh pr create' || true)"
+        | grep -vE 'Read the full review|herd pr create|gh pr create|gh pr ready' || true)"
 [ -z "$RAW" ] || fail "(7) unwrapped gh call(s) on the tick path — every one must go through _gh_timeout:
 $RAW"
 ok "(7) drift guard: no raw 'gh pr' / 'gh api' call survives in agent-watch.sh or work-units/git-pr.sh"

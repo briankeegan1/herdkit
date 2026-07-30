@@ -691,6 +691,27 @@ HERD_REPO="briankeegan1/herdkit"
 # nudge that does not land, or a SECOND stall after a delivered nudge, it escalates to a needs-you row
 # and stops (terminal — never a runaway loop). Unset (default) leaves this feature entirely off.
 # FINISH_STALL_MIN="30"
+#
+# HERD-432: the SAME lever also covers an idle builder over an unpromoted DRAFT PR (PR_FLOW=draft,
+# PR_READY_WHEN=builder) — a livelock the watcher's normal gate can never see, since it never gates a
+# draft. No new config key for detection: a draft PR is its own "unshipped work" signature. See
+# DRAFT_AUTO_PROMOTE below for the opt-in remedy.
+
+# ── Draft-PR promotion: the finish-line watchdog's remedy for HERD-432 ─────────────────────────
+# A draft PR left idle past FINISH_STALL_MIN cannot be fixed by nudging the builder's pane again — the
+# rendered task spec already says "promote it yourself with gh pr ready <pr#>" verbatim, and the
+# grounding incidents (PR #549, #550, 2026-07-29/30) show a builder overriding that clear instruction
+# with a plausible-but-wrong inference anyway. The remedy has to be engine-side and needs no live
+# agent pane at all, so it works even when the builder is limit-parked or dead.
+#
+# DRAFT_AUTO_PROMOTE — on, the watcher runs `gh pr ready <pr#>` itself the FIRST time a builder's
+# draft PR crosses FINISH_STALL_MIN idle, at most once per PR number ever (a human who deliberately
+# re-drafts a PR the engine already promoted is never fought with a second auto-promotion). A failed
+# attempt (or this lever left off) falls back to the SAME needs-you row/notification FINISH_STALL_MIN
+# already renders for the no-PR case. Ships DORMANT: off (default) is detection-and-surface only,
+# same as WEDGE_AUTOWAKE's own convention — turning this on is a SEPARATE opt-in from FINISH_STALL_MIN
+# itself, so an operator can run pure detection without the engine ever mutating a live PR.
+# DRAFT_AUTO_PROMOTE="off"   # off (default) | on
 
 # ── Post-bounce completion tracking (HERD-420) ──────────────────────────────────────────────
 # A refix wake (refix_wake_result woke=1) proves the builder's pane came back to "working" — not

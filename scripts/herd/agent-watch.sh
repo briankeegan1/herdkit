@@ -10895,10 +10895,11 @@ _finish_stall_dirty() {
 }
 
 # _classify_finish_stall <agent-status> <has-pr> <has-work> <limit-parked> <state> <first-seen> <now>
-# <grace> — the PURE verdict for a live, non-working, PR-less builder once FINISH_STALL_MIN is enabled.
-# Echoes exactly one token:
-#   NOT_STALLED  — an escape hatch holds (a PR; the agent is working; nothing pushable/uncommitted; or
-#                  the account usage limit is parking it) ⇒ the caller clears any record
+# <grace> [<is-draft>] — the PURE verdict for a live, non-working builder once FINISH_STALL_MIN is
+# enabled. Echoes exactly one token:
+#   NOT_STALLED  — an escape hatch holds (a REAL, non-draft PR; the agent is working;
+#                  nothing pushable/uncommitted; or the account usage limit is parking it) ⇒ the
+#                  caller clears any record
 #   PENDING      — the signature holds but has not yet persisted past <grace> ⇒ hold
 #   FIRST_STALL  — past grace, no re-task has fired yet for this anchor (<state> pending/empty) ⇒ the
 #                  caller should attempt the ONE re-task
@@ -10908,12 +10909,19 @@ _finish_stall_dirty() {
 #                  word fails toward INACTION, not toward "fresh, first crossing" (PR #502 review
 #                  advisory #4): the ladder considers a nudge already spent whenever it cannot PROVE
 #                  otherwise, mirroring the once-guard doctrine's "fail closed" default elsewhere.
-# <has-pr>/<has-work>/<limit-parked> are "1"/"0"; a non-numeric elapsed comparison never crashes because
-# <first-seen> empty is checked FIRST, short-circuiting the arithmetic.
+# <has-pr>/<has-work>/<limit-parked>/<is-draft> are "1"/"0"; a non-numeric elapsed comparison never
+# crashes because <first-seen> empty is checked FIRST, short-circuiting the arithmetic.
+#
+# <is-draft> (HERD-432, default "0" — every EXISTING 8-arg call site is byte-identical): a DRAFT PR
+# is never treated as an escape hatch the way a real PR is — a draft can never clear the gate on its
+# own, so "has a PR" alone must not short-circuit to NOT_STALLED when that PR is still a draft. The
+# caller (_reconcile_draft_stall) always passes has-pr=1 has-work=1 for this signature — the draft PR
+# itself IS the unshipped-work signature, no git probe needed — so the rest of the ladder (grace
+# window, PENDING/FIRST_STALL/SECOND_STALL/ESCALATED) runs identically to the no-PR case below it.
 _classify_finish_stall() {
   local astatus="$1" has_pr="${2:-0}" haswork="${3:-0}" limitp="${4:-0}" state="${5:-}" \
-        first_seen="$6" now="${7:-0}" grace="${8:-0}"
-  [ "$has_pr" = "1" ] && { printf 'NOT_STALLED'; return 0; }
+        first_seen="$6" now="${7:-0}" grace="${8:-0}" is_draft="${9:-0}"
+  if [ "$has_pr" = "1" ] && [ "$is_draft" != "1" ]; then printf 'NOT_STALLED'; return 0; fi
   case "$astatus" in done|idle) : ;; *) printf 'NOT_STALLED'; return 0 ;; esac
   [ "$haswork" = "1" ] || { printf 'NOT_STALLED'; return 0; }
   [ "$limitp" = "1" ] && { printf 'NOT_STALLED'; return 0; }
@@ -11241,6 +11249,157 @@ _reconcile_finish_stall() {
     ESCALATED) : ;;   # already surfaced (or an unrecognized state); keep rendering, never re-fire
   esac
   printf '%s' "$_rfs_verdict"
+}
+
+# ── Draft-PR finish-line watchdog (HERD-432) ──────────────────────────────────────────────────────
+# GROUNDED (2026-07-29/30, two independent builders, PR #549 + #550): a builder finishes real work,
+# commits, pushes, opens the PR as a DRAFT (PR_FLOW=draft), then goes idle believing the watcher's
+# gate will pick it up. It never does — the watcher never gates a draft PR, by design — so the item
+# sits In Progress indefinitely. _reconcile_finish_stall above cannot see this: its "unshipped work"
+# signature is worktree-scoped (uncommitted changes / commits ahead of origin), and this builder's
+# work IS fully pushed, so it reads as fully shipped. herd_why/finish_stall_scan report empty; WEDGE
+# and DEAD_BUILDER_AUTORESPAWN never fire (the agent is neither wedged nor dead by their signatures).
+#
+# THE FIX HAS TWO LEGS, per Rule 1 of docs/multi-seat-doctrine.md (reconcile every tick against
+# OBSERVED PR state, not a side effect of whichever path opened the PR):
+#   LEG A (detection) — extends the SAME FINISH_STALL_MIN lever + ladder above: a builder idle past
+#     grace over a PR that is STILL A DRAFT is a stall, exactly like the no-PR case, except the
+#     "unshipped work" signature is simply "a PR exists and is still draft" (no git probe needed —
+#     see _classify_finish_stall's <is-draft> parameter). No new config key for detection.
+#   LEG B (remedy) — CANNOT be "nudge the builder's pane again": the rendered task spec already says
+#     exactly the right thing ('promote it yourself with gh pr ready <pr#>') and both grounding
+#     incidents show a builder overriding that clear instruction with a plausible-but-wrong inference
+#     anyway (HERD-432's explicit correction to its own original diagnosis — rewording the spec is
+#     a NON-FIX). So FIRST_STALL's action here is PROMOTION ITSELF, run by the engine
+#     (_draft_promote_pr → `gh pr ready`) — an action that needs no live agent pane at all, so it
+#     works even when the builder is limit-parked or dead, exactly the failure mode that made the
+#     grounding incidents last hours. Ship-dormant on its OWN lever, DRAFT_AUTO_PROMOTE (default off,
+#     separate from FINISH_STALL_MIN): an operator can run detection/escalation alone, or opt into the
+#     engine also acting on it. With DRAFT_AUTO_PROMOTE off, or the one promotion attempt failing, the
+#     ladder falls back to the SAME needs-you escalation the no-PR leg uses.
+#
+# INDEPENDENT ANCHOR: keyed "draftpr:<slug>" in the SAME shared-pool store as the no-PR ladder
+# (_finish_stall_record etc. take an arbitrary identity string, not just a slug) but under its OWN
+# namespace — the two signatures are decoupled on purpose, each with its own clean PENDING → … →
+# ESCALATED lifecycle, so a slug that graduates from "no PR" (retasked) straight into "draft PR
+# opened" does not inherit the OTHER ladder's state word.
+#
+# ANTI-LOOP (idempotent, never fights a deliberate re-draft): promotion itself is additionally
+# guarded by _draft_promote_once, a PERMANENT once-per-PR-NUMBER guard (not anchor-scoped) — once the
+# engine has promoted PR #N, it never auto-promotes #N again, however many times a human re-drafts it
+# afterward. Detection/escalation still fires on a re-draft (so it is never silently invisible again),
+# it just never re-acts.
+
+# _draft_auto_promote_enabled — true iff DRAFT_AUTO_PROMOTE opts the auto-`gh pr ready` ACTION in.
+# DEFAULT OFF: only on|true|yes|1 enable it (mirrors _wedge_autowake_on's shape exactly). Detection +
+# escalation (leg A) fire regardless of this lever — this one gates ONLY the live PR mutation.
+_draft_auto_promote_enabled() {
+  case "${DRAFT_AUTO_PROMOTE:-off}" in
+    1|true|yes|on) return 0 ;;
+    *)             return 1 ;;
+  esac
+}
+
+# _draft_promote_once <pr#> — HERD-432 anti-loop guard: true iff the pool has NEVER auto-promoted this
+# EXACT PR NUMBER before. Permanent (not anchor-scoped, unlike _finish_stall_action_once) — a human who
+# deliberately re-drafts a PR the engine already promoted once is never fought with a second
+# auto-promotion, however long it later sits idle again. Fails OPEN (proceeds) when the store/python3
+# is unavailable, mirroring _finish_stall_action_once's own fail-open rationale for that narrow case.
+_draft_promote_once() {
+  local _dpo_pyp
+  _dpo_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_dpo_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_dpo_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --once "draft_promoted::$1" >/dev/null 2>&1
+  [ $? -ne 3 ]
+}
+
+# _draft_promote_pr <pr#> — the actual remedy: `gh pr ready`, timeout-wrapped like every other gh
+# mutation in this file. DRYRUN-first, exactly like _finish_stall_retask (never runs the real mutation
+# under a dry run, even when called directly). Fail-soft: any failure (network, permissions, the PR no
+# longer existing) returns 1 and changes nothing — the caller escalates instead of retrying in a loop.
+_draft_promote_pr() {
+  if [ -n "${DRYRUN:-}" ]; then
+    printf '🐑 (dry-run) would promote draft PR #%s\n' "$1" >&2
+    return 1
+  fi
+  _gh_timeout draft_promote pr ready "$1" >/dev/null 2>&1
+}
+
+# _reconcile_draft_stall <slug> <agent-status> <pr#> — the sibling ladder to _reconcile_finish_stall
+# for a builder whose PR IS open but stuck in DRAFT. Reuses the exact same classifier + bounded
+# two-rung ladder (via _classify_finish_stall's <is-draft>=1 leg) under its own namespaced anchor.
+# Echoes OFF | NOT_STALLED | PENDING | FIRST_STALL | SECOND_STALL | ESCALATED | PROMOTED.
+_reconcile_draft_stall() {
+  local _rds_slug="$1" _rds_astatus="$2" _rds_pr="$3" _rds_key
+  _finish_stall_enabled || { printf 'OFF'; return 0; }
+  _rds_key="draftpr:${_rds_slug}"
+  local _rds_now _rds_grace _rds_rec _rds_first="" _rds_state="" _rds_verdict _rds_mark_out \
+        _rds_mark_epoch _rds_mark_state _rds_promoted
+  _rds_now="$(_now)"
+  _rds_grace="$(_finish_stall_grace_secs)"
+  _rds_rec="$(_finish_stall_record "$_rds_key")"
+  if [ -n "$_rds_rec" ]; then IFS=$'\t' read -r _rds_first _rds_state <<< "$_rds_rec"; fi
+  # has-pr=1 has-work=1 limit-parked=0 is-draft=1: a draft PR is itself the unshipped-work signature —
+  # never git-diff based — and this action (unlike the no-PR ladder's pane nudge) needs no live agent,
+  # so a limit-parked or dead builder is never exempted the way it is above.
+  _rds_verdict="$(_classify_finish_stall "$_rds_astatus" 1 1 0 "$_rds_state" "$_rds_first" "$_rds_now" \
+    "$_rds_grace" 1)"
+  case "$_rds_verdict" in
+    NOT_STALLED)
+      [ -n "$_rds_first" ] && _finish_stall_clear "$_rds_key" ;;
+    PENDING)
+      if [ -z "$_rds_first" ]; then
+        _rds_mark_out="$(_finish_stall_mark "$_rds_key" "$_rds_now")"
+        IFS=$'\t' read -r _rds_mark_epoch _rds_mark_state <<< "$_rds_mark_out"
+        [ "$_rds_mark_epoch" = "$_rds_now" ] && \
+          journal_append finish_stall_anchor slug "$_rds_slug" first_seen "$_rds_now" reason draft_pr \
+            pr "$_rds_pr"
+      fi ;;
+    FIRST_STALL)
+      journal_append finish_stall_detected slug "$_rds_slug" first_seen "${_rds_first:-$_rds_now}" \
+        reason draft_pr pr "$_rds_pr"
+      if [ -n "${DRYRUN:-}" ]; then
+        _draft_promote_pr "$_rds_pr" >/dev/null
+      elif _finish_stall_action_once "$_rds_key" "${_rds_first:-$_rds_now}"; then
+        _rds_promoted=0
+        if _draft_auto_promote_enabled && _draft_promote_once "$_rds_pr" && _draft_promote_pr "$_rds_pr"; then
+          _rds_promoted=1
+        fi
+        if [ "$_rds_promoted" = "1" ]; then
+          _finish_stall_clear "$_rds_key"
+          journal_append draft_pr_promoted pr "$_rds_pr" slug "$_rds_slug"
+          herd_driver_notify "✅ draft PR promoted: ${_rds_slug}" \
+            "${_rds_slug}: PR #${_rds_pr} sat idle in draft past FINISH_STALL_MIN — promoted automatically, the gate takes it from here" default
+          printf 'PROMOTED'; return 0
+        else
+          _finish_stall_state "$_rds_key" escalated
+          journal_append finish_stall_escalated slug "$_rds_slug" reason "draft PR unpromoted" pr "$_rds_pr"
+          herd_driver_notify "⚠️ builder idle over an unpromoted draft PR: ${_rds_slug}" \
+            "${_rds_slug}: PR #${_rds_pr} has sat in draft past FINISH_STALL_MIN with the agent idle — promote it yourself with \`gh pr ready ${_rds_pr}\`" default
+        fi
+      fi ;;
+    SECOND_STALL)
+      if _finish_stall_action_once "$_rds_key" "escalate:${_rds_first:-$_rds_now}"; then
+        _finish_stall_state "$_rds_key" escalated
+        journal_append finish_stall_escalated slug "$_rds_slug" reason "draft PR still unpromoted" pr "$_rds_pr"
+        herd_driver_notify "⚠️ draft PR still unpromoted: ${_rds_slug}" \
+          "${_rds_slug}: PR #${_rds_pr} is still a draft — promote it yourself with \`gh pr ready ${_rds_pr}\`" default
+      fi ;;
+    ESCALATED) : ;;   # already surfaced; keep rendering, never re-fire
+  esac
+  printf '%s' "$_rds_verdict"
+}
+
+# _row_draft_stall <slug-cell> <pr-suffix> <age> — the needs-you row for a draft PR that outlived
+# FINISH_STALL_MIN with its builder idle and still unpromoted (DRAFT_AUTO_PROMOTE off, or its one
+# promotion attempt failed). Unlike _row_finish_stall this ladder has no calm 'retasked' variant — the
+# remedy either lands (PROMOTED, rendered separately by the caller) or it does not; there is no
+# partial-success rung to render calmly.
+_row_draft_stall() {
+  printf '    %s⚠️%s  %s%s%s%s %sneeds-you · draft PR stalled past grace · promote with `gh pr ready` · %s%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$1" "$C_RESET" "$2" "$C_RED" "$3" "$C_RESET"
 }
 
 # ── Serialized healthcheck gate ────────────────────────────────────────────────────────────────
@@ -13078,6 +13237,28 @@ EOF
     # see _finish_stall_note_pr_opened. ONE choke point covers every downstream has-PR branch
     # (mergeable, blocked, push-gate-awaiting, …).
     [ -n "$prnum" ] && _finish_stall_note_pr_opened "$slug"
+    # HERD-432 leg A: an idle builder over an UNPROMOTED DRAFT PR is the livelock no rail caught (PR
+    # #549/#550, 2026-07-29/30) — see _reconcile_draft_stall's header. Reconciled every tick against
+    # OBSERVED PR state (mstate), independent of the no-PR ladder above. The moment a PR leaves draft
+    # (promoted by the engine, the builder, or a human) its own namespaced anchor is dropped so a LATER
+    # re-draft starts a fresh detection cycle (the permanent per-PR once-guard inside
+    # _reconcile_draft_stall — not this anchor — is what stops the engine from re-promoting it).
+    _dstall=""
+    if [ "$dir" = "$SELF_WT" ]; then
+      : # $SELF_WT is exempt, same as every other automerge/gate decision — never act on this
+        # watcher's own checkout.
+    elif [ -n "$prnum" ] && [ "$mstate" = "DRAFT" ]; then
+      case "$astatus" in
+        done|idle) _dstall="$(_reconcile_draft_stall "$slug" "$astatus" "$prnum")" ;;
+      esac
+      case "$_dstall" in
+        PENDING)     _FSS_ELIGIBLE=$((_FSS_ELIGIBLE + 1)) ;;
+        PROMOTED)    _FSS_RETASKED=$((_FSS_RETASKED + 1)) ;;
+        FIRST_STALL|SECOND_STALL|ESCALATED) _FSS_ESCALATED=$((_FSS_ESCALATED + 1)) ;;
+      esac
+    elif [ -n "$prnum" ] && _finish_stall_enabled; then
+      _finish_stall_clear "draftpr:${slug}"
+    fi
     if [ -z "$prnum" ] && [ -n "$(push_gate_awaiting_sha "$slug" 2>/dev/null || true)" ]; then
       # PUSH_GATE=human (HERD-123): a FINISHED builder that stopped BEFORE push has NO PR yet but has
       # recorded a sha-keyed push-hold. Surface it as a 'ready · awaiting push approval' row with the
@@ -13251,6 +13432,19 @@ EOF
     elif [ "$dir" = "$SELF_WT" ]; then
       DISPLAY[i]="    ${C_DIM}🐑 ${sl} self · won't auto-merge${C_RESET}"
       FLAIR_STATE[i]="self"
+    elif [ "$_dstall" = "PROMOTED" ]; then
+      # HERD-432 leg B just ran `gh pr ready` this tick — mstate is still the STALE pre-promotion
+      # DRAFT read (fetched at the top of this tick); the next tick's fresh PRS_JSON re-classifies it
+      # normally (verifying mergeability → the ordinary candidate/blocked path).
+      DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}draft promoted · gate resumes${C_RESET}"
+      FLAIR_STATE[i]="busy"
+    elif [ "$_dstall" = "FIRST_STALL" ] || [ "$_dstall" = "SECOND_STALL" ] || [ "$_dstall" = "ESCALATED" ]; then
+      # HERD-432 leg A: past FINISH_STALL_MIN, still a draft, DRAFT_AUTO_PROMOTE off (or its one
+      # attempt failed) — needs-you, never the invisible 'blocked (DRAFT)' row this used to fall into.
+      _dsrec="$(_finish_stall_record "draftpr:${slug}")"; _dsfirst=""
+      [ -n "$_dsrec" ] && IFS=$'\t' read -r _dsfirst _ <<< "$_dsrec"
+      DISPLAY[i]="$(_row_draft_stall "$sl" "$pn" "$(_fmt_age "$(( $(_now) - ${_dsfirst:-$(_now)} ))")")"
+      FLAIR_STATE[i]="attention"
     elif [ "$mergeable" = "MERGEABLE" ] && { _should_automerge "$mstate" || _gate_bless_eligible "$prnum" "$headsha" "$mstate"; }; then
       # CLEAN → a normal merge candidate (run gates, then merge). BLOCKED-but-unblessed (HERD-194) → a
       # GATE-ONLY candidate: run the gates + post herd/gates so branch protection can clear, but the
