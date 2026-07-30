@@ -151,9 +151,12 @@ CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=
 # ROSTER_ALIVE=1 → a live resolve·<slug> row; 0 → a READABLE but EMPTY roster (positive absence);
 # blind → the '{}' herd_driver_agent_list_json falls back to when `herdr agent list` fails. HERD-206:
 # 'blind' must NEVER read as death — that fallback drove the false-dead respawn loop.
+# HERD-418: herdr ≥0.7.5 rejects the dotted role name outright, so the engine registers (and
+# `herdr agent list` echoes back) the SANITIZED form — never the pretty "resolve·<slug>" label. Fake
+# the roster the same way real herdr would, through the SAME sanitizer _resolver_roster_listed reads.
 set_roster() {
   case "$1" in
-    1)     AGENTS_JSON='{"result":{"agents":[{"name":"resolve·'"$SLUG"'","agent_status":"working"}]}}' ;;
+    1)     AGENTS_JSON='{"result":{"agents":[{"name":"'"$(herd_agent_name_sanitize "resolve·$SLUG")"'","agent_status":"working"}]}}' ;;
     blind) AGENTS_JSON='{}' ;;
     *)     AGENTS_JSON='{"result":{"agents":[]}}' ;;
   esac
