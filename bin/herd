@@ -5800,7 +5800,14 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
             warn "coordinator agent did not start — inspect tab ${coord_tab} (rest of the control room is still rebuilt)"
           fi
         else
-          warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  claude ${COORDINATOR_CMD}"
+          # HERD-428: name the operator's ACTUAL runtime (herd_driver_agent_runtime resolves the
+          # active driver's DRIVER_AGENT_ONESHOT_EXEC/INTERACTIVE_SPAWN binding's binary), not a
+          # hardcoded 'claude' — a non-Claude driver used to instruct the operator to run a binary
+          # their project does not use. Fail-soft: an unresolvable/absent binding falls back to
+          # 'claude', today's exact literal, so the default driver's message is byte-identical.
+          local _reload_rt; _reload_rt="$(herd_driver_agent_runtime 2>/dev/null || true)"
+          [ -n "$_reload_rt" ] || _reload_rt="claude"
+          warn "no coordinator agent is live in pane ${agent_pane} — start it yourself:  ${_reload_rt} ${COORDINATOR_CMD}"
         fi
       elif [ "$agent_live" -eq 1 ] && [ "$with_coordinator" -eq 1 ]; then
         warn "--with-coordinator: a coordinator agent is already live in pane ${agent_pane} — refusing to restart it (never kills a live coordinator implicitly); use 'herd pane coordinator' to relaunch it explicitly"

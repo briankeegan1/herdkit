@@ -503,3 +503,90 @@ the one-shot seam running `stub-agent` end-to-end, the byte-identical claude def
 degradation. `main` stays GREEN: every existing driver/exec test (`test-driver-agent-exec.sh`,
 `test-oneshot-exec-seam.sh`, `test-driver-abstraction.sh`, `test-model-matrix.sh`, `test-headless-driver.sh`)
 is unchanged because the default path is byte-identical.
+
+---
+
+## HERD-428: the pane-role process signature — the exec block's first real consumer
+
+The `DRIVER_AGENT_*` exec block (P1, above) was cataloged as **pure data**: "nothing renders or
+consumes these tokens yet." HERD-428 gives it its **first consumer**, and it is not one of the P2–P4
+routing phases — it is the **mux-side pane-role classifier**, `_reload_pane_role` in
+`scripts/herd/layout-reconcile.sh`.
+
+**The gap.** `_reload_pane_role` classifies a control-room pane by substring-matching its foreground
+process cmdline, in order: `backlog-view.sh` → `agent-watch.sh`/`herd-watch.sh` → the literal
+`'claude'`. Under `HERD_DRIVER=codex` or `HERD_DRIVER=grok` a live agent pane matches none of these and
+falls through to `busy` ("something else the human is running — never hijacked"), so the coordinator's
+own pane is never classified `agent`. This is the classifier every pane-mutating surface shares
+(`cmd_reload`, the `herd pane` subcommands, `coordinator.sh`) — one hardcoded literal broke agent
+classification everywhere at once, which is also why fixing it in the ONE shared function
+(`layout-reconcile.sh`) fixes every surface at once (see MULTI-SEAT AND INVARIANCE in the HERD-428 task
+spec) rather than patching each call site.
+
+### The design decision: a new sibling key inside the exec block, not a template substitution
+
+The fix needed a per-runtime **process signature** — the cmdline substring(s) that prove a live agent
+of that runtime is running in a pane. Two shapes were on the table:
+
+1. **A new `DRIVER_AGENT_PROCESS_SIGNATURE` key**, bound alongside the other seven `DRIVER_AGENT_*`
+   exec-class keys, read through the same `herd_driver_agent_value` reader.
+2. **Derive it from an existing binding** — `herd_driver_agent_runtime` already extracts the runtime
+   BINARY (the first whitespace token of `DRIVER_AGENT_ONESHOT_EXEC`/`INTERACTIVE_SPAWN`) for the P3/P6
+   one-shot seam, and for every shipped driver today that binary name (`claude`/`codex`/`grok`/
+   `stub-agent`) happens to equal the desired signature — so no new key would be needed at all.
+
+**Chose (1), a new sibling key.** Reasoning:
+
+- **Different contract, same block.** `herd_driver_agent_runtime`'s job is "what binary do I `exec`
+  to spawn/query this runtime" — an EXEC-composition concern. `PROCESS_SIGNATURE`'s job is "what
+  substring proves a LIVE process in someone else's pane belongs to this runtime" — a
+  CLASSIFICATION/OBSERVATION concern. They read the same underlying fact for every driver shipped so
+  far, but they are not guaranteed to stay equal: a runtime could ship as a wrapper script
+  (`codex` invoking a differently-named subprocess, an npm shim, a `node dist/cli.js` entry point)
+  whose spawned binary name differs from what actually shows up in a pane's foreground `cmdline`. Reusing
+  the exec-binary token would silently couple pane classification to spawn composition — a future driver
+  author fixing one would unknowingly break the other. A dedicated key keeps the two contracts
+  independent, exactly as `DRIVER_AGENT_LIMIT_PATTERN` (a banner-text contract) stays a separate key from
+  `DRIVER_AGENT_RESUME` (a spawn-shape contract) even though both are "about" the same runtime.
+- **It belongs in the exec block, not a new namespace.** The alternative to "inside the block" was a
+  wholly separate top-level capability (mux-namesped, alongside `DRIVER_LIST_AGENTS` etc.), since the
+  *consumer* (`layout-reconcile.sh`) is mux-side code. Rejected: the mux (`herdr`) is IDENTICAL across
+  every shipped driver — `DRIVER_LIST_AGENTS` et al. are byte-for-byte the same string in
+  `herdr-claude.driver`, `codex.driver`, `grok.driver`. What varies per driver is which RUNTIME's
+  process a pane holds, which is exactly the axis the `DRIVER_AGENT_*` block already carries (spawn
+  shape, permission flag, limit banner, cost schema — all runtime-identity data). `PROCESS_SIGNATURE`
+  is one more fact about "how do I recognize this runtime", so it belongs with its siblings.
+- **Reuses the existing reader with no new plumbing.** `herd_driver_agent_process_signature` in
+  `scripts/herd/driver.sh` is a two-line wrapper around `herd_driver_agent_value`, the same PURE,
+  fail-soft grep-reader every other exec-class accessor (`herd_driver_agent_limit_pattern`,
+  `herd_driver_lane_permission_flags`, …) already uses — no new parsing, no new file format.
+
+**Format convention.** `DRIVER_AGENT_PROCESS_SIGNATURE` is a **space-separated list of literal
+substrings** (mirrors `DRIVER_AGENT_COST_USAGE_KEYS`'s space-separated key-list convention), matched by
+plain `in` against a pane's foreground cmdline — **not** `DRIVER_AGENT_LIMIT_PATTERN`'s pipe-alternation
+regex convention. The pane-cmdline classifier (`_reload_pane_role`'s `has(*subs)`) has always done
+literal substring matching, never regex; keeping the new binding in that same shape means a driver
+author never has to escape regex metacharacters just to name a binary, and the fail-soft default
+(`'claude'`) degrades identically whichever way a caller happens to split it.
+
+**Byte-identical / fail-soft.** `herdr-claude.driver` binds `DRIVER_AGENT_PROCESS_SIGNATURE='claude'` —
+the exact literal `_reload_pane_role` matched before this change. `herd_driver_agent_process_signature`
+falls back to `'claude'` when the binding, the driver file, or `driver.sh` itself (not sourced by a
+caller) is absent, so every existing caller of `_reload_pane_role` — including any that predates
+`driver.sh` being sourced — classifies exactly as before. `codex.driver`/`grok.driver` bind their own
+runtime name (`'codex'`/`'grok'`); `stub.driver` binds `'stub-agent'`, proving the seam is portable, not
+claude-wired.
+
+**The reload-hint literal (`bin/herd`, `cmd_reload`).** The same audit found a second hardcoded
+`claude` literal: when no coordinator agent is live and `--with-coordinator` was not passed, the reload
+warning told the operator to run `claude <COORDINATOR_CMD>` unconditionally. This now resolves the
+runtime name via the EXISTING `herd_driver_agent_runtime` accessor (the exec-composition one, not the
+new classification key — this call site genuinely wants "what binary would I type", which is exactly
+`herd_driver_agent_runtime`'s contract) instead of a literal, with the same `'claude'` fail-soft
+fallback. `--with-coordinator`'s own start leg (`_pane_agent_start` → `herd_driver_launch_agent`) and its
+refuse-when-live message were audited too — neither hardcodes a runtime name; the start leg was already
+driver-aware (P2) and the refuse message never named a binary.
+
+Proof: `tests/test-layout-reconcile.sh` (classification for a claude pane / a codex pane / a bare shell,
+via a synthetic `DRIVER_AGENT_PROCESS_SIGNATURE` binding) and `tests/test-codex-driver.sh` (the codex
+driver binds its own signature, zero-secret, non-empty).

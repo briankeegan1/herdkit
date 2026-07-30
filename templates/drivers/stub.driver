@@ -42,3 +42,6 @@ DRIVER_AGENT_PERMISSION_FLAG='--auto-approve'
 DRIVER_AGENT_LIMIT_PATTERN='rate limit|quota exceeded|please wait'
 DRIVER_AGENT_SESSION_ID='${STUB_TRANSCRIPT_ROOT:-$HOME/.stub-agent/sessions}/<cwd:tr-/.-to-dash>/*.jsonl'
 DRIVER_AGENT_COST_USAGE_KEYS='prompt_tokens completion_tokens'
+# process-signature (HERD-428) — names the NON-CLAUDE stub-agent runtime, proving the pane-role probe
+# is portable, not claude-wired. See driver.sh's herd_driver_agent_process_signature.
+DRIVER_AGENT_PROCESS_SIGNATURE='stub-agent'

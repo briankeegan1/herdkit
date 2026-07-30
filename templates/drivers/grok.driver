@@ -86,3 +86,9 @@ DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.grok/sessions}/<session-
 # table are not a verifiable stable contract here. Fail-safe: names no real field → cost.sh sums
 # nothing and marks the model `unpriced` rather than reporting a fabricated $0.
 DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-grok-usage-token-schema'
+# process-signature (HERD-428) — the pane-cmdline substring(s) that identify a LIVE Grok agent in a
+# pane's foreground process list; the control-room pane-role probe (layout-reconcile.sh
+# _reload_pane_role) reads this instead of a hardcoded 'claude' literal, so a grok pane classifies as
+# 'agent' rather than falling through to 'busy'. Space-separated substrings, matched by plain `in`
+# (never a regex) — see driver.sh's herd_driver_agent_process_signature.
+DRIVER_AGENT_PROCESS_SIGNATURE='grok'

@@ -172,4 +172,37 @@ layout_fold_stray_tabs w1 herdtest
 [ ! -f "$S/tabs/tBs" ] || fail "fold: stray backlog-herdtest tab not closed"
 ok
 
+# ── 8. DRIVER-AWARE pane-role classification (HERD-428) ──────────────────────
+# _reload_pane_role's 'agent' branch used to substring-match the LITERAL 'claude', so a codex/grok
+# agent pane fell through to 'busy' (never 'agent') under a non-Claude HERD_DRIVER. It now reads the
+# ACTIVE driver's DRIVER_AGENT_PROCESS_SIGNATURE (scripts/herd/driver.sh's
+# herd_driver_agent_process_signature) instead. Source the REAL driver.sh (functions only, no side
+# effects) so the signature resolves against the REAL templates/drivers/*.driver files — proving this
+# against the shipped codex.driver, not a test double.
+# shellcheck source=/dev/null
+. "$HERE/../scripts/herd/driver.sh"
+
+S="$T/s8"; mkdir -p "$S"; export HERDR_STATE="$S"
+_pane "$S" pClaude tC 'claude --model x /coordinator'
+_pane "$S" pCodex  tC 'codex --model x --dangerously-bypass-approvals-and-sandbox hello'
+_pane "$S" pBare   tC ''
+
+# BYTE-IDENTICAL default: HERD_DRIVER unset resolves to herdr-claude, so classification is unchanged —
+# a claude pane is 'agent', a bare pane is 'bare', and (since the default signature is only 'claude') a
+# codex pane is NOT recognized as this driver's agent.
+unset HERD_DRIVER
+[ "$(_reload_pane_role pClaude)" = "agent" ] || fail "driver-aware: default driver did not classify a claude pane as agent"
+[ "$(_reload_pane_role pBare)"   = "bare"  ] || fail "driver-aware: default driver did not classify an empty pane as bare"
+[ "$(_reload_pane_role pCodex)"  = "busy"  ] || fail "driver-aware: default driver should not recognize a codex process as its own agent"
+
+# HERD_DRIVER=codex: a codex pane now classifies 'agent' (the gap this ships fixes) — the codex.driver
+# DRIVER_AGENT_PROCESS_SIGNATURE binding is consulted for real. A claude pane is correspondingly NOT
+# this driver's agent (scoped to the ACTIVE driver, not a blanket match), and a bare pane is unaffected.
+export HERD_DRIVER=codex
+[ "$(_reload_pane_role pCodex)"  = "agent" ] || fail "driver-aware: HERD_DRIVER=codex did not classify a codex pane as agent"
+[ "$(_reload_pane_role pClaude)" = "busy"  ] || fail "driver-aware: HERD_DRIVER=codex should not recognize a claude process as its own agent"
+[ "$(_reload_pane_role pBare)"   = "bare"  ] || fail "driver-aware: HERD_DRIVER=codex misclassified a bare pane"
+unset HERD_DRIVER
+ok
+
 echo "ALL PASS ($pass checks)"

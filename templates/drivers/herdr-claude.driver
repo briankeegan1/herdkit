@@ -42,6 +42,11 @@ DRIVER_AGENT_PERMISSION_FLAG='--dangerously-skip-permissions'
 DRIVER_AGENT_LIMIT_PATTERN='usage limit|session limit|hit your (usage|session) limit'
 DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/<cwd:tr-/.-to-dash>/*.jsonl'
 DRIVER_AGENT_COST_USAGE_KEYS='input_tokens output_tokens cache_creation_input_tokens cache_read_input_tokens'
+# process-signature (HERD-428) — the pane-cmdline substring(s) that identify a LIVE agent of this
+# runtime in a pane's foreground process list; the control-room pane-role probe (layout-reconcile.sh
+# _reload_pane_role) reads this instead of a hardcoded literal. Space-separated substrings, matched by
+# plain `in` (never a regex) — see driver.sh's herd_driver_agent_process_signature.
+DRIVER_AGENT_PROCESS_SIGNATURE='claude'
 
 # ── Agent-runtime UPDATE bindings (HERD-149 — the AGENT_UPDATE knob) ───────────────────────────────
 # The runtime-specific data the AGENT_UPDATE mechanism (scripts/herd/agent-update.sh) needs to keep
