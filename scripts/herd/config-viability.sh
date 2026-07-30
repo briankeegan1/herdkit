@@ -417,7 +417,14 @@ _cv_doctor_render_rows() {
   esac
   herd_config_viability_note DRIVER_CLI "" "$status" "$msg" doctor
   [ "$any" -eq 1 ] || printf '  \xe2\x9c\x93 no externally-coupled config keys resolve a value in this project.\n'
-  printf '  \033[2m(advisory — probes read live GitHub / PATH state each run; an offline probe warns, never blocks)\033[0m\n'
+  # The advisory footnote is DIM via the theme palette, never a hardcoded escape (HERD-439): a raw
+  # \033[2m ignored HERD_THEME and, worse, kept emitting the escape under NO_COLOR / a non-TTY, so a
+  # piped or redirected `herd doctor` carried control bytes into the capture. C_DIM/C_RESET are
+  # blanked by theme.sh on exactly those surfaces. Both are `:-`-defaulted so a caller that sourced
+  # this file WITHOUT loading a palette (the probes are also driven from `herd config set`) degrades
+  # to plain text rather than tripping `set -u` — the fail-soft rule for a cosmetic key.
+  printf '  %s(advisory — probes read live GitHub / PATH state each run; an offline probe warns, never blocks)%s\n' \
+    "${C_DIM:-}" "${C_RESET:-}"
 }
 
 # herd_config_viability_doctor_section — the "Config viability (external consistency)" doctor section.

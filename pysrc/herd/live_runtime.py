@@ -2880,6 +2880,21 @@ class LiveTick:
 
         # 6. apply — the ONLY step that actuates (and only under LiveActuator).
         if action == "MERGE":
+            # HUMAN_VERIFY_POLICY=auto (HERD-59, restored in HERD-439): a PR that DECLARED HUMAN-VERIFY
+            # steps merges on green with those steps recorded as INFORMATIONAL — the journal line is what
+            # makes it explicit and auditable that they were never human-executed. Bash journaled this
+            # right before do_merge (agent-watch.sh `_tick_act`); HERD-306 P5b deleted the bash action
+            # pass and the port never re-emitted it, leaving `human_verify_policy` a CONSUMER-ONLY event
+            # (journal-audit.sh's §5.4 reader and fixture_extract.py's HV_HOLD mapping both still parse
+            # it) with no producer — so an auto-merged human-verify PR left no forensic trace at all.
+            # Once per (pr, sha), mirroring bash's hv_informed_noted/record_hv_informed ledger guard.
+            # STRICTLY INERT on the default policy: HUMAN_VERIFY_POLICY=hold never reaches this branch
+            # with hv_hold set (hold_decision returns HOLD), so the default stream is byte-identical.
+            if cand.hv_hold and self._hv_policy == "auto" \
+                    and self.state.once(cand.pr, cand.sha, "hv_informed"):
+                self.journal.append("human_verify_policy", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "policy", "auto",
+                                    "action", "merged-with-declared-steps")
             if self.actuator.merge(cand):
                 self.state.clear_merge_refusal(cand.pr, cand.sha)
                 self.actuator.reap(cand)          # reap-on-merge (contract §6.1)
@@ -2899,8 +2914,17 @@ class LiveTick:
             return HOLD                            # stay BLESSED, re-attempt next tick
         if action == "HOLD":
             if self.state.once(cand.pr, cand.sha, "hold"):
-                self.journal.append("hold_applied", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                    "kind", "approval" if self._merge_policy == "approve" else "human-verify")
+                fields = ["pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                          "kind", "approval" if self._merge_policy == "approve" else "human-verify"]
+                # HUMAN_VERIFY_POLICY=coordinator (HERD-59, restored in HERD-439): still a HOLD, but the
+                # hold event carries the policy so a post-mortem can tell a coordinator-actionable hold
+                # (a coordinator/agent is expected to run the steps, then approve) from a plain
+                # human-verify hold waiting on a person. Bash appended exactly this field to
+                # hold_applied; HERD-306 P5b dropped it with the bash action pass. Absent on the
+                # default policy, so a `hold`-policy hold_applied line stays byte-identical.
+                if cand.hv_hold and self._hv_policy == "coordinator":
+                    fields += ["human_verify_policy", "coordinator"]
+                self.journal.append("hold_applied", *fields)
             return HOLD
         # OBSERVE — observe mode never merges.
         if self.state.once(cand.pr, cand.sha, "observe"):

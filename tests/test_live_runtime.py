@@ -191,6 +191,47 @@ class TestGateOutcomes(LiveCase):
         out, _ = self._out(review="PASS", health="CLEAN", hv_hold=True)
         self.assertEqual(out, "HOLD")
 
+    # ── HUMAN_VERIFY_POLICY forensics (HERD-59, restored HERD-439) ────────────────────────────────
+    # HERD-306 P5b deleted the bash action pass and the port never re-emitted the two policy-keyed
+    # journal surfaces bash carried, so `human_verify_policy` became a consumer-only event (read by
+    # journal-audit.sh §5.4 and fixture_extract.py, produced by nobody). A hold or an auto-merge that
+    # leaves no forensic trace is invisible to exactly the post-mortem that would explain it, so both
+    # emissions are pinned here BEHAVIORALLY — and pinned OFF on the default policy.
+
+    def test_default_hold_policy_hold_applied_carries_no_policy_field(self):
+        # Byte-identical-when-off: HUMAN_VERIFY_POLICY unset (=hold) must emit today's exact event.
+        out, ev = self._out(review="PASS", health="CLEAN", hv_hold=True)
+        self.assertEqual(out, "HOLD")
+        held = [o for o in ev if o["event"] == "hold_applied"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["kind"], "human-verify")
+        self.assertNotIn("human_verify_policy", held[0])
+
+    def test_coordinator_policy_hold_applied_names_the_policy(self):
+        out, ev = self._out(review="PASS", health="CLEAN", hv_hold=True,
+                            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "coordinator"})
+        self.assertEqual(out, "HOLD")            # coordinator STILL holds — it is not an auto-merge
+        held = [o for o in ev if o["event"] == "hold_applied"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["human_verify_policy"], "coordinator")
+
+    def test_auto_policy_merges_and_journals_the_declared_steps(self):
+        out, ev = self._out(review="PASS", health="CLEAN", hv_hold=True,
+                            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"})
+        self.assertEqual(out, "MERGE")
+        hv = [o for o in ev if o["event"] == "human_verify_policy"]
+        self.assertEqual(len(hv), 1)
+        self.assertEqual(hv[0]["policy"], "auto")
+        self.assertEqual(hv[0]["action"], "merged-with-declared-steps")
+        self.assertEqual(str(hv[0]["pr"]), "1")
+
+    def test_auto_policy_silent_when_the_pr_declared_no_steps(self):
+        # No HUMAN-VERIFY block => nothing was skipped => no event to record.
+        out, ev = self._out(review="PASS", health="CLEAN",
+                            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"})
+        self.assertEqual(out, "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "human_verify_policy"])
+
     def test_approve_policy_holds_without_approval(self):
         out, _ = self._out(review="PASS", health="CLEAN", config={"MERGE_POLICY": "approve"})
         self.assertEqual(out, "HOLD")

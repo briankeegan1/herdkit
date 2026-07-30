@@ -20,13 +20,41 @@
 # own findings filed via `herd note` (journal) for a follow-up item; see the HERD-437 PR body for
 # the full per-test evidence and the exact failing assertion. Do not remove one of these without
 # re-running it and seeing a real, reproducible pass first.
-test-cli-pane.sh
-test-codemap-reconcile.sh
-test-config-manifest.sh
+#
+# HERD-439 (2026-07-30): repaired 7 of those 10 and wired them in (rows removed). Each was diagnosed
+# with evidence before any assertion was touched — two turned out to be REAL engine/test defects, not
+# drift:
+#   • test-cli-pane.sh            — genuinely UNBOUNDED hang, not the HERD-440 too-many-spawns shape:
+#                                   check 5d drove `herd pane watch`'s HERD-322 background fallback,
+#                                   which launched a REAL agent-watch.sh daemon that outlived the
+#                                   `$(…)` capturing it. HERD_HERMETIC_GUARD (HERD-189) now stops the
+#                                   launch and the run is ~13s. Also stopped orphaning a `sleep 9999`
+#                                   per run — those orphans were the decoy the HERD-437 note read as
+#                                   the cause.
+#   • test-human-verify-policy.sh — the failing assertion was RIGHT: HERD-306 P5b deleted the bash
+#                                   action pass and the Python port never re-emitted the two
+#                                   `human_verify_policy` journal surfaces, leaving a consumer-only
+#                                   event. Restored in the engine core, pinned behaviorally in
+#                                   tests/test_live_runtime.py.
+#   • test-pr-match-truth.sh      — stale STRUCTURE, correct behavior: HERD-323 (094168e) hoisted the
+#                                   tick body into _tick_render_reconcile above the lib return, so the
+#                                   fetch call moved. Proven by a swap-only bisect of agent-watch.sh.
+#   • test-config-manifest.sh     — false DEAD key: the scan was bash-only and could not see the
+#                                   Python core, where DOC_APPLY_PATH_GLOB is genuinely read.
+#   • test-codemap-reconcile.sh   — the test itself was pipe-unsafe (`git log | grep -q` under
+#                                   pipefail, HERD-299 class), failing deterministically on a match
+#                                   in the first line.
+#   • test-review-verdict-integrity.sh — RETRY behavior confirmed intact; only the console wording it
+#                                   grepped for died with the bash action pass.
+#   • test-seam-conformance.sh    — config-viability.sh migrated off a raw ANSI escape onto the theme
+#                                   palette (the grandfather list is shrink-only, so no new row); that
+#                                   unblocked B4, which then caught retirement.sh journaling without
+#                                   declaring where journal_append comes from.
+#
+# The 3 rows below are the HERD-437 INCONCLUSIVE set, deliberately left exempt. They fail on the
+# maintainer's box ONLY because a live herdr socket is present and context-guard.sh's real-pane-
+# mutation refusal (HERD-310) correctly fires — a property of the machine, not of the tests. They must
+# be re-verified on a host with NO herdr socket (or in CI) and wired in only if they pass there.
 test-dead-builder-respawn.sh
-test-human-verify-policy.sh
-test-pr-match-truth.sh
 test-review-pane-v2.sh
-test-review-verdict-integrity.sh
 test-scoped-builder-verification.sh
-test-seam-conformance.sh

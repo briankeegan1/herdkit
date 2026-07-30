@@ -128,22 +128,51 @@ ok
 # ── (6) ratchet: the old `|| echo '[]'` collapse is gone from the tick's pr-list fetch ────────────
 # The pre-fix one-liner is the exact bug. _prs_fetch_tick (or any successor) must capture rc; the
 # bare `|| echo '[]'` form on the tick path must not return.
-if grep -nE 'gh pr list.*\|\| *echo' "$WATCH" | grep -q '_watcher_tick_fields\|PRS_JSON'; then
-  # Only fail if the collapse is still wired to the tick fields / PRS_JSON assignment path.
-  leaked="$(grep -nE 'PRS_JSON=.*gh pr list.*\|\| *echo|gh pr list --json "\$\(_watcher_tick_fields\)".*\|\| *echo' "$WATCH" || true)"
-  [ -z "$leaked" ] || fail "(6) tick still collapses failed gh pr list via || echo:
+#
+# HERD-439: this check used to grep for the _prs_fetch_tick CALL SITE textually BELOW the
+# AGENT_WATCH_LIB return, i.e. it assumed the tick's fetch is inlined in the live `while true` loop.
+# HERD-323 (094168e, 2026-07-10) factored the whole tick body into _tick_render_reconcile, defined
+# ABOVE that return so the unit tests can drive it — so the call moved above the return while the
+# shipped behavior stayed identical (proven by swapping ONLY agent-watch.sh at 094168e^/094168e with
+# this test held constant: green -> red at exactly that commit, fetch still called every tick). The
+# invariant is therefore a TWO-HOP one, and is asserted structurally rather than by line position:
+# the live loop calls the tick body, and the tick body calls _prs_fetch_tick — with the `|| echo`
+# collapse absent from BOTH. Derived, never hard-coded to a function name, so a future rename of the
+# tick entry re-points the ratchet instead of silently un-gating it.
+#
+# Every scan below reads $WATCH (a FILE) or a here-string, never `<producer> | grep -q`: agent-watch.sh
+# is far past the pipe buffer, and the early-exit consumer would EPIPE its producer under pipefail
+# (HERD-299) — the same trap this file's own `set -o pipefail` would turn into a false red.
+leaked="$(grep -nE 'PRS_JSON=.*gh pr list.*\|\| *echo|gh pr list --json "\$\(_watcher_tick_fields\)".*\|\| *echo' "$WATCH" || true)"
+[ -z "$leaked" ] || fail "(6) tick still collapses failed gh pr list via || echo:
 $leaked"
-fi
-# Positive: _prs_fetch_tick is what the main loop must call (not the inlined collapse).
+# Positive: _prs_fetch_tick is what the tick path must call (not the inlined collapse).
 grep -q '_prs_fetch_tick' "$WATCH" || fail "(6) _prs_fetch_tick must exist in agent-watch.sh"
-# The live loop (below the LIB return) must call it — not reintroduce the collapse inline.
-loop_fetch="$(awk '/^if \[ "\$\{AGENT_WATCH_LIB:-\}" = "1" \]; then return/,0' "$WATCH" | grep -n 'gh pr list\| _prs_fetch_tick' || true)"
-printf '%s' "$loop_fetch" | grep -q '_prs_fetch_tick' \
-  || fail "(6) main loop must call _prs_fetch_tick, loop refs:
-$loop_fetch"
-printf '%s' "$loop_fetch" | grep -E 'gh pr list.*\|\| *echo' \
-  && fail "(6) main loop still has gh pr list || echo collapse:
-$loop_fetch"
+
+# Hop 1: the live loop (below the LIB return) runs a tick-entry function — capture its NAME.
+loop_body="$(awk '/^if \[ "\$\{AGENT_WATCH_LIB:-\}" = "1" \]; then return/,0' "$WATCH")"
+tick_fn="$(awk '/^while true; do/{f=1; next} f && /^done/{exit}
+                f && /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$/{gsub(/[[:space:]]/,""); print; exit}' \
+           <<< "$loop_body")"
+[ -n "$tick_fn" ] || fail "(6) could not locate the watcher tick entry called by the live loop"
+# The loop itself must not re-inline the roster fetch: nothing below the LIB return may assign the
+# tick's PRS_JSON/PRS_LOOKUP_OK globals. (A bare `gh pr list` mention below the return is NOT a
+# violation — an unrelated interval constant documents the post-merge sweep's own one-shot list in a
+# trailing comment, so matching the command name alone would false-red on prose.)
+grep -qE '^[^#]*PRS_(JSON|LOOKUP_OK)=' <<< "$loop_body" \
+  && fail "(6) the live loop must not inline the roster fetch — it belongs in $tick_fn"
+
+# Hop 2: that tick entry must call _prs_fetch_tick, and must not carry the collapse.
+tick_body="$(awk -v fn="$tick_fn" '$0 ~ "^"fn"\\(\\)"{f=1} f{print} f && /^}$/{exit}' "$WATCH")"
+[ -n "$tick_body" ] || fail "(6) could not read the body of the tick entry $tick_fn"
+# A CALL in command position, never a mention: the rationale comment directly above the call site
+# names _prs_fetch_tick five times, so a bare substring grep would keep passing after the call itself
+# was deleted (verified by mutation: replacing the call with an inline fetch left the comment, and the
+# substring form still went green).
+grep -qE '^[[:space:]]*_prs_fetch_tick([[:space:]]|$)' <<< "$tick_body" \
+  || fail "(6) the tick entry $tick_fn must CALL _prs_fetch_tick (a comment mention is not a call)"
+grep -qE '^[^#]*gh pr list.*\|\| *echo' <<< "$tick_body" \
+  && fail "(6) the tick entry $tick_fn still has a gh pr list || echo collapse"
 ok
 
 echo "ALL PASS ($pass checks)"

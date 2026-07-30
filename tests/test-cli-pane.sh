@@ -185,8 +185,32 @@ exit 0
 STUB
 chmod +x "$RICH/herdr"
 
+# HERD-439 — WHY THIS FILE NEEDS THE HERMETIC GUARD, and why it used to hang forever.
+#
+# The header above claims "no real process ever spawns". That was true when it was written, and it
+# stopped being true when HERD-322 added a background-relaunch FALLBACK to `herd pane watch`: when the
+# watcher does not appear in its pane, cmd_pane_watch runs `nohup bash agent-watch.sh &` directly.
+# Check 5d deliberately drives exactly that path (it seeds a never-started "junk" watcher), so every
+# run of this test launched a REAL agent-watch.sh daemon against the fixture project — which then
+# outlived the `$(…)` capturing it and wedged the test on a pipe that never reached EOF. Measured: no
+# progress at all past 5d at 300s, with only 4s of CPU burned — i.e. BLOCKED, not slow.
+#
+# That distinguishes this from HERD-440's finding on the sibling test-cli-reload.sh, whose timeout WAS
+# just too many real subprocess spawns for a 120s cap. Raising the cap would never have fixed this one;
+# the leaked daemon is unbounded. (Its orphaned `sleep 9999` children reparenting to PID 1 are the same
+# benign `timeout`-SIGTERM fallout HERD-440 already ruled out as a cause, not a second problem.)
+#
+# HERD_HERMETIC_GUARD is the engine's designed answer: agent-watch.sh's HERD-189 guard is the single
+# choke point EVERY launch path funnels through — its own docstring names `herd pane watch` as one of
+# them — and it records the attempt then exits BEFORE the loop. So the fallback is still exercised and
+# still asserted, but no daemon survives it. The guard log is asserted at the end of this file, so a
+# leak becomes a loud, named failure instead of a hang.
+HERMETIC_LOG="$T/hermetic-leaks.tsv"
+export HERD_HERMETIC_GUARD="$HERMETIC_LOG"
+
 # _pane_run PROJECT STATE SUB [env VAR=VAL ...] [-- extra args] — run `herd pane SUB` against the
-# rich stub. Non-interactive (HERD_NONINTERACTIVE=1) and hermetic (no real process ever spawns).
+# rich stub. Non-interactive (HERD_NONINTERACTIVE=1) and hermetic: the herdr stub only RECORDS pane
+# ops, and HERD_HERMETIC_GUARD stops the one path that would otherwise spawn a real watcher.
 _pane_run() {
   local proj="$1" state="$2" sub="$3"; shift 3
   local envs=() args=()
@@ -198,7 +222,7 @@ _pane_run() {
   done
   ( cd "$proj" && env PATH="$RICH:$PATH" HERDR_STATE="$state" FAKE_WS_LABEL="panetest" \
       HERD_NONINTERACTIVE=1 HERD_RELOAD_PANE_POLLS=2 HERD_RELOAD_VERIFY_POLLS=2 \
-      HERD_RELOAD_LOCKPID_POLLS=1 \
+      HERD_RELOAD_LOCKPID_POLLS=1 HERD_HERMETIC_GUARD="$HERMETIC_LOG" \
       ${envs[@]+"${envs[@]}"} bash "$HERD" pane "$sub" ${args[@]+"${args[@]}"} 2>&1 )
 }
 
@@ -268,7 +292,13 @@ ok
 P="$T/p3"; mkdir "$P"; _make_project "$P" "panetest"; R3="$(cd "$P" && pwd -P)"
 S="$T/s3"; _coord_state "$S" "$R3"
 lockfile="$R3/trees/.watcher-panetest.pid"
-( trap '' TERM; sleep 9999 ) & STUBBORN=$!
+# The fake watcher parks in a SHORT-sleep loop, not one `sleep 9999` (HERD-439). $! is the subshell,
+# and a long-sleeping child does NOT die with it — `kill -9 $STUBBORN` below orphaned a 2h47m
+# `sleep 9999` onto PID 1 on every single run. Those orphans are what the HERD-437 note saw and read
+# as evidence of a hang; the real hang was elsewhere (see the HERD_HERMETIC_GUARD note above), so the
+# decoy is worth removing outright. Same properties the check needs — TERM is ignored, `kill -0`
+# succeeds, SIGKILL ends it — and any child left behind self-exits within a second.
+( trap '' TERM; while :; do sleep 1; done ) & STUBBORN=$!
 printf '%s\n' "$STUBBORN" > "$lockfile"
 set +e
 out="$(_pane_run "$P" "$S" watch HERD_RELOAD_SIGTERM_POLLS=3)"
@@ -501,6 +531,21 @@ set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail outside any git repo"
 printf '%s' "$out" | grep -qi "no .herd/config" || fail "missing-config error not clear outside a repo"
 printf '%s' "$out" | grep -qi "dogfood" || fail "should mention refusing the dogfood fallback outside a repo"
+ok
+
+# ── 13. HERMETICITY LEDGER (HERD-439): the watcher-launch guard did its job ───────────────────────
+# Two claims, both load-bearing, both previously unasserted:
+#   • The HERD-322 background fallback IS still exercised — check 5d's junk watcher must drive
+#     cmd_pane_watch into launching agent-watch.sh. A guard log with no rows would mean the fallback
+#     quietly stopped firing and 5d had decayed into asserting nothing.
+#   • Every such launch was CAUGHT at the guard rather than becoming a live daemon. The guard exits
+#     before the watch loop, so a row here is proof of a launch that was stopped, not one that ran.
+# Rows are "<script>\t<workspace>\t<cwd>"; only this fixture's workspace may appear.
+[ -s "$HERMETIC_LOG" ] \
+  || fail "no watcher launch was intercepted — the HERD-322 background fallback (check 5d) no longer fires, so this file's hermeticity is untested"
+grep -qv 'panetest' "$HERMETIC_LOG" 2>/dev/null \
+  && fail "the hermetic guard caught a launch outside this fixture's workspace:
+$(cat "$HERMETIC_LOG")" || true
 ok
 
 echo "ALL PASS ($pass checks)"
