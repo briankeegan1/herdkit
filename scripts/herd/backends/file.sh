@@ -112,6 +112,8 @@ _backend_add_item() {
     if git diff --cached --quiet; then
         _BACKEND_RESULT="NOCHANGE"
     else
+        # herd-scope-ok: index-scoped — the two named `git add`s above stage only the backlog file
+        # and its archive; nothing here stages by scan (HERD-435 / scripts/herd/git-scope-lint.sh).
         git commit -q -m "Backlog: $sum"
         _BACKEND_RESULT="DONE"
     fi
@@ -334,6 +336,7 @@ PY
     # hard-reset to their tip (discarding OUR claim commit; on the default branch the ONLY local-ahead
     # commit is this claim). Then re-read to see who actually owns the 🚧 line.
     git add "$BACKLOG_FILE" 2>/dev/null || true
+    # herd-scope-ok: index-scoped — the named `git add "$BACKLOG_FILE"` above is the only thing staged here
     git diff --cached --quiet || git commit -q -m "Claim: $slug → in-progress ($who)" 2>/dev/null || true
     if [ -n "$(git rev-list "$DEFAULT_BRANCH..HEAD" 2>/dev/null)" ]; then
         if ! git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then
@@ -460,6 +463,7 @@ PY
         # Our edit vanished between the write and the stage — nothing to commit, nothing was released.
         _RELEASE_RESULT="UNREACHABLE"; return 0
     fi
+    # herd-scope-ok: index-scoped — the named `git add "$BACKLOG_FILE"` above is all that is staged.
     if ! git commit -q -m "Release: $slug → unclaimed ($who)" 2>/dev/null; then
         # Never leave the operator's main checkout dirty with a half-applied release.
         git reset -q HEAD -- "$BACKLOG_FILE" >/dev/null 2>&1 || true
@@ -599,6 +603,7 @@ _file_marker_commit() {
     local msg="$1"
     git add "$BACKLOG_FILE" 2>/dev/null || true
     git diff --cached --quiet && return 1
+    # herd-scope-ok: index-scoped — the named `git add "$BACKLOG_FILE"` above is all that is staged.
     git commit -q -m "$msg" 2>/dev/null || true
     if [ -n "$(git rev-list "$DEFAULT_BRANCH..HEAD" 2>/dev/null)" ]; then
         if ! git push -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null; then

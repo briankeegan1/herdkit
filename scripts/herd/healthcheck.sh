@@ -130,6 +130,17 @@ else
   HERD_PIPE_SAFETY_SKIP_REASON="pipe-safety-lint.sh not present"
   herd_pipe_safety_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# git-scope guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/git-scope-lint.sh"
+[ -f "$DIR/scripts/herd/git-scope-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/git-scope-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_GIT_SCOPE_SKIP_REASON="git-scope-lint.sh not present"
+  herd_git_scope_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -447,6 +458,22 @@ EOF
   if [ "$pipe_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ pipe-safety — $(printf '%s' "$pipe_errs" | grep '^PIPE-UNSAFE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>' for a verified-small producer)"; printf '%s\n' "$pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$pipe_errs"; fi
+    exit 1
+  fi
+
+  # git-scope guard (HERD-435 / issue #547) — engine/project ISOLATION: a production engine path may
+  # not stage repo-wide (`git add -A|.|-u`, `git commit -a`) or commit without a `--` pathspec, so an
+  # unrelated repo (or an operator's mid-edit) sitting in or beside the tree can never be swept into a
+  # herdkit commit. The SAME lint the heavy gate runs (scripts/herd/git-scope-lint.sh). Same red
+  # semantics as caps-sync / pipe-safety. scripts/herd/sim/, scripts/herd/experiment/ and tests/ are
+  # classified FIXTURE (throwaway temp repos) and never flagged; a deliberate exception annotates with
+  # '# herd-scope-ok: <why>'. Skipped (never red) when the lint is absent or the tree has no engine
+  # git surface.
+  local gscope_errs gscope_rc
+  gscope_errs="$(herd_git_scope_lint ".")"; gscope_rc=$?
+  if [ "$gscope_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ git-scope — $(printf '%s' "$gscope_errs" | grep '^GIT-SCOPE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ GIT-SCOPE: a production engine path stages repo-wide or commits without a pathspec (name the paths, or annotate '# herd-scope-ok: <why>')"; printf '%s\n' "$gscope_errs" | grep '^GIT-SCOPE' || printf '%s\n' "$gscope_errs"; fi
     exit 1
   fi
 

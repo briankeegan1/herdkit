@@ -258,6 +258,8 @@ fleet_new() {
     if ( cd "$path" && git diff --cached --quiet 2>/dev/null ); then
       say "  ${c_dim}(nothing new to commit)${c_rst}"
     else
+      # herd-scope-ok: index-scoped — the named `git add -- "${commit_paths[@]}"` above is the only
+      # staging in this freshly-created project repo.
       ( cd "$path" && git commit -q -m "chore: seed herd project (herd fleet new)" ) \
         || die "git commit failed at $path"
       ok "committed: ${commit_paths[*]}"

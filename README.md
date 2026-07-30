@@ -654,6 +654,7 @@ scripts/herd/                   the generic engine (sources .herd/config via her
 pysrc/herd/                     the python engine core (live_runtime.py, work_unit.py — GitPrAdapter + DocApplyAdapter)
 templates/                      coordinator.md.tmpl, config.example, capabilities.tsv, drivers/, themes/
 docs/                           codemap.md + symbol-index.md (committed engine maps) + reference docs
+                                (isolation-boundary.md — what the engine will and will not touch)
 tests/                          hermetic shell + python tests and a bats wrapper
 .herd/                          herdkit's OWN dogfood config + healthcheck + review checklist
 ```

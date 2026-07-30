@@ -636,6 +636,35 @@ case "$_hc_pipe_rc" in
      exit 1 ;;
 esac
 
+# 5d. git-scope guard (HERD-435 / GitHub issue #547) — engine/project ISOLATION: a PRODUCTION engine
+# path may not stage repo-wide (`git add -A|.|-u`, `git commit -a`) or commit with no `--` pathspec,
+# so an unrelated repo nested in or beside the tree (and an operator's mid-edit in the shared
+# checkout) can never be swept into a herdkit commit. scripts/herd/sim/, scripts/herd/experiment/ and
+# tests/ build throwaway repos in temp dirs and are classified FIXTURE — scanned, counted, never
+# flagged. A deliberate exception annotates with '# herd-scope-ok: <why>'. ONE implementation shared
+# with the builder's light pre-PR gate (scripts/herd/git-scope-lint.sh), so the two can never disagree.
+gscope_note="git-scope: clean"
+HERD_GIT_SCOPE_SKIP_REASON=""
+if [ -f scripts/herd/git-scope-lint.sh ]; then
+  . scripts/herd/git-scope-lint.sh
+  _hc_gscope_errs="$(herd_git_scope_lint ".")"; _hc_gscope_rc=$?
+else
+  _hc_gscope_errs=""; _hc_gscope_rc=2
+  HERD_GIT_SCOPE_SKIP_REASON="scripts/herd/git-scope-lint.sh not present"
+fi
+case "$_hc_gscope_rc" in
+  0) gscope_note="git-scope: clean" ;;
+  2) gscope_note="git-scope: skipped ($HERD_GIT_SCOPE_SKIP_REASON)" ;;
+  *) gscope_note="git-scope: UNSCOPED ENGINE GIT OPS"
+     if [ -n "$ONELINE" ]; then
+       echo "git-scope: $(printf '%s' "$_hc_gscope_errs" | grep '^GIT-SCOPE' | head -1)"
+     else
+       echo "GIT-SCOPE: a production engine path stages repo-wide or commits without a pathspec (name the paths, or annotate '# herd-scope-ok: <why>')"
+       printf '%s\n' "$_hc_gscope_errs" | grep '^GIT-SCOPE' || printf '%s\n' "$_hc_gscope_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -656,5 +685,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $chl_note"; }
 exit 0
