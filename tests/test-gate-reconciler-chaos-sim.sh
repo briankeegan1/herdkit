@@ -552,6 +552,22 @@ env_sweep.update({
     "HERDR_TABS": tabs_json, "HERD_CONFIG_FILE": os.path.join(lega, "no-config"),
     "JOURNAL_FILE": journal_path_a, "HERD_PMS_PRS_JSON_FILE": pms_prs_json,
     "HERD_TRANSCRIPT_ROOT": os.path.join(lega, "transcripts"),
+    # HERD-436: PROJECT_ROOT/WORKTREES_DIR/WORKSPACE_NAME pre-seeded via ENV (not just sweep_tick.sh's
+    # post-source `TREES="$SIM_TREES"` reassignment) — herd-config.sh's PROJECT_ROOT/WORKTREES_DIR
+    # FALLBACK runs DURING `. "$WATCH_SH_SIM"`, i.e. BEFORE sweep_tick.sh's own reassignment lines ever
+    # execute. Every agent-watch.sh module-level constant derived from $TREES at source time (line 314:
+    # `TREES="$WORKTREES_DIR"`, then RECONCILE_STATE/TRACKER_SWEEP_LEDGER/POSTMERGE_SWEPT_LEDGER/
+    # POSTMERGE_NOTED_LEDGER, all `"$TREES/…"`) was baking in whatever WORKTREES_DIR the NO-CONFIG
+    # fallback resolved BEFORE the override landed — HERD_CONFIG_FILE points at a nonexistent path, so
+    # herd-config.sh falls through to `PROJECT_ROOT="$(_herd_main_worktree "$_HERD_REPO_DEFAULT")"`,
+    # i.e. THIS REPO's real main working tree, so WORKTREES_DIR became the REAL "<project>-trees" pool
+    # dir sitting next to it. Pre-seeding these three here — same values sweep_tick.sh already sets
+    # post-source, just visible to the CHILD PROCESS from before it execs bash, so herd-config.sh's
+    # `[ -z "${PROJECT_ROOT:-}" ]` / `: "${WORKTREES_DIR:=…}"` / `: "${WORKSPACE_NAME:=…}"` guards see
+    # them already set and never touch the real filesystem — makes every such constant resolve inside
+    # the sim's OWN sandbox from the first instruction, matching what "Hermetic: … zero real … network
+    # calls" already promises for gh/herdr but this sim was not actually delivering for the filesystem.
+    "PROJECT_ROOT": MAIN, "WORKTREES_DIR": TREES, "WORKSPACE_NAME": "simws",
 })
 
 
