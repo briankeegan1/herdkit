@@ -43,6 +43,7 @@ Role summarized from each file's top-of-file comment.
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
 - `gate-coverage-lint.sh` — THE shared gate-coverage drift guard (HERD-292, flipped for HERD-295
+- `git-scope-lint.sh` — THE shared engine/project ISOLATION guard (HERD-435, GitHub issue #547): every
 - `governance-drift-sweep.sh` — periodic, ADVISORY governance-DRIFT sweep (HERD-125).
 - `governance-hook.sh` — governance-hook.sh <target> — the SESSION-TIME governance enforcer rendered into a project's
 - `governance.sh` — the SHARED, read-only governance EXTRACTION + MAPPING helpers (HERD-119 / HERD-125).
