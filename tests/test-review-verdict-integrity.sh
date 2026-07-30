@@ -285,14 +285,46 @@ fi
 ################################################################################
 # PART 3 — source invariants
 ################################################################################
-# ── (9) RETRY console wording is infra-framed, never "blocked"; argv0 tag present ─
-grep -q 'review infra failed (no verdict)' "$WATCH" || fail "(9) agent-watch.sh should carry the 'review infra failed (no verdict)' RETRY wording"
-# The user-visible RETRY string must be infra-framed, never say "block" (an infra death is not a
-# refusal). Check the DISPLAY assignment(s) inside the RETRY case body only — comments are exempt.
-retry_display="$(awk '/^        RETRY\)/{f=1} f && /DISPLAY\[idx\]=/{print} /^          continue ;;/{if(f)exit}' "$WATCH")"
-[ -n "$retry_display" ] || fail "(9) could not locate the RETRY branch DISPLAY line"
-printf '%s\n' "$retry_display" | grep -qi 'block' && fail "(9) RETRY DISPLAY must never say 'block' (it is an infra death, not a refusal)"
-printf '%s\n' "$retry_display" | grep -q 'retrying' || fail "(9) RETRY DISPLAY should show it is retrying"
+# ── (9) an infra death RETRIES and is never framed as a refusal; argv0 tag present ─
+# HERD-439: this check used to grep agent-watch.sh for the console string
+# "review infra failed (no verdict) · retrying (k/N)" and for the DISPLAY assignment in the RETRY
+# branch of the action pass's case. HERD-306 P5b (ede7d45) deleted that action pass wholesale —
+# pysrc/herd/live_runtime.py is the sole engine core — so both the branch and its wording went with
+# it. VERIFIED before repointing: the RETRY BEHAVIOR is fully intact, only the console string moved
+# out of this file. So the assertions follow the behavior to the three surfaces that still own it,
+# and stop pinning a display literal that no longer has an owner.
+#
+# (i) agent-watch.sh — _review_gate_step's non-verdict branch: counts a retry, escalates to FAILED at
+#     the cap, and NEVER records a verdict. This is the actual "retry, don't cache" mechanism; PART 1
+#     check (3) already drives it behaviorally, this pins it structurally against a silent rewrite.
+rgs_body="$(awk '/^_review_gate_step\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$WATCH")"
+[ -n "$rgs_body" ] || fail "(9) could not read _review_gate_step's body from agent-watch.sh"
+grep -q 'record_review_retry' <<< "$rgs_body" \
+  || fail "(9) _review_gate_step must count a non-verdict death via record_review_retry"
+grep -q '_rgs_echo=RETRY' <<< "$rgs_body" \
+  || fail "(9) _review_gate_step must yield RETRY (not a verdict) on a non-verdict death"
+grep -q '_REVIEW_RETRY_MAX' <<< "$rgs_body" \
+  || fail "(9) the RETRY path must be bounded by _REVIEW_RETRY_MAX (FAILED at the cap)"
+
+# (ii) the engine core — an INFRA verdict journals an infra_event and NEVER a verdict_recorded, so a
+#      dead reviewer can never masquerade as a refusal in the forensic stream.
+# Resolved off $WATCH, not $HERE: sourcing agent-watch.sh in lib mode above rebinds HERE to the
+# engine's scripts/herd dir, so $HERE is no longer this test's own directory by the time PART 3 runs.
+ENGINE="${WATCH%/scripts/herd/agent-watch.sh}/pysrc/herd/live_runtime.py"
+[ -f "$ENGINE" ] || fail "(9) engine core not found at $ENGINE"
+engine_infra="$(awk '/if verdict == "INFRA":/{f=1} f{print; n++} n>5{exit}' "$ENGINE")"
+[ -n "$engine_infra" ] || fail "(9) could not locate the engine's INFRA branch"
+grep -q 'infra_event' <<< "$engine_infra" \
+  || fail "(9) the engine's INFRA branch must journal infra_event"
+grep -qi 'verdict_recorded' <<< "$engine_infra" \
+  && fail "(9) an INFRA death must never be recorded as a verdict"
+
+# (iii) herd-review.sh — the producer frames it as INFRA-FAIL, never a BLOCK, and tags its argv0.
+grep -q 'REVIEW: INFRA-FAIL' "$REVIEW" || fail "(9) herd-review.sh must emit REVIEW: INFRA-FAIL"
+infra_emit="$(awk '/^emit_infra_fail\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$REVIEW")"
+[ -n "$infra_emit" ] || fail "(9) could not read emit_infra_fail's body"
+grep -qi 'BLOCK' <<< "$infra_emit" \
+  && fail "(9) emit_infra_fail must never say BLOCK (it is an infra death, not a refusal)"
 grep -q 'exec -a "herd-review-gate-' "$REVIEW" || fail "(9) herd-review.sh should tag its argv0 as herd-review-gate-<pr>"
 ok
 

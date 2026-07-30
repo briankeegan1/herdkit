@@ -6,7 +6,14 @@
 # This key changes that, opt-in only:
 #   hold        (default) today's EXACT behavior, byte-identical when unset.
 #   coordinator keep the hold but notify loudly + flag it coordinator-actionable.
-#   auto        treat the declared steps as informational — journal + PR-comment them, merge on green.
+#   auto        treat the declared steps as informational — journal them, merge on green.
+#
+# SCOPE NOTE (HERD-439): bash's action pass also POSTED a PR comment on the coordinator-hold and
+# auto-merge paths. HERD-306 P5b deleted that pass; the Python engine core has no comment actuator at
+# all (LiveActuator exposes merge / reap / post_gate_status only), so the comment half is still
+# absent and is NOT asserted below. The JOURNAL half — the forensic record — is restored and pinned.
+# Filed via `herd note` for a follow-up item; restoring it means a new network side effect plus its
+# dry-run twin, which is a larger change than this test-repair item.
 #
 # Fully hermetic: stubs gh/git/herdr on PATH; touches nothing outside $T; never runs the live watch
 # loop (agent-watch.sh is sourced in AGENT_WATCH_LIB=1 mode). Mirrors test-human-verify-hold.sh.
@@ -171,12 +178,26 @@ ok
   || fail "(8) 2-arg ready label must default to hold wording"
 ok
 
-# ── 9. Source carries the policy-driven journal + comment surfaces (loop code, not sourced-callable) ─
-grep -q 'human_verify_policy coordinator' "$WATCH" || fail "(9) coordinator hold must journal human_verify_policy coordinator"
-grep -q 'journal_append human_verify_policy pr .* policy auto action merged-with-declared-steps' "$WATCH" \
+# ── 9. The policy-driven journal surfaces exist, in the file that OWNS the decision today ─────────
+# HERD-439: these were greps against agent-watch.sh's ACTION-PASS loop code. HERD-306 P5b (ede7d45)
+# deleted that pass — pysrc/herd/live_runtime.py became the sole engine core — and the port dropped
+# both policy-keyed emissions on the way, leaving `human_verify_policy` a CONSUMER-ONLY event
+# (journal-audit.sh §5.4 and pysrc/herd/fixture_extract.py both parse it; nothing produced it). That
+# is a real forensics regression, not test drift: a coordinator-actionable hold and an auto-merge of
+# a PR with declared-but-unrun steps were both indistinguishable from the plain cases in the journal.
+# The emissions are restored in the engine core; the assertions follow the decision to its new home.
+# BEHAVIOR (not just presence) is pinned in tests/test_live_runtime.py — see
+# test_coordinator_policy_hold_applied_names_the_policy /
+# test_auto_policy_merges_and_journals_the_declared_steps / their two off-path twins.
+ENGINE="$ROOT/pysrc/herd/live_runtime.py"
+[ -f "$ENGINE" ] || fail "(9) engine core not found at $ENGINE"
+grep -q '"human_verify_policy", "coordinator"' "$ENGINE" \
+  || fail "(9) coordinator hold must journal hold_applied … human_verify_policy=coordinator"
+grep -q '"action", "merged-with-declared-steps"' "$ENGINE" \
   || fail "(9) auto path must journal human_verify_policy=auto merged-with-declared-steps"
-grep -q 'coordinator-actionable' "$WATCH" || fail "(9) coordinator hold comment/notify missing"
-grep -q 'HUMAN_VERIFY_POLICY=auto' "$WATCH" || fail "(9) auto informational PR comment missing"
+# Still owned by agent-watch.sh: the console label and the invalid-value fail-safe both live in the
+# sourced (lib-mode) surface the checks above already drive, so they stay pinned here.
+grep -q 'coordinator-actionable' "$WATCH" || fail "(9) coordinator-actionable console label missing"
 grep -q 'human_verify_policy_invalid' "$WATCH" || fail "(9) invalid-value fallback must be journaled"
 ok
 

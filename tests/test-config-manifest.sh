@@ -6,9 +6,12 @@
 # key can be documented but never read (a DEAD key), read but never documented (a GHOST key), or
 # mis-scoped so `herd config set` routes it to the wrong file / a governance doc adopts a per-machine
 # knob. This test turns those invariants into a hard gate so the manifest can never silently drift
-# from the code that reads it. Eight checks:
+# from the code that reads it. Nine checks:
 #
-#   (a) DEAD keys      — every manifest config key is READ at least once under bin/ + scripts/.
+#   (a) DEAD keys      — every manifest config key is READ at least once by the engine: bin/ +
+#                        scripts/ (bash) OR pysrc/herd/*.py (the Python core, since the HERD-300 port).
+#   (a') scan bites    — the DEAD scan still FLAGS a synthetic unread key, and a Python prose MENTION
+#                        of a key is not accepted as a read. Guards (a) against decaying (HERD-439).
 #   (b) GHOST keys     — every ${UPPER_CASE:-…} config read in the engine is a DECLARED manifest key
 #                        (or an explicitly-exempt internal/env/secret/test-seam var, see EXEMPT below).
 #   (b') scan bites    — the ghost scan, with its comment/script-local waivers, still FLAGS synthetic
@@ -110,6 +113,29 @@ def strip_comments(text):
 SRC = {f: strip_comments(open(f, encoding="utf-8", errors="replace").read()) for f in ENGINE}
 ALL_SRC = "\n".join(SRC.values())
 
+# ── The PYTHON half of the engine (HERD-439) ──────────────────────────────────────────────────────
+# The DEAD-key scan below was written when every config reader was bash. Since the HERD-300 engine
+# port, pysrc/herd/live_runtime.py is the SOLE engine core and several modules read .herd/config knobs
+# straight off the config dict — so a key read ONLY from Python looked declared-but-unread and check
+# (a) reported a genuine, wired key as DEAD (DOC_APPLY_PATH_GLOB, read at
+# herd/work_unit.py:_doc_apply_path_pattern, is the one that surfaced it).
+#
+# Used by check (a) ONLY, deliberately. The GHOST scan (b) hunts the shell `${UPPER:-…}` read form and
+# the script-local waiver it depends on is a bash notion; feeding it Python would either find nothing
+# or misjudge, so the ghost surface stays exactly the bash tree it was written for.
+#
+# A read here is a CALL SHAPE, never a mention: `.get("KEY"` / `["KEY"]` (env or config dict). Matching
+# the bare quoted name would let a docstring that merely NAMES a key keep a genuinely dead one alive —
+# and work_unit.py's own prose names DOC_APPLY_PATH_GLOB three times above the line that reads it.
+def py_engine_files():
+    return [f for f in glob.glob(os.path.join(ROOT, "pysrc/herd/*.py")) if os.path.isfile(f)]
+
+PY_SRC = "\n".join(strip_comments(open(f, encoding="utf-8", errors="replace").read())
+                   for f in py_engine_files())
+
+def is_read_py(key, text):
+    return re.search(r'(?:\.get\(|\[)\s*["\']' + re.escape(key) + r'["\']', text) is not None
+
 # ── Loader-defaulted keys: the `: "${KEY:="v"}"` idiom in herd-config.sh IS the definition of a config
 # knob (the same signal the caps-sync gate greps for). A key defaulted there is a knob no matter what
 # else the engine does with it, so it can NEVER be waived by the script-local rule below — it must be
@@ -141,9 +167,24 @@ def is_read(key, text):
     return re.search(r'\$\{?' + re.escape(key) + r'(?![A-Za-z0-9_])', text) is not None
 
 # ── (a) DEAD keys: every manifest config key is read somewhere in the engine ───────────────────────
-dead = sorted(k for k in KEYS if not is_read(k, ALL_SRC))
+# "The engine" is BOTH halves since the HERD-300 port: the bash tree and the Python core.
+dead = sorted(k for k in KEYS if not is_read(k, ALL_SRC) and not is_read_py(k, PY_SRC))
 check("a: no DEAD (declared-but-unread) keys", not dead,
       "unread manifest keys: " + ", ".join(dead))
+
+# ── (a') the DEAD scan still BITES: the Python widening must not make (a) vacuous ──────────────────
+# Mirrors (b')'s discipline. A synthetic key nothing reads must still be reported, and a Python-side
+# MENTION (a docstring naming the key) must NOT count as a read — otherwise the widening above would
+# quietly retire the whole check the next time a key is deleted but left in the manifest.
+probe_dead = []
+if is_read("HERD_439_NO_SUCH_KEY", ALL_SRC) or is_read_py("HERD_439_NO_SUCH_KEY", PY_SRC):
+    probe_dead.append("an unread key was judged read")
+if is_read_py("DOC_APPLY_PATH_GLOB", '"""prose naming DOC_APPLY_PATH_GLOB in a docstring."""'):
+    probe_dead.append("a Python prose mention was judged a read")
+if not is_read_py("DOC_APPLY_PATH_GLOB", 'p = (config or {}).get("DOC_APPLY_PATH_GLOB") or ""'):
+    probe_dead.append("a real Python config read was missed")
+check("a': the DEAD scan still catches real dead keys", not probe_dead,
+      "dead scan misjudged: " + ", ".join(probe_dead))
 
 # ── (b) GHOST keys: every ${UPPER:-…} config read is a declared manifest key, or explicitly exempt ─
 # The engine reads MANY UPPER_SNAKE vars that are NOT .herd/config knobs — runtime/CLI/test overrides

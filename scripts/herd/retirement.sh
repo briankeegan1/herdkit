@@ -65,6 +65,19 @@ if ! command -v _sweep_classify_dirt >/dev/null 2>&1; then
   unset AGENT_WATCH_LIB
 fi
 
+# ── borrow journal.sh if not already in scope (HERD-439) ─────────────────────────────────────────
+# This file journals three events (retire_<kind>, retire_skip, retire_converged) but relied on its
+# host having journal.sh loaded BY CONVENTION. The borrow above already pulls it in on every real
+# path (agent-watch.sh sources journal.sh), so this is a no-op there; it only fires for a caller that
+# pre-defines _sweep_classify_dirt — skipping the borrow above — without having sourced journal.sh
+# itself, which would have made the retirement journal silently vanish. Same explicit-dependency form
+# work-unit.sh adopted under HERD-397, and what seam-conformance B4 asks of any journal_append caller:
+# say where journal_append comes from instead of assuming it.
+if ! command -v journal_append >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$_RETIRE_HERE/journal.sh"
+fi
+
 # ── tunables (deliberate constants + test seams, not config keys) ────────────────────────────────
 # How many CONSECUTIVE ticks a teardown may fail to converge before its calm 'retiring…' row turns
 # into a red needs-you. 3 ticks ≈ 12 s: long enough that a herdr round-trip lands, short enough that a

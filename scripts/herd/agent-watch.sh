@@ -5761,7 +5761,12 @@ _self_restart_hold_dispatch() { _self_restart_enabled && _self_restart_quiescing
 # whose single line is the NEW sha) and journals ONCE. Idempotent: a second call while armed no-ops.
 _self_restart_arm() {
   _self_restart_quiescing && return 0
-  _SELF_RESTART_ARMED="$(date +%s)"
+  # _now_epoch, not a raw `date +%s` (HERD-439): the drain's two clock reads — this one and the
+  # elapsed computation in _self_restart_tick — must come from the SAME source, or a test cannot pin
+  # the pair and its cap-boundary probe races the wall clock. _now_epoch is the engine's existing
+  # HERD_FAKE_NOW seam (:2516), already used for the deterministic age rendering; unset in production,
+  # so this is byte-identical to `date +%s` on every real watcher.
+  _SELF_RESTART_ARMED="$(_now_epoch)"
   _SELF_RESTART_IDLE_TICKS=0
   _SELF_RESTART_TO="$(cat "$MAIN_FRESH_RESTART" 2>/dev/null || true)"
   _SELF_RESTART_TO="${_SELF_RESTART_TO%%[$'\t\r\n ']*}"
@@ -5832,7 +5837,7 @@ _self_restart_tick() {
   fi
   local _st_n _st_waited _st_trigger
   _st_n="$(_count_gate_workers)"
-  _st_waited=$(( $(date +%s) - _SELF_RESTART_ARMED ))
+  _st_waited=$(( $(_now_epoch) - _SELF_RESTART_ARMED ))
   [ "$_st_waited" -ge 0 ] || _st_waited=0    # a clock step backwards must not skip the cap
   if [ "$_st_n" -eq 0 ]; then
     _SELF_RESTART_IDLE_TICKS=$((_SELF_RESTART_IDLE_TICKS + 1))

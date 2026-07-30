@@ -138,10 +138,20 @@ CODEMAP_AUTOREFRESH=true reconcile_map_freshness
 [ "$(cat "$MAIN/docs/symbol-index.md")" = "INDEX v2" ] \
                                     || fail "(2) symbol-index not refreshed to INDEX v2"
 # Commit messages use the reconcile shape (no PR #).
-git -C "$MAIN" log -2 --format=%s | grep -q 'chore: refresh codemap (reconcile)' \
-                                    || fail "(2) codemap commit message wrong: $(git -C "$MAIN" log -2 --format=%s)"
-git -C "$MAIN" log -2 --format=%s | grep -q 'chore: refresh symbol-index (reconcile)' \
-                                    || fail "(2) symbol-index commit message wrong: $(git -C "$MAIN" log -2 --format=%s)"
+#
+# HERD-439: these were `git log -2 --format=%s | grep -q …`, the exact pipe-unsafe shape HERD-299's
+# lint exists to prevent — and it false-red DETERMINISTICALLY here, not merely under load. This file
+# runs under `set -o pipefail`; `git log` streams a commit at a time, so when the pattern matched the
+# FIRST subject grep -q exited immediately, git's write of the second took SIGPIPE, and pipefail
+# turned rc 141 into a failed assertion. That is why exactly ONE of the two lines failed while the
+# other passed on identical output: the codemap subject is second in the log (grep reads to EOF), the
+# symbol-index subject is first (grep exits early). Read the subjects ONCE into a variable and match
+# with here-strings — the shared lint's prescribed safe form, no producer process to EPIPE.
+subjects="$(git -C "$MAIN" log -2 --format=%s)"
+grep -q 'chore: refresh codemap (reconcile)' <<< "$subjects" \
+                                    || fail "(2) codemap commit message wrong: $subjects"
+grep -q 'chore: refresh symbol-index (reconcile)' <<< "$subjects" \
+                                    || fail "(2) symbol-index commit message wrong: $subjects"
 # Journaled with provenance=reconcile (the multi-seat audit trail).
 jhas 'codemap_refresh pr  result committed pushed yes provenance reconcile' \
                                     || fail "(2) codemap journal missing provenance=reconcile: $(cat "$JLOG")"
