@@ -73,4 +73,58 @@ OUT="$(HERD_CI_FORCE_DIRECT=1 HERD_CI_PLATFORM=ubuntu HERD_CI_TESTS_DIR="$ED" HE
 [ "$RC" -eq 2 ] || fail "empty dir: expected rc 2, got $RC.  Out:\n$OUT"
 pass
 
+# ── HERD-436 legibility: a test that supports the shared `--artifacts DIR --keep` convention (the
+# sim/chaos family: test-gate-reconciler-chaos-sim.sh, test-merge-queue-sim.sh, test-merge-result-gate-
+# sim.sh) must (a) have its failing checkpoint line(s) surfaced even when they scroll off a plain
+# tail, and (b) have its scorecard.json survive past its own process into a caller-controlled dir —
+# previously the test's own EXIT trap deleted its mktemp ART dir the instant it failed, discarding the
+# one artifact that names which assertion actually failed.
+TD2="$T/tests2"; mkdir -p "$TD2"
+cat > "$TD2/test-artifact-red-sim.sh" <<'EOF'
+#!/usr/bin/env bash
+ART=""; KEEP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --keep)      KEEP=1; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "$ART" ] || ART="$(mktemp -d)"
+mkdir -p "$ART"
+echo "FAIL checkpoint_one: something specific broke"
+for i in $(seq 1 20); do echo "noise line $i (padding past a 6/10-line tail)"; done
+echo '{"result":"fail"}' > "$ART/scorecard.json"
+exit 1
+EOF
+chmod +x "$TD2/test-artifact-red-sim.sh"
+cat > "$TD2/test-artifact-green-sim.sh" <<'EOF'
+#!/usr/bin/env bash
+ART=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --artifacts) ART="${2:-}"; shift 2 ;;
+    --keep)      shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "$ART" ] || exit 1
+mkdir -p "$ART"
+echo '{"result":"pass"}' > "$ART/scorecard.json"
+exit 0
+EOF
+chmod +x "$TD2/test-artifact-green-sim.sh"
+
+ARTDIR="$T/artroot"
+OUT="$(HERD_CI_FORCE_DIRECT=1 HERD_CI_PLATFORM=ubuntu HERD_CI_TESTS_DIR="$TD2" \
+       HERD_CI_ARTIFACTS_DIR="$ARTDIR" bash "$RUNNER" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] || fail "artifacts: expected rc 1 (the red sim fails), got $RC.  Out:\n$OUT"
+printf '%s\n' "$OUT" | grep -q "FAIL checkpoint_one: something specific broke" \
+  || fail "artifacts: expected the failing checkpoint line surfaced (not just a tail).  Got:\n$OUT"
+[ -f "$ARTDIR/test-artifact-red-sim.sh/scorecard.json" ] \
+  || fail "artifacts: expected scorecard.json to survive under $ARTDIR/test-artifact-red-sim.sh"
+[ ! -e "$ARTDIR/test-artifact-green-sim.sh" ] \
+  || fail "artifacts: a passing test's artifacts should be pruned, found $ARTDIR/test-artifact-green-sim.sh"
+pass
+
 echo "PASS: test-ci-run-suite ($PASS checks)"

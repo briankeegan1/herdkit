@@ -95,6 +95,21 @@ jobs:
           python3 --version; command -v grep; grep --version | head -1
       - name: Run hermetic suite
         run: bash scripts/ci/run-suite.sh
+      - name: Upload suite failure artifacts (logs + chaos/sim scorecards)
+        # HERD-436: on a real failure, the per-test logs and any scorecard.json / per-rep detail a
+        # sim/chaos test names in its own "see <dir>/scorecard.json" message previously lived only in
+        # a runner tmpdir that was never uploaded — the single most useful diagnostic, discarded on
+        # every run. run-suite.sh exports both dirs via $GITHUB_ENV; if-no-files-found stays "ignore"
+        # since not every failure mode populates HERD_CI_ARTIFACTS_DIR (only --artifacts-capable tests do).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-failure-${{ matrix.platform }}
+          path: |
+            ${{ env.HERD_CI_LOGDIR }}
+            ${{ env.HERD_CI_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+          retention-days: 14
 
   windows-smoke:
     # WSL2-first: Windows gets a fast ADVISORY smoke, not the full suite. continue-on-error so a
