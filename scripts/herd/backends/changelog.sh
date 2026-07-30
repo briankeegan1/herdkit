@@ -31,6 +31,7 @@ _backend_add_item() {
     if git diff --cached --quiet; then
         _BACKEND_RESULT="NOCHANGE"
     else
+        # herd-scope-ok: index-scoped — the named `git add "$BACKLOG_FILE"` above is all that is staged.
         git commit -q -m "Changelog: $sum"
         _BACKEND_RESULT="DONE"
     fi

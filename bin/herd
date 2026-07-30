@@ -354,6 +354,9 @@ _untrack_rendered_skill() {
   git -C "$root" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || return 0
   git -C "$root" rm --cached --quiet -- "$rel" >/dev/null 2>&1 || return 0
   ok "untracked $rel — the rendered skill is a per-machine artifact now (HERD-214)"
+  # herd-scope-ok: operator hint TEXT, not an engine-executed command — and index-scoped by nature:
+  # the deletion `git rm --cached` just staged cannot be re-expressed as a `--` pathspec (that would
+  # re-add the still-on-disk file).
   say "  ${c_dim}commit the staged deletion to finish the migration: git commit -m 'chore: untrack rendered coordinator skill'${c_rst}"
 }
 
@@ -3015,7 +3018,7 @@ _config_open_shared_pr() {
   local slug; slug="$(_gh_repo_slug "$root" "$default_branch")"
   if ! command -v gh >/dev/null 2>&1; then
     warn "cannot auto-open the config PR — gh CLI not found. The change is APPLIED to .herd/config locally; commit it on a branch and open the PR by hand so other operators receive it:
-    git switch -c $branch && git commit -am 'config: set $key=$new' && git push -u $remote $branch && gh pr create --base $base"
+    git switch -c $branch && git add .herd/config && git commit -m 'config: set $key=$new' -- .herd/config && git push -u $remote $branch && gh pr create --base $base"
     return 0
   fi
 
@@ -3063,8 +3066,13 @@ _config_open_shared_pr() {
     _config_put_value "$wt/.herd/config" "$key" "$new" "$q"
     if ! git -C "$wt" diff --quiet -- .herd/config; then
       git -C "$wt" add .herd/config
+      # Pathspec-scoped (HERD-435): the branch must carry exactly this one key change. A linked
+      # worktree does have its own index, so nothing else is expected to be staged here — naming the
+      # path makes the commit's content a function of that path alone rather than of index state,
+      # which is the boundary rule the engine holds everywhere (docs/isolation-boundary.md).
       git -C "$wt" commit -q -m "config: set $key=$new (herd config set --shared)" \
-        -m "Propagate a PROJECT-scoped policy change to every operator (HERD-62)." 2>/dev/null || true
+        -m "Propagate a PROJECT-scoped policy change to every operator (HERD-62)." \
+        -- .herd/config 2>/dev/null || true
       # --force: the config/<key> branch is owned entirely by this command (one branch per key), so a
       # re-run legitimately replaces its own prior proposal; -B reset above makes the history diverge.
       if git -C "$wt" push -q --force "$remote" "$branch" 2>/dev/null; then
