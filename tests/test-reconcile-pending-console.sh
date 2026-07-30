@@ -131,4 +131,4 @@ build_reconcile_pending
 ok
 SCRIBE_BACKEND="linear"
 
-echo "OK ($pass checks) — test-reconcile-pending-console.sh"
+echo "PASS: test-reconcile-pending-console.sh ($pass checks)"
