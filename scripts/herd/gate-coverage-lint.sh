@@ -29,6 +29,14 @@
 #   Exit: 0 = clean · 1 = ungated · 2 = skipped (infra; NEVER a red).
 #   On a skip, $HERD_GATE_COVERAGE_SKIP_REASON carries the one-line why.
 #
+# herd_gate_coverage_advisory_note <lint-output>
+#   HERD-437: exemption counts as covered, so a clean exit (0 ungated) reads identically whether the
+#   exempt list has 5 rows or 179 — the growing blind spot was silently absorbed into a bare "clean".
+#   Pure string helper: parses the ADVISORY summary's own counts (never re-derives them) and prints a
+#   one-line "N/M exempt (P%)" (or "0 exempt") for a caller to fold into its ALWAYS-printed verdict —
+#   see .herd/healthcheck.project.sh's gcov_note — so the exempt count is visible on every run, not
+#   just when something is UNGATED.
+#
 # Fail-soft by construction: no tests/herd.bats in the tree (a consuming project) → skip,
 # never a false red. An exempt file that doesn't exist is silently treated as empty.
 
@@ -87,6 +95,31 @@ herd_gate_coverage_check() {
     "$_gc_total" "$_gc_discovered" "$_gc_wired" "$_gc_exempted" "$_gc_n" "$_gc_has_discovery"
 
   [ -z "$_gc_ungated" ]
+}
+
+# herd_gate_coverage_advisory_note <lint-output> — HERD-437: a clean lint (0 ungated) still hides a
+# growing exempt list — "exemption counts as covered" reads identically whether 5 or 179 files never
+# run. Extract the "N exempted" / "M total" counts straight out of the shared ADVISORY summary line
+# (never re-derive them independently — ONE source of truth, so a caller's note can never disagree
+# with the lint that produced it) and render a one-line, ALWAYS-printable advisory so the exempt
+# count is visible on every clean run, not silently absorbed into a bare "clean". Pure string
+# function: no filesystem access, so it is safe to call on any captured lint output.
+herd_gate_coverage_advisory_note() {
+  local _gcn_out="$1" _gcn_total=0 _gcn_exempt=0 _gcn_pct
+  _gcn_total="$(printf '%s\n' "$_gcn_out" | grep -oE '^ADVISORY: [0-9]+' | grep -oE '[0-9]+$')"
+  _gcn_exempt="$(printf '%s\n' "$_gcn_out" | grep -oE '[0-9]+ exempted' | grep -oE '^[0-9]+')"
+  [ -n "$_gcn_total" ] || _gcn_total=0
+  [ -n "$_gcn_exempt" ] || _gcn_exempt=0
+  if [ "$_gcn_exempt" -eq 0 ]; then
+    printf '0 exempt'
+    return 0
+  fi
+  if [ "$_gcn_total" -gt 0 ]; then
+    _gcn_pct=$((_gcn_exempt * 100 / _gcn_total))
+    printf '%d/%d exempt (%d%%) — see tests/gate-coverage-exempt.tsv' "$_gcn_exempt" "$_gcn_total" "$_gcn_pct"
+  else
+    printf '%d exempt' "$_gcn_exempt"
+  fi
 }
 
 # herd_gate_coverage_lint [<root>] — scan the default surface under <root> (or cwd).

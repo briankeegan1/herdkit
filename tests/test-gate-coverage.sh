@@ -187,5 +187,21 @@ printf '%s\n' "$out" | grep -q 'discovery-glob-present=0' || fail "(10) advisory
 pass
 echo "PASS (10) discovery removed → the guard fails loudly (UNGATED), proving it still catches a deleted mechanism"
 
+# ── 11. herd_gate_coverage_advisory_note: HERD-437 — exempt count surfaced, never silently absorbed ─
+note0="$(herd_gate_coverage_advisory_note "ADVISORY: 10 total test-*.sh; 10 auto-discovered; 0 referenced in herd.bats; 0 exempted; 0 ungated (clean when 0; discovery-glob-present=1)")"
+[ "$note0" = "0 exempt" ] || fail "(11) zero exempt must render '0 exempt' (got: $note0)"
+pass
+
+note_some="$(herd_gate_coverage_advisory_note "ADVISORY: 346 total test-*.sh; 164 auto-discovered; 3 referenced in herd.bats; 179 exempted; 0 ungated (clean when 0; discovery-glob-present=1)")"
+[ "$note_some" = "179/346 exempt (51%) — see tests/gate-coverage-exempt.tsv" ] \
+  || fail "(11) a real exempt count must render 'N/M exempt (P%)' (got: $note_some)"
+pass
+
+note_multiline="$(herd_gate_coverage_advisory_note "$(printf 'UNGATED test-orphan.sh — not auto-discovered…\nADVISORY: 5 total test-*.sh; 3 auto-discovered; 0 referenced in herd.bats; 1 exempted; 1 ungated (clean when 0; discovery-glob-present=1)\n')")"
+[ "$note_multiline" = "1/5 exempt (20%) — see tests/gate-coverage-exempt.tsv" ] \
+  || fail "(11) note must parse the ADVISORY line even with UNGATED lines ahead of it (got: $note_multiline)"
+pass
+echo "PASS (11) herd_gate_coverage_advisory_note renders the exempt count from the shared ADVISORY line — 0 exempt clean, a real count as 'N/M exempt (P%)', robust to UNGATED lines preceding it"
+
 echo
 echo "ALL PASS ($PASS checks) — gate-coverage drift guard is live, fail-soft, honors dynamic discovery, and catches a removed discovery glob."
