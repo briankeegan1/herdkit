@@ -86,6 +86,12 @@ export WORKSPACE_NAME="herdkit"
 export HERD_SKIP_PREFLIGHT=1
 export HERD_NO_APP=1
 LTREES="$T/trees"; mkdir -p "$LTREES"
+# HERD-440: journal.sh's JOURNAL_FILE test seam outranks WORKTREES_DIR resolution (by design, so a
+# forgetful test never pollutes a live journal); scripts/ci/run-suite.sh pins JOURNAL_FILE suite-wide
+# for that same reason, so this fixture's journal_event() reads would silently target the wrong file
+# under batch runs unless re-exported here — the documented convention ("a test that needs its own
+# journal re-exports JOURNAL_FILE").
+export JOURNAL_FILE="$LTREES/.herd/journal.jsonl"
 CFG="$T/config"
 export HERD_CONFIG_FILE="$CFG"
 

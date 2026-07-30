@@ -54,6 +54,12 @@ WT_A="$T/a"; write_journal "$WT_A"
   # shellcheck source=/dev/null
   . "$JOURNAL"; . "$COST"
   export WORKTREES_DIR="$WT_A"
+  # HERD-440: re-export JOURNAL_FILE to THIS fixture — journal.sh's JOURNAL_FILE test seam outranks
+  # WORKTREES_DIR resolution (by design, so a forgetful test never pollutes a live journal), so under
+  # scripts/ci/run-suite.sh (which pins JOURNAL_FILE suite-wide for that same reason) an unset override
+  # here would silently read/write the WRONG file. Convention documented in run-suite.sh: "a test that
+  # needs its own journal re-exports JOURNAL_FILE."
+  export JOURNAL_FILE="$WT_A/.herd/journal.jsonl"
 
   total="$(cost_day_total)"
   case "$total" in 7.5*) : ;; *) fail "cost_day_total should sum ONLY today's cost usd (=7.50), got '$total'" ;; esac
@@ -128,6 +134,7 @@ run_drain() {
     _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
     REVIEW_CONCURRENCY=2; SPAWN_AHEAD=1; DRYRUN=""
     export WORKTREES_DIR="$TREES"
+    export JOURNAL_FILE="$TREES/.herd/journal.jsonl"   # HERD-440: see Part A note — re-export over any suite-wide pin
     export BUDGET_DAILY="$1"
     [ "${2:-}" = "force" ] && export HERD_FORCE_SPAWN=1
     _BUDGET_DRAIN_PAUSED=""
@@ -214,6 +221,7 @@ export HERD_SKIP_PREFLIGHT=1
 export HERD_NO_APP=1
 LTREES="$T/ltrees"; mkdir -p "$LTREES"
 write_journal "$LTREES"          # $7.50 spent today, in this lane's own worktrees journal
+export JOURNAL_FILE="$LTREES/.herd/journal.jsonl"   # HERD-440: see Part A note — re-export over any suite-wide pin
 CFG="$T/lane-config"; export HERD_CONFIG_FILE="$CFG"
 cat > "$CFG" <<EOF
 PROJECT_ROOT="$REPO"

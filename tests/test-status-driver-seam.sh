@@ -27,12 +27,19 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 pass() { PASS=$((PASS+1)); }
 
 # ── Static wiring: status.sh routes through the seam (guarded), no raw `herdr agent list` ──────────
-_code() { awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/) print }' "$STATUS"; }
-_code | "$GREP" -qE 'herd_driver_agent_list_json' \
+# HERD-440: this used to run `_code | grep -qE ...` per check — piping awk straight into a
+# short-circuiting `grep -q` under `set -o pipefail`. grep -q exits the instant it finds a match, and
+# a still-writing awk on the other end of the pipe can then take a SIGPIPE on its next write and exit
+# non-zero; pipefail then reports the WHOLE pipeline as failed even though grep genuinely matched.
+# Whether awk's write lands before or after grep's early exit is a kernel-scheduling/pipe-buffer race
+# — reproduced as a real, if intermittent, false-negative on Linux CI runners and not on macOS.
+# Capture the filtered body ONCE and match it with bash's own regex operator (no pipe, no race).
+CODE_BODY="$(awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/) print }' "$STATUS")"
+[[ "$CODE_BODY" =~ herd_driver_agent_list_json ]] \
   || fail "status.sh does not read the roster via herd_driver_agent_list_json"
-_code | "$GREP" -qE 'declare -f herd_driver_agent_list_json' \
+[[ "$CODE_BODY" =~ "declare -f herd_driver_agent_list_json" ]] \
   || fail "status.sh does not GUARD the seam call (declare -f) for standalone-source safety"
-_code | "$GREP" -qE 'herdr agent list' \
+[[ "$CODE_BODY" =~ "herdr agent list" ]] \
   && fail "status.sh still contains a raw 'herdr agent list' call"
 pass
 

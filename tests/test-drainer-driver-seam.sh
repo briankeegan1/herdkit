@@ -26,7 +26,19 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 pass() { PASS=$((PASS+1)); }
 
 # _code_has <file> <ere> — true iff a NON-comment line of <file> matches <ere>.
-_code_has() { awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/) print }' "$1" | "$GREP" -qE "$2"; }
+#
+# HERD-440: this used to pipe awk straight into `grep -qE`, i.e. `awk ... | grep -qE ...` under
+# `set -o pipefail`. grep -q exits the instant it finds a match, and a still-writing awk on the other
+# end of the pipe can then take a SIGPIPE on its next write and exit non-zero; pipefail then reports
+# the WHOLE pipeline as failed even though grep genuinely matched. Whether awk's write lands before or
+# after grep's early exit is a kernel-scheduling/pipe-buffer race — reproduced as a real, if
+# intermittent, false-negative on Linux CI runners and not on macOS. Capture awk's output first, then
+# match it with bash's own regex operator (no pipe, no second process, no race).
+_code_has() {
+  local body
+  body="$(awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/) print }' "$1")"
+  [[ "$body" =~ $2 ]]
+}
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 # PART A — research-step.sh `report` fires the notification through the headless driver sink.
