@@ -134,6 +134,11 @@ HEALTH_CONCURRENCY="2"
 # 'MAIN RED' alarm row + notification on a red main (alarm only — never gates/reverts). Enabled here
 # because herdkit dogfoods its own merge-time tripwire; ships OFF for other consumers.
 MAIN_HEALTH_TICK="on"
+# HERD-434: main merged 5 PRs (#548-#552, 2026-07-28) while GitHub Actions CI stayed red on every one
+# and MAIN_HEALTH_TICK (above) reported green throughout — its local re-suite runs on the watcher's
+# OWN host and never asked GitHub. Enabled here for the same dogfood reason as MAIN_HEALTH_TICK;
+# ships OFF for other consumers.
+MAIN_HEALTH_CI_GATE="on"
 REFIX_MAX_ROUNDS="6"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
 REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"

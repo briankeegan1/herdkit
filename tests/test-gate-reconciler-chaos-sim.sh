@@ -275,7 +275,24 @@ record("legb_dispatch", (not killed) and json.loads(out).get("result") == "WAIT"
 
 # wait for the (detached) worker to finish writing the dispatch out-file
 disp = os.path.join(state_dir, ".health-dispatch-501-shaB01")
-deadline = time.time() + 15
+#
+# HERD-434: this poll is a TEST-HARNESS observation window, not a production contract — health()
+# itself never gives up on a slow dispatch, it just returns WAIT again next tick, forever. A too-
+# tight window here was CI-red on both platforms while green on every local run (2026-07-28 through
+# 2026-07-30): the dispatched worker is FOUR nested `bash` fork+execs deep (Popen -> healthcheck.sh
+# -> `bash -c $HEALTHCHECK_CMD` -> the worker script's own `#!/usr/bin/env bash` shebang), each of
+# which sources herd-config.sh + four lint scripts and runs a couple of `git` probes. Reproduced
+# locally by inserting a fixed per-fork-exec delay (a PATH-shimmed `bash` sleeping before exec'ing
+# the real one): at ~1s of added latency per hop the chain already lands at ~4.3s, at ~2s it lands
+# at ~8.3s — linear in the hop count, so GH Actions' slower/shared/cold-cache runners (this is
+# hermetic test #138 of 166, run sequentially, no warm page cache to lean on) landing past the old
+# 15s bound is entirely plausible, and — because the SAME chain runs every tick — deterministic
+# rather than occasional. A blown deadline here does NOT reveal a race in do_merge / gate-collect /
+# refix-bounce: it just means this observation window gave up before the (correctly, eventually
+# convergent) async dispatch finished, and every downstream checkpoint in this leg cascades false
+# off that one early giveup. Widened, not removed, so a GENUINELY hung dispatch still fails loudly
+# well inside run-suite.sh's 120s per-test cap (scripts/ci/run-suite.sh:HERD_CI_TEST_TIMEOUT).
+deadline = time.time() + 75
 while time.time() < deadline and not os.path.exists(disp):
     time.sleep(0.1)
 record("legb_worker_landed", os.path.exists(disp), "dispatch out-file present: %s" % disp)

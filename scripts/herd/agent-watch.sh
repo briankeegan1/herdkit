@@ -6391,6 +6391,18 @@ _main_health_autofix_enabled() {
   esac
 }
 
+# _main_health_ci_gate_enabled — true iff MAIN_HEALTH_CI_GATE opts in (HERD-434). Default OFF
+# (ship-dormant), same truthy-token leniency as its MAIN_HEALTH_* siblings. Gates ONLY whether
+# _main_health_ci_leg makes its `gh run list` probe — decoupled from MAIN_HEALTH_TICK (which stays
+# the prerequisite, since the leg reuses its state file / console row / notify-once path) so a repo
+# can run the local re-suite tripwire without also opting into a live GitHub API poll, or vice versa.
+_main_health_ci_gate_enabled() {
+  case "$(printf '%s' "${MAIN_HEALTH_CI_GATE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _main_health_marker <sha> — the per-sha run-once marker (mirrors the sha-keyed .health-result cache):
 # a main sha whose marker exists has ALREADY been ticked, so a re-entrant merge tick / watcher restart
 # never re-runs the suite for the same commit.
@@ -6756,7 +6768,9 @@ _main_health_file_age_mins() {
 # kind=ci (HERD-372) so it MERGES its own identity field rather than clobbering a standing local-suite
 # failing-test identity (or being clobbered by one).
 #
-# Rides the MAIN_HEALTH_TICK lever (byte-inert when off) and is fully fail-soft: an offline/old gh, no
+# Rides the MAIN_HEALTH_TICK lever (byte-inert when off) AND, HERD-434, its own MAIN_HEALTH_CI_GATE
+# lever (also byte-inert when off, default off) — decoupled so a repo can run the local re-suite
+# tripwire without also opting into a live GitHub API poll. Fully fail-soft: an offline/old gh, no
 # runs, or a run that is not yet COMPLETED yields NOTHING and never paints a red row. Deduped by
 # (sha, conclusion) via $MAIN_HEALTH_CI_STATE so a standing CI red fires the row + journal exactly ONCE,
 # never per tick. The local-suite green→clear path (kind=local) only ever drops the LOCAL identity field
@@ -6804,15 +6818,27 @@ for r in runs:                       # gh returns newest-first
 # _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs. On a
 # FAILING conclusion for the CURRENT main HEAD, fires _main_health_set_red once per (sha, conclusion). On
 # a PASSING conclusion, clears the CI identity (HERD-372) — but only when $MAIN_HEALTH_CI_STATE shows a
-# red was actually standing, so a normally-green branch never journals on every scan. Lever-gated +
-# fail-soft; always returns 0.
+# red was actually standing, so a normally-green branch never journals on every scan. Lever-gated (both
+# MAIN_HEALTH_TICK and, HERD-434, MAIN_HEALTH_CI_GATE) + fail-soft; always returns 0.
+#
+# HERD-434 BUG FIX: `gh run list --branch` wants the BARE branch name GitHub Actions itself knows the
+# run by (e.g. "main") — it silently returns zero rows for a remote-qualified ref like "origin/main".
+# $DEFAULT_BRANCH is exactly that remote-qualified form (herd-config.sh defaults it to "origin/main",
+# the shape every `git diff $DEFAULT_BRANCH` caller wants); this leg used it directly since it was
+# written (2026-07-13) and so had been RUNNING every ~10 ticks and PERMANENTLY finding zero runs —
+# hitting the byte-identical "no Actions" fail-soft path on every single probe, forever. That is the
+# actual reason five red-CI merges (#548–#552, 2026-07-28) raised no alarm: this leg was already live,
+# already enabled (MAIN_HEALTH_TICK=on in this project's own .herd/config), and already silently
+# inert. $HERD_BRANCH_NAME (herd-config.sh: the split of $DEFAULT_BRANCH after its last "/") is the
+# bare form every other `gh`-facing branch filter in this codebase already uses.
 _main_health_ci_leg() {
   _main_health_enabled || return 0
+  _main_health_ci_gate_enabled || return 0
   [ -n "${DRYRUN:-}" ] && return 0
   local _sha _json _res _bucket _wf _concl _line _prev
   _sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_sha" ] || return 0
-  _json="$(_gh_timeout main_health_ci run list --branch "$DEFAULT_BRANCH" --limit 20 \
+  _json="$(_gh_timeout main_health_ci run list --branch "$HERD_BRANCH_NAME" --limit 20 \
              --json headSha,status,conclusion,workflowName 2>/dev/null)" || return 0
   [ -n "$_json" ] || return 0                              # offline gh / no Actions → byte-identical
   _res="$(printf '%s' "$_json" | _main_ci_classify "$_sha")"
@@ -13709,10 +13735,12 @@ EOF
   # MAIN_HEALTH_RECHECK_MINS cadence. Byte-inert when MAIN_HEALTH_TICK=off.
   reconcile_main_health
 
-  # Branch-CI main-red leg (HERD-334): the MAIN RED machinery reflected only the LOCAL suite, which can be
-  # green while the DEFAULT branch's required CI is red (main sat CI-red 6h after #439 with no alarm). On a
-  # throttled cadence, probe the branch's latest CI run and fire the SAME main-red row on a failing
-  # conclusion. Byte-inert when MAIN_HEALTH_TICK=off; fail-soft (no gh / no runs → no row).
+  # Branch-CI main-red leg (HERD-334, HERD-434): the MAIN RED machinery reflected only the LOCAL suite,
+  # which runs on the WATCHER'S OWN (fast, idle) host and can be green while the DEFAULT branch's CI on
+  # GitHub's (slower, contended) runners is red on the identical sha. On a throttled cadence, probe the
+  # branch's latest CI run and fire the SAME main-red row on a failing conclusion. Byte-inert when
+  # MAIN_HEALTH_TICK=off OR MAIN_HEALTH_CI_GATE=off (HERD-434, default off); fail-soft (no gh / no runs
+  # / a run still pending → no row).
   _MAIN_CI_SCAN_TICK=$((_MAIN_CI_SCAN_TICK + 1))
   if [ "$_MAIN_CI_SCAN_TICK" -ge "$_MAIN_CI_SCAN_INTERVAL" ]; then
     _MAIN_CI_SCAN_TICK=0
