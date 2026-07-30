@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 1546 (defined in >1 file: 34) · with cross-file callers: 273
+- Functions indexed: 1547 (defined in >1 file: 34) · with cross-file callers: 273
 
 ## Functions (def → cross-file callers)
 
@@ -1324,8 +1324,9 @@ this scan cannot see).
 - `herd_engine_stale` — def `scripts/herd/engine-version.sh:77` — callers: `scripts/herd/agent-watch.sh:893`
 - `herd_engine_warn_if_stale` — def `scripts/herd/engine-version.sh:122` — callers: `bin/herd:3933`
 - `herd_enum` — def `scripts/herd/herd-config.sh:1541` — callers: —
-- `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:39` — callers: —
-- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:94`, `scripts/herd/healthcheck.sh:120` — callers: —
+- `herd_gate_coverage_advisory_note` — def `scripts/herd/gate-coverage-lint.sh:107` — callers: —
+- `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:47` — callers: —
+- `herd_gate_coverage_lint` — def `scripts/herd/gate-coverage-lint.sh:127`, `scripts/herd/healthcheck.sh:120` — callers: —
 - `herd_git_scope_check` — def `scripts/herd/git-scope-lint.sh:109` — callers: —
 - `herd_git_scope_lint` — def `scripts/herd/git-scope-lint.sh:206`, `scripts/herd/healthcheck.sh:142` — callers: —
 - `herd_is_derived_path` — def `scripts/herd/derived-files.sh:54` — callers: —

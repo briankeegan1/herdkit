@@ -595,7 +595,7 @@ else
   HERD_GATE_COVERAGE_SKIP_REASON="scripts/herd/gate-coverage-lint.sh not present"
 fi
 case "$_hc_gcov_rc" in
-  0) gcov_note="gate-coverage: clean" ;;
+  0) gcov_note="gate-coverage: clean — $(herd_gate_coverage_advisory_note "$_hc_gcov_errs")" ;;
   2) gcov_note="gate-coverage: skipped ($HERD_GATE_COVERAGE_SKIP_REASON)" ;;
   *) gcov_note="gate-coverage: UNGATED TESTS"
      if [ -n "$ONELINE" ]; then
