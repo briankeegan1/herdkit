@@ -208,7 +208,30 @@ okp
 P3="$T/p3"; _make_project "$P3"
 NOGH="$T/nogh"; mkdir -p "$NOGH"
 cp "$BIN/pgrep" "$NOGH/"; cp "$BIN/herdr" "$NOGH/"   # keep pgrep+herdr, DROP gh
-OUT="$( cd "$P3" && PATH="$NOGH:/usr/bin:/bin" HERD_RELOAD_SKIP_LAUNCH=1 HERD_CAPABILITIES_FILE="$CAPS" bash "$HERD" config set --shared CLAIM_REQUIRED on 2>&1 )"; RC=$?
+# HERD-440: a hardcoded "/usr/bin:/bin" fallback is NOT gh-free on every platform — Ubuntu's
+# actions runner installs gh into /usr/bin (unlike macOS/Homebrew, where it lives elsewhere), so this
+# degrade path was silently finding the REAL gh on ubuntu and never exercising the no-gh branch.
+# A first attempt just dropped any PATH dir that resolved a gh binary — but on Linux /usr/bin ALSO
+# holds git/python3/coreutils, so discarding the whole directory broke everything else `herd` needs
+# and the config-set subprocess hung instead of failing loudly. Mirror every OTHER executable from a
+# gh-holding directory into $NOGH (symlinks, skipping names already stubbed above) instead of
+# discarding the directory outright — gh is hidden, nothing else is lost.
+NOGH_PATH="$NOGH"
+IFS=':' read -r -a _cfgpr_path_dirs <<< "$PATH"
+for _cfgpr_d in "${_cfgpr_path_dirs[@]}"; do
+  [ -n "$_cfgpr_d" ] || continue
+  if [ -x "$_cfgpr_d/gh" ]; then
+    for _cfgpr_bin in "$_cfgpr_d"/*; do
+      [ -x "$_cfgpr_bin" ] && [ -f "$_cfgpr_bin" ] || continue
+      _cfgpr_base="${_cfgpr_bin##*/}"
+      [ "$_cfgpr_base" = "gh" ] && continue
+      [ -e "$NOGH/$_cfgpr_base" ] || ln -sf "$_cfgpr_bin" "$NOGH/$_cfgpr_base" 2>/dev/null || true
+    done
+    continue
+  fi
+  NOGH_PATH="$NOGH_PATH:$_cfgpr_d"
+done
+OUT="$( cd "$P3" && PATH="$NOGH_PATH" HERD_RELOAD_SKIP_LAUNCH=1 HERD_CAPABILITIES_FILE="$CAPS" bash "$HERD" config set --shared CLAIM_REQUIRED on 2>&1 )"; RC=$?
 [ "$RC" -eq 0 ] || fail "(6) --shared without gh should still succeed locally (rc=$RC): $OUT"
 grep -qE '^CLAIM_REQUIRED="on"' "$P3/.herd/config" || fail "(6) local change not applied in the degrade path"
 printf '%s\n' "$OUT" | grep -qi 'gh CLI not found' || fail "(6) degrade path did not warn about missing gh ($OUT)"
