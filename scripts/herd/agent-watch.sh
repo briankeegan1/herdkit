@@ -686,6 +686,7 @@ HDR_LINE=""
 RULE=""
 LANDED=""
 BLOCKED=""
+RECONCILE_PENDING=""    # HERD-438: "reconcile pending" section rows (empty when nothing is mid-flight)
 TRACKER_DRIFT=""
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
@@ -773,6 +774,57 @@ build_landed() {
     sl="$(_slug_cell "$slug" "$ref")"
     LANDED="${LANDED}    ${C_GREEN}✅${C_RESET} ${C_DIM}${pnum}${C_RESET} ${C_GREEN}${sl}${C_RESET} ${C_DIM}${hhmm}${C_RESET}"$'\n'
   done < <(reverse_file "$STATE" | head -3)  # pipe-ok: head in a command or process substitution; pipeline status not gated
+}
+
+# _RECONCILE_PENDING_OVERDUE_SECS — HERD-438: past BOTH documented convergence windows (the fast
+# merge-time path, ~100s, and the tracker-state-sweep backstop, ~20-30m) a still-unconfirmed reconcile
+# stops being "the normal async window" and starts being worth a loud look. 40m gives the slower path
+# real headroom before flipping color.
+_RECONCILE_PENDING_OVERDUE_SECS=2400
+
+# _reconcile_pending_row <epoch> <pr#> <ref> — render ONE "reconcile pending" row. Calm (dim yellow)
+# inside the normal convergence window; loud (red) once a row outlives both backstops — the one shape
+# actually worth an operator's attention, same "calm vs loud" split _tracker_heal_row already uses.
+_reconcile_pending_row() {
+  local epoch="$1" pr="$2" ref="$3" now age hhmm glyph color label
+  now="$(_now_epoch)"
+  age=$(( now - epoch )); [ "$age" -ge 0 ] || age=0
+  hhmm="$(epoch_to_hhmm "$epoch")"
+  if [ "$age" -ge "$_RECONCILE_PENDING_OVERDUE_SECS" ]; then
+    glyph='⚠️ '; color="$C_RED"; label="still pending"
+  else
+    glyph='⏳'; color="$C_YELLOW"; label="pending"
+  fi
+  printf '    %s%s%s %s%s%s %s%s%s %s#%s · %s%s' \
+    "$color" "$glyph" "$C_RESET" "$C_BOLD" "$ref" "$C_RESET" \
+    "$color" "$label" "$C_RESET" "$C_DIM" "$pr" "$hhmm" "$C_RESET"
+}
+
+# build_reconcile_pending — HERD-438: the "reconcile pending" section. There is otherwise NO
+# operator-visible signal that a merged PR's tracker item is mid-flight (not yet converged) rather
+# than genuinely stuck — the exact gap that misled a coordinator into filing HERD-429 on an
+# unexamined too-early check, and then HERD-438 itself on a stale re-read of HERD-418 (verified via
+# the Linear issue history: HERD-418 converged correctly 4 minutes after its PR merged on 2026-07-22
+# and stayed Done for 8 days; nothing here needed fixing). Reads $STATE (the same "recently landed"
+# ledger build_landed renders) and, for each row that carries a tracker ref, checks the SAME evidence
+# _pms_reconcile_handled already trusts elsewhere in this file: the tracker-state-sweep's own
+# confirmed-Done ledger, or this seat's own fast-path reconcile journal event. A ref found in either
+# is omitted — already converged, nothing to show. Byte-inert (RECONCILE_PENDING stays empty, section
+# omitted) on the `file` backend (no update-state op to confirm against, same carve-out
+# _tsweep_backend_supported uses), with no $STATE rows, or once every recent merge has converged.
+# Pure local-file reads (no network, no backend sourcing) — safe to call every render tick.
+build_reconcile_pending() {
+  RECONCILE_PENDING=""
+  [ "${SCRIBE_BACKEND:-file}" = "file" ] && return 0
+  [ -s "$STATE" ] || return 0
+  local epoch pr slug ref rows=""
+  while read -r epoch pr slug ref; do
+    [ -n "${epoch:-}" ] && [ -n "${ref:-}" ] || continue
+    _pms_tracker_ledgered "$ref" && continue      # tracker sweep already confirmed it Done
+    _pms_journal_has reconcile "$pr" && continue  # this seat's own fast-path reconcile already ran
+    rows="${rows}$(_reconcile_pending_row "$epoch" "$pr" "$ref")"$'\n'
+  done < <(reverse_file "$STATE" | head -5)  # pipe-ok: head in a command or process substitution; pipeline status not gated
+  [ -n "$rows" ] && RECONCILE_PENDING="$rows"
 }
 
 # _dep_state_style <state> — echo "<glyph>\t<color>" for a dep state. Keeps the palette mapping in
@@ -1995,6 +2047,13 @@ render() {
     frame="${frame}${CELEBRATE}"$'\n'
   fi
   frame="${frame}  ${C_DIM}recently landed${C_RESET}"$'\n'"${LANDED}"$'\n'
+  # "reconcile pending" (HERD-438) — the async window between a merge and its tracker item's
+  # confirmed Done is NORMAL (up to ~30m, two independent backstops), but was previously invisible;
+  # empty (byte-identical console) once every recent merge has converged. Sits right under "recently
+  # landed" since it annotates those same rows.
+  if [ -n "${RECONCILE_PENDING:-}" ]; then
+    frame="${frame}  ${C_DIM}reconcile pending${C_RESET}"$'\n'"${RECONCILE_PENDING}"$'\n'
+  fi
   if [ -n "${BLOCKED:-}" ]; then
     frame="${frame}  ${C_DIM}blocked on${C_RESET}"$'\n'"${BLOCKED}"$'\n'
   fi
@@ -13167,6 +13226,7 @@ _tick_render_reconcile() {
 
   build_header
   build_landed
+  build_reconcile_pending
   build_blocked
   build_tracker_drift
   build_spawn_holds
