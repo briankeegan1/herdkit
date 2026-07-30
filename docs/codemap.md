@@ -223,6 +223,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `DOCS_ONLY_GLOB` → `agent-watch.sh`, `posture-lint.sh`, `git-pr.sh`
 - `DOCTOR_STARTUP_HINT` → `bin/herd`, `herd-preflight.sh`
 - `DOC_APPLY_PATH_GLOB` → —
+- `DRAFT_AUTO_PROMOTE` → `agent-watch.sh`
 - `DRAINER_HEARTBEAT_TIMEOUT` → `lifecycle.sh`, `research.sh`, `scribe.sh`
 - `ENGINE_AUTOUPDATE` → `engine-version.sh`
 - `ENGINE_IMPL` → `engine-version.sh`, `posture-lint.sh`
