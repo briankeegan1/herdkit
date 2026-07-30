@@ -29,6 +29,10 @@
 #   HERD_CI_ALLOWLIST    env-sensitive allowlist tsv (default: <tests>/known-env-sensitive.tsv)
 #   HERD_CI_TEST_TIMEOUT per-test timeout seconds    (default: 180; needs coreutils timeout/gtimeout)
 #   HERD_CI_FORCE_DIRECT 1 = run ALL test-*.sh (the glob), not just the curated herd.bats subset
+#   HERD_CI_ARTIFACTS_DIR dir for scorecard/per-rep artifacts from tests that support the shared
+#                        `--artifacts DIR --keep` convention (default: a fresh mktemp -d). Written
+#                        back to $GITHUB_ENV in CI so a failure-upload step can find it (HERD-436:
+#                        the scorecard a chaos/sim test names on failure was never uploaded before).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -153,26 +157,58 @@ fi
 pass=0; real_fail=0; xfail=0
 real_names=(); xfail_names=()
 LOGDIR="$(mktemp -d 2>/dev/null || echo /tmp/herd-ci-logs.$$)"; mkdir -p "$LOGDIR"
+# ARTROOT (HERD-436): a per-test scratch dir for the sim/chaos tests that already support the shared
+# `--artifacts DIR --keep` convention (test-gate-reconciler-chaos-sim.sh, test-merge-queue-sim.sh,
+# test-merge-result-gate-sim.sh). Passing it in — instead of letting each test mktemp+delete its own
+# ART on EXIT — is what makes the scorecard.json / per-rep detail a failing test names survive past
+# the test's own process, so a CI upload step (or a human) can actually read it.
+ARTROOT="${HERD_CI_ARTIFACTS_DIR:-$(mktemp -d 2>/dev/null || echo /tmp/herd-ci-artifacts.$$)}"
+mkdir -p "$ARTROOT"
+if [ -n "${GITHUB_ENV:-}" ]; then
+  { echo "HERD_CI_LOGDIR=$LOGDIR"; echo "HERD_CI_ARTIFACTS_DIR=$ARTROOT"; } >> "$GITHUB_ENV"
+fi
 [ -n "$TO" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
 echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, timeout=${TO:-none}) on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
+  test_artdir="$ARTROOT/$name"
+  extra_args=()
+  if grep -q -- '--artifacts) ART=' "$t" 2>/dev/null; then
+    extra_args=(--artifacts "$test_artdir" --keep)
+  fi
   # shellcheck disable=SC2086
   # HERMETIC_TEST names the fixture for journal.sh's fail-safe (and any other test-context guards).
-  HERMETIC_TEST="$name" $TO bash "$t" </dev/null >"$log" 2>&1
+  # extra_args[@] is expanded via the +"…" guard because macOS's system bash (3.2 — the default on
+  # both the maintainer's box and the CI macos runner) treats "${arr[@]}" on an EMPTY array as an
+  # unbound-variable error under `set -u`, unlike bash >= 4.4.
+  HERMETIC_TEST="$name" $TO bash "$t" "${extra_args[@]+"${extra_args[@]}"}" </dev/null >"$log" 2>&1
   rc=$?
   if [ "$rc" -eq 0 ]; then
-    pass=$((pass+1)); continue
+    pass=$((pass+1))
+    [ ${#extra_args[@]} -eq 0 ] || rm -rf "$test_artdir"  # green: nothing worth keeping
+    continue
   fi
   timedout=""; [ "$rc" -eq 124 ] && timedout=" (TIMEOUT after ${PER_TEST_TIMEOUT}s)"
   if reason="$(allow_reason "$name")"; then
     xfail=$((xfail+1)); xfail_names+=("$name — $reason")
     echo "⚠️  XFAIL (env-sensitive) $name$timedout: $reason"
+    [ ${#extra_args[@]} -eq 0 ] || rm -rf "$test_artdir"
   else
     real_fail=$((real_fail+1)); real_names+=("$name$timedout")
-    echo "❌ FAIL $name$timedout — last lines:"
-    tail -n 6 "$log" | sed 's/^/      │ /'
+    echo "❌ FAIL $name$timedout"
+    # HERD-436: a wrapper test that runs many checkpoints (e.g. multiple chaos-sim reps) can scroll
+    # its own failing assertion off the top of a plain tail long before the wrapper's final summary
+    # line — print every checkpoint the test itself reported as failed, not just the last 6 lines.
+    if grep -qE '^FAIL[: ]' "$log"; then
+      echo "   failing checkpoints:"
+      grep -E '^FAIL[: ]' "$log" | sed 's/^/      │ /'
+    fi
+    echo "   last lines:"
+    tail -n 10 "$log" | sed 's/^/      │ /'
+    if [ -d "$test_artdir" ]; then
+      echo "   artifacts kept: $test_artdir"
+    fi
   fi
 done
 
