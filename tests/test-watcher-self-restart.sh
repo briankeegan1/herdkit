@@ -229,18 +229,28 @@ _self_restart_tick
 ok
 
 # ── (9) cap expiry restarts even with a worker STILL live ────────────────────────────────────────
-# The offset is an ABSOLUTE 15 min + 1 s — never $SELF_RESTART_CAP_SECS itself, or a widened cap would
+# The offset is an ABSOLUTE 15 min ± 1 s — never $SELF_RESTART_CAP_SECS itself, or a widened cap would
 # widen the test with it and this leg would pass against a watcher that waits forever.
+#
+# THE CLOCK IS PINNED (HERD-439). Both probes sit ONE SECOND from the cap, and they used to derive the
+# armed-at epoch from a live `date +%s` while _self_restart_tick read the wall clock AGAIN — so the
+# under-cap probe had exactly 1 s of slack against a moving clock. Any fork or scheduling delay that
+# crossed a second boundary between the two reads turned waited=899 into waited=900, tripping the cap
+# and failing "(9) restarted before the 15-minute cap expired". That is what reddened the macos CI leg
+# on PR #560 (run 30584045451); reproduced locally at 2/200 runs UNLOADED, with the instrumented
+# failure showing exactly `t1-t0=1 waited=900 cap=900`. The slower/contended macOS runner simply lost
+# the race more often — it was never a platform property, so this is a real flake fix, not an XFAIL.
+#
+# HERD_FAKE_NOW freezes both reads on the ONE source the engine already uses (_now_epoch), making each
+# probe exact instead of probabilistic: 901 MUST fire, 899 MUST NOT, with no window in between.
 reset_state; note
 _self_restart_tick                                       # arms
 worker review                                            # a reviewer that never finishes
-_SELF_RESTART_ARMED=$(( $(date +%s) - 901 ))             # armed 15 min + 1 s ago
-_self_restart_tick
+HERD_FAKE_NOW=$(( _SELF_RESTART_ARMED + 901 )) _self_restart_tick    # armed 15 min + 1 s ago
 [ "$EXECED" = "cap-expiry" ]       || fail "(9) the max-wait cap did not fire (got '${EXECED:-<none>}')"
 # …and one second INSIDE the cap it is still waiting on the live worker.
 reset_state; note; _self_restart_tick; worker review
-_SELF_RESTART_ARMED=$(( $(date +%s) - 899 ))
-_self_restart_tick
+HERD_FAKE_NOW=$(( _SELF_RESTART_ARMED + 899 )) _self_restart_tick
 [ -z "$EXECED" ]                   || fail "(9) restarted before the 15-minute cap expired"
 ok
 
