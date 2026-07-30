@@ -72,9 +72,9 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 ART=""; KEEP=""; LABEL_PREFIX="sandbox-realpanes-sim"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "sandbox-real-panes-scenario: --artifacts requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
-    --label)     LABEL_PREFIX="${2:-}"; shift 2 ;;
+    --label)     [ $# -ge 2 ] || { echo "sandbox-real-panes-scenario: --label requires a value" >&2; exit 1; }; LABEL_PREFIX="$2"; shift 2 ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-real-panes-scenario: unknown arg: $1" >&2; exit 1 ;;
   esac

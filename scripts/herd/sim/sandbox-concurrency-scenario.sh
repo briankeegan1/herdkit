@@ -77,10 +77,10 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 ART=""; KEEP=""; NPRS=3; POSTURE=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "sandbox-concurrency-scenario: --artifacts requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
-    -n|--prs)    NPRS="${2:-3}"; shift 2 ;;
-    --posture)   POSTURE="${2:-}"; shift 2 ;;
+    -n|--prs)    [ $# -ge 2 ] || { echo "sandbox-concurrency-scenario: -n/--prs requires a value" >&2; exit 1; }; NPRS="$2"; shift 2 ;;
+    --posture)   [ $# -ge 2 ] || { echo "sandbox-concurrency-scenario: --posture requires a value" >&2; exit 1; }; POSTURE="$2"; shift 2 ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "sandbox-concurrency-scenario: unknown arg: $1" >&2; exit 1 ;;
   esac

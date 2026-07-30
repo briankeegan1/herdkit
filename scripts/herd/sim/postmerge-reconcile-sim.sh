@@ -47,7 +47,7 @@ PASS=0; FAIL=0
 ART=""; KEEP=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "postmerge-reconcile-sim: --artifacts requires a value" >&2; exit 2; }; ART="$2"; KEEP=1; shift 2 ;;
     --keep)      KEEP=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac

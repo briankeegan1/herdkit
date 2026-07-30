@@ -124,4 +124,17 @@ SC2="$ART2/scorecard.json"
 [ "$(sc "$SCARD" resume_target)" = "$(sc "$SC2" resume_target)" ] || fail "(g) resume_target not reproducible"
 echo "PASS (g) deterministic across runs"
 
+# ── (h) BARE-FLAG ARG GUARD (HERD-430) — a value-taking flag with no value must fail
+# fast and loud, not hang. Pre-fix, bare `--artifacts` looped forever at 100% CPU: `shift 2` silently
+# failed under `set -uo pipefail` (no -e), so the positional count never decremented and the while
+# loop re-matched `--artifacts` forever. Wrapped in a bounded timeout so a regression here reports a
+# failure after a few seconds instead of hanging the suite forever.
+rc=0
+timeout 8 bash "$SCENARIO" --artifacts >"$T/bare-artifacts.out" 2>&1 || rc=$?
+[ "$rc" -ne 124 ] || fail "(h) bare --artifacts HUNG past the bounded timeout (regressed to the pre-HERD-430 infinite loop)"
+[ "$rc" -ne 0 ]   || fail "(h) bare --artifacts exited 0 — must fail loudly, not silently accept a missing value"
+grep -qi 'artifacts.*requires a value' "$T/bare-artifacts.out" \
+  || fail "(h) bare --artifacts did not print a usage message naming the flag:"$'\n'"$(cat "$T/bare-artifacts.out")"
+echo "PASS (h) bare --artifacts fails fast with a usage message (rc=$rc), not a hang"
+
 echo "ALL PASS"

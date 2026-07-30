@@ -354,4 +354,26 @@ NEW_ENTRIES="$(comm -13 <(printf '%s\n' "$BASELINE_STATUS") <(printf '%s\n' "$NO
 [ -z "$NEW_ENTRIES" ] || fail "(D) scenario leaked into the real repo tree:"$'\n'"$NEW_ENTRIES"
 echo "PASS (D) hermetic — no leak into the real repo"
 
+# ── (E) BARE-FLAG ARG GUARD (HERD-430) — a value-taking flag with no value must fail
+# fast and loud, not hang. Pre-fix, `--artifacts` with nothing after it looped forever at 100% CPU:
+# `shift 2` silently failed under `set -uo pipefail` (no -e), so the positional count never
+# decremented and the while loop re-matched `--artifacts` forever. Wrapped in a bounded timeout so a
+# regression here reports a failure after a few seconds instead of hanging the suite forever.
+rc=0
+timeout 8 bash "$SCENARIO" --artifacts >"$T/bare-artifacts.out" 2>&1 || rc=$?
+[ "$rc" -ne 124 ] || fail "(E) bare --artifacts HUNG past the bounded timeout (regressed to the pre-HERD-430 infinite loop)"
+[ "$rc" -ne 0 ]   || fail "(E) bare --artifacts exited 0 — must fail loudly, not silently accept a missing value"
+grep -qi 'artifacts.*requires a value' "$T/bare-artifacts.out" \
+  || fail "(E) bare --artifacts did not print a usage message naming the flag:"$'\n'"$(cat "$T/bare-artifacts.out")"
+echo "PASS (E) bare --artifacts fails fast with a usage message (rc=$rc), not a hang"
+
+# Same guard for --label, this scenario's other value-taking flag.
+rc=0
+timeout 8 bash "$SCENARIO" --label >"$T/bare-label.out" 2>&1 || rc=$?
+[ "$rc" -ne 124 ] || fail "(E) bare --label HUNG past the bounded timeout"
+[ "$rc" -ne 0 ]   || fail "(E) bare --label exited 0 — must fail loudly"
+grep -qi 'label.*requires a value' "$T/bare-label.out" \
+  || fail "(E) bare --label did not print a usage message naming the flag:"$'\n'"$(cat "$T/bare-label.out")"
+echo "PASS (E) bare --label fails fast with a usage message (rc=$rc), not a hang"
+
 echo "ALL PASS"

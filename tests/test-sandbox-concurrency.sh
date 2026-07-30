@@ -177,4 +177,19 @@ SC2="$ART2/scorecard.json"
 [ "$(sc "$SC2" queue_drained)" = "True" ]       || fail "(g) cap=3 queue must drain"
 echo "PASS (g) parameterized cap=3 (peak=$(sc "$SC2" peak_reviews_in_flight))"
 
+# ── (k) BARE-FLAG ARG GUARD (HERD-430) — a value-taking flag with no value must fail
+# fast and loud, not hang. Pre-fix, a bare value-taking flag looped forever at 100% CPU: `shift 2`
+# silently failed under `set -uo pipefail` (no -e), so the positional count never decremented and
+# the while loop re-matched the flag forever. Wrapped in a bounded timeout so a regression here
+# reports a failure after a few seconds instead of hanging the suite forever.
+for flag in --artifacts -n --posture; do
+  rc=0
+  timeout 8 bash "$SCENARIO" "$flag" >"$T/bare-$flag.out" 2>&1 || rc=$?
+  [ "$rc" -ne 124 ] || fail "(k) bare $flag HUNG past the bounded timeout (regressed to the pre-HERD-430 infinite loop)"
+  [ "$rc" -ne 0 ]   || fail "(k) bare $flag exited 0 — must fail loudly, not silently accept a missing value"
+  grep -qi 'requires a value' "$T/bare-$flag.out" \
+    || fail "(k) bare $flag did not print a usage message naming the flag:"$'\n'"$(cat "$T/bare-$flag.out")"
+  echo "PASS (k) bare $flag fails fast with a usage message (rc=$rc), not a hang"
+done
+
 echo "ALL PASS"

@@ -62,10 +62,10 @@ command -v python3 >/dev/null 2>&1 || { echo "parity-run: python3 required" >&2;
 SCENARIO="sandbox-scenario.sh"; ART=""; SHADOW=""; MAX=""; KEEP=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --scenario)  SCENARIO="${2:-}"; shift 2 ;;
-    --artifacts) ART="${2:-}"; KEEP=1; shift 2 ;;
-    --shadow)    SHADOW="${2:-}"; shift 2 ;;
-    --max)       MAX="${2:-}"; shift 2 ;;
+    --scenario)  [ $# -ge 2 ] || { echo "parity-run: --scenario requires a value" >&2; exit 2; }; SCENARIO="$2"; shift 2 ;;
+    --artifacts) [ $# -ge 2 ] || { echo "parity-run: --artifacts requires a value" >&2; exit 2; }; ART="$2"; KEEP=1; shift 2 ;;
+    --shadow)    [ $# -ge 2 ] || { echo "parity-run: --shadow requires a value" >&2; exit 2; }; SHADOW="$2"; shift 2 ;;
+    --max)       [ $# -ge 2 ] || { echo "parity-run: --max requires a value" >&2; exit 2; }; MAX="$2"; shift 2 ;;
     --keep)      KEEP=1; shift ;;
     -h|--help)   grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "parity-run: unknown arg: $1" >&2; exit 2 ;;
