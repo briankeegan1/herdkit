@@ -62,6 +62,7 @@ Role summarized from each file's top-of-file comment.
 - `herd-review.sh` — herd-review.sh <pr> <slug> — the PRE-MERGE ADVERSARIAL REVIEW GATE.
 - `herd-spawn-gate.sh` — ADVISORY pre-spawn review-gate saturation check, SOURCED by the lane
 - `herd-watch.sh` — launcher for the live "herd watch" status console (agent-watch.sh).
+- `hermetic-env-scrub.sh` — HERD-458: seal off herd-config.sh's own EXPORTED keys before a hermetic
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
 - `journal-audit.sh` — journal-driven self-audit / gap-finder (HERD-238 / N12).
 - `journal-emission-lint.sh` — THE shared CONSUMER-ONLY EVENT guard (HERD-442): every journal event
@@ -90,6 +91,7 @@ Role summarized from each file's top-of-file comment.
 - `stale-dup-gate.sh` — the PRE-MERGE STALE-DUPLICATE gate (HERD-188).
 - `status.sh` — pure helpers + the orchestrator behind `herd status`, a ONE-SHOT, READ-ONLY,
 - `steps.sh` — the shared PIPELINE STEPS runner (HERD-132): operator-defined lane stages with
+- `suite-shard.sh` — THE shared curated-test-selection + stable shard-assignment library for the
 - `sweep.sh` — the engine behind `herd sweep`: ONE-COMMAND CONTROL-ROOM CLEANUP (HERD-191).
 - `symbol-index.sh` — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
@@ -154,7 +156,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
 - `herd-config.sh` → `context-guard.sh`, `resolver-claim.sh`
 - `herd-feature.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
-- `herd-preflight.sh` → `engine-version.sh`
+- `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
@@ -203,6 +205,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
+- `CHECKOUT_GUARD` → `agent-watch.sh`
 - `CI_AUTOREPAIR` → `ci-repair.sh`
 - `CLAIM_RELEASE` → `herd-claim.sh`
 - `CLAIM_REQUIRED` → `bin/herd`, `herd-claim.sh`
@@ -236,12 +239,13 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `FINISH_STALL_MIN` → `agent-watch.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`, `config-viability.sh`
+- `GATE_STATUS_PENDING` → —
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
 - `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
-- `HEALTH_INFLIGHT_TIMEOUT` → `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
+- `HEALTH_INFLIGHT_TIMEOUT` → `bin/herd`, `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
 - `HEALTH_PANE` → `agent-watch.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
 - `HERD_BRAND` → `herd-preflight.sh`
@@ -339,6 +343,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`
+- `WATCHER_SINGLETON_RECONCILE` → `agent-watch.sh`
+- `WATCHER_STOP_REAP_MAIN_HEALTH` → `bin/herd`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
 - `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `resolver-claim.sh`
