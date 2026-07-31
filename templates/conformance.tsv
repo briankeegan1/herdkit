@@ -206,6 +206,7 @@ git-scope-lint.sh	unit	tests/test-git-scope-lint.sh
 git-scope-lint.sh	unit	tests/test-nested-repo-isolation.sh
 journal-emission-lint.sh	unit	tests/test-journal-emission-lint.sh
 env-export-lint.sh	unit	tests/test-env-export-lint.sh
+hermetic-env-scrub.sh	unit	tests/test-hermetic-env-scrub.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
@@ -345,6 +346,8 @@ MAIN_HEALTH_CI_GATE	unit	tests/test-main-health-invariant.sh
 SWEEP_AUTO	unit	tests/test-sweep.sh
 WATCHER_FLAIR	unit	tests/test-watcher-flair.sh
 WATCHER_SELF_RESTART	unit	tests/test-watcher-self-restart.sh
+WATCHER_SINGLETON_RECONCILE	unit	tests/test-watcher-singleton-reconcile.sh
+WATCHER_STOP_REAP_MAIN_HEALTH	unit	tests/test-watcher-singleton-reconcile.sh
 WATCHER_SELF_RESTART	sim	tests/test-sandbox-self-restart.sh
 OPERATOR_INBOX	unit	tests/test-operator-inbox.sh
 ORPHAN_PR_ROWS	unit	tests/test-orphan-pr-rows.sh

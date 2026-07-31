@@ -20,6 +20,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 WATCH="$REPO/scripts/herd/agent-watch.sh"
 
+# HERD-458: pin our own precondition — a CONFIGURED caller can leave ambient MAIN_HEALTH_TICK /
+# PROJECT_ROOT / HEALTH_CONCURRENCY already exported, which sections (a)-(c)'s "pending is False when
+# unset" assertions rely on being genuinely absent (section (d) below re-arms MAIN_HEALTH_TICK the
+# production way on purpose — this only clears what a CONFIGURED ambient caller left behind first).
+# The shared harness scrub (scripts/herd/hermetic-env-scrub.sh) already does this once per suite run;
+# re-arm it here too so this test is self-sufficient run alone.
+if [ -f "$REPO/scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$REPO/scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$REPO/scripts/herd/herd-config.sh"
+fi
+
 command -v git     >/dev/null 2>&1 || { echo "FAIL: git required" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 required" >&2; exit 1; }
 [ -f "$WATCH" ]   || { echo "FAIL: missing $WATCH" >&2; exit 1; }

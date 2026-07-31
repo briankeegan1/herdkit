@@ -22,6 +22,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HERD="$HERE/../bin/herd"
 
+# HERD-458: pin our own precondition — a CONFIGURED caller (herd-config.sh sourced ambient, e.g. by
+# scripts/herd/healthcheck.sh --heavy) can leave MERGE_POLICY/WATCHER_AUTOMERGE/… already set, which
+# defeats the reload-derivation assertions below (the derive-from-WATCHER_AUTOMERGE path only fires
+# when MERGE_POLICY is genuinely unset). The shared harness scrub (scripts/herd/hermetic-env-scrub.sh)
+# already does this once per suite run; re-arm it here too so this test is self-sufficient run alone.
+if [ -f "$HERE/../scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/../scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$HERE/../scripts/herd/herd-config.sh"
+fi
+
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0
@@ -404,6 +415,12 @@ PY
     if [ ! -d "$S/panes/$p" ]; then printf '{"result":{}}\n'; exit 0; fi
     cmd=""
     [ -f "$S/panes/$p/cmd" ] && [ ! -f "$S/panes/$p/noshow" ] && cmd="$(cat "$S/panes/$p/cmd")"
+    # fgcmd: what the pane's FOREGROUND process reports ONCE something has been run in it, when that
+    # differs from the command that was typed. Real launches diverge the moment the launched process
+    # re-execs — agent-watch.sh re-execs ONCE under its per-workspace argv0 marker, after which the
+    # cmdline is `herd-watch-<slug> …/agent-watch.sh` and carries no `bash` token at all (HERD-458 /
+    # GH #572). Gated on a recorded `cmd` so the pane still reads BARE (adoptable) before the run.
+    [ -f "$S/panes/$p/fgcmd" ] && [ -f "$S/panes/$p/cmd" ] && cmd="$(cat "$S/panes/$p/fgcmd")"
     if [ -n "$cmd" ]; then
       printf '{"result":{"process_info":{"shell_pid":4242,"foreground_processes":[{"pid":5151,"cmdline":"%s"}]}}}\n' "$cmd"
     else
@@ -1084,6 +1101,68 @@ grep -q "agent start" "$S/log" && fail "--with-coordinator started a second agen
 grep -qi "refusing to restart it" <<< "$out" || fail "missing the live-agent refusal message"
 grep -q "herd pane coordinator" <<< "$out" || fail "refusal message did not point at 'herd pane coordinator'"
 grep -q "^coordinator-agent pA tC" "$P40_REAL/trees/.herd-panes" || fail "registry coordinator-agent row changed despite the refusal"
+ok
+
+# ═══ HERD-458 / GH #572: the pane-visibility probe must be honest in BOTH directions (tests 41+) ═══
+# THE DEFECT. `herd reload` verified its watcher launch by demanding a `bash …/agent-watch.sh` (or
+# herd-watch.sh) cmdline in the pane's foreground. That shape survives only for the instant BEFORE
+# agent-watch.sh re-execs under its per-workspace argv0 marker (`exec -a "$HERD_WATCH_ARGV0" bash
+# …/agent-watch.sh`, issue #60) — after which the foreground cmdline is `herd-watch-<slug>
+# …/agent-watch.sh` with no `bash` token at all. So "visible ✓" was decided by a race between the
+# ~0.2s poll and the re-exec, and a second operator's WSL2 seat lost that race on EVERY (re)start:
+# four invocations, four fresh pids, every one reporting "RUNNING but NOT visible … kill <pid> and
+# inspect the pane" while `herdr pane read` showed the watcher rendering with a live clock.
+# An always-red probe is exactly as blind as an always-green one — and this one told the operator to
+# kill a healthy watcher, which produces another pid and another warning: a loop that never converges.
+# The fix ALSO accepts the identity the process actually keeps (argv0, matched as the FIRST TOKEN,
+# exactly), which is the same attribution the stop leg reaps by.
+
+# ── 41. watcher re-exec'd under its argv0 → VISIBLE, not DETACHED (the GH #572 regression) ────────
+P="$T/p41"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state41"; _rich_coord_state "$S"
+# The pane run lands, then the watcher re-execs: the foreground carries the argv0 and nothing else.
+printf 'herd-watch-reloadtest /engine/scripts/herd/agent-watch.sh' > "$S/panes/pW/fgcmd"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (argv0-visible watcher)"
+grep -q "visible ✓" <<< "$out" \
+  || fail "a watcher rendering under its argv0 was not recognised as visible (HERD-458)"
+grep -q "DETACHED" <<< "$out" \
+  && fail "a healthy argv0-tagged watcher was reported DETACHED (the GH #572 false negative)" || true
+grep -q "RUNNING but NOT visible" <<< "$out" \
+  && fail "reload told the operator to kill a healthy, visible watcher" || true
+ok
+
+# ── 42. the argv0 match is EXACT — a FOREIGN workspace's tag is not our watcher (issue #60) ───────
+# The probe accepts an argv0 only as the command's first token and only when it equals THIS
+# workspace's marker, so workspace "reloadtest" can never read "reloadtest-other"'s watcher as its
+# own launch (the same rule that keeps the reaper from cross-project kills).
+P="$T/p42"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state42"; _rich_coord_state "$S"
+printf 'herd-watch-reloadtest-other /engine/scripts/herd/agent-watch.sh' > "$S/panes/pW/fgcmd"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (foreign argv0)"
+grep -q "visible ✓" <<< "$out" \
+  && fail "a FOREIGN workspace's argv0 was accepted as this workspace's watcher" || true
+ok
+
+# ── 43. the OTHER direction: a merely-echoed argv0 token is NOT a running watcher ─────────────────
+# The fix must not buy visibility by going always-green. argv0 counts only as the command's FIRST
+# token: a stale shell whose foreground merely CONTAINS the marker (the 2026-07-06 incident shape — a
+# dead viewer's typed-ahead keystrokes concatenated onto our run) is still a MISS, so with a live
+# watcher on the lockfile this must report the genuine detached case, loudly.
+P="$T/p43"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state43"; _rich_coord_state "$S"
+printf 'bash -c echo herd-watch-reloadtest' > "$S/panes/pW/fgcmd"
+sleep 999 & ZPID43=$!
+lockfile="$P/trees/.watcher-reloadtest.pid"
+out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID43")" \
+  || { kill "$ZPID43" 2>/dev/null || true; fail "reload failed (genuinely-detached test)"; }
+grep -q "RUNNING but NOT visible" <<< "$out" \
+  || { kill "$ZPID43" 2>/dev/null || true; fail "a genuinely detached watcher no longer warns — the probe went always-green"; }
+grep -q "DETACHED" <<< "$out" \
+  || { kill "$ZPID43" 2>/dev/null || true; fail "summary missing DETACHED for a genuinely detached watcher"; }
+kill "$ZPID43" 2>/dev/null || true
 ok
 
 echo "ALL PASS ($pass checks)"

@@ -403,6 +403,22 @@ if [ -n "$_hk_jh_dir" ]; then
   : > "$_hk_jh_file" 2>/dev/null || _hk_jh_file=""
 fi
 
+# ── HERD-458 HERMETIC-ENV SCRUB ───────────────────────────────────────────────────────────────────
+# This script is invoked as a CHILD of scripts/herd/healthcheck.sh, which sources herd-config.sh in
+# its OWN process (so the light-profile lints can read the project's config) — since HERD-449 that
+# EXPORTS the engine-core config keys, and every exported var crosses the child boundary into the
+# suite we are about to run. A hermetic test's own `: "${KEY:=default}"` line then becomes a no-op
+# because the key already has a value, so a test asserting the DEFAULT reds the instant THIS project's
+# .herd/config differs from it (reproduced live: HEALTH_CONCURRENCY=2 / WATCHER_AUTOMERGE=true /
+# MAIN_HEALTH_TICK=on leaking past six tests' default assertions). unset every key herd-config.sh
+# itself exports, ONCE, before the first test runs below — same discipline as the JOURNAL_FILE pin
+# just above, generalized so the key set is DERIVED from herd-config.sh's own export statements and
+# can never drift out of sync with it. Kept in lockstep with tests/test-hermetic-env-scrub.sh.
+if [ -f scripts/herd/hermetic-env-scrub.sh ]; then
+  . scripts/herd/hermetic-env-scrub.sh
+  herd_hermetic_env_scrub
+fi
+
 _hk_dh_verdict() {
   # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
   # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
