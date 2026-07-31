@@ -277,4 +277,90 @@ run "$P8" config get TEST_PATH_GLOB
 [ "$OUT" = "$payload" ]                           || fail "glob \$(...) payload did not round-trip byte-identical (got '$OUT')"
 ok
 
+# ══ 16. HERD-456 / GH #570: the SHIPPED manifest — not a stub — actually carries the domains ══
+# Sections 13–15 prove the MECHANISM against $CAPS, a stub manifest whose MERGE_POLICY row was
+# hand-written with an enum. That is exactly why GH #570 went unnoticed: the shipped
+# templates/capabilities.tsv left SCRIBE_BACKEND (and every other documented enum) at value_shape=free,
+# so `herd config set SCRIBE_BACKEND __probe__` was ACCEPTED and the watcher restarted against a
+# non-existent adapter. These cases run against the REAL manifest the engine ships.
+REAL_CAPS="$HERE/../templates/capabilities.tsv"
+[ -f "$REAL_CAPS" ]                               || fail "shipped capabilities.tsv not found at $REAL_CAPS"
+run_real() {
+  local r="$1"; shift
+  set +e
+  OUT="$( cd "$r" && HERD_CAPABILITIES_FILE="$REAL_CAPS" HERD_RELOAD_SKIP_LAUNCH=1 \
+           HERD_RELOAD_SIGTERM_POLLS=3 FAKE_STRAY_PIDS="" bash "$HERD" "$@" 2>&1 )"
+  RC=$?
+  set -e
+}
+
+P9="$T/p9"; mkdir "$P9"; _make_project "$P9"
+before_bytes="$(cat "$P9/.herd/config")"
+run_real "$P9" config set SCRIBE_BACKEND __probe__
+[ "$RC" -ne 0 ]                                   || fail "GH #570 REGRESSION: shipped manifest accepted SCRIBE_BACKEND=__probe__ ($OUT)"
+grep -qi 'invalid value' <<< "$OUT" || fail "SCRIBE_BACKEND refusal missing invalid-value message ($OUT)"
+# the refusal must PRINT THE VALID SET — a refusal that hides the alternatives just moves the guessing.
+for member in file github linear jira changelog; do
+  grep -qF "$member" <<< "$OUT" || fail "SCRIBE_BACKEND refusal did not print valid value '$member' ($OUT)"
+done
+[ "$(cat "$P9/.herd/config")" = "$before_bytes" ] || fail "a refused set mutated .herd/config (must be byte-identical)"
+grep -q '__probe__' "$P9/.herd/config"           && fail "probe value was written despite refusal"
+ok
+
+# a value INSIDE the documented domain is still accepted and applied exactly as before.
+run_real "$P9" config set SCRIBE_BACKEND github
+[ "$RC" -eq 0 ]                                   || fail "shipped manifest refused the valid SCRIBE_BACKEND=github ($OUT)"
+run_real "$P9" config get SCRIBE_BACKEND
+[ "$OUT" = "github" ]                             || fail "valid SCRIBE_BACKEND not persisted (got '$OUT')"
+ok
+
+# an enum whose domain admits the EMPTY string renders it as "" in the refusal, not a bare pipe.
+run_real "$P9" config set ATTRIBUTION_POLICY bogus-policy
+[ "$RC" -ne 0 ]                                   || fail "shipped manifest accepted an out-of-domain ATTRIBUTION_POLICY"
+grep -qF '"" | no-ai-coauthor' <<< "$OUT" || fail "empty enum member not rendered as \"\" in the refusal ($OUT)"
+ok
+
+# an INTEGER knob refuses a non-numeric value, and WORK_UNIT_KIND — whose shape cell shipped as prose
+# ('git-pr, doc-apply (python only)'), i.e. one member no real value could ever equal — accepts its
+# own documented default again.
+run_real "$P9" config set REVIEW_LOG_KEEP many
+[ "$RC" -ne 0 ]                                   || fail "shipped manifest accepted non-numeric REVIEW_LOG_KEEP=many"
+grep -qi 'non-negative integer' <<< "$OUT" || fail "numeric refusal message wrong ($OUT)"
+run_real "$P9" config set WORK_UNIT_KIND git-pr
+[ "$RC" -eq 0 ]                                   || fail "WORK_UNIT_KIND refused its own documented default git-pr ($OUT)"
+ok
+
+# a key with NO domain recorded keeps today's free-form behavior, byte-for-byte: the ONLY line that
+# changes in .herd/config is that key's own. (BACKLOG_FILE is project-scoped + value_shape=free.)
+before_file="$T/p9-before"; cp "$P9/.herd/config" "$before_file"
+run_real "$P9" config set BACKLOG_FILE docs/any-free-form_value.42.md
+[ "$RC" -eq 0 ]                                   || fail "domainless (free) key rejected a free-form value ($OUT)"
+diff_lines="$(diff "$before_file" "$P9/.herd/config" | grep -c '^[<>]' || true)"
+[ "$diff_lines" -eq 2 ]                           || fail "free-form set changed more than the key's own line ($diff_lines changed lines)"
+grep -qE '^BACKLOG_FILE="docs/any-free-form_value.42.md"$' "$P9/.herd/config" \
+                                                  || fail "free-form value not stored as before"
+ok
+
+# ══ 17. HERD-456 fail-soft: a MALFORMED domain cell never blocks a set ═══════════════════════
+# bin/herd reads a non-reserved shape cell as a closed enum, so PROSE in that column would parse as one
+# unmatchable member and make the key unsettable. A manifest slip must degrade to today's free-form
+# behavior with a warning — never wedge a key. (test-config-manifest.sh check (h) is the other half:
+# it reds a prose cell in the SHIPPED manifest so it gets fixed rather than skipped forever.)
+BADCAPS="$T/capabilities-malformed.tsv"
+{
+  head -1 "$CAPS"
+  printf 'PROSE_SHAPE_LEVER\tconfig\tStub key whose value_shape cell is prose\tExercise fail-soft\t\t\t\tgit-pr, doc-apply (python only)\n'
+  tail -n +2 "$CAPS"
+} > "$BADCAPS"
+P10="$T/p10"; mkdir "$P10"; _make_project "$P10"
+set +e
+OUT="$( cd "$P10" && HERD_CAPABILITIES_FILE="$BADCAPS" HERD_RELOAD_SKIP_LAUNCH=1 FAKE_STRAY_PIDS="" \
+         bash "$HERD" config set PROSE_SHAPE_LEVER git-pr 2>&1 )"; RC=$?
+set -e
+[ "$RC" -eq 0 ]                                   || fail "a malformed value_shape cell BLOCKED a set instead of failing soft ($OUT)"
+grep -qi 'malformed' <<< "$OUT" || fail "malformed value_shape did not warn ($OUT)"
+grep -qE '^PROSE_SHAPE_LEVER="git-pr"$' "$P10/.herd/config" \
+                                                  || fail "fail-soft set did not write the value"
+ok
+
 echo "ALL PASS ($pass tests)"

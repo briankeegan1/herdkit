@@ -6,7 +6,7 @@
 # key can be documented but never read (a DEAD key), read but never documented (a GHOST key), or
 # mis-scoped so `herd config set` routes it to the wrong file / a governance doc adopts a per-machine
 # knob. This test turns those invariants into a hard gate so the manifest can never silently drift
-# from the code that reads it. Nine checks:
+# from the code that reads it. Twelve checks:
 #
 #   (a) DEAD keys      — every manifest config key is READ at least once by the engine: bin/ +
 #                        scripts/ (bash) OR pysrc/herd/*.py (the Python core, since the HERD-300 port).
@@ -28,6 +28,18 @@
 #                        matches that key's fallback in herd-config.sh (docs never drift from code).
 #   (g) shape literals — a value_shape enum lists the LITERAL values `herd config set` accepts; no member
 #                        may be a unit/placeholder word (that is what the `numeric` token is for).
+#   (h) shape wellformed — every value_shape cell is a reserved token (free/numeric/glob/empty) or a
+#                        pipe-separated list of literal members; PROSE in that cell (HERD-456:
+#                        WORK_UNIT_KIND shipped as `git-pr, doc-apply (python only)`) parses as one
+#                        unmatchable member, which refuses every real value the key accepts.
+#   (i) shape grounded — every enum member is quoted from the key's OWN description/when_to_surface
+#                        text (boolean synonyms exempt), so a domain can never be INVENTED — a wrong
+#                        domain that refuses a valid value is worse than no domain at all.
+#   (j) enum ratchet   — a key whose description documents an alternation (`a | b`, not an `e.g.`
+#                        illustration) MUST carry a domain. This is the check that would have caught
+#                        GH #570: SCRIBE_BACKEND documented `file | github | linear | jira |
+#                        changelog` while its value_shape said `free`, so `herd config set
+#                        SCRIBE_BACKEND __probe__` was accepted and the watcher restarted on it.
 #
 # Fully hermetic: reads the repo's own committed files; NO herdr, gh, network, or model.
 # Run:  bash tests/test-config-manifest.sh
@@ -78,6 +90,7 @@ with open(CAPS, encoding="utf-8") as f:
             "scope":       col("scope"),
             "governance":  col("governance"),
             "description": col("description"),
+            "when_to_surface": col("when_to_surface"),
             "value_shape": col("value_shape").strip(),
         }
 KEYS = set(COLS)
@@ -376,9 +389,77 @@ for k in sorted(KEYS):
 check("g: value_shape enums list literal values, not placeholders", not prose,
       "; ".join(prose))
 
+# ── The shape vocabulary shared by (h)/(i)/(j) ────────────────────────────────────────────────────
+RESERVED = ("", "free", "numeric", "glob")
+# A literal an enum member may be: word chars plus . _ - / — mirrors bin/herd's _config_shape_wellformed.
+MEMBER_RE = re.compile(r'^[A-Za-z0-9._/-]*$')
+
+# ── (h) every value_shape cell is ENFORCEABLE, never prose (HERD-456) ─────────────────────────────
+# bin/herd reads any non-reserved cell as a closed pipe-separated enum. A cell written as prose —
+# WORK_UNIT_KIND shipped as `git-pr, doc-apply (python only)` — parses as ONE member no real value can
+# equal, so the key becomes unsettable while LOOKING documented. cmd_config set fails soft on such a
+# cell (warn + skip validation) so a manifest slip never wedges a key; this check is the other half of
+# that contract — the cell gets FIXED here instead of silently skipping validation forever.
+malformed = []
+for k in sorted(KEYS):
+    shape = COLS[k]["value_shape"]
+    if shape in RESERVED:
+        continue
+    for member in shape.split("|"):
+        if not MEMBER_RE.match(member):
+            malformed.append(f"{k}: value_shape member '{member}' is not a literal value "
+                             f"(prose belongs in the description; use pipe-separated literals, or numeric/glob/free)")
+check("h: value_shape cells are enforceable enums, not prose", not malformed,
+      "; ".join(malformed))
+
+# ── (i) every enum member is GROUNDED in the key's own documentation (HERD-456) ───────────────────
+# A domain is only safe when it is quoted from what the key already documents: an INVENTED member set
+# refuses a value the engine actually accepts, which is worse than no domain at all. Boolean/truthy
+# synonyms are exempt — they are self-evident literals, not domain knowledge (CODEMAP_AUTOREFRESH
+# accepts the whole truthy family while its description just calls the lever on/off).
+BOOLEANISH = {"true", "false", "on", "off", "yes", "no", "1", "0",
+              "enable", "enabled", "disable", "disabled"}
+ungrounded = []
+for k in sorted(KEYS):
+    shape = COLS[k]["value_shape"]
+    if shape in RESERVED:
+        continue
+    doc = COLS[k]["description"] + " " + COLS[k]["when_to_surface"]
+    for member in shape.split("|"):
+        if not member or member.lower() in BOOLEANISH:
+            continue
+        if member not in doc:
+            ungrounded.append(f"{k}: enum member '{member}' appears nowhere in the key's own "
+                              f"description/when_to_surface — ground the domain in the docs or drop it")
+check("i: value_shape enum members are grounded in the key's own docs", not ungrounded,
+      "; ".join(ungrounded))
+
+# ── (j) a documented alternation MUST carry a domain — the GH #570 ratchet (HERD-456) ─────────────
+# The bug reported in GH #570 was not a missing mechanism: `herd config set` has enforced value_shape
+# since HERD-159. SCRIBE_BACKEND simply documented `file | github | linear | jira | changelog` while
+# its shape cell said `free`, so nothing validated it and a probe value was accepted + reloaded onto.
+# Any key whose description spells an alternation the same way must therefore carry a domain. An
+# `e.g.`-introduced list is an ILLUSTRATION of an open set (WATCHER_VIEW_STATUS quotes four of
+# GitHub's mergeStateStatus values), not a closed enum — it is exempt by that wording.
+ALT_RE = re.compile(r'([A-Za-z0-9_."/-]+)(?:\s*\([^)]*\))?\s+\|\s+([A-Za-z0-9_."/-]+)')
+undomained = []
+for k in sorted(KEYS):
+    if COLS[k]["value_shape"] not in ("", "free"):
+        continue
+    desc = COLS[k]["description"]
+    m = ALT_RE.search(desc)
+    if not m:
+        continue
+    if "e.g." in desc[max(0, m.start() - 24):m.start()]:
+        continue  # an illustrative sample of an open set, not a closed enum
+    undomained.append(f"{k}: description documents the alternation '{m.group(0)}' but value_shape is "
+                      f"'{COLS[k]['value_shape'] or 'empty'}' — `herd config set` validates nothing for it")
+check("j: keys documenting an enum carry a value_shape domain", not undomained,
+      "; ".join(undomained))
+
 print()
 if failures:
     print(f"{len(failures)} CHECK(S) FAILED: {', '.join(failures)}", file=sys.stderr)
     sys.exit(1)
-print("ALL PASS (8 manifest self-enforcement checks)")
+print("ALL PASS (12 manifest self-enforcement checks)")
 PY
