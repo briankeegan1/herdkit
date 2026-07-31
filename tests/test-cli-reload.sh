@@ -22,6 +22,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HERD="$HERE/../bin/herd"
 
+# HERD-458: pin our own precondition — a CONFIGURED caller (herd-config.sh sourced ambient, e.g. by
+# scripts/herd/healthcheck.sh --heavy) can leave MERGE_POLICY/WATCHER_AUTOMERGE/… already set, which
+# defeats the reload-derivation assertions below (the derive-from-WATCHER_AUTOMERGE path only fires
+# when MERGE_POLICY is genuinely unset). The shared harness scrub (scripts/herd/hermetic-env-scrub.sh)
+# already does this once per suite run; re-arm it here too so this test is self-sufficient run alone.
+if [ -f "$HERE/../scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/../scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$HERE/../scripts/herd/herd-config.sh"
+fi
+
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0

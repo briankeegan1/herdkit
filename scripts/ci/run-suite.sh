@@ -74,6 +74,20 @@ fi
 export HERD_JOURNAL_HERMETIC=1
 trap 'rm -rf "$_hk_ci_jh_dir"' EXIT
 
+# HERD-458 HERMETIC-ENV SCRUB: this runner is a direct-invocation chokepoint too (a human or a CI leg
+# can run it from a shell that already sourced herd-config.sh against a CONFIGURED .herd/config) — the
+# HERD-449 export sweep would otherwise leak those live values past every hermetic test's own
+# `: "${KEY:=default}"` default assertion below, the same shape the JOURNAL_FILE pin above guards
+# against for one key. unset the whole export surface ONCE, derived from herd-config.sh itself so it
+# can never drift. A plain GitHub Actions runner never sourced herd-config.sh, so this is a byte-
+# identical no-op there. See scripts/herd/hermetic-env-scrub.sh; kept in lockstep with
+# tests/test-hermetic-env-scrub.sh.
+if [ -f "$ROOT/scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$ROOT/scripts/herd/herd-config.sh"
+fi
+
 # ── platform detection (overridable so tests are deterministic) ──────────────────
 detect_platform() {
   if [ -n "${HERD_CI_PLATFORM:-}" ]; then printf '%s\n' "$HERD_CI_PLATFORM"; return; fi

@@ -32,6 +32,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="$HERE/../scripts/herd/agent-watch.sh"
 
+# HERD-458: pin our own precondition — a CONFIGURED caller can leave an ambient REFIX_MAX_ROUNDS (etc)
+# already exported, which the "(5) the bouncing row should read round 1/3" default assertion below
+# would otherwise inherit instead of the unset default. The shared harness scrub
+# (scripts/herd/hermetic-env-scrub.sh) already does this once per suite run; re-arm it here too so
+# this test is self-sufficient run alone.
+if [ -f "$HERE/../scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/../scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$HERE/../scripts/herd/herd-config.sh"
+fi
+
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 pass=0
 fail() { echo "FAIL: $1" >&2; exit 1; }

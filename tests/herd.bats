@@ -19,6 +19,15 @@
 
 setup() {
   REPO="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+  # HERD-458: a direct `bats tests/herd.bats` run (no .herd/healthcheck.project.sh wrapper) still
+  # needs the ambient scrub — the caller's shell may have sourced herd-config.sh itself (a CONFIGURED
+  # project's live values would otherwise leak into every `run bash <test>.sh` below). Redundant, and
+  # a byte-identical no-op, when the wrapper already scrubbed. See scripts/herd/hermetic-env-scrub.sh.
+  if [ -f "$REPO/scripts/herd/hermetic-env-scrub.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$REPO/scripts/herd/hermetic-env-scrub.sh"
+    herd_hermetic_env_scrub "$REPO/scripts/herd/herd-config.sh"
+  fi
 }
 
 # ── inline structural blocks (no single tests/test-*.sh to shell out to) ─────────────────────────
