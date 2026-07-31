@@ -21,7 +21,14 @@
 #   intent  one-line human description of the stance — what this posture is FOR (surfaced by HERD-141).
 #
 # Blank lines and lines whose first field starts with '#' are ignored; the columns are tab-separated.
-# The seven rows below are the canonical postures the posture-matrix sim asserts an invariant for.
+# The eight rows below are the canonical postures the posture-matrix sim asserts an invariant for.
+#
+# APPLYING a posture to an ALREADY-INITIALISED project: `herd posture apply <name>` (HERD-466). It
+# validates the WHOLE bundle against templates/capabilities.tsv (key exists + value_shape admits the
+# value) BEFORE any write, prints the full current→new delta, applies every key through the validated
+# `herd config set`, and then rebuilds a FRESH watcher so a lever cannot be shadowed by the stale
+# environment the running watcher was started with. `herd init --posture <name>` remains the
+# stand-up-time path; this file is the single bundle definition both consume.
 name	keys	intent
 solo-auto	MERGE_POLICY=auto	Solo operator, full autonomy: the watcher runs every gate and auto-merges — today's fixture default, no human in the merge loop.
 team-approve	MERGE_POLICY=approve HUMAN_VERIFY_POLICY=hold	Team review: gates run to green, then the merge HOLDS for a sha-keyed human approval — nothing lands without an explicit approve.
@@ -30,3 +37,4 @@ custom-steps	STEPS_PROFILE=approve-stage	Operator-defined pipeline: a .herd/step
 observe-only	MERGE_POLICY=observe	Watch-only shadow mode: the watcher runs every gate and reports/notifies but NEVER merges — for dry-running the loop against a repo you do not yet let it land into.
 full-auto	MERGE_POLICY=auto REVIEW_AUTOFIX=true HEALTHCHECK_AUTOFIX=true COORDINATOR_AUTONOMY=full DEAD_BUILDER_AUTORESPAWN=on HUMAN_VERIFY_POLICY=coordinator STALE_BASE_AUTOFIX=on SWEEP_AUTO=auto	Engine-autonomous ops: the human steers WHAT — or delegates even that to a full-autonomy coordinator — while the engine owns the rest: auto-merge on green, auto-fix BLOCK reviews and red healthchecks, respawn dead builders, self-heal stale bases, run human-verify steps via the coordinator, and self-sweep debris — a hands-off unattended loop.
 docs-lab	MERGE_POLICY=auto DOCS_ONLY_GLOB=\.(md|txt)$ REVIEW_MODEL_DOCS=claude-haiku-4-5 MODEL_FEATURE=claude-haiku-4-5 MODEL_REVIEW=claude-haiku-4-5	Docs/research-lab bundle (HERD-409, issue #520): pairs with the docs/research-lab PROJECT ARCHETYPE (templates/archetypes.tsv) — pure-doc diffs route to the cheap DOCS_ONLY_GLOB review tier, and the feature/review model tiers default to the cheapest (haiku), since a markdown-lint healthcheck needs no heavy model.
+yolo	MERGE_POLICY=auto HUMAN_VERIFY_POLICY=auto REVIEW_AUTOFIX=true HEALTHCHECK_AUTOFIX=true STALE_BASE_AUTOFIX=on DRAFT_AUTO_PROMOTE=on DEAD_BUILDER_AUTORESPAWN=on WEDGE_AUTOWAKE=on MAIN_HEALTH_AUTOFIX=on CI_AUTOREPAIR=on MERGE_FAIRNESS=on SWEEP_AUTO=auto WATCHER_SELF_RESTART=on COORDINATOR_WATCHDOG=on ADOPT_REMOTE_PRS=on COORDINATOR_AUTONOMY=full TRACKED_SPAWNS=required CLAIM_REQUIRED=on	YOLO drain (HERD-466): every auto lever ON at once — auto-merge, auto-promote drafts, auto-fix BLOCK reviews / red healthchecks / stale bases / red CI / a red default branch, respawn dead builders, wake wedged ones, self-restart the watcher, watchdog the coordinator, adopt remote PRs, full coordinator autonomy, self-sweep. Pairs with the coordinator DRAIN MODE loop. NOT gateless: the healthcheck and the adversarial review still gate every PR, and TRACKED_SPAWNS=required + CLAIM_REQUIRED=on keep every spawn on the record — what disappears is the human/coordinator PAUSE between gates. BUDGET_DAILY is the one brake that still halts the loop.

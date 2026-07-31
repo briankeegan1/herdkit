@@ -25,6 +25,7 @@
 #   herd config set        edits .herd/config, then restarts the watcher / re-renders the skill
 #   herd theme set         delegates to `herd config set HERD_THEME` — restarts the watcher
 #   herd governance apply  proposes each key through the same validated `herd config set`
+#   herd posture apply     applies a whole posture bundle through that same setter, then reloads
 #   herd backend switch    flips SCRIBE_BACKEND via config set + restarts the backlog pane
 #   herd reload            stops the watcher, rebuilds every control-room pane, re-renders the skill
 #   herd pane              restarts a named control-room pane in place (coordinator = kills the agent)
@@ -35,8 +36,9 @@
 #
 # WHAT IS NOT GUARDED — builders legitimately READ control-room state, and every read stays fully
 # allowed: status, log, why, backlog, notes/note, config get|list|lint|sync|models, doctor, codemap,
-# symbol-index, conformance, cost, stats, advise, deps, help — plus `render` (writes only the
-# cwd's own rendered skill) and `init` (stands a project up; there is no control room yet).
+# symbol-index, conformance, cost, stats, advise, deps, help, posture list|show — plus `render`
+# (writes only the cwd's own rendered skill) and `init` (stands a project up; there is no control
+# room yet).
 # The rule is per-SUBCOMMAND, never per-flag: `config` is only an actuator at `config set`.
 #
 # WHAT COUNTS AS "NOT THE MAIN CHECKOUT"
@@ -102,6 +104,7 @@ _herd_context_is_actuator() {
     config)     [ "$sub" = "set" ]    && { printf 'config set';       return 0; } ;;
     theme)      [ "$sub" = "set" ]    && { printf 'theme set';        return 0; } ;;
     governance) [ "$sub" = "apply" ]  && { printf 'governance apply'; return 0; } ;;
+    posture)    [ "$sub" = "apply" ]  && { printf 'posture apply';    return 0; } ;;
     backend)    [ "$sub" = "switch" ] && { printf 'backend switch';   return 0; } ;;
   esac
   return 1
