@@ -131,6 +131,17 @@ else
   herd_pipe_safety_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# consumer-only-event guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/journal-emission-lint.sh"
+[ -f "$DIR/scripts/herd/journal-emission-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/journal-emission-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_JOURNAL_EMISSION_SKIP_REASON="journal-emission-lint.sh not present"
+  herd_journal_emission_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # git-scope guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present (HERD-309).
 _HERD_LINT_SRC="$HERE/git-scope-lint.sh"
@@ -480,6 +491,21 @@ EOF
   # classified FIXTURE (throwaway temp repos) and never flagged; a deliberate exception annotates with
   # '# herd-scope-ok: <why>'. Skipped (never red) when the lint is absent or the tree has no engine
   # git surface.
+  # consumer-only-event guard (HERD-442) — every journal event name a CONSUMER parses must have a
+  # live PRODUCER. `human_verify_policy`, `hold_released` and `merged_external` each shipped as a
+  # consumer reading an event nobody writes; the journal is best-effort, so a missing event is
+  # indistinguishable from "it did not happen this run" and no other rail can see it. The SAME lint
+  # the heavy gate runs (scripts/herd/journal-emission-lint.sh). Same red semantics as caps-sync /
+  # pipe-safety. A deliberately-unproduced event opts out in the lint's allowlist, with its reason.
+  # Skipped (never red) when the lint is absent or the tree has no engine journal surface.
+  local jemit_errs jemit_rc
+  jemit_errs="$(herd_journal_emission_lint ".")"; jemit_rc=$?
+  if [ "$jemit_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ journal-emission — $(printf '%s' "$jemit_errs" | grep '^EMISSION-ORPHAN' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ JOURNAL-EMISSION: a consumer parses an event name no producer emits (add the producer, or allowlist it with its reason in journal-emission-lint.sh)"; printf '%s\n' "$jemit_errs" | grep '^EMISSION-ORPHAN' || printf '%s\n' "$jemit_errs"; fi
+    exit 1
+  fi
+
   local gscope_errs gscope_rc
   gscope_errs="$(herd_git_scope_lint ".")"; gscope_rc=$?
   if [ "$gscope_rc" -eq 1 ]; then

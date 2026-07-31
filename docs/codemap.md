@@ -63,6 +63,7 @@ Role summarized from each file's top-of-file comment.
 - `herd-watch.sh` — launcher for the live "herd watch" status console (agent-watch.sh).
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
 - `journal-audit.sh` — journal-driven self-audit / gap-finder (HERD-238 / N12).
+- `journal-emission-lint.sh` — THE shared CONSUMER-ONLY EVENT guard (HERD-442): every journal event
 - `journal-test-env.sh` — HERD-223 shared TEST layer: pin JOURNAL_FILE to a throwaway path so a
 - `journal.sh` — the herdkit engine journal: an append-only JSONL record of every key gate event
 - `layout-reconcile.sh` — the shared EYES-ON-LAYOUT helper for the herd control room.

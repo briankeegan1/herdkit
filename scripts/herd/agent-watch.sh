@@ -13542,7 +13542,22 @@ EOF
       # merge itself still waits for CLEAN (re-verified in the action pass). Without this a PR under
       # `require herd/gates` would sit BLOCKED forever — never a candidate, so never blessed.
       if _scope_permits_automerge "$prauthor"; then
-        if _should_automerge "$mstate"; then
+        # HELD-AND-READY row (HERD-442). A PR whose gates are green but whose merge is HELD by policy
+        # (approve) or by its own HUMAN-VERIFY block writes an `awaiting` row to the shared approvals
+        # ledger. Without this row the console kept painting `🩺 health-check` at it forever — the
+        # engine was waiting on a human and said nothing, which reads as a wedged watcher rather than
+        # a hold. Bash painted `_hold_ready_label` here and the P5b deletion took the row with the
+        # action pass; the label helper survived, so this restores the row, not a new invention.
+        #
+        # The KIND is derived, not guessed: under `auto` the ONLY thing that can produce an awaiting
+        # row is a human-verify block (hold_decision returns MERGE for everything else), so an auto-
+        # policy hold IS a human-verify hold. Under approve/observe it is the plain approval hold.
+        # One ledger read per clean candidate per tick, no network, byte-quiet when nothing is held.
+        if [ -n "$headsha" ] && approval_awaiting_noted "$prnum" "$headsha"; then
+          _hr_hv=""; [ "$(_effective_merge_policy)" = auto ] && _hr_hv=1
+          DISPLAY[i]="    ${C_GREEN}✅${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_GREEN}$(_hold_ready_label "$_hr_hv" "$prnum" "${HUMAN_VERIFY_POLICY:-hold}")${C_RESET}"
+          FLAIR_STATE[i]="attention"
+        elif _should_automerge "$mstate"; then
           # HERD-313: when a suite is ALREADY in flight for this exact (pr,sha), paint the live running
           # row here in the RENDER pass — reading the same .health-inflight / .health-log state files the
           # health worker (bash gate OR the Python engine's action pass) writes. Under ENGINE_IMPL=python
@@ -13562,7 +13577,9 @@ EOF
         else
           DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
         fi
-        FLAIR_STATE[i]="busy"
+        # A HELD candidate already set its own flair above (attention — it is waiting on a human, not
+        # on the engine); everything else on this branch is engine-busy.
+        [ "${FLAIR_STATE[i]:-}" = "attention" ] || FLAIR_STATE[i]="busy"
         CAND_IDX+=("$i"); CAND_DIR+=("$dir"); CAND_SLUG+=("$slug"); CAND_PR+=("$prnum"); CAND_BRANCH+=("$branch"); CAND_SHA+=("$headsha")
       else
         # Team mode (WATCHER_SCOPE=all): this PR is MERGEABLE+CLEAN and would auto-merge in solo mode,

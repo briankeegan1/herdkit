@@ -239,8 +239,10 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `refix_bounce` | pr, sha, slug, round, agent_status_before, rule, location | `agent-watch.sh:7321` |
 | `refix_wake_result` | pr, sha, slug, round, agent_status_before, agent_status_after, woke, escalated | `agent-watch.sh:7359` |
 | `refix_escalated_no_wake` | pr, sha, slug, kind, reason(no-live-builder), agent_status | port `live_runtime.py:LiveTick._bounce_and_wake` (HERD-370 — an unwoken bounce escalates to needs-you immediately, in the same tick, instead of holding silently) |
-| `hold_applied` | pr, sha, slug, kind | `agent-watch.sh:12287` |
-| `human_verify_policy` | pr, sha, slug, policy(auto), action | `agent-watch.sh:12314` |
+| `hold_applied` | pr, sha, slug, kind(approve\|human-verify) [, human_verify_policy] | port `live_runtime.py:LiveTick._walk` (HERD-442 — the bash anchor `agent-watch.sh:12287` died with the action pass at `ede7d45`) |
+| `hold_released` | pr, sha, slug, kind(approve\|human-verify), reason(approved) | port `live_runtime.py:LiveTick._walk` (HERD-442 — restored; consumed by `herd why` and the fleet inbox/digest) |
+| `hv_body_unreadable` | pr, sha, slug, rc, detail | port `live_runtime.py:LiveTick._resolve_hold_inputs` (HERD-442 — the fail-CLOSED record for an unreadable PR body) |
+| `human_verify_policy` | pr, sha, slug, policy(auto), action | port `live_runtime.py:LiveTick._walk` (HERD-439 — the bash anchor `agent-watch.sh:12314` died at `ede7d45`) |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
 | `merge` | pr, slug, sha, method, reason(gates_passed) | `agent-watch.sh:5788` |
 | `merge_refused_sha_moved` | pr, slug, sha, state | `agent-watch.sh:5764` |
@@ -258,6 +260,33 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 `merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with
 no bash anchor by design: both items are folded into the port, never built in the retired bash
 action pass (`pysrc/herd/live_runtime.py`, anchored in §6.3/§6.4).
+
+### 3.5 Deliberately unproduced event names (HERD-442)
+
+An event name that a CONSUMER parses but no PRODUCER emits is a silent forensics hole: the journal is
+best-effort, so a missing event is indistinguishable from "it did not happen this run", and nothing
+else in the engine can see the difference. `scripts/herd/journal-emission-lint.sh` is the standing
+guard — it reds any consumer-parsed name with no live producer, and both gate surfaces run it.
+
+Three names are consumer-side ONLY on purpose. Each is listed in that lint's allowlist with the same
+reason; **keep the two in step**, and do not "restore" one of these without restoring the behavior it
+would record:
+
+| Name | Why there is no producer |
+|---|---|
+| `resolver_respawn` | The bash resolve pass journaled it when re-dispatching a resolver for a new sha. The Python core owns dispatch now and does not re-emit it; the RESPAWN BEHAVIOR is alive (`spawn_resolver` has live callers), only the forensic line is gone. Re-adding it needs the `round`/`old_sha` ledger reads the port never took. Note `scripts/herd/sim/sandbox-resolver-respawn-scenario.sh` journals the event ITSELF and then asserts it — a self-fulfilling guard, which is why the loss went unseen. |
+| `cross_seat_block_honored` | Bash journaled it from two stages, `setter` and `merge`. The merge-stage call site died with the action pass and the setter-stage one sits inside bash's `post_gate_status`, which has had no callers since the port took over the blessing. The Python core carries **no cross-seat BLOCK precedence check at all** — HERD-247 is unenforced in the port. A forensic line for a check that does not run is worse than silence, so the event must not come back before the guard does. |
+| `gate_default` | A verdict PROVENANCE, latent by design (§3.2): there is no live call site and a no-verdict run is treated as INFRA (retry), never a default BLOCK. |
+
+Two more emissions died at `ede7d45` and are NOT allowlisted, because nothing consumes them either —
+they are recorded here so a future auditor does not have to re-derive them:
+
+- `merge_reverify_unreadable` — bash journaled it when the pre-merge `gh pr view` re-verify came back
+  ALL-EMPTY. The port covers the same blindness one step later, at the actuator, as
+  `merge_gh_unreadable` (§3.4), which is a strictly better place: it fires on the read that actually
+  authorizes the merge. Deliberately not restored.
+- `hv_body_unreadable` — RESTORED (HERD-442, §3.4 above), because the gate it records was restored
+  with it.
 
 ---
 

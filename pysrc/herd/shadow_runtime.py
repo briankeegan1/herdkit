@@ -575,8 +575,11 @@ class ShadowWatcher:
             self._apply_merge(cand)
             return "MERGE"
         if action == "HOLD":
+            # `kind` follows bash's rule (human-verify iff the PR declares a block, else approve) —
+            # see live_runtime._hold_kind. The shadow is the PARITY twin of the live core, so this
+            # field has to move with it or every head-to-head diff shows a spurious mismatch (HERD-442).
             self.journal.append("hold_applied", pr=cand.pr, sha=cand.sha, slug=cand.slug,
-                                kind="approval" if self._merge_policy == "approve" else "human-verify")
+                                kind="human-verify" if cand.hv_hold else "approve")
             return HOLD
         # OBSERVE — observe mode never merges.
         self.journal.append("shadow_observe", pr=cand.pr, sha=cand.sha, slug=cand.slug)
