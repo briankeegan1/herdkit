@@ -1229,10 +1229,13 @@ def digest_project(files):
             # GitHub), where this journal has no local merge event, only BLOCK verdicts on the
             # superseded shas. Rank it as merged so shipped wins over a stale blocked/held (HERD-290).
             pr_state(pr)["merged"] = True
-        elif ev == "merged_external" and pr:
-            # merged_external (HERD-291): explicit marker emitted by the post-merge reconcile sweep
-            # when it detects a PR merged by another seat or the gh UI. Rank it as shipped so
-            # externally-merged PRs surface in the shipped bucket rather than staying blocked/held.
+        elif ev == "merge_observed" and pr:
+            # merge_observed (HERD-232): the post-merge reconcile sweep OBSERVED a merge this seat did
+            # not perform (another seat, or the gh UI). Rank it as shipped so externally-merged PRs
+            # surface in the shipped bucket rather than staying blocked/held.
+            # HERD-442: this leg shipped as HERD-291 keyed on `merged_external` — an event name NOTHING
+            # in the engine has ever emitted, so the cross-seat leg had never once fired. The sweep
+            # journals `merge_observed` (agent-watch.sh:7915) and always has; that is the event.
             pr_state(pr)["merged"] = True
         elif ev == "hold_applied" and pr:
             pr_state(pr)["held"] = True
@@ -1500,12 +1503,15 @@ def reduce_journal(files):
         if sl:
             s["slug"] = str(sl)
         if ev == "merge" or (ev == "reap" and str(o.get("reason", "")) == "merged") \
-                or ev == "retire_converged" or ev == "merged_external":
+                or ev == "retire_converged" or ev == "merge_observed":
             # retire_converged (HERD-164) is the terminal proof the branch reached main. For a PR
             # merged OUT OF BAND (another seat / GitHub) it is the ONLY local terminal signal, since
             # this journal never saw a merge. Treat it as done so stale BLOCK rows on the superseded
             # shas clear even when gh is down (fail-open) (HERD-290).
-            # merged_external (HERD-291): explicit marker for cross-seat merges; same terminal proof.
+            # merge_observed (HERD-232) is how the sweep records a merge THIS seat did not perform —
+            # the cross-seat/gh-UI case, same terminal proof. HERD-442: shipped as HERD-291 keyed on
+            # `merged_external`, a name no producer has ever written, so the leg was inert; retargeted
+            # at the event agent-watch.sh:7915 actually emits.
             s["done"] = True
             s["blocked"] = s["held"] = s["escalated"] = s["health"] = False
         elif ev == "verdict_recorded":

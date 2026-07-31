@@ -70,6 +70,7 @@ import time
 
 from herd import cost_emit as _cost_emit
 from herd import decisions as D
+from herd import human_verify as _human_verify
 from herd import shadow_runtime as _shadow
 from herd.shadow_journal import encode_event
 
@@ -840,6 +841,72 @@ class LiveState:
             return
         try:
             open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    # approvals substrate ──────────────────────────────────────────────────────────────────────────
+    # THE SAME flat ledger `herd-approve.sh` reads and writes (approvals.sh: one seam, one answer):
+    # rows are `<epoch> <state> <pr#> <sha>` with state ∈ awaiting | approved | hv-informed, at
+    # `$HERD_APPROVALS_FILE` else `$WORKTREES_DIR/.agent-watch-approvals`. The port MUST use this file
+    # and not a private marker: `herd approve <pr#>` REFUSES ("No awaiting approval record found") when
+    # no `awaiting` row exists, so an engine that holds a PR without writing one holds it forever.
+    # Matching is EXACT on the full sha, mirroring agent-watch.sh:approval_is_approved — the prefix
+    # tolerance in approvals.sh:approval_state is for the operator-facing `list`, not the merge gate.
+
+    def approvals_ledger(self):
+        return os.environ.get("HERD_APPROVALS_FILE") or self._p(".agent-watch-approvals")
+
+    def _approval_row(self, state, pr, sha):
+        """True iff the ledger carries an exact `<epoch> <state> <pr> <sha>` row. False on any read
+        fault / missing ledger — fail-soft, mirroring bash's `[ -s "$APPROVALS" ] || return 1`."""
+        path = self.approvals_ledger()
+        if not path or not os.path.exists(path):
+            return False
+        want = (str(state), str(pr), str(sha))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and (f[1], f[2], f[3]) == want:
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def approval_is_approved(self, pr, sha):
+        """True iff `herd-approve.sh approve` wrote an explicit approval for this exact (pr, sha)."""
+        return self._approval_row("approved", pr, sha)
+
+    def approval_awaiting_noted(self, pr, sha):
+        """True iff an awaiting-approval notice is already on the ledger for this exact (pr, sha)."""
+        return self._approval_row("awaiting", pr, sha)
+
+    def record_approval(self, state, pr, sha):
+        """Append one `<epoch> <state> <pr> <sha>` row (agent-watch.sh:record_approval_awaiting /
+        :record_hv_informed). No-op with no ledger path, so a fixture/dry-run tick writes nothing."""
+        path = self.approvals_ledger()
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%d %s %s %s\n" % (int(time.time()), state, pr, sha))
+        except Exception:
+            pass
+
+    def purge_pr_approvals(self, pr):
+        """Drop EVERY row for this PR — a merge is terminal (agent-watch.sh:purge_pr_approvals,
+        HERD-90). Without this an old sha's `awaiting` row survives the merge as a phantom hold that
+        `herd approve list` keeps surfacing. Atomic rewrite, fully fail-soft."""
+        path = self.approvals_ledger()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                kept = [l for l in fh if len(l.split()) < 4 or l.split()[2] != str(pr)]
+            tmp = path + ".%d.tmp" % os.getpid()
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.writelines(kept)
+            os.replace(tmp, path)
         except Exception:
             pass
 
@@ -1949,6 +2016,25 @@ _GATE_STATUS_DESC = "healthcheck + adversarial review passed"
 # a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
 _MERGE_REFUSE_MAX = 3
 
+# Deadline on the HUMAN-VERIFY body fetch (§5.4). Mirrors the bash watcher's `_gh_timeout` budget: the
+# read is on the merge path, so it must be bounded — but it FAILS CLOSED (hold, never merge), so a
+# short deadline costs at most one tick, never a blind merge.
+_HV_BODY_TIMEOUT = 15
+
+
+def _hold_kind(hv_hold):
+    """The `kind` field of hold_applied / hold_released — bash's rule, verbatim (agent-watch.sh
+    ``hold_kind="approve"; [ -n "$hv_hold" ] && hold_kind="human-verify"``).
+
+    The port had keyed it off the merge POLICY and spelled the policy hold ``approval``, which is not
+    a value bash ever wrote: ``fleet.sh:1556`` matches ``kind == "approve"`` to render "approval hold",
+    so every ported policy hold fell through to the generic ``hold (approval)`` row. It also mislabels
+    the one case where the two rules disagree — a human-verify PR under ``MERGE_POLICY=approve``,
+    which bash called ``human-verify`` (what is actually being verified) and the port called
+    ``approval``. One rule, bash's (HERD-442).
+    """
+    return "human-verify" if hv_hold else "approve"
+
 
 class WakeResult:
     """The outcome of one refix-bounce wake attempt (HERD-370).
@@ -2064,6 +2150,48 @@ def _delete_branch_on_merge(config):
     absent default) contributes NO ``--delete-branch`` argument, so a merged branch is retained."""
     val = str((config or {}).get("DELETE_BRANCH_ON_MERGE", "") or "").strip().lower()
     return val in ("1", "true", "yes", "on")
+
+
+class LiveHoldSource:
+    """The two LIVE INPUTS to the §5.4/§5.5 hold decision: the PR body, and the approval ledger.
+
+    Restores what HERD-306 (P5b) took out. ``discover_via_graphql`` fetches number/sha/base/mergeState
+    and nothing else — no body, no approval — so ``LiveCandidate.hv_hold`` and ``.approved`` were left
+    at their constructor defaults (``False``) on EVERY live tick. The consequences were both directions
+    of the gate at once: a PR declaring HUMAN-VERIFY steps merged with no hold under the ship-default
+    policy, and (had anyone run ``MERGE_POLICY=approve``) an approved PR could never be released,
+    because nothing read the ledger `herd-approve.sh` writes.
+
+    Injected ONLY by :func:`_run_live_tick`. A fixture / dry-run tick passes ``None``, so a scenario's
+    injected ``hv_hold`` / ``approved`` are honored VERBATIM and no ``gh`` ever runs off a sim — the
+    same split :class:`FixtureDiscovery` / :class:`DryRunActuator` already draw.
+    """
+
+    def __init__(self, state, config=None):
+        self.state = state
+        self.config = config or {}
+
+    def hv_body(self, pr):
+        """``(body, rc)`` for the PR — bash ``_pr_body`` (agent-watch.sh:4341), STATUS AND ALL.
+
+        THE STATUS IS THE POINT (HERD-237). An unreadable body must never be spent as "declares no
+        block": with a bounded ``gh`` deadline a slow network would otherwise become the routine silent
+        auto-merge of a PR whose manual steps were never run. ``rc`` is 0 only when gh actually
+        answered; every fault (timeout, non-zero exit, auth, rate limit) returns non-zero and the
+        caller HOLDS.
+        """
+        try:
+            out = subprocess.run(["gh", "pr", "view", str(pr), "--json", "body", "-q", ".body"],
+                                 capture_output=True, text=True, timeout=_HV_BODY_TIMEOUT)
+        except Exception:
+            return "", 124                      # timeout / exec fault — the bash `_gh_timeout` rc
+        if out.returncode != 0:
+            return "", out.returncode or 1
+        return out.stdout, 0
+
+    def approved(self, pr, sha):
+        """True iff a sha-keyed ``approved`` row exists (agent-watch.sh:approval_is_approved)."""
+        return self.state.approval_is_approved(pr, sha)
 
 
 class LiveActuator:
@@ -2308,12 +2436,17 @@ class LiveTick:
     observe decision is :func:`herd.decisions.hold_decision`, reused verbatim.
     """
 
-    def __init__(self, config, discovery, gates, actuator, journal, state=None):
+    def __init__(self, config, discovery, gates, actuator, journal, state=None, hold_source=None):
         self.config = config or {}
         self.discovery = discovery
         self.gates = gates
         self.actuator = actuator
         self.journal = journal
+        # The §5.4/§5.5 hold INPUTS (HERD-442). A :class:`LiveHoldSource` on the live path resolves
+        # hv_hold from the PR body and `approved` from the ledger `herd-approve.sh` writes; ``None``
+        # (fixture / dry-run) leaves both fields exactly as the scenario injected them, so every sim
+        # and every existing unit fixture is byte-identical to before this was restored.
+        self.hold_source = hold_source
         # The shared on-disk state ($TREES) — used here for the once-per-(pr,sha) hold guards (§5.3).
         # None → a black-hole LiveState (no dir): a sim/dry-run tick has no cross-tick state and never
         # writes a marker, so the fixture path stays hermetic.
@@ -2586,6 +2719,39 @@ class LiveTick:
         ``restale_laps`` (a sim with a black-hole state dir carries the laps on the candidate)."""
         n = self.state.restale_count(cand.pr)
         return n if n > 0 else int(getattr(cand, "restale_laps", 0) or 0)
+
+    # ── the §5.4/§5.5 hold INPUTS (HERD-442) ──────────────────────────────────────────────────────
+    def _resolve_hold_inputs(self, cand):
+        """Resolve ``cand.hv_hold`` + ``cand.approved`` from the live world. False ⇒ HOLD, do not merge.
+
+        A strict NO-OP without a ``hold_source`` (every fixture, sim and dry-run tick), so those keep
+        whatever the scenario injected and this restoration cannot move a single existing assertion.
+
+        On the live path it mirrors bash's merge gate exactly (agent-watch.sh ``_tick_act``):
+
+          * the body is read ONLY in ``auto`` mode — ``approve``/``observe`` already hold every PR, so
+            the marker is moot there and bash never spent the fetch;
+          * the branch is on the READ, not on its emptiness (HERD-237): a non-zero rc journals
+            ``hv_body_unreadable`` and returns False (hold), because the only safe reading of "we
+            cannot see" in front of a merge is HOLD;
+          * ``approved`` is the sha-keyed row `herd-approve.sh` wrote, read fresh every tick — a
+            just-granted approval must release the hold on the very next tick.
+        """
+        if self.hold_source is None:
+            return True
+        cand.approved = bool(self.hold_source.approved(cand.pr, cand.sha))
+        if self._merge_policy != "auto":
+            return True
+        body, rc = self.hold_source.hv_body(cand.pr)
+        if rc != 0:
+            self.journal.append(
+                "hv_body_unreadable", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug, "rc", rc,
+                "detail", "cannot read the PR body — holding rather than merging a possibly "
+                          "human-verify PR")
+            return False
+        cand.hv_body = body
+        cand.hv_hold = _human_verify.has(body)
+        return True
 
     def _would_automerge(self, cand):
         """True iff this candidate's resolved merge policy would MERGE it (not HOLD on approve/human-
@@ -2863,6 +3029,15 @@ class LiveTick:
                 self.state.record_posted(cand.pr, cand.sha, "gate_status")
 
         # 5. the pure hold / merge / observe decision (reused from P2, contract §2.2/§5.4-§5.5).
+        #    Its two INPUTS are resolved from the live world first (HERD-442, restoring what P5b took
+        #    out with the bash action pass). An unreadable PR body FAILS CLOSED — hold this tick, no
+        #    ledger row, re-gate next tick — so a transient gh fault costs one tick instead of blind-
+        #    merging a PR whose declared manual steps were never run.
+        #    No lifecycle transition on that path, deliberately: the PR stays BLESSED (bash simply
+        #    `continue`d) so the recovery tick re-decides from the same state rather than replaying a
+        #    hold it never really entered.
+        if not self._resolve_hold_inputs(cand):
+            return HOLD
         action = D.hold_decision(self._merge_policy, cand.hv_hold, cand.approved, self._hv_policy)
 
         # 5b. MERGE_FAIRNESS starvation freeze (§6.2, HERD-340): a would-be sibling merge is HELD for one
@@ -2910,11 +3085,35 @@ class LiveTick:
             # with hv_hold set (hold_decision returns HOLD), so the default stream is byte-identical.
             if cand.hv_hold and self._hv_policy == "auto" \
                     and self.state.once(cand.pr, cand.sha, "hv_informed"):
+                # The ledger twin of that journal line (bash record_hv_informed). approvals.sh calls
+                # `hv-informed` "a record, NOT an approval", and approval_state reports it as the
+                # strongest row when no approval exists — so an auditor can tell "merged with steps
+                # nobody ran" from "merged after a human signed off" from the PRE-merge window too.
+                self.state.record_approval("hv-informed", cand.pr, cand.sha)
                 self.journal.append("human_verify_policy", "pr", cand.pr, "sha", cand.sha,
                                     "slug", cand.slug, "policy", "auto",
                                     "action", "merged-with-declared-steps")
+            # HOLD RELEASED (HERD-442). A PR that WAS held — by the approve policy, or by its own
+            # HUMAN-VERIFY block under a non-auto HUMAN_VERIFY_POLICY — and now carries a sha-keyed
+            # approval is about to merge. Bash journaled this immediately before do_merge and the P5b
+            # deletion took it with everything else, leaving `hold_released` a CONSUMER-ONLY event:
+            # `herd why` (bin/herd:6694, why.py:63) renders it and the fleet inbox + digest
+            # (fleet.sh:1239/:1521) use it to CLEAR the held flag — so without it every approved-then-
+            # merged PR stayed "needs-you: approval hold" in the fleet view until the row aged out.
+            # Ordered before the merge, exactly as bash did, so the release is on record even if the
+            # merge itself is then refused. Byte-inert when nothing was held (`held` false).
+            held = (self._merge_policy == "approve"
+                    or (cand.hv_hold and self._hv_policy != "auto"))
+            if held:
+                self.journal.append("hold_released", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "kind", _hold_kind(cand.hv_hold),
+                                    "reason", "approved")
             if self.actuator.merge(cand):
                 self.state.clear_merge_refusal(cand.pr, cand.sha)
+                # A merge is TERMINAL for approval state: drop every row for this PR (bash do_merge's
+                # purge_pr_approvals, HERD-90). Left behind, an old sha's `awaiting` row is a phantom
+                # hold that `herd approve list` keeps surfacing for a long-merged PR.
+                self.state.purge_pr_approvals(cand.pr)
                 self.actuator.reap(cand)          # reap-on-merge (contract §6.1)
                 return "MERGE"
             # Merge REFUSED — the actuator's API verify did not confirm state=MERGED (it journaled the
@@ -2932,8 +3131,14 @@ class LiveTick:
             return HOLD                            # stay BLESSED, re-attempt next tick
         if action == "HOLD":
             if self.state.once(cand.pr, cand.sha, "hold"):
+                # The awaiting row `herd-approve.sh` reads (HERD-442). WITHOUT it `herd approve <pr#>`
+                # exits 1 with "No awaiting approval record found" — i.e. an engine that holds a PR but
+                # writes no row holds it FOREVER, with no documented way out. Bash wrote it here, in
+                # exactly this once-per-sha branch (record_approval_awaiting); a new sha re-holds and
+                # writes a fresh row. No-op without a ledger path, so a sim writes nothing.
+                self.state.record_approval("awaiting", cand.pr, cand.sha)
                 fields = ["pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                          "kind", "approval" if self._merge_policy == "approve" else "human-verify"]
+                          "kind", _hold_kind(cand.hv_hold)]
                 # HUMAN_VERIFY_POLICY=coordinator (HERD-59, restored in HERD-439): still a HOLD, but the
                 # hold event carries the policy so a post-mortem can tell a coordinator-actionable hold
                 # (a coordinator/agent is expected to run the steps, then approve) from a plain
@@ -3079,8 +3284,12 @@ def _run_live_tick():
     journal = LiveJournal(path)
     state = LiveState()          # $TREES / $WORKTREES_DIR — the shared sha-keyed ledger + marker substrate
     actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal, config)
+    # The §5.4/§5.5 hold inputs, LIVE ONLY (HERD-442): the PR body and the approvals ledger. Passed
+    # here and nowhere else, so a dry-run / fixture tick never shells out to `gh` for a body and never
+    # overrides a scenario-injected hv_hold/approved.
     tick = LiveTick(config, _GraphQLDiscovery(config), LiveGates(home, state, journal, config),
-                    actuator, journal, state=state)
+                    actuator, journal, state=state,
+                    hold_source=LiveHoldSource(state, config))
     return tick.run()
 
 

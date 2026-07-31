@@ -299,16 +299,72 @@ hv_bool=""; HV_GH_FAIL=1 pr_human_verify_held 100 && hv_bool=1
 [ -z "$hv_bool" ] || fail "(9d) precondition"
 [ "$(_hold_decision auto "$hv_bool" '')" = "MERGE" ] \
   || fail "(9d) precondition: a boolean read of the unreadable case decides MERGE"
-# …so assert the SHIPPED merge gate does not do that. The bash gate that used to carry this was the
-# action pass (_tick_act), DELETED at the P5 cutover (HERD-306) — the Python live engine now owns the
-# merge pass, and it FAILS CLOSED on an unreadable gh read (holds without merging, never blind-merges).
-PYLIVE="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc/herd/live_runtime.py"
-python3 - "$PYLIVE" <<'GATE' || fail "(9d) the Python merge gate must FAIL CLOSED on an unreadable gh read (hold, never blind-merge)"
-import sys
-src = open(sys.argv[1], encoding='utf-8').read()
-# the unreadable-read path must journal its unreadable event and HOLD (a fail-closed marker), never merge
-sys.exit(0 if ('unreadable' in src and 'hold' in src.lower()) else 1)
+# …so assert the SHIPPED merge gate does not do that. The bash gate that carried this was the action
+# pass (_tick_act), DELETED at the P5 cutover (HERD-306); the Python live engine owns the merge pass.
+#
+# HERD-442: from P5b until now this check was a GREP — `'unreadable' in src and 'hold' in src.lower()`
+# over live_runtime.py — which both words satisfy in unrelated prose, so it passed continuously while
+# the gate it names did not exist at all (the port never read a PR body, so hv_hold was permanently
+# False and every human-verify PR auto-merged). A structural assertion over source text cannot
+# distinguish a gate from a comment about a gate. It is now BEHAVIOURAL: drive a real tick with an
+# unreadable body and assert the outcome.
+PYROOT="$(cd "$(dirname "$WATCH")/../.." && pwd)/pysrc"
+PYTHONPATH="$PYROOT" python3 - <<'GATE' || fail "(9d) the Python merge gate must FAIL CLOSED on an unreadable gh read (hold, never blind-merge)"
+import os, sys, tempfile
+from herd.live_runtime import (LiveTick, LiveJournal, LiveState, FixtureDiscovery, FixtureGates,
+                               DryRunActuator)
+
+class Unreadable:
+    """A hold source whose body read FAILS — the gh timeout / auth / rate-limit case."""
+    def hv_body(self, pr):
+        return "", 124
+    def approved(self, pr, sha):
+        return False
+
+tmp = tempfile.mkdtemp()
+jpath = os.path.join(tmp, "j.jsonl")
+journal = LiveJournal(jpath)
+scenario = {"candidates": [{"pr": 1, "sha": "s1", "review": "PASS", "health": "CLEAN"}],
+            "config": {"MERGE_POLICY": "auto"}}
+tick = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                DryRunActuator(journal), journal, state=LiveState(tmp), hold_source=Unreadable())
+res = tick.run()
+rows = [l for l in open(jpath, encoding="utf-8")] if os.path.exists(jpath) else []
+merged = [l for l in rows if '"event":"merge"' in l]
+flagged = [l for l in rows if "hv_body_unreadable" in l]
+if res["outcomes"]["1"] == "MERGE" or merged:
+    sys.stderr.write("the gate MERGED a PR whose body it could not read\n")
+    sys.exit(1)
+if not flagged:
+    sys.stderr.write("the hold left no hv_body_unreadable forensic record\n")
+    sys.exit(1)
+sys.exit(0)
 GATE
 ok
+
+# ── 10. the HELD-AND-READY console row (HERD-442) ────────────────────────────────────────────────
+# A gates-green PR held on a human used to paint `🩺 health-check` forever: the render leg had no row
+# for a hold (bash painted one from the action pass, deleted at P5b), so the engine waited on a human
+# and said nothing — indistinguishable from a wedged watcher. The row is now driven by the SAME
+# awaiting ledger row the engine writes and `herd approve` reads, so the console and the gate can
+# never disagree about whether something is held.
+rm -f "$APPROVALS"
+approval_awaiting_noted 100 "$SHA_A" && fail "(10) no ledger row must mean no hold row"
+ok
+printf '1000 awaiting 100 %s\n' "$SHA_A" > "$APPROVALS"
+approval_awaiting_noted 100 "$SHA_A" || fail "(10) the awaiting row must drive the held row"
+approval_awaiting_noted 100 "deadbeef" && fail "(10) the row is sha-keyed: a new commit re-holds"
+ok
+# The label the row carries, for each policy. Under auto the ONLY thing that can hold a gates-green PR
+# is a human-verify block, so the row must say so and name the release command.
+MERGE_POLICY=auto _p="$(_effective_merge_policy)"; [ "$_p" = auto ] || fail "(10) precondition"
+printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'human-verify pending' \
+  || fail "(10) an auto-policy hold must be labelled human-verify: $(_hold_ready_label 1 100 hold)"
+printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'approve 100' \
+  || fail "(10) the held row must name the release command"
+printf '%s' "$(_hold_ready_label "" 100)" | grep -q 'awaiting approval' \
+  || fail "(10) an approve-policy hold keeps the generic wording"
+ok
+rm -f "$APPROVALS"
 
 echo "ALL PASS ($pass checks)"
