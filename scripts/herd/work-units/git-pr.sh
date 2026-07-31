@@ -183,6 +183,21 @@ reconcile_backlog() {
   return 0
 }
 
+# _dm_reap_unsafe <slug> <dir> — HERD-444: success iff do_merge's OWN immediate post-merge reap of
+# <dir> is NOT safe right now — i.e. must be deferred to retirement.sh's reconciled tick instead.
+# Mirrors retire_classify's MERGED-branch ordering exactly: dirt is checked FIRST (never destroy real
+# work, whether or not a builder is currently "working" over it — a paused/crashed agent leaves real
+# edits behind too), THEN liveness (_reap_agent_working, retirement.sh — a POSITIVE "working" read
+# only; an absent/unreadable roster is not evidence of anything and never blocks a reap on its own).
+# Both helpers are sourced by the time this ever runs: do_merge is only CALLED from inside a live
+# watcher tick, long after agent-watch.sh has finished sourcing sweep.sh + retirement.sh in full.
+_dm_reap_unsafe() {
+  local slug="$1" dir="$2" dirt
+  dirt="$(_sweep_classify_dirt "$dir")"
+  [ "${dirt%%$'\t'*}" = dirty ] && return 0
+  _reap_agent_working "$slug"
+}
+
 # do_merge <slug> <pr#> <worktree> — the safety-railed merge + post-merge sequence.
 do_merge() {
   ds="$1"; dp="$2"; dd="$3"; dsha="${4:-}"
@@ -323,7 +338,26 @@ do_merge() {
   #      worktree, reap the HERD-92 tracker-ref marker (the ref lives on in the $STATE row), journal
   #      the reap, and close the builder / review·slug / resolver·slug tabs. Shared with the startup
   #      reap-sweep so a merge that crashed BEFORE this point (PR #208) is resumed on restart.
-  _reap_slug "$ds" "$dd" "$dp" "$dsha" merged
+  #
+  # HERD-444: this used to reap UNCONDITIONALLY, the instant the merge above landed, on the assumption
+  # that a just-merged PR's builder is "done by definition". That assumption is false: the coordinator
+  # can re-task the SAME builder onto a red (a CI failure, a post-merge finding) BEFORE this seat's own
+  # merge tick runs — the coordinator VERIFIED the wake (agent_status idle→working) minutes before this
+  # watcher merged PR #560 on green herd/gates (GitHub CI is not a gate input) and reaped it seconds
+  # later, force-removing the worktree mid-edit. The in-progress fix was never committed and was
+  # unrecoverable (2026-07-30). retire_classify (retirement.sh, HERD-356) already proves this exact
+  # liveness+dirt check safe and journals a loud 'deferred'/'held' row for it on the RECONCILED tick —
+  # this do_merge call site is the one path that skipped it entirely. Apply the SAME check here (dirt
+  # first, so a dirty-AND-working tree can never slip through on either check alone) and, if unsafe,
+  # skip the direct reap: this same watcher process already runs retirement.sh's reconciled tick every
+  # cycle, and with no open PR left on this branch the very next tick picks the worktree back up,
+  # classifies it MERGED, and drives the teardown once — and only once — it is actually safe (with its
+  # own bounded timeout guarding against a wedged agent, so this defer can never leak forever).
+  if [ -d "$dd" ] && _dm_reap_unsafe "$ds" "$dd"; then
+    journal_append reap_deferred pr "$dp" slug "$ds" sha "$dsha" reason merged-worktree-live
+  else
+    _reap_slug "$ds" "$dd" "$dp" "$dsha" merged
+  fi
   return 0
 }
 

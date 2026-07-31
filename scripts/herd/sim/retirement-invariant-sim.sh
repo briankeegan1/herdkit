@@ -153,12 +153,15 @@ printf 'LEFT %s\n' "$(retire_leftovers "$SIM_SLUG" "$TREES/$SIM_SLUG" "feat/$SIM
 CHILD
 
 # tick <scenario-dir> <slug> [crash-point] — one watcher lifetime. Echoes the child's report.
+# SIM_FAKE_NOW (HERD-444), when set, pins the child's clock (_now_epoch) so the bounded-defer-timeout
+# scenario can jump the clock forward without sleeping in real time.
 tick() {
   local scn="$1" slug="$2" crash="${3:-none}"
   PATH="$BIN:$PATH" \
   WATCH_SH="$WATCH" SIM_MAIN="$scn/main" SIM_TREES="$scn/trees" SIM_SLUG="$slug" \
   GH_DIR="$scn/gh" HERDR_TABS="$scn/tabs.json" HERD_CONFIG_FILE="$scn/no-config" \
   CRASH_AFTER="$crash" HERD_RETIRE_STUCK_TICKS=3 HERD_DISPOSABLE_WORKSPACE=1 \
+  HERD_RETIRE_DEFER_TIMEOUT="${SIM_DEFER_TIMEOUT:-1800}" HERD_FAKE_NOW="${SIM_FAKE_NOW:-}" \
   SIM_AGENT_STATUS="${SIM_AGENT_STATUS:-idle}" \
     bash "$ART/tick.sh" 2>/dev/null
 }
@@ -438,6 +441,47 @@ if [ -z "$left3" ] && [ -z "$res3" ]; then
   ok "builder went idle → merged worktree reaped within one sweep (zero leftovers, zero residue)"
 else
   bad "builder idle but the merged worktree did NOT reap — left='${left3:-}' res='${res3:-}'"
+fi
+
+# ── PART 5: HERD-444 — a deferred reap that never goes idle is bounded, never a permanent leak ────
+# Part 4 proved the defer heals the instant the builder goes idle. This proves the OTHER half of the
+# safety contract: an agent that is WEDGED — crashed without ever flipping off "working" — must not
+# strand the worktree forever. HERD_RETIRE_DEFER_TIMEOUT (via SIM_DEFER_TIMEOUT/SIM_FAKE_NOW) drives the
+# clock deterministically, so this proves the bound without sleeping in real time.
+step wedge "a deferred worktree whose builder NEVER goes idle is reaped anyway, once, past the bounded timeout"
+SLUG_WEDGE=retiree-wedged
+scn="$ART/scn-wedge"; rm -rf "$scn"; mkdir -p "$scn"
+fixture "$scn" "$SLUG_WEDGE" merged
+
+# Tick 1, clock=1000: well inside the window → deferred, worktree survives.
+rep="$(SIM_AGENT_STATUS=working SIM_DEFER_TIMEOUT=100 SIM_FAKE_NOW=1000 tick "$scn" "$SLUG_WEDGE" none)"
+state="$(printf '%s' "$rep" | sed -n "s/^STATE $SLUG_WEDGE //p" | cut -d' ' -f1)"
+[ "$state" = deferred ] && ok "tick 1 (elapsed=0s): deferred, well inside the window" \
+                        || bad "tick 1: expected deferred, got: ${state:-<none>}"
+[ -d "$scn/trees/$SLUG_WEDGE" ] || bad "tick 1: the worktree must survive while deferred"
+
+# Tick 2, clock=1050: elapsed=50s < timeout=100s → STILL deferred, the roster STILL says working.
+rep2="$(SIM_AGENT_STATUS=working SIM_DEFER_TIMEOUT=100 SIM_FAKE_NOW=1050 tick "$scn" "$SLUG_WEDGE" none)"
+state2="$(printf '%s' "$rep2" | sed -n "s/^STATE $SLUG_WEDGE //p" | cut -d' ' -f1)"
+[ "$state2" = deferred ] && ok "tick 2 (elapsed=50s < 100s): still deferred" \
+                         || bad "tick 2: expected deferred, got: ${state2:-<none>}"
+[ -d "$scn/trees/$SLUG_WEDGE" ] || bad "tick 2: the worktree must still survive"
+
+# Tick 3, clock=1101: elapsed=101s >= timeout=100s, and the roster STILL says working (a wedged agent,
+# by construction — a genuinely busy builder would have gone idle long before a real 30-minute default).
+# The reap must proceed anyway, converging to zero leftovers, and the timeout must be journaled loudly.
+rep3="$(SIM_AGENT_STATUS=working SIM_DEFER_TIMEOUT=100 SIM_FAKE_NOW=1101 tick "$scn" "$SLUG_WEDGE" none)"
+left3="$(printf '%s' "$rep3" | sed -n 's/^LEFT //p')"
+res3="$(residue "$scn" "$SLUG_WEDGE")"
+if [ -z "$left3" ] && [ -z "$res3" ]; then
+  ok "tick 3 (elapsed=101s >= 100s): reaped despite 'working' never clearing — the bound holds"
+else
+  bad "tick 3: the bounded timeout did not reap a wedged agent — left='${left3:-}' res='${res3:-}'"
+fi
+if printf '%s' "$rep3" | grep -q "^STATE $SLUG_WEDGE deferred"; then
+  bad "tick 3: the row still reads deferred past the bound — this IS the leak the timeout exists to prevent"
+else
+  ok "tick 3: the row no longer reads deferred once the bound is crossed"
 fi
 
 step done "scorecard"

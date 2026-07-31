@@ -1991,6 +1991,14 @@ class DryRunActuator:
         return True
 
     def reap(self, cand):
+        # HERD-444: defer instead of reaping when the fixture models a still-WORKING builder or a
+        # dirty tree — see LiveActuator.reap for the incident this guards against. ``agent_status``
+        # unset (``""``) and ``dirty`` unset (``False``) are both the legacy-fixture defaults, so every
+        # scenario written before this fix reaps exactly as before (byte-identical).
+        if str(getattr(cand, "agent_status", "") or "") == "working" or self.worktree_dirty(cand):
+            self.journal.append("reap_deferred", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                                "reason", "merged-worktree-live")
+            return False
         _cost_emit.emit_merge_cost(self.journal, cand.pr, cand.slug, cand.worktree)
         self.journal.append("reap", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "reason", "merged")
@@ -2149,15 +2157,25 @@ class LiveActuator:
         return True
 
     def reap(self, cand):
-        # REAP-ON-MERGE only: this fires the instant THIS tick merged ``cand`` on green gates, so the
-        # builder is DONE by definition — there is no separate resident builder to defer for here, and no
-        # roster is fetched on this path. The HERD-356 liveness gate ("a still-WORKING builder defers the
-        # reap; an idle/merged builder's pane is retired with the worktree") lives in the ONE place that
-        # reaps a merge THIS seat did not perform: the bash sweep (``sweep.sh:sweep_leg_worktrees`` and
-        # ``retirement.sh:retire_classify``, both keying off the shared ``_reap_agent_working`` verdict).
-        # That is the multi-seat authority the contract requires — it reconciles observed PR state each
-        # sweep tick, so the gate holds regardless of which seat merged. Keeping it single-sourced there
-        # (rather than re-deriving a roster verdict on this already-post-gate path) is deliberate.
+        # REAP-ON-MERGE: this fires the instant THIS tick merged ``cand`` on green gates. It used to
+        # reap UNCONDITIONALLY here on the assumption that the builder is DONE the moment its PR merges
+        # — false: the coordinator can re-task the SAME builder onto a red (a CI failure, a post-merge
+        # finding) BEFORE this tick's own merge runs, and this reap fired seconds later, force-removing
+        # the worktree mid-edit with the fix never committed (PR #560, 2026-07-30, HERD-444). The
+        # HERD-356 liveness gate ("a still-WORKING builder defers the reap") used to live ONLY in the
+        # bash sweep (``sweep.sh:sweep_leg_worktrees`` / ``retirement.sh:retire_classify``, both keying
+        # off ``_reap_agent_working``) on the theory that THIS seat's own reap-on-merge never needed it.
+        # It does. Apply the SAME two-part check here — dirt first (a paused/crashed agent can leave
+        # real edits behind even when not currently "working"), then a fresh liveness read — and defer
+        # instead of reaping when either is unsafe. Deferring costs nothing: the bash watcher STILL owns
+        # the resident `while true` loop and every sweep even under ``ENGINE_IMPL=python`` (module
+        # docstring, "Bash stays the resident supervisor"), so with no open PR left on this branch the
+        # very next bash tick re-classifies the worktree MERGED and drives the teardown once it is
+        # actually safe — with retirement.sh's own bounded timeout guarding a genuinely wedged agent.
+        if self._agent_lookup(cand.slug)[0] == "working" or self.worktree_dirty(cand):
+            self.journal.append("reap_deferred", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                                "reason", "merged-worktree-live")
+            return False
         # 0) COST ACCOUNTING (best-effort, read-only): sum this builder's worktree transcript and
         #    journal a `cost` event (builder — and the in-worktree review, if captured) BEFORE the
         #    worktree is reaped (mirrors agent-watch.sh do_merge's step 0). Never affects the reap.

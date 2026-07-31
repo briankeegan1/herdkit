@@ -657,6 +657,29 @@ class TestReapAndActuation(LiveCase):
         self.assertEqual(len(reaps), 1)
         self.assertEqual(reaps[0]["reason"], "merged")
 
+    def test_merge_defers_reap_when_builder_still_working(self):
+        # HERD-444: a candidate whose fixture models a still-WORKING builder must merge (the merge is
+        # unconditional and irreversible) but NOT reap — reaping unconditionally the instant the merge
+        # lands destroyed a builder's in-progress fix (PR #560, 2026-07-30) because the coordinator can
+        # re-task the SAME builder onto a red BEFORE this tick's own merge runs.
+        _, ev = self.tick([self.one(1, review="PASS", health="CLEAN", worktree="/wt/1",
+                                     agent_status="working")])
+        self.assertTrue([o for o in ev if o["event"] == "merge"], "the merge itself must still land")
+        self.assertFalse([o for o in ev if o["event"] == "reap"],
+                          "a WORKING builder's worktree must not be reaped on the merge tick")
+        deferred = [o for o in ev if o["event"] == "reap_deferred"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["reason"], "merged-worktree-live")
+
+    def test_merge_defers_reap_when_worktree_dirty(self):
+        # Same defer, but for the OTHER unsafe condition: real uncommitted work, whether or not a
+        # builder is currently reporting "working" (a paused/crashed agent leaves edits behind too).
+        _, ev = self.tick([self.one(1, review="PASS", health="CLEAN", worktree="/wt/1", dirty=True)])
+        self.assertTrue([o for o in ev if o["event"] == "merge"])
+        self.assertFalse([o for o in ev if o["event"] == "reap"],
+                          "a dirty worktree must not be reaped on the merge tick")
+        self.assertTrue([o for o in ev if o["event"] == "reap_deferred"])
+
     def test_refused_merge_stays_blessed_and_never_reaps(self):
         # HERD-352: a refused merge (actuator returns False) STAYS BLESSED — it HOLDS and re-attempts next
         # tick, never reaps, never a silent drop. Escalation is only after N consecutive refusals (below).
@@ -932,6 +955,28 @@ class _RecordingSub:
                 raise subprocess.CalledProcessError(1, argv)
             return _FakeCompleted(self.view_state + "\n")
         return _FakeCompleted("")
+
+
+class _RecordingSubWithRoster(_RecordingSub):
+    """HERD-444: extends ``_RecordingSub`` to script ``herdr agent list`` (LiveActuator._agent_lookup)
+    and ``git status --porcelain`` (LiveActuator.worktree_dirty) — the two real-subprocess reads the
+    reap-liveness guard makes. ``agent_status=""`` (default) reports an empty roster, exactly like a
+    genuinely absent/idle agent; ``dirty=True`` scripts one modified TRACKED path."""
+
+    def __init__(self, view_state="MERGED", fail=(), agent_status="", dirty=False):
+        super().__init__(view_state=view_state, fail=fail)
+        self.agent_status = agent_status
+        self.dirty = dirty
+
+    def run(self, argv, *a, **k):
+        if argv[:2] == ["herdr", "agent"]:
+            self.calls.append(list(argv))
+            agents = [{"name": "slug1", "agent_status": self.agent_status}] if self.agent_status else []
+            return _FakeCompleted(json.dumps({"result": {"agents": agents}}))
+        if argv[:2] == ["git", "-C"] and "status" in argv:
+            self.calls.append(list(argv))
+            return _FakeCompleted(" M file.txt\n" if self.dirty else "")
+        return super().run(argv, *a, **k)
 
 
 class TestLiveMergeVerify(LiveCase):
@@ -2761,6 +2806,57 @@ class TestCostEmitMerge(LiveCase):
         cand = LiveCandidate(43, "cafebabe", slug="slug2", worktree=wt)
         act.reap(cand)
         self.assertTrue([o for o in events(self.jpath) if o["event"] == "cost"])
+
+
+class TestLiveReapDefersOnLiveWorktree(LiveCase):
+    """HERD-444: the LIVE actuator's reap() must not force-remove a worktree whose builder is
+    confirmed WORKING (a fresh `herdr agent list` read) or whose tree carries real uncommitted work (a
+    fresh `git status --porcelain`) — see LiveActuator.reap's incident comment. Hermetic: subprocess is
+    fully stubbed via _RecordingSubWithRoster, no gh/git/herdr ever runs for real."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_reap_defers_when_agent_confirmed_working(self):
+        sub = _RecordingSubWithRoster(agent_status="working")
+        act = self._actuator(sub)
+        cand = LiveCandidate(1, "deadbeef", slug="slug1", worktree="/wt/1")
+        self.assertFalse(act.reap(cand))
+        names = [o["event"] for o in events(self.jpath)]
+        self.assertNotIn("reap", names)
+        deferred = [o for o in events(self.jpath) if o["event"] == "reap_deferred"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["reason"], "merged-worktree-live")
+        self.assertFalse(any(c[:3] == ["git", "worktree", "remove"] for c in sub.calls),
+                          "a WORKING builder's worktree must never reach `git worktree remove`")
+
+    def test_reap_defers_when_worktree_dirty(self):
+        sub = _RecordingSubWithRoster(agent_status="idle", dirty=True)
+        act = self._actuator(sub)
+        cand = LiveCandidate(1, "deadbeef", slug="slug1", worktree="/wt/1")
+        self.assertFalse(act.reap(cand))
+        self.assertFalse(any(c[:3] == ["git", "worktree", "remove"] for c in sub.calls))
+
+    def test_reap_proceeds_when_idle_and_clean(self):
+        sub = _RecordingSubWithRoster(agent_status="idle", dirty=False)
+        act = self._actuator(sub)
+        cand = LiveCandidate(1, "deadbeef", slug="slug1", worktree="/wt/1")
+        self.assertTrue(act.reap(cand))
+        names = [o["event"] for o in events(self.jpath)]
+        self.assertIn("reap", names)
+        self.assertNotIn("reap_deferred", names)
+        self.assertTrue(any(c[:3] == ["git", "worktree", "remove"] for c in sub.calls))
+
+    def test_reap_proceeds_when_roster_absent(self):
+        # Fail-soft: an empty/unreadable roster is BLINDNESS, never evidence of a working agent — it
+        # must never itself block a reap (mirrors _reap_agent_working's bash contract).
+        sub = _RecordingSubWithRoster(agent_status="", dirty=False)
+        act = self._actuator(sub)
+        cand = LiveCandidate(1, "deadbeef", slug="slug1", worktree="/wt/1")
+        self.assertTrue(act.reap(cand))
 
 
 class TestWorkUnitAdapterSkeleton(unittest.TestCase):
