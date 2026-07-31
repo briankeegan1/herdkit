@@ -20,6 +20,19 @@ APPROVE="$ENGINE/herd-approve.sh"
 [ -f "$APPROVE" ] || { echo "FAIL: herd-approve.sh not found at $APPROVE" >&2; exit 1; }
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+
+# NOTIFY HERMETICITY (HERD-139/HERD-173). Section (2) below drives a real `notify`-kind step under
+# HERD_DRIVER=headless. steps.sh's notify branch calls herd_driver_notify, and the headless driver
+# fires a best-effort NATIVE osascript/notify-send alongside its durable sink — so this test popped a
+# REAL macOS desktop notification ("memo: pre-merge checkpoint reached") from FIXTURE data on every
+# run, which the healthcheck's daemon-hermeticity guard reds as a live-production-surface leak.
+# Installing the shared stub pins HERD_HEADLESS_NATIVE_NOTIFY=off and PATH-shims osascript /
+# notify-send to CAPTURE, so the notification stays observable in the sink but never reaches a screen.
+# Both the env and the PATH are exported, so the `env … bash "$STEPS"` subprocesses inherit them.
+# shellcheck source=/dev/null
+. "$HERE/../scripts/herd/sim/sim-notify-stub.sh" || { echo "FAIL: cannot source the HERD-139 notify stub" >&2; exit 1; }
+sim_notify_install "$T" || { echo "FAIL: sim_notify_install failed" >&2; exit 1; }
+
 REPO="$T/repo"; TREES="$T/trees"; STEPS_FILE="$T/steps.tsv"; JN="$T/journal.jsonl"
 NOCFG="$T/.no-config"       # a path that does NOT exist ⇒ herd-config.sh won't walk into herdkit's own
 mkdir -p "$REPO" "$TREES"; : > "$JN"
