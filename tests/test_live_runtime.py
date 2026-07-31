@@ -5022,6 +5022,218 @@ class TestHoldLayerRestored(LiveCase):
         self.assertEqual([o for o in ev if o["event"] == "hold_applied"][0]["kind"], "human-verify")
 
 
+class _RecordingHoldActuator(DryRunActuator):
+    """A DryRunActuator that RECORDS post_comment/notify calls instead of no-opping them — the only
+    way to observe the HERD-448 hold/merge actuator surface without shelling out to gh, mirroring
+    _PromptRecordingActuator's pattern for the refix-bounce wake surface."""
+
+    def __init__(self, journal):
+        super().__init__(journal)
+        self.comments = []   # (pr, kind, body)
+        self.notifies = []   # (title, body, sound)
+
+    def post_comment(self, cand, kind, body):
+        self.comments.append((cand.pr, kind, body))
+        return True
+
+    def notify(self, title, body, sound="default"):
+        self.notifies.append((title, body, sound))
+
+
+class TestHoldNotifyActuator(LiveCase):
+    """HERD-448: a hold is not silent to the PR author — it posts a comment and/or fires an operator
+    notify, exactly once per (pr, sha, branch). Mutation-proven: neutralizing
+    LiveTick._apply_hold_actuation, or either of the hv-auto / observe call sites, reds every test
+    in this class (each asserts on act.comments/act.notifies, which only a live actuator call can
+    populate)."""
+
+    def tick_live(self, hold_source, actuator, config=None, **kw):
+        cand = self.one(1, **kw)
+        scenario = {"candidates": [cand], "config": config or {"MERGE_POLICY": "auto"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     actuator, journal, state=LiveState(self.tmp), hold_source=hold_source)
+        res = t.run()
+        return res["outcomes"]["1"], (events(self.jpath) if os.path.exists(self.jpath) else [])
+
+    # ── the three HOLD branches (agent-watch.sh:11878-11901, ede7d45^) ──────────────────────────────
+    def test_coordinator_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(
+            _StubHoldSource(body=_HV_BODY), act,
+            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "coordinator"},
+            review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "coordinator")
+        self.assertIn("coordinator-actionable", body)
+        self.assertIn("run the live smoke test", body)          # the declared step, verbatim
+        self.assertIn("herd approve 1", body)
+        self.assertEqual(len(act.notifies), 1)
+        title, note, sound = act.notifies[0]
+        self.assertIn("coordinator action needed", title)
+        self.assertIn("herd approve 1", note)
+
+    def test_human_verify_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(body=_HV_BODY), act, review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "human-verify")
+        self.assertIn("must be **human-verified**", body)
+        self.assertIn("run the live smoke test", body)
+        self.assertEqual(len(act.notifies), 1)
+        self.assertIn("human-verify pending", act.notifies[0][0])
+
+    def test_approve_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, config={"MERGE_POLICY": "approve"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "approve")
+        self.assertIn("awaiting approval before", body)
+        self.assertNotIn("HUMAN-VERIFY", body)
+        self.assertEqual(len(act.notifies), 1)
+        self.assertIn("awaiting approval", act.notifies[0][0])
+
+    # ── idempotency: same once-guard already dedups hold_applied ───────────────────────────────────
+    def test_hold_actuation_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource(body=_HV_BODY)
+        self.tick_live(src, act, review="PASS", health="CLEAN")
+        self.tick_live(src, act, review="PASS", health="CLEAN")   # re-walk the SAME (pr, sha)
+        self.assertEqual(len(act.comments), 1)
+        self.assertEqual(len(act.notifies), 1)
+
+    # ── the MERGE-branch informational comment (the case that went unnoticed 19 days) ───────────────
+    def test_hv_auto_merge_posts_comment_but_no_notify(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(
+            _StubHoldSource(body=_HV_BODY), act,
+            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"},
+            review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "hv-auto")
+        self.assertIn("NOT executed before merge", body)
+        self.assertIn("run the live smoke test", body)
+        self.assertFalse(act.notifies)      # comment only — bash never notified on this branch either
+
+    def test_hv_auto_comment_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource(body=_HV_BODY)
+        cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"}
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.assertEqual(len(act.comments), 1)
+
+    # ── the OBSERVE branch: notify only, never a comment ────────────────────────────────────────────
+    def test_observe_notifies_but_posts_no_comment(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, config={"MERGE_POLICY": "observe"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "OBSERVE")
+        self.assertFalse(act.comments)
+        self.assertEqual(len(act.notifies), 1)
+        title, note, sound = act.notifies[0]
+        self.assertIn("ready (observe)", title)
+        self.assertIn("observe mode, not merging", note)
+
+    def test_observe_notify_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource()
+        cfg = {"MERGE_POLICY": "observe"}
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.assertEqual(len(act.notifies), 1)
+
+    # ── byte-identical when no hold fires ───────────────────────────────────────────────────────────
+    def test_plain_merge_posts_nothing(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse(act.comments)
+        self.assertFalse(act.notifies)
+
+    # ── DryRunActuator: posts nothing, ever ─────────────────────────────────────────────────────────
+    def test_dry_run_actuator_posts_nothing_on_a_hold(self):
+        journal = LiveJournal(self.jpath)
+        act = DryRunActuator(journal)
+        cand = LiveCandidate(1, "sha1", slug="pr-1", hv_body=_HV_BODY, hv_hold=True)
+        self.assertTrue(act.post_comment(cand, "human-verify", "body text"))
+        self.assertIsNone(act.notify("title", "body"))
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse(ev)   # no gh, no driver.sh, no journal line of its own
+
+
+class TestLiveHoldCommentActuator(LiveCase):
+    """LiveActuator.post_comment / .notify — the REAL gh / driver-seam shape (HERD-448), hermetic:
+    subprocess is stubbed, exactly as TestLiveGateStatusPost proves post_gate_status."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_post_comment_uses_gh_pr_comment_shape(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertTrue(act.post_comment(cand, "approve", "the comment body"))
+        calls = [c for c in sub.calls if c[:3] == ["gh", "pr", "comment"]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ["gh", "pr", "comment", "7", "--body", "the comment body"])
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse([o for o in ev if o["event"] == "hold_comment_failed"])
+
+    def test_failed_post_journals_hold_comment_failed_and_never_retries(self):
+        class _FailingCommentSub:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, *a, **k):
+                self.calls.append(list(argv))
+                if argv[:3] == ["gh", "pr", "comment"]:
+                    raise subprocess.CalledProcessError(1, argv)
+                return _FakeCompleted("")
+
+        sub = _FailingCommentSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertFalse(act.post_comment(cand, "human-verify", "body"))
+        failed = [o for o in events(self.jpath) if o["event"] == "hold_comment_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(str(failed[0]["pr"]), "7")
+        self.assertEqual(str(failed[0]["sha"]), "deadbeef")
+        self.assertEqual(failed[0]["slug"], "feat-x")
+        self.assertEqual(failed[0]["kind"], "human-verify")
+        # Called exactly once — "never retried" is the CALLER's once-guard, not this method's job.
+        self.assertEqual(len(sub.calls), 1)
+
+    def test_notify_shells_out_through_the_driver_seam(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        act.notify("a title", "a body", "default")
+        calls = [c for c in sub.calls
+                 if len(c) >= 2 and c[0] == "bash" and str(c[1]).endswith("driver.sh")]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2:], ["notify", "a title", "a body", "default"])
+
+    def test_notify_never_raises_on_a_broken_driver(self):
+        class _BoomSub:
+            def run(self, *a, **k):
+                raise OSError("no such file")
+
+        act = self._actuator(_BoomSub())
+        act.notify("title", "body")   # must not raise
+
+
 class TestApprovalsLedger(LiveCase):
     """LiveState's half of the ledger — the same flat file herd-approve.sh reads and writes."""
 
