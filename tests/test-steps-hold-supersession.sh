@@ -121,8 +121,17 @@ PASSCT="$T/passct"; NOTIFYCT="$T/notifyct"; : > "$PASSCT"; : > "$NOTIFYCT"
   printf 'notify-me\tpre-merge\tprintf n >> %s\twarn\tnotify\n' "$NOTIFYCT"
 } > "$STEPS2"
 run2() {
+  # HERD-189 DAEMON-HERMETICITY: this is the only step definition in this file of kind=notify, so
+  # it is the only call in this test that can reach steps.sh's hold=notify branch
+  # (herd_driver_notify -> _herd_headless_notify -> a REAL osascript/notify-send desktop
+  # notification under HERD_DRIVER=headless, unless suppressed). HERD_HEADLESS_NATIVE_NOTIFY=off
+  # is the documented headless-tier suppression (scripts/herd/sim/sim-notify-stub.sh's own doc
+  # comment) — it only silences the native desktop call; the durable notifications.log write and
+  # steps.sh's own step_hold_notify journal line (what $NOTIFYCT / (2)'s checks actually assert on)
+  # are untouched, so this changes nothing this test observes.
   env HERD_CONFIG_FILE="$NOCFG" PROJECT_ROOT="$REPO" WORKTREES_DIR="$TREES2" \
       HERD_STEPS_FILE="$STEPS2" JOURNAL_FILE="$JN2" NO_COLOR=1 HERD_DRIVER=headless \
+      HERD_HEADLESS_NATIVE_NOTIFY=off \
       bash "$STEPS" run pre-merge --slug memo --dir "$REPO" >/dev/null 2>&1
 }
 # Three re-ticks at the SAME sha (SHA2). The pass step + notify step must each execute exactly once.

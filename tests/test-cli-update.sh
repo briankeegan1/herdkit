@@ -112,9 +112,13 @@ CFG
 }
 
 # _run_update PROJECT ENGINE [extra env...] — run herd update with standard test knobs.
+# "extra env..." entries are VAR=val STRINGS (e.g. from a variable, not a parse-time literal), so
+# they are handed to `env` rather than used as a bash prefix-assignment — "$@" VAR=val cmd only
+# works when VAR=val is an unquoted literal token at parse time, never when it comes from parameter
+# expansion (bash never re-parses an already-expanded string for '=' assignment syntax).
 _run_update() {
   local proj="$1" eng="$2"; shift 2
-  ( cd "$proj" && HERD_UPDATE_ENGINE_DIR="$eng" HERD_RELOAD_SKIP_LAUNCH=1 "$@" bash "$HERD" update 2>&1 )
+  ( cd "$proj" && env HERD_UPDATE_ENGINE_DIR="$eng" HERD_RELOAD_SKIP_LAUNCH=1 "$@" bash "$HERD" update 2>&1 )
 }
 
 # ── 1. No .herd/config → die with clear message ───────────────────────────────
@@ -229,31 +233,26 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
 ok
 
 # ── 10. No herdr on PATH → builder check skipped, update proceeds ─────────────
-# "No herdr on PATH" has to be made TRUE, not merely assumed. Moving our own stub aside only removes
-# THIS test's herdr; any other one still on PATH — a real installed herdr, or the healthcheck's
-# daemon-hermeticity shim, which prepends its own `herdr` — still resolves. So on a developer box or
-# under the gate this case silently ran WITH herdr present: it passed for the wrong reason (the
-# builder check was exercised, not skipped) and it called that herdr for real, which is exactly the
-# `suite herdr agent list` leak the gate's hermeticity guard reported. Drop EVERY PATH entry holding
-# an executable herdr for this one invocation, so absence is a fact rather than an assumption.
-_path_without_herdr() {
-  local _d _out="" _oldifs="$IFS"
-  IFS=:
-  for _d in $PATH; do
-    [ -n "$_d" ] || continue
-    [ -x "$_d/herdr" ] && continue
-    _out="${_out:+$_out:}$_d"
-  done
-  IFS="$_oldifs"
-  printf '%s' "$_out"
-}
+# HERD-189/441: moving OUR OWN $BIN/herdr aside only removes it from PATH's FIRST match — under the
+# whole-suite daemon-hermeticity sandbox (.herd/healthcheck.project.sh), a SECOND herdr tripwire
+# stub is ALSO on PATH (further down, shadowing the real binary for every test in the run), so
+# `command -v herdr` still finds THAT one and cmd_update's builder check still runs against it —
+# which both defeats this case's actual intent (it no longer exercises the "herdr genuinely
+# absent" branch) and trips the outer suite's leak detector (a false hermeticity violation, since
+# it is that OUTER stub's own tripwire firing, not a real reach past it). Build a PATH with EVERY
+# directory that provides an executable named 'herdr' filtered out — $BIN, the outer sandbox's
+# shim dir, and any real system herdr alike — so this case is a genuine, environment-independent
+# proof of "herdr unresolvable", immune to how many stub layers happen to be stacked around it.
 P="$T/p10"; mkdir "$P"
 _make_project "$P" "updatetest"
 mv "$BIN/herdr" "$BIN/herdr.bak"
-NO_HERDR_PATH="$(_path_without_herdr)"
-command -v herdr >/dev/null 2>&1 && [ -z "${NO_HERDR_PATH:-}" ] \
-  && fail "(10) could not build a herdr-free PATH"
-out="$(PATH="$NO_HERDR_PATH" _run_update "$P" "$CLEAN_ENGINE")"
+NO_HERDR_PATH=""
+IFS=':' read -ra _p10_dirs <<< "$PATH"
+for _p10_d in "${_p10_dirs[@]}"; do
+  [ -x "$_p10_d/herdr" ] && continue
+  NO_HERDR_PATH="${NO_HERDR_PATH:+$NO_HERDR_PATH:}$_p10_d"
+done
+out="$(_run_update "$P" "$CLEAN_ENGINE" "PATH=$NO_HERDR_PATH")"
 # HERD-441 class, hit live on the macos CI leg of PR #563: `printf | grep -q` is EPIPE-unsafe under
 # pipefail — grep -q exits on the first match while printf is still writing, and once $out crosses the
 # platform pipe buffer (16KB on macOS, 64KB on linux) printf takes SIGPIPE and the pipeline goes

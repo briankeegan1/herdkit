@@ -729,6 +729,14 @@ export WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATC
 # is byte-identical to before. A real BLOCK verdict NEVER trips it. Consumed by agent-watch.sh.
 : "${INFRA_BREAKER_MAX:="0"}"         # 0/unset = off (byte-inert); N>=1 = open after N consecutive INFRA (non-verdict) failures
 : "${INFRA_BREAKER_COOLDOWN:="300"}"  # seconds the breaker stays OPEN before a single half-open probe retry (non-numeric → 300)
+# HERD-447: the Python engine core (pysrc/herd/live_runtime.py) now ALSO consults/records the breaker
+# (the gate read was restored — see docs/engine-contract.md §3.3) and reads these two the SAME way
+# HEALTH_CONCURRENCY etc. do (`_CORE_ENV_KEYS`, HERD-449) — as a CHILD process's os.environ, which only
+# sees an EXPORTED var. Without this export a project's configured INFRA_BREAKER_MAX/COOLDOWN would
+# reach the bash breaker helpers (same-shell vars, no export needed) but silently fall back to the
+# python engine's built-in 0/300 defaults — the exact HERD-449 bug class, caught here before it shipped
+# by scripts/herd/env-export-lint.sh rather than discovered live a fourth time.
+export INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
 # Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang

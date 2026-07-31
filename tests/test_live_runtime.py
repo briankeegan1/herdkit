@@ -314,6 +314,216 @@ class TestGateOutcomes(LiveCase):
                          "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
+class TestInfraBreakerGate(LiveCase):
+    """HERD-447: HERD-306's P5b deleted the bash action pass (_tick_act) that consulted
+    ``_breaker_gate`` at the top of every candidate — the HERD-442 audit found the breaker's READ
+    side had had no caller since ede7d45, so it kept recording consecutive infra deaths but never
+    actually halted dispatch (a valve that records and never fires). This proves BOTH halves restored
+    in the PYTHON tick, driven end-to-end through :meth:`LiveTick.run` — never the bash helpers
+    directly (those are proven separately, unchanged, by tests/test-infra-breaker.sh):
+
+      * the READ (the breaker consult at the top of ``LiveTick._walk``) actually SUPPRESSES dispatch
+        while open — the mutation-provable core: delete that consult and
+        ``test_open_breaker_suppresses_dispatch_entirely`` goes from HOLD/no-events to MERGE.
+      * the RECORD side (the review rail's verdict classification in the same walk) counts a real
+        INFRA death and resets on a real verdict, exactly like bash's ``_review_gate_step``.
+      * BYTE-INERT by default (``INFRA_BREAKER_MAX`` unset) — every existing gate-outcome test above
+        already proves this implicitly (none of them set the key and all still pass), so this class
+        adds one direct proof rather than repeating the whole suite.
+
+    Every test drives independent ``LiveTick`` instances sharing one on-disk state dir (the
+    ``TestGateOutcomes.test_refix_round_advances_per_new_sha`` / ``TestRefixCompletionTracking``
+    multi-tick pattern — a fresh ``LiveTick`` per tick is the real production process-boundary
+    shape) with ``HERD_FAKE_NOW`` pinned per call, so the cooldown arithmetic is exact and hermetic.
+    """
+
+    def _tick(self, state_dir, jpath, cands, config, fake_now):
+        old = os.environ.get("HERD_FAKE_NOW")
+        os.environ["HERD_FAKE_NOW"] = str(fake_now)
+        try:
+            scenario = {"candidates": cands, "config": config}
+            j = LiveJournal(jpath)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                        DryRunActuator(j), j, state=LiveState(state_dir))
+            res = t.run()
+        finally:
+            if old is None:
+                os.environ.pop("HERD_FAKE_NOW", None)
+            else:
+                os.environ["HERD_FAKE_NOW"] = old
+        return res, (events(jpath) if os.path.exists(jpath) else [])
+
+    def _death(self, pr, i):
+        return dict(pr=pr, sha="sha-%s-%d" % (pr, i), slug="feat-%s" % pr, review="INFRA",
+                   health="CLEAN")
+
+    def _ledger(self, state_dir):
+        path = os.path.join(state_dir, ".agent-watch-infra-breaker")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.readline().split()
+
+    def test_byte_inert_when_disabled(self):
+        # No INFRA_BREAKER_MAX at all: a storm of consecutive INFRA deaths across many ticks must
+        # never suppress a later, unrelated clean candidate and must never write a breaker ledger.
+        state_dir = os.path.join(self.tmp, "state-off")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto"}
+        T0 = 3_000_000_000
+        for i in range(6):
+            res, _ = self._tick(state_dir, os.path.join(self.tmp, "off-%d.jsonl" % i),
+                                [self._death(900, i)], config, T0 + i)
+            self.assertEqual(res["outcomes"]["900"], "ESCALATE")
+        self.assertIsNone(self._ledger(state_dir))
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "off-clean.jsonl"),
+                            [dict(pr=901, sha="s901", slug="feat-901", review="PASS", health="CLEAN")],
+                            config, T0 + 100)
+        self.assertEqual(res["outcomes"]["901"], "MERGE")
+
+    def test_opens_after_n_consecutive_deaths_and_journals_once(self):
+        state_dir = os.path.join(self.tmp, "state-open")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "3", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        opens = []
+        for i in range(3):
+            res, ev = self._tick(state_dir, os.path.join(self.tmp, "open-%d.jsonl" % i),
+                                 [self._death(910, i)], config, T0 + i)
+            self.assertEqual(res["outcomes"]["910"], "ESCALATE")
+            opens += [o for o in ev if o["event"] == "infra_breaker_open"]
+        self.assertEqual(len(opens), 1)
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "open")
+        self.assertEqual(fa, "3")
+
+    def test_open_breaker_suppresses_dispatch_entirely(self):
+        # THE mutation-provable core: once open, an otherwise-clean candidate is HELD with NO rail
+        # ever consulted — no verdict_recorded, no healthcheck_outcome, no review/health dispatch at
+        # all. Delete the breaker consult at the top of LiveTick._walk and this candidate merges
+        # instead — see the PR body for the neutralize/red/restore/green demonstration.
+        state_dir = os.path.join(self.tmp, "state-suppress")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(915, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "blocked.jsonl"),
+                             [dict(pr=916, sha="s916", slug="feat-916", review="PASS", health="CLEAN")],
+                             config, T0 + 5)
+        self.assertEqual(res["outcomes"]["916"], "HOLD")
+        self.assertFalse([o for o in ev
+                          if o["event"] in ("verdict_recorded", "healthcheck_outcome",
+                                             "healthcheck_started", "review_dispatched")])
+        # A sibling gets the SAME treatment — the halt is global, not per-PR.
+        res2, ev2 = self._tick(state_dir, os.path.join(self.tmp, "blocked2.jsonl"),
+                              [dict(pr=917, sha="s917", slug="feat-917", review="PASS", health="CLEAN")],
+                              config, T0 + 6)
+        self.assertEqual(res2["outcomes"]["917"], "HOLD")
+        self.assertFalse([o for o in ev2 if o["event"] == "verdict_recorded"])
+
+    def test_real_verdict_resets_counter_and_never_trips(self):
+        state_dir = os.path.join(self.tmp, "state-reset")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "3", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        # Two deaths (below threshold)...
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "pre-%d.jsonl" % i), [self._death(925, i)],
+                      config, T0 + i)
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual((st, fa), ("closed", "2"))
+        # ...then a REAL verdict (PASS) resets the counter to 0 — the env is provably alive.
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "verdict.jsonl"),
+                             [dict(pr=925, sha="s925-ok", slug="feat-925", review="PASS",
+                                   health="CLEAN")], config, T0 + 10)
+        self.assertEqual(res["outcomes"]["925"], "MERGE")
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual((st, fa), ("closed", "0"))
+        # Two MORE deaths after the reset must NOT open it (would have, without the reset).
+        for i in range(2):
+            res, _ = self._tick(state_dir, os.path.join(self.tmp, "post-%d.jsonl" % i),
+                                [self._death(925, 100 + i)], config, T0 + 20 + i)
+            self.assertEqual(res["outcomes"]["925"], "ESCALATE")
+        st, _fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "closed")
+
+    def test_half_open_admits_exactly_one_probe_and_it_persists_the_claim(self):
+        state_dir = os.path.join(self.tmp, "state-half")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(930, i)],
+                      config, T0 + i)
+        # cooldown not yet elapsed (opened at T0+1; 49s later is 50-1=49 < 50) — still BLOCKED.
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "cooling.jsonl"),
+                            [dict(pr=931, sha="s931a", slug="f931", review="PASS", health="CLEAN")],
+                            config, T0 + 49)
+        self.assertEqual(res["outcomes"]["931"], "HOLD")
+        # cooldown elapsed: TWO siblings walked the SAME tick, neither resolving (WAIT) — only the
+        # FIRST claims the probe; the second, walked after, is still BLOCKED (the claim is exclusive
+        # even within one tick, not just across ticks).
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                            [dict(pr=931, sha="s931b", slug="f931", review="WAIT"),
+                             dict(pr=932, sha="s932a", slug="f932", review="WAIT")],
+                            config, T0 + 60)
+        self.assertEqual(res["outcomes"]["931"], "PENDING")
+        self.assertEqual(res["outcomes"]["932"], "HOLD")
+        _st, _fa, _op, pb = self._ledger(state_dir)
+        self.assertEqual(pb, "931")
+        # The claim PERSISTS across ticks for the SAME probe PR (still unresolved) — 932 stays BLOCKED.
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "probe2.jsonl"),
+                            [dict(pr=931, sha="s931b", slug="f931", review="WAIT"),
+                             dict(pr=932, sha="s932a", slug="f932", review="WAIT")],
+                            config, T0 + 61)
+        self.assertEqual(res["outcomes"]["931"], "PENDING")
+        self.assertEqual(res["outcomes"]["932"], "HOLD")
+
+    def test_probe_success_closes_and_resumes_normal_dispatch(self):
+        state_dir = os.path.join(self.tmp, "state-close")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(940, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                             [dict(pr=941, sha="s941", slug="f941", review="PASS", health="CLEAN")],
+                             config, T0 + 60)
+        self.assertEqual(res["outcomes"]["941"], "MERGE")
+        self.assertTrue([o for o in ev if o["event"] == "infra_breaker_close"])
+        st, fa, _op, pb = self._ledger(state_dir)
+        self.assertEqual((st, fa, pb), ("closed", "0", "-"))
+        # Dispatch resumes for EVERYONE, immediately, no further cooldown wait.
+        res2, _ = self._tick(state_dir, os.path.join(self.tmp, "resumed.jsonl"),
+                             [dict(pr=942, sha="s942", slug="f942", review="PASS", health="CLEAN")],
+                             config, T0 + 61)
+        self.assertEqual(res2["outcomes"]["942"], "MERGE")
+
+    def test_probe_failure_reopens_with_fresh_cooldown(self):
+        state_dir = os.path.join(self.tmp, "state-reopen")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(950, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                             [self._death(950, 900)], config, T0 + 60)
+        self.assertEqual(res["outcomes"]["950"], "ESCALATE")
+        self.assertTrue([o for o in ev if o["event"] == "infra_breaker_reopen"])
+        st, _fa, op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "open")
+        self.assertEqual(op, str(T0 + 60))   # opened stamped at THIS tick's HERD_FAKE_NOW
+        # Immediately after the re-open (fresh cooldown), everyone is BLOCKED again — no probe yet.
+        res2, _ = self._tick(state_dir, os.path.join(self.tmp, "reblocked.jsonl"),
+                             [dict(pr=951, sha="s951", slug="f951", review="PASS", health="CLEAN")],
+                             config, T0 + 61)
+        self.assertEqual(res2["outcomes"]["951"], "HOLD")
+
+
 class TestRefixWakeVerification(LiveCase):
     """HERD-370: a review-BLOCK refix bounced PR #471 with the wake never even attempted — no
     refix_wake_result followed, and the PR sat BLOCKED ~70 minutes with the once-guard silently
@@ -1752,6 +1962,72 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         with open(f, "w") as fh:
             fh.write("999999\n\n0\n")                  # a pid that isn't alive
         self.assertFalse(_marker_live(f))
+
+
+class TestInflightVerifiedLive(unittest.TestCase):
+    """HERD-451: a health/merge-result-inflight marker's liveness must be IDENTITY-verified, not bare
+    existence — a recycled pid must not wedge the shared HEALTH_CONCURRENCY slot forever. GROUNDED
+    2026-07-31: stale ``.health-inflight-*`` markers whose recorded pids had been recycled by the OS
+    (twice onto the watcher itself, once onto a `sleep`) were counted live indefinitely, because
+    ``_count_live_inflight`` used to trust a bare ``kill -0`` whenever the marker recorded no start-time
+    at all — the exact shape of a legacy pre-restart-safe marker."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ.pop("HERD_FAKE_NOW", None)
+        os.environ.pop("HEALTH_INFLIGHT_TIMEOUT", None)
+
+    def tearDown(self):
+        os.environ.pop("HERD_FAKE_NOW", None)
+        os.environ.pop("HEALTH_INFLIGHT_TIMEOUT", None)
+
+    def _marker(self, name, body):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def test_no_identity_marker_not_counted_once_expired(self):
+        """MUTATION-PROVE: a marker naming a live-but-wrong pid — the exact observed failure — must not
+        be counted once its age (via the file-mtime fallback) exceeds HEALTH_INFLIGHT_TIMEOUT. Reverting
+        ``_count_live_inflight`` to plain ``_marker_live`` reds this assertion (count reads 1, not 0)."""
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "3"
+        self._marker(".health-inflight-285-shaNOID", "%d\n" % os.getpid())   # 1-line legacy marker
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 9999)
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
+
+    def test_no_identity_marker_counted_within_grace_window(self):
+        """A FRESH no-identity marker (age ~0) is still trusted — a legit worker whose ps couldn't
+        answer start-time at dispatch is not punished immediately."""
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "1800"
+        self._marker(".health-inflight-286-shaFRESH", "%d\n" % os.getpid())
+        self.assertEqual(LR._total_health_inflight(self.tmp), 1)
+
+    def test_merge_result_inflight_prefix_shares_the_same_identity_check(self):
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "3"
+        self._marker(".merge-result-inflight-99-shaNOID", "%d\n" % os.getpid())
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 9999)
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
+
+    def test_review_inflight_prefix_unaffected_stays_unbounded_trust(self):
+        # HERD-451 scopes the fix to the HEALTH_CONCURRENCY-shared families only — review deliberately
+        # keeps the OLD unbounded _marker_live semantics (out of scope; no grounded incident there).
+        self._marker(".review-inflight-1-sha1", "%d\n" % os.getpid())
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 999999)
+        self.assertEqual(LR._count_live_inflight(self.tmp, ".review-inflight"), 1)
+
+    def test_matching_starttime_stays_trusted_unbounded(self):
+        pid = os.getpid()
+        st = LR._pid_starttime(pid)
+        self._marker(".health-inflight-1-shaLIVE",
+                      "%s\n%s\n%s\n" % (pid, st, int(time.time()) - 999999))
+        self.assertEqual(LR._total_health_inflight(self.tmp), 1)
+
+    def test_mismatched_starttime_never_counted(self):
+        pid = os.getpid()
+        self._marker(".health-inflight-1-shaRECY",
+                      "%s\nBOGUS START TIME\n%s\n" % (pid, int(time.time())))
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
 
 
 class TestJournalWiring(unittest.TestCase):
@@ -4810,6 +5086,218 @@ class TestHoldLayerRestored(LiveCase):
         res, ev = self.tick([self.one(1, review="PASS", health="CLEAN", hv_hold=True)])
         self.assertEqual(res["outcomes"]["1"], "HOLD")
         self.assertEqual([o for o in ev if o["event"] == "hold_applied"][0]["kind"], "human-verify")
+
+
+class _RecordingHoldActuator(DryRunActuator):
+    """A DryRunActuator that RECORDS post_comment/notify calls instead of no-opping them — the only
+    way to observe the HERD-448 hold/merge actuator surface without shelling out to gh, mirroring
+    _PromptRecordingActuator's pattern for the refix-bounce wake surface."""
+
+    def __init__(self, journal):
+        super().__init__(journal)
+        self.comments = []   # (pr, kind, body)
+        self.notifies = []   # (title, body, sound)
+
+    def post_comment(self, cand, kind, body):
+        self.comments.append((cand.pr, kind, body))
+        return True
+
+    def notify(self, title, body, sound="default"):
+        self.notifies.append((title, body, sound))
+
+
+class TestHoldNotifyActuator(LiveCase):
+    """HERD-448: a hold is not silent to the PR author — it posts a comment and/or fires an operator
+    notify, exactly once per (pr, sha, branch). Mutation-proven: neutralizing
+    LiveTick._apply_hold_actuation, or either of the hv-auto / observe call sites, reds every test
+    in this class (each asserts on act.comments/act.notifies, which only a live actuator call can
+    populate)."""
+
+    def tick_live(self, hold_source, actuator, config=None, **kw):
+        cand = self.one(1, **kw)
+        scenario = {"candidates": [cand], "config": config or {"MERGE_POLICY": "auto"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     actuator, journal, state=LiveState(self.tmp), hold_source=hold_source)
+        res = t.run()
+        return res["outcomes"]["1"], (events(self.jpath) if os.path.exists(self.jpath) else [])
+
+    # ── the three HOLD branches (agent-watch.sh:11878-11901, ede7d45^) ──────────────────────────────
+    def test_coordinator_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(
+            _StubHoldSource(body=_HV_BODY), act,
+            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "coordinator"},
+            review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "coordinator")
+        self.assertIn("coordinator-actionable", body)
+        self.assertIn("run the live smoke test", body)          # the declared step, verbatim
+        self.assertIn("herd approve 1", body)
+        self.assertEqual(len(act.notifies), 1)
+        title, note, sound = act.notifies[0]
+        self.assertIn("coordinator action needed", title)
+        self.assertIn("herd approve 1", note)
+
+    def test_human_verify_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(body=_HV_BODY), act, review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "human-verify")
+        self.assertIn("must be **human-verified**", body)
+        self.assertIn("run the live smoke test", body)
+        self.assertEqual(len(act.notifies), 1)
+        self.assertIn("human-verify pending", act.notifies[0][0])
+
+    def test_approve_hold_posts_comment_and_notifies(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, config={"MERGE_POLICY": "approve"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "approve")
+        self.assertIn("awaiting approval before", body)
+        self.assertNotIn("HUMAN-VERIFY", body)
+        self.assertEqual(len(act.notifies), 1)
+        self.assertIn("awaiting approval", act.notifies[0][0])
+
+    # ── idempotency: same once-guard already dedups hold_applied ───────────────────────────────────
+    def test_hold_actuation_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource(body=_HV_BODY)
+        self.tick_live(src, act, review="PASS", health="CLEAN")
+        self.tick_live(src, act, review="PASS", health="CLEAN")   # re-walk the SAME (pr, sha)
+        self.assertEqual(len(act.comments), 1)
+        self.assertEqual(len(act.notifies), 1)
+
+    # ── the MERGE-branch informational comment (the case that went unnoticed 19 days) ───────────────
+    def test_hv_auto_merge_posts_comment_but_no_notify(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(
+            _StubHoldSource(body=_HV_BODY), act,
+            config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"},
+            review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "hv-auto")
+        self.assertIn("NOT executed before merge", body)
+        self.assertIn("run the live smoke test", body)
+        self.assertFalse(act.notifies)      # comment only — bash never notified on this branch either
+
+    def test_hv_auto_comment_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource(body=_HV_BODY)
+        cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"}
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.assertEqual(len(act.comments), 1)
+
+    # ── the OBSERVE branch: notify only, never a comment ────────────────────────────────────────────
+    def test_observe_notifies_but_posts_no_comment(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, config={"MERGE_POLICY": "observe"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "OBSERVE")
+        self.assertFalse(act.comments)
+        self.assertEqual(len(act.notifies), 1)
+        title, note, sound = act.notifies[0]
+        self.assertIn("ready (observe)", title)
+        self.assertIn("observe mode, not merging", note)
+
+    def test_observe_notify_fires_once_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        src = _StubHoldSource()
+        cfg = {"MERGE_POLICY": "observe"}
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.tick_live(src, act, config=cfg, review="PASS", health="CLEAN")
+        self.assertEqual(len(act.notifies), 1)
+
+    # ── byte-identical when no hold fires ───────────────────────────────────────────────────────────
+    def test_plain_merge_posts_nothing(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out, ev = self.tick_live(_StubHoldSource(), act, review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse(act.comments)
+        self.assertFalse(act.notifies)
+
+    # ── DryRunActuator: posts nothing, ever ─────────────────────────────────────────────────────────
+    def test_dry_run_actuator_posts_nothing_on_a_hold(self):
+        journal = LiveJournal(self.jpath)
+        act = DryRunActuator(journal)
+        cand = LiveCandidate(1, "sha1", slug="pr-1", hv_body=_HV_BODY, hv_hold=True)
+        self.assertTrue(act.post_comment(cand, "human-verify", "body text"))
+        self.assertIsNone(act.notify("title", "body"))
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse(ev)   # no gh, no driver.sh, no journal line of its own
+
+
+class TestLiveHoldCommentActuator(LiveCase):
+    """LiveActuator.post_comment / .notify — the REAL gh / driver-seam shape (HERD-448), hermetic:
+    subprocess is stubbed, exactly as TestLiveGateStatusPost proves post_gate_status."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_post_comment_uses_gh_pr_comment_shape(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertTrue(act.post_comment(cand, "approve", "the comment body"))
+        calls = [c for c in sub.calls if c[:3] == ["gh", "pr", "comment"]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ["gh", "pr", "comment", "7", "--body", "the comment body"])
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse([o for o in ev if o["event"] == "hold_comment_failed"])
+
+    def test_failed_post_journals_hold_comment_failed_and_never_retries(self):
+        class _FailingCommentSub:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, *a, **k):
+                self.calls.append(list(argv))
+                if argv[:3] == ["gh", "pr", "comment"]:
+                    raise subprocess.CalledProcessError(1, argv)
+                return _FakeCompleted("")
+
+        sub = _FailingCommentSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertFalse(act.post_comment(cand, "human-verify", "body"))
+        failed = [o for o in events(self.jpath) if o["event"] == "hold_comment_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(str(failed[0]["pr"]), "7")
+        self.assertEqual(str(failed[0]["sha"]), "deadbeef")
+        self.assertEqual(failed[0]["slug"], "feat-x")
+        self.assertEqual(failed[0]["kind"], "human-verify")
+        # Called exactly once — "never retried" is the CALLER's once-guard, not this method's job.
+        self.assertEqual(len(sub.calls), 1)
+
+    def test_notify_shells_out_through_the_driver_seam(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        act.notify("a title", "a body", "default")
+        calls = [c for c in sub.calls
+                 if len(c) >= 2 and c[0] == "bash" and str(c[1]).endswith("driver.sh")]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2:], ["notify", "a title", "a body", "default"])
+
+    def test_notify_never_raises_on_a_broken_driver(self):
+        class _BoomSub:
+            def run(self, *a, **k):
+                raise OSError("no such file")
+
+        act = self._actuator(_BoomSub())
+        act.notify("title", "body")   # must not raise
 
 
 class TestApprovalsLedger(LiveCase):

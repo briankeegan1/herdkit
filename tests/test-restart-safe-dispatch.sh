@@ -55,7 +55,7 @@ case "$(_journal_file)" in "$T"/*) : ;; *) fail "journal path escapes the sandbo
 
 for fn in _sweep_gate_corpses _marker_write _marker_live _marker_age _pid_starttime \
           _review_inflight_file _health_inflight_file _health_dispatch_file _review_retry_count \
-          _healthcheck_gate; do
+          _healthcheck_gate _inflight_verified_live _health_pid_live _count_live_healthchecks; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 ok
@@ -187,6 +187,41 @@ t_elapsed=$(( $(date +%s) - t_start ))
 # 401's suite is still in flight (we never blocked on it).
 _marker_live "$(_health_inflight_file "401-shaSLOW")" || fail "(6) the slow suite should still be in flight after the fast collect"
 { kill "$SLOWPID" 2>/dev/null; wait "$SLOWPID"; } 2>/dev/null || true; SLOWPID=""
+ok
+
+# ── (7) HERD-451: NO-IDENTITY LEGACY MARKER — pid alive but NO recorded start-time (identity cannot be
+#     proven) must NOT be trusted forever. GROUNDED 2026-07-31: a stale marker's recorded pid was
+#     recycled by the OS onto an unrelated live process (twice onto the watcher itself, once onto a
+#     `sleep`) and the old bare-existence check (`_marker_live` with no start-time fallback) counted it
+#     live indefinitely, wedging the HEALTH_CONCURRENCY slot with zero real suites running. This is the
+#     mutation-prove case: with the OLD `_health_pid_live() { _marker_live "$1"; }` body, BOTH assertions
+#     below would red — the count would read 1 (not 0), and the sweep would never remove the marker at
+#     all (the self-holder guard blocks the kill leg since pid == $$, so nothing else ever reaps it).
+rm -f "$TREES"/.health-inflight-* "$TREES"/.health-dispatch-* 2>/dev/null || true
+: > "$JOURNAL_FILE"
+export HEALTH_INFLIGHT_TIMEOUT=3
+HINF7="$(_health_inflight_file "285-shaNOID")"
+printf '%s\n' "$$" > "$HINF7"                              # 1-line legacy marker: pid only, no identity
+# Simulate the marker having aged well past HEALTH_INFLIGHT_TIMEOUT via the mtime fallback (HERD_FAKE_NOW
+# only shifts _now_epoch; the file's real mtime is untouched, so the age computation is genuine).
+export HERD_FAKE_NOW="$((NOW + 9999))"
+[ "$(_count_live_healthchecks)" -eq 0 ] \
+  || fail "(7) an aged no-identity marker must NOT be counted live (the GROUNDED 2026-07-31 wedge)"
+_sweep_gate_corpses
+[ ! -e "$HINF7" ] || fail "(7) an aged no-identity marker must be reaped as a corpse (never trusted forever)"
+[ "$(jgrep '"reason":"health_died"')" -ge 1 ] || fail "(7) an aged no-identity marker sweep must journal health_died"
+[ "$(jgrep '"reason":"health_timeout"')" -eq 0 ] \
+  || fail "(7) an unverifiable marker must be REMOVED, never TERMed (we cannot prove it is our worker)"
+unset HERD_FAKE_NOW
+ok
+
+# A FRESH no-identity marker (just written, age ~0) is still trusted within the grace window — a
+# legit worker whose ps couldn't answer start-time at dispatch time is not punished immediately.
+HINF7b="$(_health_inflight_file "286-shaNOIDFRESH")"
+printf '%s\n' "$$" > "$HINF7b"
+[ "$(_count_live_healthchecks)" -ge 1 ] || fail "(7b) a FRESH no-identity marker must still be trusted (grace window)"
+rm -f "$HINF7b"
+unset HEALTH_INFLIGHT_TIMEOUT
 ok
 
 echo "ALL PASS ($pass checks)"

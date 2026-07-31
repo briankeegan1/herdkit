@@ -222,8 +222,53 @@ consecutive-non-verdict-death counter and OPENs at `INFRA_BREAKER_MAX` (journals
 `infra_breaker_open` `agent-watch.sh:2621`); `_breaker_record_ok` (`agent-watch.sh:2635`) — a
 real PASS/BLOCK proves the env alive — resets and CLOSEs. `_breaker_gate`
 (`agent-watch.sh:2661`) returns `BLOCKED`/`PROBE`/`PASS` to halt or single-flight dispatch while
-open (step 1 of the candidate pass, `agent-watch.sh:11949`). The port models this as an explicit
-state machine (asyncio) rather than a whole-file RMW.
+open (step 1 of the candidate pass, `agent-watch.sh:11949` pre-ede7d45). The port models this as
+plain state-file I/O over the SAME shared ledger, not a whole-file RMW.
+
+**RESTORED HERD-447** (both halves the HERD-442 audit found dead). HERD-306's P5b deletion of the
+bash action pass (`_tick_act`, `ede7d45`) took `_breaker_gate`'s only caller with it — the breaker
+kept *recording* consecutive infra deaths but nothing ever *consulted* it, "a valve that records
+and never fires." The Python port never re-grew a caller either, so the gap outlived the bash→
+Python cutover unnoticed.
+
+- **The READ** is now consulted at the top of `LiveTick._walk`
+  (`pysrc/herd/live_runtime.py:_breaker_gate`, called before ANY rail — contract §2.1 step 1),
+  mirroring exactly where bash's deleted `_tick_act` called it (`ede7d45^:11550`): `BLOCKED` skips
+  the candidate entirely (no health, no review — not even a poll of an already-in-flight worker);
+  `PROBE` falls through and dispatches exactly like a closed breaker, admitting exactly one
+  candidate per open/cooldown window (the first to claim it, ledger-persisted).
+- **The RECORD side** — the HERD-442 audit named three bash call sites; all three are
+  re-audited here for what the Python port should own:
+  - `_review_gate_step` (`agent-watch.sh:3367`) is the port's OWN review-verdict classification,
+    already inline in `LiveTick._walk` (contract §2.1 step 8) — this is the recorder the port
+    RESTORES: `_breaker_record_infra` on a fresh `INFRA` verdict, `_breaker_record_ok` on a
+    freshly-collected `PASS`/`BLOCK` (never on a `reused_review` cache hit — matching bash's own
+    "called once per tick for a candidate with no ledger verdict yet" contract, since the merge
+    path never re-invokes `_review_gate_step` once a verdict is cached).
+  - `_predispatch_review_if_parallel` (`agent-watch.sh:3825`) is genuinely OBSOLETE in the port:
+    it exists solely to kick the reviewer early under `GATE_DISPATCH=parallel` (task HERD-73), and
+    the Python `_walk` never implemented a parallel pre-dispatch step (contract §2.1 step 4 has no
+    Python equivalent) — there is no second call site for this recorder to occupy. If `GATE_DISPATCH
+    =parallel` is ever ported, its dispatch will reuse the SAME review classification in `_walk`
+    (review-once, ledger-keyed) that already owns the recorder, so no NEW record call site would be
+    needed even then.
+  - `_sweep_gate_corpses` (`agent-watch.sh:12312`) needs NO restoration: it is bash-owned via
+    `herd sweep` (`scripts/herd/sweep.sh`, `bin/herd:cmd_sweep`) — a periodic CLI leg entirely
+    independent of the deleted `_tick_act` — and is STILL a live writer today. It reads/writes the
+    SAME `.agent-watch-infra-breaker` ledger file the Python `LiveState.breaker_read`/
+    `breaker_write` methods use, so a stuck reviewer corpse `herd sweep` reaps still counts toward
+    the one shared global counter regardless of which implementation's tick is running.
+- **Config reach**: `INFRA_BREAKER_MAX`/`INFRA_BREAKER_COOLDOWN` were added to
+  `pysrc/herd/live_runtime.py:_CORE_ENV_KEYS` and `export`ed in `herd-config.sh` (the HERD-449
+  env-export-lint pattern) — the Python engine core runs as a CHILD process of the watcher and only
+  sees EXPORTED shell vars; bash's own `_breaker_*` helpers never needed this (same-shell read), so
+  the gap was invisible until the read gained a Python consumer.
+
+Mutation-proof (HERD-447, `tests/test_live_runtime.py:TestInfraBreakerGate`, driven end-to-end
+through `LiveTick.run()`): neutralizing the READ reds 3/7 cases (candidates merge instead of
+holding); neutralizing BOTH RECORD call sites reds 6/7 (the breaker never opens/closes/re-opens).
+`tests/test-infra-breaker.sh` (bash helpers, unchanged) continues to cover the shared ledger format
+and `_sweep_gate_corpses`'s still-live recorder independently.
 
 ### 3.4 Event catalog (names, required fields)
 
@@ -243,6 +288,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `hold_released` | pr, sha, slug, kind(approve\|human-verify), reason(approved) | port `live_runtime.py:LiveTick._walk` (HERD-442 — restored; consumed by `herd why` and the fleet inbox/digest) |
 | `hv_body_unreadable` | pr, sha, slug, rc, detail | port `live_runtime.py:LiveTick._resolve_hold_inputs` (HERD-442 — the fail-CLOSED record for an unreadable PR body) |
 | `human_verify_policy` | pr, sha, slug, policy(auto), action | port `live_runtime.py:LiveTick._walk` (HERD-439 — the bash anchor `agent-watch.sh:12314` died at `ede7d45`) |
+| `hold_comment_failed` | pr, sha, slug, kind(coordinator\|human-verify\|approve\|hv-auto) | port `live_runtime.py:LiveActuator.post_comment` (HERD-448 — the once-guard already fired before this runs, so a failed comment post is never retried; this is the only durable record one was attempted) |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
 | `merge` | pr, slug, sha, method, reason(gates_passed) | `agent-watch.sh:5788` |
 | `merge_refused_sha_moved` | pr, slug, sha, state | `agent-watch.sh:5764` |
@@ -427,6 +473,23 @@ its family timeout is TERMed by the corpse sweep (`_sweep_gate_corpses` `agent-w
 review TERM at `REVIEW_INFLIGHT_TIMEOUT` `agent-watch.sh:10461`, health group-terminate
 `agent-watch.sh:10506`; the watcher never TERMs itself `agent-watch.sh:10460`). The port keeps
 "a hold is loud, owned, and never a dropped signal."
+
+**RESTORED (HERD-448).** The bash anchors above (`agent-watch.sh:12294` et al.) died with the
+action pass at `ede7d45`, same as `hold_applied`/`hold_released`/`human_verify_policy` — the port
+carried the journal lines but no comment/notify actuator at all, so a held PR was silent to its own
+author (PR #563's HUMAN-VERIFY hold went unnoticed for 19 days). Restored at
+`live_runtime.py:LiveTick._apply_hold_actuation` (the three HOLD-branch templates: coordinator,
+human-verify, approve — `agent-watch.sh:11878-11901`), the MERGE-branch informational comment (the
+`HUMAN_VERIFY_POLICY=auto` case that went unnoticed, `agent-watch.sh:11916` — comment only, no
+notify, mirroring bash exactly: the PR already merged, there is nothing left to action), and the
+OBSERVE-branch notify (`agent-watch.sh:11863` — notify only, no comment). Both actuator calls sit
+beside `merge`/`reap`/`post_gate_status` on `LiveActuator`, routed through the driver seam
+(`scripts/herd/driver.sh notify`, never a hardcoded runtime); `DryRunActuator` posts nothing. Each
+fires inside the SAME once-guard (`LiveState.once`) that already dedups the journal line, so a
+held PR re-walked every tick never re-posts. A failed comment post journals
+`hold_comment_failed` (§3.4) — the once-guard already fired, so it is never retried — and never
+alters the hold/merge decision either way; `notify` itself never fails, mirroring bash's own
+contract for `herd_driver_notify`.
 
 ---
 

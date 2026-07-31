@@ -305,17 +305,30 @@ def _pos_int(value, default):
     return n if n > 0 else default
 
 
+_INFLIGHT_TIMEOUT_PREFIXES = (".health-inflight", ".merge-result-inflight")
+
+
 def _count_live_inflight(state_dir, prefix):
     """Count live in-flight markers across ALL candidates for one rail.
 
-    ``prefix`` is the glob prefix, e.g. ``.health-inflight`` or ``.review-inflight``. Dead markers are
-    not counted — a crashed worker never wedges a slot (mirrors bash's ``_count_live_healthchecks`` /
+    ``prefix`` is the glob prefix, e.g. ``.health-inflight`` or ``.review-inflight``. For the two
+    HEALTH_CONCURRENCY-shared families (HERD-451: ``.health-inflight`` and ``.merge-result-inflight``),
+    liveness is IDENTITY-verified and bounded by ``HEALTH_INFLIGHT_TIMEOUT`` when a marker carries no
+    provable identity at all (see :func:`_inflight_verified_live` — mirrored verbatim by
+    agent-watch.sh's ``_count_live_healthchecks`` / ``_health_slot_free``, cross-referenced). Every other
+    rail (review) keeps the unbounded ``_marker_live`` check, unchanged. Dead — or, for the two families
+    above, identity-unverifiable-and-expired — markers are not counted (mirrors bash's
     ``_count_live_reviews``). Zero with no state dir (a sim/dry-run tick has no on-disk markers)."""
     if not state_dir:
         return 0
+    if prefix in _INFLIGHT_TIMEOUT_PREFIXES:
+        timeout = _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800)
+        live = lambda p: _inflight_verified_live(p, timeout)
+    else:
+        live = _marker_live
     n = 0
     for path in glob.glob(os.path.join(state_dir, prefix + "-*")):
-        if _marker_live(path):
+        if live(path):
             n += 1
     return n
 
@@ -375,6 +388,115 @@ def _now_epoch():
     """Wall-clock epoch seconds, honoring the ``HERD_FAKE_NOW`` test seam (agent-watch.sh:_now_epoch)."""
     fake = os.environ.get("HERD_FAKE_NOW")
     return fake if fake else str(int(time.time()))
+
+
+# ── INFRA circuit breaker (HERD-110; gate READ restored HERD-447) ────────────────────────────────────
+# The GLOBAL "env looks dead, stop dispatching" seam (contract §3.3; agent-watch.sh:_breaker_gate /
+# :_breaker_record_infra / :_breaker_record_ok, agent-watch.sh:3141-3265). HERD-306's P5b deleted the
+# bash action pass (_tick_act) that consulted _breaker_gate at the top of every candidate's iteration —
+# the HERD-442 audit found the read had had NO caller since, so the breaker recorded consecutive
+# non-verdict review deaths but never actually halted dispatch. This restores the READ into the walk
+# below (:meth:`LiveTick._walk`) and the two RECORD call sites the port itself can reach (the review
+# rail's verdict classification, also in :meth:`LiveTick._walk` — bash's ``_review_gate_step``). A
+# THIRD bash recorder, ``_predispatch_review_if_parallel``, is genuinely obsolete here: it exists only
+# to kick the reviewer early under ``GATE_DISPATCH=parallel``, a lever the Python port never
+# implemented (no parallel pre-dispatch step exists in the walk) — see docs/engine-contract.md §3.3
+# for the full three-way audit. A FOURTH, ``_sweep_gate_corpses``, needs no restoration at all: it is
+# bash-owned via ``herd sweep`` (scripts/herd/sweep.sh; unrelated to the deleted ``_tick_act``) and
+# still runs today, writing the SAME shared ledger file :class:`LiveState`'s breaker methods use below
+# — so a stuck reviewer corpse a `herd sweep` reaps still counts toward this exact global counter.
+#
+# BYTE-INERT BY DEFAULT: every function below short-circuits to a no-op the instant
+# ``INFRA_BREAKER_MAX`` is unset/0/non-numeric (mirroring bash's ``_breaker_enabled`` guard) — no file
+# I/O, no journal write, no gating — so a tick with the lever off is byte-identical to before this
+# restoration.
+
+_BREAKER_DIGITS_RE = re.compile(r"^[0-9]+$")
+
+
+def _breaker_digits(raw, default):
+    """Parse a config value the way bash's ``case … in ''|*[!0-9]*) …; esac`` does: digits-only (no
+    sign, no decimal point) or fall back to ``default`` — so ``"-5"``/``"3.5"``/``""``/``None`` all
+    degrade exactly as they do in the shell, not merely whatever Python's permissive ``int()`` accepts."""
+    s = "" if raw is None else str(raw)
+    return int(s) if _BREAKER_DIGITS_RE.match(s) else default
+
+
+def _breaker_enabled(config):
+    """True iff ``INFRA_BREAKER_MAX`` is a positive integer (agent-watch.sh:_breaker_enabled). The
+    opt-in gate every function below checks first."""
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_MAX"), 0) > 0
+
+
+def _breaker_max(config):
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_MAX"), 0)
+
+
+def _breaker_cooldown(config):
+    """``INFRA_BREAKER_COOLDOWN`` seconds, non-numeric/unset → 300 (agent-watch.sh:_breaker_cooldown)."""
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_COOLDOWN"), 300)
+
+
+def _breaker_record_infra(state, config, journal):
+    """One non-verdict INFRA death observed — bump the consecutive counter; OPEN at
+    ``INFRA_BREAKER_MAX`` from CLOSED, or RE-OPEN (fresh cooldown) if already open/probing
+    (agent-watch.sh:_breaker_record_infra). No-op (no ledger write, no journal) when disabled."""
+    if not _breaker_enabled(config):
+        return
+    st, fa, op, _pb = state.breaker_read()
+    now = int(_now_epoch())
+    fa += 1
+    maxn = _breaker_max(config)
+    if st == "closed":
+        if fa >= maxn:
+            state.breaker_write("open", fa, now, None)
+            journal.append("infra_breaker_open", "scope", "global", "fails", fa, "threshold", maxn,
+                           "cooldown", _breaker_cooldown(config))
+        else:
+            state.breaker_write("closed", fa, op, None)
+    else:
+        state.breaker_write("open", fa, now, None)
+        journal.append("infra_breaker_reopen", "scope", "global", "fails", fa, "threshold", maxn,
+                       "cooldown", _breaker_cooldown(config))
+
+
+def _breaker_record_ok(state, config, journal):
+    """A REAL verdict landed (PASS or BLOCK): the env is provably alive — reset the counter and CLOSE
+    (agent-watch.sh:_breaker_record_ok). No-op when disabled; cheap no-op when already closed at 0."""
+    if not _breaker_enabled(config):
+        return
+    st, fa, _op, _pb = state.breaker_read()
+    if st != "closed":
+        state.breaker_write("closed", 0, 0, None)
+        journal.append("infra_breaker_close", "scope", "global", "recovered_via", "verdict")
+    elif fa != 0:
+        state.breaker_write("closed", 0, 0, None)
+
+
+def _breaker_gate(pr, state, config):
+    """Per-candidate dispatch decision (agent-watch.sh:_breaker_gate) — one of:
+
+      PASS    — breaker closed → dispatch normally.
+      PROBE   — breaker half-open and THIS candidate is (or just claimed) the single recovery probe.
+      BLOCKED — breaker open/cooling down, or another candidate already holds the probe claim.
+
+    Half-open is entered by transitioning open→probing once the cooldown elapses: the FIRST candidate
+    to reach the gate claims itself as the probe (persisted in the ledger) and gets PROBE; every other
+    candidate reads state=probing and, not being the claimed PR, gets BLOCKED. Byte-inert (always
+    PASS, no file I/O) when disabled."""
+    if not _breaker_enabled(config):
+        return "PASS"
+    st, fa, op, pb = state.breaker_read()
+    if st in ("open", "probing"):
+        now = int(_now_epoch())
+        cd = _breaker_cooldown(config)
+        if now - op >= cd:
+            state.breaker_write("probing", fa, now, pr)
+            return "PROBE"
+        if st == "probing" and pb is not None and str(pr) == str(pb):
+            return "PROBE"
+        return "BLOCKED"
+    return "PASS"
 
 
 # ── durable refix ledger I/O ($REFIX_STATE = $TREES/.agent-watch-refixed) ───────────────────────────
@@ -629,6 +751,80 @@ def _marker_live(path):
     return (not cur) or (cur == st)
 
 
+def _marker_dispatch_ts(path):
+    """Line 3 of an in-flight marker — the dispatch epoch stamped by ``_marker_write``
+    (agent-watch.sh:_marker_dispatch_ts). ``""`` when missing/unreadable (a legacy pre-restart-safe
+    marker, or any writer that laid down fewer than 3 lines)."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    return lines[2].strip() if len(lines) > 2 else ""
+
+
+def _marker_age(path):
+    """Seconds since the marker's dispatch ts, or ``None`` when no ts is recorded
+    (agent-watch.sh:_marker_age)."""
+    ts = _marker_dispatch_ts(path)
+    if not ts.isdigit():
+        return None
+    try:
+        return int(_now_epoch()) - int(ts)
+    except Exception:
+        return None
+
+
+def _marker_age_or_mtime(path):
+    """``_marker_age`` when available, else a FALLBACK computed from the marker FILE's own mtime — the
+    on-disk floor for a marker written before the dispatch-ts line existed (agent-watch.sh:
+    _marker_age_or_mtime). ``None`` only when both signals are unavailable (the file vanished mid-read)."""
+    age = _marker_age(path)
+    if age is not None:
+        return age
+    try:
+        return int(_now_epoch()) - int(os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def _inflight_verified_live(path, timeout):
+    """THE shared "does this in-flight marker still legitimately hold a health/merge-result slot" check
+    (HERD-451 — mirrors agent-watch.sh's ``_inflight_verified_live`` verbatim, cross-referenced; Rule 2,
+    one notion of liveness, never two divergent copies). Recycling-safe IDENTITY, not bare existence:
+      * pid dead → not live.
+      * pid alive AND the marker's recorded start-time matches the pid's CURRENT one → live, UNBOUNDED
+        (a verified-same-process worker is trusted for as long as it legitimately runs — the SEPARATE
+        inflight-timeout the corpse sweep enforces decides whether to TERM a long-running one, not this).
+      * pid alive but the recorded start-time does NOT match → NOT live (the classic PID-RECYCLING case;
+        already handled by ``_marker_live`` and unchanged here).
+      * pid alive but NO start-time was ever recorded (a legacy pre-restart-safe marker, or any writer
+        that bypassed ``_marker_write``) → identity CANNOT be proven from the marker alone. A bare
+        ``kill -0`` success is trusted ONLY within ``timeout`` seconds of the marker's age (dispatch-ts,
+        else file mtime); past that it reads as NOT live. An unverifiable marker no longer gets an
+        indefinite pass just because *some* process now happens to hold that recycled pid — the EXACT
+        GROUNDED 2026-07-31 failure: a stale ``.health-inflight-*`` marker's recorded pid had been
+        recycled by the OS onto the watcher itself / an unrelated ``sleep``, and the old bare-existence
+        check trusted it forever, wedging the HEALTH_CONCURRENCY slot with zero suites actually running.
+    """
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return False
+    pid = (lines[0].strip() if lines else "")
+    if not pid or not _pid_live(pid):
+        return False
+    st = (lines[1].strip() if len(lines) > 1 else "")
+    if st:
+        cur = _pid_starttime(pid)
+        if not cur:
+            return True          # transient ps hiccup — trust the recorded identity, unchanged
+        return cur == st
+    age = _marker_age_or_mtime(path)
+    if age is None:
+        return True              # no signal at all — fail toward not reaping
+    return age < timeout
+
+
 class LiveState:
     """Resolver for the sha-keyed gate ledgers + in-flight markers under ``$TREES`` (== ``$WORKTREES_DIR``).
 
@@ -842,6 +1038,54 @@ class LiveState:
             return
         try:
             open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    # INFRA circuit-breaker substrate (HERD-110, gate read restored HERD-447) ─────────────────────────
+    # THE SAME one-line ledger bash's ``_breaker_read``/``_breaker_write`` use
+    # (``$TREES/.agent-watch-infra-breaker``, agent-watch.sh:3153/:3175/:3184) — GLOBAL (not sha-keyed),
+    # so a python tick and `herd sweep`'s bash-owned ``_sweep_gate_corpses`` leg (agent-watch.sh:12312,
+    # STILL a live writer — see docs/engine-contract.md §3.3) genuinely share one counter, exactly like
+    # the review/health ledgers above. Format: ``<state> <fails> <opened_epoch> <probe_pr>``, state ∈
+    # closed|open|probing, probe_pr ``-`` when unclaimed.
+
+    def breaker_state_path(self):
+        return self._p(".agent-watch-infra-breaker")
+
+    def breaker_read(self):
+        """``(state, fails, opened, probe_pr)`` — mirrors agent-watch.sh:_breaker_read. A missing, short,
+        or corrupt ledger line reads as the closed/zeroed default, exactly like bash's ``${st:-closed}``
+        fallback fields."""
+        path = self.breaker_state_path()
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fields = fh.readline().split()
+            except Exception:
+                fields = []
+            if len(fields) >= 4:
+                st, fa, op, pb = fields[0], fields[1], fields[2], fields[3]
+                try:
+                    fa = int(fa)
+                except ValueError:
+                    fa = 0
+                try:
+                    op = int(op)
+                except ValueError:
+                    op = 0
+                return st, fa, op, (None if pb == "-" else pb)
+        return "closed", 0, 0, None
+
+    def breaker_write(self, state, fails, opened, probe_pr):
+        """Persist the one-line breaker ledger (agent-watch.sh:_breaker_write). No-op w/o a state dir —
+        a sim/dry-run tick with a black-hole state carries no cross-tick breaker memory, same as every
+        other ledger above."""
+        path = self.breaker_state_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s %s %s %s\n" % (state, fails, opened, probe_pr if probe_pr else "-"))
         except Exception:
             pass
 
@@ -2040,6 +2284,70 @@ _MERGE_REFUSE_MAX = 3
 # short deadline costs at most one tick, never a blind merge.
 _HV_BODY_TIMEOUT = 15
 
+# ── hold/merge comment + notify actuator (contract §5.6, HERD-448) ─────────────────────────────────
+# A hold that fires and tells nobody is a silent stall: bash posted a PR comment + an operator notify
+# on each of four hold/merge branches (agent-watch.sh:11873-11920, ede7d45^); the Python core carried
+# no actuator for either surface, so a held PR left a journal line and a console row and the AUTHOR
+# was never told (PR #563's HUMAN-VERIFY hold went unnoticed for 19 days). Restored here, beside the
+# merge/reap/post_gate_status actuator surface, routed through the SAME driver seam bash used
+# (herd_driver_notify / scripts/herd/driver.sh notify) — never a hardcoded runtime. Deadlines mirror
+# _HV_BODY_TIMEOUT: bounded so a stuck gh/driver call costs at most one tick, never a hang.
+_HOLD_COMMENT_TIMEOUT = 15
+_HOLD_NOTIFY_TIMEOUT = 15
+
+
+def _hv_steps_text(cand):
+    """The declared HUMAN-VERIFY steps, one per line, no bullets — bash's
+    ``hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"``, reusing the SAME already-read body
+    (no second fetch, no second timeout)."""
+    return "\n".join(_human_verify.steps(cand.hv_body))
+
+
+def _hold_coordinator_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11880, ede7d45^) for a HUMAN_VERIFY_POLICY=coordinator
+    hold: coordinator-actionable, not waiting on a human."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual "
+        "steps and `HUMAN_VERIFY_POLICY=coordinator`, so it is held as **coordinator-actionable**: a "
+        "coordinator/agent should execute these steps, then approve:\n\n%s\n\nOnce executed, run "
+        "`herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to approve commit "
+        "`%s` for merge. A new commit re-holds until re-verified."
+        % (_hv_steps_text(cand), cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hold_human_verify_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11890, ede7d45^) for the default HUMAN_VERIFY_POLICY=hold
+    hold: waiting on a human to verify the declared steps."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares "
+        "manual steps that must be **human-verified** before merge:\n\n%s\n\nOnce verified, run "
+        "`herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to approve commit "
+        "`%s` for merge. A new commit re-holds until re-verified."
+        % (_hv_steps_text(cand), cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hold_approve_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11898, ede7d45^) for a plain MERGE_POLICY=approve hold
+    (no declared HUMAN-VERIFY block)."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before "
+        "merge.\n\nRun `herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to "
+        "approve commit `%s` for merge." % (cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hv_auto_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11916, ede7d45^) for the HUMAN_VERIFY_POLICY=auto
+    informational merge: the declared steps were NOT executed, recorded for the audit trail."""
+    return (
+        "🐑 **herd watch** · `HUMAN_VERIFY_POLICY=auto` — this PR declared manual verify steps, "
+        "treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These "
+        "steps were NOT executed before merge:\n\n%s\n\nRecorded in the engine journal as "
+        "`human_verify_policy=auto merged-with-declared-steps`." % _hv_steps_text(cand)
+    )
+
 
 def _hold_kind(hv_hold):
     """The `kind` field of hold_applied / hold_released — bash's rule, verbatim (agent-watch.sh
@@ -2146,6 +2454,16 @@ class DryRunActuator:
     def worktree_dirty(self, cand):
         """HERD-420: the fixture's scripted dirty bit — see :attr:`LiveCandidate.dirty`."""
         return bool(cand.dirty)
+
+    def post_comment(self, cand, kind, body):
+        """PURE no-op twin (HERD-448): DryRunActuator posts nothing — no gh, no network, no journal.
+        Returns True (not a failure) so the side-effect-free column never fabricates a
+        ``hold_comment_failed`` line for a comment that was never meant to go out."""
+        return True
+
+    def notify(self, title, body, sound="default"):
+        """PURE no-op twin (HERD-448): no driver-seam dispatch under dry-run."""
+        return None
 
 
 # ── merge actuation config (MERGE_METHOD + DELETE_BRANCH_ON_MERGE, HERD-354) ──────────────────────
@@ -2523,6 +2841,37 @@ class LiveActuator:
         self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
                             "context", _GATE_STATUS_CONTEXT)
         return True
+
+    def _script(self, name):
+        return os.path.join(self.home, "scripts", "herd", name)
+
+    def post_comment(self, cand, kind, body):
+        """POST a PR comment via ``gh pr comment`` — the hold/merge notify actuator's forensic
+        surface (contract §5.6, HERD-448). Best-effort, mirroring bash's ``_gh_timeout ... pr
+        comment ... || true``: the caller's once-guard already fired before this runs, so a failed
+        post is NEVER retried — it is journaled instead (``hold_comment_failed``), the only durable
+        record a comment was ever attempted, and the hold/merge decision already taken above is
+        never altered either way."""
+        try:
+            subprocess.run(["gh", "pr", "comment", str(cand.pr), "--body", body],
+                           capture_output=True, text=True, check=True, timeout=_HOLD_COMMENT_TIMEOUT)
+            return True
+        except Exception:
+            self.journal.append("hold_comment_failed", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "kind", kind)
+            return False
+
+    def notify(self, title, body, sound="default"):
+        """Fire a desktop-style notification through the driver seam (``herd_driver_notify``,
+        ``scripts/herd/driver.sh notify``) — NEVER a hardcoded runtime, so a headless project gets
+        the durable notifications.log sink and a herdr-claude project gets the real desktop banner,
+        with no branch here caring which. NEVER fails (mirrors the bash seam's own contract) — no
+        journal, no exception ever escapes."""
+        try:
+            subprocess.run(["bash", self._script("driver.sh"), "notify", title, body, sound],
+                           capture_output=True, text=True, timeout=_HOLD_NOTIFY_TIMEOUT)
+        except Exception:
+            pass
 
     def reap(self, cand):
         # REAP-ON-MERGE: this fires the instant THIS tick merged ``cand`` on green gates. It used to
@@ -3157,6 +3506,20 @@ class LiveTick:
         """
         self._state.setdefault(cand.pr, _S_INTAKE)
 
+        # 0. INFRA circuit breaker (HERD-110, gate READ restored HERD-447; contract §2.1 step 1) — the
+        #    GLOBAL "env looks dead" halt, consulted before ANY rail dispatch, mirroring where bash's
+        #    deleted _tick_act called _breaker_gate at the very top of its per-candidate loop body
+        #    (agent-watch.sh ede7d45^:11550). BLOCKED skips this candidate entirely — no health, no
+        #    review, not even a poll of an already-in-flight worker — for EVERY candidate but the one
+        #    admitted as the single half-open PROBE, which falls through and dispatches exactly like a
+        #    closed breaker. Byte-inert (no file I/O) under INFRA_BREAKER_MAX unset/0 — see
+        #    _breaker_gate. cand.pr's own lifecycle state stays put; _advance degrades to a harmless
+        #    illegal_transition line (never fatal) if this candidate was mid-rail when the breaker
+        #    tripped, exactly like every other cross-cutting hold in this walk.
+        if _breaker_gate(cand.pr, self.state, self.config) == "BLOCKED":
+            self._advance(cand, "breaker_open")
+            return HOLD
+
         # 1. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
             if self.state.once(cand.pr, cand.sha, "stale"):
@@ -3232,10 +3595,22 @@ class LiveTick:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
                                 "detail", "no parseable verdict")
             self._advance(cand, "review_infra")
+            # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
+            # non-verdict branch): a non-verdict reviewer death counts against the GLOBAL consecutive
+            # counter — never a real BLOCK, so it must never be cached as one, but it DOES feed the
+            # breaker. No-op under INFRA_BREAKER_MAX unset/0 (_breaker_record_infra).
+            _breaker_record_infra(self.state, self.config, self.journal)
             return ESCALATE
         if not getattr(self.gates, "reused_review", False):
             self.journal.append("verdict_recorded", "pr", cand.pr, "sha", cand.sha, "value", verdict,
                                 "source", "reviewer")
+            # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
+            # PASS/BLOCK branches): a REAL verdict proves the env is alive — reset + close the breaker.
+            # Gated on `reused_review` exactly like the verdict_recorded journal above it: a cache-hit
+            # replay of an already-recorded verdict proves nothing NEW about the env this tick, mirroring
+            # bash's _review_gate_step contract ("called once per tick for a candidate with no ledger
+            # verdict yet" — the merge path never re-invokes it once a verdict is cached).
+            _breaker_record_ok(self.state, self.config, self.journal)
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
             # Three-way bounce gate (HERD-358).  See _refix_check_and_record for the semantics.
@@ -3375,6 +3750,12 @@ class LiveTick:
                 self.journal.append("human_verify_policy", "pr", cand.pr, "sha", cand.sha,
                                     "slug", cand.slug, "policy", "auto",
                                     "action", "merged-with-declared-steps")
+                # The comment that makes the merge NOTICEABLE (contract §5.6, HERD-448): this is
+                # exactly the branch that went unnoticed 19 days with no actuator at all — the PR
+                # looked normally merged while its declared steps were silently never run. Bash
+                # comment-only here, no notify (agent-watch.sh:11916, ede7d45^): the PR already
+                # merged, there is nothing left to action, only to record.
+                self.actuator.post_comment(cand, "hv-auto", _hv_auto_comment(cand))
             # HOLD RELEASED (HERD-442). A PR that WAS held — by the approve policy, or by its own
             # HUMAN-VERIFY block under a non-auto HUMAN_VERIFY_POLICY — and now carries a sha-keyed
             # approval is about to merge. Bash journaled this immediately before do_merge and the P5b
@@ -3430,11 +3811,43 @@ class LiveTick:
                 if cand.hv_hold and self._hv_policy == "coordinator":
                     fields += ["human_verify_policy", "coordinator"]
                 self.journal.append("hold_applied", *fields)
+                # A hold is not silent (contract §5.6, HERD-448): comment + operator notify, once
+                # per (pr, sha) — the SAME once-guard above already gates this block, so a re-walked
+                # held PR never re-posts.
+                self._apply_hold_actuation(cand)
             return HOLD
         # OBSERVE — observe mode never merges.
         if self.state.once(cand.pr, cand.sha, "observe"):
             self.journal.append("observe_noted", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+            self.actuator.notify(
+                "🐑 PR #%s ready (observe)" % cand.pr,
+                "%s: review passed — observe mode, not merging" % cand.slug)
         return "OBSERVE"
+
+    def _apply_hold_actuation(self, cand):
+        """POST the once-per-(pr,sha) hold comment + fire the operator notify (contract §5.6,
+        HERD-448). Which template fires depends on WHY this candidate held — mirrors bash's
+        three-way branch verbatim (agent-watch.sh:11878-11901, ede7d45^): a coordinator-actionable
+        HUMAN-VERIFY hold, a human-actionable HUMAN-VERIFY hold, or a plain approve-policy hold.
+        Fail-soft throughout: :meth:`LiveActuator.post_comment` journals its own failure
+        (``hold_comment_failed``) and :meth:`notify` never raises — neither can alter the hold
+        decision already taken by the caller."""
+        if cand.hv_hold and self._hv_policy == "coordinator":
+            self.actuator.post_comment(cand, "coordinator", _hold_coordinator_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s human-verify — coordinator action needed" % cand.pr,
+                "%s: gates passed — a coordinator/agent should run the steps then herd approve %s"
+                % (cand.slug, cand.pr))
+        elif cand.hv_hold:
+            self.actuator.post_comment(cand, "human-verify", _hold_human_verify_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s human-verify pending" % cand.pr,
+                "%s: gates passed — verify manual steps, then herd approve %s" % (cand.slug, cand.pr))
+        else:
+            self.actuator.post_comment(cand, "approve", _hold_approve_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s awaiting approval" % cand.pr,
+                "%s: gates passed — herd approve %s" % (cand.slug, cand.pr))
 
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""
@@ -3484,10 +3897,12 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 # knob). scripts/herd/env-export-lint.sh imports this tuple directly (not a text scrape) so the lint
 # can never drift from the actual consumer list, and fails LOUDLY on any member herd-config.sh sets
 # but does not export.
+_BREAKER_KEYS = ("INFRA_BREAKER_MAX", "INFRA_BREAKER_COOLDOWN")
+
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
-                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS)
 
 
 def _config_from_env(scenario=None):
