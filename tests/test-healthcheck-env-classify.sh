@@ -151,4 +151,51 @@ run_proj "$F" --oneline
 [ "$RC" -eq 0 ] || fail "(d) all-pass should exit 0, got $RC — out: $OUT"
 echo "PASS (d) bats pass → exit 0"
 
+# ── (e)-(h): the HERD-462 box-load timeout tolerance for test-sandbox-posture-matrix.sh ──────────────
+# That sim is CPU-bound and borderline against BATS_TEST_TIMEOUT even in isolation, so a genuine
+# BATS_TEST_TIMEOUT kill (bats' own "# timeout after Ns" TAP suffix) on it ALONE is tolerated the same
+# way the HERD-187 env-only codemap case is — but a real assertion failure inside it, or a timeout on
+# ANY other test, must never be silently downgraded.
+TIMEOUT_TEST="hermetic test-sandbox-posture-matrix.sh (dynamic)"
+
+# ── (e) SOLE timeout on the known-borderline test → exit 2 + detail quotes the real 'not ok' line ────
+TAP_TIMEOUT_ONLY="1..3
+ok 1 hermetic something-else test passes
+not ok 2 $TIMEOUT_TEST # timeout after 120s
+ok 3 hermetic another-thing test passes"
+F="$(build_fixture timeout_only "$TAP_TIMEOUT_ONLY" 1 none)"
+run_proj "$F" --oneline
+[ "$RC" -eq 2 ] || fail "(e) sole box-load timeout should exit 2, got $RC — out: $OUT"
+grep -qF "not ok 2 $TIMEOUT_TEST # timeout after 120s" <<< "$OUT" \
+  || fail "(e) oneline detail must quote the real timeout 'not ok' line — got: $OUT"
+run_proj "$F"
+[ "$RC" -eq 2 ] || fail "(e) box-load timeout full-mode should exit 2, got $RC — out: $OUT"
+echo "PASS (e) sole box-load timeout on the known-borderline test → exit 2 with correct detail"
+
+# ── (f) the SAME test fails on a real assertion (NO timeout suffix) → exit 1, never downgraded ───────
+TAP_REAL_FAIL="1..1
+not ok 1 $TIMEOUT_TEST
+#   FAIL: (b) matrix green 7/7 — posture solo-auto invariant did not pass"
+F="$(build_fixture posture_real_fail "$TAP_REAL_FAIL" 1 none)"
+run_proj "$F" --oneline
+[ "$RC" -eq 1 ] || fail "(f) a real assertion failure (no timeout suffix) must exit 1, got $RC — out: $OUT"
+echo "PASS (f) same test failing WITHOUT the timeout suffix → exit 1 (a real bug is never masked)"
+
+# ── (g) the timeout AND an unrelated genuine failure → exit 1 (not the sole failure) ─────────────────
+TAP_TIMEOUT_PLUS="1..2
+not ok 1 hermetic backlog-view rich-render test passes
+not ok 2 $TIMEOUT_TEST # timeout after 120s"
+F="$(build_fixture timeout_plus "$TAP_TIMEOUT_PLUS" 1 none)"
+run_proj "$F" --oneline
+[ "$RC" -eq 1 ] || fail "(g) timeout + an unrelated genuine failure must exit 1, got $RC — out: $OUT"
+echo "PASS (g) box-load timeout alongside an unrelated genuine failure → exit 1 (not downgraded)"
+
+# ── (h) a DIFFERENT test times out → exit 1 (only the known-borderline test is tolerated) ────────────
+TAP_OTHER_TIMEOUT="1..1
+not ok 1 hermetic test-console-truth-pass.sh (dynamic) # timeout after 120s"
+F="$(build_fixture other_timeout "$TAP_OTHER_TIMEOUT" 1 none)"
+run_proj "$F" --oneline
+[ "$RC" -eq 1 ] || fail "(h) a different test timing out must exit 1, got $RC — out: $OUT"
+echo "PASS (h) an unrelated test timing out → exit 1 (only the specific known-borderline test tolerates)"
+
 echo "ALL PASS"
