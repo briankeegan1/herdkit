@@ -33,6 +33,19 @@ The blessing is posted **exactly once per `(pr, sha)`** (sha-keyed ledger), and 
 actually ran the gates**. So a commit that no watcher has blessed simply has *no* `herd/gates=success`
 status.
 
+### Explaining the "Expected — waiting" row (`GATE_STATUS_PENDING`, default off)
+
+That "Expected / waiting" placeholder is GitHub's own, and it names no owner and no phase: it looks
+identical whether a suite is running, a reviewer is mid-verdict, or no watcher will ever gate this PR.
+`GATE_STATUS_PENDING=on` posts `herd/gates=pending` with the description *review in progress* the moment
+a candidate enters the gate cycle (once per `(pr, sha)`; the terminal `success` overwrites it), so the
+page explains itself. A gate FAIL still posts nothing.
+
+**Only turn this on once `herd/gates` is a REQUIRED check** (the recipe below). It is off by default
+because of the exact hazard described above — in an *unprotected* repo a `pending` status flips a
+`CLEAN` sha to `UNSTABLE` and strands every PR. Under protection the sha is already `BLOCKED` on the
+missing required check, so a pending status changes nothing about mergeability, only the words.
+
 Pair that with a branch-protection rule that **requires** the `herd/gates` check, and the property
 becomes fail-safe:
 
