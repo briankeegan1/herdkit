@@ -186,12 +186,14 @@ PY_APPEND = re.compile(r"journal\.append\(\s*" + Q + "(" + NAME + ")" + Q)
 PY_ENCODE = re.compile(r"encode_event\(\s*" + Q + "(" + NAME + ")" + Q)
 py_files = [p for p in walk("pysrc", (".py",)) if is_production(p)]
 for path in py_files:
-    for line in read(path):
-        if line.lstrip().startswith("#"):
-            continue
-        for rx in (PY_APPEND, PY_ENCODE):
-            for m in rx.finditer(line):
-                producers.add(m.group(1))
+    # Matched over the WHOLE file, not line by line: a long emit routinely wraps the event name onto
+    # the line after `journal.append(`, and a per-line scan would silently miss it — a producer this
+    # guard cannot see is indistinguishable from one that does not exist, which is the entire bug
+    # class here. Full-line comments are dropped first so a commented-out emit never counts.
+    body = "\n".join(l for l in read(path) if not l.lstrip().startswith("#"))
+    for rx in (PY_APPEND, PY_ENCODE):
+        for m in rx.finditer(body):
+            producers.add(m.group(1))
 
 # ── CONSUMERS ─────────────────────────────────────────────────────────────────────────────────────
 consumers = {}         # event -> [ "file:line", … ]
@@ -262,8 +264,8 @@ if os.path.exists(contract):
         if line.startswith("### 3.4"):
             inside = True
             continue
-        if inside and line.startswith("## "):
-            break
+        if inside and line.startswith("#"):
+            break                        # any following heading ends the catalog (§3.5 is prose)
         if not inside or not line.startswith("|"):
             continue
         cell = line.split("|")[1] if line.count("|") >= 2 else ""

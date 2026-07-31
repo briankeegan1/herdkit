@@ -192,4 +192,20 @@ out="$(herd_journal_emission_lint "$L")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(12) the transition alphabet must not be read as journal events: $out"
 ok
 
+# ── (13) a WRAPPED python emit is still a producer ────────────────────────────────────────────────
+# A long emit routinely puts the event name on the line after `journal.append(`. A per-line producer
+# scan misses it and reports a live producer as an orphan — a guard whose scan surface is narrower
+# than the code it guards, which is this whole bug class turned on the lint itself. Caught for real:
+# the restored hv_body_unreadable emit wraps exactly this way.
+W="$T/wrapped"; _fixture "$W"
+printf 'if ev == "wrapped_emit":\n    pass\n' > "$W/pysrc/herd/why.py"
+cat > "$W/pysrc/herd/emitter.py" <<'PYF'
+def go(self, cand):
+    self.journal.append(
+        "wrapped_emit", "pr", cand.pr, "sha", cand.sha)
+PYF
+out="$(herd_journal_emission_lint "$W")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(13) a wrapped python emit must count as a producer; got rc=$rc: $out"
+ok
+
 echo "ALL PASS ($PASS checks)"
