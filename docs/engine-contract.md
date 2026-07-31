@@ -255,6 +255,8 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `cost` | component, pr, slug, model, in, out, cache_read, cache_write, usd, msgs, unpriced | `cost.sh:424` |
 | `pr_restale` / `pr_starvation` | pr, sha, slug, kind (+ lap count) | `agent-watch.sh:3371`–`:3374` |
 | `infra_breaker_open` / `_close` | — | `agent-watch.sh:2621` / `:2643` |
+| `cross_seat_block_honored` | pr, sha, seat, stage(setter\|merge), reason | `agent-watch.sh:post_gate_status` / `:11792` — restored HERD-446 at `live_runtime.py:LiveActuator.post_gate_status` (setter) and `LiveTick._walk` (merge), from the ONE shared implementation `_cross_seat_block_standing` |
+| `cross_seat_block_scan` | pr, sha, state(degraded), reason | `agent-watch.sh:_xseat_journal_degraded` — restored HERD-446 alongside `cross_seat_block_honored`; the FAIL-SOFT twin (an unreadable commit/comment scan, or an unresolvable seat identity, reports no standing block but leaves a forensic trail of why) |
 
 `merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296) and `merge_queue_hold` /
 `merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with
@@ -268,15 +270,25 @@ best-effort, so a missing event is indistinguishable from "it did not happen thi
 else in the engine can see the difference. `scripts/herd/journal-emission-lint.sh` is the standing
 guard — it reds any consumer-parsed name with no live producer, and both gate surfaces run it.
 
-Three names are consumer-side ONLY on purpose. Each is listed in that lint's allowlist with the same
-reason; **keep the two in step**, and do not "restore" one of these without restoring the behavior it
-would record:
+Two names are consumer-side ONLY on purpose (`cross_seat_block_honored` was the third until HERD-446
+restored its guard — see below). Each is listed in that lint's allowlist with the same reason; **keep
+the two in step**, and do not "restore" one of these without restoring the behavior it would record:
 
 | Name | Why there is no producer |
 |---|---|
 | `resolver_respawn` | The bash resolve pass journaled it when re-dispatching a resolver for a new sha. The Python core owns dispatch now and does not re-emit it; the RESPAWN BEHAVIOR is alive (`spawn_resolver` has live callers), only the forensic line is gone. Re-adding it needs the `round`/`old_sha` ledger reads the port never took. Note `scripts/herd/sim/sandbox-resolver-respawn-scenario.sh` journals the event ITSELF and then asserts it — a self-fulfilling guard, which is why the loss went unseen. |
-| `cross_seat_block_honored` | Bash journaled it from two stages, `setter` and `merge`. The merge-stage call site died with the action pass and the setter-stage one sits inside bash's `post_gate_status`, which has had no callers since the port took over the blessing. The Python core carries **no cross-seat BLOCK precedence check at all** — HERD-247 is unenforced in the port. A forensic line for a check that does not run is worse than silence, so the event must not come back before the guard does. |
 | `gate_default` | A verdict PROVENANCE, latent by design (§3.2): there is no live call site and a no-verdict run is treated as INFRA (retry), never a default BLOCK. |
+
+**`cross_seat_block_honored` — RESTORED (HERD-446).** Bash journaled it from two stages, `setter` and
+`merge`. The merge-stage call site died with the action pass at `ede7d45` and the setter-stage one sat
+inside bash's `post_gate_status`, which had had no callers since the port took over the blessing — the
+Python core carried no cross-seat BLOCK precedence check at all (HERD-247 was unenforced in the port,
+per the HERD-442 audit). Per this section's own rule ("do not restore the event before the guard"),
+the guard was reinstated FIRST — `_cross_seat_block_standing` in `live_runtime.py`, reused verbatim at
+both surfaces (`LiveActuator.post_gate_status` and `LiveTick._walk`), proven by
+`tests/test_live_runtime.py::TestCrossSeatBlockPrecedence` (mutation-proven: the tests that exercise a
+standing block fail red when the guard is neutralized) — and only then was the event restored and its
+allowlist row removed. See §3.4 for its shape.
 
 Two more emissions died at `ede7d45` and are NOT allowlisted, because nothing consumes them either —
 they are recorded here so a future auditor does not have to re-derive them:

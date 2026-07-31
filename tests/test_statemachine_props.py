@@ -335,6 +335,45 @@ class MergeQueueOrdering(unittest.TestCase):
         self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_FROZEN), SM.HOLD)
 
 
+class CrossSeatBlockHold(unittest.TestCase):
+    """HERD-247/HERD-446 cross-seat BLOCK precedence: a BLESSED candidate whose sha carries a standing
+    foreign BLOCK is held via the ``cross_seat_block`` edge — the exact same shape as ``merge_frozen``/
+    ``queue_wait`` (different trigger: another seat's unresolved BLOCK, not starvation/queue order), and
+    purely additive. Unlike those two this edge is NOT lever-gated."""
+
+    def test_cross_seat_block_holds_a_blessed_candidate(self):
+        self.assertEqual(SM.transition(SM.BLESSED, SM.CROSS_SEAT_BLOCK), SM.HOLD)
+        self.assertTrue(SM.can(SM.BLESSED, SM.CROSS_SEAT_BLOCK))
+
+    def test_cross_seat_block_is_a_registered_event(self):
+        self.assertIn(SM.CROSS_SEAT_BLOCK, SM.EVENTS)
+        self.assertEqual(SM.CROSS_SEAT_BLOCK, "cross_seat_block")
+
+    def test_cross_seat_block_is_only_legal_from_blessed(self):
+        for state in SM.STATES:
+            if state == SM.BLESSED:
+                continue
+            self.assertFalse(SM.can(state, SM.CROSS_SEAT_BLOCK),
+                             "%r must not accept cross_seat_block" % (state,))
+
+    def test_held_candidate_lands_in_a_live_non_terminal_hold(self):
+        self.assertFalse(SM.is_terminal(SM.HOLD))
+        self.assertEqual(SM.transition(SM.HOLD, SM.APPROVED), SM.MERGED)
+
+    def test_held_candidate_is_still_supersedable(self):
+        for ev in (SM.NEW_SHA, SM.SIBLING_RESTALE):
+            self.assertEqual(SM.transition(SM.HOLD, ev), SM.SUPERSEDED)
+
+    def test_blessed_keeps_every_prior_exit_including_cross_seat_block(self):
+        # The new edge coexists with merge_frozen/queue_wait and the four original decisions.
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_MERGE), SM.MERGED)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_HOLD), SM.HOLD)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.DECIDE_OBSERVE), SM.OBSERVE)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_REFUSED), SM.SUPERSEDED)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.MERGE_FROZEN), SM.HOLD)
+        self.assertEqual(SM.transition(SM.BLESSED, SM.QUEUE_WAIT), SM.HOLD)
+
+
 # ── OPTIONAL hypothesis pass — extra fuzz when installed; skip-soft otherwise (never a red) ──────
 try:
     from hypothesis import given, settings, strategies as st

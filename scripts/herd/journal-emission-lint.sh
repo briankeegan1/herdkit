@@ -73,7 +73,6 @@ HERD_JOURNAL_EMISSION_SKIP_REASON=""
 # "no producer, on purpose, and here is why a future auditor should not re-add one".
 HERD_JOURNAL_EMISSION_ALLOW='
 resolver_respawn|HERD-442: the bash resolve pass journaled this when re-dispatching a resolver for a new sha; the Python core owns dispatch now and does not re-emit it. The RESPAWN BEHAVIOR is alive (spawn_resolver has live callers) — only the forensic line is gone. Restoring it needs the round/old_sha ledger reads the port has not ported; tracked separately, not re-added blind.
-cross_seat_block_honored|HERD-442: bash journaled this from two stages (setter + merge). Both call sites died with the bash action pass / the now-callerless bash post_gate_status; the Python core carries no cross-seat BLOCK precedence check at all (HERD-247 is unenforced in the port). The event must NOT be re-added without the guard it records — a forensic line for a check that does not run is worse than silence.
 gate_default|contract §3.2 documents this verdict PROVENANCE as latent-by-design: there is no live call site and a no-verdict run is treated as INFRA (retry), never a default BLOCK. Documented, deliberately unproduced.
 '
 
