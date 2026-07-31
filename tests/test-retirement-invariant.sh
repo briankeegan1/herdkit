@@ -26,6 +26,9 @@
 #     (15) VOCABULARY: 'retiring…' while converging; 'needs-you · retirement stuck: <blocker>' when it
 #          will not converge; 'needs-you · <evidence>' when held. Never 'idle', never 'awaiting task'.
 #     (16) the sha/pr-suffixed ledger globs cannot eat a SIBLING slug's files (foo vs foo-bar)
+#     (24) HERD-444: a deferred (still-WORKING) slug that never goes idle is reaped anyway once
+#          _RETIRE_DEFER_TIMEOUT elapses — a bounded timeout so a WEDGED agent cannot block teardown
+#          forever — and the timeout is journaled (retire_defer_timeout), never silent
 #
 # Uses a REAL git repo + real worktrees (the dirt / unique-commit proofs are git's, and stubbing them
 # would test the stub). `gh` is stubbed on PATH; herdr is absent, so no tab/pane is ever touched.
@@ -573,6 +576,41 @@ AGENTS_JSON='{"result":{"agents":[{"name":"cure-hold","agent_status":"idle"}]}}'
   _retire_step cure-hold "$WTREES/cure-hold" feat/cure-hold 0 worktree
 [ "$(_retire_state_of cure-hold)" = retiring ] \
   || fail "(23) the first tick after a cured hold must be calm 'retiring', got: $(_retire_state_of cure-hold)"
+ok
+
+# ── (24) HERD-444: a deferred slug that never goes idle is reaped once _RETIRE_DEFER_TIMEOUT elapses ──
+# The HERD-356 defer is correct for a builder mid-fix, but unbounded it would recreate the very leak
+# invariance-first retirement discipline exists to prevent: a WEDGED agent (crashed without ever
+# flipping off "working") would strand the worktree forever. HERD_FAKE_NOW drives the clock so this
+# never sleeps in real time.
+sha_w="$(mkwt wedged)"
+gh_says "feat/wedged" MERGED "$sha_w" 28
+export HERD_RETIRE_DEFER_TIMEOUT=100; _RETIRE_DEFER_TIMEOUT=100
+WORKING_WEDGED='{"result":{"agents":[{"name":"wedged","agent_status":"working"}]}}'
+JOURNAL_FILE="$T/journal-defer.jsonl"; : > "$JOURNAL_FILE"
+
+# Tick 1, clock=1000: still well inside the window → deferred, worktree survives.
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+HERD_FAKE_NOW=1000 AGENTS_JSON="$WORKING_WEDGED" _retire_step wedged "$WTREES/wedged" feat/wedged 0 worktree
+[ "$(_retire_state_of wedged)" = deferred ] || fail "(24) tick 1 must be deferred (still inside the window)"
+[ -d "$WTREES/wedged" ] || fail "(24) tick 1: the worktree must survive while deferred"
+
+# Tick 2, clock=1050: still deferred (elapsed=50 < timeout=100), builder STILL reports working.
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+HERD_FAKE_NOW=1050 AGENTS_JSON="$WORKING_WEDGED" _retire_step wedged "$WTREES/wedged" feat/wedged 0 worktree
+[ "$(_retire_state_of wedged)" = deferred ] || fail "(24) tick 2 must still be deferred (elapsed=50 < 100)"
+[ -d "$WTREES/wedged" ] || fail "(24) tick 2: the worktree must still survive"
+grep -q '"event":"retire_defer_timeout"' "$JOURNAL_FILE" && fail "(24) the timeout must not fire before it elapses"
+
+# Tick 3, clock=1101: elapsed=101 >= timeout=100, and the roster STILL says working — a wedged agent,
+# by construction. The reap must proceed anyway, loudly.
+cold; RETIRE_SLUG=(); RETIRE_STATE=(); RETIRE_DETAIL=(); RETIRE_DIR=()
+HERD_FAKE_NOW=1101 AGENTS_JSON="$WORKING_WEDGED" _retire_step wedged "$WTREES/wedged" feat/wedged 0 worktree
+[ -d "$WTREES/wedged" ] && fail "(24) past the timeout the worktree must be reaped even though 'working' never cleared"
+[ "$(_retire_state_of wedged)" != deferred ] || fail "(24) the row must no longer read deferred once reaped"
+grep -q '"event":"retire_defer_timeout"' "$JOURNAL_FILE" \
+  || fail "(24) the bounded-timeout reap must be journaled (retire_defer_timeout), never silent"
+grep -q '"slug":"wedged"' "$JOURNAL_FILE" || fail "(24) the timeout journal line must name the slug"
 ok
 
 echo "ALL PASS ($pass checks)"

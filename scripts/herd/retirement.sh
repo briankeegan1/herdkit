@@ -96,6 +96,17 @@ _RETIRE_STUCK_TICKS="${HERD_RETIRE_STUCK_TICKS:-3}"
 # which is precisely the answer that is cheap to be 30 s late about.
 _RETIRE_PROBE_TTL="${HERD_RETIRE_PROBE_TTL:-30}"
 
+# How long (wall-clock seconds) a slug may sit 'deferred' — terminal + disposable, but a builder is
+# still WORKING (HERD-356) — before the wait gives up and the reap proceeds anyway (HERD-444). A
+# deferral is cheap and correct for a builder that is genuinely mid-fix; it becomes a leak-shaped bug
+# the moment the agent is WEDGED (crashed without flipping off "working", a driver that misreads a dead
+# pane as busy forever) and nothing ever un-defers it. 1800 s (30 min) mirrors FINISH_STALL_MIN's own
+# default room for "how long can a builder legitimately be busy" — long enough that a real CI-fix bounce
+# is never yanked mid-edit, short enough that a wedged agent does not strand the worktree forever.
+# Epoch-based (like _RETIRE_PROBE_TTL), never tick-counted: tick cadence is not guaranteed uniform under
+# load, and the escalation state already carries a first-seen epoch for exactly this arithmetic.
+_RETIRE_DEFER_TIMEOUT="${HERD_RETIRE_DEFER_TIMEOUT:-1800}"
+
 # ── per-slug escalation state ────────────────────────────────────────────────────────────────────
 # One file per non-converged slug: "<attempts> <first_epoch>" on line 1, the leftover kinds on line 2.
 # Purely an escalation memory — the teardown itself never reads it. Deleted the moment a slug converges
@@ -1026,12 +1037,27 @@ EOF
       return 0 ;;
     deferred)
       # HERD-356: terminal + disposable, but a builder is still WORKING here. Do NOT tear down — record a
-      # loud row saying why and journal it ONCE. The worktree keeps the slug discoverable, so no escalation
-      # state is needed; the next idle tick classifies it 'retiring' and the reap proceeds. Not a stuck/red
-      # condition (nothing is wrong — we are deliberately waiting), so it never bumps the stuck counter.
-      _retire_note_once "$slug" defer "$detail"
-      _retire_record "$slug" deferred "$detail" "$dir"
-      return 0 ;;
+      # loud row saying why and journal it ONCE. The worktree keeps the slug discoverable, so no STUCK
+      # escalation is needed; the next idle tick classifies it 'retiring' and the reap proceeds. Not a
+      # stuck/red condition (nothing is wrong — we are deliberately waiting), so it never bumps the STUCK
+      # counter (_RETIRE_STUCK_TICKS is teardown-convergence escalation, a different clock).
+      #
+      # HERD-444's BOUNDED TIMEOUT, layered on top: the escalation state's first-seen epoch (the SAME
+      # file 'held' already uses) tracks how long this slug has been continuously deferred. Once that
+      # exceeds _RETIRE_DEFER_TIMEOUT, stop waiting — a wait this long is far more likely a WEDGED agent
+      # (dead without ever flipping off "working") than a legitimately slow fix — and fall through to the
+      # SAME teardown 'retiring' drives below. Journal the timeout loudly (never silently) so a post-mortem
+      # can tell "waited, then reaped" apart from "reaped immediately".
+      _retire_state_bump "$slug" deferred
+      if [ "$(( $(_now_epoch) - $(_retire_first_epoch "$slug") ))" -lt "$_RETIRE_DEFER_TIMEOUT" ]; then
+        _retire_note_once "$slug" defer "$detail"
+        _retire_record "$slug" deferred "$detail" "$dir"
+        return 0
+      fi
+      journal_append retire_defer_timeout slug "$slug" pr "$pr" \
+        detail "${detail} (deferred > ${_RETIRE_DEFER_TIMEOUT}s — treating the builder as wedged)"
+      _retire_state_clear "$slug"
+      ;;
     held)
       # Persist the escalation state even though nothing is torn down. It is what keeps a HELD ORPHAN
       # discoverable: its worktree, tab, and .herd-ref are already gone, so `.retire-<slug>` is the last
