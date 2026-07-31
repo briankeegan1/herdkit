@@ -132,6 +132,10 @@ SWEEP_N_DEFER=0
 # the swept total and from sweep_swept_total: a relink is an ADVISORY enqueue, not a reap, and folding
 # it into the total would make the watcher's auto path read "progress" on a tick that deleted nothing.
 SWEEP_N_LINK=0
+# Leg 7 (marker-sweep item): once-guard/gate-result marker files (.live-noted-*/.live-posted-*)
+# reaped for a PR whose GitHub state is provably MERGED or CLOSED. A genuine reap (real files
+# deleted), so it counts toward the swept total and toward sweep_swept_total's no-progress check.
+SWEEP_N_ONCEGUARD=0
 
 # _sweep_reset_counters — zero the counters before a run. Load-bearing for the watcher's SWEEP_AUTO=auto
 # path, which calls sweep_run_safe_legs on EVERY cadence tick inside ONE long-lived process: without
@@ -139,7 +143,7 @@ SWEEP_N_LINK=0
 # running total instead of what that tick actually swept.
 _sweep_reset_counters() {
   SWEEP_N_REAP=0; SWEEP_N_FLAG=0; SWEEP_N_TAB=0; SWEEP_N_MARKER=0; SWEEP_N_PROC=0; SWEEP_N_LINK=0
-  SWEEP_N_DEFER=0
+  SWEEP_N_DEFER=0; SWEEP_N_ONCEGUARD=0
 }
 
 # _sweep_say <icon> <line> — one narration line, themed when the console palette is loaded.
@@ -238,15 +242,36 @@ _sweep_dir_in_use() {
   [ -n "$(lsof -t +D "$dir" 2>/dev/null | head -1)" ]  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
-# _sweep_unique_commits <dir> — count commits on this worktree's HEAD that exist nowhere on the
-# default branch (i.e. work a delete would destroy). Prints a count, or "?" when the base ref cannot
-# be resolved — an unverifiable tree is FLAGGED, never reaped.
+# _sweep_unique_commits <dir> — count commits on this worktree's HEAD that exist nowhere the engine
+# can PROVE — not on the default branch, and not on any remote-tracking ref. Prints a count, or "?"
+# when the base ref cannot be resolved — an unverifiable tree is FLAGGED, never reaped.
 # DEFAULT_BRANCH is already a FULL ref ("origin/main", per templates/config.example) — never prefix it.
+#
+# HERD-457 / GH #571: the pre-fix check asked only "reachable from DEFAULT_BRANCH?", so a CLOSED
+# PR — whose branch is left intact on origin (closing a PR never deletes it; only a MERGE-time
+# DELETE_BRANCH_ON_MERGE does) — read every one of its own pushed commits as "exists only here", a
+# false positive that flags a byte-identical-to-origin worktree as if deleting it would lose work.
+# Once we know $n commits are not on DEFAULT_BRANCH, take one more look: is HEAD reachable from ANY
+# remote-tracking ref (a fetch-refreshed one)? `git branch -r --contains` answers that with no gh
+# call. FAIL-SOFT + CONSERVATIVE: an offline/slow fetch leaves the existing remote-tracking refs in
+# place (never worse than skipping the fetch), and a fetch or contains-check that cannot run at all
+# leaves $n as the (more conservative, pre-fix) verdict — an unprovable "safe on origin" never turns
+# into a silent reap.
 _sweep_unique_commits() {
-  local dir="$1" base="${DEFAULT_BRANCH:-origin/main}" n
+  local dir="$1" base="${DEFAULT_BRANCH:-origin/main}" n head
   git -C "$dir" rev-parse --verify --quiet "$base" >/dev/null 2>&1 || { printf '?'; return 0; }
   n="$(git -C "$dir" rev-list --count "$base..HEAD" 2>/dev/null || true)"
-  case "$n" in ''|*[!0-9]*) printf '?' ;; *) printf '%s' "$n" ;; esac
+  case "$n" in ''|*[!0-9]*) printf '?'; return 0 ;; esac
+  [ "$n" != "0" ] || { printf '0'; return 0; }
+  head="$(git -C "$dir" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  [ -n "$head" ] || { printf '%s' "$n"; return 0; }
+  git -C "$dir" fetch --quiet origin >/dev/null 2>&1 || true
+  local remote_hit; remote_hit="$(git -C "$dir" branch -r --contains "$head" 2>/dev/null)"
+  if [ -n "$remote_hit" ]; then
+    printf '0'
+  else
+    printf '%s' "$n"
+  fi
 }
 
 # _sweep_registry_has_slug <slug> — success iff the tab registry records a tab for this slug (an
@@ -502,6 +527,155 @@ sweep_leg_markers() {
   done < <(sweep_timedout_marker_keys)
   [ -n "$dry" ] && return 0
   [ "$n" -gt 0 ] && _sweep_gate_corpses
+  return 0
+}
+
+# ── leg 7: once-guard / gate-result marker debris ───────────────────────────────────────────────
+# Every tick decision in the live engine walks through LiveState.once()/.posted()
+# (pysrc/herd/live_runtime.py) — a once-per-(pr,sha,kind) guard written as a flat file,
+# $TREES/.live-noted-<kind>-<pr>-<sha> or .live-posted-<kind>-<pr>-<sha>, whenever no SQLite store
+# is engaged. Roughly a dozen distinct <kind>s fire across a PR's lifecycle (health/review dispatch,
+# xseat handoffs, refix escalation, fairness, blessing, hv-informed, the HERD-459 state-transition
+# dedupe, …), and nothing sweeps this family: leg 3 above only globs
+# .review-inflight-*/.health-inflight-* — in-flight WORKER markers, reaped by liveness/age, a
+# completely different lifecycle. A once-guard has no pid and no age; it is a PERMANENT record that
+# "this was already done for this (pr,sha)" — permanent, that is, until the PR reaches a terminal
+# GitHub state, at which point no tick will ever consult it again (PRS_JSON only ever lists OPEN
+# PRs) and it is pure debris. Left unswept, it is the same time-bomb class as the 23 stale health
+# markers that wedged the gate (HERD-451): harmless individually, unbounded in aggregate.
+#
+# PROOF, mirroring sweep_leg_worktrees's own discipline: a PR's markers are reaped ONLY once its
+# GitHub state is PROVABLY MERGED or CLOSED (_srs_gh_view, the SAME helper leg 1 uses — it accepts a
+# bare PR NUMBER exactly as it accepts a branch name). An OPEN PR, or a gh lookup that could not
+# answer, leaves every one of its markers untouched. Unlike leg 1's worktree reap, no sha-anchor
+# check is needed: these files hold no user work, only internal bookkeeping, so once a PR is
+# terminal EVERY marker for it — whichever historical sha it names — is unconditionally safe to
+# drop. Grouped by PR (not by individual file) so N kinds cost exactly one `gh pr view` round-trip,
+# and narrated/journaled once per PR rather than once per file.
+SWEEP_ONCE_GUARD_PREFIXES='.live-noted- .live-posted-'
+
+# _sweep_once_guard_scan_due <throttle> — may we spend a `gh pr view` round-trip now? Mirrors
+# _sweep_relink_scan_due (leg 6): the CLI (throttle empty) always may. The watcher's SWEEP_AUTO=auto
+# path passes throttle=1 and gets at most one scan per hour — this debris is hours/days old, not a
+# per-tick emergency, and the rest of the auto trigger pass is deliberately network-free.
+_sweep_once_guard_scan_due() {
+  [ -n "${1:-}" ] || return 0
+  local stamp="$TREES/.once-guard-sweep-stamp" prev now
+  now="$(_now_epoch 2>/dev/null || date +%s)"
+  prev="$(cat "$stamp" 2>/dev/null || echo 0)"
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  [ $(( now - prev )) -ge 3600 ] || return 1
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  return 0
+}
+
+# _sweep_once_guard_pr_state <pr> — MERGED | CLOSED | OPEN | UNKNOWN (gh could not answer), memoized
+# per CALL to sweep_dead_once_guard_prs (a fresh cache each scan — a PR that merges mid-run is picked
+# up on the very NEXT scan, not stranded on a stale cached OPEN) so N marker files naming the same PR
+# cost exactly one `gh pr view` round-trip.
+_SWEEP_OG_PR_STATE_CACHE=""
+_sweep_once_guard_pr_state() {
+  local pr="$1" line st
+  line="$(grep -m1 "^${pr}	" <<< "$_SWEEP_OG_PR_STATE_CACHE")"
+  if [ -n "$line" ]; then
+    printf '%s' "${line#*$'\t'}"
+    return 0
+  fi
+  IFS=$'\t' read -r st _ _ <<EOF
+$(_srs_gh_view "$pr")
+EOF
+  [ -n "$st" ] || st="UNKNOWN"
+  _SWEEP_OG_PR_STATE_CACHE="${_SWEEP_OG_PR_STATE_CACHE}
+${pr}	${st}"
+  printf '%s' "$st"
+}
+
+# _sweep_once_guard_parse <basename> — prints "<pr>\t<sha>" for a once-guard/posted marker basename,
+# or nothing when it does not parse (never touched). pr/sha are always the LAST TWO dash-delimited
+# fields regardless of how many underscore-joined <kind> segments precede them (no <kind> in
+# live_runtime.py's call sites contains a literal dash) — validated defensively anyway: pr must be
+# all-digits, sha must be 6-40 lowercase hex characters, or the file is skipped untouched.
+_sweep_once_guard_parse() {
+  local base="$1" sha rest pr
+  sha="${base##*-}"; rest="${base%-*}"; pr="${rest##*-}"
+  case "$pr" in ''|*[!0-9]*) return 0 ;; esac
+  case "$sha" in ''|*[!0-9a-f]*) return 0 ;; esac
+  case "${#sha}" in 1|2|3|4|5) return 0 ;; esac    # too short to be a real sha — never touch
+  printf '%s\t%s' "$pr" "$sha"
+}
+
+# sweep_once_guard_files — every .live-noted-*/.live-posted-* file under $TREES, one per line. Reused
+# by both the detector (below) and the actor so the two can never see a different filesystem snapshot
+# mid-sweep (a marker written between the two globs would otherwise be counted by neither, or acted on
+# by one and not the other).
+sweep_once_guard_files() {
+  local pfx f
+  for pfx in $SWEEP_ONCE_GUARD_PREFIXES; do
+    for f in "$TREES/$pfx"*; do
+      [ -e "$f" ] || continue
+      printf '%s\n' "$f"
+    done
+  done
+}
+
+# _sweep_once_guard_file_pr <path> — prints the PR this marker's basename parses to (via
+# _sweep_once_guard_parse), or nothing when it does not parse. One-file-in, one-field-out — the
+# building block both the detector and the actor loop over the same file list with.
+_sweep_once_guard_file_pr() {
+  local base="${1##*/}" pr sha
+  IFS=$'\t' read -r pr sha <<EOF
+$(_sweep_once_guard_parse "$base")
+EOF
+  [ -n "$pr" ] && [ -n "$sha" ] && printf '%s' "$pr"
+}
+
+# sweep_dead_once_guard_prs — the CHEAP detector: "<pr>\t<state>\t<count>" for every PR whose
+# once-guard/posted markers are PROVABLY terminal (MERGED/CLOSED), shared by the plan (dry-run) and
+# the live actor so they can never disagree. A fresh $_SWEEP_OG_PR_STATE_CACHE per call — see
+# _sweep_once_guard_pr_state's header comment on why that is deliberate, not an oversight.
+sweep_dead_once_guard_prs() {
+  _SWEEP_OG_PR_STATE_CACHE=""
+  local files f pr st count seen=""
+  files="$(sweep_once_guard_files)"
+  [ -n "$files" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pr="$(_sweep_once_guard_file_pr "$f")"
+    [ -n "$pr" ] || continue
+    case " $seen " in *" $pr "*) continue ;; esac
+    seen="$seen $pr"
+  done <<< "$files"
+  for pr in $seen; do
+    st="$(_sweep_once_guard_pr_state "$pr")"
+    case "$st" in MERGED|CLOSED) ;; *) continue ;; esac
+    count=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ "$(_sweep_once_guard_file_pr "$f")" = "$pr" ] && count=$(( count + 1 ))
+    done <<< "$files"
+    [ "$count" -gt 0 ] && printf '%s\t%s\t%s\n' "$pr" "$st" "$count"
+  done
+}
+
+# sweep_leg_once_guards <dry> [throttle] — narrate + (unless dry) reap every provably-terminal PR's
+# once-guard/posted markers, journaling one `sweep_once_guard` event per PR (count, not per file).
+# <throttle>, when set, is the SAME hourly gate leg 6 uses (_sweep_once_guard_scan_due) — the watcher's
+# SWEEP_AUTO=auto path passes it so this leg's `gh pr view` calls never ride the ~4s tick cadence; the
+# CLI (`herd sweep`, dry-run) always scans.
+sweep_leg_once_guards() {
+  local dry="$1" throttle="${2:-}" pr st count f
+  _sweep_once_guard_scan_due "$throttle" || return 0
+  while IFS=$'\t' read -r pr st count; do
+    [ -n "${pr:-}" ] || continue
+    SWEEP_N_ONCEGUARD=$(( SWEEP_N_ONCEGUARD + count ))
+    _sweep_say "🗑 " "drop ${count} once-guard marker(s) for PR #${pr} ($(printf '%s' "$st" | tr '[:upper:]' '[:lower:]'))"
+    [ -n "$dry" ] && continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ "$(_sweep_once_guard_file_pr "$f")" = "$pr" ] && rm -f "$f" 2>/dev/null
+    done <<< "$(sweep_once_guard_files)"
+    journal_append sweep_once_guard pr "$pr" result "$(printf '%s' "$st" | tr '[:upper:]' '[:lower:]')" count "$count"
+  done < <(sweep_dead_once_guard_prs)
   return 0
 }
 
@@ -1140,7 +1314,7 @@ sweep_journal_advice_once() {
 # leg then recognizes (and prunes the registry row for) any tab the reap's teardown missed.
 # sweep_swept_total — how many things the last sweep_run_safe_legs actually acted on (flags excluded:
 # a flag is a report, not an action). Lets the watcher's auto path detect a no-progress run.
-sweep_swept_total() { printf '%s' "$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC ))"; }
+sweep_swept_total() { printf '%s' "$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC + SWEEP_N_ONCEGUARD ))"; }
 
 # _sweep_stamp_tally — record this sweep's completion wall-clock in $TREES/.sweep-tally-stamp so a LIVE
 # watcher recomputes its cached housekeeping tally the very next tick instead of advertising the
@@ -1164,8 +1338,11 @@ sweep_run_safe_legs() {
   # here (and only here): the watcher runs this every cadence tick, and the rest of its trigger pass
   # is network-free by design.
   sweep_leg_links "" 1
+  # Leg 7 is SAFE — a marker is reaped only once its PR is PROVABLY terminal (MERGED/CLOSED) — but its
+  # `gh pr view` calls are throttled to the same hourly cadence as leg 6, for the same reason.
+  sweep_leg_once_guards "" 1
   journal_append sweep_auto reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" deferred "$SWEEP_N_DEFER" \
-    tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
+    tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC" onceguards "$SWEEP_N_ONCEGUARD"
   # Tell a live watcher the tally is stale so it recomputes now (HERD-215). Harmless in the auto path,
   # which recomputes in-process anyway; load-bearing for a manual `herd sweep` from another process.
   _sweep_stamp_tally
@@ -1197,13 +1374,14 @@ sweep_main() {
     "${WORKSPACE_NAME:-?}"
 
   # Worktrees before tabs — see sweep_run_safe_legs on why the order is load-bearing.
-  sweep_leg_markers   "$dry"
-  sweep_leg_procs     "$dry"
-  sweep_leg_worktrees "$dry"
-  sweep_leg_tabs      "$dry"
-  sweep_leg_links     "$dry"
+  sweep_leg_markers      "$dry"
+  sweep_leg_procs        "$dry"
+  sweep_leg_worktrees    "$dry"
+  sweep_leg_tabs         "$dry"
+  sweep_leg_once_guards  "$dry"
+  sweep_leg_links        "$dry"
 
-  local total=$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC ))
+  local total=$(( SWEEP_N_REAP + SWEEP_N_TAB + SWEEP_N_MARKER + SWEEP_N_PROC + SWEEP_N_ONCEGUARD ))
   printf '\n'
   if [ "$SWEEP_N_LINK" -gt 0 ]; then
     printf '  🔗 %d merged PR(s) with a missing tracker item — retroactive linkage %s\n' \
@@ -1214,9 +1392,9 @@ sweep_main() {
     # what happened, so stay silent rather than claiming a clean room over the top of it.
     [ "$SWEEP_N_LINK" -eq 0 ] && printf '  ✅ control room clean — nothing to sweep\n'
   else
-    printf '  %s %d worktree(s) · %d tab(s) · %d marker(s) · %d process(es)%s\n' \
+    printf '  %s %d worktree(s) · %d tab(s) · %d marker(s) · %d process(es) · %d once-guard(s)%s\n' \
       "$([ -n "$dry" ] && printf 'would sweep:' || printf 'swept:')" \
-      "$SWEEP_N_REAP" "$SWEEP_N_TAB" "$SWEEP_N_MARKER" "$SWEEP_N_PROC" \
+      "$SWEEP_N_REAP" "$SWEEP_N_TAB" "$SWEEP_N_MARKER" "$SWEEP_N_PROC" "$SWEEP_N_ONCEGUARD" \
       "$([ "$SWEEP_N_FLAG" -gt 0 ] && printf ' · %d FLAGGED for you' "$SWEEP_N_FLAG")"
     [ "$SWEEP_N_FLAG" -gt 0 ] && printf '  🚩 flagged items are NEVER auto-deleted — resolve them by hand\n'
     # HERD-356: a deferred reap is not a failure — it clears itself when the still-working builder goes idle.
@@ -1224,7 +1402,7 @@ sweep_main() {
   fi
 
   journal_append sweep_done mode "$mode" reaped "$SWEEP_N_REAP" flagged "$SWEEP_N_FLAG" deferred "$SWEEP_N_DEFER" \
-    tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC"
+    tabs "$SWEEP_N_TAB" markers "$SWEEP_N_MARKER" procs "$SWEEP_N_PROC" onceguards "$SWEEP_N_ONCEGUARD"
   # Invalidate a live watcher's cached tally so its housekeeping line recomputes next tick (HERD-215).
   # Skip on --dry-run: it touched nothing, so the mess is still there and the cached count is still true.
   [ -z "$dry" ] && _sweep_stamp_tally
