@@ -135,16 +135,18 @@ grep -q "REFUSING" <<< "$outC2" && fail "C2: standard launch was wrongly refused
 ok
 
 # C3. agent-watch.sh (the watcher console) from a foreign cwd REFUSES end-to-end (before the loop).
-# HERD-189: unset HERD_HERMETIC_GUARD for THIS ONE invocation. agent-watch.sh's own hermetic-guard
-# choke point (its FIRST production check after the AGENT_WATCH_LIB early-return) sits BEFORE
-# herd_console_guard's foreign-cwd refusal in file order, so under the outer suite's daemon-
-# hermeticity sandbox (which exports HERD_HERMETIC_GUARD for the WHOLE run) this deliberate,
-# safe, self-refusing direct execution trips the choke point first — logged as a false leak, and
-# masking the very refusal this case exists to prove (exit 0 via the choke point, not the
-# "REFUSING to start herd watch" path). This invocation is never a real daemon spawn (it always
-# refuses immediately, one way or the other), so exempting it here is correct, not a hermeticity
-# hole — every OTHER agent-watch.sh reach in this suite still goes through the guard.
-outC3="$(cd "$FOREIGN" && env -u HERD_HERMETIC_GUARD HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$WATCH" 2>&1)"; rc=$?
+# This ran under `env -u HERD_HERMETIC_GUARD` (HERD-189) because agent-watch.sh's hermetic-guard
+# choke point used to sit BEFORE herd_console_guard's foreign-cwd refusal, so under the suite's
+# daemon-hermeticity sandbox this deliberate self-refusing execution tripped the choke point first —
+# a false leak that also masked the refusal this case exists to prove.
+#
+# HERD-441 fixed that at the source instead: the choke point now sits AFTER herd_console_guard, on
+# the principle that A REFUSAL IS NOT A LEAK — a run the console guard turns away never becomes a
+# daemon, so it has nothing to record. The exemption is therefore no longer needed, and keeping it
+# would be strictly worse: it disarmed the guard for the one invocation in this suite that actually
+# executes agent-watch.sh, so a regression that broke the refusal could spawn a REAL watcher here
+# with nothing to catch it. Run it WITH the guard armed and assert the refusal end-to-end.
+outC3="$(cd "$FOREIGN" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$WATCH" 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] || fail "C3: agent-watch.sh did not refuse a foreign cwd (rc=$rc): $outC3"
 grep -q "REFUSING to start herd watch" <<< "$outC3" || fail "C3: agent-watch refusal missing ($outC3)"
 ok
