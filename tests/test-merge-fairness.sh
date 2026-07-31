@@ -393,8 +393,9 @@ READERS="$(grep -rlF 'RESTALE_STATE' "$ROOT/scripts" "$ROOT/bin" 2>/dev/null \
 USES="$(grep -nE 'restale_count|_starvation_row' "$WATCH" | grep -vE '^\s*[0-9]+:\s*#' | grep -vE 'restale_count\(\)|_starvation_row\(\)' | wc -l | tr -d ' ')"
 [ "$USES" -ge 1 ] || fail "(13) the counter is never read — the row would never render"
 # Every call sits inside the two display helpers; nothing in a gate/merge decision.
-grep -nE 'if .*restale_count|\[ .*restale_count.* \] (&&|\|\|) (do_merge|record_|post_gate)' "$WATCH" \
-grep -q . <<< "$(| grep -vE '_starvation_row\(\)')" && fail "(13) restale_count appears in a gate/merge decision"
+_gate_uses="$(grep -nE 'if .*restale_count|\[ .*restale_count.* \] (&&|\|\|) (do_merge|record_|post_gate)' "$WATCH" \
+  | grep -vE '_starvation_row\(\)' || true)"
+grep -q . <<< "$_gate_uses" && fail "(13) restale_count appears in a gate/merge decision"
 ok "(13) the re-stale counter is display + journal only — nothing gates on it"
 
 echo "ALL PASS ($pass checks) — merge fairness: ready-PR priority + starvation surfacing (HERD-231)"
