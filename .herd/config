@@ -139,6 +139,10 @@ MAIN_HEALTH_TICK="on"
 # OWN host and never asked GitHub. Enabled here for the same dogfood reason as MAIN_HEALTH_TICK;
 # ships OFF for other consumers.
 MAIN_HEALTH_CI_GATE="on"
+# HERD-452: auto-restore $MAIN when it is found detached-but-clean (never touches a dirty tree).
+# Enabled here for the same dogfood reason as MAIN_HEALTH_TICK/MAIN_HEALTH_CI_GATE; ships OFF for
+# other consumers.
+CHECKOUT_GUARD="on"
 REFIX_MAX_ROUNDS="6"
 # blank → every PR gets the full MODEL_REVIEW (Opus)
 REVIEW_ESCALATE_GLOB="^bin/|^scripts/herd/(agent-watch|herd-review|herd-resolve|herd-claim|spawn|scribe|backends)|^templates/"
