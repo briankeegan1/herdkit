@@ -307,9 +307,14 @@ done
 grep -q '__probe__' "$P9/.herd/config"           && fail "probe value was written despite refusal"
 ok
 
-# a value INSIDE the documented domain is still accepted and applied exactly as before.
+# a value INSIDE the documented domain is still accepted and applied exactly as before — including the
+# key's SIDE EFFECTS: SCRIBE_BACKEND is requires=watcher in the shipped manifest, so an accepted set
+# must still restart the watcher and still emit the #139 stale-drainer warning. A domain that blocked
+# typos but also suppressed the apply path would be a worse bug than the one it fixes.
 run_real "$P9" config set SCRIBE_BACKEND github
 [ "$RC" -eq 0 ]                                   || fail "shipped manifest refused the valid SCRIBE_BACKEND=github ($OUT)"
+grep -qi 'herd reload' <<< "$OUT" || fail "accepted watcher-key set did NOT run the restart path ($OUT)"
+grep -qi 'stale' <<< "$OUT" || fail "accepted SCRIBE_BACKEND flip lost the stale-drainer warning ($OUT)"
 run_real "$P9" config get SCRIBE_BACKEND
 [ "$OUT" = "github" ]                             || fail "valid SCRIBE_BACKEND not persisted (got '$OUT')"
 ok
