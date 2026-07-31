@@ -38,10 +38,13 @@
 #   pipefail-safe, the very property it enforces).
 #
 # herd_pipe_safety_lint [<root>]
-#   Entrypoint for the gate surfaces. Scans scripts/herd/*.sh + scripts/herd/work-units/*.sh +
-#   scripts/ci/*.sh + bin/herd under <root> (or cwd). Exit: 0 = clean · 1 = hit(s) · 2 = skipped
-#   (infra; NEVER a red).
+#   Entrypoint for the gate surfaces. Scans EVERY shell surface in the tree under <root> (or cwd):
+#   scripts/herd/*.sh and its backends/ sim/ experiment/ work-units/ subdirs, scripts/ci/*.sh,
+#   tests/*.sh|*.bats|*.bash, templates/*.sh (+ themes), migrations/*.sh, .herd/*.sh, herd.sh,
+#   install.sh and bin/herd. Exit: 0 = clean · 1 = hit(s) · 2 = skipped (infra; NEVER a red).
 #   On a skip, $HERD_PIPE_SAFETY_SKIP_REASON carries the one-line why.
+#   HERD-441 widened this from the engine-only surface; see the file list for why tests/ alone was
+#   not enough.
 #
 # Fail-soft by construction: a tree with none of the scan surface (every consuming project — this is
 # herdkit's own engine surface) skips, never a false red.
@@ -53,7 +56,14 @@ HERD_PIPE_SAFETY_SKIP_REASON=""
 #     `q`/`m` buried inside a later quoted pattern (e.g. `grep -v 'a-quux'`) never false-reds.
 #   • head — stops after N lines/bytes.
 # `-[[:alnum:]]*[qm]` matches -q, -qE, -qxF, -qiE, -Eq, -Eiq, -m, -m1, … (option cluster ending in q/m).
-HERD_PIPE_SAFETY_RE='\|[[:space:]]*(grep[[:space:]]+-[[:alnum:]]*[qm]|head\b)'  # pipe-ok: the detector's own pattern literal, not a pipeline
+#
+# The leading `(^|[^|])` requires a LONE pipe: the `|` must be at line start (a `\`-continued
+# pipeline whose consumer opens the physical line) or preceded by a non-`|` character. Without it the
+# OR operator in  `<test> || grep -q PAT FILE`  false-reds — the second `|` of `||` is followed by
+# ` grep -q`, yet that grep reads a FILE and has no producer process, so it can never EPIPE. That
+# class does not occur in scripts/herd, which is why the pre-HERD-441 scan surface never exposed it;
+# it is common in tests/ (13 instances), so precision here is a precondition for widening the scan.
+HERD_PIPE_SAFETY_RE='(^|[^|])\|[[:space:]]*(grep[[:space:]]+-[[:alnum:]]*[qm]|head\b)'  # pipe-ok: the detector's own pattern literal, not a pipeline
 
 # herd_pipe_safety_check <file>... — pure function; prints PIPE-UNSAFE lines + ADVISORY. Exit 0/1.
 herd_pipe_safety_check() {
@@ -97,9 +107,15 @@ herd_pipe_safety_check() {
       while [ -n "${_ps_arr[_ps_end]+x}" ]; do
         case "${_ps_arr[_ps_end]}" in *\\) _ps_end=$((_ps_end + 1)) ;; *) break ;; esac
       done
+      # The annotation must be a REAL trailing comment: '# pipe-ok' preceded by whitespace. A bare
+      # substring match also honours a line that merely QUOTES the token in prose — e.g.
+      #   fail "no PIPE-UNSAFE expected after '# pipe-ok'"
+      # which silently opted a live `printf | grep -q` out of the scan (found in this lint's own test
+      # when HERD-441 widened the surface to tests/). Requiring the leading whitespace keeps every
+      # genuine annotation working while a quoted '# pipe-ok' no longer grants an exemption.
       _ps_ok=0; _ps_j="$_ps_start"
       while [ "$_ps_j" -le "$_ps_end" ]; do
-        case "${_ps_arr[_ps_j]}" in *'# pipe-ok'*) _ps_ok=1; break ;; esac
+        case "${_ps_arr[_ps_j]}" in *[[:space:]]'# pipe-ok'*) _ps_ok=1; break ;; esac
         _ps_j=$((_ps_j + 1))
       done
       if [ "$_ps_ok" -eq 1 ]; then _ps_annot=$((_ps_annot + 1)); continue; fi
@@ -122,9 +138,31 @@ herd_pipe_safety_lint() {
   HERD_PIPE_SAFETY_SKIP_REASON=""
 
   # An unmatched glob expands to the literal pattern; the `[ -f ]` guard drops it (no nullglob needed,
-  # bash 3.2-safe). scripts/herd/*.sh + scripts/herd/work-units/*.sh + scripts/ci/*.sh + bin/herd —
-  # whichever exist.
-  for _ps_f in "$_ps_root"/scripts/herd/*.sh "$_ps_root"/scripts/herd/work-units/*.sh "$_ps_root"/scripts/ci/*.sh; do
+  # bash 3.2-safe).
+  #
+  # HERD-441 widened this list. It was scripts/herd/*.sh + work-units + scripts/ci + bin/herd, which
+  # left most of the repo's shell UNSCANNED — the lint printed '0 pipe-unsafe (clean)' while the
+  # defect it exists to stop broke CI twice from tests/ (HERD-440's driver-seam pair, then
+  # test-cli-update.sh). The blind spot was never tests-only: `scripts/herd/*.sh` does not recurse,
+  # so scripts/herd/backends/ and scripts/herd/sim/ were missed, and `.herd/healthcheck.project.sh`
+  # — the AUTHORITATIVE heavy merge gate itself — was unscanned too. Every surface below is real
+  # shell that runs under `set -o pipefail`; a glob that matches nothing costs nothing.
+  for _ps_f in \
+    "$_ps_root"/scripts/herd/*.sh \
+    "$_ps_root"/scripts/herd/backends/*.sh \
+    "$_ps_root"/scripts/herd/sim/*.sh \
+    "$_ps_root"/scripts/herd/experiment/*.sh \
+    "$_ps_root"/scripts/herd/work-units/*.sh \
+    "$_ps_root"/scripts/ci/*.sh \
+    "$_ps_root"/tests/*.sh \
+    "$_ps_root"/tests/*.bats \
+    "$_ps_root"/tests/*.bash \
+    "$_ps_root"/templates/*.sh \
+    "$_ps_root"/templates/themes/*/*.sh \
+    "$_ps_root"/migrations/*.sh \
+    "$_ps_root"/.herd/*.sh \
+    "$_ps_root"/herd.sh \
+    "$_ps_root"/install.sh; do
     [ -f "$_ps_f" ] && _ps_files+=("$_ps_f")
   done
   [ -f "$_ps_root/bin/herd" ] && _ps_files+=("$_ps_root/bin/herd")
