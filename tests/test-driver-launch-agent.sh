@@ -75,8 +75,18 @@ emit(){ for a in "$@"; do printf '[%s]\n' "$a"; done; }
       if [ "$a" = "--SEP--" ]; then seen=1; continue; fi
       if [ "$seen" = 0 ]; then got+=("$a"); else exp+=("$a"); fi
     done
-    if ! diff <(herd_driver_launch_agent "${got[@]}") <(emit "${exp[@]}") >/dev/null; then
-      echo "FAIL: $label not byte-identical"; diff <(herd_driver_launch_agent "${got[@]}") <(emit "${exp[@]}"); exit 1
+    # Capture BOTH sides once, then compare the strings. The old form ran the launcher inside a
+    # process substitution — twice, once more to render the diff — and `exit 1` then tore those
+    # async producers down while the stub herdr was still writing, so every failure buried its own
+    # diff under a wall of 'printf: write error: Broken pipe'. Same EPIPE family this PR exists to
+    # remove (HERD-441); here the early-exiting reader is the dying subshell, not a `grep -q`.
+    local got_out exp_out
+    got_out="$(herd_driver_launch_agent "${got[@]}")"
+    exp_out="$(emit "${exp[@]}")"
+    if [ "$got_out" != "$exp_out" ]; then
+      echo "FAIL: $label not byte-identical"
+      diff <(printf '%s\n' "$exp_out") <(printf '%s\n' "$got_out") || true
+      exit 1
     fi
   }
 
