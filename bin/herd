@@ -2478,6 +2478,29 @@ _config_file_has_key() {
     END { exit(found?0:1) }' "$1"
 }
 
+# ── THE OVERLAY-PRECEDENCE PAIR (HERD-47 load order, read side) ─────────────────────────────────
+# .herd/config is sourced FIRST and .herd/config.local SECOND, so a key assigned in the overlay WINS
+# at load time no matter what the baseline says. Any caller that reports a key's current value, or
+# decides which layer to write, must resolve through these two — an inline baseline read is how a
+# report comes to claim a value the engine will never see (and how a write lands in a layer nothing
+# reads). ONE implementation each, per the reconciled-invariant rule.
+
+# _config_key_pinned_local <local_cfg> <KEY> → exit 0 iff the per-user overlay ASSIGNS KEY (so the
+# overlay is the layer that wins for it). Absent overlay file → 1, silently.
+_config_key_pinned_local() {
+  [ -f "$1" ] || return 1
+  _config_file_has_key "$1" "$2"
+}
+
+# _config_effective_value <cfg> <local_cfg> <KEY> → the value that WINS at load time: the overlay's
+# when it assigns KEY (even to the empty string), else the committed baseline's.
+_config_effective_value() {
+  if _config_key_pinned_local "$2" "$3"; then
+    _config_file_value "$2" "$3"; return 0
+  fi
+  _config_file_value "$1" "$3"
+}
+
 # _config_put_value <cfg> <KEY> <VALUE> [QUOTE] — idempotent, targeted in-place write of KEY="VALUE"
 # (or KEY='VALUE' when QUOTE is a single quote — HERD-413) into the config: replaces the FIRST KEY=
 # line (preserving its leading indentation) or appends when absent, leaving every other line and
@@ -3431,23 +3454,46 @@ _gov_parse_and_validate() {
   return 0
 }
 
-# _gov_apply_pairs <root> <cfg> <caps> <pairs> <assume_yes> <file> — apply already-validated KEY<TAB>VALUE
-# pairs. With assume_yes=1 every key is applied non-interactively (journaled); otherwise each key is
-# PROPOSED with the profile line as evidence and a current→proposed diff, accept / edit / decline.
+# _gov_apply_pairs <root> <cfg> <caps> <pairs> <assume_yes> <file> [<effective_layer>] — apply
+# already-validated KEY<TAB>VALUE pairs. With assume_yes=1 every key is applied non-interactively
+# (journaled); otherwise each key is PROPOSED with the profile line as evidence and a
+# current→proposed diff, accept / edit / decline.
 # Every write goes through cmd_config_set under HERD_INIT_DEFER_APPLY=1, so a multi-key profile never
 # triggers N watcher restarts mid-apply; a single 'herd reload' hint is printed at the end when any
 # applied key is watcher/render-affecting (suppressed under init, which launches fresh). Declining
 # every key leaves .herd/config byte-identical. Iterates by line INDEX (not a here-string wrapping the
 # loop) so _ground_ask keeps reading the REAL stdin for the interactive prompts.
+#
+# <effective_layer> (optional, default 0 — every existing caller is byte-identical to before it
+# existed) fixes the OVERLAY-SHADOW hazard: `.herd/config` and `.herd/config.local` are BOTH sourced,
+# overlay last, so a key the operator pinned with `herd config set --local` WINS at load time. A bulk
+# apply that writes only the baseline for such a key changes nothing an engine will ever read, yet
+# still reports "applied" — an affirmative claim of a state transition that did not happen (and the
+# HERD-285 shadow warning that would say so is swallowed by the `>/dev/null 2>&1` below). With
+# effective_layer=1 the write is routed to the layer that actually WINS: a key already pinned in the
+# overlay is set with `--local`, so the value the caller computed its delta against is the value it
+# changes. Every applied line names the layer it landed in, so the report cannot outrun the write.
 _gov_apply_pairs() {
-  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6"
+  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6" effective_layer="${7:-0}"
   local applied=0 needs_reload=0 np i rec key val cur requires ans
+  local local_cfg; local_cfg="$(dirname "$cfg")/config.local"
+  local set_flags layer_note
   np="$(printf '%s' "$pairs" | grep -c . || true)"
   for (( i=1; i<=np; i++ )); do
     rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
     IFS=$'\t' read -r key val <<< "$rec"
     [ -n "$key" ] || continue
-    cur="$(_config_file_value "$cfg" "$key")"
+    # Target the WINNING layer when the caller asked for it (see the header). Under the default
+    # effective_layer=0 no flag is added and `cur` is the baseline value — byte-identical to before.
+    set_flags=""; layer_note=""
+    if [ "$effective_layer" = "1" ] && _config_key_pinned_local "$local_cfg" "$key"; then
+      set_flags="--local"; layer_note=" ${c_dim}(.herd/config.local — the layer that wins)${c_rst}"
+    fi
+    if [ "$effective_layer" = "1" ]; then
+      cur="$(_config_effective_value "$cfg" "$local_cfg" "$key")"
+    else
+      cur="$(_config_file_value "$cfg" "$key")"
+    fi
     if [ "$assume_yes" -ne 1 ]; then
       say ""
       say "  ${c_bold}${key}${c_rst}"
@@ -3467,10 +3513,11 @@ _gov_apply_pairs() {
       esac
     fi
     requires="$(_config_key_requires "$caps" "$key" 2>/dev/null || true)"
-    if ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set "$key" "$val" >/dev/null 2>&1 ); then
+    # shellcheck disable=SC2086  # set_flags is a single controlled literal ('' or --local), never user text
+    if ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set $set_flags "$key" "$val" >/dev/null 2>&1 ); then
       applied=$((applied+1))
       case "$requires" in watcher|render) needs_reload=1 ;; esac
-      ok "applied ${key}=\"${val}\""
+      ok "applied ${key}=\"${val}\"${layer_note}"
       if [ "$assume_yes" -eq 1 ]; then
         local wt; wt="$( ( . "$cfg" 2>/dev/null; printf '%s' "${WORKTREES_DIR:-}" ) )"
         { type journal_append >/dev/null 2>&1 && WORKTREES_DIR="$wt" journal_append governance_applied key "$key" value "$val" profile "$(basename "$file")"; } || true
@@ -3537,6 +3584,18 @@ cmd_governance_apply() {
 # a single defect refuses the command with ZERO writes. Only then is the full current→new delta
 # printed and the bundle applied.
 #
+# OVERLAY PRECEDENCE, on BOTH sides of the report: .herd/config.local is sourced after .herd/config,
+# so a key the operator pinned with `herd config set --local` WINS at load time. The delta reads the
+# EFFECTIVE value through _config_effective_value and names the layer each change will land in, and
+# the apply routes the write to that same layer (_gov_apply_pairs effective_layer=1). Without that
+# pairing a pinned key would be "applied" to a baseline nothing reads — the report claiming a
+# transition the engine never sees, which for MERGE_POLICY means a drain that silently never merges.
+#
+# EARNED SUCCESS: after applying, every key in the bundle is RE-READ at its effective value and
+# compared to the bundle. A key that did not take is named with its shadowing layer and the command
+# exits non-zero WITHOUT rebuilding the watcher — an apply never announces a posture the project is
+# not actually on.
+#
 # FRESH WATCHER (the sticky-env hazard): a running watcher inherits the environment it was STARTED
 # with, so a lever flipped in .herd/config underneath it can be shadowed by the stale exported value
 # for the rest of that watcher's life — the apply looks applied and the lever never takes. Applying a
@@ -3601,17 +3660,6 @@ cmd_posture_show() {
   say "  ${c_dim}apply to this project: herd posture apply $name${c_rst}"
   [ -n "$steps" ] && say "  ${c_dim}(also seeds .herd/steps.tsv from STEPS_PROFILE=$steps when absent)${c_rst}"
   return 0
-}
-
-# _posture_effective_value <cfg> <local_cfg> <key> — the value that WINS at load time: the per-user
-# overlay .herd/config.local when it pins the key, else the committed baseline. The delta must be
-# printed against what the engine actually reads, not against the baseline a `--local` key shadows.
-_posture_effective_value() {
-  local cfg="$1" local_cfg="$2" key="$3"
-  if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg" 2>/dev/null; then
-    _config_file_value "$local_cfg" "$key"; return 0
-  fi
-  _config_file_value "$cfg" "$key"
 }
 
 cmd_posture_apply() {
@@ -3690,20 +3738,30 @@ cmd_posture_apply() {
   say ""
 
   # ── 2. THE FULL DELTA — every key in the bundle, changing or not, against the EFFECTIVE value ──
-  local i rec cur changed=0 watcher_affecting=0 requires changed_pairs=""
+  # The delta reads the EFFECTIVE value (overlay-precedence aware) and NAMES the layer each change
+  # will land in — the same layer resolution the apply below uses, so the report can never describe a
+  # transition the write does not make.
+  local i rec cur changed=0 watcher_affecting=0 requires changed_pairs="" layer
   say "  ${c_bold}config delta${c_rst} ${c_dim}($n key(s) from $(basename "$(posture_file)"))${c_rst}"
   for (( i=1; i<=n; i++ )); do
     rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
     IFS=$'\t' read -r k v <<< "$rec"
     [ -n "$k" ] || continue
-    cur="$(_posture_effective_value "$cfg" "$local_cfg" "$k")"
+    cur="$(_config_effective_value "$cfg" "$local_cfg" "$k")"
     requires="$(_config_key_requires "$caps" "$k" 2>/dev/null || true)"
     if [ "$cur" = "$v" ]; then
       say "    ${c_dim}${k}  \"${v}\"  (unchanged)${c_rst}"
     else
       changed=$((changed+1))
       changed_pairs="${changed_pairs}${rec}"$'\n'
-      say "    ${c_bold}${k}${c_rst}  \"${cur}\" ${c_dim}→${c_rst} \"${v}\""
+      if _config_key_pinned_local "$local_cfg" "$k"; then
+        layer=" ${c_dim}→ .herd/config.local (the layer that wins for this key)${c_rst}"
+      elif [ "$(_config_key_scope "$caps" "$k")" = "machine" ]; then
+        layer=" ${c_dim}→ .herd/config.local (machine-scoped)${c_rst}"
+      else
+        layer=""
+      fi
+      say "    ${c_bold}${k}${c_rst}  \"${cur}\" ${c_dim}→${c_rst} \"${v}\"${layer}"
       case "$requires" in watcher|render) watcher_affecting=1 ;; esac
     fi
   done
@@ -3734,10 +3792,39 @@ cmd_posture_apply() {
   # HERD_INIT_DEFER_APPLY=1 for the whole batch: it suppresses the per-key watcher restart AND
   # _gov_apply_pairs's trailing "run herd reload" hint, because this command owns the reload itself
   # (step 5) rather than leaving it as a chore.
+  # effective_layer=1: a key the operator pinned with `herd config set --local` WINS at load time, so
+  # writing only the baseline for it would change nothing the engine ever reads while still printing
+  # "applied". Route each write to the layer the delta above was computed against.
   export HERD_INIT_DEFER_APPLY=1
-  _gov_apply_pairs "$root" "$cfg" "$caps" "$changed_pairs" 1 "$(posture_file)"
+  _gov_apply_pairs "$root" "$cfg" "$caps" "$changed_pairs" 1 "$(posture_file)" 1
   unset HERD_INIT_DEFER_APPLY
   [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
+
+  # ── 4b. VERIFY, don't assert — re-read what the engine will now LOAD ───────────────────────────
+  # An apply that reports success it did not achieve is worse than one that fails loudly: the operator
+  # believes full-auto is on while the drain quietly stalls. So the success claim is EARNED here, by
+  # re-reading every changed key's effective (overlay-precedence) value and comparing it to the
+  # bundle. Anything that did not take is named, with its shadowing layer, and the command exits
+  # non-zero instead of announcing a posture the project is not on.
+  local unapplied=0 got
+  for (( i=1; i<=n; i++ )); do
+    rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+    IFS=$'\t' read -r k v <<< "$rec"
+    [ -n "$k" ] || continue
+    got="$(_config_effective_value "$cfg" "$local_cfg" "$k")"
+    [ "$got" = "$v" ] && continue
+    unapplied=$((unapplied+1))
+    if _config_key_pinned_local "$local_cfg" "$k"; then
+      warn "$k did NOT take: the engine will load \"$got\" from .herd/config.local, not the posture's \"$v\". Fix it with: herd config set --local $k $v"
+    else
+      warn "$k did NOT take: the engine will load \"$got\", not the posture's \"$v\" — 'herd config set' rejected or could not place the write."
+    fi
+  done
+  if [ "$unapplied" -gt 0 ]; then
+    say ""
+    die "posture '$name' is NOT fully applied — $unapplied key(s) above do not hold their bundle value at load time. Refusing to report the posture as active (and skipping the watcher rebuild, which would only bake in the wrong values)."
+  fi
+  ok "verified: all $changed changed key(s) now hold their bundle value at load time"
 
   # ── 5. FRESH WATCHER — defeat the sticky-env shadow (see the header note) ──────────────────────
   if [ "$no_reload" -eq 1 ]; then

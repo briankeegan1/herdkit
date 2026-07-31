@@ -164,14 +164,15 @@ grep -q 'MERGE_POLICY' <<< "$OUT"  || fail "B6: the delta does not name MERGE_PO
 grep -q '→' <<< "$OUT"             || fail "B6: the delta printed no current→new arrows"
 ok "B6 apply prints the full current→new config delta"
 
-# Every lever actually landed — in the committed baseline or the per-user overlay, per its scope.
-EFFECTIVE="$(cat "$P/.herd/config" "$P/.herd/config.local" 2>/dev/null)"
+# Every lever must hold its bundle value where the ENGINE will read it. Assert through `herd config
+# get`, which resolves .herd/config.local over .herd/config exactly as load time does — NOT by
+# grepping the two files together, which would pass on a baseline write a pinned overlay shadows.
 for kv in $EXPECTED; do
   k="${kv%%=*}"; v="${kv#*=}"
-  grep -qE "^[[:space:]]*$k=\"?$v\"?$" <<< "$EFFECTIVE" \
-    || fail "B7: $k did not land as \"$v\" in .herd/config[.local]"
+  GOT="$(_herd "$P" config get "$k" 2>/dev/null | tail -1)"
+  [ "$GOT" = "$v" ] || fail "B7: $k reads \"$GOT\" at load time, not the posture's \"$v\""
 done
-ok "B7 all 18 levers landed in .herd/config / .herd/config.local"
+ok "B7 all 18 levers hold their bundle value at LOAD TIME (overlay precedence resolved)"
 
 _herd "$P" config lint >/dev/null 2>&1 || fail "B8: 'herd config lint' is red on an applied-yolo config"
 ok "B8 herd config lint is clean against an applied-yolo fixture"
@@ -196,6 +197,50 @@ GUARD_RC=0
 ( cd "$WT" && HERD_NONINTERACTIVE=1 bash "$HERD" posture apply --yes --no-reload yolo ) >/dev/null 2>&1 || GUARD_RC=$?
 [ "$GUARD_RC" -eq 3 ] || fail "B11: 'posture apply' from a builder worktree was not refused by the context guard (rc=$GUARD_RC)"
 ok "B11 the context guard refuses 'posture apply' from a builder worktree"
+
+# ── B12. OVERLAY SHADOW — the apply must change the layer that WINS, not one nothing reads ────────
+# .herd/config.local is sourced after .herd/config, so a key the operator pinned with
+# `herd config set --local` wins at load time. An apply that writes only the baseline for such a key
+# changes nothing the engine ever reads, yet would still print "applied" — an affirmative claim of a
+# transition that never happened. For MERGE_POLICY that means the drain silently never merges while
+# the operator believes full-auto is on. Reproduce that exact setup and assert the EFFECTIVE value.
+S="$T/shadow"; _mkproj "$S"
+# HERD_INIT_DEFER_APPLY=1 only skips the live external-consistency probe (offline hermetic run); the
+# validated write path, and the overlay routing being asserted, are the real ones.
+( cd "$S" && HERD_NONINTERACTIVE=1 HERD_INIT_DEFER_APPLY=1 bash "$HERD" config set --local MERGE_POLICY approve ) >/dev/null 2>&1 \
+  || fail "B12: could not pin MERGE_POLICY in the per-user overlay"
+[ "$(_herd "$S" config get MERGE_POLICY 2>/dev/null | tail -1)" = approve ] \
+  || fail "B12: the fixture did not end up with an overlay-shadowed MERGE_POLICY"
+
+SOUT="$(_herd "$S" posture apply --yes --no-reload yolo 2>&1)" || fail "B12: apply failed on the shadowed fixture"
+[ "$(_herd "$S" config get MERGE_POLICY 2>/dev/null | tail -1)" = auto ] \
+  || fail "B12: MERGE_POLICY still reads \"$(_herd "$S" config get MERGE_POLICY 2>/dev/null | tail -1)\" at load time — the apply wrote a layer the overlay shadows"
+grep -q 'config.local' <<< "$SOUT" || fail "B12: the report never named the overlay layer it wrote"
+# Every other non-machine-scoped lever must land at load time too, shadowed key or not.
+for kv in $EXPECTED; do
+  k="${kv%%=*}"; v="${kv#*=}"
+  [ "$(_herd "$S" config get "$k" 2>/dev/null | tail -1)" = "$v" ] \
+    || fail "B12: $k does not read \"$v\" at load time after the apply"
+done
+ok "B12 an overlay-pinned key is applied to the layer that WINS — the effective value really changes"
+
+# ── B13. EARNED SUCCESS — never report a posture the project is not on ────────────────────────────
+# The bundle pre-validation and `herd config set` are not the same check: the setter also refuses,
+# e.g., a MODEL_* ref whose driver prefix ships no driver definition. When a key does not take, the
+# apply must name it and exit NON-ZERO rather than announce the posture as applied.
+REFTBL="$T/badref-postures.tsv"
+printf 'name\tkeys\tintent\n' > "$REFTBL"
+printf 'badref\tMODEL_REVIEW=nosuchdriver:m1\ta driver prefix that ships no driver definition\n' >> "$REFTBL"
+V="$T/verify"; _mkproj "$V"
+BEFORE_MR="$(_herd "$V" config get MODEL_REVIEW 2>/dev/null | tail -1)"
+VOUT="$( cd "$V" && HERD_NONINTERACTIVE=1 POSTURES_FILE="$REFTBL" bash "$HERD" posture apply --yes --no-reload badref 2>&1 )" \
+  && fail "B13: apply reported success for a key the setter refused"
+grep -q 'did NOT take' <<< "$VOUT"      || fail "B13: the un-applied key was not named"
+grep -q 'NOT fully applied' <<< "$VOUT" || fail "B13: the apply did not refuse to report the posture as active"
+grep -q 'control room rebuilt' <<< "$VOUT" && fail "B13: the watcher was rebuilt despite the posture not applying"
+[ "$(_herd "$V" config get MODEL_REVIEW 2>/dev/null | tail -1)" = "$BEFORE_MR" ] \
+  || fail "B13: the refused value landed anyway"
+ok "B13 a key that does not take is named and the apply exits non-zero without claiming the posture"
 
 # ── C. the RENDER carries drain mode ──────────────────────────────────────────────────────────────
 R="$T/render"; _mkproj "$R"
