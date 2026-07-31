@@ -342,4 +342,29 @@ sys.exit(0)
 GATE
 ok
 
+# ── 10. the HELD-AND-READY console row (HERD-442) ────────────────────────────────────────────────
+# A gates-green PR held on a human used to paint `🩺 health-check` forever: the render leg had no row
+# for a hold (bash painted one from the action pass, deleted at P5b), so the engine waited on a human
+# and said nothing — indistinguishable from a wedged watcher. The row is now driven by the SAME
+# awaiting ledger row the engine writes and `herd approve` reads, so the console and the gate can
+# never disagree about whether something is held.
+rm -f "$APPROVALS"
+approval_awaiting_noted 100 "$SHA_A" && fail "(10) no ledger row must mean no hold row"
+ok
+printf '1000 awaiting 100 %s\n' "$SHA_A" > "$APPROVALS"
+approval_awaiting_noted 100 "$SHA_A" || fail "(10) the awaiting row must drive the held row"
+approval_awaiting_noted 100 "deadbeef" && fail "(10) the row is sha-keyed: a new commit re-holds"
+ok
+# The label the row carries, for each policy. Under auto the ONLY thing that can hold a gates-green PR
+# is a human-verify block, so the row must say so and name the release command.
+MERGE_POLICY=auto _p="$(_effective_merge_policy)"; [ "$_p" = auto ] || fail "(10) precondition"
+printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'human-verify pending' \
+  || fail "(10) an auto-policy hold must be labelled human-verify: $(_hold_ready_label 1 100 hold)"
+printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'approve 100' \
+  || fail "(10) the held row must name the release command"
+printf '%s' "$(_hold_ready_label "" 100)" | grep -q 'awaiting approval' \
+  || fail "(10) an approve-policy hold keeps the generic wording"
+ok
+rm -f "$APPROVALS"
+
 echo "ALL PASS ($pass checks)"
