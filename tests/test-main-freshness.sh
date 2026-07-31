@@ -235,21 +235,33 @@ ok
 
 # ── (11) RECOVERED: a held row whose condition healed clears within ONE tick (HERD-259) ───────────
 # The 2026-07-09 incident, reproduced: the file says 'dirty-tree 4 0'; the checkout is clean + current.
+#
+# HERD-455 / GH #569 UPDATE: the RENDER no longer paints a row it can observe to be false, so this
+# fixture no longer has a "still painting" moment to assert. That is the fix, not a weakening — the
+# render-tick reconcile is what makes the row clear WITHOUT a restart and without depending on any of
+# _main_fresh_recheck's early returns. Both halves are asserted here: the render drops it (and journals
+# the recovery exactly once), and the recheck path clears an identical hold on its own too.
 reset_state
 git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
 git -C "$MAIN" reset -q --hard origin/main
 _main_fresh_hold dirty-tree 4 0
 : > "$JLOG"
 build_main_freshness
-case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) ;; *) fail "(11) fixture did not paint a held row" ;; esac
-_main_fresh_recheck
-[ ! -e "$MAIN_FRESH_STATE" ] || fail "(11) clean+current MAIN kept its held state file: $(cat "$MAIN_FRESH_STATE")"
+[ -z "${MAIN_FRESHNESS:-}" ] || fail "(11) the render painted a row observed git state disproves: $MAIN_FRESHNESS"
+[ ! -e "$MAIN_FRESH_STATE" ] || fail "(11) the render left the disproved state file: $(cat "$MAIN_FRESH_STATE")"
 jhas 'main_fresh_recovered reason dirty-tree was_behind 4 was_ahead 0' \
                                || fail "(11) missing main_fresh_recovered journal: $(cat "$JLOG")"
 build_main_freshness
 [ -z "${MAIN_FRESHNESS:-}" ]   || fail "(11) the row outlived its state file: $MAIN_FRESHNESS"
-_main_fresh_recheck            # the transition journals ONCE; a recovered tick is byte-inert thereafter
 [ "$(jcount 'main_fresh_recovered')" = "1" ] || fail "(11) recovery re-journaled: $(jcount 'main_fresh_recovered') lines"
+# …and the HERD-259 recovery path is untouched: an identical hold clears on the recheck alone.
+_main_fresh_hold dirty-tree 4 0
+: > "$JLOG"
+_main_fresh_recheck
+[ ! -e "$MAIN_FRESH_STATE" ] || fail "(11) clean+current MAIN kept its held state file: $(cat "$MAIN_FRESH_STATE")"
+jhas 'main_fresh_recovered'    || fail "(11) the recheck path stopped journaling recovery"
+_main_fresh_recheck            # the transition journals ONCE; a recovered tick is byte-inert thereafter
+[ "$(jcount 'main_fresh_recovered')" = "1" ] || fail "(11) recheck recovery re-journaled"
 ok
 
 # ── (12) it clears ABOVE the defers that used to strand it ────────────────────────────────────────

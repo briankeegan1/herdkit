@@ -1497,6 +1497,78 @@ class TestLiveGateStatusPost(LiveCase):
         self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "off"}), 0)  # byte-inert
 
 
+class TestGateStatusPendingLever(LiveCase):
+    """HERD-453 count 4: GATE_STATUS_PENDING posts `herd/gates`=pending at GATE-CYCLE START so the PR
+    page explains its 'Expected — waiting' row instead of leaving it unattributed. SHIP-DORMANT and
+    STRICT — off (the default) and every unrecognized value are byte-inert, preserving the SUCCESS-ONLY
+    contract that keeps a CLEAN sha out of mergeStateStatus=UNSTABLE. Hermetic: subprocess is stubbed."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_lever_is_strict_and_defaults_off(self):
+        self.assertFalse(LR._gate_status_pending_enabled({}))
+        self.assertFalse(LR._gate_status_pending_enabled({"GATE_STATUS_PENDING": ""}))
+        self.assertFalse(LR._gate_status_pending_enabled({"GATE_STATUS_PENDING": "onn"}))
+        self.assertFalse(LR._gate_status_pending_enabled({"GATE_STATUS_PENDING": "off"}))
+        for token in ("on", "ON", "1", "true", "yes", "enabled"):
+            self.assertTrue(LR._gate_status_pending_enabled({"GATE_STATUS_PENDING": token}), token)
+
+    def test_pending_post_shape_and_journal(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        self.assertTrue(act.post_gate_status_pending(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        api = [c for c in sub.calls if any("statuses/deadbeef" in str(a) for a in c)][0]
+        self.assertIn("state=pending", api)
+        self.assertIn("context=herd/gates", api)
+        self.assertIn("description=review in progress", api)
+        gs = [o for o in events(self.jpath) if o["event"] == "gate_status"]
+        self.assertEqual([o["state"] for o in gs], ["pending"])
+
+    def test_failed_pending_post_journals_nothing_and_retries(self):
+        sub = _RecordingSub(fail={"api"})
+        act = self._actuator(sub)
+        self.assertFalse(act.post_gate_status_pending(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse([o for o in ev if o["event"] == "gate_status"])
+
+    def test_tick_posts_pending_once_when_on_and_never_when_off(self):
+        """MUTATION PROOF: with the lever ON a candidate entering the gate DAG posts pending exactly
+        once across re-walks; OFF (and with GATE_STATUS=off) it is byte-inert — zero posts."""
+
+        class Recorder(DryRunActuator):
+            def __init__(self, journal):
+                super().__init__(journal)
+                self.pending = 0
+
+            def post_gate_status_pending(self, cand):
+                self.pending += 1
+                self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "pending",
+                                    "context", "herd/gates")
+                return True
+
+        def run(config):
+            self.tmp = tempfile.mkdtemp()
+            self.jpath = os.path.join(self.tmp, "live-test.jsonl")
+            journal = LiveJournal(self.jpath)
+            rec = Recorder(journal)
+            for _ in range(2):    # re-walk the SAME (pr,sha): the ledger marker must suppress a repost
+                LiveTick(config,
+                         FixtureDiscovery({"candidates": [self.one(1, review=None, health=None)]}),
+                         FixtureGates({"candidates": [self.one(1, review=None, health=None)]}),
+                         rec, journal, state=LiveState(self.tmp)).run()
+            return rec.pending
+
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "on",
+                              "GATE_STATUS_PENDING": "on"}), 1)
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "on"}), 0)          # default off
+        self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "off",
+                              "GATE_STATUS_PENDING": "on"}), 0)   # requires the master lever
+
+
 class _XseatSub:
     """Subprocess stand-in scripting the gh reads/writes the cross-seat guard (HERD-446) and the
     ordinary merge/post-status actuation make — proves the guard end-to-end through the REAL

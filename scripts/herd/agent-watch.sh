@@ -1009,11 +1009,20 @@ _engine_seat_reconcile_tick() {
 # number to attribute the break to (the sha is recorded as "?"). Printing "(since #?)" would name a PR
 # that does not exist, so a non-numeric since renders "(observed)" instead: the row says WHAT is red and
 # admits it does not know WHO broke it, rather than pointing at a fictional PR.
+#
+# HONEST 'sha' (HERD-453): the verdict is PINNED to the sha that produced it, and nothing in the row ever
+# said so. Live 2026-07-31: 'MAIN RED — BATS FAILED (observed)' rendered for sha 312b9220 while origin/main
+# stood at db00ee4 — THREE merges later — because the re-verify for every sha since had been starved on
+# the health slot. The row was not false, but it was unqualified, so it read as a statement about the main
+# an operator can `git pull` right now. A verdict whose sha is not the observed HEAD now renders BOTH shas
+# and an ·outdated· qualifier, plus (when the re-verify that would settle it is being deferred) what it is
+# waiting on and for how long. Byte-identical whenever the verdict IS current — the ONLY case in which
+# the pre-HERD-453 row was the whole truth.
 build_main_health() {
   MAIN_HEALTH=""
   _main_health_enabled || return 0
   [ -s "$MAIN_HEALTH_STATE" ] || return 0
-  local _bm_sha _bm_since _bm_local _bm_ci _bm_fail _bm_attr
+  local _bm_sha _bm_since _bm_local _bm_ci _bm_fail _bm_attr _bm_qual="" _bm_head _bm_defer
   IFS=$'\x1f' read -r _bm_sha _bm_since _bm_local _bm_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
   _bm_fail="$_bm_local"; [ -n "$_bm_fail" ] || _bm_fail="$_bm_ci"
   [ -n "${_bm_fail:-}" ] || _bm_fail="unknown"
@@ -1021,7 +1030,13 @@ build_main_health() {
     ''|*[!0-9]*) _bm_attr="observed" ;;
     *)           _bm_attr="since #${_bm_since}" ;;
   esac
-  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(${_bm_attr})${C_RESET}"$'\n'
+  if [ "$(_main_health_verdict_state "${_bm_sha:-}")" = "outdated" ]; then
+    _bm_head="$(_main_health_observed_sha)"
+    _bm_qual="${C_DIM} · sha ${_bm_sha:0:7} ·outdated· main is at ${_bm_head:0:7}${C_RESET}"
+    _bm_defer="$(_main_health_defer_note)"
+    [ -n "$_bm_defer" ] && _bm_qual="${_bm_qual}${C_DIM} · ${_bm_defer}${C_RESET}"
+  fi
+  MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(${_bm_attr})${C_RESET}${_bm_qual}"$'\n'
 }
 
 # build_main_freshness — the MAIN-checkout freshness rows (HERD-233), both read from state files the
@@ -1029,6 +1044,17 @@ build_main_health() {
 # (2) a "restart recommended" note when a fast-forward pulled engine code this watcher process is no
 # longer running. Both files are absent on the happy path, so a fresh $MAIN renders NOTHING and the
 # console stays byte-identical to before this feature.
+#
+# RENDER-TICK RECONCILE (HERD-455 / GitHub issue #569): the row is a LEDGER read, and every mechanism
+# that invalidates that ledger — _main_fresh_recheck, reconcile_main_freshness — sits BESIDE this
+# function behind its own stack of early returns ($MAIN off-branch, an unreadable upstream ref, DRYRUN,
+# a live gate marker, a failed fetch). Any one of them silently blind ⇒ the render keeps painting a
+# verdict the tree has already disproved, restart included (the startup one-shot runs the same guarded
+# recheck). Live: `dirty-tree 0 1` painted for 10+ minutes of a provably clean tree across two watcher
+# restarts, and only `rm` of the state file cleared it. So the RENDER now verifies the claim it is about
+# to paint, from the ONE shared _main_fresh_reason_disproved check — a disproved row is dropped here,
+# on this tick, no matter which reconcile guard is blind. Byte-identical whenever the row is accurate
+# (the check is only reached when a row is held, and only ever WITHHOLDS a paint, never adds one).
 build_main_freshness() {
   MAIN_FRESHNESS=""
   local _bf_reason _bf_b _bf_a _bf_up _bf_why _bf_delta
@@ -1036,6 +1062,15 @@ build_main_freshness() {
   _bf_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
   if [ -s "${MAIN_FRESH_STATE:-}" ]; then
     read -r _bf_reason _bf_b _bf_a < "$MAIN_FRESH_STATE" 2>/dev/null || return 0
+    if _main_fresh_reason_disproved "${_bf_reason:-}"; then
+      # Observed git state disproves the stored verdict. Drop the ledger (journaling the recovery ONCE,
+      # exactly as the recheck path does) and render nothing for it. Under DRYRUN nothing is mutated —
+      # an observation run still refuses to paint the disproved row, it just leaves the file alone.
+      [ -n "${DRYRUN:-}" ] || _main_fresh_recovered
+      _bf_reason=""
+    fi
+  fi
+  if [ -n "${_bf_reason:-}" ]; then
     case "${_bf_reason:-}" in
       dirty-tree)    _bf_why="uncommitted changes in the checkout · commit or stash them" ;;
       local-commits) _bf_why="local commits nobody generated · rebase or push them by hand" ;;
@@ -5170,6 +5205,30 @@ _spawn_resolver_lane() {
 # spawned resolver has not yet registered its pid. Overridable so the sim can zero it out.
 : "${_RESOLVER_DEAD_GRACE:=90}"
 
+# _conflict_row <idx> <slug-cell> <pr-cell> <slug> <pr#> <sha> <needs-you-what> — paint a CONFLICTING
+# PR's row through the SHARED row-truth check (HERD-453). Sets DISPLAY[idx] (and FLAIR_STATE[idx]) and
+# returns:
+#   0 — a resolver is POSITIVELY working this conflict: the row reads `resolving · awaiting push`, the
+#       flair downgrades to busy (it is engine work, not the operator's move), and the caller must NOT
+#       queue a (re)dispatch — a second resolver on the same worktree races the first on merge/push,
+#       the exact hazard _resolver_in_flight exists to prevent.
+#   1 — nobody is on it: the honest `needs you · <what>` row, byte-identical to the pre-HERD-453 line,
+#       and the caller queues its dispatch exactly as before.
+# Used at EVERY non-terminal needs-you branch of the classifier below, so the resolver-awareness cannot
+# be present on one branch and missing on the next. The TERMINAL branches (escalated, resolver-failed)
+# deliberately do NOT route through it: an ESCALATE is the resolver's own "a human must decide this"
+# verdict for the sha, and honoring a still-open pane over it would bury the escalation.
+_conflict_row() {
+  local _cr_i="$1" _cr_sl="$2" _cr_pn="$3" _cr_slug="$4" _cr_pr="$5" _cr_sha="$6" _cr_what="$7" _cr_note
+  if _cr_note="$(_active_fix_note "$_cr_pr" "$_cr_sha" "$_cr_slug" conflict)" && [ -n "$_cr_note" ]; then
+    DISPLAY[_cr_i]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${_cr_sl}${C_RESET}${_cr_pn} ${C_YELLOW}${_cr_note}${C_RESET}"
+    FLAIR_STATE[_cr_i]="busy"
+    return 0
+  fi
+  DISPLAY[_cr_i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cr_sl}${C_RESET}${_cr_pn} ${C_RED}needs you · ${_cr_what}${C_RESET}"
+  return 1
+}
+
 # _classify_conflict <idx> <pr#> <slug> <branch> <headsha> — decide what to do with a CONFLICTING PR
 # (HERD-55). Sha-keyed like the review-once gate: first conflict → auto-spawn the resolver; a NEW
 # commit that reshapes the conflict, or a resolver that DIED without clearing it, → RE-spawn for the
@@ -5233,10 +5292,10 @@ _classify_conflict() {
     fi
     # DEAD resolver — re-spawn for the same sha if budget remains, else surface needs-you.
     if [ "$count" -ge "$cap" ]; then
-      DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+      _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "resolver gave up (${cap} rounds)"
       return
     fi
-    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
     CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("dead-resolver")
     return
   fi
@@ -5244,7 +5303,7 @@ _classify_conflict() {
   # No resolver dispatched for THIS sha.
   if [ "$count" -eq 0 ]; then
     # First-ever conflict on this PR — today's hands-off auto-resolve path.
-    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+    _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
     CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("first")
     return
   fi
@@ -5259,10 +5318,10 @@ _classify_conflict() {
     return
   fi
   if [ "$count" -ge "$cap" ]; then
-    DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · resolver gave up (${cap} rounds)${C_RESET}"
+    _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "resolver gave up (${cap} rounds)"
     return
   fi
-  DISPLAY[ci]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · conflict${C_RESET}"
+  _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
   CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit")
 }
 
@@ -5917,6 +5976,49 @@ _main_fresh_recovered() {
 # still excused via herd_strip_derived. Read-only: status only, no tree mutation.
 _main_fresh_dirty_status() {
   git -C "$MAIN" status --porcelain 2>/dev/null | grep -v '^??' | cut -c4- | herd_strip_derived
+}
+
+# _main_fresh_reason_disproved <reason> — THE shared "does LIVE git state DISPROVE this stored freshness
+# verdict" check (HERD-455 / GitHub issue #569). ONE implementation, consulted by the RENDER
+# (build_main_freshness, so a disproved row can never paint) and available to any other reader of the
+# ledger. Success (rc 0) means: the tree observably contradicts <reason> RIGHT NOW.
+#
+# WHY THIS EXISTS ALONGSIDE _main_fresh_recheck. The recheck is the RECOVERY path — it re-derives and
+# re-holds the whole row, and to do that safely it needs $MAIN attached to the default branch, a
+# readable upstream ref, and a non-DRYRUN tick. Every one of those is an early return, and each is a
+# place the invalidation can go silently blind while the render happily keeps painting (the #569
+# incident: a `dirty-tree` row survived a provably clean tree for 10+ minutes AND two watcher restarts).
+# This check answers the strictly NARROWER question the render actually needs — "is what I am about to
+# say observably false?" — so it needs none of that scaffolding and cannot be starved by it.
+#
+# Only the two reasons a READ-ONLY, no-fetch probe can refute UNAMBIGUOUSLY are refutable here (the same
+# pair _main_fresh_recheck restricts itself to):
+#   • dirty-tree    — the tree is observably clean (derived files excused, via the ONE dirty classifier).
+#   • local-commits — HEAD is observably NOT ahead of the local remote-tracking ref.
+# ff-failed / rebase-failed / push-failed each assert something about a HEAL ATTEMPT, not about the tree,
+# so no read-only probe can disprove them: they are never refuted here and the reconcile below the defer
+# still owns them. Fail-soft in the SAFE direction throughout — an unreadable repo, an absent upstream
+# ref, or a non-numeric count returns 1 (NOT disproved), so a doubtful read leaves a real hold standing.
+_main_fresh_reason_disproved() {
+  local _fd_reason="${1:-}" _fd_up _fd_counts _fd_ahead
+  [ -n "${MAIN:-}" ] || return 1
+  { [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ]; } || return 1
+  case "$_fd_reason" in
+    dirty-tree)
+      [ -z "$(_main_fresh_dirty_status)" ] || return 1
+      return 0
+      ;;
+    local-commits)
+      _fd_up="${HERD_REMOTE:-origin}/${HERD_BRANCH_NAME:-main}"
+      git -C "$MAIN" rev-parse --verify --quiet "$_fd_up" >/dev/null 2>&1 || return 1
+      _fd_counts="$(git -C "$MAIN" rev-list --left-right --count "HEAD...$_fd_up" 2>/dev/null || true)"
+      _fd_ahead="$(printf '%s' "$_fd_counts" | awk '{print $1}')"
+      case "${_fd_ahead:-x}" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$_fd_ahead" -eq 0 ] || return 1
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 # _main_fresh_recheck — the OBSERVED-state recovery probe (HERD-259). The held row is a STATE FILE, and
@@ -6575,6 +6677,75 @@ _main_health_ci_gate_enabled() {
   esac
 }
 
+# ── VERDICT-vs-OBSERVED truth (HERD-453 count 2) ──────────────────────────────────────────────────
+# $MAIN_HEALTH_STATE pins a verdict to the sha that produced it. Three shared checks keep every reader
+# of that ledger honest about whether the pin still describes the main an operator can pull:
+
+# _main_health_observed_sha — $MAIN's CURRENT HEAD, or empty when it cannot be read. The ONE place the
+# observed-main sha is resolved for the truth checks below, so they can never disagree about "now".
+_main_health_observed_sha() { git -C "${MAIN:-.}" rev-parse HEAD 2>/dev/null || true; }
+
+# _main_health_verdict_state <verdict-sha> — classify a pinned verdict against observed main. Echoes
+# exactly one token: `current` (the pin IS the observed HEAD), `outdated` (main has moved past it), or
+# `unknown` (no pin, or HEAD unreadable). ONLY `outdated` decorates a row — `unknown` renders exactly
+# as before, so an unreadable repo never invents a qualifier it cannot substantiate.
+_main_health_verdict_state() {
+  local _vs_sha="${1:-}" _vs_head
+  [ -n "$_vs_sha" ] || { printf 'unknown'; return 0; }
+  _vs_head="$(_main_health_observed_sha)"
+  [ -n "$_vs_head" ] || { printf 'unknown'; return 0; }
+  [ "$_vs_head" = "$_vs_sha" ] && { printf 'current'; return 0; }
+  printf 'outdated'
+}
+
+# _main_health_green_supersedes <green-sha> <pinned-sha> — is a GREEN verdict collected for <green-sha>
+# strong enough evidence to clear a RED pinned to <pinned-sha>? ANCESTOR-CLEAR:
+#   • <pinned> is an ANCESTOR of <green> (the ordinary case, and the same sha) ⇒ YES. Verifying a
+#     DESCENDANT green is strictly stronger evidence than the ancestor red: the tree that went green
+#     CONTAINS the commit that was red, so the red cannot still stand on main.
+#   • <green> is a STRICT ANCESTOR of <pinned> ⇒ NO, and this is the ONLY refusal. That green was
+#     measured on a tree the red's commit is not even in yet, so clearing on it would wipe a NEWER red
+#     with OLDER evidence — the late-collected-worker case, where a suite dispatched before the red
+#     landed reports green after it.
+#
+# EVERYTHING ELSE CLEARS, deliberately. Refusing on "not provably a descendant" would have been the
+# tempting symmetric rule and it is wrong: a REWRITTEN default branch (force-push, a rebase that
+# rewrote the sha the red is pinned to) leaves the pin dangling and unordered against every future
+# HEAD, so a "descendant required" rule would strand that MAIN RED row forever with no path back to
+# green. Unordered / diverged / unverifiable / git-unavailable therefore all fall through to the
+# pre-HERD-453 unconditional clear: a red is never stranded on a comparison we could not make, and the
+# one comparison we CAN make — provably older evidence — is the one we act on.
+_main_health_green_supersedes() {
+  local _gs_green="${1:-}" _gs_pinned="${2:-}"
+  [ -n "$_gs_green" ] || return 0
+  [ -n "$_gs_pinned" ] || return 0
+  [ "$_gs_green" = "$_gs_pinned" ] && return 0
+  git -C "${MAIN:-.}" rev-parse --verify --quiet "${_gs_green}^{commit}" >/dev/null 2>&1 || return 0
+  git -C "${MAIN:-.}" rev-parse --verify --quiet "${_gs_pinned}^{commit}" >/dev/null 2>&1 || return 0
+  git -C "${MAIN:-.}" merge-base --is-ancestor "$_gs_green" "$_gs_pinned" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+# _main_health_defer_note — the standing re-verify DEFERRAL for the sha main is at RIGHT NOW, rendered
+# as "re-verify deferred: <reason> <age> ×<attempts>", or empty when nothing is deferred for this sha.
+# The console half of the retry invariant below: a re-verify that keeps being refused a health slot is
+# the reason a red stays pinned to an old sha, and until this the operator had no way to see it (the
+# journal memo collapses the run to one line by design, so the console read as silence).
+# Empty — and byte-identical to the pre-HERD-453 row — with no defer file, an unparseable/legacy line,
+# or a defer whose sha main has already moved past (that deferral is spent, not standing).
+_main_health_defer_note() {
+  [ -s "${MAIN_HEALTH_DEFER:-}" ] || return 0
+  local _dn_sha _dn_reason _dn_first _dn_n _dn_head
+  read -r _dn_sha _dn_reason _dn_first _dn_n < "$MAIN_HEALTH_DEFER" 2>/dev/null || return 0
+  [ -n "${_dn_sha:-}" ] && [ -n "${_dn_reason:-}" ] || return 0
+  case "${_dn_first:-}" in ''|*[!0-9]*) return 0 ;; esac          # legacy 2-field memo — nothing to age
+  case "${_dn_n:-}" in ''|*[!0-9]*) _dn_n=1 ;; esac
+  _dn_head="$(_main_health_observed_sha)"
+  [ -n "$_dn_head" ] && [ "$_dn_head" = "$_dn_sha" ] || return 0
+  printf 're-verify deferred: %s %s ×%s' "$_dn_reason" \
+    "$(_fmt_age "$(( $(_now_epoch) - _dn_first ))")" "$_dn_n"
+}
+
 # _main_health_marker <sha> — the per-sha run-once marker (mirrors the sha-keyed .health-result cache):
 # a main sha whose marker exists has ALREADY been ticked, so a re-entrant merge tick / watcher restart
 # never re-runs the suite for the same commit.
@@ -6667,6 +6838,16 @@ _main_health_clear() {
   local _mc_pv_sha="" _mc_pv_since="" _mc_pv_local="" _mc_pv_ci="" _mc_own="" _mc_other=""
   if [ -s "$MAIN_HEALTH_STATE" ]; then
     IFS=$'\x1f' read -r _mc_pv_sha _mc_pv_since _mc_pv_local _mc_pv_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  fi
+  # ANCESTOR-CLEAR (HERD-453): a green is only evidence about the tree it VERIFIED. Clearing on a green
+  # whose sha is a STRICT ANCESTOR of the pinned red wipes a newer red with older evidence — a worker
+  # dispatched before the red landed and collected after it does exactly this. A green on the pinned sha
+  # or any DESCENDANT of it still clears (strictly stronger evidence), so the ordinary collect is
+  # untouched; so does an UNORDERED pair, which is what a rewritten default branch leaves behind.
+  if [ -n "$_mc_pv_sha" ] && ! _main_health_green_supersedes "$_mc_sha" "$_mc_pv_sha"; then
+    journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result infra_event reason stale-green \
+      pinned "$_mc_pv_sha" kind "$_mc_kind"
+    return 0
   fi
   case "$_mc_kind" in
     ci) _mc_own="$_mc_pv_ci"; _mc_other="$_mc_pv_local" ;;
@@ -6824,17 +7005,50 @@ _main_health_set_red() {
   _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_render" "$_sr_out"
 }
 
-# _main_health_defer <pr#> <sha> <reason> — journal a DEFERRAL (no slot, no bin) at most once per
-# (sha, reason). The reconciler re-attempts a deferred sha EVERY tick, so an unguarded journal_append
-# here would write the same "no-slot" line every ~90s for as long as a long gate holds the slot. The memo
-# collapses that run into one honest line, and re-arms the moment the sha or the reason changes.
+# Re-journal a STANDING deferral every N attempts (HERD-453). At the ~4 s tick this is ~7 min between
+# lines: enough to prove in the journal that the invariant is still retrying, nowhere near the per-tick
+# spam the memo exists to prevent. Inline constant, no config key (mirrors _MAIN_HEALTH_DIED_MAX).
+_MAIN_HEALTH_DEFER_RENOTE=100
+
+# _main_health_defer <pr#> <sha> <reason> — record a DEFERRAL (no slot, no bin) for this sha and journal
+# it on a bounded cadence. The reconciler re-attempts a deferred sha EVERY tick, so an unguarded
+# journal_append here would write the same "no-slot" line every ~4 s for as long as a long gate holds
+# the slot. The memo collapses that run, and re-arms the moment the sha or the reason changes.
+#
+# HERD-453 — THE MEMO MUST NOT LOOK LIKE SILENCE. The pre-HERD-453 memo journaled exactly ONE line per
+# (sha, reason) forever, which is indistinguishable in the journal from "tried once, then gave up". Live
+# 2026-07-31, that is precisely how it read: one `result=infra_event reason=no-slot` at 02:35:16Z for a
+# sha whose re-verify was in fact being retried every tick — and, because nothing on the console said so
+# either, a stale MAIN RED simply stood. So the memo now CARRIES the retry: the first-defer epoch and an
+# attempt counter, which (a) let _main_health_defer_note render the live "deferred: no-slot 12m ×183"
+# qualifier on the MAIN RED row, and (b) re-journal on the _MAIN_HEALTH_DEFER_RENOTE cadence so a
+# starving re-verify leaves a growing trail instead of one ambiguous line. The retry itself is unchanged
+# (reconcile_main_health re-attempts an unmarked sha every tick — see its observed-sha branch); this
+# makes that retry OBSERVABLE, which is what "every observed sha ends with a verdict" needs to be
+# auditable. The line stays whitespace-separated and is read back defensively, so a legacy 2-field memo
+# written by an older engine simply reads as "no age known" and renders nothing extra.
 _main_health_defer() {
-  local _md_pr="$1" _md_sha="$2" _md_reason="$3" _md_line _md_prev
-  _md_line="$_md_sha $_md_reason"
-  _md_prev="$(cat "$MAIN_HEALTH_DEFER" 2>/dev/null || true)"
-  printf '%s\n' "$_md_line" > "$MAIN_HEALTH_DEFER" 2>/dev/null || true
-  [ "$_md_prev" = "$_md_line" ] && return 0
-  journal_append main_health pr "$_md_pr" sha "$_md_sha" result infra_event reason "$_md_reason"
+  local _md_pr="$1" _md_sha="$2" _md_reason="$3"
+  local _md_pv_sha="" _md_pv_reason="" _md_pv_first="" _md_pv_n="" _md_first _md_n _md_now
+  _md_now="$(_now_epoch)"
+  # `[ -s ]` FIRST, not `read … < "$f" 2>/dev/null`: a failed INPUT redirection is reported by the shell
+  # itself, and the `2>` that would silence it is applied after the `<` that fails, so the diagnostic
+  # escapes to the real stderr and lands in the operator's console.
+  if [ -s "$MAIN_HEALTH_DEFER" ]; then
+    read -r _md_pv_sha _md_pv_reason _md_pv_first _md_pv_n < "$MAIN_HEALTH_DEFER" 2>/dev/null || true
+  fi
+  if [ "$_md_pv_sha" = "$_md_sha" ] && [ "$_md_pv_reason" = "$_md_reason" ]; then
+    _md_first="$_md_pv_first"; case "$_md_first" in ''|*[!0-9]*) _md_first="$_md_now" ;; esac
+    _md_n="$_md_pv_n";         case "$_md_n"     in ''|*[!0-9]*) _md_n=0 ;; esac
+    _md_n=$(( _md_n + 1 ))
+  else
+    _md_first="$_md_now"; _md_n=1
+  fi
+  printf '%s %s %s %s\n' "$_md_sha" "$_md_reason" "$_md_first" "$_md_n" > "$MAIN_HEALTH_DEFER" 2>/dev/null || true
+  if [ "$_md_n" -eq 1 ] || [ $(( _md_n % _MAIN_HEALTH_DEFER_RENOTE )) -eq 0 ]; then
+    journal_append main_health pr "$_md_pr" sha "$_md_sha" result infra_event reason "$_md_reason" \
+      attempts "$_md_n" waited_s "$(( _md_now - _md_first ))"
+  fi
   return 0
 }
 
@@ -8336,10 +8550,37 @@ _escalate_refix_stuck() {
     "PR #${_ers_pr} was bounced but nobody is fixing it — ${_ers_reason}" default
 }
 
+# THE CONFLICT RAIL IS THE SAME QUESTION (HERD-453). A CONFLICTING PR's red is worked by a resolver, not
+# by the builder, and until this the conflict row consulted neither — it painted a flat "needs you ·
+# conflict" from the dispatch ledger alone. Live 2026-07-31: the console said "export-concurrency-keys
+# #565 · needs you · conflict" while `herdr agent list` showed resolve·export-concurrency-keys at
+# status=working on that exact conflict. Under STALE_BASE_AUTOFIX plus an auto-dispatched resolver
+# nothing needed the operator, so the row was wrong on both words. The fix is NOT a second copy of the
+# row-truth rule: `conflict` becomes a KIND of this one shared check, whose evidence is the resolver
+# roster instead of the refix ledger. Everything the doctrine says still holds verbatim — only a
+# POSITIVE `working` reading suppresses needs-you, an absent/blind roster falls through to the honest
+# needs-you, and a resolver that DIES or ESCALATES stops reading `working` (the escalate verdict is
+# terminal for the sha at the classifier, above this check) so the row flips back on its own.
+
+# _active_resolve_note <slug> — the CONFLICT rail's evidence leg: print the in-progress phrase and
+# return 0 iff a resolve·<slug> agent is POSITIVELY working. Reads the tick's own $AGENTS_JSON roster
+# through the SAME oracle every other resolver decision uses (_resolver_agent_status), so the row and
+# the dispatch guard can never disagree about whether a resolver is live. Any other status — idle, done,
+# absent, unreadable roster — returns 1 and the caller paints the honest needs-you.
+_active_resolve_note() {
+  [ "$(_resolver_agent_status "$1")" = "working" ] || return 1
+  printf 'resolving · awaiting push'
+}
+
 # _active_fix_note <pr#> <headSha> <slug> <kind> — print the in-progress phrase and return 0 when an
 # agent is on this red; print nothing and return 1 when nobody is.
 _active_fix_note() {
   local _afn_pr="$1" _afn_sha="$2" _afn_slug="$3" _afn_kind="$4" _afn_rounds _afn_live
+  # kind=conflict: the work-in-flight is a RESOLVER, and the refix ledger below knows nothing about it.
+  if [ "$_afn_kind" = "conflict" ]; then
+    _active_resolve_note "$_afn_slug"
+    return $?
+  fi
   if refix_attempted "$_afn_pr" "$_afn_sha" "$_afn_kind" \
      && ! _refix_stuck_seen "$_afn_pr" "$_afn_sha" "$_afn_kind"; then
     # A bounce was delivered and not disproved by a stuck marker. One more disproof: the agent may have
@@ -11893,6 +12134,50 @@ _health_running_row() {
   printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hrr_sl}${C_RESET}${_hrr_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hrr_inf")") · $(_health_inflight_note "$_hrr_log")${C_RESET}"
 }
 
+# ── LIVE GATE PHASE (HERD-453 count 4) ────────────────────────────────────────────────────────────
+# A gate row must name the phase the pipeline is ACTUALLY in, read from the engine's own state machine —
+# the in-flight markers the health and review rails write for this exact (pr, sha) — and must reserve
+# blocked/red language for states that are NOT progressing. Live 2026-07-31 the console read
+# `gating · herd/gates (BLOCKED)` for minutes at a time while the gate cycle was running normally
+# underneath it: `BLOCKED` there is GitHub's mergeStateStatus (a fresh PR under `require herd/gates` is
+# BLOCKED precisely BECAUSE the blessing has not been posted yet — the state this branch exists to
+# resolve), but on an operator's console it reads as a stop. The reviewer leg was invisible on BOTH
+# gate branches, so a ~4-minute adversarial review rendered as a frozen placeholder.
+
+# _gate_health_inflight <pr#> <sha> — true iff a health worker is live for this exact (pr,sha). The one
+# predicate behind both the running row and the HERD-313 health-pane spawn, so the pane can never be
+# stood up for a suite the row does not show (or vice versa).
+_gate_health_inflight() {
+  [ -n "${2:-}" ] || return 1
+  _health_pid_live "$(_health_inflight_file "${1}-${2}")"
+}
+
+# _gate_phase_row <slug-cell> <pr-cell> <pr#> <sha> <fallback-row> — THE one gate-phase row. Echoes, in
+# strict evidence order:
+#   1. a live HEALTH worker  → the existing shared _health_running_row (unchanged bytes: the same row
+#      the bash gate step and the render half have always agreed on, log-line note and all);
+#   2. a live REVIEWER       → `review · in progress (<age>)`;
+#   3. neither               → <fallback-row> VERBATIM.
+# Both gate branches call this, so "what phase is this PR in" has ONE answer on the console. Reads only
+# marker files the rails already write; side-effect-free; byte-identical to the pre-HERD-453 rows
+# whenever no worker is in flight (the fallback is passed in by the caller unchanged).
+_gate_phase_row() {
+  local _gpr_sl="$1" _gpr_pn="$2" _gpr_pr="$3" _gpr_sha="$4" _gpr_fallback="$5" _gpr_inf
+  if [ -n "$_gpr_sha" ]; then
+    if _gate_health_inflight "$_gpr_pr" "$_gpr_sha"; then
+      _health_running_row "$_gpr_sl" "$_gpr_pn" "$(_health_inflight_file "${_gpr_pr}-${_gpr_sha}")" \
+        "$(_health_log_file "${_gpr_pr}-${_gpr_sha}")"
+      return 0
+    fi
+    _gpr_inf="$(_review_inflight_file "$_gpr_pr" "$_gpr_sha")"
+    if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
+      printf '%s' "    ${C_YELLOW}🔍${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}review · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
+      return 0
+    fi
+  fi
+  printf '%s' "$_gpr_fallback"
+}
+
 # _marker_age_or_mtime <file> — the marker's recorded dispatch-ts age (_marker_age) when present, else a
 # FALLBACK computed from the marker FILE's own mtime — the on-disk floor for a marker written before the
 # dispatch-ts line existed (a pre-restart-safe legacy marker, or any writer that bypassed _marker_write).
@@ -13769,17 +14054,17 @@ EOF
           # skipped, so without this the console showed a frozen bare 'health-check' for the whole ~9-min
           # suite — the invisible-healthcheck the operator hit twice. No live marker yet (pre-dispatch,
           # or between ticks) ⇒ the bare placeholder, exactly as before. Side-effect-free.
-          _hc_inf="$(_health_inflight_file "${prnum}-${headsha}")"
-          if [ -n "$headsha" ] && _health_pid_live "$_hc_inf"; then
-            DISPLAY[i]="$(_health_running_row "$sl" "$pn" "$_hc_inf" "$(_health_log_file "${prnum}-${headsha}")")"
-            # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
-            # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
-            _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
-          else
-            DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}"
-          fi
+          # HERD-453: one shared phase row — a live suite, a live reviewer, else today's placeholder.
+          DISPLAY[i]="$(_gate_phase_row "$sl" "$pn" "$prnum" "$headsha" \
+            "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}")"
+          # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
+          # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
+          _gate_health_inflight "$prnum" "$headsha" && _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
         else
-          DISPLAY[i]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · herd/gates (${mstate:-?})${C_RESET}"
+          # BLOCKED-but-unblessed: the gate cycle is what CLEARS this state, so name the phase it is
+          # actually in and say what is awaited, rather than shouting GitHub's mergeStateStatus token.
+          DISPLAY[i]="$(_gate_phase_row "$sl" "$pn" "$prnum" "$headsha" \
+            "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · awaiting ${GATE_STATUS_CONTEXT} blessing (${mstate:-?})${C_RESET}")"
         fi
         # A HELD candidate already set its own flair above (attention — it is waiting on a human, not
         # on the engine); everything else on this branch is engine-busy.

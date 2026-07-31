@@ -1640,7 +1640,7 @@ def discover_via_graphql(repo=None, limit=50):
 
 _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
                  "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER",
-                 "GATE_STATUS")
+                 "GATE_STATUS", "GATE_STATUS_PENDING")
 
 # ── merge fairness / starvation freeze (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────
 # SHIP-DORMANT. MERGE_FAIRNESS=off (the default, and any unrecognized value) disables every re-stale
@@ -2280,6 +2280,34 @@ class FixtureGates:
 _GATE_STATUS_CONTEXT = "herd/gates"
 _GATE_STATUS_DESC = "healthcheck + adversarial review passed"
 
+# GATE_STATUS_PENDING (HERD-453) — the OPT-IN pending post, and the one narrow exception to the
+# SUCCESS-ONLY rule above. THE OPERATOR PROBLEM: under `require herd/gates`, the PR page shows a bare
+# "herd/gates — Expected — Waiting for status to be reported" for the WHOLE gate cycle. It is GitHub's
+# own placeholder for a required check nothing has reported, it names no owner and no phase, and it
+# looks identical whether a suite is running, a reviewer is mid-verdict, or no watcher will ever gate
+# this PR at all. Posting `pending` at gate-cycle START replaces it with "herd/gates — pending — review
+# in progress", which the terminal success post then overwrites.
+#
+# WHY IT IS OFF BY DEFAULT AND MUST STAY THAT WAY WITHOUT BRANCH PROTECTION: a non-passing commit status
+# flips a CLEAN sha to mergeStateStatus=UNSTABLE in the DEFAULT UNPROTECTED config. UNSTABLE is neither
+# CLEAN (the PR drops out of the merge path) nor BLOCKED (it is not gate-eligible either), so every PR
+# would silently strand and the block/override/auto-refix paths would break with it — the exact
+# self-inflicted deadlock the SUCCESS-ONLY rule exists to prevent. Where `herd/gates` IS a required
+# check, that sha is ALREADY BLOCKED on the missing required check, so a pending status changes nothing
+# about mergeability and only changes the words the operator reads. Hence: opt-in, documented as
+# requiring branch protection, and STRICT (any unrecognized value reads off — a typo can never arm it).
+# A gate FAIL still posts NOTHING; the fail-safe is unchanged and still rests on the ABSENCE of success.
+_GATE_STATUS_PENDING_DESC = "review in progress"
+
+
+def _gate_status_pending_enabled(config):
+    """True iff ``GATE_STATUS_PENDING`` explicitly opts in. STRICT truthy-token match (mirrors
+    agent-watch.sh's ``_main_health_enabled`` shape): anything else — unset, empty, a typo — is off, so
+    the default and every misconfiguration preserve the SUCCESS-ONLY contract exactly."""
+    val = str((config or {}).get("GATE_STATUS_PENDING", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
 # Consecutive merge REFUSALS (the API did not confirm state=MERGED) tolerated before the tick escalates
 # with a loud needs-you row. Below the threshold the PR STAYS BLESSED and re-attempts next tick; at it,
 # a wedged merge surfaces to a human instead of retrying forever in silence (task HERD-352).
@@ -2447,6 +2475,11 @@ class DryRunActuator:
         """PURE no-op twin of the herd/gates commit-status post: no network, no ledger, no journal —
         exactly as bash's ``post_gate_status`` returns early under ``--dry-run``. Returns False (nothing
         posted) so the side-effect-free VERIFY column never records a blessing it did not actually land."""
+        return False
+
+    def post_gate_status_pending(self, cand):
+        """PURE no-op twin of the GATE_STATUS_PENDING post (HERD-453) — same contract as
+        :meth:`post_gate_status` above: an observation run touches no network and records nothing."""
         return False
 
     def peek_status(self, cand):
@@ -2848,6 +2881,33 @@ class LiveActuator:
                             "context", _GATE_STATUS_CONTEXT)
         return True
 
+    def post_gate_status_pending(self, cand):
+        """POST ``herd/gates=pending`` for this ``(pr, sha)`` at gate-cycle start (GATE_STATUS_PENDING,
+        HERD-453 — see :data:`_GATE_STATUS_PENDING_DESC` for the full rationale and the UNSTABLE hazard
+        that keeps this opt-in). Journals ``gate_status`` in the SAME shape as the success post, with
+        ``state=pending``, so one event family covers the whole status surface and every existing
+        consumer reads it unchanged. Best-effort: a failed write journals nothing and returns False, so
+        the caller records no ledger marker and the post is re-attempted next tick. Never raises.
+
+        NO cross-seat guard here, deliberately, and it is not an omission: the setter guard on the
+        success post exists to stop this seat BLESSING over another seat's standing BLOCK. A pending
+        status grants nothing — it can never make an unmergeable sha mergeable — so there is no
+        blessing to withhold, and holding the pending post behind a `gh` read would spend a network
+        call per candidate per tick to protect against nothing."""
+        if not cand.sha:
+            return False
+        try:
+            subprocess.run(
+                ["gh", "api", "repos/{owner}/{repo}/statuses/%s" % cand.sha,
+                 "-f", "state=pending", "-f", "context=%s" % _GATE_STATUS_CONTEXT,
+                 "-f", "description=%s" % _GATE_STATUS_PENDING_DESC],
+                capture_output=True, text=True, check=True)
+        except Exception:
+            return False
+        self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "pending",
+                            "context", _GATE_STATUS_CONTEXT)
+        return True
+
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
 
@@ -3061,6 +3121,10 @@ class LiveTick:
         # GATE_STATUS master lever (HERD-194 contract): on (default) → post the herd/gates commit status
         # on gates-clear; off → byte-inert (no post, no journal, no ledger). Consumed at the blessing seam.
         self._gate_status = str(self.config.get("GATE_STATUS", "on") or "on")
+        # GATE_STATUS_PENDING (HERD-453) — SHIP-DORMANT, STRICT. off (default, and every unrecognized
+        # value) → byte-identical to the SUCCESS-ONLY contract: no pending post, no journal, no ledger.
+        # See :meth:`_gate_status_pending_enabled` for why this is opt-in rather than the default.
+        self._gate_status_pending = _gate_status_pending_enabled(self.config)
         self._state = {}       # pr -> lifecycle state (the assertion layer)
         self._outcome = {}     # pr -> terminal action string
         # MERGE_FAIRNESS / starvation freeze (§6.2, HERD-340). OFF (default) → _fairness False and
@@ -3569,6 +3633,19 @@ class LiveTick:
         if _breaker_gate(cand.pr, self.state, self.config) == "BLOCKED":
             self._advance(cand, "breaker_open")
             return HOLD
+
+        # 0b. GATE-CYCLE START: post herd/gates=pending so the PR page says WHY it is waiting
+        #     (GATE_STATUS_PENDING, HERD-453). Placed here — past the breaker, before the first rail —
+        #     because this IS the moment the cycle begins for this (pr, sha): everything below either
+        #     dispatches a rail or holds with a reason, and both are "in progress" from the page's seat.
+        #     At-most-once per (pr, sha) via the same ledger the success post uses, and the marker is
+        #     recorded only on a landed write, so a network blip retries next tick. Byte-inert with the
+        #     lever off (the default) or GATE_STATUS=off: no post, no journal, no ledger row.
+        if (self._gate_status_pending and self._gate_status_enabled() and cand.sha
+                and not self.state.posted(cand.pr, cand.sha, "gate_status")
+                and not self.state.posted(cand.pr, cand.sha, "gate_status_pending")):
+            if self.actuator.post_gate_status_pending(cand):
+                self.state.record_posted(cand.pr, cand.sha, "gate_status_pending")
 
         # 1. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
