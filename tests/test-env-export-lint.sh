@@ -21,6 +21,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 LINT="$ROOT/scripts/herd/env-export-lint.sh"
 
+# HERD-458: pin our own precondition — a CONFIGURED caller can leave an ambient EXPORTED core key
+# (e.g. HEALTH_CONCURRENCY=2) already in this process's environment. That ambient export attribute
+# survives even a MUTATED herd-config.sh copy that no longer exports the key itself (§2 below), which
+# is exactly the false-green the mutation-prove leg exists to catch. The shared harness scrub
+# (scripts/herd/hermetic-env-scrub.sh) already does this once per suite run; re-arm it here too so
+# this test is self-sufficient run alone.
+if [ -f "$ROOT/scripts/herd/hermetic-env-scrub.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$ROOT/scripts/herd/hermetic-env-scrub.sh"
+  herd_hermetic_env_scrub "$ROOT/scripts/herd/herd-config.sh"
+fi
+
 [ -f "$LINT" ] || { echo "FAIL: missing lint: $LINT" >&2; exit 1; }
 # shellcheck source=/dev/null
 . "$LINT"
