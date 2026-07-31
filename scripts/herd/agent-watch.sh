@@ -13206,17 +13206,17 @@ _acquire_watcher_singleton() {
       #
       # Note a dead watcher releases its flock when its fds close, so a HELD flock over an EMPTY
       # lockfile means something ALIVE holds it. Refusing is the safe failure.
+      # POSITIVE EVIDENCE means the shared exemption seam CLEARS the holder — nothing weaker. An
+      # earlier revision also accepted "its argv0 is not our marker" as proof of non-ourness; that is
+      # absence of a marker, not presence of evidence, and CI caught it doing real damage: a holder
+      # whose argv0 had been replaced still read as "not ours" and took the bypass. Only
+      # watcher_pid_exempt (marker-owned gate worker, or a child of the canonical watcher) positively
+      # identifies a process this bypass may re-key around.
       if [ -z "$_wl_rec" ]; then
-        local _wl_bargv0="${_wl_ba%%[[:space:]]*}" _wl_bpp _wl_bypass_ok=0
+        local _wl_bpp _wl_bypass_ok=0
         if [ -n "$_wl_bh" ] && [ "$_wl_bh" != "$$" ] && kill -0 "$_wl_bh" 2>/dev/null; then
           _wl_bpp="$(ps -o ppid= -p "$_wl_bh" 2>/dev/null | tr -d '[:space:]')" || _wl_bpp="0"
-          # Provably not one of ours: a different workspace's/none of our argv0, or our own fork per
-          # the shared exemption seam (a marker-owned gate worker — exactly HERD-344's case).
-          if [ -n "${HERD_WATCH_ARGV0:-}" ] && [ "$_wl_bargv0" != "$HERD_WATCH_ARGV0" ]; then
-            _wl_bypass_ok=1
-          elif watcher_pid_exempt "$_wl_bh" "${_wl_bpp:-0}" 2>/dev/null; then
-            _wl_bypass_ok=1
-          fi
+          watcher_pid_exempt "$_wl_bh" "${_wl_bpp:-0}" 2>/dev/null && _wl_bypass_ok=1
         fi
         if [ "$_wl_bypass_ok" -eq 0 ]; then
           exec 9>&-

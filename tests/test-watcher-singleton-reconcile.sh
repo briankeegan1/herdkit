@@ -126,7 +126,8 @@ _plant_table "$LIVE 1 $LIVE $HERD_WATCH_ARGV0 /x/agent-watch.sh" \
              "424243 1 424243 $HERD_WATCH_ARGV0 /x/agent-watch.sh"
 [ "$(_verdict_state)" = DUPLICATE ] \
   || fail "1d: an orphaned second main (ppid 1) was not reported as DUPLICATE ($(watcher_singleton_verdict))"
-watcher_singleton_verdict | cut -f3 | grep -q "424243" || fail "1d: the verdict does not name the orphan pid"
+IFS=$'\t' read -r _1d_st _1d_lock _1d_mains _1d_n <<< "$(watcher_singleton_verdict)"
+case "$_1d_mains" in *424243*) : ;; *) fail "1d: the verdict does not name the orphan pid (mains=[$_1d_mains])" ;; esac
 ok
 
 # ── 1e. a foreign workspace's watcher is NEVER ours (cross-project kill guard, issue #60) ───────
@@ -262,12 +263,29 @@ if command -v flock >/dev/null 2>&1; then
   # yet, the acquire legitimately succeeds and the test reports an engine defect that did not happen.
   # (Its sibling in test-watcher-singleton.sh asserts ACQUIRE, so the same race leaves that one
   # vacuously green — which is why this is the case that surfaced it.)
-  ( exec -a "$HERD_WATCH_ARGV0" bash -c 'exec 9>>"$1"; flock 9 || exit 1; : > "$2"; sleep 60' \
-      _ "$HERD_WATCHER_LOCK" "$READY" ) &
+  # The holder runs a SCRIPT FILE, not `bash -c '…; sleep 60'`. When `sleep` is the last command of a
+  # -c string, bash may exec into it — which REPLACES argv0, so the holder silently stops carrying the
+  # watcher marker it is supposed to be impersonating. That is platform-dependent (ubuntu's bash does
+  # it, this macOS build does not: CI reported `argv0=[sleep]` where a local probe showed the marker),
+  # so it is never safe to rely on. A bash running a script file with a loop cannot exec away, which is
+  # also the real watcher's shape (`exec -a "$HERD_WATCH_ARGV0" bash …/agent-watch.sh`).
+  HOLDER_SH="$FLK/holder.sh"
+  cat > "$HOLDER_SH" <<'HS'
+exec 9>>"$1"
+flock 9 || exit 1
+: > "$2"
+while :; do sleep 1; done
+HS
+  ( exec -a "$HERD_WATCH_ARGV0" bash "$HOLDER_SH" "$HERD_WATCHER_LOCK" "$READY" ) &
   HOLDER=$!; KIDS="$KIDS $HOLDER"
   _fk=0
   while [ "$_fk" -lt 100 ] && [ ! -e "$READY" ]; do sleep 0.1; _fk=$((_fk + 1)); done
   [ -e "$READY" ] || fail "2f FIXTURE: the holder never acquired the flock within 10s — fixture broken, not an engine verdict"
+  # The scenario is "a live WATCHER MAIN holds the lock", so the holder must actually carry the marker.
+  # Assert it: if the shell exec'd it away the case would silently degrade into a different scenario.
+  _holder_argv0="$(ps -o command= -p "$HOLDER" 2>/dev/null | awk '{print $1}')"
+  [ "$_holder_argv0" = "$HERD_WATCH_ARGV0" ] \
+    || fail "2f FIXTURE: the holder lost its argv0 marker (is [$_holder_argv0], want [$HERD_WATCH_ARGV0]) — it is no longer impersonating a watcher main"
   # INDEPENDENT precondition. Prove from OUTSIDE the engine that the lock is genuinely held, so a
   # vacuous fixture can never be reported as an engine failure.
   if flock -n "$HERD_WATCHER_LOCK" true 2>/dev/null; then
@@ -284,7 +302,7 @@ if command -v flock >/dev/null 2>&1; then
     echo "  diag: lockfile=[$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)] acq_out=[$acq_out]" >&2
     fail "2f: a second watcher ACQUIRED the singleton while a live watcher main held the flock (the duplicate-watcher path)"
   fi
-  printf '%s' "$acq_out" | grep -qi "already running" || fail "2f: the refusal was not loud (no holder named on stderr)"
+  case "$acq_out" in *"already running"*) : ;; *) fail "2f: the refusal was not loud (no holder named on stderr): [$acq_out]" ;; esac
   # The refusal must be INERT: it may not kill the holder, and it may not re-key the lockfile inode
   # out from under it (re-keying IS the duplicate-watcher mechanism).
   kill -0 "$HOLDER" 2>/dev/null \
@@ -346,9 +364,8 @@ out="$( cd "$P" && env PATH="$BIN:$PATH" HERD_SWEEP_PS_CMD="$HERD_SWEEP_PS_CMD" 
 sleep 0.3
 kill -0 "$ORPH" 2>/dev/null \
   && fail "3a: the orphaned watcher SURVIVED the stop leg — a bare kill is not a stop (HERD-450)"
-printf '%s' "$out" | grep -q "still alive — sending SIGKILL" \
-  || fail "3a: reload did not report the SIGKILL escalation"
-printf '%s' "$out" | grep -q "stopped stray watcher PID $ORPH" || fail "3a: the stopped stray was not reported"
+case "$out" in *"still alive — sending SIGKILL"*) : ;; *) fail "3a: reload did not report the SIGKILL escalation" ;; esac
+case "$out" in *"stopped stray watcher PID $ORPH"*) : ;; *) fail "3a: the stopped stray was not reported" ;; esac
 ok
 
 # ── 3b. a REVIEW-TICK FORK of the canonical watcher is NOT reaped by the stop ───────────────────
@@ -425,8 +442,7 @@ kill -0 "$H2" 2>/dev/null \
   && fail "4b: the lever is ON but the orphaned main-health chain kept running (it holds a health slot for a watcher that no longer exists)"
 [ -f "$P/trees/.health-inflight-main-deadbeef" ] \
   && fail "4b: the lever is ON but the abandoned marker still holds its slot"
-printf '%s' "$out" | grep -q "stopped orphaned main-health chain PID $H2" \
-  || fail "4b: the reap was not reported to the operator"
+case "$out" in *"stopped orphaned main-health chain PID $H2"*) : ;; *) fail "4b: the reap was not reported to the operator" ;; esac
 ok
 
 # ── 4c. lever ON never touches a REVIEW worker's chain (its verdict IS collected later) ─────────
