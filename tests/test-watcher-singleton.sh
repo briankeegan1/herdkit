@@ -118,6 +118,13 @@ echo "PASS (d) bin/herd _watcher_lock_pid_if_live adopt/stale/absent signalling"
 # open-file description, while the main watcher dies (recorded pid goes dead). A new watcher
 # must adopt the lock rather than refusing forever.
 #
+# PLATFORM GUARD (HERD-450): this case is only meaningful where flock(1) exists. Without it the
+# ORPHAN takes no lock at all AND _acquire_watcher_singleton runs its atomic-mkdir primitive instead
+# of the flock branch — so on macOS the case used to "pass" while exercising nothing it claims to.
+# Skip honestly there; CI's ubuntu leg is the seat that actually proves this path.
+if ! command -v flock >/dev/null 2>&1; then
+  echo "SKIP (e) flock(1) absent on this platform — the stale-flock adoption branch is unreachable here"
+else
 # Build a dead pid guaranteed to not be recycled for the duration of this test.
 sleep 0 & DEAD2=$!; wait "$DEAD2" 2>/dev/null || true
 # Write the dead pid to the lock so the pre-flock check sees a stale holder.
@@ -125,11 +132,21 @@ printf '%s\n' "$DEAD2" > "$LOCK"
 # Spawn an "orphan" that opens the lockfile, takes the flock, and holds it for 60s.
 # Use a subshell so bash can wait on it cleanly. Two distinct layers: outer (gets the fd)
 # and inner (holds it via flock 9), so "wait" on the outer process proves the inner is live.
-( exec 9>>"$LOCK"; flock 9; sleep 60 ) &
+ORPHAN_READY="$T/orphan-ready"
+( exec 9>>"$LOCK"; flock 9 || exit 1; : > "$ORPHAN_READY"; sleep 60 ) &
 ORPHAN=$!
 trap 'kill "$LIVE" 2>/dev/null || true; kill "$ORPHAN" 2>/dev/null || true; rm -rf "$T"' EXIT
-# Give the orphan a moment to take the flock.
-sleep 0.2
+# READINESS HANDSHAKE, not a fixed sleep (HERD-450). This case asserts ACQUIRE, so if the orphan has
+# not taken the flock yet the acquire succeeds for the WRONG reason and the case passes VACUOUSLY —
+# it would stop covering the stale-flock adoption path entirely, on exactly the loaded/cold runners
+# where a fixed sleep is least reliable. The orphan touches the marker only once flock(1) granted it.
+_ok_i=0
+while [ "$_ok_i" -lt 100 ] && [ ! -e "$ORPHAN_READY" ]; do sleep 0.1; _ok_i=$((_ok_i + 1)); done
+[ -e "$ORPHAN_READY" ] || fail "(e) FIXTURE: the orphan never acquired the flock within 10s"
+# Prove from OUTSIDE that the lock really is held, so the adoption below is a real adoption.
+if flock -n "$LOCK" true 2>/dev/null; then
+  fail "(e) FIXTURE: an outside flock -n SUCCEEDED — the orphan does not hold the lock, the case would be vacuous"
+fi
 # Verify the orphan is alive and holds a lock on the lockfile, otherwise the test is vacuous.
 kill -0 "$ORPHAN" 2>/dev/null || fail "(e) orphan process unexpectedly dead before the test"
 # The acquire must succeed despite the orphan holding the flock — stale-flock adoption.
@@ -140,5 +157,6 @@ kill -0 "$ORPHAN" 2>/dev/null || fail "(e) orphan process unexpectedly dead befo
 kill "$ORPHAN" 2>/dev/null || true
 ok
 echo "PASS (e) stale-flock adoption: dead recorded pid + orphan-held flock → ACQUIRE"
+fi
 
 echo "ALL PASS ($pass checks)"

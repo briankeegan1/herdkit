@@ -13183,24 +13183,43 @@ _acquire_watcher_singleton() {
       local _wl_bh _wl_ba
       _wl_bh="$(_watcher_lock_flock_holder 2>/dev/null || true)"
       _wl_ba="$(_watcher_holder_argv "$_wl_bh" 2>/dev/null || true)"
-      # HERD-450: REFUSE, never bypass, when the flock holder is itself a live WATCHER MAIN.
-      # The bypass exists for an orphaned GATE WORKER that inherited fd 9 (HERD-344) — it re-keys to a
-      # fresh inode, which by construction defeats the singleton for whoever holds the old one. That is
-      # correct against a worker and catastrophic against a watcher: reaching here means the recorded
-      # pid was EMPTY or dead, and an empty lockfile is exactly the state the 2026-07-31 incident ran
-      # in (a live watcher holding the lock while the file named nobody — the pid write lost to a
-      # racing launcher's unlink). Bypassing there hands a SECOND main the canonical path and leaves
-      # two watchers gating the same PRs. The holder's argv0 is the same per-workspace attribution the
-      # stop leg reaps by, so this can only ever match OUR workspace's watcher.
-      # An orphaned gate WORKER has exec'd its suite, so its argv0 is `bash …/healthcheck.sh`, not our
-      # marker — and the shared watcher_pid_exempt predicate (HERD-266) is what tells the two apart, so
-      # the HERD-344 adoption this branch exists for still takes the bypass below unchanged.
-      local _wl_bargv0="${_wl_ba%%[[:space:]]*}" _wl_bpp
-      if [ -n "$_wl_bh" ] && [ -n "${HERD_WATCH_ARGV0:-}" ] \
-         && [ "$_wl_bargv0" = "$HERD_WATCH_ARGV0" ] && [ "$_wl_bh" != "$$" ] \
-         && kill -0 "$_wl_bh" 2>/dev/null; then
-        _wl_bpp="$(ps -o ppid= -p "$_wl_bh" 2>/dev/null | tr -d '[:space:]')" || _wl_bpp="0"
-        if ! watcher_pid_exempt "$_wl_bh" "${_wl_bpp:-0}" 2>/dev/null; then
+      # HERD-450 — WHAT JUSTIFIES THE BYPASS IS THE **RECORDED PID**, NOT THE HOLDER PROBE.
+      # Reaching here means flock -n failed and the recorded pid is not live. Two very different
+      # states share that description, and only one of them may re-key the lock:
+      #
+      #   (1) _wl_rec is a DEAD pid — HERD-344 proper. The lockfile POSITIVELY RECORDS that the
+      #       watcher which owned this lock is gone, so whatever still holds the flock can only be a
+      #       gate worker that inherited fd 9 before it was marked close-on-exec. Adopt, as before.
+      #       This needs no holder identification at all, which matters: `lsof` may be absent and
+      #       /proc/locks may be unreadable (a container), and an adoption that silently depended on
+      #       a probe would break wherever the probe is blind.
+      #
+      #   (2) _wl_rec is EMPTY — no owner was ever recorded. There is NO evidence the owner is gone;
+      #       a LIVE watcher main may hold this flock and simply never have written (or have had
+      #       truncated) its pid. That is precisely the 2026-07-31 incident's state, and bypassing it
+      #       re-keys the canonical path out from under a running watcher and starts a second main.
+      #       So (2) may bypass ONLY on POSITIVE evidence that the holder is not one of our watcher
+      #       mains (the HERD-206 positive-evidence-only doctrine, applied to the singleton): an
+      #       identified holder that the shared watcher_pid_exempt seam clears, or one whose argv0 is
+      #       not this workspace's marker. A holder we CANNOT identify is not evidence of anything —
+      #       refuse loudly and let the operator look, rather than manufacture the duplicate.
+      #
+      # Note a dead watcher releases its flock when its fds close, so a HELD flock over an EMPTY
+      # lockfile means something ALIVE holds it. Refusing is the safe failure.
+      if [ -z "$_wl_rec" ]; then
+        local _wl_bargv0="${_wl_ba%%[[:space:]]*}" _wl_bpp _wl_bypass_ok=0
+        if [ -n "$_wl_bh" ] && [ "$_wl_bh" != "$$" ] && kill -0 "$_wl_bh" 2>/dev/null; then
+          _wl_bpp="$(ps -o ppid= -p "$_wl_bh" 2>/dev/null | tr -d '[:space:]')" || _wl_bpp="0"
+          # Provably not one of ours: a different workspace's/none of our argv0, or our own fork per
+          # the shared exemption seam (a marker-owned gate worker — exactly HERD-344's case).
+          if [ -n "${HERD_WATCH_ARGV0:-}" ] && [ "$_wl_bargv0" != "$HERD_WATCH_ARGV0" ]; then
+            _wl_bypass_ok=1
+          elif watcher_pid_exempt "$_wl_bh" "${_wl_bpp:-0}" 2>/dev/null; then
+            _wl_bypass_ok=1
+          fi
+        fi
+        if [ "$_wl_bypass_ok" -eq 0 ]; then
+          exec 9>&-
           _watcher_singleton_refuse "$_wl_bh"
           return 1
         fi

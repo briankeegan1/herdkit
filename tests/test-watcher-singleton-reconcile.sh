@@ -255,13 +255,42 @@ if command -v flock >/dev/null 2>&1; then
   export HERD_WATCHER_LOCK="$FLK/.watcher-sgtest.pid"
   export WORKTREES_DIR="$FLK"; TREES="$FLK"
   : > "$HERD_WATCHER_LOCK"                       # EMPTY — the incident's blind state
-  ( exec -a "$HERD_WATCH_ARGV0" bash -c 'exec 9>>"$1"; flock 9; sleep 60' _ "$HERD_WATCHER_LOCK" ) &
+  READY="$FLK/holder-ready"
+  # READINESS HANDSHAKE, not a sleep. The holder touches $READY only AFTER flock(1) has actually
+  # granted the lock. A fixed `sleep` here is a race on a cold/loaded runner, and — worse — a race
+  # this assertion CANNOT distinguish from a real engine miss: if the holder has not taken the lock
+  # yet, the acquire legitimately succeeds and the test reports an engine defect that did not happen.
+  # (Its sibling in test-watcher-singleton.sh asserts ACQUIRE, so the same race leaves that one
+  # vacuously green — which is why this is the case that surfaced it.)
+  ( exec -a "$HERD_WATCH_ARGV0" bash -c 'exec 9>>"$1"; flock 9 || exit 1; : > "$2"; sleep 60' \
+      _ "$HERD_WATCHER_LOCK" "$READY" ) &
   HOLDER=$!; KIDS="$KIDS $HOLDER"
-  sleep 0.5
+  _fk=0
+  while [ "$_fk" -lt 100 ] && [ ! -e "$READY" ]; do sleep 0.1; _fk=$((_fk + 1)); done
+  [ -e "$READY" ] || fail "2f FIXTURE: the holder never acquired the flock within 10s — fixture broken, not an engine verdict"
+  # INDEPENDENT precondition. Prove from OUTSIDE the engine that the lock is genuinely held, so a
+  # vacuous fixture can never be reported as an engine failure.
+  if flock -n "$HERD_WATCHER_LOCK" true 2>/dev/null; then
+    fail "2f FIXTURE: an outside flock -n SUCCEEDED, so the lock is not actually held — fixture broken, not an engine verdict"
+  fi
+  _lock_ino_before="$(ls -i "$HERD_WATCHER_LOCK" 2>/dev/null | awk '{print $1}')"
   acq_out="$( _acquire_watcher_singleton 2>&1 )"; acq_rc=$?
-  [ "$acq_rc" -ne 0 ] \
-    || fail "2f: a second watcher ACQUIRED the singleton while a live watcher main held the flock (the duplicate-watcher path)"
+  if [ "$acq_rc" -eq 0 ]; then
+    # Self-diagnosing failure: print the exact inputs the decision was made on, so a future CI red
+    # says WHY rather than only THAT.
+    echo "  diag: holder pid=$HOLDER argv0=[$(ps -o command= -p "$HOLDER" 2>/dev/null | awk '{print $1}')]" >&2
+    echo "  diag: HERD_WATCH_ARGV0=[$HERD_WATCH_ARGV0]" >&2
+    echo "  diag: _watcher_lock_flock_holder=[$(_watcher_lock_flock_holder 2>/dev/null)]" >&2
+    echo "  diag: lockfile=[$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)] acq_out=[$acq_out]" >&2
+    fail "2f: a second watcher ACQUIRED the singleton while a live watcher main held the flock (the duplicate-watcher path)"
+  fi
   printf '%s' "$acq_out" | grep -qi "already running" || fail "2f: the refusal was not loud (no holder named on stderr)"
+  # The refusal must be INERT: it may not kill the holder, and it may not re-key the lockfile inode
+  # out from under it (re-keying IS the duplicate-watcher mechanism).
+  kill -0 "$HOLDER" 2>/dev/null \
+    || fail "2f: the acquire gate KILLED the live watcher holding the lock — it may only refuse"
+  [ "$(ls -i "$HERD_WATCHER_LOCK" 2>/dev/null | awk '{print $1}')" = "$_lock_ino_before" ] \
+    || fail "2f: the refused acquire still re-keyed the lockfile to a fresh inode (defeats the holder's singleton)"
   kill -9 "$HOLDER" 2>/dev/null || true
   ok
 else
