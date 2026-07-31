@@ -680,6 +680,33 @@ export WORKTREES_DIR             # HERD-345: reach the Python engine core the wa
 export PROJECT_ROOT              # HERD-345: ditto — the Python live_runtime refuses to tick without WORKTREES_DIR resolved, and PROJECT_ROOT is the co-required sibling
 export STORE_BACKEND             # HERD-305: reach the Python engine core the watcher spawns as a child (like PYTHONUTF8 / HERD_THEME above); default 'auto' resolves flat, so the export is a dormant selector
 export MAIN_HEALTH_TICK          # HERD-359: reach the Python engine core the watcher spawns as a child — _main_health_pending() (live_runtime --tick) reads it to reserve a health slot for main-health; set as a plain var above, without the export the child sees 'off' and the reservation is inert
+
+# HERD-449 FULL SWEEP — every remaining knob pysrc/herd/live_runtime.py's _CORE_ENV_KEYS reads from
+# os.environ, exported for the SAME reason as MODEL_REVIEW / WORKTREES_DIR / PROJECT_ROOT /
+# STORE_BACKEND / MAIN_HEALTH_TICK just above: `python3 -m herd.live_runtime --tick` runs as a CHILD
+# process of the watcher (engine-version.sh:herd_engine_live_tick) and inherits ONLY the EXPORTED
+# shell env — a plain `: "${KEY:=default}"` var (or a project override in .herd/config with no
+# `export`) never crosses that boundary, so the child silently falls back to its own built-in default
+# no matter what the project configured. Three prior items (HERD-353/345/359, the exports above) each
+# closed this gap for ONE key; this is the full sweep, plus the guard that makes it unrepeatable
+# (scripts/herd/env-export-lint.sh, wired into both healthcheck profiles) so a fourth one-off fix is
+# never needed again. GROUNDED 2026-07-31: HEALTH_CONCURRENCY=3 was configured but read as 1 by the
+# engine core, zeroing the HERD-359 main-health slot reservation (_health_max - 1 == 0) whenever
+# main-health was pending, so NO PR healthcheck could dispatch at all — two PRs sat un-gated over an
+# hour. Byte-identical for every seat already at the default: exporting only changes what a CHILD
+# process sees, never the value itself.
+export HEALTH_CONCURRENCY REVIEW_CONCURRENCY   # the two keys THIS item's bug report named
+export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD REFIX_MAX_ROUNDS \
+       REFIX_COMPLETE_MIN WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE GATE_STATUS MERGE_FAIRNESS
+# DELETE_BRANCH_ON_MERGE / HERD_REFIX_WAIT_TIMEOUT / MERGE_FAIRNESS_STARVE_THRESHOLD carry no
+# `: "${KEY:=default}"` line above (each call site inlines its own `${KEY:-default}` fallback instead)
+# — a bare `export KEY` on an unset var is a no-op, so this only matters the moment a project sets one
+# of these three in .herd/config without its own `export` line.
+export DELETE_BRANCH_ON_MERGE HERD_REFIX_WAIT_TIMEOUT MERGE_FAIRNESS_STARVE_THRESHOLD
+# WATCHER_* view/scope knobs (team-mode + console filtering): same no-default-line caveat as the three
+# above — unset-by-design is the common case and stays a byte-identical no-op export.
+export WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
+       WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER
 : "${STORE_BACKEND:="auto"}"     # HERD-305 (engine-port P4): the MUTABLE-STATE STORE backend the Python runtime (pysrc/herd/store.py, live_runtime/shadow_runtime) reads — auto | flat | sqlite (default auto, ship-dormant). auto → FLAT (the ~45 flat state files agent-watch.sh owns) UNTIL the one-shot migration runner (`python3 -m herd.store --migrate`, operator-triggered, gated by herd_engine_migration_guard) has migrated the pool and written a `.herd/store-backend` marker; only then does auto engage the SQLite (WAL) store. flat → force flat. sqlite → force sqlite (explicit opt-in / tests). With nothing migrated auto == flat, so behavior is BYTE-IDENTICAL to before this key (the store never engages a backend it cannot open). The journal stays append-only JSONL, NEVER in the db. FAIL-SOFT: an unreadable marker / missing db degrades to flat. Consumed by pysrc/herd/store.py (resolve_backend)
 : "${WATCHER_SELF_RESTART:="off"}" # HERD-251: watcher SELF-RESTART on stale engine code — on | off (default off, ship-dormant). on → when the freshness reconcile pulls a delta that rewrote agent-watch.sh (the same restart-note trigger HERD-233 already raises), the watcher QUIESCES: it stops dispatching NEW gate work (reviews, healthchecks, resolver spawns, and the stale-base heal that dispatches them) while in-flight workers finish and collect; each hold sits above its call site's ledger write, so a refused dispatch never burns a once-guard, then re-execs itself in place — same pane, same argv0 herd-watch-<ws> tag, same singleton lock (the exec keeps the pid, so the lock it re-acquires is its own) — once zero review/health gate workers remain for 2 consecutive ticks, or a 15-minute max-wait cap expires. Journals watcher_quiesce then watcher_self_restart; the console row becomes 'restarting on new engine code · draining N workers'. FAIL-SOFT: any error (unreadable script, hermetic guard) falls back to the plain 'restart recommended' row. off (default) → byte-identical to the HERD-233 recommendation row: no quiesce, no dispatch hold, no exec. Consumed by agent-watch.sh
 # BUDGET_DAILY (HERD-95) — daily SPEND CEILING in USD that ENFORCES, not just measures. herd cost

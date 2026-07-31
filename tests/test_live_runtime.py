@@ -2454,7 +2454,7 @@ class TestMainHealthSlotPriority(unittest.TestCase):
 
     def setUp(self):
         self._orig_env = {}
-        for k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT"):
+        for k in ("MAIN_HEALTH_TICK", "MAIN", "PROJECT_ROOT", "HEALTH_CONCURRENCY"):
             self._orig_env[k] = os.environ.pop(k, None)
         import tempfile as _t
         self.tmp = _t.mkdtemp()
@@ -2579,6 +2579,72 @@ class TestMainHealthSlotPriority(unittest.TestCase):
             evs = [json.loads(l) for l in fh if l.strip()]
         queued = [e for e in evs if e.get("event") == "health_queued"]
         self.assertEqual(queued, [], "health_queued must NOT be emitted when main-health slot is free")
+
+    # ── HERD-449: HEALTH_CONCURRENCY resolved through the SAME os.environ seam a correctly-exported
+    # herd-config.sh feeds the `live_runtime --tick` child (_config_from_env) — not a hand-built config
+    # dict, which is what a proper shell export makes possible and an unexported var silently defeats.
+
+    def test_health_concurrency_env_value_dispatches_despite_main_pending(self):
+        """HEALTH_CONCURRENCY=3, resolved via _config_from_env (the env seam HERD-449 fixed, not a
+        literal dict): with main-health pending and ZERO PR-health in flight, effective_max = 3 - 1 =
+        2 > 0, so PR health actually DISPATCHES this tick. Under the pre-fix bug (the export missing,
+        HEALTH_CONCURRENCY always read as its built-in default of 1) effective_max would have been
+        1 - 1 = 0, and NO PR health could ever dispatch while main-health was pending — the live
+        deadlock this item closes."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        os.environ["HEALTH_CONCURRENCY"] = "3"
+        self._main_repo()
+        d = _make_worktree(self.tmp, "feat-3")
+        cand = LiveCandidate(pr=3, sha="cafef00d", slug="feat-3", worktree=d)
+        jpath = os.path.join(self.tmp, "j3.jsonl")
+        state = LiveState(state_dir=self.tmp)
+        state.dir = self.tmp
+        journal = LiveJournal(jpath)
+        config = LR._config_from_env()
+        self.assertEqual(config.get("HEALTH_CONCURRENCY"), "3",
+                          "_config_from_env must thread an exported HEALTH_CONCURRENCY through")
+        gates = LiveGates("/nonexistent-home", state, journal, config=config)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)   # health() always returns WAIT (async); assert on WHAT happened
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(queued, [], "with room in the slot (limit 3 - 1 main reservation = 2 > 0 "
+                                      "inflight), PR health must NOT be queued")
+        started = [e for e in evs if e.get("event") == "healthcheck_started"]
+        self.assertEqual(len(started), 1, "PR health must actually DISPATCH while main-health is "
+                                           "pending once HEALTH_CONCURRENCY leaves room in the slot")
+
+    def test_health_concurrency_env_value_in_queued_journal_limit_field(self):
+        """HEALTH_CONCURRENCY=3, resolved via _config_from_env: with 2 OTHER PR healths already in
+        flight (effective_max = 3 - 1 = 2, inflight >= limit), a 3rd candidate is queued — and the
+        journaled health_queued event's 'limit' field reads 3, not the broken always-1 default."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        os.environ["HEALTH_CONCURRENCY"] = "3"
+        self._main_repo()
+        state = LiveState(state_dir=self.tmp)
+        state.dir = self.tmp
+        jpath = os.path.join(self.tmp, "j4.jsonl")
+        journal = LiveJournal(jpath)
+        config = LR._config_from_env()
+        gates = LiveGates("/nonexistent-home", state, journal, config=config)
+        # Plant 2 live PR-health in-flight markers (other candidates) so the global inflight count is 2.
+        for i in range(2):
+            other = LiveCandidate(pr=100 + i, sha="other%d" % i, slug="other-%d" % i,
+                                  worktree=_make_worktree(self.tmp, "other-%d" % i))
+            _marker_write(state.health_inflight_file(other), os.getpid())
+        d = _make_worktree(self.tmp, "feat-4")
+        cand = LiveCandidate(pr=4, sha="deadbeef", slug="feat-4", worktree=d)
+        result = gates.health(cand)
+        self.assertEqual(result, WAIT)
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        queued = [e for e in evs if e.get("event") == "health_queued"]
+        self.assertEqual(len(queued), 1, "health_queued must be journaled once the slot is full")
+        self.assertEqual(queued[0].get("limit"), 3,
+                          "the journaled limit must read the CONFIGURED HEALTH_CONCURRENCY (3), not "
+                          "the engine core's broken always-1 fallback (HERD-449)")
+        self.assertEqual(queued[0].get("inflight"), 2)
 
     # ── HERD-373: tick-scoped memoization of _main_health_pending ────────────────────────────────
 

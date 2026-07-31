@@ -665,6 +665,33 @@ case "$_hc_gscope_rc" in
      exit 1 ;;
 esac
 
+# 5d. env-export guard (HERD-449) — a config knob the Python engine core reads from os.environ
+# (pysrc/herd/live_runtime.py's _CORE_ENV_KEYS) must be `export`ed by herd-config.sh, or the
+# `live_runtime --tick` CHILD process never sees it and silently defaults — the bug that starved
+# HEALTH_CONCURRENCY/REVIEW_CONCURRENCY. ONE implementation shared with the builder's light pre-PR
+# gate (scripts/herd/env-export-lint.sh), so the two gates can never disagree.
+eexp_note="env-export: clean"
+HERD_ENV_EXPORT_SKIP_REASON=""
+if [ -f scripts/herd/env-export-lint.sh ]; then
+  . scripts/herd/env-export-lint.sh
+  _hc_eexp_errs="$(herd_env_export_lint ".")"; _hc_eexp_rc=$?
+else
+  _hc_eexp_errs=""; _hc_eexp_rc=2
+  HERD_ENV_EXPORT_SKIP_REASON="scripts/herd/env-export-lint.sh not present"
+fi
+case "$_hc_eexp_rc" in
+  0) eexp_note="env-export: clean" ;;
+  2) eexp_note="env-export: skipped ($HERD_ENV_EXPORT_SKIP_REASON)" ;;
+  *) eexp_note="env-export: UNEXPORTED CORE KEYS"
+     if [ -n "$ONELINE" ]; then
+       echo "env-export: $(printf '%s' "$_hc_eexp_errs" | head -1) set but not exported"
+     else
+       echo "ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"
+       printf '%s\n' "$_hc_eexp_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -685,5 +712,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $chl_note"; }
 exit 0

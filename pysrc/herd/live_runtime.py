@@ -3192,17 +3192,28 @@ class LiveTick:
 
 _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 
+# _CORE_ENV_KEYS (HERD-449) — THE single authoritative list of every config knob this engine core
+# resolves from os.environ. herd-config.sh MUST `export` each one (a plain `: "${KEY:=default}"` var
+# is invisible to this module's subprocess — see engine-version.sh:herd_engine_live_tick, which spawns
+# `python3 -m herd.live_runtime --tick` as a CHILD process that inherits only the EXPORTED shell env).
+# A key present here but unexported silently falls back to this module's built-in default no matter
+# what a project's .herd/config says — the exact bug class HERD-449 fixed for HEALTH_CONCURRENCY /
+# REVIEW_CONCURRENCY (three prior items, HERD-353/345/359, each fixed ONE such key for a different
+# knob). scripts/herd/env-export-lint.sh imports this tuple directly (not a text scrape) so the lint
+# can never drift from the actual consumer list, and fails LOUDLY on any member herd-config.sh sets
+# but does not export.
+_CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
+                    "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
+                    "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
+                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+
 
 def _config_from_env(scenario=None):
     config = dict((scenario or {}).get("config") or {})
     # WORK_UNIT_KIND (HERD-403): carried into the assembled config so herd.work_unit.resolve_adapter
     # can read it from the SAME dict this tick already builds. Nothing in this module branches on it
     # yet — the key is inert here, read only by the unwired adapter skeleton.
-    knobs = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
-              "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
-              "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
-             + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
-    for knob in knobs:
+    for knob in _CORE_ENV_KEYS:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
     return config
