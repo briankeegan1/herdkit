@@ -13345,8 +13345,14 @@ _row_branch_mismatch() {
 # and its agent (by slug). Reads PRS_JSON, AGENTS_JSON, WT, MAIN, TREES from the environment; emits
 # records on stdout, one per line, in the exact field order the tick loop consumes:
 #   dir slug branch pr mergeable mergeStateStatus agent_status headRefOid author matchkind matchdetail
-# The last two are HERD-226's join provenance — matchkind ∈ {branch, sha, ambig, ""} and, for the two
-# non-trivial kinds, the detail the console names (the PR's own branch, or which PRs collide).
+#   is_draft
+# matchkind/matchdetail are HERD-226's join provenance — matchkind ∈ {branch, sha, ambig, ""} and, for
+# the two non-trivial kinds, the detail the console names (the PR's own branch, or which PRs collide).
+# is_draft (HERD-470) is "1"/"0" from the PR's own `isDraft` — NEVER derived from mergeStateStatus,
+# whose enum (DIRTY|UNKNOWN|BLOCKED|BEHIND|UNSTABLE|HAS_HOOKS|CLEAN) has no "DRAFT" case at all; a real
+# draft PR reports mergeStateStatus=UNKNOWN (GitHub never computes branch-protection state against a PR
+# that cannot be merged yet). Empty ("") when the field was never fetched (FINISH_STALL_MIN off and
+# ADOPT_REMOTE_PRS off — see _watcher_tick_fields) — callers must treat empty the same as "0".
 #
 # SHA-RESILIENT JOIN (HERD-226). GROUNDED INCIDENT: a resolver exited leaving its worktree on the
 # scratch branch `pr328`; the branch-name-only join found no PR, so PR #328 was INVISIBLE to the
@@ -13453,7 +13459,8 @@ for wt, branch, head in feats:
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
         ag_status.get(slug, ""), pr.get("headRefOid", ""),
         (pr.get("author") or {}).get("login", ""),
-        kind, detail]))
+        kind, detail,
+        ("1" if pr.get("isDraft") else "0") if "isDraft" in pr else ""]))
 '
 }
 
@@ -14047,7 +14054,7 @@ _tick_render_reconcile() {
   _FSS_ELIGIBLE=0; _FSS_RETASKED=0; _FSS_ESCALATED=0
   i=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail isdraft <<EOF
 $rec
 EOF
     sl="$(_slug_cell "$slug")"
@@ -14074,15 +14081,23 @@ EOF
     [ -n "$prnum" ] && _finish_stall_note_pr_opened "$slug"
     # HERD-432 leg A: an idle builder over an UNPROMOTED DRAFT PR is the livelock no rail caught (PR
     # #549/#550, 2026-07-29/30) — see _reconcile_draft_stall's header. Reconciled every tick against
-    # OBSERVED PR state (mstate), independent of the no-PR ladder above. The moment a PR leaves draft
+    # OBSERVED PR state (isdraft), independent of the no-PR ladder above. The moment a PR leaves draft
     # (promoted by the engine, the builder, or a human) its own namespaced anchor is dropped so a LATER
     # re-draft starts a fresh detection cycle (the permanent per-PR once-guard inside
     # _reconcile_draft_stall — not this anchor — is what stops the engine from re-promoting it).
+    # HERD-470: this MUST key off isdraft (the PR's own `isDraft` boolean), never mstate. GitHub's
+    # mergeStateStatus enum (DIRTY|UNKNOWN|BLOCKED|BEHIND|UNSTABLE|HAS_HOOKS|CLEAN) has no "DRAFT" case
+    # at all — a real draft PR reports mergeStateStatus=UNKNOWN. Comparing mstate to the literal string
+    # "DRAFT" can never match a real PR, which is exactly how this leg shipped and ran silent through
+    # its first production exercise (PR #590): finish_stall_scan reported result=empty on every tick for
+    # 50+ minutes over an idle builder sitting on a genuinely stalled draft PR. The original test fixture
+    # fabricated "mergeStateStatus":"DRAFT" (a value gh never actually returns) and so passed while this
+    # branch was structurally unreachable — the vacuous-test shape.
     _dstall=""
     if [ "$dir" = "$SELF_WT" ]; then
       : # $SELF_WT is exempt, same as every other automerge/gate decision — never act on this
         # watcher's own checkout.
-    elif [ -n "$prnum" ] && [ "$mstate" = "DRAFT" ]; then
+    elif [ -n "$prnum" ] && [ "$isdraft" = "1" ]; then
       case "$astatus" in
         done|idle) _dstall="$(_reconcile_draft_stall "$slug" "$astatus" "$prnum")" ;;
       esac

@@ -75,7 +75,7 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in _classify_finish_stall _draft_auto_promote_enabled _draft_promote_once _draft_promote_pr \
           _reconcile_draft_stall _row_draft_stall _finish_stall_scan_summary _prs_fetch_tick \
-          _discover_feature_worktrees _finish_stall_note_pr_opened; do
+          _discover_feature_worktrees _finish_stall_note_pr_opened _watcher_tick_fields; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -148,7 +148,19 @@ ok
 [ -z "$(_finish_stall_record draftpr:off-e2e)" ] || fail "off: must never write a record"
 ok
 
+# ── HERD-470: the tick's `gh pr list --json` field list must carry `isDraft` ONLY when the leg is
+# actually on — off is byte-identical to before the feature (AGENTS.md ship-dormant/byte-identical);
+# once FINISH_STALL_MIN is set, isDraft MUST be fetched or the draft-stall leg can never see a draft PR
+# at all (this is the exact HERD-470 miss: mergeStateStatus alone can never say "draft" — see the
+# LIVE LOOP fixture below for why).
+( unset FINISH_STALL_MIN ADOPT_REMOTE_PRS
+  case ",$(_watcher_tick_fields)," in *,isDraft,*) fail "off: isDraft must not be fetched when the leg is off" ;; esac
+)
+ok
 export FINISH_STALL_MIN=30
+case ",$(_watcher_tick_fields)," in *,isDraft,*) : ;; *) fail "on: isDraft must be fetched once FINISH_STALL_MIN is set, got: $(_watcher_tick_fields)" ;; esac
+ok
+
 GRACE="$(_finish_stall_grace_secs)"
 
 # ── E2E: DRAFT_AUTO_PROMOTE off (default) — PENDING → FIRST_STALL escalates → stays ESCALATED ───────
@@ -200,7 +212,7 @@ unset GH_PR_READY_FAIL
 ok
 
 # ── ANTI-LOOP: a re-draft after an engine promotion never re-triggers gh pr ready for that PR ───────
-# Simulate the tick loop's own transition-clear (mstate leaves DRAFT ⇒ the draftpr anchor drops) and
+# Simulate the tick loop's own transition-clear (isdraft flips to 0 ⇒ the draftpr anchor drops) and
 # then a LATER re-draft (a fresh anchor, first_seen resets) — exactly what a human re-drafting the
 # SAME PR #802 looks like from this function's point of view. DRAFT_AUTO_PROMOTE is still ON.
 _finish_stall_clear "draftpr:e2e-on"   # PR #802 already promoted once above (still spent forever)
@@ -240,6 +252,15 @@ _finish_stall_clear "draftpr:e2e-fail"; _finish_stall_clear "draftpr:dryrun-slug
 # isolation: a broken field list, a mis-set condition guard, or a tally that never reaches the summary
 # would all pass every test above yet reproduce the grounded incident (finish_stall_scan reporting
 # result=empty for 4-6+ hours over a real idle-builder-with-a-draft-PR).
+#
+# HERD-470: the PRS_JSON fixture below uses gh's REAL values — mergeStateStatus is NEVER the literal
+# string "DRAFT" (that enum case does not exist: DIRTY | UNKNOWN | BLOCKED | BEHIND | UNSTABLE |
+# HAS_HOOKS | CLEAN — confirmed against the live GitHub GraphQL schema). A genuine draft PR reports
+# mergeStateStatus=UNKNOWN and isDraft=true; the ONLY reliable signal is isDraft. HERD-432 originally
+# shipped keyed on mergeStateStatus=="DRAFT" and this fixture matched that same wrong assumption, so it
+# passed while the leg was structurally unreachable against a real `gh pr list` response — PR #590 sat
+# draft and idle for 50+ minutes with finish_stall_scan reporting result=empty on every tick. Never
+# regress this fixture back to "DRAFT" — it would silently resurrect the vacuous-test shape.
 mkgit() {
   local d="$1"; mkdir -p "$d"; git -C "$d" init -q
   git -C "$d" checkout -q -b main 2>/dev/null || git -C "$d" checkout -q main
@@ -265,12 +286,12 @@ _live_tick() {
   done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
   _FSS_ELIGIBLE=0; _FSS_RETASKED=0; _FSS_ESCALATED=0
   for rec in ${FEATS[@]+"${FEATS[@]}"}; do
-    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail <<EOF
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail isdraft <<EOF
 $rec
 EOF
     [ -n "$prnum" ] && _finish_stall_note_pr_opened "$slug"
     _dstall=""
-    if [ -n "$prnum" ] && [ "$mstate" = "DRAFT" ]; then
+    if [ -n "$prnum" ] && [ "$isdraft" = "1" ]; then
       case "$astatus" in
         done|idle) _dstall="$(_reconcile_draft_stall "$slug" "$astatus" "$prnum")" ;;
       esac
@@ -294,8 +315,8 @@ EOF
 export LIVE_TICK_PRS_JSON="$(python3 -c '
 import json
 print(json.dumps([
-  {"number":901,"title":"draft builder","headRefName":"feat/draft-slug","headRefOid":"'"$SHA_DRAFT"'","mergeable":"MERGEABLE","mergeStateStatus":"DRAFT"},
-  {"number":902,"title":"promoted builder","headRefName":"feat/promoted-slug","headRefOid":"'"$SHA_PROMOTED"'","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"},
+  {"number":901,"title":"draft builder","headRefName":"feat/draft-slug","headRefOid":"'"$SHA_DRAFT"'","mergeable":"MERGEABLE","mergeStateStatus":"UNKNOWN","isDraft":True},
+  {"number":902,"title":"promoted builder","headRefName":"feat/promoted-slug","headRefOid":"'"$SHA_PROMOTED"'","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","isDraft":False},
 ]))
 ')"
 
