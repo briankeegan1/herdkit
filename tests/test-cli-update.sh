@@ -229,10 +229,31 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
 ok
 
 # ── 10. No herdr on PATH → builder check skipped, update proceeds ─────────────
+# "No herdr on PATH" has to be made TRUE, not merely assumed. Moving our own stub aside only removes
+# THIS test's herdr; any other one still on PATH — a real installed herdr, or the healthcheck's
+# daemon-hermeticity shim, which prepends its own `herdr` — still resolves. So on a developer box or
+# under the gate this case silently ran WITH herdr present: it passed for the wrong reason (the
+# builder check was exercised, not skipped) and it called that herdr for real, which is exactly the
+# `suite herdr agent list` leak the gate's hermeticity guard reported. Drop EVERY PATH entry holding
+# an executable herdr for this one invocation, so absence is a fact rather than an assumption.
+_path_without_herdr() {
+  local _d _out="" _oldifs="$IFS"
+  IFS=:
+  for _d in $PATH; do
+    [ -n "$_d" ] || continue
+    [ -x "$_d/herdr" ] && continue
+    _out="${_out:+$_out:}$_d"
+  done
+  IFS="$_oldifs"
+  printf '%s' "$_out"
+}
 P="$T/p10"; mkdir "$P"
 _make_project "$P" "updatetest"
 mv "$BIN/herdr" "$BIN/herdr.bak"
-out="$(_run_update "$P" "$CLEAN_ENGINE")"
+NO_HERDR_PATH="$(_path_without_herdr)"
+command -v herdr >/dev/null 2>&1 && [ -z "${NO_HERDR_PATH:-}" ] \
+  && fail "(10) could not build a herdr-free PATH"
+out="$(PATH="$NO_HERDR_PATH" _run_update "$P" "$CLEAN_ENGINE")"
 # HERD-441 class, hit live on the macos CI leg of PR #563: `printf | grep -q` is EPIPE-unsafe under
 # pipefail — grep -q exits on the first match while printf is still writing, and once $out crosses the
 # platform pipe buffer (16KB on macOS, 64KB on linux) printf takes SIGPIPE and the pipeline goes
