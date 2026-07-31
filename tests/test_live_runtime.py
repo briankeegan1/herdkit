@@ -1964,6 +1964,72 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         self.assertFalse(_marker_live(f))
 
 
+class TestInflightVerifiedLive(unittest.TestCase):
+    """HERD-451: a health/merge-result-inflight marker's liveness must be IDENTITY-verified, not bare
+    existence — a recycled pid must not wedge the shared HEALTH_CONCURRENCY slot forever. GROUNDED
+    2026-07-31: stale ``.health-inflight-*`` markers whose recorded pids had been recycled by the OS
+    (twice onto the watcher itself, once onto a `sleep`) were counted live indefinitely, because
+    ``_count_live_inflight`` used to trust a bare ``kill -0`` whenever the marker recorded no start-time
+    at all — the exact shape of a legacy pre-restart-safe marker."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ.pop("HERD_FAKE_NOW", None)
+        os.environ.pop("HEALTH_INFLIGHT_TIMEOUT", None)
+
+    def tearDown(self):
+        os.environ.pop("HERD_FAKE_NOW", None)
+        os.environ.pop("HEALTH_INFLIGHT_TIMEOUT", None)
+
+    def _marker(self, name, body):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return path
+
+    def test_no_identity_marker_not_counted_once_expired(self):
+        """MUTATION-PROVE: a marker naming a live-but-wrong pid — the exact observed failure — must not
+        be counted once its age (via the file-mtime fallback) exceeds HEALTH_INFLIGHT_TIMEOUT. Reverting
+        ``_count_live_inflight`` to plain ``_marker_live`` reds this assertion (count reads 1, not 0)."""
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "3"
+        self._marker(".health-inflight-285-shaNOID", "%d\n" % os.getpid())   # 1-line legacy marker
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 9999)
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
+
+    def test_no_identity_marker_counted_within_grace_window(self):
+        """A FRESH no-identity marker (age ~0) is still trusted — a legit worker whose ps couldn't
+        answer start-time at dispatch is not punished immediately."""
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "1800"
+        self._marker(".health-inflight-286-shaFRESH", "%d\n" % os.getpid())
+        self.assertEqual(LR._total_health_inflight(self.tmp), 1)
+
+    def test_merge_result_inflight_prefix_shares_the_same_identity_check(self):
+        os.environ["HEALTH_INFLIGHT_TIMEOUT"] = "3"
+        self._marker(".merge-result-inflight-99-shaNOID", "%d\n" % os.getpid())
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 9999)
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
+
+    def test_review_inflight_prefix_unaffected_stays_unbounded_trust(self):
+        # HERD-451 scopes the fix to the HEALTH_CONCURRENCY-shared families only — review deliberately
+        # keeps the OLD unbounded _marker_live semantics (out of scope; no grounded incident there).
+        self._marker(".review-inflight-1-sha1", "%d\n" % os.getpid())
+        os.environ["HERD_FAKE_NOW"] = str(int(time.time()) + 999999)
+        self.assertEqual(LR._count_live_inflight(self.tmp, ".review-inflight"), 1)
+
+    def test_matching_starttime_stays_trusted_unbounded(self):
+        pid = os.getpid()
+        st = LR._pid_starttime(pid)
+        self._marker(".health-inflight-1-shaLIVE",
+                      "%s\n%s\n%s\n" % (pid, st, int(time.time()) - 999999))
+        self.assertEqual(LR._total_health_inflight(self.tmp), 1)
+
+    def test_mismatched_starttime_never_counted(self):
+        pid = os.getpid()
+        self._marker(".health-inflight-1-shaRECY",
+                      "%s\nBOGUS START TIME\n%s\n" % (pid, int(time.time())))
+        self.assertEqual(LR._total_health_inflight(self.tmp), 0)
+
+
 class TestJournalWiring(unittest.TestCase):
     """Leg 2: a live actuating tick REFUSES to run unjournaled — never journal:null."""
 
