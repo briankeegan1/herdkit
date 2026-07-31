@@ -126,8 +126,25 @@ _plant_table "$LIVE 1 $LIVE $HERD_WATCH_ARGV0 /x/agent-watch.sh" \
              "424243 1 424243 $HERD_WATCH_ARGV0 /x/agent-watch.sh"
 [ "$(_verdict_state)" = DUPLICATE ] \
   || fail "1d: an orphaned second main (ppid 1) was not reported as DUPLICATE ($(watcher_singleton_verdict))"
-IFS=$'\t' read -r _1d_st _1d_lock _1d_mains _1d_n <<< "$(watcher_singleton_verdict)"
+# Resolve the verdict FIRST, then split it. `IFS=$'\t' read … <<< "$(watcher_singleton_verdict)"`
+# looks equivalent but is not: the assignment prefix is already in effect while the here-string's
+# command substitution runs, so the seam would do its own table parsing under a tab IFS (see 1h).
+_1d_line="$(watcher_singleton_verdict)"
+IFS=$'\t' read -r _1d_st _1d_lock _1d_mains _1d_n <<< "$_1d_line"
 case "$_1d_mains" in *424243*) : ;; *) fail "1d: the verdict does not name the orphan pid (mains=[$_1d_mains])" ;; esac
+ok
+
+# ── 1h. the seam is IFS-INDEPENDENT ─────────────────────────────────────────────────────────────
+# Found while writing 1d, and it is not cosmetic. The process-table rows are space-separated, so a
+# caller whose IFS is set to something else makes every row fail the numeric-pid test and
+# watcher_list_mains returns NOTHING. That list is also the KILL LIST: an empty result makes
+# _stop_project_watcher report "no running watcher found", drop the lockfile, and let its caller spawn
+# a second main on top of a live one — this PR's own incident, reachable from an inherited IFS.
+_1h_default="$(watcher_list_mains | tr '\n' ',')"   # pipe-ok: bounded pid list, far under a pipe buffer
+_1h_tabbed="$( IFS=$'\t'; watcher_list_mains | tr '\n' ',' )"   # pipe-ok: bounded pid list, far under a pipe buffer
+[ "$_1h_default" = "$_1h_tabbed" ] \
+  || fail "1h: watcher_list_mains depends on the caller's IFS (default=[$_1h_default] tab=[$_1h_tabbed]) — an empty kill list spawns a duplicate"
+case "$_1h_tabbed" in *424243*) : ;; *) fail "1h: under a tab IFS the orphan vanished from the kill list" ;; esac
 ok
 
 # ── 1e. a foreign workspace's watcher is NEVER ours (cross-project kill guard, issue #60) ───────

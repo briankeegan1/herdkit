@@ -59,6 +59,15 @@
 # (_stop_project_watcher), and a `herd reload` during a handoff must still stop the watcher. A stale
 # marker (a crashed exec) ages out after WATCHER_HANDOFF_TTL and stops masking anything.
 #
+# IFS INDEPENDENCE (HERD-450). Every `read` that splits a process-table row pins its own IFS. The
+# rows are space-separated, so with a caller's IFS set to something else (a tab, say) the split
+# collapses and EVERY row fails the numeric-pid test — watcher_list_mains then returns NOTHING. That is
+# not a cosmetic parse bug: this list is also the KILL LIST, so an empty result makes
+# _stop_project_watcher report "no running watcher found", drop the lockfile, and let its caller spawn
+# a second main on top of a live one — the exact incident this file's machinery exists to prevent,
+# reachable from nothing worse than an inherited IFS. A shared seam may not depend on its caller's
+# field-splitting state.
+#
 # PROCESS-TABLE SEAM. Every probe here reads the table through watcher_ps_table, which honors
 # $HERD_SWEEP_PS_CMD — the seam sweep.sh's unit test already uses to plant a synthetic process table
 # with no real processes at all. One seam, one table snapshot per listing: the argv0 match and the
@@ -218,7 +227,7 @@ watcher_handoff_active() {
 watcher_has_gate_child() {
   local parent="${1:-}" table="${2:-}" cpid cppid cpgid ccmd
   [ -n "$parent" ] || return 1
-  while read -r cpid cppid cpgid ccmd; do
+  while IFS=$' \t' read -r cpid cppid cpgid ccmd; do
     [ "$cppid" = "$parent" ] || continue
     case " $ccmd " in
       # gate workers (HERD-245) + the backgrounded lane dispatches (HERD-237).
@@ -277,7 +286,7 @@ watcher_list_mains() {
     printf '%s\n' "$canon"; seen=" $canon "
   fi
   [ -n "$marker" ] || return 0
-  while read -r pid ppid pgid cmd; do
+  while IFS=$' \t' read -r pid ppid pgid cmd; do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     argv0="${cmd%%[[:space:]]*}"
     [ "$argv0" = "$marker" ] || continue

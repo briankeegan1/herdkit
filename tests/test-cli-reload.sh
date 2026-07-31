@@ -1113,11 +1113,11 @@ S="$T/state41"; _rich_coord_state "$S"
 # The pane run lands, then the watcher re-execs: the foreground carries the argv0 and nothing else.
 printf 'herd-watch-reloadtest /engine/scripts/herd/agent-watch.sh' > "$S/panes/pW/fgcmd"
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (argv0-visible watcher)"
-printf '%s' "$out" | grep -q "visible ✓" \
+grep -q "visible ✓" <<< "$out" \
   || fail "a watcher rendering under its argv0 was not recognised as visible (HERD-458)"
-printf '%s' "$out" | grep -q "DETACHED" \
+grep -q "DETACHED" <<< "$out" \
   && fail "a healthy argv0-tagged watcher was reported DETACHED (the GH #572 false negative)" || true
-printf '%s' "$out" | grep -q "RUNNING but NOT visible" \
+grep -q "RUNNING but NOT visible" <<< "$out" \
   && fail "reload told the operator to kill a healthy, visible watcher" || true
 ok
 
@@ -1130,7 +1130,7 @@ _make_project "$P" "reloadtest"
 S="$T/state42"; _rich_coord_state "$S"
 printf 'herd-watch-reloadtest-other /engine/scripts/herd/agent-watch.sh' > "$S/panes/pW/fgcmd"
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (foreign argv0)"
-printf '%s' "$out" | grep -q "visible ✓" \
+grep -q "visible ✓" <<< "$out" \
   && fail "a FOREIGN workspace's argv0 was accepted as this workspace's watcher" || true
 ok
 
@@ -1147,9 +1147,9 @@ sleep 999 & ZPID43=$!
 lockfile="$P/trees/.watcher-reloadtest.pid"
 out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID43")" \
   || { kill "$ZPID43" 2>/dev/null || true; fail "reload failed (genuinely-detached test)"; }
-printf '%s' "$out" | grep -q "RUNNING but NOT visible" \
+grep -q "RUNNING but NOT visible" <<< "$out" \
   || { kill "$ZPID43" 2>/dev/null || true; fail "a genuinely detached watcher no longer warns — the probe went always-green"; }
-printf '%s' "$out" | grep -q "DETACHED" \
+grep -q "DETACHED" <<< "$out" \
   || { kill "$ZPID43" 2>/dev/null || true; fail "summary missing DETACHED for a genuinely detached watcher"; }
 kill "$ZPID43" 2>/dev/null || true
 ok
