@@ -6329,6 +6329,37 @@ _checkout_exempt_backlog() {
 # on the very next tick, unchanged, before it is promoted into $CHECKOUT_CLEAN_STATE for the row and the
 # journal, so a one-tick sample of a write-then-commit window that resolves clean by the next tick never
 # raises. Records the promoted violation signature to $CHECKOUT_CLEAN_STATE for the row and dedups the journal.
+# _checkout_guard_enabled — true iff CHECKOUT_GUARD (HERD-452 PART 3) opts in. Default OFF (mirrors
+# _main_health_enabled and every other ship-dormant lever in this file); any unrecognized value reads
+# as off (fail toward the safer, hands-off default).
+_checkout_guard_enabled() {
+  case "$(printf '%s' "${CHECKOUT_GUARD:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _checkout_guard_heal <from-sha> — HERD-452 PART 3: the auto-restore itself. PRECONDITION (enforced by
+# the ONLY caller, reconcile_checkout_cleanliness): $MAIN is detached AND _checkout_offenders is empty —
+# this function does not re-derive that, it trusts the caller's own fresh scan. Deliberately a PLAIN
+# `git checkout <default-branch>` — never --force, never `reset --hard`: a clean tree needs neither, and
+# skipping them means a genuine local commit on the default branch (ahead of origin, unrelated to the
+# detach) is never discarded, only the detached foreign commit is left behind (still reachable by sha
+# via the reflog, never destroyed). Fail-soft: any git failure returns 1 and touches nothing further —
+# the caller's normal violation path then still runs, so a failed heal is never silently swallowed.
+_checkout_guard_heal() {
+  local _cgh_branch="${HERD_BRANCH_NAME:-main}" _cgh_from="${1:-}" _cgh_to
+  if git -C "$MAIN" show-ref --verify --quiet "refs/heads/$_cgh_branch"; then
+    git -C "$MAIN" checkout --quiet "$_cgh_branch" >/dev/null 2>&1 || return 1
+  else
+    git -C "$MAIN" checkout --quiet -B "$_cgh_branch" "${HERD_REMOTE:-origin}/$_cgh_branch" >/dev/null 2>&1 || return 1
+  fi
+  _main_head_attached || return 1
+  _cgh_to="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  journal_append checkout_guard result restored from "$_cgh_from" to "$_cgh_to" branch "$_cgh_branch"
+  return 0
+}
+
 reconcile_checkout_cleanliness() {
   [ -n "${DRYRUN:-}" ] && return 0
   [ -n "${MAIN:-}" ] || return 0
@@ -6343,6 +6374,19 @@ reconcile_checkout_cleanliness() {
   _cc_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_cc_head" ] || return 0
   _cc_offenders="$(_checkout_offenders)"
+  # CHECKOUT_GUARD (HERD-452 PART 3, operator-requested auto-heal): a DETACHED-and-CLEAN checkout is
+  # SAFE to auto-restore — offenders is empty, so nothing tracked would be discarded. A DIRTY checkout
+  # (offenders non-empty, detached or not) is NEVER auto-touched no matter this lever — that evidence
+  # stays for a human, exactly as the violation path below already preserves it. Checked EAGERLY, ahead
+  # of the 2-tick debounce below, so a genuine detach is fixed the tick it is found rather than left
+  # standing an extra cycle; a successful heal never reaches (or paints) the violation row at all.
+  # Ship-dormant: off (default) → this block never runs a git command, byte-identical to pre-HERD-452.
+  if [ -n "$_cc_detached" ] && [ -z "$_cc_offenders" ] && _checkout_guard_enabled; then
+    if _checkout_guard_heal "$_cc_head"; then
+      rm -f "$CHECKOUT_CLEAN_STATE" "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true
+      return 0
+    fi
+  fi
   # Clean AND attached → drop any standing row AND any in-progress debounce (byte-inert happy path).
   if [ -z "$_cc_offenders" ] && [ -z "$_cc_detached" ]; then
     rm -f "$CHECKOUT_CLEAN_STATE" "$CHECKOUT_CLEAN_PENDING" 2>/dev/null || true
@@ -6628,6 +6672,7 @@ MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" �
 # SHARED POOL through pysrc/herd/store.py's main_health_fix_* accessors (see _main_health_fix_mark /
 # _main_health_fix_clear below) so every seat sees the same "already filed" state, not just this process.
 MAIN_HEALTH_CI_STATE="$TREES/.agent-watch-main-health-ci"  # "<sha> <conclusion>" — the last branch-CI red we fired (HERD-334)
+MAIN_HEALTH_CONTAM_STATE="$TREES/.agent-watch-main-health-contam"  # "<sha>|<reason>" dedup sig for the HERD-452 withheld-verdict journal (see _main_health_contaminated)
 
 # Throttle the branch-CI probe (HERD-334 leg b): one `gh run list` every ~40 s (10 × 4 s sleep) instead
 # of every tick, so the steady-state network profile barely moves. Inline constant — no config key
@@ -6773,28 +6818,67 @@ _main_health_observed_pr() {
   printf '%s' "$_op_n"
 }
 
+# _main_health_sandbox_note <why> — HERD-452 PART 1 fail-soft breadcrumb: the disposable worktree the
+# main-health suite runs in could NOT be created (mktemp / worktree add refused). Mirrors healthcheck.
+# sh's _baseline_sandbox_note (HERD-361) — loud on stderr (lands in the tailable log) and journaled when
+# journal_append is in scope, so a skipped run is never silent.
+_main_health_sandbox_note() {
+  printf '⚠️  main-health sandbox unavailable (%s) — suite NOT run; retried next tick (never falls back to the live shared checkout)\n' "${1:-unknown}" >&2
+  if command -v journal_append >/dev/null 2>&1; then
+    journal_append main_health_sandbox result unavailable reason "${1:-unknown}" component agent-watch
+  fi
+}
+
 # _main_health_worker <sha> <dispatch-file> <log-file> — the ASYNC main-health suite, run in the
 # BACKGROUND by main_health_tick so a post-merge heavy suite (the LONGEST the watcher runs) never blocks
-# the tick. Runs the FULL (heavy) suite against $MAIN STREAMING to the tailable log, with the same
-# retry-before-red the pre-merge gate uses, then writes "<rc>\t<detail>" atomically for the collector to
-# route. On a reproduced red, <detail> is the FIRST 'not ok' TAP line (HERD-173 honest label; the
-# tab-leak-guard line is preserved when present so the collector's transient exemption still fires).
-# (see the always-heavy note below)
+# the tick. Runs the FULL (heavy) suite STREAMING to the tailable log, with the same retry-before-red
+# the pre-merge gate uses, then writes "<rc>\t<detail>" atomically for the collector to route. On a
+# reproduced red, <detail> is the FIRST 'not ok' TAP line (HERD-173 honest label; the tab-leak-guard
+# line is preserved when present so the collector's transient exemption still fires). (see the
+# always-heavy note below)
 #
-# SHA-STABILITY GUARD (HERD-421): $MAIN is a SHARED checkout — the post-merge codemap/symbol-index
-# refresh commits and rewrites files in it directly, which can race a concurrently-running suite (live
-# case 2026-07-22: a shellcheck leg reading a script the symbol-index push was mid-rewrite on). A red
-# reproduced while $MAIN's HEAD moved out from under this run was never verified against a STABLE tree,
-# so it is downgraded to rc 3 ("checkout moved") instead of a confirmed red — the collector journals it
-# as an infra_event and reconcile_main_health picks up the NEW HEAD as a fresh observed-sha next tick.
+# ROOT-CAUSE FIX (HERD-452 PART 1): pre-fix this ran the suite DIRECTLY inside the live $MAIN working
+# tree — the one remaining "verify main" path that was never sandboxed the way HERD-361 already
+# sandboxed the baseline-vs-candidate leg. GROUNDED 2026-07-31: $MAIN was found detached at a PR
+# branch's head (#563) and the reproduced red off that FEATURE branch's own code was mislabeled 'MAIN
+# RED'. The suite now ALWAYS runs in a DISPOSABLE detached worktree pinned to the dispatched sha
+# ($_mw_sha, exactly what $MAIN's HEAD was AT DISPATCH TIME — see _main_health_dispatch's soundness
+# assert, which runs first) — never the live checkout, so nothing the suite does (stage, stash, or
+# `git checkout` something else in $PWD) can ever mutate $MAIN. Unconditional: no lever, because a
+# health suite mutating the operator's live tree is never acceptable.
+#
+# SHA-STABILITY GUARD (HERD-421), kept as-is and now belt-and-suspenders: $MAIN is a SHARED checkout —
+# the post-merge codemap/symbol-index refresh commits and rewrites files in it directly, which can race
+# a CONCURRENT process advancing $MAIN's branch while this run is in flight (live case 2026-07-22: a lint
+# leg reading a script the symbol-index push was mid-rewrite on). That race is about $MAIN's own branch
+# moving out from under the OBSERVED-sha claim, not about where the suite itself runs, so the
+# sandbox does not remove it: a red reproduced while $MAIN's HEAD moved during the run is still
+# downgraded to rc 3 ("checkout moved") instead of a confirmed red — the collector journals it as an
+# infra_event and reconcile_main_health picks up the NEW HEAD as a fresh observed-sha next tick.
 _main_health_worker() {
   local _mw_sha="$1" _mw_out="$2" _mw_log="$3" _mw_rc _mw_detail _mw_head0 _mw_head1
+  local _mw_tmp _mw_dir
   _mw_head0="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
-  bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
+  _mw_tmp="$(mktemp -d 2>/dev/null || true)"
+  if [ -z "$_mw_tmp" ]; then
+    _main_health_sandbox_note "mktemp failed"
+    printf '5\tsandbox unavailable: mktemp failed\n' > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+    return 0
+  fi
+  _mw_dir="$_mw_tmp/main-health"
+  if ! git -C "$MAIN" worktree add --detach "$_mw_dir" "$_mw_sha" >/dev/null 2>&1; then
+    rm -rf "$_mw_tmp" 2>/dev/null || true
+    _main_health_sandbox_note "worktree add refused"
+    printf '5\tsandbox unavailable: worktree add refused\n' > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+    return 0
+  fi
+  bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
   if [ "$_mw_rc" -eq 1 ]; then
-    bash "$HERD_HEALTHCHECK_BIN" "$MAIN" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
+    bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
+  git -C "$MAIN" worktree remove --force "$_mw_dir" >/dev/null 2>&1 || true
+  rm -rf "$_mw_tmp" 2>/dev/null || true
   if [ "$_mw_rc" -eq 1 ]; then
     _mw_head1="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
     if [ -n "$_mw_head0" ] && [ -n "$_mw_head1" ] && [ "$_mw_head0" != "$_mw_head1" ]; then
@@ -7052,6 +7136,37 @@ _main_health_defer() {
   return 0
 }
 
+# _main_checkout_sound — HERD-452 PART 2: the pre-verdict ASSERT. A main-health verdict is a claim
+# about the DEFAULT BRANCH; it must never be trained on a checkout that, right now, isn't one. Returns
+# 0 iff $MAIN's HEAD is ATTACHED to the default branch (_main_head_attached, HERD-336) AND carries no
+# foreign contamination (_checkout_offenders, the SAME offender scan reconcile_checkout_cleanliness
+# already runs, HERD-361) — read FRESH here every call, never the debounced CHECKOUT_CLEAN_STATE row
+# (that debounce exists so a one-tick transient never paints a console row; gating a verdict needs the
+# opposite bias — never let even ONE contaminated tick slip a dispatch through). On failure echoes a
+# one-word reason ('detached' or 'dirty') the caller journals the withheld attempt under. Read-only.
+_main_checkout_sound() {
+  _main_head_attached && { [ -z "$(_checkout_offenders)" ] || { printf 'dirty'; return 1; }; return 0; }
+  printf 'detached'
+  return 1
+}
+
+# _main_health_contaminated <pr#> <sha> <reason> — HERD-452 PART 2: journal ONCE per (sha, reason) that
+# a main-health dispatch was WITHHELD because $MAIN failed _main_checkout_sound — no worker ever runs,
+# no marker is ever written, so this sha gets NO verdict (never a false green, never a false red) and
+# reconcile_main_health simply re-attempts it next tick (self-healing the moment the checkout is sound
+# again, exactly like any other deferral). Deliberately raises NO console row of its own —
+# build_checkout_cleanliness (HERD-361) already paints a loud 'CHECKOUT UNCLEAN' row for the identical
+# condition; this is the audit trail proving a verdict was never emitted for it, not a second alarm.
+_main_health_contaminated() {
+  local _mhc_pr="${1:-?}" _mhc_sha="${2:-}" _mhc_reason="${3:-unknown}" _mhc_key _mhc_prev
+  _mhc_key="${_mhc_sha}|${_mhc_reason}"
+  _mhc_prev="$(cat "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true)"
+  [ "$_mhc_prev" = "$_mhc_key" ] && return 0
+  printf '%s\n' "$_mhc_key" > "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true
+  journal_append main_health pr "$_mhc_pr" sha "$_mhc_sha" result contaminated reason "$_mhc_reason"
+  return 0
+}
+
 # _main_health_dispatch <pr#> <sha> <provenance> — the SHARED dispatch seam behind both the do_merge fast
 # path (provenance=merge) and the tick-level reconciler (observed-sha | recheck | died). Backgrounds the
 # heavy suite (_main_health_worker) holding a HEALTH_CONCURRENCY slot and returns immediately, so a tick
@@ -7071,7 +7186,16 @@ _main_health_defer() {
 # whose suite never ran even once, silently abandoning the very invariant this file asserts. Never fails
 # a caller: no caller propagates this rc (an alarm can never fail a merge, nor a tick).
 _main_health_dispatch() {
-  local _mh_pr="${1:-}" _mh_sha="$2" _mh_prov="${3:-merge}" _mh_key _mh_inflight _mh_disp _mh_wpid _mh_log
+  local _mh_pr="${1:-}" _mh_sha="$2" _mh_prov="${3:-merge}" _mh_key _mh_inflight _mh_disp _mh_wpid _mh_log _mh_reason
+  # HERD-452 PART 2: THE ALARM MUST NOT LIE. Assert $MAIN is soundly ON the default branch BEFORE any
+  # dispatch — a contaminated checkout never gets a worker, never gets a marker, never gets a verdict
+  # (contrast the idempotency/slot checks below, which assume a sound checkout and only decide WHEN to
+  # run). Checked first, ahead of every other guard, so no other path can race a verdict past this one.
+  _mh_reason="$(_main_checkout_sound)"
+  if [ -n "$_mh_reason" ]; then
+    _main_health_contaminated "$_mh_pr" "$_mh_sha" "$_mh_reason"
+    return 1
+  fi
   _mh_key="main-$_mh_sha"
   _mh_inflight="$(_health_inflight_file "$_mh_key")"
   _mh_disp="$(_health_dispatch_file "$_mh_key")"
@@ -7221,6 +7345,11 @@ _main_health_ci_leg() {
   _main_health_enabled || return 0
   _main_health_ci_gate_enabled || return 0
   [ -n "${DRYRUN:-}" ] && return 0
+  # HERD-452 PART 2: the same soundness assert _main_health_dispatch applies — a CI-sourced verdict is
+  # STILL a claim about $MAIN's observed sha, so a contaminated checkout must withhold it too (defense
+  # in depth: in practice a foreign sha rarely matches the default branch's own CI runs anyway, but this
+  # closes the gap on principle and skips a wasted `gh run list` call).
+  _main_checkout_sound >/dev/null || return 0
   local _sha _json _res _bucket _wf _concl _line _prev
   _sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_sha" ] || return 0
@@ -7340,6 +7469,8 @@ _collect_main_health() {
          fi ;;
       3) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason checkout-moved \
            detail "$_cm_out" ;;                                   # HERD-421: $MAIN moved mid-run, unverified
+      5) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason sandbox-unavailable \
+           detail "$_cm_out" ;;                                   # HERD-452: disposable worktree could not be created, never falls back to the live checkout
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
