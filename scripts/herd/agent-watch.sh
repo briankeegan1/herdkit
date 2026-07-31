@@ -11785,12 +11785,63 @@ _health_running_row() {
   printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hrr_sl}${C_RESET}${_hrr_pn} ${C_YELLOW}health-check · running $(_fmt_age "$(_marker_age "$_hrr_inf")") · $(_health_inflight_note "$_hrr_log")${C_RESET}"
 }
 
-# _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
-# via the recycling guard, still the SAME process). Shares the restart-safe substrate with the review side.
-_health_pid_live() { _marker_live "$1"; }
+# _marker_age_or_mtime <file> — the marker's recorded dispatch-ts age (_marker_age) when present, else a
+# FALLBACK computed from the marker FILE's own mtime — the on-disk floor for a marker written before the
+# dispatch-ts line existed (a pre-restart-safe legacy marker, or any writer that bypassed _marker_write).
+# -1 only when BOTH signals are unavailable (the file vanished mid-read / stat cannot answer either).
+_marker_age_or_mtime() {
+  local a; a="$(_marker_age "$1")"
+  case "$a" in ''|-1|*[!0-9]*) ;; *) printf '%s' "$a"; return 0 ;; esac
+  local m; m="$(file_mtime "$1" 2>/dev/null || printf 0)"
+  case "$m" in ''|0|*[!0-9]*) printf -- '-1'; return 0 ;; esac
+  printf '%s' "$(( $(_now_epoch) - m ))"
+}
 
-# _count_live_healthchecks — number of inflight markers (across ALL PRs) whose holder pid is alive.
-# Dead markers are not counted (a crashed holder never wedges a slot); mirrors _count_live_reviews.
+# _inflight_verified_live <file> <timeout> — THE shared "does this in-flight marker still legitimately
+# hold a health/merge-result slot" check (HERD-451 — mirrored verbatim by pysrc/herd/live_runtime.py's
+# ``_inflight_verified_live``, cross-referenced; Rule 2, one notion of liveness, never two divergent
+# copies). Recycling-safe IDENTITY, not bare existence:
+#   • pid dead → not live (a crashed worker never wedges a slot).
+#   • pid alive AND the marker's recorded start-time matches the pid's CURRENT one → live, UNBOUNDED (a
+#     verified-same-process worker is trusted for as long as it legitimately runs — the separate
+#     inflight-TIMEOUT check in the corpse sweep decides whether to TERM a long-running one, not this).
+#   • pid alive but the recorded start-time does NOT match → NOT live (the classic PID-RECYCLING case;
+#     already handled by ``_marker_live`` and unchanged here).
+#   • pid alive but NO start-time was ever recorded (a legacy pre-restart-safe marker, or any writer that
+#     bypassed ``_marker_write``) → identity CANNOT be proven from the marker alone. A bare `kill -0`
+#     success is trusted ONLY within <timeout> seconds of the marker's age (dispatch-ts, else file
+#     mtime); past that it reads as NOT live. An unverifiable marker no longer gets an indefinite pass
+#     just because *some* process now happens to hold that recycled pid — the EXACT GROUNDED 2026-07-31
+#     failure: a stale ``.health-inflight-*`` marker's recorded pid had been recycled by the OS onto the
+#     watcher itself / an unrelated `sleep`, and the old bare-existence check trusted it forever, wedging
+#     the HEALTH_CONCURRENCY slot with zero suites actually running. 23 such markers had silently
+#     accumulated since 2026-07-08 with no code error ever raised.
+_inflight_verified_live() {
+  local f="$1" timeout="${2:-1800}" pid st cur age
+  pid="$(_marker_pid "$f")"; [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  st="$(_marker_starttime "$f")"
+  if [ -n "$st" ]; then
+    cur="$(_pid_starttime "$pid")"
+    [ -n "$cur" ] || return 0        # transient ps hiccup — trust the recorded identity, unchanged
+    [ "$cur" = "$st" ]
+    return $?
+  fi
+  age="$(_marker_age_or_mtime "$f")"
+  case "$age" in ''|-1|*[!0-9]*) return 0 ;; esac   # no signal at all — fail toward not reaping
+  [ "$age" -lt "$timeout" ]
+}
+
+# _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
+# via the recycling guard, still the SAME process — bounded by HEALTH_INFLIGHT_TIMEOUT when the marker
+# carries no provable identity at all, see _inflight_verified_live). Shares the restart-safe substrate
+# with the review side.
+_health_pid_live() { _inflight_verified_live "$1" "${HEALTH_INFLIGHT_TIMEOUT:-1800}"; }
+
+# _count_live_healthchecks — number of inflight markers (across ALL PRs) whose holder pid is VERIFIED
+# live (see _health_pid_live / _inflight_verified_live — identity, not bare existence). Dead OR
+# identity-unverifiable-and-expired markers are not counted (a crashed holder, or a recycled-pid corpse,
+# never wedges a slot); mirrors _count_live_reviews.
 _count_live_healthchecks() {
   local n=0 f
   for f in "$TREES"/.health-inflight-*; do
@@ -12349,7 +12400,10 @@ _sweep_gate_corpses() {
     [ -n "$rest" ] || continue
     # A finished suite's dispatch result is waiting — leave it for the collector.
     [ -f "$(_health_dispatch_file "$rest")" ] && continue
-    if _marker_live "$f"; then
+    # HERD-451: _health_pid_live (not bare _marker_live) so an identity-unverifiable marker past
+    # HEALTH_INFLIGHT_TIMEOUT falls straight to the corpse branch below — removed + journaled, NEVER
+    # signaled (we cannot prove it is our worker, so we never risk TERMing an unrelated recycled pid).
+    if _health_pid_live "$f"; then
       age="$(_marker_age "$f")"
       case "$age" in ''|-1|*[!0-9]*) continue ;; esac
       # HERD-281: headroom check — before the kill, honour HEALTH_TIMEOUT_HEADROOM.

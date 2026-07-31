@@ -305,17 +305,30 @@ def _pos_int(value, default):
     return n if n > 0 else default
 
 
+_INFLIGHT_TIMEOUT_PREFIXES = (".health-inflight", ".merge-result-inflight")
+
+
 def _count_live_inflight(state_dir, prefix):
     """Count live in-flight markers across ALL candidates for one rail.
 
-    ``prefix`` is the glob prefix, e.g. ``.health-inflight`` or ``.review-inflight``. Dead markers are
-    not counted — a crashed worker never wedges a slot (mirrors bash's ``_count_live_healthchecks`` /
+    ``prefix`` is the glob prefix, e.g. ``.health-inflight`` or ``.review-inflight``. For the two
+    HEALTH_CONCURRENCY-shared families (HERD-451: ``.health-inflight`` and ``.merge-result-inflight``),
+    liveness is IDENTITY-verified and bounded by ``HEALTH_INFLIGHT_TIMEOUT`` when a marker carries no
+    provable identity at all (see :func:`_inflight_verified_live` — mirrored verbatim by
+    agent-watch.sh's ``_count_live_healthchecks`` / ``_health_slot_free``, cross-referenced). Every other
+    rail (review) keeps the unbounded ``_marker_live`` check, unchanged. Dead — or, for the two families
+    above, identity-unverifiable-and-expired — markers are not counted (mirrors bash's
     ``_count_live_reviews``). Zero with no state dir (a sim/dry-run tick has no on-disk markers)."""
     if not state_dir:
         return 0
+    if prefix in _INFLIGHT_TIMEOUT_PREFIXES:
+        timeout = _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800)
+        live = lambda p: _inflight_verified_live(p, timeout)
+    else:
+        live = _marker_live
     n = 0
     for path in glob.glob(os.path.join(state_dir, prefix + "-*")):
-        if _marker_live(path):
+        if live(path):
             n += 1
     return n
 
@@ -736,6 +749,80 @@ def _marker_live(path):
         return True
     cur = _pid_starttime(pid)
     return (not cur) or (cur == st)
+
+
+def _marker_dispatch_ts(path):
+    """Line 3 of an in-flight marker — the dispatch epoch stamped by ``_marker_write``
+    (agent-watch.sh:_marker_dispatch_ts). ``""`` when missing/unreadable (a legacy pre-restart-safe
+    marker, or any writer that laid down fewer than 3 lines)."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    return lines[2].strip() if len(lines) > 2 else ""
+
+
+def _marker_age(path):
+    """Seconds since the marker's dispatch ts, or ``None`` when no ts is recorded
+    (agent-watch.sh:_marker_age)."""
+    ts = _marker_dispatch_ts(path)
+    if not ts.isdigit():
+        return None
+    try:
+        return int(_now_epoch()) - int(ts)
+    except Exception:
+        return None
+
+
+def _marker_age_or_mtime(path):
+    """``_marker_age`` when available, else a FALLBACK computed from the marker FILE's own mtime — the
+    on-disk floor for a marker written before the dispatch-ts line existed (agent-watch.sh:
+    _marker_age_or_mtime). ``None`` only when both signals are unavailable (the file vanished mid-read)."""
+    age = _marker_age(path)
+    if age is not None:
+        return age
+    try:
+        return int(_now_epoch()) - int(os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def _inflight_verified_live(path, timeout):
+    """THE shared "does this in-flight marker still legitimately hold a health/merge-result slot" check
+    (HERD-451 — mirrors agent-watch.sh's ``_inflight_verified_live`` verbatim, cross-referenced; Rule 2,
+    one notion of liveness, never two divergent copies). Recycling-safe IDENTITY, not bare existence:
+      * pid dead → not live.
+      * pid alive AND the marker's recorded start-time matches the pid's CURRENT one → live, UNBOUNDED
+        (a verified-same-process worker is trusted for as long as it legitimately runs — the SEPARATE
+        inflight-timeout the corpse sweep enforces decides whether to TERM a long-running one, not this).
+      * pid alive but the recorded start-time does NOT match → NOT live (the classic PID-RECYCLING case;
+        already handled by ``_marker_live`` and unchanged here).
+      * pid alive but NO start-time was ever recorded (a legacy pre-restart-safe marker, or any writer
+        that bypassed ``_marker_write``) → identity CANNOT be proven from the marker alone. A bare
+        ``kill -0`` success is trusted ONLY within ``timeout`` seconds of the marker's age (dispatch-ts,
+        else file mtime); past that it reads as NOT live. An unverifiable marker no longer gets an
+        indefinite pass just because *some* process now happens to hold that recycled pid — the EXACT
+        GROUNDED 2026-07-31 failure: a stale ``.health-inflight-*`` marker's recorded pid had been
+        recycled by the OS onto the watcher itself / an unrelated ``sleep``, and the old bare-existence
+        check trusted it forever, wedging the HEALTH_CONCURRENCY slot with zero suites actually running.
+    """
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return False
+    pid = (lines[0].strip() if lines else "")
+    if not pid or not _pid_live(pid):
+        return False
+    st = (lines[1].strip() if len(lines) > 1 else "")
+    if st:
+        cur = _pid_starttime(pid)
+        if not cur:
+            return True          # transient ps hiccup — trust the recorded identity, unchanged
+        return cur == st
+    age = _marker_age_or_mtime(path)
+    if age is None:
+        return True              # no signal at all — fail toward not reaping
+    return age < timeout
 
 
 class LiveState:
