@@ -241,6 +241,33 @@ build_watcher_singleton
 [ -z "${WATCHER_SINGLETON:-}" ] || fail "2e: a healed control room still painted a row"
 ok
 
+# ── 2f. the acquire gate REFUSES rather than bypasses a live watcher main holding the flock ─────
+# The OTHER half of the empty-lockfile incident. HERD-344 lets a launch ADOPT a lock whose recorded
+# pid is dead but whose flock is held by an orphaned GATE WORKER, by unlinking the file and re-keying
+# to a fresh inode. With an EMPTY lockfile there is no recorded pid to be dead, so that bypass fires
+# against a LIVE WATCHER MAIN too — it re-keys the canonical path out from under the running watcher
+# and starts a SECOND main on top of it, which is exactly the state the incident was found in. The
+# holder must be identified through the shared exemption seam first: a worker still adopts, a watcher
+# main is refused loudly. flock(1) is Linux-only, so this case SKIPS on a seat without it (macOS)
+# rather than pretending to prove something.
+if command -v flock >/dev/null 2>&1; then
+  FLK="$T/flocktest"; mkdir -p "$FLK"
+  export HERD_WATCHER_LOCK="$FLK/.watcher-sgtest.pid"
+  export WORKTREES_DIR="$FLK"; TREES="$FLK"
+  : > "$HERD_WATCHER_LOCK"                       # EMPTY — the incident's blind state
+  ( exec -a "$HERD_WATCH_ARGV0" bash -c 'exec 9>>"$1"; flock 9; sleep 60' _ "$HERD_WATCHER_LOCK" ) &
+  HOLDER=$!; KIDS="$KIDS $HOLDER"
+  sleep 0.5
+  acq_out="$( _acquire_watcher_singleton 2>&1 )"; acq_rc=$?
+  [ "$acq_rc" -ne 0 ] \
+    || fail "2f: a second watcher ACQUIRED the singleton while a live watcher main held the flock (the duplicate-watcher path)"
+  printf '%s' "$acq_out" | grep -qi "already running" || fail "2f: the refusal was not loud (no holder named on stderr)"
+  kill -9 "$HOLDER" 2>/dev/null || true
+  ok
+else
+  echo "SKIP (2f) flock(1) absent on this platform — the flock acquisition branch is unreachable here"
+fi
+
 unset HERD_SWEEP_PS_CMD AGENT_WATCH_LIB JOURNAL_FILE
 
 # ══ 3. `herd reload`'s stop leg: VERIFY DEATH, and spare the forks ═══════════════════════════════
