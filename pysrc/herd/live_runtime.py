@@ -2197,6 +2197,70 @@ _MERGE_REFUSE_MAX = 3
 # short deadline costs at most one tick, never a blind merge.
 _HV_BODY_TIMEOUT = 15
 
+# ── hold/merge comment + notify actuator (contract §5.6, HERD-448) ─────────────────────────────────
+# A hold that fires and tells nobody is a silent stall: bash posted a PR comment + an operator notify
+# on each of four hold/merge branches (agent-watch.sh:11873-11920, ede7d45^); the Python core carried
+# no actuator for either surface, so a held PR left a journal line and a console row and the AUTHOR
+# was never told (PR #563's HUMAN-VERIFY hold went unnoticed for 19 days). Restored here, beside the
+# merge/reap/post_gate_status actuator surface, routed through the SAME driver seam bash used
+# (herd_driver_notify / scripts/herd/driver.sh notify) — never a hardcoded runtime. Deadlines mirror
+# _HV_BODY_TIMEOUT: bounded so a stuck gh/driver call costs at most one tick, never a hang.
+_HOLD_COMMENT_TIMEOUT = 15
+_HOLD_NOTIFY_TIMEOUT = 15
+
+
+def _hv_steps_text(cand):
+    """The declared HUMAN-VERIFY steps, one per line, no bullets — bash's
+    ``hv_steps="$(printf '%s' "$hv_body" | human_verify_steps)"``, reusing the SAME already-read body
+    (no second fetch, no second timeout)."""
+    return "\n".join(_human_verify.steps(cand.hv_body))
+
+
+def _hold_coordinator_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11880, ede7d45^) for a HUMAN_VERIFY_POLICY=coordinator
+    hold: coordinator-actionable, not waiting on a human."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — this PR declares manual "
+        "steps and `HUMAN_VERIFY_POLICY=coordinator`, so it is held as **coordinator-actionable**: a "
+        "coordinator/agent should execute these steps, then approve:\n\n%s\n\nOnce executed, run "
+        "`herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to approve commit "
+        "`%s` for merge. A new commit re-holds until re-verified."
+        % (_hv_steps_text(cand), cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hold_human_verify_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11890, ede7d45^) for the default HUMAN_VERIFY_POLICY=hold
+    hold: waiting on a human to verify the declared steps."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) — but this PR declares "
+        "manual steps that must be **human-verified** before merge:\n\n%s\n\nOnce verified, run "
+        "`herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to approve commit "
+        "`%s` for merge. A new commit re-holds until re-verified."
+        % (_hv_steps_text(cand), cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hold_approve_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11898, ede7d45^) for a plain MERGE_POLICY=approve hold
+    (no declared HUMAN-VERIFY block)."""
+    return (
+        "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before "
+        "merge.\n\nRun `herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to "
+        "approve commit `%s` for merge." % (cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _hv_auto_comment(cand):
+    """Verbatim bash template (agent-watch.sh:11916, ede7d45^) for the HUMAN_VERIFY_POLICY=auto
+    informational merge: the declared steps were NOT executed, recorded for the audit trail."""
+    return (
+        "🐑 **herd watch** · `HUMAN_VERIFY_POLICY=auto` — this PR declared manual verify steps, "
+        "treated as **informational** and merged on green gates (healthcheck ✅ · review ✅). These "
+        "steps were NOT executed before merge:\n\n%s\n\nRecorded in the engine journal as "
+        "`human_verify_policy=auto merged-with-declared-steps`." % _hv_steps_text(cand)
+    )
+
 
 def _hold_kind(hv_hold):
     """The `kind` field of hold_applied / hold_released — bash's rule, verbatim (agent-watch.sh
@@ -2303,6 +2367,16 @@ class DryRunActuator:
     def worktree_dirty(self, cand):
         """HERD-420: the fixture's scripted dirty bit — see :attr:`LiveCandidate.dirty`."""
         return bool(cand.dirty)
+
+    def post_comment(self, cand, kind, body):
+        """PURE no-op twin (HERD-448): DryRunActuator posts nothing — no gh, no network, no journal.
+        Returns True (not a failure) so the side-effect-free column never fabricates a
+        ``hold_comment_failed`` line for a comment that was never meant to go out."""
+        return True
+
+    def notify(self, title, body, sound="default"):
+        """PURE no-op twin (HERD-448): no driver-seam dispatch under dry-run."""
+        return None
 
 
 # ── merge actuation config (MERGE_METHOD + DELETE_BRANCH_ON_MERGE, HERD-354) ──────────────────────
@@ -2680,6 +2754,37 @@ class LiveActuator:
         self.journal.append("gate_status", "pr", cand.pr, "sha", cand.sha, "state", "success",
                             "context", _GATE_STATUS_CONTEXT)
         return True
+
+    def _script(self, name):
+        return os.path.join(self.home, "scripts", "herd", name)
+
+    def post_comment(self, cand, kind, body):
+        """POST a PR comment via ``gh pr comment`` — the hold/merge notify actuator's forensic
+        surface (contract §5.6, HERD-448). Best-effort, mirroring bash's ``_gh_timeout ... pr
+        comment ... || true``: the caller's once-guard already fired before this runs, so a failed
+        post is NEVER retried — it is journaled instead (``hold_comment_failed``), the only durable
+        record a comment was ever attempted, and the hold/merge decision already taken above is
+        never altered either way."""
+        try:
+            subprocess.run(["gh", "pr", "comment", str(cand.pr), "--body", body],
+                           capture_output=True, text=True, check=True, timeout=_HOLD_COMMENT_TIMEOUT)
+            return True
+        except Exception:
+            self.journal.append("hold_comment_failed", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "kind", kind)
+            return False
+
+    def notify(self, title, body, sound="default"):
+        """Fire a desktop-style notification through the driver seam (``herd_driver_notify``,
+        ``scripts/herd/driver.sh notify``) — NEVER a hardcoded runtime, so a headless project gets
+        the durable notifications.log sink and a herdr-claude project gets the real desktop banner,
+        with no branch here caring which. NEVER fails (mirrors the bash seam's own contract) — no
+        journal, no exception ever escapes."""
+        try:
+            subprocess.run(["bash", self._script("driver.sh"), "notify", title, body, sound],
+                           capture_output=True, text=True, timeout=_HOLD_NOTIFY_TIMEOUT)
+        except Exception:
+            pass
 
     def reap(self, cand):
         # REAP-ON-MERGE: this fires the instant THIS tick merged ``cand`` on green gates. It used to
@@ -3558,6 +3663,12 @@ class LiveTick:
                 self.journal.append("human_verify_policy", "pr", cand.pr, "sha", cand.sha,
                                     "slug", cand.slug, "policy", "auto",
                                     "action", "merged-with-declared-steps")
+                # The comment that makes the merge NOTICEABLE (contract §5.6, HERD-448): this is
+                # exactly the branch that went unnoticed 19 days with no actuator at all — the PR
+                # looked normally merged while its declared steps were silently never run. Bash
+                # comment-only here, no notify (agent-watch.sh:11916, ede7d45^): the PR already
+                # merged, there is nothing left to action, only to record.
+                self.actuator.post_comment(cand, "hv-auto", _hv_auto_comment(cand))
             # HOLD RELEASED (HERD-442). A PR that WAS held — by the approve policy, or by its own
             # HUMAN-VERIFY block under a non-auto HUMAN_VERIFY_POLICY — and now carries a sha-keyed
             # approval is about to merge. Bash journaled this immediately before do_merge and the P5b
@@ -3613,11 +3724,43 @@ class LiveTick:
                 if cand.hv_hold and self._hv_policy == "coordinator":
                     fields += ["human_verify_policy", "coordinator"]
                 self.journal.append("hold_applied", *fields)
+                # A hold is not silent (contract §5.6, HERD-448): comment + operator notify, once
+                # per (pr, sha) — the SAME once-guard above already gates this block, so a re-walked
+                # held PR never re-posts.
+                self._apply_hold_actuation(cand)
             return HOLD
         # OBSERVE — observe mode never merges.
         if self.state.once(cand.pr, cand.sha, "observe"):
             self.journal.append("observe_noted", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+            self.actuator.notify(
+                "🐑 PR #%s ready (observe)" % cand.pr,
+                "%s: review passed — observe mode, not merging" % cand.slug)
         return "OBSERVE"
+
+    def _apply_hold_actuation(self, cand):
+        """POST the once-per-(pr,sha) hold comment + fire the operator notify (contract §5.6,
+        HERD-448). Which template fires depends on WHY this candidate held — mirrors bash's
+        three-way branch verbatim (agent-watch.sh:11878-11901, ede7d45^): a coordinator-actionable
+        HUMAN-VERIFY hold, a human-actionable HUMAN-VERIFY hold, or a plain approve-policy hold.
+        Fail-soft throughout: :meth:`LiveActuator.post_comment` journals its own failure
+        (``hold_comment_failed``) and :meth:`notify` never raises — neither can alter the hold
+        decision already taken by the caller."""
+        if cand.hv_hold and self._hv_policy == "coordinator":
+            self.actuator.post_comment(cand, "coordinator", _hold_coordinator_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s human-verify — coordinator action needed" % cand.pr,
+                "%s: gates passed — a coordinator/agent should run the steps then herd approve %s"
+                % (cand.slug, cand.pr))
+        elif cand.hv_hold:
+            self.actuator.post_comment(cand, "human-verify", _hold_human_verify_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s human-verify pending" % cand.pr,
+                "%s: gates passed — verify manual steps, then herd approve %s" % (cand.slug, cand.pr))
+        else:
+            self.actuator.post_comment(cand, "approve", _hold_approve_comment(cand))
+            self.actuator.notify(
+                "🐑 PR #%s awaiting approval" % cand.pr,
+                "%s: gates passed — herd approve %s" % (cand.slug, cand.pr))
 
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""

@@ -288,6 +288,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `hold_released` | pr, sha, slug, kind(approve\|human-verify), reason(approved) | port `live_runtime.py:LiveTick._walk` (HERD-442 — restored; consumed by `herd why` and the fleet inbox/digest) |
 | `hv_body_unreadable` | pr, sha, slug, rc, detail | port `live_runtime.py:LiveTick._resolve_hold_inputs` (HERD-442 — the fail-CLOSED record for an unreadable PR body) |
 | `human_verify_policy` | pr, sha, slug, policy(auto), action | port `live_runtime.py:LiveTick._walk` (HERD-439 — the bash anchor `agent-watch.sh:12314` died at `ede7d45`) |
+| `hold_comment_failed` | pr, sha, slug, kind(coordinator\|human-verify\|approve\|hv-auto) | port `live_runtime.py:LiveActuator.post_comment` (HERD-448 — the once-guard already fired before this runs, so a failed comment post is never retried; this is the only durable record one was attempted) |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
 | `merge` | pr, slug, sha, method, reason(gates_passed) | `agent-watch.sh:5788` |
 | `merge_refused_sha_moved` | pr, slug, sha, state | `agent-watch.sh:5764` |
@@ -472,6 +473,23 @@ its family timeout is TERMed by the corpse sweep (`_sweep_gate_corpses` `agent-w
 review TERM at `REVIEW_INFLIGHT_TIMEOUT` `agent-watch.sh:10461`, health group-terminate
 `agent-watch.sh:10506`; the watcher never TERMs itself `agent-watch.sh:10460`). The port keeps
 "a hold is loud, owned, and never a dropped signal."
+
+**RESTORED (HERD-448).** The bash anchors above (`agent-watch.sh:12294` et al.) died with the
+action pass at `ede7d45`, same as `hold_applied`/`hold_released`/`human_verify_policy` — the port
+carried the journal lines but no comment/notify actuator at all, so a held PR was silent to its own
+author (PR #563's HUMAN-VERIFY hold went unnoticed for 19 days). Restored at
+`live_runtime.py:LiveTick._apply_hold_actuation` (the three HOLD-branch templates: coordinator,
+human-verify, approve — `agent-watch.sh:11878-11901`), the MERGE-branch informational comment (the
+`HUMAN_VERIFY_POLICY=auto` case that went unnoticed, `agent-watch.sh:11916` — comment only, no
+notify, mirroring bash exactly: the PR already merged, there is nothing left to action), and the
+OBSERVE-branch notify (`agent-watch.sh:11863` — notify only, no comment). Both actuator calls sit
+beside `merge`/`reap`/`post_gate_status` on `LiveActuator`, routed through the driver seam
+(`scripts/herd/driver.sh notify`, never a hardcoded runtime); `DryRunActuator` posts nothing. Each
+fires inside the SAME once-guard (`LiveState.once`) that already dedups the journal line, so a
+held PR re-walked every tick never re-posts. A failed comment post journals
+`hold_comment_failed` (§3.4) — the once-guard already fired, so it is never retried — and never
+alters the hold/merge decision either way; `notify` itself never fails, mirroring bash's own
+contract for `herd_driver_notify`.
 
 ---
 
