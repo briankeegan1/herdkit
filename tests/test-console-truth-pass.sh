@@ -414,4 +414,4 @@ ROW="$(_gate_phase_row "feat-x" " #565 ·" 565 abc123 "$FALLBACK")"
 [ "$ROW" = "$FALLBACK" ] || fail "4a: a dead marker still rendered a live phase: $ROW"
 ok
 
-echo "ok — console truth pass (HERD-453 + HERD-455 / GH #569): $pass assertions"
+echo "PASS — console truth pass (HERD-453 + HERD-455 / GH #569): $pass assertions"

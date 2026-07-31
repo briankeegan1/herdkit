@@ -38,6 +38,40 @@ fail(){ echo "FAIL: $1" >&2; exit 1; }
 pass=0
 ok(){ pass=$((pass+1)); }
 
+# HERD-462: bats-core dup's a live pipe onto fd 3 (and a higher fd, observed fd 12 on bats 1.14) before
+# running each test, so it can stream the "ok N …" line back to its own aggregator. A backgrounded fake
+# watcher in the tests below inherits that fd by default and, unless it explicitly closes it, keeps the
+# WRITE end open long after the test that spawned it has finished — bats' aggregator then blocks
+# forever on a read() that will never see EOF, wedging the whole `bats` run behind ONE leaked child
+# (reproduced live: an unguarded background sleep hangs `bats` even though every test itself reports
+# "ok"). `_bg_close_fds` mirrors the exact technique bats-exec-test's OWN internal per-test-timeout
+# watchdog uses on itself (`(eval exec {0..255}">&-"; sleep "$timeout") &`) — close the whole high-fd
+# range, not just fd 3, since which fd bats happens to dup onto is an implementation detail. A plain
+# numeric `for` loop (not bash 4's `{3..255}>&-` brace-range redirection) keeps this bash-3.2-safe —
+# macOS still ships bash 3.2 as `/bin/bash` and this suite runs under it. Every backgrounded
+# fake-watcher spawn below runs this FIRST, before anything else — and each spawn is `exec`'d into its
+# final command (never left as a plain forked child) so a lone `kill` fully reaps it, no orphan left
+# holding the (now-closed) fd open.
+_bg_close_fds() {
+  local fd
+  for fd in $(seq 3 255); do eval "exec $fd>&-" 2>/dev/null; done
+}
+
+# _BG_PIDS / _bg_track / _bg_reap_all: safety net for the "known sleep-9999 orphan fallout" (HERD-462).
+# fd-closing (above) stops a leaked child from wedging bats even while it's alive, but an unexpected
+# `fail()` between spawning a fake watcher and this file's own explicit `kill` of it would still leave
+# a live sleep-9999 process running for hours. Track every backgrounded pid and SIGKILL the lot
+# unconditionally on exit, on top of the existing tempdir cleanup.
+_BG_PIDS=()
+_bg_track() { _BG_PIDS+=("$1"); }
+_bg_reap_all() {
+  local p
+  for p in "${_BG_PIDS[@]:-}"; do
+    [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+  done
+}
+trap '_bg_reap_all; rm -rf "$T"' EXIT
+
 # Portability (HERD-53): the one env -i below strips LANG/LC_*; pin a UTF-8 locale (fallback C) so the
 # harness stays byte-consistent with the rest of the suite on Git Bash. Byte-identical on Linux. (That
 # env -i exercises the herdr-absent bail, which returns before any python3 subcall, so no shim needed.)
@@ -162,8 +196,9 @@ ok
 P="$T/p4"; mkdir "$P"
 _make_project "$P" "reloadtest"
 lockfile="$P/trees/.watcher-reloadtest.pid"
-sleep 999 &
+( _bg_close_fds; exec sleep 999 ) &
 FAKEPID=$!
+_bg_track "$FAKEPID"
 printf '%s\n' "$FAKEPID" > "$lockfile"
 ( cd "$P" && HERD_RELOAD_SIGTERM_POLLS=3 HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
   || { kill "$FAKEPID" 2>/dev/null || true; fail "reload failed when a live PID was in lockfile"; }
@@ -198,8 +233,9 @@ P="$T/p7"; mkdir "$P"
 _make_project "$P" "reloadtest"
 P_REAL="$(cd "$P" && pwd -P)"
 # Start a sleep under the canonical PROJECT_ROOT so lsof -d cwd reports P_REAL.
-( cd "$P_REAL" && exec sleep 9999 ) &
+( cd "$P_REAL"; _bg_close_fds; exec sleep 9999 ) &
 STRAY_PID=$!
+_bg_track "$STRAY_PID"
 # pgrep stub will return STRAY_PID (as a stray not in the lockfile).
 ( cd "$P" && FAKE_STRAY_PIDS="$STRAY_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
   || { kill "$STRAY_PID" 2>/dev/null || true; fail "reload failed (stray-our test)"; }
@@ -217,8 +253,9 @@ _make_project "$P" "reloadtest"
 OTHER="$T/other_project"; mkdir -p "$OTHER"
 OTHER_REAL="$(cd "$OTHER" && pwd -P)"
 # Start a sleep from OTHER_REAL (simulates another workspace's watcher).
-( cd "$OTHER_REAL" && exec sleep 9999 ) &
+( cd "$OTHER_REAL"; _bg_close_fds; exec sleep 9999 ) &
 OTHER_PID=$!
+_bg_track "$OTHER_PID"
 ( cd "$P" && FAKE_STRAY_PIDS="$OTHER_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
   || { kill "$OTHER_PID" 2>/dev/null || true; fail "reload failed (stray-other test)"; }
 sleep 0.2
@@ -236,9 +273,11 @@ fi
 P="$T/p9"; mkdir "$P"
 _make_project "$P" "reloadtest"
 lockfile="$P/trees/.watcher-reloadtest.pid"
-# Fake watcher that ignores SIGTERM (simulates watcher blocked in a long child).
-( trap '' TERM; sleep 9999 ) &
+# Fake watcher that ignores SIGTERM (simulates watcher blocked in a long child). SIG_IGN survives
+# exec, so `trap '' TERM` before the `exec sleep` still leaves the final process ignoring TERM.
+( trap '' TERM; _bg_close_fds; exec sleep 9999 ) &
 STUBBORN=$!
+_bg_track "$STUBBORN"
 printf '%s\n' "$STUBBORN" > "$lockfile"
 ( cd "$P" && HERD_RELOAD_SIGTERM_POLLS=3 HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
   || { kill -9 "$STUBBORN" 2>/dev/null || true; fail "reload failed (SIGKILL escalation test)"; }
@@ -258,8 +297,12 @@ P="$T/p10"; mkdir "$P"
 _make_project "$P" "reloadtest"
 lockfile="$P/trees/.watcher-reloadtest.pid"
 mkdir -p "$P/trees"
-# Old watcher subprocess with the guarded EXIT trap (mirrors agent-watch.sh exactly).
+# Old watcher subprocess with the guarded EXIT trap (mirrors agent-watch.sh exactly). This one can't
+# `exec` its way into `sleep` (the EXIT trap needs a live bash to run when it's killed below), so
+# `sleep 9999` stays a genuine forked CHILD of this subshell — close fds first so at least that child
+# never holds bats's fd open; it is reaped explicitly (not just SIGTERM'd) right after the kill below.
 (
+  _bg_close_fds
   printf '%s\n' "$$" > "$lockfile"
   _watcher_lock_cleanup() {
     [ "$(cat "$lockfile" 2>/dev/null)" = "$$" ] \
@@ -270,6 +313,7 @@ mkdir -p "$P/trees"
   sleep 9999
 ) &
 OLD_WATCHER=$!
+_bg_track "$OLD_WATCHER"
 sleep 0.15   # let it write its PID
 
 # Simulate cmd_reload removing old lock and new watcher writing its PID.
@@ -277,9 +321,14 @@ rm -f "$lockfile" 2>/dev/null || true
 NEW_PID="77777"
 printf '%s\n' "$NEW_PID" > "$lockfile"
 
-# Kill the old watcher — its EXIT trap fires.
+# Kill the old watcher — its EXIT trap fires. The forked `sleep 9999` inside it is NOT auto-reaped
+# when bash exits via a trap-driven `exit` (the "sleep-9999 orphan fallout" HERD-462 calls out) — grab
+# it via `ps` (real `pgrep` is stubbed on PATH above, so it can't be used for our own bookkeeping)
+# while the parent link still resolves, and reap it too once the parent is gone.
+OLD_CHILD="$(ps -ax -o pid=,ppid= 2>/dev/null | awk -v pp="$OLD_WATCHER" '$2==pp{print $1; exit}')"
 kill "$OLD_WATCHER" 2>/dev/null || true
 sleep 0.3
+[ -n "$OLD_CHILD" ] && kill -9 "$OLD_CHILD" 2>/dev/null || true
 
 # The guarded EXIT trap should have left the lockfile alone (PID mismatch).
 [ -f "$lockfile" ] \
@@ -530,7 +579,8 @@ P="$T/p14"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state14"; _rich_coord_state "$S"
 touch "$S/panes/pW/noshow"
-sleep 999 & ZPID=$!
+( _bg_close_fds; exec sleep 999 ) & ZPID=$!
+_bg_track "$ZPID"
 lockfile="$P/trees/.watcher-reloadtest.pid"
 out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID")" \
   || { kill "$ZPID" 2>/dev/null || true; fail "reload failed (invisible-watcher test)"; }
@@ -864,7 +914,11 @@ ok
 # Fully hermetic — never touches a real watcher, only sleeps we spawn and reap.
 # Redirect the sleep's std fds so the backgrounded process does NOT hold the command-substitution
 # pipe open (else `$(_spawn_tagged …)` blocks for the full sleep). `exec -a M sleep` keeps argv0==M.
-_spawn_tagged() { ( exec -a "$1" sleep 9999 ) >/dev/null 2>&1 & echo $!; }   # $1 = marker → prints pid
+# `_bg_close_fds` first (HERD-462) so this fake watcher can never hold bats's own fd open either.
+# NOTE: callers capture the printed pid via `$(...)`, which runs this function in a SUBSHELL — a
+# `_bg_track` call made IN HERE would only update that subshell's copy of `_BG_PIDS`. Callers must
+# `_bg_track` the captured pid themselves.
+_spawn_tagged() { ( _bg_close_fds; exec -a "$1" sleep 9999 ) >/dev/null 2>&1 & echo $!; }   # $1 = marker → prints pid
 
 # ── 29. reload in project X reaps X's argv0 watchers (lock + lock-absent stray); Y SURVIVES ──────
 # Two fake projects share the engine. Project X has TWO tagged watchers — one recorded in its
@@ -876,6 +930,7 @@ PY="$T/py"; mkdir "$PY"; _make_project "$PY" "projy"
 X_LOCK="$(_spawn_tagged herd-watch-projx)"     # X's lockfile watcher
 X_STRAY="$(_spawn_tagged herd-watch-projx)"    # X's lock-ABSENT stray (invisible to the old code)
 Y_LIVE="$(_spawn_tagged herd-watch-projy)"     # project Y's live watcher — must never be touched
+_bg_track "$X_LOCK"; _bg_track "$X_STRAY"; _bg_track "$Y_LIVE"
 sleep 0.3
 printf '%s\n' "$X_LOCK" > "$PX/trees/.watcher-projx.pid"
 # The stubbed pgrep returns all three pids (as a real pgrep across the process table would); the
@@ -896,7 +951,8 @@ ok
 PX2="$T/px2"; mkdir "$PX2"; _make_project "$PX2" "projx"
 PX2_REAL="$(cd "$PX2" && pwd -P)"
 # A Y-tagged watcher whose cwd IS X's root (would be killed by the cwd fallback if argv0 weren't gated).
-( cd "$PX2_REAL" && exec -a "herd-watch-projy" sleep 9999 ) & YCWD=$!
+( cd "$PX2_REAL"; _bg_close_fds; exec -a "herd-watch-projy" sleep 9999 ) & YCWD=$!
+_bg_track "$YCWD"
 sleep 0.3
 ( cd "$PX2" && FAKE_STRAY_PIDS="$YCWD" HERD_RELOAD_SIGTERM_POLLS=3 \
     HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
@@ -911,7 +967,8 @@ ok
 # with no herd-watch-* argv0. It must still be reaped when its cwd is our PROJECT_ROOT.
 PX3="$T/px3"; mkdir "$PX3"; _make_project "$PX3" "projx"
 PX3_REAL="$(cd "$PX3" && pwd -P)"
-( cd "$PX3_REAL" && exec sleep 9999 ) & LEGACY=$!   # untagged (argv0 == "sleep")
+( cd "$PX3_REAL"; _bg_close_fds; exec sleep 9999 ) & LEGACY=$!   # untagged (argv0 == "sleep")
+_bg_track "$LEGACY"
 sleep 0.3
 ( cd "$PX3" && FAKE_STRAY_PIDS="$LEGACY" HERD_RELOAD_SIGTERM_POLLS=3 \
     HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
@@ -1154,7 +1211,8 @@ P="$T/p43"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state43"; _rich_coord_state "$S"
 printf 'bash -c echo herd-watch-reloadtest' > "$S/panes/pW/fgcmd"
-sleep 999 & ZPID43=$!
+( _bg_close_fds; exec sleep 999 ) & ZPID43=$!
+_bg_track "$ZPID43"
 lockfile="$P/trees/.watcher-reloadtest.pid"
 out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID43")" \
   || { kill "$ZPID43" 2>/dev/null || true; fail "reload failed (genuinely-detached test)"; }
