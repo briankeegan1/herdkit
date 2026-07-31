@@ -38,6 +38,56 @@ permissions and speed.
 
 ---
 
+## Binaries must be Linux-native inside WSL
+
+**Everything herdkit spawns — the agent runtime (`claude`, or `codex`/`grok` via `HERD_DRIVER`), plus
+`git`, `gh`, `python3`, `node` — must be the Linux build, installed *inside* WSL.** Not a Windows
+`.exe` reached through WSL's PATH interop, even though a Windows binary on your `Path` env var
+resolves happily from a WSL shell and looks "present."
+
+**Field failure that motivated this:** a WSL user's builder agents died a few seconds after every
+spawn. `herd doctor` said `claude ✓` the whole time — because `claude` genuinely resolved, just to
+`/mnt/c/Users/…/npm/claude.exe`, a Windows process WSL's interop channel bridges into the Linux
+shell. That bridge is tied to the spawning shell: the moment the lane's shell that launched it
+detaches (exactly what a herdr tab or a headless-driver spawn does right after start), the bridged
+Windows process dies with it. Presence was never the question — the RESOLVED binary was the wrong
+(Windows) one.
+
+herdkit now catches this at two points, so it never reaches an already-spawned agent again:
+
+- **`herd doctor`** reds the check when running inside WSL and the active driver's resolved agent
+  binary — or `git`/`gh`/`python3`/`node` — resolves under `/mnt/` or to a `*.exe`.
+- **Every builder lane** (`herd-feature.sh` / `herd-quick.sh`, via `new-feature.sh`'s
+  `herd_preflight`) refuses the spawn BEFORE creating a worktree or tab, with the same fix printed.
+
+**The fix — the all-in-WSL2 layout:** install every tool WSL's shell resolves to *inside* WSL, not on
+the Windows side:
+
+```bash
+# a Linux node, then claude on top of it (inside your WSL2 shell, NOT PowerShell/cmd.exe)
+sudo apt install -y nodejs npm     # or nvm — any Linux-native node
+npm install -g @anthropic-ai/claude-code
+which claude                       # must print a Linux path (e.g. /usr/local/bin/claude), never /mnt/…
+```
+
+Then, so a Windows-side install never leaks back onto WSL's `PATH` again, disable Windows PATH
+interop for new WSL shells:
+
+```ini
+# /etc/wsl.conf
+[interop]
+appendWindowsPath=false
+```
+
+```powershell
+wsl --shutdown   # from PowerShell — restart the WSL VM so the change takes effect
+```
+
+`herd doctor` re-checks resolution every run, so re-run it after the fix to confirm every binary now
+resolves Linux-native.
+
+---
+
 ## What works today in WSL2 — an honest status
 
 WSL2 is the **direction** and the supported Windows path. Not every surface is feature-complete

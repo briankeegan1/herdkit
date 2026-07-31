@@ -17,9 +17,12 @@
 # surprise) and to return non-zero only on a genuine missing/skew condition.
 #
 # Knobs:
-#   HERD_SKIP_PREFLIGHT=1   bypass the guard entirely (tests / CI / known-good environments).
-#   HERDR_MIN_VERSION=X.Y   OPT-IN floor on `herdr --version`; empty (default) = shape-probe only.
-#                           Prefer the shape probe — version strings are brittle; this is a backstop.
+#   HERD_SKIP_PREFLIGHT=1        bypass the guard entirely (tests / CI / known-good environments) —
+#                                also bypasses the WSL interop guard below.
+#   HERDR_MIN_VERSION=X.Y        OPT-IN floor on `herdr --version`; empty (default) = shape-probe only.
+#                                Prefer the shape probe — version strings are brittle; this is a backstop.
+#   HERD_WSL_PROC_VERSION_FILE   test seam for the WSL interop guard (HERD-454, driver.sh): overrides
+#                                the /proc/version path herd_is_wsl reads. Production never sets this.
 
 # _herd_brand — the display brand shown in user-facing doctor/preflight diagnostics. A consumer who
 # has branded their own workflow sees THEIR name instead of the literal "herdkit"; it defaults
@@ -37,6 +40,13 @@ _herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
 _HERD_PREFLIGHT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=/dev/null
 command -v herd_engine_guard >/dev/null 2>&1 || . "$_HERD_PREFLIGHT_DIR/engine-version.sh" 2>/dev/null || true
+# Runtime driver shim (HERD-454): herd_driver_wsl_interop_guard + herd_driver_name/herd_driver_agent_
+# runtime live here. Some callers (herd-feature.sh, herd-quick.sh) already source driver.sh in-process
+# before shelling out to new-feature.sh, but new-feature.sh runs as its OWN bash process — sourcing
+# only happens there, not here — so guard-source it exactly like engine-version.sh above: defines
+# functions only, safe to source standalone, never a double-source problem.
+# shellcheck source=/dev/null
+command -v herd_driver_wsl_interop_guard >/dev/null 2>&1 || . "$_HERD_PREFLIGHT_DIR/driver.sh" 2>/dev/null || true
 
 herd_preflight() {
   [ "${HERD_SKIP_PREFLIGHT:-}" = "1" ] && return 0
@@ -47,6 +57,14 @@ herd_preflight() {
   # headless early-return, since a headless lane writes exactly as much as a herdr one.
   if command -v herd_engine_guard >/dev/null 2>&1; then
     herd_engine_guard "lane spawn preflight" || return 1
+  fi
+  # WSL interop guard (HERD-454), BEFORE the headless early-return below: a headless-driver spawn
+  # dies to interop exactly like a herdr-paned one (both exec the SAME resolved runtime binary), so
+  # this must not be skipped just because the herdr-specific checks past it are inapplicable. Off
+  # WSL it is a single no-op probe (see driver.sh); on WSL it fails fast with the fix hint, before any
+  # worktree/tab this lane would otherwise create.
+  if command -v herd_driver_wsl_interop_guard >/dev/null 2>&1; then
+    herd_driver_wsl_interop_guard || return 1
   fi
   # The headless driver has NO herdr dependency (agents run detached; panes are a view). Every check
   # below probes the herdr CLI/JSON contract, so under HERD_DRIVER=headless the whole preflight is
@@ -534,6 +552,47 @@ herd_doctor() {
     fi
   else
     warn=$((warn+1))
+  fi
+
+  # WSL interop (HERD-454): the SAME check the lane spawn gate refuses on (herd_driver_wsl_interop_
+  # guard, driver.sh), reported doctor-style — a red row, same fix hint. Off WSL this prints NOTHING
+  # at all (not even a header), so a non-WSL `herd doctor` run stays byte-identical to before this
+  # change. On WSL it also resolution-checks git/gh/python3/node (warn-tier: these tools mostly just
+  # run SLOW through interop rather than dying like a detached agent process does, but a PATH that
+  # resolves them via /mnt/… is the exact misconfiguration behind the claude/codex/grok field failure,
+  # so it's worth surfacing here too).
+  if command -v herd_is_wsl >/dev/null 2>&1 && herd_is_wsl; then
+    printf '\nWSL interop (this host is inside WSL):\n'
+    local wsl_drv wsl_bin wsl_resolved
+    wsl_drv="$(herd_driver_name)"
+    wsl_bin="$(herd_driver_agent_runtime "$wsl_drv" 2>/dev/null || true)"
+    [ -n "$wsl_bin" ] || wsl_bin="claude"
+    wsl_resolved="$(command -v "$wsl_bin" 2>/dev/null || true)"
+    if [ -z "$wsl_resolved" ]; then
+      printf '  \xe2\x9a\xa0 %s (driver %s) not found on PATH \xe2\x80\x94 see the recommended-dep check above\n' "$wsl_bin" "$wsl_drv"
+    elif _herd_wsl_interop_path "$wsl_resolved"; then
+      printf '  \xe2\x9c\x97 %s (driver %s) resolves to a WINDOWS binary via WSL interop: %s\n' "$wsl_bin" "$wsl_drv" "$wsl_resolved"
+      printf '      a Windows process bridged through interop dies the moment the spawning lane detaches \xe2\x80\x94\n'
+      printf '      builders die seconds after spawn even though this dependency reads as present above\n'
+      printf '      fix: %s\n' "$(herd_wsl_interop_fix_hint)"
+      warn=$((warn+1))
+    else
+      printf '  \xe2\x9c\x93 %s resolves to a native Linux binary (no WSL interop): %s\n' "$wsl_bin" "$wsl_resolved"
+    fi
+    local wsl_tool wsl_tool_path wsl_interop_hits=""
+    for wsl_tool in git gh python3 node; do
+      wsl_tool_path="$(command -v "$wsl_tool" 2>/dev/null || true)"
+      [ -n "$wsl_tool_path" ] || continue
+      _herd_wsl_interop_path "$wsl_tool_path" || continue
+      wsl_interop_hits="${wsl_interop_hits:+$wsl_interop_hits, }$wsl_tool ($wsl_tool_path)"
+    done
+    if [ -n "$wsl_interop_hits" ]; then
+      printf '  \xe2\x9a\xa0 resolve via WSL interop, not a Linux-native install: %s\n' "$wsl_interop_hits"
+      printf '      fix: install the Linux build of each inside WSL; %s\n' "$(herd_wsl_interop_fix_hint)"
+      warn=$((warn+1))
+    else
+      printf '  \xe2\x9c\x93 git/gh/python3/node (whichever are installed) resolve Linux-native, no WSL interop\n'
+    fi
   fi
 
   # python3 — the JSON/UTF-8 pane helpers. Presence, then (only if present) its UTF-8 capability

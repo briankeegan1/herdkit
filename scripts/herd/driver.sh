@@ -1149,6 +1149,75 @@ except Exception:
   return "$rc"
 }
 
+# ── WSL interop guard (HERD-454) ─────────────────────────────────────────────────────────────────
+# FIELD FAILURE: a WSL user's builders died seconds after spawn because `claude` resolved via PATH
+# interop to /mnt/c/…claude.exe — a Windows binary bridged through WSL's interop channel, which dies
+# the moment the spawning lane's shell detaches. `herd doctor` said claude ✓ present the whole time:
+# presence was never the question, the RESOLVED BINARY was the wrong (Windows) one. ONE check here,
+# consumed by TWO surfaces (doctrine Rule 2): the LANE spawn gate (herd_preflight in
+# herd-preflight.sh, a hard refusal BEFORE any worktree/tab is created) and `herd doctor` (a reported
+# red row, same hint).
+#
+# Off WSL this is a complete no-op: herd_is_wsl is the ONLY probe that runs, so a non-WSL host adds
+# zero new spawn-path work and stays byte-identical.
+
+# _herd_wsl_proc_version_file — the /proc/version path the WSL probe reads. HERD_WSL_PROC_VERSION_FILE
+# overrides it (test seam: /proc/version cannot be faked in place on a non-WSL test host).
+_herd_wsl_proc_version_file() { printf '%s' "${HERD_WSL_PROC_VERSION_FILE:-/proc/version}"; }
+
+# herd_is_wsl — success iff this host is WSL (its /proc/version names Microsoft — the standard WSL
+# kernel-string marker). FAIL-SOFT: an unreadable/missing file (every non-Linux host, and most Linux
+# hosts too) reads as "not WSL" — never an abort, never a false positive.
+herd_is_wsl() {
+  local f; f="$(_herd_wsl_proc_version_file)"
+  [ -r "$f" ] || return 1
+  grep -qi microsoft "$f" 2>/dev/null
+}
+
+# _herd_wsl_interop_path <resolved-path> — success iff <resolved-path> looks like a WINDOWS binary
+# reached through WSL's PATH interop: under /mnt/ (the default Windows-drive mount point) or ending in
+# .exe (matched case-insensitively — Windows extensions are). Empty input never matches.
+_herd_wsl_interop_path() {
+  local p="${1:-}"
+  [ -n "$p" ] || return 1
+  case "$p" in /mnt/*) return 0 ;; esac
+  case "$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')" in *.exe) return 0 ;; esac
+  return 1
+}
+
+# herd_wsl_interop_fix_hint — the ONE fix sentence both consumers print, so the wording never drifts
+# between the lane refusal and the doctor row.
+herd_wsl_interop_fix_hint() {
+  printf 'install the Linux build inside WSL (npm install -g @anthropic-ai/claude-code with a Linux node — not the Windows node on PATH) and/or set [interop] appendWindowsPath=false in /etc/wsl.conf, then: wsl --shutdown'
+}
+
+# herd_driver_wsl_interop_guard — the LANE spawn-path check (HERD-454): on WSL, refuse when the ACTIVE
+# driver's resolved agent-runtime binary (claude/codex/grok — whatever HERD_DRIVER names; never
+# hardcoded) resolves through interop. FAIL-SOFT on anything short of a DEFINITIVE interop hit: no
+# active binary resolved on PATH at all → allow (a plain "missing" is herd_preflight's/doctor's OWN
+# separate concern, not this guard's). Off WSL: one herd_is_wsl call and done — no binary resolution
+# runs, so a non-WSL lane adds zero new spawn-path probes.
+herd_driver_wsl_interop_guard() {
+  herd_is_wsl || return 0
+  local drv binary resolved
+  drv="$(herd_driver_name)"
+  binary="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
+  [ -n "$binary" ] || binary="claude"   # herd_driver_agent_runtime's own documented fallback
+  resolved="$(command -v "$binary" 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 0
+  _herd_wsl_interop_path "$resolved" || return 0
+  {
+    echo "❌ herd: WSL interop guard refused the spawn."
+    echo "   $binary (driver: $drv) resolves to a WINDOWS binary via WSL PATH interop: $resolved"
+    echo "   A Windows process bridged through the interop channel dies the moment the spawning lane"
+    echo "   detaches — an agent launched this way dies seconds after spawn (herd doctor may still say"
+    echo "   the binary is ✓ present; presence isn't the problem, the resolved binary is)."
+    echo "   Fix: $(herd_wsl_interop_fix_hint)"
+    echo "   (bypass for tests/CI: HERD_SKIP_PREFLIGHT=1)"
+  } >&2
+  return 1
+}
+
 # ── start-agent ──────────────────────────────────────────────────────────────────────────────────
 # herd_driver_start_agent <slug> <worktree> <model> <flags> <pointer> [split] — spawn a builder agent
 # on a task. herdr-claude: a fresh herdr tab + `herdr agent start … claude`. headless: a DETACHED
