@@ -208,4 +208,24 @@ out="$(herd_journal_emission_lint "$W")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(13) a wrapped python emit must count as a producer; got rc=$rc: $out"
 ok
 
-echo "ALL PASS ($PASS checks)"
+# ── (14) parses under EVERY bash on this box, not just the ambient one ────────────────────────────
+# The builder's light gate runs `bash -n` with the AMBIENT bash. On macOS that is 3.2, which parses a
+# here-document inside a command substitution differently from bash 5.x: 5.x ends the heredoc at the
+# first line whose PREFIX matches the delimiter, so `<<'PY'` was closed early by the body line
+# `PY_APPEND = …` and the remaining python was parsed as shell. Locally green, ubuntu red — and
+# because this file is SOURCED by healthcheck.sh, the syntax error surfaced inside UNRELATED tests'
+# output (test-attribution-lint, test-baseline-gate) rather than pointing at itself.
+#
+# So this file is syntax-checked against every bash the box has, newest included. On a single-bash
+# host the loop still runs once and the check is honest about covering only what is installed.
+_bashes=""
+for _b in /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash "$(command -v bash 2>/dev/null)"; do
+  case " $_bashes " in *" $_b "*) continue ;; esac
+  [ -x "$_b" ] || continue
+  _bashes="$_bashes $_b"
+  "$_b" -n "$LINT" 2>/dev/null || fail "(14) $LINT does not parse under $_b ($("$_b" --version | head -1))"
+done
+[ -n "$_bashes" ] || fail "(14) no bash found to syntax-check with"
+ok
+
+echo "ALL PASS ($PASS checks · parsed under:$_bashes)"

@@ -78,9 +78,18 @@ gate_default|contract §3.2 documents this verdict PROVENANCE as latent-by-desig
 '
 
 # herd_journal_emission_check <root> — pure function; prints EMISSION-ORPHAN lines + ADVISORY. 0/1.
+#
+# The heredoc feeds python3 DIRECTLY and the function's exit status IS python3's — it is deliberately
+# NOT wrapped in a `$(…)` here. A here-document nested inside a command substitution is parsed by a
+# different path in bash, and from bash 5.x that path ends the here-document at the first line whose
+# PREFIX matches the delimiter rather than the first line EQUAL to it: with `<<'PY'`, the body line
+# `PY_APPEND = re.compile(…)` closed it early and the rest of the python was parsed as shell. bash 3.2
+# (macOS) does not do this, so it passed locally and broke the ubuntu gate — and because this file is
+# SOURCED by healthcheck.sh, the syntax error surfaced inside unrelated tests' output. Callers may
+# still wrap the CALL in `$(…)`: the function body was parsed once, at source time, outside any
+# substitution. The delimiter is also long and prefix-unique, so neither hazard can recur.
 herd_journal_emission_check() {
-  local _je_root="${1:-.}" _je_out _je_rc
-  _je_out="$(HERD_JE_ALLOW="$HERD_JOURNAL_EMISSION_ALLOW" python3 - "$_je_root" <<'PY'
+  HERD_JE_ALLOW="$HERD_JOURNAL_EMISSION_ALLOW" python3 - "${1:-.}" <<'JOURNAL_EMISSION_LINT_PY_EOF'
 import os, re, sys
 
 root = sys.argv[1]
@@ -295,8 +304,6 @@ for name in sorted(consumers):
 # HERD_JE_VERBOSE=1 dumps what the scan actually SAW. A guard that reports clean because its scan
 # surface misses the defect is the dominant failure shape in this tree, so the surface is made
 # inspectable: HERD_JE_VERBOSE=1 lists every name the scan saw on both sides.
-# (NB: this heredoc body must stay free of unbalanced apostrophes — the shell scans it for the
-# closing paren of the enclosing command substitution.)
 if os.environ.get("HERD_JE_VERBOSE"):
     for name in sorted(producers):
         print("SAW-PRODUCER %s" % name)
@@ -311,10 +318,7 @@ for name in orphans:
 print("ADVISORY: %d producer name(s), %d consumer-parsed name(s), %d allowlisted, %d orphan(s)"
       % (len(producers), len(consumers), len(allow), len(orphans)))
 sys.exit(1 if orphans else 0)
-PY
-)"; _je_rc=$?
-  [ -n "$_je_out" ] && printf '%s\n' "$_je_out"
-  return "$_je_rc"
+JOURNAL_EMISSION_LINT_PY_EOF
 }
 
 # herd_journal_emission_lint [<root>] — gate entrypoint. 0 clean · 1 orphan(s) · 2 skipped (never red).

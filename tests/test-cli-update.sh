@@ -233,7 +233,12 @@ P="$T/p10"; mkdir "$P"
 _make_project "$P" "updatetest"
 mv "$BIN/herdr" "$BIN/herdr.bak"
 out="$(_run_update "$P" "$CLEAN_ENGINE")"
-printf '%s' "$out" | grep -qi "reload complete\|MERGE_POLICY" \
+# HERD-441 class, hit live on the macos CI leg of PR #563: `printf | grep -q` is EPIPE-unsafe under
+# pipefail — grep -q exits on the first match while printf is still writing, and once $out crosses the
+# platform pipe buffer (16KB on macOS, 64KB on linux) printf takes SIGPIPE and the pipeline goes
+# non-zero on a MATCH. Here-string is the shared lint's prescribed safe form: no producer process, so
+# nothing can EPIPE. Pre-existing, not this PR's change — fixed only because it reds this PR's leg.
+grep -qi "reload complete\|MERGE_POLICY" <<< "$out" \
   || fail "update should succeed even when herdr is absent"
 mv "$BIN/herdr.bak" "$BIN/herdr"
 ok
