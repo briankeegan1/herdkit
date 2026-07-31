@@ -82,7 +82,7 @@ MODEL_FEATURE="test-feature-model"
 EOF
 
 # agent_start_line <slug> — the logged `herdr agent start … -- claude …` invocation (empty if none).
-agent_start_line() { grep -E 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null | head -1; }
+agent_start_line() { grep -Em1 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null; }
 
 # ── (a) HAPPY PATH — both lanes externalize the spec and pass only a short pointer ──────────────────
 happy() {

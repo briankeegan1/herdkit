@@ -67,9 +67,9 @@ EOF
 
 build_tracker_drift
 [ -n "${TRACKER_DRIFT:-}" ] || fail "(1) section must render when a healed row exists"
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-377" || fail "(1) the healed row for HERD-377 must render"
+grep -q "HERD-377" <<< "$TRACKER_DRIFT" || fail "(1) the healed row for HERD-377 must render"
 ok
-printf '%s' "$TRACKER_DRIFT" | grep -q "failed" && fail "(1) the superseded failed row for HERD-377 must NOT render"
+grep -q "failed" <<< "$TRACKER_DRIFT" && fail "(1) the superseded failed row for HERD-377 must NOT render"
 ok
 [ "$(printf '%s' "$TRACKER_DRIFT" | grep -c .)" -eq 1 ] \
   || fail "(1) expected exactly 1 rendered row (got $(printf '%s' "$TRACKER_DRIFT" | grep -c .))"
@@ -86,9 +86,9 @@ $NOW healed HERD-400 400 merged
 EOF
 
 build_tracker_drift
-printf '%s' "$TRACKER_DRIFT" | grep -q "healed" || fail "(2) the healed row for HERD-400 must render"
+grep -q "healed" <<< "$TRACKER_DRIFT" || fail "(2) the healed row for HERD-400 must render"
 ok
-printf '%s' "$TRACKER_DRIFT" | grep -q "failed" && fail "(2) all failed rows for HERD-400 must be superseded"
+grep -q "failed" <<< "$TRACKER_DRIFT" && fail "(2) all failed rows for HERD-400 must be superseded"
 ok
 [ "$(printf '%s' "$TRACKER_DRIFT" | grep -c .)" -eq 1 ] \
   || fail "(2) expected exactly 1 rendered row (got $(printf '%s' "$TRACKER_DRIFT" | grep -c .))"
@@ -101,9 +101,9 @@ $NOW healed HERD-600 600 merged
 EOF
 
 build_tracker_drift
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-600" || fail "(3) healed HERD-600 must render"
+grep -q "HERD-600" <<< "$TRACKER_DRIFT" || fail "(3) healed HERD-600 must render"
 ok
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-500" || fail "(3) failed HERD-500 must still render (different ref)"
+grep -q "HERD-500" <<< "$TRACKER_DRIFT" || fail "(3) failed HERD-500 must still render (different ref)"
 ok
 [ "$(printf '%s' "$TRACKER_DRIFT" | grep -c .)" -eq 2 ] \
   || fail "(3) expected exactly 2 rendered rows (got $(printf '%s' "$TRACKER_DRIFT" | grep -c .))"

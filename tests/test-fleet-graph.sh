@@ -91,29 +91,29 @@ set -e
 [ "$rc" -eq 0 ] || fail "fleet graph should exit 0, got $rc"; ok
 
 alpha_block="$(printf '%s' "$out" | awk '/^alpha/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$alpha_block" | grep -q 'link' || fail "alpha block should show a link edge: $alpha_block"
-printf '%s' "$alpha_block" | grep -q 'beta'          || fail "alpha should link to beta"
-printf '%s' "$alpha_block" | grep -Eq 'link.*gamma.*\[registered\]' \
+grep -q 'link' <<< "$alpha_block" || fail "alpha block should show a link edge: $alpha_block"
+grep -q 'beta' <<< "$alpha_block" || fail "alpha should link to beta"
+grep -Eq 'link.*gamma.*\[registered\]' <<< "$alpha_block" \
   || fail "alpha's gamma link (no repo recorded) should resolve via name-fallback to registered: $alpha_block"
-printf '%s' "$alpha_block" | grep -Eq 'link.*unknownpeer.*\[unregistered\]' \
+grep -Eq 'link.*unknownpeer.*\[unregistered\]' <<< "$alpha_block" \
   || fail "alpha's unknownpeer link should be unregistered: $alpha_block"
-printf '%s' "$alpha_block" | grep -Eq 'blocked-on.*beta#7.*\[registered\]' \
+grep -Eq 'blocked-on.*beta#7.*\[registered\]' <<< "$alpha_block" \
   || fail "alpha's blocked-on beta#7 should be registered: $alpha_block"
-printf '%s' "$alpha_block" | grep -Eq 'watch.*unknownpeer#3.*\[unregistered\]' \
+grep -Eq 'watch.*unknownpeer#3.*\[unregistered\]' <<< "$alpha_block" \
   || fail "alpha's watch unknownpeer#3 should be unregistered: $alpha_block"
 ok
 
 beta_block="$(printf '%s' "$out" | awk '/^beta/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$beta_block" | grep -qi 'no links or deps' || fail "beta (no links/deps) block: $beta_block"
+grep -qi 'no links or deps' <<< "$beta_block" || fail "beta (no links/deps) block: $beta_block"
 ok
 
 gamma_block="$(printf '%s' "$out" | awk '/^gamma/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$gamma_block" | grep -Eq 'link.*ghostproj.*\[unreachable\]' \
+grep -Eq 'link.*ghostproj.*\[unreachable\]' <<< "$gamma_block" \
   || fail "gamma's ghostproj link should be unreachable (registered row, gone path): $gamma_block"
 ok
 
 ghost_block="$(printf '%s' "$out" | awk '/^ghostproj/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$ghost_block" | grep -qi 'unreachable' || fail "ghostproj itself should render as unreachable: $ghost_block"
+grep -qi 'unreachable' <<< "$ghost_block" || fail "ghostproj itself should render as unreachable: $ghost_block"
 ok
 
 # ── 2. --json shape ──────────────────────────────────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ set +e
 out="$(HERD_FLEET_FILE="$EMPTY_REG" bash "$HERD" fleet graph)"; rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "an absent registry should still exit 0, got $rc"
-printf '%s' "$out" | grep -qi 'no fleet registry yet' || fail "absent registry should print a friendly note: $out"
+grep -qi 'no fleet registry yet' <<< "$out" || fail "absent registry should print a friendly note: $out"
 ok
 
 J2="$T/empty.json"

@@ -63,18 +63,18 @@ ok
 BLOCK_BODY="$(printf 'Some PR prose above.\n\n<!-- herd-handoff:v1 -->\n### Builder handoff\n- **Changed:** adds the handoff emitter\n- **Files:** scripts/herd/handoff.sh, tests/test-handoff-summary.sh\n- **Decisions:** self-contained script, no preamble edit\n- **Verification:** healthcheck.sh -> PASS\n- **Follow-ups:** none\n<!-- /herd-handoff:v1 -->\n')"
 printf '%s' "$BLOCK_BODY" | handoff_has || fail "present block should satisfy handoff_has"
 ok
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q '<!-- herd-handoff:v1 -->' || fail "extract missing begin sentinel"
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q '<!-- /herd-handoff:v1 -->' || fail "extract missing end sentinel"
+grep -q '<!-- herd-handoff:v1 -->' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" || fail "extract missing begin sentinel"
+grep -q '<!-- /herd-handoff:v1 -->' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" || fail "extract missing end sentinel"
 ok
 # extract must NOT include the surrounding prose
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q 'Some PR prose above' && fail "extract leaked prose outside the block"
+grep -q 'Some PR prose above' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" && fail "extract leaked prose outside the block"
 ok
 fields="$(printf '%s' "$BLOCK_BODY" | handoff_fields)"
-printf '%s' "$fields" | grep -q '^changed=adds the handoff emitter$'   || fail "changed field wrong: $fields"
-printf '%s' "$fields" | grep -q '^files=scripts/herd/handoff.sh, tests/test-handoff-summary.sh$' || fail "files field wrong: $fields"
-printf '%s' "$fields" | grep -q '^decisions=self-contained script, no preamble edit$' || fail "decisions field wrong: $fields"
-printf '%s' "$fields" | grep -q '^verification=healthcheck.sh -> PASS$' || fail "verification field wrong: $fields"
-printf '%s' "$fields" | grep -q '^followups=none$' || fail "followups field wrong: $fields"
+grep -q '^changed=adds the handoff emitter$' <<< "$fields" || fail "changed field wrong: $fields"
+grep -q '^files=scripts/herd/handoff.sh, tests/test-handoff-summary.sh$' <<< "$fields" || fail "files field wrong: $fields"
+grep -q '^decisions=self-contained script, no preamble edit$' <<< "$fields" || fail "decisions field wrong: $fields"
+grep -q '^verification=healthcheck.sh -> PASS$' <<< "$fields" || fail "verification field wrong: $fields"
+grep -q '^followups=none$' <<< "$fields" || fail "followups field wrong: $fields"
 ok
 [ "$(printf '%s' "$BLOCK_BODY" | handoff_field Changed)" = "adds the handoff emitter" ] || fail "handoff_field Changed wrong"
 [ "$(printf '%s' "$BLOCK_BODY" | handoff_field verification)" = "healthcheck.sh -> PASS" ] || fail "handoff_field verification wrong"
@@ -102,16 +102,16 @@ ok
 
 # ── 5. handoff_render — shape-complete, empty→em dash, multiline collapse ─────────────────────────
 rendered="$(HANDOFF_CHANGED="did a thing" HANDOFF_FILES="x.sh" handoff_render)"
-printf '%s' "$rendered" | grep -q '^<!-- herd-handoff:v1 -->$'  || fail "render missing begin sentinel"
-printf '%s' "$rendered" | grep -q '^<!-- /herd-handoff:v1 -->$' || fail "render missing end sentinel"
-printf '%s' "$rendered" | grep -q -- '- \*\*Changed:\*\* did a thing' || fail "render missing Changed value"
+grep -q '^<!-- herd-handoff:v1 -->$' <<< "$rendered" || fail "render missing begin sentinel"
+grep -q '^<!-- /herd-handoff:v1 -->$' <<< "$rendered" || fail "render missing end sentinel"
+grep -q -- '- \*\*Changed:\*\* did a thing' <<< "$rendered" || fail "render missing Changed value"
 # unset fields become em dashes so the block is always complete
-printf '%s' "$rendered" | grep -q -- '- \*\*Decisions:\*\* —' || fail "empty Decisions should render as em dash"
+grep -q -- '- \*\*Decisions:\*\* —' <<< "$rendered" || fail "empty Decisions should render as em dash"
 ok
 # multi-line value collapses to one physical line (preserves the one-field-per-line parse contract)
 ml="$(HANDOFF_DECISIONS="$(printf 'line one\nline two')" handoff_render)"
 [ "$(printf '%s' "$ml" | grep -c 'Decisions')" = "1" ] || fail "multi-line Decisions must collapse to one line"
-printf '%s' "$ml" | grep -q -- '- \*\*Decisions:\*\* line one line two' || fail "multi-line collapse text wrong"
+grep -q -- '- \*\*Decisions:\*\* line one line two' <<< "$ml" || fail "multi-line collapse text wrong"
 ok
 
 # ── 6. Round-trip: render → parse recovers every field ───────────────────────────────────────────
@@ -127,21 +127,21 @@ ok
 # ── 7. handoff_upsert_body — append when absent, REPLACE when present (idempotent) ────────────────
 base="$(printf 'Original PR body.\n\nRefs: HERD-106\n')"
 once="$(printf '%s' "$base" | HANDOFF_CHANGED="first" handoff_upsert_body)"
-printf '%s' "$once" | grep -q 'Original PR body' || fail "upsert dropped the original body"
-[ "$(printf '%s' "$once" | grep -c 'herd-handoff:v1' )" = "2" ] || fail "upsert should add exactly one block (2 sentinels)"
+grep -q 'Original PR body' <<< "$once" || fail "upsert dropped the original body"
+[ "$(printf '%s' "$once" | grep -c 'herd-handoff:v1')" = "2" ] || fail "upsert should add exactly one block (2 sentinels)"
 [ "$(printf '%s' "$once" | handoff_field changed)" = "first" ] || fail "upsert appended wrong Changed"
 ok
 # re-emit REPLACES, never stacks — still exactly one block, new value wins
 twice="$(printf '%s' "$once" | HANDOFF_CHANGED="second" handoff_upsert_body)"
-[ "$(printf '%s' "$twice" | grep -c 'herd-handoff:v1' )" = "2" ] || fail "re-emit must not stack blocks"
+[ "$(printf '%s' "$twice" | grep -c 'herd-handoff:v1')" = "2" ] || fail "re-emit must not stack blocks"
 [ "$(printf '%s' "$twice" | handoff_field changed)" = "second" ] || fail "re-emit should replace the value"
-printf '%s' "$twice" | grep -q 'Original PR body' || fail "re-emit dropped the original body"
+grep -q 'Original PR body' <<< "$twice" || fail "re-emit dropped the original body"
 ok
 
 # ── 8. CLI: render / emit / show / fields via the gh stub ─────────────────────────────────────────
 cli_render="$(bash "$HANDOFF" render --changed "cli change" --files "z.sh")"
-printf '%s' "$cli_render" | grep -q -- '- \*\*Changed:\*\* cli change' || fail "CLI render missing value"
-printf '%s' "$cli_render" | grep -q -- '- \*\*Files:\*\* z.sh' || fail "CLI render missing files"
+grep -q -- '- \*\*Changed:\*\* cli change' <<< "$cli_render" || fail "CLI render missing value"
+grep -q -- '- \*\*Files:\*\* z.sh' <<< "$cli_render" || fail "CLI render missing files"
 ok
 # seed a PR body, emit into it, read it back
 printf 'Body of PR 42.\nRefs: HERD-106\n' > "$BODIES/42"
@@ -152,8 +152,8 @@ grep -q 'Body of PR 42' "$BODIES/42" || fail "emit clobbered the original PR bod
 [ "$(handoff_field changed < "$BODIES/42")" = "emitted change" ] || fail "emit did not persist the block"
 ok
 # show prints the block; fields <pr#> reads it back as key=value
-bash "$HANDOFF" show 42 | grep -q '<!-- herd-handoff:v1 -->' || fail "CLI show missing block"
-bash "$HANDOFF" fields 42 | grep -q '^verification=healthcheck -> PASS$' || fail "CLI fields <pr#> wrong"
+grep -q '<!-- herd-handoff:v1 -->' <<< "$(bash "$HANDOFF" show 42)" || fail "CLI show missing block"
+grep -q '^verification=healthcheck -> PASS$' <<< "$(bash "$HANDOFF" fields 42)" || fail "CLI fields <pr#> wrong"
 ok
 # re-emit into the same PR stays single-block (idempotent through the CLI)
 bash "$HANDOFF" emit 42 --changed "re-emitted" >/dev/null || fail "CLI re-emit non-zero"

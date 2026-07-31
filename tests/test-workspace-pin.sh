@@ -75,7 +75,7 @@ emptybin="$T/noherdr"; mkdir -p "$emptybin"
 out="$(resolve_stdout alpha "$emptybin:$SYS")"
 [ -z "$out" ] || fail "(b) missing herdr: expected empty id (got: '$out')"
 warn="$(resolve_stderr alpha "$emptybin:$SYS")"
-printf '%s' "$warn" | grep -qiE "without --workspace|not on PATH" \
+grep -qiE "without --workspace|not on PATH" <<< "$warn" \
   || fail "(b) missing herdr: no warning on stderr (got: $warn)"
 ok
 
@@ -84,7 +84,7 @@ failstub="$(write_stub fail 'exit 1')"
 out="$(resolve_stdout alpha "$failstub:$SYS")"
 [ -z "$out" ] || fail "(c) failed list: expected empty id (got: '$out')"
 warn="$(resolve_stderr alpha "$failstub:$SYS")"
-printf '%s' "$warn" | grep -qiE "failed|without --workspace" \
+grep -qiE "failed|without --workspace" <<< "$warn" \
   || fail "(c) failed list: no warning on stderr (got: $warn)"
 ok
 
@@ -92,7 +92,7 @@ ok
 out="$(resolve_stdout "unknown-project" "$goodstub:$SYS")"
 [ -z "$out" ] || fail "(d) unknown label: expected empty id (got: '$out')"
 warn="$(resolve_stderr "unknown-project" "$goodstub:$SYS")"
-printf '%s' "$warn" | grep -qiE "not found|without --workspace" \
+grep -qiE "not found|without --workspace" <<< "$warn" \
   || fail "(d) unknown label: no warning on stderr (got: $warn)"
 ok
 

@@ -137,10 +137,10 @@ n_send="$("$GREP" -cE 'herd_driver_send_text' "$WATCH" || true)"
 [ "$n_send" -ge 6 ] || fail "(E) expected >=6 herd_driver_send_text call sites on the three refix rails (got $n_send)"
 # No live COMPOSE of `claude … --continue` remains (notification prose mentioning the phrase is fine
 # and stays baselined in the hardcode lint). The pre-P4 compose was `_rb_cmd=… && claude … --continue`.
-if awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/ && s ~ /_rb_cmd=.*claude/ ) print }' "$WATCH" | grep -q .; then
+if grep -q . <<< "$(awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/ && s ~ /_rb_cmd=.*claude/ ) print }' "$WATCH")"; then
   fail "(E) agent-watch.sh still composes resume via a raw _rb_cmd=…claude line"
 fi
-if awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/ && s ~ /&& claude /) print }' "$WATCH" | grep -q .; then
+if grep -q . <<< "$(awk '{ s=$0; sub(/^[ \t]+/,"",s); if (s !~ /^#/ && s ~ /&& claude /) print }' "$WATCH")"; then
   fail "(E) agent-watch.sh still has a live '&& claude ' resume compose"
 fi
 # Raw `herdr pane run` of a re-task prompt on the stale/health rails is gone (resume still uses

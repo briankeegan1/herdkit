@@ -38,11 +38,11 @@ source_config() {
 out=$(source_config 'printf "PYTHONUTF8=%s\n" "${PYTHONUTF8:-UNSET}"
 printf "PYTHONIOENCODING=%s\n" "${PYTHONIOENCODING:-UNSET}"')
 
-printf '%s' "$out" | grep -qx "PYTHONUTF8=1" \
+grep -qx "PYTHONUTF8=1" <<< "$out" \
   || fail "(a) PYTHONUTF8=1 not exported by herd-config.sh (got: $out)"
 ok
 
-printf '%s' "$out" | grep -qx "PYTHONIOENCODING=utf-8" \
+grep -qx "PYTHONIOENCODING=utf-8" <<< "$out" \
   || fail "(a) PYTHONIOENCODING=utf-8 not exported by herd-config.sh (got: $out)"
 ok
 
@@ -52,7 +52,7 @@ ok
 result=$(cd "$T" && HERD_CONFIG_FILE="$T/.nonexistent" PYTHONIOENCODING=ascii bash -c \
   ". '$LOADER'; python3 -c \"print(chr(0x2550))\"" 2>&1)
 # chr(0x2550) = '═' (U+2550, BOX DRAWINGS DOUBLE HORIZONTAL) — the exact char from issue #31.
-printf '%s' "$result" | grep -qF "═" \
+grep -qF "═" <<< "$result" \
   || fail "(b) python3 cannot print non-ASCII (═) after sourcing config with pre-set ascii encoding (got: $result)"
 ok
 
@@ -89,11 +89,11 @@ coord_out=$(HERD_ALLOW_FOREIGN_CWD=1 HERD_SKIP_PREFLIGHT=1 HERD_CONFIG_FILE="$T/
   || fail "(c) coordinator.sh should exit non-zero when workspace list fails (got exit 0)"
 ok
 
-printf '%s' "$coord_out" | grep -q "ERROR \[workspace resolve\]" \
+grep -q "ERROR \[workspace resolve\]" <<< "$coord_out" \
   || fail "(c) coordinator.sh did not print 'ERROR [workspace resolve]' (got: $coord_out)"
 ok
 
-printf '%s' "$coord_out" | grep -q "connection refused" \
+grep -q "connection refused" <<< "$coord_out" \
   || fail "(c) coordinator.sh did not surface the underlying error (got: $coord_out)"
 ok
 

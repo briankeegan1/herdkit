@@ -89,7 +89,7 @@ write_cfg() {  # write_cfg <CONTEXT_PROVISION value or __UNSET__>
 }
 
 # run_lane <script> <slug> — run a lane with the current $CFG; leaves the spec file + herdr log.
-agent_start_line() { grep -E 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null | head -1; }
+agent_start_line() { grep -Em1 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null; }
 run_lane() {
   local script="$1" slug="$2"
   export HERDR_CALL_LOG="$T/$slug.herdr.log"; : > "$HERDR_CALL_LOG"
@@ -117,8 +117,8 @@ for pair in "quick $QUICK" "feat $FEATURE"; do
   spec="$TREES/$slug.task.md"
   grep -q "$CODEMAP_MARK" "$spec" || fail "$slug: ON but the codemap pointer is missing from the spec"
   # The grounding lives in the STABLE preamble region: it must appear BEFORE the per-task body.
-  mark_ln=$(grep -n "$CODEMAP_MARK"    "$spec" | head -1 | cut -d: -f1)
-  body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  mark_ln=$(grep -nm1 "$CODEMAP_MARK"    "$spec" | cut -d: -f1)
+  body_ln=$(grep -nm1 "SENTINEL_TASK_BODY" "$spec" | cut -d: -f1)
   [ -n "$mark_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate grounding/body lines"
   [ "$mark_ln" -lt "$body_ln" ] || fail "$slug: grounding ($mark_ln) is NOT before the per-task body ($body_ln) — not in the stable preamble"
   # The externalization contract still holds: argv carries ONLY the short pointer, not the spec/grounding.
@@ -142,8 +142,8 @@ export HERD_ITEM_REF="HERD-999"
 run_lane "$QUICK" "cp-refs"
 unset HERD_ITEM_REF
 spec="$TREES/cp-refs.task.md"
-mark_ln=$(grep -n "$CODEMAP_MARK"     "$spec" | head -1 | cut -d: -f1)
-refs_ln=$(grep -n "Refs: HERD-999"    "$spec" | head -1 | cut -d: -f1)
+mark_ln=$(grep -nm1 "$CODEMAP_MARK"     "$spec" | cut -d: -f1)
+refs_ln=$(grep -nm1 "Refs: HERD-999"    "$spec" | cut -d: -f1)
 [ -n "$mark_ln" ] || fail "cp-refs: codemap pointer missing"
 [ -n "$refs_ln" ] || fail "cp-refs: Refs trailer missing (HERD_ITEM_REF not threaded?)"
 [ "$mark_ln" -le "$refs_ln" ] || fail "cp-refs: grounding ($mark_ln) came AFTER the unique Refs trailer ($refs_ln) — breaks the maximal cache prefix"
@@ -158,8 +158,8 @@ for pair in "quick $QUICK" "feat $FEATURE"; do
   grep -q "$SYMIDX_MARK"  "$spec" || fail "$slug: ON but the symbol-index pointer is missing from the spec"
   grep -q "$CODEMAP_MARK" "$spec" && fail "$slug: symbol-index only, but the codemap pointer leaked in"
   # The grounding lives in the STABLE preamble region: it must appear BEFORE the per-task body.
-  mark_ln=$(grep -n "$SYMIDX_MARK"       "$spec" | head -1 | cut -d: -f1)
-  body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  mark_ln=$(grep -nm1 "$SYMIDX_MARK"       "$spec" | cut -d: -f1)
+  body_ln=$(grep -nm1 "SENTINEL_TASK_BODY" "$spec" | cut -d: -f1)
   [ -n "$mark_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate grounding/body lines"
   [ "$mark_ln" -lt "$body_ln" ] || fail "$slug: grounding ($mark_ln) is NOT before the per-task body ($body_ln) — not in the stable preamble"
   # The externalization contract still holds: argv carries ONLY the short pointer, not the spec/grounding.
@@ -175,9 +175,9 @@ run_lane "$QUICK" "si-both"
 spec="$TREES/si-both.task.md"
 grep -q "$CODEMAP_MARK" "$spec" || fail "si-both: codemap pointer missing when both sources configured"
 grep -q "$SYMIDX_MARK"  "$spec" || fail "si-both: symbol-index pointer missing when both sources configured"
-cm_ln=$(grep -n "$CODEMAP_MARK"       "$spec" | head -1 | cut -d: -f1)
-si_ln=$(grep -n "$SYMIDX_MARK"        "$spec" | head -1 | cut -d: -f1)
-body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+cm_ln=$(grep -nm1 "$CODEMAP_MARK"       "$spec" | cut -d: -f1)
+si_ln=$(grep -nm1 "$SYMIDX_MARK"        "$spec" | cut -d: -f1)
+body_ln=$(grep -nm1 "SENTINEL_TASK_BODY" "$spec" | cut -d: -f1)
 [ "$cm_ln" -lt "$body_ln" ] && [ "$si_ln" -lt "$body_ln" ] || fail "si-both: a grounding pointer landed after the per-task body — not in the stable preamble"
 pass; echo "PASS (f) both grounding sources inject together, each in the STABLE preamble"
 
@@ -194,8 +194,8 @@ for pair in "quick $QUICK" "feat $FEATURE"; do
   spec="$TREES/$slug.task.md"
   grep -qF "$AGENTS_MARK" "$spec" || fail "$slug: agents-md ON but the AGENTS.md content was not inlined into the spec"
   # It is CONTENT inlining, not a pointer: the literal convention sentence lands in the STABLE preamble.
-  mark_ln=$(grep -nF "$AGENTS_MARK"      "$spec" | head -1 | cut -d: -f1)
-  body_ln=$(grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  mark_ln=$(grep -nFm1 "$AGENTS_MARK"      "$spec" | cut -d: -f1)
+  body_ln=$(grep -nm1 "SENTINEL_TASK_BODY" "$spec" | cut -d: -f1)
   [ -n "$mark_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate conventions/body lines"
   [ "$mark_ln" -lt "$body_ln" ] || fail "$slug: inlined conventions ($mark_ln) not before the per-task body ($body_ln)"
   # Externalization still holds: the agent-start argv carries ONLY the short pointer, not the conventions.

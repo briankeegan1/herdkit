@@ -38,8 +38,8 @@ EOF
 chmod +x "$T/bin/gh"
 
 out="$( cd "$P1" && PATH="$T/bin:$PATH" bash "$HERD" backlog )" || fail "herd backlog (github) exited non-zero"
-echo "$out" | grep -q "^#7 first open issue$"  || fail "github backlog missing '#7 first open issue' ($out)"
-echo "$out" | grep -q "^#9 second open issue$" || fail "github backlog missing '#9 second open issue'"
+grep -q "^#7 first open issue$" <<< "$out" || fail "github backlog missing '#7 first open issue' ($out)"
+grep -q "^#9 second open issue$" <<< "$out" || fail "github backlog missing '#9 second open issue'"
 grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" \
   || fail "herd backlog did not invoke the github backend's 'gh issue list --state open' on HERD_REPO"
 pass
@@ -63,9 +63,9 @@ cat > "$P2/BACKLOG.md" <<'EOF'
 - ✅ already done (should NOT list)
 EOF
 out2="$( cd "$P2" && bash "$HERD" backlog )" || fail "herd backlog (file) exited non-zero"
-echo "$out2" | grep -q "🚧 wiring the feedback loop" || fail "file backlog missing the 🚧 in-progress line ($out2)"
-echo "$out2" | grep -q "🔜 add a dark-mode toggle"   || fail "file backlog missing the 🔜 planned line"
-echo "$out2" | grep -q "already done"                && fail "file backlog should not list ✅ shipped items"
+grep -q "🚧 wiring the feedback loop" <<< "$out2" || fail "file backlog missing the 🚧 in-progress line ($out2)"
+grep -q "🔜 add a dark-mode toggle" <<< "$out2" || fail "file backlog missing the 🔜 planned line"
+grep -q "already done" <<< "$out2" && fail "file backlog should not list ✅ shipped items"
 pass
 
 # ── Case 2b: --rich on a backend with no rich op (file) → falls back to the plain list ──────────
@@ -75,7 +75,7 @@ pass
 
 # ── Case 2c: show on a backend with no detail op (file) → greps the plain list for the ref ──────
 out2c="$( cd "$P2" && bash "$HERD" backlog show "dark-mode" )" || fail "herd backlog show (file) exited non-zero"
-echo "$out2c" | grep -q "add a dark-mode toggle" || fail "show fallback did not surface the matching open line ($out2c)"
+grep -q "add a dark-mode toggle" <<< "$out2c" || fail "show fallback did not surface the matching open line ($out2c)"
 if ( cd "$P2" && bash "$HERD" backlog show "no-such-item" ) >/dev/null 2>&1; then
   fail "show with no matching item should exit non-zero"
 fi
@@ -85,7 +85,7 @@ pass
 # PATH is restricted so fzf can never be found even on a dev machine that has it installed.
 out2d="$( cd "$P2" && env PATH="/usr/bin:/bin:/usr/sbin:/sbin" bash "$HERD" backlog browse 2>"$T/browse.err" )" \
   || fail "herd backlog browse (no fzf) exited non-zero"
-echo "$out2d" | grep -q "🔜 add a dark-mode toggle" || fail "browse fallback did not print the plain list ($out2d)"
+grep -q "🔜 add a dark-mode toggle" <<< "$out2d" || fail "browse fallback did not print the plain list ($out2d)"
 grep -q "fzf not found" "$T/browse.err" || fail "browse fallback missing the fzf install hint on stderr"
 pass
 

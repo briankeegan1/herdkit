@@ -164,7 +164,7 @@ report_out="$(cd "$CONSUMER" \
          "auth-service blocked on token-refresh feature — needed to unblock consumer-app lane" \
        2>&1)"
 printf '%s\n' "$report_out" | while IFS= read -r line; do info "$line"; done
-gh_create_line="$(grep "issue create" "$GHLOG" 2>/dev/null | head -1 || true)"
+gh_create_line="$(grep -m1 "issue create" "$GHLOG" 2>/dev/null || true)"
 if [ -n "$gh_create_line" ]; then
   ok "Issue filed on provider-org/provider-lib → #${ISSUE_NUMBER}"
 else

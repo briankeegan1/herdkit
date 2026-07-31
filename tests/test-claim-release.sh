@@ -94,14 +94,14 @@ ok
 # A4 — release CLEARS our own claim: the (claimed by …) stamp goes, 🚧 goes back to 🔜.
 : > "$JOURNAL_FILE"
 ( cd "$REPO" && HERD_CLAIM_ID=wedge-item WATCHER_OWNER=alice herd_claim_or_abort wedge-item-slug ) >/dev/null 2>&1
-item_line | grep -q '🚧' || fail "A4 fixture: the claim did not flip the line to 🚧: $(item_line)"
-item_line | grep -q 'claimed by alice' || fail "A4 fixture: the claim did not stamp the owner: $(item_line)"
+grep -q '🚧' <<< "$(item_line)" || fail "A4 fixture: the claim did not flip the line to 🚧: $(item_line)"
+grep -q 'claimed by alice' <<< "$(item_line)" || fail "A4 fixture: the claim did not stamp the owner: $(item_line)"
 ok
 
 out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice wedge-item-slug dead-builder)"
 [ "$out" = released ]                     || fail "A4 release should echo 'released', got '$out'"
-item_line | grep -q 'claimed by'          && fail "A4 release must strip the claim stamp: $(item_line)"
-item_line | grep -q '🔜'                  || fail "A4 release must put the line back to 🔜: $(item_line)"
+grep -q 'claimed by' <<< "$(item_line)" && fail "A4 release must strip the claim stamp: $(item_line)"
+grep -q '🔜' <<< "$(item_line)" || fail "A4 release must put the line back to 🔜: $(item_line)"
 grep -q '"event":"claim_released"'  "$JOURNAL_FILE" || fail "A4 release must journal claim_released"
 grep -q '"result":"RELEASED"'       "$JOURNAL_FILE" || fail "A4 release must journal the tracker_write (HERD-85)"
 ok
@@ -111,7 +111,7 @@ ok
 printf -- '- 🚧 wedge-item — a thing to build (claimed by bob)\n' > "$BACKLOG_FILE"
 out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
 [ "$out" = notours ]                      || fail "A5 a foreign claim should echo 'notours', got '$out'"
-item_line | grep -q 'claimed by bob'      || fail "A5 bob's claim was stolen: $(item_line)"
+grep -q 'claimed by bob' <<< "$(item_line)" || fail "A5 bob's claim was stolen: $(item_line)"
 grep -q '"reason":"not-ours"' "$JOURNAL_FILE" || fail "A5 the refusal must be journaled"
 ok
 
@@ -119,7 +119,7 @@ ok
 printf -- '- ✅ wedge-item — a thing to build\n' > "$BACKLOG_FILE"
 out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
 [ "$out" = notours ]                      || fail "A5b a shipped item should echo 'notours', got '$out'"
-item_line | grep -q '✅'                   || fail "A5b a shipped line was rewritten: $(item_line)"
+grep -q '✅' <<< "$(item_line)" || fail "A5b a shipped line was rewritten: $(item_line)"
 ok
 
 # A5c — THE PUSH MUST LAND OR SAY IT DID NOT (review of PR #399). With a remote configured but
@@ -149,7 +149,7 @@ ok
 git -C "$REPO" remote remove origin 2>/dev/null || true
 out="$(cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice slug dead-builder)"
 [ "$out" = released ] || fail "A5d a solo operator with no remote must still be able to release, got '$out'"
-item_line | grep -q 'claimed by' && fail "A5d the claim stamp survived a local release"
+grep -q 'claimed by' <<< "$(item_line)" && fail "A5d the claim stamp survived a local release"
 ok
 
 # A6 — a backend with NO release op degrades to the flag contract: surfaced + journaled, never a red.
@@ -179,7 +179,7 @@ ok   # the wedge, reproduced: with alice's builder dead, bob can never pick this
 ( cd "$REPO" && CLAIM_RELEASE=release herd_claim_release wedge-item alice a-slug dead-builder ) >/dev/null
 ( cd "$REPO" && HERD_CLAIM_ID=wedge-item WATCHER_OWNER=bob herd_claim_or_abort b-slug ) >/dev/null 2>&1 \
   || fail "B after the release, bob's claim STILL aborts — the item is still wedged"
-item_line | grep -q 'claimed by bob' || fail "B bob should now own the item: $(item_line)"
+grep -q 'claimed by bob' <<< "$(item_line)" || fail "B bob should now own the item: $(item_line)"
 ok   # released → the very same claim that aborted now succeeds
 
 # ══ C. THE WATCHER'S POLICY RAILS (_maybe_release_claim) ═════════════════════════════════════════

@@ -115,7 +115,7 @@ empty_overlay="$(dump_effective "$LB/.herd/config" "$EMPTY")"
 $no_overlay
 --- empty overlay ---
 $empty_overlay"
-printf '%s\n' "$no_overlay" | grep -qx 'MODEL_QUICK=claude-baseline' || fail "(a) baseline MODEL_QUICK not effective ($no_overlay)"
+grep -qx 'MODEL_QUICK=claude-baseline' <<< "$no_overlay" || fail "(a) baseline MODEL_QUICK not effective ($no_overlay)"
 okp
 
 # (b) An overlay override wins; a key it does NOT set keeps the baseline value.
@@ -124,8 +124,8 @@ cat > "$OV" <<'CFG'
 MODEL_QUICK="claude-local-override"
 CFG
 ov_out="$(dump_effective "$LB/.herd/config" "$OV")"
-printf '%s\n' "$ov_out" | grep -qx 'MODEL_QUICK=claude-local-override' || fail "(b) overlay did NOT override MODEL_QUICK ($ov_out)"
-printf '%s\n' "$ov_out" | grep -qx 'SCRIBE_BACKEND=file'               || fail "(b) non-overridden SCRIBE_BACKEND lost its baseline value ($ov_out)"
+grep -qx 'MODEL_QUICK=claude-local-override' <<< "$ov_out" || fail "(b) overlay did NOT override MODEL_QUICK ($ov_out)"
+grep -qx 'SCRIBE_BACKEND=file' <<< "$ov_out" || fail "(b) non-overridden SCRIBE_BACKEND lost its baseline value ($ov_out)"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -138,7 +138,7 @@ run "$P" config set --local SCRIBE_BACKEND github
 [ -f "$P/.herd/config.local" ]                             || fail "(c1) config.local was not created"
 grep -qE '^SCRIBE_BACKEND="github"' "$P/.herd/config.local" || fail "(c1) value not written to config.local ($(cat "$P/.herd/config.local"))"
 grep -qE '^SCRIBE_BACKEND="file"'   "$P/.herd/config"       || fail "(c1) baseline SCRIBE_BACKEND was mutated"
-printf '%s\n' "$OUT" | grep -q 'config.local'              || fail "(c1) output did not name config.local ($OUT)"
+grep -q 'config.local' <<< "$OUT" || fail "(c1) output did not name config.local ($OUT)"
 okp
 
 # (c2) A MACHINE-scoped key routes to config.local even WITHOUT --local; baseline untouched.
@@ -158,7 +158,7 @@ okp
 
 # (c4) idempotent no-op set against the overlay is inert (reads the TARGET, not the baseline).
 run "$P" config set MODEL_QUICK claude-machine
-{ [ "$RC" -eq 0 ] && printf '%s\n' "$OUT" | grep -qi 'no change'; } || fail "(c4) repeat machine set not a no-op ($OUT)"
+{ [ "$RC" -eq 0 ] && grep -qi 'no change' <<< "$OUT"; } || fail "(c4) repeat machine set not a no-op ($OUT)"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,15 +174,15 @@ CFG
 run "$P2" config list
 [ "$RC" -eq 0 ] || fail "(d) list failed ($OUT)"
 # A baseline-only key is tagged [baseline].
-printf '%s\n' "$OUT" | grep -qE 'REVIEW_CONCURRENCY[[:space:]]+2[[:space:]]+\[baseline\]' \
+grep -qE 'REVIEW_CONCURRENCY[[:space:]]+2[[:space:]]+\[baseline\]' <<< "$OUT" \
   || fail "(d) baseline key missing [baseline] provenance ($OUT)"
 # An overridden key shows the LOCAL value tagged [local].
-printf '%s\n' "$OUT" | grep -qE 'SCRIBE_BACKEND[[:space:]]+github[[:space:]]+\[local\]' \
+grep -qE 'SCRIBE_BACKEND[[:space:]]+github[[:space:]]+\[local\]' <<< "$OUT" \
   || fail "(d) overridden key missing [local] provenance / wrong value ($OUT)"
-printf '%s\n' "$OUT" | grep -qE 'WORKSPACE_NAME[[:space:]]+localws[[:space:]]+\[local\]' \
+grep -qE 'WORKSPACE_NAME[[:space:]]+localws[[:space:]]+\[local\]' <<< "$OUT" \
   || fail "(d) overridden WORKSPACE_NAME missing [local] provenance ($OUT)"
 # The header notes the overlay is active.
-printf '%s\n' "$OUT" | grep -q 'config.local overlay' || fail "(d) list header did not note the overlay ($OUT)"
+grep -q 'config.local overlay' <<< "$OUT" || fail "(d) list header did not note the overlay ($OUT)"
 okp
 
 # (d2) a key present ONLY in the overlay is tagged [local-only].
@@ -192,7 +192,7 @@ CFG
 # Remove MODEL_QUICK from the baseline so it is genuinely local-only.
 grep -v '^MODEL_QUICK=' "$P2/.herd/config" > "$P2/.herd/config.tmp" && mv "$P2/.herd/config.tmp" "$P2/.herd/config"
 run "$P2" config list
-printf '%s\n' "$OUT" | grep -qE 'MODEL_QUICK[[:space:]]+claude-onlylocal[[:space:]]+\[local-only\]' \
+grep -qE 'MODEL_QUICK[[:space:]]+claude-onlylocal[[:space:]]+\[local-only\]' <<< "$OUT" \
   || fail "(d2) local-only key missing [local-only] provenance ($OUT)"
 okp
 
@@ -200,8 +200,8 @@ okp
 P3="$T/p3"; mkdir "$P3"; _make_project "$P3"
 run "$P3" config list
 [ "$RC" -eq 0 ] || fail "(d3) list failed ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'config.local overlay' && fail "(d3) overlay header shown without an overlay"
-printf '%s\n' "$OUT" | grep -qE 'SCRIBE_BACKEND[[:space:]]+file[[:space:]]+\[baseline\]' \
+grep -q 'config.local overlay' <<< "$OUT" && fail "(d3) overlay header shown without an overlay"
+grep -qE 'SCRIBE_BACKEND[[:space:]]+file[[:space:]]+\[baseline\]' <<< "$OUT" \
   || fail "(d3) no-overlay list missing [baseline] provenance ($OUT)"
 okp
 

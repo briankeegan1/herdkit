@@ -333,8 +333,8 @@ fi
 OFFENDING_SHA="$(git -C "$AT_REPO" rev-parse --short=12 HEAD)"
 _ad_out="$(hc_run "$AT_REPO" no-ai-coauthor "")"; _ad_rc=$?
 if [ "$_ad_rc" -eq 1 ] \
-   && printf '%s' "$_ad_out" | grep -q 'ATTRIBUTION LINT' \
-   && printf '%s' "$_ad_out" | grep -q "$OFFENDING_SHA"; then
+   && grep -q 'ATTRIBUTION LINT' <<< "$_ad_out" \
+   && grep -q "$OFFENDING_SHA" <<< "$_ad_out"; then
   ATTR_RED=true
   checkpoint attribution_red_names_sha pass "trailer commit reds the gate naming sha $OFFENDING_SHA"
 else
@@ -377,7 +377,7 @@ printf '\n- 🔜 CC ok.\n' >> "$CC_REPO/BACKLOG.md"
 _sf_git_env
 git -C "$CC_REPO" add -A && git -C "$CC_REPO" commit -q -m "feat: add farewell command"
 _cg_rc=0; hc_run "$CC_REPO" "" "$CC_PAT" >/dev/null 2>&1 || _cg_rc=$?
-if [ "$_cb_rc" -eq 1 ] && printf '%s' "$_cb_out" | grep -q 'COMMIT CONVENTION' && [ "$_cg_rc" -eq 0 ]; then
+if [ "$_cb_rc" -eq 1 ] && grep -q 'COMMIT CONVENTION' <<< "$_cb_out" && [ "$_cg_rc" -eq 0 ]; then
   COMMIT_REFUSED=true
   checkpoint commit_convention_refuses_nonconforming pass "non-conforming subject refused; 'feat: …' accepted"
 else

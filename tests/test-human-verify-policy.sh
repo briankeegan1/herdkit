@@ -90,7 +90,7 @@ ok
 # when_to_surface (col 4) present and mentions all three values so the manifest is self-documenting.
 wts="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY"{print $4; exit}' "$CAPS")"
 for v in coordinator auto hold; do
-  printf '%s' "$wts" | grep -q "$v" || fail "(1) when_to_surface should mention '$v': $wts"
+  grep -q "$v" <<< "$wts" || fail "(1) when_to_surface should mention '$v': $wts"
 done
 ok
 
@@ -163,7 +163,7 @@ rm -f "$APPROVALS"
 printf '%s hv-informed 300 %s\n' "1000" "$SHA_A" > "$APPROVALS"
 list_out="$(cd "$WORKTREES_DIR" && WORKTREES_DIR="$WORKTREES_DIR" HERD_CONFIG_FILE="$HERD_CONFIG_FILE" \
   PATH="$PATH" BODIES="$BODIES" bash "$APPROVE" list 2>&1)"
-printf '%s' "$list_out" | grep -q 'No PRs awaiting approval' \
+grep -q 'No PRs awaiting approval' <<< "$list_out" \
   || fail "(7) an hv-informed-only ledger must show no pending approvals. Output:
 $list_out"
 ok
@@ -207,20 +207,20 @@ printf 'Adds a live feature.\n\nHUMAN-VERIFY:\n- click through the new tab in th
 printf '1000 awaiting 500 %s\n' "$SHA_A" > "$APPROVALS"
 coord_out="$(cd "$WORKTREES_DIR" && WORKTREES_DIR="$WORKTREES_DIR" HERD_CONFIG_FILE="$HERD_CONFIG_FILE" \
   HUMAN_VERIFY_POLICY=coordinator PATH="$PATH" BODIES="$BODIES" bash "$APPROVE" list 2>&1)"
-printf '%s' "$coord_out" | grep -qi 'coordinator-actionable' \
+grep -qi 'coordinator-actionable' <<< "$coord_out" \
   || fail "(10) herd-approve.sh list should flag coordinator-actionable under =coordinator. Output:
 $coord_out"
-printf '%s' "$coord_out" | grep -q 'click through the new tab in the running app' \
+grep -q 'click through the new tab in the running app' <<< "$coord_out" \
   || fail "(10) coordinator list must still surface the steps. Output:
 $coord_out"
 ok
 # Default (hold) policy keeps the legacy wording — byte-identical surface for existing installs.
 hold_out="$(cd "$WORKTREES_DIR" && WORKTREES_DIR="$WORKTREES_DIR" HERD_CONFIG_FILE="$HERD_CONFIG_FILE" \
   PATH="$PATH" BODIES="$BODIES" bash "$APPROVE" list 2>&1)"
-printf '%s' "$hold_out" | grep -q 'human-verify — run these, then approve:' \
+grep -q 'human-verify — run these, then approve:' <<< "$hold_out" \
   || fail "(10) hold policy must keep the legacy 'run these, then approve' wording. Output:
 $hold_out"
-printf '%s' "$hold_out" | grep -qi 'coordinator-actionable' \
+grep -qi 'coordinator-actionable' <<< "$hold_out" \
   && fail "(10) hold policy must NOT show coordinator-actionable. Output:
 $hold_out"
 ok

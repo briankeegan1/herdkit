@@ -54,10 +54,10 @@ run(){ ( cd "$PROJ" && bash "$HERD" "$@" ); }
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 out="$(run theme list 2>&1)"
 for t in tokyonight gruvbox catppuccin nord; do
-  echo "$out" | grep -qw "$t" || fail "1a: 'herd theme list' omitted built-in '$t'"
+  grep -qw "$t" <<< "$out" || fail "1a: 'herd theme list' omitted built-in '$t'"
 done
-echo "$out" | grep -q 'active: tokyonight' || fail "1b: 'herd theme list' did not report the active theme"
-echo "$out" | grep -qE '●[[:space:]]*tokyonight' || fail "1c: 'herd theme list' did not MARK the active theme"
+grep -q 'active: tokyonight' <<< "$out" || fail "1b: 'herd theme list' did not report the active theme"
+grep -qE '●[[:space:]]*tokyonight' <<< "$out" || fail "1c: 'herd theme list' did not MARK the active theme"
 pass; echo "PASS (1a) list shows all built-ins and marks the active one"
 
 # Add a user theme + a user shadow of a built-in; both surface under "user", shadow noted on built-in.
@@ -65,9 +65,9 @@ mkdir -p "$PROJ/.herd/themes/mine" "$PROJ/.herd/themes/gruvbox"
 printf 'C_GREEN=""\n' > "$PROJ/.herd/themes/mine/palette.sh";    printf '{"document":{}}\n' > "$PROJ/.herd/themes/mine/glow.json"
 printf 'C_GREEN=""\n' > "$PROJ/.herd/themes/gruvbox/palette.sh"; printf '{"document":{}}\n' > "$PROJ/.herd/themes/gruvbox/glow.json"
 out="$(run theme list 2>&1)"
-echo "$out" | grep -q 'user'                 || fail "1d: list has no user section"
-echo "$out" | grep -qw 'mine'                || fail "1e: list omitted the user theme 'mine'"
-echo "$out" | grep -q 'overridden by a user' || fail "1f: list did not note the built-in shadowed by a user theme"
+grep -q 'user' <<< "$out" || fail "1d: list has no user section"
+grep -qw 'mine' <<< "$out" || fail "1e: list omitted the user theme 'mine'"
+grep -q 'overridden by a user' <<< "$out" || fail "1f: list did not note the built-in shadowed by a user theme"
 rm -rf "$PROJ/.herd/themes"
 pass; echo "PASS (1b) list surfaces user themes and notes a user shadow of a built-in"
 
@@ -75,15 +75,15 @@ pass; echo "PASS (1b) list surfaces user themes and notes a user shadow of a bui
 # 2. preview — six swatch rows for a named theme + for the active default; unknown theme refused.
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 out="$(run theme preview nord 2>&1)"
-echo "$out" | grep -q 'nord'   || fail "2a: preview did not name the theme"
+grep -q 'nord' <<< "$out" || fail "2a: preview did not name the theme"
 for lbl in blue cyan green yellow red dim; do
-  echo "$out" | grep -q "$lbl" || fail "2b: preview missing the '$lbl' swatch row"
+  grep -q "$lbl" <<< "$out" || fail "2b: preview missing the '$lbl' swatch row"
 done
 [ "$(echo "$out" | grep -c '██████')" -eq 6 ] || fail "2c: preview did not render exactly six swatch blocks"
 pass; echo "PASS (2a) preview <name> renders the six palette swatches"
 
 out="$(run theme preview 2>&1)"    # no arg → the active theme (tokyonight)
-echo "$out" | grep -q 'tokyonight' || fail "2d: preview with no arg did not default to the active theme"
+grep -q 'tokyonight' <<< "$out" || fail "2d: preview with no arg did not default to the active theme"
 pass; echo "PASS (2b) preview with no argument previews the active theme"
 
 if run theme preview does-not-exist >/dev/null 2>&1; then fail "2e: preview of an unknown theme did not fail"; fi
@@ -117,8 +117,8 @@ pass; echo "PASS (3b) set refuses an unknown/incomplete theme and leaves the con
 # 4. NO_COLOR — preview emits NO ANSI escape sequences (plain swatches).
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 nc="$( cd "$PROJ" && NO_COLOR=1 bash "$HERD" theme preview nord 2>&1 )"
-printf '%s' "$nc" | grep -q $'\033' && fail "4a: preview emitted an ANSI escape under NO_COLOR"
-printf '%s' "$nc" | grep -q '██████' || fail "4b: preview lost its swatch blocks under NO_COLOR"
+grep -q $'\033' <<< "$nc" && fail "4a: preview emitted an ANSI escape under NO_COLOR"
+grep -q '██████' <<< "$nc" || fail "4b: preview lost its swatch blocks under NO_COLOR"
 pass; echo "PASS (4a) preview renders plain (no ANSI escapes) under NO_COLOR"
 
 echo

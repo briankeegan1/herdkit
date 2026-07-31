@@ -86,7 +86,7 @@ pass
 
 out="$(advise_via_cli ok -- --help 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(A) --help should exit 0 (got $rc)"
-printf '%s' "$out" | grep -q 'usage: herd advise' || fail "(A) --help should print usage"
+grep -q 'usage: herd advise' <<< "$out" || fail "(A) --help should print usage"
 pass
 
 out="$(advise_via_cli ok -- -x 2>/dev/null)"; rc=$?
@@ -97,7 +97,7 @@ pass
 : > "$CLOG"
 out="$(advise_via_cli ok -- "which lock strategy is safer?" 2>/dev/null)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(+) happy path should exit 0 (got $rc)"
-printf '%s' "$out" | grep -q 'RECOMMENDATION: take option A' || fail "(+) advice not printed to stdout: $out"
+grep -q 'RECOMMENDATION: take option A' <<< "$out" || fail "(+) advice not printed to stdout: $out"
 grep -q -- '-p ' "$CLOG" || fail "(+) model not invoked with -p"
 # MODEL_ADVISE defaults to the resolved MODEL_FEATURE (the config sentinel).
 grep -q -- '--model sentinel-feature-model' "$CLOG" || fail "(+) MODEL_ADVISE did not default to MODEL_FEATURE: $(cat "$CLOG")"
@@ -122,13 +122,13 @@ pass
 # ── (B) degraded path: model call FAILS → fail-soft (clear message, exit 0) ────────────────────────
 out="$(advise_via_cli fail -- "q?" 2>/dev/null)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(B) a failed model call must degrade to exit 0, not a hard error (got $rc)"
-printf '%s' "$out" | grep -q 'herd advise: unavailable' || fail "(B) failed call: no clear unavailable message: $out"
+grep -q 'herd advise: unavailable' <<< "$out" || fail "(B) failed call: no clear unavailable message: $out"
 pass
 
 # Model returns EMPTY output → also degrades fail-soft.
 out="$(advise_via_cli empty -- "q?" 2>/dev/null)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(B) an empty model result must degrade to exit 0 (got $rc)"
-printf '%s' "$out" | grep -q 'herd advise: unavailable' || fail "(B) empty call: no clear unavailable message: $out"
+grep -q 'herd advise: unavailable' <<< "$out" || fail "(B) empty call: no clear unavailable message: $out"
 pass
 
 echo "ALL PASS — test-advise: $PASS checks passed"

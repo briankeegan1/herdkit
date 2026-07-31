@@ -54,46 +54,46 @@ run() { (cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" stats "$@" 2>&1); 
 
 # ── (1) default all-time aggregate ──
 out="$(run)"
-printf '%s\n' "$out" | grep -qE 'all time'                     || fail "default: scope should say 'all time'\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +2'               || fail "default: 2 merges expected\n%s" "$out"
+grep -qE 'all time' <<< "$out" || fail "default: scope should say 'all time'\n%s" "$out"
+grep -qE 'Merged PRs +2' <<< "$out" || fail "default: 2 merges expected\n%s" "$out"
 # a 🐑 per merge (exactly 2).
 sheep="$(printf '%s\n' "$out" | grep 'Merged PRs' | grep -o '🐑' | wc -l | tr -d ' ')"
 [ "$sheep" = "2" ]                                             || fail "default: expected 2 sheep, got %s\n%s" "$sheep" "$out"
-printf '%s\n' "$out" | grep -qE 'Review verdicts +3'          || fail "default: 3 verdicts expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'APPROVE 2'                   || fail "default: APPROVE 2 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'BLOCK 1'                     || fail "default: BLOCK 1 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'reviewer 2'                  || fail "default: provenance reviewer 2 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'gate_default 1'              || fail "default: provenance gate_default 1 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Refix bounces +1'           || fail "default: 1 refix bounce expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Limit park/resume +1 / 1'   || fail "default: limit 1/1 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Reaps +2'                   || fail "default: 2 reaps expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Cost recorded +\$160\.0000 \(2 events\)' || fail "default: cost \$160.0000/2 expected\n%s" "$out"
+grep -qE 'Review verdicts +3' <<< "$out" || fail "default: 3 verdicts expected\n%s" "$out"
+grep -qE 'APPROVE 2' <<< "$out" || fail "default: APPROVE 2 expected\n%s" "$out"
+grep -qE 'BLOCK 1' <<< "$out" || fail "default: BLOCK 1 expected\n%s" "$out"
+grep -qE 'reviewer 2' <<< "$out" || fail "default: provenance reviewer 2 expected\n%s" "$out"
+grep -qE 'gate_default 1' <<< "$out" || fail "default: provenance gate_default 1 expected\n%s" "$out"
+grep -qE 'Refix bounces +1' <<< "$out" || fail "default: 1 refix bounce expected\n%s" "$out"
+grep -qE 'Limit park/resume +1 / 1' <<< "$out" || fail "default: limit 1/1 expected\n%s" "$out"
+grep -qE 'Reaps +2' <<< "$out" || fail "default: 2 reaps expected\n%s" "$out"
+grep -qE 'Cost recorded +\$160\.0000 \(2 events\)' <<< "$out" || fail "default: cost \$160.0000/2 expected\n%s" "$out"
 ok
 
 # ── (2) --pr scopes to one PR ──
 out="$(run --pr 42)"
-printf '%s\n' "$out" | grep -qE 'PR #42'                     || fail "--pr: scope should name PR #42\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +1'             || fail "--pr 42: 1 merge expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Review verdicts +2'       || fail "--pr 42: 2 verdicts expected (both APPROVE)\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Refix bounces +0'        || fail "--pr 42: refix bounce belongs to PR 43, expect 0\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Cost recorded +\$160\.0000' || fail "--pr 42: cost \$160.0000 expected\n%s" "$out"
+grep -qE 'PR #42' <<< "$out" || fail "--pr: scope should name PR #42\n%s" "$out"
+grep -qE 'Merged PRs +1' <<< "$out" || fail "--pr 42: 1 merge expected\n%s" "$out"
+grep -qE 'Review verdicts +2' <<< "$out" || fail "--pr 42: 2 verdicts expected (both APPROVE)\n%s" "$out"
+grep -qE 'Refix bounces +0' <<< "$out" || fail "--pr 42: refix bounce belongs to PR 43, expect 0\n%s" "$out"
+grep -qE 'Cost recorded +\$160\.0000' <<< "$out" || fail "--pr 42: cost \$160.0000 expected\n%s" "$out"
 ok
 # PR 43 sees the BLOCK + the refix bounce, but no cost (no cost event for 43).
 out="$(run --pr 43)"
-printf '%s\n' "$out" | grep -qE 'BLOCK 1'                  || fail "--pr 43: BLOCK 1 expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Refix bounces +1'        || fail "--pr 43: 1 refix bounce expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Cost recorded +\$0\.0000 \(0 events\)' || fail "--pr 43: no cost expected\n%s" "$out"
+grep -qE 'BLOCK 1' <<< "$out" || fail "--pr 43: BLOCK 1 expected\n%s" "$out"
+grep -qE 'Refix bounces +1' <<< "$out" || fail "--pr 43: 1 refix bounce expected\n%s" "$out"
+grep -qE 'Cost recorded +\$0\.0000 \(0 events\)' <<< "$out" || fail "--pr 43: no cost expected\n%s" "$out"
 ok
 
 # ── (3) --since bounds by ts; a future date excludes everything (all zeros) ──
 out="$(run --since 2026-07-03)"
-printf '%s\n' "$out" | grep -qE 'since 2026-07-03'         || fail "--since: scope wrong\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +0'           || fail "--since future: 0 merges expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'all zeros'               || fail "--since future: should note all zeros\n%s" "$out"
+grep -qE 'since 2026-07-03' <<< "$out" || fail "--since: scope wrong\n%s" "$out"
+grep -qE 'Merged PRs +0' <<< "$out" || fail "--since future: 0 merges expected\n%s" "$out"
+grep -qE 'all zeros' <<< "$out" || fail "--since future: should note all zeros\n%s" "$out"
 ok
 # A date at/just before the entries keeps them.
 out="$(run --since 2026-07-02)"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +2'           || fail "--since 07-02: 2 merges expected\n%s" "$out"
+grep -qE 'Merged PRs +2' <<< "$out" || fail "--since 07-02: 2 merges expected\n%s" "$out"
 ok
 
 # ── (4) --today restricts to today's UTC entries ──
@@ -101,8 +101,8 @@ TODAY="$(date -u +%Y-%m-%d)"
 # Append a merge stamped today so --today is non-empty while the 07-02 fixture rows are excluded.
 printf '{"ts":"%sT08:00:00Z","event":"merge","pr":77,"slug":"today","sha":"t","method":"--merge","reason":"gates_passed"}\n' "$TODAY" >> "$TREES/.herd/journal.jsonl"
 out="$(run --today)"
-printf '%s\n' "$out" | grep -qE "today \($TODAY UTC\)"     || fail "--today: scope should name today\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +1'           || fail "--today: only today's 1 merge expected (07-02 excluded)\n%s" "$out"
+grep -qE "today \($TODAY UTC\)" <<< "$out" || fail "--today: scope should name today\n%s" "$out"
+grep -qE 'Merged PRs +1' <<< "$out" || fail "--today: only today's 1 merge expected (07-02 excluded)\n%s" "$out"
 ok
 
 # ── (5) empty / missing journal → all-zeros card, exit 0 ──
@@ -114,9 +114,9 @@ WORKSPACE_NAME="stest2"
 CFG
 out="$(cd "$EMPTYP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" stats 2>&1)"; rc=$?
 [ "$rc" -eq 0 ]                                            || fail "empty journal must exit 0 (got %d)\n%s" "$rc" "$out"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +0'          || fail "empty: 0 merges expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'Cost recorded +\$0\.0000' || fail "empty: \$0 cost expected\n%s" "$out"
-printf '%s\n' "$out" | grep -qE 'all zeros'              || fail "empty: should note all zeros\n%s" "$out"
+grep -qE 'Merged PRs +0' <<< "$out" || fail "empty: 0 merges expected\n%s" "$out"
+grep -qE 'Cost recorded +\$0\.0000' <<< "$out" || fail "empty: \$0 cost expected\n%s" "$out"
+grep -qE 'all zeros' <<< "$out" || fail "empty: should note all zeros\n%s" "$out"
 ok
 
 # ── (6) aggregation spans a rotated archive + the live journal ──
@@ -135,7 +135,7 @@ cat > "$ROTT/.herd/journal.jsonl" <<'JNL'
 {"ts":"2026-07-02T09:00:00Z","event":"merge","pr":2,"slug":"new","sha":"n","method":"--merge","reason":"gates_passed"}
 JNL
 out="$(cd "$ROTP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" stats 2>&1)"
-printf '%s\n' "$out" | grep -qE 'Merged PRs +2'          || fail "rotation: should sum archive + live = 2 merges\n%s" "$out"
+grep -qE 'Merged PRs +2' <<< "$out" || fail "rotation: should sum archive + live = 2 merges\n%s" "$out"
 ok
 
 # ── bad --pr is rejected ──

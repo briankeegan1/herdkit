@@ -92,31 +92,31 @@ RANGE="HEAD~1..HEAD"
 
 # ── (1) surface: rename + delete + symbol(func) + symbol(header) all present ───
 surface="$(bash "$SCRIPT" surface "$RANGE")" || fail "surface exited non-zero"
-printf '%s\n' "$surface" | grep -q $'^rename\tscripts/herd/agent-watch.sh\tscripts/herd/watcher.sh$' \
+grep -q $'^rename\tscripts/herd/agent-watch.sh\tscripts/herd/watcher.sh$' <<< "$surface" \
   || fail "surface missing the file rename ($surface)"
-printf '%s\n' "$surface" | grep -q $'^delete\tlegacy.sh\t$' \
+grep -q $'^delete\tlegacy.sh\t$' <<< "$surface" \
   || fail "surface missing the file delete ($surface)"
-printf '%s\n' "$surface" | grep -q $'^symbol\tdo_old_thing\t$' \
+grep -q $'^symbol\tdo_old_thing\t$' <<< "$surface" \
   || fail "surface missing the renamed function ($surface)"
-printf '%s\n' "$surface" | grep -q $'^symbol\tOld Section Heading\t$' \
+grep -q $'^symbol\tOld Section Heading\t$' <<< "$surface" \
   || fail "surface missing the renamed section header ($surface)"
 # A symbol that survived the PR (poll_prs, still defined) must NOT appear.
-printf '%s\n' "$surface" | grep -q 'poll_prs' && fail "surface flagged a symbol that still exists"
+grep -q 'poll_prs' <<< "$surface" && fail "surface flagged a symbol that still exists"
 # do_new_thing / New Section Heading are the NEW names — never surfaced as moved-away.
-printf '%s\n' "$surface" | grep -q 'do_new_thing'     && fail "surface flagged the new symbol name"
-printf '%s\n' "$surface" | grep -q 'New Section Heading' && fail "surface flagged the new header name"
+grep -q 'do_new_thing' <<< "$surface" && fail "surface flagged the new symbol name"
+grep -q 'New Section Heading' <<< "$surface" && fail "surface flagged the new header name"
 pass
 
 # ── (2) scan: dangling entries reported; unrelated + new names excluded ────────
 report="$(bash "$SCRIPT" scan "$RANGE")" || fail "scan exited non-zero"
 [ "$report" != "NONE" ] || fail "scan reported NONE despite dangling references"
-printf '%s\n' "$report" | grep -q 'Harden the watcher'  || fail "scan missed the agent-watch.sh reference"
-printf '%s\n' "$report" | grep -q 'Docs polish'         || fail "scan missed the section-header reference"
-printf '%s\n' "$report" | grep -q 'Drop legacy'         || fail "scan missed the legacy.sh delete reference"
+grep -q 'Harden the watcher' <<< "$report" || fail "scan missed the agent-watch.sh reference"
+grep -q 'Docs polish' <<< "$report" || fail "scan missed the section-header reference"
+grep -q 'Drop legacy' <<< "$report" || fail "scan missed the legacy.sh delete reference"
 # The unrelated item must NOT be flagged.
-printf '%s\n' "$report" | grep -q 'Unrelated feature'   && fail "scan false-flagged an unrelated entry"
+grep -q 'Unrelated feature' <<< "$report" && fail "scan false-flagged an unrelated entry"
 # Line numbers must be REAL (a bare '<file>:<n>' shape), never empty/misaligned.
-printf '%s\n' "$report" | grep -qE $'^rename\tscripts/herd/agent-watch.sh\tscripts/herd/watcher.sh\t[0-9]+\t' \
+grep -qE $'^rename\tscripts/herd/agent-watch.sh\tscripts/herd/watcher.sh\t[0-9]+\t' <<< "$report" \
   || fail "scan rename row is missing its line number ($report)"
 pass
 
@@ -129,7 +129,7 @@ FS
 chmod +x "$T/fake-scribe.sh"
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" run "$RANGE")" \
   || fail "run exited non-zero"
-printf '%s\n' "$out" | grep -q 'enqueued a scribe request' || fail "run did not report an enqueue ($out)"
+grep -q 'enqueued a scribe request' <<< "$out" || fail "run did not report an enqueue ($out)"
 [ -f "$REQ" ] || fail "run did not invoke the scribe seam"
 grep -q 'Edit ONLY BACKLOG.md' "$REQ"                      || fail "request lacks the edit-only guard"
 grep -q 'agent-watch.sh → scripts/herd/watcher.sh' "$REQ"  || fail "request lacks the file rename mapping"
@@ -142,7 +142,7 @@ git -C "$REPO" commit -q --allow-empty -m no-op-change
 rm -f "$REQ"
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" run "HEAD~1..HEAD")" \
   || fail "run (no-op) exited non-zero"
-printf '%s\n' "$out" | grep -q 'nothing to enqueue' || fail "run (no-op) should report nothing to enqueue ($out)"
+grep -q 'nothing to enqueue' <<< "$out" || fail "run (no-op) should report nothing to enqueue ($out)"
 [ -f "$REQ" ] && fail "run (no-op) must NOT invoke the scribe seam"
 pass
 

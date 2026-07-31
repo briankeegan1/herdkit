@@ -95,9 +95,9 @@ pass
 
 # ── 3. herd deps list surfaces the dep + its resolved upstream state. ────────────────────────────
 out="$(run deps list 2>&1)" || fail "deps list exited non-zero: $out"
-echo "$out" | grep -q 'provider-lib#42' || fail "deps list did not show the recorded dep — ($out)"
-echo "$out" | grep -q 'blocked-on'      || fail "deps list did not label the dep kind — ($out)"
-echo "$out" | grep -q 'state=open'      || fail "deps list did not resolve upstream state via the backend — ($out)"
+grep -q 'provider-lib#42' <<< "$out" || fail "deps list did not show the recorded dep — ($out)"
+grep -q 'blocked-on' <<< "$out" || fail "deps list did not label the dep kind — ($out)"
+grep -q 'state=open' <<< "$out" || fail "deps list did not resolve upstream state via the backend — ($out)"
 pass
 
 # ── 4. demote reclassifies blocked-on → non-blocking watch; the watcher no longer blocks on it. ──

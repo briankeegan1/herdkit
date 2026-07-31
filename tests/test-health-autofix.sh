@@ -154,10 +154,10 @@ reset_state
 export STUB_AGENT_NAME="slug-a" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-a"
 unset HEALTHCHECK_AUTOFIX
 _handle_health_codeerror 10 slug-a shaA 0 "$T/wt" "$NOTOK"
-row | grep -q 'needs you' || fail "(1) idle agent + autofix off must read 'needs you' (got: $(row))"
-row | grep -q "$NOTOK"    || fail "(1) the needs-you row must carry the BLOCKER (failing test)"
-row | grep -q 'fix in the worktree + push' || fail "(1) the needs-you row must carry a REMEDY (got: $(row))"
-row | grep -q '.health-log-10-shaA'       || fail "(1) the remedy must point at the tailable suite log"
+grep -q 'needs you' <<< "$(row)" || fail "(1) idle agent + autofix off must read 'needs you' (got: $(row))"
+grep -q "$NOTOK" <<< "$(row)" || fail "(1) the needs-you row must carry the BLOCKER (failing test)"
+grep -q 'fix in the worktree + push' <<< "$(row)" || fail "(1) the needs-you row must carry a REMEDY (got: $(row))"
+grep -q '.health-log-10-shaA' <<< "$(row)" || fail "(1) the remedy must point at the tailable suite log"
 [ "$(runs)" = "0" ] || fail "(1) autofix off must never pane-run"
 ok
 
@@ -165,9 +165,9 @@ ok
 reset_state
 export STUB_AGENT_STATUS="working"
 _handle_health_codeerror 10 slug-a shaA 0 "$T/wt" "$NOTOK"
-row | grep -q 'needs you' && fail "(2) 'needs you' is BANNED while the agent is working (got: $(row))"
-row | grep -q 'fix in progress' || fail "(2) a working agent must read 'fix in progress' (got: $(row))"
-row | grep -q 'awaiting push'   || fail "(2) the in-progress row must say 'awaiting push'"
+grep -q 'needs you' <<< "$(row)" && fail "(2) 'needs you' is BANNED while the agent is working (got: $(row))"
+grep -q 'fix in progress' <<< "$(row)" || fail "(2) a working agent must read 'fix in progress' (got: $(row))"
+grep -q 'awaiting push' <<< "$(row)" || fail "(2) the in-progress row must say 'awaiting push'"
 [ "$(runs)" = "0" ] || fail "(2) autofix off must never pane-run"
 [ -s "$REFIX_STATE" ] && fail "(2) autofix off must never write the refix ledger"
 ok
@@ -189,7 +189,7 @@ _handle_health_codeerror 20 slug-a shaB 0 "$T/wt" "$NOTOK"
 grep -q '^pane-a	' "$STUB_PANE_RUN_LOG" || fail "(5) the bounce must target the AGENT pane"
 grep -q "$NOTOK" "$STUB_PANE_RUN_LOG"     || fail "(5) the prompt must name the failing test"
 grep -q '.health-log-20-shaB' "$STUB_PANE_RUN_LOG" || fail "(5) the prompt must carry the suite log path"
-row | grep -q 'refixing health-check (round 1/3)' || fail "(5) the bouncing row should read 'refixing health-check (round 1/3)' (got: $(row))"
+grep -q 'refixing health-check (round 1/3)' <<< "$(row)" || fail "(5) the bouncing row should read 'refixing health-check (round 1/3)' (got: $(row))"
 refix_attempted 20 shaB health || fail "(5) the bounce must be recorded kind=health"
 refix_attempted 20 shaB review && fail "(5) a health bounce must NOT satisfy the review once-guard"
 grep -q '"event":"health_refix_bounce"' "$JOURNAL_FILE" || fail "(5) the bounce must be journaled"
@@ -198,8 +198,8 @@ ok
 # ── (3) refix-once per sha: the SAME red re-enters every tick → no second bounce, honest row ─────
 _handle_health_codeerror 20 slug-a shaB 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "1" ] || fail "(3) a second call for the same sha must not re-bounce (got $(runs) runs)"
-row | grep -q 'needs you' && fail "(3) 'needs you' is BANNED after a bounce (got: $(row))"
-row | grep -q 'fix in progress · awaiting push (round 1/3)' \
+grep -q 'needs you' <<< "$(row)" && fail "(3) 'needs you' is BANNED after a bounce (got: $(row))"
+grep -q 'fix in progress · awaiting push (round 1/3)' <<< "$(row)" \
   || fail "(3) the bounced row must read 'fix in progress · awaiting push (round 1/3)' (got: $(row))"
 ok
 # A NEW commit (new sha) is eligible for a fresh bounce.
@@ -229,8 +229,8 @@ _handle_health_codeerror 30 slug-a shaH3 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "3" ] || fail "(7) three health rounds must all bounce (got $(runs))"
 _handle_health_codeerror 30 slug-a shaH4 0 "$T/wt" "$NOTOK"   # 4th health red → over the rail cap
 [ "$(runs)" = "3" ] || fail "(7) a bounce past the cap must not be delivered (got $(runs))"
-row | grep -q 'needs you · refix limit (3 rounds) reached' || fail "(7) the cap row must read 'needs you · refix limit' (got: $(row))"
-row | grep -q "$NOTOK" || fail "(7) the cap row must still carry the blocker"
+grep -q 'needs you · refix limit (3 rounds) reached' <<< "$(row)" || fail "(7) the cap row must read 'needs you · refix limit' (got: $(row))"
+grep -q "$NOTOK" <<< "$(row)" || fail "(7) the cap row must still carry the blocker"
 grep -q '"event":"health_refix_escalated"' "$JOURNAL_FILE" || fail "(7) the cap must journal an escalation"
 ok
 
@@ -244,7 +244,7 @@ record_health_result 31 shaH4 CLEAN      # the builder's fix landed — the heal
 printf '0\n' > "$STUB_WAIT_FILE"
 _handle_health_codeerror 31 slug-a shaH5 0 "$T/wt" "$NOTOK"   # a NEW red on a later sha
 [ "$(runs)" = "1" ] || fail "(7b) a rail that resolved its red must be able to bounce again (got $(runs))"
-row | grep -q 'refixing health-check (round 1/3)' || fail "(7b) the row must restart the rail at round 1 (got: $(row))"
+grep -q 'refixing health-check (round 1/3)' <<< "$(row)" || fail "(7b) the row must restart the rail at round 1 (got: $(row))"
 ok
 
 # ── (7c) HERD-261: total-ceiling escalate reports TOTAL rounds in journal + notify, not per-rail 0 ─
@@ -263,7 +263,7 @@ refix_rail_reset 32 health "sha-hp" slug-a     # health rail refunded → rail c
 [ -n "$(_refix_budget_reason 32 health)" ] || fail "(7c) total ceiling must close the health rail"
 _handle_health_codeerror 32 slug-a shaHtot 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "0" ] || fail "(7c) total-ceiling escalate must not bounce (got $(runs))"
-row | grep -q 'refix limit (9 total rounds across rails) reached' \
+grep -q 'refix limit (9 total rounds across rails) reached' <<< "$(row)" \
   || fail "(7c) the row must name the total ceiling (got: $(row))"
 # Journal `rounds` field must be the TOTAL (9), never the per-rail 0.
 python3 - "$JOURNAL_FILE" <<'PY' || fail "(7c) journal rounds must be total 9, not per-rail 0"
@@ -287,7 +287,7 @@ printf '0\n' > "$STUB_WAIT_FILE"
 _handle_health_codeerror 40 slug-a shaLEAK 0 "$T/wt" "❌ tab-leak-guard: 1 unexpected tab"
 [ "$(runs)" = "0" ] || fail "(8) a tab-leak-guard transient must never bounce a builder"
 [ "$(refix_round_count 40)" = "0" ] || fail "(8) a tab-leak-guard transient must not consume a round"
-row | grep -q 'tab-leak-guard' || fail "(8) the leak-guard row must be preserved verbatim"
+grep -q 'tab-leak-guard' <<< "$(row)" || fail "(8) the leak-guard row must be preserved verbatim"
 ok
 
 # ── (8b) a bats red NAMING the guard is a code error, and DOES bounce (HERD-228) ────────────────
@@ -313,7 +313,7 @@ reset_state
 STUB_LIVENESS=dead _handle_health_codeerror 55 slug-a shaDEAD 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "0" ] || fail "(9b) a dead agent must never be typed at"
 [ "$(refix_round_count 55)" = "0" ] || fail "(9b) a dead-agent escalation must not burn a refix round"
-row | grep -q 'agent dead' || fail "(9b) the dead row must say so (got: $(row))"
+grep -q 'agent dead' <<< "$(row)" || fail "(9b) the dead row must say so (got: $(row))"
 ok
 
 # ── (9c) the agent never wakes → the bounce ESCALATES (loudly, once) instead of silently claiming a fix
@@ -321,7 +321,7 @@ reset_state
 printf '1\n1\n' > "$STUB_WAIT_FILE"          # neither the initial submit nor the re-send wakes it
 _handle_health_codeerror 56 slug-a shaNOWAKE 0 "$T/wt" "$NOTOK"
 [ "$(runs)" = "2" ] || fail "(9c) a non-waking agent must be re-sent exactly once (got $(runs))"
-row | grep -q 'needs you · health autofix failed' || fail "(9c) a failed wake must escalate (got: $(row))"
+grep -q 'needs you · health autofix failed' <<< "$(row)" || fail "(9c) a failed wake must escalate (got: $(row))"
 python3 - "$JOURNAL_FILE" <<'PY2' || fail "(9c) the failed wake must be journaled escalated=true"
 import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
@@ -340,13 +340,13 @@ ok
 reset_state
 printf '1\n1\n' > "$STUB_WAIT_FILE"
 _handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
-row | grep -q 'needs you' || fail "(9e) tick 1 must escalate (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(9e) tick 1 must escalate (got: $(row))"
 for _tick in 2 3; do
   DISPLAY=()
   _handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
-  row | grep -q 'fix in progress' && fail "(9e) tick $_tick must NOT claim a fix is in flight (got: $(row))"
-  row | grep -q 'needs you' || fail "(9e) tick $_tick must keep saying 'needs you' (got: $(row))"
-  row | grep -q 'stalled'   || fail "(9e) tick $_tick must name the stall (got: $(row))"
+  grep -q 'fix in progress' <<< "$(row)" && fail "(9e) tick $_tick must NOT claim a fix is in flight (got: $(row))"
+  grep -q 'needs you' <<< "$(row)" || fail "(9e) tick $_tick must keep saying 'needs you' (got: $(row))"
+  grep -q 'stalled' <<< "$(row)" || fail "(9e) tick $_tick must name the stall (got: $(row))"
 done
 [ "$(runs)" = "2" ] || fail "(9e) the once-guard must still block a re-bounce (got $(runs) pane runs)"
 python3 - "$JOURNAL_FILE" <<'PY2' || fail "(9e) the stall must journal refix_stalled EXACTLY once"
@@ -361,8 +361,8 @@ ok
 export STUB_AGENT_STATUS="working"
 DISPLAY=()
 _handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
-row | grep -q 'needs you' && fail "(9f) a rescued builder must not read 'needs you' (got: $(row))"
-row | grep -q 'fix in progress' || fail "(9f) a rescued builder reads fix-in-progress (got: $(row))"
+grep -q 'needs you' <<< "$(row)" && fail "(9f) a rescued builder must not read 'needs you' (got: $(row))"
+grep -q 'fix in progress' <<< "$(row)" || fail "(9f) a rescued builder reads fix-in-progress (got: $(row))"
 export STUB_AGENT_STATUS="idle"
 ok
 
@@ -373,11 +373,11 @@ reset_state
 printf '0\n' > "$STUB_WAIT_FILE"
 _handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"      # bounce lands, agent wakes
 DISPLAY=(); _handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"
-row | grep -q 'fix in progress' || fail "(9g) a live bounced agent reads fix-in-progress (got: $(row))"
+grep -q 'fix in progress' <<< "$(row)" || fail "(9g) a live bounced agent reads fix-in-progress (got: $(row))"
 STUB_LIVENESS=dead
 DISPLAY=(); _handle_health_codeerror 58 slug-a shaDIED 0 "$T/wt" "$NOTOK"
-row | grep -q 'fix in progress' && fail "(9g) a DEAD agent must not read 'fix in progress' (got: $(row))"
-row | grep -q 'needs you' || fail "(9g) a dead bounced agent must escalate (got: $(row))"
+grep -q 'fix in progress' <<< "$(row)" && fail "(9g) a DEAD agent must not read 'fix in progress' (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(9g) a dead bounced agent must escalate (got: $(row))"
 unset STUB_LIVENESS
 ok
 
@@ -422,7 +422,7 @@ ITAP="$T/itap.log"; printf '1..1\n   %s\n' "$NOTOK" > "$ITAP"
 NT="$T/nontap.log"; printf '❌ CODE ERROR\nscripts/herd/foo.sh: line 12: syntax error near unexpected token\n' > "$NT"
 d="$(_health_fail_detail "$NT")"
 case "$d" in "❌ CODE ERROR"*) fail "(10) the detail must not be the content-free banner (got: $d)" ;; esac
-printf '%s' "$d" | grep -q 'syntax error' || fail "(10) the non-TAP detail must name the error (got: $d)"
+grep -q 'syntax error' <<< "$d" || fail "(10) the non-TAP detail must name the error (got: $d)"
 # A benign body line must never be selected: this string is quoted VERBATIM into the re-task prompt.
 BENIGN="$T/benign.log"; printf '❌ CODE ERROR\nfailsafe handler installed\n0 failures, 0 errors\nassertion failed: widget\n' > "$BENIGN"
 d="$(_health_fail_detail "$BENIGN")"
@@ -430,7 +430,7 @@ case "$d" in
   *failsafe*)      fail "(10) 'failsafe' is not a failure (got: $d)" ;;
   *"0 failures"*)  fail "(10) a line reporting ZERO failures is not a failure (got: $d)" ;;
 esac
-printf '%s' "$d" | grep -q 'assertion failed' || fail "(10) the real failure line must win (got: $d)"
+grep -q 'assertion failed' <<< "$d" || fail "(10) the real failure line must win (got: $d)"
 
 # A PASSING line must never be selected, even when it CONTAINS a failure word. This is the generic-
 # engine case: every non-bats consumer project emits a non-TAP log that interleaves passes and failures,
@@ -442,7 +442,7 @@ d="$(_health_fail_detail "$JEST")"
 case "$d" in
   PASS*|*"✓"*) fail "(10) a PASSING jest line must never be the failure detail (got: $d)" ;;
 esac
-printf '%s' "$d" | grep -q 'widget' || fail "(10) the jest detail must name the FAILING file (got: $d)"
+grep -q 'widget' <<< "$d" || fail "(10) the jest detail must name the FAILING file (got: $d)"
 
 GO="$T/go.log"
 printf '❌ CODE ERROR\n--- PASS: TestParse/returns an error (0.00s)\n--- FAIL: TestWidget (0.01s)\n' > "$GO"
@@ -450,7 +450,7 @@ d="$(_health_fail_detail "$GO")"
 case "$d" in
   *"PASS"*) fail "(10) a PASSING go line must never be the failure detail (got: $d)" ;;
 esac
-printf '%s' "$d" | grep -q 'FAIL: TestWidget' || fail "(10) the go detail must name the FAILING test (got: $d)"
+grep -q 'FAIL: TestWidget' <<< "$d" || fail "(10) the go detail must name the FAILING test (got: $d)"
 
 # A log with NOTHING but passes (pathological: rc=1 with no failure line) must fall back to the banner —
 # uninformative, but never a lie. That is the floor the pre-diff `sed -n 1p` set.
@@ -477,7 +477,7 @@ drive 70 slug-a shae2eoff
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "(11) off-mode: the gate must still return CODEERROR (got '$_HC_RESULT')"
 [ "$(runs)" = "0" ] || fail "(11) off-mode: no bounce may be delivered"
 [ "$(refix_round_count 70)" = "0" ] || fail "(11) off-mode: no round may be consumed"
-row | grep -q 'needs you' || fail "(11) off-mode: an unattended red reads 'needs you' (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(11) off-mode: an unattended red reads 'needs you' (got: $(row))"
 ok
 
 # ON: the collect tick bounces; the NEXT tick replays the shaCache and reads fix-in-progress.
@@ -492,8 +492,8 @@ _HC_RESULT=""; DISPLAY=()
 _healthcheck_gate 71 slug-a "$T/wt" 0 shae2eon              # next tick: shaCache replay
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "(11) the cached red must stay red (got '$_HC_RESULT')"
 [ "$(runs)" = "1" ] || fail "(11) the cache replay must not re-bounce"
-row | grep -q 'needs you' && fail "(11) the cached row must not lie with 'needs you' (got: $(row))"
-row | grep -q 'fix in progress · awaiting push (round 1/3)' \
+grep -q 'needs you' <<< "$(row)" && fail "(11) the cached row must not lie with 'needs you' (got: $(row))"
+grep -q 'fix in progress · awaiting push (round 1/3)' <<< "$(row)" \
   || fail "(11) the cached row must read fix-in-progress (got: $(row))"
 ok
 

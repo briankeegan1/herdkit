@@ -71,7 +71,7 @@ out="$( cd "$T" && . "$BACKEND"
         _backend_add_item "req-1" "add second-feature"
         printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" )"
 
-echo "$out" | grep -q "RESULT=DONE" || fail "_backend_add_item did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "_backend_add_item did not report DONE ($out)"
 pass
 
 head1="$(git -C "$T" rev-parse HEAD)"
@@ -79,7 +79,7 @@ head1="$(git -C "$T" rev-parse HEAD)"
 pass
 
 # 1. The ALLOWED path proceeds: BACKLOG_FILE's new content is in the new commit.
-git -C "$T" show "$head1:$(basename "$BACKLOG_FILE")" | grep -q "second-feature" \
+grep -q "second-feature" <<< "$(git -C "$T" show "$head1:$(basename "$BACKLOG_FILE")")" \
   || fail "the allowed BACKLOG_FILE edit was not committed"
 pass
 
@@ -90,14 +90,14 @@ committed_secret="$(git -C "$T" show "$head1:secret-dir/config.secret" 2>/dev/nu
 pass
 
 # 3. The dirty edit is STILL sitting unstaged in the working tree (skipped, not silently discarded).
-git -C "$T" status --porcelain -- secret-dir/config.secret | grep -q '^ M' \
+grep -q '^ M' <<< "$(git -C "$T" status --porcelain -- secret-dir/config.secret)" \
   || fail "denied-path tracked file should remain locally modified but unstaged"
 pass
 
 # 4. A brand-new file under a DENY_PATHS entry (".env") is likewise never staged/committed.
-git -C "$T" show "$head1" --stat --name-only | grep -q '^\.env$' \
+grep -q '^\.env$' <<< "$(git -C "$T" show "$head1" --stat --name-only)" \
   && fail "denied-path untracked file (.env) was committed by the scribe write"
-git -C "$T" status --porcelain -- .env | grep -q '^?? \.env$' \
+grep -q '^?? \.env$' <<< "$(git -C "$T" status --porcelain -- .env)" \
   || fail ".env should remain untracked (skipped), not committed or ignored away"
 pass
 

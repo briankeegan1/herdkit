@@ -211,7 +211,7 @@ out="$(HERD_NO_PANE=1 HERD_REVIEW_RESULT_FILE="$RES" WORKTREES_DIR="$T/trees" \
        HERD_CONFIG_FILE="$T/no-such-config" bash "$REVIEW" 9 slug-real 2>/dev/null)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "herd-review.sh should exit 0 on PASS (got $rc)"
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "herd-review.sh should still print the verdict to stdout"
+grep -q '^REVIEW: PASS$' <<< "$out" || fail "herd-review.sh should still print the verdict to stdout"
 [ -f "$RES" ] || fail "herd-review.sh did not write the result file"
 grep -q '^REVIEW: PASS$' "$RES" || fail "result file does not contain the PASS verdict"
 ok

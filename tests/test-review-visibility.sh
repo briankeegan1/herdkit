@@ -30,9 +30,9 @@ case "$1 $2" in
   "pr comment") exit 0 ;;
   "pr view")
     # Support --json headRefOid and --json comments
-    if printf '%s\n' "$@" | grep -q 'headRefOid'; then
+    if grep -q 'headRefOid' <<< "$(printf '%s\n' "$@")"; then
       printf '{"headRefOid":"%s"}\n' "${GH_HEAD_SHA:-abc1234567890}"
-    elif printf '%s\n' "$@" | grep -q 'comments'; then
+    elif grep -q 'comments' <<< "$(printf '%s\n' "$@")"; then
       printf '{"comments":[{"author":{"login":"reviewer"},"body":"REVIEW: BLOCK — off by one"}]}\n'
     else
       printf '{"mergeable":"%s","mergeStateStatus":"%s","headRefName":"feat/test","headRefOid":"%s"}\n' \
@@ -108,23 +108,23 @@ export REVIEW_STATE OVERRIDES
 
 # No verdict → non-zero exit and error message.
 out="$(bash "$APPROVE" why 99 2>&1)" && fail "why with no verdict should exit non-zero" || true
-printf '%s\n' "$out" | grep -q "No review verdict" || fail "why: expected 'No review verdict' message"
+grep -q "No review verdict" <<< "$out" || fail "why: expected 'No review verdict' message"
 ok
 
 # Write a BLOCK verdict, run why.
 printf '1000 99 deadbeef BLOCK\n' > "$REVIEW_STATE"
 out="$(bash "$APPROVE" why 99 2>&1)"
-printf '%s\n' "$out" | grep -q "BLOCK" || fail "why: should show BLOCK in output"
+grep -q "BLOCK" <<< "$out" || fail "why: should show BLOCK in output"
 ok
-printf '%s\n' "$out" | grep -q "deadbeef" || fail "why: should show sha"
+grep -q "deadbeef" <<< "$out" || fail "why: should show sha"
 ok
-printf '%s\n' "$out" | grep -q "99" || fail "why: should show PR number"
+grep -q "99" <<< "$out" || fail "why: should show PR number"
 ok
 
 # With an override written, why should note it.
 printf '1001 override 99 deadbeef\n' > "$OVERRIDES"
 out="$(bash "$APPROVE" why 99 2>&1)"
-printf '%s\n' "$out" | grep -q "override" || fail "why: should note override when present"
+grep -q "override" <<< "$out" || fail "why: should note override when present"
 ok
 
 # ── herd-approve.sh: override subcommand ─────────────────────────────────────
@@ -146,7 +146,7 @@ ok
 printf '999 10 newsha123456789 PASS\n' > "$REVIEW_STATE"
 rm -f "$OVERRIDES"
 out="$(bash "$APPROVE" override 10 2>/dev/null)"
-printf '%s\n' "$out" | grep -qi "PASS\|already" || fail "override: should report existing PASS"
+grep -qi "PASS\|already" <<< "$out" || fail "override: should report existing PASS"
 ok
 [ ! -s "$OVERRIDES" ] || fail "override: should not write to ledger when PASS already recorded"
 ok
@@ -180,18 +180,18 @@ INPUT='{"type":"system","subtype":"init"}
 '
 
 out="$(printf '%s\n' "$INPUT" | python3 -uc "$FORMATTER")"
-printf '%s\n' "$out" | grep -q "Reviewing the diff now" || fail "formatter: assistant text not printed"
+grep -q "Reviewing the diff now" <<< "$out" || fail "formatter: assistant text not printed"
 ok
-printf '%s\n' "$out" | grep -q "\[tool\] gh" || fail "formatter: tool_use not printed"
+grep -q "\[tool\] gh" <<< "$out" || fail "formatter: tool_use not printed"
 ok
-printf '%s\n' "$out" | grep -q "REVIEW: PASS" || fail "formatter: final result text not printed"
+grep -q "REVIEW: PASS" <<< "$out" || fail "formatter: final result text not printed"
 ok
 
 # Non-JSON passthrough.
 out2="$(printf 'plain text line\n{"type":"result","result":"REVIEW: BLOCK — reason"}\n' | python3 -uc "$FORMATTER")"
-printf '%s\n' "$out2" | grep -q "plain text line" || fail "formatter: non-JSON should pass through"
+grep -q "plain text line" <<< "$out2" || fail "formatter: non-JSON should pass through"
 ok
-printf '%s\n' "$out2" | grep -q "REVIEW: BLOCK" || fail "formatter: result with BLOCK should be printed"
+grep -q "REVIEW: BLOCK" <<< "$out2" || fail "formatter: result with BLOCK should be printed"
 ok
 
 # ── herd-review.sh: log RETENTION (rolling window) ───────────────────────────

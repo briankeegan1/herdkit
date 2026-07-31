@@ -91,8 +91,8 @@ case "$review_line" in *"msgs=1"*) ok ;; *) fail "summer: review msgs should be 
 
 # Component filter: asking for just builder must not emit a review line.
 only_builder="$(cost_report_dir "$DIR" builder)"
-printf '%s\n' "$only_builder" | grep -q 'component=review' && fail "summer: 'builder' filter leaked a review line"
-printf '%s\n' "$only_builder" | grep -q 'component=builder' || fail "summer: 'builder' filter dropped the builder line"
+grep -q 'component=review' <<< "$only_builder" && fail "summer: 'builder' filter leaked a review line"
+grep -q 'component=builder' <<< "$only_builder" || fail "summer: 'builder' filter dropped the builder line"
 ok
 
 # ── (3) unknown model is flagged and contributes $0 (never guessed) ──
@@ -155,33 +155,33 @@ cat > "$TREES/.herd/journal.jsonl" <<'JNL'
 JNL
 
 cost_out="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost 2>&1)"
-printf '%s\n' "$cost_out" | grep -qE 'PR #42 +\$ *160\.0000' || fail "herd cost: PR #42 total should be 160.0000\n$cost_out"
+grep -qE 'PR #42 +\$ *160\.0000' <<< "$cost_out" || fail "herd cost: PR #42 total should be 160.0000\n$cost_out"
 ok
-printf '%s\n' "$cost_out" | grep -qE 'PR #43 +\$ *30\.0000' || fail "herd cost: PR #43 total should be 30.0000\n$cost_out"
+grep -qE 'PR #43 +\$ *30\.0000' <<< "$cost_out" || fail "herd cost: PR #43 total should be 30.0000\n$cost_out"
 ok
-printf '%s\n' "$cost_out" | grep -qE 'Cost per merged PR: +\$95\.0000' || fail "herd cost: cost-per-merged-PR should be 95.0000\n$cost_out"
+grep -qE 'Cost per merged PR: +\$95\.0000' <<< "$cost_out" || fail "herd cost: cost-per-merged-PR should be 95.0000\n$cost_out"
 ok
-printf '%s\n' "$cost_out" | grep -qE 'Merged PRs \(billed\): +2' || fail "herd cost: should count 2 merged PRs\n$cost_out"
+grep -qE 'Merged PRs \(billed\): +2' <<< "$cost_out" || fail "herd cost: should count 2 merged PRs\n$cost_out"
 ok
-printf '%s\n' "$cost_out" | grep -qE 'Total spend recorded: +\$190\.0000' || fail "herd cost: total spend should be 190.0000\n$cost_out"
+grep -qE 'Total spend recorded: +\$190\.0000' <<< "$cost_out" || fail "herd cost: total spend should be 190.0000\n$cost_out"
 ok
 # By-component rollup: builder = 110+30 = 140, review = 50.
-printf '%s\n' "$cost_out" | grep -qE 'builder +\$ *140\.0000' || fail "herd cost: builder component total should be 140.0000\n$cost_out"
+grep -qE 'builder +\$ *140\.0000' <<< "$cost_out" || fail "herd cost: builder component total should be 140.0000\n$cost_out"
 ok
-printf '%s\n' "$cost_out" | grep -qE 'review +\$ *50\.0000' || fail "herd cost: review component total should be 50.0000\n$cost_out"
+grep -qE 'review +\$ *50\.0000' <<< "$cost_out" || fail "herd cost: review component total should be 50.0000\n$cost_out"
 ok
 # By-model rollup names both models.
-printf '%s\n' "$cost_out" | grep -q 'claude-opus-4-8' || fail "herd cost: by-model should list opus\n$cost_out"
-printf '%s\n' "$cost_out" | grep -q 'claude-sonnet-4-6' || fail "herd cost: by-model should list sonnet\n$cost_out"
+grep -q 'claude-opus-4-8' <<< "$cost_out" || fail "herd cost: by-model should list opus\n$cost_out"
+grep -q 'claude-sonnet-4-6' <<< "$cost_out" || fail "herd cost: by-model should list sonnet\n$cost_out"
 ok
 
 # --pr drills into one PR: shows both components + a TOTAL, excludes PR 43.
 pr_out="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost --pr 42 2>&1)"
-printf '%s\n' "$pr_out" | grep -q 'PR #42 — cost breakdown' || fail "herd cost --pr 42: header wrong\n$pr_out"
-printf '%s\n' "$pr_out" | grep -q 'builder' || fail "herd cost --pr 42: should list builder\n$pr_out"
-printf '%s\n' "$pr_out" | grep -q 'review'  || fail "herd cost --pr 42: should list review\n$pr_out"
-printf '%s\n' "$pr_out" | grep -qE 'TOTAL +\$ *160\.0000' || fail "herd cost --pr 42: TOTAL should be 160.0000\n$pr_out"
-printf '%s\n' "$pr_out" | grep -q 'slug2' && fail "herd cost --pr 42: must not include PR 43's slug2\n$pr_out"
+grep -q 'PR #42 — cost breakdown' <<< "$pr_out" || fail "herd cost --pr 42: header wrong\n$pr_out"
+grep -q 'builder' <<< "$pr_out" || fail "herd cost --pr 42: should list builder\n$pr_out"
+grep -q 'review' <<< "$pr_out" || fail "herd cost --pr 42: should list review\n$pr_out"
+grep -qE 'TOTAL +\$ *160\.0000' <<< "$pr_out" || fail "herd cost --pr 42: TOTAL should be 160.0000\n$pr_out"
+grep -q 'slug2' <<< "$pr_out" && fail "herd cost --pr 42: must not include PR 43's slug2\n$pr_out"
 ok
 
 # empty journal → friendly message, exit 0.
@@ -193,7 +193,7 @@ WORKSPACE_NAME="ctest2"
 CFG
 empty_out="$(cd "$EMPTYP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd cost with no journal should exit 0"
-printf '%s\n' "$empty_out" | grep -q 'no engine journal yet' || fail "herd cost: empty case should say so\n$empty_out"
+grep -q 'no engine journal yet' <<< "$empty_out" || fail "herd cost: empty case should say so\n$empty_out"
 ok
 
 # ── (7) `herd cost --full` ALSO scans the live coordinator/scribe/researcher transcripts ──
@@ -241,29 +241,29 @@ export HERD_TRANSCRIPT_ROOT="$FROOT"
 
 # 7a. cost_report_full (the pure reader) emits coordinator + scribe, skips review + manual.
 full_report="$(cost_report_full "$FMDIR")"
-printf '%s\n' "$full_report" | grep -qE 'component=coordinator .*out=200000 .*usd=20\.000000' || fail "cost_report_full: coordinator line wrong: $full_report"
-printf '%s\n' "$full_report" | grep -qE 'component=scribe .*out=100000 .*usd=10\.000000' || fail "cost_report_full: scribe line wrong: $full_report"
-printf '%s\n' "$full_report" | grep -q 'component=review' && fail "cost_report_full: must skip the fallback review: $full_report"
-printf '%s\n' "$full_report" | grep -qE 'out=9000000' && fail "cost_report_full: leaked a skipped session's tokens: $full_report"
+grep -qE 'component=coordinator .*out=200000 .*usd=20\.000000' <<< "$full_report" || fail "cost_report_full: coordinator line wrong: $full_report"
+grep -qE 'component=scribe .*out=100000 .*usd=10\.000000' <<< "$full_report" || fail "cost_report_full: scribe line wrong: $full_report"
+grep -q 'component=review' <<< "$full_report" && fail "cost_report_full: must skip the fallback review: $full_report"
+grep -qE 'out=9000000' <<< "$full_report" && fail "cost_report_full: leaked a skipped session's tokens: $full_report"
 ok
 
 # 7b. `herd cost --full` appends the session agents + a complete session total (110+20+10 = 140).
 full_out="$(cd "$FPROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost --full 2>&1)"
-printf '%s\n' "$full_out" | grep -q 'Live session agents' || fail "herd cost --full: missing session-agents section\n$full_out"
-printf '%s\n' "$full_out" | grep -qE 'coordinator +claude-opus-4-8 +\$ *20\.0000' || fail "herd cost --full: coordinator \$20 missing\n$full_out"
-printf '%s\n' "$full_out" | grep -qE 'scribe +claude-opus-4-8 +\$ *10\.0000' || fail "herd cost --full: scribe \$10 missing\n$full_out"
-printf '%s\n' "$full_out" | grep -qE 'Session total .*: +\$140\.0000' || fail "herd cost --full: session total should be 140.0000\n$full_out"
+grep -q 'Live session agents' <<< "$full_out" || fail "herd cost --full: missing session-agents section\n$full_out"
+grep -qE 'coordinator +claude-opus-4-8 +\$ *20\.0000' <<< "$full_out" || fail "herd cost --full: coordinator \$20 missing\n$full_out"
+grep -qE 'scribe +claude-opus-4-8 +\$ *10\.0000' <<< "$full_out" || fail "herd cost --full: scribe \$10 missing\n$full_out"
+grep -qE 'Session total .*: +\$140\.0000' <<< "$full_out" || fail "herd cost --full: session total should be 140.0000\n$full_out"
 ok
 # The merge-gated rollup is still present and correct within --full (builder \$110 unchanged).
-printf '%s\n' "$full_out" | grep -qE 'Total spend recorded: +\$110\.0000' || fail "herd cost --full: merge-recorded total should stay 110.0000\n$full_out"
+grep -qE 'Total spend recorded: +\$110\.0000' <<< "$full_out" || fail "herd cost --full: merge-recorded total should stay 110.0000\n$full_out"
 ok
 
 # 7c. DEFAULT `herd cost` is UNCHANGED — no session section, no session total, no coordinator/scribe.
 def_out="$(cd "$FPROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost 2>&1)"
-printf '%s\n' "$def_out" | grep -q 'Live session agents' && fail "herd cost (default) must NOT scan live transcripts\n$def_out"
-printf '%s\n' "$def_out" | grep -q 'Session total' && fail "herd cost (default) must NOT print a session total\n$def_out"
-printf '%s\n' "$def_out" | grep -qiE 'coordinator|scribe' && fail "herd cost (default) must NOT mention session agents\n$def_out"
-printf '%s\n' "$def_out" | grep -qE 'Total spend recorded: +\$110\.0000' || fail "herd cost (default): total should be 110.0000\n$def_out"
+grep -q 'Live session agents' <<< "$def_out" && fail "herd cost (default) must NOT scan live transcripts\n$def_out"
+grep -q 'Session total' <<< "$def_out" && fail "herd cost (default) must NOT print a session total\n$def_out"
+grep -qiE 'coordinator|scribe' <<< "$def_out" && fail "herd cost (default) must NOT mention session agents\n$def_out"
+grep -qE 'Total spend recorded: +\$110\.0000' <<< "$def_out" || fail "herd cost (default): total should be 110.0000\n$def_out"
 ok
 
 # 7d. --full with NO transcript dir → a graceful note, still exits 0, still shows the rollup.
@@ -275,9 +275,9 @@ WORKSPACE_NAME="ctest4"
 CFG
 nod_out="$(cd "$NODIRP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" cost --full 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd cost --full with no transcript dir should exit 0\n$nod_out"
-printf '%s\n' "$nod_out" | grep -q 'Live session agents' || fail "herd cost --full: section should appear even with no dir\n$nod_out"
-printf '%s\n' "$nod_out" | grep -qiE 'no transcript dir|nothing to add' || fail "herd cost --full: should note the missing/empty scan\n$nod_out"
-printf '%s\n' "$nod_out" | grep -qE 'Session total .*: +\$110\.0000' || fail "herd cost --full: with no agents, session total == merge total\n$nod_out"
+grep -q 'Live session agents' <<< "$nod_out" || fail "herd cost --full: section should appear even with no dir\n$nod_out"
+grep -qiE 'no transcript dir|nothing to add' <<< "$nod_out" || fail "herd cost --full: should note the missing/empty scan\n$nod_out"
+grep -qE 'Session total .*: +\$110\.0000' <<< "$nod_out" || fail "herd cost --full: with no agents, session total == merge total\n$nod_out"
 ok
 unset HERD_COST_PRICE_FILE HERD_TRANSCRIPT_ROOT
 

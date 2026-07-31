@@ -69,16 +69,16 @@ enqueue_after() { ( sleep "$1"; printf '%s\n' "$3" > "$Q/$2.req" ) & }
 # ══ 1. DEFAULT (linger 0) is byte-identical: an empty queue returns EMPTY at the base poll ═════════
 next 0 0
 [ "$RC" -eq 0 ]                                  || fail "1: next exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          || fail "1: empty queue with linger 0 did not print EMPTY ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" || fail "1: empty queue with linger 0 did not print EMPTY ($OUT)"
 ok
 
 # ══ 2. A request already waiting is claimed immediately, regardless of linger ══════════════════════
 enqueue 100 "first burst request"
 next 0 8
 [ "$RC" -eq 0 ]                                  || fail "2: next exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -q '^CLAIMED '       || fail "2: a queued request was not CLAIMED ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'first burst request' || fail "2: claimed the wrong request text ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          && fail "2: printed EMPTY despite a waiting request"
+grep -q '^CLAIMED ' <<< "$OUT" || fail "2: a queued request was not CLAIMED ($OUT)"
+grep -q 'first burst request' <<< "$OUT" || fail "2: claimed the wrong request text ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" && fail "2: printed EMPTY despite a waiting request"
 # clean up the claim so the queue is empty again for the next case
 rm -f "$Q"/*.mine
 ok
@@ -88,7 +88,7 @@ ok
 enqueue_after 2 200 "late request (no linger)"
 next 0 0
 wait   # reap the backgrounded enqueue
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          || fail "3: linger 0 did not return EMPTY on the empty-then-late queue ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" || fail "3: linger 0 did not return EMPTY on the empty-then-late queue ($OUT)"
 rm -f "$Q"/*.req "$Q"/*.mine   # the late request landed after EMPTY; discard it
 ok
 
@@ -98,9 +98,9 @@ enqueue_after 2 300 "request enqueued mid-linger"
 next 0 10
 wait
 [ "$RC" -eq 0 ]                                  || fail "4: lingering next exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -q '^CLAIMED '       || fail "4: mid-linger request was not CLAIMED ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'request enqueued mid-linger' || fail "4: claimed the wrong request ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          && fail "4: printed EMPTY instead of lingering for the late request"
+grep -q '^CLAIMED ' <<< "$OUT" || fail "4: mid-linger request was not CLAIMED ($OUT)"
+grep -q 'request enqueued mid-linger' <<< "$OUT" || fail "4: claimed the wrong request ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" && fail "4: printed EMPTY instead of lingering for the late request"
 rm -f "$Q"/*.mine
 ok
 
@@ -109,14 +109,14 @@ ok
 #      drained A is the same session that drains B (HERD-88's whole point). ════════════════════════
 enqueue 400 "burst A"
 next 0 10                                        # session's 1st drain
-printf '%s\n' "$OUT" | grep -q 'burst A'         || fail "5: first drain did not claim burst A ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          && fail "5: session ended (EMPTY) before the gap"
+grep -q 'burst A' <<< "$OUT" || fail "5: first drain did not claim burst A ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" && fail "5: session ended (EMPTY) before the gap"
 rm -f "$Q"/*.mine                                # (drainer would commit+unclaim A here)
 enqueue_after 2 401 "burst B"                    # arrives during the linger, after an idle gap
 next 0 10                                        # SAME session's 2nd drain
 wait
-printf '%s\n' "$OUT" | grep -q 'burst B'         || fail "5: same session did not pick up burst B across the gap ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'EMPTY'          && fail "5: printed EMPTY instead of draining burst B"
+grep -q 'burst B' <<< "$OUT" || fail "5: same session did not pick up burst B across the gap ($OUT)"
+grep -qx 'EMPTY' <<< "$OUT" && fail "5: printed EMPTY instead of draining burst B"
 rm -f "$Q"/*.mine
 ok
 

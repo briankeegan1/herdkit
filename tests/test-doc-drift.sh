@@ -46,12 +46,12 @@ if [ "$real_rc" -ne 0 ]; then
   echo "$real_out" | grep '^DRIFT' >&2
   fail "(1) README.md / docs/*.md / templates/*.tmpl drifted from templates/capabilities.tsv (see DRIFT lines above) — fix the reference or add the row to the manifest"
 fi
-printf '%s\n' "$real_out" | grep -q '^DRIFT' && fail "(1) drift lines present despite clean exit"
+grep -q '^DRIFT' <<< "$real_out" && fail "(1) drift lines present despite clean exit"
 pass
 echo "PASS (1) README.md + docs/*.md + templates/*.tmpl ↔ capabilities.tsv: every referenced herd command (+ README CONFIG_KEY) resolves (no drift)"
 
 # ── 2. ADVISORY is emitted AND is warn-only ────────────────────────────────────────────────────
-printf '%s\n' "$real_out" | grep -q '^ADVISORY:' || fail "(2) advisory summary line missing"
+grep -q '^ADVISORY:' <<< "$real_out" || fail "(2) advisory summary line missing"
 adv_count="$(printf '%s\n' "$real_out" | sed -n 's/^ADVISORY: \([0-9]*\) command.*/\1/p')"
 [ -n "$adv_count" ] || fail "(2) could not parse advisory command count"
 pass
@@ -79,11 +79,11 @@ EOF
 
 fix_out="$(herd_doc_drift_report "$CAPS" "$FIX_README")"; fix_rc=$?
 [ "$fix_rc" -eq 2 ] || fail "(3) README fixture with deliberate drift must exit 2, got $fix_rc"
-printf '%s\n' "$fix_out" | grep -q 'DRIFT command:.*`herd boguscmd`' \
+grep -q 'DRIFT command:.*`herd boguscmd`' <<< "$fix_out" \
   || fail "(3) stale command 'herd boguscmd' not flagged"
-printf '%s\n' "$fix_out" | grep -q 'DRIFT config:  README references `TOTALLY_FAKE_KEY`' \
+grep -q 'DRIFT config:  README references `TOTALLY_FAKE_KEY`' <<< "$fix_out" \
   || fail "(3) stale key 'TOTALLY_FAKE_KEY' not flagged"
-printf '%s\n' "$fix_out" | grep -qE 'DRIFT.*(herd status|herd why|MERGE_POLICY|herd projects)' \
+grep -qE 'DRIFT.*(herd status|herd why|MERGE_POLICY|herd projects)' <<< "$fix_out" \
   && fail "(3) false positive: a real token or ignored prose was flagged as drift"
 pass
 echo "PASS (3) README deliberate-drift fixture: stale command + stale key both caught, real tokens + prose untouched"
@@ -106,15 +106,15 @@ EOF
 # Clean docs-only surface (no README keys) must pass when every command resolves.
 clean_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_DOCS/clean.md")"; clean_rc=$?
 [ "$clean_rc" -eq 0 ] || fail "(4a) clean docs fixture must exit 0, got $clean_rc — $clean_out"
-printf '%s\n' "$clean_out" | grep -q '^DRIFT' && fail "(4a) clean docs fixture emitted DRIFT lines"
+grep -q '^DRIFT' <<< "$clean_out" && fail "(4a) clean docs fixture emitted DRIFT lines"
 pass
 echo "PASS (4a) docs fixture with only real commands passes"
 
 stale_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_DOCS/stale.md")"; stale_rc=$?
 [ "$stale_rc" -eq 2 ] || fail "(4b) docs fixture with `herd foo` must exit 2, got $stale_rc"
-printf '%s\n' "$stale_out" | grep -q 'DRIFT command:.*`herd foo`' \
+grep -q 'DRIFT command:.*`herd foo`' <<< "$stale_out" \
   || fail "(4b) stale command 'herd foo' not flagged in docs fixture: $stale_out"
-printf '%s\n' "$stale_out" | grep -qE 'DRIFT.*`herd map`' \
+grep -qE 'DRIFT.*`herd map`' <<< "$stale_out" \
   && fail "(4b) false positive: real `herd map` flagged as drift"
 pass
 echo "PASS (4b) docs deliberate-drift fixture: nonexistent 'herd foo' flagged, real 'herd map' untouched"
@@ -160,18 +160,18 @@ EOF
 
 clean_tmpl_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_TMPL/clean.md.tmpl")"; clean_tmpl_rc=$?
 [ "$clean_tmpl_rc" -eq 0 ] || fail "(6a) clean tmpl fixture must exit 0, got $clean_tmpl_rc — $clean_tmpl_out"
-printf '%s\n' "$clean_tmpl_out" | grep -q '^DRIFT' && fail "(6a) clean tmpl fixture emitted DRIFT lines: $clean_tmpl_out"
+grep -q '^DRIFT' <<< "$clean_tmpl_out" && fail "(6a) clean tmpl fixture emitted DRIFT lines: $clean_tmpl_out"
 pass
 echo "PASS (6a) templates/*.tmpl fixture with only real commands + {{...}} placeholders passes"
 
 stale_tmpl_out="$(herd_doc_drift_report "$CAPS" "" "$FIX_TMPL/stale.md.tmpl")"; stale_tmpl_rc=$?
 [ "$stale_tmpl_rc" -eq 2 ] || fail "(6b) tmpl fixture with `herd boguscmd` must exit 2, got $stale_tmpl_rc"
-printf '%s\n' "$stale_tmpl_out" | grep -q 'DRIFT command:.*`herd boguscmd`' \
+grep -q 'DRIFT command:.*`herd boguscmd`' <<< "$stale_tmpl_out" \
   || fail "(6b) stale command 'herd boguscmd' not flagged in tmpl fixture: $stale_tmpl_out"
-printf '%s\n' "$stale_tmpl_out" | grep -qE 'DRIFT.*`herd notes`' \
+grep -qE 'DRIFT.*`herd notes`' <<< "$stale_tmpl_out" \
   && fail "(6b) false positive: real `herd notes` flagged as drift"
 # Placeholder residue must not invent a DRIFT (e.g. empty/partial after strip).
-printf '%s\n' "$stale_tmpl_out" | grep -q 'RENDER_CMD' \
+grep -q 'RENDER_CMD' <<< "$stale_tmpl_out" \
   && fail "(6b) false positive from {{...}} placeholder: $stale_tmpl_out"
 pass
 echo "PASS (6b) templates/*.tmpl deliberate-drift fixture: phantom 'herd boguscmd' flagged; real commands + {{...}} untouched"
@@ -187,7 +187,7 @@ Run `herd phantomtmpl` — MUST drift when scanned by herd_doc_drift_lint.
 EOF
 lint_tmpl_out="$(herd_doc_drift_lint "$LINT_TREE")"; lint_tmpl_rc=$?
 [ "$lint_tmpl_rc" -eq 1 ] || fail "(6c) lint entrypoint on tree with phantom tmpl cmd must exit 1 (drift), got $lint_tmpl_rc — $lint_tmpl_out"
-printf '%s\n' "$lint_tmpl_out" | grep -q 'DRIFT command:.*`herd phantomtmpl`' \
+grep -q 'DRIFT command:.*`herd phantomtmpl`' <<< "$lint_tmpl_out" \
   || fail "(6c) lint entrypoint did not flag phantom tmpl command: $lint_tmpl_out"
 pass
 echo "PASS (6c) herd_doc_drift_lint scans templates/*.tmpl under <root> (entrypoint, not just report)"

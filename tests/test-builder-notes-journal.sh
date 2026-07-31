@@ -65,7 +65,7 @@ out="$(
   HERMETIC_TEST=1 \
   bash "$HERD_BIN" note "this red is a stale cached row" 2>&1
 )" || fail "herd note exited non-zero: $out"
-echo "$out" | grep -q "noted" || fail "herd note should print a confirmation (got: $out)"
+grep -q "noted" <<< "$out" || fail "herd note should print a confirmation (got: $out)"
 ok
 
 [ -f "$JOURNAL_FILE" ] || fail "journal file not created"
@@ -197,8 +197,8 @@ ok
 BUILDER_NOTES_ROWS=""
 build_builder_notes
 [ -n "${BUILDER_NOTES_ROWS:-}" ] || fail "build_builder_notes should render a row"
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "my-slug" || fail "render missing slug"
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "not wired into the gate" || fail "render missing text"
+grep -q "my-slug" <<< "$BUILDER_NOTES_ROWS" || fail "render missing slug"
+grep -q "not wired into the gate" <<< "$BUILDER_NOTES_ROWS" || fail "render missing text"
 ok
 
 # ── (4) lane preambles instruct builders to use herd note ────────────────────────────────────────

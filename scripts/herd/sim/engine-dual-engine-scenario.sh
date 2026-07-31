@@ -240,7 +240,7 @@ fi
 step migrate "drive the P4 migration-quiesce gate (refuse while OLD writes, proceed once quiesced)"
 MG1="$(HERD_SIM_SEAT=migrator bash "$SEAT_RUNNER" migrate-guard 2>>"$ART/mg.log")" || true
 info "guard (OLD still active): $MG1"
-if printf '%s' "$MG1" | grep -q 'migration=refused'; then
+if grep -q 'migration=refused' <<< "$MG1"; then
   checkpoint migration_quiesce_refused pass "guard refused while a seat is still writing: $MG1"
 else
   checkpoint migration_quiesce_refused fail "expected refusal, got: $MG1"
@@ -251,7 +251,7 @@ HERD_SIM_SEAT=new HERD_ENGINE_LEVEL_FORCE=2 bash "$SEAT_RUNNER" quiesce >>"$ART/
 HERD_SIM_SEAT=old HERD_ENGINE_LEVEL_FORCE=1 bash "$SEAT_RUNNER" quiesce >>"$ART/mg.log" 2>&1 || true
 MG2="$(HERD_SIM_SEAT=migrator bash "$SEAT_RUNNER" migrate-guard 2>>"$ART/mg.log")" || true
 info "guard (all quiesced): $MG2"
-if printf '%s' "$MG2" | grep -q 'migration=proceed'; then
+if grep -q 'migration=proceed' <<< "$MG2"; then
   checkpoint migration_quiesce_ok pass "guard proceeded once every seat quiesced: $MG2"
 else
   checkpoint migration_quiesce_ok fail "expected proceed, got: $MG2"
@@ -287,8 +287,8 @@ RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT")"
 
 # Read the verdict BACK from the file (the item's "scorecard green, read from file" acceptance).
-FILE_RESULT="$(sed -n 's/.*"result": "\([a-z]*\)".*/\1/p' "$SCARD" | head -1)"
-FILE_CROSS="$(sed -n 's/.*"cross_mismatch_writes": \([0-9]*\).*/\1/p' "$SCARD" | head -1)"
+FILE_RESULT="$(sed -n 's/.*"result": "\([a-z]*\)".*/\1/p' "$SCARD" | sed -n 1p)"
+FILE_CROSS="$(sed -n 's/.*"cross_mismatch_writes": \([0-9]*\).*/\1/p' "$SCARD" | sed -n 1p)"
 
 printf '\n%s══ scorecard ══%s\n' "$c_bold" "$c_rst"
 printf '  scenario:                %s\n' "$SCENARIO"

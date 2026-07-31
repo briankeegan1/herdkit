@@ -172,7 +172,7 @@ DISPLAY=()
 _handle_block_verdict 70 slug-rev sha70 0
 [ -s "$PANE_LOG" ] || fail "reviewer-backed BLOCK should bounce the builder (pane run expected)"
 refix_attempted 70 sha70 || fail "reviewer-backed BLOCK should record a refix"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "refixing" || fail "reviewer-backed BLOCK display should show 'refixing'"
+grep -q "refixing" <<< "${DISPLAY[0]:-}" || fail "reviewer-backed BLOCK display should show 'refixing'"
 ok
 
 # 4b. source=gate_default → NO bounce (the 2026-07-02 incident: default-BLOCK woke a builder on noise).
@@ -185,9 +185,9 @@ _handle_block_verdict 71 slug-gd sha71 0
 [ ! -s "$PANE_LOG" ] || fail "gate_default BLOCK must NOT bounce the builder (no pane run)"
 ! refix_attempted 71 sha71 || fail "gate_default BLOCK must NOT record a refix"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you"            || fail "gate_default BLOCK should escalate 'needs you' (got: $d)"
-printf '%s\n' "$d" | grep -q "without a reviewer finding" || fail "gate_default BLOCK should say 'without a reviewer finding' (got: $d)"
-printf '%s\n' "$d" | grep -q "gate_default"         || fail "gate_default BLOCK should name the provenance (got: $d)"
+grep -q "needs you" <<< "$d" || fail "gate_default BLOCK should escalate 'needs you' (got: $d)"
+grep -q "without a reviewer finding" <<< "$d" || fail "gate_default BLOCK should say 'without a reviewer finding' (got: $d)"
+grep -q "gate_default" <<< "$d" || fail "gate_default BLOCK should name the provenance (got: $d)"
 ok
 
 # 4c. source=infra → NO bounce either.
@@ -230,10 +230,10 @@ STUB
 chmod +x "$BIN/claude"
 run_review 21 slug-noverdict
 [ "$REV_RC" -eq 2 ] || fail "(5) rc0-no-verdict should exit 2 (INFRA-FAIL), got $REV_RC"
-printf '%s\n' "$REV_OUT" | grep -q '^REVIEW: INFRA-FAIL' || fail "(5) should print REVIEW: INFRA-FAIL (got: $REV_OUT)"
+grep -q '^REVIEW: INFRA-FAIL' <<< "$REV_OUT" || fail "(5) should print REVIEW: INFRA-FAIL (got: $REV_OUT)"
 grep -q '^REVIEW: INFRA-FAIL' "$REV_RES" || fail "(5) result file should hold INFRA-FAIL (got: $(cat "$REV_RES" 2>/dev/null))"
-printf '%s\n' "$REV_OUT" | grep -q 'REVIEW: BLOCK' && fail "(5) rc0-no-verdict must NOT be a BLOCK"
-printf '%s\n' "$REV_OUT" | grep -qi 'defaulting to block' && fail "(5) must not use the old 'defaulting to BLOCK' path"
+grep -q 'REVIEW: BLOCK' <<< "$REV_OUT" && fail "(5) rc0-no-verdict must NOT be a BLOCK"
+grep -qi 'defaulting to block' <<< "$REV_OUT" && fail "(5) must not use the old 'defaulting to BLOCK' path"
 ok
 
 # ── (6) reviewer emits NOTHING at all (empty stream) → INFRA-FAIL ─────────────────

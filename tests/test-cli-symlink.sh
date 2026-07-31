@@ -35,13 +35,13 @@ out="$( cd "$proj" && "$prefix/herd" backlog 2>&1 )" || true
 
 # Must NOT have resolved SCRIPTS_DIR to the symlink's prefix, and must NOT have failed to
 # source herd-config.sh (both are signatures of home == symlink dir instead of real home).
-printf '%s\n' "$out" | grep -q "$prefix/scripts/herd" \
+grep -q "$prefix/scripts/herd" <<< "$out" \
   && fail "SCRIPTS_DIR resolved to the symlink prefix instead of real home: $out"
-printf '%s\n' "$out" | grep -q "$T/scripts/herd" \
+grep -q "$T/scripts/herd" <<< "$out" \
   && fail "SCRIPTS_DIR resolved under the symlink tree instead of real home: $out"
-printf '%s\n' "$out" | grep -q "herd-config.sh: No such file or directory" \
+grep -q "herd-config.sh: No such file or directory" <<< "$out" \
   && fail "could not source herd-config.sh from real home (symlink not resolved): $out"
-printf '%s\n' "$out" | grep -q "No such file or directory" \
+grep -q "No such file or directory" <<< "$out" \
   && fail "symlinked invocation errored on a missing file (wrong home): $out"
 
 echo "ALL PASS"

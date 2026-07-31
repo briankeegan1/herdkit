@@ -128,17 +128,17 @@ ok
 # ── (4) gh present but UNAUTHENTICATED ⇒ skip with a note (no derived findings) ───────────────────
 proj="$T/p4"; mkproj "$proj" "git@github.com:acme/widgets.git"
 out="$(PATH="$STUB:$PATH" GH_FIXTURE=protected GH_AUTHED=0 run_detect "$proj" "origin/main")"
-echo "$out" | grep -qi "^skip=.*authenticat" || fail "(4) unauthenticated gh should skip with a note ($out)"
+grep -qi "^skip=.*authenticat" <<< "$out" || fail "(4) unauthenticated gh should skip with a note ($out)"
 [ -z "$(field "$out" slug)" ]                || fail "(4) skip should not emit findings ($out)"
 ok
 
 # ── (5) no GitHub remote / non-GitHub remote ⇒ skip with a note ──────────────────────────────────
 proj="$T/p5a"; mkproj "$proj" ""   # no origin at all
 out="$(PATH="$STUB:$PATH" GH_FIXTURE=protected GH_AUTHED=1 run_detect "$proj" "origin/main")"
-echo "$out" | grep -qi "^skip=no GitHub remote" || fail "(5a) missing remote should skip ($out)"
+grep -qi "^skip=no GitHub remote" <<< "$out" || fail "(5a) missing remote should skip ($out)"
 proj="$T/p5b"; mkproj "$proj" "https://gitlab.com/acme/widgets.git"   # non-github host
 out="$(PATH="$STUB:$PATH" GH_FIXTURE=protected GH_AUTHED=1 run_detect "$proj" "origin/main")"
-echo "$out" | grep -qi "^skip=no GitHub remote" || fail "(5b) non-github remote should skip ($out)"
+grep -qi "^skip=no GitHub remote" <<< "$out" || fail "(5b) non-github remote should skip ($out)"
 ok
 
 # ── (6) end-to-end `herd init`: summary shown + derived defaults written to .herd/config ──────────
@@ -147,14 +147,14 @@ out="$(cd "$proj" && PATH="$STUB:$PATH" GH_FIXTURE=protected GH_AUTHED=1 \
         HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(6) init should succeed with detection (rc=$RC): $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "GitHub detection"                 || fail "(6) summary header missing: $out"
-echo "$pout" | grep -qi "acme/widgets"                     || fail "(6) repo slug not shown: $out"
-echo "$pout" | grep -qi "protected"                        || fail "(6) protection not shown: $out"
-echo "$pout" | grep -qi "2 required review"                || fail "(6) required-review count not shown: $out"
-echo "$pout" | grep -qi "required checks: ci,lint"         || fail "(6) required checks not shown: $out"
-echo "$pout" | grep -qi "CODEOWNERS:.*present"             || fail "(6) CODEOWNERS not shown: $out"
-echo "$pout" | grep -qi "MERGE_POLICY=approve"             || fail "(6) derived approve not shown: $out"
-echo "$pout" | grep -qi "MERGE_METHOD=squash"              || fail "(6) derived squash not shown: $out"
+grep -qi "GitHub detection" <<< "$pout" || fail "(6) summary header missing: $out"
+grep -qi "acme/widgets" <<< "$pout" || fail "(6) repo slug not shown: $out"
+grep -qi "protected" <<< "$pout" || fail "(6) protection not shown: $out"
+grep -qi "2 required review" <<< "$pout" || fail "(6) required-review count not shown: $out"
+grep -qi "required checks: ci,lint" <<< "$pout" || fail "(6) required checks not shown: $out"
+grep -qi "CODEOWNERS:.*present" <<< "$pout" || fail "(6) CODEOWNERS not shown: $out"
+grep -qi "MERGE_POLICY=approve" <<< "$pout" || fail "(6) derived approve not shown: $out"
+grep -qi "MERGE_METHOD=squash" <<< "$pout" || fail "(6) derived squash not shown: $out"
 grep -qE '^MERGE_POLICY="approve"$' "$proj/.herd/config"  || fail "(6) config MERGE_POLICY not approve: $(cat "$proj/.herd/config")"
 grep -qE '^MERGE_METHOD="squash"$'  "$proj/.herd/config"  || fail "(6) config MERGE_METHOD not squash"
 ok
@@ -170,8 +170,8 @@ else
   out="$(cd "$proj" && PATH="$SAFE" HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init 2>&1)"; RC=$?
   [ "$RC" -eq 0 ] || fail "(7) init must not hard-fail without gh (rc=$RC): $out"
   pout="$(plain "$out")"
-  echo "$pout" | grep -qi "skipped"                         || fail "(7) skip note missing: $out"
-  echo "$pout" | grep -qi "gh CLI not installed"            || fail "(7) no-gh reason missing: $out"
+  grep -qi "skipped" <<< "$pout" || fail "(7) skip note missing: $out"
+  grep -qi "gh CLI not installed" <<< "$pout" || fail "(7) no-gh reason missing: $out"
   grep -qE '^MERGE_POLICY="auto"$'  "$proj/.herd/config"    || fail "(7) config should default MERGE_POLICY=auto"
   grep -qE '^MERGE_METHOD="merge"$' "$proj/.herd/config"    || fail "(7) config should default MERGE_METHOD=merge"
 fi

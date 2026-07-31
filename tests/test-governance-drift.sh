@@ -53,12 +53,12 @@ cat > "$proj/CLAUDE.md" <<'MD'
 - This project targets Python 3.11 and ships weekly.
 MD
 out="$(run "$proj")" || fail "(1) sweep exited non-zero: $out"
-echo "$out" | grep -q 'governance-drift-sweep:'                        || fail "(1) drift must print a loud advisory header: $out"
-echo "$out" | grep -q 'PUSH_GATE=human'                                || fail "(1) advisory must name the drifted key + proposed value PUSH_GATE=human"
-echo "$out" | grep -q 'herd config set PUSH_GATE human'                || fail "(1) advisory must show the exact 'herd config set' to adopt"
-echo "$out" | grep -q 'MERGE_METHOD=squash'                            || fail "(1) advisory must also name MERGE_METHOD=squash"
-echo "$out" | grep -qF 'reviewed by a human before they are pushed'    || fail "(1) advisory must quote the source sentence as evidence"
-echo "$out" | grep -q 'config says: PUSH_GATE=<unset>'                 || fail "(1) advisory must show the current (empty→<unset>) config value"
+grep -q 'governance-drift-sweep:' <<< "$out" || fail "(1) drift must print a loud advisory header: $out"
+grep -q 'PUSH_GATE=human' <<< "$out" || fail "(1) advisory must name the drifted key + proposed value PUSH_GATE=human"
+grep -q 'herd config set PUSH_GATE human' <<< "$out" || fail "(1) advisory must show the exact 'herd config set' to adopt"
+grep -q 'MERGE_METHOD=squash' <<< "$out" || fail "(1) advisory must also name MERGE_METHOD=squash"
+grep -qF 'reviewed by a human before they are pushed' <<< "$out" || fail "(1) advisory must quote the source sentence as evidence"
+grep -q 'config says: PUSH_GATE=<unset>' <<< "$out" || fail "(1) advisory must show the current (empty→<unset>) config value"
 # journal: one governance_drift event per drifted key, naming key + claude_value + config_value.
 [ -f "$proj/journal.jsonl" ]                                           || fail "(1) a governance_drift journal event must be written on drift"
 grep -q '"event":"governance_drift"' "$proj/journal.jsonl"             || fail "(1) journal event type must be governance_drift"
@@ -99,8 +99,8 @@ cat > "$proj/AGENTS.md" <<'MD'
 - Never auto-merge pull requests without explicit approval.
 MD
 out="$(run "$proj")" || fail "(4) sweep exited non-zero: $out"
-echo "$out" | grep -q 'MERGE_POLICY=approve'                           || fail "(4) AGENTS.md rule must be extracted (MERGE_POLICY=approve)"
-echo "$out" | grep -q 'AGENTS.md now says'                             || fail "(4) drift line must attribute the source file (AGENTS.md)"
+grep -q 'MERGE_POLICY=approve' <<< "$out" || fail "(4) AGENTS.md rule must be extracted (MERGE_POLICY=approve)"
+grep -q 'AGENTS.md now says' <<< "$out" || fail "(4) drift line must attribute the source file (AGENTS.md)"
 grep -q '"source":"AGENTS.md"' "$proj/journal.jsonl"                   || fail "(4) journal must record source=AGENTS.md"
 ok
 
@@ -119,7 +119,7 @@ cat > "$stub" <<STUB
 STUB
 chmod +x "$stub"
 out="$(HERD_DRIFT_PR_COMMENT="$stub" run "$proj" --pr 321)" || fail "(5) sweep --pr exited non-zero: $out"
-echo "$out" | grep -q 'posted the drift advisory as a comment on PR #321' || fail "(5) --pr must report it posted a comment: $out"
+grep -q 'posted the drift advisory as a comment on PR #321' <<< "$out" || fail "(5) --pr must report it posted a comment: $out"
 [ -f "$T/comment.out" ]                                                || fail "(5) the PR-comment seam must be invoked"
 grep -q 'PR=321' "$T/comment.out"                                      || fail "(5) the comment must target the given PR number"
 grep -q 'herd config set PUSH_GATE human' "$T/comment.out"             || fail "(5) the comment body must carry the adopt command"

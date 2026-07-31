@@ -46,7 +46,7 @@ HERD_VERSION=1'
 
 # ── 2. Idempotent re-run at the current version is a safe no-op ──────────────────────────────────
 out2="$( cd "$P1" && HERD_TARGET_VERSION=2 bash "$HERD" upgrade 2>&1 )" || fail "idempotent re-run failed"
-echo "$out2" | grep -q "no pending migrations" || fail "re-run at current version should report no pending migrations"
+grep -q "no pending migrations" <<< "$out2" || fail "re-run at current version should report no pending migrations"
 [ "$(count_key "$P1/.herd/config" MERGE_POLICY)" -eq 1 ]         || fail "re-run duplicated MERGE_POLICY"
 [ "$(cfgval "$P1/.herd/config" MERGE_POLICY)"     = "observe" ] || fail "re-run altered MERGE_POLICY"
 [ "$(cfgval "$P1/.herd/config" HERD_VERSION)"     = "2" ]        || fail "re-run altered HERD_VERSION"
@@ -74,7 +74,7 @@ P4="$T/proj-current"
 mkproj "$P4" 'WORKSPACE_NAME="curproj"
 HERD_VERSION=3'
 out4="$( cd "$P4" && HERD_MIGRATIONS_DIR="$MIGDIR" HERD_TARGET_VERSION=3 bash "$HERD" upgrade 2>&1 )" || fail "no-op upgrade failed"
-echo "$out4" | grep -q "no pending migrations" || fail "already-current upgrade should report no pending migrations"
+grep -q "no pending migrations" <<< "$out4" || fail "already-current upgrade should report no pending migrations"
 [ -z "$(cfgval "$P4/.herd/config" MIG_TRACE)" ] || fail "already-current upgrade ran a migration (trace set)"
 
 # ── 5. Rollback-safe: a failing migration restores the config and leaves HERD_VERSION un-bumped ──

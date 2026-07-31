@@ -258,7 +258,7 @@ grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watch pane did no
 grep -q "pane split" "$S/log" && fail "split a new pane when the registered watch pane was reusable" || true
 grep -q "tab create" "$S/log" && fail "created a tab when the registered watch pane was reusable" || true
 grep -q "pane run pA" "$S/log" && fail "wrote into the coordinator (anchor) pane" || true
-printf '%s' "$out" | grep -q "visible ✓" || fail "watch summary missing 'visible ✓'"
+grep -q "visible ✓" <<< "$out" || fail "watch summary missing 'visible ✓'"
 # Registry rewritten with all three roles.
 grep -q "^watch pW tC" "$R1/trees/.herd-panes" || fail "registry watch row not rewritten to pW"
 grep -q "^coordinator-agent pA" "$R1/trees/.herd-panes" || fail "registry coordinator-agent row missing"
@@ -278,7 +278,7 @@ REG
 out="$(_pane_run "$P" "$S" watch)" || fail "pane watch failed (recreate when gone)"
 grep -q "pane split pA --direction down" "$S/log" || fail "gone watch pane not recreated by splitting below the coordinator"
 grep -rl "herd-watch.sh" "$S/panes" >/dev/null || fail "recreated pane did not receive herd-watch.sh"
-printf '%s' "$out" | grep -q "recreated ✓" || fail "recreated watch pane not reported"
+grep -q "recreated ✓" <<< "$out" || fail "recreated watch pane not reported"
 # Registry watch row points at the newly created pane (not the dead pW_gone).
 new_w="$(awk '$1=="watch" {print $2}' "$R2/trees/.herd-panes")"
 [ -n "$new_w" ] && [ "$new_w" != "pW_gone" ] || fail "registry watch row not updated to the recreated pane (got '$new_w')"
@@ -305,7 +305,7 @@ out="$(_pane_run "$P" "$S" watch HERD_RELOAD_SIGTERM_POLLS=3)"
 rc=$?
 set -e
 kill -9 "$STUBBORN" 2>/dev/null || true
-printf '%s' "$out" | grep -q "sending SIGKILL" || fail "SIGTERM-ignoring watcher did not trigger SIGKILL escalation"
+grep -q "sending SIGKILL" <<< "$out" || fail "SIGTERM-ignoring watcher did not trigger SIGKILL escalation"
 [ "$rc" -eq 0 ] || fail "pane watch should succeed once the stubborn watcher is SIGKILLed (rc=$rc)"
 runs="$(grep -c "pane run pW" "$S/log" || true)"
 [ "$runs" -eq 1 ] || fail "expected exactly one watcher relaunch after SIGKILL, got $runs"
@@ -341,8 +341,8 @@ if [ -n "$ZPID" ] && kill -0 "$ZPID" 2>/dev/null; then
   set -e
   kill -9 "$GUARD" 2>/dev/null || true
   [ "$rc" -ne 0 ] || fail "pane watch should abort (non-zero) when the watcher cannot be stopped"
-  printf '%s' "$out" | grep -q "could not be stopped" || fail "abort did not print the unstoppable-watcher error"
-  printf '%s' "$out" | grep -q "duplicate watchers" || fail "abort message should warn about duplicate watchers"
+  grep -q "could not be stopped" <<< "$out" || fail "abort did not print the unstoppable-watcher error"
+  grep -q "duplicate watchers" <<< "$out" || fail "abort message should warn about duplicate watchers"
   grep -q "pane run pW" "$S/log" && fail "a new watcher was launched despite the abort" || true
   ok
 else
@@ -363,7 +363,7 @@ grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog pane di
 grep -q "pane split" "$S/log" && fail "split a new pane when the backlog pane was reusable (should rerun in place)" || true
 grep -q "pane swap"  "$S/log" && fail "swapped panes when rerunning in place" || true
 grep -q "tab create" "$S/log" && fail "created a tab when rerunning the backlog in place" || true
-printf '%s' "$out" | grep -q "visible ✓" || fail "backlog summary missing 'visible ✓'"
+grep -q "visible ✓" <<< "$out" || fail "backlog summary missing 'visible ✓'"
 grep -q "^backlog pL tC" "$R4/trees/.herd-panes" || fail "registry backlog row not rewritten to pL"
 grep -q "^watch pW"      "$R4/trees/.herd-panes" || fail "registry watch row not preserved on backlog restart"
 ok
@@ -381,7 +381,7 @@ REG
 out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog failed (recreate when gone)"
 grep -q "pane split pA --direction right" "$S/log" || fail "gone backlog pane not recreated by splitting the coordinator"
 grep -q "pane swap --source-pane" "$S/log" || fail "recreated backlog pane not swapped into the left slot"
-printf '%s' "$out" | grep -q "recreated ✓" || fail "recreated backlog pane not reported"
+grep -q "recreated ✓" <<< "$out" || fail "recreated backlog pane not reported"
 ok
 
 # ── 5b. restart CLEARS pending input before injecting the command (2026-07-06 incident) ───────────
@@ -395,11 +395,11 @@ printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"
 out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog failed (input-clear path)"
 grep -q "pane send-keys pL ctrl+c ctrl+u" "$S/log" || fail "restart did not flush pending input (ctrl+c ctrl+u) on the backlog pane"
 # Ordering: the clear must precede the run in the invocation log.
-clear_ln="$(grep -n "pane send-keys pL ctrl+c ctrl+u" "$S/log" | head -1 | cut -d: -f1)"
-run_ln="$(grep -n "pane run pL" "$S/log" | head -1 | cut -d: -f1)"
+clear_ln="$(grep -nm1 "pane send-keys pL ctrl+c ctrl+u" "$S/log" | cut -d: -f1)"
+run_ln="$(grep -nm1 "pane run pL" "$S/log" | cut -d: -f1)"
 [ -n "$clear_ln" ] && [ -n "$run_ln" ] && [ "$clear_ln" -lt "$run_ln" ] \
   || fail "input clear did not precede the pane run (clear=$clear_ln run=$run_ln)"
-printf '%s' "$out" | grep -q "visible ✓" || fail "backlog restart with input-clear did not report visible"
+grep -q "visible ✓" <<< "$out" || fail "backlog restart with input-clear did not report visible"
 ok
 
 # ── 5c. NO false ✓: a stale shell echoing the script token is NOT accepted as a live viewer ───────
@@ -410,9 +410,9 @@ P="$T/p5c"; mkdir "$P"; _make_project "$P" "panetest"; R5C="$(cd "$P" && pwd -P)
 S="$T/s5c"; _coord_state "$S" "$R5C"
 printf 'rrrrbash /x/scripts/herd/backlog-view.sh' > "$S/panes/pL/junk"
 out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog exited non-zero on the junk-liveness path"
-printf '%s' "$out" | grep -q "NOT visible ✗" || fail "stale-shell junk earned a false ✓ instead of a loud failure"
-printf '%s' "$out" | grep -qi "backlog-view did not appear" || fail "loud warn missing for the never-started viewer"
-printf '%s' "$out" | grep -q "visible ✓" && fail "reported a viewer visible when only junk was present" || true
+grep -q "NOT visible ✗" <<< "$out" || fail "stale-shell junk earned a false ✓ instead of a loud failure"
+grep -qi "backlog-view did not appear" <<< "$out" || fail "loud warn missing for the never-started viewer"
+grep -q "visible ✓" <<< "$out" && fail "reported a viewer visible when only junk was present" || true
 ok
 
 # ── 5d. watch restart likewise flushes input AND strictly verifies the watcher process ────────────
@@ -423,8 +423,8 @@ set +e
 out="$(_pane_run "$P" "$S" watch)"
 set -e
 grep -q "pane send-keys pW ctrl+c ctrl+u" "$S/log" || fail "watch restart did not flush pending input on the watch pane"
-printf '%s' "$out" | grep -qE "NOT visible|DETACHED" || fail "junk watcher not surfaced loudly"
-printf '%s' "$out" | grep -q "visible ✓" && fail "watcher reported visible off a stale shell echo" || true
+grep -qE "NOT visible|DETACHED" <<< "$out" || fail "junk watcher not surfaced loudly"
+grep -q "visible ✓" <<< "$out" && fail "watcher reported visible off a stale shell echo" || true
 ok
 
 # ═══ herd pane coordinator ═══════════════════════════════════════════════════════════════════════
@@ -437,7 +437,7 @@ out="$(_pane_run "$P" "$S" coordinator)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "coordinator relaunch should refuse (non-zero) without confirmation"
-printf '%s' "$out" | grep -qi "refusing to relaunch the coordinator without confirmation" \
+grep -qi "refusing to relaunch the coordinator without confirmation" <<< "$out" \
   || fail "refusal message missing"
 grep -q "agent start" "$S/log" && fail "coordinator relaunched despite no confirmation" || true
 grep -q "pane close pA" "$S/log" && fail "killed the live coordinator pane despite no confirmation" || true
@@ -451,7 +451,7 @@ S="$T/s7"; _coord_state "$S" "$R7"
 out="$(_pane_run "$P" "$S" coordinator -- --yes)" || fail "coordinator relaunch failed with --yes"
 grep -q "pane close pA" "$S/log" || fail "did not kill the old coordinator pane"
 grep -q "agent start coordinator-panetest" "$S/log" || fail "did not start a fresh coordinator agent"
-printf '%s' "$out" | grep -q "relaunched ✓" || fail "coordinator summary missing 'relaunched ✓'"
+grep -q "relaunched ✓" <<< "$out" || fail "coordinator summary missing 'relaunched ✓'"
 # Registry rewritten with the NEW coordinator pane id (not the killed pA), backlog/watch preserved.
 new_c="$(awk '$1=="coordinator-agent" {print $2}' "$R7/trees/.herd-panes")"
 [ -n "$new_c" ] && [ "$new_c" != "pA" ] || fail "registry coordinator-agent not updated to the new pane (got '$new_c')"
@@ -475,12 +475,12 @@ git -C "$P" init -q; git -C "$P" config user.email t@t.t; git -C "$P" config use
 S="$T/s8"; mkdir -p "$S/tabs"
 set +e
 out="$( cd "$P" && env PATH="$RICH:$BIN:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="panetest" \
-    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1 )"
+    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail without a .herd/config"
-printf '%s' "$out" | grep -qi "no .herd/config" || fail "missing-config error not clear"
-printf '%s' "$out" | grep -qi "dogfood" || fail "should mention refusing the dogfood fallback"
+grep -qi "no .herd/config" <<< "$out" || fail "missing-config error not clear"
+grep -qi "dogfood" <<< "$out" || fail "should mention refusing the dogfood fallback"
 ok
 
 # ── 9. refuses when the coordinator tab is absent (control room not up) ────────────────────────────
@@ -492,7 +492,7 @@ out="$(_pane_run "$P" "$S" watch)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail when the coordinator tab is absent"
-printf '%s' "$out" | grep -qi "no coordinator tab" || fail "missing-coordinator-tab error not clear"
+grep -qi "no coordinator tab" <<< "$out" || fail "missing-coordinator-tab error not clear"
 ok
 
 # ── 10. unknown pane target fails clearly ─────────────────────────────────────────────────────────
@@ -503,7 +503,7 @@ out="$(_pane_run "$P" "$S" bogus)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "unknown pane target should fail"
-printf '%s' "$out" | grep -qi "unknown 'herd pane' target" || fail "unknown-target error not clear"
+grep -qi "unknown 'herd pane' target" <<< "$out" || fail "unknown-target error not clear"
 ok
 
 # ── 11. HERD-405: subdirectory walks up to the project's .herd/config via git toplevel ────────────
@@ -518,19 +518,19 @@ watch pW tC
 REG
 out="$(_pane_run "$P/scripts/herd" "$S" backlog)" || fail "pane backlog failed from a project subdirectory (walk-up)"
 grep -q -- "--cwd $R11 " "$S/log" || fail "walked-up config did not bind PANE_ROOT to the project root ($R11)"
-printf '%s' "$out" | grep -q "recreated ✓" || fail "subdir walk-up recreate not reported"
+grep -q "recreated ✓" <<< "$out" || fail "subdir walk-up recreate not reported"
 ok
 
 # ── 12. outside any git repo — no toplevel to walk up to, still refuses with the same message ─────
 P="$T/p12"; mkdir -p "$P/sub"   # plain directories, no git repo anywhere
 set +e
 out="$( cd "$P/sub" && env PATH="$RICH:$BIN:$PATH" HERDR_STATE="$T/s12" FAKE_WS_LABEL="panetest" \
-    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1 )"
+    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail outside any git repo"
-printf '%s' "$out" | grep -qi "no .herd/config" || fail "missing-config error not clear outside a repo"
-printf '%s' "$out" | grep -qi "dogfood" || fail "should mention refusing the dogfood fallback outside a repo"
+grep -qi "no .herd/config" <<< "$out" || fail "missing-config error not clear outside a repo"
+grep -qi "dogfood" <<< "$out" || fail "should mention refusing the dogfood fallback outside a repo"
 ok
 
 # ── 13. HERMETICITY LEDGER (HERD-439): the watcher-launch guard did its job ───────────────────────

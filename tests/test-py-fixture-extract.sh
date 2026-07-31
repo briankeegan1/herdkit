@@ -291,9 +291,9 @@ else
       # rc 1 (divergent) is the EXPECTED honest outcome for a two-engine head-to-head; rc 0 is fine too.
       [ -s "$AUTO/fixture.json" ]        || fail "--shadow auto did not write the extracted fixture"
       [ -s "$AUTO/journal-shadow.jsonl" ] || fail "--shadow auto produced no shadow journal"
-      printf '%s\n' "$a_out" | grep -q "python shadow engine via extracted fixture" \
+      grep -q "python shadow engine via extracted fixture" <<< "$a_out" \
         || fail "--shadow auto did not report the bridge mode"
-      printf '%s\n' "$a_out" | grep -qE "divergences:|journal parity: OK" \
+      grep -qE "divergences:|journal parity: OK" <<< "$a_out" \
         || fail "--shadow auto did not emit a parity report"
       ok "parity-run --shadow auto: real head-to-head on sandbox-scenario (fixture + shadow journal + honest report, rc=$rc)"
       ;;
@@ -314,7 +314,7 @@ else
     o_out="$(bash "$PARITY_RUN" --scenario sandbox-scenario --artifacts "$OFF" 2>&1)"; orc=$?
     if [ "$orc" = "0" ]; then
       [ ! -e "$OFF/fixture.json" ] || fail "the DEFAULT (self-diff) run wrote a fixture — the bridge is not opt-in"
-      printf '%s\n' "$o_out" | grep -q "self-diff" || fail "default run did not use the self-diff mode"
+      grep -q "self-diff" <<< "$o_out" || fail "default run did not use the self-diff mode"
       ok "byte-identical-off: the default self-diff run ignores the bridge (no fixture) and stays green"
     else
       skip "byte-identical-off default run: self-diff not green in this env (rc=$orc) — bridge is still opt-in"

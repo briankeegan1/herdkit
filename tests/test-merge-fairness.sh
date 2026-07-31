@@ -53,7 +53,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required"
 # exists and that no bash action-pass callsite lingers (the ordering is single-owner: Python).
 ( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1; declare -F _merge_fairness_reorder >/dev/null ) \
   || fail "(0) the _merge_fairness_reorder helper must survive (retained for the acceptance sim + the checks below)"
-grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }' | grep -q . \
+grep -q . <<< "$(grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }')" \
   && fail "(0) the deleted bash action pass (_tick_act) must not be referenced in code — the ordering is Python-owned now"
 ok "(0) the reorder helper survives for the behavioral + sim proofs; the live ordering is Python-owned (no bash action pass)"
 
@@ -353,13 +353,13 @@ _restale_note 308 "sha$_RESTALE_STARVE_THRESHOLD" slug-h stale-base
 [ "$(events pr_starvation)" = "1" ] || fail "(11) crossing the threshold must journal pr_starvation"
 [ "$(event_field pr_starvation laps)" = "$_RESTALE_STARVE_THRESHOLD" ] || fail "(11) pr_starvation must carry the lap count"
 ROW="$(_starvation_row 308)"
-printf '%s' "$ROW" | grep -q "starving · ${_RESTALE_STARVE_THRESHOLD} re-stale laps" \
+grep -q "starving · ${_RESTALE_STARVE_THRESHOLD} re-stale laps" <<< "$ROW" \
   || fail "(11) expected the loud 'starving · N re-stale laps' row, got: $ROW"
 # The row rides UNDER the existing hold row — it decorates, never replaces.
 DISPLAY=("    original hold row")
 _restale_decorate_row 0 308
-printf '%s' "${DISPLAY[0]}" | grep -q "original hold row" || fail "(11) decoration must preserve the hold row"
-printf '%s' "${DISPLAY[0]}" | grep -q "starving"          || fail "(11) decoration must append the starvation line"
+grep -q "original hold row" <<< "${DISPLAY[0]}" || fail "(11) decoration must preserve the hold row"
+grep -q "starving" <<< "${DISPLAY[0]}" || fail "(11) decoration must append the starvation line"
 [ "$(printf '%s' "${DISPLAY[0]}" | wc -l | tr -d ' ')" = "1" ] || fail "(11) decoration must add exactly one line"
 # A PR under the threshold is never decorated — the console stays byte-identical for it.
 DISPLAY=("    untouched row"); _restale_decorate_row 0 999
@@ -393,8 +393,9 @@ READERS="$(grep -rlF 'RESTALE_STATE' "$ROOT/scripts" "$ROOT/bin" 2>/dev/null \
 USES="$(grep -nE 'restale_count|_starvation_row' "$WATCH" | grep -vE '^\s*[0-9]+:\s*#' | grep -vE 'restale_count\(\)|_starvation_row\(\)' | wc -l | tr -d ' ')"
 [ "$USES" -ge 1 ] || fail "(13) the counter is never read — the row would never render"
 # Every call sits inside the two display helpers; nothing in a gate/merge decision.
-grep -nE 'if .*restale_count|\[ .*restale_count.* \] (&&|\|\|) (do_merge|record_|post_gate)' "$WATCH" \
-  | grep -vE '_starvation_row\(\)' | grep -q . && fail "(13) restale_count appears in a gate/merge decision"
+_gate_uses="$(grep -nE 'if .*restale_count|\[ .*restale_count.* \] (&&|\|\|) (do_merge|record_|post_gate)' "$WATCH" \
+  | grep -vE '_starvation_row\(\)' || true)"
+grep -q . <<< "$_gate_uses" && fail "(13) restale_count appears in a gate/merge decision"
 ok "(13) the re-stale counter is display + journal only — nothing gates on it"
 
 echo "ALL PASS ($pass checks) — merge fairness: ready-PR priority + starvation surfacing (HERD-231)"

@@ -179,7 +179,7 @@ real_remote_available() {
 delete_repo_scope_probe() {
   local out line
   out="$(gh auth status 2>&1 || true)"
-  line="$(printf '%s\n' "$out" | grep -iE 'Token scopes:' | head -n1)"
+  line="$(printf '%s\n' "$out" | grep -iE 'Token scopes:' | sed -n 1p)"
   [ -n "$line" ] || return 2
   case "$line" in
     *delete_repo*) return 0 ;;
@@ -356,7 +356,7 @@ fi
 step gate "run fixture health gate (app/greet.test.sh) on the builder branch"
 git -C "$REPO" checkout -q "$BUILDER_BRANCH"
 gate_rc=0
-gate_out="$( (cd "$REPO" && bash app/greet.test.sh) 2>&1 )" || gate_rc=$?
+gate_out="$( (cd "$REPO" && bash app/greet.test.sh) 2>&1)" || gate_rc=$?
 git -C "$REPO" checkout -q main
 if [ "$gate_rc" -eq 0 ]; then
   checkpoint gate_passed pass "gate clean: $gate_out"

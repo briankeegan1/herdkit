@@ -226,9 +226,9 @@ ok
 [ "$(limit_target_epoch "lim-ok")" = "1005060" ] || fail "5: target must still be reset+buffer=1005060"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "native auto-resume" || fail "5: cleared hold row should mention native auto-resume (got: $d)"
+grep -q "native auto-resume" <<< "$d" || fail "5: cleared hold row should mention native auto-resume (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "needs you" && fail "5: cleared hold row must NOT be a red needs-you row (got: $d)"
+grep -q "needs you" <<< "$d" && fail "5: cleared hold row must NOT be a red needs-you row (got: $d)"
 ok
 
 # 5b. Menu persists on first sighting → sendkeys 'fallback', backstop unchanged, generic hold row.
@@ -242,7 +242,7 @@ ok
 [ "$(limit_state "lim-fb")" = "scheduled" ] || fail "5b: fallback must keep the scheduled backstop"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "auto-resume at" || fail "5b: fallback hold row keeps the generic 'auto-resume at' phrasing (got: $d)"
+grep -q "auto-resume at" <<< "$d" || fail "5b: fallback hold row keeps the generic 'auto-resume at' phrasing (got: $d)"
 ok
 # Second tick must NOT re-attempt the keys (dedup via the sendkeys ledger).
 keys_before="$(wc -l < "$KEYS_LOG")"
@@ -260,7 +260,7 @@ record_sendkeys "lim-wk" "1990000" "cleared"
 DISPLAY=()
 STUB_PANE_READ_TEXT="$CLEAR_TEXT" _handle_limit_blocked "lim-wk" "$T/trees/lim-wk" "0" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "native auto-resume" || fail "6: an already-working agent at reset should show a native-resume resolve row (got: $d)"
+grep -q "native auto-resume" <<< "$d" || fail "6: an already-working agent at reset should show a native-resume resolve row (got: $d)"
 ok
 [ ! -s "$PANE_LOG" ] || fail "6: an already-working agent must NOT get a second claude --continue (log: $(cat "$PANE_LOG"))"
 ok

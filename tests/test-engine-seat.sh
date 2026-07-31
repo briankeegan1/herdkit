@@ -110,7 +110,7 @@ for p in $pids; do wait "$p"; done
 # Every seat must still be present in the latest-row-per-seat view (append-only ⇒ no lost update).
 rows="$(_herd_engine_seat_active_rows)"
 for s in a b c d; do
-  printf '%s\n' "$rows" | grep -q "^seat-$s	" || fail "(a5) seat-$s lost from the registry under concurrency"
+  grep -q "^seat-$s	" <<< "$rows" || fail "(a5) seat-$s lost from the registry under concurrency"
 done
 # And compaction kept the file bounded (well under the 400 raw appends).
 lines="$(grep -c . "$REG" 2>/dev/null)"; lines="${lines:-0}"
@@ -206,9 +206,9 @@ GH
   ENGINE_SEAT_RECONCILE=on
   printf 'stale 1 2 peerSeat\n' > "$ENGINE_SEAT_STATE"
   build_engine_seat_note
-  printf '%s' "${HERD_ENGINE_SEAT_NOTE:-}" | grep -q 'DUAL-ENGINE HALT' \
+  grep -q 'DUAL-ENGINE HALT' <<< "${HERD_ENGINE_SEAT_NOTE:-}" \
     || { echo "FAIL: (c4) a stale state file must render the loud HALT row" >&2; exit 1; }
-  printf '%s' "${HERD_ENGINE_SEAT_NOTE:-}" | grep -q 'peerSeat' \
+  grep -q 'peerSeat' <<< "${HERD_ENGINE_SEAT_NOTE:-}" \
     || { echo "FAIL: (c4) the HALT row must name the peer seat" >&2; exit 1; }
   ENGINE_SEAT_RECONCILE=off
   build_engine_seat_note

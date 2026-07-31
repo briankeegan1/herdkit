@@ -48,8 +48,8 @@ beta_nf="$(awk -F'|' '{print NF}' <<< "$beta_row")"
 [ "$beta_nf" -eq 3 ] || fail "register with no --alias should stay a 3-field row (no aliases field), got: $beta_row"
 
 out="$(HERD_FLEET_FILE="$REG1" bash "$HERD" fleet list)"
-printf '%s' "$out" | grep -q "alpha-svc" || fail "fleet list should show alpha's aliases"
-printf '%s' "$out" | grep -q "Alpha Service" || fail "fleet list should show alpha's second alias"
+grep -q "alpha-svc" <<< "$out" || fail "fleet list should show alpha's aliases"
+grep -q "Alpha Service" <<< "$out" || fail "fleet list should show alpha's second alias"
 ok
 
 # ── 2. re-registering without --alias PRESERVES existing aliases (no silent wipe) ─────────────
@@ -124,9 +124,9 @@ set +e
 err="$(resolve shared-alias 2>&1 1>/dev/null)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "a shared alias across two projects must be refused as ambiguous"
-printf '%s' "$err" | grep -qi "ambiguous" || fail "ambiguous alias refusal should say so, got: $err"
-printf '%s' "$err" | grep -q "svc-alpha" || fail "ambiguous alias candidates should list svc-alpha"
-printf '%s' "$err" | grep -q "svc-gamma" || fail "ambiguous alias candidates should list svc-gamma"
+grep -qi "ambiguous" <<< "$err" || fail "ambiguous alias refusal should say so, got: $err"
+grep -q "svc-alpha" <<< "$err" || fail "ambiguous alias candidates should list svc-alpha"
+grep -q "svc-gamma" <<< "$err" || fail "ambiguous alias candidates should list svc-gamma"
 ok
 
 # 4e. unambiguous prefix match (no exact/alias hit anywhere for "svc-be").
@@ -145,8 +145,8 @@ set +e
 err="$(resolve svc- 2>&1 1>/dev/null)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "prefix 'svc-' ties four names and must be refused as ambiguous"
-printf '%s' "$err" | grep -qi "ambiguous" || fail "ambiguous prefix refusal should say so, got: $err"
-printf '%s' "$err" | grep -q "svc-alpha-two" || fail "ambiguous prefix candidates should list svc-alpha-two"
+grep -qi "ambiguous" <<< "$err" || fail "ambiguous prefix refusal should say so, got: $err"
+grep -q "svc-alpha-two" <<< "$err" || fail "ambiguous prefix candidates should list svc-alpha-two"
 ok
 
 # 4h. exact-tier ambiguity (two DIFFERENT projects registered under the identical name) refuses
@@ -155,7 +155,7 @@ set +e
 err="$(resolve dup-name 2>&1 1>/dev/null)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "an exact-name collision across two rows must be refused as ambiguous"
-printf '%s' "$err" | grep -qi "ambiguous" || fail "exact-tier ambiguity should say so, got: $err"
+grep -qi "ambiguous" <<< "$err" || fail "exact-tier ambiguity should say so, got: $err"
 ok
 
 # 4i. no match at any tier: refuses (exit 1) and lists what IS registered.
@@ -163,7 +163,7 @@ set +e
 err="$(resolve zzz-nope 2>&1 1>/dev/null)"; rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "no match should exit 1 (not the ambiguous exit 2), got rc=$rc"
-printf '%s' "$err" | grep -q "svc-alpha" || fail "no-match refusal should list registered projects"
+grep -q "svc-alpha" <<< "$err" || fail "no-match refusal should list registered projects"
 ok
 
 # ── 5. usage / empty-registry edges ───────────────────────────────────────────────────────────
@@ -171,18 +171,18 @@ set +e
 out="$(HERD_FLEET_FILE="$REG2" bash "$HERD" fleet resolve 2>&1)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "resolve with no argument should fail loudly"
-printf '%s' "$out" | grep -qi "usage" || fail "missing-argument error should show usage"
+grep -qi "usage" <<< "$out" || fail "missing-argument error should show usage"
 ok
 
 set +e
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet resolve anything 2>&1)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "resolve against an empty/missing registry should fail"
-printf '%s' "$out" | grep -qi "register" || fail "empty-registry refusal should point at 'herd fleet register'"
+grep -qi "register" <<< "$out" || fail "empty-registry refusal should point at 'herd fleet register'"
 ok
 
 out="$(HERD_FLEET_FILE="$REG2" bash "$HERD" fleet resolve --help)"
-printf '%s' "$out" | grep -qi "precedence\|exact" || fail "--help should describe the precedence"
+grep -qi "precedence\|exact" <<< "$out" || fail "--help should describe the precedence"
 ok
 
 # ── 6. an empty/whitespace-only query refuses instead of confidently matching everything ──────
@@ -218,7 +218,7 @@ set -e
 HELPNAME="$(_make_project -h)"
 HERD_FLEET_FILE="$REG3" bash "$HERD" fleet register "$HELPNAME" >/dev/null   # path is absolute, no '--' needed here
 out="$(HERD_FLEET_FILE="$REG3" bash "$HERD" fleet resolve -h)"
-printf '%s' "$out" | grep -qi "usage: herd fleet resolve" \
+grep -qi "usage: herd fleet resolve" <<< "$out" \
   || fail "sanity: WITHOUT '--', the query '-h' should print help, not resolve the '-h' project"
 out="$(HERD_FLEET_FILE="$REG3" bash "$HERD" fleet resolve -- -h)"; rc=$?
 [ "$rc" -eq 0 ] && [ "$out" = "-h" ] \

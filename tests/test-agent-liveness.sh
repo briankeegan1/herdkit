@@ -217,7 +217,7 @@ set_agent deadbob pane-dead done
 DISPLAY=()
 _handle_block_verdict "220" "deadbob" "sha-220" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "agent dead" || fail "C1: a dead agent must escalate to 'agent dead' (got: $d)"
+grep -q "agent dead" <<< "$d" || fail "C1: a dead agent must escalate to 'agent dead' (got: $d)"
 ok
 [ "$(wc -l < "$CALLS")" -eq 0 ] || fail "C1: a dead agent must NOT be sent a wake (herdr pane run calls=$(wc -l < "$CALLS"))"
 ok
@@ -240,7 +240,7 @@ rm -rf "$S/panes"; mkdir -p "$S/panes"; reset_agents
 DISPLAY=()
 _handle_block_verdict "222" "ghostbob" "sha-222" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "agent missing" || fail "C1b: a missing agent must escalate to 'agent missing' (got: $d)"
+grep -q "agent missing" <<< "$d" || fail "C1b: a missing agent must escalate to 'agent missing' (got: $d)"
 ok
 [ "$(wc -l < "$CALLS")" -eq 0 ] || fail "C1b: a missing agent must NOT be sent a wake (herdr pane run calls=$(wc -l < "$CALLS"))"
 ok
@@ -262,7 +262,7 @@ sleep() { :; }
 DISPLAY=()
 _handle_block_verdict "221" "livebob" "sha-221" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "agent dead" && fail "C2: a LIVE agent must NOT escalate to 'agent dead' (got: $d)"
+grep -q "agent dead" <<< "$d" && fail "C2: a LIVE agent must NOT escalate to 'agent dead' (got: $d)"
 ok
 [ "$(wc -l < "$CALLS")" -ge 1 ] || fail "C2: a live agent must be sent the normal wake (pane run) — calls=$(wc -l < "$CALLS")"
 ok
@@ -305,18 +305,18 @@ mk_tab tab-ft "my-feature";       mk_pane p-ft "" tab-ft
 # a multi-pane control room (coordinator) with a bare pane ⇒ NOT flagged (not single-pane, not labelled)
 mk_tab tab-co "coordinator-proj"; mk_pane p-co1 "" tab-co; mk_pane p-co2 "claude coord" tab-co
 out="$(layout_stale_agent_tabs "$WS")"
-printf '%s\n' "$out" | grep -q "review·featx" || fail "E1: a crashed single-pane reviewer tab must be flagged (out: $out)"
+grep -q "review·featx" <<< "$out" || fail "E1: a crashed single-pane reviewer tab must be flagged (out: $out)"
 ok
-printf '%s\n' "$out" | grep -q "scribe-proj"  || fail "E2: a crashed single-pane scribe drainer must be flagged (out: $out)"
+grep -q "scribe-proj" <<< "$out" || fail "E2: a crashed single-pane scribe drainer must be flagged (out: $out)"
 ok
-printf '%s\n' "$out" | grep -q "review·featy" && fail "E3: a LIVE reviewer tab must NOT be flagged (out: $out)"
+grep -q "review·featy" <<< "$out" && fail "E3: a LIVE reviewer tab must NOT be flagged (out: $out)"
 ok
-printf '%s\n' "$out" | grep -q "my-feature"   && fail "E4: a non-engine feature tab must NOT be flagged (out: $out)"
+grep -q "my-feature" <<< "$out" && fail "E4: a non-engine feature tab must NOT be flagged (out: $out)"
 ok
-printf '%s\n' "$out" | grep -q "coordinator-proj" && fail "E5: a multi-pane control room must NOT be flagged (out: $out)"
+grep -q "coordinator-proj" <<< "$out" && fail "E5: a multi-pane control room must NOT be flagged (out: $out)"
 ok
 # every flagged row carries a bare|gone role
-printf '%s\n' "$out" | grep "review·featx" | grep -qE '	(bare|gone)$' || fail "E6: a flagged row must record the dead role"
+grep -qE '	(bare|gone)$' <<< "$(printf '%s\n' "$out" | grep "review·featx")" || fail "E6: a flagged row must record the dead role"
 ok
 
 echo "ALL PASS ($pass checks)"

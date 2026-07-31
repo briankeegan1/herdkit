@@ -215,7 +215,7 @@ esac
 case "$row" in *"12m"*) : ;; *) fail "the wedged row must carry its age, got: $row" ;; esac
 case "$row" in *"awaiting task"*) fail "a wedge must NEVER read as an awaiting-task spare" ;; esac
 case "$row" in *"✅"*) fail "a wedge must NEVER render as a success" ;; esac
-printf '%s' "$row" | grep -qw 'idle' && fail "the wedged row leaked the banned 'idle' word: $row"
+grep -qw 'idle' <<< "$row" && fail "the wedged row leaked the banned 'idle' word: $row"
 ok
 
 woke="$(NO_COLOR=1 _row_wedged "slugcell" "12m" woken)"

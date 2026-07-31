@@ -71,8 +71,8 @@ grep -qE '^MERGE_METHOD="squash"$'   "$PROF"          || fail "(1) MERGE_METHOD 
 grep -qE '^PUSH_GATE="human"$'       "$PROF"          || fail "(1) PUSH_GATE not exported"
 grep -qE '^COMMIT_CONVENTION='       "$PROF"          || fail "(1) COMMIT_CONVENTION not exported"
 # Scope the exclusion checks to KEY=VALUE assignment lines — the header prose legitimately says "secrets".
-grep -E '^[A-Za-z_]+=' "$PROF" | grep -q 'MODEL_FEATURE'           && fail "(1) machine-scoped MODEL_FEATURE must NOT travel"
-grep -E '^[A-Za-z_]+=' "$PROF" | grep -qiE 'SECRET|TOKEN|API_?KEY' && fail "(1) no secret-shaped key may appear in a profile"
+grep -q 'MODEL_FEATURE' <<< "$(grep -E '^[A-Za-z_]+=' "$PROF")" && fail "(1) machine-scoped MODEL_FEATURE must NOT travel"
+grep -qiE 'SECRET|TOKEN|API_?KEY' <<< "$(grep -E '^[A-Za-z_]+=' "$PROF")" && fail "(1) no secret-shaped key may appear in a profile"
 
 DST="$T/dst"; mkcfg "$DST"
 ( cd "$DST" && "$HERD" governance apply --yes "$PROF" ) >/dev/null 2>&1 || fail "(1) apply --yes failed"
@@ -104,9 +104,9 @@ open(dst, "w", encoding="utf-8").write("\n".join(out))
 PY
 printf 'MODEL_FEATURE="claude-x"\n' >> "$SRC/.herd/config"   # set it in the baseline so it COULD leak
 mtout="$( cd "$SRC" && HERD_CAPABILITIES_FILE="$MISTAG" "$HERD" governance export 2>/dev/null )" || fail "(2) export failed"
-printf '%s\n' "$mtout" | grep -qE '^MODEL_FEATURE=' && fail "(2) machine key leaked despite mis-tag"
-printf '%s\n' "$mtout" | grep -qE '^MY_API_KEY='    && fail "(2) secret-shaped key leaked despite mis-tag"
-printf '%s\n' "$mtout" | grep -qE '^MERGE_POLICY='  || fail "(2) legit governance key should still export"
+grep -qE '^MODEL_FEATURE=' <<< "$mtout" && fail "(2) machine key leaked despite mis-tag"
+grep -qE '^MY_API_KEY=' <<< "$mtout" && fail "(2) secret-shaped key leaked despite mis-tag"
+grep -qE '^MERGE_POLICY=' <<< "$mtout" || fail "(2) legit governance key should still export"
 ok
 echo "PASS (2) machine/secret keys excluded even when the manifest mis-tags them governance"
 
@@ -142,7 +142,7 @@ out="$( cd "$DEC" && printf 'n\nn\nn\nn\n' \
         | PATH="$SAFE" HERD_GROUND_ASSUME_TTY=1 "$REAL_BASH" "$HERD" governance apply "$PROF" 2>&1 )" \
         || fail "(4a) interactive apply failed: $out"
 [ "$(cat "$deccfg")" = "$decbase" ]                     || fail "(4a) decline-all mutated the config"
-printf '%s\n' "$out" | grep -q "nothing applied"        || fail "(4a) decline-all should report nothing applied"
+grep -q "nothing applied" <<< "$out" || fail "(4a) decline-all should report nothing applied"
 ok
 echo "PASS (4a) decline-all (interactive) leaves .herd/config byte-identical"
 
@@ -157,7 +157,7 @@ out="$( cd "$INITP" && printf 'n\n' \
 icfg="$INITP/.herd/config"
 grep -qE '^MERGE_POLICY="approve"$' "$icfg" || fail "(4b) init --governance did not seed MERGE_POLICY: $(grep MERGE_POLICY "$icfg")"
 grep -qE '^PUSH_GATE="human"$'      "$icfg" || fail "(4b) init --governance did not seed PUSH_GATE"
-printf '%s\n' "$out" | grep -q "Seeding governance from profile" || fail "(4b) init should announce the profile seeding"
+grep -q "Seeding governance from profile" <<< "$out" || fail "(4b) init should announce the profile seeding"
 # malformed --governance aborts BEFORE writing any config
 BADINIT="$T/badinit"; rm -rf "$BADINIT"; mkdir -p "$BADINIT"; git -C "$BADINIT" init -q
 ( cd "$BADINIT" && PATH="$SAFE" HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \

@@ -32,9 +32,9 @@ printf '%s\n' "$QUESTION" > "$RESEARCH_QUEUE/$ID.req"
 
 # 2. next: should CLAIM it, echo the id and the question; queue file becomes .mine.
 out="$(bash "$STEP" next)"
-echo "$out" | grep -q "^CLAIMED " || fail "next did not print CLAIMED ($out)"
-echo "$out" | grep -qx "$ID" || fail "next did not echo the REQ_ID ($out)"
-echo "$out" | grep -qF "$QUESTION" || fail "next did not echo the question ($out)"
+grep -q "^CLAIMED " <<< "$out" || fail "next did not print CLAIMED ($out)"
+grep -qx "$ID" <<< "$out" || fail "next did not echo the REQ_ID ($out)"
+grep -qF "$QUESTION" <<< "$out" || fail "next did not echo the question ($out)"
 claimed="$(echo "$out" | sed -n 's/^CLAIMED //p')"
 [ -f "$claimed" ] || fail "claimed file missing: $claimed"
 [ -f "$RESEARCH_QUEUE/$ID.req" ] && fail "original .req still present after claim"
@@ -46,7 +46,7 @@ ls "$RESEARCH_QUEUE"/*.mine >/dev/null 2>&1 || fail "no .mine claim file present
 # 4. report: file fake findings -> report appears, inbox line added, claim + temp gone.
 findings="$(mktemp)"; printf '# Findings\n\nAnswer: scripts/herd/agent-watch.sh:1\n' > "$findings"
 rep="$(bash "$STEP" report "$claimed" "$findings")"
-echo "$rep" | grep -q "^DONE $ID" || fail "report did not print DONE ($rep)"
+grep -q "^DONE $ID" <<< "$rep" || fail "report did not print DONE ($rep)"
 [ -f "$RESEARCH_REPORTS/$ID.md" ] || fail "report file not created"
 grep -q "agent-watch.sh:1" "$RESEARCH_REPORTS/$ID.md" || fail "report content wrong"
 [ -f "$findings" ] && fail "findings temp file should have been moved, not copied"
@@ -55,7 +55,7 @@ grep -qF "$ID" "$RESEARCH_INBOX" || fail "inbox missing id line"
 grep -qF "$QUESTION" "$RESEARCH_INBOX" || fail "inbox missing question"
 
 # 5. research-get.sh: known id prints the report, unknown id prints PENDING.
-bash "$GET" "$ID" | grep -q "agent-watch.sh:1" || fail "research-get did not print report"
+grep -q "agent-watch.sh:1" <<< "$(bash "$GET" "$ID")" || fail "research-get did not print report"
 [ "$(bash "$GET" nonexistent-id)" = "PENDING" ] || fail "research-get unknown id not PENDING"
 
 # 6. finish: empty queue -> STOP (no RESEARCH_TAB so no herdr call); pending req -> MORE.

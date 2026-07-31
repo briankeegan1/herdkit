@@ -106,26 +106,26 @@ cat > "$APPROVALS" << 'ROWS'
 ROWS
 printf '1500 90 some-slug\n' > "$MERGED_STATE"
 out="$(MERGED_PRS='' bash "$APPROVE" list 2>/dev/null)"
-printf '%s' "$out" | grep -q 'PR #90' && fail "list must not show merged PR 90 (offline ledger backstop)"
+grep -q 'PR #90' <<< "$out" && fail "list must not show merged PR 90 (offline ledger backstop)"
 ok
-printf '%s' "$out" | grep -q 'PR #91' || fail "list must still show genuinely-awaiting PR 91"
+grep -q 'PR #91' <<< "$out" || fail "list must still show genuinely-awaiting PR 91"
 ok
 
 # ── 3. herd-approve.sh list — out-of-band gh MERGED backstop ─────────────────────────────────────
 # No merge/reap ledger entry for 90 (merged directly on GitHub by a human); gh reports it MERGED.
 rm -f "$MERGED_STATE"
 out="$(MERGED_PRS='90' bash "$APPROVE" list 2>/dev/null)"
-printf '%s' "$out" | grep -q 'PR #90' && fail "list must not show PR 90 merged out-of-band (gh backstop)"
+grep -q 'PR #90' <<< "$out" && fail "list must not show PR 90 merged out-of-band (gh backstop)"
 ok
-printf '%s' "$out" | grep -q 'PR #91' || fail "list must still show PR 91 (gh reports it OPEN)"
+grep -q 'PR #91' <<< "$out" || fail "list must still show PR 91 (gh reports it OPEN)"
 ok
 
 # ── 4. Regression guard — unmerged PRs still surface ─────────────────────────────────────────────
 # No ledger, nothing merged in gh: both awaiting PRs must show (the backstop must not over-skip).
 out="$(MERGED_PRS='' bash "$APPROVE" list 2>/dev/null)"
-printf '%s' "$out" | grep -q 'PR #90' || fail "unmerged PR 90 must still show"
+grep -q 'PR #90' <<< "$out" || fail "unmerged PR 90 must still show"
 ok
-printf '%s' "$out" | grep -q 'PR #91' || fail "unmerged PR 91 must still show"
+grep -q 'PR #91' <<< "$out" || fail "unmerged PR 91 must still show"
 ok
 
 echo "ALL PASS ($pass checks)"

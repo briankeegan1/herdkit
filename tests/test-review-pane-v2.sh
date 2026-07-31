@@ -145,7 +145,7 @@ ok
 # Verify: verdict collected, PASS
 [ "$rc" -eq 0 ] || fail "1: herd-review.sh should exit 0 on PASS (got $rc)"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "1: should print REVIEW: PASS to stdout"
+grep -q '^REVIEW: PASS$' <<< "$out" || fail "1: should print REVIEW: PASS to stdout"
 ok
 [ -f "$RES" ] || fail "1: result file should exist"
 ok
@@ -178,7 +178,7 @@ ok
 # Verdict comes from headless claude (stub returns PASS)
 [ "$rc" -eq 0 ] || fail "2: herd-review.sh should exit 0 on PASS from headless fallback (got $rc)"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "2: headless fallback should produce REVIEW: PASS"
+grep -q '^REVIEW: PASS$' <<< "$out" || fail "2: headless fallback should produce REVIEW: PASS"
 ok
 
 # ── (3) agent-pane BLOCK: BLOCK verdict from result file ─────────────────────
@@ -199,11 +199,11 @@ rc=$?
 
 [ "$rc" -eq 1 ] || fail "3: herd-review.sh should exit 1 on BLOCK (got $rc)"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: BLOCK' || fail "3: should print REVIEW: BLOCK to stdout"
+grep -q '^REVIEW: BLOCK' <<< "$out" || fail "3: should print REVIEW: BLOCK to stdout"
 ok
 grep -q '^REVIEW: BLOCK' "$RES" || fail "3: result file should contain REVIEW: BLOCK"
 ok
-printf '%s\n' "$out" | grep -q 'off by one' || fail "3: BLOCK reason should be preserved"
+grep -q 'off by one' <<< "$out" || fail "3: BLOCK reason should be preserved"
 ok
 
 wait 2>/dev/null || true
@@ -231,7 +231,7 @@ rc=$?
 
 [ "$rc" -eq 0 ] || fail "4: headless mode (HERD_NO_PANE=1) should exit 0 on PASS (got $rc)"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "4: headless fallback should produce REVIEW: PASS"
+grep -q '^REVIEW: PASS$' <<< "$out" || fail "4: headless fallback should produce REVIEW: PASS"
 ok
 [ -f "$RES" ] || fail "4: headless mode should still write the result file"
 ok
@@ -260,7 +260,7 @@ rc=$?
 
 [ "$rc" -eq 2 ] || fail "5: timed-out agent-pane reviewer should exit 2 (INFRA-FAIL, got $rc)"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: INFRA-FAIL' || fail "5: should emit REVIEW: INFRA-FAIL on timeout"
+grep -q '^REVIEW: INFRA-FAIL' <<< "$out" || fail "5: should emit REVIEW: INFRA-FAIL on timeout"
 ok
 # INFRA-FAIL must be written to the result file so the watcher sees it (and retries).
 [ -f "$RES" ] || fail "5: INFRA-FAIL should be written to the result file"

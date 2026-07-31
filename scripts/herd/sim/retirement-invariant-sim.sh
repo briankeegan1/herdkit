@@ -276,7 +276,7 @@ for crash in none before-teardown after-reap after-registry-prune after-branch-d
     bad "crash=$crash → next tick did NOT converge; leftovers: $left"
   elif [ -n "$res" ]; then
     bad "crash=$crash → residue survived teardown: $res"
-  elif printf '%s' "$rep" | grep -q "^STATE $SLUG"; then
+  elif grep -q "^STATE $SLUG" <<< "$rep"; then
     bad "crash=$crash → converged but still renders a row: $(printf '%s' "$rep" | sed -n "s/^STATE //p")"
   else
     ok "crash=$crash → next tick converged to zero leftovers (worktree, tab, agent, branch, ledgers)"
@@ -305,7 +305,7 @@ done
 # Idempotence: a THIRD tick over a fully-converged world must do nothing and say nothing.
 scn="$ART/scn-none"
 rep="$(tick "$scn" "$SLUG" none)"
-if [ "$(printf '%s' "$rep" | sed -n 's/^LEFT //p')" = "" ] && ! printf '%s' "$rep" | grep -q '^STATE '; then
+if [ "$(printf '%s' "$rep" | sed -n 's/^LEFT //p')" = "" ] && ! grep -q '^STATE ' <<< "$rep"; then
   ok "a converged world is a fixed point — re-running the tick is a no-op"
 else
   bad "re-running the tick over a converged world was not a no-op: $rep"
@@ -327,13 +327,13 @@ git -C "$scn/main" show-ref --verify --quiet "refs/heads/feat/$SLUG" \
   && ok "the branch survives" || bad "a held slug's branch was deleted"
 grep -q "\"label\":\"$SLUG\"" "$scn/tabs.json" \
   && ok "the tab survives" || bad "a held slug's tab was closed"
-printf '%s' "$rep" | grep -q "^STATE $SLUG held .*file.txt" \
+grep -q "^STATE $SLUG held .*file.txt" <<< "$rep" \
   && ok "the row carries the evidence (names the dirty file)" \
   || bad "the held row does not name the dirty file: $rep"
 
 # A second tick must keep holding — the hold is a property of the world, not a one-shot notice.
 rep2="$(tick "$scn" "$SLUG" none)"
-printf '%s' "$rep2" | grep -q "^STATE $SLUG held" \
+grep -q "^STATE $SLUG held" <<< "$rep2" \
   && ok "the hold persists tick over tick (it is an invariant, not a notification)" \
   || bad "the hold vanished on the second tick: $rep2"
 
@@ -423,13 +423,13 @@ state="$(printf '%s' "$rep" | sed -n "s/^STATE $SLUG_DEF //p" | cut -d' ' -f1)"
 grep -q "\"label\":\"$SLUG_DEF\"" "$scn/tabs.json" \
   && ok "the builder tab (and its working agent) survives" \
   || bad "a deferred slug's tab was closed out from under a working builder"
-printf '%s' "$rep" | grep -q "^STATE $SLUG_DEF deferred .*still working" \
+grep -q "^STATE $SLUG_DEF deferred .*still working" <<< "$rep" \
   && ok "the deferred row says WHY (builder still working)" \
   || bad "the deferred row does not explain itself: $rep"
 
 # A second working tick must keep deferring — the defer is a property of the world, not a one-shot notice.
 rep2="$(SIM_AGENT_STATUS=working tick "$scn" "$SLUG_DEF" none)"
-printf '%s' "$rep2" | grep -q "^STATE $SLUG_DEF deferred" \
+grep -q "^STATE $SLUG_DEF deferred" <<< "$rep2" \
   && ok "the defer persists tick over tick while the builder keeps working" \
   || bad "the defer vanished on the second working tick: $rep2"
 
@@ -478,7 +478,7 @@ if [ -z "$left3" ] && [ -z "$res3" ]; then
 else
   bad "tick 3: the bounded timeout did not reap a wedged agent — left='${left3:-}' res='${res3:-}'"
 fi
-if printf '%s' "$rep3" | grep -q "^STATE $SLUG_WEDGE deferred"; then
+if grep -q "^STATE $SLUG_WEDGE deferred" <<< "$rep3"; then
   bad "tick 3: the row still reads deferred past the bound — this IS the leak the timeout exists to prevent"
 else
   ok "tick 3: the row no longer reads deferred once the bound is crossed"

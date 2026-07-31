@@ -114,7 +114,7 @@ assert_no_secret() {
   [ ! -e "$dir/.herd/secrets" ]        || fail "$dir/.herd/secrets resolves — the secrets link was NOT refused"
   [ ! -e "$dir/.herd/.herd/secrets" ]  || fail "$dir/.herd/.herd/secrets resolves — a .herd symlink leaked the dir"
   # And the secret's content must not be reachable anywhere under the worktree (follow symlinks).
-  if grep -rIl "$SECRET_MARKER" "$dir" 2>/dev/null | grep -q .; then
+  if grep -q . <<< "$(grep -rIl "$SECRET_MARKER" "$dir" 2>/dev/null)"; then
     fail "$SECRET_MARKER is reachable from within the worktree $dir — secrets isolation breached"
   fi
 }

@@ -101,7 +101,7 @@ PY
 bl="$(wc -l < "$BOUT" | tr -d ' ')"; pl="$(wc -l < "$POUT" | tr -d ' ')"
 [ "$bl" = "$pl" ] || fail "line count mismatch: journal.sh=$bl shadow_journal=$pl"
 if ! cmp -s "$BOUT" "$POUT"; then
-  ln="$(diff "$BOUT" "$POUT" | grep -m1 -oE '^[0-9]+' || echo '?')"
+  ln="$(grep -m1 -oE '^[0-9]+' <<< "$(diff "$BOUT" "$POUT" || true)" || echo '?')"
   echo "---- first journal-encoding divergence at line $ln ----" >&2
   echo "journal.sh    : $(sed -n "${ln}p" "$BOUT")" >&2
   echo "shadow_journal: $(sed -n "${ln}p" "$POUT")" >&2
@@ -115,7 +115,7 @@ off_impl="$(bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_i
 typo_impl="$(bash -c 'ENGINE_IMPL=pythonn; . "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>/dev/null)"
 [ "$typo_impl" = python ] || fail "a typo ENGINE_IMPL must resolve 'python', got '$typo_impl'"
 warn="$(bash -c 'ENGINE_IMPL=shadow; . "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
-printf '%s' "$warn" | grep -qi 'RETIRED' || fail "ENGINE_IMPL=shadow must WARN that it is retired (got: '$warn')"
+grep -qi 'RETIRED' <<< "$warn" || fail "ENGINE_IMPL=shadow must WARN that it is retired (got: '$warn')"
 pass
 
 # ── (4) retired shadow tick: a HARD no-op even when armed — writes NO shadow journal ────────────────

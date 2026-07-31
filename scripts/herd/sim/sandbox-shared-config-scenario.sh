@@ -271,7 +271,7 @@ for line in (os.environ.get("WT") or "").splitlines():
         if wt and wt!=main and br==want: print(wt); break
         wt=None; br=None
 if wt and wt!=main and br==want: print(wt)
-' | head -1)"
+' | sed -n 1p)"
 if [ -n "$DISC" ]; then DISC_DIR="$DISC"; DISC_BRANCH="$BRANCH"; fi
 # The PR list (what the watcher fetches each tick) maps this branch → an open, mergeable PR.
 PR_MAPPED=0
@@ -333,7 +333,7 @@ fi
 # do_merge's REAL `git worktree remove` reaped the adopted worktree: the dir is gone AND it is no
 # longer registered in the repo's worktree list.
 _still_registered=0
-git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $DISC_DIR" && _still_registered=1
+grep -qxF "worktree $DISC_DIR" <<< "$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null)" && _still_registered=1
 if [ ! -d "$CWT" ] && [ "$_still_registered" -eq 0 ]; then
   checkpoint reaped pass "config worktree reaped (dir removed + unregistered from git worktree list)"
 else

@@ -102,14 +102,14 @@ J="$T/report.json"
 # ── (c) human report mentions each class + rot drives the exit code ─────────────────────────────────
 H="$("$HERD" conformance report)"; rc=$?
 [ "$rc" -eq 1 ] || fail "human report should exit 1 on rot (got $rc)"; okp
-printf '%s' "$H" | grep -q "1 mapped · 1 none-yet · 1 unmapped · 1 rot" || fail "human summary line wrong: $H"; okp
-printf '%s' "$H" | grep -q "CAP_ROT"  || fail "human report omits ROT capability"; okp
-printf '%s' "$H" | grep -q "CAP_NONE" || fail "human report omits NONE-YET capability"; okp
-printf '%s' "$H" | grep -q "unit: no test asserts CAP_NONE yet" || fail "human report omits the none-yet note"; okp
+grep -q "1 mapped · 1 none-yet · 1 unmapped · 1 rot" <<< "$H" || fail "human summary line wrong: $H"; okp
+grep -q "CAP_ROT" <<< "$H" || fail "human report omits ROT capability"; okp
+grep -q "CAP_NONE" <<< "$H" || fail "human report omits NONE-YET capability"; okp
+grep -q "unit: no test asserts CAP_NONE yet" <<< "$H" || fail "human report omits the none-yet note"; okp
 # the RATCHET advisory fires on an unmapped capability (added since mapping began, no proof row)
-printf '%s' "$H" | grep -q "UNMAPPED"  || fail "ratchet advisory section missing"; okp
-printf '%s' "$H" | grep -q "ADVISORY"  || fail "ratchet advisory must be labeled advisory (never a gate)"; okp
-printf '%s' "$H" | grep -q "CAP_GAP"   || fail "ratchet advisory omits the unmapped capability"; okp
+grep -q "UNMAPPED" <<< "$H" || fail "ratchet advisory section missing"; okp
+grep -q "ADVISORY" <<< "$H" || fail "ratchet advisory must be labeled advisory (never a gate)"; okp
+grep -q "CAP_GAP" <<< "$H" || fail "ratchet advisory omits the unmapped capability"; okp
 
 # ── (c) none-yet + unmapped WITHOUT rot exits 0 — the ratchet is advisory only, never a gate ────────
 CLEAN="$T/clean.tsv"
@@ -118,13 +118,13 @@ printf 'CAP_GREEN\tunit\ttests/good.sh\n'                        >> "$CLEAN"
 printf 'CAP_NONE\tnone-yet\tunit: still no proof\n'              >> "$CLEAN"  # CAP_ROT now unmapped, CAP_GAP too
 CH="$(HERD_CONFORMANCE_FILE="$CLEAN" "$HERD" conformance report)"; rc=$?
 [ "$rc" -eq 0 ] || fail "report should exit 0 when only none-yet+unmapped, no rot (got $rc)"; okp
-printf '%s' "$CH" | grep -q "UNMAPPED" || fail "advisory should still fire (CAP_ROT/CAP_GAP now unmapped) at exit 0"; okp
+grep -q "UNMAPPED" <<< "$CH" || fail "advisory should still fire (CAP_ROT/CAP_GAP now unmapped) at exit 0"; okp
 
 # ── (e) FAIL-SOFT: absent proof map → soft note, every capability unmapped, exit 0 ──────────────────
 HF="$(HERD_CONFORMANCE_FILE="$T/nope.tsv" "$HERD" conformance report)"; rc=$?
 [ "$rc" -eq 0 ] || fail "absent map should exit 0 (got $rc)"; okp
-printf '%s' "$HF" | grep -q "no proof map found" || fail "absent map missing soft note"; okp
-printf '%s' "$HF" | grep -q "4 capabilities · 0 mapped · 0 none-yet · 4 unmapped" || fail "absent map should read all-unmapped: $HF"; okp
+grep -q "no proof map found" <<< "$HF" || fail "absent map missing soft note"; okp
+grep -q "4 capabilities · 0 mapped · 0 none-yet · 4 unmapped" <<< "$HF" || fail "absent map should read all-unmapped: $HF"; okp
 
 # ── (d) run verdicts + conformance.json shape + --kind filter ───────────────────────────────────────
 RCAPS="$T/rcaps.tsv"
@@ -215,11 +215,11 @@ assert "CAP_LOOKS_LIKE_GATE_BUT_UNCLASSED" not in vcaps, "an unclassified capabi
 # plain report human text: the GATE/AUTOFIX RATCHET section names each violator with its reason.
 SH="$(HERD_CAPABILITIES_FILE="$SCAPS" HERD_CONFORMANCE_FILE="$SMAP" HERD_CAPABILITY_CLASS_FILE="$SCLASS" \
   "$HERD" conformance report)"
-printf '%s' "$SH" | grep -q "GATE/AUTOFIX RATCHET" || fail "human report missing a GATE/AUTOFIX RATCHET section"; okp
-printf '%s' "$SH" | grep -q "CAP_STRICT_NONE \[gate\]" || fail "human report omits CAP_STRICT_NONE"; okp
-printf '%s' "$SH" | grep -q "CAP_STRICT_ROT \[autofix\]" || fail "human report omits CAP_STRICT_ROT"; okp
-printf '%s' "$SH" | grep -q "rot" || fail "human report omits the rot reason text"; okp
-printf '%s' "$SH" | grep -q "CAP_STRICT_NEW \[autofix\]" || fail "human report omits the synthetic new capability"; okp
+grep -q "GATE/AUTOFIX RATCHET" <<< "$SH" || fail "human report missing a GATE/AUTOFIX RATCHET section"; okp
+grep -q "CAP_STRICT_NONE \[gate\]" <<< "$SH" || fail "human report omits CAP_STRICT_NONE"; okp
+grep -q "CAP_STRICT_ROT \[autofix\]" <<< "$SH" || fail "human report omits CAP_STRICT_ROT"; okp
+grep -q "rot" <<< "$SH" || fail "human report omits the rot reason text"; okp
+grep -q "CAP_STRICT_NEW \[autofix\]" <<< "$SH" || fail "human report omits the synthetic new capability"; okp
 
 # the ratchet retains the SAME fail-soft doctrine as the base command for a wholly absent proof map.
 SJ3="$T/ratchet-nomap.json"
@@ -230,7 +230,7 @@ HERD_CAPABILITIES_FILE="$SCAPS" HERD_CONFORMANCE_FILE="$T/no-such-map.tsv" HERD_
 [ "$(jq_field "$SJ3" ratchet.count)" = "0" ]           || fail "ratchet.count should be 0 when the proof map itself is absent"; okp
 NOMAP_H="$(HERD_CAPABILITIES_FILE="$SCAPS" HERD_CONFORMANCE_FILE="$T/no-such-map.tsv" HERD_CAPABILITY_CLASS_FILE="$SCLASS" \
   "$HERD" conformance report)"
-printf '%s' "$NOMAP_H" | grep -q "RATCHET: skipped" || fail "human report should note the ratchet skipped on an absent map"; okp
+grep -q "RATCHET: skipped" <<< "$NOMAP_H" || fail "human report should note the ratchet skipped on an absent map"; okp
 
 # a WHOLLY ABSENT class file (the global test default) is byte-identical to before this ratchet existed:
 # no ratchet section at all, and the exit code is governed only by the pre-existing rot/gap rules.
@@ -241,7 +241,7 @@ HERD_CAPABILITIES_FILE="$SCAPS" HERD_CONFORMANCE_FILE="$SMAP" \
 [ "$(jq_field "$SJ4" ratchet.class_present)" = "False" ] || fail "ratchet.class_present should be False with no class file"; okp
 [ "$(jq_field "$SJ4" ratchet.count)" = "0" ]             || fail "ratchet.count should be 0 with no class file"; okp
 NOCLASS_H="$(HERD_CAPABILITIES_FILE="$SCAPS" HERD_CONFORMANCE_FILE="$SMAP" "$HERD" conformance report)"
-printf '%s' "$NOCLASS_H" | grep -q "RATCHET" && fail "no class file: human report must omit the ratchet section entirely"; okp
+grep -q "RATCHET" <<< "$NOCLASS_H" && fail "no class file: human report must omit the ratchet section entirely"; okp
 
 # existing non-gate capabilities (the original a/b/c fixture, no classification anywhere) keep their OLD
 # advisory behavior verbatim — their rot/gap status still drives the exit code, but NEVER through

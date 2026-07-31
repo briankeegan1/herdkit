@@ -35,13 +35,13 @@ WT="$T/wt-spare"; mkdir -p "$WT"
 
 # ── (A) closed-vocabulary row: owner + age, never 'idle' ──────────────────────────────────────────
 out="$(_row_awaiting_task "spare-a" "$WT")"
-printf '%s' "$out" | grep -q 'awaiting task · assign or retire' \
+grep -q 'awaiting task · assign or retire' <<< "$out" \
   || fail "(A) row missing the closed-vocabulary label, got: $out"
-printf '%s' "$out" | grep -qE 'assign or retire · [0-9]+[smhd]' \
+grep -qE 'assign or retire · [0-9]+[smhd]' <<< "$out" \
   || fail "(A) row missing an age, got: $out"
-printf '%s' "$out" | grep -qw 'idle' \
+grep -qw 'idle' <<< "$out" \
   && fail "(A) row leaked the banned 'idle' word, got: $out"
-printf '%s' "$out" | grep -q 'spare-a' \
+grep -q 'spare-a' <<< "$out" \
   || fail "(A) row dropped the slug, got: $out"
 ok
 
@@ -49,22 +49,22 @@ ok
 born="$(_worktree_born "$WT")"
 # A spare freed just now reads as ~0s (whose-move: mine, but nothing lost yet).
 out_fresh="$(HERD_FAKE_NOW="$born" _row_awaiting_task "spare-a" "$WT")"
-printf '%s' "$out_fresh" | grep -qE 'assign or retire · 0s' \
+grep -qE 'assign or retire · 0s' <<< "$out_fresh" \
   || fail "(B) fresh spare should read 0s, got: $out_fresh"
 # A spare forgotten for 1h+ reads as an hour — the operator can tell it apart at a glance and reap it.
 out_old="$(HERD_FAKE_NOW="$(( born + 3700 ))" _row_awaiting_task "spare-a" "$WT")"
-printf '%s' "$out_old" | grep -qE 'assign or retire · 1h' \
+grep -qE 'assign or retire · 1h' <<< "$out_old" \
   || fail "(B) 1h-old spare should read 1h, got: $out_old"
 # A clock that ran backwards (fake-now before birth) must never emit a negative age — floors to 0s.
 out_neg="$(HERD_FAKE_NOW="$(( born - 500 ))" _row_awaiting_task "spare-a" "$WT")"
-printf '%s' "$out_neg" | grep -qE 'assign or retire · 0s' \
+grep -qE 'assign or retire · 0s' <<< "$out_neg" \
   || fail "(B) backwards clock should floor to 0s, got: $out_neg"
 ok
 
 # ── (C) the row is CALM — the benign 💤 glyph, never a loud alarm ─────────────────────────────────
-printf '%s' "$out" | grep -q '💤' \
+grep -q '💤' <<< "$out" \
   || fail "(C) awaiting-task row lost its calm 💤 glyph, got: $out"
-printf '%s' "$out" | grep -qE 'needs.you|💀|⚠️' \
+grep -qE 'needs.you|💀|⚠️' <<< "$out" \
   && fail "(C) a benign spare must not render a red needs-you/dead alarm, got: $out"
 ok
 

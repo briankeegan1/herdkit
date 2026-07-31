@@ -174,7 +174,7 @@ FUTURE="$(( $(date +%s) + 7200 ))"
 beat_at() { python3 -c 'import os,sys; t=int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
 beat_at "$BEAT" "$FUTURE"
 OUT="$(HERD_LIFECYCLE_NOW="$FUTURE" lifecycle_sweep)"
-printf '%s' "$OUT" | grep -q "^reviewer	88-def456	gate-corpse-sweep$" || fail "(4) sweep did not print the population's escalation route: [$OUT]"
+grep -q "^reviewer	88-def456	gate-corpse-sweep$" <<< "$OUT" || fail "(4) sweep did not print the population's escalation route: [$OUT]"
 [ "$(jcount lifecycle_expired)" = "1" ]                        || fail "(4) expired did not journal exactly once"
 [ "$(jfield lifecycle_expired route)" = "gate-corpse-sweep" ]  || fail "(4) lifecycle_expired must carry the escalation route"
 [ "$(jfield lifecycle_expired owner)" = "agent-watch" ]        || fail "(4) lifecycle_expired must carry the owner"

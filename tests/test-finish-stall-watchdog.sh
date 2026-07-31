@@ -263,7 +263,7 @@ case "$row" in *"needs-you"*"push + open the PR by hand"*) : ;; *) fail "the nee
 case "$row" in *"12m"*) : ;; *) fail "the row must carry its age, got: $row" ;; esac
 case "$row" in *"awaiting task"*) fail "must NEVER read as an awaiting-task spare" ;; esac
 case "$row" in *"✅"*) fail "must NEVER render as a success" ;; esac
-printf '%s' "$row" | grep -qw 'idle' && fail "the row leaked the banned 'idle' word: $row"
+grep -qw 'idle' <<< "$row" && fail "the row leaked the banned 'idle' word: $row"
 ok
 
 retasked_row="$(NO_COLOR=1 _row_finish_stall "slugcell" "1m" retasked)"

@@ -75,8 +75,18 @@ emit(){ for a in "$@"; do printf '[%s]\n' "$a"; done; }
       if [ "$a" = "--SEP--" ]; then seen=1; continue; fi
       if [ "$seen" = 0 ]; then got+=("$a"); else exp+=("$a"); fi
     done
-    if ! diff <(herd_driver_launch_agent "${got[@]}") <(emit "${exp[@]}") >/dev/null; then
-      echo "FAIL: $label not byte-identical"; diff <(herd_driver_launch_agent "${got[@]}") <(emit "${exp[@]}"); exit 1
+    # Capture BOTH sides once, then compare the strings. The old form ran the launcher inside a
+    # process substitution — twice, once more to render the diff — and `exit 1` then tore those
+    # async producers down while the stub herdr was still writing, so every failure buried its own
+    # diff under a wall of 'printf: write error: Broken pipe'. Same EPIPE family this PR exists to
+    # remove (HERD-441); here the early-exiting reader is the dying subshell, not a `grep -q`.
+    local got_out exp_out
+    got_out="$(herd_driver_launch_agent "${got[@]}")"
+    exp_out="$(emit "${exp[@]}")"
+    if [ "$got_out" != "$exp_out" ]; then
+      echo "FAIL: $label not byte-identical"
+      diff <(printf '%s\n' "$exp_out") <(printf '%s\n' "$got_out") || true
+      exit 1
     fi
   }
 
@@ -177,7 +187,7 @@ ok; echo "PASS (2) headless: routed shapes detach into the registry (cwd/env/mod
   # Unset → no --env from the endpoint helper (existing caller env still works).
   unset ANTHROPIC_BASE_URL
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
-  printf '%s\n' "$got" | grep -qF -- '--env' \
+  grep -qF -- '--env' <<< "$got" \
     && { echo "FAIL: --env leaked when ANTHROPIC_BASE_URL unset"; printf '%s\n' "$got"; exit 1; }
   # helper itself emits nothing
   [ -z "$(herd_driver_endpoint_env_lines)" ] || { echo "FAIL: endpoint_env_lines non-empty when unset"; exit 1; }
@@ -185,13 +195,13 @@ ok; echo "PASS (2) headless: routed shapes detach into the registry (cwd/env/mod
   # Set → --env ANTHROPIC_BASE_URL=<url> appears before the runtime tail.
   export ANTHROPIC_BASE_URL="https://corp.example/v1"
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
-  printf '%s\n' "$got" | grep -qF -- '[--env]' || { echo "FAIL: missing --env when URL set"; printf '%s\n' "$got"; exit 1; }
-  printf '%s\n' "$got" | grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' \
+  grep -qF -- '[--env]' <<< "$got" || { echo "FAIL: missing --env when URL set"; printf '%s\n' "$got"; exit 1; }
+  grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
     || { echo "FAIL: missing ANTHROPIC_BASE_URL value in argv"; printf '%s\n' "$got"; exit 1; }
   # composes with an explicit caller env (both present)
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 env=RESEARCH_TAB=x model=opus flags=--dangerously-skip-permissions pointer=P)"
-  printf '%s\n' "$got" | grep -qF -- '[RESEARCH_TAB=x]' || { echo "FAIL: caller env dropped"; printf '%s\n' "$got"; exit 1; }
-  printf '%s\n' "$got" | grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' \
+  grep -qF -- '[RESEARCH_TAB=x]' <<< "$got" || { echo "FAIL: caller env dropped"; printf '%s\n' "$got"; exit 1; }
+  grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
     || { echo "FAIL: endpoint env dropped when composing with caller env"; printf '%s\n' "$got"; exit 1; }
   exit 0
 ) || fail "HERD-171 endpoint env injection checks failed (see FAIL above)"

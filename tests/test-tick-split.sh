@@ -103,16 +103,16 @@ run_watchdog() {
 
 # ── (3) clean tick: succeeds, NO engine-down, NO bash action ─────────────────────────────────────
 CLEAN="$(run_watchdog 'herd_engine_live_tick(){ return 0; }' 1)"
-printf '%s\n' "$CLEAN" | grep -q '^journal:engine_down$'  && fail "clean tick must not journal engine_down"
-printf '%s\n' "$CLEAN" | grep -q '^BANNER_SET$'           && fail "clean tick must not set the engine-down banner"
-printf '%s\n' "$CLEAN" | grep -q '^ACTION:'               && fail "clean tick must run NO bash action pass (Python owns it)"
+grep -q '^journal:engine_down$' <<< "$CLEAN" && fail "clean tick must not journal engine_down"
+grep -q '^BANNER_SET$' <<< "$CLEAN" && fail "clean tick must not set the engine-down banner"
+grep -q '^ACTION:' <<< "$CLEAN" && fail "clean tick must run NO bash action pass (Python owns it)"
 pass
 
 # ── (4) faulted tick: no bash action, and past the fault streak → loud banner + journal + one notify ─
 FAULT="$(run_watchdog 'herd_engine_live_tick(){ return 1; }' 3)"
-printf '%s\n' "$FAULT" | grep -q '^ACTION:' && fail "a faulted tick must run NO bash gate/merge/resolver (no action pass exists)"
-printf '%s\n' "$FAULT" | grep -q '^BANNER_SET$' || fail "past _ENGINE_FAULT_MAX faulty ticks the engine-down banner must be set"
-printf '%s\n' "$FAULT" | grep -q '^journal:engine_down$' || fail "engine down must be journaled"
+grep -q '^ACTION:' <<< "$FAULT" && fail "a faulted tick must run NO bash gate/merge/resolver (no action pass exists)"
+grep -q '^BANNER_SET$' <<< "$FAULT" || fail "past _ENGINE_FAULT_MAX faulty ticks the engine-down banner must be set"
+grep -q '^journal:engine_down$' <<< "$FAULT" || fail "engine down must be journaled"
 [ "$(printf '%s\n' "$FAULT" | grep -c '^journal:engine_down$')" = 1 ] || fail "engine_down must be journaled exactly once per episode"
 [ "$(printf '%s\n' "$FAULT" | grep -c '^notify:')" = 1 ] || fail "engine down must fire exactly one notification per episode"
 pass

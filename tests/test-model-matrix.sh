@@ -131,7 +131,7 @@ case "$cat_out" in *"catalog: tier=judgment"*) ok ;; *) fail "no catalog tier no
 echo "PASS (2c) config set suggests from the catalog (soft note when uncatalogued)"
 
 # list shows the effective value (provenance-tagged) — round-trip visible in list too
-run_herd config list 2>/dev/null | grep -q "MODEL_QUICK" || fail "config list omits MODEL_QUICK"
+grep -q "MODEL_QUICK" <<< "$(run_herd config list 2>/dev/null)" || fail "config list omits MODEL_QUICK"
 ok; echo "PASS (2d) config list surfaces the MODEL_* values"
 
 # ── 3. catalog lint (tier + date per row). ────────────────────────────────────────────────────────

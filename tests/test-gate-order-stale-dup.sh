@@ -50,7 +50,7 @@ command -v git >/dev/null 2>&1 || fail "git required"
 ( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1
   declare -F _stale_dup_gate_step _predispatch_review_if_parallel _healthcheck_gate >/dev/null ) \
   || fail "(1) the stale-dup/review/health gate helpers must survive the cutover (retained for the checks below + the sim)"
-grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }' | grep -q . \
+grep -q . <<< "$(grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }')" \
   && fail "(1) the deleted bash action pass (_tick_act) must not be referenced in code — the gate order is Python-owned now"
 ok "(1) the gate-step helpers survive; the live gate order is Python-owned (no bash action pass)"
 
@@ -202,7 +202,7 @@ action_pass 41 stale-slug "$REPO" "$STALE_SHA" feat/stale && fail "(2) stale-bas
 [ "$(events review_dispatched)" = "0" ]   || fail "(2) a stale-base sha must dispatch NO review"
 [ "$(events healthcheck_started)" = "0" ] || fail "(2) a stale-base sha must start NO healthcheck"
 [ "$(event_order)" = "stale_dup_hold" ]   || fail "(2) unexpected event order: $(event_order)"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'needs you' || fail "(2) hold must render a needs-you row (got: ${DISPLAY[0]:-})"
+grep -q 'needs you' <<< "${DISPLAY[0]:-}" || fail "(2) hold must render a needs-you row (got: ${DISPLAY[0]:-})"
 [ "$(comments)" -ge 1 ] || fail "(2) hold must post the once-per-sha PR comment"
 ok "(2) stale-base holds before any review/healthcheck dispatch"
 

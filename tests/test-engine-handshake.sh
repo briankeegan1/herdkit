@@ -259,7 +259,7 @@ cfg="$T/cfg-quoted"; printf 'ENGINE_MIN="4" # stamped by herd upgrade\n' > "$cfg
 # git call to stub.
 # (Comments are stripped first — the header prose legitimately mentions `git pull` when explaining what
 # ENGINE_AUTOUPDATE=auto delegates to; only real CODE lines are searched for a git invocation.)
-sed -E 's/(^|[[:space:]])#.*$//' "$EV_SH" | grep -qE '(^|[^A-Za-z0-9_.-])git([[:space:]]|$)' \
+grep -qE '(^|[^A-Za-z0-9_.-])git([[:space:]]|$)' <<< "$(sed -E 's/(^|[[:space:]])#.*$//' "$EV_SH")" \
   && fail "(11) engine-version.sh shells out to git — the verdict must not depend on clone depth"
 ok
 

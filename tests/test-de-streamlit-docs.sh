@@ -53,13 +53,13 @@ echo "PASS (A.1) neutralized literals gone from all 5 scoped files (st.testing.v
 # framework-neutral harness example. We assert the guidance is present, not merely that a literal left.
 grep -Eq 'SHARE_LINKS.*e\.g\..*node_modules' "$CFG_EXAMPLE" \
   || fail "(A.2) config.example SHARE_LINKS lost its neutral example"
-awk -F'\t' '$1=="SHARE_LINKS"{print $3}' "$CAPS" | grep -Fq 'node_modules' \
+grep -Fq 'node_modules' <<< "$(awk -F'\t' '$1=="SHARE_LINKS"{print $3}' "$CAPS")" \
   || fail "(A.2) capabilities.tsv SHARE_LINKS row lost its neutral example"
 grep -Fq 'UI test harness' "$HEALTHCHECK" \
   || fail "(A.2) healthcheck.sh interaction-gate lost its framework-neutral harness example"
 grep -Fq 'UI test harness' "$CFG_EXAMPLE" \
   || fail "(A.2) config.example INTERACTION_TEST_CMD lost its framework-neutral harness example"
-awk -F'\t' '$1=="INTERACTION_TEST_CMD"{print $3}' "$CAPS" | grep -Fq 'UI test harness' \
+grep -Fq 'UI test harness' <<< "$(awk -F'\t' '$1=="INTERACTION_TEST_CMD"{print $3}' "$CAPS")" \
   || fail "(A.2) capabilities.tsv INTERACTION_TEST_CMD row lost its framework-neutral harness example"
 # herd-feature's standalone usage example still exists (a neutral slug replaced dividend-history).
 grep -Eq '^#[[:space:]]+herd-feature\.sh [a-z][a-z0-9-]+ ' "$FEATURE" \
@@ -81,18 +81,18 @@ echo "PASS (B.1) WATCHER_SCOPE + WATCHER_OWNER are documented config rows in cap
 # Default scope 'mine' — the docs must not claim a different default than the engine reads.
 grep -Fq '${WATCHER_SCOPE:-mine}' "$AGENT_WATCH" \
   || fail "(B.2) agent-watch.sh no longer defaults WATCHER_SCOPE to 'mine' — docs would drift"
-awk -F'\t' '$1=="WATCHER_SCOPE"{print $3}' "$CAPS" | grep -Fq 'mine (default)' \
+grep -Fq 'mine (default)' <<< "$(awk -F'\t' '$1=="WATCHER_SCOPE"{print $3}' "$CAPS")" \
   || fail "(B.2) capabilities.tsv WATCHER_SCOPE row must document 'mine (default)'"
 # Owner resolution order WATCHER_OWNER → WATCHER_VIEW_AUTHOR → gh api user, as coded.
 grep -Fq 'WATCHER_OWNER:-' "$AGENT_WATCH" \
   || fail "(B.2) agent-watch.sh no longer reads WATCHER_OWNER as the primary owner identity"
 grep -Fq 'WATCHER_VIEW_AUTHOR:-' "$AGENT_WATCH" \
   || fail "(B.2) agent-watch.sh no longer falls back to WATCHER_VIEW_AUTHOR for owner identity"
-awk -F'\t' '$1=="WATCHER_OWNER"{print $3}' "$CAPS" | grep -Fq 'WATCHER_VIEW_AUTHOR' \
+grep -Fq 'WATCHER_VIEW_AUTHOR' <<< "$(awk -F'\t' '$1=="WATCHER_OWNER"{print $3}' "$CAPS")" \
   || fail "(B.2) capabilities.tsv WATCHER_OWNER row must document the WATCHER_VIEW_AUTHOR fallback"
 # Both keys are watcher-affecting in the manifest.
 for k in WATCHER_SCOPE WATCHER_OWNER; do
-  awk -F'\t' -v k="$k" '$1==k{print $5}' "$CAPS" | grep -Fq 'watcher' \
+  grep -Fq 'watcher' <<< "$(awk -F'\t' -v k="$k" '$1==k{print $5}' "$CAPS")" \
     || fail "(B.2) capabilities.tsv $k row must be tagged 'watcher' in the requires column"
 done
 pass

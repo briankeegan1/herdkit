@@ -30,11 +30,11 @@ run() {
 
 # 1. add-item appends under [Unreleased] and commits.
 out="$(run _backend_add_item REQ1 "first tracked thing")"
-echo "$out" | grep -q "RESULT=DONE" || fail "add_item did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "add_item did not report DONE ($out)"
 [ -f "$T/CHANGELOG.md" ] || fail "CHANGELOG.md not created"
 grep -q "## \[Unreleased\]" "$T/CHANGELOG.md" || fail "no [Unreleased] heading"
 grep -q -- "- first tracked thing" "$T/CHANGELOG.md" || fail "item not appended"
-( cd "$T" && git log --oneline | grep -q "Changelog: first tracked thing" ) || fail "no changelog commit"
+( cd "$T" && grep -q "Changelog: first tracked thing" <<< "$(git log --oneline)") || fail "no changelog commit"
 
 # 2. a second item lands too, directly under the heading (newest first).
 run _backend_add_item REQ2 "second tracked thing" >/dev/null
@@ -42,16 +42,16 @@ grep -q -- "- second tracked thing" "$T/CHANGELOG.md" || fail "second item not a
 
 # 3. list_open prints both unreleased bullets; mark_shipped is a no-op (no error, no change).
 open="$( cd "$T" && . "$BACKEND" && _backend_list_open )"
-echo "$open" | grep -q "first tracked thing"  || fail "list_open missing first item ($open)"
-echo "$open" | grep -q "second tracked thing" || fail "list_open missing second item"
+grep -q "first tracked thing" <<< "$open" || fail "list_open missing first item ($open)"
+grep -q "second tracked thing" <<< "$open" || fail "list_open missing second item"
 before="$(cat "$T/CHANGELOG.md")"
 ( cd "$T" && . "$BACKEND" && _backend_mark_shipped some-slug http://pr ) || fail "mark_shipped errored"
 [ "$before" = "$(cat "$T/CHANGELOG.md")" ] || fail "mark_shipped mutated the changelog (should be no-op)"
 
 # 4. item_state → slug found in [Unreleased] returns open; absent slug returns closed.
 out="$(run _backend_item_state "provider#first tracked thing")"
-echo "$out" | grep -q "ITEM_STATE=open" || fail "item_state: slug in [Unreleased] should return open ($out)"
+grep -q "ITEM_STATE=open" <<< "$out" || fail "item_state: slug in [Unreleased] should return open ($out)"
 out="$(run _backend_item_state "provider#no-such-item")"
-echo "$out" | grep -q "ITEM_STATE=closed" || fail "item_state: missing slug should return closed ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "item_state: missing slug should return closed ($out)"
 
 echo "ALL PASS"

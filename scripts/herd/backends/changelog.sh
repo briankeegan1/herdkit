@@ -79,11 +79,13 @@ _backend_item_state() {
     # Sets ITEM_STATE=open|closed.  (changelog backend has no in-progress concept.)
     local ref="$1" slug
     slug="${ref#*#}"
-    if awk '
+    local unreleased
+    unreleased="$(awk '
         /^## \[Unreleased\]/ { inblk=1; next }
         /^## / { inblk=0 }
         inblk { print }
-    ' "$BACKLOG_FILE" 2>/dev/null | grep -qF "$slug" 2>/dev/null; then
+    ' "$BACKLOG_FILE" 2>/dev/null || true)"
+    if grep -qF "$slug" <<< "$unreleased" 2>/dev/null; then
         ITEM_STATE="open"
     else
         ITEM_STATE="closed"

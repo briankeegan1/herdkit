@@ -73,7 +73,7 @@ LINT
 seed_then_change
 out="$(run_hc 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(1) worktree caps-sync-lint must exit 1 (got $rc): $out"
-printf '%s\n' "$out" | grep -qF "$CS_SENTINEL" \
+grep -qF "$CS_SENTINEL" <<< "$out" \
   || fail "(1) worktree sentinel must appear in output (got: $out)"
 ok
 
@@ -85,7 +85,7 @@ seed_then_change
 out="$(run_hc 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] \
   || fail "(2) engine fallback: no caps-sync-lint in tree, expected exit 0 (got $rc): $out"
-printf '%s\n' "$out" | grep -qF "$CS_SENTINEL" \
+grep -qF "$CS_SENTINEL" <<< "$out" \
   && fail "(2) sentinel must NOT appear when falling back to engine (got: $out)"
 ok
 
@@ -101,7 +101,7 @@ LINT
 seed_then_change
 out="$(run_hc 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(3) worktree doc-drift-lint must exit 1 (got $rc): $out"
-printf '%s\n' "$out" | grep -qF "$DD_SENTINEL" \
+grep -qF "$DD_SENTINEL" <<< "$out" \
   || fail "(3) doc-drift sentinel must appear in output (got: $out)"
 ok
 
@@ -117,7 +117,7 @@ LINT
 seed_then_change
 out="$(run_hc 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(4) worktree gate-coverage-lint must exit 1 (got $rc): $out"
-printf '%s\n' "$out" | grep -qF "$GC_SENTINEL" \
+grep -qF "$GC_SENTINEL" <<< "$out" \
   || fail "(4) gate-coverage sentinel must appear in output (got: $out)"
 ok
 
