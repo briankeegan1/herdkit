@@ -41,6 +41,7 @@ Role summarized from each file's top-of-file comment.
 - `driver.sh` — the RUNTIME driver shim: the ONE seam binding each runtime-specific control-surface
 - `engine-seat.sh` — CROSS-SEAT DUAL-ENGINE SAFETY (HERD-308, engine-port P3.5).
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
+- `env-export-lint.sh` — THE shared shell→python EXPORT guard (HERD-449): a config knob the Python
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
 - `gate-coverage-lint.sh` — THE shared gate-coverage drift guard (HERD-292, flipped for HERD-295
 - `git-scope-lint.sh` — THE shared engine/project ISOLATION guard (HERD-435, GitHub issue #547): every
@@ -247,6 +248,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_DRIVER` → `bin/herd`, `context-guard.sh`, `driver.sh`, `herd-preflight.sh`
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
 - `HERD_LIMIT_UNKNOWN_WAIT` → `agent-watch.sh`
+- `HERD_REFIX_WAIT_TIMEOUT` → `agent-watch.sh`
 - `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`, `tracker-state-sweep.sh`
 - `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
@@ -272,6 +274,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_FAIRNESS` → `agent-watch.sh`
+- `MERGE_FAIRNESS_STARVE_THRESHOLD` → —
 - `MERGE_METHOD` → `bin/herd`, `config-viability.sh`, `git-pr.sh`
 - `MERGE_POLICY` → `bin/herd`, `agent-watch.sh`, `fleet.sh`, `merge-policy.sh`, `posture-lint.sh`
 - `MERGE_QUEUE` → —
