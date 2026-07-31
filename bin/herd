@@ -5025,49 +5025,69 @@ cmd_report() {
 # shell, (b) runs, (c) VERIFIES the pane's foreground actually shows the script, retrying
 # once, and reports loudly on failure. Never assume a pane run landed.
 
-# _reload_pane_state <pane_id> <match> → GONE | NOSHELL | BARE | BUSY | RUN <pid>
+# _reload_pane_state <pane_id> <match> [argv0] → GONE | NOSHELL | BARE | BUSY | RUN <pid>
 #   GONE     pane missing or the herdr call failed
 #   NOSHELL  pane exists but its shell has not initialized yet
 #   BARE     shell up, nothing in the foreground — safe to run our script here
-#   RUN      a foreground process matches <match> (|-separated substrings); pid printed
+#   RUN      a foreground process matches <match> (|-separated substrings) OR carries argv0
+#            EXACTLY <argv0> (HERD-458, see _reload_pane_alive); pid printed
 #   BUSY     something else is running — never hijack this pane
 _reload_pane_state() {
-  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" A0="${3:-}" python3 -c '
 import sys,json,os
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: print("GONE"); sys.exit(0)
 sh=pi.get("shell_pid") or 0
 if not sh: print("NOSHELL"); sys.exit(0)
 subs=[s for s in os.environ.get("M","").split("|") if s]
+a0=os.environ.get("A0","")
 fg=[p for p in (pi.get("foreground_processes") or []) if p.get("pid")!=sh]
 for p in fg:
-    if any(s in (p.get("cmdline") or "") for s in subs):
+    cl=p.get("cmdline") or ""
+    if any(s in cl for s in subs) or (a0 and cl.split()[:1]==[a0]):
         print("RUN", p.get("pid",0)); sys.exit(0)
 print("BUSY" if fg else "BARE")
 ' 2>/dev/null || printf 'GONE\n'
 }
 
-# _reload_pane_alive <pane_id> <match> → prints "<pid>" and returns 0 iff a foreground process in
-# the pane is a GENUINE `bash …/<script>` invocation of the expected viewer; returns 1 otherwise.
+# _reload_pane_alive <pane_id> <match> [argv0] → prints "<pid>" and returns 0 iff a foreground
+# process in the pane is a GENUINE `bash …/<script>` invocation of the expected viewer (or carries
+# argv0 EXACTLY <argv0>); returns 1 otherwise.
 # This is the STRICT post-launch liveness gate (vs _reload_pane_state's loose readiness substring):
 # it demands the script name sit on a real argv-token boundary — `bash` led by start/space/slash,
 # whitespace, then a path ending in the script. A stale shell whose buffered/typed-ahead text merely
 # CONTAINS the token — e.g. 'rrrr…bash …/backlog-view.sh' glued onto junk, the real 2026-07-06
 # incident where a dead viewer's leftover keystrokes concatenated onto our run — is rejected, so a
 # false ✓ can't survive. <match> is a '|'-separated set of accepted script names.
+#
+# HERD-458 — THE ALWAYS-DETACHED FALSE NEGATIVE. The `bash …/<script>` shape is the launch shape, and
+# for the WATCHER it survives only for the instant before startup: agent-watch.sh re-execs ONCE under
+# its per-workspace argv0 marker (`exec -a "$HERD_WATCH_ARGV0" bash …/agent-watch.sh`, HERD issue #60),
+# after which the pane's foreground cmdline is `herd-watch-<slug> …/agent-watch.sh` and carries no
+# `bash` token at all. So every poll after the re-exec fails this gate NO MATTER how healthily the
+# watcher renders, and whether the launch is called visible is a pure RACE between the ~0.2s poll and
+# the re-exec. GH #572: a second operator's seat lost that race on EVERY (re)start — four invocations,
+# four fresh pids, all reported "RUNNING but NOT visible … kill <pid> and inspect the pane" while the
+# watcher was demonstrably rendering with a live clock. An always-red probe is exactly as blind as an
+# always-green one, and this one told the operator to kill a healthy watcher.
+# The fix is to also accept the identity the process actually KEEPS: <argv0> is matched as the
+# command's FIRST TOKEN, exactly (never a substring), so workspace "north" can never match
+# "northern"'s watcher — the same attribution rule watcher-exempt.sh reaps by (issue #60). Callers
+# that pass no <argv0> (every viewer but the watcher) are byte-identical to before.
 _reload_pane_alive() {
-  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" python3 -c '
+  _reload_timeout "${HERD_RELOAD_HERDR_TIMEOUT:-8}" herdr pane process-info --pane "$1" 2>/dev/null | M="${2:-}" A0="${3:-}" python3 -c '
 import sys,json,os,re
 try: pi=json.load(sys.stdin)["result"]["process_info"]
 except Exception: sys.exit(1)
 sh=pi.get("shell_pid") or 0
 subs=[s for s in os.environ.get("M","").split("|") if s]
-if not subs: sys.exit(1)
+a0=os.environ.get("A0","")
+if not subs and not a0: sys.exit(1)
 pats=[re.compile(r"(?:^|[\s/])bash\s+\S*"+re.escape(s)+r"(?:\s|$)") for s in subs]
 for p in (pi.get("foreground_processes") or []):
     if p.get("pid")==sh: continue
     cl=p.get("cmdline") or ""
-    if any(pat.search(cl) for pat in pats):
+    if any(pat.search(cl) for pat in pats) or (a0 and cl.split()[:1]==[a0]):
         print(p.get("pid",0)); sys.exit(0)
 sys.exit(1)
 ' 2>/dev/null
@@ -5088,7 +5108,7 @@ _reload_pane_ready() {
   return 1
 }
 
-# _reload_pane_run_verified <pane_id> <command> <match> — readiness-gate, clear stale input, run,
+# _reload_pane_run_verified <pane_id> <command> <match> [argv0] — readiness-gate, clear stale input, run,
 # then STRICTLY verify the pane's foreground is a real invocation of <match>; retries the whole
 # sequence once. Prints the visible PID on success; callers must treat failure loudly (see
 # invisible-watcher note above). The pre-run ctrl+c/ctrl+u clears any typed-ahead junk a dead viewer
@@ -5096,7 +5116,7 @@ _reload_pane_ready() {
 # post-run gate is _reload_pane_alive (strict), not _reload_pane_state (loose), so a stale shell that
 # merely echoes the script token never earns a false ✓.
 _reload_pane_run_verified() {
-  local pane="$1" cmd="$2" match="$3" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i pid
+  local pane="$1" cmd="$2" match="$3" argv0="${4:-}" vp="${HERD_RELOAD_VERIFY_POLLS:-25}" attempt i pid
   # HARD wall-clock bound across the WHOLE verify — readiness wait AND both retry attempts. Each herdr
   # subcall below is ALSO individually time-bounded (_reload_pane_ready→_reload_pane_state,
   # _reload_pane_alive, and the send-keys/run here all route through _reload_timeout), so a single
@@ -5118,7 +5138,7 @@ _reload_pane_run_verified() {
     i=0
     while [ "$i" -lt "$vp" ]; do
       [ "$(( SECONDS - start ))" -ge "$deadline" ] && break 2
-      if pid="$(_reload_pane_alive "$pane" "$match")" && [ -n "$pid" ]; then
+      if pid="$(_reload_pane_alive "$pane" "$match" "$argv0")" && [ -n "$pid" ]; then
         printf '%s' "$pid"; return 0
       fi
       sleep 0.2; i=$((i+1))
@@ -5389,6 +5409,90 @@ _watcher_lock_pid_if_live() {
   return 0
 }
 
+# _watcher_term_verified <pid> <label> — the ONE stop primitive: SIGTERM, poll, escalate to SIGKILL,
+# poll again, and report whether <pid> is PROVABLY dead (0) or survived everything (1). Never dies
+# itself — the caller decides whether a survivor aborts the command or only warns.
+#
+# HERD-450: before this helper the lockfile watcher got this full sequence while an argv0-attributed
+# STRAY got a bare `kill` and no verification at all — `kill` only DELIVERS a signal, it does not
+# stop anything. A watcher blocks its SIGTERM trap for as long as its foreground child runs (a
+# herd-review can take minutes; a heavy healthcheck ~9), so the stop leg returned "stopped stray
+# watcher PID N", the launch leg span up a replacement, and the survivor kept ticking — 41 minutes,
+# re-parented to init, both mains gating the same PRs and racing the shared .git object store. That
+# is the incident this item exists for: the stop leg must VERIFY DEATH, not merely signal.
+#
+# Honors HERD_RELOAD_SIGTERM_POLLS (default 50 × 0.2s = 10s) for the SIGTERM window, then a fixed
+# 10 × 0.2s = 2s for the SIGKILL window (a process that outlives SIGKILL is uninterruptible-sleep or
+# already a zombie — polling longer buys nothing).
+_watcher_term_verified() {
+  local _wt_pid="${1:-}" _wt_label="${2:-watcher}"
+  [ -n "$_wt_pid" ] || return 0
+  kill -0 "$_wt_pid" 2>/dev/null || return 0        # already gone
+  kill "$_wt_pid" 2>/dev/null || true
+  local _wt_tp="${HERD_RELOAD_SIGTERM_POLLS:-50}" i=0
+  while [ "$i" -lt "$_wt_tp" ] && kill -0 "$_wt_pid" 2>/dev/null; do
+    sleep 0.2; i=$((i+1))
+  done
+  if kill -0 "$_wt_pid" 2>/dev/null; then
+    say "  $_wt_label PID $_wt_pid still alive — sending SIGKILL"
+    kill -9 "$_wt_pid" 2>/dev/null || true
+    local j=0
+    while [ "$j" -lt 10 ] && kill -0 "$_wt_pid" 2>/dev/null; do
+      sleep 0.2; j=$((j+1))
+    done
+  fi
+  kill -0 "$_wt_pid" 2>/dev/null && return 1
+  return 0
+}
+
+# _stop_reap_main_health <stopped-pids…> — HERD-450 leg (c), behind WATCHER_STOP_REAP_MAIN_HEALTH.
+# A watcher restart ORPHANS its running gate chains (they re-parent to init) instead of stopping
+# them. For the MAIN-HEALTH family that is pure loss: the orphan keeps holding its
+# .health-inflight-main-<sha> marker — and therefore a HEALTH_CONCURRENCY slot — for the rest of a
+# ~9-minute heavy suite whose verdict the departing watcher will never collect, so the marker is
+# ABANDONED and only ages out on HERD-451's timeout bound. Every PR healthcheck queued behind that
+# slot waits for a corpse.
+#
+# Reaping it is safe precisely because MAIN_HEALTH_TICK is itself a reconciled invariant: any main
+# sha without a collected verdict is simply re-run on a later tick, so a killed main-health chain
+# costs one re-run and nothing else. The PR-gate families are NOT touched — a .review-inflight /
+# per-PR .health-inflight worker writes a result file that the NEXT watcher DOES collect, so killing
+# one destroys work (and, for a review, caches nothing while burning a model call).
+#
+# Bounded (the same SIGTERM→SIGKILL primitive above), journaled per pid, and SHIP-DORMANT: with the
+# key off (default) this is a hard no-op — no glob, no signal, no journal line.
+_stop_reap_main_health() {
+  case "${WATCHER_STOP_REAP_MAIN_HEALTH:-off}" in on|true|1) : ;; *) return 0 ;; esac
+  local _sr_stopped=" $* " _sr_f _sr_pid _sr_ppid _sr_key
+  [ -n "${WORKTREES_DIR:-}" ] || return 0
+  for _sr_f in "$WORKTREES_DIR"/.health-inflight-main-*; do
+    [ -e "$_sr_f" ] || continue
+    _sr_pid="$(head -1 "$_sr_f" 2>/dev/null || true)"
+    case "$_sr_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_sr_pid" 2>/dev/null || continue
+    # Ours to reap only when it descends from a watcher we just stopped: either it still names one as
+    # its parent, or it has already been re-parented to init (ppid 1) — the orphaning this fixes.
+    # Anything else (a live sibling's worker, a chain some other seat owns) is left strictly alone.
+    _sr_ppid="$(ps -o ppid= -p "$_sr_pid" 2>/dev/null | tr -d '[:space:]')" || _sr_ppid=""
+    case "$_sr_stopped" in
+      *" ${_sr_ppid:-x} "*) : ;;
+      *) [ "${_sr_ppid:-0}" = "1" ] || continue ;;
+    esac
+    _sr_key="${_sr_f##*/.health-inflight-}"
+    if _watcher_term_verified "$_sr_pid" "main-health worker"; then
+      rm -f "$_sr_f" 2>/dev/null || true
+      say "  stopped orphaned main-health chain PID $_sr_pid ($_sr_key) + freed its health slot"
+      journal_append infra_event component herd reason main_health_chain_reaped \
+        pid "$_sr_pid" key "$_sr_key" workspace "$WORKSPACE_NAME"
+    else
+      warn "orphaned main-health chain PID $_sr_pid ($_sr_key) survived SIGKILL — its health slot stays held until HEALTH_INFLIGHT_TIMEOUT"
+      journal_append infra_event component herd reason main_health_chain_reap_failed \
+        pid "$_sr_pid" key "$_sr_key" workspace "$WORKSPACE_NAME"
+    fi
+  done
+  return 0
+}
+
 # _stop_project_watcher — stop THIS project's watcher(s) with the SIGTERM-poll-SIGKILL-abort
 # sequence + duplicate-watcher guard. Requires HERD_WATCHER_LOCK, HERD_WATCH_ARGV0 and PROJECT_ROOT
 # in scope (loaded from .herd/config). DIES (aborts the caller) when a watcher cannot be stopped,
@@ -5398,42 +5502,24 @@ _watcher_lock_pid_if_live() {
 # reload` and `herd pane watch`. Honors HERD_RELOAD_SIGTERM_POLLS (default 50 × 0.2s = 10s) for the
 # SIGTERM window.
 _stop_project_watcher() {
-  local lockpid="" killed=0
+  local lockpid="" killed=0 stopped_pids=""
 
   # Primary: PID from the per-project lockfile.
   if [ -f "$HERD_WATCHER_LOCK" ]; then
     lockpid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
     if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then
-      kill "$lockpid" 2>/dev/null || true
-      # Wait for SIGTERM: the watcher runs long foreground children synchronously
-      # (herd-review.sh can take minutes; healthcheck; gh pr merge) and bash defers
-      # the SIGTERM trap until the child returns. Poll up to HERD_RELOAD_SIGTERM_POLLS
-      # × 0.2s (default 50 = 10s) before escalating. Tests may set a shorter value.
-      local _tp="${HERD_RELOAD_SIGTERM_POLLS:-50}" i=0
-      while [ "$i" -lt "$_tp" ] && kill -0 "$lockpid" 2>/dev/null; do
-        sleep 0.2; i=$((i+1))
-      done
-      # Escalate to SIGKILL if still alive after the SIGTERM window.
-      if kill -0 "$lockpid" 2>/dev/null; then
-        say "  watcher PID $lockpid still alive — sending SIGKILL"
-        kill -9 "$lockpid" 2>/dev/null || true
-        local j=0
-        while [ "$j" -lt 10 ] && kill -0 "$lockpid" 2>/dev/null; do
-          sleep 0.2; j=$((j+1))
-        done
-      fi
-      # Abort rather than spawn a duplicate watcher: on Linux, rm-ing the lockfile while
-      # the old watcher still holds flock fd 9 lets a new exec 9> open a fresh inode and
-      # succeed while the old owner keeps the unlinked one — defeating the singleton.
-      if kill -0 "$lockpid" 2>/dev/null; then
-        die "watcher PID $lockpid could not be stopped — aborting to prevent duplicate watchers (manual: kill -9 $lockpid)"
-      fi
+      # SIGTERM-poll-SIGKILL-poll via the shared primitive: the watcher runs long foreground children
+      # synchronously (herd-review.sh can take minutes; healthcheck; gh pr merge) and bash defers the
+      # SIGTERM trap until the child returns, so the poll window is load-bearing, not cosmetic.
+      # Abort rather than spawn a duplicate watcher: on Linux, rm-ing the lockfile while the old
+      # watcher still holds flock fd 9 lets a new exec 9> open a fresh inode and succeed while the old
+      # owner keeps the unlinked one — defeating the singleton.
+      _watcher_term_verified "$lockpid" "watcher" \
+        || die "watcher PID $lockpid could not be stopped — aborting to prevent duplicate watchers (manual: kill -9 $lockpid)"
       killed=$((killed+1))
+      stopped_pids="$stopped_pids $lockpid"
       say "  stopped watcher PID $lockpid (lockfile)"
     fi
-    # Remove the lockfile ONLY after the old watcher is confirmed gone — a live watcher's
-    # EXIT trap (no-flock path) runs rm on this path and must not clobber a successor's lock.
-    rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
   fi
 
   # Strays, phase 1 — THIS project's watchers by ARGV0 attribution (issue #60). _list_project_watchers
@@ -5441,15 +5527,35 @@ _stop_project_watcher() {
   # reaps lock-ABSENT strays too (the "no running watcher found while 2 alive" case) and, because the
   # argv0 is per-workspace, is provably inert for a sibling project's watcher even though both run the
   # identical engine script.
+  #
+  # HERD-450: this listing runs BEFORE the lockfile is removed (the rm moved below), because
+  # _wx_exempt's clause (2) — "a tagged pid whose ppid is the RECORDED watcher is that watcher's own
+  # fork" — reads the lockfile. Listing after the rm blinded that clause, so the tick loop's ordinary
+  # sub-second forks (and, in the window before a marker is written, a review-tick fork) could be
+  # listed as duplicate mains and signalled. Reaping a review-tick fork caches a bogus BLOCK verdict;
+  # the fork/orphan discrimination must stay intact for the whole stop, not just the first line of it.
   local wpid
   while IFS= read -r wpid; do
     [ -n "$wpid" ] || continue
     [ "$wpid" = "$lockpid" ] && continue  # already handled by the lockfile path above
-    kill "$wpid" 2>/dev/null || true
-    killed=$((killed+1))
-    say "  stopped stray watcher PID $wpid (argv0 $HERD_WATCH_ARGV0)"
-    journal_append watcher_reaped pid "$wpid" workspace "$WORKSPACE_NAME" via argv0
+    # VERIFY DEATH — a bare `kill` here is what let the 41-minute survivor through (HERD-450). A stray
+    # that outlives SIGKILL aborts the command: spawning a replacement on top of a live main is the
+    # exact duplicate-watcher emergency this rail exists to prevent, and reload's own launch leg would
+    # otherwise do it a few lines later.
+    if _watcher_term_verified "$wpid" "stray watcher"; then
+      killed=$((killed+1))
+      stopped_pids="$stopped_pids $wpid"
+      say "  stopped stray watcher PID $wpid (argv0 $HERD_WATCH_ARGV0)"
+      journal_append watcher_reaped pid "$wpid" workspace "$WORKSPACE_NAME" via argv0 verified yes
+    else
+      journal_append watcher_reap_failed pid "$wpid" workspace "$WORKSPACE_NAME" via argv0
+      die "stray watcher PID $wpid (argv0 $HERD_WATCH_ARGV0) survived SIGTERM+SIGKILL — aborting to prevent duplicate watchers (manual: kill -9 $wpid)"
+    fi
   done < <(_list_project_watchers)
+
+  # Remove the lockfile ONLY after every watcher of ours is confirmed gone — a live watcher's EXIT
+  # trap (no-flock path) runs rm on this path and must not clobber a successor's lock.
+  rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
 
   # Strays, phase 2 — UNTAGGED legacy watchers (started before the argv0 marker existed) show as
   # `bash .../agent-watch.sh` with no marker, so phase 1 misses them. Reap those too, but ONLY when
@@ -5479,12 +5585,26 @@ _stop_project_watcher() {
       [ "$stray_cwd" = "$PROJECT_ROOT" ] && is_ours=1
     fi
     if [ "$is_ours" -eq 1 ]; then
-      kill "$stray" 2>/dev/null || true
-      killed=$((killed+1))
-      say "  stopped stray watcher PID $stray (legacy · cwd match)"
-      journal_append watcher_reaped pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd
+      # Same verify-death rule as phase 1 (HERD-450) — an untagged legacy watcher that survives the
+      # signal races the shared object store exactly as a tagged one does. It does NOT abort the
+      # command: this fallback identifies its target by cwd/lsof rather than by our own argv0 marker,
+      # so a stubborn survivor is warned about loudly instead of blocking every future reload.
+      if _watcher_term_verified "$stray" "legacy stray watcher"; then
+        killed=$((killed+1))
+        stopped_pids="$stopped_pids $stray"
+        say "  stopped stray watcher PID $stray (legacy · cwd match)"
+        journal_append watcher_reaped pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd verified yes
+      else
+        warn "legacy stray watcher PID $stray survived SIGTERM+SIGKILL — inspect it by hand (manual: kill -9 $stray)"
+        journal_append watcher_reap_failed pid "$stray" workspace "$WORKSPACE_NAME" via legacy-cwd
+      fi
     fi
   done < <(pgrep -f "agent-watch.sh" 2>/dev/null || true)
+
+  # HERD-450 leg (c): stop ORPHANING the main-health chains the watchers we just stopped were running.
+  # Ship-dormant (WATCHER_STOP_REAP_MAIN_HEALTH=off) → a hard no-op.
+  # shellcheck disable=SC2086
+  _stop_reap_main_health $stopped_pids
 
   # No watcher of ours is running now, so no self-restart generation handoff can be in flight: drop a
   # marker a crashed exec left behind (HERD-266) rather than leave it on disk until its TTL expires.
@@ -5656,7 +5776,7 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
             geom_changed=1
             if [ -n "$wPane" ]; then
               watch_pane="$wPane"
-              if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
+              if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" "${HERD_WATCH_ARGV0:-}" >/dev/null; then
                 launch_desc="pane below coordinator"
                 local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
                 while [ "$_kk" -lt "$_lp" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do
@@ -5786,14 +5906,14 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
           # drift from the incident: a `watch` row pointing at the coordinator pane id) — drop it and
           # recreate below.
           if [ -n "$reg_wpane" ] && [ "$reg_wpane" != "$agent_pane" ] && _reg_role_ok "$reg_wpane" watch; then
-            case "$(_reload_pane_state "$reg_wpane" "$watch_match")" in
+            case "$(_reload_pane_state "$reg_wpane" "$watch_match" "${HERD_WATCH_ARGV0:-}")" in
               BARE|RUN*) wPane="$reg_wpane" ;;
             esac
           fi
           if [ -z "$wPane" ]; then
             local nbd; nbd="$(_reload_neighbor "$agent_pane" down)"
             if [ -n "$nbd" ]; then
-              case "$(_reload_pane_state "$nbd" "$watch_match")" in
+              case "$(_reload_pane_state "$nbd" "$watch_match" "${HERD_WATCH_ARGV0:-}")" in
                 BARE|RUN*) wPane="$nbd" ;;
               esac
             fi
@@ -5817,7 +5937,7 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
           # Drive the watcher into the watch pane (verified; the stray/zombie guard is below).
           if [ -n "$wPane" ]; then
             watch_pane="$wPane"
-            if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
+            if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" "${HERD_WATCH_ARGV0:-}" >/dev/null; then
               launch_desc="pane below coordinator"
               local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
               while [ "$_kk" -lt "$_lp" ] && [ ! -f "$HERD_WATCHER_LOCK" ]; do
@@ -6158,14 +6278,14 @@ cmd_pane_watch() {
   #    Never adopt the anchor pane or a pane LIVE in a different role as the watch (issue #60).
   local wPane="" recreated=0 geom_changed=0
   if [ -n "$PANE_REG_W" ] && [ "$PANE_REG_W" != "$PANE_AGENT" ] && _reg_role_ok "$PANE_REG_W" watch; then
-    case "$(_reload_pane_state "$PANE_REG_W" "$watch_match")" in
+    case "$(_reload_pane_state "$PANE_REG_W" "$watch_match" "${HERD_WATCH_ARGV0:-}")" in
       BARE|RUN*) wPane="$PANE_REG_W" ;;
     esac
   fi
   if [ -z "$wPane" ]; then
     local nbd; nbd="$(_reload_neighbor "$PANE_AGENT" down)"
     if [ -n "$nbd" ]; then
-      case "$(_reload_pane_state "$nbd" "$watch_match")" in
+      case "$(_reload_pane_state "$nbd" "$watch_match" "${HERD_WATCH_ARGV0:-}")" in
         BARE|RUN*) wPane="$nbd" ;;
       esac
     fi
@@ -6185,7 +6305,7 @@ cmd_pane_watch() {
     wsum="adopted live watcher · no duplicate spawned"
     warn "watcher pid $watch_pid already running for $WORKSPACE_NAME — adopted, not re-spawned"
   elif [ -n "$wPane" ]; then
-    if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" >/dev/null; then
+    if _reload_pane_run_verified "$wPane" "bash $watch_script" "$watch_match" "${HERD_WATCH_ARGV0:-}" >/dev/null; then
       wsum="pane $wPane · visible ✓"
       [ "$recreated" -eq 1 ] && wsum="pane $wPane · recreated ✓"
       local _lp="${HERD_RELOAD_LOCKPID_POLLS:-10}" _kk=0
