@@ -3473,8 +3473,16 @@ _gov_parse_and_validate() {
 # effective_layer=1 the write is routed to the layer that actually WINS: a key already pinned in the
 # overlay is set with `--local`, so the value the caller computed its delta against is the value it
 # changes. Every applied line names the layer it landed in, so the report cannot outrun the write.
+#
+# <force_layer> (optional, default "" — every existing caller is byte-identical to before it existed;
+# HERD-469) overrides the PER-KEY layer resolution above for the WHOLE batch: "local" routes every key
+# through `cmd_config_set --local` regardless of whether it is pinned/machine-scoped (so a caller that
+# has already decided the whole bundle belongs in the gitignored overlay — e.g. `herd posture apply
+# --local` — never touches the committed baseline for any key); any other value ("" or "shared")
+# leaves the existing effective_layer resolution untouched (machine-scoped/pinned keys still auto-
+# route to the overlay; everything else lands on the committed baseline, today's behavior).
 _gov_apply_pairs() {
-  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6" effective_layer="${7:-0}"
+  local root="$1" cfg="$2" caps="$3" pairs="$4" assume_yes="$5" file="$6" effective_layer="${7:-0}" force_layer="${8:-}"
   local applied=0 needs_reload=0 np i rec key val cur requires ans
   local local_cfg; local_cfg="$(dirname "$cfg")/config.local"
   local set_flags layer_note
@@ -3486,7 +3494,9 @@ _gov_apply_pairs() {
     # Target the WINNING layer when the caller asked for it (see the header). Under the default
     # effective_layer=0 no flag is added and `cur` is the baseline value — byte-identical to before.
     set_flags=""; layer_note=""
-    if [ "$effective_layer" = "1" ] && _config_key_pinned_local "$local_cfg" "$key"; then
+    if [ "$force_layer" = "local" ]; then
+      set_flags="--local"; layer_note=" ${c_dim}(.herd/config.local — forced local)${c_rst}"
+    elif [ "$effective_layer" = "1" ] && _config_key_pinned_local "$local_cfg" "$key"; then
       set_flags="--local"; layer_note=" ${c_dim}(.herd/config.local — the layer that wins)${c_rst}"
     fi
     if [ "$effective_layer" = "1" ]; then
@@ -3662,19 +3672,52 @@ cmd_posture_show() {
   return 0
 }
 
+# _posture_second_operator <root> — HERD-469: best-effort, LOCAL-ONLY (no network/gh call) signal
+# that more than one identity has been operating this repo, so a DEFAULT posture apply does not
+# silently commit a shared-tree change on a second operator's behalf without asking. Counts distinct
+# committer emails across git history. Fail-soft: an unreadable/absent history (0 or 1 authors, or a
+# `git log` error — e.g. a fresh repo with one commit) reads as single-operator; a false negative here
+# is still caught by _posture_shared_write_would_dirty below whenever there is a real baseline delta.
+_posture_second_operator() {
+  local root="$1" n
+  n="$(git -C "$root" log --format='%ae' 2>/dev/null | sort -u | grep -c . || true)"
+  [ "${n:-0}" -gt 1 ]
+}
+
+# _posture_shared_write_would_dirty <root> <cfg> <baseline_pairs> — HERD-469: true iff applying
+# <baseline_pairs> (KEY<TAB>VALUE lines destined for the COMMITTED baseline under today's routing —
+# already excluding machine-scoped/already-locally-pinned keys, which route to the overlay
+# regardless) would leave .herd/config with an uncommitted diff. Named on purpose (rather than inlined
+# at the call site) so the DEFAULT-layer decision below reads as a decision, not an accident of the
+# delta being non-empty. `.herd/config` not yet tracked (pre-first-commit bootstrap, straight after
+# `herd init`) has no committed shared baseline to diverge from, so this reads false.
+_posture_shared_write_would_dirty() {
+  local root="$1" cfg="$2" baseline_pairs="$3"
+  git -C "$root" ls-files --error-unmatch -- "$cfg" >/dev/null 2>&1 || return 1
+  [ -n "$(printf '%s' "$baseline_pairs" | tr -d '[:space:]')" ]
+}
+
 cmd_posture_apply() {
-  local assume_yes=0 no_reload=0 name=""
+  # --local / --shared (HERD-469, mirroring `herd config set --local|--shared`): force the WHOLE
+  # bundle's changed keys onto one layer, skipping the DEFAULT-layer detection below entirely.
+  # Mutually exclusive. Neither given → the default is DETECTED per apply (see step 2) and named in
+  # the output, never silent.
+  local assume_yes=0 no_reload=0 name="" force_local=0 force_shared=0
   while [ "$#" -gt 0 ]; do
     case "${1:-}" in
       --yes|-y)    assume_yes=1; shift ;;
       --no-reload) no_reload=1; shift ;;
+      --local)     force_local=1; shift ;;
+      --shared)    force_shared=1; shift ;;
       --)          shift; break ;;
-      -?*)         die "unknown flag '$1' — usage: herd posture apply [--yes] [--no-reload] <name>" ;;
+      -?*)         die "unknown flag '$1' — usage: herd posture apply [--local|--shared] [--yes] [--no-reload] <name>" ;;
       *)           name="$1"; shift; break ;;
     esac
   done
-  [ -n "$name" ] || die "usage: herd posture apply [--yes] [--no-reload] <name>"
-  [ "$#" -eq 0 ] || die "unexpected argument '$1' — usage: herd posture apply [--yes] [--no-reload] <name>"
+  { [ "$force_local" -eq 1 ] && [ "$force_shared" -eq 1 ]; } \
+    && die "--local and --shared are mutually exclusive: --local keeps every changed key OUT of git (per-user overlay); --shared writes the committed baseline every operator shares"
+  [ -n "$name" ] || die "usage: herd posture apply [--local|--shared] [--yes] [--no-reload] <name>"
+  [ "$#" -eq 0 ] || die "unexpected argument '$1' — usage: herd posture apply [--local|--shared] [--yes] [--no-reload] <name>"
   _posture_require_table
   posture_exists "$name" \
     || die "unknown posture '$name' — see 'herd posture list' for the canonical names"
@@ -3737,11 +3780,80 @@ cmd_posture_apply() {
   say "${c_bold}herd posture apply $name${c_rst} ${c_dim}— $(posture_intent "$name")${c_rst}"
   say ""
 
-  # ── 2. THE FULL DELTA — every key in the bundle, changing or not, against the EFFECTIVE value ──
-  # The delta reads the EFFECTIVE value (overlay-precedence aware) and NAMES the layer each change
-  # will land in — the same layer resolution the apply below uses, so the report can never describe a
-  # transition the write does not make.
-  local i rec cur changed=0 watcher_affecting=0 requires changed_pairs="" layer
+  # ── 2a. SILENT PASS — which keys change, and which of those are baseline-destined (HERD-469) ────
+  # Computed before any delta is printed because the LAYER decision below (2b) needs to know, for the
+  # whole bundle, whether a --shared write would touch the committed baseline at all — printing rows
+  # as they're discovered (the old single-pass shape) would have to guess the layer before the bundle
+  # is fully walked. `baseline_pairs` excludes machine-scoped and already-locally-pinned keys, which
+  # route to the overlay unconditionally regardless of the chosen layer (see _gov_apply_pairs).
+  local i rec cur changed=0 changed_pairs="" baseline_pairs="" k v
+  for (( i=1; i<=n; i++ )); do
+    rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+    IFS=$'\t' read -r k v <<< "$rec"
+    [ -n "$k" ] || continue
+    cur="$(_config_effective_value "$cfg" "$local_cfg" "$k")"
+    [ "$cur" = "$v" ] && continue
+    changed=$((changed+1))
+    changed_pairs="${changed_pairs}${rec}"$'\n'
+    if ! _config_key_pinned_local "$local_cfg" "$k" && [ "$(_config_key_scope "$caps" "$k")" != "machine" ]; then
+      baseline_pairs="${baseline_pairs}${rec}"$'\n'
+    fi
+  done
+
+  if [ "$changed" -eq 0 ]; then
+    say "  ${c_bold}config delta${c_rst} ${c_dim}($n key(s) from $(basename "$(posture_file)"))${c_rst}"
+    for (( i=1; i<=n; i++ )); do
+      rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+      IFS=$'\t' read -r k v <<< "$rec"
+      [ -n "$k" ] || continue
+      say "    ${c_dim}${k}  \"${v}\"  (unchanged)${c_rst}"
+    done
+    [ -n "$steps_profile" ] && say "    ${c_dim}STEPS_PROFILE=${steps_profile} — seeds .herd/steps.tsv when absent${c_rst}"
+    say ""
+    ok "already on posture '$name' — every key already holds its bundle value (config untouched)"
+    [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
+    return 0
+  fi
+
+  # ── 2b. THE LAYER DECISION (HERD-469) — --local/--shared, else DETECTED and NAMED ────────────────
+  # Explicit --local/--shared always wins. Absent a flag, DEFAULT to --local whenever EITHER (a) this
+  # apply would leave the committed .herd/config with an uncommitted diff (would_dirty — the observed
+  # incident: a bundle written straight to the shared baseline raised the operator's CHECKOUT UNCLEAN
+  # row within minutes of shipping) or (b) more than one identity has committed to this repo
+  # (second_operator — a --shared write on someone else's behalf, uncommitted, is exactly the state a
+  # second operator should never silently inherit). Otherwise default stays --shared, today's
+  # committed-baseline behavior. The choice — and WHY — is always printed, never silent either way.
+  local layer_mode="" layer_why=""
+  if [ "$force_local" -eq 1 ]; then
+    layer_mode=local; layer_why="--local requested"
+  elif [ "$force_shared" -eq 1 ]; then
+    layer_mode=shared; layer_why="--shared requested"
+  else
+    local reasons="" nbase
+    if _posture_shared_write_would_dirty "$root" "$cfg" "$baseline_pairs"; then
+      nbase="$(printf '%s' "$baseline_pairs" | grep -c . || true)"
+      reasons="writing $nbase key(s) to the committed .herd/config would leave it uncommitted"
+    fi
+    if _posture_second_operator "$root"; then
+      reasons="${reasons:+$reasons; }a second operator was detected in this repo's git history"
+    fi
+    if [ -n "$reasons" ]; then
+      layer_mode=local; layer_why="auto-default: $reasons"
+    else
+      layer_mode=shared; layer_why="auto-default: single operator, no baseline key changes — nothing to dirty"
+    fi
+  fi
+  if [ "$layer_mode" = "local" ]; then
+    say "  ${c_bold}layer: .herd/config.local${c_rst} ${c_dim}(${layer_why})${c_rst}"
+  else
+    say "  ${c_bold}layer: .herd/config${c_rst} ${c_dim}(${layer_why} — committed baseline)${c_rst}"
+  fi
+  say ""
+
+  # ── 2c. PRINT THE FULL DELTA — every key in the bundle, changing or not, against the EFFECTIVE
+  # value, with every changed key's row naming the LAYER decided above (never a layer the apply below
+  # will not actually write to).
+  local watcher_affecting=0 requires layer
   say "  ${c_bold}config delta${c_rst} ${c_dim}($n key(s) from $(basename "$(posture_file)"))${c_rst}"
   for (( i=1; i<=n; i++ )); do
     rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
@@ -3752,14 +3864,14 @@ cmd_posture_apply() {
     if [ "$cur" = "$v" ]; then
       say "    ${c_dim}${k}  \"${v}\"  (unchanged)${c_rst}"
     else
-      changed=$((changed+1))
-      changed_pairs="${changed_pairs}${rec}"$'\n'
-      if _config_key_pinned_local "$local_cfg" "$k"; then
+      if [ "$layer_mode" = "local" ]; then
+        layer=" ${c_dim}→ .herd/config.local${c_rst}"
+      elif _config_key_pinned_local "$local_cfg" "$k"; then
         layer=" ${c_dim}→ .herd/config.local (the layer that wins for this key)${c_rst}"
       elif [ "$(_config_key_scope "$caps" "$k")" = "machine" ]; then
         layer=" ${c_dim}→ .herd/config.local (machine-scoped)${c_rst}"
       else
-        layer=""
+        layer=" ${c_dim}→ .herd/config${c_rst}"
       fi
       say "    ${c_bold}${k}${c_rst}  \"${cur}\" ${c_dim}→${c_rst} \"${v}\"${layer}"
       case "$requires" in watcher|render) watcher_affecting=1 ;; esac
@@ -3767,11 +3879,6 @@ cmd_posture_apply() {
   done
   [ -n "$steps_profile" ] && say "    ${c_dim}STEPS_PROFILE=${steps_profile} — seeds .herd/steps.tsv when absent${c_rst}"
   say ""
-  if [ "$changed" -eq 0 ]; then
-    ok "already on posture '$name' — every key already holds its bundle value (config untouched)"
-    [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
-    return 0
-  fi
   say "  ${c_dim}$changed key(s) change · every write goes through the validated 'herd config set'${c_rst}"
 
   # ── 3. ONE confirmation for the WHOLE bundle — a posture is all-or-nothing, never per-key ──────
@@ -3794,9 +3901,13 @@ cmd_posture_apply() {
   # (step 5) rather than leaving it as a chore.
   # effective_layer=1: a key the operator pinned with `herd config set --local` WINS at load time, so
   # writing only the baseline for it would change nothing the engine ever reads while still printing
-  # "applied". Route each write to the layer the delta above was computed against.
+  # "applied". Route each write to the layer the delta above was computed against. force_layer=local
+  # (HERD-469) additionally routes EVERY key — not just already-pinned/machine-scoped ones — through
+  # `herd config set --local` when layer_mode=local, so the committed .herd/config stays byte-
+  # identical for the whole apply; layer_mode=shared passes force_layer="" and falls back to that same
+  # per-key auto-routing (machine-scoped keys still never land in the baseline).
   export HERD_INIT_DEFER_APPLY=1
-  _gov_apply_pairs "$root" "$cfg" "$caps" "$changed_pairs" 1 "$(posture_file)" 1
+  _gov_apply_pairs "$root" "$cfg" "$caps" "$changed_pairs" 1 "$(posture_file)" 1 "$layer_mode"
   unset HERD_INIT_DEFER_APPLY
   [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
 
@@ -3825,6 +3936,21 @@ cmd_posture_apply() {
     die "posture '$name' is NOT fully applied — $unapplied key(s) above do not hold their bundle value at load time. Refusing to report the posture as active (and skipping the watcher rebuild, which would only bake in the wrong values)."
   fi
   ok "verified: all $changed changed key(s) now hold their bundle value at load time"
+
+  # ── 4c. --shared MESSAGING (HERD-469) — never a silently dirty shared tree ─────────────────────
+  # A --shared (or auto-defaulted --shared) apply just wrote directly into the COMMITTED .herd/config
+  # — exactly today's pre-HERD-469 behavior — but leaving that uncommitted is how the operator's
+  # CHECKOUT UNCLEAN row got raised "within minutes of shipping" (the incident this item exists to
+  # close). Say explicitly, every time, whether the baseline is now dirty and needs a commit, or
+  # already matches HEAD (e.g. every changed key was machine-scoped and routed to the overlay anyway).
+  if [ "$layer_mode" = "shared" ]; then
+    if git -C "$root" diff --quiet -- "$cfg" 2>/dev/null && git -C "$root" diff --cached --quiet -- "$cfg" 2>/dev/null; then
+      say "  ${c_dim}.herd/config already matches the last commit — nothing to commit${c_rst}"
+    else
+      say ""
+      warn ".herd/config now differs from the last commit — this is an UNCOMMITTED shared-baseline change: run git add .herd/config, then git commit, so every other operator receives posture '$name'; until then it is a local-only edit, not the committed policy others will run."
+    fi
+  fi
 
   # ── 5. FRESH WATCHER — defeat the sticky-env shadow (see the header note) ──────────────────────
   if [ "$no_reload" -eq 1 ]; then
