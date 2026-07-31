@@ -508,20 +508,47 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" \
-        bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+        bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
   else
     PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
-      bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+      bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
   fi
+  _hk_bats_wrapper_pid=$!
+  # HERD-462 CHOKEPOINT GUARD: a leaked test child can wedge bats' own internal fd well AFTER every
+  # test has already reported (see scripts/herd/bats-fd3-guard.sh) — the ${HEALTHCHECK_SUITE_TIMEOUT:-
+  # 1800}s backstop above still catches it eventually, but that is a 30-minute wait to notice a suite
+  # that, from its own TAP output, already finished. Poll for that condition and reap early. Signalling
+  # the `timeout` WRAPPER's pid (not a raw `bats` pid) is what safely tears down a leaked descendant
+  # too — timeout relays a signal sent to itself on to its whole child process group. (Only the
+  # `command -v timeout` branch above gets that group-kill guarantee; the no-`timeout` fallback still
+  # gets an early wake-up, just without the descendant guarantee — strictly better than today's
+  # unbounded wait either way.)
+  _hk_bats_reap_note=""
+  if [ -f scripts/herd/bats-fd3-guard.sh ]; then
+    # shellcheck source=scripts/herd/bats-fd3-guard.sh
+    . scripts/herd/bats-fd3-guard.sh
+    _hk_bats_reap_note="$(herd_bats_early_reap "$_hk_bats_out" "$_hk_bats_wrapper_pid" "${HEALTHCHECK_BATS_REAP_GRACE:-15}")"
+  fi
+  wait "$_hk_bats_wrapper_pid" 2>/dev/null
   _hk_bats_rc=$?
+  # A reap fired BEFORE bats would have exited on its own — report it exactly like bats' own timeout
+  # (rc 124, handled by the existing "suite timed out" branch below) rather than whatever raw
+  # kill-signal exit status `wait` returned.
+  [ "$_hk_bats_reap_note" = "reaped-wedged" ] && _hk_bats_rc=124
   to="$(cat "$_hk_bats_out" 2>/dev/null)"; rm -f "$_hk_bats_out" 2>/dev/null || true
   _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the timeout / env tolerances below
   if [ "$_hk_bats_rc" = 124 ]; then
     # HERD-185: a timeout-killed suite is an infrastructure hang (a wedged/tty-reading test), not a code bug.
     _hk_hung="$(grep -m1 -E '^(ok|not ok) ' <<< "$to" | tail -1)"
-    echo "bats: suite timed out (>${HEALTHCHECK_SUITE_TIMEOUT:-1800}s) — a wedged/tty-reading test, not a code bug${_hk_hung:+ — last: $_hk_hung}"
+    if [ "$_hk_bats_reap_note" = "reaped-wedged" ]; then
+      # HERD-462: every planned test had already reported — this is the fd-leak wedge class, caught
+      # (and reaped) LONG before the ${HEALTHCHECK_SUITE_TIMEOUT:-1800}s backstop below would have.
+      echo "bats: suite wedged after every test reported (HERD-462 fd leak) — not a code bug${_hk_hung:+ — last: $_hk_hung}"
+    else
+      echo "bats: suite timed out (>${HEALTHCHECK_SUITE_TIMEOUT:-1800}s) — a wedged/tty-reading test, not a code bug${_hk_hung:+ — last: $_hk_hung}"
+    fi
     [ -z "$ONELINE" ] && printf '%s\n' "$to"
     exit 2
   fi
