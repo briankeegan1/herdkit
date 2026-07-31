@@ -297,8 +297,10 @@ GATE_STATUS	unit	tests/test-gate-status.sh
 DELTA_REVIEW	unit	tests/test-delta-review.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_MAX	sim	tests/test-sandbox-concurrency.sh
+INFRA_BREAKER_MAX	unit	tests/test_live_runtime.py
 INFRA_BREAKER_COOLDOWN	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_COOLDOWN	sim	tests/test-sandbox-concurrency.sh
+INFRA_BREAKER_COOLDOWN	unit	tests/test_live_runtime.py
 REVIEW_AUTOFIX	unit	tests/test-auto-refix.sh
 REVIEW_AUTOFIX	sim	tests/test-sandbox-real-panes.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
