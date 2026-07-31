@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 1607 (defined in >1 file: 36) · with cross-file callers: 281
+- Functions indexed: 1608 (defined in >1 file: 36) · with cross-file callers: 281
 
 ## Functions (def → cross-file callers)
 
@@ -1275,6 +1275,7 @@ this scan cannot see).
 - `handoff_upsert_body` — def `scripts/herd/handoff.sh:154` — callers: —
 - `herd_agent_name_sanitize` — def `scripts/herd/driver.sh:1039` — callers: `scripts/herd/agent-watch.sh:4837`, `scripts/herd/agent-watch.sh:4920`, `scripts/herd/herd-resolve.sh:203`, `scripts/herd/herd-review.sh:760`
 - `herd_agents_conventions` — def `scripts/herd/herd-config.sh:1357` — callers: `scripts/herd/driver.sh:293`
+- `herd_bats_early_reap` — def `scripts/herd/bats-fd3-guard.sh:46` — callers: —
 - `herd_branch_parse` — def `scripts/herd/herd-config.sh:1720` — callers: `scripts/herd/agent-watch.sh:8409`, `scripts/herd/retirement.sh:396`, `scripts/herd/retirement.sh:732`
 - `herd_branch_render` — def `scripts/herd/herd-config.sh:1705` — callers: `scripts/herd/agent-watch.sh:14706`, `scripts/herd/new-feature.sh:19`
 - `herd_branch_slug` — def `scripts/herd/herd-config.sh:1754` — callers: `scripts/herd/agent-watch.sh:2101`, `scripts/herd/agent-watch.sh:2178`
@@ -1447,7 +1448,7 @@ this scan cannot see).
 - `newest` — def `scripts/herd/app-monitor.sh:45` — callers: `bin/herd:7879`, `scripts/herd/agent-watch.sh:10025`, `scripts/herd/agent-watch.sh:10623`, `scripts/herd/agent-watch.sh:10652`
 - `now_hhmm` — def `scripts/herd/backlog-view.sh:153` — callers: —
 - `observe_noted` — def `scripts/herd/agent-watch.sh:4051` — callers: —
-- `ok` — def `bin/herd:148` — callers: `scripts/herd/agent-watch.sh:12322`, `scripts/herd/agent-watch.sh:12358`, `scripts/herd/agent-watch.sh:13913`, `scripts/herd/backends/jira.sh:309`, `scripts/herd/backends/jira.sh:415`, `scripts/herd/backends/jira.sh:679`, `scripts/herd/backends/linear.sh:213`, `scripts/herd/backends/linear.sh:375`, `scripts/herd/backends/linear.sh:505`, `scripts/herd/backends/linear.sh:997`, `scripts/herd/fleet.sh:218`, `scripts/herd/fleet.sh:265`, `scripts/herd/fleet.sh:297`, `scripts/herd/fleet.sh:335`, `scripts/herd/fleet.sh:444`, `scripts/herd/fleet.sh:1909`, `scripts/herd/fleet.sh:1960`, `scripts/herd/journal-audit.sh:232`, `scripts/herd/journal-audit.sh:237`, `scripts/herd/journal-audit.sh:240`, `scripts/herd/journal-audit.sh:270`, `scripts/herd/journal-audit.sh:280`, `scripts/herd/journal-audit.sh:286`, `scripts/herd/journal-audit.sh:302`, `scripts/herd/journal-audit.sh:312`, `scripts/herd/journal-audit.sh:329`, `scripts/herd/journal-audit.sh:380`, `scripts/herd/journal-audit.sh:386`, `scripts/herd/journal-audit.sh:404`
+- `ok` — def `bin/herd:148` — callers: `scripts/herd/agent-watch.sh:12322`, `scripts/herd/agent-watch.sh:12358`, `scripts/herd/agent-watch.sh:13913`, `scripts/herd/backends/jira.sh:309`, `scripts/herd/backends/jira.sh:415`, `scripts/herd/backends/jira.sh:679`, `scripts/herd/backends/linear.sh:213`, `scripts/herd/backends/linear.sh:375`, `scripts/herd/backends/linear.sh:505`, `scripts/herd/backends/linear.sh:997`, `scripts/herd/bats-fd3-guard.sh:57`, `scripts/herd/fleet.sh:218`, `scripts/herd/fleet.sh:265`, `scripts/herd/fleet.sh:297`, `scripts/herd/fleet.sh:335`, `scripts/herd/fleet.sh:444`, `scripts/herd/fleet.sh:1909`, `scripts/herd/fleet.sh:1960`, `scripts/herd/journal-audit.sh:232`, `scripts/herd/journal-audit.sh:237`, `scripts/herd/journal-audit.sh:240`, `scripts/herd/journal-audit.sh:270`, `scripts/herd/journal-audit.sh:280`, `scripts/herd/journal-audit.sh:286`, `scripts/herd/journal-audit.sh:302`, `scripts/herd/journal-audit.sh:312`, `scripts/herd/journal-audit.sh:329`, `scripts/herd/journal-audit.sh:380`, `scripts/herd/journal-audit.sh:386`, `scripts/herd/journal-audit.sh:404`
 - `override_exists` — def `scripts/herd/agent-watch.sh:4028` — callers: —
 - `pin_matches` — def `scripts/herd/herd-approve.sh:176` — callers: —
 - `poll_wait` — def `scripts/herd/backlog-view.sh:199` — callers: —
