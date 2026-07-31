@@ -314,6 +314,216 @@ class TestGateOutcomes(LiveCase):
                          "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
+class TestInfraBreakerGate(LiveCase):
+    """HERD-447: HERD-306's P5b deleted the bash action pass (_tick_act) that consulted
+    ``_breaker_gate`` at the top of every candidate — the HERD-442 audit found the breaker's READ
+    side had had no caller since ede7d45, so it kept recording consecutive infra deaths but never
+    actually halted dispatch (a valve that records and never fires). This proves BOTH halves restored
+    in the PYTHON tick, driven end-to-end through :meth:`LiveTick.run` — never the bash helpers
+    directly (those are proven separately, unchanged, by tests/test-infra-breaker.sh):
+
+      * the READ (the breaker consult at the top of ``LiveTick._walk``) actually SUPPRESSES dispatch
+        while open — the mutation-provable core: delete that consult and
+        ``test_open_breaker_suppresses_dispatch_entirely`` goes from HOLD/no-events to MERGE.
+      * the RECORD side (the review rail's verdict classification in the same walk) counts a real
+        INFRA death and resets on a real verdict, exactly like bash's ``_review_gate_step``.
+      * BYTE-INERT by default (``INFRA_BREAKER_MAX`` unset) — every existing gate-outcome test above
+        already proves this implicitly (none of them set the key and all still pass), so this class
+        adds one direct proof rather than repeating the whole suite.
+
+    Every test drives independent ``LiveTick`` instances sharing one on-disk state dir (the
+    ``TestGateOutcomes.test_refix_round_advances_per_new_sha`` / ``TestRefixCompletionTracking``
+    multi-tick pattern — a fresh ``LiveTick`` per tick is the real production process-boundary
+    shape) with ``HERD_FAKE_NOW`` pinned per call, so the cooldown arithmetic is exact and hermetic.
+    """
+
+    def _tick(self, state_dir, jpath, cands, config, fake_now):
+        old = os.environ.get("HERD_FAKE_NOW")
+        os.environ["HERD_FAKE_NOW"] = str(fake_now)
+        try:
+            scenario = {"candidates": cands, "config": config}
+            j = LiveJournal(jpath)
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                        DryRunActuator(j), j, state=LiveState(state_dir))
+            res = t.run()
+        finally:
+            if old is None:
+                os.environ.pop("HERD_FAKE_NOW", None)
+            else:
+                os.environ["HERD_FAKE_NOW"] = old
+        return res, (events(jpath) if os.path.exists(jpath) else [])
+
+    def _death(self, pr, i):
+        return dict(pr=pr, sha="sha-%s-%d" % (pr, i), slug="feat-%s" % pr, review="INFRA",
+                   health="CLEAN")
+
+    def _ledger(self, state_dir):
+        path = os.path.join(state_dir, ".agent-watch-infra-breaker")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.readline().split()
+
+    def test_byte_inert_when_disabled(self):
+        # No INFRA_BREAKER_MAX at all: a storm of consecutive INFRA deaths across many ticks must
+        # never suppress a later, unrelated clean candidate and must never write a breaker ledger.
+        state_dir = os.path.join(self.tmp, "state-off")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto"}
+        T0 = 3_000_000_000
+        for i in range(6):
+            res, _ = self._tick(state_dir, os.path.join(self.tmp, "off-%d.jsonl" % i),
+                                [self._death(900, i)], config, T0 + i)
+            self.assertEqual(res["outcomes"]["900"], "ESCALATE")
+        self.assertIsNone(self._ledger(state_dir))
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "off-clean.jsonl"),
+                            [dict(pr=901, sha="s901", slug="feat-901", review="PASS", health="CLEAN")],
+                            config, T0 + 100)
+        self.assertEqual(res["outcomes"]["901"], "MERGE")
+
+    def test_opens_after_n_consecutive_deaths_and_journals_once(self):
+        state_dir = os.path.join(self.tmp, "state-open")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "3", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        opens = []
+        for i in range(3):
+            res, ev = self._tick(state_dir, os.path.join(self.tmp, "open-%d.jsonl" % i),
+                                 [self._death(910, i)], config, T0 + i)
+            self.assertEqual(res["outcomes"]["910"], "ESCALATE")
+            opens += [o for o in ev if o["event"] == "infra_breaker_open"]
+        self.assertEqual(len(opens), 1)
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "open")
+        self.assertEqual(fa, "3")
+
+    def test_open_breaker_suppresses_dispatch_entirely(self):
+        # THE mutation-provable core: once open, an otherwise-clean candidate is HELD with NO rail
+        # ever consulted — no verdict_recorded, no healthcheck_outcome, no review/health dispatch at
+        # all. Delete the breaker consult at the top of LiveTick._walk and this candidate merges
+        # instead — see the PR body for the neutralize/red/restore/green demonstration.
+        state_dir = os.path.join(self.tmp, "state-suppress")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(915, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "blocked.jsonl"),
+                             [dict(pr=916, sha="s916", slug="feat-916", review="PASS", health="CLEAN")],
+                             config, T0 + 5)
+        self.assertEqual(res["outcomes"]["916"], "HOLD")
+        self.assertFalse([o for o in ev
+                          if o["event"] in ("verdict_recorded", "healthcheck_outcome",
+                                             "healthcheck_started", "review_dispatched")])
+        # A sibling gets the SAME treatment — the halt is global, not per-PR.
+        res2, ev2 = self._tick(state_dir, os.path.join(self.tmp, "blocked2.jsonl"),
+                              [dict(pr=917, sha="s917", slug="feat-917", review="PASS", health="CLEAN")],
+                              config, T0 + 6)
+        self.assertEqual(res2["outcomes"]["917"], "HOLD")
+        self.assertFalse([o for o in ev2 if o["event"] == "verdict_recorded"])
+
+    def test_real_verdict_resets_counter_and_never_trips(self):
+        state_dir = os.path.join(self.tmp, "state-reset")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "3", "INFRA_BREAKER_COOLDOWN": "300"}
+        T0 = 3_000_000_000
+        # Two deaths (below threshold)...
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "pre-%d.jsonl" % i), [self._death(925, i)],
+                      config, T0 + i)
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual((st, fa), ("closed", "2"))
+        # ...then a REAL verdict (PASS) resets the counter to 0 — the env is provably alive.
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "verdict.jsonl"),
+                             [dict(pr=925, sha="s925-ok", slug="feat-925", review="PASS",
+                                   health="CLEAN")], config, T0 + 10)
+        self.assertEqual(res["outcomes"]["925"], "MERGE")
+        st, fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual((st, fa), ("closed", "0"))
+        # Two MORE deaths after the reset must NOT open it (would have, without the reset).
+        for i in range(2):
+            res, _ = self._tick(state_dir, os.path.join(self.tmp, "post-%d.jsonl" % i),
+                                [self._death(925, 100 + i)], config, T0 + 20 + i)
+            self.assertEqual(res["outcomes"]["925"], "ESCALATE")
+        st, _fa, _op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "closed")
+
+    def test_half_open_admits_exactly_one_probe_and_it_persists_the_claim(self):
+        state_dir = os.path.join(self.tmp, "state-half")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(930, i)],
+                      config, T0 + i)
+        # cooldown not yet elapsed (opened at T0+1; 49s later is 50-1=49 < 50) — still BLOCKED.
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "cooling.jsonl"),
+                            [dict(pr=931, sha="s931a", slug="f931", review="PASS", health="CLEAN")],
+                            config, T0 + 49)
+        self.assertEqual(res["outcomes"]["931"], "HOLD")
+        # cooldown elapsed: TWO siblings walked the SAME tick, neither resolving (WAIT) — only the
+        # FIRST claims the probe; the second, walked after, is still BLOCKED (the claim is exclusive
+        # even within one tick, not just across ticks).
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                            [dict(pr=931, sha="s931b", slug="f931", review="WAIT"),
+                             dict(pr=932, sha="s932a", slug="f932", review="WAIT")],
+                            config, T0 + 60)
+        self.assertEqual(res["outcomes"]["931"], "PENDING")
+        self.assertEqual(res["outcomes"]["932"], "HOLD")
+        _st, _fa, _op, pb = self._ledger(state_dir)
+        self.assertEqual(pb, "931")
+        # The claim PERSISTS across ticks for the SAME probe PR (still unresolved) — 932 stays BLOCKED.
+        res, _ = self._tick(state_dir, os.path.join(self.tmp, "probe2.jsonl"),
+                            [dict(pr=931, sha="s931b", slug="f931", review="WAIT"),
+                             dict(pr=932, sha="s932a", slug="f932", review="WAIT")],
+                            config, T0 + 61)
+        self.assertEqual(res["outcomes"]["931"], "PENDING")
+        self.assertEqual(res["outcomes"]["932"], "HOLD")
+
+    def test_probe_success_closes_and_resumes_normal_dispatch(self):
+        state_dir = os.path.join(self.tmp, "state-close")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(940, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                             [dict(pr=941, sha="s941", slug="f941", review="PASS", health="CLEAN")],
+                             config, T0 + 60)
+        self.assertEqual(res["outcomes"]["941"], "MERGE")
+        self.assertTrue([o for o in ev if o["event"] == "infra_breaker_close"])
+        st, fa, _op, pb = self._ledger(state_dir)
+        self.assertEqual((st, fa, pb), ("closed", "0", "-"))
+        # Dispatch resumes for EVERYONE, immediately, no further cooldown wait.
+        res2, _ = self._tick(state_dir, os.path.join(self.tmp, "resumed.jsonl"),
+                             [dict(pr=942, sha="s942", slug="f942", review="PASS", health="CLEAN")],
+                             config, T0 + 61)
+        self.assertEqual(res2["outcomes"]["942"], "MERGE")
+
+    def test_probe_failure_reopens_with_fresh_cooldown(self):
+        state_dir = os.path.join(self.tmp, "state-reopen")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "INFRA_BREAKER_MAX": "2", "INFRA_BREAKER_COOLDOWN": "50"}
+        T0 = 3_000_000_000
+        for i in range(2):
+            self._tick(state_dir, os.path.join(self.tmp, "trip-%d.jsonl" % i), [self._death(950, i)],
+                      config, T0 + i)
+        res, ev = self._tick(state_dir, os.path.join(self.tmp, "probe.jsonl"),
+                             [self._death(950, 900)], config, T0 + 60)
+        self.assertEqual(res["outcomes"]["950"], "ESCALATE")
+        self.assertTrue([o for o in ev if o["event"] == "infra_breaker_reopen"])
+        st, _fa, op, _pb = self._ledger(state_dir)
+        self.assertEqual(st, "open")
+        self.assertEqual(op, str(T0 + 60))   # opened stamped at THIS tick's HERD_FAKE_NOW
+        # Immediately after the re-open (fresh cooldown), everyone is BLOCKED again — no probe yet.
+        res2, _ = self._tick(state_dir, os.path.join(self.tmp, "reblocked.jsonl"),
+                             [dict(pr=951, sha="s951", slug="f951", review="PASS", health="CLEAN")],
+                             config, T0 + 61)
+        self.assertEqual(res2["outcomes"]["951"], "HOLD")
+
+
 class TestRefixWakeVerification(LiveCase):
     """HERD-370: a review-BLOCK refix bounced PR #471 with the wake never even attempted — no
     refix_wake_result followed, and the PR sat BLOCKED ~70 minutes with the once-guard silently

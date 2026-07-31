@@ -377,6 +377,115 @@ def _now_epoch():
     return fake if fake else str(int(time.time()))
 
 
+# ── INFRA circuit breaker (HERD-110; gate READ restored HERD-447) ────────────────────────────────────
+# The GLOBAL "env looks dead, stop dispatching" seam (contract §3.3; agent-watch.sh:_breaker_gate /
+# :_breaker_record_infra / :_breaker_record_ok, agent-watch.sh:3141-3265). HERD-306's P5b deleted the
+# bash action pass (_tick_act) that consulted _breaker_gate at the top of every candidate's iteration —
+# the HERD-442 audit found the read had had NO caller since, so the breaker recorded consecutive
+# non-verdict review deaths but never actually halted dispatch. This restores the READ into the walk
+# below (:meth:`LiveTick._walk`) and the two RECORD call sites the port itself can reach (the review
+# rail's verdict classification, also in :meth:`LiveTick._walk` — bash's ``_review_gate_step``). A
+# THIRD bash recorder, ``_predispatch_review_if_parallel``, is genuinely obsolete here: it exists only
+# to kick the reviewer early under ``GATE_DISPATCH=parallel``, a lever the Python port never
+# implemented (no parallel pre-dispatch step exists in the walk) — see docs/engine-contract.md §3.3
+# for the full three-way audit. A FOURTH, ``_sweep_gate_corpses``, needs no restoration at all: it is
+# bash-owned via ``herd sweep`` (scripts/herd/sweep.sh; unrelated to the deleted ``_tick_act``) and
+# still runs today, writing the SAME shared ledger file :class:`LiveState`'s breaker methods use below
+# — so a stuck reviewer corpse a `herd sweep` reaps still counts toward this exact global counter.
+#
+# BYTE-INERT BY DEFAULT: every function below short-circuits to a no-op the instant
+# ``INFRA_BREAKER_MAX`` is unset/0/non-numeric (mirroring bash's ``_breaker_enabled`` guard) — no file
+# I/O, no journal write, no gating — so a tick with the lever off is byte-identical to before this
+# restoration.
+
+_BREAKER_DIGITS_RE = re.compile(r"^[0-9]+$")
+
+
+def _breaker_digits(raw, default):
+    """Parse a config value the way bash's ``case … in ''|*[!0-9]*) …; esac`` does: digits-only (no
+    sign, no decimal point) or fall back to ``default`` — so ``"-5"``/``"3.5"``/``""``/``None`` all
+    degrade exactly as they do in the shell, not merely whatever Python's permissive ``int()`` accepts."""
+    s = "" if raw is None else str(raw)
+    return int(s) if _BREAKER_DIGITS_RE.match(s) else default
+
+
+def _breaker_enabled(config):
+    """True iff ``INFRA_BREAKER_MAX`` is a positive integer (agent-watch.sh:_breaker_enabled). The
+    opt-in gate every function below checks first."""
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_MAX"), 0) > 0
+
+
+def _breaker_max(config):
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_MAX"), 0)
+
+
+def _breaker_cooldown(config):
+    """``INFRA_BREAKER_COOLDOWN`` seconds, non-numeric/unset → 300 (agent-watch.sh:_breaker_cooldown)."""
+    return _breaker_digits((config or {}).get("INFRA_BREAKER_COOLDOWN"), 300)
+
+
+def _breaker_record_infra(state, config, journal):
+    """One non-verdict INFRA death observed — bump the consecutive counter; OPEN at
+    ``INFRA_BREAKER_MAX`` from CLOSED, or RE-OPEN (fresh cooldown) if already open/probing
+    (agent-watch.sh:_breaker_record_infra). No-op (no ledger write, no journal) when disabled."""
+    if not _breaker_enabled(config):
+        return
+    st, fa, op, _pb = state.breaker_read()
+    now = int(_now_epoch())
+    fa += 1
+    maxn = _breaker_max(config)
+    if st == "closed":
+        if fa >= maxn:
+            state.breaker_write("open", fa, now, None)
+            journal.append("infra_breaker_open", "scope", "global", "fails", fa, "threshold", maxn,
+                           "cooldown", _breaker_cooldown(config))
+        else:
+            state.breaker_write("closed", fa, op, None)
+    else:
+        state.breaker_write("open", fa, now, None)
+        journal.append("infra_breaker_reopen", "scope", "global", "fails", fa, "threshold", maxn,
+                       "cooldown", _breaker_cooldown(config))
+
+
+def _breaker_record_ok(state, config, journal):
+    """A REAL verdict landed (PASS or BLOCK): the env is provably alive — reset the counter and CLOSE
+    (agent-watch.sh:_breaker_record_ok). No-op when disabled; cheap no-op when already closed at 0."""
+    if not _breaker_enabled(config):
+        return
+    st, fa, _op, _pb = state.breaker_read()
+    if st != "closed":
+        state.breaker_write("closed", 0, 0, None)
+        journal.append("infra_breaker_close", "scope", "global", "recovered_via", "verdict")
+    elif fa != 0:
+        state.breaker_write("closed", 0, 0, None)
+
+
+def _breaker_gate(pr, state, config):
+    """Per-candidate dispatch decision (agent-watch.sh:_breaker_gate) — one of:
+
+      PASS    — breaker closed → dispatch normally.
+      PROBE   — breaker half-open and THIS candidate is (or just claimed) the single recovery probe.
+      BLOCKED — breaker open/cooling down, or another candidate already holds the probe claim.
+
+    Half-open is entered by transitioning open→probing once the cooldown elapses: the FIRST candidate
+    to reach the gate claims itself as the probe (persisted in the ledger) and gets PROBE; every other
+    candidate reads state=probing and, not being the claimed PR, gets BLOCKED. Byte-inert (always
+    PASS, no file I/O) when disabled."""
+    if not _breaker_enabled(config):
+        return "PASS"
+    st, fa, op, pb = state.breaker_read()
+    if st in ("open", "probing"):
+        now = int(_now_epoch())
+        cd = _breaker_cooldown(config)
+        if now - op >= cd:
+            state.breaker_write("probing", fa, now, pr)
+            return "PROBE"
+        if st == "probing" and pb is not None and str(pr) == str(pb):
+            return "PROBE"
+        return "BLOCKED"
+    return "PASS"
+
+
 # ── durable refix ledger I/O ($REFIX_STATE = $TREES/.agent-watch-refixed) ───────────────────────────
 # Mirrors record_refix + refix_rail_reset (agent-watch.sh:7291, :7300). Fail-soft throughout: a missing
 # or unwritable ledger loses a record, never aborts the tick.
@@ -842,6 +951,54 @@ class LiveState:
             return
         try:
             open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    # INFRA circuit-breaker substrate (HERD-110, gate read restored HERD-447) ─────────────────────────
+    # THE SAME one-line ledger bash's ``_breaker_read``/``_breaker_write`` use
+    # (``$TREES/.agent-watch-infra-breaker``, agent-watch.sh:3153/:3175/:3184) — GLOBAL (not sha-keyed),
+    # so a python tick and `herd sweep`'s bash-owned ``_sweep_gate_corpses`` leg (agent-watch.sh:12312,
+    # STILL a live writer — see docs/engine-contract.md §3.3) genuinely share one counter, exactly like
+    # the review/health ledgers above. Format: ``<state> <fails> <opened_epoch> <probe_pr>``, state ∈
+    # closed|open|probing, probe_pr ``-`` when unclaimed.
+
+    def breaker_state_path(self):
+        return self._p(".agent-watch-infra-breaker")
+
+    def breaker_read(self):
+        """``(state, fails, opened, probe_pr)`` — mirrors agent-watch.sh:_breaker_read. A missing, short,
+        or corrupt ledger line reads as the closed/zeroed default, exactly like bash's ``${st:-closed}``
+        fallback fields."""
+        path = self.breaker_state_path()
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    fields = fh.readline().split()
+            except Exception:
+                fields = []
+            if len(fields) >= 4:
+                st, fa, op, pb = fields[0], fields[1], fields[2], fields[3]
+                try:
+                    fa = int(fa)
+                except ValueError:
+                    fa = 0
+                try:
+                    op = int(op)
+                except ValueError:
+                    op = 0
+                return st, fa, op, (None if pb == "-" else pb)
+        return "closed", 0, 0, None
+
+    def breaker_write(self, state, fails, opened, probe_pr):
+        """Persist the one-line breaker ledger (agent-watch.sh:_breaker_write). No-op w/o a state dir —
+        a sim/dry-run tick with a black-hole state carries no cross-tick breaker memory, same as every
+        other ledger above."""
+        path = self.breaker_state_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s %s %s %s\n" % (state, fails, opened, probe_pr if probe_pr else "-"))
         except Exception:
             pass
 
@@ -3157,6 +3314,20 @@ class LiveTick:
         """
         self._state.setdefault(cand.pr, _S_INTAKE)
 
+        # 0. INFRA circuit breaker (HERD-110, gate READ restored HERD-447; contract §2.1 step 1) — the
+        #    GLOBAL "env looks dead" halt, consulted before ANY rail dispatch, mirroring where bash's
+        #    deleted _tick_act called _breaker_gate at the very top of its per-candidate loop body
+        #    (agent-watch.sh ede7d45^:11550). BLOCKED skips this candidate entirely — no health, no
+        #    review, not even a poll of an already-in-flight worker — for EVERY candidate but the one
+        #    admitted as the single half-open PROBE, which falls through and dispatches exactly like a
+        #    closed breaker. Byte-inert (no file I/O) under INFRA_BREAKER_MAX unset/0 — see
+        #    _breaker_gate. cand.pr's own lifecycle state stays put; _advance degrades to a harmless
+        #    illegal_transition line (never fatal) if this candidate was mid-rail when the breaker
+        #    tripped, exactly like every other cross-cutting hold in this walk.
+        if _breaker_gate(cand.pr, self.state, self.config) == "BLOCKED":
+            self._advance(cand, "breaker_open")
+            return HOLD
+
         # 1. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
             if self.state.once(cand.pr, cand.sha, "stale"):
@@ -3232,10 +3403,22 @@ class LiveTick:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "review",
                                 "detail", "no parseable verdict")
             self._advance(cand, "review_infra")
+            # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
+            # non-verdict branch): a non-verdict reviewer death counts against the GLOBAL consecutive
+            # counter — never a real BLOCK, so it must never be cached as one, but it DOES feed the
+            # breaker. No-op under INFRA_BREAKER_MAX unset/0 (_breaker_record_infra).
+            _breaker_record_infra(self.state, self.config, self.journal)
             return ESCALATE
         if not getattr(self.gates, "reused_review", False):
             self.journal.append("verdict_recorded", "pr", cand.pr, "sha", cand.sha, "value", verdict,
                                 "source", "reviewer")
+            # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
+            # PASS/BLOCK branches): a REAL verdict proves the env is alive — reset + close the breaker.
+            # Gated on `reused_review` exactly like the verdict_recorded journal above it: a cache-hit
+            # replay of an already-recorded verdict proves nothing NEW about the env this tick, mirroring
+            # bash's _review_gate_step contract ("called once per tick for a candidate with no ledger
+            # verdict yet" — the merge path never re-invokes it once a verdict is cached).
+            _breaker_record_ok(self.state, self.config, self.journal)
         self._advance(cand, "review_block" if verdict == "BLOCK" else "review_pass")
         if verdict == "BLOCK":
             # Three-way bounce gate (HERD-358).  See _refix_check_and_record for the semantics.
@@ -3484,10 +3667,12 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 # knob). scripts/herd/env-export-lint.sh imports this tuple directly (not a text scrape) so the lint
 # can never drift from the actual consumer list, and fails LOUDLY on any member herd-config.sh sets
 # but does not export.
+_BREAKER_KEYS = ("INFRA_BREAKER_MAX", "INFRA_BREAKER_COOLDOWN")
+
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
-                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS)
+                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS)
 
 
 def _config_from_env(scenario=None):
