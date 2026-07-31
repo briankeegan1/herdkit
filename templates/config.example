@@ -336,6 +336,19 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # byte-inert: no status posted, no read. Watcher-affecting (next watcher restart).
 # GATE_STATUS="on"         # on (default) | off
 
+# post herd/gates=PENDING at GATE-CYCLE START (HERD-453) — off (default, ship-dormant) | on. Requires
+# GATE_STATUS=on. Under `require herd/gates`, the PR page shows GitHub's own bare "herd/gates —
+# Expected — Waiting for status to be reported" for the whole gate cycle: a placeholder naming no owner
+# and no phase, identical whether a suite is running, a reviewer is mid-verdict, or no watcher will ever
+# gate this PR. ON → the moment a candidate enters the gate DAG the engine posts state=pending
+# description="review in progress" (exactly once per (pr,sha); the terminal success post overwrites it).
+# READ THIS BEFORE ENABLING: a non-passing commit status flips a CLEAN sha to mergeStateStatus=UNSTABLE
+# in the DEFAULT UNPROTECTED config — neither CLEAN nor BLOCKED — silently stranding every PR. Enable it
+# ONLY where herd/gates is a REQUIRED check under branch protection, where the sha is already BLOCKED on
+# the missing check and a pending status changes nothing but the words. Any unrecognized value reads off.
+# off → byte-identical to the SUCCESS-ONLY contract. Watcher-affecting (next watcher restart).
+# GATE_STATUS_PENDING="off"  # off (default) | on — requires `require herd/gates` branch protection
+
 # post-merge main-health tick (HERD-129) — catch a RED default branch AT MERGE TIME. The pre-merge
 # health gate proves each PR green in ISOLATION, but two independently-green PRs can merge into a
 # broken COMBINATION (a real incident left main red ~2h, found only when later unrelated PRs inherited
