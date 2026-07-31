@@ -289,6 +289,8 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `hv_body_unreadable` | pr, sha, slug, rc, detail | port `live_runtime.py:LiveTick._resolve_hold_inputs` (HERD-442 — the fail-CLOSED record for an unreadable PR body) |
 | `human_verify_policy` | pr, sha, slug, policy(auto), action | port `live_runtime.py:LiveTick._walk` (HERD-439 — the bash anchor `agent-watch.sh:12314` died at `ede7d45`) |
 | `hold_comment_failed` | pr, sha, slug, kind(coordinator\|human-verify\|approve\|hv-auto) | port `live_runtime.py:LiveActuator.post_comment` (HERD-448 — the once-guard already fired before this runs, so a failed comment post is never retried; this is the only durable record one was attempted) |
+| `hold_comment_superseded` | pr, sha, old_sha, slug, reason | port `live_runtime.py:LiveTick._supersede_hold_comment` (HERD-464 — a hold comment posted for `old_sha` no longer reflects reality: a new sha landed, an approval landed, or a policy change made re-holding it impossible; edited in place via `gh pr comment --edit-last`, never re-posted) |
+| `hold_comment_edit_failed` | pr, sha, slug, kind(superseded) | port `live_runtime.py:LiveActuator.edit_comment` (HERD-464 — same once-guard/never-retried contract as `hold_comment_failed`) |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
 | `merge` | pr, slug, sha, method, reason(gates_passed) | `agent-watch.sh:5788` |
 | `merge_refused_sha_moved` | pr, slug, sha, state | `agent-watch.sh:5764` |
@@ -506,6 +508,23 @@ held PR re-walked every tick never re-posts. A failed comment post journals
 `hold_comment_failed` (§3.4) — the once-guard already fired, so it is never retried — and never
 alters the hold/merge decision either way; `notify` itself never fails, mirroring bash's own
 contract for `herd_driver_notify`.
+
+**SUPERSEDED-IN-PLACE (HERD-464).** A hold comment posted once is a snapshot of one sha's gate
+state — it does not update itself when the world moves past it. Observed cost: a hold comment
+still describing an old sha's HUMAN-VERIFY block outlived that sha (a new commit landed, merged
+clean, no approval needed) and misled an operator into believing a merge-ready PR was still
+human-gated. `LiveTick._supersede_hold_comment` runs immediately after the FINAL (post
+merge-fairness/queue-freeze) hold/merge/observe decision for a candidate and EDITS — never
+re-posts — any hold comment this PR is carrying that stopped reflecting reality, via
+`LiveActuator.edit_comment` (`gh pr comment <pr> --edit-last`, no comment id ever tracked). Two
+triggers, both discovered off the SAME `hold_comment` post-marker `_apply_hold_actuation` writes
+on a successful post: (a) a marker for an OLDER sha than the candidate's current head — a new sha
+landed; (b) a marker for the candidate's OWN sha, but this tick's decision is no longer HOLD — an
+approval landed, or a `HUMAN_VERIFY_POLICY`/`MERGE_POLICY` change removed the hold, with no new
+commit at all. Guarded by the SAME `LiveState.once` doctrine as every other hold side effect
+(§5.3): each (pr, sha) pair is superseded at most once. `DryRunActuator.edit_comment` is a pure
+no-op returning success (mirrors `post_comment`); a failed live edit journals
+`hold_comment_edit_failed` (§3.4) and is never retried, exactly like `hold_comment_failed`.
 
 ---
 

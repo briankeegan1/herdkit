@@ -2397,6 +2397,33 @@ def _hold_kind(hv_hold):
     return "human-verify" if hv_hold else "approve"
 
 
+def _hold_superseded_reason(cand, old_sha, action, hv_policy, approved):
+    """Compose the forensic reason a previously-posted hold comment (for ``old_sha``) stopped
+    reflecting reality (HERD-464): a new sha landed, an approval landed, or a policy change made
+    re-holding it impossible. ``action`` is the FINAL (post merge-fairness/queue-freeze) decision
+    for ``cand`` this tick, so the wording never claims a merge that a freeze actually held back."""
+    bits = []
+    if old_sha != cand.sha:
+        bits.append("sha advanced to %s" % cand.sha[:8])
+    if action == "MERGE":
+        bits.append("approved" if approved else "no approval needed under policy=%s" % hv_policy)
+    elif action == "OBSERVE":
+        bits.append("now observe mode under policy=%s — not merging" % hv_policy)
+    else:
+        bits.append("re-held for the new commit under policy=%s" % hv_policy)
+    return "; ".join(bits)
+
+
+def _hold_superseded_comment(cand, reason):
+    """The edited body for a superseded hold comment (HERD-464) — replaces the stale hold text in
+    place so an operator reading the PR top-to-bottom never sees a hold that no longer applies."""
+    return (
+        "🐑 **herd watch** · superseded: %s. This hold comment no longer reflects commit `%s` — "
+        "see the latest activity on this PR for the current gate outcome."
+        % (reason, cand.sha[:8])
+    )
+
+
 class WakeResult:
     """The outcome of one refix-bounce wake attempt (HERD-370).
 
@@ -2503,6 +2530,11 @@ class DryRunActuator:
     def notify(self, title, body, sound="default"):
         """PURE no-op twin (HERD-448): no driver-seam dispatch under dry-run."""
         return None
+
+    def edit_comment(self, cand, kind, body):
+        """PURE no-op twin (HERD-464): DryRunActuator edits nothing — no gh, no network, no
+        journal. Returns True (not a failure), matching :meth:`post_comment`'s contract."""
+        return True
 
 
 # ── merge actuation config (MERGE_METHOD + DELETE_BRANCH_ON_MERGE, HERD-354) ──────────────────────
@@ -2924,6 +2956,24 @@ class LiveActuator:
             return True
         except Exception:
             self.journal.append("hold_comment_failed", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "kind", kind)
+            return False
+
+    def edit_comment(self, cand, kind, body):
+        """EDIT the last comment THIS identity posted on the PR, in place (HERD-464, contract
+        §5.6): ``gh pr comment <pr> --edit-last`` — no comment id ever needs tracking, since gh
+        resolves "last comment by the authenticated user" itself. This is the supersession
+        actuator: a hold comment that stopped reflecting reality (a new sha landed, an approval
+        landed, or a policy change made re-holding it impossible) is corrected in place instead of
+        left standing to mislead an operator. Same fail-soft contract as :meth:`post_comment`: the
+        caller's once-guard already fired before this runs, so a failed edit is never retried —
+        only journaled (``hold_comment_edit_failed``) as the durable record one was attempted."""
+        try:
+            subprocess.run(["gh", "pr", "comment", str(cand.pr), "--edit-last", "--body", body],
+                           capture_output=True, text=True, check=True, timeout=_HOLD_COMMENT_TIMEOUT)
+            return True
+        except Exception:
+            self.journal.append("hold_comment_edit_failed", "pr", cand.pr, "sha", cand.sha,
                                 "slug", cand.slug, "kind", kind)
             return False
 
@@ -3861,6 +3911,12 @@ class LiveTick:
         self._advance(cand, {"MERGE": "decide_merge", "HOLD": "decide_hold",
                              "OBSERVE": "decide_observe"}[action])
 
+        # 5d. HOLD-COMMENT SUPERSESSION (HERD-464, contract §5.6): `action` here is the FINAL,
+        #     post-freeze decision — edit any hold comment this PR is carrying that no longer
+        #     reflects reality BEFORE applying that decision, so the correction lands on the SAME
+        #     tick the state actually changed.
+        self._supersede_hold_comment(cand, action)
+
         # 6. apply — the ONLY step that actuates (and only under LiveActuator).
         if action == "MERGE":
             # HUMAN_VERIFY_POLICY=auto (HERD-59, restored in HERD-439): a PR that DECLARED HUMAN-VERIFY
@@ -3966,21 +4022,65 @@ class LiveTick:
         (``hold_comment_failed``) and :meth:`notify` never raises — neither can alter the hold
         decision already taken by the caller."""
         if cand.hv_hold and self._hv_policy == "coordinator":
-            self.actuator.post_comment(cand, "coordinator", _hold_coordinator_comment(cand))
+            posted = self.actuator.post_comment(cand, "coordinator", _hold_coordinator_comment(cand))
             self.actuator.notify(
                 "🐑 PR #%s human-verify — coordinator action needed" % cand.pr,
                 "%s: gates passed — a coordinator/agent should run the steps then herd approve %s"
                 % (cand.slug, cand.pr))
         elif cand.hv_hold:
-            self.actuator.post_comment(cand, "human-verify", _hold_human_verify_comment(cand))
+            posted = self.actuator.post_comment(cand, "human-verify", _hold_human_verify_comment(cand))
             self.actuator.notify(
                 "🐑 PR #%s human-verify pending" % cand.pr,
                 "%s: gates passed — verify manual steps, then herd approve %s" % (cand.slug, cand.pr))
         else:
-            self.actuator.post_comment(cand, "approve", _hold_approve_comment(cand))
+            posted = self.actuator.post_comment(cand, "approve", _hold_approve_comment(cand))
             self.actuator.notify(
                 "🐑 PR #%s awaiting approval" % cand.pr,
                 "%s: gates passed — herd approve %s" % (cand.slug, cand.pr))
+        # Remember WHICH (pr, sha) is carrying a live hold comment (HERD-464) — the sole marker
+        # :meth:`_supersede_hold_comment` globs to find a comment that later stops reflecting
+        # reality. Recorded only on a successful post, mirroring `posted`'s own success-only
+        # contract elsewhere (a failed post already journaled `hold_comment_failed` above and has
+        # nothing on the PR yet to supersede).
+        if posted:
+            self.state.record_posted(cand.pr, cand.sha, "hold_comment")
+
+    def _supersede_hold_comment(self, cand, action):
+        """EDIT a previously-posted hold comment IN PLACE once it stops reflecting reality
+        (HERD-464, contract §5.6): a new sha superseded it, an approval landed, or a policy
+        change made re-holding it impossible. A stale hold comment left standing is the exact
+        cost this restores — it misled an operator into believing a merge-ready PR was still
+        human-gated.
+
+        Two triggers, both discovered off the SAME `hold_comment` post-marker
+        :meth:`_apply_hold_actuation` writes:
+
+          (a) a marker for an OLDER sha than `cand.sha` — this PR moved on; that comment now
+              names the wrong commit no matter what this tick decides for the new one.
+          (b) a marker for `cand.sha` ITSELF, but `action` (the FINAL, post-freeze decision) is
+              no longer HOLD — the very commit the comment described was resolved by an approval
+              or a policy change, without a new commit ever landing.
+
+        Guarded by the SAME `LiveState.once` doctrine as every other hold side effect (§5.3): each
+        (pr, sha) pair is superseded at most once, so a re-walked tick never double-edits. No-op
+        with no state dir (a sim/dry-run tick carries no cross-tick marker to discover)."""
+        st = self.state
+        if not st.dir:
+            return
+        for path, old_sha in st.stale_inflight(".live-posted-hold_comment", cand.pr, cand.sha):
+            if not st.once(cand.pr, old_sha, "hold_comment_superseded"):
+                continue
+            reason = _hold_superseded_reason(cand, old_sha, action, self._hv_policy, cand.approved)
+            if self.actuator.edit_comment(cand, "superseded", _hold_superseded_comment(cand, reason)):
+                self.journal.append("hold_comment_superseded", "pr", cand.pr, "sha", cand.sha,
+                                    "old_sha", old_sha, "slug", cand.slug, "reason", reason)
+        if (action != "HOLD" and cand.sha
+                and st.posted(cand.pr, cand.sha, "hold_comment")
+                and st.once(cand.pr, cand.sha, "hold_comment_superseded")):
+            reason = _hold_superseded_reason(cand, cand.sha, action, self._hv_policy, cand.approved)
+            if self.actuator.edit_comment(cand, "superseded", _hold_superseded_comment(cand, reason)):
+                self.journal.append("hold_comment_superseded", "pr", cand.pr, "sha", cand.sha,
+                                    "old_sha", cand.sha, "slug", cand.slug, "reason", reason)
 
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""
