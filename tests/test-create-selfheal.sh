@@ -548,14 +548,14 @@ for backend in down noprobe slug; do
   case "$backend" in
     down)
       [ "$m" = "1" ] || fail "(15) [down] enqueued $m relinks; expected only the slug ref (identifiers are UNPROVEN)"
-grep -q 'relink-2' <<< "$(ls "$DQ")" || fail "(15) [down] the slug ref stopped relinking (it needs no lookup)"
-grep -q 'relink-1' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-1 is missing"
-grep -q 'relink-3' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-4242 is missing"
+      grep -q 'relink-2' <<< "$(ls "$DQ")" || fail "(15) [down] the slug ref stopped relinking (it needs no lookup)"
+      grep -q 'relink-1' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-1 is missing"
+      grep -q 'relink-3' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-4242 is missing"
       grep -q '"result":"unproven"' "$DJ" || fail "(15) [down] the stand-down was not journaled"
       grep -q '⏸' "$T/down-$backend.out"  || fail "(15) [down] a zero-finding sweep silently hid the outage" ;;
     noprobe|slug)
       [ "$m" = "0" ] || fail "(15) [$backend] enqueued $m relink(s) with nothing proven — duplicate filings incoming"
-grep -q 'relink-2' <<< "$(ls "$DQ" 2>/dev/null)" && fail "(15) [$backend] a slug ref was judged missing on a backend that mints no ids"
+      grep -q 'relink-2' <<< "$(ls "$DQ" 2>/dev/null)" && fail "(15) [$backend] a slug ref was judged missing on a backend that mints no ids"
       grep -q '🔗' "$T/down-$backend.out" && fail "(15) [$backend] a backend that cannot answer still narrated a relink"
       grep -q '"event":"link_heal"' "$DJ" && fail "(15) [$backend] a backend that cannot answer still journaled a link_heal" ;;
   esac

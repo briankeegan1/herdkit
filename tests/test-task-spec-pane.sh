@@ -273,10 +273,10 @@ chmod +x "$LBIN/herdr"
 
   # Reconcile of the coordinator tab resolves the real roles and flags NO duplicate backlog viewer.
   rec="$(layout_reconcile w1 tC '' '' '')"
-grep -qx 'backlog=pL' <<< "$rec" || { echo "FAIL: (3) backlog role not the real viewer" >&2; exit 1; }
-grep -qx 'agent=pA' <<< "$rec" || { echo "FAIL: (3) agent role not the real coordinator pane" >&2; exit 1; }
-grep -qx 'watch=pW' <<< "$rec" || { echo "FAIL: (3) watch role not the real watcher" >&2; exit 1; }
-grep -qx 'dup_backlog=' <<< "$rec" || { echo "FAIL: (3) a duplicate backlog viewer was flagged (viewer misclassified)" >&2; exit 1; }
+  grep -qx 'backlog=pL' <<< "$rec" || { echo "FAIL: (3) backlog role not the real viewer" >&2; exit 1; }
+  grep -qx 'agent=pA' <<< "$rec" || { echo "FAIL: (3) agent role not the real coordinator pane" >&2; exit 1; }
+  grep -qx 'watch=pW' <<< "$rec" || { echo "FAIL: (3) watch role not the real watcher" >&2; exit 1; }
+  grep -qx 'dup_backlog=' <<< "$rec" || { echo "FAIL: (3) a duplicate backlog viewer was flagged (viewer misclassified)" >&2; exit 1; }
 ) || exit 1
 pass; echo "PASS (3) builder-tab viewer is tab-isolated + classifies 'busy' — never a control-room role"
 

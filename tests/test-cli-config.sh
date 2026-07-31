@@ -191,7 +191,7 @@ run "$P5" config get WORKSPACE_NAME; before="$OUT"
 for bad in 'a$(id)' 'x`id`' 'a$HOME' 'b\c' 'q"r'; do
   run "$P5" config set WORKSPACE_NAME "$bad"
   [ "$RC" -ne 0 ]                                 || fail "accepted shell-active value: [$bad]"
-grep -qiE 'shell-active|newline|double-quote' <<< "$OUT" || fail "wrong rejection message for [$bad] ($OUT)"
+  grep -qiE 'shell-active|newline|double-quote' <<< "$OUT" || fail "wrong rejection message for [$bad] ($OUT)"
   grep -qF "$bad" "$P5/.herd/config"              && fail "rejected shell-active value [$bad] was written to config"
 done
 # a rejected set must not mutate the stored value.
@@ -251,7 +251,7 @@ ok
 for bad in 'x`id`' 'q"r' 'has space'; do
   run "$P7" config set TEST_PATH_GLOB "$bad"
   [ "$RC" -ne 0 ]                                 || fail "glob key accepted out-of-charset value: [$bad]"
-grep -qi 'invalid value' <<< "$OUT" || fail "glob rejection message wrong for [$bad] ($OUT)"
+  grep -qi 'invalid value' <<< "$OUT" || fail "glob rejection message wrong for [$bad] ($OUT)"
 done
 ok
 

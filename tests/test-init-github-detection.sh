@@ -170,8 +170,8 @@ else
   out="$(cd "$proj" && PATH="$SAFE" HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init 2>&1)"; RC=$?
   [ "$RC" -eq 0 ] || fail "(7) init must not hard-fail without gh (rc=$RC): $out"
   pout="$(plain "$out")"
-grep -qi "skipped" <<< "$pout" || fail "(7) skip note missing: $out"
-grep -qi "gh CLI not installed" <<< "$pout" || fail "(7) no-gh reason missing: $out"
+  grep -qi "skipped" <<< "$pout" || fail "(7) skip note missing: $out"
+  grep -qi "gh CLI not installed" <<< "$pout" || fail "(7) no-gh reason missing: $out"
   grep -qE '^MERGE_POLICY="auto"$'  "$proj/.herd/config"    || fail "(7) config should default MERGE_POLICY=auto"
   grep -qE '^MERGE_METHOD="merge"$' "$proj/.herd/config"    || fail "(7) config should default MERGE_METHOD=merge"
 fi

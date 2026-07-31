@@ -177,7 +177,7 @@ ok; echo "PASS (2) headless: routed shapes detach into the registry (cwd/env/mod
   # Unset → no --env from the endpoint helper (existing caller env still works).
   unset ANTHROPIC_BASE_URL
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
-grep -qF -- '--env' <<< "$got" \
+  grep -qF -- '--env' <<< "$got" \
     && { echo "FAIL: --env leaked when ANTHROPIC_BASE_URL unset"; printf '%s\n' "$got"; exit 1; }
   # helper itself emits nothing
   [ -z "$(herd_driver_endpoint_env_lines)" ] || { echo "FAIL: endpoint_env_lines non-empty when unset"; exit 1; }
@@ -185,13 +185,13 @@ grep -qF -- '--env' <<< "$got" \
   # Set → --env ANTHROPIC_BASE_URL=<url> appears before the runtime tail.
   export ANTHROPIC_BASE_URL="https://corp.example/v1"
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 model=opus pointer=P)"
-grep -qF -- '[--env]' <<< "$got" || { echo "FAIL: missing --env when URL set"; printf '%s\n' "$got"; exit 1; }
-grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
+  grep -qF -- '[--env]' <<< "$got" || { echo "FAIL: missing --env when URL set"; printf '%s\n' "$got"; exit 1; }
+  grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
     || { echo "FAIL: missing ANTHROPIC_BASE_URL value in argv"; printf '%s\n' "$got"; exit 1; }
   # composes with an explicit caller env (both present)
   got="$(herd_driver_launch_agent name=ep workspace=ws1 cwd=/repo tab=t1 env=RESEARCH_TAB=x model=opus flags=--dangerously-skip-permissions pointer=P)"
-grep -qF -- '[RESEARCH_TAB=x]' <<< "$got" || { echo "FAIL: caller env dropped"; printf '%s\n' "$got"; exit 1; }
-grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
+  grep -qF -- '[RESEARCH_TAB=x]' <<< "$got" || { echo "FAIL: caller env dropped"; printf '%s\n' "$got"; exit 1; }
+  grep -qF -- '[ANTHROPIC_BASE_URL=https://corp.example/v1]' <<< "$got" \
     || { echo "FAIL: endpoint env dropped when composing with caller env"; printf '%s\n' "$got"; exit 1; }
   exit 0
 ) || fail "HERD-171 endpoint env injection checks failed (see FAIL above)"

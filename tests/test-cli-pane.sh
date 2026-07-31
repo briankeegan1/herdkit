@@ -341,8 +341,8 @@ if [ -n "$ZPID" ] && kill -0 "$ZPID" 2>/dev/null; then
   set -e
   kill -9 "$GUARD" 2>/dev/null || true
   [ "$rc" -ne 0 ] || fail "pane watch should abort (non-zero) when the watcher cannot be stopped"
-grep -q "could not be stopped" <<< "$out" || fail "abort did not print the unstoppable-watcher error"
-grep -q "duplicate watchers" <<< "$out" || fail "abort message should warn about duplicate watchers"
+  grep -q "could not be stopped" <<< "$out" || fail "abort did not print the unstoppable-watcher error"
+  grep -q "duplicate watchers" <<< "$out" || fail "abort message should warn about duplicate watchers"
   grep -q "pane run pW" "$S/log" && fail "a new watcher was launched despite the abort" || true
   ok
 else

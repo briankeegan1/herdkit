@@ -117,7 +117,7 @@ done
 # The retired values WARN loudly on stderr (once); the live values are silent.
 for v in bash shadow; do
   w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
-grep -qi 'RETIRED' <<< "$w" || fail "ENGINE_IMPL='$v' must WARN that it is retired (got: '$w')"
+  grep -qi 'RETIRED' <<< "$w" || fail "ENGINE_IMPL='$v' must WARN that it is retired (got: '$w')"
 done
 for v in "" python; do
   w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"

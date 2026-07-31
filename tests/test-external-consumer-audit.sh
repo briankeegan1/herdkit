@@ -89,9 +89,9 @@ bash "$FIXTURE" "$T/fx3" >/dev/null || fail "(c) fixture build failed"
 printf '\nfunc broken( {\n' >> "$T/fx3/internal/greet/greet.go"
 out_go="$(HERD_CONFIG_FILE=/dev/null bash "$HEALTHCHECK" "$T/fx3" --oneline 2>&1)"; rc_go=$?
 if [ "$rc_go" -eq 0 ]; then
-grep -q '✅' <<< "$out_go" \
+  grep -q '✅' <<< "$out_go" \
     && fail "(c1) broken .go must NOT pass as a confident '✅ light clean' (Leak B): '$out_go'"
-grep -q '⚠️' <<< "$out_go" \
+  grep -q '⚠️' <<< "$out_go" \
     || fail "(c1) an unchecked broken .go should be flagged with a ⚠️ (got: '$out_go')"
   echo "PASS (c1) broken .go is FLAGGED (⚠️, gofmt absent), never silently green-lit: '$out_go'"
 else

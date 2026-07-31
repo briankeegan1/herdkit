@@ -90,7 +90,7 @@ ok
 # when_to_surface (col 4) present and mentions all three values so the manifest is self-documenting.
 wts="$(awk -F'\t' '$1=="HUMAN_VERIFY_POLICY"{print $4; exit}' "$CAPS")"
 for v in coordinator auto hold; do
-grep -q "$v" <<< "$wts" || fail "(1) when_to_surface should mention '$v': $wts"
+  grep -q "$v" <<< "$wts" || fail "(1) when_to_surface should mention '$v': $wts"
 done
 ok
 

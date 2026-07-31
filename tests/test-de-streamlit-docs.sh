@@ -92,7 +92,7 @@ grep -Fq 'WATCHER_VIEW_AUTHOR' <<< "$(awk -F'\t' '$1=="WATCHER_OWNER"{print $3}'
   || fail "(B.2) capabilities.tsv WATCHER_OWNER row must document the WATCHER_VIEW_AUTHOR fallback"
 # Both keys are watcher-affecting in the manifest.
 for k in WATCHER_SCOPE WATCHER_OWNER; do
-grep -Fq 'watcher' <<< "$(awk -F'\t' -v k="$k" '$1==k{print $5}' "$CAPS")" \
+  grep -Fq 'watcher' <<< "$(awk -F'\t' -v k="$k" '$1==k{print $5}' "$CAPS")" \
     || fail "(B.2) capabilities.tsv $k row must be tagged 'watcher' in the requires column"
 done
 pass

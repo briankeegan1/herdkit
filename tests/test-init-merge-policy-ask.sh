@@ -54,12 +54,12 @@ else
   [ "$RC" -eq 0 ] || fail "(1) init must not hang/hard-fail non-interactively (rc=$RC): $out"
   pout="$(plain "$out")"
   # consequence block — the operator SEES what each value does, verbatim in the flow.
-grep -qi "watcher MERGES every gate-passed PR" <<< "$pout" || fail "(1) auto consequence not shown: $out"
-grep -qi "HOLDS each PR for an explicit human" <<< "$pout" || fail "(1) approve consequence not shown: $out"
-grep -qi "NEVER merges" <<< "$pout" || fail "(1) observe consequence not shown: $out"
+  grep -qi "watcher MERGES every gate-passed PR" <<< "$pout" || fail "(1) auto consequence not shown: $out"
+  grep -qi "HOLDS each PR for an explicit human" <<< "$pout" || fail "(1) approve consequence not shown: $out"
+  grep -qi "NEVER merges" <<< "$pout" || fail "(1) observe consequence not shown: $out"
   # LOUD notice (not a single dim line) that we defaulted to auto without a human choosing it.
-grep -qi "MERGE_POLICY defaulted to 'auto'" <<< "$pout" || fail "(1) loud auto-default notice missing: $out"
-grep -qi "NO human sign-off" <<< "$pout" || fail "(1) auto notice must spell out the consequence: $out"
+  grep -qi "MERGE_POLICY defaulted to 'auto'" <<< "$pout" || fail "(1) loud auto-default notice missing: $out"
+  grep -qi "NO human sign-off" <<< "$pout" || fail "(1) auto notice must spell out the consequence: $out"
   grep -qE '^MERGE_POLICY="auto"$' "$proj/.herd/config"           || fail "(1) config should seed MERGE_POLICY=auto: $(cat "$proj/.herd/config")"
   ok
 fi
@@ -128,7 +128,7 @@ if [ "$PTY_RC" = "7" ] || [ -z "$ptyout" ]; then
   ok
 else
   pptyout="$(plain "$ptyout" | tr -d '\r')"
-grep -qi "MERGE_POLICY (auto | approve | observe)" <<< "$pptyout" || fail "(3) interactive prompt did not render: $ptyout"
+  grep -qi "MERGE_POLICY (auto | approve | observe)" <<< "$pptyout" || fail "(3) interactive prompt did not render: $ptyout"
   [ "$(plain "$(cat "$ANSF")" | tr -d '\r\n ')" = "approve" ]          || fail "(3) operator answer not honored: got [$(cat "$ANSF")]"
   ok
 fi

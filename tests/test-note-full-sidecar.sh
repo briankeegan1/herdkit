@@ -146,7 +146,7 @@ else
   : > "$TREES/.builder-notes-full"
   LONG2="BLOCKED-$(python3 -c 'import sys; sys.stdout.write("z"*400)')-TAIL"
   out="$(run_note "$LONG2")" || fail "herd note must not fail when the sidecar cannot be written: $out"
-grep -q "noted" <<< "$out" || fail "herd note should still confirm when the sidecar fails"
+  grep -q "noted" <<< "$out" || fail "herd note should still confirm when the sidecar fails"
   [ "$(_field "$JOURNAL_FILE" event)" = "builder_note" ] || fail "capped note must still be journaled on sidecar failure"
   [ "$(_field "$JOURNAL_FILE" note_full)" = "<MISSING>" ] || fail "a failed sidecar must NOT leave a note_full field"
   rm -f "$TREES/.builder-notes-full"

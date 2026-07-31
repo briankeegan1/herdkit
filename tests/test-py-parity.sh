@@ -200,9 +200,9 @@ ok "S3: a semantic field's absolute path is NOT folded — a real location diver
 HERD_SIM_LOAD_RETRY_QUIET="${HERD_SIM_LOAD_RETRY_QUIET:-3}"   # quiet interval (s) before the one retry
 
 parity_leg_assert_green() {   # <artifacts-dir> <captured-output> — the green-path invariants
-grep -q "journal parity: OK" <<< "$(printf '%s\n' "$2")" \
+  grep -q "journal parity: OK" <<< "$(printf '%s\n' "$2")" \
     || fail "parity-run exited 0 but did not report journal parity OK"
-grep -q "scorecard:" <<< "$(printf '%s\n' "$2")" \
+  grep -q "scorecard:" <<< "$(printf '%s\n' "$2")" \
     || fail "parity-run did not read/surface the scorecard from file"
   [ -f "$1/scorecard.json" ] || fail "scenario scorecard.json missing after parity-run"
   [ -s "$1/journal-real.jsonl" ] || fail "parity-run collected an empty real journal"

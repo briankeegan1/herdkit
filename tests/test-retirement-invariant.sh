@@ -447,7 +447,7 @@ for f in "${pr_files[@]}"; do : > "$f"; done
 # …nor may they manufacture a phantom slug for leg C to tear down.
 res="$(_retire_residual_slugs)"
 for phantom in 312 312-abc1234def5678 main-abc1234def5678; do
-grep -qxF "$phantom" <<< "$res" \
+  grep -qxF "$phantom" <<< "$res" \
     && fail "(19) leg C manufactured the phantom slug '$phantom' from a live PR's ledger"
 done
 # …and a full tick leaves every one of them on disk.

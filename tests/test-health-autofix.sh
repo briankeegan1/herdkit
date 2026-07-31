@@ -344,9 +344,9 @@ grep -q 'needs you' <<< "$(row)" || fail "(9e) tick 1 must escalate (got: $(row)
 for _tick in 2 3; do
   DISPLAY=()
   _handle_health_codeerror 57 slug-a shaSTUCK 0 "$T/wt" "$NOTOK"
-grep -q 'fix in progress' <<< "$(row)" && fail "(9e) tick $_tick must NOT claim a fix is in flight (got: $(row))"
-grep -q 'needs you' <<< "$(row)" || fail "(9e) tick $_tick must keep saying 'needs you' (got: $(row))"
-grep -q 'stalled' <<< "$(row)" || fail "(9e) tick $_tick must name the stall (got: $(row))"
+  grep -q 'fix in progress' <<< "$(row)" && fail "(9e) tick $_tick must NOT claim a fix is in flight (got: $(row))"
+  grep -q 'needs you' <<< "$(row)" || fail "(9e) tick $_tick must keep saying 'needs you' (got: $(row))"
+  grep -q 'stalled' <<< "$(row)" || fail "(9e) tick $_tick must name the stall (got: $(row))"
 done
 [ "$(runs)" = "2" ] || fail "(9e) the once-guard must still block a re-bounce (got $(runs) pane runs)"
 python3 - "$JOURNAL_FILE" <<'PY2' || fail "(9e) the stall must journal refix_stalled EXACTLY once"

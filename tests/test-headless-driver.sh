@@ -100,15 +100,15 @@ ok; echo "PASS (2) unknown driver → loud error listing herdr-claude AND headle
 
   # list-agents: empty registry → an empty roster (never a broken parse).
   j="$(herd_driver_agent_list_json)"
-grep -qF '"agents":[]' <<< "$j" || { echo "FAIL: empty registry not empty roster: $j"; exit 1; }
+  grep -qF '"agents":[]' <<< "$j" || { echo "FAIL: empty registry not empty roster: $j"; exit 1; }
 
   # seed a LIVE agent (this test's pid) + a DEAD one (a pid that cannot exist).
   mkdir -p "$WORKTREES_DIR/.herd/agents/live" "$WORKTREES_DIR/.herd/agents/gone"
   echo $$ > "$WORKTREES_DIR/.herd/agents/live/pid"; echo working > "$WORKTREES_DIR/.herd/agents/live/status"
   echo 2147483646 > "$WORKTREES_DIR/.herd/agents/gone/pid"
   j="$(herd_driver_agent_list_json)"
-grep -qF '"name":"live"' <<< "$j" || { echo "FAIL: live agent not listed: $j"; exit 1; }
-grep -qF '"name":"gone"' <<< "$j" && { echo "FAIL: dead-pid agent WAS listed: $j"; exit 1; }
+  grep -qF '"name":"live"' <<< "$j" || { echo "FAIL: live agent not listed: $j"; exit 1; }
+  grep -qF '"name":"gone"' <<< "$j" && { echo "FAIL: dead-pid agent WAS listed: $j"; exit 1; }
 
   # notify: durable sink written, rc 0.
   herd_driver_notify "🐑 t" "the body" default || { echo "FAIL: notify rc"; exit 1; }
@@ -124,14 +124,14 @@ grep -qF '"name":"gone"' <<< "$j" && { echo "FAIL: dead-pid agent WAS listed: $j
   # read-pane: empty on no log, tails a real log.
   [ -z "$(herd_driver_read_pane nosuch)" ] || { echo "FAIL: read-pane not empty for missing agent"; exit 1; }
   printf 'hello-log\n' > "$WORKTREES_DIR/.herd/agents/live/log"
-grep -qF hello-log <<< "$(herd_driver_read_pane live)" || { echo "FAIL: read-pane did not tail the log"; exit 1; }
+  grep -qF hello-log <<< "$(herd_driver_read_pane live)" || { echo "FAIL: read-pane did not tail the log"; exit 1; }
 
   # send-text: queues to the input file.
   herd_driver_send_text live "wake up" || { echo "FAIL: send-text rc"; exit 1; }
   grep -qF "wake up" "$WORKTREES_DIR/.herd/agents/live/input" || { echo "FAIL: send-text not queued"; exit 1; }
 
   # focus: prints view guidance, rc 0.
-grep -qF "tail -f" <<< "$(herd_driver_focus_agent live)" || { echo "FAIL: focus did not print view guidance"; exit 1; }
+  grep -qF "tail -f" <<< "$(herd_driver_focus_agent live)" || { echo "FAIL: focus did not print view guidance"; exit 1; }
   exit 0
 ) || fail "headless capability checks failed (see FAIL above)"
 ok; echo "PASS (3) headless driver: registry liveness, notify sink, no-ops, log tail — all fail-soft"

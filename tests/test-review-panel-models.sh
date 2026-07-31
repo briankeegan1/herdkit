@@ -131,7 +131,7 @@ _want(){
   if [ "$egrep" = "-" ]; then
     [ -z "$line" ] || fail "3 $label: expected NO verdict line, got '$line'"
   else
-grep -q "$egrep" <<< "$line" || fail "3 $label: line '$line' does not match '$egrep'"
+    grep -q "$egrep" <<< "$line" || fail "3 $label: line '$line' does not match '$egrep'"
   fi
 }
 # rc contract: 0 = PASS, 1 = BLOCK, 2 = INFRA (no line).

@@ -196,7 +196,7 @@ STUB
     if [ -z "$got" ]; then
       echo "SKIP (C) severed gate wrote no result file in this env"
     else
-grep -q '^REVIEW: INFRA-FAIL' <<< "$got" \
+      grep -q '^REVIEW: INFRA-FAIL' <<< "$got" \
         || fail "(C) severed review must emit INFRA-FAIL, got: '$got'"
       # And critically: NO verdict-shaped directory anywhere the gate ran.
       [ -z "$(find "$ECWD" -name 'REVIEW:*' 2>/dev/null)" ] \

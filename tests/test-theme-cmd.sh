@@ -54,7 +54,7 @@ run(){ ( cd "$PROJ" && bash "$HERD" "$@" ); }
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 out="$(run theme list 2>&1)"
 for t in tokyonight gruvbox catppuccin nord; do
-grep -qw "$t" <<< "$out" || fail "1a: 'herd theme list' omitted built-in '$t'"
+  grep -qw "$t" <<< "$out" || fail "1a: 'herd theme list' omitted built-in '$t'"
 done
 grep -q 'active: tokyonight' <<< "$out" || fail "1b: 'herd theme list' did not report the active theme"
 grep -qE '●[[:space:]]*tokyonight' <<< "$out" || fail "1c: 'herd theme list' did not MARK the active theme"
@@ -77,7 +77,7 @@ pass; echo "PASS (1b) list surfaces user themes and notes a user shadow of a bui
 out="$(run theme preview nord 2>&1)"
 grep -q 'nord' <<< "$out" || fail "2a: preview did not name the theme"
 for lbl in blue cyan green yellow red dim; do
-grep -q "$lbl" <<< "$out" || fail "2b: preview missing the '$lbl' swatch row"
+  grep -q "$lbl" <<< "$out" || fail "2b: preview missing the '$lbl' swatch row"
 done
 [ "$(echo "$out" | grep -c '██████')" -eq 6 ] || fail "2c: preview did not render exactly six swatch blocks"
 pass; echo "PASS (2a) preview <name> renders the six palette swatches"
