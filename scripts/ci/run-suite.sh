@@ -33,6 +33,17 @@
 #                        `--artifacts DIR --keep` convention (default: a fresh mktemp -d). Written
 #                        back to $GITHUB_ENV in CI so a failure-upload step can find it (HERD-436:
 #                        the scorecard a chaos/sim test names on failure was never uploaded before).
+#   HERD_CI_SHARD_INDEX / HERD_CI_SHARD_COUNT (HERD-463): run only the tests assigned to shard
+#                        HERD_CI_SHARD_INDEX (1-based) of HERD_CI_SHARD_COUNT total, via a stable
+#                        filename hash (scripts/herd/suite-shard.sh) — deterministic and balanced,
+#                        so the CI matrix can fan a ~350-test, single-threaded ~20m curated run out
+#                        across N machines. Both default to 1 (shard 1 of 1 = every curated test),
+#                        so an invocation that never sets these is byte-identical to today's
+#                        unsharded run. DOES NOT REDUCE what runs — every shard's union, across a
+#                        full matrix row, is the same curated set an unsharded run selects
+#                        (mutation-proven by tests/test-suite-shard.sh). "all" mode
+#                        (HERD_CI_FORCE_DIRECT=1) ignores sharding — it is a debug/full-glob mode,
+#                        not the gate.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -43,6 +54,18 @@ TEST_GLOB="${HERD_CI_TEST_GLOB:-test-*.sh}"
 ALLOWLIST="${HERD_CI_ALLOWLIST:-$TESTS_DIR/known-env-sensitive.tsv}"
 CURATED_SRC="$TESTS_DIR/herd.bats"
 PER_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-120}"
+SHARD_INDEX="${HERD_CI_SHARD_INDEX:-1}"
+SHARD_COUNT="${HERD_CI_SHARD_COUNT:-1}"
+case "$SHARD_INDEX" in ''|*[!0-9]*) SHARD_INDEX=1 ;; esac
+case "$SHARD_COUNT" in ''|*[!0-9]*) SHARD_COUNT=1 ;; esac
+[ "$SHARD_COUNT" -ge 1 ] 2>/dev/null || SHARD_COUNT=1
+# shellcheck source=scripts/herd/suite-shard.sh
+if [ -f "$ROOT/scripts/herd/suite-shard.sh" ]; then
+  . "$ROOT/scripts/herd/suite-shard.sh"
+elif [ "$SHARD_COUNT" -gt 1 ]; then
+  echo "❌ HERD_CI_SHARD_COUNT=$SHARD_COUNT but scripts/herd/suite-shard.sh is missing — refusing to guess a partial suite" >&2
+  exit 2
+fi
 
 # `herd reload` (exercised by test-cli-backend-switch and others) relaunches a HEADLESS background
 # watcher when herdr is absent — which a clean CI runner always is. That daemon lingers, holding the
@@ -146,16 +169,15 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
   # (tests/gate-coverage-exempt.tsv — flaky/live-env files kept out of the hermetic gate). The bespoke
   # hand-written @test blocks (e.g. test-codemap-project.sh) are NOT on the exempt list, so they are
   # selected here too — this runner runs every file, whether the gate reaches it via discovery or a block.
+  # HERD-463: the selection itself now lives in scripts/herd/suite-shard.sh (herd_suite_tests_for_shard),
+  # ONE implementation shared with tests/test-suite-shard.sh's mutation-prove membership check, so the
+  # curated glob-minus-exempt logic can never drift between the two. SHARD_COUNT=1 (the default) selects
+  # every curated test — byte-identical to the pre-shard unsharded selection.
   EXEMPT_FILE="$TESTS_DIR/gate-coverage-exempt.tsv"
-  shopt -s nullglob
-  for f in "$TESTS_DIR"/test-*.sh; do
-    base="$(basename "$f")"
-    if [ -f "$EXEMPT_FILE" ] && grep -qxF -- "$base" "$EXEMPT_FILE" 2>/dev/null; then
-      continue
-    fi
-    tests+=("$f")
-  done
-  shopt -u nullglob
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    tests+=("$TESTS_DIR/$base")
+  done < <(herd_suite_tests_for_shard "$TESTS_DIR" "$SHARD_INDEX" "$SHARD_COUNT" "$EXEMPT_FILE")
 else
   MODE="all"
   shopt -s nullglob
@@ -182,7 +204,9 @@ if [ -n "${GITHUB_ENV:-}" ]; then
   { echo "HERD_CI_LOGDIR=$LOGDIR"; echo "HERD_CI_ARTIFACTS_DIR=$ARTROOT"; } >> "$GITHUB_ENV"
 fi
 [ -n "$TO" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
-echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, timeout=${TO:-none}) on ${PLATFORM}"
+shard_note=""
+[ "$SHARD_COUNT" -gt 1 ] && shard_note=", shard=$SHARD_INDEX/$SHARD_COUNT"
+echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, timeout=${TO:-none}${shard_note}) on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
@@ -227,7 +251,7 @@ for t in "${tests[@]}"; do
 done
 
 echo
-echo "── CI suite summary (${PLATFORM}, mode=$MODE) ─────────────────"
+echo "── CI suite summary (${PLATFORM}, mode=$MODE${shard_note}) ─────────────────"
 echo "   passed:                $pass"
 echo "   XFAIL (env-sensitive): $xfail"
 echo "   real failures:         $real_fail"
@@ -237,8 +261,8 @@ fi
 if [ "$real_fail" -gt 0 ]; then
   echo "   real-failed tests:"
   printf '     ✗ %s\n' "${real_names[@]}"
-  echo "❌ CI SUITE FAILED on ${PLATFORM} ($real_fail real failure(s))"
+  echo "❌ CI SUITE FAILED on ${PLATFORM}${shard_note} ($real_fail real failure(s))"
   exit 1
 fi
-echo "✅ CI SUITE CLEAN on ${PLATFORM} ($pass passed, $xfail env-sensitive XFAIL)"
+echo "✅ CI SUITE CLEAN on ${PLATFORM}${shard_note} ($pass passed, $xfail env-sensitive XFAIL)"
 exit 0

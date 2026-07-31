@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# test-suite-parallel-wiring.sh — hermetic test for the HERD-463 local heavy-gate parallelism wiring
+# in .herd/healthcheck.project.sh: `bats --jobs N` is added when GNU `parallel` is on PATH (bounded
+# by HEALTHCHECK_SUITE_WORKERS and the box's own core count), and omitted — falling back to the exact
+# pre-HERD-463 serial bats invocation — when `parallel` is absent. Stubs `bats` itself (records its
+# argv, prints a trivial empty-pass TAP stream) so this proves the WIRING, not bats's own --jobs
+# behavior (which is a stable upstream feature, not this repo's to test).
+#
+# Against the REAL .herd/healthcheck.project.sh, same fixture-tree idiom as
+# tests/test-shellcheck-empty-retry.sh (an otherwise-empty tree keeps every other stage inert).
+#
+# Proves:
+#   (1) GNU parallel present, workers=4 → bats invoked with "--jobs 4", and the health output notes it.
+#   (2) GNU parallel ABSENT → bats invoked with NO --jobs flag at all — byte-identical to before
+#       HERD-463 — and the output notes the serial fallback.
+#   (3) HEALTHCHECK_SUITE_WORKERS=1 → no --jobs even with parallel present (bound<=1 is a strict
+#       serial request, matching scripts/herd/burst.sh's own "bound<=1 is strict serial" contract).
+#   (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own (stubbed) core count.
+#
+# Run:  bash tests/test-suite-parallel-wiring.sh
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT_REPO="$(cd "$HERE/.." && pwd)"
+PROJ="$ROOT_REPO/.herd/healthcheck.project.sh"
+[ -f "$PROJ" ] || { echo "FAIL: healthcheck.project.sh not found at $PROJ" >&2; exit 1; }
+
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+pass=0
+fail() { echo "FAIL: $1" >&2; exit 1; }
+ok()   { pass=$((pass+1)); }
+
+F="$T/fixture"; mkdir -p "$F/tests"
+printf '#!/usr/bin/env bats\n@test "stub" { run true; }\n' > "$F/tests/dummy.bats"
+
+B="$T/bin"; mkdir -p "$B"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$B/herdr"; chmod +x "$B/herdr"          # absent-ish: no live workspace
+printf '#!/usr/bin/env bash\nprintf "8\\n"\n' > "$B/nproc"; chmod +x "$B/nproc"   # pin cores=8, deterministic across boxes
+printf '#!/usr/bin/env bash\nexit 0\n' > "$B/shellcheck"; chmod +x "$B/shellcheck"  # shadow the real one: fixture has no scripts/herd/* for it to lint
+
+STUB_BATS="$B/bats"
+cat > "$STUB_BATS" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$BATS_ARGV_FILE"
+printf '1..0\n'
+exit 0
+STUB
+chmod +x "$STUB_BATS"
+
+PB="$T/parbin"; mkdir -p "$PB"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$PB/parallel"; chmod +x "$PB/parallel"
+
+# Whatever directory the REAL `parallel` (if any) resolves from on THIS box — stripped out for the
+# "absent" cases below so a box that happens to have GNU parallel installed (e.g. the maintainer's
+# own dev machine) doesn't leak it into the negative assertions. A box with no `parallel` at all
+# leaves this empty, and stripping an empty name is a no-op — the absent case is already satisfied.
+REAL_PARALLEL_DIR="$(command -v parallel 2>/dev/null)"; REAL_PARALLEL_DIR="${REAL_PARALLEL_DIR%/*}"
+
+run_proj() {
+  # run_proj <yes|no: put stub parallel on PATH> [VAR=VAL...] — sets OUT/RC/ARGV.
+  local want_parallel="$1"; shift
+  local base_path="$PATH"
+  if [ "$want_parallel" != "yes" ] && [ -n "$REAL_PARALLEL_DIR" ]; then
+    base_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$REAL_PARALLEL_DIR" | tr '\n' ':')"
+  fi
+  local p="$B:$base_path"
+  [ "$want_parallel" = "yes" ] && p="$PB:$p"
+  OUT="$(PATH="$p" BATS_ARGV_FILE="$T/argv" env "$@" bash "$PROJ" "$F" 2>&1)"; RC=$?
+  ARGV="$(cat "$T/argv" 2>/dev/null || echo "")"
+  rm -f "$T/argv"
+}
+
+# ── (1) parallel present, workers=4 → --jobs 4 in bats argv ───────────────────────────────────────
+run_proj yes HEALTHCHECK_SUITE_WORKERS=4
+[ "$RC" -eq 0 ] || fail "(1) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 4\b' <<< "$ARGV" || fail "(1) expected '--jobs 4' in bats argv, got: $ARGV"
+grep -qF "jobs=4" <<< "$OUT" || fail "(1) expected a jobs=4 note in the health output — got: $OUT"
+ok
+echo "PASS (1) GNU parallel present, workers=4 → bats invoked with --jobs 4"
+
+# ── (2) parallel ABSENT → no --jobs flag, byte-identical to pre-HERD-463 ──────────────────────────
+run_proj no HEALTHCHECK_SUITE_WORKERS=4
+[ "$RC" -eq 0 ] || fail "(2) expected clean exit, got $RC — out: $OUT"
+grep -q -- '--jobs' <<< "$ARGV" && fail "(2) parallel absent must NOT pass --jobs, got: $ARGV"
+grep -qF "serial" <<< "$OUT" || fail "(2) expected a serial-fallback note — got: $OUT"
+ok
+echo "PASS (2) GNU parallel absent → bats invoked with no --jobs flag (serial fallback, byte-identical to before)"
+
+# ── (3) HEALTHCHECK_SUITE_WORKERS=1 → no --jobs even with parallel present ────────────────────────
+run_proj yes HEALTHCHECK_SUITE_WORKERS=1
+[ "$RC" -eq 0 ] || fail "(3) expected clean exit, got $RC — out: $OUT"
+grep -q -- '--jobs' <<< "$ARGV" && fail "(3) workers=1 must NOT pass --jobs even with parallel present, got: $ARGV"
+ok
+echo "PASS (3) HEALTHCHECK_SUITE_WORKERS=1 stays serial even with GNU parallel present"
+
+# ── (4) worker count is capped at the (stubbed) core count ────────────────────────────────────────
+run_proj yes HEALTHCHECK_SUITE_WORKERS=99
+[ "$RC" -eq 0 ] || fail "(4) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(4) expected --jobs capped at the stubbed core count (8), got: $ARGV"
+ok
+echo "PASS (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own core count"
+
+echo
+echo "ALL PASS ($pass checks) — HERD-463 local heavy-gate bats --jobs wiring: present + bounded when GNU parallel is available, byte-identical serial fallback when it is not."
