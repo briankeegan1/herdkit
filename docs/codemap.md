@@ -21,6 +21,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-reconcile-sweep.sh` — periodic, ADVISORY reconcile SWEEP for backlog drift.
 - `backlog-reconcile.sh` — keep BACKLOG.md coherent when a PR MOVES or RENAMES the things backlog
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
+- `bats-fd3-guard.sh` — HERD-462: the shared-chokepoint half of the bats-FD3 wedge fix.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
