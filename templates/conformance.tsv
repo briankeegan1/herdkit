@@ -370,6 +370,7 @@ HUMAN-VERIFY:	unit	tests/test-human-verify-hold.sh
 herd-watch-<workspace>	unit	tests/test-cli-reload.sh
 HERD_REQUIRE_PROJECT_CONFIG	unit	tests/test-launch-binding-guard.sh
 HERD_ALLOW_FOREIGN_CWD	unit	tests/test-launch-binding-guard.sh
+HERD_CONFIG_ENV_OK	unit	tests/test-config-env-precedence.sh
 scripts/herd/cost.sh	unit	tests/test-cost.sh
 .herd-limit-sentinel	unit	tests/test-limit-resume.sh
 .herd-limit-sentinel	sim	tests/test-sandbox-limit-resume.sh
