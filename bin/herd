@@ -6899,10 +6899,40 @@ def describe(o):
     extra = " ".join("%s=%s" % (k, o[k]) for k in o if k not in ("ts","event","pr","unit"))
     return ev, extra
 
-print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
+# HERD-459 read side: fold a CONSECUTIVE run of identical blocks into one rendering plus a xN note.
+# The watcher re-derives the whole chain of a parked PR every poll tick, so the noise is a repeated BLOCK
+# (INTAKE->HEALTH, HEALTH->REVIEW, REVIEW->BLOCKED, over and over), not a repeated line — collapsing
+# needs the period. Rows are "identical" when they RENDER identically ignoring the timestamp; the note
+# carries the last one so the time range survives. Byte-identical on a history with no repetition.
+# Keep in lockstep with pysrc/herd/why.py — tests/test-py-readers.sh A/Bs the two paths.
+MAX_BLOCK = 12
+keys, stamps, lines = [], [], []
 for o in rows:
     label, detail = describe(o)
-    print("  %s  %-20s %s" % (str(o.get("ts","")), label, detail))
+    ts = str(o.get("ts", ""))
+    keys.append((label, detail))
+    stamps.append(ts)
+    lines.append("  %s  %-20s %s" % (ts, label, detail))
+
+print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
+n, i = len(rows), 0
+while i < n:
+    best_k, best_reps = 1, 1
+    for k in range(1, MAX_BLOCK + 1):
+        if i + 2 * k > n or keys[i:i+k] != keys[i+k:i+2*k]:
+            continue
+        reps = 2
+        while i + (reps+1) * k <= n and keys[i:i+k] == keys[i+reps*k:i+(reps+1)*k]:
+            reps += 1
+        if k * reps > best_k * best_reps:
+            best_k, best_reps = k, reps
+    for j in range(i, i + best_k):
+        print(lines[j])
+    if best_reps > 1:
+        shape = "line" if best_k == 1 else "%d-event block" % best_k
+        print("  … ×%d  (identical %s repeated, through %s)"
+              % (best_reps, shape, stamps[i + best_k * best_reps - 1]))
+    i += best_k * best_reps
 '
 }
 

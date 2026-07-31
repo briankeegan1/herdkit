@@ -211,4 +211,39 @@ for fix in dup-detected healthy; do
   ok
 done
 
+# ── (7) herd why — the ×N block fold on a NOISY journal (HERD-459) ──────────────────────────────────
+# GH #573: a PR parked on one cached verdict re-journaled its whole INTAKE→…→BLOCKED chain every ~6s
+# tick, so `herd why` was screens of identical three-line blocks. The reader folds a consecutive run of
+# identical blocks (timestamps ignored for the comparison, carried in the note) into ONE rendering plus
+# a ×N line — which fixes readability for journals ALREADY written this way, before the write-side
+# guard existed. Appended AFTER every section above so no assertion there sees these rows.
+{
+  for t in 33 38 43 48 53; do
+    printf '{"ts":"2026-07-31T03:54:%sZ","event":"live_state","pr":"55","sha":"75068de0","trigger":"dispatch_health","state_from":"INTAKE","state_to":"HEALTH"}\n' "$t"
+    printf '{"ts":"2026-07-31T03:54:%sZ","event":"live_state","pr":"55","sha":"75068de0","trigger":"health_clean","state_from":"HEALTH","state_to":"REVIEW"}\n' "$t"
+    printf '{"ts":"2026-07-31T03:54:%sZ","event":"live_state","pr":"55","sha":"75068de0","trigger":"review_block","state_from":"REVIEW","state_to":"BLOCKED"}\n' "$t"
+  done
+  # …then a genuinely NEW state (a refix bounce landed): never folded into the run above.
+  printf '{"ts":"2026-07-31T03:55:00Z","event":"refix_bounce","pr":"55","sha":"75068de0","round":"1","agent_status_before":"idle","rule":"review","location":""}\n'
+} >> "$TREES/.herd/journal.jsonl"
+
+assert_parity "why 55 (noisy)" why 55
+noisy="$(run_herd 1 why 55)"
+# The header still counts every RAW event — the fold is a rendering, never a lie about the record.
+[[ "$noisy" == *"gate history (16 events)"* ]] || fail "why 55: header must count all 16 raw events"
+[[ "$noisy" == *"× 5"* || "$noisy" == *"×5  (identical 3-event block repeated, through 2026-07-31T03:54:53Z)"* ]] \
+  || { printf '%s\n' "$noisy" >&2; fail "why 55: expected a ×5 3-event-block fold through the last ts"; }
+# Exactly 3 live_state lines survive (one block), not 15 — plus the header, the fold note and the bounce.
+[ "$(printf '%s\n' "$noisy" | grep -c 'live_state')" = 3 ] \
+  || { printf '%s\n' "$noisy" >&2; fail "why 55: expected exactly 3 rendered live_state lines"; }
+[ "$(printf '%s\n' "$noisy" | grep -c 'auto-refix bounce')" = 1 ] \
+  || fail "why 55: the distinct trailing event must survive the fold"
+ok
+
+# NON-VACUOUS: the same reader on a NON-repeating history renders every row and emits NO fold note —
+# so the fold cannot be a blanket truncation.
+[[ "$(run_herd 1 why 42)" != *"identical"* ]] || fail "why 42: a non-repeating history must never fold"
+[ "$(run_herd 1 why 42 | grep -c .)" = 8 ] || fail "why 42: expected the header + 7 unfolded rows"
+ok
+
 echo "ALL PASS ($pass checks)"
