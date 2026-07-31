@@ -58,8 +58,43 @@ AFTER="${AFTER#\#}"
 # parse (spawn-step.sh) is unchanged and an intent enqueued by an OLDER engine (no sidecar) still
 # drains correctly (empty ref). Write the sidecar FIRST, then publish the .req, so the ref is present
 # the instant the intent becomes claimable.
-INTENT_ID="$(date +%s)-$$-$RANDOM"
+#
+# HERD-443: the ID used to be `date +%s`-$$-$RANDOM. `date +%s` alone ties for any two intents
+# enqueued in the SAME second (routine — a coordinator wave fires several spawn.sh calls back to
+# back), and $$/$RANDOM have no relationship to call order, so the `sort` in spawn-step.sh's `next`
+# could silently invert real enqueue order — the exact bug tests/test-spawn-queue-drain.sh case 2
+# caught intermittently (moving-victim macOS CI red, not a timeout). agent-watch.sh's dependency-hold
+# drain (_drain_spawn_queue) explicitly relies on "FIFO order is preserved by the INTENT_ID filenames"
+# — so this was a real production race, not merely a test assumption. A queue-scoped sequence counter
+# makes same-second ordering deterministic regardless of PID allocation or $RANDOM. Serialize the
+# read-increment-write with flock(1) when present, else a plain atomic-mkdir spin-wait (stock macOS
+# has no flock). No eager "is the lock stale" heuristic: under a 40-way concurrent stress test, a
+# `find -mmin` staleness probe on the lock DIR raced with a peer's own hold-and-release cycle often
+# enough to `rmdir` a lock that was still legitimately held, letting two callers into the critical
+# section at once (proven live: duplicate .seq values). The critical section is one tiny file
+# read+write, sub-millisecond, so a bounded spin (no staleness shortcut) clears in practice; the
+# give-up-after-N-tries branch is the only recovery path, same tradeoff scribe.sh/research.sh accept.
 mkdir -p "$Q"
+_spawn_next_seq() {
+  local f="$Q/.seq" lockdir="$Q/.seq.lock.d" tries=0 n
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$Q/.seq.lock"
+    flock 8
+  else
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      tries=$((tries + 1))
+      [ "$tries" -ge 300 ] && break   # ~3s waited; proceed unlocked rather than wedge the enqueue
+      sleep 0.01
+    done
+  fi
+  n="$(cat "$f" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1))
+  printf '%s' "$n" > "$f"
+  if command -v flock >/dev/null 2>&1; then exec 8>&-; else rmdir "$lockdir" 2>/dev/null || true; fi
+  printf '%s' "$n"
+}
+INTENT_ID="$(date +%s)-$(printf '%010d' "$(_spawn_next_seq)")-$$"
 [ -n "$ITEM_REF" ] && printf '%s\n' "$ITEM_REF" > "$Q/$INTENT_ID.ref"
 [ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
 tmp=$(mktemp "$Q/.tmp.XXXXXX")
