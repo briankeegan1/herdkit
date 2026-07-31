@@ -101,11 +101,30 @@ run_view() {
 # has no MAX_POLLS hook (byte-identical to before), so run it briefly in the background then stop.
 run_view_file() {
   local dir="$1" out="$2"; shift 2
+  : > "$out"
   env -i LC_ALL="$UTF8_LOCALE" HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm \
     HERD_CONFIG_FILE="$dir/.herd/config" HERD_ALLOW_FOREIGN_CWD=1 \
     HERD_FAKE_LOG="$HERDLOG" GH_FAKE_LOG="$GHLOG" BACKLOG_VIEW_TTY=/dev/null "$@" \
     bash "$SCRIPT" </dev/null >"$out" 2>/dev/null & local vpid=$!
-  sleep 1; kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
+  # Wait for the first frame to land AND settle (byte count stops growing for two consecutive 100ms
+  # polls) instead of a fixed 1s sleep — under shard load the git init/commit plus (when extras is
+  # on) the `gh issue list` call before the first paint can exceed 1s on a busy runner, killing the
+  # loop mid-render before it ever wrote the primary header (macOS shard-load flake, HERD-468).
+  # Bounded at ~5s so a genuinely broken render still fails fast instead of hanging the suite.
+  local prev_size=-1 size stable=0 waited=0
+  while [ "$waited" -lt 50 ]; do
+    size=$(wc -c < "$out" 2>/dev/null || echo 0)
+    if [ "$size" -gt 0 ] && [ "$size" = "$prev_size" ]; then
+      stable=$((stable+1))
+      [ "$stable" -ge 2 ] && break
+    else
+      stable=0
+    fi
+    prev_size="$size"
+    sleep 0.1
+    waited=$((waited+1))
+  done
+  kill "$vpid" 2>/dev/null; wait "$vpid" 2>/dev/null
 }
 
 # ── Case 1: file backend + extras=github-issues — primary file + incoming section ────────────────

@@ -49,19 +49,28 @@ chmod +x "$STUB_BATS"
 PB="$T/parbin"; mkdir -p "$PB"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$PB/parallel"; chmod +x "$PB/parallel"
 
-# Whatever directory the REAL `parallel` (if any) resolves from on THIS box — stripped out for the
-# "absent" cases below so a box that happens to have GNU parallel installed (e.g. the maintainer's
-# own dev machine) doesn't leak it into the negative assertions. A box with no `parallel` at all
-# leaves this empty, and stripping an empty name is a no-op — the absent case is already satisfied.
-REAL_PARALLEL_DIR="$(command -v parallel 2>/dev/null)"; REAL_PARALLEL_DIR="${REAL_PARALLEL_DIR%/*}"
+# Strip every PATH directory that itself resolves an executable `parallel` — not just the single
+# directory `command -v parallel` happens to report first. On Ubuntu's usr-merge layout /bin is a
+# symlink to /usr/bin, so a `parallel` installed at /usr/bin/parallel is ALSO reachable via
+# /bin/parallel: stripping only the `command -v` hit leaves that symlinked duplicate on PATH, and
+# the "absent" cases below silently degrade to "present" on such boxes (reproduced: CI ubuntu
+# runners ship GNU parallel this way — confirmed the exact `--jobs 4` leak this guards against).
+# A box with no `parallel` at all strips nothing — the absent case is already satisfied.
+strip_parallel_dirs() {
+  local _spd_out="" _spd_d
+  while IFS= read -r _spd_d; do
+    [ -n "$_spd_d" ] || continue
+    [ -x "$_spd_d/parallel" ] && continue
+    _spd_out="${_spd_out:+$_spd_out:}$_spd_d"
+  done <<< "$(printf '%s' "$1" | tr ':' '\n')"
+  printf '%s' "$_spd_out"
+}
 
 run_proj() {
   # run_proj <yes|no: put stub parallel on PATH> [VAR=VAL...] — sets OUT/RC/ARGV.
   local want_parallel="$1"; shift
   local base_path="$PATH"
-  if [ "$want_parallel" != "yes" ] && [ -n "$REAL_PARALLEL_DIR" ]; then
-    base_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$REAL_PARALLEL_DIR" | tr '\n' ':')"
-  fi
+  [ "$want_parallel" = "yes" ] || base_path="$(strip_parallel_dirs "$PATH")"
   local p="$B:$base_path"
   [ "$want_parallel" = "yes" ] && p="$PB:$p"
   OUT="$(PATH="$p" BATS_ARGV_FILE="$T/argv" env "$@" bash "$PROJ" "$F" 2>&1)"; RC=$?
