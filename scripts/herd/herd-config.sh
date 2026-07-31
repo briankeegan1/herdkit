@@ -157,6 +157,58 @@ _herd_find_config() {
 }
 _herd_find_config
 unset -f _herd_find_config
+
+# _HERD_ENGINE_CORE_KEYS (HERD-465) — THE single list of config knobs the Python engine core reads
+# from os.environ (pysrc/herd/live_runtime.py's _CORE_ENV_KEYS, HERD-449). Consumed at BOTH ends of
+# this file: the RESET below, immediately BEFORE baseline+overlay are sourced, and the matching
+# `export` loop far below once every key is resolved. One list for both so they can never drift apart
+# the way the three one-off HERD-353/345/359 exports (and the ad-hoc HERD-449 sweep before this fix)
+# did.
+_HERD_ENGINE_CORE_KEYS="MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
+DELETE_BRANCH_ON_MERGE REFIX_MAX_ROUNDS REFIX_COMPLETE_MIN HERD_REFIX_WAIT_TIMEOUT WORK_UNIT_KIND \
+MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY WATCHER_SCOPE WATCHER_VIEW \
+WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL WATCHER_VIEW_STATUS \
+WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS MERGE_FAIRNESS MERGE_FAIRNESS_STARVE_THRESHOLD \
+INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN"
+
+# ── Engine-core key RESET (HERD-465): the FILE is authoritative, never inherited/stale env ─────────
+# WATCHER_SELF_RESTART (HERD-251) re-execs this very process in place, inheriting every var it had
+# already exported — including every key above, exported for the Python child per HERD-449. A config
+# change made AFTER first launch was therefore silently invisible down the whole re-exec chain: each
+# key below is resolved with the set-if-unset idiom `: "${KEY:=default}"`, which only fires when the
+# key is UNSET — and an inherited exported value already counts as set, so it wins over whatever the
+# file now says. GROUNDED 2026-07-31: an operator flipped HUMAN_VERIFY_POLICY=auto at 14:45; a
+# re-exec-chain watcher still resolved coordinator at 15:12 and applied a hold that policy made
+# impossible (journal: hold_applied ... human_verify_policy=coordinator while herd config get said
+# auto).
+#
+# Fix: when there is an actual project config to be authoritative over — the resolved
+# HERD_CONFIG_FILE, or its config.local sibling (HERD-47), exists on disk — unset every engine-core
+# key BEFORE sourcing either, so the file's own assignment (or, if the file stays silent on a key,
+# this loader's own `:=` engine default further down) is what wins. An inherited value never shadows
+# it again, no matter how many re-execs it has survived.
+#
+# When NEITHER file exists there is nothing to be authoritative over, so the reset is skipped — this
+# is exactly the hermetic test/sim seam (scripts/herd/sim/sandbox-*-scenario.sh, many tests/test-*.sh)
+# that points HERD_CONFIG_FILE at a deliberately absent path (e.g. "$ART/no-such-config") and
+# pre-exports these very keys — MERGE_POLICY, HEALTH_CONCURRENCY, INFRA_BREAKER_MAX, etc. — directly
+# into env to drive a scenario with no config file on disk at all. Resetting there would null every
+# knob back to its built-in default and break that seam; skipping keeps every such caller
+# byte-identical. HERD_CONFIG_ENV_OK=1 is an explicit escape hatch (same shape as the
+# HERD_ALLOW_FOREIGN_CWD override below) for a caller that needs its pre-exported value to win even
+# against a REAL file — no such caller exists today, but the lever costs nothing to keep open.
+case "${HERD_CONFIG_ENV_OK:-}" in
+  1|true|yes|on) : ;;
+  *)
+    if [ -f "$_HERD_CONFIG_FILE" ] || [ -f "$(dirname "$_HERD_CONFIG_FILE")/config.local" ]; then
+      for _hcr_key in $_HERD_ENGINE_CORE_KEYS; do
+        unset -v "$_hcr_key"
+      done
+      unset _hcr_key
+    fi
+    ;;
+esac
+
 if [ -f "$_HERD_CONFIG_FILE" ]; then
   # shellcheck source=/dev/null
   . "$_HERD_CONFIG_FILE"
@@ -695,18 +747,20 @@ export MAIN_HEALTH_TICK          # HERD-359: reach the Python engine core the wa
 # main-health was pending, so NO PR healthcheck could dispatch at all — two PRs sat un-gated over an
 # hour. Byte-identical for every seat already at the default: exporting only changes what a CHILD
 # process sees, never the value itself.
-export HEALTH_CONCURRENCY REVIEW_CONCURRENCY   # the two keys THIS item's bug report named
-export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD REFIX_MAX_ROUNDS \
-       REFIX_COMPLETE_MIN WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE GATE_STATUS MERGE_FAIRNESS
-# DELETE_BRANCH_ON_MERGE / HERD_REFIX_WAIT_TIMEOUT / MERGE_FAIRNESS_STARVE_THRESHOLD carry no
-# `: "${KEY:=default}"` line above (each call site inlines its own `${KEY:-default}` fallback instead)
-# — a bare `export KEY` on an unset var is a no-op, so this only matters the moment a project sets one
-# of these three in .herd/config without its own `export` line.
-export DELETE_BRANCH_ON_MERGE HERD_REFIX_WAIT_TIMEOUT MERGE_FAIRNESS_STARVE_THRESHOLD
-# WATCHER_* view/scope knobs (team-mode + console filtering): same no-default-line caveat as the three
-# above — unset-by-design is the common case and stays a byte-identical no-op export.
-export WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
-       WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER
+#
+# HERD-465: the actual `export` for every key in this sweep (HEALTH_CONCURRENCY / REVIEW_CONCURRENCY /
+# MERGE_POLICY / WATCHER_AUTOMERGE / HUMAN_VERIFY_POLICY / MERGE_METHOD / REFIX_MAX_ROUNDS /
+# REFIX_COMPLETE_MIN / WORK_UNIT_KIND / MERGE_RESULT_GATE / MERGE_QUEUE / GATE_STATUS /
+# MERGE_FAIRNESS / DELETE_BRANCH_ON_MERGE / HERD_REFIX_WAIT_TIMEOUT / MERGE_FAIRNESS_STARVE_THRESHOLD /
+# the WATCHER_* view+scope knobs / INFRA_BREAKER_MAX / INFRA_BREAKER_COOLDOWN) now happens ONCE, off
+# the single _HERD_ENGINE_CORE_KEYS list defined above the RESET at the top of this file, in one loop
+# below INFRA_BREAKER_COOLDOWN's own `: "${KEY:=default}"` line — the last of these keys to resolve a
+# value — so every one of them is exported with its FINAL value and the reset/export halves can never
+# drift apart again. DELETE_BRANCH_ON_MERGE / HERD_REFIX_WAIT_TIMEOUT / MERGE_FAIRNESS_STARVE_THRESHOLD
+# and the WATCHER_* knobs carry no `: "${KEY:=default}"` line of their own (each call site inlines its
+# own `${KEY:-default}` fallback instead) — a bare `export KEY` on an unset var is a no-op (verified:
+# `unset FOO; export FOO` never even creates FOO), so exporting them here only matters the moment a
+# project actually sets one in .herd/config.
 : "${STORE_BACKEND:="auto"}"     # HERD-305 (engine-port P4): the MUTABLE-STATE STORE backend the Python runtime (pysrc/herd/store.py, live_runtime/shadow_runtime) reads — auto | flat | sqlite (default auto, ship-dormant). auto → FLAT (the ~45 flat state files agent-watch.sh owns) UNTIL the one-shot migration runner (`python3 -m herd.store --migrate`, operator-triggered, gated by herd_engine_migration_guard) has migrated the pool and written a `.herd/store-backend` marker; only then does auto engage the SQLite (WAL) store. flat → force flat. sqlite → force sqlite (explicit opt-in / tests). With nothing migrated auto == flat, so behavior is BYTE-IDENTICAL to before this key (the store never engages a backend it cannot open). The journal stays append-only JSONL, NEVER in the db. FAIL-SOFT: an unreadable marker / missing db degrades to flat. Consumed by pysrc/herd/store.py (resolve_backend)
 : "${WATCHER_SELF_RESTART:="off"}" # HERD-251: watcher SELF-RESTART on stale engine code — on | off (default off, ship-dormant). on → when the freshness reconcile pulls a delta that rewrote agent-watch.sh (the same restart-note trigger HERD-233 already raises), the watcher QUIESCES: it stops dispatching NEW gate work (reviews, healthchecks, resolver spawns, and the stale-base heal that dispatches them) while in-flight workers finish and collect; each hold sits above its call site's ledger write, so a refused dispatch never burns a once-guard, then re-execs itself in place — same pane, same argv0 herd-watch-<ws> tag, same singleton lock (the exec keeps the pid, so the lock it re-acquires is its own) — once zero review/health gate workers remain for 2 consecutive ticks, or a 15-minute max-wait cap expires. Journals watcher_quiesce then watcher_self_restart; the console row becomes 'restarting on new engine code · draining N workers'. FAIL-SOFT: any error (unreadable script, hermetic guard) falls back to the plain 'restart recommended' row. off (default) → byte-identical to the HERD-233 recommendation row: no quiesce, no dispatch hold, no exec. Consumed by agent-watch.sh
 : "${WATCHER_SINGLETON_RECONCILE:="off"}" # HERD-450: the watcher SINGLETON as a RECONCILED INVARIANT — on | off (default off, ship-dormant). The invariant: EXACTLY ONE live process carries this workspace's argv0 AND the lockfile NAMES it. GROUNDED 2026-07-31: a watcher SURVIVED a `herd reload`, ran 41 minutes re-parented to init alongside its replacement (both gating the same PRs, wrecking slot accounting) while the lockfile stayed EMPTY throughout — and an empty lockfile blinds every seat at once, because `herd status`, the sweep, the launch paths' adopt-or-refuse read and the fork exemption ALL key off the recorded pid. on → each tick the watcher classifies the invariant through the shared watcher-exempt.sh seam (watcher_singleton_verdict): a DUPLICATE journals `watcher_singleton_violation` (once per signature) and paints a loud persistent console row naming the pids and the remedy; a drifted/empty/stale lockfile is REPAIRED in place by the sole live main recording itself (journals `watcher_lock_repaired`) so the guard holds something again. It NEVER kills: telling a genuine orphan (ppid 1) from a legitimate review-tick FORK (ppid == the live watcher) is the exemption seam's job, and reaping a fork caches a bogus BLOCK verdict. off (default) → byte-inert: no ps sample, no journal event, no row, no lockfile write. Consumed by agent-watch.sh
@@ -738,7 +792,21 @@ export WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATC
 # reach the bash breaker helpers (same-shell vars, no export needed) but silently fall back to the
 # python engine's built-in 0/300 defaults — the exact HERD-449 bug class, caught here before it shipped
 # by scripts/herd/env-export-lint.sh rather than discovered live a fourth time.
-export INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
+#
+# This is also the LAST of _HERD_ENGINE_CORE_KEYS to resolve a `: "${KEY:=default}"` value (the two
+# lines directly above), so the export for the WHOLE list — the HERD-465 counterpart to the RESET at
+# the top of this file — happens HERE, once every member has its final value. Written as a literal
+# `export NAME NAME ...` statement, NOT a loop over the variable: scripts/herd/hermetic-env-scrub.sh
+# (HERD-458) TEXT-SCANS this file for literal `export` statements to seal hermetic tests off from a
+# configured project's live values, and a `export "$var"` loop is invisible to that scanner — every
+# name below MUST stay byte-identical to _HERD_ENGINE_CORE_KEYS above (tests/test-config-env-precedence.sh
+# cross-checks the two so this can't silently drift).
+export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
+       DELETE_BRANCH_ON_MERGE REFIX_MAX_ROUNDS REFIX_COMPLETE_MIN HERD_REFIX_WAIT_TIMEOUT \
+       WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY \
+       WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
+       WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS MERGE_FAIRNESS \
+       MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
 # Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang

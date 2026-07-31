@@ -72,8 +72,8 @@ import re, sys
 path = sys.argv[1]
 src = open(path, encoding="utf-8").read()
 new = src.replace(
-    "export HEALTH_CONCURRENCY REVIEW_CONCURRENCY   # the two keys THIS item's bug report named\n",
-    "export REVIEW_CONCURRENCY   # mutation test: HEALTH_CONCURRENCY export deliberately dropped\n",
+    "       WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY \\\n",
+    "       WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE REVIEW_CONCURRENCY \\\n",
     1,
 )
 if new == src:
@@ -113,10 +113,8 @@ import sys
 path = sys.argv[1]
 src = open(path, encoding="utf-8").read()
 new = src.replace(
-    "export WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \\\n"
-    "       WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER\n",
-    "export WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \\\n"
-    "       WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER   # WATCHER_SCOPE dropped for this test\n",
+    "       WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \\\n",
+    "       WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \\\n",
     1,
 )
 if new == src:
